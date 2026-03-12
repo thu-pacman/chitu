@@ -4,10 +4,13 @@
 
 from typing import AsyncIterable, Any
 from .abstract_parser import AbstractToolParser
-from .types import ChoiceDelta
+from .type_def import ChoiceDelta
 
 
 class DummyToolParser(AbstractToolParser):
+    def __init__(self, tools):
+        pass
+
     @classmethod
     def patch_chat_template(cls, template: str):
         return template

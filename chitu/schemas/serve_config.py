@@ -211,17 +211,19 @@ class DpConfig:
 class MetricsConfig:
     """Metrics collection configuration"""
 
-    prometheus_listening_port: int = 9090
-    prometheus_config_file: str = "prometheus.yml"
-    prometheus_data_dir: str = "prometheus_data"
-    prometheus_scrape_interval: int = 1
-    log_interval: int = 10
+    prometheus_listening_host: str = MISSING
+    prometheus_listening_port: int = MISSING
+    prometheus_config_file: str = MISSING
+    prometheus_data_dir: str = MISSING
+    prometheus_scrape_interval: int = MISSING
+    log_interval: int = MISSING
 
 
 @dataclass
 class DebugConfig:
     skip_model_load: bool = MISSING
     force_moe_balance: bool = MISSING
+    save_trace_dir: Optional[str] = MISSING
 
 
 class StaticConfig:

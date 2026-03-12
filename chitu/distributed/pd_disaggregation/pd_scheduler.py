@@ -52,22 +52,13 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
 )
 from chitu.distributed.pd_disaggregation.pd_types import PDRequestStatus
+from chitu.metrics.prometheus_collector import (
+    inc_completed_requests,
+    observe_stage_duration,
+    set_queue_size,
+)
 
 logger = getLogger(__name__)
-
-_PD_SCHEDULER_INSTANCE: Optional["PDScheduler"] = None
-
-
-def set_pd_scheduler_instance(scheduler: Optional["PDScheduler"]) -> None:
-    """Expose PD scheduler instance for diagnostics/metrics."""
-    global _PD_SCHEDULER_INSTANCE
-    _PD_SCHEDULER_INSTANCE = scheduler
-
-
-def get_pd_scheduler_instance() -> Optional["PDScheduler"]:
-    """Return the global PD scheduler instance if available."""
-    return _PD_SCHEDULER_INSTANCE
-
 
 _PD_SCHEDULER_INSTANCE: Optional["PDScheduler"] = None
 
@@ -345,6 +336,12 @@ class PDScheduler(Scheduler):
             self.kv_manager.set_linear_attn_cache_manager(linear_attn_cache_manager)
             logger.info("linear attention cache manager set for pd scheduler")
 
+    def set_indexer_cache_manager(self, indexer_cache_manager):
+        """Set indexer KV cache manager for DeepSeek-V3.2 PD disaggregation."""
+        if self.kv_manager is not None and indexer_cache_manager is not None:
+            self.kv_manager.set_indexer_cache_manager(indexer_cache_manager)
+            logger.info("indexer cache manager set for pd scheduler")
+
     def set_token_manager(self, token_manager):
         """Attach DP token manager so we can stream tokens back to Router."""
         self.token_manager = token_manager
@@ -416,7 +413,7 @@ class PDScheduler(Scheduler):
         if not ip or port <= 0:
             raise ValueError(f"invalid decode prepare endpoint: {endpoint}")
         endpoint_addr = f"tcp://{ip}:{port}"
-        logger.info(
+        logger.debug(
             f"[PD_STAGE][decode.prepare_send.start] req_id={request_id} dp_rank={int(dp_rank)}"
         )
         payload = msgpack.packb(
@@ -460,7 +457,7 @@ class PDScheduler(Scheduler):
             timeout_s=0.05,
             poll_step_ms=5,
         )
-        logger.info(
+        logger.debug(
             f"[PD_STAGE][decode.prepare_send.end] req_id={request_id} dp_rank={int(dp_rank)} ok={int(bool(sent))}"
         )
         return sent
@@ -472,7 +469,7 @@ class PDScheduler(Scheduler):
         scheduler_type = request_data.get("scheduler_type")
 
         if pd_trace_enabled():
-            logger.info(
+            logger.debug(
                 f"[PD_TRACE][sched.recv] mode={self.pd_mode.value} "
                 f"sched_id={self.scheduler_id} req_id={request_id} type={request_type} "
                 f"scheduler_type={scheduler_type} keys={sorted(list(request_data.keys()))}"
@@ -502,23 +499,23 @@ class PDScheduler(Scheduler):
         original_request = request_data["request"]
 
         if pd_verbose_enabled():
-            logger.info(f"processing prefill request: {request_id}")
-        logger.info(f"[PD_STAGE][prefill.queue.start] req_id={request_id}")
+            logger.debug(f"processing prefill request: {request_id}")
+        logger.debug(f"[PD_STAGE][prefill.queue.start] req_id={request_id}")
 
         # Create task from request and enqueue. Actual batched prefill compute is driven by
         # the background compute loop (start_worker -> chitu_run()).
         task = self._create_task_from_request(original_request, TaskType.Prefill)
         if pd_trace_enabled():
-            logger.info(
+            logger.debug(
                 f"[PD_TRACE][prefill.task] req_id={request_id} task_id={task.task_id} "
                 f"prefix_tokens_len={int(task.prefix_tokens_len)} "
                 f"max_new_tokens={int(task.req.max_new_tokens)}"
             )
         if pd_verbose_enabled():
-            logger.info(
+            logger.debug(
                 f"prefill task enqueued for request: {request_id}; compute will be handled by worker loop"
             )
-        logger.info(f"[PD_STAGE][prefill.queue.end] req_id={request_id}")
+        logger.debug(f"[PD_STAGE][prefill.queue.end] req_id={request_id}")
 
     async def _process_decode_request(self, request_data: dict[str, Any]):
         """Process Decode-only request"""
@@ -527,7 +524,7 @@ class PDScheduler(Scheduler):
         prefill_scheduler_id = request_data.get("prefill_scheduler_id")
 
         if pd_verbose_enabled():
-            logger.info(
+            logger.debug(
                 f"processing decode request: {request_id} from prefill scheduler {prefill_scheduler_id}"
             )
 
@@ -554,12 +551,12 @@ class PDScheduler(Scheduler):
             target_dp_rank = self._dp_cursor % args.infer.dp_size
             self._dp_cursor += 1
             if pd_verbose_enabled():
-                logger.info(
+                logger.debug(
                     f"Scheduled request {request_id} to DP rank {target_dp_rank}"
                 )
         args = get_global_args()
         if pd_trace_enabled():
-            logger.info(
+            logger.debug(
                 f"[PD_TRACE][decode.dispatch] req_id={request_id} prefill_sid={prefill_scheduler_id} "
                 f"target_dp_rank={int(target_dp_rank)} infer_dp_size={int(args.infer.dp_size)} "
                 f"infer_ep_size={int(args.infer.ep_size)}"
@@ -599,56 +596,10 @@ class PDScheduler(Scheduler):
         self._decode_incoming_q.enqueue(request_id, info, allow_overflow=True)
         decode_info["status"] = PDRequestStatus.KV_TRANSFERRING
         if pd_verbose_enabled():
-            logger.info(
+            logger.debug(
                 f"[PD_QUEUE][decode.enqueue] req_id={request_id} cache_owner={target_dp_rank}"
             )
-        logger.info(f"[PD_STAGE][decode.enqueue.start] req_id={request_id}")
-
-    async def _wait_for_kv_cache(self, request_id: str, target_dp_rank: int = 0):
-        """Wait for KV cache and start decode"""
-        decode_info = self.pending_decode_requests.get(request_id)
-        if not decode_info:
-            logger.error(f"decode info not found for request: {request_id}")
-            return
-
-        if pd_verbose_enabled():
-            logger.info(
-                f"waiting for kv cache for request: {request_id} (target_rank={target_dp_rank})"
-            )
-
-        # Create task immediately; KV pull + first-token sampling will happen on the owner DP rank
-        # inside Executor.decode_step via MooncakeKVTransferHook.
-        task = self._create_task_from_request(
-            decode_info["original_request"], TaskType.Decode, enqueue=False
-        )
-        task.cache_owner = target_dp_rank
-        task.dp_rank = target_dp_rank
-        # Propagate PD binding into Task so decode worker ranks can route TransferInfo correctly.
-        prefill_sid = decode_info.get("prefill_scheduler_id", None)
-        if prefill_sid is not None:
-            task.pd_prefill_engine_rank = int(prefill_sid)
-        # NOTE: if task is wrapped by DPTokenManager, assignments above only affect the wrapper.
-        # We must also set fields on the underlying Task in TaskPool so dp workers can receive them
-        # via MsgPackableTask bootstrap (TaskPool.pool[tid].get_msgpackable_task()).
-        base_task = TaskPool.pool.get(task.task_id)
-        if base_task is not None:
-            base_task.cache_owner = target_dp_rank
-            base_task.dp_rank = target_dp_rank
-            if prefill_sid is not None:
-                base_task.pd_prefill_engine_rank = int(prefill_sid)
-
-        decode_info["status"] = PDRequestStatus.DECODE_RUNNING
-        decode_info["decode_start_time"] = time.time()
-
-        await self._execute_decode(task)
-
-        decode_info["status"] = PDRequestStatus.COMPLETED
-        decode_info["decode_complete_time"] = time.time()
-        if pd_verbose_enabled():
-            logger.info(f"completed decode for request: {request_id}")
-        if not getattr(task, "pd_exec_end_logged", False):
-            task.pd_exec_end_logged = True
-            logger.info(f"[PD_STAGE][decode.exec.end] req_id={request_id}")
+        logger.debug(f"[PD_STAGE][decode.enqueue.start] req_id={request_id}")
 
     def schedule(self) -> list[list[str]]:
         """Schedule tasks for execution.
@@ -798,68 +749,11 @@ class PDScheduler(Scheduler):
             TaskPool.enqueue(task)
         return task
 
-    async def _execute_prefill(self, task: Task) -> torch.Tensor:
-        """Execute prefill in PD Prefill-only mode.
-
-        当 pp_size > 1：
-        - PP stage 0 消费 token ids（[num_tokens]）
-        - PP stage i>0 消费 hidden states（[num_tokens, dim]）
-        - KV 由各 PP stage 生成，通过 KV hook / KVManager Transfer到 Decode
-
-        NOTE: PD Prefill-only samples the first token on Prefill side and
-        passes it to Decode via KV metadata. Decode continues from the next token.
-        """
-        request_id = None
-        if getattr(task, "req", None) is not None:
-            request_id = getattr(task.req, "request_id", None)
-        if pd_verbose_enabled():
-            logger.info(f"executing prefill for task: {task.task_id}")
-        if request_id:
-            logger.info(f"[PD_STAGE][prefill.exec.start] req_id={request_id}")
-
-        # Ensure PackedTasksBase configured
-        if not PackedTasksBase.configured:
-            args = get_global_args()
-            PackedTasksBase.configure(max_num_tasks=args.infer.max_reqs)
-
-        args = get_global_args()
-        pp_size = args.infer.pp_size
-
-        if pp_size > 1:
-            # PP+TP path:
-            #
-            # Use `PackedTasks` (not PackedTasksBase) so PipeDispatcher can serialize/forward
-            # prefill task metadata to later PP stages via ZMQ. Worker ranks are already running
-            # `Executor.step(None)` in PD worker loop and will participate in collectives.
-            tasks = PackedTasks([task.task_id], tasks=[task])
-            logits = Backend.executor.step(tasks)
-        else:
-            # TP-only path (existing behavior). This avoids any sampling in Executor.step()
-            # and is lower overhead for the common pp_size==1 deployment.
-            tokens = task.prefix_tokens
-            tasks = PackedTasksBase(
-                num_tasks=1,
-                task_ids=[task.task_id],
-                req_ids=[task.req.request_id],
-                task_type=TaskType.Prefill,
-                tokens=[tokens],
-                num_tokens=len(tokens),
-                has_outputs=[1],
-                payload_type=SerializedPackedTasksPayloadType.Prefill,
-            )
-            logits = Backend.executor.prefill_step_tp_only(tasks)
-
-        if pd_verbose_enabled():
-            logger.info(f"prefill completed for task: {task.task_id}")
-        if request_id:
-            logger.info(f"[PD_STAGE][prefill.exec.end] req_id={request_id}")
-        return logits
-
     async def _execute_decode(self, task: Task):
         """Execute decode on KV-ready task"""
 
         if pd_verbose_enabled():
-            logger.info(f"executing decode for task: {task.task_id}")
+            logger.debug(f"executing decode for task: {task.task_id}")
 
         task.task_type = TaskType.Decode
         base_task = TaskPool.pool.get(task.task_id)
@@ -895,7 +789,7 @@ class PDScheduler(Scheduler):
         if hasattr(task, "token_sender"):
             task.token_sender.send_finish(task.req.request_id, task.req.finish_reason)
         if pd_verbose_enabled():
-            logger.info(f"decode completed for task: {task.task_id}")
+            logger.debug(f"decode completed for task: {task.task_id}")
 
     def get_pd_stats(self) -> dict:
         """Get PD disaggregation statistics"""
@@ -1054,10 +948,10 @@ class PrefillOnlyScheduler(PDScheduler):
         # 该日志表示 Prefill scheduler 已接收该请求，但尚未进入 prefill executor.step 流程
         # 在等待 Decode schedule 该请求并发送 TransferInfo
         if pd_verbose_enabled():
-            logger.info(
+            logger.debug(
                 f"[PD_QUEUE][prefill.enqueue] request queued: req_id={request_id}"
             )
-        logger.info(f"[PD_STAGE][prefill.queue.start] req_id={request_id}")
+        logger.debug(f"[PD_STAGE][prefill.queue.start] req_id={request_id}")
 
     def _bootstrap_check_and_promote(
         self, max_check: Optional[int] = None, max_promote: Optional[int] = None
@@ -1081,7 +975,8 @@ class PrefillOnlyScheduler(PDScheduler):
                 break
             if self._prefill_bootstrap_q.enqueue(rid, info):
                 self._prefill_incoming_q.pop(rid)
-                logger.info(f"[PD_STAGE][prefill.transfer_info.start] req_id={rid}")
+                info["_transfer_info_start_ts"] = time.monotonic()
+                logger.debug(f"[PD_STAGE][prefill.transfer_info.start] req_id={rid}")
                 logger.debug(
                     f"[PD_QUEUE][prefill.move] incoming->bootstrap_wait req_id={rid}"
                 )
@@ -1125,11 +1020,21 @@ class PrefillOnlyScheduler(PDScheduler):
                 self._prefill_bootstrap_q.pop(rid)
                 created_ts = float(info.get("created_ts", now))
                 waited = now - created_ts
+                # Record transfer_info_wait stage duration
+                _ti_start = float(info.get("_transfer_info_start_ts", 0))
+                if _ti_start > 0:
+                    observe_stage_duration(
+                        "prefill", "transfer_info_wait", time.monotonic() - _ti_start
+                    )
+                if waited > 5.0:
+                    logger.warning(
+                        f"[PD_SLOW] prefill.transfer_info_wait req_id={rid} waited={waited:.1f}s"
+                    )
                 if pd_verbose_enabled():
-                    logger.info(
+                    logger.debug(
                         f"[PD_QUEUE][prefill.ready] req_id={rid} TransferInfo ready waited={waited:.1f}s"
                     )
-                logger.info(f"[PD_STAGE][prefill.transfer_info.end] req_id={rid}")
+                logger.debug(f"[PD_STAGE][prefill.transfer_info.end] req_id={rid}")
 
         # 3) ready -> TaskPool
         promoted = 0
@@ -1145,12 +1050,19 @@ class PrefillOnlyScheduler(PDScheduler):
             promoted += 1
             created_ts = float(info.get("created_ts", time.time()))
             waited = time.time() - created_ts
+            # Record prefill queue duration
+            observe_stage_duration("prefill", "queue", waited)
             if pd_verbose_enabled():
-                logger.info(
+                logger.debug(
                     f"[PD_BOOTSTRAP][prefill.promote] promoted req_id={rid} to Prefill task waited={waited:.1f}s"
                 )
-            logger.info(f"[PD_STAGE][prefill.queue.end] req_id={rid}")
-            logger.info(f"[PD_STAGE][prefill.exec.start] req_id={rid}")
+            logger.debug(f"[PD_STAGE][prefill.queue.end] req_id={rid}")
+            logger.debug(f"[PD_STAGE][prefill.exec.start] req_id={rid}")
+
+        # Update prefill queue size gauges
+        set_queue_size("prefill", "incoming", self._prefill_incoming_q.size())
+        set_queue_size("prefill", "bootstrap_wait", self._prefill_bootstrap_q.size())
+        set_queue_size("prefill", "ready", self._prefill_ready_q.size())
 
     def schedule(
         self,
@@ -1310,10 +1222,13 @@ class DecodeOnlyScheduler(PDScheduler):
                 self._decode_prealloc_promoted_total += 1
                 created_ts = float(info.get("created_ts", now))
                 waited = now - created_ts
-                logger.info(f"[PD_STAGE][decode.enqueue.end] req_id={rid}")
-                logger.info(f"[PD_STAGE][decode.prealloc.start] req_id={rid}")
+                info["_prealloc_start_ts"] = time.monotonic()
+                # Record enqueue stage duration
+                observe_stage_duration("decode", "enqueue", waited)
+                logger.debug(f"[PD_STAGE][decode.enqueue.end] req_id={rid}")
+                logger.debug(f"[PD_STAGE][decode.prealloc.start] req_id={rid}")
                 if pd_verbose_enabled():
-                    logger.info(
+                    logger.debug(
                         f"[PD_QUEUE][decode.prealloc] req_id={rid} cache_owner={target_dp_rank} waited={waited:.1f}s"
                     )
 
@@ -1384,10 +1299,21 @@ class DecodeOnlyScheduler(PDScheduler):
                 self._decode_ready_wait_total_s += waited
                 if waited > self._decode_ready_wait_max_s:
                     self._decode_ready_wait_max_s = waited
-                logger.info(f"[PD_STAGE][decode.prealloc.end] req_id={rid}")
-                logger.info(f"[PD_STAGE][decode.ready.start] req_id={rid}")
+                # Record prealloc stage duration
+                _pa_start = float(info.get("_prealloc_start_ts", 0))
+                if _pa_start > 0:
+                    observe_stage_duration(
+                        "decode", "prealloc", time.monotonic() - _pa_start
+                    )
+                info["_ready_start_ts"] = time.monotonic()
+                if waited > 10.0:
+                    logger.warning(
+                        f"[PD_SLOW] decode.prealloc req_id={rid} waited={waited:.1f}s"
+                    )
+                logger.debug(f"[PD_STAGE][decode.prealloc.end] req_id={rid}")
+                logger.debug(f"[PD_STAGE][decode.ready.start] req_id={rid}")
                 if pd_verbose_enabled():
-                    logger.info(
+                    logger.debug(
                         f"[PD_QUEUE][decode.ready] req_id={rid} KV ready waited={waited:.1f}s"
                     )
 
@@ -1453,10 +1379,16 @@ class DecodeOnlyScheduler(PDScheduler):
             TaskPool.enqueue(task)
             if running_per_dp is not None:
                 running_per_dp[target_dp_rank] += 1
-            logger.info(f"[PD_STAGE][decode.ready.end] req_id={rid}")
+            # Record ready_wait stage duration
+            _rdy_start = float(info.get("_ready_start_ts", 0))
+            if _rdy_start > 0:
+                observe_stage_duration(
+                    "decode", "ready_wait", time.monotonic() - _rdy_start
+                )
+            logger.debug(f"[PD_STAGE][decode.ready.end] req_id={rid}")
             if not getattr(task, "pd_exec_start_logged", False):
                 task.pd_exec_start_logged = True
-                logger.info(f"[PD_STAGE][decode.exec.start] req_id={rid}")
+                logger.debug(f"[PD_STAGE][decode.exec.start] req_id={rid}")
             prealloc_tokens = int(info.get("prealloc_tokens", 0))
             if prealloc_tokens > 0:
                 self._decode_prealloc_tokens_inflight = max(
@@ -1480,11 +1412,16 @@ class DecodeOnlyScheduler(PDScheduler):
             created_ts = float(info.get("created_ts", time.time()))
             waited = time.time() - created_ts
             if pd_verbose_enabled():
-                logger.info(
+                logger.debug(
                     f"[PD_BOOTSTRAP][decode.promote] promoted req_id={rid} to Decode task "
                     f"waited={waited:.1f}s"
                 )
-            logger.info(f"[PD_STAGE][decode.sched_wait.start] req_id={rid}")
+            logger.debug(f"[PD_STAGE][decode.sched_wait.start] req_id={rid}")
+
+        # Update decode queue size gauges
+        set_queue_size("decode", "incoming", self._decode_incoming_q.size())
+        set_queue_size("decode", "prealloc", self._decode_prealloc_q.size())
+        set_queue_size("decode", "ready", self._decode_ready_q.size())
 
         self._log_decode_prealloc_stats(now)
 
@@ -1507,7 +1444,7 @@ class DecodeOnlyScheduler(PDScheduler):
         self._decode_ready_promoted_snapshot = self._decode_ready_promoted_total
         self._decode_ready_wait_total_snapshot_s = self._decode_ready_wait_total_s
         if pd_verbose_enabled():
-            logger.info(
+            logger.debug(
                 "[PD_STATS][decode.prealloc] "
                 f"prealloc_promoted={prealloc_delta} ready_promoted={ready_delta} "
                 f"ready_wait_avg_s={avg_wait:.3f} ready_wait_max_s={self._decode_ready_wait_max_s:.3f} "
@@ -1554,8 +1491,12 @@ class DecodeOnlyScheduler(PDScheduler):
             idx = max(0, min(n - 1, idx))
             return delays[idx]
 
+        # Also record sched_wait durations into Prometheus
+        for d_ms in delays:
+            observe_stage_duration("decode", "sched_wait", d_ms / 1000.0)
+
         if pd_verbose_enabled():
-            logger.info(
+            logger.debug(
                 "[PD_STATS][decode.ready_to_exec] "
                 f"count={n} avg_ms={avg:.2f} "
                 f"p50_ms={_pct(50):.2f} p90_ms={_pct(90):.2f} "

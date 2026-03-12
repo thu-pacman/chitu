@@ -244,14 +244,16 @@ class KVCacheManagerBase:
             if prefill_chunk_size_global is not None
             else None
         )
-        self.max_total_len = num_hot_req * max_seq_len
+        _mtp_size = get_global_args().infer.mtp_size
+        _mtp_extra = _mtp_size if _mtp_size > 1 else 0
+        self.max_total_len = num_hot_req * (max_seq_len + _mtp_extra)
         self.max_total_delta_len = max(
             (
                 prefill_chunk_size_per_dp
                 if prefill_chunk_size_per_dp is not None
                 else num_hot_req * max_seq_len
             ),  # prefill
-            num_hot_req,  # decode
+            num_hot_req * _mtp_size,  # decode
         )
         self.seq_len_delta = BatchedSeqLenDelta(
             device=self.device,
@@ -457,7 +459,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
             quant_type=quant_type,
             device=device,
         )
-        self.max_blocks_per_req = ceil_div(max_seq_len, block_size)
+        mtp_extra = self.mtp_size if self.mtp_size > 1 else 0
+        self.max_blocks_per_req = ceil_div(max_seq_len + mtp_extra, block_size)
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
         if num_blocks == -1:  # Being warmed-up
             # Should be consistent with `_warmup_via_taskpool` in `chitu_main.py`

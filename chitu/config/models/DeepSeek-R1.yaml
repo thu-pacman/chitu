@@ -10,5 +10,4 @@ defaults:
 # Access info
 name: DeepSeek-R1
 source: "https://huggingface.co/deepseek-ai/DeepSeek-R1" # Just for displaying. No automatic download.
-ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
-tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
+tool_parser: DeepSeekR1ToolParser

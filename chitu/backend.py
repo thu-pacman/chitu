@@ -67,7 +67,7 @@ from chitu.tokenizer import (
     Processor,
 )
 from chitu.utils import try_import_opt_dep
-from chitu.tool_call import get_tool_parser
+from chitu.tool_call import get_tool_parser, patch_chat_template
 from chitu.constraint_decode import ConstraintDecodeManager
 from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div, get_global_args
 from chitu.moe import init_moe_impl
@@ -378,12 +378,18 @@ class Backend:
             if hasattr(args.models, "tokenizer_force_full_seq_decode")
             else False
         )
+        skip_special_tokens = (
+            args.models.skip_special_tokens
+            if hasattr(args.models, "skip_special_tokens")
+            else True
+        )
 
         if args.models.tokenizer_type == "hf":
             tokenizer = TokenizerHF(
                 path=args.models.tokenizer_path,
                 trust_remote_code=trust_remote_code,
                 force_full_seq_decode=force_full_seq_decode,
+                skip_special_tokens=skip_special_tokens,
             )
         else:
             tokenizer = Tokenizer(
@@ -465,7 +471,7 @@ class Backend:
         total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
         if pipeline_parallel_size > 1:
             layer_dist = compute_layer_dist_in_pp(
-                args.models.n_layers, pipeline_parallel_size
+                total_n_layers, pipeline_parallel_size
             )
             pp_rank = get_pp_group().rank_in_group
             local_begin_layer_id = sum(layer_dist[:pp_rank])
@@ -484,9 +490,15 @@ class Backend:
         )
         # Create appropriate cache manager
         if args.infer.cache_type == "paged":
-            block_size = 64 if args.infer.mla_absorb != "none" else 256
             if args.infer.attn_type == "npu":
                 block_size = 128
+            elif (
+                args.models.type == ModelType.DEEPSEEK_V3
+                and args.infer.mla_absorb != "none"
+            ):
+                block_size = 64
+            else:
+                block_size = 256
             return PagedKVCacheManager(
                 layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
@@ -519,7 +531,7 @@ class Backend:
         total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
         if pipeline_parallel_size > 1:
             layer_dist = compute_layer_dist_in_pp(
-                args.models.n_layers, pipeline_parallel_size
+                total_n_layers, pipeline_parallel_size
             )
             pp_rank = get_pp_group().rank_in_group
             local_begin_layer_id = sum(layer_dist[:pp_rank])
@@ -549,7 +561,7 @@ class Backend:
         total_n_layers = args.models.n_layers + (1 if mtp_size > 1 else 0)
         if pipeline_parallel_size > 1:
             layer_dist = compute_layer_dist_in_pp(
-                args.models.n_layers, pipeline_parallel_size
+                total_n_layers, pipeline_parallel_size
             )
             pp_rank = get_pp_group().rank_in_group
             local_begin_layer_id = sum(layer_dist[:pp_rank])
@@ -587,7 +599,10 @@ class Backend:
         # Compute sufficient num_blocks for indexer cache when not provided
         # Ensure enough pages for max_seq_len per hot request to avoid OOB when crossing pages
         num_hot_req = ceil_div(args.infer.max_reqs, args.infer.dp_size)
-        auto_num_blocks = ceil_div(args.infer.max_seq_len, block_size) * num_hot_req
+        mtp_extra = args.infer.mtp_size if args.infer.mtp_size > 1 else 0
+        auto_num_blocks = (
+            ceil_div(args.infer.max_seq_len + mtp_extra, block_size) * num_hot_req
+        )
         num_blocks = (
             args.infer.num_blocks if args.infer.num_blocks != -1 else auto_num_blocks
         )
@@ -1024,7 +1039,8 @@ class Backend:
         return Backend.build_model(
             args.models,
             Backend.cache_managers,
-            max_position_embeddings=args.infer.max_seq_len,
+            max_position_embeddings=args.infer.max_seq_len
+            + (args.infer.mtp_size if args.infer.mtp_size > 1 else 0),
             pipeline_parallel_size=args.infer.pp_size,
             tensor_parallel_size=args.infer.tp_size,
             attn_backend=attn_backend,
@@ -1215,24 +1231,24 @@ class Backend:
             k: str,
             checkpoint_prefix: str,
             model_prefix: str,
-            layer_prefix: str | None,
-            local_layer_prefix: str | None,
         ) -> str:
             if checkpoint_prefix != model_prefix and k.startswith(checkpoint_prefix):
                 k = f"{model_prefix}{k[len(checkpoint_prefix):]}"
-
-            if layer_prefix and local_layer_prefix and k.startswith(layer_prefix):
-                k = f"{local_layer_prefix}{k[len(layer_prefix):]}"
             return k
 
         def _load_and_apply(
             checkpoint_prefix: str,
             model_prefix: str,
-            layer_prefix: str | None = None,
             local_layer_prefix: str | None = None,
         ):
+            """
+            Example layer prefixes:
+            checkpoint_prefix:      model.layer.{global_id}
+            model_prefix:           layer.{global_id}
+            local_layer_prefix:     layer.{local_id}
+            """
             if args.skip_preprocess:
-                checkpoint_prefix = model_prefix
+                checkpoint_prefix = local_layer_prefix or model_prefix
 
             try:
                 state_dict = load_state_dict(
@@ -1247,18 +1263,17 @@ class Backend:
                 ) from e
             assert state_dict, f"No state dict found for prefix {checkpoint_prefix}"
 
-            mapped = {}
-            for k, v in state_dict.items():
-                mapped[
-                    _map_key(
-                        k,
-                        checkpoint_prefix,
-                        model_prefix,
-                        layer_prefix,
-                        local_layer_prefix,
-                    )
-                ] = v
-            state_dict = mapped
+            if not args.skip_preprocess:
+                mapped = {}
+                for k, v in state_dict.items():
+                    mapped[
+                        _map_key(
+                            k,
+                            checkpoint_prefix,
+                            model_prefix,
+                        )
+                    ] = v
+                state_dict = mapped
 
             target_prefix = local_layer_prefix or model_prefix
             try:
@@ -1297,7 +1312,6 @@ class Backend:
             _load_and_apply(
                 checkpoint_prefix,
                 model_prefix,
-                layer_prefix=layer_prefix,
                 local_layer_prefix=local_layer_prefix,
             )
 
@@ -1362,29 +1376,7 @@ class Backend:
         logger.info(
             f"using tool parser {Backend.tool_parser} from config {repr(tool_parser_config)}"
         )
-        try:
-            Backend.tokenizer.model.chat_template = (
-                Backend.tool_parser.patch_chat_template(
-                    Backend.tokenizer.model.chat_template
-                )
-            )
-        except:
-            logger.exception(f"patch chat template failed, tool call may be incorrect!")
-
-        # Initialize tool parser
-        tool_parser_config = getattr(args.models, "tool_parser", "MISSING")
-        Backend.tool_parser = get_tool_parser(tool_parser_config)
-        logger.info(
-            f"using tool parser {Backend.tool_parser} from config {repr(tool_parser_config)}"
-        )
-        try:
-            Backend.tokenizer.model.chat_template = (
-                Backend.tool_parser.patch_chat_template(
-                    Backend.tokenizer.model.chat_template
-                )
-            )
-        except:
-            logger.exception(f"patch chat template failed, tool call may be incorrect!")
+        patch_chat_template(Backend.tool_parser, Backend.tokenizer.model)
 
         attn_backend_type = Backend._get_attention_backend_type(args)
 

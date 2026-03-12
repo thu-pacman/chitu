@@ -192,6 +192,7 @@ Currently supported optional dependencies are:
 - `flash_attn`: Support `infer.attn_type=flash_attn`.
 - `flashinfer`: Support `infer.attn_type=flash_infer`.
 - `flash_mla`: Support `infer.attn_type=flash_mla`.
+- `flash_linear_attention`: Support running Qwen3-Next series models and similar models with `flash_linear_attention`.
 - `deep_gemm`: Support using DeepGEMM for fp8 inference.
 - `deep_ep`: Support using DeepEP for MoE communication (requiring NVSHMEM installed on your system **before** installing chitu. NVSHMEM is included in `requirements-build-deep_ep-cu12.txt`).
 - `cpu`: Support hybrid CPU+GPU inference.
@@ -557,8 +558,11 @@ torchrun --nnodes 1 \
     infer.max_seq_len=4096 \
     request.max_new_tokens=100 \
     infer.use_cuda_graph=True
+```
 
-# Test the service via OpenAI-compatible API (Chat Completions)
+### Test the service via OpenAI-compatible API (Chat Completions)
+
+```bash
 curl localhost:21002/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -575,13 +579,15 @@ curl localhost:21002/v1/chat/completions \
   }'
 ```
 
-# Test the service via Anthropic-compatible API (Messages)
+### Test the service via Anthropic-compatible API (Messages)
+
+```bash
 curl localhost:21002/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: example_key" \
   -d '{
     "model": "DeepSeek-R1",
-    "max_tokens": 128,
+    "max_completion_tokens": 128,
     "messages": [
       {
         "role": "user",
@@ -593,18 +599,18 @@ curl localhost:21002/v1/messages \
 
 Supported optional JSON arguments are:
 
-| Name                   | Type             | Description                                                  |
-| ---------------------- | ---------------- | ------------------------------------------------------------ |
-| `max_tokens`           | `int`            | Stop responding once the number of output tokens reaches this limit. |
-| `temperature`          | `float`          | A sampling argument affecting the diversity of the output.   |
-| `top_p`                | `float`          | A sampling argument affecting the diversity of the output.   |
-| `top_k`                | `int`            | A sampling argument affecting the diversity of the output.   |
-| `frequency_penalty`    | `float`          | A sampling argument affecting the diversity of the output.   |
-| `logprobs`             | `bool`           | If true, also return `log(softmax(logits))` before sampling, useful for precision analysis. |
-| `top_logprobs`         | `int`            | The number of `logprobs` returned.                           |
-| `stream`               | `bool`           | If true, make the HTTP response streaming, which can be used with `requests.post(stream=True)` in Python. |
-| `stop_with_eos`        | `bool`           | If false, keep generating outputs until the number of output tokens reaches `max_tokens`, even if the answer has already ended, useful for a stable speed test. |
-| `chat_template_kwargs` | `dict[str, Any]` | Additional argument for the chat template. The only currently supported argument is: `{"enable_thinking": false}` for disabling thinking mode for GLM-4.5 models. |
+| Name                    | Type             | Description                                                  |
+| ----------------------- | ---------------- | ------------------------------------------------------------ |
+| `max_completion_tokens` | `int`            | Stop responding once the number of output tokens reaches this limit. |
+| `temperature`           | `float`          | A sampling argument affecting the diversity of the output.   |
+| `top_p`                 | `float`          | A sampling argument affecting the diversity of the output.   |
+| `top_k`                 | `int`            | A sampling argument affecting the diversity of the output.   |
+| `frequency_penalty`     | `float`          | A sampling argument affecting the diversity of the output.   |
+| `logprobs`              | `bool`           | If true, also return `log(softmax(logits))` before sampling, useful for precision analysis. |
+| `top_logprobs`          | `int`            | The number of `logprobs` returned.                           |
+| `stream`                | `bool`           | If true, make the HTTP response streaming, which can be used with `requests.post(stream=True)` in Python. |
+| `stop_with_eos`         | `bool`           | If false, keep generating outputs until the number of output tokens reaches `max_completion_tokens`, even if the answer has already ended, useful for a stable speed test. |
+| `chat_template_kwargs`  | `dict[str, Any]` | Additional argument for the chat template. The only currently supported argument is: `{"enable_thinking": false}` for disabling thinking mode for GLM-4.5 models. |
 
 Additional HTTP headers:
 

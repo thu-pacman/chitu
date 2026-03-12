@@ -11,3 +11,6 @@ defaults:
 name: DeepSeek-V3.2
 source: "https://huggingface.co/deepseek-ai/DeepSeek-V3.2" # Just for displaying. No automatic download.
 chatformat_type: dsv32
+tool_parser: DeepSeekV32ToolParser
+skip_special_tokens: False # Whether to skip special tokens when decoding with the tokenizer
+reasoning_without_begin: true

@@ -2,22 +2,70 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .simple_parser import SimpleParser
 from .utils import register
+from .abstract_parser import AbstractToolParser, PatchTemplateToolParserMixin
+
+from .grammar import (
+    JsonArgumentsGrammar,
+    ToolGrammar,
+    TriggeredMultipleToolsGrammar,
+    GrammarImplBase,
+)
+
+from .parse import (
+    TriggeredParser,
+    SequenceParser,
+    JsonArgumentsParser,
+    NameParser,
+    FunctionParser,
+    ContentParser,
+    ToolParserImplBase,
+)
 
 
-@register
-class DeepSeekV3ToolParser(SimpleParser):
-    tool_begin_tag = "<｜tool▁call▁begin｜>"
-    tool_template = "function<｜tool▁sep｜>{name}\n```json\n{arguments}\n```"
-    tool_end_tag = "<｜tool▁call▁end｜>"
-    tools_begin_tag = "<｜tool▁calls▁begin｜>"
-    tools_template = "{tool}\n{tool}"
-    tools_end_tag = "<｜tool▁calls▁end｜>"
+class DeepSeekV3GrammarImpl(GrammarImplBase):
+    tool = ToolGrammar(
+        "<｜tool▁call▁begin｜>function<｜tool▁sep｜>{}\n```json\n{}\n```<｜tool▁call▁end｜>",
+        arguments=JsonArgumentsGrammar(),
+    )
+    tools = TriggeredMultipleToolsGrammar(
+        "<｜tool▁calls▁begin｜>{}\n{}<｜tool▁calls▁end｜>",
+        tool=tool,
+        trigger="<｜tool▁calls▁begin｜>",
+    )
+    root_grammar = tools
 
+
+class DeepSeekV3ParserImpl(ToolParserImplBase):
+    tool = SequenceParser(
+        "function<｜tool▁sep｜>{}\n```json\n{}\n```",
+        parsers=[NameParser(), JsonArgumentsParser()],
+    )
+    tools = TriggeredParser(
+        "<｜tool▁call▁begin｜>{}<｜tool▁call▁end｜>",
+        parser=FunctionParser(parser=tool),
+    )
+    root_parser = TriggeredParser(
+        "<｜tool▁calls▁begin｜>{}<｜tool▁calls▁end｜>",
+        parser=tools,
+        outside_parser=ContentParser(),
+    )
+
+
+class DeepSeekV3ChatTemplate(PatchTemplateToolParserMixin):
     @classmethod
     def patch_chat_template(cls, template: str):
         LOC = r"{{ bos_token }}{{ ns.system_prompt }}"
-        PATCH = r"{% if tools %}{{'\n\n# Tools\n\nYou may call one or more functions to assist with the user query.' }}{% for tool in tools %}{{ '\n' }}{{ tool | tojson }}{% endfor %}{{'\n</tools>\n\n'}}{{'For function call returns, you should first print <｜tool▁calls▁begin｜>'}}{{'For each function call, you should return object like:\n' }}{{'<｜tool▁call▁begin｜>function<｜tool▁sep｜><function_name>\n```json\n<function_arguments_in_json_format>\n```<｜tool▁call▁end｜>'}}{{'At the end of function call returns, you should print <｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}{% endif %}"
+        PATCH = r"{% if tools %}{{'\n\n## Tools\nYou have access to the following tools:\n\n'}}{% for tool in tools %}{{'### '}}{{tool.function.name}}{{'\nDescription: '}}{{tool.function.description}}{{'\n\nParameters: '}}{{tool.function.parameters | tojson}}{{'\n\n'}}{% endfor %}{{'IMPORTANT: ALWAYS adhere to this exact format for tool use:\n<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>tool_call_name\n```json\ntool_call_arguments\n```<｜tool▁call▁end｜>{additional_tool_calls}<｜tool▁calls▁end｜>\n\nWhere:\n- `tool_call_name` must be an exact match to one of the available tools\n- `tool_call_arguments` must be valid JSON that strictly follows the tool\'s Parameters Schema\n- For multiple tool calls, chain them with a newline as separator'}}{% endif %}"
         assert template.count(LOC) == 1
         return template.replace(LOC, LOC + PATCH)
+
+
+@register
+class DeepSeekV3ToolParser(
+    DeepSeekV3GrammarImpl,
+    DeepSeekV3ParserImpl,
+    AbstractToolParser,
+    DeepSeekV3ChatTemplate,
+):
+    pass

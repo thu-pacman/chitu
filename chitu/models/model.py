@@ -149,10 +149,10 @@ class RMSNorm(nn.Module):
 
 
 class RMSNormBias(RMSNorm):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__(dim=dim, eps=eps)
+    def __init__(self, dim: int, eps: float = 1e-6, dtype=None, bias_dtype=None):
+        super().__init__(dim=dim, eps=eps, dtype=dtype)
         self.bias = nn.Parameter(
-            torch.zeros(self.dim, dtype=torch.get_default_dtype()), requires_grad=False
+            torch.zeros(self.dim, dtype=bias_dtype), requires_grad=False
         )
 
     def forward(
@@ -411,7 +411,7 @@ class Transformer(nn.Module):
         self, state_dict: dict[str, Any], prefix: str, skip_preprocess: bool = False
     ) -> nn.Module:
         state_dict = self.preprocess_state_dict_parallel(
-            state_dict, skip_preprocess=skip_preprocess, is_layerwise=True
+            state_dict, skip_preprocess=skip_preprocess
         )
         module_state_dict = {}
         for key, value in state_dict.items():
@@ -889,7 +889,6 @@ class Transformer(nn.Module):
         state_dict: dict[str, Any],
         *,
         skip_preprocess: bool = False,
-        is_layerwise: bool = False,
         replace: bool = True,
     ) -> dict[str, Any]:
         if not skip_preprocess:
@@ -915,7 +914,7 @@ class Transformer(nn.Module):
                     ):
                         state_dict.pop(key, None)
 
-            if self.pipeline_exec and not is_layerwise:
+            if self.pipeline_exec:
                 state_dict = self._chunk_checkpoint_for_pipeline_parallel(
                     state_dict, self.global_n_layers, self.pp_stage, self.pp_size
                 )
@@ -1446,6 +1445,7 @@ class Transformer(nn.Module):
                 ),
                 kwargs_max_nelem={},
                 output_max_nelem_callback=output_max_nelem_callback,
+                before_capture_callback=lambda: self.prepare_decoding_attn(),
                 before_replay_callback=before_replay_callback,
                 enable=current_cuda_graph_enabled,
             )
@@ -1464,6 +1464,7 @@ class Transformer(nn.Module):
                     args_max_nelem=(tokens_max_nelem, *extra_inputs_mtp_max_nelem),
                     kwargs_max_nelem={},
                     output_max_nelem_callback=output_max_nelem_callback,
+                    before_capture_callback=lambda: self.prepare_decoding_attn_mtp(),
                     before_replay_callback=before_replay_callback,
                     enable=current_cuda_graph_enabled,
                 )
@@ -1955,7 +1956,3 @@ def get_linear_layout_contig_y(
         return QuantizationRegistry.get_quantized_linear_class_from_global_args(
             quant_kwargs=quant_kwargs, checkpoint_prefix=checkpoint_prefix
         )
-
-
-def get_rmsnorm(dim: int, *, use_bias: bool, eps: float = 1e-6) -> RMSNorm:
-    return RMSNormBias(dim, eps=eps) if use_bias else RMSNorm(dim, eps=eps)

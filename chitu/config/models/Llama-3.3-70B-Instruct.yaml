@@ -5,8 +5,6 @@
 name: Llama-3.3-70B-Instruct
 type: hf-llama
 source: "https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct" # Just for displaying. No automatic download.
-ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
-tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 tokenizer_type: "hf" # one of: hf, tiktoken
 qkv_has_bias: false
 dim: 8192

@@ -114,6 +114,12 @@ class MetricsMonitor:
                         "chitu_torch_allocated_bytes"
                     )
                 )
+                mtp_proposed_rate = self.manager.query_metric_rate_each_rank(
+                    "chitu_mtp_proposed_tokens_total", time_window=log_interval
+                )
+                mtp_accepted_rate = self.manager.query_metric_rate_each_rank(
+                    "chitu_mtp_accepted_tokens_total", time_window=log_interval
+                )
                 self._print_stats(
                     prompt_tps,
                     gen_tps,
@@ -124,6 +130,8 @@ class MetricsMonitor:
                     total_bytes,
                     used_bytes,
                     torch_allocated_bytes,
+                    mtp_proposed_rate,
+                    mtp_accepted_rate,
                 )
             except Exception as e:
                 logger.error(f"Metrics query failed: {e}")
@@ -139,6 +147,8 @@ class MetricsMonitor:
         total_bytes: dict[tuple[str, str], str],
         used_bytes: dict[tuple[str, str], str],
         torch_allocated_bytes: dict[tuple[str, str], str],
+        mtp_proposed_rate: dict[tuple[str, str], str] = None,
+        mtp_accepted_rate: dict[tuple[str, str], str] = None,
     ):
         all_metric_dict = [
             prompt_tps,
@@ -167,6 +177,13 @@ class MetricsMonitor:
             used_blocks_value = int(used_blocks.get(rank_dp, "-1"))
             total_blocks_value = int(total_blocks.get(rank_dp, "-1"))
 
+            mtp_hit_rate = None
+            if mtp_proposed_rate and mtp_accepted_rate:
+                proposed = float(mtp_proposed_rate.get(rank_dp, "0"))
+                accepted = float(mtp_accepted_rate.get(rank_dp, "0"))
+                if proposed > 0:
+                    mtp_hit_rate = accepted / proposed
+
             log_msg = self._build_stats_message(
                 prompt_tps=float(prompt_tps.get(rank_dp, "-1")),
                 gen_tps=float(gen_tps.get(rank_dp, "-1")),
@@ -180,6 +197,7 @@ class MetricsMonitor:
                 total_bytes=float(total_bytes.get(rank_dp, "-1")),
                 used_bytes=float(used_bytes.get(rank_dp, "-1")),
                 torch_allocated_bytes=float(torch_allocated_bytes.get(rank_dp, "-1")),
+                mtp_hit_rate=mtp_hit_rate,
             )
             logger.info(f"[rank{rank}, DP{dp_id}]: {log_msg}")
 
@@ -197,6 +215,7 @@ class MetricsMonitor:
         total_bytes,
         used_bytes,
         torch_allocated_bytes,
+        mtp_hit_rate=None,
     ):
         """Build metrics statistics message."""
         parts = [
@@ -207,6 +226,8 @@ class MetricsMonitor:
             f"KV cache usage: {kv_cache_usage*100:.1f}%({used_blocks}/{total_blocks})",
             f"Task evictions: {eviction_rate:.2f}/s",
         ]
+        if mtp_hit_rate is not None:
+            parts.append(f"MTP hit rate: {mtp_hit_rate*100:.1f}%")
         prealloc_msg = str(int(prealloc_blocks)) if prealloc_blocks is not None else "-"
         parts.append(f"KV blocks prealloc: {prealloc_msg}")
         if total_bytes > 0 and used_bytes >= 0:

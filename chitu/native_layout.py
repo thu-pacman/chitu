@@ -10,6 +10,7 @@ import plum
 import torch
 
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
+from chitu.utils import get_global_args
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 hygon_mixq_kernels, has_hygon = try_import_platform_dep("sugon_mixQ4_kernels")
@@ -216,7 +217,13 @@ def enable_native_layout_weight(
                 module.__setattr__(f"_{key}_layout_kwargs", other_kwargs)
                 module.__getattr__(key).data = new_tensor.layout_tensor
 
-            self.register_load_state_dict_post_hook(_preprocess_layout)
+            # skip_model_load=True时立刻处理，否则加载后处理
+            if get_global_args().debug.skip_model_load:
+                _preprocess_layout(self, None)
+            else:
+                self.register_load_state_dict_post_hook(_preprocess_layout)
+
+            # register get_native_layout_{key}
             self.__setattr__(f"get_native_layout_{key}", _get_native_layout_tensor)
 
     return EnableNativeLayoutWeightMixIn

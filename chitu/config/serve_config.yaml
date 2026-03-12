@@ -10,11 +10,15 @@ defaults:
     - serve_config_rules
 
   # Include model configs into this file. Please set it to the model you want to run.
-  # In this `Qwen2-7B-Instruct` example, it includes `chitu/config/models/Qwen2-7B-Instruct.yaml`
+  #
+  # Acceptable values: One of the model names listed in `docs/en/SUPPORTED_MODELS.md`,
+  # which is essentially one of the file names without suffix in `chitu/config/models`.
+  #
+  # E.g., `Qwen2-7B-Instruct` means including `chitu/config/models/Qwen2-7B-Instruct.yaml`
   # into this file.
   #
-  # IMPORTANT: Typically, you need to set this field.
-  - models: Qwen2-7B-Instruct
+  # IMPORTANT: You always need to set this field.
+  - models: ???
 
   # Type checks for this config file. Only for chitu developers.
   - serve_config_schema
@@ -28,6 +32,26 @@ defaults:
   # Indicates that values in this file has higher priority than values in other files.
   # Don't touch if you are not sure.
   - _self_
+
+# Configs for the model to inference.
+models:
+  # Path to the model checkpoint directory.
+  #
+  # Acceptable values: /path/to/your/checkpoint
+  #
+  # Note to developers: We use `null` instead of `???` here because we have better error messages
+  # for value missing in `chitu_main.py`, while missing values to a `???` field will always triggers
+  # Hydra's default error message.
+  #
+  # IMPORTANT: You always need to set this field.
+  ckpt_dir: null
+
+  # Path to the tokenizer.
+  #
+  # If null, the tokenizer will be loaded from `ckpt_dir`.
+  #
+  # Acceptable values: null, /path/to/your/tokenizer
+  tokenizer_path: null
 
 # Configs for how chitu responses to HTTP requests.
 serve:
@@ -339,14 +363,40 @@ dp_config:
 
 # Configs how chitu is monitored and logged.
 metrics:
+  prometheus_listening_host: 0.0.0.0 # Access prometheus server at this address
   prometheus_listening_port: 9090 # Access prometheus server at this port
   prometheus_config_file: "prometheus.yml" # prometheus configuration path, which is a yml file
   prometheus_data_dir: "prometheus_data" # prometheus data stoarge path, which is a folder
   prometheus_scrape_interval: 1 # prometheus server scrapes PrometheusMetricsCollectors every ${prometheus_scrape_interval} seconds.
   log_interval: 10
+
+# Debugging options. These options have negative effect on performance and correctness, so please
+# don't set them in production.
 debug:
+  # Skip model loading and run on uninitialized weights. You will NOT get correct output with this
+  # enabled. This is useful for quick debugging.
+  #
+  # Acceptable values:
+  # - False: Normal behavior.
+  # - True: Skip model loading.
   skip_model_load: False
+
+  # Force MoE gate to chose some balanced experts. You will NOT get correct output with this enabled.
+  # This is useful for analyze the performance inpact of MoE load inbalance, by comparing performance
+  # with this option on and off.
+  #
+  # Acceptable values:
+  # - False: Normal behavior.
+  # - True: Force balance.
   force_moe_balance: False
+
+  # Save trace to a directory. The trace can be replayed with `benchmarks/benchmark_serving.py` with
+  # additional `--dataset chitu-trace --dataset-path <path/to/trace>` arguments.
+  #
+  # Acceptable values:
+  # - null: No trace will be saved.
+  # - /path/to/directory: Save trace to this directory.
+  save_trace_dir: null
 
 # The data type for 16-bit floating point data type. This field is orthogonal to quantization.
 #

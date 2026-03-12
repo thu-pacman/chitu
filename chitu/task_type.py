@@ -25,9 +25,3 @@ def is_prefill(task_type) -> bool:
 def is_decode(task_type) -> bool:
     return task_type in DECODE_TYPES
 
-
-class TaskDecodeType(Enum):
-    Waiting = -1
-    Normal = 0
-    Stopped = 1
-    WillStopLength = 10

@@ -5,7 +5,7 @@
 import math
 from collections import OrderedDict
 from logging import getLogger
-from typing import Any
+from typing import Any, Optional, Callable
 from typing_extensions import override
 
 import torch
@@ -20,11 +20,11 @@ from chitu.global_vars import get_global_args
 from chitu.models.model import (
     Attention,
     RMSNorm,
+    RMSNormBias,
     Transformer,
     TransformerBlock,
     get_linear_layout_native_y,
     get_linear_layout_contig_y,
-    get_rmsnorm,
 )
 from chitu.models.registry import ModelType, register_model
 from chitu.ops import apply_rotary_pos_emb, silu_and_mul
@@ -33,7 +33,7 @@ from chitu.quantization import (
     get_quant_from_checkpoint_prefix,
     get_quant_kwargs_from_checkpoint_prefix,
 )
-from chitu.utils import is_layer
+from chitu.utils import is_layer, parse_dtype
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -182,8 +182,24 @@ class AttentionHFLlama(Attention):
         )
 
         if getattr(args, "use_qk_norm", False):
-            self.q_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=args.norm_eps)
+            self.q_norm = RMSNorm(
+                self.head_dim,
+                eps=args.norm_eps,
+                dtype=(
+                    parse_dtype(args.rms_norm_dtype)
+                    if hasattr(args, "rms_norm_dtype")
+                    else None
+                ),
+            )
+            self.k_norm = RMSNorm(
+                self.head_dim,
+                eps=args.norm_eps,
+                dtype=(
+                    parse_dtype(args.rms_norm_dtype)
+                    if hasattr(args, "rms_norm_dtype")
+                    else None
+                ),
+            )
 
         if self.cache.quant_type.needs_kv_scales:
             self.k_scale = torch.nn.Parameter(
@@ -222,9 +238,7 @@ class AttentionHFLlama(Attention):
         return self.o_proj(x)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: BatchedFreqsCis,
+        self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
     ):
         # 因为量化后x是个tuple，所以取shape的时候放linear后面
         xq, xk, xv = self._run_linear(x)
@@ -255,12 +269,16 @@ class AttentionHFLlama(Attention):
         else:
             descales = {}
 
+        if is_mtp:
+            seq_len_delta = self.cache.mtp_seq_len_delta
+        else:
+            seq_len_delta = self.cache.seq_len_delta
         output = self.attn_backend(
             xq,
-            self.cache.get_accessor(self.layer_id),
+            self.cache.get_accessor(self.layer_id, is_mtp),
             xk,
             xv,
-            seq_len_delta=self.cache.seq_len_delta,
+            seq_len_delta=seq_len_delta,
             causal=True,
             **descales,
         ).view(bs_seq, -1)
@@ -391,19 +409,37 @@ class TransformerBlockHFLlama(TransformerBlock):
             layer_id=layer_id,
         )
 
-        self.input_layernorm = get_rmsnorm(
-            args.dim,
-            use_bias=get_quant_kwargs_from_checkpoint_prefix(
+        input_layernorm_module_type = (
+            RMSNormBias
+            if get_quant_kwargs_from_checkpoint_prefix(
                 checkpoint_prefix + ".input_layernorm", args.quant_config.rules
-            ).get("bias"),
-            eps=args.norm_eps,
+            ).get("bias")
+            else RMSNorm
         )
-        self.post_attention_layernorm = get_rmsnorm(
+        self.input_layernorm = input_layernorm_module_type(
             args.dim,
-            use_bias=get_quant_kwargs_from_checkpoint_prefix(
-                checkpoint_prefix + ".post_attention_layernorm", args.quant_config.rules
-            ).get("bias"),
             eps=args.norm_eps,
+            dtype=(
+                parse_dtype(args.rms_norm_dtype)
+                if hasattr(args, "rms_norm_dtype")
+                else None
+            ),
+        )
+        post_attention_layernorm_module_type = (
+            RMSNormBias
+            if get_quant_kwargs_from_checkpoint_prefix(
+                checkpoint_prefix + ".post_attention_layernorm", args.quant_config.rules
+            ).get("bias")
+            else RMSNorm
+        )
+        self.post_attention_layernorm = post_attention_layernorm_module_type(
+            args.dim,
+            eps=args.norm_eps,
+            dtype=(
+                parse_dtype(args.rms_norm_dtype)
+                if hasattr(args, "rms_norm_dtype")
+                else None
+            ),
         )
 
     def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
@@ -426,12 +462,23 @@ class TransformerHFLlama(Transformer):
         attn_backend: AttnBackend,
         op_impl: str,
         rotary_type: str = "separated",
-        layer_type: type = TransformerBlockHFLlama,
+        layer_type: Optional[type] = None,
+        layer_type_callback: Optional[Callable[[int], type]] = None,
         **kvargs,
     ):
         self.rotary_emb: Any = None
         self.rotary_type = rotary_type
-        self.layer_type = layer_type
+
+        if layer_type is None and layer_type_callback is None:
+            layer_type = TransformerBlockHFLlama
+        if layer_type is not None and layer_type_callback is not None:
+            raise ValueError(
+                "Only one of layer_type or layer_type_callback can be provided."
+            )
+        if layer_type is not None:
+            layer_type_callback = lambda _: layer_type
+        self.layer_type_callback = layer_type_callback
+
         super().__init__(
             params,
             cache_managers,
@@ -596,7 +643,6 @@ class TransformerHFLlama(Transformer):
         state_dict: dict[str, Any],
         *,
         skip_preprocess: bool = False,
-        is_layerwise: bool = False,
         replace: bool = True,
     ) -> dict[str, Any]:
         if not skip_preprocess:
@@ -612,7 +658,6 @@ class TransformerHFLlama(Transformer):
         return super().preprocess_state_dict_parallel(
             state_dict,
             skip_preprocess=skip_preprocess,
-            is_layerwise=is_layerwise,
             replace=replace,
         )
 
@@ -627,7 +672,7 @@ class TransformerHFLlama(Transformer):
         self.layers = torch.nn.ModuleList()
         for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
             self.layers.append(
-                self.layer_type(
+                self.layer_type_callback(layer_id)(
                     layer_id,
                     self.params,
                     cache_managers,
@@ -639,12 +684,21 @@ class TransformerHFLlama(Transformer):
             )
 
     def _init_post_layers(self):
-        self.norm = get_rmsnorm(
-            self.params.dim,
-            use_bias=get_quant_kwargs_from_checkpoint_prefix(
+        norm_module_type = (
+            RMSNormBias
+            if get_quant_kwargs_from_checkpoint_prefix(
                 "lm_head.norm", self.params.quant_config.rules
-            ).get("bias"),
+            ).get("bias")
+            else RMSNorm
+        )
+        self.norm = norm_module_type(
+            self.params.dim,
             eps=self.params.norm_eps,
+            dtype=(
+                parse_dtype(self.params.rms_norm_dtype)
+                if hasattr(self.params, "rms_norm_dtype")
+                else None
+            ),
         )
         if not getattr(self.params, "tie_word_embeddings", False):
             self.lm_head = ColumnParallelLinear(
@@ -704,6 +758,21 @@ class TransformerHFLlama(Transformer):
                 self.cache_managers[
                     "main"
                 ].seq_len_delta.delta_position_ids_tensor_device
+            ],
+        )
+
+    @override
+    def prepare_freqs_cis_mtp(self) -> BatchedFreqsCis:
+        return BatchedFreqsCis(
+            self.rotary_emb.cos_cached[
+                self.cache_managers[
+                    "main"
+                ].mtp_seq_len_delta.delta_position_ids_tensor_device
+            ],
+            self.rotary_emb.sin_cached[
+                self.cache_managers[
+                    "main"
+                ].mtp_seq_len_delta.delta_position_ids_tensor_device
             ],
         )
 

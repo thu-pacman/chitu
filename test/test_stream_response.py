@@ -7,10 +7,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 if len(sys.argv) == 4:
     url = sys.argv[1]
     req_nums = int(sys.argv[2])
-    max_tokens = int(sys.argv[3])
+    max_completion_tokens = int(sys.argv[3])
 else:
     print(
-        f"Usage: {sys.argv[0]} <url> <req_nums> <max_tokens>. \n"
+        f"Usage: {sys.argv[0]} <url> <req_nums> <max_completion_tokens>. \n"
         f"Example: python3 {sys.argv[0]} http://localhost:25123/v1/chat/completions 1 256"
     )
     sys.exit(1)
@@ -32,7 +32,7 @@ indices_received = []
 def send_request(index: int):
     body = {
         "messages": msgs[index],
-        "max_tokens": max_tokens,
+        "max_completion_tokens": max_completion_tokens,
         "stream": True,
         "min_batch_size": req_nums,
     }
@@ -50,24 +50,20 @@ def send_request(index: int):
                 if chunk == b"[DONE]":
                     continue
                 data = json.loads(chunk)
-                delta = data["choices"][0]["delta"]
-                if delta.get("content", None):
-                    tokens += 1
-                    generated_text += delta["content"]
-                if delta.get("reasoning_content", None):
-                    tokens += 1
-                    generated_text += delta["reasoning_content"]
+                if len(choices := data["choices"]) > 0:
+                    delta = choices[0]["delta"]
+                    if delta.get("content", None):
+                        tokens += 1
+                        generated_text += delta["content"]
+                    if delta.get("reasoning_content", None):
+                        tokens += 1
+                        generated_text += delta["reasoning_content"]
 
                 with lock:
                     indices_received.append(index)
                 print(f"Response received from request {index}", flush=True)
 
-            return (
-                index,
-                generated_text,
-                reasoning_text,
-                tokens,
-            )
+            return index, generated_text, reasoning_text, tokens
         else:
             print(f"Request failed with status code: {response.status_code}")
 

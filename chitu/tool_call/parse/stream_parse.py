@@ -3,11 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-import re, json
-from typing import AsyncIterator, AsyncIterable, Callable, Any
-from .types import ChoiceDelta, ChoiceDeltaToolCall, ChoiceDeltaToolCallFunction
+import re
+from typing import AsyncIterator
 from collections import deque
-import uuid
+from functools import lru_cache
 
 
 class StreamOperatorMixin:
@@ -71,76 +70,6 @@ class BufferedStream(StreamOperatorMixin):
         return await self.fetch()
 
 
-class DeltaFactory:
-    """helper class to generate ChoiceDelta from str streams"""
-
-    def __init__(
-        self, arg_value_converter: Callable[[str, str, str], Any] | None = None
-    ):
-        self.index = -1
-        self.arg_value_converter = arg_value_converter
-
-    def begin_function(self):
-        self.index += 1
-        self.name = ""
-        self.arguments = ""
-        self.id = str(uuid.uuid4())
-
-    async def end_function_stream(self):
-        arguments = self.arguments.strip()
-        if not arguments:
-            yield self.arguments_chunk("{}")
-        elif not arguments.endswith("}"):
-            yield self.arguments_chunk("}")
-
-    def content_chunk(self, chunk: str):
-        return ChoiceDelta(content=chunk)
-
-    async def content_stream(self, stream: AsyncIterable[str]):
-        async for chunk in stream:
-            yield self.content_chunk(chunk)
-
-    def name_chunk(self, chunk: str):
-        function = ChoiceDeltaToolCallFunction(name=chunk)
-        tool = ChoiceDeltaToolCall(index=self.index, id=self.id, function=function)
-        self.id = None
-        self.name += chunk
-        return ChoiceDelta(tool_calls=[tool])
-
-    async def name_stream(self, stream: AsyncIterable[str]):
-        async for chunk in stream:
-            yield self.name_chunk(chunk)
-
-    def arguments_chunk(self, chunk: str):
-        self.arguments += chunk
-        function = ChoiceDeltaToolCallFunction(arguments=chunk)
-        tool = ChoiceDeltaToolCall(index=self.index, function=function)
-        return ChoiceDelta(tool_calls=[tool])
-
-    async def arguments_stream(self, stream: AsyncIterable[str]):
-        async for chunk in stream:
-            yield self.arguments_chunk(chunk)
-
-    def arg_key_chunk(self, chunk: str):
-        chunk_prefix = ""
-        if not self.arg_key:
-            chunk_prefix = ', "' if self.arguments else '{"'
-        self.arg_key += chunk
-        return self.arguments_chunk(chunk_prefix + chunk)
-
-    async def arg_key_stream(self, stream: AsyncIterable[str]):
-        self.arg_key = ""
-        async for chunk in stream:
-            yield self.arg_key_chunk(chunk)
-
-    async def arg_value_stream(self, stream: AsyncIterable[str]):
-        arg_value = ""
-        async for chunk in stream:
-            arg_value += chunk
-        converted = self.arg_value_converter(self.name, self.arg_key, arg_value)
-        yield self.arguments_chunk('": ' + json.dumps(converted))
-
-
 class TakeUntilStream(BufferedStream):
     def __init__(self, stream: BufferedStream, end: str, consume_end: bool = True):
         super().__init__(stream)
@@ -149,6 +78,7 @@ class TakeUntilStream(BufferedStream):
         self.consume_end = consume_end
         self.pending = ""
         self.stopped = False
+        self.found = False
 
     async def fetch(self) -> str:
         while not self.stopped:
@@ -159,6 +89,7 @@ class TakeUntilStream(BufferedStream):
                 return matched_chunk
             if matched_end:
                 self.stopped = True
+                self.found = True
                 if self.consume_end:
                     self.pending = self.pending[len(matched_end) :]
                 self.stream.put_back(self.pending)
@@ -185,13 +116,8 @@ class TakeBetweenStream(TakeUntilStream):
         return await super().fetch()
 
 
-_re_cache: dict[str, re.Pattern] = {}
-
-
+@lru_cache(maxsize=65536)
 def get_pattern_match_end(end: str):
-    global _re_cache
-    if end in _re_cache:
-        return _re_cache[end]
     assert end
     prefixs: set[str] = set()
     for i in range(1, len(end)):
@@ -199,5 +125,5 @@ def get_pattern_match_end(end: str):
     r_prefixs = "|".join(sorted(prefixs))
     r_key = re.escape(end)
     regex = rf"^(.*?)(?:{r_prefixs}|({r_key}).*)?$"
-    pattern = _re_cache[end] = re.compile(regex, re.DOTALL)
+    pattern = re.compile(regex, re.DOTALL)
     return pattern

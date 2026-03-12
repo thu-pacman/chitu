@@ -6,17 +6,12 @@ from xgrammar import Grammar
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterable
 
-from .types import ToolCallParams, ChoiceToolCall, ChoiceDelta
+from .type_def import ToolCallParams, ChoiceToolCall, ChoiceDelta
 
 
 class AbstractToolParser(ABC):
     @abstractmethod
     def __init__(self, tools):
-        raise NotImplementedError
-
-    @classmethod
-    @abstractmethod
-    def patch_chat_template(cls, template: str) -> str:
         raise NotImplementedError
 
     @classmethod
@@ -35,4 +30,15 @@ class AbstractToolParser(ABC):
     def parse_stream(
         self, stream: AsyncIterable[str]
     ) -> AsyncIterable[ChoiceDelta | AsyncIterable[ChoiceDelta]]:
+        raise NotImplementedError
+
+
+class JsonMessageToolParserMixin(ABC):
+    pass
+
+
+class PatchTemplateToolParserMixin(ABC):
+    @classmethod
+    @abstractmethod
+    def patch_chat_template(cls, template: str) -> str:
         raise NotImplementedError

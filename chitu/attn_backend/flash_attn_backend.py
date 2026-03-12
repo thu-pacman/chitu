@@ -21,6 +21,7 @@ flash_attn3, has_flash_attn3 = try_import_opt_dep(
 class FlashAttnBackend(AttnBackend):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
+
         self._fa = None
         self._use_fa3 = False
         if has_flash_attn3:
@@ -28,6 +29,17 @@ class FlashAttnBackend(AttnBackend):
             self._use_fa3 = True
         elif has_flash_attn:
             self._fa = flash_attn
+        else:
+            raise ImportError(
+                "Either flash_attn or flash_attn_interface is required. Please refer "
+                "to README.md for installing optional dependencies"
+            )
+
+        self.mtp_size = getattr(self.args.infer, "mtp_size", 1)
+
+    @override
+    def decode_op_supports_mtp(self) -> bool:
+        return True
 
     @override
     def prefill_ragged_qkvo(
@@ -117,18 +129,22 @@ class FlashAttnBackend(AttnBackend):
             extra_kvargs["k_descale"] = k_descale
             extra_kvargs["v_descale"] = v_descale
 
-        return self._fa.flash_attn_with_kvcache(
-            q.unsqueeze(1),
+        bsz = seq_len_delta.batch_size
+        s_q = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
+        output = self._fa.flash_attn_with_kvcache(
+            q.view(bsz, s_q, q.shape[-2], q.shape[-1]),
             kv_cache.k,
             kv_cache.v,
-            k=k.unsqueeze(1) if k is not None else None,
-            v=v.unsqueeze(1) if v is not None else None,
+            k=k.view(bsz, s_q, k.shape[-2], k.shape[-1]) if k is not None else None,
+            v=v.view(bsz, s_q, v.shape[-2], v.shape[-1]) if v is not None else None,
             cache_seqlens=seq_len_delta.old.lens_tensor_device,
-            causal=True,
+            causal=s_q > 1,
             window_size=window_size,
             softmax_scale=softmax_scale,
             **extra_kvargs,
-        ).squeeze(1)
+        )
+        output = output.view(bsz * s_q, output.shape[-2], output.shape[-1])
+        return output
 
     @override
     def decode_paged_kv(
@@ -162,14 +178,16 @@ class FlashAttnBackend(AttnBackend):
         if softcap != 0.0:
             extra_kvargs["softcap"] = softcap
 
+        bsz = seq_len_delta.batch_size
+        s_q = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
         kwargs = dict(
-            q=q.unsqueeze(1),
+            q=q.view(bsz, s_q, q.shape[-2], q.shape[-1]),
             k_cache=kv_cache.k,
             v_cache=kv_cache.v,
-            k=k.unsqueeze(1) if k is not None else None,
-            v=v.unsqueeze(1) if v is not None else None,
+            k=k.view(bsz, s_q, k.shape[-2], k.shape[-1]) if k is not None else None,
+            v=v.view(bsz, s_q, v.shape[-2], v.shape[-1]) if v is not None else None,
             cache_seqlens=seq_len_delta.old.lens_tensor_device,
-            causal=True,
+            causal=s_q > 1,
             window_size=window_size,
             softmax_scale=softmax_scale,
             **extra_kvargs,
@@ -182,4 +200,6 @@ class FlashAttnBackend(AttnBackend):
         else:
             kwargs["block_table"] = kv_cache.block_table
 
-        return self._fa.flash_attn_with_kvcache(**kwargs).squeeze(1)
+        output = self._fa.flash_attn_with_kvcache(**kwargs)
+        output = output.view(bsz * s_q, output.shape[-2], output.shape[-1])
+        return output

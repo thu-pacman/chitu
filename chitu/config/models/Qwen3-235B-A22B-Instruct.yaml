@@ -2,11 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# Qwen3-235B-A22B-mxfp4 is a quantization of Qwen3-235B-A22B
+# Qwen3-235B-A22B-Instruct is a tool parser variant of Qwen3-235B-A22B
 defaults:
   - Qwen3-235B-A22B
   - _self_ # Config in this file overrides configs in defaults
 
 # Access info
 name: Qwen3-235B-A22B-Instruct
+source: https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507
 tool_parser: Qwen3InstructToolParser

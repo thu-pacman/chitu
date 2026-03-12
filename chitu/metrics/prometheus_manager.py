@@ -10,9 +10,10 @@ import requests
 import atexit
 from typing import Optional
 import threading
-from chitu.global_vars import get_global_args
-from chitu.utils import is_port_available, get_free_port
 import logging
+
+from chitu.global_vars import get_global_args
+from chitu.distributed.tcp_ip import is_port_available, get_free_port
 
 
 logger = logging.getLogger(__name__)
@@ -38,12 +39,14 @@ class PrometheusServerManager:
             with cls._lock:
                 if cls._instance is None:
                     metrics_args = get_global_args().metrics
+                    server_addr: str = metrics_args.prometheus_listening_host
                     server_port: int = metrics_args.prometheus_listening_port
                     config_file: str = metrics_args.prometheus_config_file
                     data_dir: str = metrics_args.prometheus_data_dir
                     scrape_interval: int = metrics_args.prometheus_scrape_interval
                     cls._instance = cls(
                         collector_addrs,
+                        server_addr,
                         server_port,
                         config_file,
                         data_dir,
@@ -54,9 +57,10 @@ class PrometheusServerManager:
     def __init__(
         self,
         collector_addrs,
-        server_port,
-        config_file,
-        data_dir,
+        server_addr: str,
+        server_port: int,
+        config_file: str,
+        data_dir: str,
         scrape_interval: int,
     ):
         """
@@ -67,11 +71,16 @@ class PrometheusServerManager:
             data_dir: Prometheus data stoarge path
         """
         self.collector_addrs = collector_addrs
+        self.server_addr = server_addr
         self.server_port = server_port
-        self.config_file = config_file
-        self.data_dir = data_dir
+        # Use PID to isolate config/data per instance, avoiding TSDB lock
+        # conflicts when multiple instances run on the same machine.
+        pid = os.getpid()
+        base, ext = os.path.splitext(config_file)
+        self.config_file = f"{base}_{pid}{ext}"
+        self.data_dir = f"{data_dir}_{pid}"
         self.process = None
-        self.server_url = f"http://localhost:{server_port}"
+        self.server_url = f"http://{server_addr}:{server_port}"
         self.query_url = f"{self.server_url}/api/v1/query"
         self.create_config(collector_addrs, scrape_interval)
         self.start()
@@ -109,7 +118,7 @@ class PrometheusServerManager:
             f"Prometheus configuration file has been created: {self.config_file}"
         )
 
-    def start(self, timeout=10):
+    def start(self, timeout=60):
         """
         Start Prometheus Server
         Args:
@@ -128,9 +137,18 @@ class PrometheusServerManager:
                 f"Port[{self.server_port}] has been allocated, change Prometheus server port to {port}"
             )
             self.server_port = port
+            self.server_url = f"http://{self.server_addr}:{self.server_port}"
+            self.query_url = f"{self.server_url}/api/v1/query"
 
-        # 创建数据目录
+        # 创建数据目录，清理可能的残留锁文件
         os.makedirs(self.data_dir, exist_ok=True)
+        lock_file = os.path.join(self.data_dir, "lock")
+        if os.path.exists(lock_file):
+            try:
+                os.remove(lock_file)
+                logger.info(f"Removed stale TSDB lock file: {lock_file}")
+            except OSError as e:
+                logger.warning(f"Failed to remove stale TSDB lock file: {e}")
 
         # 启动Prometheus server
         cmd = [
@@ -162,15 +180,17 @@ class PrometheusServerManager:
                         f"Prometheus Server is running: port: {self.server_port}, config: {self.config_file}, data: {self.data_dir}, URL: {self.server_url}, PID: {self.process.pid}"
                     )
                     return True
-            except Exception as e:
+            except requests.exceptions.RequestException:
                 pass
 
-            # 检查进程是否异常
+            # 检查进程是否异常退出，立即终止等待
             if self.process and self.process.poll() is not None:
                 stderr = self.process.stderr.read() if self.process.stderr else ""
                 logger.error(
-                    f"Prometheus server process exited unexpectedly:\n{stderr}"
+                    f"Prometheus server process exited unexpectedly (exit_code={self.process.returncode}):\n{stderr}"
                 )
+                self.process = None
+                return False
             time.sleep(0.5)
 
         logger.error(f"Start Prometheus server timeout")
@@ -272,10 +292,10 @@ class PrometheusServerManager:
             return []
 
     def stop(self):
-        """Stop Prometheus Server"""
+        """Stop Prometheus Server and clean up per-instance files."""
         if self.process:
             logger.info(
-                f"Stoping Prometheus server process(PID: {self.process.pid})..."
+                f"Stopping Prometheus server process (PID: {self.process.pid})..."
             )
             try:
                 self.process.terminate()
@@ -285,11 +305,30 @@ class PrometheusServerManager:
                 except subprocess.TimeoutExpired:
                     self.process.kill()
                     self.process.wait()
-                    logger.info("Prometheus server has stopped")
+                    logger.info("Prometheus server has been killed")
             except Exception as e:
                 logger.error(f"Exception during stopping Prometheus server: {e}")
             finally:
                 self.process = None
+
+        # Clean up per-instance config file and data directory
+        self._cleanup_files()
+
+    def _cleanup_files(self):
+        """Remove per-instance config file and data directory."""
+        import shutil
+
+        if self.config_file and os.path.exists(self.config_file):
+            try:
+                os.remove(self.config_file)
+            except OSError as e:
+                logger.warning(f"Failed to remove config file {self.config_file}: {e}")
+
+        if self.data_dir and os.path.exists(self.data_dir):
+            try:
+                shutil.rmtree(self.data_dir)
+            except OSError as e:
+                logger.warning(f"Failed to remove data dir {self.data_dir}: {e}")
 
     @classmethod
     def cleanup(cls):

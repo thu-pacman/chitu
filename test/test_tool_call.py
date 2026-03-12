@@ -15,6 +15,7 @@ logger_engine = logging.getLogger("engine")
 sys.stdout.reconfigure(line_buffering=True)
 
 
+HOST = "localhost"
 API_KEY = "example_key"
 MAX_CONCURRENT = 64
 MAX_RETRY = 1
@@ -23,6 +24,7 @@ CHOICE_FUNC = {"type": "function", "function": {"name": CHOICE_FUNC_NAME}}
 LAUNCH_TIMEOUT = 300
 REQ_TIMEOUT = 300
 MAX_TOKENS = 1024
+ENABLE_THINKING = True
 
 # nums: describe number of tools called in each round. list of set of int, list represents chat rounds, set represents called tools
 CASES_BASE = [
@@ -214,7 +216,9 @@ async def _round_openai(
     kwargs: dict,
 ):
     response: ChatCompletion | AsyncStream[ChatCompletionChunk] = (
-        await openai_client.chat.completions.create(messages=messages, **kwargs)
+        await openai_client.chat.completions.create(
+            messages=messages, extra_body={"enable_thinking": ENABLE_THINKING}, **kwargs
+        )
     )
     if kwargs["stream"]:
         msg = await stream_gather(response)
@@ -248,6 +252,7 @@ async def _round_anthropic(
         raise RuntimeError("anthropic stream not supported in this test")
     kwargs["tool_choice"] = _tool_choice_to_anthropic(kwargs["tool_choice"])
     kwargs.pop("parallel_tool_calls")
+    kwargs["thinking"] = {"type": "enabled" if ENABLE_THINKING else "disabled"}
     msg = await anthropic_client.messages.create(messages=messages, **kwargs)
     content_blocks = getattr(msg, "content", None)
     content_parts: list[str] = []
@@ -304,6 +309,12 @@ async def test(
                     max_tokens=MAX_TOKENS,
                     temperature=0,
                 )
+                kwargs0 = dict(
+                    prompt=prompt,
+                    choice=kwargs["tool_choice"],
+                    parallel=kwargs["parallel_tool_calls"],
+                    stream=kwargs["stream"],
+                )
                 if tools is None:
                     kwargs.pop("tools")
 
@@ -321,6 +332,7 @@ async def test(
                     f"\n\tcontent={repr(content)}"
                     f"\n\trcontent={repr(rcontent)}"
                     f"\n\ttool_calls={tool_calls}"
+                    f"\n\tkwargs0={kwargs0}"
                 )
 
                 real_nums.append(len(tool_calls))
@@ -343,7 +355,7 @@ async def test(
                 f"case {idx} failed: nums mismatch "
                 f"real_nums={real_nums} expected={nums}"
             )
-        except:
+        except Exception:
             logger.exception(f"case {idx} failed {retry=}")
             tested_nums.append(None)
     else:
@@ -359,11 +371,11 @@ async def init_client_and_model():
     port = get_port()
     global openai_client, anthropic_client, model
     openai_client = AsyncOpenAI(
-        base_url=f"http://localhost:{port}/v1", api_key=API_KEY, timeout=REQ_TIMEOUT
+        base_url=f"http://{HOST}:{port}/v1", api_key=API_KEY, timeout=REQ_TIMEOUT
     )
     model = (await openai_client.models.list()).data[0].id
     anthropic_client = AsyncAnthropic(
-        base_url=f"http://localhost:{port}",
+        base_url=f"http://{HOST}:{port}",
         api_key=API_KEY,
         timeout=REQ_TIMEOUT,
     )

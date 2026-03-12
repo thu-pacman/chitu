@@ -16,6 +16,7 @@ import queue
 import zmq, os
 from chitu.backend import Backend
 from chitu.global_vars import get_global_args
+from chitu.metrics.prometheus_collector import inc_completed_requests, observe_ttft
 from chitu.task import Task
 
 logger = logging.getLogger(__name__)
@@ -181,7 +182,11 @@ class DPTokenSender:
         # If first token and task provided, include prompt_len info
         if is_first_token and task is not None and task.req is not None:
             data["prompt_len"] = task.req.prompt_len
-            logger.info(
+            # Record TTFT metric
+            _created_ts = getattr(task, "_pd_created_ts", None)
+            if _created_ts is not None:
+                observe_ttft(time.time() - _created_ts)
+            logger.debug(
                 f"DP Token Sender: [request {request_id}] first token, prompt_len={task.req.prompt_len}, token={token}"
             )
 
@@ -256,9 +261,9 @@ class DPTaskWrapper:
         self.token_sender = token_sender
         self._finish_sent = False
 
-        # Hook update_response_no_sync for token sending
-        self._original_update_response_sync = original_task.update_response_no_sync
-        original_task.update_response_no_sync = self._dp_update_response_sync
+        # Hook update_response_sync for token sending
+        self._original_update_response_sync = original_task.update_response_sync
+        original_task.update_response_sync = self._dp_update_response_sync
 
         # Hook update_decode_status for finish detection
         self._original_update_decode_status = original_task.update_decode_status
@@ -281,7 +286,9 @@ class DPTaskWrapper:
             self.token_sender.send_finish(request_id, finish_reason)
             self._finish_sent = True
             self.original_task.pd_exec_end_logged = True
-            logger.info(
+            # Record completed request metric
+            inc_completed_requests("decode")
+            logger.debug(
                 f"[PD_STAGE][decode.exec.end] req_id={request_id} finish_reason={finish_reason}"
             )
             logger.debug(f"[DPTaskWrapper] Finish signal sent: {request_id}")

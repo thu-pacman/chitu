@@ -43,8 +43,8 @@ from chitu.task import (
     TaskType,
     UserRequest,
     MockFixedLengthedUserRequest,
+    TaskCollector,
     DPTaskCollector,
-    PPTaskCollector,
 )
 from chitu.task_type import PREFILL_TYPES, DECODE_TYPES, is_decode
 from chitu.utils import (
@@ -174,6 +174,31 @@ def _auto_set_num_blocks_after_warmup(args):
         get_global_args().infer.num_blocks = new_num_block
         if new_num_block > 0:
             Backend.cache_managers["main"].realloc(new_num_block)
+
+        # Realloc indexer cache manager if present
+        indexer_cm = Backend.cache_managers.get("indexer")
+        if (
+            indexer_cm is not None
+            and isinstance(indexer_cm, PagedKVCacheManager)
+            and hasattr(indexer_cm, "realloc")
+        ):
+            # Scale indexer blocks proportionally to main cache
+            indexer_additional = get_additional_block_num(
+                indexer_cm, args.infer.memory_utilization
+            )
+            new_indexer_blocks = indexer_cm.num_blocks + indexer_additional
+            if torch.distributed.get_world_size() > 1:
+                indexer_tensor = torch.tensor(new_indexer_blocks).cuda()
+                torch.distributed.all_reduce(
+                    indexer_tensor, torch.distributed.ReduceOp.RedOpType.MIN
+                )
+                new_indexer_blocks = indexer_tensor.item()
+            if new_indexer_blocks > 0:
+                indexer_cm.realloc(new_indexer_blocks)
+                logger.info(
+                    f"indexer cache manager reallocated to {new_indexer_blocks} blocks after warmup"
+                )
+
         if torch.distributed.get_rank() == 0:
             for scheduler in Backend.schedulers:
                 scheduler.reset_kvcache_block_threshold()
@@ -196,11 +221,14 @@ def _warmup_via_taskpool(args):
     init_cache_static()
     num_warmup_reqs = args.infer.max_reqs
     prefill_chunk_size = args.infer.prefill_chunk_size
+    _mtp_size = get_global_args().infer.mtp_size
+    _n_decode_steps = 2 if get_global_args().infer.schedule_overlap else 1
+    _warmup_max_new_tokens = (1 + _n_decode_steps) * _mtp_size
     if prefill_chunk_size is not None:
         warmup_seq_len = max(
             min(
                 prefill_chunk_size // num_warmup_reqs,
-                args.infer.max_seq_len - 1,
+                args.infer.max_seq_len - _warmup_max_new_tokens,
             ),
             1,
         )
@@ -216,7 +244,7 @@ def _warmup_via_taskpool(args):
             req = MockFixedLengthedUserRequest(
                 warmup_seq_len,
                 f"{gen_req_id()}",
-                max_new_tokens=1 + get_global_args().infer.mtp_size,
+                max_new_tokens=_warmup_max_new_tokens,
                 temperature=0.7,
                 top_k=1,
             )
@@ -255,7 +283,7 @@ def _warmup_via_taskpool(args):
         num_required_prefill_schedules = ceil_div(max_tokens_per_rank, per_rank_budget)
     else:
         num_required_prefill_schedules = ceil_div(total_tokens, prefill_chunk_size)
-    num_required_decode_schedules = 2 if get_global_args().infer.schedule_overlap else 1
+    num_required_decode_schedules = _n_decode_steps * _mtp_size
 
     logger.info(
         f"Warmup: total_tokens={total_tokens}, chunk_size={prefill_chunk_size}, "
@@ -273,9 +301,6 @@ def _warmup_via_taskpool(args):
                 1
                 for task in TaskPool.pool.values()
                 if task.task_type in PREFILL_TYPES
-            )
-            logger.debug(
-                f"Warmup prefill iteration {prefill_iter}: remaining={prefill_remaining}"
             )
             if prefill_remaining == 0:
                 break
@@ -328,6 +353,7 @@ def _warmup_backend_direct(
     bs_descend=0,
     *,
     skip_model_prefill: bool = False,
+    skip_model_decode: bool = False,
 ):
     logger.info(
         f"Starting local backend warmup (direct) with local max batch size {local_max_bs}..."
@@ -371,37 +397,41 @@ def _warmup_backend_direct(
     for mgr in Backend.cache_managers.values():
         mgr.finalize_cache_all_prefill()
     # Decode steps
-    for i in tqdm(
-        range(max(1, decode_steps)), desc="finished warmup decode iterations"
-    ):
-        curr_bs = local_max_bs - i * bs_descend
-        curr_req_ids = req_ids[:curr_bs]
-        for mgr in Backend.cache_managers.values():
-            mgr.prepare_cache_decode(curr_req_ids)
-        PrometheusMetricsCollector.update_kvcache_usage()
+    if not skip_model_decode:
+        for i in tqdm(
+            range(max(1, decode_steps)), desc="finished warmup decode iterations"
+        ):
+            curr_bs = local_max_bs - i * bs_descend
+            curr_req_ids = req_ids[:curr_bs]
+            for mgr in Backend.cache_managers.values():
+                mgr.prepare_cache_decode(curr_req_ids)
+            PrometheusMetricsCollector.update_kvcache_usage()
 
-        # direct warmup 绕过了 executor，因此必须在这里显式设置
-        if hasattr(Backend.model, "moe_impl") and Backend.model.moe_impl is not None:
-            Backend.model.moe_impl.prepare(TaskType.Decode, curr_bs)
+            # direct warmup 绕过了 executor，因此必须在这里显式设置
+            if (
+                hasattr(Backend.model, "moe_impl")
+                and Backend.model.moe_impl is not None
+            ):
+                Backend.model.moe_impl.prepare(TaskType.Decode, curr_bs)
 
-        if is_pp_first_rank:
-            step_token = torch.randint(
-                1,
-                args.models.vocab_size,
-                size=(curr_bs,),
-                device="cuda",
-                dtype=torch.int64,
-            )
-        else:
-            step_token = torch.randn(
-                curr_bs,
-                args.models.dim,
-                device="cuda",
-                dtype=torch.get_default_dtype(),
-            )
-        _ = Backend.model.decode(step_token, curr_bs)
-        for mgr in Backend.cache_managers.values():
-            mgr.finalize_cache_single_decode(curr_req_ids)
+            if is_pp_first_rank:
+                step_token = torch.randint(
+                    1,
+                    args.models.vocab_size,
+                    size=(curr_bs,),
+                    device="cuda",
+                    dtype=torch.int64,
+                )
+            else:
+                step_token = torch.randn(
+                    curr_bs,
+                    args.models.dim,
+                    device="cuda",
+                    dtype=torch.get_default_dtype(),
+                )
+            _ = Backend.model.decode(step_token, curr_bs)
+            for mgr in Backend.cache_managers.values():
+                mgr.finalize_cache_single_decode(curr_req_ids)
     # Clean KV for this request
     for req_id in req_ids:
         for mgr in Backend.cache_managers.values():
@@ -415,8 +445,7 @@ def warmup_engine(args):
     if args.dp_config.router.is_router:
         return
 
-    # NOTE: DP+PP每次规划的req数量为max_reqs（纯PP为max_reqs / pp_size），可能导致同时运行的req数量大于max_reqs
-    # 如果在运行时遇到问题，请开启下面的跳过与兜底策略（目前暂未发现问题）
+    # NOTE: 如果在 DP+PP 运行时遇到问题，请开启下面的跳过与兜底策略（目前暂未发现问题）
     # if args.infer.pp_size > 1 and args.infer.dp_size > 1 and args.infer.cache_type == "paged":
     #     assert isinstance(Backend.cache_manager, PagedKVCacheManager)
     #     logger.warning("Warming-up is not supported when PP is enabled. Skipping")
@@ -441,6 +470,7 @@ def warmup_engine(args):
     runner = "direct" if pd_enabled else "taskpool"
     sched_type = str(args.scheduler.type).lower()
     skip_model_prefill = "decode_only" in sched_type
+    skip_model_decode = "prefill_only" in sched_type
     full_warmup = args.infer.full_warmup
 
     def _log_skip_prefill():
@@ -454,7 +484,10 @@ def warmup_engine(args):
     elif not full_warmup:
         _log_skip_prefill()
         _warmup_backend_direct(
-            args, decode_steps=2, skip_model_prefill=bool(skip_model_prefill)
+            args,
+            decode_steps=2,
+            skip_model_prefill=bool(skip_model_prefill),
+            skip_model_decode=bool(skip_model_decode),
         )
 
     if full_warmup:
@@ -478,6 +511,7 @@ def warmup_engine(args):
             decode_steps=local_max_bs,
             bs_descend=1,
             skip_model_prefill=bool(skip_model_prefill),
+            skip_model_decode=bool(skip_model_decode),
         )
 
     _auto_set_num_blocks_after_warmup(args)
@@ -485,9 +519,18 @@ def warmup_engine(args):
 
 def check_checkpoint_path(args):
     if args.models.ckpt_dir is None:
-        raise ValueError(
-            f"No checkpoint path provided. You can set it in command line by adding `models.ckpt_dir=<path>`. The model {args.models.name} can be downloaded from {args.models.source}"
-        )
+        if not getattr(args.models, "is_pro", False):
+            raise ValueError(
+                f"No checkpoint path provided. You can set it in command line by adding "
+                f"`models.ckpt_dir=<path>`. The model {args.models.name} can be downloaded "
+                f"from {args.models.source}"
+            )
+        else:
+            raise ValueError(
+                f"No checkpoint path provided. You can set it in command line by adding "
+                f"`models.ckpt_dir=<path>`. The model {args.models.name} is part of "
+                f"chitu-pro, which may be obtained by concatting solution@chitu.ai"
+            )
     if args.models.tokenizer_path is None:
         logger.info(
             f"Using {args.models.ckpt_dir} as the path to tokenizer. If the tokenizer has a different path, please set in command line by adding `models.tokenizer_path=<path>`"
@@ -662,7 +705,12 @@ def chitu_init(args):
             args.infer.use_cuda_graph = True
 
     if args.infer.schedule_overlap == "auto":
-        args.infer.schedule_overlap = True
+        # PD disaggregation does not support overlap
+        # MTP does synchronize after model run and overlap has no effect
+        args.infer.schedule_overlap = (
+            not args.dp_config.router.pd_disaggregation.enabled
+            and args.infer.mtp_size <= 1
+        )
 
     if args.infer.full_warmup == "auto":
         if args.infer.pp_size > 1 and args.infer.use_cuda_graph:
@@ -731,36 +779,9 @@ def chitu_init(args):
         start_prometheus_server_and_metrics_monitor(collector_addrs)
 
 
-def remove_kvcache_all_device(remove_task_ids):
-    if len(remove_task_ids) == 0:
-        return
-    # Since we are removing, any task type is fine
-    tasks = PackedTasksBase(
-        num_tasks=len(remove_task_ids),
-        task_ids=remove_task_ids,
-        req_ids=remove_task_ids,
-        task_type=TaskType.Special,
-        payload_type=SerializedPackedTasksPayloadType.EndTask,
-    )
-    Backend.executor.step(tasks)
-
-
-def remove_taskpool_all_device(remove_task_ids):
-    if len(remove_task_ids) == 0:
-        return
-    # Since we are removing, any task type is fine
-    tasks = PackedTasksBase(
-        num_tasks=len(remove_task_ids),
-        task_ids=remove_task_ids,
-        req_ids=remove_task_ids,
-        task_type=TaskType.Special,
-        payload_type=SerializedPackedTasksPayloadType.Remove,
-    )
-    Backend.executor.step(tasks)
-
-
 @torch.inference_mode()
 def chitu_run_main_rank():
+    # 1. Schedule
     if Backend.args.infer.dp_size == 1:
         assert len(Backend.schedulers) == 1
         task_ids = Backend.schedulers[0].schedule()
@@ -770,39 +791,35 @@ def chitu_run_main_rank():
         id_and_scheduler_list = list(enumerate(Backend.schedulers))
         random.shuffle(id_and_scheduler_list)
 
-        strict_allowed_task_type_list = [PREFILL_TYPES, DECODE_TYPES]
-        for strict_allowed_task_type in strict_allowed_task_type_list:
-            task_ids_list = [None] * len(id_and_scheduler_list)
-            for i, scheduler in id_and_scheduler_list:
-                task_ids = scheduler.schedule(
-                    strict_allowed_task_type=strict_allowed_task_type
-                )
-                task_ids_list[i] = task_ids
-            if any((len(task_ids) > 0 for task_ids in task_ids_list)):
-                DPTaskCollector.prepare_dp_tasks(task_ids_list)
-                for task_ids in task_ids_list:
-                    for task_id in task_ids:
-                        task = TaskPool.pool.get(task_id)
-                        if task is None:
-                            continue
-                        if not is_decode(getattr(task, "task_type", None)):
-                            continue
-                        if getattr(task, "pd_sched_wait_end_logged", False):
-                            continue
-                        task.pd_sched_wait_end_logged = True
-                        req_id = getattr(
-                            getattr(task, "req", None), "request_id", task_id
-                        )
-                        logger.debug(
-                            f"[PD_STAGE][decode.sched_wait.end] req_id={req_id}"
-                        )
-                task_ids = task_ids_list[0]
-                break
+        task_type = (
+            PREFILL_TYPES
+            if any(scheduler.can_prefill() for scheduler in Backend.schedulers)
+            else DECODE_TYPES
+        )
+        task_ids_list = [None] * len(id_and_scheduler_list)
+        for i, scheduler in id_and_scheduler_list:
+            task_ids = scheduler.schedule(strict_allowed_task_type={task_type})
+            task_ids_list[i] = task_ids
+        if any((len(task_ids) > 0 for task_ids in task_ids_list)):
+            DPTaskCollector.prepare_dp_tasks(task_ids_list)
+            for task_ids in task_ids_list:
+                for task_id in task_ids:
+                    task = TaskPool.pool.get(task_id)
+                    if task is None:
+                        continue
+                    if not is_decode(getattr(task, "task_type", None)):
+                        continue
+                    if getattr(task, "pd_sched_wait_end_logged", False):
+                        continue
+                    task.pd_sched_wait_end_logged = True
+                    req_id = getattr(getattr(task, "req", None), "request_id", task_id)
+                    logger.debug(f"[PD_STAGE][decode.sched_wait.end] req_id={req_id}")
         else:
-            task_ids = []
-    logger.info(f"task_ids: {task_ids}")
+            DPTaskCollector.prepare_dp_tasks([])
+        task_ids = task_ids_list[0]
+
+    # 2. Run
     if task_ids or DPTaskCollector.has_available_tasks():
-        # compute
         logger.debug(f"Processing {task_ids}")
         if task_ids:
             for task_id in task_ids:
@@ -817,60 +834,43 @@ def chitu_run_main_rank():
                 req_id = getattr(getattr(task, "req", None), "request_id", task_id)
                 logger.debug(f"[PD_STAGE][decode.sched_wait.end] req_id={req_id}")
         tasks = PackedTasks(task_ids)
-        backend_payload_type = Backend.executor.step(tasks)
     else:
-        backend_payload_type = Backend.executor.empty_step()
-
-    if Backend.args.infer.dp_size > 1:
-        if DPTaskCollector.has_available_tasks():
-            tasks = DPTaskCollector.get_total_packedtasks()
-            task_ids_list = DPTaskCollector.get_task_ids_list()
-            task_ids = [task_id for task_ids in task_ids_list for task_id in task_ids]
-            logger.debug(
-                f"[run] DPTaskCollector total_packed num_tasks={tasks.num_tasks} output_tasks={len(tasks.output_tasks)}"
-            )
-            DPTaskCollector.clear()
-        else:
-            task_ids = []
-    unwait_task_ids = []
-    if Backend.args.infer.pp_size > 1:
-        unwait_task_ids = PPTaskCollector.unwait_task_ids()
-        PPTaskCollector.clear()
-
-    # Collect tasks by DP rank. All tasks that have run shoule have dp_rank.
-    task_ids_per_dp = []
-    unwait_task_ids_per_dp = []
-    assert not any(
-        filter(lambda task_id: TaskPool.pool[task_id].dp_rank is None, task_ids_per_dp)
-    )
-    assert not any(
-        filter(
-            lambda task_id: TaskPool.pool[task_id].dp_rank is None,
-            unwait_task_ids_per_dp,
+        tasks = PackedTasksBase(
+            num_tasks=len(task_ids),
+            task_ids=task_ids,
+            task_type=TaskType.Special,
+            payload_type=SerializedPackedTasksPayloadType.Empty,
         )
-    )
-    for i in range(Backend.args.infer.dp_size):
-        is_this_rank = lambda task_id: TaskPool.pool[task_id].dp_rank == i
-        task_ids_per_dp.append(list(filter(is_this_rank, task_ids)))
-        unwait_task_ids_per_dp.append(list(filter(is_this_rank, unwait_task_ids)))
+    backend_payload_type = Backend.executor.step(tasks)
+
+    # 3. Update TaskPool
+    task_ids = TaskCollector.get_update_task_ids()
+    task_ids = [task_id for task_id in task_ids if TaskPool.pool.get(task_id)]
+    # tasks w/o dp_size are evicted and already removed
+    task_ids = [
+        task_id for task_id in task_ids if TaskPool.pool[task_id].dp_rank is not None
+    ]
+    DPTaskCollector.clear_last_packedtasks()
+
+    # Collect tasks by DP rank. All tasks that have run should have dp_rank.
+    task_ids_per_dp = [[] for _ in range(Backend.args.infer.dp_size)]
+    for task_id in task_ids:
+        dp_rank = TaskPool.pool[task_id].dp_rank
+        task_ids_per_dp[dp_rank].append(task_id)
 
     # tasks from the model-running tasks (task_ids) which will not run anymore
-    removed_decode_task_ids = []
-    removed_kvcache_task_ids = []
+    removed_task_ids = []
     for i in range(Backend.args.infer.dp_size):
-        dp_local_removed_decode_task_ids, dp_local_removed_kvcache_task_ids = (
-            Backend.schedulers[i].update(task_ids_per_dp[i], unwait_task_ids_per_dp[i])
-        )
-        removed_decode_task_ids += dp_local_removed_decode_task_ids
-        removed_kvcache_task_ids += dp_local_removed_kvcache_task_ids
-    remove_kvcache_all_device(removed_kvcache_task_ids)
-    remove_taskpool_all_device(removed_decode_task_ids)
+        dp_local_removed_task_ids = Backend.schedulers[i].update(task_ids_per_dp[i])
+        removed_task_ids += dp_local_removed_task_ids
+    Backend.executor.special_step(removed_task_ids, type="EndTask")
     return backend_payload_type
 
 
 @torch.inference_mode()
 def chitu_run():
     try:
+        check_alloc_retries()
         rank = torch.distributed.get_rank()
         if rank != 0:
             return Backend.executor.step(None)
@@ -883,6 +883,25 @@ def chitu_run():
         raise Exception(
             msg
         ) from None  # `msg` already contains traceback, so raise from None
+
+
+_last_alloc_retries = 0
+
+
+def check_alloc_retries():
+    global _last_alloc_retries
+    cur_alloc_retries = torch.cuda.memory_stats(torch.cuda.current_device())[
+        "num_alloc_retries"
+    ]
+    if cur_alloc_retries > _last_alloc_retries:
+        logger.warning(
+            f"{cur_alloc_retries - _last_alloc_retries} allocations successed only "
+            f"after retrying (freeing memory from PyTorch allocator to CUDA and then "
+            f"allocating them back). This will significantly reduce the performance. "
+            f"Please try reducing memory usage, for example by lowering "
+            f"`infer.memory_utilization`."
+        )
+    _last_alloc_retries = cur_alloc_retries
 
 
 async def start_enhanced_scheduler_service(rank: int, dp_config, args):

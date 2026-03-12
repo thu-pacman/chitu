@@ -7,6 +7,7 @@ ARG chitu_setup_jobs=''
 ARG enable_editable_install='false'
 ARG enable_cython='true'
 ARG enable_test='false'
+ARG pypi_mirror=''
 
 ENV CHITU_SETUP_JOBS=$chitu_setup_jobs
 ENV MAX_JOBS=$CHITU_SETUP_JOBS
@@ -34,16 +35,23 @@ ENV TZ=Etc/UTC
 ENV PIP_PROGRESS_BAR=off
 ENV PIP_NO_CACHE_DIR=1
 
-RUN pip install -U pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+# Upgrade pip and set mirror. The mirror should be set AFTER upgrading pip
+RUN if [ "${pypi_mirror}" != "" ]; then \
+    pip install -U "pip<25.3" -i "${pypi_mirror}"; \
+else \
+    pip install -U "pip<25.3"; \
+fi
+RUN if [ "${pypi_mirror}" != "" ]; then \
+    pip config set global.index-url "${pypi_mirror}"; \
+fi
 
 # NOTE: Always apt update before apt install to avoid out-dated docker cache
 # NOTE: Test dependencies include:
 # - pytest is for test/pytest (for all platforms).
-# - aiohttp is for service tests (for all platforms).
-# - matplotlib is for benchmarks/op_bench (for platforms with triton).
+# - matplotlib is for op benchmarks in test/pytest, and benchmarks/visualize_response.py (for all platforms).
 RUN if [ "${enable_test}" = "true" ]; then \
     apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping && \
-    pip install -i https://pypi.tuna.tsinghua.edu.cn/simple pytest aiohttp matplotlib; \
+    pip install pytest matplotlib; \
 fi
 RUN apt update -y && apt install -y curl
 

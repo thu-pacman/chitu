@@ -2,53 +2,100 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Any
 import argparse
 import glob
 import os
 import sys
+import hydra
 
 ZH_FILE = os.path.join("docs", "zh", "SUPPORTED_MODELS.md")
 EN_FILE = os.path.join("docs", "en", "SUPPORTED_MODELS.md")
 
 
-def _collect_model_names() -> list[str]:
-    config_dir = os.path.join("chitu", "config", "models")
-    names: list[str] = []
-    for model_file in glob.iglob(os.path.join(config_dir, "*.yaml")):
-        base = os.path.basename(model_file)
-        if base.endswith(".yaml"):
-            names.append(base[:-5])
-    names.sort()
-    return names
+def _collect_models() -> list[tuple[str, Any]]:
+    config_dir = os.path.join(os.getcwd(), "chitu", "config", "models")
+    ret: list[tuple[str, Any]] = []
+    with hydra.initialize_config_dir(config_dir=config_dir, version_base="1.1"):
+        for model_file in glob.iglob(os.path.join(config_dir, "*.yaml")):
+            base = os.path.basename(model_file)
+            if base.endswith(".yaml"):
+                filename = base[:-5]
+                cfg = hydra.compose(config_name=filename)
+                ret.append((filename, cfg))
+    return ret
 
 
-def _render_full_doc(names: list[str], lang: str) -> str:
+def _sort_models(models: list[tuple[str, Any]], is_pro: bool) -> list[tuple[str, Any]]:
+    return sorted(
+        filter(lambda x: getattr(x[1], "is_pro", False) == is_pro, models),
+        key=lambda x: x[0],
+    )
+
+
+def _render_full_doc(models: list[tuple[str, Any]], lang: str) -> str:
     if lang == "zh":
         title = "# 支持的模型\n\n"
         intro = (
-            "本页面由脚本自动生成。数据源: `chitu/config/models/*.yaml`。"
+            "> 本页面由脚本自动生成。数据源: `chitu/config/models/*.yaml`。"
             "更新命令: `python3 script/generate_supported_models_docs.py`。\n\n"
         )
     else:
         title = "# Supported Models\n\n"
         intro = (
-            "This page is auto-generated. Data source: `chitu/config/models/*.yaml`. "
+            "> This page is auto-generated. Data source: `chitu/config/models/*.yaml`. "
             "To update, run: `python3 script/generate_supported_models_docs.py`.\n\n"
         )
 
-    lines: list[str] = []
-    for name in names:
-        if lang == "zh":
-            lines.append(f"- {name}")
-            lines.append(f"  用法: 启动赤兔时追加 `models={name}` 启动参数")
-        else:
-            lines.append(f"- {name}")
-            lines.append(
-                f"  Usage: Append `models={name}` command line argument when starting Chitu"
-            )
-    lines.append("")
+    # Generate a table, example:
+    #
+    # | Name | Usage (append the argument below when starting Chitu) | How to obtain the model |
+    # |------|-------------------------------------------------------|-------------------------|
+    # | name | `models=file_name`                                    | http://...              |
 
-    return title + intro + "\n".join(lines)
+    lines: list[str] = []
+    if lang == "zh":
+        lines.append("## 开源模型")
+        lines.append("")
+        lines.append("| 名称 | 用法（启动赤兔时追加下列参数） | 获取方法 |")
+    else:
+        lines.append("## Open-source models")
+        lines.append("")
+        lines.append(
+            "| Name | Usage (append the argument below when starting Chitu) | How to obtain the model |"
+        )
+    lines.append("|---|---|---|")
+    for filename, cfg in _sort_models(models, is_pro=False):
+        lines.append(f"| {cfg.name} | `models={filename}` | {cfg.source} |")
+    lines.append("")
+    lines.append("")
+    open_source_models = "\n".join(lines)
+
+    lines: list[str] = []
+    if lang == "zh":
+        lines.append("## 赤兔-pro 模型")
+        lines.append("")
+        lines.append(
+            "以下模型随赤兔-pro提供，请联系 [solution@chitu.ai](solution@chitu.ai) 进行商务咨询。"
+        )
+        lines.append("")
+        lines.append("| 名称 | 用法（启动赤兔时追加下列参数） |")
+    else:
+        lines.append("## Chitu-pro models")
+        lines.append("")
+        lines.append(
+            "The following models are part of chitu-pro. Please concat [solution@chitu.ai](solution@chitu.ai) for business inquiries."
+        )
+        lines.append("")
+        lines.append("| Name | Usage (append the argument below when starting Chitu) |")
+    lines.append("|---|---|")
+    for filename, cfg in _sort_models(models, is_pro=True):
+        lines.append(f"| {cfg.name} | `models={filename}` |")
+    lines.append("")
+    lines.append("")
+    chitu_pro_models = "\n".join(lines)
+
+    return title + intro + open_source_models + chitu_pro_models
 
 
 def _read(path: str) -> str:
@@ -79,19 +126,19 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    names = _collect_model_names()
+    models = _collect_models()
 
     if args.print:
         print("Supported models:")
-        for name in names:
-            print(f"- {name}")
+        for filename, cfg in models:
+            print(f"- {cfg.name}")
             print(
-                f"  Usage: Append `models={name}` command line argument when starting Chitu"
+                f"  Usage: Append `models={filename}` command line argument when starting Chitu"
             )
         return 0
 
-    zh_new = _render_full_doc(names, "zh")
-    en_new = _render_full_doc(names, "en")
+    zh_new = _render_full_doc(models, "zh")
+    en_new = _render_full_doc(models, "en")
 
     zh_old = _read(ZH_FILE)
     en_old = _read(EN_FILE)

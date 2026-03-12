@@ -31,7 +31,7 @@ if {[llength $argv] > 0} {
 
 set world_size_arg [expr {$tp_size_arg * $pp_size_arg}]
 
-exec pip install evalscope==1.0.2 -i https://pypi.tuna.tsinghua.edu.cn/simple 2>/dev/null
+exec pip install evalscope==1.0.2 2>/dev/null
 
 set version_output [exec sh -c {pip list | grep -i evalscope}]
 puts "EvalScope version: $version_output"

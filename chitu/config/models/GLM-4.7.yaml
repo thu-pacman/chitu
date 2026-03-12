@@ -10,7 +10,6 @@ defaults:
 # Access info
 name: GLM-4.7
 source: "https://huggingface.co/zai-org/GLM-4.7" # Just for displaying. No automatic download.
-ckpt_dir: null # Please override this in commond line with `models.ckpt_dir=<path>`.
-tokenizer_path: null # By default the same as ckpt_dir, or you can override it with `models.tokenizer_path=<path>`.
 tokenizer_type: "hf" # one of: hf, tiktoken
 tool_parser: GLM47ToolParser
+reasoning_without_begin: true

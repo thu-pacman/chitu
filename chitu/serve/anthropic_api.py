@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import json
+import traceback
 from typing import Any, Awaitable, Callable, Optional, Literal, Annotated
+from logging import getLogger
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -16,12 +18,15 @@ from chitu.backend import Backend
 from chitu.global_vars import get_global_args
 from chitu.task import Task, TaskPool, UserRequest
 from chitu.tool_call import get_tool_parser, parse_stream_by_parser
-from chitu.tool_call.types import (
+from chitu.tool_call import (
     ChoiceToolCall,
     ToolChoiceNamedTool,
     ToolChoiceFunction,
 )
 from chitu.utils import gen_req_id
+
+
+logger = getLogger(__name__)
 
 
 class AnthropicThinking(BaseModel):
@@ -241,19 +246,6 @@ def map_anthropic_tool_choice(tool_choice: Optional[dict | str]):
     return "auto"
 
 
-def format_tool_call_text(name: str, arguments: str) -> str:
-    parser_cls = get_active_tool_parser()
-    if all(
-        hasattr(parser_cls, attr)
-        for attr in ("tool_template", "tool_begin_tag", "tool_end_tag")
-    ):
-        tool_template = parser_cls.tool_template.replace("{name}", name).replace(
-            "{arguments}", arguments
-        )
-        return f"{parser_cls.tool_begin_tag}{tool_template}{parser_cls.tool_end_tag}"
-    return f'{{"name": "{name}", "arguments": {arguments}}}'
-
-
 def tool_calls_to_anthropic_blocks(tool_calls: list[ChoiceToolCall]) -> list[dict]:
     blocks: list[dict] = []
     for tool_call in tool_calls:
@@ -280,11 +272,17 @@ def anthropic_message_to_internal(message: AnthropicMessage) -> list[dict]:
 
     results: list[dict] = []
     text_parts: list[str] = []
+    tool_calls: list[dict] = []
 
-    def flush_text():
-        if text_parts:
-            results.append({"role": message.role, "content": "".join(text_parts)})
-            text_parts.clear()
+    def flush_message():
+        if not text_parts and not tool_calls:
+            return
+        msg = {"role": message.role, "content": "".join(text_parts)}
+        if tool_calls:
+            msg["tool_calls"] = list(tool_calls)
+        results.append(msg)
+        text_parts.clear()
+        tool_calls.clear()
 
     for item in message.content:
         if isinstance(item, str):
@@ -301,13 +299,23 @@ def anthropic_message_to_internal(message: AnthropicMessage) -> list[dict]:
             continue
         if t == "tool_use":
             name = str(item.get("name", ""))
+            if not name:
+                raise ValueError("tool_use.name is required")
             input_obj = item.get("input", {})
             arguments = json.dumps(input_obj, ensure_ascii=False)
-            text_parts.append(format_tool_call_text(name, arguments))
+            tool_calls.append(
+                {
+                    "id": str(item.get("id") or gen_req_id()),
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            )
             continue
         if t == "tool_result":
-            flush_text()
+            flush_message()
             tool_use_id = item.get("tool_use_id") or item.get("tool_call_id")
+            if not tool_use_id:
+                raise ValueError("tool_result.tool_use_id is required")
             content = item.get("content", "")
             tool_text = anthropic_content_to_text(content)
             results.append(
@@ -316,7 +324,7 @@ def anthropic_message_to_internal(message: AnthropicMessage) -> list[dict]:
             continue
         raise ValueError(f"Unsupported content block type: {t}")
 
-    flush_text()
+    flush_message()
     return results
 
 
@@ -783,6 +791,8 @@ async def handle_messages_request(
             tools=tools,
             tool_choice=tool_choice,
             parallel_tool_calls=True,
+            enable_reasoning=enable_thinking,
+            save_trace_dir=args.debug.save_trace_dir,
         )
     except ValueError:
         return anthropic_error(
@@ -790,10 +800,7 @@ async def handle_messages_request(
         )
 
     task = Task(
-        user_req.request_id,
-        user_req,
-        stop_with_eos=True,
-        priority=task_priority,
+        user_req.request_id, user_req, stop_with_eos=True, priority=task_priority
     )
     TaskPool.enqueue(task)
 
@@ -928,6 +935,7 @@ async def handle_completion_request(
             top_k=top_k,
             frequency_penalty=frequency_penalty,
             enable_reasoning=False,
+            save_trace_dir=args.debug.save_trace_dir,
         )
     except ValueError:
         return anthropic_error(
@@ -935,10 +943,7 @@ async def handle_completion_request(
         )
 
     task = Task(
-        user_req.request_id,
-        user_req,
-        stop_with_eos=True,
-        priority=task_priority,
+        user_req.request_id, user_req, stop_with_eos=True, priority=task_priority
     )
     TaskPool.enqueue(task)
 
@@ -1008,16 +1013,27 @@ def create_router(
         authorization: Annotated[Optional[str], Header(alias="Authorization")] = None,
         x_api_key: Annotated[Optional[str], Header(alias="x-api-key")] = None,
     ):
-        return await handle_messages_request(
-            raw_request=raw_request,
-            authorization=authorization,
-            x_api_key=x_api_key,
-            server_status=get_server_status(),
-            dp_enabled=get_global_args().dp_config.enabled,
-            dp_service_started=get_dp_service_started(),
-            dp_register_and_submit=_dp_register_and_submit,
-            priority_for_api_key=priority_for_api_key,
-        )
+        try:
+            return await handle_messages_request(
+                raw_request=raw_request,
+                authorization=authorization,
+                x_api_key=x_api_key,
+                server_status=get_server_status(),
+                dp_enabled=get_global_args().dp_config.enabled,
+                dp_service_started=get_dp_service_started(),
+                dp_register_and_submit=_dp_register_and_submit,
+                priority_for_api_key=priority_for_api_key,
+            )
+        except HTTPException as e:
+            logger.info(
+                f"Rejected illegal request, returning {e}: {traceback.format_exc()}"
+            )
+            raise e
+        except Exception as e:
+            logger.exception(
+                f"Error processing request, got {e}: {traceback.format_exc()}"
+            )
+            raise HTTPException(status_code=500, detail="internal server error")
 
     @router.post("/v1/complete")
     async def v1_complete(
@@ -1025,15 +1041,26 @@ def create_router(
         authorization: Annotated[Optional[str], Header(alias="Authorization")] = None,
         x_api_key: Annotated[Optional[str], Header(alias="x-api-key")] = None,
     ):
-        return await handle_completion_request(
-            raw_request=raw_request,
-            authorization=authorization,
-            x_api_key=x_api_key,
-            server_status=get_server_status(),
-            dp_enabled=get_global_args().dp_config.enabled,
-            dp_service_started=get_dp_service_started(),
-            dp_register_and_submit=_dp_register_and_submit,
-            priority_for_api_key=priority_for_api_key,
-        )
+        try:
+            return await handle_completion_request(
+                raw_request=raw_request,
+                authorization=authorization,
+                x_api_key=x_api_key,
+                server_status=get_server_status(),
+                dp_enabled=get_global_args().dp_config.enabled,
+                dp_service_started=get_dp_service_started(),
+                dp_register_and_submit=_dp_register_and_submit,
+                priority_for_api_key=priority_for_api_key,
+            )
+        except HTTPException as e:
+            logger.info(
+                f"Rejected illegal request, returning {e}: {traceback.format_exc()}"
+            )
+            raise e
+        except Exception as e:
+            logger.exception(
+                f"Error processing request, got {e}: {traceback.format_exc()}"
+            )
+            raise HTTPException(status_code=500, detail="internal server error")
 
     return router

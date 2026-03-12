@@ -7,12 +7,12 @@ from typing import Protocol, Optional
 import logging
 import asyncio
 import torch
+import time
 
 from chitu.global_vars import get_global_args
 from chitu.task import (
     Task,
     TaskPool,
-    TaskDecodeType,
     PackedTasks,
     PackedTasksBase,
 )
@@ -92,9 +92,6 @@ class LocalTokenSink:
                 task_list, token_list, logprobs_list, token_idxs_list
             ):
                 task.req.add_data(token, logprobs, token_idxs, notify_server=False)
-        for task in task_list:
-            if task.need_remove():
-                task.req.finish()
 
         def notify_all_response_in_batch():
             for task in task_list:
@@ -162,15 +159,19 @@ class MooncakeKVTransferHook:
         if pd_verbose_enabled():
             if not should_send_tokens:
                 # 看到该日志表示：该 rank 只传输 KV Cache（不包含首 token）
-                logger.info(f"[KVHook] sending KV-only for requests: {req_ids_output}")
+                logger.debug(f"[KVHook] sending KV-only for requests: {req_ids_output}")
             else:
                 # 看到该日志表示：该 rank 传输 KV Cache + first-token
-                logger.info(f"[KVHook] sending KV+token for requests: {req_ids_output}")
+                logger.debug(
+                    f"[KVHook] sending KV+token for requests: {req_ids_output}"
+                )
         cache_type = None
         if hasattr(cache_manager, "args") and hasattr(cache_manager.args, "cache_type"):
             cache_type = cache_manager.args.cache_type
+
+        _kv_send_start = time.monotonic()
         for rid in req_ids_output:
-            logger.info(f"[PD_STAGE][prefill.kv_send.start] req_id={rid}")
+            logger.debug(f"[PD_STAGE][prefill.kv_send.start] req_id={rid}")
 
         if should_send_tokens:
             from chitu.backend import Backend  # local import to avoid cycles
@@ -196,7 +197,7 @@ class MooncakeKVTransferHook:
                 )
                 send_tokens = torch.argmax(logits, dim=-1).to(dtype=torch.int32)
         if pd_trace_enabled():
-            logger.info(
+            logger.debug(
                 f"[PD_TRACE][prefill.kv_send] req_ids={req_ids_output} batch={len(req_ids_output)} "
                 f"token_shape={list(send_tokens.shape) if isinstance(send_tokens, torch.Tensor) else None} "
                 f"cache_type={cache_type}"
@@ -207,6 +208,12 @@ class MooncakeKVTransferHook:
             request_ids=req_ids_output,
             cache_manager=cache_manager,
         )
+
+        # Record KV send duration (covers enqueue; actual RDMA transfer is async)
+        _kv_send_dur = time.monotonic() - _kv_send_start
+        from chitu.metrics.prometheus_collector import observe_stage_duration
+
+        observe_stage_duration("prefill", "kv_send", _kv_send_dur)
 
         from chitu.backend import Backend  # local import to avoid cycles
 
@@ -220,7 +227,7 @@ class MooncakeKVTransferHook:
                 # `decode_status` is a read-only property; update the internal state directly.
                 # Also clear `waiting` to ensure need_remove() becomes True immediately.
                 t.waiting = False
-                t._decode_status = TaskDecodeType.Stopped
+                t.stopped = True
 
     def before_decode_step(self, req_ids: list[str]):
         if self.kv_manager is None:
@@ -256,9 +263,9 @@ class MooncakeKVTransferHook:
 
         # 看到该日志表示：Decode 即将阻塞等待 KV pull succ
         if pd_verbose_enabled():
-            logger.info(f"[KVHook] receiving KV for requests: {pending}")
+            logger.debug(f"[KVHook] receiving KV for requests: {pending}")
         if pd_trace_enabled():
-            logger.info(
+            logger.debug(
                 f"[PD_TRACE][decode.kv_pull_start] pending={pending} total_req_ids={len(req_ids)} "
                 f"rank={Backend.executor.rank} tp={Backend.executor.tp_size} "
                 f"dp={Backend.executor.dp_size} ep={Backend.executor.ep_size}"
@@ -268,7 +275,7 @@ class MooncakeKVTransferHook:
             t = TaskPool.pool.get(rid)
             prefix_lens.append(int(t.prefix_tokens_len) if t is not None else 0)
         if pd_trace_enabled():
-            logger.info(
+            logger.debug(
                 f"[PD_TRACE][decode.kv_pull_prefix] pending={pending} prefix_lens={prefix_lens}"
             )
 
@@ -290,7 +297,7 @@ class MooncakeKVTransferHook:
             request_ids=pending, cache_manager=cache_manager, prefix_lens=prefix_lens
         )
         if pd_trace_enabled():
-            logger.info(
+            logger.debug(
                 f"[PD_TRACE][decode.kv_pull_done] pending={pending} token_shape={list(first_tokens.shape)}"
             )
         if len(pending) == 0:
@@ -302,6 +309,10 @@ class MooncakeKVTransferHook:
                 continue
             if task.next_token < 0:
                 task.update_response_sync(int(token))
+                # DP worker rank 的 task 没有被 DPTaskWrapper 替换 update_response_no_sync，
+                # 上面的 update_response_sync 只更新了本地状态，不会把 token 发给 Router。
+                # 在 task 上标记这个 token，后续 collect_token 会把它带回 rank 0 补发。
+                task._pd_first_token_for_dp_emit = int(token)
             if getattr(task, "req", None) is not None and not getattr(
                 task, "_pd_first_token_applied", False
             ):

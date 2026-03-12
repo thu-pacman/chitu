@@ -18,6 +18,13 @@ def is_warming_up_before_cuda_graph_capture():
     return _is_warming_up_before_cuda_graph_capture
 
 
+def is_warming_up_or_cuda_graph_capture():
+    return (
+        _is_warming_up_before_cuda_graph_capture
+        or torch.cuda.is_current_stream_capturing()
+    )
+
+
 def add_post_hook_for_currently_capturing_graph_object(hook: Callable[[], None]):
     assert isinstance(_currently_capturing_graph_object, torch.cuda.CUDAGraph)
     if _currently_capturing_graph_object not in _post_hook_per_graph_object:
@@ -31,6 +38,7 @@ def make_dispatched_graphed_callables(
     args_max_nelem: Sequence[int],
     kwargs_max_nelem: Mapping[str, int],
     output_max_nelem_callback: Callable[[Any, torch.Tensor], int],
+    before_capture_callback: Optional[Callable[[], None]] = None,
     before_replay_callback: Optional[Callable[[Any], None]] = None,
     enable: bool = True,
 ) -> Callable:
@@ -61,6 +69,7 @@ def make_dispatched_graphed_callables(
             args_max_nelem=args_max_nelem,
             kwargs_max_nelem=kwargs_max_nelem,
             output_max_nelem_callback=output_max_nelem_callback,
+            before_capture_callback=before_capture_callback,
             before_replay_callback=before_replay_callback,
             enable=enable,
         )
@@ -128,6 +137,14 @@ def make_dispatched_graphed_callables(
                     )
                 else:
                     output_static_tensor.set(sample_output)
+
+                # before capture callback
+                # NOTE: For some attn_backends like FlashMLA, the actual intiailization of
+                # metadata occurs during the first execution of the attn kernel. In such
+                # cases, the graph capture after the warmup fail to capture the metadata
+                # intialization. Therefore an additional before_capture_callback is necessary
+                if before_capture_callback is not None:
+                    before_capture_callback()
 
                 # Capture the graph
                 graph_dict[key] = torch.cuda.CUDAGraph()

@@ -134,7 +134,7 @@ set decode_spec "tp=1,pp=1,dp=4,ep=4,max_seq_len=6144,max_reqs=256,full_warmup=F
 
 set cmd_parts [list bash script/srun_pd_disagg_base_apptainer.sh \
     $model_config $model_ckpt_dir $apptainer_image \
-    --nodes 2 --gpus-per-node 8 --router-port $router_port --partition ci \
+    --nodes 2 --gpus-per-node 4 --router-port $router_port --partition ci \
     --prefill $prefill_spec \
     --prefill $prefill_spec \
     --decode $decode_spec \
@@ -294,12 +294,12 @@ def handle_obj(obj, prefix=""):
     texts = obj.get("generated_texts", [])
     errors = obj.get("errors", [])
     for i, t in enumerate(texts):
-        preview = t[:256] + "..." if len(t) > 256 else t
+        preview = t[:200] + "..." if len(t) > 200 else t
         print(f"{prefix}generated_texts[{i}]: {preview}")
     for i, e in enumerate(errors):
-        print(f"{prefix}errors[{i}]: {e}")
         if e:
             has_error = True
+            print(f"{prefix}ERROR errors[{i}]: {e}")
 
 with open(path, "r", encoding="utf-8") as f:
     content = f.read().strip()

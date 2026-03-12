@@ -61,7 +61,7 @@ class NpuAttnBackend(RefAttnBackend):
         platform = get_device_name()
         try:
             self.max_aiv_num = core_num_each_platform[platform]
-        except:
+        except Exception:
             raise RuntimeError("Unsupported platform: ", platform)
         self.max_seq_len = StaticTensor(max_nelem=1, dtype=torch.int32, device="npu")
         self.first_seq_id_per_core = StaticTensor(
@@ -74,7 +74,7 @@ class NpuAttnBackend(RefAttnBackend):
         )
 
     @override
-    def decode_op_supports_mtp(self):
+    def decode_op_supports_mtp(self) -> bool:
         return True
 
     @classmethod

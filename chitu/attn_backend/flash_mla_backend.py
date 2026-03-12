@@ -45,16 +45,13 @@ class FlashMLABackend(TritonAttnBackend):
         self.required_h_q = 128 if torch.cuda.get_device_capability() == (10, 0) else 64
 
         self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
-        # temporary tensors
+
+        # flash_mla metadata
         self.metadata_prefill = None
-        self.num_splits_prefill = None
-        # static tensor to fit graph
-        self.metadata = None
+        self.metadata_decode = None
         self.num_splits = None
 
         self.softmax_scale = None
-        self.indices_buffer = None
-        self.req_ids = None
 
         # DSA
         self.index_topk = (
@@ -69,29 +66,6 @@ class FlashMLABackend(TritonAttnBackend):
             self.use_fp8_cache = quant_config.kv_cache.type == "fp8_pertoken_dsa"
         else:
             self.use_fp8_cache = use_fp8
-
-        # NOTE:
-        # - If chunked prefill is enabled, the chunk size must be <= 4096, because the current
-        #   (old) version of flash_mla_with_kvcache does not support s_q > 4096.
-        # - Otherwise, disabling chunked prefill is also supported. In this case, we first compute
-        #   attention in bf16 then quant kv to fp8 and append to kv cache.
-        if self.use_fp8_cache:
-            prefill_chunk_size_per_dp = (
-                ceil_div(self.args.infer.prefill_chunk_size, self.args.infer.dp_size)
-                if self.args.infer.prefill_chunk_size is not None
-                else None
-            )
-            if (
-                prefill_chunk_size_per_dp is not None
-                and prefill_chunk_size_per_dp > 4096
-            ):
-                raise NotImplementedError(
-                    f"FlashMLA with index_topk requires either disabling chunked prefill by setting "
-                    f"`infer.prefill_chunk_size=null`, or enable chunked prefill with a not-too-large "
-                    f"chunk size satisfying `ceil(infer.prefill_chunk_size / infer.dp_size) <= 4096`, "
-                    f"but not we got infer.prefill_chunk_size={self.args.infer.prefill_chunk_size} "
-                    f"and infer.dp_size={self.args.infer.dp_size}"
-                )
 
         logger.info(
             f"FlashMLA backend initialized with topk={self.index_topk} and use_fp8_cache={self.use_fp8_cache}"
@@ -111,7 +85,7 @@ class FlashMLABackend(TritonAttnBackend):
         return indices_padded
 
     @override
-    def decode_op_supports_mtp(self):
+    def decode_op_supports_mtp(self) -> bool:
         return True
 
     def convert_indices_ragged_torch(
@@ -199,7 +173,6 @@ class FlashMLABackend(TritonAttnBackend):
                 BLOCK_SIZE=block_size,
                 NUM_TOPK_TOKENS=topk_indices.size(-1),
             )
-
             return topk_indices
         else:
             raise NotImplementedError(
@@ -244,8 +217,8 @@ class FlashMLABackend(TritonAttnBackend):
             block_table,
             seq_len_delta.new.lens_tensor_device,
             512,  # dv
-            self.metadata.get(),
-            self.num_splits.get(),
+            self.metadata_decode,
+            self.num_splits,
             causal=(False if s_q == 1 else True),
             softmax_scale=softmax_scale,
         )
@@ -314,14 +287,8 @@ class FlashMLABackend(TritonAttnBackend):
             cache_seqlens = seq_len_delta.new.lens_tensor_device
             batch_block_table = block_table
 
-        # old version
-        metadata, num_splits = (
-            (self.metadata.get(), self.num_splits.get())
-            if is_decode
-            else (self.metadata_prefill, self.num_splits_prefill)
-        )
-        # new version
-        # metadata, num_splits = (self.metadata, self.num_splits) if is_decode else (self.metadata_prefill, self.num_splits_prefill)
+        metadata = self.metadata_decode if is_decode else self.metadata_prefill
+        num_splits = self.num_splits
 
         output, _ = flash_mla.flash_mla_with_kvcache(
             q=q,
@@ -445,38 +412,6 @@ class FlashMLABackend(TritonAttnBackend):
                 f'or both "kv_lora" and "k_pe" tensors, but we got {list(kv_cache.kv.keys())}'
             )
 
-    def prepare_flashmla_metadata(  # old version of FlashMLA
-        self,
-        num_q_tokens_per_head_k,
-        seq_len_delta: BatchedSeqLenDelta,
-        is_prefill=False,
-    ):
-        # reuse self.metadata for both sparse/dense attn
-        # NOTE: for prefill, organized as a single batch
-        if self.index_topk is not None:  # sparse attn: DSA
-            metadata, num_splits = flash_mla.get_mla_metadata(
-                (
-                    seq_len_delta.new.lens_tensor_device.sum(
-                        0, keepdim=True, dtype=torch.int32
-                    )
-                    if is_prefill
-                    else seq_len_delta.new.lens_tensor_device
-                ),
-                num_q_tokens_per_head_k=num_q_tokens_per_head_k,
-                num_heads_q=self.local_n_heads,
-                num_heads_k=1,
-                is_fp8_kvcache=True,
-                topk=self.index_topk,
-            )
-        else:  # dense attn
-            metadata, num_splits = flash_mla.get_mla_metadata(
-                seq_len_delta.new.lens_tensor_device,
-                num_q_tokens_per_head_k,
-                self.kv_heads,  # h_q is not necessary for dense attn
-            )
-
-        return metadata, num_splits
-
     def prepare_metadata_for_prefill(
         self,
         seq_len_delta: BatchedSeqLenDelta,
@@ -485,16 +420,9 @@ class FlashMLABackend(TritonAttnBackend):
             return
 
         # fp8 sparse attn
-        num_q_tokens_per_head_k = seq_len_delta.delta_total_len * self.local_n_heads
-        # new version
-        # self.metadata_prefill, self.num_splits_prefill = flash_mla.get_mla_metadata()
-        # old version
         # prefill does not go through graph
-        self.metadata_prefill, self.num_splits_prefill = self.prepare_flashmla_metadata(
-            num_q_tokens_per_head_k,
-            seq_len_delta,
-            True,
-        )
+        # new version
+        self.metadata_prefill, _ = flash_mla.get_mla_metadata()
 
     @override
     def mla_prefill_ragged_qo_paged_kv(  # support both bf16/fp8 sparse attn
@@ -523,7 +451,9 @@ class FlashMLABackend(TritonAttnBackend):
                 seq_len_delta,
                 return_ragged=True,
             )
-            return super().mla_prefill_ragged_qkvo(  # TODO: the fall-back might be incorrect
+            # NOTE: current FlashMLA backend does not support dense bf16 prefill
+            # call triton backend for dense bf16 prefill
+            return super().mla_prefill_ragged_qkvo(
                 q_nope,
                 q_pe,
                 ragged_kv,
@@ -532,35 +462,9 @@ class FlashMLABackend(TritonAttnBackend):
                 softmax_scale=softmax_scale,
                 topk_indices=None,
             )
+        # NOTE: currently use bf16 kv with fp8 kv chunked prefill make inaccurate output
 
-        if self.use_fp8_cache:  # fp8 prefill/chunked prefill: fwd then quant
-            if seq_len_delta.is_first_prefill_chunk:
-                output = self.mla_prefill_ragged_qkvo(
-                    q_nope,
-                    q_pe,
-                    kv,
-                    seq_len_delta,
-                    causal=True,
-                    softmax_scale=softmax_scale,
-                    topk_indices=topk_indices,
-                )
-                # fp8 kv quant
-                kv = quant_pertoken_kvcache_dsa(kv)
-                # append to paged table
-                self.update_paged_mla_kv(
-                    kv_lora_rank,
-                    kv,
-                    kv_cache,
-                    seq_len_delta,
-                )
-                return output
-            else:
-                # restriction of old-version FlashMLA
-                assert (
-                    q_nope.shape[0] <= 4096
-                ), f"flash_mla_with_kvcache() does not support s_q > 4096: s_q={q_nope.shape[0]}"
-
-        # quant then forward
+        # quant then fwd with kvcache
         q = torch.cat([q_nope, q_pe], dim=-1)
 
         if self.use_fp8_cache:
@@ -586,34 +490,24 @@ class FlashMLABackend(TritonAttnBackend):
         if softmax_scale is None:
             softmax_scale = 1.0 / ((q_pe.shape[-1] + self.qk_nope_head_dim) ** 0.5)
 
-        # if don't quant, save cache than compute attn
-        if not self.use_fp8_cache:
-            # call bf16 sparse attn
-            return self.flashmla_sparse_fwd_bf16(
+        if self.use_fp8_cache:
+            return self.flashmla_sparse_fwd_fp8(
                 q,
                 paged_kv,
-                softmax_scale,
                 topk_indices,
+                kv_cache.block_table,
+                seq_len_delta,
+                softmax_scale=softmax_scale,
+                is_decode=False,
             )
 
-        # NOTE: if quant:
-        # if no cache to access, call bf16 sparse attn
-        # compute attn then save cache
-        # if seq_len_delta.is_first_prefill_chunk:
-        #     compute attn first with bf16 kv
-
-        # if accessing cache is required, quant then compute attn (mixed-batch or decode)
-
-        # compute attn with fp8 kv
-        output = self.flashmla_sparse_fwd_fp8(
+        output = self.flashmla_sparse_fwd_bf16(
             q,
             paged_kv,
+            softmax_scale,
             topk_indices,
-            kv_cache.block_table,
-            seq_len_delta,
-            softmax_scale=softmax_scale,
-            is_decode=False,
         )
+
         return output
 
     def prepare_metadata_for_decode(
@@ -623,49 +517,15 @@ class FlashMLABackend(TritonAttnBackend):
         block_size,
         softmax_scale=None,
     ):
-        # metadata is not necessary for bf16 sparse attn
+        # metadata is not necessary when decoding with bf16 sparse attn
         if not self.use_fp8_cache and self.index_topk is not None:
             return
 
-        # self.metadata, self.num_splits = flash_mla.get_mla_metadata()  # new version
-
-        s_q = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
-        num_q_tokens_per_head_k = (
-            s_q * self.local_n_heads // self.kv_heads
-        )  # kv_heads=1 for mla
-
-        max_batch_size_per_dp = ceil_div(self.args.infer.max_reqs, get_dp_size())
-
-        if self.index_topk is not None:  # sparse attn: DSA
-            metadata, num_splits = flash_mla.get_mla_metadata(  # old version
-                seq_len_delta.new.lens_tensor_device,
-                num_q_tokens_per_head_k=num_q_tokens_per_head_k,
-                num_heads_q=self.local_n_heads,
-                num_heads_k=1,
-                is_fp8_kvcache=True,
-                topk=self.index_topk,
-            )
-        else:  # dense attn
-            metadata, num_splits = flash_mla.get_mla_metadata(
-                seq_len_delta.new.lens_tensor_device,
-                num_q_tokens_per_head_k,
-                self.kv_heads,  # h_q is not necessary for dense attn
-            )
-
-        # new verison
-        # self.metadata, self.num_splits = metadata, num_splits
-        # old version
-        # reuse self.metadata for both sparse/dense attn
-        if self.metadata is None:
-            self.metadata = StaticTensor(metadata)  # `metadata` has a fixed shape
-        else:
-            self.metadata.set(metadata)
-        if self.num_splits is None:
-            self.num_splits = StaticTensor(
-                num_splits, max_nelem=max_batch_size_per_dp + 1
-            )  # `num_splits`'s shape is always (batch_size + 1,)
-        else:
-            self.num_splits.set(num_splits)
+        # NOTE: the actual metadata intialization in the updated version of
+        # FlashMLA occurs during the first execution of flash_mla_with_kvcache in
+        # decode, which should be captured in decode graph. Thus static tensor is
+        # not needed anymore. The input params are reserved for compatibility.
+        self.metadata_decode, _ = flash_mla.get_mla_metadata()
 
     @override
     def mla_decode_paged_kv(

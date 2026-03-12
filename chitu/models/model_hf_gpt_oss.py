@@ -371,7 +371,6 @@ class TransformerHFGptOss(TransformerHFLlama):
         state_dict: dict[str, Any],
         *,
         skip_preprocess: bool = False,
-        is_layerwise: bool = False,
         replace: bool = True,
     ) -> dict[str, Any]:
         if not skip_preprocess and replace:
@@ -399,7 +398,6 @@ class TransformerHFGptOss(TransformerHFLlama):
         return super().preprocess_state_dict_parallel(
             state_dict,
             skip_preprocess=skip_preprocess,
-            is_layerwise=is_layerwise,
             replace=replace,
         )
 
