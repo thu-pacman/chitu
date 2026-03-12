@@ -93,7 +93,12 @@ MODEL_SCHEDULE_OVERLAP="${MODEL_SCHEDULE_OVERLAP:-False}"
 
 # Router
 PD_CONFIG_NAME="${PD_CONFIG_NAME:-pd_disagg_serve_config}"
-PD_ROUTER_PORT="${PD_ROUTER_PORT:-21003}"
+PD_ROUTER_PORT="${PD_ROUTER_PORT:-}"
+PD_ROUTER_STATS_PORT="${PD_ROUTER_STATS_PORT:-}"
+PD_ROUTER_TOKEN_PORT="${PD_ROUTER_TOKEN_PORT:-}"
+PD_COORDINATION_PORT="${PD_COORDINATION_PORT:-}"
+PD_METADATA_SYNC_PORT="${PD_METADATA_SYNC_PORT:-}"
+PD_BOOTSTRAP_PORT="${PD_BOOTSTRAP_PORT:-}"
 PD_CACHE_TYPE="${PD_CACHE_TYPE:-paged}"
 ROUTER_PREFILL_MAX_BATCH_SIZE="${ROUTER_PREFILL_MAX_BATCH_SIZE:-32}"
 ROUTER_PREFILL_MAX_TOTAL_TOKENS="${ROUTER_PREFILL_MAX_TOTAL_TOKENS:-8192}"
@@ -105,7 +110,7 @@ PD_APPTAINER_BIND_CODE="${PD_APPTAINER_BIND_CODE:-1}"
 PD_APPTAINER_EXTRA_ARGS_STR="${PD_APPTAINER_EXTRA_ARGS_STR:-}"
 PD_APPTAINER_CWD="${PD_APPTAINER_CWD:-/workspace/chitu}"
 
-# 实例端口基准
+PD_JOB_PORT_OFFSET="${PD_JOB_PORT_OFFSET:-0}"
 PREFILL_BASE_PORT="${PREFILL_BASE_PORT:-29620}"
 DECODE_BASE_PORT="${DECODE_BASE_PORT:-29630}"
 PREFILL_MASTER_BASE_PORT="${PREFILL_MASTER_BASE_PORT:-29510}"
@@ -207,6 +212,35 @@ infer_nnodes_and_nproc() {
   echo "${nnodes} ${nproc}"
 }
 
+calc_job_port_offset() {
+  local job_id="${1:-0}"
+  [ -n "${job_id}" ] || { echo 0; return 0; }
+  echo $((job_id % 10000))
+}
+
+apply_job_port_defaults() {
+  local job_id="${1:-}"
+  PD_JOB_PORT_OFFSET="$(calc_job_port_offset "${job_id}")"
+  if [ -z "${PD_ROUTER_PORT}" ]; then
+    PD_ROUTER_PORT=$((21003 + PD_JOB_PORT_OFFSET))
+  fi
+  if [ -z "${PD_ROUTER_STATS_PORT}" ]; then
+    PD_ROUTER_STATS_PORT=$((29600 + PD_JOB_PORT_OFFSET))
+  fi
+  if [ -z "${PD_ROUTER_TOKEN_PORT}" ]; then
+    PD_ROUTER_TOKEN_PORT=$((29700 + PD_JOB_PORT_OFFSET))
+  fi
+  if [ -z "${PD_COORDINATION_PORT}" ]; then
+    PD_COORDINATION_PORT=$((29800 + PD_JOB_PORT_OFFSET))
+  fi
+  if [ -z "${PD_METADATA_SYNC_PORT}" ]; then
+    PD_METADATA_SYNC_PORT=$((29801 + PD_JOB_PORT_OFFSET))
+  fi
+  if [ -z "${PD_BOOTSTRAP_PORT}" ]; then
+    PD_BOOTSTRAP_PORT=$((8080 + PD_JOB_PORT_OFFSET))
+  fi
+}
+
 # 统一解析 prefill/decode 实例规格（替代原来两个独立函数）
 parse_instance_spec() {
   local kind="$1" idx="$2" spec="$3"
@@ -248,8 +282,8 @@ parse_instance_spec() {
   [ -n "${full_warmup}" ] && overrides="${overrides:+${overrides};}infer.full_warmup=${full_warmup}"
 
   # 自动端口
-  _v="${KIND}_BASE_PORT";        [ -n "${port}" ]        || port=$(( ${!_v} + idx ))
-  _v="${KIND}_MASTER_BASE_PORT"; [ -n "${master_port}" ] || master_port=$(( ${!_v} + idx ))
+  _v="${KIND}_BASE_PORT";        [ -n "${port}" ]        || port=$(( ${!_v} + PD_JOB_PORT_OFFSET + idx ))
+  _v="${KIND}_MASTER_BASE_PORT"; [ -n "${master_port}" ] || master_port=$(( ${!_v} + PD_JOB_PORT_OFFSET + idx ))
 
   # 推导 nnodes / nproc
   local world=$((tp * pp * dp))
@@ -357,6 +391,7 @@ pd_node_main() {
   while IFS= read -r _l; do [ -n "${_l}" ] && DECODE_SPECS+=("${_l}"); done <<< "${PD_DECODE_SPECS_STR:-}"
   PREFILL_DEFAULT_SPEC="${PD_PREFILL_DEFAULT_SPEC:-}"
   DECODE_DEFAULT_SPEC="${PD_DECODE_DEFAULT_SPEC:-}"
+  apply_job_port_defaults "${SLURM_JOB_ID:-}"
   parse_all_specs
   allocate_nodes
 
@@ -377,7 +412,7 @@ pd_node_main() {
   echo "ROUTER: ${ROUTER_IP}:${PD_ROUTER_PORT}"
 
   cleanup(){ echo "Cleaning up..."; pkill -P $$ || true; wait || true; }
-  trap cleanup INT TERM
+  trap cleanup EXIT INT TERM
 
   # Apptainer 参数
   read -r -a APPTAINER_EXTRA_ARGS <<< "${PD_APPTAINER_EXTRA_ARGS_STR:-}"
@@ -409,6 +444,10 @@ pd_node_main() {
     "infer.cache_type=${PD_CACHE_TYPE}"
     "dp_config.enabled=True" "dp_config.router.is_router=False"
     "dp_config.router.host=${ROUTER_IP}" "dp_config.scheduler_base_host=0.0.0.0"
+    "dp_config.router.stats_port=${PD_ROUTER_STATS_PORT}" "dp_config.router.token_port=${PD_ROUTER_TOKEN_PORT}"
+    "dp_config.router.pd_disaggregation.coordination_port=${PD_COORDINATION_PORT}"
+    "dp_config.router.pd_disaggregation.metadata_sync_port=${PD_METADATA_SYNC_PORT}"
+    "dp_config.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
     "infer.use_cuda_graph=${MODEL_USE_CUDA_GRAPH}" "infer.schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
     "float_16bit_variant=${MODEL_FLOAT16_VARIANT}"
     "dp_config.dp_size=${PD_TOTAL_INSTANCES}"
@@ -422,6 +461,10 @@ pd_node_main() {
       "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
       dp_config.enabled=True dp_config.dp_size="${PD_TOTAL_INSTANCES}"
       dp_config.router.is_router=True dp_config.router.host=0.0.0.0 dp_config.router.port="${PD_ROUTER_PORT}"
+      "dp_config.router.stats_port=${PD_ROUTER_STATS_PORT}" "dp_config.router.token_port=${PD_ROUTER_TOKEN_PORT}"
+      "dp_config.router.pd_disaggregation.coordination_port=${PD_COORDINATION_PORT}"
+      "dp_config.router.pd_disaggregation.metadata_sync_port=${PD_METADATA_SYNC_PORT}"
+      "dp_config.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
     )
     prefill_list=()
     for i in "${!PREFILL_START_NODE[@]}"; do
@@ -641,6 +684,8 @@ export NVSHMEM_IB_DEVICE="${NVSHMEM_IB_DEVICE:-bond0}"
 
 # ── 打印摘要 ──
 echo "=== PD Disagg (nodes=${PD_NODES} gpus=${PD_GPUS_PER_NODE}) ==="
+echo "router_port=${PD_ROUTER_PORT:-auto} job_port_offset=${PD_JOB_PORT_OFFSET}"
+echo "stats_port=${PD_ROUTER_STATS_PORT} token_port=${PD_ROUTER_TOKEN_PORT} coordination_port=${PD_COORDINATION_PORT} metadata_sync_port=${PD_METADATA_SYNC_PORT} bootstrap_port=${PD_BOOTSTRAP_PORT}"
 echo "model=${MODEL_CONFIG}  ckpt=${MODEL_CKPT_DIR}  sif=${PD_SIF_FILE}"
 echo "model: float16=${MODEL_FLOAT16_VARIANT} cuda_graph=${MODEL_USE_CUDA_GRAPH} schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
 echo "instances: prefill=${PREFILL_COUNT} decode=${DECODE_COUNT}"
@@ -660,6 +705,8 @@ SRUN_EXTRA=""
 
 srun ${SRUN_EXTRA} \
   --export=ALL \
+  --kill-on-bad-exit=1 \
+  --wait=0 \
   --nodes="${PD_NODES}" \
   --ntasks="${PD_NODES}" \
   --ntasks-per-node=1 \
