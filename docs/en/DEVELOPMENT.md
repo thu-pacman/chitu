@@ -568,7 +568,9 @@ torchrun --nnodes 1 \
     infer.use_cuda_graph=True
 ```
 
-### Test the service via OpenAI-compatible API (Chat Completions)
+### OpenAI-compatible API (Chat Completions)
+
+Test the service via OpenAI-compatible API:
 
 ```bash
 curl localhost:21002/v1/chat/completions \
@@ -579,24 +581,6 @@ curl localhost:21002/v1/chat/completions \
         "role": "system",
         "content": "You are a helpful assistant."
       },
-      {
-        "role": "user",
-        "content": "What is machine learning?"
-      }
-    ]
-  }'
-```
-
-### Test the service via Anthropic-compatible API (Messages)
-
-```bash
-curl localhost:21002/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: example_key" \
-  -d '{
-    "model": "DeepSeek-R1",
-    "max_completion_tokens": 128,
-    "messages": [
       {
         "role": "user",
         "content": "What is machine learning?"
@@ -619,12 +603,34 @@ Supported optional JSON arguments are:
 | `stream`                | `bool`           | If true, make the HTTP response streaming, which can be used with `requests.post(stream=True)` in Python. |
 | `stop_with_eos`         | `bool`           | If false, keep generating outputs until the number of output tokens reaches `max_completion_tokens`, even if the answer has already ended, useful for a stable speed test. |
 | `chat_template_kwargs`  | `dict[str, Any]` | Additional argument for the chat template. The only currently supported argument is: `{"enable_thinking": false}` for disabling thinking mode for GLM-4.5 models. |
+| `tools`                 | `list[dict]`     | Tool definitions of tool calling. Please refer https://developers.openai.com/api/docs/guides/function-calling/ |
+| `tool_choice`           | `str or dict`    | Required number of output tool calling. Supports none, auto, required, {"type": "function", "name": "$TOOL_NAME"} |
 
 Additional HTTP headers:
 
-| Name                         | Description                                                  |
-| ---------------------------- | ------------------------------------------------------------ |
-| `Authorization`              | Format: `Bearer <api_key>`. If `<api_key>` is in `serve.api_keys`, the request will be prioritized. See the `serve.api_keys` configuration when starting the service for details. |
+| Name            | Description                                                  |
+| --------------- | ------------------------------------------------------------ |
+| `Authorization` | Format: `Bearer <api_key>`. If `<api_key>` is in `serve.api_keys`, the request will be prioritized. See the `serve.api_keys` configuration when starting the service for details. |
+
+### Anthropic-compatible API (Messages)
+
+Test the service via Anthropic-compatible API:
+
+```bash
+curl localhost:21002/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: example_key" \
+  -d '{
+    "model": "DeepSeek-R1",
+    "max_completion_tokens": 128,
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is machine learning?"
+      }
+    ]
+  }'
+```
 
 ## Performance Benchmarking
 

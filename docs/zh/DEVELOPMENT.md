@@ -569,7 +569,9 @@ torchrun --nnodes 1 \
     infer.use_cuda_graph=True
 ```
 
-### 使用 OpenAI 兼容接口测试（Chat Completions）
+### OpenAI 兼容接口（Chat Completions）
+
+测试 OpenAI 兼容接口：
 
 ```bash
 curl localhost:21002/v1/chat/completions \
@@ -580,24 +582,6 @@ curl localhost:21002/v1/chat/completions \
         "role": "system",
         "content": "You are a helpful assistant."
       },
-      {
-        "role": "user",
-        "content": "What is machine learning?"
-      }
-    ]
-  }'
-```
-
-### 使用 Anthropic 兼容接口测试（Messages API）
-
-```bash
-curl localhost:21002/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: example_key" \
-  -d '{
-    "model": "DeepSeek-R1",
-    "max_completion_tokens": 128,
-    "messages": [
       {
         "role": "user",
         "content": "What is machine learning?"
@@ -620,12 +604,34 @@ curl localhost:21002/v1/messages \
 | `stream`                | `bool`           | 若为 `true` 以流模式响应 HTTP 请求，在 Python 中可通过 `requests.post(stream=True)` 使用。 |
 | `stop_with_eos`         | `bool`           | 若为 `false`，即使回答结束，也继续输出，直到输出 token 数达到 `max_completion_tokens` 限制。可用于进行稳定的速度测试。 |
 | `chat_template_kwargs`  | `dict[str, Any]` | Chat template 的额外参数。目前支持的有： `{"enable_thinking": false}` 可禁用 GLM-4.5 模型的思考模式。 |
+| `tools`                 | `list[dict]`     | 工具调用的工具定义，请参考 https://developers.openai.com/api/docs/guides/function-calling/ |
+| `tool_choice`           | `str or dict`    | 工具调用的输出数量要求，支持 none, auto, required, {"type": "function", "name": "工具名"} |
 
 额外的 HTTP 请求头：
 
-| 名称                         | 含义                                                         |
-| ---------------------------- | ------------------------------------------------------------ |
-| `Authorization`              | 格式：`Bearer <api_key>`。若 `<api_key>` 在 `serve.api_keys` 启动设置项中，该请求将被优先处理。详见服务启动时的 `serve.api_keys` 配置。 |
+| 名称            | 含义                                                         |
+| --------------- | ------------------------------------------------------------ |
+| `Authorization` | 格式：`Bearer <api_key>`。若 `<api_key>` 在 `serve.api_keys` 启动设置项中，该请求将被优先处理。详见服务启动时的 `serve.api_keys` 配置。 |
+
+### Anthropic 兼容接口（Messages API）
+
+测试 Anthropic 兼容接口：
+
+```bash
+curl localhost:21002/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: example_key" \
+  -d '{
+    "model": "DeepSeek-R1",
+    "max_completion_tokens": 128,
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is machine learning?"
+      }
+    ]
+  }'
+```
 
 ## 性能测试
 
