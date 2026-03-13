@@ -421,6 +421,7 @@ class ChatFormatHF:
                 return_dict=True,
                 add_generation_prompt=True,
                 return_tensors="pt",
+                **chat_template_kwargs,
             )
             if "pixel_values" in inputs:
                 return (

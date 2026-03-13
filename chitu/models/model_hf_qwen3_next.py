@@ -32,6 +32,7 @@ from chitu.ops import (
     update_singleton_paged_kv_cache,
     read_from_singleton_paged_kv_cache,
     apply_rotary_pos_emb,
+    apply_rotary_pos_emb_partial,
     chunk_gated_delta_rule,
     recurrent_gated_delta_rule,
     silu_and_mul,
@@ -293,7 +294,7 @@ class AttentionQwen3Next(AttentionHFLlama):
         layer_id,
         cache,
         attn_backend,
-        rotary_type="separated-half",
+        rotary_type="separated",
         op_impl: str = "torch",
         checkpoint_prefix="",
     ):
@@ -320,6 +321,8 @@ class AttentionQwen3Next(AttentionHFLlama):
             checkpoint_prefix=f"{checkpoint_prefix}.gate",
         )
 
+        self.partial_rotary_factor = float(getattr(args, "partial_rotary_factor", 0.5))
+
     def forward(
         self,
         x: torch.Tensor,
@@ -338,7 +341,18 @@ class AttentionQwen3Next(AttentionHFLlama):
         if hasattr(self, "k_norm"):
             xk = self.k_norm(xk)
 
-        xq, xk = apply_rotary_pos_emb(xq, xk, freqs_cis, rotary_type=self.rotary_type)
+        assert (xq.shape[-1] * self.partial_rotary_factor) % 1 == 0
+        assert (xk.shape[-1] * self.partial_rotary_factor) % 1 == 0
+        xq, xk, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
+            xq,
+            xk,
+            freqs_cis,
+            q_rotary_end=int(xq.shape[-1] * self.partial_rotary_factor),
+            k_rotary_end=int(xk.shape[-1] * self.partial_rotary_factor),
+            rotary_type=self.rotary_type,
+            inplace=True,
+            impl="auto",
+        )
 
         output = self.attn_backend(
             xq,
@@ -503,7 +517,7 @@ class TransformerBlockHFQwen3NextBase(TransformerBlock):
         cache_managers: dict[str, KVCacheManagerBase],
         attn_backend,
         op_impl,
-        rotary_type="separated-half",
+        rotary_type="separated",
         mlp_type=ParallelMoeBlockQwen3Next,
         *,
         checkpoint_prefix,
@@ -530,7 +544,7 @@ class TransformerBlockHFQwen3NextFull(TransformerBlockHFQwen3NextBase):
         cache_managers: dict[str, KVCacheManagerBase],
         attn_backend,
         op_impl,
-        rotary_type="separated-half",
+        rotary_type="separated",
         mlp_type=ParallelMoeBlockQwen3Next,
         *,
         checkpoint_prefix,
@@ -569,7 +583,7 @@ class TransformerBlockHFQwen3NextLinear(TransformerBlockHFQwen3NextBase):
         cache_managers: dict[str, KVCacheManagerBase],
         attn_backend,
         op_impl,
-        rotary_type="separated-half",
+        rotary_type="separated",
         mlp_type=ParallelMoeBlockQwen3Next,
         *,
         checkpoint_prefix,
@@ -608,7 +622,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
         pipeline_parallel_size: int,
         tensor_parallel_size: int,
         attn_backend: AttnBackend,
-        rotary_type: str = "separated-half",
+        rotary_type: str = "separated",
         op_impl: str = "torch",
         **kvargs,
     ):
@@ -663,6 +677,15 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
         h = self.norm(h)
         h = self.lm_head(h)
         return h
+
+    @override
+    def precompute_freqs_cis(self, max_position_embeddings, device):
+        partial_rotary_factor = float(
+            getattr(self.params, "partial_rotary_factor", 0.25)
+        )
+        return super().precompute_freqs_cis(
+            max_position_embeddings, device, partial_rotary_factor
+        )
 
     def process_state_dict_for_splitting_q_gate(self, checkpoint):
         checkpoint_keys = list(checkpoint.keys())

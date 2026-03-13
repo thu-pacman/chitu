@@ -20,7 +20,7 @@ install_requires = [
     #    torch back to the official version, please use `-c` on `pip`.
     "torch",
     "torchvision",
-    "transformers[torch]>=4.57.3,<=5.2.0",  # >=4.57.3 required by qwen3-vl-235b
+    "transformers[torch]==5.2.0",  # >=5.2.0 required by qwen3.5
     "safetensors",
     "fire",
     "tiktoken>=0.7.0",  # Required by glm4

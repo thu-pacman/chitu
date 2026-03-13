@@ -410,7 +410,9 @@ class Backend:
             Initialized processor or None if not a multimodal model
         """
 
-        if not hasattr(args.models, "vision_config"):
+        if not hasattr(args.models, "vision_config") or (
+            args.models.type == ModelType.HF_QWEN3_5 and args.infer.language_model_only
+        ):
             return None
 
         processor = Processor(path=args.models.processor_path, trust_remote_code=True)
@@ -850,7 +852,11 @@ class Backend:
                         param.data = param.data.cuda(non_blocking=non_blocking)
                         if (
                             Backend.args.models.type
-                            in {ModelType.HF_QWEN3_VL, ModelType.HF_QWEN3_VL_MOE}
+                            in {
+                                ModelType.HF_QWEN3_VL,
+                                ModelType.HF_QWEN3_VL_MOE,
+                                ModelType.HF_QWEN3_5,
+                            }
                             and not param.data.is_contiguous()
                         ):
                             param.data = param.data.contiguous()
@@ -873,6 +879,7 @@ class Backend:
                     if Backend.args.models.type in {
                         ModelType.HF_QWEN3_VL,
                         ModelType.HF_QWEN3_VL_MOE,
+                        ModelType.HF_QWEN3_5,
                     } and (
                         (buf_cuda := m._buffers[key]) is not None
                         and not buf_cuda.is_contiguous()
@@ -1091,6 +1098,7 @@ class Backend:
                 ModelType.DEEPSEEK_V3,
                 ModelType.HF_QWEN2_VL,
                 ModelType.HF_QWEN3_NEXT,
+                ModelType.HF_QWEN3_5,
             }:
                 if Backend._support_layerwise_loading():
                     checkpoint = Backend._load_hf_checkpoint_layerwise(model, args)
@@ -1326,7 +1334,10 @@ class Backend:
         attn_backend_type = Backend._get_attention_backend_type(args)
 
         # Initialize cache manager
-        if args.models.type == ModelType.HF_QWEN3_NEXT:
+        if (
+            args.models.type == ModelType.HF_QWEN3_NEXT
+            or args.models.type == ModelType.HF_QWEN3_5
+        ):
 
             def is_full_attention(layer_id):
                 return (layer_id + 1) % args.models.full_attention_interval == 0

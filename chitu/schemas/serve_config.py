@@ -93,6 +93,7 @@ class InferConfig(InferConfigLegacy):
 
     moe: MoEConfig = MISSING
     mtp_size: int = MISSING
+    language_model_only: bool = MISSING
 
 
 @dataclass
