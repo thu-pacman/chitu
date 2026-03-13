@@ -724,18 +724,27 @@ class TransformerHFLlama(Transformer):
             h = self.embed_tokens.forward_as_lm_head(h)
         return h
 
-    def precompute_freqs_cis(self, max_position_embeddings, device):
+    def precompute_freqs_cis(
+        self,
+        max_position_embeddings,
+        device,
+        partial_rotary_factor: float | None = None,
+    ):
         head_dim = (
             self.params.head_dim
             if "head_dim" in self.params
             else self.params.dim // self.params.n_heads
         )
+
+        if self.rotary_type in ["separated-half", "interleaved-half"]:
+            rotary_dim = head_dim // 2
+        elif partial_rotary_factor is not None:
+            rotary_dim = int(head_dim * partial_rotary_factor)
+        else:
+            rotary_dim = head_dim
+
         self.rotary_emb = RotaryEmbeddingHFLlama(
-            (
-                head_dim // 2
-                if self.rotary_type in ["separated-half", "interleaved-half"]
-                else head_dim
-            ),
+            dim=rotary_dim,
             max_position_embeddings=max_position_embeddings,
             base=float(self.params.rope_theta),
             rope_scaling=(

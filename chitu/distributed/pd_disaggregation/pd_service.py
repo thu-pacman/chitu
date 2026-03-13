@@ -409,7 +409,7 @@ class PDSchedulerService:
 
         # Stats reporting socket
         self.stats_socket = self.context.socket(zmq.PUSH)
-        stats_port = 29600  # Router stats port
+        stats_port = self.args.dp_config.router.stats_port
 
         router_host = self.args.dp_config.router.host
         if router_host in ["0.0.0.0", "::", "", None]:

@@ -87,6 +87,15 @@
 | Qwen3-Next-80B-A3B-Instruct-FP8 |  | `models=Qwen3-Next-80B-A3B-Instruct-FP8` | https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 |
 | Qwen3-VL-235B-A22B-Instruct |  | `models=Qwen3-VL-235B-A22B-Instruct` | https://huggingface.co/Qwen/Qwen3-VL-235B-A22B-Instruct |
 | Qwen3-VL-8B-Instruct |  | `models=Qwen3-VL-8B-Instruct` | https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct |
+| Qwen3_5-0.8B |  | `models=Qwen3_5-0.8B` | https://huggingface.co/Qwen/Qwen3.5-0.8B |
+| Qwen3_5-122B-A10B |  | `models=Qwen3_5-122B-A10B` | https://huggingface.co/Qwen/Qwen3.5-122B-A10B |
+| Qwen3_5-27B |  | `models=Qwen3_5-27B` | https://huggingface.co/Qwen/Qwen3.5-27B |
+| Qwen3_5-27B-FP8 |  | `models=Qwen3_5-27B-FP8` | https://huggingface.co/Qwen/Qwen3.5-27B-FP8 |
+| Qwen3_5-2B |  | `models=Qwen3_5-2B` | https://huggingface.co/Qwen/Qwen3.5-2B |
+| Qwen3_5-35B-A3B |  | `models=Qwen3_5-35B-A3B` | https://huggingface.co/Qwen/Qwen3.5-35B-A3B |
+| Qwen3_5-35B-A3B-FP8 |  | `models=Qwen3_5-35B-A3B-FP8` | https://huggingface.co/Qwen/Qwen3.5-35B-A3B-FP8 |
+| Qwen3_5-4B |  | `models=Qwen3_5-4B` | https://huggingface.co/Qwen/Qwen3.5-4B |
+| Qwen3_5-9B |  | `models=Qwen3_5-9B` | https://huggingface.co/Qwen/Qwen3.5-9B |
 | Seed-OSS-36B-Instruct |  | `models=Seed-OSS-36B-Instruct` | https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct |
 | glm-4-9b-chat |  | `models=glm-4-9b-chat` | https://huggingface.co/zai-org/glm-4-9b-chat-hf |
 | gpt-oss-120b-BF16 |  | `models=gpt-oss-120b-BF16` | https://huggingface.co/unsloth/gpt-oss-120b-BF16 |

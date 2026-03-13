@@ -215,6 +215,10 @@ infer:
   # Acceptable values: A positive integer.
   mtp_size: 1
 
+  # This parameter is only used for the qwen3.5 model. If this parameter is true, 
+  # you can skip loading the vision encoder and only start the language model.
+  language_model_only: False
+
   # Whether to overlap scheduling with tensor computation. We recommand to keep this feature
   # on whenever supported.
   #

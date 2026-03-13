@@ -172,7 +172,8 @@ def run_pipe_or_tensor_parallelism(args, timers):
                 num_reqs=args.infer.max_reqs,
                 max_new_tokens=args.request.max_new_tokens,
                 frequency_penalty=args.request.frequency_penalty,
-                is_vl=hasattr(args.models, "vision_config"),
+                is_vl=hasattr(args.models, "vision_config")
+                and not args.infer.language_model_only,
             )
             for req in reqs:
                 TaskPool.add(Task(req.request_id, req, stop_with_eos=True))
@@ -214,7 +215,8 @@ def run_normal(args, timers):
             num_reqs=args.infer.max_reqs,
             max_new_tokens=args.request.max_new_tokens,
             frequency_penalty=args.request.frequency_penalty,
-            is_vl=hasattr(args.models, "vision_config"),
+            is_vl=hasattr(args.models, "vision_config")
+            and not args.infer.language_model_only,
         )
         for req in reqs:
             TaskPool.add(Task(req.request_id, req, stop_with_eos=True))

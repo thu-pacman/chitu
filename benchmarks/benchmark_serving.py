@@ -457,6 +457,7 @@ class BenchmarkServing:
                     "model": self.config.model_name,
                     "messages": messages_list[i],
                     "max_completion_tokens": self.config.output_length,
+                    "max_tokens": self.config.output_length,
                     "stream": True,
                     "temperature": 1.0,
                     "top_p": 0.9,
@@ -465,6 +466,8 @@ class BenchmarkServing:
                         self.config.batch_size if self.config.force_max_min_bs else 1
                     ),
                     "stop_with_eos": False,
+                    "ignore_eos": True,
+                    "stream_options": {"include_usage": True},
                 }
 
                 tasks.append(
@@ -731,6 +734,7 @@ def main():
         outputs=outputs,
         dur_s=total_time,
         selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
+        config=config,
     )
 
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))

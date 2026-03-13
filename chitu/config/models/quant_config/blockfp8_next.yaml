@@ -17,6 +17,8 @@ quant:
       type : blockfp8
     - regex : '\.in_proj_qkvz'
       type : blockfp8
+    - regex : '\.in_proj_qkv'
+      type : blockfp8
     - regex : '\.in_proj_q'
       type : blockfp8
     - regex : '\.in_proj_k'
