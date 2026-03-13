@@ -63,3 +63,11 @@ else
     # NOTE: A better practice is to use a multi-stage build. But currently `muxi.Dockerfile`
     # requires an additional `docker run` stage to build. We will consider this in the future.
 fi
+
+# 给权限让gitlab-runner删除，如果手动都删了，可能会不太方便debug；只改出问题的几个临时目录
+find . -name ".git" -prune -o \
+    -user root \( \
+        -path "*/__pycache__" -o -path "*/__pycache__/*" -o \
+        -path "*/cinfer.tmp" -o -path "*/cinfer.tmp/*" -o \
+        -path "*/build" -o -path "*/build/*" \
+    \) -exec chmod 777 {} +

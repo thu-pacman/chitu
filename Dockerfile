@@ -189,11 +189,16 @@ FROM basic_deps AS dependency_installer
 WORKDIR /workspace/chitu
 COPY --from=dependency_resolver /tmp/requirements.txt /tmp/requirements.txt
 
+COPY ./third_party ./third_party
+COPY ./csrc/cpuinfer ./csrc/cpuinfer
+
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
-RUN --mount=type=bind,source=./third_party,target=./third_party,readwrite \
-    --mount=type=bind,source=./csrc/cpuinfer,target=./csrc/cpuinfer,readwrite \
-    pip install --no-build-isolation -r /tmp/requirements.txt \
+#依赖 pytorch 的库应该一律都需要 --no-build-isolation。因为：
+# 1. pytorch 是个构建时依赖。
+# 2. pytorch 一般都要使用和具体卡以及其他基础软件（如 cuda）版本相关的版本。
+# 3. 如果没有 --no-build-isolation ，pip 会在构建时用单独的环境重新下载所有构建时依赖，此时无法指定上述版本。
+RUN pip install --no-build-isolation -r /tmp/requirements.txt \
         -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "pytest")
 
 #####################################
@@ -219,15 +224,16 @@ RUN rm -rf /workspace/chitu/*
 #####################################
 # Build Stage
 # 
-# This stage builds chitu.
-FROM dependency_installer AS build
+FROM basic_deps AS build
 
+WORKDIR /workspace/chitu
+COPY --from=dependency_installer /opt/conda /opt/conda
 COPY --from=wheel_builder /tmp/ /tmp/
 
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
 RUN pip install /tmp/*.whl \
-    -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "numpy" -e "transformers" -e "pytest")
+    -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "numpy" -e "transformers" -e "pytest" -e 'typing-extensions' -e 'typing_extensions')
 
 RUN rm -rf /tmp/*
 COPY ./test ./test
