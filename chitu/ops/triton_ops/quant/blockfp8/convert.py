@@ -242,7 +242,7 @@ def silu_and_mul_and_blockfp8_act_quant_kernel(
     silu_x1 = silu_x1_fp32.to(x1.dtype)
     x = silu_x1 * x2
 
-    s = tl.max(tl.abs(x)) / 448.0
+    s = tl.maximum(tl.max(tl.abs(x)), 1e-10) / 448.0
     y = x / s
     y = y.to(y_ptr.dtype.element_ty)
 
