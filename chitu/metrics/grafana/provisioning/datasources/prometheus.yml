@@ -1,0 +1,11 @@
+# Auto-provisioned Prometheus datasource for Chitu metrics.
+# This file is generated at runtime by GrafanaManager; manual edits will be overwritten.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://${PROMETHEUS_HOST}:${PROMETHEUS_PORT}
+    isDefault: true
+    editable: true

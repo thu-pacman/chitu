@@ -373,6 +373,9 @@ metrics:
   prometheus_data_dir: "prometheus_data" # prometheus data stoarge path, which is a folder
   prometheus_scrape_interval: 1 # prometheus server scrapes PrometheusMetricsCollectors every ${prometheus_scrape_interval} seconds.
   log_interval: 10
+  grafana_enabled: false # Set to true to auto-start a Grafana server on rank 0
+  grafana_host: 0.0.0.0 # Grafana server bind address
+  grafana_port: 9095 # Grafana HTTP port
 
 # Debugging options. These options have negative effect on performance and correctness, so please
 # don't set them in production.

@@ -633,6 +633,42 @@ curl localhost:21002/v1/messages \
   }'
 ```
 
+### Grafana 监控面板
+
+赤兔内置了 Grafana 监控面板，可在启动服务时自动启动 Grafana 服务器，提供实时的性能指标可视化（包括吞吐量、GPU 显存使用、KV cache 使用率等）。
+
+在启动服务时，通过以下参数启用 Grafana：
+
+| 参数 | 默认值 | 说明 |
+| :--- | :----- | :--- |
+| `metrics.grafana_enabled` | `false` | 是否在 Rank 0 上自动启动 Grafana 服务器 |
+| `metrics.grafana_host` | `localhost` | Grafana 服务绑定地址。设为 `0.0.0.0` 可允许外部访问 |
+| `metrics.grafana_port` | `9095` | Grafana HTTP 端口 |
+
+启动成功后，通过浏览器访问 `http://<host>:<port>` 即可查看预配置的监控面板。
+
+> 注：Grafana 仅在 Rank 0 进程上启动。使用 Docker 部署时，需要将 Grafana 端口映射到宿主机（如 `-p 9095:9095`）。
+
+示例：
+
+```bash
+torchrun --nnodes 1 \
+    --nproc_per_node 8 \
+    --master_port=22525 \
+    -m chitu \
+    models=DeepSeek-R1 \
+    models.ckpt_dir=/data/DeepSeek-R1 \
+    infer.tp_size=8 \
+    infer.cache_type=paged \
+    infer.attn_type=flash_mla \
+    infer.mla_absorb=absorb-without-precomp \
+    infer.max_reqs=8 \
+    infer.max_seq_len=4096 \
+    metrics.grafana_enabled=true \
+    metrics.grafana_host=0.0.0.0 \
+    metrics.grafana_port=9095
+```
+
 ## 性能测试
 
 本项目源码中附带了一个性能测试工具，用于测量推理的性能，包括 latency、throughput、tokens per second 等。

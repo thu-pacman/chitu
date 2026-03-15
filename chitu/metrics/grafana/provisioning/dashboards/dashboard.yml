@@ -1,0 +1,14 @@
+# Auto-provisioned dashboard provider for Chitu.
+# Tells Grafana to load dashboard JSON files from the dashboards directory.
+apiVersion: 1
+
+providers:
+  - name: chitu
+    orgId: 1
+    folder: Chitu
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: ${DASHBOARD_DIR}
+      foldersFromFilesStructure: false

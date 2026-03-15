@@ -632,6 +632,42 @@ curl localhost:21002/v1/messages \
   }'
 ```
 
+### Grafana Dashboard
+
+Chitu includes a built-in Grafana dashboard that can be auto-started alongside the inference service, providing real-time visualization of performance metrics (throughput, GPU memory usage, KV cache utilization, etc.).
+
+To enable Grafana, add the following arguments when starting a service:
+
+| Parameter | Default | Description |
+| :--- | :------ | :--- |
+| `metrics.grafana_enabled` | `false` | Whether to auto-start a Grafana server on Rank 0 |
+| `metrics.grafana_host` | `localhost` | Grafana server bind address. Set to `0.0.0.0` for external access |
+| `metrics.grafana_port` | `9095` | Grafana HTTP port |
+
+Once started, access the pre-configured dashboard at `http://<host>:<port>` in your browser.
+
+> Note: Grafana is only started on the Rank 0 process. When deploying with Docker, map the Grafana port to the host (e.g. `-p 9095:9095`).
+
+Example:
+
+```bash
+torchrun --nnodes 1 \
+    --nproc_per_node 8 \
+    --master_port=22525 \
+    -m chitu \
+    models=DeepSeek-R1 \
+    models.ckpt_dir=/data/DeepSeek-R1 \
+    infer.tp_size=8 \
+    infer.cache_type=paged \
+    infer.attn_type=flash_mla \
+    infer.mla_absorb=absorb-without-precomp \
+    infer.max_reqs=8 \
+    infer.max_seq_len=4096 \
+    metrics.grafana_enabled=true \
+    metrics.grafana_host=0.0.0.0 \
+    metrics.grafana_port=9095
+```
+
 ## Performance Benchmarking
 
 The framework provides a comprehensive benchmarking tool to measure inference performance, including latency, throughput, and TPS (Tokens Per Second).

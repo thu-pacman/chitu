@@ -9,6 +9,7 @@ from typing import Optional
 
 from chitu.backend import Backend
 from chitu.metrics import PrometheusServerManager
+from chitu.metrics.grafana_manager import GrafanaManager
 from chitu.global_vars import get_global_args
 from chitu.metrics.task_stats import count_tasks
 from chitu.utils import ceil_div
@@ -282,7 +283,7 @@ def start_prometheus_server_and_metrics_monitor(
     collector_addrs: list,
 ):
     """
-    Start the prometheus_server and metrics monitor.
+    Start the prometheus_server, optionally Grafana, and the metrics monitor.
 
     Args:
         collector_addrs: Prometheus Server pull metrics from these addresses.
@@ -293,20 +294,32 @@ def start_prometheus_server_and_metrics_monitor(
         return
 
     manager = PrometheusServerManager.get_instance(collector_addrs)
-    log_interval = get_global_args().metrics.log_interval
+    metrics_cfg = get_global_args().metrics
+    log_interval = metrics_cfg.log_interval
     if not manager.is_running():
         logger.warning(
             f"PrometheusServer is not running, MetricsMonitor will not start."
         )
         return
+
+    if getattr(metrics_cfg, "grafana_enabled", False):
+        try:
+            prometheus_url = (
+                f"http://{metrics_cfg.prometheus_listening_host}:{manager.server_port}"
+            )
+            GrafanaManager.get_instance(prometheus_url)
+        except Exception as e:
+            logger.warning(f"Failed to start Grafana: {e}")
+
     _global_monitor = MetricsMonitor(manager, log_interval)
     _global_monitor.start()
 
 
 def stop_metrics_monitor():
-    """Stop the global metrics monitor."""
+    """Stop the global metrics monitor and managed servers."""
     global _global_monitor
     if _global_monitor is not None:
         _global_monitor.stop()
         _global_monitor = None
+    GrafanaManager.cleanup()
     PrometheusServerManager.cleanup()
