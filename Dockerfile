@@ -1,5 +1,5 @@
 # `ARG` used in a `FROM` must be defined on the top, and may be redefined below
-ARG base_image='pytorch/pytorch:2.8.0-cuda12.9-cudnn9-devel'
+ARG base_image='pytorch/pytorch:2.9.1-cuda13.0-cudnn9-devel'
 ARG is_at_least_blackwell='false'
 
 #####################################
@@ -178,26 +178,34 @@ RUN if [ "${enable_test}" = "true" ]; then \
     pip install pytest lark-oapi matplotlib; \
 fi
 
+# Forcefully remove torch's constraint on nvidia-nvshmem-cu.*, because it is
+# too strict, and conflict with our requirements.
+RUN METADATA_FILE="$( \
+            find /opt/conda/lib/python3.11/site-packages -maxdepth 1 -name "torch-*.dist-info" -type d | head -1 \
+        )/METADATA"; \
+    if [ -f "${METADATA_FILE}" ]; then \
+        echo "Removing nvidia-nvshmem-cu.* from torch's constraint file: ${METADATA_FILE}"; \
+        sed -i '/nvidia-nvshmem-cu.*/d' "${METADATA_FILE}"; \
+    fi
+
 # Always install build time dependencies. Some dependencies may fail to build
 # if some build time dependencies are missing.
 COPY ./requirements-build.txt /tmp/requirements-build.txt
 COPY ./requirements-build-deep_ep-cu12.txt /tmp/requirements-build-deep_ep-cu12.txt
 COPY ./requirements-build-deep_ep-cu13.txt /tmp/requirements-build-deep_ep-cu13.txt
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r /tmp/requirements-build.txt \
-        -c <(pip list --format freeze | grep -v "setuptools")
 RUN if [[ "${optional_deps}" == *"deep_ep"* ]]; then \
     if python3 -c "import torch; print(int(torch.version.cuda.split('.')[0]) == 13)" | grep -q "True"; then \
-        pip install -r /tmp/requirements-build-deep_ep-cu13.txt \
-            -c <(pip list --format freeze | grep -v "setuptools"); \
+        cat /tmp/requirements-build-deep_ep-cu13.txt >> /tmp/requirements-build.txt; \
     elif python3 -c "import torch; print(int(torch.version.cuda.split('.')[0]) == 12)" | grep -q "True"; then \
-        pip install -r /tmp/requirements-build-deep_ep-cu12.txt \
-            -c <(pip list --format freeze | grep -v "setuptools"); \
+        cat /tmp/requirements-build-deep_ep-cu12.txt >> /tmp/requirements-build.txt; \
     else \
         echo "Unsupported CUDA version"; \
         exit 1; \
     fi \
 fi
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r /tmp/requirements-build.txt \
+        -c <(pip list --format freeze | grep -v -e "setuptools" -e "nvidia-nvshmem-cu.*")
 
 # Triton's built-in assembler may be too old for blackwell. Use the system assembler
 # as a workaround. See https://github.com/triton-lang/triton/issues/8539.
@@ -243,6 +251,25 @@ COPY ./csrc/cpuinfer ./csrc/cpuinfer
 # 3. 如果没有 --no-build-isolation ，pip 会在构建时用单独的环境重新下载所有构建时依赖，此时无法指定上述版本。
 RUN pip install --no-build-isolation -r /tmp/requirements.txt \
         -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "pytest")
+
+RUN set -eux; \
+    VER="$(python -c "import importlib.metadata as m; \
+print(next((d.version for d in m.distributions() if (d.metadata.get('Name') or '').lower()=='flashinfer-python'), ''))")"; \
+    if [ -n "${VER}" ]; then \
+        if python3 -c "import torch; print(torch.version.cuda == '12.9')" | grep -q "True"; then \
+            CUDA_TAG="cu129"; \
+        elif python3 -c "import torch; print(torch.version.cuda == '13.0')" | grep -q "True"; then \
+            CUDA_TAG="cu130"; \
+        else \
+            echo "Unrecoginized CUDA versoin $(python3 -c 'import torch; print(torch.version.cuda)')" for flashinfer_jit_cache; \
+            CUDA_TAG=""; \
+        fi; \
+        if [ -n "${CUDA_TAG}" ]; then \
+            pip install flashinfer-jit-cache=="${VER}+${CUDA_TAG}" --index-url "https://flashinfer.ai/whl/${CUDA_TAG}"; \
+        fi; \
+    else \
+        echo "flashinfer-python not installed; skip installing flashinfer_jit_cache"; \
+    fi
 
 #####################################
 # Wheel build Stage
