@@ -218,6 +218,9 @@ class MetricsConfig:
     prometheus_data_dir: str = MISSING
     prometheus_scrape_interval: int = MISSING
     log_interval: int = MISSING
+    grafana_enabled: bool = MISSING
+    grafana_host: str = MISSING
+    grafana_port: int = MISSING
 
 
 @dataclass

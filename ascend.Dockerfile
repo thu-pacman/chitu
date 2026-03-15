@@ -86,6 +86,49 @@ RUN --mount=type=secret,id=tos_id \
     rm -rf /workspace/prometheus && \
     prometheus --version
 
+# Install Grafana
+RUN --mount=type=secret,id=tos_id \
+    --mount=type=secret,id=tos_key \
+    mkdir -p /workspace/grafana && \
+    case "$(uname -m)" in \
+        x86_64|amd64) \
+            CDN_URL="https://dl.grafana.com/grafana/release/12.4.1/grafana_12.4.1_22846628243_linux_amd64.tar.gz" && \
+            TOS_URL="tos://out-deliver/grafana_12.4.1_22846628243_linux_amd64.tar.gz" && \
+            TOOL_URL="https://tos-tools.tos-cn-beijing.volces.com/linux/tosutil" \
+            ;; \
+        aarch64|arm64) \
+            CDN_URL="https://dl.grafana.com/grafana/release/12.4.1/grafana_12.4.1_22846628243_linux_arm64.tar.gz" && \
+            TOS_URL="tos://out-deliver/grafana_12.4.1_22846628243_linux_arm64.tar.gz" && \
+            TOOL_URL="https://m645b3e1bb36e-mrap.mrap.accesspoint.tos-global.volces.com/linux/arm64/tosutil" \
+            ;; \
+        *) \
+            echo "Unsupported arch: $(uname -m)" && exit 1 \
+            ;; \
+    esac && \
+    if [ -s /run/secrets/tos_id ] && [ -s /run/secrets/tos_key ]; then \
+        echo "Download Grafana from TOS" && \
+        tos_id=$(cat /run/secrets/tos_id) && \
+        tos_key=$(cat /run/secrets/tos_key) && \
+        mkdir -p /tmp && curl "${TOOL_URL}" --output /tmp/tosutil && chmod a+x /tmp/tosutil && \
+        /tmp/tosutil cp -u -r -p=8 -j=8 -threshold=104857600 -k "${tos_key}" -i "${tos_id}" \
+            -e tos-cn-beijing.volces.com -re out-deliver.tos-cn-beijing.volces.com "${TOS_URL}" /workspace && \
+        tar -xzf /workspace/grafana_*.tar.gz --strip-components=1 -C /workspace/grafana && \
+        rm -rf /workspace/grafana_*.tar.gz && \
+        rm -rf /tmp/tosutil; \
+    else \
+        echo "Download Grafana from CDN" && \
+        curl -L --retry 3 --retry-delay 5 -o /workspace/grafana.tar.gz "${CDN_URL}" && \
+        tar -xzf /workspace/grafana.tar.gz --strip-components=1 -C /workspace/grafana && \
+        rm -rf /workspace/grafana.tar.gz; \
+    fi && \
+    cp /workspace/grafana/bin/grafana-server /usr/local/bin/ && \
+    cp /workspace/grafana/bin/grafana /usr/local/bin/ && \
+    mkdir -p /usr/share/grafana && \
+    cp -r /workspace/grafana/public /usr/share/grafana/public && \
+    cp -r /workspace/grafana/conf /usr/share/grafana/conf && \
+    rm -rf /workspace/grafana && \
+    grafana-server -v
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$(lscpu | grep x86)" ]; then \
         pip install -U torch==2.6.0+cpu -i https://download.pytorch.org/whl/cpu; \
@@ -99,6 +142,7 @@ WORKDIR /workspace/chitu
 COPY ./test ./test
 COPY ./script ./script
 COPY ./benchmarks ./benchmarks
+COPY ./chitu/metrics/grafana ./grafana
 
 # Currently, we require a development version of torch-npu to support aclgraph
 ENV CHITU_ASCEND_BUILD=1

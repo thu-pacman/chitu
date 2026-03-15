@@ -1,0 +1,425 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Throughput",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "Generation TPS (per rank)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "tokens/s",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(chitu_total_generated_tokens_total{job=\"chitu_service\"}[$__rate_interval])",
+          "legendFormat": "rank{{rank}} dp{{dp_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Prompt TPS (per rank)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "tokens/s",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(chitu_total_prompt_tokens_total{job=\"chitu_service\"}[$__rate_interval])",
+          "legendFormat": "rank{{rank}} dp{{dp_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "MTP Hit Rate (per rank)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0, "max": 1,
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(chitu_mtp_accepted_tokens_total{job=\"chitu_service\"}[$__rate_interval]) / clamp_min(rate(chitu_mtp_proposed_tokens_total{job=\"chitu_service\"}[$__rate_interval]), 1)",
+          "legendFormat": "rank{{rank}} dp{{dp_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Task Eviction Rate (per rank)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(chitu_total_task_evictions_total{job=\"chitu_service\"}[$__rate_interval])",
+          "legendFormat": "rank{{rank}} dp{{dp_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "KV Cache & Memory",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "KV Cache Usage (per rank)",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 18 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0, "max": 1,
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.7 },
+              { "color": "red", "value": 0.9 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "chitu_kv_cache_usage_ratio{job=\"chitu_service\"}",
+          "legendFormat": "rank{{rank}} dp{{dp_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "KV Cache Blocks (per rank)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 18 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "chitu_used_blocks{job=\"chitu_service\"}",
+          "legendFormat": "used rank{{rank}} dp{{dp_id}}",
+          "refId": "A"
+        },
+        {
+          "expr": "chitu_total_blocks{job=\"chitu_service\"}",
+          "legendFormat": "total rank{{rank}} dp{{dp_id}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "GPU Memory (per rank)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 18 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "chitu_used_bytes{job=\"chitu_service\"}",
+          "legendFormat": "used rank{{rank}} dp{{dp_id}}",
+          "refId": "A"
+        },
+        {
+          "expr": "chitu_total_bytes{job=\"chitu_service\"}",
+          "legendFormat": "total rank{{rank}} dp{{dp_id}}",
+          "refId": "B"
+        },
+        {
+          "expr": "chitu_torch_allocated_bytes{job=\"chitu_service\"}",
+          "legendFormat": "torch rank{{rank}} dp{{dp_id}}",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "title": "Latency & Requests",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "Time to First Token (P50 / P95 / P99)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 27 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(chitu_time_to_first_token_seconds_bucket{job=\"chitu_service\"}[$__rate_interval]))",
+          "legendFormat": "P50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(chitu_time_to_first_token_seconds_bucket{job=\"chitu_service\"}[$__rate_interval]))",
+          "legendFormat": "P95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(chitu_time_to_first_token_seconds_bucket{job=\"chitu_service\"}[$__rate_interval]))",
+          "legendFormat": "P99",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "title": "E2E Request Duration (P50 / P95 / P99)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 27 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(chitu_e2e_request_duration_seconds_bucket{job=\"chitu_service\"}[$__rate_interval]))",
+          "legendFormat": "P50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(chitu_e2e_request_duration_seconds_bucket{job=\"chitu_service\"}[$__rate_interval]))",
+          "legendFormat": "P95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(chitu_e2e_request_duration_seconds_bucket{job=\"chitu_service\"}[$__rate_interval]))",
+          "legendFormat": "P99",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "title": "Active Requests",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 35 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 2, "fillOpacity": 20 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "chitu_active_requests{job=\"chitu_service\"}",
+          "legendFormat": "active {{role}}",
+          "refId": "A"
+        },
+        {
+          "expr": "chitu_router_pending_requests{job=\"chitu_service\"}",
+          "legendFormat": "pending (router)",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "Completed Requests Rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 35 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(chitu_completed_requests_total{job=\"chitu_service\"}[$__rate_interval])",
+          "legendFormat": "{{role}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "PD Disaggregation",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "title": "PD Stage Duration (P50 / P95)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(chitu_pd_stage_duration_seconds_bucket{job=\"chitu_service\"}[$__rate_interval])) by (le, role, stage))",
+          "legendFormat": "P50 {{role}}/{{stage}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(chitu_pd_stage_duration_seconds_bucket{job=\"chitu_service\"}[$__rate_interval])) by (le, role, stage))",
+          "legendFormat": "P95 {{role}}/{{stage}}",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "KV Transfer",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(chitu_kv_transfer_duration_seconds_bucket{job=\"chitu_service\"}[$__rate_interval]))",
+          "legendFormat": "duration P50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(chitu_kv_transfer_duration_seconds_bucket{job=\"chitu_service\"}[$__rate_interval]))",
+          "legendFormat": "duration P95",
+          "refId": "B"
+        },
+        {
+          "expr": "chitu_kv_transfer_speed_gbps{job=\"chitu_service\"}",
+          "legendFormat": "speed (GB/s)",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "title": "PD Queue Size",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 52 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 2, "fillOpacity": 20 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "chitu_pd_queue_size{job=\"chitu_service\"}",
+          "legendFormat": "{{role}}/{{queue_name}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Errors & Timeouts",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 52 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "rate(chitu_kv_transfer_failures_total{job=\"chitu_service\"}[$__rate_interval])",
+          "legendFormat": "kv_failure {{role}}",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(chitu_request_timeouts_total{job=\"chitu_service\"}[$__rate_interval])",
+          "legendFormat": "timeout {{stage}}",
+          "refId": "B"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["chitu", "llm", "inference"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "Prometheus" }
+      }
+    ]
+  },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Chitu Inference Overview",
+  "uid": "chitu-overview",
+  "version": 1
+}

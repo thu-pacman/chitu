@@ -67,6 +67,31 @@ RUN mkdir -p /workspace/prometheus && \
     rm -rf /workspace/prometheus && \
     prometheus --version
 
+# Install Grafana
+RUN mkdir -p /workspace/grafana && \
+    case "$(uname -m)" in \
+        x86_64|amd64) \
+            CDN_URL="https://dl.grafana.com/grafana/release/12.4.1/grafana_12.4.1_22846628243_linux_amd64.tar.gz" \
+            ;; \
+        aarch64|arm64) \
+            CDN_URL="https://dl.grafana.com/grafana/release/12.4.1/grafana_12.4.1_22846628243_linux_arm64.tar.gz" \
+            ;; \
+        *) \
+            echo "Unsupported arch: $(uname -m)" && exit 1 \
+            ;; \
+    esac && \
+    echo "Download Grafana from CDN" && \
+    curl -L --retry 3 --retry-delay 5 -o /workspace/grafana.tar.gz "${CDN_URL}" && \
+    tar -xzf /workspace/grafana.tar.gz --strip-components=1 -C /workspace/grafana && \
+    rm -rf /workspace/grafana.tar.gz && \
+    cp /workspace/grafana/bin/grafana-server /usr/local/bin/ && \
+    cp /workspace/grafana/bin/grafana /usr/local/bin/ && \
+    mkdir -p /usr/share/grafana && \
+    cp -r /workspace/grafana/public /usr/share/grafana/public && \
+    cp -r /workspace/grafana/conf /usr/share/grafana/conf && \
+    rm -rf /workspace/grafana && \
+    grafana-server -v
+
 RUN if [ "$(lscpu | grep x86)" ]; then \
         pip install -U torch==2.6.0+cpu -i https://download.pytorch.org/whl/cpu; \
     else \
@@ -78,7 +103,7 @@ WORKDIR /workspace/chitu
 COPY ./test ./test
 COPY ./script ./script
 COPY ./benchmarks ./benchmarks
-
+COPY ./chitu/metrics/grafana ./grafana
 
 # Currently, we require a development version of torch-npu to support aclgraph
 ENV CHITU_ASCEND_BUILD=1

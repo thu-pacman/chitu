@@ -106,6 +106,17 @@ msgs = [
     [{"role": "user", "content": "怎么避免加班?"}],
     [{"role": "user", "content": "what is the recipe of mayonnaise?"}],
 ]
+# long-context test
+msgs_long = [
+    [
+        {
+            "role": "user",
+            "content": Path("test/test_texts/test_text.txt").read_text(
+                encoding="utf-8"
+            ),
+        }
+    ],
+]
 
 counter = 1
 
@@ -154,7 +165,10 @@ def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty):
 
 
 def gen_reqs(num_reqs, max_new_tokens, frequency_penalty):
-    global local_args
+    global local_args, msgs
+    if "DeepSeek-V3.2" in local_args.models.name:
+        msgs = msgs_long + msgs
+
     if local_args.request.prompt_tokens_len > 0:
         return gen_reqs_fake(
             num_reqs,
