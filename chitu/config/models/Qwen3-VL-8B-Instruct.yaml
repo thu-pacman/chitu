@@ -45,6 +45,5 @@ vision_config:
   image_token_id: 151655
   video_token_id: 151656
   vision_end_token_id: 151653
-  max_vision_tokens: 16384
 
 

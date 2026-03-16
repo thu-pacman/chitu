@@ -74,7 +74,6 @@ class InferConfig(InferConfigLegacy):
     use_cuda_graph: bool | str = MISSING
     npu_fusion_fp4: bool = MISSING
     num_blocks: int = MISSING
-    max_multimodal_blocks: int = -1
     bind_process_to_cpu: str = MISSING
     bind_thread_to_cpu: str = MISSING
     memory_utilization: float = MISSING
