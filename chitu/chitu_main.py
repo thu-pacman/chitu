@@ -376,7 +376,7 @@ def _warmup_backend_direct(
         )
     seq_len_list = [1] * local_max_bs
     # Prefill
-    for mgr in Backend.cache_managers.values():
+    for mgn, mgr in Backend.cache_managers.items():
         mgr.prepare_cache_prefill(req_ids, seq_len_list)
     PrometheusMetricsCollector.update_kvcache_usage()
 
@@ -400,8 +400,9 @@ def _warmup_backend_direct(
         ):
             curr_bs = local_max_bs - i * bs_descend
             curr_req_ids = req_ids[:curr_bs]
-            for mgr in Backend.cache_managers.values():
-                mgr.prepare_cache_decode(curr_req_ids)
+            for mgn, mgr in Backend.cache_managers.items():
+                if mgn != "multimodal":
+                    mgr.prepare_cache_decode(curr_req_ids)
             PrometheusMetricsCollector.update_kvcache_usage()
 
             # direct warmup 绕过了 executor，因此必须在这里显式设置

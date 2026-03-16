@@ -1088,7 +1088,7 @@ class Executor:
     def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         is_empty_step = tasks.num_tasks == 0
         if not is_empty_step:
-            for mgr in Backend.cache_managers.values():
+            for mgr_name, mgr in Backend.cache_managers.items():
                 mgr.prepare_cache_prefill(tasks.req_ids, [len(t) for t in tasks.tokens])
             PrometheusMetricsCollector.update_kvcache_usage()
             PrometheusMetricsCollector.update_task_counts()
@@ -1170,8 +1170,9 @@ class Executor:
         if not is_empty_step:
             # Ensure KV cache is present for PD decode-only before updating CacheManager state.
             self._kv_hook.before_decode_step(tasks.req_ids)
-            for mgr in Backend.cache_managers.values():
-                mgr.prepare_cache_decode(tasks.req_ids)
+            for mgn, mgr in Backend.cache_managers.items():
+                if mgn != "multimodal":
+                    mgr.prepare_cache_decode(tasks.req_ids)
 
             num_tokens = tasks.num_tasks
 
