@@ -15,6 +15,12 @@ class MockGroup:
         self.rank_in_group = rank_in_group
         self.global_rank = global_rank
 
+    def is_first_rank(self):
+        return True
+
+    def rank_in_group(self):
+        return 0
+
 
 class Monkcachemanager:
     def __init__(self, num_blocks, num_free_blocks):
@@ -38,6 +44,14 @@ def test_PrometheusMetricsCollector(rank, dp_id, monkeypatch):
     monkeypatch.setattr(
         "chitu.metrics.prometheus_collector.get_dp_group",
         lambda: MockGroup(rank, dp_id),
+    )
+    monkeypatch.setattr(
+        "chitu.metrics.prometheus_collector.get_tp_group",
+        lambda: MockGroup(rank, 0),
+    )
+    monkeypatch.setattr(
+        "chitu.metrics.prometheus_collector.get_pp_group",
+        lambda: MockGroup(rank, 0),
     )
 
     # 测试 get_instance

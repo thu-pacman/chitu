@@ -23,6 +23,12 @@ class MockGroup:
         self.global_rank = global_rank
         self.device = "cpu"
 
+    def is_first_rank(self):
+        return True
+
+    def rank_in_group(self):
+        return 0
+
 
 class Monkcachemanager:
     def __init__(self, num_blocks, num_free_blocks):
@@ -40,6 +46,8 @@ class Monkcachemanager:
 def run_PrometheusServerManager(rank, dp_id, result_queue, stop_event):
     chitu.metrics.prometheus_collector.Backend = Backend
     chitu.metrics.prometheus_collector.get_dp_group = lambda: MockGroup(rank, dp_id)
+    chitu.metrics.prometheus_collector.get_tp_group = lambda: MockGroup(rank, 0)
+    chitu.metrics.prometheus_collector.get_pp_group = lambda: MockGroup(rank, 0)
 
     collector = PrometheusMetricsCollector.get_instance(is_create=True)
     result_queue.put(collector.addr)
