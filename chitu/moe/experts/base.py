@@ -61,6 +61,7 @@ def fused_experts_no_sum_wrapper(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
     impl: str = "auto",
@@ -93,6 +94,7 @@ def fused_experts_no_sum_wrapper(
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
                 block_shape=block_shape,
+                round_scale_to_pow2=round_scale_to_pow2,
                 soft_fp8=soft_fp8,
                 experts_start_idx=experts_start_idx,
             )
@@ -117,6 +119,7 @@ def fused_experts_no_sum_wrapper(
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
                 block_shape=block_shape,
+                round_scale_to_pow2=round_scale_to_pow2,
                 soft_fp8=soft_fp8,
                 experts_start_idx=experts_start_idx,
             )
@@ -140,6 +143,7 @@ def fused_experts_no_sum_wrapper(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             block_shape=block_shape,
+            round_scale_to_pow2=round_scale_to_pow2,
             soft_fp8=soft_fp8,
             experts_start_idx=experts_start_idx,
         )
@@ -164,11 +168,20 @@ def fused_experts_no_sum_wrapper(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             block_shape=block_shape,
+            round_scale_to_pow2=round_scale_to_pow2,
             soft_fp8=soft_fp8,
             experts_start_idx=experts_start_idx,
         )
     elif impl == "ep_group_gemm_masked":
-        if w1.dtype == torch.float8_e4m3fn and has_deep_gemm:
+        if (
+            has_deep_gemm
+            and w1.dtype == torch.float8_e4m3fn
+            and torch.get_default_dtype() == torch.bfloat16
+            and (
+                torch.cuda.get_device_capability()[0] == 9
+                or (torch.cuda.get_device_capability()[0] == 10 and round_scale_to_pow2)
+            )
+        ):
             assert isinstance(hidden_states, PerExpertDenseBatchedRoutedActivation)
             return deepgemm_masked_fused_expert(
                 hidden_states,
@@ -189,6 +202,7 @@ def fused_experts_no_sum_wrapper(
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
                 block_shape=block_shape,
+                round_scale_to_pow2=round_scale_to_pow2,
                 soft_fp8=soft_fp8,
                 experts_start_idx=experts_start_idx,
             )
@@ -199,7 +213,15 @@ def fused_experts_no_sum_wrapper(
             raise NotImplementedError
 
     elif impl == "ep_group_gemm_contiguous":
-        if w1.dtype == torch.float8_e4m3fn and has_deep_gemm:
+        if (
+            has_deep_gemm
+            and w1.dtype == torch.float8_e4m3fn
+            and torch.get_default_dtype() == torch.bfloat16
+            and (
+                torch.cuda.get_device_capability()[0] == 9
+                or (torch.cuda.get_device_capability()[0] == 10 and round_scale_to_pow2)
+            )
+        ):
             if isinstance(hidden_states, IndexedBatchedRoutedActivationBlockfp8):
                 hidden_states = IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt.convert_from(
                     hidden_states, n_experts=w1.shape[0], pad_block_size=128
@@ -236,6 +258,7 @@ def fused_experts_no_sum_wrapper(
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
                 block_shape=block_shape,
+                round_scale_to_pow2=round_scale_to_pow2,
                 soft_fp8=soft_fp8,
                 experts_start_idx=experts_start_idx,
             )
@@ -260,6 +283,7 @@ def fused_experts_no_sum_wrapper(
                 a1_scale=a1_scale,
                 a2_scale=a2_scale,
                 block_shape=block_shape,
+                round_scale_to_pow2=round_scale_to_pow2,
                 soft_fp8=soft_fp8,
                 experts_start_idx=experts_start_idx,
             )
@@ -315,6 +339,7 @@ def fused_experts_and_sum_wrapper(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
     impl: str = "auto",
@@ -354,6 +379,7 @@ def fused_experts_and_sum_wrapper(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             block_shape=block_shape,
+            round_scale_to_pow2=round_scale_to_pow2,
             soft_fp8=soft_fp8,
             experts_start_idx=experts_start_idx,
             impl=impl,

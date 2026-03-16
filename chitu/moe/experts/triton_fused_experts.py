@@ -1006,6 +1006,7 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
     use_int8_w8a8: bool = False,
     experts_start_idx: int = 0,
@@ -1031,6 +1032,7 @@ def fused_experts(
         a1_scale,
         a2_scale,
         block_shape,
+        round_scale_to_pow2,
         soft_fp8,
         use_int8_w8a8,
     )
@@ -1055,7 +1057,9 @@ def fused_experts_impl(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
+    use_int8_w8a8: bool = False,
 ) -> BatchedExpertResult:
     raise ValueError(f"Unsupported hidden_states type: {type(hidden_states)}")
 
@@ -1079,6 +1083,7 @@ def _(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
     use_int8_w8a8: bool = False,
 ) -> BatchedExpertResult:
@@ -1115,6 +1120,7 @@ def _(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
+        round_scale_to_pow2=round_scale_to_pow2,
         soft_fp8=soft_fp8,
         use_int8_w8a8=use_int8_w8a8,
     )
@@ -1139,6 +1145,7 @@ def _(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
     use_int8_w8a8: bool = False,
 ) -> PerTokenBatchedExpertResult:
@@ -1204,7 +1211,9 @@ def _(
     if (use_fp8_w8a8 or use_fp4_w4a8) and not soft_fp8:
         block_n, block_k = block_shape
         hidden_states_activation, a1_scale = blockfp8_act_quant(
-            hidden_states.activation, block_k
+            hidden_states.activation,
+            block_size=block_k,
+            round_scale_to_pow2=round_scale_to_pow2,
         )
     else:
         hidden_states_activation = hidden_states.activation
@@ -1251,7 +1260,11 @@ def _(
 
     if (use_fp8_w8a8 or use_fp4_w4a8) and not soft_fp8:
         block_n, block_k = block_shape
-        intermediate_cache2, a2_scale = blockfp8_act_quant(intermediate_cache2, block_k)
+        intermediate_cache2, a2_scale = blockfp8_act_quant(
+            intermediate_cache2,
+            block_size=block_k,
+            round_scale_to_pow2=round_scale_to_pow2,
+        )
     if use_int8_w8a8:
         intermediate_cache2, a2_scale = a8_per_token_act_quant(intermediate_cache2)
     invoke_fused_moe_kernel(

@@ -61,7 +61,11 @@ def fp8_e4m3fn_quant_per_tensor_triton(
 @single_dispatch_lazy_tensor
 @auto_retry_triton_compilation
 def blockfp8_act_quant_triton(
-    x: torch.Tensor, block_size: int = 128
+    x: torch.Tensor,
+    *,
+    block_size: int = 128,
+    round_scale_to_pow2: bool = False,
+    eps: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantizes the input tensor `x` using block-wise quantization.
@@ -101,18 +105,57 @@ def blockfp8_act_quant_triton(
         stride_y0=y.view(-1, y.shape[-1]).stride(0),
         hidden_dim=x.shape[-1],
         BLOCK_SIZE=block_size,
+        SCALE_IS_UE8M0=round_scale_to_pow2,
+        EPS=eps,
         INDEX_DTYPE=INDEX_DTYPE,
     )
     return y, s
 
 
 @blockfp8_act_quant_triton.register
-def _(x: silu_and_mul.lazy_tensor_type(), block_size: int = 128):
+def _(
+    x: silu_and_mul.lazy_tensor_type(),
+    *,
+    block_size: int = 128,
+    round_scale_to_pow2: bool = False,
+    eps: float = 1e-4,
+):
     return silu_and_mul_and_blockfp8_act_quant_triton(
         x.kwargs["x"],
         expert_n_tokens=x.kwargs["expert_n_tokens"],
         block_size=block_size,
+        round_scale_to_pow2=round_scale_to_pow2,
+        eps=eps,
     )
+
+
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: MIT
+# SPDX-SnippetCopyrightText: 2023 DeepSeek
+# SPDX-SnippetCopyrightText: 2026 Qingcheng.AI
+# SDPX—SnippetName: Fast ue8m0 scale rounding
+#
+# Translated to Triton by Qingcheng.AI, from TileLang implementation by DeepSeek
+@triton.jit
+def fast_log2_ceil(x):
+    bits_x = tl.cast(x, tl.uint32, bitcast=True)
+    exp_x = (bits_x >> 23) & 0xFF
+    man_bits = bits_x & ((1 << 23) - 1)
+    return tl.cast(exp_x - 127 + tl.where(man_bits != 0, 1, 0), tl.int32)
+
+
+@triton.jit
+def fast_pow2(x):
+    bits_x = (x + 127) << 23
+    return tl.cast(bits_x, tl.float32, bitcast=True)
+
+
+@triton.jit
+def fast_round_scale(amax, fp8_max_inv):
+    return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
+
+
+# SPDX-SnippetEnd
 
 
 @triton.jit
@@ -124,6 +167,8 @@ def blockfp8_act_quant_kernel(
     stride_y0,
     hidden_dim,
     BLOCK_SIZE: tl.constexpr,
+    SCALE_IS_UE8M0: tl.constexpr,
+    EPS: tl.constexpr,
     INDEX_DTYPE: tl.constexpr,
 ):
     """
@@ -155,7 +200,11 @@ def blockfp8_act_quant_kernel(
     s_offs = row_id * (hidden_dim // BLOCK_SIZE) + block_id
 
     x = tl.load(x_ptr + x_offs).to(tl.float32)
-    s = tl.maximum(tl.max(tl.abs(x)), 1e-10) / 448.0
+    s = tl.maximum(tl.max(tl.abs(x)), EPS)
+    if SCALE_IS_UE8M0:
+        s = fast_round_scale(s, 1.0 / 448.0)
+    else:
+        s /= 448.0
     y = x / s
     y = y.to(y_ptr.dtype.element_ty)
     tl.store(y_ptr + y_offs, y)
@@ -168,6 +217,8 @@ def silu_and_mul_and_blockfp8_act_quant_triton(
     *,
     expert_n_tokens: Optional[torch.Tensor] = None,
     block_size: int = 128,
+    round_scale_to_pow2: bool = False,
+    eps: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if expert_n_tokens is not None:
         assert x.shape[-1] % (2 * block_size) == 0
@@ -181,7 +232,13 @@ def silu_and_mul_and_blockfp8_act_quant_triton(
             device=x.device,
         )
         silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
-            x, output, output_scale, block_size, expert_n_tokens
+            x,
+            output,
+            output_scale,
+            block_size,
+            expert_n_tokens,
+            scale_ue8m0=round_scale_to_pow2,
+            eps=eps,
         )
         return output, output_scale
 
@@ -206,7 +263,14 @@ def silu_and_mul_and_blockfp8_act_quant_triton(
 
     grid = lambda meta: (triton.cdiv(y.numel(), meta["BLOCK_SIZE"]),)
     silu_and_mul_and_blockfp8_act_quant_kernel[grid](
-        x, y, s, HIDDEN_DIM=y.size(-1), BLOCK_SIZE=block_size, INDEX_DTYPE=INDEX_DTYPE
+        x,
+        y,
+        s,
+        HIDDEN_DIM=y.size(-1),
+        BLOCK_SIZE=block_size,
+        SCALE_IS_UE8M0=round_scale_to_pow2,
+        EPS=eps,
+        INDEX_DTYPE=INDEX_DTYPE,
     )
     return y, s
 
@@ -218,6 +282,8 @@ def silu_and_mul_and_blockfp8_act_quant_kernel(
     s_ptr,
     HIDDEN_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    SCALE_IS_UE8M0: tl.constexpr,
+    EPS: tl.constexpr,
     INDEX_DTYPE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -242,7 +308,11 @@ def silu_and_mul_and_blockfp8_act_quant_kernel(
     silu_x1 = silu_x1_fp32.to(x1.dtype)
     x = silu_x1 * x2
 
-    s = tl.maximum(tl.max(tl.abs(x)), 1e-10) / 448.0
+    s = tl.maximum(tl.max(tl.abs(x)), EPS)
+    if SCALE_IS_UE8M0:
+        s = fast_round_scale(s, 1.0 / 448.0)
+    else:
+        s /= 448.0
     y = x / s
     y = y.to(y_ptr.dtype.element_ty)
 
@@ -278,6 +348,7 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask_kernel(
     BLOCK_N: tl.constexpr,
     NUM_STAGE: tl.constexpr,
     SCALE_UE8M0: tl.constexpr,
+    EPS: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -317,9 +388,10 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask_kernel(
         gate = gate / (1 + tl.exp(-gate))
         gate = gate.to(input_ptr.dtype.element_ty)
         gate_up = up * gate
-        _absmax = tl.maximum(tl.max(tl.abs(gate_up)), 1e-10)
+        _absmax = tl.maximum(tl.max(tl.abs(gate_up)), EPS)
         output_s = _absmax / fp8_max
         if SCALE_UE8M0:
+            # TODO: Use fast_round_scale
             output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
         output_q = tl.clamp(gate_up / output_s, fp8_min, fp8_max).to(
             output_ptr.dtype.element_ty
@@ -354,6 +426,7 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
     quant_group_size: int,
     masked_m: torch.Tensor,
     scale_ue8m0: bool = False,
+    eps: float = 1e-4,
 ):
     """
     input shape [expert_num, token_num_padded, hidden_dim]
@@ -411,8 +484,8 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
         NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,
         SCALE_UE8M0=scale_ue8m0,
+        EPS=eps,
     )
-    return
 
 
 # SPDX-SnippetEnd

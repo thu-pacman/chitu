@@ -103,6 +103,8 @@ SCRIPT_DIR=$(dirname "$THIS_SCRIPT")
 if [ -f "$SCRIPT_DIR/detect_ib_config.sh" ]; then
     source "$SCRIPT_DIR/detect_ib_config.sh"
     auto_configure_ib
+else
+    echo "No detect_ib_config.sh found in $SCRIPT_DIR, skipping InfiniBand configuration"
 fi
 
 # 构建 IB 相关的环境变量参数

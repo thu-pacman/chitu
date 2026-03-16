@@ -413,6 +413,7 @@ class MoEImplNoEP(MoEImplBase):
 
         assert self.ep_size == 1
 
+        # FIXME: Check whether deep_gemm support our round_scale_to_pow2 setting
         if has_deep_gemm:
             self.impl_map = {
                 TaskType.Prefill: "group_gemm_contiguous",

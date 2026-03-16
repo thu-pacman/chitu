@@ -49,12 +49,14 @@ has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
 logger = getLogger(__name__)
 
 
-def linear_block_fp8(
+def linear_blockfp8(
     x: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    block_size: int = 128,
+    *,
+    block_size: int,
+    round_scale_to_pow2: bool,
 ) -> torch.Tensor:
     """
     Applies a linear transformation to the incoming data: y = xA^T + b.
@@ -66,6 +68,9 @@ def linear_block_fp8(
         weight (torch.Tensor): The weight tensor. It may be quantized and
             requires dequantization for certain cases.
         bias (Optional[torch.Tensor]): The bias tensor to be added. Default is None.
+        round_scale_to_pow2: Round scale to powers of 2. But it does not necessarily
+            mean the scale must be stored as a 8-bit integer. Implementations are
+            free to pick a storage data type for it.
 
     Returns:
         torch.Tensor: The result of the linear transformation, which may involve
@@ -92,9 +97,18 @@ def linear_block_fp8(
         x_dtype = x.dtype
         x_shape = x.shape
         x = x.view(-1, x_shape[-1])
-        x, act_scale = blockfp8_act_quant(x, block_size)
+        x, act_scale = blockfp8_act_quant(
+            x, block_size=block_size, round_scale_to_pow2=round_scale_to_pow2
+        )
         assert weight_scale is not None
-        y = blockfp8_gemm(x, act_scale, weight, weight_scale)
+        y = blockfp8_gemm(
+            x,
+            act_scale,
+            weight,
+            weight_scale,
+            block_size=block_size,
+            round_scale_to_pow2=round_scale_to_pow2,
+        )
         if bias is not None:
             y += bias
         return y.view(x_shape[:-1] + y.shape[-1:]).to(x_dtype)
@@ -117,8 +131,21 @@ class Blockfp8Linear(QuantizedLinearBase):
         ############################################
         # Parameters specific to this quantization
         bias_dtype=None,
-        block_size=128,
+        block_size: int = 128,
+        round_scale_to_pow2: bool = False,
     ):
+        """
+        Linear layer with blockfp8 quantization
+
+        Additional args of this inheritance:
+            bias_dtype: Data type for bias. Only applied when `has_bias` is True.
+            block_size: Size of the quantization group along both of the weight
+                dimensions, which means each group is a square.
+            round_scale_to_pow2: Round scale to powers of 2. But it does not necessarily
+                mean the scale must be stored as a 8-bit integer. Implementations are
+                free to pick a storage data type for it.
+        """
+
         super().__init__(in_features, out_features, has_bias)
 
         # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
@@ -131,6 +158,7 @@ class Blockfp8Linear(QuantizedLinearBase):
         assert dtype.itemsize == 1
 
         self.block_size = block_size
+        self.round_scale_to_pow2 = round_scale_to_pow2
 
         self.register_parameter(
             "weight",
@@ -166,8 +194,13 @@ class Blockfp8Linear(QuantizedLinearBase):
 
     @torch.no_grad()
     def forward(self, x) -> torch.Tensor:
-        return linear_block_fp8(
-            x, self.weight, self.scale, self.bias, block_size=self.block_size
+        return linear_blockfp8(
+            x,
+            self.weight,
+            self.scale,
+            self.bias,
+            block_size=self.block_size,
+            round_scale_to_pow2=self.round_scale_to_pow2,
         )
 
 
@@ -211,8 +244,9 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         checkpoint_prefix: str,
         merge_gate_up: bool,
         ############################################
-        # No parameters specific to this quantization
+        # Parameters specific to this quantization
         block_size: int = 128,
+        round_scale_to_pow2: bool = False,
     ):
         """
         Initializes the MoE module.
@@ -232,6 +266,9 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
             checkpoint_prefix,
             merge_gate_up,
         )
+
+        self.block_size = block_size
+        self.round_scale_to_pow2 = round_scale_to_pow2
 
         # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
         # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
@@ -435,7 +472,8 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 use_fp8_w8a8=use_fp8_w8a8,
                 w1_scale=gate_up_proj_scale,
                 w2_scale=down_proj_scale,
-                block_shape=[128, 128],
+                block_shape=[self.block_size, self.block_size],
+                round_scale_to_pow2=self.round_scale_to_pow2,
                 soft_fp8=fused_soft_fp8,
                 global_num_experts=self.global_n_experts,
                 experts_start_idx=self.experts_start_idx,
@@ -447,42 +485,46 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp8(
+        return linear_blockfp8(
             x,
             self.gate_up_proj_weight[i],
             self.gate_up_proj_scale[i],
             None,
-            128,
+            block_size=self.block_size,
+            round_scale_to_pow2=self.round_scale_to_pow2,
         )
 
     @override
     def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp8(
+        return linear_blockfp8(
             x,
             self.gate_proj_weight[i],
             self.gate_proj_scale[i],
             None,
-            128,
+            block_size=self.block_size,
+            round_scale_to_pow2=self.round_scale_to_pow2,
         )
 
     @override
     def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp8(
+        return linear_blockfp8(
             x,
             self.up_proj_weight[i],
             self.up_proj_scale[i],
             None,
-            128,
+            block_size=self.block_size,
+            round_scale_to_pow2=self.round_scale_to_pow2,
         )
 
     @override
     def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp8(
+        return linear_blockfp8(
             x,
             self.down_proj_weight[i],
             self.down_proj_scale[i],
             None,
-            128,
+            block_size=self.block_size,
+            round_scale_to_pow2=self.round_scale_to_pow2,
         )
 
 
@@ -499,6 +541,7 @@ class Blockfp8AbsorbGemm(QuantizedAbsorbGemmBase):
         ############################################
         # Parameters specific to this quantization
         block_size: int = 128,
+        round_scale_to_pow2: bool = False,
     ):
         super().__init__()
 

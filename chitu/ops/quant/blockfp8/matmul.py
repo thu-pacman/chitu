@@ -6,7 +6,6 @@ import torch
 
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.global_vars import get_global_args
-from chitu.device_type import is_hopper
 from chitu.utils import (
     try_import_platform_dep,
     try_import_opt_dep,
@@ -34,13 +33,19 @@ def blockfp8_gemm(
     a_s: torch.Tensor,
     b: torch.Tensor,
     b_s: torch.Tensor,
+    *,
+    block_size: int = 128,
+    round_scale_to_pow2: bool = False,
     impl: str = "auto",
 ):
     if impl == "auto":
         if (
             has_deep_gemm
             and torch.get_default_dtype() == torch.bfloat16
-            and is_hopper()
+            and (
+                torch.cuda.get_device_capability()[0] == 9
+                or (torch.cuda.get_device_capability()[0] == 10 and round_scale_to_pow2)
+            )
         ):
             impl = "deep_gemm"
         elif has_triton:
@@ -51,18 +56,49 @@ def blockfp8_gemm(
             )
 
     if impl == "deep_gemm":
-        return blockfp8_gemm_deep_gemm(a, a_s, b, b_s)
+        return blockfp8_gemm_deep_gemm(
+            a,
+            a_s,
+            b,
+            b_s,
+            block_size=block_size,
+            round_scale_to_pow2=round_scale_to_pow2,
+        )
     elif impl == "triton":
-        return blockfp8_gemm_triton(a, a_s, b, b_s)
+        return blockfp8_gemm_triton(
+            a,
+            a_s,
+            b,
+            b_s,
+            block_size=block_size,
+            round_scale_to_pow2=round_scale_to_pow2,
+        )
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
 
 
 def blockfp8_gemm_deep_gemm(
-    a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, b_s: torch.Tensor
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    *,
+    block_size: int = 128,
+    round_scale_to_pow2: bool = False,
 ):
-    assert torch.get_default_dtype() == torch.bfloat16
-    assert is_hopper()
+    if block_size != 128:
+        raise NotImplementedError(
+            f"deep_gemm only supports quantization block_size=128, but got {block_size}"
+        )
+    if torch.cuda.get_device_capability()[0] == 10 and not round_scale_to_pow2:
+        raise NotImplementedError(
+            "deep_gemm does not support round_scale_to_pow2==False on sm_10x"
+        )
+    if torch.get_default_dtype() != torch.bfloat16:
+        raise NotImplementedError(
+            f"deep_gemm only supports bfloat16 activation output, but got {torch.get_default_dtype()}"
+        )
+
     c = a.new_empty(*a.shape[:-1], b.shape[0], dtype=torch.get_default_dtype())
     deep_gemm.fp8_gemm_nt((a, a_s), (b.view(torch.float8_e4m3fn), b_s), c)
     return c

@@ -5,6 +5,7 @@
 # DeepSeek-V3.1 shares the same model structure with DeepSeek-V3
 defaults:
   - DeepSeek-V3
+  - override quant_config: blockfp8_ue8m0_scale_without_o_proj
   - _self_ # Config in this file overrides configs in defaults
 
 # Access info

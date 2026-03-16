@@ -102,6 +102,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
     ]:
 
         dispatch_use_fp8 = False
+        round_scale_to_pow2 = False
         if (
             may_fuse_quant == "blockfp8"
             and may_fuse_quant_kwargs.get("block_size", 128) == 128
@@ -109,12 +110,17 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             <= 1
         ):
             dispatch_use_fp8 = True
+            round_scale_to_pow2 = may_fuse_quant_kwargs.get(
+                "round_scale_to_pow2", False
+            )
         if may_fuse_quant == "blockfp4" and not is_blackwell():
             dispatch_use_fp8 = True
         if dispatch_use_fp8:
             from chitu.ops.quant.blockfp8 import blockfp8_act_quant
 
-            hidden_states_fp8, scale = blockfp8_act_quant(x.activation, block_size=128)
+            hidden_states_fp8, scale = blockfp8_act_quant(
+                x.activation, block_size=128, round_scale_to_pow2=round_scale_to_pow2
+            )
             return self.enter_moe(
                 IndexedBatchedRoutedActivationBlockfp8(
                     activation=hidden_states_fp8,

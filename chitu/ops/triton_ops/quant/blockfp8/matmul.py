@@ -26,6 +26,9 @@ def blockfp8_gemm_triton(
     a_s: torch.Tensor,
     b: torch.Tensor,
     b_s: torch.Tensor,
+    *,
+    block_size: int = 128,
+    round_scale_to_pow2: bool = False,
 ):
     """
     Perform a matrix multiplication using FP8 precision.
@@ -51,7 +54,9 @@ def blockfp8_gemm_triton(
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    blockfp8_gemm_kernel[grid](a, b, c, a_s, b_s, M, N, K, group_n=128, group_k=128)
+    blockfp8_gemm_kernel[grid](
+        a, b, c, a_s, b_s, M, N, K, group_n=block_size, group_k=block_size
+    )
     return c
 
 

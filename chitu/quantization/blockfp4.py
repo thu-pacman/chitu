@@ -35,7 +35,6 @@ from chitu.native_layout import (
     Packed4BitWeightNPUNative,
     LinearScaleToSwizzled,
 )
-from chitu.models.registry import ModelType
 from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
@@ -132,7 +131,7 @@ def linear_block_fp4(
         x_dtype = x.dtype
         x_shape = x.shape
         x = x.view(-1, x_shape[-1])
-        x, act_scale = blockfp8_act_quant(x, act_block_size)
+        x, act_scale = blockfp8_act_quant(x, block_size=act_block_size)
         assert weight_scale is not None
         y = soft_fp4_raise_to_fp8_blockfp4_gemm(
             x,
@@ -208,6 +207,9 @@ class Blockfp4LinearBase(QuantizedLinearBase):
         self._weight_plain_shape = (out_features, in_features)
 
         block_in, block_out = block_shape
+
+        from chitu.models.registry import ModelType
+
         if (
             get_global_args().models.type == ModelType.HF_LLAMA
             and get_global_args().infer.npu_fusion_fp4
@@ -215,6 +217,7 @@ class Blockfp4LinearBase(QuantizedLinearBase):
             dtype = torch.bfloat16
         else:
             dtype = torch.uint8
+
         self.register_parameter(
             "weight_scale",
             torch.nn.Parameter(
