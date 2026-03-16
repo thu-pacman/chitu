@@ -52,7 +52,7 @@ def has_native_fp8():
 
 
 def is_hopper():
-    HOPPER_DEVICE_PATTERNS = ["H20", "H100"]
+    HOPPER_DEVICE_PATTERNS = ["H20", "H100", "H200"]
     device_name = get_device_name()
     return any(pattern in device_name for pattern in HOPPER_DEVICE_PATTERNS)
 

@@ -8,7 +8,6 @@ import re
 import torch
 
 from chitu.global_vars import get_global_args
-from chitu.models.registry import ModelType
 from chitu.quantization.base import (
     QuantizedLinearBase,
     QuantizedMoeExpertsBase,
@@ -83,6 +82,8 @@ class QuantizationRegistry:
         # - chitu/models/model_deepseek_v3.py
         # - chitu/quantization/registry.py
         # - chitu/ops/mla_prologue.py
+        from chitu.models.registry import ModelType
+
         args = get_global_args()
         if (
             has_torch_npu

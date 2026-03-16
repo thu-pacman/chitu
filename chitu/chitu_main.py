@@ -376,7 +376,7 @@ def _warmup_backend_direct(
         )
     seq_len_list = [1] * local_max_bs
     # Prefill
-    for mgr in Backend.cache_managers.values():
+    for mgn, mgr in Backend.cache_managers.items():
         mgr.prepare_cache_prefill(req_ids, seq_len_list)
     PrometheusMetricsCollector.update_kvcache_usage()
 
@@ -400,8 +400,9 @@ def _warmup_backend_direct(
         ):
             curr_bs = local_max_bs - i * bs_descend
             curr_req_ids = req_ids[:curr_bs]
-            for mgr in Backend.cache_managers.values():
-                mgr.prepare_cache_decode(curr_req_ids)
+            for mgn, mgr in Backend.cache_managers.items():
+                if mgn != "multimodal":
+                    mgr.prepare_cache_decode(curr_req_ids)
             PrometheusMetricsCollector.update_kvcache_usage()
 
             # direct warmup 绕过了 executor，因此必须在这里显式设置
@@ -742,38 +743,50 @@ def chitu_init(args):
     ###################################################################
     # Initialize backend
 
-    args = get_global_args()
-    Backend.build(args)
-    rank = torch.distributed.get_rank()
-    if rank == 0:
-        Backend.schedulers = [
-            Scheduler.build(args.scheduler, args.infer, dp_rank=i)
-            for i in range(args.infer.dp_size)
-        ]
-    executor = Executor.build(args)
-    Backend.executor = executor
-    PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
-    logger.info("Chitu has been initialized")
+    try:
+        args = get_global_args()
+        Backend.build(args)
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            Backend.schedulers = [
+                Scheduler.build(args.scheduler, args.infer, dp_rank=i)
+                for i in range(args.infer.dp_size)
+            ]
+        executor = Executor.build(args)
+        Backend.executor = executor
+        PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
+        logger.info("Chitu has been initialized")
 
-    collector = PrometheusMetricsCollector.get_instance(is_create=True)
+        collector = PrometheusMetricsCollector.get_instance(is_create=True)
 
-    collector_addrs = [collector.addr]
-    if type(get_world_group().gpu_group) != SingletonGroupPlaceholder:
-        try:
-            collector_addrs = gather_str_to_dst_rank(
-                collector.addr, dst=0, group=get_world_group().gpu_group
-            )
-        except Exception as e:
-            logger.error(
-                f"An error occurred while gathering collector addresses to rank 0. Prometheus will monitor metrics only on rank 0: {e}"
-            )
+        collector_addrs = [collector.addr]
+        if type(get_world_group().gpu_group) != SingletonGroupPlaceholder:
+            try:
+                collector_addrs = gather_str_to_dst_rank(
+                    collector.addr, dst=0, group=get_world_group().gpu_group
+                )
+            except Exception as e:
+                logger.error(
+                    f"An error occurred while gathering collector addresses to rank 0. Prometheus will monitor metrics only on rank 0: {e}"
+                )
 
-    logger.debug(f"collector_addrs:{collector_addrs}")
+        logger.debug(f"collector_addrs:{collector_addrs}")
 
-    # Only rank 0 monitors (it has all TaskPool data)
-    should_start_monitor = rank == 0
-    if should_start_monitor:
-        start_prometheus_server_and_metrics_monitor(collector_addrs)
+        # Only rank 0 monitors (it has all TaskPool data)
+        should_start_monitor = rank == 0
+        if should_start_monitor:
+            start_prometheus_server_and_metrics_monitor(collector_addrs)
+    except Exception as e:
+        if not torch.distributed.is_initialized():
+            raise e
+        rank = torch.distributed.get_rank()
+        # Prepend rank ID before the message
+        msg = "\n".join(
+            [f"[Rank {rank}] {line}" for line in traceback.format_exc().split("\n")]
+        )
+        raise Exception(
+            msg
+        ) from None  # `msg` already contains traceback, so raise from None
 
 
 @torch.inference_mode()
@@ -866,9 +879,9 @@ def chitu_run_main_rank():
 
 @torch.inference_mode()
 def chitu_run():
+    rank = torch.distributed.get_rank()
     try:
         check_alloc_retries()
-        rank = torch.distributed.get_rank()
         if rank != 0:
             return Backend.executor.step(None)
         return chitu_run_main_rank()

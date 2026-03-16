@@ -145,6 +145,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         dp_local_bs = topk_weights.shape[0]
 
         dispatch_use_fp8 = False
+        round_scale_to_pow2 = False
         if (
             may_fuse_quant == "blockfp8"
             and may_fuse_quant_kwargs.get("block_size", 128) == 128
@@ -152,6 +153,9 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             <= 1
         ):
             dispatch_use_fp8 = True
+            round_scale_to_pow2 = may_fuse_quant_kwargs.get(
+                "round_scale_to_pow2", False
+            )
         if may_fuse_quant == "blockfp4" and not is_blackwell():
             # FIXME: Add fp4 option to infer.raise_lower_bit_float_to and use it here
             dispatch_use_fp8 = True
@@ -163,6 +167,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                 topk_ids,
                 return_recv_hook=True,
                 dispatch_use_fp8=dispatch_use_fp8,
+                round_scale_to_pow2=round_scale_to_pow2,
                 cumulative_local_expert_recv_stats=(
                     self.cumulative_local_expert_recv_stats.get(layer_id, None)
                 ),
@@ -239,6 +244,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         dispatch_use_fp8: bool = False,
+        round_scale_to_pow2: bool = False,
         cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
         async_finish: bool = False,
         return_recv_hook: bool = False,
@@ -256,6 +262,8 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                 DeepEPBuffer._lowlatency_num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=dispatch_use_fp8,
+                round_scale=round_scale_to_pow2,
+                use_ue8m0=False,  # Not using 8bit storage for now
                 cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
                 async_finish=async_finish,
                 return_recv_hook=return_recv_hook,

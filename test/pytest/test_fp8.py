@@ -41,6 +41,51 @@ def init_b_and_b_s(dim, block_size):
     )
 
 
+@pytest.mark.parametrize("bs,dim", [[0, 256], [1, 256], [256, 256]])
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("round_scale_to_pow2", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("impl", ["triton"])
+@pytest.mark.skipif(
+    not has_native_fp8(),
+    reason="This test requires the GPU to have native FP8 support",
+)
+def test_blockfp8_act_quant(
+    bs, dim, block_size, round_scale_to_pow2, dtype: torch.dtype, impl, record_benchmark
+):
+    torch.set_default_dtype(dtype)
+    assert dim % block_size == 0, "dim must be divisible by block_size"
+    a = torch.randn(bs, dim, dtype=dtype, device="cuda")
+
+    a_fp8, a_s = record_benchmark.run(
+        lambda: blockfp8_act_quant(
+            a, block_size=block_size, round_scale_to_pow2=round_scale_to_pow2, impl=impl
+        ),
+        bs=bs,
+        dim=dim,
+        impl=impl,
+    )
+    a_fp8_ref, a_s_ref = record_benchmark.run(
+        lambda: blockfp8_act_quant(
+            a,
+            block_size=block_size,
+            round_scale_to_pow2=round_scale_to_pow2,
+            impl="torch",
+        ),
+        bs=bs,
+        dim=dim,
+        impl="torch",
+    )
+
+    assert a_s.dtype == torch.float32
+    assert a_s_ref.dtype == torch.float32
+    if round_scale_to_pow2:
+        assert torch.all((a_s.view(dtype=torch.int32) & 0x007FFFFF) == 0)
+        assert torch.all((a_s_ref.view(dtype=torch.int32) & 0x007FFFFF) == 0)
+    assert_close(a_fp8.float(), a_fp8_ref.float(), atol=0.15, rtol=0.15)
+    assert_close(a_s, a_s_ref, atol=0.15, rtol=0.15)
+
+
 @pytest.mark.parametrize("bs,dim", [[0, 256], [1, 256], [256, 256], [409472, 6144]])
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -145,7 +190,7 @@ def test_dequanted_gemm_is_close_to_fp8_gemm(
     a = torch.randn(bs, dim, dtype=dtype, device="cuda")
     b, b_s = init_b_and_b_s(dim, block_size)
 
-    a_fp8, a_s = blockfp8_act_quant(a, block_size)
+    a_fp8, a_s = blockfp8_act_quant(a, block_size=block_size)
 
     std_y = record_benchmark.run(
         lambda: blockfp8_gemm(a_fp8, a_s, b, b_s),
@@ -236,10 +281,10 @@ def test_blockfp8_index_score_dense_dsv32(
     b, m, n, h, d, block_size, causal, impl, record_benchmark
 ):
     q_bf16 = torch.randn(b, m, h, d, dtype=torch.bfloat16, device="cuda")
-    q_fp8, q_s = blockfp8_act_quant(q_bf16, block_size)
+    q_fp8, q_s = blockfp8_act_quant(q_bf16, block_size=block_size)
 
     k_bf16 = torch.randn(b, n, d, dtype=torch.bfloat16, device="cuda")
-    k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size)
+    k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size=block_size)
 
     output = record_benchmark.run(
         lambda: blockfp8_index_score_dense_dsv32(
@@ -284,12 +329,12 @@ def test_blockfp8_index_score_ragged_q_dense_k_dsv32(
     q_bf16 = torch.randn(
         seq_len_delta.delta_total_len, h, d, dtype=torch.bfloat16, device="cuda"
     )
-    q_fp8, q_s = blockfp8_act_quant(q_bf16, block_size)
+    q_fp8, q_s = blockfp8_act_quant(q_bf16, block_size=block_size)
 
     k_bf16 = torch.randn(
         b, seq_len_delta.new.max_len, d, dtype=torch.bfloat16, device="cuda"
     )
-    k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size)
+    k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size=block_size)
 
     output = record_benchmark.run(
         lambda: blockfp8_index_score_ragged_q_dense_k_dsv32(
@@ -338,10 +383,10 @@ def test_blockfp8_index_score_ragged_q_paged_k_dsv32(
     q_bf16 = torch.randn(
         seq_len_delta.delta_total_len, h, d, dtype=torch.bfloat16, device="cuda"
     )
-    q_fp8, q_s = blockfp8_act_quant(q_bf16, block_size)
+    q_fp8, q_s = blockfp8_act_quant(q_bf16, block_size=block_size)
 
     k_bf16 = torch.randn(n_pages, page_size, d, dtype=torch.bfloat16, device="cuda")
-    k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size)
+    k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size=block_size)
 
     page_table = torch.randperm(n_pages, device="cuda", dtype=torch.int32).view(
         b, page_cnt_per_sample
