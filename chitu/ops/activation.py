@@ -12,7 +12,7 @@ from chitu.utils import (
     try_import_opt_dep,
     try_import_and_setup_torch_npu,
 )
-from chitu.native_layout import Vector
+from chitu.native_layout import Vector, MuxiNativeLayoutActivation
 from chitu.device_type import is_muxi, has_accelerator
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
@@ -33,8 +33,6 @@ logger = getLogger(__name__)
 
 
 def silu_and_mul_torch(x: torch.Tensor):
-    import chitu.muxi_utils as muxi_utils
-
     if isinstance(x, torch.Tensor):
         d = x.shape[-1] // 2
         return torch.nn.functional.silu(x[..., :d]) * x[..., d:]
@@ -47,18 +45,18 @@ def silu_and_mul_torch(x: torch.Tensor):
             * x.layout_tensor[..., d:],
         )
 
-    elif isinstance(x, muxi_utils.MuxiNativeLayoutActivation):
+    elif isinstance(x, MuxiNativeLayoutActivation):
         assert x.plain_shape[-1] % 2 == 0
         assert x.layout_tensor.shape[0] % 2 == 0
         d = x.layout_tensor.shape[0] // 2
-        return muxi_utils.MuxiNativeLayoutActivation(
+        return MuxiNativeLayoutActivation(
             list(x.plain_shape[:-1]) + [x.plain_shape[-1] // 2],
             torch.nn.functional.silu(x.layout_tensor[:d]) * x.layout_tensor[d:],
         )
 
     else:
         raise ValueError(
-            f"Unsupported input type: {type(x)}. Expected torch.Tensor or muxi_utils.MuxiNativeLayoutActivation."
+            f"Unsupported input type: {type(x)}. Expected torch.Tensor or MuxiNativeLayoutActivation."
         )
 
 
@@ -96,10 +94,8 @@ def silu_and_mul(
     expert_n_tokens: Optional[torch.Tensor] = None,
     impl="auto",
 ):
-    import chitu.muxi_utils as muxi_utils
-
     if impl == "auto":
-        if isinstance(x, muxi_utils.MuxiNativeLayoutActivation):
+        if isinstance(x, MuxiNativeLayoutActivation):
             impl = "torch"
         elif has_torch_npu:
             impl = "torch_npu"

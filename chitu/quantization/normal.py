@@ -29,8 +29,8 @@ from chitu.native_layout import (
     PermutedTensor,
     NpuFractalNzTensor,
     NpuFractalZnTensor,
-    ACL_FORMAT_FRACTAL_NZ,
 )
+from chitu.native_layout.npu import ACL_FORMAT_FRACTAL_NZ
 from chitu.custom_gguf import GGMLQuantizationType, get_ggml_quant_type
 from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import (

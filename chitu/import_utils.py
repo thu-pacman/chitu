@@ -79,6 +79,9 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> tuple[Any, bool]:
         "fast_hadamard_transform",
         "flash_attn_interface",
         "torchada",
+        "metax_soft_fp4_kernels",
+        "sugon_mixq4_kernels",
+        "sugon_w4a8_kernels",
     }
     assert (
         opt_dep_name in opt_deps
