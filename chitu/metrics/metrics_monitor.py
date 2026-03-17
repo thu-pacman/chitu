@@ -175,8 +175,8 @@ class MetricsMonitor:
             prealloc_blocks = (
                 prealloc_blocks_by_dp.get(dp_id) if prealloc_blocks_by_dp else None
             )
-            used_blocks_value = int(used_blocks.get(rank_dp, "-1"))
-            total_blocks_value = int(total_blocks.get(rank_dp, "-1"))
+            used_blocks_value = int(used_blocks.get(rank_dp, "0"))
+            total_blocks_value = int(total_blocks.get(rank_dp, "0"))
 
             mtp_hit_rate = None
             if mtp_proposed_rate and mtp_accepted_rate:
@@ -186,18 +186,18 @@ class MetricsMonitor:
                     mtp_hit_rate = accepted / proposed
 
             log_msg = self._build_stats_message(
-                prompt_tps=float(prompt_tps.get(rank_dp, "-1")),
-                gen_tps=float(gen_tps.get(rank_dp, "-1")),
+                prompt_tps=float(prompt_tps.get(rank_dp, "0")),
+                gen_tps=float(gen_tps.get(rank_dp, "0")),
                 running=running,
                 waiting=waiting,
-                kv_cache_usage=float(kvcache_usage.get(rank_dp, "-1")),
-                eviction_rate=float(eviction_rate.get(rank_dp, "-1")),
+                kv_cache_usage=float(kvcache_usage.get(rank_dp, "0")),
+                eviction_rate=float(eviction_rate.get(rank_dp, "0")),
                 used_blocks=used_blocks_value,
                 total_blocks=total_blocks_value,
                 prealloc_blocks=prealloc_blocks,
-                total_bytes=float(total_bytes.get(rank_dp, "-1")),
-                used_bytes=float(used_bytes.get(rank_dp, "-1")),
-                torch_allocated_bytes=float(torch_allocated_bytes.get(rank_dp, "-1")),
+                total_bytes=float(total_bytes.get(rank_dp, "0")),
+                used_bytes=float(used_bytes.get(rank_dp, "0")),
+                torch_allocated_bytes=float(torch_allocated_bytes.get(rank_dp, "0")),
                 mtp_hit_rate=mtp_hit_rate,
             )
             logger.info(f"[rank{rank}, DP{dp_id}]: {log_msg}")

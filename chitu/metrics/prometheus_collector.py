@@ -250,6 +250,9 @@ def _get_nvml_memory_bytes(device_index: int, pid: int):
             try:
                 processes = pynvml.nvmlDeviceGetComputeRunningProcesses_v2(handle)
             except Exception:
+                logger.warning(
+                    "Failed to get compute running processes, use empty list as default"
+                )
                 processes = []
         for proc in processes:
             if proc.pid != pid:
@@ -259,7 +262,8 @@ def _get_nvml_memory_bytes(device_index: int, pid: int):
                 used = int(proc_used)
             break
         return used, total
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to get NVML memory bytes: {e}")
         return None
     finally:
         if initialized:
@@ -409,7 +413,8 @@ class PrometheusMetricsCollector:
 
             try:
                 ip = get_local_ip()
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Failed to get local IP: {e}, use 127.0.0.1 as default")
                 ip = "127.0.0.1"
             port = get_free_port()
             self.collector_server, self.collector_thread = start_http_server(

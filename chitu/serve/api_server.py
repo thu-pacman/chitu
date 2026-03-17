@@ -28,7 +28,7 @@ from chitu.chitu_main import chitu_init, init_logger
 from chitu.dp_request_router import get_request_router
 from chitu.dp_token_router import get_token_router
 from chitu.global_vars import get_global_args, set_global_args
-from chitu.task import RouterRequest, Task, TaskLoad, TaskPool, UserRequest
+from chitu.task import RouterRequest, Task, TaskPool, UserRequest
 from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
 from chitu.serve.common import set_min_batch_size
@@ -310,9 +310,13 @@ async def get_chitu_status():
 @app.post("/load_status")
 async def get_chitu_load_status():
     args = get_global_args()
+    load_score = sum(
+        getattr(task, "prefix_tokens_len", 0) for task in TaskPool.pool.values()
+    )
+    handle_reqs = len(TaskPool.pool) + len(getattr(TaskPool, "pending_queue", []))
     return {
-        "load_score": f"{TaskLoad.get_load()}",
-        "handle_reqs": f"{len(TaskLoad.user_req)}",
+        "load_score": f"{load_score}",
+        "handle_reqs": f"{handle_reqs}",
         "max_reqs": f"{args.infer.max_reqs}",
     }
 
