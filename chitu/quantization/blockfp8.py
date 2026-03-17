@@ -408,6 +408,7 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
                 w1_scale=gate_up_proj_scale,
                 w2_scale=down_proj_scale,
                 block_shape=[128, 128],
+                round_scale_to_pow2=self.round_scale_to_pow2,
                 soft_fp8=fused_soft_fp8,
                 global_num_experts=self.global_n_experts,
                 experts_start_idx=self.experts_start_idx,

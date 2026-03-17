@@ -42,7 +42,12 @@ class FlashMLABackend(TritonAttnBackend):
         self.mtp_size = getattr(self.args.infer, "mtp_size", 1)
         self.kv_heads = 1
         assert has_accelerator(), "FlashMLA backend only supports cuda"
-        self.required_h_q = 128 if torch.cuda.get_device_capability() == (10, 0) else 64
+        arch_major, _ = torch.cuda.get_device_capability()
+        assert arch_major in (
+            9,
+            10,
+        ), "FlashMLA backend only supports Hopper (sm9x) and Blackwell (sm10x)"
+        self.required_h_q = 128 if arch_major == 10 else 64
 
         self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
 
