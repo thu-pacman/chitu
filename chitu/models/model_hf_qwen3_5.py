@@ -827,6 +827,13 @@ class TransformerHFQwen3_5(TransformerHFQwen3Next):
             ),
         )
 
+    def _process_state_dict_for_merging_qkv_z_for_tp1(self, checkpoint: dict[str, Any]):
+        return self.process_state_dict_for_merging_tensors(
+            checkpoint,
+            tgt_layer="in_proj_qkvz",
+            src_layers=["in_proj_qkv", "in_proj_z"],
+        )
+
     def _process_state_dict_for_adding_dot_weight(self, checkpoint: dict[str, Any]):
         """
         E.g. layers.42.mlp.experts.down_proj -> layers.42.mlp.experts.down_proj.weight
@@ -882,6 +889,11 @@ class TransformerHFQwen3_5(TransformerHFQwen3Next):
                 state_dict = self.chunk_checkpoint_for_tensor_parallelize_attn_weights(
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )
+            else:
+                state_dict = self._process_state_dict_for_merging_qkv_z_for_tp1(
+                    state_dict
+                )
+
             if self.is_moe_model:
                 for k in list(state_dict.keys()):
                     v = state_dict.pop(k)
