@@ -20,6 +20,7 @@
 | DeepSeek-V3.2 | ✓ | `models=DeepSeek-V3.2` | https://huggingface.co/deepseek-ai/DeepSeek-V3.2 |
 | DeepSeek-V3.2-Exp | ✓ | `models=DeepSeek-V3.2-Exp` | https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp |
 | DeepSeek-V3.2-Exp-kv-fp8 | ✓ | `models=DeepSeek-V3.2-Exp-kv-fp8` | https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp |
+| DeepSeek-V3.2-kv-fp8 | ✓ | `models=DeepSeek-V3.2-kv-fp8` | https://huggingface.co/deepseek-ai/DeepSeek-V3.2 |
 | glm-4-32b |  | `models=GLM-4-32B-0414` | https://modelscope.cn/models/ZhipuAI/GLM-4-32B-0414 |
 | glm-4-9b |  | `models=GLM-4-9B-0414` | https://www.modelscope.cn/models/ZhipuAI/GLM-4-9B-0414 |
 | GLM-4.5 | ✓ | `models=GLM-4.5` | https://huggingface.co/zai-org/GLM-4.5 |
