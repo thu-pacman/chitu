@@ -26,6 +26,8 @@ from chitu.moe.batched_routed_activation import (
 from chitu.moe.load_balancer import get_moe_load_planner
 from chitu.global_vars import get_global_args
 from chitu.device_type import is_blackwell
+from chitu.device_type import is_muxi
+from contextlib import nullcontext
 
 # replace the buffer setting with DeepEP to concurrently enbale ll mode and normal mode, need more test to verify.
 from chitu.moe.token_dispatchers.buffercontroller import DeepEPBuffer
@@ -71,6 +73,9 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         self.prepare_profile = False
 
         self.moe_layer_id_list = moe_layer_id_list
+        self.dispatch_stream = None
+        if not is_muxi():
+            self.dispatch_stream = torch.cuda.Stream()
 
     def prepare_decode_profile(self):
         if self.prepare_profile:
@@ -142,6 +147,26 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
     ) -> tuple[PerExpertDenseBatchedRoutedActivation, Optional[torch.Tensor]]:
+        routed_x, weights, dispatch_stream = self.enter_moe_dispatch_streaming(
+            x,
+            topk_weights,
+            may_fuse_quant=may_fuse_quant,
+            may_fuse_quant_kwargs=may_fuse_quant_kwargs,
+            layer_id=layer_id,
+        )
+        if dispatch_stream is not None:
+            torch.cuda.current_stream().wait_stream(dispatch_stream)
+        return routed_x, weights
+
+    def enter_moe_dispatch_streaming(
+        self,
+        x: IndexedBatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
+        layer_id: Optional[int] = None,
+    ):
         dp_local_bs = topk_weights.shape[0]
 
         dispatch_use_fp8 = False
@@ -161,18 +186,23 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             dispatch_use_fp8 = True
 
         topk_ids = x.token_to_expert_indices.to(torch.int64)
-        recv_activation, recv_expert_count, deepep_handle, event, hook = (
-            self.deepep_token_dispatch(
-                x.activation,
-                topk_ids,
-                return_recv_hook=True,
-                dispatch_use_fp8=dispatch_use_fp8,
-                round_scale_to_pow2=round_scale_to_pow2,
-                cumulative_local_expert_recv_stats=(
-                    self.cumulative_local_expert_recv_stats.get(layer_id, None)
-                ),
+        ctx = nullcontext()
+        if self.dispatch_stream is not None:
+            self.dispatch_stream.wait_stream(torch.cuda.current_stream())
+            ctx = torch.cuda.stream(self.dispatch_stream)
+        with ctx:
+            recv_activation, recv_expert_count, deepep_handle, event, hook = (
+                self.deepep_token_dispatch(
+                    x.activation,
+                    topk_ids,
+                    return_recv_hook=True,
+                    dispatch_use_fp8=dispatch_use_fp8,
+                    round_scale_to_pow2=round_scale_to_pow2,
+                    cumulative_local_expert_recv_stats=(
+                        self.cumulative_local_expert_recv_stats.get(layer_id, None)
+                    ),
+                )
             )
-        )
         hook()
 
         # TODO(zms): A more flexible context management.
@@ -192,6 +222,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                     expert_ids_are_local=True,
                 ),
                 None,
+                self.dispatch_stream,
             )
         else:
             recv_activation, recv_activation_scale = recv_activation
@@ -203,6 +234,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                     expert_ids_are_local=True,
                 ),
                 None,
+                self.dispatch_stream,
             )
 
     @override

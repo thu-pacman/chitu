@@ -348,6 +348,11 @@ class MoEImplEP(MoEImplBase):
     def enter_moe(self, *args, **kwargs):
         return self._get_current_token_dispatcher().enter_moe(*args, **kwargs)
 
+    def enter_moe_dispatch_streaming(self, *args, **kwargs):
+        return self._get_current_token_dispatcher().enter_moe_dispatch_streaming(
+            *args, **kwargs
+        )
+
     def exit_moe_prefer_before_local_sum(self) -> bool:
         return self._get_current_token_dispatcher().exit_moe_prefer_before_local_sum()
 

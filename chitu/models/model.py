@@ -1773,6 +1773,23 @@ class ParallelMoeBlock(nn.Module):
 
         shared_y = None
         x_in_use_simultenously = False
+        experts_impl = self.moe_impl.get_experts_impl()
+        if self.moe_impl.ep_size > 1:
+            routed_x_old = routed_x
+            routed_x, weights, dispatch_stream = (
+                self.moe_impl.enter_moe_dispatch_streaming(
+                    routed_x,
+                    weights,
+                    may_fuse_quant=get_quant_from_checkpoint_prefix(
+                        f"{self.checkpoint_prefix}.experts"
+                    ),
+                    may_fuse_quant_kwargs=get_quant_kwargs_from_checkpoint_prefix(
+                        f"{self.checkpoint_prefix}.experts"
+                    ),
+                    layer_id=self.layer_id,
+                )
+            )
+
         if self.shared_experts is not None:
             ctx = nullcontext()
             if self.shared_experts_stream is not None:
@@ -1782,26 +1799,12 @@ class ParallelMoeBlock(nn.Module):
             with ctx:
                 shared_y = self.shared_experts(x)
 
-        experts_impl = "auto"
         if self.moe_impl.ep_size > 1:
-            experts_impl = self.moe_impl.get_experts_impl()
-            routed_x_old = routed_x
-            routed_x, weights = self.moe_impl.enter_moe(
-                routed_x,
-                weights,
-                may_fuse_quant=get_quant_from_checkpoint_prefix(
-                    f"{self.checkpoint_prefix}.experts"
-                ),
-                may_fuse_quant_kwargs=get_quant_kwargs_from_checkpoint_prefix(
-                    f"{self.checkpoint_prefix}.experts"
-                ),
-                layer_id=self.layer_id,
-            )
+            if dispatch_stream is not None:
+                torch.cuda.current_stream().wait_stream(dispatch_stream)
             x_in_use_simultenously = x_in_use_simultenously and (
                 routed_x_old is routed_x
             )
-        elif self.moe_impl.ep_size == 1:
-            experts_impl = self.moe_impl.get_experts_impl()
 
         if (
             self.moe_impl.ep_size > 1
