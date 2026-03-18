@@ -1483,10 +1483,7 @@ class Transformer(nn.Module):
                     kwargs_max_nelem={},
                     output_max_nelem_callback=lambda key, n: 1,
                     before_replay_callback=None,
-                    # empty decode 仅用于 EP sync，没有真实 token
-                    # 在 empty decode 上capture graph 会生成 zero-size buffer，
-                    # 后续非空 replay 会失败，因此关闭graphed，经过测试发现这部分对性能影响很小
-                    enable=False,
+                    enable=current_cuda_graph_enabled,
                 )
                 def do_empty_decode():
                     return self.empty_decode()
@@ -1500,10 +1497,7 @@ class Transformer(nn.Module):
                         kwargs_max_nelem={},
                         output_max_nelem_callback=lambda key, n: 1,
                         before_replay_callback=None,
-                        # empty MTP decode 仅用于 EP sync，没有真实 token
-                        # 在 empty decode 上捕获 CUDA graph 会生成 zero-size buffer，
-                        # 后续非空 replay 会失败，因此保持 non-graphed。
-                        enable=False,
+                        enable=current_cuda_graph_enabled,
                     )
                     def do_empty_decode_mtp():
                         return self.empty_mtp_decode()
