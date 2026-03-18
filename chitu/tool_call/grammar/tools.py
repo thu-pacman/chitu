@@ -9,9 +9,6 @@ from xgrammar.structural_tag import (
     TagsWithSeparatorFormat,
     TriggeredTagsFormat,
     TagFormat,
-    AnyTextFormat,
-    SequenceFormat,
-    ConstStringFormat,
 )
 
 from .tool import AbstractToolGrammar
@@ -87,31 +84,3 @@ class TriggeredMultipleToolsGrammar(AbstractToolsGrammar):
             stop_after_first=constraint.stop_after_first,
         )
         return triggered_tag
-
-
-class ForceReasoningGrammar(AbstractToolsGrammar):
-    def __init__(
-        self,
-        template: str = "<think>{}</think>",
-        *,
-        tools: AbstractToolsGrammar,
-        mark="{}",
-    ):
-        self.tools = tools
-        self.begin, self.end = template.split(mark)
-        assert self.end != ""
-
-    def build(self, constraint: ConstraintParams) -> Format:
-        tools = self.tools.build(constraint)
-        if constraint.at_least_one and constraint.params.enable_reasoning:
-            elements = [
-                AnyTextFormat(excludes=[self.end]),
-                ConstStringFormat(value=self.end),
-                tools,
-            ]
-            if self.begin:
-                elements.insert(0, ConstStringFormat(value=self.begin))
-            return SequenceFormat(
-                elements=elements,
-            )
-        return tools

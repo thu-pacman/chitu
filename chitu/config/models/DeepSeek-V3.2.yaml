@@ -13,4 +13,4 @@ source: "https://huggingface.co/deepseek-ai/DeepSeek-V3.2" # Just for displaying
 chatformat_type: dsv32
 tool_parser: DeepSeekV32ToolParser
 skip_special_tokens: False # Whether to skip special tokens when decoding with the tokenizer
-reasoning_without_begin: true
+reasoning_type: switchable

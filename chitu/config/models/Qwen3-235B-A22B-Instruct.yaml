@@ -10,4 +10,5 @@ defaults:
 # Access info
 name: Qwen3-235B-A22B-Instruct
 source: https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507
-tool_parser: Qwen3InstructToolParser
+tool_parser: Qwen3ToolParser
+reasoning_type: disabled

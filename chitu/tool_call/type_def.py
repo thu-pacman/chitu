@@ -4,6 +4,7 @@
 
 from typing import Literal, NamedTuple
 from pydantic import BaseModel
+from chitu.reasoning.type_def import ReasoningParams
 
 
 class ChoiceDeltaToolCallFunction(BaseModel):
@@ -47,11 +48,11 @@ class ToolChoiceNamedTool(BaseModel):
 ToolChoice = ToolChoiceNamedTool | Literal["none", "auto", "required"]
 
 
-class ToolCallParams(BaseModel):
+class ToolCallParams(NamedTuple):
     tools: list[dict]
+    reasoning_params: ReasoningParams
     tool_choice: ToolChoice = "auto"
     parallel_tool_calls: bool = True
-    enable_reasoning: bool = False
 
 
 class ConstraintParams(NamedTuple):

@@ -26,6 +26,7 @@ from chitu.backend import Backend
 from chitu.device_list import DeviceList, StaticDeviceListManager
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.tool_call import ToolChoice, ToolCallParams, adjust_message_for_tool_calls
+from chitu.reasoning import get_reasoning_params, update_chat_template_kwargs_reasoning
 from chitu.constraint_decode import ConstraintDecodeTask
 
 logger = getLogger(__name__)
@@ -180,6 +181,10 @@ class UserRequest:
             frequency_penalty=frequency_penalty,
         )
         self.chat_template_kwargs = chat_template_kwargs
+        self.reasoning_params = get_reasoning_params(enable_reasoning)
+        update_chat_template_kwargs_reasoning(
+            self.chat_template_kwargs, self.reasoning_params
+        )
 
         # constraint decoding related
         self.tools = []
@@ -191,9 +196,9 @@ class UserRequest:
             grammar = Backend.tool_parser.build_grammar(
                 ToolCallParams(
                     tools=tools,
+                    reasoning_params=self.reasoning_params,
                     tool_choice=tool_choice,
                     parallel_tool_calls=parallel_tool_calls,
-                    enable_reasoning=enable_reasoning,
                 )
             )
             self.grammar, self.grammar_str = (
@@ -202,7 +207,7 @@ class UserRequest:
 
         # response related
         self.output = ""
-        self.async_stream = AsyncDataStream(enable_reasoning=enable_reasoning)
+        self.async_stream = AsyncDataStream(self.reasoning_params)
         self.finish_reason = None
         self.max_new_tokens = max_new_tokens
         self.num_output_tokens = 0

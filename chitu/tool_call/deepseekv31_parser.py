@@ -9,7 +9,6 @@ from .grammar import (
     JsonArgumentsGrammar,
     ToolGrammar,
     TriggeredMultipleToolsGrammar,
-    ForceReasoningGrammar,
     GrammarImplBase,
 )
 
@@ -34,7 +33,7 @@ class DeepSeekV31GrammarImpl(GrammarImplBase):
         tool=tool,
         trigger="<｜tool▁calls▁begin｜>",
     )
-    root_grammar = ForceReasoningGrammar("{}</think>", tools=tools)
+    root_grammar = tools
 
 
 class DeepSeekV31ParserImpl(ToolParserImplBase):
@@ -69,6 +68,6 @@ class DeepSeekV31ToolParser(
 
     @classmethod
     def build_grammar(cls, params):
-        if params.enable_reasoning:
+        if params.reasoning_params.enable_reasoning:
             raise ValueError("DeepSeek V3.1 should use tool call without reasoning")
         return super().build_grammar(params)

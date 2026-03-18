@@ -9,7 +9,6 @@ from .grammar import (
     JsonArgumentsGrammar,
     ToolGrammar,
     TriggeredToolsGrammar,
-    ForceReasoningGrammar,
     GrammarImplBase,
 )
 
@@ -33,7 +32,7 @@ class Qwen3GrammarImpl(GrammarImplBase):
         tool=tool,
         trigger="<tool_call>",
     )
-    root_grammar = ForceReasoningGrammar("<think>{}</think>", tools=tools)
+    root_grammar = tools
 
 
 class Qwen3ParserImpl(ToolParserImplBase):

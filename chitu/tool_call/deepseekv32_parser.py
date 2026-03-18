@@ -12,7 +12,6 @@ from .grammar import (
     TypeDispatchArgumentGrammar,
     ArgumentsGrammar,
     ToolGrammar,
-    ForceReasoningGrammar,
     TriggeredMultipleToolsGrammar,
     GrammarImplBase,
 )
@@ -53,7 +52,7 @@ class DeepSeekV32GrammarImpl(GrammarImplBase):
         tool=tool,
         trigger="<｜DSML｜function_calls>",
     )
-    root_grammar = ForceReasoningGrammar("{}</think>", tools=tools)
+    root_grammar = tools
 
 
 class DeepSeekV32ParserImpl(ToolParserImplBase):

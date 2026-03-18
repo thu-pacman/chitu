@@ -40,3 +40,4 @@ re_token_id: 151649
 main_weight_dtype: float8_e4m3fn
 rms_norm_dtype: float32
 tool_parser: DeepSeekV31ToolParser
+reasoning_type: switchable

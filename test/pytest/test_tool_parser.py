@@ -4,6 +4,7 @@ import xgrammar
 
 from chitu.tool_call import ToolCallParams, get_tool_parser
 from chitu.tool_call.type_def import ChoiceToolCall, ChoiceToolCallFunction
+from chitu.reasoning.type_def import ReasoningParams
 
 test_type_arguments = json.dumps({"ks": "vs", "ko": {"kb": True}, "ka": [1, 2, 3]})
 
@@ -48,15 +49,15 @@ def run_match(
     tools=TOOLS,
     tool_choice="auto",
     parallel_tool_calls=True,
-    enable_reasoning=True,
+    reasoning_params=ReasoningParams(False),
 ):
     parser_cls = get_tool_parser(parser)
     grammar = parser_cls.build_grammar(
         ToolCallParams(
             tools=tools,
+            reasoning_params=reasoning_params,
             tool_choice=tool_choice,
             parallel_tool_calls=parallel_tool_calls,
-            enable_reasoning=enable_reasoning,
         )
     )
     vocab = sorted(set("".join([data]))) + ["<|CHITU_STOP_TOKEN|>"]
@@ -178,21 +179,6 @@ def test_deepseekv3():
     run_parse(parser, data, "begin--end", std_tools)
 
 
-def test_deepseekr1():
-    parser = "DeepSeekR1ToolParser"
-    data = (
-        "begin-<｜tool▁calls▁begin｜>"
-        f"<｜tool▁call▁begin｜>function<｜tool▁sep｜>test_type\n```json\n{test_type_arguments}\n```<｜tool▁call▁end｜>"
-        "\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>test_empty\n```json\n{}\n```<｜tool▁call▁end｜>"
-        "<｜tool▁calls▁end｜>-end"
-    )
-    run_match(parser, data, True)
-    run_match(parser, data, False, tool_choice="required")
-    data_reasoning = data.replace("begin-", "<think>reason</think>")
-    run_match(parser, data_reasoning, True, tool_choice="required")
-    run_parse(parser, data, "begin--end", std_tools)
-
-
 def test_deepseekv31():
     parser = "DeepSeekV31ToolParser"
 
@@ -202,7 +188,7 @@ def test_deepseekv31():
         "<｜tool▁call▁begin｜>test_empty<｜tool▁sep｜>{}<｜tool▁call▁end｜>"
         "<｜tool▁calls▁end｜>-end"
     )
-    run_match(parser, data, True, enable_reasoning=False)
+    run_match(parser, data, True)
     run_parse(parser, data, "begin--end", std_tools)
 
 
@@ -218,10 +204,7 @@ def test_deepseekv32():
         '<｜DSML｜invoke name="test_empty">\n</｜DSML｜invoke>\n'
         "</｜DSML｜function_calls>-end"
     )
-    run_match(parser, "reason</think>" + data, True)
-    run_match(parser, data, False, tool_choice="required")
-    data_reasoning = data.replace("begin-", "reason</think>")
-    run_match(parser, data_reasoning, True, tool_choice="required")
+    run_match(parser, data, True)
     run_parse(parser, data, "begin--end", std_tools)
 
 
@@ -236,9 +219,6 @@ def test_glm47():
         "<tool_call>test_empty</tool_call>-end"
     )
     run_match(parser, data, True)
-    run_match(parser, data, False, tool_choice="required")
-    data_reasoning = data.replace("begin-", "reason</think>")
-    run_match(parser, data_reasoning, True, tool_choice="required")
     run_parse(parser, data, "begin--mid--end", std_tools)
 
 
@@ -253,9 +233,6 @@ def test_glm45():
         "<tool_call>test_empty\n</tool_call>-end"
     )
     run_match(parser, data, True)
-    run_match(parser, data, False, tool_choice="required")
-    data_reasoning = data.replace("begin-", "reason</think>")
-    run_match(parser, data_reasoning, True, tool_choice="required")
     run_parse(parser, data, "begin-\n-end", std_tools)
 
 
@@ -288,29 +265,27 @@ def test_qwen3():
         "-end"
     )
     run_match(parser, data, True)
-    run_match(parser, data, False, tool_choice="required")
-    data_reasoning = data.replace("begin-", "<think>reason</think>")
-    run_match(parser, data_reasoning, True, tool_choice="required")
     run_parse(parser, data, "begin--mid--end", std_tools)
 
 
-def test_qwen3_instruct():
-    parser = "Qwen3InstructToolParser"
-    data = (
-        "begin-"
-        '<tool_call>\n{"name": "test_type", "arguments": '
-        f"{test_type_arguments}"
-        "}\n</tool_call>"
-        "-mid-"
-        '<tool_call>\n{"name": "test_empty", "arguments": {}}\n</tool_call>'
-        "-end"
-    )
-    run_match(parser, data, True)
-    run_parse(parser, data, "begin--mid--end", std_tools)
+def test_reasoning():
+    parser = "Qwen3ToolParser"
+    data = '<tool_call>\n{"name": "test_empty", "arguments": {}}\n</tool_call>'
+
+    run_match(parser, data, True, tool_choice="required")
+
+    rp1 = ReasoningParams(True)
+    data1 = "<think>reasoning_content</think>" + data
+    run_match(parser, data, False, tool_choice="required", reasoning_params=rp1)
+    run_match(parser, data1, True, tool_choice="required", reasoning_params=rp1)
+
+    rp2 = ReasoningParams(True, initial_state=True)
+    data2 = "reasoning_content</think>" + data
+    run_match(parser, data, False, tool_choice="required", reasoning_params=rp2)
+    run_match(parser, data2, True, tool_choice="required", reasoning_params=rp2)
 
 
 if __name__ == "__main__":
-    test_deepseekr1()
     test_deepseekv3()
     test_deepseekv31()
     test_deepseekv32()
@@ -318,5 +293,5 @@ if __name__ == "__main__":
     test_glm47()
     test_qwen3()
     test_qwen3coder()
-    test_qwen3_instruct()
+    test_reasoning()
     print("test ok")
