@@ -21,6 +21,7 @@ from chitu.moe.experts import (
     fused_experts_no_sum_wrapper,
     fused_experts_and_sum_wrapper,
 )
+from chitu.lazy import eval_lazy
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
@@ -134,6 +135,7 @@ class AscendW8A8Linear(
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = eval_lazy(x)
 
         if x.shape[0] == 0:
             return torch.empty(
@@ -210,6 +212,8 @@ class AscendW8A8DynamicLinear(
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = eval_lazy(x)
+
         if x.shape[0] == 0:
             return torch.empty([0, self.out_features], dtype=x.dtype, device=x.device)
         output_dtype = x.dtype

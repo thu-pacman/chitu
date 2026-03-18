@@ -78,7 +78,6 @@ from chitu.tensor_parallel import (
 from chitu.distributed.parallel_state import get_tp_size, get_etp_size
 from chitu.distributed.partition import compute_expert_dist_in_ep
 from chitu.utils import parse_dtype, try_import_and_setup_torch_npu
-from chitu.lazy import eval_lazy
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -807,7 +806,7 @@ class MLPDeepSeekV3(nn.Module):
         """
         if self.merge_gate_up:
             gate_up_proj_out = self.gate_up_proj(x)
-            return self.down_proj(eval_lazy(silu_and_mul(gate_up_proj_out)))
+            return self.down_proj(silu_and_mul(gate_up_proj_out))
         else:
             gate_proj_out = self.gate_proj(x)
             up_proj_out = self.up_proj(x)
