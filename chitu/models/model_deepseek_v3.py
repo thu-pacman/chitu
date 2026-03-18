@@ -869,15 +869,15 @@ def MoeExpertsDeepSeekV3(
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     checkpoint_prefix = checkpoint_prefix + ".moe"
+    merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(checkpoint_prefix)
     if base_moe_experts_class is None:
         base_moe_experts_class = (
             QuantizationRegistry.get_quantized_moe_experts_class_from_global_args(
+                merge_gate_up=merge_gate_up,
                 quant_kwargs=quant_kwargs,
                 checkpoint_prefix=checkpoint_prefix,
             )
         )
-
-    merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(checkpoint_prefix)
 
     assert args.moe_inter_dim % get_etp_size() == 0
     return base_moe_experts_class(
@@ -890,7 +890,6 @@ def MoeExpertsDeepSeekV3(
         n_activated_experts=args.n_activated_experts,
         fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
         checkpoint_prefix=checkpoint_prefix,
-        merge_gate_up=merge_gate_up,
     )
 
 

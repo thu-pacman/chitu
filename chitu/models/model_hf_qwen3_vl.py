@@ -29,7 +29,6 @@ from chitu.models.model_hf_qwen_3_moe import TransformerHFQwen3Moe
 from chitu.models.registry import ModelType, register_model
 from chitu.utils import try_import_opt_dep
 from chitu.quantization import get_quant_from_checkpoint_prefix, QuantizationRegistry
-from chitu.quantization.normal import NormalMoeExperts
 from chitu.device_type import has_accelerator
 
 _flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")

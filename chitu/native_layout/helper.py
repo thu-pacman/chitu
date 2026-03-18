@@ -12,7 +12,6 @@ from chitu.global_vars import get_global_args
 def enable_native_layout_weight(
     key: str,
     native_layout_tensor_class: type,
-    allow_missing: bool = False,
     *static_args,
     **static_kwargs,
 ) -> type:
@@ -49,7 +48,6 @@ def enable_native_layout_weight(
         key: The module will process `self.{key}` for its weight `Parameter`, and the native layout tensor
              getter will be named after `self.get_native_layout_{key}`.
         native_layout_tensor_class: A subclass of `NativeLayoutTensor` representing the layout.
-        allow_missing: If True, elegantly skip the preprocessing if `self.{key}` does not exists.
         static_args: Other positional arguments passed to `NativeLayoutTensor`.
         static_kwargs: Other keyword arguments passed to `NativeLayoutTensor`.
     """
@@ -85,8 +83,6 @@ def enable_native_layout_weight(
                 )
 
             def _preprocess_layout(module, incompatible_keys):
-                if allow_missing and not hasattr(module, key):
-                    return
                 if hasattr(module, f"_{key}_layout_class"):
                     old_tensor = _get_native_layout_tensor()
                 else:

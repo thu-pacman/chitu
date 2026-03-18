@@ -6,7 +6,7 @@ from typing_extensions import override
 import torch
 
 from chitu.utils import try_import_and_setup_torch_npu
-from chitu.quantization.base import QuantizedLinearBase, QuantizedMoeExpertsBase
+from chitu.quantization.base import QuantizedLinearBase, QuantizedMoeExpertsMerged
 from chitu.distributed.parallel_state import get_tp_group
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.native_layout import (
@@ -227,13 +227,13 @@ class AscendW8A8DynamicLinear(
         return output
 
 
-@QuantizationRegistry.register_moe_experts("ascend_w8a8_dynamic")
+@QuantizationRegistry.register_moe_experts("ascend_w8a8_dynamic", merge_gate_up=True)
 class AscendW8A8DynamicMoeExperts(
     enable_native_layout_weight("gate_up_proj_weight", NpuFractalZnTensor),
     enable_native_layout_weight("down_proj_weight", NpuFractalZnTensor),
     enable_native_layout_weight("gate_up_proj_weight_scale", SqueezeLastSingleton),
     enable_native_layout_weight("down_proj_weight_scale", SqueezeLastSingleton),
-    QuantizedMoeExpertsBase,
+    QuantizedMoeExpertsMerged,
 ):
     """
     AscendW8A8Dynamic quantized MoeExperts
@@ -252,14 +252,7 @@ class AscendW8A8DynamicMoeExperts(
         n_activated_experts: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
-        merge_gate_up: bool,
     ):
-        """
-        Initializes the MoE module.
-
-        Args:
-            args (ModelArgs): Model arguments containing MoE parameters.
-        """
         super().__init__(
             dim,
             moe_inter_dim,
@@ -270,27 +263,22 @@ class AscendW8A8DynamicMoeExperts(
             n_activated_experts,
             fuse_shared_experts,
             checkpoint_prefix,
-            merge_gate_up,
         )
 
-        if self.merge_gate_up:
-            self.gate_up_proj_weight = torch.nn.Parameter(
-                torch.empty(
-                    (self.group_size, moe_inter_dim * 2, self.dim),
-                    dtype=torch.int8,
-                ),
-                requires_grad=False,
-            )
-            self.gate_up_proj_weight_scale = torch.nn.Parameter(
-                torch.empty(
-                    (self.group_size, moe_inter_dim * 2, 1),
-                    dtype=torch.get_default_dtype(),
-                ),
-                requires_grad=False,
-            )
-        else:
-            raise NotImplementedError("Ascend MoE must use merged gate up")
-
+        self.gate_up_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, moe_inter_dim * 2, self.dim),
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        self.gate_up_proj_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, moe_inter_dim * 2, 1),
+                dtype=torch.get_default_dtype(),
+            ),
+            requires_grad=False,
+        )
         self.down_proj_weight = torch.nn.Parameter(
             torch.empty(
                 (self.group_size, self.dim, moe_inter_dim),
@@ -310,21 +298,17 @@ class AscendW8A8DynamicMoeExperts(
     def forward_no_sum(
         self, routed_x: BatchedRoutedActivation, impl: str = "npu"
     ) -> BatchedExpertResult:
-        if self.merge_gate_up:
-            return fused_experts_no_sum_wrapper(
-                routed_x,
-                w1=self.get_native_layout_gate_up_proj_weight(),
-                w1_scale=self.gate_up_proj_weight_scale,  # fp32
-                w2=self.get_native_layout_down_proj_weight(),
-                w2_scale=self.down_proj_weight_scale,  # bf16
-                use_int8_w8a8=True,
-                impl=impl,
-                global_num_experts=self.global_n_experts,
-                experts_start_idx=self.experts_start_idx,
-            )
-
-        else:
-            return super().forward_no_sum(routed_x, impl=impl)
+        return fused_experts_no_sum_wrapper(
+            routed_x,
+            w1=self.get_native_layout_gate_up_proj_weight(),
+            w1_scale=self.gate_up_proj_weight_scale,  # fp32
+            w2=self.get_native_layout_down_proj_weight(),
+            w2_scale=self.down_proj_weight_scale,  # bf16
+            use_int8_w8a8=True,
+            impl=impl,
+            global_num_experts=self.global_n_experts,
+            experts_start_idx=self.experts_start_idx,
+        )
 
     @override
     def forward(
@@ -334,19 +318,15 @@ class AscendW8A8DynamicMoeExperts(
         inplace: bool = False,
         impl: str = "npu",
     ) -> torch.Tensor:
-        if self.merge_gate_up:
-            return fused_experts_and_sum_wrapper(
-                routed_x,
-                w1=self.get_native_layout_gate_up_proj_weight(),
-                w1_scale=self.gate_up_proj_weight_scale,  # fp32
-                w2=self.get_native_layout_down_proj_weight(),
-                w2_scale=self.down_proj_weight_scale,  # bf16
-                topk_weights=weights,
-                use_int8_w8a8=True,
-                impl=impl,
-                global_num_experts=self.global_n_experts,
-                experts_start_idx=self.experts_start_idx,
-            )
-
-        else:
-            return super().forward(routed_x, weights, inplace=inplace, impl=impl)
+        return fused_experts_and_sum_wrapper(
+            routed_x,
+            w1=self.get_native_layout_gate_up_proj_weight(),
+            w1_scale=self.gate_up_proj_weight_scale,  # fp32
+            w2=self.get_native_layout_down_proj_weight(),
+            w2_scale=self.down_proj_weight_scale,  # bf16
+            topk_weights=weights,
+            use_int8_w8a8=True,
+            impl=impl,
+            global_num_experts=self.global_n_experts,
+            experts_start_idx=self.experts_start_idx,
+        )

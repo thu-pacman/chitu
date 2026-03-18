@@ -10,7 +10,8 @@ import ctypes
 
 from chitu.quantization.base import (
     QuantizedLinearBase,
-    QuantizedMoeExpertsBase,
+    QuantizedMoeExpertsUnmerged,
+    QuantizedMoeExpertsMerged,
     QuantizedAbsorbGemmBase,
 )
 from chitu.ops.quant import linear
@@ -113,8 +114,8 @@ class NormalLinearNpuFractalZn(
         )
 
 
-@QuantizationRegistry.register_moe_experts(None)
-class NormalMoeExperts(QuantizedMoeExpertsBase):
+@QuantizationRegistry.register_moe_experts(None, merge_gate_up=False)
+class NormalMoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
     def __init__(
         self,
         ############################################
@@ -128,7 +129,6 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
         n_activated_experts: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
-        merge_gate_up: bool,
         *,
         ############################################
         # Parameters specific to this quantization
@@ -144,32 +144,82 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
             n_activated_experts,
             fuse_shared_experts,
             checkpoint_prefix,
-            merge_gate_up,
         )
 
-        if not self.merge_gate_up:
-            self.gate_proj_weight = torch.nn.Parameter(
-                torch.empty(
-                    (self.group_size, moe_inter_dim, self.dim),
-                    dtype=dtype,
-                ),
-                requires_grad=False,
-            )
-            self.up_proj_weight = torch.nn.Parameter(
-                torch.empty(
-                    (self.group_size, moe_inter_dim, self.dim),
-                    dtype=dtype,
-                ),
-                requires_grad=False,
-            )
-        else:
-            self.gate_up_proj_weight = torch.nn.Parameter(
-                torch.empty(
-                    (self.group_size, moe_inter_dim * 2, self.dim),
-                    dtype=dtype,
-                ),
-                requires_grad=False,
-            )
+        self.gate_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, moe_inter_dim, self.dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+        self.up_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, moe_inter_dim, self.dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+        self.down_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, self.dim, moe_inter_dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+
+    @override
+    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear(x, self.gate_proj_weight[i], bias=None)
+
+    @override
+    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear(x, self.up_proj_weight[i], bias=None)
+
+    @override
+    def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear(x, self.down_proj_weight[i], bias=None)
+
+
+@QuantizationRegistry.register_moe_experts(None, merge_gate_up=True)
+class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
+    def __init__(
+        self,
+        ############################################
+        # Common parameters for all quantizations
+        dim: int,
+        moe_inter_dim: int,
+        global_n_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
+        n_shared_experts: int,
+        n_activated_experts: int,
+        fuse_shared_experts: bool,
+        checkpoint_prefix: str,
+        *,
+        ############################################
+        # Parameters specific to this quantization
+        dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__(
+            dim,
+            moe_inter_dim,
+            global_n_experts,
+            experts_start_idx,
+            experts_end_idx,
+            n_shared_experts,
+            n_activated_experts,
+            fuse_shared_experts,
+            checkpoint_prefix,
+        )
+
+        self.gate_up_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, moe_inter_dim * 2, self.dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
         self.down_proj_weight = torch.nn.Parameter(
             torch.empty(
                 (self.group_size, self.dim, moe_inter_dim),
@@ -182,7 +232,7 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
     def forward_no_sum(
         self, routed_x: BatchedRoutedActivation, impl="auto"
     ) -> BatchedExpertResult:
-        if self.merge_gate_up and (has_triton or has_torch_npu):
+        if has_triton or has_torch_npu:
             return fused_experts_no_sum_wrapper(
                 routed_x,
                 w1=self.gate_up_proj_weight,
@@ -202,7 +252,7 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
         inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
-        if self.merge_gate_up and (has_triton or has_torch_npu):
+        if has_triton or has_torch_npu:
             return fused_experts_and_sum_wrapper(
                 routed_x,
                 w1=self.gate_up_proj_weight,
@@ -220,14 +270,6 @@ class NormalMoeExperts(QuantizedMoeExpertsBase):
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
         return linear(x, self.gate_up_proj_weight[i], bias=None)
-
-    @override
-    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear(x, self.gate_proj_weight[i], bias=None)
-
-    @override
-    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear(x, self.up_proj_weight[i], bias=None)
 
     @override
     def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
@@ -385,7 +427,9 @@ class NormLinearCPUInfer(QuantizedLinearBase):
         return y
 
 
-@QuantizationRegistry.register_moe_experts(None, backend_type="cpuinfer")
+@QuantizationRegistry.register_moe_experts(
+    None, backend_type="cpuinfer", merge_gate_up=False
+)
 class NormalMoeExpertsCPUInfer(torch.nn.Module):
     """
     Mixture-of-Experts (MoE) module.
@@ -411,19 +455,11 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
         n_activated_experts: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
-        merge_gate_up: bool,
     ):
-        """
-        Initializes the MoE module.
-
-        Args:
-            args (ModelArgs): Model arguments containing MoE parameters.
-        """
         super().__init__()
 
         from chitu.tensor_parallel import get_tp_size
 
-        self.merge_gate_up = merge_gate_up
         self.moe_inter_dim = moe_inter_dim * get_tp_size()
         self.dim = dim
         self.fuse_shared_experts = fuse_shared_experts

@@ -11,8 +11,8 @@ from chitu.utils import try_import_opt_dep
 from chitu.quantization import (
     NormalLinear,
     Blockfp8Linear,
-    NormalMoeExperts,
-    Blockfp8MoeExperts,
+    NormalMoeExpertsMerged,
+    Blockfp8MoeExpertsMerged,
 )
 from chitu.native_layout import (
     enable_native_layout_weight,
@@ -31,7 +31,6 @@ from chitu.moe.batched_routed_activation import (
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
 )
-tbsgemm, has_tbsgemm = try_import_opt_dep("tbsgemm", "muxi_w8a8_kernels")
 
 
 @single_dispatch_lazy_tensor
@@ -452,7 +451,7 @@ class Blockfp8LinearMuxiLayoutContigY(
 class NormalMoeExpertsMuxiLayout(
     enable_native_layout_weight("gate_up_proj_weight", MuxiNativeLayoutGroupWeight),
     enable_native_layout_weight("down_proj_weight", MuxiNativeLayoutGroupWeight),
-    NormalMoeExperts,
+    NormalMoeExpertsMerged,
 ):
     def __init__(
         self,
@@ -467,7 +466,6 @@ class NormalMoeExpertsMuxiLayout(
         n_activated_experts: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
-        merge_gate_up: bool,
         *,
         ############################################
         # Parameters specific to this quantization
@@ -476,10 +474,6 @@ class NormalMoeExpertsMuxiLayout(
         if fuse_shared_experts:
             raise NotImplementedError(
                 "Fused shared experts is not supported for muxi_layout_kernels"
-            )
-        if not merge_gate_up:
-            raise NotImplementedError(
-                "muxi_layout_kernels for fused MoE requires merge_gate_up=True"
             )
         super().__init__(
             dim=dim,
@@ -491,7 +485,6 @@ class NormalMoeExpertsMuxiLayout(
             n_activated_experts=n_activated_experts,
             fuse_shared_experts=fuse_shared_experts,
             checkpoint_prefix=checkpoint_prefix,
-            merge_gate_up=merge_gate_up,
         )
 
     @override
@@ -516,7 +509,7 @@ class NormalMoeExpertsMuxiLayout(
 class Blockfp8MoeExpertsMuxiLayout(
     enable_native_layout_weight("gate_up_proj_weight", MuxiNativeLayoutGroupWeight),
     enable_native_layout_weight("down_proj_weight", MuxiNativeLayoutGroupWeight),
-    Blockfp8MoeExperts,
+    Blockfp8MoeExpertsMerged,
 ):
     def __init__(
         self,
@@ -531,17 +524,12 @@ class Blockfp8MoeExpertsMuxiLayout(
         n_activated_experts: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
-        merge_gate_up: bool,
         ############################################
         # No parameters specific to this quantization
     ):
         if fuse_shared_experts:
             raise NotImplementedError(
                 "Fused shared experts is not supported for muxi_layout_kernels"
-            )
-        if not merge_gate_up:
-            raise NotImplementedError(
-                "muxi_layout_kernels for fused MoE requires merge_gate_up=True"
             )
         super().__init__(
             dim=dim,
@@ -553,7 +541,6 @@ class Blockfp8MoeExpertsMuxiLayout(
             n_activated_experts=n_activated_experts,
             fuse_shared_experts=fuse_shared_experts,
             checkpoint_prefix=checkpoint_prefix,
-            merge_gate_up=merge_gate_up,
         )
 
     def forward(
