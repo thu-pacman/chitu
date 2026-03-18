@@ -73,6 +73,41 @@ class MoETokenDispatcher(ABC):
         """
         raise NotImplementedError(f"enter_moe is not implemented for {type(self)}")
 
+    def enter_moe_dispatch_streaming(
+        self,
+        x: BatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
+        layer_id: Optional[int] = None,
+    ):
+        """
+        Enter MoE and return the dispatch stream.
+        The dispatch stream is used to wait for the dispatch to complete.
+
+        Args:
+            x: Input BatchedRoutedActivation
+            topk_weights: Routing weight of selected experts
+            may_fuse_quant: A quantization method. The implementation may fuse activation
+                quantization during communication, but it's not guaranteed.
+            may_fuse_quant_kwargs: Keyword arguments for the quantization method.
+            layer_id: Layer id. Only for profiling purposes.
+
+        Returns:
+            routed_x: Dispatched BatchedRoutedActivation
+            weights: Optional dispatched topk weights
+            dispatch_stream: Dispatch stream
+        """
+        result = self.enter_moe(
+            x,
+            topk_weights,
+            may_fuse_quant=may_fuse_quant,
+            may_fuse_quant_kwargs=may_fuse_quant_kwargs,
+            layer_id=layer_id,
+        )
+        return result[0], result[1], None
+
     @abstractmethod
     def exit_moe_prefer_before_local_sum(self) -> bool:
         """

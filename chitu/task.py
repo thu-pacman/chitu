@@ -6,9 +6,7 @@ import asyncio
 import json
 import msgpack
 import os
-import threading
 import time
-import weakref
 import functools
 from collections import deque
 import dataclasses
@@ -28,36 +26,10 @@ from chitu.backend import Backend
 from chitu.device_list import DeviceList, StaticDeviceListManager
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.tool_call import ToolChoice, ToolCallParams, adjust_message_for_tool_calls
+from chitu.reasoning import get_reasoning_params, update_chat_template_kwargs_reasoning
 from chitu.constraint_decode import ConstraintDecodeTask
 
 logger = getLogger(__name__)
-
-
-class TaskLoad:
-    _load_score = 0
-    _lock = threading.Lock()
-    user_req = weakref.WeakSet()
-
-    @classmethod
-    def get_load(cls):
-        with cls._lock:
-            return cls._load_score
-
-    @classmethod
-    def increase(cls, score: int):
-        with cls._lock:
-            cls._load_score += score
-
-    @classmethod
-    def reduce(cls, score: int):
-        with cls._lock:
-            cls._load_score -= score
-
-    @classmethod
-    def clear(cls):
-        with cls._lock:
-            cls._load_score = 0
-            cls.user_req.clear()
 
 
 @dataclass
@@ -209,6 +181,10 @@ class UserRequest:
             frequency_penalty=frequency_penalty,
         )
         self.chat_template_kwargs = chat_template_kwargs
+        self.reasoning_params = get_reasoning_params(enable_reasoning)
+        update_chat_template_kwargs_reasoning(
+            self.chat_template_kwargs, self.reasoning_params
+        )
 
         # constraint decoding related
         self.tools = []
@@ -220,9 +196,9 @@ class UserRequest:
             grammar = Backend.tool_parser.build_grammar(
                 ToolCallParams(
                     tools=tools,
+                    reasoning_params=self.reasoning_params,
                     tool_choice=tool_choice,
                     parallel_tool_calls=parallel_tool_calls,
-                    enable_reasoning=enable_reasoning,
                 )
             )
             self.grammar, self.grammar_str = (
@@ -231,7 +207,7 @@ class UserRequest:
 
         # response related
         self.output = ""
-        self.async_stream = AsyncDataStream(enable_reasoning=enable_reasoning)
+        self.async_stream = AsyncDataStream(self.reasoning_params)
         self.finish_reason = None
         self.max_new_tokens = max_new_tokens
         self.num_output_tokens = 0
@@ -263,8 +239,6 @@ class UserRequest:
             self.max_new_tokens, max_seq_len - self.prompt_len + 1
         )
 
-        TaskLoad.user_req.add(self)
-
     def add_data(
         self,
         value: Union[int, list[int]],
@@ -294,7 +268,6 @@ class UserRequest:
         self.output = repr("".join(self.async_stream.seqs))
         self.async_stream.send_stop_signal()
         self.completion_time = time.monotonic()
-        TaskLoad.reduce(len(self.prompt_tokens) + self.num_output_tokens)
         self.save_trace_to_json()
 
     def notify_server_data_added_from_server_thread(self):
@@ -525,7 +498,6 @@ class Task(ConstraintDecodeTask):
             + self.prefix_tokens_len * 1000 * 1000
             + self.max_output_tokens * 1000 * 1000
         )
-        TaskLoad.increase(self.prefix_tokens_len)
 
         # Scheduler group
         self.sched_group_id = None
@@ -888,8 +860,6 @@ class TaskPool:
         if cls.pool.pop(task_id) is None:
             raise ValueError(f"Task {task_id} not found in pool")
         cls.id_list.remove(task_id)
-        if len(cls.pool) == 0:
-            TaskLoad.clear()
 
 
 class SerializedPackedTasksPayloadType(Enum):

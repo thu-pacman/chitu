@@ -353,13 +353,14 @@ def build_tool_use_delta(index: int, partial_json: str) -> dict:
 
 async def collect_reasoning_and_text(async_stream) -> tuple[str, str]:
     chunks: list[str] = []
-    async for data, _top_logprobs, _top_tokens in async_stream:
+    rchunks: list[str] = []
+    async for data, is_reasoning, (_top_logprobs, _top_tokens) in async_stream:
         if data:
-            chunks.append(data)
-    r_len = int(getattr(async_stream, "reasoning_len", 0) or 0)
-    if r_len:
-        return "".join(chunks[:r_len]), "".join(chunks[r_len:])
-    return "", "".join(chunks)
+            if is_reasoning:
+                rchunks.append(data)
+            else:
+                chunks.append(data)
+    return "".join(rchunks), "".join(chunks)
 
 
 def map_finish_reason_to_stop_reason(finish_reason: Optional[str]) -> str:
@@ -523,14 +524,10 @@ async def anthropic_stream_from_async_stream(*, req_obj, response_model: str):
                     if tool_call.function.arguments:
                         buf["arguments"] += tool_call.function.arguments
     else:
-        async for data, _top_logprobs, _top_tokens in stream:
+        async for data, is_reasoning, (_top_logprobs, _top_tokens) in stream:
             if not data:
                 continue
-            is_thinking = bool(
-                getattr(async_stream, "enable_reasoning", False)
-                and async_stream.is_reasoning_content()
-            )
-            async for event in _emit_text_delta(data, is_thinking):
+            async for event in _emit_text_delta(data, is_reasoning):
                 yield event
 
     if current_block_type is not None:

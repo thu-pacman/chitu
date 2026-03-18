@@ -4,6 +4,10 @@
 
 """Shared task statistics utilities for metrics collection."""
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def _count_unassigned_waiting_in_pool() -> int:
     """Unscheduled + untouched prefill tasks in TaskPool."""
@@ -36,7 +40,8 @@ def count_router_load() -> tuple[int, int]:
         waiting = waiting_in_pool + _count_pending_queue()
         running = max(0, len(TaskPool.pool) - waiting_in_pool)
         return int(running), int(waiting)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to count router load: {e}")
         return 0, 0
 
 
@@ -66,7 +71,8 @@ def count_tasks_for_dp_rank(dp_id: int) -> tuple[int, int]:
             waiting = _count_unassigned_waiting_in_pool()
 
         return running, waiting
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to count tasks for DP rank {dp_id}: {e}")
         return 0, 0
 
 
@@ -91,7 +97,8 @@ def count_tasks_non_dp() -> tuple[int, int]:
         running = len(TaskPool.pool) - waiting
 
         return running, waiting
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Failed to count tasks in non-DP mode: {e}")
         return 0, 0
 
 

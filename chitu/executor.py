@@ -22,7 +22,6 @@ from chitu.task import (
     PackedTasksBase,
     SerializedPackedTasksPayloadType,
     BatchResult,
-    TaskLoad,
     TaskType,
     TaskPool,
     TaskCollector,
@@ -1478,5 +1477,3 @@ class Executor:
                 )
             else:
                 self.get_token_sink().emit_batch(batch_result.tasks, next_token_list)
-
-        TaskLoad.increase(batch_result.num_tasks)

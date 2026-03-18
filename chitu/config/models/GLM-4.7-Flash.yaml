@@ -30,3 +30,4 @@ rope_theta: 1000000.0
 rope_factor: 1
 eos_token_id: [154820, 154827, 154829]
 tool_parser: GLM47ToolParser
+reasoning_type: switchable

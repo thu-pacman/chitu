@@ -10,4 +10,4 @@ defaults:
 # Access info
 name: DeepSeek-R1
 source: "https://huggingface.co/deepseek-ai/DeepSeek-R1" # Just for displaying. No automatic download.
-tool_parser: DeepSeekR1ToolParser
+reasoning_type: triggered

@@ -256,11 +256,14 @@ async def _round_anthropic(
     msg = await anthropic_client.messages.create(messages=messages, **kwargs)
     content_blocks = getattr(msg, "content", None)
     content_parts: list[str] = []
+    rcontent_parts: list[str] = []
     tool_calls: list[dict] = []
     for block in content_blocks or []:
         block_type = getattr(block, "type", None)
         if block_type == "text":
             content_parts.append(getattr(block, "text", "") or "")
+        elif block_type == "thinking":
+            rcontent_parts.append(getattr(block, "thinking", "") or "")
         elif block_type == "tool_use":
             tool_calls.append(
                 {
@@ -269,12 +272,14 @@ async def _round_anthropic(
                     "arguments": getattr(block, "input", None) or {},
                 }
             )
-    content = "".join(content_parts).strip()
+
+    content = "".join(content_parts)
+    rcontent = "".join(rcontent_parts)
     tool_msgs = _tool_result_messages_anthropic(tool_calls)
     assistant_msg = {"role": "assistant", "content": msg.content}
     messages.append(assistant_msg)
     messages.extend(tool_msgs)
-    return content, "", tool_calls
+    return content, rcontent, tool_calls
 
 
 async def test(

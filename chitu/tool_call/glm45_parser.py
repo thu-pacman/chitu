@@ -13,7 +13,6 @@ from .grammar import (
     TypeDispatchArgumentGrammar,
     ArgumentsGrammar,
     ToolGrammar,
-    ForceReasoningGrammar,
     TriggeredToolsGrammar,
     GrammarImplBase,
 )
@@ -53,7 +52,7 @@ class GLM45GrammarImpl(GrammarImplBase):
         tool=tool,
         trigger="<tool_call>",
     )
-    root_grammar = ForceReasoningGrammar("{}</think>", tools=tools)
+    root_grammar = tools
 
 
 class GLM45ParserImpl(ToolParserImplBase):
