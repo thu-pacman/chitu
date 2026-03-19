@@ -19,12 +19,11 @@ import uvicorn
 import resource
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 
 from chitu.async_response import AsyncResponse
 from chitu.backend import Backend
-from chitu.chitu_main import chitu_init, init_logger
 from chitu.dp_request_router import get_request_router
 from chitu.dp_token_router import get_token_router
 from chitu.global_vars import get_global_args, set_global_args
@@ -33,7 +32,7 @@ from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
 from chitu.serve.common import set_min_batch_size
 from chitu.serve.router import start_dp_components
-from chitu.tool_call import ToolChoice, ChoiceToolCall
+from chitu.tool_call import ToolChoice, ChoiceToolCall, adjust_message_for_tool_calls
 from chitu.serve.anthropic_api import create_router as create_anthropic_router
 
 logger = getLogger(__name__)
@@ -88,7 +87,19 @@ class ChatRequest(BaseModel):
 
 
 class TokenizeRequest(BaseModel):
-    prompt: str
+    prompt: str | None = None
+    messages: list[Message] | None = None
+    enable_thinking: bool = True
+
+    @model_validator(mode="after")
+    def validate_input(self):
+        if self.prompt is not None and self.messages is not None:
+            raise ValueError("prompt and messages cannot be provided together")
+        if self.prompt is None and self.messages is None:
+            raise ValueError("Either prompt or messages must be provided")
+        if self.messages is not None and len(self.messages) == 0:
+            raise ValueError("messages must not be empty")
+        return self
 
 
 class DetokenizeRequest(BaseModel):
@@ -103,6 +114,16 @@ def get_priority_from_api_key(api_key: str) -> int:
     if args.serve.validate_api_key == True:
         raise HTTPException(status_code=503, detail="Unauthorized api key")
     return 1
+
+
+def build_chat_template_kwargs(enable_thinking: bool) -> dict[str, Any]:
+    chat_template_kwargs = {}
+    if "DeepSeek-V3.1" in get_global_args().models.name:
+        # DeepSeek-V3.1 tokenizer uses `thinking` instead of `enable_thinking`
+        chat_template_kwargs["thinking"] = enable_thinking
+    else:
+        chat_template_kwargs["enable_thinking"] = enable_thinking
+    return chat_template_kwargs
 
 
 # Include Anthropic-compatible API routes (keep api_server.py thin)
@@ -217,12 +238,7 @@ async def create_chat_completion(
         )
 
         # Reconstruct chat_template_kwargs to prevent injection attacks
-        chat_template_kwargs = {}
-        if "DeepSeek-V3.1" in get_global_args().models.name:
-            # DeepSeek-V3.1 tokenizer uses `thinking` instead of `enable_thinking`
-            chat_template_kwargs["thinking"] = enable_thinking
-        else:
-            chat_template_kwargs["enable_thinking"] = enable_thinking
+        chat_template_kwargs = build_chat_template_kwargs(enable_thinking)
 
         user_req = UserRequest(
             [msg.model_dump() for msg in req.messages],
@@ -285,6 +301,8 @@ async def init_chitu_service():
     if server_status:
         return {"message": "Service has been started."}
     args = get_global_args()
+    from chitu.chitu_main import chitu_init
+
     chitu_init(args)
     server_status = True
     return {"message": "Service initial done."}
@@ -351,7 +369,38 @@ async def tokenize(raw_request: Request):
             status_code=503, detail="Tokenizer not available on this endpoint"
         )
 
-    tokens = Backend.tokenizer.model.encode(request.prompt, add_special_tokens=False)
+    if request.messages is not None:
+        if Backend.formatter is None:
+            raise HTTPException(
+                status_code=503, detail="Chat formatter not available on this endpoint"
+            )
+        enable_thinking = request.enable_thinking
+        tools = []
+        tool_choice: ToolChoice = "auto"
+        with suppress(ValidationError):
+            chat_request = ChatRequest.model_validate(data)
+            enable_thinking = chat_request.extra_body.get(
+                "enable_thinking",
+                chat_request.chat_template_kwargs.get(
+                    "enable_thinking", chat_request.enable_thinking
+                ),
+            )
+            tools = chat_request.tools
+            tool_choice = chat_request.tool_choice
+        chat_template_kwargs = build_chat_template_kwargs(enable_thinking)
+        if tools and tool_choice != "none":
+            chat_template_kwargs["tools"] = tools
+        message = [message.model_dump() for message in request.messages]
+        if hasattr(Backend, "tool_parser"):
+            message = adjust_message_for_tool_calls(Backend.tool_parser, message)
+        tokens = Backend.formatter.encode_dialog_prompt(
+            message,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        if isinstance(tokens, tuple):
+            tokens = tokens[0]
+    else:
+        tokens = Backend.tokenizer.encode(request.prompt, bos=False, eos=False)
 
     return {"tokens": tokens}
 

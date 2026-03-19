@@ -6,7 +6,12 @@ from omegaconf import OmegaConf
 import torch
 
 from chitu.models.model import ParallelMoeBlock, MoeGate
-from chitu.quantization import NormalMoeExperts, Blockfp8MoeExperts
+from chitu.quantization import (
+    NormalMoeExpertsUnmerged,
+    Blockfp8MoeExpertsUnmerged,
+    NormalMoeExpertsMerged,
+    Blockfp8MoeExpertsMerged,
+)
 from chitu.distributed.comm_group import CommGroup
 from chitu.distributed.parallel_state import (
     get_tp_rank_lists,
@@ -172,6 +177,10 @@ def test_parallel_moe_block(
                 ep_group=ep_group,
             )
         moe_impl.prepare(task_type, batch_size)
+        if merge_gate_up:
+            moe_experts_cls = NormalMoeExpertsMerged
+        else:
+            moe_experts_cls = NormalMoeExpertsUnmerged
         parallel_moe_block = ParallelMoeBlock(
             MoeGate(
                 op_impl="torch",
@@ -189,7 +198,7 @@ def test_parallel_moe_block(
                 n_fused_shared_experts=0,
                 _debug_force_moe_balance=False,
             ),
-            NormalMoeExperts(
+            moe_experts_cls(
                 dim=hidden_dim,
                 moe_inter_dim=moe_inter_dim // etp_size,
                 global_n_experts=n_experts,
@@ -199,7 +208,6 @@ def test_parallel_moe_block(
                 n_activated_experts=topk,
                 fuse_shared_experts=False,
                 checkpoint_prefix="ffn.experts",
-                merge_gate_up=merge_gate_up,
             ),
             non_fused_shared_experts=None,
             layer_id=0,
@@ -269,7 +277,7 @@ def test_parallel_moe_block(
                 n_fused_shared_experts=0,
                 _debug_force_moe_balance=False,
             ),
-            NormalMoeExperts(
+            NormalMoeExpertsUnmerged(
                 dim=hidden_dim,
                 moe_inter_dim=moe_inter_dim,
                 global_n_experts=n_experts,
@@ -279,7 +287,6 @@ def test_parallel_moe_block(
                 n_activated_experts=topk,
                 fuse_shared_experts=False,
                 checkpoint_prefix="ffn.experts",
-                merge_gate_up=False,
             ),
             non_fused_shared_experts=None,
             layer_id=0,
@@ -497,6 +504,10 @@ def test_parallel_moe_block_blockfp8(
                 ep_group=ep_group,
             )
         moe_impl.prepare(task_type, batch_size)
+        if merge_gate_up:
+            moe_experts_cls = Blockfp8MoeExpertsMerged
+        else:
+            moe_experts_cls = Blockfp8MoeExpertsUnmerged
         parallel_moe_block = ParallelMoeBlock(
             MoeGate(
                 op_impl="torch",
@@ -514,7 +525,7 @@ def test_parallel_moe_block_blockfp8(
                 n_fused_shared_experts=0,
                 _debug_force_moe_balance=False,
             ),
-            Blockfp8MoeExperts(
+            moe_experts_cls(
                 dim=hidden_dim,
                 moe_inter_dim=moe_inter_dim // etp_size,
                 global_n_experts=n_experts,
@@ -524,7 +535,6 @@ def test_parallel_moe_block_blockfp8(
                 n_activated_experts=topk,
                 fuse_shared_experts=False,
                 checkpoint_prefix="ffn.experts",
-                merge_gate_up=merge_gate_up,
                 block_size=quant_block_size,
             ),
             non_fused_shared_experts=None,
@@ -625,7 +635,7 @@ def test_parallel_moe_block_blockfp8(
                 n_fused_shared_experts=0,
                 _debug_force_moe_balance=False,
             ),
-            Blockfp8MoeExperts(
+            Blockfp8MoeExpertsUnmerged(
                 dim=hidden_dim,
                 moe_inter_dim=moe_inter_dim,
                 global_n_experts=n_experts,
@@ -635,7 +645,6 @@ def test_parallel_moe_block_blockfp8(
                 n_activated_experts=topk,
                 fuse_shared_experts=False,
                 checkpoint_prefix="ffn.experts",
-                merge_gate_up=False,
                 block_size=quant_block_size,
             ),
             non_fused_shared_experts=None,

@@ -54,11 +54,18 @@ class BatchedRoutedActivation:
         raise NotImplementedError()
 
     def get_chunks_no_larger_than(
-        self, topk_weights: torch.Tensor, max_n_tokens: int
+        self,
+        topk_weights: torch.Tensor,
+        max_n_tokens_x_topk: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
     ) -> list[tuple["BatchedRoutedActivation", torch.Tensor]]:
         """
         Split the BatchedRoutedActivation into multiple BatchedRoutedActivations, each
-        of which contains no more than `max_n_tokens` tokens, including padded tokens.
+        of which contains no more than `max_n_tokens_x_topk` tokens-expert pairs.
+
+        The resulting chunk size may be inaccurate due to padded empty pairs by each
+        BatchedRoutedActivation subclasses. It is a best-effort implementation.
 
         Returns a list of (BatchedRoutedActivation chunk, topk_weights chunk) pairs.
         """
@@ -98,8 +105,27 @@ class IndexedBatchedRoutedActivation(BatchedRoutedActivation):
 
     @override
     def get_chunks_no_larger_than(
-        self, topk_weights: torch.Tensor, max_n_tokens: int
+        self,
+        topk_weights: torch.Tensor,
+        max_n_tokens_x_topk: int,
+        global_n_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
     ) -> list[tuple["IndexedBatchedRoutedActivation", torch.Tensor]]:
+        if self.token_to_expert_indices.numel() == 0:
+            return [(self, topk_weights)]
+
+        # Esitimate the real chunk size
+        avg_experts_per_token = max(
+            int(
+                self.token_to_expert_indices.shape[1]
+                * (experts_end_idx - experts_start_idx)
+                / global_n_experts
+            ),
+            1,
+        )
+        max_n_tokens = max(int(max_n_tokens_x_topk / avg_experts_per_token), 1)
+
         return [
             (
                 IndexedBatchedRoutedActivation(
@@ -137,8 +163,27 @@ class IndexedBatchedRoutedActivationBlockfp8(IndexedBatchedRoutedActivation):
 
     @override
     def get_chunks_no_larger_than(
-        self, topk_weights: torch.Tensor, max_n_tokens: int
+        self,
+        topk_weights: torch.Tensor,
+        max_n_tokens_x_topk: int,
+        global_n_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
     ) -> list[tuple["IndexedBatchedRoutedActivationBlockfp8", torch.Tensor]]:
+        if self.token_to_expert_indices.numel() == 0:
+            return [(self, topk_weights)]
+
+        # Esitimate the real chunk size
+        avg_experts_per_token = max(
+            int(
+                self.token_to_expert_indices.shape[1]
+                * (experts_end_idx - experts_start_idx)
+                / global_n_experts
+            ),
+            1,
+        )
+        max_n_tokens = max(int(max_n_tokens_x_topk / avg_experts_per_token), 1)
+
         return [
             (
                 IndexedBatchedRoutedActivationBlockfp8(

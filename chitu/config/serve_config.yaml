@@ -260,7 +260,7 @@ infer:
 
   npu_fusion_fp4: False #  for npu fp4 fusion group_gemm mode
   moe:
-    prefill_memory_tolerance: 2.0 # In case of EP inbalance, the largest activation tensor will occupy no more than O(prefill_chunk_size / ep_size * prefill_memory_tolerance) memory
+    prefill_memory_tolerance: 2.0 # In case of EP inbalance, the largest activation tensor will occupy no more than O(prefill_chunk_size * topk / ep_size * prefill_memory_tolerance) memory
     prefill_token_dispatcher: auto # one of: auto, tp, allgather, deepep-nl
     decode_token_dispatcher: auto # one of: auto, tp, allgather, deepep-ll
 

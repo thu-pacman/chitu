@@ -10,7 +10,8 @@ import torch
 
 from chitu.quantization.base import (
     QuantizedLinearBase,
-    QuantizedMoeExpertsBase,
+    QuantizedMoeExpertsUnmerged,
+    QuantizedMoeExpertsMerged,
     QuantizedAbsorbGemmBase,
 )
 from chitu.quantization.registry import QuantizationRegistry
@@ -223,10 +224,10 @@ class Blockfp8LinearMarlinLayout(
         )
 
 
-@QuantizationRegistry.register_moe_experts("blockfp8")
-class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
+@QuantizationRegistry.register_moe_experts("blockfp8", merge_gate_up=False)
+class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
     """
-    blockfp8 quantized MoeExperts
+    blockfp8 quantized MoeExperts with unmerged gate and up projection
     """
 
     def __init__(
@@ -242,18 +243,11 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         n_activated_experts: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
-        merge_gate_up: bool,
         ############################################
         # Parameters specific to this quantization
         block_size: int = 128,
         round_scale_to_pow2: bool = False,
     ):
-        """
-        Initializes the MoE module.
-
-        Args:
-            args (ModelArgs): Model arguments containing MoE parameters.
-        """
         super().__init__(
             dim,
             moe_inter_dim,
@@ -264,7 +258,6 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
             n_activated_experts,
             fuse_shared_experts,
             checkpoint_prefix,
-            merge_gate_up,
         )
 
         self.block_size = block_size
@@ -281,64 +274,161 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
 
         gate_up_proj_in_features = dim
 
-        if self.merge_gate_up:
-            self.gate_up_proj_weight = torch.nn.Parameter(
-                torch.empty(
-                    (self.group_size, moe_inter_dim * 2, self.dim),
-                    dtype=dtype,
-                ),
-                requires_grad=False,
-            )
-            scale_out_features = (moe_inter_dim * 2 + block_size - 1) // block_size
-            scale_in_features = (
-                gate_up_proj_in_features + block_size - 1
-            ) // block_size
-            self.gate_up_proj_scale = torch.nn.Parameter(
-                torch.empty(
-                    self.group_size,
-                    scale_out_features,
-                    scale_in_features,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
+        self.gate_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, moe_inter_dim, self.dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+        self.up_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, moe_inter_dim, self.dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+        scale_out_features = (moe_inter_dim + block_size - 1) // block_size
+        scale_in_features = (gate_up_proj_in_features + block_size - 1) // block_size
+        self.gate_proj_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                scale_out_features,
+                scale_in_features,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        self.up_proj_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                scale_out_features,
+                scale_in_features,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        self.down_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, self.dim, moe_inter_dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+        down_proj_scale_out_features = (dim + block_size - 1) // block_size
+        down_proj_scale_in_features = (moe_inter_dim + block_size - 1) // block_size
+        self.down_proj_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                down_proj_scale_out_features,
+                down_proj_scale_in_features,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+
+    @override
+    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear_blockfp8(
+            x,
+            self.gate_proj_weight[i],
+            self.gate_proj_scale[i],
+            None,
+            block_size=self.block_size,
+            round_scale_to_pow2=self.round_scale_to_pow2,
+        )
+
+    @override
+    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear_blockfp8(
+            x,
+            self.up_proj_weight[i],
+            self.up_proj_scale[i],
+            None,
+            block_size=self.block_size,
+            round_scale_to_pow2=self.round_scale_to_pow2,
+        )
+
+    @override
+    def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear_blockfp8(
+            x,
+            self.down_proj_weight[i],
+            self.down_proj_scale[i],
+            None,
+            block_size=self.block_size,
+            round_scale_to_pow2=self.round_scale_to_pow2,
+        )
+
+
+@QuantizationRegistry.register_moe_experts("blockfp8", merge_gate_up=True)
+class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
+    """
+    blockfp8 quantized MoeExperts with merged gate and up projection
+    """
+
+    def __init__(
+        self,
+        ############################################
+        # Common parameters for all quantizations
+        dim: int,
+        moe_inter_dim: int,
+        global_n_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
+        n_shared_experts: int,
+        n_activated_experts: int,
+        fuse_shared_experts: bool,
+        checkpoint_prefix: str,
+        ############################################
+        # Parameters specific to this quantization
+        block_size: int = 128,
+        round_scale_to_pow2: bool = False,
+    ):
+        super().__init__(
+            dim,
+            moe_inter_dim,
+            global_n_experts,
+            experts_start_idx,
+            experts_end_idx,
+            n_shared_experts,
+            n_activated_experts,
+            fuse_shared_experts,
+            checkpoint_prefix,
+        )
+
+        self.block_size = block_size
+        self.round_scale_to_pow2 = round_scale_to_pow2
+
+        # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
+        # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
+        args = get_global_args()
+        if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
+            dtype = torch.uint8
         else:
-            self.gate_proj_weight = torch.nn.Parameter(
-                torch.empty(
-                    (self.group_size, moe_inter_dim, self.dim),
-                    dtype=dtype,
-                ),
-                requires_grad=False,
-            )
-            self.up_proj_weight = torch.nn.Parameter(
-                torch.empty(
-                    (self.group_size, moe_inter_dim, self.dim),
-                    dtype=dtype,
-                ),
-                requires_grad=False,
-            )
-            scale_out_features = (moe_inter_dim + block_size - 1) // block_size
-            scale_in_features = (
-                gate_up_proj_in_features + block_size - 1
-            ) // block_size
-            self.gate_proj_scale = torch.nn.Parameter(
-                torch.empty(
-                    self.group_size,
-                    scale_out_features,
-                    scale_in_features,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            self.up_proj_scale = torch.nn.Parameter(
-                torch.empty(
-                    self.group_size,
-                    scale_out_features,
-                    scale_in_features,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
+            dtype = torch.float8_e4m3fn
+        assert dtype.itemsize == 1
+
+        gate_up_proj_in_features = dim
+
+        self.gate_up_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, moe_inter_dim * 2, self.dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+        scale_out_features = (moe_inter_dim * 2 + block_size - 1) // block_size
+        scale_in_features = (gate_up_proj_in_features + block_size - 1) // block_size
+        self.gate_up_proj_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                scale_out_features,
+                scale_in_features,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
         self.down_proj_weight = torch.nn.Parameter(
             torch.empty(
                 (self.group_size, self.dim, moe_inter_dim),
@@ -362,7 +452,7 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
     def forward_no_sum(
         self, routed_x: BatchedRoutedActivation, impl: str = "auto"
     ) -> BatchedExpertResult:
-        if has_triton and self.merge_gate_up:
+        if has_triton:
             fused_soft_fp8 = False
             use_fp8_w8a8 = False
             if (
@@ -426,7 +516,7 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
         inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
-        if has_triton and self.merge_gate_up:
+        if has_triton:
             fused_soft_fp8 = False
             use_fp8_w8a8 = False
             if (
@@ -490,28 +580,6 @@ class Blockfp8MoeExperts(QuantizedMoeExpertsBase):
             x,
             self.gate_up_proj_weight[i],
             self.gate_up_proj_scale[i],
-            None,
-            block_size=self.block_size,
-            round_scale_to_pow2=self.round_scale_to_pow2,
-        )
-
-    @override
-    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_blockfp8(
-            x,
-            self.gate_proj_weight[i],
-            self.gate_proj_scale[i],
-            None,
-            block_size=self.block_size,
-            round_scale_to_pow2=self.round_scale_to_pow2,
-        )
-
-    @override
-    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_blockfp8(
-            x,
-            self.up_proj_weight[i],
-            self.up_proj_scale[i],
             None,
             block_size=self.block_size,
             round_scale_to_pow2=self.round_scale_to_pow2,

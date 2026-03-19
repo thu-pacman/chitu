@@ -6,6 +6,8 @@ from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import (
     QuantizedLinearBase,
     QuantizedMoeExpertsBase,
+    QuantizedMoeExpertsUnmerged,
+    QuantizedMoeExpertsMerged,
     QuantizedAbsorbGemmBase,
 )
 from chitu.quantization.utils import (
@@ -16,7 +18,8 @@ from chitu.quantization.utils import (
 )
 from chitu.quantization.normal import (
     NormalLinear,
-    NormalMoeExperts,
+    NormalMoeExpertsUnmerged,
+    NormalMoeExpertsMerged,
     NormLinearCPUInfer,
     NormalMoeExpertsCPUInfer,
 )
@@ -40,12 +43,17 @@ from chitu.quantization.ascend_w8a8 import (
     AscendW8A8DynamicMoeExperts,
 )
 from chitu.quantization.mixq import MixQLinear
-from chitu.quantization.blockfp8 import Blockfp8Linear, Blockfp8MoeExperts
+from chitu.quantization.blockfp8 import (
+    Blockfp8Linear,
+    Blockfp8MoeExpertsUnmerged,
+    Blockfp8MoeExpertsMerged,
+)
 from chitu.quantization.blockfp4 import (
     Blockfp4LinearPackKStride64,
     Blockfp4LinearPackNPUNative,
     Blockfp4MoeExpertsPackKStride64,
-    Blockfp4MoeExpertsPackNPUNative,
+    Blockfp4MoeExpertsUnmergedPackNPUNative,
+    Blockfp4MoeExpertsMergedPackNPUNative,
 )
 from chitu.quantization.q4km import MoeExpertsDeepSeekV3CPUInfer
 from chitu.quantization.hygon_utils import InXOutLinear

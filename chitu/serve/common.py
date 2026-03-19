@@ -12,7 +12,6 @@ from logging import getLogger
 import torch
 import torch.distributed
 
-from chitu.chitu_main import chitu_run
 from chitu.task import (
     TaskPool,
     SerializedPackedTasksPayloadType,
@@ -32,6 +31,8 @@ def set_min_batch_size(value: int):
 
 async def process_queue():
     """Process the task queue - common function used by both normal and DP modes"""
+    from chitu.chitu_main import chitu_run
+
     rank = torch.distributed.get_rank()
     global min_batch_size
     while True:

@@ -6,6 +6,9 @@ import torch
 
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase
+from chitu.import_utils import try_import_opt_dep
+
+tbsgemm, has_tbsgemm = try_import_opt_dep("tbsgemm", "muxi_w8a8_kernels")
 
 
 @QuantizationRegistry.register_linear("simple_w8a8_muxi")
@@ -63,8 +66,6 @@ class W8A8MuxiLinear(QuantizedLinearBase):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from chitu.muxi_utils import tbsgemm
-
         if x.dtype != torch.float16:
             x = x.to(torch.float16)
 

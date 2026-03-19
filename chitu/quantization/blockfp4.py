@@ -10,7 +10,8 @@ import torch
 
 from chitu.quantization.base import (
     QuantizedLinearBase,
-    QuantizedMoeExpertsBase,
+    QuantizedMoeExpertsUnmerged,
+    QuantizedMoeExpertsMerged,
 )
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.ops.quant import (
@@ -335,9 +336,10 @@ class Blockfp4LinearPackNPUNative(
         return y
 
 
-class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
+class Blockfp4MoeExpertsUnmergedBase(QuantizedMoeExpertsUnmerged):
     """
-    blockfp4 quantized MoeExperts with weights in Packed4BitWeightAlongK (k_stride=1) layout.
+    blockfp4 quantized MoeExperts with weights in Packed4BitWeightAlongK (k_stride=1) layout,
+    and unmerged gate and up projection.
     """
 
     def __init__(
@@ -353,18 +355,11 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
         n_activated_experts: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
-        merge_gate_up: bool,
         ############################################
         # No parameters specific to this quantization
         no_input_scale: bool = False,
         merged_global_scale: bool = False,
     ):
-        """
-        Initializes the MoE module.
-
-        Args:
-            args (ModelArgs): Model arguments containing MoE parameters.
-        """
         super().__init__(
             dim,
             moe_inter_dim,
@@ -375,7 +370,6 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
             n_activated_experts,
             fuse_shared_experts,
             checkpoint_prefix,
-            merge_gate_up,
         )
 
         quant_scale_stride = 16
@@ -385,73 +379,38 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
         # `self._{key}_plain_shape`, so `enable_native_layout_weight` can recognize it.
         # After loading, `enable_native_layout_weight` will convert them to other
         # layouts.
-        if self.merge_gate_up:
-            scale_in_features = ceil_div(dim, quant_scale_stride)
-            self.gate_up_proj_weight = torch.nn.Parameter(
-                torch.empty(
-                    self.group_size,
-                    moe_inter_dim * 2,
-                    dim // 2,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
-            )
-            self._gate_up_proj_weight_layout_class = Packed4BitWeightAlongK
-            self._gate_up_proj_weight_plain_shape = (
+        scale_in_features = ceil_div(dim, quant_scale_stride)
+        self.gate_proj_weight = torch.nn.Parameter(
+            torch.empty(
                 self.group_size,
-                moe_inter_dim * 2,
-                dim,
-            )
-            self.gate_up_proj_weight_scale = torch.nn.Parameter(
-                torch.empty(
-                    self.group_size,
-                    moe_inter_dim * 2,
-                    scale_in_features,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
-            )
-            self.gate_up_proj_weight_scale_2 = torch.nn.Parameter(
-                torch.empty(
-                    self.group_size,
-                    1 if merged_global_scale else 2,
-                    1,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-            self.gate_up_proj_input_scale = torch.nn.Parameter(
-                torch.empty(
-                    self.group_size,
-                    1 if merged_global_scale else 2,
-                    1,
-                    dtype=torch.float32,
-                ),
-                requires_grad=False,
-            )
-        else:
-            scale_in_features = ceil_div(dim, quant_scale_stride)
-            self.gate_proj_weight = torch.nn.Parameter(
-                torch.empty(
-                    self.group_size,
-                    moe_inter_dim,
-                    dim // 2,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
-            )
-            self._gate_proj_weight_layout_class = Packed4BitWeightAlongK
-            self._gate_proj_weight_plain_shape = (self.group_size, moe_inter_dim, dim)
-            self.gate_proj_weight_scale = torch.nn.Parameter(
-                torch.empty(
-                    self.group_size,
-                    moe_inter_dim,
-                    scale_in_features,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
-            )
-            self.gate_proj_weight_scale_2 = torch.nn.Parameter(
+                moe_inter_dim,
+                dim // 2,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        self._gate_proj_weight_layout_class = Packed4BitWeightAlongK
+        self._gate_proj_weight_plain_shape = (self.group_size, moe_inter_dim, dim)
+        self.gate_proj_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                moe_inter_dim,
+                scale_in_features,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        self.gate_proj_weight_scale_2 = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                1,
+                1,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        if not no_input_scale:
+            self.gate_proj_input_scale = torch.nn.Parameter(
                 torch.empty(
                     self.group_size,
                     1,
@@ -460,37 +419,37 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
                 ),
                 requires_grad=False,
             )
-            if not no_input_scale:
-                self.gate_proj_input_scale = torch.nn.Parameter(
-                    torch.empty(
-                        self.group_size,
-                        1,
-                        1,
-                        dtype=torch.float32,
-                    ),
-                    requires_grad=False,
-                )
-            self.up_proj_weight = torch.nn.Parameter(
-                torch.empty(
-                    self.group_size,
-                    moe_inter_dim,
-                    dim // 2,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
-            )
-            self._up_proj_weight_layout_class = Packed4BitWeightAlongK
-            self._up_proj_weight_plain_shape = (self.group_size, moe_inter_dim, dim)
-            self.up_proj_weight_scale = torch.nn.Parameter(
-                torch.empty(
-                    self.group_size,
-                    moe_inter_dim,
-                    scale_in_features,
-                    dtype=torch.uint8,
-                ),
-                requires_grad=False,
-            )
-            self.up_proj_weight_scale_2 = torch.nn.Parameter(
+        self.up_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                moe_inter_dim,
+                dim // 2,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        self._up_proj_weight_layout_class = Packed4BitWeightAlongK
+        self._up_proj_weight_plain_shape = (self.group_size, moe_inter_dim, dim)
+        self.up_proj_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                moe_inter_dim,
+                scale_in_features,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        self.up_proj_weight_scale_2 = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                1,
+                1,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        if not no_input_scale:
+            self.up_proj_input_scale = torch.nn.Parameter(
                 torch.empty(
                     self.group_size,
                     1,
@@ -499,16 +458,6 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
                 ),
                 requires_grad=False,
             )
-            if not no_input_scale:
-                self.up_proj_input_scale = torch.nn.Parameter(
-                    torch.empty(
-                        self.group_size,
-                        1,
-                        1,
-                        dtype=torch.float32,
-                    ),
-                    requires_grad=False,
-                )
         down_proj_scale_in_features = ceil_div(moe_inter_dim, quant_scale_stride)
         down_proj_scale_out_features = dim
         self.down_proj_weight = torch.nn.Parameter(
@@ -551,51 +500,228 @@ class Blockfp4MoeExpertsBase(QuantizedMoeExpertsBase):
                 requires_grad=False,
             )
 
+    @override
+    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear_block_fp4(
+            x,
+            self.get_native_layout_gate_proj_weight()[i],
+            self.gate_proj_weight_scale[i],
+            self.gate_proj_weight_scale_2[i],
+            128,
+            None,
+        )
+
+    @override
+    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear_block_fp4(
+            x,
+            self.get_native_layout_up_proj_weight()[i],
+            self.up_proj_weight_scale[i],
+            self.up_proj_weight_scale_2[i],
+            128,
+            None,
+        )
+
+    @override
+    def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear_block_fp4(
+            x,
+            self.get_native_layout_down_proj_weight()[i],
+            self.down_proj_weight_scale[i],
+            self.down_proj_weight_scale_2[i],
+            128,
+            None,
+        )
+
+
+class Blockfp4MoeExpertsMergedBase(QuantizedMoeExpertsMerged):
+    """
+    blockfp4 quantized MoeExperts with weights in Packed4BitWeightAlongK (k_stride=1) layout,
+    and merged gate and up projection.
+    """
+
+    def __init__(
+        self,
+        ############################################
+        # Common parameters for all quantizations
+        dim: int,
+        moe_inter_dim: int,
+        global_n_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
+        n_shared_experts: int,
+        n_activated_experts: int,
+        fuse_shared_experts: bool,
+        checkpoint_prefix: str,
+        ############################################
+        # No parameters specific to this quantization
+        no_input_scale: bool = False,
+        merged_global_scale: bool = False,
+    ):
+        super().__init__(
+            dim,
+            moe_inter_dim,
+            global_n_experts,
+            experts_start_idx,
+            experts_end_idx,
+            n_shared_experts,
+            n_activated_experts,
+            fuse_shared_experts,
+            checkpoint_prefix,
+        )
+
+        quant_scale_stride = 16
+
+        # In the checkpoint, the weights are in Packed4BitWeightAlongK layout with
+        # `stride = 1`. Here we mark the layout via `self._{key}_layout_class` and
+        # `self._{key}_plain_shape`, so `enable_native_layout_weight` can recognize it.
+        # After loading, `enable_native_layout_weight` will convert them to other
+        # layouts.
+        scale_in_features = ceil_div(dim, quant_scale_stride)
+        self.gate_up_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                moe_inter_dim * 2,
+                dim // 2,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        self._gate_up_proj_weight_layout_class = Packed4BitWeightAlongK
+        self._gate_up_proj_weight_plain_shape = (
+            self.group_size,
+            moe_inter_dim * 2,
+            dim,
+        )
+        self.gate_up_proj_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                moe_inter_dim * 2,
+                scale_in_features,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        self.gate_up_proj_weight_scale_2 = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                1 if merged_global_scale else 2,
+                1,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        self.gate_up_proj_input_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                1 if merged_global_scale else 2,
+                1,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        down_proj_scale_in_features = ceil_div(moe_inter_dim, quant_scale_stride)
+        down_proj_scale_out_features = dim
+        self.down_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                dim,
+                moe_inter_dim // 2,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        self._down_proj_weight_layout_class = Packed4BitWeightAlongK
+        self._down_proj_weight_plain_shape = (self.group_size, dim, moe_inter_dim)
+        self.down_proj_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                down_proj_scale_out_features,
+                down_proj_scale_in_features,
+                dtype=torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        self.down_proj_weight_scale_2 = torch.nn.Parameter(
+            torch.empty(
+                self.group_size,
+                1,
+                1,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        if not no_input_scale:
+            self.down_proj_input_scale = torch.nn.Parameter(
+                torch.empty(
+                    self.group_size,
+                    1,
+                    1,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+
+    @override
+    def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear_block_fp4(
+            x,
+            self.get_native_layout_gate_up_proj_weight()[i],
+            self.gate_up_proj_weight_scale[i],
+            self.gate_up_proj_weight_scale_2[i],
+            128,
+            None,
+        )
+
+    @override
+    def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear_block_fp4(
+            x,
+            self.get_native_layout_down_proj_weight()[i],
+            self.down_proj_weight_scale[i],
+            self.down_proj_weight_scale_2[i],
+            128,
+            None,
+        )
+
 
 @QuantizationRegistry.register_moe_experts(
-    "blockfp4", when=lambda: is_blackwell() and has_hard_fp4_kernels, priority=1
+    "blockfp4",
+    merge_gate_up=True,
+    when=lambda: is_blackwell() and has_hard_fp4_kernels,
+    priority=1,
 )
 @QuantizationRegistry.register_moe_experts(
-    "blockfp4_merged", when=lambda: is_blackwell() and has_hard_fp4_kernels, priority=1
+    "blockfp4_merged",
+    merge_gate_up=True,
+    when=lambda: is_blackwell() and has_hard_fp4_kernels,
+    priority=1,
 )
-class Blockfp4MoeExpertsPackKStride1(
+class Blockfp4MoeExpertsBlackwell(
     enable_native_layout_weight(
-        "gate_up_proj_weight", Packed4BitWeightAlongK, allow_missing=True, k_stride=1
-    ),
-    enable_native_layout_weight(
-        "gate_proj_weight", Packed4BitWeightAlongK, allow_missing=True, k_stride=1
-    ),
-    enable_native_layout_weight(
-        "up_proj_weight", Packed4BitWeightAlongK, allow_missing=True, k_stride=1
+        "gate_up_proj_weight", Packed4BitWeightAlongK, k_stride=1
     ),
     enable_native_layout_weight("down_proj_weight", Packed4BitWeightAlongK, k_stride=1),
-    enable_native_layout_weight(
-        "gate_up_proj_weight_scale", LinearScaleToSwizzled, allow_missing=True
-    ),
-    enable_native_layout_weight(
-        "gate_proj_weight_scale", LinearScaleToSwizzled, allow_missing=True
-    ),
-    enable_native_layout_weight(
-        "up_proj_weight_scale", LinearScaleToSwizzled, allow_missing=True
-    ),
+    enable_native_layout_weight("gate_up_proj_weight_scale", LinearScaleToSwizzled),
     enable_native_layout_weight("down_proj_weight_scale", LinearScaleToSwizzled),
-    Blockfp4MoeExpertsBase,
+    Blockfp4MoeExpertsMergedBase,
 ):
-    """
-    blockfp4 quantized MoeExperts with weights in Packed4BitWeightAlongK (k_stride=64) layout.
-    """
-
-    def forward_cuda(
+    @override
+    def forward(
         self,
-        x: torch.Tensor,
+        routed_x: BatchedRoutedActivation,
         weights: torch.Tensor,
-        indices: torch.Tensor,
         inplace: bool = False,
+        impl: str = "auto",
     ) -> torch.Tensor:
+        x, indices = routed_x.activation, routed_x.token_to_expert_indices
+        shape = x.size()
+        x = x.view(-1, self.dim)
+
         bs = x.size(0)
         backend = (
             hard_fp4_kernels.fused_moe_decode.scaled_fp4_fused_moe_decode
-            if bs <= 128 and self.merge_gate_up
+            if bs <= 128
             else hard_fp4_kernels.cuda_nvfp4_fused_moe
         )
         if not inplace:
@@ -619,7 +745,7 @@ class Blockfp4MoeExpertsPackKStride1(
                 weights,
                 indices,
             )
-            return output
+            y = output
         else:
             backend(
                 x,
@@ -633,106 +759,25 @@ class Blockfp4MoeExpertsPackKStride1(
                 weights,
                 indices,
             )
-            return x
-
-    def forward(
-        self,
-        routed_x: BatchedRoutedActivation,
-        weights: torch.Tensor,
-        inplace: bool = False,
-        impl: str = "auto",
-    ) -> torch.Tensor:
-        """
-        Forward pass for the MoE module.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-            weights (torch.Tensor): Routing weights from the gate.
-            indices (torch.Tensor): Indices of the selected experts.
-
-        Returns:
-            torch.Tensor: Output tensor.
-        """
-
-        x, indices = routed_x.activation, routed_x.token_to_expert_indices
-        shape = x.size()
-        x = x.view(-1, self.dim)
-
-        if impl == "auto":
-            if not self.merge_gate_up or (
-                not has_hard_fp4_kernels and not self.fuse_shared_experts
-            ):
-                impl = "iterative"
-            else:
-                impl = "cuda"
-        if impl == "cuda":
-            y = self.forward_cuda(x, weights, indices, inplace=inplace)
-        elif impl == "iterative":
-            y = self.forward_iterative(x, indices, weights, inplace=inplace)
+            y = x
 
         return y.reshape(shape)
 
-    @override
-    def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp4(
-            x,
-            self.get_native_layout_gate_up_proj_weight()[i],
-            self.gate_up_proj_weight_scale[i],
-            self.gate_up_proj_weight_scale_2[i],
-            None,
-            None,
-        )
 
-    @override
-    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp4(
-            x,
-            self.get_native_layout_gate_proj_weight()[i],
-            self.gate_proj_weight_scale[i],
-            self.gate_proj_weight_scale_2[i],
-            None,
-            None,
-        )
-
-    @override
-    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp4(
-            x,
-            self.get_native_layout_up_proj_weight()[i],
-            self.up_proj_weight_scale[i],
-            self.up_proj_weight_scale_2[i],
-            None,
-            None,
-        )
-
-    @override
-    def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp4(
-            x,
-            self.get_native_layout_down_proj_weight()[i],
-            self.down_proj_weight_scale[i],
-            self.down_proj_weight_scale_2[i],
-            None,
-            None,
-        )
-
-
-@QuantizationRegistry.register_moe_experts("blockfp4", when=is_nvidia)
-@QuantizationRegistry.register_moe_experts("blockfp4_merged", when=is_nvidia)
+@QuantizationRegistry.register_moe_experts(
+    "blockfp4", merge_gate_up=True, when=lambda: is_nvidia() and has_triton
+)
+@QuantizationRegistry.register_moe_experts(
+    "blockfp4_merged", merge_gate_up=True, when=lambda: is_nvidia() and has_triton
+)
 class Blockfp4MoeExpertsPackKStride64(
     enable_native_layout_weight(
-        "gate_up_proj_weight", Packed4BitWeightAlongK, allow_missing=True, k_stride=64
-    ),
-    enable_native_layout_weight(
-        "gate_proj_weight", Packed4BitWeightAlongK, allow_missing=True, k_stride=64
-    ),
-    enable_native_layout_weight(
-        "up_proj_weight", Packed4BitWeightAlongK, allow_missing=True, k_stride=64
+        "gate_up_proj_weight", Packed4BitWeightAlongK, k_stride=64
     ),
     enable_native_layout_weight(
         "down_proj_weight", Packed4BitWeightAlongK, k_stride=64
     ),
-    Blockfp4MoeExpertsBase,
+    Blockfp4MoeExpertsMergedBase,
 ):
     """
     blockfp4 quantized MoeExperts with weights in Packed4BitWeightAlongK (k_stride=64) layout.
@@ -742,29 +787,24 @@ class Blockfp4MoeExpertsPackKStride64(
     def forward_no_sum(
         self, routed_x: BatchedRoutedActivation, impl: str = "auto"
     ) -> BatchedExpertResult:
-        if has_triton and self.merge_gate_up:
-            raise_to_16 = (
-                parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
-                != 1
-            )
-            return fused_experts_no_sum_wrapper(
-                routed_x,
-                w1=self.get_native_layout_gate_up_proj_weight().layout_tensor,
-                w2=self.get_native_layout_down_proj_weight().layout_tensor,
-                use_fp4_w4a8=True,
-                w1_scale=self.gate_up_proj_weight_scale,
-                w2_scale=self.down_proj_weight_scale,
-                w1_scale_2=self.gate_up_proj_weight_scale_2,
-                w2_scale_2=self.down_proj_weight_scale_2,
-                block_shape=[128, 128],
-                soft_fp8=raise_to_16,
-                global_num_experts=self.global_n_experts,
-                experts_start_idx=self.experts_start_idx,
-                impl=impl,
-            )
-
-        else:
-            return super().forward_no_sum(routed_x, impl=impl)
+        raise_to_16 = (
+            parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize != 1
+        )
+        return fused_experts_no_sum_wrapper(
+            routed_x,
+            w1=self.get_native_layout_gate_up_proj_weight().layout_tensor,
+            w2=self.get_native_layout_down_proj_weight().layout_tensor,
+            use_fp4_w4a8=True,
+            w1_scale=self.gate_up_proj_weight_scale,
+            w2_scale=self.down_proj_weight_scale,
+            w1_scale_2=self.gate_up_proj_weight_scale_2,
+            w2_scale_2=self.down_proj_weight_scale_2,
+            block_shape=[128, 128],
+            soft_fp8=raise_to_16,
+            global_num_experts=self.global_n_experts,
+            experts_start_idx=self.experts_start_idx,
+            impl=impl,
+        )
 
     @override
     def forward(
@@ -774,115 +814,98 @@ class Blockfp4MoeExpertsPackKStride64(
         inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
-        if has_triton and self.merge_gate_up:
-            raise_to_16 = (
-                parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
-                != 1
-            )
-            return fused_experts_and_sum_wrapper(
-                routed_x,
-                w1=self.get_native_layout_gate_up_proj_weight().layout_tensor,
-                w2=self.get_native_layout_down_proj_weight().layout_tensor,
-                topk_weights=weights,
-                inplace=inplace,
-                use_fp4_w4a8=True,
-                w1_scale=self.gate_up_proj_weight_scale,
-                w2_scale=self.down_proj_weight_scale,
-                w1_scale_2=self.gate_up_proj_weight_scale_2,
-                w2_scale_2=self.down_proj_weight_scale_2,
-                block_shape=[128, 128],
-                soft_fp8=raise_to_16,
-                global_num_experts=self.global_n_experts,
-                experts_start_idx=self.experts_start_idx,
-                impl=impl,
-            )
-
-        else:
-            return super().forward(routed_x, weights, inplace=inplace, impl=impl)
-
-    @override
-    def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp4(
-            x,
-            self.get_native_layout_gate_up_proj_weight()[i],
-            self.gate_up_proj_weight_scale[i],
-            self.gate_up_proj_weight_scale_2[i],
-            128,
-            None,
+        raise_to_16 = (
+            parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize != 1
         )
-
-    @override
-    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp4(
-            x,
-            self.get_native_layout_gate_proj_weight()[i],
-            self.gate_proj_weight_scale[i],
-            self.gate_proj_weight_scale_2[i],
-            128,
-            None,
-        )
-
-    @override
-    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp4(
-            x,
-            self.get_native_layout_up_proj_weight()[i],
-            self.up_proj_weight_scale[i],
-            self.up_proj_weight_scale_2[i],
-            128,
-            None,
-        )
-
-    @override
-    def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear_block_fp4(
-            x,
-            self.get_native_layout_down_proj_weight()[i],
-            self.down_proj_weight_scale[i],
-            self.down_proj_weight_scale_2[i],
-            128,
-            None,
+        return fused_experts_and_sum_wrapper(
+            routed_x,
+            w1=self.get_native_layout_gate_up_proj_weight().layout_tensor,
+            w2=self.get_native_layout_down_proj_weight().layout_tensor,
+            topk_weights=weights,
+            inplace=inplace,
+            use_fp4_w4a8=True,
+            w1_scale=self.gate_up_proj_weight_scale,
+            w2_scale=self.down_proj_weight_scale,
+            w1_scale_2=self.gate_up_proj_weight_scale_2,
+            w2_scale_2=self.down_proj_weight_scale_2,
+            block_shape=[128, 128],
+            soft_fp8=raise_to_16,
+            global_num_experts=self.global_n_experts,
+            experts_start_idx=self.experts_start_idx,
+            impl=impl,
         )
 
 
 @QuantizationRegistry.register_moe_experts(
     "blockfp4",
+    merge_gate_up=False,
     when=lambda: has_torch_npu,
     priority=2,
 )
-class Blockfp4MoeExpertsPackNPUNative(
-    enable_native_layout_weight(
-        "gate_up_proj_weight", Packed4BitWeightNPUNative, allow_missing=True
-    ),
-    enable_native_layout_weight(
-        "gate_proj_weight", Packed4BitWeightNPUNative, allow_missing=True
-    ),
-    enable_native_layout_weight(
-        "up_proj_weight", Packed4BitWeightNPUNative, allow_missing=True
-    ),
+class Blockfp4MoeExpertsUnmergedPackNPUNative(
+    enable_native_layout_weight("gate_proj_weight", Packed4BitWeightNPUNative),
+    enable_native_layout_weight("up_proj_weight", Packed4BitWeightNPUNative),
     enable_native_layout_weight("down_proj_weight", Packed4BitWeightNPUNative),
-    Blockfp4MoeExpertsBase,
+    Blockfp4MoeExpertsMergedBase,
 ):
     """
-    blockfp4 quantized MoeExperts with weights in Packed4BitWeightNPUNative layout.
+    blockfp4 quantized MoeExperts with weights in Packed4BitWeightNPUNative layout,
+    with unmerged gate and up projection.
+    """
+
+    @override
+    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
+            x,
+            self.get_native_layout_gate_proj_weight()[i],
+            self.gate_proj_weight_scale[i],
+        )
+
+    @override
+    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
+            x,
+            self.get_native_layout_up_proj_weight()[i],
+            self.up_proj_weight_scale[i],
+        )
+
+    @override
+    def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
+            x,
+            self.get_native_layout_down_proj_weight()[i],
+            self.down_proj_weight_scale[i],
+        )
+
+
+@QuantizationRegistry.register_moe_experts(
+    "blockfp4",
+    merge_gate_up=True,
+    when=lambda: has_torch_npu,
+    priority=2,
+)
+class Blockfp4MoeExpertsMergedPackNPUNative(
+    enable_native_layout_weight("gate_up_proj_weight", Packed4BitWeightNPUNative),
+    enable_native_layout_weight("down_proj_weight", Packed4BitWeightNPUNative),
+    Blockfp4MoeExpertsMergedBase,
+):
+    """
+    blockfp4 quantized MoeExperts with weights in Packed4BitWeightNPUNative layout,
+    with merged gate and up projection.
     """
 
     @override
     def forward_no_sum(
         self, routed_x: BatchedRoutedActivation, impl="auto"
     ) -> BatchedExpertResult:
-        if self.merge_gate_up:
-            return fused_experts_no_sum_npu(
-                routed_x,
-                w1=self.gate_up_proj_weight,
-                w2=self.down_proj_weight,
-                w1_scale=self.gate_up_proj_weight_scale,
-                w2_scale=self.down_proj_weight_scale,
-                global_num_experts=self.global_n_experts,
-            )
-
-        else:
-            return super().forward_no_sum(routed_x, impl=impl)
+        return fused_experts_no_sum_npu(
+            routed_x,
+            w1=self.gate_up_proj_weight,
+            w2=self.down_proj_weight,
+            w1_scale=self.gate_up_proj_weight_scale,
+            w2_scale=self.down_proj_weight_scale,
+            global_num_experts=self.global_n_experts,
+        )
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
@@ -890,22 +913,6 @@ class Blockfp4MoeExpertsPackNPUNative(
             x,
             self.get_native_layout_gate_up_proj_weight()[i],
             self.gate_up_proj_weight_scale[i],
-        )
-
-    @override
-    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
-            x,
-            self.get_native_layout_gate_proj_weight()[i],
-            self.gate_proj_weight_scale[i],
-        )
-
-    @override
-    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
-            x,
-            self.get_native_layout_up_proj_weight()[i],
-            self.up_proj_weight_scale[i],
         )
 
     @override

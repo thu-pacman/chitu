@@ -56,6 +56,7 @@ cython_unsafe_files = (
     + glob.glob("chitu/native_layout/*.py")  # plum inside
     + [
         "chitu/moe/batched_routed_activation.py",  # plum inside
+        "chitu/quantization/base.py",  # plum inside
         "__main__.py",
     ]
 )

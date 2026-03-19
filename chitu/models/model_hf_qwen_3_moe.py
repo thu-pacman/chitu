@@ -53,16 +53,16 @@ def Qwen3MoeExperts(
     *,
     checkpoint_prefix: str,
 ):
+    quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
+    merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
     if base_moe_experts_class is None:
         base_moe_experts_class = (
             QuantizationRegistry.get_quantized_moe_experts_class_from_global_args(
+                merge_gate_up=merge_gate_up,
                 quant_kwargs=quant_kwargs,
                 checkpoint_prefix=f"{checkpoint_prefix}.moe",
             )
         )
-
-    quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
-    merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
 
     assert args.moe_intermediate_dim % get_etp_size() == 0
     return base_moe_experts_class(
@@ -75,7 +75,6 @@ def Qwen3MoeExperts(
         n_activated_experts=0,
         fuse_shared_experts=False,
         checkpoint_prefix=f"{checkpoint_prefix}.moe",
-        merge_gate_up=merge_gate_up,
     )
 
 
