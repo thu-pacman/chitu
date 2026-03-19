@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import re
+from logging import getLogger
 from typing import Any, Optional, cast
 from typing_extensions import override
 
@@ -15,7 +15,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import KVCacheManagerBase
+from chitu.cache_manager import KVCacheManagerBase, MMPagedKVCacheManager
 from chitu.distributed.parallel_state import get_etp_size
 from chitu.global_vars import get_global_args
 from chitu.moe.impl import MoEImplEP, get_moe_impl
@@ -26,12 +26,16 @@ from chitu.models.model_hf_qwen2_vl import (
     VisionRotaryEmbedding as Qwen25VisionRotaryEmbedding,
 )
 from chitu.models.model_hf_qwen_3_moe import TransformerHFQwen3Moe
+from chitu.models.mm_cache_mixin_qwen_vl import get_qwen_vl_mm_cache_class
 from chitu.models.registry import ModelType, register_model
 from chitu.utils import try_import_opt_dep
 from chitu.quantization import get_quant_from_checkpoint_prefix, QuantizationRegistry
 from chitu.device_type import has_accelerator
+from chitu.ops import append_to_paged_kv_cache
 
 _flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
+
+logger = getLogger(__name__)
 
 
 def _require_attrs(obj: Any, names: list[str], *, what: str) -> None:
@@ -457,8 +461,12 @@ def _get_placeholder_mask(
     return expanded_image_mask, expanded_video_mask
 
 
+# Create base class using factory pattern
+TransformerQwen3VLBase = get_qwen_vl_mm_cache_class(TransformerHFLlama)
+
+
 @register_model(ModelType.HF_QWEN3_VL)
-class TransformerQwen3VL(TransformerHFLlama):
+class TransformerQwen3VL(TransformerQwen3VLBase):
     """Qwen3-VL dense multimodal adapter (correctness-first)."""
 
     def __init__(
@@ -532,25 +540,7 @@ class TransformerQwen3VL(TransformerHFLlama):
         # Each entry tracks remaining image/video features and DeepStack payloads to guarantee
         # correct alignment under chunked prefilling.
         self._mm_req_cache: dict[str, dict[str, Any]] = {}
-
-    def _mm_cache_cleanup(self) -> None:
-        """Drop multimodal caches for requests that are no longer active in KV cache."""
-        try:
-            active = set(
-                getattr(self.cache_managers["main"], "req_id_to_seq_len", {}).keys()
-            )
-        except Exception:
-            return
-        if not active:
-            self._mm_req_cache.clear()
-            self._rope_delta_by_req.clear()
-            return
-        for rid in list(self._mm_req_cache.keys()):
-            if rid not in active:
-                del self._mm_req_cache[rid]
-        for rid in list(self._rope_delta_by_req.keys()):
-            if rid not in active:
-                del self._rope_delta_by_req[rid]
+        self.mm_cache_manager: MMPagedKVCacheManager = cache_managers.get("multimodal")
 
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         ret = super()._get_tensor_column_parallel_layer_names()
@@ -806,10 +796,6 @@ class TransformerQwen3VL(TransformerHFLlama):
             rope_deltas[req_idx, 0] = int(delta)
 
         return pos_ids, rope_deltas
-
-    # -----------------------------
-    # Rotary embedding (text)
-    # -----------------------------
 
     @override
     def precompute_freqs_cis(self, max_position_embeddings, device):
@@ -1129,6 +1115,20 @@ class TransformerQwen3VL(TransformerHFLlama):
         deepstack_image_embeds = None
         deepstack_video_embeds = None
 
+        def get_reqs_to_write(
+            per_req_feats: dict[str, list[torch.Tensor]], kind: str
+        ) -> list[str]:
+            """Determine which requests in this chunk need to write to the multimodal cache for this kind (image/video)."""
+            return [
+                rid
+                for rid in per_req_feats
+                if not bool(
+                    self._mm_state_get(rid, {}).get(
+                        self._mm_write_done_key(kind), False
+                    )
+                )
+            ]
+
         def _mm_prepare_cache(
             *,
             kind: str,
@@ -1182,25 +1182,17 @@ class TransformerQwen3VL(TransformerHFLlama):
                 if ds_splits_per_input is not None:
                     per_req_ds.setdefault(rid, []).append(ds_splits_per_input[j])
 
-            for rid, parts in per_req_feats.items():
-                entry = self._mm_req_cache.setdefault(rid, {})
-                key_feat = f"{kind}_embeds"
-                key_cur = f"{kind}_cursor"
-                key_ds = f"deepstack_{kind}_embeds"
-                if key_feat not in entry:
-                    entry[key_feat] = torch.cat(parts, dim=0).contiguous()
-                    entry[key_cur] = 0
-                    if rid in per_req_ds:
-                        # per_req_ds[rid] is list over inputs of list over layers
-                        ds_inputs = per_req_ds[rid]
-                        n_layers = len(ds_inputs[0])
-                        entry[key_ds] = [
-                            torch.cat(
-                                [ds_inputs[ii][li] for ii in range(len(ds_inputs))],
-                                dim=0,
-                            ).contiguous()
-                            for li in range(n_layers)
-                        ]
+            reqs_to_write = get_reqs_to_write(per_req_feats, kind)
+            per_req_feats_to_write = {rid: per_req_feats[rid] for rid in reqs_to_write}
+            per_req_ds_to_write = {
+                rid: per_req_ds[rid] for rid in reqs_to_write if rid in per_req_ds
+            }
+
+            self._write_vision_to_mm_cache(
+                kind=kind,
+                per_req_feats=per_req_feats_to_write,
+                per_req_ds=per_req_ds_to_write,
+            )
 
         def _mm_consume(
             *,
@@ -1215,72 +1207,37 @@ class TransformerQwen3VL(TransformerHFLlama):
             - deepstack chunk embeds per layer aligned to visual positions (or None)
             """
             nonlocal inputs_embeds
-            wrote_any = False
             mask_1d = None
-            deepstack_chunks: Optional[list[list[torch.Tensor]]] = None
 
-            for req_idx, rid in enumerate(req_ids):
-                entry = self._mm_req_cache.get(rid)
-                if entry is None:
-                    continue
-                key_feat = f"{kind}_embeds"
-                key_cur = f"{kind}_cursor"
-                key_ds = f"deepstack_{kind}_embeds"
-                if key_feat not in entry:
-                    continue
+            all_vis_pos, all_vision_cat, all_ds_cat = self._read_vision_from_mm_cache(
+                kind=kind,
+                token_id=token_id,
+                req_ids=req_ids,
+                seq_ids=seq_ids,
+                input_ids_flat=input_ids_flat,
+            )
 
-                req_mask = seq_ids == int(req_idx)
-                pos_vis = torch.nonzero(
-                    req_mask & (input_ids_flat == int(token_id)), as_tuple=False
-                ).view(-1)
-                n_tok = int(pos_vis.numel())
-                if n_tok <= 0:
-                    continue
-
-                feat_all: torch.Tensor = entry[key_feat]
-                cur = int(entry.get(key_cur, 0))
-                if cur + n_tok > int(feat_all.shape[0]):
-                    raise ValueError(
-                        f"Not enough cached {kind} features for req_id={rid}: need={cur+n_tok}, total={feat_all.shape[0]}"
-                    )
-                feat_chunk = feat_all[cur : cur + n_tok].to(
+            if (
+                all_vision_cat is not None
+                and all_vis_pos is not None
+                and all_vis_pos.numel() > 0
+            ):
+                inputs_embeds = inputs_embeds.clone()
+                inputs_embeds[all_vis_pos, :] = all_vision_cat.to(
                     device=inputs_embeds.device, dtype=inputs_embeds.dtype
                 )
-                if not wrote_any:
-                    inputs_embeds = inputs_embeds.clone()
-                    wrote_any = True
-                inputs_embeds[pos_vis, :] = feat_chunk
-                entry[key_cur] = cur + n_tok
-                if mask_1d is None:
-                    mask_1d = input_ids_flat == int(token_id)
+                mask_1d = input_ids_flat == int(token_id)
 
-                ds_list = entry.get(key_ds, None)
-                if ds_list is not None:
-                    if deepstack_chunks is None:
-                        deepstack_chunks = [[] for _ in range(len(ds_list))]
-                    for li, ds in enumerate(ds_list):
-                        deepstack_chunks[li].append(
-                            ds[cur : cur + n_tok].to(
-                                device=inputs_embeds.device, dtype=inputs_embeds.dtype
-                            )
-                        )
+                if all_ds_cat is not None:
+                    all_ds_cat = all_ds_cat.to(
+                        device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                    )
+                    num_layers = all_ds_cat.shape[1]
+                    return mask_1d, [all_ds_cat[:, li, :] for li in range(num_layers)]
 
-                # Free cache when fully consumed.
-                if int(entry[key_cur]) >= int(feat_all.shape[0]):
-                    entry.pop(key_feat, None)
-                    entry.pop(key_cur, None)
-                    entry.pop(key_ds, None)
-
-            if deepstack_chunks is None:
                 return mask_1d, None
-            empty = torch.empty(
-                (0, inputs_embeds.shape[-1]),
-                device=inputs_embeds.device,
-                dtype=inputs_embeds.dtype,
-            )
-            return mask_1d, [
-                (torch.cat(v, dim=0) if len(v) > 0 else empty) for v in deepstack_chunks
-            ]
+
+            return mask_1d, None
 
         curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
         if curr_req_ids is None:
@@ -1305,11 +1262,13 @@ class TransformerQwen3VL(TransformerHFLlama):
                 raise ValueError(
                     "cache.curr_req_ids is required for multimodal prefill."
                 )
-            # Identify which requests need image features in this chunk (or already have cache).
             req_indices_img: list[int] = []
             for req_idx, rid in enumerate(curr_req_ids):
-                entry = self._mm_req_cache.get(rid, {})
-                has_cache = "image_embeds" in entry
+                has_cache = False
+                total = self.mm_cache_manager.get_consumption_progress(
+                    rid, "vision_embeds"
+                )
+                has_cache = total > 0
                 has_tok = bool(
                     torch.any(
                         (seq_ids == int(req_idx))
@@ -1348,8 +1307,11 @@ class TransformerQwen3VL(TransformerHFLlama):
                 )
             req_indices_vid: list[int] = []
             for req_idx, rid in enumerate(curr_req_ids):
-                entry = self._mm_req_cache.get(rid, {})
-                has_cache = "video_embeds" in entry
+                has_cache = False
+                total = self.mm_cache_manager.get_consumption_progress(
+                    rid, "vision_embeds"
+                )
+                has_cache = total > 0
                 has_tok = bool(
                     torch.any(
                         (seq_ids == int(req_idx))
@@ -1528,8 +1490,12 @@ class TransformerQwen3VL(TransformerHFLlama):
 #
 
 
+# Create base class using factory pattern
+TransformerQwen3VLMoeBase = get_qwen_vl_mm_cache_class(TransformerHFQwen3Moe)
+
+
 @register_model(ModelType.HF_QWEN3_VL_MOE)
-class TransformerQwen3VLMoe(TransformerHFQwen3Moe):
+class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
     def __init__(
         self,
         params,
@@ -1595,25 +1561,7 @@ class TransformerQwen3VLMoe(TransformerHFQwen3Moe):
         self._rope_delta_by_req: dict[str, torch.Tensor] = {}
         # Cross-chunk multimodal caches, keyed by req_id (chunked prefill support).
         self._mm_req_cache: dict[str, dict[str, Any]] = {}
-
-    def _mm_cache_cleanup(self) -> None:
-        """Drop multimodal caches for requests that are no longer active in KV cache."""
-        try:
-            active = set(
-                getattr(self.cache_managers["main"], "req_id_to_seq_len", {}).keys()
-            )
-        except Exception:
-            return
-        if not active:
-            self._mm_req_cache.clear()
-            self._rope_delta_by_req.clear()
-            return
-        for rid in list(self._mm_req_cache.keys()):
-            if rid not in active:
-                del self._mm_req_cache[rid]
-        for rid in list(self._rope_delta_by_req.keys()):
-            if rid not in active:
-                del self._rope_delta_by_req[rid]
+        self.mm_cache_manager: MMPagedKVCacheManager = cache_managers.get("multimodal")
 
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         ret = super()._get_tensor_column_parallel_layer_names()
@@ -1749,32 +1697,49 @@ class TransformerQwen3VLMoe(TransformerHFQwen3Moe):
         deepstack_video_embeds = None
 
         curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
-        if curr_req_ids is None or len(curr_req_ids) <= 0:
-            raise ValueError(
-                "cache.curr_req_ids is required for multimodal prefill (chunked-safe)."
-            )
-        curr_req_ids = cast(list[str], curr_req_ids)
-        seq_ids = self.cache_managers[
-            "main"
-        ].seq_len_delta.delta_seq_ids_tensor_device.to(device=input_ids_flat.device)
+        if curr_req_ids is None:
+            curr_req_ids = []
+        if len(curr_req_ids) > 0:
+            seq_ids = self.cache_managers[
+                "main"
+            ].seq_len_delta.delta_seq_ids_tensor_device.to(device=input_ids_flat.device)
+            if seq_ids.numel() != input_ids_flat.numel():
+                raise ValueError(
+                    f"seq_ids length mismatch: seq_ids={seq_ids.numel()} tokens={input_ids_flat.numel()}"
+                )
+        else:
+            seq_ids = None
 
         def _mm_prepare_cache(
             *,
             kind: str,
+            req_ids: list[str],
+            req_indices: list[int],
             splits: list[torch.Tensor],
             deepstack_full: Optional[list[torch.Tensor]],
         ) -> None:
+            """
+            Prepare per-request multimodal caches.
+
+            Constraints (to avoid silent wrong mapping):
+            - Single-request: allow multiple visual inputs (all splits belong to that request).
+            - Multi-request: require an unambiguous mapping. Prefer mapping to the subset of requests that
+              either already has cached features or has placeholder tokens in this chunk (`req_indices`).
+            """
             if not splits:
                 return
-            # Single-request: allow multiple visual inputs (all splits belong to that request).
-            if len(curr_req_ids) == 1:
+            if len(req_ids) == 1:
                 mapping = [0] * len(splits)
-            # Multi-request: require exactly 1 visual input per request.
-            elif len(splits) == len(curr_req_ids):
-                mapping = list(range(len(curr_req_ids)))
+            elif len(splits) == len(req_indices) and len(req_indices) > 0:
+                mapping = list(req_indices)
+            elif len(splits) == len(req_ids):
+                mapping = list(range(len(req_ids)))
             else:
                 raise ValueError(
-                    f"Ambiguous {kind} packing under multi-request batch: batch_size={len(curr_req_ids)}, {kind}_inputs={len(splits)}"
+                    f"Chunked multimodal prefill needs an unambiguous mapping from vision inputs to requests. "
+                    f"Got batch_size={len(req_ids)}, {kind}_inputs={len(splits)}, req_indices={len(req_indices)}. "
+                    f"Supported: (1) single-request with N {kind}s, or (2) map {kind}_inputs to the requests that "
+                    f"actually need them in this chunk (or already have cache), or (3) batch where each request has exactly 1 {kind}."
                 )
 
             # DeepStack: split per visual input using the same split sizes as main features.
@@ -1789,149 +1754,182 @@ class TransformerQwen3VLMoe(TransformerHFQwen3Moe):
                     for j in range(len(splits))
                 ]
 
+            # Aggregate per request (concat multiple inputs if single-request multi-image).
             per_req_feats: dict[str, list[torch.Tensor]] = {}
             per_req_ds: dict[str, list[list[torch.Tensor]]] = {}
             for j, req_i in enumerate(mapping):
-                rid = curr_req_ids[int(req_i)]
+                rid = req_ids[int(req_i)]
                 per_req_feats.setdefault(rid, []).append(splits[j])
                 if ds_splits_per_input is not None:
                     per_req_ds.setdefault(rid, []).append(ds_splits_per_input[j])
 
-            for rid, parts in per_req_feats.items():
-                entry = self._mm_req_cache.setdefault(rid, {})
-                key_feat = f"{kind}_embeds"
-                key_cur = f"{kind}_cursor"
-                key_ds = f"deepstack_{kind}_embeds"
-                if key_feat not in entry:
-                    entry[key_feat] = torch.cat(parts, dim=0).contiguous()
-                    entry[key_cur] = 0
-                    if rid in per_req_ds:
-                        ds_inputs = per_req_ds[
-                            rid
-                        ]  # list over inputs of list over layers
-                        n_layers = len(ds_inputs[0])
-                        entry[key_ds] = [
-                            torch.cat(
-                                [ds_inputs[ii][li] for ii in range(len(ds_inputs))],
-                                dim=0,
-                            ).contiguous()
-                            for li in range(n_layers)
-                        ]
+            # Write-once gate: only writes features into mm cache once.
+            reqs_to_write = [
+                rid
+                for rid in per_req_feats
+                if not bool(
+                    self._mm_state_get(rid, {}).get(
+                        self._mm_write_done_key(kind), False
+                    )
+                )
+            ]
+            per_req_feats_to_write = {rid: per_req_feats[rid] for rid in reqs_to_write}
+            per_req_ds_to_write = {
+                rid: per_req_ds[rid] for rid in reqs_to_write if rid in per_req_ds
+            }
+
+            # Write to multi modal paged_kv_cache
+            self._write_vision_to_mm_cache(
+                kind=kind,
+                per_req_feats=per_req_feats_to_write,
+                per_req_ds=per_req_ds_to_write,
+            )
 
         def _mm_consume(
             *,
             kind: str,
             token_id: int,
+            req_ids: list[str],
+            seq_ids: torch.Tensor,
         ) -> tuple[Optional[torch.Tensor], Optional[list[torch.Tensor]]]:
             """
             Consume cached multimodal features for current chunk tokens and return:
             - mask_1d for this kind (or None)
-            - deepstack chunk embeds per layer aligned to this kind's token order (or None)
+            - deepstack chunk embeds per layer aligned to visual positions (or None)
             """
             nonlocal inputs_embeds
-            mask_1d_full = input_ids_flat == int(token_id)
-            pos_all = torch.nonzero(mask_1d_full, as_tuple=False).view(-1)
-            n_all = int(pos_all.numel())
-            if n_all <= 0:
-                return None, None
+            mask_1d = None
 
-            # Allocate per-kind DeepStack outputs (aligned to `pos_all` order) lazily.
-            ds_out: Optional[list[torch.Tensor]] = None
-            wrote_any = False
+            all_vis_pos, all_vision_cat, all_ds_cat = self._read_vision_from_mm_cache(
+                kind=kind,
+                token_id=token_id,
+                req_ids=req_ids,
+                seq_ids=seq_ids,
+                input_ids_flat=input_ids_flat,
+            )
 
-            for req_idx, rid in enumerate(curr_req_ids):
-                entry = self._mm_req_cache.get(rid)
-                if entry is None:
-                    continue
-                key_feat = f"{kind}_embeds"
-                key_cur = f"{kind}_cursor"
-                key_ds = f"deepstack_{kind}_embeds"
-                if key_feat not in entry:
-                    continue
-
-                req_mask = seq_ids == int(req_idx)
-                pos_req = torch.nonzero(req_mask & mask_1d_full, as_tuple=False).view(
-                    -1
-                )
-                n_tok = int(pos_req.numel())
-                if n_tok <= 0:
-                    continue
-
-                feat_all: torch.Tensor = entry[key_feat]
-                cur = int(entry.get(key_cur, 0))
-                if cur + n_tok > int(feat_all.shape[0]):
-                    raise ValueError(
-                        f"Not enough cached {kind} features for req_id={rid}: need={cur+n_tok}, total={feat_all.shape[0]}"
-                    )
-
-                # Map positions to indices within `pos_all` so we preserve global token order.
-                idx_in_all = torch.searchsorted(pos_all, pos_req)
-                feat_chunk = feat_all[cur : cur + n_tok].to(
+            if (
+                all_vision_cat is not None
+                and all_vis_pos is not None
+                and all_vis_pos.numel() > 0
+            ):
+                inputs_embeds = inputs_embeds.clone()
+                inputs_embeds[all_vis_pos, :] = all_vision_cat.to(
                     device=inputs_embeds.device, dtype=inputs_embeds.dtype
                 )
-                if not wrote_any:
-                    inputs_embeds = inputs_embeds.clone()
-                    wrote_any = True
-                inputs_embeds[pos_req, :] = feat_chunk
-                entry[key_cur] = cur + n_tok
+                mask_1d = input_ids_flat == int(token_id)
 
-                if key_ds in entry and entry[key_ds] is not None:
-                    ds_all: list[torch.Tensor] = entry[key_ds]
-                    if ds_out is None:
-                        ds_out = [
-                            torch.empty(
-                                (n_all, int(ds.shape[-1])),
-                                device=inputs_embeds.device,
-                                dtype=inputs_embeds.dtype,
-                            )
-                            for ds in ds_all
-                        ]
-                    for li, ds in enumerate(ds_all):
-                        ds_chunk = ds[cur : cur + n_tok].to(
-                            device=inputs_embeds.device, dtype=inputs_embeds.dtype
-                        )
-                        ds_out[li][idx_in_all, :] = ds_chunk
+                if all_ds_cat is not None:
+                    all_ds_cat = all_ds_cat.to(
+                        device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                    )
+                    num_layers = all_ds_cat.shape[1]
+                    return mask_1d, [all_ds_cat[:, li, :] for li in range(num_layers)]
 
-            return mask_1d_full, ds_out
+                return mask_1d, None
 
-        # Prepare caches from pixel inputs (may happen once in the first chunk).
-        if pixel_values is not None:
+            return mask_1d, None
+
+        # Images
+        if pixel_values is not None and grid_thw is not None:
             image_embeds_splits, deepstack_image_embeds = self.get_image_features(
                 pixel_values, grid_thw=grid_thw
             )
+            if len(curr_req_ids) == 0:
+                raise ValueError(
+                    "cache.curr_req_ids is required for multimodal prefill."
+                )
+            # Identify which requests need image features in this chunk (or already have cache).
+            req_indices_img: list[int] = []
+            for req_idx, rid in enumerate(curr_req_ids):
+                has_cache = False
+                total = self.mm_cache_manager.get_consumption_progress(
+                    rid, "vision_embeds"
+                )
+                has_cache = total > 0
+                has_tok = bool(
+                    torch.any(
+                        (seq_ids == int(req_idx))
+                        & (input_ids_flat == int(self.image_token_id))
+                    ).item()
+                )
+                if has_cache or has_tok:
+                    req_indices_img.append(int(req_idx))
+
             _mm_prepare_cache(
                 kind="image",
+                req_ids=curr_req_ids,
+                req_indices=req_indices_img,
                 splits=list(image_embeds_splits),
                 deepstack_full=deepstack_image_embeds,
             )
-        if pixel_values_videos is not None:
+            if seq_ids is None:
+                raise ValueError("seq_ids is required for multimodal prefill.")
+            image_mask_1d, ds_image = _mm_consume(
+                kind="image",
+                token_id=int(self.image_token_id),
+                req_ids=curr_req_ids,
+                seq_ids=seq_ids,
+            )
+            if ds_image is not None:
+                self._deepstack_visual_embeds = ds_image
+
+        # Videos (same mechanism)
+        if pixel_values_videos is not None and video_grid_thw is not None:
             video_embeds_splits, deepstack_video_embeds = self.get_video_features(
                 pixel_values_videos, grid_thw=video_grid_thw
             )
+            if len(curr_req_ids) == 0:
+                raise ValueError(
+                    "cache.curr_req_ids is required for multimodal prefill."
+                )
+            req_indices_vid: list[int] = []
+            for req_idx, rid in enumerate(curr_req_ids):
+                has_cache = False
+                total = self.mm_cache_manager.get_consumption_progress(
+                    rid, "vision_embeds"
+                )
+                has_cache = total > 0
+                has_tok = bool(
+                    torch.any(
+                        (seq_ids == int(req_idx))
+                        & (input_ids_flat == int(self.video_token_id))
+                    ).item()
+                )
+                if has_cache or has_tok:
+                    req_indices_vid.append(int(req_idx))
+
             _mm_prepare_cache(
                 kind="video",
+                req_ids=curr_req_ids,
+                req_indices=req_indices_vid,
                 splits=list(video_embeds_splits),
                 deepstack_full=deepstack_video_embeds,
             )
-
-        # Consume cached features for current chunk tokens.
-        image_mask_1d, ds_img = _mm_consume(
-            kind="image", token_id=int(self.image_token_id)
-        )
-        video_mask_1d, ds_vid = _mm_consume(
-            kind="video", token_id=int(self.video_token_id)
-        )
+            if seq_ids is None:
+                raise ValueError("seq_ids is required for multimodal prefill.")
+            video_mask_1d, ds_video = _mm_consume(
+                kind="video",
+                token_id=int(self.video_token_id),
+                req_ids=curr_req_ids,
+                seq_ids=seq_ids,
+            )
+            if ds_video is not None:
+                # If both image and video present, keep image+video DeepStack in one stream by concatenation.
+                if self._deepstack_visual_embeds is None:
+                    self._deepstack_visual_embeds = ds_video
+                else:
+                    if len(self._deepstack_visual_embeds) != len(ds_video):
+                        raise ValueError(
+                            f"DeepStack layer count mismatch for image vs video: "
+                            f"image_layers={len(self._deepstack_visual_embeds)} video_layers={len(ds_video)}"
+                        )
+                    self._deepstack_visual_embeds = [
+                        torch.cat([a, b], dim=0)
+                        for a, b in zip(self._deepstack_visual_embeds, ds_video)
+                    ]
 
         # DeepStack payloads aligned to flattened token stream.
-        if ds_img is not None and ds_vid is not None:
-            # Both exist: will be merged below according to masks.
-            deepstack_image_embeds = ds_img
-            deepstack_video_embeds = ds_vid
-        elif ds_img is not None:
-            deepstack_image_embeds = ds_img
-        elif ds_vid is not None:
-            deepstack_video_embeds = ds_vid
-
         if image_mask_1d is not None or video_mask_1d is not None:
             if image_mask_1d is None:
                 image_mask_1d = torch.zeros_like(input_ids_flat, dtype=torch.bool)
@@ -1940,28 +1938,30 @@ class TransformerQwen3VLMoe(TransformerHFQwen3Moe):
             visual_pos_mask = image_mask_1d | video_mask_1d
             self._visual_pos_mask = visual_pos_mask
 
-            if (
-                deepstack_image_embeds is not None
-                and deepstack_video_embeds is not None
-            ):
-                deepstack_visual_embeds = []
-                image_mask_joint = image_mask_1d[visual_pos_mask]
-                video_mask_joint = video_mask_1d[visual_pos_mask]
-                for img_embed, vid_embed in zip(
-                    deepstack_image_embeds, deepstack_video_embeds
+            # If `_deepstack_visual_embeds` was already prepared by the chunk-aware multimodal
+            # path above, do not overwrite it here.
+            if self._deepstack_visual_embeds is None:
+                if (
+                    deepstack_image_embeds is not None
+                    and deepstack_video_embeds is not None
                 ):
-                    n_vis = int(visual_pos_mask.sum().item())
-                    embed_joint = img_embed.new_zeros(
-                        (n_vis, int(img_embed.shape[-1]))
-                    ).to(img_embed.device)
-                    embed_joint[image_mask_joint, :] = img_embed
-                    embed_joint[video_mask_joint, :] = vid_embed
-                    deepstack_visual_embeds.append(embed_joint)
-                self._deepstack_visual_embeds = deepstack_visual_embeds
-            elif deepstack_image_embeds is not None:
-                self._deepstack_visual_embeds = deepstack_image_embeds
-            elif deepstack_video_embeds is not None:
-                self._deepstack_visual_embeds = deepstack_video_embeds
+                    deepstack_visual_embeds = []
+                    image_mask_joint = image_mask_1d[visual_pos_mask]
+                    video_mask_joint = video_mask_1d[visual_pos_mask]
+                    for img_embed, vid_embed in zip(
+                        deepstack_image_embeds, deepstack_video_embeds
+                    ):
+                        embed_joint = img_embed.new_zeros(
+                            visual_pos_mask.sum(), img_embed.shape[-1]
+                        ).to(img_embed.device)
+                        embed_joint[image_mask_joint, :] = img_embed
+                        embed_joint[video_mask_joint, :] = vid_embed
+                        deepstack_visual_embeds.append(embed_joint)
+                    self._deepstack_visual_embeds = deepstack_visual_embeds
+                elif deepstack_image_embeds is not None:
+                    self._deepstack_visual_embeds = deepstack_image_embeds
+                elif deepstack_video_embeds is not None:
+                    self._deepstack_visual_embeds = deepstack_video_embeds
 
         # MRoPE position ids must be prepared before materializing cos/sin for prefill.
         # Chunked prefill can split vision blocks; use incremental chunk-aware MRoPE (same as dense).

@@ -35,6 +35,7 @@ from chitu.cache_manager import (
     PagedKVCacheManager,
     SingletonPagedKVCacheManager,
     GlobalLocalMap,
+    MMPagedKVCacheManager,
 )
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
@@ -613,6 +614,87 @@ class Backend:
             block_size=block_size,
             num_blocks=num_blocks,
             device=device,
+        )
+
+    @staticmethod
+    def _init_multimodal_cache_manager(
+        args,
+        base_cache_manager,
+    ):
+        """Create a dedicated PagedKVCacheManager for Qwen3-VL/Qwen3.5 multimodal features.
+
+        This cache holds vision embeddings, DeepStack features between the
+        vision-encoder run and their chunked-prefill consumption by the LLM.
+        It is separate from the main KV cache so vision tensors never occupy
+        transformer KV blocks.
+
+        Args:
+            args: Global configuration.
+            base_cache_manager: The already-initialised main KV cache manager.
+                Used to copy block_size / num_hot_req so both caches are aligned.
+
+        Returns:
+            An MMPagedKVCacheManager instance, or None for non-Qwen3-VL models.
+        """
+        if args.models.type not in {
+            ModelType.HF_QWEN3_VL,
+            ModelType.HF_QWEN3_VL_MOE,
+            ModelType.HF_QWEN3_5,
+        }:
+            return None
+
+        vision_cfg = getattr(args.models, "vision_config", None)
+        if vision_cfg is None:
+            logger.warning(
+                "Qwen3-VL or Qwen-3.5 detected but args.models.vision_config is missing; "
+                "skipping multimodal cache manager."
+            )
+            return None
+
+        hidden_size = int(getattr(vision_cfg, "out_hidden_size", 4096))
+        deepstack_indexes = list(getattr(vision_cfg, "deepstack_visual_indexes", []))
+        num_ds_layers = len(deepstack_indexes)
+        max_vision_token = getattr(vision_cfg, "max_vision_tokens", 16384)
+
+        shape_per_token_dict = {"vision_embeds": (hidden_size,)}
+        if num_ds_layers > 0:
+            shape_per_token_dict["deepstack_embeds"] = (num_ds_layers, hidden_size)
+
+        dtype = torch.bfloat16
+        dtype_dict = {k: dtype for k in shape_per_token_dict}
+
+        block_size = base_cache_manager.block_size
+        num_hot_req = base_cache_manager.num_hot_req
+        max_pict_token_num = min(
+            max_vision_token, args.infer.max_seq_len
+        )  # max_vision_token is computed according to preprocessor_config.json in model file.
+        auto_mm_blocks = ceil_div(max_pict_token_num, block_size) * num_hot_req
+        num_mm_blocks = (
+            args.infer.max_multimodal_blocks
+            if args.infer.max_multimodal_blocks not in (-1, 0)
+            else auto_mm_blocks
+        )
+
+        device = base_cache_manager.device
+
+        layer_id_map = GlobalLocalMap.from_range(0, 1)
+
+        logger.info(
+            f"Initializing MMPagedKVCacheManager: "
+            f"num_multimodal_blocks={num_mm_blocks}, block_size={block_size}, "
+            f"hidden_size={hidden_size}, num_deepstack_layers={num_ds_layers}, dtype={dtype}"
+        )
+
+        return MMPagedKVCacheManager(
+            layer_id_map,
+            max_seq_len=args.infer.max_seq_len,
+            num_hot_req=num_hot_req,
+            shape_per_token_dict=shape_per_token_dict,
+            dtype_dict=dtype_dict,
+            block_size=block_size,
+            num_blocks=num_mm_blocks,
+            device=device,
+            quant_type="None",
         )
 
     @staticmethod
@@ -1373,6 +1455,11 @@ class Backend:
                     num_blocks=num_linear_attn_blocks,
                 ),
             }
+            mm_cache = Backend._init_multimodal_cache_manager(
+                args, Backend.cache_managers["main"]
+            )
+            if mm_cache is not None:
+                Backend.cache_managers["multimodal"] = mm_cache
         elif getattr(args.models, "type", "") == "deepseek-v3" and getattr(
             args.models, "index_head_dim", None
         ):
@@ -1382,10 +1469,12 @@ class Backend:
                 "indexer": Backend._init_indexer_cache_manager(args),
             }
         else:
-            Backend.cache_managers = {
-                "main": Backend._init_cache_manager(args, attn_backend_type)
-            }
+            main_cache = Backend._init_cache_manager(args, attn_backend_type)
+            Backend.cache_managers = {"main": main_cache}
             Backend.cache_type = args.infer.cache_type
+            mm_cache = Backend._init_multimodal_cache_manager(args, main_cache)
+            if mm_cache is not None:
+                Backend.cache_managers["multimodal"] = mm_cache
 
         # Initialize attention backend
         attn_backend = Backend._init_attention_backend(attn_backend_type)
