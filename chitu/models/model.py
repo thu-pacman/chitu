@@ -1825,14 +1825,19 @@ class ParallelMoeBlock(nn.Module):
                 and self.prefill_memory_tolerance < self.moe_impl.ep_size
                 and get_global_args().infer.prefill_chunk_size is not None
             ):
-                max_n_tokens_per_chunk = int(
+                max_n_tokens_x_topk_per_chunk = int(
                     get_global_args().infer.prefill_chunk_size
+                    * self.gate.topk
                     / self.moe_impl.ep_size
                     * self.prefill_memory_tolerance
                 )
                 try:
                     chunks = routed_x.get_chunks_no_larger_than(
-                        weights, max_n_tokens_per_chunk
+                        weights,
+                        max_n_tokens_x_topk_per_chunk,
+                        self.experts.global_n_experts,
+                        self.experts.experts_start_idx,
+                        self.experts.experts_end_idx,
                     )
                 except Exception as e:
                     logger.warning(
