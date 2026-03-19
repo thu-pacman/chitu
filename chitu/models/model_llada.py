@@ -166,6 +166,8 @@ class TransformerLLaDA(nn.Module):
     def load_weights(self, ckpt_dir: str, device: str = "cuda"):
         # LLaDA 在默认设备上构建（与 dinfer 一致），直接 load_weights，不使用 meta/to_empty。
         inner = self.model
+        print("模型结构如下：")
+        print(inner)
         torch.set_default_dtype(torch.bfloat16)
         inner.load_weights(ckpt_dir, device=device)
         # 确保 correction_bias 引用与 dtype 正确（与 dinfer 的 dtype 转换一致）。
