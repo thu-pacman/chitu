@@ -305,13 +305,14 @@ def test_blockfp8_index_score_dense_dsv32(
 @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("softfp8", [False, True])
 @pytest.mark.parametrize("impl", ["triton"])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
 def test_blockfp8_index_score_ragged_q_dense_k_dsv32(
-    b, h, d, block_size, causal, impl, record_benchmark
+    b, h, d, block_size, causal, softfp8, impl, record_benchmark
 ):
     old_seq_len_list = [torch.randint(1, 2047, (1,)).item() for _ in range(b)]
     new_seq_len_list = [torch.randint(2048, 4096, (1,)).item() for _ in range(b)]
@@ -338,7 +339,14 @@ def test_blockfp8_index_score_ragged_q_dense_k_dsv32(
 
     output = record_benchmark.run(
         lambda: blockfp8_index_score_ragged_q_dense_k_dsv32(
-            q_fp8, q_s, k_fp8, k_s, seq_len_delta, causal=causal, impl=impl
+            q_fp8,
+            q_s,
+            k_fp8,
+            k_s,
+            seq_len_delta,
+            causal=causal,
+            softfp8=softfp8,
+            impl=impl,
         ),
         b=b,
         impl=impl,
@@ -356,13 +364,14 @@ def test_blockfp8_index_score_ragged_q_dense_k_dsv32(
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("page_size", [64])
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("softfp8", [False, True])
 @pytest.mark.parametrize("impl", ["triton"])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
 def test_blockfp8_index_score_ragged_q_paged_k_dsv32(
-    b, h, d, block_size, page_size, causal, impl, record_benchmark
+    b, h, d, block_size, page_size, causal, softfp8, impl, record_benchmark
 ):
     old_seq_len_list = [torch.randint(1, 2047, (1,)).item() for _ in range(b)]
     new_seq_len_list = [torch.randint(2048, 4096, (1,)).item() for _ in range(b)]
@@ -402,6 +411,7 @@ def test_blockfp8_index_score_ragged_q_paged_k_dsv32(
             page_table,
             static_max_n=4096,
             causal=causal,
+            softfp8=softfp8,
             impl=impl,
         ),
         b=b,

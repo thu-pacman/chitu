@@ -375,6 +375,7 @@ class FlashMLABackend(TritonAttnBackend):
                 seq_len_delta.delta_seq_ids_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
+                use_i64_offsets=kv_cache.use_i64_offsets,
             )
             if return_ragged:  # fall back to prefill_ragged_qkvo when necessary
                 return read_from_paged_kv_cache(
@@ -397,6 +398,7 @@ class FlashMLABackend(TritonAttnBackend):
                 seq_len_delta.old.lens_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
+                use_i64_offsets=kv_cache.use_i64_offsets,
             )
             append_to_paged_kv_cache(
                 kv_cache.kv["k_pe"],
@@ -405,6 +407,7 @@ class FlashMLABackend(TritonAttnBackend):
                 seq_len_delta.old.lens_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
+                use_i64_offsets=kv_cache.use_i64_offsets,
             )
             kv_lora_k_pe = torch.cat(
                 [kv_cache.kv["kv_lora"], kv_cache.kv["k_pe"]], dim=-1

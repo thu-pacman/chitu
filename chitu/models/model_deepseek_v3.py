@@ -217,6 +217,7 @@ class Indexer(torch.nn.Module):
                 k_page_table=cache_accessor.block_table,
                 static_max_n=get_global_args().infer.max_seq_len,
                 causal=is_causal,
+                softfp8=get_global_args().infer.raise_lower_bit_float_to == "bfloat16",
             )
         elif isinstance(cache_accessor, DenseKVCacheAccessor):
             append_to_dense_kv_cache(
@@ -232,6 +233,7 @@ class Indexer(torch.nn.Module):
                 cache_accessor.kv["indexer_ks"],
                 seq_len_delta=seq_len_delta,
                 causal=is_causal,
+                softfp8=get_global_args().infer.raise_lower_bit_float_to == "bfloat16",
             )
         else:
             raise NotImplementedError()
