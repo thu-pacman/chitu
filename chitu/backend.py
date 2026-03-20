@@ -1141,7 +1141,7 @@ class Backend:
         ):
             logger.info(f"loading gguf file : {args.models.ckpt_dir}")
             ds_gguf_loader = GGUFLoader(args.models.ckpt_dir)
-            load_gguf_deepseek_v3_gguf(model, ds_gguf_loader, 10, args)
+            load_gguf_deepseek_v3_gguf(model, ds_gguf_loader, args)
 
         else:
             quant_config = getattr(args.models, "quant_config", None)
@@ -1549,20 +1549,26 @@ def memory_used():
     logger.debug(f"cpu memory usage: {memory_usage / 1024} MB")
 
 
-def load_gguf_deepseek_v3_gguf(
-    model, ds_gguf_loader: GGUFLoader, layer_load_per_iter=10, args=None
-):
+def load_gguf_deepseek_v3_gguf(model, ds_gguf_loader: GGUFLoader, args=None):
     logger.debug(f"loading layer : from 0 to 3")
     checkpoint0 = load_state_dict_deepseek_v3_gguf_mlp_layer(
         ds_gguf_loader, main_weight_dtype=args.models.main_weight_dtype
     )
-    model.load_state_dict_parallel(
-        checkpoint0,
-        strict=False,
-        replace=False,
-        assign=True,  # Replacing "meta" tensors in the model with tensors from the checkpoint
-        skip_preprocess=args.skip_preprocess,
-    )
+    for _, model_prefix in model._get_non_layer_prefix_mappings():
+        model.load_state_dict_by_prefix(
+            {k: v for k, v in checkpoint0.items() if k.startswith(model_prefix)},
+            model_prefix,
+            replace=False,
+            skip_preprocess=args.skip_preprocess,
+        )
+    for layer_id in range(3):
+        _, model_prefix = model._get_layer_i_prefix_mapping(layer_id)
+        model.load_state_dict_by_prefix(
+            {k: v for k, v in checkpoint0.items() if k.startswith(model_prefix)},
+            model_prefix,
+            replace=False,
+            skip_preprocess=args.skip_preprocess,
+        )
     model.apply(
         functools.partial(
             Backend._move_one_module_to_device,
@@ -1576,21 +1582,20 @@ def load_gguf_deepseek_v3_gguf(
     cpu_layers = utils.collect_layers_by_type(
         ["q4km", "gguf"], args.models.quant_config.rules
     )
-    for layer_id in range(3, 61, layer_load_per_iter):
-        end_layer = min(61, layer_id + layer_load_per_iter)
+    for layer_id in range(3, 61):
         checkpoint = load_state_dict_deepseek_v3_gguf_moe_layer(
             ds_gguf_loader,
             cpu_layers,
             layer_id,
-            end_layer,
+            layer_id + 1,
             parallel_moe_load=True,
             main_weight_dtype=args.models.main_weight_dtype,
         )
-        model.load_state_dict_parallel(
+        _, model_prefix = model._get_layer_i_prefix_mapping(layer_id)
+        model.load_state_dict_by_prefix(
             checkpoint,
-            strict=False,
+            model_prefix,
             replace=False,
-            assign=True,  # Replacing "meta" tensors in the model with tensors from the checkpoint
             skip_preprocess=args.skip_preprocess,
         )
         del checkpoint

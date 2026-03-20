@@ -141,7 +141,7 @@ class QuantizationRegistry:
         priority = -1
         impl: Type = None
         for impl_, when_, priority_ in backend_impl:
-            if when_() and priority_ > priority:
+            if when_(quant_kwargs.get(method, {})) and priority_ > priority:
                 impl, priority = impl_, priority_
         if impl is None:
             raise ValueError(
@@ -301,8 +301,9 @@ class QuantizationRegistry:
         cls,
         name: Optional[str],
         implementation: Optional[Type[QuantizedLinearBase]] = None,
+        *,
         backend_type: str = "default",
-        when=lambda: True,
+        when: Callable[[Mapping[str, Any]], bool] = lambda _: True,
         priority: int = 0,
     ) -> Callable | Type[QuantizedLinearBase]:
         """
@@ -312,6 +313,11 @@ class QuantizationRegistry:
             name: Name of the quant. None for non-quantized layer.
             implementation: Implementation class. If None, return a partial function as
                 a decorator.
+            when: Only select this implementation if the `when` function returns True.
+                The `when` function accepts the kwargs passed to the model as its only
+                argument.
+            proiority: When multiple implementations match, the one with the highest
+                priority will be selected.
         """
         if implementation is None:
             return functools.partial(
@@ -340,7 +346,7 @@ class QuantizationRegistry:
         *,
         merge_gate_up: bool,
         backend_type: str = "default",
-        when=lambda: True,
+        when: Callable[[Mapping[str, Any]], bool] = lambda _: True,
         priority: int = 0,
     ) -> Callable | Type[QuantizedMoeExpertsBase]:
         """
@@ -350,6 +356,11 @@ class QuantizationRegistry:
             name: Name of the MoeExperts layer. None for non-quantized layer.
             implementation: Implementation class. If None, return a partial function as
                 a decorator.
+            when: Only select this implementation if the `when` function returns True.
+                The `when` function accepts the kwargs passed to the model as its only
+                argument.
+            proiority: When multiple implementations match, the one with the highest
+                priority will be selected.
         """
         if implementation is None:
             return functools.partial(
@@ -377,8 +388,9 @@ class QuantizationRegistry:
         cls,
         name: Optional[str],
         implementation: Optional[Type[QuantizedAbsorbGemmBase]] = None,
+        *,
         backend_type: str = "default",
-        when=lambda: True,
+        when: Callable[[Mapping[str, Any]], bool] = lambda _: True,
         priority: int = 0,
     ) -> Callable | Type[QuantizedAbsorbGemmBase]:
         """
@@ -388,6 +400,11 @@ class QuantizationRegistry:
             name: Name of the quant. None for non-quantized layer.
             implementation: Implementation class. If None, return a partial function as
                 a decorator.
+            when: Only select this implementation if the `when` function returns True.
+                The `when` function accepts the kwargs passed to the model as its only
+                argument.
+            proiority: When multiple implementations match, the one with the highest
+                priority will be selected.
         """
         if implementation is None:
             return functools.partial(

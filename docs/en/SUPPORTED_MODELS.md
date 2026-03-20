@@ -91,11 +91,14 @@
 | Qwen3-VL-8B-Instruct |  | `models=Qwen3-VL-8B-Instruct` | https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct |
 | Qwen3_5-0.8B | ✓ | `models=Qwen3_5-0.8B` | https://huggingface.co/Qwen/Qwen3.5-0.8B |
 | Qwen3_5-122B-A10B | ✓ | `models=Qwen3_5-122B-A10B` | https://huggingface.co/Qwen/Qwen3.5-122B-A10B |
+| Qwen3_5-122B-A10B-FP8 | ✓ | `models=Qwen3_5-122B-A10B-FP8` | https://huggingface.co/Qwen/Qwen3.5-122B-A10B-FP8 |
 | Qwen3_5-27B | ✓ | `models=Qwen3_5-27B` | https://huggingface.co/Qwen/Qwen3.5-27B |
 | Qwen3_5-27B-FP8 | ✓ | `models=Qwen3_5-27B-FP8` | https://huggingface.co/Qwen/Qwen3.5-27B-FP8 |
 | Qwen3_5-2B | ✓ | `models=Qwen3_5-2B` | https://huggingface.co/Qwen/Qwen3.5-2B |
 | Qwen3_5-35B-A3B | ✓ | `models=Qwen3_5-35B-A3B` | https://huggingface.co/Qwen/Qwen3.5-35B-A3B |
 | Qwen3_5-35B-A3B-FP8 | ✓ | `models=Qwen3_5-35B-A3B-FP8` | https://huggingface.co/Qwen/Qwen3.5-35B-A3B-FP8 |
+| Qwen3_5-397B-A17B | ✓ | `models=Qwen3_5-397B-A17B` | https://huggingface.co/Qwen/Qwen3.5-397B-A17B |
+| Qwen3_5-397B-A17B-FP8 | ✓ | `models=Qwen3_5-397B-A17B-FP8` | https://huggingface.co/Qwen/Qwen3.5-397B-A17B-FP8 |
 | Qwen3_5-4B | ✓ | `models=Qwen3_5-4B` | https://huggingface.co/Qwen/Qwen3.5-4B |
 | Qwen3_5-9B | ✓ | `models=Qwen3_5-9B` | https://huggingface.co/Qwen/Qwen3.5-9B |
 | Seed-OSS-36B-Instruct |  | `models=Seed-OSS-36B-Instruct` | https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct |

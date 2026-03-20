@@ -5,6 +5,7 @@
 import torch
 
 from chitu.lazy import single_dispatch_lazy_tensor
+from chitu.native_layout import DeepGemmScale
 from chitu.global_vars import get_global_args
 from chitu.utils import (
     try_import_platform_dep,
@@ -30,7 +31,7 @@ if has_marlin:
 
 def blockfp8_gemm(
     a: torch.Tensor,
-    a_s: torch.Tensor,
+    a_s: torch.Tensor | DeepGemmScale,
     b: torch.Tensor,
     b_s: torch.Tensor,
     *,
@@ -79,7 +80,7 @@ def blockfp8_gemm(
 
 def blockfp8_gemm_deep_gemm(
     a: torch.Tensor,
-    a_s: torch.Tensor,
+    a_s: torch.Tensor | DeepGemmScale,
     b: torch.Tensor,
     b_s: torch.Tensor,
     *,
@@ -98,6 +99,9 @@ def blockfp8_gemm_deep_gemm(
         raise NotImplementedError(
             f"deep_gemm only supports bfloat16 activation output, but got {torch.get_default_dtype()}"
         )
+
+    if isinstance(b_s, DeepGemmScale):
+        b_s = b_s.layout_tensor
 
     c = a.new_empty(*a.shape[:-1], b.shape[0], dtype=torch.get_default_dtype())
     deep_gemm.fp8_gemm_nt((a, a_s), (b.view(torch.float8_e4m3fn), b_s), c)
