@@ -321,7 +321,7 @@ class AttentionQwen3Next(AttentionHFLlama):
             checkpoint_prefix=f"{checkpoint_prefix}.gate",
         )
 
-        self.partial_rotary_factor = float(getattr(args, "partial_rotary_factor", 0.5))
+        self.partial_rotary_factor = float(getattr(args, "partial_rotary_factor", 0.25))
 
     def forward(
         self,

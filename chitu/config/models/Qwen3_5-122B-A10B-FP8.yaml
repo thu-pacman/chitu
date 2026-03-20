@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Qwen3_5-122B-A10B-FP8 is a quantization of Qwen3_5-122B-A10B
+defaults:
+  - Qwen3_5-122B-A10B
+  - quant_config: blockfp8_next
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: Qwen3_5-122B-A10B-FP8
+source: "https://huggingface.co/Qwen/Qwen3.5-122B-A10B-FP8" # Just for displaying. No automatic download.
+

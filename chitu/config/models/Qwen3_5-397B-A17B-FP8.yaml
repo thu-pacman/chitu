@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Qwen3_5-397B-A17B-FP8 is a quantization of Qwen3_5-397B-A17B
+defaults:
+  - Qwen3_5-397B-A17B
+  - quant_config: blockfp8_next
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: Qwen3_5-397B-A17B-FP8
+source: "https://huggingface.co/Qwen/Qwen3.5-397B-A17B-FP8" # Just for displaying. No automatic download.
+
