@@ -68,6 +68,7 @@ __pypackages__/
 # Environments
 .env
 .venv
+.vscode
 env/
 venv/
 ENV/

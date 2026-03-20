@@ -7,16 +7,22 @@ Common service functions for Chitu serve module.
 """
 
 import asyncio
+from typing import Any
 from logging import getLogger
 
 import torch
 import torch.distributed
+from fastapi import HTTPException
 
 from chitu.task import (
+    Task,
     TaskPool,
+    UserRequest,
     SerializedPackedTasksPayloadType,
     TaskCollector,
 )
+from chitu.async_response import AsyncResponse
+from chitu.global_vars import get_global_args
 
 logger = getLogger(__name__)
 
@@ -53,3 +59,31 @@ def start_worker():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(process_queue())
+
+
+def get_priority_from_api_key(api_key: str) -> int:
+    args = get_global_args()
+    for item in args.serve.api_keys:
+        if item.key == api_key:
+            return item.priority
+    if args.serve.validate_api_key == True:
+        raise HTTPException(status_code=503, detail="Unauthorized api key")
+    return 1
+
+
+def build_chat_template_kwargs(enable_thinking: bool) -> dict[str, Any]:
+    chat_template_kwargs = {}
+    if "DeepSeek-V3.1" in get_global_args().models.name:
+        # DeepSeek-V3.1 tokenizer uses `thinking` instead of `enable_thinking`
+        chat_template_kwargs["thinking"] = enable_thinking
+    else:
+        chat_template_kwargs["enable_thinking"] = enable_thinking
+    return chat_template_kwargs
+
+
+def submit_request(req: UserRequest) -> AsyncResponse:
+    task = Task(
+        req.request_id, req, stop_with_eos=req.stop_with_eos, priority=req.priority
+    )
+    TaskPool.enqueue(task)
+    return AsyncResponse(req)

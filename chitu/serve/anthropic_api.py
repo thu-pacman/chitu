@@ -12,7 +12,7 @@ from logging import getLogger
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from chitu.backend import Backend
 from chitu.global_vars import get_global_args
@@ -20,9 +20,11 @@ from chitu.task import Task, TaskPool, UserRequest
 from chitu.tool_call import get_tool_parser, parse_stream_by_parser
 from chitu.tool_call import (
     ChoiceToolCall,
+    ToolChoice as OpenAIToolChoice,
     ToolChoiceNamedTool,
     ToolChoiceFunction,
 )
+from chitu.serve.common import build_chat_template_kwargs
 from chitu.utils import gen_req_id
 
 
@@ -33,14 +35,42 @@ class AnthropicThinking(BaseModel):
     """Subset of Anthropic 'thinking' parameter."""
 
     model_config = ConfigDict(extra="allow")
-    type: str
+    type: Literal["enabled", "disabled", "adaptive"]
     budget_tokens: Optional[int] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def warn_unsupportd_params(cls, data):
+        if not isinstance(data, dict):
+            return data
+        if data.get("type") == "adaptive":
+            logger.warning(
+                "Anthropic parameter thinking.type='adaptive' is unsupported; falling back to 'enabled'"
+            )
+        if "budget_tokens" in data:
+            logger.warning(
+                "Anthropic thinking.budget_tokens is unsupported and will be ignored"
+            )
+        return data
 
 
 class AnthropicMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
     role: Literal["user", "assistant"] | str
     content: str | list[str | dict]
+
+
+class ToolChoice(BaseModel):
+    type: Literal["auto", "any", "tool", "none"]
+    disable_parallel_tool_use: bool | None = False
+    name: str | None = None
+
+    @model_validator(mode="after")
+    def validate_tool_choice_params(self):
+        if self.type == "tool" and not self.name:
+            raise ValueError("tool_choice.name must be provided when `type` is 'tool'")
+        else:
+            return self
 
 
 class AnthropicMessagesRequest(BaseModel):
@@ -61,7 +91,7 @@ class AnthropicMessagesRequest(BaseModel):
     stop_sequences: Optional[list[str]] = None
     thinking: Optional[AnthropicThinking] = None
     tools: Optional[list[dict]] = None
-    tool_choice: Optional[dict | str] = None
+    tool_choice: Optional[ToolChoice] = None
 
 
 class AnthropicCompletionRequest(BaseModel):
@@ -163,17 +193,6 @@ def anthropic_content_to_text(content: str | list[str | dict]) -> str:
     return "".join(parts)
 
 
-def build_chat_template_kwargs(enable_thinking: bool) -> dict[str, Any]:
-    """
-    Reuse existing 'enable_thinking' compatibility rules.
-    """
-    if not enable_thinking:
-        return {}
-    if "DeepSeek-V3.1" in get_global_args().models.name:
-        return {"thinking": True}
-    return {"enable_thinking": True}
-
-
 def apply_stop_sequences_weak(text: str, stop_sequences: Optional[list[str]]):
     """
     Weak stop_sequences support: apply string truncation post-generation.
@@ -222,28 +241,27 @@ def normalize_anthropic_tools(tools: Optional[list[dict]]) -> list[dict]:
     return normalized
 
 
-def map_anthropic_tool_choice(tool_choice: Optional[dict | str]):
+def map_anthropic_tool_choice(
+    tool_choice: Optional[ToolChoice],
+) -> tuple[OpenAIToolChoice, bool]:
     if tool_choice is None:
-        return "auto"
-    if isinstance(tool_choice, str):
-        if tool_choice == "none":
-            return "none"
-        if tool_choice in {"any", "required"}:
-            return "required"
-        return "auto"
-    t = tool_choice.get("type")
+        return "auto", True
+
+    t = tool_choice.type
+    parallel_tool_calls = not bool(tool_choice.disable_parallel_tool_use)
+
     if t in {"none", "auto"}:
-        return t
+        return t, parallel_tool_calls
     if t == "any":
-        return "required"
+        return "required", parallel_tool_calls
     if t == "tool":
-        name = tool_choice.get("name")
-        if not name:
-            raise ValueError("tool_choice.name is required when type='tool'")
-        return ToolChoiceNamedTool(
-            function=ToolChoiceFunction(name=name), type="function"
+        return (
+            ToolChoiceNamedTool(
+                function=ToolChoiceFunction(name=tool_choice.name), type="function"
+            ),
+            parallel_tool_calls,
         )
-    return "auto"
+    return "auto", parallel_tool_calls
 
 
 def tool_calls_to_anthropic_blocks(tool_calls: list[ChoiceToolCall]) -> list[dict]:
@@ -658,7 +676,9 @@ async def handle_messages_request(
 
     try:
         tools = normalize_anthropic_tools(request.tools)
-        tool_choice = map_anthropic_tool_choice(request.tool_choice)
+        tool_choice, parallel_tool_calls = map_anthropic_tool_choice(
+            request.tool_choice
+        )
     except ValueError as e:
         return anthropic_error(400, "invalid_request_error", str(e))
 
@@ -694,7 +714,8 @@ async def handle_messages_request(
     frequency_penalty = 0.0
 
     enable_thinking = bool(
-        request.thinking is not None and request.thinking.type == "enabled"
+        request.thinking is not None
+        and (request.thinking.type in ["enabled", "adaptive"])
     )
     chat_template_kwargs = build_chat_template_kwargs(enable_thinking)
 
@@ -787,7 +808,7 @@ async def handle_messages_request(
             chat_template_kwargs=chat_template_kwargs,
             tools=tools,
             tool_choice=tool_choice,
-            parallel_tool_calls=True,
+            parallel_tool_calls=parallel_tool_calls,
             enable_reasoning=enable_thinking,
             save_trace_dir=args.debug.save_trace_dir,
         )

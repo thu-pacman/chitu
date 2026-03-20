@@ -155,7 +155,7 @@ class UserRequest:
         tokens=None,
         logprobs=False,
         top_logprobs=None,
-        max_new_tokens=50,
+        max_new_tokens=128,
         top_p=0.9,
         top_k=50,
         temperature=0.8,
@@ -166,6 +166,8 @@ class UserRequest:
         tool_choice: ToolChoice = "auto",
         parallel_tool_calls: bool = True,
         save_trace_dir: Optional[str] = None,
+        priority: int = 1,
+        stop_with_eos: bool = True,
     ):
         # input related
         if hasattr(Backend, "tool_parser"):
@@ -210,6 +212,8 @@ class UserRequest:
         self.async_stream = AsyncDataStream(self.reasoning_params)
         self.finish_reason = None
         self.max_new_tokens = max_new_tokens
+        self.priority = priority
+        self.stop_with_eos = stop_with_eos
         self.num_output_tokens = 0
         self.will_finish = False
         self.finished = False

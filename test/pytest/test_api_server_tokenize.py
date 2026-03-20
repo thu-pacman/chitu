@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import chitu.serve.api_server as api_server
+import chitu.serve.common as serve_common
 
 
 class DummyTokenizer:
@@ -32,7 +33,7 @@ def patch_message_tokenize_deps(monkeypatch, formatter):
     monkeypatch.setattr(api_server.Backend, "tokenizer", DummyTokenizer())
     monkeypatch.setattr(api_server.Backend, "formatter", formatter)
     monkeypatch.setattr(
-        api_server,
+        serve_common,
         "get_global_args",
         lambda: SimpleNamespace(models=SimpleNamespace(name="Qwen3-32B")),
     )
