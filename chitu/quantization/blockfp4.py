@@ -270,8 +270,8 @@ class Blockfp4LinearBase(QuantizedLinearBase):
             self.register_parameter("bias", None)
 
 
-@QuantizationRegistry.register_linear("blockfp4", when=is_nvidia)
-@QuantizationRegistry.register_linear("blockfp4_merged", when=is_nvidia)
+@QuantizationRegistry.register_linear("blockfp4", when=lambda _: is_nvidia())
+@QuantizationRegistry.register_linear("blockfp4_merged", when=lambda _: is_nvidia())
 class Blockfp4LinearPackKStride64(
     enable_native_layout_weight("weight", Packed4BitWeightAlongK, k_stride=64),
     Blockfp4LinearBase,
@@ -292,8 +292,12 @@ class Blockfp4LinearPackKStride64(
         )
 
 
-@QuantizationRegistry.register_linear("blockfp4", when=is_blackwell, priority=1)
-@QuantizationRegistry.register_linear("blockfp4_merged", when=is_blackwell, priority=1)
+@QuantizationRegistry.register_linear(
+    "blockfp4", when=lambda _: is_blackwell(), priority=1
+)
+@QuantizationRegistry.register_linear(
+    "blockfp4_merged", when=lambda _: is_blackwell(), priority=1
+)
 class Blockfp4LinearPackKStride1(
     enable_native_layout_weight("weight", Packed4BitWeightAlongK, k_stride=1),
     enable_native_layout_weight("weight_scale", LinearScaleToSwizzled),
@@ -316,7 +320,7 @@ class Blockfp4LinearPackKStride1(
 
 
 @QuantizationRegistry.register_linear(
-    "blockfp4", when=lambda: has_torch_npu, priority=2
+    "blockfp4", when=lambda _: has_torch_npu, priority=2
 )
 class Blockfp4LinearPackNPUNative(
     enable_native_layout_weight("weight", Packed4BitWeightNPUNative),
@@ -688,13 +692,13 @@ class Blockfp4MoeExpertsMergedBase(QuantizedMoeExpertsMerged):
 @QuantizationRegistry.register_moe_experts(
     "blockfp4",
     merge_gate_up=True,
-    when=lambda: is_blackwell() and has_hard_fp4_kernels,
+    when=lambda _: is_blackwell() and has_hard_fp4_kernels,
     priority=1,
 )
 @QuantizationRegistry.register_moe_experts(
     "blockfp4_merged",
     merge_gate_up=True,
-    when=lambda: is_blackwell() and has_hard_fp4_kernels,
+    when=lambda _: is_blackwell() and has_hard_fp4_kernels,
     priority=1,
 )
 class Blockfp4MoeExpertsBlackwell(
@@ -765,10 +769,10 @@ class Blockfp4MoeExpertsBlackwell(
 
 
 @QuantizationRegistry.register_moe_experts(
-    "blockfp4", merge_gate_up=True, when=lambda: is_nvidia() and has_triton
+    "blockfp4", merge_gate_up=True, when=lambda _: is_nvidia() and has_triton
 )
 @QuantizationRegistry.register_moe_experts(
-    "blockfp4_merged", merge_gate_up=True, when=lambda: is_nvidia() and has_triton
+    "blockfp4_merged", merge_gate_up=True, when=lambda _: is_nvidia() and has_triton
 )
 class Blockfp4MoeExpertsPackKStride64(
     enable_native_layout_weight(
@@ -839,7 +843,7 @@ class Blockfp4MoeExpertsPackKStride64(
 @QuantizationRegistry.register_moe_experts(
     "blockfp4",
     merge_gate_up=False,
-    when=lambda: has_torch_npu,
+    when=lambda _: has_torch_npu,
     priority=2,
 )
 class Blockfp4MoeExpertsUnmergedPackNPUNative(
@@ -881,7 +885,7 @@ class Blockfp4MoeExpertsUnmergedPackNPUNative(
 @QuantizationRegistry.register_moe_experts(
     "blockfp4",
     merge_gate_up=True,
-    when=lambda: has_torch_npu,
+    when=lambda _: has_torch_npu,
     priority=2,
 )
 class Blockfp4MoeExpertsMergedPackNPUNative(

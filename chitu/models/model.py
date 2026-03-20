@@ -408,10 +408,14 @@ class Transformer(nn.Module):
         return module
 
     def load_state_dict_by_prefix(
-        self, state_dict: dict[str, Any], prefix: str, skip_preprocess: bool = False
+        self,
+        state_dict: dict[str, Any],
+        prefix: str,
+        skip_preprocess: bool = False,
+        replace: bool = True,
     ) -> nn.Module:
         state_dict = self.preprocess_state_dict_parallel(
-            state_dict, skip_preprocess=skip_preprocess
+            state_dict, skip_preprocess=skip_preprocess, replace=replace
         )
         module_state_dict = {}
         for key, value in state_dict.items():
@@ -420,7 +424,11 @@ class Transformer(nn.Module):
         state_dict = module_state_dict
         module = self._get_module_by_prefix(prefix)
         assert module is not None, f"Module {prefix} not found"
-        module.load_state_dict(state_dict, strict=True, assign=True)
+        module.load_state_dict(
+            state_dict,
+            strict=True,
+            assign=True,  # Replacing "meta" tensors in the model with tensors from the checkpoint
+        )
         return module
 
     def _chunk_checkpoint_for_pipeline_parallel(

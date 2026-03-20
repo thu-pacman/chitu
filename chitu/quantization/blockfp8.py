@@ -25,12 +25,14 @@ from chitu.ops.quant import (
     soft_fp8_blockfp8_gemm_marlin,
 )
 from chitu.device_type import get_device_name, is_muxi, is_nvidia
-from chitu.utils import try_import_platform_dep, parse_dtype
+from chitu.utils import parse_dtype, ceil_div
+from chitu.import_utils import try_import_platform_dep, try_import_opt_dep
 from chitu.global_vars import get_global_args
 from chitu.native_layout import (
     enable_native_layout_weight,
     MarlinNativeLayoutWeight,
     MarlinNativeLayoutScale,
+    DeepGemmScale,
 )
 from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import (
@@ -44,6 +46,7 @@ from chitu.moe.experts import (
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
+deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 
 has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
 
@@ -169,8 +172,8 @@ class Blockfp8Linear(QuantizedLinearBase):
             ),
         )
 
-        scale_out_features = (out_features + block_size - 1) // block_size
-        scale_in_features = (in_features + block_size - 1) // block_size
+        scale_out_features = ceil_div(out_features, block_size)
+        scale_in_features = ceil_div(in_features, block_size)
         self.register_parameter(
             "scale",
             torch.nn.Parameter(
@@ -207,7 +210,7 @@ class Blockfp8Linear(QuantizedLinearBase):
 
 @QuantizationRegistry.register_linear(
     "blockfp8",
-    when=lambda: has_marlin
+    when=lambda _: has_marlin
     and parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize > 1,
     priority=1,
 )
@@ -221,6 +224,43 @@ class Blockfp8LinearMarlinLayout(
             x,
             self.get_native_layout_weight(),
             self.get_native_layout_scale(),
+        )
+
+
+@QuantizationRegistry.register_linear(
+    "blockfp8",
+    when=lambda quant_kwargs: quant_kwargs.get("block_size", 128) == 128
+    and has_deep_gemm
+    and torch.get_default_dtype() == torch.bfloat16
+    and (
+        torch.cuda.get_device_capability()[0] == 9
+        or (
+            torch.cuda.get_device_capability()[0] == 10
+            and quant_kwargs.get("round_scale_to_pow2", False)
+        )
+    ),
+    priority=1,
+)
+class Blockfp8LinearDeepGemm(
+    enable_native_layout_weight(
+        "scale",
+        DeepGemmScale,
+        mn=lambda m: m.out_features,
+        k=lambda m: m.in_features,
+        disable_ue8m0_cast=lambda m: not m.round_scale_to_pow2,
+    ),
+    Blockfp8Linear,
+):
+    @override
+    def forward(self, x) -> torch.Tensor:
+        return linear_blockfp8(
+            x,
+            self.weight,
+            self.get_native_layout_scale(),
+            self.bias,
+            block_size=self.block_size,
+            round_scale_to_pow2=self.round_scale_to_pow2,
+            # TODO: Call deep_gemm implementation only. No dispatching
         )
 
 
@@ -272,8 +312,6 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
             dtype = torch.float8_e4m3fn
         assert dtype.itemsize == 1
 
-        gate_up_proj_in_features = dim
-
         self.gate_proj_weight = torch.nn.Parameter(
             torch.empty(
                 (self.group_size, moe_inter_dim, self.dim),
@@ -288,8 +326,8 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
             ),
             requires_grad=False,
         )
-        scale_out_features = (moe_inter_dim + block_size - 1) // block_size
-        scale_in_features = (gate_up_proj_in_features + block_size - 1) // block_size
+        scale_out_features = ceil_div(moe_inter_dim, block_size)
+        scale_in_features = ceil_div(dim, block_size)
         self.gate_proj_scale = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
@@ -315,8 +353,8 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
             ),
             requires_grad=False,
         )
-        down_proj_scale_out_features = (dim + block_size - 1) // block_size
-        down_proj_scale_in_features = (moe_inter_dim + block_size - 1) // block_size
+        down_proj_scale_out_features = ceil_div(dim, block_size)
+        down_proj_scale_in_features = ceil_div(moe_inter_dim, block_size)
         self.down_proj_scale = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
@@ -409,8 +447,6 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             dtype = torch.float8_e4m3fn
         assert dtype.itemsize == 1
 
-        gate_up_proj_in_features = dim
-
         self.gate_up_proj_weight = torch.nn.Parameter(
             torch.empty(
                 (self.group_size, moe_inter_dim * 2, self.dim),
@@ -418,8 +454,8 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             ),
             requires_grad=False,
         )
-        scale_out_features = (moe_inter_dim * 2 + block_size - 1) // block_size
-        scale_in_features = (gate_up_proj_in_features + block_size - 1) // block_size
+        scale_out_features = ceil_div(moe_inter_dim * 2, block_size)
+        scale_in_features = ceil_div(dim, block_size)
         self.gate_up_proj_scale = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
@@ -436,8 +472,8 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             ),
             requires_grad=False,
         )
-        down_proj_scale_out_features = (dim + block_size - 1) // block_size
-        down_proj_scale_in_features = (moe_inter_dim + block_size - 1) // block_size
+        down_proj_scale_out_features = ceil_div(dim, block_size)
+        down_proj_scale_in_features = ceil_div(moe_inter_dim, block_size)
         self.down_proj_scale = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
@@ -497,7 +533,7 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
                 use_fp8_w8a8=use_fp8_w8a8,
                 w1_scale=gate_up_proj_scale,
                 w2_scale=down_proj_scale,
-                block_shape=[128, 128],
+                block_shape=[self.block_size, self.block_size],
                 round_scale_to_pow2=self.round_scale_to_pow2,
                 soft_fp8=fused_soft_fp8,
                 global_num_experts=self.global_n_experts,

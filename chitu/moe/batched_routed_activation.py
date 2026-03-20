@@ -218,6 +218,8 @@ class IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
     def convert_from(
         cls, old: IndexedBatchedRoutedActivation, *, n_experts: int, pad_block_size: int
     ) -> "IndexedBatchedRoutedActivationWithPaddedPerExpertCnt":
+        if not old.expert_ids_are_local:
+            raise NotImplementedError("`expert_ids_are_local` is required")
         token_cnt_per_expert = torch.zeros(
             n_experts, device=old.token_to_expert_indices.device, dtype=torch.int32
         )
@@ -264,6 +266,8 @@ class IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
         n_experts: int,
         pad_block_size: int,
     ) -> "IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt":
+        if not old.expert_ids_are_local:
+            raise NotImplementedError("`expert_ids_are_local` is required")
         token_cnt_per_expert = torch.zeros(
             n_experts, device=old.token_to_expert_indices.device, dtype=torch.int32
         )
