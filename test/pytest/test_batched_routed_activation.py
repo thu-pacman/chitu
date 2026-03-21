@@ -5,13 +5,15 @@ from chitu.ops import (
     batched_routed_activation_indexed_to_expert_block_indexed,
     batched_routed_activation_indexed_to_expert_block_permuted,
     batched_routed_activation_indexed_to_expert_block_permuted_blockfp8,
+    batched_routed_activation_indexed_to_per_expert_dense,
+    batched_routed_activation_indexed_to_per_expert_dense_blockfp8,
     batched_routed_activation_indexed_to_concat_permuted,
 )
-from chitu.utils import (
+from chitu.utils import ceil_div
+from chitu.import_utils import (
     try_import_platform_dep,
     try_import_opt_dep,
     try_import_and_setup_torch_npu,
-    ceil_div,
 )
 from chitu.device_type import has_native_fp8
 
@@ -21,6 +23,19 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
 )
+
+
+def gen_token_to_expert_indices(
+    num_tokens: int, num_experts: int, topk: int, distribution: str
+):
+    if distribution == "imbalance":
+        return torch.arange(topk, dtype=torch.int32, device="cuda").repeat(
+            num_tokens, 1
+        )
+    elif distribution == "uniform":
+        return torch.multinomial(
+            torch.ones(num_tokens, num_experts, device="cuda"), topk, replacement=False
+        ).to(torch.int32)
 
 
 @pytest.mark.parametrize("num_experts", [256])
@@ -41,16 +56,9 @@ def test_batched_routed_activation_indexed_to_expert_block_indexed(
             pytest.skip("muxi_layout_kernels is missing")
         if block_size != 16:
             pytest.skip("muxi only supports block_size=16")
-
-    if distribution == "imbalance":
-        token_to_expert_indices = torch.arange(
-            topk, dtype=torch.int32, device="cuda:0"
-        ).repeat(num_tokens, 1)
-    elif distribution == "uniform":
-        token_to_expert_indices = torch.randint(
-            0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda:0"
-        )
-
+    token_to_expert_indices = gen_token_to_expert_indices(
+        num_tokens, num_experts, topk, distribution
+    )
     block_to_token_x_topk_indices, block_to_expert_indices, n_blocks_scalar_tensor = (
         batched_routed_activation_indexed_to_expert_block_indexed(
             token_to_expert_indices,
@@ -123,15 +131,9 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
         dtype=torch.float32,
         device="cuda",
     )
-
-    if distribution == "imbalance":
-        token_to_expert_indices = torch.arange(
-            topk, dtype=torch.int32, device="cuda:0"
-        ).repeat(num_tokens, 1)
-    elif distribution == "uniform":
-        token_to_expert_indices = torch.randint(
-            0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda:0"
-        )
+    token_to_expert_indices = gen_token_to_expert_indices(
+        num_tokens, num_experts, topk, distribution
+    )
 
     n_tokens_per_expert_list = [0] * num_experts
     for i in range(token_to_expert_indices.shape[0]):
@@ -206,16 +208,9 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted(
     activation = torch.rand(
         (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
     ).to(torch.bfloat16)
-
-    if distribution == "imbalance":
-        token_to_expert_indices = torch.arange(
-            topk, dtype=torch.int32, device="cuda:0"
-        ).repeat(num_tokens, 1)
-    elif distribution == "uniform":
-        token_to_expert_indices = torch.randint(
-            0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda:0"
-        )
-
+    token_to_expert_indices = gen_token_to_expert_indices(
+        num_tokens, num_experts, topk, distribution
+    )
     n_tokens_per_expert_list = [0] * num_experts
     for i in range(token_to_expert_indices.shape[0]):
         for j in range(token_to_expert_indices.shape[1]):
@@ -256,6 +251,115 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted(
             )
 
 
+@pytest.mark.parametrize("num_experts", [32])
+@pytest.mark.parametrize("num_tokens", [0, 1, 64])
+@pytest.mark.parametrize("hidden_size", [7168])
+@pytest.mark.parametrize("topk", [8])
+@pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
+@pytest.mark.parametrize("impl", ["ref", "triton"])
+def test_batched_routed_activation_indexed_to_per_expert_dense(
+    num_experts, num_tokens, hidden_size, topk, distribution, impl
+):
+    if impl == "triton" and not has_triton:
+        pytest.skip("triton is missing")
+
+    activation = torch.rand(
+        (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
+    token_to_expert_indices = gen_token_to_expert_indices(
+        num_tokens, num_experts, topk, distribution
+    )
+    activation_per_expert, n_tokens_per_expert, token_pos_in_expert = (
+        batched_routed_activation_indexed_to_per_expert_dense(
+            activation=activation,
+            token_to_expert_indices=token_to_expert_indices,
+            num_experts=num_experts,
+            impl=impl,
+        )
+    )
+
+    assert tuple(activation_per_expert.shape) == (num_experts, num_tokens, hidden_size)
+    assert tuple(n_tokens_per_expert.shape) == (num_experts,)
+    assert tuple(token_pos_in_expert.shape) == (num_tokens, topk)
+    for expert_id in range(num_experts):
+        assert n_tokens_per_expert[expert_id] == torch.sum(
+            token_to_expert_indices == expert_id
+        )
+    for token_id in range(num_tokens):
+        for topk_id in range(topk):
+            expert_id = token_to_expert_indices[token_id, topk_id]
+            if expert_id >= 0 and expert_id < num_experts:
+                pos_in_expert = token_pos_in_expert[token_id, topk_id]
+                assert torch.all(
+                    activation[token_id]
+                    == activation_per_expert[expert_id, pos_in_expert]
+                ), f"activation[{token_id}] != activation_per_expert[{expert_id}, {pos_in_expert}]"
+
+
+@pytest.mark.parametrize("num_experts", [32])
+@pytest.mark.parametrize("num_tokens", [0, 1, 64])
+@pytest.mark.parametrize("hidden_size", [7168])
+@pytest.mark.parametrize("topk", [8])
+@pytest.mark.parametrize("quant_block_size", [128])
+@pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
+@pytest.mark.parametrize("impl", ["ref", "triton"])
+def test_batched_routed_activation_indexed_to_per_expert_dense_blockfp8(
+    num_experts, num_tokens, hidden_size, topk, quant_block_size, distribution, impl
+):
+    if impl == "triton" and not has_triton:
+        pytest.skip("triton is missing")
+
+    activation = torch.rand(
+        (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
+    activation_scale = torch.rand(
+        (num_tokens, ceil_div(hidden_size, quant_block_size)),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    token_to_expert_indices = gen_token_to_expert_indices(
+        num_tokens, num_experts, topk, distribution
+    )
+    (
+        activation_per_expert,
+        activation_scale_per_expert,
+        n_tokens_per_expert,
+        token_pos_in_expert,
+    ) = batched_routed_activation_indexed_to_per_expert_dense_blockfp8(
+        activation=activation,
+        activation_scale=activation_scale,
+        token_to_expert_indices=token_to_expert_indices,
+        num_experts=num_experts,
+        impl=impl,
+    )
+
+    assert tuple(activation_per_expert.shape) == (num_experts, num_tokens, hidden_size)
+    assert tuple(activation_scale_per_expert.shape) == (
+        num_experts,
+        num_tokens,
+        ceil_div(hidden_size, quant_block_size),
+    )
+    assert tuple(n_tokens_per_expert.shape) == (num_experts,)
+    assert tuple(token_pos_in_expert.shape) == (num_tokens, topk)
+    for expert_id in range(num_experts):
+        assert n_tokens_per_expert[expert_id] == torch.sum(
+            token_to_expert_indices == expert_id
+        )
+    for token_id in range(num_tokens):
+        for topk_id in range(topk):
+            expert_id = token_to_expert_indices[token_id, topk_id]
+            if expert_id >= 0 and expert_id < num_experts:
+                pos_in_expert = token_pos_in_expert[token_id, topk_id]
+                assert torch.all(
+                    activation[token_id]
+                    == activation_per_expert[expert_id, pos_in_expert]
+                ), f"activation[{token_id}] != activation_per_expert[{expert_id}, {pos_in_expert}]"
+                assert torch.all(
+                    activation_scale[token_id]
+                    == activation_scale_per_expert[expert_id, pos_in_expert]
+                ), f"activation_scale[{token_id}] != activation_scale_per_expert[{expert_id}, {pos_in_expert}]"
+
+
 @pytest.mark.parametrize(
     "num_experts,experts_start_idx,experts_end_idx", [(256, 0, 256), (256, 64, 128)]
 )
@@ -282,15 +386,9 @@ def test_batched_routed_activation_indexed_to_concat_permuted(
     activation = torch.rand(
         (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
     )
-
-    if distribution == "imbalance":
-        token_to_expert_indices = torch.arange(
-            topk, dtype=torch.int32, device="cuda:0"
-        ).repeat(num_tokens, 1)
-    elif distribution == "uniform":
-        token_to_expert_indices = torch.randint(
-            0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda:0"
-        )
+    token_to_expert_indices = gen_token_to_expert_indices(
+        num_tokens, num_experts, topk, distribution
+    )
 
     concat_activation, token_comma_topk_to_concat_indices, n_tokens_per_expert = (
         batched_routed_activation_indexed_to_concat_permuted(

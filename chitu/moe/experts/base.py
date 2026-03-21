@@ -13,7 +13,7 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivationBlockfp8,
     IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
     IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
-    PerExpertDenseBatchedRoutedActivation,
+    PerExpertDenseBatchedRoutedActivationMinimal,
     ConcatPermutedBatchedRoutedActivationMinimal,
 )
 from chitu.native_layout import NativeLayoutTensor
@@ -182,7 +182,9 @@ def fused_experts_no_sum_wrapper(
                 or (torch.cuda.get_device_capability()[0] == 10 and round_scale_to_pow2)
             )
         ):
-            assert isinstance(hidden_states, PerExpertDenseBatchedRoutedActivation)
+            assert isinstance(
+                hidden_states, PerExpertDenseBatchedRoutedActivationMinimal
+            )
             return deepgemm_masked_fused_expert(
                 hidden_states,
                 w1=w1,
@@ -207,7 +209,9 @@ def fused_experts_no_sum_wrapper(
                 experts_start_idx=experts_start_idx,
             )
         elif w1.dtype == torch.bfloat16 and has_triton:
-            assert isinstance(hidden_states, PerExpertDenseBatchedRoutedActivation)
+            assert isinstance(
+                hidden_states, PerExpertDenseBatchedRoutedActivationMinimal
+            )
             return triton_batched_experts(hidden_states, w1=w1, w2=w2)
         else:
             raise NotImplementedError

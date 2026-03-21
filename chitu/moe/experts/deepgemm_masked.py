@@ -10,8 +10,11 @@ import torch
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
+    IndexedBatchedRoutedActivationBlockfp8,
     PerExpertDenseBatchedRoutedActivation,
+    PerExpertDenseBatchedRoutedActivationMinimal,
     PerExpertDenseBatchedRoutedActivationBlockfp8,
+    PerExpertDenseBatchedRoutedActivationBlockfp8Minimal,
 )
 from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
@@ -90,110 +93,45 @@ def _(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )
 
-    token_to_expert = hidden_states.token_to_expert_indices  # [B, topk]
+    if use_fp8_w8a8:
+        assert not isinstance(hidden_states, IndexedBatchedRoutedActivationBlockfp8)
+        assert len(block_shape) == 2
+        assert block_shape[0] == block_shape[1]
+        activation_fp8, activation_scale = blockfp8_act_quant(
+            hidden_states.activation,
+            block_size=block_shape[0],
+            round_scale_to_pow2=round_scale_to_pow2,
+        )
+        return deepgemm_masked_fused_expert(
+            IndexedBatchedRoutedActivationBlockfp8(
+                activation=activation_fp8,
+                activation_scale=activation_scale,
+                token_to_expert_indices=hidden_states.token_to_expert_indices,
+            ),
+            w1=w1,
+            w2=w2,
+            activation=activation,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_fp4_w4a8=use_fp4_w4a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            global_num_experts=global_num_experts,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_scale_2=w1_scale_2,
+            w2_scale_2=w2_scale_2,
+            w1_zp=w1_zp,
+            w2_zp=w2_zp,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_shape=block_shape,
+            round_scale_to_pow2=round_scale_to_pow2,
+            soft_fp8=soft_fp8,
+            experts_start_idx=experts_start_idx,
+        )
 
-    token_cnt_per_expert = torch.zeros(
-        n_experts,
-        device=token_to_expert.device,
-        dtype=torch.int32,
-    )
-    flat_expert = token_to_expert.view(-1)
-    ones = torch.ones_like(flat_expert, dtype=torch.int32)
-    token_cnt_per_expert.index_add_(0, flat_expert, ones)
-
-    B, H = hidden_states.activation.shape
-    topk = token_to_expert.shape[1]
-
-    max_n_tokens_per_expert = B * topk
-    activation_per_expert = hidden_states.activation.new_zeros(
-        (n_experts, max_n_tokens_per_expert, H)
-    )
-
-    # # Reference semantics (not used in graph):
-    # E = n_experts
-    # token_pos_in_expert = torch.empty(
-    #     (B, topk), dtype=torch.int32, device=hidden_states.activation.device
-    # )
-    # write_pos = torch.zeros(
-    #     E, dtype=torch.int32, device=hidden_states.activation.device
-    # )
-    # for token_id in range(B):
-    #     for k in range(topk):
-    #         expert_id = token_to_expert[token_id, k].item()
-    #         pos = write_pos[expert_id].item()
-    #         activation_per_expert[expert_id, pos] = hidden_states.activation[token_id]
-    #         token_pos_in_expert[token_id, k] = pos
-    #         write_pos[expert_id] += 1
-
-    T = B * topk
-    device = hidden_states.activation.device
-
-    flat_expert = token_to_expert.view(-1).to(torch.int64)
-    flat_token_ids = (
-        torch.arange(B, device=device, dtype=torch.int64)
-        .unsqueeze(1)
-        .expand(B, topk)
-        .reshape(-1)
-    )
-
-    sorted_expert, sort_idx = torch.sort(flat_expert)
-
-    diff = torch.ones_like(sorted_expert, dtype=torch.bool)
-    if T > 1:
-        diff[1:] = sorted_expert[1:] != sorted_expert[:-1]
-
-    pos_in_expert_sorted = torch.arange(
-        T, device=device, dtype=torch.int64
-    ) - torch.searchsorted(sorted_expert, sorted_expert, side="left")
-
-    unsort_idx = torch.empty_like(sort_idx)
-    unsort_idx[sort_idx] = torch.arange(T, device=device, dtype=torch.int64)
-    flat_token_pos_in_expert = pos_in_expert_sorted[unsort_idx]
-    token_pos_in_expert = flat_token_pos_in_expert.view(B, topk).to(torch.int32)
-
-    expert_idx = flat_expert
-    pos_idx = flat_token_pos_in_expert
-    token_idx = flat_token_ids
-
-    feat_idx = torch.arange(H, device=device, dtype=torch.int64)
-    expert_idx_b = expert_idx.unsqueeze(1).expand(T, H)
-    pos_idx_b = pos_idx.unsqueeze(1).expand(T, H)
-    feat_idx_b = feat_idx.unsqueeze(0).expand(T, H)
-
-    activation_per_expert.index_put_(
-        (expert_idx_b, pos_idx_b, feat_idx_b),
-        hidden_states.activation[token_idx],
-        accumulate=False,
-    )
-
-    densed_hidden_states = PerExpertDenseBatchedRoutedActivation(
-        activation_per_expert=activation_per_expert,
-        n_tokens_per_expert=token_cnt_per_expert,
-        expert_ids_are_local=hidden_states.expert_ids_are_local,
-    )
-
-    del (
-        flat_expert,
-        ones,
-        sorted_expert,
-        sort_idx,
-        diff,
-        pos_in_expert_sorted,
-        unsort_idx,
-        flat_token_pos_in_expert,
-        expert_idx,
-        pos_idx,
-        token_idx,
-        feat_idx,
-        expert_idx_b,
-        pos_idx_b,
-        feat_idx_b,
-        flat_token_ids,
-        hidden_states,
-    )
-
-    activation_per_expert = deepgemm_masked_fused_expert(
-        densed_hidden_states,
+    return deepgemm_masked_fused_expert(
+        PerExpertDenseBatchedRoutedActivation.convert_from(hidden_states),
         w1=w1,
         w2=w2,
         activation=activation,
@@ -214,18 +152,73 @@ def _(
         round_scale_to_pow2=round_scale_to_pow2,
         soft_fp8=soft_fp8,
         experts_start_idx=experts_start_idx,
-    ).activation_per_expert
-
-    return PerExpertDenseBatchedExpertResult(
-        activation_per_expert=activation_per_expert,
-        token_to_expert_indices=token_to_expert,
-        token_pos_in_expert=token_pos_in_expert,
     )
 
 
 @deepgemm_masked_fused_expert.register
 def _(
-    hidden_states: PerExpertDenseBatchedRoutedActivation,
+    hidden_states: IndexedBatchedRoutedActivationBlockfp8,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    activation: str = "silu",
+    use_fp8_w8a8: bool = False,
+    use_fp4_w4a8: bool = False,
+    use_int8_w8a16: bool = False,
+    use_int4_w4a16: bool = False,
+    global_num_experts: int = -1,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_scale_2: Optional[torch.Tensor] = None,
+    w2_scale_2: Optional[torch.Tensor] = None,
+    w1_zp: Optional[torch.Tensor] = None,
+    w2_zp: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
+    soft_fp8: bool = False,
+    experts_start_idx: int = 0,
+) -> PerExpertDenseBatchedExpertResult:
+    # first compute the n_tokens_per_expert (Tensor) based on token_to_expert_indices
+    if global_num_experts > 0:
+        n_experts = global_num_experts
+    else:
+        from chitu.global_vars import get_global_args
+
+        n_experts = get_global_args().infer.num_experts_slots
+
+    hidden_states = hidden_states.as_local_expert_ids(
+        experts_start_idx, experts_start_idx + w1.shape[0]
+    )
+
+    return deepgemm_masked_fused_expert(
+        PerExpertDenseBatchedRoutedActivationBlockfp8.convert_from(hidden_states),
+        w1=w1,
+        w2=w2,
+        activation=activation,
+        use_fp8_w8a8=use_fp8_w8a8,
+        use_fp4_w4a8=use_fp4_w4a8,
+        use_int8_w8a16=use_int8_w8a16,
+        use_int4_w4a16=use_int4_w4a16,
+        global_num_experts=global_num_experts,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_scale_2=w1_scale_2,
+        w2_scale_2=w2_scale_2,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_shape=block_shape,
+        round_scale_to_pow2=round_scale_to_pow2,
+        soft_fp8=soft_fp8,
+        experts_start_idx=experts_start_idx,
+    )
+
+
+@deepgemm_masked_fused_expert.register
+def _(
+    hidden_states: PerExpertDenseBatchedRoutedActivationMinimal,
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
@@ -260,7 +253,9 @@ def _(
     )
 
     if not use_fp8_w8a8:
-        assert isinstance(hidden_states, PerExpertDenseBatchedRoutedActivationBlockfp8)
+        assert isinstance(
+            hidden_states, PerExpertDenseBatchedRoutedActivationBlockfp8Minimal
+        )
         assert has_deep_gemm, "BF16 masked path requires deep_gemm backend"
 
         hidden_states_bf16 = hidden_states.activation_per_expert
@@ -296,64 +291,78 @@ def _(
             M,
         )
 
-        return PerExpertDenseBatchedExpertResultMinimal(intermediate_cache3)
-
-    if tuple(block_shape) != (128, 128):
-        raise NotImplementedError(
-            f"deep_gemm only supports 128x128 quantization block, but got {block_shape}"
-        )
-    if torch.cuda.get_device_capability()[0] == 10 and not round_scale_to_pow2:
-        raise NotImplementedError(
-            "deep_gemm does not support round_scale_to_pow2==False on sm_10x"
-        )
-    if torch.get_default_dtype() != torch.bfloat16:
-        raise NotImplementedError(
-            f"deep_gemm only supports bfloat16 activation output, but got {torch.get_default_dtype()}"
-        )
-
-    assert use_fp8_w8a8
-    if isinstance(hidden_states, PerExpertDenseBatchedRoutedActivationBlockfp8):
-        hidden_states_fp8 = hidden_states.activation_per_expert
-        a1_scale = hidden_states.activation_scale_per_expert
     else:
-        hidden_states_fp8, a1_scale = blockfp8_act_quant(
-            hidden_states.activation_per_expert,
+
+        if tuple(block_shape) != (128, 128):
+            raise NotImplementedError(
+                f"deep_gemm only supports 128x128 quantization block, but got {block_shape}"
+            )
+        if torch.cuda.get_device_capability()[0] == 10 and not round_scale_to_pow2:
+            raise NotImplementedError(
+                "deep_gemm does not support round_scale_to_pow2==False on sm_10x"
+            )
+        if torch.get_default_dtype() != torch.bfloat16:
+            raise NotImplementedError(
+                f"deep_gemm only supports bfloat16 activation output, but got {torch.get_default_dtype()}"
+            )
+
+        assert use_fp8_w8a8
+        if isinstance(
+            hidden_states, PerExpertDenseBatchedRoutedActivationBlockfp8Minimal
+        ):
+            hidden_states_fp8 = hidden_states.activation_per_expert
+            a1_scale = hidden_states.activation_scale_per_expert
+        else:
+            hidden_states_fp8, a1_scale = blockfp8_act_quant(
+                hidden_states.activation_per_expert,
+                block_size=block_shape[0],
+                round_scale_to_pow2=round_scale_to_pow2,
+            )
+
+        device = hidden_states_fp8.device
+        E, M, K = hidden_states_fp8.shape
+        E2, N, K2 = w1.shape
+        assert E == E2
+        assert K == K2
+
+        intermediate_cache1 = torch.empty(
+            (E, M, N), device=device, dtype=torch.bfloat16
+        )
+        deep_gemm.m_grouped_fp8_gemm_nt_masked(
+            (hidden_states_fp8, a1_scale),
+            (w1, w1_scale),
+            intermediate_cache1,
+            hidden_states.n_tokens_per_expert,
+            M,
+        )
+        del hidden_states_fp8
+        del a1_scale
+
+        qintermediate_cache2, a2q_scale = silu_and_mul_and_blockfp8_act_quant(
+            intermediate_cache1,
+            expert_n_tokens=hidden_states.n_tokens_per_expert,
             block_size=block_shape[0],
             round_scale_to_pow2=round_scale_to_pow2,
         )
+        del intermediate_cache1
 
-    device = hidden_states_fp8.device
-    E, M, K = hidden_states_fp8.shape
-    E2, N, K2 = w1.shape
-    assert E == E2
-    assert K == K2
+        intermediate_cache3 = torch.empty(
+            (E, M, K), device=device, dtype=torch.bfloat16
+        )
+        deep_gemm.m_grouped_fp8_gemm_nt_masked(
+            (qintermediate_cache2, a2q_scale),
+            (w2, w2_scale),
+            intermediate_cache3,
+            hidden_states.n_tokens_per_expert,
+            M,
+        )
 
-    intermediate_cache1 = torch.empty((E, M, N), device=device, dtype=torch.bfloat16)
-    deep_gemm.m_grouped_fp8_gemm_nt_masked(
-        (hidden_states_fp8, a1_scale),
-        (w1, w1_scale),
-        intermediate_cache1,
-        hidden_states.n_tokens_per_expert,
-        M,
-    )
-    del hidden_states_fp8
-    del a1_scale
-
-    qintermediate_cache2, a2q_scale = silu_and_mul_and_blockfp8_act_quant(
-        intermediate_cache1,
-        expert_n_tokens=hidden_states.n_tokens_per_expert,
-        block_size=block_shape[0],
-        round_scale_to_pow2=round_scale_to_pow2,
-    )
-    del intermediate_cache1
-
-    intermediate_cache3 = torch.empty((E, M, K), device=device, dtype=torch.bfloat16)
-    deep_gemm.m_grouped_fp8_gemm_nt_masked(
-        (qintermediate_cache2, a2q_scale),
-        (w2, w2_scale),
-        intermediate_cache3,
-        hidden_states.n_tokens_per_expert,
-        M,
-    )
-
-    return PerExpertDenseBatchedExpertResultMinimal(intermediate_cache3)
+    if isinstance(hidden_states, PerExpertDenseBatchedRoutedActivation):
+        # PerExpertDenseBatchedRoutedActivation is a subclass of PerExpertDenseBatchedRoutedActivationMinimal
+        return PerExpertDenseBatchedExpertResult(
+            intermediate_cache3,
+            token_to_expert_indices=hidden_states.token_to_expert_indices,
+            token_pos_in_expert=hidden_states.token_pos_in_expert,
+        )
+    else:
+        return PerExpertDenseBatchedExpertResultMinimal(intermediate_cache3)
