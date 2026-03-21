@@ -507,11 +507,7 @@ class PerExpertDenseBatchedRoutedActivation(
     @override
     @plum.dispatch
     def convert_from(
-        cls,
-        old: IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
-        *,
-        block_size: int,
-        num_experts: int,
+        cls, old: IndexedBatchedRoutedActivation, *, num_experts: int
     ) -> "PerExpertDenseBatchedRoutedActivation":
         (activation_per_expert, n_tokens_per_expert, token_pos_in_expert) = (
             batched_routed_activation_indexed_to_per_expert_dense(
@@ -547,11 +543,7 @@ class PerExpertDenseBatchedRoutedActivationBlockfp8(
     @override
     @plum.dispatch
     def convert_from(
-        cls,
-        old: IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
-        *,
-        block_size: int,
-        num_experts: int,
+        cls, old: IndexedBatchedRoutedActivationBlockfp8, *, num_experts: int
     ) -> "PerExpertDenseBatchedRoutedActivationBlockfp8":
         (
             activation_per_expert,

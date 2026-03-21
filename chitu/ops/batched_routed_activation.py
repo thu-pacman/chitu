@@ -445,7 +445,9 @@ def batched_routed_activation_indexed_to_per_expert_dense_blockfp8_ref(
         (num_experts, bs, hidden_dim), dtype=activation.dtype, device=activation.device
     )
     activation_scale_per_expert = torch.empty(
-        (num_experts, bs, scale_dim), dtype=activation.dtype, device=activation.device
+        (num_experts, bs, scale_dim),
+        dtype=activation_scale.dtype,
+        device=activation.device,
     )
     token_pos_in_expert = torch.empty(
         (bs, topk), dtype=torch.int32, device=activation.device

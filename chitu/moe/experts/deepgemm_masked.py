@@ -107,6 +107,7 @@ def _(
                 activation=activation_fp8,
                 activation_scale=activation_scale,
                 token_to_expert_indices=hidden_states.token_to_expert_indices,
+                expert_ids_are_local=True,
             ),
             w1=w1,
             w2=w2,
@@ -131,7 +132,9 @@ def _(
         )
 
     return deepgemm_masked_fused_expert(
-        PerExpertDenseBatchedRoutedActivation.convert_from(hidden_states),
+        PerExpertDenseBatchedRoutedActivation.convert_from(
+            hidden_states, num_experts=w1.shape[0]
+        ),
         w1=w1,
         w2=w2,
         activation=activation,
@@ -192,7 +195,9 @@ def _(
     )
 
     return deepgemm_masked_fused_expert(
-        PerExpertDenseBatchedRoutedActivationBlockfp8.convert_from(hidden_states),
+        PerExpertDenseBatchedRoutedActivationBlockfp8.convert_from(
+            hidden_states, num_experts=w1.shape[0]
+        ),
         w1=w1,
         w2=w2,
         activation=activation,

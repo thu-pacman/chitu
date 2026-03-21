@@ -278,6 +278,7 @@ def test_batched_routed_activation_indexed_to_per_expert_dense(
         )
     )
 
+    assert activation_per_expert.dtype == activation.dtype
     assert tuple(activation_per_expert.shape) == (num_experts, num_tokens, hidden_size)
     assert tuple(n_tokens_per_expert.shape) == (num_experts,)
     assert tuple(token_pos_in_expert.shape) == (num_tokens, topk)
@@ -333,6 +334,8 @@ def test_batched_routed_activation_indexed_to_per_expert_dense_blockfp8(
         impl=impl,
     )
 
+    assert activation_per_expert.dtype == activation.dtype
+    assert activation_scale_per_expert.dtype == activation_scale.dtype
     assert tuple(activation_per_expert.shape) == (num_experts, num_tokens, hidden_size)
     assert tuple(activation_scale_per_expert.shape) == (
         num_experts,
@@ -401,6 +404,7 @@ def test_batched_routed_activation_indexed_to_concat_permuted(
         )
     )
 
+    assert concat_activation.dtype == activation.dtype
     assert tuple(concat_activation.shape) == (num_tokens * topk, hidden_size)
     assert tuple(token_comma_topk_to_concat_indices.shape) == (num_tokens, topk)
     assert tuple(n_tokens_per_expert.shape) == (experts_end_idx - experts_start_idx,)
