@@ -20,6 +20,7 @@ from chitu.ops.moe_gate import moe_gate
 from chitu.ops.moe_sum import (
     moe_sum_per_token,
     moe_sum_expert_block_permuted,
+    moe_sum_per_expert_dense,
     moe_sum_expert_concat_permuted,
 )
 from chitu.ops.linear_attn import (

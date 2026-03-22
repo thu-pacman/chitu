@@ -362,8 +362,15 @@ def _(
             M,
         )
 
-    if isinstance(hidden_states, PerExpertDenseBatchedRoutedActivation):
-        # PerExpertDenseBatchedRoutedActivation is a subclass of PerExpertDenseBatchedRoutedActivationMinimal
+    if isinstance(
+        hidden_states,
+        (
+            PerExpertDenseBatchedRoutedActivation,
+            PerExpertDenseBatchedRoutedActivationBlockfp8,
+        ),
+    ):
+        # PerExpertDenseBatchedRoutedActivation and PerExpertDenseBatchedRoutedActivationBlockfp8
+        # are subclasses of PerExpertDenseBatchedRoutedActivationMinimal
         return PerExpertDenseBatchedExpertResult(
             intermediate_cache3,
             token_to_expert_indices=hidden_states.token_to_expert_indices,
