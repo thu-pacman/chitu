@@ -207,7 +207,7 @@ def _fwd_kernel_ep_scatter_1(
     expert_start_loc,
     m_indices,
     num_experts: tl.constexpr,
-    N_INDICES: tl.constexpr,
+    n_indices,  # varying according to gate decision
     BLOCK_E: tl.constexpr,
     BLOCK_EXPERT_NUM: tl.constexpr,
 ):
@@ -237,7 +237,7 @@ def _fwd_kernel_ep_scatter_1(
         cur_expert_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
         expert_id_to_write = cur_expert
     else:
-        cur_expert_token_num = N_INDICES - cur_expert_start
+        cur_expert_token_num = n_indices - cur_expert_start
         expert_id_to_write = -1
 
     m_indices_start_ptr = m_indices + cur_expert_start
@@ -270,6 +270,7 @@ def _fwd_kernel_ep_scatter_2(
     output_index_stride0,
     output_index_stride1,
     topk_num: tl.constexpr,
+    num_experts: tl.constexpr,
     HIDDEN_SIZE: tl.constexpr,
     HIDDEN_SIZE_PAD: tl.constexpr,
     SCALE_HIDDEN_SIZE: tl.constexpr,
@@ -296,7 +297,7 @@ def _fwd_kernel_ep_scatter_2(
 
         for topk_index in tl.range(0, topk_num, 1, num_stages=4):
             expert_id = tl.load(recv_topk + token_id * recv_topk_stride0 + topk_index)
-            if expert_id >= 0:
+            if expert_id >= 0 and expert_id < num_experts:
                 dest_token_index = tl.atomic_add(expert_start_loc + expert_id, 1)
                 tl.store(
                     output_index + token_id * output_index_stride0 + topk_index,
@@ -314,6 +315,10 @@ def _fwd_kernel_ep_scatter_2(
                     tl.store(
                         output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s
                     )
+            else:
+                tl.store(
+                    output_index + token_id * output_index_stride0 + topk_index, -1
+                )
 
 
 @torch.no_grad()
@@ -351,7 +356,7 @@ def ep_scatter(
         m_indices,
         num_experts=num_experts,
         num_warps=num_warps,
-        N_INDICES=m_indices.shape[0],
+        n_indices=m_indices.shape[0],
         BLOCK_E=BLOCK_E,
         BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
     )
@@ -379,6 +384,7 @@ def ep_scatter(
         output_index.stride(0),
         output_index.stride(1),
         topk_num=recv_topk.shape[1],
+        num_experts=num_experts,
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
         HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
@@ -513,7 +519,7 @@ def batched_routed_activation_indexed_to_expert_block_permuted_triton(
     block_to_expert_indices = torch.empty(
         n_tokens_padded, device=activation.device, dtype=torch.int32
     )
-    token_comma_topk_to_block_x_item_indices = token_to_expert_indices.clone()
+    token_comma_topk_to_block_x_item_indices = torch.empty_like(token_to_expert_indices)
     ep_scatter(
         activation,
         None,  # no activation_scale

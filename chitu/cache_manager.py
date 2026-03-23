@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Sequence, Optional, Callable, Iterable
+from typing import Any, Sequence, Optional, Callable, Iterable
 from typing_extensions import override
 from dataclasses import dataclass
 from logging import getLogger
@@ -636,6 +636,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         return self.mtp_seq_len_delta.delta_position_ids_tensor_device % self.block_size
 
     def _upd_gpu_block_table(self, req_ids: list[str]):
+        """load block talbe of cpu on gpu as static tensor"""
         block_lists = [list(self.block_table[req_id]) for req_id in req_ids]
         max_len = max(len(blocks) for blocks in block_lists)
         if get_global_args().infer.use_cuda_graph:
@@ -832,6 +833,183 @@ class PagedKVCacheManager(KVCacheManagerBase):
             assert 0 <= int(idx) < self.num_blocks, f"invalid page index: {idx}"
         self.block_table[req_id] = list(int(x) for x in page_indices)
         self.req_id_to_seq_len[req_id] = int(prefix_length)
+
+
+class MMPagedKVCacheManager(PagedKVCacheManager):
+    """Paged KV cache manager with multimodal chunk-consumption helpers.
+
+    This class is based on `PagedKVCacheManager` and adds the extra APIs for
+    Qwen3-VL & Qwen-3.5 multimodal cache flow.
+
+    The seq_multimodal_len_delta tracks the consumption progress of multimodal tokens in a batched manner.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.req_len: dict[str, dict[str, dict[str, int]]] = {}
+        self.request_metadata: dict[str, dict[str, Any]] = {}
+        self.req_id_to_multimodal_len: dict[str, int] = {}
+        self.seq_multimodal_len_delta = BatchedSeqLenDelta(
+            device=self.device,
+            max_batch_size=self.num_hot_req,
+            max_total_len=self.max_total_len,
+            max_total_delta_len=self.max_total_delta_len,
+            cache_prefix_lens_tensor_device=True,
+            cache_position_ids_tensor_device=True,
+            cache_seq_ids_tensor_device=True,
+            cache_delta_position_ids_tensor_device=True,
+            cache_delta_seq_ids_tensor_device=True,
+        )
+
+    def register_tensor_for_consumption(
+        self,
+        req_id: str,
+        tensor_key: str,
+        total_tokens: int,
+    ) -> None:
+        if req_id not in self.req_len:
+            self.req_len[req_id] = {}
+        self.req_len[req_id][tensor_key] = {
+            "total": int(total_tokens),
+        }
+
+    def prepare_multimodal_cache_prefill(
+        self, req_ids: list[str], delta_seq_len: list[int]
+    ):
+        self.curr_req_ids = req_ids
+        tensor_key = "vision_embeds"
+
+        prev_seq_len = BatchedSeqLen(
+            [self.req_id_to_multimodal_len.get(req_id, 0) for req_id in req_ids],
+            device=self.device,
+            cache_prefix_lens_tensor_device=False,
+            cache_position_ids_tensor_device=False,
+            cache_seq_ids_tensor_device=False,
+        )
+        next_seq_len = BatchedSeqLen(
+            [
+                min(
+                    self.req_id_to_multimodal_len.get(req_id, 0) + d,
+                    self.req_len.get(req_id, {}).get(tensor_key, {}).get("total", 0),
+                )
+                for req_id, d in zip(req_ids, delta_seq_len)
+            ],
+            device=self.device,
+            cache_prefix_lens_tensor_device=False,
+            cache_position_ids_tensor_device=False,
+            cache_seq_ids_tensor_device=False,
+        )
+        self.seq_multimodal_len_delta.copy_from(prev_seq_len, next_seq_len)
+
+        for req_id, seq_len in zip(req_ids, next_seq_len.lens_list):
+            self.req_id_to_multimodal_len[req_id] = seq_len
+
+    def get_consumption_progress(self, req_id: str, tensor_key: str) -> int:
+        info = self.req_len.get(req_id, {}).get(tensor_key)
+        if info is None:
+            return 0
+        return int(info["total"])
+
+    def prepare_cache_for_pre_layers_prefill(
+        self,
+        req_ids: list[str],
+        chunk_sizes: list[int],
+    ):
+        """Prepare for tracking the consumption progress of multimodal tokens."""
+        self.prepare_multimodal_cache_prefill(req_ids, chunk_sizes)
+        self._upd_gpu_block_table(req_ids)
+
+    def batched_consume_next_chunk(
+        self,
+        req_ids: list[str],
+        tensor_keys: list[str],
+        auto_free: bool = False,
+    ) -> tuple[list[list[torch.Tensor]], list[bool]]:
+
+        delta_pos = self.seq_multimodal_len_delta.delta_position_ids_tensor_device
+        delta_seq = self.seq_multimodal_len_delta.delta_seq_ids_tensor_device
+        gpu_block_table = self.gpu_block_table.get()
+
+        local_layer_id = self.layer_id_map.to_local(0)
+        kv_data_list = []
+        for tensor_key in tensor_keys:
+            kv_data = self.paged_kv_cache[tensor_key][local_layer_id]
+            kv_data_list.append(kv_data)
+
+        delta_lens = self.seq_multimodal_len_delta._delta.lens_list
+
+        if delta_pos.numel() > 0:
+            block_indices = delta_pos // self.block_size
+            offset_indices = delta_pos % self.block_size
+
+            page_ids = gpu_block_table[delta_seq.long(), block_indices.long()]
+            flat_indices = page_ids.long() * self.block_size + offset_indices.long()
+
+            gathered_list = [
+                kv_data.view(-1, *kv_data.shape[2:])[flat_indices]
+                for kv_data in kv_data_list
+            ]
+            results = [torch.split(gathered, delta_lens) for gathered in gathered_list]
+        else:
+            results = []
+            for tensor_key in tensor_keys:
+                per_token_shape = tuple(self.shape_per_token_dict[tensor_key])
+                dtype = self.dtype_dict[tensor_key]
+                results.append(
+                    [
+                        torch.empty(
+                            0, *per_token_shape, dtype=dtype, device=self.device
+                        )
+                        for _ in req_ids
+                    ]
+                )
+
+        complete_flags = []
+        for i, req_id in enumerate(req_ids):
+            req_info = self.req_len.get(req_id, {}).get(tensor_keys[0], {})
+            total = req_info.get("total", 0)
+            consumed = self.req_id_to_multimodal_len[req_id]
+
+            is_complete = consumed >= total
+            complete_flags.append(is_complete)
+
+            if is_complete and auto_free:
+                for tensor_key in tensor_keys:
+                    self.req_len.get(req_id, {}).pop(tensor_key, None)
+
+        return results, complete_flags
+
+    def allocate_block_for_cache(self, req_ids: list[str], delta_seq_len: list[int]):
+        """Allocate blocks for the requests to write into cache."""
+        super().prepare_cache_prefill(req_ids, delta_seq_len)
+
+    @override
+    def prepare_cache_prefill(self, req_ids: list[str], delta_seq_len: list[int]):
+        pass
+
+    @override
+    def prepare_cache_decode(self, req_ids: list[str]):
+        pass
+
+    @override
+    def finalize_cache_all_decode(self, req_id: str):
+        self.timers("finalize_cache_all_decode").start()
+        try:
+            if req_id not in self.req_id_to_seq_len:
+                return
+            if req_id not in self.req_id_to_multimodal_len:
+                return
+            if req_id in self.block_table:
+                self.free_req_cache_blocks(req_id)
+            self.req_len.pop(req_id, None)
+            self.request_metadata.pop(req_id, None)
+            KVCacheManagerBase.finalize_cache_all_decode(self, req_id)
+            self.finalize_cache_all_decode_multimodal(req_id)
+        finally:
+            self.timers("finalize_cache_all_decode").stop()
+
+    def finalize_cache_all_decode_multimodal(self, req_id: str):
+        del self.req_id_to_multimodal_len[req_id]
 
 
 class SingletonPagedKVCacheManager(PagedKVCacheManager):

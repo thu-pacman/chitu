@@ -14,6 +14,8 @@ if has_triton:
         blockfp8_index_score_dense_dsv32_triton,
         blockfp8_index_score_ragged_q_dense_k_dsv32_triton,
         blockfp8_index_score_ragged_q_paged_k_dsv32_triton,
+        softfp8_blockfp8_index_score_ragged_q_dense_k_dsv32_triton,
+        softfp8_blockfp8_index_score_ragged_q_paged_k_dsv32_triton,
     )
 
 
@@ -83,6 +85,7 @@ def blockfp8_index_score_ragged_q_dense_k_dsv32(
     k_s: torch.Tensor,  # [b, n, d/block_size=1], fp32
     seq_len_delta: BatchedSeqLenDelta,
     causal: bool,
+    softfp8: bool = False,
     impl: str = "auto",
 ) -> torch.Tensor:  # [bm, n]
     if impl == "auto":
@@ -96,6 +99,10 @@ def blockfp8_index_score_ragged_q_dense_k_dsv32(
             q, q_s, k, k_s, seq_len_delta, causal=causal
         )
     elif impl == "triton":
+        if softfp8:
+            return softfp8_blockfp8_index_score_ragged_q_dense_k_dsv32_triton(
+                q, q_s, k, k_s, seq_len_delta, causal=causal
+            )
         return blockfp8_index_score_ragged_q_dense_k_dsv32_triton(
             q, q_s, k, k_s, seq_len_delta, causal=causal
         )
@@ -152,6 +159,7 @@ def blockfp8_index_score_ragged_q_paged_k_dsv32(
     k_page_table: torch.Tensor,  # [b, n_pages_per_seq]
     static_max_n: int,
     causal: bool,
+    softfp8: bool = False,
     impl: str = "auto",
 ) -> torch.Tensor:  # [bm, n]
     if impl == "auto":
@@ -172,6 +180,17 @@ def blockfp8_index_score_ragged_q_paged_k_dsv32(
             causal=causal,
         )
     elif impl == "triton":
+        if softfp8:
+            return softfp8_blockfp8_index_score_ragged_q_paged_k_dsv32_triton(
+                q,
+                q_s,
+                k,
+                k_s,
+                seq_len_delta,
+                k_page_table,
+                static_max_n=static_max_n,
+                causal=causal,
+            )
         return blockfp8_index_score_ragged_q_paged_k_dsv32_triton(
             q,
             q_s,

@@ -94,8 +94,8 @@ class DeepEPBuffer:
             num_rdma_bytes,
             low_latency_mode=deepep_mode in ["auto", "deepep-ll"],
             num_qps_per_rank=num_qps_per_rank,
-            # TODO can be false when unneeded
-            allow_mnnvl=True,
+            allow_mnnvl=True,  # TODO: can be false when unneeded
+            explicitly_destroy=True,  # If not, our test may fail to re-init the buffer for another case
         )
         return cls._buffer
 
@@ -113,7 +113,9 @@ class DeepEPBuffer:
         `get_and_cache_deepep_buffer` for the buffer being destroyed.
         """
 
-        cls._buffer = None
+        if cls._buffer is not None:
+            cls._buffer.destroy()
+            cls._buffer = None
 
     @classmethod
     def clean_buffer(cls):

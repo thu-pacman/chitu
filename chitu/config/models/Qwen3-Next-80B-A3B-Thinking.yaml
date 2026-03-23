@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - Qwen3-Next-80B-A3B-Instruct
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: Qwen3-Next-80B-A3B-Thinking
+source: "https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking" # Just for displaying. No automatic download.
+reasoning_type: forced

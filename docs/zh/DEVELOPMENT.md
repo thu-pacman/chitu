@@ -106,10 +106,18 @@ git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 pip install -r requirements-build.txt
 ```
 
-如果你选择的可选依赖中包含 `deep_ep`，还需要运行:
+如果你选择的可选依赖中包含 `deep_ep`，还需要运行以下之一:
+
+若为 CUDA 12：
 
 ```bash
 pip install -r requirements-build-deep_ep-cu12.txt
+```
+
+若为 CUDA 13：
+
+```bash
+pip install -r requirements-build-deep_ep-cu13.txt
 ```
 
 #### 3. 安装 PyTorch
@@ -561,7 +569,9 @@ torchrun --nnodes 1 \
     infer.use_cuda_graph=True
 ```
 
-### 使用 OpenAI 兼容接口测试（Chat Completions）
+### OpenAI 兼容接口（Chat Completions）
+
+测试 OpenAI 兼容接口：
 
 ```bash
 curl localhost:21002/v1/chat/completions \
@@ -572,24 +582,6 @@ curl localhost:21002/v1/chat/completions \
         "role": "system",
         "content": "You are a helpful assistant."
       },
-      {
-        "role": "user",
-        "content": "What is machine learning?"
-      }
-    ]
-  }'
-```
-
-### 使用 Anthropic 兼容接口测试（Messages API）
-
-```bash
-curl localhost:21002/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: example_key" \
-  -d '{
-    "model": "DeepSeek-R1",
-    "max_completion_tokens": 128,
-    "messages": [
       {
         "role": "user",
         "content": "What is machine learning?"
@@ -612,12 +604,70 @@ curl localhost:21002/v1/messages \
 | `stream`                | `bool`           | 若为 `true` 以流模式响应 HTTP 请求，在 Python 中可通过 `requests.post(stream=True)` 使用。 |
 | `stop_with_eos`         | `bool`           | 若为 `false`，即使回答结束，也继续输出，直到输出 token 数达到 `max_completion_tokens` 限制。可用于进行稳定的速度测试。 |
 | `chat_template_kwargs`  | `dict[str, Any]` | Chat template 的额外参数。目前支持的有： `{"enable_thinking": false}` 可禁用 GLM-4.5 模型的思考模式。 |
+| `tools`                 | `list[dict]`     | 工具调用的工具定义，请参考 https://developers.openai.com/api/docs/guides/function-calling/ |
+| `tool_choice`           | `str or dict`    | 工具调用的输出数量要求，支持 none, auto, required, {"type": "function", "name": "工具名"} |
 
 额外的 HTTP 请求头：
 
-| 名称                         | 含义                                                         |
-| ---------------------------- | ------------------------------------------------------------ |
-| `Authorization`              | 格式：`Bearer <api_key>`。若 `<api_key>` 在 `serve.api_keys` 启动设置项中，该请求将被优先处理。详见服务启动时的 `serve.api_keys` 配置。 |
+| 名称            | 含义                                                         |
+| --------------- | ------------------------------------------------------------ |
+| `Authorization` | 格式：`Bearer <api_key>`。若 `<api_key>` 在 `serve.api_keys` 启动设置项中，该请求将被优先处理。详见服务启动时的 `serve.api_keys` 配置。 |
+
+### Anthropic 兼容接口（Messages API）
+
+测试 Anthropic 兼容接口：
+
+```bash
+curl localhost:21002/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: example_key" \
+  -d '{
+    "model": "DeepSeek-R1",
+    "max_completion_tokens": 128,
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is machine learning?"
+      }
+    ]
+  }'
+```
+
+### Grafana 监控面板
+
+赤兔内置了 Grafana 监控面板，可在启动服务时自动启动 Grafana 服务器，提供实时的性能指标可视化（包括吞吐量、GPU 显存使用、KV cache 使用率等）。
+
+在启动服务时，通过以下参数启用 Grafana：
+
+| 参数 | 默认值 | 说明 |
+| :--- | :----- | :--- |
+| `metrics.grafana_enabled` | `false` | 是否在 Rank 0 上自动启动 Grafana 服务器 |
+| `metrics.grafana_host` | `localhost` | Grafana 服务绑定地址。设为 `0.0.0.0` 可允许外部访问 |
+| `metrics.grafana_port` | `9095` | Grafana HTTP 端口 |
+
+启动成功后，通过浏览器访问 `http://<host>:<port>` 即可查看预配置的监控面板。
+
+> 注：Grafana 仅在 Rank 0 进程上启动。使用 Docker 部署时，需要将 Grafana 端口映射到宿主机（如 `-p 9095:9095`）。
+
+示例：
+
+```bash
+torchrun --nnodes 1 \
+    --nproc_per_node 8 \
+    --master_port=22525 \
+    -m chitu \
+    models=DeepSeek-R1 \
+    models.ckpt_dir=/data/DeepSeek-R1 \
+    infer.tp_size=8 \
+    infer.cache_type=paged \
+    infer.attn_type=flash_mla \
+    infer.mla_absorb=absorb-without-precomp \
+    infer.max_reqs=8 \
+    infer.max_seq_len=4096 \
+    metrics.grafana_enabled=true \
+    metrics.grafana_host=0.0.0.0 \
+    metrics.grafana_port=9095
+```
 
 ## 性能测试
 

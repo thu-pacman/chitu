@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 defaults:
-  - quant_config: blockfp8
+  - quant_config: blockfp8_ue8m0_scale_without_o_proj
   - _self_ # Config in this file overrides configs in defaults
 
 name: DeepSeek-V3.2-Exp
@@ -40,3 +40,4 @@ re_token_id: 151649
 main_weight_dtype: float8_e4m3fn
 rms_norm_dtype: float32
 tool_parser: DeepSeekV31ToolParser
+reasoning_type: switchable

@@ -8,7 +8,7 @@ import ctypes
 import functools
 
 from chitu.quantization.registry import QuantizationRegistry
-from chitu.quantization.base import QuantizedMoeExpertsBase
+from chitu.quantization.base import QuantizedMoeExpertsUnmerged
 from chitu.global_vars import get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.hybrid_device import CPUParameter
@@ -23,8 +23,10 @@ from chitu.moe.batched_routed_activation import (
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 
 
-@QuantizationRegistry.register_moe_experts("q4km", backend_type="cpuinfer")
-class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
+@QuantizationRegistry.register_moe_experts(
+    "q4km", backend_type="cpuinfer", merge_gate_up=False
+)
+class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsUnmerged):
     """
     Mixture-of-Experts (MoE) module.
 
@@ -53,18 +55,11 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
         n_activated_experts: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
-        merge_gate_up: bool,
         *,
         ############################################
         # Parameters specific to this quantization
         ggml_type: str,
     ):
-        """
-        Initializes the MoE module.
-
-        Args:
-            args (ModelArgs): Model arguments containing MoE parameters.
-        """
         super().__init__(
             dim,
             moe_inter_dim,
@@ -75,7 +70,6 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsBase):
             n_activated_experts,
             fuse_shared_experts,
             checkpoint_prefix,
-            merge_gate_up,
         )
 
         self.max_batch_size = get_global_args().infer.max_reqs

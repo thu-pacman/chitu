@@ -48,6 +48,7 @@ def deepgemm_contiguous_fused_expert(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
@@ -74,6 +75,7 @@ def _(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
@@ -103,6 +105,7 @@ def _(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
+        round_scale_to_pow2=round_scale_to_pow2,
         soft_fp8=soft_fp8,
         experts_start_idx=experts_start_idx,
     )
@@ -128,6 +131,7 @@ def _(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> ExpertBlockPermutedBatchedExpertResult:
@@ -198,6 +202,7 @@ def _(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
@@ -229,6 +234,7 @@ def _(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
+        round_scale_to_pow2=round_scale_to_pow2,
         soft_fp8=soft_fp8,
         experts_start_idx=experts_start_idx,
     )
@@ -254,9 +260,23 @@ def _(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> ExpertBlockPermutedBatchedExpertResult:
+    if tuple(block_shape) != (128, 128):
+        raise NotImplementedError(
+            f"deep_gemm only supports 128x128 quantization block, but got {block_shape}"
+        )
+    if torch.cuda.get_device_capability()[0] == 10 and not round_scale_to_pow2:
+        raise NotImplementedError(
+            "deep_gemm does not support round_scale_to_pow2==False on sm_10x"
+        )
+    if torch.get_default_dtype() != torch.bfloat16:
+        raise NotImplementedError(
+            f"deep_gemm only supports bfloat16 activation output, but got {torch.get_default_dtype()}"
+        )
+
     hidden_states = hidden_states.as_local_expert_ids(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )
@@ -305,7 +325,11 @@ def _(
     intermediate_cache2 = silu_and_mul(intermediate_cache1.view(-1, N), impl="triton")
     del intermediate_cache1
 
-    qintermediate_cache2, a2q_scale = blockfp8_act_quant(x=intermediate_cache2)
+    qintermediate_cache2, a2q_scale = blockfp8_act_quant(
+        x=intermediate_cache2,
+        block_size=block_shape[0],
+        round_scale_to_pow2=round_scale_to_pow2,
+    )
     del intermediate_cache2
 
     intermediate_cache3 = torch.empty(
@@ -345,6 +369,7 @@ def _(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
@@ -353,13 +378,17 @@ def _(
     assert not use_int8_w8a16
     assert not use_int4_w4a16
 
+    assert len(block_shape) == 2
+    assert block_shape[0] == block_shape[1]
+    quant_block_size = block_shape[0]
     pad_block_size = 128
-    quant_block_size = 128
     n_experts = w1.shape[0]
 
     if use_fp8_w8a8:
         hidden_states_fp8, scale = blockfp8_act_quant(
-            hidden_states.activation, block_size=quant_block_size
+            hidden_states.activation,
+            block_size=quant_block_size,
+            round_scale_to_pow2=round_scale_to_pow2,
         )
         hidden_states = IndexedBatchedRoutedActivationBlockfp8(
             activation=hidden_states_fp8,
@@ -398,6 +427,7 @@ def _(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
+        round_scale_to_pow2=round_scale_to_pow2,
         soft_fp8=soft_fp8,
         experts_start_idx=experts_start_idx,
     )

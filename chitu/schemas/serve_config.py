@@ -74,6 +74,7 @@ class InferConfig(InferConfigLegacy):
     use_cuda_graph: bool | str = MISSING
     npu_fusion_fp4: bool = MISSING
     num_blocks: int = MISSING
+    max_multimodal_blocks: int = -1
     bind_process_to_cpu: str = MISSING
     bind_thread_to_cpu: str = MISSING
     memory_utilization: float = MISSING
@@ -93,6 +94,7 @@ class InferConfig(InferConfigLegacy):
 
     moe: MoEConfig = MISSING
     mtp_size: int = MISSING
+    language_model_only: bool = MISSING
 
 
 @dataclass
@@ -217,6 +219,9 @@ class MetricsConfig:
     prometheus_data_dir: str = MISSING
     prometheus_scrape_interval: int = MISSING
     log_interval: int = MISSING
+    grafana_enabled: bool = MISSING
+    grafana_host: str = MISSING
+    grafana_port: int = MISSING
 
 
 @dataclass

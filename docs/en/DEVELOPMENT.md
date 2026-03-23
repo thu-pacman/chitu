@@ -106,10 +106,18 @@ git clone --recursive https://github.com/thu-pacman/chitu && cd chitu
 pip install -r requirements-build.txt
 ```
 
-If you include `deep_ep` in optional dependencies, please also run:
+If you include `deep_ep` in optional dependencies, please also run one of the followings:
+
+For CUDA 12:
 
 ```bash
 pip install -r requirements-build-deep_ep-cu12.txt
+```
+
+For CUDA 13:
+
+```bash
+pip install -r requirements-build-deep_ep-cu13.txt
 ```
 
 #### 3. Install PyTorch
@@ -560,7 +568,9 @@ torchrun --nnodes 1 \
     infer.use_cuda_graph=True
 ```
 
-### Test the service via OpenAI-compatible API (Chat Completions)
+### OpenAI-compatible API (Chat Completions)
+
+Test the service via OpenAI-compatible API:
 
 ```bash
 curl localhost:21002/v1/chat/completions \
@@ -571,24 +581,6 @@ curl localhost:21002/v1/chat/completions \
         "role": "system",
         "content": "You are a helpful assistant."
       },
-      {
-        "role": "user",
-        "content": "What is machine learning?"
-      }
-    ]
-  }'
-```
-
-### Test the service via Anthropic-compatible API (Messages)
-
-```bash
-curl localhost:21002/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: example_key" \
-  -d '{
-    "model": "DeepSeek-R1",
-    "max_completion_tokens": 128,
-    "messages": [
       {
         "role": "user",
         "content": "What is machine learning?"
@@ -611,12 +603,70 @@ Supported optional JSON arguments are:
 | `stream`                | `bool`           | If true, make the HTTP response streaming, which can be used with `requests.post(stream=True)` in Python. |
 | `stop_with_eos`         | `bool`           | If false, keep generating outputs until the number of output tokens reaches `max_completion_tokens`, even if the answer has already ended, useful for a stable speed test. |
 | `chat_template_kwargs`  | `dict[str, Any]` | Additional argument for the chat template. The only currently supported argument is: `{"enable_thinking": false}` for disabling thinking mode for GLM-4.5 models. |
+| `tools`                 | `list[dict]`     | Tool definitions of tool calling. Please refer https://developers.openai.com/api/docs/guides/function-calling/ |
+| `tool_choice`           | `str or dict`    | Required number of output tool calling. Supports none, auto, required, {"type": "function", "name": "$TOOL_NAME"} |
 
 Additional HTTP headers:
 
-| Name                         | Description                                                  |
-| ---------------------------- | ------------------------------------------------------------ |
-| `Authorization`              | Format: `Bearer <api_key>`. If `<api_key>` is in `serve.api_keys`, the request will be prioritized. See the `serve.api_keys` configuration when starting the service for details. |
+| Name            | Description                                                  |
+| --------------- | ------------------------------------------------------------ |
+| `Authorization` | Format: `Bearer <api_key>`. If `<api_key>` is in `serve.api_keys`, the request will be prioritized. See the `serve.api_keys` configuration when starting the service for details. |
+
+### Anthropic-compatible API (Messages)
+
+Test the service via Anthropic-compatible API:
+
+```bash
+curl localhost:21002/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: example_key" \
+  -d '{
+    "model": "DeepSeek-R1",
+    "max_completion_tokens": 128,
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is machine learning?"
+      }
+    ]
+  }'
+```
+
+### Grafana Dashboard
+
+Chitu includes a built-in Grafana dashboard that can be auto-started alongside the inference service, providing real-time visualization of performance metrics (throughput, GPU memory usage, KV cache utilization, etc.).
+
+To enable Grafana, add the following arguments when starting a service:
+
+| Parameter | Default | Description |
+| :--- | :------ | :--- |
+| `metrics.grafana_enabled` | `false` | Whether to auto-start a Grafana server on Rank 0 |
+| `metrics.grafana_host` | `localhost` | Grafana server bind address. Set to `0.0.0.0` for external access |
+| `metrics.grafana_port` | `9095` | Grafana HTTP port |
+
+Once started, access the pre-configured dashboard at `http://<host>:<port>` in your browser.
+
+> Note: Grafana is only started on the Rank 0 process. When deploying with Docker, map the Grafana port to the host (e.g. `-p 9095:9095`).
+
+Example:
+
+```bash
+torchrun --nnodes 1 \
+    --nproc_per_node 8 \
+    --master_port=22525 \
+    -m chitu \
+    models=DeepSeek-R1 \
+    models.ckpt_dir=/data/DeepSeek-R1 \
+    infer.tp_size=8 \
+    infer.cache_type=paged \
+    infer.attn_type=flash_mla \
+    infer.mla_absorb=absorb-without-precomp \
+    infer.max_reqs=8 \
+    infer.max_seq_len=4096 \
+    metrics.grafana_enabled=true \
+    metrics.grafana_host=0.0.0.0 \
+    metrics.grafana_port=9095
+```
 
 ## Performance Benchmarking
 

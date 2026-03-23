@@ -20,4 +20,6 @@ from chitu.ops.triton_ops.quant.blockfp8.index_score import (
     blockfp8_index_score_dense_dsv32_triton,
     blockfp8_index_score_ragged_q_dense_k_dsv32_triton,
     blockfp8_index_score_ragged_q_paged_k_dsv32_triton,
+    softfp8_blockfp8_index_score_ragged_q_dense_k_dsv32_triton,
+    softfp8_blockfp8_index_score_ragged_q_paged_k_dsv32_triton,
 )

@@ -21,7 +21,10 @@ from chitu.global_vars import get_global_args, SlotHandle
 from chitu.utils import ceil_div
 from chitu.backend import Backend
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
-from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
+from chitu.metrics.prometheus_collector import (
+    PrometheusMetricsCollector,
+    inc_completed_requests,
+)
 from chitu.distributed.pd_disaggregation.pd_log_utils import pd_verbose_enabled
 
 logger = getLogger(__name__)
@@ -658,6 +661,7 @@ class Scheduler:
                 TaskPool.remove(task_id)
 
         if removed_task_ids:
+            inc_completed_requests("worker", len(removed_task_ids))
             logger.debug(f"[scheduler.update] removed_tasks={removed_task_ids}")
             logger.info(
                 f"Completed {len(removed_task_ids)} tasks",

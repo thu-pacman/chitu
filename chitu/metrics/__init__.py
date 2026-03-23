@@ -4,6 +4,7 @@
 
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 from chitu.metrics.prometheus_manager import PrometheusServerManager
+from chitu.metrics.grafana_manager import GrafanaManager
 from chitu.metrics.metrics_monitor import (
     start_prometheus_server_and_metrics_monitor,
     stop_metrics_monitor,

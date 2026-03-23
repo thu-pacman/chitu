@@ -408,10 +408,14 @@ class Transformer(nn.Module):
         return module
 
     def load_state_dict_by_prefix(
-        self, state_dict: dict[str, Any], prefix: str, skip_preprocess: bool = False
+        self,
+        state_dict: dict[str, Any],
+        prefix: str,
+        skip_preprocess: bool = False,
+        replace: bool = True,
     ) -> nn.Module:
         state_dict = self.preprocess_state_dict_parallel(
-            state_dict, skip_preprocess=skip_preprocess
+            state_dict, skip_preprocess=skip_preprocess, replace=replace
         )
         module_state_dict = {}
         for key, value in state_dict.items():
@@ -420,7 +424,11 @@ class Transformer(nn.Module):
         state_dict = module_state_dict
         module = self._get_module_by_prefix(prefix)
         assert module is not None, f"Module {prefix} not found"
-        module.load_state_dict(state_dict, strict=True, assign=True)
+        module.load_state_dict(
+            state_dict,
+            strict=True,
+            assign=True,  # Replacing "meta" tensors in the model with tensors from the checkpoint
+        )
         return module
 
     def _chunk_checkpoint_for_pipeline_parallel(
@@ -1483,10 +1491,7 @@ class Transformer(nn.Module):
                     kwargs_max_nelem={},
                     output_max_nelem_callback=lambda key, n: 1,
                     before_replay_callback=None,
-                    # empty decode 仅用于 EP sync，没有真实 token
-                    # 在 empty decode 上capture graph 会生成 zero-size buffer，
-                    # 后续非空 replay 会失败，因此关闭graphed，经过测试发现这部分对性能影响很小
-                    enable=False,
+                    enable=current_cuda_graph_enabled,
                 )
                 def do_empty_decode():
                     return self.empty_decode()
@@ -1500,10 +1505,7 @@ class Transformer(nn.Module):
                         kwargs_max_nelem={},
                         output_max_nelem_callback=lambda key, n: 1,
                         before_replay_callback=None,
-                        # empty MTP decode 仅用于 EP sync，没有真实 token
-                        # 在 empty decode 上捕获 CUDA graph 会生成 zero-size buffer，
-                        # 后续非空 replay 会失败，因此保持 non-graphed。
-                        enable=False,
+                        enable=current_cuda_graph_enabled,
                     )
                     def do_empty_decode_mtp():
                         return self.empty_mtp_decode()
@@ -1773,6 +1775,23 @@ class ParallelMoeBlock(nn.Module):
 
         shared_y = None
         x_in_use_simultenously = False
+        experts_impl = self.moe_impl.get_experts_impl()
+        if self.moe_impl.ep_size > 1:
+            routed_x_old = routed_x
+            routed_x, weights, dispatch_stream = (
+                self.moe_impl.enter_moe_dispatch_streaming(
+                    routed_x,
+                    weights,
+                    may_fuse_quant=get_quant_from_checkpoint_prefix(
+                        f"{self.checkpoint_prefix}.experts"
+                    ),
+                    may_fuse_quant_kwargs=get_quant_kwargs_from_checkpoint_prefix(
+                        f"{self.checkpoint_prefix}.experts"
+                    ),
+                    layer_id=self.layer_id,
+                )
+            )
+
         if self.shared_experts is not None:
             ctx = nullcontext()
             if self.shared_experts_stream is not None:
@@ -1782,26 +1801,12 @@ class ParallelMoeBlock(nn.Module):
             with ctx:
                 shared_y = self.shared_experts(x)
 
-        experts_impl = "auto"
         if self.moe_impl.ep_size > 1:
-            experts_impl = self.moe_impl.get_experts_impl()
-            routed_x_old = routed_x
-            routed_x, weights = self.moe_impl.enter_moe(
-                routed_x,
-                weights,
-                may_fuse_quant=get_quant_from_checkpoint_prefix(
-                    f"{self.checkpoint_prefix}.experts"
-                ),
-                may_fuse_quant_kwargs=get_quant_kwargs_from_checkpoint_prefix(
-                    f"{self.checkpoint_prefix}.experts"
-                ),
-                layer_id=self.layer_id,
-            )
+            if dispatch_stream is not None:
+                torch.cuda.current_stream().wait_stream(dispatch_stream)
             x_in_use_simultenously = x_in_use_simultenously and (
                 routed_x_old is routed_x
             )
-        elif self.moe_impl.ep_size == 1:
-            experts_impl = self.moe_impl.get_experts_impl()
 
         if (
             self.moe_impl.ep_size > 1
@@ -1828,14 +1833,19 @@ class ParallelMoeBlock(nn.Module):
                 and self.prefill_memory_tolerance < self.moe_impl.ep_size
                 and get_global_args().infer.prefill_chunk_size is not None
             ):
-                max_n_tokens_per_chunk = int(
+                max_n_tokens_x_topk_per_chunk = int(
                     get_global_args().infer.prefill_chunk_size
+                    * self.gate.topk
                     / self.moe_impl.ep_size
                     * self.prefill_memory_tolerance
                 )
                 try:
                     chunks = routed_x.get_chunks_no_larger_than(
-                        weights, max_n_tokens_per_chunk
+                        weights,
+                        max_n_tokens_x_topk_per_chunk,
+                        self.experts.global_n_experts,
+                        self.experts.experts_start_idx,
+                        self.experts.experts_end_idx,
                     )
                 except Exception as e:
                     logger.warning(

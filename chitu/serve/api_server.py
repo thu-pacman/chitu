@@ -19,22 +19,24 @@ import uvicorn
 import resource
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 
-from chitu.async_response import AsyncResponse
 from chitu.backend import Backend
-from chitu.chitu_main import chitu_init, init_logger
 from chitu.dp_request_router import get_request_router
 from chitu.dp_token_router import get_token_router
 from chitu.global_vars import get_global_args, set_global_args
-from chitu.models.registry import ModelType
-from chitu.task import RouterRequest, Task, TaskLoad, TaskPool, UserRequest
+from chitu.task import RouterRequest, Task, TaskPool, UserRequest
 from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
-from chitu.serve.common import set_min_batch_size
+from chitu.serve.common import (
+    set_min_batch_size,
+    get_priority_from_api_key,
+    submit_request,
+    build_chat_template_kwargs,
+)
 from chitu.serve.router import start_dp_components
-from chitu.tool_call import ToolChoice, ChoiceToolCall
+from chitu.tool_call import ToolChoice, ChoiceToolCall, adjust_message_for_tool_calls
 from chitu.serve.anthropic_api import create_router as create_anthropic_router
 
 logger = getLogger(__name__)
@@ -87,23 +89,90 @@ class ChatRequest(BaseModel):
     enable_thinking: bool = True
     extra_body: Mapping[str, Any] = {}
 
+    @model_validator(mode="after")
+    def validate_eos_setting(self):
+        if (
+            self.stop_with_eos is not None
+            and self.ignore_eos is not None
+            and self.stop_with_eos != (not self.ignore_eos)
+        ):
+            raise ValueError(
+                "stop_with_eos and ignore_eos cannot be conflict. Please use only one of them."
+            )
+        if self.stop_with_eos is None and self.ignore_eos is None:
+            self.stop_with_eos = True
+        if self.stop_with_eos is None:
+            self.stop_with_eos = not self.ignore_eos
+        return self
+
+    @model_validator(mode="after")
+    def validate_output_tokens(self):
+        # Handle deprecated fields or compatibility fields
+        if (
+            self.max_tokens is not None
+            and self.max_completion_tokens is not None
+            and self.max_tokens != self.max_completion_tokens
+        ):
+            raise ValueError(
+                "max_tokens and max_completion_tokens cannot be conflict. Please use only one of them."
+            )
+        if self.max_tokens is None and self.max_completion_tokens is not None:
+            self.max_tokens = self.max_completion_tokens
+        if self.max_completion_tokens is None and self.max_tokens is not None:
+            self.max_completion_tokens = self.max_tokens
+        return self
+
 
 class TokenizeRequest(BaseModel):
-    prompt: str
+    prompt: str | None = None
+    messages: list[Message] | None = None
+    enable_thinking: bool = True
+
+    @model_validator(mode="after")
+    def validate_input(self):
+        if self.prompt is not None and self.messages is not None:
+            raise ValueError("prompt and messages cannot be provided together")
+        if self.prompt is None and self.messages is None:
+            raise ValueError("Either prompt or messages must be provided")
+        if self.messages is not None and len(self.messages) == 0:
+            raise ValueError("messages must not be empty")
+        return self
 
 
 class DetokenizeRequest(BaseModel):
     tokens: list[int]
 
 
-def get_priority_from_api_key(api_key: str) -> int:
+def build_user_request(req: ChatRequest, priority: int = 1) -> UserRequest:
+    # enable_thinking / max_new_tokens / chat_template_kwargs
     args = get_global_args()
-    for item in args.serve.api_keys:
-        if item.key == api_key:
-            return item.priority
-    if args.serve.validate_api_key == True:
-        raise HTTPException(status_code=503, detail="Unauthorized api key")
-    return 1
+    id = gen_req_id()
+    max_new_tokens = req.max_tokens or args.request.max_new_tokens
+    enable_thinking = req.extra_body.get(
+        "enable_thinking",
+        req.chat_template_kwargs.get("enable_thinking", req.enable_thinking),
+    )
+    # Reconstruct chat_template_kwargs to prevent injection attacks
+    chat_template_kwargs = build_chat_template_kwargs(enable_thinking)
+    return UserRequest(
+        [msg.model_dump() for msg in req.messages],
+        id,
+        tools=req.tools,
+        tool_choice=req.tool_choice,
+        parallel_tool_calls=req.parallel_tool_calls,
+        logprobs=req.logprobs,
+        top_logprobs=req.top_logprobs,
+        max_new_tokens=max_new_tokens,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        top_k=req.top_k,
+        frequency_penalty=req.frequency_penalty,
+        chat_template_kwargs=chat_template_kwargs,
+        enable_reasoning=enable_thinking,
+        save_trace_dir=args.debug.save_trace_dir,
+        priority=priority,
+        stop_with_eos=req.stop_with_eos,
+    )
 
 
 # Include Anthropic-compatible API routes (keep api_server.py thin)
@@ -170,90 +239,15 @@ async def create_chat_completion(
             # Keep consistency with FastAPI default behavior for body validation errors
             raise HTTPException(status_code=422, detail=e.errors())
 
-        # Handle deprecated fields or compatibility fields
-        if (
-            req.max_tokens is not None
-            and req.max_completion_tokens is not None
-            and req.max_tokens != req.max_completion_tokens
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="max_tokens and max_completion_tokens cannot be conflict. Please use only one of them.",
-            )
-        if req.max_tokens is None and req.max_completion_tokens is not None:
-            req.max_tokens = req.max_completion_tokens
-        if req.max_completion_tokens is None and req.max_tokens is not None:
-            req.max_completion_tokens = req.max_tokens
-
-        if (
-            req.stop_with_eos is not None
-            and req.ignore_eos is not None
-            and req.stop_with_eos != (not req.ignore_eos)
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="stop_with_eos and ignore_eos cannot be conflict. Please use only one of them.",
-            )
-        if req.stop_with_eos is None and req.ignore_eos is not None:
-            req.stop_with_eos = not req.ignore_eos
-        if req.ignore_eos is None and req.stop_with_eos is not None:
-            req.ignore_eos = not req.stop_with_eos
-        if req.stop_with_eos is None:
-            req.stop_with_eos = True
-        if req.ignore_eos is None:
-            req.ignore_eos = False
-
         # Check if DP mode is enabled and use appropriate processing
         if get_global_args().dp_config.enabled:
             logger.debug(f"[HTTP] Using DP mode for request: {req.conversation_id}")
             return await process_dp_chat_completion(req)
 
-        req_id = gen_req_id()
-        max_new_tokens = req.max_tokens or args.request.max_new_tokens
         set_min_batch_size(req.min_batch_size)
 
-        enable_thinking = req.extra_body.get(
-            "enable_thinking",
-            req.chat_template_kwargs.get("enable_thinking", req.enable_thinking),
-        )
-
-        # Reconstruct chat_template_kwargs to prevent injection attacks
-        chat_template_kwargs = {}
-        if "DeepSeek-V3.1" in get_global_args().models.name:
-            # DeepSeek-V3.1 tokenizer uses `thinking` instead of `enable_thinking`
-            chat_template_kwargs["thinking"] = enable_thinking
-        else:
-            chat_template_kwargs["enable_thinking"] = enable_thinking
-
-        user_req = UserRequest(
-            [msg.model_dump() for msg in req.messages],
-            req_id,
-            tools=req.tools,
-            tool_choice=req.tool_choice,
-            parallel_tool_calls=req.parallel_tool_calls,
-            logprobs=req.logprobs,
-            top_logprobs=req.top_logprobs,
-            max_new_tokens=max_new_tokens,
-            temperature=req.temperature,
-            top_p=req.top_p,
-            top_k=req.top_k,
-            frequency_penalty=req.frequency_penalty,
-            chat_template_kwargs=chat_template_kwargs,
-            enable_reasoning=enable_thinking,
-            save_trace_dir=args.debug.save_trace_dir,
-        )
-        response = AsyncResponse(user_req)
-        infermode = "diffusionllm" if args.models.type == ModelType.LLADA else "autoregressive"
-        task = Task(
-            user_req.request_id,
-            user_req,
-            stop_with_eos=req.stop_with_eos,
-            priority=task_priority,
-            infermode=infermode,
-        )
-        logger.info(f"infermode: {infermode}")
-        logger.info(f"enqueue task: {task.task_id}, task content: {user_req.message}, task type: {task.task_type}")
-        TaskPool.enqueue(task)
+        user_req = build_user_request(req, task_priority)
+        response = submit_request(user_req)
         if req.stream:
             return StreamingResponse(
                 response.stream_generator(
@@ -290,6 +284,8 @@ async def init_chitu_service():
     if server_status:
         return {"message": "Service has been started."}
     args = get_global_args()
+    from chitu.chitu_main import chitu_init
+
     chitu_init(args)
     server_status = True
     return {"message": "Service initial done."}
@@ -315,9 +311,13 @@ async def get_chitu_status():
 @app.post("/load_status")
 async def get_chitu_load_status():
     args = get_global_args()
+    load_score = sum(
+        getattr(task, "prefix_tokens_len", 0) for task in TaskPool.pool.values()
+    )
+    handle_reqs = len(TaskPool.pool) + len(getattr(TaskPool, "pending_queue", []))
     return {
-        "load_score": f"{TaskLoad.get_load()}",
-        "handle_reqs": f"{len(TaskLoad.user_req)}",
+        "load_score": f"{load_score}",
+        "handle_reqs": f"{handle_reqs}",
         "max_reqs": f"{args.infer.max_reqs}",
     }
 
@@ -352,7 +352,38 @@ async def tokenize(raw_request: Request):
             status_code=503, detail="Tokenizer not available on this endpoint"
         )
 
-    tokens = Backend.tokenizer.model.encode(request.prompt, add_special_tokens=False)
+    if request.messages is not None:
+        if Backend.formatter is None:
+            raise HTTPException(
+                status_code=503, detail="Chat formatter not available on this endpoint"
+            )
+        enable_thinking = request.enable_thinking
+        tools = []
+        tool_choice: ToolChoice = "auto"
+        with suppress(ValidationError):
+            chat_request = ChatRequest.model_validate(data)
+            enable_thinking = chat_request.extra_body.get(
+                "enable_thinking",
+                chat_request.chat_template_kwargs.get(
+                    "enable_thinking", chat_request.enable_thinking
+                ),
+            )
+            tools = chat_request.tools
+            tool_choice = chat_request.tool_choice
+        chat_template_kwargs = build_chat_template_kwargs(enable_thinking)
+        if tools and tool_choice != "none":
+            chat_template_kwargs["tools"] = tools
+        message = [message.model_dump() for message in request.messages]
+        if hasattr(Backend, "tool_parser"):
+            message = adjust_message_for_tool_calls(Backend.tool_parser, message)
+        tokens = Backend.formatter.encode_dialog_prompt(
+            message,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        if isinstance(tokens, tuple):
+            tokens = tokens[0]
+    else:
+        tokens = Backend.tokenizer.encode(request.prompt, bos=False, eos=False)
 
     return {"tokens": tokens}
 

@@ -23,7 +23,6 @@ from chitu.task import (
     PackedTasksBase,
     SerializedPackedTasksPayloadType,
     BatchResult,
-    TaskLoad,
     TaskType,
     TaskPool,
     TaskCollector,
@@ -1020,6 +1019,7 @@ class Executor:
                 for mgr in Backend.cache_managers.values():
                     mgr.finalize_cache_all_decode(rid)
             PrometheusMetricsCollector.update_kvcache_usage()
+            PrometheusMetricsCollector.update_task_counts()
             if self.rank > 0:
                 for task_id in tasks.task_ids:
                     if task_id in TaskPool.pool:
@@ -1135,6 +1135,7 @@ class Executor:
             for mgr in Backend.cache_managers.values():
                 mgr.prepare_cache_prefill(tasks.req_ids, [len(t) for t in tasks.tokens])
             PrometheusMetricsCollector.update_kvcache_usage()
+            PrometheusMetricsCollector.update_task_counts()
 
             num_tokens = tasks.num_tokens
 
@@ -2063,5 +2064,3 @@ class Executor:
                 )
             else:
                 self.get_token_sink().emit_batch(batch_result.tasks, next_token_list)
-
-        TaskLoad.increase(batch_result.num_tasks)

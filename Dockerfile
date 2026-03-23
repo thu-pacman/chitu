@@ -1,5 +1,5 @@
 # `ARG` used in a `FROM` must be defined on the top, and may be redefined below
-ARG base_image='pytorch/pytorch:2.8.0-cuda12.9-cudnn9-devel'
+ARG base_image='pytorch/pytorch:2.9.1-cuda13.0-cudnn9-devel'
 ARG is_at_least_blackwell='false'
 
 #####################################
@@ -17,11 +17,11 @@ ARG enable_test='false'
 ARG pypi_mirror=''
 
 COPY ./script/is_at_least_blackwell.sh /tmp/is_at_least_blackwell.sh
-RUN if /tmp/is_at_least_blackwell.sh ${torch_cuda_arch_list} && [ "${is_at_least_blackwell}" != "true" ]; then \
+RUN if /tmp/is_at_least_blackwell.sh "${torch_cuda_arch_list}" && [ "${is_at_least_blackwell}" != "true" ]; then \
     echo "--build-arg is_at_least_blackwell must be 'true' when you have >=10.0 arch in --build-arg torch_cuda_arch_list"; \
     exit 1; \
 fi
-RUN if ! /tmp/is_at_least_blackwell.sh ${torch_cuda_arch_list} && [ "${is_at_least_blackwell}" != "false" ]; then \
+RUN if ! /tmp/is_at_least_blackwell.sh "${torch_cuda_arch_list}" && [ "${is_at_least_blackwell}" != "false" ]; then \
     echo "--build-arg is_at_least_blackwell must be 'false' when you don't have >=10.0 arch in --build-arg torch_cuda_arch_list"; \
     exit 1; \
 fi
@@ -63,11 +63,16 @@ ENV MAX_JOBS=$CHITU_SETUP_JOBS
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 
-ENV TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}
+ENV TORCH_CUDA_ARCH_LIST="${torch_cuda_arch_list}"
 
 RUN apt update -y && apt install -y \
     git gcc-11 g++-11 libnuma-dev build-essential cmake ninja-build \
     libibverbs1 ibverbs-providers libibverbs-dev rdma-core curl
+
+# Backward compatibily of include path for software developed for CUDA 12
+RUN if python3 -c "import torch; print(int(torch.version.cuda.split('.')[0]) >= 13)" | grep -q "True"; then \
+    ln -s /usr/local/cuda/include/cccl/cuda /usr/local/cuda/include/cuda; \
+fi
 
 # Download prometheus
 RUN --mount=type=secret,id=tos_id \
@@ -110,6 +115,49 @@ RUN --mount=type=secret,id=tos_id \
     rm -rf /workspace/prometheus && \
     prometheus --version
 
+# Install Grafana
+RUN --mount=type=secret,id=tos_id \
+    --mount=type=secret,id=tos_key \
+    mkdir -p /workspace/grafana && \
+    case "$(uname -m)" in \
+        x86_64|amd64) \
+            CDN_URL="https://dl.grafana.com/grafana/release/12.4.1/grafana_12.4.1_22846628243_linux_amd64.tar.gz" && \
+            TOS_URL="tos://out-deliver/grafana_12.4.1_22846628243_linux_amd64.tar.gz" && \
+            TOOL_URL="https://tos-tools.tos-cn-beijing.volces.com/linux/tosutil" \
+            ;; \
+        aarch64|arm64) \
+            CDN_URL="https://dl.grafana.com/grafana/release/12.4.1/grafana_12.4.1_22846628243_linux_arm64.tar.gz" && \
+            TOS_URL="tos://out-deliver/grafana_12.4.1_22846628243_linux_arm64.tar.gz" && \
+            TOOL_URL="https://m645b3e1bb36e-mrap.mrap.accesspoint.tos-global.volces.com/linux/arm64/tosutil" \
+            ;; \
+        *) \
+            echo "Unsupported arch: $(uname -m)" && exit 1 \
+            ;; \
+    esac && \
+    if [ -s /run/secrets/tos_id ] && [ -s /run/secrets/tos_key ]; then \
+        echo "Download Grafana from TOS" && \
+        tos_id=$(cat /run/secrets/tos_id) && \
+        tos_key=$(cat /run/secrets/tos_key) && \
+        mkdir -p /tmp && curl "${TOOL_URL}" --output /tmp/tosutil && chmod a+x /tmp/tosutil && \
+        /tmp/tosutil cp -u -r -p=8 -j=8 -threshold=104857600 -k "${tos_key}" -i "${tos_id}" \
+            -e tos-cn-beijing.volces.com -re out-deliver.tos-cn-beijing.volces.com "${TOS_URL}" /workspace && \
+        tar -xzf /workspace/grafana_*.tar.gz --strip-components=1 -C /workspace/grafana && \
+        rm -rf /workspace/grafana_*.tar.gz && \
+        rm -rf /tmp/tosutil; \
+    else \
+        echo "Download Grafana from CDN" && \
+        curl -L --retry 3 --retry-delay 5 -o /workspace/grafana.tar.gz "${CDN_URL}" && \
+        tar -xzf /workspace/grafana.tar.gz --strip-components=1 -C /workspace/grafana && \
+        rm -rf /workspace/grafana.tar.gz; \
+    fi && \
+    cp /workspace/grafana/bin/grafana-server /usr/local/bin/ && \
+    cp /workspace/grafana/bin/grafana /usr/local/bin/ && \
+    mkdir -p /usr/share/grafana && \
+    cp -r /workspace/grafana/public /usr/share/grafana/public && \
+    cp -r /workspace/grafana/conf /usr/share/grafana/conf && \
+    rm -rf /workspace/grafana && \
+    grafana-server -v
+
 # Upgrade pip and set mirror. The mirror should be set AFTER upgrading pip
 RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "${pypi_mirror}" != "" ]; then \
@@ -130,16 +178,39 @@ RUN if [ "${enable_test}" = "true" ]; then \
     pip install pytest lark-oapi matplotlib; \
 fi
 
+# Forcefully remove torch's constraint on nvidia-nvshmem-cu.*, because it is
+# too strict, and conflict with our requirements.
+RUN METADATA_FILE="$( \
+            find /opt/conda/lib/python3.11/site-packages -maxdepth 1 -name "torch-*.dist-info" -type d | head -1 \
+        )/METADATA"; \
+    if [ -f "${METADATA_FILE}" ]; then \
+        echo "Removing nvidia-nvshmem-cu.* from torch's constraint file: ${METADATA_FILE}"; \
+        sed -i '/nvidia-nvshmem-cu.*/d' "${METADATA_FILE}"; \
+    fi
+
 # Always install build time dependencies. Some dependencies may fail to build
 # if some build time dependencies are missing.
 COPY ./requirements-build.txt /tmp/requirements-build.txt
 COPY ./requirements-build-deep_ep-cu12.txt /tmp/requirements-build-deep_ep-cu12.txt
+COPY ./requirements-build-deep_ep-cu13.txt /tmp/requirements-build-deep_ep-cu13.txt
+RUN if [[ "${optional_deps}" == *"deep_ep"* ]]; then \
+    if python3 -c "import torch; print(int(torch.version.cuda.split('.')[0]) == 13)" | grep -q "True"; then \
+        cat /tmp/requirements-build-deep_ep-cu13.txt >> /tmp/requirements-build.txt; \
+    elif python3 -c "import torch; print(int(torch.version.cuda.split('.')[0]) == 12)" | grep -q "True"; then \
+        cat /tmp/requirements-build-deep_ep-cu12.txt >> /tmp/requirements-build.txt; \
+    else \
+        echo "Unsupported CUDA version"; \
+        exit 1; \
+    fi \
+fi
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r /tmp/requirements-build.txt \
-        -c <(pip list --format freeze | grep -v "setuptools")
-RUN if [[ "${optional_deps}" == *"deep_ep"* ]]; then \
-    pip install -r /tmp/requirements-build-deep_ep-cu12.txt \
-        -c <(pip list --format freeze | grep -v "setuptools"); \
+        -c <(pip list --format freeze | grep -v -e "setuptools" -e "nvidia-nvshmem-cu.*")
+
+# Triton's built-in assembler may be too old for blackwell. Use the system assembler
+# as a workaround. See https://github.com/triton-lang/triton/issues/8539.
+RUN if [ "${is_at_least_blackwell}" = "true" ]; then \
+    ln -s --force `which ptxas` /opt/conda/lib/python3.11/site-packages/triton/backends/nvidia/bin/ptxas; \
 fi
 
 
@@ -169,12 +240,36 @@ FROM basic_deps AS dependency_installer
 WORKDIR /workspace/chitu
 COPY --from=dependency_resolver /tmp/requirements.txt /tmp/requirements.txt
 
+COPY ./third_party ./third_party
+COPY ./csrc/cpuinfer ./csrc/cpuinfer
+
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
-RUN --mount=type=bind,source=./third_party,target=./third_party,readwrite \
-    --mount=type=bind,source=./csrc/cpuinfer,target=./csrc/cpuinfer,readwrite \
-    pip install --no-build-isolation -r /tmp/requirements.txt \
+#依赖 pytorch 的库应该一律都需要 --no-build-isolation。因为：
+# 1. pytorch 是个构建时依赖。
+# 2. pytorch 一般都要使用和具体卡以及其他基础软件（如 cuda）版本相关的版本。
+# 3. 如果没有 --no-build-isolation ，pip 会在构建时用单独的环境重新下载所有构建时依赖，此时无法指定上述版本。
+RUN pip install --no-build-isolation -r /tmp/requirements.txt \
         -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "pytest")
+
+RUN set -eux; \
+    VER="$(python -c "import importlib.metadata as m; \
+print(next((d.version for d in m.distributions() if (d.metadata.get('Name') or '').lower()=='flashinfer-python'), ''))")"; \
+    if [ -n "${VER}" ]; then \
+        if python3 -c "import torch; print(torch.version.cuda == '12.9')" | grep -q "True"; then \
+            CUDA_TAG="cu129"; \
+        elif python3 -c "import torch; print(torch.version.cuda == '13.0')" | grep -q "True"; then \
+            CUDA_TAG="cu130"; \
+        else \
+            echo "Unrecoginized CUDA versoin $(python3 -c 'import torch; print(torch.version.cuda)')" for flashinfer_jit_cache; \
+            CUDA_TAG=""; \
+        fi; \
+        if [ -n "${CUDA_TAG}" ]; then \
+            pip install flashinfer-jit-cache=="${VER}+${CUDA_TAG}" --index-url "https://flashinfer.ai/whl/${CUDA_TAG}"; \
+        fi; \
+    else \
+        echo "flashinfer-python not installed; skip installing flashinfer_jit_cache"; \
+    fi
 
 #####################################
 # Wheel build Stage
@@ -199,20 +294,22 @@ RUN rm -rf /workspace/chitu/*
 #####################################
 # Build Stage
 # 
-# This stage builds chitu.
-FROM dependency_installer AS build
+FROM basic_deps AS build
 
+WORKDIR /workspace/chitu
+COPY --from=dependency_installer /opt/conda /opt/conda
 COPY --from=wheel_builder /tmp/ /tmp/
 
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
 RUN pip install /tmp/*.whl \
-    -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "numpy" -e "transformers" -e "pytest")
+    -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "numpy" -e "transformers" -e "pytest" -e 'typing-extensions' -e 'typing_extensions')
 
 RUN rm -rf /tmp/*
 COPY ./test ./test
 COPY ./script ./script
 COPY ./benchmarks ./benchmarks
+COPY ./chitu/metrics/grafana ./grafana
 
 # These are optimization flags for NCCL, but according to our tests, they only make things
 # worse, so we don't use them.

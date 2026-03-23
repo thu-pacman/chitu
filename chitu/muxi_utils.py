@@ -4,7 +4,6 @@
 
 from typing import Optional
 from typing_extensions import override
-import plum
 import torch
 import functools
 
@@ -12,12 +11,14 @@ from chitu.utils import try_import_opt_dep
 from chitu.quantization import (
     NormalLinear,
     Blockfp8Linear,
-    NormalMoeExperts,
-    Blockfp8MoeExperts,
+    NormalMoeExpertsMerged,
+    Blockfp8MoeExpertsMerged,
 )
 from chitu.native_layout import (
     enable_native_layout_weight,
-    NativeLayoutTensor,
+    MuxiNativeLayoutActivation,
+    MuxiNativeLayoutWeight,
+    MuxiNativeLayoutGroupWeight,
     Vector,
     BatchPaddedActivation,
 )
@@ -30,50 +31,6 @@ from chitu.moe.batched_routed_activation import (
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
 )
-tbsgemm, has_tbsgemm = try_import_opt_dep("tbsgemm", "muxi_w8a8_kernels")
-
-
-class MuxiNativeLayoutActivation(NativeLayoutTensor):
-    @classmethod
-    @override
-    @plum.dispatch
-    def convert_from(
-        cls, tensor: BatchPaddedActivation
-    ) -> "MuxiNativeLayoutActivation":
-        assert tensor.multiple_of == 16
-        return cls(
-            tensor.plain_shape, muxi_layout_kernels.layoutB(tensor.layout_tensor)
-        )
-
-
-class MuxiNativeLayoutWeight(NativeLayoutTensor):
-    @classmethod
-    @override
-    @plum.dispatch
-    def convert_from(cls, tensor: torch.Tensor) -> "MuxiNativeLayoutWeight":
-        m, k = tensor.shape
-        assert m % 128 == 0
-        assert k % 128 == 0
-        return cls(
-            tensor.shape,
-            tensor.reshape(m // 16, 16, k // 8, 8).permute(0, 2, 1, 3).contiguous(),
-        )
-
-
-class MuxiNativeLayoutGroupWeight(NativeLayoutTensor):
-    @classmethod
-    @override
-    @plum.dispatch
-    def convert_from(cls, tensor: torch.Tensor) -> "MuxiNativeLayoutGroupWeight":
-        e, m, k = tensor.shape
-        assert m % 128 == 0
-        assert k % 128 == 0
-        return cls(
-            tensor.shape,
-            tensor.reshape(e, m // 16, 16, k // 8, 8)
-            .permute(0, 1, 3, 2, 4)
-            .contiguous(),
-        )
 
 
 @single_dispatch_lazy_tensor
@@ -494,7 +451,7 @@ class Blockfp8LinearMuxiLayoutContigY(
 class NormalMoeExpertsMuxiLayout(
     enable_native_layout_weight("gate_up_proj_weight", MuxiNativeLayoutGroupWeight),
     enable_native_layout_weight("down_proj_weight", MuxiNativeLayoutGroupWeight),
-    NormalMoeExperts,
+    NormalMoeExpertsMerged,
 ):
     def __init__(
         self,
@@ -509,7 +466,6 @@ class NormalMoeExpertsMuxiLayout(
         n_activated_experts: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
-        merge_gate_up: bool,
         *,
         ############################################
         # Parameters specific to this quantization
@@ -518,10 +474,6 @@ class NormalMoeExpertsMuxiLayout(
         if fuse_shared_experts:
             raise NotImplementedError(
                 "Fused shared experts is not supported for muxi_layout_kernels"
-            )
-        if not merge_gate_up:
-            raise NotImplementedError(
-                "muxi_layout_kernels for fused MoE requires merge_gate_up=True"
             )
         super().__init__(
             dim=dim,
@@ -533,7 +485,6 @@ class NormalMoeExpertsMuxiLayout(
             n_activated_experts=n_activated_experts,
             fuse_shared_experts=fuse_shared_experts,
             checkpoint_prefix=checkpoint_prefix,
-            merge_gate_up=merge_gate_up,
         )
 
     @override
@@ -558,7 +509,7 @@ class NormalMoeExpertsMuxiLayout(
 class Blockfp8MoeExpertsMuxiLayout(
     enable_native_layout_weight("gate_up_proj_weight", MuxiNativeLayoutGroupWeight),
     enable_native_layout_weight("down_proj_weight", MuxiNativeLayoutGroupWeight),
-    Blockfp8MoeExperts,
+    Blockfp8MoeExpertsMerged,
 ):
     def __init__(
         self,
@@ -573,17 +524,12 @@ class Blockfp8MoeExpertsMuxiLayout(
         n_activated_experts: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
-        merge_gate_up: bool,
         ############################################
         # No parameters specific to this quantization
     ):
         if fuse_shared_experts:
             raise NotImplementedError(
                 "Fused shared experts is not supported for muxi_layout_kernels"
-            )
-        if not merge_gate_up:
-            raise NotImplementedError(
-                "muxi_layout_kernels for fused MoE requires merge_gate_up=True"
             )
         super().__init__(
             dim=dim,
@@ -595,7 +541,6 @@ class Blockfp8MoeExpertsMuxiLayout(
             n_activated_experts=n_activated_experts,
             fuse_shared_experts=fuse_shared_experts,
             checkpoint_prefix=checkpoint_prefix,
-            merge_gate_up=merge_gate_up,
         )
 
     def forward(

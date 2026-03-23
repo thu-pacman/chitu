@@ -8,10 +8,11 @@ import re
 import torch
 
 from chitu.global_vars import get_global_args
-from chitu.models.registry import ModelType
 from chitu.quantization.base import (
     QuantizedLinearBase,
     QuantizedMoeExpertsBase,
+    QuantizedMoeExpertsUnmerged,
+    QuantizedMoeExpertsMerged,
     QuantizedAbsorbGemmBase,
 )
 from chitu.quantization.utils import (
@@ -32,12 +33,15 @@ class QuantizationRegistry:
 
     # NOTE: The inner dict's key can either be a `str` typed quantization method
     # nane, or `None` for no quantization (a.k.a. "normal" quantization)
-    _linear_registry: dict[str, dict[str | None, Type[QuantizedLinearBase]]] = {}
-    _moe_experts_registry: dict[
-        str, dict[str | None, Type[QuantizedMoeExpertsBase]]
+    _linear_registry: dict[str, dict[str | None, list[Type[QuantizedLinearBase]]]] = {}
+    _moe_experts_unmerged_registry: dict[
+        str, dict[str | None, list[Type[QuantizedMoeExpertsUnmerged]]]
+    ] = {}
+    _moe_experts_merged_registry: dict[
+        str, dict[str | None, list[Type[QuantizedMoeExpertsMerged]]]
     ] = {}
     _absorb_gemm_registry: dict[
-        str, dict[str | None, Type[QuantizedAbsorbGemmBase]]
+        str, dict[str | None, list[Type[QuantizedAbsorbGemmBase]]]
     ] = {}
 
     _allowed_quant_for_merge_gate_up: list = [
@@ -83,6 +87,8 @@ class QuantizationRegistry:
         # - chitu/models/model_deepseek_v3.py
         # - chitu/quantization/registry.py
         # - chitu/ops/mla_prologue.py
+        from chitu.models.registry import ModelType
+
         args = get_global_args()
         if (
             has_torch_npu
@@ -114,8 +120,10 @@ class QuantizationRegistry:
         registry: dict[str, dict[str | None, Type]]
         if class_type == "linear":
             registry = cls._linear_registry
-        elif class_type == "moe_experts":
-            registry = cls._moe_experts_registry
+        elif class_type == "moe_experts_unmerged":
+            registry = cls._moe_experts_unmerged_registry
+        elif class_type == "moe_experts_merged":
+            registry = cls._moe_experts_merged_registry
         elif class_type == "absorb_gemm":
             registry = cls._absorb_gemm_registry
         else:
@@ -124,27 +132,21 @@ class QuantizationRegistry:
         if backend_type not in registry:
             raise ValueError(f"Unknown backend impls: {backend_type}")
         backend_impls = registry[backend_type]
-
         if method not in backend_impls:
             raise ValueError(
-                f"Unknown quantization method in `method`: {method}, `backend`: {backend_type}"
+                f"Unknown quantization: `method` {method}, `backend` {backend_type}"
             )
+        backend_impl = backend_impls[method]
 
         priority = -1
         impl: Type = None
-        for impl_, when_, priority_ in backend_impls[method]:
-            if when_() and priority_ > priority:
+        for impl_, when_, priority_ in backend_impl:
+            if when_(quant_kwargs.get(method, {})) and priority_ > priority:
                 impl, priority = impl_, priority_
         if impl is None:
             raise ValueError(
                 f"No available implementation for quantization method: {method}, backend: {backend_type}"
             )
-
-        if method in quant_kwargs:
-            if method not in backend_impls:
-                raise ValueError(
-                    f"Unknown quantization method in `quant_kwargs`: {method}"
-                )
 
         if method in quant_kwargs:
 
@@ -185,6 +187,7 @@ class QuantizationRegistry:
         cls,
         method: Optional[str],
         *,
+        merge_gate_up: bool,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
     ) -> Type[QuantizedMoeExpertsBase]:
         """
@@ -194,12 +197,13 @@ class QuantizationRegistry:
             method: Quantization method name, or None for no quantization
             quant_kwargs: Nested mapping for additional arguments for specific
                 quantization methods. E.g., `{"quant_method_x": {"arg1": value1, ...}}`
+            merge_gate_up: Whether to merge gate and up projection.
         Returns:
             The quantized moe class, or None if method is None or not found
         """
 
         return cls._get_quantized_class(
-            "moe_experts",
+            "moe_experts_merged" if merge_gate_up else "moe_experts_unmerged",
             method,
             quant_kwargs=quant_kwargs,
         )
@@ -269,11 +273,12 @@ class QuantizationRegistry:
     def get_quantized_moe_experts_class_from_global_args(
         cls,
         *,
+        merge_gate_up: bool,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
         checkpoint_prefix="",
     ) -> Type[QuantizedMoeExpertsBase]:
         return cls._get_quantized_class_from_global_args(
-            "moe_experts",
+            "moe_experts_merged" if merge_gate_up else "moe_experts_unmerged",
             quant_kwargs=quant_kwargs,
             checkpoint_prefix=checkpoint_prefix,
         )
@@ -296,8 +301,9 @@ class QuantizationRegistry:
         cls,
         name: Optional[str],
         implementation: Optional[Type[QuantizedLinearBase]] = None,
+        *,
         backend_type: str = "default",
-        when=lambda: True,
+        when: Callable[[Mapping[str, Any]], bool] = lambda _: True,
         priority: int = 0,
     ) -> Callable | Type[QuantizedLinearBase]:
         """
@@ -307,6 +313,11 @@ class QuantizationRegistry:
             name: Name of the quant. None for non-quantized layer.
             implementation: Implementation class. If None, return a partial function as
                 a decorator.
+            when: Only select this implementation if the `when` function returns True.
+                The `when` function accepts the kwargs passed to the model as its only
+                argument.
+            proiority: When multiple implementations match, the one with the highest
+                priority will be selected.
         """
         if implementation is None:
             return functools.partial(
@@ -332,8 +343,10 @@ class QuantizationRegistry:
         cls,
         name: Optional[str],
         implementation: Optional[Type[QuantizedMoeExpertsBase]] = None,
+        *,
+        merge_gate_up: bool,
         backend_type: str = "default",
-        when=lambda: True,
+        when: Callable[[Mapping[str, Any]], bool] = lambda _: True,
         priority: int = 0,
     ) -> Callable | Type[QuantizedMoeExpertsBase]:
         """
@@ -343,22 +356,30 @@ class QuantizationRegistry:
             name: Name of the MoeExperts layer. None for non-quantized layer.
             implementation: Implementation class. If None, return a partial function as
                 a decorator.
+            when: Only select this implementation if the `when` function returns True.
+                The `when` function accepts the kwargs passed to the model as its only
+                argument.
+            proiority: When multiple implementations match, the one with the highest
+                priority will be selected.
         """
         if implementation is None:
             return functools.partial(
                 cls.register_moe_experts,
                 name,
+                merge_gate_up=merge_gate_up,
                 backend_type=backend_type,
                 when=when,
                 priority=priority,
             )
-        if backend_type not in cls._moe_experts_registry:
-            cls._moe_experts_registry[backend_type] = {}
-        if name not in cls._moe_experts_registry[backend_type]:
-            cls._moe_experts_registry[backend_type][name] = []
-        cls._moe_experts_registry[backend_type][name].append(
-            (implementation, when, priority)
-        )
+        if merge_gate_up:
+            registry = cls._moe_experts_merged_registry
+        else:
+            registry = cls._moe_experts_unmerged_registry
+        if backend_type not in registry:
+            registry[backend_type] = {}
+        if name not in registry[backend_type]:
+            registry[backend_type][name] = []
+        registry[backend_type][name].append((implementation, when, priority))
 
         return implementation
 
@@ -367,8 +388,9 @@ class QuantizationRegistry:
         cls,
         name: Optional[str],
         implementation: Optional[Type[QuantizedAbsorbGemmBase]] = None,
+        *,
         backend_type: str = "default",
-        when=lambda: True,
+        when: Callable[[Mapping[str, Any]], bool] = lambda _: True,
         priority: int = 0,
     ) -> Callable | Type[QuantizedAbsorbGemmBase]:
         """
@@ -378,6 +400,11 @@ class QuantizationRegistry:
             name: Name of the quant. None for non-quantized layer.
             implementation: Implementation class. If None, return a partial function as
                 a decorator.
+            when: Only select this implementation if the `when` function returns True.
+                The `when` function accepts the kwargs passed to the model as its only
+                argument.
+            proiority: When multiple implementations match, the one with the highest
+                priority will be selected.
         """
         if implementation is None:
             return functools.partial(

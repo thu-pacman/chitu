@@ -215,6 +215,10 @@ infer:
   # Acceptable values: A positive integer.
   mtp_size: 1
 
+  # This parameter is only used for the qwen3.5 model. If this parameter is true, 
+  # you can skip loading the vision encoder and only start the language model.
+  language_model_only: False
+
   # Whether to overlap scheduling with tensor computation. We recommand to keep this feature
   # on whenever supported.
   #
@@ -256,7 +260,7 @@ infer:
 
   npu_fusion_fp4: False #  for npu fp4 fusion group_gemm mode
   moe:
-    prefill_memory_tolerance: 2.0 # In case of EP inbalance, the largest activation tensor will occupy no more than O(prefill_chunk_size / ep_size * prefill_memory_tolerance) memory
+    prefill_memory_tolerance: 2.0 # In case of EP inbalance, the largest activation tensor will occupy no more than O(prefill_chunk_size * topk / ep_size * prefill_memory_tolerance) memory
     prefill_token_dispatcher: auto # one of: auto, tp, allgather, deepep-nl
     decode_token_dispatcher: auto # one of: auto, tp, allgather, deepep-ll
 
@@ -369,6 +373,9 @@ metrics:
   prometheus_data_dir: "prometheus_data" # prometheus data stoarge path, which is a folder
   prometheus_scrape_interval: 1 # prometheus server scrapes PrometheusMetricsCollectors every ${prometheus_scrape_interval} seconds.
   log_interval: 10
+  grafana_enabled: false # Set to true to auto-start a Grafana server on rank 0
+  grafana_host: 0.0.0.0 # Grafana server bind address
+  grafana_port: 9095 # Grafana HTTP port
 
 # Debugging options. These options have negative effect on performance and correctness, so please
 # don't set them in production.

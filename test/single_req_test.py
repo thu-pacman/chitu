@@ -5,6 +5,7 @@ import os
 import random
 import logging
 from logging import getLogger
+from pathlib import Path
 
 from chitu.task import UserRequest, TaskPool, Task
 from chitu.chitu_main import (
@@ -28,6 +29,17 @@ msgs = [
     [{"role": "user", "content": "飞机在对流层还是平流层飞?"}],
     [{"role": "user", "content": "怎么避免加班?"}],
     [{"role": "user", "content": "what is the recipe of mayonnaise?"}],
+]
+# long-context test
+msgs_long = [
+    [
+        {
+            "role": "user",
+            "content": Path("test/test_texts/test_text.txt").read_text(
+                encoding="utf-8"
+            ),
+        }
+    ],
 ]
 msgs_vl = [
     [
@@ -149,7 +161,10 @@ def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
 
 
 def gen_reqs(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
-    global local_args
+    global local_args, msgs
+    if "DeepSeek-V3.2" in local_args.models.name:
+        msgs = msgs_long + msgs
+
     if local_args.request.prompt_tokens_len > 0:
         return gen_reqs_fake(
             num_reqs,
@@ -172,7 +187,8 @@ def run_pipe_or_tensor_parallelism(args, timers):
                 num_reqs=args.infer.max_reqs,
                 max_new_tokens=args.request.max_new_tokens,
                 frequency_penalty=args.request.frequency_penalty,
-                is_vl=hasattr(args.models, "vision_config"),
+                is_vl=hasattr(args.models, "vision_config")
+                and not args.infer.language_model_only,
             )
             for req in reqs:
                 TaskPool.add(Task(req.request_id, req, stop_with_eos=True))
@@ -214,7 +230,8 @@ def run_normal(args, timers):
             num_reqs=args.infer.max_reqs,
             max_new_tokens=args.request.max_new_tokens,
             frequency_penalty=args.request.frequency_penalty,
-            is_vl=hasattr(args.models, "vision_config"),
+            is_vl=hasattr(args.models, "vision_config")
+            and not args.infer.language_model_only,
         )
         for req in reqs:
             TaskPool.add(Task(req.request_id, req, stop_with_eos=True))

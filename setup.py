@@ -53,10 +53,10 @@ else:
 cython_unsafe_files = (
     glob.glob("chitu/ops/triton_ops/**/*.py", recursive=True)  # Triton kernels inside
     + glob.glob("chitu/moe/experts/*.py")  # Triton kernels inside
+    + glob.glob("chitu/native_layout/*.py")  # plum inside
     + [
         "chitu/moe/batched_routed_activation.py",  # plum inside
-        "chitu/muxi_utils.py",  # plum inside
-        "chitu/native_layout.py",  # plum inside
+        "chitu/quantization/base.py",  # plum inside
         "__main__.py",
     ]
 )
@@ -116,7 +116,7 @@ if os.environ.get("CHITU_SETUP_JOBS") is not None:
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="chitu",
-    version="0.5.1",
+    version="0.5.2",
     python_requires=">=3.10",
     install_requires=install_requires,
     extras_require=extras_require,

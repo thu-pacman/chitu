@@ -5,6 +5,7 @@
 # DeepSeek-V3.1 shares the same model structure with DeepSeek-V3
 defaults:
   - DeepSeek-V3
+  - override quant_config: blockfp8_ue8m0_scale_without_o_proj
   - _self_ # Config in this file overrides configs in defaults
 
 # Access info
@@ -12,4 +13,4 @@ name: DeepSeek-V3.1
 source: "https://huggingface.co/deepseek-ai/DeepSeek-V3.1" # Just for displaying. No automatic download.
 tokenizer_type: "hf" # one of: hf, tiktoken
 tool_parser: DeepSeekV31ToolParser
-reasoning_without_begin: true
+reasoning_type: switchable

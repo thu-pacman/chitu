@@ -23,7 +23,11 @@ from chitu.models.model_hf_llama import (
 from chitu.models.registry import ModelType, register_model
 from chitu.ops import linear
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
-from chitu.quantization import get_quant_from_checkpoint_prefix, QuantizedMoeExpertsBase
+from chitu.quantization import (
+    get_quant_from_checkpoint_prefix,
+    QuantizedMoeExpertsUnmerged,
+    QuantizedMoeExpertsMerged,
+)
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 
 
@@ -102,7 +106,7 @@ class GptOssMoeGate(nn.Module):
 
 
 # TODO: Quantization Registry
-class GptOssMoeExperts(QuantizedMoeExpertsBase):
+class GptOssMoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
     def __init__(
         self,
         ############################################
@@ -116,7 +120,6 @@ class GptOssMoeExperts(QuantizedMoeExpertsBase):
         n_activated_experts: int,
         fuse_shared_experts: bool,
         checkpoint_prefix: str,
-        merge_gate_up: bool,
         *,
         ############################################
         # Parameters specific to this quantization
@@ -132,55 +135,38 @@ class GptOssMoeExperts(QuantizedMoeExpertsBase):
             n_activated_experts,
             fuse_shared_experts,
             checkpoint_prefix,
-            merge_gate_up,
         )
         self.alpha = 1.702
         self.limit = 7.0
 
-        if not self.merge_gate_up:
-            self.gate_proj_weight = torch.nn.Parameter(
-                torch.empty(
-                    (self.group_size, moe_inter_dim, self.dim),
-                    dtype=dtype,
-                ),
-                requires_grad=False,
-            )
-            self.gate_proj_bias = torch.nn.Parameter(
-                torch.empty(
-                    (self.group_size, moe_inter_dim),
-                    dtype=dtype,
-                ),
-                requires_grad=False,
-            )
-            self.up_proj_weight = torch.nn.Parameter(
-                torch.empty(
-                    (self.group_size, moe_inter_dim, self.dim),
-                    dtype=dtype,
-                ),
-                requires_grad=False,
-            )
-            self.up_proj_bias = torch.nn.Parameter(
-                torch.empty(
-                    (self.group_size, moe_inter_dim),
-                    dtype=dtype,
-                ),
-                requires_grad=False,
-            )
-        else:
-            self.gate_up_proj_weight = torch.nn.Parameter(
-                torch.empty(
-                    (self.group_size, moe_inter_dim * 2, self.dim),
-                    dtype=dtype,
-                ),
-                requires_grad=False,
-            )
-            self.gate_up_proj_bias = torch.nn.Parameter(
-                torch.empty(
-                    (self.group_size, moe_inter_dim * 2),
-                    dtype=dtype,
-                ),
-                requires_grad=False,
-            )
+        self.gate_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, moe_inter_dim, self.dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+        self.gate_proj_bias = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, moe_inter_dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+        self.up_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, moe_inter_dim, self.dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+        self.up_proj_bias = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, moe_inter_dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
         self.down_proj_weight = torch.nn.Parameter(
             torch.empty(
                 (self.group_size, self.dim, moe_inter_dim),
@@ -210,6 +196,89 @@ class GptOssMoeExperts(QuantizedMoeExpertsBase):
         return (up_out + 1) * glu
 
     @override
+    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear(x, self.gate_proj_weight[i], bias=self.gate_proj_bias[i])
+
+    @override
+    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear(x, self.up_proj_weight[i], bias=self.up_proj_bias[i])
+
+    @override
+    def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
+        return linear(
+            x,
+            self.down_proj_weight[i],
+            bias=self.down_proj_bias[i] if self.down_proj_bias is not None else None,
+        )
+
+
+class GptOssMoeExpertsMerged(QuantizedMoeExpertsMerged):
+    def __init__(
+        self,
+        ############################################
+        # Common parameters for all quantizations
+        dim: int,
+        moe_inter_dim: int,
+        global_n_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
+        n_shared_experts: int,
+        n_activated_experts: int,
+        fuse_shared_experts: bool,
+        checkpoint_prefix: str,
+        *,
+        ############################################
+        # Parameters specific to this quantization
+        dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__(
+            dim,
+            moe_inter_dim,
+            global_n_experts,
+            experts_start_idx,
+            experts_end_idx,
+            n_shared_experts,
+            n_activated_experts,
+            fuse_shared_experts,
+            checkpoint_prefix,
+        )
+        self.alpha = 1.702
+        self.limit = 7.0
+
+        self.gate_up_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, moe_inter_dim * 2, self.dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+        self.gate_up_proj_bias = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, moe_inter_dim * 2),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+        self.down_proj_weight = torch.nn.Parameter(
+            torch.empty(
+                (self.group_size, self.dim, moe_inter_dim),
+                dtype=dtype,
+            ),
+            requires_grad=False,
+        )
+        self.down_proj_bias = (
+            torch.nn.Parameter(
+                torch.empty(
+                    (self.group_size, self.dim),
+                    dtype=dtype,
+                ),
+                requires_grad=False,
+            )
+            if get_etp_group().rank_in_group == 0
+            else None
+        )
+
+    @override
     def forward_act_fn_merged(self, gate_up_out: torch.Tensor) -> torch.Tensor:
         dim = gate_up_out.shape[-1]
         assert dim % 2 == 0
@@ -220,14 +289,6 @@ class GptOssMoeExperts(QuantizedMoeExpertsBase):
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
         return linear(x, self.gate_up_proj_weight[i], bias=self.gate_up_proj_bias[i])
-
-    @override
-    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear(x, self.gate_proj_weight[i], bias=self.gate_proj_bias[i])
-
-    @override
-    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        return linear(x, self.up_proj_weight[i], bias=self.up_proj_bias[i])
 
     @override
     def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
@@ -263,7 +324,7 @@ class ParallelMoeBlockGptOss(ParallelMoeBlock):
         assert args.moe_intermediate_dim % get_etp_size() == 0
         super().__init__(
             gate=GptOssMoeGate(args),
-            experts=GptOssMoeExperts(
+            experts=GptOssMoeExpertsUnmerged(
                 dim=args.dim,
                 moe_inter_dim=args.moe_intermediate_dim // get_etp_size(),
                 global_n_experts=args.num_experts,
@@ -273,7 +334,6 @@ class ParallelMoeBlockGptOss(ParallelMoeBlock):
                 n_activated_experts=0,
                 fuse_shared_experts=False,
                 checkpoint_prefix=f"{checkpoint_prefix}.experts",
-                merge_gate_up=False,
             ),
             non_fused_shared_experts=None,
             layer_id=layer_id,

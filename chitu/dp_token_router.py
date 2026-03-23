@@ -22,6 +22,7 @@ from chitu.backend import Backend
 from chitu.task import UserRequest
 from chitu.dp_request_router import get_request_router
 from chitu.serve.event_loop import get_server_event_loop
+from chitu.reasoning import ReasoningParams
 
 logger = logging.getLogger(__name__)
 
@@ -388,7 +389,8 @@ class DPAsyncDataStream(AsyncDataStream):
     """
 
     def __init__(self):
-        super().__init__()
+        # FIXME: correct reasoning of DPAsyncDataStream is not implemented
+        super().__init__(ReasoningParams(False))
         # DP specific attributes
         self.dp_mode = True
 
@@ -414,6 +416,8 @@ class DPAsyncDataStream(AsyncDataStream):
 
             # Add text directly to sequence
             self.seqs.append(s)
+            # FIXME: correct reasoning of DPAsyncDataStream is not implemented
+            self.reasoning_states.append(False)
             self.chars_len += len(s)
 
             # Handle logprobs
@@ -437,8 +441,7 @@ class DPAsyncDataStream(AsyncDataStream):
         Note: This method should rarely be called now, as we use add_text_data
         """
         with self.lock:
-            if self.reasoning_handle(value):
-                return
+            reasoning_state = self.reasoning_parser.update(value)
 
             self.tokens_len += 1
             self.cache_tokens.append(value)
@@ -493,6 +496,7 @@ class DPAsyncDataStream(AsyncDataStream):
             else:
                 self.seqs.append(s[self.chars_len :])
                 self.chars_len = len(s)
+            self.reasoning_states.append(reasoning_state)
 
             if top_logprobs:
                 self.top_logprobs_list.append(top_logprobs)

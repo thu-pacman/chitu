@@ -30,3 +30,6 @@ full_attention_interval: 4
 num_full_attention_blocks: -1 # kv cache blocks for full attention layers, could override num_blocks
 num_linear_attention_blocks: -1 # kv cache blocks for linear attention layers, could override num_blocks
 linear_attention_impl: "auto" # choices=["auto", "torch", "fla"]
+partial_rotary_factor: 0.25
+tool_parser: Qwen3CoderToolParser
+reasoning_type: disabled

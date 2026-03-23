@@ -78,7 +78,6 @@ from chitu.tensor_parallel import (
 from chitu.distributed.parallel_state import get_tp_size, get_etp_size
 from chitu.distributed.partition import compute_expert_dist_in_ep
 from chitu.utils import parse_dtype, try_import_and_setup_torch_npu
-from chitu.lazy import eval_lazy
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -218,6 +217,7 @@ class Indexer(torch.nn.Module):
                 k_page_table=cache_accessor.block_table,
                 static_max_n=get_global_args().infer.max_seq_len,
                 causal=is_causal,
+                softfp8=get_global_args().infer.raise_lower_bit_float_to == "bfloat16",
             )
         elif isinstance(cache_accessor, DenseKVCacheAccessor):
             append_to_dense_kv_cache(
@@ -233,6 +233,7 @@ class Indexer(torch.nn.Module):
                 cache_accessor.kv["indexer_ks"],
                 seq_len_delta=seq_len_delta,
                 causal=is_causal,
+                softfp8=get_global_args().infer.raise_lower_bit_float_to == "bfloat16",
             )
         else:
             raise NotImplementedError()
@@ -807,7 +808,7 @@ class MLPDeepSeekV3(nn.Module):
         """
         if self.merge_gate_up:
             gate_up_proj_out = self.gate_up_proj(x)
-            return self.down_proj(eval_lazy(silu_and_mul(gate_up_proj_out)))
+            return self.down_proj(silu_and_mul(gate_up_proj_out))
         else:
             gate_proj_out = self.gate_proj(x)
             up_proj_out = self.up_proj(x)
@@ -869,15 +870,15 @@ def MoeExpertsDeepSeekV3(
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     checkpoint_prefix = checkpoint_prefix + ".moe"
+    merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(checkpoint_prefix)
     if base_moe_experts_class is None:
         base_moe_experts_class = (
             QuantizationRegistry.get_quantized_moe_experts_class_from_global_args(
+                merge_gate_up=merge_gate_up,
                 quant_kwargs=quant_kwargs,
                 checkpoint_prefix=checkpoint_prefix,
             )
         )
-
-    merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(checkpoint_prefix)
 
     assert args.moe_inter_dim % get_etp_size() == 0
     return base_moe_experts_class(
@@ -890,7 +891,6 @@ def MoeExpertsDeepSeekV3(
         n_activated_experts=args.n_activated_experts,
         fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
         checkpoint_prefix=checkpoint_prefix,
-        merge_gate_up=merge_gate_up,
     )
 
 

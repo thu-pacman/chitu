@@ -9,6 +9,7 @@ from typing import Optional
 
 from chitu.backend import Backend
 from chitu.metrics import PrometheusServerManager
+from chitu.metrics.grafana_manager import GrafanaManager
 from chitu.global_vars import get_global_args
 from chitu.metrics.task_stats import count_tasks
 from chitu.utils import ceil_div
@@ -174,8 +175,8 @@ class MetricsMonitor:
             prealloc_blocks = (
                 prealloc_blocks_by_dp.get(dp_id) if prealloc_blocks_by_dp else None
             )
-            used_blocks_value = int(used_blocks.get(rank_dp, "-1"))
-            total_blocks_value = int(total_blocks.get(rank_dp, "-1"))
+            used_blocks_value = int(used_blocks.get(rank_dp, "0"))
+            total_blocks_value = int(total_blocks.get(rank_dp, "0"))
 
             mtp_hit_rate = None
             if mtp_proposed_rate and mtp_accepted_rate:
@@ -185,18 +186,18 @@ class MetricsMonitor:
                     mtp_hit_rate = accepted / proposed
 
             log_msg = self._build_stats_message(
-                prompt_tps=float(prompt_tps.get(rank_dp, "-1")),
-                gen_tps=float(gen_tps.get(rank_dp, "-1")),
+                prompt_tps=float(prompt_tps.get(rank_dp, "0")),
+                gen_tps=float(gen_tps.get(rank_dp, "0")),
                 running=running,
                 waiting=waiting,
-                kv_cache_usage=float(kvcache_usage.get(rank_dp, "-1")),
-                eviction_rate=float(eviction_rate.get(rank_dp, "-1")),
+                kv_cache_usage=float(kvcache_usage.get(rank_dp, "0")),
+                eviction_rate=float(eviction_rate.get(rank_dp, "0")),
                 used_blocks=used_blocks_value,
                 total_blocks=total_blocks_value,
                 prealloc_blocks=prealloc_blocks,
-                total_bytes=float(total_bytes.get(rank_dp, "-1")),
-                used_bytes=float(used_bytes.get(rank_dp, "-1")),
-                torch_allocated_bytes=float(torch_allocated_bytes.get(rank_dp, "-1")),
+                total_bytes=float(total_bytes.get(rank_dp, "0")),
+                used_bytes=float(used_bytes.get(rank_dp, "0")),
+                torch_allocated_bytes=float(torch_allocated_bytes.get(rank_dp, "0")),
                 mtp_hit_rate=mtp_hit_rate,
             )
             logger.info(f"[rank{rank}, DP{dp_id}]: {log_msg}")
@@ -282,7 +283,7 @@ def start_prometheus_server_and_metrics_monitor(
     collector_addrs: list,
 ):
     """
-    Start the prometheus_server and metrics monitor.
+    Start the prometheus_server, optionally Grafana, and the metrics monitor.
 
     Args:
         collector_addrs: Prometheus Server pull metrics from these addresses.
@@ -293,20 +294,32 @@ def start_prometheus_server_and_metrics_monitor(
         return
 
     manager = PrometheusServerManager.get_instance(collector_addrs)
-    log_interval = get_global_args().metrics.log_interval
+    metrics_cfg = get_global_args().metrics
+    log_interval = metrics_cfg.log_interval
     if not manager.is_running():
         logger.warning(
             f"PrometheusServer is not running, MetricsMonitor will not start."
         )
         return
+
+    if getattr(metrics_cfg, "grafana_enabled", False):
+        try:
+            prometheus_url = (
+                f"http://{metrics_cfg.prometheus_listening_host}:{manager.server_port}"
+            )
+            GrafanaManager.get_instance(prometheus_url)
+        except Exception as e:
+            logger.warning(f"Failed to start Grafana: {e}")
+
     _global_monitor = MetricsMonitor(manager, log_interval)
     _global_monitor.start()
 
 
 def stop_metrics_monitor():
-    """Stop the global metrics monitor."""
+    """Stop the global metrics monitor and managed servers."""
     global _global_monitor
     if _global_monitor is not None:
         _global_monitor.stop()
         _global_monitor = None
+    GrafanaManager.cleanup()
     PrometheusServerManager.cleanup()

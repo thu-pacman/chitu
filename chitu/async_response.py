@@ -12,17 +12,11 @@ from typing import Optional
 from pydantic import BaseModel
 
 from chitu.backend import Backend
-from chitu.tokenizer import Tokenizer, TokenizerHF
 from chitu.serve.event_loop import get_server_event_loop
 from chitu.tool_call import ChoiceDelta, parse_stream_by_parser
-from chitu.global_vars import get_global_args
+from chitu.reasoning import ReasoningParams, ReasoningParser
 
 logger = getLogger(__name__)
-
-
-@functools.lru_cache(maxsize=1)
-def get_initial_reasoning_state():
-    return getattr(get_global_args().models, "reasoning_without_begin", False)
 
 
 class ChatCompletionResponse(BaseModel):
@@ -32,7 +26,7 @@ class ChatCompletionResponse(BaseModel):
 
 
 class AsyncDataStream:
-    def __init__(self, enable_reasoning: bool = True):
+    def __init__(self, reasoning_params: ReasoningParams):
         self.tokenizer = Backend.tokenizer
         self.seqs: list[str] = []
         self.tokens_len: int = 0
@@ -43,27 +37,8 @@ class AsyncDataStream:
         self.data_event = asyncio.Event()
         self.top_logprobs_list = []
         self.top_tokens_list = []
-        self.enable_reasoning = enable_reasoning
-
-        self.is_reasoning = get_initial_reasoning_state() if enable_reasoning else False
-        self.reasoning_len = 0
-        if enable_reasoning:
-            if isinstance(self.tokenizer, (Tokenizer, TokenizerHF)):
-                encoded = self.tokenizer.encode("<think></think>", bos=False, eos=False)
-                if len(encoded) == 2:
-                    self.rs_token_id, self.re_token_id = encoded
-                else:
-                    logger.info_once(
-                        "Cannot obtain reasoning token ids from tokenizer. "
-                        "Falling back to using config."
-                    )
-                    self.rs_token_id = Backend.args.models.get("rs_token_id", -1)
-                    self.re_token_id = Backend.args.models.get("re_token_id", -1)
-            else:
-                self.rs_token_id = Backend.args.models.get("rs_token_id", -1)
-                self.re_token_id = Backend.args.models.get("re_token_id", -1)
-            if self.rs_token_id == -1 or self.re_token_id == -1:
-                self.enable_reasoning = False
+        self.reasoning_parser = ReasoningParser(reasoning_params)
+        self.reasoning_states: list[bool] = []
 
     def add_data(
         self,
@@ -74,8 +49,7 @@ class AsyncDataStream:
         notify_server: bool = True,
     ):
         with self.lock:
-            if self.enable_reasoning:
-                self.reasoning_handle(value)
+            reasoning_state = self.reasoning_parser.update(value)
             self.tokens_len += 1
             self.cache_tokens.append(value)
             s = self.tokenizer.decode(self.cache_tokens)
@@ -93,6 +67,7 @@ class AsyncDataStream:
             else:
                 self.seqs.append(s[self.chars_len :])
                 self.chars_len = len(s)
+            self.reasoning_states.append(reasoning_state)
             if top_logprobs:
                 self.top_logprobs_list.append(top_logprobs)
                 self.top_tokens_list.append(top_tokens)
@@ -103,21 +78,6 @@ class AsyncDataStream:
         with self.lock:
             self.stop_signal = True
         self.notify_server_threadsafe()
-
-    def reasoning_handle(self, value: int):
-        if (
-            not self.is_reasoning and value == self.rs_token_id and self.tokens_len <= 1
-        ):  # Workaround: some models output '\n' or ' '  before <think> tag
-            self.is_reasoning = True
-        if self.is_reasoning:
-            if value == self.re_token_id:
-                self.is_reasoning = False
-            self.reasoning_len = len(self.seqs) + 1
-
-    def is_reasoning_content(self):
-        if not self.enable_reasoning:
-            return False
-        return self.is_reasoning or self.index - 1 < self.reasoning_len
 
     def notify_server_from_server_thread(self):
         self.data_event.set()
@@ -138,6 +98,7 @@ class AsyncDataStream:
                     raise StopAsyncIteration
                 if self.index < len(self.seqs):
                     result = self.seqs[self.index]
+                    is_reasoning = self.reasoning_states[self.index]
                     if self.index < len(self.top_logprobs_list):
                         top_logprobs = self.top_logprobs_list[self.index]
                         top_tokens = self.top_tokens_list[self.index]
@@ -147,7 +108,7 @@ class AsyncDataStream:
                     self.index += 1
                     return (
                         result,
-                        self.is_reasoning_content(),
+                        is_reasoning,
                         (top_logprobs, top_tokens),
                     )
             self.data_event.clear()
@@ -255,22 +216,25 @@ class AsyncResponse:
         return stream_response()
 
     async def full_generator(self):
-        text = []
         top_logprobs_list = []
         top_tokens_list = []
-        async for data, top_logprobs, top_tokens in self.async_stream:
-            text.append(data)
+        chunks = []
+        rchunks = []
+        async for data, is_reasoning, (top_logprobs, top_tokens) in self.async_stream:
+            if is_reasoning:
+                rchunks.append(data)
+            else:
+                chunks.append(data)
             if self.req.logprobs:
                 top_logprobs_list.append(top_logprobs)
                 top_tokens_list.append(top_tokens)
-        r_len = self.async_stream.reasoning_len
         message = {}
         message["role"] = "assistant"
 
-        if r_len:
-            message["reasoning_content"] = "".join(text[:r_len])
+        if self.async_stream.reasoning_parser.params.enable_reasoning:
+            message["reasoning_content"] = "".join(rchunks)
 
-        content = "".join(text[r_len:])
+        content = "".join(chunks)
         if self.tool_parser:
             content, tools = self.tool_parser.parse_string(content)
             message["tool_calls"] = tools

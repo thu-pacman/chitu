@@ -3,7 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from xgrammar import Grammar, StructuralTag
-from xgrammar.structural_tag import Format
+from xgrammar.structural_tag import (
+    Format,
+    AnyTextFormat,
+    SequenceFormat,
+    ConstStringFormat,
+)
 from .tools import AbstractToolsGrammar
 from ..type_def import ToolCallParams, ToolChoiceNamedTool, ConstraintParams
 
@@ -38,10 +43,33 @@ def compile_format_to_grammar(format: Format):
     return Grammar.from_structural_tag(StructuralTag(format=format))
 
 
+def build_reasoning_grammar(format: Format, constraint: ConstraintParams):
+    if not constraint.at_least_one:
+        return format
+    reasoning_params = constraint.params.reasoning_params
+    if not reasoning_params.enable_reasoning:
+        return format
+
+    if reasoning_params.initial_state:
+        elements = []
+    else:
+        elements = [ConstStringFormat(value=reasoning_params.start_token)]
+
+    elements += [
+        AnyTextFormat(excludes=[reasoning_params.end_token]),
+        ConstStringFormat(value=reasoning_params.end_token),
+        format,
+    ]
+    return SequenceFormat(
+        elements=elements,
+    )
+
+
 def build_grammar(
     template: AbstractToolsGrammar,
     params: ToolCallParams,
 ) -> Grammar:
     constraint = process_tool_call_params(params)
     format = template.build(constraint)
+    format = build_reasoning_grammar(format, constraint)
     return compile_format_to_grammar(format)

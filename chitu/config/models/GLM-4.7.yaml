@@ -12,4 +12,4 @@ name: GLM-4.7
 source: "https://huggingface.co/zai-org/GLM-4.7" # Just for displaying. No automatic download.
 tokenizer_type: "hf" # one of: hf, tiktoken
 tool_parser: GLM47ToolParser
-reasoning_without_begin: true
+reasoning_type: switchable

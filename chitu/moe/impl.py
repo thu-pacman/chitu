@@ -348,6 +348,11 @@ class MoEImplEP(MoEImplBase):
     def enter_moe(self, *args, **kwargs):
         return self._get_current_token_dispatcher().enter_moe(*args, **kwargs)
 
+    def enter_moe_dispatch_streaming(self, *args, **kwargs):
+        return self._get_current_token_dispatcher().enter_moe_dispatch_streaming(
+            *args, **kwargs
+        )
+
     def exit_moe_prefer_before_local_sum(self) -> bool:
         return self._get_current_token_dispatcher().exit_moe_prefer_before_local_sum()
 
@@ -413,6 +418,7 @@ class MoEImplNoEP(MoEImplBase):
 
         assert self.ep_size == 1
 
+        # FIXME: Check whether deep_gemm support our round_scale_to_pow2 setting
         if has_deep_gemm:
             self.impl_map = {
                 TaskType.Prefill: "group_gemm_contiguous",

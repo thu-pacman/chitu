@@ -109,11 +109,7 @@ class HygonMixQLinear(
         HygonMixQIntTileTensor,
         weight_bits=lambda m: m.w_bits,
     ),
-    enable_native_layout_weight(
-        "fp_weight",
-        HygonMixQFp16TileTensor,
-        allow_missing=True,
-    ),
+    enable_native_layout_weight("fp_weight", HygonMixQFp16TileTensor),
     MixQLinear,
 ):
     def __init__(

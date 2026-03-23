@@ -2,11 +2,27 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+# Why disable ue8m0 for o_proj?
+#
+# Quote from https://huggingface.co/deepseek-ai/DeepSeek-V3.1-Terminus:
+#
+# > NOTE: In the current model checkpoint, the parameters of self_attn.o_proj
+# > do not conform to the UE8M0 FP8 scale data format. This is a known issue
+# > and will be corrected in future model releases.
+#
+# We found this issue continues to at least DeepSeek-V3.2.
+
 quant: 
 - model: '.'
   rules:
+    - regex : 'o_proj'
+      type : blockfp8
+      kwargs:
+        round_scale_to_pow2: false
     - regex : 'layers\.'
       type : blockfp8
+      kwargs:
+        round_scale_to_pow2: true
 - kv_cache: '.'
   rules:
     - regex: '^kv_lora_k_pe$'

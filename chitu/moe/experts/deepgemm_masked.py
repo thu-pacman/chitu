@@ -45,6 +45,7 @@ def deepgemm_masked_fused_expert(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
@@ -73,6 +74,7 @@ def _(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> PerExpertDenseBatchedExpertResult:
@@ -209,6 +211,7 @@ def _(
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
+        round_scale_to_pow2=round_scale_to_pow2,
         soft_fp8=soft_fp8,
         experts_start_idx=experts_start_idx,
     ).activation_per_expert
@@ -240,6 +243,7 @@ def _(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> PerExpertDenseBatchedExpertResultMinimal:
@@ -294,14 +298,28 @@ def _(
 
         return PerExpertDenseBatchedExpertResultMinimal(intermediate_cache3)
 
+    if tuple(block_shape) != (128, 128):
+        raise NotImplementedError(
+            f"deep_gemm only supports 128x128 quantization block, but got {block_shape}"
+        )
+    if torch.cuda.get_device_capability()[0] == 10 and not round_scale_to_pow2:
+        raise NotImplementedError(
+            "deep_gemm does not support round_scale_to_pow2==False on sm_10x"
+        )
+    if torch.get_default_dtype() != torch.bfloat16:
+        raise NotImplementedError(
+            f"deep_gemm only supports bfloat16 activation output, but got {torch.get_default_dtype()}"
+        )
+
     assert use_fp8_w8a8
-    assert block_shape is not None
     if isinstance(hidden_states, PerExpertDenseBatchedRoutedActivationBlockfp8):
         hidden_states_fp8 = hidden_states.activation_per_expert
         a1_scale = hidden_states.activation_scale_per_expert
     else:
         hidden_states_fp8, a1_scale = blockfp8_act_quant(
-            hidden_states.activation_per_expert
+            hidden_states.activation_per_expert,
+            block_size=block_shape[0],
+            round_scale_to_pow2=round_scale_to_pow2,
         )
 
     device = hidden_states_fp8.device
@@ -324,7 +342,8 @@ def _(
     qintermediate_cache2, a2q_scale = silu_and_mul_and_blockfp8_act_quant(
         intermediate_cache1,
         expert_n_tokens=hidden_states.n_tokens_per_expert,
-        block_size=128,
+        block_size=block_shape[0],
+        round_scale_to_pow2=round_scale_to_pow2,
     )
     del intermediate_cache1
 

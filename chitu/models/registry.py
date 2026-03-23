@@ -21,6 +21,7 @@ class ModelType(str, Enum):
     LLAMA = "llama"
     HF_QWEN3_NEXT = "hf-qwen3-next"
     LLADA = "llada"
+    HF_QWEN3_5 = "hf-qwen3-5"
 
 
 def register_model(name: str | ModelType):
