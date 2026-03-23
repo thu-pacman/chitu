@@ -1350,6 +1350,7 @@ class Executor:
 
         logger.info(f"payload shape: {payload.shape}")
         from dinfer import TokenArray
+
         token_array = TokenArray(payload, num_tokens, mask_id=Backend.model.decoder.mask_id, eos_id=Backend.model.decoder.eos_id, device=self.device, offset=[len(t) for t in tasks.tokens])
         logger.info(f"token_array shape: {token_array.data.shape}")
 
@@ -1397,13 +1398,13 @@ class Executor:
         t_forward = time.perf_counter() - t0
         logger.info(f"[DLLM_PROFILE] prefill forward: {t_forward*1000:.2f}ms (seq_len={max_prefilling_length})")
 
-        inner_shape = output.past_key_values[0].shape
-        logger.info(f"inner_shape: {inner_shape}")
-
         t0 = time.perf_counter()
+        # 与 generate_uniform.dynamic_batching_generate 预填一致：stack → (L,2,B,H,S,D)
+        inner_shape = output.past_key_values[0].shape
         prefilling_kv = torch.stack(output.past_key_values, dim=0).reshape(
             num_layers, 2, *inner_shape
         )
+        logger.info(f"prefilling_kv shape: {tuple(prefilling_kv.shape)}")
 
         total_prefill_tokens = sum(prefilling_lengths)
         if total_prefill_tokens > 0:
@@ -1681,9 +1682,11 @@ class Executor:
         # 9) Write back KV to Chitu cache for block_finished (each rank updates its own shard)
         t0 = time.perf_counter()
         if block_finished.any() and block_table is not None:
-            stacked = torch.stack(output.past_key_values, dim=0)
-            # Use actual shape (TP: n_local_kv_heads per rank)
-            decoding_kv = stacked[:, :, :, :, -block_length:, :]
+            # 与 generate_uniform.dynamic_batching_generate 解码写回一致；[:, :, :batch_size] 对齐图捕获时的 padding batch
+            inner_shape = output.past_key_values[0].shape
+            decoding_kv = torch.stack(output.past_key_values, dim=0).reshape(
+                num_layers, 2, *inner_shape
+            )[:, :, :batch_size, :, -block_length:, :]
             for layer_id in range(num_layers):
                 try:
                     accessor = cache_manager.get_accessor(layer_id)

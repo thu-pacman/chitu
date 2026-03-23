@@ -322,8 +322,12 @@ class TokenizerHF:
         self.force_full_seq_decode = force_full_seq_decode
         self.skip_special_tokens = skip_special_tokens
         self.decode_cache: dict[tuple[int, bool], str] = {}
+        # 本地路径需加 local_files_only=True，避免 huggingface_hub 的 repo_id 校验
+        local_files_only = os.path.isabs(path) or path.startswith(".")
         self.model = AutoTokenizer.from_pretrained(
-            path, trust_remote_code=trust_remote_code
+            path,
+            trust_remote_code=trust_remote_code,
+            local_files_only=local_files_only,
         )
         # self.model = AutoTokenizer.from_pretrained("Qwen/Qwen2-7B-Instruct")
         # Qwen2 don't set bos but have <|im_start|>

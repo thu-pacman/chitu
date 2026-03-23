@@ -23,8 +23,8 @@ MODEL_NAME="LLaDA2.0-mini"
 
 run_server(){
     SERVE_JOB_NAME="run_serve_tp2" # Changed to a unique name for TP=2 run
-    SLURM_PARTITION=Long
-    NUM_GPUS=2
+    SLURM_PARTITION=long
+    NUM_GPUS=1
     CPUS_PER_GPU=24
     MEM_PER_GPU=142144
 
@@ -48,14 +48,14 @@ run_server(){
         HYDRA_FULL_ERROR=1 \
         torchrun \
             --nnodes=\$NUM_NODES \
-            --nproc_per_node=2 \
+            --nproc_per_node=1 \
             -m chitu \
             serve.port=21002 \
             infer.pp_size=1 \
-            infer.tp_size=2 \
+            infer.tp_size=1 \
             infer.cache_type=paged \
             models=LLaDA2.0-mini \
-            models.ckpt_dir=/home/dataset/LLaDA2.0-mini \
+            models.ckpt_dir=/data/nfs/LLaDA2.1-mini \
             infer.use_cuda_graph=True \
             infer.max_reqs=256 \
             infer.max_seq_len=2048 \
@@ -79,7 +79,7 @@ run_benchmark(){
             --base-url http://${host_name}:21002 \
             --output-dir "./results" \
             --dataset sharegpt \
-            --dataset-path /home/dataset/SharedGPT/ShareGPT_V3_unfiltered_cleaned_split.json \
+            --dataset-path /data/nfs/ShareGPT_V3_unfiltered_cleaned_split.json \
             2>&1 | stdbuf -o0 tee "$temp_file"  # Do not delete
 
         # Extract result from temp_file, Do not delete
