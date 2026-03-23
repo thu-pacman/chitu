@@ -499,7 +499,13 @@ class MetadataSerializer:
             # PackedTasksBase 特判：只能使用 special 和 TP 配置，和 TP 传输放一起
             if tasks.task_type == TaskType.Prefill:
                 return MetadataConfig.for_tp_prefill()
+            # DLLM 与常规 Prefill/Decode 一样走 TP 精简元数据，否则缺 token_lengths/num_tokens，
+            # worker 会默认 num_tokens=num_tasks（常为 1），payload 与 TP broadcast 源张量形状不一致。
+            if tasks.task_type == TaskType.PrefillDLLM:
+                return MetadataConfig.for_tp_prefill()
             elif tasks.task_type == TaskType.Decode:
+                return MetadataConfig.for_tp_decode()
+            elif tasks.task_type == TaskType.DecodeDLLM:
                 return MetadataConfig.for_tp_decode()
             else:
                 return MetadataConfig.for_special()

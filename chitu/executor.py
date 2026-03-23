@@ -1345,6 +1345,7 @@ class Executor:
 
             for dispatcher in self.task_dispatchers:
                 payload = dispatcher.recv_payload(payload)
+            logger.info(f"[RANK {self.rank}] recieved payload.")
         else:
             for dispatcher in self.task_dispatchers:
                 payload = dispatcher.recv_payload(self.dummy_logits)
@@ -1587,8 +1588,8 @@ class Executor:
                     )
                     shape = (batch_size, current_cache_length, num_kv_heads, head_dim)
                     dense = torch.zeros(shape, dtype=ragged.dtype, device=self.device)
-                    for idx, (s, p) in enumerate(zip(seq_list, pos_list)):
-                        dense[s, p, :, :] = ragged[idx]
+                    # 向量化 scatter；避免按 token 的 Python 循环（20 层×2×decode_start 可达上万次小 kernel）
+                    dense[seq_ids, position_ids, :, :] = ragged
                     dense = dense.permute(0, 2, 1, 3)
                     if kv_name == "k":
                         past_k_list.append(dense)
@@ -1750,8 +1751,8 @@ class Executor:
                 block_slice = x.data[
                     i, decoding_start_list[i] : decoding_start_list[i] + block_length
                 ]
-                if task.decoding_start > 256:
-                    block_slice[-1] = eos_id
+                # if task.decoding_start > 256:
+                #     block_slice[-1] = eos_id
                 task.next_block = block_slice.cpu().tolist()
                 if block_finished_list[i]:
                     task.decoding_start += block_length
