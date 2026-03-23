@@ -20,8 +20,8 @@ from chitu.moe.batched_expert_result import (
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
-    PerExpertDenseBatchedRoutedActivation,
-    PerExpertDenseBatchedRoutedActivationBlockfp8,
+    PerExpertDenseBatchedRoutedActivationMinimal,
+    PerExpertDenseBatchedRoutedActivationBlockfp8Minimal,
 )
 from chitu.moe.load_balancer import get_moe_load_planner
 from chitu.global_vars import get_global_args
@@ -146,7 +146,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         may_fuse_quant: Optional[str] = None,
         may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
-    ) -> tuple[PerExpertDenseBatchedRoutedActivation, Optional[torch.Tensor]]:
+    ) -> tuple[PerExpertDenseBatchedRoutedActivationMinimal, Optional[torch.Tensor]]:
         routed_x, weights, dispatch_stream = self.enter_moe_dispatch_streaming(
             x,
             topk_weights,
@@ -216,7 +216,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
 
         if not dispatch_use_fp8:
             return (
-                PerExpertDenseBatchedRoutedActivation(
+                PerExpertDenseBatchedRoutedActivationMinimal(
                     activation_per_expert=recv_activation,
                     n_tokens_per_expert=recv_expert_count,
                     expert_ids_are_local=True,
@@ -227,7 +227,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         else:
             recv_activation, recv_activation_scale = recv_activation
             return (
-                PerExpertDenseBatchedRoutedActivationBlockfp8(
+                PerExpertDenseBatchedRoutedActivationBlockfp8Minimal(
                     activation_per_expert=recv_activation,
                     activation_scale_per_expert=recv_activation_scale,
                     n_tokens_per_expert=recv_expert_count,

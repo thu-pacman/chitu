@@ -219,3 +219,131 @@ def moe_sum_expert_block_permuted_triton(
 
 
 # SPDX-SnippetEnd
+
+
+def moe_sum_per_expert_dense_triton(
+    activation_per_expert: torch.Tensor,
+    token_to_expert_indices: torch.Tensor,
+    token_pos_in_expert: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+):
+    # NOTE: Although this function accept inplace `out` parameter, but `out` cannot
+    # have the same address as any input tensor, due to Triton limitations.
+
+    E, _, N = activation_per_expert.shape
+    M, topk = token_to_expert_indices.shape
+
+    # SPDX-SnippetBegin
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-SnippetCopyrightText: 2025 unslothai
+    # SDPX—SnippetName: calculate_settings from unsloth
+    def calculate_settings(n):
+        # reference: https://github.com/unslothai/unsloth/blob/fd753fed99ed5f10ef8a9b7139588d9de9ddecfb/unsloth/kernels/utils.py#L43
+
+        MAX_FUSED_SIZE = 65536
+        BLOCK_SIZE = triton.next_power_of_2(n)
+        if BLOCK_SIZE > MAX_FUSED_SIZE:
+            raise RuntimeError(
+                f"Cannot launch Triton kernel since n = {n} exceeds "
+                f"the recommended Triton blocksize = {MAX_FUSED_SIZE}."
+            )
+
+        num_warps = 4
+        if BLOCK_SIZE >= 32768:
+            num_warps = 32
+        elif BLOCK_SIZE >= 8192:
+            num_warps = 16
+        elif BLOCK_SIZE >= 1024:
+            num_warps = 8
+        return BLOCK_SIZE, num_warps
+
+    # SPDX-SnippetEnd
+
+    BLOCK_SIZE_N, num_warps = calculate_settings(N)
+    # Determine grid and block sizes
+
+    if out is None:
+        out = torch.empty(
+            (M, N),
+            device=activation_per_expert.device,
+            dtype=activation_per_expert.dtype,
+        )
+    assert out.shape == (M, N)
+    assert out.dtype == activation_per_expert.dtype
+
+    assert token_to_expert_indices.is_contiguous()
+    assert token_pos_in_expert.is_contiguous()
+    assert topk_weights.is_contiguous()
+    assert out.is_contiguous()
+
+    moe_sum_per_expert_dense_triton_kernel[M,](
+        activation_per_expert,
+        token_to_expert_indices,
+        token_pos_in_expert,
+        topk_weights,
+        out,
+        E,
+        M,
+        topk,
+        N,
+        activation_per_expert_stride0=activation_per_expert.stride(0),
+        activation_per_expert_stride1=activation_per_expert.stride(1),
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        num_warps=num_warps,
+    )
+
+    return out
+
+
+@triton.jit
+def moe_sum_per_expert_dense_triton_kernel(
+    # Pointers to matrices
+    activation_per_expert_ptr,  # (M, max_n_tokens_per_expert, N)
+    token_to_expert_ptr,  # (M, topk)
+    token_pos_in_expert_ptr,  # (M, topk)
+    topk_weights_ptr,  # (M, topk)
+    output_ptr,  # (M, N)
+    # Matrix dimensions
+    E,
+    M,
+    topk,
+    N,
+    activation_per_expert_stride0,
+    activation_per_expert_stride1,
+    # Meta-parameters
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    # Program ID
+    row_index = tl.program_id(axis=0)
+    # Create offsets for m and n dimensions
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
+
+    # Create a mask to handle the case where the block extends beyond the matrix
+    n_mask = offs_n < N
+
+    # Initialize the output sum to zero
+    output_sum = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
+
+    # Loop over the topk dimension
+    for k in range(topk):
+        expert_id = tl.load(token_to_expert_ptr + row_index * topk + k)
+        if expert_id >= 0 and expert_id < E:
+            token_pos_in_expert = tl.load(
+                token_pos_in_expert_ptr + row_index * topk + k
+            )
+            x = tl.load(
+                activation_per_expert_ptr
+                + expert_id * activation_per_expert_stride0
+                + token_pos_in_expert * activation_per_expert_stride1
+                + offs_n,
+                mask=n_mask,
+                other=0.0,
+            )
+            topk_weight = tl.load(topk_weights_ptr + row_index * topk + k)
+            output_sum += x * topk_weight
+
+    # Store the final sum to the output tensor
+    output_offset = row_index * N + offs_n
+    tl.store(output_ptr + output_offset, output_sum, mask=n_mask)

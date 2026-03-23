@@ -37,11 +37,14 @@ from chitu.ops.triton_ops.quant import (
 from chitu.ops.triton_ops.moe_sum import (
     moe_sum_per_token_triton,
     moe_sum_expert_block_permuted_triton,
+    moe_sum_per_expert_dense_triton,
 )
 from chitu.ops.triton_ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_expert_block_indexed_triton,
     batched_routed_activation_indexed_to_expert_block_permuted_triton,
     batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton,
+    batched_routed_activation_indexed_to_per_expert_dense_triton,
+    batched_routed_activation_indexed_to_per_expert_dense_blockfp8_triton,
 )
 from chitu.ops.triton_ops.attn import (
     prefill_ragged_qkvo_triton,

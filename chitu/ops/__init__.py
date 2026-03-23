@@ -20,6 +20,7 @@ from chitu.ops.moe_gate import moe_gate
 from chitu.ops.moe_sum import (
     moe_sum_per_token,
     moe_sum_expert_block_permuted,
+    moe_sum_per_expert_dense,
     moe_sum_expert_concat_permuted,
 )
 from chitu.ops.linear_attn import (
@@ -62,6 +63,8 @@ from chitu.ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_expert_block_indexed,
     batched_routed_activation_indexed_to_expert_block_permuted,
     batched_routed_activation_indexed_to_expert_block_permuted_blockfp8,
+    batched_routed_activation_indexed_to_per_expert_dense,
+    batched_routed_activation_indexed_to_per_expert_dense_blockfp8,
     batched_routed_activation_indexed_to_concat_permuted,
 )
 from chitu.ops.hadamard import hadamard_transform

@@ -14,6 +14,8 @@ from chitu.ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_expert_block_permuted_blockfp8,
     batched_routed_activation_indexed_to_concat_permuted,
     batched_routed_activation_indexed_to_expert_block_permuted,
+    batched_routed_activation_indexed_to_per_expert_dense,
+    batched_routed_activation_indexed_to_per_expert_dense_blockfp8,
 )
 
 
@@ -470,9 +472,14 @@ class ExpertBlockPermutedBatchedRoutedActivationBlockfp8(
 
 
 @dataclass
-class PerExpertDenseBatchedRoutedActivation(BatchedRoutedActivation):
+class PerExpertDenseBatchedRoutedActivationMinimal(BatchedRoutedActivation):
     """
-    Activation is copied top-k times and stored densely for each expert.
+    Activation is copied top-k times and stored densely for each expert (minimal
+    variant).
+
+    Please note that this "minimal" variant does NOT contain necessary indices
+    for local summation. It is dedicated for summing inside DeepEP. In order
+    for full functionality, please use `PerExpertDenseBatchedRoutedActivation`.
     """
 
     activation_per_expert: (
@@ -482,12 +489,81 @@ class PerExpertDenseBatchedRoutedActivation(BatchedRoutedActivation):
 
 
 @dataclass
-class PerExpertDenseBatchedRoutedActivationBlockfp8(
-    PerExpertDenseBatchedRoutedActivation
+class PerExpertDenseBatchedRoutedActivation(
+    PerExpertDenseBatchedRoutedActivationMinimal
+):
+    """
+    Activation is copied top-k times and stored densely for each expert (full variant).
+
+    Compared to `PerExpertDenseBatchedRoutedActivationMinimal`, this variant also contains
+    information describing, for every (token, topk) pair, the corresponding position
+    in that expert's activation buffer.
+    """
+
+    token_to_expert_indices: torch.Tensor  # [batch_size, topk]
+    token_pos_in_expert: torch.Tensor  # [batch_size, topk]
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(
+        cls, old: IndexedBatchedRoutedActivation, *, num_experts: int
+    ) -> "PerExpertDenseBatchedRoutedActivation":
+        (activation_per_expert, n_tokens_per_expert, token_pos_in_expert) = (
+            batched_routed_activation_indexed_to_per_expert_dense(
+                old.activation, old.token_to_expert_indices, num_experts=num_experts
+            )
+        )
+        return cls(
+            activation_per_expert=activation_per_expert,
+            n_tokens_per_expert=n_tokens_per_expert,
+            token_to_expert_indices=old.token_to_expert_indices,
+            token_pos_in_expert=token_pos_in_expert,
+            expert_ids_are_local=old.expert_ids_are_local,
+        )
+
+
+@dataclass
+class PerExpertDenseBatchedRoutedActivationBlockfp8Minimal(
+    PerExpertDenseBatchedRoutedActivationMinimal
 ):
     activation_scale_per_expert: (
         torch.Tensor
     )  # [n_experts, max_n_tokens_per_expert, hidden_size // quant_block_size]
+
+
+@dataclass
+class PerExpertDenseBatchedRoutedActivationBlockfp8(
+    PerExpertDenseBatchedRoutedActivationBlockfp8Minimal
+):
+    token_to_expert_indices: torch.Tensor  # [batch_size, topk]
+    token_pos_in_expert: torch.Tensor  # [batch_size, topk]
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(
+        cls, old: IndexedBatchedRoutedActivationBlockfp8, *, num_experts: int
+    ) -> "PerExpertDenseBatchedRoutedActivationBlockfp8":
+        (
+            activation_per_expert,
+            activation_scale_per_expert,
+            n_tokens_per_expert,
+            token_pos_in_expert,
+        ) = batched_routed_activation_indexed_to_per_expert_dense_blockfp8(
+            old.activation,
+            old.activation_scale,
+            old.token_to_expert_indices,
+            num_experts=num_experts,
+        )
+        return cls(
+            activation_per_expert=activation_per_expert,
+            activation_scale_per_expert=activation_scale_per_expert,
+            n_tokens_per_expert=n_tokens_per_expert,
+            token_to_expert_indices=old.token_to_expert_indices,
+            token_pos_in_expert=token_pos_in_expert,
+            expert_ids_are_local=old.expert_ids_are_local,
+        )
 
 
 @dataclass

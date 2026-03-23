@@ -536,3 +536,214 @@ def batched_routed_activation_indexed_to_expert_block_permuted_triton(
         token_comma_topk_to_block_x_item_indices,
         block_to_expert_indices.view(n_blocks, block_size),
     )
+
+
+@triton.jit
+def batched_routed_activation_indexed_to_per_expert_dense_triton_kernel(
+    activation_ptr,
+    activation_scale_ptr,
+    token_to_expert_indices_ptr,
+    activation_per_expert_ptr,
+    activation_scale_per_expert_ptr,
+    n_tokens_per_expert_ptr,
+    token_pos_in_expert_ptr,
+    activation_stride0,
+    activation_scale_stride0,
+    token_to_expert_indices_stride0,
+    activation_per_expert_stride0,
+    activation_per_expert_stride1,
+    activation_scale_per_expert_stride0,
+    activation_scale_per_expert_stride1,
+    token_pos_in_expert_stride0,
+    bs,
+    TOPK: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    HIDDEN_DIM: tl.constexpr,
+    HIDDEN_DIM_PADDED: tl.constexpr,
+    SCALE_DIM: tl.constexpr = None,
+    SCALE_DIM_PADDED: tl.constexpr = None,
+    BS_BLOCK: tl.constexpr = 256,
+    HAS_SCALE: tl.constexpr = False,
+):
+    pid = tl.program_id(0)
+    if pid < bs:
+        # The first part contains bs * topk blocks, each processing one token in activation
+        token_id = pid
+        activation = tl.load(
+            activation_ptr
+            + token_id * activation_stride0
+            + tl.arange(0, HIDDEN_DIM_PADDED),
+            mask=tl.arange(0, HIDDEN_DIM_PADDED) < HIDDEN_DIM,
+        )
+        if HAS_SCALE:
+            activation_scale = tl.load(
+                activation_scale_ptr
+                + token_id * activation_scale_stride0
+                + tl.arange(0, SCALE_DIM_PADDED),
+                mask=tl.arange(0, SCALE_DIM_PADDED) < SCALE_DIM,
+            )
+        for topk_id in tl.range(TOPK):
+            expert_id = tl.load(
+                token_to_expert_indices_ptr
+                + token_id * token_to_expert_indices_stride0
+                + topk_id
+            )
+            if expert_id >= 0 and expert_id < NUM_EXPERTS:
+                # Count the number of selected expert before this one
+                expert_indices_before_accum = tl.zeros((BS_BLOCK, TOPK), dtype=tl.int32)
+                for i in tl.range(0, token_id, BS_BLOCK):
+                    expert_indices_before = tl.load(
+                        token_to_expert_indices_ptr
+                        + (i + tl.arange(0, BS_BLOCK))[:, None]
+                        * token_to_expert_indices_stride0
+                        + tl.arange(0, TOPK)[None, :],
+                        mask=(i + tl.arange(0, BS_BLOCK) < token_id)[:, None],
+                        other=-1,
+                    )
+                    expert_indices_before_accum += expert_indices_before == expert_id
+                offset_in_expert = tl.sum(expert_indices_before_accum)
+
+                tl.store(
+                    activation_per_expert_ptr
+                    + expert_id * activation_per_expert_stride0
+                    + offset_in_expert * activation_per_expert_stride1
+                    + tl.arange(0, HIDDEN_DIM_PADDED),
+                    activation,
+                    mask=tl.arange(0, HIDDEN_DIM_PADDED) < HIDDEN_DIM,
+                )
+                if HAS_SCALE:
+                    tl.store(
+                        activation_scale_per_expert_ptr
+                        + expert_id * activation_scale_per_expert_stride0
+                        + offset_in_expert * activation_scale_per_expert_stride1
+                        + tl.arange(0, SCALE_DIM_PADDED),
+                        activation_scale,
+                        mask=tl.arange(0, SCALE_DIM_PADDED) < SCALE_DIM,
+                    )
+                tl.store(
+                    token_pos_in_expert_ptr
+                    + token_id * token_pos_in_expert_stride0
+                    + topk_id,
+                    offset_in_expert,
+                )
+    else:
+        # The second part contains NUM_EXPERTS blocks, each processing one element in n_tokens_per_expert
+        expert_id = pid - bs
+
+        # Count the number of selected expert
+        expert_indices_accum = tl.zeros((BS_BLOCK, TOPK), dtype=tl.int32)
+        for i in tl.range(0, bs, BS_BLOCK):
+            expert_indices = tl.load(
+                token_to_expert_indices_ptr
+                + (i + tl.arange(0, BS_BLOCK))[:, None]
+                * token_to_expert_indices_stride0
+                + tl.arange(0, TOPK)[None, :],
+                mask=(i + tl.arange(0, BS_BLOCK) < bs)[:, None],
+                other=-1,
+            )
+            expert_indices_accum += expert_indices == expert_id
+        cnt = tl.sum(expert_indices_accum)
+
+        tl.store(n_tokens_per_expert_ptr + expert_id, cnt)
+
+
+def batched_routed_activation_indexed_to_per_expert_dense_triton(
+    activation: torch.Tensor, token_to_expert_indices: torch.Tensor, *, num_experts: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bs, hidden_dim = activation.shape
+    _, topk = token_to_expert_indices.shape
+    activation_per_expert = torch.empty(
+        (num_experts, bs, hidden_dim), dtype=activation.dtype, device=activation.device
+    )
+    n_tokens_per_expert = torch.empty(
+        num_experts, dtype=torch.int32, device=activation.device
+    )
+    token_pos_in_expert = torch.empty(
+        (bs, topk), dtype=torch.int32, device=activation.device
+    )
+
+    grid = (bs + num_experts,)
+    batched_routed_activation_indexed_to_per_expert_dense_triton_kernel[grid](
+        activation,
+        None,
+        token_to_expert_indices,
+        activation_per_expert,
+        None,
+        n_tokens_per_expert,
+        token_pos_in_expert,
+        activation_stride0=activation.stride(0),
+        activation_scale_stride0=None,
+        token_to_expert_indices_stride0=token_to_expert_indices.stride(0),
+        activation_per_expert_stride0=activation_per_expert.stride(0),
+        activation_per_expert_stride1=activation_per_expert.stride(1),
+        activation_scale_per_expert_stride0=None,
+        activation_scale_per_expert_stride1=None,
+        token_pos_in_expert_stride0=token_pos_in_expert.stride(0),
+        bs=bs,
+        TOPK=topk,
+        NUM_EXPERTS=num_experts,
+        HIDDEN_DIM=hidden_dim,
+        HIDDEN_DIM_PADDED=triton.next_power_of_2(hidden_dim),
+    )
+
+    return activation_per_expert, n_tokens_per_expert, token_pos_in_expert
+
+
+def batched_routed_activation_indexed_to_per_expert_dense_blockfp8_triton(
+    activation: torch.Tensor,
+    activation_scale: torch.Tensor,
+    token_to_expert_indices: torch.Tensor,
+    *,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    bs, hidden_dim = activation.shape
+    _, scale_dim = activation_scale.shape
+    _, topk = token_to_expert_indices.shape
+    activation_per_expert = torch.empty(
+        (num_experts, bs, hidden_dim), dtype=activation.dtype, device=activation.device
+    )
+    activation_scale_per_expert = torch.empty(
+        (num_experts, bs, scale_dim),
+        dtype=activation_scale.dtype,
+        device=activation.device,
+    )
+    n_tokens_per_expert = torch.empty(
+        num_experts, dtype=torch.int32, device=activation.device
+    )
+    token_pos_in_expert = torch.empty(
+        (bs, topk), dtype=torch.int32, device=activation.device
+    )
+
+    grid = (bs + num_experts,)
+    batched_routed_activation_indexed_to_per_expert_dense_triton_kernel[grid](
+        activation,
+        activation_scale,
+        token_to_expert_indices,
+        activation_per_expert,
+        activation_scale_per_expert,
+        n_tokens_per_expert,
+        token_pos_in_expert,
+        activation_stride0=activation.stride(0),
+        activation_scale_stride0=activation_scale.stride(0),
+        token_to_expert_indices_stride0=token_to_expert_indices.stride(0),
+        activation_per_expert_stride0=activation_per_expert.stride(0),
+        activation_per_expert_stride1=activation_per_expert.stride(1),
+        activation_scale_per_expert_stride0=activation_scale_per_expert.stride(0),
+        activation_scale_per_expert_stride1=activation_scale_per_expert.stride(1),
+        token_pos_in_expert_stride0=token_pos_in_expert.stride(0),
+        bs=bs,
+        TOPK=topk,
+        NUM_EXPERTS=num_experts,
+        HIDDEN_DIM=hidden_dim,
+        HIDDEN_DIM_PADDED=triton.next_power_of_2(hidden_dim),
+        SCALE_DIM=scale_dim,
+        SCALE_DIM_PADDED=triton.next_power_of_2(scale_dim),
+        HAS_SCALE=True,
+    )
+
+    return (
+        activation_per_expert,
+        activation_scale_per_expert,
+        n_tokens_per_expert,
+        token_pos_in_expert,
+    )

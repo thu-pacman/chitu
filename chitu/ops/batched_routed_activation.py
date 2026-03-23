@@ -5,11 +5,11 @@
 import torch
 
 from chitu.device_type import has_accelerator
-from chitu.utils import (
+from chitu.utils import ceil_div
+from chitu.import_utils import (
     try_import_platform_dep,
     try_import_opt_dep,
     try_import_and_setup_torch_npu,
-    ceil_div,
 )
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
@@ -24,6 +24,8 @@ if has_triton and has_accelerator():
         batched_routed_activation_indexed_to_expert_block_indexed_triton,
         batched_routed_activation_indexed_to_expert_block_permuted_triton,
         batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton,
+        batched_routed_activation_indexed_to_per_expert_dense_triton,
+        batched_routed_activation_indexed_to_per_expert_dense_blockfp8_triton,
     )
 
 
@@ -318,6 +320,153 @@ def batched_routed_activation_indexed_to_expert_block_permuted(
         )
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+def batched_routed_activation_indexed_to_per_expert_dense(
+    activation: torch.Tensor,
+    token_to_expert_indices: torch.Tensor,
+    *,
+    num_experts: int,
+    impl: str = "auto",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Transform from IndexedBatchedRoutedActivation to PerExpertDenseBatchedRoutedActivation
+
+    Args:
+        activation: IndexedBatchedRoutedActivation.activation.
+        token_to_expert_indices (torch.Tensor): IndexedBatchedRoutedActivation.token_to_expert_indices.
+        num_experts: Number of experts.
+
+    Returns:
+        [0]: PerExpertDenseBatchedRoutedActivation.activation_per_expert
+        [1]: PerExpertDenseBatchedRoutedActivation.n_tokens_per_expert
+        [2]: PerExpertDenseBatchedRoutedActivation.token_pos_in_expert
+    """
+
+    if impl == "auto":
+        if has_triton:
+            impl = "triton"
+        else:
+            impl = "ref"
+
+    if impl == "ref":
+        return batched_routed_activation_indexed_to_per_expert_dense_ref(
+            activation, token_to_expert_indices, num_experts=num_experts
+        )
+    elif impl == "triton":
+        return batched_routed_activation_indexed_to_per_expert_dense_triton(
+            activation, token_to_expert_indices, num_experts=num_experts
+        )
+    else:
+        raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+def batched_routed_activation_indexed_to_per_expert_dense_blockfp8(
+    activation: torch.Tensor,
+    activation_scale: torch.Tensor,
+    token_to_expert_indices: torch.Tensor,
+    *,
+    num_experts: int,
+    impl: str = "auto",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Transform from IndexedBatchedRoutedActivationBlockfp8 to PerExpertDenseBatchedRoutedActivationBlockfp8
+
+    Args:
+        activation: IndexedBatchedRoutedActivationBlockfp8.activation.
+        activation_scale: IndexedBatchedRoutedActivationBlockfp8.activation_scale.
+        token_to_expert_indices (torch.Tensor): IndexedBatchedRoutedActivationBlockfp8.token_to_expert_indices.
+        num_experts: Number of experts.
+
+    Returns:
+        [0]: PerExpertDenseBatchedRoutedActivationBlockfp8.activation_per_expert
+        [0]: PerExpertDenseBatchedRoutedActivationBlockfp8.activation_scale_per_expert
+        [1]: PerExpertDenseBatchedRoutedActivationBlockfp8.n_tokens_per_expert
+        [2]: PerExpertDenseBatchedRoutedActivationBlockfp8.token_pos_in_expert
+    """
+
+    if impl == "auto":
+        if has_triton:
+            impl = "triton"
+        else:
+            impl = "ref"
+
+    if impl == "ref":
+        return batched_routed_activation_indexed_to_per_expert_dense_blockfp8_ref(
+            activation,
+            activation_scale,
+            token_to_expert_indices,
+            num_experts=num_experts,
+        )
+    elif impl == "triton":
+        return batched_routed_activation_indexed_to_per_expert_dense_blockfp8_triton(
+            activation,
+            activation_scale,
+            token_to_expert_indices,
+            num_experts=num_experts,
+        )
+    else:
+        raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+
+def batched_routed_activation_indexed_to_per_expert_dense_ref(
+    activation: torch.Tensor, token_to_expert_indices: torch.Tensor, *, num_experts: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bs, hidden_dim = activation.shape
+    _, topk = token_to_expert_indices.shape
+    activation_per_expert = torch.empty(
+        (num_experts, bs, hidden_dim), dtype=activation.dtype, device=activation.device
+    )
+    token_pos_in_expert = torch.empty(
+        (bs, topk), dtype=torch.int32, device=activation.device
+    )
+    write_pos = torch.zeros(num_experts, dtype=torch.int32, device=activation.device)
+    for token_id in range(bs):
+        for k in range(topk):
+            expert_id = token_to_expert_indices[token_id, k].item()
+            pos = write_pos[expert_id].item()
+            activation_per_expert[expert_id, pos] = activation[token_id]
+            token_pos_in_expert[token_id, k] = pos
+            write_pos[expert_id] += 1
+    return activation_per_expert, write_pos, token_pos_in_expert
+
+
+def batched_routed_activation_indexed_to_per_expert_dense_blockfp8_ref(
+    activation: torch.Tensor,
+    activation_scale: torch.Tensor,
+    token_to_expert_indices: torch.Tensor,
+    *,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    bs, hidden_dim = activation.shape
+    _, scale_dim = activation_scale.shape
+    _, topk = token_to_expert_indices.shape
+    activation_per_expert = torch.empty(
+        (num_experts, bs, hidden_dim), dtype=activation.dtype, device=activation.device
+    )
+    activation_scale_per_expert = torch.empty(
+        (num_experts, bs, scale_dim),
+        dtype=activation_scale.dtype,
+        device=activation.device,
+    )
+    token_pos_in_expert = torch.empty(
+        (bs, topk), dtype=torch.int32, device=activation.device
+    )
+    write_pos = torch.zeros(num_experts, dtype=torch.int32, device=activation.device)
+    for token_id in range(bs):
+        for k in range(topk):
+            expert_id = token_to_expert_indices[token_id, k].item()
+            pos = write_pos[expert_id].item()
+            activation_per_expert[expert_id, pos] = activation[token_id]
+            activation_scale_per_expert[expert_id, pos] = activation_scale[token_id]
+            token_pos_in_expert[token_id, k] = pos
+            write_pos[expert_id] += 1
+    return (
+        activation_per_expert,
+        activation_scale_per_expert,
+        write_pos,
+        token_pos_in_expert,
+    )
 
 
 def batched_routed_activation_indexed_to_concat_permuted(
