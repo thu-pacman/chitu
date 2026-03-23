@@ -1518,9 +1518,10 @@ class Executor:
 
         # 2) Prepare payload: main rank from tasks, workers receive via broadcast
         logger.info(f"decode task ids: {tasks.task_ids=}")
-        if (self.rank == 0 or (self.dp_size > 1 and self.dp_dispatcher is not None)) and isinstance(
-            tasks, PackedTasks
-        ):
+        if (
+            self.is_main_rank
+            or (self.dp_size > 1 and self.dp_dispatcher is not None)
+        ) and isinstance(tasks, PackedTasks):
             payload = self._prepare_blocks_for_decode_dllm(tasks)
         else:
             payload = torch.empty(
@@ -1548,8 +1549,13 @@ class Executor:
         t0 = time.perf_counter()
         inner_model = Backend.model.model.model
         num_layers = inner_model.config.num_hidden_layers
-        num_kv_heads = inner_model.config.num_key_value_heads
-        head_dim = inner_model.config.hidden_size // inner_model.config.num_attention_heads
+        cache_manager = Backend.cache_managers["main"]
+        # TP 下 paged KV 存的是每 rank 的 n_local_kv_heads；dInfer ModelRunner 也按 num_kv_heads//tp_size
+        # 分配 cache。此处必须用 cache 的 shape，不能用 config.num_key_value_heads（全局），否则
+        # dense 与 ragged 维数不一致，或各 rank 传入的 past 与内部通信假设不一致 → NCCL 卡死。
+        _kv_per_token = cache_manager.shape_per_token_dict["k"]
+        num_kv_heads = int(_kv_per_token[0])
+        head_dim = int(_kv_per_token[1])
 
         current_cache_length = max(decoding_start_list) + block_length
         def align_exp2(x):
@@ -1564,7 +1570,6 @@ class Executor:
                 seq_list.append(i)
         total_read_tokens = len(pos_list)
 
-        cache_manager = Backend.cache_managers["main"]
         block_table = cache_manager.get_gpu_block_table() if cache_manager else None
 
         if total_read_tokens > 0 and block_table is not None:
@@ -1610,8 +1615,8 @@ class Executor:
         t_kv_read = time.perf_counter() - t0
         logger.info(
             f"[DLLM_PROFILE] decode kv_read: {t_kv_read*1000:.2f}ms "
-            f"(layers={num_layers}, read_tokens={total_read_tokens}, "
-            f"cache_len={current_cache_length})"
+            f"(layers={num_layers}, n_local_kv_heads={num_kv_heads}, "
+            f"read_tokens={total_read_tokens}, cache_len={current_cache_length})"
         )
 
         # 5) Reshape payload to [batch, block_length] and build position_ids
