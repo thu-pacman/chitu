@@ -142,7 +142,7 @@ class DPTokenSender:
             self.request_token_cache[request_id].append(token)
             cache_tokens = self.request_token_cache[request_id]
 
-            # Decode all accumulated tokens
+            # Decode incremental tokens if force_full_seq_decode is False
             s = Backend.tokenizer.decode(cache_tokens)
 
             # Skip if incomplete UTF-8 sequence (wait for more tokens)
@@ -150,8 +150,12 @@ class DPTokenSender:
                 text = ""
             else:
                 # Output incremental text
-                text = s[self._chars_len[request_id] :]
-                self._chars_len[request_id] = len(s)
+                if not Backend.tokenizer.force_full_seq_decode:
+                    text = s
+                    self.request_token_cache[request_id].clear()
+                else:
+                    text = s[self._chars_len[request_id] :]
+                    self._chars_len[request_id] = len(s)
 
             # logger.debug(
             #     f"DP Token Sender: [request {request_id}] decode token {token} -> '{text}'"
