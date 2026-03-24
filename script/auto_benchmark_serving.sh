@@ -22,9 +22,9 @@ SERVER_LOG_FILE="chitu_run.log"
 MODEL_NAME="LLaDA2.0-mini"
 
 run_server(){
-    SERVE_JOB_NAME="run_serve_tp2" # Changed to a unique name for TP=2 run
+    SERVE_JOB_NAME="run_serve_tp8" # Changed to a unique name for TP=2 run
     SLURM_PARTITION=long
-    NUM_GPUS=2                # 用2张卡跑TP=2
+    NUM_GPUS=8                # 用2张卡跑TP=2
     CPUS_PER_GPU=24
     MEM_PER_GPU=142144
 
@@ -48,11 +48,11 @@ run_server(){
         HYDRA_FULL_ERROR=1 \
         torchrun \
             --nnodes=\$NUM_NODES \
-            --nproc_per_node=2 \
+            --nproc_per_node=8 \
             -m chitu \
             serve.port=21002 \
             infer.pp_size=1 \
-            infer.tp_size=2 \
+            infer.tp_size=8 \
             infer.cache_type=paged \
             models=LLaDA2.0-mini \
             models.ckpt_dir=/data/nfs/LLaDA2.1-mini \
@@ -67,7 +67,7 @@ run_benchmark(){
     local host_name=$1
     local temp_file=$(mktemp)
     # for bsz in 1 2 4 8 16 32 64 128 256
-    for bsz in 2
+    for bsz in 16
     do
         python benchmarks/benchmark_serving.py \
             --batch-size $bsz \

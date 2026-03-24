@@ -62,6 +62,16 @@ from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
 logger = getLogger(__name__)
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+
 # Although tags are not fully supported in the NCCL backend, they are helpful to understand the code
 TASK_TENSOR_TAG = 1
 HIDDEN_TENSOR_TAG = 2
@@ -746,6 +756,10 @@ class Executor:
         )
         self._step_timing_min_ms = float(os.getenv("CHITU_STEP_TIMING_MIN_MS", "0"))
         self._decode_first_step_logged: set[str] = set()
+        # DLLM decode: torch.profiler Chrome trace（仅前 N 步，避免爆盘）
+        self._dllm_torch_prof_steps = int(
+            os.environ.get("CHITU_DLLM_TORCH_PROFILER_STEPS", "0")
+        )
 
         rank_filter = True
         if rank_filter and self.tp_size > 1:
@@ -1489,6 +1503,9 @@ class Executor:
         eos_id = decoder.eos_id
 
         batch_size = tasks.num_tasks
+        _dllm_split_prof = _env_flag("CHITU_DLLM_STEP_PROFILE")
+        prof_tp_bcast_decoding_ms = 0.0
+        prof_tp_payload_chain_ms = 0.0
 
         # 1) Get decoding_start_list: main rank from tasks, worker ranks via broadcast
         if self.tp_size > 1:
@@ -1502,11 +1519,17 @@ class Executor:
                 decoding_start_t = torch.empty(
                     batch_size, device=self.device, dtype=torch.long
                 )
+            if _dllm_split_prof:
+                torch.cuda.synchronize()
+                _t_tp_ds = time.perf_counter()
             torch.distributed.broadcast(
                 decoding_start_t,
                 src=tp_group.rank_list[0],
                 group=tp_group.gpu_group,
             )
+            if _dllm_split_prof:
+                torch.cuda.synchronize()
+                prof_tp_bcast_decoding_ms = (time.perf_counter() - _t_tp_ds) * 1000
             decoding_start_list = decoding_start_t.cpu().tolist()
         else:
             decoding_start_list = [
@@ -1529,9 +1552,15 @@ class Executor:
                 dtype=torch.long,
                 device=self.device,
             )
+        if _dllm_split_prof:
+            torch.cuda.synchronize()
+            _t_tp_pl = time.perf_counter()
         for dispatcher in self.task_dispatchers:
             payload = dispatcher.recv_payload(payload)
-        
+        if _dllm_split_prof:
+            torch.cuda.synchronize()
+            prof_tp_payload_chain_ms = (time.perf_counter() - _t_tp_pl) * 1000
+
         # 3) Prepare cache for DLLM (reserve blocks for decoding_start + block_length)
         t0 = time.perf_counter()
         self._kv_hook.before_decode_step(tasks.req_ids)
@@ -1632,16 +1661,47 @@ class Executor:
             + decoding_start_t.unsqueeze(1)
         )
 
-        # 6) Model forward
+        # 6) Model forward（TP 下各层 allreduce/allgather 等 NCCL 绝大部分落在此段时间内）
         t0 = time.perf_counter()
         torch.cuda.synchronize()
         logger.info(f"decoding_block: {decoding_block=}")
-        output = model_runner(
-            decoding_block,
-            use_cache=True,
-            position_ids=decoding_pos_ids,
-            past_key_values=past_key_values,
-        )
+        prof = None
+        run_torch_prof = self._dllm_torch_prof_steps > 0
+        if run_torch_prof:
+            self._dllm_torch_prof_steps -= 1
+            prof = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+                with_modules=True,
+            )
+            prof.start()
+        try:
+            output = model_runner(
+                decoding_block,
+                use_cache=True,
+                position_ids=decoding_pos_ids,
+                past_key_values=past_key_values,
+            )
+        finally:
+            if prof is not None:
+                prof.stop()
+                out_dir = os.environ.get(
+                    "CHITU_DLLM_PROF_DIR", "/tmp/chitu_dllm_torchprof"
+                )
+                os.makedirs(out_dir, exist_ok=True)
+                trace_path = os.path.join(
+                    out_dir,
+                    f"dllm_decode_rank{self.rank}_{time.time_ns()}.json",
+                )
+                prof.export_chrome_trace(trace_path)
+                logger.warning(
+                    "[DLLM_TORCH_PROF] Chrome trace -> %s "
+                    "(chrome://tracing 或 edge://tracing 打开；CUDA 区搜 nccl、all_reduce)",
+                    trace_path,
+                )
         torch.cuda.synchronize()
         t_forward = time.perf_counter() - t0
         logger.info(
@@ -1652,6 +1712,11 @@ class Executor:
 
         logits = output.logits
         logger.debug(f"{logits=}{logits.shape=}")
+        # CUDA Graph replay 会把 batch  pad 到 supported_batch_sizes（如 3→4、5→8），
+        # logits 第一维为 padded_bs，而 x_data 为真实 batch_size；不截断会导致
+        # batch_decode / torch.compile 里 mask_index 与 argmax(logits) 维数不一致（s31 vs s38）。
+        if logits.shape[0] != batch_size:
+            logits = logits[:batch_size, ...]
 
         # 7) batch_decode: update block in token array (broadcast_if_needed syncs from rank 0)
         t0 = time.perf_counter()
@@ -1746,6 +1811,26 @@ class Executor:
         logger.info(
             f"[DLLM_PROFILE] decode total: {(time.perf_counter()-t_step_start)*1000:.2f}ms"
         )
+        if _dllm_split_prof:
+            exposed_comm = prof_tp_bcast_decoding_ms + prof_tp_payload_chain_ms
+            logger.info(
+                "[DLLM_PROFILE_SPLIT] rank=%s tp_size=%s batch=%s | "
+                "exposed_comm_ms(tp_bcast_decoding_start=%.3f + dispatcher_payload=%.3f)=%.3f | "
+                "local_kv_read_ms=%.3f | forward_ms(mixed: dense_math + intra_forward_NCCL)=%.3f | "
+                "batch_decode_ms=%.3f | kv_write_ms=%.3f | "
+                "若 tp>>1 时 forward_ms 很大且 exposed_comm 很小，通常说明瓶颈在层内通信；"
+                "可设 CHITU_DLLM_TORCH_PROFILER_STEPS=1 导出 trace 看 nccl 占比。",
+                self.rank,
+                self.tp_size,
+                batch_size,
+                prof_tp_bcast_decoding_ms,
+                prof_tp_payload_chain_ms,
+                exposed_comm,
+                t_kv_read * 1000,
+                t_forward * 1000,
+                t_batch_decode * 1000,
+                t_kv_write * 1000,
+            )
 
         # 11) Update task state (main rank only): next_block, decoding_start; for block_finished
         #     create PackedTasks with tokens+output. Worker ranks have PackedTasksBase, skip.
