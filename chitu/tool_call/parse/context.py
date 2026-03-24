@@ -98,7 +98,7 @@ class StreamParseContext:
         string = ""
         async for chunk in stream:
             string += chunk
-            yield self.make_name_delta(chunk)
+        yield self.make_name_delta(string)
         self.name = string
 
     async def as_arguments(self, stream: AsyncIterable[str]):

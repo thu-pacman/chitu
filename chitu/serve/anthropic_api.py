@@ -38,21 +38,6 @@ class AnthropicThinking(BaseModel):
     type: Literal["enabled", "disabled", "adaptive"]
     budget_tokens: Optional[int] = None
 
-    @model_validator(mode="before")
-    @classmethod
-    def warn_unsupportd_params(cls, data):
-        if not isinstance(data, dict):
-            return data
-        if data.get("type") == "adaptive":
-            logger.warning(
-                "Anthropic parameter thinking.type='adaptive' is unsupported; falling back to 'enabled'"
-            )
-        if "budget_tokens" in data:
-            logger.warning(
-                "Anthropic thinking.budget_tokens is unsupported and will be ignored"
-            )
-        return data
-
 
 class AnthropicMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
