@@ -279,7 +279,12 @@ def test_batched_routed_activation_indexed_to_per_expert_dense(
     )
 
     assert activation_per_expert.dtype == activation.dtype
-    assert tuple(activation_per_expert.shape) == (num_experts, num_tokens, hidden_size)
+    assert activation_per_expert.ndim == 3
+    assert activation_per_expert.shape[0] == num_experts
+    assert (
+        activation_per_expert.shape[1] >= num_tokens
+    )  # No `==` for now, because we need to pad for a DeepGEMM bug
+    assert activation_per_expert.shape[2] == hidden_size
     assert tuple(n_tokens_per_expert.shape) == (num_experts,)
     assert tuple(token_pos_in_expert.shape) == (num_tokens, topk)
     for expert_id in range(num_experts):
@@ -336,11 +341,19 @@ def test_batched_routed_activation_indexed_to_per_expert_dense_blockfp8(
 
     assert activation_per_expert.dtype == activation.dtype
     assert activation_scale_per_expert.dtype == activation_scale.dtype
-    assert tuple(activation_per_expert.shape) == (num_experts, num_tokens, hidden_size)
-    assert tuple(activation_scale_per_expert.shape) == (
-        num_experts,
-        num_tokens,
-        ceil_div(hidden_size, quant_block_size),
+    assert activation_per_expert.ndim == 3
+    assert activation_per_expert.shape[0] == num_experts
+    assert (
+        activation_per_expert.shape[1] >= num_tokens
+    )  # No `==` for now, because we need to pad for a DeepGEMM bug
+    assert activation_per_expert.shape[2] == hidden_size
+    assert activation_scale_per_expert.ndim == 3
+    assert activation_scale_per_expert.shape[0] == num_experts
+    assert (
+        activation_scale_per_expert.shape[1] >= num_tokens
+    )  # No `==` for now, because we need to pad for a DeepGEMM bug
+    assert activation_scale_per_expert.shape[2] == ceil_div(
+        hidden_size, quant_block_size
     )
     assert tuple(n_tokens_per_expert.shape) == (num_experts,)
     assert tuple(token_pos_in_expert.shape) == (num_tokens, topk)

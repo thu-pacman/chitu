@@ -24,6 +24,7 @@ from chitu.moe.batched_expert_result import (
 from chitu.ops.quant import blockfp8_act_quant, silu_and_mul_and_blockfp8_act_quant
 from chitu.utils import try_import_opt_dep
 from chitu.ops import silu_and_mul
+from chitu.lazy import eval_lazy
 
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 
@@ -257,23 +258,24 @@ def _(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )
 
-    if not use_fp8_w8a8:
-        assert isinstance(
-            hidden_states, PerExpertDenseBatchedRoutedActivationBlockfp8Minimal
+    device = hidden_states.activation_per_expert.device
+    E, M, K = hidden_states.activation_per_expert.shape
+    E2, N, K2 = w1.shape
+    assert E == E2
+    assert K == K2
+
+    if M == 0:
+        intermediate_cache3 = torch.empty(
+            (E, M, K), device=device, dtype=torch.bfloat16
         )
+
+    elif not use_fp8_w8a8:
         assert has_deep_gemm, "BF16 masked path requires deep_gemm backend"
 
         hidden_states_bf16 = hidden_states.activation_per_expert
-        M = hidden_states_bf16.shape[1]
-        E, N, _ = w1.shape
 
         intermediate_cache1 = torch.empty(
-            (E, M, N), device=hidden_states_bf16.device, dtype=torch.bfloat16
-        )
-        intermediate_cache3 = torch.empty(
-            hidden_states_bf16.shape,
-            device=hidden_states_bf16.device,
-            dtype=torch.bfloat16,
+            (E, M, N), device=device, dtype=torch.bfloat16
         )
 
         deep_gemm.m_grouped_bf16_gemm_nt_masked(
@@ -284,10 +286,16 @@ def _(
             M,
         )
 
-        intermediate_cache2 = silu_and_mul(
-            intermediate_cache1.view(-1, N), impl="triton"
-        ).view_as(intermediate_cache1)
+        intermediate_cache2 = eval_lazy(
+            silu_and_mul(
+                intermediate_cache1, expert_n_tokens=hidden_states.n_tokens_per_expert
+            )
+        )
+        del intermediate_cache1
 
+        intermediate_cache3 = torch.empty(
+            (E, M, K), device=device, dtype=torch.bfloat16
+        )
         deep_gemm.m_grouped_bf16_gemm_nt_masked(
             intermediate_cache2,
             w2,
@@ -295,7 +303,7 @@ def _(
             hidden_states.n_tokens_per_expert,
             M,
         )
-
+        del intermediate_cache2
     else:
 
         if tuple(block_shape) != (128, 128):
@@ -323,12 +331,6 @@ def _(
                 block_size=block_shape[0],
                 round_scale_to_pow2=round_scale_to_pow2,
             )
-
-        device = hidden_states_fp8.device
-        E, M, K = hidden_states_fp8.shape
-        E2, N, K2 = w1.shape
-        assert E == E2
-        assert K == K2
 
         intermediate_cache1 = torch.empty(
             (E, M, N), device=device, dtype=torch.bfloat16
