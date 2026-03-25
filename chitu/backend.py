@@ -519,9 +519,15 @@ class Backend:
                 if args.infer.prefill_chunk_size is None:
                     num_blocks = num_hot_req
                 else:
+                    # First get warmup input length per DP
+                    local_prefill_chunk_size = ceil_div(
+                        args.infer.prefill_chunk_size,
+                        args.infer.dp_size,
+                    )
+                    # Then compute number of blocks that no block crosses request boundary
                     num_blocks = (
                         ceil_div(
-                            args.infer.prefill_chunk_size // num_hot_req + 1,
+                            local_prefill_chunk_size // num_hot_req + 1,
                             block_size,
                         )
                         * num_hot_req
