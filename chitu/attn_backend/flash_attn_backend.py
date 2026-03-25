@@ -9,7 +9,7 @@ import torch
 
 from chitu.attn_backend.base import AttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
+from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.utils import try_import_opt_dep
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")

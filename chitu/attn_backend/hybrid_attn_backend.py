@@ -12,7 +12,7 @@ from chitu.attn_backend.base import AttnBackend
 from chitu.attn_backend.triton_attn_backend import TritonAttnBackend
 from chitu.attn_backend.flash_attn_backend import FlashAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
+from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
 
 logger = getLogger(__name__)
 

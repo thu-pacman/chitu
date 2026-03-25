@@ -11,7 +11,7 @@ import torch
 
 from chitu.attn_backend.ref_attn_backend import RefAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
+from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.device_type import get_device_name
 from chitu.global_vars import get_global_args
 from chitu.static_tensor import StaticTensor

@@ -312,6 +312,7 @@ class PrometheusMetricsCollector:
 
         self.total_generated_tokens: Optional[Counter] = None
         self.total_prompt_tokens: Optional[Counter] = None
+        self.total_hit_tokens: Optional[Counter] = None
         self.total_task_evictions: Optional[Counter] = None
         self.mtp_proposed_tokens: Optional[Counter] = None
         self.mtp_accepted_tokens: Optional[Counter] = None
@@ -359,6 +360,7 @@ class PrometheusMetricsCollector:
                 "torch allocated GPU used memory (bytes)",
                 ["rank", "dp_id"],
             )
+
             self.kv_cache_usage.labels(rank=rank, dp_id=dp_id).set(0)
             self.used_blocks.labels(rank=rank, dp_id=dp_id).set(0)
             self.total_blocks.labels(rank=rank, dp_id=dp_id).set(0)
@@ -376,6 +378,11 @@ class PrometheusMetricsCollector:
                 self.total_prompt_tokens = Counter(
                     "chitu_total_prompt_tokens",
                     "Total prompt tokens processed by executor",
+                    ["rank", "dp_id"],
+                )
+                self.total_hit_tokens = Counter(
+                    "chitu_total_hit_tokens",
+                    "total prompt tokens hit by prefix caching",
                     ["rank", "dp_id"],
                 )
                 self.total_task_evictions = Counter(
@@ -405,6 +412,7 @@ class PrometheusMetricsCollector:
                 )
                 self.total_generated_tokens.labels(rank=rank, dp_id=dp_id).inc(0)
                 self.total_prompt_tokens.labels(rank=rank, dp_id=dp_id).inc(0)
+                self.total_hit_tokens.labels(rank=rank, dp_id=dp_id).inc(0)
                 self.total_task_evictions.labels(rank=rank, dp_id=dp_id).inc(0)
                 self.mtp_proposed_tokens.labels(rank=rank, dp_id=dp_id).inc(0)
                 self.mtp_accepted_tokens.labels(rank=rank, dp_id=dp_id).inc(0)
@@ -425,7 +433,7 @@ class PrometheusMetricsCollector:
             atexit.register(PrometheusMetricsCollector.stop_instance)
 
         except Exception as e:
-            logger.error(f"Failed to start Prometheus metrics server: {e}")
+            logger.error(f"Failed to start Prometheus metrics collector: {e}")
             raise
 
     @classmethod
@@ -477,6 +485,22 @@ class PrometheusMetricsCollector:
             logger.error(f"inc_prompt_tokens failed: {e}")
 
     @classmethod
+    def inc_hit_tokens(cls, count: int = 1):
+        if count < 0:
+            return
+
+        collector = cls.get_instance()
+        if not collector or not collector.total_hit_tokens:
+            return
+
+        try:
+            collector.total_hit_tokens.labels(
+                rank=collector.rank, dp_id=collector.dp_id
+            ).inc(count)
+        except Exception as e:
+            logger.error(f"inc_hit_tokens failed: {e}")
+
+    @classmethod
     def update_task_counts(cls):
         """Update running/waiting request count metrics."""
         collector = cls.get_instance()
@@ -503,18 +527,22 @@ class PrometheusMetricsCollector:
     @classmethod
     def update_kvcache_usage(cls):
         """Update KV cache usage metrics."""
-        if Backend.cache_managers is None:
-            return
+        from chitu.kv_cache import PagedKVCache
 
-        cls.update_GPU_usage()
+        if (
+            Backend.cache_dict is None
+            or type(Backend.cache_dict["main"]) == PagedKVCache
+        ):
+            # Get KV cache usage of PagedKVCache from cache_manager in rank0
+            return
 
         collector = cls.get_instance()
         if not collector:
             return
 
         try:
-            num_blocks = Backend.cache_managers["main"].get_num_blocks()
-            num_used_blocks = Backend.cache_managers["main"].num_used_blocks
+            num_blocks = Backend.cache_dict["main"].num_blocks
+            num_used_blocks = Backend.cache_dict["main"].num_used_blocks
 
             collector.total_blocks.labels(
                 rank=collector.rank, dp_id=collector.dp_id
@@ -530,7 +558,7 @@ class PrometheusMetricsCollector:
                 ).set(usage_ratio)
             else:
                 logger.error(
-                    f"Unexpected {type(Backend.cache_managers['main']).__name__}.num_blocks({num_blocks}), update_kvcache_usage failed. "
+                    f"Unexpected {type(Backend.cache_dict['main']).__name__}.num_blocks({num_blocks}), update_kvcache_usage failed. "
                 )
         except Exception as e:
             logger.error(f"update_kvcache_usage failed: {e}")
@@ -538,15 +566,17 @@ class PrometheusMetricsCollector:
 
     @classmethod
     def update_GPU_usage(cls):
-        if Backend.cache_managers is None:
+        if Backend.cache_dict is None:
             return
+
+        cls.update_kvcache_usage()
 
         collector = cls.get_instance()
         if not collector:
             return
 
         try:
-            device = Backend.cache_managers["main"].device
+            device = Backend.cache_dict["main"].device
             if (not isinstance(device, torch.device)) or (
                 isinstance(device, torch.device) and device.type != "cuda"
             ):

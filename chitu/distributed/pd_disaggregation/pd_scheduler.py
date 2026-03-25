@@ -57,6 +57,10 @@ from chitu.metrics.prometheus_collector import (
     observe_stage_duration,
     set_queue_size,
 )
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from chitu.kv_cache import PagedKVCacheManager
 
 logger = getLogger(__name__)
 
@@ -175,6 +179,7 @@ class PDScheduler(Scheduler):
             prefill_num_tasks,
             decode_num_tasks,
             filtered_scheduler_type,
+            Backend.cache_managers[0],
             num_scheduler_groups=args.infer.pp_size,
             dp_rank=0,
             original_scheduler_type=scheduler_type,
@@ -199,6 +204,7 @@ class PDScheduler(Scheduler):
                         prefill_num_tasks=decode_num_tasks,
                         decode_num_tasks=decode_num_tasks,
                         scheduler_type=filtered_scheduler_type,
+                        cache_manager_dict=Backend.cache_managers[dp_rank],
                         num_scheduler_groups=args.infer.pp_size,
                         dp_rank=dp_rank,
                         original_scheduler_type=scheduler_type,
@@ -308,38 +314,38 @@ class PDScheduler(Scheduler):
             raise ValueError(f"unsupported pd mode: {self.pd_mode}")
 
         # Create KV manager
-        # Note: cache_manager will be set later in the initialization process
+        # Note: kv_cache will be set later in the initialization process
         self.kv_manager = KVManager(
-            cache_manager=None,  # Will be set later
+            kv_cache=None,  # Will be set later
             metadata_buffers=self.metadata_buffers,
             disaggregation_mode=disaggregation_mode,
         )
 
         logger.info(f"initialized pd components for {self.pd_mode.value} mode")
 
-    def set_cache_manager(self, cache_manager):
+    def set_kv_cache(self, kv_cache):
         """Set cache manager after initialization"""
         if self.kv_manager is not None:
-            self.kv_manager.cache_manager = cache_manager
+            self.kv_manager.kv_cache = kv_cache
             # Re-register buffers with the actual cache manager (now safe)
             self.kv_manager.register_buffer_to_engine()
             logger.info("cache manager set for kv manager")
 
-    def set_linear_attn_cache_manager(self, linear_attn_cache_manager):
-        """Set linear attention cache manager for Qwen3-next hybrid attention support.
+    def set_linear_attn_cache(self, linear_attn_cache):
+        """Set linear attention cache for Qwen3-next hybrid attention support.
 
         For models with hybrid attention (Gated DeltaNet + Gated Softmax Attention),
         both the full attention KV cache and linear attention states (conv_state,
         recurrent_state) need to be transferred during PD disaggregation.
         """
-        if self.kv_manager is not None and linear_attn_cache_manager is not None:
-            self.kv_manager.set_linear_attn_cache_manager(linear_attn_cache_manager)
+        if self.kv_manager is not None and linear_attn_cache is not None:
+            self.kv_manager.set_linear_attn_cache(linear_attn_cache)
             logger.info("linear attention cache manager set for pd scheduler")
 
-    def set_indexer_cache_manager(self, indexer_cache_manager):
-        """Set indexer KV cache manager for DeepSeek-V3.2 PD disaggregation."""
-        if self.kv_manager is not None and indexer_cache_manager is not None:
-            self.kv_manager.set_indexer_cache_manager(indexer_cache_manager)
+    def set_indexer_cache(self, indexer_cache):
+        """Set indexer KV cache for DeepSeek-V3.2 PD disaggregation."""
+        if self.kv_manager is not None and indexer_cache is not None:
+            self.kv_manager.set_indexer_cache(indexer_cache)
             logger.info("indexer cache manager set for pd scheduler")
 
     def set_token_manager(self, token_manager):
@@ -400,13 +406,19 @@ class PDScheduler(Scheduler):
 
     def _send_pd_prepare_transfer(
         self,
+        task: "Task",
         *,
-        dp_rank: int,
         request_id: str,
-        prefill_scheduler_id: Optional[int],
-        prefix_len: int,
     ) -> bool:
-        """Send PD_PREPARE_TRANSFER to the owner dp_rank via its prepare listener."""
+        """reserve kv cache in decode side
+        Send PD_PREPARE_TRANSFER to the owner dp_rank via its prepare listener.
+        """
+
+        dp_rank = int(task.dp_rank)
+        prefill_scheduler_id = task.pd_prefill_engine_rank
+        prefix_len = int(getattr(task, "prefix_tokens_len", 0))
+        task_cache_ids = task.new_cache_ids
+
         endpoint = self._get_decode_prepare_endpoint(dp_rank)
         ip = str(endpoint.get("ip"))
         port = int(endpoint.get("port", 0) or 0)
@@ -424,6 +436,7 @@ class PDScheduler(Scheduler):
                     prefill_scheduler_id if prefill_scheduler_id is not None else None
                 ),
                 "prefix_len": prefix_len or 0,
+                "task_cache_ids": task_cache_ids,
             },
             use_bin_type=True,
         )
@@ -586,8 +599,6 @@ class PDScheduler(Scheduler):
         # 入队 decode incoming；后续由队列驱动进行预分配与 ready promote
         info = {
             "task": task,
-            "target_dp_rank": target_dp_rank,
-            "prefill_scheduler_id": prefill_scheduler_id,
             "created_ts": time.time(),
             "last_log_ts": 0.0,
             "last_prepare_ts": 0.0,
@@ -1179,12 +1190,12 @@ class DecodeOnlyScheduler(PDScheduler):
             # 这个判断一般走不到，is_full 是队列的硬限制，一般就等于 max_reqs
             if self._decode_prealloc_q.is_full():
                 break
-            task = info.get("task")
+            task: Task = info.get("task")
             if task is None:
                 self._decode_incoming_q.pop(rid)
                 continue
-            target_dp_rank = int(info.get("target_dp_rank", 0))
-            prefill_sid = info.get("prefill_scheduler_id", None)
+            target_dp_rank = int(task.dp_rank)
+            prefill_sid = task.pd_prefill_engine_rank
             prefix_len = int(getattr(task, "prefix_tokens_len", 0))
             required_tokens = max(
                 0, prefix_len + int(self._decode_prealloc_reserved_tokens)
@@ -1195,12 +1206,35 @@ class DecodeOnlyScheduler(PDScheduler):
                 > self._decode_prealloc_token_budget
             ):
                 break
-            send_ok = self._send_pd_prepare_transfer(
-                dp_rank=target_dp_rank,
-                request_id=rid,
-                prefill_scheduler_id=prefill_sid,
-                prefix_len=prefix_len,
-            )
+
+            # decode侧预分配kv cache block
+            if not task.new_cache_ids:
+                prefix_len = int(getattr(task, "prefix_tokens_len", 0))
+
+                task.prompt_to_token_block(dp_rank=target_dp_rank)
+                kv_cache_manager: "PagedKVCacheManager" = Backend.cache_managers[
+                    target_dp_rank
+                ]["main"]
+
+                aviable_blocks = (
+                    kv_cache_manager.num_blocks
+                    - kv_cache_manager.num_active_blocks
+                    - task.num_cached_idle_blocks
+                )
+                remain_prefix_len = (
+                    prefix_len - task.kv_cache_len_used_in_completed_steps
+                )
+
+                if aviable_blocks * kv_cache_manager.block_size < remain_prefix_len:
+                    continue
+
+                if remain_prefix_len == 0:
+                    remain_prefix_len = 1
+
+                task.set_prefill_chunk_size_for_one_step(remain_prefix_len)
+                kv_cache_manager.prepare_metadata_before_prefill(task)
+
+            send_ok = self._send_pd_prepare_transfer(task, request_id=rid)
             if not send_ok:
                 # backpressure: keep in incoming and retry later
                 continue
@@ -1249,9 +1283,9 @@ class DecodeOnlyScheduler(PDScheduler):
                     and not bool(info.get("timeout_logged", False))
                 ):
                     info["timeout_logged"] = True
-                    task = info.get("task")
-                    target_dp_rank = int(info.get("target_dp_rank", 0))
-                    prefill_sid = info.get("prefill_scheduler_id", None)
+                    task: "Task" = info.get("task")
+                    target_dp_rank = int(task.dp_rank)
+                    prefill_sid = task.pd_prefill_engine_rank
                     logger.warning(
                         "[PD_BOOTSTRAP][decode.timeout] "
                         f"req_id={rid} waited={waited:.1f}s timeout_s={wait_timeout_s:.1f} "
@@ -1264,13 +1298,11 @@ class DecodeOnlyScheduler(PDScheduler):
                 if (now - last_prepare_ts) >= 1.0:
                     task = info.get("task")
                     if task is not None:
-                        target_dp_rank = int(info.get("target_dp_rank", 0))
-                        prefill_sid = info.get("prefill_scheduler_id", None)
+                        target_dp_rank = int(task.dp_rank)
+                        prefill_sid = task.pd_prefill_engine_rank
                         send_ok = self._send_pd_prepare_transfer(
-                            dp_rank=target_dp_rank,
+                            task,
                             request_id=rid,
-                            prefill_scheduler_id=prefill_sid,
-                            prefix_len=int(getattr(task, "prefix_tokens_len", 0)),
                         )
                         if send_ok:
                             info["last_prepare_ts"] = now

@@ -19,11 +19,7 @@ from chitu.task_type import TaskType
 from chitu.device_type import is_muxi
 from chitu.attn_backend import AttnBackend, NpuAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import (
-    KVCacheManagerBase,
-    PagedKVCacheManager,
-    DenseKVCacheManager,
-)
+from chitu.kv_cache import KVCacheBase, PagedKVCache, DenseKVCache
 from chitu.cuda_graph import (
     make_dispatched_graphed_callables,
     cuda_graph_safe_cached_property,
@@ -170,7 +166,7 @@ class RMSNormBias(RMSNorm):
 
 
 class Attention(nn.Module):
-    def __init__(self, layer_id, cache: KVCacheManagerBase, attn_backend):
+    def __init__(self, layer_id, cache: KVCacheBase, attn_backend):
         super().__init__()
         self.layer_id = layer_id
         self.cache = cache
@@ -206,7 +202,7 @@ class TransformerBlock(nn.Module):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         op_impl,
     ):
@@ -225,7 +221,7 @@ class Transformer(nn.Module):
     def __init__(
         self,
         params,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -235,7 +231,7 @@ class Transformer(nn.Module):
         **kvargs,
     ):
         super().__init__()
-        self.cache_managers = cache_managers
+        self.cache_dict = cache_dict
         self.attn_backend = attn_backend
         self.op_impl = op_impl
         self.rank = torch.distributed.get_rank()
@@ -279,7 +275,7 @@ class Transformer(nn.Module):
 
         if not self.pipeline_exec or self.pp_stage == 0:
             self._init_pre_layers()
-        self._init_layers(cache_managers, attn_backend=attn_backend, op_impl=op_impl)
+        self._init_layers(cache_dict, attn_backend=attn_backend, op_impl=op_impl)
         if not self.pipeline_exec or self.pp_stage == self.pipeline_parallel_size - 1:
             self._init_post_layers()
 
@@ -1005,9 +1001,7 @@ class Transformer(nn.Module):
     def _init_pre_layers(self):
         raise NotImplementedError
 
-    def _init_layers(
-        self, cache_managers: dict[str, KVCacheManagerBase], attn_backend, op_impl
-    ):
+    def _init_layers(self, cache_dict: dict[str, KVCacheBase], attn_backend, op_impl):
         raise NotImplementedError
 
     def _init_post_layers(self):
@@ -1051,26 +1045,22 @@ class Transformer(nn.Module):
     def prepare_freqs_cis(self) -> BatchedFreqsCis:
         return BatchedFreqsCis(
             self.freqs_cis_real[
-                self.cache_managers[
-                    "main"
-                ].seq_len_delta.delta_position_ids_tensor_device
+                self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
             ],
             self.freqs_cis_imag[
-                self.cache_managers[
-                    "main"
-                ].seq_len_delta.delta_position_ids_tensor_device
+                self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
             ],
         )
 
     def prepare_freqs_cis_mtp(self) -> BatchedFreqsCis:
         return BatchedFreqsCis(
             self.freqs_cis_real[
-                self.cache_managers[
+                self.cache_dict[
                     "main"
                 ].mtp_seq_len_delta.delta_position_ids_tensor_device
             ],
             self.freqs_cis_imag[
-                self.cache_managers[
+                self.cache_dict[
                     "main"
                 ].mtp_seq_len_delta.delta_position_ids_tensor_device
             ],
@@ -1091,7 +1081,7 @@ class Transformer(nn.Module):
             self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
         h = self._pre_layers(tokens, **args)
         if self.mtp_size > 1:
-            for mgr in self.cache_managers.values():
+            for mgr in self.cache_dict.values():
                 mgr.seq_len_delta.is_decode_stage = False
             self.token_offset_list = None
             self.mtp_token_list = None
@@ -1100,7 +1090,7 @@ class Transformer(nn.Module):
             prefill_previous_hidden_states = self._get_prefill_previous_hidden_states(h)
             h_mtp = self._pre_layers_mtp(tokens, **args)
             h_mtp[
-                self.cache_managers[
+                self.cache_dict[
                     "main"
                 ].mtp_seq_len_delta.delta_position_ids_tensor_device
                 == 0
@@ -1160,26 +1150,26 @@ class Transformer(nn.Module):
         token_list = []
         token_list.append(tokens)
         for i in range(0, self.mtp_size):
-            for mgr in self.cache_managers.values():
-                mgr.prepare_mtp_cache_decode(i)
-                if isinstance(mgr, PagedKVCacheManager):
-                    mgr.update_page_offs()
+            for cache in self.cache_dict.values():
+                cache.prepare_mtp_cache_decode(i)
+                if isinstance(cache, PagedKVCache):
+                    cache.update_page_offs()
             self.prepare_decoding_attn_mtp()
             h = func_mtp(key_mtp, tokens, *extra_inputs_mtp)
             tokens = torch.argmax(h, dim=-1)
             token_list.append(tokens)
-        for mgr in self.cache_managers.values():
-            if isinstance(mgr, PagedKVCacheManager):
-                mgr.update_page_offs()
+        for cache in self.cache_dict.values():
+            if isinstance(cache, PagedKVCache):
+                cache.update_page_offs()
         self.main_last_hidden_states_up_to_date = False
         tokens_proposal = torch.stack(token_list[:-1], dim=1).view(-1)
         if self.use_cuda_graph:
-            for mgr in self.cache_managers.values():
-                mgr.seq_len_delta.is_decode_stage = True
+            for cache in self.cache_dict.values():
+                cache.seq_len_delta.is_decode_stage = True
             self.prepare_decoding_attn()
         else:
             self.attn_backend.prepare_metadata_for_prefill(
-                self.cache_managers["main"].seq_len_delta
+                self.cache_dict["main"].seq_len_delta
             )
             if (
                 self.moe_impl is not None
@@ -1213,8 +1203,8 @@ class Transformer(nn.Module):
             for i in range(tokens_proposal.size(0))
         ]
 
-        for mgr in self.cache_managers.values():
-            mgr.update_mtp_cache_decode(token_offset)
+        for cache in self.cache_dict.values():
+            cache.update_mtp_cache_decode(token_offset)
         self.token_offset_list = token_offset
         self.mtp_token_list = tokens_proposal_accepted
         self.last_hidden_states_4_postprocess = mtp_selected
@@ -1307,7 +1297,7 @@ class Transformer(nn.Module):
             return self.empty_prefill()
 
         self.attn_backend.prepare_metadata_for_prefill(
-            self.cache_managers["main"].seq_len_delta
+            self.cache_dict["main"].seq_len_delta
         )
         if self.pipeline_exec:
             return self.prefill_pipeline(tokens, output_token_offsets, **args)
@@ -1316,16 +1306,16 @@ class Transformer(nn.Module):
 
     def prepare_decoding_attn(self):
         self.attn_backend.prepare_metadata_for_decode(
-            self.cache_managers["main"].seq_len_delta,
-            self.cache_managers["main"].get_gpu_block_table(),
-            self.cache_managers["main"].get_block_size(),
+            self.cache_dict["main"].seq_len_delta,
+            self.cache_dict["main"].get_gpu_block_table(),
+            self.cache_dict["main"].block_size,
         )
 
     def prepare_decoding_attn_mtp(self):
         self.attn_backend.prepare_metadata_for_decode(
-            self.cache_managers["main"].mtp_seq_len_delta,
-            self.cache_managers["main"].get_gpu_block_table(),
-            self.cache_managers["main"].get_block_size(),
+            self.cache_dict["main"].mtp_seq_len_delta,
+            self.cache_dict["main"].get_gpu_block_table(),
+            self.cache_dict["main"].block_size,
         )
 
     def _decode_graph_extra_inputs(
@@ -1380,9 +1370,9 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def decode(self, tokens, batch_size):
-        if isinstance(self.cache_managers["main"], DenseKVCacheManager):
-            key = (batch_size, self.cache_managers["main"].get_start_and_end_idx()[0])
-        elif isinstance(self.cache_managers["main"], PagedKVCacheManager):
+        if isinstance(self.cache_dict["main"], DenseKVCache):
+            key = (batch_size, self.cache_dict["main"].get_start_and_end_idx()[0])
+        elif isinstance(self.cache_dict["main"], PagedKVCache):
             key = (batch_size,)
         else:
             assert False
@@ -1425,7 +1415,7 @@ class Transformer(nn.Module):
                 before_replay_callback = lambda graph: graph.update(
                     cpu_update_input=[
                         {
-                            "actual_seq_lengths_kv": self.cache_managers[
+                            "actual_seq_lengths_kv": self.cache_dict[
                                 "main"
                             ].seq_len_delta.new.lens_list
                         }

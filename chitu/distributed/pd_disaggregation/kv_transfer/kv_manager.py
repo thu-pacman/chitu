@@ -52,6 +52,10 @@ from chitu.distributed.pd_disaggregation.pd_log_utils import (
 )
 from chitu.ops import append_to_paged_kv_cache
 from chitu.utils import ceil_div
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from chitu.kv_cache import KVCacheBase
 
 import logging
 
@@ -299,7 +303,7 @@ class KVManager:
 
     def __init__(
         self,
-        cache_manager,  # CacheManager type - avoid circular import
+        kv_cache: Optional["KVCacheBase"],
         metadata_buffers: MetadataBuffers,
         disaggregation_mode: DisaggregationMode,
         pd_coordination_service=None,  # Optional PD coordination service
@@ -309,7 +313,7 @@ class KVManager:
         # Basic configuration
         self.local_ip = get_local_ip()
         self.disaggregation_mode = disaggregation_mode
-        self.cache_manager = cache_manager
+        self.kv_cache = kv_cache
         self.metadata_buffers = metadata_buffers
         self.pd_coordination_service = pd_coordination_service
         # dp_id 用于多 Prefill/Decode 实例的标识（Bootstrap 的 engine_rank）。
@@ -388,27 +392,27 @@ class KVManager:
         self._decode_status_push_sockets: dict[str, zmq.Socket] = {}
         self._decode_status_push_lock = threading.Lock()
 
-        # Register buffers to transfer engine (defer until cache_manager is set)
+        # Register buffers to transfer engine (defer until kv_cache is set)
         self._registered_ptrs = set()
         self._aux_registered = False
         # 记录已向哪些 Prefill engine_rank 完成过 decode 端的注册
         self._decode_registered_remote_set = set()
 
-        # Linear attention cache manager for Qwen3-next hybrid attention
-        self.linear_attn_cache_manager = None
+        # Linear attention cache for Qwen3-next hybrid attention
+        self.linear_attn_cache = None
         self.linear_data_ptrs = []
         self.linear_data_lens = []
         self.linear_item_lens = []
 
-        # Indexer KV cache manager
-        self.indexer_cache_manager = None
+        # Indexer KV cache
+        self.indexer_cache = None
         self.indexer_data_ptrs = []
         self.indexer_data_lens = []
         self.indexer_item_lens = []
 
         # Buffer pointer caching for CUDA-safe operations
         # When True, buffer pointers are valid and can be used without CUDA tensor access
-        # Set to False after cache_manager.realloc() to trigger refresh in decode step
+        # Set to False after kv_cache.realloc() to trigger refresh in decode step
         self._buffer_ptrs_valid = False
         # Set to True after first request is processed (warmup completed, buffers stable)
         self._warmup_completed = False
@@ -416,7 +420,7 @@ class KVManager:
         # Decode-side: control-plane prepare requests (from scheduler) that must be
         # handled on the model/compute thread to avoid CUDA/thread-safety issues.
         #
-        # Each item: (request_id: str, prefill_engine_rank: Optional[int], prefix_len: int)
+        # Each item: (request_id: str, prefill_engine_rank: Optional[int], prefix_len: int, task_cache_ids: list[int])
         self._pending_prepare_lock = threading.Lock()
         self._pending_prepare: deque[tuple[str, Optional[int], int]] = deque()
         # Serialize prepare_kv_transfer across threads (prepare worker vs kv_pull path).
@@ -448,7 +452,7 @@ class KVManager:
             os.getenv("PD_BOOTSTRAP_CACHE_FAIL_TTL_S", "0.2")
         )
         self._bootstrap_session_local = threading.local()
-        if self.cache_manager is not None:
+        if self.kv_cache is not None:
             self.register_buffer_to_engine()
             self._buffer_ptrs_valid = True
 
@@ -469,6 +473,7 @@ class KVManager:
         request_id: str,
         prefill_engine_rank: Optional[int] = None,
         prefix_len: int = 0,
+        task_cache_ids: list[int] = [],
     ) -> None:
         """Enqueue a request to prepare KV transfer on this decode dp rank.
 
@@ -480,7 +485,7 @@ class KVManager:
         if self.disaggregation_mode != DisaggregationMode.DECODE:
             return
         rid = str(request_id)
-        if not rid:
+        if not rid or not task_cache_ids:
             return
         with self._pending_prepare_lock:
             self._pending_prepare.append(
@@ -492,6 +497,7 @@ class KVManager:
                         else None
                     ),
                     int(prefix_len or 0),
+                    task_cache_ids,
                 )
             )
 
@@ -549,16 +555,16 @@ class KVManager:
         """
         if self.disaggregation_mode != DisaggregationMode.DECODE:
             return 0
-        batch: list[tuple[str, Optional[int], int]] = []
+        batch: list[tuple[str, Optional[int], int, list[int]]] = []
         with self._pending_prepare_lock:
             while self._pending_prepare and len(batch) < int(max_items):
                 batch.append(self._pending_prepare.popleft())
         if not batch:
             return 0
 
-        # FIXME: Other managers than "main"
-        cache_manager = self.cache_manager or Backend.cache_managers["main"]
-        if cache_manager is None:
+        # FIXME: Other cache than "main"
+        kv_cache = self.kv_cache or Backend.cache_dict["main"]
+        if kv_cache is None:
             # push back
             with self._pending_prepare_lock:
                 for item in reversed(batch):
@@ -568,14 +574,15 @@ class KVManager:
         processed = 0
         retry_items: list[tuple[str, Optional[int], int]] = []
         # Prepare each request independently to keep failure isolated.
-        for rid, prefill_sid, prefix_len in batch:
+        for rid, prefill_sid, prefix_len, task_cache_ids in batch:
             if prefill_sid is not None:
                 self.set_prefill_target_engine_rank(rid, int(prefill_sid))
             try:
                 self.prepare_kv_transfer(
                     request_ids=[rid],
-                    cache_manager=cache_manager,
+                    kv_cache=kv_cache,
                     prefix_lens=[prefix_len],
+                    cache_ids_list=[task_cache_ids],
                 )
                 logger.debug(f"[PD_STAGE][decode.prealloc.rank.end] req_id={rid}")
                 processed += 1
@@ -583,7 +590,7 @@ class KVManager:
             except KVTransferBackpressure as e:
                 # Not enough free blocks: requeue and retry later.
                 self._log_prepare_backpressure(rid, str(e))
-                retry_items.append((rid, prefill_sid, prefix_len))
+                retry_items.append((rid, prefill_sid, prefix_len, task_cache_ids))
 
         if retry_items:
             with self._pending_prepare_lock:
@@ -914,13 +921,13 @@ class KVManager:
 
         # Discover and register decode endpoint to all prefill instances (idempotent)
         def _bg_register_all():
-            # Wait for cache manager and buffer registration to complete
+            # Wait for cache and buffer registration to complete
             # We check both kv_data_ptrs and aux_data_ptr to be safe
             while not hasattr(self, "aux_data_ptr") or self.aux_data_ptr == 0:
                 logger.debug("Waiting for aux_data_ptr to be registered")
                 time.sleep(0.1)
             # Qwen3-next hybrid attention: also wait for linear state buffers if enabled
-            if getattr(self, "linear_attn_cache_manager", None) is not None:
+            if getattr(self, "linear_attn_cache", None) is not None:
                 wait_start = time.time()
                 while (
                     not hasattr(self, "linear_data_ptrs")
@@ -930,7 +937,7 @@ class KVManager:
                     time.sleep(0.1)
 
             # indexer cache: also wait for indexer buffers if enabled
-            if getattr(self, "indexer_cache_manager", None) is not None:
+            if getattr(self, "indexer_cache", None) is not None:
                 wait_start = time.time()
                 while (
                     not hasattr(self, "indexer_data_ptrs")
@@ -983,19 +990,19 @@ class KVManager:
         """Register KV cache and metadata buffers to transfer engine.
 
         Args:
-            force_refresh: If True, re-fetch buffer pointers from cache_manager
+            force_refresh: If True, re-fetch buffer pointers from kv_cache
                 and register any new pointers. This should be called after
-                cache_manager.realloc() which may allocate new memory.
+                kv_cache.realloc() which may allocate new memory.
         """
         # Defer if cache manager is not ready
-        if self.cache_manager is None:
-            logger.debug("cache manager not set yet, skip memory registration")
+        if self.kv_cache is None:
+            logger.debug("kv cache not set yet, skip memory registration")
             return
 
         # Get KV cache buffer info from cache manager
-        if hasattr(self.cache_manager, "get_contiguous_buf_infos"):
+        if hasattr(self.kv_cache, "get_contiguous_buf_infos"):
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
-                self.cache_manager.get_contiguous_buf_infos()
+                self.kv_cache.get_contiguous_buf_infos()
             )
 
             # Check if buffer pointers have changed (e.g., after realloc)
@@ -1046,8 +1053,8 @@ class KVManager:
             # Dense/Skew cache cannot be used here; fail fast to avoid "first token ok then KeyError(req_id)".
             cache_type = getattr(get_global_args().infer, "cache_type", None)
             raise RuntimeError(
-                f"PD KV transfer requires cache_manager.get_contiguous_buf_infos() (paged cache). "
-                f"Got cache_manager={type(self.cache_manager).__name__}, infer.cache_type={cache_type}"
+                f"PD KV transfer requires kv_cache.get_contiguous_buf_infos() (paged cache). "
+                f"Got kv_cache={type(self.kv_cache).__name__}, infer.cache_type={cache_type}"
             )
 
         # Register metadata buffers
@@ -1063,17 +1070,17 @@ class KVManager:
         # Mark buffer pointers as valid after successful registration
         self._buffer_ptrs_valid = True
 
-    def set_linear_attn_cache_manager(self, linear_cache_manager):
+    def set_linear_attn_cache(self, linear_cache):
         """Set linear attention cache manager for Qwen3-next hybrid attention."""
-        self.linear_attn_cache_manager = linear_cache_manager
-        if linear_cache_manager is not None:
+        self.linear_attn_cache = linear_cache
+        if linear_cache is not None:
             self.register_linear_attn_buffer_to_engine()
             logger.info("linear attention cache manager set for kv manager")
 
-    def set_indexer_cache_manager(self, indexer_cache_manager):
+    def set_indexer_cache(self, indexer_cache):
         """Set indexer KV cache manager for DeepSeek-V3.2."""
-        self.indexer_cache_manager = indexer_cache_manager
-        if indexer_cache_manager is not None:
+        self.indexer_cache = indexer_cache
+        if indexer_cache is not None:
             self.register_indexer_buffer_to_engine()
             logger.info("indexer cache manager set for kv manager")
 
@@ -1081,15 +1088,15 @@ class KVManager:
         """Register linear attention state buffers (conv_state, recurrent_state) for RDMA transfer.
 
         This is used for Qwen3-next style models that have both full attention and linear attention layers.
-        Supports refresh after cache_manager.realloc() which may allocate new memory.
+        Supports refresh after linear_cache.realloc() which may allocate new memory.
         """
-        if self.linear_attn_cache_manager is None:
+        if self.linear_attn_cache is None:
             logger.debug("linear attention cache manager not set, skip registration")
             return
 
-        if hasattr(self.linear_attn_cache_manager, "get_contiguous_buf_infos"):
+        if hasattr(self.linear_attn_cache, "get_contiguous_buf_infos"):
             linear_ptrs, linear_lens, linear_item_lens = (
-                self.linear_attn_cache_manager.get_contiguous_buf_infos()
+                self.linear_attn_cache.get_contiguous_buf_infos()
             )
 
             # Check if buffer pointers have changed (e.g., after realloc)
@@ -1127,21 +1134,21 @@ class KVManager:
         else:
             logger.warning(
                 f"linear attention cache manager does not support get_contiguous_buf_infos: "
-                f"{type(self.linear_attn_cache_manager).__name__}"
+                f"{type(self.linear_attn_cache).__name__}"
             )
 
     def register_indexer_buffer_to_engine(self):
         """Register indexer KV cache buffers (DeepSeek-V3.2) for RDMA transfer.
 
-        Supports refresh after cache_manager.realloc() which may allocate new memory.
+        Supports refresh after indexer_cache.realloc() which may allocate new memory.
         """
-        if self.indexer_cache_manager is None:
+        if self.indexer_cache is None:
             logger.debug("indexer cache manager not set, skip registration")
             return
 
-        if hasattr(self.indexer_cache_manager, "get_contiguous_buf_infos"):
+        if hasattr(self.indexer_cache, "get_contiguous_buf_infos"):
             indexer_ptrs, indexer_lens, indexer_item_lens = (
-                self.indexer_cache_manager.get_contiguous_buf_infos()
+                self.indexer_cache.get_contiguous_buf_infos()
             )
 
             # Check if buffer pointers have changed (e.g., after realloc)
@@ -1179,7 +1186,7 @@ class KVManager:
         else:
             logger.warning(
                 f"indexer cache manager does not support get_contiguous_buf_infos: "
-                f"{type(self.indexer_cache_manager).__name__}"
+                f"{type(self.indexer_cache).__name__}"
             )
 
     def start_prefill_thread(self):
@@ -1916,8 +1923,8 @@ class KVManager:
                         )
 
                         # Cleanup local KV for this request on this rank
-                        if hasattr(self.cache_manager, "remove_task"):
-                            self.cache_manager.remove_task(kv_chunk.room)
+                        if hasattr(self.kv_cache, "remove_task"):
+                            self.kv_cache.remove_task(kv_chunk.room)
                     else:
                         logger.error(f"kv cache transfer failed for {kv_chunk.room}")
                 else:
@@ -2049,12 +2056,12 @@ class KVManager:
         # Override parameters for auxiliary caches (e.g., indexer cache via send_indexer_kvcache)
         _override_data_ptrs: Optional[list[int]] = None,
         _override_item_lens: Optional[list[int]] = None,
-        _override_cache_manager=None,
+        _override_kv_cache=None,
     ):
         """Send KV cache to decode instance.
 
         When _override_* params are provided, uses those instead of self.kv_data_ptrs /
-        self.kv_item_lens / self.cache_manager. This allows reusing the same transfer
+        self.kv_item_lens / self.kv_cache. This allows reusing the same transfer
         logic for auxiliary caches (e.g., DeepSeek-V3.2 indexer cache).
         """
         effective_data_ptrs = (
@@ -2067,10 +2074,8 @@ class KVManager:
             if _override_item_lens is not None
             else self.kv_item_lens
         )
-        effective_cache_manager = (
-            _override_cache_manager
-            if _override_cache_manager is not None
-            else self.cache_manager
+        effective_kv_cache = (
+            _override_kv_cache if _override_kv_cache is not None else self.kv_cache
         )
 
         if not effective_data_ptrs:
@@ -2080,8 +2085,8 @@ class KVManager:
         prefill_kv_indices = prefill_kv_indices.tolist()
         dst_kv_indices = dst_kv_indices.tolist()
 
-        cache_manager = effective_cache_manager
-        num_prefill_layers = int(getattr(cache_manager, "num_layers", 0))
+        kv_cache = effective_kv_cache
+        num_prefill_layers = int(getattr(kv_cache, "num_layers", 0))
 
         # effective_data_ptrs: prefill侧的kvcache ptrs: [kptr_1,kptr_2,...kptr_local_n_layers_p,vptr_1,vptr_2,...,vptr_local_n_layers_p]
         num_prefill_ptrs = len(effective_data_ptrs)
@@ -2127,7 +2132,7 @@ class KVManager:
             getattr(get_global_args().models, "full_attention_interval", 0)
         )
         if int(pp_sz) > 1 and full_attn_interval > 1:
-            first_kv_global_id = cache_manager.layer_id_map.to_global(0)
+            first_kv_global_id = kv_cache.layer_id_map.to_global(0)
             kv_layer_offset = int(first_kv_global_id // full_attn_interval)
 
         # 此处暂时只兼容prefill_pp>1, decode_pp=1
@@ -2145,9 +2150,9 @@ class KVManager:
         # Detect MLA cache keys: MLA compressed cache is 4D [num_layers, num_blocks, block_size, compressed_dim],
         # standard MHA cache is 5D [num_layers, num_blocks, block_size, num_heads, head_dim].
         _mla_flag_by_key: dict[int, bool] = {}
-        if hasattr(cache_manager, "paged_kv_cache"):
-            for kidx, key in enumerate(cache_manager.paged_kv_cache):
-                _mla_flag_by_key[kidx] = cache_manager.paged_kv_cache[key].ndim == 4
+        if hasattr(kv_cache, "paged_kv_cache"):
+            for kidx, key in enumerate(kv_cache.paged_kv_cache):
+                _mla_flag_by_key[kidx] = kv_cache.paged_kv_cache[key].ndim == 4
 
         for pptr_idx in range(num_prefill_ptrs):
             key_idx = pptr_idx // num_prefill_layers
@@ -2178,7 +2183,7 @@ class KVManager:
             prefill_tp_size = tp_group.group_size
             tp_rank = tp_group.rank_in_group
 
-            block_size = cache_manager.get_block_size()
+            block_size = kv_cache.block_size
             prefill_block_byte_len = effective_item_lens[layer_pptr_idx]
             prefill_token_byte_len = prefill_block_byte_len // block_size
 
@@ -2341,14 +2346,14 @@ class KVManager:
         block_size and shape. All indexer cache keys are 4D (MLA-like: no head dimension),
         so we use the MLA block-splitting logic for TP parallelism.
 
-        Uses the dedicated indexer_data_ptrs / indexer_item_lens / indexer_cache_manager.
+        Uses the dedicated indexer_data_ptrs / indexer_item_lens / indexer_cache.
         """
         if not getattr(self, "indexer_data_ptrs", None):
             logger.warning("indexer data ptrs not available, skipping indexer transfer")
             return 0
 
-        indexer_cm = self.indexer_cache_manager
-        if indexer_cm is None:
+        indexer_cache = self.indexer_cache
+        if indexer_cache is None:
             logger.warning("indexer cache manager not set, skipping indexer transfer")
             return 0
 
@@ -2364,7 +2369,7 @@ class KVManager:
             # Override: use indexer cache data instead of main cache
             _override_data_ptrs=self.indexer_data_ptrs,
             _override_item_lens=self.indexer_item_lens,
-            _override_cache_manager=indexer_cm,
+            _override_cache=indexer_cache,
         )
 
     def send_linear_state(
@@ -2378,7 +2383,7 @@ class KVManager:
         """Send linear attention states (conv_state/recurrent_state) to decode instance.
 
         For Qwen3-next hybrid attention, linear attention layers maintain fixed-size states.
-        These states are stored in `SingletonPagedKVCacheManager` and can be transferred
+        These states are stored in `SingletonPagedKVCache` and can be transferred
         similarly to paged KV cache (block_size=1).
 
         Optimized for PD disaggregation with TP resharding:
@@ -2418,9 +2423,9 @@ class KVManager:
         head_dim = int(getattr(args.models, "linear_head_dim", 0))
         conv_kernel_size = int(getattr(args.models, "linear_conv_kernel_dim", 0))
 
-        # linear cache manager uses block_size=1
+        # linear cache uses block_size=1
         linear_block_size = int(
-            getattr(getattr(self, "linear_attn_cache_manager", None), "block_size", 1)
+            getattr(getattr(self, "linear_attn_cache", None), "block_size", 1)
         )
         if linear_block_size <= 0:
             linear_block_size = 1
@@ -2451,11 +2456,9 @@ class KVManager:
 
         # Calculate element size from cache tensor
         element_size = 2  # default bfloat16
-        if hasattr(self.linear_attn_cache_manager, "paged_kv_cache"):
-            for key in self.linear_attn_cache_manager.paged_kv_cache:
-                element_size = self.linear_attn_cache_manager.paged_kv_cache[
-                    key
-                ].element_size()
+        if hasattr(self.linear_attn_cache, "paged_kv_cache"):
+            for key in self.linear_attn_cache.paged_kv_cache:
+                element_size = self.linear_attn_cache.paged_kv_cache[key].element_size()
                 break
 
         # OPTIMIZATION: Collect all transfer requests upfront for maximum parallelism
@@ -2683,7 +2686,7 @@ class KVManager:
         self,
         first_tokens: Optional[torch.Tensor],
         request_ids: list[str],
-        cache_manager,
+        kv_cache,
     ):
         """Send KV cache for multiple requests (Prefill mode).
 
@@ -2699,7 +2702,7 @@ class KVManager:
             logger.warning("send_kv_cache called in non-prefill mode")
             return
 
-        # NOTE: After warmup, cache_manager.realloc() allocates new KV
+        # NOTE: After warmup, kv_cache.realloc() allocates new KV
         # buffers at different addresses.  The source pointers registered with
         # the local Mooncake engine become stale
         # RDMA reads from freed GPU
@@ -2710,9 +2713,9 @@ class KVManager:
                 "refreshing Mooncake source buffer registration"
             )
             self.register_buffer_to_engine(force_refresh=True)
-            if getattr(self, "linear_attn_cache_manager", None) is not None:
+            if getattr(self, "linear_attn_cache", None) is not None:
                 self.register_linear_attn_buffer_to_engine()
-            if getattr(self, "indexer_cache_manager", None) is not None:
+            if getattr(self, "indexer_cache", None) is not None:
                 self.register_indexer_buffer_to_engine()
             self._warmup_completed = True
             self._buffer_ptrs_valid = True
@@ -2761,10 +2764,9 @@ class KVManager:
             # 让所有 rank 都能用同一套 room<->request_id 做日志关联
             self._trace_room_to_request_id[room] = request_id
 
-            seq_len = self.cache_manager.req_id_to_seq_len[request_id]
+            seq_len = self.kv_cache.tid_to_cached_len[request_id]
 
             # Skip invalid meta to avoid busy-wait on non-control ranks.
-            # meta不是只有一个定义？总是dict且valid吧？？
             if not (isinstance(meta, dict) and meta.get("valid")):
                 continue
 
@@ -2780,12 +2782,12 @@ class KVManager:
                 logger.debug(f"Allocating metadata buffer for {room}")
                 aux_index = self.metadata_buffers.allocate(room, first_tokens[index])
 
-            # Get KV indices from cache manager.
-            if not hasattr(cache_manager, "get_page_indices"):
+            # Get KV indices from cache.
+            if not hasattr(kv_cache, "get_page_indices"):
                 raise RuntimeError(
-                    f"cache manager does not support get_page_indices for {request_id}"
+                    f"cache does not support get_page_indices for {request_id}"
                 )
-            kv_idx_list = cache_manager.get_page_indices(request_id)
+            kv_idx_list = kv_cache.get_page_indices(request_id)
             if kv_idx_list is None:
                 raise RuntimeError(
                     f"get_page_indices returned None for request_id={request_id}"
@@ -2810,15 +2812,13 @@ class KVManager:
                 and meta.get("valid", False)
                 and "dst_linear_ptrs" in meta
                 and "dst_linear_indices" in meta
-                and getattr(self, "linear_attn_cache_manager", None) is not None
+                and getattr(self, "linear_attn_cache", None) is not None
             ):
-                if not hasattr(self.linear_attn_cache_manager, "get_page_indices"):
+                if not hasattr(self.linear_attn_cache, "get_page_indices"):
                     raise RuntimeError(
-                        f"linear attention cache manager does not support get_page_indices for {request_id}"
+                        f"linear attention cache does not support get_page_indices for {request_id}"
                     )
-                lin_idx_list = self.linear_attn_cache_manager.get_page_indices(
-                    request_id
-                )
+                lin_idx_list = self.linear_attn_cache.get_page_indices(request_id)
                 if lin_idx_list is None:
                     raise RuntimeError(
                         f"linear get_page_indices returned None for request_id={request_id}"
@@ -2834,13 +2834,13 @@ class KVManager:
             _idx_cond_meta = isinstance(meta, dict) and meta.get("valid", False)
             _idx_cond_ptrs = _idx_cond_meta and "dst_indexer_ptrs" in meta
             _idx_cond_indices = _idx_cond_meta and "dst_indexer_indices" in meta
-            _idx_cond_cm = getattr(self, "indexer_cache_manager", None) is not None
-            if _idx_cond_ptrs and _idx_cond_indices and _idx_cond_cm:
-                if not hasattr(self.indexer_cache_manager, "get_page_indices"):
+            _idx_cond_cache = getattr(self, "indexer_cache", None) is not None
+            if _idx_cond_ptrs and _idx_cond_indices and _idx_cond_cache:
+                if not hasattr(self.indexer_cache, "get_page_indices"):
                     raise RuntimeError(
-                        f"indexer cache manager does not support get_page_indices for {request_id}"
+                        f"indexer cache does not support get_page_indices for {request_id}"
                     )
-                idx_list = self.indexer_cache_manager.get_page_indices(request_id)
+                idx_list = self.indexer_cache.get_page_indices(request_id)
                 if idx_list is None:
                     raise RuntimeError(
                         f"indexer get_page_indices returned None for request_id={request_id}"
@@ -2881,8 +2881,9 @@ class KVManager:
     def prepare_kv_transfer(
         self,
         request_ids: list[str],
-        cache_manager,
+        kv_cache: "KVCacheBase",
         prefix_lens: Optional[list[int]] = None,
+        cache_ids_list: list[list[int]] = [],
     ) -> None:
         """Pre-allocate destination blocks and send TransferInfo to Prefill.
 
@@ -2902,7 +2903,7 @@ class KVManager:
             if prefix_lens is None:
                 prefix_lens = [0] * len(request_ids)
 
-            # NOTE: After warmup, cache_manager.realloc() allocates new KV
+            # NOTE: After warmup, kv_cache.realloc() allocates new KV
             # buffers at different addresses.  The old Mooncake registrations and
             # the DECODE_REGISTER pointers sent to Prefill become stale.
             # Force a one-time refresh on the first prepare call after warmup (only once).
@@ -2912,9 +2913,9 @@ class KVManager:
                     "refreshing Mooncake buffer registration"
                 )
                 self.register_buffer_to_engine(force_refresh=True)
-                if getattr(self, "linear_attn_cache_manager", None) is not None:
+                if getattr(self, "linear_attn_cache", None) is not None:
                     self.register_linear_attn_buffer_to_engine()
-                if getattr(self, "indexer_cache_manager", None) is not None:
+                if getattr(self, "indexer_cache", None) is not None:
                     self.register_indexer_buffer_to_engine()
                 self._warmup_completed = True
                 self._buffer_ptrs_valid = True
@@ -2922,9 +2923,9 @@ class KVManager:
             # - 如果 kv_data_ptrs 尚未就绪（如初始化），先刷新一次，再发 TransferInfo
             if not self._buffer_ptrs_valid or not getattr(self, "kv_data_ptrs", None):
                 self.register_buffer_to_engine(force_refresh=True)
-                if getattr(self, "linear_attn_cache_manager", None) is not None:
+                if getattr(self, "linear_attn_cache", None) is not None:
                     self.register_linear_attn_buffer_to_engine()
-                if getattr(self, "indexer_cache_manager", None) is not None:
+                if getattr(self, "indexer_cache", None) is not None:
                     self.register_indexer_buffer_to_engine()
 
             # Step 0: Register to all discovered Prefill ranks (idempotent)
@@ -2974,19 +2975,20 @@ class KVManager:
                 self._prepared_transfers = {}
 
             # Pre-reserve dst kv indices and allocate aux buffer slots
+            cache_ids_list = (
+                cache_ids_list
+                if cache_ids_list
+                else [[] for _ in range(len(request_ids))]
+            )
             for idx, request_id in enumerate(request_ids):
                 room = self._to_uuid(request_id)
 
                 # Decode scheduler 会对 PD_PREPARE 做重试（如 PUSH 丢包），
                 # decode prepare listener 也可能在队列里积压重复的 req_id。
-                #
-                # 如果请求已经完成 KV pull + insert（cache_manager.req_id_to_seq_len 里已有该 req_id），
-                # 再次执行 reserve_blocks_for_transfer 会覆盖 block_table[req_id]，导致之前已占用的 blocks
-                # 测试大 batch 会泄露 block，触发 “No more free blocks”
-                if hasattr(cache_manager, "req_id_to_seq_len") and isinstance(
-                    cache_manager.req_id_to_seq_len, dict
+                if hasattr(kv_cache, "tid_to_cached_len") and isinstance(
+                    kv_cache.tid_to_cached_len, dict
                 ):
-                    if request_id in cache_manager.req_id_to_seq_len:
+                    if request_id in kv_cache.tid_to_cached_len:
                         logger.debug(
                             f"[prepare_kv_transfer] req_id={request_id} already inserted, ignoring duplicate prepare"
                         )
@@ -3000,74 +3002,61 @@ class KVManager:
                     continue
 
                 # Reserve destination blocks for KV cache
-                if not (
-                    hasattr(cache_manager, "get_max_blocks_per_req")
-                    and hasattr(cache_manager, "reserve_blocks_for_transfer")
-                ):
+                if not (hasattr(kv_cache, "max_num_blocks")):
                     raise RuntimeError(
-                        "PD KV transfer requires cache_manager.get_max_blocks_per_req() "
-                        "and cache_manager.reserve_blocks_for_transfer()"
+                        "PD KV transfer requires kv_cache.max_num_blocks "
                     )
                 # Reserve only the blocks required for the prefix length when available.
                 # Reserving `max_blocks_per_req` for every request can quickly exhaust decode-side blocks
                 # as batch size increases (especially when block_size is small, e.g., 256).
-                max_blocks = int(cache_manager.get_max_blocks_per_req())
                 prefix_len = int(prefix_lens[idx] if idx < len(prefix_lens) else 0)
-                blocks_to_reserve = max_blocks
-                if prefix_len > 0:
-                    # Prefer cache_manager.block_size if present; fallback to get_block_size().
-                    bs = int(getattr(cache_manager, "block_size", 0))
-                    if bs <= 0 and hasattr(cache_manager, "get_block_size"):
-                        try:
-                            bs = int(cache_manager.get_block_size())
-                        except Exception:
-                            bs = 0
-                    if bs > 0:
-                        blocks_to_reserve = (prefix_len + bs - 1) // bs
-                        blocks_to_reserve = max(1, blocks_to_reserve)
-                        blocks_to_reserve = min(max_blocks, blocks_to_reserve)
-                    else:
-                        # If we cannot infer block size, fall back to conservative reservation.
-                        blocks_to_reserve = max_blocks
 
-                # Reserve destination blocks for linear attention states (Qwen3-next)
-                linear_dst_np = None
-                linear_cm = getattr(self, "linear_attn_cache_manager", None)
-                linear_ptrs = getattr(self, "linear_data_ptrs", [])
-                linear_enabled = (
-                    linear_cm is not None
-                    and int(getattr(linear_cm, "num_layers", 0)) > 0
-                    and len(linear_ptrs) > 0
-                )
-
-                free_blocks = getattr(cache_manager, "num_free_blocks", None)
-                if free_blocks is not None and free_blocks < blocks_to_reserve:
-                    raise KVTransferBackpressure(
-                        f"Not enough free KV blocks for transfer: req_id={request_id} "
-                        f"need={blocks_to_reserve} free={free_blocks} "
-                        f"total={cache_manager.get_num_blocks()} used={cache_manager.num_used_blocks}"
-                    )
-
-                dst_indices = cache_manager.reserve_blocks_for_transfer(
-                    request_id, blocks_to_reserve
-                )
+                dst_indices = cache_ids_list[idx]
                 dst_indices_np = np.asarray(dst_indices, dtype=np.int32)
                 if dst_indices_np.size == 0:
                     raise RuntimeError(
                         f"reserve_blocks_for_transfer returned empty for request_id={request_id}"
                     )
 
+                # Reserve destination blocks for indexer KV cache
+                indexer_dst_np = None
+                indexer_cache = getattr(self, "indexer_cache", None)
+                indexer_ptrs = getattr(self, "indexer_data_ptrs", [])
+                indexer_enabled = (
+                    indexer_cache is not None
+                    and int(getattr(indexer_cache, "num_layers", 0)) > 0
+                    and len(indexer_ptrs) > 0
+                )
+                if indexer_enabled:
+                    idx_indices = cache_ids_list[idx]
+                    indexer_dst_np = np.asarray(idx_indices, dtype=np.int32)
+                    if indexer_dst_np.size == 0:
+                        raise RuntimeError(
+                            f"reserve_blocks_for_transfer returned empty for indexer state "
+                            f"request_id={request_id}"
+                        )
+
+                # Reserve destination blocks for linear attention states (Qwen3-next)
+                linear_dst_np = None
+                linear_cache = getattr(self, "linear_attn_cache", None)
+                linear_ptrs = getattr(self, "linear_data_ptrs", [])
+                linear_enabled = (
+                    linear_cache is not None
+                    and int(getattr(linear_cache, "num_layers", 0)) > 0
+                    and len(linear_ptrs) > 0
+                )
+
                 if linear_enabled:
                     if not (
-                        hasattr(linear_cm, "get_max_blocks_per_req")
-                        and hasattr(linear_cm, "reserve_blocks_for_transfer")
+                        hasattr(linear_cache, "max_blocks_per_req")
+                        and hasattr(linear_cache, "reserve_blocks_for_transfer")
                     ):
                         raise RuntimeError(
-                            "PD linear state transfer requires linear_attn_cache_manager methods"
+                            "PD linear state transfer requires linear_attn_cache methods"
                         )
                     # Linear attention: always reserve max_blocks_per_req (typically 1)
-                    linear_blocks_to_reserve = int(linear_cm.get_max_blocks_per_req())
-                    linear_free = getattr(linear_cm, "num_free_blocks", None)
+                    linear_blocks_to_reserve = int(linear_cache.max_blocks_per_req())
+                    linear_free = getattr(linear_cache, "num_free_blocks", None)
                     if (
                         linear_free is not None
                         and linear_free < linear_blocks_to_reserve
@@ -3076,65 +3065,13 @@ class KVManager:
                             f"Not enough free KV blocks for linear state: req_id={request_id} "
                             f"need={linear_blocks_to_reserve} free={linear_free}"
                         )
-                    lin_indices = linear_cm.reserve_blocks_for_transfer(
+                    lin_indices = linear_cache.reserve_blocks_for_transfer(
                         request_id, linear_blocks_to_reserve
                     )
                     linear_dst_np = np.asarray(lin_indices, dtype=np.int32)
                     if linear_dst_np.size == 0:
                         raise RuntimeError(
                             f"reserve_blocks_for_transfer returned empty for linear state "
-                            f"request_id={request_id}"
-                        )
-
-                # Reserve destination blocks for indexer KV cache
-                indexer_dst_np = None
-                indexer_cm = getattr(self, "indexer_cache_manager", None)
-                indexer_ptrs = getattr(self, "indexer_data_ptrs", [])
-                indexer_enabled = (
-                    indexer_cm is not None
-                    and int(getattr(indexer_cm, "num_layers", 0)) > 0
-                    and len(indexer_ptrs) > 0
-                )
-                if indexer_enabled:
-                    if not (
-                        hasattr(indexer_cm, "get_max_blocks_per_req")
-                        and hasattr(indexer_cm, "reserve_blocks_for_transfer")
-                    ):
-                        raise RuntimeError(
-                            "PD indexer transfer requires indexer_cache_manager methods"
-                        )
-                    # Indexer cache: reserve blocks based on prefix_len
-                    max_indexer_blocks = int(indexer_cm.get_max_blocks_per_req())
-                    idx_bs = int(getattr(indexer_cm, "block_size", 0))
-                    if idx_bs <= 0 and hasattr(indexer_cm, "get_block_size"):
-                        try:
-                            idx_bs = int(indexer_cm.get_block_size())
-                        except Exception:
-                            idx_bs = 0
-                    if idx_bs > 0 and prefix_len > 0:
-                        indexer_blocks_to_reserve = (prefix_len + idx_bs - 1) // idx_bs
-                        indexer_blocks_to_reserve = max(1, indexer_blocks_to_reserve)
-                        indexer_blocks_to_reserve = min(
-                            max_indexer_blocks, indexer_blocks_to_reserve
-                        )
-                    else:
-                        indexer_blocks_to_reserve = max_indexer_blocks
-                    indexer_free = getattr(indexer_cm, "num_free_blocks", None)
-                    if (
-                        indexer_free is not None
-                        and indexer_free < indexer_blocks_to_reserve
-                    ):
-                        raise KVTransferBackpressure(
-                            f"Not enough free KV blocks for indexer state: req_id={request_id} "
-                            f"need={indexer_blocks_to_reserve} free={indexer_free}"
-                        )
-                    idx_indices = indexer_cm.reserve_blocks_for_transfer(
-                        request_id, indexer_blocks_to_reserve
-                    )
-                    indexer_dst_np = np.asarray(idx_indices, dtype=np.int32)
-                    if indexer_dst_np.size == 0:
-                        raise RuntimeError(
-                            f"reserve_blocks_for_transfer returned empty for indexer state "
                             f"request_id={request_id}"
                         )
 
@@ -3224,10 +3161,10 @@ class KVManager:
     def recv_kv_cache_and_insert(
         self,
         request_ids: list[str],
-        cache_manager,
+        kv_cache: "KVCacheBase",
         prefix_lens: Optional[list[int]] = None,
     ) -> torch.Tensor:
-        """Receive KV cache and insert to cache manager (Decode mode)
+        """Receive KV cache and insert to cache (Decode mode)
 
         If prepare_kv_transfer() was called earlier, this function will use the
         already-prepared transfer info and only wait for completion. Otherwise,
@@ -3246,16 +3183,16 @@ class KVManager:
             )
 
         # CRITICAL: Refresh buffer registration on first request after warmup
-        # This handles the case where cache_manager.realloc() was called after initial registration.
+        # This handles the case where kv_cache.realloc() was called after initial registration.
         # We only need to refresh once; subsequent requests can use cached pointers.
         if not getattr(self, "_warmup_completed", False):
             logger.debug(
                 "[recv_kv_cache_and_insert] first request after warmup, refreshing buffer pointers"
             )
             self.register_buffer_to_engine(force_refresh=True)
-            if getattr(self, "linear_attn_cache_manager", None) is not None:
+            if getattr(self, "linear_attn_cache", None) is not None:
                 self.register_linear_attn_buffer_to_engine()
-            if getattr(self, "indexer_cache_manager", None) is not None:
+            if getattr(self, "indexer_cache", None) is not None:
                 self.register_indexer_buffer_to_engine()
             self._warmup_completed = True
             self._buffer_ptrs_valid = True
@@ -3297,7 +3234,7 @@ class KVManager:
             logger.debug(
                 f"[recv_kv_cache_and_insert] not all prepared, calling prepare_kv_transfer, req_ids:{request_ids}"
             )
-            self.prepare_kv_transfer(request_ids, cache_manager, prefix_lens)
+            self.prepare_kv_transfer(request_ids, kv_cache, prefix_lens)
 
             # Re-fetch prepared info (use self._prepared_transfers, not the local copy)
             prepared_transfers = getattr(self, "_prepared_transfers", {})
@@ -3423,24 +3360,24 @@ class KVManager:
                         dst_indices_np = prepared_dst_indices_np
                     if dst_indices_np is None:
                         dst_indices = (
-                            cache_manager.block_table.get(req_id, [])
-                            if hasattr(cache_manager, "block_table")
+                            kv_cache.block_table.get(req_id, [])
+                            if hasattr(kv_cache, "block_table")
                             else []
                         )
                         dst_indices_np = np.asarray(dst_indices, dtype=np.int32)
                     # linear indices (if enabled)
                     linear_dst_indices_np = None
-                    linear_cm = getattr(self, "linear_attn_cache_manager", None)
+                    linear_cache = getattr(self, "linear_attn_cache", None)
                     linear_ptrs = getattr(self, "linear_data_ptrs", [])
                     linear_enabled = (
-                        linear_cm is not None
-                        and int(getattr(linear_cm, "num_layers", 0)) > 0
+                        linear_cache is not None
+                        and int(getattr(linear_cache, "num_layers", 0)) > 0
                         and len(linear_ptrs) > 0
                     )
                     if linear_enabled:
                         linear_dst_indices = (
-                            linear_cm.block_table.get(req_id, [])
-                            if hasattr(linear_cm, "block_table")
+                            linear_cache.block_table.get(req_id, [])
+                            if hasattr(linear_cache, "block_table")
                             else []
                         )
                         linear_dst_indices_np = np.asarray(
@@ -3449,17 +3386,17 @@ class KVManager:
 
                     # indexer indices (if enabled)
                     indexer_dst_indices_np = None
-                    indexer_cm = getattr(self, "indexer_cache_manager", None)
+                    indexer_cache = getattr(self, "indexer_cache", None)
                     indexer_ptrs = getattr(self, "indexer_data_ptrs", [])
                     indexer_enabled = (
-                        indexer_cm is not None
-                        and int(getattr(indexer_cm, "num_layers", 0)) > 0
+                        indexer_cache is not None
+                        and int(getattr(indexer_cache, "num_layers", 0)) > 0
                         and len(indexer_ptrs) > 0
                     )
                     if indexer_enabled:
                         indexer_dst_indices = (
-                            indexer_cm.block_table.get(req_id, [])
-                            if hasattr(indexer_cm, "block_table")
+                            indexer_cache.block_table.get(req_id, [])
+                            if hasattr(indexer_cache, "block_table")
                             else []
                         )
                         indexer_dst_indices_np = np.asarray(
@@ -3531,10 +3468,10 @@ class KVManager:
                 f"first_tokens_shape={list(first_tokens.shape)} aux_slots={aux_indices}"
             )
 
-        # Insert transferred KV into cache manager using the reserved destination indices.
-        if not hasattr(cache_manager, "insert_kv_cache_from_transfer"):
+        # Insert transferred KV into cache using the reserved destination indices.
+        if not hasattr(kv_cache, "insert_kv_cache_from_transfer"):
             raise RuntimeError(
-                "cache manager does not support insert_kv_cache_from_transfer; "
+                "cache does not support insert_kv_cache_from_transfer; "
                 "paged cache is required for PD KV transfer"
             )
 
@@ -3542,9 +3479,7 @@ class KVManager:
             req_id = request_ids[idx]
             page_indices = reserved_dst_indices_list[idx]
             prefix_length = int(prefix_lens[idx])
-            cache_manager.insert_kv_cache_from_transfer(
-                req_id, page_indices, prefix_length
-            )
+            kv_cache.insert_kv_cache_from_transfer(req_id, page_indices, prefix_length)
             self._trace(
                 "decode_insert_kv_done",
                 room=room,
@@ -3559,14 +3494,14 @@ class KVManager:
                 )
 
         # Insert transferred linear attention state (Qwen3-next)
-        if getattr(self, "linear_attn_cache_manager", None) is not None:
+        if getattr(self, "linear_attn_cache", None) is not None:
             for idx, room in enumerate(room_ids):
                 req_id = request_ids[idx]
                 lin_indices = reserved_dst_linear_indices_list[idx]
                 if not lin_indices:
                     continue
-                self.linear_attn_cache_manager.insert_linear_state_from_transfer(
-                    req_id, int(lin_indices[0])
+                self.linear_attn_cache.insert_linear_state_from_transfer(
+                    req_id, int(lin_indices[0]), prefix_length
                 )
                 if pd_trace_enabled():
                     logger.debug(
@@ -3575,14 +3510,14 @@ class KVManager:
                     )
 
         # Insert transferred indexer KV cache
-        if getattr(self, "indexer_cache_manager", None) is not None:
+        if getattr(self, "indexer_cache", None) is not None:
             for idx, room in enumerate(room_ids):
                 req_id = request_ids[idx]
                 idx_indices = reserved_dst_indexer_indices_list[idx]
                 if not idx_indices:
                     continue
                 prefix_length = int(prefix_lens[idx])
-                self.indexer_cache_manager.insert_kv_cache_from_transfer(
+                self.indexer_cache.insert_kv_cache_from_transfer(
                     req_id, idx_indices, prefix_length
                 )
                 if pd_trace_enabled():
@@ -3608,8 +3543,8 @@ class KVManager:
         # TP 重排（Prefill TP>1 -> Decode TP=1）：
         # Prefill 侧会按“TP shard 连续”的布局把 KV 直写到 Decode 的预留 blocks。
         # Decode 在插入页表元数据前，需要把这段布局重排为 token-major 的最终布局。
-        cache_manager = self.cache_manager
-        block_size = int(getattr(cache_manager, "block_size", 0) or 0)
+        kv_cache = self.kv_cache
+        block_size = int(getattr(kv_cache, "block_size", 0) or 0)
         prepared_transfers = getattr(self, "_prepared_transfers", {})
         assert block_size > 0, f"Unexpected block_size={block_size}"
         for idx, room in enumerate(room_ids):
@@ -3632,8 +3567,8 @@ class KVManager:
                 num_heads if prefill_tp_size > num_heads else prefill_tp_size
             )
 
-            for key in cache_manager.paged_kv_cache:
-                cache = cache_manager.paged_kv_cache[key]
+            for key in kv_cache.paged_kv_cache:
+                cache = kv_cache.paged_kv_cache[key]
 
                 if cache.ndim == 4:
                     # MLA compressed KV cache (e.g. kv_lora_k_pe for DeepSeek-V3):
@@ -3677,14 +3612,14 @@ class KVManager:
                     page_table = torch.tensor(
                         reserved_blocks,
                         dtype=torch.int32,
-                        device=self.cache_manager.device,
+                        device=self.kv_cache.device,
                     )
                     position_ids = torch.arange(
                         0,
                         prefix_length,
                         1,
                         dtype=torch.int32,
-                        device=self.cache_manager.device,
+                        device=self.kv_cache.device,
                     )
                     block_ids = page_table[position_ids // block_size]  # (seq_len,)
                     offs_in_block = position_ids % block_size  # (seq_len,)

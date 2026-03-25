@@ -2,45 +2,50 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from chitu.cache_manager import MMPagedKVCacheManager
+from chitu.kv_cache import MMPagedKVCache
 from chitu.ops import append_to_paged_kv_cache
+
+if TYPE_CHECKING:
+    from chitu.task import PackedTasksBase
 
 
 class QwenVLMmCacheCoreMixin:
     """Shared multimodal cache helpers for Qwen VL family."""
 
-    mm_cache_manager: Optional[MMPagedKVCacheManager]
+    mm_cache: Optional[MMPagedKVCache]
 
-    def _require_mm_cache_manager(self) -> MMPagedKVCacheManager:
-        mm_cache_manager = getattr(self, "mm_cache_manager", None)
-        if mm_cache_manager is None:
+    def _require_mm_cache(self) -> MMPagedKVCache:
+        mm_cache = getattr(self, "mm_cache", None)
+        if mm_cache is None:
             raise ValueError(
-                "multimodal cache manager is required for multimodal prefill, but cache_managers['multimodal'] is missing."
+                "multimodal cache is required for multimodal prefill, but cache_dict['multimodal'] is missing."
             )
-        return mm_cache_manager
+        return mm_cache
 
     def _mm_cache_cleanup(self) -> None:
         """Drop multimodal caches for requests that are no longer active in KV cache."""
         try:
             active = set(
-                getattr(self.cache_managers["main"], "req_id_to_seq_len", {}).keys()
+                getattr(self.cache_dict["main"], "tid_to_cached_len", {}).keys()
             )
         except Exception:
             return
 
-        mm_cache_manager = self._require_mm_cache_manager()
+        mm_cache = self._require_mm_cache()
+
+        from chitu.task import PackedTasksBase
 
         if not active:
             self._mm_req_cache.clear()
             self._rope_delta_by_req.clear()
-            for rid in list(
-                getattr(mm_cache_manager, "req_id_to_multimodal_len", {}).keys()
-            ):
-                mm_cache_manager.finalize_cache_all_decode(rid)
+
+            task_ids = list(getattr(mm_cache, "tid_to_multimodal_len", {}).keys())
+            tasks = PackedTasksBase(num_tasks=len(task_ids), task_ids=task_ids)
+            mm_cache.finalize_cache_all_decode(tasks)
             return
 
         for rid in list(self._mm_req_cache.keys()):
@@ -50,17 +55,16 @@ class QwenVLMmCacheCoreMixin:
             if rid not in active:
                 del self._rope_delta_by_req[rid]
 
-        mm_active = set(
-            getattr(mm_cache_manager, "req_id_to_multimodal_len", {}).keys()
-        )
-        for rid in mm_active - active:
-            mm_cache_manager.finalize_cache_all_decode(rid)
+        mm_active = set(getattr(mm_cache, "tid_to_multimodal_len", {}).keys())
+        task_ids = list(mm_active - active)
+        tasks = PackedTasksBase(num_tasks=len(task_ids), task_ids=task_ids)
+        mm_cache.finalize_cache_all_decode(tasks)
 
     def _mm_state_for_req(self, rid: str) -> dict[str, Any]:
-        return self._require_mm_cache_manager().request_metadata.setdefault(rid, {})
+        return self._require_mm_cache().request_metadata.setdefault(rid, {})
 
     def _mm_state_get(self, rid: str, default: Any = None) -> Any:
-        return self._require_mm_cache_manager().request_metadata.get(rid, default)
+        return self._require_mm_cache().request_metadata.get(rid, default)
 
     def _mm_write_done_key(self, kind: str) -> str:
         return f"mm_written_{kind}"
@@ -72,7 +76,7 @@ class QwenVLMmCacheCoreMixin:
         per_req_feats: dict[str, list[torch.Tensor]],
         per_req_ds: dict[str, list[list[torch.Tensor]]],
     ) -> None:
-        mm_cache_manager = self._require_mm_cache_manager()
+        mm_cache = self._require_mm_cache()
 
         write_rids: list[str] = []
         vision_embeds_list: list[torch.Tensor] = []
@@ -89,10 +93,10 @@ class QwenVLMmCacheCoreMixin:
 
             vision_embeds = torch.cat(parts, dim=0).contiguous()
             num_vision_tokens = int(vision_embeds.shape[0])
-            mm_seq_base = int(mm_cache_manager.req_id_to_seq_len.get(rid, 0))
+            mm_seq_base = int(mm_cache.tid_to_cached_len.get(rid, 0))
 
-            mm_cache_manager.register_tensor_for_consumption(
-                req_id=rid,
+            mm_cache.register_tensor_for_consumption(
+                tid=rid,
                 tensor_key="vision_embeds",
                 total_tokens=num_vision_tokens,
             )
@@ -114,8 +118,8 @@ class QwenVLMmCacheCoreMixin:
                         for inp_idx in range(len(ds_inputs))
                     ]
                     ds_cat = torch.cat(ds_embeds, dim=0).contiguous()
-                    mm_cache_manager.register_tensor_for_consumption(
-                        req_id=rid,
+                    mm_cache.register_tensor_for_consumption(
+                        tid=rid,
                         tensor_key="deepstack_embeds",
                         total_tokens=int(ds_cat.shape[0]),
                     )
@@ -130,12 +134,18 @@ class QwenVLMmCacheCoreMixin:
 
         if not write_rids:
             return
-        mm_cache_manager.allocate_block_for_cache(
-            req_ids=alloc_req_ids, delta_seq_len=alloc_delta_lens
+
+        from chitu.task import PackedTasksBase
+
+        tasks = PackedTasksBase(
+            num_tasks=len(alloc_req_ids),
+            task_ids=alloc_req_ids,
+            tokens=[[1] * seq_len for seq_len in alloc_delta_lens],
         )
+        mm_cache.allocate_block_for_cache(tasks)
 
         device = vision_embeds_list[0].device
-        block_lists = [mm_cache_manager.get_page_indices(rid) for rid in write_rids]
+        block_lists = [mm_cache.get_page_indices(rid) for rid in write_rids]
 
         max_blocks = max(len(bl) for bl in block_lists)
         padded_blocks = [bl + [0] * (max_blocks - len(bl)) for bl in block_lists]
@@ -173,7 +183,7 @@ class QwenVLMmCacheCoreMixin:
                     torch.full((n_ds,), i, device=device, dtype=torch.int32)
                 )
 
-        accessor = mm_cache_manager.get_accessor(layer_id=0)
+        accessor = mm_cache.get_accessor(layer_id=0)
 
         append_to_paged_kv_cache(
             kv_cache=accessor.kv["vision_embeds"],
@@ -209,7 +219,7 @@ class QwenVLMmCacheCoreMixin:
         Optional[torch.Tensor],
     ]:
         del kind
-        mm_cache_manager = self._require_mm_cache_manager()
+        mm_cache = self._require_mm_cache()
 
         vision_key = "vision_embeds"
         deepstack_key = "deepstack_embeds"
@@ -231,13 +241,13 @@ class QwenVLMmCacheCoreMixin:
         else:
             chunk_sizes = [0] * n_reqs
 
-        mm_cache_manager.prepare_cache_for_pre_layers_prefill(
-            req_ids=req_ids,
+        mm_cache.prepare_cache_for_pre_layers_prefill(
+            task_ids=req_ids,
             chunk_sizes=chunk_sizes,
         )
 
-        results, _complete_flags = mm_cache_manager.batched_consume_next_chunk(
-            req_ids=req_ids,
+        results, _complete_flags = mm_cache.batched_consume_next_chunk(
+            task_ids=req_ids,
             tensor_keys=tensor_keys,
             auto_free=False,
         )

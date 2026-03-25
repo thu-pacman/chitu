@@ -121,10 +121,11 @@ def start_decode_prepare_listener_thread(
                 continue
             prefill_engine_rank = msg.get("prefill_scheduler_id", None)
             prefix_len = msg.get("prefix_len", 0)
+            task_cache_ids = msg.get("task_cache_ids", [])
             # NOTE：收到请求的 prepare 指令并开始处理
             logger.debug(
                 f"[PD_PREPARE] recv_prepare req_id={request_id} dp_rank={dp_rank} "
-                f"prefill_engine_rank={prefill_engine_rank} prefix_len={prefix_len}"
+                f"prefill_engine_rank={prefill_engine_rank} prefix_len={prefix_len},task_cache_ids:{task_cache_ids}"
             )
             logger.debug(
                 f"[PD_STAGE][decode.prealloc.rank.start] req_id={request_id} dp_rank={dp_rank}"
@@ -142,6 +143,7 @@ def start_decode_prepare_listener_thread(
                     prefill_engine_rank if prefill_engine_rank is not None else None
                 ),
                 prefix_len=prefix_len,
+                task_cache_ids=task_cache_ids,
             )
             continue
 
@@ -265,22 +267,20 @@ class PDSchedulerService:
         # Initialize ZMQ sockets on TP main rank only
         await self._init_sockets()
 
-        # Set cache manager for KVManager so that PD path can access KV buffers
+        # Set cache for KVManager so that PD path can access KV buffers
         if self.scheduler is not None:
-            self.scheduler.set_cache_manager(Backend.cache_managers["main"])
-            if "linear" in Backend.cache_managers:
-                self.scheduler.set_linear_attn_cache_manager(
-                    Backend.cache_managers["linear"]
-                )
-            if "indexer" in Backend.cache_managers:
-                indexer_cm = Backend.cache_managers["indexer"]
-                if indexer_cm is not None:
-                    self.scheduler.set_indexer_cache_manager(indexer_cm)
-                    logger.info("[PD] indexer cache manager set for PD transfer")
-            for keys in Backend.cache_managers:
+            self.scheduler.set_kv_cache(Backend.cache_dict["main"])
+            if "linear" in Backend.cache_dict:
+                self.scheduler.set_linear_attn_cache(Backend.cache_dict["linear"])
+            if "indexer" in Backend.cache_dict:
+                indexer_cache = Backend.cache_dict["indexer"]
+                if indexer_cache is not None:
+                    self.scheduler.set_indexer_cache(indexer_cache)
+                    logger.info("[PD] indexer cache set for PD transfer")
+            for keys in Backend.cache_dict:
                 if keys not in {"main", "linear", "indexer"}:
                     raise NotImplementedError(
-                        f"cache manager {keys} is not supported for PD-disaggregation"
+                        f"cache {keys} is not supported for PD-disaggregation"
                     )
 
         # Initialize DP token manager for streaming tokens back to Router
@@ -522,40 +522,38 @@ async def start_pd_worker_service(args, rank: int = 0):
         DisaggregationMode.DECODE if mode == "decode" else DisaggregationMode.PREFILL
     )
     kv_manager = KVManager(
-        cache_manager=None,  # set below
+        kv_cache=None,  # set below
         metadata_buffers=metadata_buffers,
         disaggregation_mode=disaggregation_mode,
     )
 
     # FIXME: Manager other than "main"
-    kv_manager.cache_manager = Backend.cache_managers["main"]
+    kv_manager.kv_cache = Backend.cache_dict["main"]
     kv_manager.register_buffer_to_engine()
     # Register auxiliary caches for RDMA transfer
     model_type = args.models.type
     # Linear attention cache (Qwen3-next)
     has_linear_cache = (
-        "linear" in Backend.cache_managers
-        and Backend.cache_managers["linear"] is not None
+        "linear" in Backend.cache_dict and Backend.cache_dict["linear"] is not None
     )
     logger.info(
         f"[PD_WORKER] linear cache check: model_type={model_type}, has_linear_cache={has_linear_cache}"
     )
     if model_type == "hf-qwen3-next" and has_linear_cache:
-        kv_manager.set_linear_attn_cache_manager(Backend.cache_managers["linear"])
-        logger.info("[PD_WORKER] linear attention cache manager set for kv_manager")
+        kv_manager.set_linear_attn_cache(Backend.cache_dict["linear"])
+        logger.info("[PD_WORKER] linear attention cache set for kv_manager")
 
     # Indexer KV cache (DeepSeek-V3.2)
     has_indexer_cache = (
-        "indexer" in Backend.cache_managers
-        and Backend.cache_managers["indexer"] is not None
+        "indexer" in Backend.cache_dict and Backend.cache_dict["indexer"] is not None
     )
     logger.info(
         f"[PD_WORKER] indexer cache check: model_type={model_type}, has_indexer_cache={has_indexer_cache}"
     )
     if has_indexer_cache:
-        kv_manager.set_indexer_cache_manager(Backend.cache_managers["indexer"])
-        logger.info("[PD_WORKER] indexer cache manager set for kv_manager")
-    logger.info("KVManager initialized and registered with CacheManager")
+        kv_manager.set_indexer_cache(Backend.cache_dict["indexer"])
+        logger.info("[PD_WORKER] indexer cache set for kv_manager")
+    logger.info("KVManager initialized and registered with Cache")
 
     kv_hook = MooncakeKVTransferHook(kv_manager, mode)
     Backend.executor.set_kv_hook(kv_hook)

@@ -5,7 +5,7 @@ import torch
 from omegaconf import OmegaConf
 
 from chitu.backend import Backend
-from chitu.cache_manager import GlobalLocalMap, PagedKVCacheManager
+from chitu.kv_cache import GlobalLocalMap, PagedKVCacheManager
 from chitu.distributed.parallel_state import initialize_parallel_groups
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 import chitu.global_vars as global_vars
@@ -96,21 +96,20 @@ def test_pd_dp_shard_round_robin():
         tp_size=1, pp_size=1, dp_size=world_size, ep_size=1, etp_size=1
     )
 
-    layer_map = GlobalLocalMap.from_range(0, 2)
-    Backend.cache_managers = {
-        "main": PagedKVCacheManager(
-            layer_map,
-            num_hot_req=cfg.infer.max_reqs,
-            max_seq_len=cfg.infer.max_seq_len,
-            shape_per_token_dict={"kv_cache": torch.Size([2, 8])},
-            dtype_dict={"kv_cache": torch.float16},
-            n_local_kv_heads=2,
-            head_dim=8,
-            device="cpu",
-            block_size=16,
-            num_blocks=128,
-        )
-    }
+    Backend.cache_managers = [
+        {
+            "main": PagedKVCacheManager(
+                num_blocks=128,
+                num_hot_req=cfg.infer.max_reqs,
+                max_seq_len=cfg.infer.max_seq_len,
+                dp_rank=i,
+                block_size=16,
+                mtp_size=1,
+                enable_prefix_caching=False,
+            )
+        }
+        for i in range(2)
+    ]
 
     TaskPool.reset()
 
@@ -152,6 +151,7 @@ def test_pd_dp_shard_round_robin():
         prefill_num_tasks=1,
         decode_num_tasks=4,
         scheduler_type="fcfs",
+        cache_manager_dict=Backend.cache_dict[0],
         num_scheduler_groups=1,
         dp_rank=0,
     )
@@ -160,6 +160,7 @@ def test_pd_dp_shard_round_robin():
         prefill_num_tasks=1,
         decode_num_tasks=4,
         scheduler_type="fcfs",
+        cache_manager_dict=Backend.cache_dict[0],
         num_scheduler_groups=1,
         dp_rank=1,
     )

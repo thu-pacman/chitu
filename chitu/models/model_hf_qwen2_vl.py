@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from chitu.attn_backend import AttnBackend, RefAttnBackend, FlashAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.cache_manager import KVCacheManagerBase
+from chitu.kv_cache import KVCacheBase
 from chitu.models.model import RMSNorm
 from chitu.models.model_hf_llama import (
     FeedForwardHFLlama,
@@ -507,7 +507,7 @@ class TransformerQwen2VL(TransformerHFLlama):
     def __init__(
         self,
         params,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -524,7 +524,7 @@ class TransformerQwen2VL(TransformerHFLlama):
 
         super().__init__(
             params,
-            cache_managers,
+            cache_dict,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,

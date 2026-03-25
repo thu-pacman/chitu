@@ -13,7 +13,7 @@ import torch.nn.functional as F
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import KVCacheManagerBase
+from chitu.kv_cache import KVCacheBase
 from chitu.models.model import RMSNorm, get_linear_layout_native_y
 from chitu.models.model_hf_llama import TransformerBlockHFLlama
 from chitu.models.model_hf_qwen2_vl import (
@@ -292,7 +292,7 @@ class TransformerBlockHFGlm4Moe(TransformerBlockHFLlama):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         *,
         op_impl="torch",
@@ -326,7 +326,7 @@ class TransformerBlockHFGlm4Moe(TransformerBlockHFLlama):
         super().__init__(
             layer_id,
             args,
-            cache_managers,
+            cache_dict,
             attn_backend=attn_backend,
             op_impl=op_impl,
             rotary_type=rotary_type,
@@ -350,7 +350,7 @@ class TransformerBlockHFGlm4MoeMTP(TransformerBlockHFGlm4Moe):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         *,
         op_impl="torch",
@@ -360,7 +360,7 @@ class TransformerBlockHFGlm4MoeMTP(TransformerBlockHFGlm4Moe):
         super().__init__(
             layer_id,
             args,
-            cache_managers,
+            cache_dict,
             attn_backend=attn_backend,
             op_impl=op_impl,
             rotary_type=rotary_type,
@@ -392,7 +392,7 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
     def __init__(
         self,
         params,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -410,7 +410,7 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
 
         super().__init__(
             params,
-            cache_managers,
+            cache_dict,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,

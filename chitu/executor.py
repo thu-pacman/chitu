@@ -593,11 +593,8 @@ class ExpertDataDispatcher(TasksDispatcher):
                     and getattr(kv_hook, "mode", None) == "decode"
                     and hasattr(kv_manager, "prepare_kv_transfer")
                 ):
-                    cache_manager = (
-                        getattr(kv_manager, "cache_manager", None)
-                        or Backend.cache_managers["main"]  # FIXME: other managers
-                    )
-                    if cache_manager is not None and boot_ids:
+                    kv_cache = getattr(kv_manager, "kv_cache", None)
+                    if kv_cache is not None and boot_ids:
                         prefix_lens = []
                         for rid in boot_ids:
                             t = TaskPool.pool.get(rid)
@@ -619,8 +616,9 @@ class ExpertDataDispatcher(TasksDispatcher):
                                 )
                         kv_manager.prepare_kv_transfer(
                             request_ids=list(boot_ids),
-                            cache_manager=cache_manager,
+                            kv_cache=kv_cache,
                             prefix_lens=prefix_lens,
+                            cache_ids_list=tasks.new_cache_ids_list,
                         )
                 logger.debug(
                     f"[PD_TRACE][dp.recv_decode_bootstrap] rank_in_group={int(self.rank_in_group)} "
@@ -815,28 +813,6 @@ class Executor:
         self._lb_every = args.infer.moe_lb_trigger
         self._lb_step = 0
 
-    def _should_record_metrics(
-        self, num_tokens: int = 0, is_prefill: bool = False
-    ) -> bool:
-        """Determine if current rank should record metrics.
-
-        In non-DP mode: only rank 0 records metrics.
-        In DP mode: only the DP dispatcher ranks record metrics.
-
-        Args:
-            num_tokens: Number of tokens being processed (0 means no tasks)
-            is_prefill: Whether this is a prefill step (affects which ranks process tasks in PP mode)
-        """
-        # Must have tasks to process
-        if num_tokens == 0:
-            return False
-
-        # In non-DP mode, only rank 0 records metrics
-        if self.dp_size <= 1:
-            return self.rank == 0
-
-        return self.dp_dispatcher is not None
-
     def _prepend_dispatcher(self, dispatcher: TasksDispatcher):
         self.task_dispatchers.insert(0, dispatcher)
 
@@ -971,6 +947,7 @@ class Executor:
     ) -> SerializedPackedTasksPayloadType:
         # 1. propagate tasks and handle special payload type
         payload_type = tasks.payload_type if tasks is not None else None
+
         for dispatcher in self.task_dispatchers:
             payload_type, tasks = dispatcher.dispatch_metadata(tasks)
 
@@ -987,10 +964,9 @@ class Executor:
         if payload_type == SerializedPackedTasksPayloadType.EndTask:
             Backend.constraint_decode_manager.end_tasks(tasks.req_ids)
             # Delete item from KV cache
-            for rid in tasks.req_ids:
-                for mgr in Backend.cache_managers.values():
-                    mgr.finalize_cache_all_decode(rid)
-            PrometheusMetricsCollector.update_kvcache_usage()
+            for cache in Backend.cache_dict.values():
+                cache.finalize_cache_all_decode(tasks)
+            PrometheusMetricsCollector.update_GPU_usage()
             PrometheusMetricsCollector.update_task_counts()
             if self.rank > 0:
                 for task_id in tasks.task_ids:
@@ -1087,9 +1063,9 @@ class Executor:
     def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         is_empty_step = tasks.num_tasks == 0
         if not is_empty_step:
-            for mgr in Backend.cache_managers.values():
-                mgr.prepare_cache_prefill(tasks.req_ids, [len(t) for t in tasks.tokens])
-            PrometheusMetricsCollector.update_kvcache_usage()
+            for cache in Backend.cache_dict.values():
+                cache.prepare_cache_prefill(tasks)
+            PrometheusMetricsCollector.update_GPU_usage()
             PrometheusMetricsCollector.update_task_counts()
 
             num_tokens = tasks.num_tokens
@@ -1134,11 +1110,9 @@ class Executor:
 
         if not is_empty_step:
             # Collect prompt tokens metrics
-            # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
-            # In non-DP mode: only rank 0 records metrics
-            # if self._should_record_metrics(num_tokens, is_prefill=True):
-            #     PrometheusMetricsCollector.inc_prompt_tokens(num_tokens)
-            PrometheusMetricsCollector.inc_prompt_tokens(num_tokens)
+            hit_token_len = sum(tasks.hit_token_lens)
+            PrometheusMetricsCollector.inc_prompt_tokens(num_tokens + hit_token_len)
+            PrometheusMetricsCollector.inc_hit_tokens(hit_token_len)
 
             # payload send
             #
@@ -1154,8 +1128,6 @@ class Executor:
             ]
             self._kv_hook.on_prefill_done(output_req_ids, out, tasks)
 
-            for mgr in Backend.cache_managers.values():
-                mgr.finalize_cache_all_prefill()  # like reset metadata
             return out
         else:
             for dispatcher in self.task_dispatchers:
@@ -1169,8 +1141,8 @@ class Executor:
         if not is_empty_step:
             # Ensure KV cache is present for PD decode-only before updating CacheManager state.
             self._kv_hook.before_decode_step(tasks.req_ids)
-            for mgr in Backend.cache_managers.values():
-                mgr.prepare_cache_decode(tasks.req_ids)
+            for cache in Backend.cache_dict.values():
+                cache.prepare_cache_decode(tasks)
 
             num_tokens = tasks.num_tasks
 
@@ -1224,24 +1196,16 @@ class Executor:
 
         if not is_empty_step:
             # Collect metrics for Prometheus
-            # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
-            # In non-DP mode: only rank 0 records metrics
-            if self._should_record_metrics(tasks.num_tasks, is_prefill=False):
-                PrometheusMetricsCollector.inc_generated_tokens(tasks.num_tasks)
-                if self.mtp_size > 1 and Backend.model.mtp_token_list:
-                    mtp_proposed = (self.mtp_size - 1) * tasks.num_tasks
-                    mtp_accepted = sum(len(t) for t in Backend.model.mtp_token_list)
-                    PrometheusMetricsCollector.inc_mtp_tokens(
-                        mtp_proposed, mtp_accepted
-                    )
+            PrometheusMetricsCollector.inc_generated_tokens(tasks.num_tasks)
+            if self.mtp_size > 1 and Backend.model.mtp_token_list:
+                mtp_proposed = (self.mtp_size - 1) * tasks.num_tasks
+                mtp_accepted = sum(len(t) for t in Backend.model.mtp_token_list)
+                PrometheusMetricsCollector.inc_mtp_tokens(mtp_proposed, mtp_accepted)
 
             # payload send
             for dispatcher in self.task_dispatchers:
                 dispatcher.send_payload(out, tasks)
 
-            # update seq_len and reset block table
-            for mgr in Backend.cache_managers.values():
-                mgr.finalize_cache_single_decode(tasks.req_ids)
             return out
         else:
             for dispatcher in self.task_dispatchers:

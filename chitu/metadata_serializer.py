@@ -347,6 +347,11 @@ class MetadataSerializer:
         if config.include_slot_idx and slot_idx is not None:
             msg_dict["slot_idx"] = slot_idx
 
+        if tasks.new_cache_ids_list:
+            msg_dict["new_cache_ids_list"] = tasks.new_cache_ids_list
+        if tasks.hit_token_lens:
+            msg_dict["hit_token_lens"] = tasks.hit_token_lens
+
         # 序列化
         return msgpack.packb(msg_dict, use_bin_type=True)
 
@@ -383,9 +388,12 @@ class MetadataSerializer:
                 task_type=task_type,
                 tokens=tokens,
                 payload_type=payload_type,
+                new_cache_ids_list=msg_dict.get("new_cache_ids_list", []),
+                hit_token_lens=msg_dict.get("hit_token_lens", []),
                 num_tokens=num_tokens,
                 has_outputs=msg_dict.get("has_outputs", []),
             )
+
             return payload_type, packed_tasks_base, slot_idx
 
         # 解析基础信息
@@ -435,6 +443,9 @@ class MetadataSerializer:
         # 使用接收的状态信息，覆盖从本地读取的状态信息
         if has_outputs:
             packed_tasks.has_outputs = has_outputs
+
+        packed_tasks.new_cache_ids_list = msg_dict.get("new_cache_ids_list", [])
+        packed_tasks.hit_token_lens = msg_dict.get("hit_token_lens", [])
 
         return payload_type, packed_tasks, slot_idx
 

@@ -11,7 +11,7 @@ import torch
 from chitu.attn_backend.triton_attn_backend import TritonAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.static_tensor import StaticTensor
-from chitu.cache_manager import PagedKVCacheAccessor
+from chitu.kv_cache import PagedKVCacheAccessor
 from chitu.ops import append_to_paged_kv_cache, read_from_paged_kv_cache
 from chitu.utils import try_import_opt_dep, ceil_div
 from chitu.distributed.parallel_state import get_dp_size
@@ -214,16 +214,21 @@ class FlashMLABackend(TritonAttnBackend):
         # pad h_q to required_h_q if necessary
         q = self.pad_h_q(q, num_tokens, local_h_q)
 
+        # 确保 decode 元数据已初始化（开启prefix caching后warmup可能尚未调用 prepare_metadata_for_decode）
+        if self.metadata_decode is None:
+            self.metadata_decode, self.num_splits = flash_mla.get_mla_metadata()
+
         q = q.view(bsz, s_q, q.shape[-2], q.shape[-1])
+        # 使用关键字参数调用以兼容新版 FlashMLA 接口，并显式传入 tile_scheduler_metadata
         # Don't pass `indices` here because it requires some new versions of FlashMLA
         output, _ = flash_mla.flash_mla_with_kvcache(
-            q,
-            kv_lora_k_pe.unsqueeze(2),
-            block_table,
-            seq_len_delta.new.lens_tensor_device,
-            512,  # dv
-            self.metadata_decode,
-            self.num_splits,
+            q=q,
+            k_cache=kv_lora_k_pe.unsqueeze(2),
+            block_table=block_table,
+            head_dim_v=512,
+            cache_seqlens=seq_len_delta.new.lens_tensor_device,
+            tile_scheduler_metadata=self.metadata_decode,
+            num_splits=self.num_splits,
             causal=(False if s_q == 1 else True),
             softmax_scale=softmax_scale,
         )
