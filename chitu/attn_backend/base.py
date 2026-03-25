@@ -11,11 +11,7 @@ from logging import getLogger
 import torch
 
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.cache_manager import (
-    KVCacheAccessor,
-    PagedKVCacheAccessor,
-    DenseKVCacheAccessor,
-)
+from chitu.kv_cache import KVCacheAccessor, DenseKVCacheAccessor, PagedKVCacheAccessor
 from chitu.native_layout import (
     ColumnOddEvenSeparatedTensor,
     PartialColumnOddEvenSeparatedTensor,

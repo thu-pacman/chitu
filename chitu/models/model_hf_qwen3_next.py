@@ -12,7 +12,7 @@ from torch import nn
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import KVCacheManagerBase
+from chitu.kv_cache import KVCacheBase
 from chitu.distributed.parallel_state import get_tp_group, get_tp_size
 from chitu.models.model import (
     RMSNorm,
@@ -514,7 +514,7 @@ class TransformerBlockHFQwen3NextBase(TransformerBlock):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         op_impl,
         rotary_type="separated",
@@ -522,7 +522,7 @@ class TransformerBlockHFQwen3NextBase(TransformerBlock):
         *,
         checkpoint_prefix,
     ):
-        super().__init__(layer_id, args, cache_managers, attn_backend, op_impl)
+        super().__init__(layer_id, args, cache_dict, attn_backend, op_impl)
         self.mlp = mlp_type(
             args,
             op_impl=op_impl,
@@ -541,7 +541,7 @@ class TransformerBlockHFQwen3NextFull(TransformerBlockHFQwen3NextBase):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         op_impl,
         rotary_type="separated",
@@ -552,7 +552,7 @@ class TransformerBlockHFQwen3NextFull(TransformerBlockHFQwen3NextBase):
         super().__init__(
             layer_id,
             args,
-            cache_managers,
+            cache_dict,
             attn_backend,
             op_impl,
             rotary_type,
@@ -562,7 +562,7 @@ class TransformerBlockHFQwen3NextFull(TransformerBlockHFQwen3NextBase):
         self.self_attn = AttentionQwen3Next(
             args,
             layer_id,
-            cache_managers["main"],
+            cache_dict["main"],
             attn_backend,
             rotary_type=rotary_type,
             op_impl=op_impl,
@@ -580,7 +580,7 @@ class TransformerBlockHFQwen3NextLinear(TransformerBlockHFQwen3NextBase):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         op_impl,
         rotary_type="separated",
@@ -591,7 +591,7 @@ class TransformerBlockHFQwen3NextLinear(TransformerBlockHFQwen3NextBase):
         super().__init__(
             layer_id,
             args,
-            cache_managers,
+            cache_dict,
             attn_backend,
             op_impl,
             rotary_type,
@@ -601,7 +601,7 @@ class TransformerBlockHFQwen3NextLinear(TransformerBlockHFQwen3NextBase):
         self.linear_attn = Qwen3NextGatedDeltaNet(
             args,
             layer_id,
-            cache_managers["linear"],
+            cache_dict["linear"],
             checkpoint_prefix=f"{checkpoint_prefix}.linear_attn",
         )
 
@@ -616,7 +616,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
     def __init__(
         self,
         params,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -634,7 +634,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
 
         super().__init__(
             params,
-            cache_managers,
+            cache_dict,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,

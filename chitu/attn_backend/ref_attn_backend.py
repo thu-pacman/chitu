@@ -11,7 +11,7 @@ import torch
 
 from chitu.attn_backend.base import AttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
+from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
 
 
 # SPDX-SnippetBegin

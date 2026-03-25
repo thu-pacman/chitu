@@ -10,7 +10,7 @@ import torch
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import KVCacheManagerBase, MMPagedKVCacheManager
+from chitu.kv_cache import KVCacheBase, MMPagedKVCache
 from chitu.models.mm_cache_mixin_qwen_vl import get_qwen_vl_mm_cache_class
 from chitu.models.registry import ModelType, register_model
 from chitu.tensor_parallel import (
@@ -47,7 +47,7 @@ class TransformerBlockHFQwen3_5FullMoe(TransformerBlockHFQwen3NextFull):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         op_impl,
         rotary_type="separated",
@@ -58,7 +58,7 @@ class TransformerBlockHFQwen3_5FullMoe(TransformerBlockHFQwen3NextFull):
         super().__init__(
             layer_id,
             args,
-            cache_managers,
+            cache_dict,
             attn_backend,
             op_impl,
             rotary_type,
@@ -72,7 +72,7 @@ class TransformerBlockHFQwen3_5FullDense(TransformerBlockHFQwen3NextFull):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         op_impl,
         rotary_type="separated",
@@ -83,7 +83,7 @@ class TransformerBlockHFQwen3_5FullDense(TransformerBlockHFQwen3NextFull):
         super().__init__(
             layer_id,
             args,
-            cache_managers,
+            cache_dict,
             attn_backend,
             op_impl,
             rotary_type,
@@ -97,7 +97,7 @@ class TransformerBlockHFQwen3_5LinearMoe(TransformerBlockHFQwen3NextLinear):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         op_impl,
         rotary_type="separated",
@@ -108,7 +108,7 @@ class TransformerBlockHFQwen3_5LinearMoe(TransformerBlockHFQwen3NextLinear):
         super().__init__(
             layer_id,
             args,
-            cache_managers,
+            cache_dict,
             attn_backend,
             op_impl,
             rotary_type,
@@ -122,7 +122,7 @@ class TransformerBlockHFQwen3_5LinearDense(TransformerBlockHFQwen3NextLinear):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         op_impl,
         rotary_type="separated",
@@ -133,7 +133,7 @@ class TransformerBlockHFQwen3_5LinearDense(TransformerBlockHFQwen3NextLinear):
         super().__init__(
             layer_id,
             args,
-            cache_managers,
+            cache_dict,
             attn_backend,
             op_impl,
             rotary_type,
@@ -163,7 +163,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
     def __init__(
         self,
         params,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -199,7 +199,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
 
         super(TransformerHFQwen3Next, self).__init__(
             params,
-            cache_managers,
+            cache_dict,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,
@@ -255,7 +255,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         self._rope_delta_by_req: dict[str, torch.Tensor] = {}
         # Cross-chunk multimodal caches, keyed by req_id (chunked prefill support).
         self._mm_req_cache: dict[str, dict[str, Any]] = {}
-        self.mm_cache_manager: MMPagedKVCacheManager = cache_managers.get("multimodal")
+        self.mm_cache: MMPagedKVCache = cache_dict.get("multimodal")
 
     @override
     def _init_post_layers(self):
@@ -343,17 +343,17 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         deepstack_image_embeds = None
         deepstack_video_embeds = None
 
-        curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
-        if curr_req_ids is None or len(curr_req_ids) <= 0:
+        curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
+        if curr_tids is None or len(curr_tids) <= 0:
             raise ValueError(
-                "cache.curr_req_ids is required for multimodal prefill (chunked-safe)."
+                "cache.curr_tids is required for multimodal prefill (chunked-safe)."
             )
-        curr_req_ids = cast(list[str], curr_req_ids)
-        seq_ids = self.cache_managers[
-            "main"
-        ].seq_len_delta.delta_seq_ids_tensor_device.to(device=input_ids_flat.device)
+        curr_tids = cast(list[str], curr_tids)
+        seq_ids = self.cache_dict["main"].seq_len_delta.delta_seq_ids_tensor_device.to(
+            device=input_ids_flat.device
+        )
 
-        mm_cache_manager = self._require_mm_cache_manager()
+        mm_cache = self._require_mm_cache()
 
         def get_reqs_to_write(
             per_req_feats: dict[str, list[torch.Tensor]], kind: str
@@ -477,8 +477,8 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
                 pixel_values, grid_thw=grid_thw
             )
             req_indices_img: list[int] = []
-            for req_idx, rid in enumerate(curr_req_ids):
-                total = mm_cache_manager.get_consumption_progress(rid, "vision_embeds")
+            for req_idx, rid in enumerate(curr_tids):
+                total = mm_cache.get_consumption_progress(rid, "vision_embeds")
                 has_cache = total > 0
                 has_tok = bool(
                     torch.any(
@@ -490,7 +490,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
                     req_indices_img.append(int(req_idx))
             _mm_prepare_cache(
                 kind="image",
-                req_ids=curr_req_ids,
+                req_ids=curr_tids,
                 req_indices=req_indices_img,
                 splits=list(image_embeds_splits),
                 deepstack_full=deepstack_image_embeds,
@@ -498,7 +498,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
             image_mask_1d, ds_img = _mm_consume(
                 kind="image",
                 token_id=int(self.image_token_id),
-                req_ids=curr_req_ids,
+                req_ids=curr_tids,
                 seq_ids=seq_ids,
             )
         if pixel_values_videos is not None:
@@ -506,8 +506,8 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
                 pixel_values_videos, grid_thw=video_grid_thw
             )
             req_indices_vid: list[int] = []
-            for req_idx, rid in enumerate(curr_req_ids):
-                total = mm_cache_manager.get_consumption_progress(rid, "vision_embeds")
+            for req_idx, rid in enumerate(curr_tids):
+                total = mm_cache.get_consumption_progress(rid, "vision_embeds")
                 has_cache = total > 0
                 has_tok = bool(
                     torch.any(
@@ -519,7 +519,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
                     req_indices_vid.append(int(req_idx))
             _mm_prepare_cache(
                 kind="video",
-                req_ids=curr_req_ids,
+                req_ids=curr_tids,
                 req_indices=req_indices_vid,
                 splits=list(video_embeds_splits),
                 deepstack_full=deepstack_video_embeds,
@@ -527,7 +527,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
             video_mask_1d, ds_vid = _mm_consume(
                 kind="video",
                 token_id=int(self.video_token_id),
-                req_ids=curr_req_ids,
+                req_ids=curr_tids,
                 seq_ids=seq_ids,
             )
 
@@ -581,7 +581,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
                     cast(Any, self),
                     input_ids_flat=input_ids_flat,
                     seq_ids=seq_ids,
-                    curr_req_ids=curr_req_ids,
+                    curr_tids=curr_tids,
                     grid_thw=grid_thw,
                     video_grid_thw=video_grid_thw,
                     spatial_merge_size=spatial_merge_size,
@@ -589,7 +589,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
             )
             self._last_position_ids = pos_flat.reshape(3, -1)
             # Persist rope_delta per request id for later decode steps.
-            for i, rid in enumerate(curr_req_ids):
+            for i, rid in enumerate(curr_tids):
                 self._rope_delta_by_req[rid] = (
                     rope_deltas[i, 0].to(torch.int32).reshape(())
                 )
@@ -705,35 +705,31 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         # During multimodal prefill we compute 3-axis (T/H/W) position ids; use them directly.
         if self._last_position_ids is not None:
             pos3 = self._last_position_ids.to(
-                self.cache_managers[
+                self.cache_dict[
                     "main"
                 ].seq_len_delta.delta_position_ids_tensor_device.device
             ).view(3, 1, -1)
         else:
-            pos = self.cache_managers[
-                "main"
-            ].seq_len_delta.delta_position_ids_tensor_device
+            pos = self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
             # vLLM parity: apply cached rope_delta for multimodal decode.
             # NOTE: decode batch membership can change across steps; use per-req mapping when available.
             if self._rope_delta_by_req:
-                curr_req_ids = getattr(
-                    self.cache_managers["main"], "curr_req_ids", None
-                )
+                curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
                 if (
-                    curr_req_ids is not None
+                    curr_tids is not None
                     and pos.dim() == 1
-                    and pos.numel() == len(curr_req_ids)
+                    and pos.numel() == len(curr_tids)
                 ):
                     rope = torch.empty_like(pos)
                     rope.zero_()
-                    for i, rid in enumerate(curr_req_ids):
+                    for i, rid in enumerate(curr_tids):
                         v = self._rope_delta_by_req.get(rid, None)
                         if v is not None:
                             rope[i] = v.to(device=pos.device, dtype=pos.dtype)
                     pos = pos + rope
                 else:
                     raise ValueError(
-                        "Qwen3.5 multimodal decode requires cache.curr_req_ids aligned with "
+                        "Qwen3.5 multimodal decode requires cache.curr_tids aligned with "
                         "delta_position_ids (per-request rope_delta is enabled)."
                     )
             pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)
@@ -763,16 +759,16 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
             return super()._decode_graph_extra_inputs(tokens, batch_size)
 
         # Keep CUDA-graph decode signature stable: always pass a rope_delta tensor (zeros if not available).
-        pos = self.cache_managers["main"].seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
         rope = torch.zeros_like(pos)
-        curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
+        curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
         if self._rope_delta_by_req:
-            if curr_req_ids is None or len(curr_req_ids) != int(rope.numel()):
+            if curr_tids is None or len(curr_tids) != int(rope.numel()):
                 raise ValueError(
-                    "Qwen3.5 multimodal CUDA-graph decode requires cache.curr_req_ids aligned with "
+                    "Qwen3.5 multimodal CUDA-graph decode requires cache.curr_tids aligned with "
                     "delta_position_ids (per-request rope_delta is enabled)."
                 )
-            for i, rid in enumerate(curr_req_ids):
+            for i, rid in enumerate(curr_tids):
                 v = self._rope_delta_by_req.get(rid, None)
                 if v is not None:
                     rope[i] = v.to(device=rope.device, dtype=rope.dtype)
@@ -790,7 +786,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         if len(extra_inputs) < 1:
             raise ValueError("Qwen3.5 decode graph requires rope_delta as extra input")
         rope_delta = extra_inputs[0]
-        pos = self.cache_managers["main"].seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
         pos = pos + rope_delta.to(device=pos.device, dtype=pos.dtype)
         pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)
 

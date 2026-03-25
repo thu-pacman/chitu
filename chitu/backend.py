@@ -30,12 +30,16 @@ from chitu.attn_backend import (
     NpuAttnBackend,
     HybridAttnBackend,
 )
-from chitu.cache_manager import (
-    DenseKVCacheManager,
+
+from chitu.kv_cache import (
+    KVCacheManagerBase,
     PagedKVCacheManager,
-    SingletonPagedKVCacheManager,
+    PagedKVCache,
+    KVCacheBase,
+    DenseKVCache,
+    SingletonPagedKVCache,
     GlobalLocalMap,
-    MMPagedKVCacheManager,
+    MMPagedKVCache,
 )
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
@@ -94,12 +98,11 @@ class Backend:
     # init once
     model = None
     tokenizer = None
-    cache_managers = None
+    cache_dict: dict[str, KVCacheBase] = {}
     formatter = None
     processor = None
     args = None
-    # --- cache_manager related (not used in the current code)
-    curr_req_ids = None
+    curr_tids = None
     cache_type = ""
     # ---
     use_gloo = True
@@ -112,6 +115,9 @@ class Backend:
 
     # components
     schedulers: Optional[list["Scheduler"]] = None  # One per each DP rank
+    cache_managers: Optional[list[dict[str, "KVCacheManagerBase"]]] = (
+        None  # One per each DP rank
+    )
     executor: Optional["Executor"] = None
 
     # mutable
@@ -442,11 +448,11 @@ class Backend:
             return ChatFormat(Backend.tokenizer)
 
     @staticmethod
-    def _init_cache_manager(
+    def _init_cache_and_manager(
         args,
         attn_backend_type,
         layer_filter_fn=lambda x: x,
-        num_blocks: int = None,
+        num_blocks: Optional[int] = None,
     ):
         """
         Initialize the appropriate KV cache manager based on configuration.
@@ -485,6 +491,14 @@ class Backend:
         logger.info(
             f"{args.infer.cache_type} cache dtype_dict: {kv_cache_kvargs.get('dtype_dict', None)}"
         )
+
+        if args.infer.enable_prefix_caching and args.models.type in {
+            ModelType.HF_QWEN3_NEXT
+        }:
+            raise Exception(
+                f"Temporarily, {ModelType.HF_QWEN3_NEXT} does not yet support prefix caching."
+            )
+
         # Create appropriate cache manager
         if args.infer.cache_type == "paged":
             if args.infer.attn_type == "npu":
@@ -496,17 +510,52 @@ class Backend:
                 block_size = 64
             else:
                 block_size = 256
-            return PagedKVCacheManager(
+
+            num_hot_req = ceil_div(args.infer.max_reqs, args.infer.dp_size)
+            max_seq_len = args.infer.max_seq_len
+
+            num_blocks = args.infer.num_blocks if num_blocks is None else num_blocks
+            if num_blocks == -1:
+                if args.infer.prefill_chunk_size is None:
+                    num_blocks = num_hot_req
+                else:
+                    num_blocks = (
+                        ceil_div(
+                            args.infer.prefill_chunk_size // num_hot_req + 1,
+                            block_size,
+                        )
+                        * num_hot_req
+                    )
+
+            if torch.distributed.get_rank() == 0:
+                Backend.cache_managers = [
+                    {
+                        "main": PagedKVCacheManager(
+                            num_blocks,
+                            num_hot_req=num_hot_req,
+                            max_seq_len=max_seq_len,
+                            dp_rank=i,
+                            mtp_size=args.infer.mtp_size,
+                            enable_prefix_caching=args.infer.enable_prefix_caching,
+                            block_size=block_size,
+                        )
+                    }
+                    for i in range(args.infer.dp_size)
+                ]
+
+            Backend.cache_dict["main"] = PagedKVCache(
                 layer_id_map,
-                max_seq_len=args.infer.max_seq_len,
-                num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
+                num_hot_req=num_hot_req,
+                max_seq_len=max_seq_len,
+                num_blocks=num_blocks,
                 block_size=block_size,
-                num_blocks=args.infer.num_blocks if num_blocks is None else num_blocks,
                 device=device,
                 **kv_cache_kvargs,
             )
+            return
+
         elif args.infer.cache_type == "skew":
-            return DenseKVCacheManager(
+            Backend.cache_dict["main"] = DenseKVCache(
                 layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
                 num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
@@ -517,7 +566,7 @@ class Backend:
             raise ValueError(f"Unknown cache type {args.infer.cache_type}")
 
     @staticmethod
-    def _init_linear_attn_cache_manager(
+    def _init_linear_attn_cache(
         args, layer_filter_fn=lambda x: x, num_blocks: int = None
     ):
         device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
@@ -540,7 +589,7 @@ class Backend:
         local_layers = layer_filter_fn(range(local_begin_layer_id, local_end_layer_id))
         layer_id_map = GlobalLocalMap.from_list(local_layers)
 
-        return SingletonPagedKVCacheManager(
+        Backend.cache_dict["linear"] = SingletonPagedKVCache(
             layer_id_map,
             num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
             shape_per_token_dict=Backend._get_linear_attn_cache_params(args),
@@ -548,9 +597,7 @@ class Backend:
         )
 
     @staticmethod
-    def _init_indexer_cache_manager(
-        args, layer_filter_fn=lambda x: x, num_blocks: int = None
-    ):
+    def _init_indexer_cache(args, layer_filter_fn=lambda x: x, num_blocks: int = None):
         device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
         pipeline_parallel_size = args.infer.pp_size
 
@@ -576,7 +623,7 @@ class Backend:
             logger.warning(
                 f"Index head dim is not set or is not positive, skipping indexer cache manager"
             )
-            return None
+            return
 
         shape_per_token_dict = {
             "indexer_k": (int(index_head_dim),),
@@ -604,24 +651,23 @@ class Backend:
             args.infer.num_blocks if args.infer.num_blocks != -1 else auto_num_blocks
         )
 
-        return PagedKVCacheManager(
+        Backend.cache_dict["indexer"] = PagedKVCache(
             layer_id_map,
+            num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
             max_seq_len=args.infer.max_seq_len,
-            num_hot_req=(args.infer.max_reqs + args.infer.dp_size - 1)
-            // args.infer.dp_size,
-            shape_per_token_dict=shape_per_token_dict,
-            dtype_dict=dtype_dict,
-            block_size=block_size,
             num_blocks=num_blocks,
+            block_size=block_size,
             device=device,
+            dtype_dict=dtype_dict,
+            shape_per_token_dict=shape_per_token_dict,
         )
 
     @staticmethod
-    def _init_multimodal_cache_manager(
+    def _init_multimodal_cache(
         args,
-        base_cache_manager,
+        base_cache,
     ):
-        """Create a dedicated PagedKVCacheManager for Qwen3-VL/Qwen3.5 multimodal features.
+        """Create a dedicated PagedKVCache for Qwen3-VL/Qwen3.5 multimodal features.
 
         This cache holds vision embeddings, DeepStack features between the
         vision-encoder run and their chunked-prefill consumption by the LLM.
@@ -630,11 +676,11 @@ class Backend:
 
         Args:
             args: Global configuration.
-            base_cache_manager: The already-initialised main KV cache manager.
+            base_cache: The already-initialised main KV cache.
                 Used to copy block_size / num_hot_req so both caches are aligned.
 
         Returns:
-            An MMPagedKVCacheManager instance, or None for non-Qwen3-VL models.
+            An MMPagedKVCache instance, or None for non-Qwen3-VL models.
         """
         if args.models.type not in {
             ModelType.HF_QWEN3_VL,
@@ -651,6 +697,11 @@ class Backend:
             )
             return None
 
+        if args.infer.enable_prefix_caching:
+            raise Exception(
+                f"Temporarily, MMPagedKVCache does not yet support prefix caching."
+            )
+
         hidden_size = int(getattr(vision_cfg, "out_hidden_size", 4096))
         deepstack_indexes = list(getattr(vision_cfg, "deepstack_visual_indexes", []))
         num_ds_layers = len(deepstack_indexes)
@@ -663,8 +714,8 @@ class Backend:
         dtype = torch.bfloat16
         dtype_dict = {k: dtype for k in shape_per_token_dict}
 
-        block_size = base_cache_manager.block_size
-        num_hot_req = base_cache_manager.num_hot_req
+        block_size = base_cache.block_size
+        num_hot_req = base_cache.num_hot_req
         max_pict_token_num = min(
             max_vision_token, args.infer.max_seq_len
         )  # max_vision_token is computed according to preprocessor_config.json in model file.
@@ -675,25 +726,25 @@ class Backend:
             else auto_mm_blocks
         )
 
-        device = base_cache_manager.device
+        device = base_cache.device
 
         layer_id_map = GlobalLocalMap.from_range(0, 1)
 
         logger.info(
-            f"Initializing MMPagedKVCacheManager: "
+            f"Initializing MMPagedKVCache: "
             f"num_multimodal_blocks={num_mm_blocks}, block_size={block_size}, "
             f"hidden_size={hidden_size}, num_deepstack_layers={num_ds_layers}, dtype={dtype}"
         )
 
-        return MMPagedKVCacheManager(
+        return MMPagedKVCache(
             layer_id_map,
-            max_seq_len=args.infer.max_seq_len,
             num_hot_req=num_hot_req,
-            shape_per_token_dict=shape_per_token_dict,
-            dtype_dict=dtype_dict,
-            block_size=block_size,
+            max_seq_len=args.infer.max_seq_len,
             num_blocks=num_mm_blocks,
+            block_size=block_size,
             device=device,
+            dtype_dict=dtype_dict,
+            shape_per_token_dict=shape_per_token_dict,
             quant_type="None",
         )
 
@@ -858,10 +909,6 @@ class Backend:
             "recurrent_state": (n_local_v_heads, head_dim, head_dim),
         }
 
-    # @staticmethod
-    # def _init_linear_attn_cache(args):
-    #     return Qwen3LinearAttnCacheManager()
-
     @staticmethod
     def _get_attention_backend_type(args):
         if args.infer.attn_type == "auto":
@@ -895,12 +942,12 @@ class Backend:
         # Yes, use `type` instead of `isinstance` here, because `AttnBackend`s inherit each other
         if attn_backend_type is FlashInferBackend:
             max_num_blocks = 0
-            for mgr in Backend.cache_managers.values():
-                if not isinstance(mgr, PagedKVCacheManager):
+            for cache in Backend.cache_dict.values():
+                if not isinstance(cache, PagedKVCache):
                     raise NotImplementedError(
                         "`infer.attn_type=flash_infer` is only compatible with `infer.cache_type=paged`"
                     )
-                max_num_blocks = max(max_num_blocks, mgr.get_max_num_blocks())
+                max_num_blocks = max(max_num_blocks, cache.max_num_blocks)
             return attn_backend_type(max_num_blocks)
         else:
             return attn_backend_type()
@@ -1075,7 +1122,7 @@ class Backend:
 
         return Backend.build_model(
             args.models,
-            Backend.cache_managers,
+            Backend.cache_dict,
             max_position_embeddings=args.infer.max_seq_len
             + (args.infer.mtp_size if args.infer.mtp_size > 1 else 0),
             pipeline_parallel_size=args.infer.pp_size,
@@ -1442,39 +1489,32 @@ class Backend:
             )
 
             Backend.cache_type = args.infer.cache_type
-            Backend.cache_managers = {
-                "main": Backend._init_cache_manager(
-                    args,
-                    attn_backend_type,
-                    layer_filter_fn=filter_full_attn_layer,
-                    num_blocks=num_full_attn_blocks,
-                ),
-                "linear": Backend._init_linear_attn_cache_manager(
-                    args,
-                    layer_filter_fn=filter_linear_attn_layer,
-                    num_blocks=num_linear_attn_blocks,
-                ),
-            }
-            mm_cache = Backend._init_multimodal_cache_manager(
-                args, Backend.cache_managers["main"]
+            Backend._init_cache_and_manager(
+                args,
+                attn_backend_type,
+                layer_filter_fn=filter_full_attn_layer,
+                num_blocks=num_full_attn_blocks,
             )
+            Backend._init_linear_attn_cache(
+                args,
+                layer_filter_fn=filter_linear_attn_layer,
+                num_blocks=num_linear_attn_blocks,
+            )
+            mm_cache = Backend._init_multimodal_cache(args, Backend.cache_dict["main"])
             if mm_cache is not None:
-                Backend.cache_managers["multimodal"] = mm_cache
+                Backend.cache_dict["multimodal"] = mm_cache
         elif getattr(args.models, "type", "") == "deepseek-v3" and getattr(
             args.models, "index_head_dim", None
         ):
             Backend.cache_type = args.infer.cache_type
-            Backend.cache_managers = {
-                "main": Backend._init_cache_manager(args, attn_backend_type),
-                "indexer": Backend._init_indexer_cache_manager(args),
-            }
+            Backend._init_cache_and_manager(args, attn_backend_type)
+            Backend._init_indexer_cache(args)
         else:
-            main_cache = Backend._init_cache_manager(args, attn_backend_type)
-            Backend.cache_managers = {"main": main_cache}
+            Backend._init_cache_and_manager(args, attn_backend_type)
             Backend.cache_type = args.infer.cache_type
-            mm_cache = Backend._init_multimodal_cache_manager(args, main_cache)
+            mm_cache = Backend._init_multimodal_cache(args, Backend.cache_dict["main"])
             if mm_cache is not None:
-                Backend.cache_managers["multimodal"] = mm_cache
+                Backend.cache_dict["multimodal"] = mm_cache
 
         # Initialize attention backend
         attn_backend = Backend._init_attention_backend(attn_backend_type)
@@ -1500,6 +1540,7 @@ class Backend:
     @staticmethod
     def stop():
         setattr(Backend, "model", None)
+        Backend.cache_dict.clear()
         setattr(Backend, "cache_managers", None)
         gc.collect()
         torch.cuda.empty_cache()

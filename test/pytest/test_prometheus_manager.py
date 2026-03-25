@@ -14,7 +14,7 @@ from chitu.metrics import PrometheusServerManager
 
 
 class Backend:
-    cache_manager = None
+    cache_dict = None
 
 
 class MockGroup:
@@ -22,6 +22,7 @@ class MockGroup:
         self.rank_in_group = rank_in_group
         self.global_rank = global_rank
         self.device = "cpu"
+        self.is_first_rank = True
 
     def is_first_rank(self):
         return True
@@ -34,9 +35,6 @@ class Monkcachemanager:
     def __init__(self, num_blocks, num_free_blocks):
         self.num_blocks = num_blocks
         self.num_free_blocks = num_free_blocks
-
-    def get_num_blocks(self):
-        return self.num_blocks
 
     @property
     def num_used_blocks(self):
@@ -56,7 +54,7 @@ def run_PrometheusServerManager(rank, dp_id, result_queue, stop_event):
         mock_cache_manager = Monkcachemanager(num_blocks=100, num_free_blocks=50)
     else:
         mock_cache_manager = Monkcachemanager(num_blocks=100, num_free_blocks=20)
-    Backend.cache_managers = {"main": mock_cache_manager}
+    Backend.cache_dict = {"main": mock_cache_manager}
 
     while not stop_event.is_set():
         if dp_id == 0:

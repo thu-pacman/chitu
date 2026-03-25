@@ -6,7 +6,7 @@ import torch
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import KVCacheManagerBase
+from chitu.kv_cache import KVCacheBase
 from chitu.models.model import RMSNorm, TransformerBlock
 from chitu.models.model_hf_llama import (
     AttentionHFLlama,
@@ -22,18 +22,18 @@ class TransformerBlockHFGlmZ1(TransformerBlock):
         self,
         layer_id: int,
         args,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         attn_backend,
         op_impl,
         rotary_type="interleaved-half",
         mlp_type=FeedForwardHFLlama,
         checkpoint_prefix="",
     ):
-        super().__init__(layer_id, args, cache_managers, attn_backend, op_impl)
+        super().__init__(layer_id, args, cache_dict, attn_backend, op_impl)
         self.self_attn = AttentionHFLlama(
             args,
             layer_id,
-            cache_managers["main"],
+            cache_dict["main"],
             attn_backend,
             rotary_type=rotary_type,
             op_impl=op_impl,
@@ -66,7 +66,7 @@ class TransformerHFGlmZ1(TransformerHFLlama):
     def __init__(
         self,
         params,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -79,7 +79,7 @@ class TransformerHFGlmZ1(TransformerHFLlama):
     ):
         super().__init__(
             params,
-            cache_managers,
+            cache_dict,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             tensor_parallel_size=tensor_parallel_size,

@@ -7,13 +7,14 @@ import re
 
 
 class Backend:
-    cache_manager = None
+    cache_dict = None
 
 
 class MockGroup:
     def __init__(self, global_rank, rank_in_group):
         self.rank_in_group = rank_in_group
         self.global_rank = global_rank
+        self.is_first_rank = True
 
     def is_first_rank(self):
         return True
@@ -27,9 +28,6 @@ class Monkcachemanager:
         self.num_blocks = num_blocks
         self.num_free_blocks = num_free_blocks
         self.device = "cpu"
-
-    def get_num_blocks(self):
-        return self.num_blocks
 
     @property
     def num_used_blocks(self):
@@ -124,7 +122,7 @@ def test_PrometheusMetricsCollector(rank, dp_id, monkeypatch):
 
     # test update_kvcache_usage
     mock_cache_manager = Monkcachemanager(num_blocks=100, num_free_blocks=50)
-    Backend.cache_managers = {"main": mock_cache_manager}
+    Backend.cache_dict = {"main": mock_cache_manager}
     PrometheusMetricsCollector.update_kvcache_usage()
     samples = collector.kv_cache_usage.collect()[0].samples
     target_sample = None

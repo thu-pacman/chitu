@@ -21,7 +21,7 @@ import zmq.asyncio
 import msgpack
 
 from chitu.backend import Backend, BackendState
-from chitu.cache_manager import PagedKVCacheManager
+from chitu.kv_cache import PagedKVCache, PagedKVCacheManager
 from chitu.device_type import is_nvidia, has_accelerator
 from chitu.executor import Executor
 from chitu.global_vars import (
@@ -96,13 +96,13 @@ def init_cache_static():
         torch.cuda.reset_peak_memory_stats()
 
 
-def get_additional_block_num(cache_manager, memory_utilization=0.98):
+def get_additional_block_num(kv_cache: PagedKVCache, memory_utilization: float = 0.98):
     """
     Calculate additional block numbers based on available memory.
     Works on both CPU and GPU machines.
 
     Args:
-        cache_manager: The cache manager object.
+        kv_cache: The PagedKVcache object.
         memory_utilization: Fraction of GPU/CPU memory to use (default: 0.98).
 
     Returns:
@@ -113,12 +113,12 @@ def get_additional_block_num(cache_manager, memory_utilization=0.98):
         return functools.reduce(operator.mul, t, 1)
 
     block_mem = 0
-    for key in cache_manager.shape_per_token_dict:
+    for key in kv_cache.shape_per_token_dict:
         block_mem += (
-            cache_manager.dtype_dict[key].itemsize
-            * cache_manager.block_size
-            * tuple_product(cache_manager.shape_per_token_dict[key])
-            * cache_manager.num_layers
+            kv_cache.dtype_dict[key].itemsize
+            * kv_cache.block_size
+            * tuple_product(kv_cache.shape_per_token_dict[key])
+            * kv_cache.num_layers
         )
 
     if get_global_args().infer.op_impl == "cpu":
@@ -157,11 +157,11 @@ def get_additional_block_num(cache_manager, memory_utilization=0.98):
 def _auto_set_num_blocks_after_warmup(args):
     # FIXME: other managers than "main"
     if args.infer.cache_type == "paged" and args.infer.num_blocks == -1:
-        assert isinstance(Backend.cache_managers["main"], PagedKVCacheManager)
+        assert isinstance(Backend.cache_dict["main"], PagedKVCache)
         additional_blocks = get_additional_block_num(
-            Backend.cache_managers["main"], args.infer.memory_utilization
+            Backend.cache_dict["main"], args.infer.memory_utilization
         )
-        new_num_block = Backend.cache_managers["main"].num_blocks + additional_blocks
+        new_num_block = Backend.cache_dict["main"].num_blocks + additional_blocks
 
         if torch.distributed.get_world_size() > 1:
             new_num_block_tensor = torch.tensor(new_num_block).cuda()
@@ -172,10 +172,10 @@ def _auto_set_num_blocks_after_warmup(args):
 
         get_global_args().infer.num_blocks = new_num_block
         if new_num_block > 0:
-            Backend.cache_managers["main"].realloc(new_num_block)
+            Backend.cache_dict["main"].realloc(new_num_block)
 
         # Realloc indexer cache manager if present
-        indexer_cm = Backend.cache_managers.get("indexer")
+        indexer_cm = Backend.cache_dict.get("indexer")
         if (
             indexer_cm is not None
             and isinstance(indexer_cm, PagedKVCacheManager)
@@ -200,6 +200,7 @@ def _auto_set_num_blocks_after_warmup(args):
 
         if torch.distributed.get_rank() == 0:
             for scheduler in Backend.schedulers:
+                scheduler.cache_manager_dict["main"].realloc(new_num_block)
                 scheduler.reset_kvcache_block_threshold()
     else:
         logger.info(
@@ -375,10 +376,18 @@ def _warmup_backend_direct(
             dtype=torch.get_default_dtype(),
         )
     seq_len_list = [1] * local_max_bs
+
+    all_tasks = PackedTasksBase(local_max_bs, task_ids=req_ids)
+    all_tasks.new_cache_ids_list = [
+        [random.randrange(Backend.cache_dict["main"].num_blocks)]
+        for _ in range(local_max_bs)
+    ]
+    all_tasks.tokens = [[1] for _ in range(local_max_bs)]
+
     # Prefill
-    for mgr in Backend.cache_managers.values():
-        mgr.prepare_cache_prefill(req_ids, seq_len_list)
-    PrometheusMetricsCollector.update_kvcache_usage()
+    for cache in Backend.cache_dict.values():
+        cache.prepare_cache_prefill(all_tasks)
+    PrometheusMetricsCollector.update_GPU_usage()
 
     # decode_only 下，Decode 不需要跑 prefill；但需要把 cache 的 seq_len
     # 和 block_table 初始化到可 decode 的状态（否则后续 prepare_cache_decode 会找不到 req_id）
@@ -391,8 +400,7 @@ def _warmup_backend_direct(
     )
     if not skip_model_prefill:
         Backend.model.prefill(tokens, output_token_offsets)
-    for mgr in Backend.cache_managers.values():
-        mgr.finalize_cache_all_prefill()
+
     # Decode steps
     if not skip_model_decode:
         for i in tqdm(
@@ -400,9 +408,14 @@ def _warmup_backend_direct(
         ):
             curr_bs = local_max_bs - i * bs_descend
             curr_req_ids = req_ids[:curr_bs]
-            for mgr in Backend.cache_managers.values():
-                mgr.prepare_cache_decode(curr_req_ids)
-            PrometheusMetricsCollector.update_kvcache_usage()
+
+            cur_tasks = PackedTasksBase(curr_bs, task_ids=curr_req_ids)
+            cur_tasks.new_cache_ids_list = []
+            cur_tasks.tokens = [[1] for _ in range(curr_bs)]
+
+            for cache in Backend.cache_dict.values():
+                cache.prepare_cache_decode(cur_tasks)
+            PrometheusMetricsCollector.update_GPU_usage()
 
             # direct warmup 绕过了 executor，因此必须在这里显式设置
             if (
@@ -427,13 +440,11 @@ def _warmup_backend_direct(
                     dtype=torch.get_default_dtype(),
                 )
             _ = Backend.model.decode(step_token, curr_bs)
-            for mgr in Backend.cache_managers.values():
-                mgr.finalize_cache_single_decode(curr_req_ids)
+
     # Clean KV for this request
-    for req_id in req_ids:
-        for mgr in Backend.cache_managers.values():
-            mgr.finalize_cache_all_decode(req_id)
-    PrometheusMetricsCollector.update_kvcache_usage()
+    for cache in Backend.cache_dict.values():
+        cache.finalize_cache_all_decode(all_tasks)
+    PrometheusMetricsCollector.update_GPU_usage()
     logger.info("Local backend warmup (direct) completed")
 
 
@@ -441,25 +452,6 @@ def warmup_engine(args):
     # Router 进程不做 warmup
     if args.dp_config.router.is_router:
         return
-
-    # NOTE: 如果在 DP+PP 运行时遇到问题，请开启下面的跳过与兜底策略（目前暂未发现问题）
-    # if args.infer.pp_size > 1 and args.infer.dp_size > 1 and args.infer.cache_type == "paged":
-    #     assert isinstance(Backend.cache_manager, PagedKVCacheManager)
-    #     logger.warning("Warming-up is not supported when PP is enabled. Skipping")
-    #     if args.infer.num_blocks == -1:
-    #         logger.warning(
-    #             "Auto infer.num_blocks (infer.num_blocks=-1) relies on warming-up to calculate the number of "
-    #             "blocks, but this is not supported when PP is enabled. A safe but inefficient value is used."
-    #         )
-    #         new_num_block = ceil_div(
-    #             args.infer.max_reqs, args.infer.dp_size
-    #         ) * ceil_div(args.infer.max_seq_len, Backend.cache_manager.block_size)
-    #         get_global_args().infer.num_blocks = new_num_block
-    #         Backend.cache_manager.realloc(new_num_block)
-    #         if torch.distributed.get_rank() == 0:
-    #             for scheduler in Backend.schedulers:
-    #                 scheduler.reset_kvcache_block_threshold()
-    #     return
 
     # PD分离→direct，非PD→taskpool
     pd_enabled = args.dp_config.router.pd_disaggregation.enabled

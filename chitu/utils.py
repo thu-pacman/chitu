@@ -262,12 +262,9 @@ class DataSaver:
                 decode_step = 0
                 if args and hasattr(args[0], "cache"):
                     cache_manager = args[0].cache
-                    if (
-                        hasattr(cache_manager, "curr_req_ids")
-                        and cache_manager.curr_req_ids
-                    ):
-                        req_id = cache_manager.curr_req_ids[0]
-                        decode_step = cache_manager.req_id_to_seq_len.get(req_id, 0)
+                    if hasattr(cache_manager, "curr_tids") and cache_manager.curr_tids:
+                        req_id = cache_manager.curr_tids[0]
+                        decode_step = cache_manager.tid_to_cached_len.get(req_id, 0)
 
                 # 获取模型名称和数据类型
                 try:
