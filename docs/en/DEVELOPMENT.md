@@ -568,7 +568,7 @@ torchrun --nnodes 1 \
     infer.use_cuda_graph=True
 ```
 
-### OpenAI-compatible API (Chat Completions)
+### API Parameters
 
 Test the service via OpenAI-compatible API:
 
@@ -588,32 +588,6 @@ curl localhost:21002/v1/chat/completions \
     ]
   }'
 ```
-
-Supported optional JSON arguments are:
-
-| Name                    | Type             | Description                                                  |
-| ----------------------- | ---------------- | ------------------------------------------------------------ |
-| `max_completion_tokens` | `int`            | Stop responding once the number of output tokens reaches this limit. |
-| `temperature`           | `float`          | A sampling argument affecting the diversity of the output.   |
-| `top_p`                 | `float`          | A sampling argument affecting the diversity of the output.   |
-| `top_k`                 | `int`            | A sampling argument affecting the diversity of the output.   |
-| `frequency_penalty`     | `float`          | A sampling argument affecting the diversity of the output.   |
-| `logprobs`              | `bool`           | If true, also return `log(softmax(logits))` before sampling, useful for precision analysis. |
-| `top_logprobs`          | `int`            | The number of `logprobs` returned.                           |
-| `stream`                | `bool`           | If true, make the HTTP response streaming, which can be used with `requests.post(stream=True)` in Python. |
-| `stop_with_eos`         | `bool`           | If false, keep generating outputs until the number of output tokens reaches `max_completion_tokens`, even if the answer has already ended, useful for a stable speed test. |
-| `chat_template_kwargs`  | `dict[str, Any]` | Additional argument for the chat template. The only currently supported argument is: `{"enable_thinking": false}` for disabling thinking mode for GLM-4.5 models. |
-| `tools`                 | `list[dict]`     | Tool definitions of tool calling. Please refer https://developers.openai.com/api/docs/guides/function-calling/ |
-| `tool_choice`           | `str or dict`    | Required number of output tool calling. Supports none, auto, required, {"type": "function", "name": "$TOOL_NAME"} |
-
-Additional HTTP headers:
-
-| Name            | Description                                                  |
-| --------------- | ------------------------------------------------------------ |
-| `Authorization` | Format: `Bearer <api_key>`. If `<api_key>` is in `serve.api_keys`, the request will be prioritized. See the `serve.api_keys` configuration when starting the service for details. |
-
-### Anthropic-compatible API (Messages)
-
 Test the service via Anthropic-compatible API:
 
 ```bash
@@ -631,6 +605,8 @@ curl localhost:21002/v1/messages \
     ]
   }'
 ```
+
+For OpenAI-compatible and Anthropic-compatible API parameters, see [API Parameters](./API_PARAMETERS.md).
 
 ### Grafana Dashboard
 

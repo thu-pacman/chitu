@@ -60,11 +60,7 @@ CASES_OPEN_AI = [
     {**case, "stream": stream, "api": "openai"}
     for case, stream in itertools.product(CASES_BASE, [False, True])
 ]
-CASES_ANTHROPIC = [
-    {**case, "stream": False, "api": "anthropic"}
-    for case in CASES_BASE
-    if case["parallel"] == True
-]
+CASES_ANTHROPIC = [{**case, "stream": False, "api": "anthropic"} for case in CASES_BASE]
 CASES = [
     {**case, "idx": idx} for idx, case in enumerate(CASES_OPEN_AI + CASES_ANTHROPIC)
 ]
@@ -234,14 +230,21 @@ async def _round_openai(
     return content, rcontent, tool_calls
 
 
-def _tool_choice_to_anthropic(choice):
+def _tool_choice_to_anthropic(choice, parallel_tool_calls):
+    disable_parallel = not parallel_tool_calls
     if isinstance(choice, dict) and choice.get("function", {}).get("name"):
-        return {"type": "tool", "name": choice["function"]["name"]}
-    if choice == "required":
-        return {"type": "any"}
-    if choice in {"none", "auto"}:
-        return {"type": choice}
-    return {"type": "auto"}
+        return {
+            "type": "tool",
+            "name": choice["function"]["name"],
+            "disable_parallel_tool_use": disable_parallel,
+        }
+    if choice == "none":
+        return {"type": "none"}
+
+    return {
+        "type": "any" if choice == "required" else "auto",
+        "disable_parallel_tool_use": disable_parallel,
+    }
 
 
 async def _round_anthropic(
@@ -250,7 +253,9 @@ async def _round_anthropic(
 ):
     if kwargs["stream"]:
         raise RuntimeError("anthropic stream not supported in this test")
-    kwargs["tool_choice"] = _tool_choice_to_anthropic(kwargs["tool_choice"])
+    kwargs["tool_choice"] = _tool_choice_to_anthropic(
+        kwargs["tool_choice"], kwargs["parallel_tool_calls"]
+    )
     kwargs.pop("parallel_tool_calls")
     kwargs["thinking"] = {"type": "enabled" if ENABLE_THINKING else "disabled"}
     msg = await anthropic_client.messages.create(messages=messages, **kwargs)

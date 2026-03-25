@@ -414,9 +414,15 @@ def batched_routed_activation_indexed_to_per_expert_dense_ref(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs, hidden_dim = activation.shape
     _, topk = token_to_expert_indices.shape
+
+    # NOTE: The second dimension of activation_per_expert must be no less than 64 to
+    # work around a DeepGEMM bug: https://github.com/deepseek-ai/DeepGEMM/issues/268
     activation_per_expert = torch.empty(
-        (num_experts, bs, hidden_dim), dtype=activation.dtype, device=activation.device
+        (num_experts, max(bs, 64), hidden_dim),
+        dtype=activation.dtype,
+        device=activation.device,
     )
+
     token_pos_in_expert = torch.empty(
         (bs, topk), dtype=torch.int32, device=activation.device
     )
@@ -441,14 +447,20 @@ def batched_routed_activation_indexed_to_per_expert_dense_blockfp8_ref(
     bs, hidden_dim = activation.shape
     _, scale_dim = activation_scale.shape
     _, topk = token_to_expert_indices.shape
+
+    # NOTE: The second dimension of activation_per_expert must be no less than 64 to
+    # work around a DeepGEMM bug: https://github.com/deepseek-ai/DeepGEMM/issues/268
     activation_per_expert = torch.empty(
-        (num_experts, bs, hidden_dim), dtype=activation.dtype, device=activation.device
+        (num_experts, max(bs, 64), hidden_dim),
+        dtype=activation.dtype,
+        device=activation.device,
     )
     activation_scale_per_expert = torch.empty(
-        (num_experts, bs, scale_dim),
+        (num_experts, max(bs, 64), scale_dim),
         dtype=activation_scale.dtype,
         device=activation.device,
     )
+
     token_pos_in_expert = torch.empty(
         (bs, topk), dtype=torch.int32, device=activation.device
     )

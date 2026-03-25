@@ -71,9 +71,18 @@ fi
 
 TORCHRUN_ARGS=("${@:4}")
 
-MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-MASTER_PORT=$((($SLURM_JOB_ID % 10000)+52000))
-RDVZ_PORT=$((($SLURM_JOB_ID % 10000) +53000))
+if [[ $NODES -gt 1 ]]; then
+    MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+    MASTER_PORT=$((($SLURM_JOB_ID % 10000)+52000))
+    RDVZ_PORT=$((($SLURM_JOB_ID % 10000) +53000))
+else
+    # If running on single node, let torchrun pick a random port. It's still
+    # sufficiently unique across jobs on this node. See
+    # https://docs.pytorch.org/docs/stable/elastic/run.html#stacked-single-node-multi-worker
+    MASTER_ADDR="127.0.0.1"
+    MASTER_PORT=0
+    RDVZ_PORT=0
+fi
 RDVZ_ID=chitu
 
 echo prepare torchrun on node $(hostname) 

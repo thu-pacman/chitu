@@ -394,6 +394,7 @@ def _(
             activation=hidden_states_fp8,
             activation_scale=scale,
             token_to_expert_indices=hidden_states.token_to_expert_indices,
+            expected_n_tokens_per_expert=hidden_states.expected_n_tokens_per_expert,
             expert_ids_are_local=hidden_states.expert_ids_are_local,
         )
         hidden_states = (

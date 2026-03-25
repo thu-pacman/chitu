@@ -1770,7 +1770,12 @@ class ParallelMoeBlock(nn.Module):
             rerouted_indices = indices
 
         routed_x = IndexedBatchedRoutedActivation(
-            x, rerouted_indices, expert_ids_are_local=self.moe_impl.ep_size == 1
+            x,
+            rerouted_indices,
+            expected_n_tokens_per_expert=ceil_div(
+                weights.numel(), self.experts.global_n_experts
+            ),
+            expert_ids_are_local=self.moe_impl.ep_size == 1,
         )
 
         shared_y = None

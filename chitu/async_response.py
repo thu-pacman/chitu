@@ -5,11 +5,12 @@
 import asyncio
 import threading
 import functools
+import time
 from datetime import datetime
 from logging import getLogger
-from typing import Optional
+from typing import Optional, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from chitu.backend import Backend
 from chitu.serve.event_loop import get_server_event_loop
@@ -21,6 +22,8 @@ logger = getLogger(__name__)
 
 class ChatCompletionResponse(BaseModel):
     id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
     choices: list
     usage: Optional[dict] = None
 
@@ -130,8 +133,11 @@ class AsyncResponse:
 
         async def stream_response():
             try:
+                has_tool_calls = False
                 async for data, is_reasoning, (top_logprobs, top_tokens) in stream:
                     if data:
+                        if isinstance(data, ChoiceDelta) and data.tool_calls:
+                            has_tool_calls = True
                         if isinstance(data, ChoiceDelta):
                             delta = data
                         elif is_reasoning:
@@ -174,13 +180,16 @@ class AsyncResponse:
                         data = chunk.model_dump_json(exclude_none=True)
                         yield f"data: {data}\n\n"
 
+                finish_reason = self.req.finish_reason
+                if has_tool_calls and finish_reason != "length":
+                    finish_reason = "tool_calls"
                 chunk = ChatCompletionResponse(
                     id=self.id,
                     choices=[
                         {
                             "index": 0,
                             "delta": {"content": ""},
-                            "finish_reason": self.req.finish_reason,
+                            "finish_reason": finish_reason,
                         }
                     ],
                 )
