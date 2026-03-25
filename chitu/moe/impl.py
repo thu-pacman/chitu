@@ -274,6 +274,7 @@ class MoEImplEP(MoEImplBase):
             self.prefill_experts_impl = "fused_experts_for_ep"
         elif self.prefill_token_dispatcher_impl == "allgather":
             self.prefill_token_dispatcher = MoEAllGatherTokenDispatcher(
+                self.n_global_experts_slots,
                 tp_group=self.tp_group,
                 dp_group=self.dp_group,
                 etp_group=self.etp_group,
@@ -316,6 +317,7 @@ class MoEImplEP(MoEImplBase):
             self.decode_experts_impl = "fused_experts_for_ep"
         elif self.decode_token_dispatcher_impl == "allgather":
             self.decode_token_dispatcher = MoEAllGatherTokenDispatcher(
+                self.n_global_experts_slots,
                 tp_group=self.tp_group,
                 dp_group=self.dp_group,
                 etp_group=self.etp_group,

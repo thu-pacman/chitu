@@ -7,11 +7,12 @@ from typing import Optional
 from typing_extensions import override
 import functools
 
-from chitu.device_type import is_blackwell
-from chitu.global_vars import get_global_args
 import torch
 
-from chitu.utils import parse_dtype, try_import_opt_dep
+from chitu.device_type import is_blackwell
+from chitu.global_vars import get_global_args
+from chitu.utils import parse_dtype, ceil_div
+from chitu.import_utils import try_import_opt_dep
 from chitu.distributed.comm_group import CommGroup
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.moe.batched_routed_activation import (
@@ -48,7 +49,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         super().__init__(
             tp_group=tp_group, dp_group=dp_group, etp_group=etp_group, ep_group=ep_group
         )
-        self.num_experts = num_experts
+        self.num_global_experts = num_experts
         self._buffer = None
         self.hidden = hidden
         self.max_bs_per_dp_rank = max_bs_per_dp_rank
@@ -57,7 +58,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         # Set the number of SMs to use
         # NOTES: this is a static variable, so it will be shared by all the instances of the class
         deep_ep.Buffer.set_num_sms(24)
-        assert self.num_experts % self.ep_group.group_size == 0
+        assert self.num_global_experts % self.ep_group.group_size == 0
 
     @override
     def prepare(self, num_tokens):
@@ -69,7 +70,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             self.max_bs_per_dp_rank,
             2,
             self.mode,
-            self.num_experts,
+            self.num_global_experts,
         )
         DeepEPBuffer.set_dispatch_mode_as_normal()
 
@@ -126,6 +127,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                     activation=hidden_states_fp8,
                     token_to_expert_indices=x.token_to_expert_indices,
                     activation_scale=scale,
+                    expected_n_tokens_per_expert=x.expected_n_tokens_per_expert,
                     expert_ids_are_local=True,
                 ),
                 topk_weights,
@@ -159,6 +161,12 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                     device=recv_topk_idx.device,
                 ),
                 pad_block_size=128,
+                # NOTE on expected_n_tokens_per_expert: Recompute using info local to EP,
+                # because DP ranks may be inbalance, and cannot reflect EP reality.
+                expected_n_tokens_per_expert=ceil_div(
+                    sum(num_recv_tokens_per_expert_list),
+                    len(num_recv_tokens_per_expert_list),
+                ),
                 expert_ids_are_local=True,
             ),
             recv_topk_weights,
@@ -203,6 +211,12 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                     device=recv_topk_idx.device,
                 ),
                 pad_block_size=128,
+                # NOTE on expected_n_tokens_per_expert: Recompute using info local to EP,
+                # because DP ranks may be inbalance, and cannot reflect EP reality.
+                expected_n_tokens_per_expert=ceil_div(
+                    sum(num_recv_tokens_per_expert_list),
+                    len(num_recv_tokens_per_expert_list),
+                ),
                 expert_ids_are_local=True,
             ),
             recv_topk_weights,
@@ -253,7 +267,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             previous_event,
         ) = self._buffer.get_dispatch_layout(
             topk_idx,
-            self.num_experts,
+            self.num_global_experts,
             previous_event=previous_event,
             async_finish=async_finish,
             allocate_on_comm_stream=previous_event is not None,

@@ -15,6 +15,7 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
 )
 from chitu.global_vars import get_global_args
+from chitu.utils import ceil_div
 
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
@@ -25,6 +26,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
     def __init__(
         self,
+        num_experts: int,
         *,
         tp_group: CommGroup,
         dp_group: CommGroup,
@@ -34,6 +36,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         super().__init__(
             tp_group=tp_group, dp_group=dp_group, etp_group=etp_group, ep_group=ep_group
         )
+
+        self.num_global_experts = num_experts
+
         # set in prepare
         # its a cpu list now
         self.cum_num_tokens = None
@@ -97,7 +102,14 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             )
             return (
                 IndexedBatchedRoutedActivation(
-                    global_activation, global_topk_ids, expert_ids_are_local=False
+                    global_activation,
+                    global_topk_ids,
+                    # NOTE on expected_n_tokens_per_expert: Recompute using global info,
+                    # because DP ranks may be inbalance, and cannot reflect global reality.
+                    expected_n_tokens_per_expert=ceil_div(
+                        global_topk_ids.numel(), self.num_global_experts
+                    ),
+                    expert_ids_are_local=False,
                 ),
                 global_topk_weights,
             )

@@ -97,6 +97,10 @@ class IndexedBatchedRoutedActivation(BatchedRoutedActivation):
 
     `token_to_expert_indices` may contain out-of-range expert IDs for invalid experts.
 
+    `expected_n_tokens_per_expert` is an estimated number, and may be inaccurate.
+    This number is desinged to be set when we have access to global expert count,
+    preferably after the MoE gate.
+
     NOTE: Currently there are only indices pointing from tokens to experts. If you
     further need (reversed) indices pointing from experts to tokens, added here as a
     lazy (cached) property.
@@ -104,6 +108,12 @@ class IndexedBatchedRoutedActivation(BatchedRoutedActivation):
 
     activation: torch.Tensor  # [batch_size, hidden_size]
     token_to_expert_indices: torch.Tensor  # [batch_size, topk]
+
+    # This marks all following properties must be set via kwargs, so that they won't
+    # appear before the first argument of the sub-classes.
+    _: dataclasses.KW_ONLY
+
+    expected_n_tokens_per_expert: int  # = bs * topk / num_global_experts
 
     @override
     def get_chunks_no_larger_than(
@@ -117,8 +127,14 @@ class IndexedBatchedRoutedActivation(BatchedRoutedActivation):
         if self.token_to_expert_indices.numel() == 0:
             return [(self, topk_weights)]
 
-        # Esitimate the real chunk size
-        avg_experts_per_token = max(
+        # Esitimate the real chunk size.
+        #
+        # NOTE: Relation among the following values may be a bit confusing:
+        # - expected_n_tokens_per_expert = bs * topk / num_global_experts
+        # - expected_n_tokens_per_local_expert = expected_n_tokens_per_expert = bs * topk / num_global_experts
+        # - expected_n_experts_per_token = bs * topk / bs = topk
+        # - expected_n_local_experts_per_token = topk * local_experts_per_global_experts
+        expected_n_local_experts_per_token = max(
             int(
                 self.token_to_expert_indices.shape[1]
                 * (experts_end_idx - experts_start_idx)
@@ -126,12 +142,17 @@ class IndexedBatchedRoutedActivation(BatchedRoutedActivation):
             ),
             1,
         )
-        max_n_tokens = max(int(max_n_tokens_x_topk / avg_experts_per_token), 1)
+        max_n_tokens = max(
+            int(max_n_tokens_x_topk / expected_n_local_experts_per_token), 1
+        )
 
         return [
             (
                 IndexedBatchedRoutedActivation(
-                    a, t, expert_ids_are_local=self.expert_ids_are_local
+                    a,
+                    t,
+                    expected_n_tokens_per_expert=self.expected_n_tokens_per_expert,
+                    expert_ids_are_local=self.expert_ids_are_local,
                 ),
                 w,
             )
@@ -189,7 +210,11 @@ class IndexedBatchedRoutedActivationBlockfp8(IndexedBatchedRoutedActivation):
         return [
             (
                 IndexedBatchedRoutedActivationBlockfp8(
-                    a, t, s, expert_ids_are_local=self.expert_ids_are_local
+                    a,
+                    t,
+                    s,
+                    expected_n_tokens_per_expert=self.expected_n_tokens_per_expert,
+                    expert_ids_are_local=self.expert_ids_are_local,
                 ),
                 w,
             )
@@ -243,6 +268,7 @@ class IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
             n_tokens_per_expert_padded=n_tokens_per_expert_padded,
             pad_block_size=pad_block_size,
             expert_ids_are_local=old.expert_ids_are_local,
+            expected_n_tokens_per_expert=old.expected_n_tokens_per_expert,
         )
 
 
@@ -292,6 +318,7 @@ class IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
             n_tokens_per_expert_padded=n_tokens_per_expert_padded,
             pad_block_size=pad_block_size,
             expert_ids_are_local=old.expert_ids_are_local,
+            expected_n_tokens_per_expert=old.expected_n_tokens_per_expert,
         )
 
 
@@ -486,6 +513,7 @@ class PerExpertDenseBatchedRoutedActivationMinimal(BatchedRoutedActivation):
         torch.Tensor
     )  # [n_experts, max_n_tokens_per_expert, hidden_size]
     n_tokens_per_expert: torch.Tensor  # [n_experts]
+    expected_n_tokens_per_expert: int  # = bs * topk / num_global_experts
 
 
 @dataclass
@@ -516,6 +544,7 @@ class PerExpertDenseBatchedRoutedActivation(
         )
         return cls(
             activation_per_expert=activation_per_expert,
+            expected_n_tokens_per_expert=old.expected_n_tokens_per_expert,
             n_tokens_per_expert=n_tokens_per_expert,
             token_to_expert_indices=old.token_to_expert_indices,
             token_pos_in_expert=token_pos_in_expert,
@@ -559,6 +588,7 @@ class PerExpertDenseBatchedRoutedActivationBlockfp8(
         return cls(
             activation_per_expert=activation_per_expert,
             activation_scale_per_expert=activation_scale_per_expert,
+            expected_n_tokens_per_expert=old.expected_n_tokens_per_expert,
             n_tokens_per_expert=n_tokens_per_expert,
             token_to_expert_indices=old.token_to_expert_indices,
             token_pos_in_expert=token_pos_in_expert,

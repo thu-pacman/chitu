@@ -254,7 +254,7 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted(
 @pytest.mark.parametrize("num_experts", [32])
 @pytest.mark.parametrize("num_tokens", [0, 1, 64])
 @pytest.mark.parametrize("hidden_size", [7168])
-@pytest.mark.parametrize("topk", [8])
+@pytest.mark.parametrize("topk", [8, 10])  # 10 is for Qwen3-Next
 @pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
 @pytest.mark.parametrize("impl", ["ref", "triton"])
 def test_batched_routed_activation_indexed_to_per_expert_dense(
@@ -305,7 +305,7 @@ def test_batched_routed_activation_indexed_to_per_expert_dense(
 @pytest.mark.parametrize("num_experts", [32])
 @pytest.mark.parametrize("num_tokens", [0, 1, 64])
 @pytest.mark.parametrize("hidden_size", [7168])
-@pytest.mark.parametrize("topk", [8])
+@pytest.mark.parametrize("topk", [8, 10])  # 10 is for Qwen3-Next
 @pytest.mark.parametrize("quant_block_size", [128])
 @pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
 @pytest.mark.parametrize("impl", ["ref", "triton"])

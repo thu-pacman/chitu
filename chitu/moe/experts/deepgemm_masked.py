@@ -108,6 +108,7 @@ def _(
                 activation=activation_fp8,
                 activation_scale=activation_scale,
                 token_to_expert_indices=hidden_states.token_to_expert_indices,
+                expected_n_tokens_per_expert=hidden_states.expected_n_tokens_per_expert,
                 expert_ids_are_local=True,
             ),
             w1=w1,
@@ -264,6 +265,9 @@ def _(
     assert E == E2
     assert K == K2
 
+    # M<64 triggers a DeepGEMM bug: https://github.com/deepseek-ai/DeepGEMM/issues/268
+    assert M >= 64
+
     if M == 0:
         intermediate_cache3 = torch.empty(
             (E, M, K), device=device, dtype=torch.bfloat16
@@ -272,18 +276,20 @@ def _(
     elif not use_fp8_w8a8:
         assert has_deep_gemm, "BF16 masked path requires deep_gemm backend"
 
-        hidden_states_bf16 = hidden_states.activation_per_expert
+        # For bf16, DeepGEMM requires reduction dimensions % 64 == 0. Search `DG_HOST_ASSERT(k % 64 == 0)`
+        # in `third_party/DeepGEMM/csrc/jit_kernels/impls/sm90_bf16_gemm.hpp` for details.
+        assert K % 64 == 0
+        assert N % 64 == 0
 
         intermediate_cache1 = torch.empty(
             (E, M, N), device=device, dtype=torch.bfloat16
         )
-
         deep_gemm.m_grouped_bf16_gemm_nt_masked(
-            hidden_states_bf16,
+            hidden_states.activation_per_expert,
             w1,
             intermediate_cache1,
             hidden_states.n_tokens_per_expert,
-            M,
+            expected_m=hidden_states.expected_n_tokens_per_expert,
         )
 
         intermediate_cache2 = eval_lazy(
@@ -301,7 +307,7 @@ def _(
             w2,
             intermediate_cache3,
             hidden_states.n_tokens_per_expert,
-            M,
+            expected_m=hidden_states.expected_n_tokens_per_expert,
         )
         del intermediate_cache2
     else:
@@ -340,7 +346,7 @@ def _(
             (w1, w1_scale),
             intermediate_cache1,
             hidden_states.n_tokens_per_expert,
-            M,
+            expected_m=hidden_states.expected_n_tokens_per_expert,
         )
         del hidden_states_fp8
         del a1_scale
@@ -361,7 +367,7 @@ def _(
             (w2, w2_scale),
             intermediate_cache3,
             hidden_states.n_tokens_per_expert,
-            M,
+            expected_m=hidden_states.expected_n_tokens_per_expert,
         )
 
     if isinstance(

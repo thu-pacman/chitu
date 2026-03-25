@@ -557,6 +557,7 @@ def batched_routed_activation_indexed_to_per_expert_dense_triton_kernel(
     token_pos_in_expert_stride0,
     bs,
     TOPK: tl.constexpr,
+    TOPK_PADDED: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     HIDDEN_DIM: tl.constexpr,
     HIDDEN_DIM_PADDED: tl.constexpr,
@@ -590,14 +591,17 @@ def batched_routed_activation_indexed_to_per_expert_dense_triton_kernel(
             )
             if expert_id >= 0 and expert_id < NUM_EXPERTS:
                 # Count the number of selected expert before this one
-                expert_indices_before_accum = tl.zeros((BS_BLOCK, TOPK), dtype=tl.int32)
+                expert_indices_before_accum = tl.zeros(
+                    (BS_BLOCK, TOPK_PADDED), dtype=tl.int32
+                )
                 for i in tl.range(0, token_id, BS_BLOCK):
                     expert_indices_before = tl.load(
                         token_to_expert_indices_ptr
                         + (i + tl.arange(0, BS_BLOCK))[:, None]
                         * token_to_expert_indices_stride0
-                        + tl.arange(0, TOPK)[None, :],
-                        mask=(i + tl.arange(0, BS_BLOCK) < token_id)[:, None],
+                        + tl.arange(0, TOPK_PADDED)[None, :],
+                        mask=(i + tl.arange(0, BS_BLOCK) < token_id)[:, None]
+                        & (tl.arange(0, TOPK_PADDED) < TOPK)[None, :],
                         other=-1,
                     )
                     expert_indices_before_accum += expert_indices_before == expert_id
@@ -631,14 +635,15 @@ def batched_routed_activation_indexed_to_per_expert_dense_triton_kernel(
         expert_id = pid - bs
 
         # Count the number of selected expert
-        expert_indices_accum = tl.zeros((BS_BLOCK, TOPK), dtype=tl.int32)
+        expert_indices_accum = tl.zeros((BS_BLOCK, TOPK_PADDED), dtype=tl.int32)
         for i in tl.range(0, bs, BS_BLOCK):
             expert_indices = tl.load(
                 token_to_expert_indices_ptr
                 + (i + tl.arange(0, BS_BLOCK))[:, None]
                 * token_to_expert_indices_stride0
-                + tl.arange(0, TOPK)[None, :],
-                mask=(i + tl.arange(0, BS_BLOCK) < bs)[:, None],
+                + tl.arange(0, TOPK_PADDED)[None, :],
+                mask=(i + tl.arange(0, BS_BLOCK) < bs)[:, None]
+                & (tl.arange(0, TOPK_PADDED) < TOPK)[None, :],
                 other=-1,
             )
             expert_indices_accum += expert_indices == expert_id
@@ -687,6 +692,7 @@ def batched_routed_activation_indexed_to_per_expert_dense_triton(
         token_pos_in_expert_stride0=token_pos_in_expert.stride(0),
         bs=bs,
         TOPK=topk,
+        TOPK_PADDED=triton.next_power_of_2(topk),
         NUM_EXPERTS=num_experts,
         HIDDEN_DIM=hidden_dim,
         HIDDEN_DIM_PADDED=triton.next_power_of_2(hidden_dim),
@@ -745,6 +751,7 @@ def batched_routed_activation_indexed_to_per_expert_dense_blockfp8_triton(
         token_pos_in_expert_stride0=token_pos_in_expert.stride(0),
         bs=bs,
         TOPK=topk,
+        TOPK_PADDED=triton.next_power_of_2(topk),
         NUM_EXPERTS=num_experts,
         HIDDEN_DIM=hidden_dim,
         HIDDEN_DIM_PADDED=triton.next_power_of_2(hidden_dim),
