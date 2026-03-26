@@ -35,22 +35,13 @@ def deepgemm_masked_fused_expert(
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
-    use_fp8_w8a8: bool = False,
-    use_fp4_w4a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
     global_num_experts: int = -1,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
-    w1_scale_2: Optional[torch.Tensor] = None,
-    w2_scale_2: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     round_scale_to_pow2: bool = False,
-    soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
     raise NotImplementedError(
@@ -64,22 +55,11 @@ def _(
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
-    use_fp8_w8a8: bool = False,
-    use_fp4_w4a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
     global_num_experts: int = -1,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
-    w1_scale_2: Optional[torch.Tensor] = None,
-    w2_scale_2: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     round_scale_to_pow2: bool = False,
-    soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> PerExpertDenseBatchedExpertResult:
     # first compute the n_tokens_per_expert (Tensor) based on token_to_expert_indices
@@ -94,7 +74,7 @@ def _(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )
 
-    if use_fp8_w8a8:
+    if w1.dtype == torch.float8_e4m3fn:
         assert not isinstance(hidden_states, IndexedBatchedRoutedActivationBlockfp8)
         assert len(block_shape) == 2
         assert block_shape[0] == block_shape[1]
@@ -114,22 +94,11 @@ def _(
             w1=w1,
             w2=w2,
             activation=activation,
-            use_fp8_w8a8=use_fp8_w8a8,
-            use_fp4_w4a8=use_fp4_w4a8,
-            use_int8_w8a16=use_int8_w8a16,
-            use_int4_w4a16=use_int4_w4a16,
             global_num_experts=global_num_experts,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
-            w1_scale_2=w1_scale_2,
-            w2_scale_2=w2_scale_2,
-            w1_zp=w1_zp,
-            w2_zp=w2_zp,
-            a1_scale=a1_scale,
-            a2_scale=a2_scale,
             block_shape=block_shape,
             round_scale_to_pow2=round_scale_to_pow2,
-            soft_fp8=soft_fp8,
             experts_start_idx=experts_start_idx,
         )
 
@@ -140,22 +109,9 @@ def _(
         w1=w1,
         w2=w2,
         activation=activation,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_fp4_w4a8=use_fp4_w4a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        global_num_experts=global_num_experts,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
-        w1_scale_2=w1_scale_2,
-        w2_scale_2=w2_scale_2,
-        w1_zp=w1_zp,
-        w2_zp=w2_zp,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
         block_shape=block_shape,
-        round_scale_to_pow2=round_scale_to_pow2,
-        soft_fp8=soft_fp8,
         experts_start_idx=experts_start_idx,
     )
 
@@ -166,22 +122,13 @@ def _(
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
-    use_fp8_w8a8: bool = False,
-    use_fp4_w4a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
     global_num_experts: int = -1,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
-    w1_scale_2: Optional[torch.Tensor] = None,
-    w2_scale_2: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     round_scale_to_pow2: bool = False,
-    soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> PerExpertDenseBatchedExpertResult:
     # first compute the n_tokens_per_expert (Tensor) based on token_to_expert_indices
@@ -203,22 +150,13 @@ def _(
         w1=w1,
         w2=w2,
         activation=activation,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_fp4_w4a8=use_fp4_w4a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
         global_num_experts=global_num_experts,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
-        w1_scale_2=w1_scale_2,
-        w2_scale_2=w2_scale_2,
-        w1_zp=w1_zp,
-        w2_zp=w2_zp,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
         block_shape=block_shape,
         round_scale_to_pow2=round_scale_to_pow2,
-        soft_fp8=soft_fp8,
         experts_start_idx=experts_start_idx,
     )
 
@@ -229,31 +167,14 @@ def _(
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
-    use_fp8_w8a8: bool = False,
-    use_fp4_w4a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    global_num_experts: int = -1,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
-    w1_scale_2: Optional[torch.Tensor] = None,
-    w2_scale_2: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     round_scale_to_pow2: bool = False,
-    soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> PerExpertDenseBatchedExpertResultMinimal:
     # dtype check
     assert activation == "silu"
-    assert not soft_fp8
-    assert w1_zp is None
-    assert w2_zp is None
-    assert not use_int8_w8a16
-    assert not use_int4_w4a16
 
     hidden_states = hidden_states.as_local_expert_ids(
         experts_start_idx, experts_start_idx + w1.shape[0]
@@ -272,8 +193,7 @@ def _(
         intermediate_cache3 = torch.empty(
             (E, M, K), device=device, dtype=torch.bfloat16
         )
-
-    elif not use_fp8_w8a8:
+    elif w1.dtype != torch.float8_e4m3fn:
         assert has_deep_gemm, "BF16 masked path requires deep_gemm backend"
 
         # For bf16, DeepGEMM requires reduction dimensions % 64 == 0. Search `DG_HOST_ASSERT(k % 64 == 0)`
@@ -325,7 +245,6 @@ def _(
                 f"deep_gemm only supports bfloat16 activation output, but got {torch.get_default_dtype()}"
             )
 
-        assert use_fp8_w8a8
         if isinstance(
             hidden_states, PerExpertDenseBatchedRoutedActivationBlockfp8Minimal
         ):
