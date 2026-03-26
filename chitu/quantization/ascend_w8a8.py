@@ -2,7 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
 from typing_extensions import override
+import functools
 import torch
 
 from chitu.utils import try_import_and_setup_torch_npu
@@ -16,14 +18,23 @@ from chitu.native_layout import (
     SqueezeLastSingleton,
 )
 from chitu.moe.batched_expert_result import BatchedExpertResult
-from chitu.moe.batched_routed_activation import BatchedRoutedActivation
+from chitu.moe.batched_routed_activation import (
+    BatchedRoutedActivation,
+    IndexedBatchedRoutedActivation,
+    ConcatPermutedBatchedRoutedActivationMinimal,
+)
 from chitu.moe.experts import (
-    fused_experts_no_sum_wrapper,
-    fused_experts_and_sum_wrapper,
+    make_op_dispatcher,
 )
 from chitu.lazy import eval_lazy
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+
+if has_torch_npu:
+    from chitu.moe.experts import (
+        fused_experts_no_sum_npu,
+        fused_experts_npu_for_ep,
+    )
 
 
 @QuantizationRegistry.register_linear("ascend_w8a8")
@@ -231,6 +242,106 @@ class AscendW8A8DynamicLinear(
         return output
 
 
+def _finalize_fused_experts_sum_output(
+    output, hidden_states, topk_weights: torch.Tensor, inplace: bool
+):
+    if hasattr(output, "weighted_sum"):
+        out = hidden_states.activation if inplace else None
+        return output.weighted_sum(topk_weights, out=out)
+    return output
+
+
+@make_op_dispatcher
+def fused_experts_no_sum_ascend_w8a8_indexed(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    impl: str = "auto",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    global_num_experts: int = -1,
+    experts_start_idx: int = 0,
+    use_int8_w8a8: bool = False,
+): ...
+
+
+@fused_experts_no_sum_ascend_w8a8_indexed.register_auto
+def _auto_fused_experts_no_sum_ascend_w8a8_indexed():
+    if has_torch_npu:
+        return "torch_npu"
+    raise NotImplementedError
+
+
+@fused_experts_no_sum_ascend_w8a8_indexed.register("torch_npu")
+def _run_indexed_torch_npu_impl(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    impl: str = "torch_npu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    global_num_experts: int = -1,
+    experts_start_idx: int = 0,
+    use_int8_w8a8: bool = False,
+):
+    return fused_experts_no_sum_npu(
+        hidden_states,
+        w1=w1,
+        w1_scale=w1_scale,
+        w2=w2,
+        w2_scale=w2_scale,
+        global_num_experts=global_num_experts,
+        experts_start_idx=experts_start_idx,
+        use_int8_w8a8=use_int8_w8a8,
+    )
+
+
+@make_op_dispatcher
+def fused_experts_no_sum_ascend_w8a8_concat_permuted(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    impl: str = "auto",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    experts_start_idx: int = 0,
+    use_int8_w8a8: bool = False,
+): ...
+
+
+@fused_experts_no_sum_ascend_w8a8_concat_permuted.register_auto
+def _auto_fused_experts_no_sum_ascend_w8a8_concat_permuted():
+    if has_torch_npu:
+        return "torch_npu"
+    raise NotImplementedError
+
+
+@fused_experts_no_sum_ascend_w8a8_concat_permuted.register("torch_npu")
+def _run_concat_permuted_torch_npu_impl(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    impl: str = "torch_npu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    experts_start_idx: int = 0,
+    use_int8_w8a8: bool = False,
+):
+    return fused_experts_npu_for_ep(
+        hidden_states,
+        w1=w1,
+        w1_scale=w1_scale,
+        w2=w2,
+        w2_scale=w2_scale,
+        experts_start_idx=experts_start_idx,
+        use_int8_w8a8=use_int8_w8a8,
+    )
+
+
 @QuantizationRegistry.register_moe_experts("ascend_w8a8_dynamic", merge_gate_up=True)
 class AscendW8A8DynamicMoeExperts(
     enable_native_layout_weight("gate_up_proj_weight", NpuFractalZnTensor),
@@ -299,15 +410,22 @@ class AscendW8A8DynamicMoeExperts(
         )
 
     @override
+    @functools.singledispatchmethod
     def forward_no_sum(
-        self, routed_x: BatchedRoutedActivation, impl: str = "npu"
+        self, routed_x: BatchedRoutedActivation, impl: str = "torch_npu"
     ) -> BatchedExpertResult:
-        return fused_experts_no_sum_wrapper(
+        return super().forward_no_sum(routed_x, impl=impl)
+
+    @forward_no_sum.register
+    def _(
+        self, routed_x: IndexedBatchedRoutedActivation, impl: str = "torch_npu"
+    ) -> BatchedExpertResult:
+        return fused_experts_no_sum_ascend_w8a8_indexed(
             routed_x,
             w1=self.get_native_layout_gate_up_proj_weight(),
-            w1_scale=self.gate_up_proj_weight_scale,  # fp32
+            w1_scale=self.gate_up_proj_weight_scale,
             w2=self.get_native_layout_down_proj_weight(),
-            w2_scale=self.down_proj_weight_scale,  # bf16
+            w2_scale=self.down_proj_weight_scale,
             use_int8_w8a8=True,
             impl=impl,
             global_num_experts=self.global_n_experts,
@@ -315,22 +433,179 @@ class AscendW8A8DynamicMoeExperts(
         )
 
     @override
+    @functools.singledispatchmethod
     def forward(
         self,
         routed_x: BatchedRoutedActivation,
         weights: torch.Tensor,
         inplace: bool = False,
-        impl: str = "npu",
+        impl: str = "torch_npu",
     ) -> torch.Tensor:
-        return fused_experts_and_sum_wrapper(
+        return super().forward(routed_x, weights, inplace=inplace, impl=impl)
+
+    @forward.register
+    def _(
+        self,
+        routed_x: IndexedBatchedRoutedActivation,
+        weights: torch.Tensor,
+        inplace: bool = False,
+        impl: str = "torch_npu",
+    ) -> torch.Tensor:
+        return fused_experts_sum_ascend_w8a8_indexed(
             routed_x,
             w1=self.get_native_layout_gate_up_proj_weight(),
-            w1_scale=self.gate_up_proj_weight_scale,  # fp32
+            w1_scale=self.gate_up_proj_weight_scale,
             w2=self.get_native_layout_down_proj_weight(),
-            w2_scale=self.down_proj_weight_scale,  # bf16
+            w2_scale=self.down_proj_weight_scale,
             topk_weights=weights,
             use_int8_w8a8=True,
             impl=impl,
             global_num_experts=self.global_n_experts,
             experts_start_idx=self.experts_start_idx,
         )
+
+    @forward_no_sum.register
+    def _(
+        self,
+        routed_x: ConcatPermutedBatchedRoutedActivationMinimal,
+        impl: str = "torch_npu",
+    ) -> BatchedExpertResult:
+        return fused_experts_no_sum_ascend_w8a8_concat_permuted(
+            routed_x,
+            w1=self.get_native_layout_gate_up_proj_weight(),
+            w1_scale=self.gate_up_proj_weight_scale,
+            w2=self.get_native_layout_down_proj_weight(),
+            w2_scale=self.down_proj_weight_scale,
+            use_int8_w8a8=True,
+            impl=impl,
+            global_num_experts=self.global_n_experts,
+            experts_start_idx=self.experts_start_idx,
+        )
+
+    @forward.register
+    def _(
+        self,
+        routed_x: ConcatPermutedBatchedRoutedActivationMinimal,
+        weights: torch.Tensor,
+        inplace: bool = False,
+        impl: str = "torch_npu",
+    ) -> torch.Tensor:
+        return fused_experts_sum_ascend_w8a8_concat_permuted(
+            routed_x,
+            w1=self.get_native_layout_gate_up_proj_weight(),
+            w1_scale=self.gate_up_proj_weight_scale,
+            w2=self.get_native_layout_down_proj_weight(),
+            w2_scale=self.down_proj_weight_scale,
+            topk_weights=weights,
+            use_int8_w8a8=True,
+            impl=impl,
+            global_num_experts=self.global_n_experts,
+            experts_start_idx=self.experts_start_idx,
+        )
+
+
+@make_op_dispatcher
+def fused_experts_sum_ascend_w8a8_indexed(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights: torch.Tensor,
+    *,
+    inplace: bool = False,
+    impl: str = "auto",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    global_num_experts: int = -1,
+    experts_start_idx: int = 0,
+    use_int8_w8a8: bool = False,
+): ...
+
+
+@fused_experts_sum_ascend_w8a8_indexed.register_auto
+def _auto_fused_experts_sum_ascend_w8a8_indexed():
+    if has_torch_npu:
+        return "torch_npu"
+    raise NotImplementedError
+
+
+@fused_experts_sum_ascend_w8a8_indexed.register("torch_npu")
+def _run_sum_indexed_torch_npu(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights: torch.Tensor,
+    *,
+    inplace: bool = False,
+    impl: str = "torch_npu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    global_num_experts: int = -1,
+    experts_start_idx: int = 0,
+    use_int8_w8a8: bool = False,
+):
+    output = fused_experts_no_sum_ascend_w8a8_indexed(
+        hidden_states,
+        w1,
+        w2,
+        impl=impl,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        global_num_experts=global_num_experts,
+        experts_start_idx=experts_start_idx,
+        use_int8_w8a8=use_int8_w8a8,
+    )
+    return _finalize_fused_experts_sum_output(
+        output, hidden_states, topk_weights=topk_weights, inplace=inplace
+    )
+
+
+@make_op_dispatcher
+def fused_experts_sum_ascend_w8a8_concat_permuted(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights: torch.Tensor,
+    *,
+    inplace: bool = False,
+    impl: str = "auto",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    experts_start_idx: int = 0,
+    use_int8_w8a8: bool = False,
+): ...
+
+
+@fused_experts_sum_ascend_w8a8_concat_permuted.register_auto
+def _auto_fused_experts_sum_ascend_w8a8_concat_permuted():
+    if has_torch_npu:
+        return "torch_npu"
+    raise NotImplementedError
+
+
+@fused_experts_sum_ascend_w8a8_concat_permuted.register("torch_npu")
+def _run_sum_concat_torch_npu(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights: torch.Tensor,
+    *,
+    inplace: bool = False,
+    impl: str = "torch_npu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    experts_start_idx: int = 0,
+    use_int8_w8a8: bool = False,
+):
+    output = fused_experts_no_sum_ascend_w8a8_concat_permuted(
+        hidden_states,
+        w1,
+        w2,
+        impl=impl,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        experts_start_idx=experts_start_idx,
+        use_int8_w8a8=use_int8_w8a8,
+    )
+    return _finalize_fused_experts_sum_output(
+        output, hidden_states, topk_weights=topk_weights, inplace=inplace
+    )

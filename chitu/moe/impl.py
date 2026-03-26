@@ -262,7 +262,6 @@ class MoEImplEP(MoEImplBase):
                 etp_group=self.etp_group,
                 ep_group=self.ep_group,
             )
-            self.prefill_experts_impl = "ep_group_gemm_contiguous"
         elif self.prefill_token_dispatcher_impl == "npu_all_to_all":
             self.prefill_token_dispatcher = MoENpuAllToAllTokenDispatcher(
                 self.n_global_experts_slots,
@@ -271,7 +270,6 @@ class MoEImplEP(MoEImplBase):
                 etp_group=self.etp_group,
                 ep_group=self.ep_group,
             )
-            self.prefill_experts_impl = "fused_experts_for_ep"
         elif self.prefill_token_dispatcher_impl == "allgather":
             self.prefill_token_dispatcher = MoEAllGatherTokenDispatcher(
                 self.n_global_experts_slots,
@@ -296,7 +294,6 @@ class MoEImplEP(MoEImplBase):
                 ep_group=self.ep_group,
                 moe_layer_id_list=self.moe_layer_id_list,
             )
-            self.decode_experts_impl = "ep_group_gemm_masked"
         elif self.decode_token_dispatcher_impl == "npu_all_to_all":
             self.decode_token_dispatcher = MoENpuAllToAllTokenDispatcher(
                 self.n_global_experts_slots,
@@ -305,7 +302,6 @@ class MoEImplEP(MoEImplBase):
                 etp_group=self.etp_group,
                 ep_group=self.ep_group,
             )
-            self.decode_experts_impl = "fused_experts_for_ep"
         elif self.decode_token_dispatcher_impl == "npu_distribute":
             self.decode_token_dispatcher = MoENpuDistributeTokenDispatcher(
                 self.n_global_experts_slots,
@@ -314,7 +310,6 @@ class MoEImplEP(MoEImplBase):
                 etp_group=self.etp_group,
                 ep_group=self.ep_group,
             )
-            self.decode_experts_impl = "fused_experts_for_ep"
         elif self.decode_token_dispatcher_impl == "allgather":
             self.decode_token_dispatcher = MoEAllGatherTokenDispatcher(
                 self.n_global_experts_slots,
@@ -423,7 +418,7 @@ class MoEImplNoEP(MoEImplBase):
         # FIXME: Check whether deep_gemm support our round_scale_to_pow2 setting
         if has_deep_gemm:
             self.impl_map = {
-                TaskType.Prefill: "group_gemm_contiguous",
+                TaskType.Prefill: "auto",
                 TaskType.Decode: "auto",
             }
         else:

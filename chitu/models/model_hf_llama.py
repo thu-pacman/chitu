@@ -532,6 +532,9 @@ class TransformerHFLlama(Transformer):
             prefix_mappings.extend([("model.norm.", "norm.")])
             if not getattr(self.params, "tie_word_embeddings", False):
                 prefix_mappings.extend([("lm_head.", "lm_head.")])
+            else:
+                # Tied embeddings use embed_tokens as lm_head on the last PP stage.
+                prefix_mappings.extend([("model.embed_tokens.", "embed_tokens.")])
         return prefix_mappings
 
     @override

@@ -42,8 +42,7 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
 )
 from chitu.moe.experts import (
-    fused_experts_no_sum_wrapper,
-    fused_experts_and_sum_wrapper,
+    make_op_dispatcher,
 )
 
 hard_fp4_kernels, has_hard_fp4_kernels = try_import_opt_dep(
@@ -53,6 +52,8 @@ triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 if has_torch_npu:
     from chitu.npu_utils import fused_experts_no_sum_npu
+if has_triton:
+    from chitu.moe.experts import fused_experts_soft_fp4
 
 
 logger = getLogger(__name__)
@@ -338,6 +339,148 @@ class Blockfp4LinearPackNPUNative(
         if self.bias is not None:
             y += self.bias
         return y
+
+
+def _finalize_fused_experts_sum_output(
+    output, hidden_states, topk_weights: Optional[torch.Tensor], inplace: bool
+):
+    if hasattr(output, "weighted_sum"):
+        if (
+            inplace
+            and isinstance(hidden_states, IndexedBatchedRoutedActivation)
+            and hidden_states.activation.dtype == torch.get_default_dtype()
+        ):
+            out = hidden_states.activation
+        else:
+            out = None
+        return output.weighted_sum(topk_weights, out=out)
+    return output
+
+
+@make_op_dispatcher
+def fused_experts_no_sum_blockfp4_indexed(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    impl: str = "auto",
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_scale_2: Optional[torch.Tensor] = None,
+    w2_scale_2: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    round_scale_to_pow2: bool = False,
+    experts_start_idx: int = 0,
+): ...
+
+
+@fused_experts_no_sum_blockfp4_indexed.register_auto
+def _auto_fused_experts_no_sum_blockfp4_indexed():
+    if has_triton:
+        return "triton"
+    raise NotImplementedError
+
+
+@fused_experts_no_sum_blockfp4_indexed.register("triton")
+def _fused_experts_no_sum_blockfp4_indexed_triton(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    impl: str = "triton",
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_scale_2: Optional[torch.Tensor] = None,
+    w2_scale_2: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    round_scale_to_pow2: bool = False,
+    experts_start_idx: int = 0,
+):
+    return fused_experts_soft_fp4(
+        hidden_states,
+        w1=w1,
+        w2=w2,
+        activation=activation,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_scale2=w1_scale_2,
+        w2_scale2=w2_scale_2,
+        block_shape=block_shape,
+        soft_fp8=soft_fp8,
+        round_scale_to_pow2=round_scale_to_pow2,
+        experts_start_idx=experts_start_idx,
+    )
+
+
+@make_op_dispatcher
+def fused_experts_sum_blockfp4_indexed(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights: Optional[torch.Tensor],
+    *,
+    inplace: bool = False,
+    impl: str = "auto",
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_scale_2: Optional[torch.Tensor] = None,
+    w2_scale_2: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    round_scale_to_pow2: bool = False,
+    experts_start_idx: int = 0,
+): ...
+
+
+@fused_experts_sum_blockfp4_indexed.register_auto
+def _auto_fused_experts_sum_blockfp4_indexed():
+    if has_triton:
+        return "triton"
+    raise NotImplementedError
+
+
+@fused_experts_sum_blockfp4_indexed.register("triton")
+def _fused_experts_sum_blockfp4_indexed_triton(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights: Optional[torch.Tensor],
+    *,
+    inplace: bool = False,
+    impl: str = "triton",
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_scale_2: Optional[torch.Tensor] = None,
+    w2_scale_2: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    round_scale_to_pow2: bool = False,
+    experts_start_idx: int = 0,
+):
+    output = fused_experts_no_sum_blockfp4_indexed(
+        hidden_states,
+        w1,
+        w2,
+        impl=impl,
+        activation=activation,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        w1_scale_2=w1_scale_2,
+        w2_scale_2=w2_scale_2,
+        block_shape=block_shape,
+        soft_fp8=soft_fp8,
+        round_scale_to_pow2=round_scale_to_pow2,
+        experts_start_idx=experts_start_idx,
+    )
+    return _finalize_fused_experts_sum_output(
+        output, hidden_states, topk_weights=topk_weights, inplace=inplace
+    )
 
 
 class Blockfp4MoeExpertsUnmergedBase(QuantizedMoeExpertsUnmerged):
@@ -791,21 +934,20 @@ class Blockfp4MoeExpertsPackKStride64(
     def forward_no_sum(
         self, routed_x: BatchedRoutedActivation, impl: str = "auto"
     ) -> BatchedExpertResult:
+        assert isinstance(routed_x, IndexedBatchedRoutedActivation)
         raise_to_16 = (
             parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize != 1
         )
-        return fused_experts_no_sum_wrapper(
+        return fused_experts_no_sum_blockfp4_indexed(
             routed_x,
             w1=self.get_native_layout_gate_up_proj_weight().layout_tensor,
             w2=self.get_native_layout_down_proj_weight().layout_tensor,
-            use_fp4_w4a8=True,
             w1_scale=self.gate_up_proj_weight_scale,
             w2_scale=self.down_proj_weight_scale,
             w1_scale_2=self.gate_up_proj_weight_scale_2,
             w2_scale_2=self.down_proj_weight_scale_2,
             block_shape=[128, 128],
             soft_fp8=raise_to_16,
-            global_num_experts=self.global_n_experts,
             experts_start_idx=self.experts_start_idx,
             impl=impl,
         )
@@ -818,23 +960,22 @@ class Blockfp4MoeExpertsPackKStride64(
         inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
+        assert isinstance(routed_x, IndexedBatchedRoutedActivation)
         raise_to_16 = (
             parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize != 1
         )
-        return fused_experts_and_sum_wrapper(
+        return fused_experts_sum_blockfp4_indexed(
             routed_x,
             w1=self.get_native_layout_gate_up_proj_weight().layout_tensor,
             w2=self.get_native_layout_down_proj_weight().layout_tensor,
             topk_weights=weights,
             inplace=inplace,
-            use_fp4_w4a8=True,
             w1_scale=self.gate_up_proj_weight_scale,
             w2_scale=self.down_proj_weight_scale,
             w1_scale_2=self.gate_up_proj_weight_scale_2,
             w2_scale_2=self.down_proj_weight_scale_2,
             block_shape=[128, 128],
             soft_fp8=raise_to_16,
-            global_num_experts=self.global_n_experts,
             experts_start_idx=self.experts_start_idx,
             impl=impl,
         )
