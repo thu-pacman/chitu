@@ -74,7 +74,7 @@ class MoELoadPlannerSwap(BaseMoELoadPlanner):
         if self._ep_rank == 0 and self.record_ratios:
             import json, os
 
-            file_path = os.path.join("/home/liurq/logs/stats", "layer_ratios_dlb.json")
+            file_path = os.path.join("./", "layer_ratios_dlb.json")
             saved_layer_ratios = [
                 {"layer": i, "ratio": self.layer_ratios[i]}
                 for i, ratio in enumerate(self.layer_ratios)
@@ -224,7 +224,6 @@ class MoELoadPlannerSwap(BaseMoELoadPlanner):
                 torch.stack(self._mapping[layer_id], dim=0).to(self._stats_device)
             )
         self._init_inverse_mapping()
-        logger.info(f"MoELoadPlanner mapping: initialized successfully ")
 
     def _plan_layer(self, layer_id: int, total: int) -> List[AdjustmentAction]:
         """Plan rebalancing actions for a layer using exchange strategy."""
@@ -388,7 +387,6 @@ class MoELoadPlannerReplace(BaseMoELoadPlanner):
                 torch.stack(self._mapping[layer_id], dim=0).to(self._stats_device)
             )
         self._init_inverse_mapping()
-        logger.info(f"MoELoadPlanner mapping: initialized successfully ")
 
     def generate_actions_and_order(self) -> None:
         """If reduce finished, run planner and launch async migration.
@@ -428,7 +426,7 @@ class MoELoadPlannerReplace(BaseMoELoadPlanner):
         if self._ep_rank == 0 and self.record_ratios:
             import json, os
 
-            file_path = os.path.join("/home/liurq/logs/stats", "layer_ratios_dlb.json")
+            file_path = os.path.join("./", "layer_ratios_dlb.json")
             saved_layer_ratios = [
                 {"layer": i, "ratio": self.layer_ratios[i]}
                 for i, ratio in enumerate(self.layer_ratios)

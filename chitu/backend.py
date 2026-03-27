@@ -72,7 +72,6 @@ from chitu.tokenizer import (
 )
 from chitu.utils import try_import_opt_dep
 from chitu.tool_call import get_tool_parser, patch_chat_template
-from chitu.constraint_decode import ConstraintDecodeManager
 from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div, get_global_args
 from chitu.moe import init_moe_impl
 from chitu.global_vars import set_slot_handle
@@ -148,7 +147,6 @@ class Backend:
             from chitu.moe.load_balancer import register_moe_weight_accessor
 
             register_moe_weight_accessor(accessor, get_ep_group())
-            logger.info("Backend: MoE weight accessor installed and registered")
         except Exception as e:
             logger.warning(f"Backend: failed to register MoE weight accessor: {e}")
 
@@ -163,7 +161,6 @@ class Backend:
             try:
                 # Lazy import to avoid circular deps at import time
                 from chitu.moe.load_balancer import ExpertParamAccessor
-                import torch
 
                 class _ModelExpertsAccessor(ExpertParamAccessor):  # type: ignore
 
@@ -225,9 +222,6 @@ class Backend:
 
                 accessor = _ModelExpertsAccessor()
                 Backend.set_moe_weight_accessor(accessor)
-                logger.info(
-                    "Backend: auto-built ModelExpertsAccessor and registered to planner"
-                )
             except Exception as e:
                 logger.warning(
                     f"Backend: failed to build/register ModelExpertsAccessor: {e}"
@@ -1454,9 +1448,6 @@ class Backend:
         Backend.tokenizer = Backend._init_tokenizer(args)
         Backend.processor = Backend._init_processor(args)
         Backend.formatter = Backend._init_formatter(args)
-        Backend.constraint_decode_manager = ConstraintDecodeManager(
-            Backend.tokenizer.model, args.models.vocab_size
-        )
 
         # Initialize tool parser
         tool_parser_config = getattr(args.models, "tool_parser", "MISSING")

@@ -2773,11 +2773,7 @@ class KVManager:
             # Allocate aux buffer only on the unique sender rank (last PP stage, tp_rank=0).
             # Aux stores first-token metadata (token id).
             aux_index = -1
-            should_send_aux = (
-                isinstance(first_tokens, torch.Tensor)
-                and bool(pp_group.is_last_rank)
-                and bool(tp_group.is_first_rank)
-            )
+            should_send_aux = isinstance(first_tokens, torch.Tensor)
             if should_send_aux:
                 logger.debug(f"Allocating metadata buffer for {room}")
                 aux_index = self.metadata_buffers.allocate(room, first_tokens[index])
