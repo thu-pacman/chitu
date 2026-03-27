@@ -20,11 +20,11 @@ import torch
 from chitu.task_type import TaskType
 from chitu.async_response import AsyncDataStream
 from chitu.backend import Backend
-from chitu.device_list import DeviceList, StaticDeviceListManager
+from chitu.device_list import DeviceList
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.tool_call import ToolChoice, ToolCallParams, adjust_message_for_tool_calls
 from chitu.reasoning import get_reasoning_params, update_chat_template_kwargs_reasoning
-from chitu.constraint_decode import ConstraintDecodeTask
+from chitu.sampling.utils import compile_grammar, deserialize_grammar
 from chitu.kv_cache import TokenBlock
 
 logger = getLogger(__name__)
@@ -201,9 +201,7 @@ class UserRequest:
                     parallel_tool_calls=parallel_tool_calls,
                 )
             )
-            self.grammar, self.grammar_str = (
-                Backend.constraint_decode_manager.compile_grammar(grammar)
-            )
+            self.grammar, self.grammar_str = compile_grammar(grammar)
 
         # response related
         self.output = ""
@@ -386,7 +384,7 @@ class MockFixedLengthedUserRequest(UserRequest):
         return [1] * self.input_len
 
 
-class Task(ConstraintDecodeTask):
+class Task:
     def __init__(
         self,
         task_id: str,
@@ -429,20 +427,7 @@ class Task(ConstraintDecodeTask):
             self.grammar = req.grammar
         else:
             self.grammar_str = grammar_str
-            # Only deserialize grammar if grammar_str is not empty
-            # This allows creating Task without Backend being fully initialized (e.g., in tests)
-            if grammar_str:
-                constraint_decode_manager = getattr(
-                    Backend, "constraint_decode_manager", None
-                )
-                if constraint_decode_manager is not None:
-                    self.grammar = constraint_decode_manager.deserialize_grammar(
-                        grammar_str
-                    )
-                else:
-                    self.grammar = None
-            else:
-                self.grammar = None
+            self.grammar = deserialize_grammar(grammar_str)
 
         self.prefill_chunk_size: Optional[int] = (
             None  # Dynamic in Task, but adds up to be no higher than a static bound in PackedTasks
@@ -456,19 +441,11 @@ class Task(ConstraintDecodeTask):
         self.hit_token_len: int = 0
 
         # Response
-        # Use getattr for safe access in test environments where infer config may be incomplete
-        infer_cfg = getattr(get_global_args(), "infer", None)
-        op_impl = getattr(infer_cfg, "op_impl", None) if infer_cfg is not None else None
-        if op_impl == "cpu":
-            self.response = DeviceList([], dtype=torch.long, device="cpu")
-        else:
-            self.response = DeviceList([], dtype=torch.long, device="cuda")
         self.num_new_tokens: int = 0
         self.next_token: int = -1  # Only effective when num_new_tokens > 0
         self.num_new_tokens_single_step: int = 1
         self.mtp_token_list: list[int] = []
         self.generated_result: Optional[torch.Tensor] = None
-        self.record_next_token: Union[int, torch.Tensor, None] = None
 
         # task status
         self.has_unsync_new_token: bool = False
@@ -619,19 +596,9 @@ class Task(ConstraintDecodeTask):
 
         Args:
             token: The generated token ID
-
-        TODO: Fix _test_standard_tokens not None with batch_size > 1
-        TODO: _test_standard_tokens does not support DP > 1
         """
         assert token is not None, "Token cannot be None"
         self.next_token = token
-
-        if self._test_standard_tokens and self.num_new_tokens < len(
-            self._test_standard_tokens
-        ):
-            self.record_next_token = token
-            self.next_token = self._test_standard_tokens[self.num_new_tokens]
-
         self.num_new_tokens += self.num_new_tokens_single_step
         self.has_unsync_new_token = True
 
@@ -646,16 +613,10 @@ class Task(ConstraintDecodeTask):
             return
         if not isinstance(self.next_token, int):
             self.next_token = int(self.next_token.cpu().item())
-        if self.next_token == -1 and self.record_next_token is None:
+        if self.next_token == -1:
             return
         has_update = self.task_type == TaskType.Decode or self.evicting
-        if self.record_next_token is not None:
-            if not isinstance(self.record_next_token, int):
-                self.record_next_token = int(self.record_next_token.cpu().item())
-            if has_update:
-                self.prefix_tokens.append(self.record_next_token)
-            self.record_next_token = None
-        elif has_update:
+        if has_update:
             if Backend.executor.mtp_size > 1:
                 self.prefix_tokens.extend(self.mtp_token_list)
             self.prefix_tokens.append(self.next_token)
@@ -903,8 +864,6 @@ class TaskPool:
                 cls.pool[task_id].req.finish()
             else:
                 cls.pool[task_id].req.will_finish = True
-        if PackedTasks.response_list_manager is not None:
-            PackedTasks.response_list_manager.remove_list(cls.pool[task_id].response)
         if cls.pool.pop(task_id) is None:
             raise ValueError(f"Task {task_id} not found in pool")
         cls.id_list.remove(task_id)
@@ -967,6 +926,10 @@ class PackedTasksBase:
     def req_ids(self):
         return self.task_ids
 
+    @functools.cached_property
+    def output_task_ids(self):
+        return [self.task_ids[i] for i in range(self.num_tasks) if self.has_outputs[i]]
+
     @classmethod
     def configure(cls, max_num_tasks: int):
         assert not PackedTasksBase.configured, "PackedTasksBase cannot be reconfigured"
@@ -975,8 +938,6 @@ class PackedTasksBase:
 
 
 class PackedTasks(PackedTasksBase):
-    response_list_manager = None
-
     def __init__(
         self,
         task_ids: list[str],
@@ -992,9 +953,6 @@ class PackedTasks(PackedTasksBase):
             task_ids = [task.task_id for task in tasks]
             self.tasks = tasks
         self.output_tasks = [task for task in self.tasks if task.has_output()]
-        self.should_apply_frequency_penalty = any(
-            task.sample_params.frequency_penalty > 0 for task in self.output_tasks
-        )
         self.return_logprobs = any(
             getattr(task.req, "logprobs", False) for task in self.output_tasks
         )
@@ -1070,63 +1028,6 @@ class PackedTasks(PackedTasksBase):
                 self.pixel_values.append(task.pixel_values)
             if task.grid_thw is not None:
                 self.grid_thw.append(task.grid_thw)
-
-        # sample related
-        self.is_all_greedy = all(
-            task.sample_params.top_k <= 1 for task in self.output_tasks
-        )
-        self.temperatures = torch.tensor(
-            [task.sample_params.temperature for task in self.output_tasks],
-            pin_memory=True,
-        ).to(device=self.rank, non_blocking=True)
-        self.top_ps = torch.tensor(
-            [task.sample_params.top_p for task in self.output_tasks], pin_memory=True
-        ).to(device=self.rank, non_blocking=True)
-        self.top_ks = torch.tensor(
-            [task.sample_params.top_k for task in self.output_tasks], pin_memory=True
-        ).to(device=self.rank, non_blocking=True)
-        self.frequency_penalties = torch.tensor(
-            [task.sample_params.frequency_penalty for task in self.output_tasks],
-            dtype=torch.float32,
-            pin_memory=True,
-        ).to(device=self.rank, non_blocking=True)
-
-        if self.should_apply_frequency_penalty:
-            if PackedTasks.response_list_manager is None:
-                # Use getattr for safe access in test environments where infer config may be incomplete
-                if getattr(args.infer, "op_impl", None) == "cpu":
-                    PackedTasks.response_list_manager = StaticDeviceListManager(
-                        max_num_rows=args.infer.max_reqs,
-                        max_num_cols=args.infer.max_seq_len,
-                        dtype=torch.long,
-                        device="cpu",
-                    )
-                else:
-                    PackedTasks.response_list_manager = StaticDeviceListManager(
-                        max_num_rows=args.infer.max_reqs,
-                        max_num_cols=args.infer.max_seq_len,
-                        dtype=torch.long,
-                        device="cuda",
-                    )
-
-            for task in self.output_tasks:
-                PackedTasks.response_list_manager.push_list(task.response)
-
-            self.response_len = torch.tensor(
-                [len(task.response) for task in self.output_tasks],
-                dtype=torch.int,
-                device=self.rank,
-            )
-            self.response_capacity = torch.tensor(
-                [len(task.response._data) for task in self.output_tasks],
-                dtype=torch.int,
-                device=self.rank,
-            )
-            self.response_ptr = torch.tensor(
-                [task.response._data.data_ptr() for task in self.output_tasks],
-                dtype=torch.long,
-                device=self.rank,
-            )
 
     def get_result_len(self) -> int:
         """

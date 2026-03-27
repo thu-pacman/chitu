@@ -5,10 +5,14 @@
 from typing import Optional
 
 import torch
+import xgrammar
 
-from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
-from chitu.device_list import DeviceList
-from chitu.device_type import has_accelerator
+from chitu.utils import (
+    try_import_platform_dep,
+    try_import_and_setup_torch_npu,
+    create_tensor,
+)
+from chitu.device_type import has_accelerator, is_muxi, is_ascend
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -58,61 +62,62 @@ def multinomial(
 @torch.no_grad()
 def apply_frequency_penalty(
     logits: torch.Tensor,
-    logits_index: DeviceList,
-    response_list: list[DeviceList],
-    response_len_list: DeviceList,
-    frequency_penalty: torch.Tensor,
+    indices: list[int],
+    blocks: list[torch.Tensor],
+    sizes: list[int],
+    penalties: list[float],
     impl="auto",
 ):
-    bs = len(logits_index)
+    bs = len(blocks)
     if bs == 0:
         return
-    assert (
-        len(response_list) == bs
-        and len(response_len_list) == bs
-        and frequency_penalty.shape[0] == bs
-    )
-    assert frequency_penalty.is_contiguous()
+    assert len(blocks) == len(indices) == len(sizes) == len(penalties) == bs
+
+    device = logits.device
     if impl == "auto":
-        # NOTE: This is a temporary solution based tests on h20.
-        if has_triton and bs > 8 and bs <= 16:
+        if device.type == "cpu":
+            impl = "torch"
+        elif has_triton and bs > 8 and bs <= 16:
+            # NOTE: This is a temporary solution based tests on h20.
             impl = "triton"
         elif bs < 16 or has_torch_npu:
             impl = "torch"
         else:
             impl = "cuda"
-    if impl == "triton":
-        apply_frequency_penalty_triton(
-            logits,
-            logits_index.to_tensor(),
-            response_list,
-            response_len_list.to_tensor(),
-            frequency_penalty,
-        )
-    elif impl == "torch":
-        for i, idx in enumerate(logits_index.to_tensor()):
+
+    if impl == "torch":
+        for block, idx, size, penalty in zip(blocks, indices, sizes, penalties):
             logits[idx].index_add_(
                 -1,
-                response_list[i].to_tensor(),
-                -frequency_penalty[idx]
-                * torch.ones(
-                    (response_len_list[i],),
-                    dtype=logits.dtype,
-                    device=logits.device,
-                ),
+                block[:size],
+                torch.ones(size, dtype=logits.dtype, device=device) * -penalty,
             )
+        return
+
+    indices_ = create_tensor(indices, device=device, dtype=torch.int64)
+    sizes_ = create_tensor(sizes, device=device, dtype=torch.int64)
+    penalties_ = create_tensor(penalties, device=device, dtype=torch.float32)
+
+    if impl == "triton":
+        stacked_blocks = torch.stack(blocks)
+        apply_frequency_penalty_triton(
+            logits,
+            indices_,
+            stacked_blocks,
+            sizes_,
+            penalties_,
+        )
     elif impl == "cuda":
-        assert logits.dtype == torch.float
-        responses = [response.to_tensor().data_ptr() for response in response_list]
-        response_ptr_list = torch.tensor(
-            responses, dtype=torch.int64, device=logits.device
+        assert logits.dtype == torch.float32
+        block_ptrs = create_tensor(
+            [block.data_ptr() for block in blocks], device=device, dtype=torch.int64
         )
         chitu_backend.cuda_frequency_penalty(
             logits,
-            logits_index.to_tensor(),
-            response_ptr_list,
-            frequency_penalty,
-            response_len_list.to_tensor(),
+            indices_,
+            block_ptrs,
+            penalties_,
+            sizes_,
             bs,
             logits.shape[-1],
             logits.stride(0),
@@ -123,45 +128,114 @@ def apply_frequency_penalty(
 
 
 @torch.no_grad()
-def response_append_cuda(
-    response_list,
-    tokens_list,
-    response_len,
-    task_num,
+def batch_append_tokens(
+    blocks: list[torch.Tensor],
+    indices: list[int],
+    tokens: list[int],
+    impl="auto",
 ):
-    assert response_list.dtype == torch.long, f"{response_list.dtype=}"
-    assert tokens_list.dtype == torch.long, f"{tokens_list.dtype=}"
-    assert response_len.dtype == torch.int, f"{response_len.dtype=}"
-    need_expand = torch.zeros(len(response_len), device=response_len.device).bool()
-    chitu_backend.cuda_response_append(
-        response_list, response_list, tokens_list, response_len, need_expand
-    )
+    device = blocks[0].device
 
-
-def response_append(tasks, tokens, impl="auto"):
     if impl == "auto":
-        if len(tasks.output_tasks) > 8 and has_chitu_backend:
+        if has_chitu_backend and device.type == "cuda" and len(blocks) > 8:
             impl = "cuda"
         else:
             impl = "torch"
 
-    need_expand = tasks.response_len == tasks.response_capacity
-    assert torch.all(
-        need_expand == False
-    ), f"Cannot append: DeviceList's length equals capacity."
     if impl == "torch":
-        tasks.response_list_manager.batch_append(
-            [task.response for task in tasks.output_tasks], tokens
-        )
+        for block, index, token in zip(blocks, indices, tokens):
+            block[index] = token
     elif impl == "cuda":
-        response_append_cuda(
-            tasks.response_ptr,
-            tokens,
-            tasks.response_len,
-            task_num=len(tasks.output_tasks),
+        block_ptrs = create_tensor(
+            [block.data_ptr() for block in blocks], device=device, dtype=torch.int64
         )
-        for task in tasks.output_tasks:
-            task.response._len += 1
-        tasks.response_len += 1
+        tokens = create_tensor(tokens, device=device, dtype=torch.int64)
+        indices = create_tensor(indices, device=device, dtype=torch.int32)
+        _need_expand = torch.zeros(len(blocks), device=device, dtype=torch.bool)
+        chitu_backend.cuda_response_append(
+            block_ptrs, block_ptrs, tokens, indices, _need_expand
+        )
     else:
-        raise NotImplementedError(f"{impl=}")
+        raise NotImplementedError
+
+
+def apply_bitmask_torch(
+    logits: torch.Tensor, bitmask: torch.Tensor, indices: list[int]
+):
+    _, H = logits.shape
+    _, M = bitmask.shape
+    B = len(indices)
+    bitmask = bitmask[indices].view(B, M, 1)
+    # shift left fallback to cpu on npu, thus we use pow
+    bits = torch.arange(32, device=logits.device, dtype=torch.int32)
+    bits = torch.pow(2, bits).view(1, 1, 32)
+    mask = bits & bitmask
+    mask = mask.view(B, M * 32)[:, :H]
+    logits[indices] = logits[indices].masked_fill_(mask == 0, float("-inf"))
+    return logits
+
+
+def apply_bitmask(logits: torch.Tensor, bitmask: torch.Tensor, indices: list[int]):
+    """
+    apply bitmask to logits
+
+    for idx in indices:
+        for token in range(vocab_size):
+            if bitmask[idx, token // 32] & (1 << (token % 32)) == 0:
+                logits[idx, token] = -inf
+    """
+    if is_ascend() or is_muxi():
+        return apply_bitmask_torch(logits, bitmask, indices)
+    return xgrammar.apply_token_bitmask_inplace(logits, bitmask, indices=indices)
+
+
+def top_k_top_p_min_p_sampling_from_logits(
+    logits: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    # TODO: Support min_ps
+):
+    """A top-k, top-p and min-p sampling implementation."""
+
+    if is_ascend() and has_torch_npu:
+        assert logits.dim() == 2
+        assert (
+            top_ps.shape[0] == logits.shape[0]
+        ), f"top_ps.shape[0]={top_ps.shape[0]} didn't match logits.shape[0]={logits.shape[0]}"
+        assert (
+            top_ks.shape[0] == logits.shape[0]
+        ), f"top_ks.shape[0]={top_ks.shape[0]} didn't match logits.shape[0]={logits.shape[0]}"
+        top_ps = top_ps.to(torch.float)
+        top_ks = top_ks.to(torch.int32)
+        probs = torch.softmax(logits, dim=-1)
+        probs = torch_npu.npu_top_k_top_p(probs, top_ps, top_ks)
+        sampled_index = multinomial(probs, num_samples=1, impl="sync-free").view(-1)
+        return sampled_index
+
+    # SPDX-SnippetBegin
+    # SPDX-License-Identifier: Apache-2.0
+    # SPDX-SnippetCopyrightText: 2025 SGLang Team
+    # SPDX—SnippetName: top_k_top_p_min_p_sampling_from_logits_torch
+    #
+    # This sampling implementation is originally from SGLang
+    # (https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/sampler.py),
+    # licensed under Apache 2.0.
+    probs = torch.softmax(logits, dim=-1)
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    # TODO: Support min_ps like: min_p_thresholds = probs_sort[:, 0] * min_ps
+
+    top_p_mask = (probs_sum - probs_sort) > top_ps.view(-1, 1)
+    top_k_mask = torch.arange(0, probs.shape[-1], device=probs.device).view(
+        1, -1
+    ) >= top_ks.view(-1, 1)
+    if is_ascend():
+        probs_sort *= ~(top_p_mask | top_k_mask)
+    else:
+        probs_sort[top_p_mask | top_k_mask] = 0.0
+    # TODO: Support min_ps like:  probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+    probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
+    sampled_index = multinomial(probs_sort, num_samples=1, impl="sync-free")
+    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
+    return batch_next_token_ids
+    # SPDX-SnippetEnd

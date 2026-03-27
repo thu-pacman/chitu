@@ -1,10 +1,7 @@
 import random, xgrammar
 
-from chitu.constraint_decode import apply_bitmask
+from chitu.ops.sampling import apply_bitmask
 import torch
-from chitu.utils import try_import_and_setup_torch_npu
-
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
 def test_regex_reject_tags():

@@ -31,7 +31,6 @@ from chitu.task import (
 from chitu.metadata_serializer import MetadataSerializer, MetadataConfig
 from chitu.distributed.parallel_state import (
     get_tp_group,
-    get_tp_size,
     get_pp_group,
     get_pp_pair_group,
     get_dp_group,
@@ -41,16 +40,11 @@ from chitu.distributed.parallel_state import (
 from chitu.moe import get_moe_impl
 from chitu.hooks import TokenSink, LocalTokenSink, KVTransferHook, NoopKVTransferHook
 from chitu.utils import (
-    top_k_top_p_min_p_sampling_from_logits,
     try_import_and_setup_torch_npu,
 )
-from chitu.ops import apply_frequency_penalty, response_append
-from chitu.device_list import DeviceList
 from chitu.moe.load_balancer import get_moe_load_planner  # added
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
-from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
-    DisaggregationMode,
-)
+from chitu.sampling.sampler import Sampler
 
 logger = getLogger(__name__)
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -813,6 +807,9 @@ class Executor:
         self._lb_every = args.infer.moe_lb_trigger
         self._lb_step = 0
 
+        if self.is_sample_stage:
+            self.sampler = Sampler()
+
     def _prepend_dispatcher(self, dispatcher: TasksDispatcher):
         self.task_dispatchers.insert(0, dispatcher)
 
@@ -962,7 +959,8 @@ class Executor:
             return payload_type
 
         if payload_type == SerializedPackedTasksPayloadType.EndTask:
-            Backend.constraint_decode_manager.end_tasks(tasks.req_ids)
+            if self.is_sample_stage:
+                self.sampler.end_tasks(tasks.task_ids)
             # Delete item from KV cache
             for cache in Backend.cache_dict.values():
                 cache.finalize_cache_all_decode(tasks)
@@ -1016,8 +1014,9 @@ class Executor:
                     task.has_unsync_new_token = True
 
         # 3. sample
+        tokens = None
         if self.is_sample_stage and len(tasks.output_tasks) > 0:
-            tokens = self.sample(out, tasks)
+            tokens = self.sampler.sample(out, tasks.output_tasks)
             if tasks.return_logprobs:
                 logprobs = torch.log_softmax(out, dim=-1)
                 logprobs, token_idxs = logprobs.sort(dim=-1, descending=True)
@@ -1026,6 +1025,11 @@ class Executor:
             tasks.generated_result = tasks.pack_result(
                 tokens, logprobs, token_idxs, out
             )
+
+        # Notify KV transfer hook after prefill completes.
+        if tasks.task_type == TaskType.Prefill:
+            self._kv_hook.on_prefill_done(tokens, tasks)
+
         # async postprocess
         TaskCollector.process_last_batch_results()
 
@@ -1122,12 +1126,6 @@ class Executor:
             for dispatcher in self.task_dispatchers:
                 dispatcher.send_payload(out, tasks)
 
-            # Notify KV transfer hook after prefill completes.
-            output_req_ids = [
-                tasks.req_ids[i] for i in range(tasks.num_tasks) if tasks.has_outputs[i]
-            ]
-            self._kv_hook.on_prefill_done(output_req_ids, out, tasks)
-
             return out
         else:
             for dispatcher in self.task_dispatchers:
@@ -1212,64 +1210,6 @@ class Executor:
                 dispatcher.send_payload(self.dummy_logits, tasks=tasks)
 
             return self.dummy_output
-
-    def sample(self, logits: torch.Tensor, tasks: PackedTasks):
-        """
-        schedule -> model -> ***sample*** -> sync -> send
-
-        Sample the next token with model outputs.
-
-        This part is fully GPU computation without synchronization, and is before the model run.
-        """
-        logits = logits.view(-1, logits.shape[-1]).contiguous()
-        assert (
-            len(tasks.output_tasks) == logits.shape[0]
-        ), f"logits has shape {logits.shape}, but there are {len(tasks.output_tasks)} output_tasks"
-        # logits is now [num_tasks, vocab_size]
-
-        Backend.constraint_decode_manager.apply_grammars(logits, tasks.output_tasks)
-
-        if tasks.is_all_greedy:
-            tokens = torch.argmax(logits, dim=-1)
-        else:
-            if tasks.should_apply_frequency_penalty:
-                logits_index_list = []
-                response_list = []
-                response_len_list = []
-                for it, task in enumerate(tasks.output_tasks):
-                    if (
-                        task.sample_params.frequency_penalty > 0
-                        and task.task_type == TaskType.Decode
-                        and len(task.response) > 0
-                    ):
-                        logits_index_list.append(it)
-                        response_list.append(task.response)
-                        response_len_list.append(len(task.response))
-                # TODO: initialize DeviceList could trigger synchronization between CPU and GPU
-                logits_index_list = DeviceList(
-                    logits_index_list, dtype=torch.int64, device=logits.device
-                )
-                response_len_list = DeviceList(
-                    response_len_list, dtype=torch.int64, device=logits.device
-                )
-                apply_frequency_penalty(
-                    logits,
-                    logits_index_list,
-                    response_list,
-                    response_len_list,
-                    tasks.frequency_penalties,
-                    impl="auto",
-                )
-
-            logits = logits / tasks.temperatures.view(-1, 1)
-            tokens = top_k_top_p_min_p_sampling_from_logits(
-                logits, tasks.top_ks, tasks.top_ps
-            )
-
-            if tasks.should_apply_frequency_penalty:
-                response_append(tasks, tokens)
-
-        return tokens
 
     def postprocess_before_sync(self, tasks: PackedTasks):
         """

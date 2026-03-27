@@ -72,7 +72,6 @@ from chitu.tokenizer import (
 )
 from chitu.utils import try_import_opt_dep
 from chitu.tool_call import get_tool_parser, patch_chat_template
-from chitu.constraint_decode import ConstraintDecodeManager
 from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div, get_global_args
 from chitu.moe import init_moe_impl
 from chitu.global_vars import set_slot_handle
@@ -1454,9 +1453,6 @@ class Backend:
         Backend.tokenizer = Backend._init_tokenizer(args)
         Backend.processor = Backend._init_processor(args)
         Backend.formatter = Backend._init_formatter(args)
-        Backend.constraint_decode_manager = ConstraintDecodeManager(
-            Backend.tokenizer.model, args.models.vocab_size
-        )
 
         # Initialize tool parser
         tool_parser_config = getattr(args.models, "tool_parser", "MISSING")

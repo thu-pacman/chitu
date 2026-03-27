@@ -41,9 +41,7 @@ class KVTransferHook(Protocol):
     receive KV before decode. Default (NoopKVTransferHook) does nothing.
     """
 
-    def on_prefill_done(
-        self, req_ids_output: list[str], logits, tasks: Optional[PackedTasksBase] = None
-    ):
+    def on_prefill_done(self, tokens: torch.Tensor | None, tasks: PackedTasksBase):
         pass
 
     def before_decode_step(self, req_ids: list[str]):
@@ -51,9 +49,7 @@ class KVTransferHook(Protocol):
 
 
 class NoopKVTransferHook:
-    def on_prefill_done(
-        self, req_ids_output: list[str], logits, tasks: Optional[PackedTasksBase] = None
-    ):
+    def on_prefill_done(self, tokens: torch.Tensor | None, tasks: PackedTasksBase):
         return
 
     def before_decode_step(self, req_ids: list[str]):
@@ -139,33 +135,19 @@ class MooncakeKVTransferHook:
         self.kv_manager = kv_manager
         self.mode = disaggregation_mode
 
-    def on_prefill_done(
-        self, req_ids_output: list[str], logits, tasks: Optional[PackedTasksBase] = None
-    ):
+    def on_prefill_done(self, send_tokens: torch.Tensor | None, tasks: PackedTasksBase):
         if self.kv_manager is None:
             return
         if self.mode != "prefill":
             return
-        if not req_ids_output:
+        if tasks.num_tasks == 0:
             return
         # Send KV cache and first-token metadata to decode side.
-        #
-        # In PP>1:
-        # - Non-last PP stages do not own the final LM head, so their `logits` is actually
-        #   intermediate hidden states (not usable by Decode). They should send KV-only.
-        # - Last PP stage sends KV and first-token metadata.
         kv_cache = self.kv_manager.kv_cache
-        send_tokens = None
-        pp_size = get_global_args().infer.pp_size
-        if pp_size > 1:
-            if not get_pp_group().is_last_rank:
-                send_tokens = None
 
-        should_send_tokens = isinstance(logits, torch.Tensor) and (
-            pp_size <= 1 or get_pp_group().is_last_rank
-        )
+        req_ids_output = tasks.output_task_ids
         if pd_verbose_enabled():
-            if not should_send_tokens:
+            if send_tokens is None:
                 # 看到该日志表示：该 rank 只传输 KV Cache（不包含首 token）
                 logger.debug(f"[KVHook] sending KV-only for requests: {req_ids_output}")
             else:
@@ -178,29 +160,6 @@ class MooncakeKVTransferHook:
         for rid in req_ids_output:
             logger.debug(f"[PD_STAGE][prefill.kv_send.start] req_id={rid}")
 
-        if should_send_tokens:
-            from chitu.backend import Backend  # local import to avoid cycles
-
-            task_list: Optional[list[Task]] = None
-            if isinstance(tasks, PackedTasks) and getattr(tasks, "tasks", None):
-                tasks_by_id = {t.task_id: t for t in tasks.tasks}
-                if all(rid in tasks_by_id for rid in req_ids_output):
-                    task_list = [tasks_by_id[rid] for rid in req_ids_output]
-            elif tasks is not None:
-                if all(rid in TaskPool.pool for rid in req_ids_output):
-                    task_list = [TaskPool.pool[rid] for rid in req_ids_output]
-
-            if task_list:
-                packed = PackedTasks([t.task_id for t in task_list], tasks=task_list)
-                with torch.inference_mode():
-                    send_tokens = Backend.executor.sample(logits, packed).to(
-                        dtype=torch.int32
-                    )
-            else:
-                logger.warning(
-                    "[KVHook] missing task metadata for sampling; fallback to argmax."
-                )
-                send_tokens = torch.argmax(logits, dim=-1).to(dtype=torch.int32)
         if pd_trace_enabled():
             logger.debug(
                 f"[PD_TRACE][prefill.kv_send] req_ids={req_ids_output} batch={len(req_ids_output)} "
@@ -222,9 +181,8 @@ class MooncakeKVTransferHook:
 
         from chitu.backend import Backend  # local import to avoid cycles
 
-        if Backend.executor._pd_prefill_only:
-            for rid in req_ids_output:
-                t = TaskPool.pool.get(rid)
+        if Backend.executor._pd_prefill_only and isinstance(tasks, PackedTasks):
+            for t in tasks.tasks:
                 if t is None:
                     continue
                 if t.req is not None and not t.req.finish_reason:
