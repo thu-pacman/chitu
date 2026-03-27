@@ -16,6 +16,7 @@ import zmq
 import zmq.asyncio
 import msgpack
 import logging
+from typing_extensions import override
 
 from chitu.async_response import AsyncDataStream, AsyncResponse
 from chitu.backend import Backend
@@ -412,7 +413,7 @@ class DPAsyncDataStream(AsyncDataStream):
                 logger.debug(
                     f"DP AsyncStream: Skipping text with invalid characters '{s}'"
                 )
-                return
+                s = s.replace("\ufffd", "")
 
             # Add text directly to sequence
             self.seqs.append(s)
@@ -428,9 +429,16 @@ class DPAsyncDataStream(AsyncDataStream):
         # Trigger data event
         self.data_event.set()
 
+    @override
+    def send_stop_signal(self):
+        with self.lock:
+            self.stop_signal = True
+        self.notify_server_threadsafe()
+
+    @override
     def add_data(
         self,
-        value: int,
+        value: Optional[int],
         top_logprobs=None,
         top_token_idx=None,
         *,
@@ -438,73 +446,11 @@ class DPAsyncDataStream(AsyncDataStream):
     ):
         """Override add_data method, optimized for DP scenarios
 
-        Note: This method should rarely be called now, as we use add_text_data
+        Note: This method should NEVER be called now, as we use add_text_data
         """
-        with self.lock:
-            reasoning_state = self.reasoning_parser.update(value)
-
-            self.tokens_len += 1
-            self.cache_tokens.append(value)
-
-            # Use Backend.tokenizer for decoding
-            try:
-                if Backend.tokenizer is not None:
-                    s = Backend.tokenizer.decode(self.cache_tokens)
-
-                    top_tokens = (
-                        [
-                            Backend.tokenizer.decode([token_idx])
-                            for token_idx in top_token_idx
-                        ]
-                        if top_token_idx
-                        else None
-                    )
-
-                    logger.debug(
-                        f"DP Token decoded successfully: token_id={value} -> text='{s}'"
-                    )
-                else:
-                    # Fallback: Backend.tokenizer is None
-                    s = f"[TOKEN_{value}]"
-                    top_tokens = None
-                    logger.warning(f"Backend.tokenizer is None, using fallback: {s}")
-            except Exception as decode_error:
-                # Fallback: decoding failed
-                s = f"[TOKEN_{value}]"
-                top_tokens = None
-                logger.error(
-                    f"Token decoding failed: {decode_error}, using fallback: {s}"
-                )
-
-            if "\ufffd" in s:
-                return
-
-            # Check tokenizer's force_full_seq_decode attribute
-            force_full_seq_decode = False
-            try:
-                if Backend.tokenizer is not None:
-                    force_full_seq_decode = getattr(
-                        Backend.tokenizer, "force_full_seq_decode", False
-                    )
-            except Exception:
-                force_full_seq_decode = False
-
-            if not force_full_seq_decode:
-                self.cache_tokens.clear()
-                self.seqs.append(s)
-                self.chars_len += len(s)
-            else:
-                self.seqs.append(s[self.chars_len :])
-                self.chars_len = len(s)
-            self.reasoning_states.append(reasoning_state)
-
-            if top_logprobs:
-                self.top_logprobs_list.append(top_logprobs)
-                self.top_tokens_list.append(top_tokens)
-
-        if notify_server and (loop := get_server_event_loop()) is not None:
-            # No need to notify if there is no server (e.g. offline inference)
-            loop.call_soon_threadsafe(self.data_event.set)
+        raise NotImplementedError(
+            "DPAsyncDataStream.add_data should not be called. Please use DPAsyncDataStream.add_text_data instead."
+        )
 
 
 # Global Token Router instance

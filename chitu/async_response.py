@@ -42,27 +42,42 @@ class AsyncDataStream:
         self.top_tokens_list = []
         self.reasoning_parser = ReasoningParser(reasoning_params)
         self.reasoning_states: list[bool] = []
+        self.cached_reasoning_state: bool = False
 
     def add_data(
         self,
-        value: int,
+        value: Optional[int],
         top_logprobs=None,
         top_token_idx=None,
         *,
         notify_server: bool = True,
     ):
         with self.lock:
-            reasoning_state = self.reasoning_parser.update(value)
-            self.tokens_len += 1
-            self.cache_tokens.append(value)
+            if value is not None:
+                self.cached_reasoning_state = self.reasoning_parser.update(value)
+                self.tokens_len += 1
+                self.cache_tokens.append(value)
+            elif len(self.cache_tokens) == 0:
+                return
             s = self.tokenizer.decode(self.cache_tokens)
             top_tokens = (
                 [self.tokenizer.decode(token_idx) for token_idx in top_token_idx]
                 if top_token_idx
                 else None
             )
+            # When stop signal received, use `add_data(None)` to clear the token cache
+            # TODO: avoid hardcode max length of cache_tokens
             if "\ufffd" in s:
-                return
+                if value is None or (
+                    not self.tokenizer.force_full_seq_decode
+                    and len(self.cache_tokens) > 10
+                ):
+                    logger.warning(
+                        f"\\ufffd detected with context: {''.join(self.seqs[-10:]) + s}"
+                    )
+                    pass
+                else:
+                    return
             if not self.tokenizer.force_full_seq_decode:
                 self.cache_tokens.clear()
                 self.seqs.append(s)
@@ -70,7 +85,7 @@ class AsyncDataStream:
             else:
                 self.seqs.append(s[self.chars_len :])
                 self.chars_len = len(s)
-            self.reasoning_states.append(reasoning_state)
+            self.reasoning_states.append(self.cached_reasoning_state)
             if top_logprobs:
                 self.top_logprobs_list.append(top_logprobs)
                 self.top_tokens_list.append(top_tokens)
@@ -78,6 +93,7 @@ class AsyncDataStream:
             self.notify_server_threadsafe()
 
     def send_stop_signal(self):
+        self.add_data(None)
         with self.lock:
             self.stop_signal = True
         self.notify_server_threadsafe()

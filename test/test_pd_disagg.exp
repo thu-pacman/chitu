@@ -396,6 +396,7 @@ expect -i $bench_spawn_id -timeout 7200 {
     }
     timeout {
         puts "ERROR: benchmark timeout"
+        dump_startup_logs
         exit 1
     }
 }
@@ -403,12 +404,14 @@ set bench_status [wait -i $bench_spawn_id]
 set bench_exit [lindex $bench_status 3]
 if {$bench_exit ne "0"} {
     puts "ERROR: benchmark failed with exit code $bench_exit"
+    dump_startup_logs
     exit 1
 }
 
 set json_path "$bench_output_dir/benchmark_results.jsonl"
 if {![file exists $json_path]} {
     puts "ERROR: benchmark results not found: $json_path"
+    dump_startup_logs
     exit 1
 }
 
@@ -492,6 +495,7 @@ expect -i $parse_spawn_id -timeout 7200 {
     }
     timeout {
         puts "ERROR: parse timeout"
+        dump_startup_logs
         exit 1
     }
 }
@@ -499,6 +503,7 @@ set parse_status [wait -i $parse_spawn_id]
 set parse_exit [lindex $parse_status 3]
 if {$parse_exit ne "0"} {
     puts "ERROR: benchmark validation failed"
+    dump_startup_logs
     exit 1
 }
 
