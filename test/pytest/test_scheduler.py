@@ -964,7 +964,7 @@ def test_single_decode_prompt_seq_bigger_than_kvcache_capacity():
     TaskPool.remove(task.task_id)
 
 
-def test_evict_decode_task():
+def test_evict_task():
     set_global_args(
         OmegaConf.create(
             {
@@ -1007,7 +1007,9 @@ def test_evict_decode_task():
     # add 4 decoding tasks into TaskPool, allocate kv_cache for them according to their prefix length
     for i in range(NUM_BLOCKS):
         req = MockFixedLengthedUserRequest(
-            input_len=BLOCK_SIZE,
+            input_len=(
+                BLOCK_SIZE if i != 3 else BLOCK_SIZE * 2
+            ),  # prompt_lens: [BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, 2*BLOCK_SIZE]
             request_id=f"req_{i}",
             enable_reasoning=False,
         )
@@ -1018,14 +1020,15 @@ def test_evict_decode_task():
 
         task.dp_rank = 0
         task.prompt_to_token_block(task.dp_rank)
-        task.set_prefill_chunk_size_for_one_step(task.prefix_tokens_len)
+        task.set_prefill_chunk_size_for_one_step(BLOCK_SIZE)
         Backend.cache_managers[0]["main"].prepare_metadata_before_prefill(task)
         task.consume_req_tokens()
-        task.prefix_tokens.append(1)
+        if i != 3:
+            task.prefix_tokens.append(1)
 
-    # TaskPool: ['req_0', 'req_1', 'req_2', 'req_3']
+    # TaskPool: ['req_0':Decode, 'req_1':Decode, 'req_2':Decode, 'req_3':Prefill]
     # num_free_blocks: 0
-    # evict low priority tasks('req_2', 'req_3') when cache manager has no more blocks for decoding
+    # evict low priority tasks('req_2':Decode, 'req_3':Prefill) when cache manager has no more blocks for decoding
     req_2_prefix_tokens = tasks[-2].prefix_tokens
     req_3_prefix_tokens = tasks[-1].prefix_tokens
     scheduler = Scheduler(
@@ -1077,8 +1080,171 @@ def test_evict_decode_task():
     # num_free_blocks: 4
     task_ids = scheduler.schedule()
     assert len(task_ids) == 2
-    assert TaskPool.pool[task_ids[-1]].prefix_tokens == req_2_prefix_tokens
-    assert TaskPool.pool[task_ids[-2]].prefix_tokens == req_3_prefix_tokens
+    assert TaskPool.pool[task_ids[-2]].prefix_tokens == req_2_prefix_tokens
+    assert TaskPool.pool[task_ids[-1]].prefix_tokens == req_3_prefix_tokens
+
+
+def test_can_prefill():
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 5123,
+                    "cache_type": "paged",
+                    "op_impl": "torch",
+                    "schedule_overlap": True,
+                    "mtp_size": 1,
+                }
+            }
+        ),
+        need_ensure=False,
+    )
+    TaskPool.reset()
+
+    NUM_BLOCKS = 4
+    BLOCK_SIZE = 512
+    DECODE_NUM_TASKS = 4
+
+    Backend.cache_managers = [
+        {
+            "main": PagedKVCacheManager(
+                num_blocks=NUM_BLOCKS,
+                num_hot_req=4,
+                max_seq_len=5123,
+                dp_rank=0,
+                block_size=BLOCK_SIZE,
+            )
+        }
+    ]  # kv_cache capacity = 5120
+
+    # 假设taskpool中全是其它dp_rank的任务
+    for i in range(4):
+        req = MockFixedLengthedUserRequest(
+            input_len=1,
+            request_id=f"req_{i}",
+            enable_reasoning=False,
+        )
+        task = Task(f"{req.request_id}", req)
+        task.dp_rank = 1
+        TaskPool.add(task)  # pool: ['req_0', 'req_1', 'req_2', 'req_3']
+
+    scheduler = Scheduler(
+        100,
+        4,
+        DECODE_NUM_TASKS,
+        "request_preset,fcfs",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=1,
+        dp_rank=0,
+    )
+    assert not scheduler.can_prefill()
+    assert scheduler.schedule(strict_allowed_task_type={TaskType.Prefill}) == []
+
+    # 假设taskpool中全是decode任务
+    TaskPool.reset()
+    for i in range(4):
+        req = MockFixedLengthedUserRequest(
+            input_len=1,
+            request_id=f"req_{i}",
+            enable_reasoning=False,
+        )
+        task = Task(f"{req.request_id}", req)
+        task.task_type = TaskType.Decode
+        TaskPool.add(task)  # pool: ['req_0', 'req_1', 'req_2', 'req_3']
+
+    scheduler = Scheduler(
+        100,
+        4,
+        DECODE_NUM_TASKS,
+        "request_preset,fcfs",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=1,
+        dp_rank=0,
+    )
+    assert not scheduler.can_prefill()
+    assert scheduler.schedule(strict_allowed_task_type={TaskType.Prefill}) == []
+
+    # 假设taskpool中全是waiting任务
+    TaskPool.reset()
+    for i in range(4):
+        req = MockFixedLengthedUserRequest(
+            input_len=1,
+            request_id=f"req_{i}",
+            enable_reasoning=False,
+        )
+        task = Task(f"{req.request_id}", req)
+        task.waiting = True
+        task.dp_rank = 0
+        TaskPool.add(task)  # pool: ['req_0', 'req_1', 'req_2', 'req_3']
+
+    scheduler = Scheduler(
+        100,
+        4,
+        DECODE_NUM_TASKS,
+        "request_preset,fcfs",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=1,
+        dp_rank=0,
+    )
+    assert not scheduler.can_prefill()
+    assert scheduler.schedule(strict_allowed_task_type={TaskType.Prefill}) == []
+
+    # 假设最高优先级的任务长度过大
+    TaskPool.reset()
+    req_0 = MockFixedLengthedUserRequest(
+        input_len=1,
+        request_id=f"req_0",
+        enable_reasoning=False,
+    )
+    task_0 = Task(f"{req_0.request_id}", req_0)
+    TaskPool.add(task_0)
+
+    req_1 = MockFixedLengthedUserRequest(
+        input_len=BLOCK_SIZE * NUM_BLOCKS + 1,
+        request_id=f"req_1",
+        enable_reasoning=False,
+    )
+    task_1 = Task(
+        f"{req_1.request_id}", req_1, priority=2
+    )  # task_1后加入taskpool但优先级更高
+    TaskPool.add(task_1)
+
+    scheduler = Scheduler(
+        100,
+        4,
+        DECODE_NUM_TASKS,
+        "request_preset,fcfs",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=1,
+        dp_rank=0,
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        scheduler.can_prefill()
+    assert "KV cache capacity is insufficient to support prefilling" in str(exc_info)
+
+    # can_prefill返回True，则scheudler.schedule()一定会调度出prefill任务
+    TaskPool.reset()
+    req_0 = MockFixedLengthedUserRequest(
+        input_len=1,
+        request_id=f"req_0",
+        enable_reasoning=False,
+    )
+    task_0 = Task(f"{req_0.request_id}", req_0)
+    TaskPool.add(task_0)
+
+    scheduler = Scheduler(
+        100,
+        4,
+        DECODE_NUM_TASKS,
+        "request_preset,fcfs",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=1,
+        dp_rank=0,
+    )
+
+    assert scheduler.can_prefill()
+    assert len(scheduler.schedule(strict_allowed_task_type={TaskType.Prefill})) > 0
 
 
 def test_scheduler_group():

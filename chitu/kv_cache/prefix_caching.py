@@ -31,7 +31,7 @@ class TokenBlock:
         None  # 为kvcache的块索引，只有当该block被分配了kvcache索引时有效，否则为None
     )
     active_cnt: int = (
-        0  # 表示该TokenBlock击中的task中处于活跃状态（task调用prepare_metadada_before_prefill之后，调用finalize_metadata_all_decode之前）的数量
+        0  # 表示该TokenBlock击中的task数量，只有当该block被分配了kvcache索引时有效
     )
 
     @classmethod
