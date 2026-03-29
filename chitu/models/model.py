@@ -1236,7 +1236,6 @@ class Transformer(nn.Module):
             h = h[output_token_offsets]
             h = self._post_layers(h)
             h = h.float()
-
         return h
 
     @torch.inference_mode()
@@ -1250,7 +1249,6 @@ class Transformer(nn.Module):
         if self.pp_stage == self.pp_end_stage:
             h = self._post_layers(h)
             h = h.float()
-
         return h
 
     @torch.inference_mode()

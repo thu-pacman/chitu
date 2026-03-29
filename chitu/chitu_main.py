@@ -5,6 +5,8 @@
 import functools
 import operator
 import os
+import gc
+import math
 import time
 import traceback
 from logging import getLogger
@@ -64,6 +66,14 @@ from chitu.metrics import (
 )
 from chitu.distributed.comm_group import SingletonGroupPlaceholder
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
+from chitu.kv_cache.utils import (
+    get_additional_block_num_from_current,
+    plan_kv_cache_blocks_after_warmup,
+    reduce_num_block_plan_across_ranks,
+    estimate_indexer_blocks_from_main,
+    solve_main_target_after_shrink,
+    allreduce_min_int,
+)
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
@@ -96,116 +106,227 @@ def init_cache_static():
         torch.cuda.reset_peak_memory_stats()
 
 
-def get_additional_block_num(kv_cache: PagedKVCache, memory_utilization: float = 0.98):
-    """
-    Calculate additional block numbers based on available memory.
-    Works on both CPU and GPU machines.
-
-    Args:
-        kv_cache: The PagedKVcache object.
-        memory_utilization: Fraction of GPU/CPU memory to use (default: 0.98).
-
-    Returns:
-        Number of additional blocks that can be allocated.
-    """
-
-    def tuple_product(t):
-        return functools.reduce(operator.mul, t, 1)
-
-    block_mem = 0
-    for key in kv_cache.shape_per_token_dict:
-        block_mem += (
-            kv_cache.dtype_dict[key].itemsize
-            * kv_cache.block_size
-            * tuple_product(kv_cache.shape_per_token_dict[key])
-            * kv_cache.num_layers
-        )
-
-    if get_global_args().infer.op_impl == "cpu":
-        process = psutil.Process(os.getpid())
-        current_process_mem = process.memory_info().vms
-        additional_memory = (
-            psutil.virtual_memory().total * memory_utilization - current_process_mem
-        )
-        num_blocks = int(additional_memory) // block_mem
-        return max(0, num_blocks)
-    current_device = torch.cuda.current_device()
-    torch.cuda.synchronize()  # Wait for all kernels to finish before we can get peak memory usage
-    _, total_memory = torch.cuda.mem_get_info(current_device)
-    peak_memory = torch.cuda.memory_stats(current_device)["allocated_bytes.all.peak"]
-    torch.cuda.empty_cache()
-    torch_allocated_bytes = torch.cuda.memory_stats(current_device)[
-        "allocated_bytes.all.current"
-    ]
-    total_allocated_bytes = (
-        torch.cuda.mem_get_info(current_device)[1]
-        - torch.cuda.mem_get_info(current_device)[0]
-    )
-    non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
-    if non_torch_allocations > 0:
-        peak_memory += non_torch_allocations
-    additional_kv_cache_memory = total_memory * memory_utilization - peak_memory
-    logger.debug(
-        f"{additional_kv_cache_memory} bytes of memory available on this rank for additional KV "
-        f"cache after warming-up."
-    )
-
-    num_blocks = int(additional_kv_cache_memory) // block_mem
-    return max(0, num_blocks)
-
-
 def _auto_set_num_blocks_after_warmup(args):
-    # FIXME: other managers than "main"
-    if args.infer.cache_type == "paged" and args.infer.num_blocks == -1:
-        assert isinstance(Backend.cache_dict["main"], PagedKVCache)
-        additional_blocks = get_additional_block_num(
-            Backend.cache_dict["main"], args.infer.memory_utilization
-        )
-        new_num_block = Backend.cache_dict["main"].num_blocks + additional_blocks
-
-        if torch.distributed.get_world_size() > 1:
-            new_num_block_tensor = torch.tensor(new_num_block).cuda()
-            torch.distributed.all_reduce(
-                new_num_block_tensor, torch.distributed.ReduceOp.RedOpType.MIN
-            )
-            new_num_block = new_num_block_tensor.item()
-
-        get_global_args().infer.num_blocks = new_num_block
-        if new_num_block > 0:
-            Backend.cache_dict["main"].realloc(new_num_block)
-
-        # Realloc indexer cache manager if present
-        indexer_cm = Backend.cache_dict.get("indexer")
-        if (
-            indexer_cm is not None
-            and isinstance(indexer_cm, PagedKVCacheManager)
-            and hasattr(indexer_cm, "realloc")
-        ):
-            # Scale indexer blocks proportionally to main cache
-            indexer_additional = get_additional_block_num(
-                indexer_cm, args.infer.memory_utilization
-            )
-            new_indexer_blocks = indexer_cm.num_blocks + indexer_additional
-            if torch.distributed.get_world_size() > 1:
-                indexer_tensor = torch.tensor(new_indexer_blocks).cuda()
-                torch.distributed.all_reduce(
-                    indexer_tensor, torch.distributed.ReduceOp.RedOpType.MIN
-                )
-                new_indexer_blocks = indexer_tensor.item()
-            if new_indexer_blocks > 0:
-                indexer_cm.realloc(new_indexer_blocks)
-                logger.info(
-                    f"indexer cache manager reallocated to {new_indexer_blocks} blocks after warmup"
-                )
-
-        if torch.distributed.get_rank() == 0:
-            for scheduler in Backend.schedulers:
-                scheduler.cache_manager_dict["main"].realloc(new_num_block)
-                scheduler.reset_kvcache_block_threshold()
-    else:
+    if not (args.infer.cache_type == "paged" and args.infer.num_blocks == -1):
         logger.info(
             f"skip auto set num blocks after warmup because {args.infer.num_blocks=}"
         )
+        return
+
+    paged_caches = {}
+    for name, cache in Backend.cache_dict.items():
+        if (
+            hasattr(cache, "realloc")
+            and hasattr(cache, "num_blocks")
+            and hasattr(cache, "max_num_blocks")
+        ):
+            paged_caches[name] = cache
+
+    if "main" not in paged_caches:
+        logger.warning(
+            "skip auto set num blocks after warmup because main cache manager is missing"
+        )
+        return
+
+    for name, cache in paged_caches.items():
+        bytes_per_block = (
+            int(cache.estimate_bytes_per_block())
+            if hasattr(cache, "estimate_bytes_per_block")
+            else -1
+        )
+        logger.info(
+            "%s warmup stats before planning: bytes_per_block=%s current_blocks=%s max_num_blocks=%s",
+            name,
+            bytes_per_block,
+            int(cache.num_blocks),
+            int(cache.max_num_blocks),
+        )
+
+    plan = plan_kv_cache_blocks_after_warmup(args, paged_caches)
+    plan = reduce_num_block_plan_across_ranks(plan)
+    logger.info("KV cache reduced pre-plan after warmup: %s", plan)
+
+    # shrink non-main managers first
+    for name, cm in paged_caches.items():
+        if name == "main":
+            continue
+
+        current_blocks = int(cm.num_blocks)
+        target_blocks = int(plan.get(name, current_blocks))
+
+        if target_blocks < current_blocks:
+            cm.realloc(int(target_blocks))
+            logger.info(
+                "%s cache manager shrunk to %d blocks before joint solve",
+                name,
+                int(target_blocks),
+            )
+
+    if get_global_args().infer.op_impl != "cpu":
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    main_cm = paged_caches["main"]
+    main_current = int(main_cm.num_blocks)
+    main_cap = int(main_cm.max_num_blocks)
+
+    reserve_bytes = int(512 << 20)  # 512 MiB
+
+    final_main_target = int(main_current)
+    final_indexer_target = None
+
+    if "indexer" in paged_caches:
+        indexer_cm = paged_caches["indexer"]
+        solved_main, solved_indexer = solve_main_target_after_shrink(
+            args=args,
+            main_cm=main_cm,
+            indexer_cm=indexer_cm,
+            reserve_bytes=reserve_bytes,
+        )
+
+        solved_main = allreduce_min_int(int(solved_main))
+
+        solved_main = min(max(int(main_current), int(solved_main)), int(main_cap))
+        solved_indexer = estimate_indexer_blocks_from_main(
+            main_cm, indexer_cm, int(solved_main)
+        )
+        solved_indexer = min(
+            max(0, int(solved_indexer)),
+            int(indexer_cm.max_num_blocks),
+        )
+
+        final_main_target = int(solved_main)
+        final_indexer_target = int(solved_indexer)
+
+        logger.info(
+            "KV final joint targets: main_current=%d final_main_target=%d final_indexer_target=%d reserve_bytes=%d",
+            int(main_current),
+            int(final_main_target),
+            int(final_indexer_target),
+            int(reserve_bytes),
+        )
+    else:
+        additional_main_blocks = int(
+            get_additional_block_num_from_current(
+                main_cm,
+                args.infer.memory_utilization,
+                reserve_bytes=reserve_bytes,
+            )
+        )
+        final_main_target = min(
+            int(main_current) + int(additional_main_blocks), int(main_cap)
+        )
+        final_main_target = max(0, int(final_main_target))
+        final_main_target = allreduce_min_int(int(final_main_target))
+
+    if "indexer" in paged_caches:
+        indexer_cm = paged_caches["indexer"]
+        indexer_current = int(indexer_cm.num_blocks)
+
+        proposed_indexer_target = (
+            int(final_indexer_target)
+            if final_indexer_target is not None
+            else int(indexer_current)
+        )
+        if int(proposed_indexer_target) <= int(indexer_current):
+            proposed_indexer_target = int(indexer_current)
+
+        reduced_indexer_target = allreduce_min_int(int(proposed_indexer_target))
+
+        if int(reduced_indexer_target) > int(indexer_current):
+            indexer_cm.realloc(int(reduced_indexer_target))
+            logger.info(
+                "indexer cache manager reallocated to %d blocks before main growth",
+                int(reduced_indexer_target),
+            )
+
+            if get_global_args().infer.op_impl != "cpu":
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+    # after indexer is in place, re-check main safe target from current memory
+    main_current = int(main_cm.num_blocks)
+    reserve_bytes = int(512 << 20)
+
+    safe_additional_main_blocks = int(
+        get_additional_block_num_from_current(
+            main_cm,
+            args.infer.memory_utilization,
+            reserve_bytes=reserve_bytes,
+        )
+    )
+    safe_main_target = min(
+        int(main_current) + int(safe_additional_main_blocks),
+        int(final_main_target),
+    )
+    safe_main_target = min(int(safe_main_target), int(main_cm.max_num_blocks))
+    safe_main_target = max(0, int(safe_main_target))
+    safe_main_target = allreduce_min_int(int(safe_main_target))
+
+    logger.info(
+        "KV safe main target before final grow: current=%d final_main_target=%d safe_main_target=%d",
+        int(main_current),
+        int(final_main_target),
+        int(safe_main_target),
+    )
+
+    get_global_args().infer.num_blocks = int(safe_main_target)
+
+    # grow main
+    if int(safe_main_target) > int(main_current):
+        main_cm.realloc(int(safe_main_target))
+        logger.info(
+            "main cache manager reallocated to %d blocks after warmup",
+            int(safe_main_target),
+        )
+    else:
+        logger.info(
+            "main cache manager keeps %d blocks after warmup",
+            int(main_current),
+        )
+
+    if get_global_args().infer.op_impl != "cpu":
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    final_main_blocks = int(main_cm.num_blocks)
+    final_main_blocks = allreduce_min_int(int(final_main_blocks))
+    get_global_args().infer.num_blocks = int(final_main_blocks)
+
+    if Backend.cache_managers:
+        for dp_rank_managers in Backend.cache_managers:
+            main_mgr = dp_rank_managers.get("main")
+            if main_mgr is None:
+                continue
+
+            mgr_current = int(main_mgr.num_blocks)
+            if int(final_main_blocks) != int(mgr_current):
+                main_mgr.realloc(int(final_main_blocks))
+                logger.info(
+                    "scheduler main cache manager synced to %d blocks after warmup",
+                    int(final_main_blocks),
+                )
+
+    # finalize other non-main managers
+    for name, cm in paged_caches.items():
+        if name == "main":
+            continue
+
+        logger.info(
+            "%s cache manager keeps %d blocks after warmup",
+            name,
+            int(cm.num_blocks),
+        )
+
+    if torch.distributed.get_rank() == 0:
+        for scheduler in Backend.schedulers:
+            scheduler.reset_kvcache_block_threshold()
 
 
 def _warmup_via_taskpool(args):
