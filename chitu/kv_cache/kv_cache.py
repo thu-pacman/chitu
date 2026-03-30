@@ -325,6 +325,9 @@ class KVCacheBase:
                 f"Unsupported kv_cache quant type: {self.quant_type}"
             )
 
+    def estimate_bytes_per_block(self) -> int:
+        raise NotImplementedError()
+
     def prepare_cache_prefill(self, tasks: "PackedTasksBase"):
         if tasks.hit_token_lens:
             cached_token_lens: list[int] = [
@@ -578,6 +581,34 @@ class PagedKVCache(KVCacheBase):
             for tid, new_cache_ids in zip(tasks.task_ids, tasks.new_cache_ids_list):
                 self.block_table[tid].extend(new_cache_ids)
         self._upd_gpu_block_table(tasks.task_ids)
+
+    def estimate_bytes_per_block(self) -> int:
+        """
+        Estimate additional bytes required to allocate 1 more KV page/block.
+
+        For paged KV cache, each key is stored as a tensor shaped:
+            (num_layers, num_blocks, block_size, *shape_per_token)
+
+        Increasing num_blocks by 1 adds:
+            num_layers * block_size * prod(shape_per_token) * element_size(dtype)
+        bytes for that key.
+        """
+        bs = int(self.block_size)
+        n_layers = int(self.num_layers)
+
+        total = 0
+        for key, shape in self.shape_per_token_dict.items():
+            n_elem_per_token = 1
+            for d in tuple(shape):
+                n_elem_per_token *= int(d)
+
+            dtype = self.dtype_dict[key]
+            elem_size = torch.empty((), dtype=dtype).element_size()
+
+            bytes_per_layer_per_block = bs * n_elem_per_token * elem_size
+            total += n_layers * bytes_per_layer_per_block
+
+        return int(total)
 
     def finalize_cache_all_decode(self, tasks: "PackedTasksBase"):
         super().finalize_cache_all_decode(tasks)

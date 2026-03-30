@@ -261,7 +261,7 @@ print(next((d.version for d in m.distributions() if (d.metadata.get('Name') or '
         elif python3 -c "import torch; print(torch.version.cuda == '13.0')" | grep -q "True"; then \
             CUDA_TAG="cu130"; \
         else \
-            echo "Unrecoginized CUDA versoin $(python3 -c 'import torch; print(torch.version.cuda)')" for flashinfer_jit_cache; \
+            echo "Unrecoginized CUDA version $(python3 -c 'import torch; print(torch.version.cuda)')" for flashinfer_jit_cache; \
             CUDA_TAG=""; \
         fi; \
         if [ -n "${CUDA_TAG}" ]; then \

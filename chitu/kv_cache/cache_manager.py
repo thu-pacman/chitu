@@ -320,6 +320,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
         if task.task_id not in self.tid_to_cached_len:
             return
         for block in task.token_blocks:
+            if block.cache_idx is None:
+                break
             block.active_cnt -= 1
             assert (
                 block.active_cnt >= 0
