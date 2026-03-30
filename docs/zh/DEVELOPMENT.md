@@ -671,6 +671,42 @@ python benchmarks/benchmark_serving.py \
 
 注意当 `--batch-size` 较大时，性能测试工具会占用大量文件描述符，可能超过 `ulimit` 限制。**建议在运行性能测试前提升限制，如 `ulimit -n 65536`。**
 
+## 单元测试
+
+一些单元测试可用于定位潜在问题：
+
+**单卡测试：**
+
+```bash
+pytest [pytest arguments...] ./test/pytest
+```
+
+其中可任意添加 [PyTest](https://docs.pytest.org/) 选项，以控制输出、筛选测例等。
+
+许多测例还支持性能测试。请为 `pytest` 追加 `-s` 选项来显式结果。测试中默认的计时轮次仅为 1，所以还请通过追加  `--warmup-round=<rounds> --timing-round=<rounds>` 选项来调整及时轮次，来获得准确的测量结果。
+
+示例：
+
+``` bash
+pytest --warmup-round=5 --timing-round=20 -s ./test/pytest
+```
+
+**多卡测试：**
+
+```bash
+torchrun [torchrun arguments...] --no-python ./run_pytest_with_pretty_print.sh [pytest arguments...] ./test/dist_pytest
+```
+
+该命令会用不多于此处通过 `torchrun` 参数的卡数，来运行测试。
+
+由于分布式程序中的错误时常导致通信过程不能正常结束，经常一个测例发生错误会导致其后的其他测例均无法运行。建议为 `pytest` 追加 `-x` 选项，以使其在遇到第一处错误后就退出。
+
+示例：
+
+```bash
+torchrun --nproc_per_node 8 --no-python ./test/dist_pytest/run_pytest_with_pretty_print.sh -x ./test/dist_pytest
+```
+
 ## 环境变量
 
 安装时：
