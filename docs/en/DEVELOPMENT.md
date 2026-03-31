@@ -669,6 +669,42 @@ The benchmark follows the following assumption, and you should keep them consist
 
 Note that the benchmarking script uses a lot of file handles when `--batch-size` is large, which may be over the limit by `ulimit`. **It is recommended to raise to limit before benchmarking, for example by `ulimit -n 65536`.**
 
+## Unit Tests
+
+Some unit tests may be used for diagnosing potential issues:
+
+**Single-GPU tests:**
+
+```bash
+pytest [pytest arguments...] ./test/pytest
+```
+
+Feel free to add any other [PyTest](https://docs.pytest.org/) arguments to control printing, filter cases, etc.
+
+Many of the test cases also support benchmarking. Please append `-s` to `pytest` to show the result. By default the timing round is only 1, please also adjust it by appending `--warmup-round=<rounds> --timing-round=<rounds>` for accurate results.
+
+Example:
+
+``` bash
+pytest --warmup-round=5 --timing-round=20 -s ./test/pytest
+```
+
+**Multi-GPU tests:**
+
+```bash
+torchrun [torchrun arguments...] --no-python ./run_pytest_with_pretty_print.sh [pytest arguments...] ./test/dist_pytest
+```
+
+It will perform tests that use GPUs no more than the GPUs you provide via the `torchrun` arguments.
+
+Since errors in distributed programs often make communications hang, it is common that other tests cannot run after any previous test fails. It is recommended to make `pytest` exit on the first error by setting `-x` as a PyTest argument.
+
+Example:
+
+```bash
+torchrun --nproc_per_node 8 --no-python ./test/dist_pytest/run_pytest_with_pretty_print.sh -x ./test/dist_pytest
+```
+
 ## Environment Variables
 
 Install time:

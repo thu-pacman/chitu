@@ -49,3 +49,13 @@ class TokenBlock:
     def __len__(self):
         """TokenBlock中实际存储的token数量"""
         return len(self.tokens)
+
+    def __repr__(self):
+        return (
+            f"TokenBlock(length={self.__len__()}, "
+            f"blk_hash={self.blk_hash}, "
+            f"pre_blk_hash={self.pre_blk_hash}, "
+            f"blk_size={self.blk_size}, "
+            f"cache_idx={self.cache_idx}, "
+            f"active_cnt={self.active_cnt})"
+        )

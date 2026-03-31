@@ -175,10 +175,12 @@ class PagedKVCacheManager(KVCacheManagerBase):
         """prepare and update metadata before the task begin a prefill step"""
         task.new_cache_ids = []
 
-        if task.task_id not in self.tid_to_cached_len and self.enable_prefix_caching:
+        if self.enable_prefix_caching:
             # 被prefix caching击中block不占chunk prefill size的容量，也不增加额外的kv cache block需求
             task.consumed_req_tokens = 0
-            for idx in range(len(task.token_blocks)):
+            for idx in range(
+                len(self.task_to_cache_ids[task.task_id]), len(task.token_blocks)
+            ):
                 block = task.token_blocks[idx]
 
                 # 如果block未被prefix caching块击中，停止遍历
@@ -226,7 +228,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             block = task.token_blocks[idx]
             assert (
                 block.cache_idx is None
-            ), f"idx:{idx}, task.token_blocks:{task.token_blocks}"
+            ), f"[DP {self.dp_rank}] task_id: {task.task_id}, idx:{idx}, tasks.cached_blocks:{[blk.cache_idx for blk in task.token_blocks]}, cache_manager.task_to_cache_ids:{self.task_to_cache_ids[task.task_id]}"
             cache_idx = self.get_free_cache_idx()
             assert (
                 cache_idx not in self.task_to_cache_ids[task.task_id]
