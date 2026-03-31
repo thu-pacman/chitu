@@ -10,6 +10,7 @@ import math
 import time
 import traceback
 from logging import getLogger
+from typing import Optional
 import psutil
 import random
 import re
@@ -82,6 +83,12 @@ deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 
 
 logger = getLogger(__name__)
+_last_step_task_type: Optional[TaskType] = None
+
+
+def get_last_step_task_type() -> Optional[TaskType]:
+    """Return the TaskType (Prefill / Decode) of the most recent local step."""
+    return _last_step_task_type
 
 
 def init_logger():
@@ -904,9 +911,13 @@ def chitu_init(args):
 @torch.inference_mode()
 def chitu_run_main_rank():
     # 1. Schedule
+    global _last_step_task_type
     if Backend.args.infer.dp_size == 1:
         assert len(Backend.schedulers) == 1
         task_ids = Backend.schedulers[0].schedule()
+        _last_step_task_type = (
+            TaskType.Prefill if Backend.schedulers[0].can_prefill() else TaskType.Decode
+        )
     else:
         # Make new-coming tasks go to a random DP rank to improve load balance.
         # This is achieved by randomly shuffle the scheduler list.
@@ -918,6 +929,7 @@ def chitu_run_main_rank():
             if any(scheduler.can_prefill() for scheduler in Backend.schedulers)
             else TaskType.Decode
         )
+        _last_step_task_type = task_type
         task_ids_list = [None] * len(id_and_scheduler_list)
         for i, scheduler in id_and_scheduler_list:
             task_ids = scheduler.schedule(strict_allowed_task_type={task_type})
@@ -964,6 +976,7 @@ def chitu_run_main_rank():
             payload_type=SerializedPackedTasksPayloadType.Empty,
         )
     backend_payload_type = Backend.executor.step(tasks)
+    _last_step_task_type = Backend.executor.last_profile_task_type
 
     # 3. Update TaskPool
     task_ids = TaskCollector.get_update_task_ids()
@@ -993,9 +1006,12 @@ def chitu_run_main_rank():
 def chitu_run():
     rank = torch.distributed.get_rank()
     try:
+        global _last_step_task_type
         check_alloc_retries()
         if rank != 0:
-            return Backend.executor.step(None)
+            payload_type = Backend.executor.step(None)
+            _last_step_task_type = Backend.executor.last_profile_task_type
+            return payload_type
         return chitu_run_main_rank()
     except Exception as e:
         # Prepend rank ID before the message

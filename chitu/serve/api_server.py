@@ -27,10 +27,15 @@ from chitu.backend import Backend
 from chitu.dp_request_router import get_request_router
 from chitu.dp_token_router import get_token_router
 from chitu.global_vars import get_global_args, set_global_args
+from chitu.profiler import MemoryRecorder
 from chitu.task import RouterRequest, Task, TaskPool, UserRequest, SampleParams
 from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
 from chitu.serve.common import (
+    get_profile_output_root,
+    queue_mem_dump,
+    queue_profile_start,
+    queue_profile_stop,
     set_min_batch_size,
     get_priority_from_api_key,
     submit_request,
@@ -142,6 +147,17 @@ class TokenizeRequest(BaseModel):
 
 class DetokenizeRequest(BaseModel):
     tokens: list[int]
+
+
+class ProfileRequest(BaseModel):
+    output_dir: str = "trace/chitu"
+    activities: Optional[list[str]] = None
+    start_step: int = Field(default=0, ge=0)
+    num_steps: int = Field(default=10, ge=1)
+    with_stack: bool = False
+    profile_by_stage: bool = False
+    profile_memory: bool = False
+    memory_max_entries: int = Field(default=100000, ge=1)
 
 
 def build_user_request(req: ChatRequest, priority: int = 1) -> UserRequest:
@@ -331,6 +347,72 @@ async def get_chitu_ping():
 @app.post("/health")
 async def health():
     pass  # TODO Check the inference service
+
+
+@app.post("/profile/start")
+async def start_profile(request: ProfileRequest):
+    try:
+        output_dir = queue_profile_start(
+            output_dir=request.output_dir,
+            activities=request.activities,
+            start_step=request.start_step,
+            num_steps=request.num_steps,
+            with_stack=request.with_stack,
+            profile_by_stage=request.profile_by_stage,
+            profile_memory=request.profile_memory,
+            memory_max_entries=request.memory_max_entries,
+        )
+    except Exception as e:
+        logger.exception("Failed to queue profiler start request")
+        raise HTTPException(status_code=500, detail=f"Failed to start profiler: {e}")
+
+    return {
+        "message": "Profiler start queued",
+        "output_dir": output_dir,
+        "requested_output_dir": request.output_dir,
+        "resolved_output_dir": output_dir,
+        "runtime_cwd": os.getcwd(),
+        "output_root": get_profile_output_root(),
+        "activities": request.activities,
+        "start_step": request.start_step,
+        "num_steps": request.num_steps,
+        "with_stack": request.with_stack,
+        "profile_by_stage": request.profile_by_stage,
+        "memory_max_entries": request.memory_max_entries,
+    }
+
+
+@app.post("/profile/stop")
+async def stop_profile():
+    try:
+        queue_profile_stop()
+    except Exception as e:
+        logger.exception("Failed to queue profiler stop request")
+        raise HTTPException(status_code=500, detail=f"Failed to stop profiler: {e}")
+
+    return {
+        "message": "Profiler stop queued",
+        "runtime_cwd": os.getcwd(),
+    }
+
+
+@app.post("/profile/dump_memory")
+async def dump_memory():
+    """Queue a dump_memory command for all ranks."""
+    rec = MemoryRecorder.get()
+    if not rec.enabled and not rec.recording:
+        raise HTTPException(
+            status_code=400,
+            detail="Memory recording is not active "
+            "(set CHITU_MEM_TRACK=1 or start a MEM profile)",
+        )
+
+    queue_mem_dump()
+
+    return {
+        "message": "dump_memory command queued (rank 0 applies immediately, "
+        "others receive via ZMQ during next inference step)",
+    }
 
 
 @app.post("/tokenize")

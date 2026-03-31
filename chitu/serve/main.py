@@ -17,6 +17,7 @@ import torch.distributed
 
 import chitu.serve.api_server as api_server
 from chitu.chitu_main import chitu_init, warmup_engine
+from chitu.profiler import MemoryRecorder
 from chitu.schemas import ServeConfig
 from chitu.serve.api_server import init_dp_router, start_uvicorn
 from chitu.serve.common import start_worker
@@ -48,12 +49,19 @@ def main(args: ServeConfig):
         init_dp_scheduler(args, rank)
 
     else:
-        # chitu_init will handle setting global args
+        checkpoint = MemoryRecorder.checkpoint
+        checkpoint("before chitu_init")
         chitu_init(args)
+        checkpoint("after chitu_init (model loaded)")
+        rec = MemoryRecorder.get()
+        rec.install_oom_hook(rec.snapshot_dir)
+
         torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
         rank = torch.distributed.get_rank()
 
+        checkpoint("before warmup_engine")
         warmup_engine(args)
+        checkpoint("after warmup_engine")
         if rank == 0:
             uvicorn_thread = Thread(target=start_uvicorn, args=(args,))
             uvicorn_thread.start()
