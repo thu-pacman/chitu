@@ -17,10 +17,10 @@ def hadamard_transform(
     x: torch.Tensor, scale: float, impl: str = "auto"
 ) -> torch.Tensor:
     if impl == "auto":
-        if has_scipy:
-            impl = "scipy"
-        elif has_fast_hadamard_transform:
+        if has_fast_hadamard_transform:
             impl = "fast_hadamard_transform"
+        elif has_scipy:
+            impl = "scipy"
         else:
             raise NotImplementedError(
                 "Please install either scipy or fast_hadamard_transform"
