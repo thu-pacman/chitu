@@ -218,6 +218,8 @@ class UserRequest:
         self.num_output_tokens = 0
         self.will_finish = False
         self.finished = False
+        # Diffusion LLM: one increment per `ModelRunner` forward (prefill + decode steps)
+        self.dllm_forward_count = 0
 
         # test information related
         self._test_flag = False

@@ -114,7 +114,7 @@ class TransformerLLaDA(nn.Module):
         ## hard code here
         self.max_length = 2048
         self.aligned_lengths = [32, 64, 96, 128]
-        self.supported_batch_sizes = [1,2,4,8,16]
+        self.supported_batch_sizes = [1,2,4,8,16,32]
         self.device = torch.device("cuda")
         ## need to add more decoder here, store this option in config (llada.yaml)
         self.decoder = ThresholdParallelDecoder(temperature=0, threshold=0.9, mask_id=156895, eos_id=156892)

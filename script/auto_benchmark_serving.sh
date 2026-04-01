@@ -22,9 +22,8 @@ SERVER_LOG_FILE="chitu_run.log"
 MODEL_NAME="LLaDA2.0-mini"
 
 run_server(){
-    SERVE_JOB_NAME="run_serve_tp8" # Changed to a unique name for TP=2 run
     SLURM_PARTITION=long
-    NUM_GPUS=8                # 用2张卡跑TP=2
+    NUM_GPUS=4                # 用2张卡跑TP=2
     CPUS_PER_GPU=24
     MEM_PER_GPU=142144
 
@@ -40,6 +39,7 @@ run_server(){
         --nodes=1 \
         --ntasks=1 \
         -N 1 \
+        --time=30:00 \
         bash -c "
         echo \"SLURM_STEP_GPUS: \$SLURM_STEP_GPUS\"
         echo \"CUDA_VISIBLE_DEVICES: \$CUDA_VISIBLE_DEVICES\"
@@ -48,16 +48,16 @@ run_server(){
         HYDRA_FULL_ERROR=1 \
         torchrun \
             --nnodes=\$NUM_NODES \
-            --nproc_per_node=8 \
+            --nproc_per_node=4 \
             -m chitu \
             serve.port=21002 \
             infer.pp_size=1 \
-            infer.tp_size=8 \
+            infer.tp_size=4 \
             infer.cache_type=paged \
             models=LLaDA2.0-mini \
             models.ckpt_dir=/data/nfs/LLaDA2.1-mini \
             infer.use_cuda_graph=True \
-            infer.max_reqs=256 \
+            infer.max_reqs=16 \
             infer.max_seq_len=2048 \
             request.max_new_tokens=1200
         "
@@ -67,7 +67,7 @@ run_benchmark(){
     local host_name=$1
     local temp_file=$(mktemp)
     # for bsz in 1 2 4 8 16 32 64 128 256
-    for bsz in 16
+    for bsz in 64
     do
         python benchmarks/benchmark_serving.py \
             --batch-size $bsz \

@@ -915,7 +915,7 @@ class Executor:
             dtype=torch.long,
         )
 
-    def _prepare_blocks_for_decode_dllm(self, tasks: PackedTasks) -> torch.Tensor:
+    def _prepare_blocks_for_decode_dllm(self, tasks: PackedTasks):
         """Prepare payload as concatenated blocks for DLLM decode. Each task's next_block is [block_length] tokens."""
         blocks = []
         for task in tasks.tasks:
@@ -1313,9 +1313,11 @@ class Executor:
     def prefill_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         t_step_start = time.perf_counter()
         is_empty_step = tasks.num_tasks == 0
-        logger.info(f"{tasks.task_ids=}")
-        logger.info(f"{tasks.tokens=}")
-        
+        num_tokens = tasks.num_tokens
+        if self.rank == 0:
+            logger.info(f"{tasks.task_ids=}")
+            logger.info(f"{tasks.tokens=}")
+
         # Backend.model.model is ModelRunner; ModelRunner.model is the actual LLaDA model
         inner_model = Backend.model.model.model
         num_layers = inner_model.config.num_hidden_layers
@@ -1331,16 +1333,18 @@ class Executor:
                     ((non_mask_number) // block_length) * block_length, 1024
                 )
                 prefilling_lengths.append(decoding_start)
-            logger.info(f"{prefilling_lengths=}")
+            if self.rank == 0:
+                logger.info(f"{prefilling_lengths=}")
 
             t0 = time.perf_counter()
             for mgr in Backend.cache_managers.values():
                 mgr.prepare_cache_prefill(tasks.req_ids, prefilling_lengths)
             PrometheusMetricsCollector.update_kvcache_usage()
             t_prepare = time.perf_counter() - t0
-            logger.info(f"[DLLM_PROFILE] prefill prepare_cache: {t_prepare*1000:.2f}ms")
-
-            num_tokens = tasks.num_tokens
+            if self.rank == 0:
+                logger.info(
+                    f"[DLLM_PROFILE] prefill prepare_cache: {t_prepare*1000:.2f}ms",
+                )
 
             if (self.rank == 0 and num_tokens > 0) or (
                 self.dp_size > 1 and self.pp_stage == 0
@@ -1359,16 +1363,19 @@ class Executor:
 
             for dispatcher in self.task_dispatchers:
                 payload = dispatcher.recv_payload(payload)
-            logger.info(f"[RANK {self.rank}] recieved payload.")
+            if self.rank == 0:
+                logger.info("prefill_dllm: received payload.")
         else:
             for dispatcher in self.task_dispatchers:
                 payload = dispatcher.recv_payload(self.dummy_logits)
 
-        logger.info(f"payload shape: {payload.shape}")
+        if self.rank == 0:
+            logger.info(f"payload shape: {payload.shape}")
         from dinfer import TokenArray
 
         token_array = TokenArray(payload, num_tokens, mask_id=Backend.model.decoder.mask_id, eos_id=Backend.model.decoder.eos_id, device=self.device, offset=[len(t) for t in tasks.tokens])
-        logger.info(f"token_array shape: {token_array.data.shape}")
+        if self.rank == 0:
+            logger.info(f"token_array shape: {token_array.data.shape}")
 
         # Only main rank (rank 0) updates task.decoding_start; worker ranks have PackedTasksBase
         if (
@@ -1379,7 +1386,8 @@ class Executor:
             for it, task in enumerate(tasks.tasks):
                 task.decoding_start = prefilling_lengths[it] + task.consumed_req_tokens
         max_prefilling_length = max(prefilling_lengths) if prefilling_lengths else 0
-        logger.info(f"max_prefilling_length: {max_prefilling_length}")
+        if self.rank == 0:
+            logger.info(f"max_prefilling_length: {max_prefilling_length}")
         if is_empty_step or max_prefilling_length == 0:
             for mgr in Backend.cache_managers.values():
                 mgr.finalize_cache_all_prefill()
@@ -1412,7 +1420,10 @@ class Executor:
         )
         torch.cuda.synchronize()
         t_forward = time.perf_counter() - t0
-        logger.info(f"[DLLM_PROFILE] prefill forward: {t_forward*1000:.2f}ms (seq_len={max_prefilling_length})")
+        if self.rank == 0:
+            logger.info(
+                f"[DLLM_PROFILE] prefill forward: {t_forward*1000:.2f}ms (seq_len={max_prefilling_length})",
+            )
 
         t0 = time.perf_counter()
         # 与 generate_uniform.dynamic_batching_generate 预填一致：stack → (L,2,B,H,S,D)
@@ -1420,7 +1431,8 @@ class Executor:
         prefilling_kv = torch.stack(output.past_key_values, dim=0).reshape(
             num_layers, 2, *inner_shape
         )
-        logger.info(f"prefilling_kv shape: {tuple(prefilling_kv.shape)}")
+        if self.rank == 0:
+            logger.info(f"prefilling_kv shape: {tuple(prefilling_kv.shape)}")
 
         total_prefill_tokens = sum(prefilling_lengths)
         if total_prefill_tokens > 0:
@@ -1428,8 +1440,9 @@ class Executor:
             seq_len_delta = cache_manager.seq_len_delta
             delta_position_ids = seq_len_delta.delta_position_ids_tensor_device
             delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
-            logger.info(f"delta_position_ids: {delta_position_ids=}")
-            logger.info(f"delta_seq_ids: {delta_seq_ids=}")
+            if self.rank == 0:
+                logger.info(f"delta_position_ids: {delta_position_ids=}")
+                logger.info(f"delta_seq_ids: {delta_seq_ids=}")
             for layer_id in range(num_layers):
                 try:
                     accessor = cache_manager.get_accessor(layer_id)
@@ -1461,13 +1474,14 @@ class Executor:
                 mgr.finalize_cache_all_prefill()
         torch.cuda.synchronize()
         t_kv_write = time.perf_counter() - t0
-        logger.info(
-            f"[DLLM_PROFILE] prefill kv_write: {t_kv_write*1000:.2f}ms "
-            f"(layers={num_layers}, tokens={total_prefill_tokens})"
-        )
-        logger.info(
-            f"[DLLM_PROFILE] prefill total: {(time.perf_counter()-t_step_start)*1000:.2f}ms"
-        )
+        if self.rank == 0:
+            logger.info(
+                f"[DLLM_PROFILE] prefill kv_write: {t_kv_write*1000:.2f}ms "
+                f"(layers={num_layers}, tokens={total_prefill_tokens})",
+            )
+            logger.info(
+                f"[DLLM_PROFILE] prefill total: {(time.perf_counter()-t_step_start)*1000:.2f}ms",
+            )
 
         logits = output.logits
         batch_size_ret = tasks.num_tasks
@@ -1503,9 +1517,30 @@ class Executor:
         eos_id = decoder.eos_id
 
         batch_size = tasks.num_tasks
-        _dllm_split_prof = _env_flag("CHITU_DLLM_STEP_PROFILE")
-        prof_tp_bcast_decoding_ms = 0.0
-        prof_tp_payload_chain_ms = 0.0
+        if self.rank == 0:
+            logger.info(
+                "[DLLM_PROFILE] decode: batch_size=%s block_length=%s",
+                batch_size,
+                block_length,
+            )
+
+        def _dllm_decode_seg_end(
+            seg_name: str,
+            seg_start: float,
+            segments_out: dict[str, float],
+            *,
+            sync_cuda: bool = True,
+        ) -> float:
+            if sync_cuda:
+                torch.cuda.synchronize()
+            now = time.perf_counter()
+            segments_out[seg_name] = (now - seg_start) * 1000.0
+            return now
+
+        # 连续分段（秒→毫秒写入 segments_out），与 [DLLM_PROFILE] decode total 对齐后可对账：
+        # total ≈ sum(segments)；gap 多为未单独拆开的 CPU/Python 或极少异步未同步部分。
+        _dllm_seg: dict[str, float] = {}
+        _mark = t_step_start
 
         # 1) Get decoding_start_list: main rank from tasks, worker ranks via broadcast
         if self.tp_size > 1:
@@ -1519,17 +1554,11 @@ class Executor:
                 decoding_start_t = torch.empty(
                     batch_size, device=self.device, dtype=torch.long
                 )
-            if _dllm_split_prof:
-                torch.cuda.synchronize()
-                _t_tp_ds = time.perf_counter()
             torch.distributed.broadcast(
                 decoding_start_t,
                 src=tp_group.rank_list[0],
                 group=tp_group.gpu_group,
             )
-            if _dllm_split_prof:
-                torch.cuda.synchronize()
-                prof_tp_bcast_decoding_ms = (time.perf_counter() - _t_tp_ds) * 1000
             decoding_start_list = decoding_start_t.cpu().tolist()
         else:
             decoding_start_list = [
@@ -1540,7 +1569,6 @@ class Executor:
             )
 
         # 2) Prepare payload: main rank from tasks, workers receive via broadcast
-        logger.info(f"decode task ids: {tasks.task_ids=}")
         if (
             self.is_main_rank
             or (self.dp_size > 1 and self.dp_dispatcher is not None)
@@ -1552,17 +1580,12 @@ class Executor:
                 dtype=torch.long,
                 device=self.device,
             )
-        if _dllm_split_prof:
-            torch.cuda.synchronize()
-            _t_tp_pl = time.perf_counter()
         for dispatcher in self.task_dispatchers:
             payload = dispatcher.recv_payload(payload)
-        if _dllm_split_prof:
-            torch.cuda.synchronize()
-            prof_tp_payload_chain_ms = (time.perf_counter() - _t_tp_pl) * 1000
+
+        _mark = _dllm_decode_seg_end("bootstrap_payload", _mark, _dllm_seg)
 
         # 3) Prepare cache for DLLM (reserve blocks for decoding_start + block_length)
-        t0 = time.perf_counter()
         self._kv_hook.before_decode_step(tasks.req_ids)
         for mgr in Backend.cache_managers.values():
             if hasattr(mgr, "prepare_cache_decode_dllm"):
@@ -1571,11 +1594,18 @@ class Executor:
                 )
         logger.debug(f"{payload=}{payload.shape=}")
         PrometheusMetricsCollector.update_kvcache_usage()
-        t_prepare = time.perf_counter() - t0
-        logger.info(f"[DLLM_PROFILE] decode prepare_cache: {t_prepare*1000:.2f}ms")
+        _mark = _dllm_decode_seg_end("prepare_cache_decode", _mark, _dllm_seg)
+
+        
+        _kv_bridge_detail = os.environ.get("CHITU_DLLM_KV_BRIDGE_PROFILE", "1") == "1"
+        kv_read_index_ms = 0.0
+        kv_read_chitu_paged_ms = 0.0
+        kv_read_iface_dense_ms = 0.0
+        kv_read_stack_ms = 0.0
+        kv_write_iface_ms = 0.0
+        kv_write_chitu_append_ms = 0.0
 
         # 4) Read past_key_values from Chitu paged cache
-        t0 = time.perf_counter()
         inner_model = Backend.model.model.model
         num_layers = inner_model.config.num_hidden_layers
         cache_manager = Backend.cache_managers["main"]
@@ -1586,11 +1616,17 @@ class Executor:
         num_kv_heads = int(_kv_per_token[0])
         head_dim = int(_kv_per_token[1])
 
-        current_cache_length = max(decoding_start_list) + block_length
-        def align_exp2(x):
+        def align_exp2(x: int) -> int:
             return 1 << (x - 1).bit_length() if x > 0 else 1
 
-        current_cache_length = max(128, align_exp2(current_cache_length))
+        # 与 dinfer ModelRunner.CudaGraphRunner 捕获的 cache_length 一致（128,256,512,...）；
+        # 否则 can_run 失败会一直走 forward_normal，CUDA Graph / torch.compile 预热路径都白做。
+        need_len = max(decoding_start_list) + block_length
+        current_cache_length = max(128, align_exp2(need_len))
+
+        if _kv_bridge_detail:
+            torch.cuda.synchronize()
+            _kv_idx_t0 = time.perf_counter()
 
         pos_list, seq_list = [], []
         for i, ds in enumerate(decoding_start_list):
@@ -1605,6 +1641,10 @@ class Executor:
             position_ids = torch.tensor(pos_list, device=self.device, dtype=torch.long)
             seq_ids = torch.tensor(seq_list, device=self.device, dtype=torch.long)
 
+            if _kv_bridge_detail:
+                torch.cuda.synchronize()
+                kv_read_index_ms += (time.perf_counter() - _kv_idx_t0) * 1000.0
+
             past_k_list = []
             past_v_list = []
             for layer_id in range(num_layers):
@@ -1614,22 +1654,36 @@ class Executor:
                     continue
                 for kv_name in ["k", "v"]:
                     kv_cache = accessor.kv[kv_name]
+                    if _kv_bridge_detail:
+                        torch.cuda.synchronize()
+                        _t_chitu_r0 = time.perf_counter()
                     ragged = read_from_paged_kv_cache(
                         kv_cache,
                         block_table,
                         position_ids,
                         seq_ids,
                     )
+                    if _kv_bridge_detail:
+                        torch.cuda.synchronize()
+                        kv_read_chitu_paged_ms += (time.perf_counter() - _t_chitu_r0) * 1000.0
+                        torch.cuda.synchronize()
+                        _t_iface_d0 = time.perf_counter()
                     shape = (batch_size, current_cache_length, num_kv_heads, head_dim)
                     dense = torch.zeros(shape, dtype=ragged.dtype, device=self.device)
                     # 向量化 scatter；避免按 token 的 Python 循环（20 层×2×decode_start 可达上万次小 kernel）
                     dense[seq_ids, position_ids, :, :] = ragged
                     dense = dense.permute(0, 2, 1, 3)
+                    if _kv_bridge_detail:
+                        torch.cuda.synchronize()
+                        kv_read_iface_dense_ms += (time.perf_counter() - _t_iface_d0) * 1000.0
                     if kv_name == "k":
                         past_k_list.append(dense)
                     else:
                         past_v_list.append(dense)
 
+            if _kv_bridge_detail:
+                torch.cuda.synchronize()
+                _t_stack0 = time.perf_counter()
             past_key_values = torch.stack(
                 [
                     torch.stack([past_k_list[i], past_v_list[i]], dim=0)
@@ -1637,34 +1691,34 @@ class Executor:
                 ],
                 dim=0,
             )
-            logger.info(f"past_key_values shape: {past_key_values.shape}")
+            if _kv_bridge_detail:
+                torch.cuda.synchronize()
+                kv_read_stack_ms += (time.perf_counter() - _t_stack0) * 1000.0
+            if self.rank == 0:
+                logger.info(f"past_key_values shape: {past_key_values.shape}")
         else:
             past_key_values = None
-        torch.cuda.synchronize()
-        t_kv_read = time.perf_counter() - t0
-        logger.info(
-            f"[DLLM_PROFILE] decode kv_read: {t_kv_read*1000:.2f}ms "
-            f"(layers={num_layers}, n_local_kv_heads={num_kv_heads}, "
-            f"read_tokens={total_read_tokens}, cache_len={current_cache_length})"
-        )
+            if _kv_bridge_detail:
+                torch.cuda.synchronize()
+                kv_read_index_ms += (time.perf_counter() - _kv_idx_t0) * 1000.0
+        _mark = _dllm_decode_seg_end("kv_read_paged_to_dense", _mark, _dllm_seg)
 
         # 5) Reshape payload to [batch, block_length] and build position_ids
         decoding_block = payload.view(batch_size, block_length)
         decoding_start_t = torch.tensor(
             decoding_start_list, device=self.device, dtype=torch.long
         )
-        logger.info(f"decoding_start_t: {decoding_start_t=}")
+        if self.rank == 0:
+            logger.info(f"decoding_start_t: {decoding_start_t=}")
         decoding_pos_ids = (
             torch.arange(block_length, device=self.device, dtype=torch.long)
             .unsqueeze(0)
             .expand(batch_size, -1)
             + decoding_start_t.unsqueeze(1)
         )
+        _mark = _dllm_decode_seg_end("decode_tensor_prep", _mark, _dllm_seg)
 
         # 6) Model forward（TP 下各层 allreduce/allgather 等 NCCL 绝大部分落在此段时间内）
-        t0 = time.perf_counter()
-        torch.cuda.synchronize()
-        logger.info(f"decoding_block: {decoding_block=}")
         prof = None
         run_torch_prof = self._dllm_torch_prof_steps > 0
         if run_torch_prof:
@@ -1697,21 +1751,17 @@ class Executor:
                     f"dllm_decode_rank{self.rank}_{time.time_ns()}.json",
                 )
                 prof.export_chrome_trace(trace_path)
-                logger.warning(
-                    "[DLLM_TORCH_PROF] Chrome trace -> %s "
-                    "(chrome://tracing 或 edge://tracing 打开；CUDA 区搜 nccl、all_reduce)",
-                    trace_path,
-                )
-        torch.cuda.synchronize()
-        t_forward = time.perf_counter() - t0
-        logger.info(
-            f"[DLLM_PROFILE] decode forward: {t_forward*1000:.2f}ms "
-            f"(batch={batch_size}, block_len={block_length}, "
-            f"cache_len={current_cache_length})"
-        )
+                if self.rank == 0:
+                    logger.warning(
+                        "[DLLM_TORCH_PROF] Chrome trace -> %s "
+                        "(chrome://tracing 或 edge://tracing 打开；CUDA 区搜 nccl、all_reduce)",
+                        trace_path,
+                    )
+        _mark = _dllm_decode_seg_end("forward_model_runner", _mark, _dllm_seg)
 
         logits = output.logits
-        logger.debug(f"{logits=}{logits.shape=}")
+        if self.rank == 0:
+            logger.debug(f"{logits=}{logits.shape=}")
         # CUDA Graph replay 会把 batch  pad 到 supported_batch_sizes（如 3→4、5→8），
         # logits 第一维为 padded_bs，而 x_data 为真实 batch_size；不截断会导致
         # batch_decode / torch.compile 里 mask_index 与 argmax(logits) 维数不一致（s31 vs s38）。
@@ -1719,15 +1769,16 @@ class Executor:
             logits = logits[:batch_size, ...]
 
         # 7) batch_decode: update block in token array (broadcast_if_needed syncs from rank 0)
-        t0 = time.perf_counter()
         total_len = max(decoding_start_list) + block_length
         x_data = torch.full(
             (batch_size, total_len), mask_id, dtype=torch.long, device=self.device
         )
-        for i in range(batch_size):
-            x_data[i, decoding_start_list[i] : decoding_start_list[i] + block_length] = (
-                decoding_block[i]
-            )
+
+        batch_idx = torch.arange(batch_size, device=x_data.device).unsqueeze(1)  # (batch_size, 1)
+        start_idx = torch.tensor(decoding_start_list, device=x_data.device).unsqueeze(1)  # (batch_size, 1)
+        block_offset = torch.arange(block_length, device=x_data.device).unsqueeze(0)  # (1, block_length)
+        col_idx = start_idx + block_offset  # (batch_size, block_length)
+        x_data[batch_idx.expand(-1, block_length), col_idx] = decoding_block
 
         class TokenArrayLike:
             def __init__(self, data):
@@ -1737,9 +1788,7 @@ class Executor:
         decoder.batch_decode(
             logits, decoding_start_t, x, block_length
         )
-        torch.cuda.synchronize()
-        t_batch_decode = time.perf_counter() - t0
-        logger.info(f"[DLLM_PROFILE] decode batch_decode: {t_batch_decode*1000:.2f}ms")
+        _mark = _dllm_decode_seg_end("batch_decode", _mark, _dllm_seg)
 
         # 8) block_finished: no mask left in block
         decoded_block = x.data[
@@ -1747,18 +1796,24 @@ class Executor:
             decoding_start_t.unsqueeze(1)
             + torch.arange(block_length, device=self.device).unsqueeze(0),
         ]
-        logger.info(f"decoded_block: {decoded_block=}")
+
         block_finished = (decoded_block == mask_id).sum(dim=1) == 0
         block_finished_list = block_finished.cpu().tolist()
+        _mark = _dllm_decode_seg_end("block_finished_meta", _mark, _dllm_seg)
 
         # 9) Write back KV to Chitu cache for block_finished (each rank updates its own shard)
-        t0 = time.perf_counter()
         if block_finished.any() and block_table is not None:
             # 与 generate_uniform.dynamic_batching_generate 解码写回一致；[:, :, :batch_size] 对齐图捕获时的 padding batch
+            if _kv_bridge_detail:
+                torch.cuda.synchronize()
+                _tw_stack0 = time.perf_counter()
             inner_shape = output.past_key_values[0].shape
             decoding_kv = torch.stack(output.past_key_values, dim=0).reshape(
                 num_layers, 2, *inner_shape
             )[:, :, :batch_size, :, -block_length:, :]
+            if _kv_bridge_detail:
+                torch.cuda.synchronize()
+                kv_write_iface_ms += (time.perf_counter() - _tw_stack0) * 1000.0
             for layer_id in range(num_layers):
                 try:
                     accessor = cache_manager.get_accessor(layer_id)
@@ -1769,6 +1824,9 @@ class Executor:
                     finished_kv = layer_kv[block_finished]
                     if finished_kv.shape[0] == 0:
                         continue
+                    if _kv_bridge_detail:
+                        torch.cuda.synchronize()
+                        _tw_i0 = time.perf_counter()
                     delta_pos_list = []
                     delta_seq_list = []
                     for fidx in block_finished.nonzero(as_tuple=True)[0]:
@@ -1787,6 +1845,11 @@ class Executor:
                     delta_seq_ids = torch.tensor(
                         delta_seq_list, device=self.device, dtype=torch.long
                     )
+                    if _kv_bridge_detail:
+                        torch.cuda.synchronize()
+                        kv_write_iface_ms += (time.perf_counter() - _tw_i0) * 1000.0
+                        torch.cuda.synchronize()
+                        _tw_a0 = time.perf_counter()
                     append_to_paged_kv_cache(
                         accessor.kv[kv_name],
                         block_table,
@@ -1794,12 +1857,10 @@ class Executor:
                         delta_position_ids,
                         delta_seq_ids,
                     )
-        torch.cuda.synchronize()
-        t_kv_write = time.perf_counter() - t0
-        logger.info(
-            f"[DLLM_PROFILE] decode kv_write: {t_kv_write*1000:.2f}ms "
-            f"(block_finished={sum(block_finished_list)}/{batch_size})"
-        )
+                    if _kv_bridge_detail:
+                        torch.cuda.synchronize()
+                        kv_write_chitu_append_ms += (time.perf_counter() - _tw_a0) * 1000.0
+        _mark = _dllm_decode_seg_end("kv_write_paged", _mark, _dllm_seg)
 
         # 10) Finalize cache: update req_id_to_seq_len for finished blocks
         for mgr in Backend.cache_managers.values():
@@ -1807,30 +1868,7 @@ class Executor:
                 mgr.finalize_cache_single_decode_dllm(
                     tasks.req_ids, block_finished_list, block_length
                 )
-
-        logger.info(
-            f"[DLLM_PROFILE] decode total: {(time.perf_counter()-t_step_start)*1000:.2f}ms"
-        )
-        if _dllm_split_prof:
-            exposed_comm = prof_tp_bcast_decoding_ms + prof_tp_payload_chain_ms
-            logger.info(
-                "[DLLM_PROFILE_SPLIT] rank=%s tp_size=%s batch=%s | "
-                "exposed_comm_ms(tp_bcast_decoding_start=%.3f + dispatcher_payload=%.3f)=%.3f | "
-                "local_kv_read_ms=%.3f | forward_ms(mixed: dense_math + intra_forward_NCCL)=%.3f | "
-                "batch_decode_ms=%.3f | kv_write_ms=%.3f | "
-                "若 tp>>1 时 forward_ms 很大且 exposed_comm 很小，通常说明瓶颈在层内通信；"
-                "可设 CHITU_DLLM_TORCH_PROFILER_STEPS=1 导出 trace 看 nccl 占比。",
-                self.rank,
-                self.tp_size,
-                batch_size,
-                prof_tp_bcast_decoding_ms,
-                prof_tp_payload_chain_ms,
-                exposed_comm,
-                t_kv_read * 1000,
-                t_forward * 1000,
-                t_batch_decode * 1000,
-                t_kv_write * 1000,
-            )
+        _mark = _dllm_decode_seg_end("finalize_cache_dllm", _mark, _dllm_seg)
 
         # 11) Update task state (main rank only): next_block, decoding_start; for block_finished
         #     create PackedTasks with tokens+output. Worker ranks have PackedTasksBase, skip.
@@ -1877,6 +1915,69 @@ class Executor:
         for dispatcher in self.task_dispatchers:
             dispatcher.send_payload(logits[:, -1, :], tasks)
 
+        _dllm_decode_seg_end("task_update_and_send", _mark, _dllm_seg)
+        if self.rank == 0:
+            _ordered_dllm_segs = (
+                "bootstrap_payload",
+                "prepare_cache_decode",
+                "kv_read_paged_to_dense",
+                "decode_tensor_prep",
+                "forward_model_runner",
+                "batch_decode",
+                "block_finished_meta",
+                "kv_write_paged",
+                "finalize_cache_dllm",
+                "task_update_and_send",
+            )
+            _seg_parts = [
+                f"{k}={_dllm_seg[k]:.2f}ms"
+                for k in _ordered_dllm_segs
+                if k in _dllm_seg
+            ]
+            _sum_ms = sum(_dllm_seg.values())
+            _total_ms = (time.perf_counter() - t_step_start) * 1000.0
+            _gap_ms = _total_ms - _sum_ms
+            logger.info(
+                "[DLLM_PROFILE] decode segments batch=%s block_length=%s: %s | "
+                "sum=%.2fms total=%.2fms gap=%.2fms "
+                "(layers=%s cache_len=%s read_tokens=%s block_finished=%s/%s)",
+                batch_size,
+                block_length,
+                " ".join(_seg_parts),
+                _sum_ms,
+                _total_ms,
+                _gap_ms,
+                num_layers,
+                current_cache_length,
+                total_read_tokens,
+                sum(block_finished_list),
+                batch_size,
+            )
+            if _kv_bridge_detail:
+                _iface_excl_chitu = (
+                    kv_read_index_ms
+                    + kv_read_iface_dense_ms
+                    + kv_read_stack_ms
+                    + kv_write_iface_ms
+                )
+                _chitu_kv_io = kv_read_chitu_paged_ms + kv_write_chitu_append_ms
+                logger.info(
+                    "[DLLM_PROFILE] decode kv_bridge batch=%s block_len=%s | "
+                    "chitu_paged_read=%.2fms chitu_append=%.2fms (chitu_kv_io=%.2fms) | "
+                    "iface_index_pos_blocktable=%.2fms iface_dense_zeros_scatter=%.2fms "
+                    "iface_stack_past=%.2fms iface_write_stack_slice_delta=%.2fms "
+                    "(iface_align_total=%.2fms, 即除 read/append 外为接 dInfer 的转换)",
+                    batch_size,
+                    block_length,
+                    kv_read_chitu_paged_ms,
+                    kv_write_chitu_append_ms,
+                    _chitu_kv_io,
+                    kv_read_index_ms,
+                    kv_read_iface_dense_ms,
+                    kv_read_stack_ms,
+                    kv_write_iface_ms,
+                    _iface_excl_chitu,
+                )
         # Return logits for compatibility (DLLM does not sample per-step; last pos logits)
         return logits[:, -1, :]
 
