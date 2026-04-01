@@ -68,12 +68,14 @@ from chitu.metrics import (
 from chitu.distributed.comm_group import SingletonGroupPlaceholder
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
 from chitu.kv_cache.utils import (
-    get_additional_block_num_from_current,
     plan_kv_cache_blocks_after_warmup,
     reduce_num_block_plan_across_ranks,
     estimate_indexer_blocks_from_main,
     solve_main_target_after_shrink,
+    solve_main_target_from_current,
+    cleanup_cuda_if_needed,
     allreduce_min_int,
+    clamp_int,
 )
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
@@ -159,24 +161,20 @@ def _auto_set_num_blocks_after_warmup(args):
                 int(target_blocks),
             )
 
-    if get_global_args().infer.op_impl != "cpu":
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+    cleanup_cuda_if_needed()
 
     main_cm = paged_caches["main"]
+    indexer_cm = paged_caches.get("indexer")
+
     main_current = int(main_cm.num_blocks)
     main_cap = int(main_cm.max_num_blocks)
-
-    reserve_bytes = int(512 << 20)  # 512 MiB
+    reserve_bytes = 512 << 20  # 512 MiB
 
     final_main_target = int(main_current)
     final_indexer_target = None
 
-    if "indexer" in paged_caches:
-        indexer_cm = paged_caches["indexer"]
-        solved_main, solved_indexer = solve_main_target_after_shrink(
+    if indexer_cm is not None:
+        solved_main = solve_main_target_after_shrink(
             args=args,
             main_cm=main_cm,
             indexer_cm=indexer_cm,
@@ -184,18 +182,19 @@ def _auto_set_num_blocks_after_warmup(args):
         )
 
         solved_main = allreduce_min_int(int(solved_main))
+        solved_main = clamp_int(solved_main, 0, int(main_cap))
 
-        solved_main = min(max(int(main_current), int(solved_main)), int(main_cap))
-        solved_indexer = estimate_indexer_blocks_from_main(
+        final_indexer_target = estimate_indexer_blocks_from_main(
             main_cm, indexer_cm, int(solved_main)
         )
-        solved_indexer = min(
-            max(0, int(solved_indexer)),
+        final_indexer_target = clamp_int(
+            final_indexer_target,
+            0,
             int(indexer_cm.max_num_blocks),
         )
+        final_indexer_target = allreduce_min_int(int(final_indexer_target))
 
         final_main_target = int(solved_main)
-        final_indexer_target = int(solved_indexer)
 
         logger.info(
             "KV final joint targets: main_current=%d final_main_target=%d final_indexer_target=%d reserve_bytes=%d",
@@ -205,79 +204,88 @@ def _auto_set_num_blocks_after_warmup(args):
             int(reserve_bytes),
         )
     else:
-        additional_main_blocks = int(
-            get_additional_block_num_from_current(
-                main_cm,
-                args.infer.memory_utilization,
-                reserve_bytes=reserve_bytes,
-            )
-        )
-        final_main_target = min(
-            int(main_current) + int(additional_main_blocks), int(main_cap)
-        )
-        final_main_target = max(0, int(final_main_target))
-        final_main_target = allreduce_min_int(int(final_main_target))
-
-    if "indexer" in paged_caches:
-        indexer_cm = paged_caches["indexer"]
-        indexer_current = int(indexer_cm.num_blocks)
-
-        proposed_indexer_target = (
-            int(final_indexer_target)
-            if final_indexer_target is not None
-            else int(indexer_current)
-        )
-        if int(proposed_indexer_target) <= int(indexer_current):
-            proposed_indexer_target = int(indexer_current)
-
-        reduced_indexer_target = allreduce_min_int(int(proposed_indexer_target))
-
-        if int(reduced_indexer_target) > int(indexer_current):
-            indexer_cm.realloc(int(reduced_indexer_target))
-            logger.info(
-                "indexer cache manager reallocated to %d blocks before main growth",
-                int(reduced_indexer_target),
-            )
-
-            if get_global_args().infer.op_impl != "cpu":
-                torch.cuda.synchronize()
-                gc.collect()
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-
-    # after indexer is in place, re-check main safe target from current memory
-    main_current = int(main_cm.num_blocks)
-    reserve_bytes = int(512 << 20)
-
-    safe_additional_main_blocks = int(
-        get_additional_block_num_from_current(
-            main_cm,
-            args.infer.memory_utilization,
+        final_main_target = solve_main_target_from_current(
+            args=args,
+            main_cm=main_cm,
             reserve_bytes=reserve_bytes,
         )
+        final_main_target = allreduce_min_int(int(final_main_target))
+        final_main_target = clamp_int(final_main_target, 0, int(main_cap))
+
+    # If main needs shrink, do it early to release memory before any later growth.
+    main_current = int(main_cm.num_blocks)
+    if int(final_main_target) < int(main_current):
+        main_cm.realloc(int(final_main_target))
+        logger.info(
+            "main cache manager pre-shrunk from %d to %d blocks before final placement",
+            int(main_current),
+            int(final_main_target),
+        )
+        cleanup_cuda_if_needed()
+
+    # Place indexer to the final target if present. Allow both shrink and grow.
+    if indexer_cm is not None:
+        indexer_current = int(indexer_cm.num_blocks)
+        if int(final_indexer_target) != int(indexer_current):
+            indexer_cm.realloc(int(final_indexer_target))
+            logger.info(
+                "indexer cache manager resized from %d to %d blocks before main safe solve",
+                int(indexer_current),
+                int(final_indexer_target),
+            )
+            cleanup_cuda_if_needed()
+
+    # Recheck main safe target from current memory after indexer is in place
+    main_current = int(main_cm.num_blocks)
+    safe_main_target = solve_main_target_from_current(
+        args=args,
+        main_cm=main_cm,
+        reserve_bytes=reserve_bytes,
     )
-    safe_main_target = min(
-        int(main_current) + int(safe_additional_main_blocks),
-        int(final_main_target),
+    safe_main_target = min(int(safe_main_target), int(final_main_target))
+    safe_main_target = clamp_int(
+        safe_main_target,
+        0,
+        int(main_cm.max_num_blocks),
     )
-    safe_main_target = min(int(safe_main_target), int(main_cm.max_num_blocks))
-    safe_main_target = max(0, int(safe_main_target))
     safe_main_target = allreduce_min_int(int(safe_main_target))
 
     logger.info(
-        "KV safe main target before final grow: current=%d final_main_target=%d safe_main_target=%d",
+        "KV safe main target before final resize: current=%d final_main_target=%d safe_main_target=%d",
         int(main_current),
         int(final_main_target),
         int(safe_main_target),
     )
 
-    get_global_args().infer.num_blocks = int(safe_main_target)
+    # Align indexer to the final safe main target
+    if indexer_cm is not None:
+        indexer_current = int(indexer_cm.num_blocks)
+        safe_indexer_target = estimate_indexer_blocks_from_main(
+            main_cm, indexer_cm, int(safe_main_target)
+        )
+        safe_indexer_target = clamp_int(
+            safe_indexer_target,
+            0,
+            int(indexer_cm.max_num_blocks),
+        )
+        safe_indexer_target = allreduce_min_int(int(safe_indexer_target))
 
-    # grow main
-    if int(safe_main_target) > int(main_current):
+        if int(safe_indexer_target) != int(indexer_current):
+            indexer_cm.realloc(int(safe_indexer_target))
+            logger.info(
+                "indexer cache manager resized from %d to %d blocks for safe main target",
+                int(indexer_current),
+                int(safe_indexer_target),
+            )
+            cleanup_cuda_if_needed()
+
+    # Final resize main
+    main_current = int(main_cm.num_blocks)
+    if int(safe_main_target) != int(main_current):
         main_cm.realloc(int(safe_main_target))
         logger.info(
-            "main cache manager reallocated to %d blocks after warmup",
+            "main cache manager resized from %d to %d blocks after warmup",
+            int(main_current),
             int(safe_main_target),
         )
     else:
@@ -286,11 +294,7 @@ def _auto_set_num_blocks_after_warmup(args):
             int(main_current),
         )
 
-    if get_global_args().infer.op_impl != "cpu":
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+    cleanup_cuda_if_needed()
 
     final_main_blocks = int(main_cm.num_blocks)
     final_main_blocks = allreduce_min_int(int(final_main_blocks))
