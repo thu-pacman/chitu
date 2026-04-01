@@ -72,10 +72,14 @@ class AsyncDataStream:
                     not self.tokenizer.force_full_seq_decode
                     and len(self.cache_tokens) > 10
                 ):
-                    logger.info(
-                        f"\\ufffd detected with context: {''.join(self.seqs[-10:]) + s}"
+                    logger.warning_once(
+                        "Tokenzier decoding not succeeded using at least 10 latest tokens. The output is "
+                        "probably ill-formed. This may happen when using random inputs for benchmarking "
+                        "and please try some well-formed inputs (e.g. datasets) instead."
                     )
-                    pass
+                    logger.debug(
+                        f"The tokenzier failure above occurred with tokens: {''.join(self.seqs[-10:]) + s}"
+                    )
                 else:
                     return
             if not self.tokenizer.force_full_seq_decode:
