@@ -110,6 +110,9 @@ infer:
   # `docs/en/DEVELOPMENT.md#parallelism` for details.
   ep_size: 1
 
+  # Number of Tensor Parallel ranks for embed_tokens and lm_head.
+  embed_tokens_lm_head_tp_size: auto
+
   # Random seed
   seed: 0
 

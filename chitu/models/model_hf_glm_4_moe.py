@@ -38,6 +38,8 @@ from chitu.muxi_utils import (
 )
 from chitu.tensor_parallel import ColumnParallelLinear, VocabParallelEmbedding
 from chitu.distributed.partition import compute_expert_dist_in_ep
+from chitu.utils import ceil_div
+from chitu.distributed.parallel_state import get_dp_size
 
 
 class Glm4vVisionEmbeddings(nn.Module):
@@ -369,8 +371,13 @@ class TransformerBlockHFGlm4MoeMTP(TransformerBlockHFGlm4Moe):
         self.enorm = RMSNorm(args.dim, eps=getattr(args, "rms_norm_eps", 1e-6))
         self.hnorm = RMSNorm(args.dim, eps=getattr(args, "rms_norm_eps", 1e-6))
         self.eh_proj = torch.nn.Linear(args.dim * 2, args.dim, bias=False)
-        self.shared_head = SharedHeadDeepSeekV3(args)
-        self.embed_tokens = VocabParallelEmbedding(args.vocab_size, args.dim)
+        self.max_batch_size_per_dp = ceil_div(
+            int(getattr(get_global_args().infer, "max_reqs", 1)), get_dp_size()
+        )
+        self.shared_head = SharedHeadDeepSeekV3(args, self.max_batch_size_per_dp)
+        self.embed_tokens = VocabParallelEmbedding(
+            args.vocab_size, args.dim, decode_max_num_tokens=self.max_batch_size_per_dp
+        )
 
     @override
     def forward(
@@ -555,7 +562,12 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
 
     @override
     def _pre_layers_mtp(self, h, **args):
-        return self.layers[-1].embed_tokens(h)
+        if self.specialize_embed_tokens_lm_head_parallel:
+            return self.layers[-1].embed_tokens(
+                h, self.global_embed_num_tokens, self.embed_tokens_cum_num_tokens
+            )
+        else:
+            return self.layers[-1].embed_tokens(h)
 
     @override
     def _get_prefill_previous_hidden_states(self, h):

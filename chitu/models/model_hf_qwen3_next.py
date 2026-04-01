@@ -42,7 +42,12 @@ from chitu.ops import (
     fused_g,
 )
 from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
-from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear, LocalLinear
+from chitu.tensor_parallel import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    LocalLinear,
+    LmHeadColumnParallelLinear,
+)
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 from chitu.utils import proportion_split
 
@@ -665,9 +670,10 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
 
     def _init_post_layers(self):
         self.norm = Qwen3NextRMSNorm(self.params.dim, eps=self.params.norm_eps)
-        self.lm_head = ColumnParallelLinear(
+        self.lm_head = LmHeadColumnParallelLinear(
             self.params.dim,
             self.params.vocab_size,
+            decode_max_num_tokens=self.max_batch_size_per_dp * self.mtp_size,
             has_bias=False,
             checkpoint_prefix=f"lm_head",
         )
@@ -675,7 +681,12 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
     def _post_layers(self, h):
         """NOTE: _post_layers is assumed to be a token-wise computation"""
         h = self.norm(h)
-        h = self.lm_head(h)
+        if self.specialize_embed_tokens_lm_head_parallel:
+            h = self.lm_head(
+                h, self.global_lm_head_num_tokens, self.lm_head_cum_num_tokens
+            )
+        else:
+            h = self.lm_head(h)
         return h
 
     @override

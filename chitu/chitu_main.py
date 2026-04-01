@@ -841,6 +841,13 @@ def chitu_init(args):
     if args.scheduler.pp_config.pp_micro_batch_size_decode == "auto":
         args.scheduler.pp_config.pp_micro_batch_size_decode = "max"
 
+    if args.infer.embed_tokens_lm_head_tp_size == "auto":
+        args.infer.embed_tokens_lm_head_tp_size = args.infer.tp_size
+    else:
+        assert (
+            args.infer.embed_tokens_lm_head_tp_size.isdigit()
+        ), "embed_tokens_lm_head_tp_size must be auto or an integer"
+
     if args.infer.dp_size > args.infer.max_reqs:
         raise ValueError(
             f"infer.dp_size ({args.infer.dp_size}) cannot be greater than infer.max_reqs ({args.infer.max_reqs})"

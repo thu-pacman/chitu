@@ -22,6 +22,7 @@ _DP_GROUP: Optional[CommGroup] = None
 _ETP_GROUP: Optional[CommGroup] = None
 _EP_GROUP: Optional[CommGroup] = None
 _PP_GROUP: Optional[CommGroup] = None
+_EMBED_TOKENS_LM_HEAD_TP_GROUP: Optional[CommGroup] = None
 
 _PP_PAIR_GROUP_DICT: dict[tuple[int, int], Any] = {}  # Compatible with NPU platforms
 
@@ -54,6 +55,10 @@ def get_ep_group() -> CommGroup:
 
 def get_pp_group() -> CommGroup:
     return get_global_var("_PP_GROUP")
+
+
+def get_embed_tokens_lm_head_tp_group() -> CommGroup:
+    return get_global_var("_EMBED_TOKENS_LM_HEAD_TP_GROUP")
 
 
 def get_tp_size() -> int:
@@ -94,6 +99,14 @@ def get_pp_size() -> int:
     if _PP_GROUP is None:
         return 1
     return _PP_GROUP.group_size
+
+
+def get_embed_tokens_lm_head_tp_size() -> int:
+    """return 1 if not initialized"""
+    global _EMBED_TOKENS_LM_HEAD_TP_GROUP
+    if _EMBED_TOKENS_LM_HEAD_TP_GROUP is None:
+        return 1
+    return _EMBED_TOKENS_LM_HEAD_TP_GROUP.group_size
 
 
 # Order of parallelism (from near to far):
@@ -163,6 +176,15 @@ def get_ep_rank_lists(*, etp_size: int, ep_size: int, world_size: int):
 
 def get_pp_rank_lists(*, pp_size: int, world_size: int):
     return _get_last_level_rank_lists(last_level_size=pp_size, world_size=world_size)
+
+
+def get_embed_tokens_lm_head_tp_rank_lists(
+    *, embed_tokens_lm_head_tp_size: int, world_size: int
+):
+    return _get_first_level_rank_lists(
+        first_level_size=embed_tokens_lm_head_tp_size,
+        world_size=world_size,
+    )
 
 
 def get_pp_pair_group(
@@ -260,8 +282,35 @@ def initialize_ep_group(rank: int, *, etp_size: int, ep_size: int, world_size: i
     )
 
 
+def initialize_embed_tokens_lm_head_tp_group(
+    rank: int,
+    *,
+    tp_size: int,
+    embed_tokens_lm_head_tp_size: int,
+    world_size: int,
+):
+    global _EMBED_TOKENS_LM_HEAD_TP_GROUP
+    assert _EMBED_TOKENS_LM_HEAD_TP_GROUP is None
+    if tp_size > 1:
+        _EMBED_TOKENS_LM_HEAD_TP_GROUP = get_tp_group()
+    else:
+        _EMBED_TOKENS_LM_HEAD_TP_GROUP = CommGroup(
+            get_embed_tokens_lm_head_tp_rank_lists(
+                embed_tokens_lm_head_tp_size=embed_tokens_lm_head_tp_size,
+                world_size=world_size,
+            ),
+            rank,
+        )
+
+
 def initialize_parallel_groups(
-    *, tp_size: int, dp_size: int = 1, etp_size: int = 1, ep_size: int = 1, pp_size: int
+    *,
+    tp_size: int,
+    dp_size: int = 1,
+    etp_size: int = 1,
+    ep_size: int = 1,
+    pp_size: int,
+    embed_tokens_lm_head_tp_size: int = 1,
 ):
     global _PARALLEL_GROUPS_INITIALIZED
     assert not _PARALLEL_GROUPS_INITIALIZED
@@ -277,6 +326,12 @@ def initialize_parallel_groups(
     initialize_etp_group(rank, etp_size=etp_size, world_size=world_size)
     initialize_ep_group(rank, etp_size=etp_size, ep_size=ep_size, world_size=world_size)
     initialize_pp_group(rank, pp_size=pp_size, world_size=world_size)
+    initialize_embed_tokens_lm_head_tp_group(
+        rank,
+        tp_size=tp_size,
+        embed_tokens_lm_head_tp_size=embed_tokens_lm_head_tp_size,
+        world_size=world_size,
+    )
 
     _PARALLEL_GROUPS_INITIALIZED = True
 

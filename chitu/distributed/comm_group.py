@@ -270,11 +270,12 @@ class CommGroup:
         *,
         input_size_per_rank: Optional[list[int] | torch.Tensor] = None,
         cumulative_input_size_per_rank: Optional[list[int] | torch.Tensor] = None,
+        max_num_tokens: Optional[int] = None,
     ) -> torch.Tensor:
         if cumulative_input_size_per_rank is not None:
-            if input_size_per_rank is not None:
+            if input_size_per_rank is not None or max_num_tokens is not None:
                 raise ValueError(
-                    "Only one of input_size_per_rank and cumulative_input_size_per_rank can be set."
+                    "Only one of input_size_per_rank, cumulative_input_size_per_rank and max_num_tokens can be set."
                 )
             if len(cumulative_input_size_per_rank) != self.group_size + 1:
                 raise ValueError(
@@ -286,9 +287,10 @@ class CommGroup:
                 for i in range(self.group_size)
             ]
         if input_size_per_rank is None:
-            raise ValueError(
-                "At least one of input_size_per_rank and cumulative_input_size_per_rank should be set."
-            )
+            if max_num_tokens is None:
+                raise ValueError(
+                    "At least one of input_size_per_rank and max_num_tokens should be set."
+                )
 
         # For allgather v, we cannot assign output tensor beforehand
         # because we don't known the output shape.
@@ -296,15 +298,24 @@ class CommGroup:
         # Bypass the function if we are using only 1 GPU.
         if self.group_size == 1:
             return input
-
-        output_tensor_list = [
-            torch.empty(
-                (input_size_per_rank[i], input.size(-1)),
-                dtype=input.dtype,
-                device=input.device,
-            )
-            for i in range(self.group_size)
-        ]
+        if input_size_per_rank is not None:
+            output_tensor_list = [
+                torch.empty(
+                    (input_size_per_rank[i], input.size(-1)),
+                    dtype=input.dtype,
+                    device=input.device,
+                )
+                for i in range(self.group_size)
+            ]
+        elif max_num_tokens is not None:
+            output_tensor_list = [
+                torch.empty(
+                    (max_num_tokens, input.size(-1)),
+                    dtype=input.dtype,
+                    device=input.device,
+                )
+                for i in range(self.group_size)
+            ]
 
         torch.distributed.all_gather(output_tensor_list, input, group=self.gpu_group)
 

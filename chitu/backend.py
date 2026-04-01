@@ -280,10 +280,24 @@ class Backend:
         pipeline_parallel_size = args.infer.pp_size
         non_expert_data_parallel_size = args.infer.dp_size
         expert_parallel_size = args.infer.ep_size
+        embed_tokens_lm_head_tp_size = int(args.infer.embed_tokens_lm_head_tp_size)
         assert (
             tensor_parallel_size * non_expert_data_parallel_size % expert_parallel_size
             == 0
         )
+        if tensor_parallel_size > 1:
+            assert (
+                embed_tokens_lm_head_tp_size == tensor_parallel_size
+            ), "embed_tokens_lm_head_tp_size must be equal to tensor_parallel_size when tensor_parallel_size > 1"
+        elif non_expert_data_parallel_size > 1:
+            assert (
+                non_expert_data_parallel_size % embed_tokens_lm_head_tp_size == 0
+            ), "non_expert_data_parallel_size must be divisible by embed_tokens_lm_head_tp_size when non_expert_data_parallel_size > 1"
+        else:
+            assert (
+                embed_tokens_lm_head_tp_size == 1
+            ), "embed_tokens_lm_head_tp_size must be 1 when tensor_parallel_size == 1 and non_expert_data_parallel_size == 1"
+
         expert_tensor_parallel_size = (
             tensor_parallel_size * non_expert_data_parallel_size // expert_parallel_size
         )
@@ -322,6 +336,7 @@ class Backend:
             etp_size=expert_tensor_parallel_size,
             ep_size=expert_parallel_size,
             pp_size=pipeline_parallel_size,
+            embed_tokens_lm_head_tp_size=embed_tokens_lm_head_tp_size,
         )
         world_group = get_world_group()
         Backend.ip_port_list = world_group.gather_all_rank_ip_port()

@@ -37,6 +37,7 @@ from chitu.distributed.parallel_state import (
     get_dp_group,
     get_dp_size,
     get_world_group,
+    get_embed_tokens_lm_head_tp_group,
 )
 from chitu.moe import get_moe_impl
 from chitu.hooks import TokenSink, LocalTokenSink, KVTransferHook, NoopKVTransferHook
@@ -728,6 +729,7 @@ class Executor:
         self.tp_size = args.infer.tp_size
         self.dp_size = args.infer.dp_size
         self.ep_size = args.infer.ep_size
+        self.embed_tokens_lm_head_tp_size = int(args.infer.embed_tokens_lm_head_tp_size)
         self.dim_ = args.models.dim
         self.mtp_size = args.infer.mtp_size
         self.pipe_dispatcher = None
@@ -807,6 +809,10 @@ class Executor:
         # Hooks for token streaming and KV transfer. Defaults keep existing behavior.
         self._token_sink: TokenSink = LocalTokenSink()
         self._kv_hook: KVTransferHook = NoopKVTransferHook()
+
+        self.specialize_embed_tokens_lm_head_parallel = (
+            self.tp_size == 1 and self.embed_tokens_lm_head_tp_size > 1
+        )
 
         # PD disaggregation: Prefill-only mode not sample tokens on the Prefill side.
         #
@@ -1016,6 +1022,11 @@ class Executor:
                 else tasks.num_tokens
             )
             self.moe_impl.prepare(tasks.task_type, tasks_num_tokens)
+
+        if self.specialize_embed_tokens_lm_head_parallel:
+            Backend.model.prepare_global_num_tokens(
+                tasks, get_embed_tokens_lm_head_tp_group()
+            )
 
         if tasks.task_type == TaskType.Prefill:
             out = self.prefill_step(tasks)
