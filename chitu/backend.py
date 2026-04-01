@@ -30,12 +30,16 @@ from chitu.attn_backend import (
     NpuAttnBackend,
     HybridAttnBackend,
 )
-from chitu.cache_manager import (
-    DenseKVCacheManager,
+
+from chitu.kv_cache import (
+    KVCacheManagerBase,
     PagedKVCacheManager,
-    SingletonPagedKVCacheManager,
+    PagedKVCache,
+    KVCacheBase,
+    DenseKVCache,
+    SingletonPagedKVCache,
     GlobalLocalMap,
-    MMPagedKVCacheManager,
+    MMPagedKVCache,
 )
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
@@ -69,11 +73,12 @@ from chitu.tokenizer import (
 )
 from chitu.utils import try_import_opt_dep
 from chitu.tool_call import get_tool_parser, patch_chat_template
-from chitu.constraint_decode import ConstraintDecodeManager
 from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div, get_global_args
 from chitu.moe import init_moe_impl
 from chitu.global_vars import set_slot_handle
 from chitu.numa_utils import bind_process_to_numa
+from chitu.kv_cache.providers import register_all_providers
+from chitu.kv_cache.builders import build_cache_managers
 
 if TYPE_CHECKING:
     from chitu.executor import Executor
@@ -95,12 +100,11 @@ class Backend:
     # init once
     model = None
     tokenizer = None
-    cache_managers = None
+    cache_dict: dict[str, KVCacheBase] = {}
     formatter = None
     processor = None
     args = None
-    # --- cache_manager related (not used in the current code)
-    curr_req_ids = None
+    curr_tids = None
     cache_type = ""
     # ---
     use_gloo = True
@@ -113,6 +117,9 @@ class Backend:
 
     # components
     schedulers: Optional[list["Scheduler"]] = None  # One per each DP rank
+    cache_managers: Optional[list[dict[str, "KVCacheManagerBase"]]] = (
+        None  # One per each DP rank
+    )
     executor: Optional["Executor"] = None
 
     # mutable
@@ -143,7 +150,6 @@ class Backend:
             from chitu.moe.load_balancer import register_moe_weight_accessor
 
             register_moe_weight_accessor(accessor, get_ep_group())
-            logger.info("Backend: MoE weight accessor installed and registered")
         except Exception as e:
             logger.warning(f"Backend: failed to register MoE weight accessor: {e}")
 
@@ -158,7 +164,6 @@ class Backend:
             try:
                 # Lazy import to avoid circular deps at import time
                 from chitu.moe.load_balancer import ExpertParamAccessor
-                import torch
 
                 class _ModelExpertsAccessor(ExpertParamAccessor):  # type: ignore
 
@@ -220,9 +225,6 @@ class Backend:
 
                 accessor = _ModelExpertsAccessor()
                 Backend.set_moe_weight_accessor(accessor)
-                logger.info(
-                    "Backend: auto-built ModelExpertsAccessor and registered to planner"
-                )
             except Exception as e:
                 logger.warning(
                     f"Backend: failed to build/register ModelExpertsAccessor: {e}"
@@ -448,6 +450,7 @@ class Backend:
             return ChatFormat(Backend.tokenizer)
 
     @staticmethod
+<<<<<<< HEAD
     def _init_cache_manager(
         args,
         attn_backend_type,
@@ -910,8 +913,11 @@ class Backend:
     #     return Qwen3LinearAttnCacheManager()
 
     @staticmethod
+=======
+>>>>>>> public-main
     def _get_attention_backend_type(args):
         if args.infer.attn_type == "auto":
+            # TODO auto use hunyuan attn
             if is_ascend():
                 return NpuAttnBackend
             elif args.infer.op_impl == "cpu":
@@ -942,12 +948,12 @@ class Backend:
         # Yes, use `type` instead of `isinstance` here, because `AttnBackend`s inherit each other
         if attn_backend_type is FlashInferBackend:
             max_num_blocks = 0
-            for mgr in Backend.cache_managers.values():
-                if not isinstance(mgr, PagedKVCacheManager):
+            for cache in Backend.cache_dict.values():
+                if not isinstance(cache, PagedKVCache):
                     raise NotImplementedError(
                         "`infer.attn_type=flash_infer` is only compatible with `infer.cache_type=paged`"
                     )
-                max_num_blocks = max(max_num_blocks, mgr.get_max_num_blocks())
+                max_num_blocks = max(max_num_blocks, cache.max_num_blocks)
             return attn_backend_type(max_num_blocks)
         else:
             return attn_backend_type()
@@ -1127,7 +1133,7 @@ class Backend:
 
         return Backend.build_model(
             args.models,
-            Backend.cache_managers,
+            Backend.cache_dict,
             max_position_embeddings=args.infer.max_seq_len
             + (args.infer.mtp_size if args.infer.mtp_size > 1 else 0),
             pipeline_parallel_size=args.infer.pp_size,
@@ -1439,6 +1445,7 @@ class Backend:
         """
         # Initialize distributed environment
         Backend._init_distributed(args)
+        register_all_providers()
 
         # Dense KVCache and PP related
         if args.infer.cache_type == "skew":
@@ -1456,9 +1463,6 @@ class Backend:
         Backend.tokenizer = Backend._init_tokenizer(args)
         Backend.processor = Backend._init_processor(args)
         Backend.formatter = Backend._init_formatter(args)
-        Backend.constraint_decode_manager = ConstraintDecodeManager(
-            Backend.tokenizer.model, args.models.vocab_size
-        )
 
         # Initialize tool parser
         tool_parser_config = getattr(args.models, "tool_parser", "MISSING")
@@ -1470,66 +1474,11 @@ class Backend:
 
         attn_backend_type = Backend._get_attention_backend_type(args)
 
-        # Initialize cache manager
-        if (
-            args.models.type == ModelType.HF_QWEN3_NEXT
-            or args.models.type == ModelType.HF_QWEN3_5
-        ):
-
-            def is_full_attention(layer_id):
-                return (layer_id + 1) % args.models.full_attention_interval == 0
-
-            def filter_full_attn_layer(layers: Iterable[int]):
-                return [idx for idx in layers if is_full_attention(idx)]
-
-            def filter_linear_attn_layer(layers: Iterable[int]):
-                return [idx for idx in layers if not is_full_attention(idx)]
-
-            num_full_attn_blocks = (
-                args.infer.num_blocks
-                if args.models.num_full_attention_blocks == -1
-                else args.models.num_full_attention_blocks
-            )
-            num_linear_attn_blocks = (
-                args.infer.num_blocks
-                if args.models.num_linear_attention_blocks == -1
-                else args.models.num_linear_attention_blocks
-            )
-
-            Backend.cache_type = args.infer.cache_type
-            Backend.cache_managers = {
-                "main": Backend._init_cache_manager(
-                    args,
-                    attn_backend_type,
-                    layer_filter_fn=filter_full_attn_layer,
-                    num_blocks=num_full_attn_blocks,
-                ),
-                "linear": Backend._init_linear_attn_cache_manager(
-                    args,
-                    layer_filter_fn=filter_linear_attn_layer,
-                    num_blocks=num_linear_attn_blocks,
-                ),
-            }
-            mm_cache = Backend._init_multimodal_cache_manager(
-                args, Backend.cache_managers["main"]
-            )
-            if mm_cache is not None:
-                Backend.cache_managers["multimodal"] = mm_cache
-        elif getattr(args.models, "type", "") == "deepseek-v3" and getattr(
-            args.models, "index_head_dim", None
-        ):
-            Backend.cache_type = args.infer.cache_type
-            Backend.cache_managers = {
-                "main": Backend._init_cache_manager(args, attn_backend_type),
-                "indexer": Backend._init_indexer_cache_manager(args),
-            }
-        else:
-            main_cache = Backend._init_cache_manager(args, attn_backend_type)
-            Backend.cache_managers = {"main": main_cache}
-            Backend.cache_type = args.infer.cache_type
-            mm_cache = Backend._init_multimodal_cache_manager(args, main_cache)
-            if mm_cache is not None:
-                Backend.cache_managers["multimodal"] = mm_cache
+        # Initialize cache managers
+        bundle = build_cache_managers(args, attn_backend_type)
+        Backend.cache_type = bundle.cache_type
+        Backend.cache_dict = bundle.cache_dict
+        Backend.cache_managers = bundle.cache_managers
 
         # Initialize attention backend
         attn_backend = Backend._init_attention_backend(attn_backend_type)
@@ -1555,6 +1504,7 @@ class Backend:
     @staticmethod
     def stop():
         setattr(Backend, "model", None)
+        Backend.cache_dict.clear()
         setattr(Backend, "cache_managers", None)
         gc.collect()
         torch.cuda.empty_cache()

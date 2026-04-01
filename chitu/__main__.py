@@ -2,6 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from chitu.profiler import MemoryRecorder
+
+MemoryRecorder.init()
+
 from chitu.serve.main import main
 
 if __name__ == "__main__":

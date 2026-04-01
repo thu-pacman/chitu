@@ -16,6 +16,7 @@ if has_triton and has_accelerator():
     from chitu.ops.triton_ops import (
         moe_sum_per_token_triton,
         moe_sum_expert_block_permuted_triton,
+        moe_sum_per_expert_dense_triton,
     )
 
 
@@ -114,6 +115,86 @@ def moe_sum_expert_block_permuted_torch(
         )
         * topk_weights.unsqueeze(-1)
     ).sum(dim=1)
+
+
+def moe_sum_per_expert_dense(
+    activation_per_expert: torch.Tensor,
+    token_to_expert_indices: torch.Tensor,
+    token_pos_in_expert: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    impl: str = "auto",
+):
+    """
+    Operator of PerExpertDenseBatchedExpertResult.weighted_sum.
+
+    Args:
+        activation_per_expert: [batch_size, max_n_tokens_per_expert, hidden_size]. Input activatoin.
+        token_to_expert_indices: [batch_size, topk]. Selected expert IDs for each token.
+        token_pos_in_expert: [batch_size, topk]. Position of each token in the expert's activation buffer.
+        topk_weights: [batch_size, topk]. Weight for each expert.
+        out: Optional inplace output.
+
+    Returns:
+        [batch_size, hidden_size]. Summed activation.
+    """
+
+    if impl == "auto":
+        if has_triton:
+            impl = "triton"
+        else:
+            impl = "ref"
+
+    if impl == "triton":
+        return moe_sum_per_expert_dense_triton(
+            activation_per_expert,
+            token_to_expert_indices,
+            token_pos_in_expert,
+            topk_weights,
+            out=out,
+        )
+    elif impl == "ref":
+        return moe_sum_per_expert_dense_ref(
+            activation_per_expert,
+            token_to_expert_indices,
+            token_pos_in_expert,
+            topk_weights,
+            out=out,
+        )
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
+
+
+@compatible_with_inplace
+def moe_sum_per_expert_dense_ref(
+    activation_per_expert: torch.Tensor,
+    token_to_expert_indices: torch.Tensor,
+    token_pos_in_expert: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+):
+    batch_size, topk = topk_weights.shape
+    assert token_to_expert_indices.shape == (batch_size, topk)
+    assert token_pos_in_expert.shape == (batch_size, topk)
+    n_experts, max_n_tokens_per_expert, hidden_size = activation_per_expert.shape
+
+    gathered = torch.zeros(
+        batch_size,
+        topk,
+        hidden_size,
+        dtype=activation_per_expert.dtype,
+        device=activation_per_expert.device,
+    )
+    for i in range(batch_size):
+        for j in range(topk):
+            expert_id = token_to_expert_indices[i, j].item()
+            if expert_id >= 0 and expert_id < n_experts:
+                pos = token_pos_in_expert[i, j].item()
+                gathered[i, j] = activation_per_expert[expert_id, pos]
+
+    return moe_sum_per_token(gathered, topk_weights, out=out)
 
 
 def moe_sum_expert_concat_permuted(

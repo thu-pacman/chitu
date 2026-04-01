@@ -11,7 +11,8 @@ import os
 import torch
 
 from chitu.distributed.comm_group import CommGroup
-from chitu.utils import try_import_opt_dep, parse_dtype
+from chitu.utils import parse_dtype
+from chitu.import_utils import try_import_opt_dep
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
@@ -20,8 +21,8 @@ from chitu.moe.batched_expert_result import (
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
-    PerExpertDenseBatchedRoutedActivation,
-    PerExpertDenseBatchedRoutedActivationBlockfp8,
+    PerExpertDenseBatchedRoutedActivationMinimal,
+    PerExpertDenseBatchedRoutedActivationBlockfp8Minimal,
 )
 from chitu.moe.load_balancer import get_moe_load_planner
 from chitu.global_vars import get_global_args
@@ -56,7 +57,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         super().__init__(
             tp_group=tp_group, dp_group=dp_group, etp_group=etp_group, ep_group=ep_group
         )
-        self.num_experts = num_experts
+        self.num_global_experts = num_experts
         os.environ["DEEPEP_DISABLE_LL_DISPATCH_OPT"] = (
             "0" if self.ep_group.group_size % 8 == 0 else "1"
         )
@@ -66,8 +67,8 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         self.mode = mode
 
         # NOTES: for the best performance, the QP number **must** be equal to the number of the local experts
-        assert self.num_experts % self.ep_group.group_size == 0
-        self.num_local_experts = self.num_experts // self.ep_group.group_size
+        assert self.num_global_experts % self.ep_group.group_size == 0
+        self.num_local_experts = self.num_global_experts // self.ep_group.group_size
 
         self.profile = profile
         self.prepare_profile = False
@@ -97,7 +98,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             # TODO(zms): remove moe layer range hard coding
             for layer_id in self.moe_layer_id_list:
                 expert_stats = torch.zeros(
-                    (self.num_experts,), dtype=torch.int, device="cuda"
+                    (self.num_global_experts,), dtype=torch.int, device="cuda"
                 )
                 self.ep_group.all_gather_into_tensor(
                     expert_stats, self.cumulative_local_expert_recv_stats[layer_id]
@@ -119,7 +120,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             self.max_bs_per_dp_rank,
             2,
             self.mode,
-            self.num_experts,
+            self.num_global_experts,
         )
 
     @override
@@ -146,7 +147,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         may_fuse_quant: Optional[str] = None,
         may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
-    ) -> tuple[PerExpertDenseBatchedRoutedActivation, Optional[torch.Tensor]]:
+    ) -> tuple[PerExpertDenseBatchedRoutedActivationMinimal, Optional[torch.Tensor]]:
         routed_x, weights, dispatch_stream = self.enter_moe_dispatch_streaming(
             x,
             topk_weights,
@@ -216,8 +217,13 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
 
         if not dispatch_use_fp8:
             return (
-                PerExpertDenseBatchedRoutedActivation(
+                PerExpertDenseBatchedRoutedActivationMinimal(
                     activation_per_expert=recv_activation,
+                    # NOTE on expected_n_tokens_per_expert: Although the estimation here is based
+                    # on information per DP rank and not global, we have to use it because our
+                    # CUDA graph is also captured per DP rank. It should be close enough. But a
+                    # DP rank may have 0 tokens, so we have to max with 1 here.
+                    expected_n_tokens_per_expert=max(x.expected_n_tokens_per_expert, 1),
                     n_tokens_per_expert=recv_expert_count,
                     expert_ids_are_local=True,
                 ),
@@ -227,9 +233,14 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         else:
             recv_activation, recv_activation_scale = recv_activation
             return (
-                PerExpertDenseBatchedRoutedActivationBlockfp8(
+                PerExpertDenseBatchedRoutedActivationBlockfp8Minimal(
                     activation_per_expert=recv_activation,
                     activation_scale_per_expert=recv_activation_scale,
+                    # NOTE on expected_n_tokens_per_expert: Although the estimation here is based
+                    # on information per DP rank and not global, we have to use it because our
+                    # CUDA graph is also captured per DP rank. It should be close enough. But a
+                    # DP rank may have 0 tokens, so we have to max with 1 here.
+                    expected_n_tokens_per_expert=max(x.expected_n_tokens_per_expert, 1),
                     n_tokens_per_expert=recv_expert_count,
                     expert_ids_are_local=True,
                 ),
@@ -292,7 +303,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                 hidden_states,
                 topk_idx,
                 DeepEPBuffer._lowlatency_num_max_dispatch_tokens_per_rank,
-                self.num_experts,
+                self.num_global_experts,
                 use_fp8=dispatch_use_fp8,
                 round_scale=round_scale_to_pow2,
                 use_ue8m0=False,  # Not using 8bit storage for now

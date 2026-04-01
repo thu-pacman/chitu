@@ -9,12 +9,9 @@ import plum
 import torch
 
 from chitu.native_layout.base import NativeLayoutTensor
-# from chitu.import_utils import try_import_platform_dep
+from chitu.import_utils import try_import_platform_dep
 
-# chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-# has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
-# if has_marlin:
-#     from chitu_backend import gptq_marlin_repack
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
 
 @dataclass

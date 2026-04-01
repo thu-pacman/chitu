@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import json as _json
 import os
 import time
 import itertools
@@ -33,7 +34,6 @@ from chitu.task_type import is_prefill, is_decode
 from chitu.metadata_serializer import MetadataSerializer, MetadataConfig
 from chitu.distributed.parallel_state import (
     get_tp_group,
-    get_tp_size,
     get_pp_group,
     get_pp_pair_group,
     get_dp_group,
@@ -43,7 +43,6 @@ from chitu.distributed.parallel_state import (
 from chitu.moe import get_moe_impl
 from chitu.hooks import TokenSink, LocalTokenSink, KVTransferHook, NoopKVTransferHook
 from chitu.utils import (
-    top_k_top_p_min_p_sampling_from_logits,
     try_import_and_setup_torch_npu,
 )
 from chitu.ops import (
@@ -55,9 +54,7 @@ from chitu.ops import (
 from chitu.device_list import DeviceList
 from chitu.moe.load_balancer import get_moe_load_planner  # added
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
-from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
-    DisaggregationMode,
-)
+from chitu.sampling.sampler import Sampler
 
 logger = getLogger(__name__)
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -521,6 +518,18 @@ class ExpertDataDispatcher(TasksDispatcher):
         # 初始化统一的 metadata serializer
         self.metadata_serializer = MetadataSerializer(mode="DP")
 
+    @staticmethod
+    def _get_pending_profile_payload():
+        from chitu.serve.common import get_and_clear_pending_profile_payload
+
+        return get_and_clear_pending_profile_payload()
+
+    @staticmethod
+    def _apply_profile_payload(payload):
+        from chitu.serve.common import apply_profile_command
+
+        apply_profile_command(payload)
+
     def dispatch_metadata(self, tasks):
         """统一的 metadata dispatch（使用 msgpack + ZMQ）"""
 
@@ -537,6 +546,11 @@ class ExpertDataDispatcher(TasksDispatcher):
                 # Special task type: broadcast remove / endtask to all ranks
                 current_task_type = TaskType.Special
                 task_ids_list = [tasks.task_ids] * self.group_size
+
+            profile_payload = self._get_pending_profile_payload()
+            profile_frame = (
+                _json.dumps(profile_payload).encode() if profile_payload else b""
+            )
 
             for rank_in_group in range(1, self.group_size):
                 target_is_pd_decode_rank = (
@@ -585,11 +599,18 @@ class ExpertDataDispatcher(TasksDispatcher):
                             f"bootstrap_tasks={boot_tasks_ids} frames={len(msgs)} frame_bytes={[len(m) for m in msgs]}"
                         )
 
+                msgs.append(profile_frame)
                 self.socket.send_multipart(msgs)
+
             return local_tasks.payload_type, local_tasks
         else:  # other dp ranks
             logger.debug(f"DP rank {self.rank_in_group} waiting for recv_metadata")
-            msgs = self.socket.recv_multipart()  # [tasks, (bootstrap)]
+            msgs = self.socket.recv_multipart()  # [tasks, (bootstrap), profile]
+
+            profile_frame = msgs.pop() if msgs else b""
+            if profile_frame:
+                self._apply_profile_payload(_json.loads(profile_frame))
+
             payload_type, tasks, slot_idx = (
                 self.metadata_serializer.deserialize_metadata(msgs[0])
             )
@@ -610,11 +631,8 @@ class ExpertDataDispatcher(TasksDispatcher):
                     and getattr(kv_hook, "mode", None) == "decode"
                     and hasattr(kv_manager, "prepare_kv_transfer")
                 ):
-                    cache_manager = (
-                        getattr(kv_manager, "cache_manager", None)
-                        or Backend.cache_managers["main"]  # FIXME: other managers
-                    )
-                    if cache_manager is not None and boot_ids:
+                    kv_cache = getattr(kv_manager, "kv_cache", None)
+                    if kv_cache is not None and boot_ids:
                         prefix_lens = []
                         for rid in boot_ids:
                             t = TaskPool.pool.get(rid)
@@ -636,8 +654,9 @@ class ExpertDataDispatcher(TasksDispatcher):
                                 )
                         kv_manager.prepare_kv_transfer(
                             request_ids=list(boot_ids),
-                            cache_manager=cache_manager,
+                            kv_cache=kv_cache,
                             prefix_lens=prefix_lens,
+                            cache_ids_list=tasks.new_cache_ids_list,
                         )
                 logger.debug(
                     f"[PD_TRACE][dp.recv_decode_bootstrap] rank_in_group={int(self.rank_in_group)} "
@@ -760,6 +779,7 @@ class Executor:
         self._dllm_torch_prof_steps = int(
             os.environ.get("CHITU_DLLM_TORCH_PROFILER_STEPS", "0")
         )
+        self.last_profile_task_type: Optional[TaskType] = None
 
         rank_filter = True
         if rank_filter and self.tp_size > 1:
@@ -843,27 +863,8 @@ class Executor:
         self._lb_step = 0
         self._pending_dllm_block = None
 
-    def _should_record_metrics(
-        self, num_tokens: int = 0, is_prefill: bool = False
-    ) -> bool:
-        """Determine if current rank should record metrics.
-
-        In non-DP mode: only rank 0 records metrics.
-        In DP mode: only the DP dispatcher ranks record metrics.
-
-        Args:
-            num_tokens: Number of tokens being processed (0 means no tasks)
-            is_prefill: Whether this is a prefill step (affects which ranks process tasks in PP mode)
-        """
-        # Must have tasks to process
-        if num_tokens == 0:
-            return False
-
-        # In non-DP mode, only rank 0 records metrics
-        if self.dp_size <= 1:
-            return self.rank == 0
-
-        return self.dp_dispatcher is not None
+        if self.is_sample_stage:
+            self.sampler = Sampler()
 
     def _prepend_dispatcher(self, dispatcher: TasksDispatcher):
         self.task_dispatchers.insert(0, dispatcher)
@@ -1011,11 +1012,17 @@ class Executor:
     def step(
         self, tasks: Optional[PackedTasksBase]
     ) -> SerializedPackedTasksPayloadType:
+        self.last_profile_task_type = None
         # 1. propagate tasks and handle special payload type
         payload_type = tasks.payload_type if tasks is not None else None
+
         for dispatcher in self.task_dispatchers:
             payload_type, tasks = dispatcher.dispatch_metadata(tasks)
         logger.info(f"payload_type: {payload_type}")
+
+        if tasks is not None and tasks.task_type in (TaskType.Prefill, TaskType.Decode):
+            self.last_profile_task_type = tasks.task_type
+
         if payload_type == SerializedPackedTasksPayloadType.TerminateBackend:
             Backend.state = BackendState.Terminated
         if Backend.state == BackendState.Terminated:
@@ -1027,12 +1034,12 @@ class Executor:
             return payload_type
 
         if payload_type == SerializedPackedTasksPayloadType.EndTask:
-            Backend.constraint_decode_manager.end_tasks(tasks.req_ids)
+            if self.is_sample_stage:
+                self.sampler.end_tasks(tasks.task_ids)
             # Delete item from KV cache
-            for rid in tasks.req_ids:
-                for mgr in Backend.cache_managers.values():
-                    mgr.finalize_cache_all_decode(rid)
-            PrometheusMetricsCollector.update_kvcache_usage()
+            for cache in Backend.cache_dict.values():
+                cache.finalize_cache_all_decode(tasks)
+            PrometheusMetricsCollector.update_GPU_usage()
             PrometheusMetricsCollector.update_task_counts()
             if self.rank > 0:
                 for task_id in tasks.task_ids:
@@ -1087,13 +1094,9 @@ class Executor:
                     task.has_unsync_new_token = True
 
         # 3. sample
-        if (
-            self.is_sample_stage
-            and isinstance(tasks, PackedTasks)
-            and len(tasks.output_tasks) > 0
-            and tasks.task_type not in (TaskType.PrefillDLLM, TaskType.DecodeDLLM)
-        ):
-            tokens = self.sample(out, tasks)
+        tokens = None
+        if self.is_sample_stage and len(tasks.output_tasks) > 0 and tasks.task_type not in (TaskType.PrefillDLLM, TaskType.DecodeDLLM):
+            tokens = self.sampler.sample(out, tasks.output_tasks)
             if tasks.return_logprobs:
                 logprobs = torch.log_softmax(out, dim=-1)
                 logprobs, token_idxs = logprobs.sort(dim=-1, descending=True)
@@ -1108,6 +1111,9 @@ class Executor:
         # the user via postprocess_async_part -> emit_batch -> req.add_data().
         if tasks.task_type == TaskType.DecodeDLLM:
             self._process_dllm_block_results()
+        # Notify KV transfer hook after prefill completes.
+        if tasks.task_type == TaskType.Prefill:
+            self._kv_hook.on_prefill_done(tokens, tasks)
 
         # async postprocess
         TaskCollector.process_last_batch_results()
@@ -1146,9 +1152,9 @@ class Executor:
     def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         is_empty_step = tasks.num_tasks == 0
         if not is_empty_step:
-            for mgr in Backend.cache_managers.values():
-                mgr.prepare_cache_prefill(tasks.req_ids, [len(t) for t in tasks.tokens])
-            PrometheusMetricsCollector.update_kvcache_usage()
+            for cache in Backend.cache_dict.values():
+                cache.prepare_cache_prefill(tasks)
+            PrometheusMetricsCollector.update_GPU_usage()
             PrometheusMetricsCollector.update_task_counts()
 
             num_tokens = tasks.num_tokens
@@ -1193,11 +1199,9 @@ class Executor:
 
         if not is_empty_step:
             # Collect prompt tokens metrics
-            # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
-            # In non-DP mode: only rank 0 records metrics
-            # if self._should_record_metrics(num_tokens, is_prefill=True):
-            #     PrometheusMetricsCollector.inc_prompt_tokens(num_tokens)
-            PrometheusMetricsCollector.inc_prompt_tokens(num_tokens)
+            hit_token_len = sum(tasks.hit_token_lens)
+            PrometheusMetricsCollector.inc_prompt_tokens(num_tokens + hit_token_len)
+            PrometheusMetricsCollector.inc_hit_tokens(hit_token_len)
 
             # payload send
             #
@@ -1207,14 +1211,6 @@ class Executor:
             for dispatcher in self.task_dispatchers:
                 dispatcher.send_payload(out, tasks)
 
-            # Notify KV transfer hook after prefill completes.
-            output_req_ids = [
-                tasks.req_ids[i] for i in range(tasks.num_tasks) if tasks.has_outputs[i]
-            ]
-            self._kv_hook.on_prefill_done(output_req_ids, out, tasks)
-
-            for mgr in Backend.cache_managers.values():
-                mgr.finalize_cache_all_prefill()  # like reset metadata
             return out
         else:
             for dispatcher in self.task_dispatchers:
@@ -1228,8 +1224,8 @@ class Executor:
         if not is_empty_step:
             # Ensure KV cache is present for PD decode-only before updating CacheManager state.
             self._kv_hook.before_decode_step(tasks.req_ids)
-            for mgr in Backend.cache_managers.values():
-                mgr.prepare_cache_decode(tasks.req_ids)
+            for cache in Backend.cache_dict.values():
+                cache.prepare_cache_decode(tasks)
 
             num_tokens = tasks.num_tasks
 
@@ -1283,32 +1279,22 @@ class Executor:
 
         if not is_empty_step:
             # Collect metrics for Prometheus
-            # In DP mode: all dp ranks record their local tokens (distinguished by dp_id)
-            # In non-DP mode: only rank 0 records metrics
-            if self._should_record_metrics(tasks.num_tasks, is_prefill=False):
-                PrometheusMetricsCollector.inc_generated_tokens(tasks.num_tasks)
-                if self.mtp_size > 1 and Backend.model.mtp_token_list:
-                    mtp_proposed = (self.mtp_size - 1) * tasks.num_tasks
-                    mtp_accepted = sum(len(t) for t in Backend.model.mtp_token_list)
-                    PrometheusMetricsCollector.inc_mtp_tokens(
-                        mtp_proposed, mtp_accepted
-                    )
+            PrometheusMetricsCollector.inc_generated_tokens(tasks.num_tasks)
+            if self.mtp_size > 1 and Backend.model.mtp_token_list:
+                mtp_proposed = (self.mtp_size - 1) * tasks.num_tasks
+                mtp_accepted = sum(len(t) for t in Backend.model.mtp_token_list)
+                PrometheusMetricsCollector.inc_mtp_tokens(mtp_proposed, mtp_accepted)
 
             # payload send
             for dispatcher in self.task_dispatchers:
                 dispatcher.send_payload(out, tasks)
 
-            # update seq_len and reset block table
-            for mgr in Backend.cache_managers.values():
-                mgr.finalize_cache_single_decode(tasks.req_ids)
             return out
         else:
             for dispatcher in self.task_dispatchers:
                 dispatcher.send_payload(self.dummy_logits, tasks=tasks)
 
             return self.dummy_output
-
-
 
     def prefill_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         t_step_start = time.perf_counter()
@@ -1589,9 +1575,7 @@ class Executor:
         self._kv_hook.before_decode_step(tasks.req_ids)
         for mgr in Backend.cache_managers.values():
             if hasattr(mgr, "prepare_cache_decode_dllm"):
-                mgr.prepare_cache_decode_dllm(
-                    tasks.req_ids, decoding_start_list, block_length
-                )
+                mgr.prepare_cache_decode_dllm(tasks, decoding_start_list, block_length)
         logger.debug(f"{payload=}{payload.shape=}")
         PrometheusMetricsCollector.update_kvcache_usage()
         _mark = _dllm_decode_seg_end("prepare_cache_decode", _mark, _dllm_seg)
@@ -2039,7 +2023,7 @@ class Executor:
 
         return tokens
 
-    def postprocess_before_sync(self, tasks: PackedTasksBase):
+    def postprocess_before_sync(self, tasks: PackedTasks):
         """
         This part is always after sample and before sync.
         Can use to store data to task before sync.

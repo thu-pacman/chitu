@@ -34,22 +34,9 @@ def deepgemm_contiguous_fused_expert(
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
-    use_fp8_w8a8: bool = False,
-    use_fp4_w4a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    global_num_experts: int = -1,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
-    w1_scale_2: Optional[torch.Tensor] = None,
-    w2_scale_2: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
-    round_scale_to_pow2: bool = False,
-    soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
     raise ValueError(f"Unsupported hidden_states type: {type(hidden_states)}")
@@ -61,22 +48,6 @@ def _(
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
-    use_fp8_w8a8: bool = False,
-    use_fp4_w4a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    global_num_experts: int = -1,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    w1_scale_2: Optional[torch.Tensor] = None,
-    w2_scale_2: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-    round_scale_to_pow2: bool = False,
-    soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
     hidden_states = hidden_states.as_local_expert_ids(
@@ -91,22 +62,6 @@ def _(
         w1=w1,
         w2=w2,
         activation=activation,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_fp4_w4a8=use_fp4_w4a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        global_num_experts=global_num_experts,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        w1_scale_2=w1_scale_2,
-        w2_scale_2=w2_scale_2,
-        w1_zp=w1_zp,
-        w2_zp=w2_zp,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        block_shape=block_shape,
-        round_scale_to_pow2=round_scale_to_pow2,
-        soft_fp8=soft_fp8,
         experts_start_idx=experts_start_idx,
     )
 
@@ -117,22 +72,6 @@ def _(
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
-    use_fp8_w8a8: bool = False,
-    use_fp4_w4a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    global_num_experts: int = -1,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    w1_scale_2: Optional[torch.Tensor] = None,
-    w2_scale_2: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-    round_scale_to_pow2: bool = False,
-    soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> ExpertBlockPermutedBatchedExpertResult:
     hidden_states = hidden_states.as_local_expert_ids(
@@ -188,22 +127,9 @@ def _(
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
-    use_fp8_w8a8: bool = False,
-    use_fp4_w4a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    global_num_experts: int = -1,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
-    w1_scale_2: Optional[torch.Tensor] = None,
-    w2_scale_2: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
-    round_scale_to_pow2: bool = False,
-    soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
     hidden_states = hidden_states.as_local_expert_ids(
@@ -220,22 +146,9 @@ def _(
         w1=w1,
         w2=w2,
         activation=activation,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_fp4_w4a8=use_fp4_w4a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        global_num_experts=global_num_experts,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
-        w1_scale_2=w1_scale_2,
-        w2_scale_2=w2_scale_2,
-        w1_zp=w1_zp,
-        w2_zp=w2_zp,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
         block_shape=block_shape,
-        round_scale_to_pow2=round_scale_to_pow2,
-        soft_fp8=soft_fp8,
         experts_start_idx=experts_start_idx,
     )
 
@@ -246,22 +159,10 @@ def _(
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
-    use_fp8_w8a8: bool = False,
-    use_fp4_w4a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    global_num_experts: int = -1,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
-    w1_scale_2: Optional[torch.Tensor] = None,
-    w2_scale_2: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     round_scale_to_pow2: bool = False,
-    soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> ExpertBlockPermutedBatchedExpertResult:
     if tuple(block_shape) != (128, 128):
@@ -281,14 +182,8 @@ def _(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )
 
-    assert use_fp8_w8a8
     assert block_shape is not None
-    assert not use_int8_w8a16
-    assert not use_int4_w4a16
-    assert not soft_fp8
     assert activation == "silu"
-    assert w1_zp is None
-    assert w2_zp is None
 
     blocked_activation = hidden_states.blocked_activation
     blocked_activation_scale = hidden_states.blocked_activation_scale
@@ -355,36 +250,23 @@ def _(
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
-    use_fp8_w8a8: bool = False,
-    use_fp4_w4a8: bool = False,
-    use_int8_w8a16: bool = False,
-    use_int4_w4a16: bool = False,
-    global_num_experts: int = -1,
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
-    w1_scale_2: Optional[torch.Tensor] = None,
-    w2_scale_2: Optional[torch.Tensor] = None,
-    w1_zp: Optional[torch.Tensor] = None,
-    w2_zp: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     round_scale_to_pow2: bool = False,
-    soft_fp8: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
-
-    assert not use_fp4_w4a8
-    assert not use_int8_w8a16
-    assert not use_int4_w4a16
 
     assert len(block_shape) == 2
     assert block_shape[0] == block_shape[1]
     quant_block_size = block_shape[0]
     pad_block_size = 128
     n_experts = w1.shape[0]
+    hidden_states = hidden_states.as_local_expert_ids(
+        experts_start_idx, experts_start_idx + n_experts
+    )
 
-    if use_fp8_w8a8:
+    if w1.dtype == torch.float8_e4m3fn:
         hidden_states_fp8, scale = blockfp8_act_quant(
             hidden_states.activation,
             block_size=quant_block_size,
@@ -394,6 +276,7 @@ def _(
             activation=hidden_states_fp8,
             activation_scale=scale,
             token_to_expert_indices=hidden_states.token_to_expert_indices,
+            expected_n_tokens_per_expert=hidden_states.expected_n_tokens_per_expert,
             expert_ids_are_local=hidden_states.expert_ids_are_local,
         )
         hidden_states = (
@@ -401,33 +284,26 @@ def _(
                 hidden_states, pad_block_size=pad_block_size, n_experts=n_experts
             )
         )
+        return deepgemm_contiguous_fused_expert(
+            hidden_states,
+            w1=w1,
+            w2=w2,
+            activation=activation,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            block_shape=block_shape,
+            experts_start_idx=experts_start_idx,
+        )
     else:
         hidden_states = (
             IndexedBatchedRoutedActivationWithPaddedPerExpertCnt.convert_from(
                 hidden_states, pad_block_size=pad_block_size, n_experts=n_experts
             )
         )
-
-    return deepgemm_contiguous_fused_expert(
-        hidden_states,
-        w1=w1,
-        w2=w2,
-        activation=activation,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_fp4_w4a8=use_fp4_w4a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        global_num_experts=n_experts,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        w1_scale_2=w1_scale_2,
-        w2_scale_2=w2_scale_2,
-        w1_zp=w1_zp,
-        w2_zp=w2_zp,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        block_shape=block_shape,
-        round_scale_to_pow2=round_scale_to_pow2,
-        soft_fp8=soft_fp8,
-        experts_start_idx=experts_start_idx,
-    )
+        return deepgemm_contiguous_fused_expert(
+            hidden_states,
+            w1=w1,
+            w2=w2,
+            activation=activation,
+            experts_start_idx=experts_start_idx,
+        )

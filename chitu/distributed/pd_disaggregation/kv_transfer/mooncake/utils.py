@@ -86,7 +86,6 @@ def get_ptr_sections_from_kv_indices(
                 + block_idx * block_byte_len
                 + end_off_in_block * token_byte_len
             )
-            # print(f"end_off_in_block({end_off_in_block}) * token_byte_len({token_byte_len})={end_off_in_block * token_byte_len}")
         ptr_sections.append([int(start_ptr), int(end_ptr)])
 
     return ptr_sections

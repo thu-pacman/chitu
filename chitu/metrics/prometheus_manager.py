@@ -223,20 +223,28 @@ class PrometheusServerManager:
         Returns:
             {(rank, dp_id): metric_rate}
         """
-        query = f"rate({metric_name}[{time_window}])"
-        response = requests.get(self.query_url, params={"query": query})
-        response.raise_for_status()
-        data = response.json()
-        if data["status"] != "success":
-            raise Exception(f"查询失败: {data}")
+        try:
+            query = f"rate({metric_name}[{time_window}])"
+            response = requests.get(
+                self.query_url,
+                params={"query": query},
+                timeout=5,
+            )
+            response.raise_for_status()
+            data = response.json()
+            if data["status"] != "success":
+                raise Exception(f"查询失败: {data}")
 
-        ans = {}
-        for result in data["data"]["result"]:
-            if result["metric"]["job"] == _DEFAULT_JOB_NAME:
-                key = (result["metric"]["rank"], result["metric"]["dp_id"])
-                val = result["value"][1]
-                ans[key] = val
-        return ans
+            ans = {}
+            for result in data["data"]["result"]:
+                if result["metric"]["job"] == _DEFAULT_JOB_NAME:
+                    key = (result["metric"]["rank"], result["metric"]["dp_id"])
+                    val = result["value"][1]
+                    ans[key] = val
+            return ans
+        except Exception as e:
+            logger.error(f"query_metric_rate_each_rank failed: {e}")
+            return {}
 
     def query_metric_latest_value_each_rank(self, metric_name: str) -> dict[str, str]:
         """
@@ -250,21 +258,29 @@ class PrometheusServerManager:
         Returns:
             {(rank, dp_id): metric_value}
         """
-        query = f"{metric_name} offset 0s"
-        response = requests.get(self.query_url, params={"query": query})
-        response.raise_for_status()
-        data = response.json()
+        try:
+            query = f"{metric_name} offset 0s"
+            response = requests.get(
+                self.query_url,
+                params={"query": query},
+                timeout=5,
+            )
+            response.raise_for_status()
+            data = response.json()
 
-        if data["status"] != "success":
-            raise Exception(f"查询失败: {data}")
+            if data["status"] != "success":
+                raise Exception(f"查询失败: {data}")
 
-        ans = {}
-        for result in data["data"]["result"]:
-            if result["metric"]["job"] == _DEFAULT_JOB_NAME:
-                key = (result["metric"]["rank"], result["metric"]["dp_id"])
-                val = result["value"][1]
-                ans[key] = val
-        return ans
+            ans = {}
+            for result in data["data"]["result"]:
+                if result["metric"]["job"] == _DEFAULT_JOB_NAME:
+                    key = (result["metric"]["rank"], result["metric"]["dp_id"])
+                    val = result["value"][1]
+                    ans[key] = val
+            return ans
+        except Exception as e:
+            logger.error(f"query_metric_latest_value_each_rank failed: {e}")
+            return {}
 
     def list_all_metrics(self):
         """

@@ -7,7 +7,7 @@ import zmq
 
 import torch
 
-from chitu.cache_manager import GlobalLocalMap, PagedKVCacheManager
+from chitu.kv_cache import GlobalLocalMap, PagedKVCache
 from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
     KVManager,
     DisaggregationMode,
@@ -26,19 +26,20 @@ if _JOB_NAME and _JOB_NAME != _PD_UNIT_JOB_NAME:
     pytest.skip("skip PD unit tests outside pd_unit_test_h20", allow_module_level=True)
 
 
-def _build_cache_manager(device="cuda"):
+def _build_paged_cache(device="cuda"):
     layer_map = GlobalLocalMap.from_range(0, 2)
-    return PagedKVCacheManager(
+
+    return PagedKVCache(
         layer_map,
         num_hot_req=8,
         max_seq_len=128,
+        num_blocks=64,
         shape_per_token_dict={"kv_cache": torch.Size([2, 8])},
         dtype_dict={"kv_cache": torch.float16},
         n_local_kv_heads=2,
         head_dim=8,
         device=device,
         block_size=16,
-        num_blocks=64,
     )
 
 
@@ -78,10 +79,10 @@ def test_decode_prepare_listener(
     init_distributed,
 ):
     device = "cuda"
-    cache_manager = _build_cache_manager(device=device)
+    cache = _build_paged_cache(device=device)
     meta = MetadataBuffers(size=4)
     kv_manager = KVManager(
-        cache_manager=cache_manager,
+        kv_cache=cache,
         metadata_buffers=meta,
         disaggregation_mode=DisaggregationMode.DECODE,
     )
@@ -116,6 +117,7 @@ def test_decode_prepare_listener(
                 "request_id": "req-prepare-1",
                 "prefill_scheduler_id": 0,
                 "prefix_len": 32,
+                "task_cache_ids": [0],
             },
             use_bin_type=True,
         )

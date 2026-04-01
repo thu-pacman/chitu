@@ -85,6 +85,7 @@ class InferConfig(InferConfigLegacy):
     num_experts_slots: Optional[int] = None
     moe_lb_trigger: int = -1
     moe_lb_threshold: float = 3.0
+    enable_prefix_caching: bool = MISSING
 
     @dataclass
     class MoEConfig:

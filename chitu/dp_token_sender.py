@@ -115,7 +115,7 @@ class DPTokenSender:
     def send_token(
         self,
         request_id: str,
-        token: int,
+        token: Optional[int],
         top_logprobs: Optional[list[float]] = None,
         top_token_idx: Optional[list[int]] = None,
         task=None,  # Add task parameter to get prompt_len
@@ -139,28 +139,39 @@ class DPTokenSender:
                 self._chars_len[request_id] = 0
 
             # Accumulate tokens
-            self.request_token_cache[request_id].append(token)
+            if token is not None:
+                self.request_token_cache[request_id].append(token)
             cache_tokens = self.request_token_cache[request_id]
+            if len(cache_tokens) == 0:
+                return
 
-            # Decode all accumulated tokens
+            # Decode incremental tokens if force_full_seq_decode is False
             s = Backend.tokenizer.decode(cache_tokens)
 
             # Skip if incomplete UTF-8 sequence (wait for more tokens)
-            if "\ufffd" in s:
+            # TODO: avoid hardcode max length of cache_tokens (from chitu/async_response.py)
+            if "\ufffd" in s and len(cache_tokens) <= 10:
                 text = ""
             else:
                 # Output incremental text
-                text = s[self._chars_len[request_id] :]
-                self._chars_len[request_id] = len(s)
+                if not Backend.tokenizer.force_full_seq_decode:
+                    text = s
+                    self.request_token_cache[request_id].clear()
+                else:
+                    text = s[self._chars_len[request_id] :]
+                    self._chars_len[request_id] = len(s)
 
             # logger.debug(
             #     f"DP Token Sender: [request {request_id}] decode token {token} -> '{text}'"
             # )
-        else:
+        elif token is not None:
             logger.warning(
                 f"DP Token Sender: [request {request_id}] tokenizer not available, cannot decode token {token}"
             )
             text = f"[TOKEN_{token}]"
+        else:
+            # tokenizer = None & token = None
+            return
 
         # Decode top_tokens (if present)
         top_tokens_text = None
@@ -200,6 +211,7 @@ class DPTokenSender:
     def send_finish(self, request_id: str, finish_reason: str = "stop"):
         """Send request finish signal"""
         # Clean up caches for this request
+        self.send_token(request_id, None)
         self.request_token_cache.pop(request_id, None)
         self._chars_len.pop(request_id, None)
         self._first_token_sent.discard(request_id)

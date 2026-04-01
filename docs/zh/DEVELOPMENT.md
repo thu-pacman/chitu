@@ -569,7 +569,7 @@ torchrun --nnodes 1 \
     infer.use_cuda_graph=True
 ```
 
-### OpenAI 兼容接口（Chat Completions）
+### API 参数
 
 测试 OpenAI 兼容接口：
 
@@ -590,30 +590,27 @@ curl localhost:21002/v1/chat/completions \
   }'
 ```
 
-服务还支持若干可选 JSON 参数，如下：
+测试 OpenAI Responses 接口：
 
-| 名称                    | 数据类型         | 含义                                                         |
-| ----------------------- | ---------------- | ------------------------------------------------------------ |
-| `max_completion_tokens` | `int`            | 输出长度达到此限制后停止输出。                               |
-| `temperature`           | `float`          | 用于控制输出多样性的采样参数。                               |
-| `top_p`                 | `float`          | 用于控制输出多样性的采样参数。                               |
-| `top_k`                 | `int`            | 用于控制输出多样性的采样参数。                               |
-| `frequency_penalty`     | `float`          | 用于控制输出多样性的采样参数。                               |
-| `logprobs`              | `bool`           | 若为 `true`，额外返回采样前的 `log(softmax(logits))` ，可用于分析模型精度。 |
-| `top_logprobs`          | `int`            | `logprobs` 的返回数量。                                      |
-| `stream`                | `bool`           | 若为 `true` 以流模式响应 HTTP 请求，在 Python 中可通过 `requests.post(stream=True)` 使用。 |
-| `stop_with_eos`         | `bool`           | 若为 `false`，即使回答结束，也继续输出，直到输出 token 数达到 `max_completion_tokens` 限制。可用于进行稳定的速度测试。 |
-| `chat_template_kwargs`  | `dict[str, Any]` | Chat template 的额外参数。目前支持的有： `{"enable_thinking": false}` 可禁用 GLM-4.5 模型的思考模式。 |
-| `tools`                 | `list[dict]`     | 工具调用的工具定义，请参考 https://developers.openai.com/api/docs/guides/function-calling/ |
-| `tool_choice`           | `str or dict`    | 工具调用的输出数量要求，支持 none, auto, required, {"type": "function", "name": "工具名"} |
+```bash
+curl localhost:21002/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "DeepSeek-R1",
+    "instructions": "You are a helpful assistant.",
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "input_text", "text": "Summarize this image input."},
+          {"type": "input_image", "image_url": "https://example.com/cat.png"}
+        ]
+      }
+    ]
+  }'
+```
 
-额外的 HTTP 请求头：
-
-| 名称            | 含义                                                         |
-| --------------- | ------------------------------------------------------------ |
-| `Authorization` | 格式：`Bearer <api_key>`。若 `<api_key>` 在 `serve.api_keys` 启动设置项中，该请求将被优先处理。详见服务启动时的 `serve.api_keys` 配置。 |
-
-### Anthropic 兼容接口（Messages API）
+注意：`input_image` / `input_file` 当前仅做接口兼容，会被转换为文本占位，不会触发真正的多模态推理。
 
 测试 Anthropic 兼容接口：
 
@@ -632,6 +629,8 @@ curl localhost:21002/v1/messages \
     ]
   }'
 ```
+
+OpenAI 兼容、OpenAI Responses 兼容和 Anthropic 兼容接口的参数说明请参见 [API_PARAMETERS.md](./API_PARAMETERS.md)。
 
 ### Grafana 监控面板
 
@@ -693,6 +692,42 @@ python benchmarks/benchmark_serving.py \
 - 不在请求间进行缓存。
 
 注意当 `--batch-size` 较大时，性能测试工具会占用大量文件描述符，可能超过 `ulimit` 限制。**建议在运行性能测试前提升限制，如 `ulimit -n 65536`。**
+
+## 单元测试
+
+一些单元测试可用于定位潜在问题：
+
+**单卡测试：**
+
+```bash
+pytest [pytest arguments...] ./test/pytest
+```
+
+其中可任意添加 [PyTest](https://docs.pytest.org/) 选项，以控制输出、筛选测例等。
+
+许多测例还支持性能测试。请为 `pytest` 追加 `-s` 选项来显式结果。测试中默认的计时轮次仅为 1，所以还请通过追加  `--warmup-round=<rounds> --timing-round=<rounds>` 选项来调整及时轮次，来获得准确的测量结果。
+
+示例：
+
+``` bash
+pytest --warmup-round=5 --timing-round=20 -s ./test/pytest
+```
+
+**多卡测试：**
+
+```bash
+torchrun [torchrun arguments...] --no-python ./run_pytest_with_pretty_print.sh [pytest arguments...] ./test/dist_pytest
+```
+
+该命令会用不多于此处通过 `torchrun` 参数的卡数，来运行测试。
+
+由于分布式程序中的错误时常导致通信过程不能正常结束，经常一个测例发生错误会导致其后的其他测例均无法运行。建议为 `pytest` 追加 `-x` 选项，以使其在遇到第一处错误后就退出。
+
+示例：
+
+```bash
+torchrun --nproc_per_node 8 --no-python ./test/dist_pytest/run_pytest_with_pretty_print.sh -x ./test/dist_pytest
+```
 
 ## 环境变量
 

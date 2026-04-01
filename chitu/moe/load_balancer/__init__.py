@@ -92,18 +92,11 @@ def register_moe_weight_accessor(accessor, ep_group: CommGroup) -> None:
     global _EXECUTOR
     planner = get_moe_load_planner()
     if planner is None:
-        logger.warning(
-            "register_moe_weight_accessor called before planner init; deferring has no effect"
-        )
         return
     try:
         executor = WeightMigrationExecutor(accessor=accessor, ep_group=ep_group)
         planner.register_action_executor(executor)
         _EXECUTOR = executor
-        logger.info(
-            "MoE load balancer: WeightMigrationExecutor registered (self-test is not auto-run)"
-        )
-        # executor.self_test_send_recv()
     except Exception as e:
         logger.exception(f"Failed to register WeightMigrationExecutor: {e}")
 
@@ -116,14 +109,12 @@ def get_moe_weight_executor():
 def warmup_for_moe_schema() -> None:
     exec_inst = get_moe_weight_executor()
     if exec_inst is None:
-        logger.warning(
+        logger.info(
             "MoE load balancer: no WeightMigrationExecutor registered; skip warmup"
         )
         return
     try:
         exec_inst.warmup_static_schema()
-        # exec_inst.batch_isend_irecv_warmup2()
-        logger.info("MoE load balancer: warmup for MoE schema finished")
     except Exception as te:
         logger.warning(f"MoE load balancer: warmup for MoE schema failed: {te}")
 

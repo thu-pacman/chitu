@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import Optional
+import functools
 from typing_extensions import override
 from logging import getLogger
 
@@ -24,7 +25,14 @@ from chitu.ops.quant import (
     blockfp8_einsum_shc_hdc_shd,
     soft_fp8_blockfp8_gemm_marlin,
 )
+from chitu.moe.experts import make_op_dispatcher
 from chitu.device_type import get_device_name, is_muxi, is_nvidia
+from chitu.utils import (
+    try_import_platform_dep,
+    parse_dtype,
+    try_import_opt_dep,
+    try_import_and_setup_torch_npu,
+)
 from chitu.utils import parse_dtype, ceil_div
 from chitu.import_utils import try_import_platform_dep, try_import_opt_dep
 from chitu.global_vars import get_global_args
@@ -38,17 +46,24 @@ from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
-)
-from chitu.moe.experts import (
-    fused_experts_no_sum_wrapper,
-    fused_experts_and_sum_wrapper,
+    ConcatPermutedBatchedRoutedActivationMinimal,
+    PerExpertDenseBatchedRoutedActivationMinimal,
 )
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 
 has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
+
+if has_torch_npu:
+    from chitu.npu_utils import fused_experts_no_sum_npu, fused_experts_npu_for_ep
+if has_triton:
+    from chitu.moe.experts import fused_experts_fp8
+if has_deep_gemm:
+    from chitu.moe.experts import deepgemm_masked_fused_expert
+    from chitu.moe.experts import deepgemm_contiguous_fused_expert
 
 logger = getLogger(__name__)
 
@@ -262,6 +277,394 @@ class Blockfp8LinearDeepGemm(
             round_scale_to_pow2=self.round_scale_to_pow2,
             # TODO: Call deep_gemm implementation only. No dispatching
         )
+
+
+def _finalize_fused_experts_sum_output(
+    output, hidden_states, topk_weights: Optional[torch.Tensor], inplace: bool
+):
+    if hasattr(output, "weighted_sum"):
+        if (
+            inplace
+            and isinstance(hidden_states, IndexedBatchedRoutedActivation)
+            and hidden_states.activation.dtype == torch.get_default_dtype()
+        ):
+            out = hidden_states.activation
+        else:
+            out = None
+        return output.weighted_sum(topk_weights, out=out)
+    return output
+
+
+@make_op_dispatcher
+def fused_experts_no_sum_blockfp8_indexed(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    impl: str = "auto",
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    round_scale_to_pow2: bool = False,
+    global_num_experts: int = -1,
+    experts_start_idx: int = 0,
+): ...
+
+
+@fused_experts_no_sum_blockfp8_indexed.register_auto
+def _auto_fused_experts_no_sum_blockfp8_indexed():
+    if has_triton:
+        return "triton"
+    if has_torch_npu:
+        return "torch_npu"
+    raise NotImplementedError
+
+
+@fused_experts_no_sum_blockfp8_indexed.register("triton")
+def _fused_experts_no_sum_blockfp8_indexed_triton(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    impl: str = "triton",
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    round_scale_to_pow2: bool = False,
+    experts_start_idx: int = 0,
+):
+    return fused_experts_fp8(
+        hidden_states,
+        w1=w1,
+        w2=w2,
+        activation=activation,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        block_shape=block_shape,
+        soft_fp8=soft_fp8,
+        round_scale_to_pow2=round_scale_to_pow2,
+        experts_start_idx=experts_start_idx,
+    )
+
+
+@fused_experts_no_sum_blockfp8_indexed.register("torch_npu")
+def _fused_experts_no_sum_blockfp8_indexed_torch_npu(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    impl: str = "torch_npu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    global_num_experts: int = -1,
+    experts_start_idx: int = 0,
+):
+    return fused_experts_no_sum_npu(
+        hidden_states,
+        w1=w1,
+        w1_scale=w1_scale,
+        w2=w2,
+        w2_scale=w2_scale,
+        global_num_experts=global_num_experts,
+        experts_start_idx=experts_start_idx,
+    )
+
+
+@fused_experts_no_sum_blockfp8_indexed.register("deepgemm")
+def _fused_experts_no_sum_blockfp8_indexed_deepgemm(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    impl: str = "deepgemm",
+    activation: Optional[str] = None,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
+    experts_start_idx: int = 0,
+):
+    return deepgemm_contiguous_fused_expert(
+        hidden_states,
+        w1=w1,
+        w2=w2,
+        activation=activation,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        block_shape=block_shape,
+        round_scale_to_pow2=round_scale_to_pow2,
+        experts_start_idx=experts_start_idx,
+    )
+
+
+@make_op_dispatcher
+def fused_experts_sum_blockfp8_indexed(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights: Optional[torch.Tensor],
+    *,
+    inplace: bool = False,
+    impl: str = "auto",
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    round_scale_to_pow2: bool = False,
+    global_num_experts: int = -1,
+    experts_start_idx: int = 0,
+): ...
+
+
+@fused_experts_sum_blockfp8_indexed.register_auto
+def _auto_fused_experts_sum_blockfp8_indexed():
+    if has_triton:
+        return "triton"
+    if has_torch_npu:
+        return "torch_npu"
+    raise NotImplementedError
+
+
+@fused_experts_sum_blockfp8_indexed.register("triton")
+@fused_experts_sum_blockfp8_indexed.register("torch_npu")
+@fused_experts_sum_blockfp8_indexed.register("deepgemm")
+def _fused_experts_sum_blockfp8_indexed_any(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights: Optional[torch.Tensor],
+    *,
+    inplace: bool = False,
+    impl: str = "auto",
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    round_scale_to_pow2: bool = False,
+    global_num_experts: int = -1,
+    experts_start_idx: int = 0,
+):
+    output = fused_experts_no_sum_blockfp8_indexed(
+        hidden_states,
+        w1,
+        w2,
+        impl=impl,
+        activation=activation,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        block_shape=block_shape,
+        soft_fp8=soft_fp8,
+        round_scale_to_pow2=round_scale_to_pow2,
+        global_num_experts=global_num_experts,
+        experts_start_idx=experts_start_idx,
+    )
+    return _finalize_fused_experts_sum_output(
+        output, hidden_states, topk_weights=topk_weights, inplace=inplace
+    )
+
+
+@make_op_dispatcher
+def fused_experts_no_sum_blockfp8_concat_permuted(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    impl: str = "auto",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    experts_start_idx: int = 0,
+): ...
+
+
+@fused_experts_no_sum_blockfp8_concat_permuted.register_auto
+def _auto_fused_experts_no_sum_blockfp8_concat_permuted():
+    if has_torch_npu:
+        return "torch_npu"
+    raise NotImplementedError
+
+
+@fused_experts_no_sum_blockfp8_concat_permuted.register("torch_npu")
+def _fused_experts_no_sum_blockfp8_concat_permuted_torch_npu(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    impl: str = "torch_npu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    experts_start_idx: int = 0,
+):
+    return fused_experts_npu_for_ep(
+        hidden_states,
+        w1=w1,
+        w1_scale=w1_scale,  # fp32
+        w2=w2,
+        w2_scale=w2_scale,  # bf16
+        experts_start_idx=experts_start_idx,
+    )
+
+
+@make_op_dispatcher
+def fused_experts_sum_blockfp8_concat_permuted(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights: Optional[torch.Tensor],
+    *,
+    inplace: bool = False,
+    impl: str = "auto",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    experts_start_idx: int = 0,
+): ...
+
+
+@fused_experts_sum_blockfp8_concat_permuted.register_auto
+def _auto_fused_experts_sum_blockfp8_concat_permuted():
+    if has_torch_npu:
+        return "torch_npu"
+    raise NotImplementedError
+
+
+@fused_experts_sum_blockfp8_concat_permuted.register("torch_npu")
+def _fused_experts_sum_blockfp8_concat_permuted_torch_npu(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights: Optional[torch.Tensor],
+    *,
+    inplace: bool = False,
+    impl: str = "torch_npu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    experts_start_idx: int = 0,
+):
+    output = fused_experts_no_sum_blockfp8_concat_permuted(
+        hidden_states,
+        w1,
+        w2,
+        impl=impl,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        experts_start_idx=experts_start_idx,
+    )
+    return _finalize_fused_experts_sum_output(
+        output, hidden_states, topk_weights=topk_weights, inplace=inplace
+    )
+
+
+@make_op_dispatcher
+def fused_experts_no_sum_blockfp8_per_expert_dense(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    impl: str = "auto",
+    activation: Optional[str] = None,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
+    experts_start_idx: int = 0,
+): ...
+
+
+@fused_experts_no_sum_blockfp8_per_expert_dense.register_auto
+def _auto_fused_experts_no_sum_blockfp8_per_expert_dense():
+    if has_deep_gemm:
+        return "deepgemm"
+    raise NotImplementedError
+
+
+@fused_experts_no_sum_blockfp8_per_expert_dense.register("deepgemm")
+def _fused_experts_no_sum_blockfp8_per_expert_dense_deepgemm(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    impl: str = "deepgemm",
+    activation: Optional[str] = None,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
+    experts_start_idx: int = 0,
+):
+    return deepgemm_masked_fused_expert(
+        hidden_states,
+        w1=w1,
+        w2=w2,
+        activation=activation,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        block_shape=block_shape,
+        round_scale_to_pow2=round_scale_to_pow2,
+        experts_start_idx=experts_start_idx,
+    )
+
+
+@make_op_dispatcher
+def fused_experts_sum_blockfp8_per_expert_dense(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights: Optional[torch.Tensor],
+    *,
+    inplace: bool = False,
+    impl: str = "auto",
+    activation: Optional[str] = None,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
+    experts_start_idx: int = 0,
+): ...
+
+
+@fused_experts_sum_blockfp8_per_expert_dense.register_auto
+def _auto_fused_experts_sum_blockfp8_per_expert_dense():
+    if has_deep_gemm:
+        return "deepgemm"
+    raise NotImplementedError
+
+
+@fused_experts_sum_blockfp8_per_expert_dense.register("deepgemm")
+def _fused_experts_sum_blockfp8_per_expert_dense_deepgemm(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights: Optional[torch.Tensor],
+    *,
+    inplace: bool = False,
+    impl: str = "deepgemm",
+    activation: Optional[str] = None,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
+    experts_start_idx: int = 0,
+):
+    output = fused_experts_no_sum_blockfp8_per_expert_dense(
+        hidden_states,
+        w1,
+        w2,
+        impl=impl,
+        activation=activation,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        block_shape=block_shape,
+        round_scale_to_pow2=round_scale_to_pow2,
+        experts_start_idx=experts_start_idx,
+    )
+    return _finalize_fused_experts_sum_output(
+        output, hidden_states, topk_weights=topk_weights, inplace=inplace
+    )
 
 
 @QuantizationRegistry.register_moe_experts("blockfp8", merge_gate_up=False)
@@ -485,9 +888,13 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
         )
 
     @override
+    @functools.singledispatchmethod
     def forward_no_sum(
         self, routed_x: BatchedRoutedActivation, impl: str = "auto"
     ) -> BatchedExpertResult:
+        return super().forward_no_sum(routed_x, impl=impl)
+
+    def _resolve_runtime_weights(self):
         if has_triton:
             fused_soft_fp8 = False
             use_fp8_w8a8 = False
@@ -526,25 +933,111 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
                 )
                 down_proj_scale = None
 
-            return fused_experts_no_sum_wrapper(
-                routed_x,
-                w1=gate_up_proj_weight,
-                w2=down_proj_weight,
-                use_fp8_w8a8=use_fp8_w8a8,
-                w1_scale=gate_up_proj_scale,
-                w2_scale=down_proj_scale,
-                block_shape=[self.block_size, self.block_size],
-                round_scale_to_pow2=self.round_scale_to_pow2,
-                soft_fp8=fused_soft_fp8,
-                global_num_experts=self.global_n_experts,
-                experts_start_idx=self.experts_start_idx,
-                impl=impl,
+            return (
+                gate_up_proj_weight,
+                gate_up_proj_scale,
+                down_proj_weight,
+                down_proj_scale,
+                fused_soft_fp8,
+                use_fp8_w8a8,
             )
+        return None
 
-        else:
+    @forward_no_sum.register
+    def _(
+        self, routed_x: IndexedBatchedRoutedActivation, impl: str = "auto"
+    ) -> BatchedExpertResult:
+        resolved = self._resolve_runtime_weights()
+        if resolved is None:
             return super().forward_no_sum(routed_x, impl=impl)
+        (
+            gate_up_proj_weight,
+            gate_up_proj_scale,
+            down_proj_weight,
+            down_proj_scale,
+            fused_soft_fp8,
+            _,
+        ) = resolved
+        return fused_experts_no_sum_blockfp8_indexed(
+            routed_x,
+            w1=gate_up_proj_weight,
+            w2=down_proj_weight,
+            activation="silu",
+            w1_scale=gate_up_proj_scale,
+            w2_scale=down_proj_scale,
+            block_shape=[self.block_size, self.block_size],
+            round_scale_to_pow2=self.round_scale_to_pow2,
+            soft_fp8=fused_soft_fp8,
+            global_num_experts=self.global_n_experts,
+            experts_start_idx=self.experts_start_idx,
+            impl=impl,
+        )
+
+    @forward_no_sum.register
+    def _(
+        self,
+        routed_x: ConcatPermutedBatchedRoutedActivationMinimal,
+        impl: str = "auto",
+    ) -> BatchedExpertResult:
+        resolved = self._resolve_runtime_weights()
+        if resolved is None:
+            return super().forward_no_sum(routed_x, impl=impl)
+        impl = "torch_npu" if impl == "auto" else impl
+        (
+            gate_up_proj_weight,
+            gate_up_proj_scale,
+            down_proj_weight,
+            down_proj_scale,
+            fused_soft_fp8,
+            _,
+        ) = resolved
+        return fused_experts_no_sum_blockfp8_concat_permuted(
+            routed_x,
+            w1=gate_up_proj_weight,
+            w2=down_proj_weight,
+            w1_scale=gate_up_proj_scale,
+            w2_scale=down_proj_scale,
+            experts_start_idx=self.experts_start_idx,
+            impl=impl,
+        )
+
+    @forward_no_sum.register
+    def _(
+        self,
+        routed_x: PerExpertDenseBatchedRoutedActivationMinimal,
+        impl: str = "auto",
+    ) -> BatchedExpertResult:
+        resolved = self._resolve_runtime_weights()
+        if resolved is None:
+            return super().forward_no_sum(routed_x, impl=impl)
+        if impl == "auto":
+            if has_deep_gemm:
+                impl = "deepgemm"
+            else:
+                return super().forward_no_sum(routed_x, impl=impl)
+        (
+            gate_up_proj_weight,
+            gate_up_proj_scale,
+            down_proj_weight,
+            down_proj_scale,
+            fused_soft_fp8,
+            _,
+        ) = resolved
+        return fused_experts_no_sum_blockfp8_per_expert_dense(
+            routed_x,
+            w1=gate_up_proj_weight,
+            w2=down_proj_weight,
+            activation="silu",
+            w1_scale=gate_up_proj_scale,
+            w2_scale=down_proj_scale,
+            block_shape=[self.block_size, self.block_size],
+            round_scale_to_pow2=self.round_scale_to_pow2,
+            experts_start_idx=self.experts_start_idx,
+            impl=impl,
+        )
 
     @override
+    @functools.singledispatchmethod
     def forward(
         self,
         routed_x: BatchedRoutedActivation,
@@ -552,63 +1045,114 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
         inplace: bool = False,
         impl: str = "auto",
     ) -> torch.Tensor:
-        if has_triton:
-            fused_soft_fp8 = False
-            use_fp8_w8a8 = False
-            if (
-                parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
-                == 1
-                or is_nvidia()
-                or is_muxi()
-            ):
-                fused_soft_fp8 = (
-                    parse_dtype(
-                        get_global_args().infer.raise_lower_bit_float_to
-                    ).itemsize
-                    != 1
-                )
-                gate_up_proj_weight = self.gate_up_proj_weight
-                gate_up_proj_scale = self.gate_up_proj_scale
-                down_proj_weight = self.down_proj_weight
-                down_proj_scale = self.down_proj_scale
-                use_fp8_w8a8 = True
-            else:
-                logger.warning(
-                    f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
-                )
-                block_size = 128
-                gate_up_proj_weight = soft_fp8_blockfp8_weight_dequant(
-                    self.gate_up_proj_weight,
-                    self.gate_up_proj_scale,
-                    block_size,
-                )
-                gate_up_proj_scale = None
-                down_proj_weight = soft_fp8_blockfp8_weight_dequant(
-                    self.down_proj_weight,
-                    self.down_proj_scale,
-                    block_size,
-                )
-                down_proj_scale = None
+        return super().forward(routed_x, weights, inplace=inplace, impl=impl)
 
-            return fused_experts_and_sum_wrapper(
-                routed_x,
-                w1=gate_up_proj_weight,
-                w2=down_proj_weight,
-                topk_weights=weights,
-                inplace=inplace,
-                use_fp8_w8a8=use_fp8_w8a8,
-                w1_scale=gate_up_proj_scale,
-                w2_scale=down_proj_scale,
-                block_shape=[self.block_size, self.block_size],
-                round_scale_to_pow2=self.round_scale_to_pow2,
-                soft_fp8=fused_soft_fp8,
-                global_num_experts=self.global_n_experts,
-                experts_start_idx=self.experts_start_idx,
-                impl=impl,
-            )
-
-        else:
+    @forward.register
+    def _(
+        self,
+        routed_x: IndexedBatchedRoutedActivation,
+        weights: torch.Tensor,
+        inplace: bool = False,
+        impl: str = "auto",
+    ) -> torch.Tensor:
+        resolved = self._resolve_runtime_weights()
+        if resolved is None:
             return super().forward(routed_x, weights, inplace=inplace, impl=impl)
+        (
+            gate_up_proj_weight,
+            gate_up_proj_scale,
+            down_proj_weight,
+            down_proj_scale,
+            fused_soft_fp8,
+            _,
+        ) = resolved
+        return fused_experts_sum_blockfp8_indexed(
+            routed_x,
+            w1=gate_up_proj_weight,
+            w2=down_proj_weight,
+            topk_weights=weights,
+            activation="silu",
+            inplace=inplace,
+            w1_scale=gate_up_proj_scale,
+            w2_scale=down_proj_scale,
+            block_shape=[self.block_size, self.block_size],
+            round_scale_to_pow2=self.round_scale_to_pow2,
+            soft_fp8=fused_soft_fp8,
+            global_num_experts=self.global_n_experts,
+            experts_start_idx=self.experts_start_idx,
+            impl=impl,
+        )
+
+    @forward.register
+    def _(
+        self,
+        routed_x: ConcatPermutedBatchedRoutedActivationMinimal,
+        weights: torch.Tensor,
+        inplace: bool = False,
+        impl: str = "auto",
+    ) -> torch.Tensor:
+        resolved = self._resolve_runtime_weights()
+        if resolved is None:
+            return super().forward(routed_x, weights, inplace=inplace, impl=impl)
+        impl = "torch_npu" if impl == "auto" else impl
+        (
+            gate_up_proj_weight,
+            gate_up_proj_scale,
+            down_proj_weight,
+            down_proj_scale,
+            fused_soft_fp8,
+            _,
+        ) = resolved
+        return fused_experts_sum_blockfp8_concat_permuted(
+            routed_x,
+            w1=gate_up_proj_weight,
+            w2=down_proj_weight,
+            topk_weights=weights,
+            inplace=inplace,
+            w1_scale=gate_up_proj_scale,
+            w2_scale=down_proj_scale,
+            experts_start_idx=self.experts_start_idx,
+            impl=impl,
+        )
+
+    @forward.register
+    def _(
+        self,
+        routed_x: PerExpertDenseBatchedRoutedActivationMinimal,
+        weights: torch.Tensor,
+        inplace: bool = False,
+        impl: str = "auto",
+    ) -> torch.Tensor:
+        resolved = self._resolve_runtime_weights()
+        if resolved is None:
+            return super().forward(routed_x, weights, inplace=inplace, impl=impl)
+        if impl == "auto":
+            if has_deep_gemm:
+                impl = "deepgemm"
+            else:
+                return super().forward(routed_x, weights, inplace=inplace, impl=impl)
+        (
+            gate_up_proj_weight,
+            gate_up_proj_scale,
+            down_proj_weight,
+            down_proj_scale,
+            _,
+            _,
+        ) = resolved
+        return fused_experts_sum_blockfp8_per_expert_dense(
+            routed_x,
+            w1=gate_up_proj_weight,
+            w2=down_proj_weight,
+            topk_weights=weights,
+            activation="silu",
+            inplace=inplace,
+            w1_scale=gate_up_proj_scale,
+            w2_scale=down_proj_scale,
+            block_shape=[self.block_size, self.block_size],
+            round_scale_to_pow2=self.round_scale_to_pow2,
+            experts_start_idx=self.experts_start_idx,
+            impl=impl,
+        )
 
     @override
     def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:

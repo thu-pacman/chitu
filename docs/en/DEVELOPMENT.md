@@ -568,7 +568,7 @@ torchrun --nnodes 1 \
     infer.use_cuda_graph=True
 ```
 
-### OpenAI-compatible API (Chat Completions)
+### API Parameters
 
 Test the service via OpenAI-compatible API:
 
@@ -589,30 +589,27 @@ curl localhost:21002/v1/chat/completions \
   }'
 ```
 
-Supported optional JSON arguments are:
+Test the service via OpenAI Responses API:
 
-| Name                    | Type             | Description                                                  |
-| ----------------------- | ---------------- | ------------------------------------------------------------ |
-| `max_completion_tokens` | `int`            | Stop responding once the number of output tokens reaches this limit. |
-| `temperature`           | `float`          | A sampling argument affecting the diversity of the output.   |
-| `top_p`                 | `float`          | A sampling argument affecting the diversity of the output.   |
-| `top_k`                 | `int`            | A sampling argument affecting the diversity of the output.   |
-| `frequency_penalty`     | `float`          | A sampling argument affecting the diversity of the output.   |
-| `logprobs`              | `bool`           | If true, also return `log(softmax(logits))` before sampling, useful for precision analysis. |
-| `top_logprobs`          | `int`            | The number of `logprobs` returned.                           |
-| `stream`                | `bool`           | If true, make the HTTP response streaming, which can be used with `requests.post(stream=True)` in Python. |
-| `stop_with_eos`         | `bool`           | If false, keep generating outputs until the number of output tokens reaches `max_completion_tokens`, even if the answer has already ended, useful for a stable speed test. |
-| `chat_template_kwargs`  | `dict[str, Any]` | Additional argument for the chat template. The only currently supported argument is: `{"enable_thinking": false}` for disabling thinking mode for GLM-4.5 models. |
-| `tools`                 | `list[dict]`     | Tool definitions of tool calling. Please refer https://developers.openai.com/api/docs/guides/function-calling/ |
-| `tool_choice`           | `str or dict`    | Required number of output tool calling. Supports none, auto, required, {"type": "function", "name": "$TOOL_NAME"} |
+```bash
+curl localhost:21002/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "DeepSeek-R1",
+    "instructions": "You are a helpful assistant.",
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "input_text", "text": "Summarize this image input."},
+          {"type": "input_image", "image_url": "https://example.com/cat.png"}
+        ]
+      }
+    ]
+  }'
+```
 
-Additional HTTP headers:
-
-| Name            | Description                                                  |
-| --------------- | ------------------------------------------------------------ |
-| `Authorization` | Format: `Bearer <api_key>`. If `<api_key>` is in `serve.api_keys`, the request will be prioritized. See the `serve.api_keys` configuration when starting the service for details. |
-
-### Anthropic-compatible API (Messages)
+Note: `input_image` / `input_file` blocks are currently accepted for compatibility and converted to text placeholders. Chitu does not perform real multimodal inference on `/v1/responses` yet.
 
 Test the service via Anthropic-compatible API:
 
@@ -631,6 +628,8 @@ curl localhost:21002/v1/messages \
     ]
   }'
 ```
+
+For OpenAI-compatible, OpenAI Responses, and Anthropic-compatible API parameters, see [API Parameters](./API_PARAMETERS.md).
 
 ### Grafana Dashboard
 
@@ -692,6 +691,42 @@ The benchmark follows the following assumption, and you should keep them consist
 - There is no caching between requests.
 
 Note that the benchmarking script uses a lot of file handles when `--batch-size` is large, which may be over the limit by `ulimit`. **It is recommended to raise to limit before benchmarking, for example by `ulimit -n 65536`.**
+
+## Unit Tests
+
+Some unit tests may be used for diagnosing potential issues:
+
+**Single-GPU tests:**
+
+```bash
+pytest [pytest arguments...] ./test/pytest
+```
+
+Feel free to add any other [PyTest](https://docs.pytest.org/) arguments to control printing, filter cases, etc.
+
+Many of the test cases also support benchmarking. Please append `-s` to `pytest` to show the result. By default the timing round is only 1, please also adjust it by appending `--warmup-round=<rounds> --timing-round=<rounds>` for accurate results.
+
+Example:
+
+``` bash
+pytest --warmup-round=5 --timing-round=20 -s ./test/pytest
+```
+
+**Multi-GPU tests:**
+
+```bash
+torchrun [torchrun arguments...] --no-python ./run_pytest_with_pretty_print.sh [pytest arguments...] ./test/dist_pytest
+```
+
+It will perform tests that use GPUs no more than the GPUs you provide via the `torchrun` arguments.
+
+Since errors in distributed programs often make communications hang, it is common that other tests cannot run after any previous test fails. It is recommended to make `pytest` exit on the first error by setting `-x` as a PyTest argument.
+
+Example:
+
+```bash
+torchrun --nproc_per_node 8 --no-python ./test/dist_pytest/run_pytest_with_pretty_print.sh -x ./test/dist_pytest
+```
 
 ## Environment Variables
 

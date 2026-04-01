@@ -5,11 +5,12 @@
 import asyncio
 import threading
 import functools
+import time
 from datetime import datetime
 from logging import getLogger
-from typing import Optional
+from typing import Optional, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from chitu.backend import Backend
 from chitu.serve.event_loop import get_server_event_loop
@@ -21,6 +22,8 @@ logger = getLogger(__name__)
 
 class ChatCompletionResponse(BaseModel):
     id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
     choices: list
     usage: Optional[dict] = None
 
@@ -39,27 +42,46 @@ class AsyncDataStream:
         self.top_tokens_list = []
         self.reasoning_parser = ReasoningParser(reasoning_params)
         self.reasoning_states: list[bool] = []
+        self.cached_reasoning_state: bool = False
 
     def add_data(
         self,
-        value: int,
+        value: Optional[int],
         top_logprobs=None,
         top_token_idx=None,
         *,
         notify_server: bool = True,
     ):
         with self.lock:
-            reasoning_state = self.reasoning_parser.update(value)
-            self.tokens_len += 1
-            self.cache_tokens.append(value)
+            if value is not None:
+                self.cached_reasoning_state = self.reasoning_parser.update(value)
+                self.tokens_len += 1
+                self.cache_tokens.append(value)
+            elif len(self.cache_tokens) == 0:
+                return
             s = self.tokenizer.decode(self.cache_tokens)
             top_tokens = (
                 [self.tokenizer.decode(token_idx) for token_idx in top_token_idx]
                 if top_token_idx
                 else None
             )
+            # When stop signal received, use `add_data(None)` to clear the token cache
+            # TODO: avoid hardcode max length of cache_tokens
             if "\ufffd" in s:
-                return
+                if value is None or (
+                    not self.tokenizer.force_full_seq_decode
+                    and len(self.cache_tokens) > 10
+                ):
+                    logger.warning_once(
+                        "Tokenzier decoding not succeeded using at least 10 latest tokens. The output is "
+                        "probably ill-formed. This may happen when using random inputs for benchmarking "
+                        "and please try some well-formed inputs (e.g. datasets) instead."
+                    )
+                    logger.debug(
+                        f"The tokenzier failure above occurred with tokens: {''.join(self.seqs[-10:]) + s}"
+                    )
+                else:
+                    return
             if not self.tokenizer.force_full_seq_decode:
                 self.cache_tokens.clear()
                 self.seqs.append(s)
@@ -67,7 +89,7 @@ class AsyncDataStream:
             else:
                 self.seqs.append(s[self.chars_len :])
                 self.chars_len = len(s)
-            self.reasoning_states.append(reasoning_state)
+            self.reasoning_states.append(self.cached_reasoning_state)
             if top_logprobs:
                 self.top_logprobs_list.append(top_logprobs)
                 self.top_tokens_list.append(top_tokens)
@@ -75,6 +97,7 @@ class AsyncDataStream:
             self.notify_server_threadsafe()
 
     def send_stop_signal(self):
+        self.add_data(None)
         with self.lock:
             self.stop_signal = True
         self.notify_server_threadsafe()
@@ -130,8 +153,11 @@ class AsyncResponse:
 
         async def stream_response():
             try:
+                has_tool_calls = False
                 async for data, is_reasoning, (top_logprobs, top_tokens) in stream:
                     if data:
+                        if isinstance(data, ChoiceDelta) and data.tool_calls:
+                            has_tool_calls = True
                         if isinstance(data, ChoiceDelta):
                             delta = data
                         elif is_reasoning:
@@ -174,13 +200,16 @@ class AsyncResponse:
                         data = chunk.model_dump_json(exclude_none=True)
                         yield f"data: {data}\n\n"
 
+                finish_reason = self.req.finish_reason
+                if has_tool_calls and finish_reason != "length":
+                    finish_reason = "tool_calls"
                 chunk = ChatCompletionResponse(
                     id=self.id,
                     choices=[
                         {
                             "index": 0,
                             "delta": {"content": ""},
-                            "finish_reason": self.req.finish_reason,
+                            "finish_reason": finish_reason,
                         }
                     ],
                 )

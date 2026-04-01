@@ -4,13 +4,28 @@ import pytest
 from chitu.ops import (
     moe_sum_per_token,
     moe_sum_expert_block_permuted,
+    moe_sum_per_expert_dense,
     moe_sum_expert_concat_permuted,
+    batched_routed_activation_indexed_to_per_expert_dense,
 )
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 from chitu.testing import assert_close
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+
+
+def gen_token_to_expert_indices(
+    num_tokens: int, num_experts: int, topk: int, distribution: str
+):
+    if distribution == "imbalance":
+        return torch.arange(topk, dtype=torch.int32, device="cuda").repeat(
+            num_tokens, 1
+        )
+    elif distribution == "uniform":
+        return torch.multinomial(
+            torch.ones(num_tokens, num_experts, device="cuda"), topk, replacement=False
+        ).to(torch.int32)
 
 
 @pytest.mark.parametrize("M", [0, 32, 64, 128])
@@ -83,6 +98,54 @@ def test_moe_sum_expert_block_permuted(
         lambda: moe_sum_expert_block_permuted(
             input_tensor,
             token_comma_topk_to_block_x_item_indices,
+            topk_weights,
+            out=test_output,
+            impl="triton",
+        ),
+        N=N,
+        impl="triton",
+    )
+
+    assert_close(test_output, ref_output, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("E", [32])
+@pytest.mark.parametrize("M", [0, 32])
+@pytest.mark.parametrize("topk", [8])
+@pytest.mark.parametrize("N", [256])
+@pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
+@pytest.mark.parametrize("compute_dtype", [torch.float16])
+@pytest.mark.skipif(not has_triton, reason="triton is not available")
+def test_moe_sum_per_expert_dense(
+    E, M, topk, N, distribution, compute_dtype, record_benchmark
+):
+    activation = torch.rand((M, N), dtype=compute_dtype, device="cuda")
+    token_to_expert_indices = gen_token_to_expert_indices(M, E, topk, distribution)
+    activation_per_expert, n_tokens_per_expert, token_pos_in_expert = (
+        batched_routed_activation_indexed_to_per_expert_dense(
+            activation=activation,
+            token_to_expert_indices=token_to_expert_indices,
+            num_experts=E,
+        )
+    )
+    topk_weights = torch.rand(M, topk, device="cuda", dtype=compute_dtype)
+
+    ref_output = torch.zeros(M, N, device="cuda", dtype=compute_dtype)
+    moe_sum_per_expert_dense(
+        activation_per_expert,
+        token_to_expert_indices,
+        token_pos_in_expert,
+        topk_weights,
+        out=ref_output,
+        impl="ref",
+    )
+
+    test_output = torch.zeros(M, N, device="cuda", dtype=compute_dtype)
+    record_benchmark.run(
+        lambda: moe_sum_per_expert_dense(
+            activation_per_expert,
+            token_to_expert_indices,
+            token_pos_in_expert,
             topk_weights,
             out=test_output,
             impl="triton",

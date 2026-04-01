@@ -7,6 +7,7 @@ from openai.types.chat import (
     ChatCompletionMessage,
     ChatCompletionMessageFunctionToolCall,
 )
+from openai.types.responses import Response
 from anthropic import AsyncAnthropic
 
 logging.basicConfig(format="[%(name)s] %(message)s", level=logging.INFO)
@@ -60,13 +61,14 @@ CASES_OPEN_AI = [
     {**case, "stream": stream, "api": "openai"}
     for case, stream in itertools.product(CASES_BASE, [False, True])
 ]
-CASES_ANTHROPIC = [
-    {**case, "stream": False, "api": "anthropic"}
-    for case in CASES_BASE
-    if case["parallel"] == True
+CASES_RESPONSES = [
+    {**case, "stream": stream, "api": "responses"}
+    for case, stream in itertools.product(CASES_BASE, [False, True])
 ]
+CASES_ANTHROPIC = [{**case, "stream": False, "api": "anthropic"} for case in CASES_BASE]
 CASES = [
-    {**case, "idx": idx} for idx, case in enumerate(CASES_OPEN_AI + CASES_ANTHROPIC)
+    {**case, "idx": idx}
+    for idx, case in enumerate(CASES_OPEN_AI + CASES_RESPONSES + CASES_ANTHROPIC)
 ]
 
 
@@ -211,6 +213,66 @@ def _tool_result_messages_anthropic(tool_calls: list[dict]) -> list[dict]:
     return [{"role": "user", "content": tool_result_blocks}]
 
 
+def _tool_choice_to_responses(choice):
+    if isinstance(choice, dict) and choice.get("function", {}).get("name"):
+        return {
+            "type": "function",
+            "name": choice["function"]["name"],
+        }
+    return choice
+
+
+def _tools_to_responses(tools: list[dict] | None) -> list[dict] | None:
+    if tools is None:
+        return None
+    return [
+        {
+            "type": "function",
+            "name": tool["function"]["name"],
+            "description": tool["function"].get("description", ""),
+            "parameters": tool["function"].get("parameters", {}),
+        }
+        for tool in tools
+    ]
+
+
+def _response_tool_calls(response: Response) -> list[dict]:
+    tool_calls = []
+    for item in response.output:
+        if getattr(item, "type", None) != "function_call":
+            continue
+        tool_calls.append(
+            {
+                "id": item.call_id,
+                "name": item.name,
+                "arguments": json.loads(item.arguments),
+            }
+        )
+    return tool_calls
+
+
+def _response_output_items_to_input(response: Response) -> list[dict]:
+    return [
+        item.model_dump(exclude_none=True, by_alias=True) for item in response.output
+    ]
+
+
+def _tool_result_messages_responses(tool_calls: list[dict]) -> list[dict]:
+    tool_msgs = []
+    for tool_call in tool_calls:
+        name = tool_call["name"]
+        args = tool_call["arguments"]
+        result = tool_functions[name](**args)
+        tool_msgs.append(
+            {
+                "type": "function_call_output",
+                "call_id": tool_call["id"],
+                "output": result,
+            }
+        )
+    return tool_msgs
+
+
 async def _round_openai(
     messages: list,
     kwargs: dict,
@@ -234,14 +296,59 @@ async def _round_openai(
     return content, rcontent, tool_calls
 
 
-def _tool_choice_to_anthropic(choice):
+async def _round_responses(
+    messages: list,
+    kwargs: dict,
+):
+    req_kwargs = dict(
+        model=kwargs["model"],
+        input=messages,
+        tools=_tools_to_responses(kwargs.get("tools")),
+        tool_choice=_tool_choice_to_responses(kwargs["tool_choice"]),
+        parallel_tool_calls=kwargs["parallel_tool_calls"],
+        max_output_tokens=kwargs["max_tokens"],
+        temperature=kwargs["temperature"],
+        stream=kwargs["stream"],
+        reasoning={"effort": "medium" if ENABLE_THINKING else "none"},
+    )
+    if req_kwargs["tools"] is None:
+        req_kwargs.pop("tools")
+
+    response = await openai_client.responses.create(**req_kwargs)
+    if kwargs["stream"]:
+        final_response = None
+        async for event in response:
+            if event.type == "response.completed":
+                final_response = event.response
+        if final_response is None:
+            raise RuntimeError("responses stream finished without response.completed")
+        response = final_response
+
+    assert isinstance(response, Response)
+    content = getattr(response, "output_text", "") or ""
+    rcontent = ""
+    tool_calls = _response_tool_calls(response)
+    tool_msgs = _tool_result_messages_responses(tool_calls)
+    messages.extend(_response_output_items_to_input(response))
+    messages.extend(tool_msgs)
+    return content, rcontent, tool_calls
+
+
+def _tool_choice_to_anthropic(choice, parallel_tool_calls):
+    disable_parallel = not parallel_tool_calls
     if isinstance(choice, dict) and choice.get("function", {}).get("name"):
-        return {"type": "tool", "name": choice["function"]["name"]}
-    if choice == "required":
-        return {"type": "any"}
-    if choice in {"none", "auto"}:
-        return {"type": choice}
-    return {"type": "auto"}
+        return {
+            "type": "tool",
+            "name": choice["function"]["name"],
+            "disable_parallel_tool_use": disable_parallel,
+        }
+    if choice == "none":
+        return {"type": "none"}
+
+    return {
+        "type": "any" if choice == "required" else "auto",
+        "disable_parallel_tool_use": disable_parallel,
+    }
 
 
 async def _round_anthropic(
@@ -250,7 +357,9 @@ async def _round_anthropic(
 ):
     if kwargs["stream"]:
         raise RuntimeError("anthropic stream not supported in this test")
-    kwargs["tool_choice"] = _tool_choice_to_anthropic(kwargs["tool_choice"])
+    kwargs["tool_choice"] = _tool_choice_to_anthropic(
+        kwargs["tool_choice"], kwargs["parallel_tool_calls"]
+    )
     kwargs.pop("parallel_tool_calls")
     kwargs["thinking"] = {"type": "enabled" if ENABLE_THINKING else "disabled"}
     msg = await anthropic_client.messages.create(messages=messages, **kwargs)
@@ -301,7 +410,15 @@ async def test(
             logger.info(f"case {idx} begin {retry=}")
             city = CITIES[base_idx % len(CITIES)]
             prompt_str = PROMPTS[prompt].format(city=city)
-            messages = [{"role": "user", "content": prompt_str}]
+            if api == "responses":
+                messages = [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": prompt_str}],
+                    }
+                ]
+            else:
+                messages = [{"role": "user", "content": prompt_str}]
 
             real_nums = []
             for i in range(len(nums)):
@@ -326,6 +443,8 @@ async def test(
                 old_messages = messages.copy()
                 if api == "openai":
                     round_result = await _round_openai(messages, kwargs)
+                elif api == "responses":
+                    round_result = await _round_responses(messages, kwargs)
                 else:
                     round_result = await _round_anthropic(messages, kwargs)
                 content, rcontent, tool_calls = round_result

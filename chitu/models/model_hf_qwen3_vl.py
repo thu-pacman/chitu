@@ -15,7 +15,7 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.cache_manager import KVCacheManagerBase, MMPagedKVCacheManager
+from chitu.kv_cache import KVCacheBase, MMPagedKVCache
 from chitu.distributed.parallel_state import get_etp_size
 from chitu.global_vars import get_global_args
 from chitu.moe.impl import MoEImplEP, get_moe_impl
@@ -472,7 +472,7 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
     def __init__(
         self,
         params,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -510,7 +510,7 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
 
         super().__init__(
             params,
-            cache_managers,
+            cache_dict,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             attn_backend=attn_backend,
@@ -540,7 +540,7 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
         # Each entry tracks remaining image/video features and DeepStack payloads to guarantee
         # correct alignment under chunked prefilling.
         self._mm_req_cache: dict[str, dict[str, Any]] = {}
-        self.mm_cache_manager: MMPagedKVCacheManager = cache_managers.get("multimodal")
+        self.mm_cache: MMPagedKVCache = cache_dict.get("multimodal")
 
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         ret = super()._get_tensor_column_parallel_layer_names()
@@ -554,7 +554,7 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
         *,
         input_ids_flat: torch.Tensor,
         seq_ids: torch.Tensor,
-        curr_req_ids: list[str],
+        curr_tids: list[str],
         grid_thw: Optional[torch.Tensor],
         video_grid_thw: Optional[torch.Tensor],
         spatial_merge_size: int,
@@ -568,7 +568,7 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
 
         Returns:
             position_ids_flat: [3, total_tokens]
-            rope_deltas: [batch_size, 1] (aligned to curr_req_ids order)
+            rope_deltas: [batch_size, 1] (aligned to curr_tids order)
         """
         if input_ids_flat.dim() != 1:
             raise ValueError("input_ids_flat must be 1D")
@@ -576,9 +576,9 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
             raise ValueError(
                 f"seq_ids length mismatch: seq_ids={seq_ids.numel()} tokens={input_ids_flat.numel()}"
             )
-        bsz = len(curr_req_ids)
+        bsz = len(curr_tids)
         if bsz <= 0:
-            raise ValueError("cache.curr_req_ids is required for multimodal MRoPE")
+            raise ValueError("cache.curr_tids is required for multimodal MRoPE")
 
         # Build per-request grid lists (conservative mapping to ensure correctness).
         img_grid_by_req: dict[int, list[torch.Tensor]] = {}
@@ -614,20 +614,18 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
                 )
 
         # Reset per-request MRoPE state when a request is new in this step (old_len == 0).
-        old_lens = getattr(
-            self.cache_managers["main"].seq_len_delta.old, "lens_list", None
-        )
+        old_lens = getattr(self.cache_dict["main"].seq_len_delta.old, "lens_list", None)
         if old_lens is None or len(old_lens) != bsz:
             # Fallback: do not reset; still produce incremental ids best-effort.
             old_lens = [None] * bsz
-        for req_idx, rid in enumerate(curr_req_ids):
+        for req_idx, rid in enumerate(curr_tids):
             if old_lens[req_idx] == 0:
                 entry = self._mm_req_cache.setdefault(rid, {})
                 entry.pop("mrope", None)
 
         # Helper: create/get state dict
         def _state_for(req_idx: int) -> dict[str, Any]:
-            rid = curr_req_ids[req_idx]
+            rid = curr_tids[req_idx]
             entry = self._mm_req_cache.setdefault(rid, {})
             st = entry.get("mrope")
             if st is None:
@@ -776,12 +774,10 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
         rope_deltas = torch.zeros(
             (bsz, 1), device=input_ids_flat.device, dtype=input_ids_flat.dtype
         )
-        new_lens = getattr(
-            self.cache_managers["main"].seq_len_delta.new, "lens_list", None
-        )
+        new_lens = getattr(self.cache_dict["main"].seq_len_delta.new, "lens_list", None)
         if new_lens is None or len(new_lens) != bsz:
             new_lens = [None] * bsz
-        for req_idx, rid in enumerate(curr_req_ids):
+        for req_idx, rid in enumerate(curr_tids):
             st = _state_for(req_idx)
             if st["in_vision"]:
                 max_pos = int(st["base"]) + int(st["max"])
@@ -851,39 +847,35 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
         # During multimodal prefill we compute 3-axis (T/H/W) position ids; use them directly.
         if self._last_position_ids is not None:
             pos3 = self._last_position_ids.to(
-                self.cache_managers[
+                self.cache_dict[
                     "main"
                 ].seq_len_delta.delta_position_ids_tensor_device.device
             ).view(3, 1, -1)
         else:
-            pos = self.cache_managers[
-                "main"
-            ].seq_len_delta.delta_position_ids_tensor_device
+            pos = self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
             # RoPE itself only depends on position ids (not tokens). For multimodal MRoPE, the "token index"
             # position ids in `cache.seq_len_delta` are not the final RoPE positions when vision tokens were
             # present in prefill (they are compressed/mapped). We therefore adjust position ids by a cached
             # per-request `rope_delta` so decode continues from the correct RoPE phase.
             # NOTE: decode batch membership can change across steps; use per-req mapping when available.
             if self._rope_delta_by_req:
-                curr_req_ids = getattr(
-                    self.cache_managers["main"], "curr_req_ids", None
-                )
+                curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
                 if (
-                    curr_req_ids is not None
+                    curr_tids is not None
                     and pos.dim() == 1
-                    and pos.numel() == len(curr_req_ids)
+                    and pos.numel() == len(curr_tids)
                 ):
                     # CUDA-graph safe: build rope deltas purely on device (no host->device copies).
                     rope_delta = torch.empty_like(pos)
                     rope_delta.zero_()
-                    for i, rid in enumerate(curr_req_ids):
+                    for i, rid in enumerate(curr_tids):
                         v = self._rope_delta_by_req.get(rid, None)
                         if v is not None:
                             rope_delta[i] = v.to(device=pos.device, dtype=pos.dtype)
                     pos = pos + rope_delta
                 else:
                     raise ValueError(
-                        "Qwen3-VL multimodal decode requires cache.curr_req_ids aligned with "
+                        "Qwen3-VL multimodal decode requires cache.curr_tids aligned with "
                         "delta_position_ids (per-request rope_delta is enabled)."
                     )
             pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)
@@ -904,16 +896,16 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
     ) -> tuple[tuple[torch.Tensor, ...], tuple[int, ...]]:
         # NOTE: Must always return the same number of extra inputs for a given captured graph.
         # We always pass a rope_delta tensor (zeros if not available) to keep the signature stable.
-        pos = self.cache_managers["main"].seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
         rope = torch.zeros_like(pos)
-        curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
+        curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
         if self._rope_delta_by_req:
-            if curr_req_ids is None or len(curr_req_ids) != int(rope.numel()):
+            if curr_tids is None or len(curr_tids) != int(rope.numel()):
                 raise ValueError(
-                    "Qwen3-VL multimodal CUDA-graph decode requires cache.curr_req_ids aligned with "
+                    "Qwen3-VL multimodal CUDA-graph decode requires cache.curr_tids aligned with "
                     "delta_position_ids (per-request rope_delta is enabled)."
                 )
-            for i, rid in enumerate(curr_req_ids):
+            for i, rid in enumerate(curr_tids):
                 v = self._rope_delta_by_req.get(rid, None)
                 if v is not None:
                     rope[i] = v.to(device=rope.device, dtype=rope.dtype)
@@ -928,7 +920,7 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
         if len(extra_inputs) < 1:
             raise ValueError("Qwen3-VL decode graph requires rope_delta as extra input")
         rope_delta = extra_inputs[0]
-        pos = self.cache_managers["main"].seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
         pos = pos + rope_delta.to(device=pos.device, dtype=pos.dtype)
         pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)
 
@@ -946,18 +938,16 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
         self, tokens: torch.Tensor, batch_size: int
     ) -> tuple[tuple[torch.Tensor, ...], tuple[int, ...]]:
         # Keep CUDA-graph MTP decode signature stable: always pass a rope_delta tensor (zeros if not available).
-        pos = self.cache_managers[
-            "main"
-        ].mtp_seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_dict["main"].mtp_seq_len_delta.delta_position_ids_tensor_device
         rope = torch.zeros_like(pos)
-        curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
+        curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
         if self._rope_delta_by_req:
-            if curr_req_ids is None or len(curr_req_ids) != int(rope.numel()):
+            if curr_tids is None or len(curr_tids) != int(rope.numel()):
                 raise ValueError(
-                    "Qwen3-VL multimodal CUDA-graph MTP decode requires cache.curr_req_ids aligned with "
+                    "Qwen3-VL multimodal CUDA-graph MTP decode requires cache.curr_tids aligned with "
                     "mtp delta_position_ids (per-request rope_delta is enabled)."
                 )
-            for i, rid in enumerate(curr_req_ids):
+            for i, rid in enumerate(curr_tids):
                 v = self._rope_delta_by_req.get(rid, None)
                 if v is not None:
                     rope[i] = v.to(device=rope.device, dtype=rope.dtype)
@@ -972,9 +962,7 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
                 "Qwen3-VL MTP decode graph requires rope_delta as extra input"
             )
         rope_delta = extra_inputs[0]
-        pos = self.cache_managers[
-            "main"
-        ].mtp_seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_dict["main"].mtp_seq_len_delta.delta_position_ids_tensor_device
         pos = pos + rope_delta.to(device=pos.device, dtype=pos.dtype)
         pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)
 
@@ -991,33 +979,31 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
     def prepare_freqs_cis_mtp(self) -> BatchedFreqsCis:
         if self._last_position_ids is not None:
             pos3 = self._last_position_ids.to(
-                self.cache_managers[
+                self.cache_dict[
                     "main"
                 ].mtp_seq_len_delta.delta_position_ids_tensor_device.device
             ).view(3, 1, -1)
         else:
-            pos = self.cache_managers[
+            pos = self.cache_dict[
                 "main"
             ].mtp_seq_len_delta.delta_position_ids_tensor_device
             if self._rope_delta_by_req:
-                curr_req_ids = getattr(
-                    self.cache_managers["main"], "curr_req_ids", None
-                )
+                curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
                 if (
-                    curr_req_ids is not None
+                    curr_tids is not None
                     and pos.dim() == 1
-                    and pos.numel() == len(curr_req_ids)
+                    and pos.numel() == len(curr_tids)
                 ):
                     rope_delta = torch.empty_like(pos)
                     rope_delta.zero_()
-                    for i, rid in enumerate(curr_req_ids):
+                    for i, rid in enumerate(curr_tids):
                         v = self._rope_delta_by_req.get(rid, None)
                         if v is not None:
                             rope_delta[i] = v.to(device=pos.device, dtype=pos.dtype)
                     pos = pos + rope_delta
                 else:
                     raise ValueError(
-                        "Qwen3-VL multimodal MTP decode requires cache.curr_req_ids aligned with "
+                        "Qwen3-VL multimodal MTP decode requires cache.curr_tids aligned with "
                         "mtp delta_position_ids (per-request rope_delta is enabled)."
                     )
             pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)
@@ -1239,11 +1225,11 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
 
             return mask_1d, None
 
-        curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
-        if curr_req_ids is None:
-            curr_req_ids = []
-        if len(curr_req_ids) > 0:
-            seq_ids = self.cache_managers[
+        curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
+        if curr_tids is None:
+            curr_tids = []
+        if len(curr_tids) > 0:
+            seq_ids = self.cache_dict[
                 "main"
             ].seq_len_delta.delta_seq_ids_tensor_device.to(device=input_ids_flat.device)
             if seq_ids.numel() != input_ids_flat.numel():
@@ -1258,16 +1244,12 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
             image_embeds_splits, deepstack_image_embeds = self.get_image_features(
                 pixel_values, grid_thw=grid_thw
             )
-            if len(curr_req_ids) == 0:
-                raise ValueError(
-                    "cache.curr_req_ids is required for multimodal prefill."
-                )
+            if len(curr_tids) == 0:
+                raise ValueError("cache.curr_tids is required for multimodal prefill.")
             req_indices_img: list[int] = []
-            for req_idx, rid in enumerate(curr_req_ids):
+            for req_idx, rid in enumerate(curr_tids):
                 has_cache = False
-                total = self.mm_cache_manager.get_consumption_progress(
-                    rid, "vision_embeds"
-                )
+                total = self.mm_cache.get_consumption_progress(rid, "vision_embeds")
                 has_cache = total > 0
                 has_tok = bool(
                     torch.any(
@@ -1280,7 +1262,7 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
 
             _mm_prepare_cache(
                 kind="image",
-                req_ids=curr_req_ids,
+                req_ids=curr_tids,
                 req_indices=req_indices_img,
                 splits=list(image_embeds_splits),
                 deepstack_full=deepstack_image_embeds,
@@ -1290,7 +1272,7 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
             image_mask_1d, ds_image = _mm_consume(
                 kind="image",
                 token_id=int(self.image_token_id),
-                req_ids=curr_req_ids,
+                req_ids=curr_tids,
                 seq_ids=seq_ids,
             )
             if ds_image is not None:
@@ -1301,16 +1283,12 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
             video_embeds_splits, deepstack_video_embeds = self.get_video_features(
                 pixel_values_videos, grid_thw=video_grid_thw
             )
-            if len(curr_req_ids) == 0:
-                raise ValueError(
-                    "cache.curr_req_ids is required for multimodal prefill."
-                )
+            if len(curr_tids) == 0:
+                raise ValueError("cache.curr_tids is required for multimodal prefill.")
             req_indices_vid: list[int] = []
-            for req_idx, rid in enumerate(curr_req_ids):
+            for req_idx, rid in enumerate(curr_tids):
                 has_cache = False
-                total = self.mm_cache_manager.get_consumption_progress(
-                    rid, "vision_embeds"
-                )
+                total = self.mm_cache.get_consumption_progress(rid, "vision_embeds")
                 has_cache = total > 0
                 has_tok = bool(
                     torch.any(
@@ -1323,7 +1301,7 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
 
             _mm_prepare_cache(
                 kind="video",
-                req_ids=curr_req_ids,
+                req_ids=curr_tids,
                 req_indices=req_indices_vid,
                 splits=list(video_embeds_splits),
                 deepstack_full=deepstack_video_embeds,
@@ -1333,7 +1311,7 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
             video_mask_1d, ds_video = _mm_consume(
                 kind="video",
                 token_id=int(self.video_token_id),
-                req_ids=curr_req_ids,
+                req_ids=curr_tids,
                 seq_ids=seq_ids,
             )
             if ds_video is not None:
@@ -1388,24 +1366,24 @@ class TransformerQwen3VL(TransformerQwen3VLBase):
         # MRoPE position ids must be prepared before materializing cos/sin for prefill.
         # Chunked prefill can split vision blocks; use incremental chunk-aware MRoPE.
         if grid_thw is not None or video_grid_thw is not None:
-            curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
-            if curr_req_ids is None:
-                raise ValueError("cache.curr_req_ids is required for multimodal MRoPE")
-            seq_ids = self.cache_managers[
+            curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
+            if curr_tids is None:
+                raise ValueError("cache.curr_tids is required for multimodal MRoPE")
+            seq_ids = self.cache_dict[
                 "main"
             ].seq_len_delta.delta_seq_ids_tensor_device.to(device=input_ids_flat.device)
             spatial_merge_size = int(self.vision_config.spatial_merge_size)
             pos_flat, rope_deltas = self._get_mrope_position_ids_chunked_flat(
                 input_ids_flat=input_ids_flat,
                 seq_ids=seq_ids,
-                curr_req_ids=curr_req_ids,
+                curr_tids=curr_tids,
                 grid_thw=grid_thw,
                 video_grid_thw=video_grid_thw,
                 spatial_merge_size=spatial_merge_size,
             )
             self._last_position_ids = pos_flat.reshape(3, -1)
             # Persist rope_delta per request id for later decode steps.
-            for i, rid in enumerate(curr_req_ids):
+            for i, rid in enumerate(curr_tids):
                 # Store as CUDA 0-d tensor to avoid host->device copies during CUDA graph capture.
                 self._rope_delta_by_req[rid] = (
                     rope_deltas[i, 0].to(torch.int32).reshape(())
@@ -1499,7 +1477,7 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
     def __init__(
         self,
         params,
-        cache_managers: dict[str, KVCacheManagerBase],
+        cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
         pipeline_parallel_size: int,
@@ -1536,7 +1514,7 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
 
         super().__init__(
             params,
-            cache_managers,
+            cache_dict,
             max_position_embeddings=max_position_embeddings,
             pipeline_parallel_size=pipeline_parallel_size,
             attn_backend=attn_backend,
@@ -1561,7 +1539,7 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
         self._rope_delta_by_req: dict[str, torch.Tensor] = {}
         # Cross-chunk multimodal caches, keyed by req_id (chunked prefill support).
         self._mm_req_cache: dict[str, dict[str, Any]] = {}
-        self.mm_cache_manager: MMPagedKVCacheManager = cache_managers.get("multimodal")
+        self.mm_cache: MMPagedKVCache = cache_dict.get("multimodal")
 
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:
         ret = super()._get_tensor_column_parallel_layer_names()
@@ -1696,11 +1674,11 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
         deepstack_image_embeds = None
         deepstack_video_embeds = None
 
-        curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
-        if curr_req_ids is None:
-            curr_req_ids = []
-        if len(curr_req_ids) > 0:
-            seq_ids = self.cache_managers[
+        curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
+        if curr_tids is None:
+            curr_tids = []
+        if len(curr_tids) > 0:
+            seq_ids = self.cache_dict[
                 "main"
             ].seq_len_delta.delta_seq_ids_tensor_device.to(device=input_ids_flat.device)
             if seq_ids.numel() != input_ids_flat.numel():
@@ -1835,17 +1813,13 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
             image_embeds_splits, deepstack_image_embeds = self.get_image_features(
                 pixel_values, grid_thw=grid_thw
             )
-            if len(curr_req_ids) == 0:
-                raise ValueError(
-                    "cache.curr_req_ids is required for multimodal prefill."
-                )
+            if len(curr_tids) == 0:
+                raise ValueError("cache.curr_tids is required for multimodal prefill.")
             # Identify which requests need image features in this chunk (or already have cache).
             req_indices_img: list[int] = []
-            for req_idx, rid in enumerate(curr_req_ids):
+            for req_idx, rid in enumerate(curr_tids):
                 has_cache = False
-                total = self.mm_cache_manager.get_consumption_progress(
-                    rid, "vision_embeds"
-                )
+                total = self.mm_cache.get_consumption_progress(rid, "vision_embeds")
                 has_cache = total > 0
                 has_tok = bool(
                     torch.any(
@@ -1858,7 +1832,7 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
 
             _mm_prepare_cache(
                 kind="image",
-                req_ids=curr_req_ids,
+                req_ids=curr_tids,
                 req_indices=req_indices_img,
                 splits=list(image_embeds_splits),
                 deepstack_full=deepstack_image_embeds,
@@ -1868,7 +1842,7 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
             image_mask_1d, ds_image = _mm_consume(
                 kind="image",
                 token_id=int(self.image_token_id),
-                req_ids=curr_req_ids,
+                req_ids=curr_tids,
                 seq_ids=seq_ids,
             )
             if ds_image is not None:
@@ -1879,16 +1853,12 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
             video_embeds_splits, deepstack_video_embeds = self.get_video_features(
                 pixel_values_videos, grid_thw=video_grid_thw
             )
-            if len(curr_req_ids) == 0:
-                raise ValueError(
-                    "cache.curr_req_ids is required for multimodal prefill."
-                )
+            if len(curr_tids) == 0:
+                raise ValueError("cache.curr_tids is required for multimodal prefill.")
             req_indices_vid: list[int] = []
-            for req_idx, rid in enumerate(curr_req_ids):
+            for req_idx, rid in enumerate(curr_tids):
                 has_cache = False
-                total = self.mm_cache_manager.get_consumption_progress(
-                    rid, "vision_embeds"
-                )
+                total = self.mm_cache.get_consumption_progress(rid, "vision_embeds")
                 has_cache = total > 0
                 has_tok = bool(
                     torch.any(
@@ -1901,7 +1871,7 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
 
             _mm_prepare_cache(
                 kind="video",
-                req_ids=curr_req_ids,
+                req_ids=curr_tids,
                 req_indices=req_indices_vid,
                 splits=list(video_embeds_splits),
                 deepstack_full=deepstack_video_embeds,
@@ -1911,7 +1881,7 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
             video_mask_1d, ds_video = _mm_consume(
                 kind="video",
                 token_id=int(self.video_token_id),
-                req_ids=curr_req_ids,
+                req_ids=curr_tids,
                 seq_ids=seq_ids,
             )
             if ds_video is not None:
@@ -1972,7 +1942,7 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
                     cast(Any, self),
                     input_ids_flat=input_ids_flat,
                     seq_ids=seq_ids,
-                    curr_req_ids=curr_req_ids,
+                    curr_tids=curr_tids,
                     grid_thw=grid_thw,
                     video_grid_thw=video_grid_thw,
                     spatial_merge_size=spatial_merge_size,
@@ -1980,7 +1950,7 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
             )
             self._last_position_ids = pos_flat.reshape(3, -1)
             # Persist rope_delta per request id for later decode steps.
-            for i, rid in enumerate(curr_req_ids):
+            for i, rid in enumerate(curr_tids):
                 self._rope_delta_by_req[rid] = (
                     rope_deltas[i, 0].to(torch.int32).reshape(())
                 )
@@ -2081,35 +2051,31 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
         # During multimodal prefill we compute 3-axis (T/H/W) position ids; use them directly.
         if self._last_position_ids is not None:
             pos3 = self._last_position_ids.to(
-                self.cache_managers[
+                self.cache_dict[
                     "main"
                 ].seq_len_delta.delta_position_ids_tensor_device.device
             ).view(3, 1, -1)
         else:
-            pos = self.cache_managers[
-                "main"
-            ].seq_len_delta.delta_position_ids_tensor_device
+            pos = self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
             # vLLM parity: apply cached rope_delta for multimodal decode.
             # NOTE: decode batch membership can change across steps; use per-req mapping when available.
             if self._rope_delta_by_req:
-                curr_req_ids = getattr(
-                    self.cache_managers["main"], "curr_req_ids", None
-                )
+                curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
                 if (
-                    curr_req_ids is not None
+                    curr_tids is not None
                     and pos.dim() == 1
-                    and pos.numel() == len(curr_req_ids)
+                    and pos.numel() == len(curr_tids)
                 ):
                     rope = torch.empty_like(pos)
                     rope.zero_()
-                    for i, rid in enumerate(curr_req_ids):
+                    for i, rid in enumerate(curr_tids):
                         v = self._rope_delta_by_req.get(rid, None)
                         if v is not None:
                             rope[i] = v.to(device=pos.device, dtype=pos.dtype)
                     pos = pos + rope
                 else:
                     raise ValueError(
-                        "Qwen3-VL-MoE multimodal decode requires cache.curr_req_ids aligned with "
+                        "Qwen3-VL-MoE multimodal decode requires cache.curr_tids aligned with "
                         "delta_position_ids (per-request rope_delta is enabled)."
                     )
             pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)
@@ -2135,16 +2101,16 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
         self, tokens: torch.Tensor, batch_size: int
     ) -> tuple[tuple[torch.Tensor, ...], tuple[int, ...]]:
         # Keep CUDA-graph decode signature stable: always pass a rope_delta tensor (zeros if not available).
-        pos = self.cache_managers["main"].seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
         rope = torch.zeros_like(pos)
-        curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
+        curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
         if self._rope_delta_by_req:
-            if curr_req_ids is None or len(curr_req_ids) != int(rope.numel()):
+            if curr_tids is None or len(curr_tids) != int(rope.numel()):
                 raise ValueError(
-                    "Qwen3-VL-MoE multimodal CUDA-graph decode requires cache.curr_req_ids aligned with "
+                    "Qwen3-VL-MoE multimodal CUDA-graph decode requires cache.curr_tids aligned with "
                     "delta_position_ids (per-request rope_delta is enabled)."
                 )
-            for i, rid in enumerate(curr_req_ids):
+            for i, rid in enumerate(curr_tids):
                 v = self._rope_delta_by_req.get(rid, None)
                 if v is not None:
                     rope[i] = v.to(device=rope.device, dtype=rope.dtype)
@@ -2160,7 +2126,7 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
                 "Qwen3-VL-MoE decode graph requires rope_delta as extra input"
             )
         rope_delta = extra_inputs[0]
-        pos = self.cache_managers["main"].seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_dict["main"].seq_len_delta.delta_position_ids_tensor_device
         pos = pos + rope_delta.to(device=pos.device, dtype=pos.dtype)
         pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)
 
@@ -2184,18 +2150,16 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
         self, tokens: torch.Tensor, batch_size: int
     ) -> tuple[tuple[torch.Tensor, ...], tuple[int, ...]]:
         # Keep CUDA-graph MTP decode signature stable: always pass a rope_delta tensor (zeros if not available).
-        pos = self.cache_managers[
-            "main"
-        ].mtp_seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_dict["main"].mtp_seq_len_delta.delta_position_ids_tensor_device
         rope = torch.zeros_like(pos)
-        curr_req_ids = getattr(self.cache_managers["main"], "curr_req_ids", None)
+        curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
         if self._rope_delta_by_req:
-            if curr_req_ids is None or len(curr_req_ids) != int(rope.numel()):
+            if curr_tids is None or len(curr_tids) != int(rope.numel()):
                 raise ValueError(
-                    "Qwen3-VL-MoE multimodal CUDA-graph MTP decode requires cache.curr_req_ids aligned with "
+                    "Qwen3-VL-MoE multimodal CUDA-graph MTP decode requires cache.curr_tids aligned with "
                     "mtp delta_position_ids (per-request rope_delta is enabled)."
                 )
-            for i, rid in enumerate(curr_req_ids):
+            for i, rid in enumerate(curr_tids):
                 v = self._rope_delta_by_req.get(rid, None)
                 if v is not None:
                     rope[i] = v.to(device=rope.device, dtype=rope.dtype)
@@ -2210,9 +2174,7 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
                 "Qwen3-VL-MoE MTP decode graph requires rope_delta as extra input"
             )
         rope_delta = extra_inputs[0]
-        pos = self.cache_managers[
-            "main"
-        ].mtp_seq_len_delta.delta_position_ids_tensor_device
+        pos = self.cache_dict["main"].mtp_seq_len_delta.delta_position_ids_tensor_device
         pos = pos + rope_delta.to(device=pos.device, dtype=pos.dtype)
         pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)
 
@@ -2235,33 +2197,31 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
     def prepare_freqs_cis_mtp(self) -> BatchedFreqsCis:
         if self._last_position_ids is not None:
             pos3 = self._last_position_ids.to(
-                self.cache_managers[
+                self.cache_dict[
                     "main"
                 ].mtp_seq_len_delta.delta_position_ids_tensor_device.device
             ).view(3, 1, -1)
         else:
-            pos = self.cache_managers[
+            pos = self.cache_dict[
                 "main"
             ].mtp_seq_len_delta.delta_position_ids_tensor_device
             if self._rope_delta_by_req:
-                curr_req_ids = getattr(
-                    self.cache_managers["main"], "curr_req_ids", None
-                )
+                curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
                 if (
-                    curr_req_ids is not None
+                    curr_tids is not None
                     and pos.dim() == 1
-                    and pos.numel() == len(curr_req_ids)
+                    and pos.numel() == len(curr_tids)
                 ):
                     rope_delta = torch.empty_like(pos)
                     rope_delta.zero_()
-                    for i, rid in enumerate(curr_req_ids):
+                    for i, rid in enumerate(curr_tids):
                         v = self._rope_delta_by_req.get(rid, None)
                         if v is not None:
                             rope_delta[i] = v.to(device=pos.device, dtype=pos.dtype)
                     pos = pos + rope_delta
                 else:
                     raise ValueError(
-                        "Qwen3-VL-MoE multimodal MTP decode requires cache.curr_req_ids aligned with "
+                        "Qwen3-VL-MoE multimodal MTP decode requires cache.curr_tids aligned with "
                         "mtp delta_position_ids (per-request rope_delta is enabled)."
                     )
             pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)

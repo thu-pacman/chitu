@@ -162,7 +162,10 @@ def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
 
 def gen_reqs(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
     global local_args, msgs
-    if "DeepSeek-V3.2" in local_args.models.name:
+    if (
+        "DeepSeek-V3.2" in local_args.models.name
+        and local_args.infer.max_seq_len >= 4096
+    ):
         msgs = msgs_long + msgs
 
     if local_args.request.prompt_tokens_len > 0:

@@ -2,9 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import asyncio
 import json
-import msgpack
 import os
 import time
 import functools
@@ -14,7 +12,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from logging import getLogger
-from pathlib import Path
 from typing import Any, ClassVar, Deque, Optional, Mapping, Union, Iterable
 from typing_extensions import override
 
@@ -23,12 +20,17 @@ import torch
 from chitu.task_type import TaskType, is_prefill, is_decode
 from chitu.async_response import AsyncDataStream
 from chitu.backend import Backend
-from chitu.device_list import DeviceList, StaticDeviceListManager
+from chitu.device_list import DeviceList
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.tool_call import ToolChoice, ToolCallParams, adjust_message_for_tool_calls
 from chitu.reasoning import get_reasoning_params, update_chat_template_kwargs_reasoning
+<<<<<<< HEAD
 from chitu.constraint_decode import ConstraintDecodeTask
 from chitu.serve.event_loop import get_server_event_loop
+=======
+from chitu.sampling.utils import compile_grammar, deserialize_grammar
+from chitu.kv_cache import TokenBlock
+>>>>>>> public-main
 
 logger = getLogger(__name__)
 
@@ -204,9 +206,7 @@ class UserRequest:
                     parallel_tool_calls=parallel_tool_calls,
                 )
             )
-            self.grammar, self.grammar_str = (
-                Backend.constraint_decode_manager.compile_grammar(grammar)
-            )
+            self.grammar, self.grammar_str = compile_grammar(grammar)
 
         # response related
         self.output = ""
@@ -392,7 +392,7 @@ class MockFixedLengthedUserRequest(UserRequest):
         return [1] * self.input_len
 
 
-class Task(ConstraintDecodeTask):
+class Task:
     def __init__(
         self,
         task_id: str,
@@ -446,40 +446,25 @@ class Task(ConstraintDecodeTask):
             self.grammar = req.grammar
         else:
             self.grammar_str = grammar_str
-            # Only deserialize grammar if grammar_str is not empty
-            # This allows creating Task without Backend being fully initialized (e.g., in tests)
-            if grammar_str:
-                constraint_decode_manager = getattr(
-                    Backend, "constraint_decode_manager", None
-                )
-                if constraint_decode_manager is not None:
-                    self.grammar = constraint_decode_manager.deserialize_grammar(
-                        grammar_str
-                    )
-                else:
-                    self.grammar = None
-            else:
-                self.grammar = None
+            self.grammar = deserialize_grammar(grammar_str)
 
         self.prefill_chunk_size: Optional[int] = (
             None  # Dynamic in Task, but adds up to be no higher than a static bound in PackedTasks
         )
         self.consumed_req_tokens = 0
 
+        self.new_cache_ids = []
+
+        # prefix caching
+        self.token_blocks: list[TokenBlock] = []
+        self.hit_token_len: int = 0
+
         # Response
-        # Use getattr for safe access in test environments where infer config may be incomplete
-        infer_cfg = getattr(get_global_args(), "infer", None)
-        op_impl = getattr(infer_cfg, "op_impl", None) if infer_cfg is not None else None
-        if op_impl == "cpu":
-            self.response = DeviceList([], dtype=torch.long, device="cpu")
-        else:
-            self.response = DeviceList([], dtype=torch.long, device="cuda")
         self.num_new_tokens: int = 0
         self.next_token: int = -1  # Only effective when num_new_tokens > 0
         self.num_new_tokens_single_step: int = 1
         self.mtp_token_list: list[int] = []
         self.generated_result: Optional[torch.Tensor] = None
-        self.record_next_token: Union[int, torch.Tensor, None] = None
 
         # task status
         self.has_unsync_new_token: bool = False
@@ -526,6 +511,40 @@ class Task(ConstraintDecodeTask):
 
         # PD prefill info
         self.pd_prefill_engine_rank: Optional[int] = None
+
+    def prompt_to_token_block(self, dp_rank) -> list[TokenBlock]:
+        """
+        将prompt转化为TokenBlock列表，如：
+        block_size: 4
+        prompt: [1,1,1,1,2,2,2,2,3,3,3,3,4,4,4]
+        chunk: [[1,1,1,1],[2,2,2,2],[3,3,3,3],[4,4,4]]
+        返回4个TokenBlock实例组成的列表，最后一个实例未满，因此其blk_hash为None
+        """
+        self.token_blocks = []
+        pre_blk_hash = None
+        block_size = Backend.cache_managers[dp_rank]["main"].block_size
+        for i in range(0, len(self.prefix_tokens), block_size):
+            tokens = self.prefix_tokens[i : i + block_size]
+            block = Backend.cache_managers[dp_rank]["main"].tokens_to_block(
+                tokens=tokens, pre_blk_hash=pre_blk_hash
+            )
+            self.token_blocks.append(block)
+            pre_blk_hash = block.blk_hash
+        return self.token_blocks
+
+    @property
+    def num_cached_blocks(self) -> int:
+        """Number of cached blocks (cached_idle_blocks and active_blocks) that are hit by the req's prompt (Called before prefill step only)."""
+        return sum(1 for block in self.token_blocks if block.cache_idx is not None)
+
+    @property
+    def num_cached_idle_blocks(self) -> int:
+        """number of cached_idle_blocks (cache_idx is not None and active_cnt == 0) that are hit by the req's prompt"""
+        return sum(
+            1
+            for block in self.token_blocks
+            if (block.cache_idx is not None and block.active_cnt == 0)
+        )
 
     def need_remove(self):
         return self.stopped
@@ -596,19 +615,9 @@ class Task(ConstraintDecodeTask):
 
         Args:
             token: The generated token ID
-
-        TODO: Fix _test_standard_tokens not None with batch_size > 1
-        TODO: _test_standard_tokens does not support DP > 1
         """
         assert token is not None, "Token cannot be None"
         self.next_token = token
-
-        if self._test_standard_tokens and self.num_new_tokens < len(
-            self._test_standard_tokens
-        ):
-            self.record_next_token = token
-            self.next_token = self._test_standard_tokens[self.num_new_tokens]
-
         self.num_new_tokens += self.num_new_tokens_single_step
         self.has_unsync_new_token = True
 
@@ -623,8 +632,9 @@ class Task(ConstraintDecodeTask):
             return
         if not isinstance(self.next_token, int):
             self.next_token = int(self.next_token.cpu().item())
-        if self.next_token == -1 and self.record_next_token is None:
+        if self.next_token == -1:
             return
+<<<<<<< HEAD
         has_update = is_decode(self.task_type) or self.evicting
         if self.record_next_token is not None:
             if not isinstance(self.record_next_token, int):
@@ -633,11 +643,17 @@ class Task(ConstraintDecodeTask):
                 self.prefix_tokens.append(self.record_next_token)
             self.record_next_token = None
         elif has_update:
+=======
+        has_update = self.task_type == TaskType.Decode or self.evicting
+        if has_update:
+>>>>>>> public-main
             if Backend.executor.mtp_size > 1:
                 self.prefix_tokens.extend(self.mtp_token_list)
             self.prefix_tokens.append(self.next_token)
         self.has_unsync_new_token = False
         self.evicting = False
+        # if Backend.cache_managers is not None:
+        #     Backend.cache_managers[self.dp_rank]["main"].update_metadata_after_decode(self, 1)
 
     def update_response_sync(self, token: Union[int, torch.Tensor]):
         self.update_response_no_sync(token)
@@ -658,8 +674,7 @@ class Task(ConstraintDecodeTask):
         base_len = getattr(self, "_prefix_tokens_base_len", 0)
         if is_decode(self.task_type) and base_len > 0:
             total = base_len + len(self.prefix_tokens)
-            if self.has_unsync_new_token:
-                total += Backend.executor.mtp_size
+            total += Backend.executor.mtp_size
             return total
         return (
             len(self.prefix_tokens)
@@ -787,21 +802,44 @@ class Task(ConstraintDecodeTask):
 
     @property
     def kv_cache_len_used_in_completed_steps(self):
+<<<<<<< HEAD
         if is_prefill(self.task_type):
             return self.consumed_req_tokens
         elif is_decode(self.task_type):
             return len(self.prefix_tokens) - (
                 self.num_new_tokens_single_step if not self.has_unsync_new_token else 0
             )
+=======
+        """在以往step中已经缓存到kv cache中的token长度"""
+        if self.task_type == TaskType.Prefill:
+            if self.consumed_req_tokens != 0:
+                return self.consumed_req_tokens
+            else:
+                # 尚未进行推理，但可能被prefix caching击中
+                return self.num_cached_blocks * self.token_blocks[0].blk_size
+        elif self.task_type == TaskType.Decode:
+            return self.prefix_tokens_len - 1
+>>>>>>> public-main
         else:
             assert False
 
     @property
     def kv_cache_len_used_in_completed_steps_and_next_step(self):
+<<<<<<< HEAD
         if is_prefill(self.task_type):
             return self.consumed_req_tokens + self.next_req_tokens_len
         elif is_decode(self.task_type):
             return min(self.prefix_tokens_len, get_global_args().infer.max_seq_len)
+=======
+        """在下一个step完成后缓存到kv cache中的token长度"""
+        if self.task_type == TaskType.Prefill:
+            return self.consumed_req_tokens + self.next_req_tokens_len
+        elif self.task_type == TaskType.Decode:
+            return min(
+                self.prefix_tokens_len - 1 + get_global_args().infer.mtp_size,
+                get_global_args().infer.max_seq_len,
+            )
+>>>>>>> public-main
         else:
             assert False
 
@@ -882,10 +920,6 @@ class TaskPool:
                 cls.pool[task_id].req.finish()
             else:
                 cls.pool[task_id].req.will_finish = True
-        if PackedTasksBase.response_list_manager is not None:
-            PackedTasksBase.response_list_manager.remove_list(
-                cls.pool[task_id].response
-            )
         if cls.pool.pop(task_id) is None:
             raise ValueError(f"Task {task_id} not found in pool")
         cls.id_list.remove(task_id)
@@ -942,11 +976,19 @@ class PackedTasksBase:
     )
     num_tokens: int = 0
     has_outputs: list[int] = field(default_factory=list)
-    response_list_manager = None
+
+    # 用于从KVCacheManager -> KVCache传递索引信息: KVCacheManager新分配kv cache索引时有值，否则为[]
+    new_cache_ids_list: list[list[int]] = field(default_factory=list)
+    # 用于从KVCacheManager -> KVCache传递prefix caching击中长度信息: 首次被prefix caching击中时有值，否则为[]
+    hit_token_lens: list[int] = field(default_factory=list)
 
     @property
     def req_ids(self):
         return self.task_ids
+
+    @functools.cached_property
+    def output_task_ids(self):
+        return [self.task_ids[i] for i in range(self.num_tasks) if self.has_outputs[i]]
 
     @classmethod
     def configure(cls, max_num_tasks: int):
@@ -971,9 +1013,6 @@ class PackedTasks(PackedTasksBase):
             task_ids = [task.task_id for task in tasks]
             self.tasks = tasks
         self.output_tasks = [task for task in self.tasks if task.has_output()]
-        self.should_apply_frequency_penalty = any(
-            task.sample_params.frequency_penalty > 0 for task in self.output_tasks
-        )
         self.return_logprobs = any(
             getattr(task.req, "logprobs", False) for task in self.output_tasks
         )
@@ -1015,6 +1054,11 @@ class PackedTasks(PackedTasksBase):
         if is_prefill(self.task_type):
             self.tokens = [task.next_req_tokens() for task in self.tasks]
 
+        if any(task.new_cache_ids for task in self.tasks):
+            self.new_cache_ids_list = [task.new_cache_ids for task in self.tasks]
+        if any(task.hit_token_len for task in self.tasks):
+            self.hit_token_lens = [task.hit_token_len for task in self.tasks]
+
         self.payload_type = SerializedPackedTasksPayloadType(self.task_type.value)
 
         # additional modifications are required when adapting to MTP or Hybrid.
@@ -1044,63 +1088,6 @@ class PackedTasks(PackedTasksBase):
                 self.pixel_values.append(task.pixel_values)
             if task.grid_thw is not None:
                 self.grid_thw.append(task.grid_thw)
-
-        # sample related
-        self.is_all_greedy = all(
-            task.sample_params.top_k <= 1 for task in self.output_tasks
-        )
-        self.temperatures = torch.tensor(
-            [task.sample_params.temperature for task in self.output_tasks],
-            pin_memory=True,
-        ).to(device=self.rank, non_blocking=True)
-        self.top_ps = torch.tensor(
-            [task.sample_params.top_p for task in self.output_tasks], pin_memory=True
-        ).to(device=self.rank, non_blocking=True)
-        self.top_ks = torch.tensor(
-            [task.sample_params.top_k for task in self.output_tasks], pin_memory=True
-        ).to(device=self.rank, non_blocking=True)
-        self.frequency_penalties = torch.tensor(
-            [task.sample_params.frequency_penalty for task in self.output_tasks],
-            dtype=torch.float32,
-            pin_memory=True,
-        ).to(device=self.rank, non_blocking=True)
-
-        if self.should_apply_frequency_penalty:
-            if PackedTasksBase.response_list_manager is None:
-                # Use getattr for safe access in test environments where infer config may be incomplete
-                if getattr(args.infer, "op_impl", None) == "cpu":
-                    PackedTasksBase.response_list_manager = StaticDeviceListManager(
-                        max_num_rows=args.infer.max_reqs,
-                        max_num_cols=args.infer.max_seq_len,
-                        dtype=torch.long,
-                        device="cpu",
-                    )
-                else:
-                    PackedTasksBase.response_list_manager = StaticDeviceListManager(
-                        max_num_rows=args.infer.max_reqs,
-                        max_num_cols=args.infer.max_seq_len,
-                        dtype=torch.long,
-                        device="cuda",
-                    )
-
-            for task in self.output_tasks:
-                PackedTasksBase.response_list_manager.push_list(task.response)
-
-            self.response_len = torch.tensor(
-                [len(task.response) for task in self.output_tasks],
-                dtype=torch.int,
-                device=self.rank,
-            )
-            self.response_capacity = torch.tensor(
-                [len(task.response._data) for task in self.output_tasks],
-                dtype=torch.int,
-                device=self.rank,
-            )
-            self.response_ptr = torch.tensor(
-                [task.response._data.data_ptr() for task in self.output_tasks],
-                dtype=torch.long,
-                device=self.rank,
-            )
 
     def get_result_len(self) -> int:
         """

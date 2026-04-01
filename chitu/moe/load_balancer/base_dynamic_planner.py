@@ -246,7 +246,7 @@ class BaseMoELoadPlanner(ABC):
         self._dirty_layers.clear()
         self._cached_warmup_stats.clear()
 
-    def save_global_activation(self) -> None:
+    def save_global_activation(self, path) -> None:
         """Save the latest recorded global activation stats for all layers as csv file."""
         import pandas as pd, os, datetime as _dt
 
@@ -261,11 +261,9 @@ class BaseMoELoadPlanner(ABC):
             logger.info("MoELoadPlanner: no stats to save")
             return
         df = pd.DataFrame(rows, columns=["layer", "counts"])
-        os.makedirs("/home/liurq/logs/stats", exist_ok=True)
+        os.makedirs(path, exist_ok=True)
         date = _dt.datetime.fromtimestamp(time.time()).strftime("%m%d_%H%M%S")
-        file_path = os.path.join(
-            "/home/liurq/logs/stats", f"{date}_activation_stats.csv"
-        )
+        file_path = os.path.join(path, f"{date}_activation_stats.csv")
         df.to_csv(file_path, index=False)
         logger.info(f"MoELoadPlanner: saved merged activation stats to {file_path}")
 

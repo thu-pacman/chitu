@@ -11,7 +11,7 @@ from chitu.attn_backend import (
     FlashMLABackend,
     NpuAttnBackend,
 )
-from chitu.cache_manager import PagedKVCacheAccessor, DenseKVCacheAccessor
+from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.global_vars import set_global_args
 from chitu.utils import (
     ceil_div,

@@ -17,6 +17,10 @@ from chitu.task import (
     PackedTasksBase,
 )
 from chitu.serve.event_loop import get_server_event_loop
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from chitu.task import PackedTasksBase
 from chitu.distributed.parallel_state import get_pp_group
 from chitu.distributed.pd_disaggregation.pd_log_utils import (
     pd_trace_enabled,
@@ -24,6 +28,10 @@ from chitu.distributed.pd_disaggregation.pd_log_utils import (
 )
 
 logger = logging.getLogger(__name__)
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import KVManager
 
 
 class KVTransferHook(Protocol):
@@ -33,9 +41,7 @@ class KVTransferHook(Protocol):
     receive KV before decode. Default (NoopKVTransferHook) does nothing.
     """
 
-    def on_prefill_done(
-        self, req_ids_output: list[str], logits, tasks: Optional[PackedTasksBase] = None
-    ):
+    def on_prefill_done(self, tokens: torch.Tensor | None, tasks: PackedTasksBase):
         pass
 
     def before_decode_step(self, req_ids: list[str]):
@@ -43,9 +49,7 @@ class KVTransferHook(Protocol):
 
 
 class NoopKVTransferHook:
-    def on_prefill_done(
-        self, req_ids_output: list[str], logits, tasks: Optional[PackedTasksBase] = None
-    ):
+    def on_prefill_done(self, tokens: torch.Tensor | None, tasks: PackedTasksBase):
         return
 
     def before_decode_step(self, req_ids: list[str]):
@@ -127,37 +131,23 @@ class MooncakeKVTransferHook:
       - "decode" : receive KV before decode
     """
 
-    def __init__(self, kv_manager, disaggregation_mode: str):
+    def __init__(self, kv_manager: "KVManager", disaggregation_mode: str):
         self.kv_manager = kv_manager
         self.mode = disaggregation_mode
 
-    def on_prefill_done(
-        self, req_ids_output: list[str], logits, tasks: Optional[PackedTasksBase] = None
-    ):
+    def on_prefill_done(self, send_tokens: torch.Tensor | None, tasks: PackedTasksBase):
         if self.kv_manager is None:
             return
         if self.mode != "prefill":
             return
-        if not req_ids_output:
+        if tasks.num_tasks == 0:
             return
         # Send KV cache and first-token metadata to decode side.
-        #
-        # In PP>1:
-        # - Non-last PP stages do not own the final LM head, so their `logits` is actually
-        #   intermediate hidden states (not usable by Decode). They should send KV-only.
-        # - Last PP stage sends KV and first-token metadata.
-        cache_manager = self.kv_manager.cache_manager
-        send_tokens = None
-        pp_size = get_global_args().infer.pp_size
-        if pp_size > 1:
-            if not get_pp_group().is_last_rank:
-                send_tokens = None
+        kv_cache = self.kv_manager.kv_cache
 
-        should_send_tokens = isinstance(logits, torch.Tensor) and (
-            pp_size <= 1 or get_pp_group().is_last_rank
-        )
+        req_ids_output = tasks.output_task_ids
         if pd_verbose_enabled():
-            if not should_send_tokens:
+            if send_tokens is None:
                 # 看到该日志表示：该 rank 只传输 KV Cache（不包含首 token）
                 logger.debug(f"[KVHook] sending KV-only for requests: {req_ids_output}")
             else:
@@ -165,48 +155,22 @@ class MooncakeKVTransferHook:
                 logger.debug(
                     f"[KVHook] sending KV+token for requests: {req_ids_output}"
                 )
-        cache_type = None
-        if hasattr(cache_manager, "args") and hasattr(cache_manager.args, "cache_type"):
-            cache_type = cache_manager.args.cache_type
 
         _kv_send_start = time.monotonic()
         for rid in req_ids_output:
             logger.debug(f"[PD_STAGE][prefill.kv_send.start] req_id={rid}")
 
-        if should_send_tokens:
-            from chitu.backend import Backend  # local import to avoid cycles
-
-            task_list: Optional[list[Task]] = None
-            if isinstance(tasks, PackedTasks) and getattr(tasks, "tasks", None):
-                tasks_by_id = {t.task_id: t for t in tasks.tasks}
-                if all(rid in tasks_by_id for rid in req_ids_output):
-                    task_list = [tasks_by_id[rid] for rid in req_ids_output]
-            elif tasks is not None:
-                if all(rid in TaskPool.pool for rid in req_ids_output):
-                    task_list = [TaskPool.pool[rid] for rid in req_ids_output]
-
-            if task_list:
-                packed = PackedTasks([t.task_id for t in task_list], tasks=task_list)
-                with torch.inference_mode():
-                    send_tokens = Backend.executor.sample(logits, packed).to(
-                        dtype=torch.int32
-                    )
-            else:
-                logger.warning(
-                    "[KVHook] missing task metadata for sampling; fallback to argmax."
-                )
-                send_tokens = torch.argmax(logits, dim=-1).to(dtype=torch.int32)
         if pd_trace_enabled():
             logger.debug(
                 f"[PD_TRACE][prefill.kv_send] req_ids={req_ids_output} batch={len(req_ids_output)} "
                 f"token_shape={list(send_tokens.shape) if isinstance(send_tokens, torch.Tensor) else None} "
-                f"cache_type={cache_type}"
+                f"cache_type={get_global_args().infer.cache_type}"
             )
 
         self.kv_manager.send_kv_cache(
             first_tokens=send_tokens,
             request_ids=req_ids_output,
-            cache_manager=cache_manager,
+            kv_cache=kv_cache,
         )
 
         # Record KV send duration (covers enqueue; actual RDMA transfer is async)
@@ -217,9 +181,8 @@ class MooncakeKVTransferHook:
 
         from chitu.backend import Backend  # local import to avoid cycles
 
-        if Backend.executor._pd_prefill_only:
-            for rid in req_ids_output:
-                t = TaskPool.pool.get(rid)
+        if Backend.executor._pd_prefill_only and isinstance(tasks, PackedTasks):
+            for t in tasks.tasks:
                 if t is None:
                     continue
                 if t.req is not None and not t.req.finish_reason:
@@ -238,24 +201,21 @@ class MooncakeKVTransferHook:
         from chitu.backend import Backend  # local import to avoid cycles
 
         # FIXME: Managers other than "main"
-        cache_manager = self.kv_manager.cache_manager or Backend.cache_managers["main"]
+        kv_cache = self.kv_manager.kv_cache
         if len(req_ids) == 0:
             return
         # Short-circuit if KV already present for all requests.
-        # NOTE: Must check req_id_to_seq_len, not just block_table!
+        # NOTE: Must check kv_cache, not just block_table!
         # reserve_blocks_for_transfer() allocates blocks but doesn't set seq_len.
-        # Only insert_kv_cache_from_transfer() sets req_id_to_seq_len after KV data transfer.
+        # Only insert_kv_cache_from_transfer() sets kv_cache after KV data transfer.
         pending: list[str] = []
         for rid in req_ids:
             has_kv = False
             # Check if seq_len is set (indicates KV was fully transferred and inserted)
-            if hasattr(cache_manager, "req_id_to_seq_len"):
-                has_kv = rid in cache_manager.req_id_to_seq_len
-            elif hasattr(cache_manager, "get_page_indices"):
-                indices = cache_manager.get_page_indices(rid)
-                has_kv = indices
-            elif hasattr(cache_manager, "block_table"):
-                has_kv = cache_manager.block_table.get(rid, [])
+            if hasattr(kv_cache, "tid_to_cached_len"):
+                has_kv = rid in kv_cache.tid_to_cached_len
+            elif hasattr(kv_cache, "block_table"):
+                has_kv = rid in kv_cache.block_table
             if not has_kv:
                 pending.append(rid)
         if not pending:
@@ -294,7 +254,7 @@ class MooncakeKVTransferHook:
                 self.kv_manager.set_prefill_target_engine_rank(rid, prefill_rank)
 
         first_tokens = self.kv_manager.recv_kv_cache_and_insert(
-            request_ids=pending, cache_manager=cache_manager, prefix_lens=prefix_lens
+            request_ids=pending, kv_cache=kv_cache, prefix_lens=prefix_lens
         )
         if pd_trace_enabled():
             logger.debug(

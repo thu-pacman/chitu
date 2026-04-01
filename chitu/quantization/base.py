@@ -16,7 +16,7 @@ from chitu.moe.batched_expert_result import (
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
-    PerExpertDenseBatchedRoutedActivation,
+    PerExpertDenseBatchedRoutedActivationMinimal,
 )
 
 
@@ -96,7 +96,9 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         Compute all experts but without summing across multiple experts for each token.
         """
 
-        raise NotImplementedError()
+        raise NotImplementedError(
+            f"No implementatoin found for {type(self)}.forward_no_sum({type(routed_x)})"
+        )
 
     def forward(
         self,
@@ -254,12 +256,12 @@ class QuantizedMoeExpertsUnmerged(QuantizedMoeExpertsBase):
     @override
     @plum.dispatch
     def forward_no_sum(
-        self, routed_x: PerExpertDenseBatchedRoutedActivation, impl="auto"
+        self, routed_x: PerExpertDenseBatchedRoutedActivationMinimal, impl="auto"
     ) -> PerExpertDenseBatchedExpertResultMinimal:
         """
         Sequantially iterate through each expert and compute the output.
 
-        This is a fallback method for PerExpertDenseBatchedRoutedActivation input, in case there is
+        This is a fallback method for PerExpertDenseBatchedRoutedActivationMinimal input, in case there is
         no fused forward implementation. This method requires the `forward_ith_expert_*`
         methods to be implemented.
         """
@@ -409,12 +411,12 @@ class QuantizedMoeExpertsMerged(QuantizedMoeExpertsBase):
     @override
     @plum.dispatch
     def forward_no_sum(
-        self, routed_x: PerExpertDenseBatchedRoutedActivation, impl="auto"
+        self, routed_x: PerExpertDenseBatchedRoutedActivationMinimal, impl="auto"
     ) -> PerExpertDenseBatchedExpertResultMinimal:
         """
         Sequantially iterate through each expert and compute the output.
 
-        This is a fallback method for PerExpertDenseBatchedRoutedActivation input, in case there is
+        This is a fallback method for PerExpertDenseBatchedRoutedActivationMinimal input, in case there is
         no fused forward implementation. This method requires the `forward_ith_expert_*`
         methods to be implemented.
         """

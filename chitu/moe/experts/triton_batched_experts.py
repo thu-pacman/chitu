@@ -9,7 +9,9 @@ import triton
 import triton.language as tl
 
 from chitu.ops import silu_and_mul
-from chitu.moe.batched_routed_activation import PerExpertDenseBatchedRoutedActivation
+from chitu.moe.batched_routed_activation import (
+    PerExpertDenseBatchedRoutedActivationMinimal,
+)
 from chitu.moe.batched_expert_result import PerExpertDenseBatchedExpertResultMinimal
 
 
@@ -498,7 +500,7 @@ def invoke_moe_batched_triton_kernel(
 
 
 def triton_batched_experts(
-    hidden_states: PerExpertDenseBatchedRoutedActivation,
+    hidden_states: PerExpertDenseBatchedRoutedActivationMinimal,
     w1: torch.Tensor,
     w2: torch.Tensor,
 ) -> PerExpertDenseBatchedExpertResultMinimal:
@@ -570,7 +572,7 @@ def triton_batched_experts(
 
 
 def triton_batched_experts_ref(
-    hidden_states: PerExpertDenseBatchedRoutedActivation,
+    hidden_states: PerExpertDenseBatchedRoutedActivationMinimal,
     w1: torch.Tensor,
     w2: torch.Tensor,
 ) -> PerExpertDenseBatchedExpertResultMinimal:

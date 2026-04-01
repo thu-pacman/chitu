@@ -31,7 +31,7 @@ class MemTransferEngine:
         return 0
 
 
-class MonkPagedCacheManager:
+class MonkPagedCache:
     def __init__(self, kv_cache: dict[str, torch.Tensor]):
         self.paged_kv_cache = (
             kv_cache  # {key:torsor(n_layers,n_blocks,block_size,n_heads,head_dim)}
@@ -45,9 +45,6 @@ class MonkPagedCacheManager:
         self.num_heads = n_heads
         self.head_dim = head_dim
         self.device = list(kv_cache.values())[0].device
-
-    def get_block_size(self):
-        return self.block_size
 
     def get_contiguous_buf_infos(self):
         """
@@ -78,12 +75,10 @@ class MonkPagedCacheManager:
 class MonKVManager(KVManager):
     """只用于测试KVManager.send_kvcache和KVManager.recv_kv_cache_and_insert，验证kv cache直传的正确性"""
 
-    def __init__(
-        self, cache_manager: MonkPagedCacheManager, transfer_engine: MemTransferEngine
-    ):
-        self.cache_manager = cache_manager
+    def __init__(self, kv_cache: MonkPagedCache, transfer_engine: MemTransferEngine):
+        self.kv_cache = kv_cache
         self.kv_data_ptrs, self.kv_data_lens, self.kv_item_lens = (
-            cache_manager.get_contiguous_buf_infos()
+            kv_cache.get_contiguous_buf_infos()
         )
         self.executor = concurrent.futures.ThreadPoolExecutor(12)
         self.transfer_engine = transfer_engine
@@ -153,7 +148,7 @@ def test_kv_cache_transfer(
         need_ensure=False,
     )
 
-    cache = torch.zeros(
+    cache_blocks = torch.zeros(
         [num_layers, num_blocks, block_size, num_heads, head_dim], dtype=torch.int32
     )
     for layer in range(num_layers):
@@ -166,19 +161,19 @@ def test_kv_cache_transfer(
                 for head in range(num_heads):
                     for dim in range(head_dim):
                         if position >= seq_len or position == -1:
-                            cache[layer, block, off, head, dim] = 0
+                            cache_blocks[layer, block, off, head, dim] = 0
                         else:
-                            cache[layer, block, off, head, dim] = int(
+                            cache_blocks[layer, block, off, head, dim] = int(
                                 f"{layer+1}{block+1}{off+1}{head+1}{dim+1}"
                             )
 
     num_decode_layers = num_layers
-    decode_cache = torch.zeros(
+    decode_cache_blocks = torch.zeros(
         [num_decode_layers, num_blocks, block_size, num_heads, head_dim],
         dtype=torch.int32,
     )
-    decode_cache_manager = MonkPagedCacheManager({"kv_cache": decode_cache})
-    decode_kvmanager = MonKVManager(decode_cache_manager, MemTransferEngine())
+    decode_cache = MonkPagedCache({"kv_cache": decode_cache_blocks})
+    decode_kvmanager = MonKVManager(decode_cache, MemTransferEngine())
 
     assert (
         prefill_tp_size % num_heads == 0 or num_heads % prefill_tp_size == 0
@@ -194,9 +189,9 @@ def test_kv_cache_transfer(
         else:
             start = tp_rank * prefill_n_local_heads
         end = start + prefill_n_local_heads
-        p_cache = cache[:, :, :, start:end, :].contiguous()
-        p_cache_manager = MonkPagedCacheManager({"kv_cache": p_cache})
-        p_kvmanager = MonKVManager(p_cache_manager, MemTransferEngine())
+        p_cache_blocks = cache_blocks[:, :, :, start:end, :].contiguous()
+        p_cache = MonkPagedCache({"kv_cache": p_cache_blocks})
+        p_kvmanager = MonKVManager(p_cache, MemTransferEngine())
         prefill_kvmanagers.append(p_kvmanager)
 
     # 模拟调用send_kvcache将kvcache从prefill端发送到decode端
@@ -230,7 +225,9 @@ def test_kv_cache_transfer(
             decode_tp_size=1,
         )
 
-    print(f"decode_cache before reorder:\n{decode_cache}")
+    print(
+        f"decode_cache_blocks before reorder:\n{decode_cache.paged_kv_cache['kv_cache']}"
+    )
     # assert False
 
     # for decode side
@@ -260,6 +257,6 @@ def test_kv_cache_transfer(
     }
     decode_kvmanager.reorder_kvcache(room_ids)
 
-    print(f"decode_cache:\n{decode_cache}")
-    # print(f"cache:\n{cache}")
-    assert torch.all(decode_cache == cache)
+    print(f"decode_cache_blocks: \n{decode_cache.paged_kv_cache['kv_cache']}")
+    # print(f"cache_blocks:\n{cache_blocks}")
+    assert torch.all(decode_cache.paged_kv_cache["kv_cache"] == cache_blocks)
