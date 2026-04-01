@@ -72,7 +72,7 @@ class AsyncDataStream:
                     not self.tokenizer.force_full_seq_decode
                     and len(self.cache_tokens) > 10
                 ):
-                    logger.warning(
+                    logger.info(
                         f"\\ufffd detected with context: {''.join(self.seqs[-10:]) + s}"
                     )
                     pass
