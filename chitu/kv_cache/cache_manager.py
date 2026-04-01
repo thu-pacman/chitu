@@ -177,7 +177,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
         if self.enable_prefix_caching:
             # 被prefix caching击中block不占chunk prefill size的容量，也不增加额外的kv cache block需求
-            task.consumed_req_tokens = 0
             for idx in range(
                 len(self.task_to_cache_ids[task.task_id]), len(task.token_blocks)
             ):

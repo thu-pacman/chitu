@@ -517,7 +517,7 @@ class PDScheduler(Scheduler):
 
         # Create task from request and enqueue. Actual batched prefill compute is driven by
         # the background compute loop (start_worker -> chitu_run()).
-        task = self._create_task_from_request(original_request, TaskType.Prefill)
+        task = self._create_task_from_request(original_request)
         if pd_trace_enabled():
             logger.debug(
                 f"[PD_TRACE][prefill.task] req_id={request_id} task_id={task.task_id} "
@@ -585,10 +585,11 @@ class PDScheduler(Scheduler):
                 request_id, int(prefill_scheduler_id)
             )
 
-        # Create decode task but not enqueue to TaskPool
+        # Create task but not enqueue to TaskPool
+        # task.task_type is still prefill untill cache_manager allocate blocks for the task
         # req will be promoted only after KV Cache is ready
         task = self._create_task_from_request(
-            decode_info["original_request"], TaskType.Decode, enqueue=False
+            decode_info["original_request"], enqueue=False
         )
         # Bind request to the target DP rank for compute placement.
         task.cache_owner = target_dp_rank
@@ -641,9 +642,7 @@ class PDScheduler(Scheduler):
             return []
         return super().schedule()
 
-    def _create_task_from_request(
-        self, request, task_type: TaskType, *, enqueue: bool = True
-    ) -> Task:
+    def _create_task_from_request(self, request, *, enqueue: bool = True) -> Task:
         """Create Task object from request using existing UserRequest/Task semantics"""
         # Support dict payload from Router
         if isinstance(request, dict):
@@ -733,7 +732,7 @@ class PDScheduler(Scheduler):
             priority=(request.priority if hasattr(request, "priority") else 1),
             stop_with_eos=stop_with_eos,
         )
-        if task_type == TaskType.Decode and task.req is not None:
+        if task.req is not None:
             # In PD disagg mode, prefill produces the first token.
             # Decode should only generate up to max_seq_len - prompt_len tokens.
             max_seq_len = get_global_args().infer.max_seq_len
@@ -753,9 +752,6 @@ class PDScheduler(Scheduler):
         # update_response_no_sync to stream tokens; it does NOT require TaskPool.add().
         if self.token_manager is not None:
             _ = self.token_manager.wrap_task(task)
-        if task_type == TaskType.Decode:
-            # Decode-only: mark prefill as already complete on decode side.
-            task.consume_req_tokens()
         if enqueue:
             TaskPool.enqueue(task)
         return task
@@ -1057,7 +1053,7 @@ class PrefillOnlyScheduler(PDScheduler):
                 self._prefill_ready_q.pop(rid)
                 continue
             self._prefill_ready_q.pop(rid)
-            self._create_task_from_request(original_request, TaskType.Prefill)
+            self._create_task_from_request(original_request)
             promoted += 1
             created_ts = float(info.get("created_ts", time.time()))
             waited = time.time() - created_ts
@@ -1226,6 +1222,16 @@ class DecodeOnlyScheduler(PDScheduler):
                 )
 
                 if aviable_blocks * kv_cache_manager.block_size < remain_prefix_len:
+                    if (
+                        prefix_len
+                        > kv_cache_manager.block_size * kv_cache_manager.num_blocks
+                    ):
+                        raise RuntimeError(
+                            "KV cache capacity is insufficient to support prefilling.\n"
+                            f"  - number of total blocks: {kv_cache_manager.num_blocks}\n"
+                            f"  - Block size: {kv_cache_manager.block_size}\n"
+                            f"However, {task.task_id} prefill prompts are too long: {task.prompt_len}"
+                        )
                     continue
 
                 if remain_prefix_len == 0:
@@ -1233,6 +1239,10 @@ class DecodeOnlyScheduler(PDScheduler):
 
                 task.set_prefill_chunk_size_for_one_step(remain_prefix_len)
                 kv_cache_manager.prepare_metadata_before_prefill(task)
+                task.consume_req_tokens()
+                assert (
+                    task.task_type == TaskType.Decode
+                ), f"{task.task_type} vs {TaskType.Decode}"
 
             send_ok = self._send_pd_prepare_transfer(task, request_id=rid)
             if not send_ok:
