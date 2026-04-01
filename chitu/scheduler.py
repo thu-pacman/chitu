@@ -478,6 +478,7 @@ class Scheduler:
         if (
             task.kv_cache_len_used_in_completed_steps_and_next_step
             > self.cache_manager_dict["main"].num_blocks
+            * self.cache_manager_dict["main"].block_size
         ):
             raise RuntimeError(
                 "KV cache capacity is insufficient to support prefilling.\n"

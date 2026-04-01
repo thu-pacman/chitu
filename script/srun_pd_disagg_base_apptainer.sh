@@ -712,7 +712,7 @@ srun ${SRUN_EXTRA} \
   --ntasks-per-node=1 \
   --gres="gpu:${PD_GPUS_PER_NODE}" \
   --cpus-per-task=$((PD_GPUS_PER_NODE * PD_CPUS_PER_GPU)) \
-  --job-name="pd_disagg_multi_apptainer" \
+  --job-name="${JOB_NAME:-pd_disagg_multi_apptainer}" \
   --time=3:00:00 \
   -l \
   bash "${THIS_SCRIPT}" --node
