@@ -66,6 +66,53 @@ POST /v1/chat/completions
 
 返回当前服务已加载的模型列表，无需参数。
 
+### Responses 接口
+
+```
+POST /v1/responses
+```
+
+这是 OpenAI Responses API 的最小可用子集，目标是兼容官方 OpenAI SDK 的文本生成、流式 SSE、函数调用和工具结果回传。
+
+#### 已支持参数
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `model` | `string` | 当前已加载模型 | 模型标识符，支持 `model_aliases` 配置。 |
+| `input` | `string \| list[object]` | **必填** | 输入文本或输入 item 列表。支持 message item（`role` + `content`）、`function_call` 和 `function_call_output`。 |
+| `instructions` | `string` | `null` | 作为系统/开发者指令插入到请求前。 |
+| `max_output_tokens` | `integer` | 服务端默认值 | 最大生成 token 数。 |
+| `stream` | `boolean` | `false` | 是否使用 Responses 风格的 SSE 事件流返回。 |
+| `stream_options` | `object` | `{}` | 流式选项。当前仅为兼容保留，`include_obfuscation` 会被忽略。 |
+| `temperature` | `float` | `0.8` | 采样温度。 |
+| `top_p` | `float` | `0.9` | 核采样阈值。 |
+| `text` | `object` | `{ "format": { "type": "text" } }` | 文本输出配置。`text.format.type` 支持 `text`、`json_object`、`json_schema`。 |
+| `reasoning` | `object` | `null` | 推理配置。`reasoning.effort="none"` 会关闭 thinking，其余值视为开启。 |
+| `tools` | `list[object]` | `[]` | 函数工具。既支持 Responses 风格的扁平 function tool，也支持 Chat Completions 风格的嵌套 `function` tool。 |
+| `tool_choice` | `string \| object` | `"auto"` | 支持 `"auto"`、`"none"`、`"required"`，以及 `{ "type": "function", "name": "..." }`。 |
+| `parallel_tool_calls` | `boolean` | `true` | 是否允许模型并行发起多个工具调用。 |
+| `metadata` | `object` | `{}` | 原样回显到响应里的元数据。 |
+
+#### 已支持的输入内容块
+
+message `content` 中支持以下 block 类型：
+
+| Block 类型 | 行为 |
+|------------|------|
+| `input_text` / `text` / `output_text` | 直接作为文本传递。 |
+| `input_image` | 接口可接受，但会降级成 `[input_image omitted]` 这类文本占位，不执行真实多模态推理。 |
+| `input_file` | 接口可接受，但会降级成 `[input_file omitted: report.pdf]` 这类文本占位，不执行真实文件理解。 |
+
+#### 当前限制
+
+| 字段 | 状态 |
+|------|------|
+| `previous_response_id` | 直接返回 `400 invalid_request_error` |
+| `store=true` | 直接返回 `400 invalid_request_error` |
+| `conversation` | 直接返回 `400 invalid_request_error` |
+| OpenAI 内建工具（`web_search`、`file_search` 等） | 暂不支持 |
+| 真正的多模态理解 | 暂不支持 |
+
 ---
 
 ## Anthropic 兼容 API

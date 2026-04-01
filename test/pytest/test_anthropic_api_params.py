@@ -10,6 +10,7 @@ Tests AnthropicMessagesRequest, AnthropicCompletionRequest, and related helper f
 import pytest
 from pydantic import ValidationError
 
+from fastapi import HTTPException
 from chitu.serve.anthropic_api import (
     AnthropicMessagesRequest,
     AnthropicCompletionRequest,
@@ -20,6 +21,7 @@ from chitu.serve.anthropic_api import (
     apply_stop_sequences_weak,
     normalize_anthropic_tools,
     map_anthropic_tool_choice,
+    parse_api_key_from_headers,
 )
 
 
@@ -678,3 +680,27 @@ class TestMapAnthropicToolChoice:
         tc = ToolChoice(type="any", disable_parallel_tool_use=False)
         choice, parallel = map_anthropic_tool_choice(tc)
         assert parallel is True
+
+
+class TestParseApiKeyFromHeaders:
+    def test_x_api_key_takes_precedence(self):
+        assert parse_api_key_from_headers("Bearer token", "x-key") == "x-key"
+
+    def test_missing_headers_returns_empty_string(self):
+        assert parse_api_key_from_headers(None, None) == ""
+
+    def test_bearer_without_space_is_accepted_as_empty_key(self):
+        assert parse_api_key_from_headers("Bearer", None) == ""
+
+    def test_bearer_with_trailing_space_is_accepted_as_empty_key(self):
+        assert parse_api_key_from_headers("Bearer ", None) == ""
+
+    def test_bearer_token_is_extracted(self):
+        assert parse_api_key_from_headers("Bearer abc", None) == "abc"
+
+    def test_bearer_without_space_before_token_is_accepted(self):
+        assert parse_api_key_from_headers("Bearerabc", None) == "abc"
+
+    def test_non_bearer_scheme_raises(self):
+        with pytest.raises(HTTPException, match="must start with 'Bearer'"):
+            parse_api_key_from_headers("Basic abc", None)

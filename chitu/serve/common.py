@@ -316,6 +316,25 @@ def get_priority_from_api_key(api_key: str) -> int:
     return 1
 
 
+def parse_api_key_from_headers(
+    authorization: Optional[str], x_api_key: Optional[str] = None
+) -> str:
+    if x_api_key:
+        return x_api_key
+    if authorization is None:
+        return ""
+
+    value = authorization.strip()
+    if value == "":
+        return ""
+
+    if not value.lower().startswith("bearer"):
+        raise HTTPException(
+            status_code=400, detail="Authorization header must start with 'Bearer'"
+        )
+    return value[len("bearer") :].strip()
+
+
 def build_chat_template_kwargs(enable_thinking: bool) -> dict[str, Any]:
     chat_template_kwargs = {}
     if "DeepSeek-V3.1" in get_global_args().models.name:

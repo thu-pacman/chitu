@@ -38,12 +38,14 @@ from chitu.serve.common import (
     queue_profile_stop,
     set_min_batch_size,
     get_priority_from_api_key,
+    parse_api_key_from_headers,
     submit_request,
     build_chat_template_kwargs,
 )
 from chitu.serve.router import start_dp_components
 from chitu.tool_call import ToolChoice, ChoiceToolCall, adjust_message_for_tool_calls
 from chitu.serve.anthropic_api import create_router as create_anthropic_router
+from chitu.serve.responses_api import create_router as create_responses_router
 
 logger = getLogger(__name__)
 
@@ -200,6 +202,13 @@ app.include_router(
         priority_for_api_key=get_priority_from_api_key,
     )
 )
+app.include_router(
+    create_responses_router(
+        get_server_status=lambda: server_status,
+        get_dp_service_started=lambda: dp_service_started,
+        priority_for_api_key=get_priority_from_api_key,
+    )
+)
 
 # ====== Standard HTTP Endpoints ======
 
@@ -232,14 +241,7 @@ async def create_chat_completion(
 
         args = get_global_args()
 
-        api_key = ""
-        if authorization is not None:
-            if not authorization.startswith("Bearer "):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Authorization header must start with 'Bearer'",
-                )
-            api_key = authorization[len("Bearer ") :]
+        api_key = parse_api_key_from_headers(authorization)
         task_priority = get_priority_from_api_key(api_key)
 
         # Parse JSON body tolerant to missing/incorrect content-type

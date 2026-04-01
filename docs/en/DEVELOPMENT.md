@@ -588,6 +588,29 @@ curl localhost:21002/v1/chat/completions \
     ]
   }'
 ```
+
+Test the service via OpenAI Responses API:
+
+```bash
+curl localhost:21002/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "DeepSeek-R1",
+    "instructions": "You are a helpful assistant.",
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "input_text", "text": "Summarize this image input."},
+          {"type": "input_image", "image_url": "https://example.com/cat.png"}
+        ]
+      }
+    ]
+  }'
+```
+
+Note: `input_image` / `input_file` blocks are currently accepted for compatibility and converted to text placeholders. Chitu does not perform real multimodal inference on `/v1/responses` yet.
+
 Test the service via Anthropic-compatible API:
 
 ```bash
@@ -606,7 +629,7 @@ curl localhost:21002/v1/messages \
   }'
 ```
 
-For OpenAI-compatible and Anthropic-compatible API parameters, see [API Parameters](./API_PARAMETERS.md).
+For OpenAI-compatible, OpenAI Responses, and Anthropic-compatible API parameters, see [API Parameters](./API_PARAMETERS.md).
 
 ### Grafana Dashboard
 

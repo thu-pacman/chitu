@@ -590,6 +590,28 @@ curl localhost:21002/v1/chat/completions \
   }'
 ```
 
+测试 OpenAI Responses 接口：
+
+```bash
+curl localhost:21002/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "DeepSeek-R1",
+    "instructions": "You are a helpful assistant.",
+    "input": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "input_text", "text": "Summarize this image input."},
+          {"type": "input_image", "image_url": "https://example.com/cat.png"}
+        ]
+      }
+    ]
+  }'
+```
+
+注意：`input_image` / `input_file` 当前仅做接口兼容，会被转换为文本占位，不会触发真正的多模态推理。
+
 测试 Anthropic 兼容接口：
 
 ```bash
@@ -608,7 +630,7 @@ curl localhost:21002/v1/messages \
   }'
 ```
 
-OpenAI 兼容和 Anthropic 兼容接口的参数说明请参见 [API_PARAMETERS.md](./API_PARAMETERS.md)。
+OpenAI 兼容、OpenAI Responses 兼容和 Anthropic 兼容接口的参数说明请参见 [API_PARAMETERS.md](./API_PARAMETERS.md)。
 
 ### Grafana 监控面板
 

@@ -24,7 +24,7 @@ from chitu.tool_call import (
     ToolChoiceNamedTool,
     ToolChoiceFunction,
 )
-from chitu.serve.common import build_chat_template_kwargs
+from chitu.serve.common import build_chat_template_kwargs, parse_api_key_from_headers
 from chitu.utils import gen_req_id
 
 
@@ -116,20 +116,6 @@ def _sse_event(event: str, data: dict) -> str:
 
 def _sse_data(data: dict) -> str:
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-
-def parse_api_key_from_headers(
-    authorization: Optional[str], x_api_key: Optional[str]
-) -> str:
-    if x_api_key:
-        return x_api_key
-    if authorization is None:
-        return ""
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=400, detail="Authorization header must start with 'Bearer'"
-        )
-    return authorization[len("Bearer ") :]
 
 
 def resolve_requested_model_or_error(requested_model: Optional[str]) -> str:

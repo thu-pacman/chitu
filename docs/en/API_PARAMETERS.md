@@ -66,6 +66,53 @@ POST /v1/chat/completions
 
 Returns the list of models currently loaded by this server. No parameters required.
 
+### Responses Endpoint
+
+```
+POST /v1/responses
+```
+
+Minimal subset of the OpenAI Responses API. This endpoint is intended to work with the official OpenAI SDK for text generation, streaming, function calling, and tool-result round-trips.
+
+#### Supported Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `model` | `string` | loaded model | Model identifier. Supports `model_aliases` configuration. |
+| `input` | `string \| list[object]` | **required** | Input text or input items. Supported item types: message items (`role` + `content`), `function_call`, and `function_call_output`. |
+| `instructions` | `string` | `null` | System/developer instruction prepended to the request. |
+| `max_output_tokens` | `integer` | server default | Maximum number of tokens to generate. |
+| `stream` | `boolean` | `false` | Whether to stream the response using Responses-style SSE events. |
+| `stream_options` | `object` | `{}` | Streaming options. Currently accepted for compatibility; `include_obfuscation` is ignored. |
+| `temperature` | `float` | `0.8` | Sampling temperature. |
+| `top_p` | `float` | `0.9` | Nucleus sampling threshold. |
+| `text` | `object` | `{ "format": { "type": "text" } }` | Text output configuration. `text.format.type` supports `text`, `json_object`, and `json_schema`. |
+| `reasoning` | `object` | `null` | Reasoning configuration. `reasoning.effort="none"` disables thinking mode; other values are treated as enabled. |
+| `tools` | `list[object]` | `[]` | Function tools. Both Responses-style flat function tools and Chat Completions-style nested `function` tools are accepted. |
+| `tool_choice` | `string \| object` | `"auto"` | Supports `"auto"`, `"none"`, `"required"`, or `{ "type": "function", "name": "..." }`. |
+| `parallel_tool_calls` | `boolean` | `true` | Whether the model can make multiple tool calls in parallel. |
+| `metadata` | `object` | `{}` | Arbitrary metadata echoed back in the response. |
+
+#### Supported Input Content Blocks
+
+Inside message `content`, the following block types are accepted:
+
+| Block Type | Behavior |
+|------------|----------|
+| `input_text` / `text` / `output_text` | Passed through as text. |
+| `input_image` | Accepted, but converted to a text placeholder such as `[input_image omitted]`. No multimodal inference is performed. |
+| `input_file` | Accepted, but converted to a text placeholder such as `[input_file omitted: report.pdf]`. No file understanding is performed. |
+
+#### Current Limitations
+
+| Field | Status |
+|-------|--------|
+| `previous_response_id` | Rejected with `400 invalid_request_error` |
+| `store=true` | Rejected with `400 invalid_request_error` |
+| `conversation` | Rejected with `400 invalid_request_error` |
+| Built-in OpenAI tools (`web_search`, `file_search`, etc.) | Not supported |
+| True multimodal understanding | Not supported |
+
 ---
 
 ## Anthropic-Compatible API
