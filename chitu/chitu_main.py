@@ -83,6 +83,8 @@ deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 
 
 logger = getLogger(__name__)
+
+
 _last_step_task_type: Optional[TaskType] = None
 
 
@@ -93,18 +95,6 @@ def get_last_step_task_type() -> Optional[TaskType]:
 
 def init_logger():
     setup_chitu_logging()
-
-    base_name = __name__.split(".")[0]
-    base_logger = getLogger(base_name)
-
-    if base_logger.handlers:
-        for handler in base_logger.handlers[:]:
-            base_logger.removeHandler(handler)
-
-    root_logger = getLogger()
-    if root_logger.handlers:
-        for handler in root_logger.handlers:
-            base_logger.addHandler(handler)
 
 
 def init_cache_static():

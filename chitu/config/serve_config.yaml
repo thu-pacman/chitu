@@ -5,6 +5,9 @@
 # `defaults` are other config files or scripts included into this config file. See
 # https://hydra.cc/docs/tutorials/basic/your_first_app/defaults/ for details.
 defaults:
+  # Config loggers. Only for chitu developers.
+  - logger
+
   # Config validating scripts. Only for chitu developers.
   - hydra/callbacks: 
     - serve_config_rules
