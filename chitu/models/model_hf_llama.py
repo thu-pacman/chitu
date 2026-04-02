@@ -38,6 +38,7 @@ from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+    LmHeadColumnParallelLinear,
 )
 from chitu.distributed.parallel_state import get_tp_size
 
@@ -666,7 +667,9 @@ class TransformerHFLlama(Transformer):
 
     def _init_pre_layers(self):
         self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=self.params.vocab_size, embedding_dim=self.params.dim
+            num_embeddings=self.params.vocab_size,
+            embedding_dim=self.params.dim,
+            decode_max_num_tokens=self.max_batch_size_per_dp * self.mtp_size,
         )
 
     def _init_layers(self, cache_dict: dict[str, KVCacheBase], attn_backend, op_impl):
@@ -702,27 +705,45 @@ class TransformerHFLlama(Transformer):
             ),
         )
         if not getattr(self.params, "tie_word_embeddings", False):
-            self.lm_head = ColumnParallelLinear(
+            self.lm_head = LmHeadColumnParallelLinear(
                 self.params.dim,
                 self.params.vocab_size,
+                decode_max_num_tokens=self.max_batch_size_per_dp * self.mtp_size,
                 has_bias=False,
                 checkpoint_prefix=f"lm_head",
             )
         elif not getattr(self, "embed_tokens", None):
             self.embed_tokens = VocabParallelEmbedding(
-                num_embeddings=self.params.vocab_size, embedding_dim=self.params.dim
+                num_embeddings=self.params.vocab_size,
+                embedding_dim=self.params.dim,
+                decode_max_num_tokens=self.max_batch_size_per_dp * self.mtp_size,
             )
 
     def _pre_layers(self, h, **args):
-        return self.embed_tokens(h)
+        if self.specialize_embed_tokens_lm_head_parallel:
+            return self.embed_tokens(
+                h, self.global_embed_num_tokens, self.embed_tokens_cum_num_tokens
+            )
+        else:
+            return self.embed_tokens(h)
 
     def _post_layers(self, h):
         """NOTE: _post_layers is assumed to be a token-wise computation"""
         h = self.norm(h, impl=get_rms_norm_impl())
         if not getattr(self.params, "tie_word_embeddings", False):
-            h = self.lm_head(h)
+            if self.specialize_embed_tokens_lm_head_parallel:
+                h = self.lm_head(
+                    h, self.global_lm_head_num_tokens, self.lm_head_cum_num_tokens
+                )
+            else:
+                h = self.lm_head(h)
         else:
-            h = self.embed_tokens.forward_as_lm_head(h)
+            if self.specialize_embed_tokens_lm_head_parallel:
+                h = self.embed_tokens.forward_as_lm_head(
+                    h, self.global_lm_head_num_tokens, self.lm_head_cum_num_tokens
+                )
+            else:
+                h = self.embed_tokens.forward_as_lm_head(h)
         return h
 
     def precompute_freqs_cis(

@@ -37,6 +37,7 @@ def deepgemm_contiguous_fused_expert(
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
     raise ValueError(f"Unsupported hidden_states type: {type(hidden_states)}")
@@ -130,6 +131,7 @@ def _(
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
     hidden_states = hidden_states.as_local_expert_ids(
@@ -149,6 +151,7 @@ def _(
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         block_shape=block_shape,
+        round_scale_to_pow2=round_scale_to_pow2,
         experts_start_idx=experts_start_idx,
     )
 

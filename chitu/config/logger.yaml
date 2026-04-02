@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# This file is a modification to Hydra's logger configuration. Only items different
+# from Hydra's default configuration are listed here. To view the full configuration
+# combined with Hydra's default configuration, run chitu with `--cfg hydra`.
+
+hydra:
+  job_logging:
+    formatters:
+      # Reuse the formatter name "simple" from Hydra, so Hydra's default handlers
+      # for console and files can recognize it. Otherwise, we have to build our own
+      # handlers for console and files.
+      simple:
+        class: "chitu.logging_utils.ChituFormatter"
+        format: "%(levelname)s %(asctime)s %(rank)s [%(name)s:%(lineno)d] %(context)s %(message)s"
+        datefmt: "%m-%d %H:%M:%S"

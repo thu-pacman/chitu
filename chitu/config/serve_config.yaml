@@ -5,6 +5,9 @@
 # `defaults` are other config files or scripts included into this config file. See
 # https://hydra.cc/docs/tutorials/basic/your_first_app/defaults/ for details.
 defaults:
+  # Config loggers. Only for chitu developers.
+  - logger
+
   # Config validating scripts. Only for chitu developers.
   - hydra/callbacks: 
     - serve_config_rules
@@ -109,6 +112,9 @@ infer:
   # Number of Expert Parallel ranks for MoE modules in MoE models. See
   # `docs/en/DEVELOPMENT.md#parallelism` for details.
   ep_size: 1
+
+  # Number of Tensor Parallel ranks for embed_tokens and lm_head.
+  embed_tokens_lm_head_tp_size: auto
 
   # Random seed
   seed: 0

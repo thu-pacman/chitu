@@ -14,7 +14,7 @@ from chitu.kv_cache import KVCacheBase, MMPagedKVCache
 from chitu.models.mm_cache_mixin_qwen_vl import get_qwen_vl_mm_cache_class
 from chitu.models.registry import ModelType, register_model
 from chitu.tensor_parallel import (
-    ColumnParallelLinear,
+    LmHeadColumnParallelLinear,
     VocabParallelEmbedding,
 )
 
@@ -261,15 +261,18 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
     def _init_post_layers(self):
         self.norm = Qwen3NextRMSNorm(self.params.dim, eps=self.params.norm_eps)
         if not getattr(self.params, "tie_word_embeddings", False):
-            self.lm_head = ColumnParallelLinear(
+            self.lm_head = LmHeadColumnParallelLinear(
                 self.params.dim,
                 self.params.vocab_size,
+                decode_max_num_tokens=self.max_batch_size_per_dp * self.mtp_size,
                 has_bias=False,
                 checkpoint_prefix=f"lm_head",
             )
         elif not getattr(self, "embed_tokens", None):
             self.embed_tokens = VocabParallelEmbedding(
-                num_embeddings=self.params.vocab_size, embedding_dim=self.params.dim
+                num_embeddings=self.params.vocab_size,
+                embedding_dim=self.params.dim,
+                decode_max_num_tokens=self.max_batch_size_per_dp * self.mtp_size,
             )
 
     @override
@@ -277,9 +280,19 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         """NOTE: _post_layers is assumed to be a token-wise computation"""
         h = self.norm(h)
         if not getattr(self.params, "tie_word_embeddings", False):
-            h = self.lm_head(h)
+            if self.specialize_embed_tokens_lm_head_parallel:
+                h = self.lm_head(
+                    h, self.global_lm_head_num_tokens, self.lm_head_cum_num_tokens
+                )
+            else:
+                h = self.lm_head(h)
         else:
-            h = self.embed_tokens.forward_as_lm_head(h)
+            if self.specialize_embed_tokens_lm_head_parallel:
+                h = self.embed_tokens.forward_as_lm_head(
+                    h, self.global_lm_head_num_tokens, self.lm_head_cum_num_tokens
+                )
+            else:
+                h = self.embed_tokens.forward_as_lm_head(h)
         return h
 
     def get_image_features(
