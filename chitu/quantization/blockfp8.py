@@ -36,6 +36,7 @@ from chitu.utils import (
 from chitu.utils import parse_dtype, ceil_div
 from chitu.import_utils import try_import_platform_dep, try_import_opt_dep
 from chitu.global_vars import get_global_args
+from chitu.cuda_graph import is_warming_up_or_cuda_graph_capture
 from chitu.native_layout import (
     enable_native_layout_weight,
     MarlinNativeLayoutWeight,
@@ -46,6 +47,9 @@ from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
+    IndexedBatchedRoutedActivationBlockfp8,
+    IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
+    IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
     ConcatPermutedBatchedRoutedActivationMinimal,
     PerExpertDenseBatchedRoutedActivationMinimal,
 )
@@ -317,6 +321,8 @@ def fused_experts_no_sum_blockfp8_indexed(
 def _auto_fused_experts_no_sum_blockfp8_indexed():
     if has_triton:
         return "triton"
+    if has_deep_gemm:
+        return "deepgemm"
     if has_torch_npu:
         return "torch_npu"
     raise NotImplementedError
@@ -425,9 +431,58 @@ def fused_experts_sum_blockfp8_indexed(
 def _auto_fused_experts_sum_blockfp8_indexed():
     if has_triton:
         return "triton"
+    if has_deep_gemm:
+        return "deepgemm"
     if has_torch_npu:
         return "torch_npu"
     raise NotImplementedError
+
+
+def _resolve_indexed_blockfp8_impl(
+    routed_x: IndexedBatchedRoutedActivation, impl: str, *, soft_fp8: bool = False
+) -> str:
+    if impl != "auto":
+        return impl
+    if soft_fp8:
+        return "triton"
+    # DeepEP prefill may produce indexed inputs with padded per-expert counts.
+    # These paths should go through deepgemm contiguous kernels instead of Triton.
+    if isinstance(
+        routed_x,
+        (
+            IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
+            IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
+        ),
+    ):
+        if has_deep_gemm:
+            return "deepgemm"
+    # For blockfp8 indexed input:
+    # - prefill prefers deepgemm contiguous
+    # - decode (CUDA graph warmup/capture phase) prefers triton
+    if isinstance(routed_x, IndexedBatchedRoutedActivationBlockfp8):
+        if is_warming_up_or_cuda_graph_capture():
+            if has_triton:
+                return "triton"
+        else:
+            if has_deep_gemm:
+                return "deepgemm"
+    # For non-blockfp8 indexed input:
+    # - prefill prefers deepgemm contiguous
+    # - decode (CUDA graph warmup/capture phase) prefers triton
+    if isinstance(routed_x, IndexedBatchedRoutedActivation):
+        if is_warming_up_or_cuda_graph_capture():
+            if has_triton:
+                return "triton"
+        else:
+            if has_deep_gemm:
+                return "deepgemm"
+    if has_triton:
+        return "triton"
+    if has_deep_gemm:
+        return "deepgemm"
+    if has_torch_npu:
+        return "torch_npu"
+    raise NotImplementedError("No available implementation for indexed blockfp8 MoE")
 
 
 @fused_experts_sum_blockfp8_indexed.register("triton")
@@ -958,6 +1013,7 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             fused_soft_fp8,
             _,
         ) = resolved
+        impl = _resolve_indexed_blockfp8_impl(routed_x, impl, soft_fp8=fused_soft_fp8)
         return fused_experts_no_sum_blockfp8_indexed(
             routed_x,
             w1=gate_up_proj_weight,
@@ -1066,6 +1122,7 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             fused_soft_fp8,
             _,
         ) = resolved
+        impl = _resolve_indexed_blockfp8_impl(routed_x, impl, soft_fp8=fused_soft_fp8)
         return fused_experts_sum_blockfp8_indexed(
             routed_x,
             w1=gate_up_proj_weight,
