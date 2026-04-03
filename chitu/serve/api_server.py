@@ -26,12 +26,8 @@ from chitu.backend import Backend
 from chitu.dp_request_router import get_request_router
 from chitu.dp_token_router import get_token_router
 from chitu.global_vars import get_global_args, set_global_args
-<<<<<<< HEAD
-from chitu.task import RouterRequest, Task, TaskPool, UserRequest
-=======
 from chitu.profiler import MemoryRecorder
 from chitu.task import RouterRequest, Task, TaskPool, UserRequest, SampleParams
->>>>>>> public-main
 from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
 from chitu.serve.common import (

@@ -24,13 +24,8 @@ from chitu.device_list import DeviceList
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.tool_call import ToolChoice, ToolCallParams, adjust_message_for_tool_calls
 from chitu.reasoning import get_reasoning_params, update_chat_template_kwargs_reasoning
-<<<<<<< HEAD
-from chitu.constraint_decode import ConstraintDecodeTask
-from chitu.serve.event_loop import get_server_event_loop
-=======
 from chitu.sampling.utils import compile_grammar, deserialize_grammar
 from chitu.kv_cache import TokenBlock
->>>>>>> public-main
 
 logger = getLogger(__name__)
 
@@ -634,19 +629,8 @@ class Task:
             self.next_token = int(self.next_token.cpu().item())
         if self.next_token == -1:
             return
-<<<<<<< HEAD
         has_update = is_decode(self.task_type) or self.evicting
-        if self.record_next_token is not None:
-            if not isinstance(self.record_next_token, int):
-                self.record_next_token = int(self.record_next_token.cpu().item())
-            if has_update:
-                self.prefix_tokens.append(self.record_next_token)
-            self.record_next_token = None
-        elif has_update:
-=======
-        has_update = self.task_type == TaskType.Decode or self.evicting
         if has_update:
->>>>>>> public-main
             if Backend.executor.mtp_size > 1:
                 self.prefix_tokens.extend(self.mtp_token_list)
             self.prefix_tokens.append(self.next_token)
@@ -802,44 +786,28 @@ class Task:
 
     @property
     def kv_cache_len_used_in_completed_steps(self):
-<<<<<<< HEAD
-        if is_prefill(self.task_type):
-            return self.consumed_req_tokens
-        elif is_decode(self.task_type):
-            return len(self.prefix_tokens) - (
-                self.num_new_tokens_single_step if not self.has_unsync_new_token else 0
-            )
-=======
         """在以往step中已经缓存到kv cache中的token长度"""
-        if self.task_type == TaskType.Prefill:
+        if is_prefill(self.task_type):
             if self.consumed_req_tokens != 0:
                 return self.consumed_req_tokens
             else:
                 # 尚未进行推理，但可能被prefix caching击中
                 return self.num_cached_blocks * self.token_blocks[0].blk_size
-        elif self.task_type == TaskType.Decode:
+        elif is_decode(self.task_type):
             return self.prefix_tokens_len - 1
->>>>>>> public-main
         else:
             assert False
 
     @property
     def kv_cache_len_used_in_completed_steps_and_next_step(self):
-<<<<<<< HEAD
+        """在下一个step完成后缓存到kv cache中的token长度"""
         if is_prefill(self.task_type):
             return self.consumed_req_tokens + self.next_req_tokens_len
         elif is_decode(self.task_type):
-            return min(self.prefix_tokens_len, get_global_args().infer.max_seq_len)
-=======
-        """在下一个step完成后缓存到kv cache中的token长度"""
-        if self.task_type == TaskType.Prefill:
-            return self.consumed_req_tokens + self.next_req_tokens_len
-        elif self.task_type == TaskType.Decode:
             return min(
                 self.prefix_tokens_len - 1 + get_global_args().infer.mtp_size,
                 get_global_args().infer.max_seq_len,
             )
->>>>>>> public-main
         else:
             assert False
 

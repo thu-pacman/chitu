@@ -423,7 +423,7 @@ class Scheduler:
         for task_id in TaskPool.id_list:
             task = TaskPool.pool[task_id]
             if (
-                task.task_type == TaskType.Prefill
+                is_prefill(task.task_type)
                 and task.can_schedule()
                 and task.dp_rank in schedule_dp_rank
             ):
@@ -502,8 +502,8 @@ class Scheduler:
                 break
 
             task = TaskPool.pool[task_id]
-            if task.task_type != TaskType.Prefill:
-                # filter out non-prefill tasks
+            if not is_prefill(task.task_type):
+                # filter out non-prefill tasks (includes PrefillDLLM)
                 continue
 
             # prefill chunk size check
@@ -575,7 +575,7 @@ class Scheduler:
                 f"  - available blocks: {self.kvcache_block_threshold - self.cache_manager_dict['main'].num_active_blocks}\n"
                 f"  - Prefill chunk size: {self.prefill_chunk_size if self.prefill_chunk_size is not None else 'inf'}\n"
                 "However, all prefill prompts are too long:\n"
-                f"{[TaskPool.pool[idx].prefix_tokens_len for idx in task_ids if TaskPool.pool[idx].task_type == TaskType.Prefill]}"
+                f"{[TaskPool.pool[idx].prefix_tokens_len for idx in task_ids if is_prefill(TaskPool.pool[idx].task_type)]}"
             )
         return sched_out_task_ids
 
@@ -933,7 +933,7 @@ class SkewScheduler(Scheduler):
             if TaskPool.pool[tid].dp_rank in (self.dp_rank, None)
             and TaskPool.pool[tid].sched_group_id in (sgroup_id, None)
             and TaskPool.pool[tid].can_schedule()
-            and TaskPool.pool[tid].task_type == TaskType.Prefill
+            and is_prefill(TaskPool.pool[tid].task_type)
         ]
         return len(task_ids) > 0
 

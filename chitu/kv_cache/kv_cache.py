@@ -366,6 +366,15 @@ class KVCacheBase:
         for tid, seq_len in zip(tasks.task_ids, next_seq_len.lens_list):
             self.tid_to_cached_len[tid] = seq_len
 
+    def prepare_cache_prefill_dllm(
+        self, tasks: "PackedTasksBase", prefilling_lengths: list[int]
+    ) -> None:
+        """DLLM partial prefill window; override in PagedKVCache. Default: no-op."""
+
+    def finalize_cache_all_prefill(self) -> None:
+        """Clear current task ids after a prefill step (AR + DLLM)."""
+        self.curr_tids = None
+
     def prepare_cache_decode(self, tasks: "PackedTasksBase"):
         cached_token_lens: list[int] = [
             self.tid_to_cached_len.get(tid, 0) for tid in tasks.task_ids
@@ -585,6 +594,24 @@ class PagedKVCache(KVCacheBase):
             for tid, new_cache_ids in zip(tasks.task_ids, tasks.new_cache_ids_list):
                 self.block_table[tid].extend(new_cache_ids)
         self._upd_gpu_block_table(tasks.task_ids)
+
+    @override
+    def prepare_cache_prefill_dllm(
+        self, tasks: "PackedTasksBase", prefilling_lengths: list[int]
+    ) -> None:
+        """Set seq_len_delta for the partial prefix written in this DLLM prefill step."""
+        self.curr_tids = tasks.task_ids
+        cached = [self.tid_to_cached_len.get(tid, 0) for tid in tasks.task_ids]
+        next_lens = [
+            cached[i] + prefilling_lengths[i] for i in range(len(tasks.task_ids))
+        ]
+        self.seq_len_delta.copy_from_list(cached, next_lens)
+        if tasks.new_cache_ids_list:
+            for tid, new_cache_ids in zip(tasks.task_ids, tasks.new_cache_ids_list):
+                self.block_table[tid].extend(new_cache_ids)
+        self._upd_gpu_block_table(tasks.task_ids)
+        for tid, nl in zip(tasks.task_ids, next_lens):
+            self.tid_to_cached_len[tid] = nl
 
     @override
     def prepare_cache_decode(self, tasks: "PackedTasksBase"):

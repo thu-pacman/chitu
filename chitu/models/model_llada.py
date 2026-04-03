@@ -6,7 +6,7 @@ import torch.nn as nn
 from transformers import AutoConfig
 
 from chitu.attn_backend import AttnBackend
-from chitu.cache_manager import KVCacheManagerBase
+from chitu.kv_cache.cache_manager import KVCacheManagerBase
 from chitu.global_vars import get_global_args
 from chitu.models.registry import ModelType, register_model
 from dinfer.decoding.diffusion_runner import ModelRunner

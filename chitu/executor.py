@@ -46,12 +46,9 @@ from chitu.utils import (
     try_import_and_setup_torch_npu,
 )
 from chitu.ops import (
-    apply_frequency_penalty,
-    response_append,
     append_to_paged_kv_cache,
     read_from_paged_kv_cache,
 )
-from chitu.device_list import DeviceList
 from chitu.moe.load_balancer import get_moe_load_planner  # added
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 from chitu.sampling.sampler import Sampler
@@ -1323,8 +1320,9 @@ class Executor:
                 logger.info(f"{prefilling_lengths=}")
 
             t0 = time.perf_counter()
-            for mgr in Backend.cache_managers.values():
-                mgr.prepare_cache_prefill(tasks.req_ids, prefilling_lengths)
+            # GPU paged KV lives in cache_dict on every rank; cache_managers is rank-0-only metadata.
+            for cache in Backend.cache_dict.values():
+                cache.prepare_cache_prefill_dllm(tasks, prefilling_lengths)
             PrometheusMetricsCollector.update_kvcache_usage()
             t_prepare = time.perf_counter() - t0
             if self.rank == 0:
@@ -1375,8 +1373,8 @@ class Executor:
         if self.rank == 0:
             logger.info(f"max_prefilling_length: {max_prefilling_length}")
         if is_empty_step or max_prefilling_length == 0:
-            for mgr in Backend.cache_managers.values():
-                mgr.finalize_cache_all_prefill()
+            for cache in Backend.cache_dict.values():
+                cache.finalize_cache_all_prefill()
             return self.dummy_output
 
         batch_size = tasks.num_tasks
@@ -1422,7 +1420,8 @@ class Executor:
 
         total_prefill_tokens = sum(prefilling_lengths)
         if total_prefill_tokens > 0:
-            cache_manager = Backend.cache_managers["main"]
+            cache_manager = Backend.cache_dict["main"]
+            n_kv_heads_cache = int(cache_manager.shape_per_token_dict["k"][0])
             seq_len_delta = cache_manager.seq_len_delta
             delta_position_ids = seq_len_delta.delta_position_ids_tensor_device
             delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
@@ -1436,6 +1435,13 @@ class Executor:
                     continue
                 for kv_idx, kv_name in enumerate(["k", "v"]):
                     layer_kv = prefilling_kv[layer_id, kv_idx].contiguous()
+                    # dInfer layout is (B, n_local_kv, seq, head_dim); guard (B, seq, H, d).
+                    if (
+                        layer_kv.ndim == 4
+                        and layer_kv.shape[1] != n_kv_heads_cache
+                        and layer_kv.shape[2] == n_kv_heads_cache
+                    ):
+                        layer_kv = layer_kv.transpose(1, 2).contiguous()
                     this_kv_list = []
                     for b in range(tasks.num_tasks):
                         Lb = prefilling_lengths[b]
@@ -1456,8 +1462,8 @@ class Executor:
                             use_i64_offsets=accessor.use_i64_offsets,
                         )
 
-            for mgr in Backend.cache_managers.values():
-                mgr.finalize_cache_all_prefill()
+            for cache in Backend.cache_dict.values():
+                cache.finalize_cache_all_prefill()
         torch.cuda.synchronize()
         t_kv_write = time.perf_counter() - t0
         if self.rank == 0:
@@ -1573,9 +1579,9 @@ class Executor:
 
         # 3) Prepare cache for DLLM (reserve blocks for decoding_start + block_length)
         self._kv_hook.before_decode_step(tasks.req_ids)
-        for mgr in Backend.cache_managers.values():
-            if hasattr(mgr, "prepare_cache_decode_dllm"):
-                mgr.prepare_cache_decode_dllm(tasks, decoding_start_list, block_length)
+        Backend.cache_dict["main"].prepare_cache_decode_dllm(
+            tasks, decoding_start_list, block_length
+        )
         logger.debug(f"{payload=}{payload.shape=}")
         PrometheusMetricsCollector.update_kvcache_usage()
         _mark = _dllm_decode_seg_end("prepare_cache_decode", _mark, _dllm_seg)
@@ -1592,7 +1598,7 @@ class Executor:
         # 4) Read past_key_values from Chitu paged cache
         inner_model = Backend.model.model.model
         num_layers = inner_model.config.num_hidden_layers
-        cache_manager = Backend.cache_managers["main"]
+        cache_manager = Backend.cache_dict["main"]
         # TP 下 paged KV 存的是每 rank 的 n_local_kv_heads；dInfer ModelRunner 也按 num_kv_heads//tp_size
         # 分配 cache。此处必须用 cache 的 shape，不能用 config.num_key_value_heads（全局），否则
         # dense 与 ragged 维数不一致，或各 rank 传入的 past 与内部通信假设不一致 → NCCL 卡死。
@@ -1847,11 +1853,9 @@ class Executor:
         _mark = _dllm_decode_seg_end("kv_write_paged", _mark, _dllm_seg)
 
         # 10) Finalize cache: update req_id_to_seq_len for finished blocks
-        for mgr in Backend.cache_managers.values():
-            if hasattr(mgr, "finalize_cache_single_decode_dllm"):
-                mgr.finalize_cache_single_decode_dllm(
-                    tasks.req_ids, block_finished_list, block_length
-                )
+        Backend.cache_dict["main"].finalize_cache_single_decode_dllm(
+            tasks.req_ids, block_finished_list, block_length
+        )
         _mark = _dllm_decode_seg_end("finalize_cache_dllm", _mark, _dllm_seg)
 
         # 11) Update task state (main rank only): next_block, decoding_start; for block_finished
@@ -1964,64 +1968,6 @@ class Executor:
                 )
         # Return logits for compatibility (DLLM does not sample per-step; last pos logits)
         return logits[:, -1, :]
-
-    def sample(self, logits: torch.Tensor, tasks: PackedTasks):
-        """
-        schedule -> model -> ***sample*** -> sync -> send
-
-        Sample the next token with model outputs.
-
-        This part is fully GPU computation without synchronization, and is before the model run.
-        """
-        logits = logits.view(-1, logits.shape[-1]).contiguous()
-        assert (
-            len(tasks.output_tasks) == logits.shape[0]
-        ), f"logits has shape {logits.shape}, but there are {len(tasks.output_tasks)} output_tasks"
-        # logits is now [num_tasks, vocab_size]
-
-        Backend.constraint_decode_manager.apply_grammars(logits, tasks.output_tasks)
-
-        if tasks.is_all_greedy:
-            tokens = torch.argmax(logits, dim=-1)
-        else:
-            if tasks.should_apply_frequency_penalty:
-                logits_index_list = []
-                response_list = []
-                response_len_list = []
-                for it, task in enumerate(tasks.output_tasks):
-                    if (
-                        task.sample_params.frequency_penalty > 0
-                        and is_decode(task.task_type)
-                        and len(task.response) > 0
-                    ):
-                        logits_index_list.append(it)
-                        response_list.append(task.response)
-                        response_len_list.append(len(task.response))
-                # TODO: initialize DeviceList could trigger synchronization between CPU and GPU
-                logits_index_list = DeviceList(
-                    logits_index_list, dtype=torch.int64, device=logits.device
-                )
-                response_len_list = DeviceList(
-                    response_len_list, dtype=torch.int64, device=logits.device
-                )
-                apply_frequency_penalty(
-                    logits,
-                    logits_index_list,
-                    response_list,
-                    response_len_list,
-                    tasks.frequency_penalties,
-                    impl="auto",
-                )
-
-            logits = logits / tasks.temperatures.view(-1, 1)
-            tokens = top_k_top_p_min_p_sampling_from_logits(
-                logits, tasks.top_ks, tasks.top_ps
-            )
-
-            if tasks.should_apply_frequency_penalty:
-                response_append(tasks, tokens)
-
-        return tokens
 
     def postprocess_before_sync(self, tasks: PackedTasks):
         """
