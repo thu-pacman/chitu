@@ -26,6 +26,7 @@ from chitu.ops.moe_sum import (
 from chitu.ops.linear_attn import (
     chunk_gated_delta_rule,
     recurrent_gated_delta_rule,
+    recurrent_gated_delta_rule_all_state,
 )
 from chitu.ops.quant import (
     linear,

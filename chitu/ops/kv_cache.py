@@ -83,6 +83,7 @@ def update_singleton_paged_kv_cache(
     page_table: torch.Tensor,
     this_kv: torch.Tensor,
     impl: str = "auto",
+    mtp_size: int = 1,
 ):
     """
     Update singleton paged K/V cache.
@@ -97,7 +98,7 @@ def update_singleton_paged_kv_cache(
         impl = "torch"
 
     if impl == "torch":
-        update_singleton_paged_kv_cache_torch(kv_cache, page_table, this_kv)
+        update_singleton_paged_kv_cache_torch(kv_cache, page_table, this_kv, mtp_size)
     else:
         raise ValueError(f"Unknown implementation: {impl}")
 
@@ -192,13 +193,14 @@ def update_singleton_paged_kv_cache_torch(
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
     this_kv: torch.Tensor,
+    mtp_size: int = 1,
 ):
     # Page size is always 1
-    assert kv_cache.shape[1] == 1
+    assert kv_cache.shape[1] == mtp_size
     assert page_table.shape[1] == 1
 
     kv_cache[page_table.squeeze(1)] = this_kv.view(
-        this_kv.shape[0], 1, *kv_cache.shape[2:]
+        this_kv.shape[0], mtp_size, *kv_cache.shape[2:]
     )
 
 
@@ -290,7 +292,10 @@ def read_from_paged_kv_cache(
 
 
 def read_from_singleton_paged_kv_cache(
-    kv_cache: torch.Tensor, page_table: torch.Tensor, impl: str = "auto"
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    impl: str = "auto",
+    mtp_offset: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     Read from singleton paged K/V cache.
@@ -304,7 +309,9 @@ def read_from_singleton_paged_kv_cache(
         impl = "torch"
 
     if impl == "torch":
-        return read_from_singleton_paged_kv_cache_torch(kv_cache, page_table)
+        return read_from_singleton_paged_kv_cache_torch(
+            kv_cache, page_table, mtp_offset
+        )
     else:
         raise NotImplementedError(f"Unsupported implementation: {impl}")
 
@@ -353,9 +360,12 @@ def read_from_paged_kv_cache_torch(
 
 
 def read_from_singleton_paged_kv_cache_torch(
-    kv_cache: torch.Tensor, page_table: torch.Tensor
+    kv_cache: torch.Tensor, page_table: torch.Tensor, mtp_offset: torch.Tensor = None
 ) -> torch.Tensor:
-    return kv_cache[page_table.squeeze(1)].squeeze(1)
+    if mtp_offset is None:
+        return kv_cache[page_table.squeeze(1)].squeeze(1)
+    else:
+        return kv_cache[page_table.squeeze(1), mtp_offset]
 
 
 def read_from_dense_kv_cache_torch(

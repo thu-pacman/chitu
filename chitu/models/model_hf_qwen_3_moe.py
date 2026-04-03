@@ -214,7 +214,7 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
         """
 
         local_experts = compute_expert_dist_in_ep(
-            self.args.models.n_layers,
+            self.global_n_layers,
             self.ep_size,
             self.args.models.num_experts,
             self.moe_impl,

@@ -421,6 +421,7 @@ class PagedKVCache(KVCacheBase):
         quant_type: str = None,
         device="cuda",
         block_size: int = 512,  # must be a multiple of 256 for FlashAttention
+        is_singleton: bool = False,
     ):
         super().__init__(
             layer_id_map,
@@ -433,7 +434,7 @@ class PagedKVCache(KVCacheBase):
             quant_type=quant_type,
             device=device,
         )
-        mtp_extra = self.mtp_size if self.mtp_size > 1 else 0
+        mtp_extra = self.mtp_size if (self.mtp_size > 1 and not is_singleton) else 0
         self.max_blocks_per_req = ceil_div(max_seq_len + mtp_extra, block_size)
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
         self.num_blocks = num_blocks
@@ -710,21 +711,31 @@ class SingletonPagedKVCache(PagedKVCache):
         head_dim: Optional[int] = None,
         device="cuda",
     ):
+        self.mtp_size = get_global_args().infer.mtp_size
         super().__init__(
             layer_id_map,
             num_hot_req=num_hot_req,
-            max_seq_len=1,
+            max_seq_len=self.mtp_size,
             shape_per_token_dict=shape_per_token_dict,
             dtype_dict=dtype_dict,
             n_local_kv_heads=n_local_kv_heads,
             head_dim=head_dim,
             device=device,
-            block_size=1,
+            block_size=self.mtp_size,
             num_blocks=num_hot_req,
+            is_singleton=True,
         )
         self.max_blocks_per_req = 1
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
         self.free_blocks = deque(range(self.num_blocks))
+
+        if self.mtp_size > 1:
+            self.tid_to_mtp_offset: dict[str, int] = {}
+            self.mtp_offset = []
+            self.is_mtp_decode_stage = False
+            self.mtp_offset_tensor = StaticTensor(
+                max_nelem=self.num_hot_req, device=device, dtype=torch.int32
+            )
 
     def realloc(self, num_blocks):
         super().realloc(num_blocks)
@@ -736,6 +747,15 @@ class SingletonPagedKVCache(PagedKVCache):
         return len(self.free_blocks)
 
     @override
+    def update_mtp_cache_decode(self, mtp_offset: list[int]):
+        super().update_mtp_cache_decode(mtp_offset)
+
+        if self.mtp_size > 1:
+            task_ids = self.curr_tids
+            for task_id, off_set in zip(task_ids, mtp_offset):
+                self.tid_to_mtp_offset[task_id] = off_set - 1
+
+    @override
     def prepare_cache_prefill(self, tasks: "PackedTasksBase"):
         KVCacheBase.prepare_cache_prefill(self, tasks)
 
@@ -744,10 +764,27 @@ class SingletonPagedKVCache(PagedKVCache):
                 self.block_table[task_id] = [self.get_free_block()]
         self._upd_gpu_block_table(tasks.task_ids)
 
+        if self.mtp_size > 1:
+            self.mtp_offset.clear()
+            for task_id in tasks.task_ids:
+                self.tid_to_mtp_offset[task_id] = -1
+                self.mtp_offset.append(-1)
+            self.is_mtp_decode_stage = False
+            self.mtp_offset_tensor.set(
+                torch.tensor(self.mtp_offset, dtype=torch.int32, device=self.device)
+            )
+
     @override
     def prepare_cache_decode(self, tasks: "PackedTasksBase"):
         KVCacheBase.prepare_cache_decode(self, tasks)
         self._upd_gpu_block_table(tasks.task_ids)
+
+        if self.mtp_size > 1:
+            self.mtp_offset = list(self.tid_to_mtp_offset.values())
+            self.is_mtp_decode_stage = True
+            self.mtp_offset_tensor.set(
+                torch.tensor(self.mtp_offset, dtype=torch.int32, device=self.device)
+            )
 
     @override
     def finalize_cache_all_decode(self, tasks: "PackedTasksBase"):
@@ -756,6 +793,11 @@ class SingletonPagedKVCache(PagedKVCache):
             if tid not in self.block_table:
                 continue
             self.free_req_cache_blocks(tid)
+
+        if self.mtp_size > 1:
+            for tid in tasks.task_ids:
+                if tid in self.tid_to_mtp_offset:
+                    self.tid_to_mtp_offset.pop(tid)
 
     def free_req_cache_blocks(self, tid: str):
         for block in self.block_table[tid]:

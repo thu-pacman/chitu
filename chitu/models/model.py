@@ -363,6 +363,9 @@ class Transformer(nn.Module):
     def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
         raise NotImplementedError
 
+    def _get_layer_mtp_prefix_mapping(self, i: int) -> tuple[str, str, dict[str, str]]:
+        raise NotImplementedError
+
     def _get_2d_out_x_in_tensor_names(self, quant) -> list[str]:
         ret = ["weight"]
         if quant == "blockfp8" or quant == "q4km":

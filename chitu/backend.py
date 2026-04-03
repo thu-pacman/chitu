@@ -834,8 +834,13 @@ class Backend:
                     and f"model.layers.{args.models.n_layers}" in k
                 ):
                     return False
-                if args.models.type == ModelType.HF_QWEN3_NEXT and "mtp." in k:
+                if (
+                    args.models.type in [ModelType.HF_QWEN3_NEXT, ModelType.HF_QWEN3_5]
+                    and "mtp." in k
+                ):
                     return False
+            if args.infer.language_model_only and k.startswith("model.visual"):
+                return False
             if args.models.quant_config.type == "blockfp4" and (
                 k.endswith(".k_scale") or k.endswith(".v_scale")
             ):
@@ -872,6 +877,7 @@ class Backend:
             checkpoint_prefix: str,
             model_prefix: str,
             local_layer_prefix: str | None = None,
+            extra_prefix_dict: dict[str, str] = None,
         ):
             """
             Example layer prefixes:
@@ -888,6 +894,11 @@ class Backend:
                     skip_preprocess=args.skip_preprocess,
                     key_filter=key_filter,
                     prefix=checkpoint_prefix,
+                    prefix_list=(
+                        list(extra_prefix_dict.keys())
+                        if extra_prefix_dict is not None
+                        else None
+                    ),
                 )
             except Exception as e:
                 raise RuntimeError(
@@ -906,6 +917,14 @@ class Backend:
                         )
                     ] = v
                 state_dict = mapped
+
+                if extra_prefix_dict is not None:
+                    for k in list(state_dict.keys()):
+                        v = state_dict.pop(k)
+                        new_k = k
+                        for prefix_, replacement_ in extra_prefix_dict.items():
+                            new_k = new_k.replace(prefix_, replacement_)
+                        state_dict[new_k] = v
 
             target_prefix = local_layer_prefix or model_prefix
             try:
@@ -927,8 +946,16 @@ class Backend:
 
         # Load transformer layers
         is_print_rank = int(os.environ.get("LOCAL_RANK", 0)) == 0
+        is_qwen3_5_mtp = (
+            args.models.type == ModelType.HF_QWEN3_5 and args.infer.mtp_size > 1
+        )
+        local_main_end_layer_id = (
+            model.local_end_layer_id
+            if not is_qwen3_5_mtp
+            else model.local_end_layer_id - 1
+        )
         for global_layer_id in tqdm(
-            range(model.local_begin_layer_id, model.local_end_layer_id),
+            range(model.local_begin_layer_id, local_main_end_layer_id),
             disable=not is_print_rank,
             desc="Model loading",
             unit="layer",
@@ -947,6 +974,27 @@ class Backend:
                 local_layer_prefix=local_layer_prefix,
             )
 
+        if is_qwen3_5_mtp:
+            for global_layer_id in tqdm(
+                range(local_main_end_layer_id, model.local_end_layer_id),
+                disable=not is_print_rank,
+                desc="Model loading",
+                unit="layer",
+                leave=False,
+            ):
+                checkpoint_prefix, model_prefix, extra_prefix_dict = (
+                    model._get_layer_mtp_prefix_mapping(global_layer_id)
+                )
+                local_layer_id = global_layer_id - model.local_begin_layer_id
+
+                layer_prefix = f"layers.{global_layer_id}."
+                local_layer_prefix = f"layers.{local_layer_id}."
+                _load_and_apply(
+                    checkpoint_prefix,
+                    model_prefix,
+                    local_layer_prefix=local_layer_prefix,
+                    extra_prefix_dict=extra_prefix_dict,
+                )
         torch.cuda.empty_cache()
 
     @staticmethod
@@ -1052,6 +1100,7 @@ def load_state_dict(
     skip_preprocess=False,
     key_filter: Callable[[str], bool] = None,
     prefix: str = "",
+    prefix_list: list[str] = None,
 ):
     if not skip_preprocess:
         path = os.path.join(hf_ckpt_path, "*.safetensors")
@@ -1071,6 +1120,12 @@ def load_state_dict(
                     state_dict[name] = param
                 else:
                     ignored_params.append(name)
+
+            if prefix_list is not None:
+                for name in f.keys():
+                    if name.startswith(tuple(prefix_list)):
+                        param: torch.Tensor = f.get_tensor(name)
+                        state_dict[name] = param
 
     if ignored_params:
         logger.info(
