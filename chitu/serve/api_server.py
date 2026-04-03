@@ -56,6 +56,9 @@ rank = 0
 # DP related globals
 dp_service_started = False
 
+# Reference to the uvicorn server instance for graceful shutdown
+_uvicorn_server: Optional["uvicorn.Server"] = None
+
 # Create FastAPI app
 app = FastAPI()  # Unified API
 
@@ -310,15 +313,42 @@ async def init_chitu_service():
     return {"message": "Service initial done."}
 
 
-@app.post("/stop")
-async def stop_chitu_service():
-    global server_status
-    if server_status:
-        Backend.stop()
-        server_status = False
-        return {"message": "Service has been terminated."}
-    else:
-        return {"message": "Service has not been initialized."}
+class TerminateRequest(BaseModel):
+    confirm: bool = False
+
+
+@app.post("/terminate_engine")
+async def terminate_engine(request: TerminateRequest):
+    global server_status, _uvicorn_server
+    if not server_status:
+        return JSONResponse(
+            status_code=400,
+            content={"message": "Service has not been initialized."},
+        )
+    if not request.confirm:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "message": 'Termination not confirmed. Send {"confirm": true} to proceed.'
+            },
+        )
+
+    logger.info(
+        "[terminate_engine] Termination requested, draining in-flight requests..."
+    )
+    server_status = False
+
+    # Set Terminating (not Terminated) so the worker thread finishes
+    # in-flight requests before broadcasting TerminateBackend.
+    from chitu.backend import Backend, BackendState
+
+    Backend.state = BackendState.Terminating
+
+    # Signal uvicorn to shut down gracefully
+    if _uvicorn_server is not None:
+        _uvicorn_server.should_exit = True
+
+    return {"message": "Terminate signal sent. Engine and server are shutting down."}
 
 
 @app.post("/status")
@@ -868,7 +898,9 @@ async def start_uvicorn_async(args):
         timeout_keep_alive=keepalive,
         access_log=True,
     )
+    global _uvicorn_server
     server = uvicorn.Server(config)
+    _uvicorn_server = server
     # Run server in current event loop - use await instead of asyncio.run!
     await server.serve()
 

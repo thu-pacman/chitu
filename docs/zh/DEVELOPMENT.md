@@ -630,6 +630,15 @@ curl localhost:21002/v1/messages \
   }'
 ```
 
+优雅终止引擎和 API 服务（需要 `{"confirm": true}` 以防止误操作）。已在处理的请求会在服务退出前完成，终止发起后新请求将被拒绝。
+
+```bash
+curl localhost:21002/terminate_engine \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"confirm": true}'
+```
+
 OpenAI 兼容、OpenAI Responses 兼容和 Anthropic 兼容接口的参数说明请参见 [API_PARAMETERS.md](./API_PARAMETERS.md)。
 
 ### Grafana 监控面板

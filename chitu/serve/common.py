@@ -270,7 +270,13 @@ def step_profiler(task_type: Optional[TaskType] = None):
 
 async def process_queue():
     """Process the task queue - common function used by both normal and DP modes"""
-    from chitu.chitu_main import chitu_run, get_last_step_task_type
+    from chitu.backend import Backend, BackendState
+    from chitu.chitu_main import (
+        chitu_run,
+        get_last_step_task_type,
+        chitu_is_terminated,
+        chitu_terminate,
+    )
 
     rank = torch.distributed.get_rank()
     is_distributed = (
@@ -278,14 +284,24 @@ async def process_queue():
     )
     global min_batch_size, _pending_profile_payload
     while True:
+        if chitu_is_terminated():
+            break
         if rank == 0:
             _drain_profile_queue()
             if _pending_profile_payload is not None:
                 _apply_profile_command(_pending_profile_payload)
                 if not is_distributed:
                     _pending_profile_payload = None
+            if Backend.state == BackendState.Terminating and TaskPool.all_finished():
+                chitu_terminate()
+                break
+
         TaskPool.add_all_queued()
-        if (len(TaskPool.pool) >= min_batch_size) or rank != 0:
+        if (
+            (len(TaskPool.pool) >= min_batch_size)
+            or rank != 0
+            or Backend.state == BackendState.Terminating
+        ):
             min_batch_size = 1
             status = chitu_run()
             if status != SerializedPackedTasksPayloadType.NoneType:
