@@ -1346,7 +1346,7 @@ class Transformer(nn.Module):
             )
         if self.ep_size > 1:
             for it, layer in enumerate(self.layers):
-                if it < self.moe_impl.n_dense_layers:
+                if self.local_begin_layer_id + it < self.moe_impl.n_dense_layers:
                     continue
                 layer.mlp(self.dummy_input)
         if self.specialize_embed_tokens_lm_head_parallel:
@@ -1372,9 +1372,10 @@ class Transformer(nn.Module):
                 self.global_embed_num_tokens,
                 self.embed_tokens_cum_num_tokens,
             )
-        layer_main = self.layers[0:-1] if self.mtp_size > 1 else self.layers
+        has_mtp_layer = self.mtp_size > 1 and self.pp_stage == self.pp_end_stage
+        layer_main = self.layers[0:-1] if has_mtp_layer else self.layers
         for it, layer in enumerate(layer_main):
-            if it < self.moe_impl.n_dense_layers:
+            if self.local_begin_layer_id + it < self.moe_impl.n_dense_layers:
                 continue
             layer.mlp(self.dummy_input)
         if self.specialize_embed_tokens_lm_head_parallel:

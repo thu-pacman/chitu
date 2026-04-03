@@ -124,9 +124,6 @@ class IndexedBatchedRoutedActivation(BatchedRoutedActivation):
         experts_start_idx: int,
         experts_end_idx: int,
     ) -> list[tuple["IndexedBatchedRoutedActivation", torch.Tensor]]:
-        if self.token_to_expert_indices.numel() == 0:
-            return [(self, topk_weights)]
-
         # Esitimate the real chunk size.
         #
         # NOTE: Relation among the following values may be a bit confusing:
@@ -145,6 +142,13 @@ class IndexedBatchedRoutedActivation(BatchedRoutedActivation):
         max_n_tokens = max(
             int(max_n_tokens_x_topk / expected_n_local_experts_per_token), 1
         )
+
+        if self.token_to_expert_indices.shape[0] <= max_n_tokens:
+            # Early return without creating new objects. This is performance-critical for
+            # IndexedBatchedRoutedActivation's subclasses, because they reuse
+            # get_chunks_no_larger_than from IndexedBatchedRoutedActivation, and returning
+            # the original object prevents the type relaxing.
+            return [(self, topk_weights)]
 
         return [
             (
@@ -193,9 +197,6 @@ class IndexedBatchedRoutedActivationBlockfp8(IndexedBatchedRoutedActivation):
         experts_start_idx: int,
         experts_end_idx: int,
     ) -> list[tuple["IndexedBatchedRoutedActivationBlockfp8", torch.Tensor]]:
-        if self.token_to_expert_indices.numel() == 0:
-            return [(self, topk_weights)]
-
         # Esitimate the real chunk size
         avg_experts_per_token = max(
             int(
@@ -206,6 +207,13 @@ class IndexedBatchedRoutedActivationBlockfp8(IndexedBatchedRoutedActivation):
             1,
         )
         max_n_tokens = max(int(max_n_tokens_x_topk / avg_experts_per_token), 1)
+
+        if self.token_to_expert_indices.shape[0] <= max_n_tokens:
+            # Early return without creating new objects. This is performance-critical for
+            # IndexedBatchedRoutedActivationBlockfp8's subclasses, because they reuse
+            # get_chunks_no_larger_than from IndexedBatchedRoutedActivationBlockfp8, and
+            # returning the original object prevents the type relaxing.
+            return [(self, topk_weights)]
 
         return [
             (

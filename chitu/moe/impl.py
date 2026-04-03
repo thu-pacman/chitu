@@ -15,8 +15,7 @@ from chitu.moe.token_dispatchers import (
     MoENpuDistributeTokenDispatcher,
 )
 from chitu.moe.load_balancer import (
-    MoELargeScaleNaiveLoadBalancer,
-    MoENaiveLoadBalancer,
+    MoESlotCntLoadBalancer,
     init_moe_load_balancer,
     register_moe_weight_accessor,
 )
@@ -382,14 +381,10 @@ class MoEImplEP(MoEImplBase):
 
         self.load_balancer = {}
         for layer_id in self.moe_layer_id_list:
-            cur_load_balancer = MoELargeScaleNaiveLoadBalancer(
-                self.n_experts,
-                self.n_global_experts_slots,
-                self.ep_size,
+            cur_load_balancer = MoESlotCntLoadBalancer(
+                self.n_experts, self.n_global_experts_slots, self.ep_size
             )
-            cur_load_balancer.update_expert_mapping(
-                expert_stats=expert_stats[layer_id],
-            )
+            cur_load_balancer.update_expert_mapping(expert_stats=expert_stats[layer_id])
             self.load_balancer[layer_id] = cur_load_balancer
 
     def get_expert_mapping(self, layer_id: int):

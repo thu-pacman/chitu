@@ -3,10 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import Optional
+from typing_extensions import override
 
 import torch
 
-from .base import MoELoadBalancer
+from chitu.moe.load_balancer.base import MoELoadBalancer
 
 
 def assign_groups_contiguous(N, M):
@@ -34,16 +35,16 @@ def gen_mapping_from_instance_idx(
     for e in range(num_experts):
         instance_count = len(instance_idx[e])
         groups = assign_groups_contiguous(ep_size, instance_count)
-        for ep_rank in range(ep_size):
-            expert_mapping_list[ep_rank][e] = instance_idx[e][groups[ep_rank]]
+        for src_rank in range(ep_size):
+            expert_mapping_list[src_rank][e] = instance_idx[e][groups[src_rank]]
 
     expert_mapping_list = [
         torch.tensor(
-            expert_mapping_list[ep_rank],
+            expert_mapping_list[src_rank],
             device=torch.cuda.current_device(),
             dtype=torch.int32,
         )
-        for ep_rank in range(ep_size)
+        for src_rank in range(ep_size)
     ]
 
     return expert_mapping_list
@@ -57,18 +58,51 @@ def gen_instance_idx_from_slot(num_slots, num_experts, slot_mapping):
     return instance_idx
 
 
-class MoELargeScaleNaiveLoadBalancer(MoELoadBalancer):
-    # This strategy only ensures that:
-    # - each expert has at least one instance
-    # - every slot store an expert which could be used by certain ranks.
-    #
-    # This strategy does NOT ensure:
-    # - workload balancing
+class MoESlotCntLoadBalancer(MoELoadBalancer):
+    """
+    Assign the mapping between experts, slots, and ranks.
+
+    This MoELoadBalancer specialization optimizes for balanced slot count per expert.
+    It ensures that:
+    - Each expert has at least one slot.
+    - Every slot has the opportunity to be used.
+
+    This specialization does NOT ensure that:
+    - Tokens are balanced across slots.
+    - Each token choose its nearest expert.
+
+    Algorithm:
+    1. Slots are partitioned contiguously to EP ranks.
+    2. Experts are assigned to slots in a round-robin manner, or by pre-collected
+       stats.
+    3. Slots holding the same expert are distributed to source ranks evenly.
+       Source ranks meaning DP*TP/ETP ranks, i.e. EP ranks before communication.
+
+    Example: 6 experts, 9 slots, 3 ranks, no pre-collected stats.
+
+    First assign experts to slot:
+
+    | EP Rank   | 0         | 1         | 2         |
+    | Slot ID   | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+    | Expert ID | 0 | 1 | 2 | 3 | 4 | 5 | 0 | 1 | 2 |
+
+    Note that each of Expert 0-2 has two slots each, while each of Expert 3-5
+    only has one slot.
+
+    | Expert ID | 0     | 1     | 2     | 3 | 4 | 5 |
+    | Slot ID   | 0 | 6 | 1 | 7 | 2 | 8 | 3 | 4 | 5 |
+
+    We then distribute slots to EP ranks according to this slot count:
+
+    | Src Rank \ Expert ID | 0 | 1 | 2 | 3 | 4 | 5 |
+    |----------------------|---|---|---|---|---|---|
+    | 0                    | 0 | 1 | 2 | 3 | 4 | 5 |
+    | 1                    | 0 | 1 | 2 | 3 | 4 | 5 |
+    | 2                    | 6 | 7 | 8 | 3 | 4 | 5 |
+    """
 
     def generate_expert_mapping(
-        self,
-        expert_stats: Optional[torch.Tensor] = None,
-        eplb: bool = False,
+        self, expert_stats: Optional[torch.Tensor] = None, eplb: bool = False
     ):
         self.num_local_slots = self.num_slots // self.ep_size
 
@@ -90,17 +124,21 @@ class MoELargeScaleNaiveLoadBalancer(MoELoadBalancer):
             self.ep_size, self.num_experts, instance_idx, self.is_cuda
         )
 
+    @override
     def get_local_experts(self, ep_rank):
         slot_start_idx = ep_rank * self.num_local_slots
         slot_end_idx = slot_start_idx + self.num_local_slots
         return self.slot_mapping[slot_start_idx:slot_end_idx]
 
+    @override
     def get_num_local_slots(self):
         return self.num_local_slots
 
-    def get_expert_mapping(self, ep_rank):
-        return self.expert_mapping_list[ep_rank]
+    @override
+    def get_expert_mapping(self, src_rank):
+        return self.expert_mapping_list[src_rank]
 
+    @override
     def get_slot_mapping(self):
         return self.slot_mapping
 

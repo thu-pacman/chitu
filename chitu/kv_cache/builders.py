@@ -25,7 +25,6 @@ from chitu.kv_cache.utils import build_layer_id_map
 from chitu.models.registry import ModelType
 from chitu.utils import ceil_div
 
-
 logger = getLogger(__name__)
 
 
@@ -233,33 +232,47 @@ def _build_indexer_cache(args):
     if spec is None:
         return None
 
-    block_size = (
-        int(spec.block_size)
-        if spec.block_size is not None
-        else default_paged_block_size_policy(args)
-    )
-
     num_hot_req = ceil_div(args.infer.max_reqs, args.infer.dp_size)
-    mtp_extra = args.infer.mtp_size if args.infer.mtp_size > 1 else 0
-    auto_num_blocks = (
-        ceil_div(args.infer.max_seq_len + mtp_extra, block_size) * num_hot_req
-    )
 
-    resolved_num_blocks = (
-        int(args.infer.num_blocks)
-        if args.infer.num_blocks != -1
-        else int(auto_num_blocks)
-    )
+    if args.infer.cache_type == "paged":
 
-    return PagedKVCache(
-        layer_id_map,
-        num_hot_req=num_hot_req,
-        max_seq_len=args.infer.max_seq_len,
-        num_blocks=resolved_num_blocks,
-        block_size=block_size,
-        device=device,
-        **spec.kvargs,
-    )
+        block_size = (
+            int(spec.block_size)
+            if spec.block_size is not None
+            else default_paged_block_size_policy(args)
+        )
+
+        mtp_extra = args.infer.mtp_size if args.infer.mtp_size > 1 else 0
+        auto_num_blocks = (
+            ceil_div(args.infer.max_seq_len + mtp_extra, block_size) * num_hot_req
+        )
+
+        resolved_num_blocks = (
+            int(args.infer.num_blocks)
+            if args.infer.num_blocks != -1
+            else int(auto_num_blocks)
+        )
+
+        return PagedKVCache(
+            layer_id_map,
+            num_hot_req=num_hot_req,
+            max_seq_len=args.infer.max_seq_len,
+            num_blocks=resolved_num_blocks,
+            block_size=block_size,
+            device=device,
+            **spec.kvargs,
+        )
+
+    if args.infer.cache_type == "skew":
+        return DenseKVCache(
+            layer_id_map,
+            num_hot_req=num_hot_req,
+            max_seq_len=args.infer.max_seq_len,
+            device=device,
+            **spec.kvargs,
+        )
+
+    raise ValueError(f"Unknown cache type {args.infer.cache_type} for Indexer")
 
 
 def _build_multimodal_cache(

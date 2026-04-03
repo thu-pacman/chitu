@@ -14,13 +14,12 @@ logger = getLogger(__name__)
 
 
 class MoELoadBalancer(ABC):
+    """
+    Assign the mapping between experts, slots, and ranks.
+    """
 
     def __init__(
-        self,
-        num_experts: int,
-        num_slots: int,
-        ep_size: int,
-        is_cuda: bool = True,
+        self, num_experts: int, num_slots: int, ep_size: int, is_cuda: bool = True
     ):
         self.num_experts = num_experts
         self.num_slots = num_slots
@@ -28,24 +27,16 @@ class MoELoadBalancer(ABC):
         self.is_cuda = is_cuda
 
     def update_expert_mapping(
-        self,
-        expert_stats: Optional[torch.Tensor] = None,
-        strict_verify: bool = False,
+        self, expert_stats: Optional[torch.Tensor] = None, strict_verify: bool = False
     ):
         self.generate_expert_mapping(expert_stats)
         self.verify_expert_mapping(strict=strict_verify)
 
     @abstractmethod
-    def generate_expert_mapping(
-        self,
-        expert_stats: Optional[torch.Tensor] = None,
-    ):
+    def generate_expert_mapping(self, expert_stats: Optional[torch.Tensor] = None):
         raise NotImplementedError("generate expert mapping not implemented.")
 
-    def verify_expert_mapping(
-        self,
-        strict=False,
-    ):
+    def verify_expert_mapping(self, strict=False):
         expert_instance_counter = [0 for _ in range(self.num_experts)]
         slot_expert_mapping = []
 
@@ -83,34 +74,28 @@ class MoELoadBalancer(ABC):
                     logger.warning(msg)
 
     @abstractmethod
-    def get_local_experts(
-        self,
-        ep_rank: int,
-    ):
+    def get_local_experts(self, ep_rank: int):
+        """
+        Given EP rank, return the list of local experts stored on this rank.
+        """
         raise NotImplementedError("get local experts not implemented.")
 
     @abstractmethod
-    def get_num_local_slots(
-        self,
-    ):
+    def get_num_local_slots(self):
         raise NotImplementedError("get num local slots not implemented.")
 
     @abstractmethod
-    def get_slot_mapping(
-        self,
-    ):
+    def get_slot_mapping(self):
         """
         return global slot mapping
         """
         raise NotImplementedError("get slot mapping not implemented.")
 
     @abstractmethod
-    def get_expert_mapping(
-        self,
-        ep_rank: int,
-    ) -> torch.Tensor:
+    def get_expert_mapping(self, src_rank: int) -> torch.Tensor:
         """
-        physical expert -> expert slot mapping
-        return a tensor with shape [num_experts],
+        Given source rank, return a tensor with shape [num_experts], representing the
+        mapping from expert ID to slot ID. Source ranks meaning DP*TP/ETP ranks, i.e.
+        EP ranks before communication.
         """
         raise NotImplementedError("get expert mapping not implemented")

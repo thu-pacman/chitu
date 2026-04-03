@@ -270,11 +270,15 @@ def _(
     )
 
     if w1.dtype == torch.float8_e4m3fn:
-        hidden_states_fp8, scale = blockfp8_act_quant(
-            hidden_states.activation,
-            block_size=quant_block_size,
-            round_scale_to_pow2=round_scale_to_pow2,
-        )
+        if isinstance(hidden_states, IndexedBatchedRoutedActivationBlockfp8):
+            hidden_states_fp8 = hidden_states.activation
+            scale = hidden_states.activation_scale
+        else:
+            hidden_states_fp8, scale = blockfp8_act_quant(
+                hidden_states.activation,
+                block_size=quant_block_size,
+                round_scale_to_pow2=round_scale_to_pow2,
+            )
         hidden_states = IndexedBatchedRoutedActivationBlockfp8(
             activation=hidden_states_fp8,
             activation_scale=scale,
