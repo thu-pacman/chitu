@@ -16,6 +16,7 @@ from chitu.import_utils import (
     try_import_and_setup_torch_npu,
 )
 from chitu.device_type import has_native_fp8
+from chitu.testing import gen_token_to_expert_indices
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
@@ -23,19 +24,6 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
 )
-
-
-def gen_token_to_expert_indices(
-    num_tokens: int, num_experts: int, topk: int, distribution: str
-):
-    if distribution == "imbalance":
-        return torch.arange(topk, dtype=torch.int32, device="cuda").repeat(
-            num_tokens, 1
-        )
-    elif distribution == "uniform":
-        return torch.multinomial(
-            torch.ones(num_tokens, num_experts, device="cuda"), topk, replacement=False
-        ).to(torch.int32)
 
 
 @pytest.mark.parametrize("num_experts", [256])

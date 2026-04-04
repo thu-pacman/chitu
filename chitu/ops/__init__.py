@@ -72,3 +72,4 @@ from chitu.ops.hadamard import hadamard_transform
 from chitu.ops.causal_conv import causal_conv1d_update, causal_conv1d_prefill
 from chitu.ops.norm_gate import rms_norm_gate
 from chitu.ops.fused_g import fused_g
+from chitu.ops.add_shared_experts import add_shared_experts
