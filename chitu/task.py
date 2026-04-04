@@ -515,17 +515,24 @@ class Task:
 
     @property
     def num_cached_blocks(self) -> int:
-        """Number of cached blocks (cached_idle_blocks and active_blocks) that are hit by the req's prompt (Called before prefill step only)."""
-        return sum(1 for block in self.token_blocks if block.cache_idx is not None)
+        """Number of contiguous cached blocks hit from prompt start."""
+        num = 0
+        for block in self.token_blocks:
+            if block.cache_idx is None:
+                break
+            num += 1
+        return num
 
     @property
     def num_cached_idle_blocks(self) -> int:
-        """number of cached_idle_blocks (cache_idx is not None and active_cnt == 0) that are hit by the req's prompt"""
-        return sum(
-            1
-            for block in self.token_blocks
-            if (block.cache_idx is not None and block.active_cnt == 0)
-        )
+        """Number of idle cached blocks inside the contiguous cached prefix."""
+        num = 0
+        for block in self.token_blocks:
+            if block.cache_idx is None:
+                break
+            if block.active_cnt == 0:
+                num += 1
+        return num
 
     def need_remove(self):
         return self.stopped
@@ -919,7 +926,7 @@ class PackedTasksBase:
 
     # 用于从KVCacheManager -> KVCache传递索引信息: KVCacheManager新分配kv cache索引时有值，否则为[]
     new_cache_ids_list: list[list[int]] = field(default_factory=list)
-    # 用于从KVCacheManager -> KVCache传递prefix caching击中长度信息: 首次被prefix caching击中时有值，否则为[]
+    # 用于从KVCacheManager -> KVCache传递prefix caching本轮新增击中长度: 有新增击中时有值，否则为[]
     hit_token_lens: list[int] = field(default_factory=list)
 
     @property

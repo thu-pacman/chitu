@@ -331,11 +331,7 @@ class KVCacheBase:
     def prepare_cache_prefill(self, tasks: "PackedTasksBase"):
         if tasks.hit_token_lens:
             cached_token_lens: list[int] = [
-                (
-                    tasks.hit_token_lens[i]
-                    if tasks.hit_token_lens[i]
-                    else self.tid_to_cached_len.get(tid, 0)
-                )
+                self.tid_to_cached_len.get(tid, 0) + tasks.hit_token_lens[i]
                 for i, tid in enumerate(tasks.task_ids)
             ]
         else:
