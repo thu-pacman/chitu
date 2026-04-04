@@ -31,7 +31,7 @@ from chitu.muxi_utils import (
     LinearMuxiLayoutContigY,
     LinearMuxiLayoutNativeY,
 )
-from chitu.ops import apply_rotary_pos_emb, rms_norm, moe_gate
+from chitu.ops import apply_rotary_pos_emb, rms_norm, moe_gate, add_shared_experts
 from chitu.distributed.comm_group import CommGroup
 from chitu.distributed.parallel_state import (
     get_tp_group,
@@ -67,7 +67,6 @@ from chitu.quantization import (
 from chitu.hybrid_device import CPUParameter
 from chitu.static_tensor import StaticTensor
 
-chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
@@ -361,6 +360,9 @@ class Transformer(nn.Module):
         raise NotImplementedError
 
     def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
+        raise NotImplementedError
+
+    def _get_layer_mtp_prefix_mapping(self, i: int) -> tuple[str, str, dict[str, str]]:
         raise NotImplementedError
 
     def _get_2d_out_x_in_tensor_names(self, quant) -> list[str]:
@@ -1761,28 +1763,9 @@ class MoeGate(nn.Module):
         indices = indices.to(torch.int32)
 
         if self.n_fused_shared_experts > 0:
-            indice_shape = indices.shape
-            final_indices = torch.empty(
-                (indice_shape[0], indice_shape[1] + 1),
-                dtype=indices.dtype,
-                device=indices.device,
+            weights, indices = add_shared_experts(
+                weights, indices, self.n_experts, self.n_fused_shared_experts
             )
-
-            final_weights = torch.empty(
-                (weights.shape[0], weights.shape[1] + 1),
-                dtype=weights.dtype,
-                device=weights.device,
-            )
-
-            chitu_backend.cuda_add_shared_experts(
-                final_weights,
-                final_indices,
-                weights,
-                indices,
-                self.n_experts,
-                self.n_fused_shared_experts,
-            )
-            weights, indices = final_weights, final_indices
 
         return weights, indices
 

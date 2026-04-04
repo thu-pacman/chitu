@@ -35,6 +35,7 @@ from chitu.ops import (
     apply_rotary_pos_emb_partial,
     chunk_gated_delta_rule,
     recurrent_gated_delta_rule,
+    recurrent_gated_delta_rule_all_state,
     silu_and_mul,
     causal_conv1d_update,
     causal_conv1d_prefill,
@@ -50,6 +51,7 @@ from chitu.tensor_parallel import (
 )
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 from chitu.utils import proportion_split
+from chitu.global_vars import get_global_args
 
 
 class Qwen3NextRMSNorm(RMSNorm):
@@ -154,6 +156,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             checkpoint_prefix=f"{checkpoint_prefix}.out_proj",
         )
 
+        self.mtp_size = get_global_args().infer.mtp_size
+
     def fix_qkvz_ba_ordering(self, mixed_qkvz, mixed_ba):
         """
         Derives `q`, `k` and `v` tensors from `mixed_qkvzba`.
@@ -189,11 +193,21 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         use_precomputed_states = seq_len_delta.is_classic_decoding
 
         cache_accessor = self.cache.get_accessor(self.layer_id)
+        is_mtp_decode_stage = (
+            self.cache.is_mtp_decode_stage if self.mtp_size > 1 else False
+        )
+        mtp_offset_tensor = (
+            self.cache.mtp_offset_tensor.get() if self.mtp_size > 1 else None
+        )
         conv_state = read_from_singleton_paged_kv_cache(
-            cache_accessor.kv["conv_state"], cache_accessor.block_table
+            cache_accessor.kv["conv_state"],
+            cache_accessor.block_table,
+            mtp_offset=mtp_offset_tensor,
         )
         recurrent_state = read_from_singleton_paged_kv_cache(
-            cache_accessor.kv["recurrent_state"], cache_accessor.block_table
+            cache_accessor.kv["recurrent_state"],
+            cache_accessor.block_table,
+            mtp_offset=mtp_offset_tensor,
         )
 
         qkvz = self.in_proj_qkvz(x)
@@ -201,9 +215,26 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         qkv, z, b, a = self.fix_qkvz_ba_ordering(qkvz, ba)
 
+        # classic decode
         if use_precomputed_states:
             qkv, conv_state = causal_conv1d_update(qkv, conv_state, self.conv1d.weight)
             # qkv: (bsz, hidden_size), conv_state: (bsz, hidden_size, state_len)
+        # mtp decode, could be optimized with a fused kernel
+        elif is_mtp_decode_stage:
+            qkv = qkv.view(-1, self.mtp_size, *qkv.shape[1:])
+            qkv_out = torch.empty_like(qkv)
+            conv_state_out = torch.empty(
+                (qkv.shape[0], self.mtp_size, *conv_state.shape[1:]), device=qkv.device
+            )
+            for i in range(0, self.mtp_size):
+                qkv_slice = qkv[:, i, ...]
+                qkv_out[:, i, ...], conv_state = causal_conv1d_update(
+                    qkv_slice, conv_state, self.conv1d.weight
+                )
+                conv_state_out[:, i, ...] = conv_state
+            qkv = qkv_out.view(-1, *qkv_out.shape[2:])
+            conv_state = conv_state_out
+        # prefill
         else:
             qkv, conv_state = causal_conv1d_prefill(
                 qkv,
@@ -212,6 +243,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 seq_len_delta.delta_prefix_lens_tensor_device,
             )
             # qkv: (total_len, hidden_size), conv_state: (total_len, hidden_size, state_len)
+            if self.mtp_size > 1:
+                conv_state = conv_state.unsqueeze(1).expand(
+                    -1, self.mtp_size, *([-1] * (conv_state.dim() - 1))
+                )
 
         q, k, v = torch.split(
             qkv,
@@ -231,13 +266,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         g = fused_g(a, self.A_log, self.dt_bias)
 
-        if not use_precomputed_states:
-            q = q.repeat_interleave(
-                self.n_v_heads // self.n_qk_heads, dim=1
-            )  # (total_len, n_v_heads, head_dim)
-            k = k.repeat_interleave(
-                self.n_v_heads // self.n_qk_heads, dim=1
-            )  # (total_len, n_v_heads, head_dim)
+        q = q.repeat_interleave(
+            self.n_v_heads // self.n_qk_heads, dim=1
+        )  # (total_len, n_v_heads, head_dim)
+        k = k.repeat_interleave(
+            self.n_v_heads // self.n_qk_heads, dim=1
+        )  # (total_len, n_v_heads, head_dim)
+
+        # prefill
+        if not use_precomputed_states and not is_mtp_decode_stage:
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 q.unsqueeze(0),
                 k.unsqueeze(0),
@@ -251,14 +288,29 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 seq_len_list=seq_len_delta.delta_lens_list,
                 impl=self.impl,
             )
+            if self.mtp_size > 1:
+                last_recurrent_state = last_recurrent_state.unsqueeze(1).expand(
+                    -1, self.mtp_size, *([-1] * (last_recurrent_state.dim() - 1))
+                )
+        # mtp decode, return all step state, could be optimized with triton kernel
+        elif is_mtp_decode_stage:
+            q, k, v, beta, g = map(
+                lambda x: x.view(-1, self.mtp_size, *x.shape[1:]), [q, k, v, beta, g]
+            )
+
+            core_attn_out, last_recurrent_state = recurrent_gated_delta_rule_all_state(
+                q,
+                k,
+                v,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                impl=self.impl,
+            )
+        # classic decode
         else:
-            # Decode path: also need to repeat q/k to match v heads
-            q = q.repeat_interleave(
-                self.n_v_heads // self.n_qk_heads, dim=1
-            )  # (total_len, n_v_heads, head_dim)
-            k = k.repeat_interleave(
-                self.n_v_heads // self.n_qk_heads, dim=1
-            )  # (total_len, n_v_heads, head_dim)
             core_attn_out, last_recurrent_state = recurrent_gated_delta_rule(
                 q.unsqueeze(1),
                 k.unsqueeze(1),
@@ -272,12 +324,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
 
         update_singleton_paged_kv_cache(
-            cache_accessor.kv["conv_state"], cache_accessor.block_table, conv_state
+            cache_accessor.kv["conv_state"],
+            cache_accessor.block_table,
+            conv_state,
+            mtp_size=self.mtp_size,
         )
         update_singleton_paged_kv_cache(
             cache_accessor.kv["recurrent_state"],
             cache_accessor.block_table,
             last_recurrent_state.to(x.dtype),
+            mtp_size=self.mtp_size,
         )
         self.last_conv_state = conv_state.contiguous()
         self.last_recurrent_state = last_recurrent_state.to(x.dtype).contiguous()
@@ -329,10 +385,13 @@ class AttentionQwen3Next(AttentionHFLlama):
         self.partial_rotary_factor = float(getattr(args, "partial_rotary_factor", 0.25))
 
     def forward(
-        self,
-        x: torch.Tensor,
-        freqs_cis: BatchedFreqsCis,
+        self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
     ):
+        if is_mtp:
+            seq_len_delta = self.cache.mtp_seq_len_delta
+        else:
+            seq_len_delta = self.cache.seq_len_delta
+
         xq, xk, xv = self._run_linear(x)
         gate = self.attn_gate(x)
 
@@ -361,10 +420,10 @@ class AttentionQwen3Next(AttentionHFLlama):
 
         output = self.attn_backend(
             xq,
-            self.cache.get_accessor(self.layer_id),
+            self.cache.get_accessor(self.layer_id, is_mtp=is_mtp),
             xk,
             xv,
-            seq_len_delta=self.cache.seq_len_delta,
+            seq_len_delta=seq_len_delta,
             causal=True,
         ).view(bs_seq, -1)
         output = output * torch.sigmoid(gate)
@@ -574,8 +633,10 @@ class TransformerBlockHFQwen3NextFull(TransformerBlockHFQwen3NextBase):
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
         )
 
-    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
-        h = self.self_attn(self.input_layernorm(x), freqs_cis)
+    def forward(
+        self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
+    ):
+        h = self.self_attn(self.input_layernorm(x), freqs_cis, is_mtp)
         h += x
         return super().forward(h, freqs_cis)
 
@@ -610,7 +671,9 @@ class TransformerBlockHFQwen3NextLinear(TransformerBlockHFQwen3NextBase):
             checkpoint_prefix=f"{checkpoint_prefix}.linear_attn",
         )
 
-    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
+    def forward(
+        self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
+    ):
         h = self.linear_attn(self.input_layernorm(x))
         h += x
         return super().forward(h, freqs_cis)

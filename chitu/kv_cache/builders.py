@@ -289,6 +289,9 @@ def _build_multimodal_cache(
     }:
         return None
 
+    if args.models.type == ModelType.HF_QWEN3_5 and args.infer.language_model_only:
+        return None
+
     if args.infer.enable_prefix_caching:
         raise Exception(
             "Temporarily, MMPagedKVCache does not yet support prefix caching."
@@ -338,6 +341,8 @@ def _build_multimodal_cache(
 @register_cache_manager_builder(model_types=[ModelType.HF_QWEN3_NEXT], priority=2)
 def _build_qwen3_next_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
     def is_full_attention(layer_id: int) -> bool:
+        if args.infer.mtp_size > 1 and layer_id == args.models.n_layers:
+            return True
         return (layer_id + 1) % args.models.full_attention_interval == 0
 
     def filter_full(layers: Iterable[int]):
@@ -373,6 +378,8 @@ def _build_qwen3_next_cache_managers(args, attn_backend_type) -> CacheBuildBundl
 @register_cache_manager_builder(model_types=[ModelType.HF_QWEN3_5], priority=3)
 def _build_qwen3_5_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
     def is_full_attention(layer_id: int) -> bool:
+        if args.infer.mtp_size > 1 and layer_id == args.models.n_layers:
+            return True
         return (layer_id + 1) % args.models.full_attention_interval == 0
 
     def filter_full(layers: Iterable[int]):

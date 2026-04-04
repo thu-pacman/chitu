@@ -42,3 +42,20 @@ def assert_close(
             if 1 - sim <= cos_sim_tol:
                 return
         torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+
+def gen_token_to_expert_indices(
+    num_tokens: int, num_experts: int, topk: int, distribution: str
+):
+    """
+    Generate fake data for expert selection in MoE models.
+    """
+
+    if distribution == "imbalance":
+        return torch.arange(topk, dtype=torch.int32, device="cuda").repeat(
+            num_tokens, 1
+        )
+    elif distribution == "uniform":
+        return torch.multinomial(
+            torch.ones(num_tokens, num_experts, device="cuda"), topk, replacement=False
+        ).to(torch.int32)

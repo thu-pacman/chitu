@@ -629,6 +629,15 @@ curl localhost:21002/v1/messages \
   }'
 ```
 
+Gracefully terminate the engine and API server (requires `{"confirm": true}` to prevent accidental shutdown). In-flight requests will complete before the service exits. New requests are rejected once termination is initiated.
+
+```bash
+curl localhost:21002/terminate_engine \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"confirm": true}'
+```
+
 For OpenAI-compatible, OpenAI Responses, and Anthropic-compatible API parameters, see [API Parameters](./API_PARAMETERS.md).
 
 ### Grafana Dashboard

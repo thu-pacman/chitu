@@ -311,6 +311,87 @@ def recurrent_gated_delta_rule_torch(
 # SPDX-SnippetEnd
 
 
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: MIT
+# SPDX-SnippetCopyrightText: 2026 fla-org
+# SPDX-SnippetName: naive_recurrent_gated_delta_rule from flash-linear-attention
+def naive_recurrent_gated_delta_rule_all_state(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float = None,
+    initial_state: torch.Tensor = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel=False,
+):
+    """
+    Reference PyTorch implementation of recurrent gated delta rule.
+
+    Args:
+        q: [B, T, H, K]
+        k: [B, T, H, K]
+        v: [B, T, H, V]
+        beta: [B, T, H]
+        g: [B, T, H]
+        scale: float, optional
+        initial_state: [B, H, K, V], optional
+        output_final_state: bool
+
+    Returns:
+        o: [B, T, H, V]
+        final_state: [B, H, T, K, V] if output_final_state else None
+    """
+    initial_dtype = q.dtype
+    if use_qk_l2norm_in_kernel:
+        head_dim = q.size(-1)
+        inv_scale = head_dim**-0.5
+        q = F.rms_norm(q, (head_dim,), eps=1e-6) * inv_scale
+        k = F.rms_norm(k, (head_dim,), eps=1e-6) * inv_scale
+
+    q, k, v, beta, g = map(
+        lambda x: x.transpose(1, 2).contiguous().to(torch.float32), [q, k, v, beta, g]
+    )
+    B, H, T, K = k.shape
+    V = v.shape[-1]
+
+    o = torch.zeros(B, H, T, V, device=v.device, dtype=v.dtype)
+    h = torch.zeros(B, H, K, V, device=v.device, dtype=v.dtype)
+
+    if initial_state is not None:
+        h = initial_state.to(torch.float32)
+
+    if scale is None:
+        scale = 1 / (q.shape[-1] ** 0.5)
+    q = q * scale
+
+    h_all = torch.empty(B, H, T, K, V, device=v.device, dtype=v.dtype)
+
+    for i in range(T):
+        b_q = q[:, :, i]
+        b_k = k[:, :, i]
+        b_v = v[:, :, i]
+        h = h * g[:, :, i].exp()[..., None, None]
+        b_beta = beta[:, :, i]
+        b_v = b_v - (h * b_k[..., None]).sum(-2)
+        b_v = b_v * b_beta[..., None]
+        h = h + b_k.unsqueeze(-1) * b_v.unsqueeze(-2)
+        o[:, :, i] = torch.einsum("bhd,bhdm->bhm", b_q, h)
+        h_all[:, :, i] = h
+
+    h_all = h_all.transpose(1, 2).contiguous()
+
+    if not output_final_state:
+        h_all = None
+    o = o.transpose(1, 2).contiguous().to(initial_dtype)
+
+    return o, h_all
+
+
+# SPDX-SnippetEnd
+
+
 def chunk_gated_delta_rule(
     query,
     key,
@@ -399,5 +480,38 @@ def recurrent_gated_delta_rule(
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
+
+
+def recurrent_gated_delta_rule_all_state(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state,
+    output_final_state,
+    use_qk_l2norm_in_kernel=False,
+    impl="auto",
+):
+    if impl == "auto":
+        impl = "torch"
+
+    if impl == "torch":
+        return naive_recurrent_gated_delta_rule_all_state(
+            q=query,
+            k=key,
+            v=value,
+            beta=beta,
+            g=g,
+            scale=None,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+    elif impl == "triton":
+        raise NotImplementedError("Triton implementation not available yet.")
+
     else:
         raise ValueError(f"Unknown implementation: {impl}")

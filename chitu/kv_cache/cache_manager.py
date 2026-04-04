@@ -174,6 +174,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
     def prepare_metadata_before_prefill(self, task: "Task"):
         """prepare and update metadata before the task begin a prefill step"""
         task.new_cache_ids = []
+        task.hit_token_len = 0  # must be reset every step
+        consumed_before_prefill = task.consumed_req_tokens
 
         if self.enable_prefix_caching:
             # 被prefix caching击中block不占chunk prefill size的容量，也不增加额外的kv cache block需求
@@ -208,8 +210,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
                 assert task.prefill_chunk_size == 1
                 task.consumed_req_tokens -= 1
 
-            if task.consumed_req_tokens != 0:
-                task.hit_token_len = task.consumed_req_tokens
+            if task.consumed_req_tokens > consumed_before_prefill:
+                # incremental prefix-caching hits in this step.
+                task.hit_token_len = task.consumed_req_tokens - consumed_before_prefill
 
         num_full_blocks = task.consumed_req_tokens // self.block_size
         self.update_prefix_caching_metadata(task, num_full_blocks)
@@ -320,9 +323,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
     def finalize_metadata_all_decode(self, task: "Task"):
         if task.task_id not in self.tid_to_cached_len:
             return
-        for block in task.token_blocks:
+        for block in reversed(task.token_blocks):
             if block.cache_idx is None:
-                break
+                continue
             block.active_cnt -= 1
             assert (
                 block.active_cnt >= 0

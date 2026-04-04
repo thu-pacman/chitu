@@ -42,6 +42,23 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 )
 
 
+class MTPMixin:
+    def _init_mtp_modules(self, args):
+        self.pre_fc_norm_embedding = Qwen3NextRMSNorm(args.dim, eps=args.norm_eps)
+        self.pre_fc_norm_hidden = Qwen3NextRMSNorm(args.dim, eps=args.norm_eps)
+        self.fc = torch.nn.Linear(args.dim * 2, args.dim, bias=False)
+        self.norm = Qwen3NextRMSNorm(args.dim, eps=args.norm_eps)
+
+    def _mtp_fuse(
+        self,
+        x: torch.Tensor,
+        previous_hidden_states: torch.Tensor,
+    ):
+        inputs_embeds = self.pre_fc_norm_embedding(x)
+        previous_hidden_states = self.pre_fc_norm_hidden(previous_hidden_states)
+        return self.fc(torch.cat([inputs_embeds, previous_hidden_states], dim=-1))
+
+
 class TransformerBlockHFQwen3_5FullMoe(TransformerBlockHFQwen3NextFull):
     def __init__(
         self,
@@ -67,6 +84,43 @@ class TransformerBlockHFQwen3_5FullMoe(TransformerBlockHFQwen3NextFull):
         )
 
 
+class TransformerBlockHFQwen3_5FullMoeMTP(MTPMixin, TransformerBlockHFQwen3_5FullMoe):
+    def __init__(
+        self,
+        layer_id: int,
+        args,
+        cache_dict: dict[str, KVCacheBase],
+        attn_backend,
+        op_impl,
+        rotary_type="separated",
+        mlp_type=ParallelMoeBlockQwen3Next,
+        *,
+        checkpoint_prefix,
+    ):
+        super().__init__(
+            layer_id,
+            args,
+            cache_dict,
+            attn_backend,
+            op_impl,
+            rotary_type,
+            mlp_type,
+            checkpoint_prefix=checkpoint_prefix,
+        )
+        self._init_mtp_modules(args)
+
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        previous_hidden_states: torch.Tensor,
+        is_mtp: bool = False,
+    ):
+        x = self._mtp_fuse(x, previous_hidden_states)
+        return super().forward(x, freqs_cis, is_mtp)
+
+
 class TransformerBlockHFQwen3_5FullDense(TransformerBlockHFQwen3NextFull):
     def __init__(
         self,
@@ -90,6 +144,45 @@ class TransformerBlockHFQwen3_5FullDense(TransformerBlockHFQwen3NextFull):
             mlp_type,
             checkpoint_prefix=checkpoint_prefix,
         )
+
+
+class TransformerBlockHFQwen3_5FullDenseMTP(
+    MTPMixin, TransformerBlockHFQwen3_5FullDense
+):
+    def __init__(
+        self,
+        layer_id: int,
+        args,
+        cache_dict: dict[str, KVCacheBase],
+        attn_backend,
+        op_impl,
+        rotary_type="separated",
+        mlp_type=FeedForwardHFLlama,
+        *,
+        checkpoint_prefix,
+    ):
+        super().__init__(
+            layer_id,
+            args,
+            cache_dict,
+            attn_backend,
+            op_impl,
+            rotary_type,
+            mlp_type,
+            checkpoint_prefix=checkpoint_prefix,
+        )
+        self._init_mtp_modules(args)
+
+    @override
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        previous_hidden_states: torch.Tensor,
+        is_mtp: bool = False,
+    ):
+        x = self._mtp_fuse(x, previous_hidden_states)
+        return super().forward(x, freqs_cis, is_mtp)
 
 
 class TransformerBlockHFQwen3_5LinearMoe(TransformerBlockHFQwen3NextLinear):
@@ -184,6 +277,12 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         self.is_fp8_model = str(params.name).endswith("FP8")
 
         def layer_type_callback(layer_id: int):
+            if self.mtp_size > 1 and layer_id >= params.n_layers:
+                if self.is_moe_model:
+                    return TransformerBlockHFQwen3_5FullMoeMTP
+                else:
+                    return TransformerBlockHFQwen3_5FullDenseMTP
+
             if (layer_id + 1) % params.full_attention_interval == 0:
                 if self.is_moe_model:
                     return TransformerBlockHFQwen3_5FullMoe
@@ -315,6 +414,25 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         self, pixel_values: torch.Tensor, grid_thw: Optional[torch.Tensor] = None
     ):
         return self.get_image_features(pixel_values, grid_thw)
+
+    @override
+    def _pre_layers_mtp(self, h, **args):
+        h = self.embed_tokens(h)
+        return h
+
+    @override
+    def _post_layers_mtp(self, h):
+        h = self.layers[-1].norm(h)
+        if not getattr(self.params, "tie_word_embeddings", False):
+            h = self.lm_head(h)
+        else:
+            h = self.embed_tokens.forward_as_lm_head(h)
+        return h
+
+    @override
+    def _get_prefill_previous_hidden_states(self, h):
+        self.prefill_main_last_hidden_states = self.norm(h, compute_dtype=h.dtype)
+        return torch.roll(self.prefill_main_last_hidden_states, shifts=1, dims=0)
 
     @override
     @torch.inference_mode()
@@ -870,6 +988,9 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         if str(self.params.name).endswith("FP8"):
             return super().process_state_dict_for_merging_experts(checkpoint)
 
+        if self.mtp_size > 1:
+            checkpoint = super().process_state_dict_for_merging_experts(checkpoint)
+
         for k in list(checkpoint.keys()):
             parts = k.split(".")
             if len(parts) >= 3 and parts[-3] != "experts":
@@ -942,6 +1063,16 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
     @override
     def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
         return (f"model.language_model.layers.{i}.", f"layers.{i}.")
+
+    @override
+    def _get_layer_mtp_prefix_mapping(self, i: int) -> tuple[str, str, dict[str, str]]:
+        extra_prefix_dict = {
+            "mtp.fc.": f"layers.{i}.fc.",
+            "mtp.pre_fc_norm_embedding.": f"layers.{i}.pre_fc_norm_embedding.",
+            "mtp.pre_fc_norm_hidden.": f"layers.{i}.pre_fc_norm_hidden.",
+            "mtp.norm.": f"layers.{i}.norm.",
+        }
+        return ("mtp.layers.0.", f"layers.{i}.", extra_prefix_dict)
 
     @override
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:

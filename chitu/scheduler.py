@@ -462,7 +462,7 @@ class Scheduler:
 
         cur_blocks = task.num_cached_blocks
         target_blocks = ceil_div(
-            task.kv_cache_len_used_in_completed_steps_and_next_step,
+            num_cached_tokens + task.next_req_tokens_len,
             self.cache_manager_dict["main"].block_size,
         )
         aviable_blocks = (
@@ -548,7 +548,7 @@ class Scheduler:
 
             cur_blocks = task.num_cached_blocks
             target_blocks = ceil_div(
-                task.kv_cache_len_used_in_completed_steps_and_next_step,
+                num_cached_tokens + task.next_req_tokens_len,
                 self.cache_manager_dict["main"].block_size,
             )
             aviable_blocks = (

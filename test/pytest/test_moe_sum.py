@@ -9,23 +9,10 @@ from chitu.ops import (
     batched_routed_activation_indexed_to_per_expert_dense,
 )
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
-from chitu.testing import assert_close
+from chitu.testing import assert_close, gen_token_to_expert_indices
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-
-
-def gen_token_to_expert_indices(
-    num_tokens: int, num_experts: int, topk: int, distribution: str
-):
-    if distribution == "imbalance":
-        return torch.arange(topk, dtype=torch.int32, device="cuda").repeat(
-            num_tokens, 1
-        )
-    elif distribution == "uniform":
-        return torch.multinomial(
-            torch.ones(num_tokens, num_experts, device="cuda"), topk, replacement=False
-        ).to(torch.int32)
 
 
 @pytest.mark.parametrize("M", [0, 32, 64, 128])
