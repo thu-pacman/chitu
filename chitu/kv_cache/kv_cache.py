@@ -432,7 +432,14 @@ class PagedKVCache(KVCacheBase):
         )
         mtp_extra = self.mtp_size if (self.mtp_size > 1 and not is_singleton) else 0
         self.max_blocks_per_req = ceil_div(max_seq_len + mtp_extra, block_size)
-        self.max_num_blocks = self.max_blocks_per_req * num_hot_req
+        self.page_table_max_num_blocks = self.max_blocks_per_req * num_hot_req
+        self.max_num_blocks = self.page_table_max_num_blocks
+
+        if get_global_args().infer.enable_prefix_caching:
+            self.allocatable_max_num_blocks = 1 << 60
+        else:
+            self.allocatable_max_num_blocks = self.page_table_max_num_blocks
+
         self.num_blocks = num_blocks
         self.block_size = block_size
 
@@ -466,16 +473,30 @@ class PagedKVCache(KVCacheBase):
         self._offs_in_page_up_to_date = False
         self.use_i64_offsets = self.needs_i64_kv_offsets()
 
+    def get_allocatable_max_num_blocks(self) -> int:
+        return int(getattr(self, "allocatable_max_num_blocks", self.max_num_blocks))
+
     def realloc(self, num_blocks):
+        requested_num_blocks = int(num_blocks)
+        allocatable_cap = self.get_allocatable_max_num_blocks()
+
         logger.info(
-            f"The GPU memory supports at most {num_blocks} KV blocks. According to the current "
-            f"infer.max_reqs({get_global_args().infer.max_reqs}) and infer.max_seq_len"
-            f"({get_global_args().infer.max_seq_len}) setting, no more than {self.max_num_blocks} "
-            f"KV blocks is needed."
+            f"Requested realloc to {requested_num_blocks} KV blocks. "
+            f"page_table_max_num_blocks={self.page_table_max_num_blocks}, "
+            f"allocatable_max_num_blocks={allocatable_cap}, "
+            f"infer.max_reqs={get_global_args().infer.max_reqs}, "
+            f"infer.max_seq_len={get_global_args().infer.max_seq_len}, "
+            f"prefix_caching={get_global_args().infer.enable_prefix_caching}"
         )
-        self.num_blocks = min(num_blocks, self.max_num_blocks)
+
+        if requested_num_blocks < 0:
+            raise ValueError(f"num_blocks must be >= 0, got {requested_num_blocks}")
+
+        self.num_blocks = min(requested_num_blocks, allocatable_cap)
+
         logger.info(
-            f"Reallocating KV cache to {self.num_blocks} blocks, each of size {self.block_size}"
+            f"Reallocating KV cache to {self.num_blocks} blocks, "
+            f"each of size {self.block_size}"
         )
 
         keys = list(self.paged_kv_cache.keys())
@@ -535,7 +556,7 @@ class PagedKVCache(KVCacheBase):
         if get_global_args().infer.use_cuda_graph:
             if max_len > self.max_blocks_per_req:
                 logger.warning(
-                    "block_table length exceeds max_blocks_per_req; "
+                    "block_table length exceeds per-request page-table limit; "
                     "decode max_seq_len may be too small. "
                     f"max_len={max_len} max_blocks_per_req={self.max_blocks_per_req} "
                     f"max_seq_len={get_global_args().infer.max_seq_len} block_size={self.block_size}"

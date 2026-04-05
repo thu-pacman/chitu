@@ -193,7 +193,7 @@ infer:
   # Device memory utilization rate for automatic page allocation for paged KV cache.
   #
   # Acceptable values: 0.0 to 1.0, e.g., 0.98 means 98% of GPU memory will be used.
-  memory_utilization: 0.98
+  memory_utilization: 0.98 # pls decrease memory_utilization when enable prefix cache
 
   # If not -1, override the automatic page allocation for paged KV cache, and disables the
   # `memory_utilization` field.

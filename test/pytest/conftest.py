@@ -628,6 +628,7 @@ def global_args(pd_ports):
                 "max_reqs": 16,
                 "prefill_chunk_size": 128,
                 "use_cuda_graph": False,
+                "enable_prefix_caching": False,
             },
             "scheduler": {
                 "type": "prefill_only",

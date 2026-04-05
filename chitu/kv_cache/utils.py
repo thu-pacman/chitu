@@ -74,23 +74,25 @@ def plan_kv_cache_blocks_after_warmup(args, cache_managers):
             "cm": cm,
             "block_mem": cm.estimate_bytes_per_block(),
             "current_blocks": cm.num_blocks,
-            "max_num_blocks": cm.max_num_blocks,
+            "max_num_blocks": cm.get_allocatable_max_num_blocks(),
         }
 
     main_cm = cache_managers["main"]
-    main_cur = main_cm.num_blocks
+    main_cur = int(main_cm.num_blocks)
 
     plan = {"main": main_cur}
 
     if "indexer" in cache_managers:
         indexer_cm = cache_managers["indexer"]
-        indexer_cur = indexer_cm.num_blocks
-        indexer_cap = indexer_cm.max_num_blocks
+        indexer_cur = int(indexer_cm.num_blocks)
+        indexer_cap = indexer_cm.get_allocatable_max_num_blocks()
 
         desired_indexer_blocks = estimate_indexer_blocks_from_main(
             main_cm, indexer_cm, main_cur
         )
-        desired_indexer_blocks = min(max(0, desired_indexer_blocks), indexer_cap)
+        desired_indexer_blocks = min(
+            max(0, int(desired_indexer_blocks)), int(indexer_cap)
+        )
 
         # shrink-only in pre-plan
         indexer_target = min(indexer_cur, desired_indexer_blocks)
@@ -103,12 +105,11 @@ def plan_kv_cache_blocks_after_warmup(args, cache_managers):
             desired_indexer_blocks,
             indexer_target,
         )
-    # TODO: add mm plan
 
     for name, info in infos.items():
         if name in plan:
             continue
-        plan[name] = min(info["current_blocks"], info["max_num_blocks"])
+        plan[name] = min(int(info["current_blocks"]), int(info["max_num_blocks"]))
 
     return plan
 
@@ -183,7 +184,7 @@ def solve_main_target_from_current(
     This may shrink or grow main.
     """
     main_cur = int(main_cm.num_blocks)
-    main_cap = int(main_cm.max_num_blocks)
+    main_cap = main_cm.get_allocatable_max_num_blocks()
     main_bpb = int(main_cm.estimate_bytes_per_block())
 
     if main_bpb <= 0:
@@ -202,12 +203,13 @@ def solve_main_target_from_current(
 
     logger.info(
         "KV main-only solve: live_bytes=%d target_budget_bytes=%d "
-        "baseline_bytes=%d main_cur=%d target_main_blocks=%d",
+        "baseline_bytes=%d main_cur=%d target_main_blocks=%d main_cap=%d",
         int(live_bytes),
         int(target_budget_bytes),
         int(baseline_bytes),
         int(main_cur),
         int(target_main_blocks),
+        int(main_cap),
     )
 
     return max(0, min(int(target_main_blocks), int(main_cap)))
@@ -225,11 +227,11 @@ def solve_main_target_after_shrink(
     This may shrink or grow main.
     """
     main_cur = int(main_cm.num_blocks)
-    main_cap = int(main_cm.max_num_blocks)
+    main_cap = main_cm.get_allocatable_max_num_blocks()
     main_bpb = int(main_cm.estimate_bytes_per_block())
 
     indexer_cur = int(indexer_cm.num_blocks)
-    indexer_cap = int(indexer_cm.max_num_blocks)
+    indexer_cap = indexer_cm.get_allocatable_max_num_blocks()
     indexer_bpb = int(indexer_cm.estimate_bytes_per_block())
 
     live_bytes, target_budget_bytes = get_current_live_and_target_bytes(
@@ -270,7 +272,8 @@ def solve_main_target_after_shrink(
 
     logger.info(
         "KV joint solve after shrink: live_bytes=%d target_budget_bytes=%d "
-        "baseline_bytes=%d main_cur=%d indexer_cur=%d best_main=%d best_indexer=%d",
+        "baseline_bytes=%d main_cur=%d indexer_cur=%d best_main=%d best_indexer=%d "
+        "main_cap=%d indexer_cap=%d",
         int(live_bytes),
         int(target_budget_bytes),
         int(baseline_bytes),
@@ -278,6 +281,8 @@ def solve_main_target_after_shrink(
         int(indexer_cur),
         int(best_main),
         int(best_indexer),
+        int(main_cap),
+        int(indexer_cap),
     )
     return int(best_main)
 

@@ -133,12 +133,15 @@ def _auto_set_num_blocks_after_warmup(args):
             if hasattr(cache, "estimate_bytes_per_block")
             else -1
         )
+        effective_cap = cache.get_allocatable_max_num_blocks()
         logger.info(
-            "%s warmup stats before planning: bytes_per_block=%s current_blocks=%s max_num_blocks=%s",
+            "%s warmup stats before planning: bytes_per_block=%s current_blocks=%s "
+            "max_num_blocks=%s effective_cap=%s",
             name,
             bytes_per_block,
             int(cache.num_blocks),
             int(cache.max_num_blocks),
+            int(effective_cap),
         )
 
     plan = plan_kv_cache_blocks_after_warmup(args, paged_caches)
@@ -152,6 +155,7 @@ def _auto_set_num_blocks_after_warmup(args):
 
         current_blocks = int(cm.num_blocks)
         target_blocks = int(plan.get(name, current_blocks))
+        target_blocks = clamp_int(target_blocks, 0, cm.get_allocatable_max_num_blocks())
 
         if target_blocks < current_blocks:
             cm.realloc(int(target_blocks))
@@ -167,7 +171,7 @@ def _auto_set_num_blocks_after_warmup(args):
     indexer_cm = paged_caches.get("indexer")
 
     main_current = int(main_cm.num_blocks)
-    main_cap = int(main_cm.max_num_blocks)
+    main_cap = main_cm.get_allocatable_max_num_blocks()
     reserve_bytes = 512 << 20  # 512 MiB
 
     final_main_target = int(main_current)
@@ -182,7 +186,7 @@ def _auto_set_num_blocks_after_warmup(args):
         )
 
         solved_main = allreduce_min_int(int(solved_main))
-        solved_main = clamp_int(solved_main, 0, int(main_cap))
+        solved_main = clamp_int(int(solved_main), 0, int(main_cap))
 
         final_indexer_target = estimate_indexer_blocks_from_main(
             main_cm, indexer_cm, int(solved_main)
@@ -190,14 +194,15 @@ def _auto_set_num_blocks_after_warmup(args):
         final_indexer_target = clamp_int(
             final_indexer_target,
             0,
-            int(indexer_cm.max_num_blocks),
+            indexer_cm.get_allocatable_max_num_blocks(),
         )
         final_indexer_target = allreduce_min_int(int(final_indexer_target))
 
         final_main_target = int(solved_main)
 
         logger.info(
-            "KV final joint targets: main_current=%d final_main_target=%d final_indexer_target=%d reserve_bytes=%d",
+            "KV final joint targets: main_current=%d final_main_target=%d "
+            "final_indexer_target=%d reserve_bytes=%d",
             int(main_current),
             int(final_main_target),
             int(final_indexer_target),
@@ -210,7 +215,7 @@ def _auto_set_num_blocks_after_warmup(args):
             reserve_bytes=reserve_bytes,
         )
         final_main_target = allreduce_min_int(int(final_main_target))
-        final_main_target = clamp_int(final_main_target, 0, int(main_cap))
+        final_main_target = clamp_int(int(final_main_target), 0, int(main_cap))
 
     # If main needs shrink, do it early to release memory before any later growth.
     main_current = int(main_cm.num_blocks)
@@ -226,6 +231,11 @@ def _auto_set_num_blocks_after_warmup(args):
     # Place indexer to the final target if present. Allow both shrink and grow.
     if indexer_cm is not None:
         indexer_current = int(indexer_cm.num_blocks)
+        final_indexer_target = clamp_int(
+            final_indexer_target,
+            0,
+            indexer_cm.get_allocatable_max_num_blocks(),
+        )
         if int(final_indexer_target) != int(indexer_current):
             indexer_cm.realloc(int(final_indexer_target))
             logger.info(
@@ -246,7 +256,7 @@ def _auto_set_num_blocks_after_warmup(args):
     safe_main_target = clamp_int(
         safe_main_target,
         0,
-        int(main_cm.max_num_blocks),
+        main_cm.get_allocatable_max_num_blocks(),
     )
     safe_main_target = allreduce_min_int(int(safe_main_target))
 
@@ -266,7 +276,7 @@ def _auto_set_num_blocks_after_warmup(args):
         safe_indexer_target = clamp_int(
             safe_indexer_target,
             0,
-            int(indexer_cm.max_num_blocks),
+            indexer_cm.get_allocatable_max_num_blocks(),
         )
         safe_indexer_target = allreduce_min_int(int(safe_indexer_target))
 
