@@ -95,7 +95,7 @@ def test_mla_prefill_ragged_qkvo(
                     "qk_rope_head_dim": qk_rope_head_dim,
                     "qk_nope_head_dim": qk_nope_head_dim,
                     "dim": 7168,
-                    "type": None,
+                    "type": "deepseek-v3",
                     "index_topk": topk,
                 },
             }
@@ -237,7 +237,7 @@ def test_mla_prefill_ragged_qo_paged_kv(
                     "qk_rope_head_dim": qk_rope_head_dim,
                     "qk_nope_head_dim": qk_nope_head_dim,
                     "dim": 7168,
-                    "type": None,
+                    "type": "deepseek-v3",
                 },
             }
         ),
@@ -552,9 +552,6 @@ def test_mla_decode_paged_kv(
         torch.set_default_dtype(torch.bfloat16)
     else:
         torch.set_default_dtype(torch.float16)
-    # NPU MLA 算子要求 num_key_value_heads=1，需要设置 type="deepseek-v3"
-    # 确保 NpuAttnBackend.__init__ 中 local_n_kv_heads 为 1
-    model_type = "deepseek-v3" if impl == "npu" else None
     set_global_args(
         OmegaConf.create(
             {
@@ -574,7 +571,7 @@ def test_mla_decode_paged_kv(
                     "qk_rope_head_dim": qk_rope_head_dim,
                     "qk_nope_head_dim": qk_nope_head_dim,
                     "dim": 7168,
-                    "type": model_type,
+                    "type": "deepseek-v3",
                     "index_topk": topk,
                 },
             }
@@ -716,7 +713,7 @@ def test_prefill_ragged_qkvo(
         OmegaConf.create(
             {
                 "infer": {
-                    "mla_absorb": None,
+                    "mla_absorb": "none",
                     "max_reqs": 4,
                     "op_impl": "torch",
                     "use_cuda_graph": False,
@@ -834,7 +831,7 @@ def test_decode_dense_kv(
         OmegaConf.create(
             {
                 "infer": {
-                    "mla_absorb": None,
+                    "mla_absorb": "none",
                     "op_impl": "torch",
                     "max_reqs": 4,
                     "use_cuda_graph": False,
@@ -979,7 +976,7 @@ def test_decode_paged_kv(
         OmegaConf.create(
             {
                 "infer": {
-                    "mla_absorb": None,
+                    "mla_absorb": "none",
                     "op_impl": "torch",
                     "max_reqs": 4,
                     "use_cuda_graph": True if impl == "flashinfer" else False,

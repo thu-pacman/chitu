@@ -20,11 +20,13 @@ flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 
 class FlashInferBackend(TritonAttnBackend):
     def __init__(self, tot_num_blocks, *, qk_nope_head_dim: Optional[int] = None):
+        from chitu.models.registry import ModelType
+
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
         self.is_mla = (
-            self.args.infer.mla_absorb == "absorb-without-precomp"
-            or self.args.infer.mla_absorb == "absorb"
+            self.args.models.type == ModelType.DEEPSEEK_V3
+            and self.args.infer.mla_absorb in {"absorb-without-precomp", "absorb"}
         )
         self.is_paged = self.args.infer.cache_type == "paged"
 

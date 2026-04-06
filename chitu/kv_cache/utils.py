@@ -74,23 +74,25 @@ def plan_kv_cache_blocks_after_warmup(args, cache_managers):
             "cm": cm,
             "block_mem": cm.estimate_bytes_per_block(),
             "current_blocks": cm.num_blocks,
-            "max_num_blocks": cm.max_num_blocks,
+            "max_num_blocks": cm.get_allocatable_max_num_blocks(),
         }
 
     main_cm = cache_managers["main"]
-    main_cur = main_cm.num_blocks
+    main_cur = int(main_cm.num_blocks)
 
     plan = {"main": main_cur}
 
     if "indexer" in cache_managers:
         indexer_cm = cache_managers["indexer"]
-        indexer_cur = indexer_cm.num_blocks
-        indexer_cap = indexer_cm.max_num_blocks
+        indexer_cur = int(indexer_cm.num_blocks)
+        indexer_cap = indexer_cm.get_allocatable_max_num_blocks()
 
         desired_indexer_blocks = estimate_indexer_blocks_from_main(
             main_cm, indexer_cm, main_cur
         )
-        desired_indexer_blocks = min(max(0, desired_indexer_blocks), indexer_cap)
+        desired_indexer_blocks = min(
+            max(0, int(desired_indexer_blocks)), int(indexer_cap)
+        )
 
         # shrink-only in pre-plan
         indexer_target = min(indexer_cur, desired_indexer_blocks)
@@ -103,40 +105,27 @@ def plan_kv_cache_blocks_after_warmup(args, cache_managers):
             desired_indexer_blocks,
             indexer_target,
         )
-    # TODO: add mm plan
 
     for name, info in infos.items():
         if name in plan:
             continue
-        plan[name] = min(info["current_blocks"], info["max_num_blocks"])
+        plan[name] = min(int(info["current_blocks"]), int(info["max_num_blocks"]))
 
     return plan
 
 
-def get_current_available_kv_cache_memory_bytes(
-    memory_utilization=0.98,
-    reserve_bytes=0,
-) -> int:
-    """
-    Estimate additional bytes available for KV cache based on current live memory.
-    """
-    live_bytes, target_budget_bytes = get_current_live_and_target_bytes(
-        memory_utilization=memory_utilization,
-        reserve_bytes=reserve_bytes,
-    )
-    return max(0, int(target_budget_bytes) - int(live_bytes))
-
-
-def get_current_live_and_target_bytes(
+def get_peak_live_and_target_bytes(
     memory_utilization=0.98,
     reserve_bytes=0,
 ) -> tuple[int, int]:
     """
     Return:
-      live_bytes: current live memory bytes
-      target_budget_bytes: target live-memory budget after applying
-                           memory_utilization and reserve_bytes
+        live_bytes: peak memory bytes until now (including activation memory
+            observed during warming-up)
+        target_budget_bytes: target live-memory budget after applying
+            memory_utilization and reserve_bytes
     """
+
     if get_global_args().infer.op_impl == "cpu":
         process = psutil.Process(os.getpid())
         live_bytes = int(process.memory_info().vms)
@@ -150,16 +139,39 @@ def get_current_live_and_target_bytes(
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
 
+    memory_stats = torch.cuda.memory_stats(current_device)
     free_bytes, total_bytes = torch.cuda.mem_get_info(current_device)
 
-    torch_allocated_bytes = torch.cuda.memory_stats(current_device)[
-        "allocated_bytes.all.current"
-    ]
+    ###################################################################
+    # Memory stats part 1: Peak torch allocated bytes
+    #
+    # We use peak becuase it includes the activation memory observed during
+    # warming-up
+    peak_torch_allocated_bytes = memory_stats["allocated_bytes.all.peak"]
+    # Memory stats part 1 ends.
+    ###################################################################
 
-    total_allocated_bytes = total_bytes - free_bytes
-    non_torch_allocations = max(0, total_allocated_bytes - torch_allocated_bytes)
+    ###################################################################
+    # Memory stats part 2: Current non-torch allocated bytes
+    #
+    # We fallback to current instead of peak, beacuse we have no way to
+    # track peak non-torch allocated bytes.
 
-    live_bytes = int(torch_allocated_bytes + non_torch_allocations)
+    current_cuda_allocated_bytes = total_bytes - free_bytes
+    # current_cuda_allocated_bytes includes torch allocated bytes, torch unused
+    # bytes, and non-torch allocated bytes
+
+    current_torch_reserved_bytes = memory_stats["reserved_bytes.all.current"]
+    # current_torch_reserved_bytes includes torch allocated bytes and torch
+    # unused bytes
+
+    current_non_torch_allocations = max(
+        0, current_cuda_allocated_bytes - current_torch_reserved_bytes
+    )
+    # Memory stats part 2 ends.
+    ###################################################################
+
+    live_bytes = int(peak_torch_allocated_bytes + current_non_torch_allocations)
     target_budget_bytes = int(total_bytes * memory_utilization) - int(reserve_bytes)
 
     logger.debug(
@@ -183,13 +195,13 @@ def solve_main_target_from_current(
     This may shrink or grow main.
     """
     main_cur = int(main_cm.num_blocks)
-    main_cap = int(main_cm.max_num_blocks)
+    main_cap = main_cm.get_allocatable_max_num_blocks()
     main_bpb = int(main_cm.estimate_bytes_per_block())
 
     if main_bpb <= 0:
         return 0
 
-    live_bytes, target_budget_bytes = get_current_live_and_target_bytes(
+    live_bytes, target_budget_bytes = get_peak_live_and_target_bytes(
         memory_utilization=args.infer.memory_utilization,
         reserve_bytes=reserve_bytes,
     )
@@ -202,12 +214,13 @@ def solve_main_target_from_current(
 
     logger.info(
         "KV main-only solve: live_bytes=%d target_budget_bytes=%d "
-        "baseline_bytes=%d main_cur=%d target_main_blocks=%d",
+        "baseline_bytes=%d main_cur=%d target_main_blocks=%d main_cap=%d",
         int(live_bytes),
         int(target_budget_bytes),
         int(baseline_bytes),
         int(main_cur),
         int(target_main_blocks),
+        int(main_cap),
     )
 
     return max(0, min(int(target_main_blocks), int(main_cap)))
@@ -225,14 +238,14 @@ def solve_main_target_after_shrink(
     This may shrink or grow main.
     """
     main_cur = int(main_cm.num_blocks)
-    main_cap = int(main_cm.max_num_blocks)
+    main_cap = main_cm.get_allocatable_max_num_blocks()
     main_bpb = int(main_cm.estimate_bytes_per_block())
 
     indexer_cur = int(indexer_cm.num_blocks)
-    indexer_cap = int(indexer_cm.max_num_blocks)
+    indexer_cap = indexer_cm.get_allocatable_max_num_blocks()
     indexer_bpb = int(indexer_cm.estimate_bytes_per_block())
 
-    live_bytes, target_budget_bytes = get_current_live_and_target_bytes(
+    live_bytes, target_budget_bytes = get_peak_live_and_target_bytes(
         memory_utilization=args.infer.memory_utilization,
         reserve_bytes=reserve_bytes,
     )
@@ -253,7 +266,7 @@ def solve_main_target_after_shrink(
         mid = (lo + hi) // 2
 
         derived_indexer = estimate_indexer_blocks_from_main(main_cm, indexer_cm, mid)
-        derived_indexer = min(max(0, int(derived_indexer)), int(indexer_cap))
+        derived_indexer = clamp_int(derived_indexer, 1, indexer_cap)
 
         total_live_if_mid = (
             int(baseline_bytes)
@@ -270,7 +283,8 @@ def solve_main_target_after_shrink(
 
     logger.info(
         "KV joint solve after shrink: live_bytes=%d target_budget_bytes=%d "
-        "baseline_bytes=%d main_cur=%d indexer_cur=%d best_main=%d best_indexer=%d",
+        "baseline_bytes=%d main_cur=%d indexer_cur=%d best_main=%d best_indexer=%d "
+        "main_cap=%d indexer_cap=%d",
         int(live_bytes),
         int(target_budget_bytes),
         int(baseline_bytes),
@@ -278,6 +292,8 @@ def solve_main_target_after_shrink(
         int(indexer_cur),
         int(best_main),
         int(best_indexer),
+        int(main_cap),
+        int(indexer_cap),
     )
     return int(best_main)
 
