@@ -155,7 +155,7 @@ def _auto_set_num_blocks_after_warmup(args):
 
         current_blocks = int(cm.num_blocks)
         target_blocks = int(plan.get(name, current_blocks))
-        target_blocks = clamp_int(target_blocks, 0, cm.get_allocatable_max_num_blocks())
+        target_blocks = clamp_int(target_blocks, 1, cm.get_allocatable_max_num_blocks())
 
         if target_blocks < current_blocks:
             cm.realloc(int(target_blocks))
@@ -186,14 +186,14 @@ def _auto_set_num_blocks_after_warmup(args):
         )
 
         solved_main = allreduce_min_int(int(solved_main))
-        solved_main = clamp_int(int(solved_main), 0, int(main_cap))
+        solved_main = clamp_int(int(solved_main), 1, int(main_cap))
 
         final_indexer_target = estimate_indexer_blocks_from_main(
             main_cm, indexer_cm, int(solved_main)
         )
         final_indexer_target = clamp_int(
             final_indexer_target,
-            0,
+            1,
             indexer_cm.get_allocatable_max_num_blocks(),
         )
         final_indexer_target = allreduce_min_int(int(final_indexer_target))
@@ -215,7 +215,7 @@ def _auto_set_num_blocks_after_warmup(args):
             reserve_bytes=reserve_bytes,
         )
         final_main_target = allreduce_min_int(int(final_main_target))
-        final_main_target = clamp_int(int(final_main_target), 0, int(main_cap))
+        final_main_target = clamp_int(int(final_main_target), 1, int(main_cap))
 
     # If main needs shrink, do it early to release memory before any later growth.
     main_current = int(main_cm.num_blocks)
@@ -233,7 +233,7 @@ def _auto_set_num_blocks_after_warmup(args):
         indexer_current = int(indexer_cm.num_blocks)
         final_indexer_target = clamp_int(
             final_indexer_target,
-            0,
+            1,
             indexer_cm.get_allocatable_max_num_blocks(),
         )
         if int(final_indexer_target) != int(indexer_current):
@@ -255,7 +255,7 @@ def _auto_set_num_blocks_after_warmup(args):
     safe_main_target = min(int(safe_main_target), int(final_main_target))
     safe_main_target = clamp_int(
         safe_main_target,
-        0,
+        1,
         main_cm.get_allocatable_max_num_blocks(),
     )
     safe_main_target = allreduce_min_int(int(safe_main_target))
@@ -275,7 +275,7 @@ def _auto_set_num_blocks_after_warmup(args):
         )
         safe_indexer_target = clamp_int(
             safe_indexer_target,
-            0,
+            1,
             indexer_cm.get_allocatable_max_num_blocks(),
         )
         safe_indexer_target = allreduce_min_int(int(safe_indexer_target))
@@ -851,6 +851,16 @@ def chitu_init(args):
         assert (
             args.infer.embed_tokens_lm_head_tp_size.isdigit()
         ), "embed_tokens_lm_head_tp_size must be auto or an integer"
+
+    if args.infer.mla_absorb == "auto":
+        if args.models.type == ModelType.DEEPSEEK_V3:
+            if args.models.name.lower() == "GLM-5-FP8".lower():
+                # GLM-5-FP8's quantization blocking stops using absorb-without-precomp
+                args.infer.mla_absorb = "absorb"
+            else:
+                args.infer.mla_absorb = "absorb-without-precomp"
+        else:
+            args.infer.mla_absorb = "none"
 
     if args.infer.dp_size > args.infer.max_reqs:
         raise ValueError(

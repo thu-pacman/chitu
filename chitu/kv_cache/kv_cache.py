@@ -489,8 +489,8 @@ class PagedKVCache(KVCacheBase):
             f"prefix_caching={get_global_args().infer.enable_prefix_caching}"
         )
 
-        if requested_num_blocks < 0:
-            raise ValueError(f"num_blocks must be >= 0, got {requested_num_blocks}")
+        if requested_num_blocks <= 0:
+            raise ValueError(f"num_blocks must be > 0, got {requested_num_blocks}")
 
         self.num_blocks = min(requested_num_blocks, allocatable_cap)
 

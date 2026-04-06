@@ -485,7 +485,7 @@ curl -X POST http://<Router_IP>:21003/v1/chat/completions \
 | `chitu_kv_transfer_speed_gbps`             | —                    | 最近一次 KV 传输速度   |
 | `chitu_kv_cache_usage_ratio`               | `rank`, `dp_id`      | KV Cache 使用率   |
 | `chitu_used_blocks` / `chitu_total_blocks` | `rank`, `dp_id`      | KV Cache 块使用情况 |
-| `chitu_used_bytes` / `chitu_total_bytes`   | `rank`, `dp_id`      | GPU 显存使用       |
+| `chitu_cuda_used_bytes` / `chitu_cuda_total_bytes` | `rank`, `dp_id` | GPU 显存使用       |
 
 
 **计数器（Counter）**

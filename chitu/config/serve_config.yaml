@@ -148,6 +148,7 @@ infer:
   # Absorption mode for MLA. This field is ignored when the model does not contain MLA.
   # 
   # Acceptable values:
+  # - "auto": Decide automatically.
   # - "none": No absorption. This is an optimization for lower FLOP counts, which matches the
   #   typical need for prefilling.
   # - "absorb-without-precomp": exchange some matrices in the order of multiplication. This is
@@ -156,7 +157,7 @@ infer:
   # - "absorb": exchange some matrices in the order of multiplication, and precompute all the
   #   multiplications that can be computed before inference. This is an optimization for fewer
   #   operator counts, which may be useful for low-latency + low-concurrency cases.
-  mla_absorb: "none"
+  mla_absorb: "auto"
 
   # The hardware-supported data type used for software implementation for lower-bit data types
   # that are not supported by the hardware. For example, when you want to run a float8_e4m3fn
@@ -191,6 +192,12 @@ infer:
   use_cuda_graph: auto
 
   # Device memory utilization rate for automatic page allocation for paged KV cache.
+  #
+  # Chitu will try to allocate as many pages as possible, satisfying that
+  # `kv_cache_mem + weight_mem + estimated_activation_mem <= memory_utilization * total_gpu_mem`,
+  # where `estimated_activation_mem` is estimated during engine warmup. Since the
+  # esitimation may not be accurate enough, `memory_utilization` may be needed to be
+  # tuned.
   #
   # Acceptable values: 0.0 to 1.0, e.g., 0.98 means 98% of GPU memory will be used.
   memory_utilization: 0.98 # pls decrease memory_utilization when enable prefix cache

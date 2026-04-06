@@ -167,12 +167,12 @@
       },
       "targets": [
         {
-          "expr": "chitu_used_bytes{job=\"chitu_service\"}",
+          "expr": "chitu_cuda_used_bytes{job=\"chitu_service\"}",
           "legendFormat": "used rank{{rank}} dp{{dp_id}}",
           "refId": "A"
         },
         {
-          "expr": "chitu_total_bytes{job=\"chitu_service\"}",
+          "expr": "chitu_cuda_total_bytes{job=\"chitu_service\"}",
           "legendFormat": "total rank{{rank}} dp{{dp_id}}",
           "refId": "B"
         },

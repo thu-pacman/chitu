@@ -319,9 +319,10 @@ class PrometheusMetricsCollector:
         self.kv_cache_usage: Optional[Gauge] = None
         self.used_blocks: Optional[Gauge] = None
         self.total_blocks: Optional[Gauge] = None
-        self.total_bytes: Optional[Gauge] = None
-        self.used_bytes: Optional[Gauge] = None
+        self.cuda_total_bytes: Optional[Gauge] = None
+        self.cuda_used_bytes: Optional[Gauge] = None
         self.torch_allocated_bytes: Optional[Gauge] = None
+        self.torch_reserved_bytes: Optional[Gauge] = None
         self.running_requests: Optional[Gauge] = None
         self.waiting_requests: Optional[Gauge] = None
         self.collector_server = None
@@ -345,28 +346,36 @@ class PrometheusMetricsCollector:
                 "KV cache total blocks",
                 ["rank", "dp_id"],
             )
-            self.total_bytes = Gauge(
-                "chitu_total_bytes",
-                "GPU total memory (bytes)",
+            self.cuda_total_bytes = Gauge(
+                "chitu_cuda_total_bytes",
+                "CUDA total memory (bytes)",
                 ["rank", "dp_id"],
             )
-            self.used_bytes = Gauge(
-                "chitu_used_bytes",
-                "GPU used memory (bytes)",
+            self.cuda_used_bytes = Gauge(
+                "chitu_cuda_used_bytes",
+                "CUDA used memory (bytes), including torch allocated memory, torch "
+                "reserved but unused memory, and other CUDA memory",
                 ["rank", "dp_id"],
             )
             self.torch_allocated_bytes = Gauge(
                 "chitu_torch_allocated_bytes",
-                "torch allocated GPU used memory (bytes)",
+                "torch allocated GPU memory (bytes)",
+                ["rank", "dp_id"],
+            )
+            self.torch_reserved_bytes = Gauge(
+                "chitu_torch_reserved_bytes",
+                "torch reserved GPU memory (bytes), including torch allocated memory, "
+                "and torch reserved but unused memory",
                 ["rank", "dp_id"],
             )
 
             self.kv_cache_usage.labels(rank=rank, dp_id=dp_id).set(0)
             self.used_blocks.labels(rank=rank, dp_id=dp_id).set(0)
             self.total_blocks.labels(rank=rank, dp_id=dp_id).set(0)
-            self.total_bytes.labels(rank=rank, dp_id=dp_id).set(0)
-            self.used_bytes.labels(rank=rank, dp_id=dp_id).set(0)
+            self.cuda_total_bytes.labels(rank=rank, dp_id=dp_id).set(0)
+            self.cuda_used_bytes.labels(rank=rank, dp_id=dp_id).set(0)
             self.torch_allocated_bytes.labels(rank=rank, dp_id=dp_id).set(0)
+            self.torch_reserved_bytes.labels(rank=rank, dp_id=dp_id).set(0)
 
             # --- Per-dp metrics (throughput, task counts)
             if self.is_dp_metrics_rank:
@@ -587,20 +596,25 @@ class PrometheusMetricsCollector:
                 device_index = torch.cuda.current_device()
             mem_info = _get_nvml_memory_bytes(device_index, os.getpid())
             if mem_info is not None:
-                used_bytes, total_bytes = mem_info
+                cuda_used_bytes, cuda_total_bytes = mem_info
             else:
-                free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
-                used_bytes = total_bytes - free_bytes
-            torch_allocated = torch.cuda.memory_allocated(device_index)
-            collector.total_bytes.labels(
+                free_bytes, cuda_total_bytes = torch.cuda.mem_get_info(device_index)
+                cuda_used_bytes = cuda_total_bytes - free_bytes
+            memory_stats = torch.cuda.memory_stats(device_index)
+            torch_allocated = memory_stats["allocated_bytes.all.current"]
+            torch_reserved = memory_stats["reserved_bytes.all.current"]
+            collector.cuda_total_bytes.labels(
                 rank=collector.rank, dp_id=collector.dp_id
-            ).set(total_bytes)
-            collector.used_bytes.labels(rank=collector.rank, dp_id=collector.dp_id).set(
-                used_bytes
-            )
+            ).set(cuda_total_bytes)
+            collector.cuda_used_bytes.labels(
+                rank=collector.rank, dp_id=collector.dp_id
+            ).set(cuda_used_bytes)
             collector.torch_allocated_bytes.labels(
                 rank=collector.rank, dp_id=collector.dp_id
             ).set(torch_allocated)
+            collector.torch_reserved_bytes.labels(
+                rank=collector.rank, dp_id=collector.dp_id
+            ).set(torch_reserved)
 
         except Exception as e:
             logger.error(f"update_GPU_usage failed: {e}")

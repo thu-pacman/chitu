@@ -111,16 +111,19 @@ class MetricsMonitor:
                 total_blocks = self.manager.query_metric_latest_value_each_rank(
                     "chitu_total_blocks"
                 )
-                total_bytes = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_total_bytes"
+                cuda_total_bytes = self.manager.query_metric_latest_value_each_rank(
+                    "chitu_cuda_total_bytes"
                 )
-                used_bytes = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_used_bytes"
+                cuda_used_bytes = self.manager.query_metric_latest_value_each_rank(
+                    "chitu_cuda_used_bytes"
                 )
                 torch_allocated_bytes = (
                     self.manager.query_metric_latest_value_each_rank(
                         "chitu_torch_allocated_bytes"
                     )
+                )
+                torch_reserved_bytes = self.manager.query_metric_latest_value_each_rank(
+                    "chitu_torch_reserved_bytes"
                 )
                 mtp_proposed_rate = self.manager.query_metric_rate_each_rank(
                     "chitu_mtp_proposed_tokens_total", time_window=log_interval
@@ -141,9 +144,10 @@ class MetricsMonitor:
                     kvcache_usage,
                     used_blocks,
                     total_blocks,
-                    total_bytes,
-                    used_bytes,
+                    cuda_total_bytes,
+                    cuda_used_bytes,
                     torch_allocated_bytes,
+                    torch_reserved_bytes,
                     total_hit_tokens,
                     total_prompt_tokens,
                     mtp_proposed_rate,
@@ -160,9 +164,10 @@ class MetricsMonitor:
         kvcache_usage: dict[tuple[str, str], str],
         used_blocks: dict[tuple[str, str], str],
         total_blocks: dict[tuple[str, str], str],
-        total_bytes: dict[tuple[str, str], str],
-        used_bytes: dict[tuple[str, str], str],
+        cuda_total_bytes: dict[tuple[str, str], str],
+        cuda_used_bytes: dict[tuple[str, str], str],
         torch_allocated_bytes: dict[tuple[str, str], str],
+        torch_reserved_bytes: dict[tuple[str, str], str],
         total_hit_tokens: dict[tuple[str, str], str],
         total_prompt_tokens: dict[tuple[str, str], str],
         mtp_proposed_rate: dict[tuple[str, str], str] = None,
@@ -175,9 +180,10 @@ class MetricsMonitor:
             kvcache_usage,
             used_blocks,
             total_blocks,
-            total_bytes,
-            used_bytes,
+            cuda_total_bytes,
+            cuda_used_bytes,
             torch_allocated_bytes,
+            torch_reserved_bytes,
             total_hit_tokens,
             total_prompt_tokens,
         ]
@@ -225,9 +231,10 @@ class MetricsMonitor:
                 used_blocks=used_blocks_value,
                 total_blocks=total_blocks_value,
                 prealloc_blocks=prealloc_blocks,
-                total_bytes=float(total_bytes.get(rank_dp, "0")),
-                used_bytes=float(used_bytes.get(rank_dp, "0")),
+                cuda_total_bytes=float(cuda_total_bytes.get(rank_dp, "0")),
+                cuda_used_bytes=float(cuda_used_bytes.get(rank_dp, "0")),
                 torch_allocated_bytes=float(torch_allocated_bytes.get(rank_dp, "0")),
+                torch_reserved_bytes=float(torch_reserved_bytes.get(rank_dp, "0")),
                 hit_len=hit_tokens,
                 prompt_tokens=prompt_tokens,
                 hit_rate=hit_rate,
@@ -246,9 +253,10 @@ class MetricsMonitor:
         used_blocks,
         total_blocks,
         prealloc_blocks,
-        total_bytes,
-        used_bytes,
+        cuda_total_bytes,
+        cuda_used_bytes,
         torch_allocated_bytes,
+        torch_reserved_bytes,
         hit_len,
         prompt_tokens,
         hit_rate,
@@ -268,16 +276,21 @@ class MetricsMonitor:
             parts.append(f"MTP hit rate: {mtp_hit_rate*100:.1f}%")
         prealloc_msg = str(int(prealloc_blocks)) if prealloc_blocks is not None else "-"
         parts.append(f"KV blocks prealloc: {prealloc_msg}")
-        if total_bytes > 0 and used_bytes >= 0:
-            used_gib = used_bytes / 1024**3
-            total_gib = total_bytes / 1024**3
+        if cuda_total_bytes > 0 and cuda_used_bytes >= 0:
+            used_gib = cuda_used_bytes / 1024**3
+            total_gib = cuda_total_bytes / 1024**3
             if torch_allocated_bytes >= 0:
-                torch_gib = torch_allocated_bytes / 1024**3
-                non_torch_gib = max(used_bytes - torch_allocated_bytes, 0.0) / 1024**3
+                torch_allocated_gib = torch_allocated_bytes / 1024**3
+                torch_reserved_gib = torch_reserved_bytes / 1024**3
+                torch_unused_gib = torch_reserved_gib - torch_allocated_gib
+                non_torch_gib = (
+                    max(cuda_used_bytes - torch_reserved_bytes, 0.0) / 1024**3
+                )
                 parts.append(
                     "GPU mem: "
                     f"{used_gib:.2f}/{total_gib:.2f} GiB "
-                    f"(torch: {torch_gib:.2f} GiB, non-torch: {non_torch_gib:.2f} GiB)"
+                    f"(torch-allocated: {torch_allocated_gib:.2f} GiB, torch-unused: {torch_unused_gib:.2f} "
+                    f"GiB, non-torch: {non_torch_gib:.2f} GiB)"
                 )
             else:
                 parts.append(f"GPU mem: {used_gib:.2f}/{total_gib:.2f} GiB")
