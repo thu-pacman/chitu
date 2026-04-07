@@ -3,12 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 from typing_extensions import override
 import functools
 import plum
 
 import torch
+import torch.nn.functional as F
 
 from chitu.native_layout.base import NativeLayoutTensor
 from chitu.import_utils import try_import_platform_dep
@@ -273,6 +274,89 @@ class Packed4BitWeightAlongK(NativeLayoutTensor):
             )
         return Packed4BitWeightAlongK(
             self.plain_shape[1:], self.layout_tensor[index], k_stride=self.k_stride
+        )
+
+
+@dataclass
+class Blockfp4LinearPackedWeightPadToShape(Packed4BitWeightAlongK):
+    """
+    Pad 2D packed blockfp4 weights to ``padded_shape`` (MoE Hygon-style target sizes), then
+    ``Packed4BitWeightAlongK``.
+    """
+
+    padded_shape: Optional[tuple] = None
+    """
+    Stored for ``enable_native_layout_weight`` reconstruction: ``get_native_layout_*`` passes
+    ``_weight_layout_kwargs`` (including ``padded_shape``) into ``__init__``.
+    """
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(
+        cls,
+        tensor: torch.Tensor,
+        *,
+        padded_shape: tuple,
+        k_stride: int = 1,
+    ) -> "Blockfp4LinearPackedWeightPadToShape":
+        assert (
+            tensor.dtype == torch.uint8
+        ), "Blockfp4LinearPackedWeightPadToShape expects uint8 packed weights"
+        assert tensor.ndim == 2, f"expected 2D linear weight, got shape {tensor.shape}"
+        n, k_half = tensor.shape[0], tensor.shape[1]
+        padded_n, padded_k_half = padded_shape[0], padded_shape[1]
+        assert padded_n == n, f"out dim mismatch: {n} vs {padded_n}"
+        if k_half != padded_k_half:
+            if k_half > padded_k_half:
+                raise ValueError(
+                    f"packed K {k_half} larger than padded target {padded_k_half}"
+                )
+            tensor = F.pad(tensor, (0, padded_k_half - k_half), value=0)
+            tensor = tensor.contiguous()
+        inner = Packed4BitWeightAlongK.convert_from(tensor, k_stride=k_stride)
+        return cls(
+            plain_shape=inner.plain_shape,
+            layout_tensor=inner.layout_tensor,
+            k_stride=inner.k_stride,
+            padded_shape=tuple(padded_shape),
+        )
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(
+        cls,
+        packed: Packed4BitWeightAlongK,
+        *,
+        padded_shape: tuple,
+        k_stride: int = 1,
+    ) -> "Blockfp4LinearPackedWeightPadToShape":
+        """
+        ``Blockfp4LinearBase`` sets ``_weight_layout_class = Packed4BitWeightAlongK``, so the
+        load_state_dict hook often receives a ``Packed4BitWeightAlongK`` from
+        ``get_native_layout_weight()`` instead of a raw ``torch.Tensor``.
+        """
+        assert packed.layout_tensor.ndim == 2, packed.layout_tensor.shape
+        n, k_half = packed.layout_tensor.shape[0], packed.layout_tensor.shape[1]
+        padded_n, padded_k_half = padded_shape[0], padded_shape[1]
+        assert padded_n == n, f"out dim mismatch: {n} vs {padded_n}"
+        if packed.k_stride != k_stride:
+            packed = Packed4BitWeightAlongK.convert_from(packed, k_stride=k_stride)
+            k_half = packed.layout_tensor.shape[1]
+        lt = packed.layout_tensor
+        if k_half > padded_k_half:
+            raise ValueError(
+                f"packed K {k_half} larger than padded target {padded_k_half}"
+            )
+        if k_half < padded_k_half:
+            lt = F.pad(lt, (0, padded_k_half - k_half), value=0)
+        k_log = padded_k_half * 2
+        return cls(
+            plain_shape=(n, k_log),
+            layout_tensor=lt.contiguous(),
+            k_stride=k_stride,
+            padded_shape=tuple(padded_shape),
         )
 
 

@@ -6,6 +6,7 @@ from typing import Optional
 from typing_extensions import override
 from logging import getLogger
 
+from chitu.lazy import eval_lazy
 import torch
 
 from chitu.quantization.base import (
@@ -32,9 +33,14 @@ from chitu.utils import (
 from chitu.global_vars import get_global_args
 from chitu.native_layout import (
     enable_native_layout_weight,
+    BlackwellMXFP4MOEPadWeight,
+    BlackwellMXFP4MOEScalePadToSwizzled,
+    Blockfp4LinearPackedWeightPadToShape,
+    Blockfp4LinearScalePadToSwizzled,
     Packed4BitWeightAlongK,
     Packed4BitWeightNPUNative,
     LinearScaleToSwizzled,
+    nvfp4_moe_down_proj_n_padded,
 )
 from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import (
@@ -122,44 +128,28 @@ def _linear_block_fp4_blackwell(
     x_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Note: blackwell impl need swizzled weights, while others weights are linear
-
-    # FIXME: Add fp4 option to infer.raise_lower_bit_float_to and use it here
-    if x.dtype not in {torch.float16, torch.bfloat16}:
-        raise ValueError(f"Unsupported input type: {x.dtype}")
-    if x_scale is not None:
-        raise ValueError(f"No x_scale is supported for {x.dtype=}")
-    assert x.shape[-1] == weight.layout_tensor.shape[-1] * 2
-    y = blockfp4_gemm(
-        x,
-        weight.layout_tensor,
-        weight_scale,
-        weight_scale_2,
-        alpha=None,
-        out_dtype=parse_dtype(get_global_args().infer.raise_lower_bit_float_to),
-    )
-    if bias is not None:
-        y += bias
-    return y
-
-
-@linear_block_fp4.register("bf16", available=is_nvidia() or is_muxi())
-def _linear_block_fp4_bf16(
-    x: torch.Tensor,
-    weight: Packed4BitWeightAlongK,
-    weight_scale: torch.Tensor,
-    weight_scale_2: torch.Tensor,
-    act_block_size: int,
-    bias: Optional[torch.Tensor] = None,
-    *,
-    x_scale: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    if x.dtype not in {torch.float16, torch.bfloat16}:
-        raise ValueError(f"Unsupported input type: {x.dtype}")
-    if x_scale is not None:
-        raise ValueError(f"No x_scale is supported for {x.dtype=}")
-    if is_nvidia() or is_muxi():
-        y = soft_fp4_raise_to_bf16_blockfp4_gemm(
-            x, weight, weight_scale, weight_scale_2
+    if impl == "blackwell":
+        # FIXME: Add fp4 option to infer.raise_lower_bit_float_to and use it here
+        k_w = weight.layout_tensor.shape[-1] * 2
+        k_x = x.shape[-1]
+        if k_x < k_w:
+            x = eval_lazy(x)
+            x = torch.nn.functional.pad(x, (0, k_w - k_x), value=0).contiguous()
+        elif k_x > k_w:
+            raise AssertionError(
+                f"activation K {k_x} exceeds weight K {k_w} (packed last dim "
+                f"{weight.layout_tensor.shape[-1]})"
+            )
+        assert (
+            x.shape[-1] == weight.layout_tensor.shape[-1] * 2
+        ), f"{x.shape=}, {weight.layout_tensor.shape=}"
+        y = blockfp4_gemm(
+            x,
+            weight.layout_tensor,
+            weight_scale,
+            weight_scale_2,
+            alpha=None,
+            out_dtype=parse_dtype(get_global_args().infer.raise_lower_bit_float_to),
         )
         if bias is not None:
             y += bias
@@ -267,6 +257,7 @@ class Blockfp4LinearBase(QuantizedLinearBase):
         self._weight_plain_shape = (out_features, in_features)
 
         block_in, block_out = block_shape
+        self.block_shape = block_shape
 
         from chitu.models.registry import ModelType
 
@@ -358,8 +349,29 @@ class Blockfp4LinearPackKStride64(
     "blockfp4_merged", when=lambda _: is_blackwell(), priority=1
 )
 class Blockfp4LinearPackKStride1(
-    enable_native_layout_weight("weight", Packed4BitWeightAlongK, k_stride=1),
-    enable_native_layout_weight("weight_scale", LinearScaleToSwizzled),
+    enable_native_layout_weight(
+        "weight",
+        Blockfp4LinearPackedWeightPadToShape,
+        k_stride=1,
+        padded_shape=lambda m: [
+            m.weight.shape[0],
+            ((m.weight.shape[1] * 2 + 255) // 256 * 256) // 2,
+        ],
+    ),
+    enable_native_layout_weight(
+        "weight_scale",
+        Blockfp4LinearScalePadToSwizzled,
+        padded_shape=lambda m: [
+            m.weight_scale.shape[0],
+            max(
+                (m.weight_scale.shape[1] + 7) // 8 * 8,
+                ceil_div(
+                    ((m.weight.shape[1] * 2 + 255) // 256 * 256),
+                    m.block_shape[0],
+                ),
+            ),
+        ],
+    ),
     Blockfp4LinearBase,
 ):
     """
@@ -910,11 +922,45 @@ class Blockfp4MoeExpertsMergedBase(QuantizedMoeExpertsMerged):
 )
 class Blockfp4MoeExpertsBlackwell(
     enable_native_layout_weight(
-        "gate_up_proj_weight", Packed4BitWeightAlongK, k_stride=1
+        "gate_up_proj_weight",
+        BlackwellMXFP4MOEPadWeight,
+        padded_shape=lambda m: [
+            m.gate_up_proj_weight.shape[0],
+            (m.gate_up_proj_weight.shape[1] // 2 + 255) // 256 * 256 * 2,
+            ((m.gate_up_proj_weight.shape[2] * 2 + 255) // 256 * 256) // 2,
+        ],
     ),
-    enable_native_layout_weight("down_proj_weight", Packed4BitWeightAlongK, k_stride=1),
-    enable_native_layout_weight("gate_up_proj_weight_scale", LinearScaleToSwizzled),
-    enable_native_layout_weight("down_proj_weight_scale", LinearScaleToSwizzled),
+    enable_native_layout_weight(
+        "down_proj_weight",
+        BlackwellMXFP4MOEPadWeight,
+        padded_shape=lambda m: [
+            m.down_proj_weight.shape[0],
+            nvfp4_moe_down_proj_n_padded(
+                m.down_proj_weight.shape[1], m.down_proj_weight.shape[2]
+            ),
+            ((m.down_proj_weight.shape[2] * 2 + 255) // 256 * 256) // 2,
+        ],
+    ),
+    enable_native_layout_weight(
+        "gate_up_proj_weight_scale",
+        BlackwellMXFP4MOEScalePadToSwizzled,
+        padded_shape=lambda m: [
+            m.gate_up_proj_weight_scale.shape[0],
+            (m.gate_up_proj_weight_scale.shape[1] // 2 + 255) // 256 * 256 * 2,
+            (m.gate_up_proj_weight_scale.shape[2] + 7) // 8 * 8,
+        ],
+    ),
+    enable_native_layout_weight(
+        "down_proj_weight_scale",
+        BlackwellMXFP4MOEScalePadToSwizzled,
+        padded_shape=lambda m: [
+            m.down_proj_weight_scale.shape[0],
+            nvfp4_moe_down_proj_n_padded(
+                m.down_proj_weight.shape[1], m.down_proj_weight.shape[2]
+            ),
+            ((m.down_proj_weight.shape[2] * 2 + 255) // 256 * 256) // 16,
+        ],
+    ),
     Blockfp4MoeExpertsMergedBase,
 ):
     @override
@@ -931,51 +977,53 @@ class Blockfp4MoeExpertsBlackwell(
             )
         x, indices = routed_x.activation, routed_x.token_to_expert_indices
         shape = x.size()
+        x = eval_lazy(x)
         x = x.view(-1, self.dim)
+        w1 = self.get_native_layout_gate_up_proj_weight().layout_tensor
+        k1 = w1.shape[2] * 2
+        if x.shape[1] < k1:
+            x = torch.nn.functional.pad(x, (0, k1 - x.shape[1]), value=0).contiguous()
+        elif x.shape[1] > k1:
+            raise AssertionError(
+                f"MoE activation K {x.shape[1]} exceeds padded gate_up K {k1}"
+            )
 
         bs = x.size(0)
+        use_decode_path = bs <= 128
         backend = (
             hard_fp4_kernels.fused_moe_decode.scaled_fp4_fused_moe_decode
-            if bs <= 128
+            if use_decode_path
             else hard_fp4_kernels.cuda_nvfp4_fused_moe
         )
-        if not inplace:
-            output = torch.empty(
-                (
-                    x.size(0),
-                    self.get_native_layout_down_proj_weight().layout_tensor.size(1),
-                ),
+        w2 = self.get_native_layout_down_proj_weight().layout_tensor
+        n2_pad = w2.size(1)
+        # Fused decode and Cutlass paths both fill ``output[:, :N2]``. Inplace uses ``X`` as
+        # ``output``; that buffer is only ``K1`` wide after ``x`` pad. If ``N2 > K1``, inplace
+        # overflows (often surfaces as illegal access at the next NCCL sync).
+        fused_out_rows = x.size(0)
+        fused_safe_inplace = n2_pad <= k1
+        y = x
+        if not (inplace and fused_safe_inplace):
+            y = torch.empty(
+                (fused_out_rows, n2_pad),
                 dtype=x.dtype,
                 device=x.device,
             )
-            backend(
-                output,
-                x,
-                self.get_native_layout_gate_up_proj_weight().layout_tensor,
-                self.gate_up_proj_weight_scale,
-                self.gate_up_proj_weight_scale_2,
-                self.get_native_layout_down_proj_weight().layout_tensor,
-                self.down_proj_weight_scale,
-                self.down_proj_weight_scale_2,
-                weights,
-                indices,
-            )
-            y = output
-        else:
-            backend(
-                x,
-                x,
-                self.get_native_layout_gate_up_proj_weight().layout_tensor,
-                self.gate_up_proj_weight_scale,
-                self.gate_up_proj_weight_scale_2,
-                self.get_native_layout_down_proj_weight().layout_tensor,
-                self.down_proj_weight_scale,
-                self.down_proj_weight_scale_2,
-                weights,
-                indices,
-            )
-            y = x
+        backend(
+            y,
+            x,
+            w1,
+            self.gate_up_proj_weight_scale,
+            self.gate_up_proj_weight_scale_2,
+            w2,
+            self.down_proj_weight_scale,
+            self.down_proj_weight_scale_2,
+            weights,
+            indices,
+        )
 
+        if n2_pad != self.dim:
+            y = y[..., : self.dim]
         return y.reshape(shape)
 
 

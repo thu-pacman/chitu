@@ -252,7 +252,8 @@ def cutlass_scaled_fp4_mm(
     cuda_nvfp4_scaled_mm_kernel = (
         (
             hard_fp4_kernels.cuda_nvfp4_scaled_mm_decode
-            if m <= batch_size_threshold and k % 256 == 0
+            # if m <= batch_size_threshold and k % 256 == 0
+            if m <= batch_size_threshold
             else hard_fp4_kernels.cuda_nvfp4_scaled_mm
         )
         if has_hard_fp4_kernels

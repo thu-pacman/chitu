@@ -9,6 +9,7 @@ from chitu.native_layout.common import (
     PermutedTensor,
     TransposeLastTwoDim,
     BatchPaddedActivation,
+    Blockfp4LinearPackedWeightPadToShape,
     Packed4BitWeightAlongK,
     Packed4BitWeightAlongN,
     Packed4BitWeightQServe,
@@ -37,7 +38,12 @@ from chitu.native_layout.hygon import (
     HygonMixQFp16TileTensor,
 )
 from chitu.native_layout.cutlass import (
+    BlackwellMXFP4MOEPadWeight,
+    BlackwellMXFP4MOEScalePadToSwizzled,
+    Blockfp4LinearScalePadToSwizzled,
     LinearScaleToSwizzled,
+    nvfp4_moe_down_proj_n_padded,
+    nvfp4_moe_pad_n_for_group_mm_b_scale,
 )
 from chitu.native_layout.marlin import (
     MarlinNativeLayoutWeight,
