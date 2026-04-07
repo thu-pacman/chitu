@@ -133,13 +133,13 @@ template <typename T> __device__ inline T add(const T a, const T b) {
 const torch::TensorOptions int64_option =
     torch::TensorOptions().dtype(torch::kInt64).requires_grad(false);
 
-inline void checkTensor(Tensor &T, torch::ScalarType type) {
+inline void checkTensor(const Tensor &T, torch::ScalarType type) {
     ASSERTWITH(T.is_contiguous(), "Tensor is not contiguous");
     ASSERTWITH(T.device().type() == torch::kCUDA, "Tensor is not on CUDA");
     ASSERTWITH(T.dtype() == type, "Tensor type is incorrect");
 }
 
-inline void checkTensor(Tensor &T) {
+inline void checkTensor(const Tensor &T) {
     ASSERTWITH(T.is_contiguous(), "Tensor is not contiguous");
     ASSERTWITH(T.device().type() == torch::kCUDA, "Tensor is not on CUDA");
 }
