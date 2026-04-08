@@ -101,7 +101,7 @@ class ShareGPTDataset:
             if len(prompt_ids) >= input_len:
                 reqs.append(
                     UserRequest(
-                        message=None,
+                        message="",
                         request_id=gen_sequential_id(),
                         tokens=prompt_ids,
                         max_new_tokens=max_new_tokens,

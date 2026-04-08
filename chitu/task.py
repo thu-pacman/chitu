@@ -216,7 +216,8 @@ class UserRequest:
 
         # test information related
         self._test_flag = False
-        self._test_logits = []
+        self._test_topk_logits = []
+        self._test_topk_tokens = []
         self._test_tokens = []
         self._test_standard_tokens = None
         self._test_standard_it = 0
@@ -277,12 +278,10 @@ class UserRequest:
         self.async_stream.notify_server_threadsafe()
 
     def _test_add_logit(self, logit):
-        # logit = logit.tolist()
-        logit = torch.topk(
-            logit, k=100, dim=-1
-        ).values.tolist()  # Only use top100 logits to compare in single_req_compare to save disk footprint.
-        self._test_logits.append(logit)
-        # logger.warning(f"add logit {logit}")
+        # Only use top100 logits to compare in single_req_compare to save disk footprint.
+        topk_logits, topk_tokens = torch.topk(logit, k=100, dim=-1)
+        self._test_topk_logits.append(topk_logits)
+        self._test_topk_tokens.append(topk_tokens)
 
     def _test_add_token(self, token):
         self._test_tokens.append(token)

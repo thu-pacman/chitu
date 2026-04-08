@@ -9,6 +9,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 from chitu.models.registry import ModelType
+from chitu.utils import try_import_opt_dep
+
+_, has_flash_attn3 = try_import_opt_dep("flash_attn_interface", "flash_attn_interface")
 
 KVArgs = Dict[str, Any]
 KVKeys = List[str]
@@ -80,6 +83,28 @@ def get_kv_cache_spec(
     )
 
 
+def should_use_hopper_mixed_backend(args) -> bool:
+    """
+    Single source of truth for both ``default_paged_block_size_policy`` (return 1) and
+    choosing ``HopperMixedBackend``: DSV3 MLA sparse with flash_mla +
+    index_topk, bf16 MLA KV, and flash-attn 3 available.
+    """
+    if (
+        getattr(args.models, "type", None) != ModelType.DEEPSEEK_V3
+        or getattr(args.infer, "mla_absorb", "none") == "none"
+        or not getattr(args.models, "index_topk", None)
+    ):
+        return False
+    quant_config = getattr(args.models, "quant_config", None)
+    kv_cache_cfg = getattr(quant_config, "kv_cache", None) if quant_config else None
+    if (
+        kv_cache_cfg is not None
+        and getattr(kv_cache_cfg, "type", None) == "fp8_pertoken_dsa"
+    ):
+        return False
+    return has_flash_attn3
+
+
 def default_paged_block_size_policy(args) -> int:
     attn_type = getattr(args.infer, "attn_type", None)
 
@@ -88,6 +113,9 @@ def default_paged_block_size_policy(args) -> int:
 
     if attn_type == "hunyuan_attn":
         return 64
+
+    if should_use_hopper_mixed_backend(args):
+        return 1
 
     mla_absorb = getattr(args.infer, "mla_absorb", "none")
     if (

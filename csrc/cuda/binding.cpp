@@ -20,6 +20,7 @@
 #include "norm/rms_norm.h"
 #include "response_append/response_append.h"
 #include "rotary/rotary_pos_emb_llama.h"
+#include "topk/topk.h"
 #include "weight_layout/weight_layout_change.h"
 
 namespace py = pybind11;
@@ -38,6 +39,15 @@ void init_compute(py::module &m) {
     m.def("cuda_rms_norm", &rms_norm, "x"_a, "w"_a, "eps"_a,
           "out"_a = std::nullopt, "");
     m.def("weight_layout_change", &weight_layout_change, "");
+    m.def("fast_topk", &fast_topk_interface, "score"_a, "indices"_a,
+          "lengths_opt"_a = std::nullopt, "row_starts_opt"_a = std::nullopt,
+          "");
+    m.def("fast_topk_transform", &fast_topk_transform_interface, "score"_a,
+          "lengths"_a, "dst_page_table"_a, "src_page_table"_a, "cu_seqlens_q"_a,
+          "row_starts_opt"_a = std::nullopt, "");
+    m.def("fast_topk_transform_ragged", &fast_topk_transform_ragged_interface,
+          "score"_a, "lengths"_a, "topk_indices_ragged"_a,
+          "topk_indices_offset"_a, "row_starts_opt"_a = std::nullopt, "");
     m.def("cuda_topk_softmax", &topk_softmax, "");
     m.def("cuda_frequency_penalty", &applyFrequencyPenalty, "");
     m.def("cuda_response_append", &response_append, "");

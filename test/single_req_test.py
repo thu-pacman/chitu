@@ -2,6 +2,7 @@ import hydra
 import torch
 import time
 import os
+import sys
 import random
 import logging
 from logging import getLogger
@@ -216,8 +217,14 @@ def run_pipe_or_tensor_parallelism(args, timers):
             )
 
             for i, req in enumerate(reqs):
+                if sys.stdout.isatty():
+                    GRAY = "\033[1;30m"
+                    RESET = "\033[0m"
+                else:
+                    GRAY = ""
+                    RESET = ""
                 logger.info(
-                    f"Response in rank {rank}: reqs[{i}].output={req.output},reqs[{i}].input={req.message}"
+                    f"Response in rank {rank}: reqs[{i}].output={req.output}, {GRAY}reqs[{i}].input={req.message}{RESET}"
                 )
 
             timers.log()

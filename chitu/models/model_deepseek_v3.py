@@ -58,6 +58,7 @@ from chitu.ops import (
     append_to_paged_kv_cache,
     append_to_dense_kv_cache,
     hadamard_transform,
+    topk_indices,
 )
 from chitu.quantization import (
     QuantizationRegistry,
@@ -185,7 +186,7 @@ class Indexer(torch.nn.Module):
         k_fp8, k_scale = blockfp8_act_quant(k, block_size=self.block_size)
 
         weights = self.weights_proj(x) * self.n_heads**-0.5
-        q_scale = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
         delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
         delta_pos_ids = seq_len_delta.delta_position_ids_tensor_device
@@ -211,7 +212,7 @@ class Indexer(torch.nn.Module):
             )
             index_score = blockfp8_index_score_ragged_q_paged_k_dsv32(
                 q_fp8,
-                q_scale,
+                weights,
                 cache_accessor.kv["indexer_k"],
                 cache_accessor.kv["indexer_ks"],
                 seq_len_delta=seq_len_delta,
@@ -229,7 +230,7 @@ class Indexer(torch.nn.Module):
             )
             index_score = blockfp8_index_score_ragged_q_dense_k_dsv32(
                 q_fp8,
-                q_scale,
+                weights,
                 cache_accessor.kv["indexer_k"],
                 cache_accessor.kv["indexer_ks"],
                 seq_len_delta=seq_len_delta,
@@ -241,9 +242,11 @@ class Indexer(torch.nn.Module):
 
         # Ensure k does not exceed the actual size of index_score
         k = min(self.index_topk, index_score.size(-1))
-        _, topk_indices = index_score.topk(k, dim=-1)
+        indices = topk_indices(
+            index_score, k, lengths=seq_len_delta.delta_position_ids_tensor_device + 1
+        )
         # shape: [bs_seq_q, k]. May select some out-of-range items as -inf, which is fine
-        return topk_indices
+        return indices
 
     def _rotate_activation(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dtype == torch.bfloat16

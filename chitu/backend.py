@@ -24,6 +24,7 @@ from chitu.attn_backend import (
     FlashAttnBackend,
     FlashInferBackend,
     FlashMLABackend,
+    HopperMixedBackend,
     NpuAttnBackend,
     RefAttnBackend,
     TritonAttnBackend,
@@ -31,6 +32,7 @@ from chitu.attn_backend import (
     HybridAttnBackend,
 )
 
+from chitu.kv_cache.registry import should_use_hopper_mixed_backend
 from chitu.kv_cache import (
     KVCacheManagerBase,
     PagedKVCacheManager,
@@ -466,6 +468,8 @@ class Backend:
                 return NpuAttnBackend
             elif args.infer.op_impl == "cpu":
                 return RefAttnBackend
+            elif should_use_hopper_mixed_backend(args):
+                return HopperMixedBackend
             elif args.models.type == ModelType.DEEPSEEK_V3:
                 return FlashMLABackend
             else:
@@ -484,6 +488,8 @@ class Backend:
             return NpuAttnBackend
         elif args.infer.attn_type == "ref":
             return RefAttnBackend
+        elif args.infer.attn_type == "hopper_mixed":
+            return HopperMixedBackend
         else:
             raise ValueError(f"Unknown attn type {args.infer.attn_type}")
 
