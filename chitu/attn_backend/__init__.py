@@ -7,6 +7,9 @@ from chitu.attn_backend.flash_attn_backend import FlashAttnBackend
 from chitu.attn_backend.ref_attn_backend import RefAttnBackend
 from chitu.attn_backend.triton_attn_backend import TritonAttnBackend
 from chitu.attn_backend.flash_mla_backend import FlashMLABackend
+from chitu.attn_backend.hopper_mixed_backend import (
+    HopperMixedBackend,
+)
 from chitu.attn_backend.flash_infer_backend import FlashInferBackend
 from chitu.attn_backend.npu_attn_backend import NpuAttnBackend
 from chitu.attn_backend.hybrid_attn_backend import HybridAttnBackend
