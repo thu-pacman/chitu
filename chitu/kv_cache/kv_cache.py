@@ -1101,6 +1101,14 @@ class MMPagedKVCache(PagedKVCache):
     def prepare_cache_decode(self, tasks: "PackedTasksBase"):
         pass
 
+    @override
+    def prepare_mtp_cache_decode(self, mtp_offset: int):
+        pass
+
+    @override
+    def update_mtp_cache_decode(self, mtp_offset: list[int]):
+        pass
+
     def free_req_cache_blocks(self, tid: str):
         for block_id in self.block_table[tid]:
             self.free_blocks.append(block_id)

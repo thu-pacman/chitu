@@ -744,8 +744,26 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         visual_pos_mask = self._visual_pos_mask
 
         if self.mtp_size > 1:
-            for _it, layer in enumerate(self.layers):
-                h = layer(h, freqs_cis)
+            h_mtp = h
+            for mgr in self.cache_dict.values():
+                mgr.seq_len_delta.is_decode_stage = False
+            self.token_offset_list = None
+            self.mtp_token_list = None
+            for it, layer in enumerate(self.layers[0:-1]):
+                h = layer(h, freqs_cis, False)
+            prefill_previous_hidden_states = self._get_prefill_previous_hidden_states(h)
+            h_mtp[
+                self.cache_dict[
+                    "main"
+                ].mtp_seq_len_delta.delta_position_ids_tensor_device
+                == 0
+            ] = 0
+            h_mtp = self.layers[-1](
+                h_mtp, freqs_cis, prefill_previous_hidden_states, False
+            )
+            self.last_hidden_states_4_postprocess = (
+                self.prefill_main_last_hidden_states[output_token_offsets]
+            )
         else:
             for it, layer in enumerate(self.layers):
                 h = layer(h, freqs_cis)
@@ -894,7 +912,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         rope = torch.zeros_like(pos)
         curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
         if self._rope_delta_by_req:
-            if curr_tids is None or len(curr_tids) != int(rope.numel()):
+            if curr_tids is None or len(curr_tids) * self.mtp_size != int(rope.numel()):
                 raise ValueError(
                     "Qwen3.5 multimodal CUDA-graph decode requires cache.curr_tids aligned with "
                     "delta_position_ids (per-request rope_delta is enabled)."
@@ -902,9 +920,11 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
             for i, rid in enumerate(curr_tids):
                 v = self._rope_delta_by_req.get(rid, None)
                 if v is not None:
-                    rope[i] = v.to(device=rope.device, dtype=rope.dtype)
+                    rope[i * self.mtp_size : (i + 1) * self.mtp_size] = v.to(
+                        device=rope.device, dtype=rope.dtype
+                    )
 
-        return (rope,), (self.max_batch_size_per_dp,)
+        return (rope,), (self.max_batch_size_per_dp * self.mtp_size,)
 
     @override
     def _prepare_freqs_cis_for_decode(
@@ -931,6 +951,45 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
             self.embed_tokens.weight, "dtype", torch.get_default_dtype()
         )
         dummy = torch.empty((1, 1), device=pos3.device, dtype=dummy_dtype)
+        cos_full, sin_full = self.rotary_emb(dummy, pos3)  # [1, n_tokens, head_dim]
+        half = cos_full.shape[-1] // 2
+        cos = cos_full[0, :, :half].contiguous()
+        sin = sin_full[0, :, :half].contiguous()
+        return BatchedFreqsCis(cos, sin)
+
+    def _get_rope_delta(self) -> torch.Tensor:
+        pos = self.cache_dict["main"].mtp_seq_len_delta.delta_position_ids_tensor_device
+        rope = torch.zeros_like(pos)
+        curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
+        if self._rope_delta_by_req:
+            if curr_tids is None or len(curr_tids) != int(rope.numel()):
+                raise ValueError(
+                    "Qwen3.5 multimodal CUDA-graph mtp decode requires cache.curr_tids aligned with "
+                    "delta_position_ids (per-request rope_delta is enabled)."
+                )
+            for i, rid in enumerate(curr_tids):
+                v = self._rope_delta_by_req.get(rid, None)
+                if v is not None:
+                    rope[i] = v.to(device=rope.device, dtype=rope.dtype)
+        return rope
+
+    @override
+    def _prepare_freqs_cis_for_decode_mtp(
+        self, *extra_inputs: torch.Tensor
+    ) -> BatchedFreqsCis:
+        if self.language_model_only:
+            return super()._prepare_freqs_cis_for_decode_mtp(*extra_inputs)
+
+        rope_delta = self._get_rope_delta()
+        pos = self.cache_dict["main"].mtp_seq_len_delta.delta_position_ids_tensor_device
+        pos = pos + rope_delta.to(device=pos.device, dtype=pos.dtype)
+        pos3 = torch.stack([pos, pos, pos], dim=0).view(3, 1, -1)
+
+        dummy_dtype = getattr(
+            self.embed_tokens.weight, "dtype", torch.get_default_dtype()
+        )
+        dummy = torch.empty((1, 1), device=pos3.device, dtype=dummy_dtype)
+
         cos_full, sin_full = self.rotary_emb(dummy, pos3)  # [1, n_tokens, head_dim]
         half = cos_full.shape[-1] // 2
         cos = cos_full[0, :, :half].contiguous()
