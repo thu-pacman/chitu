@@ -62,6 +62,34 @@ _uvicorn_server: Optional["uvicorn.Server"] = None
 # Create FastAPI app
 app = FastAPI()  # Unified API
 
+# Inference endpoint prefixes that are subject to overload rejection
+_INFERENCE_PATH_PREFIXES = (
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/messages",
+    "/v1/responses",
+)
+
+
+@app.middleware("http")
+async def reject_overload(request: Request, call_next):
+    if request.url.path.startswith(_INFERENCE_PATH_PREFIXES):
+        args = get_global_args()
+        max_total = getattr(args.infer, "max_concurrent_requests", None)
+        if max_total is not None:
+            current = len(TaskPool.pool) + len(TaskPool.pending_queue)
+            if current >= max_total:
+                logger.warning(
+                    f"Overloaded: {current} requests in flight (limit {max_total}), rejecting"
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": {"message": "Server overloaded", "type": "overloaded"}
+                    },
+                )
+    return await call_next(request)
+
 
 class Message(BaseModel):
     role: str = "user"
@@ -367,7 +395,8 @@ async def get_chitu_load_status():
     return {
         "load_score": f"{load_score}",
         "handle_reqs": f"{handle_reqs}",
-        "max_reqs": f"{args.infer.max_reqs}",
+        "max_batch_size": f"{args.infer.max_batch_size}",
+        "max_concurrent_requests": f"{getattr(args.infer, 'max_concurrent_requests', '')}",
     }
 
 

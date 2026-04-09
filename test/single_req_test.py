@@ -188,7 +188,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
         chitu_start()
         if rank == 0:
             reqs = gen_reqs(
-                num_reqs=args.infer.max_reqs,
+                num_reqs=args.infer.max_batch_size,
                 max_new_tokens=args.request.max_new_tokens,
                 frequency_penalty=args.request.frequency_penalty,
                 is_vl=hasattr(args.models, "vision_config")
@@ -237,7 +237,7 @@ def run_normal(args, timers):
 
     for i in range(2):
         reqs = gen_reqs(
-            num_reqs=args.infer.max_reqs,
+            num_reqs=args.infer.max_batch_size,
             max_new_tokens=args.request.max_new_tokens,
             frequency_penalty=args.request.frequency_penalty,
             is_vl=hasattr(args.models, "vision_config")

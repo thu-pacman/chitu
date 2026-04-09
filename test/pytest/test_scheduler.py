@@ -112,7 +112,7 @@ def test_chunked_prefill_skew():
             {
                 "infer": {
                     "max_seq_len": 32768,
-                    "max_reqs": 256,
+                    "max_batch_size": 256,
                     "op_impl": "torch",
                     "cache_type": "skew",
                     "pp_size": 2,
@@ -127,7 +127,7 @@ def test_chunked_prefill_skew():
 
     infer_args = get_global_args().infer
     set_slot_handle(
-        infer_args.max_reqs,
+        infer_args.max_batch_size,
         infer_args.pp_size,
     )
 
@@ -142,7 +142,7 @@ def test_chunked_prefill_skew():
         TaskPool.add(task)
 
     scheduler = SkewScheduler(
-        max_reqs=infer_args.max_reqs,
+        max_batch_size=infer_args.max_batch_size,
         cache_manager_dict=None,
         original_scheduler_type="prefill_first",
         prefill_chunk_size=4096,
@@ -296,7 +296,7 @@ def test_priority_prefill_first_skew():
             {
                 "infer": {
                     "max_seq_len": 1024,
-                    "max_reqs": 4,
+                    "max_batch_size": 4,
                     "op_impl": "torch",
                     "cache_type": "skew",
                     "pp_size": 1,
@@ -311,7 +311,7 @@ def test_priority_prefill_first_skew():
 
     infer_args = get_global_args().infer
     set_slot_handle(
-        infer_args.max_reqs,
+        infer_args.max_batch_size,
         infer_args.pp_size,
     )
 
@@ -341,7 +341,7 @@ def test_priority_prefill_first_skew():
     TaskPool.add(tasks[6])
 
     scheduler = SkewScheduler(
-        infer_args.max_reqs,
+        infer_args.max_batch_size,
         cache_manager_dict=None,
         original_scheduler_type="prefill_first",
         prefill_chunk_size=None,
@@ -482,7 +482,7 @@ def test_priority_fcfs_skew():
             {
                 "infer": {
                     "max_seq_len": 1024,
-                    "max_reqs": 4,
+                    "max_batch_size": 4,
                     "op_impl": "torch",
                     "cache_type": "skew",
                     "pp_size": 1,
@@ -496,7 +496,7 @@ def test_priority_fcfs_skew():
     )
     infer_args = get_global_args().infer
     set_slot_handle(
-        infer_args.max_reqs,
+        infer_args.max_batch_size,
         infer_args.pp_size,
     )
 
@@ -524,7 +524,7 @@ def test_priority_fcfs_skew():
     TaskPool.add(tasks[6])
 
     scheduler = SkewScheduler(
-        infer_args.max_reqs,
+        infer_args.max_batch_size,
         cache_manager_dict=None,
         original_scheduler_type="fcfs",
         prefill_chunk_size=None,
@@ -674,7 +674,7 @@ def test_priority_request_preset_over_prefill_first_skew():
             {
                 "infer": {
                     "max_seq_len": 1024,
-                    "max_reqs": 4,
+                    "max_batch_size": 4,
                     "op_impl": "torch",
                     "cache_type": "skew",
                     "pp_size": 1,
@@ -688,7 +688,7 @@ def test_priority_request_preset_over_prefill_first_skew():
     )
     infer_args = get_global_args().infer
     set_slot_handle(
-        infer_args.max_reqs,
+        infer_args.max_batch_size,
         infer_args.pp_size,
     )
 
@@ -718,7 +718,7 @@ def test_priority_request_preset_over_prefill_first_skew():
 
     # skewScheduler's prefill_mbs == decode_mbs == 4
     scheduler = SkewScheduler(
-        infer_args.max_reqs,
+        infer_args.max_batch_size,
         cache_manager_dict=None,
         original_scheduler_type="request_preset,prefill_first",
         prefill_chunk_size=None,
@@ -1388,7 +1388,7 @@ def test_slot_group_skew():
             {
                 "infer": {
                     "max_seq_len": 1024,
-                    "max_reqs": 8,
+                    "max_batch_size": 8,
                     "op_impl": "torch",
                     "cache_type": "skew",
                     "pp_size": 2,
@@ -1402,7 +1402,7 @@ def test_slot_group_skew():
     )
     infer_args = get_global_args().infer
     set_slot_handle(
-        infer_args.max_reqs,
+        infer_args.max_batch_size,
         infer_args.pp_size,
     )
 
@@ -1431,7 +1431,7 @@ def test_slot_group_skew():
 
     # skewScheduler's prefill_mbs == decode_mbs == 4
     scheduler = SkewScheduler(
-        infer_args.max_reqs,
+        infer_args.max_batch_size,
         cache_manager_dict=None,
         original_scheduler_type="request_preset,prefill_first",
         prefill_chunk_size=None,

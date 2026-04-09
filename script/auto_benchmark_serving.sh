@@ -56,7 +56,7 @@ run_server(){
             models=Qwen3-32B \
             models.ckpt_dir=/data/nfs/Qwen3-32B \
             infer.use_cuda_graph=True \
-            infer.max_reqs=256 \
+            infer.max_batch_size=256 \
             infer.max_seq_len=2048 \
             request.max_new_tokens=1200
         "

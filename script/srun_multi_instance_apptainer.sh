@@ -42,7 +42,7 @@ usage() {
      --instances N                  创建 N 个使用默认配置的 unified 实例
      --instance-default "k=v,..."   设置所有实例的默认参数
      --instance "k=v,..."           添加一个自定义实例 (可重复; 与 --instances 互斥)
-       实例 key: tp, pp, dp, ep, max_seq_len, max_reqs, max_new_tokens,
+       实例 key: tp, pp, dp, ep, max_seq_len, max_batch_size, max_new_tokens,
                  full_warmup, nnodes, nproc, port, master_port
        含 . 的 key 自动当作 hydra override，如 infer.memory_utilization=0.90
 
@@ -61,14 +61,14 @@ usage() {
   bash script/srun_multi_instance_apptainer.sh \
     Qwen3-30B-A3B /data/nfs/Qwen3-30B-A3B /path/to/chitu.sif \
     --nodes 1 --instances 4 \
-    --instance-default "tp=2,max_seq_len=4096,max_reqs=128"
+    --instance-default "tp=2,max_seq_len=4096,max_batch_size=128"
 
   # 2 节点, 2 个 tp=8 实例 (需要逐个配置不同参数时用 --instance)
   bash script/srun_multi_instance_apptainer.sh \
     Qwen3-30B-A3B /data/nfs/Qwen3-30B-A3B /path/to/chitu.sif \
     --nodes 2 \
-    --instance "tp=8,max_seq_len=4096,max_reqs=128" \
-    --instance "tp=8,max_seq_len=8192,max_reqs=64"
+    --instance "tp=8,max_seq_len=4096,max_batch_size=128" \
+    --instance "tp=8,max_seq_len=8192,max_batch_size=64"
 EOF
 }
 
@@ -108,7 +108,10 @@ INSTANCE_MASTER_BASE_PORT="${INSTANCE_MASTER_BASE_PORT:-29510}"
 
 # 实例默认值
 INST_DEFAULT_TP=4;  INST_DEFAULT_PP=1;  INST_DEFAULT_DP=1;  INST_DEFAULT_EP=1
-INST_DEFAULT_MAX_SEQ_LEN=4096;  INST_DEFAULT_MAX_REQS=64;  INST_DEFAULT_MAX_NEW_TOKENS=4096
+INST_DEFAULT_MAX_SEQ_LEN=4096
+INST_DEFAULT_MAX_REQS=null
+INST_DEFAULT_MAX_BATCH_SIZE=64
+INST_DEFAULT_MAX_NEW_TOKENS=4096
 INST_DEFAULT_FULL_WARMUP=""
 INST_DEFAULT_SPEC=""
 
@@ -146,7 +149,7 @@ apply_instance_default() {
     [ -n "${_kv}" ] || continue
     local key="${_kv%%=*}" val="${_kv#*=}"
     case "${key}" in
-      tp|pp|dp|ep|max_seq_len|max_reqs|max_new_tokens)
+      tp|pp|dp|ep|max_seq_len|max_batch_size|max_reqs|max_new_tokens)
         printf -v "INST_DEFAULT_${key^^}" '%s' "${val}";;
       full_warmup|warmup)
         printf -v "INST_DEFAULT_FULL_WARMUP" '%s' "${val}";;
@@ -181,7 +184,8 @@ parse_instance_spec() {
   local tp="${INST_DEFAULT_TP}" pp="${INST_DEFAULT_PP}"
   local dp="${INST_DEFAULT_DP}" ep="${INST_DEFAULT_EP}"
   local max_seq_len="${INST_DEFAULT_MAX_SEQ_LEN}"
-  local max_reqs="${INST_DEFAULT_MAX_REQS}"
+  local max_reqs="${INST_DEFAULT_MAX_REQS}" # Legacy
+  local max_batch_size="${INST_DEFAULT_MAX_BATCH_SIZE}"
   local max_new_tokens="${INST_DEFAULT_MAX_NEW_TOKENS}"
   local def_full_warmup="${INST_DEFAULT_FULL_WARMUP}"
   local nnodes="" port="" master_port="" nproc="" overrides="" full_warmup=""
@@ -194,6 +198,7 @@ parse_instance_spec() {
       tp=*) tp="${_kv#*=}";; pp=*) pp="${_kv#*=}";; dp=*) dp="${_kv#*=}";; ep=*) ep="${_kv#*=}";;
       max_seq_len=*)              max_seq_len="${_kv#*=}";;
       max_reqs=*)                 max_reqs="${_kv#*=}";;
+      max_batch_size=*)           max_batch_size="${_kv#*=}";;
       max_new_tokens=*)           max_new_tokens="${_kv#*=}";;
       port=*|base_port=*)         port="${_kv#*=}";;
       master_port=*)              master_port="${_kv#*=}";;
@@ -215,14 +220,17 @@ parse_instance_spec() {
 
   INST_NNODES[idx]="${nnodes}";  INST_TP[idx]="${tp}";  INST_PP[idx]="${pp}"
   INST_DP[idx]="${dp}";          INST_EP[idx]="${ep}"
-  INST_MAX_SEQ_LEN[idx]="${max_seq_len}";  INST_MAX_REQS[idx]="${max_reqs}";  INST_MAX_NEW_TOKENS[idx]="${max_new_tokens}"
+  INST_MAX_SEQ_LEN[idx]="${max_seq_len}"
+  INST_MAX_REQS[idx]="${max_reqs}"
+  INST_MAX_BATCH_SIZE[idx]="${max_batch_size}"
+  INST_MAX_NEW_TOKENS[idx]="${max_new_tokens}"
   INST_PORT[idx]="${port}";  INST_MASTER_PORT[idx]="${master_port}"
   INST_NPROC_PER_NODE[idx]="${nproc}";  INST_OVERRIDES_SPEC[idx]="${overrides}"
 }
 
 reset_instance_arrays() {
   INST_NNODES=(); INST_TP=(); INST_PP=(); INST_DP=(); INST_EP=()
-  INST_MAX_SEQ_LEN=(); INST_MAX_REQS=(); INST_MAX_NEW_TOKENS=()
+  INST_MAX_SEQ_LEN=(); INST_MAX_REQS=(); INST_MAX_BATCH_SIZE=(); INST_MAX_NEW_TOKENS=()
   INST_PORT=(); INST_MASTER_PORT=(); INST_NPROC_PER_NODE=(); INST_OVERRIDES_SPEC=()
   INST_START_NODE=()
 }
@@ -425,7 +433,10 @@ mi_node_main() {
       --nnodes="${INST_NNODES[_idx]}" --nproc_per_node="${INST_NPROC_PER_NODE[_idx]}"
       --node_rank="${_rank}" --master_addr="${_master_addr}" --master_port="${INST_MASTER_PORT[_idx]}"
       -m chitu "${COMMON_ARGS[@]}"
-      "infer.max_seq_len=${INST_MAX_SEQ_LEN[_idx]}" "infer.max_reqs=${INST_MAX_REQS[_idx]}" "request.max_new_tokens=${INST_MAX_NEW_TOKENS[_idx]}"
+      "infer.max_seq_len=${INST_MAX_SEQ_LEN[_idx]}"
+      "infer.max_reqs=${INST_MAX_REQS[_idx]}"
+      "infer.max_batch_size=${INST_MAX_BATCH_SIZE[_idx]}"
+      "request.max_new_tokens=${INST_MAX_NEW_TOKENS[_idx]}"
       "dp_config.scheduler_base_port=${INST_PORT[_idx]}" "dp_config.dp_id=${_idx}"
       "infer.tp_size=${INST_TP[_idx]}" "infer.pp_size=${INST_PP[_idx]}" "infer.dp_size=${INST_DP[_idx]}" "infer.ep_size=${INST_EP[_idx]}"
       "${COMMON_OVERRIDES[@]}" "${_ovr[@]}"
@@ -539,7 +550,7 @@ echo "model: float16=${MODEL_FLOAT16_VARIANT} cuda_graph=${MODEL_USE_CUDA_GRAPH}
 echo "router: port=${MI_ROUTER_PORT} lb=${MI_LB_ALGORITHM}"
 echo "instances: ${INSTANCE_COUNT}"
 for i in "${!INST_NNODES[@]}"; do
-  echo "  I${i}: start_node=${INST_START_NODE[i]} nn=${INST_NNODES[i]} tp=${INST_TP[i]} pp=${INST_PP[i]} dp=${INST_DP[i]} ep=${INST_EP[i]} port=${INST_PORT[i]} max_seq_len=${INST_MAX_SEQ_LEN[i]} max_reqs=${INST_MAX_REQS[i]}"
+  echo "  I${i}: start_node=${INST_START_NODE[i]} nn=${INST_NNODES[i]} tp=${INST_TP[i]} pp=${INST_PP[i]} dp=${INST_DP[i]} ep=${INST_EP[i]} port=${INST_PORT[i]} max_seq_len=${INST_MAX_SEQ_LEN[i]} max_reqs=${INST_MAX_REQS[i]} max_batch_size=${INST_MAX_BATCH_SIZE[i]}"
 done
 [ -n "${MI_EXCLUDE}" ] && echo "exclude=${MI_EXCLUDE}"
 echo "bind_code=${MI_APPTAINER_BIND_CODE}  log=${LOG_DIR}"

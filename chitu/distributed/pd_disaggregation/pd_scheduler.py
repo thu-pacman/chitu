@@ -172,7 +172,7 @@ class PDScheduler(Scheduler):
         filtered_scheduler_type = self._filter_scheduler_type(scheduler_type)
         args = get_global_args()
         max_running_tasks = compute_local_batch_size_dist_in_dp(
-            args.infer.max_reqs, args.infer.dp_size
+            args.infer.max_batch_size, args.infer.dp_size
         )[0]
         super().__init__(
             max_running_tasks,
@@ -195,7 +195,7 @@ class PDScheduler(Scheduler):
         if self.pd_mode == PDSchedulerMode.DECODE_ONLY and args.infer.dp_size > 1:
             dp_size = args.infer.dp_size
             max_running_tasks_dist = compute_local_batch_size_dist_in_dp(
-                args.infer.max_reqs, dp_size
+                args.infer.max_batch_size, dp_size
             )
             for dp_rank in range(dp_size):
                 self.dp_schedulers.append(
@@ -223,7 +223,7 @@ class PDScheduler(Scheduler):
         self._queue_max_pending = int(
             self._kv_cfg.queue_max_pending
             if hasattr(self._kv_cfg, "queue_max_pending")
-            else args.infer.max_reqs
+            else args.infer.max_batch_size
         )
         self._queue_log_interval_s = float(
             self._kv_cfg.queue_log_interval_s
@@ -1183,7 +1183,7 @@ class DecodeOnlyScheduler(PDScheduler):
                 # 但这个设大了就会导致推理过程爆block，还不太好关联到这里，有待改进错误提示
                 # prealloc 的block 已经达到上限，incoming 队列的请求不能进来
                 break
-            # 这个判断一般走不到，is_full 是队列的硬限制，一般就等于 max_reqs
+            # 这个判断一般走不到，is_full 是队列的硬限制，一般就等于 max_batch_size
             if self._decode_prealloc_q.is_full():
                 break
             task: Task = info.get("task")

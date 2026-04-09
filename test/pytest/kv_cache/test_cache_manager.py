@@ -18,7 +18,7 @@ def setup_global_args():
             {
                 "infer": {
                     "max_seq_len": 2048,
-                    "max_reqs": 10,
+                    "max_batch_size": 10,
                     "op_impl": "torch",
                     "cache_type": "paged",
                     "schedule_overlap": True,
@@ -191,7 +191,7 @@ class TestPagedKVCacheManager:
                 {
                     "infer": {
                         "max_seq_len": 2048,
-                        "max_reqs": 10,
+                        "max_batch_size": 10,
                         "op_impl": "torch",
                         "cache_type": "paged",
                         "schedule_overlap": True,

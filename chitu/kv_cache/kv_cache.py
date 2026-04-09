@@ -484,7 +484,7 @@ class PagedKVCache(KVCacheBase):
             f"Requested realloc to {requested_num_blocks} KV blocks. "
             f"page_table_max_num_blocks={self.page_table_max_num_blocks}, "
             f"allocatable_max_num_blocks={allocatable_cap}, "
-            f"infer.max_reqs={get_global_args().infer.max_reqs}, "
+            f"infer.max_batch_size={get_global_args().infer.max_batch_size}, "
             f"infer.max_seq_len={get_global_args().infer.max_seq_len}, "
             f"prefix_caching={get_global_args().infer.enable_prefix_caching}"
         )

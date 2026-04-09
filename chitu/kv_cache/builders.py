@@ -116,7 +116,7 @@ def _device_from_args(args) -> torch.device:
 def _resolve_default_num_blocks(
     args, block_size: int, explicit_num_blocks: Optional[int]
 ) -> int:
-    num_hot_req = ceil_div(args.infer.max_reqs, args.infer.dp_size)
+    num_hot_req = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
     num_blocks = (
         args.infer.num_blocks if explicit_num_blocks is None else explicit_num_blocks
     )
@@ -165,7 +165,7 @@ def _build_main_cache_bundle(
             if spec.block_size is not None
             else default_paged_block_size_policy(args)
         )
-        num_hot_req = ceil_div(args.infer.max_reqs, args.infer.dp_size)
+        num_hot_req = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
         max_seq_len = args.infer.max_seq_len
         resolved_num_blocks = _resolve_default_num_blocks(args, block_size, num_blocks)
 
@@ -201,7 +201,7 @@ def _build_main_cache_bundle(
         main_cache = DenseKVCache(
             layer_id_map,
             max_seq_len=args.infer.max_seq_len,
-            num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
+            num_hot_req=ceil_div(args.infer.max_batch_size, args.infer.dp_size),
             device=device,
             **kvargs,
         )
@@ -218,7 +218,7 @@ def _build_linear_cache(args, *, layer_filter_fn=lambda x: x):
 
     return SingletonPagedKVCache(
         layer_id_map,
-        num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
+        num_hot_req=ceil_div(args.infer.max_batch_size, args.infer.dp_size),
         shape_per_token_dict=spec.kvargs["shape_per_token_dict"],
         device=device,
     )
@@ -232,7 +232,7 @@ def _build_indexer_cache(args):
     if spec is None:
         return None
 
-    num_hot_req = ceil_div(args.infer.max_reqs, args.infer.dp_size)
+    num_hot_req = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
 
     if args.infer.cache_type == "paged":
 

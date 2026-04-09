@@ -1040,7 +1040,7 @@ class Backend:
         # Dense KVCache and PP related
         if args.infer.cache_type == "skew":
             max_reqs_per_dp = compute_local_batch_size_dist_in_dp(
-                args.infer.max_reqs, args.infer.dp_size
+                args.infer.max_batch_size, args.infer.dp_size
             )[get_dp_group().rank_in_group]
             set_slot_handle(max_reqs_per_dp, args.infer.pp_size)
 

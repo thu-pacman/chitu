@@ -72,7 +72,7 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsUnmerged):
             checkpoint_prefix,
         )
 
-        self.max_batch_size = get_global_args().infer.max_reqs
+        self.max_batch_size = get_global_args().infer.max_batch_size
 
         self.gguf_gate_proj = CPUParameter(
             torch.empty(

@@ -83,7 +83,7 @@ class Scheduler:
     @staticmethod
     def build(args, infer_args, *, dp_rank: int):
         max_reqs_per_dp = compute_local_batch_size_dist_in_dp(
-            infer_args.max_reqs, infer_args.dp_size
+            infer_args.max_batch_size, infer_args.dp_size
         )[dp_rank]
         if infer_args.prefill_chunk_size is not None:
             prefill_chunk_size_per_dp: Optional[int] = (
@@ -653,7 +653,7 @@ class Scheduler:
 
         if len(evict_tasks) > 0:
             logger.warning(
-                f"KV cache capacity reached limit, forcing eviction of {len(evict_tasks)} decode tasks, this may impact throughput and latency. To prevent performance degradation, consider decreasing max_reqs or increasing or num_blocks."
+                f"KV cache capacity reached limit, forcing eviction of {len(evict_tasks)} decode tasks, this may impact throughput and latency. To prevent performance degradation, consider decreasing max_batch_size or increasing or num_blocks."
             )
 
         return sched_out_task_ids
@@ -766,7 +766,7 @@ class SkewScheduler(Scheduler):
 
     def __init__(
         self,
-        max_reqs: int,
+        max_batch_size: int,
         cache_manager_dict: Optional[dict],
         *,
         dp_rank: int = 0,
@@ -774,11 +774,11 @@ class SkewScheduler(Scheduler):
         prefill_chunk_size: Optional[int] = None,
     ):
         args = get_global_args()
-        self.slot_handle = SlotHandle(max_reqs, args.infer.pp_size)
+        self.slot_handle = SlotHandle(max_batch_size, args.infer.pp_size)
         super().__init__(
-            max_reqs,
-            ceil_div(max_reqs, self.slot_handle.num_slots),  # prefill_num_tasks
-            ceil_div(max_reqs, self.slot_handle.num_slots),  # decode_num_tasks
+            max_batch_size,
+            ceil_div(max_batch_size, self.slot_handle.num_slots),  # prefill_num_tasks
+            ceil_div(max_batch_size, self.slot_handle.num_slots),  # decode_num_tasks
             Scheduler._normalize_scheduler_type(original_scheduler_type),
             cache_manager_dict,
             dp_rank=dp_rank,

@@ -74,12 +74,21 @@ serve:
 
 # Configs for how chitu do the LLM inference computation.
 infer:
-  # Hard batch size limit, WITHOUT considering memory limit. This value is the global (total)
-  # value across DP ranks. If the number of concurrent requests exceeds this value, some
+  # Maximum number of concurrent inference tasks (the actual batch size limit).
+  # The actual batch size may be smaller due to memory limit, or insufficient
+  # requests. If the number of concurrent requests exceeds this value, some
   # of the requests will wait.
   #
+  # This value is the global (total) value across DP ranks.
+  #
+  # If not set, defaults to max_reqs for backward compatibility.
+  #
   # IMPORTANT: Typically, you need to set this field.
-  max_reqs: 8
+  max_batch_size: 8
+
+  # Maximum concurrent requests (running + queued). When exceeded, new inference
+  # requests are rejected with HTTP 503. If not set, defaults to max_batch_size * 2.
+  max_concurrent_requests: null
 
   # Hard sequence length limit of a single request, WITHOUT considering memory limit. This
   # is the maximum number of input and output tokens in total.
@@ -277,15 +286,16 @@ infer:
     prefill_token_dispatcher: auto # one of: auto, tp, allgather, deepep-nl
     decode_token_dispatcher: auto # one of: auto, tp, allgather, deepep-ll
 
-  # The followings are legacy parameters. They are to be removed in the future.
-  do_load: True
-  soft_fp8: false
-
   # Whether to enable prefix caching
   # - True: enable
   # - False: not enable
   # -default: False
   enable_prefix_caching: False
+
+  # The followings are legacy parameters. They are to be removed in the future.
+  do_load: True
+  soft_fp8: false
+  max_reqs: null
 
 # Configs for how chitu schedules multiple requests.
 scheduler:

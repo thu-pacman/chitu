@@ -110,7 +110,7 @@ class MoENpuDistributeTokenDispatcher(MoETokenDispatcher):
             )
 
         global_bs_for_distpatch_combine = (
-            ceil_div(get_global_args().infer.max_reqs, self.ep_group.group_size)
+            ceil_div(get_global_args().infer.max_batch_size, self.ep_group.group_size)
             * self.ep_group.group_size
             * get_global_args().infer.mtp_size
         )

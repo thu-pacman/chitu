@@ -224,26 +224,26 @@ class PDSchedulerService:
 
     def _init_scheduler(self):
         """Initialize the appropriate scheduler"""
-        max_reqs = self.args.infer.max_reqs
+        max_batch_size = self.args.infer.max_batch_size
         scheduler_type = self.args.scheduler.type
 
         if self.pd_mode == PDSchedulerMode.PREFILL_ONLY:
             self.scheduler = PrefillOnlyScheduler(
-                prefill_num_tasks=max_reqs,
+                prefill_num_tasks=max_batch_size,
                 scheduler_type=scheduler_type,
                 scheduler_id=self.rank,
             )
         elif self.pd_mode == PDSchedulerMode.DECODE_ONLY:
             self.scheduler = DecodeOnlyScheduler(
-                decode_num_tasks=max_reqs,
+                decode_num_tasks=max_batch_size,
                 scheduler_type=scheduler_type,
                 scheduler_id=self.rank,
             )
         else:
             # Unified mode - use regular scheduler but wrapped in PDScheduler
             self.scheduler = PDScheduler(
-                prefill_num_tasks=max_reqs,
-                decode_num_tasks=max_reqs,
+                prefill_num_tasks=max_batch_size,
+                decode_num_tasks=max_batch_size,
                 scheduler_type=scheduler_type,
                 pd_mode=PDSchedulerMode.UNIFIED,
                 scheduler_id=self.rank,
@@ -514,8 +514,8 @@ async def start_pd_worker_service(args, rank: int = 0):
 
     logger.info("Initializing KVManager for worker")
 
-    max_reqs = args.infer.max_reqs
-    buffer_size = max_reqs * 2
+    max_batch_size = args.infer.max_batch_size
+    buffer_size = max_batch_size * 2
     metadata_buffers = MetadataBuffers(buffer_size)
 
     disaggregation_mode = (

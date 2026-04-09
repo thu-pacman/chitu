@@ -84,7 +84,7 @@ def test_mla_prefill_ragged_qkvo(
         OmegaConf.create(
             {
                 "infer": {
-                    "max_reqs": 4,
+                    "max_batch_size": 4,
                     "op_impl": "torch",
                     "use_cuda_graph": False,
                     "tp_size": 1,
@@ -226,7 +226,7 @@ def test_mla_prefill_ragged_qo_paged_kv(
         OmegaConf.create(
             {
                 "infer": {
-                    "max_reqs": 4,
+                    "max_batch_size": 4,
                     "op_impl": "torch",
                     "use_cuda_graph": False,
                     "tp_size": 1,
@@ -381,7 +381,7 @@ def test_mla_decode_dense_kv(
         OmegaConf.create(
             {
                 "infer": {
-                    "max_reqs": bs,
+                    "max_batch_size": bs,
                     "use_cuda_graph": False,
                     "tp_size": 1,
                     "op_impl": "torch",
@@ -560,7 +560,7 @@ def test_mla_decode_paged_kv(
         OmegaConf.create(
             {
                 "infer": {
-                    "max_reqs": bs,
+                    "max_batch_size": bs,
                     "use_cuda_graph": False,
                     "tp_size": 1,
                     "op_impl": "torch",
@@ -712,7 +712,7 @@ def test_hopper_mixed_decode_paged_kv(
         OmegaConf.create(
             {
                 "infer": {
-                    "max_reqs": max(bs, 1),
+                    "max_batch_size": max(bs, 1),
                     "use_cuda_graph": False,
                     "tp_size": 1,
                     "op_impl": "torch",
@@ -851,7 +851,7 @@ def test_prefill_ragged_qkvo(
             {
                 "infer": {
                     "mla_absorb": "none",
-                    "max_reqs": 4,
+                    "max_batch_size": 4,
                     "op_impl": "torch",
                     "use_cuda_graph": False,
                     "tp_size": 1,
@@ -970,7 +970,7 @@ def test_decode_dense_kv(
                 "infer": {
                     "mla_absorb": "none",
                     "op_impl": "torch",
-                    "max_reqs": 4,
+                    "max_batch_size": 4,
                     "use_cuda_graph": False,
                     "tp_size": 1,
                     "cache_type": "skew",
@@ -1115,7 +1115,7 @@ def test_decode_paged_kv(
                 "infer": {
                     "mla_absorb": "none",
                     "op_impl": "torch",
-                    "max_reqs": 4,
+                    "max_batch_size": 4,
                     "use_cuda_graph": True if impl == "flashinfer" else False,
                     "tp_size": 1,
                     "cache_type": "paged",
