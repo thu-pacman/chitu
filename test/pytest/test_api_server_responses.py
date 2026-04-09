@@ -56,6 +56,13 @@ class DummyToolParser:
 def create_client(monkeypatch):
     monkeypatch.setattr(api_server, "server_status", True)
     monkeypatch.setattr(
+        api_server,
+        "get_global_args",
+        lambda: SimpleNamespace(
+            infer=SimpleNamespace(max_concurrent_requests=None),
+        ),
+    )
+    monkeypatch.setattr(
         serve_common,
         "get_global_args",
         lambda: SimpleNamespace(
