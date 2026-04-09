@@ -17,6 +17,7 @@ from chitu.kv_cache import (
     PagedKVCacheManager,
 )
 from chitu.kv_cache.registry import (
+    _normalize_model_type,
     apply_kv_cache_quantization_rules,
     default_paged_block_size_policy,
     get_kv_cache_spec,
@@ -62,15 +63,6 @@ class CacheBuildBundle:
 _BUILDER_REGISTRY: List[
     Tuple[int, Callable[[Any], bool], Callable[[Any, Any], CacheBuildBundle]]
 ] = []
-
-
-def _normalize_model_type(v) -> Any:
-    if isinstance(v, ModelType):
-        return v
-    try:
-        return ModelType(v)
-    except Exception:
-        return v
 
 
 def register_cache_manager_builder(
@@ -420,7 +412,7 @@ def _build_qwen3_5_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
 @register_cache_manager_builder(
     predicate=lambda args: (
         _normalize_model_type(getattr(args.models, "type", None))
-        == ModelType.DEEPSEEK_V3
+        in {ModelType.DEEPSEEK_V3}
         and getattr(args.models, "index_head_dim", None)
     ),
     priority=1,

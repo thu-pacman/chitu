@@ -119,7 +119,8 @@ def default_paged_block_size_policy(args) -> int:
 
     mla_absorb = getattr(args.infer, "mla_absorb", "none")
     if (
-        getattr(args.models, "type", None) == ModelType.DEEPSEEK_V3
+        getattr(args.models, "type", None)
+        in [ModelType.DEEPSEEK_V3, ModelType.KIMI_K2_5]
         and mla_absorb != "none"
     ):
         return 64
