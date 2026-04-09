@@ -37,7 +37,9 @@ def deepseek_v3_indexer_cache_spec(args, attn_backend_type) -> KVCacheSpec:
     )
 
 
-@register_kv_cache_spec(model_types=[ModelType.DEEPSEEK_V3], priority=1)
+@register_kv_cache_spec(
+    model_types=[ModelType.DEEPSEEK_V3, ModelType.KIMI_K2_5], priority=1
+)
 def deepseek_v3_kv_cache_spec(args, attn_backend_type) -> KVCacheSpec:
     tp = int(args.infer.tp_size)
     quant_cfg = getattr(args.models, "quant_config", None)

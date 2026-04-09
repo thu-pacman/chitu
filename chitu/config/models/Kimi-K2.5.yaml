@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - quant_config: blockint4
+  - _self_ # Config in this file overrides configs in defaults
+
+name: Kimi-K2.5
+type: kimi-k2-5
+source: "https://huggingface.co/moonshotai/Kimi-K2.5" # Just for displaying. No automatic download.
+tokenizer_type: "hf" # switched from tiktoken to hf for multimodal processor support
+processor_path: null # defaults to ckpt_dir
+vocab_size: 163840
+dim: 7168
+inter_dim: 18432
+moe_inter_dim: 2048
+n_layers: 61
+n_dense_layers: 1
+n_heads: 64
+n_routed_experts: 384
+n_shared_experts: 1
+n_activated_experts: 8
+n_expert_groups: 1
+n_limited_groups: 1
+route_scale: 2.827
+score_func: "sigmoid"
+norm_topk_prob: True
+q_lora_rank: 1536
+kv_lora_rank: 512
+qk_nope_head_dim: 128
+qk_rope_head_dim: 64
+v_head_dim: 128
+rope_theta: 50000.0
+rope_factor: 64.0
+rs_token_id: 163584
+re_token_id: 163585
+# Vision encoder configuration (MoonViT3d)
+vision_config:
+  hidden_size: 1152
+  num_hidden_layers: 27
+  num_attention_heads: 16
+  intermediate_size: 4304
+  patch_size: 14
+  init_pos_emb_height: 64
+  init_pos_emb_width: 64
+  init_pos_emb_time: 4
+  pos_emb_type: "divided_fixed"
+  merge_kernel_size: [2, 2]
+  merge_type: "sd2_tpool"
+  video_attn_type: "spatial_temporal"
+  text_hidden_size: 7168
+  media_placeholder_token_id: 163605

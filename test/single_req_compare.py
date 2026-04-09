@@ -244,7 +244,7 @@ def run(args: ServeConfig, results_ref):
     for i in range(1):
         if rank == 0:
             reqs = gen_reqs(
-                num_reqs=args.infer.max_reqs,
+                num_reqs=args.infer.max_batch_size,
                 max_new_tokens=args.request.max_new_tokens,
                 frequency_penalty=args.request.frequency_penalty,
             )

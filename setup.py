@@ -57,6 +57,7 @@ cython_unsafe_files = (
     + [
         "chitu/moe/batched_routed_activation.py",  # plum inside
         "chitu/quantization/base.py",  # plum inside
+        "chitu/quantization/blockint4.py",  # plum inside
         "__main__.py",
     ]
 )

@@ -7,7 +7,6 @@ from typing import Any, Optional, Union
 
 from omegaconf import MISSING
 
-
 ######################################################################################
 # The following are legacy configs. They might be removed at any time in the future.
 
@@ -16,6 +15,7 @@ from omegaconf import MISSING
 class InferConfigLegacy:
     do_load: bool = MISSING
     soft_fp8: bool = MISSING
+    max_reqs: Optional[int] = MISSING
 
 
 @dataclass
@@ -68,7 +68,8 @@ class InferConfig(InferConfigLegacy):
     mla_absorb: Optional[str] = MISSING
     raise_lower_bit_float_to: str = MISSING
     fuse_shared_experts: bool = MISSING
-    max_reqs: int = MISSING
+    max_batch_size: int = MISSING
+    max_concurrent_requests: Optional[int] = MISSING
     device_ids: Optional[list[int]] = MISSING
     pp_layer_partition: Optional[list[int]] = MISSING
     use_cuda_graph: bool | str = MISSING

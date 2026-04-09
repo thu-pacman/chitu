@@ -70,7 +70,7 @@ def init_moe_impl(args) -> None:
                 else 0
             ),
             hidden_dim=args.models.dim,
-            max_bs_per_dp_rank=ceil_div(args.infer.max_reqs, args.infer.dp_size),
+            max_bs_per_dp_rank=ceil_div(args.infer.max_batch_size, args.infer.dp_size),
             n_experts=n_experts,
             n_global_experts_slots=args.infer.num_experts_slots,
             prefill_token_dispatcher_impl=args.infer.moe.prefill_token_dispatcher,

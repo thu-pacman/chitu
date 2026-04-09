@@ -386,9 +386,11 @@ class Backend:
             Initialized tokenizer
         """
         model_name_lower = args.models.name.lower()
-        trust_remote_code = model_name_lower.startswith(
-            "glm-4"
-        ) or model_name_lower.startswith("glm-5")
+        trust_remote_code = (
+            model_name_lower.startswith("glm-4")
+            or model_name_lower.startswith("glm-5")
+            or model_name_lower.startswith("kimi")
+        )
         force_full_seq_decode = (
             args.models.tokenizer_force_full_seq_decode
             if hasattr(args.models, "tokenizer_force_full_seq_decode")
@@ -470,7 +472,7 @@ class Backend:
                 return RefAttnBackend
             elif should_use_hopper_mixed_backend(args):
                 return HopperMixedBackend
-            elif args.models.type == ModelType.DEEPSEEK_V3:
+            elif args.models.type in [ModelType.DEEPSEEK_V3, ModelType.KIMI_K2_5]:
                 return FlashMLABackend
             else:
                 return HybridAttnBackend
@@ -673,7 +675,11 @@ class Backend:
         Returns:
             Initialized model architecture
         """
-        if args.models.type in [ModelType.DEEPSEEK_V3, ModelType.HF_QWEN_3_MOE]:
+        if args.models.type in [
+            ModelType.DEEPSEEK_V3,
+            ModelType.KIMI_K2_5,
+            ModelType.HF_QWEN_3_MOE,
+        ]:
             QuantizationRegistry._allowed_quant_for_merge_gate_up.append("blockfp4")
 
         return Backend.build_model(
@@ -781,6 +787,7 @@ class Backend:
                 ModelType.HF_GPT_OSS,
                 ModelType.HF_MIXTRAL,
                 ModelType.DEEPSEEK_V3,
+                ModelType.KIMI_K2_5,
                 ModelType.HF_QWEN2_VL,
                 ModelType.HF_QWEN3_NEXT,
                 ModelType.HF_QWEN3_5,
@@ -1040,7 +1047,7 @@ class Backend:
         # Dense KVCache and PP related
         if args.infer.cache_type == "skew":
             max_reqs_per_dp = compute_local_batch_size_dist_in_dp(
-                args.infer.max_reqs, args.infer.dp_size
+                args.infer.max_batch_size, args.infer.dp_size
             )[get_dp_group().rank_in_group]
             set_slot_handle(max_reqs_per_dp, args.infer.pp_size)
 

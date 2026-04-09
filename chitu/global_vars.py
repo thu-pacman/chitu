@@ -220,10 +220,10 @@ def get_debug():
     return _GLOBAL_DEBUG
 
 
-def set_slot_handle(max_reqs, pp_size):
+def set_slot_handle(max_batch_size, pp_size):
     global _GLOBAL_SLOT_HANDLE
     # _ensure_var_is_not_initialized(_GLOBAL_SLOT_HANDLE, "slot_handle")
-    _GLOBAL_SLOT_HANDLE = SlotHandle(max_reqs, pp_size)
+    _GLOBAL_SLOT_HANDLE = SlotHandle(max_batch_size, pp_size)
 
 
 def _set_tensorboard_writer(args):
@@ -420,12 +420,12 @@ class GlobalMemoryBuffer:
 
 class SlotHandle:
     """
-    split max_reqs to micro_batch size
+    split max_batch_size to micro_batch size
     max_req = 10, pp_size = 3, self.slots_size = [4, 3, 3]
     """
 
-    def __init__(self, max_reqs, pp_size):
-        self.slots_size = self.split_slots(max_reqs, pp_size)
+    def __init__(self, max_batch_size, pp_size):
+        self.slots_size = self.split_slots(max_batch_size, pp_size)
         self.num_slots = len(self.slots_size)
         self.slot_idx = 0
         self.slot_start_idx = []

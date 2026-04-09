@@ -390,6 +390,56 @@ def normalize_dialog(dialog):
     return new_dialog
 
 
+def _collect_images_from_dialog(dialog):
+    """Collect PIL images from dialog messages that contain image content."""
+    from PIL import Image
+
+    images = []
+    for msg in dialog:
+        content = msg.get("content", [])
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "image":
+                    images.append(Image.open(item["image"]).convert("RGB"))
+    return images
+
+
+def _extract_vision_outputs(result):
+    """Extract (input_ids, pixel_values, grid_thw) from processor output."""
+    grid_thw_key = "image_grid_thw" if "image_grid_thw" in result else "grid_thws"
+    pv = result["pixel_values"]
+    if pv.ndim > 2:
+        pv = pv.flatten(1)
+    return (
+        result["input_ids"].reshape(-1).tolist(),
+        pv,
+        result[grid_thw_key],
+    )
+
+
+def _encode_kimi_vl(hf_proc, dialog, chat_template_kwargs):
+    """Two-step encoding for Kimi K2.5 VL: expand media_pad tokens, then call processor."""
+    text = hf_proc.apply_chat_template(
+        dialog,
+        tokenize=False,
+        add_generation_prompt=True,
+        **chat_template_kwargs,
+    )
+
+    images = _collect_images_from_dialog(dialog)
+
+    media_pad = "<|media_pad|>"
+    for img in images:
+        num_tokens = hf_proc.media_processor.media_tokens_calculator(
+            {"type": "image", "image": img}
+        )
+        text = text.replace(media_pad, media_pad * num_tokens, 1)
+
+    medias = [{"type": "image", "image": img} for img in images]
+    result = hf_proc(text=[text], medias=medias, return_tensors="pt")
+    return _extract_vision_outputs(result)
+
+
 class ChatFormatHF:
     def __init__(self, tokenizer: TokenizerHF, processor: Processor):
         self.tokenizer = tokenizer
@@ -415,22 +465,29 @@ class ChatFormatHF:
         chat_template_kwargs: Mapping[str, Any] = {},
     ):
         if self.processor:
+            normalized = normalize_dialog(dialog)
             inputs = self.processor.apply_chat_template(
-                normalize_dialog(dialog),
+                normalized,
                 tokenize=True,
                 return_dict=True,
                 add_generation_prompt=True,
                 return_tensors="pt",
                 **chat_template_kwargs,
             )
+
+            # Qwen VL style: apply_chat_template returns pixel_values directly.
             if "pixel_values" in inputs:
-                return (
-                    inputs["input_ids"].reshape(-1).tolist(),
-                    inputs["pixel_values"],
-                    inputs["image_grid_thw"],
-                )
-            else:
-                return inputs["input_ids"].reshape(-1).tolist()
+                return _extract_vision_outputs(inputs)
+
+            # Kimi K2.5 style: apply_chat_template only tokenizes text.
+            # Need a second pass to process images via media_processor.
+            hf_proc = self.processor.processor
+            if hasattr(hf_proc, "media_processor") and _collect_images_from_dialog(
+                normalized
+            ):
+                return _encode_kimi_vl(hf_proc, normalized, chat_template_kwargs)
+
+            return inputs["input_ids"].reshape(-1).tolist()
 
         if hasattr(self.tokenizer.model, "apply_chat_template"):
             chat_template_kwargs = chat_template_kwargs or {}

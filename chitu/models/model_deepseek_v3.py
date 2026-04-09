@@ -1084,7 +1084,7 @@ class TransformerBlockDeepSeekV3MTP(TransformerBlockDeepSeekV3):
         )
         self.eh_proj = torch.nn.Linear(args.dim * 2, args.dim, bias=False)
         self.max_batch_size_per_dp = ceil_div(
-            int(getattr(get_global_args().infer, "max_reqs", 1)), get_dp_size()
+            int(getattr(get_global_args().infer, "max_batch_size", 1)), get_dp_size()
         )
         self.shared_head = SharedHeadDeepSeekV3(args, self.max_batch_size_per_dp)
         if not getattr(args, "mtp_tie_word_embeddings", False):

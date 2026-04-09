@@ -59,7 +59,7 @@ class ServeConfigRules(Callback):
                     f"model {model_name} is not compatible with flash_infer"
                 )
         elif attn_type == "flash_mla":
-            if "deepseek-v3" not in model_type:
+            if model_type not in ["deepseek-v3", "kimi-k2-5"]:
                 self._exit_with_error(
                     f"model {model_name} is not compatible with flash_mla"
                 )

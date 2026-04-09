@@ -43,11 +43,11 @@ usage() {
              decode_max_running_tasks_per_dp
 
   4. Prefill/Decode 特有, 可重复:
-     --prefill "tp=8,pp=2,dp=1,ep=1,max_seq_len=6144,max_reqs=256,chunk=57344,full_warmup=True"
-     --decode  "tp=1,pp=1,dp=16,ep=16,max_seq_len=6144,max_reqs=512,full_warmup=True"
+     --prefill "tp=8,pp=2,dp=1,ep=1,max_seq_len=6144,max_batch_size=256,chunk=57344,full_warmup=True"
+     --decode  "tp=1,pp=1,dp=16,ep=16,max_seq_len=6144,max_batch_size=512,full_warmup=True"
      --prefill-default "tp=4,pp=2,..."    (批量设置 prefill 默认值)
      --decode-default  "tp=1,pp=1,..."    (批量设置 decode 默认值)
-       实例 key: tp, pp, dp, ep, max_seq_len, max_reqs, max_new_tokens,
+       实例 key: tp, pp, dp, ep, max_seq_len, max_batch_size, max_new_tokens,
                  chunk(仅prefill), full_warmup, nnodes, nproc, port, master_port
        含 . 的 key 自动当作 hydra override，如 infer.memory_utilization=0.90
 
@@ -69,8 +69,8 @@ usage() {
     --nodes 4 --router-port 21006 \
     --model-spec "attn_type=flash_mla,mla_absorb=absorb-without-precomp" \
     --pd-spec "decode_wait_timeout_s=1200,decode_prealloc_max_pending=256,decode_prealloc_token_budget=350000,decode_prealloc_reserved_tokens=1024,decode_max_running_tasks_per_dp=30" \
-    --prefill "tp=8,pp=2,dp=1,ep=1,max_seq_len=6144,max_reqs=256,full_warmup=True,infer.memory_utilization=0.90" \
-    --decode  "tp=1,pp=1,dp=16,ep=16,max_seq_len=6144,max_reqs=512,full_warmup=True"
+    --prefill "tp=8,pp=2,dp=1,ep=1,max_seq_len=6144,max_batch_size=256,full_warmup=True,infer.memory_utilization=0.90" \
+    --decode  "tp=1,pp=1,dp=16,ep=16,max_seq_len=6144,max_batch_size=512,full_warmup=True"
 EOF
 }
 
@@ -118,10 +118,16 @@ DECODE_MASTER_BASE_PORT="${DECODE_MASTER_BASE_PORT:-29520}"
 
 # 实例默认值
 PREFILL_DEFAULT_TP=4;  PREFILL_DEFAULT_PP=2;  PREFILL_DEFAULT_DP=1;  PREFILL_DEFAULT_EP=1
-PREFILL_DEFAULT_MAX_SEQ_LEN=4096;  PREFILL_DEFAULT_MAX_REQS=64;  PREFILL_DEFAULT_MAX_NEW_TOKENS=4096
+PREFILL_DEFAULT_MAX_SEQ_LEN=4096
+PREFILL_DEFAULT_MAX_REQS=null
+PREFILL_DEFAULT_MAX_BATCH_SIZE=64
+PREFILL_DEFAULT_MAX_NEW_TOKENS=4096
 PREFILL_DEFAULT_FULL_WARMUP=""
 DECODE_DEFAULT_TP=1;   DECODE_DEFAULT_PP=1;   DECODE_DEFAULT_DP=16;  DECODE_DEFAULT_EP=16
-DECODE_DEFAULT_MAX_SEQ_LEN=4096;   DECODE_DEFAULT_MAX_REQS=64;   DECODE_DEFAULT_MAX_NEW_TOKENS=4096
+DECODE_DEFAULT_MAX_SEQ_LEN=4096
+DECODE_DEFAULT_MAX_REQS=null
+DECODE_DEFAULT_MAX_BATCH_SIZE=64
+DECODE_DEFAULT_MAX_NEW_TOKENS=4096
 DECODE_DEFAULT_FULL_WARMUP=""
 PREFILL_DEFAULT_SPEC=""
 DECODE_DEFAULT_SPEC=""
@@ -183,7 +189,7 @@ apply_default_spec() {
     [ -n "${_kv}" ] || continue
     local key="${_kv%%=*}" val="${_kv#*=}"
     case "${key}" in
-      tp|pp|dp|ep|max_seq_len|max_reqs|max_new_tokens)
+      tp|pp|dp|ep|max_seq_len|max_batch_size|max_reqs|max_new_tokens)
         printf -v "${KIND}_DEFAULT_${key^^}" '%s' "${val}";;
       full_warmup|warmup)
         printf -v "${KIND}_DEFAULT_FULL_WARMUP" '%s' "${val}";;
@@ -253,6 +259,7 @@ parse_instance_spec() {
   _v="${KIND}_DEFAULT_EP";                 local ep="${!_v}"
   _v="${KIND}_DEFAULT_MAX_SEQ_LEN";        local max_seq_len="${!_v}"
   _v="${KIND}_DEFAULT_MAX_REQS";           local max_reqs="${!_v}"
+  _v="${KIND}_DEFAULT_MAX_BATCH_SIZE";     local max_batch_size="${!_v}"
   _v="${KIND}_DEFAULT_MAX_NEW_TOKENS";     local max_new_tokens="${!_v}"
   _v="${KIND}_DEFAULT_FULL_WARMUP";        local def_full_warmup="${!_v}"
   local nnodes="" port="" master_port="" nproc="" overrides="" chunk="" full_warmup=""
@@ -265,6 +272,7 @@ parse_instance_spec() {
       tp=*) tp="${_kv#*=}";; pp=*) pp="${_kv#*=}";; dp=*) dp="${_kv#*=}";; ep=*) ep="${_kv#*=}";;
       max_seq_len=*)              max_seq_len="${_kv#*=}";;
       max_reqs=*)                 max_reqs="${_kv#*=}";;
+      max_batch_size=*)           max_batch_size="${_kv#*=}";;
       max_new_tokens=*)           max_new_tokens="${_kv#*=}";;
       port=*|base_port=*)         port="${_kv#*=}";;
       master_port=*)              master_port="${_kv#*=}";;
@@ -292,18 +300,21 @@ parse_instance_spec() {
   # 写入数组（nameref，安全无 eval）
   local -n _o_nn="${KIND}_NNODES"      _o_tp="${KIND}_TP"       _o_pp="${KIND}_PP"
   local -n _o_dp="${KIND}_DP"          _o_ep="${KIND}_EP"
-  local -n _o_msl="${KIND}_MAX_SEQ_LEN"   _o_mr="${KIND}_MAX_REQS"   _o_mnt="${KIND}_MAX_NEW_TOKENS"
+  local -n _o_msl="${KIND}_MAX_SEQ_LEN"   _o_mr="${KIND}_MAX_REQS" _o_mbs="${KIND}_MAX_BATCH_SIZE"  _o_mnt="${KIND}_MAX_NEW_TOKENS"
   local -n _o_pt="${KIND}_PORT"           _o_mpt="${KIND}_MASTER_PORT"
   local -n _o_np="${KIND}_NPROC_PER_NODE" _o_ov="${KIND}_OVERRIDES_SPEC"
   _o_nn[idx]="${nnodes}";  _o_tp[idx]="${tp}";  _o_pp[idx]="${pp}"
   _o_dp[idx]="${dp}";      _o_ep[idx]="${ep}"
-  _o_msl[idx]="${max_seq_len}";  _o_mr[idx]="${max_reqs}";  _o_mnt[idx]="${max_new_tokens}"
+  _o_msl[idx]="${max_seq_len}"
+  _o_mr[idx]="${max_reqs}"
+  _o_mbs[idx]="${max_batch_size}"
+  _o_mnt[idx]="${max_new_tokens}"
   _o_pt[idx]="${port}";  _o_mpt[idx]="${master_port}"
   _o_np[idx]="${nproc}";  _o_ov[idx]="${overrides}"
 }
 
 reset_instance_arrays() {
-  for _a in NNODES TP PP DP EP MAX_SEQ_LEN MAX_REQS MAX_NEW_TOKENS PORT MASTER_PORT NPROC_PER_NODE OVERRIDES_SPEC; do
+  for _a in NNODES TP PP DP EP MAX_SEQ_LEN MAX_REQS MAX_BATCH_SIZE MAX_NEW_TOKENS PORT MASTER_PORT NPROC_PER_NODE OVERRIDES_SPEC; do
     eval "PREFILL_${_a}=(); DECODE_${_a}=()"
   done
   PREFILL_START_NODE=(); DECODE_START_NODE=()
@@ -555,7 +566,7 @@ pd_node_main() {
 
     local -n _li="LOCAL_${KIND}_IDX" _lg="LOCAL_${KIND}_GPU_LIST" _lr="LOCAL_${KIND}_NODE_RANK"
     local -n _a_nn="${KIND}_NNODES"  _a_tp="${KIND}_TP"  _a_pp="${KIND}_PP"  _a_dp="${KIND}_DP"  _a_ep="${KIND}_EP"
-    local -n _a_msl="${KIND}_MAX_SEQ_LEN" _a_mr="${KIND}_MAX_REQS" _a_mnt="${KIND}_MAX_NEW_TOKENS"
+    local -n _a_msl="${KIND}_MAX_SEQ_LEN" _a_mr="${KIND}_MAX_REQS" _a_mbs="${KIND}_MAX_BATCH_SIZE" _a_mnt="${KIND}_MAX_NEW_TOKENS"
     local -n _a_pt="${KIND}_PORT" _a_mpt="${KIND}_MASTER_PORT" _a_np="${KIND}_NPROC_PER_NODE"
     local -n _a_sn="${KIND}_START_NODE" _a_ovr="${KIND}_OVERRIDES_SPEC"
 
@@ -572,7 +583,10 @@ pd_node_main() {
         --nnodes="${_a_nn[_idx]}" --nproc_per_node="${_a_np[_idx]}"
         --node_rank="${_rank}" --master_addr="${_master_addr}" --master_port="${_a_mpt[_idx]}"
         -m chitu "${COMMON_ARGS[@]}"
-        "infer.max_seq_len=${_a_msl[_idx]}" "infer.max_reqs=${_a_mr[_idx]}" "request.max_new_tokens=${_a_mnt[_idx]}"
+        "infer.max_seq_len=${_a_msl[_idx]}"
+        "infer.max_reqs=${_a_mr[_idx]}"
+        "infer.max_batch_size=${_a_mbs[_idx]}"
+        "request.max_new_tokens=${_a_mnt[_idx]}"
         "dp_config.scheduler_base_port=${_a_pt[_idx]}" "dp_config.dp_id=$((dp_offset + _idx))"
         "scheduler.type=${sched_type}"
         "infer.tp_size=${_a_tp[_idx]}" "infer.pp_size=${_a_pp[_idx]}" "infer.dp_size=${_a_dp[_idx]}" "infer.ep_size=${_a_ep[_idx]}"
@@ -690,10 +704,10 @@ echo "model=${MODEL_CONFIG}  ckpt=${MODEL_CKPT_DIR}  sif=${PD_SIF_FILE}"
 echo "model: float16=${MODEL_FLOAT16_VARIANT} cuda_graph=${MODEL_USE_CUDA_GRAPH} schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
 echo "instances: prefill=${PREFILL_COUNT} decode=${DECODE_COUNT}"
 for i in "${!PREFILL_NNODES[@]}"; do
-  echo "  P${i}: nn=${PREFILL_NNODES[i]} tp=${PREFILL_TP[i]} pp=${PREFILL_PP[i]} dp=${PREFILL_DP[i]} ep=${PREFILL_EP[i]} max_seq_len=${PREFILL_MAX_SEQ_LEN[i]} max_reqs=${PREFILL_MAX_REQS[i]}"
+  echo "  P${i}: nn=${PREFILL_NNODES[i]} tp=${PREFILL_TP[i]} pp=${PREFILL_PP[i]} dp=${PREFILL_DP[i]} ep=${PREFILL_EP[i]} max_seq_len=${PREFILL_MAX_SEQ_LEN[i]} max_reqs=${PREFILL_MAX_REQS[i]} max_batch_size=${PREFILL_MAX_BATCH_SIZE[i]}"
 done
 for i in "${!DECODE_NNODES[@]}"; do
-  echo "  D${i}: nn=${DECODE_NNODES[i]} tp=${DECODE_TP[i]} pp=${DECODE_PP[i]} dp=${DECODE_DP[i]} ep=${DECODE_EP[i]} max_seq_len=${DECODE_MAX_SEQ_LEN[i]} max_reqs=${DECODE_MAX_REQS[i]}"
+  echo "  D${i}: nn=${DECODE_NNODES[i]} tp=${DECODE_TP[i]} pp=${DECODE_PP[i]} dp=${DECODE_DP[i]} ep=${DECODE_EP[i]} max_seq_len=${DECODE_MAX_SEQ_LEN[i]} max_reqs=${DECODE_MAX_REQS[i]} max_batch_size=${DECODE_MAX_BATCH_SIZE[i]}"
 done
 [ -n "${PD_EXCLUDE}" ] && echo "exclude=${PD_EXCLUDE}"
 echo "bind_code=${PD_APPTAINER_BIND_CODE}  log=${LOG_DIR}"

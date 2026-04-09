@@ -746,15 +746,15 @@ class NormLinearCPUInfer(QuantizedLinearBase):
                 ),
                 requires_grad=False,
             )
-            max_reqs = get_global_args().infer.max_reqs
+            max_batch_size = get_global_args().infer.max_batch_size
             self.input_cpu = StaticTensor(
-                max_nelem=max_reqs * self.in_features,
+                max_nelem=max_batch_size * self.in_features,
                 device="cpu",
                 pin_memory=True,
                 dtype=torch.get_default_dtype(),
             )
             self.output_cpu = StaticTensor(
-                max_nelem=max_reqs * self.out_features,
+                max_nelem=max_batch_size * self.out_features,
                 device="cpu",
                 pin_memory=True,
                 dtype=torch.get_default_dtype(),
@@ -850,7 +850,7 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
         self.moe_inter_dim = moe_inter_dim * get_tp_size()
         self.dim = dim
         self.fuse_shared_experts = fuse_shared_experts
-        self.max_batch_size = get_global_args().infer.max_reqs
+        self.max_batch_size = get_global_args().infer.max_batch_size
         self.n_shared_experts = n_shared_experts
         self.n_fused_shared_experts = (
             n_shared_experts if self.fuse_shared_experts else 0

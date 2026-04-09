@@ -15,7 +15,7 @@ def setup_global_args():
             {
                 "infer": {
                     "max_seq_len": 1024,
-                    "max_reqs": 10,
+                    "max_batch_size": 10,
                     "op_impl": "torch",
                     "cache_type": "paged",
                     "schedule_overlap": True,

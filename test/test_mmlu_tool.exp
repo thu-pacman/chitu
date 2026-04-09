@@ -45,7 +45,7 @@ set cmd "torchrun --nproc_per_node $world_size_arg -m chitu \
   serve.port=21002 \
   models.ckpt_dir=$model_dir_arg \
   infer.cache_type=paged \
-  infer.max_reqs=$eval_batch_size_arg \
+  infer.max_batch_size=$eval_batch_size_arg \
   infer.max_seq_len=8192 \
   $ATNN_TYPE_ARG \
   infer.tp_size=$tp_size_arg \

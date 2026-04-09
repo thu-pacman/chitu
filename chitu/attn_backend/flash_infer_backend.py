@@ -35,7 +35,7 @@ class FlashInferBackend(TritonAttnBackend):
         # - For KV, we need to convert `block_table` to CSR format.
         # These buffers must be allocated when initializing
         # `flashinfer.mla.BatchMLAPagedAttentionWrapper` when cuda graph is enabled
-        max_batch_size_per_dp = ceil_div(self.args.infer.max_reqs, get_dp_size())
+        max_batch_size_per_dp = ceil_div(self.args.infer.max_batch_size, get_dp_size())
         self.head_dim = (
             self.args.models.head_dim
             if hasattr(self.args.models, "head_dim")

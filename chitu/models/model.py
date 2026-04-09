@@ -267,7 +267,7 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.global_n_layers = params.n_layers + (1 if self.mtp_size > 1 else 0)
         self.max_batch_size_per_dp = ceil_div(
-            int(getattr(get_global_args().infer, "max_reqs", 1)), get_dp_size()
+            int(getattr(get_global_args().infer, "max_batch_size", 1)), get_dp_size()
         )
         if self.pipeline_exec:
             num_layers_of_each_rank = compute_layer_dist_in_pp(
@@ -381,6 +381,8 @@ class Transformer(nn.Module):
             ret += ["fp_weight"]
         elif quant == "ascend_w8a8_dynamic":
             ret += ["weight_scale", "weight_offset"]
+        elif quant == "blockint4":
+            ret += ["qweight", "scales"]
         return ret
 
     def _get_2d_in_x_out_tensor_names(self, quant) -> list[str]:
@@ -1537,7 +1539,7 @@ class Transformer(nn.Module):
             if is_ascend() and not (
                 infer_args.cache_type == "skew"
                 and NpuAttnBackend.should_use_attn_from_cinfer_ascendc(
-                    self.args.models.type, infer_args.max_reqs
+                    self.args.models.type, infer_args.max_batch_size
                 )
             ):
                 before_replay_callback = lambda graph: graph.update(
@@ -1702,7 +1704,7 @@ class MoeGate(nn.Module):
         if self._debug_force_moe_balance:
             self._debug_force_moe_balance_mask_cache = (
                 self._debug_gen_force_moe_balance_mask(
-                    ceil_div(get_global_args().infer.max_reqs, get_dp_size())
+                    ceil_div(get_global_args().infer.max_batch_size, get_dp_size())
                 )
             )
 

@@ -399,7 +399,7 @@ bash script/srun_pd_disagg_base_apptainer.sh <MODEL_CONFIG> <MODEL_CKPT_DIR> <SI
 | Router | `--router-port PORT` `--config-name NAME` `--bind-code 0|1`                       | Router 配置                                                 |
 
 
-**实例参数支持的 key：** `tp`, `pp`, `dp`, `ep`, `max_seq_len`, `max_reqs`, `max_new_tokens`, `chunk`(仅 prefill), `full_warmup`, `nnodes`, `nproc`。含 `.` 的 key 自动作为 Hydra override（如 `infer.memory_utilization=0.90`）。
+**实例参数支持的 key：** `tp`, `pp`, `dp`, `ep`, `max_seq_len`, `max_batch_size`, `max_new_tokens`, `chunk`(仅 prefill), `full_warmup`, `nnodes`, `nproc`。含 `.` 的 key 自动作为 Hydra override（如 `infer.memory_utilization=0.90`）。
 
 #### 示例 1：DeepSeek-R1（4 节点，1P1D，PP=2）
 
@@ -411,8 +411,8 @@ bash script/srun_pd_disagg_base_apptainer.sh \
   --nodes 4 --router-port 21006 \
   --model-spec "attn_type=flash_mla,mla_absorb=absorb-without-precomp" \
   --pd-spec "decode_wait_timeout_s=1200,decode_prealloc_max_pending=256,decode_prealloc_token_budget=350000,decode_prealloc_reserved_tokens=1024,decode_max_running_tasks_per_dp=30" \
-  --prefill "tp=8,pp=2,dp=1,ep=1,max_seq_len=6144,max_reqs=256,full_warmup=True,infer.memory_utilization=0.90" \
-  --decode "tp=1,pp=1,dp=16,ep=16,max_seq_len=6144,max_reqs=512,full_warmup=True,infer.use_cuda_graph=True" \
+  --prefill "tp=8,pp=2,dp=1,ep=1,max_seq_len=6144,max_batch_size=256,full_warmup=True,infer.memory_utilization=0.90" \
+  --decode "tp=1,pp=1,dp=16,ep=16,max_seq_len=6144,max_batch_size=512,full_warmup=True,infer.use_cuda_graph=True" \
   --bind-code 1
 ```
 
@@ -426,9 +426,9 @@ bash script/srun_pd_disagg_base_apptainer.sh \
   --nodes 4 --router-port 21006 \
   --model-spec "attn_type=flash_mla" \
   --pd-spec "decode_wait_timeout_s=1200,decode_prealloc_max_pending=256,decode_prealloc_token_budget=350000,decode_prealloc_reserved_tokens=1024,decode_max_running_tasks_per_dp=30" \
-  --prefill "tp=4,pp=2,dp=1,ep=1,max_seq_len=6144,max_reqs=256,full_warmup=True,infer.memory_utilization=0.90" \
-  --prefill "tp=4,pp=2,dp=1,ep=1,max_seq_len=6144,max_reqs=256,full_warmup=True,infer.memory_utilization=0.90" \
-  --decode "tp=1,pp=1,dp=16,ep=16,max_seq_len=6144,max_reqs=512,full_warmup=True,infer.use_cuda_graph=True" \
+  --prefill "tp=4,pp=2,dp=1,ep=1,max_seq_len=6144,max_batch_size=256,full_warmup=True,infer.memory_utilization=0.90" \
+  --prefill "tp=4,pp=2,dp=1,ep=1,max_seq_len=6144,max_batch_size=256,full_warmup=True,infer.memory_utilization=0.90" \
+  --decode "tp=1,pp=1,dp=16,ep=16,max_seq_len=6144,max_batch_size=512,full_warmup=True,infer.use_cuda_graph=True" \
   --bind-code 1
 ```
 

@@ -351,7 +351,7 @@ def _warmup_via_taskpool(args):
     logger.info("Starting inference system warmup...")
 
     init_cache_static()
-    num_warmup_reqs = args.infer.max_reqs
+    num_warmup_reqs = args.infer.max_batch_size
     prefill_chunk_size = args.infer.prefill_chunk_size
     _mtp_size = get_global_args().infer.mtp_size
     _n_decode_steps = 2 if get_global_args().infer.schedule_overlap else 1
@@ -369,7 +369,7 @@ def _warmup_via_taskpool(args):
             "infer.prefill_chunk_size is not set, GPU memory usage estimation may be incorrect (may cause OOM)"
         )
         warmup_seq_len = 1
-        prefill_chunk_size = args.infer.max_seq_len * args.infer.max_reqs
+        prefill_chunk_size = args.infer.max_seq_len * args.infer.max_batch_size
     if rank == 0:
         for i in range(num_warmup_reqs):
             req = MockFixedLengthedUserRequest(
@@ -388,7 +388,7 @@ def _warmup_via_taskpool(args):
     # Prefill phase
     # In DP chunk prefill, each schedule processes approximately `prefill_chunk_size` tokens across the whole DP group.
     # Due to per-rank budget constraints and uneven task distribution, some tokens may be left unprocessed.
-    # Example: DP2, chunk=16, max_reqs=5 (创建 5 个 warmup 任务), 每任务 3 tokens
+    # Example: DP2, chunk=16, max_batch_size=5 (创建 5 个 warmup 任务), 每任务 3 tokens
     #   - Budget: Rank0=8, Rank1=8 (chunk_size 均分给各 rank)
     #   - Tasks: Rank0 分到 3 个任务 (round robin), Rank1 分到 2 个任务
     #   - Actual: Rank0 处理 8 tokens (3+3+2, task4 剩 1 token), Rank1 处理 6 tokens (3+3)
@@ -615,7 +615,7 @@ def warmup_engine(args):
         if runner == "direct":
             logger.info("[warmup] full_warmup enabled, skip base warmup")
         _log_skip_prefill()
-        max_reqs_per_dp = ceil_div(args.infer.max_reqs, args.infer.dp_size)
+        max_reqs_per_dp = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
         if args.infer.pp_size > 1:
             if (
                 args.scheduler.pp_config.pp_micro_batch_size_decode == "max"
@@ -706,6 +706,20 @@ def chitu_init(args):
             "Argument `infer.do_load=False` is deprecated. Use `debug.skip_model_load=True` instead."
         )
         args.debug.skip_model_load = True
+    if hasattr(args.infer, "max_reqs") and args.infer.max_reqs is not None:
+        args.infer.max_batch_size = args.infer.max_reqs
+        logger.warning(
+            f"Argument `infer.max_reqs={args.infer.max_reqs}` is deprecated. Use `infer.max_batch_size={args.infer.max_batch_size}` instead."
+        )
+    # max_concurrent_requests default: max_batch_size * 2
+    if getattr(args.infer, "max_concurrent_requests", None) is not None:
+        pass
+    else:
+        args.infer.max_concurrent_requests = args.infer.max_batch_size * 2
+        logger.info(
+            f"infer.max_concurrent_requests not set, defaulting to max_batch_size * 2 ({args.infer.max_concurrent_requests})"
+        )
+
     if (
         hasattr(args.scheduler.pp_config, "prefill_num_tasks_divided_by_pp")
         and not args.scheduler.pp_config.prefill_num_tasks_divided_by_pp
@@ -751,15 +765,18 @@ def chitu_init(args):
 
     if (
         args.infer.prefill_chunk_size is not None
-        and args.infer.prefill_chunk_size > args.infer.max_reqs * args.infer.max_seq_len
+        and args.infer.prefill_chunk_size
+        > args.infer.max_batch_size * args.infer.max_seq_len
     ):
         logger.warning(
             f"infer.prefill_chunk_size ({args.infer.prefill_chunk_size}) is larger than "
-            f"infer.max_reqs ({args.infer.max_reqs}) * infer.max_seq_len "
-            f"({args.infer.max_seq_len}), which has no effect. Reducing it to infer.max_reqs "
-            f" * infer.max_seq_len."
+            f"infer.max_batch_size ({args.infer.max_batch_size}) * infer.max_seq_len "
+            f"({args.infer.max_seq_len}), which has no effect. Reducing it to "
+            f"infer.max_batch_size * infer.max_seq_len."
         )
-        args.infer.prefill_chunk_size = args.infer.max_reqs * args.infer.max_seq_len
+        args.infer.prefill_chunk_size = (
+            args.infer.max_batch_size * args.infer.max_seq_len
+        )
 
     if args.infer.prefill_chunk_size is not None:
         if args.infer.pp_size > 1 and args.infer.cache_type == "skew":
@@ -862,9 +879,9 @@ def chitu_init(args):
         else:
             args.infer.mla_absorb = "none"
 
-    if args.infer.dp_size > args.infer.max_reqs:
+    if args.infer.dp_size > args.infer.max_batch_size:
         raise ValueError(
-            f"infer.dp_size ({args.infer.dp_size}) cannot be greater than infer.max_reqs ({args.infer.max_reqs})"
+            f"infer.dp_size ({args.infer.dp_size}) cannot be greater than infer.max_batch_size ({args.infer.max_batch_size})"
         )
 
     # Check checkpoint exists
@@ -894,7 +911,7 @@ def chitu_init(args):
             ]
         executor = Executor.build(args)
         Backend.executor = executor
-        PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
+        PackedTasks.configure(max_num_tasks=args.infer.max_batch_size)
         logger.info("Chitu has been initialized")
 
         collector = PrometheusMetricsCollector.get_instance(is_create=True)

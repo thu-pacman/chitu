@@ -272,8 +272,8 @@ set srun_out "${log_dir}/srun.out"
 set model_tag $model_config
 regsub -all {[^A-Za-z0-9_.-]} $model_tag "_" model_tag
 
-set prefill_spec "tp=2,pp=1,dp=1,ep=1,max_seq_len=5200,max_reqs=128,chunk=65536,full_warmup=False"
-set decode_spec "tp=1,pp=1,dp=4,ep=4,max_seq_len=6144,max_reqs=256,full_warmup=False"
+set prefill_spec "tp=2,pp=1,dp=1,ep=1,max_seq_len=5200,max_batch_size=128,chunk=65536,full_warmup=False"
+set decode_spec "tp=1,pp=1,dp=4,ep=4,max_seq_len=6144,max_batch_size=256,full_warmup=False"
 
 set cmd_parts [list bash script/srun_pd_disagg_base_apptainer.sh \
     $model_config $model_ckpt_dir $apptainer_image \
