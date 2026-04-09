@@ -141,6 +141,7 @@ infer:
   # - "triton": Use chitu's built-in triton backend. This requires running on a platform
   #   supporting Triton.
   # - "npu": Use operators dedicated for Ascend NPUs.
+  # - "hopper_mixed": Special hybrid backend for running sparse attention on Hopper GPUs.
   # - "ref": Use chitu's built-in reference backend. This is backend has full support for
   #   different types of attention, but it is very slow and consumes much memory.
   attn_type: auto

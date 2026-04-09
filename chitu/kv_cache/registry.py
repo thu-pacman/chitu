@@ -114,7 +114,9 @@ def default_paged_block_size_policy(args) -> int:
     if attn_type == "hunyuan_attn":
         return 64
 
-    if should_use_hopper_mixed_backend(args):
+    if attn_type == "hopper_mixed" or (
+        attn_type == "auto" and should_use_hopper_mixed_backend(args)
+    ):
         return 1
 
     mla_absorb = getattr(args.infer, "mla_absorb", "none")
