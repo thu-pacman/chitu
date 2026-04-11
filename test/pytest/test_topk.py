@@ -3,7 +3,6 @@ import torch
 
 from chitu.utils import try_import_platform_dep
 from chitu.ops import topk_indices
-from chitu.batched_seq_len import BatchedSeqLenDelta
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 

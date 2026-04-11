@@ -2,16 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import functools
-import operator
 import os
-import gc
-import math
 import time
 import traceback
 from logging import getLogger
 from typing import Optional
-import psutil
 import random
 import re
 import traceback
@@ -24,7 +19,6 @@ import zmq.asyncio
 import msgpack
 
 from chitu.backend import Backend, BackendState
-from chitu.kv_cache import PagedKVCache, PagedKVCacheManager
 from chitu.device_type import is_nvidia, has_accelerator
 from chitu.executor import Executor
 from chitu.global_vars import (
@@ -174,9 +168,6 @@ def _auto_set_num_blocks_after_warmup(args):
     main_cap = main_cm.get_allocatable_max_num_blocks()
     reserve_bytes = 512 << 20  # 512 MiB
 
-    final_main_target = int(main_current)
-    final_indexer_target = None
-
     if indexer_cm is not None:
         solved_main = solve_main_target_after_shrink(
             args=args,
@@ -216,6 +207,7 @@ def _auto_set_num_blocks_after_warmup(args):
         )
         final_main_target = allreduce_min_int(int(final_main_target))
         final_main_target = clamp_int(int(final_main_target), 1, int(main_cap))
+        final_indexer_target = None
 
     # If main needs shrink, do it early to release memory before any later growth.
     main_current = int(main_cm.num_blocks)
@@ -871,7 +863,7 @@ def chitu_init(args):
 
     if args.infer.mla_absorb == "auto":
         if args.models.type == ModelType.DEEPSEEK_V3:
-            if args.models.name.lower() == "GLM-5-FP8".lower():
+            if args.models.name.lower() in {"GLM-5-FP8".lower(), "GLM-5.1-FP8".lower()}:
                 # GLM-5-FP8's quantization blocking stops using absorb-without-precomp
                 args.infer.mla_absorb = "absorb"
             else:

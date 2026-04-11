@@ -242,6 +242,7 @@ COPY --from=dependency_resolver /tmp/requirements.txt /tmp/requirements.txt
 
 COPY ./third_party ./third_party
 COPY ./csrc/cpuinfer ./csrc/cpuinfer
+COPY ./pypi-links ./pypi-links
 
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
@@ -250,7 +251,9 @@ COPY ./csrc/cpuinfer ./csrc/cpuinfer
 # 2. pytorch 一般都要使用和具体卡以及其他基础软件（如 cuda）版本相关的版本。
 # 3. 如果没有 --no-build-isolation ，pip 会在构建时用单独的环境重新下载所有构建时依赖，此时无法指定上述版本。
 RUN pip install --no-build-isolation -r /tmp/requirements.txt \
-        -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "pytest") --extra-index-url https://pypi.org/simple
+        -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "pytest") \
+        --find-links ./pypi-links \
+        --timeout 60 --retries 10
 
 RUN set -eux; \
     VER="$(python -c "import importlib.metadata as m; \

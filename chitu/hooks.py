@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from chitu.task import PackedTasksBase
-from chitu.distributed.parallel_state import get_pp_group
 from chitu.distributed.pd_disaggregation.pd_log_utils import (
     pd_trace_enabled,
     pd_verbose_enabled,

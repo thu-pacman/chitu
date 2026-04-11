@@ -5,7 +5,7 @@ import torch
 from omegaconf import OmegaConf
 
 from chitu.backend import Backend
-from chitu.kv_cache import GlobalLocalMap, PagedKVCacheManager
+from chitu.kv_cache import PagedKVCacheManager
 from chitu.distributed.parallel_state import initialize_parallel_groups
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 import chitu.global_vars as global_vars

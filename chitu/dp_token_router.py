@@ -19,10 +19,8 @@ import logging
 from typing_extensions import override
 
 from chitu.async_response import AsyncDataStream, AsyncResponse
-from chitu.backend import Backend
 from chitu.task import UserRequest
 from chitu.dp_request_router import get_request_router
-from chitu.serve.event_loop import get_server_event_loop
 from chitu.reasoning import ReasoningParams
 
 logger = logging.getLogger(__name__)

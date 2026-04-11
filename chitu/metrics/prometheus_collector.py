@@ -16,7 +16,6 @@ from chitu.backend import Backend
 from chitu.distributed.parallel_state import get_dp_group, get_tp_group, get_pp_group
 from chitu.distributed.tcp_ip import get_local_ip, get_free_port
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -571,7 +570,6 @@ class PrometheusMetricsCollector:
                 )
         except Exception as e:
             logger.error(f"update_kvcache_usage failed: {e}")
-            pass
 
     @classmethod
     def update_GPU_usage(cls):

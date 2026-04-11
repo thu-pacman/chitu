@@ -5,7 +5,7 @@
 import time
 import math
 from logging import getLogger
-from typing import Optional, TYPE_CHECKING
+from typing import Optional
 from typing_extensions import override
 from collections import deque, defaultdict
 

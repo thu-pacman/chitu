@@ -803,10 +803,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         # This matches the dense Qwen3.5 adapter and avoids subtle MRoPE mismatches.
         rope_scaling = getattr(self.params, "rope_scaling", None)
         if rope_scaling is not None and not isinstance(rope_scaling, dict):
-            try:
-                rope_scaling = dict(rope_scaling)
-            except Exception:
-                rope_scaling = rope_scaling
+            rope_scaling = dict(rope_scaling)
         if isinstance(rope_scaling, dict):
             # Qwen3.5 checkpoints store rope_type="mrope" with MRoPE hints; HF expects "default".
             if rope_scaling.get("rope_type") == "mrope":

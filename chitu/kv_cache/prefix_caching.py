@@ -2,12 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from enum import Enum
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Optional, Any
 import pickle
-
 
 # NONE_BLK_HASH must be deterministic across processes/ranks.
 NONE_BLK_HASH = "0" * 64

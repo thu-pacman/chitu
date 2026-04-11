@@ -4,7 +4,6 @@
 
 import asyncio
 import threading
-import functools
 import time
 from datetime import datetime
 from logging import getLogger
