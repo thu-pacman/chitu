@@ -20,7 +20,6 @@ import torch
 from chitu.task_type import TaskType
 from chitu.async_response import AsyncDataStream
 from chitu.backend import Backend
-from chitu.device_list import DeviceList
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.tool_call import ToolChoice, ToolCallParams, adjust_message_for_tool_calls
 from chitu.reasoning import get_reasoning_params, update_chat_template_kwargs_reasoning

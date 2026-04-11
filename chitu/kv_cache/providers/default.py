@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from chitu.kv_cache.registry import KVCacheSpec, register_kv_cache_spec
-from chitu.models.registry import ModelType
 
 
 @register_kv_cache_spec(priority=-1000)

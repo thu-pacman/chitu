@@ -13,7 +13,7 @@ from enum import Enum
 from glob import glob
 from logging import getLogger
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional, Iterable
+from typing import TYPE_CHECKING, Callable, Optional
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
@@ -33,29 +33,16 @@ from chitu.attn_backend import (
 )
 
 from chitu.kv_cache.registry import should_use_hopper_mixed_backend
-from chitu.kv_cache import (
-    KVCacheManagerBase,
-    PagedKVCacheManager,
-    PagedKVCache,
-    KVCacheBase,
-    DenseKVCache,
-    SingletonPagedKVCache,
-    GlobalLocalMap,
-    MMPagedKVCache,
-)
+from chitu.kv_cache import KVCacheManagerBase, PagedKVCache, KVCacheBase
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
 from chitu.distributed.parallel_state import (
     get_world_group,
-    get_pp_group,
     get_ep_group,
     get_dp_group,
     initialize_parallel_groups,
 )
-from chitu.distributed.partition import (
-    compute_local_batch_size_dist_in_dp,
-    compute_layer_dist_in_pp,
-)
+from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
 from chitu.quantization import (
@@ -74,7 +61,8 @@ from chitu.tokenizer import (
 )
 from chitu.utils import try_import_opt_dep
 from chitu.tool_call import get_tool_parser, patch_chat_template
-from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div, get_global_args
+from chitu.utils import parse_dtype
+from chitu.import_utils import try_import_opt_dep
 from chitu.moe import init_moe_impl
 from chitu.global_vars import set_slot_handle
 from chitu.numa_utils import bind_process_to_numa
@@ -951,8 +939,6 @@ class Backend:
                     f"Error loading tensors into model part by prefix {target_prefix}"
                 ) from e
 
-            del state_dict
-
         # Load non-layer weights
         for checkpoint_prefix, model_prefix in model._get_non_layer_prefix_mappings():
             _load_and_apply(checkpoint_prefix, model_prefix)
@@ -979,7 +965,6 @@ class Backend:
             )
             local_layer_id = global_layer_id - model.local_begin_layer_id
 
-            layer_prefix = f"layers.{global_layer_id}."
             local_layer_prefix = f"layers.{local_layer_id}."
             _load_and_apply(
                 checkpoint_prefix,
@@ -1000,7 +985,6 @@ class Backend:
                 )
                 local_layer_id = global_layer_id - model.local_begin_layer_id
 
-                layer_prefix = f"layers.{global_layer_id}."
                 local_layer_prefix = f"layers.{local_layer_id}."
                 _load_and_apply(
                     checkpoint_prefix,

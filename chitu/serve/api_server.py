@@ -501,7 +501,6 @@ async def tokenize(raw_request: Request):
             raise HTTPException(
                 status_code=503, detail="Chat formatter not available on this endpoint"
             )
-        enable_thinking = request.enable_thinking
         tools = []
         tool_choice: ToolChoice = "auto"
         with suppress(ValidationError):
@@ -1009,7 +1008,6 @@ def init_dp_router(args):
 
     # Basic initialization
     from chitu.chitu_main import init_logger
-    from chitu.global_vars import set_global_args
 
     init_logger()
     set_global_args(args)

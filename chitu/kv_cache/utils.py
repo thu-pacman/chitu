@@ -8,15 +8,12 @@ import math
 import torch
 import psutil
 from logging import getLogger
-import torch.distributed as dist
-
-from typing import Callable, Iterable, Tuple, Dict, Optional
+from typing import Callable, Iterable
 
 from chitu.kv_cache import GlobalLocalMap
 from chitu.distributed.parallel_state import get_pp_group
 from chitu.distributed.partition import compute_layer_dist_in_pp
 from chitu.utils import get_global_args
-
 
 logger = getLogger(__name__)
 

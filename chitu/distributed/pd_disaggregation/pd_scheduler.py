@@ -1208,7 +1208,7 @@ class DecodeOnlyScheduler(PDScheduler):
                 prefix_len = int(getattr(task, "prefix_tokens_len", 0))
 
                 task.prompt_to_token_block(dp_rank=target_dp_rank)
-                kv_cache_manager: "PagedKVCacheManager" = Backend.cache_managers[
+                kv_cache_manager: PagedKVCacheManager = Backend.cache_managers[
                     target_dp_rank
                 ]["main"]
 

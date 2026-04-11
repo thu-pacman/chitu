@@ -11,7 +11,6 @@ from chitu.utils import ceil_div
 from chitu.kv_cache import TokenBlock, NONE_BLK_HASH
 from weakref import WeakValueDictionary
 from collections import defaultdict
-from chitu.task_type import TaskType
 
 if TYPE_CHECKING:
     from chitu.task import Task
