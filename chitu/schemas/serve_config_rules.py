@@ -45,10 +45,11 @@ class ServeConfigRules(Callback):
             "flash_infer",
             "triton",
             "npu",
+            "hopper_mixed",
             "ref",
         }:
             self._exit_with_error(
-                f"attn_type must be one of [auto, flash_attn, flash_mla, flash_infer, triton, npu, ref], got {attn_type}"
+                f"attn_type must be one of [auto, flash_attn, flash_mla, flash_infer, triton, npu, hopper_mixed, ref], got {attn_type}"
             )
 
         model_name = config.models.name
@@ -59,7 +60,7 @@ class ServeConfigRules(Callback):
                     f"model {model_name} is not compatible with flash_infer"
                 )
         elif attn_type == "flash_mla":
-            if "deepseek-v3" not in model_type:
+            if model_type not in ["deepseek-v3", "kimi-k2-5"]:
                 self._exit_with_error(
                     f"model {model_name} is not compatible with flash_mla"
                 )

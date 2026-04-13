@@ -10,7 +10,6 @@ import torch
 
 from chitu.attn_backend.triton_attn_backend import TritonAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.static_tensor import StaticTensor
 from chitu.kv_cache import PagedKVCacheAccessor
 from chitu.ops import append_to_paged_kv_cache, read_from_paged_kv_cache
 from chitu.utils import try_import_opt_dep, ceil_div

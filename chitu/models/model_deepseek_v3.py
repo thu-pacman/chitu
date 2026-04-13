@@ -58,6 +58,7 @@ from chitu.ops import (
     append_to_paged_kv_cache,
     append_to_dense_kv_cache,
     hadamard_transform,
+    topk_indices,
 )
 from chitu.quantization import (
     QuantizationRegistry,
@@ -74,10 +75,11 @@ from chitu.tensor_parallel import (
     LocalLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+    LmHeadColumnParallelLinear,
 )
-from chitu.distributed.parallel_state import get_tp_size, get_etp_size
+from chitu.distributed.parallel_state import get_tp_size, get_etp_size, get_dp_size
 from chitu.distributed.partition import compute_expert_dist_in_ep
-from chitu.utils import parse_dtype, try_import_and_setup_torch_npu
+from chitu.utils import ceil_div, parse_dtype, try_import_and_setup_torch_npu
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -184,7 +186,7 @@ class Indexer(torch.nn.Module):
         k_fp8, k_scale = blockfp8_act_quant(k, block_size=self.block_size)
 
         weights = self.weights_proj(x) * self.n_heads**-0.5
-        q_scale = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
         delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
         delta_pos_ids = seq_len_delta.delta_position_ids_tensor_device
@@ -210,7 +212,7 @@ class Indexer(torch.nn.Module):
             )
             index_score = blockfp8_index_score_ragged_q_paged_k_dsv32(
                 q_fp8,
-                q_scale,
+                weights,
                 cache_accessor.kv["indexer_k"],
                 cache_accessor.kv["indexer_ks"],
                 seq_len_delta=seq_len_delta,
@@ -228,7 +230,7 @@ class Indexer(torch.nn.Module):
             )
             index_score = blockfp8_index_score_ragged_q_dense_k_dsv32(
                 q_fp8,
-                q_scale,
+                weights,
                 cache_accessor.kv["indexer_k"],
                 cache_accessor.kv["indexer_ks"],
                 seq_len_delta=seq_len_delta,
@@ -240,9 +242,11 @@ class Indexer(torch.nn.Module):
 
         # Ensure k does not exceed the actual size of index_score
         k = min(self.index_topk, index_score.size(-1))
-        _, topk_indices = index_score.topk(k, dim=-1)
+        indices = topk_indices(
+            index_score, k, lengths=seq_len_delta.delta_position_ids_tensor_device + 1
+        )
         # shape: [bs_seq_q, k]. May select some out-of-range items as -inf, which is fine
-        return topk_indices
+        return indices
 
     def _rotate_activation(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dtype == torch.bfloat16
@@ -664,7 +668,7 @@ class AttentionDeepSeekV3(Attention):
 
 
 class SharedHeadDeepSeekV3(nn.Module):
-    def __init__(self, args) -> None:
+    def __init__(self, args, decode_max_num_tokens: int) -> None:
         super().__init__()
 
         self.norm = RMSNorm(
@@ -679,9 +683,10 @@ class SharedHeadDeepSeekV3(nn.Module):
 
         self.mtp_tie_lm_head = getattr(args, "mtp_tie_lm_head", False)
         if not self.mtp_tie_lm_head:
-            self.head = ColumnParallelLinear(
+            self.head = LmHeadColumnParallelLinear(
                 args.dim,
                 args.vocab_size,
+                decode_max_num_tokens=decode_max_num_tokens,
                 has_bias=False,
                 gather_output=True,
                 checkpoint_prefix="mtp.head",
@@ -1078,9 +1083,16 @@ class TransformerBlockDeepSeekV3MTP(TransformerBlockDeepSeekV3):
             eps=getattr(args, "rms_norm_eps", 1e-6),
         )
         self.eh_proj = torch.nn.Linear(args.dim * 2, args.dim, bias=False)
-        self.shared_head = SharedHeadDeepSeekV3(args)
+        self.max_batch_size_per_dp = ceil_div(
+            int(getattr(get_global_args().infer, "max_batch_size", 1)), get_dp_size()
+        )
+        self.shared_head = SharedHeadDeepSeekV3(args, self.max_batch_size_per_dp)
         if not getattr(args, "mtp_tie_word_embeddings", False):
-            self.embed_tokens = VocabParallelEmbedding(args.vocab_size, args.dim)
+            self.embed_tokens = VocabParallelEmbedding(
+                args.vocab_size,
+                args.dim,
+                decode_max_num_tokens=self.max_batch_size_per_dp,
+            )
 
     @override
     def forward(
@@ -1665,7 +1677,9 @@ class TransformerDeepSeekV3(Transformer):
     @override
     def _init_pre_layers(self):
         self.embed_tokens = VocabParallelEmbedding(
-            self.params.vocab_size, self.params.dim
+            self.params.vocab_size,
+            self.params.dim,
+            decode_max_num_tokens=self.max_batch_size_per_dp * self.mtp_size,
         )
 
     @override
@@ -1714,9 +1728,10 @@ class TransformerDeepSeekV3(Transformer):
             ),
             eps=getattr(self.params, "rms_norm_eps", 1e-6),
         )
-        self.lm_head = ColumnParallelLinear(
+        self.lm_head = LmHeadColumnParallelLinear(
             self.params.dim,
             self.params.vocab_size,
+            decode_max_num_tokens=self.max_batch_size_per_dp * self.mtp_size,
             has_bias=False,
             gather_output=True,
             checkpoint_prefix="lm_head",
@@ -1724,21 +1739,38 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def _pre_layers(self, h, **args):
-        return self.embed_tokens(h)
+        if self.specialize_embed_tokens_lm_head_parallel:
+            return self.embed_tokens(
+                h, self.global_embed_num_tokens, self.embed_tokens_cum_num_tokens
+            )
+        else:
+            return self.embed_tokens(h)
 
     @override
     def _pre_layers_mtp(self, h, **args):
         if not getattr(self.params, "mtp_tie_word_embeddings", False):
-            h = self.layers[-1].embed_tokens(h)
+            embed_tokens = self.layers[-1].embed_tokens
         else:
-            h = self.embed_tokens(h)
+            embed_tokens = self.embed_tokens
+
+        if self.specialize_embed_tokens_lm_head_parallel:
+            h = embed_tokens(
+                h, self.global_embed_num_tokens, self.embed_tokens_cum_num_tokens
+            )
+        else:
+            h = embed_tokens(h)
         return h
 
     @override
     def _post_layers(self, h):
         """NOTE: _post_layers is assumed to be a token-wise computation"""
         h = self.norm(h, compute_dtype=h.dtype)
-        h = self.lm_head(h)
+        if self.specialize_embed_tokens_lm_head_parallel:
+            h = self.lm_head(
+                h, self.global_lm_head_num_tokens, self.lm_head_cum_num_tokens
+            )
+        else:
+            h = self.lm_head(h)
         return h
 
     @override

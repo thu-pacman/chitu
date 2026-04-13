@@ -12,7 +12,7 @@
     url = https://github.com/Dao-AILab/flash-attention.git
 [submodule "third_party/DeepGEMM"]
     path = third_party/DeepGEMM
-    url = https://github.com/deepseek-ai/DeepGEMM.git
+    url = https://github.com/QingCheng-AI/DeepGEMM.git
 [submodule "third_party/llama.cpp"]
     path = third_party/llama.cpp
     url = https://github.com/ggml-org/llama.cpp.git

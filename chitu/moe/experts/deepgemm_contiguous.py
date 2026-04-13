@@ -37,6 +37,7 @@ def deepgemm_contiguous_fused_expert(
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
     raise ValueError(f"Unsupported hidden_states type: {type(hidden_states)}")
@@ -130,6 +131,7 @@ def _(
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
     hidden_states = hidden_states.as_local_expert_ids(
@@ -149,6 +151,7 @@ def _(
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         block_shape=block_shape,
+        round_scale_to_pow2=round_scale_to_pow2,
         experts_start_idx=experts_start_idx,
     )
 
@@ -267,11 +270,15 @@ def _(
     )
 
     if w1.dtype == torch.float8_e4m3fn:
-        hidden_states_fp8, scale = blockfp8_act_quant(
-            hidden_states.activation,
-            block_size=quant_block_size,
-            round_scale_to_pow2=round_scale_to_pow2,
-        )
+        if isinstance(hidden_states, IndexedBatchedRoutedActivationBlockfp8):
+            hidden_states_fp8 = hidden_states.activation
+            scale = hidden_states.activation_scale
+        else:
+            hidden_states_fp8, scale = blockfp8_act_quant(
+                hidden_states.activation,
+                block_size=quant_block_size,
+                round_scale_to_pow2=round_scale_to_pow2,
+            )
         hidden_states = IndexedBatchedRoutedActivationBlockfp8(
             activation=hidden_states_fp8,
             activation_scale=scale,

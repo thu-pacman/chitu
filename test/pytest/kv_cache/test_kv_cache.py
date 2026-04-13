@@ -15,7 +15,7 @@ def setup_global_args():
             {
                 "infer": {
                     "max_seq_len": 1024,
-                    "max_reqs": 10,
+                    "max_batch_size": 10,
                     "op_impl": "torch",
                     "cache_type": "paged",
                     "schedule_overlap": True,
@@ -23,6 +23,7 @@ def setup_global_args():
                     "mtp_size": 1,
                     "dp_size": 1,
                     "use_cuda_graph": True,
+                    "enable_prefix_caching": False,
                 }
             }
         ),

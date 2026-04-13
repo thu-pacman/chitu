@@ -24,6 +24,8 @@ from chitu.serve.common import start_worker
 from chitu.serve.scheduler import init_dp_scheduler
 from chitu.utils import get_config_dir_path, get_chitu_env
 
+logger = getLogger(__name__)
+
 
 @hydra.main(
     version_base=None,
@@ -70,5 +72,7 @@ def main(args: ServeConfig):
         api_server.server_status = True
         start_worker()
 
+        # Worker loop exited (termination signal received)
+        logger.info(f"[Rank {rank}] Worker loop finished.")
         if rank == 0:
             uvicorn_thread.join()

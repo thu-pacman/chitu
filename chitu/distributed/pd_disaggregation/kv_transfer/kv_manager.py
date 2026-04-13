@@ -50,8 +50,6 @@ from chitu.distributed.pd_disaggregation.pd_log_utils import (
     pd_trace_enabled,
     pd_verbose_enabled,
 )
-from chitu.ops import append_to_paged_kv_cache
-from chitu.utils import ceil_div
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -3005,7 +3003,6 @@ class KVManager:
                 # Reserve only the blocks required for the prefix length when available.
                 # Reserving `max_blocks_per_req` for every request can quickly exhaust decode-side blocks
                 # as batch size increases (especially when block_size is small, e.g., 256).
-                prefix_len = int(prefix_lens[idx] if idx < len(prefix_lens) else 0)
 
                 dst_indices = cache_ids_list[idx]
                 dst_indices_np = np.asarray(dst_indices, dtype=np.int32)

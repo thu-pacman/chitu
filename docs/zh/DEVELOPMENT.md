@@ -265,7 +265,7 @@ torchrun --nproc_per_node 8 test/single_req_test.py \
     infer.cache_type=paged \
     infer.attn_type=flash_mla \
     infer.mla_absorb=absorb-without-precomp \
-    infer.max_reqs=1 \
+    infer.max_batch_size=1 \
     infer.max_seq_len=512 \
     request.max_new_tokens=100
 ```
@@ -355,7 +355,7 @@ torchrun --nnodes 1 \
     models.ckpt_dir=/data/DeepSeek-R1 \
     infer.mla_absorb=absorb-without-precomp \
     infer.raise_lower_bit_float_to=bfloat16 \
-    infer.max_reqs=1 \
+    infer.max_batch_size=1 \
     scheduler.pp_config.pp_micro_batch_size_prefill=8 \
     scheduler.pp_config.pp_micro_batch_size_decode=auto \
     infer.max_seq_len=4096 \
@@ -477,7 +477,7 @@ torchrun --nproc_per_node 1 test/single_req_test.py \
     request.prompt_tokens_len=128 \
     request.max_new_tokens=64 \
     infer.max_seq_len=192 \
-    infer.max_reqs=8 
+    infer.max_batch_size=8 
 ```
 ### 使用给定的配置预处理模型的 state_dict 并将其保存到新的检查点（checkpoint），并在将来跳过预处理
 
@@ -532,7 +532,7 @@ torchrun --nproc_per_node 1 \
     infer.cache_type=paged \
     infer.attn_type=flash_mla \
     infer.mla_absorb=absorb-without-precomp \
-    infer.max_reqs=1 \
+    infer.max_batch_size=1 \
     infer.max_seq_len=256 \
     request.max_new_tokens=100
 ```
@@ -563,7 +563,7 @@ torchrun --nnodes 1 \
     models.ckpt_dir=/data/DeepSeek-R1 \
     infer.mla_absorb=absorb-without-precomp \
     infer.raise_lower_bit_float_to=bfloat16 \
-    infer.max_reqs=1 \
+    infer.max_batch_size=1 \
     infer.max_seq_len=4096 \
     request.max_new_tokens=100 \
     infer.use_cuda_graph=True
@@ -630,6 +630,15 @@ curl localhost:21002/v1/messages \
   }'
 ```
 
+优雅终止引擎和 API 服务（需要 `{"confirm": true}` 以防止误操作）。已在处理的请求会在服务退出前完成，终止发起后新请求将被拒绝。
+
+```bash
+curl localhost:21002/terminate_engine \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"confirm": true}'
+```
+
 OpenAI 兼容、OpenAI Responses 兼容和 Anthropic 兼容接口的参数说明请参见 [API_PARAMETERS.md](./API_PARAMETERS.md)。
 
 ### Grafana 监控面板
@@ -661,7 +670,7 @@ torchrun --nnodes 1 \
     infer.cache_type=paged \
     infer.attn_type=flash_mla \
     infer.mla_absorb=absorb-without-precomp \
-    infer.max_reqs=8 \
+    infer.max_batch_size=8 \
     infer.max_seq_len=4096 \
     metrics.grafana_enabled=true \
     metrics.grafana_host=0.0.0.0 \

@@ -59,7 +59,7 @@ bash "$SRUN_PATH" "$NODE" "$NUM_GPU_PER_NODE" \
     infer.cache_type=paged \
     infer.attn_type=flash_mla \
     infer.num_blocks=100 \
-    infer.max_reqs="$MAX_NUM_REQS" \
+    infer.max_batch_size="$MAX_NUM_REQS" \
     infer.max_seq_len="$MAX_SEQ_LEN" \
     benchmark.iters="$ITERS" \
     benchmark.num_reqs_list="$NUM_REQS_LIST" \

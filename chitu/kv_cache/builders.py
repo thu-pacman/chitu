@@ -17,6 +17,7 @@ from chitu.kv_cache import (
     PagedKVCacheManager,
 )
 from chitu.kv_cache.registry import (
+    _normalize_model_type,
     apply_kv_cache_quantization_rules,
     default_paged_block_size_policy,
     get_kv_cache_spec,
@@ -24,7 +25,6 @@ from chitu.kv_cache.registry import (
 from chitu.kv_cache.utils import build_layer_id_map
 from chitu.models.registry import ModelType
 from chitu.utils import ceil_div
-
 
 logger = getLogger(__name__)
 
@@ -63,15 +63,6 @@ class CacheBuildBundle:
 _BUILDER_REGISTRY: List[
     Tuple[int, Callable[[Any], bool], Callable[[Any, Any], CacheBuildBundle]]
 ] = []
-
-
-def _normalize_model_type(v) -> Any:
-    if isinstance(v, ModelType):
-        return v
-    try:
-        return ModelType(v)
-    except Exception:
-        return v
 
 
 def register_cache_manager_builder(
@@ -117,7 +108,7 @@ def _device_from_args(args) -> torch.device:
 def _resolve_default_num_blocks(
     args, block_size: int, explicit_num_blocks: Optional[int]
 ) -> int:
-    num_hot_req = ceil_div(args.infer.max_reqs, args.infer.dp_size)
+    num_hot_req = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
     num_blocks = (
         args.infer.num_blocks if explicit_num_blocks is None else explicit_num_blocks
     )
@@ -131,8 +122,11 @@ def _resolve_default_num_blocks(
         args.infer.prefill_chunk_size,
         args.infer.dp_size,
     )
+
+    # We run 1 prefill step + 1 decode step during warmup, each producing 1 token of output,
+    # thus +2.
     return int(
-        ceil_div(local_prefill_chunk_size // num_hot_req + 1, block_size) * num_hot_req
+        ceil_div(local_prefill_chunk_size // num_hot_req + 2, block_size) * num_hot_req
     )
 
 
@@ -166,7 +160,7 @@ def _build_main_cache_bundle(
             if spec.block_size is not None
             else default_paged_block_size_policy(args)
         )
-        num_hot_req = ceil_div(args.infer.max_reqs, args.infer.dp_size)
+        num_hot_req = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
         max_seq_len = args.infer.max_seq_len
         resolved_num_blocks = _resolve_default_num_blocks(args, block_size, num_blocks)
 
@@ -202,7 +196,7 @@ def _build_main_cache_bundle(
         main_cache = DenseKVCache(
             layer_id_map,
             max_seq_len=args.infer.max_seq_len,
-            num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
+            num_hot_req=ceil_div(args.infer.max_batch_size, args.infer.dp_size),
             device=device,
             **kvargs,
         )
@@ -219,7 +213,7 @@ def _build_linear_cache(args, *, layer_filter_fn=lambda x: x):
 
     return SingletonPagedKVCache(
         layer_id_map,
-        num_hot_req=ceil_div(args.infer.max_reqs, args.infer.dp_size),
+        num_hot_req=ceil_div(args.infer.max_batch_size, args.infer.dp_size),
         shape_per_token_dict=spec.kvargs["shape_per_token_dict"],
         device=device,
     )
@@ -233,33 +227,47 @@ def _build_indexer_cache(args):
     if spec is None:
         return None
 
-    block_size = (
-        int(spec.block_size)
-        if spec.block_size is not None
-        else default_paged_block_size_policy(args)
-    )
+    num_hot_req = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
 
-    num_hot_req = ceil_div(args.infer.max_reqs, args.infer.dp_size)
-    mtp_extra = args.infer.mtp_size if args.infer.mtp_size > 1 else 0
-    auto_num_blocks = (
-        ceil_div(args.infer.max_seq_len + mtp_extra, block_size) * num_hot_req
-    )
+    if args.infer.cache_type == "paged":
 
-    resolved_num_blocks = (
-        int(args.infer.num_blocks)
-        if args.infer.num_blocks != -1
-        else int(auto_num_blocks)
-    )
+        block_size = (
+            int(spec.block_size)
+            if spec.block_size is not None
+            else default_paged_block_size_policy(args)
+        )
 
-    return PagedKVCache(
-        layer_id_map,
-        num_hot_req=num_hot_req,
-        max_seq_len=args.infer.max_seq_len,
-        num_blocks=resolved_num_blocks,
-        block_size=block_size,
-        device=device,
-        **spec.kvargs,
-    )
+        mtp_extra = args.infer.mtp_size if args.infer.mtp_size > 1 else 0
+        auto_num_blocks = (
+            ceil_div(args.infer.max_seq_len + mtp_extra, block_size) * num_hot_req
+        )
+
+        resolved_num_blocks = (
+            int(args.infer.num_blocks)
+            if args.infer.num_blocks != -1
+            else int(auto_num_blocks)
+        )
+
+        return PagedKVCache(
+            layer_id_map,
+            num_hot_req=num_hot_req,
+            max_seq_len=args.infer.max_seq_len,
+            num_blocks=resolved_num_blocks,
+            block_size=block_size,
+            device=device,
+            **spec.kvargs,
+        )
+
+    if args.infer.cache_type == "skew":
+        return DenseKVCache(
+            layer_id_map,
+            num_hot_req=num_hot_req,
+            max_seq_len=args.infer.max_seq_len,
+            device=device,
+            **spec.kvargs,
+        )
+
+    raise ValueError(f"Unknown cache type {args.infer.cache_type} for Indexer")
 
 
 def _build_multimodal_cache(
@@ -274,6 +282,9 @@ def _build_multimodal_cache(
         ModelType.HF_QWEN3_VL_MOE,
         ModelType.HF_QWEN3_5,
     }:
+        return None
+
+    if args.models.type == ModelType.HF_QWEN3_5 and args.infer.language_model_only:
         return None
 
     if args.infer.enable_prefix_caching:
@@ -325,6 +336,8 @@ def _build_multimodal_cache(
 @register_cache_manager_builder(model_types=[ModelType.HF_QWEN3_NEXT], priority=2)
 def _build_qwen3_next_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
     def is_full_attention(layer_id: int) -> bool:
+        if args.infer.mtp_size > 1 and layer_id == args.models.n_layers:
+            return True
         return (layer_id + 1) % args.models.full_attention_interval == 0
 
     def filter_full(layers: Iterable[int]):
@@ -360,6 +373,8 @@ def _build_qwen3_next_cache_managers(args, attn_backend_type) -> CacheBuildBundl
 @register_cache_manager_builder(model_types=[ModelType.HF_QWEN3_5], priority=3)
 def _build_qwen3_5_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
     def is_full_attention(layer_id: int) -> bool:
+        if args.infer.mtp_size > 1 and layer_id == args.models.n_layers:
+            return True
         return (layer_id + 1) % args.models.full_attention_interval == 0
 
     def filter_full(layers: Iterable[int]):
@@ -400,7 +415,7 @@ def _build_qwen3_5_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
 @register_cache_manager_builder(
     predicate=lambda args: (
         _normalize_model_type(getattr(args.models, "type", None))
-        == ModelType.DEEPSEEK_V3
+        in {ModelType.DEEPSEEK_V3}
         and getattr(args.models, "index_head_dim", None)
     ),
     priority=1,

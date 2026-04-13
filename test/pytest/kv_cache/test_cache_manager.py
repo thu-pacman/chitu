@@ -1,11 +1,11 @@
 import pytest
-from chitu.kv_cache import PagedKVCacheManager, TokenBlock, PagedKVCache, NONE_BLK_HASH
+from chitu.kv_cache import PagedKVCacheManager, TokenBlock, NONE_BLK_HASH
 from weakref import WeakValueDictionary
 from collections import deque
 from chitu.task import MockFixedLengthedUserRequest, Task
 from chitu.task_type import TaskType
 from omegaconf import OmegaConf
-from chitu.global_vars import set_global_args, get_global_args
+from chitu.global_vars import set_global_args
 from chitu.backend import Backend
 from chitu.utils import ceil_div
 
@@ -18,7 +18,7 @@ def setup_global_args():
             {
                 "infer": {
                     "max_seq_len": 2048,
-                    "max_reqs": 10,
+                    "max_batch_size": 10,
                     "op_impl": "torch",
                     "cache_type": "paged",
                     "schedule_overlap": True,
@@ -191,7 +191,7 @@ class TestPagedKVCacheManager:
                 {
                     "infer": {
                         "max_seq_len": 2048,
-                        "max_reqs": 10,
+                        "max_batch_size": 10,
                         "op_impl": "torch",
                         "cache_type": "paged",
                         "schedule_overlap": True,
@@ -293,7 +293,7 @@ class TestPagedKVCacheManagerWithPrefixCaching:
             == block2
         )
         assert block2.blk_hash == block1.blk_hash
-        assert block2.pre_blk_hash == block2.pre_blk_hash
+        assert block2.pre_blk_hash == block1.pre_blk_hash
 
     def test_task_life_cycle_in_cache_manager(
         self, cache_manager_with_prefix_caching: PagedKVCacheManager

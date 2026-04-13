@@ -9,6 +9,7 @@ from chitu.attn_backend import (
     FlashAttnBackend,
     FlashInferBackend,
     FlashMLABackend,
+    HopperMixedBackend,
     NpuAttnBackend,
 )
 from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
@@ -28,6 +29,9 @@ flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+flash_attn3, has_flash_attn3 = try_import_opt_dep(
+    "flash_attn_interface", "flash_attn_interface"
+)
 
 
 @pytest.mark.parametrize("bs", [0, 1, 3])
@@ -80,7 +84,7 @@ def test_mla_prefill_ragged_qkvo(
         OmegaConf.create(
             {
                 "infer": {
-                    "max_reqs": 4,
+                    "max_batch_size": 4,
                     "op_impl": "torch",
                     "use_cuda_graph": False,
                     "tp_size": 1,
@@ -95,7 +99,7 @@ def test_mla_prefill_ragged_qkvo(
                     "qk_rope_head_dim": qk_rope_head_dim,
                     "qk_nope_head_dim": qk_nope_head_dim,
                     "dim": 7168,
-                    "type": None,
+                    "type": "deepseek-v3",
                     "index_topk": topk,
                 },
             }
@@ -222,7 +226,7 @@ def test_mla_prefill_ragged_qo_paged_kv(
         OmegaConf.create(
             {
                 "infer": {
-                    "max_reqs": 4,
+                    "max_batch_size": 4,
                     "op_impl": "torch",
                     "use_cuda_graph": False,
                     "tp_size": 1,
@@ -237,7 +241,7 @@ def test_mla_prefill_ragged_qo_paged_kv(
                     "qk_rope_head_dim": qk_rope_head_dim,
                     "qk_nope_head_dim": qk_nope_head_dim,
                     "dim": 7168,
-                    "type": None,
+                    "type": "deepseek-v3",
                 },
             }
         ),
@@ -377,7 +381,7 @@ def test_mla_decode_dense_kv(
         OmegaConf.create(
             {
                 "infer": {
-                    "max_reqs": bs,
+                    "max_batch_size": bs,
                     "use_cuda_graph": False,
                     "tp_size": 1,
                     "op_impl": "torch",
@@ -552,14 +556,11 @@ def test_mla_decode_paged_kv(
         torch.set_default_dtype(torch.bfloat16)
     else:
         torch.set_default_dtype(torch.float16)
-    # NPU MLA 算子要求 num_key_value_heads=1，需要设置 type="deepseek-v3"
-    # 确保 NpuAttnBackend.__init__ 中 local_n_kv_heads 为 1
-    model_type = "deepseek-v3" if impl == "npu" else None
     set_global_args(
         OmegaConf.create(
             {
                 "infer": {
-                    "max_reqs": bs,
+                    "max_batch_size": bs,
                     "use_cuda_graph": False,
                     "tp_size": 1,
                     "op_impl": "torch",
@@ -574,7 +575,7 @@ def test_mla_decode_paged_kv(
                     "qk_rope_head_dim": qk_rope_head_dim,
                     "qk_nope_head_dim": qk_nope_head_dim,
                     "dim": 7168,
-                    "type": model_type,
+                    "type": "deepseek-v3",
                     "index_topk": topk,
                 },
             }
@@ -677,6 +678,139 @@ def test_mla_decode_paged_kv(
     assert_close(y, y_ref, atol=1e-2, rtol=1e-2, cos_sim_tol=cos_sim_tol)
 
 
+@pytest.mark.parametrize("bs", [0, 1, 4])
+@pytest.mark.parametrize(
+    "local_n_heads,kv_lora_rank,qk_rope_head_dim,qk_nope_head_dim",
+    [
+        (128, 512, 64, 128),  # DeepSeek-V3 TP1
+        (16, 512, 64, 128),  # DeepSeek-V3 TP8
+    ],
+)
+@pytest.mark.parametrize("topk", [64, 128])
+@pytest.mark.parametrize("softmax_scale", [None, 0.13])
+def test_hopper_mixed_decode_paged_kv(
+    bs,
+    local_n_heads,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    qk_nope_head_dim,
+    topk,
+    softmax_scale,
+    record_benchmark,
+):
+    if not has_flash_attn3:
+        pytest.skip("flash_attn_interface is missing")
+    if not has_accelerator():
+        pytest.skip("CUDA accelerator is required")
+
+    _, total_memory = torch.cuda.mem_get_info()
+    if local_n_heads == 128 and total_memory / (1024**3) < 80:
+        pytest.skip("Skip testing h_q=128 on devices with not enough memory")
+
+    torch.set_default_dtype(torch.bfloat16)
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_batch_size": max(bs, 1),
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                    "dp_size": 1,
+                    "mla_absorb": "absorb",
+                    "max_seq_len": 1024,
+                },
+                "models": {
+                    "n_heads": local_n_heads,
+                    "kv_lora_rank": kv_lora_rank,
+                    "qk_rope_head_dim": qk_rope_head_dim,
+                    "qk_nope_head_dim": qk_nope_head_dim,
+                    "dim": 7168,
+                    "type": None,
+                    "index_topk": topk,
+                },
+            }
+        ),
+        need_ensure=False,
+    )
+
+    # HopperMixedBackend requires page_size == 1 (block_size == 1)
+    page_size = 1
+    page_cnt_per_sample = 4096  # max pages per sample (one page per token)
+    max_num_pages = page_cnt_per_sample * max(bs, 1)
+
+    prev_seq_len_list = [torch.randint(1, 4096, (1,)).item() for _ in range(bs)]
+    seq_len_delta = BatchedSeqLenDelta(
+        prev_seq_len_list,
+        [item + 1 for item in prev_seq_len_list],
+        device="cuda",
+        cache_prefix_lens_tensor_device=False,
+        cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
+        cache_delta_position_ids_tensor_device=False,
+        cache_delta_seq_ids_tensor_device=False,
+    )
+
+    q_nope = torch.randn(bs, local_n_heads, kv_lora_rank, device="cuda")
+    q_pe = torch.randn(bs, local_n_heads, qk_rope_head_dim, device="cuda")
+    kv_cache = torch.randn(
+        max_num_pages, page_size, kv_lora_rank + qk_rope_head_dim, device="cuda"
+    )
+    this_kv = torch.randn(bs, 1, kv_lora_rank + qk_rope_head_dim, device="cuda")
+
+    if bs > 0:
+        # NOTE: topk_indices may be out of the range of sequence length, and
+        # the attention backend being tested should handle that.
+        topk_indices_list = []
+        for i in range(bs):
+            topk_indices_list.append(
+                torch.randperm(
+                    max(topk, seq_len_delta.new.lens_list[i]), device="cuda"
+                )[:topk]
+            )
+        topk_indices = torch.stack(topk_indices_list, dim=0)
+    else:
+        topk_indices = None
+
+    page_table = torch.randperm(max_num_pages, device="cuda", dtype=torch.int32)[
+        : max(bs, 1) * page_cnt_per_sample
+    ].view(max(bs, 1), page_cnt_per_sample)
+    if bs == 0:
+        page_table = page_table[:0]
+
+    attn = HopperMixedBackend(qk_nope_head_dim=qk_nope_head_dim, index_topk=topk)
+    attn_ref = RefAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+
+    kv_cache_dict_1 = {"kv_lora_k_pe": kv_cache.clone()}
+    kv_cache_dict_2 = {"kv_lora_k_pe": kv_cache.clone()}
+
+    y = record_benchmark.run(
+        lambda: attn.mla_decode_paged_kv(
+            q_nope,
+            q_pe,
+            PagedKVCacheAccessor(page_table, kv_cache_dict_1),
+            this_kv,
+            seq_len_delta=seq_len_delta,
+            softmax_scale=softmax_scale,
+            topk_indices=topk_indices,
+        ),
+        bs=bs,
+        impl="hopper_mixed",
+    )
+    y_ref = attn_ref.mla_decode_paged_kv(
+        q_nope,
+        q_pe,
+        PagedKVCacheAccessor(page_table, kv_cache_dict_2),
+        this_kv,
+        seq_len_delta=seq_len_delta,
+        softmax_scale=softmax_scale,
+        topk_indices=topk_indices,
+    )
+
+    assert_close(y, y_ref, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("bs", [0, 1, 9])
 @pytest.mark.parametrize("n_heads", [32])
 @pytest.mark.parametrize("n_kv_heads", [4])
@@ -716,8 +850,8 @@ def test_prefill_ragged_qkvo(
         OmegaConf.create(
             {
                 "infer": {
-                    "mla_absorb": None,
-                    "max_reqs": 4,
+                    "mla_absorb": "none",
+                    "max_batch_size": 4,
                     "op_impl": "torch",
                     "use_cuda_graph": False,
                     "tp_size": 1,
@@ -834,9 +968,9 @@ def test_decode_dense_kv(
         OmegaConf.create(
             {
                 "infer": {
-                    "mla_absorb": None,
+                    "mla_absorb": "none",
                     "op_impl": "torch",
-                    "max_reqs": 4,
+                    "max_batch_size": 4,
                     "use_cuda_graph": False,
                     "tp_size": 1,
                     "cache_type": "skew",
@@ -979,9 +1113,9 @@ def test_decode_paged_kv(
         OmegaConf.create(
             {
                 "infer": {
-                    "mla_absorb": None,
+                    "mla_absorb": "none",
                     "op_impl": "torch",
-                    "max_reqs": 4,
+                    "max_batch_size": 4,
                     "use_cuda_graph": True if impl == "flashinfer" else False,
                     "tp_size": 1,
                     "cache_type": "paged",

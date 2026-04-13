@@ -8,7 +8,7 @@ import logging
 from typing import Any, Dict, Set, Tuple
 from contextvars import ContextVar
 from contextlib import contextmanager
-from logging.config import dictConfig
+from logging import getLogger
 
 from chitu.utils import get_chitu_env
 
@@ -64,13 +64,6 @@ logging.setLoggerClass(ChituLogger)
 
 CHITU_LOGGING_LEVEL = get_chitu_env("CHITU_LOGGING_LEVEL", "INFO")
 
-_FORMAT = (
-    f"%(levelname)s %(asctime)s "
-    f"%(rank)s [%(name)s:%(lineno)d] %(context)s %(message)s"
-)
-
-_DATE_FORMAT = "%m-%d %H:%M:%S"
-
 _COLORS = [
     "\033[0;31m",  # Red (ID 0)
     "\033[0;32m",  # Green (ID 1)
@@ -117,38 +110,6 @@ class ChituFormatter(logging.Formatter):
         return super().format(record)
 
 
-DEFAULT_CHITU_LOGGING_CONFIG = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "chitu": {
-            "class": "chitu.logging_utils.ChituFormatter",
-            "format": _FORMAT,
-            "datefmt": _DATE_FORMAT,
-        },
-    },
-    "handlers": {
-        "chitu": {
-            "class": "logging.StreamHandler",
-            "formatter": "chitu",
-            "level": CHITU_LOGGING_LEVEL,
-            "stream": "ext://sys.stdout",
-        },
-    },
-    "loggers": {
-        "chitu": {
-            "level": CHITU_LOGGING_LEVEL,
-            "handlers": ["chitu"],
-            "propagate": False,
-        },
-    },
-    "root": {
-        "level": CHITU_LOGGING_LEVEL,
-        "handlers": ["chitu"],
-    },
-}
-
-
 @contextmanager
 def log_context(**kwargs):
 
@@ -163,9 +124,7 @@ def log_context(**kwargs):
         _log_context.set(old_context)
 
 
-def configure_chitu_logging():
-    dictConfig(DEFAULT_CHITU_LOGGING_CONFIG)
-
-
 def setup_chitu_logging():
-    configure_chitu_logging()
+    base_name = __name__.split(".")[0]
+    base_logger = getLogger(base_name)
+    base_logger.setLevel(CHITU_LOGGING_LEVEL)

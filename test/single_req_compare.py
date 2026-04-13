@@ -1,5 +1,6 @@
 import hydra
 import torch
+import torch.nn.functional as F
 import time
 import os
 import random
@@ -20,14 +21,13 @@ from chitu.schemas import ServeConfig
 from chitu.utils import get_config_dir_path, gen_req_id, get_chitu_env
 
 # -----------utils part begin--------------
-import json
 
 
-def save_result(data_list, filename="data.json"):
+def save_results(data_list, filename="data.json"):
     torch.save(data_list, filename)
 
 
-def load_result(filename="data.json"):
+def load_results(filename="data.json"):
     try:
         filename = Path(filename)
         data_list = torch.load(filename)
@@ -37,61 +37,114 @@ def load_result(filename="data.json"):
         return []
 
 
-def check_result(
-    result_0_lst, result_1_lst, threshold=0.99
-) -> tuple[float, float, int, int]:
-    tot_cos_sim = 0.0
-    logit_cnt = 0
-    min_cos_sim = float("inf")
-    min_cos_sim_result_it = -1
-    min_cos_sim_logit_it = -1
+def analyze_topk_similarity(
+    topk_logits1: torch.Tensor,
+    topk_tokens1: torch.Tensor,
+    topk_logits2: torch.Tensor,
+    topk_tokens2: torch.Tensor,
+):
+    """
+    计算两组 Top-K 预测结果的相似度，包含语义对齐的余弦相似度、概率占比、数量占比。
+    """
+    B, K = topk_tokens1.shape
+    device = topk_tokens1.device
 
-    for result_it in range(min(len(result_0_lst), len(result_1_lst))):
-        result_0 = result_0_lst[result_it]
-        result_1 = result_1_lst[result_it]
-        assert (
-            result_0["prompt"] == result_1["prompt"]
-        ), f"prompt difference in result {result_it}:{result_0['prompt']} vs {result_1['prompt']}"
-        assert (
-            len(result_1["logits"]) > 0
-        ), f"history result {result_it} has empty logits"
-        assert (
-            len(result_0["logits"]) > 0
-        ), f"current result {result_it} has empty logits"
+    # 0. 预生成索引序列
+    indices = torch.arange(K, device=device).float()
 
-        num_logits = min(len(result_0["logits"]), len(result_1["logits"]))
+    # 1. 计算公共元素数量及Mask (前num_shared个位置为公共区域)
+    is_shared1 = (topk_tokens1.unsqueeze(2) == topk_tokens2.unsqueeze(1)).any(dim=2)
+    is_shared2 = (topk_tokens2.unsqueeze(2) == topk_tokens1.unsqueeze(1)).any(dim=2)
+    share_num = is_shared1.sum(dim=1)
+    share_mask = torch.arange(K, device=device).unsqueeze(0) < share_num.unsqueeze(1)
+
+    # 2. T1排序：公共元素优先，内部保持原序
+    sort_idx1 = torch.argsort(is_shared1.float() * K + (K - indices), descending=True)
+    logits1 = torch.gather(topk_logits1, 1, sort_idx1)
+
+    # 3. T2排序：查找T2元素在T1中的索引作为对齐依据，公共元素优先
+    match_idx = (
+        (topk_tokens2.unsqueeze(2) == topk_tokens1.unsqueeze(1)).float().argmax(dim=2)
+    )
+    sort_key2 = torch.where(
+        is_shared2, K - match_idx.float(), torch.tensor(-1.0, device=device)
+    )
+    sort_idx2 = torch.argsort(sort_key2, descending=True)
+    logits2 = torch.gather(topk_logits2, 1, sort_idx2)
+
+    # 4. 仅对公共部分计算余弦相似度
+    mask_float = share_mask.float()
+    cosine_sim = F.cosine_similarity(
+        logits1 * mask_float, logits2 * mask_float, dim=1, eps=1e-8
+    )
+
+    # 5. 计算公共部分的概率占比 (取两者较小值)
+    ratio1 = F.softmax(logits1, dim=1).mul(mask_float).sum(dim=1)
+    ratio2 = F.softmax(logits2, dim=1).mul(mask_float).sum(dim=1)
+
+    share_prob = torch.min(ratio1, ratio2)
+    share_token = share_num / K
+    return cosine_sim, share_prob, share_token
+
+
+def check_results(results_now, results_ref) -> tuple[float, float, int, int]:
+    logger.info("checking cosine simulariy, share prob, share token")
+    logger.info("cs_avg cs_min sp_avg sp_min st_avg st_min")
+    tolerance = torch.tensor([0.994, 0.96, 0.995, 0.7, 0.65, 0.05], dtype=torch.float64)
+
+    def check_metric(metric: torch.Tensor, mark="❌✅"):
+        all_ok = metric >= tolerance
+        s = [f"{m:.6f}{mark[ok]}" for m, ok in zip(metric.tolist(), all_ok.tolist())]
+        logger.info(" ".join(s))
+        return torch.all(all_ok).item()
+
+    min_metric = torch.ones(len(tolerance), dtype=torch.float64)
+    fails = []
+    for i, (result_now, result_ref) in enumerate(zip(results_now, results_ref)):
+        assert (
+            result_now["prompt"] == result_ref["prompt"]
+        ), f"prompt difference in result {i}:{result_now['prompt']} vs {result_ref['prompt']}"
+        assert (
+            len(result_ref["topk_logits"]) > 0
+        ), f"history result {i} has empty logits"
+        assert (
+            len(result_now["topk_logits"]) > 0
+        ), f"current result {i} has empty logits"
+
+        num_logits = min(len(result_now["topk_logits"]), len(result_ref["topk_logits"]))
         if num_logits == 0:
             continue
-        logit_cnt += num_logits
 
-        logit0 = result_0["logits"][:num_logits]
-        logit1 = result_1["logits"][:num_logits]
-
-        dp = torch.sum(logit0.float() * logit1.float(), dim=-1)
-        norm = torch.norm(logit0.float(), p=2, dim=-1) * torch.norm(
-            logit1.float(), p=2, dim=-1
+        cos_sim, share_prob, share_token = analyze_topk_similarity(
+            result_now["topk_logits"][:num_logits],
+            result_now["topk_tokens"][:num_logits],
+            result_ref["topk_logits"][:num_logits],
+            result_ref["topk_tokens"][:num_logits],
         )
-        mask = norm != 0
-        cos_sim = torch.where(mask, dp / norm, 0.0)
+        metric = torch.stack(
+            [
+                cos_sim.mean(),
+                cos_sim.min(),
+                share_prob.mean(),
+                share_prob.min(),
+                share_token.mean(),
+                share_token.min(),
+            ]
+        )
+        if not check_metric(metric):
+            fails.append(i)
+        min_metric = torch.min(min_metric, metric)
 
-        min_val, min_idx = list(map(lambda x: x.item(), torch.min(cos_sim, dim=0)))
-        if min_val < min_cos_sim:
-            min_cos_sim = min_val
-            min_cos_sim_logit_it = min_idx
-            min_cos_sim_result_it = result_it
+    logger.info("worst:")
+    assert check_metric(min_metric) == (len(fails) == 0)
+    logger.info("tolerance:")
+    assert check_metric(tolerance, mark="🚩🚩")
 
-        assert (
-            min_val >= threshold
-        ), f"cosine similarity difference in result {result_it}:: logit {min_idx}, min_cos_sim: {min_val}, threshold: {threshold}"
-
-        tot_cos_sim += torch.sum(cos_sim).item()
-
-    if min_cos_sim == float("inf"):
-        min_cos_sim = 0.0
-
-    avg_cos_sim = tot_cos_sim / logit_cnt if logit_cnt > 0 else 0.0
-
-    return (avg_cos_sim, min_cos_sim, min_cos_sim_result_it, min_cos_sim_logit_it)
+    if fails:
+        logger.error(f"failed req: {fails}")
+        raise UserWarning(f"failed req: {fails}")
+    else:
+        logger.info("All asserts passed")
 
 
 # -----------utils part end--------------
@@ -180,27 +233,27 @@ def gen_reqs(num_reqs, max_new_tokens, frequency_penalty):
         return gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty)
 
 
-def run_pipe_or_tensor_parallelism(args, timers, history_result):
-    result = []
-    result_prompt = []
-    result_logits = []
-    result_tokens = []
-    history_it = 0
+def run(args: ServeConfig, results_ref):
+    logger.info(f"Run with args: {args}")
+    chitu_init(args)
+    logger.info("finish init")
+    timers = get_timers()
+    warmup_engine(args)
+    results = []
     rank = torch.distributed.get_rank()
     for i in range(1):
         if rank == 0:
             reqs = gen_reqs(
-                num_reqs=args.infer.max_reqs,
+                num_reqs=args.infer.max_batch_size,
                 max_new_tokens=args.request.max_new_tokens,
                 frequency_penalty=args.request.frequency_penalty,
             )
-            for req in reqs:
+            for j, req in enumerate(reqs):
                 req._test_flag = True
-                if not history_result == None:
-                    req._test_standard_tokens = history_result[history_it]["tokens"]
-                    history_it = history_it + 1
+                if not results_ref == None:
+                    result_it = (i * len(reqs) + j) % len(results_ref)
+                    req._test_standard_tokens = results_ref[result_it]["tokens"]
                 TaskPool.add(Task(req.request_id, req))
-                result_prompt.append(req.message[0]["content"])
         t_start = time.time()
         timers("overall").start()
         while not chitu_is_terminated():
@@ -213,66 +266,20 @@ def run_pipe_or_tensor_parallelism(args, timers, history_result):
 
         if rank == 0:
             for req in reqs:
-                logger.warning(f"Response in rank {rank}: {req.output}")
-            result_logits.extend([req._test_logits for req in reqs])
-            result_tokens.extend([req._test_tokens for req in reqs])
+                logger.info(f"Response {len(req._test_tokens)} tokens: {req.output}")
+                result = {
+                    "prompt": req.message[0]["content"],
+                    "topk_logits": torch.stack(req._test_topk_logits),
+                    "topk_tokens": torch.stack(req._test_topk_tokens),
+                    "tokens": torch.tensor(req._test_tokens),
+                }
+                results.append(result)
 
         timers.log()
 
     chitu_terminate()
 
-    if rank == 0:
-        for it in range(len(result_prompt)):
-            prompt = result_prompt[it]
-            logits = torch.tensor(result_logits[it])
-            tokens = torch.tensor(result_tokens[it])
-            result.append({"prompt": prompt, "logits": logits, "tokens": tokens})
-    return result
-
-
-def run_normal(args, timers, history_result):
-    result = []
-    result_prompt = []
-    result_logits = []
-    result_tokens = []
-    history_it = 0
-    rank = torch.distributed.get_rank()
-    for i in range(1):
-        reqs = gen_reqs(
-            num_reqs=args.infer.max_reqs,
-            max_new_tokens=args.request.max_new_tokens,
-            frequency_penalty=args.request.frequency_penalty,
-        )
-        for req in reqs:
-            req._test_flag = True
-            if not history_result == None:
-                req._test_standard_tokens = history_result[history_it]["tokens"]
-                history_it = history_it + 1
-            TaskPool.add(Task(req.request_id, req))
-            result_prompt.append(req.message[0]["content"])
-        t_start = time.time()
-        timers("overall").start()
-        while len(TaskPool.pool) > 0:
-            chitu_run()
-
-        print("GPU memory used : ", torch.cuda.memory_allocated())
-        timers("overall").stop()
-        t_end = time.time()
-        logger.warning(f"Time cost {t_end - t_start}")
-
-        for req in reqs:
-            logger.warning(f"Response in rank {rank}: {req.output}")
-        result_logits.extend([req._test_logits for req in reqs])
-        result_tokens.extend([req._test_tokens for req in reqs])
-
-        timers.log()
-
-    for it in range(len(result_prompt)):
-        prompt = result_prompt[it]
-        logits = torch.tensor(result_logits[it])
-        tokens = torch.tensor(result_tokens[it])
-        result.append({"prompt": prompt, "logits": logits, "tokens": tokens})
-    return result
+    return results
 
 
 @hydra.main(
@@ -288,65 +295,62 @@ def main(args: ServeConfig):
     global local_args
     local_args = args
     logger.setLevel(logging.DEBUG)
-    logger.info(f"Run with args: {args}")
+    rank = int(os.getenv("RANK"))
+    update_history = os.environ.get("UPDATE_HISTORY", "").lower() == "true"
+    history_path = os.getenv("HISTORY_PATH", "")
+    history2_path = os.getenv("HISTORY2_PATH", "")
 
-    chitu_init(args)
-    torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
+    assert history_path
+    with_history = Path(history_path).exists()
+    if update_history:
+        assert not with_history, "history exists, forget to change HISTORY_VERSION ?"
+    if with_history:
+        assert Path(history_path).is_file()
 
-    timers = get_timers()
-    logger.debug("finish init")
+    results_ref = None
+    if rank == 0 and with_history:
+        results_ref = load_results(history_path)
 
-    rank = torch.distributed.get_rank()
-    warmup_engine(args)
-
-    update_history = os.getenv("UPDATE_HISTORY", "false").lower() == "true"
-    history_path = os.getenv("HISTORY_PATH", "./example/history/history.txt")
-    history_result = None
-    if rank == 0 and not update_history:
-        if os.path.exists(history_path):
-            history_result = load_result(history_path)
-
-    now_result = None
-    if args.infer.pp_size > 1 or args.infer.tp_size > 1 or args.infer.dp_size > 1:
-        now_result = run_pipe_or_tensor_parallelism(args, timers, history_result)
+    if history2_path:
+        logger.info("skip run")
+        if rank == 0:
+            results_now = load_results(history2_path)
+            logger.info(f"load now result from {history2_path}")
     else:
-        now_result = run_normal(args, timers, history_result)
+        logger.info("start run")
+        results_now = run(args, results_ref)
 
-    if rank == 0:
-        if update_history:
-            logger.info(
-                "UPDATE_HISTORY is set to true, saving current result as history."
-            )
-            save_result(now_result, history_path)
-        else:
-            if history_result is not None:
-                threshold = 0.99
-                (
-                    avg_cos_sim,
-                    min_cos_sim,
-                    min_cos_sim_result_it,
-                    min_cos_sim_logit_it,
-                ) = check_result(now_result, history_result, threshold=threshold)
-                logger.info(f"!!!!!!!!! Average cosine similarity: {avg_cos_sim}")
-                logger.info(f"!!!!!!!!! Minimum cosine similarity: {min_cos_sim}")
-                logger.info(
-                    f"!!!!!!!!! Minimum cosine similarity found in result {min_cos_sim_result_it}, logit {min_cos_sim_logit_it}"
-                )
-            else:
-                logger.warning(
-                    "No history result to compare. This is OK for a newly added test case. "
-                    "Merge this commit to `regression_test_reference` branch to update the "
-                    "reference result."
-                )
+    if rank != 0:
+        return
+
+    if with_history:
+        logger.info("checking result...")
+        check_results(results_now, results_ref)
+    else:
+        logger.warning(f"history file {history_path} not found, do automatic save")
+        save_results(results_now, history_path)
+        if not update_history:
+            raise UserWarning(f"History saved at {history_path}")
 
 
 if __name__ == "__main__":
-    main()
-
-    # Sometimes torch.distributed will hang during destruction if CUDA graph is enabled.
-    # As a workaround, we `exec` a dummy process to kill the current process, without
-    # returning an error.
-    logger.info("Waiting for all ranks to finish...")
-    torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
-    # Don't exec bash because it loads startup scripts
-    os.execl("/usr/bin/true", "true")  # /usr/bin/true does nothing but exits
+    successful = True
+    try:
+        main()
+    except:
+        logger.exception("exception")
+        successful = False
+    finally:
+        if torch.distributed.is_initialized():
+            logger.info("Waiting for all ranks to finish...")
+            torch.distributed.barrier(device_ids=[int(os.environ.get("LOCAL_RANK"))])
+            logger.info("All ranks finished")
+        # Sometimes torch.distributed will hang during destruction if CUDA graph is enabled.
+        # As a workaround, we `exec` a dummy process to kill the current process, without
+        # returning an error.
+        # Don't exec bash because it loads startup scripts
+        if successful:
+            # /usr/bin/true does nothing but exits
+            os.execl("/usr/bin/true", "true")
+        else:
+            os.execl("/usr/bin/false", "false")

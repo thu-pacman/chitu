@@ -4,6 +4,7 @@
 
 __all__ = [
     "ColumnParallelLinear",
+    "LmHeadColumnParallelLinear",
     "RowParallelLinear",
     "VocabParallelEmbedding",
 ]
@@ -14,9 +15,15 @@ from logging import getLogger
 
 from chitu.quantization import QuantizationRegistry
 from chitu.device_type import is_ascend
-from chitu.distributed.parallel_state import get_tp_group, get_tp_size
+from chitu.distributed.parallel_state import (
+    get_tp_group,
+    get_tp_size,
+    get_embed_tokens_lm_head_tp_group,
+    get_embed_tokens_lm_head_tp_size,
+)
 from chitu.distributed.comm_group import CommGroup
 from chitu.ops.quant import linear
+from chitu.utils import pad_tensor
 
 logger = getLogger(__name__)
 
@@ -250,6 +257,115 @@ class ColumnParallelLinearMixIn:
         return y
 
 
+class LmHeadColumnParallelLinearMixIn(ColumnParallelLinearMixIn):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        decode_max_num_tokens: int = None,
+        has_bias: bool = True,
+        gather_output: bool = True,
+    ):
+        tp_group = get_embed_tokens_lm_head_tp_group()
+        super().__init__(in_features, out_features, has_bias, gather_output, tp_group)
+
+        self.rank = tp_group.rank_in_group
+        self.tp_size = get_embed_tokens_lm_head_tp_size()
+        self.specialize = get_tp_size() == 1 and get_embed_tokens_lm_head_tp_size() > 1
+        if self.specialize:
+            assert decode_max_num_tokens is not None
+        self.decode_max_num_tokens = decode_max_num_tokens
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_size_per_rank: torch.Tensor = None,
+        cum_num_tokens: list[int] = None,
+    ) -> torch.Tensor:
+        if self.specialize:
+            original_num_tokens = x.shape[0]
+
+            if cum_num_tokens is not None:
+                x = pad_tensor(
+                    x, cum_num_tokens[self.rank + 1] - cum_num_tokens[self.rank]
+                )
+            else:
+                x = pad_tensor(x, self.decode_max_num_tokens)
+
+            if input_size_per_rank is not None:
+                x = self.tp_group.all_gatherv_into_tensor(
+                    x, input_size_per_rank=input_size_per_rank[1:]
+                )
+            else:
+                x = self.tp_group.all_gatherv_into_tensor(
+                    x, max_num_tokens=self.decode_max_num_tokens
+                )
+
+        y = super().forward(x)
+
+        if self.specialize:
+            if cum_num_tokens is not None:
+                y = y[
+                    cum_num_tokens[self.rank] : cum_num_tokens[self.rank]
+                    + original_num_tokens
+                ]
+            else:
+                y = y[
+                    self.decode_max_num_tokens
+                    * self.rank : self.decode_max_num_tokens
+                    * self.rank
+                    + original_num_tokens
+                ]
+        return y
+
+
+def get_lm_head_column_parallel_linear_class(
+    base_linear_class: Optional[type] = None,
+    *,
+    checkpoint_prefix: str,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+):
+    if base_linear_class is None:
+        base_linear_class = (
+            QuantizationRegistry.get_quantized_linear_class_from_global_args(
+                quant_kwargs=quant_kwargs,
+                checkpoint_prefix=checkpoint_prefix,
+            )
+        )
+
+    class LmHeadColumnParallelLinearImpl(
+        LmHeadColumnParallelLinearMixIn, base_linear_class
+    ):
+        pass
+
+    return LmHeadColumnParallelLinearImpl
+
+
+def LmHeadColumnParallelLinear(
+    in_features: int,
+    out_features: int,
+    decode_max_num_tokens: int = None,
+    has_bias: bool = True,
+    gather_output: bool = True,
+    *,
+    checkpoint_prefix: str,
+    base_linear_class: Optional[type] = None,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+):
+    """Factory function for LmHeadColumnParallelLinear, analogous to ColumnParallelLinear."""
+    return get_lm_head_column_parallel_linear_class(
+        base_linear_class,
+        quant_kwargs=quant_kwargs,
+        checkpoint_prefix=checkpoint_prefix,
+    )(
+        in_features=in_features,
+        out_features=out_features,
+        decode_max_num_tokens=decode_max_num_tokens,
+        has_bias=has_bias,
+        gather_output=gather_output,
+    )
+
+
 class RowParallelLinearMixIn:
     def __init__(
         self,
@@ -317,7 +433,13 @@ class RowParallelLinearMixIn:
 
 
 class VocabParallelEmbedding(torch.nn.Module):
-    def __init__(self, num_embeddings: int, embedding_dim: int, dtype=None):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        decode_max_num_tokens: int = None,
+        dtype=None,
+    ):
         """
         Parallelized embedding layer
 
@@ -329,9 +451,14 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         super().__init__()
 
-        self.tp_group = get_tp_group().gpu_group
-        self.rank = get_tp_group().rank_in_group
-        self.tp_size = get_tp_size()
+        self.specialize = get_tp_size() == 1 and get_embed_tokens_lm_head_tp_size() > 1
+        self._comm_group = get_embed_tokens_lm_head_tp_group()
+        self.tp_group = self._comm_group.gpu_group
+        self.rank = self._comm_group.rank_in_group
+        self.tp_size = get_embed_tokens_lm_head_tp_size()
+        if self.specialize:
+            assert decode_max_num_tokens is not None
+        self.decode_max_num_tokens = decode_max_num_tokens
 
         assert (
             num_embeddings % self.tp_size == 0
@@ -344,7 +471,31 @@ class VocabParallelEmbedding(torch.nn.Module):
             requires_grad=False,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_size_per_rank: torch.Tensor = None,
+        cum_num_tokens: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if self.specialize:
+            original_num_tokens = x.shape[0]
+
+            if cum_num_tokens is not None:
+                x = pad_tensor(
+                    x, cum_num_tokens[self.rank + 1] - cum_num_tokens[self.rank]
+                )
+            else:
+                x = pad_tensor(x, self.decode_max_num_tokens)
+
+            if input_size_per_rank is not None:
+                x = self._comm_group.all_gatherv_into_tensor(
+                    x.reshape(-1, 1), input_size_per_rank=input_size_per_rank[1:]
+                ).squeeze(-1)
+            else:
+                x = self._comm_group.all_gatherv_into_tensor(
+                    x.reshape(-1, 1), max_num_tokens=self.decode_max_num_tokens
+                ).squeeze(-1)
+
         if self.tp_size > 1:
             mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
             x = x - self.vocab_start_idx
@@ -361,9 +512,47 @@ class VocabParallelEmbedding(torch.nn.Module):
             else:
                 y[mask] = 0
             torch.distributed.all_reduce(y, group=self.tp_group)
+
+        if self.specialize:
+            if cum_num_tokens is not None:
+                y = y[
+                    cum_num_tokens[self.rank] : cum_num_tokens[self.rank]
+                    + original_num_tokens
+                ]
+            else:
+                y = y[
+                    self.decode_max_num_tokens
+                    * self.rank : self.decode_max_num_tokens
+                    * self.rank
+                    + original_num_tokens
+                ]
         return y
 
-    def forward_as_lm_head(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_as_lm_head(
+        self,
+        x: torch.Tensor,
+        input_size_per_rank: torch.Tensor = None,
+        cum_num_tokens: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if self.specialize:
+            original_num_tokens = x.shape[0]
+
+            if cum_num_tokens is not None:
+                x = pad_tensor(
+                    x, cum_num_tokens[self.rank + 1] - cum_num_tokens[self.rank]
+                )
+            else:
+                x = pad_tensor(x, self.decode_max_num_tokens)
+
+            if input_size_per_rank is not None:
+                x = self.tp_group.all_gatherv_into_tensor(
+                    x, input_size_per_rank=input_size_per_rank[1:]
+                )
+            else:
+                x = self.tp_group.all_gatherv_into_tensor(
+                    x, max_num_tokens=self.decode_max_num_tokens
+                )
+
         y = linear(x, self.weight)
         if self.tp_size > 1:
             y_transposed = y.permute(-1, *range(y.dim() - 1)).contiguous()
@@ -374,4 +563,18 @@ class VocabParallelEmbedding(torch.nn.Module):
                 y_gathered, y_transposed, group=self.tp_group
             )
             y = y_gathered.permute(*range(1, y.dim()), 0)
+
+        if self.specialize:
+            if cum_num_tokens is not None:
+                y = y[
+                    cum_num_tokens[self.rank] : cum_num_tokens[self.rank]
+                    + original_num_tokens
+                ]
+            else:
+                y = y[
+                    self.decode_max_num_tokens
+                    * self.rank : self.decode_max_num_tokens
+                    * self.rank
+                    + original_num_tokens
+                ]
         return y

@@ -27,7 +27,6 @@ MetadataSerializer 综合单元测试
 import pytest
 import msgpack
 
-
 # ============================================================================
 # Fixtures
 # ============================================================================
@@ -83,7 +82,7 @@ def ensure_global_args():
                     "pp_size": 1,
                     "dp_size": 1,
                     "max_seq_len": 4096,
-                    "max_reqs": 32,
+                    "max_batch_size": 32,
                     "mtp_size": 1,
                     "schedule_overlap": False,
                 }

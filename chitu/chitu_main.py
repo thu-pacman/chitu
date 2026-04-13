@@ -2,16 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import functools
-import operator
 import os
-import gc
-import math
 import time
 import traceback
 from logging import getLogger
 from typing import Optional
-import psutil
 import random
 import re
 import traceback
@@ -24,7 +19,6 @@ import zmq.asyncio
 import msgpack
 
 from chitu.backend import Backend, BackendState
-from chitu.kv_cache import PagedKVCache, PagedKVCacheManager
 from chitu.device_type import is_nvidia, has_accelerator
 from chitu.executor import Executor
 from chitu.global_vars import (
@@ -69,12 +63,14 @@ from chitu.metrics import (
 from chitu.distributed.comm_group import SingletonGroupPlaceholder
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
 from chitu.kv_cache.utils import (
-    get_additional_block_num_from_current,
     plan_kv_cache_blocks_after_warmup,
     reduce_num_block_plan_across_ranks,
     estimate_indexer_blocks_from_main,
     solve_main_target_after_shrink,
+    solve_main_target_from_current,
+    cleanup_cuda_if_needed,
     allreduce_min_int,
+    clamp_int,
 )
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
@@ -84,6 +80,8 @@ deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 
 
 logger = getLogger(__name__)
+
+
 _last_step_task_type: Optional[TaskType] = None
 
 
@@ -94,18 +92,6 @@ def get_last_step_task_type() -> Optional[TaskType]:
 
 def init_logger():
     setup_chitu_logging()
-
-    base_name = __name__.split(".")[0]
-    base_logger = getLogger(base_name)
-
-    if base_logger.handlers:
-        for handler in base_logger.handlers[:]:
-            base_logger.removeHandler(handler)
-
-    root_logger = getLogger()
-    if root_logger.handlers:
-        for handler in root_logger.handlers:
-            base_logger.addHandler(handler)
 
 
 def init_cache_static():
@@ -142,12 +128,15 @@ def _auto_set_num_blocks_after_warmup(args):
             if hasattr(cache, "estimate_bytes_per_block")
             else -1
         )
+        effective_cap = cache.get_allocatable_max_num_blocks()
         logger.info(
-            "%s warmup stats before planning: bytes_per_block=%s current_blocks=%s max_num_blocks=%s",
+            "%s warmup stats before planning: bytes_per_block=%s current_blocks=%s "
+            "max_num_blocks=%s effective_cap=%s",
             name,
             bytes_per_block,
             int(cache.num_blocks),
             int(cache.max_num_blocks),
+            int(effective_cap),
         )
 
     plan = plan_kv_cache_blocks_after_warmup(args, paged_caches)
@@ -161,6 +150,7 @@ def _auto_set_num_blocks_after_warmup(args):
 
         current_blocks = int(cm.num_blocks)
         target_blocks = int(plan.get(name, current_blocks))
+        target_blocks = clamp_int(target_blocks, 1, cm.get_allocatable_max_num_blocks())
 
         if target_blocks < current_blocks:
             cm.realloc(int(target_blocks))
@@ -170,24 +160,17 @@ def _auto_set_num_blocks_after_warmup(args):
                 int(target_blocks),
             )
 
-    if get_global_args().infer.op_impl != "cpu":
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+    cleanup_cuda_if_needed()
 
     main_cm = paged_caches["main"]
+    indexer_cm = paged_caches.get("indexer")
+
     main_current = int(main_cm.num_blocks)
-    main_cap = int(main_cm.max_num_blocks)
+    main_cap = main_cm.get_allocatable_max_num_blocks()
+    reserve_bytes = 512 << 20  # 512 MiB
 
-    reserve_bytes = int(512 << 20)  # 512 MiB
-
-    final_main_target = int(main_current)
-    final_indexer_target = None
-
-    if "indexer" in paged_caches:
-        indexer_cm = paged_caches["indexer"]
-        solved_main, solved_indexer = solve_main_target_after_shrink(
+    if indexer_cm is not None:
+        solved_main = solve_main_target_after_shrink(
             args=args,
             main_cm=main_cm,
             indexer_cm=indexer_cm,
@@ -195,100 +178,117 @@ def _auto_set_num_blocks_after_warmup(args):
         )
 
         solved_main = allreduce_min_int(int(solved_main))
+        solved_main = clamp_int(int(solved_main), 1, int(main_cap))
 
-        solved_main = min(max(int(main_current), int(solved_main)), int(main_cap))
-        solved_indexer = estimate_indexer_blocks_from_main(
+        final_indexer_target = estimate_indexer_blocks_from_main(
             main_cm, indexer_cm, int(solved_main)
         )
-        solved_indexer = min(
-            max(0, int(solved_indexer)),
-            int(indexer_cm.max_num_blocks),
+        final_indexer_target = clamp_int(
+            final_indexer_target,
+            1,
+            indexer_cm.get_allocatable_max_num_blocks(),
         )
+        final_indexer_target = allreduce_min_int(int(final_indexer_target))
 
         final_main_target = int(solved_main)
-        final_indexer_target = int(solved_indexer)
 
         logger.info(
-            "KV final joint targets: main_current=%d final_main_target=%d final_indexer_target=%d reserve_bytes=%d",
+            "KV final joint targets: main_current=%d final_main_target=%d "
+            "final_indexer_target=%d reserve_bytes=%d",
             int(main_current),
             int(final_main_target),
             int(final_indexer_target),
             int(reserve_bytes),
         )
     else:
-        additional_main_blocks = int(
-            get_additional_block_num_from_current(
-                main_cm,
-                args.infer.memory_utilization,
-                reserve_bytes=reserve_bytes,
-            )
-        )
-        final_main_target = min(
-            int(main_current) + int(additional_main_blocks), int(main_cap)
-        )
-        final_main_target = max(0, int(final_main_target))
-        final_main_target = allreduce_min_int(int(final_main_target))
-
-    if "indexer" in paged_caches:
-        indexer_cm = paged_caches["indexer"]
-        indexer_current = int(indexer_cm.num_blocks)
-
-        proposed_indexer_target = (
-            int(final_indexer_target)
-            if final_indexer_target is not None
-            else int(indexer_current)
-        )
-        if int(proposed_indexer_target) <= int(indexer_current):
-            proposed_indexer_target = int(indexer_current)
-
-        reduced_indexer_target = allreduce_min_int(int(proposed_indexer_target))
-
-        if int(reduced_indexer_target) > int(indexer_current):
-            indexer_cm.realloc(int(reduced_indexer_target))
-            logger.info(
-                "indexer cache manager reallocated to %d blocks before main growth",
-                int(reduced_indexer_target),
-            )
-
-            if get_global_args().infer.op_impl != "cpu":
-                torch.cuda.synchronize()
-                gc.collect()
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-
-    # after indexer is in place, re-check main safe target from current memory
-    main_current = int(main_cm.num_blocks)
-    reserve_bytes = int(512 << 20)
-
-    safe_additional_main_blocks = int(
-        get_additional_block_num_from_current(
-            main_cm,
-            args.infer.memory_utilization,
+        final_main_target = solve_main_target_from_current(
+            args=args,
+            main_cm=main_cm,
             reserve_bytes=reserve_bytes,
         )
+        final_main_target = allreduce_min_int(int(final_main_target))
+        final_main_target = clamp_int(int(final_main_target), 1, int(main_cap))
+        final_indexer_target = None
+
+    # If main needs shrink, do it early to release memory before any later growth.
+    main_current = int(main_cm.num_blocks)
+    if int(final_main_target) < int(main_current):
+        main_cm.realloc(int(final_main_target))
+        logger.info(
+            "main cache manager pre-shrunk from %d to %d blocks before final placement",
+            int(main_current),
+            int(final_main_target),
+        )
+        cleanup_cuda_if_needed()
+
+    # Place indexer to the final target if present. Allow both shrink and grow.
+    if indexer_cm is not None:
+        indexer_current = int(indexer_cm.num_blocks)
+        final_indexer_target = clamp_int(
+            final_indexer_target,
+            1,
+            indexer_cm.get_allocatable_max_num_blocks(),
+        )
+        if int(final_indexer_target) != int(indexer_current):
+            indexer_cm.realloc(int(final_indexer_target))
+            logger.info(
+                "indexer cache manager resized from %d to %d blocks before main safe solve",
+                int(indexer_current),
+                int(final_indexer_target),
+            )
+            cleanup_cuda_if_needed()
+
+    # Recheck main safe target from current memory after indexer is in place
+    main_current = int(main_cm.num_blocks)
+    safe_main_target = solve_main_target_from_current(
+        args=args,
+        main_cm=main_cm,
+        reserve_bytes=reserve_bytes,
     )
-    safe_main_target = min(
-        int(main_current) + int(safe_additional_main_blocks),
-        int(final_main_target),
+    safe_main_target = min(int(safe_main_target), int(final_main_target))
+    safe_main_target = clamp_int(
+        safe_main_target,
+        1,
+        main_cm.get_allocatable_max_num_blocks(),
     )
-    safe_main_target = min(int(safe_main_target), int(main_cm.max_num_blocks))
-    safe_main_target = max(0, int(safe_main_target))
     safe_main_target = allreduce_min_int(int(safe_main_target))
 
     logger.info(
-        "KV safe main target before final grow: current=%d final_main_target=%d safe_main_target=%d",
+        "KV safe main target before final resize: current=%d final_main_target=%d safe_main_target=%d",
         int(main_current),
         int(final_main_target),
         int(safe_main_target),
     )
 
-    get_global_args().infer.num_blocks = int(safe_main_target)
+    # Align indexer to the final safe main target
+    if indexer_cm is not None:
+        indexer_current = int(indexer_cm.num_blocks)
+        safe_indexer_target = estimate_indexer_blocks_from_main(
+            main_cm, indexer_cm, int(safe_main_target)
+        )
+        safe_indexer_target = clamp_int(
+            safe_indexer_target,
+            1,
+            indexer_cm.get_allocatable_max_num_blocks(),
+        )
+        safe_indexer_target = allreduce_min_int(int(safe_indexer_target))
 
-    # grow main
-    if int(safe_main_target) > int(main_current):
+        if int(safe_indexer_target) != int(indexer_current):
+            indexer_cm.realloc(int(safe_indexer_target))
+            logger.info(
+                "indexer cache manager resized from %d to %d blocks for safe main target",
+                int(indexer_current),
+                int(safe_indexer_target),
+            )
+            cleanup_cuda_if_needed()
+
+    # Final resize main
+    main_current = int(main_cm.num_blocks)
+    if int(safe_main_target) != int(main_current):
         main_cm.realloc(int(safe_main_target))
         logger.info(
-            "main cache manager reallocated to %d blocks after warmup",
+            "main cache manager resized from %d to %d blocks after warmup",
+            int(main_current),
             int(safe_main_target),
         )
     else:
@@ -297,11 +297,7 @@ def _auto_set_num_blocks_after_warmup(args):
             int(main_current),
         )
 
-    if get_global_args().infer.op_impl != "cpu":
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+    cleanup_cuda_if_needed()
 
     final_main_blocks = int(main_cm.num_blocks)
     final_main_blocks = allreduce_min_int(int(final_main_blocks))
@@ -348,7 +344,7 @@ def _warmup_via_taskpool(args):
     logger.info("Starting inference system warmup...")
 
     init_cache_static()
-    num_warmup_reqs = args.infer.max_reqs
+    num_warmup_reqs = args.infer.max_batch_size
     prefill_chunk_size = args.infer.prefill_chunk_size
     _mtp_size = get_global_args().infer.mtp_size
     _n_decode_steps = 2 if get_global_args().infer.schedule_overlap else 1
@@ -366,8 +362,12 @@ def _warmup_via_taskpool(args):
             "infer.prefill_chunk_size is not set, GPU memory usage estimation may be incorrect (may cause OOM)"
         )
         warmup_seq_len = 1
+<<<<<<< HEAD
         prefill_chunk_size = args.infer.max_seq_len * args.infer.max_reqs
     infermode = "diffusionllm" if args.models.type == ModelType.LLADA else "autoregressive"
+=======
+        prefill_chunk_size = args.infer.max_seq_len * args.infer.max_batch_size
+>>>>>>> public-main
     if rank == 0:
         for i in range(num_warmup_reqs):
             req = MockFixedLengthedUserRequest(
@@ -386,7 +386,7 @@ def _warmup_via_taskpool(args):
     # Prefill phase
     # In DP chunk prefill, each schedule processes approximately `prefill_chunk_size` tokens across the whole DP group.
     # Due to per-rank budget constraints and uneven task distribution, some tokens may be left unprocessed.
-    # Example: DP2, chunk=16, max_reqs=5 (创建 5 个 warmup 任务), 每任务 3 tokens
+    # Example: DP2, chunk=16, max_batch_size=5 (创建 5 个 warmup 任务), 每任务 3 tokens
     #   - Budget: Rank0=8, Rank1=8 (chunk_size 均分给各 rank)
     #   - Tasks: Rank0 分到 3 个任务 (round robin), Rank1 分到 2 个任务
     #   - Actual: Rank0 处理 8 tokens (3+3+2, task4 剩 1 token), Rank1 处理 6 tokens (3+3)
@@ -614,7 +614,7 @@ def warmup_engine(args):
         if runner == "direct":
             logger.info("[warmup] full_warmup enabled, skip base warmup")
         _log_skip_prefill()
-        max_reqs_per_dp = ceil_div(args.infer.max_reqs, args.infer.dp_size)
+        max_reqs_per_dp = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
         if args.infer.pp_size > 1:
             if (
                 args.scheduler.pp_config.pp_micro_batch_size_decode == "max"
@@ -705,6 +705,20 @@ def chitu_init(args):
             "Argument `infer.do_load=False` is deprecated. Use `debug.skip_model_load=True` instead."
         )
         args.debug.skip_model_load = True
+    if hasattr(args.infer, "max_reqs") and args.infer.max_reqs is not None:
+        args.infer.max_batch_size = args.infer.max_reqs
+        logger.warning(
+            f"Argument `infer.max_reqs={args.infer.max_reqs}` is deprecated. Use `infer.max_batch_size={args.infer.max_batch_size}` instead."
+        )
+    # max_concurrent_requests default: max_batch_size * 2
+    if getattr(args.infer, "max_concurrent_requests", None) is not None:
+        pass
+    else:
+        args.infer.max_concurrent_requests = args.infer.max_batch_size * 2
+        logger.info(
+            f"infer.max_concurrent_requests not set, defaulting to max_batch_size * 2 ({args.infer.max_concurrent_requests})"
+        )
+
     if (
         hasattr(args.scheduler.pp_config, "prefill_num_tasks_divided_by_pp")
         and not args.scheduler.pp_config.prefill_num_tasks_divided_by_pp
@@ -750,15 +764,18 @@ def chitu_init(args):
 
     if (
         args.infer.prefill_chunk_size is not None
-        and args.infer.prefill_chunk_size > args.infer.max_reqs * args.infer.max_seq_len
+        and args.infer.prefill_chunk_size
+        > args.infer.max_batch_size * args.infer.max_seq_len
     ):
         logger.warning(
             f"infer.prefill_chunk_size ({args.infer.prefill_chunk_size}) is larger than "
-            f"infer.max_reqs ({args.infer.max_reqs}) * infer.max_seq_len "
-            f"({args.infer.max_seq_len}), which has no effect. Reducing it to infer.max_reqs "
-            f" * infer.max_seq_len."
+            f"infer.max_batch_size ({args.infer.max_batch_size}) * infer.max_seq_len "
+            f"({args.infer.max_seq_len}), which has no effect. Reducing it to "
+            f"infer.max_batch_size * infer.max_seq_len."
         )
-        args.infer.prefill_chunk_size = args.infer.max_reqs * args.infer.max_seq_len
+        args.infer.prefill_chunk_size = (
+            args.infer.max_batch_size * args.infer.max_seq_len
+        )
 
     if args.infer.prefill_chunk_size is not None:
         if args.infer.pp_size > 1 and args.infer.cache_type == "skew":
@@ -844,9 +861,26 @@ def chitu_init(args):
     if args.scheduler.pp_config.pp_micro_batch_size_decode == "auto":
         args.scheduler.pp_config.pp_micro_batch_size_decode = "max"
 
-    if args.infer.dp_size > args.infer.max_reqs:
+    if args.infer.embed_tokens_lm_head_tp_size == "auto":
+        args.infer.embed_tokens_lm_head_tp_size = args.infer.tp_size
+    else:
+        assert (
+            args.infer.embed_tokens_lm_head_tp_size.isdigit()
+        ), "embed_tokens_lm_head_tp_size must be auto or an integer"
+
+    if args.infer.mla_absorb == "auto":
+        if args.models.type == ModelType.DEEPSEEK_V3:
+            if args.models.name.lower() in {"GLM-5-FP8".lower(), "GLM-5.1-FP8".lower()}:
+                # GLM-5-FP8's quantization blocking stops using absorb-without-precomp
+                args.infer.mla_absorb = "absorb"
+            else:
+                args.infer.mla_absorb = "absorb-without-precomp"
+        else:
+            args.infer.mla_absorb = "none"
+
+    if args.infer.dp_size > args.infer.max_batch_size:
         raise ValueError(
-            f"infer.dp_size ({args.infer.dp_size}) cannot be greater than infer.max_reqs ({args.infer.max_reqs})"
+            f"infer.dp_size ({args.infer.dp_size}) cannot be greater than infer.max_batch_size ({args.infer.max_batch_size})"
         )
 
     # Check checkpoint exists
@@ -876,7 +910,7 @@ def chitu_init(args):
             ]
         executor = Executor.build(args)
         Backend.executor = executor
-        PackedTasks.configure(max_num_tasks=args.infer.max_reqs)
+        PackedTasks.configure(max_num_tasks=args.infer.max_batch_size)
         logger.info("Chitu has been initialized")
 
         collector = PrometheusMetricsCollector.get_instance(is_create=True)

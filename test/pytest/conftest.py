@@ -625,9 +625,10 @@ def global_args(pd_ports):
                 "ep_size": 1,
                 "mtp_size": 1,
                 "max_seq_len": 512,
-                "max_reqs": 16,
+                "max_batch_size": 16,
                 "prefill_chunk_size": 128,
                 "use_cuda_graph": False,
+                "enable_prefix_caching": False,
             },
             "scheduler": {
                 "type": "prefill_only",

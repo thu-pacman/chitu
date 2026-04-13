@@ -144,7 +144,6 @@ class LoadBalancer:
 
         min_load = float("inf")
         best_scheduler = 0
-        alive_schedulers = self._select_alive_schedulers()
 
         # Consider only alive schedulers
         try:

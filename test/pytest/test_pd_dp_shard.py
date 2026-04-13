@@ -5,14 +5,13 @@ import torch
 from omegaconf import OmegaConf
 
 from chitu.backend import Backend
-from chitu.kv_cache import GlobalLocalMap, PagedKVCacheManager
+from chitu.kv_cache import PagedKVCacheManager
 from chitu.distributed.parallel_state import initialize_parallel_groups
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 import chitu.global_vars as global_vars
 from chitu.global_vars import set_global_args
 from chitu.scheduler import Scheduler
 from chitu.task import Task, TaskPool, TaskType, UserRequest
-
 
 _PD_UNIT_JOB_NAME = "pd_unit_test_h20"
 _JOB_NAME = os.environ.get("CI_JOB_NAME") or os.environ.get("JOB_NAME")
@@ -62,7 +61,7 @@ def test_pd_dp_shard_round_robin():
                 "prefill_chunk_size": None,
                 "schedule_overlap": False,
                 "max_seq_len": 128,
-                "max_reqs": 8,
+                "max_batch_size": 8,
                 "use_cuda_graph": False,
             },
             "dp_config": {
@@ -100,7 +99,7 @@ def test_pd_dp_shard_round_robin():
         {
             "main": PagedKVCacheManager(
                 num_blocks=128,
-                num_hot_req=cfg.infer.max_reqs,
+                num_hot_req=cfg.infer.max_batch_size,
                 max_seq_len=cfg.infer.max_seq_len,
                 dp_rank=i,
                 block_size=16,
@@ -144,7 +143,7 @@ def test_pd_dp_shard_round_robin():
         TaskPool.add(t)
 
     max_reqs_per_dp = compute_local_batch_size_dist_in_dp(
-        cfg.infer.max_reqs, cfg.infer.dp_size
+        cfg.infer.max_batch_size, cfg.infer.dp_size
     )
     sched0 = Scheduler(
         max_reqs_per_dp[0],

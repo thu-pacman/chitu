@@ -57,6 +57,7 @@ cython_unsafe_files = (
     + [
         "chitu/moe/batched_routed_activation.py",  # plum inside
         "chitu/quantization/base.py",  # plum inside
+        "chitu/quantization/blockint4.py",  # plum inside
         "__main__.py",
     ]
 )
@@ -116,7 +117,7 @@ if os.environ.get("CHITU_SETUP_JOBS") is not None:
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="chitu",
-    version="0.5.3",
+    version="0.5.4",
     python_requires=">=3.10",
     install_requires=install_requires,
     extras_require=extras_require,

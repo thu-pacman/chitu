@@ -10,6 +10,13 @@ import csrc.setup_build as operators
 
 setup_dir = os.path.dirname(os.path.abspath(__file__))
 
+cuda_major = int((torch.version.cuda or "0").split(".")[0])
+
+if cuda_major == 13:
+    mooncake = "mooncake-transfer-engine-cuda13"
+else:
+    mooncake = "mooncake-transfer-engine"
+
 install_requires = [
     # Special notes on torch:
     # 1. Users should not expect the installing of chitu to automatically
@@ -118,5 +125,6 @@ extras_require = {
         + os.path.join(setup_dir, "third_party/fast-hadamard-transform")
     ],
     "numa": ["numa"],
+    "mooncake": [mooncake],
     **operators.get_extras_require(),
 }

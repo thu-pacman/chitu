@@ -5,6 +5,9 @@
 # `defaults` are other config files or scripts included into this config file. See
 # https://hydra.cc/docs/tutorials/basic/your_first_app/defaults/ for details.
 defaults:
+  # Config loggers. Only for chitu developers.
+  - logger
+
   # Config validating scripts. Only for chitu developers.
   - hydra/callbacks: 
     - serve_config_rules
@@ -71,12 +74,21 @@ serve:
 
 # Configs for how chitu do the LLM inference computation.
 infer:
-  # Hard batch size limit, WITHOUT considering memory limit. This value is the global (total)
-  # value across DP ranks. If the number of concurrent requests exceeds this value, some
+  # Maximum number of concurrent inference tasks (the actual batch size limit).
+  # The actual batch size may be smaller due to memory limit, or insufficient
+  # requests. If the number of concurrent requests exceeds this value, some
   # of the requests will wait.
   #
+  # This value is the global (total) value across DP ranks.
+  #
+  # If not set, defaults to max_reqs for backward compatibility.
+  #
   # IMPORTANT: Typically, you need to set this field.
-  max_reqs: 8
+  max_batch_size: 8
+
+  # Maximum concurrent requests (running + queued). When exceeded, new inference
+  # requests are rejected with HTTP 503. If not set, defaults to max_batch_size * 2.
+  max_concurrent_requests: null
 
   # Hard sequence length limit of a single request, WITHOUT considering memory limit. This
   # is the maximum number of input and output tokens in total.
@@ -110,6 +122,9 @@ infer:
   # `docs/en/DEVELOPMENT.md#parallelism` for details.
   ep_size: 1
 
+  # Number of Tensor Parallel ranks for embed_tokens and lm_head.
+  embed_tokens_lm_head_tp_size: auto
+
   # Random seed
   seed: 0
 
@@ -126,6 +141,7 @@ infer:
   # - "triton": Use chitu's built-in triton backend. This requires running on a platform
   #   supporting Triton.
   # - "npu": Use operators dedicated for Ascend NPUs.
+  # - "hopper_mixed": Special hybrid backend for running sparse attention on Hopper GPUs.
   # - "ref": Use chitu's built-in reference backend. This is backend has full support for
   #   different types of attention, but it is very slow and consumes much memory.
   attn_type: auto
@@ -142,6 +158,7 @@ infer:
   # Absorption mode for MLA. This field is ignored when the model does not contain MLA.
   # 
   # Acceptable values:
+  # - "auto": Decide automatically.
   # - "none": No absorption. This is an optimization for lower FLOP counts, which matches the
   #   typical need for prefilling.
   # - "absorb-without-precomp": exchange some matrices in the order of multiplication. This is
@@ -150,7 +167,7 @@ infer:
   # - "absorb": exchange some matrices in the order of multiplication, and precompute all the
   #   multiplications that can be computed before inference. This is an optimization for fewer
   #   operator counts, which may be useful for low-latency + low-concurrency cases.
-  mla_absorb: "none"
+  mla_absorb: "auto"
 
   # The hardware-supported data type used for software implementation for lower-bit data types
   # that are not supported by the hardware. For example, when you want to run a float8_e4m3fn
@@ -186,8 +203,14 @@ infer:
 
   # Device memory utilization rate for automatic page allocation for paged KV cache.
   #
+  # Chitu will try to allocate as many pages as possible, satisfying that
+  # `kv_cache_mem + weight_mem + estimated_activation_mem <= memory_utilization * total_gpu_mem`,
+  # where `estimated_activation_mem` is estimated during engine warmup. Since the
+  # esitimation may not be accurate enough, `memory_utilization` may be needed to be
+  # tuned.
+  #
   # Acceptable values: 0.0 to 1.0, e.g., 0.98 means 98% of GPU memory will be used.
-  memory_utilization: 0.98
+  memory_utilization: 0.98 # pls decrease memory_utilization when enable prefix cache
 
   # If not -1, override the automatic page allocation for paged KV cache, and disables the
   # `memory_utilization` field.
@@ -264,15 +287,16 @@ infer:
     prefill_token_dispatcher: auto # one of: auto, tp, allgather, deepep-nl
     decode_token_dispatcher: auto # one of: auto, tp, allgather, deepep-ll
 
-  # The followings are legacy parameters. They are to be removed in the future.
-  do_load: True
-  soft_fp8: false
-
   # Whether to enable prefix caching
   # - True: enable
   # - False: not enable
   # -default: False
   enable_prefix_caching: False
+
+  # The followings are legacy parameters. They are to be removed in the future.
+  do_load: True
+  soft_fp8: false
+  max_reqs: null
 
 # Configs for how chitu schedules multiple requests.
 scheduler:

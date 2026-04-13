@@ -7,7 +7,6 @@ import triton
 import triton.language as tl
 
 from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
-from chitu.device_list import DeviceList
 
 
 @auto_retry_triton_compilation

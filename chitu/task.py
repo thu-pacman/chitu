@@ -20,7 +20,6 @@ import torch
 from chitu.task_type import TaskType, is_prefill, is_decode
 from chitu.async_response import AsyncDataStream
 from chitu.backend import Backend
-from chitu.device_list import DeviceList
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.tool_call import ToolChoice, ToolCallParams, adjust_message_for_tool_calls
 from chitu.reasoning import get_reasoning_params, update_chat_template_kwargs_reasoning
@@ -218,7 +217,8 @@ class UserRequest:
 
         # test information related
         self._test_flag = False
-        self._test_logits = []
+        self._test_topk_logits = []
+        self._test_topk_tokens = []
         self._test_tokens = []
         self._test_standard_tokens = None
         self._test_standard_it = 0
@@ -279,12 +279,10 @@ class UserRequest:
         self.async_stream.notify_server_threadsafe()
 
     def _test_add_logit(self, logit):
-        # logit = logit.tolist()
-        logit = torch.topk(
-            logit, k=100, dim=-1
-        ).values.tolist()  # Only use top100 logits to compare in single_req_compare to save disk footprint.
-        self._test_logits.append(logit)
-        # logger.warning(f"add logit {logit}")
+        # Only use top100 logits to compare in single_req_compare to save disk footprint.
+        topk_logits, topk_tokens = torch.topk(logit, k=100, dim=-1)
+        self._test_topk_logits.append(topk_logits)
+        self._test_topk_tokens.append(topk_tokens)
 
     def _test_add_token(self, token):
         self._test_tokens.append(token)
@@ -529,17 +527,24 @@ class Task:
 
     @property
     def num_cached_blocks(self) -> int:
-        """Number of cached blocks (cached_idle_blocks and active_blocks) that are hit by the req's prompt (Called before prefill step only)."""
-        return sum(1 for block in self.token_blocks if block.cache_idx is not None)
+        """Number of contiguous cached blocks hit from prompt start."""
+        num = 0
+        for block in self.token_blocks:
+            if block.cache_idx is None:
+                break
+            num += 1
+        return num
 
     @property
     def num_cached_idle_blocks(self) -> int:
-        """number of cached_idle_blocks (cache_idx is not None and active_cnt == 0) that are hit by the req's prompt"""
-        return sum(
-            1
-            for block in self.token_blocks
-            if (block.cache_idx is not None and block.active_cnt == 0)
-        )
+        """Number of idle cached blocks inside the contiguous cached prefix."""
+        num = 0
+        for block in self.token_blocks:
+            if block.cache_idx is None:
+                break
+            if block.active_cnt == 0:
+                num += 1
+        return num
 
     def need_remove(self):
         return self.stopped
@@ -947,7 +952,7 @@ class PackedTasksBase:
 
     # 用于从KVCacheManager -> KVCache传递索引信息: KVCacheManager新分配kv cache索引时有值，否则为[]
     new_cache_ids_list: list[list[int]] = field(default_factory=list)
-    # 用于从KVCacheManager -> KVCache传递prefix caching击中长度信息: 首次被prefix caching击中时有值，否则为[]
+    # 用于从KVCacheManager -> KVCache传递prefix caching本轮新增击中长度: 有新增击中时有值，否则为[]
     hit_token_lens: list[int] = field(default_factory=list)
 
     @property

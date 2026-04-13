@@ -102,6 +102,7 @@ def get_extensions():
                 os.path.join(this_dir, "cuda/moe/group_topk.cu"),
                 os.path.join(this_dir, "cuda/moe/vllm_topk_softmax.cu"),
                 os.path.join(this_dir, "cuda/rotary/rotary_pos_emb_llama.cu"),
+                os.path.join(this_dir, "cuda/topk/topk.cu"),
                 os.path.join(this_dir, "cuda/norm/rms_norm.cu"),
                 os.path.join(this_dir, "cuda/frequency_penalty/frequency_penalty.cu"),
                 os.path.join(this_dir, "cuda/response_append/response_append.cu"),

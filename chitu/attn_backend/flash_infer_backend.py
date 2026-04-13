@@ -20,11 +20,13 @@ flashinfer, has_flashinfer = try_import_opt_dep("flashinfer", "flashinfer")
 
 class FlashInferBackend(TritonAttnBackend):
     def __init__(self, tot_num_blocks, *, qk_nope_head_dim: Optional[int] = None):
+        from chitu.models.registry import ModelType
+
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
         self.is_mla = (
-            self.args.infer.mla_absorb == "absorb-without-precomp"
-            or self.args.infer.mla_absorb == "absorb"
+            self.args.models.type == ModelType.DEEPSEEK_V3
+            and self.args.infer.mla_absorb in {"absorb-without-precomp", "absorb"}
         )
         self.is_paged = self.args.infer.cache_type == "paged"
 
@@ -33,7 +35,7 @@ class FlashInferBackend(TritonAttnBackend):
         # - For KV, we need to convert `block_table` to CSR format.
         # These buffers must be allocated when initializing
         # `flashinfer.mla.BatchMLAPagedAttentionWrapper` when cuda graph is enabled
-        max_batch_size_per_dp = ceil_div(self.args.infer.max_reqs, get_dp_size())
+        max_batch_size_per_dp = ceil_div(self.args.infer.max_batch_size, get_dp_size())
         self.head_dim = (
             self.args.models.head_dim
             if hasattr(self.args.models, "head_dim")

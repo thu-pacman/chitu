@@ -331,11 +331,7 @@ class KVCacheBase:
     def prepare_cache_prefill(self, tasks: "PackedTasksBase"):
         if tasks.hit_token_lens:
             cached_token_lens: list[int] = [
-                (
-                    tasks.hit_token_lens[i]
-                    if tasks.hit_token_lens[i]
-                    else self.tid_to_cached_len.get(tid, 0)
-                )
+                self.tid_to_cached_len.get(tid, 0) + tasks.hit_token_lens[i]
                 for i, tid in enumerate(tasks.task_ids)
             ]
         else:
@@ -444,6 +440,7 @@ class PagedKVCache(KVCacheBase):
         quant_type: str = None,
         device="cuda",
         block_size: int = 512,  # must be a multiple of 256 for FlashAttention
+        is_singleton: bool = False,
     ):
         super().__init__(
             layer_id_map,
@@ -456,9 +453,16 @@ class PagedKVCache(KVCacheBase):
             quant_type=quant_type,
             device=device,
         )
-        mtp_extra = self.mtp_size if self.mtp_size > 1 else 0
+        mtp_extra = self.mtp_size if (self.mtp_size > 1 and not is_singleton) else 0
         self.max_blocks_per_req = ceil_div(max_seq_len + mtp_extra, block_size)
-        self.max_num_blocks = self.max_blocks_per_req * num_hot_req
+        self.page_table_max_num_blocks = self.max_blocks_per_req * num_hot_req
+        self.max_num_blocks = self.page_table_max_num_blocks
+
+        if get_global_args().infer.enable_prefix_caching:
+            self.allocatable_max_num_blocks = 1 << 60
+        else:
+            self.allocatable_max_num_blocks = self.page_table_max_num_blocks
+
         self.num_blocks = num_blocks
         self.block_size = block_size
 
@@ -492,16 +496,30 @@ class PagedKVCache(KVCacheBase):
         self._offs_in_page_up_to_date = False
         self.use_i64_offsets = self.needs_i64_kv_offsets()
 
+    def get_allocatable_max_num_blocks(self) -> int:
+        return int(getattr(self, "allocatable_max_num_blocks", self.max_num_blocks))
+
     def realloc(self, num_blocks):
+        requested_num_blocks = int(num_blocks)
+        allocatable_cap = self.get_allocatable_max_num_blocks()
+
         logger.info(
-            f"The GPU memory supports at most {num_blocks} KV blocks. According to the current "
-            f"infer.max_reqs({get_global_args().infer.max_reqs}) and infer.max_seq_len"
-            f"({get_global_args().infer.max_seq_len}) setting, no more than {self.max_num_blocks} "
-            f"KV blocks is needed."
+            f"Requested realloc to {requested_num_blocks} KV blocks. "
+            f"page_table_max_num_blocks={self.page_table_max_num_blocks}, "
+            f"allocatable_max_num_blocks={allocatable_cap}, "
+            f"infer.max_batch_size={get_global_args().infer.max_batch_size}, "
+            f"infer.max_seq_len={get_global_args().infer.max_seq_len}, "
+            f"prefix_caching={get_global_args().infer.enable_prefix_caching}"
         )
-        self.num_blocks = min(num_blocks, self.max_num_blocks)
+
+        if requested_num_blocks <= 0:
+            raise ValueError(f"num_blocks must be > 0, got {requested_num_blocks}")
+
+        self.num_blocks = min(requested_num_blocks, allocatable_cap)
+
         logger.info(
-            f"Reallocating KV cache to {self.num_blocks} blocks, each of size {self.block_size}"
+            f"Reallocating KV cache to {self.num_blocks} blocks, "
+            f"each of size {self.block_size}"
         )
 
         keys = list(self.paged_kv_cache.keys())
@@ -561,7 +579,7 @@ class PagedKVCache(KVCacheBase):
         if get_global_args().infer.use_cuda_graph:
             if max_len > self.max_blocks_per_req:
                 logger.warning(
-                    "block_table length exceeds max_blocks_per_req; "
+                    "block_table length exceeds per-request page-table limit; "
                     "decode max_seq_len may be too small. "
                     f"max_len={max_len} max_blocks_per_req={self.max_blocks_per_req} "
                     f"max_seq_len={get_global_args().infer.max_seq_len} block_size={self.block_size}"
@@ -771,21 +789,31 @@ class SingletonPagedKVCache(PagedKVCache):
         head_dim: Optional[int] = None,
         device="cuda",
     ):
+        self.mtp_size = get_global_args().infer.mtp_size
         super().__init__(
             layer_id_map,
             num_hot_req=num_hot_req,
-            max_seq_len=1,
+            max_seq_len=self.mtp_size,
             shape_per_token_dict=shape_per_token_dict,
             dtype_dict=dtype_dict,
             n_local_kv_heads=n_local_kv_heads,
             head_dim=head_dim,
             device=device,
-            block_size=1,
+            block_size=self.mtp_size,
             num_blocks=num_hot_req,
+            is_singleton=True,
         )
         self.max_blocks_per_req = 1
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
         self.free_blocks = deque(range(self.num_blocks))
+
+        if self.mtp_size > 1:
+            self.tid_to_mtp_offset: dict[str, int] = {}
+            self.mtp_offset = []
+            self.is_mtp_decode_stage = False
+            self.mtp_offset_tensor = StaticTensor(
+                max_nelem=self.num_hot_req, device=device, dtype=torch.int32
+            )
 
     def realloc(self, num_blocks):
         super().realloc(num_blocks)
@@ -797,6 +825,15 @@ class SingletonPagedKVCache(PagedKVCache):
         return len(self.free_blocks)
 
     @override
+    def update_mtp_cache_decode(self, mtp_offset: list[int]):
+        super().update_mtp_cache_decode(mtp_offset)
+
+        if self.mtp_size > 1:
+            task_ids = self.curr_tids
+            for task_id, off_set in zip(task_ids, mtp_offset):
+                self.tid_to_mtp_offset[task_id] = off_set - 1
+
+    @override
     def prepare_cache_prefill(self, tasks: "PackedTasksBase"):
         KVCacheBase.prepare_cache_prefill(self, tasks)
 
@@ -805,10 +842,27 @@ class SingletonPagedKVCache(PagedKVCache):
                 self.block_table[task_id] = [self.get_free_block()]
         self._upd_gpu_block_table(tasks.task_ids)
 
+        if self.mtp_size > 1:
+            self.mtp_offset.clear()
+            for task_id in tasks.task_ids:
+                self.tid_to_mtp_offset[task_id] = -1
+                self.mtp_offset.append(-1)
+            self.is_mtp_decode_stage = False
+            self.mtp_offset_tensor.set(
+                torch.tensor(self.mtp_offset, dtype=torch.int32, device=self.device)
+            )
+
     @override
     def prepare_cache_decode(self, tasks: "PackedTasksBase"):
         KVCacheBase.prepare_cache_decode(self, tasks)
         self._upd_gpu_block_table(tasks.task_ids)
+
+        if self.mtp_size > 1:
+            self.mtp_offset = list(self.tid_to_mtp_offset.values())
+            self.is_mtp_decode_stage = True
+            self.mtp_offset_tensor.set(
+                torch.tensor(self.mtp_offset, dtype=torch.int32, device=self.device)
+            )
 
     @override
     def finalize_cache_all_decode(self, tasks: "PackedTasksBase"):
@@ -817,6 +871,11 @@ class SingletonPagedKVCache(PagedKVCache):
             if tid not in self.block_table:
                 continue
             self.free_req_cache_blocks(tid)
+
+        if self.mtp_size > 1:
+            for tid in tasks.task_ids:
+                if tid in self.tid_to_mtp_offset:
+                    self.tid_to_mtp_offset.pop(tid)
 
     def free_req_cache_blocks(self, tid: str):
         for block in self.block_table[tid]:
@@ -1101,6 +1160,14 @@ class MMPagedKVCache(PagedKVCache):
 
     @override
     def prepare_cache_decode(self, tasks: "PackedTasksBase"):
+        pass
+
+    @override
+    def prepare_mtp_cache_decode(self, mtp_offset: int):
+        pass
+
+    @override
+    def update_mtp_cache_decode(self, mtp_offset: list[int]):
         pass
 
     def free_req_cache_blocks(self, tid: str):

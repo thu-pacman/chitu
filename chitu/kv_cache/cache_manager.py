@@ -11,7 +11,6 @@ from chitu.utils import ceil_div
 from chitu.kv_cache import TokenBlock, NONE_BLK_HASH
 from weakref import WeakValueDictionary
 from collections import defaultdict
-from chitu.task_type import TaskType
 
 if TYPE_CHECKING:
     from chitu.task import Task
@@ -38,7 +37,13 @@ class PagedKVCacheManager(KVCacheManagerBase):
     ):
 
         self.max_blocks_per_req = ceil_div(max_seq_len, block_size)
-        self.max_num_blocks = self.max_blocks_per_req * num_hot_req
+        self.page_table_max_num_blocks = self.max_blocks_per_req * num_hot_req
+        self.max_num_blocks = self.page_table_max_num_blocks
+
+        if enable_prefix_caching:
+            self.allocatable_max_num_blocks = 1 << 60
+        else:
+            self.allocatable_max_num_blocks = self.page_table_max_num_blocks
 
         self.num_blocks = num_blocks
         self.dp_rank = dp_rank
@@ -76,24 +81,45 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # 数据含义: {task_id: cache_hashed_block_cnt}
         self.task_hashed_block_cnt: defaultdict[str, int] = defaultdict(int)
 
+    def get_allocatable_max_num_blocks(self) -> int:
+        return int(getattr(self, "allocatable_max_num_blocks", self.max_num_blocks))
+
     @property
     def num_active_blocks(self):
         return len(self.active_blocks)
 
     def realloc(self, num_blocks):
+        requested_num_blocks = int(num_blocks)
+        allocatable_cap = self.get_allocatable_max_num_blocks()
+
         logger.info(
-            f"The GPU memory supports at most {num_blocks} KV blocks. According to the current "
-            f"infer.max_reqs({get_global_args().infer.max_reqs}) and infer.max_seq_len"
-            f"({get_global_args().infer.max_seq_len}) setting, no more than {self.max_num_blocks} "
-            f"KV blocks is needed."
+            f"Requested realloc to {requested_num_blocks} KV blocks. "
+            f"page_table_max_num_blocks={self.page_table_max_num_blocks}, "
+            f"allocatable_max_num_blocks={allocatable_cap}, "
+            f"infer.max_batch_size={get_global_args().infer.max_batch_size}, "
+            f"infer.max_seq_len={get_global_args().infer.max_seq_len}, "
+            f"prefix_caching={self.enable_prefix_caching}"
         )
-        self.num_blocks = min(num_blocks, self.max_num_blocks)
+
+        if requested_num_blocks < 0:
+            raise ValueError(f"num_blocks must be >= 0, got {requested_num_blocks}")
+
+        self.num_blocks = min(requested_num_blocks, allocatable_cap)
+
         logger.info(
-            f"Reallocating KV cache to {self.num_blocks} blocks, each of size {self.block_size}"
+            f"Reallocating KV cache manager to {self.num_blocks} blocks, "
+            f"each of size {self.block_size}"
         )
+
         self.free_cache_ids = deque(range(self.num_blocks))
         self.active_blocks.clear()
         self.cached_idle_blocks.clear()
+
+        # after warmup, clear status
+        self.tid_to_cached_len.clear()
+        self.task_to_cache_ids.clear()
+        self.task_hashed_block_cnt.clear()
+        self.hashed_block_pool = WeakValueDictionary()
 
     def add_to_hashed_block_pool(self, block: TokenBlock) -> TokenBlock:
         """将block添加到hashed_block_pool中
@@ -174,6 +200,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
     def prepare_metadata_before_prefill(self, task: "Task"):
         """prepare and update metadata before the task begin a prefill step"""
         task.new_cache_ids = []
+        task.hit_token_len = 0  # must be reset every step
+        consumed_before_prefill = task.consumed_req_tokens
 
         if self.enable_prefix_caching:
             # 被prefix caching击中block不占chunk prefill size的容量，也不增加额外的kv cache block需求
@@ -208,8 +236,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
                 assert task.prefill_chunk_size == 1
                 task.consumed_req_tokens -= 1
 
-            if task.consumed_req_tokens != 0:
-                task.hit_token_len = task.consumed_req_tokens
+            if task.consumed_req_tokens > consumed_before_prefill:
+                # incremental prefix-caching hits in this step.
+                task.hit_token_len = task.consumed_req_tokens - consumed_before_prefill
 
         num_full_blocks = task.consumed_req_tokens // self.block_size
         self.update_prefix_caching_metadata(task, num_full_blocks)
@@ -320,9 +349,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
     def finalize_metadata_all_decode(self, task: "Task"):
         if task.task_id not in self.tid_to_cached_len:
             return
-        for block in task.token_blocks:
+        for block in reversed(task.token_blocks):
             if block.cache_idx is None:
-                break
+                continue
             block.active_cnt -= 1
             assert (
                 block.active_cnt >= 0

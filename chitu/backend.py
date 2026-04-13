@@ -13,7 +13,7 @@ from enum import Enum
 from glob import glob
 from logging import getLogger
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional, Iterable
+from typing import TYPE_CHECKING, Callable, Optional
 import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
@@ -24,6 +24,7 @@ from chitu.attn_backend import (
     FlashAttnBackend,
     FlashInferBackend,
     FlashMLABackend,
+    HopperMixedBackend,
     NpuAttnBackend,
     RefAttnBackend,
     TritonAttnBackend,
@@ -31,29 +32,17 @@ from chitu.attn_backend import (
     HybridAttnBackend,
 )
 
-from chitu.kv_cache import (
-    KVCacheManagerBase,
-    PagedKVCacheManager,
-    PagedKVCache,
-    KVCacheBase,
-    DenseKVCache,
-    SingletonPagedKVCache,
-    GlobalLocalMap,
-    MMPagedKVCache,
-)
+from chitu.kv_cache.registry import should_use_hopper_mixed_backend
+from chitu.kv_cache import KVCacheManagerBase, PagedKVCache, KVCacheBase
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
 from chitu.distributed.parallel_state import (
     get_world_group,
-    get_pp_group,
     get_ep_group,
     get_dp_group,
     initialize_parallel_groups,
 )
-from chitu.distributed.partition import (
-    compute_local_batch_size_dist_in_dp,
-    compute_layer_dist_in_pp,
-)
+from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
 from chitu.quantization import (
@@ -73,7 +62,8 @@ from chitu.tokenizer import (
 )
 from chitu.utils import try_import_opt_dep
 from chitu.tool_call import get_tool_parser, patch_chat_template
-from chitu.utils import parse_dtype, try_import_opt_dep, ceil_div, get_global_args
+from chitu.utils import parse_dtype
+from chitu.import_utils import try_import_opt_dep
 from chitu.moe import init_moe_impl
 from chitu.global_vars import set_slot_handle
 from chitu.numa_utils import bind_process_to_numa
@@ -281,10 +271,24 @@ class Backend:
         pipeline_parallel_size = args.infer.pp_size
         non_expert_data_parallel_size = args.infer.dp_size
         expert_parallel_size = args.infer.ep_size
+        embed_tokens_lm_head_tp_size = int(args.infer.embed_tokens_lm_head_tp_size)
         assert (
             tensor_parallel_size * non_expert_data_parallel_size % expert_parallel_size
             == 0
         )
+        if tensor_parallel_size > 1:
+            assert (
+                embed_tokens_lm_head_tp_size == tensor_parallel_size
+            ), "embed_tokens_lm_head_tp_size must be equal to tensor_parallel_size when tensor_parallel_size > 1"
+        elif non_expert_data_parallel_size > 1:
+            assert (
+                non_expert_data_parallel_size % embed_tokens_lm_head_tp_size == 0
+            ), "non_expert_data_parallel_size must be divisible by embed_tokens_lm_head_tp_size when non_expert_data_parallel_size > 1"
+        else:
+            assert (
+                embed_tokens_lm_head_tp_size == 1
+            ), "embed_tokens_lm_head_tp_size must be 1 when tensor_parallel_size == 1 and non_expert_data_parallel_size == 1"
+
         expert_tensor_parallel_size = (
             tensor_parallel_size * non_expert_data_parallel_size // expert_parallel_size
         )
@@ -323,6 +327,7 @@ class Backend:
             etp_size=expert_tensor_parallel_size,
             ep_size=expert_parallel_size,
             pp_size=pipeline_parallel_size,
+            embed_tokens_lm_head_tp_size=embed_tokens_lm_head_tp_size,
         )
         world_group = get_world_group()
         Backend.ip_port_list = world_group.gather_all_rank_ip_port()
@@ -373,9 +378,11 @@ class Backend:
             Initialized tokenizer
         """
         model_name_lower = args.models.name.lower()
-        trust_remote_code = model_name_lower.startswith(
-            "glm-4"
-        ) or model_name_lower.startswith("glm-5")
+        trust_remote_code = (
+            model_name_lower.startswith("glm-4")
+            or model_name_lower.startswith("glm-5")
+            or model_name_lower.startswith("kimi")
+        )
         force_full_seq_decode = (
             args.models.tokenizer_force_full_seq_decode
             if hasattr(args.models, "tokenizer_force_full_seq_decode")
@@ -457,7 +464,9 @@ class Backend:
                 return NpuAttnBackend
             elif args.infer.op_impl == "cpu":
                 return RefAttnBackend
-            elif args.models.type == ModelType.DEEPSEEK_V3:
+            elif should_use_hopper_mixed_backend(args):
+                return HopperMixedBackend
+            elif args.models.type in [ModelType.DEEPSEEK_V3, ModelType.KIMI_K2_5]:
                 return FlashMLABackend
             else:
                 return HybridAttnBackend
@@ -475,6 +484,8 @@ class Backend:
             return NpuAttnBackend
         elif args.infer.attn_type == "ref":
             return RefAttnBackend
+        elif args.infer.attn_type == "hopper_mixed":
+            return HopperMixedBackend
         else:
             raise ValueError(f"Unknown attn type {args.infer.attn_type}")
 
@@ -663,7 +674,11 @@ class Backend:
         Returns:
             Initialized model architecture
         """
-        if args.models.type in [ModelType.DEEPSEEK_V3, ModelType.HF_QWEN_3_MOE]:
+        if args.models.type in [
+            ModelType.DEEPSEEK_V3,
+            ModelType.KIMI_K2_5,
+            ModelType.HF_QWEN_3_MOE,
+        ]:
             QuantizationRegistry._allowed_quant_for_merge_gate_up.append("blockfp4")
 
         return Backend.build_model(
@@ -774,6 +789,7 @@ class Backend:
                 ModelType.HF_GPT_OSS,
                 ModelType.HF_MIXTRAL,
                 ModelType.DEEPSEEK_V3,
+                ModelType.KIMI_K2_5,
                 ModelType.HF_QWEN2_VL,
                 ModelType.HF_QWEN3_NEXT,
                 ModelType.HF_QWEN3_5,
@@ -833,8 +849,13 @@ class Backend:
                     and f"model.layers.{args.models.n_layers}" in k
                 ):
                     return False
-                if args.models.type == ModelType.HF_QWEN3_NEXT and "mtp." in k:
+                if (
+                    args.models.type in [ModelType.HF_QWEN3_NEXT, ModelType.HF_QWEN3_5]
+                    and "mtp." in k
+                ):
                     return False
+            if args.infer.language_model_only and k.startswith("model.visual"):
+                return False
             if args.models.quant_config.type == "blockfp4" and (
                 k.endswith(".k_scale") or k.endswith(".v_scale")
             ):
@@ -871,6 +892,7 @@ class Backend:
             checkpoint_prefix: str,
             model_prefix: str,
             local_layer_prefix: str | None = None,
+            extra_prefix_dict: dict[str, str] = None,
         ):
             """
             Example layer prefixes:
@@ -887,6 +909,11 @@ class Backend:
                     skip_preprocess=args.skip_preprocess,
                     key_filter=key_filter,
                     prefix=checkpoint_prefix,
+                    prefix_list=(
+                        list(extra_prefix_dict.keys())
+                        if extra_prefix_dict is not None
+                        else None
+                    ),
                 )
             except Exception as e:
                 raise RuntimeError(
@@ -906,6 +933,14 @@ class Backend:
                     ] = v
                 state_dict = mapped
 
+                if extra_prefix_dict is not None:
+                    for k in list(state_dict.keys()):
+                        v = state_dict.pop(k)
+                        new_k = k
+                        for prefix_, replacement_ in extra_prefix_dict.items():
+                            new_k = new_k.replace(prefix_, replacement_)
+                        state_dict[new_k] = v
+
             target_prefix = local_layer_prefix or model_prefix
             try:
                 state_dict = Backend._handle_quantized_weights_casting(state_dict, args)
@@ -918,16 +953,22 @@ class Backend:
                     f"Error loading tensors into model part by prefix {target_prefix}"
                 ) from e
 
-            del state_dict
-
         # Load non-layer weights
         for checkpoint_prefix, model_prefix in model._get_non_layer_prefix_mappings():
             _load_and_apply(checkpoint_prefix, model_prefix)
 
         # Load transformer layers
         is_print_rank = int(os.environ.get("LOCAL_RANK", 0)) == 0
+        is_qwen3_5_mtp = (
+            args.models.type == ModelType.HF_QWEN3_5 and args.infer.mtp_size > 1
+        )
+        local_main_end_layer_id = (
+            model.local_end_layer_id
+            if not is_qwen3_5_mtp
+            else model.local_end_layer_id - 1
+        )
         for global_layer_id in tqdm(
-            range(model.local_begin_layer_id, model.local_end_layer_id),
+            range(model.local_begin_layer_id, local_main_end_layer_id),
             disable=not is_print_rank,
             desc="Model loading",
             unit="layer",
@@ -938,7 +979,6 @@ class Backend:
             )
             local_layer_id = global_layer_id - model.local_begin_layer_id
 
-            layer_prefix = f"layers.{global_layer_id}."
             local_layer_prefix = f"layers.{local_layer_id}."
             _load_and_apply(
                 checkpoint_prefix,
@@ -946,6 +986,26 @@ class Backend:
                 local_layer_prefix=local_layer_prefix,
             )
 
+        if is_qwen3_5_mtp:
+            for global_layer_id in tqdm(
+                range(local_main_end_layer_id, model.local_end_layer_id),
+                disable=not is_print_rank,
+                desc="Model loading",
+                unit="layer",
+                leave=False,
+            ):
+                checkpoint_prefix, model_prefix, extra_prefix_dict = (
+                    model._get_layer_mtp_prefix_mapping(global_layer_id)
+                )
+                local_layer_id = global_layer_id - model.local_begin_layer_id
+
+                local_layer_prefix = f"layers.{local_layer_id}."
+                _load_and_apply(
+                    checkpoint_prefix,
+                    model_prefix,
+                    local_layer_prefix=local_layer_prefix,
+                    extra_prefix_dict=extra_prefix_dict,
+                )
         torch.cuda.empty_cache()
 
     @staticmethod
@@ -985,7 +1045,7 @@ class Backend:
         # Dense KVCache and PP related
         if args.infer.cache_type == "skew":
             max_reqs_per_dp = compute_local_batch_size_dist_in_dp(
-                args.infer.max_reqs, args.infer.dp_size
+                args.infer.max_batch_size, args.infer.dp_size
             )[get_dp_group().rank_in_group]
             set_slot_handle(max_reqs_per_dp, args.infer.pp_size)
 
@@ -1051,6 +1111,7 @@ def load_state_dict(
     skip_preprocess=False,
     key_filter: Callable[[str], bool] = None,
     prefix: str = "",
+    prefix_list: list[str] = None,
 ):
     if not skip_preprocess:
         path = os.path.join(hf_ckpt_path, "*.safetensors")
@@ -1070,6 +1131,12 @@ def load_state_dict(
                     state_dict[name] = param
                 else:
                     ignored_params.append(name)
+
+            if prefix_list is not None:
+                for name in f.keys():
+                    if name.startswith(tuple(prefix_list)):
+                        param: torch.Tensor = f.get_tensor(name)
+                        state_dict[name] = param
 
     if ignored_params:
         logger.info(

@@ -46,7 +46,7 @@ spawn timeout 10m torchrun --nproc_per_node $world_size --master_port $MASTER_PO
     infer.tp_size=$tp_size_arg \
     infer.ep_size=$ep_size_arg \
     infer.cache_type=paged \
-    infer.max_reqs=2 \
+    infer.max_batch_size=2 \
     infer.max_seq_len=1024 \
     serve.host=127.0.0.1 \
     serve.port=$SERVE_PORT

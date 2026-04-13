@@ -15,6 +15,7 @@ from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
     ExpertBlockIndexedBatchedRoutedActivation,
+    IndexedBatchedRoutedActivationBlockfp8,
 )
 from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
@@ -581,7 +582,7 @@ def fused_experts_int8(
 
 @_inject_moe_config("fused_experts_fp8", lambda *args, **kwargs: _DEFAULT_MOE_CONFIG)
 def fused_experts_fp8(
-    hidden_states: ExpertBlockIndexedBatchedRoutedActivation,
+    hidden_states: IndexedBatchedRoutedActivation,
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
@@ -614,6 +615,7 @@ def fused_experts_fp8(
         torch.float32,
         torch.float16,
         torch.bfloat16,
+        torch.float8_e4m3fn,
     ]
 
     if M > 32768:
@@ -642,7 +644,10 @@ def fused_experts_fp8(
     compute_type = to_triton_dtype(hidden_states.activation.dtype)
     # Add bs as a tuning key if in graph, because bs is also a key for graph
     # capturing and thus fixed per graph.
-    if not soft_fp8:
+    if isinstance(hidden_states, IndexedBatchedRoutedActivationBlockfp8):
+        hidden_states_activation = hidden_states.activation
+        a1_scale = hidden_states.activation_scale
+    elif not soft_fp8:
         block_n, block_k = block_shape
         hidden_states_activation, a1_scale = blockfp8_act_quant(
             hidden_states.activation,
