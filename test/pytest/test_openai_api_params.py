@@ -11,12 +11,10 @@ import pytest
 from pydantic import ValidationError
 
 from chitu.serve.api_server import (
-    ChatRequest,
     TokenizeRequest,
     DetokenizeRequest,
-    Message,
-    StreamOptions,
 )
+from chitu.serve.openai_api import ChatRequest, Message, StreamOptions
 
 
 # ============================================================

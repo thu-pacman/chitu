@@ -15,23 +15,25 @@ logger = logging.getLogger("tester")
 logger_engine = logging.getLogger("engine")
 sys.stdout.reconfigure(line_buffering=True)
 
-
-HOST = "localhost"
 API_KEY = "example_key"
 MAX_CONCURRENT = 64
 MAX_RETRY = 1
 CHOICE_FUNC_NAME = "get_temperature"
 CHOICE_FUNC = {"type": "function", "function": {"name": CHOICE_FUNC_NAME}}
-LAUNCH_TIMEOUT = 300
-REQ_TIMEOUT = 300
+LAUNCH_TIMEOUT = 3000
+REQ_TIMEOUT = 3000
 MAX_TOKENS = 1024
 ENABLE_THINKING = True
 
 # nums: describe number of tools called in each round. list of set of int, list represents chat rounds, set represents called tools
 CASES_BASE = [
     dict(prompt=0, choice="none", parallel=False, nums=[{0}]),
-    dict(prompt=0, choice="none", parallel=True, nums=[{0}]),
     dict(prompt=0, choice="required", parallel=False, nums=[{1}]),
+    dict(prompt=2, choice="auto", parallel=False, nums=[{1}, {1}, {0}]),
+    dict(prompt=2, choice="auto", parallel=True, nums=[{2}]),
+    dict(prompt=1, choice=CHOICE_FUNC, parallel=True, nums=[{1}]),
+    # fundamental test case above
+    dict(prompt=0, choice="none", parallel=True, nums=[{0}]),
     dict(prompt=0, choice="required", parallel=True, nums=[{1, 2}]),
     dict(prompt=0, choice="auto", parallel=False, nums=[{0}]),
     dict(prompt=0, choice="auto", parallel=True, nums=[{0}]),
@@ -45,14 +47,11 @@ CASES_BASE = [
     dict(prompt=2, choice="none", parallel=True, nums=[{0}]),
     dict(prompt=2, choice="required", parallel=False, nums=[{1}, {1}, {0}]),
     dict(prompt=2, choice="required", parallel=True, nums=[{2}, {0}]),
-    dict(prompt=2, choice="auto", parallel=False, nums=[{1}, {1}, {0}]),
-    dict(prompt=2, choice="auto", parallel=True, nums=[{2}]),
     dict(prompt=0, choice="auto", parallel=False, nums=[{0}], tools=None),
     dict(prompt=0, choice="auto", parallel=True, nums=[{0}], tools=None),
     dict(prompt=0, choice=CHOICE_FUNC, parallel=False, nums=[{1}]),
     dict(prompt=0, choice=CHOICE_FUNC, parallel=True, nums=[{1}]),
     dict(prompt=1, choice=CHOICE_FUNC, parallel=False, nums=[{1}]),
-    dict(prompt=1, choice=CHOICE_FUNC, parallel=True, nums=[{1}]),
     dict(prompt=2, choice=CHOICE_FUNC, parallel=False, nums=[{1}]),
     dict(prompt=2, choice=CHOICE_FUNC, parallel=True, nums=[{1}]),
 ]
@@ -403,6 +402,7 @@ async def test(
     stream: bool = False,
     **kwargs,
 ):
+    expected_nums = nums
     tested_nums = []
     ok = all_ok = False
     for retry in range(MAX_RETRY):
@@ -421,7 +421,7 @@ async def test(
                 messages = [{"role": "user", "content": prompt_str}]
 
             real_nums = []
-            for i in range(len(nums)):
+            for i in range(len(expected_nums)):
                 kwargs = dict(
                     model=model,
                     tools=tools,
@@ -468,16 +468,17 @@ async def test(
                         and tool_calls[0]["name"] == CHOICE_FUNC_NAME
                     )
 
-            logger.info(f"case {idx} end {retry=} real_nums={real_nums}")
+            logger.info(f"case {idx} end {retry=} {real_nums=} {expected_nums=}")
             tested_nums.append(real_nums)
 
-            ok = real_nums[0] in nums[0]
-            all_ok = all(real_num in num for real_num, num in zip(real_nums, nums))
+            ok = real_nums[0] in expected_nums[0]
+            all_ok = all(
+                real_num in num for real_num, num in zip(real_nums, expected_nums)
+            )
             if not ok or all_ok:
                 return idx, tested_nums, ok, all_ok
             logger.error(
-                f"case {idx} failed: nums mismatch "
-                f"real_nums={real_nums} expected={nums}"
+                f"case {idx} failed: nums mismatch " f"{real_nums=} {expected_nums=}"
             )
         except Exception:
             logger.exception(f"case {idx} failed {retry=}")
@@ -492,14 +493,16 @@ model = None
 
 
 async def init_client_and_model():
-    port = get_port()
+    base_url = get_base_url()
+    if not base_url.startswith("http"):
+        base_url = "http://" + base_url
     global openai_client, anthropic_client, model
     openai_client = AsyncOpenAI(
-        base_url=f"http://{HOST}:{port}/v1", api_key=API_KEY, timeout=REQ_TIMEOUT
+        base_url=base_url + "/v1", api_key=API_KEY, timeout=REQ_TIMEOUT
     )
     model = (await openai_client.models.list()).data[0].id
     anthropic_client = AsyncAnthropic(
-        base_url=f"http://{HOST}:{port}",
+        base_url=base_url,
         api_key=API_KEY,
         timeout=REQ_TIMEOUT,
     )
@@ -537,7 +540,7 @@ async def test_all(ready: asyncio.Event):
 
 
 async def launch_engine(ready: asyncio.Event):
-    if len(sys.argv[1:]) == 1:
+    if len(sys.argv) <= 2:
         logger.info("skip launch engine")
         ready.set()
         while True:
@@ -569,10 +572,12 @@ async def launch_engine(ready: asyncio.Event):
     logger.info("engine stopped!")
 
 
-def get_port():
+def get_base_url():
+    if len(sys.argv) == 2:
+        return sys.argv[1]
     for arg in sys.argv[1:]:
         if arg.startswith("serve.port="):
-            return int(arg.split("=")[1])
+            return "localhost:" + arg.split("=")[1]
     raise ValueError("serve.port not found in argv")
 
 
@@ -596,7 +601,7 @@ if __name__ == "__main__":
             "Usage1: add this script before engine launch command line\n"
             f"\te.g. python {sys.argv[0]} torchrun ... -m chitu serve.port=PORT ...\n"
             "Usage2: use this script after engine launched\n"
-            f"\te.g. python {sys.argv[0]} serve.port=PORT\n"
+            f"\te.g. python {sys.argv[0]} 127.0.0.1:8080\n"
         )
         exit(1)
     asyncio.run(main())

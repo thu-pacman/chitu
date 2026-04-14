@@ -16,7 +16,6 @@ import torch
 import torch.distributed
 from fastapi import HTTPException
 
-from chitu.async_response import AsyncResponse
 from chitu.global_vars import get_global_args
 from chitu.profiler import MemoryRecorder, ProfileManager
 from chitu.task import (
@@ -27,6 +26,8 @@ from chitu.task import (
     TaskCollector,
 )
 from chitu.task_type import TaskType
+from chitu.dp_request_router import get_request_router
+from chitu.dp_token_router import get_token_router
 
 logger = getLogger(__name__)
 
@@ -361,9 +362,18 @@ def build_chat_template_kwargs(enable_thinking: bool) -> dict[str, Any]:
     return chat_template_kwargs
 
 
-def submit_request(req: UserRequest) -> AsyncResponse:
-    task = Task(
-        req.request_id, req, stop_with_eos=req.stop_with_eos, priority=req.priority
-    )
-    TaskPool.enqueue(task)
-    return AsyncResponse(req)
+async def submit_request(req: UserRequest):
+    if get_global_args().dp_config.enabled:
+        logger.debug(f"[HTTP] Using DP mode for request: {req.request_id}")
+        token_router = get_token_router()
+        request_router = get_request_router()
+        await request_router.add_request(req)
+        await token_router.register_request(req)
+    else:
+        task = Task(
+            req.request_id,
+            req,
+            stop_with_eos=req.stop_with_eos,
+            priority=req.priority,
+        )
+        TaskPool.enqueue(task)

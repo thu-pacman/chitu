@@ -16,13 +16,13 @@ from chitu.serve.anthropic_api import (
     AnthropicCompletionRequest,
     AnthropicThinking,
     AnthropicMessage,
-    ToolChoice,
+    AnthropicToolChoice,
     anthropic_content_to_text,
     apply_stop_sequences_weak,
     normalize_anthropic_tools,
     map_anthropic_tool_choice,
-    parse_api_key_from_headers,
 )
+from chitu.serve.common import parse_api_key_from_headers
 
 
 # ============================================================
@@ -82,41 +82,41 @@ class TestAnthropicMessage:
 
 
 # ============================================================
-# ToolChoice model tests
+# AnthropicToolChoice model tests
 # ============================================================
 
 
 class TestToolChoice:
     def test_auto(self):
-        tc = ToolChoice(type="auto")
+        tc = AnthropicToolChoice(type="auto")
         assert tc.type == "auto"
         assert tc.disable_parallel_tool_use is False
         assert tc.name is None
 
     def test_any(self):
-        tc = ToolChoice(type="any")
+        tc = AnthropicToolChoice(type="any")
         assert tc.type == "any"
 
     def test_none(self):
-        tc = ToolChoice(type="none")
+        tc = AnthropicToolChoice(type="none")
         assert tc.type == "none"
 
     def test_tool_with_name(self):
-        tc = ToolChoice(type="tool", name="get_weather")
+        tc = AnthropicToolChoice(type="tool", name="get_weather")
         assert tc.type == "tool"
         assert tc.name == "get_weather"
 
     def test_tool_without_name_raises(self):
         with pytest.raises(ValidationError, match="must be provided"):
-            ToolChoice(type="tool")
+            AnthropicToolChoice(type="tool")
 
     def test_disable_parallel_tool_use(self):
-        tc = ToolChoice(type="auto", disable_parallel_tool_use=True)
+        tc = AnthropicToolChoice(type="auto", disable_parallel_tool_use=True)
         assert tc.disable_parallel_tool_use is True
 
     def test_invalid_type(self):
         with pytest.raises(ValidationError):
-            ToolChoice(type="invalid")
+            AnthropicToolChoice(type="invalid")
 
 
 # ============================================================
@@ -645,41 +645,41 @@ class TestNormalizeAnthropicTools:
 
 class TestMapAnthropicToolChoice:
     def test_none_defaults_auto(self):
-        choice, parallel = map_anthropic_tool_choice(None)
-        assert choice == "auto"
-        assert parallel is True
+        config = map_anthropic_tool_choice(None)
+        assert config.choice == "auto"
+        assert config.at_most_one is False
 
     def test_auto(self):
-        tc = ToolChoice(type="auto")
-        choice, parallel = map_anthropic_tool_choice(tc)
-        assert choice == "auto"
-        assert parallel is True
+        tc = AnthropicToolChoice(type="auto")
+        config = map_anthropic_tool_choice(tc)
+        assert config.choice == "auto"
+        assert config.at_most_one is False
 
     def test_none_type(self):
-        tc = ToolChoice(type="none")
-        choice, parallel = map_anthropic_tool_choice(tc)
-        assert choice == "none"
+        tc = AnthropicToolChoice(type="none")
+        config = map_anthropic_tool_choice(tc)
+        assert config.choice == "none"
 
     def test_any_maps_to_required(self):
-        tc = ToolChoice(type="any")
-        choice, parallel = map_anthropic_tool_choice(tc)
-        assert choice == "required"
+        tc = AnthropicToolChoice(type="any")
+        config = map_anthropic_tool_choice(tc)
+        assert config.choice == "required"
 
     def test_tool_maps_to_named(self):
-        tc = ToolChoice(type="tool", name="get_weather")
-        choice, parallel = map_anthropic_tool_choice(tc)
-        assert choice.function.name == "get_weather"
-        assert choice.type == "function"
+        tc = AnthropicToolChoice(type="tool", name="get_weather")
+        config = map_anthropic_tool_choice(tc)
+        assert config.subset == ["get_weather"]
+        assert config.choice == "required"
 
     def test_disable_parallel_tool_use(self):
-        tc = ToolChoice(type="auto", disable_parallel_tool_use=True)
-        choice, parallel = map_anthropic_tool_choice(tc)
-        assert parallel is False
+        tc = AnthropicToolChoice(type="auto", disable_parallel_tool_use=True)
+        config = map_anthropic_tool_choice(tc)
+        assert config.at_most_one is True
 
     def test_enable_parallel_tool_use(self):
-        tc = ToolChoice(type="any", disable_parallel_tool_use=False)
-        choice, parallel = map_anthropic_tool_choice(tc)
-        assert parallel is True
+        tc = AnthropicToolChoice(type="any", disable_parallel_tool_use=False)
+        config = map_anthropic_tool_choice(tc)
+        assert config.at_most_one is False
 
 
 class TestParseApiKeyFromHeaders:

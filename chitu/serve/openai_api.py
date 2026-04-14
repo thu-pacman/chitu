@@ -2,21 +2,109 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import asyncio
-import threading
 import time
 from datetime import datetime
 from logging import getLogger
-from typing import Optional, Literal
-
-from pydantic import BaseModel, Field
-
-from chitu.backend import Backend
-from chitu.serve.event_loop import get_server_event_loop
-from chitu.tool_call import ChoiceDelta, parse_stream_by_parser
-from chitu.reasoning import ReasoningParams, ReasoningParser
+from typing import Any, Optional, Literal, Mapping
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, model_validator
+from chitu.global_vars import get_global_args
+from chitu.task import UserRequest, RequestParams
+from chitu.utils import gen_req_id
+from chitu.serve.common import (
+    set_min_batch_size,
+    submit_request,
+    build_chat_template_kwargs,
+)
+from chitu.tool_call import (
+    ChoiceDelta,
+    parse_stream_by_parser,
+    get_tool_parser_cls,
+    ToolConfig,
+    ChoiceToolCall,
+)
 
 logger = getLogger(__name__)
+
+
+class Message(BaseModel):
+    role: str = "user"
+    # Note on `None` on `content`: OpenClaw may set `content` to be `None`, although this
+    # does not comply with OpenAI spec.
+    content: str | list[str | dict] | None = "hello, who are you"
+    reasoning_content: str | None = None
+    tool_calls: list[ChoiceToolCall] = []
+    tool_call_id: str | None = None
+
+
+class StreamOptions(BaseModel):
+    include_usage: bool = True
+
+
+class ToolChoiceFunction(BaseModel):
+    name: str
+
+
+class ToolChoiceNamedTool(BaseModel):
+    function: ToolChoiceFunction
+    type: Literal["function"]
+
+
+class ChatRequest(BaseModel):
+    conversation_id: str = Field(default_factory=gen_req_id)
+    messages: list[Message]
+    tools: list[dict] = []
+    tool_choice: Literal["none", "auto", "required"] | ToolChoiceNamedTool = "auto"
+    parallel_tool_calls: bool = True
+    logprobs: bool = False
+    top_logprobs: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
+    max_tokens: Optional[int] = Field(default=None, deprecated=True)
+    stream: bool = False
+    stream_options: StreamOptions = Field(default_factory=StreamOptions)
+    temperature: float = 0.8  # [0, 2]
+    top_p: float = 0.9  # [0,1]
+    top_k: int = 50  # -1 or positive integer
+    frequency_penalty: float = 0.0  # [-2, 2]
+    min_batch_size: int = 1
+    stop_with_eos: Optional[bool] = None
+    ignore_eos: Optional[bool] = None  # Compatible with vLLM. Not a OpenAI standard
+    chat_template_kwargs: Mapping[str, Any] = {}
+    enable_thinking: bool = True
+    extra_body: Mapping[str, Any] = {}
+
+    @model_validator(mode="after")
+    def validate_eos_setting(self):
+        if (
+            self.stop_with_eos is not None
+            and self.ignore_eos is not None
+            and self.stop_with_eos != (not self.ignore_eos)
+        ):
+            raise ValueError(
+                "stop_with_eos and ignore_eos cannot be conflict. Please use only one of them."
+            )
+        if self.stop_with_eos is None and self.ignore_eos is None:
+            self.stop_with_eos = True
+        if self.stop_with_eos is None:
+            self.stop_with_eos = not self.ignore_eos
+        return self
+
+    @model_validator(mode="after")
+    def validate_output_tokens(self):
+        # Handle deprecated fields or compatibility fields
+        if (
+            self.max_tokens is not None
+            and self.max_completion_tokens is not None
+            and self.max_tokens != self.max_completion_tokens
+        ):
+            raise ValueError(
+                "max_tokens and max_completion_tokens cannot be conflict. Please use only one of them."
+            )
+        if self.max_tokens is None and self.max_completion_tokens is not None:
+            self.max_tokens = self.max_completion_tokens
+        if self.max_completion_tokens is None and self.max_tokens is not None:
+            self.max_completion_tokens = self.max_tokens
+        return self
 
 
 class ChatCompletionResponse(BaseModel):
@@ -27,122 +115,15 @@ class ChatCompletionResponse(BaseModel):
     usage: Optional[dict] = None
 
 
-class AsyncDataStream:
-    def __init__(self, reasoning_params: ReasoningParams):
-        self.tokenizer = Backend.tokenizer
-        self.seqs: list[str] = []
-        self.tokens_len: int = 0
-        self.chars_len: int = 0
-        self.cache_tokens: list[int] = []
-        self.stop_signal = False
-        self.lock = threading.Lock()
-        self.data_event = asyncio.Event()
-        self.top_logprobs_list = []
-        self.top_tokens_list = []
-        self.reasoning_parser = ReasoningParser(reasoning_params)
-        self.reasoning_states: list[bool] = []
-        self.cached_reasoning_state: bool = False
-
-    def add_data(
-        self,
-        value: Optional[int],
-        top_logprobs=None,
-        top_token_idx=None,
-        *,
-        notify_server: bool = True,
-    ):
-        with self.lock:
-            if value is not None:
-                self.cached_reasoning_state = self.reasoning_parser.update(value)
-                self.tokens_len += 1
-                self.cache_tokens.append(value)
-            elif len(self.cache_tokens) == 0:
-                return
-            s = self.tokenizer.decode(self.cache_tokens)
-            top_tokens = (
-                [self.tokenizer.decode(token_idx) for token_idx in top_token_idx]
-                if top_token_idx
-                else None
-            )
-            # When stop signal received, use `add_data(None)` to clear the token cache
-            # TODO: avoid hardcode max length of cache_tokens
-            if "\ufffd" in s:
-                if value is None or (
-                    not self.tokenizer.force_full_seq_decode
-                    and len(self.cache_tokens) > 10
-                ):
-                    logger.warning_once(
-                        "Tokenzier decoding not succeeded using at least 10 latest tokens. The output is "
-                        "probably ill-formed. This may happen when using random inputs for benchmarking "
-                        "and please try some well-formed inputs (e.g. datasets) instead."
-                    )
-                    logger.debug(
-                        f"The tokenzier failure above occurred with tokens: {''.join(self.seqs[-10:]) + s}"
-                    )
-                else:
-                    return
-            if not self.tokenizer.force_full_seq_decode:
-                self.cache_tokens.clear()
-                self.seqs.append(s)
-                self.chars_len += len(s)
-            else:
-                self.seqs.append(s[self.chars_len :])
-                self.chars_len = len(s)
-            self.reasoning_states.append(self.cached_reasoning_state)
-            if top_logprobs:
-                self.top_logprobs_list.append(top_logprobs)
-                self.top_tokens_list.append(top_tokens)
-        if notify_server:
-            self.notify_server_threadsafe()
-
-    def send_stop_signal(self):
-        self.add_data(None)
-        with self.lock:
-            self.stop_signal = True
-        self.notify_server_threadsafe()
-
-    def notify_server_from_server_thread(self):
-        self.data_event.set()
-
-    def notify_server_threadsafe(self):
-        if (loop := get_server_event_loop()) is not None:
-            # No need to notify if there is no server (e.g. offline inference)
-            loop.call_soon_threadsafe(self.data_event.set)
-
-    def __aiter__(self):
-        self.index = 0
-        return self
-
-    async def __anext__(self):
-        while True:
-            with self.lock:
-                if self.stop_signal and self.index >= len(self.seqs):
-                    raise StopAsyncIteration
-                if self.index < len(self.seqs):
-                    result = self.seqs[self.index]
-                    is_reasoning = self.reasoning_states[self.index]
-                    if self.index < len(self.top_logprobs_list):
-                        top_logprobs = self.top_logprobs_list[self.index]
-                        top_tokens = self.top_tokens_list[self.index]
-                    else:
-                        top_logprobs = None
-                        top_tokens = None
-                    self.index += 1
-                    return (
-                        result,
-                        is_reasoning,
-                        (top_logprobs, top_tokens),
-                    )
-            self.data_event.clear()
-            await self.data_event.wait()
-
-
 class AsyncResponse:
-    def __init__(self, req):
+    def __init__(self, req: UserRequest):
         self.req = req
         self.id = req.request_id
-        self.async_stream: AsyncDataStream = req.async_stream
-        self.tool_parser = Backend.tool_parser(req.tools) if req.tools else None
+        self.async_stream = req.async_stream
+        if req.tool_call_params:
+            self.tool_parser = get_tool_parser_cls()(req.tool_call_params.tools)
+        else:
+            self.tool_parser = None
 
     def stream_generator(self, *, include_usage: bool):
         if self.tool_parser:
@@ -302,3 +283,67 @@ class AsyncResponse:
             f"Completed_{self.id}: {self.req.output}, token_len: {self.async_stream.tokens_len}\n"
         )
         return full_response
+
+
+def build_user_request(req: ChatRequest, priority: int = 1) -> UserRequest:
+    # enable_thinking / max_new_tokens / chat_template_kwargs
+    args = get_global_args()
+    max_new_tokens = req.max_tokens or args.request.max_new_tokens
+    enable_thinking = req.extra_body.get(
+        "enable_thinking",
+        req.chat_template_kwargs.get("enable_thinking", req.enable_thinking),
+    )
+    # Reconstruct chat_template_kwargs to prevent injection attacks
+    chat_template_kwargs = build_chat_template_kwargs(enable_thinking)
+    if isinstance(req.tool_choice, ToolChoiceNamedTool):
+        tool_config = ToolConfig(
+            "required", not req.parallel_tool_calls, [req.tool_choice.function.name]
+        )
+    else:
+        tool_config = ToolConfig(req.tool_choice, not req.parallel_tool_calls)
+    req_params = RequestParams(
+        messages=[msg.model_dump() for msg in req.messages],
+        request_id=gen_req_id(),
+        logprobs=req.logprobs,
+        top_logprobs=req.top_logprobs,
+        max_new_tokens=max_new_tokens,
+        top_p=req.top_p,
+        top_k=req.top_k,
+        temperature=req.temperature,
+        frequency_penalty=req.frequency_penalty,
+        chat_template_kwargs=chat_template_kwargs,
+        enable_thinking=enable_thinking,
+        tools=req.tools,
+        tool_config=tool_config,
+        save_trace_dir=args.debug.save_trace_dir,
+        priority=priority,
+        stop_with_eos=req.stop_with_eos,
+    )
+    return UserRequest.from_request_params(req_params)
+
+
+async def handle_chat_completion(
+    request: ChatRequest,
+    priority: int,
+):
+
+    args = get_global_args()
+    set_min_batch_size(request.min_batch_size)
+    user_req = build_user_request(request, priority)
+    await submit_request(user_req)
+    rsp = AsyncResponse(user_req)
+
+    if request.stream:
+        return StreamingResponse(
+            rsp.stream_generator(include_usage=request.stream_options.include_usage),
+            media_type="text/event-stream",
+        )
+    else:
+        full_response = await rsp.full_generator()
+        response_dict = full_response.model_dump()
+        response_dict.update(
+            {
+                "model": args.models.name,
+            }
+        )
+        return JSONResponse(response_dict)

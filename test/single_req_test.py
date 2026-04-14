@@ -118,12 +118,13 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens, frequency_penalty):
     reqs: list[UserRequest] = []
     for i in range(num_reqs):
         msg = generate_prompt(prompt_len - 1, Backend.tokenizer)
-        req = UserRequest(
+        req = UserRequest.create(
             msg,
             f"{gen_req_id()}",
             max_new_tokens=max_new_tokens,
             frequency_penalty=frequency_penalty,
         )
+        req.messages = msg
         reqs.append(req)
     return reqs
 
@@ -132,31 +133,35 @@ def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
     reqs: list[UserRequest] = []
     for i in range(num_reqs):
         if USE_TOOLS:
-            msg_tool = msg_tools[i % len(msg_tools)]
-            req = UserRequest(
-                msg_tool["messages"],
+            req_data = msg_tools[i % len(msg_tools)]
+            msg = req_data["messages"]
+            req = UserRequest.create(
+                msg,
                 f"{gen_req_id()}",
                 max_new_tokens=max_new_tokens,
                 frequency_penalty=frequency_penalty,
                 temperature=1,
-                tools=msg_tool["tools"],
+                tools=req_data["tools"],
             )
         elif is_vl:
-            req = UserRequest(
-                msgs_vl[i % len(msgs_vl)],
+            msg = msgs_vl[i % len(msgs_vl)]
+            req = UserRequest.create(
+                msg,
                 f"{gen_req_id()}",
                 max_new_tokens=max_new_tokens,
                 frequency_penalty=frequency_penalty,
                 temperature=1,
             )
         else:
-            req = UserRequest(
-                msgs[i % len(msgs)],
+            msg = msgs[i % len(msgs)]
+            req = UserRequest.create(
+                msg,
                 f"{gen_req_id()}",
                 max_new_tokens=max_new_tokens,
                 frequency_penalty=frequency_penalty,
                 temperature=1,
             )
+        req.messages = msg
         reqs.append(req)
     return reqs
 
@@ -224,7 +229,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
                     GRAY = ""
                     RESET = ""
                 logger.info(
-                    f"Response in rank {rank}: reqs[{i}].output={req.output}, {GRAY}reqs[{i}].input={req.message}{RESET}"
+                    f"Response in rank {rank}: reqs[{i}].output={req.output}, {GRAY}reqs[{i}].input={req.messages}{RESET}"
                 )
 
             timers.log()

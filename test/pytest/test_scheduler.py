@@ -1,6 +1,6 @@
 from omegaconf import OmegaConf
 
-from chitu.task import Task, TaskPool, MockFixedLengthedUserRequest
+from chitu.task import Task, TaskPool, UserRequest
 from chitu.kv_cache import PagedKVCacheManager
 from chitu.scheduler import Scheduler, SkewScheduler
 from chitu.global_vars import set_global_args, set_slot_handle, get_global_args
@@ -56,8 +56,8 @@ def test_chunked_prefill():
     Backend.executor = MockExecutor()
 
     for i in range(4):
-        req = MockFixedLengthedUserRequest(
-            input_len=1000 * (i + 1), request_id=f"req_{i}", enable_reasoning=False
+        req = UserRequest.create_mock(
+            input_len=1000 * (i + 1), request_id=f"req_{i}", enable_thinking=False
         )
         task = Task(f"{req.request_id}", req)
         TaskPool.add(task)
@@ -135,8 +135,8 @@ def test_chunked_prefill_skew():
     Backend.cache_managers = None
 
     for i in range(4):
-        req = MockFixedLengthedUserRequest(
-            input_len=1000 * (i + 1), request_id=f"req_{i}", enable_reasoning=False
+        req = UserRequest.create_mock(
+            input_len=1000 * (i + 1), request_id=f"req_{i}", enable_thinking=False
         )
         task = Task(f"{req.request_id}", req)
         TaskPool.add(task)
@@ -229,8 +229,8 @@ def test_priority_prefill_first():
 
     tasks = []
     for i in range(9):
-        req = MockFixedLengthedUserRequest(
-            input_len=10, request_id=f"req_{i}", enable_reasoning=False
+        req = UserRequest.create_mock(
+            input_len=10, request_id=f"req_{i}", enable_thinking=False
         )
         task = Task(f"{req.request_id}", req)
         tasks.append(task)
@@ -321,8 +321,8 @@ def test_priority_prefill_first_skew():
 
     tasks = []
     for i in range(9):
-        req = MockFixedLengthedUserRequest(
-            input_len=10, request_id=f"req_{i}", enable_reasoning=False
+        req = UserRequest.create_mock(
+            input_len=10, request_id=f"req_{i}", enable_thinking=False
         )
         task = Task(f"{req.request_id}", req)
         tasks.append(task)
@@ -419,8 +419,8 @@ def test_priority_fcfs():
 
     tasks = []
     for i in range(9):
-        req = MockFixedLengthedUserRequest(
-            input_len=10, request_id=f"req_{i}", enable_reasoning=False
+        req = UserRequest.create_mock(
+            input_len=10, request_id=f"req_{i}", enable_thinking=False
         )
         task = Task(f"{req.request_id}", req)
         tasks.append(task)
@@ -504,8 +504,8 @@ def test_priority_fcfs_skew():
     Backend.cache_managers = None
     tasks = []
     for i in range(9):
-        req = MockFixedLengthedUserRequest(
-            input_len=10, request_id=f"req_{i}", enable_reasoning=False
+        req = UserRequest.create_mock(
+            input_len=10, request_id=f"req_{i}", enable_thinking=False
         )
         task = Task(f"{req.request_id}", req)
         tasks.append(task)
@@ -603,8 +603,8 @@ def test_priority_request_preset_over_prefill_first():
 
     tasks = []
     for i in range(9):
-        req = MockFixedLengthedUserRequest(
-            input_len=10, request_id=f"req_{i}", enable_reasoning=False
+        req = UserRequest.create_mock(
+            input_len=10, request_id=f"req_{i}", enable_thinking=False
         )
         task = Task(f"{req.request_id}", req, priority=2 if i in [0, 3, 4, 6] else 1)
         tasks.append(task)
@@ -697,8 +697,8 @@ def test_priority_request_preset_over_prefill_first_skew():
 
     tasks = []
     for i in range(9):
-        req = MockFixedLengthedUserRequest(
-            input_len=10, request_id=f"req_{i}", enable_reasoning=False
+        req = UserRequest.create_mock(
+            input_len=10, request_id=f"req_{i}", enable_thinking=False
         )
         task = Task(f"{req.request_id}", req, priority=2 if i in [0, 3, 4, 6] else 1)
         tasks.append(task)
@@ -796,8 +796,8 @@ def test_max_running_tasks():
 
     tasks = []
     for i in range(9):
-        req = MockFixedLengthedUserRequest(
-            input_len=10, request_id=f"req_{i}", enable_reasoning=False
+        req = UserRequest.create_mock(
+            input_len=10, request_id=f"req_{i}", enable_thinking=False
         )
         task = Task(f"{req.request_id}", req)
         tasks.append(task)
@@ -870,10 +870,10 @@ def test_single_prompt_seq_bigger_than_scheduler_capacity():
         }
     ]  # kv_cache capacity = 1024
 
-    req = MockFixedLengthedUserRequest(
+    req = UserRequest.create_mock(
         input_len=NUM_BLOCKS * BLOCK_SIZE + 1,
         request_id=f"req_0",
-        enable_reasoning=False,
+        enable_thinking=False,
     )
     task = Task(f"{req.request_id}", req)
     TaskPool.add(task)
@@ -929,10 +929,10 @@ def test_single_decode_prompt_seq_bigger_than_kvcache_capacity():
         }
     ]  # kv_cache capacity = 1024
 
-    req = MockFixedLengthedUserRequest(
+    req = UserRequest.create_mock(
         input_len=NUM_BLOCKS * BLOCK_SIZE - DIFF,
         request_id=f"req_0",
-        enable_reasoning=False,
+        enable_thinking=False,
     )
     task = Task(f"{req.request_id}", req)
     TaskPool.add(task)
@@ -1006,12 +1006,12 @@ def test_evict_task():
 
     # add 4 decoding tasks into TaskPool, allocate kv_cache for them according to their prefix length
     for i in range(NUM_BLOCKS):
-        req = MockFixedLengthedUserRequest(
+        req = UserRequest.create_mock(
             input_len=(
                 BLOCK_SIZE if i != 3 else BLOCK_SIZE * 2
             ),  # prompt_lens: [BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE, 2*BLOCK_SIZE]
             request_id=f"req_{i}",
-            enable_reasoning=False,
+            enable_thinking=False,
         )
         task = Task(f"{req.request_id}", req)
         tasks.append(task)
@@ -1119,10 +1119,10 @@ def test_can_prefill():
 
     # 假设taskpool中全是其它dp_rank的任务
     for i in range(4):
-        req = MockFixedLengthedUserRequest(
+        req = UserRequest.create_mock(
             input_len=1,
             request_id=f"req_{i}",
-            enable_reasoning=False,
+            enable_thinking=False,
         )
         task = Task(f"{req.request_id}", req)
         task.dp_rank = 1
@@ -1143,10 +1143,10 @@ def test_can_prefill():
     # 假设taskpool中全是decode任务
     TaskPool.reset()
     for i in range(4):
-        req = MockFixedLengthedUserRequest(
+        req = UserRequest.create_mock(
             input_len=1,
             request_id=f"req_{i}",
-            enable_reasoning=False,
+            enable_thinking=False,
         )
         task = Task(f"{req.request_id}", req)
         task.task_type = TaskType.Decode
@@ -1167,10 +1167,10 @@ def test_can_prefill():
     # 假设taskpool中全是waiting任务
     TaskPool.reset()
     for i in range(4):
-        req = MockFixedLengthedUserRequest(
+        req = UserRequest.create_mock(
             input_len=1,
             request_id=f"req_{i}",
-            enable_reasoning=False,
+            enable_thinking=False,
         )
         task = Task(f"{req.request_id}", req)
         task.waiting = True
@@ -1191,18 +1191,18 @@ def test_can_prefill():
 
     # 假设最高优先级的任务长度过大
     TaskPool.reset()
-    req_0 = MockFixedLengthedUserRequest(
+    req_0 = UserRequest.create_mock(
         input_len=1,
         request_id=f"req_0",
-        enable_reasoning=False,
+        enable_thinking=False,
     )
     task_0 = Task(f"{req_0.request_id}", req_0)
     TaskPool.add(task_0)
 
-    req_1 = MockFixedLengthedUserRequest(
+    req_1 = UserRequest.create_mock(
         input_len=BLOCK_SIZE * NUM_BLOCKS + 1,
         request_id=f"req_1",
-        enable_reasoning=False,
+        enable_thinking=False,
     )
     task_1 = Task(
         f"{req_1.request_id}", req_1, priority=2
@@ -1225,10 +1225,10 @@ def test_can_prefill():
 
     # can_prefill返回True，则scheudler.schedule()一定会调度出prefill任务
     TaskPool.reset()
-    req_0 = MockFixedLengthedUserRequest(
+    req_0 = UserRequest.create_mock(
         input_len=1,
         request_id=f"req_0",
-        enable_reasoning=False,
+        enable_thinking=False,
     )
     task_0 = Task(f"{req_0.request_id}", req_0)
     TaskPool.add(task_0)
@@ -1280,8 +1280,8 @@ def test_scheduler_group():
 
     tasks = []
     for i in range(9):
-        req = MockFixedLengthedUserRequest(
-            input_len=10, request_id=f"req_{i}", enable_reasoning=False
+        req = UserRequest.create_mock(
+            input_len=10, request_id=f"req_{i}", enable_thinking=False
         )
         task = Task(f"{req.request_id}", req)
         tasks.append(task)
@@ -1412,8 +1412,8 @@ def test_slot_group_skew():
 
     tasks = []
     for i in range(9):
-        req = MockFixedLengthedUserRequest(
-            input_len=10, request_id=f"req_{i}", enable_reasoning=False
+        req = UserRequest.create_mock(
+            input_len=10, request_id=f"req_{i}", enable_thinking=False
         )
         task = Task(f"{req.request_id}", req)
         tasks.append(task)
@@ -1542,15 +1542,15 @@ def test_pp_chunked_prefill():
     Backend.executor = MockExecutor()
 
     for i in range(5):
-        req = MockFixedLengthedUserRequest(
-            input_len=192, request_id=f"req_{i}", enable_reasoning=False
+        req = UserRequest.create_mock(
+            input_len=192, request_id=f"req_{i}", enable_thinking=False
         )
         task = Task(f"{req.request_id}", req)
         TaskPool.add(task)
 
     for i in range(5):
-        req = MockFixedLengthedUserRequest(
-            input_len=96, request_id=f"req_{i + 5}", enable_reasoning=False
+        req = UserRequest.create_mock(
+            input_len=96, request_id=f"req_{i + 5}", enable_thinking=False
         )
         task = Task(f"{req.request_id}", req)
         TaskPool.add(task)

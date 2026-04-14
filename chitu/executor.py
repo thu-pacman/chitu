@@ -550,7 +550,7 @@ class ExpertDataDispatcher(TasksDispatcher):
                     config=(
                         None
                         if not target_is_pd_decode_rank
-                        else MetadataConfig.for_pd_decode_rank()
+                        else MetadataConfig.for_pd_dpep_decode_rank()
                     ),
                     slot_idx=(
                         Backend.schedulers[

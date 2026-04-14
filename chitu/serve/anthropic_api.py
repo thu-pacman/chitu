@@ -6,25 +6,25 @@
 from __future__ import annotations
 
 import json
-import traceback
-from typing import Any, Awaitable, Callable, Optional, Literal, Annotated
+from typing import Optional, Literal
 from logging import getLogger
 
-from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from chitu.backend import Backend
 from chitu.global_vars import get_global_args
-from chitu.task import Task, TaskPool, UserRequest
-from chitu.tool_call import get_tool_parser, parse_stream_by_parser
+from chitu.task import SampleParams, UserRequest, RequestParams
 from chitu.tool_call import (
     ChoiceToolCall,
-    ToolChoice as OpenAIToolChoice,
-    ToolChoiceNamedTool,
-    ToolChoiceFunction,
+    ToolConfig,
+    get_tool_parser_cls,
+    parse_stream_by_parser,
 )
-from chitu.serve.common import build_chat_template_kwargs, parse_api_key_from_headers
+from chitu.serve.common import (
+    build_chat_template_kwargs,
+    submit_request,
+)
 from chitu.utils import gen_req_id
 
 
@@ -45,7 +45,7 @@ class AnthropicMessage(BaseModel):
     content: str | list[str | dict]
 
 
-class ToolChoice(BaseModel):
+class AnthropicToolChoice(BaseModel):
     type: Literal["auto", "any", "tool", "none"]
     disable_parallel_tool_use: bool | None = False
     name: str | None = None
@@ -76,7 +76,7 @@ class AnthropicMessagesRequest(BaseModel):
     stop_sequences: Optional[list[str]] = None
     thinking: Optional[AnthropicThinking] = None
     tools: Optional[list[dict]] = None
-    tool_choice: Optional[ToolChoice] = None
+    tool_choice: Optional[AnthropicToolChoice] = None
 
 
 class AnthropicCompletionRequest(BaseModel):
@@ -130,7 +130,7 @@ def resolve_requested_model_or_error(requested_model: Optional[str]) -> str:
     loaded = args.models.name
     req_model = requested_model or loaded
 
-    aliases = getattr(args.serve, "model_aliases", None) or {}
+    aliases = args.serve.model_aliases
     resolved = aliases.get(req_model, req_model)
 
     if resolved != loaded:
@@ -213,26 +213,21 @@ def normalize_anthropic_tools(tools: Optional[list[dict]]) -> list[dict]:
 
 
 def map_anthropic_tool_choice(
-    tool_choice: Optional[ToolChoice],
-) -> tuple[OpenAIToolChoice, bool]:
+    tool_choice: Optional[AnthropicToolChoice],
+) -> ToolConfig:
     if tool_choice is None:
-        return "auto", True
+        return ToolConfig("auto")
 
     t = tool_choice.type
-    parallel_tool_calls = not bool(tool_choice.disable_parallel_tool_use)
+    no_parallel = bool(tool_choice.disable_parallel_tool_use)
 
     if t in {"none", "auto"}:
-        return t, parallel_tool_calls
+        return ToolConfig(t, no_parallel)
     if t == "any":
-        return "required", parallel_tool_calls
+        return ToolConfig("required", no_parallel)
     if t == "tool":
-        return (
-            ToolChoiceNamedTool(
-                function=ToolChoiceFunction(name=tool_choice.name), type="function"
-            ),
-            parallel_tool_calls,
-        )
-    return "auto", parallel_tool_calls
+        return ToolConfig("required", no_parallel, [tool_choice.name])
+    return ToolConfig("auto", no_parallel)
 
 
 def tool_calls_to_anthropic_blocks(tool_calls: list[ChoiceToolCall]) -> list[dict]:
@@ -317,10 +312,6 @@ def anthropic_message_to_internal(message: AnthropicMessage) -> list[dict]:
     return results
 
 
-def get_active_tool_parser():
-    return getattr(Backend, "tool_parser", None) or get_tool_parser("MISSING")
-
-
 def build_tool_use_block(
     tool_call_id: Optional[str], name: str, input_obj: dict
 ) -> dict:
@@ -393,13 +384,15 @@ def build_fim_prompt(prefix: str, suffix: str) -> str:
     raise ValueError("Tokenizer does not support FIM tokens for suffix completion.")
 
 
-async def anthropic_stream_from_async_stream(*, req_obj, response_model: str):
+async def anthropic_stream_from_async_stream(
+    *, user_req: UserRequest, response_model: str
+):
     """
     Convert Chitu async token stream to Anthropic SSE event stream.
     Exposes thinking via a separate content block when possible.
     """
-    async_stream = req_obj.async_stream
-    msg_id = f"msg_{req_obj.request_id}"
+    async_stream = user_req.async_stream
+    msg_id = f"msg_{user_req.request_id}"
 
     yield _sse_event(
         "message_start",
@@ -414,21 +407,21 @@ async def anthropic_stream_from_async_stream(*, req_obj, response_model: str):
                 "stop_reason": None,
                 "stop_sequence": None,
                 "usage": {
-                    "input_tokens": int(getattr(req_obj, "prompt_len", 0) or 0),
+                    "input_tokens": user_req.prompt_len,
                     "output_tokens": 0,
                 },
             },
         },
     )
 
-    tool_parser_cls = get_active_tool_parser()
-    tools = getattr(req_obj, "tools", None)
-    tool_parser = tool_parser_cls(tools) if tools else None
-    stream = (
-        parse_stream_by_parser(async_stream, tool_parser)
-        if tool_parser
-        else async_stream
-    )
+    if user_req.tool_call_params:
+        parser_cls = get_tool_parser_cls()
+        tools = user_req.tool_call_params.tools
+        tool_parser = parser_cls(tools)
+        stream = parse_stream_by_parser(async_stream, tool_parser)
+    else:
+        stream = async_stream
+        tool_parser = None
 
     block_index = -1
     current_block_type: Optional[str] = None  # "thinking" | "text"
@@ -557,9 +550,7 @@ async def anthropic_stream_from_async_stream(*, req_obj, response_model: str):
             next_index += 1
             block_index = next_index - 1
 
-    stop_reason = map_finish_reason_to_stop_reason(
-        getattr(req_obj, "finish_reason", None)
-    )
+    stop_reason = map_finish_reason_to_stop_reason(user_req.finish_reason)
     if tool_call_buffers and not saw_text and stop_reason == "end_turn":
         stop_reason = "tool_use"
     yield _sse_event(
@@ -570,18 +561,16 @@ async def anthropic_stream_from_async_stream(*, req_obj, response_model: str):
                 "stop_reason": stop_reason,
                 "stop_sequence": None,
             },
-            "usage": {
-                "output_tokens": int(getattr(async_stream, "tokens_len", 0) or 0)
-            },
+            "usage": {"output_tokens": async_stream.tokens_len},
         },
     )
     yield _sse_event("message_stop", {"type": "message_stop"})
 
 
 async def anthropic_completion_stream_from_async_stream(
-    *, req_obj, response_model: str
+    *, req: UserRequest, response_model: str
 ):
-    async_stream = req_obj.async_stream
+    async_stream = req.async_stream
     async for data, _top_logprobs, _top_tokens in async_stream:
         if not data:
             continue
@@ -595,9 +584,7 @@ async def anthropic_completion_stream_from_async_stream(
             }
         )
 
-    stop_reason = map_finish_reason_to_completion_stop_reason(
-        getattr(req_obj, "finish_reason", None)
-    )
+    stop_reason = map_finish_reason_to_completion_stop_reason(req.finish_reason)
     yield _sse_data(
         {
             "type": "completion",
@@ -609,56 +596,12 @@ async def anthropic_completion_stream_from_async_stream(
     )
 
 
-async def handle_messages_request(
-    *,
-    raw_request: Request,
-    authorization: Optional[str],
-    x_api_key: Optional[str],
-    server_status: bool,
-    dp_enabled: bool,
-    dp_service_started: bool,
-    dp_register_and_submit: Callable[[Any], Awaitable[Any]],
-    priority_for_api_key: Callable[[str], int],
-):
-    """
-    Main entry for `/v1/messages` route. Keeps `api_server.py` thin.
-    """
-
-    try:
-        api_key = parse_api_key_from_headers(authorization, x_api_key)
-    except HTTPException as e:
-        return anthropic_error(400, "invalid_request_error", str(e.detail))
-    task_priority = priority_for_api_key(api_key)
-
-    if not server_status:
-        return anthropic_error(503, "service_unavailable", "Service is not started")
-
-    try:
-        data = await raw_request.json()
-    except Exception:
-        return anthropic_error(
-            400, "invalid_request_error", "Invalid JSON body. Expecting JSON payload."
-        )
-
-    try:
-        request = AnthropicMessagesRequest.model_validate(data)
-    except ValidationError as e:
-        return anthropic_error(422, "invalid_request_error", json.dumps(e.errors()))
-
+async def handle_messages_request(*, request: AnthropicMessagesRequest, priority: int):
     try:
         tools = normalize_anthropic_tools(request.tools)
-        tool_choice, parallel_tool_calls = map_anthropic_tool_choice(
-            request.tool_choice
-        )
+        tool_config = map_anthropic_tool_choice(request.tool_choice)
     except ValueError as e:
         return anthropic_error(400, "invalid_request_error", str(e))
-
-    if dp_enabled and tools:
-        return anthropic_error(
-            400,
-            "invalid_request_error",
-            "tools are not supported in DP mode yet.",
-        )
 
     try:
         response_model = resolve_requested_model_or_error(request.model)
@@ -671,7 +614,10 @@ async def handle_messages_request(
         internal_messages: list[dict] = []
         if request.system is not None:
             internal_messages.append(
-                {"role": "system", "content": anthropic_content_to_text(request.system)}
+                {
+                    "role": "system",
+                    "content": anthropic_content_to_text(request.system),
+                }
             )
         for m in request.messages:
             internal_messages.extend(anthropic_message_to_internal(m))
@@ -690,113 +636,30 @@ async def handle_messages_request(
     )
     chat_template_kwargs = build_chat_template_kwargs(enable_thinking)
 
-    # DP mode
-    if dp_enabled:
-        if not dp_service_started:
-            return anthropic_error(503, "service_unavailable", "DP service not started")
-        try:
-            from chitu.task import RouterRequest
-        except Exception as e:
-            return anthropic_error(500, "internal_error", f"DP import error: {e}")
-
-        req_id = gen_req_id()
-        router_request = RouterRequest(
-            message=internal_messages,
-            request_id=req_id,
-            logprobs=False,
-            top_logprobs=None,
-            max_new_tokens=max_new_tokens,
-            top_p=top_p,
-            top_k=top_k,
-            temperature=temperature,
-            frequency_penalty=frequency_penalty,
-            chat_template_kwargs=chat_template_kwargs,
-            stop_with_eos=True,
-        )
-
-        try:
-            response = await dp_register_and_submit(router_request)
-        except HTTPException as e:
-            return anthropic_error(
-                int(e.status_code), "service_unavailable", str(e.detail)
-            )
-        except Exception as e:
-            return anthropic_error(500, "internal_error", str(e))
-
-        req_obj = getattr(response, "req", router_request)
-        if request.stream:
-            return StreamingResponse(
-                anthropic_stream_from_async_stream(
-                    req_obj=req_obj, response_model=response_model
-                ),
-                media_type="text/event-stream",
-            )
-
-        reasoning_text, output_text = await collect_reasoning_and_text(
-            req_obj.async_stream
-        )
-        output_text, stop_reason_override, stop_sequence = apply_stop_sequences_weak(
-            output_text, request.stop_sequences
-        )
-        stop_reason = stop_reason_override or map_finish_reason_to_stop_reason(
-            getattr(req_obj, "finish_reason", None)
-        )
-        content_blocks: list[dict] = []
-        if reasoning_text:
-            content_blocks.append({"type": "thinking", "thinking": reasoning_text})
-        content_blocks.append({"type": "text", "text": output_text})
-        return JSONResponse(
-            {
-                "id": f"msg_{req_obj.request_id}",
-                "type": "message",
-                "role": "assistant",
-                "model": response_model,
-                "content": content_blocks,
-                "stop_reason": stop_reason,
-                "stop_sequence": stop_sequence,
-                "usage": {
-                    "input_tokens": int(getattr(req_obj, "prompt_len", 0) or 0),
-                    "output_tokens": int(
-                        getattr(req_obj.async_stream, "tokens_len", 0) or 0
-                    ),
-                },
-            }
-        )
-
-    # Non-DP mode
-    req_id = gen_req_id()
-    try:
-        user_req = UserRequest(
-            internal_messages,
-            req_id,
-            logprobs=False,
-            top_logprobs=None,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            frequency_penalty=frequency_penalty,
-            chat_template_kwargs=chat_template_kwargs,
-            tools=tools,
-            tool_choice=tool_choice,
-            parallel_tool_calls=parallel_tool_calls,
-            enable_reasoning=enable_thinking,
-            save_trace_dir=args.debug.save_trace_dir,
-        )
-    except ValueError:
-        return anthropic_error(
-            400, "invalid_request_error", "prompt length is greater than max_seq_len"
-        )
-
-    task = Task(
-        user_req.request_id, user_req, stop_with_eos=True, priority=task_priority
+    req_params = RequestParams(
+        messages=internal_messages,
+        request_id=gen_req_id(),
+        logprobs=False,
+        top_logprobs=None,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        frequency_penalty=frequency_penalty,
+        chat_template_kwargs=chat_template_kwargs,
+        tools=tools,
+        tool_config=tool_config,
+        enable_thinking=enable_thinking,
+        save_trace_dir=args.debug.save_trace_dir,
+        priority=priority,
     )
-    TaskPool.enqueue(task)
+    user_req = UserRequest.from_request_params(req_params)
 
+    await submit_request(user_req)
     if request.stream:
         return StreamingResponse(
             anthropic_stream_from_async_stream(
-                req_obj=user_req, response_model=response_model
+                user_req=user_req, response_model=response_model
             ),
             media_type="text/event-stream",
         )
@@ -808,12 +671,13 @@ async def handle_messages_request(
         output_text, request.stop_sequences
     )
     stop_reason = stop_reason_override or map_finish_reason_to_stop_reason(
-        getattr(user_req, "finish_reason", None)
+        user_req.finish_reason
     )
     tool_calls = []
-    if tools:
-        parser_cls = get_active_tool_parser()
-        parser = parser_cls(tools)
+
+    if user_req.tool_call_params:
+        parser_cls = get_tool_parser_cls()
+        parser = parser_cls(user_req.tool_call_params.tools)
         output_text, tool_calls = parser.parse_string(output_text)
 
     content_blocks: list[dict] = []
@@ -833,10 +697,8 @@ async def handle_messages_request(
             "stop_reason": stop_reason,
             "stop_sequence": stop_sequence,
             "usage": {
-                "input_tokens": int(getattr(user_req, "prompt_len", 0) or 0),
-                "output_tokens": int(
-                    getattr(user_req.async_stream, "tokens_len", 0) or 0
-                ),
+                "input_tokens": user_req.prompt_len,
+                "output_tokens": user_req.async_stream.tokens_len,
             },
         }
     )
@@ -844,46 +706,9 @@ async def handle_messages_request(
 
 async def handle_completion_request(
     *,
-    raw_request: Request,
-    authorization: Optional[str],
-    x_api_key: Optional[str],
-    server_status: bool,
-    dp_enabled: bool,
-    dp_service_started: bool,
-    dp_register_and_submit: Callable[[Any], Awaitable[Any]],
-    priority_for_api_key: Callable[[str], int],
+    request: AnthropicCompletionRequest,
+    priority: int,
 ):
-    """
-    Main entry for `/v1/complete` route (legacy completions / code infill).
-    """
-    try:
-        api_key = parse_api_key_from_headers(authorization, x_api_key)
-    except HTTPException as e:
-        return anthropic_error(400, "invalid_request_error", str(e.detail))
-    task_priority = priority_for_api_key(api_key)
-
-    if not server_status:
-        return anthropic_error(503, "service_unavailable", "Service is not started")
-
-    try:
-        data = await raw_request.json()
-    except Exception:
-        return anthropic_error(
-            400, "invalid_request_error", "Invalid JSON body. Expecting JSON payload."
-        )
-
-    try:
-        request = AnthropicCompletionRequest.model_validate(data)
-    except ValidationError as e:
-        return anthropic_error(422, "invalid_request_error", json.dumps(e.errors()))
-
-    if dp_enabled:
-        return anthropic_error(
-            400,
-            "invalid_request_error",
-            "Completion endpoint is not supported in DP mode yet.",
-        )
-
     try:
         response_model = resolve_requested_model_or_error(request.model)
     except ValueError as e:
@@ -903,43 +728,39 @@ async def handle_completion_request(
         )
     except Exception as e:
         return anthropic_error(400, "invalid_request_error", f"Tokenize error: {e}")
-
+    prompt_len = len(prompt_tokens)
     max_new_tokens = request.max_tokens_to_sample or args.request.max_new_tokens
-    temperature = request.temperature if request.temperature is not None else 0.8
-    top_p = request.top_p if request.top_p is not None else 0.9
-    top_k = request.top_k if request.top_k is not None else 50
-    frequency_penalty = 0.0
-
-    req_id = gen_req_id()
-    try:
-        user_req = UserRequest(
-            message=[],
-            request_id=req_id,
-            tokens=prompt_tokens,
-            logprobs=False,
-            top_logprobs=None,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            frequency_penalty=frequency_penalty,
-            enable_reasoning=False,
-            save_trace_dir=args.debug.save_trace_dir,
-        )
-    except ValueError:
-        return anthropic_error(
-            400, "invalid_request_error", "prompt length is greater than max_seq_len"
-        )
-
-    task = Task(
-        user_req.request_id, user_req, stop_with_eos=True, priority=task_priority
+    max_new_tokens = UserRequest.cap_max_new_tokens(max_new_tokens, prompt_len)
+    sample_params = SampleParams(
+        request.temperature if request.temperature is not None else 0.8,
+        top_p=request.top_p if request.top_p is not None else 0.9,
+        top_k=request.top_k if request.top_k is not None else 50,
+        frequency_penalty=0.0,
     )
-    TaskPool.enqueue(task)
+    user_req = UserRequest(
+        request_id=gen_req_id(),
+        enable_thinking=False,
+        logprobs=False,
+        top_logprobs=None,
+        save_trace_dir=args.debug.save_trace_dir,
+        priority=priority,
+        stop_with_eos=True,
+        sample_params=sample_params,
+        tool_call_params=None,
+        prompt_tokens=prompt_tokens,
+        pixel_values=None,
+        grid_thw=None,
+        prompt_len=prompt_len,
+        max_new_tokens=max_new_tokens,
+        trace_data={},
+    )
+
+    await submit_request(user_req)
 
     if request.stream:
         return StreamingResponse(
             anthropic_completion_stream_from_async_stream(
-                req_obj=user_req, response_model=response_model
+                req=user_req, response_model=response_model
             ),
             media_type="text/event-stream",
         )
@@ -951,7 +772,7 @@ async def handle_completion_request(
         output_text, request.stop_sequences
     )
     stop_reason = stop_reason_override or map_finish_reason_to_completion_stop_reason(
-        getattr(user_req, "finish_reason", None)
+        user_req.finish_reason
     )
     return JSONResponse(
         {
@@ -962,94 +783,3 @@ async def handle_completion_request(
             "model": response_model,
         }
     )
-
-
-def create_router(
-    *,
-    get_server_status: Callable[[], bool],
-    get_dp_service_started: Callable[[], bool],
-    priority_for_api_key: Callable[[str], int],
-) -> APIRouter:
-    """
-    Create an APIRouter that exposes Anthropic-compatible endpoints.
-
-    We keep this in `anthropic_api.py` so `api_server.py` only needs to include the router.
-    """
-
-    router = APIRouter()
-
-    async def _dp_register_and_submit(router_request):
-        if not get_global_args().dp_config.enabled:
-            raise HTTPException(status_code=400, detail="DP mode not enabled")
-        if not get_dp_service_started():
-            raise HTTPException(status_code=503, detail="DP service not started")
-
-        from chitu.dp_token_router import get_token_router
-        from chitu.dp_request_router import get_request_router
-
-        token_router = get_token_router()
-        response = await token_router.register_request(
-            router_request.request_id, router_request
-        )
-
-        request_router = get_request_router()
-        await request_router.add_request(router_request)
-        return response
-
-    @router.post("/v1/messages")
-    async def v1_messages(
-        raw_request: Request,
-        authorization: Annotated[Optional[str], Header(alias="Authorization")] = None,
-        x_api_key: Annotated[Optional[str], Header(alias="x-api-key")] = None,
-    ):
-        try:
-            return await handle_messages_request(
-                raw_request=raw_request,
-                authorization=authorization,
-                x_api_key=x_api_key,
-                server_status=get_server_status(),
-                dp_enabled=get_global_args().dp_config.enabled,
-                dp_service_started=get_dp_service_started(),
-                dp_register_and_submit=_dp_register_and_submit,
-                priority_for_api_key=priority_for_api_key,
-            )
-        except HTTPException as e:
-            logger.info(
-                f"Rejected illegal request, returning {e}: {traceback.format_exc()}"
-            )
-            raise e
-        except Exception as e:
-            logger.exception(
-                f"Error processing request, got {e}: {traceback.format_exc()}"
-            )
-            raise HTTPException(status_code=500, detail="internal server error")
-
-    @router.post("/v1/complete")
-    async def v1_complete(
-        raw_request: Request,
-        authorization: Annotated[Optional[str], Header(alias="Authorization")] = None,
-        x_api_key: Annotated[Optional[str], Header(alias="x-api-key")] = None,
-    ):
-        try:
-            return await handle_completion_request(
-                raw_request=raw_request,
-                authorization=authorization,
-                x_api_key=x_api_key,
-                server_status=get_server_status(),
-                dp_enabled=get_global_args().dp_config.enabled,
-                dp_service_started=get_dp_service_started(),
-                dp_register_and_submit=_dp_register_and_submit,
-                priority_for_api_key=priority_for_api_key,
-            )
-        except HTTPException as e:
-            logger.info(
-                f"Rejected illegal request, returning {e}: {traceback.format_exc()}"
-            )
-            raise e
-        except Exception as e:
-            logger.exception(
-                f"Error processing request, got {e}: {traceback.format_exc()}"
-            )
-            raise HTTPException(status_code=500, detail="internal server error")
-
-    return router

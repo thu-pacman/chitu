@@ -13,6 +13,8 @@ from typing import Any, Optional
 
 import torch
 
+from chitu.task import UserRequest
+
 
 class PDRequestStatus(Enum):
     """PD request status"""
@@ -60,7 +62,7 @@ class PendingPDRequest:
     """Pending PD request"""
 
     request_id: str
-    original_request: Any  # ChatRequest type, avoid circular import
+    original_request: UserRequest
     prefill_scheduler_id: int
     decode_scheduler_id: int
     status: PDRequestStatus = PDRequestStatus.PENDING

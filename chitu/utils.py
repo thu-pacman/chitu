@@ -9,19 +9,20 @@ import os
 import re
 from pathlib import Path
 import random
-from typing import Optional, Sequence, Any
+from typing import Optional, Sequence, Any, TypeVar, get_type_hints
+from dataclasses import is_dataclass, fields
+from types import UnionType
 import importlib
 import importlib.resources
+from types import UnionType
 
 import torch
 import torch.distributed as dist
-from torch.distributed import get_rank, get_world_size
-
 from chitu.global_vars import get_global_args
 from chitu.import_utils import (
+    try_import_and_setup_torch_npu,
     try_import_platform_dep,
     try_import_opt_dep,
-    try_import_and_setup_torch_npu,
 )
 
 logger = getLogger(__name__)
@@ -491,3 +492,35 @@ class AsyncCPUTensor:
             self._event.synchronize()
             self._event = None
         return self._tensor
+
+
+def dataclass_to_dict(obj: Any) -> dict[str, Any] | Any:
+    """
+    将dataclass转为字典，支持field为 dataclass或Union[dataclass, ...] 的嵌套转换
+    """
+    if not is_dataclass(obj):
+        return obj
+    return {
+        field.name: dataclass_to_dict(getattr(obj, field.name)) for field in fields(obj)
+    }
+
+
+T = TypeVar("T")
+
+
+def dataclass_from_dict(data: Any, cls: type[T]) -> T:
+    """
+    将字典转为dataclass，支持field为 dataclass或Union[dataclass, ...] 的嵌套转换
+    """
+    if not is_dataclass(cls) or not isinstance(data, dict):
+        return data
+    kwargs = {}
+    type_hints = get_type_hints(cls)
+    for field in fields(cls):
+        fcls = type_hints[field.name]
+        if isinstance(fcls, UnionType):
+            for fcls in fcls.__args__:
+                if is_dataclass(fcls):
+                    break
+        kwargs[field.name] = dataclass_from_dict(data[field.name], fcls)
+    return cls(**kwargs)

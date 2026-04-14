@@ -10,7 +10,6 @@ PD disaggregation Scheduler
 - Decode-only：只做 decode 计算；KV pull 与首 token 处理由 KV hook 触发。
 """
 
-import os
 import time
 import threading
 import math
@@ -21,7 +20,6 @@ from typing import Any, Optional
 
 import torch
 import msgpack
-import asyncio
 import zmq
 
 from chitu.scheduler import Scheduler
@@ -29,8 +27,6 @@ from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 from chitu.task import (
     DPTaskCollector,
     PackedTasks,
-    PackedTasksBase,
-    SerializedPackedTasksPayloadType,
     Task,
     TaskPool,
     TaskType,
@@ -46,7 +42,6 @@ from chitu.distributed.pd_disaggregation.pd_log_utils import (
     pd_trace_enabled,
     pd_verbose_enabled,
 )
-from chitu.distributed.parallel_state import get_dp_group
 from chitu.backend import Backend
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
@@ -642,108 +637,29 @@ class PDScheduler(Scheduler):
             return []
         return super().schedule()
 
-    def _create_task_from_request(self, request, *, enqueue: bool = True) -> Task:
-        """Create Task object from request using existing UserRequest/Task semantics"""
-        # Support dict payload from Router
-        if isinstance(request, dict):
-            request_id = (
-                request.get("conversation_id")
-                or request.get("request_id")
-                or str(time.time())
-            )
-            messages = request.get("messages") or request.get("message") or []
-            max_new_tokens = (
-                request.get("max_new_tokens") or request.get("max_tokens") or 50
-            )
-            temperature = request.get("temperature", 1.0)
-            top_p = request.get("top_p", 0.9)
-            top_k = request.get("top_k", 50)
-            frequency_penalty = request.get("frequency_penalty", 0.0)
-            chat_template_kwargs = request.get("chat_template_kwargs", {})
-        else:
-            if hasattr(request, "conversation_id") and request.conversation_id:
-                request_id = request.conversation_id
-            elif hasattr(request, "request_id") and request.request_id:
-                request_id = request.request_id
-            else:
-                request_id = str(time.time())
-
-            if hasattr(request, "messages"):
-                messages = request.messages
-            elif hasattr(request, "message"):
-                messages = request.message
-            else:
-                messages = []
-
-            if hasattr(request, "max_new_tokens"):
-                max_new_tokens = request.max_new_tokens
-            elif hasattr(request, "max_tokens"):
-                max_new_tokens = request.max_tokens
-            else:
-                max_new_tokens = 50
-
-            temperature = (
-                request.temperature if hasattr(request, "temperature") else 1.0
-            )
-            top_p = request.top_p if hasattr(request, "top_p") else 0.9
-            top_k = request.top_k if hasattr(request, "top_k") else 50
-            frequency_penalty = (
-                request.frequency_penalty
-                if hasattr(request, "frequency_penalty")
-                else 0.0
-            )
-            chat_template_kwargs = (
-                request.chat_template_kwargs
-                if hasattr(request, "chat_template_kwargs")
-                else {}
-            )
-
-        user_req = UserRequest(
-            message=messages,
-            request_id=request_id,
-            max_new_tokens=int(max_new_tokens),
-            top_p=top_p,
-            top_k=top_k,
-            temperature=temperature,
-            frequency_penalty=frequency_penalty,
-            chat_template_kwargs=(
-                chat_template_kwargs if isinstance(chat_template_kwargs, dict) else {}
-            ),
-        )
-
-        stop_with_eos = True
-
-        # From dict payload
-        if isinstance(request, dict):
-            if request.get("ignore_eos") is True:
-                stop_with_eos = False
-            elif request.get("stop_with_eos") is False:
-                stop_with_eos = False
-        else:
-            # From object payloads
-            if hasattr(request, "ignore_eos") and request.ignore_eos is True:
-                stop_with_eos = False
-            elif hasattr(request, "stop_with_eos") and request.stop_with_eos is False:
-                stop_with_eos = False
-
+    def _create_task_from_request(
+        self, request_data: dict, *, enqueue: bool = True
+    ) -> Task:
+        """Create Task object from serialized request"""
+        assert isinstance(request_data, dict)
+        req = UserRequest.from_dict(request_data)
         task = Task(
-            task_id=user_req.request_id,
-            req=user_req,
-            priority=(request.priority if hasattr(request, "priority") else 1),
-            stop_with_eos=stop_with_eos,
+            task_id=req.request_id,
+            req=req,
+            priority=req.priority,
+            stop_with_eos=req.stop_with_eos,
         )
-        if task.req is not None:
-            # In PD disagg mode, prefill produces the first token.
-            # Decode should only generate up to max_seq_len - prompt_len tokens.
-            max_seq_len = get_global_args().infer.max_seq_len
-            allowed_new = max(0, int(max_seq_len) - int(task.prompt_len))
-            if int(task.req.max_new_tokens) > allowed_new:
-                logger.warning(
-                    f"[PD_DECODE] clamp max_new_tokens: req_id={task.task_id} "
-                    f"prompt_len={int(task.prompt_len)} max_seq_len={int(max_seq_len)} "
-                    f"max_new_tokens={int(task.req.max_new_tokens)} -> {int(allowed_new)}"
-                )
-                task.req.max_new_tokens = int(allowed_new)
+        # In PD disagg mode, prefill produces the first token.
+        # Decode should only generate up to max_seq_len - prompt_len tokens.
+        max_seq_len = get_global_args().infer.max_seq_len
+        allowed_new = max(0, int(max_seq_len) - int(task.prompt_len))
+        if int(task.req.max_new_tokens) > allowed_new:
+            logger.warning(
+                f"[PD_DECODE] clamp max_new_tokens: req_id={task.task_id} "
+                f"prompt_len={int(task.prompt_len)} max_seq_len={int(max_seq_len)} "
+                f"max_new_tokens={int(task.req.max_new_tokens)} -> {int(allowed_new)}"
+            )
+            task.req.max_new_tokens = int(allowed_new)
         # For PD services, keep request handling non-blocking and thread-safe:
         # enqueue tasks here; the background compute loop (start_worker -> chitu_run())
         # will call TaskPool.add_all_queued() and drive batched scheduling/execution.

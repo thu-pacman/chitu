@@ -69,7 +69,7 @@ def main(args: ServeConfig):
             uvicorn_thread.start()
 
         # Set server status at module level
-        api_server.server_status = True
+        api_server.set_server_status(True)
         start_worker()
 
         # Worker loop exited (termination signal received)

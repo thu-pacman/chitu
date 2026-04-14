@@ -3,18 +3,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .utils import (
-    get_tool_parser,
+    get_tool_parser_cls,
     parse_stream_by_parser,
     adjust_message_for_tool_calls,
     patch_chat_template,
+    build_grammar,
 )
 from .type_def import (
     ChoiceDelta,
     ChoiceToolCall,
     ToolCallParams,
-    ToolChoice,
-    ToolChoiceNamedTool,
-    ToolChoiceFunction,
+    ToolConfig,
 )
 
 # import is required, otherwise the module is not initialized, and the class will not register

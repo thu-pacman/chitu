@@ -118,7 +118,7 @@ class DPTokenSender:
         token: Optional[int],
         top_logprobs: Optional[list[float]] = None,
         top_token_idx: Optional[list[int]] = None,
-        task=None,  # Add task parameter to get prompt_len
+        task: Task | None = None,  # Add task parameter to record ttft
     ):
         """Send a single token to the Router"""
         # Check if this is the first token and get prompt_len
@@ -126,73 +126,18 @@ class DPTokenSender:
         if is_first_token:
             self._first_token_sent.add(request_id)
 
-        # logger.debug(
-        #     f"DP Token Sender: [request {request_id}] prepare to send token {token}, is_first_token={is_first_token}"
-        # )
-
-        # Decode token to text
-        text = ""
-        if Backend.tokenizer is not None:
-            # Initialize cache for this request
-            if request_id not in self.request_token_cache:
-                self.request_token_cache[request_id] = []
-                self._chars_len[request_id] = 0
-
-            # Accumulate tokens
-            if token is not None:
-                self.request_token_cache[request_id].append(token)
-            cache_tokens = self.request_token_cache[request_id]
-            if len(cache_tokens) == 0:
-                return
-
-            # Decode incremental tokens if force_full_seq_decode is False
-            s = Backend.tokenizer.decode(cache_tokens)
-
-            # Skip if incomplete UTF-8 sequence (wait for more tokens)
-            # TODO: avoid hardcode max length of cache_tokens (from chitu/async_response.py)
-            if "\ufffd" in s and len(cache_tokens) <= 10:
-                text = ""
-            else:
-                # Output incremental text
-                if not Backend.tokenizer.force_full_seq_decode:
-                    text = s
-                    self.request_token_cache[request_id].clear()
-                else:
-                    text = s[self._chars_len[request_id] :]
-                    self._chars_len[request_id] = len(s)
-
-            # logger.debug(
-            #     f"DP Token Sender: [request {request_id}] decode token {token} -> '{text}'"
-            # )
-        elif token is not None:
-            logger.warning(
-                f"DP Token Sender: [request {request_id}] tokenizer not available, cannot decode token {token}"
-            )
-            text = f"[TOKEN_{token}]"
-        else:
-            # tokenizer = None & token = None
-            return
-
-        # Decode top_tokens (if present)
-        top_tokens_text = None
-        if top_token_idx is not None and Backend.tokenizer is not None:
-            top_tokens_text = [Backend.tokenizer.decode([idx]) for idx in top_token_idx]
-            # logger.info(
-            #     f"DP Token Sender: [request {request_id}] decode top_tokens {top_token_idx} -> {top_tokens_text}"
-            # )
-
-        data = {
-            "type": "token",
-            "request_id": request_id,
-            "text": text,
-            "original_token_id": token,
-            "scheduler_id": self.dp_group_id,
-            "timestamp": time.time(),
-        }
+        data = dict(
+            type="token",
+            request_id=request_id,
+            token=token,
+            top_logprobs=top_logprobs,
+            top_token_idx=top_token_idx,
+            scheduler_id=self.dp_group_id,
+            timestamp=time.time(),
+        )
 
         # If first token and task provided, include prompt_len info
         if is_first_token and task is not None and task.req is not None:
-            data["prompt_len"] = task.req.prompt_len
             # Record TTFT metric
             _created_ts = getattr(task, "_pd_created_ts", None)
             if _created_ts is not None:
@@ -200,12 +145,6 @@ class DPTokenSender:
             logger.debug(
                 f"DP Token Sender: [request {request_id}] first token, prompt_len={task.req.prompt_len}, token={token}"
             )
-
-        if top_logprobs is not None:
-            data["top_logprobs"] = top_logprobs
-        if top_tokens_text is not None:
-            data["top_tokens_text"] = top_tokens_text
-
         self._send_data(data)
 
     def send_finish(self, request_id: str, finish_reason: str = "stop"):

@@ -31,6 +31,7 @@ from chitu.metrics.prometheus_collector import (
     chitu_router_pending_requests,
     observe_pd_stage,
 )
+from chitu.task import UserRequest
 
 logger = logging.getLogger(__name__)
 
@@ -214,7 +215,7 @@ class PDRequestRouter(RequestRouter):
                 self.bootstrap_server.start_in_background()
                 logger.info("mooncake bootstrap server started")
 
-    async def add_request(self, request):
+    async def add_request(self, request: UserRequest):
         """Add request to router"""
         if self.pd_enabled:
             await self._add_pd_request(request)
@@ -222,9 +223,9 @@ class PDRequestRouter(RequestRouter):
             # 使用父类的逻辑
             await super().add_request(request)
 
-    async def _add_pd_request(self, request):
+    async def _add_pd_request(self, request: UserRequest):
         """Add PD disaggregation request"""
-        request_id = getattr(request, "request_id", str(time.time()))
+        request_id = request.request_id
         logger.debug(f"[PD_STAGE][router.recv.start] req_id={request_id}")
 
         with observe_pd_stage("router", "recv"):
@@ -237,14 +238,11 @@ class PDRequestRouter(RequestRouter):
                 return
 
             # PD trace: Router selected a P/D pair for this request.
-            messages = getattr(request, "message", getattr(request, "messages", None))
-            msg_count = len(messages) if isinstance(messages, list) else None
-            max_new = getattr(
-                request, "max_new_tokens", getattr(request, "max_tokens", None)
-            )
+            prompt_len = request.prompt_len
+            max_new_tokens = request.max_new_tokens
             logger.debug(
                 f"[PD_TRACE][router.select_pair] req_id={request_id} prefill_sid={prefill_scheduler_id} "
-                f"decode_sid={decode_scheduler_id} msg_count={msg_count} max_new_tokens={max_new}"
+                f"decode_sid={decode_scheduler_id} {prompt_len=} {max_new_tokens=}"
             )
 
             # Create PD request record
@@ -322,15 +320,19 @@ class PDRequestRouter(RequestRouter):
         logger.info("starting pd request processor")
 
         while True:
-            if self.pending_requests:
-                pd_request = self.pending_requests.popleft()
+            try:
+                if self.pending_requests:
+                    pd_request = self.pending_requests.popleft()
 
-                if isinstance(pd_request, PendingPDRequest):
-                    await self._process_pd_request(pd_request)
-                else:
-                    raise ValueError(f"unexpected request type: {type(pd_request)}")
+                    if isinstance(pd_request, PendingPDRequest):
+                        await self._process_pd_request(pd_request)
+                    else:
+                        raise ValueError(f"unexpected request type: {type(pd_request)}")
 
-            await asyncio.sleep(0.01)  # 10ms polling interval
+                await asyncio.sleep(0.01)  # 10ms polling interval
+            except:
+                logger.exception("Failed to process PD request")
+                raise
 
     async def _process_pd_request(self, pd_request: PendingPDRequest):
         """Process PD disaggregation request"""
@@ -339,12 +341,9 @@ class PDRequestRouter(RequestRouter):
         pd_request.prefill_start_time = time.time()
 
         # Prepare request data
-        serializable_request = self._serialize_original_request(
-            pd_request.original_request
-        )
         request_data = {
             "request_id": pd_request.request_id,
-            "request": serializable_request,
+            "request": pd_request.original_request.to_dict(),
             "type": "pd_request",
         }
 
@@ -383,82 +382,6 @@ class PDRequestRouter(RequestRouter):
         logger.debug(f"pd disaggregation request dispatched: {pd_request.request_id}")
         # Update router performance counters on successful dispatch
         self.total_requests += 1
-
-    def _serialize_original_request(self, req) -> dict:
-        """Convert RouterRequest/ChatRequest/dict to a msgpack-serializable dict"""
-        # dict-like
-        if isinstance(req, dict):
-            return req
-        # pydantic-like
-        if hasattr(req, "model_dump"):
-            return req.model_dump()
-        # RouterRequest object from chitu.task
-        # Extract common fields safely
-        request_id = getattr(
-            req, "request_id", getattr(req, "conversation_id", str(time.time()))
-        )
-        messages = getattr(req, "message", getattr(req, "messages", []))
-        messages = self._serialize_messages(messages)
-        max_new_tokens = getattr(req, "max_new_tokens", getattr(req, "max_tokens", 100))
-        logprobs = getattr(req, "logprobs", False)
-        top_logprobs = getattr(req, "top_logprobs", None)
-        temperature = getattr(
-            getattr(req, "params", None),
-            "temperature",
-            getattr(req, "temperature", 1.0),
-        )
-        top_p = getattr(
-            getattr(req, "params", None), "top_p", getattr(req, "top_p", 0.9)
-        )
-        top_k = getattr(
-            getattr(req, "params", None), "top_k", getattr(req, "top_k", 50)
-        )
-        frequency_penalty = getattr(
-            getattr(req, "params", None),
-            "frequency_penalty",
-            getattr(req, "frequency_penalty", 0.0),
-        )
-        ignore_eos = getattr(req, "stop_with_eos", True)
-        chat_template_kwargs = getattr(req, "chat_template_kwargs", {})
-        return {
-            "conversation_id": request_id,
-            "messages": messages,
-            "max_new_tokens": max_new_tokens,
-            "logprobs": logprobs,
-            "top_logprobs": top_logprobs,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "frequency_penalty": frequency_penalty,
-            # For PD path, align naming with downstream: use explicit ignore_eos flag
-            # True  -> allow generation beyond EOS (i.e., don't stop at EOS)
-            # False -> stop at EOS
-            "ignore_eos": not ignore_eos,
-            # Also include stop_with_eos explicitly to avoid default being misread downstream
-            "stop_with_eos": ignore_eos,
-            "chat_template_kwargs": chat_template_kwargs,
-        }
-
-    def _serialize_messages(self, messages) -> list:
-        """Convert list of Message/BaseModel/dict to list of plain dicts"""
-        serial = []
-        if messages is None:
-            return serial
-        for m in messages:
-            # pydantic BaseModel
-            if hasattr(m, "model_dump"):
-                d = m.model_dump()
-                serial.append({"role": d.get("role"), "content": d.get("content")})
-                continue
-            # dict
-            if isinstance(m, dict):
-                serial.append({"role": m.get("role"), "content": m.get("content")})
-                continue
-            # generic object with attributes
-            role = getattr(m, "role", None)
-            content = getattr(m, "content", None)
-            serial.append({"role": role, "content": content})
-        return serial
 
     async def _send_to_prefill_scheduler(self, scheduler_id: int, request_data: dict):
         """Send request to Prefill Scheduler"""

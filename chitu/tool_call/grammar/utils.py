@@ -10,26 +10,28 @@ from xgrammar.structural_tag import (
     ConstStringFormat,
 )
 from .tools import AbstractToolsGrammar
-from ..type_def import ToolCallParams, ToolChoiceNamedTool, ConstraintParams
+from ..type_def import ToolCallParams, ConstraintParams
+from chitu.reasoning.utils import get_reasoning_params
 
 
 def process_tool_call_params(params: ToolCallParams) -> ConstraintParams:
-    if params.tool_choice == "none":
-        raise NotImplementedError
-    if isinstance(params.tool_choice, ToolChoiceNamedTool):
-        at_least_one = True
-        stop_after_first = True
-        forced_tool = params.tool_choice.function.name
-    else:
-        at_least_one = params.tool_choice == "required"
-        stop_after_first = not params.parallel_tool_calls
-        forced_tool = None
+    assert params.config.choice != "none"
+    at_least_one = params.config.choice == "required"
+    stop_after_first = params.config.at_most_one
 
     tool_schemas = {
         tool["function"]["name"]: tool["function"]["parameters"]
         for tool in params.tools
-        if forced_tool is None or forced_tool == tool["function"]["name"]
     }
+    if params.config.subset is not None:
+        tool_schemas = {
+            k: tool_schemas[k] for k in params.config.subset if k in tool_schemas
+        }
+
+    if at_least_one and not tool_schemas:
+        raise ValueError("tool choice is required but no valid tool")
+    if len(tool_schemas) <= 1:
+        stop_after_first = True
 
     return ConstraintParams(
         at_least_one=at_least_one,
@@ -46,7 +48,7 @@ def compile_format_to_grammar(format: Format):
 def build_reasoning_grammar(format: Format, constraint: ConstraintParams):
     if not constraint.at_least_one:
         return format
-    reasoning_params = constraint.params.reasoning_params
+    reasoning_params = get_reasoning_params(constraint.params.enable_thinking)
     if not reasoning_params.enable_reasoning:
         return format
 

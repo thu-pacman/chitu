@@ -2,7 +2,7 @@ import pytest
 from chitu.kv_cache import PagedKVCacheManager, TokenBlock, NONE_BLK_HASH
 from weakref import WeakValueDictionary
 from collections import deque
-from chitu.task import MockFixedLengthedUserRequest, Task
+from chitu.task import UserRequest, Task
 from chitu.task_type import TaskType
 from omegaconf import OmegaConf
 from chitu.global_vars import set_global_args
@@ -142,8 +142,8 @@ class TestPagedKVCacheManager:
         Backend.cache_managers = [{"main": cache_manager}]
 
         # 在warmup或API server中完成的步骤
-        req = MockFixedLengthedUserRequest(
-            input_len=600, request_id=f"test_task", enable_reasoning=False
+        req = UserRequest.create_mock(
+            input_len=600, request_id=f"test_task", enable_thinking=False
         )
         task = Task(f"{req.request_id}", req)
         task.task_type == TaskType.Prefill
@@ -301,8 +301,8 @@ class TestPagedKVCacheManagerWithPrefixCaching:
         Backend.cache_managers = [{"main": cache_manager_with_prefix_caching}]
 
         # 在warmup或API server中完成的步骤
-        req_0 = MockFixedLengthedUserRequest(
-            input_len=1024, request_id=f"req_0", enable_reasoning=False
+        req_0 = UserRequest.create_mock(
+            input_len=1024, request_id=f"req_0", enable_thinking=False
         )
         task_0 = Task(f"{req_0.request_id}", req_0)
         task_0.task_type == TaskType.Prefill
@@ -346,8 +346,8 @@ class TestPagedKVCacheManagerWithPrefixCaching:
 
         # 测试req_1的token被部分击中时
         # 此时来了一条req_1请求
-        req_1 = MockFixedLengthedUserRequest(
-            input_len=600, request_id=f"req_1", enable_reasoning=False
+        req_1 = UserRequest.create_mock(
+            input_len=600, request_id=f"req_1", enable_thinking=False
         )
         task_1 = Task(f"{req_1.request_id}", req_1)
         task_1.task_type == TaskType.Prefill
@@ -395,8 +395,8 @@ class TestPagedKVCacheManagerWithPrefixCaching:
         )
 
         # 测试req_2的token被全部击中时
-        req_2 = MockFixedLengthedUserRequest(
-            input_len=1024, request_id=f"req_2", enable_reasoning=False
+        req_2 = UserRequest.create_mock(
+            input_len=1024, request_id=f"req_2", enable_thinking=False
         )
         task_2 = Task(f"{req_2.request_id}", req_2)
         task_2.task_type == TaskType.Prefill

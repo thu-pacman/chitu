@@ -193,12 +193,13 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens, frequency_penalty):
     reqs: list[UserRequest] = []
     for i in range(num_reqs):
         msg = generate_prompt(prompt_len - 1, Backend.tokenizer)
-        req = UserRequest(
+        req = UserRequest.create(
             msg,
             f"{gen_req_id()}",
             max_new_tokens=max_new_tokens,
             frequency_penalty=frequency_penalty,
         )
+        req.messages = msg
         reqs.append(req)
     return reqs
 
@@ -206,13 +207,15 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens, frequency_penalty):
 def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty):
     reqs: list[UserRequest] = []
     for i in range(num_reqs):
-        req = UserRequest(
-            msgs[i % len(msgs)],
+        msg = msgs[i % len(msgs)]
+        req = UserRequest.create(
+            msg,
             f"{gen_req_id()}",
             max_new_tokens=max_new_tokens,
             frequency_penalty=frequency_penalty,
             temperature=1,
         )
+        req.messages = msg
         reqs.append(req)
     return reqs
 
@@ -268,7 +271,7 @@ def run(args: ServeConfig, results_ref):
             for req in reqs:
                 logger.info(f"Response {len(req._test_tokens)} tokens: {req.output}")
                 result = {
-                    "prompt": req.message[0]["content"],
+                    "prompt": req.messages[0]["content"],
                     "topk_logits": torch.stack(req._test_topk_logits),
                     "topk_tokens": torch.stack(req._test_topk_tokens),
                     "tokens": torch.tensor(req._test_tokens),

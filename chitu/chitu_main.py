@@ -39,7 +39,6 @@ from chitu.task import (
     TaskPool,
     TaskType,
     UserRequest,
-    MockFixedLengthedUserRequest,
     TaskCollector,
     DPTaskCollector,
 )
@@ -364,9 +363,9 @@ def _warmup_via_taskpool(args):
         prefill_chunk_size = args.infer.max_seq_len * args.infer.max_batch_size
     if rank == 0:
         for i in range(num_warmup_reqs):
-            req = MockFixedLengthedUserRequest(
-                warmup_seq_len,
-                f"{gen_req_id()}",
+            req = UserRequest.create_mock(
+                input_len=warmup_seq_len,
+                request_id=f"{gen_req_id()}",
                 max_new_tokens=_warmup_max_new_tokens,
                 temperature=0.7,
                 top_k=1,
@@ -1201,27 +1200,9 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
 async def process_scheduler_request(rank: int, request_data: dict):
     """Handle scheduling requests from Router"""
     try:
-        # Build UserRequest object
-        request_id = request_data.get("request_id", gen_req_id())
-        message = request_data.get("message", [])
-        max_new_tokens = request_data.get("max_new_tokens", 50)
-        temperature = request_data.get("temperature", 1.0)
-        top_p = request_data.get("top_p", 1.0)
-        top_k = request_data.get("top_k", 50)
-        logprobs = request_data.get("logprobs", False)
-        top_logprobs = request_data.get("top_logprobs", None)
-
         # Create UserRequest
-        user_request = UserRequest(
-            message=message,
-            request_id=request_id,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            logprobs=logprobs,
-            top_logprobs=top_logprobs,
-        )
+        user_request = UserRequest.from_dict(request_data)
+        request_id = user_request.request_id
 
         # Create Task, honoring stop/ignore_eos semantics from request_data
         stop_with_eos = True

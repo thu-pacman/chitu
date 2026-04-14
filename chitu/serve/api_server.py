@@ -12,49 +12,37 @@ import os
 import time
 import traceback
 from logging import getLogger
-from typing import Any, Optional, Mapping, Annotated
+from typing import Optional, Annotated
 from contextlib import suppress
 
 import uvicorn
 import resource
-from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Header, Request, Depends
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 
-from chitu.async_response import AsyncResponse
 from chitu.backend import Backend
 from chitu.dp_request_router import get_request_router
 from chitu.dp_token_router import get_token_router
 from chitu.global_vars import get_global_args, set_global_args
+from chitu.task import TaskPool
 from chitu.profiler import MemoryRecorder
-from chitu.task import RouterRequest, Task, TaskPool, UserRequest, SampleParams
-from chitu.utils import gen_req_id
 from chitu.serve.event_loop import start_server_in_new_event_loop
 from chitu.serve.common import (
     get_profile_output_root,
     queue_mem_dump,
     queue_profile_start,
     queue_profile_stop,
-    set_min_batch_size,
-    get_priority_from_api_key,
-    parse_api_key_from_headers,
-    submit_request,
     build_chat_template_kwargs,
+    parse_api_key_from_headers,
+    get_priority_from_api_key,
 )
 from chitu.serve.router import start_dp_components
-from chitu.tool_call import ToolChoice, ChoiceToolCall, adjust_message_for_tool_calls
-from chitu.serve.anthropic_api import create_router as create_anthropic_router
-from chitu.serve.responses_api import create_router as create_responses_router
+from chitu.tool_call import adjust_message_for_tool_calls
+from chitu.serve import openai_api, anthropic_api, responses_api
 
 logger = getLogger(__name__)
-
-# Global variables
-server_status = False
-rank = 0
-
-# DP related globals
-dp_service_started = False
 
 # Reference to the uvicorn server instance for graceful shutdown
 _uvicorn_server: Optional["uvicorn.Server"] = None
@@ -91,80 +79,22 @@ async def reject_overload(request: Request, call_next):
     return await call_next(request)
 
 
-class Message(BaseModel):
-    role: str = "user"
-    # Note on `None` on `content`: OpenClaw may set `content` to be `None`, although this
-    # does not comply with OpenAI spec.
-    content: str | list[str | dict] | None = "hello, who are you"
-    reasoning_content: str | None = None
-    tool_calls: list[ChoiceToolCall] = []
-    tool_call_id: str | None = None  # useless, at least for qwen3
+server_status = False
 
 
-class StreamOptions(BaseModel):
-    include_usage: bool = True
+def get_server_status():
+    global server_status
+    return server_status
 
 
-class ChatRequest(BaseModel):
-    conversation_id: str = Field(default_factory=gen_req_id)
-    messages: list[Message]
-    tools: list[dict] = []
-    tool_choice: ToolChoice = "auto"
-    parallel_tool_calls: bool = True
-    logprobs: bool = False
-    top_logprobs: Optional[int] = None
-    max_completion_tokens: Optional[int] = None
-    max_tokens: Optional[int] = Field(default=None, deprecated=True)
-    stream: bool = False
-    stream_options: StreamOptions = Field(default_factory=StreamOptions)
-    temperature: float = 0.8  # [0, 2]
-    top_p: float = 0.9  # [0,1]
-    top_k: int = 50  # -1 or positive integer
-    frequency_penalty: float = 0.0  # [-2, 2]
-    min_batch_size: int = 1
-    stop_with_eos: Optional[bool] = None
-    ignore_eos: Optional[bool] = None  # Compatible with vLLM. Not a OpenAI standard
-    chat_template_kwargs: Mapping[str, Any] = {}
-    enable_thinking: bool = True
-    extra_body: Mapping[str, Any] = {}
-
-    @model_validator(mode="after")
-    def validate_eos_setting(self):
-        if (
-            self.stop_with_eos is not None
-            and self.ignore_eos is not None
-            and self.stop_with_eos != (not self.ignore_eos)
-        ):
-            raise ValueError(
-                "stop_with_eos and ignore_eos cannot be conflict. Please use only one of them."
-            )
-        if self.stop_with_eos is None and self.ignore_eos is None:
-            self.stop_with_eos = True
-        if self.stop_with_eos is None:
-            self.stop_with_eos = not self.ignore_eos
-        return self
-
-    @model_validator(mode="after")
-    def validate_output_tokens(self):
-        # Handle deprecated fields or compatibility fields
-        if (
-            self.max_tokens is not None
-            and self.max_completion_tokens is not None
-            and self.max_tokens != self.max_completion_tokens
-        ):
-            raise ValueError(
-                "max_tokens and max_completion_tokens cannot be conflict. Please use only one of them."
-            )
-        if self.max_tokens is None and self.max_completion_tokens is not None:
-            self.max_tokens = self.max_completion_tokens
-        if self.max_completion_tokens is None and self.max_tokens is not None:
-            self.max_completion_tokens = self.max_tokens
-        return self
+def set_server_status(new_status: bool):
+    global server_status
+    server_status = new_status
 
 
 class TokenizeRequest(BaseModel):
     prompt: str | None = None
-    messages: list[Message] | None = None
+    messages: list[openai_api.Message] | None = None
     enable_thinking: bool = True
 
     @model_validator(mode="after")
@@ -193,53 +123,31 @@ class ProfileRequest(BaseModel):
     memory_max_entries: int = Field(default=100000, ge=1)
 
 
-def build_user_request(req: ChatRequest, priority: int = 1) -> UserRequest:
-    # enable_thinking / max_new_tokens / chat_template_kwargs
-    args = get_global_args()
-    id = gen_req_id()
-    max_new_tokens = req.max_tokens or args.request.max_new_tokens
-    enable_thinking = req.extra_body.get(
-        "enable_thinking",
-        req.chat_template_kwargs.get("enable_thinking", req.enable_thinking),
-    )
-    # Reconstruct chat_template_kwargs to prevent injection attacks
-    chat_template_kwargs = build_chat_template_kwargs(enable_thinking)
-    return UserRequest(
-        [msg.model_dump() for msg in req.messages],
-        id,
-        tools=req.tools,
-        tool_choice=req.tool_choice,
-        parallel_tool_calls=req.parallel_tool_calls,
-        logprobs=req.logprobs,
-        top_logprobs=req.top_logprobs,
-        max_new_tokens=max_new_tokens,
-        temperature=req.temperature,
-        top_p=req.top_p,
-        top_k=req.top_k,
-        frequency_penalty=req.frequency_penalty,
-        chat_template_kwargs=chat_template_kwargs,
-        enable_reasoning=enable_thinking,
-        save_trace_dir=args.debug.save_trace_dir,
-        priority=priority,
-        stop_with_eos=req.stop_with_eos,
-    )
+# ====== FastAPI Utils ======
 
 
-# Include Anthropic-compatible API routes (keep api_server.py thin)
-app.include_router(
-    create_anthropic_router(
-        get_server_status=lambda: server_status,
-        get_dp_service_started=lambda: dp_service_started,
-        priority_for_api_key=get_priority_from_api_key,
+async def api_guard(
+    authorization: Annotated[Optional[str], Header(alias="Authorization")] = None,
+    x_api_key: Annotated[Optional[str], Header(alias="x-api-key")] = None,
+) -> int:
+    """Validate api key, server status, return priority"""
+
+    if not get_server_status():
+        raise HTTPException(503, "Service is not started")
+
+    api_key = parse_api_key_from_headers(authorization, x_api_key)
+    priority = get_priority_from_api_key(api_key)
+    return priority
+
+
+@app.exception_handler(Exception)
+async def handle_generic_exception(request, e: Exception):
+    logger.error("Unhandled internal exception", exc_info=e)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(e)},
     )
-)
-app.include_router(
-    create_responses_router(
-        get_server_status=lambda: server_status,
-        get_dp_service_started=lambda: dp_service_started,
-        priority_for_api_key=get_priority_from_api_key,
-    )
-)
+
 
 # ====== Standard HTTP Endpoints ======
 
@@ -253,7 +161,7 @@ async def list_models():
                 "id": get_global_args().models.name,
                 "object": "model",
                 "created": 0,
-                "owned_by": "organization-owner",
+                "owned_by": "unknown",
             }
         ],
     }
@@ -261,83 +169,58 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(
-    raw_request: Request,
-    authorization: Annotated[Optional[str], Header(alias="Authorization")] = None,
+    request: openai_api.ChatRequest,
+    priority=Depends(api_guard),
 ):
-    global server_status
+    """openai chat.completions endpoint"""
 
-    try:
-        if not server_status:
-            return {"message": "Service is not started"}
+    return await openai_api.handle_chat_completion(request=request, priority=priority)
 
-        args = get_global_args()
 
-        api_key = parse_api_key_from_headers(authorization)
-        task_priority = get_priority_from_api_key(api_key)
+@app.post("/v1/messages")
+async def v1_messages(
+    request: anthropic_api.AnthropicMessagesRequest,
+    priority=Depends(api_guard),
+):
+    """anthropic messages endpoint"""
+    return await anthropic_api.handle_messages_request(
+        request=request, priority=priority
+    )
 
-        # Parse JSON body tolerant to missing/incorrect content-type
-        try:
-            data = await raw_request.json()
-        except Exception:
-            raise HTTPException(
-                status_code=400, detail="Invalid JSON body. Expecting JSON payload."
-            )
 
-        try:
-            req: ChatRequest = ChatRequest.model_validate(data)
-        except ValidationError as e:
-            # Keep consistency with FastAPI default behavior for body validation errors
-            raise HTTPException(status_code=422, detail=e.errors())
+@app.post("/v1/complete")
+async def v1_complete(
+    request: anthropic_api.AnthropicCompletionRequest,
+    priority=Depends(api_guard),
+):
+    """anthropic complete endpoint"""
+    return await anthropic_api.handle_completion_request(
+        request=request,
+        priority=priority,
+    )
 
-        # Check if DP mode is enabled and use appropriate processing
-        if get_global_args().dp_config.enabled:
-            logger.debug(f"[HTTP] Using DP mode for request: {req.conversation_id}")
-            return await process_dp_chat_completion(req)
 
-        set_min_batch_size(req.min_batch_size)
-
-        user_req = build_user_request(req, task_priority)
-        response = submit_request(user_req)
-        if req.stream:
-            return StreamingResponse(
-                response.stream_generator(
-                    include_usage=req.stream_options.include_usage
-                ),
-                media_type="text/event-stream",
-            )
-        else:
-            full_response = await response.full_generator()
-            response_dict = full_response.model_dump()
-            response_dict.update(
-                {
-                    "model": args.models.name,
-                }
-            )
-            return JSONResponse(response_dict)
-    except HTTPException as e:
-        logger.info(
-            f"Rejected illegal request, returning {e}: {traceback.format_exc()}"
-        )
-        raise e
-    except Exception as e:
-        logger.exception(f"Error processing request, got {e}: {traceback.format_exc()}")
-        with suppress(Exception):
-            del user_req
-        with suppress(Exception):
-            del response
-        raise HTTPException(status_code=500, detail="internal server error")
+@app.post("/v1/responses")
+async def v1_responses(
+    request: responses_api.ResponsesCreateRequest,
+    priority=Depends(api_guard),
+):
+    """openai responses endpoint"""
+    return await responses_api.handle_responses_request(
+        request=request,
+        priority=priority,
+    )
 
 
 @app.post("/init")
 async def init_chitu_service():
-    global server_status
-    if server_status:
+    if get_server_status():
         return {"message": "Service has been started."}
     args = get_global_args()
     from chitu.chitu_main import chitu_init
 
     chitu_init(args)
-    server_status = True
+    set_server_status(True)
     return {"message": "Service initial done."}
 
 
@@ -347,8 +230,8 @@ class TerminateRequest(BaseModel):
 
 @app.post("/terminate_engine")
 async def terminate_engine(request: TerminateRequest):
-    global server_status, _uvicorn_server
-    if not server_status:
+    global _uvicorn_server
+    if not get_server_status():
         return JSONResponse(
             status_code=400,
             content={"message": "Service has not been initialized."},
@@ -364,7 +247,7 @@ async def terminate_engine(request: TerminateRequest):
     logger.info(
         "[terminate_engine] Termination requested, draining in-flight requests..."
     )
-    server_status = False
+    set_server_status(False)
 
     # Set Terminating (not Terminated) so the worker thread finishes
     # in-flight requests before broadcasting TerminateBackend.
@@ -381,17 +264,14 @@ async def terminate_engine(request: TerminateRequest):
 
 @app.post("/status")
 async def get_chitu_status():
-    global server_status
-    return {"message": f"{server_status}"}
+    return {"message": f"{get_server_status()}"}
 
 
 @app.post("/load_status")
 async def get_chitu_load_status():
     args = get_global_args()
-    load_score = sum(
-        getattr(task, "prefix_tokens_len", 0) for task in TaskPool.pool.values()
-    )
-    handle_reqs = len(TaskPool.pool) + len(getattr(TaskPool, "pending_queue", []))
+    load_score = sum(task.prefix_tokens_len for task in TaskPool.pool.values())
+    handle_reqs = len(TaskPool.pool) + len(TaskPool.pending_queue)
     return {
         "load_score": f"{load_score}",
         "handle_reqs": f"{handle_reqs}",
@@ -502,9 +382,9 @@ async def tokenize(raw_request: Request):
                 status_code=503, detail="Chat formatter not available on this endpoint"
             )
         tools = []
-        tool_choice: ToolChoice = "auto"
+        tool_choice = "auto"
         with suppress(ValidationError):
-            chat_request = ChatRequest.model_validate(data)
+            chat_request = openai_api.ChatRequest.model_validate(data)
             enable_thinking = chat_request.extra_body.get(
                 "enable_thinking",
                 chat_request.chat_template_kwargs.get(
@@ -517,8 +397,7 @@ async def tokenize(raw_request: Request):
         if tools and tool_choice != "none":
             chat_template_kwargs["tools"] = tools
         message = [message.model_dump() for message in request.messages]
-        if hasattr(Backend, "tool_parser"):
-            message = adjust_message_for_tool_calls(Backend.tool_parser, message)
+        message = adjust_message_for_tool_calls(message)
         tokens = Backend.formatter.encode_dialog_prompt(
             message,
             chat_template_kwargs=chat_template_kwargs,
@@ -556,129 +435,6 @@ async def detokenize(raw_request: Request):
     return {"prompt": prompt}
 
 
-# ====== DP Processing Functions ======
-
-
-async def process_dp_chat_completion(request: ChatRequest):
-    """Process chat completion request using DP mode"""
-    global dp_service_started
-
-    # Detailed DP request processing logs
-    start_time = time.time()
-    logger.debug(f"[DP_HTTP] Processing DP mode request: {request.conversation_id}")
-
-    try:
-        dp_enabled = get_global_args().dp_config.enabled
-
-        if not dp_enabled:
-            logger.error(
-                f"[DP_HTTP] DP mode not enabled for request: {request.conversation_id}"
-            )
-            raise HTTPException(status_code=400, detail="DP mode not enabled")
-
-        if not dp_service_started:
-            logger.error(
-                f"[DP_HTTP] DP service not started for request: {request.conversation_id}"
-            )
-            raise HTTPException(status_code=503, detail="DP service not started")
-
-        # Process request parameters
-        message = request.messages
-        req_id = request.conversation_id
-        logprobs = request.logprobs
-        top_logprobs = request.top_logprobs
-        max_new_tokens = request.max_tokens or 100
-        temperature = request.temperature
-        top_p = request.top_p
-        top_k = request.top_k
-        frequency_penalty = request.frequency_penalty
-        stream = request.stream
-        stop_with_eos = request.stop_with_eos
-
-        logger.debug(
-            f"[DP_HTTP] Request parameters parsed: max_tokens={max_new_tokens}, temp={temperature}, stream={stream}"
-        )
-
-        # Create lightweight router request (no tokenization)
-        router_request = RouterRequest(
-            message=message,
-            request_id=req_id,
-            tools=request.tools,
-            tool_choice=request.tool_choice,
-            parallel_tool_calls=request.parallel_tool_calls,
-            logprobs=logprobs,
-            top_logprobs=top_logprobs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            frequency_penalty=frequency_penalty,
-            stop_with_eos=stop_with_eos,
-        )
-
-        # Router no longer performs tokenization, sends raw message directly
-        # tokenization will be performed in Enhanced Scheduler
-        logger.debug(f"[DP_HTTP] Router request object created: {req_id}")
-
-        # Register to Token Router and get AsyncResponse
-        logger.debug(f"[DP_HTTP] Registering to Token Router...")
-        token_router_start = time.time()
-        token_router = get_token_router()
-        response = await token_router.register_request(req_id, router_request)
-        token_router_time = time.time() - token_router_start
-        logger.debug(
-            f"[DP_HTTP] Token Router registration completed in {token_router_time*1000:.2f}ms"
-        )
-
-        # Send request to Request Router for scheduling
-        logger.debug(f"[DP_HTTP] Sending to Request Router for scheduling...")
-        request_router_start = time.time()
-        request_router = get_request_router()
-
-        # Check Request Router status
-        logger.info(
-            f"[DP_HTTP] Request Router status: queue_size={len(request_router.pending_requests)}, total_requests={request_router.total_requests}, instance_id={id(request_router)}"
-        )
-
-        # Use PD-aware path to ensure PDRequestRouter follows disaggregation logic
-        await request_router.add_request(router_request)
-        request_router_time = time.time() - request_router_start
-        logger.debug(
-            f"[DP_HTTP] Request submitted to Request Router in {request_router_time*1000:.2f}ms"
-        )
-
-        total_setup_time = time.time() - start_time
-        logger.debug(
-            f"[DP_HTTP] Request setup completed in {total_setup_time*1000:.2f}ms"
-        )
-
-        # Return different response types based on stream parameter
-        if stream:
-            logger.debug(
-                f"[DP_HTTP] Returning streaming response for request: {req_id}"
-            )
-            return StreamingResponse(
-                response.stream_generator(
-                    include_usage=request.stream_options.include_usage
-                ),
-                media_type="text/event-stream",
-            )
-        else:
-            logger.debug(f"[DP_HTTP] Waiting for full response: {req_id}")
-            full_response = await response.full_generator()
-            logger.debug(f"[DP_HTTP] Full response generated for request: {req_id}")
-            return JSONResponse(full_response.model_dump())
-
-    except Exception as e:
-        logger.error(
-            f"[DP_HTTP] DP request processing failed for {request.conversation_id}: {e}"
-        )
-        logger.error(f"[DP_HTTP] Error details: {traceback.format_exc()}")
-        raise HTTPException(
-            status_code=500, detail=f"DP request processing failed: {str(e)}"
-        )
-
-
 # ====== DP Router HTTP Endpoints ======
 
 
@@ -711,7 +467,7 @@ async def get_dp_config():
         request_router = get_request_router()
         config = {
             "dp_enabled": args.dp_config.enabled,
-            "dp_service_started": True,
+            "server_status": get_server_status(),
             "mode": "full",
             "scheduler_count": len(getattr(request_router, "scheduler_addresses", [])),
             "load_balance_method": getattr(
@@ -735,7 +491,6 @@ async def get_dp_config():
 @app.get("/dp/debug")
 async def get_dp_debug_info():
     """Debug endpoint: get DP system detailed status"""
-    dp_service_started
 
     try:
         # Get global args safely
@@ -753,12 +508,12 @@ async def get_dp_debug_info():
 
         debug_info = {
             "dp_enabled": dp_enabled,
-            "dp_service_started": dp_service_started,
+            "server_status": get_server_status(),
             "dp_config": dp_config if dp_enabled else None,
             "global_args_status": args_status,
         }
 
-        if dp_enabled and dp_service_started:
+        if dp_enabled and get_server_status():
             try:
                 # Try to get Router component status
                 token_router = get_token_router()
@@ -813,7 +568,7 @@ async def test_dp_system():
         }
 
         # Check DP service status
-        if dp_service_started:
+        if get_server_status():
             test_result["router_status"] = "running"
 
             # Try to get Router component status
@@ -876,12 +631,9 @@ async def test_dp_system():
 @app.get("/dp/status")
 async def get_dp_status():
     """Get DP service status"""
-    global dp_service_started, server_status
-
     status = {
         "dp_enabled": get_global_args().dp_config.enabled,
-        "dp_service_started": dp_service_started,
-        "server_status": server_status,
+        "server_status": get_server_status(),
     }
     return status
 
@@ -939,7 +691,6 @@ def start_uvicorn(args):
 
 async def start_router_components_and_serve():
     """Start DP components and provide HTTP service"""
-    global dp_service_started, server_status
     args = get_global_args()
 
     logger.info("[ROUTER] Starting DP components...")
@@ -949,8 +700,7 @@ async def start_router_components_and_serve():
         logger.info("[ROUTER] DP components startup completed")
 
         # Critical fix: set service status to available
-        dp_service_started = True
-        server_status = True
+        set_server_status(True)
         logger.info(
             "[ROUTER] Service status set to available, can accept inference requests"
         )
@@ -1020,6 +770,7 @@ def init_dp_router(args):
     if tokenizer_path:
         args.models.tokenizer_path = tokenizer_path
         Backend.tokenizer = Backend._init_tokenizer(args)
+        Backend.formatter = Backend._init_formatter(args)
         logger.info("[ROUTER] Tokenizer initialized successfully")
     else:
         logger.info(

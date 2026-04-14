@@ -59,8 +59,7 @@ from chitu.tokenizer import (
     TokenizerHF,
     Processor,
 )
-from chitu.utils import try_import_opt_dep
-from chitu.tool_call import get_tool_parser, patch_chat_template
+from chitu.tool_call import patch_chat_template
 from chitu.utils import parse_dtype
 from chitu.import_utils import try_import_opt_dep
 from chitu.moe import init_moe_impl
@@ -406,6 +405,7 @@ class Backend:
                 args.models.vocab_size == tokenizer.n_words
             ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
 
+        patch_chat_template(tokenizer.model)
         return tokenizer
 
     @staticmethod
@@ -1044,14 +1044,6 @@ class Backend:
         Backend.tokenizer = Backend._init_tokenizer(args)
         Backend.processor = Backend._init_processor(args)
         Backend.formatter = Backend._init_formatter(args)
-
-        # Initialize tool parser
-        tool_parser_config = getattr(args.models, "tool_parser", "MISSING")
-        Backend.tool_parser = get_tool_parser(tool_parser_config)
-        logger.info(
-            f"using tool parser {Backend.tool_parser} from config {repr(tool_parser_config)}"
-        )
-        patch_chat_template(Backend.tool_parser, Backend.tokenizer.model)
 
         attn_backend_type = Backend._get_attention_backend_type(args)
 
