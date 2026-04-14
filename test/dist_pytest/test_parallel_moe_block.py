@@ -327,9 +327,8 @@ def test_parallel_moe_block(
         [1, 1, 1, 1],  # Serial
         [2, 1, 2, 1],  # TP2 + ETP2
         [2, 1, 1, 2],  # TP2 + EP2
-        # TODO: Enable the following:
-        # [1, 2, 1, 2],  # DP2 + EP2
-        # [2, 2, 1, 4],  # TP2 * DP2 + EP4
+        [1, 2, 1, 2],  # DP2 + EP2
+        [2, 2, 1, 4],  # TP2 * DP2 + EP4
     ],
 )
 @pytest.mark.parametrize("batch_size", [0, 1, 16])

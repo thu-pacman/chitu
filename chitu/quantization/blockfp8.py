@@ -78,31 +78,34 @@ def linear_blockfp8(
     weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     *,
+    x_scale: Optional[torch.Tensor] = None,
     block_size: int,
     round_scale_to_pow2: bool,
 ) -> torch.Tensor:
     """
-    Applies a linear transformation to the incoming data: y = xA^T + b.
-    This function supports specialized implementations based on quantization
-    and tensor formats.
+    Quantized linear with blockfp8 quantization.
 
     Args:
-        x (torch.Tensor): The input tensor.
-        weight (torch.Tensor): The weight tensor. It may be quantized and
-            requires dequantization for certain cases.
+        x (torch.Tensor): The input tensor, maybe in fp16, bf16 or fp8. If in fp8,
+            `x_scale` should also be set.
+        weight (torch.Tensor): The weight tensor, in fp8.
         bias (Optional[torch.Tensor]): The bias tensor to be added. Default is None.
+        x_scale: The scale of the input tensor, if the input tensor is quantized.
         round_scale_to_pow2: Round scale to powers of 2. But it does not necessarily
             mean the scale must be stored as a 8-bit integer. Implementations are
             free to pick a storage data type for it.
 
     Returns:
-        torch.Tensor: The result of the linear transformation, which may involve
-        quantization-aware computations depending on the input parameters.
+        torch.Tensor: The result of the linear transformation.
     """
 
     assert weight.element_size() == 1
 
     if get_global_args().infer.raise_lower_bit_float_to == "bfloat16":
+        if x.dtype not in {torch.float16, torch.bfloat16}:
+            raise ValueError(f"Unsupported input type: {x.dtype}")
+        if x_scale is not None:
+            raise ValueError(f"No x_scale is supported for {x.dtype=}")
         try:
             y = soft_fp8_blockfp8_gemm(x, weight, weight_scale)
             if bias is not None:
@@ -117,24 +120,30 @@ def linear_blockfp8(
             )
             return linear(x, weight_dequanted, bias)
     else:
-        x_dtype = x.dtype
         x_shape = x.shape
-        x = x.view(-1, x_shape[-1])
-        x, act_scale = blockfp8_act_quant(
-            x, block_size=block_size, round_scale_to_pow2=round_scale_to_pow2
-        )
+        if x.dtype in {torch.float16, torch.bfloat16}:
+            x = x.view(-1, x_shape[-1])
+            x, x_scale = blockfp8_act_quant(
+                x, block_size=block_size, round_scale_to_pow2=round_scale_to_pow2
+            )
+        elif x.dtype == torch.float8_e4m3fn:
+            assert x_scale is not None
+            x = x.view(-1, x_shape[-1])
+            x_scale = x_scale.view(-1, x_scale.shape[-1])
+        else:
+            raise ValueError(f"Unsupported input type: {x.dtype}")
         assert weight_scale is not None
         y = blockfp8_gemm(
             x,
-            act_scale,
+            x_scale,
             weight,
             weight_scale,
             block_size=block_size,
             round_scale_to_pow2=round_scale_to_pow2,
         )
         if bias is not None:
-            y += bias
-        return y.view(x_shape[:-1] + y.shape[-1:]).to(x_dtype)
+            y = (y + bias).to(y.dtype)
+        return y.view(x_shape[:-1] + y.shape[-1:])
 
 
 @QuantizationRegistry.register_linear("blockfp8")
@@ -824,23 +833,29 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
         )
 
     @override
-    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_gate(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         return linear_blockfp8(
             x,
             self.gate_proj_weight[i],
             self.gate_proj_scale[i],
             None,
+            x_scale=x_scale,
             block_size=self.block_size,
             round_scale_to_pow2=self.round_scale_to_pow2,
         )
 
     @override
-    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_up(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         return linear_blockfp8(
             x,
             self.up_proj_weight[i],
             self.up_proj_scale[i],
             None,
+            x_scale=x_scale,
             block_size=self.block_size,
             round_scale_to_pow2=self.round_scale_to_pow2,
         )
@@ -1212,12 +1227,15 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
         )
 
     @override
-    def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_gate_up(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         return linear_blockfp8(
             x,
             self.gate_up_proj_weight[i],
             self.gate_up_proj_scale[i],
             None,
+            x_scale=x_scale,
             block_size=self.block_size,
             round_scale_to_pow2=self.round_scale_to_pow2,
         )

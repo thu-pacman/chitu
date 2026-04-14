@@ -474,11 +474,17 @@ class NormalMoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
         )
 
     @override
-    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_gate(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        assert x_scale is None
         return linear(x, self.gate_proj_weight[i], bias=None)
 
     @override
-    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_up(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        assert x_scale is None
         return linear(x, self.up_proj_weight[i], bias=None)
 
     @override
@@ -655,7 +661,10 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
         return super().forward(routed_x, weights, inplace=inplace, impl=impl)
 
     @override
-    def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_gate_up(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        assert x_scale is None
         return linear(x, self.gate_up_proj_weight[i], bias=None)
 
     @override

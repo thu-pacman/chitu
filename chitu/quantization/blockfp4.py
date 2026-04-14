@@ -66,12 +66,12 @@ def linear_block_fp4(
     weight_scale_2: torch.Tensor,
     act_block_size: int,
     bias: Optional[torch.Tensor] = None,
+    *,
+    x_scale: Optional[torch.Tensor] = None,
     impl: str = "auto",
 ) -> torch.Tensor:
     """
-    Applies a linear transformation to the incoming data: y = xA^T + b.
-    This function supports specialized implementations based on quantization
-    and tensor formats.
+    Quantized linear with blockfp4 quantization.
 
     Args:
         x (torch.Tensor): The input tensor.
@@ -80,11 +80,11 @@ def linear_block_fp4(
         weight_scale_2 (torch.Tensor): The second-level scale tensor.
         act_block_size (int): The block size for activation quantization.
         bias (Optional[torch.Tensor]): The bias tensor to be added. Default is None.
+        x_scale: The scale of the input tensor, if the input tensor is quantized.
         impl: The implementation of linear transformation. "blackwell" means the blackwell nvfp4 implementation. "fp8" and "bf16" means raise the input tensor to fp8 and bf16. Default is auto.
 
     Returns:
-        torch.Tensor: The result of the linear transformation, which may involve
-        quantization-aware computations depending on the input parameters.
+        torch.Tensor: The result of the linear transformation.
     """
 
     if impl == "auto":
@@ -104,6 +104,10 @@ def linear_block_fp4(
     # Note: blackwell impl need swizzled weights, while others weights are linear
     if impl == "blackwell":
         # FIXME: Add fp4 option to infer.raise_lower_bit_float_to and use it here
+        if x.dtype not in {torch.float16, torch.bfloat16}:
+            raise ValueError(f"Unsupported input type: {x.dtype}")
+        if x_scale is not None:
+            raise ValueError(f"No x_scale is supported for {x.dtype=}")
         assert x.shape[-1] == weight.layout_tensor.shape[-1] * 2
         y = blockfp4_gemm(
             x,
@@ -117,6 +121,10 @@ def linear_block_fp4(
             y += bias
         return y
     elif impl == "bf16":
+        if x.dtype not in {torch.float16, torch.bfloat16}:
+            raise ValueError(f"Unsupported input type: {x.dtype}")
+        if x_scale is not None:
+            raise ValueError(f"No x_scale is supported for {x.dtype=}")
         if is_nvidia() or is_muxi():
             y = soft_fp4_raise_to_bf16_blockfp4_gemm(
                 x, weight, weight_scale, weight_scale_2
@@ -130,22 +138,28 @@ def linear_block_fp4(
             )
             # FIXME: Use a dequant-then-compute approach
     else:
-        x_dtype = x.dtype
         x_shape = x.shape
-        x = x.view(-1, x_shape[-1])
-        x, act_scale = blockfp8_act_quant(x, block_size=act_block_size)
+        if x.dtype in {torch.float16, torch.bfloat16}:
+            x = x.view(-1, x_shape[-1])
+            x, x_scale = blockfp8_act_quant(x, block_size=act_block_size)
+        elif x.dtype == torch.float8_e4m3fn:
+            assert x_scale is not None
+            x = x.view(-1, x_shape[-1])
+            x_scale = x_scale.view(-1, x_scale.shape[-1])
+        else:
+            raise ValueError(f"Unsupported input type: {x.dtype}")
         assert weight_scale is not None
         y = soft_fp4_raise_to_fp8_blockfp4_gemm(
             x,
-            act_scale,
+            x_scale,
             weight,
             weight_scale,
             weight_scale_2,
             act_block_size=act_block_size,
         )
         if bias is not None:
-            y += bias
-        return y.view(x_shape[:-1] + y.shape[-1:]).to(x_dtype)
+            y = (y + bias).to(y.dtype)
+        return y.view(x_shape[:-1] + y.shape[-1:])
 
 
 class Blockfp4LinearBase(QuantizedLinearBase):
@@ -648,7 +662,9 @@ class Blockfp4MoeExpertsUnmergedBase(QuantizedMoeExpertsUnmerged):
             )
 
     @override
-    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_gate(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         return linear_block_fp4(
             x,
             self.get_native_layout_gate_proj_weight()[i],
@@ -656,10 +672,13 @@ class Blockfp4MoeExpertsUnmergedBase(QuantizedMoeExpertsUnmerged):
             self.gate_proj_weight_scale_2[i],
             128,
             None,
+            x_scale=x_scale,
         )
 
     @override
-    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_up(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         return linear_block_fp4(
             x,
             self.get_native_layout_up_proj_weight()[i],
@@ -667,6 +686,7 @@ class Blockfp4MoeExpertsUnmergedBase(QuantizedMoeExpertsUnmerged):
             self.up_proj_weight_scale_2[i],
             128,
             None,
+            x_scale=x_scale,
         )
 
     @override
@@ -810,7 +830,9 @@ class Blockfp4MoeExpertsMergedBase(QuantizedMoeExpertsMerged):
             )
 
     @override
-    def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_gate_up(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         return linear_block_fp4(
             x,
             self.get_native_layout_gate_up_proj_weight()[i],
@@ -818,6 +840,7 @@ class Blockfp4MoeExpertsMergedBase(QuantizedMoeExpertsMerged):
             self.gate_up_proj_weight_scale_2[i],
             128,
             None,
+            x_scale=x_scale,
         )
 
     @override
@@ -999,7 +1022,10 @@ class Blockfp4MoeExpertsUnmergedPackNPUNative(
     """
 
     @override
-    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_gate(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        assert x_scale is None
         return soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
             x,
             self.get_native_layout_gate_proj_weight()[i],
@@ -1007,7 +1033,10 @@ class Blockfp4MoeExpertsUnmergedPackNPUNative(
         )
 
     @override
-    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_up(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        assert x_scale is None
         return soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
             x,
             self.get_native_layout_up_proj_weight()[i],
@@ -1053,7 +1082,10 @@ class Blockfp4MoeExpertsMergedPackNPUNative(
         )
 
     @override
-    def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_gate_up(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        assert x_scale is None
         return soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
             x,
             self.get_native_layout_gate_up_proj_weight()[i],

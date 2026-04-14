@@ -2,10 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import logging
+from typing import Optional
 from typing_extensions import override
-
+import logging
 import plum
+
 import torch
 import torch.nn as nn
 
@@ -390,7 +391,11 @@ class BlockInt4MoeExpertsUnmerged(
     #  Per-expert iterative forward (fallback)                            #
     # ------------------------------------------------------------------ #
 
-    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    @override
+    def forward_ith_expert_gate(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        assert x_scale is None
         if not self._marlin_repacked:
             self._repack_to_marlin()
         return self._marlin_gemm(
@@ -401,7 +406,11 @@ class BlockInt4MoeExpertsUnmerged(
             self.moe_inter_dim,
         )
 
-    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    @override
+    def forward_ith_expert_up(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        assert x_scale is None
         if not self._marlin_repacked:
             self._repack_to_marlin()
         return self._marlin_gemm(
@@ -412,6 +421,7 @@ class BlockInt4MoeExpertsUnmerged(
             self.moe_inter_dim,
         )
 
+    @override
     def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
         if not self._marlin_repacked:
             self._repack_to_marlin()

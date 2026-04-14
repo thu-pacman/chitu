@@ -186,8 +186,11 @@ def _(
     assert E == E2
     assert K == K2
 
-    # M<64 triggers a DeepGEMM bug: https://github.com/deepseek-ai/DeepGEMM/issues/268
-    assert M >= 64
+    if M < 64:
+        # M<64 triggers a DeepGEMM bug: https://github.com/deepseek-ai/DeepGEMM/issues/268
+        hidden_states.activation_per_expert = torch.nn.functional.pad(
+            hidden_states.activation_per_expert, (0, 0, 0, 64 - M), "constant", 0
+        )
 
     if M == 0:
         intermediate_cache3 = torch.empty(
