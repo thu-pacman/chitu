@@ -9,8 +9,6 @@ This allows the serve package to be executed as a module: python -m chitu.serve
 
 from logging import getLogger
 from threading import Thread
-import os
-
 import hydra
 import torch
 import torch.distributed

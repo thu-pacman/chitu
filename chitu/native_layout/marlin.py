@@ -4,7 +4,6 @@
 
 from dataclasses import dataclass
 from typing_extensions import override
-import plum
 
 import torch
 

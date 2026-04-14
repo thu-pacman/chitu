@@ -2,14 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import re
 from abc import ABC, abstractmethod
+from xgrammar.structural_tag import TagFormat
 
-from xgrammar.structural_tag import (
-    TagFormat,
-)
-
-from .arguments import AbstractArgumentsGrammar
+from chitu.tool_call.grammar.arguments import AbstractArgumentsGrammar
 
 
 class AbstractToolGrammar(ABC):

@@ -13,8 +13,9 @@ import time
 from typing import Any, Optional
 import threading
 import queue
-import zmq, os
-from chitu.backend import Backend
+import zmq
+import os
+
 from chitu.global_vars import get_global_args
 from chitu.metrics.prometheus_collector import inc_completed_requests, observe_ttft
 from chitu.task import Task

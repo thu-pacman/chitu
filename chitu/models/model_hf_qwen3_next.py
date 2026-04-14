@@ -13,7 +13,7 @@ from torch import nn
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.kv_cache import KVCacheBase
-from chitu.distributed.parallel_state import get_tp_group, get_tp_size
+from chitu.distributed.parallel_state import get_tp_size
 from chitu.models.model import (
     RMSNorm,
     TransformerBlock,
@@ -31,7 +31,6 @@ from chitu.models.registry import ModelType, register_model
 from chitu.ops import (
     update_singleton_paged_kv_cache,
     read_from_singleton_paged_kv_cache,
-    apply_rotary_pos_emb,
     apply_rotary_pos_emb_partial,
     chunk_gated_delta_rule,
     recurrent_gated_delta_rule,

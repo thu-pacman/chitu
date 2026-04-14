@@ -24,7 +24,6 @@ from chitu.ops import (
     read_from_paged_kv_cache,
 )
 from chitu.utils import try_import_platform_dep
-from chitu.device_type import is_ascend
 
 triton, has_triton = try_import_platform_dep("triton")
 

@@ -1603,7 +1603,6 @@ class TransformerDeepSeekV3(Transformer):
     @override
     def process_state_dict_for_merging_qkv(self, checkpoint: dict[str, Any]):
         def enable_callback(k: str):
-            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
             layer_id = get_layer_id_from_checkpoint_prefix(
                 k, self.params.quant_config.rules
             )

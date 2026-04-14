@@ -2,10 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from chitu.native_layout.base import (
-    NativeLayoutTensor,
-    NATIVE_LAYOUT_TENSOR_PROPERTY_NAME,
-)
+from chitu.native_layout.base import NATIVE_LAYOUT_TENSOR_PROPERTY_NAME
 from chitu.global_vars import get_global_args
 
 

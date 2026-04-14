@@ -5,7 +5,6 @@
 
 from typing import Protocol, Optional
 import logging
-import asyncio
 import torch
 import time
 

@@ -6,7 +6,6 @@ import itertools
 import functools
 import operator
 from logging import getLogger
-import os
 from collections import OrderedDict
 from typing import Any, Mapping, Optional, Callable
 from contextlib import nullcontext

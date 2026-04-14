@@ -2,13 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import re
+from xgrammar.structural_tag import TagFormat
 
-from xgrammar.structural_tag import (
-    TagFormat,
-)
-
-from .arg_value import AbstractArgValueGrammar
+from chitu.tool_call.grammar.arg_value import AbstractArgValueGrammar
 
 
 class AbstractArgumentGrammar:
