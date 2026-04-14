@@ -2,10 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import NamedTuple, Literal
+from dataclasses import dataclass
+from typing import Literal
 
 
-class ReasoningParams(NamedTuple):
+@dataclass
+class ReasoningParams:
     enable_reasoning: bool
     start_token_id: int = -1
     end_token_id: int = -1

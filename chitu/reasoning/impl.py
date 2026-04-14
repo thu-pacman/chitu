@@ -2,12 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from .type_def import ReasoningParams
+from .utils import get_reasoning_params
 
 
 class ReasoningParser:
-    def __init__(self, params: ReasoningParams):
-        self.params = params
+    def __init__(self, enable_thinking: bool):
+        self.params = get_reasoning_params(enable_thinking)
         self.state = self.params.initial_state
         self.count = 0
 

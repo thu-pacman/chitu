@@ -7,22 +7,29 @@ import os
 import time
 import functools
 from collections import deque
-import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from logging import getLogger
-from typing import Any, ClassVar, Deque, Optional, Mapping, Union, Iterable
-from typing_extensions import override
+from typing import Any, ClassVar, Deque, Optional, Union, Iterable
+import random
 
 import torch
 
 from chitu.task_type import TaskType
-from chitu.async_response import AsyncDataStream
+from chitu.async_stream import AsyncDataStream
 from chitu.backend import Backend
 from chitu.global_vars import get_slot_handle, get_global_args
-from chitu.tool_call import ToolChoice, ToolCallParams, adjust_message_for_tool_calls
-from chitu.reasoning import get_reasoning_params, update_chat_template_kwargs_reasoning
+from chitu.tool_call import (
+    ToolCallParams,
+    ToolConfig,
+    adjust_message_for_tool_calls,
+    build_grammar,
+)
+from chitu.utils import dataclass_to_dict, dataclass_from_dict
+from chitu.reasoning import (
+    update_chat_template_kwargs_reasoning,
+)
 from chitu.sampling.utils import compile_grammar, deserialize_grammar
 from chitu.kv_cache import TokenBlock
 
@@ -42,173 +49,73 @@ class SampleParams:
             self.top_k = 1
 
 
-class RouterRequest:
-    """Lightweight request class for Router process without tokenization"""
+@dataclass
+class RequestParams:
+    messages: list
+    request_id: str
+    logprobs: bool = False
+    top_logprobs: int | None = None
+    max_new_tokens: int = 128
+    top_p: float = 0.9
+    top_k: int = 50
+    temperature: float = 0.8
+    frequency_penalty: float = 0.0
+    chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
+    enable_thinking: bool = True
+    tools: list[dict] = field(default_factory=list)
+    tool_config: ToolConfig = field(default_factory=ToolConfig)
+    save_trace_dir: str | None = None
+    priority: int = 1
+    stop_with_eos: bool = True
 
-    def __init__(
-        self,
-        message,
-        request_id,
-        tools: list[dict] = [],
-        tool_choice: ToolChoice = "auto",
-        parallel_tool_calls: bool = True,
-        logprobs=False,
-        top_logprobs=None,
-        max_new_tokens=50,
-        top_p=0.9,
-        top_k=50,
-        temperature=0.8,
-        frequency_penalty=0.0,
-        chat_template_kwargs: Mapping[str, Any] = {},
-        stop_with_eos: bool = True,
-    ):
-        # input related
-        self.message = message
-        self.request_id = request_id
-        self.tools = tools
-        self.tool_choice = tool_choice
-        self.parallel_tool_calls = parallel_tool_calls
-        self.sample_params = SampleParams(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            frequency_penalty=frequency_penalty,
-        )
-        self.chat_template_kwargs = chat_template_kwargs
-        self.stop_with_eos = stop_with_eos
-
-        # response related
-        self.output = ""
-        self.async_stream = (
-            None  # Will be set by Token Router, Router doesn't need stream processing
-        )
-        self.finish_reason = None
-        self.max_new_tokens = max_new_tokens
-        self.finished = False
-
-        # test information related
-        self._test_flag = False
-        self._test_logits = []
-        self._test_tokens = []
-        self._test_standard_tokens = None
-        self._test_standard_it = 0
-        self.logprobs = logprobs
-        self.top_logprobs = 0 if logprobs and not top_logprobs else top_logprobs
-
-        # performance metrics
-        self.timestamp: str = datetime.now().strftime("%H:%M:%S:%f")
-        self.start_time: float = time.monotonic()
-        self.prefill_end_time: float = 0
-        self.completion_time: float = 0
-
-        # No tokenization or length checking in Router
-        self._prompt_len = 0  # Will be set later by Enhanced Scheduler
-
-    def finish(self):
-        if self.finished:
-            return
-        self.finished = True
-        self.output = repr("".join(self.async_stream.seqs))
-        self.async_stream.send_stop_signal()
-
-    @property
-    def prompt_len(self):
-        """Return prompt_len, initially 0 until set by Enhanced Scheduler"""
-        return self._prompt_len
-
-    def set_prompt_len(self, prompt_len: int):
-        """Set prompt_len when received from Enhanced Scheduler"""
-        self._prompt_len = prompt_len
-
-    def to_user_request(self) -> "UserRequest":
-        """Convert RouterRequest to UserRequest when needed in Enhanced Scheduler"""
-        return UserRequest(
-            message=self.message,
-            request_id=self.request_id,
-            tools=self.tools,
-            tool_choice=self.tool_choice,
-            parallel_tool_calls=self.parallel_tool_calls,
-            logprobs=self.logprobs,
-            top_logprobs=self.top_logprobs,
-            max_new_tokens=self.max_new_tokens,
-            top_p=self.sample_params.top_p,
-            top_k=self.sample_params.top_k,
-            temperature=self.sample_params.temperature,
-            frequency_penalty=self.sample_params.frequency_penalty,
-            chat_template_kwargs=self.chat_template_kwargs,
-        )
+    def create_trace_data(self):
+        return {
+            "id": self.request_id,
+            "message": self.messages,
+            "sample_params": {
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "top_k": self.top_k,
+                "frequency_penalty": self.frequency_penalty,
+            },
+            "chat_template_kwargs": self.chat_template_kwargs,
+            "tools": self.tools,
+            "max_new_tokens": self.max_new_tokens,
+        }
 
 
+@dataclass
 class UserRequest:
     """
-    Unified interface for user request from any API standard (OpenAI, Anthropic)
+    Request object holding context for processing input request
     """
 
-    def __init__(
-        self,
-        message,
-        request_id,
-        *,
-        tokens=None,
-        logprobs=False,
-        top_logprobs=None,
-        max_new_tokens=128,
-        top_p=0.9,
-        top_k=50,
-        temperature=0.8,
-        frequency_penalty=0.0,
-        chat_template_kwargs: Mapping[str, Any] = {},
-        enable_reasoning: bool = True,
-        tools: list[dict] = [],
-        tool_choice: ToolChoice = "auto",
-        parallel_tool_calls: bool = True,
-        save_trace_dir: Optional[str] = None,
-        priority: int = 1,
-        stop_with_eos: bool = True,
-    ):
-        # input related
-        if hasattr(Backend, "tool_parser"):
-            message = adjust_message_for_tool_calls(Backend.tool_parser, message)
+    # ============ Serialization fields ==============
 
-        self.message = message
-        self.request_id = request_id
-        self.tokens = tokens
-        self.sample_params = SampleParams(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            frequency_penalty=frequency_penalty,
-        )
-        self.chat_template_kwargs = chat_template_kwargs
-        self.reasoning_params = get_reasoning_params(enable_reasoning)
-        update_chat_template_kwargs_reasoning(
-            self.chat_template_kwargs, self.reasoning_params
-        )
+    request_id: str
+    enable_thinking: bool
+    logprobs: bool
+    top_logprobs: int | None
+    save_trace_dir: str | None
+    priority: int
+    stop_with_eos: bool
 
-        # constraint decoding related
-        self.tools = []
-        self.grammar = None
-        self.grammar_str = ""
-        if tools and tool_choice != "none":
-            self.tools = tools
-            self.chat_template_kwargs["tools"] = tools
-            grammar = Backend.tool_parser.build_grammar(
-                ToolCallParams(
-                    tools=tools,
-                    reasoning_params=self.reasoning_params,
-                    tool_choice=tool_choice,
-                    parallel_tool_calls=parallel_tool_calls,
-                )
-            )
-            self.grammar, self.grammar_str = compile_grammar(grammar)
+    sample_params: SampleParams
+    tool_call_params: ToolCallParams | None
+    prompt_tokens: list[int]
+    pixel_values: Any | None
+    grid_thw: Any | None
+    prompt_len: int
+    max_new_tokens: int
+    trace_data: dict
 
+    # ============ Serialization fields end ==========
+
+    def __post_init__(self):
         # response related
         self.output = ""
-        self.async_stream = AsyncDataStream(self.reasoning_params)
+        self.async_stream = AsyncDataStream(self.enable_thinking)
         self.finish_reason = None
-        self.max_new_tokens = max_new_tokens
-        self.priority = priority
-        self.stop_with_eos = stop_with_eos
         self.num_output_tokens = 0
         self.will_finish = False
         self.finished = False
@@ -220,9 +127,6 @@ class UserRequest:
         self._test_tokens = []
         self._test_standard_tokens = None
         self._test_standard_it = 0
-        self.logprobs = logprobs
-        self.top_logprobs = 0 if logprobs and not top_logprobs else top_logprobs
-        self.save_trace_dir = save_trace_dir
 
         # performance metrics
         self.timestamp: str = datetime.now().strftime("%H:%M:%S:%f")
@@ -230,14 +134,160 @@ class UserRequest:
         self.prefill_end_time: float = 0
         self.completion_time: float = 0
 
-        max_seq_len = get_global_args().infer.max_seq_len
-        if self.prompt_len >= max_seq_len:
-            raise ValueError(
-                f"prompt length({self.prompt_len}) cannot be greater than max_seq_len({max_seq_len})"
-            )
-        self.max_new_tokens = min(
-            self.max_new_tokens, max_seq_len - self.prompt_len + 1
+    @staticmethod
+    def from_request_params(params: RequestParams, max_prompt_len: int | None = None):
+        sample_params = SampleParams(
+            temperature=params.temperature,
+            top_p=params.top_p,
+            top_k=params.top_k,
+            frequency_penalty=params.frequency_penalty,
         )
+        chat_template_kwargs = params.chat_template_kwargs.copy()
+        update_chat_template_kwargs_reasoning(
+            chat_template_kwargs, params.enable_thinking
+        )
+        if params.tools and params.tool_config.choice != "none":
+            chat_template_kwargs["tools"] = params.tools
+            tool_call_params = ToolCallParams(
+                tools=params.tools,
+                config=params.tool_config,
+                enable_thinking=params.enable_thinking,
+            )
+        else:
+            tool_call_params = None
+
+        messages = adjust_message_for_tool_calls(params.messages)
+        encoded = Backend.formatter.encode_dialog_prompt(
+            messages, chat_template_kwargs=chat_template_kwargs
+        )
+        if isinstance(encoded, tuple):
+            prompt_tokens, pixel_values, grid_thw = encoded
+        else:
+            prompt_tokens, pixel_values, grid_thw = encoded, None, None
+        prompt_len = len(prompt_tokens)
+        if max_prompt_len is not None and prompt_len > max_prompt_len:
+            prompt_tokens = prompt_tokens[:max_prompt_len]
+            prompt_len = max_prompt_len
+
+        max_new_tokens = UserRequest.cap_max_new_tokens(
+            params.max_new_tokens, prompt_len
+        )
+
+        if params.save_trace_dir:
+            trace_data = params.create_trace_data()
+        else:
+            trace_data = {}
+
+        return UserRequest(
+            request_id=params.request_id,
+            enable_thinking=params.enable_thinking,
+            logprobs=params.logprobs,
+            top_logprobs=params.top_logprobs,
+            save_trace_dir=params.save_trace_dir,
+            priority=params.priority,
+            stop_with_eos=params.stop_with_eos,
+            sample_params=sample_params,
+            tool_call_params=tool_call_params,
+            prompt_tokens=prompt_tokens,
+            pixel_values=pixel_values,
+            grid_thw=grid_thw,
+            prompt_len=prompt_len,
+            max_new_tokens=max_new_tokens,
+            trace_data=trace_data,
+        )
+
+    @staticmethod
+    def cap_max_new_tokens(max_new_tokens: int, prompt_len: int) -> int:
+        max_seq_len = get_global_args().infer.max_seq_len
+        if prompt_len >= max_seq_len:
+            raise ValueError(
+                f"prompt length({prompt_len}) cannot be greater than max_seq_len({max_seq_len})"
+            )
+        max_new_tokens = min(max_new_tokens, max_seq_len - prompt_len + 1)
+        return max_new_tokens
+
+    @staticmethod
+    def create(messages: list, request_id: str, max_prompt_len=None, **kwargs):
+        """simple creation with compatibility"""
+        params = RequestParams(messages, request_id, **kwargs)
+        return UserRequest.from_request_params(params, max_prompt_len=max_prompt_len)
+
+    @staticmethod
+    def create_mock(
+        input_len: int,
+        request_id: str,
+        logprobs=False,
+        top_logprobs=None,
+        max_new_tokens=50,
+        top_p=0.9,
+        top_k=50,
+        temperature=0.8,
+        frequency_penalty=0.0,
+        enable_thinking: bool = True,
+        random_tokens: bool = False,
+    ):
+        if random_tokens:
+            args = get_global_args()
+            vocab_size = args.models.vocab_size
+            prompt_tokens = random.choices(range(vocab_size), k=input_len)
+        else:
+            prompt_tokens = [1] * input_len
+
+        sample_params = SampleParams(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
+        )
+
+        return UserRequest(
+            request_id=request_id,
+            enable_thinking=enable_thinking,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
+            save_trace_dir=None,
+            priority=1,
+            stop_with_eos=False,
+            sample_params=sample_params,
+            tool_call_params=None,
+            prompt_tokens=prompt_tokens,
+            pixel_values=None,
+            grid_thw=None,
+            prompt_len=input_len,
+            max_new_tokens=max_new_tokens,
+            trace_data={},
+        )
+
+    @staticmethod
+    def from_dict(data: dict) -> "UserRequest":
+        return dataclass_from_dict(data, UserRequest)
+
+    def to_dict(self) -> dict:
+        return dataclass_to_dict(self)
+
+    def save_trace_data(self):
+        prefill_duration = self.prefill_end_time - self.start_time
+        all_duration = self.completion_time - self.start_time
+        tps = self.async_stream.tokens_len / all_duration
+
+        trace_data = {
+            **self.trace_data,
+            "input_length": self.prompt_len,
+            "timestamp": self.timestamp,
+            "output_length": self.async_stream.tokens_len,
+            "prefill_duration": round(prefill_duration, 6),
+            "all_duration": round(all_duration, 6),
+            "tps": round(tps, 6),
+        }
+
+        trace_str = json.dumps(trace_data)
+
+        os.makedirs(self.save_trace_dir, exist_ok=True)
+        path = (
+            f"{self.save_trace_dir}/trace_{datetime.now().strftime('%Y_%m_%d')}.jsonl"
+        )
+        with open(path, "a") as file:
+            file.write(trace_str + "\n")
 
     def add_data(
         self,
@@ -268,7 +318,8 @@ class UserRequest:
         self.output = repr("".join(self.async_stream.seqs))
         self.async_stream.send_stop_signal()
         self.completion_time = time.monotonic()
-        self.save_trace_to_json()
+        if self.save_trace_dir and self.trace_data:
+            self.save_trace_data()
 
     def notify_server_data_added_from_server_thread(self):
         self.async_stream.notify_server_from_server_thread()
@@ -285,101 +336,6 @@ class UserRequest:
     def _test_add_token(self, token):
         self._test_tokens.append(token)
         # logger.warning(f"add token {token}")
-
-    def save_trace_to_json(self):
-        if self.save_trace_dir is None:
-            return
-
-        prefill_duration = self.prefill_end_time - self.start_time
-        all_duration = self.completion_time - self.start_time
-        tps = self.async_stream.tokens_len / all_duration
-
-        trace_data = {
-            "id": self.request_id,
-            "message": self.message,
-            "sample_params": dataclasses.asdict(self.sample_params),
-            "chat_template_kwargs": self.chat_template_kwargs,
-            "tools": self.tools,
-            "grammar_str": self.grammar_str,
-            "max_new_tokens": self.max_new_tokens,
-            "timestamp": self.timestamp,
-            "input_length": self.prompt_len,
-            "output_length": self.async_stream.tokens_len,
-            "prefill_duration": round(prefill_duration, 6),
-            "all_duration": round(all_duration, 6),
-            "tps": round(tps, 6),
-        }
-        trace_str = json.dumps(trace_data)
-
-        os.makedirs(self.save_trace_dir, exist_ok=True)
-        path = (
-            f"{self.save_trace_dir}/trace_{datetime.now().strftime('%Y_%m_%d')}.jsonl"
-        )
-        with open(path, "a") as file:
-            file.write(trace_str + "\n")
-
-    @functools.cached_property
-    def prompt_tokens(self) -> list[int]:
-        """
-        Prompt tokens.
-        """
-        if self.message:
-            tokens = Backend.formatter.encode_dialog_prompt(
-                self.message, chat_template_kwargs=self.chat_template_kwargs
-            )
-            if isinstance(tokens, tuple):
-                self.tokens = tokens[0]
-                self.pixel_values = tokens[1]
-                self.grid_thw = tokens[2]
-            else:
-                self.tokens = tokens
-        assert self.tokens is not None
-        return self.tokens
-
-    @functools.cached_property
-    def prompt_len(self):
-        """
-        Length of self.prompt_tokens
-        """
-        return len(self.prompt_tokens)
-
-
-class MockFixedLengthedUserRequest(UserRequest):
-    """
-    A mock request that has a fixed length of tokens, useful for warmup and testing.
-    """
-
-    def __init__(
-        self,
-        input_len: int,
-        request_id,
-        logprobs=False,
-        top_logprobs=None,
-        max_new_tokens=50,
-        top_p=0.9,
-        top_k=50,
-        temperature=0.8,
-        frequency_penalty=0.0,
-        enable_reasoning: bool = True,
-    ):
-        self.input_len = input_len
-        super().__init__(
-            message=["(this is a mock)"],
-            request_id=request_id,
-            logprobs=logprobs,
-            top_logprobs=top_logprobs,
-            max_new_tokens=max_new_tokens,
-            top_p=top_p,
-            top_k=top_k,
-            temperature=temperature,
-            frequency_penalty=frequency_penalty,
-            enable_reasoning=enable_reasoning,
-        )
-
-    @override
-    @functools.cached_property
-    def prompt_tokens(self):
-        return [1] * self.input_len
 
 
 class Task:
@@ -420,9 +376,15 @@ class Task:
 
         # Request
         self.req = req
+
+        # Grammar
         if req:
-            self.grammar_str = req.grammar_str
-            self.grammar = req.grammar
+            if req.tool_call_params:
+                grammar = build_grammar(req.tool_call_params)
+                self.grammar, self.grammar_str = compile_grammar(grammar)
+            else:
+                self.grammar = None
+                self.grammar_str = ""
         else:
             self.grammar_str = grammar_str
             self.grammar = deserialize_grammar(grammar_str)
@@ -456,18 +418,23 @@ class Task:
         self.waiting = False
 
         # logprobs and test flag
-        self.return_logprobs = getattr(req, "logprobs", False)
+        if req:
+            self.return_logprobs = req.logprobs
+            self._test_flag = req._test_flag
+            self.grid_thw = req.grid_thw
+            self.pixel_values = req.pixel_values
+        else:
+            self.return_logprobs = False
+            self._test_flag = False
+            self.pixel_values = None
+            self.grid_thw = None
         self.logprobs = None
         self.token_idxs = None
-        self._test_flag = getattr(req, "_test_flag", False)
         self._test_standard_tokens = None
         if self._test_flag and self.req._test_standard_tokens is not None:
             self._test_standard_tokens = (
                 self.req._test_standard_tokens.flatten().tolist()
             )
-
-        self.pixel_values = getattr(req, "pixel_values", None)
-        self.grid_thw = getattr(req, "grid_thw", None)
 
         # Scheduling priority
         self.arrv_ts = time.perf_counter_ns()

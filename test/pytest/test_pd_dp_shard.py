@@ -115,7 +115,7 @@ def test_pd_dp_shard_round_robin():
     # Create tasks assigned to dp_rank 0/1
     tasks = []
     for i in range(4):
-        req = UserRequest(
+        req = UserRequest.create(
             message="",
             tokens=[1],
             request_id=f"r0-{i}",
@@ -127,7 +127,7 @@ def test_pd_dp_shard_round_robin():
         t.dp_rank = 0
         tasks.append(t)
     for i in range(4):
-        req = UserRequest(
+        req = UserRequest.create(
             message="",
             tokens=[1],
             request_id=f"r1-{i}",

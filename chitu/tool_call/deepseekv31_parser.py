@@ -68,6 +68,6 @@ class DeepSeekV31ToolParser(
 
     @classmethod
     def build_grammar(cls, params):
-        if params.reasoning_params.enable_reasoning:
+        if params.enable_thinking:
             raise ValueError("DeepSeek V3.1 should use tool call without reasoning")
         return super().build_grammar(params)

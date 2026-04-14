@@ -2,9 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Literal, NamedTuple
+from dataclasses import dataclass
+from typing import Literal
 from pydantic import BaseModel
-from chitu.reasoning.type_def import ReasoningParams
 
 
 class ChoiceDeltaToolCallFunction(BaseModel):
@@ -36,28 +36,23 @@ class ChoiceToolCall(BaseModel):
     type: Literal["function"] = "function"
 
 
-class ToolChoiceFunction(BaseModel):
-    name: str
+@dataclass
+class ToolConfig:
+    choice: Literal["required", "auto", "none"] = "auto"
+    at_most_one: bool = False
+    subset: list[str] | None = None
 
 
-class ToolChoiceNamedTool(BaseModel):
-    function: ToolChoiceFunction
-    type: Literal["function"]
-
-
-ToolChoice = ToolChoiceNamedTool | Literal["none", "auto", "required"]
-
-
-class ToolCallParams(NamedTuple):
+@dataclass
+class ToolCallParams:
     tools: list[dict]
-    reasoning_params: ReasoningParams
-    tool_choice: ToolChoice = "auto"
-    parallel_tool_calls: bool = True
+    config: ToolConfig
+    enable_thinking: bool
 
 
-class ConstraintParams(NamedTuple):
+@dataclass
+class ConstraintParams:
     params: ToolCallParams
-    is_none: bool = False
-    at_least_one: bool = False
-    stop_after_first: bool = False
-    tool_schemas: dict[str, dict] = {}
+    at_least_one: bool
+    stop_after_first: bool
+    tool_schemas: dict[str, dict]

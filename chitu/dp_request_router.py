@@ -13,14 +13,14 @@ import logging
 import random
 import time
 import traceback
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass
 from chitu.global_vars import get_global_args
 import zmq
 import zmq.asyncio
 import msgpack
 
-from chitu.utils import gen_req_id
+from chitu.task import UserRequest
 
 logger = logging.getLogger(__name__)
 
@@ -232,10 +232,7 @@ class RequestRouter:
         self.stats_socket = None
 
         # Request queues and routing state
-        self.pending_requests = deque()
-        self.request_stats = defaultdict(
-            lambda: {"start_time": 0.0, "prompt_len": None, "generated_tokens": 0}
-        )
+        self.pending_requests: deque = deque()
 
         # Resolve scheduler addresses from config
         self._scheduler_addresses: list[str] = []
@@ -438,7 +435,7 @@ class RequestRouter:
             except Exception as e:
                 logger.error(f"Error in health monitor: {e}")
 
-    async def submit_request(self, request):
+    async def submit_request(self, request: UserRequest):
         """Add request to processing queue."""
         queue_size_before = len(self.pending_requests)
         self.pending_requests.append(request)
@@ -448,7 +445,7 @@ class RequestRouter:
 
         logger.debug(f"Submitted request {request.request_id} to queue")
 
-    async def _send_request(self, scheduler_id: int, request):
+    async def _send_request(self, scheduler_id: int, request: UserRequest):
         """Send request to specified Enhanced Scheduler."""
         logger.debug(
             f"[REQUEST_ROUTER] Sending request {request.request_id} to scheduler {scheduler_id}"
@@ -456,59 +453,7 @@ class RequestRouter:
 
         socket = self.scheduler_sockets[scheduler_id]
 
-        # Send raw message to Enhanced Scheduler for tokenization
-        # Convert Pydantic Message objects to serializable dictionaries
-        serializable_message = []
-        if isinstance(request.message, list):
-            for msg in request.message:
-                if hasattr(msg, "model_dump"):  # Pydantic v2
-                    serializable_message.append(msg.model_dump())
-                elif hasattr(msg, "dict"):  # Pydantic v1
-                    serializable_message.append(msg.dict())
-                elif isinstance(msg, dict):
-                    serializable_message.append(msg)
-                else:
-                    # If other type, try to convert to string
-                    serializable_message.append(str(msg))
-        elif isinstance(request.message, str):
-            serializable_message = request.message
-        else:
-            # Single Message object
-            if hasattr(request.message, "model_dump"):  # Pydantic v2
-                serializable_message = request.message.model_dump()
-            elif hasattr(request.message, "dict"):  # Pydantic v1
-                serializable_message = request.message.dict()
-            else:
-                serializable_message = str(request.message)
-
-        # Extract parameters with fallbacks for RouterRequest
-        request_data = {
-            "request_id": request.request_id,
-            "message": serializable_message,  # Use serializable message
-            "max_new_tokens": request.max_new_tokens,
-            "temperature": (
-                request.sample_params.temperature
-                if hasattr(request, "sample_params")
-                else request.temperature
-            ),
-            "top_p": (
-                request.sample_params.top_p
-                if hasattr(request, "sample_params")
-                else request.top_p
-            ),
-            "top_k": (
-                request.sample_params.top_k
-                if hasattr(request, "sample_params")
-                else request.top_k
-            ),
-            "logprobs": request.logprobs,
-            "top_logprobs": request.top_logprobs,
-            # honor stop_with_eos from RouterRequest; default True (stop on EOS)
-            "stop_with_eos": request.stop_with_eos,
-            "timestamp": time.time(),
-            "scheduler_id": scheduler_id,
-        }
-
+        request_data = request.to_dict()
         try:
             data = msgpack.packb(request_data)
             send_t0 = time.time()
@@ -528,41 +473,17 @@ class RequestRouter:
                 f"[REQUEST_ROUTER] Failed to send request {request.request_id} to scheduler {scheduler_id}: {e}"
             )
 
-    async def add_request(self, request):
+    async def add_request(self, request: UserRequest):
         """Add new request to processing queue."""
-        request.request_id = (
-            gen_req_id() if not hasattr(request, "request_id") else request.request_id
-        )
         self.pending_requests.append(request)
 
         # Update request stats for monitoring
-        self.request_stats[request.request_id]["start_time"] = time.time()
-        self.request_stats[request.request_id]["prompt_len"] = None
-        self.request_stats[request.request_id]["generated_tokens"] = 0
-
         logger.debug(
             f"Added request {request.request_id} to queue (queue size: {len(self.pending_requests)})"
         )
 
-    def record_prompt_len(self, request_id: str, prompt_len: int):
-        """Record prompt length once and update total token count."""
-        if prompt_len is None:
-            return
-        prompt_len = int(prompt_len)
-        if prompt_len <= 0:
-            return
-        stats = self.request_stats[request_id]
-        if stats.get("prompt_len") in (None, 0):
-            stats["prompt_len"] = prompt_len
-            self.total_tokens += prompt_len
-
     def record_generated_token(self, request_id: str, count: int = 1):
         """Record generated tokens and update total token count."""
-        count = int(count)
-        if count <= 0:
-            return
-        stats = self.request_stats[request_id]
-        stats["generated_tokens"] = stats.get("generated_tokens", 0) + count
         self.total_tokens += count
 
     def get_performance_stats(self) -> dict:

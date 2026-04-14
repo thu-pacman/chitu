@@ -49,8 +49,41 @@ def _(
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
+    if w1.dtype == torch.float8_e4m3fn:
+        assert len(block_shape) == 2
+        assert block_shape[0] == block_shape[1]
+        quant_block_size = block_shape[0]
+        hidden_states_fp8, scale = blockfp8_act_quant(
+            hidden_states.activation,
+            block_size=quant_block_size,
+            round_scale_to_pow2=round_scale_to_pow2,
+        )
+        return deepgemm_contiguous_fused_expert(
+            IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
+                activation=hidden_states_fp8,
+                activation_scale=scale,
+                token_to_expert_indices=hidden_states.token_to_expert_indices,
+                n_tokens_per_expert_padded=hidden_states.n_tokens_per_expert_padded,
+                pad_block_size=hidden_states.pad_block_size,
+                expert_ids_are_local=hidden_states.expert_ids_are_local,
+                expected_n_tokens_per_expert=hidden_states.expected_n_tokens_per_expert,
+            ),
+            w1=w1,
+            w2=w2,
+            activation=activation,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            block_shape=block_shape,
+            round_scale_to_pow2=round_scale_to_pow2,
+            experts_start_idx=experts_start_idx,
+        )
+
     hidden_states = hidden_states.as_local_expert_ids(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )
@@ -73,8 +106,17 @@ def _(
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    round_scale_to_pow2: bool = False,
     experts_start_idx: int = 0,
 ) -> ExpertBlockPermutedBatchedExpertResult:
+    assert w1.dtype in {torch.bfloat16, torch.float16}
+    assert w2.dtype in {torch.bfloat16, torch.float16}
+    assert w1_scale is None
+    assert w2_scale is None
+
     hidden_states = hidden_states.as_local_expert_ids(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )

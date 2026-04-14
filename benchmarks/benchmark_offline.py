@@ -17,7 +17,6 @@ import torch
 from datetime import datetime
 
 from logging import getLogger
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from chitu.task import UserRequest, TaskPool, Task
 from chitu.chitu_main import (
@@ -72,7 +71,6 @@ class ShareGPTDataset:
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
         num_requests: int,
         input_len: int,
         max_new_tokens: int,
@@ -93,20 +91,13 @@ class ShareGPTDataset:
         while len(reqs) < num_requests:
             entry = self.data[idx]
             prompt = entry["conversations"][0]["value"]
-
-            prompt_ids = tokenizer(
-                prompt, max_length=input_len, truncation=True, add_special_tokens=False
-            ).input_ids
-
-            if len(prompt_ids) >= input_len:
-                reqs.append(
-                    UserRequest(
-                        message="",
-                        request_id=gen_sequential_id(),
-                        tokens=prompt_ids,
-                        max_new_tokens=max_new_tokens,
-                    )
-                )
+            req = UserRequest.create(
+                messages=[{"role": "user", "content": prompt}],
+                request_id=gen_sequential_id(),
+                max_prompt_len=input_len,
+                max_new_tokens=max_new_tokens,
+            )
+            reqs.append(req)
 
             idx += 1
             if idx == n:
@@ -129,16 +120,14 @@ class ShareGPTDataset:
 
 
 def random_requests(args, num_reqs):
-    vocab_size = args.models.vocab_size
     prompt_len = args.benchmark.input_len
     max_new_tokens = args.benchmark.output_len
 
     reqs = []
     for _ in range(num_reqs):
-        req = UserRequest(
-            message=None,
+        req = UserRequest.create_mock(
+            input_len=prompt_len,
             request_id=gen_sequential_id(),
-            tokens=[random.randint(0, vocab_size - 1) for _ in range(prompt_len)],
             max_new_tokens=max_new_tokens,
         )
         reqs.append(req)
@@ -151,9 +140,6 @@ def get_requests(args, num_reqs) -> list[UserRequest]:
     else:
         dataset = ShareGPTDataset(args.benchmark.dataset_path)
         return dataset.sample(
-            AutoTokenizer.from_pretrained(
-                args.models.tokenizer_path, trust_remote_code=True
-            ),  # [TODO] support tokenizer other than hf
             num_requests=num_reqs,
             input_len=args.benchmark.input_len,
             max_new_tokens=args.benchmark.output_len,

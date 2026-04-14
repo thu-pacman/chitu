@@ -2,9 +2,11 @@ import random, asyncio, json
 import rich
 import xgrammar
 
-from chitu.tool_call import ToolCallParams, get_tool_parser
+from chitu.tool_call import ToolCallParams, ToolConfig
+from chitu.tool_call.utils import _registere_parsers
 from chitu.tool_call.type_def import ChoiceToolCall, ChoiceToolCallFunction
 from chitu.reasoning.type_def import ReasoningParams
+from chitu.reasoning.utils import _reasoning_params_cache
 
 test_type_arguments = json.dumps({"ks": "vs", "ko": {"kb": True}, "ka": [1, 2, 3]})
 
@@ -49,15 +51,19 @@ def run_match(
     tools=TOOLS,
     tool_choice="auto",
     parallel_tool_calls=True,
-    reasoning_params=ReasoningParams(False),
+    thinking=False,
+    initial_thinking=False,
 ):
-    parser_cls = get_tool_parser(parser)
+    parser_cls = _registere_parsers[parser]
+    _reasoning_params_cache.clear()
+    _reasoning_params_cache[thinking] = ReasoningParams(
+        thinking, initial_state=initial_thinking
+    )
     grammar = parser_cls.build_grammar(
         ToolCallParams(
             tools=tools,
-            reasoning_params=reasoning_params,
-            tool_choice=tool_choice,
-            parallel_tool_calls=parallel_tool_calls,
+            enable_thinking=thinking,
+            config=ToolConfig(choice=tool_choice, at_most_one=not parallel_tool_calls),
         )
     )
     vocab = sorted(set("".join([data]))) + ["<|CHITU_STOP_TOKEN|>"]
@@ -105,7 +111,7 @@ def run_parse(
     for i, tool in enumerate(std_tools):
         tool.id = f"tool_id_{i}"
 
-    parser_cls = get_tool_parser(parser)
+    parser_cls = _registere_parsers[parser]
     parser_obj = parser_cls(TOOLS)
 
     def parse():
@@ -274,15 +280,14 @@ def test_reasoning():
 
     run_match(parser, data, True, tool_choice="required")
 
-    rp1 = ReasoningParams(True)
+    kwargs = dict(tool_choice="required", thinking=True)
     data1 = "<think>reasoning_content</think>" + data
-    run_match(parser, data, False, tool_choice="required", reasoning_params=rp1)
-    run_match(parser, data1, True, tool_choice="required", reasoning_params=rp1)
-
-    rp2 = ReasoningParams(True, initial_state=True)
+    run_match(parser, data, False, **kwargs)
+    run_match(parser, data1, True, **kwargs)
     data2 = "reasoning_content</think>" + data
-    run_match(parser, data, False, tool_choice="required", reasoning_params=rp2)
-    run_match(parser, data2, True, tool_choice="required", reasoning_params=rp2)
+    kwargs["initial_thinking"] = True
+    run_match(parser, data, False, **kwargs)
+    run_match(parser, data2, True, **kwargs)
 
 
 if __name__ == "__main__":

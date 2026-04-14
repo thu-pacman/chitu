@@ -174,6 +174,12 @@ class MetadataConfig:
             include_next_token=True,
         )
 
+    @classmethod
+    def for_pd_dpep_decode_rank(cls) -> "MetadataConfig":
+        cfg = MetadataConfig.for_pd_decode_rank()
+        cfg.include_tokens = True
+        return cfg
+
     # 目前未使用，保留
     # 目前的通信中 PP 和 DP 需要传输的信息是相同的，故不做区分
     @classmethod

@@ -2,8 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
 from typing_extensions import override
 import functools
+import itertools
 import plum
 import torch
 
@@ -136,7 +138,9 @@ class QuantizedMoeExpertsUnmerged(QuantizedMoeExpertsBase):
     MoE experts with unmerged gate and up
     """
 
-    def forward_ith_expert_gate(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_gate(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Compute the i-th expert's separated gate_proj layer only.
 
@@ -146,7 +150,9 @@ class QuantizedMoeExpertsUnmerged(QuantizedMoeExpertsBase):
 
         raise NotImplementedError()
 
-    def forward_ith_expert_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_up(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Compute the i-th expert's separated up_proj layer only.
 
@@ -195,6 +201,10 @@ class QuantizedMoeExpertsUnmerged(QuantizedMoeExpertsBase):
         )
 
         x, indices = routed_x.activation, routed_x.token_to_expert_indices
+        if hasattr(routed_x, "activation_scale"):
+            x_scale = routed_x.activation_scale
+        else:
+            x_scale = None
 
         flattened_indices = indices.flatten()
         in_range_indices = flattened_indices[
@@ -208,23 +218,30 @@ class QuantizedMoeExpertsUnmerged(QuantizedMoeExpertsBase):
         }
 
         xs = []
+        x_scales = []
         for i in range(self.experts_end_idx - self.experts_start_idx):
             this_x = None
+            this_x_scale = None
             if i in activated_expert_ids:
                 idx, top = torch.where(indices == i)
                 this_x = x[idx]
+                if x_scale is not None:
+                    this_x_scale = x_scale[idx]
             xs.append(this_x)
+            x_scales.append(this_x_scale)
         if self.fuse_shared_experts:
             xs += [x] * self.n_fused_shared_experts
+            x_scales += [x_scale] * self.n_fused_shared_experts
 
         assert len(xs) == self.group_size
+        assert len(x_scales) == self.group_size
         act = []
-        for i, xsi in enumerate(xs):
+        for i, xs_i, x_scales_i in zip(itertools.count(), xs, x_scales):
             out = None
-            if xsi is not None:
+            if xs_i is not None:
                 out = self.forward_act_fn_unmerged(
-                    self.forward_ith_expert_gate(i, xsi),
-                    self.forward_ith_expert_up(i, xsi),
+                    self.forward_ith_expert_gate(i, xs_i, x_scales_i),
+                    self.forward_ith_expert_up(i, xs_i, x_scales_i),
                 )
             act.append(out)
 
@@ -272,19 +289,26 @@ class QuantizedMoeExpertsUnmerged(QuantizedMoeExpertsBase):
 
         n_tokens_per_expert_cpu = routed_x.n_tokens_per_expert.cpu()
         xs = []
+        x_scales = []
         for i in range(self.group_size):
             this_x = None
+            this_x_scale = None
             if n_tokens_per_expert_cpu[i] > 0:
                 this_x = routed_x.activation_per_expert[i, : n_tokens_per_expert_cpu[i]]
+                if hasattr(routed_x, "activation_scale_per_expert"):
+                    this_x_scale = routed_x.activation_scale_per_expert[
+                        i, : n_tokens_per_expert_cpu[i]
+                    ]
             xs.append(this_x)
+            x_scales.append(this_x_scale)
 
         act = []
-        for i, xsi in enumerate(xs):
+        for i, xs_i, x_scales_i in zip(itertools.count(), xs, x_scales):
             out = None
-            if xsi is not None:
+            if xs_i is not None:
                 out = self.forward_act_fn_unmerged(
-                    self.forward_ith_expert_gate(i, xsi),
-                    self.forward_ith_expert_up(i, xsi),
+                    self.forward_ith_expert_gate(i, xs_i, x_scales_i),
+                    self.forward_ith_expert_up(i, xs_i, x_scales_i),
                 )
             act.append(out)
 
@@ -303,7 +327,9 @@ class QuantizedMoeExpertsMerged(QuantizedMoeExpertsBase):
     MoE experts with merged gate and up
     """
 
-    def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_gate_up(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Compute the i-th expert's merged gate_up_proj layer only.
 
@@ -351,6 +377,10 @@ class QuantizedMoeExpertsMerged(QuantizedMoeExpertsBase):
         )
 
         x, indices = routed_x.activation, routed_x.token_to_expert_indices
+        if hasattr(routed_x, "activation_scale"):
+            x_scale = routed_x.activation_scale
+        else:
+            x_scale = None
 
         flattened_indices = indices.flatten()
         in_range_indices = flattened_indices[
@@ -364,22 +394,29 @@ class QuantizedMoeExpertsMerged(QuantizedMoeExpertsBase):
         }
 
         xs = []
+        x_scales = []
         for i in range(self.experts_end_idx - self.experts_start_idx):
             this_x = None
+            this_x_scale = None
             if i in activated_expert_ids:
                 idx, top = torch.where(indices == i)
                 this_x = x[idx]
+                if x_scale is not None:
+                    this_x_scale = x_scale[idx]
             xs.append(this_x)
+            x_scales.append(this_x_scale)
         if self.fuse_shared_experts:
             xs += [x] * self.n_fused_shared_experts
+            x_scales += [x_scale] * self.n_fused_shared_experts
 
         assert len(xs) == self.group_size
+        assert len(x_scales) == self.group_size
         act = []
-        for i, xsi in enumerate(xs):
+        for i, xs_i, x_scales_i in zip(itertools.count(), xs, x_scales):
             out = None
-            if xsi is not None:
+            if xs_i is not None:
                 out = self.forward_act_fn_merged(
-                    self.forward_ith_expert_gate_up(i, xsi)
+                    self.forward_ith_expert_gate_up(i, xs_i, x_scales_i)
                 )
             act.append(out)
 
@@ -427,18 +464,25 @@ class QuantizedMoeExpertsMerged(QuantizedMoeExpertsBase):
 
         n_tokens_per_expert_cpu = routed_x.n_tokens_per_expert.cpu()
         xs = []
+        x_scales = []
         for i in range(self.group_size):
             this_x = None
+            this_x_scale = None
             if n_tokens_per_expert_cpu[i] > 0:
                 this_x = routed_x.activation_per_expert[i, : n_tokens_per_expert_cpu[i]]
+                if hasattr(routed_x, "activation_scale_per_expert"):
+                    this_x_scale = routed_x.activation_scale_per_expert[
+                        i, : n_tokens_per_expert_cpu[i]
+                    ]
             xs.append(this_x)
+            x_scales.append(this_x_scale)
 
         act = []
-        for i, xsi in enumerate(xs):
+        for i, xs_i, x_scales_i in zip(itertools.count(), xs, x_scales):
             out = None
-            if xsi is not None:
+            if xs_i is not None:
                 out = self.forward_act_fn_merged(
-                    self.forward_ith_expert_gate_up(i, xsi)
+                    self.forward_ith_expert_gate_up(i, xs_i, x_scales_i)
                 )
             act.append(out)
 

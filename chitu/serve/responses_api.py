@@ -6,34 +6,23 @@ from __future__ import annotations
 
 import json
 import time
-import traceback
 from logging import getLogger
 from typing import (
-    Annotated,
     Any,
-    AsyncIterator,
-    Awaitable,
-    cast,
-    Callable,
     Literal,
     Optional,
-    Protocol,
 )
 
-from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from chitu.backend import Backend
 from chitu.global_vars import get_global_args
-from chitu.task import RouterRequest, UserRequest
+from chitu.task import UserRequest, RequestParams
 from chitu.tool_call import (
     ChoiceDelta,
     ChoiceToolCall,
-    ToolChoice as OpenAIToolChoice,
-    ToolChoiceFunction,
-    ToolChoiceNamedTool,
-    get_tool_parser,
+    ToolConfig,
+    get_tool_parser_cls,
     parse_stream_by_parser,
 )
 from chitu.serve.anthropic_api import (
@@ -41,7 +30,6 @@ from chitu.serve.anthropic_api import (
 )
 from chitu.serve.common import (
     build_chat_template_kwargs,
-    parse_api_key_from_headers,
     submit_request,
 )
 from chitu.utils import gen_req_id
@@ -78,6 +66,11 @@ class ResponsesTextConfig(BaseModel):
     verbosity: str | None = None
 
 
+class ToolChoiceNamedTool(BaseModel):
+    type: Literal["function"]
+    name: str
+
+
 class ResponsesCreateRequest(BaseModel):
     """
     Minimal subset of OpenAI Responses API.
@@ -98,7 +91,7 @@ class ResponsesCreateRequest(BaseModel):
     text: ResponsesTextConfig | None = None
     reasoning: ResponsesReasoningConfig | None = None
     tools: list[dict[str, Any]] = Field(default_factory=list)
-    tool_choice: str | dict[str, Any] = "auto"
+    tool_choice: Literal["none", "auto", "required"] | ToolChoiceNamedTool = "auto"
     parallel_tool_calls: bool = True
     previous_response_id: Optional[str] = None
     store: bool = False
@@ -120,27 +113,6 @@ class ResponsesCreateRequest(BaseModel):
     @property
     def resolved_top_p(self) -> float:
         return self.top_p if self.top_p is not None else 0.9
-
-
-class ResponsesAsyncStream(Protocol):
-    tokens_len: int | None
-
-    def __aiter__(self) -> AsyncIterator[tuple[Any, bool, Any]]: ...
-
-
-class ResponsesReqObject(Protocol):
-    request_id: str
-    async_stream: ResponsesAsyncStream
-    prompt_len: int | None
-    finish_reason: str | None
-
-
-class ResponsesRequestError(Exception):
-    def __init__(self, status_code: int, error_type: str, message: str):
-        super().__init__(message)
-        self.status_code = status_code
-        self.error_type = error_type
-        self.message = message
 
 
 def responses_error(status_code: int, error_type: str, message: str):
@@ -251,29 +223,6 @@ def normalize_response_tools(
             public_tool["strict"] = strict
         public_tools.append(public_tool)
     return internal_tools, public_tools
-
-
-def map_responses_tool_choice(
-    tool_choice: str | dict[str, Any],
-) -> tuple[OpenAIToolChoice, str | dict[str, Any]]:
-    if isinstance(tool_choice, str):
-        if tool_choice not in {"auto", "none", "required"}:
-            raise ValueError(f"Unsupported tool_choice: {tool_choice}")
-        return tool_choice, tool_choice
-
-    choice_type = tool_choice.get("type")
-    if choice_type == "function":
-        name = tool_choice.get("name", "")
-        if not name:
-            raise ValueError("tool_choice.name is required when type='function'")
-        return (
-            ToolChoiceNamedTool(
-                function=ToolChoiceFunction(name=name),
-                type="function",
-            ),
-            {"type": "function", "name": name},
-        )
-    raise ValueError(f"Unsupported tool_choice type: {choice_type}")
 
 
 def normalize_text_config(
@@ -397,70 +346,6 @@ def enable_thinking_from_request(request: ResponsesCreateRequest) -> bool:
     return request.reasoning.effort != "none"
 
 
-def build_user_request_from_responses(
-    *,
-    internal_messages: list[dict[str, Any]],
-    internal_tools: list[dict[str, Any]],
-    tool_choice: OpenAIToolChoice,
-    request: ResponsesCreateRequest,
-    task_priority: int,
-) -> UserRequest:
-    args = get_global_args()
-    enable_thinking = enable_thinking_from_request(request)
-    chat_template_kwargs = build_chat_template_kwargs(enable_thinking)
-    return UserRequest(
-        internal_messages,
-        gen_req_id(),
-        tools=internal_tools,
-        tool_choice=tool_choice,
-        parallel_tool_calls=request.parallel_tool_calls,
-        logprobs=False,
-        top_logprobs=None,
-        max_new_tokens=request.max_output_tokens or args.request.max_new_tokens,
-        temperature=request.resolved_temperature,
-        top_p=request.resolved_top_p,
-        top_k=50,
-        frequency_penalty=0.0,
-        chat_template_kwargs=chat_template_kwargs,
-        enable_reasoning=enable_thinking,
-        save_trace_dir=args.debug.save_trace_dir,
-        priority=task_priority,
-        stop_with_eos=True,
-    )
-
-
-def build_router_request_from_responses(
-    *,
-    internal_messages: list[dict[str, Any]],
-    internal_tools: list[dict[str, Any]],
-    tool_choice: OpenAIToolChoice,
-    request: ResponsesCreateRequest,
-) -> RouterRequest:
-    enable_thinking = enable_thinking_from_request(request)
-    chat_template_kwargs = build_chat_template_kwargs(enable_thinking)
-    return RouterRequest(
-        message=internal_messages,
-        request_id=gen_req_id(),
-        tools=internal_tools,
-        tool_choice=tool_choice,
-        parallel_tool_calls=request.parallel_tool_calls,
-        logprobs=False,
-        top_logprobs=None,
-        max_new_tokens=request.max_output_tokens
-        or get_global_args().request.max_new_tokens,
-        top_p=request.resolved_top_p,
-        top_k=50,
-        temperature=request.resolved_temperature,
-        frequency_penalty=0.0,
-        chat_template_kwargs=chat_template_kwargs,
-        stop_with_eos=True,
-    )
-
-
-def get_active_tool_parser():
-    return getattr(Backend, "tool_parser", None)
-
-
 def _make_message_item(item_id: str, text: str) -> dict[str, Any]:
     return {
         "id": item_id,
@@ -515,28 +400,27 @@ def _update_tool_buffer(
 
 
 def _stream_source_for_response(
-    req_obj: ResponsesReqObject,
-    internal_tools: list[dict[str, Any]],
+    req: UserRequest,
 ):
-    if not internal_tools:
-        return req_obj.async_stream
+    if not req.tool_call_params:
+        return req.async_stream
 
-    parser_cls = get_active_tool_parser() or get_tool_parser("MISSING")
-    parser = parser_cls(internal_tools)
-    return parse_stream_by_parser(req_obj.async_stream, parser)
+    parser_cls = get_tool_parser_cls()
+    parser = parser_cls(req.tool_call_params.tools)
+    return parse_stream_by_parser(req.async_stream, parser)
 
 
 def _response_status_and_incomplete_details(
-    req_obj: ResponsesReqObject,
+    req: UserRequest,
 ) -> tuple[str, dict[str, Any] | None]:
-    if getattr(req_obj, "finish_reason", None) == "length":
+    if req.finish_reason == "length":
         return "incomplete", {"reason": "max_output_tokens"}
     return "completed", None
 
 
-def _response_usage(req_obj: ResponsesReqObject) -> dict[str, Any]:
-    completion_tokens = int(getattr(req_obj.async_stream, "tokens_len", 0) or 0)
-    prompt_tokens = int(getattr(req_obj, "prompt_len", 0) or 0)
+def _response_usage(req: UserRequest) -> dict[str, Any]:
+    completion_tokens = req.async_stream.tokens_len
+    prompt_tokens = req.prompt_len
     return {
         "input_tokens": prompt_tokens,
         "input_tokens_details": {"cached_tokens": 0},
@@ -722,27 +606,15 @@ def _build_function_call_done_events(
     ]
 
 
-def _require_responses_req_obj(req_obj: Any) -> ResponsesReqObject:
-    async_stream = getattr(req_obj, "async_stream", None)
-    if async_stream is None:
-        raise ResponsesRequestError(
-            500,
-            "internal_error",
-            "response stream is not ready",
-        )
-    return cast(ResponsesReqObject, req_obj)
-
-
 async def collect_response_output(
     *,
-    req_obj: ResponsesReqObject,
-    internal_tools: list[dict[str, Any]],
+    req: UserRequest,
 ) -> tuple[str, list[dict[str, Any]]]:
     output_text_parts: list[str] = []
     tool_buffers: dict[int, dict[str, str]] = {}
 
-    if internal_tools:
-        stream = _stream_source_for_response(req_obj, internal_tools)
+    if req.tool_call_params:
+        stream = _stream_source_for_response(req)
         async for data, _is_reasoning, _extra in stream:
             if not data or not isinstance(data, ChoiceDelta):
                 continue
@@ -751,7 +623,7 @@ async def collect_response_output(
             for tool_call in data.tool_calls or []:
                 _update_tool_buffer(tool_buffers, tool_call, track_started=False)
     else:
-        async for data, is_reasoning, _extra in req_obj.async_stream:
+        async for data, is_reasoning, _extra in req.async_stream:
             if not data or is_reasoning:
                 continue
             output_text_parts.append(data)
@@ -759,9 +631,7 @@ async def collect_response_output(
     output_items: list[dict[str, Any]] = []
     output_text = "".join(output_text_parts)
     if output_text:
-        output_items.append(
-            _make_message_item(f"msg_{req_obj.request_id}", output_text)
-        )
+        output_items.append(_make_message_item(f"msg_{req.request_id}", output_text))
     for index in sorted(tool_buffers):
         buf = tool_buffers[index]
         call_id = buf["id"] or f"call_{gen_req_id()}"
@@ -780,18 +650,18 @@ def build_responses_response(
     *,
     request: ResponsesCreateRequest,
     response_model: str,
-    req_obj: ResponsesReqObject,
+    user_req: UserRequest,
     output_text: str,
     output_items: list[dict[str, Any]],
     public_tools: list[dict[str, Any]],
     public_tool_choice: str | dict[str, Any],
 ) -> dict[str, Any]:
     created_at = int(time.time())
-    status, incomplete_details = _response_status_and_incomplete_details(req_obj)
+    status, incomplete_details = _response_status_and_incomplete_details(user_req)
     return _build_response_skeleton(
         request=request,
         response_model=response_model,
-        response_id=f"resp_{req_obj.request_id}",
+        response_id=f"resp_{user_req.request_id}",
         public_tools=public_tools,
         public_tool_choice=public_tool_choice,
         status=status,
@@ -799,21 +669,20 @@ def build_responses_response(
         completed_at=created_at,
         output=output_items,
         output_text=output_text,
-        usage=_response_usage(req_obj),
+        usage=_response_usage(user_req),
         incomplete_details=incomplete_details,
     )
 
 
 async def responses_stream_from_async_stream(
     *,
-    req_obj: ResponsesReqObject,
+    user_req: UserRequest,
     request: ResponsesCreateRequest,
     response_model: str,
-    internal_tools: list[dict[str, Any]],
     public_tools: list[dict[str, Any]],
     public_tool_choice: str | dict[str, Any],
 ):
-    response_id = f"resp_{req_obj.request_id}"
+    response_id = f"resp_{user_req.request_id}"
     output_text_parts: list[str] = []
     tool_buffers: dict[int, dict[str, str]] = {}
 
@@ -837,9 +706,9 @@ async def responses_stream_from_async_stream(
             },
         )
 
-    stream = _stream_source_for_response(req_obj, internal_tools)
+    stream = _stream_source_for_response(user_req)
 
-    text_item_id = f"msg_{req_obj.request_id}"
+    text_item_id = f"msg_{user_req.request_id}"
     text_started = False
     async for data, is_reasoning, _extra in stream:
         if not data:
@@ -939,7 +808,7 @@ async def responses_stream_from_async_stream(
             "response": build_responses_response(
                 request=request,
                 response_model=response_model,
-                req_obj=req_obj,
+                user_req=user_req,
                 output_text=output_text,
                 output_items=output_items,
                 public_tools=public_tools,
@@ -951,39 +820,24 @@ async def responses_stream_from_async_stream(
 
 async def handle_responses_request(
     *,
-    raw_request: Request,
-    authorization: Optional[str],
-    server_status: bool,
-    dp_enabled: bool,
-    dp_service_started: bool,
-    dp_register_and_submit: Callable[[Any], Awaitable[Any]],
-    priority_for_api_key: Callable[[str], int],
+    request: ResponsesCreateRequest,
+    priority: int,
 ):
-    try:
-        api_key = parse_api_key_from_headers(authorization, None)
-    except HTTPException as e:
-        return responses_error(400, "invalid_request_error", str(e.detail))
-    task_priority = priority_for_api_key(api_key)
-
-    if not server_status:
-        return responses_error(503, "service_unavailable", "Service is not started")
-
-    try:
-        data = await raw_request.json()
-    except Exception:
-        return responses_error(
-            400, "invalid_request_error", "Invalid JSON body. Expecting JSON payload."
-        )
-
-    try:
-        request = ResponsesCreateRequest.model_validate(data)
-    except ValidationError as e:
-        return responses_error(422, "invalid_request_error", json.dumps(e.errors()))
-
     try:
         response_model = resolve_requested_model_or_error(request.model)
         internal_tools, public_tools = normalize_response_tools(request.tools)
-        tool_choice, public_tool_choice = map_responses_tool_choice(request.tool_choice)
+        if isinstance(request.tool_choice, ToolChoiceNamedTool):
+            tool_config = ToolConfig(
+                "required",
+                request.parallel_tool_calls,
+                [request.tool_choice.name],
+            )
+            public_tool_choice = request.tool_choice.model_dump()
+        else:
+            tool_config = ToolConfig(
+                request.tool_choice, not request.parallel_tool_calls
+            )
+            public_tool_choice = request.tool_choice
         internal_messages = build_internal_messages(request)
     except ValueError as e:
         return responses_error(400, "invalid_request_error", str(e))
@@ -1007,154 +861,52 @@ async def handle_responses_request(
             "conversation is not supported yet",
         )
 
-    try:
-        req_obj = await _submit_responses_request(
-            request=request,
-            internal_messages=internal_messages,
-            internal_tools=internal_tools,
-            tool_choice=tool_choice,
-            task_priority=task_priority,
-            dp_enabled=dp_enabled,
-            dp_service_started=dp_service_started,
-            dp_register_and_submit=dp_register_and_submit,
-        )
-    except ResponsesRequestError as e:
-        return responses_error(e.status_code, e.error_type, e.message)
+    args = get_global_args()
+    enable_thinking = enable_thinking_from_request(request)
+    chat_template_kwargs = build_chat_template_kwargs(enable_thinking)
+
+    req_params = RequestParams(
+        messages=internal_messages,
+        request_id=gen_req_id(),
+        tools=internal_tools,
+        tool_config=tool_config,
+        logprobs=False,
+        top_logprobs=None,
+        max_new_tokens=request.max_output_tokens or args.request.max_new_tokens,
+        temperature=request.resolved_temperature,
+        top_p=request.resolved_top_p,
+        top_k=50,
+        frequency_penalty=0.0,
+        chat_template_kwargs=chat_template_kwargs,
+        enable_thinking=enable_thinking,
+        save_trace_dir=args.debug.save_trace_dir,
+        priority=priority,
+        stop_with_eos=True,
+    )
+    user_req = UserRequest.from_request_params(req_params)
+    await submit_request(user_req)
 
     if request.stream:
         return StreamingResponse(
             responses_stream_from_async_stream(
-                req_obj=req_obj,
+                user_req=user_req,
                 request=request,
                 response_model=response_model,
-                internal_tools=internal_tools,
                 public_tools=public_tools,
                 public_tool_choice=public_tool_choice,
             ),
             media_type="text/event-stream",
         )
 
-    output_text, output_items = await collect_response_output(
-        req_obj=req_obj, internal_tools=internal_tools
-    )
+    output_text, output_items = await collect_response_output(req=user_req)
     return JSONResponse(
         build_responses_response(
             request=request,
             response_model=response_model,
-            req_obj=req_obj,
+            user_req=user_req,
             output_text=output_text,
             output_items=output_items,
             public_tools=public_tools,
             public_tool_choice=public_tool_choice,
         )
     )
-
-
-async def _submit_responses_request(
-    *,
-    request: ResponsesCreateRequest,
-    internal_messages: list[dict[str, Any]],
-    internal_tools: list[dict[str, Any]],
-    tool_choice: OpenAIToolChoice,
-    task_priority: int,
-    dp_enabled: bool,
-    dp_service_started: bool,
-    dp_register_and_submit: Callable[[Any], Awaitable[Any]],
-) -> ResponsesReqObject:
-    if dp_enabled:
-        if not dp_service_started:
-            raise ResponsesRequestError(
-                503, "service_unavailable", "DP service not started"
-            )
-        try:
-            router_request = build_router_request_from_responses(
-                internal_messages=internal_messages,
-                internal_tools=internal_tools,
-                tool_choice=tool_choice,
-                request=request,
-            )
-            response = await dp_register_and_submit(router_request)
-        except HTTPException as e:
-            raise ResponsesRequestError(
-                int(e.status_code), "service_unavailable", str(e.detail)
-            )
-        except ValueError:
-            raise ResponsesRequestError(
-                400,
-                "invalid_request_error",
-                "prompt length is greater than max_seq_len",
-            )
-        except Exception as e:
-            raise ResponsesRequestError(500, "internal_error", str(e))
-        return _require_responses_req_obj(getattr(response, "req", router_request))
-
-    try:
-        user_req = build_user_request_from_responses(
-            internal_messages=internal_messages,
-            internal_tools=internal_tools,
-            tool_choice=tool_choice,
-            request=request,
-            task_priority=task_priority,
-        )
-    except ValueError:
-        raise ResponsesRequestError(
-            400, "invalid_request_error", "prompt length is greater than max_seq_len"
-        )
-
-    response = submit_request(user_req)
-    return _require_responses_req_obj(getattr(response, "req", user_req))
-
-
-def create_router(
-    *,
-    get_server_status: Callable[[], bool],
-    get_dp_service_started: Callable[[], bool],
-    priority_for_api_key: Callable[[str], int],
-) -> APIRouter:
-    router = APIRouter()
-
-    async def _dp_register_and_submit(router_request):
-        if not get_global_args().dp_config.enabled:
-            raise HTTPException(status_code=400, detail="DP mode not enabled")
-        if not get_dp_service_started():
-            raise HTTPException(status_code=503, detail="DP service not started")
-
-        from chitu.dp_token_router import get_token_router
-        from chitu.dp_request_router import get_request_router
-
-        token_router = get_token_router()
-        response = await token_router.register_request(
-            router_request.request_id, router_request
-        )
-
-        request_router = get_request_router()
-        await request_router.add_request(router_request)
-        return response
-
-    @router.post("/v1/responses")
-    async def v1_responses(
-        raw_request: Request,
-        authorization: Annotated[Optional[str], Header(alias="Authorization")] = None,
-    ):
-        try:
-            return await handle_responses_request(
-                raw_request=raw_request,
-                authorization=authorization,
-                server_status=get_server_status(),
-                dp_enabled=get_global_args().dp_config.enabled,
-                dp_service_started=get_dp_service_started(),
-                dp_register_and_submit=_dp_register_and_submit,
-                priority_for_api_key=priority_for_api_key,
-            )
-        except HTTPException as e:
-            logger.info(
-                f"Rejected illegal request, returning {e}: {traceback.format_exc()}"
-            )
-            raise e
-        except Exception as e:
-            logger.exception(
-                f"Error processing request, got {e}: {traceback.format_exc()}"
-            )
-            raise HTTPException(status_code=500, detail="internal server error")
-
-    return router

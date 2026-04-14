@@ -66,7 +66,8 @@ def create_client(monkeypatch):
         serve_common,
         "get_global_args",
         lambda: SimpleNamespace(
-            serve=SimpleNamespace(api_keys=[], validate_api_key=False)
+            serve=SimpleNamespace(api_keys=[], validate_api_key=False),
+            models=SimpleNamespace(name="Qwen3-32B"),
         ),
     )
     monkeypatch.setattr(
@@ -86,12 +87,17 @@ def create_client(monkeypatch):
     return TestClient(api_server.app)
 
 
+async def _submit_request_passthrough(req):
+    return SimpleNamespace(req=req)
+
+
 def test_responses_endpoint_returns_text_response(monkeypatch):
     client = create_client(monkeypatch)
     fake_req = SimpleNamespace(
         request_id="req_text",
         prompt_len=5,
         finish_reason="stop",
+        tool_call_params=None,
         async_stream=StaticAsyncStream(
             [
                 ("Hello", False, (None, None)),
@@ -102,11 +108,9 @@ def test_responses_endpoint_returns_text_response(monkeypatch):
     )
 
     monkeypatch.setattr(
-        responses_api, "build_user_request_from_responses", lambda **kwargs: fake_req
+        responses_api.UserRequest, "from_request_params", lambda params: fake_req
     )
-    monkeypatch.setattr(
-        responses_api, "submit_request", lambda req: SimpleNamespace(req=req)
-    )
+    monkeypatch.setattr(responses_api, "submit_request", _submit_request_passthrough)
 
     response = client.post(
         "/v1/responses",
@@ -128,6 +132,7 @@ def test_responses_endpoint_streams_sse_events(monkeypatch):
         request_id="req_stream",
         prompt_len=3,
         finish_reason="stop",
+        tool_call_params=None,
         async_stream=StaticAsyncStream(
             [
                 ("Hi", False, (None, None)),
@@ -138,11 +143,9 @@ def test_responses_endpoint_streams_sse_events(monkeypatch):
     )
 
     monkeypatch.setattr(
-        responses_api, "build_user_request_from_responses", lambda **kwargs: fake_req
+        responses_api.UserRequest, "from_request_params", lambda params: fake_req
     )
-    monkeypatch.setattr(
-        responses_api, "submit_request", lambda req: SimpleNamespace(req=req)
-    )
+    monkeypatch.setattr(responses_api, "submit_request", _submit_request_passthrough)
 
     with client.stream(
         "POST",
@@ -164,6 +167,18 @@ def test_responses_endpoint_returns_function_call_item(monkeypatch):
         request_id="req_tool",
         prompt_len=4,
         finish_reason="tool_calls",
+        tool_call_params=SimpleNamespace(
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ]
+        ),
         async_stream=StaticAsyncStream(
             [("tool", False, (None, None))],
             tokens_len=1,
@@ -171,14 +186,10 @@ def test_responses_endpoint_returns_function_call_item(monkeypatch):
     )
 
     monkeypatch.setattr(
-        responses_api, "build_user_request_from_responses", lambda **kwargs: fake_req
+        responses_api.UserRequest, "from_request_params", lambda params: fake_req
     )
-    monkeypatch.setattr(
-        responses_api, "submit_request", lambda req: SimpleNamespace(req=req)
-    )
-    monkeypatch.setattr(
-        responses_api, "get_active_tool_parser", lambda: DummyToolParser
-    )
+    monkeypatch.setattr(responses_api, "submit_request", _submit_request_passthrough)
+    monkeypatch.setattr(responses_api, "get_tool_parser_cls", lambda: DummyToolParser)
 
     response = client.post(
         "/v1/responses",

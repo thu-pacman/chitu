@@ -427,11 +427,15 @@ class PDSchedulerService:
         logger.info("starting request handler")
 
         while self.running:
-            if await self.request_socket.poll(timeout=100):  # 100ms timeout
-                request_bytes = await self.request_socket.recv()
-                request_data = msgpack.unpackb(request_bytes, raw=False)
+            try:
+                if await self.request_socket.poll(timeout=100):  # 100ms timeout
+                    request_bytes = await self.request_socket.recv()
+                    request_data = msgpack.unpackb(request_bytes, raw=False)
 
-                await self.scheduler.process_request(request_data)
+                    await self.scheduler.process_request(request_data)
+            except:
+                logger.exception("PDSchedulerService process request failed")
+                raise
 
     async def _stats_reporter(self):
         """Report statistics to router"""

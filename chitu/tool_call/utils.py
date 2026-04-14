@@ -4,14 +4,16 @@
 
 import json
 import logging
+import functools
 from .abstract_parser import (
     AbstractToolParser,
     JsonMessageToolParserMixin,
     PatchTemplateToolParserMixin,
 )
-from .type_def import ChoiceDelta
+from .type_def import ChoiceDelta, ToolCallParams
 from .dummy_parser import DummyToolParser
 from typing import Any, AsyncIterable, AsyncGenerator, TypeVar
+from chitu.global_vars import get_global_args
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +28,13 @@ def register(cls: T) -> T:
     return cls
 
 
-def get_tool_parser(name: str) -> type[AbstractToolParser]:
-    return _registere_parsers.get(name, DummyToolParser)
+@functools.cache
+def get_tool_parser_cls() -> type[AbstractToolParser]:
+    args = get_global_args()
+    name = getattr(args.models, "tool_parser", "MISSING")
+    cls = _registere_parsers.get(name, DummyToolParser)
+    logger.info(f"using tool parser {cls.__name__} from config {repr(name)}")
+    return cls
 
 
 class StreamAdapter:
@@ -67,7 +74,8 @@ async def parse_stream_by_parser(
                     yield adapter.wrap(chunk)
 
 
-def adjust_message_for_tool_calls(parser_cls: type[AbstractToolParser], message: list):
+def adjust_message_for_tool_calls(message: list):
+    parser_cls = get_tool_parser_cls()
     if not issubclass(parser_cls, JsonMessageToolParserMixin):
         return message
     for chunk in message:
@@ -80,10 +88,16 @@ def adjust_message_for_tool_calls(parser_cls: type[AbstractToolParser], message:
     return message
 
 
-def patch_chat_template(parser_cls: type[AbstractToolParser], model):
+def patch_chat_template(model):
+    parser_cls = get_tool_parser_cls()
     if not issubclass(parser_cls, PatchTemplateToolParserMixin):
         return
     try:
         model.chat_template = parser_cls.patch_chat_template(model.chat_template)
     except Exception:
         logger.exception(f"patch chat template failed, tool call may be incorrect!")
+
+
+def build_grammar(params: ToolCallParams):
+    parser_cls = get_tool_parser_cls()
+    return parser_cls.build_grammar(params)

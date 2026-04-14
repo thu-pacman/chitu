@@ -10,18 +10,15 @@ Responsible for receiving tokens returned from each DP group and forwarding them
 import asyncio
 import os
 import time
-from collections import defaultdict, deque
-from typing import Any, Optional
+from collections import defaultdict
+from typing import Any
 import zmq
 import zmq.asyncio
 import msgpack
 import logging
-from typing_extensions import override
 
-from chitu.async_response import AsyncDataStream, AsyncResponse
 from chitu.task import UserRequest
 from chitu.dp_request_router import get_request_router
-from chitu.reasoning import ReasoningParams
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +31,7 @@ class TokenRouter:
         self.context = zmq.asyncio.Context()
 
         # Store active request connection mappings
-        self.active_requests: dict[str, RequestContext] = {}
+        self.active_requests: dict[str, UserRequest] = {}
 
         # Socket(s) for receiving tokens from DP groups
         self.token_receiver = None  # legacy single-socket mode
@@ -97,53 +94,19 @@ class TokenRouter:
                 self.token_receivers[dp_id] = sock
                 logger.info(f"Router token receiver[{dp_id}] listening on {addr}")
 
-    async def register_request(self, request_id: str, router_request) -> AsyncResponse:
-        """Register new request, return AsyncResponse for streaming"""
-        logger.debug(f"Token Router: Registering request {request_id}")
+    async def register_request(self, req: UserRequest):
+        """Register new request"""
+        logger.debug(f"Token Router: Registering request {req.request_id}")
 
-        # Create special AsyncDataStream for DP scenario
-        dp_stream = DPAsyncDataStream()
-        router_request.async_stream = dp_stream
-
-        # Create request context
-        context = RequestContext(
-            request_id=request_id,
-            user_request=router_request,  # Store RouterRequest for now
-            dp_stream=dp_stream,
-            created_time=time.time(),
-        )
-
-        self.active_requests[request_id] = context
-
-        # Create and return AsyncResponse
-        response = AsyncResponse(router_request)
-        # Attach a completion callback to mark this request as finished on router side
-        try:
-            orig_send_stop_signal = router_request.async_stream.send_stop_signal
-
-            def wrapped_send_stop_signal():
-                logger.debug(f"Token Router: Stream stop for request {request_id}")
-                orig_send_stop_signal()
-                # Mark finished timestamp for diagnostics
-                ctx = self.active_requests.get(request_id)
-                if ctx is not None:
-                    ctx.finished_time = time.time()
-                    ctx.finished_marked = True
-
-            router_request.async_stream.send_stop_signal = wrapped_send_stop_signal
-        except Exception as e:
-            logger.warning(
-                f"Token Router: failed to wrap stop signal for {request_id}: {e}"
-            )
+        self.active_requests[req.request_id] = req
 
         # Update active requests gauge
         from chitu.metrics.prometheus_collector import chitu_active_requests
 
         chitu_active_requests.labels(role="decode").set(len(self.active_requests))
         logger.debug(
-            f"Token Router: Request {request_id} registered, active requests: {len(self.active_requests)}"
+            f"Token Router: Request {req.request_id} registered, active requests: {len(self.active_requests)}"
         )
-        return response
 
     async def _recv_loop(self, dp_id: int, sock):
         # 批量排空
@@ -190,14 +153,13 @@ class TokenRouter:
             )
             return
 
-        context = self.active_requests[request_id]
+        req = self.active_requests[request_id]
         logger.debug(f"Token Router: Found request context, processing token...")
 
         # If the stream has already been marked finished, log and drop
-        if getattr(context, "finished_marked", False):
-            finished_at = getattr(context, "finished_time", 0)
+        if req.finished:
             logger.error(
-                f"Token Router: token arrived after stream finished: request_id={request_id}, delay={time.time()-finished_at:.3f}s"
+                f"Token Router: token arrived after stream finished: request_id={request_id}, delay={time.monotonic()-req.completion_time:.3f}s"
             )
             return
 
@@ -209,48 +171,14 @@ class TokenRouter:
             )
             return
 
-        # Safety check 4: DP group ID validation (optional)
-        dp_group_id = token_data.get("scheduler_id")
-        if dp_group_id is not None and hasattr(context, "expected_dp_group"):
-            if dp_group_id != context.expected_dp_group:
-                logger.error(
-                    f"Token Router: Token from unexpected DP group {dp_group_id}, request_id={request_id}"
-                )
-                return
-
         # Process based on token type
         if token_data.get("type") == "token":
             # token contains decoded text
-            text = token_data.get("text")
-            original_token_id = token_data.get("original_token_id")  # for debugging
+            token = token_data.get("token")
             top_logprobs = token_data.get("top_logprobs")
-            top_tokens_text = token_data.get(
-                "top_tokens_text"
-            )  # decoded top tokens text
+            top_token_idx = token_data.get("top_token_idx")
+            req.async_stream.add_data(token, top_logprobs, top_token_idx)
 
-            # Check if this token contains prompt_len (for first token from Enhanced Scheduler)
-            prompt_len = token_data.get("prompt_len")
-            if prompt_len is not None and hasattr(
-                context.user_request, "set_prompt_len"
-            ):
-                context.user_request.set_prompt_len(prompt_len)
-                logger.debug(
-                    f"Token Router: Updated prompt_len={prompt_len} for request {request_id}"
-                )
-                router = get_request_router()
-                if router is not None and hasattr(router, "record_prompt_len"):
-                    router.record_prompt_len(request_id, prompt_len)
-
-            # Safety check 5: text must exist
-            if text is None:
-                logger.error(
-                    f"Token Router: Received token data missing text field, request_id={request_id}"
-                )
-                return
-
-            context.dp_stream.add_text_data(
-                text, top_logprobs, top_tokens_text, original_token_id
-            )
             self.total_tokens_received += 1
             # per-dp 统计
             dp_id = int(token_data.get("scheduler_id", -1))
@@ -261,11 +189,9 @@ class TokenRouter:
                 router.record_generated_token(request_id, 1)
 
             # first token arrival time
-            ctx = self.active_requests.get(request_id)
-            if ctx and not ctx.first_token_logged:
-                ctx.first_token_logged = True
-                created_ts = getattr(ctx, "created_time", self.start_time)
-                ttft_s = time.time() - created_ts
+            if req.async_stream.tokens_len == 0:
+                req.prefill_end_time = time.monotonic()
+                ttft_s = req.prefill_end_time - req.start_time
                 # Record TTFT metric (router-side, includes network latency)
                 from chitu.metrics.prometheus_collector import observe_ttft
 
@@ -277,10 +203,6 @@ class TokenRouter:
                     logger.warning(
                         f"[TTFT] dp={token_data.get('scheduler_id')}, request={request_id}, has long ttft_s={ttft_s:.1f}"
                     )
-                # 首 token 到达即释放 Router 本地准入占位
-                router = get_request_router()
-                if router is not None and hasattr(router, "mark_request_first_token"):
-                    router.mark_request_first_token(request_id)
 
             # Periodically print per-dp throughput, help locate if all channels are flowing
             now = time.time()
@@ -297,8 +219,8 @@ class TokenRouter:
         elif token_data.get("type") == "finish":
             # Request completed
             finish_reason = token_data.get("finish_reason", "stop")
-            context.user_request.finish_reason = finish_reason
-            context.user_request.finish()
+            req.finish_reason = finish_reason
+            req.finish()
 
             # Remove from active requests
             del self.active_requests[request_id]
@@ -322,7 +244,7 @@ class TokenRouter:
             )
 
             # Send stop signal and cleanup
-            context.user_request.finish()
+            req.finish()
             del self.active_requests[request_id]
 
         else:
@@ -334,14 +256,13 @@ class TokenRouter:
         """Clean up timed out requests"""
         while True:
             try:
-                current_time = time.time()
+                current_time = time.monotonic()
                 timeout_requests = []
 
-                for request_id, context in self.active_requests.items():
+                for request_id, req in self.active_requests.items():
                     if (
                         self._cleanup_timeout_s > 0
-                        and current_time - context.created_time
-                        > self._cleanup_timeout_s
+                        and current_time - req.start_time > self._cleanup_timeout_s
                     ):
                         timeout_requests.append(request_id)
 
@@ -349,8 +270,7 @@ class TokenRouter:
                     logger.warning(
                         f"Token Router: Request {request_id} timed out, cleaning up"
                     )
-                    context = self.active_requests[request_id]
-                    context.dp_stream.send_stop_signal()
+                    req.async_stream.send_stop_signal()
                     del self.active_requests[request_id]
 
                 await asyncio.sleep(60)  # Clean up every minute
@@ -358,97 +278,6 @@ class TokenRouter:
             except Exception as e:
                 logger.error(f"Token Router: Error in cleanup task: {e}")
                 await asyncio.sleep(60)
-
-
-class RequestContext:
-    """Request context, stores request-related information"""
-
-    def __init__(
-        self,
-        request_id: str,
-        user_request: UserRequest,
-        dp_stream: "DPAsyncDataStream",
-        created_time: float,
-    ):
-        self.request_id = request_id
-        self.user_request = user_request
-        self.dp_stream = dp_stream
-        self.created_time = created_time
-        # Finish state for graceful teardown
-        self.finished_marked: bool = False
-        self.finished_time: float = 0.0
-        # First token latency logging flag
-        self.first_token_logged: bool = False
-
-
-class DPAsyncDataStream(AsyncDataStream):
-    """AsyncDataStream specifically designed for DP scenarios
-
-    Inherits from original AsyncDataStream but optimized for cross-process communication
-    """
-
-    def __init__(self):
-        # FIXME: correct reasoning of DPAsyncDataStream is not implemented
-        super().__init__(ReasoningParams(False))
-        # DP specific attributes
-        self.dp_mode = True
-
-    def add_text_data(
-        self, text: str, top_logprobs=None, top_tokens_text=None, original_token_id=None
-    ):
-        """New method: directly add text data without decoding
-
-        This method is designed for DP scenarios, receives text already decoded in Enhanced Scheduler
-        """
-        with self.lock:
-            self.tokens_len += 1  # Count tokens
-
-            # Use received text directly
-            s = text
-
-            # Check for invalid characters
-            if "\ufffd" in s:
-                logger.debug(
-                    f"DP AsyncStream: Skipping text with invalid characters '{s}'"
-                )
-                s = s.replace("\ufffd", "")
-
-            # Add text directly to sequence
-            self.seqs.append(s)
-            # FIXME: correct reasoning of DPAsyncDataStream is not implemented
-            self.reasoning_states.append(False)
-            self.chars_len += len(s)
-
-            # Handle logprobs
-            if top_logprobs and top_tokens_text:
-                self.top_logprobs_list.append(top_logprobs)
-                self.top_tokens_list.append(top_tokens_text)
-
-        # Trigger data event
-        self.data_event.set()
-
-    @override
-    def send_stop_signal(self):
-        with self.lock:
-            self.stop_signal = True
-        self.notify_server_threadsafe()
-
-    @override
-    def add_data(
-        self,
-        value: Optional[int],
-        top_logprobs=None,
-        top_token_idx=None,
-        *,
-        notify_server: bool = True,
-    ):
-        """Override add_data method, optimized for DP scenarios
-
-        Note: This method should NEVER be called now, as we use add_text_data
-        """
-        raise NotImplementedError(
-            "DPAsyncDataStream.add_data should not be called. Please use DPAsyncDataStream.add_text_data instead."
-        )
 
 
 # Global Token Router instance
