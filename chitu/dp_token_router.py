@@ -177,6 +177,7 @@ class TokenRouter:
             token = token_data.get("token")
             top_logprobs = token_data.get("top_logprobs")
             top_token_idx = token_data.get("top_token_idx")
+            is_first_token = req.async_stream.tokens_len == 0
             req.async_stream.add_data(token, top_logprobs, top_token_idx)
 
             self.total_tokens_received += 1
@@ -189,7 +190,7 @@ class TokenRouter:
                 router.record_generated_token(request_id, 1)
 
             # first token arrival time
-            if req.async_stream.tokens_len == 0:
+            if is_first_token:
                 req.prefill_end_time = time.monotonic()
                 ttft_s = req.prefill_end_time - req.start_time
                 # Record TTFT metric (router-side, includes network latency)
