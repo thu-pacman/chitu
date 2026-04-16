@@ -193,7 +193,7 @@ def test_append_to_paged_kv_cache_decode(
         this_kv,
         delta_position_ids,
         delta_seq_ids=None,
-        use_i64_offsets=False,
+        use_i64_offsets=True,
         impl="torch",
     )
 
@@ -334,7 +334,7 @@ def test_dense_append_decode_matches_torch(
         this_kv,
         delta_position_ids,
         delta_seq_ids=None,
-        use_i64_offsets=False,
+        use_i64_offsets=True,
         impl="torch",
     )
 

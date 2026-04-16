@@ -16,6 +16,7 @@ from chitu.utils import (
 from chitu.global_vars import get_global_args
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
+from chitu.ops.utils import make_op_dispatcher
 from chitu.native_layout import (
     NativeLayoutTensor,
     ColumnOddEvenSeparatedTensor,
@@ -26,8 +27,9 @@ cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+has_triton_impl = has_triton and has_accelerator()
 
-if has_triton and has_accelerator():
+if has_triton_impl:
     from chitu.ops.triton_ops import apply_rotary_pos_emb_triton
 
 
@@ -56,6 +58,63 @@ def reshape_rotary_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     return freqs_cis.view(*shape)
 
 
+@make_op_dispatcher(op_name="apply_rotary_pos_emb")
+def _dispatch_apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
+    q_out: Optional[torch.Tensor | NativeLayoutTensor] = None,
+    k_out: Optional[torch.Tensor | NativeLayoutTensor] = None,
+    rotary_type: str = "separated",
+    impl: str = "auto",
+) -> tuple[torch.Tensor | NativeLayoutTensor, torch.Tensor | NativeLayoutTensor]:
+    raise NotImplementedError
+
+
+@_dispatch_apply_rotary_pos_emb.register_auto
+def _auto_apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
+    q_out: Optional[torch.Tensor | NativeLayoutTensor] = None,
+    k_out: Optional[torch.Tensor | NativeLayoutTensor] = None,
+    rotary_type: str = "separated",
+):
+    if has_cpuinfer and get_global_args().infer.op_impl == "cpu":
+        return "cpu"
+    if (
+        q_out is None
+        and k_out is None
+        and has_triton_impl
+        and (
+            rotary_type == "separated"
+            or (
+                rotary_type == "interleaved" and hasattr(triton.language, "interleaved")
+            )
+        )
+    ):
+        return "triton"
+    if has_chitu_backend:
+        return "cuda"
+    if has_torch_npu:
+        if (
+            rotary_type == "interleaved"
+            and q.shape[-1] == 64
+            and q.dtype == freqs_cis.cos.dtype
+            and (q_out is None or isinstance(q_out, ColumnOddEvenSeparatedTensor))
+            and (k_out is None or isinstance(k_out, ColumnOddEvenSeparatedTensor))
+        ):
+            return "torch_npu_with_output_layout"
+        return "torch_npu"
+    return "torch"
+
+
+_dispatch_apply_rotary_pos_emb.register_candidate("triton")
+if has_triton_impl:
+    _dispatch_apply_rotary_pos_emb.register("triton")(apply_rotary_pos_emb_triton)
+
+
+@_dispatch_apply_rotary_pos_emb.register("cuda", available=has_chitu_backend)
 def apply_rotary_pos_emb_cuda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -111,52 +170,7 @@ def apply_rotary_pos_emb_cuda(
     return q_out.view(q_shape), k_out.view(k_shape)
 
 
-def apply_rotary_pos_emb_torch(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    freqs_cis: BatchedFreqsCis,
-    q_out: Optional[torch.Tensor] = None,
-    k_out: Optional[torch.Tensor] = None,
-    rotary_type: str = "separated",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if rotary_type == "separated":
-        # "separated" has an [real, real, ..., real, imag, imag, ..., imag] layout.
-        cos = freqs_cis.separatedly_doubled_cos
-        sin = freqs_cis.separatedly_doubled_sin
-        cos_q = reshape_rotary_for_broadcast(cos, q)
-        sin_q = reshape_rotary_for_broadcast(sin, q)
-        cos_k = reshape_rotary_for_broadcast(cos, k)
-        sin_k = reshape_rotary_for_broadcast(sin, k)
-        q_embed = (q * cos_q) + (rotate_half(q) * sin_q)
-        k_embed = (k * cos_k) + (rotate_half(k) * sin_k)
-        q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
-
-    elif rotary_type == "interleaved":
-        # "interleaved" has an [real, imag, real, imag, ..., real, imag] layout.
-        cos = freqs_cis.interleavedly_doubled_cos
-        sin = freqs_cis.interleavedly_doubled_sin
-        cos_q = reshape_rotary_for_broadcast(cos, q)
-        sin_q = reshape_rotary_for_broadcast(sin, q)
-        cos_k = reshape_rotary_for_broadcast(cos, k)
-        sin_k = reshape_rotary_for_broadcast(sin, k)
-        q_embed = (q * cos_q) + (rotate_pairwise(q) * sin_q)
-        k_embed = (k * cos_k) + (rotate_pairwise(k) * sin_k)
-        q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
-
-    else:
-        raise ValueError(f"Unknown rotary type: {rotary_type}")
-
-    if q_out is not None:
-        q_out.copy_(q_embed)
-    else:
-        q_out = q_embed
-    if k_out is not None:
-        k_out.copy_(k_embed)
-    else:
-        k_out = k_embed
-    return q_out, k_out
-
-
+@_dispatch_apply_rotary_pos_emb.register("torch_npu", available=has_torch_npu)
 def apply_rotary_pos_emb_torch_npu(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -224,6 +238,9 @@ def apply_rotary_pos_emb_torch_npu(
     return q_out, k_out
 
 
+@_dispatch_apply_rotary_pos_emb.register(
+    "torch_npu_with_output_layout", available=has_torch_npu
+)
 def apply_rotary_pos_emb_torch_npu_with_output_layout(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -288,6 +305,7 @@ def apply_rotary_pos_emb_torch_npu_with_output_layout(
     return q_out, k_out
 
 
+@_dispatch_apply_rotary_pos_emb.register("cpu", available=has_cpuinfer)
 def apply_rotary_pos_emb_cpu(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -359,6 +377,53 @@ def apply_rotary_pos_emb_cpu(
     return q_out, k_out
 
 
+@_dispatch_apply_rotary_pos_emb.register("torch")
+def apply_rotary_pos_emb_torch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
+    q_out: Optional[torch.Tensor] = None,
+    k_out: Optional[torch.Tensor] = None,
+    rotary_type: str = "separated",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if rotary_type == "separated":
+        # "separated" has an [real, real, ..., real, imag, imag, ..., imag] layout.
+        cos = freqs_cis.separatedly_doubled_cos
+        sin = freqs_cis.separatedly_doubled_sin
+        cos_q = reshape_rotary_for_broadcast(cos, q)
+        sin_q = reshape_rotary_for_broadcast(sin, q)
+        cos_k = reshape_rotary_for_broadcast(cos, k)
+        sin_k = reshape_rotary_for_broadcast(sin, k)
+        q_embed = (q * cos_q) + (rotate_half(q) * sin_q)
+        k_embed = (k * cos_k) + (rotate_half(k) * sin_k)
+        q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
+
+    elif rotary_type == "interleaved":
+        # "interleaved" has an [real, imag, real, imag, ..., real, imag] layout.
+        cos = freqs_cis.interleavedly_doubled_cos
+        sin = freqs_cis.interleavedly_doubled_sin
+        cos_q = reshape_rotary_for_broadcast(cos, q)
+        sin_q = reshape_rotary_for_broadcast(sin, q)
+        cos_k = reshape_rotary_for_broadcast(cos, k)
+        sin_k = reshape_rotary_for_broadcast(sin, k)
+        q_embed = (q * cos_q) + (rotate_pairwise(q) * sin_q)
+        k_embed = (k * cos_k) + (rotate_pairwise(k) * sin_k)
+        q_embed, k_embed = q_embed.to(q.dtype), k_embed.to(k.dtype)
+
+    else:
+        raise ValueError(f"Unknown rotary type: {rotary_type}")
+
+    if q_out is not None:
+        q_out.copy_(q_embed)
+    else:
+        q_out = q_embed
+    if k_out is not None:
+        k_out.copy_(k_embed)
+    else:
+        k_out = k_embed
+    return q_out, k_out
+
+
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -420,67 +485,13 @@ def apply_rotary_pos_emb(
         )
         return q_out, k_out
 
-    if impl == "auto":
-        if has_cpuinfer and get_global_args().infer.op_impl == "cpu":
-            impl = "cpu"
-        elif (
-            q_out is None
-            and k_out is None
-            and (
-                rotary_type == "separated"
-                or (
-                    rotary_type == "interleaved"
-                    and hasattr(triton.language, "interleaved")
-                )
-            )
-        ) and has_triton:
-            impl = "triton"
-        elif has_chitu_backend:
-            impl = "cuda"
-        elif has_torch_npu:
-            if (
-                rotary_type == "interleaved"
-                and q.shape[-1] == 64
-                and q.dtype == freqs_cis.cos.dtype
-                and (q_out is None or isinstance(q_out, ColumnOddEvenSeparatedTensor))
-                and (k_out is None or isinstance(k_out, ColumnOddEvenSeparatedTensor))
-            ):
-                impl = "torch_npu_with_output_layout"
-            else:
-                impl = "torch_npu"
-        else:
-            impl = "torch"
+    return _dispatch_apply_rotary_pos_emb(
+        q, k, freqs_cis, q_out=q_out, k_out=k_out, rotary_type=rotary_type, impl=impl
+    )
 
-    if impl == "triton" and has_triton:
-        if rotary_type == "interleaved" and not hasattr(triton.language, "interleave"):
-            raise RuntimeError(
-                "triton.language.interleave is not supported, please check triton version"
-            )
-        # NOTE: Performance of triton rotary kernel is untested for large batch sizes.
-        # If it's slow on prefill, just switch to torch implementation on the else case.
-        return apply_rotary_pos_emb_triton(
-            q, k, freqs_cis, q_out=q_out, k_out=k_out, rotary_type=rotary_type
-        )
-    elif impl == "cuda":
-        return apply_rotary_pos_emb_cuda(
-            q, k, freqs_cis, q_out=q_out, k_out=k_out, rotary_type=rotary_type
-        )
-    elif impl == "torch_npu":
-        return apply_rotary_pos_emb_torch_npu(
-            q, k, freqs_cis, q_out=q_out, k_out=k_out, rotary_type=rotary_type
-        )
-    elif impl == "torch_npu_with_output_layout":
-        return apply_rotary_pos_emb_torch_npu_with_output_layout(
-            q, k, freqs_cis, q_out=q_out, k_out=k_out, rotary_type=rotary_type
-        )
-    elif impl == "cpu":
-        return apply_rotary_pos_emb_cpu(
-            q, k, freqs_cis, q_out=q_out, k_out=k_out, rotary_type=rotary_type
-        )
-    else:
-        return apply_rotary_pos_emb_torch(
-            q, k, freqs_cis, q_out=q_out, k_out=k_out, rotary_type=rotary_type
-        )
+
+def _uses_torch_npu_output_layout_impl(impl: str) -> bool:
+    return impl == "torch_npu_with_output_layout"
 
 
 def apply_rotary_pos_emb_partial(
@@ -554,20 +565,20 @@ def apply_rotary_pos_emb_partial(
     assert q.dtype == k.dtype
     assert freqs_cis.cos.dtype == freqs_cis.sin.dtype
 
-    if (
-        impl == "auto"
-        and has_torch_npu
-        and rotary_type == "interleaved"
-        and q_rotary_dim == 64
-        and q.dtype == freqs_cis.cos.dtype
-    ):
-        impl = "torch_npu_with_output_layout"
-
     if inplace:
         q_rotary_part = q[..., q_rotary_begin:q_rotary_end]
         k_rotary_part = k[..., k_rotary_begin:k_rotary_end]
+        impl = _dispatch_apply_rotary_pos_emb.resolve_impl(
+            q_rotary_part,
+            k_rotary_part,
+            freqs_cis,
+            q_out=None,
+            k_out=None,
+            rotary_type=rotary_type,
+            impl=impl,
+        )
 
-        if impl == "torch_npu_with_output_layout":
+        if _uses_torch_npu_output_layout_impl(impl):
             q_rotary_part_out = ColumnOddEvenSeparatedTensor(
                 plain_shape=q_rotary_part.shape, layout_tensor=q_rotary_part
             )
@@ -594,6 +605,15 @@ def apply_rotary_pos_emb_partial(
     else:
         q_rotary_part = q[..., q_rotary_begin:q_rotary_end]
         k_rotary_part = k[..., k_rotary_begin:k_rotary_end]
+        impl = _dispatch_apply_rotary_pos_emb.resolve_impl(
+            q_rotary_part,
+            k_rotary_part,
+            freqs_cis,
+            q_out=None,
+            k_out=None,
+            rotary_type=rotary_type,
+            impl=impl,
+        )
         q_rotary_part_out, k_rotary_part_out = apply_rotary_pos_emb(
             q_rotary_part, k_rotary_part, freqs_cis, rotary_type=rotary_type, impl=impl
         )
@@ -602,7 +622,7 @@ def apply_rotary_pos_emb_partial(
             q_out = q_rotary_part_out
         else:
             q_out = q.clone()
-            if impl == "torch_npu_with_output_layout":
+            if _uses_torch_npu_output_layout_impl(impl):
                 q_out[..., q_rotary_begin:q_rotary_end] = (
                     q_rotary_part_out.layout_tensor
                 )
@@ -613,7 +633,7 @@ def apply_rotary_pos_emb_partial(
             k_out = k_rotary_part_out
         else:
             k_out = k.clone()
-            if impl == "torch_npu_with_output_layout":
+            if _uses_torch_npu_output_layout_impl(impl):
                 k_out[..., k_rotary_begin:k_rotary_end] = (
                     k_rotary_part_out.layout_tensor
                 )
@@ -624,7 +644,7 @@ def apply_rotary_pos_emb_partial(
     k_out_leading_part = k_out[..., :k_rotary_begin]
     q_out_trailing_part = q_out[..., q_rotary_end:]
     k_out_trailing_part = k_out[..., k_rotary_end:]
-    if impl == "torch_npu_with_output_layout":
+    if _uses_torch_npu_output_layout_impl(impl):
         q_out = PartialColumnOddEvenSeparatedTensor(
             plain_shape=q_out.shape,
             layout_tensor=q_out,

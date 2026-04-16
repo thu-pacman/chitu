@@ -14,7 +14,6 @@ from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
 )
-from chitu.global_vars import get_global_args
 from chitu.utils import ceil_div
 
 
@@ -27,6 +26,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     def __init__(
         self,
         num_experts: int,
+        use_cuda_graph: bool = False,
         *,
         tp_group: CommGroup,
         dp_group: CommGroup,
@@ -38,6 +38,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         )
 
         self.num_global_experts = num_experts
+        self.use_cuda_graph = use_cuda_graph
 
         # set in prepare
         # its a cpu list now
@@ -46,7 +47,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     @override
     def prepare(self, num_tokens):
         if self.dp_group.group_size > 1:
-            if get_global_args().infer.use_cuda_graph:
+            if self.use_cuda_graph:
                 raise NotImplementedError(
                     "infer.use_cuda_graph is not supported for MoEAllGatherTokenDispatcher when infer.dp_size > 1"
                 )

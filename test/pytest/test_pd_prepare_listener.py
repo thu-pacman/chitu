@@ -18,7 +18,9 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
 from chitu.distributed.pd_disaggregation.pd_service import (
     start_decode_prepare_listener_thread,
 )
+from chitu.import_utils import try_import_opt_dep
 
+mooncake, has_mooncake = try_import_opt_dep("mooncake", "mooncake")
 
 _PD_UNIT_JOB_NAME = "pd_unit_test_h20"
 _JOB_NAME = os.environ.get("CI_JOB_NAME") or os.environ.get("JOB_NAME")
@@ -72,6 +74,7 @@ def _wait_until(cond, timeout_s: float = 5.0):
 
 
 @pytest.mark.pd_unit
+@pytest.mark.skipif(not has_mooncake, reason="mooncake is not installed")
 def test_decode_prepare_listener(
     cuda_available,
     global_args,

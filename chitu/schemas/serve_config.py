@@ -88,6 +88,8 @@ class InferConfig(InferConfigLegacy):
     moe_lb_trigger: int = -1
     moe_lb_threshold: float = 3.0
     enable_prefix_caching: bool = MISSING
+    dp_prefix_caching_idle_rate_weight: float = 0.01
+    dp_prefix_caching_running_penalty_weight: float = 0.01
 
     @dataclass
     class MoEConfig:

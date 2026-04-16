@@ -41,9 +41,7 @@ from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
 )
-from chitu.moe.experts import (
-    make_op_dispatcher,
-)
+from chitu.ops.utils import make_op_dispatcher
 
 hard_fp4_kernels, has_hard_fp4_kernels = try_import_opt_dep(
     "hard_fp4_kernels", "hard_fp4_kernels"
@@ -59,6 +57,7 @@ if has_triton:
 logger = getLogger(__name__)
 
 
+@make_op_dispatcher
 def linear_block_fp4(
     x: torch.Tensor,
     weight: Packed4BitWeightAlongK,
@@ -86,80 +85,125 @@ def linear_block_fp4(
     Returns:
         torch.Tensor: The result of the linear transformation.
     """
+    raise NotImplementedError
 
-    if impl == "auto":
-        if is_blackwell():
-            if weight.k_stride == 1:
-                impl = "blackwell"
-            else:
-                impl = "fp8"
-        elif get_global_args().infer.raise_lower_bit_float_to == "bfloat16":
-            if is_nvidia() or is_muxi():
-                impl = "bf16"
-            else:
-                impl = "fp8"
-        else:
-            impl = "fp8"
 
+@linear_block_fp4.register_auto
+def _auto_linear_block_fp4(
+    x: torch.Tensor,
+    weight: Packed4BitWeightAlongK,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    act_block_size: int,
+    bias: Optional[torch.Tensor] = None,
+    *,
+    x_scale: Optional[torch.Tensor] = None,
+):
+    if is_blackwell():
+        if weight.k_stride == 1:
+            return "blackwell"
+        return "fp8"
+    if get_global_args().infer.raise_lower_bit_float_to == "bfloat16":
+        if is_nvidia() or is_muxi():
+            return "bf16"
+        return "fp8"
+    return "fp8"
+
+
+@linear_block_fp4.register("blackwell", available=is_blackwell())
+def _linear_block_fp4_blackwell(
+    x: torch.Tensor,
+    weight: Packed4BitWeightAlongK,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    act_block_size: int,
+    bias: Optional[torch.Tensor] = None,
+    *,
+    x_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     # Note: blackwell impl need swizzled weights, while others weights are linear
-    if impl == "blackwell":
-        # FIXME: Add fp4 option to infer.raise_lower_bit_float_to and use it here
-        if x.dtype not in {torch.float16, torch.bfloat16}:
-            raise ValueError(f"Unsupported input type: {x.dtype}")
-        if x_scale is not None:
-            raise ValueError(f"No x_scale is supported for {x.dtype=}")
-        assert x.shape[-1] == weight.layout_tensor.shape[-1] * 2
-        y = blockfp4_gemm(
-            x,
-            weight.layout_tensor,
-            weight_scale,
-            weight_scale_2,
-            alpha=None,
-            out_dtype=parse_dtype(get_global_args().infer.raise_lower_bit_float_to),
+
+    # FIXME: Add fp4 option to infer.raise_lower_bit_float_to and use it here
+    if x.dtype not in {torch.float16, torch.bfloat16}:
+        raise ValueError(f"Unsupported input type: {x.dtype}")
+    if x_scale is not None:
+        raise ValueError(f"No x_scale is supported for {x.dtype=}")
+    assert x.shape[-1] == weight.layout_tensor.shape[-1] * 2
+    y = blockfp4_gemm(
+        x,
+        weight.layout_tensor,
+        weight_scale,
+        weight_scale_2,
+        alpha=None,
+        out_dtype=parse_dtype(get_global_args().infer.raise_lower_bit_float_to),
+    )
+    if bias is not None:
+        y += bias
+    return y
+
+
+@linear_block_fp4.register("bf16", available=is_nvidia() or is_muxi())
+def _linear_block_fp4_bf16(
+    x: torch.Tensor,
+    weight: Packed4BitWeightAlongK,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    act_block_size: int,
+    bias: Optional[torch.Tensor] = None,
+    *,
+    x_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if x.dtype not in {torch.float16, torch.bfloat16}:
+        raise ValueError(f"Unsupported input type: {x.dtype}")
+    if x_scale is not None:
+        raise ValueError(f"No x_scale is supported for {x.dtype=}")
+    if is_nvidia() or is_muxi():
+        y = soft_fp4_raise_to_bf16_blockfp4_gemm(
+            x, weight, weight_scale, weight_scale_2
         )
         if bias is not None:
             y += bias
         return y
-    elif impl == "bf16":
-        if x.dtype not in {torch.float16, torch.bfloat16}:
-            raise ValueError(f"Unsupported input type: {x.dtype}")
-        if x_scale is not None:
-            raise ValueError(f"No x_scale is supported for {x.dtype=}")
-        if is_nvidia() or is_muxi():
-            y = soft_fp4_raise_to_bf16_blockfp4_gemm(
-                x, weight, weight_scale, weight_scale_2
-            )
-            if bias is not None:
-                y += bias
-            return y
-        else:
-            raise NotImplementedError(
-                f"Soft-fp8 fused gemm not implemented for {get_device_name()}"
-            )
-            # FIXME: Use a dequant-then-compute approach
     else:
-        x_shape = x.shape
-        if x.dtype in {torch.float16, torch.bfloat16}:
-            x = x.view(-1, x_shape[-1])
-            x, x_scale = blockfp8_act_quant(x, block_size=act_block_size)
-        elif x.dtype == torch.float8_e4m3fn:
-            assert x_scale is not None
-            x = x.view(-1, x_shape[-1])
-            x_scale = x_scale.view(-1, x_scale.shape[-1])
-        else:
-            raise ValueError(f"Unsupported input type: {x.dtype}")
-        assert weight_scale is not None
-        y = soft_fp4_raise_to_fp8_blockfp4_gemm(
-            x,
-            x_scale,
-            weight,
-            weight_scale,
-            weight_scale_2,
-            act_block_size=act_block_size,
+        raise NotImplementedError(
+            f"Soft-fp8 fused gemm not implemented for {get_device_name()}"
         )
-        if bias is not None:
-            y = (y + bias).to(y.dtype)
-        return y.view(x_shape[:-1] + y.shape[-1:])
+        # FIXME: Use a dequant-then-compute approach
+
+
+@linear_block_fp4.register("fp8")
+def _linear_block_fp4_fp8(
+    x: torch.Tensor,
+    weight: Packed4BitWeightAlongK,
+    weight_scale: torch.Tensor,
+    weight_scale_2: torch.Tensor,
+    act_block_size: int,
+    bias: Optional[torch.Tensor] = None,
+    *,
+    x_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    x_shape = x.shape
+    if x.dtype in {torch.float16, torch.bfloat16}:
+        x = x.view(-1, x_shape[-1])
+        x, x_scale = blockfp8_act_quant(x, block_size=act_block_size)
+    elif x.dtype == torch.float8_e4m3fn:
+        assert x_scale is not None
+        x = x.view(-1, x_shape[-1])
+        x_scale = x_scale.view(-1, x_scale.shape[-1])
+    else:
+        raise ValueError(f"Unsupported input type: {x.dtype}")
+    assert weight_scale is not None
+    y = soft_fp4_raise_to_fp8_blockfp4_gemm(
+        x,
+        x_scale,
+        weight,
+        weight_scale,
+        weight_scale_2,
+        act_block_size=act_block_size,
+    )
+    if bias is not None:
+        y = (y + bias).to(y.dtype)
+    return y.view(x_shape[:-1] + y.shape[-1:])
 
 
 class Blockfp4LinearBase(QuantizedLinearBase):
@@ -397,13 +441,12 @@ def _auto_fused_experts_no_sum_blockfp4_indexed():
     raise NotImplementedError
 
 
-@fused_experts_no_sum_blockfp4_indexed.register("triton")
+@fused_experts_no_sum_blockfp4_indexed.register("triton", available=has_triton)
 def _fused_experts_no_sum_blockfp4_indexed_triton(
     hidden_states,
     w1,
     w2,
     *,
-    impl: str = "triton",
     activation: str = "silu",
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -458,7 +501,7 @@ def _auto_fused_experts_sum_blockfp4_indexed():
     raise NotImplementedError
 
 
-@fused_experts_sum_blockfp4_indexed.register("triton")
+@fused_experts_sum_blockfp4_indexed.register("triton", available=has_triton)
 def _fused_experts_sum_blockfp4_indexed_triton(
     hidden_states,
     w1,
@@ -466,7 +509,6 @@ def _fused_experts_sum_blockfp4_indexed_triton(
     topk_weights: Optional[torch.Tensor],
     *,
     inplace: bool = False,
-    impl: str = "triton",
     activation: str = "silu",
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
@@ -476,6 +518,7 @@ def _fused_experts_sum_blockfp4_indexed_triton(
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
     experts_start_idx: int = 0,
+    impl: str,
 ):
     output = fused_experts_no_sum_blockfp4_indexed(
         hidden_states,

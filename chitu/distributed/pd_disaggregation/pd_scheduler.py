@@ -1141,7 +1141,7 @@ class DecodeOnlyScheduler(PDScheduler):
                             "KV cache capacity is insufficient to support prefilling.\n"
                             f"  - number of total blocks: {kv_cache_manager.num_blocks}\n"
                             f"  - Block size: {kv_cache_manager.block_size}\n"
-                            f"However, {task.task_id} prefill prompts are too long: {task.prompt_len}"
+                            f"However, task[{task.task_id}] prefill prompts are too long: {task.prompt_len}"
                         )
                     continue
 

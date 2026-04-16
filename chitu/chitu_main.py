@@ -58,6 +58,10 @@ from chitu.metrics import (
     start_prometheus_server_and_metrics_monitor,
     stop_metrics_monitor,
 )
+from chitu.ops.utils import (
+    clear_observed_op_impl_selections,
+    emit_observed_op_impl_summary,
+)
 from chitu.distributed.comm_group import SingletonGroupPlaceholder
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
 from chitu.kv_cache.utils import (
@@ -331,6 +335,16 @@ def _auto_set_num_blocks_after_warmup(args):
             scheduler.reset_kvcache_block_threshold()
 
 
+def _emit_observed_op_impl_summary_after_warmup():
+    if (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_rank() != 0
+    ):
+        return False
+    return emit_observed_op_impl_summary(target_logger=logger)
+
+
 def _warmup_via_taskpool(args):
     rank = torch.distributed.get_rank()
 
@@ -575,6 +589,8 @@ def warmup_engine(args):
     if args.dp_config.router.is_router:
         return
 
+    clear_observed_op_impl_selections()
+
     # PD分离→direct，非PD→taskpool
     pd_enabled = args.dp_config.router.pd_disaggregation.enabled
 
@@ -626,6 +642,7 @@ def warmup_engine(args):
         )
 
     _auto_set_num_blocks_after_warmup(args)
+    _emit_observed_op_impl_summary_after_warmup()
 
 
 def check_checkpoint_path(args):
@@ -936,6 +953,92 @@ def chitu_init(args):
         ) from None  # `msg` already contains traceback, so raise from None
 
 
+def _update_tasks_preferred_dp_rank():
+    """Update the preferred DP rank for each schedulable but unscheduled prefill task.
+    The preferred DP rank selection considers:
+        - Prefix cache hit rate
+        - Load of each DP rank
+    """
+    args = get_global_args()
+    dp_size = int(args.infer.dp_size)
+    enable_prefix_caching = bool(args.infer.enable_prefix_caching)
+
+    if dp_size <= 1:
+        return
+
+    # weight of preifx cache hit rate
+    _CACHED_RATE_WEIGHT = 1
+
+    # penalty weight of idle rate
+    cache_idle_penalty_weight = float(
+        getattr(args.infer, "dp_prefix_caching_idle_rate_weight", 0.01)
+    )
+
+    # penalty weight of the number of running tasks in the DP rank
+    running_tasks_penalty_weight = float(
+        getattr(args.infer, "dp_prefix_caching_running_penalty_weight", 0.01)
+    )
+
+    cache_idle_penalty_weight = max(min(cache_idle_penalty_weight, 1), 0)
+    running_tasks_penalty_weight = max(min(running_tasks_penalty_weight, 1), 0)
+
+    if Backend.cache_managers is not None:
+        # paged kv cache
+        projected_running_tasks_per_dp = [
+            len(
+                Backend.schedulers[dp_rank].cache_manager_dict["main"].tid_to_cached_len
+            )
+            for dp_rank in range(dp_size)
+        ]
+    else:
+        # dense kv cache
+        projected_running_tasks_per_dp = [0 for dp_rank in range(dp_size)]
+        for task in TaskPool.pool.values():
+            if task.dp_rank is not None and 0 <= task.dp_rank <= dp_size:
+                projected_running_tasks_per_dp[task.dp_rank] += 1
+
+    for task in TaskPool.pool.values():
+        if (
+            task.dp_rank is not None
+            or task.task_type != TaskType.Prefill
+            or not task.can_schedule()
+        ):
+            continue
+
+        best_preference_score = float("-inf")
+        best_dp_rank = None
+
+        for dp_rank in range(dp_size):
+            if enable_prefix_caching:
+                task.prompt_to_token_block(dp_rank)
+                cached_blocks = task.num_cached_blocks
+                cached_idle_blocks = task.num_cached_idle_blocks
+                total_blocks = len(task.token_blocks)
+                if total_blocks > 0:
+                    cached_rate = cached_blocks / total_blocks
+                    idle_rate = cached_idle_blocks / total_blocks
+                else:
+                    cached_rate = 0.0
+                    idle_rate = 0.0
+            else:
+                cached_rate = 0.0
+                idle_rate = 0.0
+
+            preference_score = (
+                cached_rate * _CACHED_RATE_WEIGHT
+                - idle_rate * cache_idle_penalty_weight
+                - running_tasks_penalty_weight * projected_running_tasks_per_dp[dp_rank]
+            )
+
+            if preference_score > best_preference_score:
+                best_preference_score = preference_score
+                best_dp_rank = dp_rank
+
+        task.preferred_dp_rank = best_dp_rank
+        if best_dp_rank is not None:
+            projected_running_tasks_per_dp[best_dp_rank] += 1
+
+
 @torch.inference_mode()
 def chitu_run_main_rank():
     # 1. Schedule
@@ -947,10 +1050,10 @@ def chitu_run_main_rank():
             TaskType.Prefill if Backend.schedulers[0].can_prefill() else TaskType.Decode
         )
     else:
-        # Make new-coming tasks go to a random DP rank to improve load balance.
-        # This is achieved by randomly shuffle the scheduler list.
+        _update_tasks_preferred_dp_rank()  # 按击中率和负载均衡路由
+
+        # New prefill tasks are routed by DP preference assignment above.
         id_and_scheduler_list = list(enumerate(Backend.schedulers))
-        random.shuffle(id_and_scheduler_list)
 
         task_type = (
             TaskType.Prefill

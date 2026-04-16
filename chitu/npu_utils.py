@@ -114,7 +114,7 @@ def fused_experts_npu_tp_all_gather(input: torch.Tensor, origin_bs: int):
 
 
 def fused_experts_npu_for_ep(
-    x: ConcatPermutedBatchedRoutedActivationMinimal,
+    hidden_states: ConcatPermutedBatchedRoutedActivationMinimal,
     w1: torch.Tensor | NativeLayoutTensor,
     w2: torch.Tensor | NativeLayoutTensor,
     w1_scale=None,
@@ -136,12 +136,14 @@ def fused_experts_npu_for_ep(
         raise NotImplementedError(f"Unsupported type of `w2`: {type(w2)}")
 
     n_local_experts = w1.shape[0]
-    x = x.as_local_expert_ids(experts_start_idx, experts_start_idx + n_local_experts)
+    hidden_states = hidden_states.as_local_expert_ids(
+        experts_start_idx, experts_start_idx + n_local_experts
+    )
 
-    group_list = x.n_tokens_per_expert.to(torch.int64)
+    group_list = hidden_states.n_tokens_per_expert.to(torch.int64)
 
     hidden_states = torch_npu.npu_grouped_matmul(
-        [x.concat_activation],
+        [hidden_states.concat_activation],
         [w1],
         group_list=group_list,
         split_item=3,
@@ -155,7 +157,9 @@ def fused_experts_npu_for_ep(
         hidden_states, gate_up_out_scale = torch_npu.npu_dequant_swiglu_quant(
             x=hidden_states,
             weight_scale=w1_scale_fp32,
-            activation_scale=x.concat_activation_scale.to(torch.float32).contiguous(),
+            activation_scale=hidden_states.concat_activation_scale.to(
+                torch.float32
+            ).contiguous(),
             bias=None,
             quant_scale=None,
             quant_offset=None,
@@ -191,6 +195,7 @@ def fused_experts_no_sum_npu(
     w1_scale=None,
     w2_scale=None,
     *,
+    activation: str = "silu",
     global_num_experts: int,
     experts_start_idx: int = 0,
     use_int8_w8a8=False,
@@ -206,10 +211,12 @@ def _(
     w1_scale=None,
     w2_scale=None,
     *,
+    activation: str = "silu",
     global_num_experts: int,
     experts_start_idx: int = 0,
     use_int8_w8a8=False,
 ) -> BatchedExpertResult:
+    assert activation == "silu"
     n_local_experts = w1.shape[0] if isinstance(w1, torch.Tensor) else w1.plain_shape[0]
     expert_result = fused_experts_no_sum_npu(
         ConcatPermutedBatchedRoutedActivation.convert_from(
@@ -239,6 +246,7 @@ def _(
     w1_scale=None,
     w2_scale=None,
     *,
+    activation: str = "silu",
     global_num_experts: int,
     experts_start_idx: int = 0,
     use_int8_w8a8=False,
@@ -258,6 +266,7 @@ def _(
         torch.float16,
         torch.bfloat16,
     ]
+    assert activation == "silu"
 
     concat_activation = hidden_states.concat_activation
 

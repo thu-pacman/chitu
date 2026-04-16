@@ -187,7 +187,19 @@ def make_lazy_op(func: Callable) -> LazyOp:
         def lazy_tensor_type(self):
             return LazyTensorImpl
 
-    return LazyOpImpl()
+    ret = LazyOpImpl()
+
+    # Compatible with `make_op_dispatcher`:
+    if hasattr(func, "register_candidate"):
+        ret.register_candidate = func.register_candidate
+    if hasattr(func, "register"):
+        ret.register = func.register
+    if hasattr(func, "register_auto"):
+        ret.register_auto = func.register_auto
+    if hasattr(func, "resolve_impl"):
+        ret.resolve_impl = func.resolve_impl
+
+    return ret
 
 
 def single_dispatch_lazy_tensor(func: Callable):

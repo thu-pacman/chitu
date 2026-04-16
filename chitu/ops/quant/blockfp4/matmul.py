@@ -8,6 +8,7 @@ from chitu.device_type import is_blackwell
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.native_layout import Packed4BitWeightAlongK, Packed4BitWeightNPUNative
 from chitu.global_vars import get_global_args
+from chitu.ops.utils import make_op_dispatcher
 from chitu.ops.quant.blockfp4.convert import blockfp4_act_quant
 from chitu.utils import try_import_platform_dep, try_import_opt_dep
 
@@ -16,7 +17,9 @@ chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 hard_fp4_kernels, has_hard_fp4_kernels = try_import_opt_dep(
     "hard_fp4_kernels", "hard_fp4_kernels"
 )
-cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
+cinfer_ascendc, has_cinfer_ascendc = try_import_opt_dep(
+    "cinfer_ascendc", "ascend_kernels"
+)
 
 if has_triton:
     from chitu.ops.triton_ops import (
@@ -25,6 +28,7 @@ if has_triton:
     )
 
 
+@make_op_dispatcher
 def soft_fp4_raise_to_fp8_blockfp4_gemm(
     a: torch.Tensor,
     a_s: torch.Tensor,
@@ -48,18 +52,22 @@ def soft_fp4_raise_to_fp8_blockfp4_gemm(
     Returns:
         torch.Tensor: The result of the matrix multiplication.
     """
-
-    if impl == "auto":
-        impl = "triton"
-
-    if impl == "triton" and has_triton:
-        return soft_fp4_raise_to_fp8_blockfp4_gemm_triton(
-            a, a_s, b, b_s, b_s_2, act_block_size
-        )
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+    raise NotImplementedError
 
 
+@soft_fp4_raise_to_fp8_blockfp4_gemm.register_auto
+def _auto_soft_fp4_raise_to_fp8_blockfp4_gemm():
+    return "triton"
+
+
+soft_fp4_raise_to_fp8_blockfp4_gemm.register_candidate("triton")
+if has_triton:
+    soft_fp4_raise_to_fp8_blockfp4_gemm.register("triton")(
+        soft_fp4_raise_to_fp8_blockfp4_gemm_triton
+    )
+
+
+@make_op_dispatcher
 def soft_fp4_raise_to_bf16_blockfp4_gemm(
     a: torch.Tensor,
     b: Packed4BitWeightAlongK,
@@ -79,20 +87,26 @@ def soft_fp4_raise_to_bf16_blockfp4_gemm(
     Returns:
         torch.Tensor: The result of the matrix multiplication.
     """
-
-    if impl == "auto":
-        impl = "triton"
-
-    if impl == "triton" and has_triton:
-        return soft_fp4_raise_to_bf16_blockfp4_gemm_triton(a, b, b_s, b_s_2)
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+    raise NotImplementedError
 
 
+@soft_fp4_raise_to_bf16_blockfp4_gemm.register_auto
+def _auto_soft_fp4_raise_to_bf16_blockfp4_gemm():
+    return "triton"
+
+
+soft_fp4_raise_to_bf16_blockfp4_gemm.register_candidate("triton")
+if has_triton:
+    soft_fp4_raise_to_bf16_blockfp4_gemm.register("triton")(
+        soft_fp4_raise_to_bf16_blockfp4_gemm_triton
+    )
+
+
+@make_op_dispatcher
 def soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
-    a: torch.Tensor,
-    b: Packed4BitWeightNPUNative,
-    b_s: torch.Tensor,
+    x: torch.Tensor,
+    weight: Packed4BitWeightNPUNative,
+    weight_scale: torch.Tensor,
     impl: str = "auto",
 ):
     """
@@ -100,23 +114,24 @@ def soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm(
     casted to BF16.
 
     Args:
-        a (torch.Tensor): The first input matrix, must be contiguous.
-        b (Packed4BitWeightAlongK): The second input matrix, must be in Packed4BitWeightAlongK layout.
-        b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
+        x (torch.Tensor): The first input matrix, must be contiguous.
+        weight (Packed4BitWeightAlongK): The second input matrix, must be in Packed4BitWeightAlongK layout.
+        weight_scale (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
 
     Returns:
         torch.Tensor: The result of the matrix multiplication.
     """
-
-    if impl == "auto":
-        impl = "npu"
-
-    if impl == "npu":
-        return soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm_npu(a, b, b_s)
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+    raise NotImplementedError
 
 
+@soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm.register_auto
+def _auto_soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm():
+    return "npu"
+
+
+@soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm.register(
+    "npu", available=has_cinfer_ascendc
+)
 @single_dispatch_lazy_tensor
 def soft_fp4_raise_to_bf16_blockfp4_single_scale_gemm_npu(
     x: torch.Tensor,

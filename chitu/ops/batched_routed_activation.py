@@ -6,6 +6,7 @@ import torch
 
 from chitu.device_type import has_accelerator
 from chitu.utils import ceil_div
+from chitu.ops.utils import make_op_dispatcher
 from chitu.import_utils import (
     try_import_platform_dep,
     try_import_opt_dep,
@@ -15,11 +16,12 @@ from chitu.import_utils import (
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+has_triton_impl = has_triton and has_accelerator()
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
 )
 
-if has_triton and has_accelerator():
+if has_triton_impl:
     from chitu.ops.triton_ops import (
         batched_routed_activation_indexed_to_expert_block_indexed_triton,
         batched_routed_activation_indexed_to_expert_block_permuted_triton,
@@ -29,6 +31,7 @@ if has_triton and has_accelerator():
     )
 
 
+@make_op_dispatcher
 def batched_routed_activation_indexed_to_expert_block_indexed(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -81,37 +84,33 @@ def batched_routed_activation_indexed_to_expert_block_indexed(
         by block_size for proper block matrix operations.
     """
     # SPDX-SnippetEnd
+    raise NotImplementedError
 
-    if impl == "auto":
-        if (
-            has_muxi_layout_kernels
-            and num_experts in [8, 16, 32, 64, 128, 256]
-            and block_size in [16]
-        ):
-            impl = "muxi"
-        elif has_chitu_backend:
-            impl = "cuda"
-        elif has_triton:
-            impl = "triton"
-        else:
-            raise NotImplementedError(
-                "No implementation available for batched_routed_activation_indexed_to_expert_block_indexed"
-            )
 
-    if impl == "cuda":
-        return batched_routed_activation_indexed_to_expert_block_indexed_cuda(
-            topk_ids, block_size, num_experts
-        )
-    elif impl == "triton":
-        return batched_routed_activation_indexed_to_expert_block_indexed_triton(
-            topk_ids, block_size, num_experts
-        )
-    elif impl == "muxi":
-        return batched_routed_activation_indexed_to_expert_block_indexed_muxi(
-            topk_ids, block_size, num_experts
-        )
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+@batched_routed_activation_indexed_to_expert_block_indexed.register_auto
+def _auto_batched_routed_activation_indexed_to_expert_block_indexed(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int
+):
+    if (
+        has_muxi_layout_kernels
+        and num_experts in [8, 16, 32, 64, 128, 256]
+        and block_size in [16]
+    ):
+        return "muxi"
+    if has_chitu_backend:
+        return "cuda"
+    if has_triton_impl:
+        return "triton"
+    raise NotImplementedError(
+        "No implementation available for batched_routed_activation_indexed_to_expert_block_indexed"
+    )
+
+
+batched_routed_activation_indexed_to_expert_block_indexed.register_candidate("triton")
+if has_triton_impl:
+    batched_routed_activation_indexed_to_expert_block_indexed.register("triton")(
+        batched_routed_activation_indexed_to_expert_block_indexed_triton
+    )
 
 
 # SPDX-SnippetBegin
@@ -122,6 +121,9 @@ def batched_routed_activation_indexed_to_expert_block_indexed(
 # The CUDA implementation to align activations to blocks for MoE is originally from SGLang
 # (https://github.com/sgl-project/sglang/commit/ba5112ff691d791a9e38c6c71f59324a5fcb49d0),
 # licensed under Apache 2.0.
+@batched_routed_activation_indexed_to_expert_block_indexed.register(
+    "cuda", available=has_chitu_backend
+)
 def batched_routed_activation_indexed_to_expert_block_indexed_cuda(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -176,6 +178,9 @@ def batched_routed_activation_indexed_to_expert_block_indexed_cuda(
 # SPDX-SnippetEnd
 
 
+@batched_routed_activation_indexed_to_expert_block_indexed.register(
+    "muxi", available=has_muxi_layout_kernels
+)
 def batched_routed_activation_indexed_to_expert_block_indexed_muxi(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -215,6 +220,7 @@ def batched_routed_activation_indexed_to_expert_block_indexed_muxi(
     return sorted_token_ids, experts_ids, padded_num_experts
 
 
+@make_op_dispatcher
 def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
     activation: torch.Tensor,
     activation_scale: torch.Tensor,
@@ -245,30 +251,29 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
         [3]: ExpertBlockPermutedBatchedRoutedActivation.block_to_expert_indices.
     """
 
-    if impl == "auto":
-        if has_triton:
-            impl = "triton"
-        else:
-            raise NotImplementedError(
-                "No available implementation found for "
-                "batched_routed_activation_indexed_to_expert_block_permuted_blockfp8"
-            )
-
-    if impl == "triton":
-        return (
-            batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton(
-                activation,
-                activation_scale,
-                token_to_expert_indices,
-                block_size=block_size,
-                num_experts=num_experts,
-                n_tokens_per_expert_padded=n_tokens_per_expert_padded,
-            )
-        )
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+    raise NotImplementedError
 
 
+@batched_routed_activation_indexed_to_expert_block_permuted_blockfp8.register_auto
+def _auto_batched_routed_activation_indexed_to_expert_block_permuted_blockfp8():
+    if has_triton_impl:
+        return "triton"
+    raise NotImplementedError(
+        "No available implementation found for "
+        "batched_routed_activation_indexed_to_expert_block_permuted_blockfp8"
+    )
+
+
+batched_routed_activation_indexed_to_expert_block_permuted_blockfp8.register_candidate(
+    "triton"
+)
+if has_triton_impl:
+    batched_routed_activation_indexed_to_expert_block_permuted_blockfp8.register(
+        "triton"
+    )(batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton)
+
+
+@make_op_dispatcher
 def batched_routed_activation_indexed_to_expert_block_permuted(
     activation: torch.Tensor,
     token_to_expert_indices: torch.Tensor,
@@ -290,38 +295,50 @@ def batched_routed_activation_indexed_to_expert_block_permuted(
         [1]: token_comma_topk_to_block_x_item_indices
         [2]: block_to_expert_indices       [n_blocks, block_size]
     """
-
-    if impl == "auto":
-        if has_triton:
-            impl = "triton"
-        else:
-            raise NotImplementedError(
-                "No available implementation found for "
-                "batched_routed_activation_indexed_to_expert_block_permuted"
-            )
-
-    if impl == "triton":
-        (
-            blocked_activation,
-            token_comma_topk_to_block_x_item_indices,
-            block_to_expert_indices,
-        ) = batched_routed_activation_indexed_to_expert_block_permuted_triton(
-            activation,
-            token_to_expert_indices,
-            block_size=block_size,
-            num_experts=num_experts,
-            n_tokens_per_expert_padded=n_tokens_per_expert_padded,
-        )
-        assert blocked_activation.dtype == torch.get_default_dtype()
-        return (
-            blocked_activation,
-            token_comma_topk_to_block_x_item_indices,
-            block_to_expert_indices,
-        )
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+    raise NotImplementedError
 
 
+@batched_routed_activation_indexed_to_expert_block_permuted.register_auto
+def _auto_batched_routed_activation_indexed_to_expert_block_permuted():
+    if has_triton_impl:
+        return "triton"
+    raise NotImplementedError(
+        "No available implementation found for "
+        "batched_routed_activation_indexed_to_expert_block_permuted"
+    )
+
+
+@batched_routed_activation_indexed_to_expert_block_permuted.register(
+    "triton", available=has_triton_impl
+)
+def _indexed_to_expert_block_permuted_triton(
+    activation,
+    token_to_expert_indices,
+    *,
+    block_size,
+    num_experts,
+    n_tokens_per_expert_padded,
+):
+    (
+        blocked_activation,
+        token_comma_topk_to_block_x_item_indices,
+        block_to_expert_indices,
+    ) = batched_routed_activation_indexed_to_expert_block_permuted_triton(
+        activation,
+        token_to_expert_indices,
+        block_size=block_size,
+        num_experts=num_experts,
+        n_tokens_per_expert_padded=n_tokens_per_expert_padded,
+    )
+    assert blocked_activation.dtype == torch.get_default_dtype()
+    return (
+        blocked_activation,
+        token_comma_topk_to_block_x_item_indices,
+        block_to_expert_indices,
+    )
+
+
+@make_op_dispatcher
 def batched_routed_activation_indexed_to_per_expert_dense(
     activation: torch.Tensor,
     token_to_expert_indices: torch.Tensor,
@@ -342,25 +359,24 @@ def batched_routed_activation_indexed_to_per_expert_dense(
         [1]: PerExpertDenseBatchedRoutedActivation.n_tokens_per_expert
         [2]: PerExpertDenseBatchedRoutedActivation.token_pos_in_expert
     """
-
-    if impl == "auto":
-        if has_triton:
-            impl = "triton"
-        else:
-            impl = "ref"
-
-    if impl == "ref":
-        return batched_routed_activation_indexed_to_per_expert_dense_ref(
-            activation, token_to_expert_indices, num_experts=num_experts
-        )
-    elif impl == "triton":
-        return batched_routed_activation_indexed_to_per_expert_dense_triton(
-            activation, token_to_expert_indices, num_experts=num_experts
-        )
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+    raise NotImplementedError
 
 
+@batched_routed_activation_indexed_to_per_expert_dense.register_auto
+def _auto_batched_routed_activation_indexed_to_per_expert_dense():
+    if has_triton_impl:
+        return "triton"
+    return "ref"
+
+
+batched_routed_activation_indexed_to_per_expert_dense.register_candidate("triton")
+if has_triton_impl:
+    batched_routed_activation_indexed_to_per_expert_dense.register("triton")(
+        batched_routed_activation_indexed_to_per_expert_dense_triton
+    )
+
+
+@make_op_dispatcher
 def batched_routed_activation_indexed_to_per_expert_dense_blockfp8(
     activation: torch.Tensor,
     activation_scale: torch.Tensor,
@@ -384,31 +400,26 @@ def batched_routed_activation_indexed_to_per_expert_dense_blockfp8(
         [1]: PerExpertDenseBatchedRoutedActivationBlockfp8.n_tokens_per_expert
         [2]: PerExpertDenseBatchedRoutedActivationBlockfp8.token_pos_in_expert
     """
-
-    if impl == "auto":
-        if has_triton:
-            impl = "triton"
-        else:
-            impl = "ref"
-
-    if impl == "ref":
-        return batched_routed_activation_indexed_to_per_expert_dense_blockfp8_ref(
-            activation,
-            activation_scale,
-            token_to_expert_indices,
-            num_experts=num_experts,
-        )
-    elif impl == "triton":
-        return batched_routed_activation_indexed_to_per_expert_dense_blockfp8_triton(
-            activation,
-            activation_scale,
-            token_to_expert_indices,
-            num_experts=num_experts,
-        )
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+    raise NotImplementedError
 
 
+@batched_routed_activation_indexed_to_per_expert_dense_blockfp8.register_auto
+def _auto_batched_routed_activation_indexed_to_per_expert_dense_blockfp8():
+    if has_triton_impl:
+        return "triton"
+    return "ref"
+
+
+batched_routed_activation_indexed_to_per_expert_dense_blockfp8.register_candidate(
+    "triton"
+)
+if has_triton_impl:
+    batched_routed_activation_indexed_to_per_expert_dense_blockfp8.register("triton")(
+        batched_routed_activation_indexed_to_per_expert_dense_blockfp8_triton
+    )
+
+
+@batched_routed_activation_indexed_to_per_expert_dense.register("ref")
 def batched_routed_activation_indexed_to_per_expert_dense_ref(
     activation: torch.Tensor, token_to_expert_indices: torch.Tensor, *, num_experts: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -437,6 +448,7 @@ def batched_routed_activation_indexed_to_per_expert_dense_ref(
     return activation_per_expert, write_pos, token_pos_in_expert
 
 
+@batched_routed_activation_indexed_to_per_expert_dense_blockfp8.register("ref")
 def batched_routed_activation_indexed_to_per_expert_dense_blockfp8_ref(
     activation: torch.Tensor,
     activation_scale: torch.Tensor,
@@ -481,6 +493,7 @@ def batched_routed_activation_indexed_to_per_expert_dense_blockfp8_ref(
     )
 
 
+@make_op_dispatcher
 def batched_routed_activation_indexed_to_concat_permuted(
     activation: torch.Tensor,
     token_to_expert_indices: torch.Tensor,
@@ -503,28 +516,22 @@ def batched_routed_activation_indexed_to_concat_permuted(
         [1]: ConcatPermutedBatchedRoutedActivation.token_x_topk_to_concat_indices.
         [2]: ConcatPermutedBatchedRoutedActivation.n_tokens_per_expert
     """
-
-    if impl == "auto":
-        if has_torch_npu:
-            impl = "torch_npu"
-        else:
-            raise NotImplementedError(
-                "No available implementation found for "
-                "batched_routed_activation_indexed_to_concat_permuted"
-            )
-
-    if impl == "torch_npu":
-        return batched_routed_activation_indexed_to_concat_permuted_torch_npu(
-            activation,
-            token_to_expert_indices,
-            n_experts=n_experts,
-            experts_start_idx=experts_start_idx,
-            experts_end_idx=experts_end_idx,
-        )
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+    raise NotImplementedError
 
 
+@batched_routed_activation_indexed_to_concat_permuted.register_auto
+def _auto_batched_routed_activation_indexed_to_concat_permuted():
+    if has_torch_npu:
+        return "torch_npu"
+    raise NotImplementedError(
+        "No available implementation found for "
+        "batched_routed_activation_indexed_to_concat_permuted"
+    )
+
+
+@batched_routed_activation_indexed_to_concat_permuted.register(
+    "torch_npu", available=has_torch_npu
+)
 def batched_routed_activation_indexed_to_concat_permuted_torch_npu(
     activation: torch.Tensor,
     token_to_expert_indices: torch.Tensor,

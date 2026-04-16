@@ -63,27 +63,29 @@ def blockfp8_gemm_triton(
 @single_dispatch_lazy_tensor
 @auto_retry_triton_compilation
 def soft_fp8_blockfp8_gemm_triton(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    b_s: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
 ):
     """
     Perform a matrix multiplication with FP8 dynamically casted to BF16.
 
     Args:
-        a (torch.Tensor): The first input matrix, must be contiguous.
-        b (torch.Tensor): The second input matrix, must be contiguous.
-        b_s (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
+        x (torch.Tensor): The first input matrix, must be contiguous.
+        weight (torch.Tensor): The second input matrix, must be contiguous.
+        scale (torch.Tensor): The scaling factor for the second input matrix, must be contiguous.
 
     Returns:
         torch.Tensor: The result of the matrix multiplication.
     """
-    assert a.is_contiguous() and b.is_contiguous(), "Input tensors must be contiguous"
-    assert b_s.is_contiguous(), "Scaling factor tensor must be contiguous"
-    K = a.size(-1)
-    M = a.numel() // K
-    N = b.size(0)
-    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+    assert (
+        x.is_contiguous() and weight.is_contiguous()
+    ), "Input tensors must be contiguous"
+    assert scale.is_contiguous(), "Scaling factor tensor must be contiguous"
+    K = x.size(-1)
+    M = x.numel() // K
+    N = weight.size(0)
+    c = x.new_empty(*x.size()[:-1], N, dtype=torch.get_default_dtype())
 
     # Some of our platforms only has Triton with low versions, where these is no `tl.cast`
     # which is used for initializing a constant with a given type. Therefore, we need to
@@ -93,10 +95,10 @@ def soft_fp8_blockfp8_gemm_triton(
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
     soft_fp8_blockfp8_gemm_kernel[grid](
-        a,
-        b.view(dtype=torch.uint8),
+        x,
+        weight.view(dtype=torch.uint8),
         c,
-        b_s,
+        scale,
         M,
         N,
         K,

@@ -5,6 +5,7 @@
 import torch
 import torch.nn.functional as F
 
+from chitu.ops.utils import make_op_dispatcher
 from chitu.utils import try_import_platform_dep
 
 triton, has_triton = try_import_platform_dep("triton")
@@ -13,6 +14,7 @@ if has_triton:
     from chitu.ops.triton_ops import fused_g_triton
 
 
+@make_op_dispatcher
 def fused_g(
     a: torch.Tensor,
     A_log: torch.Tensor,
@@ -30,16 +32,21 @@ def fused_g(
     Returns:
         g: tensor of shape [batch_size, d_inner]
     """
+    raise NotImplementedError
 
-    if impl == "auto":
-        if has_triton:
-            impl = "triton"
-        else:
-            impl = "torch"
 
-    if impl == "triton":
-        return fused_g_triton(a, A_log, dt_bias)
-    elif impl == "torch":
-        return -A_log.float().exp() * F.softplus(a.float() + dt_bias)
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+@fused_g.register_auto
+def _auto_fused_g():
+    if has_triton:
+        return "triton"
+    return "torch"
+
+
+@fused_g.register("torch")
+def fused_g_torch(a: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor):
+    return -A_log.float().exp() * F.softplus(a.float() + dt_bias)
+
+
+fused_g.register_candidate("triton")
+if has_triton:
+    fused_g.register("triton")(fused_g_triton)

@@ -269,14 +269,17 @@ class Scheduler:
         self.scheduling_ts = time.perf_counter_ns()
 
         # collect ready task ids
-        n_running = sum(
-            1
-            for task_id in TaskPool.id_list
-            if TaskPool.pool[task_id].dp_rank == self.dp_rank
-        )
+        n_running = len(self.cache_manager_dict["main"].tid_to_cached_len)
+
         task_ids: list[str] = []
         for task_id in TaskPool.id_list:
             task = TaskPool.pool[task_id]
+            if (
+                task.dp_rank is None
+                and task.preferred_dp_rank is not None
+                and task.preferred_dp_rank != self.dp_rank
+            ):
+                continue
             if (
                 task.dp_rank is None
                 or self.dp_rank == task.dp_rank

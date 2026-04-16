@@ -12,19 +12,19 @@ from chitu.device_type import is_muxi
 
 
 def rms_norm_gate_triton(
-    X: torch.Tensor,
+    x: torch.Tensor,
     gate: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
-    out: Optional[torch.Tensor],
     compute_dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
 ):
-    num_cols = X.shape[-1]
-    num_rows = X.numel() // num_cols
+    num_cols = x.shape[-1]
+    num_rows = x.numel() // num_cols
 
     if out is None:
-        out = torch.empty_like(X)
-    X = X.view(num_rows, num_cols)
+        out = torch.empty_like(x)
+    x = x.view(num_rows, num_cols)
     out = out.view(num_rows, num_cols)
     gate = gate.view(num_rows, num_cols)
     assert weight.is_contiguous()
@@ -58,8 +58,8 @@ def rms_norm_gate_triton(
     BLOCK_SIZE, num_warps = calculate_settings(num_cols)
 
     rms_norm_gate_kernel[(num_rows,)](
-        X,
-        X.stride(-2),
+        x,
+        x.stride(-2),
         gate,
         gate.stride(-2),
         weight,
@@ -68,10 +68,10 @@ def rms_norm_gate_triton(
         out.stride(-2),
         num_cols,
         compute_dtype=to_triton_dtype(compute_dtype),
-        input_dtype=to_triton_dtype(X.dtype),
+        input_dtype=to_triton_dtype(x.dtype),
         BLOCK_SIZE=BLOCK_SIZE,
     )
-    return out.to(X.dtype)
+    return out.to(x.dtype)
 
 
 rms_norm_configs = [

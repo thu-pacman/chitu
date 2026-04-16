@@ -37,7 +37,9 @@ def deepgemm_contiguous_fused_expert(
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
     raise ValueError(f"Unsupported hidden_states type: {type(hidden_states)}")
@@ -52,9 +54,12 @@ def _(
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
+    assert not soft_fp8
     if w1.dtype == torch.float8_e4m3fn:
         assert len(block_shape) == 2
         assert block_shape[0] == block_shape[1]
@@ -109,9 +114,12 @@ def _(
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> ExpertBlockPermutedBatchedExpertResult:
+    assert not soft_fp8
     assert w1.dtype in {torch.bfloat16, torch.float16}
     assert w2.dtype in {torch.bfloat16, torch.float16}
     assert w1_scale is None
@@ -173,9 +181,12 @@ def _(
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
+    assert not soft_fp8
     hidden_states = hidden_states.as_local_expert_ids(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )
@@ -207,7 +218,9 @@ def _(
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> ExpertBlockPermutedBatchedExpertResult:
     if tuple(block_shape) != (128, 128):
@@ -227,6 +240,7 @@ def _(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )
 
+    assert not soft_fp8
     assert block_shape is not None
     assert activation == "silu"
 
@@ -266,7 +280,7 @@ def _(
     del intermediate_cache1
 
     qintermediate_cache2, a2q_scale = blockfp8_act_quant(
-        x=intermediate_cache2,
+        intermediate_cache2,
         block_size=block_shape[0],
         round_scale_to_pow2=round_scale_to_pow2,
     )
@@ -298,10 +312,12 @@ def _(
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
-
+    assert not soft_fp8
     assert len(block_shape) == 2
     assert block_shape[0] == block_shape[1]
     quant_block_size = block_shape[0]

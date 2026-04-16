@@ -77,6 +77,9 @@ from chitu.distributed.pd_disaggregation.pd_coordination import PDCoordinationSe
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.transfer_engine import (
     MooncakeBootstrapServer,
 )
+from chitu.import_utils import try_import_opt_dep
+
+mooncake, has_mooncake = try_import_opt_dep("mooncake", "mooncake")
 
 # Add project root to path (required for correct module imports in pytest)
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -533,11 +536,9 @@ def pytest_configure(config):
 def _set_mooncake_env():
     # If mooncake is unavailable, fall back to mock.
     if "MOONCAKE_MOCK_MODE" not in os.environ:
-        try:
-            import mooncake  # noqa: F401
-
+        if has_mooncake:
             os.environ["MOONCAKE_MOCK_MODE"] = "0"
-        except Exception:
+        else:
             os.environ["MOONCAKE_MOCK_MODE"] = "1"
     master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("PD_MASTER_ADDR", master_addr)

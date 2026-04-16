@@ -152,6 +152,9 @@ def test_parallel_moe_block(
     )
 
     if rank < test_world_size:
+        local_batch_size = compute_local_batch_size_dist_in_dp(batch_size, dp_size)[
+            dp_group.rank_in_group
+        ]
         experts_start_idx = ep_group.rank_in_group * n_experts // ep_size
         experts_end_idx = (ep_group.rank_in_group + 1) * n_experts // ep_size
         if ep_size > 1:
@@ -176,7 +179,7 @@ def test_parallel_moe_block(
                 etp_group=etp_group,
                 ep_group=ep_group,
             )
-        moe_impl.prepare(task_type, batch_size)
+        moe_impl.prepare(task_type, local_batch_size)
         if merge_gate_up:
             moe_experts_cls = NormalMoeExpertsMerged
         else:
@@ -259,7 +262,7 @@ def test_parallel_moe_block(
             etp_group=etp_group,
             ep_group=singleton_group,
         )
-        ref_moe_impl.prepare(task_type, batch_size)
+        ref_moe_impl.prepare(task_type, local_batch_size)
         ref_moe_block = ParallelMoeBlock(
             MoeGate(
                 op_impl="torch",
@@ -478,6 +481,9 @@ def test_parallel_moe_block_blockfp8(
     )
 
     if rank < test_world_size:
+        local_batch_size = compute_local_batch_size_dist_in_dp(batch_size, dp_size)[
+            dp_group.rank_in_group
+        ]
         experts_start_idx = ep_group.rank_in_group * n_experts // ep_size
         experts_end_idx = (ep_group.rank_in_group + 1) * n_experts // ep_size
         if ep_size > 1:
@@ -502,7 +508,7 @@ def test_parallel_moe_block_blockfp8(
                 etp_group=etp_group,
                 ep_group=ep_group,
             )
-        moe_impl.prepare(task_type, batch_size)
+        moe_impl.prepare(task_type, local_batch_size)
         if merge_gate_up:
             moe_experts_cls = Blockfp8MoeExpertsMerged
         else:
@@ -616,7 +622,7 @@ def test_parallel_moe_block_blockfp8(
             etp_group=etp_group,
             ep_group=singleton_group,
         )
-        ref_moe_impl.prepare(task_type, batch_size)
+        ref_moe_impl.prepare(task_type, local_batch_size)
         ref_moe_block = ParallelMoeBlock(
             MoeGate(
                 op_impl="torch",
