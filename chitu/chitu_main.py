@@ -498,7 +498,6 @@ def _warmup_backend_direct(
             device="cuda",
             dtype=torch.get_default_dtype(),
         )
-    seq_len_list = [1] * local_max_bs
 
     all_tasks = PackedTasksBase(local_max_bs, task_ids=req_ids)
     all_tasks.new_cache_ids_list = [

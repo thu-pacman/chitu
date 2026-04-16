@@ -18,8 +18,6 @@ from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.kv_cache import KVCacheBase, MMPagedKVCache
 from chitu.distributed.parallel_state import get_etp_size
 from chitu.global_vars import get_global_args
-from chitu.moe.impl import MoEImplEP, get_moe_impl
-from chitu.models.model import ParallelMoeBlock
 from chitu.models.model_hf_llama import TransformerBlockHFLlama, TransformerHFLlama
 from chitu.models.model_hf_qwen2_vl import (
     VisionAttention as Qwen25VisionAttention,
@@ -29,9 +27,7 @@ from chitu.models.model_hf_qwen_3_moe import TransformerHFQwen3Moe
 from chitu.models.mm_cache_mixin_qwen_vl import get_qwen_vl_mm_cache_class
 from chitu.models.registry import ModelType, register_model
 from chitu.utils import try_import_opt_dep
-from chitu.quantization import get_quant_from_checkpoint_prefix, QuantizationRegistry
 from chitu.device_type import has_accelerator
-from chitu.ops import append_to_paged_kv_cache
 
 _flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 

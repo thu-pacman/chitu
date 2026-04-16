@@ -42,7 +42,6 @@ from chitu.tensor_parallel import (
 )
 from chitu.distributed.parallel_state import get_tp_size
 
-
 logger = getLogger(__name__)
 
 
@@ -549,11 +548,6 @@ class TransformerHFLlama(Transformer):
             self.params.n_heads
             if self.params.n_kv_heads is None
             else self.params.n_kv_heads
-        )
-        head_dim = (
-            self.params.head_dim
-            if hasattr(self.params, "head_dim")
-            else self.params.dim // n_heads
         )
         return self.process_state_dict_for_splitting_tensors(
             checkpoint,

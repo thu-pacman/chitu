@@ -23,28 +23,30 @@ def _get_numa_of_gpu(gpu_id: int):
             "Detecting NUMA node near GPU is only supported on NVIDIA GPUs"
         )
 
-    # Get PCI bus ID from nvidia-smi
-    result = subprocess.run(
-        f"nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i {gpu_id}",
-        shell=True,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    pci_bus_id = result.stdout.strip()
+    try:
+        # Get PCI bus ID from nvidia-smi
+        result = subprocess.run(
+            f"nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i {gpu_id}",
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        pci_bus_id = result.stdout.strip()
 
-    # Convert format (e.g., 00000000:3B:00.0 -> 0000:3b:00.0)
-    pci_parts = pci_bus_id.split(":")
-    if len(pci_parts) != 3:
-        raise RuntimeError(f"Invalid PCI bus ID: {pci_bus_id}")
-    pci_bus_id = f"{pci_parts[0][-4:]}:{pci_parts[1]}:{pci_parts[2]}"
-    pci_bus_id = pci_bus_id.lower()
+        # Convert format (e.g., 00000000:3B:00.0 -> 0000:3b:00.0)
+        pci_parts = pci_bus_id.split(":")
+        if len(pci_parts) != 3:
+            raise RuntimeError(f"Invalid PCI bus ID: {pci_bus_id}")
+        pci_bus_id = f"{pci_parts[0][-4:]}:{pci_parts[1]}:{pci_parts[2]}"
+        pci_bus_id = pci_bus_id.lower()
 
-    # Read from /sys/bus/pci/devices/0000:3b:00.0/numa_node
-    with open(f"/sys/bus/pci/devices/{pci_bus_id}/numa_node") as f:
-        return int(f.read().strip())
+        # Read from /sys/bus/pci/devices/0000:3b:00.0/numa_node
+        with open(f"/sys/bus/pci/devices/{pci_bus_id}/numa_node") as f:
+            return int(f.read().strip())
 
-    raise RuntimeError("NUMA node not found")
+    except Exception as e:
+        raise RuntimeError("NUMA node not found") from e
 
 
 def _bind_process_to_numa_id(numa_id: int):

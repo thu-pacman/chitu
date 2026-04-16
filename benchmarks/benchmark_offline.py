@@ -97,7 +97,8 @@ class ShareGPTDataset:
                 max_prompt_len=input_len,
                 max_new_tokens=max_new_tokens,
             )
-            reqs.append(req)
+            if req.prompt_len == input_len:
+                reqs.append(req)
 
             idx += 1
             if idx == n:

@@ -4,7 +4,6 @@
 
 from typing import Optional
 from typing_extensions import override
-import functools
 import itertools
 import plum
 import torch

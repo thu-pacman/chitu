@@ -4,7 +4,6 @@
 
 import json as _json
 import os
-import itertools
 import zmq
 import msgpack
 from logging import getLogger
@@ -424,7 +423,6 @@ class TensorDispatcher(TasksDispatcher):
         """统一的 metadata dispatch（使用 msgpack + ZMQ ipc://）"""
 
         if self.is_main_rank:
-            payload_type = tasks.payload_type
             slot_handle = get_slot_handle()
             slot_idx = slot_handle.get_slot_idx() if slot_handle else None
             tasks_msg = self.metadata_serializer.serialize_metadata(

@@ -4,9 +4,9 @@
 
 from xgrammar import Grammar
 from abc import ABC, abstractmethod
-from typing import Any, AsyncIterable
+from typing import AsyncIterable
 
-from .type_def import ToolCallParams, ChoiceToolCall, ChoiceDelta
+from chitu.tool_call.type_def import ToolCallParams, ChoiceToolCall, ChoiceDelta
 
 
 class AbstractToolParser(ABC):

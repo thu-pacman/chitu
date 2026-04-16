@@ -62,14 +62,6 @@ def _(
     round_scale_to_pow2: bool = False,
     experts_start_idx: int = 0,
 ) -> PerExpertDenseBatchedExpertResult:
-    # first compute the n_tokens_per_expert (Tensor) based on token_to_expert_indices
-    if global_num_experts > 0:
-        n_experts = global_num_experts
-    else:
-        from chitu.global_vars import get_global_args
-
-        n_experts = get_global_args().infer.num_experts_slots
-
     hidden_states = hidden_states.as_local_expert_ids(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )
@@ -131,14 +123,6 @@ def _(
     round_scale_to_pow2: bool = False,
     experts_start_idx: int = 0,
 ) -> PerExpertDenseBatchedExpertResult:
-    # first compute the n_tokens_per_expert (Tensor) based on token_to_expert_indices
-    if global_num_experts > 0:
-        n_experts = global_num_experts
-    else:
-        from chitu.global_vars import get_global_args
-
-        n_experts = get_global_args().infer.num_experts_slots
-
     hidden_states = hidden_states.as_local_expert_ids(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )

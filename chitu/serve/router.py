@@ -9,15 +9,13 @@ Contains the core distributed parallel router logic without HTTP endpoints.
 
 import asyncio
 import logging
-import traceback
 from logging import getLogger
 
 from chitu.global_vars import get_global_args
-
-logger = getLogger(__name__)
-
 from chitu.dp_token_router import start_token_router
 from chitu.dp_request_router import start_request_router
+
+logger = getLogger(__name__)
 
 
 async def start_dp_components():

@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-import socket
 from typing import Optional, List, Tuple, Sequence, Any
 
 import torch

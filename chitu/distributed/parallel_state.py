@@ -2,12 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 from typing import Optional, Any
-
-import torch
 from logging import getLogger
 
+import torch
 
 from chitu.distributed.comm_group import CommGroup
 from chitu.device_type import is_ascend

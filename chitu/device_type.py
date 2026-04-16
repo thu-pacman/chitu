@@ -64,7 +64,7 @@ def is_blackwell():
 
 
 def is_hygon():
-    HYGON_DEVICE_PATTERNS = ["BW"]
+    HYGON_DEVICE_PATTERNS = ["BW", "K100"]
     device_name = get_device_name()
     return any(pattern in device_name for pattern in HYGON_DEVICE_PATTERNS)
 

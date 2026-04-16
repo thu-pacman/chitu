@@ -14,7 +14,8 @@ from chitu.kv_cache import PagedKVCacheAccessor
 from chitu.ops import append_to_paged_kv_cache, read_from_paged_kv_cache
 from chitu.utils import try_import_opt_dep, ceil_div
 from chitu.distributed.parallel_state import get_dp_size
-from chitu.device_type import has_accelerator
+from chitu.device_type import has_accelerator, is_hygon
+from chitu.static_tensor import StaticTensor
 
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
 
@@ -41,12 +42,15 @@ class FlashMLABackend(TritonAttnBackend):
         self.mtp_size = getattr(self.args.infer, "mtp_size", 1)
         self.kv_heads = 1
         assert has_accelerator(), "FlashMLA backend only supports cuda"
-        arch_major, _ = torch.cuda.get_device_capability()
-        assert arch_major in (
-            9,
-            10,
-        ), "FlashMLA backend only supports Hopper (sm9x) and Blackwell (sm10x)"
-        self.required_h_q = 128 if arch_major == 10 else 64
+        arch_major, arch_minor = torch.cuda.get_device_capability()
+        if is_hygon():
+            self.required_h_q = 64
+        else:
+            assert arch_major in (
+                9,
+                10,
+            ), "FlashMLA backend only supports Hopper (sm9x) and Blackwell (sm10x)"
+            self.required_h_q = 128 if arch_major == 10 else 64
 
         self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
 
@@ -54,6 +58,10 @@ class FlashMLABackend(TritonAttnBackend):
         self.metadata_prefill = None
         self.metadata_decode = None
         self.num_splits = None
+        # 海光使用旧版 FlashMLA：prefill 与 decode 的 num_splits 需分别保存；decode 侧走 CUDA graph 静态缓冲
+        self.num_splits_prefill = None
+        self.hygon_metadata_decode: Optional[StaticTensor] = None
+        self.hygon_num_splits_decode: Optional[StaticTensor] = None
 
         self.softmax_scale = None
 
@@ -70,6 +78,24 @@ class FlashMLABackend(TritonAttnBackend):
             self.use_fp8_cache = quant_config.kv_cache.type == "fp8_pertoken_dsa"
         else:
             self.use_fp8_cache = use_fp8
+
+        if is_hygon() and self.use_fp8_cache:
+            prefill_chunk_size_per_dp = (
+                ceil_div(self.args.infer.prefill_chunk_size, self.args.infer.dp_size)
+                if self.args.infer.prefill_chunk_size is not None
+                else None
+            )
+            if (
+                prefill_chunk_size_per_dp is not None
+                and prefill_chunk_size_per_dp > 4096
+            ):
+                raise NotImplementedError(
+                    f"FlashMLA with index_topk requires either disabling chunked prefill by setting "
+                    f"`infer.prefill_chunk_size=null`, or enable chunked prefill with a not-too-large "
+                    f"chunk size satisfying `ceil(infer.prefill_chunk_size / infer.dp_size) <= 4096`, "
+                    f"but not we got infer.prefill_chunk_size={self.args.infer.prefill_chunk_size} "
+                    f"and infer.dp_size={self.args.infer.dp_size}"
+                )
 
         logger.info(
             f"FlashMLA backend initialized with topk={self.index_topk} and use_fp8_cache={self.use_fp8_cache}"
@@ -213,24 +239,43 @@ class FlashMLABackend(TritonAttnBackend):
         # pad h_q to required_h_q if necessary
         q = self.pad_h_q(q, num_tokens, local_h_q)
 
-        # 确保 decode 元数据已初始化（开启prefix caching后warmup可能尚未调用 prepare_metadata_for_decode）
-        if self.metadata_decode is None:
-            self.metadata_decode, self.num_splits = flash_mla.get_mla_metadata()
-
         q = q.view(bsz, s_q, q.shape[-2], q.shape[-1])
-        # 使用关键字参数调用以兼容新版 FlashMLA 接口，并显式传入 tile_scheduler_metadata
-        # Don't pass `indices` here because it requires some new versions of FlashMLA
-        output, _ = flash_mla.flash_mla_with_kvcache(
-            q=q,
-            k_cache=kv_lora_k_pe.unsqueeze(2),
-            block_table=block_table,
-            head_dim_v=512,
-            cache_seqlens=seq_len_delta.new.lens_tensor_device,
-            tile_scheduler_metadata=self.metadata_decode,
-            num_splits=self.num_splits,
-            causal=(False if s_q == 1 else True),
-            softmax_scale=softmax_scale,
-        )
+        if is_hygon():
+            assert (
+                self.hygon_metadata_decode is not None
+                and self.hygon_num_splits_decode is not None
+            ), (
+                "Hygon FlashMLA requires prepare_metadata_for_decode() before dense decode; "
+                "lazy get_mla_metadata() is not supported."
+            )
+            output, _ = flash_mla.flash_mla_with_kvcache(
+                q,
+                kv_lora_k_pe.unsqueeze(2),
+                block_table,
+                seq_len_delta.new.lens_tensor_device,
+                512,
+                self.hygon_metadata_decode.get(),
+                self.hygon_num_splits_decode.get(),
+                causal=s_q > 1,
+                softmax_scale=softmax_scale,
+            )
+        else:
+            # 确保 decode 元数据已初始化（开启prefix caching后warmup可能尚未调用 prepare_metadata_for_decode）
+            if self.metadata_decode is None:
+                self.metadata_decode, self.num_splits = flash_mla.get_mla_metadata()
+            # 使用关键字参数调用以兼容新版 FlashMLA 接口，并显式传入 tile_scheduler_metadata
+            # Don't pass `indices` here because it requires some new versions of FlashMLA
+            output, _ = flash_mla.flash_mla_with_kvcache(
+                q=q,
+                k_cache=kv_lora_k_pe.unsqueeze(2),
+                block_table=block_table,
+                head_dim_v=512,
+                cache_seqlens=seq_len_delta.new.lens_tensor_device,
+                tile_scheduler_metadata=self.metadata_decode,
+                num_splits=self.num_splits,
+                causal=(False if s_q == 1 else True),
+                softmax_scale=softmax_scale,
+            )
         output = output.view(bsz * s_q, output.shape[-2], output.shape[-1])
         return output[:, :local_h_q, :]
 
@@ -296,8 +341,18 @@ class FlashMLABackend(TritonAttnBackend):
             cache_seqlens = seq_len_delta.new.lens_tensor_device
             batch_block_table = block_table
 
-        metadata = self.metadata_decode if is_decode else self.metadata_prefill
-        num_splits = self.num_splits
+        if is_hygon():
+            metadata, num_splits = (
+                (
+                    self.hygon_metadata_decode.get(),
+                    self.hygon_num_splits_decode.get(),
+                )
+                if is_decode
+                else (self.metadata_prefill, self.num_splits_prefill)
+            )
+        else:
+            metadata = self.metadata_decode if is_decode else self.metadata_prefill
+            num_splits = self.num_splits
 
         output, _ = flash_mla.flash_mla_with_kvcache(
             q=q,
@@ -424,6 +479,36 @@ class FlashMLABackend(TritonAttnBackend):
                 f'or both "kv_lora" and "k_pe" tensors, but we got {list(kv_cache.kv.keys())}'
             )
 
+    def prepare_flashmla_metadata(
+        self,
+        num_q_tokens_per_head_k,
+        seq_len_delta: BatchedSeqLenDelta,
+        is_prefill=False,
+    ):
+        """海光等平台绑定的旧版 FlashMLA：`get_mla_metadata` 必须传入 cache 长度与 head 信息。"""
+        if self.index_topk is not None:
+            metadata, num_splits = flash_mla.get_mla_metadata(
+                (
+                    seq_len_delta.new.lens_tensor_device.sum(
+                        0, keepdim=True, dtype=torch.int32
+                    )
+                    if is_prefill
+                    else seq_len_delta.new.lens_tensor_device
+                ),
+                num_q_tokens_per_head_k=num_q_tokens_per_head_k,
+                num_heads_q=self.local_n_heads,
+                num_heads_k=1,
+                is_fp8_kvcache=True,
+                topk=self.index_topk,
+            )
+        else:
+            metadata, num_splits = flash_mla.get_mla_metadata(
+                seq_len_delta.new.lens_tensor_device,
+                num_q_tokens_per_head_k,
+                self.kv_heads,
+            )
+        return metadata, num_splits
+
     def prepare_metadata_for_prefill(
         self,
         seq_len_delta: BatchedSeqLenDelta,
@@ -433,8 +518,18 @@ class FlashMLABackend(TritonAttnBackend):
 
         # fp8 sparse attn
         # prefill does not go through graph
-        # new version
-        self.metadata_prefill, _ = flash_mla.get_mla_metadata()
+        if is_hygon():
+            num_q_tokens_per_head_k = seq_len_delta.delta_total_len * self.local_n_heads
+            self.metadata_prefill, self.num_splits_prefill = (
+                self.prepare_flashmla_metadata(
+                    num_q_tokens_per_head_k,
+                    seq_len_delta,
+                    True,
+                )
+            )
+        else:
+            # new version
+            self.metadata_prefill, _ = flash_mla.get_mla_metadata()
 
     @override
     def mla_prefill_ragged_qo_paged_kv(  # support both bf16/fp8 sparse attn
@@ -475,6 +570,30 @@ class FlashMLABackend(TritonAttnBackend):
                 topk_indices=None,
             )
         # NOTE: currently use bf16 kv with fp8 kv chunked prefill make inaccurate output
+
+        if is_hygon() and self.use_fp8_cache:
+            if seq_len_delta.is_first_prefill_chunk:
+                output = self.mla_prefill_ragged_qkvo(
+                    q_nope,
+                    q_pe,
+                    kv,
+                    seq_len_delta,
+                    causal=True,
+                    softmax_scale=softmax_scale,
+                    topk_indices=topk_indices,
+                )
+                kv = quant_pertoken_kvcache_dsa(kv)
+                self.update_paged_mla_kv(
+                    kv_lora_rank,
+                    kv,
+                    kv_cache,
+                    seq_len_delta,
+                )
+                return output
+            assert q_nope.shape[0] <= 4096, (
+                "flash_mla_with_kvcache() does not support s_q > 4096: "
+                f"s_q={q_nope.shape[0]}"
+            )
 
         # quant then fwd with kvcache
         q = torch.cat([q_nope, q_pe], dim=-1)
@@ -533,11 +652,45 @@ class FlashMLABackend(TritonAttnBackend):
         if not self.use_fp8_cache and self.index_topk is not None:
             return
 
-        # NOTE: the actual metadata intialization in the updated version of
-        # FlashMLA occurs during the first execution of flash_mla_with_kvcache in
-        # decode, which should be captured in decode graph. Thus static tensor is
-        # not needed anymore. The input params are reserved for compatibility.
-        self.metadata_decode, _ = flash_mla.get_mla_metadata()
+        if is_hygon():
+            # 参考旧版FlashMLA的实现，将metadata和num_splits存储为static tensor
+            s_q = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
+            num_q_tokens_per_head_k = s_q * self.local_n_heads // self.kv_heads
+
+            max_batch_size_per_dp = ceil_div(self.args.infer.max_reqs, get_dp_size())
+
+            if self.index_topk is not None:
+                metadata, num_splits = flash_mla.get_mla_metadata(
+                    seq_len_delta.new.lens_tensor_device,
+                    num_q_tokens_per_head_k=num_q_tokens_per_head_k,
+                    num_heads_q=self.local_n_heads,
+                    num_heads_k=1,
+                    is_fp8_kvcache=True,
+                    topk=self.index_topk,
+                )
+            else:
+                metadata, num_splits = flash_mla.get_mla_metadata(
+                    seq_len_delta.new.lens_tensor_device,
+                    num_q_tokens_per_head_k,
+                    self.kv_heads,
+                )
+
+            if self.hygon_metadata_decode is None:
+                self.hygon_metadata_decode = StaticTensor(metadata)
+            else:
+                self.hygon_metadata_decode.set(metadata)
+            if self.hygon_num_splits_decode is None:
+                self.hygon_num_splits_decode = StaticTensor(
+                    num_splits, max_nelem=max_batch_size_per_dp + 1
+                )
+            else:
+                self.hygon_num_splits_decode.set(num_splits)
+        else:
+            # NOTE: the actual metadata intialization in the updated version of
+            # FlashMLA occurs during the first execution of flash_mla_with_kvcache in
+            # decode, which should be captured in decode graph. Thus static tensor is
+            # not needed anymore. The input params are reserved for compatibility.
+            self.metadata_decode, _ = flash_mla.get_mla_metadata()
 
     @override
     def mla_decode_paged_kv(

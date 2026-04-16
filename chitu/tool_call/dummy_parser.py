@@ -2,9 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import AsyncIterable, Any
-from .abstract_parser import AbstractToolParser
-from .type_def import ChoiceDelta
+from typing import AsyncIterable
+
+from chitu.tool_call.abstract_parser import AbstractToolParser
+from chitu.tool_call.type_def import ChoiceDelta
 
 
 class DummyToolParser(AbstractToolParser):

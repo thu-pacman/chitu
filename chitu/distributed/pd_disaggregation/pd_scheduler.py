@@ -16,7 +16,7 @@ import math
 from enum import Enum
 from collections import OrderedDict
 from logging import getLogger
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 import torch
 import msgpack
@@ -47,12 +47,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
 )
 from chitu.distributed.pd_disaggregation.pd_types import PDRequestStatus
-from chitu.metrics.prometheus_collector import (
-    inc_completed_requests,
-    observe_stage_duration,
-    set_queue_size,
-)
-from typing import TYPE_CHECKING
+from chitu.metrics.prometheus_collector import observe_stage_duration, set_queue_size
 
 if TYPE_CHECKING:
     from chitu.kv_cache import PagedKVCacheManager
