@@ -359,7 +359,10 @@ class Task:
         self.sample_params = (
             sample_params if sample_params is not None else req.sample_params
         )
-        self.dp_rank: Optional[int] = None
+        self.dp_rank: Optional[int] = None  # The actual dp rank of the task
+        self.preferred_dp_rank: Optional[int] = (
+            None  # Preferred rank from prefix-cache locality and DP load.
+        )
         self.prefix_tokens = (
             prefix_tokens
             if prefix_tokens is not None

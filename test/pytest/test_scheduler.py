@@ -266,24 +266,36 @@ def test_priority_prefill_first():
     assert sorted(batch1_ids) == sorted(["req_7", "req_1", "req_3", "req_8"])
     scheduler.update(batch1_ids)
     for task_id in batch1_ids:
+        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
+            TaskPool.pool[task_id]
+        )
         TaskPool.remove(task_id)
 
     batch2_ids = scheduler.schedule()
     assert sorted(batch2_ids) == sorted(["req_0", "req_4"])
     scheduler.update(batch2_ids)
     for task_id in batch2_ids:
+        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
+            TaskPool.pool[task_id]
+        )
         TaskPool.remove(task_id)
 
     batch3_ids = scheduler.schedule()
     assert sorted(batch3_ids) == sorted(["req_2", "req_5"])
     scheduler.update(batch3_ids)
     for task_id in batch3_ids:
+        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
+            TaskPool.pool[task_id]
+        )
         TaskPool.remove(task_id)
 
     batch4_ids = scheduler.schedule()
     assert sorted(batch4_ids) == sorted(["req_6"])
     scheduler.update(batch4_ids)
     for task_id in batch4_ids:
+        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
+            TaskPool.pool[task_id]
+        )
         TaskPool.remove(task_id)
 
     batch5_ids = scheduler.schedule()
@@ -457,18 +469,27 @@ def test_priority_fcfs():
     assert sorted(batch1_ids) == sorted(["req_0", "req_1", "req_2", "req_3"])
     scheduler.update(batch1_ids)
     for task_id in batch1_ids:
+        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
+            TaskPool.pool[task_id]
+        )
         TaskPool.remove(task_id)
 
     batch2_ids = scheduler.schedule()
     assert sorted(batch2_ids) == sorted(["req_4", "req_5"])
     scheduler.update(batch2_ids)
     for task_id in batch2_ids:
+        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
+            TaskPool.pool[task_id]
+        )
         TaskPool.remove(task_id)
 
     batch3_ids = scheduler.schedule()
     assert sorted(batch3_ids) == sorted(["req_6", "req_7", "req_8"])
     scheduler.update(batch3_ids)
     for task_id in batch3_ids:
+        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
+            TaskPool.pool[task_id]
+        )
         TaskPool.remove(task_id)
 
     batch4_ids = scheduler.schedule()
@@ -641,6 +662,9 @@ def test_priority_request_preset_over_prefill_first():
     assert sorted(batch1_ids) == sorted(["req_7", "req_3", "req_0", "req_4"])
     scheduler.update(batch1_ids)
     for task_id in batch1_ids:
+        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
+            TaskPool.pool[task_id]
+        )
         TaskPool.remove(task_id)
 
     # TaskPool: ['req_2':Decode, 'req_1', 'req_5':Decode, 'req_8', 'req_6':Decode]
@@ -648,6 +672,9 @@ def test_priority_request_preset_over_prefill_first():
     assert sorted(batch2_ids) == sorted(["req_2", "req_6"])
     scheduler.update(batch2_ids)
     for task_id in batch2_ids:
+        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
+            TaskPool.pool[task_id]
+        )
         TaskPool.remove(task_id)
 
     # TaskPool: ['req_1', 'req_5':Decode, 'req_8']
@@ -655,6 +682,9 @@ def test_priority_request_preset_over_prefill_first():
     assert sorted(batch3_ids) == sorted(["req_1", "req_8"])
     scheduler.update(batch3_ids)
     for task_id in batch3_ids:
+        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
+            TaskPool.pool[task_id]
+        )
         TaskPool.remove(task_id)
 
     # TaskPool: ['req_5':Decode]
@@ -662,6 +692,9 @@ def test_priority_request_preset_over_prefill_first():
     assert sorted(batch4_ids) == sorted(["req_5"])
     scheduler.update(batch4_ids)
     for task_id in batch4_ids:
+        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
+            TaskPool.pool[task_id]
+        )
         TaskPool.remove(task_id)
 
     batch5_ids = scheduler.schedule()
@@ -891,6 +924,7 @@ def test_single_prompt_seq_bigger_than_scheduler_capacity():
     assert "KV cache capacity is insufficient to support prefilling" in str(exc_info)
 
     TaskPool.remove(task.task_id)
+    scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(task)
 
 
 def test_single_decode_prompt_seq_bigger_than_kvcache_capacity():
@@ -962,6 +996,7 @@ def test_single_decode_prompt_seq_bigger_than_kvcache_capacity():
         exc_info
     )
     TaskPool.remove(task.task_id)
+    scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(task)
 
 
 def test_evict_task():
@@ -1165,6 +1200,8 @@ def test_can_prefill():
     assert scheduler.schedule(strict_allowed_task_type={TaskType.Prefill}) == []
 
     # 假设taskpool中全是waiting任务
+    for task in TaskPool.pool.values():
+        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(task)
     TaskPool.reset()
     for i in range(4):
         req = UserRequest.create_mock(
@@ -1173,8 +1210,10 @@ def test_can_prefill():
             enable_thinking=False,
         )
         task = Task(f"{req.request_id}", req)
-        task.waiting = True
         task.dp_rank = 0
+        task.prompt_to_token_block(task.dp_rank)
+        scheduler.cache_manager_dict["main"].prepare_metadata_before_prefill(task)
+        task.waiting = True
         TaskPool.add(task)  # pool: ['req_0', 'req_1', 'req_2', 'req_3']
 
     scheduler = Scheduler(
@@ -1190,6 +1229,8 @@ def test_can_prefill():
     assert scheduler.schedule(strict_allowed_task_type={TaskType.Prefill}) == []
 
     # 假设最高优先级的任务长度过大
+    for task in TaskPool.pool.values():
+        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(task)
     TaskPool.reset()
     req_0 = UserRequest.create_mock(
         input_len=1,
@@ -1224,6 +1265,8 @@ def test_can_prefill():
     assert "KV cache capacity is insufficient to support prefilling" in str(exc_info)
 
     # can_prefill返回True，则scheudler.schedule()一定会调度出prefill任务
+    for task in TaskPool.pool.values():
+        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(task)
     TaskPool.reset()
     req_0 = UserRequest.create_mock(
         input_len=1,
@@ -1286,8 +1329,8 @@ def test_scheduler_group():
         task = Task(f"{req.request_id}", req)
         tasks.append(task)
 
-    # 让task_2, task_5, task_6为decode状态
-    for task in [tasks[2], tasks[5], tasks[6]]:
+    # 让task_2, task_5为decode状态
+    for task in [tasks[2], tasks[5]]:
         task.dp_rank = 0
         task.prompt_to_token_block(task.dp_rank)
         task.set_prefill_chunk_size_for_one_step(task.prefix_tokens_len)
@@ -1331,6 +1374,13 @@ def test_scheduler_group():
     TaskPool.add(tasks[0])
     TaskPool.add(tasks[4])
     TaskPool.add(tasks[6])
+
+    # 让task_6为decode状态
+    tasks[6].dp_rank = 0
+    tasks[6].prompt_to_token_block(tasks[6].dp_rank)
+    tasks[6].set_prefill_chunk_size_for_one_step(tasks[6].prefix_tokens_len)
+    Backend.cache_managers[0]["main"].prepare_metadata_before_prefill(tasks[6])
+    tasks[6].consume_req_tokens()
 
     # sgroup head at: 0, empty sgroup: []
     scheduler.update(batch1_ids)

@@ -225,7 +225,7 @@ class MetricsMonitor:
                 gen_tps=float(gen_tps.get(rank_dp, "0")),
                 running=running,
                 waiting=waiting,
-                kv_cache_usage=float(kvcache_usage.get(rank_dp, "0")),
+                kv_cache_usage=kv_cache_usage,
                 eviction_rate=float(eviction_rate.get(rank_dp, "0")),
                 used_blocks=used_blocks_value,
                 total_blocks=total_blocks_value,
