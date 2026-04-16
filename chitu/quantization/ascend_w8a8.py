@@ -23,9 +23,7 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
     ConcatPermutedBatchedRoutedActivationMinimal,
 )
-from chitu.moe.experts import (
-    make_op_dispatcher,
-)
+from chitu.ops.utils import make_op_dispatcher
 from chitu.lazy import eval_lazy
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -273,28 +271,10 @@ def _auto_fused_experts_no_sum_ascend_w8a8_indexed():
     raise NotImplementedError
 
 
-@fused_experts_no_sum_ascend_w8a8_indexed.register("torch_npu")
-def _run_indexed_torch_npu_impl(
-    hidden_states,
-    w1,
-    w2,
-    *,
-    impl: str = "torch_npu",
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    global_num_experts: int = -1,
-    experts_start_idx: int = 0,
-    use_int8_w8a8: bool = False,
-):
-    return fused_experts_no_sum_npu(
-        hidden_states,
-        w1=w1,
-        w1_scale=w1_scale,
-        w2=w2,
-        w2_scale=w2_scale,
-        global_num_experts=global_num_experts,
-        experts_start_idx=experts_start_idx,
-        use_int8_w8a8=use_int8_w8a8,
+fused_experts_no_sum_ascend_w8a8_indexed.register_candidate("torch_npu")
+if has_torch_npu:
+    fused_experts_no_sum_ascend_w8a8_indexed.register("torch_npu")(
+        fused_experts_no_sum_npu
     )
 
 
@@ -319,26 +299,10 @@ def _auto_fused_experts_no_sum_ascend_w8a8_concat_permuted():
     raise NotImplementedError
 
 
-@fused_experts_no_sum_ascend_w8a8_concat_permuted.register("torch_npu")
-def _run_concat_permuted_torch_npu_impl(
-    hidden_states,
-    w1,
-    w2,
-    *,
-    impl: str = "torch_npu",
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    experts_start_idx: int = 0,
-    use_int8_w8a8: bool = False,
-):
-    return fused_experts_npu_for_ep(
-        hidden_states,
-        w1=w1,
-        w1_scale=w1_scale,
-        w2=w2,
-        w2_scale=w2_scale,
-        experts_start_idx=experts_start_idx,
-        use_int8_w8a8=use_int8_w8a8,
+fused_experts_no_sum_ascend_w8a8_concat_permuted.register_candidate("torch_npu")
+if has_torch_npu:
+    fused_experts_no_sum_ascend_w8a8_concat_permuted.register("torch_npu")(
+        fused_experts_npu_for_ep
     )
 
 
@@ -536,12 +500,12 @@ def _run_sum_indexed_torch_npu(
     topk_weights: torch.Tensor,
     *,
     inplace: bool = False,
-    impl: str = "torch_npu",
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
     use_int8_w8a8: bool = False,
+    impl: str,
 ):
     output = fused_experts_no_sum_ascend_w8a8_indexed(
         hidden_states,
@@ -590,11 +554,11 @@ def _run_sum_concat_torch_npu(
     topk_weights: torch.Tensor,
     *,
     inplace: bool = False,
-    impl: str = "torch_npu",
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,
     use_int8_w8a8: bool = False,
+    impl: str,
 ):
     output = fused_experts_no_sum_ascend_w8a8_concat_permuted(
         hidden_states,

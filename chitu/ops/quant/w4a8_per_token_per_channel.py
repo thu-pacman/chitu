@@ -6,6 +6,7 @@ import torch
 
 from chitu.utils import try_import_platform_dep
 from chitu.native_layout import Packed4BitWeightAlongK
+from chitu.ops.utils import make_op_dispatcher
 
 triton, has_triton = try_import_platform_dep("triton")
 
@@ -13,6 +14,7 @@ if has_triton:
     from chitu.ops.triton_ops import w4a8_gemm_per_token_per_channel_asymm_triton
 
 
+@make_op_dispatcher
 def w4a8_gemm_per_token_per_channel_asymm(
     a: torch.Tensor,
     a_s: torch.Tensor,
@@ -21,11 +23,16 @@ def w4a8_gemm_per_token_per_channel_asymm(
     b_z: torch.Tensor,
     impl: str = "auto",
 ):
-    if impl == "auto":
-        impl = "triton"
+    raise NotImplementedError
 
-    if impl == "triton":
-        assert has_triton
-        return w4a8_gemm_per_token_per_channel_asymm_triton(a, a_s, b, b_s, b_z)
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+@w4a8_gemm_per_token_per_channel_asymm.register_auto
+def _auto_w4a8_gemm_per_token_per_channel_asymm():
+    return "triton"
+
+
+w4a8_gemm_per_token_per_channel_asymm.register_candidate("triton")
+if has_triton:
+    w4a8_gemm_per_token_per_channel_asymm.register("triton")(
+        w4a8_gemm_per_token_per_channel_asymm_triton
+    )

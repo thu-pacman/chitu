@@ -6,13 +6,15 @@ from typing import Optional, Callable
 import torch
 
 from chitu.device_type import has_accelerator
+from chitu.ops.utils import make_op_dispatcher
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 from chitu.global_vars import get_global_args
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+has_triton_impl = has_triton and has_accelerator()
 
-if has_triton and has_accelerator():
+if has_triton_impl:
     from chitu.ops.triton_ops import (
         append_to_paged_kv_cache_triton,
         append_to_dense_kv_cache_triton,
@@ -21,6 +23,7 @@ if has_triton and has_accelerator():
     )
 
 
+@make_op_dispatcher
 def append_to_paged_kv_cache(
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -47,109 +50,26 @@ def append_to_paged_kv_cache(
             delta_seq_ids = [1, 1, 2]. This parameter can be ignored if the number of incremented
             tokens of every sequence is 1.
     """
-
-    if impl == "auto":
-        if has_triton and get_global_args().infer.op_impl != "cpu":
-            impl = "triton"
-        else:
-            impl = "torch"
-
-    if impl == "triton":
-        assert has_triton
-        append_to_paged_kv_cache_triton(
-            kv_cache,
-            page_table,
-            this_kv,
-            delta_position_ids,
-            delta_seq_ids,
-            use_i64_offsets,
-        )
-    elif impl == "torch":
-        append_to_paged_kv_cache_torch(
-            kv_cache,
-            page_table,
-            this_kv,
-            delta_position_ids,
-            delta_seq_ids,
-            get_page_ids,
-            get_offs_in_page,
-        )
-    else:
-        raise ValueError(f"Unknown implementation: {impl}")
+    raise NotImplementedError
 
 
-def update_singleton_paged_kv_cache(
+@append_to_paged_kv_cache.register_auto
+def _auto_append_to_paged_kv_cache(
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
     this_kv: torch.Tensor,
-    impl: str = "auto",
-    mtp_size: int = 1,
-):
-    """
-    Update singleton paged K/V cache.
-
-    Args:
-        kv_cache: (num_pages, 1, other contiguous dims...). Data of the paged K/V cache.
-        page_table: (batch_size, 1). Page table of the paged K/V cache.
-        this_kv: (num_tokens, other contiguous dims...). New K/V value.
-    """
-
-    if impl == "auto":
-        impl = "torch"
-
-    if impl == "torch":
-        update_singleton_paged_kv_cache_torch(kv_cache, page_table, this_kv, mtp_size)
-    else:
-        raise ValueError(f"Unknown implementation: {impl}")
-
-
-def append_to_dense_kv_cache(
-    kv_cache: torch.Tensor,
-    this_kv: torch.Tensor,
     delta_position_ids: torch.Tensor,
     delta_seq_ids: Optional[torch.Tensor] = None,
+    get_page_ids: Optional[Callable[[], torch.Tensor]] = None,
+    get_offs_in_page: Optional[Callable[[], torch.Tensor]] = None,
     use_i64_offsets: bool = False,
-    impl: str = "auto",
 ):
-    """
-    Read from ragged K/V, append to dense K/V cache.
-
-    Args:
-        kv_cache: (batch_size, seq_len, other contiguous dims...). Dense K/V cache.
-        this_kv: (num_tokens, other contiguous dims...). Ragged K/V.
-        delta_position_ids: (num_tokens,). Position IDs of the incremented tokens. E.g, if
-            appending the 8th, 9th token of the 1st sequence, and the 7th token of the 2nd
-            sequence, delta_position_ids = [8, 9, 7].
-        delta_seq_ids: (num_tokens,). Sequence IDs of the incremented tokens. E.g, if appending
-            the 8th, 9th token of the 1st sequence, and the 7th token of the 2nd sequence,
-            delta_seq_ids = [1, 1, 2]. This parameter can be ignored if the number of incremented
-            tokens of every sequence is 1.
-    """
-
-    if impl == "auto":
-        if has_triton:
-            impl = "triton"
-        else:
-            impl = "torch"
-
-    if impl == "triton":
-        assert has_triton
-        append_to_dense_kv_cache_triton(
-            kv_cache, this_kv, delta_position_ids, delta_seq_ids, use_i64_offsets
-        )
-    elif impl == "torch":
-        append_to_dense_kv_cache_torch(
-            kv_cache, this_kv, delta_position_ids, delta_seq_ids
-        )
-    elif impl == "torch_npu":
-        assert has_torch_npu
-        append_to_dense_kv_cache_torch_npu(
-            kv_cache, this_kv, delta_position_ids, delta_seq_ids
-        )
-    else:
-        raise ValueError(f"Unknown implementation: {impl}")
+    if has_triton_impl and get_global_args().infer.op_impl != "cpu":
+        return "triton"
+    return "torch"
 
 
+@append_to_paged_kv_cache.register("torch")
 def append_to_paged_kv_cache_torch(
     kv_cache: torch.Tensor,  # (num_pages, page_size, other contiguous dims...)
     page_table: torch.Tensor,  # (batch_size, num_pages_per_sample)
@@ -160,7 +80,10 @@ def append_to_paged_kv_cache_torch(
     get_offs_in_page: Optional[
         Callable[[], torch.Tensor]
     ] = None,  # fn -> (num_tokens,)
+    use_i64_offsets: bool = False,
 ):
+    # NOTE: PyTorch always use i64 offsets in its ops. So we can safely ignore use_i64_offsets
+
     page_size = kv_cache.shape[1]
 
     if get_page_ids is None:
@@ -189,6 +112,36 @@ def append_to_paged_kv_cache_torch(
     )
 
 
+append_to_paged_kv_cache.register_candidate("triton")
+if has_triton_impl:
+    append_to_paged_kv_cache.register("triton")(append_to_paged_kv_cache_triton)
+
+
+@make_op_dispatcher
+def update_singleton_paged_kv_cache(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    this_kv: torch.Tensor,
+    mtp_size: int = 1,
+    impl: str = "auto",
+):
+    """
+    Update singleton paged K/V cache.
+
+    Args:
+        kv_cache: (num_pages, 1, other contiguous dims...). Data of the paged K/V cache.
+        page_table: (batch_size, 1). Page table of the paged K/V cache.
+        this_kv: (num_tokens, other contiguous dims...). New K/V value.
+    """
+    raise NotImplementedError
+
+
+@update_singleton_paged_kv_cache.register_auto
+def _auto_update_singleton_paged_kv_cache():
+    return "torch"
+
+
+@update_singleton_paged_kv_cache.register("torch")
 def update_singleton_paged_kv_cache_torch(
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -204,12 +157,55 @@ def update_singleton_paged_kv_cache_torch(
     )
 
 
+@make_op_dispatcher
+def append_to_dense_kv_cache(
+    kv_cache: torch.Tensor,
+    this_kv: torch.Tensor,
+    delta_position_ids: torch.Tensor,
+    delta_seq_ids: Optional[torch.Tensor] = None,
+    use_i64_offsets: bool = False,
+    impl: str = "auto",
+):
+    """
+    Read from ragged K/V, append to dense K/V cache.
+
+    Args:
+        kv_cache: (batch_size, seq_len, other contiguous dims...). Dense K/V cache.
+        this_kv: (num_tokens, other contiguous dims...). Ragged K/V.
+        delta_position_ids: (num_tokens,). Position IDs of the incremented tokens. E.g, if
+            appending the 8th, 9th token of the 1st sequence, and the 7th token of the 2nd
+            sequence, delta_position_ids = [8, 9, 7].
+        delta_seq_ids: (num_tokens,). Sequence IDs of the incremented tokens. E.g, if appending
+            the 8th, 9th token of the 1st sequence, and the 7th token of the 2nd sequence,
+            delta_seq_ids = [1, 1, 2]. This parameter can be ignored if the number of incremented
+            tokens of every sequence is 1.
+    """
+    raise NotImplementedError
+
+
+@append_to_dense_kv_cache.register_auto
+def _auto_append_to_dense_kv_cache(
+    kv_cache: torch.Tensor,
+    this_kv: torch.Tensor,
+    delta_position_ids: torch.Tensor,
+    delta_seq_ids: Optional[torch.Tensor] = None,
+    use_i64_offsets: bool = False,
+):
+    if has_triton_impl:
+        return "triton"
+    return "torch"
+
+
+@append_to_dense_kv_cache.register("torch")
 def append_to_dense_kv_cache_torch(
     kv_cache: torch.Tensor,  # (batch_size, seq_len, other contiguous dims...)
     this_kv: torch.Tensor,  # (num_tokens, other contiguous dims...)
     delta_position_ids: torch.Tensor,  # (num_tokens,)
     delta_seq_ids: Optional[torch.Tensor] = None,  # (num_tokens,)
+    use_i64_offsets: bool = False,
 ):
+    # NOTE: PyTorch always use i64 offsets in its ops. So we can safely ignore use_i64_offsets
+
     if delta_seq_ids is None:
         if kv_cache.shape[0] != delta_position_ids.shape[0]:
             raise ValueError(
@@ -227,12 +223,17 @@ def append_to_dense_kv_cache_torch(
     )
 
 
+@append_to_dense_kv_cache.register("torch_npu", available=has_torch_npu)
 def append_to_dense_kv_cache_torch_npu(
     kv_cache: torch.Tensor,  # (batch_size, seq_len, other contiguous dims...)
     this_kv: torch.Tensor,  # (num_tokens, other contiguous dims...)
     delta_position_ids: torch.Tensor,  # (num_tokens,)
     delta_seq_ids: Optional[torch.Tensor] = None,  # (num_tokens,)
+    use_i64_offsets: bool = False,
 ):
+    # NOTE: We can safely igonre use_i64_offsets. This is guaranteed by test:
+    # test_dense_offset_overflow_case_matches_torch_with_i64
+
     if delta_seq_ids is None and kv_cache.shape[0] != delta_position_ids.shape[0]:
         raise ValueError(
             f"batch_size ({kv_cache.shape[0]}) must be equal to num_tokens "
@@ -259,6 +260,12 @@ def append_to_dense_kv_cache_torch_npu(
         )
 
 
+append_to_dense_kv_cache.register_candidate("triton")
+if has_triton_impl:
+    append_to_dense_kv_cache.register("triton")(append_to_dense_kv_cache_triton)
+
+
+@make_op_dispatcher
 def read_from_paged_kv_cache(
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -279,23 +286,33 @@ def read_from_paged_kv_cache(
             the 0th, 1st token of the 1st sequence, and the 0th token of the 2nd sequence,
             seq_ids = [1, 1, 2].
     """
-
-    if impl == "auto":
-        impl = "torch"
-
-    if impl == "torch":
-        return read_from_paged_kv_cache_torch(
-            kv_cache, page_table, position_ids, seq_ids
-        )
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+    raise NotImplementedError
 
 
+@read_from_paged_kv_cache.register_auto
+def _auto_read_from_paged_kv_cache():
+    return "torch"
+
+
+@read_from_paged_kv_cache.register("torch")
+def read_from_paged_kv_cache_torch(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_ids: torch.Tensor,
+) -> torch.Tensor:
+    return kv_cache[
+        page_table[seq_ids, position_ids // kv_cache.shape[1]],
+        position_ids % kv_cache.shape[1],
+    ]
+
+
+@make_op_dispatcher
 def read_from_singleton_paged_kv_cache(
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
-    impl: str = "auto",
     mtp_offset: torch.Tensor = None,
+    impl: str = "auto",
 ) -> torch.Tensor:
     """
     Read from singleton paged K/V cache.
@@ -304,18 +321,25 @@ def read_from_singleton_paged_kv_cache(
         kv_cache: (num_pages, page_size, other contiguous dims...). Data of the paged K/V cache.
         page_table: (batch_size, num_pages_per_sample). Page table of the paged K/V cache.
     """
+    raise NotImplementedError
 
-    if impl == "auto":
-        impl = "torch"
 
-    if impl == "torch":
-        return read_from_singleton_paged_kv_cache_torch(
-            kv_cache, page_table, mtp_offset
-        )
+@read_from_singleton_paged_kv_cache.register_auto
+def _auto_read_from_singleton_paged_kv_cache():
+    return "torch"
+
+
+@read_from_singleton_paged_kv_cache.register("torch")
+def read_from_singleton_paged_kv_cache_torch(
+    kv_cache: torch.Tensor, page_table: torch.Tensor, mtp_offset: torch.Tensor = None
+) -> torch.Tensor:
+    if mtp_offset is None:
+        return kv_cache[page_table.squeeze(1)].squeeze(1)
     else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+        return kv_cache[page_table.squeeze(1), mtp_offset]
 
 
+@make_op_dispatcher
 def read_from_dense_kv_cache(
     kv_cache: torch.Tensor,
     position_ids: torch.Tensor,
@@ -337,41 +361,24 @@ def read_from_dense_kv_cache(
     Returns:
         (num_tokens, other contiguous dims...). Ragged K/V.
     """
-
-    if impl == "auto":
-        impl = "torch"
-
-    if impl == "torch":
-        return read_from_dense_kv_cache_torch(kv_cache, position_ids, seq_ids)
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+    raise NotImplementedError
 
 
-def read_from_paged_kv_cache_torch(
-    kv_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    position_ids: torch.Tensor,
-    seq_ids: torch.Tensor,
-) -> torch.Tensor:
-    return kv_cache[
-        page_table[seq_ids, position_ids // kv_cache.shape[1]],
-        position_ids % kv_cache.shape[1],
-    ]
+@read_from_dense_kv_cache.register_auto
+def _auto_read_from_dense_kv_cache():
+    return "torch"
 
 
-def read_from_singleton_paged_kv_cache_torch(
-    kv_cache: torch.Tensor, page_table: torch.Tensor, mtp_offset: torch.Tensor = None
-) -> torch.Tensor:
-    if mtp_offset is None:
-        return kv_cache[page_table.squeeze(1)].squeeze(1)
-    else:
-        return kv_cache[page_table.squeeze(1), mtp_offset]
-
-
+@read_from_dense_kv_cache.register("torch")
 def read_from_dense_kv_cache_torch(
     kv_cache: torch.Tensor, position_ids: torch.Tensor, seq_ids: torch.Tensor
 ) -> torch.Tensor:
     return kv_cache[seq_ids, position_ids]
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 
 def fp8_pertensor_kvcache_quant(xq, xk, xv, k_scale, v_scale, batch_size, head_num):

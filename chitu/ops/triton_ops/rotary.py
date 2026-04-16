@@ -20,6 +20,11 @@ def apply_rotary_pos_emb_triton(
     k_out: Optional[torch.Tensor] = None,
     rotary_type: str = "separated",
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if rotary_type == "interleaved" and not hasattr(tl, "interleave"):
+        raise RuntimeError(
+            "triton.language.interleave is not supported, please check triton version"
+        )
+
     # Triton does not support in-place operation. This function is only a compatitive
     # adaptor for in-place interface, but not for performance.
     q_embed, k_embed = apply_rotary_pos_emb_triton_out_of_place(

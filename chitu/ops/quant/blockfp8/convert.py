@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 
+from chitu.ops.utils import make_op_dispatcher
 from chitu.utils import try_import_platform_dep
 
 triton, has_triton = try_import_platform_dep("triton")
@@ -46,6 +47,7 @@ def blockfp8_weight_quant(
     return w, s
 
 
+@make_op_dispatcher
 def blockfp8_weight_dequant(
     x: torch.Tensor, s: torch.Tensor, block_size: int = 128, impl: str = "auto"
 ) -> torch.Tensor:
@@ -63,16 +65,20 @@ def blockfp8_weight_dequant(
     Raises:
         AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
     """
-
-    if impl == "auto":
-        impl = "triton"
-
-    if impl == "triton" and has_triton:
-        return blockfp8_weight_dequant_triton(x, s, block_size)
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+    raise NotImplementedError
 
 
+@blockfp8_weight_dequant.register_auto
+def _auto_blockfp8_weight_dequant():
+    return "triton"
+
+
+blockfp8_weight_dequant.register_candidate("triton")
+if has_triton:
+    blockfp8_weight_dequant.register("triton")(blockfp8_weight_dequant_triton)
+
+
+@make_op_dispatcher
 def soft_fp8_blockfp8_weight_dequant(
     x: torch.Tensor, s: torch.Tensor, block_size: int = 128, impl: str = "auto"
 ) -> torch.Tensor:
@@ -90,16 +96,22 @@ def soft_fp8_blockfp8_weight_dequant(
     Raises:
         AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
     """
-
-    if impl == "auto":
-        impl = "triton"
-
-    if impl == "triton" and has_triton:
-        return soft_fp8_blockfp8_weight_dequant_triton(x, s, block_size)
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+    raise NotImplementedError
 
 
+@soft_fp8_blockfp8_weight_dequant.register_auto
+def _auto_soft_fp8_blockfp8_weight_dequant():
+    return "triton"
+
+
+soft_fp8_blockfp8_weight_dequant.register_candidate("triton")
+if has_triton:
+    soft_fp8_blockfp8_weight_dequant.register("triton")(
+        soft_fp8_blockfp8_weight_dequant_triton
+    )
+
+
+@make_op_dispatcher
 def blockfp8_act_quant(
     x: torch.Tensor,
     *,
@@ -127,26 +139,17 @@ def blockfp8_act_quant(
             - The quantized tensor with dtype `torch.float8_e4m3fn`.
             - A tensor of scaling factors with dtype `torch.float32`.
     """
-
-    if impl == "auto":
-        if has_triton:
-            impl = "triton"
-        else:
-            impl = "torch"
-
-    if impl == "torch":
-        return blockfp8_act_quant_torch(
-            x, block_size=block_size, round_scale_to_pow2=round_scale_to_pow2, eps=eps
-        )
-    elif impl == "triton":
-        assert has_triton
-        return blockfp8_act_quant_triton(
-            x, block_size=block_size, round_scale_to_pow2=round_scale_to_pow2, eps=eps
-        )
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+    raise NotImplementedError
 
 
+@blockfp8_act_quant.register_auto
+def _auto_blockfp8_act_quant():
+    if has_triton:
+        return "triton"
+    return "torch"
+
+
+@blockfp8_act_quant.register("torch")
 def blockfp8_act_quant_torch(
     x: torch.Tensor,
     *,
@@ -166,17 +169,31 @@ def blockfp8_act_quant_torch(
     return (x_blocked / s).to(torch.float8_e4m3fn).view(x.shape), s.squeeze(-1)
 
 
+blockfp8_act_quant.register_candidate("triton")
+if has_triton:
+    blockfp8_act_quant.register("triton")(blockfp8_act_quant_triton)
+
+
+@make_op_dispatcher
 def fp8_e4m3fn_quant_per_tensor(
-    x: torch.Tensor, scale: torch.Tensor, impl: str = "auto"
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    impl: str = "auto",
 ) -> torch.Tensor:
-    if impl == "auto":
-        impl = "triton"
-    if impl == "triton" and has_triton:
-        return fp8_e4m3fn_quant_per_tensor_triton(x, scale)
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+    raise NotImplementedError
 
 
+@fp8_e4m3fn_quant_per_tensor.register_auto
+def _auto_fp8_e4m3fn_quant_per_tensor():
+    return "triton"
+
+
+fp8_e4m3fn_quant_per_tensor.register_candidate("triton")
+if has_triton:
+    fp8_e4m3fn_quant_per_tensor.register("triton")(fp8_e4m3fn_quant_per_tensor_triton)
+
+
+@make_op_dispatcher
 def silu_and_mul_and_blockfp8_act_quant(
     x: torch.Tensor,
     *,
@@ -186,17 +203,16 @@ def silu_and_mul_and_blockfp8_act_quant(
     eps: float = 1e-4,
     impl: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if impl == "auto":
-        impl = "triton"
+    raise NotImplementedError
 
-    if impl == "triton":
-        assert has_triton
-        return silu_and_mul_and_blockfp8_act_quant_triton(
-            x,
-            expert_n_tokens=expert_n_tokens,
-            block_size=block_size,
-            round_scale_to_pow2=round_scale_to_pow2,
-            eps=eps,
-        )
-    else:
-        raise NotImplementedError(f"Unsupported implementation: {impl}")
+
+@silu_and_mul_and_blockfp8_act_quant.register_auto
+def _auto_silu_and_mul_and_blockfp8_act_quant():
+    return "triton"
+
+
+silu_and_mul_and_blockfp8_act_quant.register_candidate("triton")
+if has_triton:
+    silu_and_mul_and_blockfp8_act_quant.register("triton")(
+        silu_and_mul_and_blockfp8_act_quant_triton
+    )

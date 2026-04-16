@@ -2,11 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import functools
-import inspect
-
-from typing import Optional, Callable, Dict
-
 from chitu.utils import (
     try_import_opt_dep,
     try_import_platform_dep,

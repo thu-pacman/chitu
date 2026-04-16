@@ -272,6 +272,7 @@ class MoEImplEP(MoEImplBase):
         elif self.prefill_token_dispatcher_impl == "allgather":
             self.prefill_token_dispatcher = MoEAllGatherTokenDispatcher(
                 self.n_global_experts_slots,
+                use_cuda_graph=self.use_cuda_graph,
                 tp_group=self.tp_group,
                 dp_group=self.dp_group,
                 etp_group=self.etp_group,
@@ -312,6 +313,7 @@ class MoEImplEP(MoEImplBase):
         elif self.decode_token_dispatcher_impl == "allgather":
             self.decode_token_dispatcher = MoEAllGatherTokenDispatcher(
                 self.n_global_experts_slots,
+                use_cuda_graph=self.use_cuda_graph,
                 tp_group=self.tp_group,
                 dp_group=self.dp_group,
                 etp_group=self.etp_group,

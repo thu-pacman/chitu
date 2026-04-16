@@ -174,7 +174,7 @@ def _fwd_kernel_ep_gather(
 @torch.no_grad()
 def moe_sum_expert_block_permuted_triton(
     x: torch.Tensor,
-    token_comma_topk_to_row_indices: torch.Tensor,
+    token_comma_topk_to_block_x_item_indices: torch.Tensor,
     topk_weights: torch.Tensor,
     *,
     out: Optional[torch.Tensor] = None,
@@ -204,9 +204,9 @@ def moe_sum_expert_block_permuted_triton(
         topk_weights,
         topk_weights.stride(0),
         topk_weights.stride(1),
-        token_comma_topk_to_row_indices,
-        token_comma_topk_to_row_indices.stride(0),
-        token_comma_topk_to_row_indices.stride(1),
+        token_comma_topk_to_block_x_item_indices,
+        token_comma_topk_to_block_x_item_indices.stride(0),
+        token_comma_topk_to_block_x_item_indices.stride(1),
         out,
         out.stride(0),
         out.stride(1),

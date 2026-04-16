@@ -5,6 +5,7 @@
 import functools
 import torch
 
+from chitu.ops.utils import make_op_dispatcher
 from chitu.utils import try_import_opt_dep, is_power_of_two, next_power_of_two
 
 scipy, has_scipy = try_import_opt_dep("scipy", "scipy")
@@ -13,25 +14,20 @@ fast_hadamard_transform, has_fast_hadamard_transform = try_import_opt_dep(
 )
 
 
+@make_op_dispatcher
 def hadamard_transform(
     x: torch.Tensor, scale: float, impl: str = "auto"
 ) -> torch.Tensor:
-    if impl == "auto":
-        if has_fast_hadamard_transform:
-            impl = "fast_hadamard_transform"
-        elif has_scipy:
-            impl = "scipy"
-        else:
-            raise NotImplementedError(
-                "Please install either scipy or fast_hadamard_transform"
-            )
+    raise NotImplementedError
 
-    if impl == "scipy":
-        return hadamard_transform_scipy(x, scale)
-    elif impl == "fast_hadamard_transform":
-        return hadamard_transform_fast_hadamard_transform(x, scale)
-    else:
-        raise NotImplementedError(f"Unsupported impl: {impl}")
+
+@hadamard_transform.register_auto
+def _auto_hadamard_transform():
+    if has_fast_hadamard_transform:
+        return "fast_hadamard_transform"
+    if has_scipy:
+        return "scipy"
+    raise NotImplementedError("Please install either scipy or fast_hadamard_transform")
 
 
 @functools.cache
@@ -41,6 +37,7 @@ def get_hadamard_matrix_scipy(
     return torch.tensor(scipy.linalg.hadamard(dim), dtype=dtype, device=device)
 
 
+@hadamard_transform.register("scipy", available=has_scipy)
 def hadamard_transform_scipy(x: torch.Tensor, scale: float) -> torch.Tensor:
     dim = x.shape[-1]
     if not is_power_of_two(dim):
@@ -56,6 +53,9 @@ def hadamard_transform_scipy(x: torch.Tensor, scale: float) -> torch.Tensor:
     )
 
 
+@hadamard_transform.register(
+    "fast_hadamard_transform", available=has_fast_hadamard_transform
+)
 def hadamard_transform_fast_hadamard_transform(
     x: torch.Tensor, scale: float
 ) -> torch.Tensor:

@@ -58,6 +58,10 @@ from chitu.metrics import (
     start_prometheus_server_and_metrics_monitor,
     stop_metrics_monitor,
 )
+from chitu.ops.utils import (
+    clear_observed_op_impl_selections,
+    emit_observed_op_impl_summary,
+)
 from chitu.distributed.comm_group import SingletonGroupPlaceholder
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
 from chitu.kv_cache.utils import (
@@ -331,6 +335,16 @@ def _auto_set_num_blocks_after_warmup(args):
             scheduler.reset_kvcache_block_threshold()
 
 
+def _emit_observed_op_impl_summary_after_warmup():
+    if (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_rank() != 0
+    ):
+        return False
+    return emit_observed_op_impl_summary(target_logger=logger)
+
+
 def _warmup_via_taskpool(args):
     rank = torch.distributed.get_rank()
 
@@ -575,6 +589,8 @@ def warmup_engine(args):
     if args.dp_config.router.is_router:
         return
 
+    clear_observed_op_impl_selections()
+
     # PD分离→direct，非PD→taskpool
     pd_enabled = args.dp_config.router.pd_disaggregation.enabled
 
@@ -626,6 +642,7 @@ def warmup_engine(args):
         )
 
     _auto_set_num_blocks_after_warmup(args)
+    _emit_observed_op_impl_summary_after_warmup()
 
 
 def check_checkpoint_path(args):

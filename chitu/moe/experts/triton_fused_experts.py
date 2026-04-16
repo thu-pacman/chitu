@@ -396,6 +396,7 @@ def fused_experts(
     w2: torch.Tensor,
     *,
     activation: str = "silu",
+    global_num_experts: int = -1,
     experts_start_idx: int = 0,
     config: Optional[dict[str, Any]] = None,
 ) -> BatchedExpertResult:
@@ -593,6 +594,7 @@ def fused_experts_fp8(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    global_num_experts: int = -1,
     experts_start_idx: int = 0,
     config: Optional[dict[str, Any]] = None,
 ) -> PerTokenBatchedExpertResult:

@@ -20,20 +20,20 @@ from chitu.ops.utils import compatible_with_inplace
 @compatible_with_inplace
 @auto_retry_triton_compilation
 def rms_norm_triton(
-    X: torch.Tensor, W: torch.Tensor, *, eps, compute_dtype: torch.dtype
+    x: torch.Tensor, weight: torch.Tensor, *, eps, compute_dtype: torch.dtype
 ):
-    out = torch.empty_like(X)
+    out = torch.empty_like(x)
 
-    X_shape = X.shape
-    num_cols = X.shape[-1]
-    num_rows = X.numel() // num_cols
+    x_shape = x.shape
+    num_cols = x.shape[-1]
+    num_rows = x.numel() // num_cols
 
     # Assume the row dimensions are contiguous, but it can be non-contiguous between
     # each row
-    X = X.view(num_rows, num_cols)
+    x = x.view(num_rows, num_cols)
     out = out.view(num_rows, num_cols)
 
-    assert W.is_contiguous()
+    assert weight.is_contiguous()
 
     # SPDX-SnippetBegin
     # SPDX-License-Identifier: Apache-2.0
@@ -65,15 +65,15 @@ def rms_norm_triton(
     rms_norm_kernel[num_rows,](
         out,
         out.stride(-2),
-        X,
-        X.stride(-2),
-        W,
+        x,
+        x.stride(-2),
+        weight,
         num_cols,
         eps,
         compute_dtype=to_triton_dtype(compute_dtype),
         BLOCK_SIZE=BLOCK_SIZE,
     )
-    return out.view(X_shape)
+    return out.view(x_shape)
 
 
 rms_norm_configs = [

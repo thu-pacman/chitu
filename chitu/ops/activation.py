@@ -18,11 +18,13 @@ from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
 from chitu.global_vars import get_global_args
 from chitu.lazy import make_lazy_op
+from chitu.ops.utils import make_op_dispatcher
 
 triton, has_triton = try_import_platform_dep("triton")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-if has_triton and has_accelerator():
+has_triton_impl = has_triton and has_accelerator()
+if has_triton_impl:
     from chitu.ops.triton_ops import (
         silu_and_mul_triton,
         silu_and_mul_triton_with_expert_mask,
@@ -89,54 +91,64 @@ def silu_and_mul_cpu(x: torch.Tensor):
 
 
 @make_lazy_op
+@make_op_dispatcher
 def silu_and_mul(
-    x: torch.Tensor,
-    expert_n_tokens: Optional[torch.Tensor] = None,
-    impl="auto",
+    x: torch.Tensor, expert_n_tokens: Optional[torch.Tensor] = None, impl="auto"
 ):
-    if impl == "auto":
-        if isinstance(x, MuxiNativeLayoutActivation):
-            impl = "torch"
-        elif has_torch_npu:
-            impl = "torch_npu"
-        elif (
-            is_muxi()
-            and not isinstance(x, Vector)
-            and x.shape.numel() // x.shape[-1] > 1024
-        ):
-            # triton implementation fails for large amount of tokens on Muxi.
-            # This happens on prefill stage for large input lengths. (FIXME)
-            impl = "torch"
-        elif get_global_args().infer.op_impl == "cpu":
-            impl = "cpu"
-        else:
-            impl = "triton"
+    raise NotImplementedError
 
-    if impl == "triton" and has_triton:
-        if expert_n_tokens is not None:
-            return silu_and_mul_triton_with_expert_mask(x, expert_n_tokens)
-        else:
-            return silu_and_mul_triton(x)
-    elif impl == "torch_npu":
-        if expert_n_tokens is not None:
-            logger.warning_once(
-                "silu_and_mul(impl=torch_npu) does not support expert_n_tokens, "
-                "falling back to computing the whole tensor"
-            )
-        return torch_npu.npu_swiglu(x)
-    elif impl == "cpu":
-        if expert_n_tokens is not None:
-            logger.warning_once(
-                "silu_and_mul(impl=cpu) does not support expert_n_tokens, "
-                "falling back to computing the whole tensor"
-            )
-        return silu_and_mul_cpu(x)
-    elif impl == "torch":
-        if expert_n_tokens is not None:
-            logger.warning_once(
-                "silu_and_mul(impl=torch) does not support expert_n_tokens, "
-                "falling back to computing the whole tensor"
-            )
-        return silu_and_mul_torch(x)
-    else:
-        raise ValueError(f"Unsupported implementation of silu_and_mul: {impl}")
+
+@silu_and_mul.register_auto
+def _auto_silu_and_mul(x: torch.Tensor, expert_n_tokens: Optional[torch.Tensor] = None):
+    if isinstance(x, MuxiNativeLayoutActivation):
+        return "torch"
+    if has_torch_npu:
+        return "torch_npu"
+    if (
+        is_muxi()
+        and not isinstance(x, Vector)
+        and x.shape.numel() // x.shape[-1] > 1024
+    ):
+        return "torch"
+    if get_global_args().infer.op_impl == "cpu":
+        return "cpu"
+    if has_triton_impl:
+        return "triton"
+    return "torch"
+
+
+@silu_and_mul.register("triton", available=has_triton_impl)
+def _silu_and_mul_triton(x, expert_n_tokens=None):
+    if expert_n_tokens is not None:
+        return silu_and_mul_triton_with_expert_mask(x, expert_n_tokens)
+    return silu_and_mul_triton(x)
+
+
+@silu_and_mul.register("torch_npu", available=has_torch_npu)
+def _silu_and_mul_npu(x, expert_n_tokens=None):
+    if expert_n_tokens is not None:
+        logger.warning_once(
+            "silu_and_mul(impl=torch_npu) does not support expert_n_tokens, "
+            "falling back to computing the whole tensor"
+        )
+    return torch_npu.npu_swiglu(x)
+
+
+@silu_and_mul.register("cpu", available=has_cpuinfer)
+def _silu_and_mul_cpu_handler(x, expert_n_tokens=None):
+    if expert_n_tokens is not None:
+        logger.warning_once(
+            "silu_and_mul(impl=cpu) does not support expert_n_tokens, "
+            "falling back to computing the whole tensor"
+        )
+    return silu_and_mul_cpu(x)
+
+
+@silu_and_mul.register("torch")
+def _silu_and_mul_torch_handler(x, expert_n_tokens=None):
+    if expert_n_tokens is not None:
+        logger.warning_once(
+            "silu_and_mul(impl=torch) does not support expert_n_tokens, "
+            "falling back to computing the whole tensor"
+        )
+    return silu_and_mul_torch(x)

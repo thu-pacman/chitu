@@ -6,41 +6,37 @@ import torch
 import torch.nn.functional as F
 
 from chitu.device_type import has_accelerator
+from chitu.ops.utils import make_op_dispatcher
 from chitu.utils import try_import_platform_dep
 
 triton, has_triton = try_import_platform_dep("triton")
+has_triton_impl = has_triton and has_accelerator()
 
-if has_triton and has_accelerator():
+if has_triton_impl:
     from chitu.ops.triton_ops import (
         causal_conv1d_update_triton,
         causal_conv1d_prefill_triton,
     )
 
 
+@make_op_dispatcher
 def causal_conv1d_update(
     this_hidden_states: torch.Tensor,
     old_hidden_states: torch.Tensor,
     weight: torch.Tensor,
     impl: str = "auto",
 ):
-    if impl == "auto":
-        if has_triton:
-            impl = "triton"
-        else:
-            impl = "torch"
-
-    if impl == "torch":
-        return causal_conv1d_update_torch(this_hidden_states, old_hidden_states, weight)
-    elif impl == "ref":
-        return causal_conv1d_update_ref(this_hidden_states, old_hidden_states, weight)
-    elif impl == "triton":
-        return causal_conv1d_update_triton(
-            this_hidden_states, old_hidden_states, weight
-        )
-    else:
-        raise ValueError(f"Unknown implementation: {impl}")
+    raise NotImplementedError
 
 
+@causal_conv1d_update.register_auto
+def _auto_causal_conv1d_update():
+    if has_triton_impl:
+        return "triton"
+    return "torch"
+
+
+@causal_conv1d_update.register("torch")
 def causal_conv1d_update_torch(
     this_hidden_states: torch.Tensor,
     old_hidden_states: torch.Tensor,
@@ -68,6 +64,7 @@ def causal_conv1d_update_torch(
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-SnippetCopyrightText: 2025 HuggingFace
 # SDPX—SnippetName: torch_causal_conv1d_update from transformers
+@causal_conv1d_update.register("ref")
 def causal_conv1d_update_ref(
     this_hidden_states: torch.Tensor,
     old_hidden_states: torch.Tensor,
@@ -92,6 +89,14 @@ def causal_conv1d_update_ref(
 # SPDX-SnippetEnd
 
 
+causal_conv1d_update.register_candidate("triton")
+if has_triton_impl:
+    causal_conv1d_update.register("triton", available=has_triton_impl)(
+        causal_conv1d_update_triton
+    )
+
+
+@make_op_dispatcher
 def causal_conv1d_prefill(
     inputs: torch.Tensor,
     conv_state: torch.Tensor,
@@ -109,19 +114,17 @@ def causal_conv1d_prefill(
         outputs: (total_len, hidden_size)
         conv_states: (bsz, hidden_size, conv_kernel_size)
     """
-    if impl == "auto":
-        if has_triton:
-            impl = "triton"
-        else:
-            impl = "ref"
-    if impl == "ref":
-        return causal_conv1d_prefill_ref(inputs, conv_state, weight, prefix_lens)
-    elif impl == "triton":
-        return causal_conv1d_prefill_triton(inputs, conv_state, weight, prefix_lens)
-    else:
-        assert ValueError(f"Unsupported causal_conv1d_prefill impl: {impl}")
+    raise NotImplementedError
 
 
+@causal_conv1d_prefill.register_auto
+def _auto_causal_conv1d_prefill():
+    if has_triton_impl:
+        return "triton"
+    return "ref"
+
+
+@causal_conv1d_prefill.register("ref")
 def causal_conv1d_prefill_ref(
     inputs: torch.Tensor,
     conv_state: torch.Tensor,
@@ -168,3 +171,8 @@ def causal_conv1d_prefill_ref(
         new_conv_state, dim=0
     )  # (bsz,hidden_size,conv_kernel_size)
     return outputs, new_conv_state
+
+
+causal_conv1d_prefill.register_candidate("triton")
+if has_triton_impl:
+    causal_conv1d_prefill.register("triton")(causal_conv1d_prefill_triton)

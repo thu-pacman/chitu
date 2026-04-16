@@ -15,11 +15,13 @@ from chitu.native_layout import (
     ColumnOddEvenSeparatedTensor,
     PartialColumnOddEvenSeparatedTensor,
 )
+from chitu.ops.utils import make_op_dispatcher
 from chitu.utils import ceil_div, try_import_and_setup_torch_npu
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
+@make_op_dispatcher
 def mla_prologue(
     x: torch.Tensor,
     q_a_proj_weight: torch.Tensor | NativeLayoutTensor,
@@ -40,76 +42,54 @@ def mla_prologue(
 ) -> tuple[
     torch.Tensor, torch.Tensor | NativeLayoutTensor, torch.Tensor | NativeLayoutTensor
 ]:  # q_nope, q_pe, kv
-    if impl == "auto":
-        # This restriction is from
-        # https://www.hiascend.com/document/detail/zh/Pytorch/710/apiref/torchnpuCustomsapi/context/torch_npu-npu_mla_prolog_v2.md
-        # Should be synchronized in the following files:
-        # - chitu/models/model_deepseek_v3.py
-        # - chitu/quantization/registry.py
-        # - chitu/ops/mla_prologue.py
-        if (
-            has_torch_npu
-            and (x.dtype == torch.bfloat16 or x.dtype == torch.int8)
-            and x.shape[-1] == 7168
-            and q_a_layernorm_weight.shape[0] == 1536
-            and kv_b_proj_absorb_1_weight.shape[0] in [8, 16, 32, 64, 128]
-            and kv_a_layernorm_weight.shape[0] == 512
-            and kv_b_proj_absorb_1_weight.shape[2] == 128
-            and freqs_cis.cos.shape[-1] * 2 == 64
-            and isinstance(q_a_proj_weight, NpuFractalZnTensor)
-            and isinstance(q_b_proj_weight, NpuFractalZnTensor)
-            and isinstance(kv_b_proj_absorb_1_weight, PermutedTensor)
-            and tuple(kv_b_proj_absorb_1_weight.perm) == (0, 2, 1)
-            and isinstance(kv_a_proj_with_mqa_weight, NpuFractalZnTensor)
-        ):
-            impl = "torch_npu"
-        elif (
-            isinstance(q_a_proj_weight, torch.Tensor)
-            and isinstance(q_b_proj_weight, torch.Tensor)
-            and isinstance(kv_b_proj_absorb_1_weight, torch.Tensor)
-            and isinstance(kv_a_proj_with_mqa_weight, torch.Tensor)
-        ):
-            impl = "torch"
-        else:
-            raise NotImplementedError(
-                "No supported implementation found for mla_prologue"
-            )
-
-    if impl == "torch_npu":
-        return mla_prologue_torch_npu(
-            x=x,
-            q_a_proj_weight=q_a_proj_weight,
-            q_b_proj_weight=q_b_proj_weight,
-            kv_b_proj_absorb_1_weight=kv_b_proj_absorb_1_weight,
-            kv_a_proj_with_mqa_weight=kv_a_proj_with_mqa_weight,
-            q_a_layernorm_weight=q_a_layernorm_weight,
-            kv_a_layernorm_weight=kv_a_layernorm_weight,
-            freqs_cis=freqs_cis,
-            q_a_layernorm_eps=q_a_layernorm_eps,
-            kv_a_layernorm_eps=kv_a_layernorm_eps,
-            dequant_scale_x=dequant_scale_x,
-            dequant_scale_q_a_proj=dequant_scale_q_a_proj,
-            dequant_scale_q_b_proj=dequant_scale_q_b_proj,
-            dequant_scale_kv_a_proj_with_mqa=dequant_scale_kv_a_proj_with_mqa,
-            smooth_scales=smooth_scales,
-        )
-    elif impl == "torch":
-        return mla_prologue_torch(
-            x=x,
-            q_a_proj_weight=q_a_proj_weight,
-            q_b_proj_weight=q_b_proj_weight,
-            kv_b_proj_absorb_1_weight=kv_b_proj_absorb_1_weight,
-            kv_a_proj_with_mqa_weight=kv_a_proj_with_mqa_weight,
-            q_a_layernorm_weight=q_a_layernorm_weight,
-            kv_a_layernorm_weight=kv_a_layernorm_weight,
-            freqs_cis=freqs_cis,
-            q_a_layernorm_eps=q_a_layernorm_eps,
-            kv_a_layernorm_eps=kv_a_layernorm_eps,
-        )
-    else:
-        raise ValueError(f"Invalid mla_prologue implementation: {impl}")
+    raise NotImplementedError
 
 
+@mla_prologue.register_auto
+def _auto_mla_prologue(
+    x,
+    q_a_proj_weight,
+    q_b_proj_weight,
+    kv_b_proj_absorb_1_weight,
+    kv_a_proj_with_mqa_weight,
+    q_a_layernorm_weight,
+    kv_a_layernorm_weight,
+    freqs_cis,
+    q_a_layernorm_eps,
+    kv_a_layernorm_eps,
+    dequant_scale_x=None,
+    dequant_scale_q_a_proj=None,
+    dequant_scale_q_b_proj=None,
+    dequant_scale_kv_a_proj_with_mqa=None,
+    smooth_scales=None,
+):
+    if (
+        has_torch_npu
+        and (x.dtype == torch.bfloat16 or x.dtype == torch.int8)
+        and x.shape[-1] == 7168
+        and q_a_layernorm_weight.shape[0] == 1536
+        and kv_b_proj_absorb_1_weight.shape[0] in [8, 16, 32, 64, 128]
+        and kv_a_layernorm_weight.shape[0] == 512
+        and kv_b_proj_absorb_1_weight.shape[2] == 128
+        and freqs_cis.cos.shape[-1] * 2 == 64
+        and isinstance(q_a_proj_weight, NpuFractalZnTensor)
+        and isinstance(q_b_proj_weight, NpuFractalZnTensor)
+        and isinstance(kv_b_proj_absorb_1_weight, PermutedTensor)
+        and tuple(kv_b_proj_absorb_1_weight.perm) == (0, 2, 1)
+        and isinstance(kv_a_proj_with_mqa_weight, NpuFractalZnTensor)
+    ):
+        return "torch_npu"
+    if (
+        isinstance(q_a_proj_weight, torch.Tensor)
+        and isinstance(q_b_proj_weight, torch.Tensor)
+        and isinstance(kv_b_proj_absorb_1_weight, torch.Tensor)
+        and isinstance(kv_a_proj_with_mqa_weight, torch.Tensor)
+    ):
+        return "torch"
+    raise NotImplementedError("No supported implementation found for mla_prologue")
+
+
+@mla_prologue.register("torch")
 def mla_prologue_torch(
     x: torch.Tensor,
     q_a_proj_weight: torch.Tensor,
@@ -121,9 +101,35 @@ def mla_prologue_torch(
     freqs_cis: BatchedFreqsCis,
     q_a_layernorm_eps: float,
     kv_a_layernorm_eps: float,
+    dequant_scale_x=None,
+    dequant_scale_q_a_proj=None,
+    dequant_scale_q_b_proj=None,
+    dequant_scale_kv_a_proj_with_mqa=None,
+    smooth_scales=None,
 ) -> tuple[
     torch.Tensor, torch.Tensor | NativeLayoutTensor, torch.Tensor | NativeLayoutTensor
 ]:  # q_nope, q_pe, kv
+    if dequant_scale_x is not None:
+        raise NotImplementedError(
+            "dequant_scale_x is not supported for mla_prologue_torch"
+        )
+    if dequant_scale_q_a_proj is not None:
+        raise NotImplementedError(
+            "dequant_scale_q_a_proj is not supported for mla_prologue_torch"
+        )
+    if dequant_scale_q_b_proj is not None:
+        raise NotImplementedError(
+            "dequant_scale_q_b_proj is not supported for mla_prologue_torch"
+        )
+    if dequant_scale_kv_a_proj_with_mqa is not None:
+        raise NotImplementedError(
+            "dequant_scale_kv_a_proj_with_mqa is not supported for mla_prologue_torch"
+        )
+    if smooth_scales is not None:
+        raise NotImplementedError(
+            "smooth_scales is not supported for mla_prologue_torch"
+        )
+
     assert isinstance(q_a_proj_weight, torch.Tensor)
     assert isinstance(q_b_proj_weight, torch.Tensor)
     assert isinstance(kv_b_proj_absorb_1_weight, torch.Tensor)
@@ -169,6 +175,7 @@ def mla_prologue_torch(
     return q_nope, q_pe, kv
 
 
+@mla_prologue.register("torch_npu", available=has_torch_npu)
 def mla_prologue_torch_npu(
     x: torch.Tensor,
     q_a_proj_weight: NpuFractalZnTensor,  # a.k.a. weight_dq

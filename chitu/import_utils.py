@@ -72,7 +72,7 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> tuple[Any, bool]:
         "fla",
         "flash_mla",
         "deep_gemm",
-        "deep_ep",  # [TODO] add installation support
+        "deep_ep",
         "cpu",
         "hard_fp4_kernels",
         "scipy",
@@ -82,6 +82,7 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> tuple[Any, bool]:
         "metax_soft_fp4_kernels",
         "sugon_mixq4_kernels",
         "sugon_w4a8_kernels",
+        "mooncake",
     }
     assert (
         opt_dep_name in opt_deps

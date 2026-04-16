@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
+from typing import Optional, Callable
 
 import torch
 import triton
@@ -18,8 +18,12 @@ def append_to_paged_kv_cache_triton(
     this_kv: torch.Tensor,  # (num_tokens, other contiguous dims...)
     delta_position_ids: torch.Tensor,  # (num_tokens,)
     delta_seq_ids: Optional[torch.Tensor] = None,  # (num_tokens,)
+    get_page_ids: Optional[Callable[[], torch.Tensor]] = None,
+    get_offs_in_page: Optional[Callable[[], torch.Tensor]] = None,
     use_i64_offsets: bool = False,
 ):
+    # NOTE: get_page_ids and get_offs_in_page does not benefit this implementation
+
     if delta_seq_ids is None and page_table.shape[0] != delta_position_ids.shape[0]:
         raise ValueError(
             f"batch_size ({page_table.shape[0]}) must be equal to num_tokens "

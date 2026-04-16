@@ -6,13 +6,14 @@ from typing import Optional
 import torch
 
 from chitu.device_type import has_accelerator
-from chitu.ops.utils import compatible_with_inplace
+from chitu.ops.utils import compatible_with_inplace, make_op_dispatcher
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+has_triton_impl = has_triton and has_accelerator()
 
-if has_triton and has_accelerator():
+if has_triton_impl:
     from chitu.ops.triton_ops import (
         moe_sum_per_token_triton,
         moe_sum_expert_block_permuted_triton,
@@ -20,6 +21,7 @@ if has_triton and has_accelerator():
     )
 
 
+@make_op_dispatcher
 def moe_sum_per_token(
     x: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -38,26 +40,28 @@ def moe_sum_per_token(
     Returns:
         [batch_size, hidden_size]. Summed activation.
     """
-
-    if impl == "auto":
-        if has_triton:
-            impl = "triton"
-        else:
-            impl = "torch"
-
-    if impl == "triton":
-        return moe_sum_per_token_triton(x, topk_weights, out=out)
-    elif impl == "torch":
-        return moe_sum_per_token_torch(x, topk_weights, out=out)
-    else:
-        raise ValueError(f"Unknown implementation: {impl}")
+    raise NotImplementedError
 
 
+@moe_sum_per_token.register_auto
+def _auto_moe_sum_per_token():
+    if has_triton_impl:
+        return "triton"
+    return "torch"
+
+
+moe_sum_per_token.register_candidate("triton")
+if has_triton_impl:
+    moe_sum_per_token.register("triton")(moe_sum_per_token_triton)
+
+
+@moe_sum_per_token.register("torch")
 @compatible_with_inplace
 def moe_sum_per_token_torch(x: torch.Tensor, topk_weights: torch.Tensor):
     return (x * topk_weights.unsqueeze(-1)).sum(dim=1)
 
 
+@make_op_dispatcher
 def moe_sum_expert_block_permuted(
     x: torch.Tensor,
     token_comma_topk_to_block_x_item_indices: torch.Tensor,
@@ -78,25 +82,24 @@ def moe_sum_expert_block_permuted(
     Returns:
         [batch_size, hidden_size]. Summed activation.
     """
-
-    if impl == "auto":
-        if has_triton:
-            impl = "triton"
-        else:
-            impl = "torch"
-
-    if impl == "triton":
-        return moe_sum_expert_block_permuted_triton(
-            x, token_comma_topk_to_block_x_item_indices, topk_weights, out=out
-        )
-    elif impl == "torch":
-        return moe_sum_expert_block_permuted_torch(
-            x, token_comma_topk_to_block_x_item_indices, topk_weights, out=out
-        )
-    else:
-        raise ValueError(f"Unknown implementation: {impl}")
+    raise NotImplementedError
 
 
+@moe_sum_expert_block_permuted.register_auto
+def _auto_moe_sum_expert_block_permuted():
+    if has_triton_impl:
+        return "triton"
+    return "torch"
+
+
+moe_sum_expert_block_permuted.register_candidate("triton")
+if has_triton_impl:
+    moe_sum_expert_block_permuted.register("triton")(
+        moe_sum_expert_block_permuted_triton
+    )
+
+
+@moe_sum_expert_block_permuted.register("torch")
 @compatible_with_inplace
 def moe_sum_expert_block_permuted_torch(
     x: torch.Tensor,
@@ -117,6 +120,7 @@ def moe_sum_expert_block_permuted_torch(
     ).sum(dim=1)
 
 
+@make_op_dispatcher
 def moe_sum_per_expert_dense(
     activation_per_expert: torch.Tensor,
     token_to_expert_indices: torch.Tensor,
@@ -139,34 +143,22 @@ def moe_sum_per_expert_dense(
     Returns:
         [batch_size, hidden_size]. Summed activation.
     """
-
-    if impl == "auto":
-        if has_triton:
-            impl = "triton"
-        else:
-            impl = "ref"
-
-    if impl == "triton":
-        return moe_sum_per_expert_dense_triton(
-            activation_per_expert,
-            token_to_expert_indices,
-            token_pos_in_expert,
-            topk_weights,
-            out=out,
-        )
-    elif impl == "ref":
-        return moe_sum_per_expert_dense_ref(
-            activation_per_expert,
-            token_to_expert_indices,
-            token_pos_in_expert,
-            topk_weights,
-            out=out,
-        )
-    else:
-        raise ValueError(f"Unknown implementation: {impl}")
+    raise NotImplementedError
 
 
-@compatible_with_inplace
+@moe_sum_per_expert_dense.register_auto
+def _auto_moe_sum_per_expert_dense():
+    if has_triton_impl:
+        return "triton"
+    return "ref"
+
+
+moe_sum_per_expert_dense.register_candidate("triton")
+if has_triton_impl:
+    moe_sum_per_expert_dense.register("triton")(moe_sum_per_expert_dense_triton)
+
+
+@moe_sum_per_expert_dense.register("ref")
 def moe_sum_per_expert_dense_ref(
     activation_per_expert: torch.Tensor,
     token_to_expert_indices: torch.Tensor,
@@ -197,6 +189,7 @@ def moe_sum_per_expert_dense_ref(
     return moe_sum_per_token(gathered, topk_weights, out=out)
 
 
+@make_op_dispatcher
 def moe_sum_expert_concat_permuted(
     x: torch.Tensor,
     token_comma_topk_to_concat_indices: torch.Tensor,
@@ -222,57 +215,17 @@ def moe_sum_expert_concat_permuted(
     Returns:
         [batch_size, hidden_size]. Summed activation.
     """
-
-    if impl == "auto":
-        if has_torch_npu:
-            impl = "torch_npu"
-        else:
-            impl = "torch"
-
-    if impl == "torch_npu":
-        return moe_sum_expert_concat_permuted_torch_npu(
-            x,
-            token_comma_topk_to_concat_indices,
-            topk_weights,
-            indices_maybe_invalid=indices_maybe_invalid,
-            inplace=inplace,
-            out=out,
-        )
-    elif impl == "torch":
-        return moe_sum_expert_concat_permuted_torch(
-            x,
-            token_comma_topk_to_concat_indices,
-            topk_weights,
-            indices_maybe_invalid=indices_maybe_invalid,
-            inplace=inplace,
-            out=out,
-        )
-    else:
-        raise ValueError(f"Unknown implementation: {impl}")
+    raise NotImplementedError
 
 
-@compatible_with_inplace
-def moe_sum_expert_concat_permuted_torch(
-    x: torch.Tensor,
-    token_comma_topk_to_concat_indices: torch.Tensor,
-    topk_weights: torch.Tensor,
-    *,
-    indices_maybe_invalid: bool = True,
-    inplace: bool = True,
-):
-    batch_size, topk = token_comma_topk_to_concat_indices.shape
-    hidden = x.shape[-1]
-    if indices_maybe_invalid:
-        token_comma_topk_hidden = torch.where(
-            token_comma_topk_to_concat_indices.view(batch_size, topk, 1) >= 0,
-            x[torch.clamp(token_comma_topk_to_concat_indices, min=0)],
-            torch.zeros(batch_size, topk, hidden, device=x.device, dtype=x.dtype),
-        )
-    else:
-        token_comma_topk_hidden = x[token_comma_topk_to_concat_indices]
-    return (token_comma_topk_hidden * topk_weights.unsqueeze(-1)).sum(dim=1)
+@moe_sum_expert_concat_permuted.register_auto
+def _auto_moe_sum_expert_concat_permuted():
+    if has_torch_npu:
+        return "torch_npu"
+    return "torch"
 
 
+@moe_sum_expert_concat_permuted.register("torch_npu")
 @compatible_with_inplace
 def moe_sum_expert_concat_permuted_torch_npu(
     x: torch.Tensor,
@@ -303,3 +256,26 @@ def moe_sum_expert_concat_permuted_torch_npu(
         export_for_source_row=None,
         drop_pad_mode=2,
     )
+
+
+@moe_sum_expert_concat_permuted.register("torch")
+@compatible_with_inplace
+def moe_sum_expert_concat_permuted_torch(
+    x: torch.Tensor,
+    token_comma_topk_to_concat_indices: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    indices_maybe_invalid: bool = True,
+    inplace: bool = True,
+):
+    batch_size, topk = token_comma_topk_to_concat_indices.shape
+    hidden = x.shape[-1]
+    if indices_maybe_invalid:
+        token_comma_topk_hidden = torch.where(
+            token_comma_topk_to_concat_indices.view(batch_size, topk, 1) >= 0,
+            x[torch.clamp(token_comma_topk_to_concat_indices, min=0)],
+            torch.zeros(batch_size, topk, hidden, device=x.device, dtype=x.dtype),
+        )
+    else:
+        token_comma_topk_hidden = x[token_comma_topk_to_concat_indices]
+    return (token_comma_topk_hidden * topk_weights.unsqueeze(-1)).sum(dim=1)
