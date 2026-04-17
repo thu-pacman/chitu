@@ -131,6 +131,31 @@ class BatchedSeqLen:
         invalidate_cached_property(self, "total_len")
         invalidate_cached_property(self, "max_len")
 
+    def copy_from_tensor(self, lens_tensor: torch.Tensor):
+        """Copy from a tensor instead of a list.
+
+        Args:
+            lens_tensor: Tensor of sequence lengths [batch_size], must be on same device.
+        """
+        assert (
+            lens_tensor.device == self.device
+        ), f"Device mismatch: {lens_tensor.device} vs {self.device}"
+        self.lens_list = lens_tensor.tolist()
+        self.lens_static_tensor_device.set(lens_tensor.to(torch.int32))
+
+        if self.cache_prefix_lens_tensor_device:
+            self._prefix_lens_tensor_device_up_to_date = False
+        if self.cache_position_ids_tensor_device:
+            self._position_ids_tensor_device_up_to_date = False
+        if self.cache_seq_ids_tensor_device:
+            self._seq_ids_tensor_device_up_to_date = False
+
+        invalidate_cached_property(self, "lens_tensor_cpu")
+        invalidate_cached_property(self, "prefix_lens_list")
+        invalidate_cached_property(self, "batch_size")
+        invalidate_cached_property(self, "total_len")
+        invalidate_cached_property(self, "max_len")
+
     def copy_from(self, other: "BatchedSeqLen"):
         assert (
             self.device == other.device
@@ -369,6 +394,23 @@ class BatchedSeqLenDelta:
         self._delta.copy_from_list(
             [x - y for x, y in zip(self.new.lens_list, self.old.lens_list)]
         )
+        self.is_classic_decoding = all(x > 0 for x in self.old.lens_list) and all(
+            (x + 1 == y for x, y in zip(self.old.lens_list, self.new.lens_list))
+        )
+        self._delta_position_ids_tensor_device_up_to_date = False
+
+    def copy_from_tensor(
+        self, old_len_tensor: torch.Tensor, new_len_tensor: torch.Tensor
+    ):
+        """Copy from tensors instead of lists.
+
+        Args:
+            old_len_tensor: Tensor of old sequence lengths [batch_size]
+            new_len_tensor: Tensor of new sequence lengths [batch_size]
+        """
+        self.old.copy_from_tensor(old_len_tensor)
+        self.new.copy_from_tensor(new_len_tensor)
+        self._delta.copy_from_tensor(new_len_tensor - old_len_tensor)
         self.is_classic_decoding = all(x > 0 for x in self.old.lens_list) and all(
             (x + 1 == y for x, y in zip(self.old.lens_list, self.new.lens_list))
         )

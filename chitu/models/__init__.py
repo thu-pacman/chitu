@@ -13,5 +13,6 @@ from chitu.models import model_hf_glm_4_moe  # NOQA
 from chitu.models import model_hf_gpt_oss  # NOQA
 from chitu.models import model_hf_mixtral  # NOQA
 from chitu.models import model_llama  # NOQA
+from chitu.models import model_llada2  # NOQA
 from chitu.models import model_hf_qwen3_5  # NOQA
 from chitu.models import model_kimi_k25  # NOQA

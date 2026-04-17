@@ -43,6 +43,7 @@ class ServeConfigRules(Callback):
             "flash_attn",
             "flash_mla",
             "flash_infer",
+            "dllm",
             "triton",
             "npu",
             "hopper_mixed",

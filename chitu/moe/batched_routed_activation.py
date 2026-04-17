@@ -545,7 +545,7 @@ class PerExpertDenseBatchedRoutedActivation(
     def convert_from(
         cls, old: IndexedBatchedRoutedActivation, *, num_experts: int
     ) -> "PerExpertDenseBatchedRoutedActivation":
-        (activation_per_expert, n_tokens_per_expert, token_pos_in_expert) = (
+        activation_per_expert, n_tokens_per_expert, token_pos_in_expert = (
             batched_routed_activation_indexed_to_per_expert_dense(
                 old.activation, old.token_to_expert_indices, num_experts=num_experts
             )

@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: LLaDA2.1-mini
+type: llada2
+source: "https://huggingface.co/inclusionAI/LLaDA2.0-mini" # Just for displaying. No automatic download.
+tokenizer_type: "hf" # one of: hf, tiktoken
+chatformat_type: "llada" # one of: hf, tiktoken, llada
+
+dim: 2048
+n_layers: 20
+n_dense_layers: 1
+n_heads: 16
+n_kv_heads: 4
+n_group: 8
+vocab_size: 157184
+intermediate_dim: 5120
+max_position_embeddings: 32768
+moe_intermediate_dim: 512
+num_experts: 256
+num_experts_per_tok: 8
+num_shared_experts: 1
+norm_topk_prob: True
+norm_eps: 1e-06
+rms_norm_dtype: bfloat16
+rope_theta: 600000
+topk_group: 4
+routed_scaling_factor: 2.5
+qkv_has_bias: False
+head_dim: 128
+pad_token_id: 156892
+use_qk_norm: True

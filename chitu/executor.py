@@ -17,6 +17,7 @@ import torch.distributed
 
 from chitu.backend import Backend, BackendState
 from chitu.global_vars import get_global_args, get_slot_handle, get_timers
+from chitu.models.registry import ModelType
 from chitu.task import (
     PackedTasks,
     PackedTasksBase,
@@ -771,6 +772,10 @@ class Executor:
             self.dp_dispatcher = ExpertDataDispatcher(self.device, weakref.ref(self))
             self._prepend_dispatcher(self.dp_dispatcher)
 
+        self.is_main_rank = self.tp_size <= 1 or (
+            self.tp_group is not None and self.tp_group.is_first_rank
+        )
+
         if self.rank == 0 or self.dp_dispatcher:
             # PP 下的循环节长度为 pp_size
             # 需要接收 pp_size-1 步前的结果
@@ -811,6 +816,7 @@ class Executor:
         self.specialize_embed_tokens_lm_head_parallel = (
             self.tp_size == 1 and self.embed_tokens_lm_head_tp_size > 1
         )
+        self.model_type = args.models.type
 
         # PD disaggregation: Prefill-only mode not sample tokens on the Prefill side.
         #
@@ -836,6 +842,7 @@ class Executor:
         self._lb_enabled = self._lb_planner is not None
         self._lb_every = args.infer.moe_lb_trigger
         self._lb_step = 0
+        self._pending_dllm_block = None
 
         if self.is_sample_stage:
             self.sampler = Sampler()
@@ -889,6 +896,19 @@ class Executor:
             device=self.device,
             dtype=torch.long,
         )
+
+    def _prepare_blocks_for_decode_dllm(self, tasks: PackedTasks) -> torch.Tensor:
+        """Prepare payload as concatenated blocks for DLLM decode. Each task's next_block is [block_length] tokens."""
+        block_length = get_global_args().infer.dllm_block_length
+        blocks = []
+        for task in tasks.tasks:
+            if task.next_block is not None:
+                blocks.extend(task.next_block)
+            else:
+                # Fallback: mask block if not set (e.g. from DP bootstrap)
+                mask_id = Backend.model.decoder.mask_id
+                blocks.extend([mask_id] * block_length)
+        return torch.tensor(blocks, device=self.device, dtype=torch.long)
 
     def _prepare_lhs_for_decode(self, tasks: PackedTasks):
         return torch.cat([task._last_hidden_states for task in tasks.tasks], dim=0)
@@ -979,7 +999,11 @@ class Executor:
         for dispatcher in self.task_dispatchers:
             payload_type, tasks = dispatcher.dispatch_metadata(tasks)
 
-        if tasks is not None and tasks.task_type in (TaskType.Prefill, TaskType.Decode):
+        if (
+            tasks is not None
+            and tasks.task_type == TaskType.Prefill
+            or tasks.task_type == TaskType.Decode
+        ):
             self.last_profile_task_type = tasks.task_type
 
         if payload_type == SerializedPackedTasksPayloadType.TerminateBackend:
@@ -1027,9 +1051,17 @@ class Executor:
             )
 
         if tasks.task_type == TaskType.Prefill:
-            out = self.prefill_step(tasks)
+            out = (
+                self.prefill_step(tasks)
+                if self.model_type != ModelType.LLADA2
+                else self.prefill_dllm_step(tasks)
+            )
         elif tasks.task_type == TaskType.Decode:
-            out = self.decode_step(tasks)
+            out = (
+                self.decode_step(tasks)
+                if self.model_type != ModelType.LLADA2
+                else self.decode_dllm_step(tasks)
+            )
         else:
             raise NotImplementedError
 
@@ -1054,7 +1086,11 @@ class Executor:
 
         # 3. sample
         tokens = None
-        if self.is_sample_stage and len(tasks.output_tasks) > 0:
+        if (
+            self.is_sample_stage
+            and len(tasks.output_tasks) > 0
+            and self.model_type != ModelType.LLADA2
+        ):
             tokens = self.sampler.sample(out, tasks.output_tasks)
             if tasks.return_logprobs:
                 logprobs = torch.log_softmax(out, dim=-1)
@@ -1064,6 +1100,10 @@ class Executor:
             tasks.generated_result = tasks.pack_result(
                 tokens, logprobs, token_idxs, out
             )
+
+        # For DLLM: convert finished block results into BatchResults
+        if self.model_type == ModelType.LLADA2:
+            self._process_dllm_block_results()
 
         # Notify KV transfer hook after prefill completes.
         if tasks.task_type == TaskType.Prefill:
@@ -1250,13 +1290,236 @@ class Executor:
 
             return self.dummy_output
 
-    def postprocess_before_sync(self, tasks: PackedTasks):
+    def prefill_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
+        is_empty_step = tasks.num_tasks == 0
+        block_length = get_global_args().infer.dllm_block_length
+        num_tokens = tasks.num_tokens
+        prefilling_lengths: list[int] = []
+
+        if not is_empty_step:
+            for it, task_id in enumerate(tasks.task_ids):
+                non_mask_number = len(tasks.tokens[it])
+                decoding_start = min(
+                    ((non_mask_number) // block_length) * block_length, 1024
+                )
+                prefilling_lengths.append(decoding_start)
+
+            for cache in Backend.cache_dict.values():
+                if hasattr(cache, "prepare_cache_prefill_dllm"):
+                    cache.prepare_cache_prefill_dllm(tasks, prefilling_lengths)
+            PrometheusMetricsCollector.update_kvcache_usage()
+        else:
+            for dispatcher in self.task_dispatchers:
+                dispatcher.recv_payload(self.dummy_logits)
+
+        # Update task.decoding_start on main rank
+        if (
+            not is_empty_step
+            and isinstance(tasks, PackedTasks)
+            and (self.tp_size <= 1 or self.is_main_rank)
+        ):
+            for it, task in enumerate(tasks.tasks):
+                task.decoding_start = prefilling_lengths[it] + task.consumed_req_tokens
+
+        max_prefilling_length = max(prefilling_lengths) if prefilling_lengths else 0
+        if is_empty_step or max_prefilling_length == 0:
+            return self.dummy_output
+
+        batch_size = tasks.num_tasks
+
+        # Build ragged token tensor
+        if (self.rank == 0 and num_tokens > 0) or (
+            self.dp_size > 1 and self.pp_stage == 0
+        ):
+            payload = (
+                torch.from_numpy(
+                    np.concatenate(
+                        [
+                            tasks.tokens[i][: prefilling_lengths[i]]
+                            for i in range(batch_size)
+                        ]
+                    )
+                )
+                .to(self.device)
+                .to(torch.int64)
+            )
+        else:
+            payload = torch.empty(
+                sum(prefilling_lengths),
+                dtype=self.get_payload_dtype(),
+                device=self.device,
+            )
+        for dispatcher in self.task_dispatchers:
+            payload = dispatcher.recv_payload(payload)
+
+        # Cumulative offsets for extracting each sequence's last token
+        plen_tensor = torch.tensor(
+            prefilling_lengths, device=self.device, dtype=torch.long
+        )
+        output_token_offsets = torch.cumsum(plen_tensor, dim=0) - 1
+
+        logits = Backend.model.prefill_dllm(
+            payload,
+            output_token_offsets,
+            prefilling_lengths=prefilling_lengths,
+        )
+
+        torch.cuda.synchronize()
+        return logits
+
+    def decode_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
+        """DLLM decode: payload is the full block per task, forward + batch_decode + update state."""
+        if tasks.num_tasks == 0:
+            return self.dummy_output
+        if self.tp_size <= 1 and not isinstance(tasks, PackedTasks):
+            return self.dummy_output
+
+        decoder = Backend.model.decoder
+        block_length = get_global_args().infer.dllm_block_length
+        mask_id, eos_id = decoder.mask_id, decoder.eos_id
+        batch_size = tasks.num_tasks
+
+        # 1) Get decoding_start tensor (broadcast for TP>1)
+        if self.tp_size > 1:
+            tp_group = get_tp_group()
+            if isinstance(tasks, PackedTasks):
+                decoding_start = torch.tensor(
+                    [getattr(t, "decoding_start", 0) for t in tasks.tasks],
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            else:
+                decoding_start = torch.empty(
+                    batch_size, device=self.device, dtype=torch.long
+                )
+            torch.distributed.broadcast(
+                decoding_start, src=tp_group.rank_list[0], group=tp_group.gpu_group
+            )
+        else:
+            decoding_start = torch.tensor(
+                [getattr(t, "decoding_start", 0) for t in tasks.tasks],
+                device=self.device,
+                dtype=torch.long,
+            )
+
+        # 2) Prepare payload
+        if (
+            self.is_main_rank or (self.dp_size > 1 and self.dp_dispatcher is not None)
+        ) and isinstance(tasks, PackedTasks):
+            payload = self._prepare_blocks_for_decode_dllm(tasks)
+        else:
+            payload = torch.empty(
+                [batch_size * block_length], dtype=torch.long, device=self.device
+            )
+        for dispatcher in self.task_dispatchers:
+            payload = dispatcher.recv_payload(payload)
+
+        # 3) Prepare cache
+        self._kv_hook.before_decode_step(tasks.req_ids)
+        for cache in Backend.cache_dict.values():
+            if hasattr(cache, "prepare_cache_decode_dllm"):
+                cache.prepare_cache_decode_dllm(tasks, decoding_start, block_length)
+        PrometheusMetricsCollector.update_kvcache_usage()
+
+        # 4-6) Loop forward + batch_decode until at least one block is fully decoded.
+        total_len = decoding_start.max().item() + block_length
+        col_indices = torch.arange(block_length, device=self.device).unsqueeze(
+            0
+        ) + decoding_start.unsqueeze(1)
+
+        for _dllm_iter in range(block_length):
+            decoding_block = payload.view(batch_size, block_length)
+            logits = Backend.model.decode_dllm(
+                decoding_block.flatten(),
+                decoding_start=decoding_start,
+                block_length=block_length,
+            )
+            if logits.shape[0] != batch_size:
+                logits = logits[:batch_size, ...]
+
+            tokens = torch.full(
+                (batch_size, total_len), mask_id, dtype=torch.long, device=self.device
+            )
+            tokens.scatter_(1, col_indices, decoding_block)
+            decoder.batch_decode(logits, decoding_start, tokens, block_length)
+
+            decoded_blocks = tokens.gather(1, col_indices)
+            block_finished = (decoded_blocks == mask_id).sum(dim=1) == 0
+
+            if block_finished.any():
+                break
+
+            payload = decoded_blocks.flatten()
+
+        torch.cuda.synchronize()
+
+        # 7) Finalize cache
+        for mgr in Backend.cache_dict.values():
+            if hasattr(mgr, "finalize_cache_single_decode_dllm"):
+                mgr.finalize_cache_single_decode_dllm(
+                    tasks.req_ids, block_finished, block_length
+                )
+
+        # 8) Update task state (main rank only)
+        if self.is_main_rank and isinstance(tasks, PackedTasks):
+            has_eos = (decoded_blocks == eos_id).any(dim=1)
+            has_eos_list = has_eos.cpu().tolist()
+
+            block_finished_tasks, block_tokens_tensors, block_skip_prompt_tokens = (
+                [],
+                [],
+                [],
+            )
+            for i, task in enumerate(tasks.tasks):
+                block_slice = decoded_blocks[i]
+                task.next_block = block_slice.cpu().tolist()
+
+                if block_finished[i]:
+                    ds_i = decoding_start[i].item()
+                    skip = max(0, min(task.prompt_len, ds_i + block_length) - ds_i)
+                    block_skip_prompt_tokens.append(skip)
+                    task.decoding_start += block_length
+                    block_finished_tasks.append(task)
+                    block_tokens_tensors.append(block_slice.clone())
+
+                    if has_eos_list[i]:
+                        task.stopped = True
+                        if task.req is not None:
+                            task.req.finish_reason = "stop"
+                    elif (
+                        task.req is not None
+                        and task.req.num_output_tokens + block_length
+                        >= task.req.max_new_tokens
+                    ):
+                        task.stopped = True
+                        task.req.finish_reason = "length"
+                    task.next_block = None
+
+            if block_finished_tasks:
+                block_tasks = PackedTasks([], tasks=block_finished_tasks)
+                block_tasks.generated_result = torch.stack(block_tokens_tensors)
+                block_tasks.skip_prompt_tokens = block_skip_prompt_tokens
+                self._pending_dllm_block = block_tasks
+            else:
+                self._pending_dllm_block = None
+        else:
+            self._pending_dllm_block = None
+
+        for dispatcher in self.task_dispatchers:
+            dispatcher.send_payload(logits[:, -1, :], tasks)
+        return logits[:, -1, :]
+
+    def postprocess_before_sync(self, tasks: PackedTasksBase):
         """
         This part is always after sample and before sync.
         Can use to store data to task before sync.
         """
         # mtp
-        if self.mtp_size > 1 and (self.rank == 0 or self.dp_dispatcher):
+        if (
+            isinstance(tasks, PackedTasks)
+            and self.mtp_size > 1
+            and (self.rank == 0 or self.dp_dispatcher)
+        ):
             for it, task in enumerate(tasks.tasks):
                 task.num_new_tokens_single_step = (
                     1
@@ -1271,6 +1534,55 @@ class Executor:
                 task._last_hidden_states = (
                     Backend.model.last_hidden_states_4_postprocess[it : it + 1, :]
                 )
+
+    def _process_dllm_block_results(self):
+        """Push finished DLLM block tokens directly to user requests.
+
+        Bypasses the BatchResult queue so all tokens in a block are delivered
+        before req.finish() is called.  Using the queue would trigger finish()
+        on the very first add_data() call (because will_finish / stopped is
+        already set), silently dropping the remaining block tokens.
+        """
+        if torch.distributed.get_rank() > 0:
+            self._pending_dllm_block = None
+            return
+        block_tasks = self._pending_dllm_block
+        self._pending_dllm_block = None
+        if block_tasks is None:
+            return
+        result = block_tasks.generated_result
+        if result is None:
+            return
+        result = result.cpu()
+        block_length = result.shape[1]
+        tasks_list = block_tasks.tasks
+        skip_prompt_tokens = getattr(
+            block_tasks, "skip_prompt_tokens", [0] * len(tasks_list)
+        )
+
+        # Step 1: stream every token in the block to the request stream,
+        #         notify_server=False so we batch the wake-up below.
+        #         Skip prompt tokens (only output newly generated tokens).
+        for i, task in enumerate(tasks_list):
+            skip = skip_prompt_tokens[i]
+            if skip >= block_length:
+                continue
+            tokens_to_output = result[i, skip:].tolist()
+            for token in tokens_to_output:
+                task.update_response_sync(token)
+            if task.req is not None:
+                task.req.add_data(tokens_to_output, notify_server=False)
+
+        # Step 2: now that ALL tokens have been added, finish stopped tasks
+        #         (finish() sends the stop signal + notifies the server).
+        #         For tasks still decoding, notify the server explicitly.
+        for task in tasks_list:
+            if task.req is None:
+                continue
+            if task.stopped and not task.req.finished:
+                task.req.finish()
+            else:
+                task.req.notify_server_data_added_threadsafe()
 
     def postprocess_sync_part(self, tasks: PackedTasksBase):
         """
@@ -1362,9 +1674,10 @@ class Executor:
                         if self.dp_size <= 1
                         else DPTaskCollector.get_total_packedtasks()
                     )
-                    for task in all_current_tasks.tasks:
-                        task.has_unsync_new_token = True
-                        task.update_decode_status()
+                    if isinstance(all_current_tasks, PackedTasks):
+                        for task in all_current_tasks.tasks:
+                            task.has_unsync_new_token = True
+                            task.update_decode_status()
                     TaskCollector.set_update_task_ids(
                         list(set(collect_tasks.task_ids + all_current_tasks.task_ids))
                     )

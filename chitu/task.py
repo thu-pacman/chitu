@@ -16,10 +16,11 @@ import random
 
 import torch
 
-from chitu.task_type import TaskType
+from chitu.models.registry import ModelType
 from chitu.async_stream import AsyncDataStream
 from chitu.backend import Backend
 from chitu.global_vars import get_slot_handle, get_global_args
+from chitu.task_type import TaskType
 from chitu.tool_call import (
     ToolCallParams,
     ToolConfig,
@@ -349,6 +350,7 @@ class Task:
         grammar_str: str = "",
         priority: int = 1,
         stop_with_eos: bool = True,
+        block_length: int = 32,
     ):
         logger.debug(f"Create Task {task_id} with priority {priority}")
 
@@ -376,6 +378,12 @@ class Task:
         self._prefix_tokens_base_len = (
             self.prompt_len if (self.prefix_tokens == [] and self.prompt_len) else 0
         )
+
+        ## for DLLM task
+        self.decoding_start = 0
+        # DLLM decode: payload is the full block (not single token). Set when transitioning prefill->decode.
+        self.next_block: Optional[list[int]] = None
+        self.block_length = block_length
 
         # Request
         self.req = req
@@ -711,7 +719,25 @@ class Task:
 
             if self.req is not None:
                 self.req.prefill_end_time = time.monotonic()
-
+            if (
+                hasattr(Backend.args, "models")
+                and Backend.args.models.type == ModelType.LLADA2
+            ):
+                self.next_block = self.prefix_tokens[
+                    self.decoding_start : self.decoding_start + self.block_length
+                ]
+                # 如果 next_block 不足 block_length，则用 mask_id 补足
+                if (
+                    self.next_block is not None
+                    and len(self.next_block) < self.block_length
+                ):
+                    pad_len = self.block_length - len(self.next_block)
+                    decoder = getattr(Backend.model, "decoder", None)
+                    if decoder is not None:
+                        mask_id = decoder.mask_id
+                    else:
+                        mask_id = 0  # Fallback, ideally should never hit
+                    self.next_block = self.next_block + [mask_id] * pad_len
             logger.debug(
                 f"[task.consume] task={self.task_id} prefill->decode "
                 f"consumed={self.consumed_req_tokens}/{self.prefix_tokens_len}"
@@ -743,8 +769,18 @@ class Task:
                 return self.consumed_req_tokens
             else:
                 # 尚未进行推理，但可能被prefix caching击中
-                return self.num_cached_blocks * self.token_blocks[0].blk_size
+                return (
+                    self.num_cached_blocks * self.token_blocks[0].blk_size
+                    if self.token_blocks
+                    else 0
+                )
         elif self.task_type == TaskType.Decode:
+            # For DLLM decode, use decoding_start as cached length
+            if (
+                hasattr(Backend.args, "models")
+                and Backend.args.models.type == ModelType.LLADA2
+            ):
+                return self.decoding_start
             return self.prefix_tokens_len - 1
         else:
             assert False
@@ -755,6 +791,15 @@ class Task:
         if self.task_type == TaskType.Prefill:
             return self.consumed_req_tokens + self.next_req_tokens_len
         elif self.task_type == TaskType.Decode:
+            # For DLLM decode, need decoding_start + block_length
+            if (
+                hasattr(Backend.args, "models")
+                and Backend.args.models.type == ModelType.LLADA2
+            ):
+                return min(
+                    self.decoding_start + self.block_length,
+                    get_global_args().infer.max_seq_len,
+                )
             return min(
                 self.prefix_tokens_len - 1 + get_global_args().infer.mtp_size,
                 get_global_args().infer.max_seq_len,
