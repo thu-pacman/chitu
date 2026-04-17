@@ -36,6 +36,8 @@
 | glm-z1-9b |  | `models=GLM-Z1-9B-0414` | https://modelscope.cn/models/ZhipuAI/GLM-Z1-9B-0414 |
 | Kimi-K2-Instruct |  | `models=Kimi-K2-Instruct` | https://huggingface.co/moonshotai/Kimi-K2-Instruct |
 | Kimi-K2.5 |  | `models=Kimi-K2.5` | https://huggingface.co/moonshotai/Kimi-K2.5 |
+| LLaDA2.1-flash |  | `models=LLaDA2.1-flash` | https://huggingface.co/inclusionAI/LLaDA2.0-flash |
+| LLaDA2.1-mini |  | `models=LLaDA2.1-mini` | https://huggingface.co/inclusionAI/LLaDA2.0-mini |
 | Llama-3-8B-QServe |  | `models=Llama-3-8B-QServe` | https://huggingface.co/mit-han-lab/Llama-3-8B-QServe |
 | Llama-3-8B-QServe-g128 |  | `models=Llama-3-8B-QServe-g128` | https://huggingface.co/mit-han-lab/Llama-3-8B-QServe-g128 |
 | Llama-3.3-70B-Instruct |  | `models=Llama-3.3-70B-Instruct` | https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct |

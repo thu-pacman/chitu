@@ -184,22 +184,16 @@ def gen_debug_req_id(len=8):
 def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens, frequency_penalty):
     from chitu.backend import Backend
 
-    def generate_prompt(token_length, tkn):
-        while True:
-            tokens = [random.randint(100, 1000) for _ in range(token_length)]
-            if len(tkn.encode(tkn.decode(tokens), bos=False, eos=True)) == token_length:
-                return tkn.decode(tokens)
-
     reqs: list[UserRequest] = []
     for i in range(num_reqs):
-        msg = generate_prompt(prompt_len - 1, Backend.tokenizer)
-        req = UserRequest.create(
-            msg,
-            f"{gen_req_id()}",
+        req = UserRequest.create_mock(
+            input_len=prompt_len,
+            request_id=f"{gen_req_id()}",
             max_new_tokens=max_new_tokens,
             frequency_penalty=frequency_penalty,
+            random_tokens=True,
         )
-        req.messages = msg
+        req.messages = Backend.tokenizer.decode(req.prompt_tokens)
         reqs.append(req)
     return reqs
 

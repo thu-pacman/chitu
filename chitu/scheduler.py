@@ -333,7 +333,7 @@ class Scheduler:
 
         # scheduling decode tasks
         if filter_task_type == TaskType.Decode:
-            task_ids = self._schedule_decode_tasks(task_ids)
+            task_ids = self._schedule_decode_tasks(task_ids)[: self.decode_num_tasks]
 
         # Allocate sgroup for for task_ids
         self.sgroup_list.set_task_ids(task_ids)

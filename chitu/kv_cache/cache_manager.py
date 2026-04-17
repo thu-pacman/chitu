@@ -7,6 +7,7 @@ from logging import getLogger
 from collections import deque, OrderedDict
 
 from chitu.global_vars import get_global_args
+from chitu.task_type import TaskType
 from chitu.utils import ceil_div
 from chitu.kv_cache import TokenBlock, NONE_BLK_HASH
 from weakref import WeakValueDictionary
@@ -271,6 +272,14 @@ class PagedKVCacheManager(KVCacheManagerBase):
         """prepare and update metadata before the task begin a decode step"""
         task.new_cache_ids = []
 
+        # DLLM decode: use decoding_start + block_length
+        from chitu.models.registry import ModelType
+
+        args = get_global_args()
+        if hasattr(args, "models") and args.models.type == ModelType.LLADA2:
+            self._prepare_metadata_before_decode_dllm(task)
+            return
+
         # NOTE:
         # For prefix caching, hashes must be derived from tokens that are already synced into
         # `task.prefix_tokens`. Under schedule_overlap and/or PP, `task.prefix_tokens_len`
@@ -317,6 +326,52 @@ class PagedKVCacheManager(KVCacheManagerBase):
             task.new_cache_ids.append(cache_idx)
             block.active_cnt += 1
             self.active_blocks[block.cache_idx] = block
+
+    def _prepare_metadata_before_decode_dllm(self, task: "Task"):
+        """Prepare metadata for DLLM decode step.
+
+        DLLM decode uses decoding_start + block_length to determine cache requirements.
+        Unlike normal decode, DLLM decode processes a full block of tokens per step.
+        """
+        task.new_cache_ids = []
+
+        block_length = task.block_length
+        decoding_start = task.decoding_start
+        target_seq_len = decoding_start + block_length
+
+        self.tid_to_cached_len[task.task_id] = target_seq_len
+        num_target_blocks = ceil_div(target_seq_len, self.block_size)
+
+        for idx in range(
+            len(self.task_to_cache_ids[task.task_id]), num_target_blocks, 1
+        ):
+            cache_idx = self.get_free_cache_idx()
+            self.task_to_cache_ids[task.task_id].add(cache_idx)
+            task.new_cache_ids.append(cache_idx)
+
+            # Create a placeholder TokenBlock if needed
+            # DLLM decode doesn't use prefix_tokens for token tracking,
+            # so we create placeholder blocks for metadata management only.
+            if idx < len(task.token_blocks):
+                block = task.token_blocks[idx]
+            else:
+                # Create a placeholder block for DLLM decode
+                block = TokenBlock(
+                    tokens=[0]
+                    * self.block_size,  # Placeholder tokens (not used for DLLM)
+                    blk_hash=None,
+                    blk_size=self.block_size,
+                    pre_blk_hash=(
+                        task.token_blocks[-1].blk_hash
+                        if task.token_blocks
+                        else NONE_BLK_HASH
+                    ),
+                )
+                task.token_blocks.append(block)
+
+            block.cache_idx = cache_idx
+            block.active_cnt += 1
+            self.active_blocks[cache_idx] = block
 
     def update_prefix_caching_metadata(self, task: "Task", num_full_blocks):
         """Update metadata in task_hashed_block_cnt, task.token_blocks and hashed_block_pool"""
