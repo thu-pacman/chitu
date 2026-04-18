@@ -493,7 +493,9 @@ def test_mla_decode_dense_kv(
 @pytest.mark.parametrize("page_size", [16, 64, 256])
 @pytest.mark.parametrize("topk", [None, 128])
 @pytest.mark.parametrize("use_separated_kv_lora_k_pe", [False, True])
-@pytest.mark.parametrize("impl", ["triton", "flashinfer", "npu", "flash_mla"])
+@pytest.mark.parametrize(
+    "impl", ["triton", "flashinfer", "npu", "flash_mla", "flash_attn"]
+)
 def test_mla_decode_paged_kv(
     bs,
     local_n_heads,
@@ -551,6 +553,15 @@ def test_mla_decode_paged_kv(
     else:  # only test h_q=128 for flash_mla
         if local_n_heads == 128:
             pytest.skip(f"Skip testing h_q=128 with {impl} attn backend")
+    if impl == "flash_attn":
+        if not has_flash_attn and not has_flash_attn3:
+            pytest.skip("flash_attn/flash_attn_interface is missing")
+        if not has_flash_attn3:
+            pytest.skip(
+                "MLA paged decode with flash_attn requires flash_attn_interface"
+            )
+        if topk is not None:
+            pytest.skip("flash_attn only supports dense attention for now")
 
     if impl == "flash_mla":
         torch.set_default_dtype(torch.bfloat16)
@@ -631,6 +642,8 @@ def test_mla_decode_paged_kv(
         attn = NpuAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
     elif impl == "flash_mla":
         attn = FlashMLABackend(qk_nope_head_dim=qk_nope_head_dim, index_topk=topk)
+    elif impl == "flash_attn":
+        attn = FlashAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
     else:
         raise NotImplementedError()
     attn_ref = RefAttnBackend(qk_nope_head_dim=qk_nope_head_dim)

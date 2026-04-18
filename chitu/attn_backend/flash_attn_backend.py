@@ -203,3 +203,176 @@ class FlashAttnBackend(AttnBackend):
         output = self._fa.flash_attn_with_kvcache(**kwargs)
         output = output.view(bsz * s_q, output.shape[-2], output.shape[-1])
         return output
+
+    def _fa3_mla_decode_paged_kv_impl(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_cache: PagedKVCacheAccessor,
+        kv: Optional[torch.Tensor],
+        seq_len_delta: BatchedSeqLenDelta,
+        softmax_scale=None,
+        page_table_override: Optional[torch.Tensor] = None,
+        cache_seqlens_override: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Unified FA3 MLA paged decode helper.
+
+        Mode A: kv is not None
+            - append new KV inside flash_attn_with_kvcache
+            - default cache_seqlens = old lengths
+
+        Mode B: kv is None
+            - caller has already appended KV into kv_cache
+            - default cache_seqlens = new lengths
+
+        Optional overrides:
+            - page_table_override
+            - cache_seqlens_override
+        """
+
+        if q_nope.numel() == 0:
+            return torch.empty(
+                0,
+                q_nope.shape[1],
+                q_nope.shape[-1],
+                device=q_nope.device,
+                dtype=q_nope.dtype,
+            )
+
+        batch_size = seq_len_delta.batch_size
+        query_tokens_per_req = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
+
+        query_rope = q_pe.view(
+            batch_size,
+            query_tokens_per_req,
+            q_pe.shape[-2],
+            q_pe.shape[-1],
+        )
+        query_value = q_nope.view(
+            batch_size,
+            query_tokens_per_req,
+            q_nope.shape[-2],
+            q_nope.shape[-1],
+        )
+
+        kv_lora_rank = q_nope.shape[-1]
+        qk_rope_head_dim = q_pe.shape[-1]
+
+        if softmax_scale is None:
+            assert self.qk_nope_head_dim is not None
+            softmax_scale = 1.0 / ((self.qk_nope_head_dim + qk_rope_head_dim) ** 0.5)
+
+        if kv is not None:
+            kv_batched = kv.view(
+                batch_size,
+                query_tokens_per_req,
+                kv.shape[-2],
+                kv.shape[-1],
+            )
+            new_value_lora = kv_batched[..., :kv_lora_rank].contiguous()
+            new_key_rope = kv_batched[..., kv_lora_rank:].contiguous()
+            default_cache_seqlens = seq_len_delta.old.lens_tensor_device
+        else:
+            new_value_lora = None
+            new_key_rope = None
+            default_cache_seqlens = seq_len_delta.new.lens_tensor_device
+
+        cache_seqlens = (
+            cache_seqlens_override
+            if cache_seqlens_override is not None
+            else default_cache_seqlens
+        )
+        page_table = (
+            page_table_override
+            if page_table_override is not None
+            else kv_cache.block_table
+        )
+
+        if "kv_lora_k_pe" in kv_cache.kv:
+            packed_cache = kv_cache.kv["kv_lora_k_pe"].view(
+                kv_cache.kv["kv_lora_k_pe"].shape[0],  # num_pages
+                kv_cache.kv["kv_lora_k_pe"].shape[1],  # page_size
+                1,
+                kv_cache.kv["kv_lora_k_pe"].shape[-1],
+            )
+            cache_value_lora = packed_cache[..., :kv_lora_rank]
+            cache_key_rope = packed_cache[..., kv_lora_rank:]
+        elif "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
+            cache_value_lora = kv_cache.kv["kv_lora"].view(
+                kv_cache.kv["kv_lora"].shape[0],
+                kv_cache.kv["kv_lora"].shape[1],
+                1,
+                kv_cache.kv["kv_lora"].shape[-1],
+            )
+            cache_key_rope = kv_cache.kv["k_pe"].view(
+                kv_cache.kv["k_pe"].shape[0],
+                kv_cache.kv["k_pe"].shape[1],
+                1,
+                kv_cache.kv["k_pe"].shape[-1],
+            )
+        else:
+            raise ValueError(
+                'For MLA, the KV cache should either have a "kv_lora_k_pe" tensor '
+                f'or both "kv_lora" and "k_pe" tensors, but got {list(kv_cache.kv.keys())}'
+            )
+
+        assert (
+            cache_key_rope.stride(-1) == 1
+        ), f"cache_key_rope.stride(-1) must be 1, got {cache_key_rope.stride(-1)}"
+        assert (
+            cache_value_lora.stride(-1) == 1
+        ), f"cache_value_lora.stride(-1) must be 1, got {cache_value_lora.stride(-1)}"
+
+        output = self._fa.flash_attn_with_kvcache(
+            q=query_rope,
+            k_cache=cache_key_rope,
+            v_cache=cache_value_lora,
+            k=new_key_rope,
+            v=new_value_lora,
+            qv=query_value,
+            cache_seqlens=cache_seqlens,
+            page_table=page_table,
+            causal=query_tokens_per_req > 1,
+            softmax_scale=softmax_scale,
+        )
+
+        return output.view(
+            batch_size * query_tokens_per_req,
+            output.shape[-2],
+            output.shape[-1],
+        )
+
+    @override
+    def mla_decode_paged_kv(
+        self,
+        q_nope,
+        q_pe,
+        kv_cache: PagedKVCacheAccessor,
+        kv,
+        seq_len_delta: BatchedSeqLenDelta,
+        softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
+    ):
+        if not self._use_fa3:
+            return super().mla_decode_paged_kv(
+                q_nope,
+                q_pe,
+                kv_cache,
+                kv,
+                seq_len_delta=seq_len_delta,
+                softmax_scale=softmax_scale,
+                topk_indices=topk_indices,
+            )
+
+        if topk_indices is not None:
+            raise NotImplementedError()
+
+        return self._fa3_mla_decode_paged_kv_impl(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            kv_cache=kv_cache,
+            kv=kv,
+            seq_len_delta=seq_len_delta,
+            softmax_scale=softmax_scale,
+        )
