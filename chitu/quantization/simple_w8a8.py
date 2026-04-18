@@ -46,7 +46,7 @@ class W8A8Linear(QuantizedLinearBase):
             self.bias = torch.nn.Parameter(
                 torch.zeros(
                     (self.out_features,),
-                    dtype=torch.float16,
+                    dtype=torch.get_default_dtype(),
                 ),
                 requires_grad=False,
             )

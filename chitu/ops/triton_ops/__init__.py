@@ -33,6 +33,8 @@ from chitu.ops.triton_ops.quant import (
     softfp8_blockfp8_index_score_ragged_q_dense_k_dsv32_triton,
     softfp8_blockfp8_index_score_ragged_q_paged_k_dsv32_triton,
     fp8_e4m3fn_quant_per_tensor_triton,
+    per_token_quant_fp8_triton,
+    silu_mul_quant_fp8_triton,
 )
 from chitu.ops.triton_ops.moe_sum import (
     moe_sum_per_token_triton,

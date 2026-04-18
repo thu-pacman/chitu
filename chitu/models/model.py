@@ -368,6 +368,8 @@ class Transformer(nn.Module):
         ret = ["weight"]
         if quant == "blockfp8" or quant == "q4km":
             ret += ["scale"]
+        elif quant == "fp8_per_channel":
+            ret += ["weight_scale"]
         elif quant == "blockfp4" or quant == "blockfp4_merged":
             ret += ["weight_scale", "weight_scale_2", "input_scale"]
         elif quant == "w4a8_per_token_per_channel_asymm":

@@ -269,6 +269,7 @@ def fused_moe_kernel_wrapper_fp8(
     compute_type: tl.dtype,
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
+    per_channel_quant: bool = False,
 ):
     M = A.shape[0]
     EM = sorted_token_ids.shape[0]
@@ -312,6 +313,7 @@ def fused_moe_kernel_wrapper_fp8(
         top_k=top_k,
         compute_type=compute_type,
         soft_fp8=soft_fp8,
+        per_channel_quant=per_channel_quant,
         bs_if_in_graph=bs_if_in_graph,
         **config,
     )
@@ -704,6 +706,101 @@ def fused_experts_fp8(
         compute_type=compute_type,
         block_shape=block_shape,
         soft_fp8=soft_fp8,
+    )
+
+    return PerTokenBatchedExpertResult(
+        intermediate_cache3.view(*intermediate_cache3.shape)
+    )
+
+
+@single_dispatch_lazy_tensor
+@_inject_moe_config(
+    "fused_experts_fp8_per_channel", lambda *args, **kwargs: _DEFAULT_MOE_CONFIG
+)
+def fused_experts_fp8_per_channel(
+    hidden_states: IndexedBatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    experts_start_idx: int = 0,
+    config: Optional[dict[str, Any]] = None,
+) -> PerTokenBatchedExpertResult:
+    from chitu.ops.triton_ops.quant.fp8_per_token import per_token_quant_fp8
+
+    n_local_experts = w1.shape[0]
+    M, _ = hidden_states.activation.shape
+    E, N, _ = w1.shape
+    hidden_states = hidden_states.as_local_expert_ids(
+        experts_start_idx,
+        experts_start_idx + n_local_experts,
+    )
+    hidden_states = ExpertBlockIndexedBatchedRoutedActivation.convert_from(
+        hidden_states, n_experts=E, block_size=config["BLOCK_SIZE_M"]
+    )
+    assert hidden_states.activation.shape[1] == w1.shape[2], "Hidden size mismatch"
+    assert hidden_states.activation.is_contiguous(), "Hidden_states must be contiguous"
+    assert w1.is_contiguous(), "Expert weights1 must be contiguous"
+    assert w2.is_contiguous(), "Expert weights2 must be contiguous"
+
+    intermediate_cache1 = torch.zeros(
+        (M, hidden_states.topk, N),
+        device=hidden_states.activation.device,
+        dtype=hidden_states.activation.dtype,
+    )
+    intermediate_cache3 = torch.zeros(
+        (M, hidden_states.topk, w2.shape[1]),
+        device=hidden_states.activation.device,
+        dtype=hidden_states.activation.dtype,
+    )
+
+    compute_type = to_triton_dtype(hidden_states.activation.dtype)
+
+    # Per-token FP8 quantization for activations
+    hidden_states_activation, a1_scale = per_token_quant_fp8(hidden_states.activation)
+
+    fused_moe_kernel_wrapper_fp8(
+        hidden_states_activation,
+        w1,
+        intermediate_cache1,
+        a1_scale,
+        w1_scale,
+        hidden_states.block_to_token_x_topk_indices.flatten(),
+        hidden_states.block_to_expert_indices,
+        hidden_states.n_blocks_scalar_tensor,
+        hidden_states.activation.shape[0] * hidden_states.topk,
+        hidden_states.topk,
+        config,
+        compute_type=compute_type,
+        per_channel_quant=True,
+    )
+
+    if activation == "silu":
+        # Fused silu_and_mul + per-token FP8 quant: one kernel instead of
+        # two, plus skips materializing the (M*topk, N) bf16 intermediate.
+        from chitu.ops.triton_ops.quant.fp8_per_token import silu_mul_quant_fp8
+
+        intermediate_cache2, a2_scale = silu_mul_quant_fp8(
+            intermediate_cache1.view(-1, N)
+        )
+    else:
+        raise ValueError(f"Unsupported FusedMoe activation: {activation}")
+
+    fused_moe_kernel_wrapper_fp8(
+        intermediate_cache2,
+        w2,
+        intermediate_cache3,
+        a2_scale,
+        w2_scale,
+        hidden_states.block_to_token_x_topk_indices.flatten(),
+        hidden_states.block_to_expert_indices,
+        hidden_states.n_blocks_scalar_tensor,
+        hidden_states.activation.shape[0] * hidden_states.topk,
+        1,
+        config,
+        compute_type=compute_type,
+        per_channel_quant=True,
     )
 
     return PerTokenBatchedExpertResult(

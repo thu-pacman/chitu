@@ -29,6 +29,7 @@
 | GLM-4.6 | ✓ | `models=GLM-4.6` | https://huggingface.co/zai-org/GLM-4.6 |
 | GLM-4.6V |  | `models=GLM-4.6V` | https://huggingface.co/zai-org/GLM-4.6V |
 | GLM-4.7 | ✓ | `models=GLM-4.7` | https://huggingface.co/zai-org/GLM-4.7 |
+| GLM-4.7-FP8 | ✓ | `models=GLM-4.7-FP8` | https://huggingface.co/zai-org/GLM-4.7-FP8 |
 | GLM-4.7-Flash | ✓ | `models=GLM-4.7-Flash` | https://huggingface.co/zai-org/GLM-4.7-Flash |
 | GLM-5 | ✓ | `models=GLM-5` | https://huggingface.co/zai-org/GLM-5 |
 | GLM-5-FP8 | ✓ | `models=GLM-5-FP8` | https://huggingface.co/zai-org/GLM-5-FP8 |

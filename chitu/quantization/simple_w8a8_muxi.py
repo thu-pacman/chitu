@@ -56,7 +56,7 @@ class W8A8MuxiLinear(QuantizedLinearBase):
                 torch.nn.Parameter(
                     torch.empty(
                         self.out_features,
-                        dtype=torch.float16,
+                        dtype=torch.get_default_dtype(),
                     ),
                     requires_grad=False,
                 ),
