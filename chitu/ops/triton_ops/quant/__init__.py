@@ -31,3 +31,7 @@ from chitu.ops.triton_ops.quant.w4a4_per_token_per_channel import (
     w4a4_gemm_per_token_per_channel_triton,
 )
 from chitu.ops.triton_ops.quant.mixq import mixq_w8a8_gemm_triton, mixq_w4a4_gemm_triton
+from chitu.ops.triton_ops.quant.fp8_per_token import (
+    per_token_quant_fp8 as per_token_quant_fp8_triton,
+    silu_mul_quant_fp8 as silu_mul_quant_fp8_triton,
+)

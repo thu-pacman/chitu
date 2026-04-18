@@ -8,6 +8,8 @@ import torch
 from typing_extensions import override
 
 from chitu.attn_backend.flash_mla_backend import FlashMLABackend
+from chitu.attn_backend.flash_attn_backend import FlashAttnBackend
+
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import PagedKVCacheAccessor
 from chitu.utils import try_import_opt_dep
@@ -30,67 +32,64 @@ class HopperMixedBackend(FlashMLABackend):
             not self.use_fp8_cache
         ), "HopperMixedBackend is only valid with bf16 MLA KV cache"
         assert has_flash_attn3, "HopperMixedBackend requires flash_attn_interface (FA3)"
+        # Make self compatible with FlashAttnBackend.mla_decode_paged_kv
+        self._fa = flash_attn3
+        self._use_fa3 = True
 
-    def fa3_sparse_mqa_decode(
+    def requires_sparse_decode_page_table(self) -> bool:
+        return True
+
+    def _build_sparse_page_table_and_valid_counts(
         self,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        kv_lora_k_pe: torch.Tensor,
         topk_indices: torch.Tensor,
         block_table: torch.Tensor,
         seq_len_delta: BatchedSeqLenDelta,
-        softmax_scale: float,
-        kv_lora_rank: int,
-    ) -> torch.Tensor:
-        bsz = seq_len_delta.batch_size
-        s_q = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
-        num_tokens, local_h_q, _ = q_nope.shape
-        qk_rope_head_dim = q_pe.shape[-1]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Convert token-level topk indices to FA3 page_table + cache_seqlens format.
 
-        num_blocks_total = kv_lora_k_pe.shape[0]
-        d_full = kv_lora_k_pe.shape[-1]
-        assert d_full == kv_lora_rank + qk_rope_head_dim
-        k_cache = (
-            kv_lora_k_pe[..., kv_lora_rank:]
-            .contiguous()
-            .view(num_blocks_total, 1, 1, qk_rope_head_dim)
-        )
-        v_cache = (
-            kv_lora_k_pe[..., :kv_lora_rank]
-            .contiguous()
-            .view(num_blocks_total, 1, 1, kv_lora_rank)
-        )
-
+        Assumes block_size == 1, so token index == page index inside each request.
+        """
+        batch_size = seq_len_delta.batch_size
+        query_tokens_per_req = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
         topk = topk_indices.shape[-1]
-        # For MTP (s_q > 1), all s_q steps share the same KV sequence, so use step 0.
-        topk_indices_per_seq = topk_indices.view(bsz, s_q, topk)[:, 0, :]
 
-        upper_bounds = seq_len_delta.delta_position_ids_tensor_device + 1
-        valid_mask = (topk_indices_per_seq >= 0) & (
-            topk_indices_per_seq < upper_bounds.unsqueeze(1)
+        # Shape: [bsz, s_q, topk] -> take step 0
+        topk_indices_per_seq = topk_indices.view(
+            batch_size, query_tokens_per_req, topk
+        )[:, 0, :]
+
+        # For step-0-only sparse metadata, upper bound should also use step 0.
+        position_ids_per_seq = seq_len_delta.delta_position_ids_tensor_device.view(
+            batch_size, query_tokens_per_req
+        )[:, 0]
+        upper_bounds = position_ids_per_seq + 1  # [bsz]
+
+        max_blocks_per_seq = block_table.size(1)
+        if max_blocks_per_seq <= 0:
+            raise ValueError("block_table has zero width")
+
+        # Need both semantic validity and physical table-bound validity.
+        valid_mask = (
+            (topk_indices_per_seq >= 0)
+            & (topk_indices_per_seq < upper_bounds.unsqueeze(1))
+            & (topk_indices_per_seq < max_blocks_per_seq)
         )
-        safe_indices = topk_indices_per_seq.clamp(min=0)
 
-        page_ids = block_table.gather(1, safe_indices)
+        # Clamp to the valid gather range so gather itself never OOBs.
+        safe_indices = topk_indices_per_seq.clamp(min=0, max=max_blocks_per_seq - 1).to(
+            torch.long
+        )
 
+        sparse_page_ids = block_table.gather(1, safe_indices)
+
+        # FA3 reads the first cache_seqlens[i] entries per row, so valid
+        # pages must be packed to the front via argsort.
         sort_order = valid_mask.long().argsort(dim=-1, descending=True, stable=True)
-        page_table = page_ids.gather(1, sort_order).to(torch.int32)
+        sparse_page_table = sparse_page_ids.gather(1, sort_order).to(torch.int32)
         valid_counts = valid_mask.sum(dim=-1).to(torch.int32)
 
-        q_rope = q_pe.view(bsz, s_q, local_h_q, qk_rope_head_dim)
-        qv = q_nope.view(bsz, s_q, local_h_q, kv_lora_rank)
-
-        output = flash_attn3.flash_attn_with_kvcache(
-            q=q_rope,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            qv=qv,
-            cache_seqlens=valid_counts,
-            page_table=page_table,
-            softmax_scale=softmax_scale,
-            causal=s_q > 1,
-        )
-        return output.view(num_tokens, local_h_q, kv_lora_rank)
+        return sparse_page_table, valid_counts
 
     @override
     def mla_decode_paged_kv(
@@ -102,8 +101,9 @@ class HopperMixedBackend(FlashMLABackend):
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
+        topk_page_table: Optional[torch.Tensor] = None,
     ):
-        if q_nope.numel() == 0 or topk_indices is None:
+        if q_nope.numel() == 0 or (topk_indices is None and topk_page_table is None):
             return super().mla_decode_paged_kv(
                 q_nope,
                 q_pe,
@@ -113,7 +113,9 @@ class HopperMixedBackend(FlashMLABackend):
                 softmax_scale=softmax_scale,
                 topk_indices=topk_indices,
             )
+
         kv_lora_rank = q_nope.shape[-1]
+
         kv_lora_k_pe = self.update_paged_mla_kv(
             kv_lora_rank,
             kv,
@@ -123,18 +125,37 @@ class HopperMixedBackend(FlashMLABackend):
         assert (
             kv_lora_k_pe.size(1) == 1
         ), "HopperMixedBackend expects paged KV block dim 1"
+
         if softmax_scale is None:
             softmax_scale = 1.0 / ((q_pe.shape[-1] + self.qk_nope_head_dim) ** 0.5)
-        topk_indices = topk_indices.to(torch.int32)
-        if topk_indices.size(-1) < self.index_topk:
-            topk_indices = self.pad_indices(topk_indices)
-        return self.fa3_sparse_mqa_decode(
-            q_nope,
-            q_pe,
-            kv_lora_k_pe,
-            topk_indices,
-            kv_cache.block_table,
-            seq_len_delta,
-            softmax_scale,
-            kv_lora_rank,
+
+        if topk_page_table is not None:
+            # Pre-built page table from caller — no argsort needed.
+            assert seq_len_delta.is_classic_decoding
+            sparse_page_table = topk_page_table
+            valid_counts = (topk_page_table != -1).sum(dim=-1).to(torch.int32)
+        else:
+            # Fallback: build page table from topk_indices.
+            topk_indices = topk_indices.to(torch.int32)
+            if topk_indices.size(-1) < self.index_topk:
+                topk_indices = self.pad_indices(topk_indices)
+
+            sparse_page_table, valid_counts = (
+                self._build_sparse_page_table_and_valid_counts(
+                    topk_indices=topk_indices,
+                    block_table=kv_cache.block_table,
+                    seq_len_delta=seq_len_delta,
+                )
+            )
+
+        return FlashAttnBackend._fa3_mla_decode_paged_kv_impl(
+            self,
+            q_nope=q_nope,
+            q_pe=q_pe,
+            kv_cache=kv_cache,
+            kv=None,
+            seq_len_delta=seq_len_delta,
+            softmax_scale=softmax_scale,
+            page_table_override=sparse_page_table,
+            cache_seqlens_override=valid_counts,
         )

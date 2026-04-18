@@ -45,6 +45,10 @@ from chitu.quantization.ascend_w8a8 import (
     AscendW8A8DynamicMoeExperts,
 )
 from chitu.quantization.mixq import MixQLinear
+from chitu.quantization.fp8_per_channel import (
+    Fp8PerChannelLinear,
+    Fp8PerChannelMoeExpertsMerged,
+)
 from chitu.quantization.blockfp8 import (
     Blockfp8Linear,
     Blockfp8MoeExpertsUnmerged,

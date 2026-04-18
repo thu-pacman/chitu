@@ -788,6 +788,13 @@ def _mla_decode_topk_ragged_qkvo(
         num_kv_splits,
     )
 
+    # This op fails to process stride(0) for unkown reasons, maybe a triton bug.
+    # Call contiguous for now. (FIXME)
+    if q_nope.stride(0) != q_nope.stride(1) * q_nope.shape[1]:
+        q_nope = q_nope.contiguous()
+    if q_pe.stride(0) != q_pe.stride(1) * q_pe.shape[1]:
+        q_pe = q_pe.contiguous()
+
     _mla_decode_topk_ragged_qkvo_kernel[grid](
         q_nope,
         q_pe,

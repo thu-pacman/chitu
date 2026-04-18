@@ -47,6 +47,7 @@ class QuantizationRegistry:
     _allowed_quant_for_merge_gate_up: list = [
         "blockfp4_merged",
         "blockfp8",
+        "fp8_per_channel",
         "autoawq",
         "simple_w8a8",
         "mixq",
@@ -57,6 +58,7 @@ class QuantizationRegistry:
     _allowed_quant_for_merge_qkv: list = [
         "blockfp4_merged",
         "blockfp8",
+        "fp8_per_channel",
         "autoawq",
         "simple_w8a8",
         "mixq",

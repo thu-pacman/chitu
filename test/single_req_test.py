@@ -36,7 +36,7 @@ msgs_long = [
     [
         {
             "role": "user",
-            "content": Path("test/test_texts/test_text.txt").read_text(
+            "content": (Path(__file__).parent / "test_texts/test_text.txt").read_text(
                 encoding="utf-8"
             ),
         }

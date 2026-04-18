@@ -36,10 +36,7 @@ from chitu.models.model import (
 )
 from chitu.models.registry import ModelType, register_model
 from chitu.native_layout import NativeLayoutTensor
-from chitu.muxi_utils import (
-    NormalMoeExpertsMuxiLayout,
-    Blockfp8MoeExpertsMuxiLayout,
-)
+from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.ops import (
     apply_rotary_pos_emb_partial,
     silu_and_mul,
@@ -129,18 +126,6 @@ class Indexer(torch.nn.Module):
         max_seq_len = get_global_args().infer.max_seq_len
         self.index_topk: int = min(args.index_topk, max_seq_len)
         self.q_lora_rank: int = args.q_lora_rank
-        self.wq_b = LocalLinear(
-            self.q_lora_rank,
-            self.n_heads * self.head_dim,
-            has_bias=False,
-            checkpoint_prefix=f"{checkpoint_prefix}.wq_a",
-        )
-        self.wk = LocalLinear(
-            self.dim,
-            self.head_dim,
-            has_bias=False,
-            checkpoint_prefix=f"{checkpoint_prefix}.wk",
-        )
         self.k_norm = LayerNorm(
             self.head_dim,
             dtype=parse_dtype(getattr(args, "index_norm_dtype", "float32")),
@@ -159,16 +144,15 @@ class Indexer(torch.nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        qr: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
         seq_len_delta: BatchedSeqLenDelta,
         freqs_cis: BatchedFreqsCis,
         is_causal: bool,
         cache_accessor: KVCacheAccessor,
     ):
         assert x.ndim == 2
-        q = self.wq_b(qr)
         q = einops.rearrange(q, "s (h d) -> s h d", d=self.head_dim)
-        k = self.wk(x)
         k = self.k_norm(k)
         q, k, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
             q,
@@ -359,12 +343,24 @@ class AttentionDeepSeekV3(Attention):
             # fp8 gemm can handle weights not divisible by block_size, but it does not hold
             # after merging for the output dimension, except for the last weight.
             assert self.q_lora_rank % block_size == 0
-            self.wqkv_a = LocalLinear(
-                self.dim,
-                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
-                has_bias=False,
-                checkpoint_prefix=f"{checkpoint_prefix}.wqkv_a",
-            )  # FIXME: Run this layer with muxi_layout_kernels
+            if self.index_topk is None:
+                self.wqkv_a = LocalLinear(
+                    self.dim,
+                    self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+                    has_bias=False,
+                    checkpoint_prefix=f"{checkpoint_prefix}.wqkv_a",  # FIXME: Really use name from checkpoint
+                )  # FIXME: Run this layer with muxi_layout_kernels
+            else:
+                assert self.index_head_dim % block_size == 0
+                self.wqkv_a_indexer_k = LocalLinear(
+                    self.dim,
+                    self.index_head_dim
+                    + self.q_lora_rank
+                    + self.kv_lora_rank
+                    + self.qk_rope_head_dim,
+                    has_bias=False,
+                    checkpoint_prefix=f"{checkpoint_prefix}.wqkv_a",  # FIXME: Really use name from checkpoint
+                )  # FIXME: Run this layer with muxi_layout_kernels
         else:
             self.q_a_proj = LocalLinear(
                 self.dim,
@@ -390,6 +386,14 @@ class AttentionDeepSeekV3(Attention):
                     else None
                 ),
             )  # FIXME: Run this layer with muxi_layout_kernels
+            if self.index_topk is not None:
+                self.indexer_wk = LocalLinear(
+                    self.dim,
+                    self.index_head_dim,
+                    has_bias=False,
+                    checkpoint_prefix=f"{checkpoint_prefix}.indexer.wk",
+                )
+
         self.q_a_layernorm = RMSNorm(
             self.q_lora_rank,
             dtype=(
@@ -399,30 +403,58 @@ class AttentionDeepSeekV3(Attention):
             ),
             eps=getattr(args, "rms_norm_eps", 1e-6),
         )
-        self.q_b_proj = ColumnParallelLinear(
-            self.q_lora_rank,
-            (
-                self.n_heads * self.qk_head_dim
-                if self.mla_absorb != "absorb"
-                else self.n_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
-            ),
-            has_bias=False,
-            gather_output=False,
-            base_linear_class=(
-                NormalLinearNpuFractalZn
-                if (
-                    self.can_use_mla_prologue_torch_npu
-                    and not (
-                        self.mla_prologue_int8_partial or self.mla_prologue_int8_full
+
+        if self.merge_qkv and self.index_topk is not None:
+            # fp8 gemm can handle weights not divisible by block_size, but it does not hold
+            # after merging for the output dimension, except for the last weight.
+            assert self.index_n_heads * self.index_head_dim % block_size == 0
+            assert not self.can_use_mla_prologue_torch_npu
+            self.wq_b_indexer_q_b = LocalLinear(
+                self.q_lora_rank,
+                self.index_n_heads * self.index_head_dim
+                + (
+                    self.n_heads * self.qk_head_dim
+                    if self.mla_absorb != "absorb"
+                    else self.n_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
+                )
+                // get_tp_size(),
+                has_bias=False,
+                checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",  # FIXME: Really use name from checkpoint
+            )
+        else:
+            self.q_b_proj = ColumnParallelLinear(
+                self.q_lora_rank,
+                (
+                    self.n_heads * self.qk_head_dim
+                    if self.mla_absorb != "absorb"
+                    else self.n_heads * (self.kv_lora_rank + self.qk_rope_head_dim)
+                ),
+                has_bias=False,
+                gather_output=False,
+                base_linear_class=(
+                    NormalLinearNpuFractalZn
+                    if (
+                        self.can_use_mla_prologue_torch_npu
+                        and not (
+                            self.mla_prologue_int8_partial
+                            or self.mla_prologue_int8_full
+                        )
                     )
+                    else get_linear_layout_contig_y(
+                        op_impl,
+                        checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
+                    )
+                ),
+                checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
+            )
+            if self.index_topk is not None:
+                self.indexer_wq_b = LocalLinear(
+                    self.q_lora_rank,
+                    self.index_n_heads * self.index_head_dim,
+                    has_bias=False,
+                    checkpoint_prefix=f"{checkpoint_prefix}.indexer.wq_b",
                 )
-                else get_linear_layout_contig_y(
-                    op_impl,
-                    checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
-                )
-            ),
-            checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
-        )
+
         self.kv_a_layernorm = RMSNorm(
             self.kv_lora_rank,
             dtype=(
@@ -489,7 +521,16 @@ class AttentionDeepSeekV3(Attention):
                 args, checkpoint_prefix=f"{checkpoint_prefix}.indexer"
             )
 
-    def _run_linear(self, x, freqs_cis: BatchedFreqsCis):
+    def forward(
+        self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
+    ):
+        if is_mtp:
+            seq_len_delta = self.cache.mtp_seq_len_delta
+        else:
+            seq_len_delta = self.cache.seq_len_delta
+
+        bs_seq, _ = x.size()
+
         if self.can_use_mla_prologue_torch_npu:
             if self.mla_prologue_int8_full:
                 x_int8, scale_w_x = torch_npu.npu_dynamic_quant(x.view(-1, x.shape[-1]))
@@ -513,7 +554,6 @@ class AttentionDeepSeekV3(Attention):
                     smooth_scales=None,
                     impl="torch_npu",
                 )
-                return q_nope, q_pe, kv, None
             else:
                 q_nope, q_pe, kv = mla_prologue(
                     x,
@@ -530,120 +570,6 @@ class AttentionDeepSeekV3(Attention):
                     smooth_scales=None,
                     impl="torch_npu",
                 )
-                return q_nope, q_pe, kv, None
-
-        bs_seq, _ = x.size()
-        assert self.q_lora_rank > 0
-        if self.merge_qkv:
-            q_a_kv = self.wqkv_a(x)
-            q_a, kv = torch.split(
-                q_a_kv,
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                dim=-1,
-            )
-        else:
-            q_a = self.q_a_proj(x)
-            kv = self.kv_a_proj_with_mqa(x)
-        qr = self.q_a_layernorm(q_a, compute_dtype=q_a.dtype)
-        q = self.q_b_proj(qr)
-
-        q = q.view(bs_seq, self.n_local_heads, -1)
-        kv = kv.view(bs_seq, 1, -1)
-
-        q, kv, q_nope, q_pe, _, kv_lora, k_pe, _ = apply_rotary_pos_emb_partial(
-            q,
-            kv,
-            freqs_cis,
-            q_rotary_begin=q.shape[-1] - self.qk_rope_head_dim,
-            k_rotary_begin=self.kv_lora_rank,
-            rotary_type="interleaved",
-        )
-
-        if self.mla_absorb == "none":
-            if isinstance(k_pe, NativeLayoutTensor):
-                k_pe = k_pe.convert_to_plain()
-
-            kv = self.kv_b_proj(self.kv_a_layernorm(kv_lora))
-
-            kv = kv.view(
-                bs_seq, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-            k_nope, v = torch.split(
-                kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-            )
-            k = torch.cat(
-                [
-                    k_nope.view(bs_seq, self.n_local_heads, self.qk_nope_head_dim),
-                    k_pe.view(bs_seq, 1, self.qk_rope_head_dim).expand(
-                        -1, self.n_local_heads, -1
-                    ),
-                ],
-                dim=-1,
-            )
-            return q, k, v, qr
-
-        elif self.mla_absorb in ["absorb-without-precomp", "absorb"]:
-            if self.mla_absorb == "absorb-without-precomp":
-                q_nope = self.kv_b_proj_absorb_1(q_nope)
-
-            # In-place update to `kv_lora`, which is part of `kv`
-            self.kv_a_layernorm(kv_lora, compute_dtype=kv.dtype, out=kv_lora)
-
-            return q_nope, q_pe, kv, qr
-
-        else:
-            raise NotImplementedError(
-                f"MLA absorb mode {self.mla_absorb} not supported"
-            )
-
-    def forward(
-        self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
-    ):
-        bs_seq, _ = x.size()
-
-        if self.mla_absorb == "none":
-            q, k, v, qr = self._run_linear(x, freqs_cis)
-            if self.index_topk is not None:
-                assert self.indexer_cache is not None
-                topk_indices = self.indexer(
-                    x,
-                    qr,
-                    self.cache.seq_len_delta,
-                    freqs_cis,
-                    is_causal=True,
-                    cache_accessor=self.indexer_cache.get_accessor(self.layer_id),
-                )
-            else:
-                topk_indices = None
-            x = self.attn_backend(
-                q,
-                self.cache.get_accessor(self.layer_id),
-                k,
-                v,
-                seq_len_delta=self.cache.seq_len_delta,
-                causal=True,
-                softmax_scale=self.softmax_scale,
-            )
-
-        elif self.mla_absorb in ["absorb-without-precomp", "absorb"]:
-            if is_mtp:
-                seq_len_delta = self.cache.mtp_seq_len_delta
-            else:
-                seq_len_delta = self.cache.seq_len_delta
-
-            q_nope, q_pe, kv, qr = self._run_linear(x, freqs_cis)
-            if self.index_topk is not None:
-                assert self.indexer_cache is not None
-                topk_indices = self.indexer(
-                    x,
-                    qr,
-                    seq_len_delta,
-                    freqs_cis,
-                    is_causal=True,
-                    cache_accessor=self.indexer_cache.get_accessor(self.layer_id),
-                )
-            else:
-                topk_indices = None
 
             x = self.attn_backend.mla(
                 q_nope,
@@ -653,16 +579,156 @@ class AttentionDeepSeekV3(Attention):
                 seq_len_delta=seq_len_delta,
                 causal=True,
                 softmax_scale=self.softmax_scale,
-                topk_indices=topk_indices,
             )
 
-            if self.mla_absorb == "absorb-without-precomp":
-                x = self.kv_b_proj_absorb_2(x)
+            x = self.kv_b_proj_absorb_2(x)
 
-        else:
-            raise NotImplementedError(
-                f"MLA absorb mode {self.mla_absorb} not supported"
+        else:  # not self.can_use_mla_prologue_torch_npu:
+            assert self.q_lora_rank > 0
+            if self.merge_qkv:
+                if self.index_topk is None:
+                    q_a_kv = self.wqkv_a(x)
+                    q_a, kv = torch.split(
+                        q_a_kv,
+                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                        dim=-1,
+                    )
+                else:
+                    q_a_kv_indexer_k = self.wqkv_a_indexer_k(x)
+                    indexer_k, q_a, kv = torch.split(
+                        q_a_kv_indexer_k,
+                        [
+                            self.index_head_dim,
+                            self.q_lora_rank,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ],
+                        dim=-1,
+                    )
+            else:
+                q_a = self.q_a_proj(x)
+                kv = self.kv_a_proj_with_mqa(x)
+                if self.index_topk is not None:
+                    indexer_k = self.indexer_wk(x)
+                else:
+                    indexer_k = None
+
+            qr = self.q_a_layernorm(q_a, compute_dtype=q_a.dtype)
+
+            if self.merge_qkv and self.index_topk is not None:
+                q_indexer_q = self.wq_b_indexer_q_b(qr)
+                indexer_q, q = torch.split(
+                    q_indexer_q,
+                    [
+                        self.index_n_heads * self.index_head_dim,
+                        q_indexer_q.shape[-1]
+                        - self.index_n_heads * self.index_head_dim,
+                    ],
+                    dim=-1,
+                )
+            else:
+                q = self.q_b_proj(qr)
+                if self.index_topk is not None:
+                    indexer_q = self.indexer_wq_b(qr)
+                else:
+                    indexer_q = None
+
+            q = q.view(bs_seq, self.n_local_heads, -1)
+            kv = kv.view(bs_seq, 1, -1)
+
+            q, kv, q_nope, q_pe, _, kv_lora, k_pe, _ = apply_rotary_pos_emb_partial(
+                q,
+                kv,
+                freqs_cis,
+                q_rotary_begin=q.shape[-1] - self.qk_rope_head_dim,
+                k_rotary_begin=self.kv_lora_rank,
+                rotary_type="interleaved",
             )
+
+            if self.mla_absorb == "none":
+                if isinstance(k_pe, NativeLayoutTensor):
+                    k_pe = k_pe.convert_to_plain()
+
+                kv = self.kv_b_proj(self.kv_a_layernorm(kv_lora))
+
+                kv = kv.view(
+                    bs_seq, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim
+                )
+                k_nope, v = torch.split(
+                    kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+                )
+                k = torch.cat(
+                    [
+                        k_nope.view(bs_seq, self.n_local_heads, self.qk_nope_head_dim),
+                        k_pe.view(bs_seq, 1, self.qk_rope_head_dim).expand(
+                            -1, self.n_local_heads, -1
+                        ),
+                    ],
+                    dim=-1,
+                )
+
+                if self.index_topk is not None:
+                    assert self.indexer_cache is not None
+                    topk_indices = self.indexer(
+                        x,
+                        indexer_q,
+                        indexer_k,
+                        seq_len_delta,
+                        freqs_cis,
+                        is_causal=True,
+                        cache_accessor=self.indexer_cache.get_accessor(self.layer_id),
+                    )
+                else:
+                    topk_indices = None
+
+                x = self.attn_backend(
+                    q,
+                    self.cache.get_accessor(self.layer_id),
+                    k,
+                    v,
+                    seq_len_delta=seq_len_delta,
+                    causal=True,
+                    softmax_scale=self.softmax_scale,
+                )
+
+            elif self.mla_absorb in ["absorb-without-precomp", "absorb"]:
+                if self.mla_absorb == "absorb-without-precomp":
+                    q_nope = self.kv_b_proj_absorb_1(q_nope)
+
+                # In-place update to `kv_lora`, which is part of `kv`
+                self.kv_a_layernorm(kv_lora, compute_dtype=kv.dtype, out=kv_lora)
+
+                if self.index_topk is not None:
+                    assert self.indexer_cache is not None
+                    topk_indices = self.indexer(
+                        x,
+                        indexer_q,
+                        indexer_k,
+                        seq_len_delta,
+                        freqs_cis,
+                        is_causal=True,
+                        cache_accessor=self.indexer_cache.get_accessor(self.layer_id),
+                    )
+                else:
+                    topk_indices = None
+
+                x = self.attn_backend.mla(
+                    q_nope,
+                    q_pe,
+                    self.cache.get_accessor(self.layer_id, is_mtp),
+                    kv,
+                    seq_len_delta=seq_len_delta,
+                    causal=True,
+                    softmax_scale=self.softmax_scale,
+                    topk_indices=topk_indices,
+                )
+
+                if self.mla_absorb == "absorb-without-precomp":
+                    x = self.kv_b_proj_absorb_2(x)
+
+            else:
+                raise NotImplementedError(
+                    f"MLA absorb mode {self.mla_absorb} not supported"
+                )
 
         return self.o_proj(x.flatten(-2)).view(bs_seq, -1)
 
@@ -1618,12 +1684,26 @@ class TransformerDeepSeekV3(Transformer):
                 ),
             )
 
-        return self.process_state_dict_for_merging_tensors(
-            checkpoint,
-            tgt_layer="wqkv_a",
-            src_layers=["q_a_proj", "kv_a_proj_with_mqa"],
-            enable_callback=enable_callback,
-        )
+        if not hasattr(self.params, "index_topk"):
+            return self.process_state_dict_for_merging_tensors(
+                checkpoint,
+                tgt_layer="wqkv_a",
+                src_layers=["q_a_proj", "kv_a_proj_with_mqa"],
+                enable_callback=enable_callback,
+            )
+        else:
+            checkpoint = self.process_state_dict_for_merging_tensors(
+                checkpoint,
+                tgt_layer="wqkv_a_indexer_k",
+                src_layers=["indexer_wk", "q_a_proj", "kv_a_proj_with_mqa"],
+                enable_callback=enable_callback,
+            )
+            return self.process_state_dict_for_merging_tensors(
+                checkpoint,
+                tgt_layer="wq_b_indexer_q_b",
+                src_layers=["indexer_wq_b", "q_b_proj"],
+                enable_callback=enable_callback,
+            )
 
     @override
     def process_state_dict_for_merging_gate_up(self, checkpoint: dict[str, Any]):
@@ -1643,12 +1723,13 @@ class TransformerDeepSeekV3(Transformer):
         replace: bool = True,
     ) -> dict[str, Any]:
         if not skip_preprocess and replace:
-            state_dict_keys = list(state_dict.keys())
-            for k in state_dict_keys:
+            for k in list(state_dict.keys()):
                 value = state_dict.pop(k)
                 if "self_attn.rotary_emb.inv_freq" not in k:
                     name = k
                     name = name.replace(".weight_scale_inv", ".scale")
+                    name = name.replace(".indexer.wq_b", ".indexer_wq_b")
+                    name = name.replace(".indexer.wk", ".indexer_wk")
                     state_dict[name] = value
         return super().preprocess_state_dict_parallel(
             state_dict,
