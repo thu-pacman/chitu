@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from chitu.ops.utils import make_op_dispatcher
 from chitu.device_type import is_muxi
-from chitu.utils import try_import_opt_dep
+from chitu.utils import try_import_opt_dep, try_import_platform_dep
 
 if is_muxi():
     has_fla = False
@@ -18,6 +18,12 @@ if has_fla:
     from fla.ops import chunk_gated_delta_rule as chunk_gated_delta_rule_fla
     from fla.ops import (
         fused_recurrent_gated_delta_rule as fused_recurrent_gated_delta_rule_fla,
+    )
+
+triton, has_triton = try_import_platform_dep("triton")
+if has_triton:
+    from chitu.ops.triton_ops.fused_recurrent import (
+        fused_recurrent_gated_delta_rule_fwd_all_state_triton,
     )
 
 
@@ -494,6 +500,8 @@ def recurrent_gated_delta_rule_all_state(
 
 @recurrent_gated_delta_rule_all_state.register_auto
 def _auto_recurrent_gated_delta_rule_all_state():
+    if has_triton:
+        return "triton"
     return "torch"
 
 
@@ -514,6 +522,30 @@ def _recurrent_gated_delta_rule_all_state_torch(
         v=value,
         beta=beta,
         g=g,
+        scale=None,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+
+
+@recurrent_gated_delta_rule_all_state.register("triton")
+def _recurrent_gated_delta_rule_all_state_triton(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state,
+    output_final_state,
+    use_qk_l2norm_in_kernel=False,
+):
+    return fused_recurrent_gated_delta_rule_fwd_all_state_triton(
+        q=query,
+        k=key,
+        v=value,
+        g=g,
+        beta=beta,
         scale=None,
         initial_state=initial_state,
         output_final_state=output_final_state,

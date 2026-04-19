@@ -294,7 +294,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # mtp decode, return all step state, could be optimized with triton kernel
         elif is_mtp_decode_stage:
             q, k, v, beta, g = map(
-                lambda x: x.view(-1, self.mtp_size, *x.shape[1:]), [q, k, v, beta, g]
+                lambda x: x.view(-1, self.mtp_size, *x.shape[1:]).contiguous(),
+                [q, k, v, beta, g],
             )
 
             core_attn_out, last_recurrent_state = recurrent_gated_delta_rule_all_state(
