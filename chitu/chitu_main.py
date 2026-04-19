@@ -837,15 +837,6 @@ def chitu_init(args):
             and str(args.models).find("'backend': 'cpuinfer'") != -1
         ):
             args.infer.use_cuda_graph = False
-        elif (
-            args.infer.attn_type == "npu"
-            and args.infer.cache_type == "paged"
-            and (
-                args.models.type is not None
-                and args.models.type == ModelType.DEEPSEEK_V3
-            )
-        ):
-            args.infer.use_cuda_graph = False
         else:
             args.infer.use_cuda_graph = True
 
