@@ -23,15 +23,18 @@ def rms_norm_triton(
     x: torch.Tensor, weight: torch.Tensor, *, eps, compute_dtype: torch.dtype
 ):
     out = torch.empty_like(x)
+    if x.numel() == 0:
+        return out
 
     x_shape = x.shape
     num_cols = x.shape[-1]
-    num_rows = x.numel() // num_cols
+    num_heads = x.shape[-2]
+    num_seqs = x.numel() // (num_cols * num_heads)
 
-    # Assume the row dimensions are contiguous, but it can be non-contiguous between
-    # each row
-    x = x.view(num_rows, num_cols)
-    out = out.view(num_rows, num_cols)
+    # Assume the batch dimensions are contiguous, but it can be non-contiguous
+    # in the last two dimensions.
+    x = x.view(num_seqs, num_heads, num_cols)
+    out = out.view(num_seqs, num_heads, num_cols)
 
     assert weight.is_contiguous()
 
@@ -62,10 +65,12 @@ def rms_norm_triton(
     # SPDX-SnippetEnd
 
     BLOCK_SIZE, num_warps = calculate_settings(num_cols)
-    rms_norm_kernel[num_rows,](
+    rms_norm_kernel[num_seqs, num_heads](
         out,
+        out.stride(-3),
         out.stride(-2),
         x,
+        x.stride(-3),
         x.stride(-2),
         weight,
         num_cols,
@@ -95,14 +100,22 @@ if os.environ.get("CI_TESTS", "false") == "true":
 
 @autotune_compat(
     configs=rms_norm_configs,
-    key=["Y_row_stride", "X_row_stride", "compute_dtype"],
+    key=[
+        "Y_seq_stride",
+        "Y_head_stride",
+        "X_seq_stride",
+        "X_head_stride",
+        "compute_dtype",
+    ],
 )
 @triton.jit
 def rms_norm_kernel(
     Y,
-    Y_row_stride: tl.constexpr,
+    Y_seq_stride: tl.constexpr,
+    Y_head_stride: tl.constexpr,
     X,
-    X_row_stride: tl.constexpr,
+    X_seq_stride: tl.constexpr,
+    X_head_stride: tl.constexpr,
     W,
     n_cols: tl.constexpr,
     eps: tl.constexpr,
@@ -114,12 +127,14 @@ def rms_norm_kernel(
     Inspiration from a Triton tutorial:
     https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html
     """
-    row_idx = tl.program_id(0)
+
+    seq_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < n_cols
 
-    Y += row_idx * Y_row_stride
-    X += row_idx * X_row_stride
+    Y += seq_idx * Y_seq_stride + head_idx * Y_head_stride
+    X += seq_idx * X_seq_stride + head_idx * X_head_stride
 
     X_row = tl.load(X + col_offsets, mask=mask, other=0).to(compute_dtype)
     W_row = tl.load(W + col_offsets, mask=mask, other=0)

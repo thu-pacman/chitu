@@ -65,3 +65,6 @@ from chitu.ops.triton_ops.causal_conv import (
     causal_conv1d_prefill_triton,
 )
 from chitu.ops.triton_ops.fused_g import fused_g_triton
+from chitu.ops.triton_ops.fused_recurrent import (
+    fused_recurrent_gated_delta_rule_fwd_all_state_triton,
+)

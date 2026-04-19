@@ -14,7 +14,7 @@ from chitu.testing import assert_close
 @pytest.mark.parametrize("out_features", [8192])
 @pytest.mark.parametrize("has_bias", [True, False])
 def test_column_parallel_linear(
-    tp_group_size, batch_size, in_features, out_features, has_bias
+    tp_group_size, batch_size, in_features, out_features, has_bias, record_benchmark
 ):
     if not torch.distributed.is_initialized():
         torch.distributed.init_process_group("nccl")
@@ -63,7 +63,14 @@ def test_column_parallel_linear(
             state_dict["bias"] = torch.chunk(global_bias, tp_group_size, dim=0)[rank]
         parallel_linear.load_state_dict(state_dict, strict=True, assign=True)
 
-        y = parallel_linear(x)
+        y = record_benchmark.run(
+            lambda: parallel_linear(x),
+            batch_size=batch_size,
+            in_features=in_features,
+            out_features=out_features,
+            tp_group_size=tp_group_size,
+            has_bias=has_bias,
+        )
         y_ref = torch.nn.functional.linear(x, global_weight, global_bias)
 
         assert_close(y, y_ref, atol=1e-2, rtol=1e-2)
@@ -77,7 +84,7 @@ def test_column_parallel_linear(
 @pytest.mark.parametrize("out_features", [8192])
 @pytest.mark.parametrize("has_bias", [True, False])
 def test_row_parallel_linear(
-    tp_group_size, batch_size, in_features, out_features, has_bias
+    tp_group_size, batch_size, in_features, out_features, has_bias, record_benchmark
 ):
     if not torch.distributed.is_initialized():
         torch.distributed.init_process_group("nccl")
@@ -126,7 +133,14 @@ def test_row_parallel_linear(
             state_dict["bias"] = bias
         parallel_linear.load_state_dict(state_dict, strict=True, assign=True)
 
-        y = parallel_linear(x)
+        y = record_benchmark.run(
+            lambda: parallel_linear(x),
+            batch_size=batch_size,
+            in_features=in_features,
+            out_features=out_features,
+            tp_group_size=tp_group_size,
+            has_bias=has_bias,
+        )
         y_ref = torch.nn.functional.linear(x, global_weight, bias)
 
         assert_close(y, y_ref, atol=1.5e-1, rtol=1.5e-1)
