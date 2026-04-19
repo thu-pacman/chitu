@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Pytest configuration for cinfer tests.
+Pytest configuration for chitu tests.
 
 Provides automatic benchmark capability for any test:
 - Benchmarks are always enabled
@@ -82,7 +82,7 @@ from chitu.import_utils import try_import_opt_dep
 mooncake, has_mooncake = try_import_opt_dep("mooncake", "mooncake")
 
 # Add project root to path (required for correct module imports in pytest)
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
@@ -103,7 +103,7 @@ def pytest_addoption(parser):
     )
 
 
-# Global storage for benchmark results
+# Global storage for benchmark results: {test_name -> {impl_name -> [(x_val, x_name, time_us)]}}
 _benchmark_data: Dict[str, Dict[str, List[tuple]]] = defaultdict(
     lambda: defaultdict(list)
 )
@@ -155,7 +155,7 @@ def _print_benchmark_results():
     print("=" * 60)
 
     for test_name, impl_data in sorted(_benchmark_data.items()):
-        print(f"\n.{test_name}-performance:")
+        print(f"\n.{test_name}-performance (μs):")
 
         # Collect all unique x values and impls
         all_x_vals = set()
@@ -182,10 +182,13 @@ def _print_benchmark_results():
         sorted_impls = sorted(all_impls)
 
         # Build lookup table
+        #
+        # If multiple value exists for the same (x_val, impl) pair, use the lowest one
         lookup = {}
         for impl, measurements in impl_data.items():
             for x_val, _, time_us in measurements:
-                lookup[(x_val, impl)] = time_us
+                if (x_val, impl) not in lookup or time_us < lookup[(x_val, impl)]:
+                    lookup[(x_val, impl)] = time_us
 
         # Build table
         columns = [x_param_name] + sorted_impls

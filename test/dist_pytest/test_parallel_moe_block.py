@@ -62,6 +62,7 @@ def test_parallel_moe_block(
     merge_gate_up,
     task_type,
     dtype,
+    record_benchmark,
 ):
     if is_ascend_910b() and dp_size > 1 and ep_size > 1 and ep_size % 16 != 0:
         pytest.skip("DP+EP on Ascend 910B requires ep_size % 16 == 0")
@@ -311,7 +312,21 @@ def test_parallel_moe_block(
         dp_token_start = cumulative_local_bs_list[dp_group.rank_in_group]
         dp_token_end = cumulative_local_bs_list[dp_group.rank_in_group + 1]
         local_x = x[dp_token_start:dp_token_end]
-        local_y = parallel_moe_block(local_x)
+        local_y = record_benchmark.run(
+            lambda: parallel_moe_block(local_x),
+            batch_size=batch_size,
+            tp_size=tp_size,
+            dp_size=dp_size,
+            etp_size=etp_size,
+            ep_size=ep_size,
+            hidden_dim=hidden_dim,
+            n_experts=n_experts,
+            topk=topk,
+            moe_inter_dim=moe_inter_dim,
+            merge_gate_up=merge_gate_up,
+            task_type=task_type,
+            dtype=dtype,
+        )
         ref_y = ref_moe_block(ref_x)
         ref_local_y = ref_y[dp_token_start:dp_token_end]
 
@@ -363,6 +378,7 @@ def test_parallel_moe_block_blockfp8(
     merge_gate_up,
     task_type,
     dtype,
+    record_benchmark,
 ):
     set_global_args(
         OmegaConf.create(
@@ -675,7 +691,21 @@ def test_parallel_moe_block_blockfp8(
         dp_token_start = cumulative_local_bs_list[dp_group.rank_in_group]
         dp_token_end = cumulative_local_bs_list[dp_group.rank_in_group + 1]
         local_x = x[dp_token_start:dp_token_end]
-        local_y = parallel_moe_block(local_x)
+        local_y = record_benchmark.run(
+            lambda: parallel_moe_block(local_x),
+            batch_size=batch_size,
+            tp_size=tp_size,
+            dp_size=dp_size,
+            etp_size=etp_size,
+            ep_size=ep_size,
+            hidden_dim=hidden_dim,
+            n_experts=n_experts,
+            topk=topk,
+            moe_inter_dim=moe_inter_dim,
+            merge_gate_up=merge_gate_up,
+            task_type=task_type,
+            dtype=dtype,
+        )
         ref_y = ref_moe_block(ref_x)
         ref_local_y = ref_y[dp_token_start:dp_token_end]
 
