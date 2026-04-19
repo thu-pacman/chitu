@@ -11,7 +11,8 @@ proc read_tail {path max_bytes} {
     }
     set size [file size $path]
     set fh [open $path r]
-    if {$size > $max_bytes} {
+    # max_bytes <= 0 means dump the entire file.
+    if {$max_bytes > 0 && $size > $max_bytes} {
         seek $fh [expr {$size - $max_bytes}]
     }
     set data [read $fh]
@@ -28,6 +29,14 @@ proc file_contains {path needle} {
         return 1
     }
     return 0
+}
+
+proc env_or_default {name default} {
+    global env
+    if {[info exists env($name)] && $env($name) ne ""} {
+        return $env($name)
+    }
+    return $default
 }
 
 proc file_has_error {path} {
@@ -87,14 +96,14 @@ proc print_tail_if_exists {label path max_bytes} {
 
 proc dump_startup_logs {} {
     global srun_out router_log prefill_p0_glob prefill_p1_glob decode_d0_glob
-    print_tail_if_exists "srun tail" $srun_out 4000
+    print_tail_if_exists "srun log" $srun_out -1
     foreach pattern [list $router_log $prefill_p0_glob $prefill_p1_glob $decode_d0_glob] {
         if {$pattern eq ""} {
             continue
         }
         foreach f [glob -nocomplain $pattern] {
             if {[file isfile $f]} {
-                print_tail_if_exists "component tail" $f 4000
+                print_tail_if_exists "component log" $f -1
             }
         }
     }
@@ -201,6 +210,16 @@ set pd_pid ""
 set slurm_job_id ""
 set cleanup_done 0
 
+proc persist_slurm_job_id {} {
+    global slurm_job_id slurm_job_id_file
+    if {$slurm_job_id eq "" || $slurm_job_id_file eq ""} {
+        return
+    }
+    set fh [open $slurm_job_id_file w]
+    puts $fh $slurm_job_id
+    close $fh
+}
+
 proc update_slurm_job_id {} {
     global srun_out slurm_job_id
     if {$slurm_job_id ne ""} {
@@ -209,6 +228,7 @@ proc update_slurm_job_id {} {
     set job_id [extract_job_id $srun_out]
     if {$job_id ne ""} {
         set slurm_job_id $job_id
+        persist_slurm_job_id
         puts "Detected Slurm job id: $slurm_job_id"
     }
 }
@@ -219,6 +239,7 @@ proc cleanup_pd_processes {} {
         return
     }
     set cleanup_done 1
+    update_slurm_job_id
     puts "Cleaning up PD resources..."
     if {$slurm_job_id ne ""} {
         catch {exec scancel $slurm_job_id}
@@ -242,8 +263,17 @@ trap {cleanup_pd_processes; tcl_exit 1} {SIGINT SIGTERM SIGHUP}
 puts "=== PD Disaggregation CI Test ==="
 puts "Working directory: [pwd]"
 
-set model_config "Qwen3-30B-A3B-fp8"
-set model_ckpt_dir "/data/nfs/Qwen3-30B-A3B-FP8/"
+set model_config [env_or_default "PD_MODEL_CONFIG" "Qwen3-30B-A3B-fp8"]
+set model_ckpt_dir [env_or_default "PD_MODEL_CKPT_DIR" "/data/nfs/Qwen3-30B-A3B-FP8/"]
+set model_spec [env_or_default "PD_MODEL_SPEC" ""]
+set pd_spec [env_or_default "PD_PD_SPEC" "decode_wait_timeout_s=600,decode_prealloc_max_pending=128,decode_prealloc_token_budget=250000,decode_prealloc_reserved_tokens=1024,decode_max_running_tasks_per_dp=64"]
+set default_prefill_spec "tp=1,pp=2,dp=2,ep=2,max_seq_len=8200,max_reqs=128,chunk=65536,full_warmup=True"
+set prefill_spec [env_or_default "PD_PREFILL_SPEC" $default_prefill_spec]
+set prefill_spec_p0 [env_or_default "PD_PREFILL_SPEC_0" $prefill_spec]
+set prefill_spec_p1 [env_or_default "PD_PREFILL_SPEC_1" $prefill_spec]
+set decode_spec [env_or_default "PD_DECODE_SPEC" "tp=2,pp=2,dp=2,ep=4,max_seq_len=10240,max_reqs=256,full_warmup=False"]
+set srun_partition [env_or_default "PD_PARTITION" "ci"]
+set bind_code [env_or_default "PD_BIND_CODE" "0"]
 set router_port ""
 set router_log ""
 set prefill_p0_glob ""
@@ -264,29 +294,36 @@ if {![file exists $apptainer_image]} {
     exit 1
 }
 
-set log_dir "[pwd]/log"
-set env(LOG_DIR) $log_dir
+if {[info exists env(LOG_DIR)] && $env(LOG_DIR) ne ""} {
+    set log_dir $env(LOG_DIR)
+} else {
+    set log_dir "[pwd]/log"
+    set env(LOG_DIR) $log_dir
+}
 file mkdir $log_dir
 set srun_out "${log_dir}/srun.out"
+set slurm_job_id_file "${log_dir}/slurm_job_id"
+if {[file exists $slurm_job_id_file]} {
+    file delete -force $slurm_job_id_file
+}
 
 set model_tag $model_config
 regsub -all {[^A-Za-z0-9_.-]} $model_tag "_" model_tag
 
-set prefill_spec "tp=2,pp=1,dp=1,ep=1,max_seq_len=5200,max_batch_size=128,chunk=65536,full_warmup=False"
-set decode_spec "tp=1,pp=1,dp=4,ep=4,max_seq_len=6144,max_batch_size=256,full_warmup=False"
-
 set cmd_parts [list bash script/srun_pd_disagg_base_apptainer.sh \
     $model_config $model_ckpt_dir $apptainer_image \
-    --nodes 2 --gpus-per-node 4 --partition ci \
-    --prefill $prefill_spec \
-    --prefill $prefill_spec \
+    --nodes 2 --gpus-per-node 8 --partition $srun_partition]
+if {$model_spec ne ""} {
+    lappend cmd_parts --model-spec $model_spec
+}
+if {$pd_spec ne ""} {
+    lappend cmd_parts --pd-spec $pd_spec
+}
+lappend cmd_parts \
+    --prefill $prefill_spec_p0 \
+    --prefill $prefill_spec_p1 \
     --decode $decode_spec \
-    --bind-code 0 \
-    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_wait_timeout_s=600 \
-    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_max_pending=128 \
-    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_token_budget=250000 \
-    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_prealloc_reserved_tokens=1024 \
-    --common-override dp_config.router.pd_disaggregation.kv_transfer.decode_max_running_tasks_per_dp=64]
+    --bind-code $bind_code
 set cmd_str [join $cmd_parts " "]
 
 puts "=== Launching PD Disaggregation via srun ==="
@@ -341,7 +378,7 @@ while {$router_ip eq ""} {
     }
     if {[expr {[clock seconds] - $start}] > $router_timeout} {
         puts "ERROR: timeout waiting for router info"
-        puts [read_tail $srun_out 4000]
+        puts [read_tail $srun_out -1]
         exit 1
     }
     sleep 1
@@ -367,7 +404,19 @@ wait_for_pattern "Prefill P1" $prefill_p1_glob $worker_ready_str 1200
 puts "Waiting for Decode D0 readiness..."
 wait_for_pattern "Decode D0" $decode_d0_glob $worker_ready_str 1200
 
-set bench_output_dir "[pwd]/benchmark_output_30B_A3B_temp"
+set bench_model [env_or_default "PD_BENCH_MODEL" $model_config]
+set bench_batch_size [env_or_default "PD_BENCH_BATCH_SIZE" "128"]
+set bench_iterations [env_or_default "PD_BENCH_ITERATIONS" "1"]
+set bench_input_len [env_or_default "PD_BENCH_INPUT_LEN" "8192"]
+set bench_output_len [env_or_default "PD_BENCH_OUTPUT_LEN" "2048"]
+set bench_warmup [env_or_default "PD_BENCH_WARMUP" "1"]
+set bench_dataset [env_or_default "PD_BENCH_DATASET" "sharegpt"]
+set bench_dataset_path [env_or_default "PD_BENCH_DATASET_PATH" "/data/nfs/ShareGPT_V3_unfiltered_cleaned_split.json"]
+set bench_tokenizer_path [env_or_default "PD_BENCH_TOKENIZER_PATH" "/data/nfs/Qwen3-30B-A3B-FP8/"]
+set bench_output_dir [env_or_default "PD_BENCH_OUTPUT_DIR" "benchmark_output_${model_tag}_temp"]
+if {[file pathtype $bench_output_dir] ne "absolute"} {
+    set bench_output_dir "[pwd]/$bench_output_dir"
+}
 file mkdir $bench_output_dir
 
 set bench_inner_cmd "PY=python; if test -x /opt/conda/bin/python; then PY=/opt/conda/bin/python; fi; \
@@ -377,15 +426,15 @@ set bench_inner_cmd "PY=python; if test -x /opt/conda/bin/python; then PY=/opt/c
     which \$PY || true; \
     \$PY -c \"import sys; print('python:', sys.executable); import transformers; print('transformers:', transformers.__version__)\"; \
     cd /workspace/chitu/benchmarks && \$PY benchmark_serving.py \
-    --batch-size 128 \
-    --model $model_config \
-    --iterations 1 \
-    --input-len 1024 \
-    --output-len 1024 \
-    --warmup 1 \
-    --dataset sharegpt \
-    --dataset-path /data/nfs/ShareGPT_V3_unfiltered_cleaned_split.json \
-    --tokenizer-path /data/nfs/Qwen3-30B-A3B-FP8/ \
+    --batch-size $bench_batch_size \
+    --model $bench_model \
+    --iterations $bench_iterations \
+    --input-len $bench_input_len \
+    --output-len $bench_output_len \
+    --warmup $bench_warmup \
+    --dataset $bench_dataset \
+    --dataset-path $bench_dataset_path \
+    --tokenizer-path $bench_tokenizer_path \
     --output-dir $bench_output_dir/ \
     --base-url http://$router_ip:$router_port"
 
@@ -438,7 +487,7 @@ def handle_obj(obj, prefix=""):
     texts = obj.get("generated_texts", [])
     errors = obj.get("errors", [])
     for i, t in enumerate(texts):
-        preview = t[:200] + "..." if len(t) > 200 else t
+        preview = t[:1024] + "..." if len(t) > 1024 else t
         print(f"{prefix}generated_texts[{i}]: {preview}")
     for i, e in enumerate(errors):
         if e:

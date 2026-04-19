@@ -35,7 +35,7 @@ dp_config:
       coordination_port: 29800
       metadata_sync_port: 29801
       kv_transfer_backend: "mooncake"
-      ib_device: "mlx5_0"
+      ib_device: null
       bootstrap_port: 8080
 
       kv_transfer:

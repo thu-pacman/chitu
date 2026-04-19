@@ -133,19 +133,22 @@ class KvTransferConfig:
     buffer_size: int = 2048
     transfer_timeout: float = 30.0
     max_concurrent_transfers: int = 8
-    # Decode 侧等待 Prefill 回写 Success 信号的参数（见 kv_manager.recv_kv_cache_and_insert）
+    # Settings for how long Decode waits for the Success signal from Prefill
+    # (see kv_manager.recv_kv_cache_and_insert).
     decode_wait_timeout_s: float = 20.0
     decode_resend_interval_s: float = 0.5
     decode_poll_interval_s: float = 0.05
-    # Decode 预分配相关参数：用于解耦预分配与运行时
+    # Decode preallocation settings. These separate preallocation from runtime work.
     decode_prealloc_max_pending: Optional[int] = None
     decode_prealloc_poll_interval_s: float = 0.01
-    # Decode 预分配预算：控制 prealloc 并发的 token 数量
+    # Decode preallocation budget. Limits the number of tokens that can be
+    # preallocated at the same time. A value <= 0 disables this limit.
     decode_prealloc_token_budget: Optional[int] = None
     decode_prealloc_reserved_tokens: int = 0
-    # Decode 运行并发上限（per DP rank）。用于将 block 上限与运行并发解耦
+    # Decode runtime concurrency limit, per DP rank. This separates the block
+    # limit from the runtime concurrency limit. A value <= 0 means no limit.
     decode_max_running_tasks_per_dp: Optional[int] = None
-    # Decode prepare backpressure 日志节流间隔/s
+    # Log throttling interval for Decode prepare backpressure, in seconds.
     prepare_backpressure_log_interval_s: float = 5.0
 
 

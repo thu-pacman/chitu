@@ -343,6 +343,42 @@ class PDScheduler(Scheduler):
         self.token_manager = token_manager
         logger.info("token manager set for pd scheduler")
 
+    def _fail_decode_request_before_taskpool(
+        self, request_id: str, info: Optional[dict[str, Any]], error_message: str
+    ) -> None:
+        rid = request_id
+        now = time.time()
+        task = info.get("task") if info is not None else None
+
+        self._decode_incoming_q.pop(rid)
+        self._decode_prealloc_q.pop(rid)
+        self._decode_ready_q.pop(rid)
+
+        decode_info = self.pending_decode_requests.get(rid)
+        if decode_info is not None:
+            decode_info["status"] = PDRequestStatus.FAILED
+            decode_info["error_message"] = error_message
+            decode_info["decode_complete_time"] = now
+
+        if self.kv_manager is not None:
+            room = self.kv_manager._to_uuid(rid)
+            self.kv_manager.request_status.pop(room, None)
+            trace_map = self.kv_manager._trace_room_to_request_id
+            if isinstance(trace_map, dict):
+                trace_map.pop(room, None)
+
+        if task is not None and getattr(task, "req", None) is not None:
+            task.stopped = True
+            if not task.req.finished:
+                task.req.finish_reason = "error"
+                task.req.finish()
+
+        if self.token_manager is not None:
+            self.token_manager.token_sender.send_error(rid, error_message)
+            self.token_manager.unwrap_task(rid)
+
+        logger.error(f"[PD_DECODE][reject] req_id={rid} error={error_message}")
+
     def _get_decode_prepare_endpoint(
         self, dp_rank: int, timeout_s: float = 5.0
     ) -> dict:
@@ -1137,11 +1173,21 @@ class DecodeOnlyScheduler(PDScheduler):
                         prefix_len
                         > kv_cache_manager.block_size * kv_cache_manager.num_blocks
                     ):
-                        raise RuntimeError(
-                            "KV cache capacity is insufficient to support prefilling.\n"
-                            f"  - number of total blocks: {kv_cache_manager.num_blocks}\n"
-                            f"  - Block size: {kv_cache_manager.block_size}\n"
-                            f"However, task[{task.task_id}] prefill prompts are too long: {task.prompt_len}"
+                        total_capacity_tokens = (
+                            kv_cache_manager.block_size * kv_cache_manager.num_blocks
+                        )
+                        error_message = (
+                            "KV cache capacity is insufficient to support prefilling. "
+                            f"total_blocks={kv_cache_manager.num_blocks} "
+                            f"block_size={kv_cache_manager.block_size} "
+                            f"total_capacity_tokens={total_capacity_tokens} "
+                            f"prompt_len={task.prompt_len}. "
+                            "Increase decode KV blocks or enable full_warmup."
+                        )
+                        self._fail_decode_request_before_taskpool(
+                            rid,
+                            info,
+                            error_message,
                         )
                     continue
 
@@ -1163,6 +1209,7 @@ class DecodeOnlyScheduler(PDScheduler):
             if float(info.get("first_prepare_ts", 0.0)) <= 0.0:
                 info["first_prepare_ts"] = now
             info["prealloc_tokens"] = required_tokens
+            info["target_dp_rank"] = target_dp_rank
             if self._decode_prealloc_q.enqueue(rid, info):
                 self._decode_incoming_q.pop(rid)
                 self._decode_prealloc_tokens_inflight += required_tokens
@@ -1455,6 +1502,53 @@ class DecodeOnlyScheduler(PDScheduler):
                 f"p50_ms={_pct(50):.2f} p90_ms={_pct(90):.2f} "
                 f"p95_ms={_pct(95):.2f} p99_ms={_pct(99):.2f}"
             )
+
+    def evict_task(self, task_id: str) -> None:
+        """Override evict_task for decode-only PD mode.
+
+        In PD disaggregation, a task that arrives at the decode node has already
+        completed prefill on the prefill node.  The base-class evict_task() resets
+        the task back to TaskType.Prefill so it can be re-prefilled locally, but on
+        a decode-only node there is no prefill engine — the task would sit forever as
+        a zombie Prefill task, causing can_prefill() to return True and forcing every
+        schedule() call to return [] across ALL DP ranks, deadlocking the service.
+
+        Instead we free the KV cache and mark the task as stopped so that update()
+        removes it from TaskPool on the next step.  The client receives an error
+        (finish_reason="evicted") and can retry.
+        """
+        from chitu.backend import Backend
+        from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
+
+        task = TaskPool.pool[task_id]
+
+        # Free KV cache metadata (same as base class)
+        task.next_token = -1
+        task.evicting = True
+        self.cache_manager_dict["main"].finalize_metadata_all_decode(task)
+        Backend.executor.special_step([task.task_id], type="EndTask")
+
+        logger.warning(
+            f"[PD] Evicted decode task {task_id} due to insufficient KV cache; "
+            f"task will be failed (cannot re-prefill on decode-only node)",
+            extra={
+                "task_id": task_id,
+                "event": "scheduler_task_evicted",
+                "kvcache_block_threshold": self.kvcache_block_threshold,
+                "total_blocks": self.cache_manager_dict["main"].num_blocks,
+            },
+        )
+
+        PrometheusMetricsCollector.inc_task_eviction()
+
+        # Mark stopped so need_remove() returns True and update() drops it
+        task.stopped = True
+        if getattr(task, "req", None) is not None and not task.req.finished:
+            task.req.finish_reason = "evicted"
+            task.req.finish()
+
+        # For congestion control
+        self.kvcache_block_threshold = max(1, self.kvcache_block_threshold // 2)
 
     def schedule(
         self,

@@ -220,6 +220,7 @@ class TestTPDispatch:
             len(send_tokens) == len(recv_tokens)
             for send_tokens, recv_tokens in zip(base.tokens, out.tokens)
         )
+        assert out.prefix_lens == base.prefix_lens
 
     def test_empty_prefill(self, configured_packed_tasks_base, record_benchmark):
         """TP Empty Prefill"""

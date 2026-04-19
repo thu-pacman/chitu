@@ -357,6 +357,8 @@ class MetadataSerializer:
             msg_dict["new_cache_ids_list"] = tasks.new_cache_ids_list
         if tasks.hit_token_lens:
             msg_dict["hit_token_lens"] = tasks.hit_token_lens
+        if tasks.prefix_lens:
+            msg_dict["prefix_lens"] = tasks.prefix_lens
 
         # 序列化
         return msgpack.packb(msg_dict, use_bin_type=True)
@@ -396,6 +398,7 @@ class MetadataSerializer:
                 payload_type=payload_type,
                 new_cache_ids_list=msg_dict.get("new_cache_ids_list", []),
                 hit_token_lens=msg_dict.get("hit_token_lens", []),
+                prefix_lens=msg_dict.get("prefix_lens", []),
                 num_tokens=num_tokens,
                 has_outputs=msg_dict.get("has_outputs", []),
             )
@@ -452,6 +455,7 @@ class MetadataSerializer:
 
         packed_tasks.new_cache_ids_list = msg_dict.get("new_cache_ids_list", [])
         packed_tasks.hit_token_lens = msg_dict.get("hit_token_lens", [])
+        packed_tasks.prefix_lens = msg_dict.get("prefix_lens", [])
 
         return payload_type, packed_tasks, slot_idx
 

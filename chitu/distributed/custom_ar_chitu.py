@@ -13,7 +13,6 @@ from logging import getLogger
 
 from chitu.import_utils import try_import_platform_dep
 
-
 ops = None
 has_chitu_backend = False
 custom_ar = False

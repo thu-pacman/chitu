@@ -11,6 +11,7 @@ from chitu.kv_cache import GlobalLocalMap, PagedKVCache
 from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
     KVManager,
     DisaggregationMode,
+    KVPoll,
 )
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
@@ -53,6 +54,25 @@ def _coordination_get_decode_prepare_endpoint(addr: str, decode_sid: int, dp_ran
         msgpack.packb(
             {
                 "type": "get_decode_prepare_endpoint",
+                "decode_scheduler_id": decode_sid,
+                "dp_rank": dp_rank,
+            },
+            use_bin_type=True,
+        )
+    )
+    resp = msgpack.unpackb(sock.recv(), raw=False)
+    sock.close()
+    return resp
+
+
+def _coordination_get_decode_status_endpoint(addr: str, decode_sid: int, dp_rank: int):
+    ctx = zmq.Context.instance()
+    sock = ctx.socket(zmq.REQ)
+    sock.connect(addr)
+    sock.send(
+        msgpack.packb(
+            {
+                "type": "get_decode_status_endpoint",
                 "decode_scheduler_id": decode_sid,
                 "dp_rank": dp_rank,
             },
@@ -133,3 +153,130 @@ def test_decode_prepare_listener(
 
     room = kv_manager._to_uuid("req-prepare-1")
     assert room in kv_manager._prepared_transfers
+
+
+@pytest.mark.pd_unit
+def test_decode_status_endpoint_publishes_broadcast_port(
+    cuda_available,
+    global_args,
+    coordination_service,
+    init_distributed,
+):
+    device = "cuda"
+    cache = _build_paged_cache(device=device)
+    meta = MetadataBuffers(size=4)
+    kv_manager = KVManager(
+        kv_cache=cache,
+        metadata_buffers=meta,
+        disaggregation_mode=DisaggregationMode.DECODE,
+    )
+
+    addr = kv_manager._coordination_metadata_addr
+    assert addr is not None
+    assert _wait_until(
+        lambda: _coordination_get_decode_status_endpoint(
+            addr, decode_sid=0, dp_rank=0
+        ).get("status")
+        == "success"
+    )
+    endpoint = _coordination_get_decode_status_endpoint(
+        addr,
+        decode_sid=0,
+        dp_rank=0,
+    ).get("endpoint", {})
+    assert endpoint.get("ip")
+    assert int(endpoint.get("port", 0) or 0) > 0
+    assert int(endpoint.get("broadcast_port", 0) or 0) > 0
+
+
+class _DummyBroadcastSock:
+    def __init__(self):
+        self.payloads = []
+
+    def send(self, payload):
+        self.payloads.append(payload)
+
+
+@pytest.mark.pd_unit
+def test_handle_prepare_transfer_message_relays_to_internal_broadcast(
+    cuda_available,
+    global_args,
+    coordination_service,
+    init_distributed,
+):
+    device = "cuda"
+    cache = _build_paged_cache(device=device)
+    meta = MetadataBuffers(size=4)
+    kv_manager = KVManager(
+        kv_cache=cache,
+        metadata_buffers=meta,
+        disaggregation_mode=DisaggregationMode.DECODE,
+    )
+    broadcast = _DummyBroadcastSock()
+    kv_manager._decode_internal_pub_socket = broadcast
+
+    payload = msgpack.packb(
+        {
+            "type": "PD_PREPARE_TRANSFER",
+            "request_id": "req-prepare-relay-1",
+            "prefill_scheduler_id": 0,
+            "prefix_len": 32,
+            "task_cache_ids": [0],
+        },
+        use_bin_type=True,
+    )
+    msg = msgpack.unpackb(payload, raw=False)
+
+    kv_manager.handle_prepare_transfer_message(
+        msg,
+        payload=payload,
+        relay_internal=True,
+    )
+    kv_manager.process_pending_prepare_transfers()
+
+    room = kv_manager._to_uuid("req-prepare-relay-1")
+    assert room in kv_manager._prepared_transfers
+    assert broadcast.payloads == [payload]
+
+
+@pytest.mark.pd_unit
+def test_handle_decode_internal_status_message_relays_to_internal_broadcast(
+    cuda_available,
+    global_args,
+    coordination_service,
+    init_distributed,
+):
+    device = "cuda"
+    cache = _build_paged_cache(device=device)
+    meta = MetadataBuffers(size=4)
+    kv_manager = KVManager(
+        kv_cache=cache,
+        metadata_buffers=meta,
+        disaggregation_mode=DisaggregationMode.DECODE,
+    )
+    broadcast = _DummyBroadcastSock()
+    kv_manager._decode_internal_pub_socket = broadcast
+
+    request_id = "req-status-relay-1"
+    room = kv_manager._to_uuid(request_id)
+    kv_manager._trace_room_to_request_id[room] = request_id
+
+    payload = msgpack.packb(
+        {
+            "type": "PD_STATUS_UPDATE",
+            "request_id": request_id,
+            "room": room.bytes,
+            "status": int(KVPoll.Success.value),
+        },
+        use_bin_type=True,
+    )
+    msg = msgpack.unpackb(payload, raw=False)
+
+    kv_manager.handle_decode_internal_message(
+        msg,
+        payload=payload,
+        relay_internal=True,
+    )
+
+    assert kv_manager.request_status[room] == int(KVPoll.Success.value)
+    assert broadcast.payloads == [payload]

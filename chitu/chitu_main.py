@@ -109,6 +109,14 @@ def _auto_set_num_blocks_after_warmup(args):
         )
         return
 
+    pd_cfg = args.dp_config.router.pd_disaggregation
+    if pd_cfg.enabled:
+        sched_type = args.scheduler.type.lower()
+        is_pd_decode_only = "decode_only" in sched_type
+    else:
+        is_pd_decode_only = False
+    full_warmup = args.infer.full_warmup
+
     paged_caches = {}
     for name, cache in Backend.cache_dict.items():
         if (
@@ -121,6 +129,32 @@ def _auto_set_num_blocks_after_warmup(args):
     if "main" not in paged_caches:
         logger.warning(
             "skip auto set num blocks after warmup because main cache manager is missing"
+        )
+        return
+
+    if is_pd_decode_only and not full_warmup:
+        current_main_blocks = int(paged_caches["main"].num_blocks)
+        get_global_args().infer.num_blocks = int(current_main_blocks)
+        if Backend.cache_managers:
+            for dp_rank_managers in Backend.cache_managers:
+                main_mgr = dp_rank_managers.get("main")
+                if main_mgr is None:
+                    continue
+                mgr_current = int(main_mgr.num_blocks)
+                if int(current_main_blocks) != int(mgr_current):
+                    main_mgr.realloc(int(current_main_blocks))
+                    logger.info(
+                        "scheduler main cache manager synced to %d blocks after warmup skip",
+                        int(current_main_blocks),
+                    )
+        if torch.distributed.get_rank() == 0:
+            for scheduler in Backend.schedulers:
+                scheduler.reset_kvcache_block_threshold()
+        logger.warning(
+            "skip auto set num blocks after warmup for PD decode-only without "
+            "full_warmup; direct warmup only exercises batch_size=1 and seq_len=1, "
+            "so keeping current main KV blocks=%d",
+            int(current_main_blocks),
         )
         return
 
@@ -170,6 +204,13 @@ def _auto_set_num_blocks_after_warmup(args):
     main_current = int(main_cm.num_blocks)
     main_cap = main_cm.get_allocatable_max_num_blocks()
     reserve_bytes = 512 << 20  # 512 MiB
+    min_decode_blocks = 1
+    if is_pd_decode_only:
+        min_decode_blocks = int(
+            getattr(main_cm, "max_blocks_per_req", 0)
+            or ceil_div(int(args.infer.max_seq_len), int(main_cm.block_size))
+        )
+        min_decode_blocks = clamp_int(min_decode_blocks, 1, int(main_cap))
 
     if indexer_cm is not None:
         solved_main = solve_main_target_after_shrink(
@@ -211,6 +252,15 @@ def _auto_set_num_blocks_after_warmup(args):
         final_main_target = allreduce_min_int(int(final_main_target))
         final_main_target = clamp_int(int(final_main_target), 1, int(main_cap))
         final_indexer_target = None
+
+    if is_pd_decode_only and int(final_main_target) < int(min_decode_blocks):
+        logger.warning(
+            "PD decode-only warmup solve requested %d main KV blocks, but at least "
+            "%d are required to hold one max_seq_len request; clamping upward",
+            int(final_main_target),
+            int(min_decode_blocks),
+        )
+        final_main_target = int(min_decode_blocks)
 
     # If main needs shrink, do it early to release memory before any later growth.
     main_current = int(main_cm.num_blocks)
@@ -254,6 +304,14 @@ def _auto_set_num_blocks_after_warmup(args):
         main_cm.get_allocatable_max_num_blocks(),
     )
     safe_main_target = allreduce_min_int(int(safe_main_target))
+    if is_pd_decode_only and int(safe_main_target) < int(min_decode_blocks):
+        logger.warning(
+            "PD decode-only safe main KV target %d is smaller than the one-request "
+            "floor %d; clamping upward",
+            int(safe_main_target),
+            int(min_decode_blocks),
+        )
+        safe_main_target = int(min_decode_blocks)
 
     logger.info(
         "KV safe main target before final resize: current=%d final_main_target=%d safe_main_target=%d",

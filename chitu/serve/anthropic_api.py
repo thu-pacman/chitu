@@ -27,7 +27,6 @@ from chitu.serve.common import (
 )
 from chitu.utils import gen_req_id
 
-
 logger = getLogger(__name__)
 
 
