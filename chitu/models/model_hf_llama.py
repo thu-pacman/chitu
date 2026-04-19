@@ -244,9 +244,9 @@ class AttentionHFLlama(Attention):
         xq, xk, xv = self._run_linear(x)
 
         bs_seq = xq.numel() // xq.shape[-1]
-        xq = xq.view(bs_seq, self.n_local_heads, self.head_dim).contiguous()
-        xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
-        xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
+        xq = xq.view(bs_seq, self.n_local_heads, self.head_dim)
+        xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim)
 
         if hasattr(self, "q_norm"):
             xq = self.q_norm(xq)
