@@ -55,7 +55,9 @@ class PDCoordinationService:
 
         # Decode status endpoints (control plane) per (decode_scheduler_id, dp_rank).
         # Prefill sends final Success to the owner dp_rank's status endpoint.
-        # Decode scheduler (rank0) may also need to discover dp_rank0 endpoint for status aggregation.
+        # Decode scheduler (rank0) need to discover dp_rank0 endpoint for
+        # status aggregation. The same owner record publish an
+        # internal broadcast port for decode-local ZMQ broadcast.
         self.decode_status_endpoints: dict[tuple[int, int], dict] = {}
 
         # ZMQ related
@@ -341,6 +343,7 @@ class PDCoordinationService:
             dp_rank = int(request_data.get("dp_rank", 0) or 0)
             ip = str(request_data.get("ip", "") or "").strip()
             port = int(request_data.get("port", 0) or 0)
+            broadcast_port = request_data.get("broadcast_port", 0)
             if not ip or port <= 0:
                 return {
                     "status": "error",
@@ -349,6 +352,7 @@ class PDCoordinationService:
             self.decode_status_endpoints[(decode_scheduler_id, dp_rank)] = {
                 "ip": ip,
                 "port": port,
+                "broadcast_port": broadcast_port,
             }
             return {"status": "success"}
 

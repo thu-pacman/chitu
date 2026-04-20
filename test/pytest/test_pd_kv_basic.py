@@ -1,6 +1,8 @@
 import os
 import time
+from uuid import NAMESPACE_DNS, uuid5
 
+import numpy as np
 import pytest
 import torch
 
@@ -9,7 +11,9 @@ from chitu.task_type import TaskType
 from chitu.kv_cache import GlobalLocalMap, PagedKVCache
 from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
     KVManager,
+    KVPoll,
     DisaggregationMode,
+    TransferKVChunk,
 )
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
@@ -140,3 +144,155 @@ def test_pd_transfer_end_to_end(
     )
 
     assert req_id in decode_cache.tid_to_cached_len
+
+
+@pytest.mark.pd_unit
+def test_recv_kv_cache_and_insert_fallback_uses_batch_cache_ids():
+    class FakeMetadataBuffers:
+        def get(self, aux_indices):
+            return torch.zeros((len(aux_indices),), dtype=torch.int32)
+
+        def free(self, room_ids):
+            return
+
+    class FakeKVCache:
+        def __init__(self):
+            self.tid_to_cached_len = {}
+            self.insert_calls = []
+
+        def insert_kv_cache_from_transfer(self, req_id, page_indices, prefix_length):
+            self.insert_calls.append((req_id, list(page_indices), int(prefix_length)))
+            self.tid_to_cached_len[req_id] = int(prefix_length)
+
+    kv_manager = KVManager.__new__(KVManager)
+    kv_manager.disaggregation_mode = DisaggregationMode.DECODE
+    kv_manager._warmup_completed = True
+    kv_manager._buffer_ptrs_valid = True
+    kv_manager._prepared_transfers = {}
+    kv_manager.request_status = {}
+    kv_manager.metadata_buffers = FakeMetadataBuffers()
+    kv_manager._is_decode_public_status_rank = False
+    kv_manager.linear_attn_cache = None
+    kv_manager.indexer_cache = None
+    kv_manager._trace = lambda *args, **kwargs: None
+    kv_manager.reorder_kvcache = lambda room_ids: None
+    kv_manager._get_decode_public_status_endpoint = lambda: ("127.0.0.1", 1)
+    kv_manager._to_uuid = lambda request_id: uuid5(NAMESPACE_DNS, request_id)
+
+    captured = {}
+
+    def fake_prepare(request_ids, kv_cache, prefix_lens, cache_ids_list=None):
+        captured["request_ids"] = list(request_ids)
+        captured["prefix_lens"] = list(prefix_lens)
+        captured["cache_ids_list"] = [list(ids) for ids in cache_ids_list or []]
+        for idx, request_id in enumerate(request_ids):
+            room = kv_manager._to_uuid(request_id)
+            kv_manager._prepared_transfers[room] = {
+                "aux_index": idx,
+                "dst_indices_np": np.asarray(cache_ids_list[idx], dtype=np.int32),
+            }
+            kv_manager.request_status[room] = KVPoll.Success.value
+
+    kv_manager.prepare_kv_transfer = fake_prepare
+
+    kv_cache = FakeKVCache()
+    request_ids = ["req-fallback-1"]
+    prefix_lens = [64]
+    cache_ids_list = [[7, 8, 9, 10]]
+
+    first_tokens = kv_manager.recv_kv_cache_and_insert(
+        request_ids=request_ids,
+        kv_cache=kv_cache,
+        prefix_lens=prefix_lens,
+        cache_ids_list=cache_ids_list,
+    )
+
+    assert captured["request_ids"] == request_ids
+    assert captured["prefix_lens"] == prefix_lens
+    assert captured["cache_ids_list"] == cache_ids_list
+    assert kv_cache.insert_calls == [
+        ("req-fallback-1", cache_ids_list[0], prefix_lens[0])
+    ]
+    assert torch.equal(first_tokens, torch.zeros((1,), dtype=torch.int32))
+
+
+def test_transfer_worker_frees_aux_once_for_decode_tp_shards(monkeypatch):
+    class FakeQueue:
+        def __init__(self, item):
+            self._item = item
+            self._returned = False
+
+        def get(self):
+            if not self._returned:
+                self._returned = True
+                return self._item
+            raise KeyboardInterrupt()
+
+        def put(self, item):
+            raise AssertionError("transfer_worker should not requeue successful chunk")
+
+    class FakeMetadataBuffers:
+        def __init__(self):
+            self.freed = []
+
+        def free(self, room_ids):
+            self.freed.append(list(room_ids))
+
+    class FakeKVCache:
+        def __init__(self):
+            self.removed = []
+
+        def remove_task(self, room):
+            self.removed.append(room)
+
+    kv_manager = KVManager.__new__(KVManager)
+    kv_manager.metadata_buffers = FakeMetadataBuffers()
+    kv_manager.kv_cache = FakeKVCache()
+    kv_manager._trace_room_to_request_id = {}
+    kv_manager._trace = lambda *args, **kwargs: None
+
+    notifications = []
+    kv_manager._notify_prefill_ctrl_stage_done = (
+        lambda room, aux_done: notifications.append((room, aux_done))
+    )
+
+    room = uuid5(NAMESPACE_DNS, "req-transfer-worker-1")
+    kv_chunk = TransferKVChunk(
+        room=room,
+        prefill_kv_indices=np.asarray([0, 1], dtype=np.int32),
+        prefill_aux_index=7,
+        seq_len=32,
+    )
+    metas = [
+        {
+            "decode_pp_rank": 0,
+            "decode_pp_size": 1,
+            "decode_tp_rank": 0,
+            "decode_tp_size": 2,
+        },
+        {
+            "decode_pp_rank": 0,
+            "decode_pp_size": 1,
+            "decode_tp_rank": 1,
+            "decode_tp_size": 2,
+        },
+    ]
+    kv_manager._collect_all_metas_for_room = lambda room_id: list(metas)
+
+    transfer_calls = []
+
+    def fake_transfer_one_meta(meta, chunk, executor):
+        transfer_calls.append((int(meta["decode_tp_rank"]), chunk.prefill_aux_index))
+        return True, True
+
+    kv_manager._transfer_one_meta = fake_transfer_one_meta
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+
+    with pytest.raises(KeyboardInterrupt):
+        kv_manager.transfer_worker(FakeQueue(kv_chunk), executor=None)
+
+    assert transfer_calls == [(0, 7), (1, 7)]
+    assert kv_manager.metadata_buffers.freed == [[room]]
+    assert notifications == [(room, True)]
+    assert kv_manager.kv_cache.removed == [room]

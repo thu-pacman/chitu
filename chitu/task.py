@@ -627,7 +627,8 @@ class Task:
         base_len = getattr(self, "_prefix_tokens_base_len", 0)
         if self.task_type == TaskType.Decode and base_len > 0:
             total = base_len + len(self.prefix_tokens)
-            total += Backend.executor.mtp_size
+            if self.has_unsync_new_token:
+                total += Backend.executor.mtp_size
             return total
         return (
             len(self.prefix_tokens)
@@ -937,10 +938,16 @@ class PackedTasksBase:
     num_tokens: int = 0
     has_outputs: list[int] = field(default_factory=list)
 
-    # 用于从KVCacheManager -> KVCache传递索引信息: KVCacheManager新分配kv cache索引时有值，否则为[]
+    # Used to pass index data from KVCacheManager to KVCache. This is populated
+    # only when KVCacheManager allocates new KV cache indices; otherwise it is [].
     new_cache_ids_list: list[list[int]] = field(default_factory=list)
-    # 用于从KVCacheManager -> KVCache传递prefix caching本轮新增击中长度: 有新增击中时有值，否则为[]
+    # Used to pass the newly added prefix-cache hit lengths from the current step
+    # from KVCacheManager to KVCache. This is populated only when new hits are
+    # added; otherwise it is [].
     hit_token_lens: list[int] = field(default_factory=list)
+    # Used by PD Decode KV pull. Stores the prefix length of each request in the
+    # current batch.
+    prefix_lens: list[int] = field(default_factory=list)
 
     @property
     def req_ids(self):
@@ -1018,6 +1025,7 @@ class PackedTasks(PackedTasksBase):
             self.new_cache_ids_list = [task.new_cache_ids for task in self.tasks]
         if any(task.hit_token_len for task in self.tasks):
             self.hit_token_lens = [task.hit_token_len for task in self.tasks]
+        self.prefix_lens = [int(task.prefix_tokens_len) for task in self.tasks]
 
         self.payload_type = SerializedPackedTasksPayloadType(self.task_type.value)
 

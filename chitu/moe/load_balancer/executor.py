@@ -122,7 +122,7 @@ class WeightMigrationExecutor:
         try:
             params = self.accessor.get_params(sample_layer_id, sample_slot)
         except Exception as e:
-            logger.error(
+            logger.warning(
                 f"[schema warmup] failed to get params for layer={sample_layer_id}, slot={sample_slot}: {e}"
             )
             return

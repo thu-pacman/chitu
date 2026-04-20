@@ -14,7 +14,6 @@ from chitu.moe.batched_routed_activation import (
 )
 from chitu.moe.batched_expert_result import PerExpertDenseBatchedExpertResultMinimal
 
-
 # SPDX-SnippetBegin
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-SnippetCopyrightText: 2025 vLLM Team

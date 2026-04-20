@@ -1081,7 +1081,7 @@ class Executor:
                 for task in update_tasks.tasks:
                     task.consume_req_tokens()
             if self.rank == 0:
-                for task in update_tasks.tasks:
+                for task in update_tasks.output_tasks:
                     task.has_unsync_new_token = True
 
         # 3. sample
@@ -1217,7 +1217,11 @@ class Executor:
             is_empty_step = True
         if not is_empty_step:
             # Ensure KV cache is present for PD decode-only before updating CacheManager state.
-            self._kv_hook.before_decode_step(tasks.req_ids)
+            self._kv_hook.before_decode_step(
+                tasks.req_ids,
+                cache_ids_list=getattr(tasks, "new_cache_ids_list", None),
+                prefix_lens=getattr(tasks, "prefix_lens", None),
+            )
             for cache in Backend.cache_dict.values():
                 cache.prepare_cache_decode(tasks)
 
@@ -1674,7 +1678,10 @@ class Executor:
                         if self.dp_size <= 1
                         else DPTaskCollector.get_total_packedtasks()
                     )
-                    if isinstance(all_current_tasks, PackedTasks):
+                    if (
+                        isinstance(all_current_tasks, PackedTasks)
+                        and all_current_tasks.task_type == TaskType.Decode
+                    ):
                         for task in all_current_tasks.tasks:
                             task.has_unsync_new_token = True
                             task.update_decode_status()

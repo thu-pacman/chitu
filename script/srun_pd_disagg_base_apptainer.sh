@@ -28,6 +28,7 @@ usage() {
      --gpus-per-node N      (默认 8)
      --cpus-per-gpu N       (默认 24)
      --partition P          (默认 long; 空串=不传)
+     --slurm-job-id ID      (复用已有 allocation 的 job id)
      --exclude NODES        (srun --exclude, 如 node005 或 node[005-007])
      --log-dir DIR          (默认 $(pwd)/log)
 
@@ -83,6 +84,7 @@ PD_NODES="${PD_NODES:-3}"
 PD_GPUS_PER_NODE="${PD_GPUS_PER_NODE:-8}"
 PD_CPUS_PER_GPU="${PD_CPUS_PER_GPU:-24}"
 PD_PARTITION="${PD_PARTITION:-long}"
+PD_SLURM_JOB_ID="${PD_SLURM_JOB_ID:-}"
 PD_EXCLUDE="${PD_EXCLUDE:-}"
 LOG_DIR="${LOG_DIR:-"$(pwd)/log"}"
 
@@ -247,6 +249,37 @@ apply_job_port_defaults() {
   fi
 }
 
+validate_existing_slurm_job() {
+  local job_id="${1:-}"
+  [ -n "${job_id}" ] || return 0
+
+  local job_info job_state alloc_nodes
+  job_info="$(scontrol show job -o "${job_id}" 2>/dev/null || true)"
+  [ -n "${job_info}" ] || die "cannot find slurm job id: ${job_id}"
+
+  job_state="$(sed -n 's/.* JobState=\([^ ]*\).*/\1/p' <<< "${job_info}")"
+  [ "${job_state}" = "RUNNING" ] || die "slurm job ${job_id} is not runnable (state=${job_state:-unknown})"
+
+  alloc_nodes="$(sed -n 's/.* NumNodes=\([^ ]*\).*/\1/p' <<< "${job_info}")"
+  if [ -n "${alloc_nodes}" ] && [ "${alloc_nodes}" -lt "${PD_NODES}" ]; then
+    die "slurm job ${job_id} only has ${alloc_nodes} nodes, but this launch needs ${PD_NODES}; pass a smaller --nodes or use another allocation"
+  fi
+}
+
+print_existing_slurm_job_summary() {
+  local job_id="${1:-}"
+  [ -n "${job_id}" ] || return 0
+
+  local job_info job_state alloc_nodes node_list
+  job_info="$(scontrol show job -o "${job_id}" 2>/dev/null || true)"
+  [ -n "${job_info}" ] || return 0
+
+  job_state="$(sed -n 's/.* JobState=\([^ ]*\).*/\1/p' <<< "${job_info}")"
+  alloc_nodes="$(sed -n 's/.* NumNodes=\([^ ]*\).*/\1/p' <<< "${job_info}")"
+  node_list="$(sed -n 's/.* NodeList=\([^ ]*\).*/\1/p' <<< "${job_info}")"
+  echo "reuse_slurm_job_id=${job_id} state=${job_state:-unknown} alloc_nodes=${alloc_nodes:-unknown} node_list=${node_list:-unknown}"
+}
+
 # 统一解析 prefill/decode 实例规格（替代原来两个独立函数）
 parse_instance_spec() {
   local kind="$1" idx="$2" spec="$3"
@@ -263,6 +296,7 @@ parse_instance_spec() {
   _v="${KIND}_DEFAULT_MAX_NEW_TOKENS";     local max_new_tokens="${!_v}"
   _v="${KIND}_DEFAULT_FULL_WARMUP";        local def_full_warmup="${!_v}"
   local nnodes="" port="" master_port="" nproc="" overrides="" chunk="" full_warmup=""
+  local max_reqs_explicit=0 max_batch_size_explicit=0
 
   IFS=',' read -r -a _kvs <<< "${spec}"
   for _kv in "${_kvs[@]}"; do
@@ -271,8 +305,8 @@ parse_instance_spec() {
       nnodes=*|nodes=*)           nnodes="${_kv#*=}";;
       tp=*) tp="${_kv#*=}";; pp=*) pp="${_kv#*=}";; dp=*) dp="${_kv#*=}";; ep=*) ep="${_kv#*=}";;
       max_seq_len=*)              max_seq_len="${_kv#*=}";;
-      max_reqs=*)                 max_reqs="${_kv#*=}";;
-      max_batch_size=*)           max_batch_size="${_kv#*=}";;
+      max_reqs=*)                 max_reqs="${_kv#*=}"; max_reqs_explicit=1;;
+      max_batch_size=*)           max_batch_size="${_kv#*=}"; max_batch_size_explicit=1;;
       max_new_tokens=*)           max_new_tokens="${_kv#*=}";;
       port=*|base_port=*)         port="${_kv#*=}";;
       master_port=*)              master_port="${_kv#*=}";;
@@ -288,6 +322,14 @@ parse_instance_spec() {
   [ -n "${chunk}" ] && overrides="${overrides:+${overrides};}infer.prefill_chunk_size=${chunk}"
   [ -z "${full_warmup}" ] && full_warmup="${def_full_warmup}"
   [ -n "${full_warmup}" ] && overrides="${overrides:+${overrides};}infer.full_warmup=${full_warmup}"
+
+  # Legacy `max_reqs` is still forwarded to runtime and overrides `max_batch_size`
+  # inside chitu_main. Keep the summary/effective config consistent when only the
+  # legacy field is explicitly provided by the caller.
+  if [ "${max_reqs_explicit}" -eq 1 ] && [ "${max_batch_size_explicit}" -eq 0 ] \
+      && [ -n "${max_reqs}" ] && [ "${max_reqs}" != "null" ]; then
+    max_batch_size="${max_reqs}"
+  fi
 
   # 自动端口
   _v="${KIND}_BASE_PORT";        [ -n "${port}" ]        || port=$(( ${!_v} + PD_JOB_PORT_OFFSET + idx ))
@@ -381,6 +423,190 @@ split_overrides_to_array() {
   for _x in "${_out[@]}"; do [ -n "${_x}" ] && printf '%s\n' "${_x}"; done
 }
 
+pd_configure_ib_env_from_detect_script() {
+  local script_dir="$1"
+  local ib_cards=""
+  local ib_iface=""
+
+  if [ ! -f "${script_dir}/detect_ib_config.sh" ]; then
+    echo "No detect_ib_config.sh found in ${script_dir}, skipping InfiniBand configuration" >&2
+    return 1
+  fi
+
+  source "${script_dir}/detect_ib_config.sh"
+
+  if declare -F detect_ib_cards >/dev/null; then
+    if ib_cards="$(detect_ib_cards)"; then
+      if [ -n "${ib_cards}" ]; then
+        export NCCL_IB_HCA="${ib_cards}"
+        export NVSHMEM_HCA_LIST="${ib_cards}"
+        echo "Detected IB cards: ${ib_cards}" >&2
+        echo "Set NCCL_IB_HCA=${ib_cards}" >&2
+        echo "Set NVSHMEM_HCA_LIST=${ib_cards}" >&2
+      fi
+    fi
+  fi
+
+  if declare -F detect_ib_network_interface >/dev/null; then
+    if ib_iface="$(detect_ib_network_interface)"; then
+      if [ -n "${ib_iface}" ]; then
+        export GLOO_SOCKET_IFNAME="${ib_iface}"
+        export NCCL_SOCKET_IFNAME="${ib_iface}"
+        export HCCL_SOCKET_IFNAME="${ib_iface}"
+        export NVSHMEM_IB_DEVICE="${ib_iface}"
+        echo "Detected IB network interface: ${ib_iface}" >&2
+        echo "Set GLOO_SOCKET_IFNAME=${ib_iface}" >&2
+        echo "Set NCCL_SOCKET_IFNAME=${ib_iface}" >&2
+        echo "Set HCCL_SOCKET_IFNAME=${ib_iface}" >&2
+        echo "Set NVSHMEM_IB_DEVICE=${ib_iface}" >&2
+      fi
+    fi
+  fi
+
+  return 0
+}
+
+pd_detect_mooncake_gpu_ib_map() {
+  local active_cards="$1"
+  local topo_output=""
+
+  [ -n "${active_cards}" ] || return 1
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+
+  topo_output="$(nvidia-smi topo -m 2>/dev/null | sed -r 's/\x1B\[[0-9;]*[[:alpha:]]//g')"
+  [ -n "${topo_output}" ] || return 1
+
+  printf '%s\n' "${topo_output}" | awk -v active_cards="${active_cards}" '
+    function trim(s) {
+      sub(/^[[:space:]]+/, "", s)
+      sub(/[[:space:]]+$/, "", s)
+      return s
+    }
+    function affinity_score(rel) {
+      if (rel == "PIX") return 0
+      if (rel == "PXB") return 1
+      if (rel == "PHB") return 2
+      if (rel == "NODE") return 3
+      if (rel == "SYS") return 4
+      return 100
+    }
+    BEGIN {
+      n_cards = split(active_cards, cards, ",")
+      for (i = 1; i <= n_cards; i++) {
+        card = trim(cards[i])
+        if (card != "") active[card] = 1
+      }
+    }
+    /GPU0/ && /NIC0/ && /CPU/ {
+      nic_count = 0
+      matrix_count = 0
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^(GPU[0-9]+|NIC[0-9]+)$/) {
+          matrix_count++
+          if ($i ~ /^NIC[0-9]+$/) {
+            nic_count++
+            nic_label[nic_count] = $i
+            nic_matrix_pos[nic_count] = matrix_count
+          }
+        }
+        if ($i == "CPU") break
+      }
+      next
+    }
+    /^GPU[0-9]+[[:space:]]+/ {
+      gpu_id = substr($1, 4) + 0
+      if (gpu_id > max_gpu) max_gpu = gpu_id
+      for (i = 1; i <= nic_count; i++) {
+        field_idx = nic_matrix_pos[i] + 1
+        nic_rel[gpu_id, nic_label[i]] = $(field_idx)
+      }
+      next
+    }
+    /^[[:space:]]*NIC[0-9]+:/ {
+      legend = $1
+      sub(/:$/, "", legend)
+      nic_to_device[legend] = $2
+      next
+    }
+    END {
+      if (nic_count == 0) exit 1
+
+      for (gpu_id = 0; gpu_id <= max_gpu; gpu_id++) {
+        best_score = 1000
+        candidate_count = 0
+        delete candidates
+
+        for (i = 1; i <= nic_count; i++) {
+          device = nic_to_device[nic_label[i]]
+          if (!(device in active)) continue
+
+          rel = nic_rel[gpu_id, nic_label[i]]
+          score = affinity_score(rel)
+          if (score < best_score) {
+            best_score = score
+            candidate_count = 1
+            candidates[1] = device
+          } else if (score == best_score) {
+            candidate_count++
+            candidates[candidate_count] = device
+          }
+        }
+
+        if (candidate_count == 0) continue
+
+        chosen = candidates[1]
+        if (gpu_id % 2 == 1 && resolved[gpu_id - 1] != "") {
+          for (i = 1; i <= candidate_count; i++) {
+            if (candidates[i] == resolved[gpu_id - 1]) {
+              chosen = candidates[i]
+              break
+            }
+          }
+        }
+
+        resolved[gpu_id] = chosen
+        print gpu_id, chosen
+      }
+    }
+  '
+}
+
+pd_detect_mooncake_ib_devices_for_gpu_list() {
+  local gpu_list="$1"
+  local gpu_ib_map="${PD_GPU_IB_DEVICE_MAP:-}"
+  local -A gpu_to_ib=()
+  local -a gpus=()
+  local -a ib_devices=()
+  local gpu_id=""
+  local ib_device=""
+  local old_ifs="$IFS"
+
+  [ -n "${gpu_list}" ] || return 1
+  [ -n "${gpu_ib_map}" ] || return 1
+
+  while read -r gpu_id ib_device; do
+    [ -n "${gpu_id}" ] && [ -n "${ib_device}" ] || continue
+    gpu_to_ib["${gpu_id}"]="${ib_device}"
+  done <<< "${gpu_ib_map}"
+
+  IFS=','
+  read -r -a gpus <<< "${gpu_list// /}"
+  IFS="${old_ifs}"
+
+  for gpu_id in "${gpus[@]}"; do
+    [ -n "${gpu_id}" ] || continue
+    ib_device="${gpu_to_ib[${gpu_id}]:-}"
+    [ -n "${ib_device}" ] || return 1
+    ib_devices+=("${ib_device}")
+  done
+
+  [ "${#ib_devices[@]}" -gt 0 ] || return 1
+
+  IFS=','
+  printf '%s\n' "${ib_devices[*]}"
+  IFS="${old_ifs}"
+}
+
 ################################################################################
 # Per-node worker
 ################################################################################
@@ -392,6 +618,26 @@ pd_node_main() {
   LOG_DIR_INNER="${LOG_DIR}"
   mkdir -p "${LOG_DIR_INNER}"
   MODEL_NAME_TAG="${PD_MODEL_NAME_SAFE:-model}"
+
+  local script_dir
+  script_dir="$(dirname "${THIS_SCRIPT}")"
+  if ! pd_configure_ib_env_from_detect_script "${script_dir}"; then
+    echo "Proceeding without detected InfiniBand environment overrides" >&2
+  fi
+
+  PD_ACTIVE_IB_CARDS="${NCCL_IB_HCA:-}"
+  PD_GPU_IB_DEVICE_MAP=""
+  if [ -n "${PD_ACTIVE_IB_CARDS}" ]; then
+    if PD_GPU_IB_DEVICE_MAP="$(pd_detect_mooncake_gpu_ib_map "${PD_ACTIVE_IB_CARDS}")"; then
+      echo "Detected GPU/IB topology map for Mooncake:" >&2
+      while read -r _gpu_id _ib_device; do
+        [ -n "${_gpu_id}" ] && [ -n "${_ib_device}" ] || continue
+        echo "  GPU${_gpu_id} -> ${_ib_device}" >&2
+      done <<< "${PD_GPU_IB_DEVICE_MAP}"
+    else
+      echo "Warning: failed to detect GPU/IB topology map for Mooncake" >&2
+    fi
+  fi
 
   # 从环境恢复序列化的数组
   COMMON_OVERRIDES=()
@@ -436,12 +682,14 @@ pd_node_main() {
     --env NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL}" --env NCCL_IB_MTU="${NCCL_IB_MTU}"
     --env NCCL_IB_TC="${NCCL_IB_TC}" --env NVSHMEM_HCA_LIST="${NVSHMEM_HCA_LIST}"
     --env GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME}" --env NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME}"
+    --env HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME}"
     --env NVSHMEM_IB_DEVICE="${NVSHMEM_IB_DEVICE}"
     --env CHITU_LOGGING_LEVEL=INFO --env CHITU_PD_TRACE=1 --env MC_TE_METRIC=1
   )
   ROUTER_ENV_ARGS=()
   [ -n "${CUDA_VISIBLE_DEVICES:-}" ] && ROUTER_ENV_ARGS+=(--env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}")
   [ -n "${CHITU_DEBUG_RUN_ID:-}" ] && APPTAINER_BASE_ARGS+=(--env CHITU_DEBUG_RUN_ID="${CHITU_DEBUG_RUN_ID}")
+  [ -n "${CHITU_PD_LOG_VERBOSE:-}" ] && APPTAINER_BASE_ARGS+=(--env CHITU_PD_LOG_VERBOSE="${CHITU_PD_LOG_VERBOSE}")
   [ -d /dev/infiniband ] && APPTAINER_BASE_ARGS+=(-B /dev/infiniband:/dev/infiniband)
   if [ "${PD_APPTAINER_BIND_CODE}" = "1" ]; then
     APPTAINER_BASE_ARGS+=(-B "${ROOT_DIR}:/workspace/chitu" -B "${ROOT_DIR}:${ROOT_DIR}" --env PYTHONPATH=/workspace/chitu)
@@ -555,6 +803,23 @@ pd_node_main() {
   alloc_gpus_for prefill
   alloc_gpus_for decode
 
+  resolve_instance_mooncake_ib_devices() {
+    local gpu_list="$1"
+    local resolved=""
+
+    if resolved="$(pd_detect_mooncake_ib_devices_for_gpu_list "${gpu_list}")"; then
+      printf '%s\n' "${resolved}"
+      return 0
+    fi
+
+    if [ -n "${PD_MOONCAKE_IB_DEVICE:-}" ]; then
+      printf '%s\n' "${PD_MOONCAKE_IB_DEVICE}"
+      return 0
+    fi
+
+    return 1
+  }
+
   # ── 启动 Prefill/Decode 实例（统一逻辑）──
   LOCAL_PIDS=()
 
@@ -576,6 +841,20 @@ pd_node_main() {
 
       local -a _ovr=()
       while IFS= read -r _o; do [ -n "${_o}" ] && _ovr+=("${_o}"); done < <(split_overrides_to_array "${_a_ovr[_idx]}")
+      local -a _batch_args=()
+      if [ -n "${_a_mbs[_idx]}" ] && [ "${_a_mbs[_idx]}" != "null" ]; then
+        _batch_args+=("infer.max_batch_size=${_a_mbs[_idx]}")
+      elif [ -n "${_a_mr[_idx]}" ] && [ "${_a_mr[_idx]}" != "null" ]; then
+        _batch_args+=("infer.max_batch_size=${_a_mr[_idx]}")
+      fi
+
+      local _mc_ib=""
+      if _mc_ib="$(resolve_instance_mooncake_ib_devices "${_gpu}")"; then
+        echo "Resolved Mooncake IB devices for gpus=${_gpu}: ${_mc_ib}"
+        _ovr+=("dp_config.router.pd_disaggregation.ib_device='${_mc_ib}'")
+      else
+        echo "Warning: failed to resolve Mooncake IB devices for gpus=${_gpu}, leaving ib_device unset" >&2
+      fi
 
       echo "=== ${kind^} ${label^^}${_idx}: rank=${_rank}/${_a_nn[_idx]} master=${_master_addr}:${_a_mpt[_idx]} gpus=${_gpu} ==="
       local -a _CMD=(
@@ -584,8 +863,7 @@ pd_node_main() {
         --node_rank="${_rank}" --master_addr="${_master_addr}" --master_port="${_a_mpt[_idx]}"
         -m chitu "${COMMON_ARGS[@]}"
         "infer.max_seq_len=${_a_msl[_idx]}"
-        "infer.max_reqs=${_a_mr[_idx]}"
-        "infer.max_batch_size=${_a_mbs[_idx]}"
+        "${_batch_args[@]}"
         "request.max_new_tokens=${_a_mnt[_idx]}"
         "dp_config.scheduler_base_port=${_a_pt[_idx]}" "dp_config.dp_id=$((dp_offset + _idx))"
         "scheduler.type=${sched_type}"
@@ -614,6 +892,10 @@ pd_node_main() {
 # 编排器入口
 ################################################################################
 
+if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
+  return 0
+fi
+
 if [ "${1:-}" = "--node" ]; then
   shift; pd_node_main "$@"; exit 0
 fi
@@ -632,6 +914,7 @@ while [ $# -gt 0 ]; do
     --gpus-per-node) PD_GPUS_PER_NODE="$2"; shift 2;;
     --cpus-per-gpu)  PD_CPUS_PER_GPU="$2"; shift 2;;
     --partition)     PD_PARTITION="$2"; shift 2;;
+    --slurm-job-id)  PD_SLURM_JOB_ID="$2"; shift 2;;
     --exclude)       PD_EXCLUDE="$2"; shift 2;;
     --log-dir)       LOG_DIR="$2"; shift 2;;
     # 模型 / PD
@@ -663,6 +946,7 @@ done
 
 [ "${PD_NODES}" -ge 1 ] || die "--nodes must be >= 1"
 parse_all_specs
+validate_existing_slurm_job "${PD_SLURM_JOB_ID}"
 mkdir -p "${LOG_DIR}"
 
 # ── 导出到 node worker ──
@@ -675,6 +959,22 @@ export PD_APPTAINER_BIND_CODE PD_APPTAINER_EXTRA_ARGS_STR PD_APPTAINER_CWD
 export MODEL_FLOAT16_VARIANT MODEL_USE_CUDA_GRAPH MODEL_SCHEDULE_OVERLAP
 export PD_MODEL_NAME_SAFE PD_TOTAL_INSTANCES
 
+# NCCL / IB defaults (device lists are auto-detected per node in node mode)
+export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+export NCCL_IB_HCA="${NCCL_IB_HCA:-}"
+export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-2}"
+export NCCL_IB_MTU="${NCCL_IB_MTU:-8192}"
+export NCCL_IB_TC="${NCCL_IB_TC:-106}"
+export NVSHMEM_HCA_LIST="${NVSHMEM_HCA_LIST:-}"
+export NCCL_GRAPH_MIXING_SUPPORT=0 NCCL_GRAPH_REGISTER=0
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-}"
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-}"
+export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-}"
+export NVSHMEM_IB_DEVICE="${NVSHMEM_IB_DEVICE:-}"
+
+# 手工兜底：仅在自动拓扑探测不可用时使用。
+export PD_MOONCAKE_IB_DEVICE="${PD_MOONCAKE_IB_DEVICE:-}"
+
 PD_COMMON_OVERRIDES_STR=""
 for _x in "${COMMON_OVERRIDES[@]}"; do PD_COMMON_OVERRIDES_STR+="${_x}"$'\n'; done
 PD_PREFILL_SPECS_STR=""
@@ -683,18 +983,6 @@ PD_DECODE_SPECS_STR=""
 for _x in "${DECODE_SPECS[@]}"; do PD_DECODE_SPECS_STR+="${_x}"$'\n'; done
 export PD_COMMON_OVERRIDES_STR PD_PREFILL_SPECS_STR PD_DECODE_SPECS_STR
 export PD_PREFILL_DEFAULT_SPEC="${PREFILL_DEFAULT_SPEC}" PD_DECODE_DEFAULT_SPEC="${DECODE_DEFAULT_SPEC}"
-
-# NCCL / IB defaults (users can override via env)
-export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
-export NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_0,mlx5_3,mlx5_4,mlx5_7}"
-export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-2}"
-export NCCL_IB_MTU="${NCCL_IB_MTU:-8192}"
-export NCCL_IB_TC="${NCCL_IB_TC:-106}"
-export NVSHMEM_HCA_LIST="${NVSHMEM_HCA_LIST:-mlx5_0,mlx5_3,mlx5_4,mlx5_7}"
-export NCCL_GRAPH_MIXING_SUPPORT=0 NCCL_GRAPH_REGISTER=0
-export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-bond0}"
-export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-bond0}"
-export NVSHMEM_IB_DEVICE="${NVSHMEM_IB_DEVICE:-bond0}"
 
 # ── 打印摘要 ──
 echo "=== PD Disagg (nodes=${PD_NODES} gpus=${PD_GPUS_PER_NODE}) ==="
@@ -711,22 +999,34 @@ for i in "${!DECODE_NNODES[@]}"; do
 done
 [ -n "${PD_EXCLUDE}" ] && echo "exclude=${PD_EXCLUDE}"
 echo "bind_code=${PD_APPTAINER_BIND_CODE}  log=${LOG_DIR}"
+if [ -n "${PD_SLURM_JOB_ID}" ]; then
+  echo "launch_mode=reuse_allocation"
+  print_existing_slurm_job_summary "${PD_SLURM_JOB_ID}"
+else
+  echo "launch_mode=new_allocation"
+fi
 
 # ── srun ──
-SRUN_EXTRA=""
-[ -n "${PD_PARTITION}" ] && SRUN_EXTRA+=" --partition=${PD_PARTITION}"
-[ -n "${PD_EXCLUDE}" ]   && SRUN_EXTRA+=" --exclude=${PD_EXCLUDE}"
+SRUN_CMD=(
+  srun
+  --export=ALL
+  --kill-on-bad-exit=1
+  --wait=0
+  --nodes="${PD_NODES}"
+  --ntasks="${PD_NODES}"
+  --ntasks-per-node=1
+  --cpus-per-task=$((PD_GPUS_PER_NODE * PD_CPUS_PER_GPU))
+  -l
+)
 
-srun ${SRUN_EXTRA} \
-  --export=ALL \
-  --kill-on-bad-exit=1 \
-  --wait=0 \
-  --nodes="${PD_NODES}" \
-  --ntasks="${PD_NODES}" \
-  --ntasks-per-node=1 \
-  --gres="gpu:${PD_GPUS_PER_NODE}" \
-  --cpus-per-task=$((PD_GPUS_PER_NODE * PD_CPUS_PER_GPU)) \
-  --job-name="${JOB_NAME:-pd_disagg_multi_apptainer}" \
-  --time=3:00:00 \
-  -l \
-  bash "${THIS_SCRIPT}" --node
+if [ -n "${PD_SLURM_JOB_ID}" ]; then
+  SRUN_CMD+=(--jobid="${PD_SLURM_JOB_ID}")
+else
+  SRUN_CMD+=(--gres="gpu:${PD_GPUS_PER_NODE}")
+  [ -n "${PD_PARTITION}" ] && SRUN_CMD+=(--partition="${PD_PARTITION}")
+  [ -n "${PD_EXCLUDE}" ] && SRUN_CMD+=(--exclude="${PD_EXCLUDE}")
+  SRUN_CMD+=(--job-name="${JOB_NAME:-pd_disagg_multi_apptainer}" --time=1:00:00)
+fi
+
+SRUN_CMD+=(bash "${THIS_SCRIPT}" --node)
+"${SRUN_CMD[@]}"

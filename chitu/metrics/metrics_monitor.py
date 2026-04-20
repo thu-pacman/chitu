@@ -206,10 +206,14 @@ class MetricsMonitor:
 
             used_blocks_value = int(used_blocks.get(rank_dp, "0"))
             total_blocks_value = int(total_blocks.get(rank_dp, "0"))
-            kv_cache_usage = float(kvcache_usage.get(rank_dp, "0"))
+            kv_cache_usage_value = float(kvcache_usage.get(rank_dp, "0"))
 
-            if used_blocks_value == 0 or total_blocks_value == 0 or kv_cache_usage == 0:
-                used_blocks_value, total_blocks_value, kv_cache_usage = (
+            if (
+                used_blocks_value == 0
+                or total_blocks_value == 0
+                or kv_cache_usage_value == 0
+            ):
+                used_blocks_value, total_blocks_value, kv_cache_usage_value = (
                     paged_kvcache_stats(dp_id=dp_id)
                 )
 
@@ -225,7 +229,7 @@ class MetricsMonitor:
                 gen_tps=float(gen_tps.get(rank_dp, "0")),
                 running=running,
                 waiting=waiting,
-                kv_cache_usage=kv_cache_usage,
+                kv_cache_usage=kv_cache_usage_value,
                 eviction_rate=float(eviction_rate.get(rank_dp, "0")),
                 used_blocks=used_blocks_value,
                 total_blocks=total_blocks_value,

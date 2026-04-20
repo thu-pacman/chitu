@@ -67,6 +67,10 @@ def start_decode_prepare_listener_thread(
         sock.bind(f"tcp://*:0")
         port = get_port_from_zmq_socket(sock)
         ip = kv_manager.local_ip if kv_manager.local_ip else "localhost"
+        if not kv_manager.wait_decode_internal_broadcast_ready():
+            raise RuntimeError(
+                "decode internal broadcast is not ready; refusing to publish prepare endpoint"
+            )
         logger.info(
             f"[PD_PREPARE] listener_ready decode_sid={decode_scheduler_id} dp_rank={dp_rank} "
             f"bind=tcp://{ip}:{port}"
@@ -113,37 +117,10 @@ def start_decode_prepare_listener_thread(
                 msg = msgpack.unpackb(payload, raw=False)
             except Exception:
                 continue
-            if not isinstance(msg, dict) or msg.get("type") != "PD_PREPARE_TRANSFER":
-                continue
-
-            request_id = msg.get("request_id", "")
-            if not request_id:
-                continue
-            prefill_engine_rank = msg.get("prefill_scheduler_id", None)
-            prefix_len = msg.get("prefix_len", 0)
-            task_cache_ids = msg.get("task_cache_ids", [])
-            # NOTE：收到请求的 prepare 指令并开始处理
-            logger.debug(
-                f"[PD_PREPARE] recv_prepare req_id={request_id} dp_rank={dp_rank} "
-                f"prefill_engine_rank={prefill_engine_rank} prefix_len={prefix_len},task_cache_ids:{task_cache_ids}"
-            )
-            logger.debug(
-                f"[PD_STAGE][decode.prealloc.rank.start] req_id={request_id} dp_rank={dp_rank}"
-            )
-
-            if prefill_engine_rank is not None:
-                kv_manager.set_prefill_target_engine_rank(
-                    request_id, prefill_engine_rank
-                )
-            # Decode prepare listener 线程只做入队；实际 prepare 由计算线程调用
-            # kv_manager.process_pending_prepare_transfers() 执行，避免与模型计算线程争用资源。
-            kv_manager.enqueue_prepare_transfer(
-                request_id=request_id,
-                prefill_engine_rank=(
-                    prefill_engine_rank if prefill_engine_rank is not None else None
-                ),
-                prefix_len=prefix_len,
-                task_cache_ids=task_cache_ids,
+            kv_manager.handle_prepare_transfer_message(
+                msg,
+                payload=payload,
+                relay_internal=True,
             )
             continue
 

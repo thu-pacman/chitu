@@ -42,7 +42,12 @@ class KVTransferHook(Protocol):
     def on_prefill_done(self, tokens: torch.Tensor | None, tasks: PackedTasksBase):
         pass
 
-    def before_decode_step(self, req_ids: list[str]):
+    def before_decode_step(
+        self,
+        req_ids: list[str],
+        cache_ids_list: Optional[list[list[int]]] = None,
+        prefix_lens: Optional[list[int]] = None,
+    ):
         pass
 
 
@@ -50,7 +55,12 @@ class NoopKVTransferHook:
     def on_prefill_done(self, tokens: torch.Tensor | None, tasks: PackedTasksBase):
         return
 
-    def before_decode_step(self, req_ids: list[str]):
+    def before_decode_step(
+        self,
+        req_ids: list[str],
+        cache_ids_list: Optional[list[list[int]]] = None,
+        prefix_lens: Optional[list[int]] = None,
+    ):
         return
 
 
@@ -67,6 +77,7 @@ class TokenSink(Protocol):
         token_list: list[int],
         logprobs_list: Optional[list[list[float]]] = None,
         token_idxs_list: Optional[list[list[int]]] = None,
+        mtp_token_list: Optional[list[list[int]]] = None,
     ) -> None:
         pass
 
@@ -117,6 +128,7 @@ class DPTokenSink:
         token_list: list[int],
         logprobs_list: Optional[list[list[float]]] = None,
         token_idxs_list: Optional[list[list[int]]] = None,
+        mtp_token_list: Optional[list[list[int]]] = None,
     ) -> None:
         return
 
@@ -180,7 +192,10 @@ class MooncakeKVTransferHook:
         from chitu.backend import Backend  # local import to avoid cycles
 
         if Backend.executor._pd_prefill_only and isinstance(tasks, PackedTasks):
-            for t in tasks.tasks:
+            output_tasks = list(
+                tasks.output_tasks if hasattr(tasks, "output_tasks") else [] or []
+            )
+            for t in output_tasks:
                 if t is None:
                     continue
                 if t.req is not None and not t.req.finish_reason:
@@ -190,7 +205,12 @@ class MooncakeKVTransferHook:
                 t.waiting = False
                 t.stopped = True
 
-    def before_decode_step(self, req_ids: list[str]):
+    def before_decode_step(
+        self,
+        req_ids: list[str],
+        cache_ids_list: Optional[list[list[int]]] = None,
+        prefix_lens: Optional[list[int]] = None,
+    ):
         if self.kv_manager is None:
             return
         if self.mode != "decode":
@@ -228,13 +248,39 @@ class MooncakeKVTransferHook:
                 f"rank={Backend.executor.rank} tp={Backend.executor.tp_size} "
                 f"dp={Backend.executor.dp_size} ep={Backend.executor.ep_size}"
             )
-        prefix_lens = []
-        for rid in pending:
+        provided_prefix_lens = (
+            prefix_lens
+            if prefix_lens is not None and len(prefix_lens) == len(req_ids)
+            else None
+        )
+        provided_cache_ids_list = (
+            cache_ids_list
+            if cache_ids_list is not None and len(cache_ids_list) == len(req_ids)
+            else None
+        )
+        pending_prefix_lens = []
+        pending_cache_ids_list = []
+        for idx, rid in enumerate(req_ids):
+            if rid not in pending:
+                continue
             t = TaskPool.pool.get(rid)
-            prefix_lens.append(int(t.prefix_tokens_len) if t is not None else 0)
+            prefix_len = (
+                int(provided_prefix_lens[idx])
+                if provided_prefix_lens is not None
+                else (int(t.prefix_tokens_len) if t is not None else 0)
+            )
+            pending_prefix_lens.append(prefix_len)
+            cache_ids = (
+                list(provided_cache_ids_list[idx] or [])
+                if provided_cache_ids_list is not None
+                else (
+                    list(getattr(t, "new_cache_ids", []) or []) if t is not None else []
+                )
+            )
+            pending_cache_ids_list.append(cache_ids)
         if pd_trace_enabled():
             logger.debug(
-                f"[PD_TRACE][decode.kv_pull_prefix] pending={pending} prefix_lens={prefix_lens}"
+                f"[PD_TRACE][decode.kv_pull_prefix] pending={pending} prefix_lens={pending_prefix_lens}"
             )
 
         # Ensure the local decode rank knows which prefill engine_rank to talk to.
@@ -252,7 +298,10 @@ class MooncakeKVTransferHook:
                 self.kv_manager.set_prefill_target_engine_rank(rid, prefill_rank)
 
         first_tokens = self.kv_manager.recv_kv_cache_and_insert(
-            request_ids=pending, kv_cache=kv_cache, prefix_lens=prefix_lens
+            request_ids=pending,
+            kv_cache=kv_cache,
+            prefix_lens=pending_prefix_lens,
+            cache_ids_list=pending_cache_ids_list,
         )
         if pd_trace_enabled():
             logger.debug(

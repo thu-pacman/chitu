@@ -18,7 +18,6 @@ from chitu.utils import try_import_and_setup_torch_npu
 from chitu.distributed.comm_group import CommGroup
 from chitu.device_type import has_accelerator
 
-
 LOCAL_WORLD_SIZE = None
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 if not has_torch_npu:

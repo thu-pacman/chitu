@@ -162,6 +162,7 @@ class KVPoll(Enum):
 
 - 后台线程发现所有 Prefill engine_rank，对每个执行一次性endpoint注册
 - per-request 向目标 Prefill 发送 `TRANSFER_INFO`
+- `(tp=0, pp=0)` owner rank 对外暴露 prepare/status endpoint，并通过一个 decode-local ZMQ broadcast 将 `PD_PREPARE_TRANSFER` / `KVPoll.Success` 同步给本地其他 TP/PP ranks
 - 轮询 `request_status` 等待 `KVPoll.Success`
 
 ### ZMQ 消息协议（`kv_manager.py`）
@@ -241,8 +242,8 @@ class KVPoll(Enum):
 | `get_prefill_ctrl_endpoint`   | P/D → Coordination     | 查询 Prefill control rank endpoint |
 | `set_decode_prepare_endpoint` | Decode → Coordination  | 注册 Decode 准备 endpoint            |
 | `get_decode_prepare_endpoint` | Prefill → Coordination | 查询 Decode 准备 endpoint            |
-| `set_decode_status_endpoint`  | Decode → Coordination  | 注册 Decode 状态 endpoint            |
-| `get_decode_status_endpoint`  | Prefill → Coordination | 查询 Decode 状态 endpoint            |
+| `set_decode_status_endpoint`  | Decode → Coordination  | 注册 Decode 状态 endpoint（附带 internal broadcast port） |
+| `get_decode_status_endpoint`  | Prefill / Decode → Coordination | 查询 Decode 状态 endpoint与 internal broadcast |
 
 
 ### MooncakeBootstrapServer（`kv_transfer/mooncake/transfer_engine.py`）
@@ -252,7 +253,7 @@ class KVPoll(Enum):
 MooncakeBootstrapServer vs PDCoordinationService：
 
 - **MooncakeBootstrapServer**：Prefill endpoint 集合。Decode 通过 `_get_bootstrap_info()` 查询 Bootstrap 来发现 Prefill 的 ZMQ 地址，通过 `_discover_prefill_engine_ranks()` 探测有多少个 Prefill。这是 Decode 找到 Prefill 的手段。
-- **PDCoordinationService：**：内部控制面端点同步。用于 Prefill PP/TP ranks 之间发现 control rank 的广播端口、Decode prepare/status endpoint 等。
+- **PDCoordinationService：**：内部控制面端点同步。用于 Prefill PP/TP ranks 之间发现 control rank 的广播端口、Decode prepare/status endpoint，以及 Decode 内部 broadcast endpoint。
 
 唯一存在 fallback 的地方是 Prefill **注册自身** endpoint 这一步：优先通过 Coordination Service 注册，仅当 Coordination 不可用时才 fallback 到 Bootstrap 的 `PUT /route`（`_register_to_bootstrap()`）。
 
