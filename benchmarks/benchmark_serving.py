@@ -320,7 +320,7 @@ class BenchmarkServing:
             )
 
         data = response.json()
-        prompt = data.get("prompt", "")
+        prompt = data.get("prompt") or data.get("text", "")
 
         return prompt
 
