@@ -753,10 +753,10 @@ Install time:
 
 Runtime:
 
-| Name                       | Possible Values              | Description                                            |
-| -------------------------- | ---------------------------- | ------------------------------------------------------ |
-| `CHITU_LOGGING_LEVEL`      | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | Logging level.                      |
-| `CHITU_DEBUG`              | `0`, `1`                     | Debug mode. Currently this flag enables some timers.   |
-| `CHITU_CONFIG_PATH`        | Path to a directory          | Override the config directory.                         |
-| `CHITU_CONFIG_NAME`        | Config file name w/o .yml    | Override the entry config file name.                   |
-| `CHITU_PREPROCESS_AND_SAVE_DIR` | Path to a directory     | Output directory for `script/preprocess_and_save.py`   |
+| Name                            | Possible Values              | Description                                            |
+| ------------------------------- | ---------------------------- | ------------------------------------------------------ |
+| `CHITU_LOGGING_LEVEL`           | `<level>` or `<module1>:<level1>;<module2>:<level2>;...`. Each level can be `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. If set, each module can be any module path in the source tree, like `chitu.ops`. | Logging level. |
+| `CHITU_DEBUG`                   | `0`, `1`                     | Debug mode. Currently this flag enables some timers.   |
+| `CHITU_CONFIG_PATH`             | Path to a directory          | Override the config directory.                         |
+| `CHITU_CONFIG_NAME`             | Config file name w/o .yml    | Override the entry config file name.                   |
+| `CHITU_PREPROCESS_AND_SAVE_DIR` | Path to a directory          | Output directory for `script/preprocess_and_save.py`   |

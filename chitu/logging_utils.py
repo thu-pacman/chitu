@@ -62,8 +62,6 @@ class ChituLogger(logging.Logger):
 # Set ChituLogger as the default logger class
 logging.setLoggerClass(ChituLogger)
 
-CHITU_LOGGING_LEVEL = get_chitu_env("CHITU_LOGGING_LEVEL", "INFO")
-
 _COLORS = [
     "\033[0;31m",  # Red (ID 0)
     "\033[0;32m",  # Green (ID 1)
@@ -125,6 +123,18 @@ def log_context(**kwargs):
 
 
 def setup_chitu_logging():
-    base_name = __name__.split(".")[0]
-    base_logger = getLogger(base_name)
-    base_logger.setLevel(CHITU_LOGGING_LEVEL)
+    # Format: `<level>` or `<module1>:<level1>;<module2>:<level2>;...`
+    level_str = get_chitu_env("CHITU_LOGGING_LEVEL", "INFO")
+    try:
+        base_name = __name__.split(".")[0]
+        for substr in level_str.split(";"):
+            if ":" in substr:
+                module, level = substr.split(":")
+                logging.getLogger(module).setLevel(level)
+            else:
+                logging.getLogger(base_name).setLevel(substr)
+    except Exception as e:
+        raise ValueError(
+            f"Invalid CHITU_LOGGING_LEVEL: {level_str}. Acceptable format: "
+            f"`<level>` or `<module1>:<level1>;<module2>:<level2>;..."
+        ) from e
