@@ -478,10 +478,16 @@ template <auto *f, size_t max_dynamic_smem> void setup_kernel_smem_once() {
 
 namespace chitu {
 
+inline void checkLogitsTensor(const Tensor &T) {
+    ASSERTWITH(T.dim() == 2, "Tensor is not 2D");
+    ASSERTWITH(T.device().type() == torch::kCUDA, "Tensor is not on CUDA");
+    ASSERTWITH(T.stride(-1) == 1, "Tensor is not contiguous in last dimension");
+}
+
 void fast_topk_interface(const at::Tensor &score, at::Tensor &indices,
                          const std::optional<at::Tensor> &lengths_opt,
                          const std::optional<at::Tensor> &row_starts_opt) {
-    checkTensor(score);
+    checkLogitsTensor(score);
     checkTensor(indices);
     if (row_starts_opt.has_value()) {
         checkTensor(row_starts_opt.value());
@@ -512,7 +518,7 @@ void fast_topk_transform_interface(const at::Tensor &score,
                                    const at::Tensor &src_page_table,
                                    const at::Tensor &cu_seqlens_q,
                                    std::optional<at::Tensor> row_starts_opt) {
-    checkTensor(score);
+    checkLogitsTensor(score);
     checkTensor(lengths);
     checkTensor(dst_page_table);
     checkTensor(src_page_table);
@@ -581,7 +587,7 @@ void fast_topk_transform_ragged_interface(
     const at::Tensor &score, const at::Tensor &lengths,
     at::Tensor &topk_indices_ragged, const at::Tensor &topk_indices_offset,
     std::optional<at::Tensor> row_starts_opt) {
-    checkTensor(score);
+    checkLogitsTensor(score);
     checkTensor(lengths);
     checkTensor(topk_indices_ragged);
     checkTensor(topk_indices_offset);

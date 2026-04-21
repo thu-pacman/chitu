@@ -23,6 +23,21 @@ from chitu.models.registry import ModelType
 )
 def deepseek_v3_indexer_cache_spec(args, attn_backend_type) -> KVCacheSpec:
     index_head_dim = int(args.models.index_head_dim)
+
+    # deepgemm indexer-kv layout
+    if args.infer.indexer_type == "deepgemm":
+        return KVCacheSpec(
+            block_size=64,
+            kvargs={
+                "shape_per_token_dict": {
+                    "indexer_k_ks": (index_head_dim + (index_head_dim // 128) * 4,),
+                },
+                "dtype_dict": {
+                    "indexer_k_ks": (torch.float8_e4m3fn),
+                },
+            },
+        )
+
     return KVCacheSpec(
         kvargs={
             "shape_per_token_dict": {

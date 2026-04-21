@@ -940,6 +940,33 @@ def chitu_init(args):
             f"infer.dp_size ({args.infer.dp_size}) cannot be greater than infer.max_batch_size ({args.infer.max_batch_size})"
         )
 
+    if (
+        args.models.type == ModelType.DEEPSEEK_V3
+        and args.models.get("index_topk", None) is not None
+    ):
+        assert args.infer.indexer_type in ("auto", "deepgemm", "triton")
+        from chitu.dsa_indexer import support_indexer_deepgemm
+
+        if args.infer.indexer_type == "auto":
+            if (
+                support_indexer_deepgemm
+                and args.infer.cache_type == "paged"
+                and args.infer.mtp_size < 3
+            ):
+                args.infer.indexer_type = "deepgemm"
+            else:
+                args.infer.indexer_type = "triton"
+
+        elif args.infer.indexer_type == "deepgemm":
+            if not support_indexer_deepgemm:
+                raise ValueError("indexer_type=deepgemm is not supported ")
+            if args.infer.mtp_size > 2:
+                raise ValueError("indexer_type=deepgemm does not support mtp_size > 2")
+            if args.infer.cache_type != "paged":
+                raise ValueError(
+                    f"indexer_type=deepgemm only supports cache_type=paged, but got {args.infer.cache_type}"
+                )
+
     # Check checkpoint exists
     check_checkpoint_path(args)
 

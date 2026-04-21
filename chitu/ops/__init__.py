@@ -12,6 +12,8 @@ from chitu.ops.kv_cache import (
     read_from_paged_kv_cache,
     read_from_singleton_paged_kv_cache,
     read_from_dense_kv_cache,
+    append_to_paged_kv_cache_blockfp8_deepgemm,
+    read_from_paged_indexer_kv_cache_deepgemm,
     fp8_pertensor_kvcache_quant,
     fp8_pertoken_kvcache_quant_dsa,
 )

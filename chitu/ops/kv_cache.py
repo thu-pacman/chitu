@@ -20,6 +20,8 @@ if has_triton_impl:
         append_to_dense_kv_cache_triton,
         fp8_e4m3fn_quant_per_tensor_triton,
         quant_pertoken_kvcache_dsa,  # only for DSV32 fp8 cache
+        append_to_paged_kv_cache_blockfp8_deepgemm_triton,
+        read_from_paged_indexer_kv_cache_deepgemm_triton,
     )
 
 
@@ -115,6 +117,77 @@ def append_to_paged_kv_cache_torch(
 append_to_paged_kv_cache.register_candidate("triton")
 if has_triton_impl:
     append_to_paged_kv_cache.register("triton")(append_to_paged_kv_cache_triton)
+
+
+@make_op_dispatcher
+def append_to_paged_kv_cache_blockfp8_deepgemm(
+    kv_cache: torch.Tensor,  # (num_pages, page_size, other contiguous dims...)
+    page_table: torch.Tensor,  # (batch_size, num_pages_per_sample)
+    k_fp8: torch.Tensor,  # (num_tokens, other contiguous dims...)
+    k_scale: torch.Tensor,  # (num_tokens, other contiguous dims...)
+    delta_position_ids: torch.Tensor,  # (num_tokens,)
+    delta_seq_ids: Optional[torch.Tensor] = None,  # (num_tokens,)
+    use_i64_offsets: bool = False,
+    impl: str = "auto",
+):
+    raise NotImplementedError
+
+
+@append_to_paged_kv_cache_blockfp8_deepgemm.register_auto
+def _auto_append_to_paged_kv_cache_blockfp8_deepgemm(
+    kv_cache: torch.Tensor,  # (num_pages, page_size, other contiguous dims...)
+    page_table: torch.Tensor,  # (batch_size, num_pages_per_sample)
+    k_fp8: torch.Tensor,  # (num_tokens, other contiguous dims...)
+    k_scale: torch.Tensor,  # (num_tokens, other contiguous dims...)
+    delta_position_ids: torch.Tensor,  # (num_tokens,)
+    delta_seq_ids: Optional[torch.Tensor] = None,  # (num_tokens,)
+    use_i64_offsets: bool = False,
+):
+    if has_triton_impl and get_global_args().infer.op_impl != "cpu":
+        return "triton"
+    return "torch"
+
+
+@append_to_paged_kv_cache_blockfp8_deepgemm.register("torch")
+def append_to_paged_kv_cache_blockfp8_deepgemm_torch(
+    kv_cache: torch.Tensor,  # (num_pages, page_size, other contiguous dims...)
+    page_table: torch.Tensor,  # (batch_size, num_pages_per_sample)
+    k_fp8: torch.Tensor,  # (num_tokens, other contiguous dims...)
+    k_scale: torch.Tensor,  # (num_tokens, other contiguous dims...)
+    delta_position_ids: torch.Tensor,  # (num_tokens,)
+    delta_seq_ids: Optional[torch.Tensor] = None,  # (num_tokens,)
+    use_i64_offsets: bool = False,
+):
+    num_pages = kv_cache.shape[0]
+    page_size = kv_cache.shape[1]
+    kv_cache = kv_cache.view(num_pages, -1)
+    assert kv_cache.shape[1] == page_size * 132
+
+    scale_page_offs = page_size * 128
+    k_fp8_paged = kv_cache[:, :scale_page_offs].view(num_pages, page_size, -1)
+    k_scale_paged = kv_cache[:, scale_page_offs:].view(num_pages, page_size, -1)
+
+    append_to_paged_kv_cache_torch(
+        k_fp8_paged,
+        page_table,
+        k_fp8,
+        delta_position_ids,
+        delta_seq_ids,
+    )
+    append_to_paged_kv_cache_torch(
+        k_scale_paged,
+        page_table,
+        k_scale.view(torch.float8_e4m3fn).view(k_scale.shape[0], -1),
+        delta_position_ids,
+        delta_seq_ids,
+    )
+
+
+append_to_paged_kv_cache_blockfp8_deepgemm.register_candidate("triton")
+if has_triton_impl:
+    append_to_paged_kv_cache_blockfp8_deepgemm.register("triton")(
+        append_to_paged_kv_cache_blockfp8_deepgemm_triton
+    )
 
 
 @make_op_dispatcher
@@ -305,6 +378,71 @@ def read_from_paged_kv_cache_torch(
         page_table[seq_ids, position_ids // kv_cache.shape[1]],
         position_ids % kv_cache.shape[1],
     ]
+
+
+@make_op_dispatcher
+def read_from_paged_indexer_kv_cache_deepgemm(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_ids: torch.Tensor,
+    use_i64_offsets: bool = False,
+    impl: str = "auto",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    raise NotImplementedError
+
+
+@read_from_paged_indexer_kv_cache_deepgemm.register_auto
+def _auto_read_from_paged_indexer_kv_cache_deepgemm(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_ids: torch.Tensor,
+    use_i64_offsets: bool = False,
+):
+    if has_triton_impl and get_global_args().infer.op_impl != "cpu":
+        return "triton"
+    return "torch"
+
+
+@read_from_paged_indexer_kv_cache_deepgemm.register("torch")
+def read_from_paged_indexer_kv_cache_deepgemm_torch(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_ids: torch.Tensor,
+    use_i64_offsets: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_pages = kv_cache.shape[0]
+    page_size = kv_cache.shape[1]
+    kv_cache = kv_cache.view(num_pages, -1)
+    assert kv_cache.shape[1] == page_size * 132
+
+    scale_page_offs = page_size * 128
+    k_fp8_paged = kv_cache[:, :scale_page_offs].view(num_pages, page_size, -1)
+    k_scale_paged = kv_cache[:, scale_page_offs:].view(num_pages, page_size, -1)
+
+    k_fp8_ragged = read_from_paged_kv_cache_torch(
+        k_fp8_paged,
+        page_table,
+        position_ids,
+        seq_ids,
+    )
+    k_scale_ragged = read_from_paged_kv_cache_torch(
+        k_scale_paged,
+        page_table,
+        position_ids,
+        seq_ids,
+    )
+
+    return k_fp8_ragged.contiguous(), k_scale_ragged.contiguous().view(torch.float32)
+
+
+read_from_paged_indexer_kv_cache_deepgemm.register_candidate("triton")
+if has_triton_impl:
+    read_from_paged_indexer_kv_cache_deepgemm.register("triton")(
+        read_from_paged_indexer_kv_cache_deepgemm_triton
+    )
 
 
 @make_op_dispatcher
