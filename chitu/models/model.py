@@ -1254,8 +1254,6 @@ class Transformer(nn.Module):
         self.main_last_hidden_states_up_to_date = False
         tokens_proposal = torch.stack(token_list[:-1], dim=1).view(-1)
         if self.use_cuda_graph:
-            for cache in self.cache_dict.values():
-                cache.seq_len_delta.is_decode_stage = True
             self.prepare_decoding_attn()
         else:
             self.attn_backend.prepare_metadata_for_prefill(
@@ -1427,6 +1425,8 @@ class Transformer(nn.Module):
         if tokens.shape[0] == 0:
             return self.empty_prefill()
 
+        for cache in self.cache_dict.values():
+            cache.seq_len_delta.is_decode_stage = False
         self.attn_backend.prepare_metadata_for_prefill(
             self.cache_dict["main"].seq_len_delta
         )
@@ -1507,6 +1507,9 @@ class Transformer(nn.Module):
             key = (batch_size,)
         else:
             assert False
+
+        for cache in self.cache_dict.values():
+            cache.seq_len_delta.is_decode_stage = True
 
         if batch_size != 0 and not self.mtp_size > 1:
             self.prepare_decoding_attn()

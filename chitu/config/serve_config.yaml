@@ -146,6 +146,14 @@ infer:
   #   different types of attention, but it is very slow and consumes much memory.
   attn_type: auto
 
+  # Indexer impl type, only valid for models with DSA (DeepSeek Sparse Attention).
+  #
+  # Accetable values:
+  # - "auto": Automatically choose.
+  # - "deepgemm": use deep_gemm mqa logits and fused paged indexer-kv layout (requires deep_gemm).
+  # - "triton": use triton impl when computing index_score and separate (paged/skew) indexer-kv layout.
+  indexer_type: auto
+
   # Currently this option is only for enabling/disabling muxi_custom_kernel.
   #
   # Acceptable values:

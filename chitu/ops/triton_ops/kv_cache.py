@@ -205,3 +205,199 @@ def append_to_dense_kv_cache_kernel(
 
     this_kv_data = tl.load(this_kv_ptr + this_kv_offset, mask=dim_mask)
     tl.store(kv_cache_ptr + kv_cache_offset, this_kv_data, mask=dim_mask)
+
+
+def append_to_paged_kv_cache_blockfp8_deepgemm_triton(
+    kv_cache: torch.Tensor,  # (num_pages, page_size, other contiguous dims...)
+    page_table: torch.Tensor,  # (batch_size, num_pages_per_sample)
+    k_fp8: torch.Tensor,  # (num_tokens, other contiguous dims...)
+    k_scale: torch.Tensor,  # (num_tokens, other contiguous dims...)
+    delta_position_ids: torch.Tensor,  # (num_tokens,)
+    delta_seq_ids: Optional[torch.Tensor] = None,  # (num_tokens,)
+    use_i64_offsets: bool = False,
+):
+    if delta_seq_ids is None and page_table.shape[0] != delta_position_ids.shape[0]:
+        raise ValueError(
+            f"batch_size ({page_table.shape[0]}) must be equal to num_tokens "
+            f"({delta_position_ids.shape[0]}) if ignoring delta_seq_ids"
+        )
+    if k_fp8.numel() == 0:
+        return
+
+    # the deepgemm fp8 indexer kv format is shown below
+    # layout: [num_blocks, block_size*head_dim (k_fp8) + block_size*4 (k_scale)]
+    page_size = kv_cache.shape[1]
+    kv_cache = kv_cache.view(kv_cache.shape[0], -1)
+    k_fp8 = k_fp8.view(k_fp8.shape[0], -1)
+    assert (
+        k_fp8.shape[-1] == 128
+    ), f"index_head_dim should be 128, but got {k_fp8.shape[-1]}"
+    assert page_table.is_contiguous()
+    assert delta_position_ids.is_contiguous()
+
+    batch_size, num_pages_per_sample = page_table.shape
+    num_tokens = k_fp8.shape[0]
+    assert (
+        delta_position_ids.shape[0] == num_tokens
+    ), f"num_tokens: {num_tokens}, delta_position_ids.shape: {delta_position_ids.shape}"
+    if delta_seq_ids is not None:
+        assert delta_seq_ids.shape[0] == num_tokens
+
+    block_size = 128  # GPU block size, not page size (only for indexer kv)
+    if use_i64_offsets:
+        INDEX_DTYPE = tl.int64
+    else:
+        INDEX_DTYPE = tl.int32
+
+    grid = (num_tokens,)
+    append_to_paged_kv_cache_blockfp8_deepgemm_kernel[grid](
+        kv_cache_ptr=kv_cache,
+        page_table_ptr=page_table,
+        k_fp8_ptr=k_fp8,
+        k_scale_ptr=k_scale,
+        delta_position_ids_ptr=delta_position_ids,
+        delta_seq_ids_ptr=delta_seq_ids,
+        PAGE_SIZE=page_size,
+        NUM_PAGES_PER_SAMPLE=num_pages_per_sample,
+        KV_CACHE_STRIDE0=kv_cache.stride(0),
+        BLOCK_SIZE=block_size,
+        HAS_DELTA_SEQ_IDS=delta_seq_ids is not None,
+        INDEX_DTYPE=INDEX_DTYPE,
+    )
+
+
+@triton.jit
+def append_to_paged_kv_cache_blockfp8_deepgemm_kernel(
+    kv_cache_ptr,  # (num_pages, page_size, other dims...)
+    page_table_ptr,  # (batch_size, num_pages_per_sample)
+    k_fp8_ptr,
+    k_scale_ptr,
+    delta_position_ids_ptr,  # (num_tokens,)
+    delta_seq_ids_ptr,  # (num_tokens,)
+    PAGE_SIZE: tl.constexpr,
+    NUM_PAGES_PER_SAMPLE: tl.constexpr,
+    KV_CACHE_STRIDE0: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,  # GPU block size, not page size
+    HAS_DELTA_SEQ_IDS: tl.constexpr,
+    INDEX_DTYPE: tl.constexpr,
+):
+    token_id = tl.program_id(axis=0).to(INDEX_DTYPE)
+    per_token_k_offs = tl.arange(0, BLOCK_SIZE).to(INDEX_DTYPE)
+
+    seqlen = tl.load(delta_position_ids_ptr + token_id).to(INDEX_DTYPE)
+
+    if HAS_DELTA_SEQ_IDS:
+        batch_id = tl.load(delta_seq_ids_ptr + token_id).to(INDEX_DTYPE)
+    else:
+        batch_id = token_id
+
+    page_table_offset = batch_id * NUM_PAGES_PER_SAMPLE + seqlen // PAGE_SIZE
+    page_id = tl.load(page_table_ptr + page_table_offset).to(INDEX_DTYPE)
+    page_offs = page_id * KV_CACHE_STRIDE0
+
+    # store k_fp8
+    k_fp8_paged_offset = (
+        page_offs + (seqlen % PAGE_SIZE) * BLOCK_SIZE + per_token_k_offs
+    )
+    k_fp8_src_offs = token_id * BLOCK_SIZE + per_token_k_offs
+
+    k_fp8_src = tl.load(k_fp8_ptr + k_fp8_src_offs)
+    tl.store(kv_cache_ptr + k_fp8_paged_offset, k_fp8_src)
+
+    # store k_scale
+    k_scale_paged_offset = page_offs + BLOCK_SIZE * PAGE_SIZE + (seqlen % PAGE_SIZE) * 4
+    k_scale_src = tl.load(k_scale_ptr + token_id)
+    k_scale_tar_ptr = kv_cache_ptr + k_scale_paged_offset
+    tl.store(k_scale_tar_ptr.to(tl.pointer_type(tl.float32)), k_scale_src)
+
+
+def read_from_paged_indexer_kv_cache_deepgemm_triton(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_ids: torch.Tensor,
+    use_i64_offsets: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    page_size = kv_cache.shape[1]
+    kv_cache = kv_cache.view(kv_cache.shape[0], -1)
+
+    num_tokens = position_ids.shape[0]
+    batch_size, num_pages_per_sample = page_table.shape
+    k_fp8_out = torch.empty(
+        (num_tokens, 128), dtype=kv_cache.dtype, device=kv_cache.device
+    )
+    k_scale_out = torch.empty(
+        (num_tokens, 4), dtype=kv_cache.dtype, device=kv_cache.device
+    )
+
+    grid = (num_tokens,)
+    block_size = 128  # GPU block size, not page size (only for indexer kv)
+
+    INDEX_DTYPE = tl.int64 if use_i64_offsets else tl.int32
+
+    read_from_paged_indexer_kv_cache_deepgemm_kernel[grid](
+        kv_cache_ptr=kv_cache,
+        page_table_ptr=page_table,
+        position_ids_ptr=position_ids,
+        seq_ids_ptr=seq_ids,
+        k_fp8_ptr=k_fp8_out,
+        k_scale_ptr=k_scale_out,
+        NUM_PAGES_PER_SAMPLE=num_pages_per_sample,
+        KV_CACHE_STRIDE0=kv_cache.stride(0),
+        PAGE_SIZE=page_size,
+        BLOCK_SIZE=block_size,
+        HAS_DELTA_SEQ_IDS=seq_ids is not None,
+        INDEX_DTYPE=INDEX_DTYPE,
+    )
+
+    return k_fp8_out.view(torch.float8_e4m3fn), k_scale_out.view(torch.float32)
+
+
+@triton.jit
+def read_from_paged_indexer_kv_cache_deepgemm_kernel(
+    kv_cache_ptr,
+    page_table_ptr,
+    position_ids_ptr,
+    seq_ids_ptr,
+    k_fp8_ptr,
+    k_scale_ptr,
+    NUM_PAGES_PER_SAMPLE: tl.constexpr,
+    KV_CACHE_STRIDE0: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_DELTA_SEQ_IDS: tl.constexpr,
+    INDEX_DTYPE: tl.constexpr,
+):
+    token_id = tl.program_id(axis=0).to(INDEX_DTYPE)
+    per_token_k_offs = tl.arange(0, BLOCK_SIZE).to(INDEX_DTYPE)
+    per_token_ks_offs = tl.arange(0, 4).to(INDEX_DTYPE)
+
+    seqlen = tl.load(position_ids_ptr + token_id).to(INDEX_DTYPE)
+
+    if HAS_DELTA_SEQ_IDS:
+        batch_id = tl.load(seq_ids_ptr + token_id).to(INDEX_DTYPE)
+    else:
+        batch_id = token_id
+
+    page_table_offset = batch_id * NUM_PAGES_PER_SAMPLE + seqlen // PAGE_SIZE
+    page_id = tl.load(page_table_ptr + page_table_offset).to(INDEX_DTYPE)
+    page_offs = page_id * KV_CACHE_STRIDE0
+
+    # read k_fp8
+    k_fp8_paged_offset = (
+        page_offs + (seqlen % PAGE_SIZE) * BLOCK_SIZE + per_token_k_offs
+    )
+    k_fp8_tar_offset = token_id * 128
+
+    k_fp8_src = tl.load(kv_cache_ptr + k_fp8_paged_offset)
+    tl.store(k_fp8_ptr + k_fp8_tar_offset + per_token_k_offs, k_fp8_src)
+
+    # read k_scale
+    k_scale_paged_offset = (
+        page_offs
+        + BLOCK_SIZE * PAGE_SIZE
+        + (seqlen % PAGE_SIZE) * 4
+        + per_token_ks_offs
+    )
+    k_scale_src = tl.load(kv_cache_ptr + k_scale_paged_offset)
+    tl.store(k_scale_ptr + token_id * 4 + per_token_ks_offs, k_scale_src)

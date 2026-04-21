@@ -63,6 +63,7 @@ class InferConfig(InferConfigLegacy):
     seed: float = MISSING
     max_seq_len: int = MISSING
     cache_type: str = MISSING
+    indexer_type: str = MISSING
     attn_type: str = MISSING
     op_impl: str = MISSING
     mla_absorb: Optional[str] = MISSING

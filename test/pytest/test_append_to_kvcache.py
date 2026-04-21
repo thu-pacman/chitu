@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from chitu.testing import assert_close
-from chitu.device_type import has_accelerator
+from chitu.device_type import has_accelerator, has_native_fp8
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 from chitu.ops import append_to_dense_kv_cache, append_to_paged_kv_cache
 
@@ -142,6 +142,99 @@ TAIL_SHAPES = [
     (5, 205),  # 1025
     (3, 7, 37),  # 777
 ]
+
+
+@pytest.mark.parametrize("batch_size", [100])
+@pytest.mark.parametrize("page_size", [64])
+@pytest.mark.parametrize("num_pages_per_sample", [2])
+@pytest.mark.parametrize("shuffle_page_table", [False, True])
+@pytest.mark.parametrize("use_i64_offsets", [False, True])
+@pytest.mark.parametrize("impl", ["triton"])
+@pytest.mark.skipif(
+    not has_native_fp8(),
+    reason="This test requires the GPU to have native FP8 support",
+)
+def test_append_to_indexer_paged_kv_deepgemm(
+    batch_size,
+    page_size,
+    num_pages_per_sample,
+    shuffle_page_table,
+    use_i64_offsets,
+    record_benchmark,
+    impl,
+):
+    if impl == "triton" and not has_triton:
+        pytest.skip("triton is missing")
+
+    device = "cuda"
+
+    num_tokens = batch_size
+
+    num_pages = batch_size * num_pages_per_sample
+    kv_cache = torch.zeros(
+        (num_pages, page_size, 132), device=device, dtype=torch.float8_e4m3fn
+    )
+    kv_cache_ref = kv_cache.clone()
+
+    page_table = _make_page_table(
+        batch_size, num_pages_per_sample, device, shuffle_page_table
+    )
+
+    max_pos = page_size * num_pages_per_sample
+    delta_position_ids = _make_unique_positions(num_tokens, max_pos, device=device)
+    delta_seq_ids = torch.arange(0, batch_size, dtype=torch.int32, device=device)
+
+    k_fp8 = (
+        torch.randn((num_tokens, 128), device=device)
+        .to(torch.float8_e4m3fn)
+        .contiguous()
+    )
+    k_scale = torch.randn((num_tokens,), device=device).to(torch.float32).contiguous()
+    from chitu.ops import (
+        append_to_paged_kv_cache_blockfp8_deepgemm,
+        read_from_paged_indexer_kv_cache_deepgemm,
+    )
+
+    # ref torch impl
+    append_to_paged_kv_cache_blockfp8_deepgemm(
+        kv_cache_ref,
+        page_table,
+        k_fp8,
+        k_scale,
+        delta_position_ids,
+        use_i64_offsets=use_i64_offsets,
+        impl="torch",
+    )
+    k_fp8_ref, k_scale_ref = read_from_paged_indexer_kv_cache_deepgemm(
+        kv_cache_ref,
+        page_table,
+        delta_position_ids,
+        delta_seq_ids,
+        use_i64_offsets=use_i64_offsets,
+        impl="torch",
+    )
+    # triton impl
+    append_to_paged_kv_cache_blockfp8_deepgemm(
+        kv_cache,
+        page_table,
+        k_fp8,
+        k_scale,
+        delta_position_ids,
+        use_i64_offsets=use_i64_offsets,
+        impl=impl,
+    )
+    k_fp8, k_scale = read_from_paged_indexer_kv_cache_deepgemm(
+        kv_cache,
+        page_table,
+        delta_position_ids,
+        delta_seq_ids,
+        use_i64_offsets=use_i64_offsets,
+        impl=impl,
+    )
+
+    assert_close(k_fp8, k_fp8_ref, 0.0, 0.0)
+    assert_close(k_scale.view(torch.float32), k_scale_ref.view(torch.float32), 0.0, 0.0)
+    assert torch.allclose(kv_cache, kv_cache_ref, equal_nan=True, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

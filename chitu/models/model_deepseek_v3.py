@@ -57,6 +57,7 @@ from chitu.ops import (
     hadamard_transform,
     topk_indices,
 )
+from chitu.dsa_indexer import DSAIndexer
 from chitu.quantization import (
     QuantizationRegistry,
     get_quant_from_checkpoint_prefix,
@@ -114,7 +115,7 @@ def ParallelAbsorbGemm(
 
 
 class Indexer(torch.nn.Module):
-    def __init__(self, args, *, checkpoint_prefix: str):
+    def __init__(self, args, *, checkpoint_prefix: str, indexer_impl: DSAIndexer):
         super().__init__()
         self.dim: int = args.dim
         self.n_heads: int = args.index_n_heads
@@ -140,6 +141,8 @@ class Indexer(torch.nn.Module):
         )
         self.softmax_scale = self.head_dim**-0.5
         self.block_size = 128
+        self.indexer_type = get_global_args().infer.indexer_type
+        self.indexer_impl = indexer_impl
 
     def forward(
         self,
@@ -172,64 +175,16 @@ class Indexer(torch.nn.Module):
         weights = self.weights_proj(x) * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
-        delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
-        delta_pos_ids = seq_len_delta.delta_position_ids_tensor_device
-
-        if isinstance(cache_accessor, PagedKVCacheAccessor):
-            append_to_paged_kv_cache(
-                cache_accessor.kv["indexer_k"],
-                cache_accessor.block_table,
-                k_fp8,
-                delta_pos_ids,
-                delta_seq_ids,
-                get_page_ids=cache_accessor.get_page_ids,
-                get_offs_in_page=cache_accessor.get_offs_in_page,
-            )
-            append_to_paged_kv_cache(
-                cache_accessor.kv["indexer_ks"],
-                cache_accessor.block_table,
-                k_scale,
-                delta_pos_ids,
-                delta_seq_ids,
-                get_page_ids=cache_accessor.get_page_ids,
-                get_offs_in_page=cache_accessor.get_offs_in_page,
-            )
-            index_score = blockfp8_index_score_ragged_q_paged_k_dsv32(
-                q_fp8,
-                weights,
-                cache_accessor.kv["indexer_k"],
-                cache_accessor.kv["indexer_ks"],
-                seq_len_delta=seq_len_delta,
-                k_page_table=cache_accessor.block_table,
-                static_max_n=get_global_args().infer.max_seq_len,
-                causal=is_causal,
-                softfp8=get_global_args().infer.raise_lower_bit_float_to == "bfloat16",
-            )
-        elif isinstance(cache_accessor, DenseKVCacheAccessor):
-            append_to_dense_kv_cache(
-                cache_accessor.kv["indexer_k"], k_fp8, delta_pos_ids, delta_seq_ids
-            )
-            append_to_dense_kv_cache(
-                cache_accessor.kv["indexer_ks"], k_scale, delta_pos_ids, delta_seq_ids
-            )
-            index_score = blockfp8_index_score_ragged_q_dense_k_dsv32(
-                q_fp8,
-                weights,
-                cache_accessor.kv["indexer_k"],
-                cache_accessor.kv["indexer_ks"],
-                seq_len_delta=seq_len_delta,
-                causal=is_causal,
-                softfp8=get_global_args().infer.raise_lower_bit_float_to == "bfloat16",
-            )
-        else:
-            raise NotImplementedError()
-
-        # Ensure k does not exceed the actual size of index_score
-        k = min(self.index_topk, index_score.size(-1))
-        indices = topk_indices(
-            index_score, k, lengths=seq_len_delta.delta_position_ids_tensor_device + 1
+        indices = self.indexer_impl.dsa_indexer(
+            q_fp8,
+            k_fp8,
+            k_scale,
+            weights,
+            seq_len_delta,
+            cache_accessor,
+            is_causal,
+            self.index_topk,
         )
-        # shape: [bs_seq_q, k]. May select some out-of-range items as -inf, which is fine
         return indices
 
     def _rotate_activation(self, x: torch.Tensor) -> torch.Tensor:
@@ -250,6 +205,7 @@ class AttentionDeepSeekV3(Attention):
         *,
         checkpoint_prefix: str,
         indexer_cache: Optional[KVCacheBase] = None,
+        indexer_impl: Optional[DSAIndexer],
     ):
         super().__init__(layer_id, cache, attn_backend)
         self.op_impl = op_impl
@@ -517,8 +473,13 @@ class AttentionDeepSeekV3(Attention):
         self.softmax_scale = compute_softmax_scale_deepseek_v3(args)
 
         if self.index_topk is not None:
+            assert isinstance(
+                indexer_impl, DSAIndexer
+            ), f"DSA is enabled, but got impl={type(indexer_impl)}"
             self.indexer = Indexer(
-                args, checkpoint_prefix=f"{checkpoint_prefix}.indexer"
+                args,
+                checkpoint_prefix=f"{checkpoint_prefix}.indexer",
+                indexer_impl=indexer_impl,
             )
 
     def forward(
@@ -1031,6 +992,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         mla_absorb,
         *,
         checkpoint_prefix,
+        indexer_impl,
     ):
         super().__init__(
             layer_id, args, cache_dict, attn_backend=attn_backend, op_impl=op_impl
@@ -1045,6 +1007,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             mla_absorb=mla_absorb,
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
             indexer_cache=cache_dict.get("indexer", None),
+            indexer_impl=indexer_impl,
         )
         base_moe_experts_class = None
         if op_impl == "muxi_custom_kernel":
@@ -1118,6 +1081,7 @@ class TransformerBlockDeepSeekV3MTP(TransformerBlockDeepSeekV3):
         mla_absorb,
         *,
         checkpoint_prefix,
+        indexer_impl,
     ):
         super().__init__(
             layer_id,
@@ -1127,6 +1091,7 @@ class TransformerBlockDeepSeekV3MTP(TransformerBlockDeepSeekV3):
             op_impl=op_impl,
             mla_absorb=mla_absorb,
             checkpoint_prefix=checkpoint_prefix,
+            indexer_impl=indexer_impl,
         )
 
         self.enorm = RMSNorm(
@@ -1190,6 +1155,7 @@ class TransformerDeepSeekV3(Transformer):
         mla_absorb: str,
     ):
         self.mla_absorb = mla_absorb
+        self.indexer_backend = DSAIndexer() if hasattr(params, "index_topk") else None
         super().__init__(
             params,
             cache_dict,
@@ -1782,6 +1748,7 @@ class TransformerDeepSeekV3(Transformer):
                         self.op_impl,
                         mla_absorb=self.mla_absorb,
                         checkpoint_prefix=f"layers.{layer_id}",
+                        indexer_impl=self.indexer_backend,
                     )
                 )
             else:
@@ -1794,6 +1761,7 @@ class TransformerDeepSeekV3(Transformer):
                         self.op_impl,
                         mla_absorb=self.mla_absorb,
                         checkpoint_prefix=f"layers.{layer_id}",
+                        indexer_impl=self.indexer_backend,
                     )
                 )
 
@@ -1895,6 +1863,10 @@ class TransformerDeepSeekV3(Transformer):
             self.cache_dict["main"].block_size,
             softmax_scale=compute_softmax_scale_deepseek_v3(self.params),
         )
+        if self.indexer_backend is not None:
+            self.indexer_backend.prepare_metadata_for_decode(
+                self.cache_dict["main"].seq_len_delta
+            )
 
 
 def precompute_freqs_cis_deepseek_v3(args, max_position_embeddings) -> torch.Tensor:

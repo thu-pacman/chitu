@@ -21,8 +21,13 @@ from chitu.utils import (
     try_import_and_setup_torch_npu,
 )
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.device_type import is_muxi, has_accelerator
+from chitu.device_type import is_muxi, has_accelerator, has_native_fp8
 from chitu.testing import assert_close
+from chitu.ops import (
+    append_to_paged_kv_cache,
+    append_to_paged_kv_cache_blockfp8_deepgemm,
+)
+from chitu.dsa_indexer import DSAIndexer, support_indexer_deepgemm
 
 triton, has_triton = try_import_platform_dep("triton")
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
@@ -32,6 +37,212 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 flash_attn3, has_flash_attn3 = try_import_opt_dep(
     "flash_attn_interface", "flash_attn_interface"
 )
+deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
+
+
+@pytest.mark.parametrize("bs", [0, 1, 5])
+@pytest.mark.parametrize(
+    "s_q, s_k",
+    [
+        (1, 4096),  # mtp=1
+        (2, 4096),  # mtp=2
+        (4096, 4096),  # prefill
+        (2048, 4096),  # chunked prefill
+    ],
+)
+@pytest.mark.parametrize("n_heads", [64])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("impl", ["deepgemm", "triton"])
+@pytest.mark.skipif(
+    not has_native_fp8(),
+    reason="This test requires the GPU to have native FP8 support",
+)
+def test_dsa_indexer_paged_kv(
+    bs,
+    s_q,
+    s_k,
+    n_heads,
+    head_dim,
+    impl,
+    record_benchmark,
+):
+    if not has_triton:
+        pytest.skip("triton is missing")
+    if impl == "deepgemm":
+        if not support_indexer_deepgemm:
+            pytest.skip("deep_gemm is not supported")
+    elif impl == "triton":
+        pass
+    else:
+        pytest.skip(f"{impl=} is not supported")
+
+    torch.set_default_dtype(torch.bfloat16)
+
+    max_seq_len = 8192
+    mtp_size = s_q if s_q <= 2 else 1
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_batch_size": 4,
+                    "op_impl": "torch",
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "cache_type": "paged",
+                    "dp_size": 1,
+                    "mla_absorb": "absorb",
+                    "max_seq_len": max_seq_len,
+                    "mtp_size": mtp_size,
+                },
+                "models": {
+                    "index_n_heads": n_heads,
+                    "index_head_dim": head_dim,
+                },
+            }
+        ),
+        need_ensure=False,
+    )
+
+    is_decode = s_q <= 2
+    if is_decode:
+        old_seq_len_list = [torch.randint(1, s_k - s_q, (1,)).item() for _ in range(bs)]
+        new_seq_len_list = [ol + s_q for ol in old_seq_len_list]
+    elif s_q == s_k:  # prefill
+        old_seq_len_list = [0] * bs
+        new_seq_len_list = [torch.randint(1, s_k, (1,)).item() for _ in range(bs)]
+    else:  # chunked-prefill
+        old_seq_len_list = [torch.randint(1, s_k - s_q, (1,)).item() for _ in range(bs)]
+        new_seq_len_list = [
+            torch.randint(s_k - s_q, s_k, (1,)).item() for _ in range(bs)
+        ]
+
+    seq_len_delta = BatchedSeqLenDelta(
+        old_seq_len_list,
+        new_seq_len_list,
+        device="cuda",
+        cache_prefix_lens_tensor_device=False,
+        cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
+        cache_delta_position_ids_tensor_device=False,
+        cache_delta_seq_ids_tensor_device=False,
+    )
+
+    page_size = 64
+    page_cnt_per_sample = ceil_div(max_seq_len, page_size)
+    max_num_pages = page_cnt_per_sample * bs
+    page_table = torch.randperm(max_num_pages, device="cuda", dtype=torch.int32)[
+        : bs * page_cnt_per_sample
+    ].view(bs, page_cnt_per_sample)
+
+    q = torch.randn(seq_len_delta.delta_total_len, n_heads, head_dim, device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    weights = torch.randn(
+        seq_len_delta.delta_total_len, n_heads, dtype=torch.float32, device="cuda"
+    )
+    k_ragged = torch.randn(seq_len_delta.new.total_len, head_dim, device="cuda").to(
+        torch.float8_e4m3fn
+    )
+    ks_ragged = torch.randn(
+        seq_len_delta.new.total_len, 1, dtype=torch.float32, device="cuda"
+    )
+
+    k_ks_old = (
+        None
+        if not is_decode
+        else (
+            k_ragged[: seq_len_delta.old.total_len],
+            ks_ragged[: seq_len_delta.old.total_len],
+        )
+    )
+
+    k_delta = k_ragged[seq_len_delta.old.total_len :]
+    ks_delta = ks_ragged[seq_len_delta.old.total_len :]
+
+    indexer_backend = DSAIndexer(impl)
+
+    def init_indexer_paged_kv_accessor(impl, k_ks=None):
+        if impl == "deepgemm":
+            k_ks_paged = torch.zeros(
+                max_num_pages, page_size, head_dim + 4, device="cuda"
+            ).to(torch.float8_e4m3fn)
+            if k_ks is not None:
+                append_to_paged_kv_cache_blockfp8_deepgemm(
+                    k_ks_paged,
+                    page_table,
+                    *k_ks,
+                    seq_len_delta.old.position_ids_tensor_device,
+                    seq_len_delta.old.seq_ids_tensor_device,
+                )
+            return PagedKVCacheAccessor(page_table, {"indexer_k_ks": k_ks_paged})
+
+        k_paged = torch.zeros(max_num_pages, page_size, head_dim, device="cuda").to(
+            torch.float8_e4m3fn
+        )
+        ks_paged = torch.zeros(max_num_pages, page_size, 1, device="cuda").to(
+            torch.float32
+        )
+        if k_ks is not None:
+            append_to_paged_kv_cache(
+                k_paged,
+                page_table,
+                k_ks[0],
+                seq_len_delta.old.position_ids_tensor_device,
+                seq_len_delta.old.seq_ids_tensor_device,
+            )
+            append_to_paged_kv_cache(
+                ks_paged,
+                page_table,
+                k_ks[1],
+                seq_len_delta.old.position_ids_tensor_device,
+                seq_len_delta.old.seq_ids_tensor_device,
+            )
+        return PagedKVCacheAccessor(
+            page_table,
+            {
+                "indexer_k": k_paged,
+                "indexer_ks": ks_paged,
+            },
+        )
+
+    # test impl
+    if is_decode:
+        indexer_backend.prepare_metadata_for_decode(seq_len_delta)
+
+    logits = record_benchmark.run(
+        lambda: indexer_backend.dsa_indexer(
+            q,
+            k_delta,
+            ks_delta,
+            weights,
+            seq_len_delta,
+            init_indexer_paged_kv_accessor(impl, k_ks_old),
+            is_causal=True,
+            return_indices=False,
+        ),
+        x_val=f"bs={bs} sq={s_q} sk={s_k}",
+        impl=impl,
+    )
+
+    mask = torch.arange(0, max_seq_len, device="cuda").unsqueeze(
+        0
+    ) <= seq_len_delta.delta_position_ids_tensor_device.unsqueeze(1)
+    logits[~mask] = float("-inf")  # causal masking before comparison
+
+    # ref torch impl
+    ref_indexer_backend = DSAIndexer("torch")
+    ref_logits = ref_indexer_backend.dsa_indexer(
+        q,
+        k_delta,
+        ks_delta,
+        weights,
+        seq_len_delta,
+        init_indexer_paged_kv_accessor("torch", k_ks_old),
+        is_causal=True,
+        return_indices=False,
+    )
+
+    assert_close(logits.to(ref_logits.dtype), ref_logits, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("bs", [0, 1, 3])

@@ -753,10 +753,10 @@ torchrun --nproc_per_node 8 --no-python ./test/dist_pytest/run_pytest_with_prett
 
 运行时：
 
-| 名称                       | 可选值                       | 描述                                                   |
-| -------------------------- | ---------------------------- | ------------------------------------------------------ |
-| `CHITU_LOGGING_LEVEL`      | `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` | 日志级别。                          |
-| `CHITU_DEBUG`              | `0`, `1`                     | 调试模式。当前仅用于启用一些计时器。                   |
-| `CHITU_CONFIG_PATH`        | 指向配置文件目录的路径       | 覆盖默认的配置文件目录。                               |
-| `CHITU_CONFIG_NAME`        | 不含 .yml 后缀的配置文件名   | 覆盖默认的配置文件名。                                 |
-| `CHITU_PREPROCESS_AND_SAVE_DIR` | 指向目录的路径          | `script/preprocess_and_save.py` 的输出目录。           |
+| 名称                            | 可选值                       | 描述                                                   |
+| ------------------------------- | ---------------------------- | ------------------------------------------------------ |
+| `CHITU_LOGGING_LEVEL`           | `<level>` 或 `<module1>:<level1>;<module2>:<level2>;...`，各 level 可为 `DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`，各 module（如设置）可为源码树中任意模块路径，如 `chitu.ops`。 | 日志级别。 |
+| `CHITU_DEBUG`                   | `0`, `1`                     | 调试模式。当前仅用于启用一些计时器。                   |
+| `CHITU_CONFIG_PATH`             | 指向配置文件目录的路径       | 覆盖默认的配置文件目录。                               |
+| `CHITU_CONFIG_NAME`             | 不含 .yml 后缀的配置文件名   | 覆盖默认的配置文件名。                                 |
+| `CHITU_PREPROCESS_AND_SAVE_DIR` | 指向目录的路径               | `script/preprocess_and_save.py` 的输出目录。           |

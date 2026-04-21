@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Kimi-K2.6 shares the same model structure with Kimi-K2.5
+defaults:
+  - Kimi-K2.5
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: Kimi-K2.6
+source: "https://huggingface.co/moonshotai/Kimi-K2.6" # Just for displaying. No automatic download.
