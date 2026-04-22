@@ -33,6 +33,10 @@ def clamp_int(x, low, high):
     return min(max(x, low), high)
 
 
+def _bytes_to_gb(x: int) -> float:
+    return float(x) / 1e9
+
+
 def build_layer_id_map(
     args,
     layer_filter_fn: Callable[[Iterable[int]], Iterable[int]] = lambda x: x,
@@ -114,13 +118,14 @@ def plan_kv_cache_blocks_after_warmup(args, cache_managers):
 def get_peak_live_and_target_bytes(
     memory_utilization=0.98,
     reserve_bytes=0,
-) -> tuple[int, int]:
+) -> tuple[int, int, dict[str, int]]:
     """
     Return:
         live_bytes: peak memory bytes until now (including activation memory
             observed during warming-up)
         target_budget_bytes: target live-memory budget after applying
             memory_utilization and reserve_bytes
+        allocator_debug_bytes: allocator peak/current debug fields
     """
 
     if get_global_args().infer.op_impl == "cpu":
@@ -129,7 +134,13 @@ def get_peak_live_and_target_bytes(
         target_budget_bytes = int(
             psutil.virtual_memory().total * memory_utilization
         ) - int(reserve_bytes)
-        return live_bytes, target_budget_bytes
+        return (
+            live_bytes,
+            target_budget_bytes,
+            {
+                "reserved_peak_gap_bytes": 0,
+            },
+        )
 
     current_device = torch.cuda.current_device()
     torch.cuda.synchronize()
@@ -145,6 +156,7 @@ def get_peak_live_and_target_bytes(
     # We use peak becuase it includes the activation memory observed during
     # warming-up
     peak_torch_allocated_bytes = memory_stats["allocated_bytes.all.peak"]
+    peak_torch_reserved_bytes = memory_stats["reserved_bytes.all.peak"]
     # Memory stats part 1 ends.
     ###################################################################
 
@@ -170,6 +182,11 @@ def get_peak_live_and_target_bytes(
 
     live_bytes = int(peak_torch_allocated_bytes + current_non_torch_allocations)
     target_budget_bytes = int(total_bytes * memory_utilization) - int(reserve_bytes)
+    allocator_debug_bytes = {
+        "reserved_peak_gap_bytes": max(
+            0, int(peak_torch_reserved_bytes) - int(peak_torch_allocated_bytes)
+        ),
+    }
 
     logger.debug(
         "Current live KV budget: total_bytes=%d, live_bytes=%d, reserve_bytes=%d, "
@@ -179,7 +196,7 @@ def get_peak_live_and_target_bytes(
         reserve_bytes,
         target_budget_bytes,
     )
-    return live_bytes, target_budget_bytes
+    return live_bytes, target_budget_bytes, allocator_debug_bytes
 
 
 def solve_main_target_from_current(
@@ -198,9 +215,11 @@ def solve_main_target_from_current(
     if main_bpb <= 0:
         return 0
 
-    live_bytes, target_budget_bytes = get_peak_live_and_target_bytes(
-        memory_utilization=args.infer.memory_utilization,
-        reserve_bytes=reserve_bytes,
+    live_bytes, target_budget_bytes, allocator_debug_bytes = (
+        get_peak_live_and_target_bytes(
+            memory_utilization=args.infer.memory_utilization,
+            reserve_bytes=reserve_bytes,
+        )
     )
 
     # baseline = everything except current main cache
@@ -210,14 +229,16 @@ def solve_main_target_from_current(
     target_main_blocks = allowed_main_bytes // int(main_bpb)
 
     logger.info(
-        "KV main-only solve: live_bytes=%d target_budget_bytes=%d "
-        "baseline_bytes=%d main_cur=%d target_main_blocks=%d main_cap=%d",
-        int(live_bytes),
-        int(target_budget_bytes),
-        int(baseline_bytes),
+        "KV main-only solve: live=%.2fGB target_budget=%.2fGB "
+        "baseline=%.2fGB main_cur=%d target_main_blocks=%d main_cap=%d "
+        "reserved_peak_gap=%.2fGB",
+        _bytes_to_gb(live_bytes),
+        _bytes_to_gb(target_budget_bytes),
+        _bytes_to_gb(baseline_bytes),
         int(main_cur),
         int(target_main_blocks),
         int(main_cap),
+        _bytes_to_gb(allocator_debug_bytes["reserved_peak_gap_bytes"]),
     )
 
     return max(0, min(int(target_main_blocks), int(main_cap)))
@@ -242,9 +263,11 @@ def solve_main_target_after_shrink(
     indexer_cap = indexer_cm.get_allocatable_max_num_blocks()
     indexer_bpb = int(indexer_cm.estimate_bytes_per_block())
 
-    live_bytes, target_budget_bytes = get_peak_live_and_target_bytes(
-        memory_utilization=args.infer.memory_utilization,
-        reserve_bytes=reserve_bytes,
+    live_bytes, target_budget_bytes, allocator_debug_bytes = (
+        get_peak_live_and_target_bytes(
+            memory_utilization=args.infer.memory_utilization,
+            reserve_bytes=reserve_bytes,
+        )
     )
 
     # baseline = everything except current main + current indexer
@@ -279,18 +302,19 @@ def solve_main_target_after_shrink(
             hi = mid - 1
 
     logger.info(
-        "KV joint solve after shrink: live_bytes=%d target_budget_bytes=%d "
-        "baseline_bytes=%d main_cur=%d indexer_cur=%d best_main=%d best_indexer=%d "
-        "main_cap=%d indexer_cap=%d",
-        int(live_bytes),
-        int(target_budget_bytes),
-        int(baseline_bytes),
+        "KV joint solve after shrink: live=%.2fGB target_budget=%.2fGB "
+        "baseline=%.2fGB main_cur=%d indexer_cur=%d best_main=%d best_indexer=%d "
+        "main_cap=%d indexer_cap=%d reserved_peak_gap=%.2fGB",
+        _bytes_to_gb(live_bytes),
+        _bytes_to_gb(target_budget_bytes),
+        _bytes_to_gb(baseline_bytes),
         int(main_cur),
         int(indexer_cur),
         int(best_main),
         int(best_indexer),
         int(main_cap),
         int(indexer_cap),
+        _bytes_to_gb(allocator_debug_bytes["reserved_peak_gap_bytes"]),
     )
     return int(best_main)
 

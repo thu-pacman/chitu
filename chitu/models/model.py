@@ -72,6 +72,14 @@ cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 
 logger = getLogger(__name__)
+_SHARED_EXPERTS_STREAM: torch.cuda.Stream | None = None
+
+
+def _make_shared_experts_stream() -> torch.cuda.Stream:
+    global _SHARED_EXPERTS_STREAM
+    if _SHARED_EXPERTS_STREAM is None:
+        _SHARED_EXPERTS_STREAM = torch.cuda.Stream()
+    return _SHARED_EXPERTS_STREAM
 
 
 class LayerNorm(nn.Module):
@@ -1818,7 +1826,7 @@ class ParallelMoeBlock(nn.Module):
 
         self.shared_experts_stream = None
         if self.shared_experts is not None and not is_muxi():
-            self.shared_experts_stream = torch.cuda.Stream()
+            self.shared_experts_stream = _make_shared_experts_stream()
 
         self.moe_impl = moe_impl
         if self.moe_impl is not None and self.moe_impl.ep_size > 1:
