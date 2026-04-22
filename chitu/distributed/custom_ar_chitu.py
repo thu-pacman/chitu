@@ -73,6 +73,47 @@ def _check_p2p_access(rank: int, world_size: int) -> bool:
     return True
 
 
+def _check_full_nvlink(physical_device_ids) -> bool:
+    """Every pair of GPUs is connected by NVLink (1 hop).
+
+    Matches vLLM's `is_fully_connected` (vllm/platforms/cuda.py): query NVML
+    via pynvml for each pair with `NVML_P2P_CAPS_INDEX_NVLINK`. Only returns
+    True if every pair reports `NVML_P2P_STATUS_OK`. PCIe-only hosts will see
+    `NOT_SUPPORTED` and correctly yield False — which is the condition the
+    custom AR spin-barrier kernel relies on.
+    """
+    try:
+        import pynvml
+    except ImportError:
+        logger.warning(
+            "pynvml not available; cannot verify NVLink. Disabling custom AR."
+        )
+        return False
+    try:
+        pynvml.nvmlInit()
+        try:
+            handles = [
+                pynvml.nvmlDeviceGetHandleByIndex(int(i)) for i in physical_device_ids
+            ]
+            for i, h_i in enumerate(handles):
+                for j, h_j in enumerate(handles):
+                    if i >= j:
+                        continue
+                    try:
+                        st = pynvml.nvmlDeviceGetP2PStatus(
+                            h_i, h_j, pynvml.NVML_P2P_CAPS_INDEX_NVLINK
+                        )
+                        if st != pynvml.NVML_P2P_STATUS_OK:
+                            return False
+                    except pynvml.NVMLError:
+                        return False
+            return True
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:
+        return False
+
+
 class ChituCustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
 
@@ -120,17 +161,21 @@ class ChituCustomAllreduce:
 
         try:
             cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+            local_index = device.index
+            if local_index is None:
+                local_index = torch.cuda.current_device()
             if cuda_visible_devices:
                 device_ids = list(map(int, cuda_visible_devices.split(",")))
-                physical_device_id = device_ids[device.index]
+                physical_device_id = device_ids[local_index]
             else:
-                physical_device_id = device.index
+                physical_device_id = local_index
 
             tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
             gather_list = [torch.zeros_like(tensor) for _ in range(self.world_size)]
             dist.all_gather(gather_list, tensor, group=self.group)
 
-            self.fully_connected = True
+            physical_device_ids = [int(t.item()) for t in gather_list]
+            self.fully_connected = _check_full_nvlink(physical_device_ids)
 
             if not _check_p2p_access(self.rank, self.world_size):
                 logger.warning(
@@ -139,18 +184,29 @@ class ChituCustomAllreduce:
                 self.disabled = True
                 return
 
-            if self.world_size > 2 and not self.fully_connected:
+            if not self.fully_connected:
+                # vLLM's upstream check is `world_size > 2 and not fully_connected`
+                # because its 2-GPU 1stage kernel is meant to work on PCIe. In
+                # practice the cross-device release/acquire.sys barrier is still
+                # unreliable on PCIe-only hosts (see vllm_custom_all_reduce.cuh's
+                # multi_gpu_barrier), so we keep the stricter rule: any group
+                # without full NVLink disables custom AR.
                 logger.warning(
-                    "Custom allreduce disabled: >2 GPUs without full interconnect."
+                    "Custom allreduce disabled: not full NVLink between all GPUs "
+                    "in this group (world_size=%d). PCIe P2P cannot guarantee the "
+                    "cross-device atomic / release-acquire visibility the barrier "
+                    "kernel depends on.",
+                    self.world_size,
                 )
                 self.disabled = True
                 return
 
         except Exception as e:
             logger.warning(
-                f"Topology detection failed: {e}. Defaulting to fully_connected=True"
+                f"Topology detection failed: {e}. Disabling custom AR for safety."
             )
-            self.fully_connected = True
+            self.disabled = True
+            return
 
         self.max_size = max_size
 

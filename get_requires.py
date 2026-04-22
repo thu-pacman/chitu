@@ -49,6 +49,7 @@ install_requires = [
     "openai",
     "anthropic",
     "aiohttp",
+    "pynvml>=13.0.1",
 ]
 
 
