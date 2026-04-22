@@ -119,7 +119,6 @@ class MoEImplBase:
         self.ep_size = ep_group.group_size
 
         self.task_type: Optional[TaskType] = None
-        self.impl_map: dict[TaskType, str] = {}
         self.load_balancer = {}
 
     def prepare(self, task_type: TaskType, num_tokens: int) -> None:
@@ -142,9 +141,6 @@ class MoEImplBase:
 
     def exit_moe_reduce_rank_list(self):
         raise NotImplementedError()
-
-    def get_experts_impl(self) -> str:
-        return self.impl_map[self.task_type]
 
 
 class MoEImplEP(MoEImplBase):
@@ -182,8 +178,6 @@ class MoEImplEP(MoEImplBase):
 
         self.task_type: Optional[TaskType] = None
 
-        self.prefill_experts_impl = "auto"
-        self.decode_experts_impl = "auto"
         self.prefill_token_dispatcher_impl = prefill_token_dispatcher_impl
         self.decode_token_dispatcher_impl = decode_token_dispatcher_impl
         self.use_cuda_graph = use_cuda_graph
@@ -195,7 +189,6 @@ class MoEImplEP(MoEImplBase):
             )
         self.n_global_experts_slots = n_global_experts_slots
         self._init_token_dispatcher()
-        self._init_experts_impl()
         self._init_load_balancer(expert_stats_path)
 
         if self.n_experts > 1:
@@ -333,12 +326,6 @@ class MoEImplEP(MoEImplBase):
         else:
             raise ValueError(f"Invalid task type: {self.task_type}")
 
-    def _init_experts_impl(self):
-        self.impl_map = {
-            TaskType.Prefill: self.prefill_experts_impl,
-            TaskType.Decode: self.decode_experts_impl,
-        }
-
     def prepare(self, task_type: TaskType, num_tokens: int) -> None:
         super().prepare(task_type, num_tokens)
         self._get_current_token_dispatcher().prepare(num_tokens)
@@ -411,15 +398,3 @@ class MoEImplNoEP(MoEImplBase):
         )
 
         assert self.ep_size == 1
-
-        # FIXME: Check whether deep_gemm support our round_scale_to_pow2 setting
-        if has_deep_gemm:
-            self.impl_map = {
-                TaskType.Prefill: "auto",
-                TaskType.Decode: "auto",
-            }
-        else:
-            self.impl_map = {
-                TaskType.Prefill: "auto",
-                TaskType.Decode: "auto",
-            }

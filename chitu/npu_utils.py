@@ -12,15 +12,6 @@ from chitu.utils import (
     try_import_and_setup_torch_npu,
     next_power_of_two,
 )
-from chitu.distributed.parallel_state import (
-    get_ep_size,
-    get_ep_group,
-    get_tp_size,
-    get_tp_group,
-    get_etp_size,
-    get_etp_group,
-)
-from chitu.device_type import is_ascend_910b
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
@@ -84,10 +75,16 @@ def get_hcomm_info(rank, comm_group):
 
 
 def fused_experts_npu_tp_split(
-    input: torch.Tensor, n_local_experts=-1, is_expert_ids=False, is_zero_batch_ok=False
+    input: torch.Tensor,
+    *,
+    tp_group,
+    ep_group,
+    n_local_experts=-1,
+    is_expert_ids=False,
+    is_zero_batch_ok=False,
 ):
-    rank_in_group = get_tp_group().rank_in_group
-    output = torch.tensor_split(input, get_tp_size())[rank_in_group]
+    rank_in_group = tp_group.rank_in_group
+    output = torch.tensor_split(input, tp_group.group_size)[rank_in_group]
     if output.shape[0] > 0 or is_zero_batch_ok:
         return output
 
@@ -98,18 +95,18 @@ def fused_experts_npu_tp_split(
     # duplicate expert id is not allowed, generate evenly and communication friendly
     topk = input.shape[1]
     rank_num = next_power_of_two(topk // n_local_experts)
-    st = get_ep_group().rank_in_group // rank_num * rank_num * n_local_experts
+    st = ep_group.rank_in_group // rank_num * rank_num * n_local_experts
     ed = st + topk
     return torch.arange(st, ed, dtype=output.dtype, device=output.device).view(1, -1)
 
 
-def fused_experts_npu_tp_all_gather(input: torch.Tensor, origin_bs: int):
+def fused_experts_npu_tp_all_gather(input: torch.Tensor, tp_group, origin_bs: int):
     output = input.new_empty((origin_bs,) + input.shape[1:])
-    tensor_list = list(torch.tensor_split(output, get_tp_size()))
-    rank_in_group = get_tp_group().rank_in_group
+    tensor_list = list(torch.tensor_split(output, tp_group.group_size))
+    rank_in_group = tp_group.rank_in_group
     if tensor_list[rank_in_group].shape[0] == 0:
         input = tensor_list[rank_in_group]
-    torch.distributed.all_gather(tensor_list, input, group=get_tp_group().gpu_group)
+    torch.distributed.all_gather(tensor_list, input, group=tp_group.gpu_group)
     return output
 
 

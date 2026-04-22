@@ -1842,7 +1842,9 @@ class ParallelMoeBlock(nn.Module):
             )
         self.prefill_memory_tolerance = prefill_memory_tolerance
 
-    def forward(self, x: torch.Tensor, inplace: bool = True) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, inplace: bool = True, *, experts_impl: str = "auto"
+    ) -> torch.Tensor:
         """
         Forward pass for the MoE block.
 
@@ -1885,7 +1887,6 @@ class ParallelMoeBlock(nn.Module):
 
         shared_y = None
         x_in_use_simultenously = False
-        experts_impl = self.moe_impl.get_experts_impl()
         if self.moe_impl.ep_size > 1:
             routed_x_old = routed_x
             routed_x, weights, dispatch_stream = (
