@@ -14,28 +14,61 @@ from chitu.testing import assert_close, gen_token_to_expert_indices
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
+_I32_MAX = 2**31 - 1
 
-@pytest.mark.parametrize("M", [0, 32, 64, 128])
-@pytest.mark.parametrize("topk", [8])
-@pytest.mark.parametrize("N", [256, 512, 1024])
-@pytest.mark.parametrize("compute_dtype", [torch.float16])
+
+_MOE_SUM_PER_TOKEN_CASES = [
+    pytest.param(M, 8, N, torch.float16, None, id=f"M{M}_N{N}")
+    for M in [0, 32, 64, 128]
+    for N in [256, 512, 1024]
+] + [
+    pytest.param(1024, 8, 7168, torch.bfloat16, False, id="int32_offset_path"),
+    pytest.param(49152, 8, 7168, torch.bfloat16, True, id="int64_offset_path"),
+]
+
+
+@pytest.mark.parametrize(
+    "M, topk, N, compute_dtype, expect_i64_offset", _MOE_SUM_PER_TOKEN_CASES
+)
 @pytest.mark.skipif(not has_triton, reason="triton is not available")
-def test_moe_sum_per_token(M, topk, N, compute_dtype, record_benchmark):
+def test_moe_sum_per_token(
+    M, topk, N, compute_dtype, expect_i64_offset, record_benchmark
+):
     input_tensor = torch.rand(M, topk, N, device="cuda", dtype=compute_dtype)
     topk_weights = torch.rand(M, topk, device="cuda", dtype=compute_dtype)
 
-    ref_output = torch.zeros(M, N, device="cuda", dtype=compute_dtype)
-    moe_sum_per_token(input_tensor, topk_weights, out=ref_output, impl="torch")
-
     test_output = torch.zeros(M, N, device="cuda", dtype=compute_dtype)
-
-    record_benchmark.run(
-        lambda: moe_sum_per_token(
-            input_tensor, topk_weights, out=test_output, impl="triton"
-        ),
-        N=N,
-        impl="triton",
+    run_triton = lambda: moe_sum_per_token(
+        input_tensor, topk_weights, out=test_output, impl="triton"
     )
+
+    if expect_i64_offset is None:
+        ref_output = torch.zeros(M, N, device="cuda", dtype=compute_dtype)
+        moe_sum_per_token(input_tensor, topk_weights, out=ref_output, impl="torch")
+        record_benchmark.run(run_triton, N=N, impl="triton")
+    else:
+        product = M * topk * N
+        assert (product > _I32_MAX) == expect_i64_offset, (
+            f"input size not expected: M*topk*N={product}, "
+            f"expect_i64_offset={expect_i64_offset}"
+        )
+
+        run_triton()
+        torch.cuda.synchronize()
+
+        ref_output = torch.empty((M, N), device="cuda", dtype=compute_dtype)
+        # Build the reference in chunks so the int64-path case does not OOM in CI.
+        chunk_size = 512 if expect_i64_offset else M
+        for start in range(0, M, chunk_size):
+            end = min(start + chunk_size, M)
+            ref_output[start:end] = (
+                (
+                    input_tensor[start:end].float()
+                    * topk_weights[start:end].float().unsqueeze(-1)
+                )
+                .sum(dim=1)
+                .to(compute_dtype)
+            )
 
     assert_close(test_output, ref_output, rtol=1e-2, atol=1e-2)
 
