@@ -292,15 +292,13 @@ class PipeDispatcher(TasksDispatcher):
 
     def dispatch_metadata(
         self, tasks: Optional[PackedTasks | PackedTasksBase]
-    ) -> Optional[
-        tuple[SerializedPackedTasksPayloadType, PackedTasks | PackedTasksBase]
-    ]:
+    ) -> tuple[SerializedPackedTasksPayloadType, PackedTasks | PackedTasksBase]:
         # recv task from previous stage
         if self.is_first_stage:
             payload_type = tasks.payload_type
         else:
             msgs = self.recv_socket.recv_multipart()
-            payload_type, tasks, slot_idx = (
+            payload_type, tasks, slot_idx, extra_info = (
                 self.metadata_serializer.deserialize_metadata(msgs[0])
             )
             slot_handle = get_slot_handle()
@@ -312,17 +310,8 @@ class PipeDispatcher(TasksDispatcher):
             slot_handle = get_slot_handle()
             slot_idx = slot_handle.get_slot_idx() if slot_handle else None
             # auto select optimal serialize config
-            target_is_pd_decode_rank = (
-                get_global_args().dp_config.router.pd_disaggregation.enabled
-            ) and tasks.task_type == TaskType.Decode
             tasks_msg = self.metadata_serializer.serialize_metadata(
-                tasks,
-                config=(
-                    None
-                    if not target_is_pd_decode_rank
-                    else MetadataConfig.for_pd_decode_rank()
-                ),
-                slot_idx=slot_idx,
+                tasks, slot_idx=slot_idx
             )
             msgs = [tasks_msg]
             self.send_socket.send_multipart(msgs)
@@ -330,7 +319,6 @@ class PipeDispatcher(TasksDispatcher):
         return payload_type, tasks
 
     def recv_payload(self, payload: torch.Tensor) -> torch.Tensor:
-        # only hidden payload
         if not self.is_first_stage:
             torch.distributed.recv(
                 tensor=payload,
@@ -349,9 +337,7 @@ class PipeDispatcher(TasksDispatcher):
                 group=self.next_pair_group,
             )
 
-    def recv_results(self, tasks: Optional[PackedTasks]):
-        if tasks is None or len(tasks.output_tasks) == 0:
-            return
+    def recv_results(self, tasks: Optional[PackedTasks] = None):
         num_output_tasks = len(tasks.output_tasks)
         results = torch.empty(
             (num_output_tasks, tasks.get_result_len()),
@@ -367,6 +353,14 @@ class PipeDispatcher(TasksDispatcher):
         tasks.generated_result = results
 
     def send_results(self, tasks: Optional[PackedTasks] = None):
+        torch.distributed.send(
+            tensor=tasks.generated_result,
+            dst=self.next_rank,
+            tag=RESULT_TAG,
+            group=self.next_pair_group,
+        )
+
+    def collect_results(self, tasks: Optional[PackedTasks] = None):
         # PD Prefill-only:
         # - Prefill side does not sample tokens in PP send_payload (no sampling round-trip).
         # - Prefill runs model prefill and KV transfer; first token is sampled in KV hook
@@ -379,12 +373,10 @@ class PipeDispatcher(TasksDispatcher):
             return
         if tasks is None or len(tasks.output_tasks) == 0:
             return
-        torch.distributed.send(
-            tensor=tasks.generated_result,
-            dst=self.next_rank,
-            tag=RESULT_TAG,
-            group=self.next_pair_group,
-        )
+        if self.is_first_stage:
+            self.recv_results(tasks)
+        elif self.is_last_stage:
+            self.send_results(tasks)
 
 
 class TensorDispatcher(TasksDispatcher):
@@ -419,8 +411,8 @@ class TensorDispatcher(TasksDispatcher):
         )
 
     def dispatch_metadata(
-        self, tasks: Optional[PackedTasksBase]
-    ) -> tuple[SerializedPackedTasksPayloadType, PackedTasksBase]:
+        self, tasks: Optional[PackedTasks | PackedTasksBase]
+    ) -> tuple[SerializedPackedTasksPayloadType, PackedTasks | PackedTasksBase]:
         """统一的 metadata dispatch（使用 msgpack + ZMQ ipc://）"""
 
         if self.is_main_rank:
@@ -441,7 +433,7 @@ class TensorDispatcher(TasksDispatcher):
         else:
             # 非主 rank：接收消息
             msgs = self.socket.recv_multipart()
-            payload_type, tasks, slot_idx = (
+            payload_type, tasks, slot_idx, extra_info = (
                 self.metadata_serializer.deserialize_metadata(
                     msgs[0],
                 )
@@ -511,7 +503,9 @@ class ExpertDataDispatcher(TasksDispatcher):
 
         apply_profile_command(payload)
 
-    def dispatch_metadata(self, tasks):
+    def dispatch_metadata(
+        self, tasks: Optional[PackedTasks | PackedTasksBase]
+    ) -> tuple[SerializedPackedTasksPayloadType, PackedTasks | PackedTasksBase]:
         """统一的 metadata dispatch（使用 msgpack + ZMQ）"""
 
         if self.is_main_rank:
@@ -546,11 +540,6 @@ class ExpertDataDispatcher(TasksDispatcher):
                     rank_tasks = PackedTasks([], task_type=current_task_type)
                 tasks_msg = self.metadata_serializer.serialize_metadata(
                     rank_tasks,
-                    config=(
-                        None
-                        if not target_is_pd_decode_rank
-                        else MetadataConfig.for_pd_dpep_decode_rank()
-                    ),
                     slot_idx=(
                         Backend.schedulers[
                             rank_in_group
@@ -563,23 +552,6 @@ class ExpertDataDispatcher(TasksDispatcher):
                     f"{rank_in_group}".encode(),
                     tasks_msg,
                 ]
-                if target_is_pd_decode_rank:
-                    # Decode task meta：首次下发时发送 MsgPackableTask
-                    # 让 worker rank 本地 TaskPool 可以构造 PackedTasks，并在收到 bootstrap 时发送 TransferInfo
-                    sent = self._decode_bootstrap_sent[rank_in_group]
-                    boot_tasks_ids = [
-                        tid
-                        for tid in task_ids
-                        if tid not in sent and tid in TaskPool.pool
-                    ]
-                    if boot_tasks_ids:
-                        msgs.append(msgpack.packb(boot_tasks_ids, use_bin_type=True))
-                        sent.update(boot_tasks_ids)
-                        logger.debug(
-                            f"[PD_TRACE][dp.send_decode_bootstrap] to_rank={int(rank_in_group)} scheduled_task_ids_len={len(task_ids)} "
-                            f"bootstrap_tasks={boot_tasks_ids} frames={len(msgs)} frame_bytes={[len(m) for m in msgs]}"
-                        )
-
                 msgs.append(profile_frame)
                 self.socket.send_multipart(msgs)
 
@@ -592,47 +564,30 @@ class ExpertDataDispatcher(TasksDispatcher):
             if profile_frame:
                 self._apply_profile_payload(_json.loads(profile_frame))
 
-            payload_type, tasks, slot_idx = (
+            payload_type, tasks, slot_idx, extra_info = (
                 self.metadata_serializer.deserialize_metadata(msgs[0])
             )
-            if len(msgs) > 1:
+            if extra_info.get("boot_ids", None) is not None:
                 logger.debug(f"DP rank {self.rank_in_group} received decode bootstrap")
-                boot_ids = msgpack.unpackb(msgs[-1], raw=False)
-                for tid in boot_ids:
-                    if tid in TaskPool.pool:
-                        TaskPool.pool[tid].task_type = TaskType.Decode
-                        logger.debug(
-                            f"DP rank {self.rank_in_group} updated task type for task {tid} to Decode"
-                        )
+                boot_ids = extra_info["boot_ids"]
+                assert all(
+                    task_id in TaskPool.pool for task_id in boot_ids
+                ), "Bootstrap ID not in task pool"
                 # PD decode-only: prepare TransferInfo on worker ranks immediately upon bootstrap.
                 kv_hook = self.get_executor().get_kv_hook()
                 kv_manager = getattr(kv_hook, "kv_manager", None)
                 if (
                     kv_manager is not None
                     and getattr(kv_hook, "mode", None) == "decode"
-                    and hasattr(kv_manager, "prepare_kv_transfer")
                 ):
                     kv_cache = getattr(kv_manager, "kv_cache", None)
                     if kv_cache is not None and boot_ids:
                         prefix_lens = []
                         for rid in boot_ids:
-                            t = TaskPool.pool.get(rid)
-                            prefix_lens.append(
-                                int(getattr(t, "prefix_tokens_len", 0) or 0)
-                                if t is not None
-                                else 0
-                            )
-                            prefill_rank = (
-                                getattr(t, "pd_prefill_engine_rank", None)
-                                if t is not None
-                                else None
-                            )
-                            if prefill_rank is not None and hasattr(
-                                kv_manager, "set_prefill_target_engine_rank"
-                            ):
-                                kv_manager.set_prefill_target_engine_rank(
-                                    rid, int(prefill_rank)
-                                )
+                            t = TaskPool.pool[rid]
+                            prefix_lens.append(t.prefix_tokens_len)
+                            prefill_rank = t.pd_prefill_engine_rank
+                            kv_manager.set_prefill_target_engine_rank(rid, prefill_rank)
                         kv_manager.prepare_kv_transfer(
                             request_ids=list(boot_ids),
                             kv_cache=kv_cache,
@@ -684,8 +639,7 @@ class ExpertDataDispatcher(TasksDispatcher):
                     all_tokens_mtp[rank_in_group] = msgpack.unpackb(msgs[2])
                 if len(msgs) > base_frame_count:
                     ft = msgpack.unpackb(msgs[base_frame_count])
-                    if ft:
-                        all_first_tokens.update(ft)
+                    all_first_tokens.update(ft)
             if not self.mtp_size > 1:
                 return (
                     sum(all_tokens, token_list),
@@ -847,6 +801,29 @@ class Executor:
         if self.is_sample_stage:
             self.sampler = Sampler()
 
+        self.process_queue = []
+        if not self.is_pp_first_stage:
+            # For pp last stage:
+            # sync postprocess before PP receive will cause ACL stream synchronize failed with error code:107020
+            # TODO: fix this bug and move postprocess_sync_part in front of model run
+            self.process_queue = [
+                self.model_run,
+            ]
+        elif not self.has_schedule_overlap:
+            # normal step
+            self.process_queue = [
+                self.model_run,
+                TaskCollector.process_last_batch_results,
+                self.postprocess_sync_part,
+            ]
+        else:
+            # step with overlap
+            self.process_queue = [
+                self.postprocess_sync_part,
+                self.model_run,
+                TaskCollector.process_last_batch_results,
+            ]
+
     def _prepend_dispatcher(self, dispatcher: TasksDispatcher):
         self.task_dispatchers.insert(0, dispatcher)
 
@@ -1006,16 +983,13 @@ class Executor:
         ):
             self.last_profile_task_type = tasks.task_type
 
+        # Payload Type: Terminated
         if payload_type == SerializedPackedTasksPayloadType.TerminateBackend:
             Backend.state = BackendState.Terminated
         if Backend.state == BackendState.Terminated:
             return SerializedPackedTasksPayloadType.TerminateBackend
 
-        if payload_type == SerializedPackedTasksPayloadType.Empty:
-            self.postprocess_sync_part(tasks)
-            TaskCollector.process_last_batch_results()
-            return payload_type
-
+        # Payload Type: EndTask, remove given tasks
         if payload_type == SerializedPackedTasksPayloadType.EndTask:
             if self.is_sample_stage:
                 self.sampler.end_tasks(tasks.task_ids)
@@ -1030,9 +1004,42 @@ class Executor:
                         TaskPool.remove(task_id)
             return payload_type
 
-        # synchronize
-        if self.has_schedule_overlap and self.is_pp_first_stage:
-            self.postprocess_sync_part(tasks)
+        process_queue = self.process_queue
+        for process_step in process_queue:
+            process_step(tasks)
+
+        return payload_type
+
+    def special_step(self, task_ids: list[str], type: str = "EndTask"):
+        if len(task_ids) == 0:
+            return
+        tasks = PackedTasksBase(
+            num_tasks=len(task_ids),
+            task_ids=task_ids,
+            task_type=TaskType.Special,
+            payload_type=SerializedPackedTasksPayloadType[type],
+        )
+        self.step(tasks)
+
+    def _get_output_token_offsets(self, tasks: PackedTasksBase) -> torch.Tensor:
+        if tasks.task_type == TaskType.Prefill:
+            output_token_offsets = []
+            cnt = 0
+            for i in range(tasks.num_tasks):
+                cnt += len(tasks.tokens[i])
+                if tasks.has_outputs[i]:
+                    output_token_offsets.append(cnt - 1)
+            return torch.tensor(
+                output_token_offsets, dtype=torch.int32, device=self.device
+            )
+        else:
+            return torch.arange(tasks.num_tasks, dtype=torch.int32, device=self.device)
+
+    def model_run(self, tasks: PackedTasksBase):
+        if tasks.payload_type == SerializedPackedTasksPayloadType.Empty:
+            if not self.is_pp_first_stage:
+                self.postprocess_sync_part(tasks)
+            return
 
         if self.moe_impl is not None:
             tasks_num_tokens = (
@@ -1072,11 +1079,10 @@ class Executor:
 
         # *consume prefill tokens / update prefix token length
         if isinstance(tasks, PackedTasks):
-            update_tasks = (
-                tasks
-                if self.rank > 0 or self.dp_size <= 1
-                else DPTaskCollector.get_total_packedtasks()
-            )
+            if self.dp_size > 1 and self.rank == 0:
+                update_tasks = DPTaskCollector.get_total_packedtasks()
+            else:
+                update_tasks = tasks
             if update_tasks.task_type == TaskType.Prefill:
                 for task in update_tasks.tasks:
                     task.consume_req_tokens()
@@ -1084,7 +1090,6 @@ class Executor:
                 for task in update_tasks.output_tasks:
                     task.has_unsync_new_token = True
 
-        # 3. sample
         tokens = None
         if (
             self.is_sample_stage
@@ -1108,40 +1113,7 @@ class Executor:
         # Notify KV transfer hook after prefill completes.
         if tasks.task_type == TaskType.Prefill:
             self._kv_hook.on_prefill_done(tokens, tasks)
-
-        # async postprocess
-        TaskCollector.process_last_batch_results()
-
-        # 4. sync postprocess
         self.postprocess_before_sync(tasks)
-        if not self.has_schedule_overlap and self.is_pp_first_stage:
-            self.postprocess_sync_part(tasks)
-        return payload_type
-
-    def special_step(self, task_ids: list[str], type: str = "EndTask"):
-        if len(task_ids) == 0:
-            return
-        tasks = PackedTasksBase(
-            num_tasks=len(task_ids),
-            task_ids=task_ids,
-            task_type=TaskType.Special,
-            payload_type=SerializedPackedTasksPayloadType[type],
-        )
-        self.step(tasks)
-
-    def _get_output_token_offsets(self, tasks: PackedTasksBase) -> torch.Tensor:
-        if tasks.task_type == TaskType.Prefill:
-            output_token_offsets = []
-            cnt = 0
-            for i in range(tasks.num_tasks):
-                cnt += len(tasks.tokens[i])
-                if tasks.has_outputs[i]:
-                    output_token_offsets.append(cnt - 1)
-            return torch.tensor(
-                output_token_offsets, dtype=torch.int32, device=self.device
-            )
-        else:
-            return torch.arange(tasks.num_tasks, dtype=torch.int32, device=self.device)
 
     def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         is_empty_step = tasks.num_tasks == 0
@@ -1487,7 +1459,7 @@ class Executor:
                     block_tokens_tensors.append(block_slice.clone())
 
                     if has_eos_list[i]:
-                        task.stopped = True
+                        task.set_stopped()
                         if task.req is not None:
                             task.req.finish_reason = "stop"
                     elif (
@@ -1495,7 +1467,7 @@ class Executor:
                         and task.req.num_output_tokens + block_length
                         >= task.req.max_new_tokens
                     ):
-                        task.stopped = True
+                        task.set_stopped()
                         task.req.finish_reason = "length"
                     task.next_block = None
 
@@ -1583,8 +1555,8 @@ class Executor:
         for task in tasks_list:
             if task.req is None:
                 continue
-            if task.stopped and not task.req.finished:
-                task.req.finish()
+            if task.user_request_finished() and not task.req.finished:
+                task.req.stop_stream()
             else:
                 task.req.notify_server_data_added_threadsafe()
 
@@ -1594,28 +1566,25 @@ class Executor:
 
         Synchronize next tokens from GPU to CPU.
 
+        After synchronizing, collect result from the PP last stage and each DP rank.
+
         By default, this part is after the async postprocess.
 
         When schedule overlap is enable, this part will execute before the model run.
         """
         collect_tasks: Optional[PackedTasks] = None
+        pd_first_tokens_from_workers: dict[str, int] = {}
         # get the collect packed tasks (tasks that finished this step)
-        if self.rank == 0 or self.dp_dispatcher:
+        if TaskCollector.available():
             collect_tasks = TaskCollector.collect(tasks)
         # pp collect result from last stage
         if self.pipe_dispatcher:
-            if self.pipe_dispatcher.is_last_stage:
-                collect_tasks = TaskCollector.collect(tasks)
-                self.pipe_dispatcher.send_results(collect_tasks)
-            elif self.pipe_dispatcher.is_first_stage and not self._pd_prefill_only:
-                self.pipe_dispatcher.recv_results(collect_tasks)
+            self.pipe_dispatcher.collect_results(collect_tasks)
         if collect_tasks is None:
             collect_tasks = PackedTasks([], task_type=TaskType.Special)
+        # dp collect result from each dp rank
         if self.rank == 0 or self.dp_dispatcher:
-            pd_first_tokens_from_workers: dict[str, int] = {}
-            local_output_tasks = (
-                collect_tasks.output_tasks if collect_tasks.num_tasks > 0 else []
-            )
+            local_output_tasks = collect_tasks.output_tasks
             if self.rank == 0 and self.dp_dispatcher:
                 all_tasks = DPTaskCollector.get_last_packedtasks()
                 if all_tasks is not None:
@@ -1652,12 +1621,14 @@ class Executor:
                     collect_tasks.generated_result = torch.tensor(
                         result_list, device="cpu", dtype=torch.int32
                     )
-                if self.mtp_size > 1:
-                    for it, task in enumerate(collect_tasks.output_tasks):
-                        task.num_new_tokens_single_step = len(mtp_token_list[it]) + 1
-                        task.mtp_token_list = mtp_token_list[it]
+                    if self.mtp_size > 1:
+                        for it, task in enumerate(collect_tasks.output_tasks):
+                            task.num_new_tokens_single_step = (
+                                len(mtp_token_list[it]) + 1
+                            )
+                            task.mtp_token_list = mtp_token_list[it]
             # PD 分离 DP 场景下，只有 rank 0 的 task 被 DPTaskWrapper
-            # 替换了 update_response_no_sync，调用时会把 token 发给 Router。
+            # 替换了 update_response_sync，调用时会把 token 发给 Router。
             # Worker rank 的 task 没有这层替换，第一个 token 只更新了本地状态。
             # 这里在 rank 0 上补发 worker rank 的第一个 token，确保它们在第二个 token 之前到达 Router。
             if (
@@ -1669,9 +1640,9 @@ class Executor:
                     task = TaskPool.pool.get(rid)
                     if task is not None:
                         task.update_response_sync(token)
-            collect_tasks.update_task_by_result()
+            collect_tasks.add_task_to_batch_result()
             if self.rank == 0:
-                collect_tasks.batch_update_status()
+                collect_tasks.batch_update_decode_status()
                 if self.has_schedule_overlap and is_normal_payload(tasks.payload_type):
                     all_current_tasks = (
                         tasks

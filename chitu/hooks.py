@@ -105,6 +105,9 @@ class LocalTokenSink:
                 task_list, token_list, logprobs_list, token_idxs_list
             ):
                 task.req.add_data(token, logprobs, token_idxs, notify_server=False)
+        for task in task_list:
+            if task.user_request_finished():
+                task.req.stop_stream()
 
         def notify_all_response_in_batch():
             for task in task_list:
@@ -192,18 +195,14 @@ class MooncakeKVTransferHook:
         from chitu.backend import Backend  # local import to avoid cycles
 
         if Backend.executor._pd_prefill_only and isinstance(tasks, PackedTasks):
-            output_tasks = list(
-                tasks.output_tasks if hasattr(tasks, "output_tasks") else [] or []
-            )
-            for t in output_tasks:
+            for t in tasks.output_tasks:
                 if t is None:
                     continue
                 if t.req is not None and not t.req.finish_reason:
                     t.req.finish_reason = "prefill_only"
-                # `decode_status` is a read-only property; update the internal state directly.
                 # Also clear `waiting` to ensure need_remove() becomes True immediately.
-                t.waiting = False
-                t.stopped = True
+                t.unwait()
+                t.set_stopped()
 
     def before_decode_step(
         self,
@@ -314,9 +313,9 @@ class MooncakeKVTransferHook:
             task = TaskPool.pool.get(rid)
             if task is None:
                 continue
-            if task.next_token < 0:
+            if not task.has_next_token():
                 task.update_response_sync(int(token))
-                # DP worker rank 的 task 没有被 DPTaskWrapper 替换 update_response_no_sync，
+                # DP worker rank 的 task 没有被 DPTaskWrapper 替换 update_response_sync，
                 # 上面的 update_response_sync 只更新了本地状态，不会把 token 发给 Router。
                 # 在 task 上标记这个 token，后续 collect_token 会把它带回 rank 0 补发。
                 task._pd_first_token_for_dp_emit = int(token)

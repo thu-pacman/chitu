@@ -47,7 +47,7 @@ class SchedulerGroupList:
         released_task_ids = self._sgroup_list[sgroup_id]
         for task_id in released_task_ids:
             task = TaskPool.pool.get(task_id)
-            if task is not None and task.waiting:
+            if task is not None:
                 task.unwait()
         self._sgroup_list[sgroup_id] = []
         return released_task_ids
@@ -667,8 +667,10 @@ class Scheduler:
         task = TaskPool.pool[task_id]
 
         # Remove kvcache of this task
-        task.next_token = -1
-        task.evicting = True
+        if task.has_unsync_new_token:
+            task.evicting_with_new_token = True
+        else:
+            task.next_token = -1
         self.cache_manager_dict["main"].finalize_metadata_all_decode(
             task
         )  # 清除KVCacheManager中的元数据

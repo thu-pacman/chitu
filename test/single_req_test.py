@@ -248,6 +248,9 @@ def run_normal(args, timers):
         while len(TaskPool.pool) > 0:
             tokens += 1
             chitu_run()
+        while not TaskPool.all_finished():
+            # no new token generated, but chitu is not terminated
+            chitu_run()
 
         print("GPU memory used : ", torch.cuda.memory_allocated())
         timers("overall").stop()

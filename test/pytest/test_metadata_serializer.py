@@ -169,7 +169,7 @@ class TestTPDispatch:
             data = serializer.serialize_metadata(base)
             return serializer.deserialize_metadata(data)
 
-        payload_type, out, slot_idx = record_benchmark.run(
+        payload_type, out, slot_idx, _ = record_benchmark.run(
             roundtrip,
             num_tasks=num_tasks,
             impl="tp_prefill",
@@ -206,7 +206,7 @@ class TestTPDispatch:
             data = serializer.serialize_metadata(base)
             return serializer.deserialize_metadata(data)
 
-        payload_type, out, _ = record_benchmark.run(
+        payload_type, out, _, _ = record_benchmark.run(
             roundtrip,
             num_tasks=num_tasks,
             impl="tp_decode",
@@ -239,7 +239,7 @@ class TestTPDispatch:
             data = serializer.serialize_metadata(base)
             return serializer.deserialize_metadata(data)
 
-        payload_type, out, _ = record_benchmark.run(
+        payload_type, out, _, _ = record_benchmark.run(
             roundtrip,
             num_tasks=0,
             impl="tp_empty_prefill",
@@ -265,7 +265,7 @@ class TestTPDispatch:
             data = serializer.serialize_metadata(base)
             return serializer.deserialize_metadata(data)
 
-        payload_type, out, _ = record_benchmark.run(
+        payload_type, out, _, _ = record_benchmark.run(
             roundtrip,
             num_tasks=0,
             impl="tp_empty_decode",
@@ -293,7 +293,7 @@ class TestTPDispatch:
             data = serializer.serialize_metadata(base, slot_idx=42)
             return serializer.deserialize_metadata(data)
 
-        payload_type, out, slot_idx = record_benchmark.run(
+        payload_type, out, slot_idx, _ = record_benchmark.run(
             roundtrip,
             num_tasks=1,
             impl="tp_slot_idx",
@@ -324,7 +324,7 @@ class TestEmptyTasksDispatch:
             data = serializer.serialize_metadata(empty, config=config)
             return serializer.deserialize_metadata(data)
 
-        payload_type, out, _ = record_benchmark.run(
+        payload_type, out, _, _ = record_benchmark.run(
             roundtrip,
             num_tasks=0,
             impl="pp_empty_prefill",
@@ -346,7 +346,7 @@ class TestEmptyTasksDispatch:
             data = serializer.serialize_metadata(empty, config=config)
             return serializer.deserialize_metadata(data)
 
-        payload_type, out, _ = record_benchmark.run(
+        payload_type, out, _, _ = record_benchmark.run(
             roundtrip,
             num_tasks=0,
             impl="pp_empty_decode",
@@ -738,7 +738,7 @@ class TestTPPPChunkedPrefill:
             data = serializer.serialize_metadata(base, slot_idx=1)
             return serializer.deserialize_metadata(data)
 
-        _, _, recv_slot_idx = record_benchmark.run(
+        _, _, recv_slot_idx, _ = record_benchmark.run(
             roundtrip,
             num_tasks=1,
             impl="pp_slot_idx",

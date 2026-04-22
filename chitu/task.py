@@ -37,6 +37,12 @@ from chitu.kv_cache import TokenBlock
 logger = getLogger(__name__)
 
 
+class TaskStatus(Enum):
+    Stopped = -1
+    AvailableForSchedule = 0
+    Waiting = 1
+
+
 @dataclass
 class SampleParams:
     temperature: float
@@ -118,8 +124,6 @@ class UserRequest:
         self.async_stream = AsyncDataStream(self.enable_thinking)
         self.finish_reason = None
         self.num_output_tokens = 0
-        self.will_finish = False
-        self.finished = False
 
         # test information related
         self._test_flag = False
@@ -270,7 +274,6 @@ class UserRequest:
         prefill_duration = self.prefill_end_time - self.start_time
         all_duration = self.completion_time - self.start_time
         tps = self.async_stream.tokens_len / all_duration
-
         trace_data = {
             **self.trace_data,
             "input_length": self.prompt_len,
@@ -289,6 +292,19 @@ class UserRequest:
         )
         with open(path, "a") as file:
             file.write(trace_str + "\n")
+
+    @property
+    def finished(self):
+        return self.async_stream.stop_signal
+
+    def stop_stream(self):
+        if self.finished:
+            return
+        self.output = repr("".join(self.async_stream.seqs))
+        self.async_stream.send_stop_signal()
+        self.completion_time = time.monotonic()
+        if self.save_trace_dir and self.trace_data:
+            self.save_trace_data()
 
     def add_data(
         self,
@@ -309,18 +325,6 @@ class UserRequest:
             logger.debug(f"add data: {i}")
 
         self.num_output_tokens += len(value)
-        if self.will_finish:
-            self.finish()
-
-    def finish(self):
-        if self.finished:
-            return
-        self.finished = True
-        self.output = repr("".join(self.async_stream.seqs))
-        self.async_stream.send_stop_signal()
-        self.completion_time = time.monotonic()
-        if self.save_trace_dir and self.trace_data:
-            self.save_trace_data()
 
     def notify_server_data_added_from_server_thread(self):
         self.async_stream.notify_server_from_server_thread()
@@ -375,6 +379,8 @@ class Task:
         )
         # Decode worker 可能只携带 prompt_len 而不携带 prefix_tokens，
         # 需要用 base_len 还原真实 prefix 长度。
+        # 计算 prefix_token_len 会同时考虑到 prefix_tokens 和 prefix_token_base_len，
+        # 当 prefix_tokens 不为空时，设置 prefix_tokens_base_len 为 0，避免重复计算
         self._prefix_tokens_base_len = (
             self.prompt_len if (self.prefix_tokens == [] and self.prompt_len) else 0
         )
@@ -418,15 +424,15 @@ class Task:
         self.mtp_token_list: list[int] = []
         self.generated_result: Optional[torch.Tensor] = None
 
-        # task status
+        # task states
+        # has_unsync_new_token is used to estimate the prefix_tokens_len
+        # True if a new token is generated and not synchronized to CPU
         self.has_unsync_new_token: bool = False
-        self.evicting = False
-        self.stopped: bool = False
-        # Waiting is only meaningful in pipeline parallelism. It means either of:
+        # TaskStatus.Waiting is only meaningful in pipeline parallelism. It means either of:
         # 1) waiting logits to return from another node, or
         # 2) waiting for a prefill task to end to begin a decode task
         # Data parallelism and tensor parallelism do not need this, because they only call scheduler after finishing a task
-        self.waiting = False
+        self.status: TaskStatus = TaskStatus.AvailableForSchedule
 
         # logprobs and test flag
         if req:
@@ -511,13 +517,25 @@ class Task:
         return num
 
     def need_remove(self):
-        return self.stopped
+        # reserved as interface
+        return self.status == TaskStatus.Stopped
 
     def can_schedule(self):
-        return not self.stopped and not self.waiting
+        # reserved as interface
+        return self.status == TaskStatus.AvailableForSchedule
+
+    def user_request_finished(self):
+        if not self.status == TaskStatus.Stopped:
+            return False
+        if self.req is None or self.req.finish_reason == "stop":
+            return True
+        if DPTaskCollector.available():
+            return not DPTaskCollector.is_current_running(self.task_id)
+        else:
+            return not TaskCollector.is_current_running(self.task_id)
 
     def update_decode_status(self):
-        if self.stopped:
+        if self.status == TaskStatus.Stopped:
             return
         if self.req is None:
             return
@@ -529,18 +547,16 @@ class Task:
                 or (set(self.mtp_token_list) & Backend.tokenizer.stop_tokens)
             )
         ):
-            self.stopped = True
+            self.set_stopped()
             self.req.finish_reason = "stop"
-            self.req.finish()
         elif (
             self.num_new_tokens
             + (self.num_new_tokens_single_step if self.has_unsync_new_token else 0)
             > self.req.max_new_tokens - get_global_args().infer.mtp_size
         ):
-            self.stopped = True
+            self.set_stopped()
             self.req.finish_reason = "length"
-            self.req.will_finish = True
-        if self.stopped and not self.waiting:
+        if self.status == TaskStatus.Stopped:
             pd_cfg = getattr(
                 getattr(get_global_args(), "dp_config", None), "router", None
             )
@@ -589,22 +605,16 @@ class Task:
         """
         Update prefix tokens by the next_token and synchronize the next_token to CPU if necessary
         """
-        # 如果在 Prefill 阶段 append, prefix_tokens_len 会不断增长
-        # 导致consume_req_tokens中的判断条件永远不满足
-        # 任务永远停留在 Prefill 状态
         if not self.has_unsync_new_token:
             return
         if not isinstance(self.next_token, int):
             self.next_token = int(self.next_token.cpu().item())
-        if self.next_token == -1:
+        if not self.has_next_token():
             return
-        has_update = self.task_type == TaskType.Decode or self.evicting
-        if has_update:
-            if Backend.executor.mtp_size > 1:
-                self.prefix_tokens.extend(self.mtp_token_list)
-            self.prefix_tokens.append(self.next_token)
+        if get_global_args().infer.mtp_size > 1:
+            self.prefix_tokens.extend(self.mtp_token_list)
+        self.prefix_tokens.append(self.next_token)
         self.has_unsync_new_token = False
-        self.evicting = False
         # if Backend.cache_managers is not None:
         #     Backend.cache_managers[self.dp_rank]["main"].update_metadata_after_decode(self, 1)
 
@@ -613,28 +623,26 @@ class Task:
         self.update_prefix()
 
     def wait(self):
-        assert not self.waiting
-        self.waiting = True
+        if self.status == TaskStatus.AvailableForSchedule:
+            self.status = TaskStatus.Waiting
 
     def unwait(self):
-        logger.debug(f"unwait {self.task_id}")
-        assert self.waiting
-        self.waiting = False
+        if self.status == TaskStatus.Waiting:
+            logger.debug(f"unwait {self.task_id}")
+            self.status = TaskStatus.AvailableForSchedule
+
+    def set_stopped(self):
+        if self.status != TaskStatus.Stopped:
+            logger.debug(f"Task {self.task_id} is stopped")
+            self.status = TaskStatus.Stopped
 
     @property
     def prefix_tokens_len(self):
         # if not sync, compute the prefix tokens length after sync
-        base_len = getattr(self, "_prefix_tokens_base_len", 0)
-        if self.task_type == TaskType.Decode and base_len > 0:
-            total = base_len + len(self.prefix_tokens)
-            if self.has_unsync_new_token:
-                total += Backend.executor.mtp_size
-            return total
-        return (
-            len(self.prefix_tokens)
-            if not self.has_unsync_new_token or self.task_type == TaskType.Prefill
-            else len(self.prefix_tokens) + Backend.executor.mtp_size
-        )
+        base_len = self._prefix_tokens_base_len + len(self.prefix_tokens)
+        if self.has_unsync_new_token and self.task_type == TaskType.Decode:
+            return base_len + Backend.executor.mtp_size
+        return base_len
 
     def set_prefill_chunk_size_for_one_step(self, prefill_chunk_size: int):
         """
@@ -879,12 +887,6 @@ class TaskPool:
     @classmethod
     def remove(cls, task_id: str):
         assert task_id in cls.pool, "Task not found in pool"
-        # stop requests
-        if isinstance(cls.pool[task_id].req, UserRequest):
-            if get_global_args().infer.schedule_overlap:
-                cls.pool[task_id].req.finish()
-            else:
-                cls.pool[task_id].req.will_finish = True
         if cls.pool.pop(task_id) is None:
             raise ValueError(f"Task {task_id} not found in pool")
         cls.id_list.remove(task_id)
@@ -1124,7 +1126,7 @@ class PackedTasks(PackedTasksBase):
         if tasks is None:
             tasks = [task for task in self.output_tasks if task.has_next_token()]
         if tokens is None:
-            tokens = [task.next_token for task in tasks]
+            tokens = [task.prefix_tokens[-1] for task in tasks]
         if not self.return_logprobs:
             logprobs, token_idxs = None, None
         else:
@@ -1144,7 +1146,9 @@ class PackedTasks(PackedTasksBase):
             mtp_token_list=mtp_token_list,
         )
 
-    def update_task_by_result(self, result: Optional[list[int] | torch.Tensor] = None):
+    def add_task_to_batch_result(
+        self, result: Optional[list[int] | torch.Tensor] = None
+    ):
         if result is None:
             result = self.generated_result
             self.generated_result = None
@@ -1171,7 +1175,7 @@ class PackedTasks(PackedTasksBase):
             self.token_idxs = token_idxs.cpu()
         TaskCollector.append_to_last_batch_results(self.get_batch_result(tokens=tokens))
 
-    def batch_update_status(self):
+    def batch_update_decode_status(self):
         for task in self.tasks:
             task.update_decode_status()
 
@@ -1185,7 +1189,7 @@ class TaskCollector:
 
     _total_waiting_steps: int = -1
     _waiting_queue: Deque[Optional[PackedTasks]] = deque()
-    _last_batch_results: Deque[BatchResult] = deque()
+    _last_batch_results: list[BatchResult] = []
     _update_task_ids: list[str] = []
 
     @staticmethod
@@ -1194,6 +1198,10 @@ class TaskCollector:
         TaskCollector._waiting_queue = deque(
             [None] * TaskCollector._total_waiting_steps
         )
+
+    @staticmethod
+    def available():
+        return TaskCollector._total_waiting_steps >= 0
 
     @staticmethod
     def all_finished():
@@ -1220,6 +1228,15 @@ class TaskCollector:
         TaskCollector._waiting_queue[-1] = None
         return tasks
 
+    @staticmethod
+    def is_current_running(task_id):
+        if TaskCollector._total_waiting_steps <= 0:
+            return False
+        target_tasks = TaskCollector._waiting_queue[0]
+        if target_tasks is None:
+            return False
+        return task_id in target_tasks.task_ids
+
     # Last batch results
     @staticmethod
     def has_batch_results():
@@ -1230,11 +1247,10 @@ class TaskCollector:
         TaskCollector._last_batch_results.append(result)
 
     @staticmethod
-    def process_last_batch_results():
-        while TaskCollector.has_batch_results():
-            Backend.executor.postprocess_async_part(
-                TaskCollector._last_batch_results.popleft()
-            )
+    def process_last_batch_results(current_tasks: Optional[PackedTasksBase] = None):
+        for tasks in TaskCollector._last_batch_results:
+            Backend.executor.postprocess_async_part(tasks)
+        TaskCollector._last_batch_results.clear()
 
     # Update (remove taskpool & remove kvcache)
     @staticmethod
@@ -1266,7 +1282,7 @@ class DPTaskCollector:
     Different from TaskCollector, the DPTaskCollector needs to store the last PackedTasks.
     """
 
-    _total_waiting_steps: int = None
+    _total_waiting_steps: int = -1
     _total_packedtasks_queue: Deque[Optional[PackedTasks]] = deque()
     _task_ids_list: Optional[list[list[str]]] = None
 
@@ -1279,6 +1295,12 @@ class DPTaskCollector:
         DPTaskCollector._task_ids_list = None
 
     @staticmethod
+    def available():
+        if DPTaskCollector._total_waiting_steps == -1:
+            return False
+        return get_global_args().infer.dp_size > 1
+
+    @staticmethod
     def all_finished():
         return all(
             (tasks is None or tasks.num_tasks == 0)
@@ -1287,6 +1309,8 @@ class DPTaskCollector:
 
     @staticmethod
     def prepare_dp_tasks(task_ids_list: list[list[str]]):
+        if not DPTaskCollector.available():
+            return
         if any(len(task_ids) > 0 for task_ids in task_ids_list):
             all_tasks = PackedTasks(
                 [task_id for task_ids in task_ids_list for task_id in task_ids],
@@ -1302,8 +1326,18 @@ class DPTaskCollector:
         DPTaskCollector._task_ids_list = task_ids_list
 
     @staticmethod
+    def is_current_running(task_id):
+        if DPTaskCollector._total_waiting_steps <= 0:
+            return False
+        target_tasks = DPTaskCollector._total_packedtasks_queue[0]
+        if target_tasks is None:
+            return False
+        return task_id in target_tasks.task_ids
+
+    @staticmethod
     def get_total_packedtasks(index: int = 0):
-        return DPTaskCollector._total_packedtasks_queue[index]
+        if DPTaskCollector.available():
+            return DPTaskCollector._total_packedtasks_queue[index]
 
     @staticmethod
     def get_task_ids_list():
@@ -1315,11 +1349,13 @@ class DPTaskCollector:
 
     @staticmethod
     def get_last_packedtasks():
-        return DPTaskCollector._total_packedtasks_queue[-1]
+        if DPTaskCollector.available():
+            return DPTaskCollector._total_packedtasks_queue[-1]
 
     @staticmethod
     def clear_last_packedtasks():
-        DPTaskCollector._total_packedtasks_queue[-1] = None
+        if DPTaskCollector.available():
+            DPTaskCollector._total_packedtasks_queue[-1] = None
 
     @staticmethod
     def has_available_tasks(index: int = 0):
@@ -1327,7 +1363,8 @@ class DPTaskCollector:
 
     @staticmethod
     def clear():
-        DPTaskCollector._total_packedtasks_queue = deque(
-            [None] * DPTaskCollector._total_waiting_steps
-        )
-        DPTaskCollector._task_ids_list = None
+        if DPTaskCollector.available():
+            DPTaskCollector._total_packedtasks_queue = deque(
+                [None] * DPTaskCollector._total_waiting_steps
+            )
+            DPTaskCollector._task_ids_list = None

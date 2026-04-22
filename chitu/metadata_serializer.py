@@ -9,7 +9,9 @@
 import msgpack
 from typing import Optional, List, Dict, Set, Literal, Union, Any
 from dataclasses import dataclass
+from logging import getLogger
 
+from chitu.global_vars import get_global_args
 from chitu.task import (
     Task,
     PackedTasks,
@@ -20,6 +22,8 @@ from chitu.task import (
     SampleParams,
     is_normal_payload,
 )
+
+logger = getLogger(__name__)
 
 
 @dataclass
@@ -51,6 +55,7 @@ class MetadataConfig:
     include_prompt_len: bool = False
     include_next_token: bool = False
     include_pd_prefill_engine_rank: bool = False
+    include_boot_ids: bool = False
 
     # 辅助信息
     include_has_outputs: bool = False  # 状态信息
@@ -175,10 +180,25 @@ class MetadataConfig:
         )
 
     @classmethod
-    def for_pd_dpep_decode_rank(cls) -> "MetadataConfig":
-        cfg = MetadataConfig.for_pd_decode_rank()
-        cfg.include_tokens = True
-        return cfg
+    def for_pd_dp_decode_rank(cls) -> "MetadataConfig":
+        """PD 对 decode rank 通信专用配置（DP 版）
+
+        比常规的 PD 分离配置多传输一个 boot_ids，用于接收 bootstrap 信息
+        """
+        return cls(
+            include_task_ids=True,
+            include_payload_type=True,
+            include_task_type=True,
+            include_has_outputs=True,
+            include_slot_idx=True,
+            include_sample_params=True,
+            include_return_params=True,
+            include_prompt_len=True,
+            include_pd_prefill_engine_rank=True,
+            include_next_token=True,
+            include_boot_ids=True,
+            include_tokens=True,
+        )
 
     # 目前未使用，保留
     # 目前的通信中 PP 和 DP 需要传输的信息是相同的，故不做区分
@@ -241,14 +261,13 @@ class MetadataSerializer:
             tasks, PackedTasksBase
         ), "Input tasks should be PackedTasksBase or PackedTasks"
 
-        # 去重检测：检查哪些任务是新任务，哪些是已知任务
+        # 去重检测：检查哪些任务是新任务
         new_task_ids = []
-        known_task_ids = []
         has_dedup = (
             self.enable_dedup
             and auto_dedup
             and isinstance(tasks, PackedTasks)
-            and isinstance(tasks.tasks, list)
+            and isinstance(tasks.task_ids, list)
             and tasks.task_type != TaskType.Special
         )
 
@@ -256,10 +275,11 @@ class MetadataSerializer:
             if not self.transmitted_task_ids.get(target_rank):
                 self.transmitted_task_ids[target_rank] = set()
             transmitted_task_ids = self.transmitted_task_ids[target_rank]
-            for task_id in tasks.task_ids:
-                (
-                    known_task_ids if task_id in transmitted_task_ids else new_task_ids
-                ).append(task_id)
+            new_task_ids = [
+                task_id
+                for task_id in tasks.task_ids
+                if task_id not in transmitted_task_ids
+            ]
             transmitted_task_ids.update(new_task_ids)
         elif tasks.payload_type == SerializedPackedTasksPayloadType.EndTask:
             if self.transmitted_task_ids.get(target_rank):
@@ -267,9 +287,7 @@ class MetadataSerializer:
 
         # 选择配置
         if config is None:
-            config = self._auto_select_config_with_dedup(
-                tasks, new_task_ids, known_task_ids
-            )
+            config = self._auto_select_config_with_dedup(tasks, new_task_ids)
 
         msg_dict: Dict[str, Any] = {}
 
@@ -352,6 +370,14 @@ class MetadataSerializer:
         # 辅助信息
         if config.include_slot_idx and slot_idx is not None:
             msg_dict["slot_idx"] = slot_idx
+        if config.include_boot_ids and len(new_task_ids) > 0:
+            # Decode task meta：首次下发时发送 MsgPackableTask
+            # 让 worker rank 本地 TaskPool 可以构造 PackedTasks，并在收到 bootstrap 时发送 TransferInfo
+            msg_dict["boot_ids"] = new_task_ids
+            logger.debug(
+                f"[PD_TRACE][dp.send_decode_bootstrap] to_rank={int(target_rank)} "
+                f"scheduled_task_ids_len={len(tasks.task_ids)} bootstrap_tasks={new_task_ids}"
+            )
 
         if tasks.new_cache_ids_list:
             msg_dict["new_cache_ids_list"] = tasks.new_cache_ids_list
@@ -370,7 +396,9 @@ class MetadataSerializer:
         SerializedPackedTasksPayloadType,
         Union[PackedTasks, PackedTasksBase],
         Optional[int],
+        Dict[str, Any],
     ]:
+        extra_info = dict()
         msg_dict = msgpack.unpackb(data, raw=False)
         msg_format = msg_dict.get("format", "error no format")
         assert msg_format in (
@@ -403,7 +431,7 @@ class MetadataSerializer:
                 has_outputs=msg_dict.get("has_outputs", []),
             )
 
-            return payload_type, packed_tasks_base, slot_idx
+            return payload_type, packed_tasks_base, slot_idx, extra_info
 
         # 解析基础信息
         task_type = TaskType[msg_dict.get("task_type", "Special")]
@@ -414,7 +442,12 @@ class MetadataSerializer:
 
         # 处理空任务
         if len(task_ids) == 0:
-            return payload_type, PackedTasks([], task_type=task_type), slot_idx
+            return (
+                payload_type,
+                PackedTasks([], task_type=task_type),
+                slot_idx,
+                extra_info,
+            )
 
         # 重建或更新 Task 对象
         task_list = []
@@ -457,7 +490,11 @@ class MetadataSerializer:
         packed_tasks.hit_token_lens = msg_dict.get("hit_token_lens", [])
         packed_tasks.prefix_lens = msg_dict.get("prefix_lens", [])
 
-        return payload_type, packed_tasks, slot_idx
+        boot_ids = msg_dict.get("boot_ids", None)
+        if boot_ids:
+            extra_info["boot_ids"] = boot_ids
+
+        return payload_type, packed_tasks, slot_idx, extra_info
 
     def _create_task_from_data(
         self, task_id: str, task_data: Dict, task_type: TaskType = TaskType.Prefill
@@ -474,7 +511,6 @@ class MetadataSerializer:
         tokens = task_data.get("tokens")
         grammar_str = task_data.get("grammar_str", "")
         prompt_len = task_data.get("prompt_len")
-        pd_prefill_engine_rank = task_data.get("pd_prefill_engine_rank")
         task = Task(
             task_id=task_id,
             req=None,
@@ -486,9 +522,7 @@ class MetadataSerializer:
         task.return_logprobs = task_data.get("return_logprobs")
         task._test_flag = task_data.get("_test_flag")
         task._test_standard_tokens = task_data.get("standard_tokens")
-        if pd_prefill_engine_rank is not None:
-            # Carry PD binding to worker ranks (used by KV hook before KV pull).
-            task.pd_prefill_engine_rank = int(pd_prefill_engine_rank)
+        task.pd_prefill_engine_rank = task_data.get("pd_prefill_engine_rank")
         if task_type in (TaskType.Prefill, TaskType.Decode):
             task.task_type = task_type
         return task
@@ -497,14 +531,12 @@ class MetadataSerializer:
         self,
         tasks: Union[PackedTasks, PackedTasksBase],
         new_task_ids: List[str],
-        known_task_ids: List[str],
     ) -> MetadataConfig:
         """根据 tasks 类型和去重状态自动选择配置
 
         Args:
             tasks: PackedTasks 对象
             new_task_ids: 新任务的 ID 列表（在 _transmitted_tasks 中不存在的任务）
-            known_task_ids: 已知任务的 ID 列表（在 _transmitted_tasks 中存在的任务）
             force_include_last_tokens: 强制包含 last_tokens（用于 DP+PP 场景）
 
         配置选择逻辑：
@@ -525,9 +557,19 @@ class MetadataSerializer:
             else:
                 return MetadataConfig.for_special()
 
+        pd_enabled = (
+            get_global_args().dp_config.router.pd_disaggregation.enabled
+            if getattr(get_global_args(), "dp_config", None) is not None
+            else False
+        )
         if tasks.task_type == TaskType.Prefill:
             return MetadataConfig.for_prefill()
         elif tasks.task_type == TaskType.Decode:
-            return MetadataConfig.for_decode_with_status()
+            if pd_enabled:
+                if self.mode == "DP":
+                    return MetadataConfig.for_pd_dp_decode_rank()
+                return MetadataConfig.for_pd_decode_rank()
+            else:
+                return MetadataConfig.for_decode_with_status()
         else:
             return MetadataConfig.for_special()

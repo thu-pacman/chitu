@@ -222,7 +222,7 @@ class DPTaskWrapper:
         original_task.update_decode_status = self._dp_update_decode_status
 
     def _dp_update_response_sync(self, token: int):
-        """Override update_response_no_sync to also send token to Router"""
+        """Override update_response_sync to also send token to Router"""
         self._original_update_response_sync(token)
         # Enqueue in order to keep relative order with finish
         self._send_token_to_router(token)
