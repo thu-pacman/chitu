@@ -15,6 +15,7 @@ from types import UnionType
 import importlib
 import importlib.resources
 from types import UnionType
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import torch.distributed as dist
@@ -524,3 +525,19 @@ def dataclass_from_dict(data: Any, cls: type[T]) -> T:
                     break
         kwargs[field.name] = dataclass_from_dict(data[field.name], fcls)
     return cls(**kwargs)
+
+
+def prefetch_state_dict(state_dict: dict[str, torch.Tensor], max_workers: int = 16):
+    """
+    多线程将state_dict预取到内存，不阻塞主线程
+    """
+    state_dict = state_dict.copy()  # 避免state_dict之后被修改
+
+    def _prefetch(key: str):
+        # 假设绝大部分tensor都是磁盘mmap到内存再view，此时只需做一次clone即可完成预取
+        state_dict[key].clone()
+
+    executor = ThreadPoolExecutor(
+        max_workers=max_workers, thread_name_prefix="prefetch"
+    )
+    executor.map(_prefetch, state_dict)
