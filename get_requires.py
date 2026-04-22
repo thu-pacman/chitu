@@ -94,11 +94,16 @@ extras_require = {
     # TODO: Upgrade to latest flashInfer version and resolve environment compatibility issues
     "flashinfer": [
         (
-            "flashinfer-python<=0.2.5"
+            "flashinfer-python==0.6.8.post1"
             if packaging.version.parse(torch.__version__)
-            < packaging.version.parse("2.7.0")
-            else "flashinfer-python<=0.2.7.post1,!=0.2.6"
-            # !=0.2.6: https://github.com/flashinfer-ai/flashinfer/issues/1139
+            >= packaging.version.parse("2.7.0")
+            else "flashinfer-python<=0.2.5"
+        ),
+        (
+            "flashinfer-cubin==0.6.8.post1"
+            if packaging.version.parse(torch.__version__)
+            >= packaging.version.parse("2.7.0")
+            else "flashinfer-cubin<=0.2.5"
         ),
     ],
     "flash_linear_attention": [
