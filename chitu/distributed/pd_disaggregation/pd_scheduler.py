@@ -368,7 +368,7 @@ class PDScheduler(Scheduler):
                 trace_map.pop(room, None)
 
         if task is not None and getattr(task, "req", None) is not None:
-            task.stopped = True
+            task.set_stopped()
             if not task.req.finished:
                 task.req.finish_reason = "error"
                 task.req.finish()
@@ -702,48 +702,6 @@ class PDScheduler(Scheduler):
         if enqueue:
             TaskPool.enqueue(task)
         return task
-
-    async def _execute_decode(self, task: Task):
-        """Execute decode on KV-ready task"""
-
-        if pd_verbose_enabled():
-            logger.debug(f"executing decode for task: {task.task_id}")
-
-        task.task_type = TaskType.Decode
-        base_task = TaskPool.pool.get(task.task_id)
-        if base_task is not None:
-            base_task.task_type = TaskType.Decode
-
-        dp_size = Backend.args.infer.dp_size
-        owner = task.cache_owner if hasattr(task, "cache_owner") else 0
-        if owner < 0 or owner >= dp_size:
-            owner = 0
-        task_ids_list = [[] for _ in range(dp_size)]
-        task_ids_list[owner].append(task.task_id)
-
-        max_new = task.req.max_new_tokens
-        for _ in range(max_new):
-            DPTaskCollector.prepare_dp_tasks(task_ids_list)
-            local_task_ids = task_ids_list[0]
-            local_tasks = PackedTasks(local_task_ids)
-            with torch.inference_mode():
-                Backend.executor.step(local_tasks)
-
-            total = DPTaskCollector.get_total_packedtasks()
-            if total is not None:
-                total.batch_update_status()
-            DPTaskCollector.clear()
-
-            if task.need_remove():
-                break
-
-        # NOTE: 以下代码需要重构，因为还来不及适配前后处理 overlap 的优化，暂且先这么实现
-        if not task.req.finish_reason:
-            task.req.finish_reason = "length"
-        if hasattr(task, "token_sender"):
-            task.token_sender.send_finish(task.req.request_id, task.req.finish_reason)
-        if pd_verbose_enabled():
-            logger.debug(f"decode completed for task: {task.task_id}")
 
     def get_pd_stats(self) -> dict:
         """Get PD disaggregation statistics"""
@@ -1542,7 +1500,7 @@ class DecodeOnlyScheduler(PDScheduler):
         PrometheusMetricsCollector.inc_task_eviction()
 
         # Mark stopped so need_remove() returns True and update() drops it
-        task.stopped = True
+        task.set_stopped()
         if getattr(task, "req", None) is not None and not task.req.finished:
             task.req.finish_reason = "evicted"
             task.req.finish()

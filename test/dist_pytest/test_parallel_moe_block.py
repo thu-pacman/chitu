@@ -26,7 +26,17 @@ from chitu.moe import MoEImplEP, MoEImplNoEP
 from chitu.moe.token_dispatchers.buffercontroller import DeepEPBuffer
 from chitu.global_vars import set_global_args
 from chitu.utils import ceil_div
+from chitu.import_utils import (
+    try_import_platform_dep,
+    try_import_opt_dep,
+    try_import_and_setup_torch_npu,
+)
 from chitu.testing import assert_close
+
+triton, has_triton = try_import_platform_dep("triton")
+deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
+deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
 @pytest.mark.parametrize(
@@ -49,6 +59,11 @@ from chitu.testing import assert_close
 @pytest.mark.parametrize("merge_gate_up", [False, True])
 @pytest.mark.parametrize("task_type", [TaskType.Prefill, TaskType.Decode])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize(
+    "token_dispatcher_impl",
+    [None, "allgather", "deepep-nl", "deepep-ll", "npu_all_to_all", "npu_distribute"],
+)
+@pytest.mark.parametrize("experts_impl", ["triton", "torch_npu"])
 def test_parallel_moe_block(
     tp_size,
     dp_size,
@@ -62,21 +77,45 @@ def test_parallel_moe_block(
     merge_gate_up,
     task_type,
     dtype,
+    token_dispatcher_impl,
+    experts_impl,
     record_benchmark,
 ):
-    if is_ascend_910b() and dp_size > 1 and ep_size > 1 and ep_size % 16 != 0:
-        pytest.skip("DP+EP on Ascend 910B requires ep_size % 16 == 0")
+    ############################################################################
+    # Filter test settings
 
-    set_global_args(
-        OmegaConf.create(
-            {
-                "infer": {"op_impl": "torch", "npu_fusion_fp4": False},
-                "models": {"quant_config": {"rules": []}},
-            }
-        ),
-        need_ensure=False,
-    )
+    # Filter token_dispatcher_impl
+    if ep_size > 1:
+        if token_dispatcher_impl is None:
+            pytest.skip("token_dispatcher_impl is required for EP")
+        if dp_size == 1 and token_dispatcher_impl in {
+            "npu_all_to_all",
+            "npu_distribute",
+        }:
+            pytest.skip(f"{token_dispatcher_impl} is only for DP+EP")
+    else:
+        if token_dispatcher_impl is not None:
+            pytest.skip("token_dispatcher_impl is not available without EP")
+    if token_dispatcher_impl in {"deepep-nl", "deepep-ll"} and not has_deep_ep:
+        pytest.skip("DeepEP is not available")
+    if experts_impl == "triton" and not has_triton:
+        pytest.skip("triton is not available")
+    if (
+        token_dispatcher_impl in {"npu_all_to_all", "npu_distribute"}
+        or experts_impl == "torch_npu"
+    ) and not has_torch_npu:
+        pytest.skip("torch_npu is not available")
+    if token_dispatcher_impl == "deepep-nl" and task_type == TaskType.Decode:
+        pytest.skip(f"{token_dispatcher_impl} is only for prefill")
+    if (
+        token_dispatcher_impl in {"deepep-ll", "npu_distribute"}
+        and task_type == TaskType.Prefill
+    ):
+        pytest.skip(f"{token_dispatcher_impl} is only for decode")
+    if is_ascend_910b() and tp_size > 1 and token_dispatcher_impl == "npu_distribute":
+        pytest.skip("npu_distribute with TP>1 on Ascend 910B is not supported")
 
+    # Filter distributed settings
     if not torch.distributed.is_initialized():
         torch.distributed.init_process_group("nccl")
 
@@ -92,6 +131,23 @@ def test_parallel_moe_block(
         )
     if n_experts % ep_size != 0:
         pytest.skip(f"n_experts({n_experts}) should be divisible by ep_size({ep_size})")
+
+    # Other filters
+    if is_ascend_910b() and dp_size > 1 and ep_size > 1 and ep_size % 16 != 0:
+        pytest.skip("DP+EP on Ascend 910B requires ep_size % 16 == 0")
+
+    ############################################################################
+    # Setup distributed environment
+
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {"op_impl": "torch", "npu_fusion_fp4": False},
+                "models": {"quant_config": {"rules": []}},
+            }
+        ),
+        need_ensure=False,
+    )
 
     rank = torch.distributed.get_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -152,6 +208,9 @@ def test_parallel_moe_block(
         [[r] for r in range(torch.distributed.get_world_size())], rank
     )
 
+    ############################################################################
+    # Test on participating ranks
+
     if rank < test_world_size:
         local_batch_size = compute_local_batch_size_dist_in_dp(batch_size, dp_size)[
             dp_group.rank_in_group
@@ -159,6 +218,11 @@ def test_parallel_moe_block(
         experts_start_idx = ep_group.rank_in_group * n_experts // ep_size
         experts_end_idx = (ep_group.rank_in_group + 1) * n_experts // ep_size
         if ep_size > 1:
+            kwargs = {}
+            if task_type == TaskType.Prefill:
+                kwargs["prefill_token_dispatcher_impl"] = token_dispatcher_impl
+            else:
+                kwargs["decode_token_dispatcher_impl"] = token_dispatcher_impl
             moe_impl = MoEImplEP(
                 n_layers=1,
                 n_dense_layers=0,
@@ -172,6 +236,7 @@ def test_parallel_moe_block(
                 dp_group=dp_group,
                 etp_group=etp_group,
                 ep_group=ep_group,
+                **kwargs,
             )
         else:
             moe_impl = MoEImplNoEP(
@@ -313,7 +378,7 @@ def test_parallel_moe_block(
         dp_token_end = cumulative_local_bs_list[dp_group.rank_in_group + 1]
         local_x = x[dp_token_start:dp_token_end]
         local_y = record_benchmark.run(
-            lambda: parallel_moe_block(local_x),
+            lambda: parallel_moe_block(local_x, experts_impl=experts_impl),
             batch_size=batch_size,
             tp_size=tp_size,
             dp_size=dp_size,
@@ -326,6 +391,7 @@ def test_parallel_moe_block(
             merge_gate_up=merge_gate_up,
             task_type=task_type,
             dtype=dtype,
+            impl=f"{token_dispatcher_impl}+{experts_impl}",
         )
         ref_y = ref_moe_block(ref_x)
         ref_local_y = ref_y[dp_token_start:dp_token_end]
@@ -364,6 +430,11 @@ def test_parallel_moe_block(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
+@pytest.mark.parametrize(
+    "token_dispatcher_impl",
+    [None, "allgather", "deepep-nl", "deepep-ll"],
+)
+@pytest.mark.parametrize("experts_impl", ["triton", "deepgemm"])
 def test_parallel_moe_block_blockfp8(
     tp_size,
     dp_size,
@@ -378,24 +449,34 @@ def test_parallel_moe_block_blockfp8(
     merge_gate_up,
     task_type,
     dtype,
+    token_dispatcher_impl,
+    experts_impl,
     record_benchmark,
 ):
-    set_global_args(
-        OmegaConf.create(
-            {
-                "infer": {
-                    "op_impl": "torch",
-                    "npu_fusion_fp4": False,
-                    "raise_lower_bit_float_to": "float8_e4m3fn",
-                },
-                "models": {
-                    "quant_config": {"rules": [{"regex": "", "type": "blockfp8"}]}
-                },
-            }
-        ),
-        need_ensure=False,
-    )
+    ############################################################################
+    # Filter test settings
 
+    # Filter token_dispatcher_impl
+    if ep_size > 1:
+        if token_dispatcher_impl is None:
+            pytest.skip("token_dispatcher_impl is required for EP")
+    else:
+        if token_dispatcher_impl is not None:
+            pytest.skip("token_dispatcher_impl is not available without EP")
+    if token_dispatcher_impl in {"deepep-nl", "deepep-ll"} and not has_deep_ep:
+        pytest.skip("DeepEP is not available")
+    if experts_impl == "triton" and not has_triton:
+        pytest.skip("triton is not available")
+    if experts_impl == "deepgemm" and not has_deep_gemm:
+        pytest.skip("deep_gemm is not available")
+    if token_dispatcher_impl == "deepep-nl" and task_type == TaskType.Decode:
+        pytest.skip(f"{token_dispatcher_impl} is only for prefill")
+    if token_dispatcher_impl == "deepep-ll" and task_type == TaskType.Prefill:
+        pytest.skip(f"{token_dispatcher_impl} is only for decode")
+    if token_dispatcher_impl == "deepep-ll" and experts_impl == "triton":
+        pytest.skip(f"{token_dispatcher_impl}+{experts_impl} is not implemented")
+
+    # Filter distributed settings
     if not torch.distributed.is_initialized():
         torch.distributed.init_process_group("nccl")
 
@@ -411,6 +492,25 @@ def test_parallel_moe_block_blockfp8(
         )
     if n_experts % ep_size != 0:
         pytest.skip(f"n_experts({n_experts}) should be divisible by ep_size({ep_size})")
+
+    ############################################################################
+    # Setup distributed environment
+
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "op_impl": "torch",
+                    "npu_fusion_fp4": False,
+                    "raise_lower_bit_float_to": "float8_e4m3fn",
+                },
+                "models": {
+                    "quant_config": {"rules": [{"regex": "", "type": "blockfp8"}]}
+                },
+            }
+        ),
+        need_ensure=False,
+    )
 
     rank = torch.distributed.get_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -496,6 +596,9 @@ def test_parallel_moe_block_blockfp8(
         [[r] for r in range(torch.distributed.get_world_size())], rank
     )
 
+    ############################################################################
+    # Test on participating ranks
+
     if rank < test_world_size:
         local_batch_size = compute_local_batch_size_dist_in_dp(batch_size, dp_size)[
             dp_group.rank_in_group
@@ -503,6 +606,11 @@ def test_parallel_moe_block_blockfp8(
         experts_start_idx = ep_group.rank_in_group * n_experts // ep_size
         experts_end_idx = (ep_group.rank_in_group + 1) * n_experts // ep_size
         if ep_size > 1:
+            kwargs = {}
+            if task_type == TaskType.Prefill:
+                kwargs["prefill_token_dispatcher_impl"] = token_dispatcher_impl
+            else:
+                kwargs["decode_token_dispatcher_impl"] = token_dispatcher_impl
             moe_impl = MoEImplEP(
                 n_layers=1,
                 n_dense_layers=0,
@@ -516,6 +624,7 @@ def test_parallel_moe_block_blockfp8(
                 dp_group=dp_group,
                 etp_group=etp_group,
                 ep_group=ep_group,
+                **kwargs,
             )
         else:
             moe_impl = MoEImplNoEP(
@@ -692,7 +801,7 @@ def test_parallel_moe_block_blockfp8(
         dp_token_end = cumulative_local_bs_list[dp_group.rank_in_group + 1]
         local_x = x[dp_token_start:dp_token_end]
         local_y = record_benchmark.run(
-            lambda: parallel_moe_block(local_x),
+            lambda: parallel_moe_block(local_x, experts_impl=experts_impl),
             batch_size=batch_size,
             tp_size=tp_size,
             dp_size=dp_size,
@@ -705,6 +814,7 @@ def test_parallel_moe_block_blockfp8(
             merge_gate_up=merge_gate_up,
             task_type=task_type,
             dtype=dtype,
+            impl=f"{token_dispatcher_impl}+{experts_impl}",
         )
         ref_y = ref_moe_block(ref_x)
         ref_local_y = ref_y[dp_token_start:dp_token_end]

@@ -55,6 +55,7 @@ from chitu.utils import (
     try_import_opt_dep,
     ceil_div,
     proportion_split,
+    prefetch_state_dict,
 )
 from chitu.quantization import (
     QuantizationRegistry,
@@ -71,6 +72,14 @@ cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 
 logger = getLogger(__name__)
+_SHARED_EXPERTS_STREAM: torch.cuda.Stream | None = None
+
+
+def _make_shared_experts_stream() -> torch.cuda.Stream:
+    global _SHARED_EXPERTS_STREAM
+    if _SHARED_EXPERTS_STREAM is None:
+        _SHARED_EXPERTS_STREAM = torch.cuda.Stream()
+    return _SHARED_EXPERTS_STREAM
 
 
 class LayerNorm(nn.Module):
@@ -970,6 +979,7 @@ class Transformer(nn.Module):
                 state_dict = self.process_state_dict_for_splitting_gate_up(state_dict)
 
                 # Repeat kv_head weights in case tensor_parallel_size > n_kv_heads
+                # TODO: 与后面的chunk tp合并，消除可能的内存复制，否则prefetch会失效
                 state_dict = self.process_state_dict_for_repeat_kv_head(state_dict)
 
                 state_dict = self._chunk_checkpoint_for_tensor_parallel(
@@ -984,6 +994,7 @@ class Transformer(nn.Module):
                     )
                 )
 
+        prefetch_state_dict(state_dict)
         return self.preprocess_state_dict(state_dict, skip_preprocess=skip_preprocess)
 
     def preprocess_state_dict(
@@ -1815,7 +1826,7 @@ class ParallelMoeBlock(nn.Module):
 
         self.shared_experts_stream = None
         if self.shared_experts is not None and not is_muxi():
-            self.shared_experts_stream = torch.cuda.Stream()
+            self.shared_experts_stream = _make_shared_experts_stream()
 
         self.moe_impl = moe_impl
         if self.moe_impl is not None and self.moe_impl.ep_size > 1:
@@ -1842,7 +1853,9 @@ class ParallelMoeBlock(nn.Module):
             )
         self.prefill_memory_tolerance = prefill_memory_tolerance
 
-    def forward(self, x: torch.Tensor, inplace: bool = True) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, inplace: bool = True, *, experts_impl: str = "auto"
+    ) -> torch.Tensor:
         """
         Forward pass for the MoE block.
 
@@ -1885,7 +1898,6 @@ class ParallelMoeBlock(nn.Module):
 
         shared_y = None
         x_in_use_simultenously = False
-        experts_impl = self.moe_impl.get_experts_impl()
         if self.moe_impl.ep_size > 1:
             routed_x_old = routed_x
             routed_x, weights, dispatch_stream = (

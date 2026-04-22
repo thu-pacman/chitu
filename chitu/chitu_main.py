@@ -899,12 +899,8 @@ def chitu_init(args):
             args.infer.use_cuda_graph = True
 
     if args.infer.schedule_overlap == "auto":
-        # PD disaggregation does not support overlap
         # MTP does synchronize after model run and overlap has no effect
-        args.infer.schedule_overlap = (
-            not args.dp_config.router.pd_disaggregation.enabled
-            and args.infer.mtp_size <= 1
-        )
+        args.infer.schedule_overlap = args.infer.mtp_size <= 1
 
     if args.infer.full_warmup == "auto":
         if args.infer.pp_size > 1 and args.infer.use_cuda_graph:

@@ -221,7 +221,7 @@ class TokenRouter:
             # Request completed
             finish_reason = token_data.get("finish_reason", "stop")
             req.finish_reason = finish_reason
-            req.finish()
+            req.stop_stream()
 
             # Remove from active requests
             del self.active_requests[request_id]
@@ -245,7 +245,7 @@ class TokenRouter:
             )
 
             # Send stop signal and cleanup
-            req.finish()
+            req.stop_stream()
             del self.active_requests[request_id]
 
         else:

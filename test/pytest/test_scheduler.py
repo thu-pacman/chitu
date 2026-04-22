@@ -367,7 +367,7 @@ def test_priority_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch1_ids)
 
     # slot_groups: [[]], free_sgroup: deque([0])
@@ -378,7 +378,7 @@ def test_priority_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch2_ids)
 
     # slot_group: [[]], free_sgroups: deque([0])
@@ -391,7 +391,7 @@ def test_priority_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch3_ids)
 
     # slot_group: [[]], free_sgroups: deque([0])
@@ -560,7 +560,7 @@ def test_priority_fcfs_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch1_ids)
 
     # slot_group: [[]], free_sgroup: deque([0])
@@ -572,7 +572,7 @@ def test_priority_fcfs_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch2_ids)
 
     # slot_group: [[]], free_sgroup: deque([0])
@@ -585,7 +585,7 @@ def test_priority_fcfs_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch3_ids)
 
     # slot_group: [[]], free_sgroup: deque([0])
@@ -766,7 +766,7 @@ def test_priority_request_preset_over_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch1_ids)
 
     # TaskPool: ['req_2', 'req_1', 'req_5', 'req_8', 'req_6']
@@ -778,7 +778,7 @@ def test_priority_request_preset_over_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch2_ids)
 
     # TaskPool: ['req_1', 'req_8']
@@ -790,7 +790,7 @@ def test_priority_request_preset_over_prefill_first_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch3_ids)
 
     # TaskPool: []
@@ -1101,7 +1101,7 @@ def test_evict_task():
         task = TaskPool.pool[f"req_{i}"]
         task.next_token = 2
         task.num_new_tokens = 1
-        task.stopped = True
+        task.set_stopped()
     task_ids = [task.task_id for task in tasks]
     removed_task_ids = scheduler.update(task_ids)
     assert len(removed_task_ids) == 2
@@ -1213,7 +1213,7 @@ def test_can_prefill():
         task.dp_rank = 0
         task.prompt_to_token_block(task.dp_rank)
         scheduler.cache_manager_dict["main"].prepare_metadata_before_prefill(task)
-        task.waiting = True
+        task.wait()
         TaskPool.add(task)  # pool: ['req_0', 'req_1', 'req_2', 'req_3']
 
     scheduler = Scheduler(
@@ -1396,7 +1396,7 @@ def test_scheduler_group():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     # sgroup head at: 1, empty sgroup: []
     scheduler.update(batch2_ids)
 
@@ -1410,7 +1410,7 @@ def test_scheduler_group():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     # sgroup head at: 0, empty sgroup: []
     scheduler.update(batch3_ids)
 
@@ -1423,7 +1423,7 @@ def test_scheduler_group():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch4_ids)
     scheduler.update(batch5_ids)
 
@@ -1524,7 +1524,7 @@ def test_slot_group_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     # slot_group: [['req_2', 'req_5'], ['req_7', 'req_1', 'req_3', 'req_8']], sgroup head at: 1
     scheduler.update(batch2_ids)
 
@@ -1539,7 +1539,7 @@ def test_slot_group_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     # slot_group: [['req_0', 'req_4'], ['req_7', 'req_1', 'req_3', 'req_8']], sgroup head at: 0
     scheduler.update(batch3_ids)
 
@@ -1552,7 +1552,7 @@ def test_slot_group_skew():
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
-        TaskPool.pool[task_id].stopped = True
+        TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch4_ids)
     scheduler.update(batch5_ids)
 

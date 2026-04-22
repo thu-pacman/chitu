@@ -54,6 +54,7 @@ def moe_sum_per_token_triton(
     assert topk_weights.is_contiguous()
     assert out.is_contiguous()
 
+    use_i64 = M * topk * N > 2**31 - 1
     moe_sum_per_token_triton_kernel[M,](
         x,
         topk_weights,
@@ -62,6 +63,7 @@ def moe_sum_per_token_triton(
         topk,
         N,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
+        USE_I64_OFFSET=use_i64,
         num_warps=num_warps,
     )
 
@@ -80,10 +82,13 @@ def moe_sum_per_token_triton_kernel(
     N,
     # Meta-parameters
     BLOCK_SIZE_N: tl.constexpr,
+    USE_I64_OFFSET: tl.constexpr,
 ):
     # Program ID
     row_index = tl.program_id(axis=0)
     # Create offsets for m and n dimensions
+    if USE_I64_OFFSET:
+        row_index = row_index.to(tl.int64)
     offs_n = tl.arange(0, BLOCK_SIZE_N)
 
     # Create a mask to handle the case where the block extends beyond the matrix
@@ -136,6 +141,7 @@ def _fwd_kernel_ep_gather(
     output_tensor_stride1,
     topk_num: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    USE_I64_OFFSET: tl.constexpr,
 ):
     cur_block = tl.program_id(0)
     start_cur_token = tl.program_id(1)
@@ -154,9 +160,13 @@ def _fwd_kernel_ep_gather(
                 acc_weight = tl.load(
                     recv_topk_weight + cur_token * recv_topk_weight_stride0 + topk_index
                 )
+                if USE_I64_OFFSET:
+                    source_offset = source_token_index.to(tl.int64)
+                else:
+                    source_offset = source_token_index
                 tmp = tl.load(
                     input_tensor
-                    + source_token_index * input_tensor_stride0
+                    + source_offset * input_tensor_stride0
                     + cur_block * BLOCK_D
                     + off_d
                 )
@@ -195,6 +205,7 @@ def moe_sum_expert_block_permuted_triton(
     BLOCK_D = 1024  # No longer needed (FIXME)
     num_warps = 2
     assert hidden_size % BLOCK_D == 0
+    use_i64 = x.shape[0] * x.stride(0) > 2**31 - 1
     grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, 1024))
     _fwd_kernel_ep_gather[grid](
         num_tokens,
@@ -213,6 +224,7 @@ def moe_sum_expert_block_permuted_triton(
         topk_num=topk,
         num_warps=num_warps,
         BLOCK_D=BLOCK_D,
+        USE_I64_OFFSET=use_i64,
     )
 
     return out

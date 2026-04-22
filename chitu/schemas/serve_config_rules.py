@@ -56,9 +56,11 @@ class ServeConfigRules(Callback):
         model_name = config.models.name
         model_type = config.models.type
         if attn_type == "flash_infer":
-            if config.models.n_heads // config.models.n_kv_heads not in [1, 2, 3, 4, 8]:
+            if config.models.n_heads % config.models.n_kv_heads != 0:
                 self._exit_with_error(
-                    f"model {model_name} is not compatible with flash_infer"
+                    f"model {model_name} is not compatible with flash_infer: "
+                    f"n_heads ({config.models.n_heads}) must be divisible by "
+                    f"n_kv_heads ({config.models.n_kv_heads})"
                 )
         elif attn_type == "flash_mla":
             if model_type not in ["deepseek-v3", "kimi-k2-5"]:

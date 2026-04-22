@@ -103,10 +103,18 @@ class MoENpuDistributeTokenDispatcher(MoETokenDispatcher):
             raise NotImplementedError
         if self.tp_group.group_size > 1 or origin_bs == 0:
             # split inputs from tp group into ep rank
-            hidden_states = fused_experts_npu_tp_split(hidden_states)
-            topk_weights = fused_experts_npu_tp_split(topk_weights)
+            hidden_states = fused_experts_npu_tp_split(
+                hidden_states, tp_group=self.tp_group, ep_group=self.ep_group
+            )
+            topk_weights = fused_experts_npu_tp_split(
+                topk_weights, tp_group=self.tp_group, ep_group=self.ep_group
+            )
             topk_ids = fused_experts_npu_tp_split(
-                topk_ids, self.num_local_experts, is_expert_ids=True
+                topk_ids,
+                tp_group=self.tp_group,
+                ep_group=self.ep_group,
+                n_local_experts=self.num_local_experts,
+                is_expert_ids=True,
             )
 
         global_bs_for_distpatch_combine = (
@@ -221,7 +229,7 @@ class MoENpuDistributeTokenDispatcher(MoETokenDispatcher):
 
         if self.tp_group.group_size > 1:
             hidden_states = fused_experts_npu_tp_all_gather(
-                hidden_states, self.origin_bs
+                hidden_states, self.tp_group, self.origin_bs
             )
 
         self.topk_ids = None

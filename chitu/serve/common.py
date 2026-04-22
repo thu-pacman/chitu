@@ -299,9 +299,10 @@ async def process_queue():
 
         TaskPool.add_all_queued()
         if (
-            (len(TaskPool.pool) >= min_batch_size)
-            or rank != 0
+            rank != 0
             or Backend.state == BackendState.Terminating
+            or (len(TaskPool.pool) >= min_batch_size)
+            or (len(TaskPool.pool) == 0 and not TaskPool.all_finished())
         ):
             min_batch_size = 1
             status = chitu_run()

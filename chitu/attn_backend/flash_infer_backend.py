@@ -64,6 +64,18 @@ class FlashInferBackend(TritonAttnBackend):
             128 * 1024 * 1024, dtype=torch.int8
         ).cuda()
 
+        # Enable tensor-core decode path when the GQA group size is large enough
+        # (>=4 for bf16, per sglang's heuristic). This routes through flashinfer's
+        # prefill-style kernel which supports arbitrary group_size (including 12 for
+        # GLM-4.7). The default non-tensor-core decode path only supports group_size
+        # in {1,2,3,4,8}.
+        if not self.is_mla:
+            n_q = self.args.models.n_heads // self.args.infer.tp_size
+            n_kv = self.args.models.n_kv_heads // self.args.infer.tp_size
+            self.decode_use_tensor_cores = (n_q // max(n_kv, 1)) >= 4
+        else:
+            self.decode_use_tensor_cores = False
+
         if self.is_paged == True:
             self.last_page_len = torch.zeros(
                 max_batch_size_per_dp, dtype=torch.int32, device="cuda"
@@ -79,6 +91,7 @@ class FlashInferBackend(TritonAttnBackend):
                     paged_kv_indptr_buffer=self.kv_indptr.get()[: bs + 1],
                     paged_kv_indices_buffer=self.kv_indices.get(),
                     paged_kv_last_page_len_buffer=self.last_page_len[:bs],
+                    use_tensor_cores=self.decode_use_tensor_cores,
                 )
 
         self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
@@ -375,6 +388,9 @@ class FlashInferBackend(TritonAttnBackend):
         k,
         v,
         seq_len_delta: BatchedSeqLenDelta,
+        q_descale: torch.Tensor = None,
+        k_descale: torch.Tensor = None,
+        v_descale: torch.Tensor = None,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -384,6 +400,11 @@ class FlashInferBackend(TritonAttnBackend):
     ):
         if topk_indices is not None:
             raise NotImplementedError()
+        if q_descale is not None or k_descale is not None or v_descale is not None:
+            raise NotImplementedError(
+                "FlashInferBackend.prefill_ragged_qkvo does not support FP8 "
+                "QKV descale yet; activations are expected to be bf16."
+            )
 
         if seq_len_delta.batch_size == 0:
             return torch.empty(
@@ -418,6 +439,9 @@ class FlashInferBackend(TritonAttnBackend):
         k=None,
         v=None,
         *,
+        q_descale: torch.Tensor = None,
+        k_descale: torch.Tensor = None,
+        v_descale: torch.Tensor = None,
         seq_len_delta: BatchedSeqLenDelta,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -427,6 +451,11 @@ class FlashInferBackend(TritonAttnBackend):
     ):
         if topk_indices is not None:
             raise NotImplementedError()
+        if q_descale is not None or k_descale is not None or v_descale is not None:
+            raise NotImplementedError(
+                "FlashInferBackend.decode_dense_kv does not support FP8 "
+                "QKV descale yet; activations are expected to be bf16."
+            )
 
         batch_size = q.shape[0]
         o = torch.empty_like(q)
@@ -452,6 +481,9 @@ class FlashInferBackend(TritonAttnBackend):
         k=None,
         v=None,
         *,
+        q_descale: torch.Tensor = None,
+        k_descale: torch.Tensor = None,
+        v_descale: torch.Tensor = None,
         seq_len_delta: BatchedSeqLenDelta,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -461,6 +493,11 @@ class FlashInferBackend(TritonAttnBackend):
     ):
         if topk_indices is not None:
             raise NotImplementedError()
+        if q_descale is not None or k_descale is not None or v_descale is not None:
+            raise NotImplementedError(
+                "FlashInferBackend.decode_paged_kv does not support FP8 "
+                "QKV descale yet; activations are expected to be bf16."
+            )
 
         batch_size = q.shape[0]
         if batch_size == 0:

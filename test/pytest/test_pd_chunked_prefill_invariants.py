@@ -15,7 +15,7 @@ import pytest
 from chitu import backend as backend_module
 from chitu import hooks as hooks_module
 from chitu.hooks import MooncakeKVTransferHook
-from chitu.task import TaskType
+from chitu.task import TaskType, TaskStatus, UserRequest, Task
 
 # ---------------------------------------------------------------------------
 # Minimal task stub
@@ -24,70 +24,28 @@ from chitu.task import TaskType
 
 def _make_task(task_id, *, prefix_tokens_len, consumed, chunk_size, max_new_tokens):
     """Create a minimal Task-like object that models chunked prefill state."""
-    req = SimpleNamespace(
+    req = UserRequest.create_mock(
+        input_len=prefix_tokens_len,
         request_id=task_id,
-        finish_reason=None,
         max_new_tokens=max_new_tokens,
-        will_finish=False,
-        finish=lambda: None,
-        logprobs=False,
-        prefill_end_time=0,
+        enable_thinking=False,
     )
-    task = SimpleNamespace(
-        task_id=task_id,
-        req=req,
-        task_type=TaskType.Prefill,
-        stopped=False,
-        waiting=True,
-        has_unsync_new_token=False,
-        num_new_tokens=0,
-        num_new_tokens_single_step=1,
-        next_token=-1,
-        stop_with_eos=False,
-        mtp_token_list=[],
-        consumed_req_tokens=consumed,
-        prefix_tokens_len=prefix_tokens_len,
-        prefill_chunk_size=chunk_size,
-        dp_rank=0,
-    )
-
-    def _has_output():
-        return (
-            task.task_type == TaskType.Prefill
-            and (
-                task.prefill_chunk_size is None
-                or task.consumed_req_tokens + task.prefill_chunk_size
-                >= task.prefix_tokens_len
-            )
-        ) or task.task_type == TaskType.Decode
-
-    def _consume_req_tokens():
-        if (
-            task.prefill_chunk_size is None
-            or task.consumed_req_tokens + task.prefill_chunk_size
-            >= task.prefix_tokens_len
-        ):
-            task.consumed_req_tokens = task.prefix_tokens_len
-            task.task_type = TaskType.Decode
-        else:
-            task.consumed_req_tokens += task.prefill_chunk_size
-        task.prefill_chunk_size = None
-
-    task.has_output = _has_output
-    task.consume_req_tokens = _consume_req_tokens
+    task = Task(task_id, req)
+    task.consumed_req_tokens = consumed
+    task.prefill_chunk_size = chunk_size
     return task
 
 
 def _update_decode_status(task, mtp_size=1):
     """Minimal replica of Task.update_decode_status length-stop logic."""
-    if task.stopped or task.req is None:
+    if task.status == TaskStatus.Stopped or task.req is None:
         return
     if (
         task.num_new_tokens
         + (task.num_new_tokens_single_step if task.has_unsync_new_token else 0)
         > task.req.max_new_tokens - mtp_size
     ):
-        task.stopped = True
+        task.set_stopped()
         task.req.finish_reason = "length"
 
 
@@ -240,7 +198,7 @@ class TestUpdateDecodeStatus:
             "req", prefix_tokens_len=100, consumed=0, chunk_size=None, max_new_tokens=1
         )
         _update_decode_status(t, mtp_size=1)
-        assert t.stopped is False
+        assert t.status != TaskStatus.Stopped
 
     def test_task_with_unsync_token_at_limit_stopped(self):
         """has_unsync_new_token=True counts as one pending token; max_new_tokens=1 → stopped."""
@@ -249,7 +207,7 @@ class TestUpdateDecodeStatus:
         )
         t.has_unsync_new_token = True
         _update_decode_status(t, mtp_size=1)
-        assert t.stopped is True
+        assert t.status == TaskStatus.Stopped
         assert t.req.finish_reason == "length"
 
     def test_task_with_synced_tokens_at_limit_stopped(self):
@@ -259,7 +217,7 @@ class TestUpdateDecodeStatus:
         )
         t.num_new_tokens = 5
         _update_decode_status(t, mtp_size=1)
-        assert t.stopped is True
+        assert t.status == TaskStatus.Stopped
         assert t.req.finish_reason == "length"
 
     def test_task_below_limit_not_stopped(self):
@@ -273,13 +231,13 @@ class TestUpdateDecodeStatus:
         t.num_new_tokens = 3
         t.has_unsync_new_token = True
         _update_decode_status(t, mtp_size=1)
-        assert t.stopped is False
+        assert t.status != TaskStatus.Stopped
 
     def test_already_stopped_task_unchanged(self):
         t = _make_task(
             "req", prefix_tokens_len=100, consumed=0, chunk_size=None, max_new_tokens=1
         )
-        t.stopped = True
+        t.set_stopped()
         t.req.finish_reason = "stop"
         _update_decode_status(t, mtp_size=1)
         assert t.req.finish_reason == "stop"
@@ -304,7 +262,9 @@ class TestPrefillOnlyHookFinalization:
         monkeypatch.setattr(
             backend_module,
             "Backend",
-            SimpleNamespace(executor=SimpleNamespace(_pd_prefill_only=True)),
+            SimpleNamespace(
+                executor=SimpleNamespace(_pd_prefill_only=True), tokenizer=None
+            ),
         )
         return hook
 
@@ -327,7 +287,7 @@ class TestPrefillOnlyHookFinalization:
         )
         tasks = self._make_packed_tasks([output], [output])
         hook.on_prefill_done(send_tokens=None, tasks=tasks)
-        assert output.stopped is True
+        assert output.status == TaskStatus.Stopped
         assert output.req.finish_reason == "prefill_only"
 
     def test_intermediate_chunk_not_finalized(self, monkeypatch):
@@ -348,8 +308,8 @@ class TestPrefillOnlyHookFinalization:
         )
         tasks = self._make_packed_tasks([output, middle], [output])
         hook.on_prefill_done(send_tokens=None, tasks=tasks)
-        assert output.stopped is True
-        assert middle.stopped is False
+        assert output.status == TaskStatus.Stopped
+        assert middle.status != TaskStatus.Stopped
         assert middle.req.finish_reason is None
 
     def test_no_tasks_is_noop(self, monkeypatch):

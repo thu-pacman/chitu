@@ -83,13 +83,23 @@ class MoENpuAllToAllTokenDispatcher(MoETokenDispatcher):
         if self.tp_group.group_size > 1:
             # split inputs from tp group into ep rank
             hidden_states = fused_experts_npu_tp_split(
-                hidden_states, is_zero_batch_ok=True
+                hidden_states,
+                tp_group=self.tp_group,
+                ep_group=self.ep_group,
+                is_zero_batch_ok=True,
             )
             topk_weights = fused_experts_npu_tp_split(
-                topk_weights, is_zero_batch_ok=True
+                topk_weights,
+                tp_group=self.tp_group,
+                ep_group=self.ep_group,
+                is_zero_batch_ok=True,
             )
             topk_ids = fused_experts_npu_tp_split(
-                topk_ids, self.num_local_experts, is_expert_ids=True
+                topk_ids,
+                tp_group=self.tp_group,
+                ep_group=self.ep_group,
+                n_local_experts=self.num_local_experts,
+                is_expert_ids=True,
             )
 
         bs, hidden_dim = hidden_states.shape
@@ -271,7 +281,7 @@ class MoENpuAllToAllTokenDispatcher(MoETokenDispatcher):
 
         if self.tp_group.group_size > 1:
             final_hidden_states = fused_experts_npu_tp_all_gather(
-                final_hidden_states, self.origin_bs
+                final_hidden_states, self.tp_group, self.origin_bs
             )
 
         self.expanded_x_shape = None

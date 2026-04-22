@@ -276,6 +276,7 @@ def _fwd_kernel_ep_scatter_2(
     SCALE_HIDDEN_SIZE: tl.constexpr,
     SCALE_HIDDEN_SIZE_PAD: tl.constexpr,
     HAS_SCALE: tl.constexpr,
+    USE_I64_OFFSET: tl.constexpr,
 ):
     start_token_id = tl.program_id(0)
     grid_num = tl.num_programs(0)
@@ -303,14 +304,18 @@ def _fwd_kernel_ep_scatter_2(
                     output_index + token_id * output_index_stride0 + topk_index,
                     dest_token_index,
                 )
+                if USE_I64_OFFSET:
+                    dest_token_offset = dest_token_index.to(tl.int64)
+                else:
+                    dest_token_offset = dest_token_index
                 output_tensor_ptr = (
-                    output_tensor + dest_token_index * output_tensor_stride0
+                    output_tensor + dest_token_offset * output_tensor_stride0
                 )
                 tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
                 if HAS_SCALE:
                     output_tensor_scale_ptr = (
                         output_tensor_scale
-                        + dest_token_index * output_tensor_scale_stride0
+                        + dest_token_offset * output_tensor_scale_stride0
                     )
                     tl.store(
                         output_tensor_scale_ptr + offset_in_s, to_copy_s, mask=mask_s
@@ -338,7 +343,6 @@ def ep_scatter(
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
     hidden_size = recv_x.shape[1]
-
     assert m_indices.shape[0] % BLOCK_E == 0
 
     if recv_x_scale is not None:
@@ -362,6 +366,7 @@ def ep_scatter(
     )
 
     grid = min(recv_topk.shape[0], 1024 * 8)
+    use_i64 = output_tensor.shape[0] * output_tensor.stride(0) > 2**31 - 1
     _fwd_kernel_ep_scatter_2[(grid,)](
         recv_topk.shape[0],
         expert_start_loc,
@@ -391,6 +396,7 @@ def ep_scatter(
         SCALE_HIDDEN_SIZE=hidden_size // BLOCK_D,
         SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size // BLOCK_D),
         HAS_SCALE=has_scale,
+        USE_I64_OFFSET=use_i64,
     )
 
 

@@ -277,7 +277,7 @@ def test_mla_prefill_ragged_qkvo(
         if topk is None:  # skip since default triton fall-back
             pytest.skip("flash_mla prefill only supports sparse attention for now")
         if not hasattr(flash_mla, "flash_mla_sparse_fwd"):
-            pytest.skip("flash_mla is too old too have `flash_mla_sparse_fwd`")
+            pytest.skip("flash_mla is too old to have `flash_mla_sparse_fwd`")
 
         _, total_memory = torch.cuda.mem_get_info()
         total_memory = total_memory / (1024**3)
