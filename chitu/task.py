@@ -32,7 +32,11 @@ from chitu.reasoning import (
     update_chat_template_kwargs_reasoning,
 )
 from chitu.sampling.utils import compile_grammar, deserialize_grammar
-from chitu.kv_cache import TokenBlock
+from chitu.kv_cache import TokenBlock, BlockRuntime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from chitu.kv_cache import PagedKVCacheManager
 
 logger = getLogger(__name__)
 
@@ -483,16 +487,20 @@ class Task:
         chunk: [[1,1,1,1],[2,2,2,2],[3,3,3,3],[4,4,4]]
         返回4个TokenBlock实例组成的列表，最后一个实例未满，因此其blk_hash为None
         """
-        self.token_blocks = []
-        pre_blk_hash = None
-        block_size = Backend.cache_managers[dp_rank]["main"].block_size
-        for i in range(0, len(self.prefix_tokens), block_size):
-            tokens = self.prefix_tokens[i : i + block_size]
-            block = Backend.cache_managers[dp_rank]["main"].tokens_to_block(
-                tokens=tokens, pre_blk_hash=pre_blk_hash
-            )
-            self.token_blocks.append(block)
-            pre_blk_hash = block.blk_hash
+        manager: "PagedKVCacheManager" = Backend.cache_managers[dp_rank]["main"]
+        identity_builder = manager.identity_builder
+
+        identities = identity_builder.build(
+            tokens=self.prefix_tokens,
+            auto_register=manager.enable_prefix_caching,
+        )
+        self.token_blocks = [
+            TokenBlock(identity=identity, runtime=BlockRuntime())
+            for identity in identities
+        ]
+        if manager.enable_prefix_caching:
+            for block in self.token_blocks:
+                manager.get_or_register_identity(block)
         return self.token_blocks
 
     @property
@@ -512,6 +520,10 @@ class Task:
         for block in self.token_blocks:
             if block.cache_idx is None:
                 break
+            if getattr(block, "state", None) is not None:
+                if block.state.value == "idle":
+                    num += 1
+                continue
             if block.active_cnt == 0:
                 num += 1
         return num
