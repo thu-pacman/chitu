@@ -9,7 +9,13 @@ from collections import deque, OrderedDict
 from chitu.global_vars import get_global_args
 from chitu.task_type import TaskType
 from chitu.utils import ceil_div
-from chitu.kv_cache import TokenBlock, NONE_BLK_HASH
+from chitu.kv_cache.prefix_caching import (
+    TokenBlock,
+    BlockIdentity,
+    BlockIdentityChainBuilder,
+    BlockRuntime,
+    NONE_BLK_HASH,
+)
 from weakref import WeakValueDictionary
 from collections import defaultdict
 
@@ -61,23 +67,31 @@ class PagedKVCacheManager(KVCacheManagerBase):
             range(self.num_blocks)
         )  # list of cache_idx, 保存所有未分配给TokenBlock的cache索引
 
-        # 保存活跃度大于0的TokenBlock, 数据含义: {cache_idx: TokenBlock}
+        # 保存活跃度大于0的运行时块状态, 数据含义: {cache_idx: BlockRuntime}
         # 元素生命周期: TokenBlock在prepare_metadata_before_prefill/decode中，初次分配cache_idx或active_cnt从0变为1时，进入，
         #             在finalize_metadata_all_decode中active_cnt为0时移除
-        self.active_blocks: dict[int, TokenBlock] = {}
+        self.active_blocks: dict[int, BlockRuntime] = {}
 
-        # 保存活跃度为0，但分配了cache_idx的TokenBlock, 数据含义: {cache_idx: TokenBlock}
+        # 保存活跃度为0，但分配了cache_idx的运行时块状态, 数据含义: {cache_idx: BlockRuntime}
         # 元素生命周期: 在调用finalize_metadata_all_decode时，若元素的active_cnt为0，则被放入self.cached_idle_blocks链表最右边
         #             在调用get_free_cache_idx时，若self.free_cache_ids为空，self.cached_idle_blocks链表最左边元素被最先移除
-        self.cached_idle_blocks: OrderedDict[int, TokenBlock] = OrderedDict()
+        self.cached_idle_blocks: OrderedDict[int, BlockRuntime] = OrderedDict()
 
         # prefix_caching related
         self.enable_prefix_caching: bool = enable_prefix_caching
-        # 保存满容量且已分配cache_idx的TokenBlock块，仅需在enable_prefix_caching时维护, 数据含义: {blk_hash: TokenBlock}
-        # 元素生命周期: 在TokenBlock的满容量且cache_idx不为None时移入，在TokenBlock的引用计数为0时移除（python自动支持）
-        self.hashed_block_pool: WeakValueDictionary[str, TokenBlock] = (
+        # 保存满容量块的不可变身份对象, 数据含义: {blk_hash: BlockIdentity}
+        self.hashed_block_pool: WeakValueDictionary[str, BlockIdentity] = (
             WeakValueDictionary()
         )
+        self.identity_builder = BlockIdentityChainBuilder(
+            block_size=self.block_size,
+            existing_identities=self.hashed_block_pool,
+        )
+        # 保存块身份到运行时状态的映射, 数据含义: {blk_hash: BlockRuntime}
+        self.identity_runtime_pool: WeakValueDictionary[str, BlockRuntime] = (
+            WeakValueDictionary()
+        )
+        self.cache_idx_to_hash: dict[int, str] = {}
         # 保存该任务已生成blk_hash的TokenBLock数量（该任务在self.hashed_block_pool中的TokenBlock数量），仅需在enable_prefix_caching时维护
         # 数据含义: {task_id: cache_hashed_block_cnt}
         self.task_hashed_block_cnt: defaultdict[str, int] = defaultdict(int)
@@ -121,71 +135,65 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.task_to_cache_ids.clear()
         self.task_hashed_block_cnt.clear()
         self.hashed_block_pool = WeakValueDictionary()
+        self.identity_builder.existing_identities = self.hashed_block_pool
+        self.identity_runtime_pool = WeakValueDictionary()
+        self.cache_idx_to_hash.clear()
 
-    def add_to_hashed_block_pool(self, block: TokenBlock) -> TokenBlock:
-        """将block添加到hashed_block_pool中
-        检查block是否与self.hash_to_block中的block哈希碰撞，若是，修改block的blk_hash值为非碰撞的哈希值, 并返回新的block
-        """
+    def get_or_register_identity(self, block: TokenBlock) -> BlockIdentity:
+        """Get identity from hashed pool and attach shared runtime if exists."""
         if not self.enable_prefix_caching or len(block.tokens) != block.blk_size:
-            return block
+            return block.identity
 
-        blk_hash = block.blk_hash
+        identity = self.identity_builder.make_identity(
+            token_chunk=list(block.identity.tokens),
+            pre_blk_hash=block.identity.pre_blk_hash,
+            auto_register=True,
+        )
+        block.set_identity(identity)
+        blk_hash = identity.blk_hash
         if blk_hash is None:
-            blk_hash = TokenBlock.hash_fn((block.pre_blk_hash, tuple(block.tokens)))
+            return block.identity
 
-        # 哈希碰撞检查
-        collision_count = 0
-        while blk_hash in self.hashed_block_pool:
-            cached_block = self.hashed_block_pool[blk_hash]
-            if (
-                cached_block.tokens != block.tokens
-                or cached_block.pre_blk_hash != block.pre_blk_hash
-            ):
-                logger.warning(
-                    f"检测到哈希碰撞!: \n"
-                    f" - blk_hash: {blk_hash} \n"
-                    f" - cached_block.tokens: {cached_block.tokens} \n"
-                    f" - block.tokens: {block.tokens} \n"
-                    f" - cached_block.pre_blk_hash: {cached_block.pre_blk_hash} \n"
-                    f" - block.pre_blk_hash: {block.pre_blk_hash} \n"
-                )
-                collision_count += 1
-                blk_hash = TokenBlock.hash_fn(
-                    (block.pre_blk_hash, tuple(block.tokens), collision_count)
-                )
-                continue
-            else:
-                break
+        runtime = self.identity_runtime_pool.get(blk_hash)
+        if runtime is not None:
+            if block.cache_idx is not None:
+                # 若当前block已绑定cache_idx，则与复用runtime的关键状态必须一致，否则状态已漂移。
+                assert block.runtime is runtime or (
+                    block.cache_idx == runtime.cache_idx
+                    and block.active_cnt == runtime.active_cnt
+                ), f"Inconsistent runtime object: {block.runtime} vs {runtime}"
+            block.set_runtime(runtime)
+        elif block.cache_idx is not None:
+            self.identity_runtime_pool[blk_hash] = block.runtime
+            self.cache_idx_to_hash[block.cache_idx] = blk_hash
 
-        block.blk_hash = blk_hash
-        if blk_hash in self.hashed_block_pool:
-            block = self.hashed_block_pool[blk_hash]
-        else:
-            self.hashed_block_pool[blk_hash] = block
+        return block.identity
 
-        return block
+    def _bind_block_to_cache_idx(self, block: TokenBlock, cache_idx: int) -> None:
+        runtime = block.runtime
+        runtime.cache_idx = cache_idx
+        runtime.active_cnt += 1
+        self.active_blocks[cache_idx] = runtime
+        if block.blk_hash is not None and len(block.tokens) == block.blk_size:
+            self.identity_runtime_pool[block.blk_hash] = runtime
+            self.cache_idx_to_hash[cache_idx] = block.blk_hash
 
-    def tokens_to_block(
+    def _build_task_block(
         self, tokens: list[int], pre_blk_hash: Optional[str]
     ) -> TokenBlock:
-        """将tokens转化为一个TokenBlock"""
+        """Build task block via builder abstractions."""
         if pre_blk_hash is None:
             pre_blk_hash = NONE_BLK_HASH
         tokens = list(tokens)
-
-        if len(tokens) <= self.block_size:
-            block = TokenBlock(
-                tokens=tokens,
-                blk_hash=None,
-                blk_size=self.block_size,
-                pre_blk_hash=pre_blk_hash,
-            )
-            block = self.add_to_hashed_block_pool(block)
-            return block
-
-        raise ValueError(
-            f"Input tokens length ({len(tokens)}) shouldn't bigger than block size ({self.block_size})"
+        identity = self.identity_builder.make_identity(
+            token_chunk=tokens,
+            pre_blk_hash=pre_blk_hash,
+            auto_register=self.enable_prefix_caching,
         )
+        block = TokenBlock(identity=identity, runtime=BlockRuntime())
+        if self.enable_prefix_caching:
+            self.get_or_register_identity(block)
+        return block
 
     def get_free_cache_idx(self):
         if self.free_cache_ids:
@@ -194,8 +202,14 @@ class PagedKVCacheManager(KVCacheManagerBase):
             raise Exception(
                 f"No more free KVCache blocks: KVCache has total {self.num_blocks} blocks, {len(self.active_blocks)} blocks has been used."
             )
-        cache_idx, block_evicted = self.cached_idle_blocks.popitem(last=False)
-        block_evicted.cache_idx = None
+        cache_idx, runtime_evicted = self.cached_idle_blocks.popitem(last=False)
+        runtime_evicted.cache_idx = None
+        blk_hash = self.cache_idx_to_hash.pop(cache_idx, None)
+        if (
+            blk_hash is not None
+            and self.identity_runtime_pool.get(blk_hash) is runtime_evicted
+        ):
+            self.identity_runtime_pool.pop(blk_hash, None)
         return cache_idx
 
     def prepare_metadata_before_prefill(self, task: "Task"):
@@ -223,13 +237,13 @@ class PagedKVCacheManager(KVCacheManagerBase):
                     assert (
                         block.active_cnt == 0
                     ), f"The active count of cached idle block ({block.active_cnt}) should 0. "
-                    self.active_blocks[block.cache_idx] = block
+                    self.active_blocks[block.cache_idx] = block.runtime
                     self.cached_idle_blocks.pop(block.cache_idx)
 
                 # 更新块的活跃状态、当前step新分配给任务的kvcache块索引，以及任务的所有kvcache块索引
                 self.task_to_cache_ids[task.task_id].add(block.cache_idx)
                 task.new_cache_ids.append(block.cache_idx)
-                block.active_cnt += 1
+                block.runtime.active_cnt += 1
                 task.consumed_req_tokens += self.block_size
 
             if task.consumed_req_tokens == task.prefix_tokens_len:
@@ -263,10 +277,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
                 cache_idx not in self.task_to_cache_ids[task.task_id]
             ), f"{cache_idx} is already in {self.task_to_cache_ids[task.task_id]}"
             task.new_cache_ids.append(cache_idx)
-            block.cache_idx = cache_idx
-            self.task_to_cache_ids[task.task_id].add(block.cache_idx)
-            block.active_cnt += 1
-            self.active_blocks[block.cache_idx] = block
+            self._bind_block_to_cache_idx(block, cache_idx)
+            self.task_to_cache_ids[task.task_id].add(cache_idx)
 
     def prepare_metadata_before_decode(self, task: "Task"):
         """prepare and update metadata before the task begin a decode step"""
@@ -311,7 +323,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
                     idx * self.block_size : (idx + 1) * self.block_size
                 ]
                 pre_blk_hash = task.token_blocks[-1].blk_hash
-                block = self.tokens_to_block(tokens=tokens, pre_blk_hash=pre_blk_hash)
+                block = self._build_task_block(tokens=tokens, pre_blk_hash=pre_blk_hash)
                 assert (
                     block.cache_idx is None
                 ), f"idx:{idx}, task.token_blocks:{task.token_blocks}"
@@ -321,11 +333,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
             assert (
                 cache_idx not in self.task_to_cache_ids[task.task_id]
             ), f"{cache_idx} is already in {self.task_to_cache_ids[task.task_id]}"
-            block.cache_idx = cache_idx
-            self.task_to_cache_ids[task.task_id].add(block.cache_idx)
+            self._bind_block_to_cache_idx(block, cache_idx)
+            self.task_to_cache_ids[task.task_id].add(cache_idx)
             task.new_cache_ids.append(cache_idx)
-            block.active_cnt += 1
-            self.active_blocks[block.cache_idx] = block
 
     def _prepare_metadata_before_decode_dllm(self, task: "Task"):
         """Prepare metadata for DLLM decode step.
@@ -363,15 +373,16 @@ class PagedKVCacheManager(KVCacheManagerBase):
                     blk_size=self.block_size,
                     pre_blk_hash=(
                         task.token_blocks[-1].blk_hash
-                        if task.token_blocks
+                        if (
+                            task.token_blocks
+                            and task.token_blocks[-1].blk_hash is not None
+                        )
                         else NONE_BLK_HASH
                     ),
                 )
                 task.token_blocks.append(block)
 
-            block.cache_idx = cache_idx
-            block.active_cnt += 1
-            self.active_blocks[cache_idx] = block
+            self._bind_block_to_cache_idx(block, cache_idx)
 
     def update_prefix_caching_metadata(self, task: "Task", num_full_blocks):
         """Update metadata in task_hashed_block_cnt, task.token_blocks and hashed_block_pool"""
@@ -392,13 +403,21 @@ class PagedKVCacheManager(KVCacheManagerBase):
                 assert (
                     pre_blk_hash is not None
                 ), f"idx:{idx}, pre_block: {task.token_blocks[idx-1]} , task.token_blocks:{task.token_blocks}"
-            block.pre_blk_hash = pre_blk_hash
+            block.update_identity(pre_blk_hash=pre_blk_hash, blk_hash=None)
             if len(block.tokens) != self.block_size:
                 # decode
-                block.tokens = task.prefix_tokens[
-                    idx * self.block_size : (idx + 1) * self.block_size
-                ]
-            block = self.add_to_hashed_block_pool(block)
+                block.update_identity(
+                    tokens=task.prefix_tokens[
+                        idx * self.block_size : (idx + 1) * self.block_size
+                    ],
+                    blk_hash=None,
+                )
+            self.get_or_register_identity(block)
+            if idx > 0:
+                assert block.pre_blk_hash == task.token_blocks[idx - 1].blk_hash, (
+                    f"hash chain broken for task {task.task_id} idx={idx}: "
+                    f"pre={block.pre_blk_hash}, prev={task.token_blocks[idx - 1].blk_hash}"
+                )
         self.task_hashed_block_cnt[task.task_id] = num_full_blocks
 
     def finalize_metadata_all_decode(self, task: "Task"):
@@ -407,14 +426,14 @@ class PagedKVCacheManager(KVCacheManagerBase):
         for block in reversed(task.token_blocks):
             if block.cache_idx is None:
                 continue
-            block.active_cnt -= 1
+            block.runtime.active_cnt -= 1
             assert (
                 block.active_cnt >= 0
             ), f"TokenBlock.activte_cnt ({block.active_cnt}) shouldn't smaller than 0."
             if block.active_cnt == 0:
                 # 当block的活跃度为0时，将block从active_blocks中移除，并放入cached_idle_blocks的最右端
                 self.active_blocks.pop(block.cache_idx)
-                self.cached_idle_blocks[block.cache_idx] = block
+                self.cached_idle_blocks[block.cache_idx] = block.runtime
         self.tid_to_cached_len.pop(task.task_id)
         self.task_to_cache_ids.pop(task.task_id)
         if task.task_id in self.task_hashed_block_cnt:

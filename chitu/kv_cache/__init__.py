@@ -27,7 +27,14 @@ To add support for a new model:
   non-default cache-manager topology.
 """
 
-from chitu.kv_cache.prefix_caching import TokenBlock, NONE_BLK_HASH
+from chitu.kv_cache.prefix_caching import (
+    TokenBlock,
+    BlockIdentity,
+    BlockIdentityChainBuilder,
+    BlockRuntime,
+    KVBlockState,
+    NONE_BLK_HASH,
+)
 from chitu.kv_cache.kv_cache import (
     GlobalLocalMap,
     KVCacheBase,
