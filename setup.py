@@ -30,7 +30,6 @@ assert packaging.version.parse(setuptools.__version__) >= packaging.version.pars
 import csrc.setup_build as operators
 from get_requires import install_requires, extras_require
 
-
 # In case of OOM, volunteerly make OOM killer more likely to kill this process, and less
 # likely to hang the system.
 try:
@@ -117,7 +116,7 @@ if os.environ.get("CHITU_SETUP_JOBS") is not None:
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="chitu",
-    version="0.5.4",
+    version="0.5.5",
     python_requires=">=3.10",
     install_requires=install_requires,
     extras_require=extras_require,
