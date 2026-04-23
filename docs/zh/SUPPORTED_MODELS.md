@@ -89,6 +89,7 @@
 | Qwen3-Coder-480B-A35B-Instruct | ✓ | `models=Qwen3-Coder-480B-A35B-Instruct` | https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct |
 | Qwen3-Coder-480B-A35B-Instruct-fp8 | ✓ | `models=Qwen3-Coder-480B-A35B-Instruct-fp8` | https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 |
 | Qwen3-Coder-Next | ✓ | `models=Qwen3-Coder-Next` | https://huggingface.co/Qwen/Qwen3-Coder-Next |
+| Qwen3-Coder-Next-FP8 | ✓ | `models=Qwen3-Coder-Next-FP8` | https://huggingface.co/Qwen/Qwen3-Coder-Next-FP8 |
 | Qwen3-Next-80B-A3B-Instruct | ✓ | `models=Qwen3-Next-80B-A3B-Instruct` | https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct |
 | Qwen3-Next-80B-A3B-Instruct-FP8 | ✓ | `models=Qwen3-Next-80B-A3B-Instruct-FP8` | https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 |
 | Qwen3-Next-80B-A3B-Thinking | ✓ | `models=Qwen3-Next-80B-A3B-Thinking` | https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking |
