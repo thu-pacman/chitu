@@ -76,6 +76,7 @@ def _(
                 token_to_expert_indices=hidden_states.token_to_expert_indices,
                 n_tokens_per_expert_padded=hidden_states.n_tokens_per_expert_padded,
                 pad_block_size=hidden_states.pad_block_size,
+                n_tokens_padded=hidden_states.n_tokens_padded,
                 expert_ids_are_local=hidden_states.expert_ids_are_local,
                 expected_n_tokens_per_expert=hidden_states.expected_n_tokens_per_expert,
             ),

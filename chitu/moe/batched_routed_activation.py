@@ -19,6 +19,54 @@ from chitu.ops.batched_routed_activation import (
 )
 
 
+def _compute_padded_per_expert_counts(
+    token_to_expert_indices: torch.Tensor,
+    *,
+    n_experts: int,
+    pad_block_size: int,
+) -> torch.Tensor:
+    """Return per-expert padded token counts as a device-side tensor (no D2H sync)."""
+    token_cnt_per_expert = torch.zeros(
+        n_experts, device=token_to_expert_indices.device, dtype=torch.int32
+    )
+    expert_ids = token_to_expert_indices.view(-1)
+    expert_ids = expert_ids[(expert_ids >= 0) & (expert_ids < n_experts)]
+    token_cnt_per_expert.index_add_(
+        0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
+    )
+    del expert_ids
+    n_tokens_per_expert_padded = (
+        (token_cnt_per_expert + pad_block_size - 1) // pad_block_size * pad_block_size
+    )
+    del token_cnt_per_expert
+    return n_tokens_per_expert_padded
+
+
+def _require_local_expert_ids(old: "BatchedRoutedActivation") -> None:
+    if not old.expert_ids_are_local:
+        raise NotImplementedError("`expert_ids_are_local` is required")
+
+
+def _rewrap_chunks_with_padded_metadata(
+    routed_activation,
+    base_chunks: list[tuple["IndexedBatchedRoutedActivation", torch.Tensor]],
+) -> list[tuple["IndexedBatchedRoutedActivation", torch.Tensor]]:
+    if len(base_chunks) == 1 and base_chunks[0][0] is routed_activation:
+        return base_chunks
+    n_experts = int(routed_activation.n_tokens_per_expert_padded.numel())
+    return [
+        (
+            type(routed_activation).convert_from(
+                chunk,
+                n_experts=n_experts,
+                pad_block_size=routed_activation.pad_block_size,
+            ),
+            weights,
+        )
+        for chunk, weights in base_chunks
+    ]
+
+
 @dataclass
 class BatchedRoutedActivation:
     """
@@ -239,42 +287,63 @@ class IndexedBatchedRoutedActivationBlockfp8(IndexedBatchedRoutedActivation):
 class IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
     IndexedBatchedRoutedActivation
 ):
-    """
-    IndexedBatchedRoutedActivation with extra info used for optianlly converting to
-    ExpertBlockPermutedBatchedRoutedActivation
-    """
+    """Indexed routed activation with exact padded per-expert token counts."""
 
     n_tokens_per_expert_padded: torch.Tensor
     pad_block_size: int
+    n_tokens_padded: Optional[int] = None
+
+    @override
+    def get_chunks_no_larger_than(
+        self,
+        topk_weights: torch.Tensor,
+        max_n_tokens_x_topk: int,
+        global_n_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
+    ) -> list[
+        tuple["IndexedBatchedRoutedActivationWithPaddedPerExpertCnt", torch.Tensor]
+    ]:
+        base_chunks = super().get_chunks_no_larger_than(
+            topk_weights,
+            max_n_tokens_x_topk,
+            global_n_experts,
+            experts_start_idx,
+            experts_end_idx,
+        )
+        return _rewrap_chunks_with_padded_metadata(self, base_chunks)
 
     @classmethod
     @override
     @plum.dispatch
     def convert_from(
-        cls, old: IndexedBatchedRoutedActivation, *, n_experts: int, pad_block_size: int
+        cls,
+        old: IndexedBatchedRoutedActivation,
+        *,
+        n_experts: int,
+        pad_block_size: int,
     ) -> "IndexedBatchedRoutedActivationWithPaddedPerExpertCnt":
-        if not old.expert_ids_are_local:
-            raise NotImplementedError("`expert_ids_are_local` is required")
-        token_cnt_per_expert = torch.zeros(
-            n_experts, device=old.token_to_expert_indices.device, dtype=torch.int32
-        )
-        expert_ids = old.token_to_expert_indices.view(-1)
-        expert_ids = expert_ids[(expert_ids >= 0) & (expert_ids < n_experts)]
-        token_cnt_per_expert.index_add_(
-            0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
-        )
-        del expert_ids
-        n_tokens_per_expert_padded = (
-            (token_cnt_per_expert + pad_block_size - 1)
-            // pad_block_size
-            * pad_block_size
-        )
-        del token_cnt_per_expert
-        return IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
+        _require_local_expert_ids(old)
+        if (
+            isinstance(old, cls)
+            and old.pad_block_size == pad_block_size
+            and old.n_tokens_per_expert_padded.numel() == n_experts
+        ):
+            n_tokens_per_expert_padded = old.n_tokens_per_expert_padded
+            n_tokens_padded = old.n_tokens_padded
+        else:
+            n_tokens_per_expert_padded = _compute_padded_per_expert_counts(
+                old.token_to_expert_indices,
+                n_experts=n_experts,
+                pad_block_size=pad_block_size,
+            )
+            n_tokens_padded = None
+        return cls(
             activation=old.activation,
             token_to_expert_indices=old.token_to_expert_indices,
             n_tokens_per_expert_padded=n_tokens_per_expert_padded,
             pad_block_size=pad_block_size,
+            n_tokens_padded=n_tokens_padded,
             expert_ids_are_local=old.expert_ids_are_local,
             expected_n_tokens_per_expert=old.expected_n_tokens_per_expert,
         )
@@ -284,13 +353,34 @@ class IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
 class IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
     IndexedBatchedRoutedActivationBlockfp8
 ):
-    """
-    IndexedBatchedRoutedActivationBlockfp8 with extra info used for optianlly converting to
-    ExpertBlockPermutedBatchedRoutedActivationBlockfp8
-    """
+    """Blockfp8 indexed routed activation with exact padded per-expert counts."""
 
     n_tokens_per_expert_padded: torch.Tensor
     pad_block_size: int
+    n_tokens_padded: Optional[int] = None
+
+    @override
+    def get_chunks_no_larger_than(
+        self,
+        topk_weights: torch.Tensor,
+        max_n_tokens_x_topk: int,
+        global_n_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
+    ) -> list[
+        tuple[
+            "IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt",
+            torch.Tensor,
+        ]
+    ]:
+        base_chunks = super().get_chunks_no_larger_than(
+            topk_weights,
+            max_n_tokens_x_topk,
+            global_n_experts,
+            experts_start_idx,
+            experts_end_idx,
+        )
+        return _rewrap_chunks_with_padded_metadata(self, base_chunks)
 
     @classmethod
     @override
@@ -302,29 +392,28 @@ class IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
         n_experts: int,
         pad_block_size: int,
     ) -> "IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt":
-        if not old.expert_ids_are_local:
-            raise NotImplementedError("`expert_ids_are_local` is required")
-        token_cnt_per_expert = torch.zeros(
-            n_experts, device=old.token_to_expert_indices.device, dtype=torch.int32
-        )
-        expert_ids = old.token_to_expert_indices.view(-1)
-        expert_ids = expert_ids[(expert_ids >= 0) & (expert_ids < n_experts)]
-        token_cnt_per_expert.index_add_(
-            0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
-        )
-        del expert_ids
-        n_tokens_per_expert_padded = (
-            (token_cnt_per_expert + pad_block_size - 1)
-            // pad_block_size
-            * pad_block_size
-        )
-        del token_cnt_per_expert
-        return IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
+        _require_local_expert_ids(old)
+        if (
+            isinstance(old, cls)
+            and old.pad_block_size == pad_block_size
+            and old.n_tokens_per_expert_padded.numel() == n_experts
+        ):
+            n_tokens_per_expert_padded = old.n_tokens_per_expert_padded
+            n_tokens_padded = old.n_tokens_padded
+        else:
+            n_tokens_per_expert_padded = _compute_padded_per_expert_counts(
+                old.token_to_expert_indices,
+                n_experts=n_experts,
+                pad_block_size=pad_block_size,
+            )
+            n_tokens_padded = None
+        return cls(
             activation=old.activation,
             activation_scale=old.activation_scale,
             token_to_expert_indices=old.token_to_expert_indices,
             n_tokens_per_expert_padded=n_tokens_per_expert_padded,
             pad_block_size=pad_block_size,
+            n_tokens_padded=n_tokens_padded,
             expert_ids_are_local=old.expert_ids_are_local,
             expected_n_tokens_per_expert=old.expected_n_tokens_per_expert,
         )
@@ -453,6 +542,7 @@ class ExpertBlockPermutedBatchedRoutedActivationNormal(
             old.activation,
             old.token_to_expert_indices,
             n_tokens_per_expert_padded=old.n_tokens_per_expert_padded,
+            n_tokens_padded=old.n_tokens_padded,
             block_size=block_size,
             num_experts=num_experts,
         )
@@ -494,6 +584,7 @@ class ExpertBlockPermutedBatchedRoutedActivationBlockfp8(
             old.activation_scale,
             old.token_to_expert_indices,
             n_tokens_per_expert_padded=old.n_tokens_per_expert_padded,
+            n_tokens_padded=old.n_tokens_padded,
             block_size=block_size,
             num_experts=num_experts,
         )

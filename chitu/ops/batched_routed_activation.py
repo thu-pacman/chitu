@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
+
 import torch
 
 from chitu.device_type import has_accelerator
@@ -229,6 +231,7 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
     block_size: int,
     num_experts: int,
     n_tokens_per_expert_padded: torch.Tensor,
+    n_tokens_padded: Optional[int] = None,
     impl: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -240,9 +243,12 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
         activation_scale (torch.Tensor): IndexedBatchedRoutedActivationBlockfp8.activation_scale.
         token_to_expert_indices (torch.Tensor): IndexedBatchedRoutedActivationBlockfp8.token_to_expert_indices.
         block_size: Block size of ExpertBlockPermutedBatchedRoutedActivation.
-        n_tokens_padded: Number of tokens of all experts, each padded to be multiple of block_size.
         n_tokens_per_expert_padded: Number of tokens assigned to each expert, padded to be multiple
             of block_size.
+        n_tokens_padded: Optional host-side scalar equal to `n_tokens_per_expert_padded.sum()`.
+            When provided, the impl allocates the exact padded rows. Otherwise it
+            falls back to a host-side conservative upper bound to avoid a
+            device->host sync.
 
     Returns:
         [0]: ExpertBlockPermutedBatchedRoutedActivation.blocked_activation.
@@ -281,6 +287,7 @@ def batched_routed_activation_indexed_to_expert_block_permuted(
     block_size: int,
     num_experts: int,
     n_tokens_per_expert_padded: torch.Tensor,
+    n_tokens_padded: Optional[int] = None,
     impl: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -288,7 +295,8 @@ def batched_routed_activation_indexed_to_expert_block_permuted(
 
     This mirrors the layout transformation of
     `batched_routed_activation_indexed_to_expert_block_permuted_blockfp8` but
-    without using real quantization scales.
+    without using real quantization scales. `n_tokens_padded` follows the same
+    contract as the blockfp8 path.
 
     Returns:
         [0]: blocked_activation            (16-bit) [n_blocks, block_size, hidden]
@@ -318,6 +326,7 @@ def _indexed_to_expert_block_permuted_triton(
     block_size,
     num_experts,
     n_tokens_per_expert_padded,
+    n_tokens_padded: Optional[int] = None,
 ):
     (
         blocked_activation,
@@ -329,6 +338,7 @@ def _indexed_to_expert_block_permuted_triton(
         block_size=block_size,
         num_experts=num_experts,
         n_tokens_per_expert_padded=n_tokens_per_expert_padded,
+        n_tokens_padded=n_tokens_padded,
     )
     assert blocked_activation.dtype == torch.get_default_dtype()
     return (

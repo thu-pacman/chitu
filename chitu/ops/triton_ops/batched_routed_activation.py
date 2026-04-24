@@ -10,6 +10,23 @@ import triton.language as tl
 
 from chitu.utils import ceil_div
 
+
+def _conservative_n_tokens_padded_upper_bound(
+    token_to_expert_indices: torch.Tensor, *, num_experts: int, block_size: int
+) -> int:
+    """
+    Host-side upper bound on `sum(n_tokens_per_expert_padded)` for the indexed ->
+    expert-block-permuted layout.
+
+    Derivation: at most `num_experts` tokens can land in their own block (one token
+    each), and the remaining tokens pack `block_size` per block. This bound is
+    exact in the worst case and never requires a device->host sync.
+    """
+    numel = token_to_expert_indices.numel()
+    n_blocks = min(num_experts, numel) + max(numel - num_experts, 0) // block_size
+    return n_blocks * block_size
+
+
 # SPDX-SnippetBegin
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-SnippetCopyrightText: 2025 SGLang Team
@@ -411,16 +428,18 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton(
     block_size: int,
     num_experts: int,
     n_tokens_per_expert_padded: torch.Tensor,
+    n_tokens_padded: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Find the largest possible n_blocks: Suppose the first `num_experts` tokens each
-    # routed to a different expert, each occupying one block. For the reset
-    # `topk_ids.numel() - num_experts` tokens, every `block_size` tokens contributes
-    # to one block
-    n_blocks = (
-        min(num_experts, token_to_expert_indices.numel())
-        + max(token_to_expert_indices.numel() - num_experts, 0) // block_size
-    )
-    n_tokens_padded = n_blocks * block_size
+    # Callers that already know the exact padded row count host-side (DeepEP
+    # dispatcher) pass it in so `ep_scatter` allocates the exact buffer. Otherwise
+    # fall back to a purely host-side conservative upper bound, to avoid paying a
+    # device->host sync just to tighten the allocation.
+    if n_tokens_padded is None:
+        n_tokens_padded = _conservative_n_tokens_padded_upper_bound(
+            token_to_expert_indices, num_experts=num_experts, block_size=block_size
+        )
+    assert n_tokens_padded % block_size == 0
+    n_blocks = n_tokens_padded // block_size
 
     if n_blocks == 0:
         return (
@@ -489,16 +508,15 @@ def batched_routed_activation_indexed_to_expert_block_permuted_triton(
     block_size: int,
     num_experts: int,
     n_tokens_per_expert_padded: torch.Tensor,
+    n_tokens_padded: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Find the largest possible n_blocks: Suppose the first `num_experts` tokens each
-    # routed to a different expert, each occupying one block. For the reset
-    # `topk_ids.numel() - num_experts` tokens, every `block_size` tokens contributes
-    # to one block
-    n_blocks = (
-        min(num_experts, token_to_expert_indices.numel())
-        + max(token_to_expert_indices.numel() - num_experts, 0) // block_size
-    )
-    n_tokens_padded = n_blocks * block_size
+    # See blockfp8 variant above for the `n_tokens_padded` contract.
+    if n_tokens_padded is None:
+        n_tokens_padded = _conservative_n_tokens_padded_upper_bound(
+            token_to_expert_indices, num_experts=num_experts, block_size=block_size
+        )
+    assert n_tokens_padded % block_size == 0
+    n_blocks = n_tokens_padded // block_size
 
     if n_blocks == 0:
         return (
