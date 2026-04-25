@@ -368,7 +368,7 @@ mi_node_main() {
       dp_config.enabled=True dp_config.dp_size="${INSTANCE_COUNT}"
       dp_config.router.is_router=True dp_config.router.host=0.0.0.0 dp_config.router.port="${MI_ROUTER_PORT}"
       "dp_config.router.pd_disaggregation.enabled=False"
-      "dp_config.router.load_balancer_algorithm=${MI_LB_ALGORITHM}"
+      "dp_config.router.routing_algorithm=${MI_LB_ALGORITHM}"
       "dp_config.router.dp_addresses=[$(IFS=,; echo "${dp_addr_list[*]}")]"
       "${COMMON_OVERRIDES[@]}"
     )

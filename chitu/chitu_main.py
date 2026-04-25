@@ -1301,6 +1301,8 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
     logger.warning(
         f"[Enhanced Scheduler {dp_id}] Starting to process requests, scheduler listening to requests on {request_address}"
     )
+    last_num_blocks = 0
+    last_block_size = 0
     try:
         while True:
             # Check if there are requests
@@ -1334,17 +1336,56 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
                 from chitu.metrics.task_stats import count_router_load
 
                 running_requests, waiting_requests = count_router_load()
-                stats = {
-                    "scheduler_id": dp_config.dp_id,
-                    "running_requests": int(running_requests),
-                    "waiting_requests": int(waiting_requests),
-                    "pending_tokens": 0,  # TODO: calculate pending tokens
-                    "throughput_tokens_per_sec": throughput,
-                    "last_update_time": current_time,
-                    "heartbeat": True,
-                }
+                evicted_blk_hashes = []
+                num_blocks = 0
+                block_size = None
+                try:
+                    num_managers = len(Backend.cache_managers)
+                    for cache_manager_dict in Backend.cache_managers:
+                        if block_size is None:
+                            block_size = cache_manager_dict["main"].block_size
+                        assert (
+                            block_size == cache_manager_dict["main"].block_size
+                        ), f"The block size of all main cache managers in the same instance should be the same. "
+
+                        num_blocks += cache_manager_dict["main"].num_blocks
+
+                        # Send only incremental evictions
+                        if hasattr(
+                            cache_manager_dict["main"], "pop_evicted_blk_hashes"
+                        ):
+                            evicted_blk_hashes.extend(
+                                cache_manager_dict["main"].pop_evicted_blk_hashes(
+                                    max_items=(512 // num_managers)
+                                )
+                            )
+
+                except Exception as cache_e:
+                    logger.error(
+                        f"[Enhanced Scheduler {dp_id}] collect cache stats failed: {cache_e}"
+                    )
 
                 try:
+                    stats = {
+                        "scheduler_id": dp_config.dp_id,
+                        "running_requests": int(running_requests),
+                        "waiting_requests": int(waiting_requests),
+                        "pending_tokens": 0,  # TODO: calculate pending tokens
+                        "throughput_tokens_per_sec": throughput,
+                        "last_update_time": current_time,
+                        "heartbeat": True,
+                    }
+
+                    # num_blocks, block_size, evicted_blk_hashes这3个参数有变动时才传输
+                    if num_blocks != last_num_blocks:
+                        stats["num_blocks"] = num_blocks
+                        last_num_blocks = num_blocks
+                    if block_size != last_block_size:
+                        stats["block_size"] = block_size
+                        last_block_size = block_size
+                    if evicted_blk_hashes:
+                        stats["evicted_blk_hashes"] = evicted_blk_hashes
+
                     stats_data = msgpack.packb(stats)
                     await stats_socket.send(stats_data)
                     logger.debug(

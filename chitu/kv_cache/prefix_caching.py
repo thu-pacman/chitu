@@ -5,7 +5,7 @@
 from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 import pickle
 
 # NONE_BLK_HASH must be deterministic across processes/ranks.

@@ -471,13 +471,9 @@ async def get_dp_config():
             "mode": "full",
             "scheduler_count": len(getattr(request_router, "scheduler_addresses", [])),
             "load_balance_method": getattr(
-                request_router.load_balancer.config,
-                "load_balancer_algorithm",
-                getattr(
-                    request_router.load_balancer.config,
-                    "load_balance_algorithm",
-                    "power_of_two_choices",
-                ),
+                request_router,
+                "routing_algorithm",
+                "power_of_two_choices",
             ),
             "scheduler_addresses": getattr(request_router, "scheduler_addresses", []),
         }

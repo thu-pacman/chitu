@@ -205,6 +205,17 @@ class TokenRouter:
                         f"[TTFT] dp={token_data.get('scheduler_id')}, request={request_id}, has long ttft_s={ttft_s:.1f}"
                     )
 
+                # 首token返回时将request_id对应的TokenBlocks插入到对应的cache_blocks[instance_id]
+                if request_router := get_request_router():
+                    if hasattr(request_router, "policy") and hasattr(
+                        request_router.policy, "insert_req_blocks"
+                    ):
+                        request_router.policy.insert_req_blocks(request_id)
+                    if hasattr(request_router, "policy") and hasattr(
+                        request_router.policy, "forget_request"
+                    ):
+                        request_router.policy.forget_request(request_id)
+
             # Periodically print per-dp throughput, help locate if all channels are flowing
             now = time.time()
             if now - self._last_stats_log_ts >= 5.0:
@@ -236,6 +247,11 @@ class TokenRouter:
             logger.debug(
                 f"Token Router: Request {request_id} finished, reason={finish_reason}"
             )
+            if request_router := get_request_router():
+                if hasattr(request_router, "policy") and hasattr(
+                    request_router.policy, "forget_request"
+                ):
+                    request_router.policy.forget_request(request_id)
 
         elif token_data.get("type") == "error":
             # Handle error
@@ -247,6 +263,11 @@ class TokenRouter:
             # Send stop signal and cleanup
             req.stop_stream()
             del self.active_requests[request_id]
+            if request_router := get_request_router():
+                if hasattr(request_router, "policy") and hasattr(
+                    request_router.policy, "forget_request"
+                ):
+                    request_router.policy.forget_request(request_id)
 
         else:
             logger.warning(
