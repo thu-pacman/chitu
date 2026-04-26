@@ -718,7 +718,6 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
 
         self.block_size = block_size
         self.round_scale_to_pow2 = round_scale_to_pow2
-        self._resolved_impl_log_keys = set()
 
         # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
         # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
@@ -825,25 +824,13 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
     def _log_resolved_impl_once(
         self,
         *,
-        callsite: str,
         routed_x: BatchedRoutedActivation,
         requested_impl: str,
         resolved_impl: str,
     ) -> None:
-        key = (
-            callsite,
+        logger.info_once(
+            "MoE impl resolved: checkpoint_prefix=%s routed_x=%s requested_impl=%s resolved_impl=%s experts=[%d,%d) (set CHITU_LOG_STACK_TRACE=1 for call site)",
             self.checkpoint_prefix,
-            type(routed_x).__name__,
-            requested_impl,
-            resolved_impl,
-        )
-        if key in self._resolved_impl_log_keys:
-            return
-        self._resolved_impl_log_keys.add(key)
-        logger.info(
-            "MoE impl resolved: checkpoint_prefix=%s callsite=%s routed_x=%s requested_impl=%s resolved_impl=%s experts=[%d,%d)",
-            self.checkpoint_prefix,
-            callsite,
             type(routed_x).__name__,
             requested_impl,
             resolved_impl,
@@ -869,7 +856,6 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
         requested_impl = impl
         impl = _resolve_indexed_blockfp8_impl(routed_x, impl, soft_fp8=fused_soft_fp8)
         self._log_resolved_impl_once(
-            callsite="forward_no_sum",
             routed_x=routed_x,
             requested_impl=requested_impl,
             resolved_impl=impl,
@@ -916,7 +902,6 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             _,
         ) = resolved
         self._log_resolved_impl_once(
-            callsite="forward_no_sum",
             routed_x=routed_x,
             requested_impl=requested_impl,
             resolved_impl=impl,
@@ -967,7 +952,6 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
         requested_impl = impl
         impl = _resolve_indexed_blockfp8_impl(routed_x, impl, soft_fp8=fused_soft_fp8)
         self._log_resolved_impl_once(
-            callsite="forward",
             routed_x=routed_x,
             requested_impl=requested_impl,
             resolved_impl=impl,
@@ -1016,7 +1000,6 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             _,
         ) = resolved
         self._log_resolved_impl_once(
-            callsite="forward",
             routed_x=routed_x,
             requested_impl=requested_impl,
             resolved_impl=impl,

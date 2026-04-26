@@ -49,6 +49,20 @@ def get_chitu_env(
     return default
 
 
+def get_chitu_bool_env(
+    name: str, default: Optional[bool] = None, *, legacy_names: Sequence[str] = []
+) -> Optional[bool]:
+    if default is not None:
+        default_str = "1" if default else "0"
+    else:
+        default_str = None
+    str_val = get_chitu_env(name, default_str, legacy_names=legacy_names)
+    if str_val is None:
+        return None
+    else:
+        return str_val.lower() in {"1", "true", "yes", "on"}
+
+
 _regex_special_chars = set(".^$*+?{}[]|()")
 
 

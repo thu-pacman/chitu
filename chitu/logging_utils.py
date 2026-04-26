@@ -5,12 +5,13 @@
 import sys
 import inspect
 import logging
-from typing import Any, Dict, Set, Tuple
+import traceback
+from typing import Any, Dict, Set, Tuple, Callable
 from contextvars import ContextVar
 from contextlib import contextmanager
 from logging import getLogger
 
-from chitu.utils import get_chitu_env
+from chitu.utils import get_chitu_env, get_chitu_bool_env
 
 try:
     import torch.distributed as dist
@@ -22,41 +23,41 @@ except ImportError:
 
 _log_context: ContextVar[Dict[str, Any]] = ContextVar("chitu_log_context", default={})
 
-_logged_once_messages: Set[Tuple[str, int, str]] = set()  # (filename, lineno, msg)
+_logged_once_messages: Set[Tuple[str, int, str, str]] = (
+    set()
+)  # (filename, lineno, stack_trace, msg)
+
+_log_stack_trace = get_chitu_bool_env("CHITU_LOG_STACK_TRACE", False)
 
 
 class ChituLogger(logging.Logger):
     """Custom logger with *_once methods that log a message only the first time."""
 
+    def _any_once(self, log_fn: Callable, msg: str, *args, **kwargs):
+        f = inspect.currentframe().f_back.f_back
+        if _log_stack_trace:
+            stack_trace = "".join(traceback.format_stack())
+        else:
+            stack_trace = ""
+        key = (f.f_code.co_filename, f.f_lineno, stack_trace, msg)
+        if key not in _logged_once_messages:
+            _logged_once_messages.add(key)
+            log_fn(msg, *args, stacklevel=3, **kwargs)
+
     def debug_once(self, msg: str, *args, **kwargs):
-        f = inspect.currentframe().f_back
-        if (f.f_code.co_filename, f.f_lineno, msg) not in _logged_once_messages:
-            _logged_once_messages.add((f.f_code.co_filename, f.f_lineno, msg))
-            self.debug(msg, *args, stacklevel=2, **kwargs)
+        self._any_once(self.debug, msg, *args, **kwargs)
 
     def info_once(self, msg: str, *args, **kwargs):
-        f = inspect.currentframe().f_back
-        if (f.f_code.co_filename, f.f_lineno, msg) not in _logged_once_messages:
-            _logged_once_messages.add((f.f_code.co_filename, f.f_lineno, msg))
-            self.info(msg, *args, stacklevel=2, **kwargs)
+        self._any_once(self.info, msg, *args, **kwargs)
 
     def warning_once(self, msg: str, *args, **kwargs):
-        f = inspect.currentframe().f_back
-        if (f.f_code.co_filename, f.f_lineno, msg) not in _logged_once_messages:
-            _logged_once_messages.add((f.f_code.co_filename, f.f_lineno, msg))
-            self.warning(msg, *args, stacklevel=2, **kwargs)
+        self._any_once(self.warning, msg, *args, **kwargs)
 
     def error_once(self, msg: str, *args, **kwargs):
-        f = inspect.currentframe().f_back
-        if (f.f_code.co_filename, f.f_lineno, msg) not in _logged_once_messages:
-            _logged_once_messages.add((f.f_code.co_filename, f.f_lineno, msg))
-            self.error(msg, *args, stacklevel=2, **kwargs)
+        self._any_once(self.error, msg, *args, **kwargs)
 
     def critical_once(self, msg: str, *args, **kwargs):
-        f = inspect.currentframe().f_back
-        if (f.f_code.co_filename, f.f_lineno, msg) not in _logged_once_messages:
-            _logged_once_messages.add((f.f_code.co_filename, f.f_lineno, msg))
-            self.critical(msg, *args, stacklevel=2, **kwargs)
+        self._any_once(self.critical, msg, *args, **kwargs)
 
 
 # Set ChituLogger as the default logger class
@@ -81,11 +82,13 @@ _RESET = "\033[0m"
 
 
 class ChituFormatter(logging.Formatter):
-
     def __init__(self, fmt=None, datefmt=None, style="%"):
         super().__init__(fmt, datefmt, style)
 
     def format(self, record: logging.LogRecord) -> str:
+        # Please note that Formatter runs AFTER Logger, so extra messages added in Formatter
+        # must be explicitly added as keys in `*_once` functinos in Logger.
+
         original_msg = record.getMessage()
 
         if IS_DIST and dist.is_initialized():
@@ -102,6 +105,14 @@ class ChituFormatter(logging.Formatter):
             record.context = f"[{context_str}]"
         else:
             record.context = ""
+
+        if _log_stack_trace:
+            stacks = [
+                stack for stack in traceback.format_stack() if "logging/" not in stack
+            ]
+            record.stack_trace = "\n" + "".join(stacks)
+        else:
+            record.stack_trace = ""
 
         record.msg = original_msg
         record.args = None

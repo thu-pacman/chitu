@@ -48,7 +48,7 @@ from chitu.utils import (
     try_import_and_setup_torch_npu,
     ceil_div,
     gather_str_to_dst_rank,
-    get_chitu_env,
+    get_chitu_bool_env,
 )
 from chitu.schemas.utils import ModelConfigResolver
 from chitu.distributed.parallel_state import get_pp_group, get_world_group
@@ -741,7 +741,7 @@ def _has_cpu_layer(args) -> bool:
 
 
 def chitu_init(args):
-    debug = get_chitu_env("CHITU_DEBUG", "0") == "1"
+    debug = get_chitu_bool_env("CHITU_DEBUG", False)
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
 

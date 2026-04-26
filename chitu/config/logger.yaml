@@ -14,5 +14,5 @@ hydra:
       # handlers for console and files.
       simple:
         class: "chitu.logging_utils.ChituFormatter"
-        format: "%(levelname)s %(asctime)s %(rank)s [%(name)s:%(lineno)d] %(context)s %(message)s"
+        format: "%(levelname)s %(asctime)s %(rank)s [%(name)s:%(lineno)d] %(context)s %(message)s%(stack_trace)s"
         datefmt: "%m-%d %H:%M:%S"

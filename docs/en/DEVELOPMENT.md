@@ -756,6 +756,7 @@ Runtime:
 | Name                            | Possible Values              | Description                                            |
 | ------------------------------- | ---------------------------- | ------------------------------------------------------ |
 | `CHITU_LOGGING_LEVEL`           | `<level>` or `<module1>:<level1>;<module2>:<level2>;...`. Each level can be `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. If set, each module can be any module path in the source tree, like `chitu.ops`. | Logging level. |
+| `CHITU_LOG_STACK_TRACE`         | `0`, `1`                     | Log stack trace after each log message.                |
 | `CHITU_DEBUG`                   | `0`, `1`                     | Debug mode. Currently this flag enables some timers.   |
 | `CHITU_CONFIG_PATH`             | Path to a directory          | Override the config directory.                         |
 | `CHITU_CONFIG_NAME`             | Config file name w/o .yml    | Override the entry config file name.                   |
