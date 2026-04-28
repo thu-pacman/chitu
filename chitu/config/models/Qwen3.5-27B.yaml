@@ -2,18 +2,18 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-name: Qwen3_5-9B
+name: Qwen3.5-27B
 type: hf-qwen3-5
-source: "https://huggingface.co/Qwen/Qwen3.5-9B" # Just for displaying. No automatic download.
+source: "https://huggingface.co/Qwen/Qwen3.5-27B" # Just for displaying. No automatic download.
 tokenizer_type: "hf" # one of: hf, tiktoken
 processor_path: null
 
-dim: 4096
-n_layers: 32
-n_heads: 16
+dim: 5120
+n_layers: 64
+n_heads: 24
 n_kv_heads: 4
 vocab_size: 248320
-intermediate_dim: 12288
+intermediate_dim: 17408
 norm_topk_prob: True
 norm_eps: 1e-06
 qkv_has_bias: False
@@ -22,7 +22,7 @@ use_qk_norm: True
 linear_conv_kernel_dim: 4
 linear_head_dim: 128
 linear_n_qk_heads: 16
-linear_n_v_heads: 32
+linear_n_v_heads: 48
 eos_token_id: 248044
 full_attention_interval: 4
 num_full_attention_blocks: -1 # kv cache blocks for full attention layers, could override num_blocks
@@ -43,7 +43,7 @@ vision_config:
   intermediate_size: 4304
   num_heads: 16
   in_channels: 3
-  out_hidden_size: 4096
+  out_hidden_size: 5120
   patch_size: 16
   spatial_merge_size: 2
   temporal_patch_size: 2

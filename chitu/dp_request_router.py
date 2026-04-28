@@ -13,14 +13,16 @@ import logging
 import random
 import time
 import traceback
-from collections import deque
-from dataclasses import dataclass
+from collections import deque, OrderedDict
+from dataclasses import dataclass, field
 from chitu.global_vars import get_global_args
 import zmq
 import zmq.asyncio
 import msgpack
+from typing import Optional
 
 from chitu.task import UserRequest
+from chitu.kv_cache import BlockIdentity, BlockIdentityChainBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -37,170 +39,41 @@ class SchedulerStats:
     last_update_time: float
     last_heartbeat_time: float = 0.0  # last heartbeat timestamp
     is_alive: bool = True  # alive status flag
+    num_blocks: Optional[int] = (
+        None  # total number of blocks of cache_managers in instance
+    )
+    block_size: Optional[int] = None  # block size of cache_managers in instance
+    evicted_blk_hashes: list[str] = field(
+        default_factory=list
+    )  # evicted block hash values returned from the instance
 
 
 from chitu.schemas.serve_config import RouterConfig as ServeRouterConfig
 
+NUM_ESTIMATED_TOKENS_PER_REQ = 100
+PENDING_TOKENS_WEIGHT = 1 / NUM_ESTIMATED_TOKENS_PER_REQ  # 0.01
 
-class LoadBalancer:
-    """Load balancing algorithms for request routing."""
 
-    def __init__(self, config: ServeRouterConfig):
+class RoutePolicy:
+    def __init__(self, config):
         self.config = config
-        self.round_robin_counter = 0
         self.scheduler_stats: dict[int, SchedulerStats] = {}
+        self.algorithm = getattr(
+            self.config,
+            "routing_algorithm",
+            "power_of_two_choices",
+        )
         # admission control: per-scheduler running_requests cap
         self.max_inflight_per_scheduler = max(
-            1, int(os.getenv("ROUTER_MAX_INFLIGHT_PER_SCHED", "24"))
-        )
-        logger.info(
-            f"[LOAD_BALANCER] max_inflight_per_scheduler: {self.max_inflight_per_scheduler}"
+            1, int(getattr(config, "max_inflight_per_instance", "24"))
         )
 
     def update_stats(self, stats: SchedulerStats):
         """Update statistics from Enhanced Schedulers."""
         self.scheduler_stats[stats.scheduler_id] = stats
-
-    def select_scheduler(self) -> int:
-        """Select the best scheduler for next request (respecting soft admission)."""
-        # Determine eligible ids first (soft admission)
-        eligible_ids = self.eligible_schedulers()
-        if not eligible_ids:
-            raise RuntimeError("No eligible schedulers available for request routing.")
-
-        algorithm = getattr(
-            self.config,
-            "load_balancer_algorithm",
-            getattr(self.config, "load_balance_algorithm", "power_of_two_choices"),
-        )
         logger.debug(
-            f"[LOAD_BALANCER] Starting scheduler selection with algorithm: {algorithm}, candidates={eligible_ids}"
+            f"Updated stats for scheduler {stats.scheduler_id}, stats: {stats}"
         )
-
-        # Round-robin among eligible ids
-        if algorithm == "round_robin":
-            idx = self.round_robin_counter % len(eligible_ids)
-            self.round_robin_counter += 1
-            return eligible_ids[idx]
-
-        # Least-loaded among eligible ids
-        if algorithm == "least_loaded":
-            min_load = float("inf")
-            best_scheduler = eligible_ids[0]
-            for s_id in eligible_ids:
-                stats = self.scheduler_stats[s_id]
-                load_score = stats.pending_tokens + stats.running_requests * 100
-                if load_score < min_load:
-                    min_load = load_score
-                    best_scheduler = s_id
-            return best_scheduler
-
-        # Power-of-two-choices among eligible ids (fallbacks handled)
-        if algorithm == "power_of_two_choices":
-            if len(eligible_ids) < 2:
-                return eligible_ids[0]
-            c1, c2 = random.sample(eligible_ids, 2)
-            s1, s2 = self.scheduler_stats[c1], self.scheduler_stats[c2]
-            load1 = s1.pending_tokens + s1.running_requests * 100
-            load2 = s2.pending_tokens + s2.running_requests * 100
-            return c1 if load1 <= load2 else c2
-
-        raise ValueError(f"Unknown load balance algorithm: {algorithm}")
-
-    def _select_alive_schedulers(self) -> list[tuple[int, SchedulerStats]]:
-        """Select only alive schedulers based on stats."""
-        alive_schedulers = [
-            (s_id, stats)
-            for s_id, stats in self.scheduler_stats.items()
-            if stats.is_alive
-        ]
-        if not alive_schedulers:
-            # Raise exception to indicate no available scheduler
-            raise RuntimeError("No alive schedulers available for request routing.")
-        logger.info(
-            f"[ALIVE_SCHEDULERS] Found {len(alive_schedulers)} alive schedulers out of {len(self.scheduler_stats.items())} total"
-        )
-        return alive_schedulers
-
-    def _round_robin(self) -> int:
-        """Simple round-robin selection."""
-        try:
-            alive_schedulers = self._select_alive_schedulers()
-        except RuntimeError as e:
-            logger.error(f"-ROUND_ROBIN {e}")
-            raise
-        idx = self.round_robin_counter % len(alive_schedulers)
-        self.round_robin_counter += 1
-        # return actual scheduler id, not index
-        return alive_schedulers[idx][0]
-
-    def _least_loaded(self) -> int:
-        """Select scheduler with least load."""
-        if not self.scheduler_stats:
-            logger.warning(
-                f"[LEAST_LOADED] No statistics available, returning default scheduler 0"
-            )
-            return 0
-
-        min_load = float("inf")
-        best_scheduler = 0
-
-        # Consider only alive schedulers
-        try:
-            alive_schedulers = self._select_alive_schedulers()
-        except RuntimeError as e:
-            logger.error(f"-LEAST_LOADED {e}")
-            raise
-
-        # pick alive schedulers from alive ones
-        for scheduler_id, stats in alive_schedulers:
-            # Calculate load score: pending_tokens + running_requests * 100
-            load_score = stats.pending_tokens + stats.running_requests * 100
-
-            if load_score < min_load:
-                min_load = load_score
-                best_scheduler = scheduler_id
-
-        logger.debug(
-            f"[LEAST_LOADED] Selected scheduler {best_scheduler} with load: {min_load}"
-        )
-        return best_scheduler
-
-    def _power_of_two_choices(self) -> int:
-        """Power of two choices algorithm for better load distribution."""
-        if len(self.scheduler_stats) < 2:
-            logger.warning(
-                f"[POWER_OF_TWO] Statistics insufficient ({len(self.scheduler_stats)}), cannot use power of two choices algorithm"
-            )
-            return 0
-
-        try:
-            alive_schedulers = self._select_alive_schedulers()
-        except RuntimeError as e:
-            logger.error(f"-POWER_OF_TWO {e}")
-            raise
-
-        scheduler_ids = [s_id for s_id, _ in alive_schedulers]
-        if len(scheduler_ids) < 2:
-            logger.warning(
-                f"[POWER_OF_TWO] Available schedulers insufficient ({len(scheduler_ids)}), returning first one"
-            )
-            return scheduler_ids[0] if scheduler_ids else 0
-
-        choice1, choice2 = random.sample(scheduler_ids, 2)
-        stats1 = self.scheduler_stats[choice1]
-        stats2 = self.scheduler_stats[choice2]
-
-        # Compare load and select the better one
-        load1 = stats1.pending_tokens + stats1.running_requests * 100
-        load2 = stats2.pending_tokens + stats2.running_requests * 100
-
-        selected = choice1 if load1 <= load2 else choice2
-        logger.debug(
-            f"[POWER_OF_TWO] Selected scheduler {selected} (load: {min(load1, load2)})"
-        )
-
-        return selected
 
     def eligible_schedulers(self) -> list[int]:
         """Soft-admission: prefer under-cap alive schedulers; fallback to all alive.
@@ -216,13 +89,286 @@ class LoadBalancer:
                     under_cap.append(s_id)
         return under_cap if under_cap else alive
 
+    def remember_request(self, request: UserRequest, scheduler_id: int) -> None:
+        pass
+
+    def forget_request(self, request_id: str) -> None:
+        pass
+
+
+class LoadBalancer(RoutePolicy):
+    """Load balancing algorithms for request routing."""
+
+    def __init__(self, config: ServeRouterConfig):
+        super().__init__(config)
+        self.round_robin_counter = 0
+        self.w_pending_tokens = float(PENDING_TOKENS_WEIGHT)
+        logger.info(
+            f"[LOAD_BALANCER] max_inflight_per_scheduler: {self.max_inflight_per_scheduler}"
+        )
+
+    def _round_robin(self, eligible_ids: list[int]) -> int:
+        idx = self.round_robin_counter % len(eligible_ids)
+        self.round_robin_counter += 1
+        return eligible_ids[idx]
+
+    def _least_loaded(self, eligible_ids: list[int]) -> int:
+        min_load = float("inf")
+        best_scheduler = eligible_ids[0]
+        for s_id in eligible_ids:
+            stats = self.scheduler_stats[s_id]
+            load_score = (
+                stats.pending_tokens * self.w_pending_tokens + stats.running_requests
+            )
+            if load_score < min_load:
+                min_load = load_score
+                best_scheduler = s_id
+        return best_scheduler
+
+    def _power_of_two_choices(self, eligible_ids: list[int]) -> int:
+        if len(eligible_ids) < 2:
+            return eligible_ids[0]
+        c1, c2 = random.sample(eligible_ids, 2)
+        s1, s2 = self.scheduler_stats[c1], self.scheduler_stats[c2]
+        load1 = s1.pending_tokens * self.w_pending_tokens + s1.running_requests
+        load2 = s2.pending_tokens * self.w_pending_tokens + s2.running_requests
+        return c1 if load1 <= load2 else c2
+
+    def select_scheduler(
+        self,
+        request: Optional[UserRequest] = None,
+        *,
+        eligible_ids: Optional[list[int]] = None,
+        algorithm: Optional[str] = None,
+    ) -> int:
+        """Select scheduler by the configured load-balancing strategy."""
+        if eligible_ids is None:
+            eligible_ids = self.eligible_schedulers()
+        if not eligible_ids:
+            raise RuntimeError("No eligible schedulers available for request routing.")
+
+        logger.debug(
+            f"[LOAD_BALANCER] Starting scheduler selection with algorithm: {algorithm}, candidates={eligible_ids}"
+        )
+
+        if algorithm is None:
+            algorithm = self.algorithm
+
+        if algorithm == "round_robin":
+            return self._round_robin(eligible_ids)
+        if algorithm == "least_loaded":
+            return self._least_loaded(eligible_ids)
+        if algorithm == "power_of_two_choices":
+            return self._power_of_two_choices(eligible_ids)
+
+        raise ValueError(f"Unknown load balance algorithm: {algorithm}")
+
+
+class PrefixCacheAwarePolicy(LoadBalancer):
+    """Prefix cache aware policy"""
+
+    def __init__(self, config: ServeRouterConfig):
+        super().__init__(config)
+
+        # The weight of the prefix cache hit block count during router routing tasks.
+        self.w_hit = float(getattr(config, "router_hit_weight", 1.0))
+        # The penalty weight of instance load during router routing tasks.
+        self.w_load = float(getattr(config, "router_load_penalty_weight", 0.02))
+
+        # Router-side per-instance shadow cache (LRU by block hash).
+        # The element lifecycle of the LRU :
+        #  - insert BlockIdentities of the request when the first token arrived.
+        #  - evict the earlist BlockIdenty when out lru capacity.
+        self.cached_blocks: dict[int, OrderedDict[str, BlockIdentity]] = {}
+        # Router-side Per-instance hashed blocks, for hash collision solving
+        # The element lifecycle in the hashed_blocks :
+        # - insert BlockIdentity when making identity
+        # - remove when the BlockIdenty is evicted from all lru.
+        self.hashed_blocks: dict[str, BlockIdentity] = {}
+
+        # Per-instance cache metadata from stats channel.
+        self.instances_num_total_blocks: dict[int, int] = {}
+        self.instances_block_size: dict[int, int] = {}
+
+        # Used by inserting request blocks when first token arrived
+        self.req_to_blocks: dict[str, list[BlockIdentity]] = {}
+        self.req_to_scheduler: dict[str, int] = {}
+
+        # Router evicted block buffer temporarily holds cache blocks evicted from the router's cached_blocks.
+        self.evict_buffer: dict[int, OrderedDict[str, float]] = {}
+        self.evict_buffer_size = max(
+            1, int(getattr(config, "router_evict_buffer_size", 64))
+        )
+        self.cache_miss_fallback_algorithm = getattr(
+            config,
+            "router_cache_miss_fallback_algorithm",
+            "power_of_two_choices",
+        )
+        if self.cache_miss_fallback_algorithm == "prefix_cache_aware":
+            self.cache_miss_fallback_algorithm = "power_of_two_choices"
+
+    def update_stats(self, stats: SchedulerStats):
+        super().update_stats(stats)
+        if isinstance(stats.num_blocks, int) and stats.num_blocks > 0:
+            self.instances_num_total_blocks[stats.scheduler_id] = stats.num_blocks
+        if isinstance(stats.block_size, int) and stats.block_size > 0:
+            self.instances_block_size[stats.scheduler_id] = stats.block_size
+        self.apply_instance_evicts(stats.scheduler_id, stats.evicted_blk_hashes)
+
+    def build_req_token_blocks(
+        self, request: UserRequest, scheduler_id: int
+    ) -> list[BlockIdentity]:
+        block_size = self.instances_block_size.get(scheduler_id)
+        if not block_size or block_size <= 0:
+            return []
+        prompt_tokens = list(getattr(request, "prompt_tokens", []) or [])
+        if not prompt_tokens:
+            return []
+
+        return BlockIdentityChainBuilder(block_size, self.hashed_blocks).build(
+            prompt_tokens, auto_register=True
+        )
+
+    def num_hit_blocks(self, scheduler_id: int, req_blocks: list[BlockIdentity]) -> int:
+        # Count contiguous prefix hits from the beginning of block chain.
+        if not req_blocks:
+            return 0
+        lru = self.cached_blocks.get(scheduler_id)
+        num_hits = 0
+        if not lru:
+            return num_hits
+        for block in req_blocks:
+            blk_hash = block.blk_hash
+            if not blk_hash:
+                break
+            if blk_hash not in lru:
+                break
+            num_hits += 1
+        return num_hits
+
+    def _load_score(self, scheduler_id: int) -> float:
+        stats = self.scheduler_stats.get(scheduler_id)
+        if stats is None:
+            return float("inf")
+        return stats.pending_tokens * PENDING_TOKENS_WEIGHT + stats.running_requests
+
+    def select_scheduler(self, request: UserRequest) -> int:
+        """Use prefix-cache score first, fallback to load-balance on zero-hit."""
+        eligible_ids = self.eligible_schedulers()
+        if not eligible_ids:
+            raise RuntimeError("No eligible schedulers available for request routing.")
+
+        best_scheduler = eligible_ids[0]
+        best_score = float("-inf")
+        max_num_hits = 0
+        logger.debug(f"Select chain for request[{request.request_id}]:")
+        for scheduler_id in eligible_ids:
+            req_blocks = self.build_req_token_blocks(request, scheduler_id)
+            num_hits = self.num_hit_blocks(scheduler_id, req_blocks)
+            max_num_hits = max(max_num_hits, num_hits)
+            score = self.w_hit * num_hits - self.w_load * self._load_score(scheduler_id)
+            logger.debug(
+                f"  - scheduler_id={scheduler_id}: "
+                f"score = w_hit({self.w_hit})*num_hits({num_hits}) - "
+                f"w_load({self.w_load})*_load_score({self._load_score(scheduler_id)})"
+            )
+            if score > best_score:
+                best_score = score
+                best_scheduler = scheduler_id
+
+        if max_num_hits == 0:
+            logger.debug(
+                f"Fallback to {self.cache_miss_fallback_algorithm} algorithm because max_num_hits is 0"
+            )
+            return super().select_scheduler(
+                request,
+                eligible_ids=eligible_ids,
+                algorithm=self.cache_miss_fallback_algorithm,
+            )
+
+        return best_scheduler
+
+    def remember_request(self, request: UserRequest, scheduler_id: int) -> None:
+        req_blocks = self.build_req_token_blocks(request, scheduler_id)
+        self.req_to_scheduler[request.request_id] = scheduler_id
+        self.req_to_blocks[request.request_id] = req_blocks
+
+    def insert_req_blocks(self, request_id: str) -> None:
+        # Insert request blocks into cached_blocks when the first token arrived.
+        scheduler_id = self.req_to_scheduler.get(request_id)
+        req_blocks = self.req_to_blocks.get(request_id)
+        if scheduler_id is None or req_blocks is None:
+            logger.error(
+                f"[REQUEST_ROUTER] skip insert_req_blocks for unknown request_id={request_id}"
+            )
+            return
+        lru = self.cached_blocks.setdefault(scheduler_id, OrderedDict())
+        cap = self.instances_num_total_blocks.get(scheduler_id, 0)
+        if cap <= 0:
+            return
+        for block in req_blocks:
+            blk_hash = block.blk_hash
+            if not blk_hash:
+                # Prefix-cache hit chain must be contiguous;
+                break
+            if blk_hash in lru:
+                lru.move_to_end(blk_hash, last=True)
+            else:
+                lru[blk_hash] = block
+            while len(lru) > cap:
+                # Router local LRU eviction (shadow cache only).
+                evicted_hash, _ = lru.popitem(last=False)
+                if all(evicted_hash not in lru for lru in self.cached_blocks.values()):
+                    self.hashed_blocks.pop(evicted_hash, None)
+                self._push_evict_buffer(scheduler_id, evicted_hash)
+
+    def forget_request(self, request_id: str) -> None:
+        self.req_to_blocks.pop(request_id, None)
+        self.req_to_scheduler.pop(request_id, None)
+
+    def apply_instance_evicts(self, scheduler_id: int, evicted_hashes) -> None:
+        """Evict hash blocks based on the stats information returned by the instance."""
+        if not isinstance(evicted_hashes, list) or not evicted_hashes:
+            return
+        lru = self.cached_blocks.setdefault(scheduler_id, OrderedDict())
+        buffer = self.evict_buffer.setdefault(scheduler_id, OrderedDict())
+        for blk_hash in evicted_hashes:
+            if blk_hash in buffer or blk_hash in lru:
+                buffer.pop(blk_hash, None)
+                lru.pop(blk_hash, None)
+                if all(blk_hash not in l for l in self.cached_blocks.values()):
+                    self.hashed_blocks.pop(blk_hash, None)
+            else:
+                logger.warning(
+                    "[REQUEST_ROUTER] instance evict hash not found in cached_blocks "
+                    f"or evicted block buffer, scheduler_id={scheduler_id}, blk_hash={blk_hash}. "
+                    "If this warning is frequent, router/instance cache states may drift; "
+                    "try increasing dp_config.router.router_evict_buffer_size."
+                )
+
+    def _push_evict_buffer(self, scheduler_id: int, blk_hash: str) -> None:
+        buffer = self.evict_buffer.setdefault(scheduler_id, OrderedDict())
+        buffer[blk_hash] = time.time()
+        buffer.move_to_end(blk_hash, last=True)
+        if len(buffer) > self.evict_buffer_size:
+            overflow_hash, _ = buffer.popitem(last=False)
+            logger.warning(
+                "[REQUEST_ROUTER] evicted block buffer overflow, dropping oldest buffer block hash, "
+                f"scheduler_id={scheduler_id}, dropped_blk_hash={overflow_hash}, "
+                f"capacity={self.evict_buffer_size}. "
+                "If this warning is frequent, router/instance cache states may drift."
+            )
+
 
 class RequestRouter:
     """Main Request Router for two-level data parallel scheduling."""
 
     def __init__(self, config: ServeRouterConfig):
         self.config = config
-        self.load_balancer = LoadBalancer(config)
+        if config.routing_algorithm == "prefix_cache_aware":
+            self.policy = PrefixCacheAwarePolicy(config)
+        else:
+            self.policy = LoadBalancer(config)
         self.context = zmq.asyncio.Context()
         # 轮询游标
         self._rr_cursor: int = 0
@@ -232,7 +378,7 @@ class RequestRouter:
         self.stats_socket = None
 
         # Request queues and routing state
-        self.pending_requests: deque = deque()
+        self.pending_requests: deque[UserRequest] = deque()
 
         # Resolve scheduler addresses from config
         self._scheduler_addresses: list[str] = []
@@ -286,10 +432,15 @@ class RequestRouter:
             logger.info(
                 f"[REQUEST_ROUTER] Connected to Enhanced Scheduler {i}: {address}"
             )
+            if hasattr(self.policy, "cached_blocks"):
+                self.policy.cached_blocks[i] = OrderedDict()
+            if hasattr(self.policy, "evict_buffer"):
+                self.policy.evict_buffer[i] = OrderedDict()
 
         # Create socket for receiving stats
         self.stats_socket = self.context.socket(zmq.PULL)
-        stats_address = "tcp://*:29600"  # Router stats listening port
+        stats_port = int(getattr(self.config, "stats_port", 29600))
+        stats_address = f"tcp://*:{stats_port}"  # Router stats listening port
         self.stats_socket.bind(stats_address)
         logger.info(f"[REQUEST_ROUTER] Listening for statistics: {stats_address}")
 
@@ -318,10 +469,12 @@ class RequestRouter:
                         ),
                         last_heartbeat_time=time.time(),  # update heartbeat timestamp
                         is_alive=stats_dict.get("heartbeat", False),  # mark alive
+                        num_blocks=stats_dict.get("num_blocks", None),
+                        block_size=stats_dict.get("block_size", None),
+                        evicted_blk_hashes=stats_dict.get("evicted_blk_hashes", []),
                     )
 
-                    self.load_balancer.update_stats(stats)
-                    logger.debug(f"Updated stats for scheduler {stats.scheduler_id}")
+                    self.policy.update_stats(stats)
 
             except KeyError as e:
                 logger.error(f"Missing required field in stats data: {e}")
@@ -344,7 +497,7 @@ class RequestRouter:
                     # Admission + selection delegated to LoadBalancer (soft admission inside)
                     start_time = time.time()
                     try:
-                        scheduler_id = self.load_balancer.select_scheduler()
+                        scheduler_id = self.policy.select_scheduler(request)
                     except Exception:
                         # No eligible/alive schedulers currently; push back briefly
                         self.pending_requests.appendleft(request)
@@ -360,13 +513,22 @@ class RequestRouter:
 
                     # Send request to selected scheduler
                     send_start_time = time.time()
-                    await self._send_request(scheduler_id, request)
+                    self.policy.remember_request(request, scheduler_id)
+                    try:
+                        await self._send_request(scheduler_id, request)
+                    except Exception:
+                        self.pending_requests.appendleft(request)
+                        self.policy.forget_request(request.request_id)
+                        await asyncio.sleep(0.001)
+                        continue
                     send_time = time.time() - send_start_time
 
                     # Update statistics
                     self.total_requests += 1
                     estimated_tokens = (
-                        len(request.input_ids) if hasattr(request, "input_ids") else 100
+                        len(request.input_ids)
+                        if hasattr(request, "input_ids")
+                        else NUM_ESTIMATED_TOKENS_PER_REQ
                     )
                     self.total_tokens += estimated_tokens
 
@@ -390,7 +552,7 @@ class RequestRouter:
             current_time = time.time()
 
             # Check heartbeat status for all schedulers
-            for scheduler_id, stats in self.load_balancer.scheduler_stats.items():
+            for scheduler_id, stats in self.policy.scheduler_stats.items():
                 if current_time - stats.last_heartbeat_time > HEARTBEAT_TIMEOUT:
                     logger.warning(
                         f"--- [HEARTBEAT_MONITOR] Scheduler {scheduler_id} heartbeat timeout! ---"
@@ -423,7 +585,7 @@ class RequestRouter:
                     for (
                         scheduler_id,
                         stats,
-                    ) in self.load_balancer.scheduler_stats.items():
+                    ) in self.policy.scheduler_stats.items():
                         logger.debug(
                             f"Scheduler {scheduler_id}: "
                             f"running={stats.running_requests}, "
@@ -472,6 +634,7 @@ class RequestRouter:
             logger.error(
                 f"[REQUEST_ROUTER] Failed to send request {request.request_id} to scheduler {scheduler_id}: {e}"
             )
+            raise
 
     async def add_request(self, request: UserRequest):
         """Add new request to processing queue."""
@@ -502,7 +665,7 @@ class RequestRouter:
             ),
             "queue_size": len(self.pending_requests),
             "elapsed_time": elapsed_time,
-            "scheduler_stats": dict(self.load_balancer.scheduler_stats),
+            "scheduler_stats": dict(self.policy.scheduler_stats),
         }
 
     async def shutdown(self):

@@ -315,7 +315,7 @@ dp_config:
     port: 21003                    # HTTP 推理入口端口
     stats_port: 29600              # 统计上报端口
     token_port: 29700              # Token 回传端口
-    load_balancer_algorithm: "power_of_two_choices"
+    routing_algorithm: "power_of_two_choices"
 
     pd_disaggregation:
       enabled: True

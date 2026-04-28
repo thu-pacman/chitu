@@ -95,6 +95,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # 保存该任务已生成blk_hash的TokenBLock数量（该任务在self.hashed_block_pool中的TokenBlock数量），仅需在enable_prefix_caching时维护
         # 数据含义: {task_id: cache_hashed_block_cnt}
         self.task_hashed_block_cnt: defaultdict[str, int] = defaultdict(int)
+        # Incremental evicted block hashes, consumed by scheduler stats reporter.
+        self.evicted_blk_hashes: deque[str] = deque()
 
     def get_allocatable_max_num_blocks(self) -> int:
         return int(getattr(self, "allocatable_max_num_blocks", self.max_num_blocks))
@@ -205,12 +207,32 @@ class PagedKVCacheManager(KVCacheManagerBase):
         cache_idx, runtime_evicted = self.cached_idle_blocks.popitem(last=False)
         runtime_evicted.cache_idx = None
         blk_hash = self.cache_idx_to_hash.pop(cache_idx, None)
+        dp_config = getattr(get_global_args(), "dp_config", None)
+        if (
+            dp_config
+            and getattr(dp_config, "enabled", False)
+            and not getattr(
+                getattr(getattr(dp_config, "router", None), "pd_disaggregation", None),
+                "enabled",
+                True,
+            )
+        ):
+            self.evicted_blk_hashes.append(blk_hash)
         if (
             blk_hash is not None
             and self.identity_runtime_pool.get(blk_hash) is runtime_evicted
         ):
             self.identity_runtime_pool.pop(blk_hash, None)
         return cache_idx
+
+    def pop_evicted_blk_hashes(self, max_items: int = 512) -> list[str]:
+        # Bounded pop to avoid oversized stats payload.
+        if max_items <= 0 or not self.evicted_blk_hashes:
+            return []
+        out = []
+        while self.evicted_blk_hashes and len(out) < max_items:
+            out.append(self.evicted_blk_hashes.popleft())
+        return out
 
     def prepare_metadata_before_prefill(self, task: "Task"):
         """prepare and update metadata before the task begin a prefill step"""

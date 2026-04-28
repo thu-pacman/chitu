@@ -197,7 +197,12 @@ class RouterConfig:
     port: int = MISSING
     stats_port: int = MISSING
     token_port: int = MISSING
-    load_balancer_algorithm: str = MISSING
+    max_inflight_per_instance: int = 24
+    routing_algorithm: str = MISSING
+    router_cache_miss_fallback_algorithm: str = MISSING
+    router_hit_weight: float = 1.0
+    router_load_penalty_weight: float = 0.02
+    router_evict_buffer_size: int = 64
     dp_addresses: list[DpAddressesConfig] = MISSING
     # PD disaggregation configuration
     pd_disaggregation: PDDisaggregationConfig = field(

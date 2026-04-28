@@ -32,7 +32,15 @@ def setup_global_args():
                     "prefill_chunk_size": None,
                     "mtp_size": 1,
                     "dp_size": 1,
-                }
+                },
+                "dp_config": {
+                    "enabled": True,
+                    "router": {
+                        "pd_disaggregation": {
+                            "enabled": False,
+                        }
+                    },
+                },
             }
         ),
         need_ensure=False,
@@ -115,6 +123,24 @@ class TestPagedKVCacheManager:
         assert idx == 5
         assert 5 not in cache_manager.cached_idle_blocks
         assert runtime.cache_idx is None
+
+    def test_get_free_cache_idx_collects_evicted_blk_hash(
+        self, cache_manager: PagedKVCacheManager
+    ):
+        """测试被动逐出时会记录evicted blk hash，并可按上限批量弹出"""
+        cache_manager.free_cache_ids = deque()
+        block = TokenBlock(tokens=[1, 2, 3, 4], blk_size=4, pre_blk_hash=NONE_BLK_HASH)
+        block.generate_blk_hash()
+        block.cache_idx = 7
+        cache_manager.cached_idle_blocks[7] = block
+        cache_manager.cache_idx_to_hash[7] = block.blk_hash
+
+        idx = cache_manager.get_free_cache_idx()
+        assert idx == 7
+
+        popped = cache_manager.pop_evicted_blk_hashes(max_items=512)
+        assert popped == [block.blk_hash]
+        assert cache_manager.pop_evicted_blk_hashes(max_items=512) == []
 
     def test_identity_chain_builder(self, cache_manager: PagedKVCacheManager):
         """测试BlockIdentityChainBuilder构建逻辑"""

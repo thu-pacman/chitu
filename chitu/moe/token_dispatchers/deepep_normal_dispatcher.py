@@ -151,6 +151,10 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         )
 
         self.dispatch_ctx = (handle, recv_topk_idx, recv_topk_weights, dp_local_bs)
+        # `num_recv_tokens_per_expert_list` is host-side (std::vector<int>) with each
+        # entry already aligned to `expert_alignment=128`, so `sum()` is the exact
+        # padded row count and costs no extra device sync.
+        n_tokens_padded = sum(num_recv_tokens_per_expert_list)
         return (
             IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
                 recv_activation,
@@ -161,11 +165,11 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                     device=recv_topk_idx.device,
                 ),
                 pad_block_size=128,
+                n_tokens_padded=n_tokens_padded,
                 # NOTE on expected_n_tokens_per_expert: Recompute using info local to EP,
                 # because DP ranks may be inbalance, and cannot reflect EP reality.
                 expected_n_tokens_per_expert=ceil_div(
-                    sum(num_recv_tokens_per_expert_list),
-                    len(num_recv_tokens_per_expert_list),
+                    n_tokens_padded, len(num_recv_tokens_per_expert_list)
                 ),
                 expert_ids_are_local=True,
             ),
@@ -200,6 +204,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         )
 
         self.dispatch_ctx = (handle, recv_topk_idx, recv_topk_weights, dp_local_bs)
+        n_tokens_padded = sum(num_recv_tokens_per_expert_list)
         return (
             IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
                 activation=recv_activation,
@@ -211,11 +216,11 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                     device=recv_topk_idx.device,
                 ),
                 pad_block_size=128,
+                n_tokens_padded=n_tokens_padded,
                 # NOTE on expected_n_tokens_per_expert: Recompute using info local to EP,
                 # because DP ranks may be inbalance, and cannot reflect EP reality.
                 expected_n_tokens_per_expert=ceil_div(
-                    sum(num_recv_tokens_per_expert_list),
-                    len(num_recv_tokens_per_expert_list),
+                    n_tokens_padded, len(num_recv_tokens_per_expert_list)
                 ),
                 expert_ids_are_local=True,
             ),

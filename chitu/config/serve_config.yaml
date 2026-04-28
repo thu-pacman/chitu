@@ -373,7 +373,20 @@ dp_config:
     port: 21003              # HTTP service port
     stats_port: 29600        # ZMQ port
     token_port: 29700        # ZMQ port
-    load_balancer_algorithm: "power_of_two_choices"
+    max_inflight_per_instance: 24 # max number of inflight requests per dp instance
+    routing_algorithm: "power_of_two_choices" # option: prefix_cache_aware, power_of_two_choices, round_robin, least_loaded
+
+    # Only effective when routing_algorithm == prefix_cache_aware
+    # when router cache miss, fallback the this algorithm, option: power_of_two_choices, round_robin, least_loaded
+    router_cache_miss_fallback_algorithm: "power_of_two_choices"
+    router_hit_weight: 1.0 # The weight of the prefix cache hit block count during router routing tasks.
+    router_load_penalty_weight: 0.02 # The penalty weight of instance load during router routing tasks.
+
+    # Size of the router cache block eviction buffer (unit: blocks).
+    # The buffer temporarily holds cache blocks evicted from the router's local cache.
+    # It addresses the asynchrony in eviction timing between the router and its downstream instances.
+    router_evict_buffer_size: 64 
+
     # Scheduler zmq address, there many scheduler, use dp_id to identify the scheduler
     # dp_id = 0, scheduler_address = tcp://0.0.0.0:29610
     # dp_id = 1, scheduler_address = tcp://0.0.0.0:29611

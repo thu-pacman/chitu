@@ -267,12 +267,14 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         **kvargs,
     ):
         self.is_moe_model = str(params.name) not in [
-            "Qwen3_5-27B",
-            "Qwen3_5-27B-FP8",
-            "Qwen3_5-9B",
-            "Qwen3_5-4B",
-            "Qwen3_5-2B",
-            "Qwen3_5-0.8B",
+            "Qwen3.5-27B",
+            "Qwen3.6-27B",
+            "Qwen3.5-27B-FP8",
+            "Qwen3.6-27B-FP8",
+            "Qwen3.5-9B",
+            "Qwen3.5-4B",
+            "Qwen3.5-2B",
+            "Qwen3.5-0.8B",
         ]
         self.is_fp8_model = str(params.name).endswith("FP8")
 

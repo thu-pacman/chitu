@@ -92,7 +92,7 @@ def format_observed_op_impl_summary_lines(pretty: bool = True) -> list[str]:
 
     table = []
     for op_name, avail_map, selected_impls in observed_states:
-        impl_names = list(avail_map)
+        impl_names = sorted(list(avail_map))
         for impl_name in selected_impls:
             if impl_name not in avail_map:
                 impl_names.append(impl_name)
@@ -141,6 +141,9 @@ def emit_observed_op_impl_summary(target_logger=None) -> bool:
     )
     for line in lines:
         target_logger.info(line)
+    target_logger.info(
+        "Set CHITU_LOGGING_LEVEL=chitu.ops:DEBUG for dispatchment details"
+    )
     return True
 
 
@@ -213,6 +216,11 @@ def make_op_dispatcher(
                     impl = auto_resolver(*args, **fwd)
                 else:
                     impl = auto_resolver(**fwd)
+            else:
+                logger.debug_once(
+                    f"Dispatched `{dispatch_name}` to `{impl}` as per caller request "
+                    f"(set CHITU_LOG_STACK_TRACE=1 for call site)"
+                )
 
             if impl not in handlers:
                 raise NotImplementedError(
@@ -301,8 +309,33 @@ def make_op_dispatcher(
 
         def register_auto(auto_func: Callable):
             nonlocal auto_resolver, _auto_pass_args, _auto_kw_filter
-            auto_resolver = auto_func
             sig = inspect.signature(auto_func)
+
+            @functools.wraps(auto_func)
+            def auto_resolver(*args, **kwargs):
+                bound = sig.bind(*args, **kwargs)
+                bound.apply_defaults()
+
+                impl = auto_func(*args, **kwargs)
+
+                arg_logs = []
+                for name, value in bound.arguments.items():
+                    if isinstance(value, (int, float, str)):
+                        arg_logs.append(f"{name} = {value}")
+                    elif isinstance(value, torch.Tensor):
+                        arg_logs.append(
+                            f"{name} = tensor of dtype {value.dtype} shape {tuple(value.shape)} stride {tuple(value.stride())}"
+                        )
+                    else:
+                        arg_logs.append(f"{name} = {type(value)}")
+                msg = f"Dispatched `{dispatch_name}` to `{impl}`"
+                if len(arg_logs) > 0:
+                    msg += f" with args: {', '.join(arg_logs)}"
+                msg += ". (set CHITU_LOG_STACK_TRACE=1 for call site)"
+                logger.debug_once(msg)
+
+                return impl
+
             params = sig.parameters
             _auto_pass_args = any(
                 p.kind

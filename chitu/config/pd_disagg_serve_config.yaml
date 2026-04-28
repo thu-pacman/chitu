@@ -26,7 +26,12 @@ dp_config:
     port: 21003
     stats_port: 29600
     token_port: 29700
-    load_balancer_algorithm: "power_of_two_choices"
+    max_inflight_per_instance: 24 # max number of inflight requests per dp instance
+    routing_algorithm: "power_of_two_choices"
+    router_cache_miss_fallback_algorithm: "power_of_two_choices"
+    router_hit_weight: 1.0 # The weight of the prefix cache hit block count during router routing tasks.
+    router_load_penalty_weight: 0.02 # The penalty weight of instance load during router routing tasks.
+    router_evict_buffer_size: 64 
 
     # PD 分离配置（协调/元数据同步、RDMA 后端与 Bootstrap）
     pd_disaggregation:

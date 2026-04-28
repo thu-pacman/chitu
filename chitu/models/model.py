@@ -1515,7 +1515,8 @@ class Transformer(nn.Module):
         if isinstance(self.cache_dict["main"], DenseKVCache):
             key = (batch_size, self.cache_dict["main"].get_start_and_end_idx()[0])
         elif isinstance(self.cache_dict["main"], PagedKVCache):
-            key = (batch_size,)
+            # get_global_args().infer.num_blocks is in key to re-trace after warming-up
+            key = (batch_size, get_global_args().infer.num_blocks)
         else:
             assert False
 
@@ -1526,16 +1527,6 @@ class Transformer(nn.Module):
             self.prepare_decoding_attn()
 
         infer_args = get_global_args().infer
-        current_cuda_graph_enabled = self.use_cuda_graph and (
-            infer_args.cache_type != "paged" or infer_args.num_blocks != -1
-        )
-
-        if (
-            hasattr(self, "_last_cuda_graph_enabled")
-            and self._last_cuda_graph_enabled != current_cuda_graph_enabled
-        ):
-            self.do_decode_callable = None
-        self._last_cuda_graph_enabled = current_cuda_graph_enabled
 
         extra_inputs, extra_inputs_max_nelem = self._decode_graph_extra_inputs(
             tokens, batch_size
@@ -1590,7 +1581,7 @@ class Transformer(nn.Module):
                 output_max_nelem_callback=output_max_nelem_callback,
                 before_capture_callback=lambda: self.prepare_decoding_attn(),
                 before_replay_callback=before_replay_callback,
-                enable=current_cuda_graph_enabled,
+                enable=self.use_cuda_graph,
             )
             def do_decode(tokens, *extra_inputs):
                 freqs_cis = self._prepare_freqs_cis_for_decode(*extra_inputs)
@@ -1609,7 +1600,7 @@ class Transformer(nn.Module):
                     output_max_nelem_callback=output_max_nelem_callback,
                     before_capture_callback=lambda: self.prepare_decoding_attn_mtp(),
                     before_replay_callback=before_replay_callback,
-                    enable=current_cuda_graph_enabled,
+                    enable=self.use_cuda_graph,
                 )
                 def do_decode_mtp(tokens, *extra_inputs_mtp):
                     freqs_cis = self._prepare_freqs_cis_for_decode_mtp(
@@ -1626,7 +1617,7 @@ class Transformer(nn.Module):
                     kwargs_max_nelem={},
                     output_max_nelem_callback=lambda key, n: 1,
                     before_replay_callback=None,
-                    enable=current_cuda_graph_enabled,
+                    enable=self.use_cuda_graph,
                 )
                 def do_empty_decode():
                     return self.empty_decode()
@@ -1640,7 +1631,7 @@ class Transformer(nn.Module):
                         kwargs_max_nelem={},
                         output_max_nelem_callback=lambda key, n: 1,
                         before_replay_callback=None,
-                        enable=current_cuda_graph_enabled,
+                        enable=self.use_cuda_graph,
                     )
                     def do_empty_decode_mtp():
                         return self.empty_mtp_decode()
