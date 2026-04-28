@@ -58,8 +58,15 @@ def batched_routed_activation_indexed_to_expert_block_indexed_stage1(
     for i in range(tokens_per_thread):
         if start_idx + i < numel:
             idx = tl.load(topk_ids_ptr + start_idx + i)
-            token_cnt = tl.load(tokens_cnts_ptr + off_c + idx)
-            tl.store(tokens_cnts_ptr + off_c + idx, token_cnt + 1)
+            # Skip sentinel markers (e.g. -1 for invalid tokens from DeepEP,
+            # or num_experts for tokens routed outside the local EP window).
+            # Without this guard, negative values turn the loads/stores below
+            # into a read/write one int32 before `tokens_cnts`'s base, which
+            # on strict-VM-fault devices (Hygon HCU / ROCm) hits an unmapped
+            # page and triggers an HSA VMFault.
+            if 0 <= idx and idx < num_experts:
+                token_cnt = tl.load(tokens_cnts_ptr + off_c + idx)
+                tl.store(tokens_cnts_ptr + off_c + idx, token_cnt + 1)
 
 
 @triton.jit
@@ -117,10 +124,17 @@ def batched_routed_activation_indexed_to_expert_block_indexed_stage4(
 
     for i in range(start_idx, tl.minimum(start_idx + tokens_per_thread, numel)):
         expert_id = tl.load(topk_ids_ptr + i)
-        token_cnt = tl.load(tokens_cnts_ptr + off_t + expert_id)
-        rank_post_pad = token_cnt + tl.load(cumsum_ptr + expert_id)
-        tl.store(sorted_token_ids_ptr + rank_post_pad, i)
-        tl.store(tokens_cnts_ptr + off_t + expert_id, token_cnt + 1)
+        # Same guard as stage1: skip sentinel markers. Without it,
+        # `tl.load(cumsum_ptr + expert_id)` with `expert_id == -1` reads one
+        # int32 before the base of `cumsum_buffer`, which the ROCm caching
+        # allocator frequently places on a 4KB page boundary -- the previous
+        # page is unmapped, so the HCU raises an HSA VMFault at the address
+        # ending in `...000`.
+        if 0 <= expert_id and expert_id < num_experts:
+            token_cnt = tl.load(tokens_cnts_ptr + off_t + expert_id)
+            rank_post_pad = token_cnt + tl.load(cumsum_ptr + expert_id)
+            tl.store(sorted_token_ids_ptr + rank_post_pad, i)
+            tl.store(tokens_cnts_ptr + off_t + expert_id, token_cnt + 1)
 
 
 def batched_routed_activation_indexed_to_expert_block_indexed_triton_detail(

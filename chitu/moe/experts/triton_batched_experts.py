@@ -298,6 +298,7 @@ def batched_triton_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    use_i64_expert_offset: tl.constexpr,
 ):
     expert_id = tl.program_id(axis=0)
     e_num_tokens = tl.load(expert_num_tokens + expert_id)
@@ -320,6 +321,14 @@ def batched_triton_kernel(
 
     cta_m_size = min(BLOCK_M, e_num_tokens - cta_m_start)
     cta_n_size = min(BLOCK_N, N - cta_n_start)
+
+    # Promote per-expert strides to int64 to avoid int32 overflow when
+    # expert_id * stride_?e exceeds INT32_MAX (e.g. B with 4096*6144 = 25M
+    # elements per expert, 128 experts => ~3.2G > 2.1G int32 cap).
+    if use_i64_expert_offset:
+        stride_ae = tl.cast(stride_ae, tl.int64)
+        stride_be = tl.cast(stride_be, tl.int64)
+        stride_ce = tl.cast(stride_ce, tl.int64)
 
     a_ptr = a_ptr + expert_id * stride_ae + cta_m_start * stride_am
     b_ptr = b_ptr + expert_id * stride_be + cta_n_start * stride_bn
@@ -450,6 +459,14 @@ def invoke_moe_batched_triton_kernel(
         stride_ase = 0
         stride_asm = 0
         stride_ask = 0
+    use_i64_expert_offset = False
+    expert_num = expert_num_tokens.size(0)
+    if (
+        (expert_num - 1) * A.stride(0) > 2**31 - 1
+        or (expert_num - 1) * B.stride(0) > 2**31 - 1
+        or (expert_num - 1) * C.stride(0) > 2**31 - 1
+    ):
+        use_i64_expert_offset = True
 
     batched_triton_kernel[grid](
         A,
@@ -492,6 +509,7 @@ def invoke_moe_batched_triton_kernel(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        use_i64_expert_offset=use_i64_expert_offset,
     )
 
 

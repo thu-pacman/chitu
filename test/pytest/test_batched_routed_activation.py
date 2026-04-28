@@ -127,9 +127,24 @@ def _assert_blockfp8_expert_block_permuted_matches(
 @pytest.mark.parametrize("num_tokens", [0, 64, 4096])
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
+@pytest.mark.parametrize(
+    "invalid_marker",
+    [
+        pytest.param(-1, id="neg1"),
+        pytest.param("num_experts", id="Emark"),
+    ],
+)
+@pytest.mark.parametrize("invalid_rate", [0.0, 0.2])
 @pytest.mark.parametrize("impl", ["triton", "cuda", "muxi"])
 def test_batched_routed_activation_indexed_to_expert_block_indexed(
-    num_experts, block_size, num_tokens, topk, distribution, impl
+    num_experts,
+    block_size,
+    num_tokens,
+    topk,
+    distribution,
+    invalid_marker,
+    invalid_rate,
+    impl,
 ):
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
@@ -143,6 +158,27 @@ def test_batched_routed_activation_indexed_to_expert_block_indexed(
     token_to_expert_indices = gen_token_to_expert_indices(
         num_tokens, num_experts, topk, distribution
     )
+
+    # Reproducer for the VMFault seen in the distributed MoE block test on Hygon
+    # HCU. The real caller (`as_local_expert_ids` / `convert_from`) injects sentinel
+    # values into `token_to_expert_indices` -- `-1` for an invalid token, and
+    # `num_experts` for a token whose expert is not on the local EP rank. The
+    # triton `batched_routed_activation_indexed_to_expert_block_indexed` kernel
+    # does not guard its `tl.load`s against these, and on strict-VM-fault devices
+    # the negative sentinel turns `tl.load(cumsum_ptr + expert_id)` into a read
+    # one int32 before the base of `cumsum_buffer`, which the HCU/ROCm caching
+    # allocator frequently places on a 4KB page boundary.
+    marker_value = (
+        num_experts if invalid_marker == "num_experts" else int(invalid_marker)
+    )
+    if impl == "triton" and invalid_rate > 0 and marker_value == -1:
+        invalid_mask = torch.rand((num_tokens, topk), device="cuda") < invalid_rate
+        token_to_expert_indices = torch.where(
+            invalid_mask,
+            torch.full_like(token_to_expert_indices, marker_value),
+            token_to_expert_indices,
+        )
+
     block_to_token_x_topk_indices, block_to_expert_indices, n_blocks_scalar_tensor = (
         batched_routed_activation_indexed_to_expert_block_indexed(
             token_to_expert_indices,
@@ -152,8 +188,13 @@ def test_batched_routed_activation_indexed_to_expert_block_indexed(
         )
     )
 
-    # For each selected expert, find blocks that map to this expert
-    for expert_id in torch.unique(token_to_expert_indices):
+    # For each selected expert, find blocks that map to this expert.
+    # Skip sentinel values (e.g. -1 or num_experts): they are not assigned
+    # blocks in block_to_expert_indices, so there is nothing to cat/compare.
+    for expert_id_tensor in torch.unique(token_to_expert_indices):
+        expert_id = int(expert_id_tensor)
+        if expert_id < 0 or expert_id >= num_experts:
+            continue
         block_indices = torch.nonzero(
             block_to_expert_indices[:n_blocks_scalar_tensor] == expert_id
         )
