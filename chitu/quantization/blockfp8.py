@@ -358,56 +358,43 @@ def fused_experts_sum_blockfp8_indexed(
 
 
 @fused_experts_sum_blockfp8_indexed.register_auto
-def _auto_fused_experts_sum_blockfp8_indexed():
-    if has_triton:
-        return "triton"
-    if has_deep_gemm:
-        return "deepgemm"
-    raise NotImplementedError
-
-
-def _resolve_indexed_blockfp8_impl(
-    routed_x: IndexedBatchedRoutedActivation, impl: str, *, soft_fp8: bool = False
+def _auto_fused_experts_sum_blockfp8_indexed(
+    hidden_states,
+    w1,
+    w2,
+    topk_weights: Optional[torch.Tensor],
+    *,
+    inplace: bool = False,
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    round_scale_to_pow2: bool = False,
+    global_num_experts: int = -1,
+    experts_start_idx: int = 0,
+    impl: str,
 ) -> str:
     if impl != "auto":
         return impl
-    if soft_fp8:
+
+    # Soft FP8
+    if parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize > 1:
         return "triton"
-    # DeepEP prefill may produce indexed inputs with padded per-expert counts.
-    # These paths should go through deepgemm contiguous kernels instead of Triton.
-    if isinstance(
-        routed_x,
-        (
-            IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
-            IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
-        ),
-    ):
+
+    if not is_warming_up_or_cuda_graph_capture():
+        # Prefill (no CUDA graph warmup/capture phase) prefers deepgemm contiguous
         if has_deep_gemm:
             return "deepgemm"
-    # For blockfp8 indexed input:
-    # - prefill prefers deepgemm contiguous
-    # - decode (CUDA graph warmup/capture phase) prefers triton
-    if isinstance(routed_x, IndexedBatchedRoutedActivationBlockfp8):
-        if is_warming_up_or_cuda_graph_capture():
-            if has_triton:
-                return "triton"
-        else:
-            if has_deep_gemm:
-                return "deepgemm"
-    # For non-blockfp8 indexed input:
-    # - prefill prefers deepgemm contiguous
-    # - decode (CUDA graph warmup/capture phase) prefers triton
-    if isinstance(routed_x, IndexedBatchedRoutedActivation):
-        if is_warming_up_or_cuda_graph_capture():
-            if has_triton:
-                return "triton"
-        else:
-            if has_deep_gemm:
-                return "deepgemm"
-    if has_triton:
-        return "triton"
-    if has_deep_gemm:
-        return "deepgemm"
+        elif has_triton:
+            return "triton"
+    else:
+        # Decode (CUDA graph warmup/capture phase) prefers triton
+        if has_triton:
+            return "triton"
+        elif has_deep_gemm:
+            return "deepgemm"
+
     raise NotImplementedError("No available implementation for indexed blockfp8 MoE")
 
 
@@ -821,23 +808,6 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             )
         return None
 
-    def _log_resolved_impl_once(
-        self,
-        *,
-        routed_x: BatchedRoutedActivation,
-        requested_impl: str,
-        resolved_impl: str,
-    ) -> None:
-        logger.info_once(
-            "MoE impl resolved: checkpoint_prefix=%s routed_x=%s requested_impl=%s resolved_impl=%s experts=[%d,%d) (set CHITU_LOG_STACK_TRACE=1 for call site)",
-            self.checkpoint_prefix,
-            type(routed_x).__name__,
-            requested_impl,
-            resolved_impl,
-            self.experts_start_idx,
-            self.experts_end_idx,
-        )
-
     @forward_no_sum.register
     def _(
         self, routed_x: IndexedBatchedRoutedActivation, impl: str = "auto"
@@ -853,13 +823,6 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             fused_soft_fp8,
             _,
         ) = resolved
-        requested_impl = impl
-        impl = _resolve_indexed_blockfp8_impl(routed_x, impl, soft_fp8=fused_soft_fp8)
-        self._log_resolved_impl_once(
-            routed_x=routed_x,
-            requested_impl=requested_impl,
-            resolved_impl=impl,
-        )
         return fused_experts_no_sum_blockfp8_indexed(
             routed_x,
             w1=gate_up_proj_weight,
@@ -901,11 +864,6 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             fused_soft_fp8,
             _,
         ) = resolved
-        self._log_resolved_impl_once(
-            routed_x=routed_x,
-            requested_impl=requested_impl,
-            resolved_impl=impl,
-        )
         return fused_experts_no_sum_blockfp8_per_expert_dense(
             routed_x,
             w1=gate_up_proj_weight,
@@ -949,13 +907,6 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             fused_soft_fp8,
             _,
         ) = resolved
-        requested_impl = impl
-        impl = _resolve_indexed_blockfp8_impl(routed_x, impl, soft_fp8=fused_soft_fp8)
-        self._log_resolved_impl_once(
-            routed_x=routed_x,
-            requested_impl=requested_impl,
-            resolved_impl=impl,
-        )
         return fused_experts_sum_blockfp8_indexed(
             routed_x,
             w1=gate_up_proj_weight,
@@ -999,11 +950,6 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             _,
             _,
         ) = resolved
-        self._log_resolved_impl_once(
-            routed_x=routed_x,
-            requested_impl=requested_impl,
-            resolved_impl=impl,
-        )
         return fused_experts_sum_blockfp8_per_expert_dense(
             routed_x,
             w1=gate_up_proj_weight,

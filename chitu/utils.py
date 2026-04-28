@@ -57,10 +57,12 @@ def get_chitu_bool_env(
     else:
         default_str = None
     str_val = get_chitu_env(name, default_str, legacy_names=legacy_names)
-    if str_val is None:
-        return None
+    if str_val is not None and str_val.lower() in {"1", "true", "yes", "on"}:
+        return True
+    elif str_val is not None and str_val.lower() in {"0", "false", "no", "off"}:
+        return False
     else:
-        return str_val.lower() in {"1", "true", "yes", "on"}
+        return None
 
 
 _regex_special_chars = set(".^$*+?{}[]|()")

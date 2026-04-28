@@ -52,7 +52,7 @@ def test_make_op_dispatcher_tracks_selected_and_available_impls():
         fused_op(5, impl="torch_npu")
 
     assert format_observed_op_impl_summary_lines(pretty=False) == [
-        "fused_op | torch ✓ | triton ✓ | cuda · | torch_npu ×"
+        "fused_op | cuda · | torch ✓ | torch_npu × | triton ✓"
     ]
 
 
@@ -76,7 +76,11 @@ def test_emit_observed_op_impl_summary_logs_once(caplog):
         assert emit_observed_op_impl_summary(target_logger=test_logger) is True
         assert emit_observed_op_impl_summary(target_logger=test_logger) is False
 
-    assert caplog.messages[1:] == ["op | torch ✓"]
+    caplog.messages[:-1] == [
+        "Dispatched `op` to `torch`. (set CHITU_LOG_STACK_TRACE=1 for call site)",
+        "Operator implementations used during warmup (✓ = used at least once; · = not used; × = not installed):"
+        "op | torch ✓",
+    ]
 
 
 def test_make_op_dispatcher_supports_custom_op_name():
