@@ -5,6 +5,17 @@ log_user 1
 exp_internal 0
 set timeout -1
 
+proc read_file {path} {
+    if {$path eq "" || ![file exists $path] || ![file isfile $path]} {
+        return ""
+    }
+    set size [file size $path]
+    set fh [open $path r]
+    set data [read $fh]
+    close $fh
+    return $data
+}
+
 proc read_tail {path max_bytes} {
     if {$path eq "" || ![file exists $path] || ![file isfile $path]} {
         return ""
@@ -24,7 +35,7 @@ proc file_contains {path needle} {
     if {$path eq "" || ![file exists $path] || ![file isfile $path]} {
         return 0
     }
-    set data [read_tail $path 20000]
+    set data [read_file $path]
     if {[string first $needle $data] >= 0} {
         return 1
     }
@@ -43,7 +54,7 @@ proc file_has_error {path} {
     if {$path eq "" || ![file exists $path] || ![file isfile $path]} {
         return 0
     }
-    set data [read_tail $path 20000]
+    set data [read_file $path]
     # Chitu log format: "LEVEL MM-DD HH:MM:SS ..." with optional ANSI color prefix
     if {[regexp -line {^(?:\x1b\[[0-9;]*m)*(?:ERROR|CRITICAL) \d{2}-\d{2} \d{2}:\d{2}:\d{2}} $data]} {
         return 1
@@ -188,7 +199,7 @@ proc extract_router {path} {
     if {![file exists $path]} {
         return ""
     }
-    set data [read_tail $path 20000]
+    set data [read_file $path]
     if {[regexp {ROUTER: ([0-9\.]+):([0-9]+)} $data -> ip port]} {
         return [list $ip $port]
     }
@@ -199,7 +210,7 @@ proc extract_job_id {path} {
     if {![file exists $path]} {
         return ""
     }
-    set data [read_tail $path 20000]
+    set data [read_file $path]
     if {[regexp {srun: job ([0-9]+)} $data -> job_id]} {
         return $job_id
     }
@@ -338,7 +349,7 @@ while {1} {
     update_slurm_job_id
     ensure_process_alive "waiting for srun start"
     ensure_no_startup_error "waiting for srun start"
-    set data [read_tail $srun_out 20000]
+    set data [read_file $srun_out]
     if {[regexp {srun: job .* has been allocated resources} $data]} {
         puts "srun allocated resources."
         break
@@ -378,7 +389,7 @@ while {$router_ip eq ""} {
     }
     if {[expr {[clock seconds] - $start}] > $router_timeout} {
         puts "ERROR: timeout waiting for router info"
-        puts [read_tail $srun_out -1]
+        puts [read_file $srun_out]
         exit 1
     }
     sleep 1

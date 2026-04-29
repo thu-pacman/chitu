@@ -4,6 +4,7 @@
 
 from typing import Callable, Sequence, Mapping, Any, Optional
 import functools
+import gc
 import torch
 
 from chitu.static_tensor import StaticTensor
@@ -148,6 +149,7 @@ def make_dispatched_graphed_callables(
 
                 # Capture the graph
                 graph_dict[key] = torch.cuda.CUDAGraph()
+                gc.disable()  # Disable GC to prevent mid-capture tensor destruction
                 try:
                     _currently_capturing_graph_object = graph_dict[key]
                     if is_ascend():
@@ -185,6 +187,8 @@ def make_dispatched_graphed_callables(
                             output_static_tensor.set(output)
                 finally:
                     _currently_capturing_graph_object = None
+                    gc.enable()  # Always re-enable GC
+                    gc.collect()  # Clean up anything that was delayed
                 if cuda_graph_pool is None:
                     cuda_graph_pool = graph_dict[key].pool()
 
