@@ -48,15 +48,18 @@ def get_extensions():
 
     muxi_build = os.environ.get("CHITU_MUXI_BUILD", "0").strip()
     ascend_build = os.environ.get("CHITU_ASCEND_BUILD", "0").strip()
+    hygon_build = os.environ.get("CHITU_HYGON_BUILD", "0").strip()
     torch_cuda_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
 
     enable_nvfp4 = os.environ.get("ENABLE_NVFP4", "0") == "1"
     enable_marlin = False
-    if muxi_build == "0":
+    if (hygon_build == "0") and (muxi_build == "0"):
         for arch in torch_cuda_arch_list.split():
             if arch.startswith("8.") or arch.startswith("9."):
                 enable_marlin = True
-    enable_custom_all_reduce = (muxi_build == "0") and (ascend_build == "0")
+    enable_custom_all_reduce = (
+        (hygon_build == "0") and (muxi_build == "0") and (ascend_build == "0")
+    )
 
     if enable_nvfp4:
         cutlass_path = os.path.join(this_dir, "../third_party/cutlass")
@@ -92,30 +95,40 @@ def get_extensions():
             os.path.join(this_dir, "cuda/allreduce/vllm_custom_all_reduce.cu"),
         ]
 
+    base_sources = [
+        os.path.join(this_dir, "cuda/binding.cpp"),
+        os.path.join(this_dir, "cuda/moe/moe_align_kernel.cu"),
+        os.path.join(this_dir, "cuda/moe/fused_shared_experts_kernel.cu"),
+        os.path.join(this_dir, "cuda/moe/group_topk.cu"),
+        os.path.join(this_dir, "cuda/moe/vllm_topk_softmax.cu"),
+        os.path.join(this_dir, "cuda/rotary/rotary_pos_emb_llama.cu"),
+        os.path.join(this_dir, "cuda/topk/topk.cu"),
+        os.path.join(this_dir, "cuda/norm/rms_norm.cu"),
+        os.path.join(this_dir, "cuda/frequency_penalty/frequency_penalty.cu"),
+        os.path.join(this_dir, "cuda/response_append/response_append.cu"),
+        os.path.join(this_dir, "cuda/weight_layout/weight_layout_change.cu"),
+        os.path.join(this_dir, "cuda/dequant/dequant.cu"),
+    ]
+    if hygon_build == "0":
+        base_sources.append(
+            os.path.join(this_dir, "cuda/gemm/w4a8_per_group_gemm_cuda.cu")
+        )
+
+    if hygon_build == "1":
+        cxx_extra_args += ["-DCHITU_HYGON_BUILD=1"]
+        nvcc_extra_args += ["-DCHITU_HYGON_BUILD=1"]
+
+    extra_link_args = [] if hygon_build == "1" else ["-lcuda"]
+
     return [
         CUDAExtension(
             name="chitu_backend",
-            sources=[
-                os.path.join(this_dir, "cuda/binding.cpp"),
-                os.path.join(this_dir, "cuda/moe/moe_align_kernel.cu"),
-                os.path.join(this_dir, "cuda/moe/fused_shared_experts_kernel.cu"),
-                os.path.join(this_dir, "cuda/moe/group_topk.cu"),
-                os.path.join(this_dir, "cuda/moe/vllm_topk_softmax.cu"),
-                os.path.join(this_dir, "cuda/rotary/rotary_pos_emb_llama.cu"),
-                os.path.join(this_dir, "cuda/topk/topk.cu"),
-                os.path.join(this_dir, "cuda/norm/rms_norm.cu"),
-                os.path.join(this_dir, "cuda/frequency_penalty/frequency_penalty.cu"),
-                os.path.join(this_dir, "cuda/response_append/response_append.cu"),
-                os.path.join(this_dir, "cuda/weight_layout/weight_layout_change.cu"),
-                os.path.join(this_dir, "cuda/dequant/dequant.cu"),
-                os.path.join(this_dir, "cuda/gemm/w4a8_per_group_gemm_cuda.cu"),
-            ]
-            + extra_sources,
+            sources=base_sources + extra_sources,
             extra_compile_args={
                 "cxx": ["-std=c++17"] + cxx_extra_args,
                 "nvcc": ["-std=c++17"] + nvcc_extra_args,
             },
-            extra_link_args=["-lcuda"],
+            extra_link_args=extra_link_args,
             define_macros=[
                 ("CHITU_MUXI_BUILD", os.environ.get("CHITU_MUXI_BUILD", "0")),
             ],

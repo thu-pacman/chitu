@@ -60,13 +60,14 @@ count_and_sort_expert_tokens_kernel(const scalar_t *__restrict__ topk_ids,
 }
 
 template <typename scalar_t>
-__global__ void
-batched_routed_activation_indexed_to_expert_block_indexed_kernel(
-    const scalar_t *__restrict__ topk_ids,
-    int32_t *__restrict__ sorted_token_ids, int32_t *__restrict__ expert_ids,
-    int32_t *__restrict__ total_blocks_post_pad, int32_t num_experts,
-    int32_t padded_num_experts, int32_t experts_per_warp, int32_t block_size,
-    size_t numel, int32_t *__restrict__ cumsum) {
+__launch_bounds__(1024) __global__
+    void batched_routed_activation_indexed_to_expert_block_indexed_kernel(
+        const scalar_t *__restrict__ topk_ids,
+        int32_t *__restrict__ sorted_token_ids,
+        int32_t *__restrict__ expert_ids,
+        int32_t *__restrict__ total_blocks_post_pad, int32_t num_experts,
+        int32_t padded_num_experts, int32_t experts_per_warp,
+        int32_t block_size, size_t numel, int32_t *__restrict__ cumsum) {
     extern __shared__ int32_t shared_counts[];
     __shared__ int32_t shared_data[2048];
     int tid = threadIdx.x;

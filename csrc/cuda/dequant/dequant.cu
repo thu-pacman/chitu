@@ -14,12 +14,11 @@
 
 #include <c10/cuda/CUDAGuard.h>
 #include <cstdint>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
 #include <torch/extension.h>
 #include <torch/library.h>
 #include <torch/torch.h>
+
+#include "platform.h"
 
 __global__ void dequantize_q8_0_fp32_kernel(const int8_t *data, float *output,
                                             const int blk_size,

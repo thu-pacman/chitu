@@ -8,9 +8,6 @@
 #include <cub/cub.cuh>
 #include <cub/util_type.cuh>
 
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-
 #include "common.h"
 #include "moe_kernel.h"
 
@@ -18,7 +15,12 @@ namespace chitu {
 
 // FIXME: set it as a template parameter according to the device
 #define WARP_SIZE 32
+// HIP requires 64-bit mask for shuffle operations
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+#define WARP_SHFL_MASK 0xffffffffffffffffULL
+#else
 #define WARP_SHFL_MASK 0xffffffff
+#endif
 
 template <typename T,
           /// Number of elements in the array
@@ -34,8 +36,11 @@ template <typename T, int EXPERTS, int BYTES_PER_LDG> struct TopkConstants {
     static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 ||
                       EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0,
                   "");
+    // Use ternary instead of std::max for HIP constexpr compatibility
     static constexpr int VECs_PER_THREAD =
-        std::max(1, EXPERTS / (ELTS_PER_LDG * WARP_SIZE));
+        (EXPERTS / (ELTS_PER_LDG * WARP_SIZE) > 0)
+            ? (EXPERTS / (ELTS_PER_LDG * WARP_SIZE))
+            : 1;
     static constexpr int VPT = VECs_PER_THREAD * ELTS_PER_LDG;
     static constexpr int THREADS_PER_ROW = EXPERTS / VPT;
     //   static const int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
@@ -65,8 +70,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     const int warpBaseRow = blockBaseRow + threadIdx.y * ROWS_PER_WARP;
     const int threadRow = warpBaseRow + threadIdx.x / THREADS_PER_ROW;
 
-    if (threadRow >= batchSize)
-        return;
+    // On HIP platform, all threads in wavefront must participate in shuffle
+    // ops. Invalid threads will contribute zeros and skip writing results.
+    const bool isValidThread = (threadRow < batchSize);
 
     // ===== compute self data ptr. =====
     const T *threadInputPtr = input + threadRow * NUM_EXPERTS;
@@ -87,10 +93,17 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     INT4 *expertIdsOutputPtr =
         reinterpret_cast<INT4 *>(expertsIds + threadRow * topK);
 
+    // Invalid threads load zeros to participate in shuffle ops without
+    // affecting results
 #pragma unroll
-    for (int i = 0; i < LDG_PER_THREAD; ++i) {
-        // row_chunk_vec_ptr[i] = vec_thread_read_ptr[i * THREADS_PER_ROW];
-        row_chunk_vec_ptr[i] = vec_thread_read_ptr[i];
+    for (int i = 0; i < VPT; ++i) {
+        row_chunk[i] = to_scalar<T>(0.0f);
+    }
+    if (isValidThread) {
+#pragma unroll
+        for (int i = 0; i < LDG_PER_THREAD; ++i) {
+            row_chunk_vec_ptr[i] = vec_thread_read_ptr[i];
+        }
     }
 
     // ===== compute sigmoid values =====
@@ -103,25 +116,30 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     // Declare row_chunk_bias_original with the appropriate type based on
     // whether bias is null
     BIAS_T row_chunk_bias_original[VPT];
-    // T row_chunk_bias[VPT];
-    if (bias != nullptr) {
-        // const T *threadBiasPtr = bias + threadRow * NUM_EXPERTS;
-        const BIAS_T *biasReadPtr = bias + firstEleReadByThread;
-        const AccessTypeBias *bias_vec_ptr =
-            reinterpret_cast<const AccessTypeBias *>(biasReadPtr);
-        AccessTypeBias *row_chunk_bias_vec_ptr =
-            reinterpret_cast<AccessTypeBias *>(row_chunk_bias_original);
-        for (int i = 0; i < LDG_PER_THREAD_BIAS; ++i) {
-            row_chunk_bias_vec_ptr[i] = bias_vec_ptr[i];
-        }
-        for (int i = 0; i < VPT; ++i) {
-            row_chunk_bias_original[i] = to_scalar<BIAS_T>(add(
-                to_float(row_chunk[i]), to_float(row_chunk_bias_original[i])));
-            // row_chunk_bias[i] = to_scalar<T>(row_chunk_bias_original[i]);
-        }
-    } else {
-        for (int i = 0; i < VPT; ++i) {
-            row_chunk_bias_original[i] = to_scalar<BIAS_T>(row_chunk[i]);
+    // Invalid threads initialize to zero
+#pragma unroll
+    for (int i = 0; i < VPT; ++i) {
+        row_chunk_bias_original[i] = to_scalar<BIAS_T>(0.0f);
+    }
+    if (isValidThread) {
+        if (bias != nullptr) {
+            const BIAS_T *biasReadPtr = bias + firstEleReadByThread;
+            const AccessTypeBias *bias_vec_ptr =
+                reinterpret_cast<const AccessTypeBias *>(biasReadPtr);
+            AccessTypeBias *row_chunk_bias_vec_ptr =
+                reinterpret_cast<AccessTypeBias *>(row_chunk_bias_original);
+            for (int i = 0; i < LDG_PER_THREAD_BIAS; ++i) {
+                row_chunk_bias_vec_ptr[i] = bias_vec_ptr[i];
+            }
+            for (int i = 0; i < VPT; ++i) {
+                row_chunk_bias_original[i] = to_scalar<BIAS_T>(
+                    add(to_float(row_chunk[i]),
+                        to_float(row_chunk_bias_original[i])));
+            }
+        } else {
+            for (int i = 0; i < VPT; ++i) {
+                row_chunk_bias_original[i] = to_scalar<BIAS_T>(row_chunk[i]);
+            }
         }
     }
 
@@ -286,7 +304,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     // This is a simple sorting algorithm, but it should work well for our case.
     // A more efficient sorting algorithm may be needed if the dataset is very
     // large.
-    if (threadIdInGroup == 0) {
+    if (threadIdInGroup == 0 && isValidThread) {
         int index_t = 0, int_t = 0;
         int output_offset = threadRow * topK;
         for (index_t = 0; index_t < topK / ELTS_PER_LDG; ++index_t) {

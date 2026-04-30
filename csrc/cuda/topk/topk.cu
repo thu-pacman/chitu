@@ -17,9 +17,6 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
-#include <cuda.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -464,14 +461,24 @@ auto get_params(const at::Tensor &score,
 }
 
 template <auto *f, size_t max_dynamic_smem> void setup_kernel_smem_once() {
-    [[maybe_unused]]
-    static const auto result = [] {
-        // CUDA: keep original behavior (no cast needed).
+    [[maybe_unused]] static const auto result = [] {
+    // HIP requires explicit cast to void* for function pointer
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        return ::hipFuncSetAttribute(
+            reinterpret_cast<const void *>(f),
+            ::hipFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
+#else
         return ::cudaFuncSetAttribute(
             f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
+#endif
     }();
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    TORCH_CHECK(result == hipSuccess,
+                "set_up_kernel_once failed:", ::hipGetErrorString(result));
+#else
     TORCH_CHECK(result == cudaSuccess,
                 "set_up_kernel_once failed:", ::cudaGetErrorString(result));
+#endif
 }
 
 } // namespace

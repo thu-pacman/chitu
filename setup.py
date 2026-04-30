@@ -42,7 +42,6 @@ except Exception as e:
 
 if (
     os.environ.get("CHITU_ASCEND_BUILD", "0") == "1"
-    or os.environ.get("CHITU_HYGON_BUILD", "0") == "1"
     or os.environ.get("CHITU_MOORE_BUILD", "0") == "1"
 ):
     ext_modules = []

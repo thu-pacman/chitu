@@ -8,14 +8,20 @@
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#include "common/platform.h"
+
+#if !defined(CHITU_HYGON_BUILD) || CHITU_HYGON_BUILD != 1
 #include "allreduce/custom_all_reduce.h"
+#endif
 #include "dequant/ops.h"
 #include "frequency_penalty/frequency_penalty.h"
-#include "gemm/w4a8_per_group_gemm_cuda.h"
 #include "hard_fp4/nvfp4_quant_entry.h"
 #include "hard_fp4/nvfp4_scaled_mm_entry.h"
 #include "marlin/marlin_gemm/gptq_marlin.h"
 #include "marlin/marlin_group_gemm/ops.h"
+#if !defined(CHITU_HYGON_BUILD) || CHITU_HYGON_BUILD != 1
+#include "gemm/w4a8_per_group_gemm_cuda.h"
+#endif
 #include "moe/moe_kernel.h"
 #include "norm/rms_norm.h"
 #include "response_append/response_append.h"
@@ -51,6 +57,7 @@ void init_compute(py::module &m) {
     m.def("cuda_topk_softmax", &topk_softmax, "");
     m.def("cuda_frequency_penalty", &applyFrequencyPenalty, "");
     m.def("cuda_response_append", &response_append, "");
+#if !defined(CHITU_HYGON_BUILD) || CHITU_HYGON_BUILD != 1
     m.def("init_custom_ar", &init_custom_ar, "Initialize custom all-reduce",
           "ipc_pointers"_a, "rank_data"_a, "rank"_a, "full_nvlink"_a);
     m.def("all_reduce", &all_reduce, "Perform all-reduce operation", "handle"_a,
@@ -72,8 +79,11 @@ void init_compute(py::module &m) {
           "mem_handle"_a);
     m.def("free_shared_buffer", &free_shared_buffer, "Free shared buffer",
           "buffer"_a);
+#endif
+#if !defined(CHITU_HYGON_BUILD) || CHITU_HYGON_BUILD != 1
     m.def("w4a8_per_group_gemm_forward_cuda", &w4a8_per_group_gemm_forward_cuda,
           "");
+#endif
 #if defined ENABLE_MARLIN && ENABLE_MARLIN
     m.def("gptq_marlin_gemm", &gptq_marlin_gemm, "VLLM Marlin GEMM");
     m.def("moe_wna16_marlin_gemm", &moe_wna16_marlin_gemm,
