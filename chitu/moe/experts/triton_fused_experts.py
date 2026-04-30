@@ -1081,11 +1081,6 @@ def fused_experts_fp8_per_channel(
     )
 
 
-@_inject_moe_config(
-    "fused_experts_soft_fp4",
-    lambda *args, **kwargs: _resolve_soft_fp4_moe_config(
-        block_shape=kwargs.get("block_shape")
-    ),
 def fused_experts_soft_fp4_key(
     hidden_states: ExpertBlockIndexedBatchedRoutedActivation,
     w1: torch.Tensor,
