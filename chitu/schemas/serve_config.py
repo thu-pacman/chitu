@@ -244,6 +244,7 @@ class DebugConfig:
     skip_model_load: bool = MISSING
     force_moe_balance: bool = MISSING
     save_trace_dir: Optional[str] = MISSING
+    disable_inter_op_auto_tune: bool = MISSING
 
 
 class StaticConfig:

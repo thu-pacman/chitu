@@ -4,7 +4,6 @@
 
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-#include <cuda_bf16.h>
 
 #include <ATen/ATen.h>
 
@@ -47,8 +46,12 @@ __global__ void cuda_rms_norm_kernel(const Tx *x, const Tw *__restrict__ w,
     for (size_t t = tid; t < dim; t += blockDim.x) {
         auto x_value = to_scalar<float>(x[offset + t]);
         auto w_value = to_scalar<float>(w[t]);
+        // Use rsqrtf() instead of rsqrt() to ensure float return type.
+        // On HIP compiler, rsqrt() may return double causing the entire
+        // expression to be deduced as double, which doesn't match
+        // to_scalar<Tx>'s float->bf16 specialization.
         out[offset + t] =
-            to_scalar<Tx>(x_value * rsqrt(shared_data[0] + eps) * w_value);
+            to_scalar<Tx>(x_value * rsqrtf(shared_data[0] + eps) * w_value);
     }
 }
 

@@ -44,10 +44,17 @@
 
 #define WARP_SIZE 32
 
+// HIP requires 64-bit mask for shuffle operations
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+#define VLLM_SHFL_MASK uint64_t(-1)
+#else
+#define VLLM_SHFL_MASK uint32_t(-1)
+#endif
+
 #define VLLM_SHFL_XOR_SYNC(var, lane_mask)                                     \
-    __shfl_xor_sync(uint32_t(-1), var, lane_mask)
+    __shfl_xor_sync(VLLM_SHFL_MASK, var, lane_mask)
 #define VLLM_SHFL_XOR_SYNC_WIDTH(var, lane_mask, width)                        \
-    __shfl_xor_sync(uint32_t(-1), var, lane_mask, width)
+    __shfl_xor_sync(VLLM_SHFL_MASK, var, lane_mask, width)
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -269,11 +276,11 @@ __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
     const int thread_row_in_warp = threadIdx.x / THREADS_PER_ROW;
     const int thread_row = warp_base_row + thread_row_in_warp;
 
-    // Threads with indices out of bounds should early exit here.
-    if (thread_row >= num_rows) {
-        return;
-    }
-    const bool row_is_active = finished ? !finished[thread_row] : true;
+    // On HIP platform, all threads in wavefront must participate in shuffle
+    // ops. Invalid threads will contribute zeros and skip writing results.
+    const bool is_valid_thread = thread_row < num_rows;
+    const bool row_is_active =
+        is_valid_thread && (finished ? !finished[thread_row] : true);
 
     // We finally start setting up the read pointers for each thread. First,
     // each thread jumps to the start of the row it will read.
@@ -293,13 +300,22 @@ __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
     using AccessType = AlignedArray<float, ELTS_PER_LDG>;
 
     // Finally, we pull in the data from global mem
+    // Invalid threads initialize to zero to participate in shuffle ops without
+    // affecting results
     float row_chunk[VPT];
-    AccessType *row_chunk_vec_ptr = reinterpret_cast<AccessType *>(&row_chunk);
-    const AccessType *vec_thread_read_ptr =
-        reinterpret_cast<const AccessType *>(thread_read_ptr);
 #pragma unroll
-    for (int ii = 0; ii < LDG_PER_THREAD; ++ii) {
-        row_chunk_vec_ptr[ii] = vec_thread_read_ptr[ii * THREADS_PER_ROW];
+    for (int ii = 0; ii < VPT; ++ii) {
+        row_chunk[ii] = 0.0f;
+    }
+    if (is_valid_thread) {
+        AccessType *row_chunk_vec_ptr =
+            reinterpret_cast<AccessType *>(&row_chunk);
+        const AccessType *vec_thread_read_ptr =
+            reinterpret_cast<const AccessType *>(thread_read_ptr);
+#pragma unroll
+        for (int ii = 0; ii < LDG_PER_THREAD; ++ii) {
+            row_chunk_vec_ptr[ii] = vec_thread_read_ptr[ii * THREADS_PER_ROW];
+        }
     }
 
     // First, we perform a max reduce within the thread. We can do the max in
@@ -396,7 +412,7 @@ __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
         }
 
         // Write the max for this k iteration to global memory.
-        if (thread_group_idx == 0) {
+        if (thread_group_idx == 0 && is_valid_thread) {
             // Add a guard to ignore experts not included by this node
             const bool node_uses_expert =
                 expert >= start_expert && expert < end_expert;

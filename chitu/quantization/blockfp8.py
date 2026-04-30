@@ -316,15 +316,6 @@ def fused_experts_no_sum_blockfp8_indexed(
 ): ...
 
 
-@fused_experts_no_sum_blockfp8_indexed.register_auto
-def _auto_fused_experts_no_sum_blockfp8_indexed():
-    if has_triton:
-        return "triton"
-    if has_deep_gemm:
-        return "deepgemm"
-    raise NotImplementedError
-
-
 fused_experts_no_sum_blockfp8_indexed.register_candidate("triton")
 if has_triton:
     fused_experts_no_sum_blockfp8_indexed.register("triton")(fused_experts_fp8)
@@ -358,26 +349,8 @@ def fused_experts_sum_blockfp8_indexed(
 
 
 @fused_experts_sum_blockfp8_indexed.register_auto
-def _auto_fused_experts_sum_blockfp8_indexed(
-    hidden_states,
-    w1,
-    w2,
-    topk_weights: Optional[torch.Tensor],
-    *,
-    inplace: bool = False,
-    activation: str = "silu",
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-    soft_fp8: bool = False,
-    round_scale_to_pow2: bool = False,
-    global_num_experts: int = -1,
-    experts_start_idx: int = 0,
-    impl: str,
-) -> str:
-    if impl != "auto":
-        return impl
-
+@fused_experts_no_sum_blockfp8_indexed.register_auto
+def _auto_fused_experts_sum_blockfp8_indexed() -> str:
     # Soft FP8
     if parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize > 1:
         return "triton"

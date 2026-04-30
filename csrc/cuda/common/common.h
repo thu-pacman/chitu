@@ -6,10 +6,10 @@
 
 #pragma once
 
-#include <cuda_runtime.h>
+#include "platform.h"
+
 #include <stdint.h>
 
-#include <cuda_bf16.h>
 #include <spdlog/spdlog.h>
 #include <torch/extension.h>
 #include <torch/torch.h>
@@ -80,7 +80,7 @@ __device__ inline dst_type to_scalar(from_type x) {
         return __bfloat162float(x);
     } else {
         // For other conversions, go through float as an intermediate step
-        return to_scalar<float, dst_type>(to_scalar<from_type, float>(x));
+        return to_scalar<dst_type, float>(to_scalar<float, from_type>(x));
     }
 }
 

@@ -278,7 +278,7 @@ def make_op_dispatcher(
                     impl_params_set = set(impl_params)
                     if not dispatcher_params_set.issubset(impl_params_set):
                         raise ValueError(
-                            f"{impl_func} should accepet all parameters of {dispatch_func}: "
+                            f"{impl_func} should accept all parameters of {dispatch_func}: "
                             f"{dispatcher_params_set - impl_params_set}"
                         )
 

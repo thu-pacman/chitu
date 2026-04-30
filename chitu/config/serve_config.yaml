@@ -464,6 +464,14 @@ debug:
   # - /path/to/directory: Save trace to this directory.
   save_trace_dir: null
 
+  # If true, skip heavy inter-op auto-tuning. The service will start quickly but the performance
+  # may be worse.
+  #
+  # Acceptable values:
+  # - False: Normal behavior.
+  # - True: Skip inter-op auto-tuning.
+  disable_inter_op_auto_tune: False
+
 # The data type for 16-bit floating point data type. This field is orthogonal to quantization.
 #
 # Acceptable values:

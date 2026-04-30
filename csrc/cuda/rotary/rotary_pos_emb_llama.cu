@@ -4,7 +4,6 @@
 
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-#include <cuda_bf16.h>
 
 #include <ATen/ATen.h>
 

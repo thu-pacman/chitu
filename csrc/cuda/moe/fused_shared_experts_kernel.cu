@@ -6,7 +6,6 @@
 #include "moe_kernel.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-#include <cuda_runtime.h>
 
 #define BLOCK_SIZE 128
 

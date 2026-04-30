@@ -26,6 +26,8 @@ from chitu.ops.quant import blockfp8_act_quant, a8_per_token_act_quant
 from chitu.device_type import has_accelerator
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.cuda_graph import is_warming_up_or_cuda_graph_capture
+from chitu.testing import AutotuneGraphTimer, Autotuner
+from chitu.global_vars import get_global_args
 
 if has_accelerator():
     from chitu.ops.triton_ops.utils import to_triton_dtype
@@ -51,92 +53,240 @@ _REQUIRED_MOE_CONFIG_KEYS = (
     "BLOCK_SIZE_K",
     "GROUP_SIZE_M",
 )
-_MOE_CONFIG_RESOLVERS: dict[str, Callable[..., dict[str, Any]]] = {}
-_MOE_CONFIG_CACHE_KEY_FNS: dict[str, Callable[..., Hashable]] = {}
-_MOE_CONFIG_CACHE: dict[tuple[str, Hashable], dict[str, Any]] = {}
 
 
-def _resolve_soft_fp4_moe_config(*, block_shape: Optional[list[int]]) -> dict[str, int]:
-    # Keep historical behavior: when block shape is known, align tile K/N with it.
-    if block_shape is not None:
-        return {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": block_shape[0],
-            "BLOCK_SIZE_K": block_shape[1],
-            "GROUP_SIZE_M": 8,
+def _safe_block_shape_tuple(
+    block_shape: Optional[list[int]],
+) -> Optional[tuple[int, int]]:
+    if block_shape is None:
+        return None
+    return (int(block_shape[0]), int(block_shape[1]))
+
+
+def _build_moe_config_list(
+    *,
+    block_m_values: list[int],
+    block_n_values: list[int],
+    block_k_values: list[int],
+    group_m_values: list[int],
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "BLOCK_SIZE_M": block_m,
+            "BLOCK_SIZE_N": block_n,
+            "BLOCK_SIZE_K": block_k,
+            "GROUP_SIZE_M": group_m,
         }
-    return _DEFAULT_MOE_CONFIG
+        for block_m in block_m_values
+        for block_n in block_n_values
+        for block_k in block_k_values
+        for group_m in group_m_values
+    ]
 
 
-def _normalize_moe_config(config: dict[str, Any]) -> dict[str, Any]:
+fused_moe_kernel_configs = _build_moe_config_list(
+    block_m_values=[16, 64, 128],
+    block_n_values=[32, 64, 128],
+    block_k_values=[64, 128],
+    group_m_values=[8, 16],
+)
+
+
+fused_moe_small_batch_kernel_configs = _build_moe_config_list(
+    block_m_values=[16, 64, 128],
+    block_n_values=[32],
+    block_k_values=[64],
+    group_m_values=[1],
+)
+
+
+def _build_block_shape_kernel_configs(
+    block_shape: Optional[list[int]],
+) -> list[dict[str, Any]]:
+    if block_shape is None:
+        return fused_moe_kernel_configs
+    block_n, block_k = block_shape
+    return _build_moe_config_list(
+        block_m_values=[16, 32, 64],
+        block_n_values=[block_n],
+        block_k_values=[block_k],
+        group_m_values=[8, 16, 32],
+    )
+
+
+def _moe_default_candidate_configs(M: int, E: int) -> list[dict[str, Any]]:
+    if M == 0:
+        return []
+    configs = [dict(cfg) for cfg in fused_moe_kernel_configs]
+    if M <= E:
+        configs += [dict(cfg) for cfg in fused_moe_small_batch_kernel_configs]
+    return configs
+
+
+def _moe_fp8_candidate_configs(
+    *,
+    M: int,
+    E: int,
+    block_shape: Optional[list[int]],
+) -> list[dict[str, Any]]:
+    if M == 0:
+        return []
+    if block_shape is None:
+        return _moe_default_candidate_configs(M=M, E=E)
+    return [dict(cfg) for cfg in _build_block_shape_kernel_configs(block_shape)]
+
+
+def _prepend_default_config_candidate(
+    default_config: dict[str, Any],
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    default_cfg = dict(default_config)
+    merged = [default_cfg]
+    merged.extend(dict(cfg) for cfg in candidates if cfg != default_cfg)
+    return merged
+
+
+def check_moe_config(config: dict[str, Any]):
     missing = [k for k in _REQUIRED_MOE_CONFIG_KEYS if k not in config]
     if missing:
         raise ValueError(f"Missing MoE Triton config keys: {missing}")
-    return dict(config)
 
 
-def register_moe_config_resolver(
-    name: str,
-    resolver: Callable[..., dict[str, Any]],
+def _build_moe_autotune_key(
+    hidden_states: BatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    m_bucket: int,
+    extra: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    activation_shape = list(hidden_states.activation.shape)
+    activation_shape[0] = int(m_bucket)
+    return (
+        tuple(activation_shape),
+        str(hidden_states.activation.dtype),
+        str(hidden_states.activation.device),
+        tuple(w1.shape),
+        tuple(w2.shape),
+        *extra,
+    )
+
+
+def _bucket_m_for_autotune_key(m: int) -> int:
+    """
+    Relax M-dimension key to reduce repeated retune for nearby decode batch sizes.
+    """
+    assert m >= 0
+    if m == 0:
+        return 0
+    if m < 16:
+        return 16
+    if m <= 64:
+        return 32
+    if m <= 192:
+        return 128
+    if m <= 384:
+        return 256
+    return 512
+
+
+def inter_op_auto_tune(
+    fn: Optional[Callable[..., Any]] = None,
     *,
-    cache_key_fn: Optional[Callable[..., Hashable]] = None,
-) -> None:
+    key_fn: Callable[..., Hashable],
+    config_candidates_fn: Callable[..., list[dict[str, Any]]],
+    default_config_fn: Callable[..., dict[str, Any]],
+    name: Optional[str] = None,
+):
     """
-    Register external config resolver for fused_experts*.
+    Auto-tune a function, which may contain any number of kernels.
 
-    This enables joint autotune logic to inject tuned configs without touching
-    fused_experts* call sites.
+    Args:
+        key_fn: A function accepts the same parameters as `fn` except for the `config` parameter,
+            and returns a hashable key, where arguments corresponding to the same key share
+            the auto-tuned result.
+        default_config_fn: A function accepts the same parameters as `fn` except for the `config`
+            parameter, and returns a default config. It will be used when auto-tuning is disabled.
+        config_candidates_fn: A function accepts the same parameters as `fn` except for the `config`
+            parameter, and returns the tuning space.
+        fn: The function to be auto-tuned. If omitted, `inter_op_auto_tune` will act as a decorator.
+            The function should accpet a parameter named `config` for the tuned result.
+        name: The name to identify the function to be tuned. Defaults to be get from `fn.__name__`,
+            but may also be explicitly specified.
     """
-    _MOE_CONFIG_RESOLVERS[name] = resolver
-    if cache_key_fn is None:
-        _MOE_CONFIG_CACHE_KEY_FNS.pop(name, None)
-    else:
-        _MOE_CONFIG_CACHE_KEY_FNS[name] = cache_key_fn
 
+    if fn is None:
+        return functools.partial(
+            inter_op_auto_tune,
+            key_fn=key_fn,
+            config_candidates_fn=config_candidates_fn,
+            default_config_fn=default_config_fn,
+            name=name,
+        )
 
-def clear_moe_config_cache(name: Optional[str] = None) -> None:
     if name is None:
-        _MOE_CONFIG_CACHE.clear()
-        return
-    keys_to_remove = [k for k in _MOE_CONFIG_CACHE if k[0] == name]
-    for key in keys_to_remove:
-        _MOE_CONFIG_CACHE.pop(key, None)
+        name = fn.__name__
 
+    tuner = Autotuner(timer=AutotuneGraphTimer(), name=name)
 
-def _resolve_moe_config(
-    name: str,
-    fallback_resolver: Callable[..., dict[str, Any]],
-    *args,
-    **kwargs,
-) -> dict[str, Any]:
-    resolver = _MOE_CONFIG_RESOLVERS.get(name, fallback_resolver)
-    cache_key_fn = _MOE_CONFIG_CACHE_KEY_FNS.get(name)
-    if cache_key_fn is None:
-        return _normalize_moe_config(resolver(*args, **kwargs))
-
-    cache_key = (name, cache_key_fn(*args, **kwargs))
-    cached = _MOE_CONFIG_CACHE.get(cache_key)
-    if cached is not None:
-        return dict(cached)
-
-    config = _normalize_moe_config(resolver(*args, **kwargs))
-    _MOE_CONFIG_CACHE[cache_key] = dict(config)
-    return config
-
-
-def _inject_moe_config(name: str, fallback_resolver: Callable[..., dict[str, Any]]):
-    def decorator(fn):
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            if kwargs.get("config") is None:
-                kwargs["config"] = _resolve_moe_config(
-                    name, fallback_resolver, *args, **kwargs
+    @functools.wraps(fn)
+    def wrapper(*args, config: Optional[dict[str, Any]] = None, **kwargs):
+        if config is not None:
+            logger.debug_once(
+                f"Use caller-specified config for {name}: config={config}"
+            )
+        else:
+            default_config = default_config_fn(*args, **kwargs)
+            if getattr(
+                getattr(get_global_args(), "debug", {}),
+                "disable_inter_op_auto_tune",
+                False,
+            ):
+                config = default_config
+                logger.debug_once(
+                    f"Disabled auto-tuning for {name}: use default config={config}"
                 )
-            return fn(*args, **kwargs)
+            else:
+                key = key_fn(*args, **kwargs)
+                candidates = config_candidates_fn(*args, **kwargs)
+                # Keep the default config in the candidate set so autotune cannot regress
+                # below autotune-off behavior.
+                candidates = _prepend_default_config_candidate(
+                    default_config, candidates
+                )
+                assert len(candidates) >= 1
+                if len(candidates) == 1:
+                    config = dict(candidates[0])
+                    logger.debug_once(
+                        f"Use the only config for {name}: key={key}, config={config}"
+                    )
+                else:
+                    cached_cfg = tuner.try_get_cached(key=key, valid_configs=candidates)
+                    if cached_cfg is not None:
+                        logger.debug_once(
+                            f"Reuse tuned config for {name}: key={key}, config={cached_cfg}"
+                        )
+                        config = dict(cached_cfg)
+                    else:
+                        assert (
+                            not torch.cuda.is_current_stream_capturing()
+                        ), "auto-tuning should not happen during graph capturing"
+                        config = dict(
+                            tuner.tune(
+                                key=key,
+                                configs=candidates,
+                                make_bench_fn=lambda cfg: functools.partial(
+                                    fn, *args, config=cfg, **kwargs
+                                ),
+                            )
+                        )
+                        logger.debug_once(
+                            f"Tuned config for {name}: key={key}, candidates={candidates}, resulting config={config}"
+                        )
 
-        return wrapper
+        check_moe_config(config)
+        return fn(*args, config=config, **kwargs)
 
-    return decorator
+    return wrapper
 
 
 @single_dispatch_lazy_tensor
@@ -391,7 +541,40 @@ def fused_moe_kernel_wrapper_soft_fp4(
     )
 
 
-@_inject_moe_config("fused_experts", lambda *args, **kwargs: _DEFAULT_MOE_CONFIG)
+def fused_experts_key(
+    hidden_states: BatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    *,
+    activation: str = "silu",
+    global_num_experts: int = -1,
+    experts_start_idx: int = 0,
+):
+    M = int(hidden_states.activation.shape[0])
+    m_bucket = _bucket_m_for_autotune_key(M)
+    key_extra = (activation,)
+    return _build_moe_autotune_key(hidden_states, w1, w2, m_bucket, key_extra)
+
+
+def fused_experts_config_candidates(
+    hidden_states: BatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    *,
+    activation: str = "silu",
+    global_num_experts: int = -1,
+    experts_start_idx: int = 0,
+):
+    M = int(hidden_states.activation.shape[0])
+    E = int(w1.shape[0])
+    return _moe_default_candidate_configs(M=M, E=E)
+
+
+@inter_op_auto_tune(
+    key_fn=fused_experts_key,
+    config_candidates_fn=fused_experts_config_candidates,
+    default_config_fn=lambda *args, **kwargs: _DEFAULT_MOE_CONFIG,
+)
 def fused_experts(
     hidden_states: BatchedRoutedActivation,
     w1: torch.Tensor,
@@ -475,7 +658,48 @@ def fused_experts(
     )
 
 
-@_inject_moe_config("fused_experts_int8", lambda *args, **kwargs: _DEFAULT_MOE_CONFIG)
+def fused_experts_int8_key(
+    hidden_states: ExpertBlockIndexedBatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    activation: str = "silu",
+    use_int8_w8a16: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    use_int8_w8a8: bool = False,
+    experts_start_idx: int = 0,
+):
+    M = int(hidden_states.activation.shape[0])
+    m_bucket = _bucket_m_for_autotune_key(M)
+    key_extra = (activation, use_int8_w8a16, use_int8_w8a8)
+    return _build_moe_autotune_key(hidden_states, w1, w2, m_bucket, key_extra)
+
+
+def fused_experts_int8_config_candidates(
+    hidden_states: ExpertBlockIndexedBatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    activation: str = "silu",
+    use_int8_w8a16: bool = False,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    use_int8_w8a8: bool = False,
+    experts_start_idx: int = 0,
+):
+    M = int(hidden_states.activation.shape[0])
+    E = int(w1.shape[0])
+    return _moe_default_candidate_configs(M=M, E=E)
+
+
+@inter_op_auto_tune(
+    key_fn=fused_experts_int8_key,
+    config_candidates_fn=fused_experts_int8_config_candidates,
+    default_config_fn=lambda *args, **kwargs: _DEFAULT_MOE_CONFIG,
+)
 def fused_experts_int8(
     hidden_states: ExpertBlockIndexedBatchedRoutedActivation,
     w1: torch.Tensor,
@@ -583,7 +807,57 @@ def fused_experts_int8(
     )
 
 
-@_inject_moe_config("fused_experts_fp8", lambda *args, **kwargs: _DEFAULT_MOE_CONFIG)
+def fused_experts_fp8_key(
+    hidden_states: IndexedBatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    round_scale_to_pow2: bool = False,
+    global_num_experts: int = -1,
+    experts_start_idx: int = 0,
+):
+    M = int(hidden_states.activation.shape[0])
+    m_bucket = _bucket_m_for_autotune_key(M)
+    key_extra = (
+        activation,
+        _safe_block_shape_tuple(block_shape),
+        soft_fp8,
+        round_scale_to_pow2,
+    )
+    return _build_moe_autotune_key(hidden_states, w1, w2, m_bucket, key_extra)
+
+
+def fused_experts_fp8_config_candidates(
+    hidden_states: IndexedBatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    round_scale_to_pow2: bool = False,
+    global_num_experts: int = -1,
+    experts_start_idx: int = 0,
+):
+    M = int(hidden_states.activation.shape[0])
+    E = int(w1.shape[0])
+    return _moe_fp8_candidate_configs(M=M, E=E, block_shape=block_shape)
+
+
+@inter_op_auto_tune(
+    key_fn=fused_experts_fp8_key,
+    config_candidates_fn=fused_experts_fp8_config_candidates,
+    default_config_fn=lambda *args, **kwargs: _DEFAULT_MOE_CONFIG,
+)
 def fused_experts_fp8(
     hidden_states: IndexedBatchedRoutedActivation,
     w1: torch.Tensor,
@@ -714,9 +988,6 @@ def fused_experts_fp8(
 
 
 @single_dispatch_lazy_tensor
-@_inject_moe_config(
-    "fused_experts_fp8_per_channel", lambda *args, **kwargs: _DEFAULT_MOE_CONFIG
-)
 def fused_experts_fp8_per_channel(
     hidden_states: IndexedBatchedRoutedActivation,
     w1: torch.Tensor,
@@ -725,8 +996,10 @@ def fused_experts_fp8_per_channel(
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,
-    config: Optional[dict[str, Any]] = None,
+    config: Optional[dict[str, Any]] = _DEFAULT_MOE_CONFIG,
 ) -> PerTokenBatchedExpertResult:
+    # TODO: Auto-tune this kernel
+
     from chitu.ops.triton_ops.quant.fp8_per_token import per_token_quant_fp8
 
     n_local_experts = w1.shape[0]
@@ -813,6 +1086,85 @@ def fused_experts_fp8_per_channel(
     lambda *args, **kwargs: _resolve_soft_fp4_moe_config(
         block_shape=kwargs.get("block_shape")
     ),
+def fused_experts_soft_fp4_key(
+    hidden_states: ExpertBlockIndexedBatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_scale2: Optional[torch.Tensor] = None,
+    w2_scale2: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    experts_start_idx: int = 0,
+    round_scale_to_pow2: bool = False,
+):
+    M = int(hidden_states.activation.shape[0])
+    m_bucket = _bucket_m_for_autotune_key(M)
+    key_extra = (
+        activation,
+        _safe_block_shape_tuple(block_shape),
+        soft_fp8,
+        round_scale_to_pow2,
+    )
+    return _build_moe_autotune_key(hidden_states, w1, w2, m_bucket, key_extra)
+
+
+def fused_experts_soft_fp4_config_candidates(
+    hidden_states: ExpertBlockIndexedBatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_scale2: Optional[torch.Tensor] = None,
+    w2_scale2: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    experts_start_idx: int = 0,
+    round_scale_to_pow2: bool = False,
+):
+    M = int(hidden_states.activation.shape[0])
+    E = int(w1.shape[0])
+    return _moe_fp8_candidate_configs(M=M, E=E, block_shape=block_shape)
+
+
+def fused_experts_soft_fp4_default_config(
+    hidden_states: ExpertBlockIndexedBatchedRoutedActivation,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    activation: str = "silu",
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    w1_scale2: Optional[torch.Tensor] = None,
+    w2_scale2: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    block_shape: Optional[list[int]] = None,
+    soft_fp8: bool = False,
+    experts_start_idx: int = 0,
+    round_scale_to_pow2: bool = False,
+):
+    # Keep historical behavior: when block shape is known, align tile K/N with it.
+    if block_shape is not None:
+        return {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": block_shape[0],
+            "BLOCK_SIZE_K": block_shape[1],
+            "GROUP_SIZE_M": 8,
+        }
+    return _DEFAULT_MOE_CONFIG
+
+
+@inter_op_auto_tune(
+    key_fn=fused_experts_soft_fp4_key,
+    config_candidates_fn=fused_experts_soft_fp4_config_candidates,
+    default_config_fn=fused_experts_soft_fp4_default_config,
 )
 def fused_experts_soft_fp4(
     hidden_states: ExpertBlockIndexedBatchedRoutedActivation,
