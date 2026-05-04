@@ -301,13 +301,12 @@ infer:
   # -default: False
   enable_prefix_caching: False
 
-  # Penalty weight for prefix-cached idle blocks ratio when selecting preferred DP rank.
-  # Higher value means more emphasis on active block cache hit rate than idle block cache hit rate
-  dp_prefix_caching_idle_rate_weight: 0.01
+  # The weight of the prefix cache hit rate during router routing tasks.
+  dp_prefix_caching_hit_rate_weight: 0.01
 
   # Penalty weight for running task count of each DP rank when selecting preferred DP rank.
   # Higher value means stronger load balancing pressure.
-  dp_prefix_caching_running_penalty_weight: 0.01
+  dp_prefix_caching_running_penalty_weight: 0.1
 
   # The followings are legacy parameters. They are to be removed in the future.
   do_load: True

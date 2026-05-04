@@ -31,7 +31,12 @@ class MetadataBuffers:
         item_len = self.output_tokens[0].nbytes
         return ptr, data_len, item_len
 
-    def allocate(self, tid, first_token: Optional[torch.Tensor | int] = None):
+    def allocate(
+        self,
+        tid,
+        first_token: Optional[torch.Tensor | int] = None,
+        num_hit_tokens: Optional[int] = None,
+    ):
         """Allocate buffer for a task"""
         if len(self.free_indices) == 0:
             raise RuntimeError("no free indices available")
@@ -45,12 +50,17 @@ class MetadataBuffers:
                 )
             else:
                 self.output_tokens[index, 0] = int(first_token)
+        if num_hit_tokens is not None:
+            self.output_tokens[index, 1] = int(num_hit_tokens)
         return index
 
     def get(self, index_list):
-        """Get first token ids by indices"""
+        """Get first-token ids and cached-hit tokens by indices."""
         assert isinstance(index_list, list), "index_list must be a list"
-        return self.output_tokens[index_list, 0].clone()
+        return (
+            self.output_tokens[index_list, 0].clone(),
+            self.output_tokens[index_list, 1].clone(),
+        )
 
     def free(self, tid_list):
         """Free buffers for tasks"""

@@ -232,6 +232,9 @@ class TokenRouter:
             # Request completed
             finish_reason = token_data.get("finish_reason", "stop")
             req.finish_reason = finish_reason
+            req.num_hit_tokens = int(
+                token_data.get("num_hit_tokens", req.num_hit_tokens)
+            )
             req.stop_stream()
 
             # Remove from active requests

@@ -148,7 +148,12 @@ class DPTokenSender:
             )
         self._send_data(data)
 
-    def send_finish(self, request_id: str, finish_reason: str = "stop"):
+    def send_finish(
+        self,
+        request_id: str,
+        finish_reason: str = "stop",
+        num_hit_tokens: int = 0,
+    ):
         """Send request finish signal"""
         # Clean up caches for this request
         self.send_token(request_id, None)
@@ -159,6 +164,7 @@ class DPTokenSender:
             "type": "finish",
             "request_id": request_id,
             "finish_reason": finish_reason,
+            "num_hit_tokens": int(num_hit_tokens),
             "scheduler_id": self.dp_group_id,
             "timestamp": time.time(),
         }
@@ -235,7 +241,11 @@ class DPTaskWrapper:
         if not self._finish_sent and self.original_task.need_remove():
             request_id = self.original_task.req.request_id
             finish_reason = self.original_task.req.finish_reason or "stop"
-            self.token_sender.send_finish(request_id, finish_reason)
+            self.token_sender.send_finish(
+                request_id,
+                finish_reason,
+                getattr(self.original_task.req, "num_hit_tokens", 0),
+            )
             self._finish_sent = True
             self.original_task.pd_exec_end_logged = True
             # Record completed request metric

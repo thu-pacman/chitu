@@ -1039,11 +1039,8 @@ def _update_tasks_preferred_dp_rank():
         return
 
     # weight of preifx cache hit rate
-    _CACHED_RATE_WEIGHT = 1
-
-    # penalty weight of idle rate
-    cache_idle_penalty_weight = float(
-        getattr(args.infer, "dp_prefix_caching_idle_rate_weight", 0.01)
+    hit_rate_weight = float(
+        getattr(args.infer, "dp_prefix_caching_hit_rate_weight", 0.01)
     )
 
     # penalty weight of the number of running tasks in the DP rank
@@ -1051,7 +1048,7 @@ def _update_tasks_preferred_dp_rank():
         getattr(args.infer, "dp_prefix_caching_running_penalty_weight", 0.01)
     )
 
-    cache_idle_penalty_weight = max(min(cache_idle_penalty_weight, 1), 0)
+    hit_rate_weight = max(min(hit_rate_weight, 1), 0)
     running_tasks_penalty_weight = max(min(running_tasks_penalty_weight, 1), 0)
 
     if Backend.cache_managers is not None:
@@ -1084,21 +1081,16 @@ def _update_tasks_preferred_dp_rank():
             if enable_prefix_caching:
                 task.prompt_to_token_block(dp_rank)
                 cached_blocks = task.num_cached_blocks
-                cached_idle_blocks = task.num_cached_idle_blocks
                 total_blocks = len(task.token_blocks)
                 if total_blocks > 0:
                     cached_rate = cached_blocks / total_blocks
-                    idle_rate = cached_idle_blocks / total_blocks
                 else:
                     cached_rate = 0.0
-                    idle_rate = 0.0
             else:
                 cached_rate = 0.0
-                idle_rate = 0.0
 
             preference_score = (
-                cached_rate * _CACHED_RATE_WEIGHT
-                - idle_rate * cache_idle_penalty_weight
+                cached_rate * hit_rate_weight
                 - running_tasks_penalty_weight * projected_running_tasks_per_dp[dp_rank]
             )
 

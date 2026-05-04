@@ -560,7 +560,10 @@ async def anthropic_stream_from_async_stream(
                 "stop_reason": stop_reason,
                 "stop_sequence": None,
             },
-            "usage": {"output_tokens": async_stream.tokens_len},
+            "usage": {
+                "output_tokens": async_stream.tokens_len,
+                "cached_token": user_req.num_hit_tokens,
+            },
         },
     )
     yield _sse_event("message_stop", {"type": "message_stop"})
@@ -584,6 +587,7 @@ async def anthropic_completion_stream_from_async_stream(
         )
 
     stop_reason = map_finish_reason_to_completion_stop_reason(req.finish_reason)
+    num_hit_tokens = req.num_hit_tokens
     yield _sse_data(
         {
             "type": "completion",
@@ -591,6 +595,7 @@ async def anthropic_completion_stream_from_async_stream(
             "stop_reason": stop_reason,
             "stop_sequence": None,
             "model": response_model,
+            "cached_token": num_hit_tokens,
         }
     )
 
@@ -698,6 +703,7 @@ async def handle_messages_request(*, request: AnthropicMessagesRequest, priority
             "usage": {
                 "input_tokens": user_req.prompt_len,
                 "output_tokens": user_req.async_stream.tokens_len,
+                "cached_token": user_req.num_hit_tokens,
             },
         }
     )
@@ -780,5 +786,6 @@ async def handle_completion_request(
             "stop_reason": stop_reason,
             "stop_sequence": stop_sequence,
             "model": response_model,
+            "cached_token": user_req.num_hit_tokens,
         }
     )

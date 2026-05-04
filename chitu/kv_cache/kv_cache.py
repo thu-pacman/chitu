@@ -329,9 +329,9 @@ class KVCacheBase:
         raise NotImplementedError()
 
     def prepare_cache_prefill(self, tasks: "PackedTasksBase"):
-        if tasks.hit_token_lens:
+        if tasks.inc_hit_tokens_list:
             cached_token_lens: list[int] = [
-                self.tid_to_cached_len.get(tid, 0) + tasks.hit_token_lens[i]
+                self.tid_to_cached_len.get(tid, 0) + tasks.inc_hit_tokens_list[i]
                 for i, tid in enumerate(tasks.task_ids)
             ]
         else:

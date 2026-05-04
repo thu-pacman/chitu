@@ -150,7 +150,10 @@ def test_pd_transfer_end_to_end(
 def test_recv_kv_cache_and_insert_fallback_uses_batch_cache_ids():
     class FakeMetadataBuffers:
         def get(self, aux_indices):
-            return torch.zeros((len(aux_indices),), dtype=torch.int32)
+            return (
+                torch.zeros((len(aux_indices),), dtype=torch.int32),
+                torch.zeros((len(aux_indices),), dtype=torch.int32),
+            )
 
         def free(self, room_ids):
             return
@@ -200,7 +203,7 @@ def test_recv_kv_cache_and_insert_fallback_uses_batch_cache_ids():
     prefix_lens = [64]
     cache_ids_list = [[7, 8, 9, 10]]
 
-    first_tokens = kv_manager.recv_kv_cache_and_insert(
+    first_tokens, _ = kv_manager.recv_kv_cache_and_insert(
         request_ids=request_ids,
         kv_cache=kv_cache,
         prefix_lens=prefix_lens,

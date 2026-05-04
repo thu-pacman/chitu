@@ -208,6 +208,7 @@ class AsyncResponse:
                             "completion_tokens": self.async_stream.tokens_len,
                             "total_tokens": self.async_stream.tokens_len
                             + self.req.prompt_len,
+                            "cached_token": self.req.num_hit_tokens,
                         },
                     )
                     data = chunk.model_dump_json(exclude_none=True)
@@ -277,6 +278,7 @@ class AsyncResponse:
                 "prompt_tokens": self.req.prompt_len,
                 "completion_tokens": self.async_stream.tokens_len,
                 "total_tokens": self.async_stream.tokens_len + self.req.prompt_len,
+                "cached_token": self.req.num_hit_tokens,
             },
         )
         logger.debug(

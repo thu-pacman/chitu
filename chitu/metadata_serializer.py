@@ -381,8 +381,8 @@ class MetadataSerializer:
 
         if tasks.new_cache_ids_list:
             msg_dict["new_cache_ids_list"] = tasks.new_cache_ids_list
-        if tasks.hit_token_lens:
-            msg_dict["hit_token_lens"] = tasks.hit_token_lens
+        if tasks.inc_hit_tokens_list:
+            msg_dict["inc_hit_tokens_list"] = tasks.inc_hit_tokens_list
         if tasks.prefix_lens:
             msg_dict["prefix_lens"] = tasks.prefix_lens
 
@@ -425,7 +425,7 @@ class MetadataSerializer:
                 tokens=tokens,
                 payload_type=payload_type,
                 new_cache_ids_list=msg_dict.get("new_cache_ids_list", []),
-                hit_token_lens=msg_dict.get("hit_token_lens", []),
+                inc_hit_tokens_list=msg_dict.get("inc_hit_tokens_list", []),
                 prefix_lens=msg_dict.get("prefix_lens", []),
                 num_tokens=num_tokens,
                 has_outputs=msg_dict.get("has_outputs", []),
@@ -487,7 +487,7 @@ class MetadataSerializer:
             packed_tasks.has_outputs = has_outputs
 
         packed_tasks.new_cache_ids_list = msg_dict.get("new_cache_ids_list", [])
-        packed_tasks.hit_token_lens = msg_dict.get("hit_token_lens", [])
+        packed_tasks.inc_hit_tokens_list = msg_dict.get("inc_hit_tokens_list", [])
         packed_tasks.prefix_lens = msg_dict.get("prefix_lens", [])
 
         boot_ids = msg_dict.get("boot_ids", None)

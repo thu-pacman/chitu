@@ -159,6 +159,13 @@ class MooncakeKVTransferHook:
         kv_cache = self.kv_manager.kv_cache
 
         req_ids_output = tasks.output_task_ids
+        request_cached_tokens = {}
+        for t in getattr(tasks, "output_tasks", []):
+            if t is None or getattr(t, "req", None) is None:
+                continue
+            request_cached_tokens[str(t.req.request_id)] = int(
+                getattr(t.req, "num_hit_tokens", 0)
+            )
         if pd_verbose_enabled():
             if send_tokens is None:
                 # 看到该日志表示：该 rank 只传输 KV Cache（不包含首 token）
@@ -184,6 +191,7 @@ class MooncakeKVTransferHook:
             first_tokens=send_tokens,
             request_ids=req_ids_output,
             kv_cache=kv_cache,
+            request_cached_tokens=request_cached_tokens,
         )
 
         # Record KV send duration (covers enqueue; actual RDMA transfer is async)
@@ -296,7 +304,7 @@ class MooncakeKVTransferHook:
             if self.kv_manager.prefill_target_rank_by_room.get(room) is None:
                 self.kv_manager.set_prefill_target_engine_rank(rid, prefill_rank)
 
-        first_tokens = self.kv_manager.recv_kv_cache_and_insert(
+        first_tokens, cached_hit_tokens = self.kv_manager.recv_kv_cache_and_insert(
             request_ids=pending,
             kv_cache=kv_cache,
             prefix_lens=pending_prefix_lens,
@@ -309,10 +317,17 @@ class MooncakeKVTransferHook:
         if len(pending) == 0:
             return
         tokens_cpu = first_tokens.to(dtype=torch.int64, device="cpu").tolist()
-        for rid, token in zip(pending, tokens_cpu):
+        cached_hit_tokens_cpu = cached_hit_tokens.to(
+            dtype=torch.int64, device="cpu"
+        ).tolist()
+        for rid, token, cached_hit_tokens_i in zip(
+            pending, tokens_cpu, cached_hit_tokens_cpu
+        ):
             task = TaskPool.pool.get(rid)
             if task is None:
                 continue
+            # Worker rank 的 task 没有 req；先把值挂在 task 上，后续由主 rank 汇聚回传。
+            task._pd_cached_hit_tokens_for_dp_emit = int(cached_hit_tokens_i)
             if not task.has_next_token():
                 task.update_response_sync(int(token))
                 # DP worker rank 的 task 没有被 DPTaskWrapper 替换 update_response_sync，
@@ -322,6 +337,10 @@ class MooncakeKVTransferHook:
             if getattr(task, "req", None) is not None and not getattr(
                 task, "_pd_first_token_applied", False
             ):
+                task.req.num_hit_tokens = max(
+                    int(getattr(task.req, "num_hit_tokens", 0)),
+                    int(cached_hit_tokens_i),
+                )
                 task._pd_first_token_applied = True
                 max_seq_len = get_global_args().infer.max_seq_len
                 remaining = max(0, int(max_seq_len) - int(task.prefix_tokens_len))

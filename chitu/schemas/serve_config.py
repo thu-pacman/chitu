@@ -90,7 +90,7 @@ class InferConfig(InferConfigLegacy):
     moe_lb_threshold: float = 3.0
     dllm_block_length: int = 32  # block length for dLLM decode
     enable_prefix_caching: bool = MISSING
-    dp_prefix_caching_idle_rate_weight: float = 0.01
+    dp_prefix_caching_hit_rate_weight: float = 0.01
     dp_prefix_caching_running_penalty_weight: float = 0.01
 
     @dataclass
