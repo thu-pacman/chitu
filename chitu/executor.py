@@ -622,14 +622,23 @@ class ExpertDataDispatcher(TasksDispatcher):
         token_list: list[list[int]],
         mtp_token_list: Optional[list[list[int]]] = None,
         pd_first_tokens: Optional[dict[str, int]] = None,
-    ) -> tuple[list[list[int]], Optional[list[list[int]]], dict[str, int]]:
+        pd_cached_hit_tokens: Optional[dict[str, int]] = None,
+    ) -> tuple[
+        list[list[int]],
+        Optional[list[list[int]]],
+        dict[str, int],
+        dict[str, int],
+    ]:
         if pd_first_tokens is None:
             pd_first_tokens = {}
+        if pd_cached_hit_tokens is None:
+            pd_cached_hit_tokens = {}
         if self.is_main_rank:
             all_tokens = [[] for _ in range(self.group_size)]
             if self.mtp_size > 1:
                 all_tokens_mtp = [[] for _ in range(self.group_size)]
             all_first_tokens: dict[str, int] = {}
+            all_cached_hit_tokens: dict[str, int] = {}
             base_frame_count = 2 + (1 if self.mtp_size > 1 else 0)
             for _ in range(1, self.group_size):
                 msgs = self.socket.recv_multipart()
@@ -638,28 +647,49 @@ class ExpertDataDispatcher(TasksDispatcher):
                 if self.mtp_size > 1:
                     all_tokens_mtp[rank_in_group] = msgpack.unpackb(msgs[2])
                 if len(msgs) > base_frame_count:
-                    ft = msgpack.unpackb(msgs[base_frame_count])
-                    all_first_tokens.update(ft)
+                    ext = msgpack.unpackb(msgs[base_frame_count])
+                    # Backward compatibility: old workers may still send first_tokens dict directly.
+                    if isinstance(ext, dict) and (
+                        "first_tokens" in ext or "cached_hit_tokens" in ext
+                    ):
+                        all_first_tokens.update(ext.get("first_tokens", {}))
+                        all_cached_hit_tokens.update(ext.get("cached_hit_tokens", {}))
+                    elif isinstance(ext, dict):
+                        all_first_tokens.update(ext)
             if not self.mtp_size > 1:
                 return (
                     sum(all_tokens, token_list),
                     None,
                     all_first_tokens,
+                    all_cached_hit_tokens,
                 )
             else:
                 return (
                     sum(all_tokens, token_list),
                     sum(all_tokens_mtp, mtp_token_list),
                     all_first_tokens,
+                    all_cached_hit_tokens,
                 )
         else:
             msg = [msgpack.packb(token_list)]
             if self.mtp_size > 1:
                 msg.append(msgpack.packb(mtp_token_list))
-            if pd_first_tokens:
-                msg.append(msgpack.packb(pd_first_tokens))
+            if pd_first_tokens or pd_cached_hit_tokens:
+                msg.append(
+                    msgpack.packb(
+                        {
+                            "first_tokens": pd_first_tokens,
+                            "cached_hit_tokens": pd_cached_hit_tokens,
+                        }
+                    )
+                )
             self.socket.send_multipart(msg)
-            return token_list, (mtp_token_list if self.mtp_size > 1 else None), {}
+            return (
+                token_list,
+                (mtp_token_list if self.mtp_size > 1 else None),
+                {},
+                {},
+            )
 
     def send_payload(self, payload: torch.Tensor, tasks=None):
         pass
@@ -1165,9 +1195,9 @@ class Executor:
 
         if not is_empty_step:
             # Collect prompt tokens metrics
-            hit_token_len = sum(tasks.hit_token_lens)
-            PrometheusMetricsCollector.inc_prompt_tokens(num_tokens + hit_token_len)
-            PrometheusMetricsCollector.inc_hit_tokens(hit_token_len)
+            inc_hit_tokens = sum(tasks.inc_hit_tokens_list)
+            PrometheusMetricsCollector.inc_prompt_tokens(num_tokens + inc_hit_tokens)
+            PrometheusMetricsCollector.inc_hit_tokens(inc_hit_tokens)
 
             # payload send
             #
@@ -1574,6 +1604,7 @@ class Executor:
         """
         collect_tasks: Optional[PackedTasks] = None
         pd_first_tokens_from_workers: dict[str, int] = {}
+        pd_cached_hit_tokens_from_workers: dict[str, int] = {}
         # get the collect packed tasks (tasks that finished this step)
         if TaskCollector.available():
             collect_tasks = TaskCollector.collect(tasks)
@@ -1607,15 +1638,26 @@ class Executor:
                     else None
                 )
                 local_first_tokens: dict[str, int] = {}
+                local_cached_hit_tokens: dict[str, int] = {}
                 for task in collect_tasks.output_tasks:
                     ft = getattr(task, "_pd_first_token_for_dp_emit", None)
                     if ft is not None:
                         local_first_tokens[task.task_id] = ft
                         del task._pd_first_token_for_dp_emit
-                result_list, mtp_token_list, pd_first_tokens_from_workers = (
-                    self.dp_dispatcher.collect_token(
-                        result_list, mtp_token_list, pd_first_tokens=local_first_tokens
-                    )
+                    cached = getattr(task, "_pd_cached_hit_tokens_for_dp_emit", None)
+                    if cached is not None:
+                        local_cached_hit_tokens[task.task_id] = int(cached)
+                        del task._pd_cached_hit_tokens_for_dp_emit
+                (
+                    result_list,
+                    mtp_token_list,
+                    pd_first_tokens_from_workers,
+                    pd_cached_hit_tokens_from_workers,
+                ) = self.dp_dispatcher.collect_token(
+                    result_list,
+                    mtp_token_list,
+                    pd_first_tokens=local_first_tokens,
+                    pd_cached_hit_tokens=local_cached_hit_tokens,
                 )
                 if len(result_list) > 0:
                     collect_tasks.generated_result = torch.tensor(
@@ -1640,6 +1682,18 @@ class Executor:
                     task = TaskPool.pool.get(rid)
                     if task is not None:
                         task.update_response_sync(token)
+            if (
+                pd_cached_hit_tokens_from_workers
+                and self.dp_dispatcher
+                and self.dp_dispatcher.is_main_rank
+            ):
+                for rid, cached in pd_cached_hit_tokens_from_workers.items():
+                    task = TaskPool.pool.get(rid)
+                    if task is not None and getattr(task, "req", None) is not None:
+                        task.req.num_hit_tokens = max(
+                            int(getattr(task.req, "num_hit_tokens", 0)),
+                            int(cached),
+                        )
             collect_tasks.add_task_to_batch_result()
             if self.rank == 0:
                 collect_tasks.batch_update_decode_status()

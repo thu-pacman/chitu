@@ -237,7 +237,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
     def prepare_metadata_before_prefill(self, task: "Task"):
         """prepare and update metadata before the task begin a prefill step"""
         task.new_cache_ids = []
-        task.hit_token_len = 0  # must be reset every step
+        task.set_inc_hit_tokens(0)  # must be reset every step
         consumed_before_prefill = task.consumed_req_tokens
 
         if self.enable_prefix_caching:
@@ -275,7 +275,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
             if task.consumed_req_tokens > consumed_before_prefill:
                 # incremental prefix-caching hits in this step.
-                task.hit_token_len = task.consumed_req_tokens - consumed_before_prefill
+                task.set_inc_hit_tokens(
+                    task.consumed_req_tokens - consumed_before_prefill
+                )
 
         num_full_blocks = task.consumed_req_tokens // self.block_size
         self.update_prefix_caching_metadata(task, num_full_blocks)

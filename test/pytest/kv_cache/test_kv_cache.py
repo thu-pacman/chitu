@@ -150,7 +150,7 @@ class TestPagedKVCache:
             tokens=[[1, 1], [1, 2, 3, 4, 5, 6, 7, 8, 9]],
             num_tokens=11,
             new_cache_ids_list=[[0, 1], [2]],
-            hit_token_lens=[512, 0],
+            inc_hit_tokens_list=[512, 0],
         )
         # req_3: [1]*512 + [1,1]
         # req_4: prompt length小于block size, 无法被击中

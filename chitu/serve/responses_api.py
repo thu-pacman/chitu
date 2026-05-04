@@ -420,12 +420,14 @@ def _response_status_and_incomplete_details(
 def _response_usage(req: UserRequest) -> dict[str, Any]:
     completion_tokens = req.async_stream.tokens_len
     prompt_tokens = req.prompt_len
+    cached_tokens = int(getattr(req, "num_hit_tokens", 0))
     return {
         "input_tokens": prompt_tokens,
-        "input_tokens_details": {"cached_tokens": 0},
+        "input_tokens_details": {"cached_tokens": cached_tokens},
         "output_tokens": completion_tokens,
         "output_tokens_details": {"reasoning_tokens": 0},
         "total_tokens": prompt_tokens + completion_tokens,
+        "cached_token": cached_tokens,
     }
 
 

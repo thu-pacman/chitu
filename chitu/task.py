@@ -128,6 +128,7 @@ class UserRequest:
         self.async_stream = AsyncDataStream(self.enable_thinking)
         self.finish_reason = None
         self.num_output_tokens = 0
+        self.num_hit_tokens = 0  # 该请求被击中的token总数（全量）
 
         # test information related
         self._test_flag = False
@@ -419,7 +420,7 @@ class Task:
 
         # prefix caching
         self.token_blocks: list[TokenBlock] = []
-        self.hit_token_len: int = 0
+        self.inc_hit_tokens: int = 0  # 该任务在每个step中被击中的token数（增量）
 
         # Response
         self.num_new_tokens: int = 0
@@ -478,6 +479,12 @@ class Task:
 
         # PD prefill info
         self.pd_prefill_engine_rank: Optional[int] = None
+
+    def set_inc_hit_tokens(self, num: int) -> None:
+        # Per-step incremental hit tokens; clamp negatives to avoid metric drift.
+        self.inc_hit_tokens = max(0, int(num))
+        if self.inc_hit_tokens > 0 and self.req is not None:
+            self.req.num_hit_tokens += self.inc_hit_tokens
 
     def prompt_to_token_block(self, dp_rank) -> list[TokenBlock]:
         """
@@ -627,8 +634,6 @@ class Task:
             self.prefix_tokens.extend(self.mtp_token_list)
         self.prefix_tokens.append(self.next_token)
         self.has_unsync_new_token = False
-        # if Backend.cache_managers is not None:
-        #     Backend.cache_managers[self.dp_rank]["main"].update_metadata_after_decode(self, 1)
 
     def update_response_sync(self, token: Union[int, torch.Tensor]):
         self.update_response_no_sync(token)
@@ -958,7 +963,7 @@ class PackedTasksBase:
     # Used to pass the newly added prefix-cache hit lengths from the current step
     # from KVCacheManager to KVCache. This is populated only when new hits are
     # added; otherwise it is [].
-    hit_token_lens: list[int] = field(default_factory=list)
+    inc_hit_tokens_list: list[int] = field(default_factory=list)
     # Used by PD Decode KV pull. Stores the prefix length of each request in the
     # current batch.
     prefix_lens: list[int] = field(default_factory=list)
@@ -1037,8 +1042,8 @@ class PackedTasks(PackedTasksBase):
 
         if any(task.new_cache_ids for task in self.tasks):
             self.new_cache_ids_list = [task.new_cache_ids for task in self.tasks]
-        if any(task.hit_token_len for task in self.tasks):
-            self.hit_token_lens = [task.hit_token_len for task in self.tasks]
+        if any(task.inc_hit_tokens for task in self.tasks):
+            self.inc_hit_tokens_list = [task.inc_hit_tokens for task in self.tasks]
         self.prefix_lens = [int(task.prefix_tokens_len) for task in self.tasks]
 
         self.payload_type = SerializedPackedTasksPayloadType(self.task_type.value)

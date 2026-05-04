@@ -3515,6 +3515,7 @@ class KVManager:
         first_tokens: Optional[torch.Tensor],
         request_ids: list[str],
         kv_cache,
+        request_cached_tokens: Optional[dict[str, int]] = None,
     ):
         """Send KV cache for multiple requests (Prefill mode).
 
@@ -3598,7 +3599,16 @@ class KVManager:
             should_send_aux = isinstance(first_tokens, torch.Tensor)
             if should_send_aux:
                 logger.debug(f"Allocating metadata buffer for {room}")
-                aux_index = self.metadata_buffers.allocate(room, first_tokens[index])
+                cached_tokens = (
+                    int(request_cached_tokens.get(request_id, 0))
+                    if isinstance(request_cached_tokens, dict)
+                    else 0
+                )
+                aux_index = self.metadata_buffers.allocate(
+                    room,
+                    first_tokens[index],
+                    num_hit_tokens=cached_tokens,
+                )
 
             # Get KV indices from cache.
             if not hasattr(kv_cache, "get_page_indices"):
@@ -3991,7 +4001,7 @@ class KVManager:
         kv_cache: "KVCacheBase",
         prefix_lens: Optional[list[int]] = None,
         cache_ids_list: Optional[list[list[int]]] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Receive KV cache and insert to cache (Decode mode)
 
         If prepare_kv_transfer() was called earlier, this function will use the
@@ -4002,7 +4012,7 @@ class KVManager:
         """
         if self.disaggregation_mode != DisaggregationMode.DECODE:
             logger.warning("recv_kv_cache_and_insert called in non-decode mode")
-            return torch.empty(0)
+            return torch.empty(0), torch.empty(0)
 
         if prefix_lens is None or len(prefix_lens) != len(request_ids):
             raise ValueError(
@@ -4327,8 +4337,8 @@ class KVManager:
 
         self.reorder_kvcache(room_ids)
 
-        # Fetch first-token ids from aux buffer
-        first_tokens = self.metadata_buffers.get(aux_indices)
+        # Fetch first-token ids and cached-hit tokens from aux buffer
+        first_tokens, cached_hit_tokens = self.metadata_buffers.get(aux_indices)
         if pd_trace_enabled():
             logger.debug(
                 f"[PD_TRACE][decode.kv_transfer_done] req_ids={request_ids} "
@@ -4404,7 +4414,7 @@ class KVManager:
             ):
                 del self._prepared_transfers[room]
 
-        return first_tokens
+        return first_tokens, cached_hit_tokens
 
     def reorder_kvcache(self, room_ids: list):
         # Reorder KV layout when Prefill uses TP>1 and Decode uses TP=1.
