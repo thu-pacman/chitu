@@ -5,6 +5,7 @@
 from typing import Optional
 
 from chitu.moe.impl import MoEImplBase, MoEImplEP
+from chitu.moe.load_balancer import get_moe_load_planner
 from chitu.global_vars import get_global_args
 
 
@@ -41,12 +42,23 @@ def compute_expert_dist_in_ep(
     num_moe_layers: int, ep_size: int, num_experts: int, moe_impl: Optional[MoEImplBase]
 ) -> list[list[list[int]]]:  # expert ids for each layer for each ep rank
     if isinstance(moe_impl, MoEImplEP):
-        return [
-            [
-                moe_impl.load_balancer[layer_id].get_local_experts(ep_rank)
-                for layer_id in moe_impl.moe_layer_id_list
+        enable_dynamic_load_balance = get_global_args().infer.moe_lb_trigger > 0
+        if enable_dynamic_load_balance:
+            planner = get_moe_load_planner()
+            return [
+                [
+                    planner.get_current_mapping(layer_id)[ep_rank]
+                    for layer_id in moe_impl.moe_layer_id_list
+                ]
+                for ep_rank in range(ep_size)
             ]
-            for ep_rank in range(ep_size)
-        ]
+        else:
+            return [
+                [
+                    moe_impl.load_balancer[layer_id].get_local_experts(ep_rank)
+                    for layer_id in moe_impl.moe_layer_id_list
+                ]
+                for ep_rank in range(ep_size)
+            ]
     else:
         return [[list(range(num_experts))] * num_moe_layers] * ep_size
