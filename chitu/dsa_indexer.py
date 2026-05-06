@@ -74,7 +74,7 @@ class DSAIndexer:
         """
         weights = weights.view(q.shape[0], q.shape[1])  # [s_q, h=64]
         k = k.view(k.shape[0], -1)  # [s_k, h=1, d=128]
-        k_s = k_s.squeeze()  # [s_k,]
+        k_s = k_s.reshape(k.shape[0])  # [s_k,]
 
         ks = seq_len_delta.new.prefix_lens_tensor_device[
             seq_len_delta.delta_seq_ids_tensor_device
