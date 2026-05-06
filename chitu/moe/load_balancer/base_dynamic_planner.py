@@ -192,19 +192,6 @@ class BaseMoELoadPlanner(ABC):
         """
         return [t.clone() for t in self._mapping[layer_id]]
 
-    def get_mapping_tensor(self, layer_id: int) -> torch.Tensor:
-        """Return mapping tensor for a layer.
-
-        Args:
-            layer_id: Layer index.
-
-        Returns:
-            LongTensor of shape [ep_size, num_local_experts], mapping local slot -> global expert id.
-        """
-        return (
-            torch.stack(self._mapping[layer_id], dim=0).clone().to(self._stats_device)
-        )
-
     def route_expert_ids(self, layer_id: int, expert_ids: torch.Tensor) -> torch.Tensor:
         """Map global expert ids to (rank, local_slot) using pre-built inverse mapping."""
         inv = self.inv_mappings[layer_id]
