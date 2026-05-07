@@ -23,15 +23,15 @@ def _get_numa_of_gpu(gpu_id: int):
             "Detecting NUMA node near GPU is only supported on NVIDIA GPUs"
         )
 
-    try:
-        # Get PCI bus ID from nvidia-smi
-        result = subprocess.run(
-            f"nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i {gpu_id}",
-            shell=True,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        try:
+            # Get PCI bus ID from nvidia-smi
+            result = subprocess.run(
+                ['nvidia-smi', '--query-gpu=pci.bus_id', '--format=csv,noheader', '-i', str(gpu_id)],
+                shell=False,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
         pci_bus_id = result.stdout.strip()
 
         # Convert format (e.g., 00000000:3B:00.0 -> 0000:3b:00.0)
