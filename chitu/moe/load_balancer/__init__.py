@@ -7,7 +7,7 @@ from typing import Optional
 from logging import getLogger
 
 from chitu.moe.load_balancer.base import MoELoadBalancer
-from chitu.moe.load_balancer.large_scale_balancer import MoESlotCntLoadBalancer
+from chitu.moe.load_balancer.slot_cnt_balancer import MoESlotCntLoadBalancer
 from chitu.moe.load_balancer.executor import (
     ExpertParamAccessor,
     WeightMigrationExecutor,

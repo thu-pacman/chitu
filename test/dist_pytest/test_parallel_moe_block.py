@@ -56,6 +56,7 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
         [2048, 128, 8, 768],  # Qwen3-30B-A3B
     ],
 )
+@pytest.mark.parametrize("slot_ratio", [1.0, 1.5])
 @pytest.mark.parametrize("merge_gate_up", [False, True])
 @pytest.mark.parametrize("task_type", [TaskType.Prefill, TaskType.Decode])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -74,6 +75,7 @@ def test_parallel_moe_block(
     n_experts,
     topk,
     moe_inter_dim,
+    slot_ratio,
     merge_gate_up,
     task_type,
     dtype,
@@ -133,6 +135,8 @@ def test_parallel_moe_block(
         pytest.skip(f"n_experts({n_experts}) should be divisible by ep_size({ep_size})")
 
     # Other filters
+    if ep_size == 1 and slot_ratio != 1.0:
+        pytest.skip("slot_ratio is only available for EP")
     if is_ascend_910b() and dp_size > 1 and ep_size > 1 and ep_size % 16 != 0:
         pytest.skip("DP+EP on Ascend 910B requires ep_size % 16 == 0")
 
@@ -215,8 +219,9 @@ def test_parallel_moe_block(
         local_batch_size = compute_local_batch_size_dist_in_dp(batch_size, dp_size)[
             dp_group.rank_in_group
         ]
-        experts_start_idx = ep_group.rank_in_group * n_experts // ep_size
-        experts_end_idx = (ep_group.rank_in_group + 1) * n_experts // ep_size
+        n_slots = int(n_experts * slot_ratio)
+        experts_start_idx = ep_group.rank_in_group * n_slots // ep_size
+        experts_end_idx = (ep_group.rank_in_group + 1) * n_slots // ep_size
         if ep_size > 1:
             kwargs = {}
             if task_type == TaskType.Prefill:
@@ -231,6 +236,7 @@ def test_parallel_moe_block(
                     ceil_div(batch_size, dp_size) if task_type == TaskType.Decode else 1
                 ),
                 n_experts=n_experts,
+                n_global_experts_slots=n_slots,
                 use_cuda_graph=False,
                 tp_group=tp_group,
                 dp_group=dp_group,
@@ -238,6 +244,16 @@ def test_parallel_moe_block(
                 ep_group=ep_group,
                 **kwargs,
             )
+            slot_to_expert = moe_impl.load_balancer[0].get_local_experts(
+                ep_group.rank_in_group
+            )
+            experts_gate_weight_in_local_slots = global_experts_gate_weight[
+                slot_to_expert
+            ]
+            experts_up_weight_in_local_slots = global_experts_up_weight[slot_to_expert]
+            experts_down_weight_in_local_slots = global_experts_down_weight[
+                slot_to_expert
+            ]
         else:
             moe_impl = MoEImplNoEP(
                 tp_group=tp_group,
@@ -245,6 +261,9 @@ def test_parallel_moe_block(
                 etp_group=etp_group,
                 ep_group=ep_group,
             )
+            experts_gate_weight_in_local_slots = global_experts_gate_weight
+            experts_up_weight_in_local_slots = global_experts_up_weight
+            experts_down_weight_in_local_slots = global_experts_down_weight
         moe_impl.prepare(task_type, local_batch_size)
         if merge_gate_up:
             moe_experts_cls = NormalMoeExpertsMerged
@@ -270,7 +289,7 @@ def test_parallel_moe_block(
             moe_experts_cls(
                 dim=hidden_dim,
                 moe_inter_dim=moe_inter_dim // etp_size,
-                global_n_experts=n_experts,
+                global_n_experts=n_slots,
                 experts_start_idx=experts_start_idx,
                 experts_end_idx=experts_end_idx,
                 n_shared_experts=0,
@@ -288,35 +307,25 @@ def test_parallel_moe_block(
         state_dict = {
             "gate.weight": global_gate_weight,
             "experts.down_proj_weight": torch.chunk(
-                global_experts_down_weight[experts_start_idx:experts_end_idx],
-                etp_size,
-                dim=2,
+                experts_down_weight_in_local_slots, etp_size, dim=2
             )[etp_group.rank_in_group].contiguous(),
         }
         if not merge_gate_up:
             state_dict["experts.gate_proj_weight"] = torch.chunk(
-                global_experts_gate_weight[experts_start_idx:experts_end_idx],
-                etp_size,
-                dim=1,
+                experts_gate_weight_in_local_slots, etp_size, dim=1
             )[etp_group.rank_in_group].contiguous()
             state_dict["experts.up_proj_weight"] = torch.chunk(
-                global_experts_up_weight[experts_start_idx:experts_end_idx],
-                etp_size,
-                dim=1,
+                experts_up_weight_in_local_slots, etp_size, dim=1
             )[etp_group.rank_in_group].contiguous()
         else:
             state_dict["experts.gate_up_proj_weight"] = torch.cat(
                 [
-                    torch.chunk(
-                        global_experts_gate_weight[experts_start_idx:experts_end_idx],
-                        etp_size,
-                        dim=1,
-                    )[etp_group.rank_in_group],
-                    torch.chunk(
-                        global_experts_up_weight[experts_start_idx:experts_end_idx],
-                        etp_size,
-                        dim=1,
-                    )[etp_group.rank_in_group],
+                    torch.chunk(experts_gate_weight_in_local_slots, etp_size, dim=1)[
+                        etp_group.rank_in_group
+                    ],
+                    torch.chunk(experts_up_weight_in_local_slots, etp_size, dim=1)[
+                        etp_group.rank_in_group
+                    ],
                 ],
                 dim=1,
             )
@@ -423,6 +432,7 @@ def test_parallel_moe_block(
     ],
 )
 @pytest.mark.parametrize("quant_block_size", [128])
+@pytest.mark.parametrize("slot_ratio", [1.0, 1.5])
 @pytest.mark.parametrize("merge_gate_up", [False, True])
 @pytest.mark.parametrize("task_type", [TaskType.Prefill, TaskType.Decode])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -446,6 +456,7 @@ def test_parallel_moe_block_blockfp8(
     n_experts,
     topk,
     moe_inter_dim,
+    slot_ratio,
     merge_gate_up,
     task_type,
     dtype,
@@ -492,6 +503,10 @@ def test_parallel_moe_block_blockfp8(
         )
     if n_experts % ep_size != 0:
         pytest.skip(f"n_experts({n_experts}) should be divisible by ep_size({ep_size})")
+
+    # Other filters
+    if ep_size == 1 and slot_ratio != 1.0:
+        pytest.skip("slot_ratio is only available for EP")
 
     ############################################################################
     # Setup distributed environment
@@ -603,8 +618,9 @@ def test_parallel_moe_block_blockfp8(
         local_batch_size = compute_local_batch_size_dist_in_dp(batch_size, dp_size)[
             dp_group.rank_in_group
         ]
-        experts_start_idx = ep_group.rank_in_group * n_experts // ep_size
-        experts_end_idx = (ep_group.rank_in_group + 1) * n_experts // ep_size
+        n_slots = int(n_experts * slot_ratio)
+        experts_start_idx = ep_group.rank_in_group * n_slots // ep_size
+        experts_end_idx = (ep_group.rank_in_group + 1) * n_slots // ep_size
         if ep_size > 1:
             kwargs = {}
             if task_type == TaskType.Prefill:
@@ -619,6 +635,7 @@ def test_parallel_moe_block_blockfp8(
                     ceil_div(batch_size, dp_size) if task_type == TaskType.Decode else 1
                 ),
                 n_experts=n_experts,
+                n_global_experts_slots=n_slots,
                 use_cuda_graph=False,
                 tp_group=tp_group,
                 dp_group=dp_group,
@@ -626,6 +643,23 @@ def test_parallel_moe_block_blockfp8(
                 ep_group=ep_group,
                 **kwargs,
             )
+            slot_to_expert = moe_impl.load_balancer[0].get_local_experts(
+                ep_group.rank_in_group
+            )
+            experts_gate_weight_in_local_slots = global_experts_gate_weight[
+                slot_to_expert
+            ]
+            experts_gate_scale_in_local_slots = global_experts_gate_scale[
+                slot_to_expert
+            ]
+            experts_up_weight_in_local_slots = global_experts_up_weight[slot_to_expert]
+            experts_up_scale_in_local_slots = global_experts_up_scale[slot_to_expert]
+            experts_down_weight_in_local_slots = global_experts_down_weight[
+                slot_to_expert
+            ]
+            experts_down_scale_in_local_slots = global_experts_down_scale[
+                slot_to_expert
+            ]
         else:
             moe_impl = MoEImplNoEP(
                 tp_group=tp_group,
@@ -633,6 +667,12 @@ def test_parallel_moe_block_blockfp8(
                 etp_group=etp_group,
                 ep_group=ep_group,
             )
+            experts_gate_weight_in_local_slots = global_experts_gate_weight
+            experts_gate_scale_in_local_slots = global_experts_gate_scale
+            experts_up_weight_in_local_slots = global_experts_up_weight
+            experts_up_scale_in_local_slots = global_experts_up_scale
+            experts_down_weight_in_local_slots = global_experts_down_weight
+            experts_down_scale_in_local_slots = global_experts_down_scale
         moe_impl.prepare(task_type, local_batch_size)
         if merge_gate_up:
             moe_experts_cls = Blockfp8MoeExpertsMerged
@@ -658,7 +698,7 @@ def test_parallel_moe_block_blockfp8(
             moe_experts_cls(
                 dim=hidden_dim,
                 moe_inter_dim=moe_inter_dim // etp_size,
-                global_n_experts=n_experts,
+                global_n_experts=n_slots,
                 experts_start_idx=experts_start_idx,
                 experts_end_idx=experts_end_idx,
                 n_shared_experts=0,
@@ -677,65 +717,45 @@ def test_parallel_moe_block_blockfp8(
         state_dict = {
             "gate.weight": global_gate_weight,
             "experts.down_proj_weight": torch.chunk(
-                global_experts_down_weight[experts_start_idx:experts_end_idx],
-                etp_size,
-                dim=2,
+                experts_down_weight_in_local_slots, etp_size, dim=2
             )[etp_group.rank_in_group].contiguous(),
             "experts.down_proj_scale": torch.chunk(
-                global_experts_down_scale[experts_start_idx:experts_end_idx],
-                etp_size,
-                dim=2,
+                experts_down_scale_in_local_slots, etp_size, dim=2
             )[etp_group.rank_in_group].contiguous(),
         }
         if not merge_gate_up:
             state_dict["experts.gate_proj_weight"] = torch.chunk(
-                global_experts_gate_weight[experts_start_idx:experts_end_idx],
-                etp_size,
-                dim=1,
+                experts_gate_weight_in_local_slots, etp_size, dim=1
             )[etp_group.rank_in_group].contiguous()
             state_dict["experts.gate_proj_scale"] = torch.chunk(
-                global_experts_gate_scale[experts_start_idx:experts_end_idx],
-                etp_size,
-                dim=1,
+                experts_gate_scale_in_local_slots, etp_size, dim=1
             )[etp_group.rank_in_group].contiguous()
             state_dict["experts.up_proj_weight"] = torch.chunk(
-                global_experts_up_weight[experts_start_idx:experts_end_idx],
-                etp_size,
-                dim=1,
+                experts_up_weight_in_local_slots, etp_size, dim=1
             )[etp_group.rank_in_group].contiguous()
             state_dict["experts.up_proj_scale"] = torch.chunk(
-                global_experts_up_scale[experts_start_idx:experts_end_idx],
-                etp_size,
-                dim=1,
+                experts_up_scale_in_local_slots, etp_size, dim=1
             )[etp_group.rank_in_group].contiguous()
         else:
             state_dict["experts.gate_up_proj_weight"] = torch.cat(
                 [
-                    torch.chunk(
-                        global_experts_gate_weight[experts_start_idx:experts_end_idx],
-                        etp_size,
-                        dim=1,
-                    )[etp_group.rank_in_group],
-                    torch.chunk(
-                        global_experts_up_weight[experts_start_idx:experts_end_idx],
-                        etp_size,
-                        dim=1,
-                    )[etp_group.rank_in_group],
+                    torch.chunk(experts_gate_weight_in_local_slots, etp_size, dim=1)[
+                        etp_group.rank_in_group
+                    ],
+                    torch.chunk(experts_up_weight_in_local_slots, etp_size, dim=1)[
+                        etp_group.rank_in_group
+                    ],
                 ],
                 dim=1,
             )
             state_dict["experts.gate_up_proj_scale"] = torch.cat(
                 [
-                    torch.chunk(
-                        global_experts_gate_scale[experts_start_idx:experts_end_idx],
-                        etp_size,
-                        dim=1,
-                    )[etp_group.rank_in_group],
-                    torch.chunk(
-                        global_experts_up_scale[experts_start_idx:experts_end_idx],
-                        etp_size,
-                        dim=1,
-                    )[etp_group.rank_in_group],
+                    torch.chunk(experts_gate_scale_in_local_slots, etp_size, dim=1)[
+                        etp_group.rank_in_group
+                    ],
+                    torch.chunk(experts_up_scale_in_local_slots, etp_size, dim=1)[
+                        etp_group.rank_in_group
+                    ],
                 ],
                 dim=1,
             )

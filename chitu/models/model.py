@@ -45,7 +45,10 @@ from chitu.distributed.parallel_state import (
     get_embed_tokens_lm_head_tp_group,
     get_embed_tokens_lm_head_tp_size,
 )
-from chitu.distributed.partition import compute_layer_dist_in_pp
+from chitu.distributed.partition import (
+    compute_layer_dist_in_pp,
+    compute_expert_dist_in_ep,
+)
 from chitu.moe import get_moe_impl, MoEImplBase
 from chitu.moe.batched_routed_activation import IndexedBatchedRoutedActivation
 from chitu.moe.load_balancer import get_moe_load_planner
@@ -256,6 +259,7 @@ class Transformer(nn.Module):
         self.tensor_exec = tensor_parallel_size > 1
 
         self.tp_size = tensor_parallel_size
+        self.tp_group = get_tp_group()
         self.pp_size = pipeline_parallel_size
         self.dp_size = get_dp_size()
         self.ep_group = get_ep_group()
@@ -461,12 +465,31 @@ class Transformer(nn.Module):
         )
         return module
 
+    def _chunk_checkpoint_for_expert_parallel(
+        self, checkpoint: dict[str, Any], rank: int, ep_size: int
+    ):
+        local_experts = compute_expert_dist_in_ep(
+            self.global_n_layers - self.moe_impl.n_dense_layers,  # MTP layer included
+            ep_size,
+            self.moe_impl.n_experts,
+            self.moe_impl,
+        )[rank]
+
+        for key in list(checkpoint.keys()):
+            key_split = key.split(".")
+            if key_split[0] != "layers":
+                continue
+            layer_id = int(key_split[1])
+            if (".experts." in key) and all(
+                f"{layer_id}.mlp.experts.{x}." not in key
+                for x in local_experts[layer_id - self.moe_impl.n_dense_layers]
+            ):
+                checkpoint.pop(key, None)
+
+        return checkpoint
+
     def _chunk_checkpoint_for_pipeline_parallel(
-        self,
-        checkpoint: dict[str, Any],
-        num_layers: int,
-        rank: int,
-        pp_size: int,
+        self, checkpoint: dict[str, Any], num_layers: int, rank: int, pp_size: int
     ):
         keys = checkpoint.keys()
         partial_checkpoint = {}
@@ -497,10 +520,7 @@ class Transformer(nn.Module):
         return partial_checkpoint
 
     def _chunk_checkpoint_for_tensor_parallel(
-        self,
-        checkpoint: dict[str, Any],
-        rank: int,
-        tp_size: int,
+        self, checkpoint: dict[str, Any], rank: int, tp_size: int
     ):
         partial_checkpoint = {}
 
@@ -947,27 +967,10 @@ class Transformer(nn.Module):
     ) -> dict[str, Any]:
         if not skip_preprocess:
             state_dict = self.process_state_dict_for_blockfp4_before_chunk(state_dict)
-            # handle ep param
             if self.ep_size > 1:
-                local_experts = [
-                    self.moe_impl.load_balancer[layer_id].get_local_experts(
-                        self.moe_impl.ep_group.rank_in_group
-                    )
-                    for layer_id in self.moe_impl.moe_layer_id_list
-                ]
-                state_dict_keys = list(state_dict.keys())
-
-                for key in state_dict_keys:
-                    key_split = key.split(".")
-                    if key_split[0] != "layers":
-                        continue
-                    layer_id = int(key_split[1])
-                    if (".experts." in key) and all(
-                        f"{layer_id}.mlp.experts.{x}." not in key
-                        for x in local_experts[layer_id - self.moe_impl.n_dense_layers]
-                    ):
-                        state_dict.pop(key, None)
-
+                state_dict = self._chunk_checkpoint_for_expert_parallel(
+                    state_dict, self.ep_group.rank_in_group, self.ep_size
+                )
             if self.pipeline_exec:
                 state_dict = self._chunk_checkpoint_for_pipeline_parallel(
                     state_dict, self.global_n_layers, self.pp_stage, self.pp_size
@@ -983,13 +986,13 @@ class Transformer(nn.Module):
                 state_dict = self.process_state_dict_for_repeat_kv_head(state_dict)
 
                 state_dict = self._chunk_checkpoint_for_tensor_parallel(
-                    state_dict, self.rank % self.tp_size, self.tp_size
+                    state_dict, self.tp_group.rank_in_group, self.tp_size
                 )
             if self.specialize_embed_tokens_lm_head_parallel:
                 state_dict = (
                     self._chunk_checkpoint_for_specialize_embed_tokens_lm_head_parallel(
                         state_dict,
-                        self.rank % self.embed_tokens_lm_head_tp_size,
+                        self.embed_tokens_lm_head_tp_rank,
                         self.embed_tokens_lm_head_tp_size,
                     )
                 )
@@ -1820,10 +1823,13 @@ class ParallelMoeBlock(nn.Module):
             self.shared_experts_stream = _make_shared_experts_stream()
 
         self.moe_impl = moe_impl
+        self.expert_mapping = None
         if self.moe_impl is not None and self.moe_impl.ep_size > 1:
-            self.expert_mapping = self.moe_impl.get_expert_mapping(layer_id=layer_id)
-        else:
-            self.expert_mapping = None
+            if (m := self.moe_impl.get_expert_mapping(layer_id)).tolist() != list(
+                range(self.gate.n_experts)
+            ):
+                # Only do permutation on run time if the mapping is not identical
+                self.expert_mapping = m
 
         self.checkpoint_prefix = checkpoint_prefix
         self.layer_id = layer_id

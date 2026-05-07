@@ -19,10 +19,17 @@ class MoELoadBalancer(ABC):
     """
 
     def __init__(
-        self, num_experts: int, num_slots: int, ep_size: int, is_cuda: bool = True
+        self,
+        num_experts: int,
+        num_slots: int,
+        *,
+        dp_size: int,
+        ep_size: int,
+        is_cuda: bool = True,
     ):
         self.num_experts = num_experts
         self.num_slots = num_slots
+        self.dp_size = dp_size
         self.ep_size = ep_size
         self.is_cuda = is_cuda
 
@@ -60,8 +67,8 @@ class MoELoadBalancer(ABC):
             assert expert_instance_counter[e] > 0, f"expert {e} has no instance."
 
         slot_counter = [0 for _ in range(self.num_slots)]
-        for ep_rank in range(self.ep_size):
-            expert_mapping = self.get_expert_mapping(ep_rank)
+        for dp_rank in range(self.dp_size):
+            expert_mapping = self.get_expert_mapping(dp_rank)
             for e in range(self.num_experts):
                 slot_counter[expert_mapping[e]] += 1
 
@@ -92,10 +99,17 @@ class MoELoadBalancer(ABC):
         raise NotImplementedError("get slot mapping not implemented.")
 
     @abstractmethod
-    def get_expert_mapping(self, src_rank: int) -> torch.Tensor:
+    def get_expert_mapping(self, dp_rank: int) -> torch.Tensor:
         """
-        Given source rank, return a tensor with shape [num_experts], representing the
-        mapping from expert ID to slot ID. Source ranks meaning DP*TP/ETP ranks, i.e.
-        EP ranks before communication.
+        Given communication source (DP) rank, return a tensor with shape [num_experts],
+        representing the mapping from expert ID to slot ID. Different DP ranks may
+        get different mappings.
+
+        NOTE on TP: Mappings will be the same for the same DP rank, even the TP rank is
+        different. This is because any request should have a consistent mapping.
+        Counter example: Consider TP2+EP2, if a request chooses expert 0, where expert
+        0 is routed to slots in EP Rank 1 in TP Rank 0 and routed to slots in EP Rank 0
+        in TP Rank 1, because there is no communication in TP+EP, none of the two EP
+        ranks will do the computation.
         """
         raise NotImplementedError("get expert mapping not implemented")

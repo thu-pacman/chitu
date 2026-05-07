@@ -22,29 +22,24 @@ def assign_groups_contiguous(N, M):
     return groups
 
 
-def gen_mapping_from_instance_idx(
-    ep_size,
-    num_experts,
-    instance_idx,
-    is_cuda,
-):
+def gen_mapping_from_instance_idx(dp_size, num_experts, instance_idx, is_cuda):
     expert_mapping_list = []
-    for _ in range(ep_size):
+    for _ in range(dp_size):
         expert_mapping_list.append([None for _ in range(num_experts)])
 
     for e in range(num_experts):
         instance_count = len(instance_idx[e])
-        groups = assign_groups_contiguous(ep_size, instance_count)
-        for src_rank in range(ep_size):
-            expert_mapping_list[src_rank][e] = instance_idx[e][groups[src_rank]]
+        groups = assign_groups_contiguous(dp_size, instance_count)
+        for dp_rank in range(dp_size):
+            expert_mapping_list[dp_rank][e] = instance_idx[e][groups[dp_rank]]
 
     expert_mapping_list = [
         torch.tensor(
-            expert_mapping_list[src_rank],
+            expert_mapping_list[dp_rank],
             device=torch.cuda.current_device(),
             dtype=torch.int32,
         )
-        for src_rank in range(ep_size)
+        for dp_rank in range(dp_size)
     ]
 
     return expert_mapping_list
@@ -66,39 +61,58 @@ class MoESlotCntLoadBalancer(MoELoadBalancer):
     It ensures that:
     - Each expert has at least one slot.
     - Every slot has the opportunity to be used.
+    - Experts are assigned to slots according to their statistics of activation counts.
+      If there are no such statistics, the value of all experts are assumed to be equal.
 
     This specialization does NOT ensure that:
     - Tokens are balanced across slots.
     - Each token choose its nearest expert.
 
-    Algorithm:
-    1. Slots are partitioned contiguously to EP ranks.
-    2. Experts are assigned to slots in a round-robin manner, or by pre-collected
-       stats.
-    3. Slots holding the same expert are distributed to source ranks evenly.
-       Source ranks meaning DP*TP/ETP ranks, i.e. EP ranks before communication.
+    There are two algorithms:
+    1. Greedy.
+    2. EPLB.
+
+    Greedy Algorithm:
+    1. First decide how many instances per each expert:
+        a. Each expert has at least one instance.
+        b. If there are still vacant slots, choose the expert with the greatest activation
+           count. If the activation count is the same choose the expert with the smallest
+           ID.
+        c. If an expert now has `n_instancse` instances, its activation count is reduced
+           to `original_activation_count / n_instances`, assuming the activation will be
+           evenly divided across instances.
+        d. Repeat until there are no more vacant slots.
+    2. Then assign expert instances to slots. Slots are assigned in a round-robin manner,
+       but the slots are assigned in an expert-then-local-slot order, so that the same
+       expert will unlikely be assigned to slots on the same rank.
 
     Example: 6 experts, 9 slots, 3 ranks, no pre-collected stats.
 
-    First assign experts to slot:
+    First decide instance count for each expert:
 
-    | EP Rank   | 0         | 1         | 2         |
-    | Slot ID   | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
-    | Expert ID | 0 | 1 | 2 | 3 | 4 | 5 | 0 | 1 | 2 |
+    | Expert ID   | 0 | 1 | 2 | 3 | 4 | 5 |
+    | # instances | 2 | 2 | 2 | 1 | 1 | 1 |
+
+    Then assign experts to slot:
+
+    | EP Rank      | 0         | 1         | 2         |
+    | Slot ID      | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+    | Assign order | 1 | 4 | 5 | 2 | 6 | 7 | 3 | 8 | 9 |
+    | Expert ID    | 0 | 1 | 3 | 0 | 2 | 4 | 1 | 2 | 5 |
 
     Note that each of Expert 0-2 has two slots each, while each of Expert 3-5
     only has one slot.
 
     | Expert ID | 0     | 1     | 2     | 3 | 4 | 5 |
-    | Slot ID   | 0 | 6 | 1 | 7 | 2 | 8 | 3 | 4 | 5 |
+    | Slot ID   | 0 | 3 | 1 | 6 | 4 | 7 | 2 | 5 | 8 |
 
-    We then distribute slots to EP ranks according to this slot count:
+    We then distribute slots to DP ranks according to this slot count:
 
-    | Src Rank \ Expert ID | 0 | 1 | 2 | 3 | 4 | 5 |
-    |----------------------|---|---|---|---|---|---|
-    | 0                    | 0 | 1 | 2 | 3 | 4 | 5 |
-    | 1                    | 0 | 1 | 2 | 3 | 4 | 5 |
-    | 2                    | 6 | 7 | 8 | 3 | 4 | 5 |
+    | DP Rank \ Expert ID | 0 | 1 | 2 | 3 | 4 | 5 |
+    |---------------------|---|---|---|---|---|---|
+    | 0                   | 0 | 1 | 4 | 2 | 5 | 8 |
+    | 1                   | 0 | 1 | 4 | 2 | 5 | 8 |
+    | 2                   | 3 | 6 | 7 | 2 | 5 | 8 |
     """
 
     def generate_expert_mapping(
@@ -107,12 +121,12 @@ class MoESlotCntLoadBalancer(MoELoadBalancer):
         self.num_local_slots = self.num_slots // self.ep_size
 
         if expert_stats is None:
-            self.naive_assign_slot()
+            expert_stats = torch.ones(self.num_experts)
+
+        if eplb:
+            self.eplb_assign_slot(expert_stats)
         else:
-            if eplb:
-                self.eplb_assign_slot(expert_stats)
-            else:
-                self.greedy_assign_slot(expert_stats)
+            self.greedy_assign_slot(expert_stats)
 
         instance_idx = gen_instance_idx_from_slot(
             self.num_slots,
@@ -121,7 +135,7 @@ class MoESlotCntLoadBalancer(MoELoadBalancer):
         )
 
         self.expert_mapping_list = gen_mapping_from_instance_idx(
-            self.ep_size, self.num_experts, instance_idx, self.is_cuda
+            self.dp_size, self.num_experts, instance_idx, self.is_cuda
         )
 
     @override
@@ -135,22 +149,25 @@ class MoESlotCntLoadBalancer(MoELoadBalancer):
         return self.num_local_slots
 
     @override
-    def get_expert_mapping(self, src_rank):
-        return self.expert_mapping_list[src_rank]
+    def get_expert_mapping(self, dp_rank):
+        return self.expert_mapping_list[dp_rank]
 
     @override
     def get_slot_mapping(self):
         return self.slot_mapping
 
-    def naive_assign_slot(self):
-        # sequential assignment
-        self.slot_mapping = [idx % self.num_experts for idx in range(self.num_slots)]
-
     def greedy_assign_slot(self, expert_stats: torch.Tensor):
+        if self.num_slots == self.num_experts:
+            # Always use identical mapping in this trivial case, to avoid runtime
+            # permutation
+            self.slot_mapping = list(range(self.num_slots))
+            return
+
         assert expert_stats.shape == (self.num_experts,)
         instance_counter = [1] * self.num_experts
         remain_slots = self.num_slots - self.num_experts
         for _ in range(remain_slots):
+            # If multiple max value, torch.argmax returns the first
             expert_id = torch.argmax(expert_stats)
             cnt = instance_counter[expert_id]
             expert_stats[expert_id] = expert_stats[expert_id] * cnt / (cnt + 1)
