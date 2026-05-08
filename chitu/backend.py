@@ -1039,7 +1039,10 @@ class Backend:
             )[get_dp_group().rank_in_group]
             set_slot_handle(max_reqs_per_dp, args.infer.pp_size)
 
-        init_moe_impl(args)
+        if hasattr(args.models, "n_routed_experts") or hasattr(
+            args.models, "num_experts"
+        ):
+            init_moe_impl(args)
 
         # Setup environment and basic configuration
         Backend._setup_environment(args)

@@ -347,9 +347,7 @@ class NormalMoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
         global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
-        n_shared_experts: int,
         n_activated_experts: int,
-        fuse_shared_experts: bool,
         checkpoint_prefix: str,
         *,
         ############################################
@@ -362,9 +360,7 @@ class NormalMoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
             global_n_experts,
             experts_start_idx,
             experts_end_idx,
-            n_shared_experts,
             n_activated_experts,
-            fuse_shared_experts,
             checkpoint_prefix,
         )
 
@@ -420,9 +416,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
         global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
-        n_shared_experts: int,
         n_activated_experts: int,
-        fuse_shared_experts: bool,
         checkpoint_prefix: str,
         *,
         ############################################
@@ -435,9 +429,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
             global_n_experts,
             experts_start_idx,
             experts_end_idx,
-            n_shared_experts,
             n_activated_experts,
-            fuse_shared_experts,
             checkpoint_prefix,
         )
 
@@ -744,19 +736,6 @@ class NormLinearCPUInfer(QuantizedLinearBase):
     None, backend_type="cpuinfer", merge_gate_up=False
 )
 class NormalMoeExpertsCPUInfer(torch.nn.Module):
-    """
-    Mixture-of-Experts (MoE) module.
-
-    Attributes:
-        dim (int): Dimensionality of input features.
-        n_routed_experts (int): Total number of experts in the model.
-        n_local_experts (int): Number of experts handled locally in distributed systems.
-        n_activated_experts (int): Number of experts activated for each input.
-        gate (nn.Module): Gating mechanism to route inputs to experts.
-        experts (nn.ModuleList): List of expert modules.
-        shared_experts (nn.Module): Shared experts applied to all inputs.
-    """
-
     def __init__(
         self,
         dim: int,
@@ -764,9 +743,7 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
         global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
-        n_shared_experts: int,
         n_activated_experts: int,
-        fuse_shared_experts: bool,
         checkpoint_prefix: str,
     ):
         super().__init__()
@@ -775,15 +752,9 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
 
         self.moe_inter_dim = moe_inter_dim * get_tp_size()
         self.dim = dim
-        self.fuse_shared_experts = fuse_shared_experts
         self.max_batch_size = get_global_args().infer.max_batch_size
-        self.n_shared_experts = n_shared_experts
-        self.n_fused_shared_experts = (
-            n_shared_experts if self.fuse_shared_experts else 0
-        )
-        self.n_routed_experts = self.experts_end_idx - self.experts_start_idx
+        self.group_size = self.experts_end_idx - self.experts_start_idx
         self.n_activated_experts = n_activated_experts
-        self.group_size = self.n_routed_experts + self.n_fused_shared_experts
         self.checkpoint_prefix = checkpoint_prefix
 
         if torch.distributed.get_rank() == 0:
@@ -885,7 +856,7 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
                 ).contents
             )
             moe_config = cpuinfer.moe.MOEConfig(
-                self.n_routed_experts,
+                self.group_size,
                 self.n_activated_experts,
                 self.dim,
                 self.moe_inter_dim,

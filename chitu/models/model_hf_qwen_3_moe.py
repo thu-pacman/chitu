@@ -71,9 +71,7 @@ def Qwen3MoeExperts(
         global_n_experts=global_n_experts,
         experts_start_idx=experts_start_idx,
         experts_end_idx=experts_end_idx,
-        n_shared_experts=0,
         n_activated_experts=0,
-        fuse_shared_experts=False,
         checkpoint_prefix=f"{checkpoint_prefix}.moe",
     )
 
@@ -213,12 +211,9 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
         输出键：'layers.3.mlp.experts.gate_proj.part_name' (合并所有该层的专家权重)
         """
 
-        local_experts = compute_expert_dist_in_ep(
-            self.global_n_layers,
-            self.ep_size,
-            self.args.models.num_experts,
-            self.moe_impl,
-        )[self.ep_group.rank_in_group]
+        local_experts = compute_expert_dist_in_ep(self.global_n_layers, self.moe_impl)[
+            self.ep_group.rank_in_group
+        ]
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)

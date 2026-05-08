@@ -372,9 +372,7 @@ def LLaDA2MoeExperts(
         global_n_experts=global_n_experts,
         experts_start_idx=experts_start_idx,
         experts_end_idx=experts_end_idx,
-        n_shared_experts=0,
         n_activated_experts=0,
-        fuse_shared_experts=False,
         checkpoint_prefix=checkpoint_prefix,
     )
 
@@ -643,10 +641,7 @@ class TransformerLLaDA2(TransformerHFLlama):
             return checkpoint
 
         local_experts = compute_expert_dist_in_ep(
-            self.args.models.n_layers,
-            self.ep_size,
-            self.params.num_experts,
-            self.moe_impl,
+            self.args.models.n_layers, self.moe_impl
         )[self.ep_group.rank_in_group]
 
         checkpoint_keys = list(checkpoint.keys())

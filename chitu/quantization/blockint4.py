@@ -54,9 +54,7 @@ class BlockInt4MoeExpertsUnmerged(
         global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
-        n_shared_experts: int,
         n_activated_experts: int,
-        fuse_shared_experts: bool,
         checkpoint_prefix: str,
         ############################################
         # Parameters specific to this quantization
@@ -68,9 +66,7 @@ class BlockInt4MoeExpertsUnmerged(
             global_n_experts,
             experts_start_idx,
             experts_end_idx,
-            n_shared_experts,
             n_activated_experts,
-            fuse_shared_experts,
             checkpoint_prefix,
         )
 
@@ -284,10 +280,6 @@ class BlockInt4MoeExpertsUnmerged(
         Computes gate/up/down projections for all experts in parallel via the
         Marlin MoE grouped GEMM kernel, enabling CUDA graph compatibility.
         """
-        # Fused shared experts require a separate computation path that the
-        # grouped GEMM kernel does not support; fall back to iterative.
-        if self.fuse_shared_experts:
-            return QuantizedMoeExpertsUnmerged.forward_no_sum(self, routed_x, impl)
 
         if not self._marlin_repacked:
             self._repack_to_marlin()

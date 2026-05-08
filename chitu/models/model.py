@@ -470,8 +470,6 @@ class Transformer(nn.Module):
     ):
         local_experts = compute_expert_dist_in_ep(
             self.global_n_layers - self.moe_impl.n_dense_layers,  # MTP layer included
-            ep_size,
-            self.moe_impl.n_experts,
             self.moe_impl,
         )[rank]
 
@@ -1741,10 +1739,14 @@ class MoeGate(nn.Module):
         """
         if x.shape[0] == 0:
             return torch.empty(
-                (0, self.topk),
+                (0, self.topk + self.n_fused_shared_experts),
                 dtype=self.weight.dtype,
                 device=self.weight.device,
-            ), torch.empty((0, self.topk), dtype=torch.int32, device=self.weight.device)
+            ), torch.empty(
+                (0, self.topk + self.n_fused_shared_experts),
+                dtype=torch.int32,
+                device=self.weight.device,
+            )
         scores = F.linear(x, self.weight, self.bias)
 
         e_score_correction_bias = self.e_score_correction_bias
