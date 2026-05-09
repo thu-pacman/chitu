@@ -212,6 +212,10 @@ class DSAIndexer:
     ):
         delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
         delta_pos_ids = seq_len_delta.delta_position_ids_tensor_device
+        softfp8 = (
+            getattr(get_global_args().infer, "raise_lower_bit_float_to", None)
+            == "bfloat16"
+        )
 
         if isinstance(cache_accessor, PagedKVCacheAccessor):
             append_to_paged_kv_cache(
@@ -241,6 +245,7 @@ class DSAIndexer:
                 k_page_table=cache_accessor.block_table,
                 static_max_n=get_global_args().infer.max_seq_len,
                 causal=is_causal,
+                softfp8=softfp8,
                 impl=self.impl,
             )
         elif isinstance(cache_accessor, DenseKVCacheAccessor):
@@ -257,6 +262,7 @@ class DSAIndexer:
                 cache_accessor.kv["indexer_ks"],
                 seq_len_delta=seq_len_delta,
                 causal=is_causal,
+                softfp8=softfp8,
                 impl=self.impl,
             )
         else:
