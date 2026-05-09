@@ -20,6 +20,9 @@ from chitu.distributed.pd_disaggregation.pd_service import (
     start_decode_prepare_listener_thread,
 )
 from chitu.import_utils import try_import_opt_dep
+from chitu.distributed.pd_disaggregation.kv_transfer import (
+    kv_manager as kv_manager_module,
+)
 
 mooncake, has_mooncake = try_import_opt_dep("mooncake", "mooncake")
 
@@ -27,6 +30,11 @@ _PD_UNIT_JOB_NAME = "pd_unit_test_h20"
 _JOB_NAME = os.environ.get("CI_JOB_NAME") or os.environ.get("JOB_NAME")
 if _JOB_NAME and _JOB_NAME != _PD_UNIT_JOB_NAME:
     pytest.skip("skip PD unit tests outside pd_unit_test_h20", allow_module_level=True)
+
+
+@pytest.fixture(autouse=True)
+def mock_local_ip(monkeypatch):
+    monkeypatch.setattr(kv_manager_module, "get_local_ip", lambda: "127.0.0.1")
 
 
 def _build_paged_cache(device="cuda"):
@@ -140,7 +148,7 @@ def test_decode_prepare_listener(
                 "request_id": "req-prepare-1",
                 "prefill_scheduler_id": 0,
                 "prefix_len": 32,
-                "task_cache_ids": [0],
+                "new_cache_ids": {"main": [0]},
             },
             use_bin_type=True,
         )
@@ -221,7 +229,7 @@ def test_handle_prepare_transfer_message_relays_to_internal_broadcast(
             "request_id": "req-prepare-relay-1",
             "prefill_scheduler_id": 0,
             "prefix_len": 32,
-            "task_cache_ids": [0],
+            "new_cache_ids": {"main": [0]},
         },
         use_bin_type=True,
     )

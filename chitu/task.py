@@ -7,7 +7,7 @@ import os
 import time
 import functools
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict, fields
 from datetime import datetime
 from enum import Enum
 from logging import getLogger
@@ -32,11 +32,6 @@ from chitu.reasoning import (
     update_chat_template_kwargs_reasoning,
 )
 from chitu.sampling.utils import compile_grammar, deserialize_grammar
-from chitu.kv_cache import TokenBlock, BlockRuntime
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from chitu.kv_cache import PagedKVCacheManager
 
 logger = getLogger(__name__)
 
@@ -416,10 +411,9 @@ class Task:
         )
         self.consumed_req_tokens = 0
 
-        self.new_cache_ids = []
+        self.new_cache_ids: dict[str, list[int]] = {}
 
         # prefix caching
-        self.token_blocks: list[TokenBlock] = []
         self.inc_hit_tokens: int = 0  # 该任务在每个step中被击中的token数（增量）
 
         # Response
@@ -485,55 +479,6 @@ class Task:
         self.inc_hit_tokens = max(0, int(num))
         if self.inc_hit_tokens > 0 and self.req is not None:
             self.req.num_hit_tokens += self.inc_hit_tokens
-
-    def prompt_to_token_block(self, dp_rank) -> list[TokenBlock]:
-        """
-        将prompt转化为TokenBlock列表，如：
-        block_size: 4
-        prompt: [1,1,1,1,2,2,2,2,3,3,3,3,4,4,4]
-        chunk: [[1,1,1,1],[2,2,2,2],[3,3,3,3],[4,4,4]]
-        返回4个TokenBlock实例组成的列表，最后一个实例未满，因此其blk_hash为None
-        """
-        manager: "PagedKVCacheManager" = Backend.cache_managers[dp_rank]["main"]
-        identity_builder = manager.identity_builder
-
-        identities = identity_builder.build(
-            tokens=self.prefix_tokens,
-            auto_register=manager.enable_prefix_caching,
-        )
-        self.token_blocks = [
-            TokenBlock(identity=identity, runtime=BlockRuntime())
-            for identity in identities
-        ]
-        if manager.enable_prefix_caching:
-            for block in self.token_blocks:
-                manager.get_or_register_identity(block)
-        return self.token_blocks
-
-    @property
-    def num_cached_blocks(self) -> int:
-        """Number of contiguous cached blocks hit from prompt start."""
-        num = 0
-        for block in self.token_blocks:
-            if block.cache_idx is None:
-                break
-            num += 1
-        return num
-
-    @property
-    def num_cached_idle_blocks(self) -> int:
-        """Number of idle cached blocks inside the contiguous cached prefix."""
-        num = 0
-        for block in self.token_blocks:
-            if block.cache_idx is None:
-                break
-            if getattr(block, "state", None) is not None:
-                if block.state.value == "idle":
-                    num += 1
-                continue
-            if block.active_cnt == 0:
-                num += 1
-        return num
 
     def need_remove(self):
         # reserved as interface
@@ -791,15 +736,7 @@ class Task:
     def kv_cache_len_used_in_completed_steps(self):
         """在以往step中已经缓存到kv cache中的token长度"""
         if self.task_type == TaskType.Prefill:
-            if self.consumed_req_tokens != 0:
-                return self.consumed_req_tokens
-            else:
-                # 尚未进行推理，但可能被prefix caching击中
-                return (
-                    self.num_cached_blocks * self.token_blocks[0].blk_size
-                    if self.token_blocks
-                    else 0
-                )
+            return self.consumed_req_tokens
         elif self.task_type == TaskType.Decode:
             # For DLLM decode, use decoding_start as cached length
             if (
@@ -959,7 +896,7 @@ class PackedTasksBase:
 
     # Used to pass index data from KVCacheManager to KVCache. This is populated
     # only when KVCacheManager allocates new KV cache indices; otherwise it is [].
-    new_cache_ids_list: list[list[int]] = field(default_factory=list)
+    new_cache_ids_list: list[dict[str, list[int]]] = field(default_factory=list)
     # Used to pass the newly added prefix-cache hit lengths from the current step
     # from KVCacheManager to KVCache. This is populated only when new hits are
     # added; otherwise it is [].

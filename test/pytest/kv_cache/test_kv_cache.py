@@ -88,7 +88,10 @@ class TestPagedKVCache:
             task_type=TaskType.Prefill,
             tokens=[[1] * 512, [1, 2, 3, 4, 5, 6, 7, 8, 9]],
             num_tokens=521,
-            new_cache_ids_list=[[0], [1]],
+            new_cache_ids_list=[
+                {"main": [0]},
+                {"main": [1]},
+            ],
         )
 
         # test prepare_cache_prefill
@@ -116,7 +119,10 @@ class TestPagedKVCache:
             task_type=TaskType.Decode,
             tokens=[[2], [2]],
             num_tokens=2,
-            new_cache_ids_list=[[2], []],
+            new_cache_ids_list=[
+                {"main": [2]},
+                {},
+            ],
         )
 
         # test prepare_cache_decode
@@ -149,7 +155,10 @@ class TestPagedKVCache:
             task_type=TaskType.Prefill,
             tokens=[[1, 1], [1, 2, 3, 4, 5, 6, 7, 8, 9]],
             num_tokens=11,
-            new_cache_ids_list=[[0, 1], [2]],
+            new_cache_ids_list=[
+                {"main": [0, 1]},
+                {"main": [2]},
+            ],
             inc_hit_tokens_list=[512, 0],
         )
         # req_3: [1]*512 + [1,1]

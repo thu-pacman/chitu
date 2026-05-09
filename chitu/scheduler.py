@@ -9,7 +9,7 @@ from typing import Optional
 from typing_extensions import override
 from collections import deque, defaultdict
 
-from chitu.task import TaskPool, TaskType
+from chitu.task import TaskPool, TaskType, Task
 from chitu.global_vars import get_global_args, SlotHandle
 from chitu.utils import ceil_div
 from chitu.backend import Backend
@@ -249,13 +249,86 @@ class Scheduler:
     def end_warmup(self):
         self.is_warmup_stage = False
 
-    def scorer(self, task):
+    def scorer(self, task: Task):
         if self.is_warmup_stage:
             fn = lambda task: (
                 1 if task.task_type == TaskType.Prefill else 0
             )  # prefill first
             return (fn(task),)
         return tuple(fn(task) for fn in self.scorers)
+
+    def _num_prefill_cached_tokens(self, task: Task) -> int:
+        completed_tokens = task.kv_cache_len_used_in_completed_steps
+        if not self.cache_manager_dict["main"].enable_prefix_caching:
+            return completed_tokens
+
+        num_cached_tokens = task.prefix_tokens_len
+        for manager in list(self.cache_manager_dict.values()):
+            num_cached_tokens = min(
+                num_cached_tokens, manager.num_cached_blocks(task) * manager.block_size
+            )
+            if num_cached_tokens <= completed_tokens:
+                return completed_tokens
+
+        return num_cached_tokens
+
+    def _check_prefill_capacity(self, task, cached_len: int) -> bool:
+        for name, cache_manager in self.cache_manager_dict.items():
+            cur_blocks = ceil_div(cached_len, cache_manager.block_size)
+            target_blocks = ceil_div(
+                cached_len + task.next_req_tokens_len,
+                cache_manager.block_size,
+            )
+            block_threshold = (
+                self.kvcache_block_threshold
+                if name == "main"
+                else cache_manager.num_blocks
+            )
+            available_blocks = (
+                block_threshold
+                - cache_manager.num_active_blocks
+                - cache_manager.num_cached_idle_blocks(
+                    task, max_cached_token_len=cached_len
+                )
+            )
+            if target_blocks - cur_blocks > available_blocks:
+                return False
+        return True
+
+    def _check_decode_capacity(self, task) -> bool:
+        for _, cache_manager in self.cache_manager_dict.items():
+            available_blocks = (
+                cache_manager.num_blocks - cache_manager.num_active_blocks
+            )
+            cur_blocks = len(cache_manager.task_to_cache_ids[task.task_id])
+            target_blocks = ceil_div(
+                task.kv_cache_len_used_in_completed_steps_and_next_step,
+                cache_manager.block_size,
+            )
+            if target_blocks - cur_blocks > available_blocks:
+                return False
+        return True
+
+    def _prepare_prefill_metadata(self, task, cached_len: int) -> None:
+        assert (
+            task.consumed_req_tokens <= cached_len <= task.prefix_tokens_len
+        ), f"{task.consumed_req_tokens} vs {cached_len} vs {task.prefix_tokens_len}"
+        if cached_len == task.prefix_tokens_len:
+            cached_len = task.prefix_tokens_len - 1
+
+        for name, cache_manager in self.cache_manager_dict.items():
+            task.new_cache_ids[name] = cache_manager.prepare_metadata_before_prefill(
+                task, max_cached_token_len=cached_len
+            )
+
+        task.hit_token_len = cached_len - task.consumed_req_tokens
+        task.consumed_req_tokens = cached_len
+
+    def _prepare_decode_metadata(self, task) -> None:
+        for name, cache_manager in self.cache_manager_dict.items():
+            task.new_cache_ids[name] = cache_manager.prepare_metadata_before_decode(
+                task
+            )
 
     def schedule(
         self,
@@ -438,10 +511,10 @@ class Scheduler:
 
         # 判断该scheduler是否至少能调度出最高优先级的prefill任务
         task = TaskPool.pool[task_ids[0]]
-        if task.dp_rank is None:
-            task.prompt_to_token_block(self.dp_rank)
+        for _, cache_manager in self.cache_manager_dict.items():
+            cache_manager.ensure_task_token_blocks(task)
 
-        num_cached_tokens = task.kv_cache_len_used_in_completed_steps
+        num_cached_tokens = self._num_prefill_cached_tokens(task)
         num_uncomputed_tokens = task.prefix_tokens_len - num_cached_tokens
         if num_uncomputed_tokens == 0:
             return True
@@ -457,32 +530,21 @@ class Scheduler:
         task_origin_prefill_chunk_size = task.prefill_chunk_size
         task.set_prefill_chunk_size_for_one_step(task_prefill_chunk_size)
 
-        cur_blocks = task.num_cached_blocks
-        target_blocks = ceil_div(
-            num_cached_tokens + task.next_req_tokens_len,
-            self.cache_manager_dict["main"].block_size,
-        )
-        aviable_blocks = (
-            self.kvcache_block_threshold
-            - self.cache_manager_dict["main"].num_active_blocks
-            - task.num_cached_idle_blocks
-        )
-
-        if target_blocks - cur_blocks <= aviable_blocks:
+        if self._check_prefill_capacity(task, num_cached_tokens):
             task.prefill_chunk_size = task_origin_prefill_chunk_size
             return True
 
-        if (
-            task.kv_cache_len_used_in_completed_steps_and_next_step
-            > self.cache_manager_dict["main"].num_blocks
-            * self.cache_manager_dict["main"].block_size
-        ):
-            raise RuntimeError(
-                "KV cache capacity is insufficient to support prefilling.\n"
-                f"  - number of total blocks: {self.cache_manager_dict['main'].num_blocks}\n"
-                f"  - Block size: {self.cache_manager_dict['main'].block_size}\n"
-                f"However, {task.task_id} prefill prompts are too long: {task.prompt_len}"
-            )
+        for _, cache_manager in self.cache_manager_dict.items():
+            if (
+                task.kv_cache_len_used_in_completed_steps_and_next_step
+                > cache_manager.num_blocks * cache_manager.block_size
+            ):
+                raise RuntimeError(
+                    "KV cache capacity is insufficient to support prefilling.\n"
+                    f"  - number of total blocks: {cache_manager.num_blocks}\n"
+                    f"  - Block size: {cache_manager.block_size}\n"
+                    f"However, {task.task_id} prefill prompts are too long: {task.prompt_len}"
+                )
         return False
 
     def _schedule_prefill_tasks(self, task_ids: list[str]) -> list[str]:
@@ -494,7 +556,8 @@ class Scheduler:
         """
         sched_out_task_ids = []
         prefill_tokens = 0
-        block_size = self.cache_manager_dict["main"].block_size
+        kv_cache_manager = self.cache_manager_dict["main"]
+        block_size = kv_cache_manager.block_size
 
         for task_id in task_ids:
             if len(sched_out_task_ids) >= self.prefill_num_tasks:
@@ -516,15 +579,14 @@ class Scheduler:
                 else task.prefix_tokens_len
             )
 
-            # 未分配dp_rank的任务，需计算task.token_blocks.
-            if task.dp_rank is None:
-                task.prompt_to_token_block(self.dp_rank)
+            for _, cache_manager in self.cache_manager_dict.items():
+                cache_manager.ensure_task_token_blocks(task)
 
             # check task's remain tokens
 
             # task.prefix_tokens_len: in prefill stage, it's prompt length
             # num_cached_tokens: number of tokens that are hit by cached_idle_blocks or active_blocks
-            num_cached_tokens = task.kv_cache_len_used_in_completed_steps
+            num_cached_tokens = self._num_prefill_cached_tokens(task)
             num_uncomputed_tokens = task.prefix_tokens_len - num_cached_tokens
             if num_uncomputed_tokens == 0:
                 # prompt_len == num_cached_tokens
@@ -534,7 +596,7 @@ class Scheduler:
                 prefill_tokens += 1
                 task.set_prefill_chunk_size_for_one_step(1)
                 sched_out_task_ids.append(task_id)
-                self.cache_manager_dict["main"].prepare_metadata_before_prefill(task)
+                self._prepare_prefill_metadata(task, num_cached_tokens)
                 continue
 
             task_prefill_chunk_size = min(
@@ -543,35 +605,23 @@ class Scheduler:
             task_origin_prefill_chunk_size = task.prefill_chunk_size
             task.set_prefill_chunk_size_for_one_step(task_prefill_chunk_size)
 
-            cur_blocks = task.num_cached_blocks
-            target_blocks = ceil_div(
-                num_cached_tokens + task.next_req_tokens_len,
-                self.cache_manager_dict["main"].block_size,
-            )
-            aviable_blocks = (
-                self.kvcache_block_threshold
-                - self.cache_manager_dict["main"].num_active_blocks
-                - task.num_cached_idle_blocks
-            )
-
-            if target_blocks - cur_blocks > aviable_blocks:
+            if not self._check_prefill_capacity(task, num_cached_tokens):
                 task.prefill_chunk_size = task_origin_prefill_chunk_size
                 break
 
             prefill_tokens += task_prefill_chunk_size
             sched_out_task_ids.append(task_id)
-            self.cache_manager_dict["main"].prepare_metadata_before_prefill(task)
+            self._prepare_prefill_metadata(task, num_cached_tokens)
 
         if (
             len(sched_out_task_ids) == 0
-            and self.kvcache_block_threshold
-            == self.cache_manager_dict["main"].num_blocks
-            and self.cache_manager_dict["main"].num_active_blocks == 0
+            and self.kvcache_block_threshold == kv_cache_manager.num_blocks
+            and kv_cache_manager.num_active_blocks == 0
         ):
             raise RuntimeError(
                 "KV cache capacity is insufficient to support prefilling.\n"
                 f"  - Block size: {block_size}\n"
-                f"  - available blocks: {self.kvcache_block_threshold - self.cache_manager_dict['main'].num_active_blocks}\n"
+                f"  - available blocks: {self.kvcache_block_threshold - kv_cache_manager.num_active_blocks}\n"
                 f"  - Prefill chunk size: {self.prefill_chunk_size if self.prefill_chunk_size is not None else 'inf'}\n"
                 "However, all prefill prompts are too long:\n"
                 f"{[TaskPool.pool[idx].prefix_tokens_len for idx in task_ids if TaskPool.pool[idx].task_type == TaskType.Prefill]}"
@@ -609,21 +659,9 @@ class Scheduler:
             candidate_task_id = decode_task_ids.popleft()
             candidate_task = TaskPool.pool[candidate_task_id]
 
-            aviable_blocks = (
-                self.cache_manager_dict["main"].num_blocks
-                - self.cache_manager_dict["main"].num_active_blocks
-            )
-            cur_blocks = candidate_task.num_cached_blocks
-            target_blocks = ceil_div(
-                candidate_task.kv_cache_len_used_in_completed_steps_and_next_step,
-                self.cache_manager_dict["main"].block_size,
-            )
-
-            if target_blocks - cur_blocks <= aviable_blocks:
+            if self._check_decode_capacity(candidate_task):
                 sched_out_task_ids.append(candidate_task_id)
-                self.cache_manager_dict["main"].prepare_metadata_before_decode(
-                    candidate_task
-                )
+                self._prepare_decode_metadata(candidate_task)
                 continue
 
             if not decode_task_ids and not cached_prefill_task_ids:
@@ -671,9 +709,10 @@ class Scheduler:
             task.evicting_with_new_token = True
         else:
             task.next_token = -1
-        self.cache_manager_dict["main"].finalize_metadata_all_decode(
-            task
-        )  # 清除KVCacheManager中的元数据
+        for cache_manager in self.cache_manager_dict.values():
+            cache_manager.finalize_metadata_all_decode(
+                task
+            )  # 清除KVCacheManager中的元数据
         Backend.executor.special_step(
             [task.task_id], type="EndTask"
         )  # 清除KVCache中的元数据
@@ -735,7 +774,8 @@ class Scheduler:
             if task.need_remove():
                 removed_task_ids.append(task_id)
                 if type(self) != SkewScheduler:
-                    self.cache_manager_dict["main"].finalize_metadata_all_decode(task)
+                    for cache_manager in self.cache_manager_dict.values():
+                        cache_manager.finalize_metadata_all_decode(task)
                     self.kvcache_block_threshold = self.cache_manager_dict[
                         "main"
                     ].num_blocks

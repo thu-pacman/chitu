@@ -482,6 +482,7 @@ class PagedKVCache(KVCacheBase):
         device="cuda",
         block_size: int = 512,  # must be a multiple of 256 for FlashAttention
         is_singleton: bool = False,
+        manager_name: str = "main",
     ):
         super().__init__(
             layer_id_map,
@@ -506,6 +507,7 @@ class PagedKVCache(KVCacheBase):
 
         self.num_blocks = num_blocks
         self.block_size = block_size
+        self.manager_name = manager_name
 
         self.block_table: dict[str, list[int]] = defaultdict(
             list
@@ -650,7 +652,8 @@ class PagedKVCache(KVCacheBase):
     def prepare_cache_prefill(self, tasks: "PackedTasksBase"):
         super().prepare_cache_prefill(tasks)
         if tasks.new_cache_ids_list:
-            for tid, new_cache_ids in zip(tasks.task_ids, tasks.new_cache_ids_list):
+            for tid, item in zip(tasks.task_ids, tasks.new_cache_ids_list):
+                new_cache_ids = item.get(self.manager_name, [])
                 self.block_table[tid].extend(new_cache_ids)
         self._upd_gpu_block_table(tasks.task_ids)
 
@@ -673,7 +676,8 @@ class PagedKVCache(KVCacheBase):
 
         # Receive pre-allocated block indices from scheduler
         if tasks.new_cache_ids_list:
-            for tid, new_cache_ids in zip(tasks.task_ids, tasks.new_cache_ids_list):
+            for tid, item in zip(tasks.task_ids, tasks.new_cache_ids_list):
+                new_cache_ids = item.get(self.manager_name, [])
                 self.block_table[tid].extend(new_cache_ids)
         self._upd_gpu_block_table(tasks.task_ids)
 
@@ -683,7 +687,8 @@ class PagedKVCache(KVCacheBase):
         # paged kv cache in place.
         super().prepare_cache_decode(tasks)
         if tasks.new_cache_ids_list:
-            for tid, new_cache_ids in zip(tasks.task_ids, tasks.new_cache_ids_list):
+            for tid, item in zip(tasks.task_ids, tasks.new_cache_ids_list):
+                new_cache_ids = item.get(self.manager_name, [])
                 self.block_table[tid].extend(new_cache_ids)
         self._upd_gpu_block_table(tasks.task_ids)
 
@@ -703,7 +708,8 @@ class PagedKVCache(KVCacheBase):
 
         # Receive pre-allocated block indices from scheduler (via new_cache_ids_list)
         if tasks.new_cache_ids_list:
-            for tid, new_cache_ids in zip(tasks.task_ids, tasks.new_cache_ids_list):
+            for tid, item in zip(tasks.task_ids, tasks.new_cache_ids_list):
+                new_cache_ids = item.get(self.manager_name, [])
                 self.block_table[tid].extend(new_cache_ids)
         self._upd_gpu_block_table(tasks.task_ids)
 

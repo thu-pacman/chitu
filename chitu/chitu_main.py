@@ -572,10 +572,11 @@ def _warmup_backend_direct(
         )
 
     all_tasks = PackedTasksBase(local_max_bs, task_ids=req_ids)
-    all_tasks.new_cache_ids_list = [
-        [random.randrange(Backend.cache_dict["main"].num_blocks)]
-        for _ in range(local_max_bs)
-    ]
+    if Backend.cache_managers:
+        new_cache_ids = {}
+        for name, manager in Backend.cache_managers[0].items():
+            new_cache_ids[name] = [random.randrange(manager.num_blocks)]
+        all_tasks.new_cache_ids_list = [new_cache_ids for _ in range(local_max_bs)]
     all_tasks.tokens = [[1] for _ in range(local_max_bs)]
 
     # Prefill
@@ -1079,11 +1080,16 @@ def _update_tasks_preferred_dp_rank():
 
         for dp_rank in range(dp_size):
             if enable_prefix_caching:
-                task.prompt_to_token_block(dp_rank)
-                cached_blocks = task.num_cached_blocks
-                total_blocks = len(task.token_blocks)
-                if total_blocks > 0:
-                    cached_rate = cached_blocks / total_blocks
+                cache_managers = list(Backend.cache_managers[dp_rank].values())
+                cached_tokens = task.prefix_tokens_len
+                for cache_manager in cache_managers:
+                    cache_manager.ensure_task_token_blocks(task)
+                    manager_cached_tokens = (
+                        cache_manager.num_cached_blocks(task) * cache_manager.block_size
+                    )
+                    cached_tokens = min(cached_tokens, manager_cached_tokens)
+                if task.prefix_tokens_len > 0:
+                    cached_rate = cached_tokens / task.prefix_tokens_len
                 else:
                     cached_rate = 0.0
             else:
@@ -1099,6 +1105,11 @@ def _update_tasks_preferred_dp_rank():
                 best_dp_rank = dp_rank
 
         task.preferred_dp_rank = best_dp_rank
+        if enable_prefix_caching:
+            for dp_rank in range(dp_size):
+                if dp_rank != best_dp_rank:
+                    for cache_manager in Backend.cache_managers[dp_rank].values():
+                        cache_manager.drop_task_token_blocks(task)
         if best_dp_rank is not None:
             projected_running_tasks_per_dp[best_dp_rank] += 1
 
