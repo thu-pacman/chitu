@@ -56,11 +56,9 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         dim: int,
         moe_inter_dim: int,
         global_n_experts: int,
-        experts_start_idx: int,
-        experts_end_idx: int,
-        n_shared_experts: int,
+        experts_start_idx: int,  # fused shared experts included
+        experts_end_idx: int,  # fused shared experts included
         n_activated_experts: int,
-        fuse_shared_experts: bool,
         checkpoint_prefix: str,
     ):
         super().__init__()
@@ -70,16 +68,10 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         self.global_n_experts = global_n_experts
         self.experts_start_idx = experts_start_idx
         self.experts_end_idx = experts_end_idx
-        self.n_shared_experts = n_shared_experts
         self.n_activated_experts = n_activated_experts
-        self.fuse_shared_experts = fuse_shared_experts
         self.checkpoint_prefix = checkpoint_prefix
 
-        self.n_fused_shared_experts = (
-            n_shared_experts if self.fuse_shared_experts else 0
-        )
-        self.n_routed_experts = self.experts_end_idx - self.experts_start_idx
-        self.group_size = self.n_routed_experts + self.n_fused_shared_experts
+        self.group_size = self.experts_end_idx - self.experts_start_idx
 
     def __repr__(self):
         inheritance_order = []
@@ -88,7 +80,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
                 break
             inheritance_order.append(cls.__name__)
         inheritance_order_str = " <- ".join(inheritance_order)
-        return f"{inheritance_order_str}(dim={self.dim}, moe_inter_dim={self.moe_inter_dim}, global_n_experts={self.global_n_experts}, n_shared_experts={self.n_shared_experts}, n_activated_experts={self.n_activated_experts})"
+        return f"{inheritance_order_str}(dim={self.dim}, moe_inter_dim={self.moe_inter_dim}, global_n_experts={self.global_n_experts}, n_activated_experts={self.n_activated_experts})"
 
     def forward_no_sum(
         self, routed_x: BatchedRoutedActivation, impl="auto"
@@ -228,9 +220,6 @@ class QuantizedMoeExpertsUnmerged(QuantizedMoeExpertsBase):
                     this_x_scale = x_scale[idx]
             xs.append(this_x)
             x_scales.append(this_x_scale)
-        if self.fuse_shared_experts:
-            xs += [x] * self.n_fused_shared_experts
-            x_scales += [x_scale] * self.n_fused_shared_experts
 
         assert len(xs) == self.group_size
         assert len(x_scales) == self.group_size
@@ -262,11 +251,6 @@ class QuantizedMoeExpertsUnmerged(QuantizedMoeExpertsBase):
             if i in activated_expert_ids:
                 idx, top = torch.where(indices == i)
                 y[idx, top] = down_proj_outs[i]
-        if self.fuse_shared_experts:
-            for i in range(self.n_fused_shared_experts):
-                y[:, self.experts_end_idx - self.experts_start_idx + i] = (
-                    down_proj_outs[i]
-                )
         return PerTokenBatchedExpertResult(y)
 
     @override
@@ -404,9 +388,6 @@ class QuantizedMoeExpertsMerged(QuantizedMoeExpertsBase):
                     this_x_scale = x_scale[idx]
             xs.append(this_x)
             x_scales.append(this_x_scale)
-        if self.fuse_shared_experts:
-            xs += [x] * self.n_fused_shared_experts
-            x_scales += [x_scale] * self.n_fused_shared_experts
 
         assert len(xs) == self.group_size
         assert len(x_scales) == self.group_size
@@ -437,11 +418,6 @@ class QuantizedMoeExpertsMerged(QuantizedMoeExpertsBase):
             if i in activated_expert_ids:
                 idx, top = torch.where(indices == i)
                 y[idx, top] = down_proj_outs[i]
-        if self.fuse_shared_experts:
-            for i in range(self.n_fused_shared_experts):
-                y[:, self.experts_end_idx - self.experts_start_idx + i] = (
-                    down_proj_outs[i]
-                )
         return PerTokenBatchedExpertResult(y)
 
     @override

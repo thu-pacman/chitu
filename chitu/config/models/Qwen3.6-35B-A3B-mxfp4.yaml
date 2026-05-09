@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Qwen3.6-35B-A3B-mxfp4 shares the same model structure with Qwen3.5-35B-A3B-mxfp4
+defaults:
+  - Qwen3.5-35B-A3B-mxfp4
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: Qwen3.6-35B-A3B-mxfp4
+is_pro: true

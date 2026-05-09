@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+quant: 
+- model: '.'
+  rules:
+    - regex : 'layers\.(?!.*(?:mlp\.shared_experts\.gate\.|mlp\.shared_expert_gate\.|linear_attn\.in_proj_ba\.))'
+      type : mxfp4

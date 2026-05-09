@@ -514,9 +514,7 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
         global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
-        n_shared_experts: int,
         n_activated_experts: int,
-        fuse_shared_experts: bool,
         checkpoint_prefix: str,
         ############################################
         # Parameters specific to this quantization
@@ -529,9 +527,7 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
             global_n_experts,
             experts_start_idx,
             experts_end_idx,
-            n_shared_experts,
             n_activated_experts,
-            fuse_shared_experts,
             checkpoint_prefix,
         )
 
@@ -655,9 +651,7 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
         global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
-        n_shared_experts: int,
         n_activated_experts: int,
-        fuse_shared_experts: bool,
         checkpoint_prefix: str,
         ############################################
         # Parameters specific to this quantization
@@ -670,9 +664,7 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             global_n_experts,
             experts_start_idx,
             experts_end_idx,
-            n_shared_experts,
             n_activated_experts,
-            fuse_shared_experts,
             checkpoint_prefix,
         )
 

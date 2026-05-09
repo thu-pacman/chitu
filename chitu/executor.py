@@ -583,16 +583,26 @@ class ExpertDataDispatcher(TasksDispatcher):
                     kv_cache = getattr(kv_manager, "kv_cache", None)
                     if kv_cache is not None and boot_ids:
                         prefix_lens = []
+                        rid_to_pos = {
+                            rid: pos for pos, rid in enumerate(tasks.task_ids)
+                        }
+                        new_cache_ids_list = []
                         for rid in boot_ids:
                             t = TaskPool.pool[rid]
                             prefix_lens.append(t.prefix_tokens_len)
+                            if tasks.new_cache_ids_list:
+                                new_cache_ids_list.append(
+                                    tasks.new_cache_ids_list[rid_to_pos[rid]]
+                                )
+                            else:
+                                new_cache_ids_list.append({})
                             prefill_rank = t.pd_prefill_engine_rank
                             kv_manager.set_prefill_target_engine_rank(rid, prefill_rank)
                         kv_manager.prepare_kv_transfer(
                             request_ids=list(boot_ids),
                             kv_cache=kv_cache,
                             prefix_lens=prefix_lens,
-                            cache_ids_list=tasks.new_cache_ids_list,
+                            new_cache_ids_list=new_cache_ids_list,
                         )
                 logger.debug(
                     f"[PD_TRACE][dp.recv_decode_bootstrap] rank_in_group={int(self.rank_in_group)} "
@@ -1221,7 +1231,7 @@ class Executor:
             # Ensure KV cache is present for PD decode-only before updating CacheManager state.
             self._kv_hook.before_decode_step(
                 tasks.req_ids,
-                cache_ids_list=getattr(tasks, "new_cache_ids_list", None),
+                new_cache_ids_list=getattr(tasks, "new_cache_ids_list", []),
                 prefix_lens=getattr(tasks, "prefix_lens", None),
             )
             for cache in Backend.cache_dict.values():

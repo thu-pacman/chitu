@@ -31,7 +31,13 @@ if _JOB_NAME and _JOB_NAME != _PD_UNIT_JOB_NAME:
 # Helpers functions
 
 
-def _build_paged_cache(device="cuda", num_layers=2, num_blocks=64, block_size=16):
+def _build_paged_cache(
+    device="cuda",
+    num_layers=2,
+    num_blocks=64,
+    block_size=16,
+    manager_name="main",
+):
     layer_map = GlobalLocalMap.from_range(0, num_layers)
 
     return PagedKVCache(
@@ -45,6 +51,7 @@ def _build_paged_cache(device="cuda", num_layers=2, num_blocks=64, block_size=16
         head_dim=8,
         device=device,
         block_size=block_size,
+        manager_name=manager_name,
     )
 
 
@@ -76,7 +83,7 @@ class TestMultiCachePrepareDecode:
             num_tasks=1,
             task_ids=["r1"],
             task_type=TaskType.Decode,
-            new_cache_ids_list=[[3]],
+            new_cache_ids_list=[{"main": [3]}],
         )
 
         main.prepare_cache_decode(tasks)
@@ -102,7 +109,7 @@ class TestMultiCachePrepareDecode:
             num_tasks=1,
             task_ids=["r1"],
             task_type=TaskType.Decode,
-            new_cache_ids_list=[[3]],
+            new_cache_ids_list=[{"main": [3]}],
         )
 
         main.prepare_cache_decode(tasks)
@@ -124,7 +131,7 @@ class TestMultiCachePrepareDecode:
 
     def test_main_indexer(self, cuda_available, global_args, init_distributed):
         main = _build_paged_cache()
-        indexer = _build_paged_cache(num_blocks=32)
+        indexer = _build_paged_cache(num_blocks=32, manager_name="indexer")
 
         main.insert_kv_cache_from_transfer("r1", [0, 1], 32)
         indexer.insert_kv_cache_from_transfer("r1", [0, 1], 32)
@@ -134,7 +141,7 @@ class TestMultiCachePrepareDecode:
             num_tasks=1,
             task_ids=["r1"],
             task_type=TaskType.Decode,
-            new_cache_ids_list=[[2]],
+            new_cache_ids_list=[{"main": [2], "indexer": [2]}],
         )
 
         for cache in [main, indexer]:
@@ -151,7 +158,7 @@ class TestMultiCachePrepareDecode:
     def test_triple_cache(self, cuda_available, global_args, init_distributed):
         main = _build_paged_cache()
         linear = _build_singleton_cache()
-        indexer = _build_paged_cache(num_blocks=32)
+        indexer = _build_paged_cache(num_blocks=32, manager_name="indexer")
 
         # insert kv cache req a
         main.insert_kv_cache_from_transfer("a", [0, 1], 32)
@@ -168,7 +175,10 @@ class TestMultiCachePrepareDecode:
             num_tasks=2,
             task_ids=["a", "b"],
             task_type=TaskType.Decode,
-            new_cache_ids_list=[[4], [5]],
+            new_cache_ids_list=[
+                {"main": [4], "indexer": [4]},
+                {"main": [5], "indexer": [5]},
+            ],
         )
 
         for cache in [main, indexer]:
@@ -212,7 +222,7 @@ class TestMultiCachePrepareDecode:
             num_tasks=1,
             task_ids=["r1"],
             task_type=TaskType.Decode,
-            new_cache_ids_list=[[3]],
+            new_cache_ids_list=[{"main": [3]}],
         )
 
         main.prepare_cache_decode(tasks)
@@ -223,7 +233,7 @@ class TestMultiCachePrepareDecode:
         self, cuda_available, global_args, init_distributed
     ):
         main = _build_paged_cache()
-        indexer = _build_paged_cache(num_blocks=32)
+        indexer = _build_paged_cache(num_blocks=32, manager_name="indexer")
 
         main.insert_kv_cache_from_transfer("r1", [0, 1], 32)
 
@@ -232,7 +242,7 @@ class TestMultiCachePrepareDecode:
             num_tasks=1,
             task_ids=["r1"],
             task_type=TaskType.Decode,
-            new_cache_ids_list=[[2]],
+            new_cache_ids_list=[{"main": [2], "indexer": [2]}],
         )
 
         main.prepare_cache_decode(tasks)
@@ -253,7 +263,7 @@ class TestMultiCachePrepareDecode:
             num_tasks=len(req_ids),
             task_ids=req_ids,
             task_type=TaskType.Decode,
-            new_cache_ids_list=[[16 + i] for i in range(len(req_ids))],
+            new_cache_ids_list=[{"main": [16 + i]} for i in range(len(req_ids))],
         )
 
         main.prepare_cache_decode(tasks)
@@ -296,7 +306,7 @@ class TestMultiCacheLifecycle:
             num_tasks=1,
             task_ids=["r1"],
             task_type=TaskType.Decode,
-            new_cache_ids_list=[[2]],
+            new_cache_ids_list=[{"main": [2]}],
         )
 
         for cache in [main, linear]:
@@ -324,7 +334,10 @@ class TestMultiCacheLifecycle:
             num_tasks=2,
             task_ids=["r1", "r2"],
             task_type=TaskType.Decode,
-            new_cache_ids_list=[[1], [2]],
+            new_cache_ids_list=[
+                {"main": [1]},
+                {"main": [2]},
+            ],
         )
 
         for cache in caches:
@@ -342,7 +355,10 @@ class TestMultiCacheLifecycle:
             num_tasks=2,
             task_ids=["r3", "r4"],
             task_type=TaskType.Decode,
-            new_cache_ids_list=[[2], [3]],
+            new_cache_ids_list=[
+                {"main": [2]},
+                {"main": [3]},
+            ],
         )
 
         for cache in caches:
@@ -359,7 +375,7 @@ class TestMultiCacheLifecycle:
     ):
         main = _build_paged_cache()
         linear = _build_singleton_cache()
-        indexer = _build_paged_cache(num_blocks=32)
+        indexer = _build_paged_cache(num_blocks=32, manager_name="indexer")
         caches = [main, linear, indexer]
 
         req_ids = ["a", "b", "c"]
@@ -373,7 +389,11 @@ class TestMultiCacheLifecycle:
             num_tasks=3,
             task_ids=["a", "b", "c"],
             task_type=TaskType.Decode,
-            new_cache_ids_list=[[3], [4], [5]],
+            new_cache_ids_list=[
+                {"main": [3], "indexer": [3]},
+                {"main": [4], "indexer": [4]},
+                {"main": [5], "indexer": [5]},
+            ],
         )
 
         for cache in caches:
@@ -401,7 +421,7 @@ class TestMultiCacheLifecycle:
             num_tasks=1,
             task_ids=["r1"],
             task_type=TaskType.Decode,
-            new_cache_ids_list=[[3]],
+            new_cache_ids_list=[{"main": [3]}],
         )
 
         for cache in caches:
@@ -418,7 +438,10 @@ class TestMultiCacheLifecycle:
             num_tasks=1,
             task_ids=["r2", "r3"],
             task_type=TaskType.Decode,
-            new_cache_ids_list=[[4], [5]],
+            new_cache_ids_list=[
+                {"main": [4]},
+                {"main": [5]},
+            ],
         )
 
         for cache in caches:

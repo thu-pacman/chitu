@@ -88,7 +88,7 @@ def test_pd_transfer_end_to_end(
         task_type=TaskType.Prefill,
         tokens=[[1] * prefix_len],
         num_tokens=prefix_len,
-        new_cache_ids_list=[list(range(ceil_div(prefix_len, BLOCK_SIZE)))],
+        new_cache_ids_list=[{"main": list(range(ceil_div(prefix_len, BLOCK_SIZE)))}],
     )
 
     # Prefill side
@@ -114,8 +114,8 @@ def test_pd_transfer_end_to_end(
     # Wait for decode to register its buffers on prefill (DECODE_REGISTER)
     assert _wait_until(lambda: len(prefill_kv.decode_kv_args_table) > 0)
 
-    task_cache_ids_list: list[list[int]] = [
-        [i for i in range(1, ceil_div(prefix_len, BLOCK_SIZE) + 1)]
+    task_cache_ids_list: list[dict[str, list[int]]] = [
+        {"main": [i for i in range(1, ceil_div(prefix_len, BLOCK_SIZE) + 1)]}
     ]
 
     # Decode sends TransferInfo for req_id
@@ -184,15 +184,19 @@ def test_recv_kv_cache_and_insert_fallback_uses_batch_cache_ids():
 
     captured = {}
 
-    def fake_prepare(request_ids, kv_cache, prefix_lens, cache_ids_list=None):
+    def fake_prepare(request_ids, kv_cache, prefix_lens, new_cache_ids_list=None):
         captured["request_ids"] = list(request_ids)
         captured["prefix_lens"] = list(prefix_lens)
-        captured["cache_ids_list"] = [list(ids) for ids in cache_ids_list or []]
+        captured["cache_ids_list"] = [
+            list(obj["main"]) for obj in new_cache_ids_list or []
+        ]
         for idx, request_id in enumerate(request_ids):
             room = kv_manager._to_uuid(request_id)
             kv_manager._prepared_transfers[room] = {
                 "aux_index": idx,
-                "dst_indices_np": np.asarray(cache_ids_list[idx], dtype=np.int32),
+                "dst_indices_np": np.asarray(
+                    captured["cache_ids_list"][idx], dtype=np.int32
+                ),
             }
             kv_manager.request_status[room] = KVPoll.Success.value
 
@@ -201,20 +205,20 @@ def test_recv_kv_cache_and_insert_fallback_uses_batch_cache_ids():
     kv_cache = FakeKVCache()
     request_ids = ["req-fallback-1"]
     prefix_lens = [64]
-    cache_ids_list = [[7, 8, 9, 10]]
+    cache_ids_list = [{"main": [7, 8, 9, 10]}]
 
     first_tokens, _ = kv_manager.recv_kv_cache_and_insert(
         request_ids=request_ids,
         kv_cache=kv_cache,
         prefix_lens=prefix_lens,
-        cache_ids_list=cache_ids_list,
+        new_cache_ids_list=cache_ids_list,
     )
 
     assert captured["request_ids"] == request_ids
     assert captured["prefix_lens"] == prefix_lens
-    assert captured["cache_ids_list"] == cache_ids_list
+    assert captured["cache_ids_list"] == [list(obj["main"]) for obj in cache_ids_list]
     assert kv_cache.insert_calls == [
-        ("req-fallback-1", cache_ids_list[0], prefix_lens[0])
+        ("req-fallback-1", cache_ids_list[0]["main"], prefix_lens[0])
     ]
     assert torch.equal(first_tokens, torch.zeros((1,), dtype=torch.int32))
 

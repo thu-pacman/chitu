@@ -116,12 +116,34 @@ class MoESlotCntLoadBalancer(MoELoadBalancer):
     """
 
     def generate_expert_mapping(
-        self, expert_stats: Optional[torch.Tensor] = None, eplb: bool = False
+        self,
+        n_routed_experts: Optional[int] = None,
+        n_activated_experts: Optional[int] = None,
+        n_fused_shared_experts: int = 0,
+        expert_stats: Optional[torch.Tensor] = None,
+        eplb: bool = False,
     ):
+        assert self.num_slots % self.ep_size == 0
         self.num_local_slots = self.num_slots // self.ep_size
 
         if expert_stats is None:
-            expert_stats = torch.ones(self.num_experts)
+            if n_fused_shared_experts > 0:
+                if n_routed_experts is None:
+                    raise ValueError(
+                        "n_routed_experts must be specified if n_fused_shared_experts > 0"
+                    )
+                if n_activated_experts is None:
+                    raise ValueError(
+                        "n_activated_experts must be specified if n_fused_shared_experts > 0"
+                    )
+                assert n_routed_experts + n_fused_shared_experts == self.num_experts
+                expert_stats = torch.tensor(
+                    [n_activated_experts / n_routed_experts] * n_routed_experts
+                    + [1.0] * n_fused_shared_experts,
+                    dtype=torch.float32,
+                )
+            else:
+                expert_stats = torch.ones(self.num_experts, dtype=torch.float32)
 
         if eplb:
             self.eplb_assign_slot(expert_stats)

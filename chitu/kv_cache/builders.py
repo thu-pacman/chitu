@@ -15,6 +15,7 @@ from chitu.kv_cache import (
     MMPagedKVCache,
     SingletonPagedKVCache,
     PagedKVCacheManager,
+    KVCacheManagerBase,
 )
 from chitu.kv_cache.registry import (
     _normalize_model_type,
@@ -51,7 +52,7 @@ class CacheBuildBundle:
 
     cache_type: str
     cache_dict: Dict[str, Any]
-    cache_managers: Optional[List[Dict[str, Any]]] = None
+    cache_managers: Optional[List[Dict[str, KVCacheManagerBase]]] = None
 
 
 # Registry entries are tuples:
@@ -61,15 +62,21 @@ class CacheBuildBundle:
 # predicates are not guaranteed to be mutually exclusive (e.g. a default builder
 # may also match), so matching order should not depend on registration order.
 _BUILDER_REGISTRY: List[
-    Tuple[int, Callable[[Any], bool], Callable[[Any, Any], CacheBuildBundle]]
+    Tuple[
+        int,  # cache_manager_builder的匹配优先级
+        Callable[[Any], bool],  # 判断是否使用当前元组中的cache_manager_builder函数
+        Callable[[Any, Any], CacheBuildBundle],  # cache_manager_builder函数
+    ]
 ] = []
 
 
 def register_cache_manager_builder(
     *,
-    model_types: Optional[List[Any]] = None,
-    predicate: Optional[Callable[[Any], bool]] = None,
-    priority: int = 0,
+    model_types: Optional[List[Any]] = None,  # 该cache_manager_builder支持的模型类型
+    predicate: Optional[
+        Callable[[Any], bool]
+    ] = None,  # 根据传入的args判断是否使用当前的cache_manager_builder
+    priority: int = 0,  # cache_manager_builder 在_BUILDER_REGISTRY中的排序，priority越大排序越前
 ):
     if predicate is None:
         if model_types is None:
@@ -186,6 +193,7 @@ def _build_main_cache_bundle(
                         mtp_size=args.infer.mtp_size,
                         enable_prefix_caching=args.infer.enable_prefix_caching,
                         block_size=block_size,
+                        manager_name="main",
                     )
                 }
                 for i in range(args.infer.dp_size)
@@ -428,6 +436,27 @@ def _build_deepseek_v3_with_indexer_cache_managers(
 
     indexer = _build_indexer_cache(args)
     if indexer is not None:
+        if (
+            args.infer.cache_type == "paged"
+            and isinstance(main_cache, PagedKVCache)
+            and isinstance(indexer, PagedKVCache)
+        ):
+            use_indexer_manager = indexer.block_size != main_cache.block_size
+            indexer.manager_name = "indexer" if use_indexer_manager else "main"
+            if use_indexer_manager and main_managers is not None:
+                for dp_rank, cache_manager_dict in enumerate(main_managers):
+                    cache_manager_dict["indexer"] = PagedKVCacheManager(
+                        indexer.num_blocks,
+                        num_hot_req=ceil_div(
+                            args.infer.max_batch_size, args.infer.dp_size
+                        ),
+                        max_seq_len=args.infer.max_seq_len,
+                        dp_rank=dp_rank,
+                        mtp_size=args.infer.mtp_size,
+                        enable_prefix_caching=args.infer.enable_prefix_caching,
+                        block_size=indexer.block_size,
+                        manager_name="indexer",
+                    )
         cache_dict["indexer"] = indexer
 
     return CacheBuildBundle(

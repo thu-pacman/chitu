@@ -39,8 +39,21 @@ def compute_layer_dist_in_pp(num_layers: int, pp_size: int):
 
 
 def compute_expert_dist_in_ep(
-    num_moe_layers: int, ep_size: int, num_experts: int, moe_impl: Optional[MoEImplBase]
-) -> list[list[list[int]]]:  # expert ids for each layer for each ep rank
+    num_moe_layers: int, moe_impl: Optional[MoEImplBase]
+) -> list[list[list[int]]]:
+    """
+    Return local experts IDs
+
+    Args:
+        num_moe_layers: Number of MoE layers. Dense layers are NOT included.
+        moe_impl: The MoEImplBase object.
+
+    Returns:
+        [[[Expert IDs] for each MoE layer] for each EP rank]. IDs include routed experts and
+            fused shared experts. Fused experts are numbered after routed experts. Non-fused
+            shared experts are not included.
+    """
+
     if isinstance(moe_impl, MoEImplEP):
         enable_dynamic_load_balance = get_global_args().infer.moe_lb_trigger > 0
         if enable_dynamic_load_balance:
@@ -50,7 +63,7 @@ def compute_expert_dist_in_ep(
                     planner.get_current_mapping(layer_id)[ep_rank]
                     for layer_id in moe_impl.moe_layer_id_list
                 ]
-                for ep_rank in range(ep_size)
+                for ep_rank in range(moe_impl.ep_size)
             ]
         else:
             return [
@@ -58,7 +71,7 @@ def compute_expert_dist_in_ep(
                     moe_impl.load_balancer[layer_id].get_local_experts(ep_rank)
                     for layer_id in moe_impl.moe_layer_id_list
                 ]
-                for ep_rank in range(ep_size)
+                for ep_rank in range(moe_impl.ep_size)
             ]
     else:
-        return [[list(range(num_experts))] * num_moe_layers] * ep_size
+        return [[list(range(moe_impl.n_experts))] * num_moe_layers] * moe_impl.ep_size

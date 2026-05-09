@@ -10,6 +10,7 @@ produces the same output as the per-expert iterative path.
 import pytest
 import torch
 
+from chitu.quantization import QuantizedMoeExpertsUnmerged, BlockInt4MoeExpertsUnmerged
 from chitu.utils import try_import_platform_dep
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
@@ -30,7 +31,6 @@ def _make_experts_module(
     group_size: int = 128,
 ):
     """Create a BlockInt4MoeExpertsUnmerged with random quantized weights."""
-    from chitu.quantization.blockint4 import BlockInt4MoeExpertsUnmerged
 
     module = BlockInt4MoeExpertsUnmerged(
         dim=dim,
@@ -38,9 +38,7 @@ def _make_experts_module(
         global_n_experts=n_experts,
         experts_start_idx=0,
         experts_end_idx=n_experts,
-        n_shared_experts=0,
         n_activated_experts=2,
-        fuse_shared_experts=False,
         checkpoint_prefix="test",
         group_size=group_size,
     )
@@ -108,8 +106,6 @@ def test_groupgemm_matches_iterative(
     module._repack_to_marlin()
 
     # --- Iterative path (base class fallback) ---
-    from chitu.quantization.base import QuantizedMoeExpertsUnmerged
-
     iterative_result = QuantizedMoeExpertsUnmerged.forward_no_sum(module, routed_x)
 
     # --- Groupgemm path ---

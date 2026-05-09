@@ -919,9 +919,7 @@ def MoeExpertsDeepSeekV3(
         global_n_experts=global_n_experts,
         experts_start_idx=experts_start_idx,
         experts_end_idx=experts_end_idx,
-        n_shared_experts=args.n_shared_experts,
         n_activated_experts=args.n_activated_experts,
-        fuse_shared_experts=get_global_args().infer.fuse_shared_experts,
         checkpoint_prefix=checkpoint_prefix,
     )
 
@@ -953,8 +951,10 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
                 op_impl=op_impl,
                 checkpoint_prefix=f"{checkpoint_prefix}.shared_experts",
             )
+            n_fused_shared_experts = 0
         else:
             non_fused_shared_experts = None
+            n_fused_shared_experts = 1
 
         if isinstance(moe_impl, MoEImplEP):
             num_local_slots = moe_impl.load_balancer[layer_id].get_num_local_slots()
@@ -962,7 +962,7 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
             experts_end_idx = experts_start_idx + num_local_slots
         else:
             experts_start_idx = 0
-            experts_end_idx = args.n_routed_experts
+            experts_end_idx = args.n_routed_experts + n_fused_shared_experts
         super().__init__(
             gate=GateDeepSeekV3(args, op_impl=op_impl),
             experts=MoeExpertsDeepSeekV3(
@@ -1229,8 +1229,6 @@ class TransformerDeepSeekV3(Transformer):
         n_dense_layers = self.args.models.n_dense_layers
         local_experts = compute_expert_dist_in_ep(
             self.global_n_layers - n_dense_layers,  # MTP layer included
-            self.ep_size,
-            self.args.models.n_routed_experts,
             self.moe_impl,
         )[self.ep_group.rank_in_group]
 
@@ -1255,9 +1253,13 @@ class TransformerDeepSeekV3(Transformer):
                 prefix = f"layers.{layer_id}.mlp."
                 parts = []
                 for i in local_experts[layer_id - n_dense_layers]:
-                    parts.append(prefix + f"experts.{i}.{w}.{part}")
-                if fuse_shared_experts:
-                    parts.append(prefix + f"shared_experts.{w}.{part}")
+                    if i < self.args.models.n_routed_experts:
+                        parts.append(prefix + f"experts.{i}.{w}.{part}")
+                    elif i == self.args.models.n_routed_experts:
+                        assert fuse_shared_experts
+                        parts.append(prefix + f"shared_experts.{w}.{part}")
+                    else:
+                        assert False, "This model should have only one shared expert"
                 checkpoint[prefix + f"experts.{w}_{part}"] = torch.stack(
                     [checkpoint.pop(key) for key in parts], dim=0
                 )

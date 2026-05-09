@@ -15,6 +15,7 @@ from chitu.models.mm_cache_mixin_qwen_vl import get_qwen_vl_mm_cache_class
 from chitu.models.registry import ModelType, register_model
 from chitu.tensor_parallel import (
     LmHeadColumnParallelLinear,
+    LocalLinear,
     VocabParallelEmbedding,
 )
 
@@ -43,10 +44,15 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 
 
 class MTPMixin:
-    def _init_mtp_modules(self, args):
+    def _init_mtp_modules(self, args, *, checkpoint_prefix: str):
         self.pre_fc_norm_embedding = Qwen3NextRMSNorm(args.dim, eps=args.norm_eps)
         self.pre_fc_norm_hidden = Qwen3NextRMSNorm(args.dim, eps=args.norm_eps)
-        self.fc = torch.nn.Linear(args.dim * 2, args.dim, bias=False)
+        self.fc = LocalLinear(
+            args.dim * 2,
+            args.dim,
+            has_bias=False,
+            checkpoint_prefix=f"{checkpoint_prefix}.fc",
+        )
         self.norm = Qwen3NextRMSNorm(args.dim, eps=args.norm_eps)
 
     def _mtp_fuse(
@@ -107,7 +113,7 @@ class TransformerBlockHFQwen3_5FullMoeMTP(MTPMixin, TransformerBlockHFQwen3_5Ful
             mlp_type,
             checkpoint_prefix=checkpoint_prefix,
         )
-        self._init_mtp_modules(args)
+        self._init_mtp_modules(args, checkpoint_prefix=checkpoint_prefix)
 
     @override
     def forward(
@@ -171,7 +177,7 @@ class TransformerBlockHFQwen3_5FullDenseMTP(
             mlp_type,
             checkpoint_prefix=checkpoint_prefix,
         )
-        self._init_mtp_modules(args)
+        self._init_mtp_modules(args, checkpoint_prefix=checkpoint_prefix)
 
     @override
     def forward(
@@ -271,12 +277,15 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
             "Qwen3.6-27B",
             "Qwen3.5-27B-FP8",
             "Qwen3.6-27B-FP8",
+            "Qwen3.5-27B-mxfp4",
+            "Qwen3.6-27B-mxfp4",
             "Qwen3.5-9B",
             "Qwen3.5-4B",
             "Qwen3.5-2B",
             "Qwen3.5-0.8B",
         ]
         self.is_fp8_model = str(params.name).endswith("FP8")
+        self.is_mxfp4_model = str(params.name).endswith("mxfp4")
 
         def layer_type_callback(layer_id: int):
             if self.mtp_size > 1 and layer_id >= params.n_layers:
@@ -1043,7 +1052,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         if not self.is_moe_model:
             return checkpoint
 
-        if str(self.params.name).endswith("FP8"):
+        if self.is_fp8_model or self.is_mxfp4_model:
             return super().process_state_dict_for_merging_experts(checkpoint)
 
         if self.mtp_size > 1:

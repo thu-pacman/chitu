@@ -520,26 +520,18 @@ class Blockfp8MoeExpertsMuxiLayout(
         global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
-        n_shared_experts: int,
         n_activated_experts: int,
-        fuse_shared_experts: bool,
         checkpoint_prefix: str,
         ############################################
         # No parameters specific to this quantization
     ):
-        if fuse_shared_experts:
-            raise NotImplementedError(
-                "Fused shared experts is not supported for muxi_layout_kernels"
-            )
         super().__init__(
             dim=dim,
             moe_inter_dim=moe_inter_dim,
             global_n_experts=global_n_experts,
             experts_start_idx=experts_start_idx,
             experts_end_idx=experts_end_idx,
-            n_shared_experts=n_shared_experts,
             n_activated_experts=n_activated_experts,
-            fuse_shared_experts=fuse_shared_experts,
             checkpoint_prefix=checkpoint_prefix,
         )
 

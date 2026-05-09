@@ -17,7 +17,7 @@ import threading
 import time
 from collections import deque
 from enum import Enum, IntEnum
-from typing import Optional
+from typing import Any, Optional
 from uuid import UUID, uuid5, NAMESPACE_DNS
 import dataclasses
 import msgpack
@@ -535,9 +535,11 @@ class KVManager:
         # Decode-side prepare requests. Process them on the compute thread because
         # CUDA access is not thread-safe across these paths.
         #
-        # Each item: (request_id: str, prefill_engine_rank: Optional[int], prefix_len: int, task_cache_ids: list[int])
+        # Each item: (request_id, prefill_engine_rank, prefix_len, new_cache_ids)
         self._pending_prepare_lock = threading.Lock()
-        self._pending_prepare: deque[tuple[str, Optional[int], int]] = deque()
+        self._pending_prepare: deque[
+            tuple[str, Optional[int], int, dict[str, list[int]]]
+        ] = deque()
         # Serialize prepare_kv_transfer across threads (prepare worker vs kv_pull path).
         self._prepare_exec_lock = threading.Lock()
         self._prepare_backpressure_log_interval_s = 5.0
@@ -588,7 +590,7 @@ class KVManager:
         request_id: str,
         prefill_engine_rank: Optional[int] = None,
         prefix_len: int = 0,
-        task_cache_ids: list[int] = [],
+        new_cache_ids: Optional[dict[str, list[int]]] = None,
     ) -> None:
         """Enqueue a request to prepare KV transfer on this decode dp rank.
 
@@ -600,7 +602,8 @@ class KVManager:
         if self.disaggregation_mode != DisaggregationMode.DECODE:
             return
         rid = str(request_id)
-        if not rid or not task_cache_ids:
+        task_new_cache_ids = new_cache_ids
+        if not rid or not task_new_cache_ids:
             return
         with self._pending_prepare_lock:
             self._pending_prepare.append(
@@ -612,7 +615,7 @@ class KVManager:
                         else None
                     ),
                     int(prefix_len or 0),
-                    task_cache_ids,
+                    task_new_cache_ids,
                 )
             )
 
@@ -657,7 +660,7 @@ class KVManager:
                 request_id=request_id,
                 prefill_engine_rank=msg.get("prefill_scheduler_id", None),
                 prefix_len=int(msg.get("prefix_len", 0) or 0),
-                task_cache_ids=list(msg.get("task_cache_ids", []) or []),
+                new_cache_ids=msg.get("new_cache_ids", {}),
             )
             self._relay_decode_internal_payload(
                 payload,
@@ -771,7 +774,7 @@ class KVManager:
         """
         if self.disaggregation_mode != DisaggregationMode.DECODE:
             return 0
-        batch: list[tuple[str, Optional[int], int, list[int]]] = []
+        batch: list[tuple[str, Optional[int], int, dict[str, list[int]]]] = []
         with self._pending_prepare_lock:
             while self._pending_prepare and len(batch) < int(max_items):
                 batch.append(self._pending_prepare.popleft())
@@ -788,9 +791,9 @@ class KVManager:
             return 0
 
         processed = 0
-        retry_items: list[tuple[str, Optional[int], int]] = []
+        retry_items: list[tuple[str, Optional[int], int, dict[str, list[int]]]] = []
         # Process each request independently.
-        for rid, prefill_sid, prefix_len, task_cache_ids in batch:
+        for rid, prefill_sid, prefix_len, new_cache_ids in batch:
             if prefill_sid is not None:
                 self.set_prefill_target_engine_rank(rid, int(prefill_sid))
             try:
@@ -798,7 +801,7 @@ class KVManager:
                     request_ids=[rid],
                     kv_cache=kv_cache,
                     prefix_lens=[prefix_len],
-                    cache_ids_list=[task_cache_ids],
+                    new_cache_ids_list=[new_cache_ids],
                 )
                 logger.debug(f"[PD_STAGE][decode.prealloc.rank.end] req_id={rid}")
                 processed += 1
@@ -806,7 +809,7 @@ class KVManager:
             except KVTransferBackpressure as e:
                 # Not enough free blocks: requeue and retry later.
                 self._log_prepare_backpressure(rid, str(e))
-                retry_items.append((rid, prefill_sid, prefix_len, task_cache_ids))
+                retry_items.append((rid, prefill_sid, prefix_len, new_cache_ids))
 
         if retry_items:
             with self._pending_prepare_lock:
@@ -3711,7 +3714,7 @@ class KVManager:
         request_ids: list[str],
         kv_cache: "KVCacheBase",
         prefix_lens: Optional[list[int]] = None,
-        cache_ids_list: Optional[list[list[int]]] = None,
+        new_cache_ids_list: Optional[list[Any]] = None,
     ) -> None:
         """Pre-allocate destination blocks and send TransferInfo to Prefill.
 
@@ -3730,6 +3733,13 @@ class KVManager:
 
             if prefix_lens is None:
                 prefix_lens = [0] * len(request_ids)
+            if new_cache_ids_list is not None and len(new_cache_ids_list) != len(
+                request_ids
+            ):
+                raise ValueError(
+                    "new_cache_ids_list must match request_ids length: "
+                    f"{len(new_cache_ids_list)} vs {len(request_ids)}"
+                )
 
             # Refresh decode buffer registrations after the first post-warmup
             # realloc.
@@ -3811,11 +3821,11 @@ class KVManager:
             if not hasattr(self, "_prepared_transfers"):
                 self._prepared_transfers = {}
 
-            # Pre-reserve dst kv indices and allocate aux buffer slots
-            cache_ids_list = (
-                cache_ids_list
-                if cache_ids_list is not None
-                else [[] for _ in range(len(request_ids))]
+            # Pre-reserve dst kv indices and allocate aux buffer slots.
+            new_cache_ids_list = (
+                new_cache_ids_list
+                if new_cache_ids_list is not None
+                else [{} for _ in range(len(request_ids))]
             )
             for idx, request_id in enumerate(request_ids):
                 room = self._to_uuid(request_id)
@@ -3847,11 +3857,14 @@ class KVManager:
                 # Reserving max_blocks_per_req for every request exhausts decode
                 # blocks quickly as batch size grows.
 
-                dst_indices = cache_ids_list[idx]
+                new_cache_ids = new_cache_ids_list[idx]
+                main_manager_name = getattr(kv_cache, "manager_name", "main")
+                dst_indices = new_cache_ids.get(main_manager_name)
                 dst_indices_np = np.asarray(dst_indices, dtype=np.int32)
                 if dst_indices_np.size == 0:
                     raise RuntimeError(
-                        f"reserve_blocks_for_transfer returned empty for request_id={request_id}"
+                        "reserve_blocks_for_transfer returned empty for "
+                        f"request_id={request_id} manager_name={main_manager_name}"
                     )
 
                 # Reserve destination blocks for indexer KV cache
@@ -3864,12 +3877,15 @@ class KVManager:
                     and len(indexer_ptrs) > 0
                 )
                 if indexer_enabled:
-                    idx_indices = cache_ids_list[idx]
+                    indexer_manager_name = getattr(
+                        indexer_cache, "manager_name", "main"
+                    )
+                    idx_indices = new_cache_ids.get(indexer_manager_name)
                     indexer_dst_np = np.asarray(idx_indices, dtype=np.int32)
                     if indexer_dst_np.size == 0:
                         raise RuntimeError(
                             f"reserve_blocks_for_transfer returned empty for indexer state "
-                            f"request_id={request_id}"
+                            f"request_id={request_id} manager_name={indexer_manager_name}"
                         )
 
                 # Reserve destination blocks for linear attention states (Qwen3-next)
@@ -4000,7 +4016,7 @@ class KVManager:
         request_ids: list[str],
         kv_cache: "KVCacheBase",
         prefix_lens: Optional[list[int]] = None,
-        cache_ids_list: Optional[list[list[int]]] = None,
+        new_cache_ids_list: Optional[list[Any]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Receive KV cache and insert to cache (Decode mode)
 
@@ -4019,10 +4035,12 @@ class KVManager:
                 f"prefix_lens must be provided with the same length as request_ids: "
                 f"{len(prefix_lens) if prefix_lens is not None else None} vs {len(request_ids)}"
             )
-        if cache_ids_list is not None and len(cache_ids_list) != len(request_ids):
+        if new_cache_ids_list is not None and len(new_cache_ids_list) != len(
+            request_ids
+        ):
             raise ValueError(
-                "cache_ids_list must match request_ids length: "
-                f"{len(cache_ids_list)} vs {len(request_ids)}"
+                "new_cache_ids_list must match request_ids length: "
+                f"{len(new_cache_ids_list)} vs {len(request_ids)}"
             )
 
         # Refresh buffer registration on the first request after warmup.
@@ -4075,27 +4093,24 @@ class KVManager:
             logger.debug(
                 f"[recv_kv_cache_and_insert] not all prepared, calling prepare_kv_transfer, req_ids:{request_ids}"
             )
-            resolved_cache_ids_list: list[list[int]] = []
+            resolved_new_cache_ids_list: list[dict[str, list[int]]] = []
             for idx, request_id in enumerate(request_ids):
-                cache_ids = (
-                    list(cache_ids_list[idx] or [])
-                    if cache_ids_list is not None
-                    else []
+                new_cache_ids = (
+                    new_cache_ids_list[idx] if new_cache_ids_list is not None else None
                 )
-                if not cache_ids:
+                if not new_cache_ids:
                     task = TaskPool.pool.get(request_id)
-                    task_cache_ids = (
+                    new_cache_ids = (
                         getattr(task, "new_cache_ids", None)
                         if task is not None
                         else None
                     )
-                    cache_ids = list(task_cache_ids or [])
-                resolved_cache_ids_list.append(cache_ids)
+                resolved_new_cache_ids_list.append(new_cache_ids)
             self.prepare_kv_transfer(
                 request_ids,
                 kv_cache,
                 prefix_lens,
-                cache_ids_list=resolved_cache_ids_list,
+                new_cache_ids_list=resolved_new_cache_ids_list,
             )
 
             # Re-fetch prepared info (use self._prepared_transfers, not the local copy)

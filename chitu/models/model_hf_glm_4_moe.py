@@ -458,8 +458,6 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
         n_dense_layers = self.args.models.n_dense_layers
         local_experts = compute_expert_dist_in_ep(
             self.global_n_layers - self.args.models.n_dense_layers,
-            self.ep_size,
-            self.args.models.n_routed_experts,
             self.moe_impl,
         )[self.ep_group.rank_in_group]
         checkpoint_keys = list(checkpoint.keys())
@@ -483,9 +481,13 @@ class TransformerHFGlm4Moe(TransformerQwen2VL):
                 prefix = f"layers.{layer_id}.mlp."
                 parts = []
                 for i in local_experts[layer_id - n_dense_layers]:
-                    parts.append(prefix + f"experts.{i}.{w}.{part}")
-                if fuse_shared_experts:
-                    parts.append(prefix + f"shared_experts.{w}.{part}")
+                    if i < self.args.models.n_routed_experts:
+                        parts.append(prefix + f"experts.{i}.{w}.{part}")
+                    elif i == self.args.models.n_routed_experts:
+                        assert fuse_shared_experts
+                        parts.append(prefix + f"shared_experts.{w}.{part}")
+                    else:
+                        assert False, "This model should have only one shared expert"
                 checkpoint[prefix + f"experts.{w}_{part}"] = torch.stack(
                     [checkpoint.pop(key) for key in parts], dim=0
                 )

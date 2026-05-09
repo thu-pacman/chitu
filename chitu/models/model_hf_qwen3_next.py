@@ -796,6 +796,20 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
                 checkpoint[prefix + "attn_gate.weight_scale_inv"] = gate.reshape(
                     self.params.n_heads * self.params.head_dim // 128, -1
                 )
+            if k.endswith(".q_proj.weight_scale"):
+                prefix = k[: -len("q_proj.weight_scale")]
+                q_scale = checkpoint[k]
+                q_scale, gate = torch.chunk(
+                    q_scale.view(self.params.n_heads, self.params.head_dim * 2, -1),
+                    2,
+                    dim=1,
+                )
+                checkpoint[k] = q_scale.reshape(
+                    self.params.n_heads * self.params.head_dim, -1
+                )
+                checkpoint[prefix + "attn_gate.weight_scale"] = gate.reshape(
+                    self.params.n_heads * self.params.head_dim, -1
+                )
 
         return checkpoint
 

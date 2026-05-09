@@ -45,14 +45,27 @@ def init_moe_impl(args) -> None:
     global MOE_IMPL_INSTANCE
     assert MOE_IMPL_INSTANCE is None, "moe impl already initialized"
 
-    if args.infer.ep_size > 1:
-        n_experts = getattr(args.models, "n_routed_experts", None) or getattr(
-            args.models, "num_experts", None
+    n_routed_experts = getattr(args.models, "n_routed_experts", None) or getattr(
+        args.models, "num_experts", None
+    )
+    if n_routed_experts is None:
+        raise ValueError(
+            "n_routed_experts or num_experts must be specified in model args"
         )
-        if n_experts is None:
-            raise ValueError(
-                "n_routed_experts or num_experts must be specified in model args"
-            )
+    n_activated_experts = getattr(args.models, "n_activated_experts", None) or getattr(
+        args.models, "num_experts_per_tok", None
+    )
+    if n_activated_experts is None:
+        raise ValueError(
+            "n_activated_experts or num_experts_per_tok must be specified in model args"
+        )
+    if args.infer.fuse_shared_experts:
+        n_fused_shared_experts = getattr(args.models, "n_shared_experts", None)
+        if n_fused_shared_experts is None:
+            raise ValueError("n_shared_experts must be specified in model args")
+    else:
+        n_fused_shared_experts = 0
+    if args.infer.ep_size > 1:
         n_layers = getattr(args.models, "n_layers", None) or getattr(
             args.models, "num_hidden_layers", None
         )
@@ -71,7 +84,9 @@ def init_moe_impl(args) -> None:
             ),
             hidden_dim=args.models.dim,
             max_bs_per_dp_rank=ceil_div(args.infer.max_batch_size, args.infer.dp_size),
-            n_experts=n_experts,
+            n_routed_experts=n_routed_experts,
+            n_activated_experts=n_activated_experts,
+            n_fused_shared_experts=n_fused_shared_experts,
             n_global_experts_slots=args.infer.num_experts_slots,
             prefill_token_dispatcher_impl=args.infer.moe.prefill_token_dispatcher,
             decode_token_dispatcher_impl=args.infer.moe.decode_token_dispatcher,
@@ -81,26 +96,35 @@ def init_moe_impl(args) -> None:
             moe_lb_threshold=args.infer.moe_lb_threshold,
         )
     else:
-        MOE_IMPL_INSTANCE = MoEImplNoEP()
+        MOE_IMPL_INSTANCE = MoEImplNoEP(
+            n_routed_experts=n_routed_experts,
+            n_activated_experts=n_activated_experts,
+            n_fused_shared_experts=n_fused_shared_experts,
+        )
 
 
-def get_moe_impl() -> "MoEImplBase":
+def get_moe_impl() -> Optional["MoEImplBase"]:
     """Get singleton MoEImpl instance."""
-    assert (
-        MOE_IMPL_INSTANCE is not None
-    ), "moe impl should have been already initialized"
     return MOE_IMPL_INSTANCE
 
 
 class MoEImplBase:
     def __init__(
         self,
+        n_routed_experts: int,
+        n_activated_experts: int,
+        n_fused_shared_experts: int,
         *,
         tp_group: Optional[CommGroup] = None,
         dp_group: Optional[CommGroup] = None,
         etp_group: Optional[CommGroup] = None,
         ep_group: Optional[CommGroup] = None,
     ):
+        self.n_routed_experts = n_routed_experts
+        self.n_activated_experts = n_activated_experts
+        self.n_fused_shared_experts = n_fused_shared_experts
+        self.n_experts = self.n_routed_experts + self.n_fused_shared_experts
+
         if tp_group is None:
             tp_group = get_tp_group()
         self.tp_group = tp_group
@@ -153,7 +177,9 @@ class MoEImplEP(MoEImplBase):
         n_dense_layers: int,
         hidden_dim: int,
         max_bs_per_dp_rank: int,
-        n_experts: int,
+        n_routed_experts: int,
+        n_activated_experts: int,
+        n_fused_shared_experts: int,
         tp_group: Optional[CommGroup] = None,
         dp_group: Optional[CommGroup] = None,
         etp_group: Optional[CommGroup] = None,
@@ -167,13 +193,18 @@ class MoEImplEP(MoEImplBase):
         moe_lb_threshold: float = 3.0,
     ):
         super().__init__(
-            tp_group=tp_group, dp_group=dp_group, etp_group=etp_group, ep_group=ep_group
+            n_routed_experts=n_routed_experts,
+            n_activated_experts=n_activated_experts,
+            n_fused_shared_experts=n_fused_shared_experts,
+            tp_group=tp_group,
+            dp_group=dp_group,
+            etp_group=etp_group,
+            ep_group=ep_group,
         )
 
         self.n_layers = n_layers
         self.n_dense_layers = n_dense_layers
         self.hidden_dim = hidden_dim
-        self.n_experts = n_experts
         self.max_bs_per_dp_rank = max_bs_per_dp_rank
 
         self.task_type: Optional[TaskType] = None
@@ -376,7 +407,12 @@ class MoEImplEP(MoEImplBase):
                 dp_size=self.dp_size,
                 ep_size=self.ep_size,
             )
-            cur_load_balancer.update_expert_mapping(expert_stats=expert_stats[layer_id])
+            cur_load_balancer.update_expert_mapping(
+                self.n_routed_experts,
+                self.n_activated_experts,
+                self.n_fused_shared_experts,
+                expert_stats=expert_stats[layer_id],
+            )
             self.load_balancer[layer_id] = cur_load_balancer
 
     def get_expert_mapping(self, layer_id: int):
@@ -390,6 +426,9 @@ class MoEImplNoEP(MoEImplBase):
 
     def __init__(
         self,
+        n_routed_experts: int,
+        n_activated_experts: int,
+        n_fused_shared_experts: int,
         *,
         tp_group: Optional[CommGroup] = None,
         dp_group: Optional[CommGroup] = None,
@@ -397,7 +436,13 @@ class MoEImplNoEP(MoEImplBase):
         ep_group: Optional[CommGroup] = None,
     ):
         super().__init__(
-            tp_group=tp_group, dp_group=dp_group, etp_group=etp_group, ep_group=ep_group
+            n_routed_experts=n_routed_experts,
+            n_activated_experts=n_activated_experts,
+            n_fused_shared_experts=n_fused_shared_experts,
+            tp_group=tp_group,
+            dp_group=dp_group,
+            etp_group=etp_group,
+            ep_group=ep_group,
         )
 
         assert self.ep_size == 1

@@ -116,9 +116,7 @@ class GptOssMoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
         global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
-        n_shared_experts: int,
         n_activated_experts: int,
-        fuse_shared_experts: bool,
         checkpoint_prefix: str,
         *,
         ############################################
@@ -131,9 +129,7 @@ class GptOssMoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
             global_n_experts,
             experts_start_idx,
             experts_end_idx,
-            n_shared_experts,
             n_activated_experts,
-            fuse_shared_experts,
             checkpoint_prefix,
         )
         self.alpha = 1.702
@@ -228,9 +224,7 @@ class GptOssMoeExpertsMerged(QuantizedMoeExpertsMerged):
         global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
-        n_shared_experts: int,
         n_activated_experts: int,
-        fuse_shared_experts: bool,
         checkpoint_prefix: str,
         *,
         ############################################
@@ -243,9 +237,7 @@ class GptOssMoeExpertsMerged(QuantizedMoeExpertsMerged):
             global_n_experts,
             experts_start_idx,
             experts_end_idx,
-            n_shared_experts,
             n_activated_experts,
-            fuse_shared_experts,
             checkpoint_prefix,
         )
         self.alpha = 1.702
@@ -336,9 +328,7 @@ class ParallelMoeBlockGptOss(ParallelMoeBlock):
                 global_n_experts=args.num_experts,
                 experts_start_idx=experts_start_idx,
                 experts_end_idx=experts_end_idx,
-                n_shared_experts=0,
                 n_activated_experts=0,
-                fuse_shared_experts=False,
                 checkpoint_prefix=f"{checkpoint_prefix}.experts",
             ),
             non_fused_shared_experts=None,
@@ -495,10 +485,7 @@ class TransformerHFGptOss(TransformerHFLlama):
 
     def _process_state_dict_for_splitting_experts(self, checkpoint: dict[str, Any]):
         local_experts = compute_expert_dist_in_ep(
-            self.args.models.n_layers,
-            self.ep_size,
-            self.args.models.num_experts,
-            self.moe_impl,
+            self.args.models.n_layers, self.moe_impl
         )[self.ep_group.rank_in_group]
         new_checkpoint = {}
         for k in checkpoint.keys():
@@ -540,10 +527,7 @@ class TransformerHFGptOss(TransformerHFLlama):
         if not TP, already merged, no tensors modified, just change name
         """
         local_experts = compute_expert_dist_in_ep(
-            self.args.models.n_layers,
-            self.ep_size,
-            self.args.models.num_experts,
-            self.moe_impl,
+            self.args.models.n_layers, self.moe_impl
         )[self.ep_group.rank_in_group]
         new_checkpoint = {}
         for k in checkpoint.keys():

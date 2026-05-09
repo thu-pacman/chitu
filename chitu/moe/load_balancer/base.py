@@ -34,13 +34,26 @@ class MoELoadBalancer(ABC):
         self.is_cuda = is_cuda
 
     def update_expert_mapping(
-        self, expert_stats: Optional[torch.Tensor] = None, strict_verify: bool = False
+        self,
+        n_routed_experts: Optional[int] = None,
+        n_activated_experts: Optional[int] = None,
+        n_fused_shared_experts: int = 0,
+        expert_stats: Optional[torch.Tensor] = None,
+        strict_verify: bool = False,
     ):
-        self.generate_expert_mapping(expert_stats)
+        self.generate_expert_mapping(
+            n_routed_experts, n_activated_experts, n_fused_shared_experts, expert_stats
+        )
         self.verify_expert_mapping(strict=strict_verify)
 
     @abstractmethod
-    def generate_expert_mapping(self, expert_stats: Optional[torch.Tensor] = None):
+    def generate_expert_mapping(
+        self,
+        n_routed_experts: Optional[int] = None,
+        n_activated_experts: Optional[int] = None,
+        n_fused_shared_experts: int = 0,
+        expert_stats: Optional[torch.Tensor] = None,
+    ):
         raise NotImplementedError("generate expert mapping not implemented.")
 
     def verify_expert_mapping(self, strict=False):

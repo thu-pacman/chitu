@@ -227,6 +227,17 @@ def test_priority_prefill_first():
         }
     ]
 
+    scheduler = Scheduler(
+        max_runing_tasks=100,
+        prefill_num_tasks=4,
+        decode_num_tasks=2,
+        cache_manager_dict=Backend.cache_managers[0],
+        scheduler_type="prefill_first",
+        num_scheduler_groups=1,
+    )
+
+    main_manager = Backend.cache_managers[0]["main"]
+
     tasks = []
     for i in range(9):
         req = UserRequest.create_mock(
@@ -238,9 +249,9 @@ def test_priority_prefill_first():
     # 让task_2, task_5, task_6为decode状态
     for task in [tasks[2], tasks[5], tasks[6]]:
         task.dp_rank = 0
-        task.prompt_to_token_block(task.dp_rank)
+        main_manager.ensure_task_token_blocks(task)
         task.set_prefill_chunk_size_for_one_step(task.prefix_tokens_len)
-        Backend.cache_managers[0]["main"].prepare_metadata_before_prefill(task)
+        scheduler._prepare_prefill_metadata(task, cached_len=0)
         task.consume_req_tokens()
 
     TaskPool.add(tasks[7])
@@ -253,50 +264,29 @@ def test_priority_prefill_first():
     TaskPool.add(tasks[4])
     TaskPool.add(tasks[6])
 
-    scheduler = Scheduler(
-        max_runing_tasks=100,
-        prefill_num_tasks=4,
-        decode_num_tasks=2,
-        cache_manager_dict=Backend.cache_managers[0],
-        scheduler_type="prefill_first",
-        num_scheduler_groups=1,
-    )
-
     batch1_ids = scheduler.schedule()
     assert sorted(batch1_ids) == sorted(["req_7", "req_1", "req_3", "req_8"])
-    scheduler.update(batch1_ids)
     for task_id in batch1_ids:
-        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
-            TaskPool.pool[task_id]
-        )
-        TaskPool.remove(task_id)
+        TaskPool.pool[task_id].set_stopped()
+    scheduler.update(batch1_ids)
 
     batch2_ids = scheduler.schedule()
     assert sorted(batch2_ids) == sorted(["req_0", "req_4"])
-    scheduler.update(batch2_ids)
     for task_id in batch2_ids:
-        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
-            TaskPool.pool[task_id]
-        )
-        TaskPool.remove(task_id)
+        TaskPool.pool[task_id].set_stopped()
+    scheduler.update(batch2_ids)
 
     batch3_ids = scheduler.schedule()
     assert sorted(batch3_ids) == sorted(["req_2", "req_5"])
-    scheduler.update(batch3_ids)
     for task_id in batch3_ids:
-        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
-            TaskPool.pool[task_id]
-        )
-        TaskPool.remove(task_id)
+        TaskPool.pool[task_id].set_stopped()
+    scheduler.update(batch3_ids)
 
     batch4_ids = scheduler.schedule()
     assert sorted(batch4_ids) == sorted(["req_6"])
-    scheduler.update(batch4_ids)
     for task_id in batch4_ids:
-        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
-            TaskPool.pool[task_id]
-        )
-        TaskPool.remove(task_id)
+        TaskPool.pool[task_id].set_stopped()
+    scheduler.update(batch4_ids)
 
     batch5_ids = scheduler.schedule()
     assert len(batch5_ids) == 0
@@ -429,6 +419,18 @@ def test_priority_fcfs():
         }
     ]
 
+    main_manager = Backend.cache_managers[0]["main"]
+
+    scheduler = Scheduler(
+        max_runing_tasks=100,
+        prefill_num_tasks=4,
+        decode_num_tasks=4,
+        scheduler_type="fcfs",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=1,
+        dp_rank=0,
+    )
+
     tasks = []
     for i in range(9):
         req = UserRequest.create_mock(
@@ -440,9 +442,9 @@ def test_priority_fcfs():
     # 让task_6, task_7, task_8为decode状态
     for task in [tasks[6], tasks[7], tasks[8]]:
         task.dp_rank = 0
-        task.prompt_to_token_block(task.dp_rank)
+        main_manager.ensure_task_token_blocks(task)
         task.set_prefill_chunk_size_for_one_step(task.prefix_tokens_len)
-        Backend.cache_managers[0]["main"].prepare_metadata_before_prefill(task)
+        scheduler._prepare_prefill_metadata(task, cached_len=0)
         task.consume_req_tokens()
 
     TaskPool.add(tasks[7])
@@ -455,42 +457,23 @@ def test_priority_fcfs():
     TaskPool.add(tasks[4])
     TaskPool.add(tasks[6])
 
-    scheduler = Scheduler(
-        max_runing_tasks=100,
-        prefill_num_tasks=4,
-        decode_num_tasks=4,
-        scheduler_type="fcfs",
-        cache_manager_dict=Backend.cache_managers[0],
-        num_scheduler_groups=1,
-        dp_rank=0,
-    )
-
     batch1_ids = scheduler.schedule()
     assert sorted(batch1_ids) == sorted(["req_0", "req_1", "req_2", "req_3"])
-    scheduler.update(batch1_ids)
     for task_id in batch1_ids:
-        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
-            TaskPool.pool[task_id]
-        )
-        TaskPool.remove(task_id)
+        TaskPool.pool[task_id].set_stopped()
+    scheduler.update(batch1_ids)
 
     batch2_ids = scheduler.schedule()
     assert sorted(batch2_ids) == sorted(["req_4", "req_5"])
-    scheduler.update(batch2_ids)
     for task_id in batch2_ids:
-        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
-            TaskPool.pool[task_id]
-        )
-        TaskPool.remove(task_id)
+        TaskPool.pool[task_id].set_stopped()
+    scheduler.update(batch2_ids)
 
     batch3_ids = scheduler.schedule()
     assert sorted(batch3_ids) == sorted(["req_6", "req_7", "req_8"])
-    scheduler.update(batch3_ids)
     for task_id in batch3_ids:
-        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
-            TaskPool.pool[task_id]
-        )
-        TaskPool.remove(task_id)
+        TaskPool.pool[task_id].set_stopped()
+    scheduler.update(batch3_ids)
 
     batch4_ids = scheduler.schedule()
     assert len(batch4_ids) == 0
@@ -622,6 +605,17 @@ def test_priority_request_preset_over_prefill_first():
         }
     ]
 
+    main_manager = Backend.cache_managers[0]["main"]
+
+    scheduler = Scheduler(
+        100,
+        4,
+        2,
+        "request_preset,prefill_first",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=1,
+    )
+
     tasks = []
     for i in range(9):
         req = UserRequest.create_mock(
@@ -633,9 +627,9 @@ def test_priority_request_preset_over_prefill_first():
     # 让task_2, task_5, task_6为decode状态
     for task in [tasks[2], tasks[5], tasks[6]]:
         task.dp_rank = 0
-        task.prompt_to_token_block(task.dp_rank)
+        main_manager.ensure_task_token_blocks(task)
         task.set_prefill_chunk_size_for_one_step(task.prefix_tokens_len)
-        Backend.cache_managers[0]["main"].prepare_metadata_before_prefill(task)
+        scheduler._prepare_prefill_metadata(task, cached_len=0)
         task.consume_req_tokens()
 
     TaskPool.add(tasks[7])
@@ -648,54 +642,33 @@ def test_priority_request_preset_over_prefill_first():
     TaskPool.add(tasks[4])
     TaskPool.add(tasks[6])
 
-    scheduler = Scheduler(
-        100,
-        4,
-        2,
-        "request_preset,prefill_first",
-        cache_manager_dict=Backend.cache_managers[0],
-        num_scheduler_groups=1,
-    )
-
     # ['req_7', 'req_2':Decode, 'req_1', 'req_5':Decode, 'req_3', 'req_8', 'req_0', 'req_4', 'req_6':Decode]
     batch1_ids = scheduler.schedule()
     assert sorted(batch1_ids) == sorted(["req_7", "req_3", "req_0", "req_4"])
-    scheduler.update(batch1_ids)
     for task_id in batch1_ids:
-        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
-            TaskPool.pool[task_id]
-        )
-        TaskPool.remove(task_id)
+        TaskPool.pool[task_id].set_stopped()
+    scheduler.update(batch1_ids)
 
     # TaskPool: ['req_2':Decode, 'req_1', 'req_5':Decode, 'req_8', 'req_6':Decode]
     batch2_ids = scheduler.schedule()
     assert sorted(batch2_ids) == sorted(["req_2", "req_6"])
-    scheduler.update(batch2_ids)
     for task_id in batch2_ids:
-        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
-            TaskPool.pool[task_id]
-        )
-        TaskPool.remove(task_id)
+        TaskPool.pool[task_id].set_stopped()
+    scheduler.update(batch2_ids)
 
     # TaskPool: ['req_1', 'req_5':Decode, 'req_8']
     batch3_ids = scheduler.schedule()
     assert sorted(batch3_ids) == sorted(["req_1", "req_8"])
-    scheduler.update(batch3_ids)
     for task_id in batch3_ids:
-        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
-            TaskPool.pool[task_id]
-        )
-        TaskPool.remove(task_id)
+        TaskPool.pool[task_id].set_stopped()
+    scheduler.update(batch3_ids)
 
     # TaskPool: ['req_5':Decode]
     batch4_ids = scheduler.schedule()
     assert sorted(batch4_ids) == sorted(["req_5"])
-    scheduler.update(batch4_ids)
     for task_id in batch4_ids:
-        scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(
-            TaskPool.pool[task_id]
-        )
-        TaskPool.remove(task_id)
+        TaskPool.pool[task_id].set_stopped()
+    scheduler.update(batch4_ids)
 
     batch5_ids = scheduler.schedule()
     assert len(batch5_ids) == 0
@@ -1034,6 +1007,16 @@ def test_evict_task():
         }
     ]  # kv_cache capacity = 5120
 
+    main_manager = Backend.cache_managers[0]["main"]
+    scheduler = Scheduler(
+        100,
+        4,
+        DECODE_NUM_TASKS,
+        "prefill_first,fcfs",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=1,
+    )
+
     Backend.tokenizer = MockTokenizer()
     tasks = []
     task_ids = []
@@ -1054,9 +1037,9 @@ def test_evict_task():
         TaskPool.add(task)  # pool: ['req_0', 'req_1', 'req_2', 'req_3']
 
         task.dp_rank = 0
-        task.prompt_to_token_block(task.dp_rank)
+        main_manager.ensure_task_token_blocks(task)
         task.set_prefill_chunk_size_for_one_step(BLOCK_SIZE)
-        Backend.cache_managers[0]["main"].prepare_metadata_before_prefill(task)
+        scheduler._prepare_prefill_metadata(task, cached_len=0)
         task.consume_req_tokens()
         if i != 3:
             task.prefix_tokens.append(1)
@@ -1066,14 +1049,7 @@ def test_evict_task():
     # evict low priority tasks('req_2':Decode, 'req_3':Prefill) when cache manager has no more blocks for decoding
     req_2_prefix_tokens = tasks[-2].prefix_tokens
     req_3_prefix_tokens = tasks[-1].prefix_tokens
-    scheduler = Scheduler(
-        100,
-        4,
-        DECODE_NUM_TASKS,
-        "prefill_first,fcfs",
-        cache_manager_dict=Backend.cache_managers[0],
-        num_scheduler_groups=1,
-    )
+
     assert (
         scheduler.kvcache_block_threshold
         == Backend.cache_managers[0]["main"].num_blocks
@@ -1200,6 +1176,15 @@ def test_can_prefill():
     assert scheduler.schedule(strict_allowed_task_type={TaskType.Prefill}) == []
 
     # 假设taskpool中全是waiting任务
+    scheduler = Scheduler(
+        100,
+        4,
+        DECODE_NUM_TASKS,
+        "request_preset,fcfs",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=1,
+        dp_rank=0,
+    )
     for task in TaskPool.pool.values():
         scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(task)
     TaskPool.reset()
@@ -1211,20 +1196,11 @@ def test_can_prefill():
         )
         task = Task(f"{req.request_id}", req)
         task.dp_rank = 0
-        task.prompt_to_token_block(task.dp_rank)
-        scheduler.cache_manager_dict["main"].prepare_metadata_before_prefill(task)
+        scheduler.cache_manager_dict["main"].ensure_task_token_blocks(task)
+        scheduler._prepare_prefill_metadata(task, cached_len=0)
         task.wait()
         TaskPool.add(task)  # pool: ['req_0', 'req_1', 'req_2', 'req_3']
 
-    scheduler = Scheduler(
-        100,
-        4,
-        DECODE_NUM_TASKS,
-        "request_preset,fcfs",
-        cache_manager_dict=Backend.cache_managers[0],
-        num_scheduler_groups=1,
-        dp_rank=0,
-    )
     assert not scheduler.can_prefill()
     assert scheduler.schedule(strict_allowed_task_type={TaskType.Prefill}) == []
 
@@ -1321,6 +1297,15 @@ def test_scheduler_group():
     ]
     Backend.tokenizer = MockTokenizer()
 
+    scheduler = Scheduler(
+        100,
+        4,
+        2,
+        "prefill_first",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=2,
+    )
+
     tasks = []
     for i in range(9):
         req = UserRequest.create_mock(
@@ -1332,9 +1317,9 @@ def test_scheduler_group():
     # 让task_2, task_5为decode状态
     for task in [tasks[2], tasks[5]]:
         task.dp_rank = 0
-        task.prompt_to_token_block(task.dp_rank)
+        Backend.cache_managers[0]["main"].ensure_task_token_blocks(task)
         task.set_prefill_chunk_size_for_one_step(task.prefix_tokens_len)
-        Backend.cache_managers[0]["main"].prepare_metadata_before_prefill(task)
+        scheduler._prepare_prefill_metadata(task, cached_len=0)
         task.consume_req_tokens()
 
     # Add 4 tasks
@@ -1342,15 +1327,6 @@ def test_scheduler_group():
     TaskPool.add(tasks[2])
     TaskPool.add(tasks[1])
     TaskPool.add(tasks[5])
-
-    scheduler = Scheduler(
-        100,
-        4,
-        2,
-        "prefill_first",
-        cache_manager_dict=Backend.cache_managers[0],
-        num_scheduler_groups=2,
-    )
 
     # TaskPool: ['req_7', 'req_2', 'req_1', 'req_5']
     # sgroup head at: 0, empty sgroup: [0, 1]
@@ -1377,9 +1353,9 @@ def test_scheduler_group():
 
     # 让task_6为decode状态
     tasks[6].dp_rank = 0
-    tasks[6].prompt_to_token_block(tasks[6].dp_rank)
+    Backend.cache_managers[0]["main"].ensure_task_token_blocks(tasks[6])
     tasks[6].set_prefill_chunk_size_for_one_step(tasks[6].prefix_tokens_len)
-    Backend.cache_managers[0]["main"].prepare_metadata_before_prefill(tasks[6])
+    scheduler._prepare_prefill_metadata(tasks[6], cached_len=0)
     tasks[6].consume_req_tokens()
 
     # sgroup head at: 0, empty sgroup: []
@@ -1634,3 +1610,212 @@ def test_pp_chunked_prefill():
             TaskPool.pool[task_id].consume_req_tokens()
 
         scheduler.update(batch_ids)
+
+
+def _build_scheduler_for_helper_tests(cache_manager_dict: dict, *, main_threshold=None):
+    scheduler = Scheduler(
+        100,
+        12,
+        12,
+        "prefill_first",
+        cache_manager_dict=cache_manager_dict,
+        num_scheduler_groups=1,
+        prefill_chunk_size=20000,
+    )
+    if main_threshold is not None:
+        scheduler.kvcache_block_threshold = main_threshold
+
+    return scheduler
+
+
+def test_prepare_prefill_metadata_multi_cache_managers():
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 2048,
+                    "cache_type": "paged",
+                    "op_impl": "torch",
+                    "schedule_overlap": True,
+                    "mtp_size": 1,
+                }
+            }
+        ),
+        need_ensure=False,
+    )
+
+    main = PagedKVCacheManager(
+        num_hot_req=8,
+        max_seq_len=2048,
+        dp_rank=0,
+        block_size=128,
+        num_blocks=16,
+        enable_prefix_caching=True,
+    )
+    indexer = PagedKVCacheManager(
+        num_hot_req=8,
+        max_seq_len=2048,
+        dp_rank=0,
+        block_size=64,
+        num_blocks=32,
+        enable_prefix_caching=True,
+    )
+    scheduler = Scheduler(
+        100,
+        12,
+        12,
+        "prefill_first",
+        cache_manager_dict={"main": main, "indexer": indexer},
+        num_scheduler_groups=1,
+        prefill_chunk_size=20000,
+    )
+
+    task0 = Task("req_prefill_0", UserRequest.create_mock(512, "req_prefill_0"))
+
+    for manager in (main, indexer):
+        manager.ensure_task_token_blocks(task0)
+    task0.set_prefill_chunk_size_for_one_step(128)
+
+    scheduler._prepare_prefill_metadata(task0, cached_len=0)
+    task0.consume_req_tokens()
+
+    assert len(task0.new_cache_ids["main"]) == 1
+    assert len(task0.new_cache_ids["indexer"]) == 2
+    assert task0.hit_token_len == 0
+    assert task0.consumed_req_tokens == 128
+    assert main.tid_to_cached_len[task0.task_id] == 128
+    assert indexer.tid_to_cached_len[task0.task_id] == 128
+
+    # 测试task1的prompt被main和indexer manager全部击中
+    task1 = Task("req_prefill_1", UserRequest.create_mock(128, "req_prefill_1"))
+    for manager in (main, indexer):
+        manager.ensure_task_token_blocks(task1)
+    assert main.num_cached_blocks(task1) == 1
+    assert indexer.num_cached_blocks(task1) == 2
+
+    num_cached_tokens = scheduler._num_prefill_cached_tokens(task1)
+    assert num_cached_tokens == task1.prefix_tokens_len
+    task1.set_prefill_chunk_size_for_one_step(1)
+    scheduler._prepare_prefill_metadata(task1, cached_len=num_cached_tokens)
+
+    assert len(task1.new_cache_ids["main"]) == 1
+    assert len(task1.new_cache_ids["indexer"]) == 2
+    assert task1.hit_token_len == 127
+    assert task1.consumed_req_tokens == 127
+    assert main.tid_to_cached_len[task1.task_id] == 128
+    assert indexer.tid_to_cached_len[task1.task_id] == 128
+
+    # 测试test1的prepare_decode_metadata过程
+    task1.consume_req_tokens()
+    task1.prefix_tokens.append(1)
+    assert task1.task_type == TaskType.Decode
+    assert task1.prefix_tokens_len == 129
+
+    assert main.task_to_cache_ids[task1.task_id] == {0}
+    assert indexer.task_to_cache_ids[task1.task_id] == {0, 1}
+    scheduler._prepare_decode_metadata(task1)
+    assert len(task1.new_cache_ids["main"]) == 1
+    assert len(task1.new_cache_ids["indexer"]) == 1
+
+
+def test_check_prefill_capacity_requires_all_cache_managers():
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 2048,
+                    "cache_type": "paged",
+                    "op_impl": "torch",
+                    "schedule_overlap": True,
+                    "mtp_size": 1,
+                }
+            }
+        ),
+        need_ensure=False,
+    )
+    task = Task("req_capacity", UserRequest.create_mock(1024, "req_capacity"))
+    task.set_prefill_chunk_size_for_one_step(256)
+
+    # main manager has enough blocks, indexer manager does not.
+    main = PagedKVCacheManager(
+        num_hot_req=4,
+        max_seq_len=2048,
+        dp_rank=0,
+        block_size=256,
+        num_blocks=8,
+        enable_prefix_caching=False,
+    )
+    indexer = PagedKVCacheManager(
+        num_hot_req=4,
+        max_seq_len=2048,
+        dp_rank=0,
+        block_size=128,
+        num_blocks=5,
+        enable_prefix_caching=False,
+    )
+    main.active_blocks = {i: object() for i in range(6)}
+    indexer.active_blocks = {i: object() for i in range(4)}
+    scheduler = Scheduler(
+        100,
+        12,
+        12,
+        "prefill_first",
+        cache_manager_dict={"main": main, "indexer": indexer},
+        num_scheduler_groups=1,
+        prefill_chunk_size=20000,
+    )
+    scheduler.kvcache_block_threshold = 8
+    assert not scheduler._check_prefill_capacity(task, cached_len=512)
+
+
+def test_check_decode_capacity_requires_all_cache_managers():
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 2048,
+                    "cache_type": "paged",
+                    "op_impl": "torch",
+                    "schedule_overlap": True,
+                    "mtp_size": 1,
+                }
+            }
+        ),
+        need_ensure=False,
+    )
+    task = Task(
+        "req_decode_capacity", UserRequest.create_mock(400, "req_decode_capacity")
+    )
+    task.task_type = TaskType.Decode
+
+    main = PagedKVCacheManager(
+        num_blocks=10,
+        num_hot_req=8,
+        max_seq_len=2048,
+        dp_rank=0,
+        block_size=100,
+        enable_prefix_caching=False,
+    )
+    main.active_blocks = {i: object() for i in range(5)}
+    main.task_to_cache_ids[task.task_id] = {0, 1}
+    indexer = PagedKVCacheManager(
+        num_blocks=3,
+        num_hot_req=8,
+        max_seq_len=2048,
+        dp_rank=0,
+        block_size=128,
+        enable_prefix_caching=False,
+    )
+    indexer.active_blocks = {i: object() for i in range(2)}
+    indexer.task_to_cache_ids[task.task_id] = {0, 1}
+    scheduler = Scheduler(
+        100,
+        12,
+        12,
+        "prefill_first",
+        cache_manager_dict={"main": main, "indexer": indexer},
+        num_scheduler_groups=1,
+        prefill_chunk_size=20000,
+    )
+
+    assert not scheduler._check_decode_capacity(task)

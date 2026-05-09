@@ -157,4 +157,10 @@ The following models are part of chitu-pro. Please concat [solution@chitu.ai](so
 | Qwen3-4B-mxfp4 | ✓ | `models=Qwen3-4B-mxfp4` |
 | Qwen3-8B-ascend-int8 | ✓ | `models=Qwen3-8B-ascend-int8` |
 | Qwen3-Coder-480B-A35B-Instruct-int8 | ✓ | `models=Qwen3-Coder-480B-A35B-Instruct-int8` |
+| Qwen3.5-122B-A10B-mxfp4 | ✓ | `models=Qwen3.5-122B-A10B-mxfp4` |
+| Qwen3.5-27B-mxfp4 | ✓ | `models=Qwen3.5-27B-mxfp4` |
+| Qwen3.5-35B-A3B-mxfp4 | ✓ | `models=Qwen3.5-35B-A3B-mxfp4` |
+| Qwen3.5-397B-A17B-mxfp4 | ✓ | `models=Qwen3.5-397B-A17B-mxfp4` |
+| Qwen3.6-27B-mxfp4 | ✓ | `models=Qwen3.6-27B-mxfp4` |
+| Qwen3.6-35B-A3B-mxfp4 | ✓ | `models=Qwen3.6-35B-A3B-mxfp4` |
 

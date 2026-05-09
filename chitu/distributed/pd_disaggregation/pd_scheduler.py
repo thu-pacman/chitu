@@ -33,6 +33,7 @@ from chitu.task import (
     UserRequest,
 )
 from chitu.global_vars import get_global_args
+from chitu.utils import ceil_div
 from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
     KVManager,
     DisaggregationMode,
@@ -443,7 +444,7 @@ class PDScheduler(Scheduler):
         dp_rank = int(task.dp_rank)
         prefill_scheduler_id = task.pd_prefill_engine_rank
         prefix_len = int(getattr(task, "prefix_tokens_len", 0))
-        task_cache_ids = task.new_cache_ids
+        task_new_cache_ids = task.new_cache_ids
 
         endpoint = self._get_decode_prepare_endpoint(dp_rank)
         ip = str(endpoint.get("ip"))
@@ -462,7 +463,7 @@ class PDScheduler(Scheduler):
                     prefill_scheduler_id if prefill_scheduler_id is not None else None
                 ),
                 "prefix_len": prefix_len or 0,
-                "task_cache_ids": task_cache_ids,
+                "new_cache_ids": task_new_cache_ids,
             },
             use_bin_type=True,
         )
@@ -1112,32 +1113,50 @@ class DecodeOnlyScheduler(PDScheduler):
             if not task.new_cache_ids:
                 prefix_len = int(getattr(task, "prefix_tokens_len", 0))
 
-                task.prompt_to_token_block(dp_rank=target_dp_rank)
-                kv_cache_manager: PagedKVCacheManager = Backend.cache_managers[
-                    target_dp_rank
-                ]["main"]
-
-                aviable_blocks = (
-                    kv_cache_manager.num_blocks
-                    - kv_cache_manager.num_active_blocks
-                    - task.num_cached_idle_blocks
+                cache_manager_dict: dict[str, PagedKVCacheManager] = (
+                    Backend.cache_managers[target_dp_rank]
                 )
-                remain_prefix_len = (
-                    prefix_len - task.kv_cache_len_used_in_completed_steps
-                )
+                for cache_manager in cache_manager_dict.values():
+                    cache_manager.ensure_task_token_blocks(task)
 
-                if aviable_blocks * kv_cache_manager.block_size < remain_prefix_len:
-                    if (
-                        prefix_len
-                        > kv_cache_manager.block_size * kv_cache_manager.num_blocks
+                num_cached_tokens = min(
+                    cache_manager.num_cached_blocks(task) * cache_manager.block_size
+                    for cache_manager in cache_manager_dict.values()
+                )
+                remain_prefix_len = prefix_len - num_cached_tokens
+
+                has_capacity = True
+                failed_cache_manager = None
+                for cache_manager in cache_manager_dict.values():
+                    cur_blocks = ceil_div(num_cached_tokens, cache_manager.block_size)
+                    target_blocks = ceil_div(prefix_len, cache_manager.block_size)
+                    idle_hit_blocks = cache_manager.num_cached_idle_blocks(
+                        task, max_cached_token_len=num_cached_tokens
+                    )
+                    available_blocks = (
+                        cache_manager.num_blocks
+                        - cache_manager.num_active_blocks
+                        - idle_hit_blocks
+                    )
+                    if target_blocks - cur_blocks > available_blocks:
+                        has_capacity = False
+                        failed_cache_manager = cache_manager
+                        break
+
+                if not has_capacity:
+                    assert failed_cache_manager is not None
+                    if prefix_len > (
+                        failed_cache_manager.block_size
+                        * failed_cache_manager.num_blocks
                     ):
                         total_capacity_tokens = (
-                            kv_cache_manager.block_size * kv_cache_manager.num_blocks
+                            failed_cache_manager.block_size
+                            * failed_cache_manager.num_blocks
                         )
                         error_message = (
                             "KV cache capacity is insufficient to support prefilling. "
-                            f"total_blocks={kv_cache_manager.num_blocks} "
-                            f"block_size={kv_cache_manager.block_size} "
+                            f"total_blocks={failed_cache_manager.num_blocks} "
+                            f"block_size={failed_cache_manager.block_size} "
                             f"total_capacity_tokens={total_capacity_tokens} "
                             f"prompt_len={task.prompt_len}. "
                             "Increase decode KV blocks or enable full_warmup."
@@ -1153,7 +1172,21 @@ class DecodeOnlyScheduler(PDScheduler):
                     remain_prefix_len = 1
 
                 task.set_prefill_chunk_size_for_one_step(remain_prefix_len)
-                kv_cache_manager.prepare_metadata_before_prefill(task)
+
+                if num_cached_tokens == task.prefix_tokens_len:
+                    num_cached_tokens = task.prefix_tokens_len - 1
+
+                for name, cache_manager in cache_manager_dict.items():
+                    task.new_cache_ids[name] = (
+                        cache_manager.prepare_metadata_before_prefill(
+                            task,
+                            max_cached_token_len=num_cached_tokens,
+                        )
+                    )
+
+                task.hit_token_len = num_cached_tokens - task.consumed_req_tokens
+                task.consumed_req_tokens = num_cached_tokens
+
                 task.consume_req_tokens()
                 assert (
                     task.task_type == TaskType.Decode
@@ -1483,7 +1516,8 @@ class DecodeOnlyScheduler(PDScheduler):
         # Free KV cache metadata (same as base class)
         task.next_token = -1
         task.evicting = True
-        self.cache_manager_dict["main"].finalize_metadata_all_decode(task)
+        for cache_manager in self.cache_manager_dict.values():
+            cache_manager.finalize_metadata_all_decode(task)
         Backend.executor.special_step([task.task_id], type="EndTask")
 
         logger.warning(

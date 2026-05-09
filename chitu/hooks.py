@@ -45,7 +45,7 @@ class KVTransferHook(Protocol):
     def before_decode_step(
         self,
         req_ids: list[str],
-        cache_ids_list: Optional[list[list[int]]] = None,
+        new_cache_ids_list: Optional[list[dict[str, list[int]]]] = None,
         prefix_lens: Optional[list[int]] = None,
     ):
         pass
@@ -58,7 +58,7 @@ class NoopKVTransferHook:
     def before_decode_step(
         self,
         req_ids: list[str],
-        cache_ids_list: Optional[list[list[int]]] = None,
+        new_cache_ids_list: Optional[list[dict[str, list[int]]]] = None,
         prefix_lens: Optional[list[int]] = None,
     ):
         return
@@ -215,7 +215,7 @@ class MooncakeKVTransferHook:
     def before_decode_step(
         self,
         req_ids: list[str],
-        cache_ids_list: Optional[list[list[int]]] = None,
+        new_cache_ids_list: Optional[list[dict[str, list[int]]]] = None,
         prefix_lens: Optional[list[int]] = None,
     ):
         if self.kv_manager is None:
@@ -260,13 +260,14 @@ class MooncakeKVTransferHook:
             if prefix_lens is not None and len(prefix_lens) == len(req_ids)
             else None
         )
-        provided_cache_ids_list = (
-            cache_ids_list
-            if cache_ids_list is not None and len(cache_ids_list) == len(req_ids)
+        provided_new_cache_ids_list = (
+            new_cache_ids_list
+            if new_cache_ids_list is not None
+            and len(new_cache_ids_list) == len(req_ids)
             else None
         )
         pending_prefix_lens = []
-        pending_cache_ids_list = []
+        pending_new_cache_ids_list = []
         for idx, rid in enumerate(req_ids):
             if rid not in pending:
                 continue
@@ -277,14 +278,12 @@ class MooncakeKVTransferHook:
                 else (int(t.prefix_tokens_len) if t is not None else 0)
             )
             pending_prefix_lens.append(prefix_len)
-            cache_ids = (
-                list(provided_cache_ids_list[idx] or [])
-                if provided_cache_ids_list is not None
-                else (
-                    list(getattr(t, "new_cache_ids", []) or []) if t is not None else []
-                )
+            new_cache_ids = (
+                provided_new_cache_ids_list[idx]
+                if provided_new_cache_ids_list is not None
+                else getattr(t, "new_cache_ids", None)
             )
-            pending_cache_ids_list.append(cache_ids)
+            pending_new_cache_ids_list.append(new_cache_ids)
         if pd_trace_enabled():
             logger.debug(
                 f"[PD_TRACE][decode.kv_pull_prefix] pending={pending} prefix_lens={pending_prefix_lens}"
@@ -308,7 +307,7 @@ class MooncakeKVTransferHook:
             request_ids=pending,
             kv_cache=kv_cache,
             prefix_lens=pending_prefix_lens,
-            cache_ids_list=pending_cache_ids_list,
+            new_cache_ids_list=pending_new_cache_ids_list,
         )
         if pd_trace_enabled():
             logger.debug(

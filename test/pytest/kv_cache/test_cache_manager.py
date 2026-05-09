@@ -15,6 +15,7 @@ from omegaconf import OmegaConf
 from chitu.global_vars import set_global_args
 from chitu.backend import Backend
 from chitu.utils import ceil_div
+from chitu.scheduler import Scheduler
 
 
 @pytest.fixture(autouse=True)
@@ -184,16 +185,19 @@ class TestPagedKVCacheManager:
 
         # 在scheduler中完成步骤
         task.dp_rank = 0
-        task.prompt_to_token_block(task.dp_rank)
-        assert len(task.token_blocks) == 2
+        cache_manager.ensure_task_token_blocks(task)
+        token_blocks = cache_manager.get_task_token_blocks(task)
+        assert len(token_blocks) == 2
         assert task.kv_cache_len_used_in_completed_steps == 0
         task.set_prefill_chunk_size_for_one_step(300)  # 假如prefill_chunk_size为300
-        cache_manager.prepare_metadata_before_prefill(task)
+        task.new_cache_ids = {
+            "main": cache_manager.prepare_metadata_before_prefill(task)
+        }
 
         assert task.consumed_req_tokens == 0
-        assert task.new_cache_ids == [0]
+        assert task.new_cache_ids["main"] == [0]
         assert cache_manager.task_to_cache_ids[task.task_id] == {0}
-        assert cache_manager.active_blocks[0] is task.token_blocks[0].runtime
+        assert cache_manager.active_blocks[0] is token_blocks[0].runtime
         assert cache_manager.tid_to_cached_len[task.task_id] == 300
 
         # 在executor中完成的步骤
@@ -202,14 +206,17 @@ class TestPagedKVCacheManager:
         assert task.task_type == TaskType.Prefill
 
         # 第二次被prefill调度
-        assert task.num_cached_blocks == 1
+        assert cache_manager.num_cached_blocks(task) == 1
         assert task.kv_cache_len_used_in_completed_steps == 300
         task.set_prefill_chunk_size_for_one_step(300)  # 假如prefill_chunk_size为300
-        cache_manager.prepare_metadata_before_prefill(task)
-        assert task.new_cache_ids == [1]
+        task.new_cache_ids = {
+            "main": cache_manager.prepare_metadata_before_prefill(task)
+        }
+        token_blocks = cache_manager.get_task_token_blocks(task)
+        assert task.new_cache_ids["main"] == [1]
         assert cache_manager.task_to_cache_ids[task.task_id] == {0, 1}
-        assert cache_manager.active_blocks[1] is task.token_blocks[1].runtime
-        assert task.token_blocks[1].active_cnt == 1
+        assert cache_manager.active_blocks[1] is token_blocks[1].runtime
+        assert token_blocks[1].active_cnt == 1
         assert cache_manager.tid_to_cached_len[task.task_id] == 600
 
         # 在executor中完成的步骤
@@ -240,9 +247,9 @@ class TestPagedKVCacheManager:
         cache_manager.mtp_size = 500  # 设定mtp_size为500
 
         # 开始被decode调度
-        assert task.num_cached_blocks == 2
+        assert cache_manager.num_cached_blocks(task) == 2
         aviable_blocks = cache_manager.num_blocks - cache_manager.num_active_blocks
-        cur_blocks = task.num_cached_blocks
+        cur_blocks = cache_manager.num_cached_blocks(task)
         target_blocks = ceil_div(
             task.kv_cache_len_used_in_completed_steps_and_next_step,
             cache_manager.block_size,
@@ -251,11 +258,14 @@ class TestPagedKVCacheManager:
         assert aviable_blocks == 98
         assert cur_blocks == 2
         assert target_blocks == 3
-        cache_manager.prepare_metadata_before_decode(task)
-        assert task.new_cache_ids == [2]
+        task.new_cache_ids = {
+            "main": cache_manager.prepare_metadata_before_decode(task)
+        }
+        token_blocks = cache_manager.get_task_token_blocks(task)
+        assert task.new_cache_ids["main"] == [2]
         assert cache_manager.task_to_cache_ids[task.task_id] == {0, 1, 2}
-        assert cache_manager.active_blocks[2] is task.token_blocks[2].runtime
-        assert task.token_blocks[1].active_cnt == 1
+        assert cache_manager.active_blocks[2] is token_blocks[2].runtime
+        assert token_blocks[1].active_cnt == 1
         assert cache_manager.tid_to_cached_len[task.task_id] == 1100
 
         # 在executor中执行decode step
@@ -264,9 +274,9 @@ class TestPagedKVCacheManager:
         assert task.prefix_tokens_len == 1001
 
         # 再次被decode调度
-        assert task.num_cached_blocks == 3
+        assert cache_manager.num_cached_blocks(task) == 3
         aviable_blocks = cache_manager.num_blocks - cache_manager.num_active_blocks
-        cur_blocks = task.num_cached_blocks
+        cur_blocks = cache_manager.num_cached_blocks(task)
         target_blocks = ceil_div(
             task.kv_cache_len_used_in_completed_steps_and_next_step,
             cache_manager.block_size,
@@ -275,8 +285,10 @@ class TestPagedKVCacheManager:
         assert aviable_blocks == 97
         assert cur_blocks == 3
         assert target_blocks == 3
-        cache_manager.prepare_metadata_before_decode(task)
-        assert task.new_cache_ids == []
+        task.new_cache_ids = {
+            "main": cache_manager.prepare_metadata_before_decode(task)
+        }
+        assert task.new_cache_ids["main"] == []
         assert cache_manager.task_to_cache_ids[task.task_id] == {0, 1, 2}
         assert cache_manager.tid_to_cached_len[task.task_id] == 1500
 
@@ -306,7 +318,7 @@ class TestPagedKVCacheManagerWithPrefixCaching:
         tokens = list(range(512))
         identity_1 = builder.make_identity(tokens, NONE_BLK_HASH, auto_register=True)
         block1 = TokenBlock(identity=identity_1, runtime=BlockRuntime())
-        cache_manager_with_prefix_caching.get_or_register_identity(block1)
+        cache_manager_with_prefix_caching.refresh_prefix_cache_block(block1)
 
         assert block1.tokens == tokens
         assert block1.blk_size == cache_manager_with_prefix_caching.block_size
@@ -329,7 +341,7 @@ class TestPagedKVCacheManagerWithPrefixCaching:
         tokens = list(range(512))
         identity_2 = builder.make_identity(tokens, NONE_BLK_HASH, auto_register=True)
         block2 = TokenBlock(identity=identity_2, runtime=BlockRuntime())
-        cache_manager_with_prefix_caching.get_or_register_identity(block2)
+        cache_manager_with_prefix_caching.refresh_prefix_cache_block(block2)
         assert block2.tokens == tokens
         assert block2.identity == block1.identity
         assert block2.runtime == block1.runtime
@@ -343,7 +355,10 @@ class TestPagedKVCacheManagerWithPrefixCaching:
     def test_task_life_cycle_in_cache_manager(
         self, cache_manager_with_prefix_caching: PagedKVCacheManager
     ):
-        Backend.cache_managers = [{"main": cache_manager_with_prefix_caching}]
+        main_manager = cache_manager_with_prefix_caching
+        Backend.cache_managers = [{"main": main_manager}]
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.cache_manager_dict = {"main": main_manager}
 
         # 在warmup或API server中完成的步骤
         req_0 = UserRequest.create_mock(
@@ -354,23 +369,21 @@ class TestPagedKVCacheManagerWithPrefixCaching:
 
         # 在scheduler中完成步骤
         task_0.dp_rank = 0
-        task_0.prompt_to_token_block(task_0.dp_rank)
-        assert len(task_0.token_blocks) == 2
+        main_manager.ensure_task_token_blocks(task_0)
+        assert len(main_manager.task_to_token_blocks[task_0.task_id]) == 2
         assert task_0.kv_cache_len_used_in_completed_steps == 0
         task_0.set_prefill_chunk_size_for_one_step(1024)  # 假如prefill_chunk_size为1024
-        cache_manager_with_prefix_caching.prepare_metadata_before_prefill(task_0)
+        scheduler._prepare_prefill_metadata(task_0, cached_len=0)
 
         assert task_0.consumed_req_tokens == 0
-        assert task_0.new_cache_ids == [0, 1]
-        assert cache_manager_with_prefix_caching.task_to_cache_ids[task_0.task_id] == {
+        assert task_0.new_cache_ids["main"] == [0, 1]
+        assert main_manager.task_to_cache_ids[task_0.task_id] == {
             0,
             1,
         }
-        assert len(cache_manager_with_prefix_caching.active_blocks) == 2
-        assert len(cache_manager_with_prefix_caching.cached_idle_blocks) == 0
-        assert (
-            cache_manager_with_prefix_caching.tid_to_cached_len[task_0.task_id] == 1024
-        )
+        assert len(main_manager.active_blocks) == 2
+        assert len(main_manager.cached_idle_blocks) == 0
+        assert main_manager.tid_to_cached_len[task_0.task_id] == 1024
 
         # 在executor中完成的步骤
         task_0.consume_req_tokens()
@@ -380,15 +393,18 @@ class TestPagedKVCacheManagerWithPrefixCaching:
         assert task_0.task_type == TaskType.Decode
 
         # task_0在做一次decode，才能把hashed + cached block存入到cache_manager_with_prefix_caching.hashed_block_pool中
-        cache_manager_with_prefix_caching.prepare_metadata_before_decode(task_0)
+        task_0.new_cache_ids = {
+            "main": main_manager.prepare_metadata_before_decode(task_0)
+        }
+        assert main_manager.task_hashed_block_cnt[task_0.task_id] == 2
         assert (
-            cache_manager_with_prefix_caching.task_hashed_block_cnt[task_0.task_id] == 2
+            main_manager.get_task_token_blocks(task_0)[0].blk_hash
+            in main_manager.hashed_block_pool
         )
         assert (
-            task_0.token_blocks[0].blk_hash
-            in cache_manager_with_prefix_caching.hashed_block_pool
+            main_manager.get_task_token_blocks(task_0)[1].pre_blk_hash
+            == main_manager.get_task_token_blocks(task_0)[0].blk_hash
         )
-        assert task_0.token_blocks[1].pre_blk_hash == task_0.token_blocks[0].blk_hash
 
         # 测试req_1的token被部分击中时
         # 此时来了一条req_1请求
@@ -398,47 +414,38 @@ class TestPagedKVCacheManagerWithPrefixCaching:
         task_1 = Task(f"{req_1.request_id}", req_1)
         task_1.task_type == TaskType.Prefill
         task_1.dp_rank = 0
-        task_1.prompt_to_token_block(task_1.dp_rank)
-        assert len(task_1.token_blocks) == 2
-        assert (
-            task_1.kv_cache_len_used_in_completed_steps == 512
-        )  # 被prefix caching击中
+        main_manager.ensure_task_token_blocks(task_1)
+        assert len(main_manager.get_task_token_blocks(task_1)) == 2
+        assert main_manager.num_cached_blocks(task_1) * main_manager.block_size == 512
 
         # 暂不调度task_1，让task_0结束推理
-        cache_manager_with_prefix_caching.finalize_metadata_all_decode(task_0)
-        for block in task_0.token_blocks:
+        main_manager.finalize_metadata_all_decode(task_0)
+        for block in main_manager.get_task_token_blocks(task_0):
             assert block.active_cnt == 0
-        assert len(cache_manager_with_prefix_caching.active_blocks) == 0
-        assert len(cache_manager_with_prefix_caching.cached_idle_blocks.keys()) == 3
-        assert task_0.task_id not in cache_manager_with_prefix_caching.tid_to_cached_len
-        assert task_0.task_id not in cache_manager_with_prefix_caching.task_to_cache_ids
-        assert (
-            task_0.task_id
-            not in cache_manager_with_prefix_caching.task_hashed_block_cnt
-        )
+        assert len(main_manager.active_blocks) == 0
+        assert len(main_manager.cached_idle_blocks.keys()) == 3
+        assert task_0.task_id not in main_manager.tid_to_cached_len
+        assert task_0.task_id not in main_manager.task_to_cache_ids
+        assert task_0.task_id not in main_manager.task_hashed_block_cnt
 
         # free_cache_ids: [3,4,...], active_blocks:{}, cached_idle_blocks: {0,1,2}
         # 调度task_1
-        num_uncomputed_tokens = (
-            task_1.prefix_tokens_len - task_1.kv_cache_len_used_in_completed_steps
+        num_uncomputed_tokens = task_1.prefix_tokens_len - (
+            main_manager.num_cached_blocks(task_1) * main_manager.block_size
         )
         assert num_uncomputed_tokens == 88
         task_1.set_prefill_chunk_size_for_one_step(88)
-        cache_manager_with_prefix_caching.prepare_metadata_before_prefill(task_1)
+        scheduler._prepare_prefill_metadata(task_1, cached_len=512)
         assert task_1.consumed_req_tokens == 512
         assert task_1.prefill_chunk_size == 88
-        assert task_1.new_cache_ids == [0, 3]
-        assert cache_manager_with_prefix_caching.task_to_cache_ids[task_1.task_id] == {
+        assert task_1.new_cache_ids["main"] == [0, 3]
+        assert main_manager.task_to_cache_ids[task_1.task_id] == {
             0,
             3,
         }
-        assert len(cache_manager_with_prefix_caching.active_blocks) == 2  # [0,3]
-        assert (
-            len(cache_manager_with_prefix_caching.cached_idle_blocks.keys()) == 2
-        )  # [1,2]
-        assert (
-            cache_manager_with_prefix_caching.tid_to_cached_len[task_1.task_id] == 600
-        )
+        assert len(main_manager.active_blocks) == 2  # [0,3]
+        assert len(main_manager.cached_idle_blocks.keys()) == 2  # [1,2]
+        assert main_manager.tid_to_cached_len[task_1.task_id] == 600
 
         # 测试req_2的token被全部击中时
         req_2 = UserRequest.create_mock(
@@ -447,33 +454,29 @@ class TestPagedKVCacheManagerWithPrefixCaching:
         task_2 = Task(f"{req_2.request_id}", req_2)
         task_2.task_type == TaskType.Prefill
         task_2.dp_rank = 0
-        task_2.prompt_to_token_block(task_2.dp_rank)
-        assert len(task_2.token_blocks) == 2
+        main_manager.ensure_task_token_blocks(task_2)
+        assert len(main_manager.get_task_token_blocks(task_2)) == 2
         assert (
-            task_2.kv_cache_len_used_in_completed_steps == 1024
+            main_manager.num_cached_blocks(task_2) * main_manager.block_size == 1024
         )  # 被prefix caching击中
-        num_uncomputed_tokens = (
-            task_2.prefix_tokens_len - task_2.kv_cache_len_used_in_completed_steps
+        num_uncomputed_tokens = task_2.prefix_tokens_len - (
+            main_manager.num_cached_blocks(task_2) * main_manager.block_size
         )
         assert num_uncomputed_tokens == 0
         task_2.set_prefill_chunk_size_for_one_step(1)
-        cache_manager_with_prefix_caching.prepare_metadata_before_prefill(task_2)
-        assert (
-            task_2.consumed_req_tokens == 1023
-        )  # 最后一个token需要作为输入，获取next_token
+        scheduler._prepare_prefill_metadata(task_2, cached_len=1024)
+        assert task_2.consumed_req_tokens == 1023
         assert task_2.prefill_chunk_size == 1
-        assert task_2.new_cache_ids == [0, 1]
-        assert cache_manager_with_prefix_caching.task_to_cache_ids[task_2.task_id] == {
+        assert task_2.new_cache_ids["main"] == [0, 1]
+        assert main_manager.task_to_cache_ids[task_2.task_id] == {
             0,
             1,
         }
-        assert len(cache_manager_with_prefix_caching.active_blocks) == 3
-        assert (
-            cache_manager_with_prefix_caching.tid_to_cached_len[task_2.task_id] == 1024
-        )
+        assert len(main_manager.active_blocks) == 3
+        assert main_manager.tid_to_cached_len[task_2.task_id] == 1024
 
-        cache_manager_with_prefix_caching.finalize_metadata_all_decode(task_1)
-        cache_manager_with_prefix_caching.finalize_metadata_all_decode(task_2)
+        main_manager.finalize_metadata_all_decode(task_1)
+        main_manager.finalize_metadata_all_decode(task_2)
 
 
 class TestBlockBuilderInterfaces:
