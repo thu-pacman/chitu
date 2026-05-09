@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Qwen3.5-397B-A17B-mxfp4 is a quantization of Qwen3.5-397B-A17B
+defaults:
+  - Qwen3.5-397B-A17B
+  - quant_config: mxfp4_qwen_3_5
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: Qwen3.5-397B-A17B-mxfp4
+is_pro: true
