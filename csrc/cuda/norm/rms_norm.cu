@@ -20,9 +20,9 @@ namespace chitu {
 #define WARP_SIZE 32
 
 template <typename Tx, typename Tw>
-__global__ void cuda_rms_norm_kernel(const Tx *x, const Tw *__restrict__ w,
-                                     Tx *out, int dim, float eps,
-                                     size_t x_row_stride) {
+__global__ void __launch_bounds__(1024)
+    cuda_rms_norm_kernel(const Tx *x, const Tw *__restrict__ w, Tx *out,
+                         int dim, float eps, size_t x_row_stride) {
     // NOTE: No restrict pointers because `x` may be alias to `out`
 
     extern __shared__ float shared_data[];
