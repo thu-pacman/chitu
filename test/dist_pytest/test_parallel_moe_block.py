@@ -49,6 +49,7 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
         [2, 1, 1, 2],  # TP2 + EP2
         [1, 2, 1, 2],  # DP2 + EP2
         [2, 2, 1, 4],  # TP2 * DP2 + EP4
+        [2, 2, 2, 2],  # TP2 * DP2 + ETP2 * EP2
     ],
 )
 @pytest.mark.parametrize("batch_size", [0, 1, 16])
@@ -99,6 +100,13 @@ def test_parallel_moe_block(
             "npu_distribute",
         }:
             pytest.skip(f"{token_dispatcher_impl} is only for DP+EP")
+        if etp_size > 1 and token_dispatcher_impl in {
+            "deepep-nl",
+            "deepep-ll",
+            "npu_all_to_all",
+            "npu_distribute",
+        }:
+            pytest.skip(f"{token_dispatcher_impl} does not support EP*ETP")
     else:
         if token_dispatcher_impl is not None:
             pytest.skip("token_dispatcher_impl is not available without EP")
@@ -209,16 +217,16 @@ def test_parallel_moe_block(
     if test_world_size < torch.distributed.get_world_size():
         # Dummy sub-group for non-participating ranks
         tp_rank_lists += [
-            list(range(test_world_size, torch.distributed.get_world_size()))
+            [i] for i in range(test_world_size, torch.distributed.get_world_size())
         ]
         dp_rank_lists += [
-            list(range(test_world_size, torch.distributed.get_world_size()))
+            [i] for i in range(test_world_size, torch.distributed.get_world_size())
         ]
         etp_rank_lists += [
-            list(range(test_world_size, torch.distributed.get_world_size()))
+            [i] for i in range(test_world_size, torch.distributed.get_world_size())
         ]
         ep_rank_lists += [
-            list(range(test_world_size, torch.distributed.get_world_size()))
+            [i] for i in range(test_world_size, torch.distributed.get_world_size())
         ]
     tp_group = CommGroup(tp_rank_lists, rank)
     dp_group = CommGroup(dp_rank_lists, rank)
@@ -363,7 +371,7 @@ def test_parallel_moe_block(
             n_fused_shared_experts=n_fused_shared_experts,
             tp_group=singleton_group,
             dp_group=singleton_group,
-            etp_group=etp_group,
+            etp_group=singleton_group,
             ep_group=singleton_group,
         )
         ref_moe_impl.prepare(task_type, local_batch_size)
@@ -460,6 +468,7 @@ def test_parallel_moe_block(
         [2, 1, 1, 2],  # TP2 + EP2
         [1, 2, 1, 2],  # DP2 + EP2
         [2, 2, 1, 4],  # TP2 * DP2 + EP4
+        [2, 2, 2, 2],  # TP2 * DP2 + ETP2 * EP2
     ],
 )
 @pytest.mark.parametrize("batch_size", [0, 1, 16])
@@ -511,6 +520,8 @@ def test_parallel_moe_block_blockfp8(
     if ep_size > 1:
         if token_dispatcher_impl is None:
             pytest.skip("token_dispatcher_impl is required for EP")
+        if etp_size > 1 and token_dispatcher_impl in {"deepep-nl", "deepep-ll"}:
+            pytest.skip(f"{token_dispatcher_impl} does not support EP*ETP")
     else:
         if token_dispatcher_impl is not None:
             pytest.skip("token_dispatcher_impl is not available without EP")
@@ -644,16 +655,16 @@ def test_parallel_moe_block_blockfp8(
     if test_world_size < torch.distributed.get_world_size():
         # Dummy sub-group for non-participating ranks
         tp_rank_lists += [
-            list(range(test_world_size, torch.distributed.get_world_size()))
+            [i] for i in range(test_world_size, torch.distributed.get_world_size())
         ]
         dp_rank_lists += [
-            list(range(test_world_size, torch.distributed.get_world_size()))
+            [i] for i in range(test_world_size, torch.distributed.get_world_size())
         ]
         etp_rank_lists += [
-            list(range(test_world_size, torch.distributed.get_world_size()))
+            [i] for i in range(test_world_size, torch.distributed.get_world_size())
         ]
         ep_rank_lists += [
-            list(range(test_world_size, torch.distributed.get_world_size()))
+            [i] for i in range(test_world_size, torch.distributed.get_world_size())
         ]
     tp_group = CommGroup(tp_rank_lists, rank)
     dp_group = CommGroup(dp_rank_lists, rank)
@@ -829,7 +840,7 @@ def test_parallel_moe_block_blockfp8(
             n_fused_shared_experts=n_fused_shared_experts,
             tp_group=singleton_group,
             dp_group=singleton_group,
-            etp_group=etp_group,
+            etp_group=singleton_group,
             ep_group=singleton_group,
         )
         ref_moe_impl.prepare(task_type, local_batch_size)

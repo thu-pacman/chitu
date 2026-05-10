@@ -2,7 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
+from typing import Optional, Sequence
+from typing_extensions import override
 
 import torch
 
@@ -19,6 +20,8 @@ from chitu.moe.load_balancer import (
     init_moe_load_balancer,
     register_moe_weight_accessor,
 )
+from chitu.moe.batched_expert_result import BatchedExpertResult
+from chitu.moe.batched_routed_activation import BatchedRoutedActivation
 from chitu.device_type import is_ascend_910b
 from chitu.distributed.parallel_state import (
     get_tp_group,
@@ -151,19 +154,42 @@ class MoEImplBase:
     def get_expert_mapping(self, layer_id: int):
         raise NotImplementedError()
 
-    def enter_moe(self, *args, **kwargs):
+    def enter_moe(
+        self,
+        x: BatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
+        layer_id: Optional[int] = None,
+    ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
+        raise NotImplementedError()
+
+    def enter_moe_dispatch_streaming(
+        self,
+        x: BatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
+        layer_id: Optional[int] = None,
+    ) -> tuple[
+        BatchedRoutedActivation, Optional[torch.Tensor], Optional[torch.cuda.Stream]
+    ]:
         raise NotImplementedError()
 
     def exit_moe_prefer_before_local_sum(self) -> bool:
         raise NotImplementedError()
 
-    def exit_moe_before_local_sum(self, *args, **kwargs):
+    def exit_moe_before_local_sum(
+        self, expert_result: BatchedExpertResult
+    ) -> torch.Tensor:
         raise NotImplementedError()
 
-    def exit_moe_after_local_sum(self, *args, **kwargs):
+    def exit_moe_after_local_sum(self, local_sum_result: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError()
 
-    def exit_moe_reduce_rank_list(self):
+    def exit_moe_reduce_rank_lists(self) -> Optional[Sequence[Sequence[int]]]:
         raise NotImplementedError()
 
 
@@ -248,23 +274,24 @@ class MoEImplEP(MoEImplBase):
     def _init_token_dispatcher(self):
         # impl selection
         if self.prefill_token_dispatcher_impl == "auto":
-            if self.dp_size > 1 and has_deep_ep:
+            if self.dp_size > 1 and self.etp_size == 1 and has_deep_ep:
                 self.prefill_token_dispatcher_impl = "deepep-nl"
-            elif self.dp_size > 1 and has_torch_npu:
+            elif self.dp_size > 1 and self.etp_size == 1 and has_torch_npu:
                 self.prefill_token_dispatcher_impl = "npu_all_to_all"
             else:
                 self.prefill_token_dispatcher_impl = "allgather"
 
         if self.decode_token_dispatcher_impl == "auto":
-            if self.dp_size > 1 and has_deep_ep:
+            if self.dp_size > 1 and self.etp_size == 1 and has_deep_ep:
                 self.decode_token_dispatcher_impl = "deepep-ll"
             elif (
                 self.dp_size > 1
+                and self.etp_size == 1
                 and has_torch_npu
                 and not (is_ascend_910b() and self.tp_size > 1)
             ):
                 self.decode_token_dispatcher_impl = "npu_distribute"
-            elif self.dp_size > 1 and has_torch_npu:
+            elif self.dp_size > 1 and self.etp_size == 1 and has_torch_npu:
                 self.decode_token_dispatcher_impl = "npu_all_to_all"
             else:
                 self.decode_token_dispatcher_impl = "allgather"
@@ -357,36 +384,70 @@ class MoEImplEP(MoEImplBase):
         else:
             raise ValueError(f"Invalid task type: {self.task_type}")
 
+    @override
     def prepare(self, task_type: TaskType, num_tokens: int) -> None:
         super().prepare(task_type, num_tokens)
         self._get_current_token_dispatcher().prepare(num_tokens)
 
-    def enter_moe(self, *args, **kwargs):
-        return self._get_current_token_dispatcher().enter_moe(*args, **kwargs)
-
-    def enter_moe_dispatch_streaming(self, *args, **kwargs):
-        return self._get_current_token_dispatcher().enter_moe_dispatch_streaming(
-            *args, **kwargs
+    @override
+    def enter_moe(
+        self,
+        x: BatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
+        layer_id: Optional[int] = None,
+    ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
+        return self._get_current_token_dispatcher().enter_moe(
+            x,
+            topk_weights,
+            may_fuse_quant=may_fuse_quant,
+            may_fuse_quant_kwargs=may_fuse_quant_kwargs,
+            layer_id=layer_id,
         )
 
+    @override
+    def enter_moe_dispatch_streaming(
+        self,
+        x: BatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
+        layer_id: Optional[int] = None,
+    ) -> tuple[
+        BatchedRoutedActivation, Optional[torch.Tensor], Optional[torch.cuda.Stream]
+    ]:
+        return self._get_current_token_dispatcher().enter_moe_dispatch_streaming(
+            x,
+            topk_weights,
+            may_fuse_quant=may_fuse_quant,
+            may_fuse_quant_kwargs=may_fuse_quant_kwargs,
+            layer_id=layer_id,
+        )
+
+    @override
     def exit_moe_prefer_before_local_sum(self) -> bool:
         return self._get_current_token_dispatcher().exit_moe_prefer_before_local_sum()
 
-    def exit_moe_before_local_sum(self, *args, **kwargs):
+    @override
+    def exit_moe_before_local_sum(
+        self, expert_result: BatchedExpertResult
+    ) -> torch.Tensor:
         return self._get_current_token_dispatcher().exit_moe_before_local_sum(
-            *args, **kwargs
+            expert_result
         )
 
-    def exit_moe_after_local_sum(self, *args, **kwargs):
+    @override
+    def exit_moe_after_local_sum(self, local_sum_result: torch.Tensor) -> torch.Tensor:
         return self._get_current_token_dispatcher().exit_moe_after_local_sum(
-            *args, **kwargs
+            local_sum_result
         )
 
-    def exit_moe_reduce_rank_list(self):
-        dispatcher = self._get_current_token_dispatcher()
-        if isinstance(dispatcher, MoEAllGatherTokenDispatcher):
-            return self.ep_group.rank_list
-        return None
+    @override
+    def exit_moe_reduce_rank_lists(self):
+        return self._get_current_token_dispatcher().exit_moe_reduce_rank_lists()
 
     def _load_expert_stats(self, file_path):
         expert_stats = torch.load(file_path)
@@ -415,6 +476,7 @@ class MoEImplEP(MoEImplBase):
             )
             self.load_balancer[layer_id] = cur_load_balancer
 
+    @override
     def get_expert_mapping(self, layer_id: int):
         return self.load_balancer[layer_id].get_expert_mapping(
             self.dp_group.rank_in_group
@@ -446,3 +508,43 @@ class MoEImplNoEP(MoEImplBase):
         )
 
         assert self.ep_size == 1
+
+    @override
+    def enter_moe(
+        self,
+        x: BatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
+        layer_id: Optional[int] = None,
+    ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
+        return x, topk_weights
+
+    @override
+    def enter_moe_dispatch_streaming(
+        self,
+        x: BatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
+        layer_id: Optional[int] = None,
+    ) -> tuple[
+        BatchedRoutedActivation, Optional[torch.Tensor], Optional[torch.cuda.Stream]
+    ]:
+        return x, topk_weights, None
+
+    @override
+    def exit_moe_prefer_before_local_sum(self) -> bool:
+        return False
+
+    @override
+    def exit_moe_after_local_sum(self, local_sum_result: torch.Tensor) -> torch.Tensor:
+        if self.etp_size > 1:
+            self.etp_group.all_reduce(local_sum_result)
+        return local_sum_result
+
+    @override
+    def exit_moe_reduce_rank_lists(self) -> Optional[Sequence[Sequence[int]]]:
+        return self.etp_group.rank_lists

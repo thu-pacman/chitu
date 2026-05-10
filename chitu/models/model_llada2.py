@@ -87,15 +87,15 @@ class AttentionLLaDA2(AttentionHFLlama):
 
         # Handle GQA
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        tensor_parallel_size = get_tp_size()
-        self.n_local_heads = args.n_heads // tensor_parallel_size
+        tp_size = get_tp_size()
+        self.n_local_heads = args.n_heads // tp_size
 
-        if self.n_kv_heads >= tensor_parallel_size:
-            self.n_local_kv_heads = self.n_kv_heads // tensor_parallel_size
+        if self.n_kv_heads >= tp_size:
+            self.n_local_kv_heads = self.n_kv_heads // tp_size
             self.n_kv_head_multiplier = 1
         else:
             self.n_local_kv_heads = 1
-            self.n_kv_head_multiplier = tensor_parallel_size // self.n_kv_heads
+            self.n_kv_head_multiplier = tp_size // self.n_kv_heads
 
         self.head_dim = (
             args.head_dim if hasattr(args, "head_dim") else args.dim // args.n_heads
@@ -446,8 +446,6 @@ class TransformerLLaDA2(TransformerHFLlama):
         cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
-        pipeline_parallel_size: int,
-        tensor_parallel_size: int,
         attn_backend: AttnBackend,
         op_impl: str,
         rotary_type: str = "separated-half",
@@ -486,8 +484,6 @@ class TransformerLLaDA2(TransformerHFLlama):
             params,
             cache_dict,
             max_position_embeddings=max_position_embeddings,
-            pipeline_parallel_size=pipeline_parallel_size,
-            tensor_parallel_size=tensor_parallel_size,
             attn_backend=attn_backend,
             rotary_type=rotary_type,
             layer_type=layer_type,

@@ -1148,8 +1148,6 @@ class TransformerDeepSeekV3(Transformer):
         cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
-        pipeline_parallel_size: int,
-        tensor_parallel_size: int,
         attn_backend: AttnBackend,
         op_impl: str,
         mla_absorb: str,
@@ -1160,8 +1158,6 @@ class TransformerDeepSeekV3(Transformer):
             params,
             cache_dict,
             max_position_embeddings=max_position_embeddings,
-            pipeline_parallel_size=pipeline_parallel_size,
-            tensor_parallel_size=tensor_parallel_size,
             attn_backend=attn_backend,
             op_impl=op_impl,
             mla_absorb=mla_absorb,
@@ -1276,8 +1272,8 @@ class TransformerDeepSeekV3(Transformer):
     def _process_state_dict_for_absorption_without_precomputation(
         self, checkpoint: dict[str, Any]
     ):
-        tensor_parallel_size = get_tp_size()
-        n_local_heads = self.params.n_heads // tensor_parallel_size
+        tp_size = get_tp_size()
+        n_local_heads = self.params.n_heads // tp_size
 
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
@@ -1349,8 +1345,8 @@ class TransformerDeepSeekV3(Transformer):
         return checkpoint
 
     def _process_state_dict_for_absorption(self, checkpoint: dict[str, Any]):
-        tensor_parallel_size = get_tp_size()
-        n_local_heads = self.params.n_heads // tensor_parallel_size
+        tp_size = get_tp_size()
+        n_local_heads = self.params.n_heads // tp_size
 
         weight_dequant_fn = (
             soft_fp8_blockfp8_weight_dequant

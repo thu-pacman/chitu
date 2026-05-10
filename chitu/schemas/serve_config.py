@@ -60,6 +60,7 @@ class InferConfig(InferConfigLegacy):
     pp_size: int = MISSING
     dp_size: int = MISSING
     ep_size: int = MISSING
+    etp_size: Optional[int] = MISSING
     seed: float = MISSING
     max_seq_len: int = MISSING
     cache_type: str = MISSING

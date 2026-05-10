@@ -167,7 +167,9 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         may_fuse_quant: Optional[str] = None,
         may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
-    ):
+    ) -> tuple[
+        BatchedRoutedActivation, Optional[torch.Tensor], Optional[torch.cuda.Stream]
+    ]:
         dp_local_bs = topk_weights.shape[0]
 
         dispatch_use_fp8 = False

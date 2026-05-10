@@ -45,7 +45,9 @@ def test_column_parallel_linear(
     rank_lists = [list(range(tp_group_size))]
     if tp_group_size < torch.distributed.get_world_size():
         # Dummy sub-group for non-participating ranks
-        rank_lists += [list(range(tp_group_size, torch.distributed.get_world_size()))]
+        rank_lists += [
+            [i] for i in range(tp_group_size, torch.distributed.get_world_size())
+        ]
     tp_group = CommGroup(rank_lists, rank)
 
     if rank < tp_group_size:
@@ -115,7 +117,9 @@ def test_row_parallel_linear(
     rank_lists = [list(range(tp_group_size))]
     if tp_group_size < torch.distributed.get_world_size():
         # Dummy sub-group for non-participating ranks
-        rank_lists += [list(range(tp_group_size, torch.distributed.get_world_size()))]
+        rank_lists += [
+            [i] for i in range(tp_group_size, torch.distributed.get_world_size())
+        ]
     tp_group = CommGroup(rank_lists, rank)
 
     if rank < tp_group_size:

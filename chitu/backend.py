@@ -270,11 +270,20 @@ class Backend:
         pipeline_parallel_size = args.infer.pp_size
         non_expert_data_parallel_size = args.infer.dp_size
         expert_parallel_size = args.infer.ep_size
+        expert_tensor_parallel_size = args.infer.etp_size
+        if expert_tensor_parallel_size is None:
+            assert (
+                tensor_parallel_size
+                * non_expert_data_parallel_size
+                % expert_parallel_size
+                == 0
+            )
+            expert_tensor_parallel_size = (
+                tensor_parallel_size
+                * non_expert_data_parallel_size
+                // expert_parallel_size
+            )
         embed_tokens_lm_head_tp_size = int(args.infer.embed_tokens_lm_head_tp_size)
-        assert (
-            tensor_parallel_size * non_expert_data_parallel_size % expert_parallel_size
-            == 0
-        )
         if tensor_parallel_size > 1:
             assert (
                 embed_tokens_lm_head_tp_size == tensor_parallel_size
@@ -287,10 +296,6 @@ class Backend:
             assert (
                 embed_tokens_lm_head_tp_size == 1
             ), "embed_tokens_lm_head_tp_size must be 1 when tensor_parallel_size == 1 and non_expert_data_parallel_size == 1"
-
-        expert_tensor_parallel_size = (
-            tensor_parallel_size * non_expert_data_parallel_size // expert_parallel_size
-        )
 
         global_rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
@@ -679,8 +684,6 @@ class Backend:
             Backend.cache_dict,
             max_position_embeddings=args.infer.max_seq_len
             + (args.infer.mtp_size if args.infer.mtp_size > 1 else 0),
-            pipeline_parallel_size=args.infer.pp_size,
-            tensor_parallel_size=args.infer.tp_size,
             attn_backend=attn_backend,
             op_impl=args.infer.op_impl,
             mla_absorb=args.infer.mla_absorb,
