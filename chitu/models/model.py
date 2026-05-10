@@ -35,6 +35,7 @@ from chitu.distributed.comm_group import CommGroup
 from chitu.distributed.parallel_state import (
     get_tp_group,
     get_tp_size,
+    get_etp_group,
     get_etp_size,
     get_ep_group,
     get_ep_size,
@@ -237,8 +238,6 @@ class Transformer(nn.Module):
         cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
-        pipeline_parallel_size: int,
-        tensor_parallel_size: int,
         attn_backend: AttnBackend,
         op_impl: str,
         **kvargs,
@@ -253,24 +252,21 @@ class Transformer(nn.Module):
             "cpu" if get_global_args().infer.op_impl == "cpu" else "cuda"
         )
 
-        self.pipeline_parallel_size = pipeline_parallel_size
-        self.tensor_parallel_size = tensor_parallel_size
-        self.pipeline_exec = pipeline_parallel_size > 1
-        self.tensor_exec = tensor_parallel_size > 1
-
-        self.tp_size = tensor_parallel_size
+        self.tp_size = get_tp_size()
         self.tp_group = get_tp_group()
-        self.pp_size = pipeline_parallel_size
+        self.pp_size = get_pp_size()
         self.dp_size = get_dp_size()
         self.ep_group = get_ep_group()
-        self.ep_size = self.ep_group.group_size
+        self.ep_size = get_ep_size()
+        self.etp_size = get_etp_size()
+        self.etp_group = get_etp_group()
         self.embed_tokens_lm_head_tp_size = get_embed_tokens_lm_head_tp_size()
         self.embed_tokens_lm_head_tp_rank = (
             get_embed_tokens_lm_head_tp_group().rank_in_group
         )
         self.pp_stage = get_pp_group().rank_in_group
-        self.pp_main_rank = (self.rank // tensor_parallel_size) * tensor_parallel_size
-        self.pp_end_stage = get_pp_size() - 1
+        self.pp_main_rank = (self.rank // self.tp_size) * self.tp_size
+        self.pp_end_stage = self.pp_size - 1
 
         # `get_global_args()` can be a Hydra/OmegaConf object; force to plain int for type checkers.
         self.mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
@@ -281,9 +277,9 @@ class Transformer(nn.Module):
         self.max_batch_size_per_dp = ceil_div(
             int(getattr(get_global_args().infer, "max_batch_size", 1)), get_dp_size()
         )
-        if self.pipeline_exec:
+        if self.pp_size > 1:
             num_layers_of_each_rank = compute_layer_dist_in_pp(
-                self.global_n_layers, self.pipeline_parallel_size
+                self.global_n_layers, self.pp_size
             )
             first_layer_id_of_each_rank = list(
                 itertools.accumulate([0] + num_layers_of_each_rank)
@@ -294,10 +290,10 @@ class Transformer(nn.Module):
             self.local_begin_layer_id = 0
             self.local_end_layer_id = self.global_n_layers
 
-        if not self.pipeline_exec or self.pp_stage == 0:
+        if self.pp_size == 1 or self.pp_stage == 0:
             self._init_pre_layers()
         self._init_layers(cache_dict, attn_backend=attn_backend, op_impl=op_impl)
-        if not self.pipeline_exec or self.pp_stage == self.pipeline_parallel_size - 1:
+        if self.pp_size == 1 or self.pp_stage == self.pp_size - 1:
             self._init_post_layers()
 
         with self.device:
@@ -518,23 +514,30 @@ class Transformer(nn.Module):
         return partial_checkpoint
 
     def _chunk_checkpoint_for_tensor_parallel(
-        self, checkpoint: dict[str, Any], rank: int, tp_size: int
+        self,
+        checkpoint: dict[str, Any],
+        tp_rank: int,
+        etp_rank: int,
+        tp_size: int,
+        etp_size: int,
     ):
         partial_checkpoint = {}
 
         cpl_names = self._get_tensor_column_parallel_layer_names()
         rpl_names = self._get_tensor_row_parallel_layer_names()
 
-        enable_expert_parallel = get_ep_size() > 1
-
         for name, param in checkpoint.items():
             quant = get_quant_from_checkpoint_prefix(name)
             backend = get_backend_from_checkpoint_prefix(name)
+            if ".experts." in name:
+                tp_or_etp_size = etp_size
+                tp_or_etp_rank = etp_rank
+            else:
+                tp_or_etp_size = tp_size
+                tp_or_etp_rank = tp_rank
             if backend == "cpuinfer":
-                if rank == 0:
+                if tp_or_etp_rank == 0:
                     partial_checkpoint[name] = param
-            elif enable_expert_parallel and ".experts." in name:
-                partial_checkpoint[name] = param
             elif any(is_layer(s, name) for s in cpl_names):
                 if name.split(".")[-1] in self._get_1d_out_tensor_names(quant):
                     assert (
@@ -543,12 +546,12 @@ class Transformer(nn.Module):
                     if param.shape[-1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        if param.shape[-1] % tp_size != 0:
+                        if param.shape[-1] % tp_or_etp_size != 0:
                             raise RuntimeError(
-                                f"Tensor {name}'s last dim {param.shape[-1]} should be divisible by tp_size {tp_size}"
+                                f"Tensor {name}'s last dim {param.shape[-1]} should be divisible by tp_or_etp_size {tp_or_etp_size}"
                             )
-                        chunks = torch.chunk(param, tp_size, dim=-1)
-                        partial_checkpoint[name] = chunks[rank]
+                        chunks = torch.chunk(param, tp_or_etp_size, dim=-1)
+                        partial_checkpoint[name] = chunks[tp_or_etp_rank]
                 elif name.split(".")[-1] in self._get_1d_in_tensor_names(quant):
                     assert (
                         param.dim() == 1
@@ -562,12 +565,12 @@ class Transformer(nn.Module):
                     if param.shape[-2] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        if param.shape[-2] % tp_size != 0:
+                        if param.shape[-2] % tp_or_etp_size != 0:
                             raise RuntimeError(
-                                f"Tensor {name}'s out dim {param.shape[-2]} should be divisible by tp_size {tp_size}"
+                                f"Tensor {name}'s out dim {param.shape[-2]} should be divisible by tp_or_etp_size {tp_or_etp_size}"
                             )
-                        chunks = torch.chunk(param, tp_size, dim=-2)
-                        partial_checkpoint[name] = chunks[rank]
+                        chunks = torch.chunk(param, tp_or_etp_size, dim=-2)
+                        partial_checkpoint[name] = chunks[tp_or_etp_rank]
                 elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names(quant):
                     assert (
                         param.dim() >= 2
@@ -575,12 +578,12 @@ class Transformer(nn.Module):
                     if param.shape[-1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        if param.shape[-1] % tp_size != 0:
+                        if param.shape[-1] % tp_or_etp_size != 0:
                             raise RuntimeError(
-                                f"Tensor {name}'s out dim {param.shape[-1]} should be divisible by tp_size {tp_size}"
+                                f"Tensor {name}'s out dim {param.shape[-1]} should be divisible by tp_or_etp_size {tp_or_etp_size}"
                             )
-                        chunks = torch.chunk(param, tp_size, dim=-1)
-                        partial_checkpoint[name] = chunks[rank]
+                        chunks = torch.chunk(param, tp_or_etp_size, dim=-1)
+                        partial_checkpoint[name] = chunks[tp_or_etp_rank]
                 else:
                     # FIXME: Support quant=llmint8 for TP
                     assert False, f"Illegal parallel tensor {name}"
@@ -593,12 +596,12 @@ class Transformer(nn.Module):
                     if param.shape[-1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        if param.shape[-1] % tp_size != 0:
+                        if param.shape[-1] % tp_or_etp_size != 0:
                             raise RuntimeError(
-                                f"Tensor {name}'s last dim {param.shape[-1]} should be divisible by tp_size {tp_size}"
+                                f"Tensor {name}'s last dim {param.shape[-1]} should be divisible by tp_or_etp_size {tp_or_etp_size}"
                             )
-                        chunks = torch.chunk(param, tp_size, dim=-1)
-                        partial_checkpoint[name] = chunks[rank]
+                        chunks = torch.chunk(param, tp_or_etp_size, dim=-1)
+                        partial_checkpoint[name] = chunks[tp_or_etp_rank]
                 elif name.split(".")[-1] in self._get_1d_out_tensor_names(quant):
                     assert (
                         param.dim() == 1
@@ -614,12 +617,12 @@ class Transformer(nn.Module):
                     if param.shape[-1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        if param.shape[-1] % tp_size != 0:
+                        if param.shape[-1] % tp_or_etp_size != 0:
                             raise RuntimeError(
-                                f"Tensor {name}'s in dim {param.shape[-1]} should be divisible by tp_size {tp_size}"
+                                f"Tensor {name}'s in dim {param.shape[-1]} should be divisible by tp_or_etp_size {tp_or_etp_size}"
                             )
-                        chunks = torch.chunk(param, tp_size, dim=-1)
-                        partial_checkpoint[name] = chunks[rank]
+                        chunks = torch.chunk(param, tp_or_etp_size, dim=-1)
+                        partial_checkpoint[name] = chunks[tp_or_etp_rank]
                 elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names(quant):
                     assert (
                         param.dim() >= 2
@@ -627,9 +630,9 @@ class Transformer(nn.Module):
                     if param.shape[-2] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
-                        assert param.shape[-2] % tp_size == 0
-                        chunks = torch.chunk(param, tp_size, dim=-2)
-                        partial_checkpoint[name] = chunks[rank]
+                        assert param.shape[-2] % tp_or_etp_size == 0
+                        chunks = torch.chunk(param, tp_or_etp_size, dim=-2)
+                        partial_checkpoint[name] = chunks[tp_or_etp_rank]
                 else:
                     # FIXME: Support quant=llmint8 for TP
                     assert False, f"Illegal parallel tensor {name}"
@@ -969,22 +972,26 @@ class Transformer(nn.Module):
                 state_dict = self._chunk_checkpoint_for_expert_parallel(
                     state_dict, self.ep_group.rank_in_group, self.ep_size
                 )
-            if self.pipeline_exec:
+            if self.pp_size > 1:
                 state_dict = self._chunk_checkpoint_for_pipeline_parallel(
                     state_dict, self.global_n_layers, self.pp_stage, self.pp_size
                 )
-            if self.tensor_exec:
+            if self.tp_size > 1:
                 # QKV and gate/up layers might already be merged in the checkpoint, but they should be split
                 # for TP. After we process for TP, we merge them back.
                 state_dict = self.process_state_dict_for_splitting_qkv(state_dict)
                 state_dict = self.process_state_dict_for_splitting_gate_up(state_dict)
 
-                # Repeat kv_head weights in case tensor_parallel_size > n_kv_heads
+                # Repeat kv_head weights in case tp_size > n_kv_heads
                 # TODO: 与后面的chunk tp合并，消除可能的内存复制，否则prefetch会失效
                 state_dict = self.process_state_dict_for_repeat_kv_head(state_dict)
 
                 state_dict = self._chunk_checkpoint_for_tensor_parallel(
-                    state_dict, self.tp_group.rank_in_group, self.tp_size
+                    state_dict,
+                    self.tp_group.rank_in_group,
+                    self.etp_group.rank_in_group,
+                    self.tp_size,
+                    self.etp_size,
                 )
             if self.specialize_embed_tokens_lm_head_parallel:
                 state_dict = (
@@ -1442,7 +1449,7 @@ class Transformer(nn.Module):
         self.attn_backend.prepare_metadata_for_prefill(
             self.cache_dict["main"].seq_len_delta
         )
-        if self.pipeline_exec:
+        if self.pp_size > 1:
             return self.prefill_pipeline(tokens, output_token_offsets, **args)
         else:
             return self.prefill_no_pipeline(tokens, output_token_offsets, **args)
@@ -1586,7 +1593,7 @@ class Transformer(nn.Module):
             )
             def do_decode(tokens, *extra_inputs):
                 freqs_cis = self._prepare_freqs_cis_for_decode(*extra_inputs)
-                if self.pipeline_exec:
+                if self.pp_size > 1:
                     return self.decode_pipeline(tokens, freqs_cis)
                 else:
                     return self.decode_no_pipeline(tokens, freqs_cis)
@@ -1993,12 +2000,13 @@ class ParallelMoeBlock(nn.Module):
                 y = torch.cat(y_list, dim=0)
 
             if shared_y is not None and self.moe_impl.tp_size > 1:
-                # we need to reduce shared_y on tp group, if this group equals the group reduce y later, we can merge them together
-                if self.moe_impl and self.moe_impl.ep_size > 1:
-                    y_reduce_rank_list = self.moe_impl.exit_moe_reduce_rank_list()
-                else:
-                    y_reduce_rank_list = self.moe_impl.tp_group.rank_list
-                if self.moe_impl.tp_group.rank_list == y_reduce_rank_list:
+                # Note that shared experts are partitioned among TP groups instead of ETP groups,
+                # so we need to reduce shared_y on tp group. If this group equals the group reduce
+                # y on EP and/or ETP group, we can merge them together.
+                if (
+                    self.moe_impl.tp_group.rank_lists
+                    == self.moe_impl.exit_moe_reduce_rank_lists()
+                ):
                     if self.shared_experts_stream:
                         torch.cuda.current_stream().wait_stream(
                             self.shared_experts_stream
@@ -2006,10 +2014,7 @@ class ParallelMoeBlock(nn.Module):
                     y += shared_y
                     shared_y = None
 
-            if self.moe_impl.ep_size > 1:
-                y = self.moe_impl.exit_moe_after_local_sum(y)
-            elif self.moe_impl.tp_size > 1:
-                self.moe_impl.tp_group.all_reduce(y)
+            y = self.moe_impl.exit_moe_after_local_sum(y)
 
         if shared_y is not None:
             if self.shared_experts_stream:

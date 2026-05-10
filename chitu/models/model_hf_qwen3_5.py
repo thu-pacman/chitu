@@ -265,8 +265,6 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
-        pipeline_parallel_size: int,
-        tensor_parallel_size: int,
         attn_backend: AttnBackend,
         rotary_type: str = "separated",
         op_impl: str = "torch",
@@ -311,8 +309,6 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
             params,
             cache_dict,
             max_position_embeddings=max_position_embeddings,
-            pipeline_parallel_size=pipeline_parallel_size,
-            tensor_parallel_size=tensor_parallel_size,
             attn_backend=attn_backend,
             rotary_type=rotary_type,
             layer_type_callback=layer_type_callback,
@@ -1082,7 +1078,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
             if not self.is_fp8_model and self.is_moe_model:
                 state_dict = self._process_state_dict_for_adding_dot_weight(state_dict)
 
-            if self.tensor_exec:
+            if self.tp_size > 1:
                 state_dict = self.chunk_checkpoint_for_tensor_parallelize_attn_weights(
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )

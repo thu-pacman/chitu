@@ -88,24 +88,24 @@ class AttentionHFLlama(Attention):
         self.merge_qkv = QuantizationRegistry.allowed_merge_qkv(checkpoint_prefix)
 
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
-        tensor_parallel_size = get_tp_size()
+        tp_size = get_tp_size()
         assert (
-            args.n_heads % tensor_parallel_size == 0
-        ), f"n_heads must divisible by tp_size, got n_heads={args.n_heads} and tp_size={tensor_parallel_size}"
-        self.n_local_heads = args.n_heads // tensor_parallel_size
+            args.n_heads % tp_size == 0
+        ), f"n_heads must divisible by tp_size, got n_heads={args.n_heads} and tp_size={tp_size}"
+        self.n_local_heads = args.n_heads // tp_size
 
-        if self.n_kv_heads >= tensor_parallel_size:
+        if self.n_kv_heads >= tp_size:
             assert (
-                self.n_kv_heads % tensor_parallel_size == 0
-            ), f"when n_kv_heads >= tp_size, n_kv_heads must divisible by tp_size, got n_kv_heads={self.n_kv_heads} and tp_size={tensor_parallel_size}"
-            self.n_local_kv_heads = self.n_kv_heads // tensor_parallel_size
+                self.n_kv_heads % tp_size == 0
+            ), f"when n_kv_heads >= tp_size, n_kv_heads must divisible by tp_size, got n_kv_heads={self.n_kv_heads} and tp_size={tp_size}"
+            self.n_local_kv_heads = self.n_kv_heads // tp_size
             self.n_kv_head_multiplier = 1
         else:
             assert (
-                tensor_parallel_size % self.n_kv_heads == 0
-            ), f"when n_kv_heads < tp_size, tp_size must divisible by n_kv_heads, got n_kv_heads={self.n_kv_heads} and tp_size={tensor_parallel_size}"
+                tp_size % self.n_kv_heads == 0
+            ), f"when n_kv_heads < tp_size, tp_size must divisible by n_kv_heads, got n_kv_heads={self.n_kv_heads} and tp_size={tp_size}"
             self.n_local_kv_heads = 1
-            self.n_kv_head_multiplier = tensor_parallel_size // self.n_kv_heads
+            self.n_kv_head_multiplier = tp_size // self.n_kv_heads
 
         self.head_dim = (
             args.head_dim if hasattr(args, "head_dim") else args.dim // args.n_heads
@@ -115,7 +115,7 @@ class AttentionHFLlama(Attention):
         # - Parallelization should be among the kv_heads dim, so there is no communication.
         # - Outputs from q_proj, k_proj, v_proj should be contiguous in memory.
         #
-        # Therefore, the projected shape should be [tensor_parallel_size, self.n_rep + 2, self.n_local_kv_heads, self.head_dim]
+        # Therefore, the projected shape should be [tp_size, self.n_rep + 2, self.n_local_kv_heads, self.head_dim]
 
         qkv_has_bias = args.qkv_has_bias if hasattr(args, "qkv_has_bias") else True
         o_has_bias = args.o_has_bias if hasattr(args, "o_has_bias") else False
@@ -301,7 +301,7 @@ class FeedForwardHFLlama(nn.Module):
         )
 
         # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
-        # Therefore, the projected shape is [tensor_parallel_size, 2 * params.intermediate_dim]
+        # Therefore, the projected shape is [tp_size, 2 * params.intermediate_dim]
 
         gate_up_proj_linear = get_linear_layout_native_y(
             op_impl,
@@ -457,8 +457,6 @@ class TransformerHFLlama(Transformer):
         cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
-        pipeline_parallel_size: int,
-        tensor_parallel_size: int,
         attn_backend: AttnBackend,
         op_impl: str,
         rotary_type: str = "separated",
@@ -483,8 +481,6 @@ class TransformerHFLlama(Transformer):
             params,
             cache_dict,
             max_position_embeddings=max_position_embeddings,
-            pipeline_parallel_size=pipeline_parallel_size,
-            tensor_parallel_size=tensor_parallel_size,
             attn_backend=attn_backend,
             op_impl=op_impl,
             **kvargs,
@@ -600,10 +596,10 @@ class TransformerHFLlama(Transformer):
             if self.params.n_kv_heads is None
             else self.params.n_kv_heads
         )
-        repeats = self.tensor_parallel_size // n_kv_heads
+        repeats = self.tp_size // n_kv_heads
         if repeats <= 1:
             return checkpoint
-        assert self.tensor_parallel_size % n_kv_heads == 0
+        assert self.tp_size % n_kv_heads == 0
 
         n_kv_heads = self.params.n_kv_heads
         repeat_kv_head_names = self._get_tensor_parallel_repeat_kv_head_layer_names()

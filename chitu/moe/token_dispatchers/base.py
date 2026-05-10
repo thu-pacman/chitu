@@ -7,7 +7,7 @@
 # - https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/transformer/moe/token_dispatcher.py
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Sequence
 from typing_extensions import override
 
 import torch
@@ -81,7 +81,9 @@ class MoETokenDispatcher(ABC):
         may_fuse_quant: Optional[str] = None,
         may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
-    ):
+    ) -> tuple[
+        BatchedRoutedActivation, Optional[torch.Tensor], Optional[torch.cuda.Stream]
+    ]:
         """
         Enter MoE and return the dispatch stream.
         The dispatch stream is used to wait for the dispatch to complete.
@@ -160,3 +162,6 @@ class MoETokenDispatcher(ABC):
         raise NotImplementedError(
             f"exit_moe_after_local_sum is not implemented for {type(self)}"
         )
+
+    def exit_moe_reduce_rank_lists(self) -> Optional[Sequence[Sequence[int]]]:
+        return None

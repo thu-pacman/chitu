@@ -309,7 +309,7 @@ torchrun --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 mo
 - 对于一般模型或 MoE 模型中的 attention 块，TP 组由最近的设备组成，DP 组由次近的设备组成，PP 组由最远的设备组成。若以分布式网格的方式描述，网格的形状是 PP * DP * TP。请注意赤兔中的 DP 是用于 MoE 中的 attention 块的，所以 DP 在网格中位于 PP 和 TP 之间，而非 PP 之外。若要通过复制权重的方式扩展非 MoE 模型的并行性，请使用多实例部署而非 DP。
 - 对于 MoE 模型中的 MoE 块，ETP 组由最近的设备组成，EP 组由次近的设备组成，PP 组由最远的设备组成。若以分布式网格的方式描述，网格的形状是 PP * EP * ETP。MoE 块还可以通过将专家复制到专家槽位的方式来扩展并行性。这种方式类似 DP，但更加灵活。
 
-TP、DP、EP 和/或 PP 可通过传入 `tp_size`、`dp_size`、`ep_size` 和/或 `pp_size` 参数开启。ETP 的并行度始终等于 `tp_size * dp_size // ep_size`。
+TP、DP、ETP、EP 和/或 PP 可通过传入 `tp_size`、`dp_size`、`etp_size`、`ep_size` 和/或 `pp_size` 参数开启。ETP 的并行度如不设置，默认等于 `tp_size * dp_size // ep_size`。
 
 TP 样例参数：
 

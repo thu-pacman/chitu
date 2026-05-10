@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
+from typing import Optional, Sequence
 from typing_extensions import override
 import functools
 
@@ -39,6 +39,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
         self.num_global_experts = num_experts
         self.use_cuda_graph = use_cuda_graph
+        self.ep_etp_group = self.ep_group.cartesian_product(self.etp_group)
 
         # set in prepare
         # its a cpu list now
@@ -123,7 +124,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     def exit_moe_after_local_sum(self, local_sum_result: torch.Tensor) -> torch.Tensor:
         # NOTE: This function do in-place operation on input.
         # TODO: For safety, add an `inplace: bool` parameter.
-        self.ep_group.all_reduce(local_sum_result)
+        self.ep_etp_group.all_reduce(local_sum_result)
         if self.dp_group.group_size > 1:
             local_sum_result = local_sum_result[
                 self.cum_num_tokens[self.dp_group.rank_in_group] : self.cum_num_tokens[
@@ -131,3 +132,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
                 ]
             ]
         return local_sum_result
+
+    @override
+    def exit_moe_reduce_rank_lists(self) -> Optional[Sequence[Sequence[int]]]:
+        return self.ep_etp_group.rank_lists

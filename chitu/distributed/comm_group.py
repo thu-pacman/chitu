@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
+import itertools
 import os
 from typing import Optional, List, Tuple, Sequence, Any
 
@@ -69,18 +71,16 @@ class CommGroup:
         self,
         rank_lists: Sequence[Sequence[int]],
         global_rank: int,
+        *,
         enable_custom_allreduce: bool = True,
-        fully_connected: bool = True,
         custom_allreduce_max_size: int = 8 * 1024 * 1024,  # 8MB default
         force_no_dedup: bool = False,
     ):
+        # NOTE: `self.rank_lists` is global, which includes all ranks. This is different
+        # from `self.rank_list`.
+        self.rank_lists: Sequence[Sequence[int]] = rank_lists
+
         self.global_rank = global_rank
-        self.cpu_group = None
-        self.gpu_group = None
-        self.rank_in_group = None
-        self.group_size = None
-        self.rank_list = None
-        self.fully_connected = fully_connected
         self.custom_allreduce_max_size = custom_allreduce_max_size
 
         self.device = torch.device("cuda")
@@ -112,10 +112,12 @@ class CommGroup:
             # we need to do a world barrier before dp group barrier in init_zmq
             self.barrier()
 
-        self.rank_list = rank_lists[this_rank_idx]
+        # NOTE: `self.rank_list` is local, which includes only the ranks communicating with
+        # the current rank. This is different from `self.rank_lists`.
+        self.rank_list: Sequence[int] = rank_lists[this_rank_idx]
+
         self.rank_in_group = self.rank_list.index(global_rank)
         self.group_size = len(self.rank_list)
-        self.moe_comm_group = None
 
         self.custom_ar_manager = None
         self._enable_custom_allreduce = enable_custom_allreduce
@@ -196,6 +198,66 @@ class CommGroup:
             f"group_size={self.group_size}, "
             f"rank_in_group={self.rank_in_group}, "
             f"rank_list={self.rank_list}, "
+        )
+
+    def communicates(self, rank0, rank1) -> bool:
+        """
+        Check if rank0 and rank1 communicate in this `CommGroup`.
+
+        NOTE: A rank is always considered to communicate with itself.
+        """
+        for lst in self.rank_lists:
+            if rank0 in lst and rank1 in lst:
+                return True
+        return False
+
+    def is_orthogonal_to(self, other) -> bool:
+        """
+        `CommGroup` A and B are orthogonal if and only if: ∀r, s ∈ ranks, r != s,
+        not (A.communicates(r, s) and B.communicates(r, s))
+        """
+        for lst in self.rank_lists:
+            for i, r in enumerate(lst[:-1]):
+                for s in lst[i + 1 :]:
+                    if other.communicates(r, s):
+                        return False
+        return True
+
+    def cartesian_product(
+        self,
+        other,
+        *,
+        enable_custom_allreduce: bool = True,
+        custom_allreduce_max_size: int = 8 * 1024 * 1024,  # 8MB default
+        force_no_dedup: bool = False,
+    ) -> "CommGroup":
+        """
+        Two orthogonal `CommGroup` A and B's cartesian product C is defined as:
+        C.communicates(r, s) if and only if ∃t: A.communicates(r, t) and B.communicates(t, s)
+        """
+        if not self.is_orthogonal_to(other):
+            raise ValueError(
+                "Cartesian product of non-orthogonal `CommGroup`s is undefined."
+            )
+        new_rank_lists = []
+        for lst0 in self.rank_lists:
+            done = False
+            for lst1 in new_rank_lists:
+                if any(
+                    other.communicates(r, s) for r, s in itertools.product(lst0, lst1)
+                ):
+                    lst1 += lst0
+                    done = True
+                    break
+            if not done:
+                new_rank_lists.append(copy.copy(lst0))
+        new_rank_lists = sorted([sorted(lst) for lst in new_rank_lists])
+        return CommGroup(
+            new_rank_lists,
+            self.global_rank,
+            enable_custom_allreduce=enable_custom_allreduce,
+            custom_allreduce_max_size=custom_allreduce_max_size,
+            force_no_dedup=force_no_dedup,
         )
 
     def barrier(self):

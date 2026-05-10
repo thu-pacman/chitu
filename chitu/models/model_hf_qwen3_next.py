@@ -101,9 +101,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.layer_id = layer_id
         self.cache = cache
 
-        tensor_parallel_size = get_tp_size()
-        self.n_local_v_heads = self.n_v_heads // tensor_parallel_size
-        self.n_local_qk_heads = self.n_qk_heads // tensor_parallel_size
+        tp_size = get_tp_size()
+        self.n_local_v_heads = self.n_v_heads // tp_size
+        self.n_local_qk_heads = self.n_qk_heads // tp_size
 
         self.local_conv_dim = (
             self.n_local_qk_heads * 2 + self.n_local_v_heads
@@ -121,11 +121,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         )
 
         self.dt_bias = nn.Parameter(
-            torch.ones(self.n_v_heads // tensor_parallel_size),
+            torch.ones(self.n_v_heads // tp_size),
         )
         self.A_log = nn.Parameter(
             torch.empty(
-                self.n_v_heads // tensor_parallel_size,
+                self.n_v_heads // tp_size,
             )
         )
 
@@ -446,7 +446,7 @@ class MLPQwen3Next(nn.Module):
         )
 
         # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
-        # Therefore, the projected shape is [tensor_parallel_size, 2 * params.intermediate_dim]
+        # Therefore, the projected shape is [tp_size, 2 * params.intermediate_dim]
 
         gate_up_proj_linear = get_linear_layout_native_y(
             op_impl,
@@ -687,8 +687,6 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
         cache_dict: dict[str, KVCacheBase],
         *,
         max_position_embeddings: int,
-        pipeline_parallel_size: int,
-        tensor_parallel_size: int,
         attn_backend: AttnBackend,
         rotary_type: str = "separated",
         op_impl: str = "torch",
@@ -704,8 +702,6 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
             params,
             cache_dict,
             max_position_embeddings=max_position_embeddings,
-            pipeline_parallel_size=pipeline_parallel_size,
-            tensor_parallel_size=tensor_parallel_size,
             attn_backend=attn_backend,
             rotary_type=rotary_type,
             layer_type_callback=layer_type_callback,
@@ -924,7 +920,7 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
     ) -> dict[str, Any]:
         if not skip_preprocess:
             state_dict = self.process_state_dict_for_splitting_q_gate(state_dict)
-            if self.tensor_exec:
+            if self.tp_size > 1:
                 state_dict = self.chunk_checkpoint_for_tensor_parallelize_attn_weights(
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )

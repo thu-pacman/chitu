@@ -20,6 +20,14 @@ from chitu.static_tensor import StaticTensor
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
 
 if has_flash_mla and has_accelerator():
+    # Try importing new interface, fallback to None if not available (旧版 FlashMLA)
+    try:
+        from flash_mla.flash_mla_interface import FlashMLASchedMeta
+
+        has_flash_mla_sched_meta = True
+    except ImportError:
+        FlashMLASchedMeta = None
+        has_flash_mla_sched_meta = False
     from chitu.ops.triton_ops import (
         convert_req_index_to_global_paged_index_triton,
         quant_pertoken_kvcache_dsa,
@@ -60,8 +68,12 @@ class FlashMLABackend(TritonAttnBackend):
         self.num_splits = None
         # 海光使用旧版 FlashMLA：prefill 与 decode 的 num_splits 需分别保存；decode 侧走 CUDA graph 静态缓冲
         self.num_splits_prefill = None
-        self.hygon_metadata_decode: Optional[StaticTensor] = None
-        self.hygon_num_splits_decode: Optional[StaticTensor] = None
+        # 新版 FlashMLA 使用 FlashMLASchedMeta，旧版使用 StaticTensor
+        if has_flash_mla_sched_meta:
+            self.hygon_metadata_decode: Optional[FlashMLASchedMeta] = None
+        else:
+            self.hygon_metadata_decode: Optional[StaticTensor] = None
+        self.hygon_num_splits_decode: Optional[StaticTensor] = None  # 旧版需要
 
         self.softmax_scale = None
 
@@ -241,24 +253,43 @@ class FlashMLABackend(TritonAttnBackend):
 
         q = q.view(bsz, s_q, q.shape[-2], q.shape[-1])
         if is_hygon():
-            assert (
-                self.hygon_metadata_decode is not None
-                and self.hygon_num_splits_decode is not None
-            ), (
-                "Hygon FlashMLA requires prepare_metadata_for_decode() before dense decode; "
-                "lazy get_mla_metadata() is not supported."
-            )
-            output, _ = flash_mla.flash_mla_with_kvcache(
-                q,
-                kv_lora_k_pe.unsqueeze(2),
-                block_table,
-                seq_len_delta.new.lens_tensor_device,
-                512,
-                self.hygon_metadata_decode.get(),
-                self.hygon_num_splits_decode.get(),
-                causal=s_q > 1,
-                softmax_scale=softmax_scale,
-            )
+            if has_flash_mla_sched_meta:
+                # 新版 FlashMLA 接口：直接使用 FlashMLASchedMeta
+                assert self.hygon_metadata_decode is not None, (
+                    "Hygon FlashMLA requires prepare_metadata_for_decode() before dense decode; "
+                    "lazy get_mla_metadata() is not supported."
+                )
+                output, _ = flash_mla.flash_mla_with_kvcache(
+                    q=q,
+                    k_cache=kv_lora_k_pe.unsqueeze(2),
+                    block_table=block_table,
+                    head_dim_v=512,
+                    cache_seqlens=seq_len_delta.new.lens_tensor_device,
+                    tile_scheduler_metadata=self.hygon_metadata_decode,
+                    num_splits=None,  # 新版接口使用 None
+                    causal=(False if s_q == 1 else True),
+                    softmax_scale=softmax_scale,
+                )
+            else:
+                # 旧版 FlashMLA 接口：使用 StaticTensor
+                assert (
+                    self.hygon_metadata_decode is not None
+                    and self.hygon_num_splits_decode is not None
+                ), (
+                    "Hygon FlashMLA requires prepare_metadata_for_decode() before dense decode; "
+                    "lazy get_mla_metadata() is not supported."
+                )
+                output, _ = flash_mla.flash_mla_with_kvcache(
+                    q,
+                    kv_lora_k_pe.unsqueeze(2),
+                    block_table,
+                    seq_len_delta.new.lens_tensor_device,
+                    512,
+                    self.hygon_metadata_decode.get(),
+                    self.hygon_num_splits_decode.get(),
+                    causal=s_q > 1,
+                    softmax_scale=softmax_scale,
+                )
         else:
             # 确保 decode 元数据已初始化（开启prefix caching后warmup可能尚未调用 prepare_metadata_for_decode）
             if self.metadata_decode is None:
@@ -342,14 +373,22 @@ class FlashMLABackend(TritonAttnBackend):
             batch_block_table = block_table
 
         if is_hygon():
-            metadata, num_splits = (
-                (
-                    self.hygon_metadata_decode.get(),
-                    self.hygon_num_splits_decode.get(),
+            if has_flash_mla_sched_meta:
+                # 新版 FlashMLA 接口
+                metadata = (
+                    self.hygon_metadata_decode if is_decode else self.metadata_prefill
                 )
-                if is_decode
-                else (self.metadata_prefill, self.num_splits_prefill)
-            )
+                num_splits = None  # 新版接口使用 None
+            else:
+                # 旧版 FlashMLA 接口
+                metadata, num_splits = (
+                    (
+                        self.hygon_metadata_decode.get(),
+                        self.hygon_num_splits_decode.get(),
+                    )
+                    if is_decode
+                    else (self.metadata_prefill, self.num_splits_prefill)
+                )
         else:
             metadata = self.metadata_decode if is_decode else self.metadata_prefill
             num_splits = self.num_splits
@@ -675,16 +714,24 @@ class FlashMLABackend(TritonAttnBackend):
                     self.kv_heads,
                 )
 
-            if self.hygon_metadata_decode is None:
-                self.hygon_metadata_decode = StaticTensor(metadata)
+            if has_flash_mla_sched_meta:
+                # 新版 FlashMLA 接口：直接创建 FlashMLASchedMeta
+                if self.hygon_metadata_decode is None:
+                    # Create empty FlashMLASchedMeta using get_mla_metadata()
+                    # The actual tensor data will be generated during kernel execution
+                    self.hygon_metadata_decode, _ = flash_mla.get_mla_metadata()
             else:
-                self.hygon_metadata_decode.set(metadata)
-            if self.hygon_num_splits_decode is None:
-                self.hygon_num_splits_decode = StaticTensor(
-                    num_splits, max_nelem=max_batch_size_per_dp + 1
-                )
-            else:
-                self.hygon_num_splits_decode.set(num_splits)
+                # 旧版 FlashMLA 接口：使用 StaticTensor 存储
+                if self.hygon_metadata_decode is None:
+                    self.hygon_metadata_decode = StaticTensor(metadata)
+                else:
+                    self.hygon_metadata_decode.set(metadata)
+                if self.hygon_num_splits_decode is None:
+                    self.hygon_num_splits_decode = StaticTensor(
+                        num_splits, max_nelem=max_batch_size_per_dp + 1
+                    )
+                else:
+                    self.hygon_num_splits_decode.set(num_splits)
         else:
             # NOTE: the actual metadata intialization in the updated version of
             # FlashMLA occurs during the first execution of flash_mla_with_kvcache in

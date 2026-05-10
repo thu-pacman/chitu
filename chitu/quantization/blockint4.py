@@ -27,7 +27,11 @@ from chitu.quantization.gptqmodel import (
 logger = logging.getLogger(__name__)
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-
+triton, has_triton = try_import_platform_dep("triton")
+if has_triton:
+    from chitu.moe.experts.triton_batched_experts import (
+        invoke_fused_moe_wna16_triton_kernel,
+    )
 # ScalarTypeId for ScalarType::uint4b8
 # Computed from scalar_type.hpp: ScalarType(exponent=0, mantissa=4, signed_=false, bias=8)
 # with NAN_IEEE_754=1, packed as: exponent(8b)|mantissa(8b)|signed_(1b)|bias(32b)|finite(1b)|nan_repr(8b)
@@ -281,6 +285,23 @@ class BlockInt4MoeExpertsUnmerged(
         Marlin MoE grouped GEMM kernel, enabling CUDA graph compatibility.
         """
 
+        # Use Triton path when moe_wna16_marlin_gemm is not available
+        if (
+            has_triton
+            and not has_chitu_backend
+            or not hasattr(chitu_backend, "moe_wna16_marlin_gemm")
+        ):
+            return self._forward_triton(routed_x)
+
+        # CUDA path: use Marlin kernel
+        return self._forward_marlin(routed_x)
+
+    def _forward_marlin(
+        self, routed_x: IndexedBatchedRoutedActivation
+    ) -> PerTokenBatchedExpertResult:
+        """
+        MoE forward using Marlin CUDA kernel (for NVIDIA platform).
+        """
         if not self._marlin_repacked:
             self._repack_to_marlin()
 
@@ -378,6 +399,149 @@ class BlockInt4MoeExpertsUnmerged(
         del intermediate
 
         return PerTokenBatchedExpertResult(down_out.view(M, topk, self.dim))
+
+    def _forward_triton(
+        self, routed_x: IndexedBatchedRoutedActivation
+    ) -> PerTokenBatchedExpertResult:
+        """
+        MoE forward using Triton kernel (for Hygon platform).
+
+        Uses fused_moe_kernel_gptq_awq from vllm, which works with
+        AWQ format weights: [E, N, K//8] for int4 packed weights.
+        """
+
+        routed_x = routed_x.as_local_expert_ids(
+            self.experts_start_idx, self.experts_end_idx
+        )
+
+        activation_shape = routed_x.activation.shape
+        M = activation_shape[0]
+        topk = routed_x.token_to_expert_indices.shape[1]
+
+        n_local_experts = self.experts_end_idx - self.experts_start_idx
+        device = routed_x.activation.device
+
+        if M == 0:
+            y = torch.zeros(
+                M,
+                topk,
+                self.dim,
+                device=device,
+                dtype=routed_x.activation.dtype,
+            )
+            return PerTokenBatchedExpertResult(y)
+
+        # Convert to ExpertBlockIndexed format (sorted_token_ids, expert_ids)
+        block_routed = ExpertBlockIndexedBatchedRoutedActivation.convert_from(
+            routed_x,
+            n_experts=n_local_experts,
+            block_size=self.MOE_BLOCK_SIZE,
+        )
+
+        sorted_token_ids = (
+            block_routed.block_to_token_x_topk_indices.flatten().contiguous()
+        ).to(
+            torch.int64
+        )  # Convert to int64 for kernel compatibility
+        expert_ids = block_routed.block_to_expert_indices.contiguous().to(torch.int64)
+
+        num_tokens_past_padded = (
+            block_routed.n_blocks_scalar_tensor * self.MOE_BLOCK_SIZE
+        )
+
+        # Ensure activation dtype matches scales
+        a = routed_x.activation
+        if a.dtype != self.gate_proj_scales.dtype:
+            a = a.to(self.gate_proj_scales.dtype)
+
+        # Default config for Triton kernel
+        config = {
+            "BLOCK_SIZE_M": self.MOE_BLOCK_SIZE,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+        }
+
+        # Dummy topk_weights (mul_routed_weight=False, not used)
+        topk_weights = torch.empty(M, topk, dtype=torch.float32, device=device)
+
+        # Gate projection: (M, dim) -> (M, topk, moe_inter_dim)
+        # Weight shape: [E, N, K//8] = [E, moe_inter_dim, dim//8]
+        # Scale shape: [E, N, num_groups] = [E, moe_inter_dim, dim//group_size]
+        # Output C: 3D tensor [M, topk, N]
+        gate_out = torch.empty(
+            M, topk, self.moe_inter_dim, dtype=a.dtype, device=device
+        )
+
+        invoke_fused_moe_wna16_triton_kernel(
+            A=a,
+            B=self.gate_proj_qweight,  # [E, N, K//8]
+            C=gate_out,
+            B_scale=self.gate_proj_scales,  # [E, N, num_groups]
+            B_zp=None,  # Symmetric quantization, no zero point
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_past_padded,
+            mul_routed_weight=False,
+            top_k=topk,
+            config=config,
+            use_int4_w4a16=True,
+            use_int8_w8a16=False,
+            group_size=self.quant_group_size,
+        )
+
+        # Up projection: (M, dim) -> (M, topk, moe_inter_dim)
+        up_out = torch.empty(M, topk, self.moe_inter_dim, dtype=a.dtype, device=device)
+        invoke_fused_moe_wna16_triton_kernel(
+            A=a,
+            B=self.up_proj_qweight,
+            C=up_out,
+            B_scale=self.up_proj_scales,
+            B_zp=None,
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_past_padded,
+            mul_routed_weight=False,
+            top_k=topk,
+            config=config,
+            use_int4_w4a16=True,
+            use_int8_w8a16=False,
+            group_size=self.quant_group_size,
+        )
+
+        # Activation: silu(gate) * up
+        intermediate = torch.nn.functional.silu(gate_out) * up_out
+        del gate_out, up_out
+
+        # Down projection: (M, topk, moe_inter_dim) -> (M, topk, dim)
+        # Weight shape: [E, dim, moe_inter_dim//8]
+        # Scale shape: [E, dim, moe_inter_dim//group_size]
+        # For down projection, top_k=1 because we process M*topk tokens as M tokens each with top_k=1
+        down_out = torch.empty(M, topk, self.dim, dtype=a.dtype, device=device)
+        invoke_fused_moe_wna16_triton_kernel(
+            A=intermediate.view(
+                M * topk, self.moe_inter_dim
+            ),  # 2D input [M*topk, moe_inter_dim]
+            B=self.down_proj_qweight,
+            C=down_out,
+            B_scale=self.down_proj_scales,
+            B_zp=None,
+            topk_weights=topk_weights,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_padded=num_tokens_past_padded,
+            mul_routed_weight=False,
+            top_k=1,  # Input is already topk-expanded
+            config=config,
+            use_int4_w4a16=True,
+            use_int8_w8a16=False,
+            group_size=self.quant_group_size,
+        )
+        del intermediate
+
+        return PerTokenBatchedExpertResult(down_out)
 
     # ------------------------------------------------------------------ #
     #  Per-expert iterative forward (fallback)                            #

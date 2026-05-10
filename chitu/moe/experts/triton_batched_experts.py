@@ -625,3 +625,122 @@ def triton_batched_experts_ref(
             intermediate_output2[i][: hidden_states.n_tokens_per_expert[i]], w2[i].T
         )
     return PerExpertDenseBatchedExpertResultMinimal(output)
+
+
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: Copyright contributors to the vLLM project
+# SPDX-SnippetName: invoke_fused_moe_wna16_triton_kernel from vLLM
+#
+# MoE kernel for INT4/INT8 weight-only quantization (W4A16/W8A16)
+# Originally from vLLM: https://github.com/vllm-project/vllm
+
+
+def invoke_fused_moe_wna16_triton_kernel(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    B_scale: torch.Tensor,
+    B_zp: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict,
+    use_int4_w4a16: bool,
+    use_int8_w8a16: bool,
+    group_size: int,
+):
+    """
+    Invoke the fused_moe_kernel_gptq_awq kernel for MoE WNA16 computation.
+
+    Args:
+        A: Input tensor [M, K]
+        B: Weight tensor [E, N, K//8] for int4 (packed along K)
+        C: Output tensor [M, topk, N] (3D tensor!)
+        B_scale: Scale tensor [E, N, num_groups]
+        B_zp: Zero point tensor (optional)
+        topk_weights: Top-k weights (optional)
+        sorted_token_id: Sorted token indices
+        expert_ids: Expert IDs for each block
+        num_tokens_post_padded: Number of tokens after padding
+        mul_routed_weight: Whether to multiply routed weight
+        top_k: Number of top-k experts
+        config: Kernel config with BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M
+        compute_type: Computation dtype (tl.float16 or tl.bfloat16)
+        use_int4_w4a16: True for int4, False for int8
+        group_size: Quantization group size
+
+    Note:
+        C must be a 3D tensor [M, topk, N] because the kernel uses:
+        - C.stride(1) for stride_cm (topk dimension stride)
+        - C.stride(2) for stride_cn (N dimension stride)
+    """
+    from chitu.ops.triton_ops.triton_group_gemm import fused_moe_kernel_gptq_awq
+
+    compute_type = tl.bfloat16 if A.dtype == torch.bfloat16 else tl.float16
+    assert B_scale.ndim == 3
+    assert B_zp is None or B_zp.ndim == 3
+    # C should be 3D: [M, topk, N]
+    assert C.ndim == 3, f"C must be 3D [M, topk, N], got shape {C.shape}"
+
+    M = A.size(0)
+    num_tokens = M * top_k
+    N = B.size(1)
+    K = A.size(1)
+
+    EM = sorted_token_ids.size(0)
+    if A.size(0) < config["BLOCK_SIZE_M"]:
+        # optimize for small batch_size.
+        # We assume that top_ids of each token is unique,
+        # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
+        # and we can skip some invalid blocks.
+        EM = min(sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"])
+
+    grid = lambda META: (
+        triton.cdiv(EM, META["BLOCK_SIZE_M"])
+        * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
+    )
+
+    fused_moe_kernel_gptq_awq[grid](
+        A,
+        B,
+        C,
+        B_scale,
+        B_zp,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        N,
+        K,
+        EM,
+        num_tokens,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),  # stride_cm: stride for topk dimension
+        C.stride(2),  # stride_cn: stride for N dimension
+        B_scale.stride(0),
+        B_scale.stride(2),
+        B_scale.stride(1),
+        B_zp.stride(0) if B_zp is not None else 0,
+        B_zp.stride(2) if B_zp is not None else 0,
+        B_zp.stride(1) if B_zp is not None else 0,
+        block_k_diviable=K % config["BLOCK_SIZE_K"] == 0,
+        group_size=group_size,
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=compute_type,
+        has_zp=B_zp is not None,
+        use_int4_w4a16=use_int4_w4a16,
+        use_int8_w8a16=use_int8_w8a16,
+        **config,
+    )
+
+
+# SPDX-SnippetEnd

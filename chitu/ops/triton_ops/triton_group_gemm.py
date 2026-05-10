@@ -691,3 +691,209 @@ def fused_moe_kernel_int8(
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+# SPDX-SnippetBegin
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-SnippetCopyrightText: Copyright contributors to the vLLM project
+# SPDX-SnippetName: fused_moe_kernel_gptq_awq from vLLM
+#
+# MoE kernel for INT4/INT8 weight-only quantization (W4A16/W8A16)
+# Originally from vLLM: https://github.com/vllm-project/vllm
+
+
+@triton.jit
+def fused_moe_kernel_gptq_awq(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_scale_ptr,
+    b_zp_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
+    N: tl.constexpr,
+    K: tl.constexpr,
+    EM,
+    num_valid_tokens,
+    # Strides
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
+    stride_bze,
+    stride_bzk,
+    stride_bzn,
+    block_k_diviable: tl.constexpr,
+    group_size: tl.constexpr,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    has_zp: tl.constexpr,
+    use_int4_w4a16: tl.constexpr,
+    use_int8_w8a16: tl.constexpr,
+):
+    """
+    MoE kernel for INT4/INT8 weight-only quantization (W4A16/W8A16).
+
+    Args:
+        A: Input tensor [M, K]
+        B: Weight tensor [E, N, K//8] for int4 (packed as 8 int4 per int32 along K)
+        C: Output tensor [M*topk, N]
+        B_scale: Scale tensor [E, num_groups, N]
+        B_zp: Zero point tensor (optional)
+        sorted_token_ids: Sorted token indices
+        expert_ids: Expert IDs for each block
+    """
+    # Map program ids to block of C
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_experts == -1:
+        write_zeros_to_output(
+            c_ptr,
+            stride_cm,
+            stride_cn,
+            pid_n,
+            N,
+            offs_token,
+            token_mask,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            compute_type,
+        )
+        return
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    )
+
+    if use_int4_w4a16:
+        # AWQ packs 8 int4 values per int32 (K//8 format)
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + (offs_k[:, None] // 8) * stride_bk
+            + offs_bn[None, :] * stride_bn
+        )
+        b_shifter = (offs_k[:, None] % 8) * 4
+    elif use_int8_w8a16:
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + offs_k[:, None] * stride_bk
+            + offs_bn[None, :] * stride_bn
+        )
+
+    if not has_zp and use_int4_w4a16:
+        b_zp_num = 8
+    if not has_zp and use_int8_w8a16:
+        b_zp_num = 128
+    elif has_zp and use_int4_w4a16:
+        b_zp_shifter = (offs_bn[None, :] % 2) * 4
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        if not block_k_diviable:
+            k_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
+            k_other = 0.0
+        else:
+            k_mask = None
+            k_other = None
+
+        a = tl.load(
+            a_ptrs,
+            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+            other=0.0,
+        )
+        b = tl.load(b_ptrs)
+        if use_int4_w4a16:
+            b = (b >> b_shifter) & 0xF
+
+        b_scale_ptrs = (
+            b_scale_ptr
+            + off_experts * stride_bse
+            + offs_bn[None, :] * stride_bsn
+            + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
+        )
+        b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
+        b_scale = b_scale.to(tl.float32)
+
+        if has_zp and use_int4_w4a16:
+            offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+            b_zp_ptrs = (
+                b_zp_ptr
+                + off_experts * stride_bze
+                + (offs_bn[None, :] // 2) * stride_bzn
+                + offs_k_true * stride_bzk
+            )
+            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            b_zp = (b_zp >> b_zp_shifter) & 0xF
+            b_zp = b_zp.to(tl.float32)
+        elif has_zp and use_int8_w8a16:
+            offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+            b_zp_ptrs = (
+                b_zp_ptr
+                + off_experts * stride_bze
+                + offs_bn[None, :] * stride_bzn
+                + offs_k_true * stride_bzk
+            )
+            b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            b_zp = b_zp.to(tl.float32)
+
+        if has_zp:
+            b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+        else:
+            b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
+        accumulator = tl.dot(a, b, acc=accumulator)
+
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        if use_int4_w4a16:
+            # With 8 int4 per int32, advance by BLOCK_SIZE_K // 8
+            b_ptrs += (BLOCK_SIZE_K // 8) * stride_bk
+        else:
+            b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator = accumulator * moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+# SPDX-SnippetEnd

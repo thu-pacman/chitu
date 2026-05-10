@@ -14,6 +14,7 @@ from chitu.task import (
     TaskPool,
     PackedTasks,
     PackedTasksBase,
+    DPTaskCollector,
 )
 from chitu.serve.event_loop import get_server_event_loop
 from typing import TYPE_CHECKING
@@ -153,55 +154,61 @@ class MooncakeKVTransferHook:
             return
         if self.mode != "prefill":
             return
-        if tasks.num_tasks == 0:
+        if tasks.num_tasks == 0 and not DPTaskCollector.available():
             return
-        # Send KV cache and first-token metadata to decode side.
-        kv_cache = self.kv_manager.kv_cache
 
-        req_ids_output = tasks.output_task_ids
-        request_cached_tokens = {}
-        for t in getattr(tasks, "output_tasks", []):
-            if t is None or getattr(t, "req", None) is None:
-                continue
-            request_cached_tokens[str(t.req.request_id)] = int(
-                getattr(t.req, "num_hit_tokens", 0)
-            )
-        if pd_verbose_enabled():
-            if send_tokens is None:
-                # 看到该日志表示：该 rank 只传输 KV Cache（不包含首 token）
-                logger.debug(f"[KVHook] sending KV-only for requests: {req_ids_output}")
-            else:
-                # 看到该日志表示：该 rank 传输 KV Cache + first-token
+        if tasks.num_tasks > 0:
+            # Send KV cache and first-token metadata to decode side.
+            kv_cache = self.kv_manager.kv_cache
+
+            req_ids_output = tasks.output_task_ids
+            request_cached_tokens = {}
+            for t in getattr(tasks, "output_tasks", []):
+                if t is None or getattr(t, "req", None) is None:
+                    continue
+                request_cached_tokens[str(t.req.request_id)] = int(
+                    getattr(t.req, "num_hit_tokens", 0)
+                )
+            if pd_verbose_enabled():
+                if send_tokens is None:
+                    # 看到该日志表示：该 rank 只传输 KV Cache（不包含首 token）
+                    logger.debug(
+                        f"[KVHook] sending KV-only for requests: {req_ids_output}"
+                    )
+                else:
+                    # 看到该日志表示：该 rank 传输 KV Cache + first-token
+                    logger.debug(
+                        f"[KVHook] sending KV+token for requests: {req_ids_output}"
+                    )
+
+            _kv_send_start = time.monotonic()
+            for rid in req_ids_output:
+                logger.debug(f"[PD_STAGE][prefill.kv_send.start] req_id={rid}")
+
+            if pd_trace_enabled():
                 logger.debug(
-                    f"[KVHook] sending KV+token for requests: {req_ids_output}"
+                    f"[PD_TRACE][prefill.kv_send] req_ids={req_ids_output} batch={len(req_ids_output)} "
+                    f"token_shape={list(send_tokens.shape) if isinstance(send_tokens, torch.Tensor) else None} "
+                    f"cache_type={get_global_args().infer.cache_type}"
                 )
 
-        _kv_send_start = time.monotonic()
-        for rid in req_ids_output:
-            logger.debug(f"[PD_STAGE][prefill.kv_send.start] req_id={rid}")
-
-        if pd_trace_enabled():
-            logger.debug(
-                f"[PD_TRACE][prefill.kv_send] req_ids={req_ids_output} batch={len(req_ids_output)} "
-                f"token_shape={list(send_tokens.shape) if isinstance(send_tokens, torch.Tensor) else None} "
-                f"cache_type={get_global_args().infer.cache_type}"
+            self.kv_manager.send_kv_cache(
+                first_tokens=send_tokens,
+                request_ids=req_ids_output,
+                kv_cache=kv_cache,
+                request_cached_tokens=request_cached_tokens,
             )
 
-        self.kv_manager.send_kv_cache(
-            first_tokens=send_tokens,
-            request_ids=req_ids_output,
-            kv_cache=kv_cache,
-            request_cached_tokens=request_cached_tokens,
-        )
+            # Record KV send duration (covers enqueue; actual RDMA transfer is async)
+            _kv_send_dur = time.monotonic() - _kv_send_start
+            from chitu.metrics.prometheus_collector import observe_stage_duration
 
-        # Record KV send duration (covers enqueue; actual RDMA transfer is async)
-        _kv_send_dur = time.monotonic() - _kv_send_start
-        from chitu.metrics.prometheus_collector import observe_stage_duration
-
-        observe_stage_duration("prefill", "kv_send", _kv_send_dur)
+            observe_stage_duration("prefill", "kv_send", _kv_send_dur)
 
         from chitu.backend import Backend  # local import to avoid cycles
 
+        if DPTaskCollector.available():
+            tasks = DPTaskCollector.get_total_packedtasks()
         if Backend.executor._pd_prefill_only and isinstance(tasks, PackedTasks):
             for t in tasks.output_tasks:
                 if t is None:

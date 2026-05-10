@@ -303,7 +303,7 @@ Chitu makes parallelism with higher communication demands use nearer devices:
 - In case of ordinary models or attention blocks in MoE models, a TP group consists of nearest devices, than a DP group, and PP group consists of most far away devices. In terms of a distributed mesh, the mesh shape is PP * DP * TP. Please note that DP designed for parallelizing attention blocks in MoE models, so DP is in between PP and TP, instead of outer than PP. To scale a non-MoE model by copying weight, please utilize multi-instance deployment instead of DP described here.
 - In case of MoE blocks in MoE models, a ETP group consists of nearest devices, than a EP group, and PP group consists of most far away devices. In terms of a distributed mesh, the mesh shape is PP * EP * ETP. A MoE block can also be scaled by copying its weight, which can be done via expert slots. Which is similar to DP, but with more flexibility.
 
-TP, DP, EP and/or PP can be used by passing `tp_size`, `dp_size`, `ep_size` and/or `pp_size` arguments. ETP size is always `tp_size * dp_size // ep_size`.
+TP, DP, ETP, EP and/or PP can be used by passing `tp_size`, `dp_size`, `etp_size`, `ep_size` and/or `pp_size` arguments. ETP size is `tp_size * dp_size // ep_size` by default if omitted.
 
 Example arguments for TP:
 
