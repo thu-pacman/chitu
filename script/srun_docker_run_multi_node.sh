@@ -132,7 +132,7 @@ if which nvidia-smi >/dev/null 2>&1; then
         --privileged \
         --shm-size=1g \
         -e NCCL_GRAPH_MIXING_SUPPORT=0 \
-        -e NCCL_GRAPH_REGISTER=0 "
+        -e NCCL_GRAPH_REGISTER=0"
 elif which npu-smi >/dev/null 2>&1; then
     DOCKER_RUN_CMD="${DOCKER_RUN_CMD} \
         --privileged \
@@ -147,6 +147,20 @@ elif which npu-smi >/dev/null 2>&1; then
     for dev in /dev/davinci*; do
         DOCKER_RUN_CMD="${DOCKER_RUN_CMD} -v $dev:$dev"
     done
+elif which hy-smi >/dev/null 2>&1; then
+    DOCKER_RUN_CMD="${DOCKER_RUN_CMD} \
+        --privileged \
+        --device=/dev/kfd \
+        --device=/dev/dri \
+        --ipc=host \
+        --shm-size=100G \
+        --group-add video \
+        --cap-add=SYS_PTRACE \
+        --security-opt seccomp=unconfined \
+        -u root \
+        --ulimit stack=-1:-1 \
+        --ulimit memlock=-1:-1 \
+        -v /opt/hyhal:/opt/hyhal:ro"
 else
     echo "No supported type of devices detected"
     exit -1

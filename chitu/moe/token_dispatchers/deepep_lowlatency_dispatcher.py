@@ -26,8 +26,7 @@ from chitu.moe.batched_routed_activation import (
 )
 from chitu.moe.load_balancer import get_moe_load_planner
 from chitu.global_vars import get_global_args
-from chitu.device_type import is_blackwell
-from chitu.device_type import is_muxi
+from chitu.device_type import is_blackwell, is_muxi, is_hygon
 from contextlib import nullcontext
 
 # replace the buffer setting with DeepEP to concurrently enbale ll mode and normal mode, need more test to verify.
@@ -300,20 +299,43 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
 
         assert not (async_finish and return_recv_hook)
         # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
-        recv_hidden_states, recv_expert_count, handle, event, hook = (
-            self._buffer.low_latency_dispatch(
-                hidden_states,
-                topk_idx,
-                DeepEPBuffer._lowlatency_num_max_dispatch_tokens_per_rank,
-                self.num_global_experts,
-                use_fp8=dispatch_use_fp8,
-                round_scale=round_scale_to_pow2,
-                use_ue8m0=False,  # Not using 8bit storage for now
-                cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
-                async_finish=async_finish,
-                return_recv_hook=return_recv_hook,
+        # ---- _chitu_hygon_lowlatency_dispatch_marker_ ----
+        if is_hygon():
+            # Hygon DCU DeepEP build replaced the (use_fp8, use_ue8m0, round_scale) trio
+            # with an integer quant_type enum (0=none, 1=int8, 2=fp8_e4m3, 3=fp8_ue8m0,
+            # 4=fp8_e5m2) and a renamed fp8_round_scale arg.
+            # cumulative_local_expert_recv_stats is not implemented in this build
+            # (profiling-only on the upstream path).
+            recv_hidden_states, recv_expert_count, handle, event, hook = (
+                self._buffer.low_latency_dispatch(
+                    hidden_states,
+                    topk_idx,
+                    DeepEPBuffer._lowlatency_num_max_dispatch_tokens_per_rank,
+                    self.num_global_experts,
+                    quant_type=(
+                        2 if dispatch_use_fp8 else 0
+                    ),  # fp8_e4m3 (UE8M0 not used here)
+                    quant_group_size=128,  # cinfer only enables fp8 when block_size == 128
+                    fp8_round_scale=round_scale_to_pow2,
+                    async_finish=async_finish,
+                    return_recv_hook=return_recv_hook,
+                )
             )
-        )
+        else:
+            recv_hidden_states, recv_expert_count, handle, event, hook = (
+                self._buffer.low_latency_dispatch(
+                    hidden_states,
+                    topk_idx,
+                    DeepEPBuffer._lowlatency_num_max_dispatch_tokens_per_rank,
+                    self.num_global_experts,
+                    use_fp8=dispatch_use_fp8,
+                    round_scale=round_scale_to_pow2,
+                    use_ue8m0=False,  # Not using 8bit storage for now
+                    cumulative_local_expert_recv_stats=cumulative_local_expert_recv_stats,
+                    async_finish=async_finish,
+                    return_recv_hook=return_recv_hook,
+                )
+            )
         # NOTES: the actual tensor will not be received only if you call `hook()`,
         # it is useful for double-batch overlapping, but **without any SM occupation**
         # If you don't want to overlap, please set `return_recv_hook=False`

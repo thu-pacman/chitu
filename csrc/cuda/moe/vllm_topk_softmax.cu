@@ -44,17 +44,21 @@
 
 #define WARP_SIZE 32
 
-// HIP requires 64-bit mask for shuffle operations
+// ---- _chitu_hygon_vllm_topk_shfl_marker_ ----
+// DTK HIP has no __shfl_xor_sync; only __shfl_xor(var, lane[, width]).
+// VLLM_SHFL_MASK is kept for source-compat but unused in the HIP expansion.
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 #define VLLM_SHFL_MASK uint64_t(-1)
+#define VLLM_SHFL_XOR_SYNC(var, lane_mask) __shfl_xor((var), (lane_mask))
+#define VLLM_SHFL_XOR_SYNC_WIDTH(var, lane_mask, width)                        \
+    __shfl_xor((var), (lane_mask), (width))
 #else
 #define VLLM_SHFL_MASK uint32_t(-1)
-#endif
-
 #define VLLM_SHFL_XOR_SYNC(var, lane_mask)                                     \
     __shfl_xor_sync(VLLM_SHFL_MASK, var, lane_mask)
 #define VLLM_SHFL_XOR_SYNC_WIDTH(var, lane_mask, width)                        \
     __shfl_xor_sync(VLLM_SHFL_MASK, var, lane_mask, width)
+#endif
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))

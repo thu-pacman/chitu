@@ -22,6 +22,38 @@ namespace chitu {
 #define WARP_SHFL_MASK 0xffffffff
 #endif
 
+// ---- _chitu_hygon_group_topk_shfl_template_v2_ ----
+// DTK HIP has no __shfl_xor_sync, and its __shfl_xor only overloads int /
+// unsigned / float / double — NOT __hip_bfloat16 / __half. Implicit conversion
+// from a 2-byte floating type to those overloads is ambiguous. Wrap in a
+// template that bitcasts 2-byte types through int via __builtin_memcpy so the
+// bit pattern is preserved across the shuffle.
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+template <typename T>
+__device__ __forceinline__ T chitu_shfl_xor_sync(T var,
+                                                 unsigned long long /*mask*/,
+                                                 int lane, int width) {
+    if constexpr (sizeof(T) == 4) {
+        return __shfl_xor(var, lane, width);
+    } else if constexpr (sizeof(T) == 2) {
+        int tmp = 0;
+        __builtin_memcpy(&tmp, &var, sizeof(T));
+        tmp = __shfl_xor(tmp, lane, width);
+        T out;
+        __builtin_memcpy(&out, &tmp, sizeof(T));
+        return out;
+    } else {
+        static_assert(sizeof(T) == 4 || sizeof(T) == 2,
+                      "chitu_shfl_xor_sync: unsupported element size");
+    }
+}
+#define CHITU_SHFL_XOR_SYNC(var, mask, lane, width)                            \
+    chitu_shfl_xor_sync((var), (unsigned long long)(mask), (lane), (width))
+#else
+#define CHITU_SHFL_XOR_SYNC(var, mask, lane, width)                            \
+    __shfl_xor_sync((mask), (var), (lane), (width))
+#endif
+
 template <typename T,
           /// Number of elements in the array
           int N,
@@ -169,10 +201,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 
         for (int mask = (experts_per_group / VPT) / 2; mask > 0; mask >>= 1) {
             BIAS_T tmp =
-                __shfl_xor_sync(WARP_SHFL_MASK, max_score_in_experts_group_tmp,
-                                mask, THREADS_PER_ROW);
-            int tmp_id =
-                __shfl_xor_sync(WARP_SHFL_MASK, max_id, mask, THREADS_PER_ROW);
+                CHITU_SHFL_XOR_SYNC(max_score_in_experts_group_tmp,
+                                    WARP_SHFL_MASK, mask, THREADS_PER_ROW);
+            int tmp_id = CHITU_SHFL_XOR_SYNC(max_id, WARP_SHFL_MASK, mask,
+                                             THREADS_PER_ROW);
             if (gt(tmp, max_score_in_experts_group_tmp) ||
                 (eq(tmp, max_score_in_experts_group_tmp) && tmp_id < max_id)) {
                 max_score_in_experts_group_tmp = tmp;
@@ -194,10 +226,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     BIAS_T max_tmp = max_score_in_experts_group;
     for (int i = 0; i < topK_groups; i++) {
         for (int mask = THREADS_PER_ROW / 2; mask > 0; mask >>= 1) {
-            BIAS_T tmp =
-                __shfl_xor_sync(WARP_SHFL_MASK, max_tmp, mask, THREADS_PER_ROW);
-            int tmp_expert_id = __shfl_xor_sync(
-                WARP_SHFL_MASK, max_experts_group_id, mask, THREADS_PER_ROW);
+            BIAS_T tmp = CHITU_SHFL_XOR_SYNC(max_tmp, WARP_SHFL_MASK, mask,
+                                             THREADS_PER_ROW);
+            int tmp_expert_id = CHITU_SHFL_XOR_SYNC(
+                max_experts_group_id, WARP_SHFL_MASK, mask, THREADS_PER_ROW);
             if (gt(tmp, max_tmp) ||
                 (eq(tmp, max_tmp) && tmp_expert_id < max_experts_group_id)) {
                 max_tmp = tmp;
@@ -260,12 +292,12 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 // Second, use butterfly to find the global max
 #pragma unroll
         for (int mask = THREADS_PER_ROW / 2; mask > 0; mask >>= 1) {
-            BIAS_T other_max_val =
-                __shfl_xor_sync(WARP_SHFL_MASK, max_val, mask, THREADS_PER_ROW);
-            int other_expert_id = __shfl_xor_sync(WARP_SHFL_MASK, expert_id,
-                                                  mask, THREADS_PER_ROW);
-            T other_max_val_no_bias = __shfl_xor_sync(
-                WARP_SHFL_MASK, max_val_no_bias, mask, THREADS_PER_ROW);
+            BIAS_T other_max_val = CHITU_SHFL_XOR_SYNC(max_val, WARP_SHFL_MASK,
+                                                       mask, THREADS_PER_ROW);
+            int other_expert_id = CHITU_SHFL_XOR_SYNC(expert_id, WARP_SHFL_MASK,
+                                                      mask, THREADS_PER_ROW);
+            T other_max_val_no_bias = CHITU_SHFL_XOR_SYNC(
+                max_val_no_bias, WARP_SHFL_MASK, mask, THREADS_PER_ROW);
 
             // keep the lower expert_id "win"
             if (gt(other_max_val, max_val) ||

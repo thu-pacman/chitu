@@ -10,16 +10,26 @@
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 // HIP platform (ROCm/Hygon)
+// ---- _chitu_hygon_platform_host_safe_marker_ ----
+// hip_bf16.h / hip_fp16.h transitively include device_library_decls.h, which
+// uses _Float16 and __builtin_amdgcn_* — these require hipcc's device-mode
+// predefines and are NOT host-safe. Include them only under device compilation
+// (hipcc) so plain g++ host TUs (e.g. binding.cpp) keep building.
+#include <hip/hip_runtime.h>
+#if defined(__HIPCC__) || defined(__HIP_DEVICE_COMPILE__)
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
 
-// Provide nv_bfloat16 as an alias for source compatibility
+// ---- _chitu_hygon_platform_v2_alias_guard_ ----
+// These aliases reference __hip_bfloat16/__hip_bfloat162, which are only
+// declared by hip_bf16.h above. Keep them under the same device-only guard so
+// host TUs (g++ compiling binding.cpp) don't fail to resolve the target type.
 using nv_bfloat16 = __hip_bfloat16;
 using nv_bfloat162 = __hip_bfloat162;
 using nv_bfloat16_2 = __hip_bfloat162;
 using __nv_bfloat16 = __hip_bfloat16;
 using __nv_bfloat162 = __hip_bfloat162;
+#endif
 
 // Note: __float2bfloat16 and __bfloat162float are already defined in hip_bf16.h
 // They accept __hip_bfloat16 which matches our type alias
