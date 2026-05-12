@@ -14,7 +14,6 @@ import triton.language as tl
 
 from chitu.lazy import single_dispatch_lazy_tensor
 
-
 _FP8_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
 _FP8_MIN = -_FP8_MAX
 _FP8_EPS = 1e-12

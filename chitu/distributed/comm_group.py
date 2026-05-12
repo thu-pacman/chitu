@@ -12,7 +12,7 @@ import torch.distributed
 from logging import getLogger
 
 from chitu.distributed.custom_ar_chitu import create_chitu_custom_allreduce
-from chitu.distributed.tcp_ip import FreeTCPPortHolder, get_local_ip
+from chitu.distributed.tcp_ip import get_local_ip, reserve_free_port
 
 logger = getLogger(__name__)
 
@@ -426,23 +426,16 @@ class CommGroup:
                 "2) if all ranks are in a single server, all ranks use localhost as IP."
             ) from local_ip_fail_reason
 
-        # 为 TP, DP, PP 各分配一个空闲端口
-        try:
-            local_port_holder_tp = FreeTCPPortHolder()
-            local_port_holder_dp = FreeTCPPortHolder()
-            local_port_holder_pp = FreeTCPPortHolder()
-        except Exception as e:
-            raise RuntimeError(f"Cannot bind to free ports on {local_ip}.") from e
-
-        local_port_tp = local_port_holder_tp.pop()
+        # 为 TP, DP, PP 各保留一个空闲端口，直到对应 ZMQ ROUTER bind 前再释放。
+        local_port_tp = reserve_free_port()
         port_tp_list = [None] * self.group_size
         torch.distributed.all_gather_object(port_tp_list, local_port_tp, self.cpu_group)
 
-        local_port_dp = local_port_holder_dp.pop()
+        local_port_dp = reserve_free_port()
         port_dp_list = [None] * self.group_size
         torch.distributed.all_gather_object(port_dp_list, local_port_dp, self.cpu_group)
 
-        local_port_pp = local_port_holder_pp.pop()
+        local_port_pp = reserve_free_port()
         port_pp_list = [None] * self.group_size
         torch.distributed.all_gather_object(port_pp_list, local_port_pp, self.cpu_group)
 

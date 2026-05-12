@@ -2,7 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import json as _json
 import os
 import zmq
 import msgpack
@@ -47,6 +46,7 @@ from chitu.utils import (
 from chitu.moe.load_balancer import get_moe_load_planner  # added
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 from chitu.sampling.sampler import Sampler
+from chitu.distributed.tcp_ip import release_reserved_port
 
 logger = getLogger(__name__)
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -98,6 +98,43 @@ class TasksDispatcher(ABC):
     # ip_port_list 中的端口索引
     # (IP, TP_port, DP_port, PP_port) - 系统启动时动态分配的空闲端口
     PORT_INDEX = {"TP": 1, "DP": 2, "PP": 3}
+    supports_profile_payload = True
+    CONTROL_FRAME_TYPE_PROFILE = "profile"
+
+    def _build_control_frame(self) -> bytes:
+        from chitu.serve.common import get_pending_profile_payload
+
+        payload = get_pending_profile_payload()
+        if payload is None:
+            return b""
+        control = {
+            "type": self.CONTROL_FRAME_TYPE_PROFILE,
+            "payload": payload,
+        }
+        return msgpack.packb(control, use_bin_type=True)
+
+    def _append_control_frame(self, frames: list[bytes]) -> list[bytes]:
+        frames.append(self._build_control_frame())
+        return frames
+
+    def _consume_control_frame(self, frames: list[bytes]) -> bytes:
+        metadata_frame = frames[0]
+        if len(frames) <= 1:
+            return metadata_frame
+
+        control_frame = frames[-1]
+        if not control_frame:
+            return metadata_frame
+
+        control = msgpack.unpackb(control_frame, raw=False)
+        if (
+            isinstance(control, dict)
+            and control.get("type") == self.CONTROL_FRAME_TYPE_PROFILE
+        ):
+            from chitu.serve.common import receive_profile_payload
+
+            receive_profile_payload(control["payload"])
+        return metadata_frame
 
     def _is_same_node_with_rank(self, other_rank: int) -> bool:
         """判断当前 rank 与另一个 rank 是否在同一节点
@@ -174,6 +211,8 @@ class TasksDispatcher(ABC):
             self.socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
 
             self.socket.bind(ipc_url)
+            tcp_port = Backend.ip_port_list[main_rank][self.PORT_INDEX[group_name]]
+            release_reserved_port(tcp_port)
             self.socket.bind(tcp_url)
             logger.info(f"{group_name} ROUTER bind: {ipc_url} + {tcp_url}")
 
@@ -274,6 +313,8 @@ class PipeDispatcher(TasksDispatcher):
             self.send_url = ipc_url if use_ipc else tcp_url
 
             self.send_socket = self.ctx.socket(zmq.PUSH)
+            tcp_port = Backend.ip_port_list[self.rank][self.PORT_INDEX["PP"]]
+            release_reserved_port(tcp_port)
             self.send_socket.bind(self.send_url)
             logger.info(f"PP stage {self.rank} → {self.next_rank}: " f"{self.send_url}")
 
@@ -293,28 +334,27 @@ class PipeDispatcher(TasksDispatcher):
     def dispatch_metadata(
         self, tasks: Optional[PackedTasks | PackedTasksBase]
     ) -> tuple[SerializedPackedTasksPayloadType, PackedTasks | PackedTasksBase]:
-        # recv task from previous stage
         if self.is_first_stage:
             payload_type = tasks.payload_type
         else:
+            # Recv task from previous PP stage.
             msgs = self.recv_socket.recv_multipart()
+            tasks_msg = self._consume_control_frame(msgs)
             payload_type, tasks, slot_idx, extra_info = (
-                self.metadata_serializer.deserialize_metadata(msgs[0])
+                self.metadata_serializer.deserialize_metadata(tasks_msg)
             )
             slot_handle = get_slot_handle()
             if slot_handle and slot_idx is not None:
                 slot_handle.set_slot_idx(slot_idx)
 
-        # send task to next stage
+        # Send task to next PP stage.
         if not self.is_last_stage:
             slot_handle = get_slot_handle()
             slot_idx = slot_handle.get_slot_idx() if slot_handle else None
-            # auto select optimal serialize config
             tasks_msg = self.metadata_serializer.serialize_metadata(
                 tasks, slot_idx=slot_idx
             )
-            msgs = [tasks_msg]
-            self.send_socket.send_multipart(msgs)
+            self.send_socket.send_multipart(self._append_control_frame([tasks_msg]))
 
         return payload_type, tasks
 
@@ -422,20 +462,19 @@ class TensorDispatcher(TasksDispatcher):
                 tasks, config=None, slot_idx=slot_idx
             )
             for rank_in_group in range(1, self.group_size):
-                msgs = [
-                    f"{rank_in_group}".encode(),
-                    tasks_msg,
-                ]
+                msgs = self._append_control_frame(
+                    [f"{rank_in_group}".encode(), tasks_msg]
+                )
                 self.socket.send_multipart(msgs)
 
             return tasks.payload_type, tasks
 
         else:
-            # 非主 rank：接收消息
             msgs = self.socket.recv_multipart()
+            tasks_msg = self._consume_control_frame(msgs)
             payload_type, tasks, slot_idx, extra_info = (
                 self.metadata_serializer.deserialize_metadata(
-                    msgs[0],
+                    tasks_msg,
                 )
             )
             slot_handle = get_slot_handle()
@@ -491,18 +530,6 @@ class ExpertDataDispatcher(TasksDispatcher):
         # 初始化统一的 metadata serializer
         self.metadata_serializer = MetadataSerializer(mode="DP")
 
-    @staticmethod
-    def _get_pending_profile_payload():
-        from chitu.serve.common import get_and_clear_pending_profile_payload
-
-        return get_and_clear_pending_profile_payload()
-
-    @staticmethod
-    def _apply_profile_payload(payload):
-        from chitu.serve.common import apply_profile_command
-
-        apply_profile_command(payload)
-
     def dispatch_metadata(
         self, tasks: Optional[PackedTasks | PackedTasksBase]
     ) -> tuple[SerializedPackedTasksPayloadType, PackedTasks | PackedTasksBase]:
@@ -521,11 +548,6 @@ class ExpertDataDispatcher(TasksDispatcher):
                 # Special task type: broadcast remove / endtask to all ranks
                 current_task_type = TaskType.Special
                 task_ids_list = [tasks.task_ids] * self.group_size
-
-            profile_payload = self._get_pending_profile_payload()
-            profile_frame = (
-                _json.dumps(profile_payload).encode() if profile_payload else b""
-            )
 
             for rank_in_group in range(1, self.group_size):
                 target_is_pd_decode_rank = (
@@ -548,24 +570,19 @@ class ExpertDataDispatcher(TasksDispatcher):
                         else None
                     ),
                 )
-                msgs = [
-                    f"{rank_in_group}".encode(),
-                    tasks_msg,
-                ]
-                msgs.append(profile_frame)
+                msgs = self._append_control_frame(
+                    [f"{rank_in_group}".encode(), tasks_msg]
+                )
                 self.socket.send_multipart(msgs)
 
             return local_tasks.payload_type, local_tasks
         else:  # other dp ranks
             logger.debug(f"DP rank {self.rank_in_group} waiting for recv_metadata")
-            msgs = self.socket.recv_multipart()  # [tasks, (bootstrap), profile]
-
-            profile_frame = msgs.pop() if msgs else b""
-            if profile_frame:
-                self._apply_profile_payload(_json.loads(profile_frame))
+            msgs = self.socket.recv_multipart()
+            tasks_msg = self._consume_control_frame(msgs)
 
             payload_type, tasks, slot_idx, extra_info = (
-                self.metadata_serializer.deserialize_metadata(msgs[0])
+                self.metadata_serializer.deserialize_metadata(tasks_msg)
             )
             if extra_info.get("boot_ids", None) is not None:
                 logger.debug(f"DP rank {self.rank_in_group} received decode bootstrap")
@@ -751,7 +768,6 @@ class Executor:
         )
         self._step_timing_min_ms = float(os.getenv("CHITU_STEP_TIMING_MIN_MS", "0"))
         self._decode_first_step_logged: set[str] = set()
-        self.last_profile_task_type: Optional[TaskType] = None
 
         rank_filter = True
         if rank_filter and self.tp_size > 1:
@@ -1009,19 +1025,16 @@ class Executor:
     def step(
         self, tasks: Optional[PackedTasksBase]
     ) -> SerializedPackedTasksPayloadType:
-        self.last_profile_task_type = None
         # 1. propagate tasks and handle special payload type
         payload_type = tasks.payload_type if tasks is not None else None
 
         for dispatcher in self.task_dispatchers:
             payload_type, tasks = dispatcher.dispatch_metadata(tasks)
 
-        if (
-            tasks is not None
-            and tasks.task_type == TaskType.Prefill
-            or tasks.task_type == TaskType.Decode
-        ):
-            self.last_profile_task_type = tasks.task_type
+        if self.task_dispatchers:
+            from chitu.serve.common import clear_pending_profile_payload
+
+            clear_pending_profile_payload()
 
         # Payload Type: Terminated
         if payload_type == SerializedPackedTasksPayloadType.TerminateBackend:

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from logging import getLogger
 from typing import Callable
 
+
 import torch
 
 logger = getLogger(__name__)
@@ -233,14 +234,17 @@ class ProfilerTorch(ProfilerBase):
             return
         os.makedirs(self.output_dir, exist_ok=True)
         trace_path = _build_trace_path(self.output_dir, self.output_suffix)
-        try:
-            self._profiler.stop()
-            self._profiler.export_chrome_trace(trace_path)
-            logger.warning("Profiler trace saved: %s", trace_path)
-        finally:
-            self._profiler = None
-        if torch.distributed.is_initialized():
-            torch.distributed.barrier()
+        # Sync before stop so every launched kernel finishes and CUPTI
+        # records it; sync again after stop to let CUPTI's async flush
+        # drain its activity buffers before chrome trace export.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._profiler.stop()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._profiler.export_chrome_trace(trace_path)
+        logger.warning("Profiler trace saved: %s", trace_path)
+        self._profiler = None
 
     def step(self) -> None:
         if self._profiler is not None:
@@ -290,12 +294,15 @@ def _get_rank() -> int:
 
 
 def _build_trace_path(output_dir: str, suffix: str = "") -> str:
+    # PID is included so distinct PD scheduler processes that share the
+    # same node + rank id don't overwrite each other's trace.
     rank = _get_rank()
     hostname = socket.gethostname()
+    pid = os.getpid()
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     return os.path.join(
         output_dir,
-        f"{timestamp}.rank_{rank}.{hostname}{suffix}.pt.trace.json.gz",
+        f"{timestamp}.rank_{rank}.{hostname}.pid_{pid}{suffix}.pt.trace.json.gz",
     )
 
 
@@ -306,11 +313,12 @@ def _build_memory_snapshot_path(
 ) -> str:
     rank = _get_rank()
     hostname = socket.gethostname()
+    pid = os.getpid()
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     tag_part = f"-{tag}" if tag else ""
     return os.path.join(
         output_dir,
-        f"{timestamp}.rank_{rank}.{hostname}{suffix}{tag_part}"
+        f"{timestamp}.rank_{rank}.{hostname}.pid_{pid}{suffix}{tag_part}"
         f".memory_snapshot.pickle",
     )
 

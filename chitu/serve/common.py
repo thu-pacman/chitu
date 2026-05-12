@@ -35,6 +35,12 @@ logger = getLogger(__name__)
 min_batch_size = 1
 _profile_manager: Optional[ProfileManager] = None
 _profile_cmd_queue: queue.Queue = queue.Queue()
+_pending_profile_payload: Optional[dict] = None
+_pending_profile_applied = False
+
+
+def _put_to_profile_queue(payload: dict) -> None:
+    _profile_cmd_queue.put(payload)
 
 
 def set_min_batch_size(value: int):
@@ -111,16 +117,31 @@ def queue_profile_start(
         "activities": resolved_activities,
         "memory_max_entries": max(memory_max_entries, 1),
     }
-    _profile_cmd_queue.put(payload)
+    _put_to_profile_queue(payload)
     return output_dir
 
 
 def queue_profile_stop() -> None:
-    _profile_cmd_queue.put({"action": "stop"})
+    _put_to_profile_queue({"action": "stop"})
 
 
 def queue_mem_dump() -> None:
-    _profile_cmd_queue.put({"action": "dump_memory"})
+    _put_to_profile_queue({"action": "dump_memory"})
+
+
+def enqueue_profile_payload(payload: dict) -> None:
+    """Enqueue a pre-built profile command payload into the local queue.
+
+    Used by PD scheduler ZMQ handlers to forward commands received from the
+    Router into the inference loop's queue. The payload should already be in
+    the same shape as what queue_profile_start/queue_profile_stop/queue_mem_dump
+    produce (i.e. a dict with an "action" key).
+
+    The actual application happens later in the inference thread via
+    process_queue() draining the queue, preserving the
+    "torch.profiler runs on the inference thread" invariant.
+    """
+    _put_to_profile_queue(payload)
 
 
 # memory profiler
@@ -172,40 +193,21 @@ def _stop_local_profiler():
         mgr.stop()
 
 
-# ======================================================================
-# Profile command distribution across ranks.
-#
-# The API server thread and the inference loop thread live in the same
-# process.  Profile commands (start / stop / dump_memory) are passed
-# between them through queue.Queue
-#
-# In a multi-rank setup the inference loop on rank 0 picks up the
-# command from the queue and attaches it as ZMQ frame inside
-# ExpertDataDispatcher.dispatch_metadata().  Other ranks read that
-# frame and execute the same command.
-# ======================================================================
-
-_pending_profile_payload: Optional[dict] = None
-
-
-def _drain_profile_queue():
-    """Read all pending commands from the queue, keeping only the last one.
-
-    Called on rank 0 each iteration of the inference
-    loop.  If multiple commands were enqueued between two iterations,
-    only the newest one matters. Earlier ones are superseded.
-    """
-    global _pending_profile_payload
+def _drain_profile_queue() -> Optional[dict]:
+    """Pop all queued payloads and return only the newest one (or None)."""
+    drained: Optional[dict] = None
     while True:
         try:
-            _pending_profile_payload = _profile_cmd_queue.get_nowait()
+            drained = _profile_cmd_queue.get_nowait()
         except queue.Empty:
             break
+    return drained
 
 
 def _apply_profile_command(payload: dict):
-    """Execute a single profile command on the current rank."""
+    """Apply a profile command on the local inference thread."""
     action = payload.get("action")
+    logger.info("_apply_profile_command action=%s", action)
     if action == "start":
         activities = _resolve_activities(
             payload.get("activities"),
@@ -228,25 +230,55 @@ def _apply_profile_command(payload: dict):
         logger.warning("Ignoring unknown profiler action: %s", action)
 
 
-def get_and_clear_pending_profile_payload() -> Optional[dict]:
-    """Pop the buffered profile command so it can be sent to ranks via ZMQ.
+def _drain_profile_queue_to_pending() -> None:
+    global _pending_profile_payload, _pending_profile_applied
 
-    Called by ExpertDataDispatcher.dispatch_metadata() on rank 0.
-    Returns the payload dict if one is pending, otherwise None.
-    The buffer is cleared after this call. Each command is sent once.
-    """
-    global _pending_profile_payload
-    payload = _pending_profile_payload
+    payload = _drain_profile_queue()
+    if payload is not None:
+        _pending_profile_payload = payload
+        _pending_profile_applied = False
+
+
+def has_pending_profile_payload() -> bool:
+    return _pending_profile_payload is not None
+
+
+def get_pending_profile_payload() -> Optional[dict]:
+    return _pending_profile_payload
+
+
+def clear_pending_profile_payload() -> None:
+    global _pending_profile_payload, _pending_profile_applied
+
     _pending_profile_payload = None
-    return payload
+    _pending_profile_applied = False
 
 
-def apply_profile_command(payload: dict):
-    """Execute a profile command received from rank 0 via ZMQ.
+def apply_pending_profile_command(clear_after_apply: bool) -> None:
+    """Apply the newest queued profile command once on the inference thread."""
+    global _pending_profile_payload, _pending_profile_applied
 
-    Called by ExpertDataDispatcher on non-rank-0 workers after they
-    read the extra ZMQ frame attached by rank 0.
-    """
+    _drain_profile_queue_to_pending()
+    if _pending_profile_payload is None or _pending_profile_applied:
+        return
+
+    _apply_profile_command(_pending_profile_payload)
+    _pending_profile_applied = True
+    if clear_after_apply:
+        _pending_profile_payload = None
+        _pending_profile_applied = False
+
+
+def receive_profile_payload(payload: dict) -> None:
+    global _pending_profile_payload, _pending_profile_applied
+
+    if _pending_profile_payload != payload:
+        _pending_profile_payload = payload
+        _pending_profile_applied = False
+    apply_pending_profile_command(clear_after_apply=False)
+
+
+def apply_profile_command(payload: dict) -> None:
     _apply_profile_command(payload)
 
 
@@ -280,35 +312,40 @@ async def process_queue():
     )
 
     rank = torch.distributed.get_rank()
-    is_distributed = (
-        torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
-    )
-    global min_batch_size, _pending_profile_payload
+    global min_batch_size
     while True:
         if chitu_is_terminated():
             break
         if rank == 0:
-            _drain_profile_queue()
-            if _pending_profile_payload is not None:
-                _apply_profile_command(_pending_profile_payload)
-                if not is_distributed:
-                    _pending_profile_payload = None
+            can_forward_profile_payload = any(
+                getattr(dispatcher, "supports_profile_payload", False)
+                for dispatcher in Backend.executor.task_dispatchers
+            )
+            apply_pending_profile_command(
+                clear_after_apply=not can_forward_profile_payload
+            )
             if Backend.state == BackendState.Terminating and TaskPool.all_finished():
                 chitu_terminate()
                 break
 
+        has_profile_command = rank == 0 and (
+            not _profile_cmd_queue.empty() or has_pending_profile_payload()
+        )
         TaskPool.add_all_queued()
         if (
             rank != 0
             or Backend.state == BackendState.Terminating
             or (len(TaskPool.pool) >= min_batch_size)
             or (len(TaskPool.pool) == 0 and not TaskPool.all_finished())
+            or has_profile_command
         ):
             min_batch_size = 1
             status = chitu_run()
             if status != SerializedPackedTasksPayloadType.NoneType:
                 if _profile_manager is not None:
-                    step_profiler(task_type=get_last_step_task_type())
+                    task_type = get_last_step_task_type()
+                    if task_type is not None:
+                        step_profiler(task_type=task_type)
             if status == SerializedPackedTasksPayloadType.NoneType:
                 await asyncio.sleep(0.01)
         elif TaskCollector.has_batch_results():

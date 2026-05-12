@@ -31,13 +31,33 @@ class FreeTCPPortHolder:
     def __del__(self):
         self.sock.close()
 
+    @property
+    def port(self):
+        return self.sock.getsockname()[1]
+
     def pop(self):
         if not self.alive:
             raise RuntimeError("TCPPortHolder is already closed")
-        port = self.sock.getsockname()[1]
+        port = self.port
         self.sock.close()
         self.alive = False
         return port
+
+
+_reserved_tcp_port_holders: dict[int, FreeTCPPortHolder] = {}
+
+
+def reserve_free_port():
+    holder = FreeTCPPortHolder()
+    port = holder.port
+    _reserved_tcp_port_holders[port] = holder
+    return port
+
+
+def release_reserved_port(port: int):
+    holder = _reserved_tcp_port_holders.pop(port, None)
+    if holder is not None and holder.alive:
+        holder.pop()
 
 
 def get_free_port():

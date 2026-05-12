@@ -1164,7 +1164,12 @@ def chitu_run_main_rank():
             payload_type=SerializedPackedTasksPayloadType.Empty,
         )
     backend_payload_type = Backend.executor.step(tasks)
-    _last_step_task_type = Backend.executor.last_profile_task_type
+    _last_step_task_type = (
+        tasks.task_type
+        if tasks.payload_type != SerializedPackedTasksPayloadType.Empty
+        and tasks.task_type in (TaskType.Prefill, TaskType.Decode)
+        else None
+    )
 
     # 3. Update TaskPool
     task_ids = TaskCollector.get_update_task_ids()
@@ -1198,7 +1203,7 @@ def chitu_run():
         check_alloc_retries()
         if rank != 0:
             payload_type = Backend.executor.step(None)
-            _last_step_task_type = Backend.executor.last_profile_task_type
+            _last_step_task_type = None
             return payload_type
         return chitu_run_main_rank()
     except Exception as e:
