@@ -749,7 +749,10 @@ class FlashMLABackend(TritonAttnBackend):
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
+        topk_page_table: Optional[torch.Tensor] = None,
     ):
+        if topk_page_table is not None:
+            raise NotImplementedError()
         # handle the potential emtpy tensor
         if q_nope.numel() == 0:
             return torch.empty_like(q_nope)

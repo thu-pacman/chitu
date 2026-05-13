@@ -7,9 +7,8 @@ from typing import Optional
 import torch
 from typing_extensions import override
 
-from chitu.attn_backend.flash_mla_backend import FlashMLABackend
 from chitu.attn_backend.flash_attn_backend import FlashAttnBackend
-
+from chitu.attn_backend.flash_mla_backend import FlashMLABackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import PagedKVCacheAccessor
 from chitu.utils import try_import_opt_dep
@@ -32,7 +31,6 @@ class HopperMixedBackend(FlashMLABackend):
             not self.use_fp8_cache
         ), "HopperMixedBackend is only valid with bf16 MLA KV cache"
         assert has_flash_attn3, "HopperMixedBackend requires flash_attn_interface (FA3)"
-        # Make self compatible with FlashAttnBackend.mla_decode_paged_kv
         self._fa = flash_attn3
         self._use_fa3 = True
 
@@ -114,39 +112,33 @@ class HopperMixedBackend(FlashMLABackend):
                 topk_indices=topk_indices,
             )
 
-        kv_lora_rank = q_nope.shape[-1]
-
-        kv_lora_k_pe = self.update_paged_mla_kv(
-            kv_lora_rank,
+        paged_mla_cache = self.update_paged_mla_kv(
+            q_nope.shape[-1],
             kv,
             kv_cache,
             seq_len_delta,
         )
         assert (
-            kv_lora_k_pe.size(1) == 1
+            paged_mla_cache.size(1) == 1
         ), "HopperMixedBackend expects paged KV block dim 1"
 
         if softmax_scale is None:
             softmax_scale = 1.0 / ((q_pe.shape[-1] + self.qk_nope_head_dim) ** 0.5)
 
-        if topk_page_table is not None:
-            # Pre-built page table from caller — no argsort needed.
-            assert seq_len_delta.is_classic_decoding
-            sparse_page_table = topk_page_table
-            valid_counts = (topk_page_table != -1).sum(dim=-1).to(torch.int32)
-        else:
-            # Fallback: build page table from topk_indices.
+        if topk_page_table is None:
+            assert topk_indices is not None
             topk_indices = topk_indices.to(torch.int32)
             if topk_indices.size(-1) < self.index_topk:
                 topk_indices = self.pad_indices(topk_indices)
-
-            sparse_page_table, valid_counts = (
-                self._build_sparse_page_table_and_valid_counts(
-                    topk_indices=topk_indices,
-                    block_table=kv_cache.block_table,
-                    seq_len_delta=seq_len_delta,
-                )
+            page_table, valid_counts = self._build_sparse_page_table_and_valid_counts(
+                topk_indices=topk_indices,
+                block_table=kv_cache.block_table,
+                seq_len_delta=seq_len_delta,
             )
+        else:
+            assert seq_len_delta.is_classic_decoding
+            page_table = topk_page_table
+            valid_counts = (topk_page_table != -1).sum(dim=-1).to(torch.int32)
 
         return FlashAttnBackend._fa3_mla_decode_paged_kv_impl(
             self,
@@ -156,6 +148,6 @@ class HopperMixedBackend(FlashMLABackend):
             kv=None,
             seq_len_delta=seq_len_delta,
             softmax_scale=softmax_scale,
-            page_table_override=sparse_page_table,
+            page_table_override=page_table,
             cache_seqlens_override=valid_counts,
         )

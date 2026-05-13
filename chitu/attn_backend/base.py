@@ -53,6 +53,9 @@ class AttnBackend(abc.ABC):
     def prepare_metadata_for_prefill(self, *args, **kwargs):
         pass
 
+    def requires_sparse_decode_page_table(self) -> bool:
+        return False
+
     # SPDX-SnippetBegin
     # SPDX-License-Identifier: BSD-3-Clause
     # SPDX-SnippetCopyrightText: 2025 Dao-AILab
@@ -167,6 +170,7 @@ class AttnBackend(abc.ABC):
         causal: bool = False,
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
+        topk_page_table: Optional[torch.Tensor] = None,
     ):
         # If Q and K has the same layout on their columns, no matter what layout
         # they have, the result will be the same, because the operation between
@@ -197,6 +201,7 @@ class AttnBackend(abc.ABC):
                 seq_len_delta=seq_len_delta,
                 softmax_scale=softmax_scale,
                 topk_indices=topk_indices,
+                topk_page_table=topk_page_table,
             )
         else:
             return self.mla_prefill(
@@ -589,6 +594,7 @@ class AttnBackend(abc.ABC):
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
+        topk_page_table: Optional[torch.Tensor] = None,
     ):
         if isinstance(kv_cache, DenseKVCacheAccessor):
             # Call self.mla_decode_dense_kv here instead of directly calling
@@ -615,6 +621,7 @@ class AttnBackend(abc.ABC):
                 seq_len_delta=seq_len_delta,
                 softmax_scale=softmax_scale,
                 topk_indices=topk_indices,
+                topk_page_table=topk_page_table,
             )
         else:
             raise NotImplementedError()
@@ -946,7 +953,10 @@ class AttnBackend(abc.ABC):
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
+        topk_page_table: Optional[torch.Tensor] = None,
     ):
+        if topk_page_table is not None:
+            raise NotImplementedError()
         # If not overridden, fall back to a multi-query attention
         return self._mla_to_mqa(
             q_nope,

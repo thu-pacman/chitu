@@ -24,14 +24,12 @@ from chitu.attn_backend import (
     FlashInferBackend,
     FlashMLABackend,
     HopperMixedBackend,
+    HybridAttnBackend,
+    DLLMAttnBackend,
     NpuAttnBackend,
     RefAttnBackend,
     TritonAttnBackend,
-    NpuAttnBackend,
-    HybridAttnBackend,
-    DLLMAttnBackend,
 )
-
 from chitu.kv_cache.registry import should_use_hopper_mixed_backend
 from chitu.kv_cache import KVCacheManagerBase, PagedKVCache, KVCacheBase
 from chitu.custom_gguf import *

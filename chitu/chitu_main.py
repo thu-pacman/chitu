@@ -320,28 +320,6 @@ def _auto_set_num_blocks_after_warmup(args):
         int(safe_main_target),
     )
 
-    # Align indexer to the final safe main target
-    if indexer_cm is not None:
-        indexer_current = int(indexer_cm.num_blocks)
-        safe_indexer_target = estimate_indexer_blocks_from_main(
-            main_cm, indexer_cm, int(safe_main_target)
-        )
-        safe_indexer_target = clamp_int(
-            safe_indexer_target,
-            1,
-            indexer_cm.get_allocatable_max_num_blocks(),
-        )
-        safe_indexer_target = allreduce_min_int(int(safe_indexer_target))
-
-        if int(safe_indexer_target) != int(indexer_current):
-            indexer_cm.realloc(int(safe_indexer_target))
-            logger.info(
-                "indexer cache manager resized from %d to %d blocks for safe main target",
-                int(indexer_current),
-                int(safe_indexer_target),
-            )
-            cleanup_cuda_if_needed()
-
     # Final resize main
     main_current = int(main_cm.num_blocks)
     if int(safe_main_target) != int(main_current):
@@ -364,18 +342,22 @@ def _auto_set_num_blocks_after_warmup(args):
     get_global_args().infer.num_blocks = int(final_main_blocks)
 
     if Backend.cache_managers:
-        for dp_rank_managers in Backend.cache_managers:
-            main_mgr = dp_rank_managers.get("main")
-            if main_mgr is None:
-                continue
+        for dp_rank, dp_rank_managers in enumerate(Backend.cache_managers):
+            for name, cache in paged_caches.items():
+                manager = dp_rank_managers.get(name)
+                if manager is None:
+                    continue
 
-            mgr_current = int(main_mgr.num_blocks)
-            if int(final_main_blocks) != int(mgr_current):
-                main_mgr.realloc(int(final_main_blocks))
-                logger.info(
-                    "scheduler main cache manager synced to %d blocks after warmup",
-                    int(final_main_blocks),
-                )
+                final_blocks = int(cache.num_blocks)
+                mgr_current = int(manager.num_blocks)
+                if int(final_blocks) != int(mgr_current):
+                    manager.realloc(int(final_blocks))
+                    logger.info(
+                        "scheduler dp_rank=%d %s cache manager synced to %d blocks after warmup",
+                        dp_rank,
+                        name,
+                        int(final_blocks),
+                    )
 
     # finalize other non-main managers
     for name, cm in paged_caches.items():
@@ -383,7 +365,7 @@ def _auto_set_num_blocks_after_warmup(args):
             continue
 
         logger.info(
-            "%s cache manager keeps %d blocks after warmup",
+            "%s cache keeps %d blocks after warmup",
             name,
             int(cm.num_blocks),
         )

@@ -2,8 +2,15 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Any
+
 import torch
-from chitu.attn_backend import FlashInferBackend, TritonAttnBackend, NpuAttnBackend
+from chitu.attn_backend import (
+    FlashInferBackend,
+    HopperMixedBackend,
+    NpuAttnBackend,
+    TritonAttnBackend,
+)
 from chitu.kv_cache.registry import (
     KVCacheSpec,
     register_kv_cache_spec,
@@ -12,8 +19,21 @@ from chitu.kv_cache.registry import (
 from chitu.models.registry import ModelType
 
 
+def _deepseek_v3_paged_block_size(args, attn_backend_type, *, cache_name: str):
+    if getattr(args.infer, "mla_absorb", "none") == "none":
+        return None
+
+    if attn_backend_type is NpuAttnBackend:
+        return None
+
+    if attn_backend_type is HopperMixedBackend:
+        return 1 if cache_name == "main" else 64
+
+    return 64
+
+
 @register_kv_cache_spec(
-    predicate=lambda args, cache_name: (
+    predicate=lambda args, cache_name: bool(
         cache_name == "indexer"
         and _normalize_model_type(getattr(getattr(args, "models", args), "type", None))
         == ModelType.DEEPSEEK_V3
@@ -48,7 +68,10 @@ def deepseek_v3_indexer_cache_spec(args, attn_backend_type) -> KVCacheSpec:
                 "indexer_k": torch.float8_e4m3fn,
                 "indexer_ks": torch.float32,
             },
-        }
+        },
+        block_size=_deepseek_v3_paged_block_size(
+            args, attn_backend_type, cache_name="indexer"
+        ),
     )
 
 
@@ -66,11 +89,14 @@ def deepseek_v3_kv_cache_spec(args, attn_backend_type) -> KVCacheSpec:
 
     mla_absorb = getattr(args.infer, "mla_absorb", "none")
 
-    kvargs = {}
+    kvargs: dict[str, Any] = {}
 
     if mla_absorb in ["absorb", "absorb-without-precomp"]:
         use_separated = attn_backend_type in [FlashInferBackend, TritonAttnBackend] or (
             attn_backend_type is NpuAttnBackend and args.infer.cache_type == "paged"
+        )
+        block_size = _deepseek_v3_paged_block_size(
+            args, attn_backend_type, cache_name="main"
         )
 
         if use_separated:
@@ -90,7 +116,7 @@ def deepseek_v3_kv_cache_spec(args, attn_backend_type) -> KVCacheSpec:
                 }
             kv_keys = ["kv_lora_k_pe"]
 
-        return KVCacheSpec(kvargs=kvargs, kv_keys=kv_keys)
+        return KVCacheSpec(kvargs=kvargs, kv_keys=kv_keys, block_size=block_size)
 
     if mla_absorb == "none":
         assert (

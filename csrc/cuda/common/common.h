@@ -51,6 +51,12 @@ template <typename T> struct map_to_cuda_type {
     using type = T;
 };
 
+// ---- _chitu_hygon_common_device_only_guard_ ----
+// __half / nv_bfloat16 are only declared when compiling with hipcc/nvcc (see
+// platform.h). Host TUs (e.g. binding.cpp compiled with g++) transitively
+// include this header via torch extension wiring but never use these helpers —
+// hide them from the host parser.
+#if defined(__CUDACC__) || defined(__HIPCC__)
 // float16: map at::Half -> __half
 
 template <> struct map_to_cuda_type<at::Half> {
@@ -111,6 +117,7 @@ template <typename T> __device__ inline T add(const T a, const T b) {
         return a + b;
     }
 }
+#endif // _chitu_hygon_common_device_only_guard_
 
 #define DISPATCH_CASE_INTEGRAL_TYPES(...)                                      \
     AT_DISPATCH_CASE(at::ScalarType::Byte, __VA_ARGS__)                        \
