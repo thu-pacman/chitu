@@ -321,7 +321,7 @@ class Scheduler:
                 task, max_cached_token_len=cached_len
             )
 
-        task.hit_token_len = cached_len - task.consumed_req_tokens
+        task.inc_hit_tokens = cached_len - task.consumed_req_tokens
         task.consumed_req_tokens = cached_len
 
     def _prepare_decode_metadata(self, task) -> None:

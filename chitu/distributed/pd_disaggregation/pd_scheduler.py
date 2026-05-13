@@ -162,6 +162,9 @@ class PDScheduler(Scheduler):
         # Filter out PD-specific scheduler types before passing to parent
         filtered_scheduler_type = self._filter_scheduler_type(scheduler_type)
         args = get_global_args()
+        cache_managers = Backend.cache_managers
+        if cache_managers is None:
+            raise RuntimeError("Backend.cache_managers is not initialized")
         max_running_tasks = compute_local_batch_size_dist_in_dp(
             args.infer.max_batch_size, args.infer.dp_size
         )[0]
@@ -170,7 +173,7 @@ class PDScheduler(Scheduler):
             prefill_num_tasks,
             decode_num_tasks,
             filtered_scheduler_type,
-            Backend.cache_managers[0],
+            cache_managers[0],
             num_scheduler_groups=args.infer.pp_size,
             dp_rank=0,
             original_scheduler_type=scheduler_type,
@@ -195,7 +198,7 @@ class PDScheduler(Scheduler):
                         prefill_num_tasks=decode_num_tasks,
                         decode_num_tasks=decode_num_tasks,
                         scheduler_type=filtered_scheduler_type,
-                        cache_manager_dict=Backend.cache_managers[dp_rank],
+                        cache_manager_dict=cache_managers[dp_rank],
                         num_scheduler_groups=args.infer.pp_size,
                         dp_rank=dp_rank,
                         original_scheduler_type=scheduler_type,
@@ -1184,10 +1187,10 @@ class DecodeOnlyScheduler(PDScheduler):
                         )
                     )
 
-                task.hit_token_len = num_cached_tokens - task.consumed_req_tokens
+                task.inc_hit_tokens = num_cached_tokens - task.consumed_req_tokens
                 task.consumed_req_tokens = num_cached_tokens
-
                 task.consume_req_tokens()
+
                 assert (
                     task.task_type == TaskType.Decode
                 ), f"{task.task_type} vs {TaskType.Decode}"

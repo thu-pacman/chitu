@@ -1681,7 +1681,7 @@ def test_prepare_prefill_metadata_multi_cache_managers():
 
     assert len(task0.new_cache_ids["main"]) == 1
     assert len(task0.new_cache_ids["indexer"]) == 2
-    assert task0.hit_token_len == 0
+    assert task0.inc_hit_tokens == 0
     assert task0.consumed_req_tokens == 128
     assert main.tid_to_cached_len[task0.task_id] == 128
     assert indexer.tid_to_cached_len[task0.task_id] == 128
@@ -1700,7 +1700,7 @@ def test_prepare_prefill_metadata_multi_cache_managers():
 
     assert len(task1.new_cache_ids["main"]) == 1
     assert len(task1.new_cache_ids["indexer"]) == 2
-    assert task1.hit_token_len == 127
+    assert task1.inc_hit_tokens == 127
     assert task1.consumed_req_tokens == 127
     assert main.tid_to_cached_len[task1.task_id] == 128
     assert indexer.tid_to_cached_len[task1.task_id] == 128

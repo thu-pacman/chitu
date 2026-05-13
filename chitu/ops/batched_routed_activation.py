@@ -256,7 +256,6 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
         [2]: ExpertBlockPermutedBatchedRoutedActivation.token_comma_topk_to_block_x_item_indices.
         [3]: ExpertBlockPermutedBatchedRoutedActivation.block_to_expert_indices.
     """
-
     raise NotImplementedError
 
 

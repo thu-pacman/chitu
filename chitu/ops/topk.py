@@ -12,6 +12,40 @@ from chitu.ops.utils import make_op_dispatcher
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
 
+def topk_page_table_decode_cuda(
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    source_page_table: torch.Tensor,
+) -> torch.Tensor:
+    if logits.numel() == 0:
+        return torch.empty(
+            logits.shape[0], 2048, dtype=torch.int32, device=logits.device
+        )
+
+    assert has_chitu_backend
+    assert logits.dim() == 2
+    assert logits.shape[0] == lengths.shape[0]
+    assert logits.shape[0] == source_page_table.shape[0]
+    assert source_page_table.dtype == torch.int32
+
+    query_cu_seqlens = torch.arange(
+        logits.shape[0] + 1,
+        dtype=torch.int32,
+        device=logits.device,
+    )
+    page_table = torch.empty(
+        logits.shape[0], 2048, dtype=torch.int32, device=logits.device
+    )
+    chitu_backend.fast_topk_transform(
+        logits,
+        lengths,
+        page_table,
+        source_page_table,
+        query_cu_seqlens,
+    )
+    return page_table
+
+
 @make_op_dispatcher
 def topk_indices(
     logits: torch.Tensor,

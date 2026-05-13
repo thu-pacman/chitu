@@ -353,7 +353,10 @@ class FlashAttnBackend(AttnBackend):
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
+        topk_page_table: Optional[torch.Tensor] = None,
     ):
+        if topk_page_table is not None:
+            raise NotImplementedError()
         if not self._use_fa3:
             return super().mla_decode_paged_kv(
                 q_nope,

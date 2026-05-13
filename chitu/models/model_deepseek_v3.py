@@ -20,7 +20,6 @@ from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.kv_cache import (
     KVCacheBase,
     KVCacheAccessor,
-    DenseKVCacheAccessor,
     PagedKVCacheAccessor,
 )
 from chitu.global_vars import get_global_args
@@ -50,12 +49,9 @@ from chitu.ops import (
     to_fp4_e2m1_in_uint8,
     mla_prologue,
     blockfp8_act_quant,
-    blockfp8_index_score_ragged_q_paged_k_dsv32,
-    blockfp8_index_score_ragged_q_dense_k_dsv32,
-    append_to_paged_kv_cache,
-    append_to_dense_kv_cache,
     hadamard_transform,
     topk_indices,
+    topk_page_table_decode_cuda,
 )
 from chitu.dsa_indexer import DSAIndexer
 from chitu.quantization import (
@@ -141,18 +137,14 @@ class Indexer(torch.nn.Module):
         )
         self.softmax_scale = self.head_dim**-0.5
         self.block_size = 128
-        self.indexer_type = get_global_args().infer.indexer_type
         self.indexer_impl = indexer_impl
 
-    def forward(
+    def _build_index_qk(
         self,
         x: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
-        seq_len_delta: BatchedSeqLenDelta,
         freqs_cis: BatchedFreqsCis,
-        is_causal: bool,
-        cache_accessor: KVCacheAccessor,
     ):
         assert x.ndim == 2
         q = einops.rearrange(q, "s (h d) -> s h d", d=self.head_dim)
@@ -168,14 +160,26 @@ class Indexer(torch.nn.Module):
 
         q = self._rotate_activation(q)
         k = self._rotate_activation(k)
+        return blockfp8_act_quant(q, block_size=self.block_size), blockfp8_act_quant(
+            k, block_size=self.block_size
+        )
 
-        q_fp8, q_scale = blockfp8_act_quant(q, block_size=self.block_size)
-        k_fp8, k_scale = blockfp8_act_quant(k, block_size=self.block_size)
-
+    def _build_index_score(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        seq_len_delta: BatchedSeqLenDelta,
+        freqs_cis: BatchedFreqsCis,
+        is_causal: bool,
+        cache_accessor: KVCacheAccessor,
+    ) -> torch.Tensor:
+        q_pack, k_pack = self._build_index_qk(x, q, k, freqs_cis)
+        q_fp8, q_scale = q_pack
+        k_fp8, k_scale = k_pack
         weights = self.weights_proj(x) * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
-
-        indices = self.indexer_impl.dsa_indexer(
+        return self.indexer_impl.dsa_indexer(
             q_fp8,
             k_fp8,
             k_scale,
@@ -184,8 +188,42 @@ class Indexer(torch.nn.Module):
             cache_accessor,
             is_causal,
             self.index_topk,
+            return_indices=False,
         )
-        return indices
+
+    def build_decode_topk_page_table(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        seq_len_delta: BatchedSeqLenDelta,
+        freqs_cis: BatchedFreqsCis,
+        is_causal: bool,
+        cache_accessor: KVCacheAccessor,
+        source_page_table: torch.Tensor,
+    ) -> torch.Tensor:
+        index_score = self._build_index_score(
+            x, q, k, seq_len_delta, freqs_cis, is_causal, cache_accessor
+        )
+        lengths = seq_len_delta.delta_position_ids_tensor_device + 1
+        return topk_page_table_decode_cuda(index_score, lengths, source_page_table)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        seq_len_delta: BatchedSeqLenDelta,
+        freqs_cis: BatchedFreqsCis,
+        is_causal: bool,
+        cache_accessor: KVCacheAccessor,
+    ):
+        index_score = self._build_index_score(
+            x, q, k, seq_len_delta, freqs_cis, is_causal, cache_accessor
+        )
+        topk = min(self.index_topk, index_score.size(-1))
+        lengths = seq_len_delta.delta_position_ids_tensor_device + 1
+        return topk_indices(index_score, topk, lengths=lengths)
 
     def _rotate_activation(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dtype == torch.bfloat16
@@ -531,7 +569,6 @@ class AttentionDeepSeekV3(Attention):
                     smooth_scales=None,
                     impl="torch_npu",
                 )
-
             x = self.attn_backend.mla(
                 q_nope,
                 q_pe,
@@ -546,6 +583,7 @@ class AttentionDeepSeekV3(Attention):
 
         else:  # not self.can_use_mla_prologue_torch_npu:
             assert self.q_lora_rank > 0
+            indexer_k = None
             if self.merge_qkv:
                 if self.index_topk is None:
                     q_a_kv = self.wqkv_a(x)
@@ -575,6 +613,7 @@ class AttentionDeepSeekV3(Attention):
 
             qr = self.q_a_layernorm(q_a, compute_dtype=q_a.dtype)
 
+            indexer_q = None
             if self.merge_qkv and self.index_topk is not None:
                 q_indexer_q = self.wq_b_indexer_q_b(qr)
                 indexer_q, q = torch.split(
@@ -658,29 +697,50 @@ class AttentionDeepSeekV3(Attention):
                 # In-place update to `kv_lora`, which is part of `kv`
                 self.kv_a_layernorm(kv_lora, compute_dtype=kv.dtype, out=kv_lora)
 
+                main_cache_accessor = self.cache.get_accessor(self.layer_id, is_mtp)
+                topk_indices = None
+                topk_page_table = None
                 if self.index_topk is not None:
                     assert self.indexer_cache is not None
-                    topk_indices = self.indexer(
-                        x,
-                        indexer_q,
-                        indexer_k,
-                        seq_len_delta,
-                        freqs_cis,
-                        is_causal=True,
-                        cache_accessor=self.indexer_cache.get_accessor(self.layer_id),
+                    indexer_cache_accessor = self.indexer_cache.get_accessor(
+                        self.layer_id
                     )
-                else:
-                    topk_indices = None
+                    if (
+                        self.attn_backend.requires_sparse_decode_page_table()
+                        and seq_len_delta.is_classic_decoding
+                        and isinstance(main_cache_accessor, PagedKVCacheAccessor)
+                    ):
+                        topk_page_table = self.indexer.build_decode_topk_page_table(
+                            x,
+                            indexer_q,
+                            indexer_k,
+                            seq_len_delta,
+                            freqs_cis,
+                            is_causal=True,
+                            cache_accessor=indexer_cache_accessor,
+                            source_page_table=main_cache_accessor.block_table,
+                        )
+                    else:
+                        topk_indices = self.indexer(
+                            x,
+                            indexer_q,
+                            indexer_k,
+                            seq_len_delta,
+                            freqs_cis,
+                            is_causal=True,
+                            cache_accessor=indexer_cache_accessor,
+                        )
 
                 x = self.attn_backend.mla(
                     q_nope,
                     q_pe,
-                    self.cache.get_accessor(self.layer_id, is_mtp),
+                    main_cache_accessor,
                     kv,
                     seq_len_delta=seq_len_delta,
                     causal=True,
                     softmax_scale=self.softmax_scale,
                     topk_indices=topk_indices,
+                    topk_page_table=topk_page_table,
                 )
 
                 if self.mla_absorb == "absorb-without-precomp":

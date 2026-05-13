@@ -278,7 +278,10 @@ class TritonAttnBackend(RefAttnBackend):
         seq_len_delta: BatchedSeqLenDelta,
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
+        topk_page_table: Optional[torch.Tensor] = None,
     ):
+        if topk_page_table is not None:
+            raise NotImplementedError()
         if is_muxi() and topk_indices is None:
             # Fallback to MQA, which calls `decode_paged_kv_triton`. Experiments show it is faster than `mla_decode_paged_kv_triton`.
             return super().mla_decode_paged_kv(

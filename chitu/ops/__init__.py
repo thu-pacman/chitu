@@ -75,4 +75,4 @@ from chitu.ops.causal_conv import causal_conv1d_update, causal_conv1d_prefill
 from chitu.ops.norm_gate import rms_norm_gate
 from chitu.ops.fused_g import fused_g
 from chitu.ops.add_shared_experts import add_shared_experts
-from chitu.ops.topk import topk_indices
+from chitu.ops.topk import topk_indices, topk_page_table_decode_cuda
