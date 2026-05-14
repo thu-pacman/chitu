@@ -117,29 +117,20 @@ class PrometheusServerManager:
             f"Prometheus configuration file has been created: {self.config_file}"
         )
 
-    def start(self, timeout=60):
+    def start(self, timeout=60, max_retries=8):
         """
         Start Prometheus Server
         Args:
             timeout: 等待超时时间(秒)
+            max_retries: retry count after a failed start attempt
         Returns:
-            subprocess.Popen: Prometheus Server process
+            bool: whether Prometheus Server is ready
         """
         if not os.path.exists(self.config_file):
             raise FileNotFoundError(
                 f"Prometheus config file doesn't exist: {self.config_file}. "
             )
 
-        if not is_port_available(self.server_port):
-            port = get_free_port()
-            logger.warning(
-                f"Port[{self.server_port}] has been allocated, change Prometheus server port to {port}"
-            )
-            self.server_port = port
-            self.server_url = f"http://{self.server_addr}:{self.server_port}"
-            self.query_url = f"{self.server_url}/api/v1/query"
-
-        # 创建数据目录，清理可能的残留锁文件
         os.makedirs(self.data_dir, exist_ok=True)
         lock_file = os.path.join(self.data_dir, "lock")
         if os.path.exists(lock_file):
@@ -149,7 +140,26 @@ class PrometheusServerManager:
             except OSError as e:
                 logger.warning(f"Failed to remove stale TSDB lock file: {e}")
 
-        # 启动Prometheus server
+        for attempt in range(max_retries + 1):
+            if attempt > 0 or not is_port_available(self.server_port):
+                port = get_free_port()
+                logger.warning(
+                    f"Port[{self.server_port}] is unavailable, change Prometheus server port to {port}"
+                )
+                self.server_port = port
+                self.server_url = f"http://{self.server_addr}:{self.server_port}"
+                self.query_url = f"{self.server_url}/api/v1/query"
+
+            if self._start_once(timeout):
+                return True
+
+        logger.error(
+            f"Failed to start Prometheus server after {max_retries + 1} attempts"
+        )
+        return False
+
+    def _start_once(self, timeout=60):
+        """Start Prometheus once on self.server_port and wait until it is ready."""
         cmd = [
             "prometheus",
             f"--config.file={self.config_file}",
@@ -165,13 +175,21 @@ class PrometheusServerManager:
             logger.error(
                 f"Error occurred while starting Prometheus, please verify whether the Prometheus binary path is included in the current $PATH variable: {e}"
             )
-            return
+            return False
 
         start_time = time.time()
         health_url = f"{self.server_url}/-/ready"
 
         logger.info(f"Waiting Prometheus server ready ...")
         while time.time() - start_time < timeout:
+            if self.process and self.process.poll() is not None:
+                stderr = self.process.stderr.read() if self.process.stderr else ""
+                logger.error(
+                    f"Prometheus server process exited unexpectedly (exit_code={self.process.returncode}):\n{stderr}"
+                )
+                self.process = None
+                return False
+
             try:
                 response = requests.get(health_url, timeout=1)
                 if response.status_code == 200:
@@ -181,18 +199,27 @@ class PrometheusServerManager:
                     return True
             except requests.exceptions.RequestException:
                 pass
-
-            # 检查进程是否异常退出，立即终止等待
-            if self.process and self.process.poll() is not None:
-                stderr = self.process.stderr.read() if self.process.stderr else ""
-                logger.error(
-                    f"Prometheus server process exited unexpectedly (exit_code={self.process.returncode}):\n{stderr}"
-                )
-                self.process = None
-                return False
             time.sleep(0.5)
 
         logger.error(f"Start Prometheus server timeout")
+        self._stop_current_process()
+        return False
+
+    def _stop_current_process(self):
+        if not self.process:
+            return
+        try:
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+        except Exception as e:
+            logger.warning(f"Failed to stop Prometheus process: {e}")
+        finally:
+            self.process = None
 
     def is_running(self):
         """
@@ -203,11 +230,7 @@ class PrometheusServerManager:
         """
         if self.process and self.process.poll() is None:
             return True
-        try:
-            response = requests.get(f"{self.server_url}/-/ready", timeout=1)
-            return response.status_code == 200
-        except requests.exceptions.RequestException:
-            return False
+        return False
 
     def query_metric_rate_each_rank(
         self, metric_name: str, time_window: str = "10s"
