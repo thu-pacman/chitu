@@ -211,11 +211,22 @@ class CommGroup:
                 return True
         return False
 
+    def is_singleton(self) -> bool:
+        """
+        If every rank in this CommGroup only communicates with itself, return True
+        """
+        for lst in self.rank_lists:
+            if len(lst) > 1:
+                return False
+        return True
+
     def is_orthogonal_to(self, other) -> bool:
         """
         `CommGroup` A and B are orthogonal if and only if: ∀r, s ∈ ranks, r != s,
         not (A.communicates(r, s) and B.communicates(r, s))
         """
+        if self.is_singleton() or other.is_singleton():
+            return True
         for lst in self.rank_lists:
             for i, r in enumerate(lst[:-1]):
                 for s in lst[i + 1 :]:
@@ -235,6 +246,13 @@ class CommGroup:
         Two orthogonal `CommGroup` A and B's cartesian product C is defined as:
         C.communicates(r, s) if and only if ∃t: A.communicates(r, t) and B.communicates(t, s)
         """
+
+        if not force_no_dedup:
+            if self.is_singleton():
+                return other
+            if other.is_singleton():
+                return self
+
         if not self.is_orthogonal_to(other):
             raise ValueError(
                 "Cartesian product of non-orthogonal `CommGroup`s is undefined."
@@ -265,10 +283,7 @@ class CommGroup:
             group=self.gpu_group, device_ids=[torch.cuda.current_device()]
         )
 
-    def all_reduce(
-        self,
-        tensor: torch.Tensor,
-    ):
+    def all_reduce(self, tensor: torch.Tensor):
         ca_comm = self.get_custom_ar_manager
         use_custom = False
 

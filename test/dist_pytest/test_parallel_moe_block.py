@@ -101,8 +101,6 @@ def test_parallel_moe_block(
         }:
             pytest.skip(f"{token_dispatcher_impl} is only for DP+EP")
         if etp_size > 1 and token_dispatcher_impl in {
-            "deepep-nl",
-            "deepep-ll",
             "npu_all_to_all",
             "npu_distribute",
         }:
@@ -520,8 +518,6 @@ def test_parallel_moe_block_blockfp8(
     if ep_size > 1:
         if token_dispatcher_impl is None:
             pytest.skip("token_dispatcher_impl is required for EP")
-        if etp_size > 1 and token_dispatcher_impl in {"deepep-nl", "deepep-ll"}:
-            pytest.skip(f"{token_dispatcher_impl} does not support EP*ETP")
     else:
         if token_dispatcher_impl is not None:
             pytest.skip("token_dispatcher_impl is not available without EP")

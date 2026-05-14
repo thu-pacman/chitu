@@ -274,7 +274,11 @@ class MoEImplEP(MoEImplBase):
     def _init_token_dispatcher(self):
         # impl selection
         if self.prefill_token_dispatcher_impl == "auto":
-            if self.dp_size > 1 and self.etp_size == 1 and has_deep_ep:
+            if (
+                self.dp_size > 1
+                and (self.etp_size == 1 or self.etp_size == self.tp_size)
+                and has_deep_ep
+            ):
                 self.prefill_token_dispatcher_impl = "deepep-nl"
             elif self.dp_size > 1 and self.etp_size == 1 and has_torch_npu:
                 self.prefill_token_dispatcher_impl = "npu_all_to_all"
@@ -282,7 +286,11 @@ class MoEImplEP(MoEImplBase):
                 self.prefill_token_dispatcher_impl = "allgather"
 
         if self.decode_token_dispatcher_impl == "auto":
-            if self.dp_size > 1 and self.etp_size == 1 and has_deep_ep:
+            if (
+                self.dp_size > 1
+                and (self.etp_size == 1 or self.etp_size == self.tp_size)
+                and has_deep_ep
+            ):
                 self.decode_token_dispatcher_impl = "deepep-ll"
             elif (
                 self.dp_size > 1
