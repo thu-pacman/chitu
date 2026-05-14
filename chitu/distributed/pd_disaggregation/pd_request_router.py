@@ -445,6 +445,39 @@ class PDRequestRouter(RequestRouter):
                     raise
                 await asyncio.sleep(retry_s)
 
+    async def broadcast_profile(self, payload: dict) -> dict:
+        """Broadcast a profile command to schedulers."""
+        if not self.pd_enabled:
+            raise RuntimeError("broadcast_profile called outside PD mode")
+
+        control_msg = {"__chitu_msg_type": "profile", "payload": payload}
+        packed = msgpack.packb(control_msg)
+
+        prefill_targets = list(self.prefill_sockets.items())
+
+        sent = {"prefill": []}
+        errors: list[str] = []
+
+        async def _send_one(socket, label):
+            try:
+                await self._send_with_retry(socket, packed, label)
+                return True
+            except Exception as e:
+                errors.append(f"{label}: {e}")
+                logger.exception(f"broadcast_profile failed for {label}")
+                return False
+
+        for sid, socket in prefill_targets:
+            label = f"prefill:{sid}"
+            if await _send_one(socket, label):
+                sent["prefill"].append(sid)
+
+        return {
+            "action": payload.get("action"),
+            "sent_to": sent,
+            "errors": errors,
+        }
+
     async def _pd_coordination_task(self):
         """PD coordination task"""
         if not self.pd_coordination_service:

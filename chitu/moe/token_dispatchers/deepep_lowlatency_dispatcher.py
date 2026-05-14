@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from logging import getLogger
-from typing import Optional
+from typing import Optional, Sequence
 from typing_extensions import override
 import functools
 import os
@@ -56,9 +56,10 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         super().__init__(
             tp_group=tp_group, dp_group=dp_group, etp_group=etp_group, ep_group=ep_group
         )
+        self.ep_etp_group = self.ep_group.cartesian_product(self.etp_group)
         self.num_global_experts = num_experts
         os.environ["DEEPEP_DISABLE_LL_DISPATCH_OPT"] = (
-            "0" if self.ep_group.group_size % 8 == 0 else "1"
+            "0" if self.ep_etp_group.group_size % 8 == 0 else "1"
         )
         self._buffer = None
         self.hidden = hidden
@@ -97,7 +98,9 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             # TODO(zms): remove moe layer range hard coding
             for layer_id in self.moe_layer_id_list:
                 expert_stats = torch.zeros(
-                    (self.num_global_experts,), dtype=torch.int, device="cuda"
+                    (self.num_global_experts * self.etp_group.group_size,),
+                    dtype=torch.int,
+                    device="cuda",
                 )
                 self.ep_group.all_gather_into_tensor(
                     expert_stats, self.cumulative_local_expert_recv_stats[layer_id]
@@ -114,12 +117,12 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
     def prepare_deepep_buffer(self):
         DeepEPBuffer.set_dispatch_mode_as_low_latency()
         self._buffer = DeepEPBuffer.get_and_cache_deepep_buffer(
-            self.ep_group.gpu_group,
+            self.ep_etp_group.gpu_group,
             self.hidden,
             self.max_bs_per_dp_rank,
             2,
             self.mode,
-            self.num_global_experts,
+            self.num_global_experts * self.etp_group.group_size,
         )
 
     @override
@@ -187,12 +190,35 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             # FIXME: Add fp4 option to infer.raise_lower_bit_float_to and use it here
             dispatch_use_fp8 = True
 
-        topk_ids = x.token_to_expert_indices.to(torch.int64)
         ctx = nullcontext()
         if self.dispatch_stream is not None:
             self.dispatch_stream.wait_stream(torch.cuda.current_stream())
             ctx = torch.cuda.stream(self.dispatch_stream)
         with ctx:
+            # Here we may modify `topk_ids`. Please note that `dispatcher_ctx` must save
+            # the MODIFIED `topk_ids`.
+            topk_ids = x.token_to_expert_indices.to(torch.int64)
+            if self.tp_group.group_size > 1:
+                if self.etp_group.group_size == 1:
+                    if not self.tp_group.is_first_rank:
+                        # Don't dispatch from this rank. It's the same as TP rank 0.
+                        topk_ids = torch.full_like(topk_ids, -1)
+                elif self.etp_group.group_size == self.tp_group.group_size:
+                    # Although undocumented, DeepEP does not support non-contiguous ranks in EP
+                    # group, which means we can't put ETP groups inside EP groups. Therefore,
+                    # we have to use virtual expert IDs to mimick the ETP group here.
+                    topk_ids = (
+                        topk_ids
+                        // self.num_local_experts
+                        * (self.num_local_experts * self.etp_group.group_size)
+                        + self.etp_group.rank_in_group * self.num_local_experts
+                        + topk_ids % self.num_local_experts
+                    )
+                else:
+                    raise NotImplementedError(
+                        "Only TP=1, TP=ETP, (TP>1 and ETP=1) are supported in MoELowLatencyTokenDispatcher"
+                    )
+
             recv_activation, recv_expert_count, deepep_handle, event, hook = (
                 self.deepep_token_dispatch(
                     x.activation,
@@ -275,6 +301,21 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             handle,
             dp_local_bs,
         )
+
+        if self.tp_group.group_size > 1:
+            if self.etp_group.group_size == 1:
+                torch.distributed.broadcast(
+                    outputs,
+                    src=self.tp_group.rank_list[0],
+                    group=self.tp_group.gpu_group,
+                )
+            elif self.etp_group.group_size == self.tp_group.group_size:
+                self.etp_group.all_reduce(outputs)
+            else:
+                raise NotImplementedError(
+                    "Only TP=1, TP=ETP, (TP>1 and ETP=1) are supported in MoELowLatencyTokenDispatcher"
+                )
+
         return outputs
 
     # SPDX-SnippetBegin
@@ -293,10 +334,6 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
-        if self.tp_group.group_size > 1 and not self.tp_group.is_first_rank:
-            # Don't dispatch from this rank. It's the same as TP rank 0.
-            topk_idx = torch.full_like(topk_idx, -1)
-
         assert not (async_finish and return_recv_hook)
         # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
         # ---- _chitu_hygon_lowlatency_dispatch_marker_ ----
@@ -311,7 +348,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                     hidden_states,
                     topk_idx,
                     DeepEPBuffer._lowlatency_num_max_dispatch_tokens_per_rank,
-                    self.num_global_experts,
+                    self.num_global_experts * self.etp_group.group_size,
                     quant_type=(
                         2 if dispatch_use_fp8 else 0
                     ),  # fp8_e4m3 (UE8M0 not used here)
@@ -327,7 +364,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                     hidden_states,
                     topk_idx,
                     DeepEPBuffer._lowlatency_num_max_dispatch_tokens_per_rank,
-                    self.num_global_experts,
+                    self.num_global_experts * self.etp_group.group_size,
                     use_fp8=dispatch_use_fp8,
                     round_scale=round_scale_to_pow2,
                     use_ue8m0=False,  # Not using 8bit storage for now
@@ -379,24 +416,25 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             async_finish=async_finish,
             return_recv_hook=return_recv_hook,
         )
-        if self.tp_group.group_size == 1 or self.tp_group.is_first_rank:
+        if self.tp_group.group_size > 1 and self.etp_group.group_size == 1:
+            if self.tp_group.is_first_rank:
+                assert tuple(combined_hidden_states.shape) == (
+                    dp_local_bs,
+                    self.hidden,
+                ), f"combined_hidden_states.shape ({combined_hidden_states.shape}) should be ({dp_local_bs}, {self.hidden})"
+                assert combined_hidden_states.dtype == dtype
+                assert combined_hidden_states.device == device
+            else:
+                combined_hidden_states = torch.empty(
+                    (dp_local_bs, self.hidden), dtype=dtype, device=device
+                )
+        else:
             assert tuple(combined_hidden_states.shape) == (
                 dp_local_bs,
                 self.hidden,
             ), f"combined_hidden_states.shape ({combined_hidden_states.shape}) should be ({dp_local_bs}, {self.hidden})"
             assert combined_hidden_states.dtype == dtype
             assert combined_hidden_states.device == device
-        else:
-            combined_hidden_states = torch.empty(
-                (dp_local_bs, self.hidden), dtype=dtype, device=device
-            )
-
-        if self.tp_group.group_size > 1:
-            torch.distributed.broadcast(
-                combined_hidden_states,
-                src=self.tp_group.rank_list[0],
-                group=self.tp_group.gpu_group,
-            )
 
         # NOTES: the same behavior as described in the dispatch kernel
         return combined_hidden_states, event, hook

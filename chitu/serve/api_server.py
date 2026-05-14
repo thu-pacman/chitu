@@ -34,6 +34,8 @@ from chitu.serve.common import (
     queue_mem_dump,
     queue_profile_start,
     queue_profile_stop,
+    resolve_profile_output_dir,
+    _resolve_activities,
     build_chat_template_kwargs,
     parse_api_key_from_headers,
     get_priority_from_api_key,
@@ -121,6 +123,7 @@ class ProfileRequest(BaseModel):
     profile_by_stage: bool = False
     profile_memory: bool = False
     memory_max_entries: int = Field(default=100000, ge=1)
+    pd_stage: Optional[str] = None
 
 
 # ====== FastAPI Utils ======
@@ -290,24 +293,73 @@ async def health():
     pass  # TODO Check the inference service
 
 
+def _is_pd_router_process() -> bool:
+    """Detect whether this process is a PD-mode Router."""
+    args = get_global_args()
+    router_cfg = getattr(getattr(args, "dp_config", None), "router", None)
+    pd_cfg = getattr(router_cfg, "pd_disaggregation", None)
+    if pd_cfg is None or not getattr(pd_cfg, "enabled", False):
+        return False
+    return bool(getattr(router_cfg, "is_router", False))
+
+
+def _validate_pd_profile_request(request: "ProfileRequest") -> None:
+    if request.pd_stage not in (None, "prefill"):
+        raise HTTPException(
+            status_code=400,
+            detail='pd_stage must be omitted or set to "prefill".',
+        )
+
+
+def _build_profile_start_payload(request: "ProfileRequest") -> tuple[dict, str]:
+    """Build a {"action": "start", ...} payload identical in shape to what
+    queue_profile_start enqueues. Returned together with the resolved
+    output_dir for HTTP response feedback.
+    """
+    output_dir = resolve_profile_output_dir(request.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    activities = _resolve_activities(request.activities, request.profile_memory)
+    payload: dict = {
+        "action": "start",
+        "output_dir": output_dir,
+        "start_step": max(request.start_step, 0),
+        "num_steps": max(request.num_steps, 1),
+        "with_stack": bool(request.with_stack),
+        "profile_by_stage": bool(request.profile_by_stage),
+        "activities": activities,
+        "memory_max_entries": max(request.memory_max_entries, 1),
+    }
+    return payload, output_dir
+
+
 @app.post("/profile/start")
 async def start_profile(request: ProfileRequest):
     try:
-        output_dir = queue_profile_start(
-            output_dir=request.output_dir,
-            activities=request.activities,
-            start_step=request.start_step,
-            num_steps=request.num_steps,
-            with_stack=request.with_stack,
-            profile_by_stage=request.profile_by_stage,
-            profile_memory=request.profile_memory,
-            memory_max_entries=request.memory_max_entries,
-        )
+        if _is_pd_router_process():
+            _validate_pd_profile_request(request)
+            payload, output_dir = _build_profile_start_payload(request)
+            payload["profile_by_stage"] = True
+            router = get_request_router()
+            broadcast_result = await router.broadcast_profile(payload)
+        else:
+            output_dir = queue_profile_start(
+                output_dir=request.output_dir,
+                activities=request.activities,
+                start_step=request.start_step,
+                num_steps=request.num_steps,
+                with_stack=request.with_stack,
+                profile_by_stage=request.profile_by_stage,
+                profile_memory=request.profile_memory,
+                memory_max_entries=request.memory_max_entries,
+            )
+            broadcast_result = None
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Failed to queue profiler start request")
         raise HTTPException(status_code=500, detail=f"Failed to start profiler: {e}")
 
-    return {
+    response = {
         "message": "Profiler start queued",
         "output_dir": output_dir,
         "requested_output_dir": request.output_dir,
@@ -321,25 +373,55 @@ async def start_profile(request: ProfileRequest):
         "profile_by_stage": request.profile_by_stage,
         "memory_max_entries": request.memory_max_entries,
     }
+    if broadcast_result is not None:
+        response["pd_broadcast"] = broadcast_result
+    return response
 
 
 @app.post("/profile/stop")
 async def stop_profile():
     try:
-        queue_profile_stop()
+        if _is_pd_router_process():
+            payload = {"action": "stop"}
+            router = get_request_router()
+            broadcast_result = await router.broadcast_profile(payload)
+        else:
+            queue_profile_stop()
+            broadcast_result = None
     except Exception as e:
         logger.exception("Failed to queue profiler stop request")
         raise HTTPException(status_code=500, detail=f"Failed to stop profiler: {e}")
 
-    return {
+    response = {
         "message": "Profiler stop queued",
         "runtime_cwd": os.getcwd(),
     }
+    if broadcast_result is not None:
+        response["pd_broadcast"] = broadcast_result
+    return response
 
 
 @app.post("/profile/dump_memory")
 async def dump_memory():
     """Queue a dump_memory command for all ranks."""
+    if _is_pd_router_process():
+        # Router process does not run a model, so its local MemoryRecorder is
+        # never enabled. Skip the local check and broadcast unconditionally;
+        # each peer enforces its own recording precondition.
+        try:
+            payload = {"action": "dump_memory"}
+            router = get_request_router()
+            broadcast_result = await router.broadcast_profile(payload)
+        except Exception as e:
+            logger.exception("Failed to broadcast dump_memory")
+            raise HTTPException(
+                status_code=500, detail=f"Failed to broadcast dump_memory: {e}"
+            )
+        return {
+            "message": "dump_memory command broadcast to PD prefill peers",
+            "pd_broadcast": broadcast_result,
+        }
+
     rec = MemoryRecorder.get()
     if not rec.enabled and not rec.recording:
         raise HTTPException(

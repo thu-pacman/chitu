@@ -2,10 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
+from typing_extensions import override
 import functools
 
 import torch
-from typing_extensions import override
 
 from chitu.ops.quant import per_token_quant_fp8
 from chitu.quantization.registry import QuantizationRegistry
@@ -189,13 +190,19 @@ class Fp8PerChannelMoeExpertsMerged(QuantizedMoeExpertsMerged):
         )
 
     @override
-    def forward_ith_expert_gate_up(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_gate_up(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        assert x_scale is None
         return _fp8_per_channel_gemm(
             x, self.gate_up_proj_weight[i], self.gate_up_proj_weight_scale[i]
         )
 
     @override
-    def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_ith_expert_down(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        assert x_scale is None
         return _fp8_per_channel_gemm(
             x, self.down_proj_weight[i], self.down_proj_weight_scale[i]
         )

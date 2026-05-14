@@ -1504,7 +1504,7 @@ class DecodeOnlyScheduler(PDScheduler):
         completed prefill on the prefill node.  The base-class evict_task() resets
         the task back to TaskType.Prefill so it can be re-prefilled locally, but on
         a decode-only node there is no prefill engine — the task would sit forever as
-        a zombie Prefill task, causing can_prefill() to return True and forcing every
+        a zombie Prefill task, causing forcing every
         schedule() call to return [] across ALL DP ranks, deadlocking the service.
 
         Instead we free the KV cache and mark the task as stopped so that update()

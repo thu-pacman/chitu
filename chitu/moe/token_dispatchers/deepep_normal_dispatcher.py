@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from logging import getLogger
-from typing import Optional
+from typing import Optional, Sequence
 from typing_extensions import override
 import functools
 
@@ -49,6 +49,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         super().__init__(
             tp_group=tp_group, dp_group=dp_group, etp_group=etp_group, ep_group=ep_group
         )
+        self.ep_etp_group = self.ep_group.cartesian_product(self.etp_group)
         self.num_global_experts = num_experts
         self._buffer = None
         self.hidden = hidden
@@ -59,18 +60,19 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         # NOTES: this is a static variable, so it will be shared by all the instances of the class
         deep_ep.Buffer.set_num_sms(24)
         assert self.num_global_experts % self.ep_group.group_size == 0
+        self.num_local_experts = self.num_global_experts // self.ep_group.group_size
 
     @override
     def prepare(self, num_tokens):
         # NOTES: you may also replace `get_*_config` with your auto-tuned results via all the tests
 
         self._buffer = DeepEPBuffer.get_and_cache_deepep_buffer(
-            self.ep_group.gpu_group,
+            self.ep_etp_group.gpu_group,
             self.hidden,
             self.max_bs_per_dp_rank,
             2,
             self.mode,
-            self.num_global_experts,
+            self.num_global_experts * self.etp_group.group_size,
         )
         DeepEPBuffer.set_dispatch_mode_as_normal()
 
@@ -101,7 +103,6 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
     ) -> tuple[
         IndexedBatchedRoutedActivationWithPaddedPerExpertCnt, Optional[torch.Tensor]
     ]:
-
         dispatch_use_fp8 = False
         round_scale_to_pow2 = False
         if (
@@ -256,9 +257,26 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         async_finish: bool = False,
         previous_event: Optional["deep_ep.EventOverlap"] = None,
     ):
-        if self.tp_group.group_size > 1 and not self.tp_group.is_first_rank:
-            # Don't dispatch from this rank. It's the same as TP rank 0.
-            topk_idx = torch.full_like(topk_idx, -1)
+        if self.tp_group.group_size > 1:
+            if self.etp_group.group_size == 1:
+                if not self.tp_group.is_first_rank:
+                    # Don't dispatch from this rank. It's the same as TP rank 0.
+                    topk_idx = torch.full_like(topk_idx, -1)
+            elif self.etp_group.group_size == self.tp_group.group_size:
+                # Although undocumented, DeepEP does not support non-contiguous ranks in EP
+                # group, which means we can't put ETP groups inside EP groups. Therefore,
+                # we have to use virtual expert IDs to mimick the ETP group here.
+                topk_idx = (
+                    topk_idx
+                    // self.num_local_experts
+                    * (self.num_local_experts * self.etp_group.group_size)
+                    + self.etp_group.rank_in_group * self.num_local_experts
+                    + topk_idx % self.num_local_experts
+                )
+            else:
+                raise NotImplementedError(
+                    "Only TP=1, TP=ETP, (TP>1 and ETP=1) are supported in MoENormalTokenDispatcher"
+                )
 
         # NOTES: an optional `previous_event` means a CUDA event captured that you want to make it as a dependency
         # of the dispatch kernel, it may be useful with communication-computation overlap. For more information, please
@@ -272,7 +290,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             previous_event,
         ) = self._buffer.get_dispatch_layout(
             topk_idx,
-            self.num_global_experts,
+            self.num_global_experts * self.etp_group.group_size,
             previous_event=previous_event,
             async_finish=async_finish,
             allocate_on_comm_stream=previous_event is not None,
@@ -338,24 +356,39 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             previous_event=previous_event,
             allocate_on_comm_stream=previous_event is not None,
         )
-        if self.tp_group.group_size == 1 or self.tp_group.is_first_rank:
+        if self.tp_group.group_size > 1 and self.etp_group.group_size == 1:
+            if self.tp_group.is_first_rank:
+                assert tuple(combined_x.shape) == (
+                    dp_local_bs,
+                    self.hidden,
+                ), f"combined_x.shape ({combined_x.shape}) should be ({dp_local_bs}, {self.hidden})"
+                assert combined_x.dtype == dtype
+                assert combined_x.device == device
+            else:
+                combined_x = torch.empty(
+                    (dp_local_bs, self.hidden), dtype=dtype, device=device
+                )
+        else:
             assert tuple(combined_x.shape) == (
                 dp_local_bs,
                 self.hidden,
             ), f"combined_x.shape ({combined_x.shape}) should be ({dp_local_bs}, {self.hidden})"
             assert combined_x.dtype == dtype
             assert combined_x.device == device
-        else:
-            combined_x = torch.empty(
-                (dp_local_bs, self.hidden), dtype=dtype, device=device
-            )
 
         if self.tp_group.group_size > 1:
-            torch.distributed.broadcast(
-                combined_x,
-                src=self.tp_group.rank_list[0],
-                group=self.tp_group.gpu_group,
-            )
+            if self.etp_group.group_size == 1:
+                torch.distributed.broadcast(
+                    combined_x,
+                    src=self.tp_group.rank_list[0],
+                    group=self.tp_group.gpu_group,
+                )
+            elif self.etp_group.group_size == self.tp_group.group_size:
+                self.etp_group.all_reduce(combined_x)
+            else:
+                raise NotImplementedError(
+                    "Only TP=1, TP=ETP, (TP>1 and ETP=1) are supported in MoENormalTokenDispatcher"
+                )
 
         return combined_x, event
 

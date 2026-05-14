@@ -1100,45 +1100,53 @@ def _update_tasks_preferred_dp_rank():
 def chitu_run_main_rank():
     # 1. Schedule
     global _last_step_task_type
+    for scheduler in Backend.schedulers:
+        scheduler.prepare_for_schedule()
     if Backend.args.infer.dp_size == 1:
         assert len(Backend.schedulers) == 1
         task_ids = Backend.schedulers[0].schedule()
-        _last_step_task_type = (
-            TaskType.Prefill if Backend.schedulers[0].can_prefill() else TaskType.Decode
-        )
     else:
         _update_tasks_preferred_dp_rank()  # 按击中率和负载均衡路由
 
         # New prefill tasks are routed by DP preference assignment above.
         id_and_scheduler_list = list(enumerate(Backend.schedulers))
-
-        task_type = (
-            TaskType.Prefill
-            if any(scheduler.can_prefill() for scheduler in Backend.schedulers)
-            else TaskType.Decode
-        )
-        _last_step_task_type = task_type
-        task_ids_list = [None] * len(id_and_scheduler_list)
-        for i, scheduler in id_and_scheduler_list:
-            task_ids = scheduler.schedule(strict_allowed_task_type={task_type})
-            task_ids_list[i] = task_ids
-        if any((len(task_ids) > 0 for task_ids in task_ids_list)):
-            DPTaskCollector.prepare_dp_tasks(task_ids_list)
-            for task_ids in task_ids_list:
-                for task_id in task_ids:
-                    task = TaskPool.pool.get(task_id)
-                    if task is None:
-                        continue
-                    if getattr(task, "task_type", None) != TaskType.Decode:
-                        continue
-                    if getattr(task, "pd_sched_wait_end_logged", False):
-                        continue
-                    task.pd_sched_wait_end_logged = True
-                    req_id = getattr(getattr(task, "req", None), "request_id", task_id)
-                    logger.debug(f"[PD_STAGE][decode.sched_wait.end] req_id={req_id}")
-        else:
+        task_ids_list = [[]] * len(id_and_scheduler_list)
+        for task_type in (TaskType.Prefill, TaskType.Decode):
+            for i, scheduler in id_and_scheduler_list:
+                task_ids = scheduler.schedule(strict_allowed_task_type={task_type})
+                task_ids_list[i] = task_ids
+            if any((len(task_ids) > 0 for task_ids in task_ids_list)):
+                DPTaskCollector.prepare_dp_tasks(task_ids_list)
+                for task_ids in task_ids_list:
+                    for task_id in task_ids:
+                        task = TaskPool.pool.get(task_id)
+                        if task is None:
+                            continue
+                        if getattr(task, "task_type", None) != TaskType.Decode:
+                            continue
+                        if getattr(task, "pd_sched_wait_end_logged", False):
+                            continue
+                        task.pd_sched_wait_end_logged = True
+                        req_id = getattr(
+                            getattr(task, "req", None), "request_id", task_id
+                        )
+                        logger.debug(
+                            f"[PD_STAGE][decode.sched_wait.end] req_id={req_id}"
+                        )
+                break
+        if all(len(task_ids) == 0 for task_ids in task_ids_list):
             DPTaskCollector.prepare_dp_tasks([])
         task_ids = task_ids_list[0]
+    all_rank_task_ids = (
+        task_ids
+        if Backend.args.infer.dp_size == 1
+        else [task_id for task_ids in task_ids_list for task_id in task_ids]
+    )
+    _last_step_task_type = (
+        TaskType.Special
+        if len(all_rank_task_ids) == 0
+        else TaskPool.pool[all_rank_task_ids[0]].task_type
+    )
 
     # 2. Run
     if task_ids or DPTaskCollector.has_available_tasks():
@@ -1164,7 +1172,12 @@ def chitu_run_main_rank():
             payload_type=SerializedPackedTasksPayloadType.Empty,
         )
     backend_payload_type = Backend.executor.step(tasks)
-    _last_step_task_type = Backend.executor.last_profile_task_type
+    _last_step_task_type = (
+        tasks.task_type
+        if tasks.payload_type != SerializedPackedTasksPayloadType.Empty
+        and tasks.task_type in (TaskType.Prefill, TaskType.Decode)
+        else None
+    )
 
     # 3. Update TaskPool
     task_ids = TaskCollector.get_update_task_ids()
@@ -1198,7 +1211,7 @@ def chitu_run():
         check_alloc_retries()
         if rank != 0:
             payload_type = Backend.executor.step(None)
-            _last_step_task_type = Backend.executor.last_profile_task_type
+            _last_step_task_type = None
             return payload_type
         return chitu_run_main_rank()
     except Exception as e:

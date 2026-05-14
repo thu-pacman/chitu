@@ -164,6 +164,8 @@ def test_pd_dp_shard_round_robin():
         dp_rank=1,
     )
 
+    sched0.prepare_for_schedule()
+    sched1.prepare_for_schedule()
     batch0 = sched0.schedule(strict_allowed_task_type={TaskType.Decode})
     batch1 = sched1.schedule(strict_allowed_task_type={TaskType.Decode})
 

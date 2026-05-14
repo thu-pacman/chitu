@@ -330,11 +330,14 @@ class Scheduler:
                 task
             )
 
+    def prepare_for_schedule(self) -> None:
+        self.sgroup_list.switch_to_next_sgroup()
+
     def schedule(
         self,
         strict_allowed_task_type: set[TaskType] = {TaskType.Prefill, TaskType.Decode},
     ) -> list[str]:
-        sgroup_id = self.sgroup_list.switch_to_next_sgroup()
+        sgroup_id = self.sgroup_list.get_current_sgroup()
         if TaskPool.is_empty():
             logger.debug("TaskPool is empty, returning empty task list.")
             return []
@@ -476,76 +479,6 @@ class Scheduler:
                 f"p50_ms={_pct(50):.2f} p90_ms={_pct(90):.2f} "
                 f"p95_ms={_pct(95):.2f} p99_ms={_pct(99):.2f}"
             )
-
-    def can_prefill(self) -> bool:
-        """
-        NOTE: can_prefill=True does not mean this dp rank has prefill task.
-        The first dp rank with can_prefill=True must have prefill task.
-        """
-        n_running = sum(
-            1
-            for task_id in TaskPool.id_list
-            if TaskPool.pool[task_id].dp_rank == self.dp_rank
-        )
-        schedule_dp_rank = (self.dp_rank,)
-        if n_running < self.max_runing_tasks:
-            schedule_dp_rank += (None,)
-
-        task_ids = []
-        for task_id in TaskPool.id_list:
-            task = TaskPool.pool[task_id]
-            if (
-                task.task_type == TaskType.Prefill
-                and task.can_schedule()
-                and task.dp_rank in schedule_dp_rank
-            ):
-                task_ids.append(task_id)
-
-        if len(task_ids) == 0:
-            return False
-
-        task_ids.sort(
-            key=lambda x: self.scorer(TaskPool.pool[x]),
-            reverse=True,  # Largest first
-        )
-
-        # 判断该scheduler是否至少能调度出最高优先级的prefill任务
-        task = TaskPool.pool[task_ids[0]]
-        for _, cache_manager in self.cache_manager_dict.items():
-            cache_manager.ensure_task_token_blocks(task)
-
-        num_cached_tokens = self._num_prefill_cached_tokens(task)
-        num_uncomputed_tokens = task.prefix_tokens_len - num_cached_tokens
-        if num_uncomputed_tokens == 0:
-            return True
-
-        task_prefill_chunk_size = min(
-            (
-                self.prefill_chunk_size
-                if self.prefill_chunk_size
-                else num_uncomputed_tokens
-            ),
-            num_uncomputed_tokens,
-        )
-        task_origin_prefill_chunk_size = task.prefill_chunk_size
-        task.set_prefill_chunk_size_for_one_step(task_prefill_chunk_size)
-
-        if self._check_prefill_capacity(task, num_cached_tokens):
-            task.prefill_chunk_size = task_origin_prefill_chunk_size
-            return True
-
-        for _, cache_manager in self.cache_manager_dict.items():
-            if (
-                task.kv_cache_len_used_in_completed_steps_and_next_step
-                > cache_manager.num_blocks * cache_manager.block_size
-            ):
-                raise RuntimeError(
-                    "KV cache capacity is insufficient to support prefilling.\n"
-                    f"  - number of total blocks: {cache_manager.num_blocks}\n"
-                    f"  - Block size: {cache_manager.block_size}\n"
-                    f"However, {task.task_id} prefill prompts are too long: {task.prompt_len}"
-                )
-        return False
 
     def _schedule_prefill_tasks(self, task_ids: list[str]) -> list[str]:
         """Prefill tasks scheduling with congestion control
@@ -834,7 +767,7 @@ class SkewScheduler(Scheduler):
         self,
         strict_allowed_task_type: set[TaskType] = {TaskType.Prefill, TaskType.Decode},
     ) -> list[str]:
-        sgroup_id = self.sgroup_list.switch_to_next_sgroup()
+        sgroup_id = self.sgroup_list.get_current_sgroup()
         if TaskPool.is_empty():
             logger.debug("TaskPool is empty, returning empty task list.")
             return []
@@ -962,21 +895,6 @@ class SkewScheduler(Scheduler):
             if remaining_prefill_tokens <= 0:
                 break
         return i + 1
-
-    @override
-    def can_prefill(self):
-        sgroup_id = (
-            self.sgroup_list.get_current_sgroup() + 1
-        ) % self.num_scheduler_groups
-        task_ids = [
-            tid
-            for tid in TaskPool.id_list
-            if TaskPool.pool[tid].dp_rank in (self.dp_rank, None)
-            and TaskPool.pool[tid].sched_group_id in (sgroup_id, None)
-            and TaskPool.pool[tid].can_schedule()
-            and TaskPool.pool[tid].task_type == TaskType.Prefill
-        ]
-        return len(task_ids) > 0
 
     def find_prefill_task_start_pos_sgroup(self, sgroup):
         n = len(sgroup)

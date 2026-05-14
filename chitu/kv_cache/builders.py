@@ -125,15 +125,13 @@ def _resolve_default_num_blocks(
     if args.infer.prefill_chunk_size is None:
         return int(num_hot_req)
 
-    local_prefill_chunk_size = ceil_div(
-        args.infer.prefill_chunk_size,
-        args.infer.dp_size,
-    )
-
     # We run 1 prefill step + 1 decode step during warmup, each producing 1 token of output,
     # thus +2.
     return int(
-        ceil_div(local_prefill_chunk_size // num_hot_req + 2, block_size) * num_hot_req
+        ceil_div(
+            args.infer.prefill_chunk_size // args.infer.max_batch_size + 2, block_size
+        )
+        * num_hot_req
     )
 
 

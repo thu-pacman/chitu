@@ -42,8 +42,14 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
 from chitu.distributed.tcp_ip import get_port_from_zmq_socket
 from chitu.dp_token_sender import start_dp_token_manager
 from chitu.hooks import DPTokenSink, MooncakeKVTransferHook, NoopKVTransferHook
-from chitu.serve.common import start_worker
+from chitu.serve.common import (
+    enqueue_profile_payload,
+    start_worker,
+    step_profiler,
+)
 from chitu.serve.event_loop import get_server_event_loop
+from chitu.task import SerializedPackedTasksPayloadType
+from chitu.task_type import TaskType
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +158,8 @@ class PDSchedulerService:
         self.running = False
         self.request_task = None
         self.stats_task = None
+        self.ready_event: Optional[threading.Event] = None
+        self.external_compute_loop = False
 
         # Initialize scheduler
         self._init_scheduler()
@@ -311,7 +319,7 @@ class PDSchedulerService:
         # handler responsive and let the compute loop drive batched scheduling/execution.
         if not hasattr(self, "_compute_thread_started"):
             self._compute_thread_started = False
-        if not self._compute_thread_started:
+        if not self.external_compute_loop and not self._compute_thread_started:
             t = threading.Thread(target=start_worker, daemon=True)
             t.start()
             self._compute_thread_started = True
@@ -324,6 +332,8 @@ class PDSchedulerService:
         self.stats_task = asyncio.create_task(self._stats_reporter())
 
         logger.info("pd scheduler service started")
+        if self.ready_event is not None:
+            self.ready_event.set()
 
         # Keep service running
         await asyncio.gather(self.request_task, self.stats_task)
@@ -331,9 +341,15 @@ class PDSchedulerService:
     async def _worker_loop(self):
         """TP non-main rank worker loop: participate in collectives and model compute without ZMQ."""
         logger.info("starting tp worker loop (no ZMQ service)")
+
         while True:
             # Step with None to receive tasks via dispatchers' collectives
-            Backend.executor.step(None)
+            status = Backend.executor.step(None)
+            if (
+                self.pd_mode == PDSchedulerMode.PREFILL_ONLY
+                and status == SerializedPackedTasksPayloadType.Prefill
+            ):
+                step_profiler(task_type=TaskType.Prefill)
             await asyncio.sleep(0)  # avoid busy-waiting
 
     async def stop(self):
@@ -409,7 +425,15 @@ class PDSchedulerService:
                     request_bytes = await self.request_socket.recv()
                     request_data = msgpack.unpackb(request_bytes, raw=False)
 
-                    await self.scheduler.process_request(request_data)
+                    if (
+                        isinstance(request_data, dict)
+                        and request_data.get("__chitu_msg_type") == "profile"
+                        and "payload" in request_data
+                    ):
+                        # Keep torch.profiler start/stop on the inference thread.
+                        enqueue_profile_payload(request_data["payload"])
+                    else:
+                        await self.scheduler.process_request(request_data)
             except:
                 logger.exception("PDSchedulerService process request failed")
                 raise
@@ -467,7 +491,27 @@ def init_pd_scheduler(args, rank: int = 0):
     """Initialize PD scheduler (entry point)"""
     logger.info(f"initializing pd scheduler for rank {rank}")
 
-    asyncio.run(start_pd_scheduler_service(args, rank))
+    service = PDSchedulerService(args, rank)
+    if not service.is_tp_main_rank:
+        asyncio.run(_run_existing_service_async(service))
+        return
+
+    ready_event = threading.Event()
+    service.ready_event = ready_event
+    service.external_compute_loop = True
+
+    def _run_service():
+        asyncio.run(_run_existing_service_async(service))
+
+    threading.Thread(target=_run_service, daemon=True).start()
+    ready_event.wait()
+    start_worker()
+
+
+async def _run_existing_service_async(service: "PDSchedulerService") -> None:
+    loop = asyncio.get_running_loop()
+    event_loop_module._server_event_loop = loop
+    await service.start()
 
 
 async def start_pd_worker_service(args, rank: int = 0):
@@ -564,6 +608,7 @@ async def start_pd_worker_service(args, rank: int = 0):
     logger.info("PD Worker hooks initialized")
 
     logger.info("Entering PD Worker Loop")
+
     while True:
         with torch.inference_mode():
             if mode == "decode":
@@ -577,7 +622,9 @@ async def start_pd_worker_service(args, rank: int = 0):
                 ):
                     await asyncio.sleep(0)
                     continue
-            Backend.executor.step(None)
+            status = Backend.executor.step(None)
+            if mode == "prefill" and status == SerializedPackedTasksPayloadType.Prefill:
+                step_profiler(task_type=TaskType.Prefill)
         await asyncio.sleep(0)
 
 
