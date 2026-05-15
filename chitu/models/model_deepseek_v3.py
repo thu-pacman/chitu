@@ -52,6 +52,7 @@ from chitu.ops import (
     hadamard_transform,
     topk_indices,
     topk_page_table_decode_cuda,
+    a8_per_token_act_quant,
 )
 from chitu.dsa_indexer import DSAIndexer
 from chitu.quantization import (
@@ -532,7 +533,7 @@ class AttentionDeepSeekV3(Attention):
 
         if self.can_use_mla_prologue_torch_npu:
             if self.mla_prologue_int8_full:
-                x_int8, scale_w_x = torch_npu.npu_dynamic_quant(x.view(-1, x.shape[-1]))
+                x_int8, scale_w_x = a8_per_token_act_quant(x.view(-1, x.shape[-1]))
                 q_nope, q_pe, kv = mla_prologue(
                     x_int8,
                     self.q_a_proj.get_native_layout_weight(),

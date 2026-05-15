@@ -23,6 +23,7 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
     ConcatPermutedBatchedRoutedActivationMinimal,
 )
+from chitu.ops import a8_per_token_act_quant
 from chitu.ops.utils import make_op_dispatcher
 from chitu.lazy import eval_lazy
 
@@ -226,7 +227,7 @@ class AscendW8A8DynamicLinear(
         if x.shape[0] == 0:
             return torch.empty([0, self.out_features], dtype=x.dtype, device=x.device)
         output_dtype = x.dtype
-        quantized_x, dynamic_scale = torch_npu.npu_dynamic_quant(
+        quantized_x, dynamic_scale = a8_per_token_act_quant(
             x.view(-1, self.in_features)
         )
         output = torch_npu.npu_quant_matmul(

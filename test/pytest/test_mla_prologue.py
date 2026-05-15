@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.ops import mla_prologue
+from chitu.ops import mla_prologue, a8_per_token_act_quant
 from chitu.native_layout import NativeLayoutTensor, PermutedTensor, NpuFractalZnTensor
 from chitu.utils import try_import_and_setup_torch_npu
 from chitu.testing import assert_close
@@ -267,14 +267,14 @@ def test_mla_prologue_torch_npu_int8(
         impl="torch",
     )
 
-    x_int8, scale_w_x = torch_npu.npu_dynamic_quant(x.view(-1, x.shape[-1]))
-    q_a_proj_weight_int8, scale_w_q_a = torch_npu.npu_dynamic_quant(
+    x_int8, scale_w_x = a8_per_token_act_quant(x.view(-1, x.shape[-1]))
+    q_a_proj_weight_int8, scale_w_q_a = a8_per_token_act_quant(
         q_a_proj_weight.view(-1, q_a_proj_weight.shape[1])
     )
-    q_b_int8, scale_w_q_b = torch_npu.npu_dynamic_quant(
+    q_b_int8, scale_w_q_b = a8_per_token_act_quant(
         q_b_proj_weight.view(-1, q_b_proj_weight.shape[1])
     )
-    kv_a_proj_with_mqa_weight_int8, scale_w_kv_a = torch_npu.npu_dynamic_quant(
+    kv_a_proj_with_mqa_weight_int8, scale_w_kv_a = a8_per_token_act_quant(
         kv_a_proj_with_mqa_weight.view(-1, kv_a_proj_with_mqa_weight.shape[1])
     )
 
