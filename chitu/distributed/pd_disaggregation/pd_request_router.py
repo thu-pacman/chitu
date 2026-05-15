@@ -11,12 +11,19 @@ import asyncio
 import logging
 import os
 import time
+from collections import OrderedDict
 from typing import Optional
 
-import zmq
 import msgpack
+import zmq
 
-from chitu.dp_request_router import RequestRouter
+from chitu.distributed.pd_disaggregation.pd_scheduler import PDSchedulerMode
+from chitu.dp_request_router import (
+    LoadBalancer,
+    PrefixCacheAwarePolicy,
+    RequestRouter,
+    SchedulerStats,
+)
 from chitu.schemas.serve_config import RouterConfig as ServeRouterConfig
 from chitu.distributed.pd_disaggregation.pd_coordination import PDCoordinationService
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.transfer_engine import (
@@ -34,6 +41,28 @@ from chitu.metrics.prometheus_collector import (
 from chitu.task import UserRequest
 
 logger = logging.getLogger(__name__)
+
+
+def _policy_name(policy) -> str:
+    if isinstance(policy, PrefixCacheAwarePolicy):
+        return "prefix_cache_aware"
+    return type(policy).__name__
+
+
+def _policy_algorithm(policy) -> str:
+    if isinstance(policy, PrefixCacheAwarePolicy):
+        return "prefix_cache_aware"
+    return str(getattr(policy, "algorithm", "unknown"))
+
+
+def _policy_stats(policy, scheduler_id: int) -> str:
+    stats = getattr(policy, "scheduler_stats", {}).get(scheduler_id)
+    if stats is None:
+        return "stats=missing"
+    return (
+        f"alive={stats.is_alive} running={stats.running_requests} "
+        f"waiting={stats.waiting_requests} pending_tokens={stats.pending_tokens}"
+    )
 
 
 class PDRequestRouter(RequestRouter):
@@ -55,10 +84,6 @@ class PDRequestRouter(RequestRouter):
             self.pending_pd_requests: dict[str, PendingPDRequest] = {}
             self.prefill_schedulers: dict[int, dict] = {}  # scheduler_id -> info
             self.decode_schedulers: dict[int, dict] = {}  # scheduler_id -> info
-
-            # Load-balancing counters
-            self.prefill_round_robin = 0
-            self.decode_round_robin = 0
 
             # PD coordination service
             if hasattr(config.pd_disaggregation, "coordination_port"):
@@ -82,6 +107,70 @@ class PDRequestRouter(RequestRouter):
 
             # Bootstrap Server (Mooncake)
             self.bootstrap_server: Optional[MooncakeBootstrapServer] = None
+
+            # Keep P/D stats in separate policy instances so scheduler_id spaces can overlap.
+            routing_algorithm = getattr(self.config, "routing_algorithm", "")
+            if routing_algorithm == "prefix_cache_aware":
+                self.prefill_policy = PrefixCacheAwarePolicy(self.config)
+            elif routing_algorithm in ("round_robin", "power_of_two_choices"):
+                self.prefill_policy = LoadBalancer(self.config)
+                self.prefill_policy.algorithm = routing_algorithm
+            else:
+                raise ValueError(
+                    "pd_disaggregation routing_algorithm only supports "
+                    "round_robin, power_of_two_choices, or prefix_cache_aware "
+                    f"(got {routing_algorithm!r})"
+                )
+
+            decode_algorithm = getattr(
+                self.config, "routing_algorithm_for_decode", "power_of_two_choices"
+            )
+            if decode_algorithm not in ("round_robin", "power_of_two_choices"):
+                raise ValueError(
+                    "pd_disaggregation decode routing only supports "
+                    "round_robin or power_of_two_choices "
+                    f"(got {decode_algorithm!r})"
+                )
+            self.decode_policy = LoadBalancer(self.config)
+            self.decode_policy.algorithm = decode_algorithm
+            self.policy = self.prefill_policy
+            self._pd_stats_logged: set[tuple[str, int]] = set()
+            logger.info(
+                "[PD_ROUTER][policy_config] prefill_policy=%s prefill_algorithm=%s "
+                "decode_policy=%s decode_algorithm=%s",
+                _policy_name(self.prefill_policy),
+                _policy_algorithm(self.prefill_policy),
+                _policy_name(self.decode_policy),
+                _policy_algorithm(self.decode_policy),
+            )
+
+            now = time.time()
+            for scheduler_id in self.prefill_schedulers:
+                self.prefill_policy.update_stats(
+                    SchedulerStats(
+                        scheduler_id=scheduler_id,
+                        running_requests=0,
+                        waiting_requests=0,
+                        pending_tokens=0,
+                        throughput_tokens_per_sec=0.0,
+                        last_update_time=now,
+                        last_heartbeat_time=now,
+                        is_alive=True,
+                    )
+                )
+            for scheduler_id in self.decode_schedulers:
+                self.decode_policy.update_stats(
+                    SchedulerStats(
+                        scheduler_id=scheduler_id,
+                        running_requests=0,
+                        waiting_requests=0,
+                        pending_tokens=0,
+                        throughput_tokens_per_sec=0.0,
+                        last_update_time=now,
+                        last_heartbeat_time=now,
+                        is_alive=True,
+                    )
+                )
 
         else:
             logger.info("using traditional unified scheduler mode")
@@ -177,6 +266,8 @@ class PDRequestRouter(RequestRouter):
                 f"connected to prefill scheduler {scheduler_id}: {info['address']}"
             )
 
+        self._init_prefill_policy_shadow_caches()
+
         # Create sockets to Decode Schedulers
         for scheduler_id, info in self.decode_schedulers.items():
             socket = self.context.socket(zmq.PUSH)
@@ -193,6 +284,92 @@ class PDRequestRouter(RequestRouter):
             stats_address = f"tcp://*:{self.config.stats_port}"
             self.stats_socket.bind(stats_address)
             logger.info(f"listening for stats: {stats_address}")
+
+    def _init_prefill_policy_shadow_caches(self) -> None:
+        """Mirror RequestRouter._init_sockets prefix-cache bookkeeping for each prefill slot."""
+        if not getattr(self, "pd_enabled", False):
+            return
+        if hasattr(self.prefill_policy, "cached_blocks"):
+            for sid in self.prefill_schedulers:
+                self.prefill_policy.cached_blocks.setdefault(sid, OrderedDict())
+        if hasattr(self.prefill_policy, "evict_buffer"):
+            for sid in self.prefill_schedulers:
+                self.prefill_policy.evict_buffer.setdefault(sid, OrderedDict())
+
+    async def _stats_collector_task(self):
+        """PD mode: keep prefill/decode stats in separate policies."""
+        if self.pd_enabled:
+            await self._pd_stats_collector_task()
+        else:
+            await super()._stats_collector_task()
+
+    async def _pd_stats_collector_task(self):
+        while True:
+            try:
+                if self.stats_socket and await self.stats_socket.poll(timeout=100):
+                    data = await self.stats_socket.recv()
+                    stats_dict = msgpack.unpackb(data, raw=False)
+
+                    scheduler_type = stats_dict.get("scheduler_type") or stats_dict.get(
+                        "pd_mode"
+                    )
+                    scheduler_id = int(stats_dict.get("scheduler_id", -1))
+                    if scheduler_type == PDSchedulerMode.PREFILL_ONLY.value:
+                        if scheduler_id not in self.prefill_schedulers:
+                            continue
+                        policy = self.prefill_policy
+                        role = "prefill"
+                    elif scheduler_type == PDSchedulerMode.DECODE_ONLY.value:
+                        if scheduler_id not in self.decode_schedulers:
+                            continue
+                        policy = self.decode_policy
+                        role = "decode"
+                    else:
+                        continue
+
+                    stats = SchedulerStats(
+                        scheduler_id=scheduler_id,
+                        running_requests=stats_dict.get("running_requests", 0),
+                        waiting_requests=stats_dict.get("waiting_requests", 0),
+                        pending_tokens=stats_dict.get("pending_tokens", 0),
+                        throughput_tokens_per_sec=stats_dict.get(
+                            "throughput_tokens_per_sec", 0.0
+                        ),
+                        last_update_time=stats_dict.get(
+                            "last_update_time", time.time()
+                        ),
+                        last_heartbeat_time=time.time(),
+                        is_alive=stats_dict.get("heartbeat", False),
+                        num_blocks=stats_dict.get("num_blocks", None),
+                        block_size=stats_dict.get("block_size", None),
+                        evicted_blk_hashes=stats_dict.get("evicted_blk_hashes", []),
+                    )
+                    policy.update_stats(stats)
+                    stats_log_key = (role, scheduler_id)
+                    if stats_log_key not in self._pd_stats_logged:
+                        self._pd_stats_logged.add(stats_log_key)
+                        logger.info(
+                            "[PD_ROUTER][stats_connected] role=%s sid=%s policy=%s "
+                            "algorithm=%s alive=%s running=%s waiting=%s "
+                            "pending_tokens=%s block_size=%s num_blocks=%s",
+                            role,
+                            scheduler_id,
+                            _policy_name(policy),
+                            _policy_algorithm(policy),
+                            stats.is_alive,
+                            stats.running_requests,
+                            stats.waiting_requests,
+                            stats.pending_tokens,
+                            stats.block_size,
+                            stats.num_blocks,
+                        )
+
+            except KeyError as e:
+                logger.error(f"[PD_ROUTER] missing field in stats data: {e}")
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.error(f"[PD_ROUTER] stats collector error: {e}")
+                await asyncio.sleep(0.1)
 
     async def _start_bootstrap_server_if_needed(self):
         """Start Mooncake Bootstrap HTTP server on Router if configured"""
@@ -229,13 +406,26 @@ class PDRequestRouter(RequestRouter):
         logger.debug(f"[PD_STAGE][router.recv.start] req_id={request_id}")
 
         with observe_pd_stage("router", "recv"):
-            # Select Prefill and Decode Scheduler
-            prefill_scheduler_id = self._select_prefill_scheduler()
-            decode_scheduler_id = self._select_decode_scheduler()
-
-            if prefill_scheduler_id is None or decode_scheduler_id is None:
-                logger.error("no available prefill or decode scheduler")
+            try:
+                prefill_scheduler_id = self.prefill_policy.select_scheduler(request)
+                decode_scheduler_id = self.decode_policy.select_scheduler(request)
+            except Exception as e:
+                logger.warning(f"no available prefill or decode scheduler: {e}")
                 return
+            logger.info(
+                "[PD_ROUTER][route_select] req_id=%s prefill_policy=%s "
+                "prefill_algorithm=%s prefill_sid=%s prefill_stats=(%s) "
+                "decode_policy=%s decode_algorithm=%s decode_sid=%s decode_stats=(%s)",
+                request_id,
+                _policy_name(self.prefill_policy),
+                _policy_algorithm(self.prefill_policy),
+                prefill_scheduler_id,
+                _policy_stats(self.prefill_policy, prefill_scheduler_id),
+                _policy_name(self.decode_policy),
+                _policy_algorithm(self.decode_policy),
+                decode_scheduler_id,
+                _policy_stats(self.decode_policy, decode_scheduler_id),
+            )
 
             # PD trace: Router selected a P/D pair for this request.
             prompt_len = request.prompt_len
@@ -266,54 +456,14 @@ class PDRequestRouter(RequestRouter):
                 f"created pd request: {request_id} -> P{prefill_scheduler_id}-D{decode_scheduler_id}"
             )
 
+            self.prefill_policy.remember_request(request, prefill_scheduler_id)
+
             # Put request into processing queue
             self.pending_requests.append(pd_request)
 
         # Update router pending requests gauge
         chitu_router_pending_requests.set(len(self.pending_pd_requests))
         logger.debug(f"[PD_STAGE][router.recv.end] req_id={request_id}")
-
-    def _select_prefill_scheduler(self) -> Optional[int]:
-        """Select Prefill Scheduler"""
-        if not self.prefill_schedulers:
-            return None
-
-        # Simple round-robin algorithm
-        available_schedulers = [
-            sid
-            for sid, info in self.prefill_schedulers.items()
-            if info["status"] == "online"
-        ]
-
-        if not available_schedulers:
-            return None
-
-        scheduler_id = available_schedulers[
-            self.prefill_round_robin % len(available_schedulers)
-        ]
-        self.prefill_round_robin += 1
-        return scheduler_id
-
-    def _select_decode_scheduler(self) -> Optional[int]:
-        """Select Decode Scheduler"""
-        if not self.decode_schedulers:
-            return None
-
-        # Simple round-robin algorithm
-        available_schedulers = [
-            sid
-            for sid, info in self.decode_schedulers.items()
-            if info["status"] == "online"
-        ]
-
-        if not available_schedulers:
-            return None
-
-        scheduler_id = available_schedulers[
-            self.decode_round_robin % len(available_schedulers)
-        ]
-        self.decode_round_robin += 1
-        return scheduler_id
 
     async def _pd_request_processor_task(self):
         """PD request processing task"""
@@ -371,7 +521,8 @@ class PDRequestRouter(RequestRouter):
                 )
             except Exception as e:
                 logger.error(
-                    f"pd request dispatch failed: req_id={pd_request.request_id} err={e}"
+                    f"pd request dispatch failed: req_id={pd_request.request_id} "
+                    f"err_type={type(e).__name__} err={e}"
                 )
                 pd_request.status = PDRequestStatus.PENDING
                 self.pending_requests.appendleft(pd_request)
@@ -440,9 +591,11 @@ class PDRequestRouter(RequestRouter):
             try:
                 await socket.send(payload, flags=zmq.DONTWAIT)
                 return
-            except zmq.Again:
+            except zmq.Again as e:
                 if time.time() - start_time > timeout_s:
-                    raise
+                    raise RuntimeError(
+                        f"send to {label} timed out after {timeout_s:.1f}s: {e}"
+                    ) from e
                 await asyncio.sleep(retry_s)
 
     async def broadcast_profile(self, payload: dict) -> dict:

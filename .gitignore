@@ -102,3 +102,7 @@ log/*
 
 # macOS
 .DS_Store
+
+# skills
+.claude/*
+AGENTS.md

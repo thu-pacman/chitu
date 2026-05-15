@@ -120,15 +120,14 @@ def test_remember_req_and_insert_req_blocks_and_forget_req():
 
     req = MonkReq("req-test", [1, 2, 3, 4, 5, 6, 7, 8])
     router.policy.remember_request(req, scheduler_id=0)
-    assert req.request_id in router.policy.req_to_blocks
-    assert len(router.policy.req_to_blocks[req.request_id]) == 2
+    assert req.request_id in router.policy.req_to_request
     assert router.policy.req_to_scheduler[req.request_id] == 0
 
     router.policy.insert_req_blocks(req.request_id)
     assert len(router.policy.cached_blocks[0]) == 2
 
     router.policy.forget_request(req.request_id)
-    assert req.request_id not in router.policy.req_to_blocks
+    assert req.request_id not in router.policy.req_to_request
     assert req.request_id not in router.policy.req_to_scheduler
 
 

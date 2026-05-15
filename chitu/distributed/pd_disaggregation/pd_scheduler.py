@@ -69,6 +69,44 @@ def get_pd_scheduler_instance() -> Optional["PDScheduler"]:
     return _PD_SCHEDULER_INSTANCE
 
 
+def _collect_router_kv_cache_stats() -> dict[str, Any]:
+    """KV metadata and eviction hints for router prefix-cache policy.
+
+    Mirrors ``start_enhanced_scheduler_service`` stats collection in ``chitu_main`` so
+    ``PrefixCacheAwarePolicy`` receives ``block_size`` / ``num_blocks`` over PD stats.
+    """
+    out: dict[str, Any] = {}
+    num_blocks = 0
+    block_size: Optional[int] = None
+    evicted_blk_hashes: list[str] = []
+    try:
+        num_managers = len(Backend.cache_managers)
+        if num_managers <= 0:
+            return out
+        for cache_manager_dict in Backend.cache_managers:
+            main_cm = cache_manager_dict["main"]
+            if block_size is None:
+                block_size = int(main_cm.block_size)
+            assert block_size == main_cm.block_size, (
+                "The block size of all main cache managers in the same instance "
+                "should be the same."
+            )
+            num_blocks += int(main_cm.num_blocks)
+            if hasattr(main_cm, "pop_evicted_blk_hashes"):
+                pop = getattr(main_cm, "pop_evicted_blk_hashes")
+                evicted_blk_hashes.extend(pop(max_items=(512 // num_managers)))
+    except Exception:
+        return out
+
+    if num_blocks > 0:
+        out["num_blocks"] = num_blocks
+    if isinstance(block_size, int) and block_size > 0:
+        out["block_size"] = block_size
+    if evicted_blk_hashes:
+        out["evicted_blk_hashes"] = evicted_blk_hashes
+    return out
+
+
 class PDSchedulerMode(Enum):
     """PD Scheduler mode"""
 
@@ -775,6 +813,9 @@ class PDScheduler(Scheduler):
                 "ready_wait_avg_s": ready_wait_avg,
                 "ready_wait_max_s": ready_wait_max,
             }
+
+        if self.pd_mode == PDSchedulerMode.PREFILL_ONLY:
+            stats.update(_collect_router_kv_cache_stats())
 
         return stats
 
