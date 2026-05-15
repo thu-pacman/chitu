@@ -172,123 +172,103 @@ class MetricsMonitor:
         mtp_proposed_rate: dict[tuple[str, str], str] = None,
         mtp_accepted_rate: dict[tuple[str, str], str] = None,
     ):
-        all_metric_dict = [
+        stats_parts: dict[tuple[str, str], list[str]] = {}
+
+        def append_part(rank_dp: tuple[str, str], part: str):
+            stats_parts.setdefault(rank_dp, []).append(part)
+
+        for rank_dp, value in prompt_tps.items():
+            append_part(rank_dp, f"Avg prompt throughput: {float(value):.1f} tokens/s")
+
+        for rank_dp, value in gen_tps.items():
+            append_part(
+                rank_dp, f"Avg generation throughput: {float(value):.1f} tokens/s"
+            )
+
+        for rank_dp, value in eviction_rate.items():
+            append_part(rank_dp, f"Task evictions: {float(value):.2f}/s")
+
+        for rank_dp in total_prompt_tokens:
+            prompt_tokens = int(total_prompt_tokens[rank_dp])
+            hit_tokens = int(total_hit_tokens.get(rank_dp, "0"))
+            hit_rate = hit_tokens / prompt_tokens if prompt_tokens != 0 else 0
+            append_part(
+                rank_dp, f"Hit rate: {hit_rate*100:.1f}%({hit_tokens}/{prompt_tokens})"
+            )
+
+        if mtp_proposed_rate and mtp_accepted_rate:
+            for rank_dp, proposed_value in mtp_proposed_rate.items():
+                proposed = float(proposed_value)
+                if proposed <= 0:
+                    continue
+                accepted = float(mtp_accepted_rate.get(rank_dp, "0"))
+                append_part(rank_dp, f"MTP hit rate: {accepted/proposed*100:.1f}%")
+
+        task_metric_dicts = [
             prompt_tps,
             gen_tps,
             eviction_rate,
-            kvcache_usage,
-            used_blocks,
-            total_blocks,
-            cuda_total_bytes,
-            cuda_used_bytes,
-            torch_allocated_bytes,
-            torch_reserved_bytes,
             total_hit_tokens,
             total_prompt_tokens,
         ]
-        all_rank_dp_pairs = {
-            key for metric_dict in all_metric_dict for key in metric_dict
+        if mtp_proposed_rate:
+            task_metric_dicts.append(mtp_proposed_rate)
+        if mtp_accepted_rate:
+            task_metric_dicts.append(mtp_accepted_rate)
+        task_rank_dp_pairs = {
+            key for metric_dict in task_metric_dicts for key in metric_dict
         }
-        dp_ids = {int(rank_dp[1]) for rank_dp in all_rank_dp_pairs}
+        dp_ids = {int(rank_dp[1]) for rank_dp in task_rank_dp_pairs}
         dp_size = max(dp_ids) + 1 if dp_ids else 1
-        prealloc_blocks_by_dp = self._get_prealloc_blocks_by_dp(dp_size)
-        for rank_dp in all_rank_dp_pairs:
+        prealloc_blocks_by_dp = (
+            self._get_prealloc_blocks_by_dp(dp_size) if task_rank_dp_pairs else None
+        )
+
+        for rank_dp in sorted(task_rank_dp_pairs):
             dp_id = int(rank_dp[1])
-            rank = int(rank_dp[0])
             running, waiting = count_tasks(dp_id=dp_id)
-            prealloc_blocks = (
-                prealloc_blocks_by_dp.get(dp_id) if prealloc_blocks_by_dp else None
-            )
+            append_part(rank_dp, f"Running: {running} reqs")
+            append_part(rank_dp, f"Waiting: {waiting} reqs")
+            if prealloc_blocks_by_dp and dp_id in prealloc_blocks_by_dp:
+                append_part(
+                    rank_dp, f"KV blocks prealloc: {int(prealloc_blocks_by_dp[dp_id])}"
+                )
 
-            hit_tokens = int(total_hit_tokens.get(rank_dp, "0"))
-            prompt_tokens = int(total_prompt_tokens.get(rank_dp, "0"))
-            hit_rate = hit_tokens / prompt_tokens if prompt_tokens != 0 else 0
-
+        kvcache_rank_dp_pairs = (
+            set(kvcache_usage) | set(used_blocks) | set(total_blocks)
+        )
+        for rank_dp in sorted(kvcache_rank_dp_pairs):
             used_blocks_value = int(used_blocks.get(rank_dp, "0"))
             total_blocks_value = int(total_blocks.get(rank_dp, "0"))
             kv_cache_usage_value = float(kvcache_usage.get(rank_dp, "0"))
-
-            if (
-                used_blocks_value == 0
-                or total_blocks_value == 0
-                or kv_cache_usage_value == 0
-            ):
+            if total_blocks_value == 0 and rank_dp in task_rank_dp_pairs:
+                dp_id = int(rank_dp[1])
                 used_blocks_value, total_blocks_value, kv_cache_usage_value = (
                     paged_kvcache_stats(dp_id=dp_id)
                 )
-
-            mtp_hit_rate = None
-            if mtp_proposed_rate and mtp_accepted_rate:
-                proposed = float(mtp_proposed_rate.get(rank_dp, "0"))
-                accepted = float(mtp_accepted_rate.get(rank_dp, "0"))
-                if proposed > 0:
-                    mtp_hit_rate = accepted / proposed
-
-            log_msg = self._build_stats_message(
-                prompt_tps=float(prompt_tps.get(rank_dp, "0")),
-                gen_tps=float(gen_tps.get(rank_dp, "0")),
-                running=running,
-                waiting=waiting,
-                kv_cache_usage=kv_cache_usage_value,
-                eviction_rate=float(eviction_rate.get(rank_dp, "0")),
-                used_blocks=used_blocks_value,
-                total_blocks=total_blocks_value,
-                prealloc_blocks=prealloc_blocks,
-                cuda_total_bytes=float(cuda_total_bytes.get(rank_dp, "0")),
-                cuda_used_bytes=float(cuda_used_bytes.get(rank_dp, "0")),
-                torch_allocated_bytes=float(torch_allocated_bytes.get(rank_dp, "0")),
-                torch_reserved_bytes=float(torch_reserved_bytes.get(rank_dp, "0")),
-                hit_len=hit_tokens,
-                prompt_tokens=prompt_tokens,
-                hit_rate=hit_rate,
-                mtp_hit_rate=mtp_hit_rate,
-            )
-            logger.info(f"[rank{rank}, DP{dp_id}]: {log_msg}")
-
-    def _build_stats_message(
-        self,
-        prompt_tps,
-        gen_tps,
-        running,
-        waiting,
-        kv_cache_usage,
-        eviction_rate,
-        used_blocks,
-        total_blocks,
-        prealloc_blocks,
-        cuda_total_bytes,
-        cuda_used_bytes,
-        torch_allocated_bytes,
-        torch_reserved_bytes,
-        hit_len,
-        prompt_tokens,
-        hit_rate,
-        mtp_hit_rate=None,
-    ):
-        """Build metrics statistics message."""
-        parts = [
-            f"Avg prompt throughput: {prompt_tps:.1f} tokens/s",
-            f"Avg generation throughput: {gen_tps:.1f} tokens/s",
-            f"Running: {running} reqs",
-            f"Waiting: {waiting} reqs",
-            f"KV cache usage: {kv_cache_usage*100:.1f}%({used_blocks}/{total_blocks})",
-            f"Hit rate: {hit_rate*100:.1f}%({hit_len}/{prompt_tokens})",
-            f"Task evictions: {eviction_rate:.2f}/s",
-        ]
-        if mtp_hit_rate is not None:
-            parts.append(f"MTP hit rate: {mtp_hit_rate*100:.1f}%")
-        prealloc_msg = str(int(prealloc_blocks)) if prealloc_blocks is not None else "-"
-        parts.append(f"KV blocks prealloc: {prealloc_msg}")
-        if cuda_total_bytes > 0 and cuda_used_bytes >= 0:
-            used_gib = cuda_used_bytes / 1024**3
-            total_gib = cuda_total_bytes / 1024**3
-            if torch_allocated_bytes >= 0:
-                torch_allocated_gib = torch_allocated_bytes / 1024**3
-                torch_reserved_gib = torch_reserved_bytes / 1024**3
-                torch_unused_gib = torch_reserved_gib - torch_allocated_gib
-                non_torch_gib = (
-                    max(cuda_used_bytes - torch_reserved_bytes, 0.0) / 1024**3
+            if total_blocks_value > 0:
+                append_part(
+                    rank_dp,
+                    f"KV cache usage: {kv_cache_usage_value*100:.1f}%"
+                    f"({used_blocks_value}/{total_blocks_value})",
                 )
+
+        gpu_rank_dp_pairs = set(cuda_total_bytes) | set(cuda_used_bytes)
+        for rank_dp in sorted(gpu_rank_dp_pairs):
+            cuda_total = float(cuda_total_bytes.get(rank_dp, "0"))
+            cuda_used = float(cuda_used_bytes.get(rank_dp, "0"))
+            if cuda_total <= 0 or cuda_used < 0:
+                continue
+            parts = stats_parts.setdefault(rank_dp, [])
+            torch_allocated = float(torch_allocated_bytes.get(rank_dp, "-1"))
+            torch_reserved = float(torch_reserved_bytes.get(rank_dp, "-1"))
+            used_gib = cuda_used / 1024**3
+            total_gib = cuda_total / 1024**3
+            if torch_allocated >= 0 and torch_reserved >= 0:
+                torch_allocated_gib = torch_allocated / 1024**3
+                torch_reserved_gib = torch_reserved / 1024**3
+                torch_unused_gib = torch_reserved_gib - torch_allocated_gib
+                non_torch_gib = max(cuda_used - torch_reserved, 0.0) / 1024**3
                 parts.append(
                     "GPU mem: "
                     f"{used_gib:.2f}/{total_gib:.2f} GiB "
@@ -297,7 +277,11 @@ class MetricsMonitor:
                 )
             else:
                 parts.append(f"GPU mem: {used_gib:.2f}/{total_gib:.2f} GiB")
-        return ", ".join(parts)
+
+        for rank_dp in sorted(stats_parts):
+            rank = int(rank_dp[0])
+            dp_id = int(rank_dp[1])
+            logger.info(f"[rank{rank}, DP{dp_id}]: {', '.join(stats_parts[rank_dp])}")
 
     def _get_prealloc_blocks_by_dp(self, dp_size: int) -> Optional[dict[int, int]]:
         """Get prealloc KV blocks per DP rank from PD scheduler."""

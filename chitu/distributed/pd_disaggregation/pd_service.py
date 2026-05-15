@@ -54,6 +54,29 @@ from chitu.task_type import TaskType
 logger = logging.getLogger(__name__)
 
 
+def _determine_pd_scheduler_id(args, pd_mode: PDSchedulerMode, rank: int) -> int:
+    """Return the scheduler id used by PDRequestRouter for this role."""
+    scheduler_base_port = int(getattr(args.dp_config, "scheduler_base_port", -1))
+    if pd_mode == PDSchedulerMode.PREFILL_ONLY:
+        schedulers = getattr(args.dp_config.router, "prefill_schedulers", [])
+    elif pd_mode == PDSchedulerMode.DECODE_ONLY:
+        schedulers = getattr(args.dp_config.router, "decode_schedulers", [])
+    else:
+        schedulers = []
+
+    for scheduler_id, scheduler_config in enumerate(schedulers or []):
+        if int(getattr(scheduler_config, "port", -1)) == scheduler_base_port:
+            return scheduler_id
+
+    # Backward-compatible fallback for configs that do not pass scheduler lists to workers.
+    dp_id = int(getattr(args.dp_config, "dp_id", rank))
+    if pd_mode == PDSchedulerMode.DECODE_ONLY:
+        prefill_schedulers = getattr(args.dp_config.router, "prefill_schedulers", [])
+        prefill_count = len(prefill_schedulers or [])
+        return dp_id - prefill_count if prefill_count > 0 else dp_id
+    return dp_id
+
+
 def start_decode_prepare_listener_thread(
     *,
     kv_manager: KVManager,
@@ -146,6 +169,7 @@ class PDSchedulerService:
         self.rank = rank
         self.scheduler: Optional[PDScheduler] = None
         self.pd_mode = self._determine_pd_mode()
+        self.scheduler_id = self._determine_scheduler_id()
         # Only TP main rank should expose ZMQ service
         self.is_tp_main_rank = self._determine_tp_main_rank()
 
@@ -158,6 +182,7 @@ class PDSchedulerService:
         self.running = False
         self.request_task = None
         self.stats_task = None
+        self._stats_identity_logged = False
         self.ready_event: Optional[threading.Event] = None
         self.external_compute_loop = False
 
@@ -202,6 +227,10 @@ class PDSchedulerService:
                 # Other instances default to unified mode
                 return PDSchedulerMode.UNIFIED
 
+    def _determine_scheduler_id(self) -> int:
+        """Return the Router-facing scheduler id for this PD role."""
+        return _determine_pd_scheduler_id(self.args, self.pd_mode, self.rank)
+
     def _determine_tp_main_rank(self) -> bool:
         """Return True if current rank is TP main rank or TP is not initialized."""
         tp_group = get_tp_group()
@@ -216,13 +245,13 @@ class PDSchedulerService:
             self.scheduler = PrefillOnlyScheduler(
                 prefill_num_tasks=max_batch_size,
                 scheduler_type=scheduler_type,
-                scheduler_id=self.rank,
+                scheduler_id=self.scheduler_id,
             )
         elif self.pd_mode == PDSchedulerMode.DECODE_ONLY:
             self.scheduler = DecodeOnlyScheduler(
                 decode_num_tasks=max_batch_size,
                 scheduler_type=scheduler_type,
-                scheduler_id=self.rank,
+                scheduler_id=self.scheduler_id,
             )
         else:
             # Unified mode - use regular scheduler but wrapped in PDScheduler
@@ -231,7 +260,7 @@ class PDSchedulerService:
                 decode_num_tasks=max_batch_size,
                 scheduler_type=scheduler_type,
                 pd_mode=PDSchedulerMode.UNIFIED,
-                scheduler_id=self.rank,
+                scheduler_id=self.scheduler_id,
             )
 
         set_pd_scheduler_instance(self.scheduler)
@@ -278,7 +307,9 @@ class PDSchedulerService:
                 "localhost" if router_host in ["0.0.0.0", "::", ""] else router_host
             )
             router_address = f"tcp://{connect_host}:{router_token_port}"
-            token_manager = await start_dp_token_manager(self.rank, router_address)
+            token_manager = await start_dp_token_manager(
+                self.scheduler.scheduler_id, router_address
+            )
             self.scheduler.set_token_manager(token_manager)
             # Inject hooks into executor
             kv_hook = MooncakeKVTransferHook(self.scheduler.kv_manager, "decode")
@@ -444,6 +475,21 @@ class PDSchedulerService:
 
         while self.running:
             stats = self._collect_stats()
+            if not self._stats_identity_logged:
+                self._stats_identity_logged = True
+                logger.info(
+                    "[PD_STATS_IDENTITY] mode=%s torch_rank=%s dp_config.dp_id=%s "
+                    "scheduler_base_port=%s "
+                    "scheduler.scheduler_id=%s stats.scheduler_id=%s "
+                    "is_tp_main_rank=%s",
+                    self.pd_mode.value,
+                    self.rank,
+                    getattr(self.args.dp_config, "dp_id", None),
+                    getattr(self.args.dp_config, "scheduler_base_port", None),
+                    getattr(self.scheduler, "scheduler_id", None),
+                    stats.get("scheduler_id"),
+                    self.is_tp_main_rank,
+                )
 
             # Send stats to router
             stats_bytes = msgpack.packb(stats)
@@ -457,7 +503,7 @@ class PDSchedulerService:
         last_update_ts = get_server_event_loop().time()
 
         stats = {
-            "scheduler_id": self.rank,
+            "scheduler_id": self.scheduler.scheduler_id,
             "scheduler_type": self.pd_mode.value,
             # 目前仅透传 scheduler.get_pd_stats()，以下字段暂不统计，固定为 0。
             "running_requests": 0,
@@ -595,8 +641,8 @@ async def start_pd_worker_service(args, rank: int = 0):
         pp_group = get_pp_group()
         should_start_listener = tp_group.is_first_rank and pp_group.is_first_rank
         dp_rank = dp_group.rank_in_group
-        decode_scheduler_id = (
-            0  # single decode scheduler instance in current deployment
+        decode_scheduler_id = _determine_pd_scheduler_id(
+            args, PDSchedulerMode.DECODE_ONLY, rank
         )
 
         if should_start_listener:

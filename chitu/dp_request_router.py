@@ -190,8 +190,10 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         self.instances_num_total_blocks: dict[int, int] = {}
         self.instances_block_size: dict[int, int] = {}
 
-        # Used by inserting request blocks when first token arrived
-        self.req_to_blocks: dict[str, list[BlockIdentity]] = {}
+        # Remember routed requests until first token; blocks are built lazily in
+        # ``insert_req_blocks`` so shadow-cache insert sees ``block_size`` from stats
+        # even when routing happened before the first prefill stats heartbeat.
+        self.req_to_request: dict[str, UserRequest] = {}
         self.req_to_scheduler: dict[str, int] = {}
 
         # Router evicted block buffer temporarily holds cache blocks evicted from the router's cached_blocks.
@@ -289,19 +291,19 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         return best_scheduler
 
     def remember_request(self, request: UserRequest, scheduler_id: int) -> None:
-        req_blocks = self.build_req_token_blocks(request, scheduler_id)
         self.req_to_scheduler[request.request_id] = scheduler_id
-        self.req_to_blocks[request.request_id] = req_blocks
+        self.req_to_request[request.request_id] = request
 
     def insert_req_blocks(self, request_id: str) -> None:
         # Insert request blocks into cached_blocks when the first token arrived.
         scheduler_id = self.req_to_scheduler.get(request_id)
-        req_blocks = self.req_to_blocks.get(request_id)
-        if scheduler_id is None or req_blocks is None:
+        request = self.req_to_request.get(request_id)
+        if scheduler_id is None or request is None:
             logger.error(
                 f"[REQUEST_ROUTER] skip insert_req_blocks for unknown request_id={request_id}"
             )
             return
+        req_blocks = self.build_req_token_blocks(request, scheduler_id)
         lru = self.cached_blocks.setdefault(scheduler_id, OrderedDict())
         cap = self.instances_num_total_blocks.get(scheduler_id, 0)
         if cap <= 0:
@@ -323,7 +325,7 @@ class PrefixCacheAwarePolicy(LoadBalancer):
                 self._push_evict_buffer(scheduler_id, evicted_hash)
 
     def forget_request(self, request_id: str) -> None:
-        self.req_to_blocks.pop(request_id, None)
+        self.req_to_request.pop(request_id, None)
         self.req_to_scheduler.pop(request_id, None)
 
     def apply_instance_evicts(self, scheduler_id: int, evicted_hashes) -> None:

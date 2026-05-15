@@ -12,6 +12,7 @@ from chitu.utils import (
     try_import_and_setup_torch_npu,
     next_power_of_two,
 )
+from chitu.ops import a8_per_token_act_quant
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
@@ -279,9 +280,7 @@ def _(
         )
 
     if use_int8_w8a8:
-        concat_activation, dynamic_scale = torch_npu.npu_dynamic_quant(
-            concat_activation
-        )
+        concat_activation, dynamic_scale = a8_per_token_act_quant(concat_activation)
         concat_activation = concat_activation.contiguous()
         dynamic_scale = dynamic_scale.to(torch.float32).contiguous()
 

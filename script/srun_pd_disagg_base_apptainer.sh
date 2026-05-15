@@ -83,7 +83,7 @@ EOF
 PD_NODES="${PD_NODES:-3}"
 PD_GPUS_PER_NODE="${PD_GPUS_PER_NODE:-8}"
 PD_CPUS_PER_GPU="${PD_CPUS_PER_GPU:-24}"
-PD_PARTITION="${PD_PARTITION:-long}"
+PD_PARTITION="${PD_PARTITION:-debug}"
 PD_SLURM_JOB_ID="${PD_SLURM_JOB_ID:-}"
 PD_EXCLUDE="${PD_EXCLUDE:-}"
 LOG_DIR="${LOG_DIR:-"$(pwd)/log"}"
@@ -696,6 +696,20 @@ pd_node_main() {
   fi
   APPTAINER_BASE_ARGS+=("${APPTAINER_EXTRA_ARGS[@]}")
 
+  prefill_list=()
+  for i in "${!PREFILL_START_NODE[@]}"; do
+    _ip="$(to_ip "${NODE_ARR[${PREFILL_START_NODE[i]}]}")"
+    prefill_list+=("{host:${_ip},port:${PREFILL_PORT[i]},max_batch_size:${ROUTER_PREFILL_MAX_BATCH_SIZE},max_total_tokens:${ROUTER_PREFILL_MAX_TOTAL_TOKENS},batching_strategy:${ROUTER_PREFILL_BATCHING_STRATEGY}}")
+  done
+  PD_PREFILL_SCHEDULERS_OVERRIDE="dp_config.router.prefill_schedulers=[$(IFS=,; echo "${prefill_list[*]}")]"
+
+  decode_list=()
+  for i in "${!DECODE_START_NODE[@]}"; do
+    _ip="$(to_ip "${NODE_ARR[${DECODE_START_NODE[i]}]}")"
+    decode_list+=("{host:${_ip},port:${DECODE_PORT[i]},scheduling_strategy:${ROUTER_DECODE_SCHEDULING_STRATEGY}}")
+  done
+  PD_DECODE_SCHEDULERS_OVERRIDE="dp_config.router.decode_schedulers=[$(IFS=,; echo "${decode_list[*]}")]"
+
   # Prefill/Decode 共用参数
   COMMON_ARGS=(
     --config-name="${PD_CONFIG_NAME}"
@@ -710,6 +724,7 @@ pd_node_main() {
     "infer.use_cuda_graph=${MODEL_USE_CUDA_GRAPH}" "infer.schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
     "float_16bit_variant=${MODEL_FLOAT16_VARIANT}"
     "dp_config.dp_size=${PD_TOTAL_INSTANCES}"
+    "${PD_PREFILL_SCHEDULERS_OVERRIDE}" "${PD_DECODE_SCHEDULERS_OVERRIDE}"
   )
 
   # ── 启动 Router (仅 Node0) ──
@@ -725,18 +740,7 @@ pd_node_main() {
       "dp_config.router.pd_disaggregation.metadata_sync_port=${PD_METADATA_SYNC_PORT}"
       "dp_config.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
     )
-    prefill_list=()
-    for i in "${!PREFILL_START_NODE[@]}"; do
-      _ip="$(to_ip "${NODE_ARR[${PREFILL_START_NODE[i]}]}")"
-      prefill_list+=("{host:${_ip},port:${PREFILL_PORT[i]},max_batch_size:${ROUTER_PREFILL_MAX_BATCH_SIZE},max_total_tokens:${ROUTER_PREFILL_MAX_TOTAL_TOKENS},batching_strategy:${ROUTER_PREFILL_BATCHING_STRATEGY}}")
-    done
-    ROUTER_CMD+=("dp_config.router.prefill_schedulers=[$(IFS=,; echo "${prefill_list[*]}")]")
-    decode_list=()
-    for i in "${!DECODE_START_NODE[@]}"; do
-      _ip="$(to_ip "${NODE_ARR[${DECODE_START_NODE[i]}]}")"
-      decode_list+=("{host:${_ip},port:${DECODE_PORT[i]},scheduling_strategy:${ROUTER_DECODE_SCHEDULING_STRATEGY}}")
-    done
-    ROUTER_CMD+=("dp_config.router.decode_schedulers=[$(IFS=,; echo "${decode_list[*]}")]")
+    ROUTER_CMD+=("${PD_PREFILL_SCHEDULERS_OVERRIDE}" "${PD_DECODE_SCHEDULERS_OVERRIDE}")
     ROUTER_CMD+=("${COMMON_OVERRIDES[@]}")
 
     apptainer run "${APPTAINER_BASE_ARGS[@]}" "${ROUTER_ENV_ARGS[@]}" "${PD_SIF_FILE}" "${ROUTER_CMD[@]}" \

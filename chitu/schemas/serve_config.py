@@ -200,6 +200,7 @@ class RouterConfig:
     token_port: int = MISSING
     max_inflight_per_instance: int = 24
     routing_algorithm: str = MISSING
+    routing_algorithm_for_decode: str = "power_of_two_choices"
     router_cache_miss_fallback_algorithm: str = MISSING
     router_hit_weight: float = 1.0
     router_load_penalty_weight: float = 0.02
