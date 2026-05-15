@@ -40,7 +40,7 @@ class ArgumentsGrammar(AbstractArgumentsGrammar):
 
     def build(self, schema: dict) -> Format:
         properties = schema["properties"]
-        required_set = set(schema["required"])
+        required_set = set(schema.get("required", []))
 
         tag_by_key: dict[str, TagFormat] = {}
         for arg_name, arg_schema in properties.items():
