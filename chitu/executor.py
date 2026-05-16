@@ -800,8 +800,21 @@ class Executor:
             TaskCollector.init(length=1)
 
         if self.pp_size > 1 and not get_pp_group().is_first_rank:
-            self.get_payload_shape = lambda num_tokens: [num_tokens, args.models.dim]
-            self.get_payload_dtype = lambda: torch.get_default_dtype()
+            model_payload_shape = getattr(
+                Backend.model, "get_pipeline_payload_shape", None
+            )
+            model_payload_dtype = getattr(
+                Backend.model, "get_pipeline_payload_dtype", None
+            )
+            if callable(model_payload_shape) and callable(model_payload_dtype):
+                self.get_payload_shape = model_payload_shape
+                self.get_payload_dtype = model_payload_dtype
+            else:
+                self.get_payload_shape = lambda num_tokens: [
+                    num_tokens,
+                    args.models.dim,
+                ]
+                self.get_payload_dtype = lambda: torch.get_default_dtype()
         else:
             self.get_payload_shape = lambda num_tokens: [num_tokens]
             self.get_payload_dtype = lambda: torch.int64

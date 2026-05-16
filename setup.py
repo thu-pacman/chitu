@@ -50,6 +50,9 @@ else:
 
 cython_unsafe_files = (
     glob.glob("chitu/ops/triton_ops/**/*.py", recursive=True)  # Triton kernels inside
+    + glob.glob(
+        "chitu/ops/tilelang_ops/**/*.py", recursive=True
+    )  # Tilelang kernels inside
     + glob.glob("chitu/moe/experts/*.py")  # Triton kernels inside
     + glob.glob("chitu/native_layout/*.py")  # plum inside
     + [

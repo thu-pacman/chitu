@@ -677,14 +677,23 @@ class Backend:
         ]:
             QuantizationRegistry._allowed_quant_for_merge_gate_up.append("blockfp4")
 
-        return Backend.build_model(
-            args.models,
-            Backend.cache_dict,
+        model_kwargs = dict(
             max_position_embeddings=args.infer.max_seq_len
             + (args.infer.mtp_size if args.infer.mtp_size > 1 else 0),
             attn_backend=attn_backend,
             op_impl=args.infer.op_impl,
             mla_absorb=args.infer.mla_absorb,
+        )
+        if args.models.type == ModelType.DEEPSEEK_V4:
+            model_kwargs.update(
+                pipeline_parallel_size=args.infer.pp_size,
+                tensor_parallel_size=args.infer.tp_size,
+            )
+
+        return Backend.build_model(
+            args.models,
+            Backend.cache_dict,
+            **model_kwargs,
         )
 
     @staticmethod
@@ -784,6 +793,7 @@ class Backend:
                 ModelType.HF_QWEN3_NEXT,
                 ModelType.HF_QWEN3_5,
                 ModelType.LLADA2,
+                ModelType.DEEPSEEK_V4,
             }:
                 if Backend._support_layerwise_loading():
                     checkpoint = Backend._load_hf_checkpoint_layerwise(model, args)
@@ -845,9 +855,12 @@ class Backend:
                     and "mtp." in k
                 ):
                     return False
+                if args.models.type == ModelType.DEEPSEEK_V4 and k.startswith("mtp."):
+                    return False
             if args.infer.language_model_only and k.startswith("model.visual"):
                 return False
-            if args.models.quant_config.type == "blockfp4" and (
+            quant_config = getattr(args.models, "quant_config", None)
+            if getattr(quant_config, "type", None) == "blockfp4" and (
                 k.endswith(".k_scale") or k.endswith(".v_scale")
             ):
                 return False
