@@ -14,7 +14,7 @@ from chitu.kv_cache import PagedKVCacheAccessor
 from chitu.ops import append_to_paged_kv_cache, read_from_paged_kv_cache
 from chitu.utils import try_import_opt_dep, ceil_div
 from chitu.distributed.parallel_state import get_dp_size
-from chitu.device_type import has_accelerator, is_hygon
+from chitu.device_type import has_accelerator, is_hygon, is_muxi
 from chitu.static_tensor import StaticTensor
 
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
@@ -50,15 +50,27 @@ class FlashMLABackend(TritonAttnBackend):
         self.mtp_size = getattr(self.args.infer, "mtp_size", 1)
         self.kv_heads = 1
         assert has_accelerator(), "FlashMLA backend only supports cuda"
-        arch_major, arch_minor = torch.cuda.get_device_capability()
-        if is_hygon():
-            self.required_h_q = 64
+
+        if hasattr(flash_mla, "flash_mla_sparse_fwd"):
+            self.sparse_attn_supported = True
+            arch_major, arch_minor = torch.cuda.get_device_capability()
+            if is_hygon():
+                self.sparse_attn_unsupported_h_q_set = set(range(17, 64)).union(
+                    range(65, 128)
+                )
+            else:
+                if arch_major == 9:
+                    self.sparse_attn_unsupported_h_q_set = set(range(1, 64)).union(
+                        range(65, 128)
+                    )
+                elif arch_major == 10:
+                    self.sparse_attn_unsupported_h_q_set = set(range(1, 128))
+                else:
+                    raise NotImplementedError(
+                        "FlashMLA backend only supports Hopper (sm9x) and Blackwell (sm10x)"
+                    )
         else:
-            assert arch_major in (
-                9,
-                10,
-            ), "FlashMLA backend only supports Hopper (sm9x) and Blackwell (sm10x)"
-            self.required_h_q = 128 if arch_major == 10 else 64
+            self.sparse_attn_supported = False
 
         self.local_n_heads = self.args.models.n_heads // self.args.infer.tp_size
 
@@ -91,23 +103,10 @@ class FlashMLABackend(TritonAttnBackend):
         else:
             self.use_fp8_cache = use_fp8
 
-        if is_hygon() and self.use_fp8_cache:
-            prefill_chunk_size_per_dp = (
-                ceil_div(self.args.infer.prefill_chunk_size, self.args.infer.dp_size)
-                if self.args.infer.prefill_chunk_size is not None
-                else None
+        if self.use_fp8_cache and (is_hygon() or is_muxi()):
+            raise NotImplementedError(
+                "The version of flashmla on this platform does not support FP8"
             )
-            if (
-                prefill_chunk_size_per_dp is not None
-                and prefill_chunk_size_per_dp > 4096
-            ):
-                raise NotImplementedError(
-                    f"FlashMLA with index_topk requires either disabling chunked prefill by setting "
-                    f"`infer.prefill_chunk_size=null`, or enable chunked prefill with a not-too-large "
-                    f"chunk size satisfying `ceil(infer.prefill_chunk_size / infer.dp_size) <= 4096`, "
-                    f"but not we got infer.prefill_chunk_size={self.args.infer.prefill_chunk_size} "
-                    f"and infer.dp_size={self.args.infer.dp_size}"
-                )
 
         logger.info(
             f"FlashMLA backend initialized with topk={self.index_topk} and use_fp8_cache={self.use_fp8_cache}"
@@ -227,10 +226,16 @@ class FlashMLABackend(TritonAttnBackend):
         num_tokens,
         local_h_q,
     ):
-        if local_h_q % self.required_h_q != 0:
+        if not self.sparse_attn_supported:
+            raise NotImplementedError(
+                "The installed version of flash_mla dose not support sparse attention"
+            )
+        if local_h_q in self.sparse_attn_unsupported_h_q_set:
             assert len(q.shape) == 3
-            # assert self.required_h_q % local_h_q == 0
-            q_padded = q.new_empty((num_tokens, self.required_h_q, q.shape[2]))
+            padded_h_q = local_h_q + 1
+            while padded_h_q in self.sparse_attn_unsupported_h_q_set:
+                padded_h_q += 1
+            q_padded = q.new_empty((num_tokens, padded_h_q, q.shape[2]))
             q_padded[:, :local_h_q, :] = q
             q = q_padded
         return q
@@ -243,16 +248,12 @@ class FlashMLABackend(TritonAttnBackend):
         seq_len_delta,
         softmax_scale,
     ):
-        # NOTE: updated FlashMLA requires padding h_q to required_h_q
         bsz = seq_len_delta.batch_size
         s_q = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
-
-        num_tokens, local_h_q, _ = q.shape
-        # pad h_q to required_h_q if necessary
-        q = self.pad_h_q(q, num_tokens, local_h_q)
-
         q = q.view(bsz, s_q, q.shape[-2], q.shape[-1])
-        if is_hygon():
+        if bsz == 0:
+            return torch.empty(0, q.shape[-2], 512, dtype=q.dtype, device=q.device)
+        if is_hygon() or is_muxi():
             if has_flash_mla_sched_meta:
                 # 新版 FlashMLA 接口：直接使用 FlashMLASchedMeta
                 assert self.hygon_metadata_decode is not None, (
@@ -307,8 +308,7 @@ class FlashMLABackend(TritonAttnBackend):
                 causal=(False if s_q == 1 else True),
                 softmax_scale=softmax_scale,
             )
-        output = output.view(bsz * s_q, output.shape[-2], output.shape[-1])
-        return output[:, :local_h_q, :]
+        return output.view(bsz * s_q, output.shape[-2], output.shape[-1])
 
     def flashmla_sparse_fwd_bf16(  # this kernel only supports mixed 1-batch forward
         self,
@@ -322,7 +322,7 @@ class FlashMLABackend(TritonAttnBackend):
         ), "flashmla_sparse_fwd_bf16 only support sparse attn"
 
         num_tokens, local_h_q, _ = q.shape
-        # pad q_heads to required_h_q of FlashMLA
+
         q = self.pad_h_q(q, num_tokens, local_h_q)
 
         topk_indices = topk_indices.to(q.device)
@@ -372,7 +372,7 @@ class FlashMLABackend(TritonAttnBackend):
             cache_seqlens = seq_len_delta.new.lens_tensor_device
             batch_block_table = block_table
 
-        if is_hygon():
+        if is_hygon() or is_muxi():
             if has_flash_mla_sched_meta:
                 # 新版 FlashMLA 接口
                 metadata = (
@@ -557,7 +557,7 @@ class FlashMLABackend(TritonAttnBackend):
 
         # fp8 sparse attn
         # prefill does not go through graph
-        if is_hygon():
+        if is_hygon() or is_muxi():
             num_q_tokens_per_head_k = seq_len_delta.delta_total_len * self.local_n_heads
             self.metadata_prefill, self.num_splits_prefill = (
                 self.prepare_flashmla_metadata(
@@ -609,30 +609,6 @@ class FlashMLABackend(TritonAttnBackend):
                 topk_indices=None,
             )
         # NOTE: currently use bf16 kv with fp8 kv chunked prefill make inaccurate output
-
-        if is_hygon() and self.use_fp8_cache:
-            if seq_len_delta.is_first_prefill_chunk:
-                output = self.mla_prefill_ragged_qkvo(
-                    q_nope,
-                    q_pe,
-                    kv,
-                    seq_len_delta,
-                    causal=True,
-                    softmax_scale=softmax_scale,
-                    topk_indices=topk_indices,
-                )
-                kv = quant_pertoken_kvcache_dsa(kv)
-                self.update_paged_mla_kv(
-                    kv_lora_rank,
-                    kv,
-                    kv_cache,
-                    seq_len_delta,
-                )
-                return output
-            assert q_nope.shape[0] <= 4096, (
-                "flash_mla_with_kvcache() does not support s_q > 4096: "
-                f"s_q={q_nope.shape[0]}"
-            )
 
         # quant then fwd with kvcache
         q = torch.cat([q_nope, q_pe], dim=-1)
@@ -691,12 +667,17 @@ class FlashMLABackend(TritonAttnBackend):
         if not self.use_fp8_cache and self.index_topk is not None:
             return
 
-        if is_hygon():
+        if seq_len_delta.batch_size == 0:
+            return
+
+        if is_hygon() or is_muxi():
             # 参考旧版FlashMLA的实现，将metadata和num_splits存储为static tensor
             s_q = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
             num_q_tokens_per_head_k = s_q * self.local_n_heads // self.kv_heads
 
-            max_batch_size_per_dp = ceil_div(self.args.infer.max_reqs, get_dp_size())
+            max_batch_size_per_dp = ceil_div(
+                self.args.infer.max_batch_size, get_dp_size()
+            )
 
             if self.index_topk is not None:
                 metadata, num_splits = flash_mla.get_mla_metadata(

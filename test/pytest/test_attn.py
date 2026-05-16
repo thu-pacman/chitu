@@ -246,7 +246,7 @@ def test_dsa_indexer_paged_kv(
 
 
 @pytest.mark.parametrize("bs", [0, 1, 3])
-@pytest.mark.parametrize("local_n_heads", [16, 128])
+@pytest.mark.parametrize("local_n_heads", [16, 32, 64, 128])
 @pytest.mark.parametrize("kv_lora_rank", [512])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
@@ -264,6 +264,11 @@ def test_mla_prefill_ragged_qkvo(
     impl,
     record_benchmark,
 ):
+    _, total_memory = torch.cuda.mem_get_info()
+    total_memory = total_memory / (1024**3)
+    if local_n_heads >= 64 and total_memory < 80:
+        pytest.skip("Skip testing h_q>=64 on devices with not enough memory")
+
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
     if impl == "npu":
@@ -283,9 +288,6 @@ def test_mla_prefill_ragged_qkvo(
         total_memory = total_memory / (1024**3)
         if local_n_heads == 128 and total_memory < 80:
             pytest.skip("Skip testing h_q=128 on devices with not enough memory")
-    else:  # only test h_q=128 for flash_mla
-        if local_n_heads == 128:
-            pytest.skip(f"Skip testing h_q=128 with {impl} attn backend")
 
     if impl == "flash_mla":
         torch.set_default_dtype(torch.bfloat16)
@@ -698,6 +700,8 @@ def test_mla_decode_dense_kv(
     [
         (128, 512, 64, 128),  # DeepSeek-V3 TP1
         (16, 512, 64, 128),  # DeepSeek-V3 TP8
+        (64, 512, 64, 192),  # GLM-5 TP1
+        (8, 512, 64, 192),  # GLM-5 TP8
         (20, 512, 64, 192),  # GLM-4.7-Flash TP1
     ],
 )
@@ -719,6 +723,11 @@ def test_mla_decode_paged_kv(
     impl,
     record_benchmark,
 ):
+    _, total_memory = torch.cuda.mem_get_info()
+    total_memory = total_memory / (1024**3)
+    if local_n_heads >= 64 and total_memory < 80:
+        pytest.skip("Skip testing h_q>=64 on devices with not enough memory")
+
     if impl == "triton":
         if not has_triton:
             pytest.skip("triton is missing")
@@ -752,18 +761,14 @@ def test_mla_decode_paged_kv(
     if impl == "flash_mla":
         if not has_accelerator() or not has_flash_mla:
             pytest.skip("flash_mla is missing")
-        if local_n_heads % 64 != 0:
-            pytest.skip("flash_mla only supports h_q % 64 (sm90) | 128 (sm100) == 0")
-        if topk is None:
-            pytest.skip("flash_mla only supports dense attention for now")
-
-        _, total_memory = torch.cuda.mem_get_info()
-        total_memory = total_memory / (1024**3)
-        if local_n_heads == 128 and total_memory < 80:
-            pytest.skip("Skip testing h_q=128 on devices with not enough memory")
-    else:  # only test h_q=128 for flash_mla
-        if local_n_heads == 128:
-            pytest.skip(f"Skip testing h_q=128 with {impl} attn backend")
+        if topk is None and page_size != 64:
+            pytest.skip("MLA paged decode requires page_size=64 in dense mode")
+        if topk is not None and not hasattr(flash_mla, "flash_mla_sparse_fwd"):
+            pytest.skip("flash_mla is too old to have `flash_mla_sparse_fwd`")
+        if is_muxi() and local_n_heads == 20:
+            # FIXME: We don't know whether there are other numbers of heads this function
+            # fails to support.
+            pytest.skip("flash_mla does not support #heads=20 on muxi")
     if impl == "flash_attn":
         if not has_flash_attn and not has_flash_attn3:
             pytest.skip("flash_attn/flash_attn_interface is missing")
