@@ -165,5 +165,13 @@ COPY ./chitu/metrics/grafana ./grafana
 
 ENV CHITU_MUXI_BUILD=1
 
+# Update entrypoint, which calls the original entrypoint of the base image.
+#
+# If you want to change the base image, use
+# `docker inspect --format='Entrypoint: {{.Config.Entrypoint}}' <image>`
+# to check its entrypoint.
+COPY ./script/entrypoint.sh /chitu-entrypoint.sh
+ENTRYPOINT ["/chitu-entrypoint.sh", "/bin/bash", "/entrypoint.sh"]
+
 # The actual installing procedure requries a GPU device, which is not available in the `docker build` stage.
 # We delay it to an additional `docker run` stage which runs `script/install.sh`.

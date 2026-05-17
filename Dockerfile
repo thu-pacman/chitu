@@ -318,3 +318,11 @@ COPY ./chitu/metrics/grafana ./grafana
 # worse, so we don't use them.
 ENV NCCL_GRAPH_MIXING_SUPPORT=0
 ENV NCCL_GRAPH_REGISTER=0
+
+# Update entrypoint, which calls the original entrypoint of the base image.
+#
+# If you want to change the base image, use
+# `docker inspect --format='Entrypoint: {{.Config.Entrypoint}}' <image>`
+# to check its entrypoint.
+COPY ./script/entrypoint.sh /chitu-entrypoint.sh
+ENTRYPOINT ["/chitu-entrypoint.sh", "/opt/nvidia/nvidia_entrypoint.sh"]
