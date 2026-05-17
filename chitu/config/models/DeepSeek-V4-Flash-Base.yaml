@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 defaults:
-  - quant_config: blockfp8_ue8m0_scale_without_o_proj
+  - quant_config: blockfp8_ue8m0_scale
   - _self_ # Config in this file overrides configs in defaults
 
 name: DeepSeek-V4-Flash-Base

@@ -30,8 +30,7 @@ from chitu.ops.quant import (
     blockfp8_weight_dequant,
     soft_fp8_blockfp8_weight_dequant,
 )
-from chitu.quantization import Blockfp8Linear, QuantizedMoeExpertsBase
-from chitu.quantization.normal import NormalLinear
+from chitu.quantization import NormalLinear, Blockfp8Linear, QuantizedMoeExpertsBase
 from chitu.tensor_parallel import ColumnParallelLinear, LocalLinear, RowParallelLinear
 from chitu.distributed.parallel_state import get_tp_group, get_tp_size
 
@@ -596,7 +595,6 @@ class AttentionDeepSeekV4(Attention):
             args.o_groups * args.o_lora_rank,
             has_bias=False,
             gather_output=False,
-            base_linear_class=Blockfp8LinearRoundScaleToPow2,
             checkpoint_prefix=f"{checkpoint_prefix}.wo_a",
         )
         self.wo_b = RowParallelLinear(
@@ -709,16 +707,21 @@ class AttentionDeepSeekV4(Attention):
             self.indexer.compressor.freqs_cis = self.freqs_cis
 
     def _dequant_wo_a(self) -> torch.Tensor:
-        weight_dequant_fn = (
-            soft_fp8_blockfp8_weight_dequant
-            if get_global_args().infer.raise_lower_bit_float_to == "bfloat16"
-            else blockfp8_weight_dequant
-        )
-        return weight_dequant_fn(
-            self.wo_a.weight,
-            self.wo_a.scale,
-            block_size=self.wo_a.block_size,
-        ).view(self.n_local_groups, self.o_lora_rank, -1)
+        if isinstance(self.wo_a, NormalLinear):
+            return self.wo_a.weight
+        elif isinstance(self.wo_a, Blockfp8Linear):
+            weight_dequant_fn = (
+                soft_fp8_blockfp8_weight_dequant
+                if get_global_args().infer.raise_lower_bit_float_to == "bfloat16"
+                else blockfp8_weight_dequant
+            )
+            return weight_dequant_fn(
+                self.wo_a.weight,
+                self.wo_a.scale,
+                block_size=self.wo_a.block_size,
+            )
+        else:
+            assert False
 
     def forward(
         self,
@@ -742,7 +745,7 @@ class AttentionDeepSeekV4(Attention):
         decode_cache_slots = []
         prefix_lens = seq_len_delta.delta_prefix_lens_list
         old_lens = seq_len_delta.old.lens_list
-        wo_a = self._dequant_wo_a()
+        wo_a = self._dequant_wo_a().view(self.n_local_groups, self.o_lora_rank, -1)
         for i in range(seq_len_delta.batch_size):
             begin, end = prefix_lens[i], prefix_lens[i + 1]
             if begin == end:

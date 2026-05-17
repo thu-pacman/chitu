@@ -12,7 +12,7 @@
 #
 # We found this issue continues to at least DeepSeek-V3.2.
 
-quant: 
+quant:
 - model: '.'
   rules:
     - regex : 'o_proj'

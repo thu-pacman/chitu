@@ -1251,7 +1251,7 @@ def check_alloc_retries():
     ]
     if cur_alloc_retries > _last_alloc_retries:
         logger.warning(
-            f"{cur_alloc_retries - _last_alloc_retries} allocations successed only "
+            f"{cur_alloc_retries - _last_alloc_retries} allocations succeeded only "
             f"after retrying (freeing memory from PyTorch allocator to CUDA and then "
             f"allocating them back). This will significantly reduce the performance. "
             f"Please try reducing memory usage, for example by lowering "
