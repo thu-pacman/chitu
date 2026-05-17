@@ -58,6 +58,20 @@ def deepseek_v3_indexer_cache_spec(args, attn_backend_type) -> KVCacheSpec:
             },
         )
 
+    # Hygon BF16 indexer-kv layout keeps only K.
+    if args.infer.indexer_type == "hygon":
+        return KVCacheSpec(
+            block_size=64,
+            kvargs={
+                "shape_per_token_dict": {
+                    "indexer_k": (index_head_dim,),
+                },
+                "dtype_dict": {
+                    "indexer_k": torch.bfloat16,
+                },
+            },
+        )
+
     return KVCacheSpec(
         kvargs={
             "shape_per_token_dict": {

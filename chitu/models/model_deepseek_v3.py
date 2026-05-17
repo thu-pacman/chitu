@@ -161,6 +161,8 @@ class Indexer(torch.nn.Module):
 
         q = self._rotate_activation(q)
         k = self._rotate_activation(k)
+        if self.indexer_impl.impl == "hygon":
+            return (q, None), (k, None)
         return blockfp8_act_quant(q, block_size=self.block_size), blockfp8_act_quant(
             k, block_size=self.block_size
         )
@@ -176,13 +178,16 @@ class Indexer(torch.nn.Module):
         cache_accessor: KVCacheAccessor,
     ) -> torch.Tensor:
         q_pack, k_pack = self._build_index_qk(x, q, k, freqs_cis)
-        q_fp8, q_scale = q_pack
-        k_fp8, k_scale = k_pack
+        q_indexer, q_scale = q_pack
+        k_indexer, k_scale = k_pack
         weights = self.weights_proj(x) * self.n_heads**-0.5
-        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        if self.indexer_impl.impl == "hygon":
+            weights = (weights * self.softmax_scale).to(torch.float32).contiguous()
+        else:
+            weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return self.indexer_impl.dsa_indexer(
-            q_fp8,
-            k_fp8,
+            q_indexer,
+            k_indexer,
             k_scale,
             weights,
             seq_len_delta,

@@ -9,6 +9,7 @@ from chitu.ops import (
     append_to_paged_kv_cache,
     append_to_dense_kv_cache,
     append_to_paged_kv_cache_blockfp8_deepgemm,
+    read_from_paged_kv_cache,
     read_from_paged_indexer_kv_cache_deepgemm,
 )
 from chitu.kv_cache import (
@@ -16,7 +17,7 @@ from chitu.kv_cache import (
     PagedKVCacheAccessor,
     DenseKVCacheAccessor,
 )
-from chitu.device_type import is_nvidia
+from chitu.device_type import is_hygon, is_nvidia
 from chitu.utils import try_import_opt_dep, try_import_platform_dep, get_global_args
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.ops.topk import topk_indices
@@ -30,6 +31,7 @@ logger = getLogger(__name__)
 
 triton, has_triton = try_import_platform_dep("triton")
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
+lightop, has_hygon_lightop = try_import_platform_dep("lightop")
 
 support_indexer_deepgemm = (
     is_nvidia()
@@ -37,23 +39,80 @@ support_indexer_deepgemm = (
     and has_triton
     and has_deep_gemm
 )
+support_indexer_hygon = (
+    is_hygon()
+    and has_hygon_lightop
+    and hasattr(lightop, "op")
+    and hasattr(lightop.op, "mqa_logits")
+    and hasattr(lightop, "gemmopt")
+    and hasattr(lightop.gemmopt, "paged_mqa_logits")
+    and hasattr(lightop.gemmopt, "get_paged_mqa_logits_metadata")
+)
+
+
+def validate_indexer_config(args, indexer_type):
+    if args.models.get("index_topk", None) is None:
+        return
+    if indexer_type == "deepgemm":
+        _validate_deepgemm_indexer_config(args)
+    elif indexer_type == "hygon":
+        _validate_hygon_indexer_config(args)
+
+
+def _validate_deepgemm_indexer_config(args):
+    if not support_indexer_deepgemm:
+        raise ValueError("indexer_type=deepgemm is not supported ")
+    if args.infer.mtp_size > 2:
+        raise ValueError("indexer_type=deepgemm does not support mtp_size > 2")
+    if args.infer.cache_type != "paged":
+        raise ValueError(
+            f"indexer_type=deepgemm only supports cache_type=paged, but got {args.infer.cache_type}"
+        )
+
+
+def _validate_hygon_indexer_config(args):
+    if not support_indexer_hygon:
+        raise ValueError(
+            "indexer_type=hygon requires Hygon lightop mqa logits, paged mqa logits, and paged metadata"
+        )
+    if args.infer.cache_type != "paged":
+        raise ValueError(
+            f"indexer_type=hygon only supports cache_type=paged, but got {args.infer.cache_type}"
+        )
+    if args.infer.mtp_size > 2:
+        raise ValueError("indexer_type=hygon does not support mtp_size > 2")
+    if int(args.models.index_head_dim) != 128:
+        raise ValueError(
+            f"indexer_type=hygon requires index_head_dim=128, but got {args.models.index_head_dim}"
+        )
+    if int(args.models.index_n_heads) not in (32, 64):
+        raise ValueError(
+            f"indexer_type=hygon only supports index_n_heads in (32, 64), but got {args.models.index_n_heads}"
+        )
 
 
 class DSAIndexer:
     def __init__(self, impl="auto"):
+        args = get_global_args()
         if impl == "auto":
-            assert getattr(get_global_args().infer, "indexer_type") is not None
-            self.impl = get_global_args().infer.indexer_type
+            assert getattr(args.infer, "indexer_type") is not None
+            self.impl = args.infer.indexer_type
         else:
-            assert impl in ["deepgemm", "triton", "torch"], f"Unsupported {impl=}"
+            assert impl in [
+                "deepgemm",
+                "hygon",
+                "triton",
+                "torch",
+            ], f"Unsupported {impl=}"
             self.impl = impl
 
-        self.static_max_n = get_global_args().infer.max_seq_len
-        self.mtp_size = getattr(get_global_args().infer, "mtp_size", 1)
+        validate_indexer_config(args, self.impl)
+
+        self.static_max_n = args.infer.max_seq_len
+        self.mtp_size = getattr(args.infer, "mtp_size", 1)
 
         # deepgemm only
         if self.impl == "deepgemm":
-            assert support_indexer_deepgemm
             self.metadata = None
             self.num_sms = deep_gemm.get_num_sms()
 
@@ -96,6 +155,90 @@ class DSAIndexer:
         )
 
         return index_score
+
+    def bf16_index_score_ragged_qk_dsv32_hygon(
+        self,
+        q: torch.Tensor,  # [s_q, h, d=128], bf16
+        weights: torch.Tensor,  # [s_q, h], fp32
+        k: torch.Tensor,  # [s_k, d=128] or [s_k, 1, d=128], bf16
+        seq_len_delta: BatchedSeqLenDelta,
+        causal: bool,
+    ):
+        """
+        Indexer score by Hygon lightop.op.mqa_logits() for ragged qk in prefill stage.
+        """
+        s_q, h, _ = q.shape
+        assert k.dim() == 2
+
+        weights = weights.reshape(s_q, h)
+
+        ks = seq_len_delta.new.prefix_lens_tensor_device[
+            seq_len_delta.delta_seq_ids_tensor_device
+        ]
+        if causal:
+            ke = seq_len_delta.delta_position_ids_tensor_device + ks + 1
+        else:
+            ke = (
+                seq_len_delta.new.lens_tensor_device[
+                    seq_len_delta.delta_seq_ids_tensor_device
+                ]
+                + ks
+            )
+
+        index_score = lightop.op.mqa_logits(
+            q,
+            k,
+            weights,
+            ks,
+            ke,
+            s_q,
+            k.shape[0],
+            h,
+            q.shape[2],
+            None,
+            True,
+        )
+
+        return index_score
+
+    def bf16_index_score_ragged_q_paged_k_dsv32_hygon(
+        self,
+        q: torch.Tensor,  # [s_q, h, d=128], bf16
+        weights: torch.Tensor,  # [s_q, h], fp32
+        k: torch.Tensor,  # [n_pages, page_size, d=128]
+        seq_len_delta: BatchedSeqLenDelta,
+        k_page_table: torch.Tensor,  # [b, n_pages_per_seq]
+    ):
+        """
+        Indexer score by Hygon lightop.gemmopt.paged_mqa_logits() for decode stage.
+        """
+        s_q, h, d = q.shape
+        batch_size = seq_len_delta.batch_size
+        assert s_q == batch_size * self.mtp_size
+
+        # reshape as batch view
+        q = q.view(batch_size, self.mtp_size, h, d)
+
+        weights = weights.reshape(s_q, h)
+        assert k.dim() == 3
+        k = k.unsqueeze(2)
+
+        context_lens = seq_len_delta.new.lens_tensor_device
+        schedule_meta = lightop.gemmopt.get_paged_mqa_logits_metadata(
+            context_lens,
+            64,  # lightop paged MQA metadata uses page_size=64
+            torch.cuda.get_device_properties(q.device).multi_processor_count,
+        )
+        return lightop.gemmopt.paged_mqa_logits(
+            q,
+            k,
+            weights,
+            context_lens,
+            k_page_table,
+            schedule_meta,
+            self.static_max_n,
+            clean_logits=True,
+        )
 
     def prepare_metadata_for_decode(
         self,
@@ -270,6 +413,53 @@ class DSAIndexer:
 
         return index_score
 
+    def bf16_index_score_dsa_hygon(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        seq_len_delta: BatchedSeqLenDelta,
+        cache_accessor: KVCacheAccessor,
+        is_causal=True,
+    ):
+        assert isinstance(cache_accessor, PagedKVCacheAccessor)
+        append_to_paged_kv_cache(
+            cache_accessor.kv["indexer_k"],
+            cache_accessor.block_table,
+            k,
+            seq_len_delta.delta_position_ids_tensor_device,
+            seq_len_delta.delta_seq_ids_tensor_device,
+            get_page_ids=cache_accessor.get_page_ids,
+            get_offs_in_page=cache_accessor.get_offs_in_page,
+            use_i64_offsets=cache_accessor.use_i64_offsets,
+        )
+
+        if seq_len_delta.is_decode_stage:
+            index_score = self.bf16_index_score_ragged_q_paged_k_dsv32_hygon(
+                q,
+                weights,
+                cache_accessor.kv["indexer_k"],
+                seq_len_delta,
+                cache_accessor.block_table,
+            )
+        else:
+            k = read_from_paged_kv_cache(
+                cache_accessor.kv["indexer_k"],
+                cache_accessor.block_table,
+                seq_len_delta.new.position_ids_tensor_device,
+                seq_len_delta.new.seq_ids_tensor_device,
+            )
+
+            index_score = self.bf16_index_score_ragged_qk_dsv32_hygon(
+                q,
+                weights,
+                k,
+                seq_len_delta,
+                is_causal,
+            )
+
+        return index_score
+
     def dsa_indexer(
         self,
         q_fp8,
@@ -290,6 +480,15 @@ class DSAIndexer:
                 q_fp8,
                 k_fp8,
                 k_scale,
+                weights,
+                seq_len_delta,
+                cache_accessor,
+                is_causal,
+            )
+        elif self.impl == "hygon":
+            logits = self.bf16_index_score_dsa_hygon(
+                q_fp8,
+                k_fp8,
                 weights,
                 seq_len_delta,
                 cache_accessor,
