@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# DeepSeek-V4-Flash-FP8 is a finetune of DeepSeek-V4-Flash-Base,
+# and the quantization is slightly different.
+defaults:
+  - DeepSeek-V4-Flash-Base
+  - override quant_config: blockfp8_ue8m0_scale_with_wo_a_unquant
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: DeepSeek-V4-Flash-FP8
+source: "https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8" # Just for displaying. No automatic download.

@@ -132,5 +132,6 @@ extras_require = {
     ],
     "numa": ["numa"],
     "mooncake": [mooncake],
+    "tilelang": ["tilelang"],
     **operators.get_extras_require(),
 }

@@ -71,6 +71,7 @@ class MetadataConfig:
             or self.include_consumed_tokens
             or self.include_chunk_size
             or self.include_prompt_len
+            or self.include_next_token
             or self.include_pd_prefill_engine_rank
         )
 

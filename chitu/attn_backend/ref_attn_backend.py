@@ -26,6 +26,30 @@ class RefAttnBackend(AttnBackend):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
+    def sparse_attn(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        attn_sink: torch.Tensor,
+        topk_idxs: torch.Tensor,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        kv = kv.unsqueeze(2)
+        topk_idxs = torch.where(
+            topk_idxs < 0,
+            torch.full_like(topk_idxs, kv.size(1)),
+            topk_idxs,
+        )
+        output, _ = self._attention(
+            q,
+            kv,
+            kv,
+            softmax_scale=softmax_scale,
+            sinks=attn_sink,
+            topk_indices_batch=topk_idxs.long(),
+        )
+        return output.contiguous()
+
     def _construct_local_mask(
         self,
         seqlen_q,

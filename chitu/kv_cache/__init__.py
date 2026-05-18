@@ -42,6 +42,8 @@ from chitu.kv_cache.kv_cache import (
     SingletonPagedKVCache,
     MMPagedKVCache,
     DenseKVCache,
+    DeepSeekV4DenseKVCache,
+    DeepSeekV4PagedKVCache,
     KVCacheAccessor,
     PagedKVCacheAccessor,
     DenseKVCacheAccessor,

@@ -1251,6 +1251,7 @@ class DenseKVCache(KVCacheBase):
         *,
         num_hot_req: int,
         max_seq_len: int,
+        storage_max_seq_len: Optional[int] = None,
         shape_per_token_dict: Optional[dict[str, torch.Size | Sequence[int]]] = None,
         dtype_dict: Optional[dict[str, torch.dtype]] = None,
         n_local_kv_heads: Optional[int] = None,
@@ -1269,6 +1270,11 @@ class DenseKVCache(KVCacheBase):
             quant_type=quant_type,
             device=device,
         )
+        self.storage_max_seq_len = (
+            self.max_seq_len
+            if storage_max_seq_len is None
+            else int(storage_max_seq_len)
+        )
         self.block_size = self.max_seq_len
         self.num_blocks = num_hot_req
         self.slot_availability = [True] * num_hot_req
@@ -1281,7 +1287,7 @@ class DenseKVCache(KVCacheBase):
                 (
                     self.num_layers,
                     self.num_hot_req,
-                    self.max_seq_len,
+                    self.storage_max_seq_len,
                 )
                 + tuple(self.shape_per_token_dict[key]),
                 dtype=self.dtype_dict[key],
@@ -1309,6 +1315,21 @@ class DenseKVCache(KVCacheBase):
 
     def update_page_offs(self):
         pass
+
+    def estimate_bytes_per_block(self) -> int:
+        total = 0
+        for key, shape in self.shape_per_token_dict.items():
+            n_elem_per_token = 1
+            for dim in tuple(shape):
+                n_elem_per_token *= int(dim)
+            elem_size = torch.empty((), dtype=self.dtype_dict[key]).element_size()
+            total += (
+                int(self.num_layers)
+                * int(self.storage_max_seq_len)
+                * n_elem_per_token
+                * elem_size
+            )
+        return int(total)
 
     @property
     def num_free_blocks(self):
@@ -1380,6 +1401,14 @@ class DenseKVCache(KVCacheBase):
         }
         return DenseKVCacheAccessor(ret_kv, self.use_i64_offsets)
 
+    def _copy_cache_slot(self, dst_slot: int, src_slot: int):
+        for key in self.kv_buffer:
+            self.kv_buffer[key][:, dst_slot] = self.kv_buffer[key][:, src_slot]
+
+    def _zero_cache_slot(self, slot: int):
+        for key in self.kv_buffer:
+            self.kv_buffer[key][:, slot].zero_()
+
     @override
     def finalize_cache_all_decode(self, tasks: "PackedTasksBase"):
         for tid in tasks.task_ids:
@@ -1404,10 +1433,7 @@ class DenseKVCache(KVCacheBase):
                     break
 
             if slot_last_id is not None:
-                for key in self.kv_buffer:
-                    self.kv_buffer[key][:, slot_id] = self.kv_buffer[key][
-                        :, slot_last_id
-                    ]
+                self._copy_cache_slot(slot_id, slot_last_id)
                 req_key = next(
                     (k for k, v in self.req2slot.items() if v == slot_last_id), None
                 )
@@ -1418,11 +1444,76 @@ class DenseKVCache(KVCacheBase):
                 self.slot_availability[slot_last_id] = True
                 if tid in self.req2slot:
                     self.req2slot.pop(tid)
-                for key in self.kv_buffer:
-                    self.kv_buffer[key][:, slot_last_id].zero_()
+                self._zero_cache_slot(slot_last_id)
             else:
                 self.hot_reqs[slot_id] = None
                 self.slot_availability[slot_id] = True
                 self.req2slot.pop(tid)
-                for key in self.kv_buffer:
-                    self.kv_buffer[key][:, slot_id].zero_()
+                self._zero_cache_slot(slot_id)
+
+
+class DeepSeekV4DenseKVCache(DenseKVCache):
+    def __init__(self, *args, **kwargs):
+        self.request_shape_dict = kwargs.pop("request_shape_dict", {})
+        self.request_dtype_dict = kwargs.pop("request_dtype_dict", {})
+        super().__init__(*args, **kwargs)
+        self.request_buffer: dict[str, torch.Tensor] = {}
+        self.prepared_request_cache: dict[str, torch.Tensor] = {}
+        for key, shape in self.request_shape_dict.items():
+            dtype = self.request_dtype_dict.get(key, torch.get_default_dtype())
+            self.request_buffer[key] = torch.zeros(
+                (self.num_layers, self.num_hot_req) + tuple(shape),
+                dtype=dtype,
+                device=self.device,
+            )
+
+    def estimate_bytes_per_block(self) -> int:
+        total = super().estimate_bytes_per_block()
+        for key, shape in self.request_shape_dict.items():
+            n_elem_per_req = 1
+            for dim in tuple(shape):
+                n_elem_per_req *= int(dim)
+            dtype = self.request_dtype_dict.get(key, torch.get_default_dtype())
+            elem_size = torch.empty((), dtype=dtype).element_size()
+            total += int(self.num_layers) * n_elem_per_req * elem_size
+        return int(total)
+
+    def _prepare_cache(self, task_ids: list[str], start_pos: int):
+        super()._prepare_cache(task_ids, start_pos)
+        for key in self.request_buffer:
+            self.prepared_request_cache[key] = self.request_buffer[key][
+                :, start_pos : start_pos + len(task_ids)
+            ]
+
+    def get_accessor(self, layer_id: int, is_mtp: bool = False):
+        accessor = super().get_accessor(layer_id, is_mtp)
+        local_layer_id = self.layer_id_map.to_local(layer_id)
+        accessor.kv.update(
+            {
+                key: cache[local_layer_id]
+                for key, cache in self.prepared_request_cache.items()
+            }
+        )
+        return accessor
+
+    def _copy_cache_slot(self, dst_slot: int, src_slot: int):
+        super()._copy_cache_slot(dst_slot, src_slot)
+        for key in self.request_buffer:
+            self.request_buffer[key][:, dst_slot] = self.request_buffer[key][
+                :, src_slot
+            ]
+
+    def _zero_cache_slot(self, slot: int):
+        super()._zero_cache_slot(slot)
+        for key in self.request_buffer:
+            self.request_buffer[key][:, slot].zero_()
+
+    def get_deepseek_v4_cache_slots(self, seq_delta) -> list[int]:
+        curr_tids = self.curr_tids
+        if curr_tids is None or len(curr_tids) != seq_delta.batch_size:
+            return list(range(seq_delta.batch_size))
+        return [self.req2slot[tid] for tid in curr_tids]
+
+
+class DeepSeekV4PagedKVCache(PagedKVCache):
+    pass

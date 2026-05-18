@@ -376,7 +376,7 @@ class Transformer(nn.Module):
     def _get_2d_out_x_in_tensor_names(self, quant) -> list[str]:
         ret = ["weight"]
         if quant == "blockfp8" or quant == "q4km":
-            ret += ["scale"]
+            ret += ["scale", "weight_scale_inv"]
         elif quant == "fp8_per_channel":
             ret += ["weight_scale"]
         elif quant == "blockfp4" or quant == "blockfp4_merged":

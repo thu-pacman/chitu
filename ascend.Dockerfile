@@ -147,5 +147,13 @@ COPY ./chitu/metrics/grafana ./grafana
 # Currently, we require a development version of torch-npu to support aclgraph
 ENV CHITU_ASCEND_BUILD=1
 
+# Update entrypoint, which calls the original entrypoint of the base image.
+#
+# If you want to change the base image, use
+# `docker inspect --format='Entrypoint: {{.Config.Entrypoint}}' <image>`
+# to check its entrypoint.
+COPY ./script/entrypoint.sh /chitu-entrypoint.sh
+ENTRYPOINT ["/chitu-entrypoint.sh", "/bin/bash", "-c", "source /usr/local/Ascend/ascend-toolkit/set_env.sh && source /usr/local/Ascend/nnal/atb/set_env.sh && exec \"$@\"", "--"]
+
 # The actual installing procedure requries a NPU device, which is not available in the `docker build` stage.
 # We delay it to an additional `docker run` stage which runs `script/install.sh`.

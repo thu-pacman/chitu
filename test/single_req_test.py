@@ -63,6 +63,11 @@ msgs_vl = [
     ],
 ]
 
+
+def use_long_context_msgs(model_name: str) -> bool:
+    return "DeepSeek-V3" in model_name or "DeepSeek-V4" in model_name
+
+
 USE_TOOLS = False
 msg_tools = [
     {
@@ -160,8 +165,9 @@ def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
 def gen_reqs(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
     global local_args, msgs
     if (
-        "DeepSeek-V3.2" in local_args.models.name
+        use_long_context_msgs(local_args.models.name)
         and local_args.infer.max_seq_len >= 4096
+        and msgs[: len(msgs_long)] != msgs_long
     ):
         msgs = msgs_long + msgs
 

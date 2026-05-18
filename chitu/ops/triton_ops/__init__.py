@@ -70,3 +70,4 @@ from chitu.ops.triton_ops.fused_g import fused_g_triton
 from chitu.ops.triton_ops.fused_recurrent import (
     fused_recurrent_gated_delta_rule_fwd_all_state_triton,
 )
+from chitu.ops.triton_ops.mhc import mhc_pre_triton, mhc_post_triton

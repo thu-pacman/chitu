@@ -537,6 +537,7 @@ def _warmup_backend_direct(
 
     req_ids = [f"__warmup_{i}__" for i in range(local_max_bs)]
     is_pp_first_rank = get_pp_group() is None or get_pp_group().is_first_rank
+    is_deepseek_v4 = args.models.type == ModelType.DEEPSEEK_V4
     if is_pp_first_rank:
         tokens = torch.randint(
             1,
@@ -544,6 +545,14 @@ def _warmup_backend_direct(
             size=(local_max_bs,),
             device="cuda",
             dtype=torch.int64,
+        )
+    elif is_deepseek_v4:
+        tokens = torch.randn(
+            local_max_bs,
+            args.models.hc_mult,
+            args.models.dim,
+            device="cuda",
+            dtype=torch.bfloat16,
         )
     else:
         tokens = torch.randn(
@@ -608,6 +617,14 @@ def _warmup_backend_direct(
                     size=(curr_bs,),
                     device="cuda",
                     dtype=torch.int64,
+                )
+            elif is_deepseek_v4:
+                step_token = torch.randn(
+                    curr_bs,
+                    args.models.hc_mult,
+                    args.models.dim,
+                    device="cuda",
+                    dtype=torch.bfloat16,
                 )
             else:
                 step_token = torch.randn(
@@ -1234,7 +1251,7 @@ def check_alloc_retries():
     ]
     if cur_alloc_retries > _last_alloc_retries:
         logger.warning(
-            f"{cur_alloc_retries - _last_alloc_retries} allocations successed only "
+            f"{cur_alloc_retries - _last_alloc_retries} allocations succeeded only "
             f"after retrying (freeing memory from PyTorch allocator to CUDA and then "
             f"allocating them back). This will significantly reduce the performance. "
             f"Please try reducing memory usage, for example by lowering "

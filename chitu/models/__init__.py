@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from chitu.models import model_deepseek_v3  # NOQA
+from chitu.models import model_deepseek_v4  # NOQA
 from chitu.models import model_hf_llama  # NOQA
 from chitu.models import model_hf_qwen_3_moe  # NOQA
 from chitu.models import model_hf_qwen2_vl  # NOQA
