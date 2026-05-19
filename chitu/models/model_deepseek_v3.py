@@ -34,6 +34,7 @@ from chitu.models.model import (
     get_linear_layout_contig_y,
 )
 from chitu.models.registry import ModelType, register_model
+from chitu.device_type import is_hygon
 from chitu.native_layout import NativeLayoutTensor
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.ops import (
@@ -1347,6 +1348,31 @@ class TransformerDeepSeekV3(Transformer):
 
         return checkpoint
 
+    def _normalize_hygon_w8a8_kv_b_proj_checkpoint(
+        self, state_dict: dict[str, Any]
+    ) -> None:
+        if self.mla_absorb != "absorb-without-precomp":
+            return
+
+        for k in list(state_dict.keys()):
+            if not k.endswith(".kv_b_proj.weight"):
+                continue
+            if (
+                get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+                is not None
+            ):
+                continue
+
+            w = state_dict[k]
+            scale_key = k + "_scale"
+            if w.dtype != torch.int8 or scale_key not in state_dict:
+                continue
+
+            # Hygon GLM-5-W8A8 stores kv_b_proj as int8+per-channel scale,
+            # while absorb-without-precomp consumes it as an unquantized weight.
+            scale = state_dict.pop(scale_key)
+            state_dict[k] = (w.to(scale.dtype) * scale).to(torch.get_default_dtype())
+
     def _process_state_dict_for_absorption_without_precomputation(
         self, checkpoint: dict[str, Any]
     ):
@@ -1528,6 +1554,18 @@ class TransformerDeepSeekV3(Transformer):
 
             if k.endswith(".kv_b_proj.weight"):
                 prefix = k[: -len("kv_b_proj.weight")]
+                q_b_proj_quant = get_quant_from_checkpoint_prefix(
+                    prefix + "q_b_proj.weight", self.params.quant_config.rules
+                )
+                o_proj_quant = get_quant_from_checkpoint_prefix(
+                    prefix + "o_proj.weight", self.params.quant_config.rules
+                )
+                if "w8a8_dynamic" in (q_b_proj_quant, o_proj_quant):
+                    raise NotImplementedError(
+                        "infer.mla_absorb=absorb is not implemented for "
+                        "w8a8_dynamic q_b_proj/o_proj weights. Use "
+                        "infer.mla_absorb=absorb-without-precomp."
+                    )
                 assert prefix + "kv_b_proj.weight" in checkpoint
                 kv_b_proj_ckpt_weight = checkpoint.pop(k)
                 if quant in [None, "gguf"]:  # blockfp4 skips quantizing MLA
@@ -1854,6 +1892,9 @@ class TransformerDeepSeekV3(Transformer):
         replace: bool = True,
     ) -> dict[str, Any]:
         if not skip_preprocess and replace:
+            if is_hygon():
+                self._normalize_hygon_w8a8_kv_b_proj_checkpoint(state_dict)
+
             for k in list(state_dict.keys()):
                 value = state_dict.pop(k)
                 if "self_attn.rotary_emb.inv_freq" not in k:

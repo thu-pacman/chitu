@@ -389,7 +389,7 @@ class Transformer(nn.Module):
             ret += ["weight"]
         elif quant == "mixq":
             ret += ["fp_weight"]
-        elif quant == "ascend_w8a8_dynamic":
+        elif quant in ("ascend_w8a8_dynamic", "w8a8_dynamic"):
             ret += ["weight_scale", "weight_offset"]
         elif quant == "blockint4":
             ret += ["qweight", "scales"]

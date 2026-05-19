@@ -52,6 +52,7 @@ class QuantizationRegistry:
         "simple_w8a8",
         "mixq",
         "ascend_w8a8_dynamic",
+        "w8a8_dynamic",
         "w4_g128_symm_a8_symm",
         None,
     ]
@@ -63,6 +64,7 @@ class QuantizationRegistry:
         "simple_w8a8",
         "mixq",
         "ascend_w8a8_dynamic",
+        "w8a8_dynamic",
         "w4_g128_symm_a8_symm",
         None,
     ]

@@ -29,6 +29,9 @@ from chitu.native_layout.metax import (
     MuxiNativeLayoutGroupWeight,
 )
 from chitu.native_layout.hygon import (
+    AiterMoeCInt8Gemm1Weight,
+    AiterMoeCInt8Gemm2Weight,
+    HygonDeepGemmW8A8MarlinWeight,
     HygonW4A8Int4TileTensor,
     HygonW4A8Int8TileTensor,
     HygonMixQIntTileTensor,

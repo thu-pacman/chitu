@@ -36,6 +36,7 @@
 | GLM-5 | ✓ | `models=GLM-5` | https://huggingface.co/zai-org/GLM-5 |
 | GLM-5-FP8 | ✓ | `models=GLM-5-FP8` | https://huggingface.co/zai-org/GLM-5-FP8 |
 | GLM-5-FP8-kv | ✓ | `models=GLM-5-FP8-kv` | https://huggingface.co/zai-org/GLM-5-FP8 |
+| GLM-5-W8A8 | ✓ | `models=GLM-5-W8A8` | https://huggingface.co/zai-org/GLM-5 |
 | GLM-5.1 | ✓ | `models=GLM-5.1` | https://huggingface.co/zai-org/GLM-5.1 |
 | GLM-5.1-FP8 | ✓ | `models=GLM-5.1-FP8` | https://huggingface.co/zai-org/GLM-5.1-FP8 |
 | glm-z1-32b |  | `models=GLM-Z1-32B-0414` | https://modelscope.cn/models/ZhipuAI/GLM-Z1-32B-0414/ |
