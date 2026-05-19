@@ -2,7 +2,6 @@ import pytest
 from chitu.kv_cache import (
     PagedKVCacheManager,
     TokenBlock,
-    BlockIdentity,
     BlockIdentityChainBuilder,
     BlockRuntime,
     NONE_BLK_HASH,
@@ -21,6 +20,7 @@ from chitu.scheduler import Scheduler
 @pytest.fixture(autouse=True)
 def setup_global_args():
     """Set up global arguments for tests."""
+    BlockIdentityChainBuilder.clear_registry()
     set_global_args(
         OmegaConf.create(
             {
@@ -48,37 +48,19 @@ def setup_global_args():
     )
 
 
-@pytest.fixture
-def cache_manager():
-    """创建不开启prefix_caching的PagedKVCacheManager实例"""
-    return PagedKVCacheManager(
-        num_blocks=100,
-        num_hot_req=100,
-        max_seq_len=2048,
-        dp_rank=0,
-        block_size=512,
-        enable_prefix_caching=False,
-    )
-
-
-@pytest.fixture
-def cache_manager_with_prefix_caching():
-    """创建开启prefix_caching的PagedKVCacheManager实例"""
-    return PagedKVCacheManager(
-        num_blocks=100,
-        num_hot_req=100,
-        max_seq_len=2048,
-        dp_rank=0,
-        block_size=512,
-        enable_prefix_caching=True,
-    )
-
-
 class TestPagedKVCacheManager:
     """测试PagedKVCacheManager类"""
 
-    def test_initialization(self, cache_manager: PagedKVCacheManager):
+    def test_initialization(self):
         """测试类初始化"""
+        cache_manager = PagedKVCacheManager(
+            num_blocks=100,
+            num_hot_req=100,
+            max_seq_len=2048,
+            dp_rank=0,
+            block_size=512,
+            enable_prefix_caching=False,
+        )
         assert cache_manager.num_blocks == 100
         assert cache_manager.block_size == 512
         assert cache_manager.max_num_blocks == 400
@@ -88,8 +70,16 @@ class TestPagedKVCacheManager:
         assert len(cache_manager.cached_idle_blocks) == 0
         assert cache_manager.enable_prefix_caching is False
 
-    def test_realloc(self, cache_manager: PagedKVCacheManager):
+    def test_realloc(self):
         """测试重新分配block数量"""
+        cache_manager = PagedKVCacheManager(
+            num_blocks=100,
+            num_hot_req=100,
+            max_seq_len=2048,
+            dp_rank=0,
+            block_size=512,
+            enable_prefix_caching=False,
+        )
         cache_manager.realloc(50)
 
         assert cache_manager.num_blocks == 50
@@ -100,8 +90,16 @@ class TestPagedKVCacheManager:
         assert cache_manager.num_blocks == 400
         assert len(cache_manager.free_cache_ids) == 400
 
-    def test_get_free_cache_idx(self, cache_manager: PagedKVCacheManager):
+    def test_get_free_cache_idx(self):
         """测试get_free_cache_idx函数"""
+        cache_manager = PagedKVCacheManager(
+            num_blocks=100,
+            num_hot_req=100,
+            max_seq_len=2048,
+            dp_rank=0,
+            block_size=512,
+            enable_prefix_caching=False,
+        )
 
         # 从free_cache_ids中分配
         idx = cache_manager.get_free_cache_idx()
@@ -125,14 +123,25 @@ class TestPagedKVCacheManager:
         assert 5 not in cache_manager.cached_idle_blocks
         assert runtime.cache_idx is None
 
-    def test_get_free_cache_idx_collects_evicted_blk_hash(
-        self, cache_manager: PagedKVCacheManager
-    ):
+    def test_get_free_cache_idx_collects_evicted_blk_hash(self):
         """测试被动逐出时会记录evicted blk hash，并可按上限批量弹出"""
+        cache_manager = PagedKVCacheManager(
+            num_blocks=100,
+            num_hot_req=100,
+            max_seq_len=2048,
+            dp_rank=0,
+            block_size=4,
+            enable_prefix_caching=False,
+        )
+
         cache_manager.free_cache_ids = deque()
-        block = TokenBlock(tokens=[1, 2, 3, 4], blk_size=4, pre_blk_hash=NONE_BLK_HASH)
-        block.generate_blk_hash()
-        block.cache_idx = 7
+        identity = cache_manager.identity_builder.make_identity(
+            token_chunk=[1, 2, 3, 4],
+            pre_blk_hash=NONE_BLK_HASH,
+            canonical_prefix_hashes=True,
+        )
+
+        block = TokenBlock(identity=identity, runtime=BlockRuntime(cache_idx=7))
         cache_manager.cached_idle_blocks[7] = block
         cache_manager.cache_idx_to_hash[7] = block.blk_hash
 
@@ -143,36 +152,43 @@ class TestPagedKVCacheManager:
         assert popped == [block.blk_hash]
         assert cache_manager.pop_evicted_blk_hashes(max_items=512) == []
 
-    def test_identity_chain_builder(self, cache_manager: PagedKVCacheManager):
+    def test_identity_chain_builder(self):
         """测试BlockIdentityChainBuilder构建逻辑"""
-        builder = BlockIdentityChainBuilder(block_size=cache_manager.block_size)
+        BLOCK_SIZE = 512
+
+        builder = BlockIdentityChainBuilder.acquire("__test_kv_isolated", BLOCK_SIZE)
 
         # 测试pre_blk_hash为None
         tokens = list(range(512))
         identity = builder.make_identity(tokens, NONE_BLK_HASH)
 
         assert list(identity.tokens) == tokens
-        assert identity.blk_size == cache_manager.block_size
+        assert identity.blk_size == BLOCK_SIZE
         assert identity.pre_blk_hash == NONE_BLK_HASH
 
         # 测试给定一个pre_hash值
-        tokens = list(range(cache_manager.block_size))
+        tokens = list(range(BLOCK_SIZE))
         pre_hash = "some_previous_hash"
         identity = builder.make_identity(tokens, pre_hash)
         assert identity.pre_blk_hash == pre_hash
-        assert (
-            identity.blk_hash not in cache_manager.hashed_block_pool
-        )  # 未开启prefix caching，不会维护hashed_block_pool
 
         # 测试tokens长度超过block_size长度
-        tokens = list(range(cache_manager.block_size + 1))
+        tokens = list(range(BLOCK_SIZE + 1))
         with pytest.raises(ValueError):
             builder.make_identity(tokens, NONE_BLK_HASH)
 
-    def test_task_life_cycle_in_cache_manager(self, cache_manager: PagedKVCacheManager):
+    def test_task_life_cycle_in_cache_manager(self):
         """测试任务在cache_manager中的生命周期，
         涉及函数:prepare_metadata_before_prefill/decode, finalize_metadata_all_decode
         """
+        cache_manager = PagedKVCacheManager(
+            num_blocks=100,
+            num_hot_req=100,
+            max_seq_len=2048,
+            dp_rank=0,
+            block_size=512,
+            enable_prefix_caching=False,
+        )
 
         Backend.cache_managers = [{"main": cache_manager}]
 
@@ -185,10 +201,11 @@ class TestPagedKVCacheManager:
 
         # 在scheduler中完成步骤
         task.dp_rank = 0
-        cache_manager.ensure_task_token_blocks(task)
-        token_blocks = cache_manager.get_task_token_blocks(task)
-        assert len(token_blocks) == 2
-        assert task.kv_cache_len_used_in_completed_steps == 0
+        task_n_cached_blocks = cache_manager.num_cached_blocks(task)
+        assert task_n_cached_blocks == 0, f"{task_n_cached_blocks} vs 0"
+        assert (
+            task.kv_cache_len_used_in_completed_steps == 0
+        ), f"{task.kv_cache_len_used_in_completed_steps} vs 0"
         task.set_prefill_chunk_size_for_one_step(300)  # 假如prefill_chunk_size为300
         task.new_cache_ids = {
             "main": cache_manager.prepare_metadata_before_prefill(task)
@@ -197,8 +214,10 @@ class TestPagedKVCacheManager:
         assert task.consumed_req_tokens == 0
         assert task.new_cache_ids["main"] == [0]
         assert cache_manager.task_to_cache_ids[task.task_id] == {0}
-        assert cache_manager.active_blocks[0] is token_blocks[0].runtime
-        assert cache_manager.tid_to_cached_len[task.task_id] == 300
+        task_token_blocks = cache_manager.task_to_token_blocks[task.task_id]
+        assert len(task_token_blocks) == 1, f"{len(task_token_blocks)} vs 1"
+        assert cache_manager.active_blocks[0] is task_token_blocks[0].runtime
+        assert task_token_blocks[0].active_cnt == 1
 
         # 在executor中完成的步骤
         task.consume_req_tokens()
@@ -212,12 +231,11 @@ class TestPagedKVCacheManager:
         task.new_cache_ids = {
             "main": cache_manager.prepare_metadata_before_prefill(task)
         }
-        token_blocks = cache_manager.get_task_token_blocks(task)
         assert task.new_cache_ids["main"] == [1]
         assert cache_manager.task_to_cache_ids[task.task_id] == {0, 1}
-        assert cache_manager.active_blocks[1] is token_blocks[1].runtime
-        assert token_blocks[1].active_cnt == 1
-        assert cache_manager.tid_to_cached_len[task.task_id] == 600
+        assert len(task_token_blocks) == 2
+        assert cache_manager.active_blocks[1] is task_token_blocks[1].runtime
+        assert task_token_blocks[1].active_cnt == 1
 
         # 在executor中完成的步骤
         task.consume_req_tokens()
@@ -243,7 +261,7 @@ class TestPagedKVCacheManager:
                 }
             ),
             need_ensure=False,
-        )
+        )  # task计算kv_cache_len_used_in_completed_steps_and_next_step时会用到全局的mtp_size信息
         cache_manager.mtp_size = 500  # 设定mtp_size为500
 
         # 开始被decode调度
@@ -261,12 +279,11 @@ class TestPagedKVCacheManager:
         task.new_cache_ids = {
             "main": cache_manager.prepare_metadata_before_decode(task)
         }
-        token_blocks = cache_manager.get_task_token_blocks(task)
+
         assert task.new_cache_ids["main"] == [2]
         assert cache_manager.task_to_cache_ids[task.task_id] == {0, 1, 2}
-        assert cache_manager.active_blocks[2] is token_blocks[2].runtime
-        assert token_blocks[1].active_cnt == 1
-        assert cache_manager.tid_to_cached_len[task.task_id] == 1100
+        assert cache_manager.active_blocks[2] is task_token_blocks[2].runtime
+        assert task_token_blocks[1].active_cnt == 1
 
         # 在executor中执行decode step
         task.next_token = 1
@@ -290,72 +307,115 @@ class TestPagedKVCacheManager:
         }
         assert task.new_cache_ids["main"] == []
         assert cache_manager.task_to_cache_ids[task.task_id] == {0, 1, 2}
-        assert cache_manager.tid_to_cached_len[task.task_id] == 1500
+
+
+@pytest.fixture
+def cache_manager_with_prefix_caching():
+    """创建开启prefix_caching的PagedKVCacheManager实例"""
+    return PagedKVCacheManager(
+        num_blocks=100,
+        num_hot_req=100,
+        max_seq_len=2048,
+        dp_rank=0,
+        block_size=512,
+        enable_prefix_caching=True,
+    )
 
 
 class TestPagedKVCacheManagerWithPrefixCaching:
 
-    def test_initialization_with_prefix_caching(
-        self, cache_manager_with_prefix_caching: PagedKVCacheManager
-    ):
+    def test_initialization_with_prefix_caching(self):
         """测试开启prefix_caching"""
-
-        assert cache_manager_with_prefix_caching.enable_prefix_caching is True
-        assert isinstance(
-            cache_manager_with_prefix_caching.hashed_block_pool, WeakValueDictionary
+        cache_manager = PagedKVCacheManager(
+            num_blocks=100,
+            num_hot_req=100,
+            max_seq_len=2048,
+            dp_rank=0,
+            block_size=512,
+            enable_prefix_caching=True,
         )
-        assert len(cache_manager_with_prefix_caching.task_hashed_block_cnt) == 0
+
+        assert cache_manager.enable_prefix_caching is True
+        assert len(cache_manager.task_to_cache_ids) == 0
+        assert len(cache_manager.task_to_token_blocks) == 0
 
     def test_identity_chain_builder_with_prefix_pool(
-        self, cache_manager_with_prefix_caching: PagedKVCacheManager
+        self,
     ):
-        builder = BlockIdentityChainBuilder(
-            block_size=cache_manager_with_prefix_caching.block_size,
-            existing_identities=cache_manager_with_prefix_caching.hashed_block_pool,
+        cache_manager = PagedKVCacheManager(
+            num_blocks=100,
+            num_hot_req=100,
+            max_seq_len=2048,
+            dp_rank=0,
+            block_size=512,
+            enable_prefix_caching=True,
         )
+
+        builder = cache_manager.identity_builder
 
         # tokens长度为blk_size
         tokens = list(range(512))
-        identity_1 = builder.make_identity(tokens, NONE_BLK_HASH, auto_register=True)
-        block1 = TokenBlock(identity=identity_1, runtime=BlockRuntime())
-        cache_manager_with_prefix_caching.refresh_prefix_cache_block(block1)
-
-        assert block1.tokens == tokens
-        assert block1.blk_size == cache_manager_with_prefix_caching.block_size
+        identity_1 = builder.make_identity(
+            tokens,
+            NONE_BLK_HASH,
+            canonical_prefix_hashes=cache_manager.enable_prefix_caching,
+        )
+        block1 = TokenBlock(
+            identity=identity_1, runtime=BlockRuntime(cache_idx=0, active_cnt=1)
+        )
+        cache_manager.upload_to_identity_runtime_pool(block1)
+        assert block1.tokens == tuple(tokens)
+        assert block1.blk_size == cache_manager.block_size
         assert block1.pre_blk_hash == NONE_BLK_HASH
         assert len(block1.blk_hash) == 64  # SHA-256 produces 64 hex characters
-        assert (
-            cache_manager_with_prefix_caching.hashed_block_pool[block1.blk_hash]
-            == block1.identity
-        )
+        assert builder.hashed_block_pool[block1.blk_hash] == block1.identity
+        assert cache_manager.identity_runtime_pool[block1.blk_hash] is block1.runtime
 
         # tokens 长度小于blk_size
         tokens = [1, 2, 3, 4]
-        identity = builder.make_identity(tokens, NONE_BLK_HASH, auto_register=True)
-        assert identity.blk_hash is None
-        assert (
-            identity.blk_hash not in cache_manager_with_prefix_caching.hashed_block_pool
+        identity_2 = builder.make_identity(
+            tokens,
+            NONE_BLK_HASH,
+            canonical_prefix_hashes=cache_manager.enable_prefix_caching,
         )
+        block2 = TokenBlock(
+            identity=identity_2, runtime=BlockRuntime(cache_idx=1, active_cnt=1)
+        )
+        cache_manager.upload_to_identity_runtime_pool(block2)
+        assert block2.blk_hash is None
+        assert block2.blk_hash not in builder.hashed_block_pool
+        assert block2.blk_hash not in cache_manager.identity_runtime_pool
 
         # 相同的tokens和pre_blk_hash，会产生相同的tokenblock
         tokens = list(range(512))
-        identity_2 = builder.make_identity(tokens, NONE_BLK_HASH, auto_register=True)
-        block2 = TokenBlock(identity=identity_2, runtime=BlockRuntime())
-        cache_manager_with_prefix_caching.refresh_prefix_cache_block(block2)
-        assert block2.tokens == tokens
-        assert block2.identity == block1.identity
-        assert block2.runtime == block1.runtime
-        assert (
-            cache_manager_with_prefix_caching.hashed_block_pool[block2.blk_hash]
-            == block2.identity
+        identity_3 = builder.make_identity(
+            tokens,
+            NONE_BLK_HASH,
+            canonical_prefix_hashes=cache_manager.enable_prefix_caching,
         )
-        assert block2.blk_hash == block1.blk_hash
-        assert block2.pre_blk_hash == block1.pre_blk_hash
+        assert identity_3 is block1.identity
+        assert (
+            cache_manager.identity_runtime_pool[identity_3.blk_hash] is block1.runtime
+        )
 
-    def test_task_life_cycle_in_cache_manager(
-        self, cache_manager_with_prefix_caching: PagedKVCacheManager
-    ):
-        main_manager = cache_manager_with_prefix_caching
+        # 若此时为identity_3分配新的runtime并试图同步到cache_manager.identity_runtime_pool,
+        # 不会改变cache_manager.identity_runtime_pool中blk_hash对应的runtime信息(为保持chache_manager与各rank上的KVCache元数据一致)
+        block3 = TokenBlock(
+            identity=identity_3, runtime=BlockRuntime(cache_idx=2, active_cnt=1)
+        )
+        cache_manager.upload_to_identity_runtime_pool(block3)
+        assert cache_manager.identity_runtime_pool[block3.blk_hash] is block1.runtime
+
+    def test_task_life_cycle_in_cache_manager(self):
+        main_manager = PagedKVCacheManager(
+            num_blocks=100,
+            num_hot_req=100,
+            max_seq_len=2048,
+            dp_rank=0,
+            block_size=512,
+            enable_prefix_caching=True,
+        )
+
         Backend.cache_managers = [{"main": main_manager}]
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.cache_manager_dict = {"main": main_manager}
@@ -369,8 +429,8 @@ class TestPagedKVCacheManagerWithPrefixCaching:
 
         # 在scheduler中完成步骤
         task_0.dp_rank = 0
-        main_manager.ensure_task_token_blocks(task_0)
-        assert len(main_manager.task_to_token_blocks[task_0.task_id]) == 2
+        assert main_manager.num_cached_blocks(task_0) == 0
+        assert len(main_manager.identity_builder.tid_to_identities[task_0.task_id]) == 2
         assert task_0.kv_cache_len_used_in_completed_steps == 0
         task_0.set_prefill_chunk_size_for_one_step(1024)  # 假如prefill_chunk_size为1024
         scheduler._prepare_prefill_metadata(task_0, cached_len=0)
@@ -381,9 +441,18 @@ class TestPagedKVCacheManagerWithPrefixCaching:
             0,
             1,
         }
+        task0_token_blocks = main_manager.task_to_token_blocks[task_0.task_id]
+        assert len(task0_token_blocks) == 2
+        assert (
+            main_manager.identity_runtime_pool[task0_token_blocks[0].blk_hash]
+            == task0_token_blocks[0].runtime
+        )
+        assert (
+            main_manager.identity_runtime_pool[task0_token_blocks[1].blk_hash]
+            == task0_token_blocks[1].runtime
+        )
         assert len(main_manager.active_blocks) == 2
         assert len(main_manager.cached_idle_blocks) == 0
-        assert main_manager.tid_to_cached_len[task_0.task_id] == 1024
 
         # 在executor中完成的步骤
         task_0.consume_req_tokens()
@@ -392,70 +461,53 @@ class TestPagedKVCacheManagerWithPrefixCaching:
         assert task_0.consumed_req_tokens == 1024
         assert task_0.task_type == TaskType.Decode
 
-        # task_0在做一次decode，才能把hashed + cached block存入到cache_manager_with_prefix_caching.hashed_block_pool中
-        task_0.new_cache_ids = {
-            "main": main_manager.prepare_metadata_before_decode(task_0)
-        }
-        assert main_manager.task_hashed_block_cnt[task_0.task_id] == 2
-        assert (
-            main_manager.get_task_token_blocks(task_0)[0].blk_hash
-            in main_manager.hashed_block_pool
-        )
-        assert (
-            main_manager.get_task_token_blocks(task_0)[1].pre_blk_hash
-            == main_manager.get_task_token_blocks(task_0)[0].blk_hash
-        )
-
-        # 测试req_1的token被部分击中时
-        # 此时来了一条req_1请求
+        # 此时来了一条req_1请求, 测试req_1的token被部分击中
         req_1 = UserRequest.create_mock(
             input_len=600, request_id=f"req_1", enable_thinking=False
         )
         task_1 = Task(f"{req_1.request_id}", req_1)
         task_1.task_type == TaskType.Prefill
         task_1.dp_rank = 0
-        main_manager.ensure_task_token_blocks(task_1)
-        assert len(main_manager.get_task_token_blocks(task_1)) == 2
+        assert main_manager.num_cached_blocks(task_1) == 1
+        assert len(main_manager.identity_builder.tid_to_identities[task_1.task_id]) == 2
         assert main_manager.num_cached_blocks(task_1) * main_manager.block_size == 512
 
         # 暂不调度task_1，让task_0结束推理
         main_manager.finalize_metadata_all_decode(task_0)
-        for block in main_manager.get_task_token_blocks(task_0):
+        for block in task0_token_blocks:
             assert block.active_cnt == 0
         assert len(main_manager.active_blocks) == 0
-        assert len(main_manager.cached_idle_blocks.keys()) == 3
-        assert task_0.task_id not in main_manager.tid_to_cached_len
+        assert len(main_manager.cached_idle_blocks.keys()) == 2
         assert task_0.task_id not in main_manager.task_to_cache_ids
-        assert task_0.task_id not in main_manager.task_hashed_block_cnt
+        assert task_0.task_id not in main_manager.task_to_token_blocks
+        assert task_0.task_id not in main_manager.identity_builder.tid_to_identities
 
-        # free_cache_ids: [3,4,...], active_blocks:{}, cached_idle_blocks: {0,1,2}
+        # free_cache_ids: [2,3,4,...], active_blocks:{}, cached_idle_blocks: {0,1}
         # 调度task_1
-        num_uncomputed_tokens = task_1.prefix_tokens_len - (
+        num_cached_tokens = (
             main_manager.num_cached_blocks(task_1) * main_manager.block_size
         )
+        num_uncomputed_tokens = task_1.prefix_tokens_len - num_cached_tokens
         assert num_uncomputed_tokens == 88
         task_1.set_prefill_chunk_size_for_one_step(88)
-        scheduler._prepare_prefill_metadata(task_1, cached_len=512)
+        scheduler._prepare_prefill_metadata(task_1, cached_len=num_cached_tokens)
         assert task_1.consumed_req_tokens == 512
         assert task_1.prefill_chunk_size == 88
-        assert task_1.new_cache_ids["main"] == [0, 3]
+        assert task_1.new_cache_ids["main"] == [0, 2]
         assert main_manager.task_to_cache_ids[task_1.task_id] == {
             0,
-            3,
+            2,
         }
-        assert len(main_manager.active_blocks) == 2  # [0,3]
-        assert len(main_manager.cached_idle_blocks.keys()) == 2  # [1,2]
-        assert main_manager.tid_to_cached_len[task_1.task_id] == 600
+        assert len(main_manager.active_blocks) == 2  # [0,2]
+        assert len(main_manager.cached_idle_blocks.keys()) == 1  # [1]
 
-        # 测试req_2的token被全部击中时
+        # 测试req_2的token被全部击中
         req_2 = UserRequest.create_mock(
             input_len=1024, request_id=f"req_2", enable_thinking=False
         )
         task_2 = Task(f"{req_2.request_id}", req_2)
         task_2.task_type == TaskType.Prefill
         task_2.dp_rank = 0
-        main_manager.ensure_task_token_blocks(task_2)
-        assert len(main_manager.get_task_token_blocks(task_2)) == 2
         assert (
             main_manager.num_cached_blocks(task_2) * main_manager.block_size == 1024
         )  # 被prefix caching击中
@@ -472,27 +524,23 @@ class TestPagedKVCacheManagerWithPrefixCaching:
             0,
             1,
         }
-        assert len(main_manager.active_blocks) == 3
-        assert main_manager.tid_to_cached_len[task_2.task_id] == 1024
-
+        assert len(main_manager.active_blocks) == 3  # [0,1,2]
         main_manager.finalize_metadata_all_decode(task_1)
         main_manager.finalize_metadata_all_decode(task_2)
 
 
 class TestBlockBuilderInterfaces:
     def test_identity_chain_builder_reuses_existing_identity(self):
-        existing: dict[str, BlockIdentity] = {}
-        builder = BlockIdentityChainBuilder(block_size=4, existing_identities=existing)
-        first = builder.make_identity([1, 2, 3, 4], NONE_BLK_HASH, auto_register=True)
-        second = builder.make_identity([1, 2, 3, 4], NONE_BLK_HASH, auto_register=False)
+        builder = BlockIdentityChainBuilder.acquire("__pytest_iface_collision", 4)
+        first = builder.make_identity([1, 2, 3, 4], NONE_BLK_HASH)
+        second = builder.make_identity([1, 2, 3, 4], NONE_BLK_HASH)
         assert first is second
-        assert first.blk_hash in existing
+        assert first.blk_hash in builder.hashed_block_pool
 
     def test_identity_chain_builder_chain(self):
-        existing: dict[str, BlockIdentity] = {}
-        builder = BlockIdentityChainBuilder(block_size=4, existing_identities=existing)
-        identities = builder.build(tokens=[1, 2, 3, 4, 5, 6, 7, 8], auto_register=True)
+        builder = BlockIdentityChainBuilder.acquire("__pytest_iface_chain", 4)
+        identities = builder.make_identity_chain_from_tokens([1, 2, 3, 4, 5, 6, 7, 8])
         assert len(identities) == 2
         assert identities[0].blk_hash is not None
         assert identities[1].pre_blk_hash == identities[0].blk_hash
-        assert identities[0].blk_hash in existing
+        assert identities[0].blk_hash in builder.hashed_block_pool

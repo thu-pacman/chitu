@@ -22,7 +22,10 @@ import msgpack
 from typing import Optional
 
 from chitu.task import UserRequest
-from chitu.kv_cache import BlockIdentity, BlockIdentityChainBuilder
+from chitu.kv_cache.prefix_caching import (
+    BlockIdentity,
+    BlockIdentityChainBuilder,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,9 @@ from chitu.schemas.serve_config import RouterConfig as ServeRouterConfig
 
 NUM_ESTIMATED_TOKENS_PER_REQ = 100
 PENDING_TOKENS_WEIGHT = 1 / NUM_ESTIMATED_TOKENS_PER_REQ  # 0.01
+
+# Router-side prefix scoring shares BlockIdentityChainBuilder with this logical name.
+ROUTER_BLOCK_IDENTITY_MANAGER_NAME = "router"
 
 
 class RoutePolicy:
@@ -180,11 +186,6 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         #  - insert BlockIdentities of the request when the first token arrived.
         #  - evict the earlist BlockIdenty when out lru capacity.
         self.cached_blocks: dict[int, OrderedDict[str, BlockIdentity]] = {}
-        # Router-side Per-instance hashed blocks, for hash collision solving
-        # The element lifecycle in the hashed_blocks :
-        # - insert BlockIdentity when making identity
-        # - remove when the BlockIdenty is evicted from all lru.
-        self.hashed_blocks: dict[str, BlockIdentity] = {}
 
         # Per-instance cache metadata from stats channel.
         self.instances_num_total_blocks: dict[int, int] = {}
@@ -227,9 +228,9 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         if not prompt_tokens:
             return []
 
-        return BlockIdentityChainBuilder(block_size, self.hashed_blocks).build(
-            prompt_tokens, auto_register=True
-        )
+        return BlockIdentityChainBuilder.acquire(
+            ROUTER_BLOCK_IDENTITY_MANAGER_NAME, block_size
+        ).make_identity_chain_from_tokens(prompt_tokens)
 
     def num_hit_blocks(self, scheduler_id: int, req_blocks: list[BlockIdentity]) -> int:
         # Count contiguous prefix hits from the beginning of block chain.
@@ -320,8 +321,6 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             while len(lru) > cap:
                 # Router local LRU eviction (shadow cache only).
                 evicted_hash, _ = lru.popitem(last=False)
-                if all(evicted_hash not in lru for lru in self.cached_blocks.values()):
-                    self.hashed_blocks.pop(evicted_hash, None)
                 self._push_evict_buffer(scheduler_id, evicted_hash)
 
     def forget_request(self, request_id: str) -> None:
@@ -338,8 +337,6 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             if blk_hash in buffer or blk_hash in lru:
                 buffer.pop(blk_hash, None)
                 lru.pop(blk_hash, None)
-                if all(blk_hash not in l for l in self.cached_blocks.values()):
-                    self.hashed_blocks.pop(blk_hash, None)
             else:
                 logger.warning(
                     "[REQUEST_ROUTER] instance evict hash not found in cached_blocks "

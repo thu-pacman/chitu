@@ -316,13 +316,13 @@ class Scheduler:
         if cached_len == task.prefix_tokens_len:
             cached_len = task.prefix_tokens_len - 1
 
-        for name, cache_manager in self.cache_manager_dict.items():
-            task.new_cache_ids[name] = cache_manager.prepare_metadata_before_prefill(
-                task, max_cached_token_len=cached_len
-            )
-
         task.inc_hit_tokens = cached_len - task.consumed_req_tokens
         task.consumed_req_tokens = cached_len
+
+        for name, cache_manager in self.cache_manager_dict.items():
+            task.new_cache_ids[name] = cache_manager.prepare_metadata_before_prefill(
+                task
+            )
 
     def _prepare_decode_metadata(self, task) -> None:
         for name, cache_manager in self.cache_manager_dict.items():
@@ -345,7 +345,7 @@ class Scheduler:
         self.scheduling_ts = time.perf_counter_ns()
 
         # collect ready task ids
-        n_running = len(self.cache_manager_dict["main"].tid_to_cached_len)
+        n_running = len(self.cache_manager_dict["main"].task_to_cache_ids)
 
         task_ids: list[str] = []
         for task_id in TaskPool.id_list:
@@ -512,9 +512,6 @@ class Scheduler:
                 else task.prefix_tokens_len
             )
 
-            for _, cache_manager in self.cache_manager_dict.items():
-                cache_manager.ensure_task_token_blocks(task)
-
             # check task's remain tokens
 
             # task.prefix_tokens_len: in prefill stage, it's prompt length
@@ -578,7 +575,7 @@ class Scheduler:
                 decode_task_ids.append(tid)
             elif (
                 task.task_type == TaskType.Prefill
-                and task.task_id in self.cache_manager_dict["main"].tid_to_cached_len
+                and task.task_id in self.cache_manager_dict["main"].task_to_cache_ids
             ):
                 cached_prefill_task_ids.append(tid)
 

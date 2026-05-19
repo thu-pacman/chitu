@@ -1055,7 +1055,7 @@ def _update_tasks_preferred_dp_rank():
         # paged kv cache
         projected_running_tasks_per_dp = [
             len(
-                Backend.schedulers[dp_rank].cache_manager_dict["main"].tid_to_cached_len
+                Backend.schedulers[dp_rank].cache_manager_dict["main"].task_to_cache_ids
             )
             for dp_rank in range(dp_size)
         ]
@@ -1082,7 +1082,6 @@ def _update_tasks_preferred_dp_rank():
                 cache_managers = list(Backend.cache_managers[dp_rank].values())
                 cached_tokens = task.prefix_tokens_len
                 for cache_manager in cache_managers:
-                    cache_manager.ensure_task_token_blocks(task)
                     manager_cached_tokens = (
                         cache_manager.num_cached_blocks(task) * cache_manager.block_size
                     )
@@ -1104,11 +1103,6 @@ def _update_tasks_preferred_dp_rank():
                 best_dp_rank = dp_rank
 
         task.preferred_dp_rank = best_dp_rank
-        if enable_prefix_caching:
-            for dp_rank in range(dp_size):
-                if dp_rank != best_dp_rank:
-                    for cache_manager in Backend.cache_managers[dp_rank].values():
-                        cache_manager.drop_task_token_blocks(task)
         if best_dp_rank is not None:
             projected_running_tasks_per_dp[best_dp_rank] += 1
 
