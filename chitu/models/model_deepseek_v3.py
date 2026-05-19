@@ -478,6 +478,18 @@ class AttentionDeepSeekV3(Attention):
                 checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
             )
         elif self.mla_absorb == "absorb-without-precomp":
+            kv_b_proj_features_per_head = self.qk_nope_head_dim + self.v_head_dim
+            absorb_block_size = block_size
+            if (
+                quant == "blockfp8"
+                and block_size == 128
+                and (
+                    self.qk_nope_head_dim % block_size != 0
+                    or kv_b_proj_features_per_head % block_size != 0
+                )
+            ):
+                absorb_block_size = 64
+            absorb_quant_kwargs = {"blockfp8": {"block_size": absorb_block_size}}
             self.kv_b_proj_absorb_1 = ParallelAbsorbGemm(
                 self.n_heads,
                 self.qk_nope_head_dim,
@@ -487,14 +499,14 @@ class AttentionDeepSeekV3(Attention):
                     if self.can_use_mla_prologue_torch_npu
                     else None
                 ),
-                quant_kwargs={"blockfp8": {"block_size": block_size}},
+                quant_kwargs=absorb_quant_kwargs,
                 checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
             )
             self.kv_b_proj_absorb_2 = ParallelAbsorbGemm(
                 self.n_heads,
                 self.kv_lora_rank,
                 self.v_head_dim,
-                quant_kwargs={"blockfp8": {"block_size": block_size}},
+                quant_kwargs=absorb_quant_kwargs,
                 checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
             )
 
@@ -1340,7 +1352,6 @@ class TransformerDeepSeekV3(Transformer):
     ):
         tp_size = get_tp_size()
         n_local_heads = self.params.n_heads // tp_size
-
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
@@ -1350,6 +1361,19 @@ class TransformerDeepSeekV3(Transformer):
             ):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".kv_b_proj.{tensor_name}")]
+                src_key = f"{prefix}.kv_b_proj.{tensor_name}"
+                if src_key not in checkpoint:
+                    continue
+                block_size = 16 if quant in ["blockfp4"] else 128
+                absorbed_dim = self.params.qk_nope_head_dim + self.params.v_head_dim
+                use_blockfp8_absorb64 = (
+                    quant == "blockfp8"
+                    and block_size == 128
+                    and (
+                        self.params.qk_nope_head_dim % block_size != 0
+                        or absorbed_dim % block_size != 0
+                    )
+                )
                 if k.endswith(f".kv_b_proj.input_scale") or k.endswith(
                     f".kv_b_proj.weight_scale_2"
                 ):
@@ -1359,14 +1383,91 @@ class TransformerDeepSeekV3(Transformer):
                     checkpoint[f"{prefix}.kv_b_proj_absorb_2.{tensor_name}"] = (
                         checkpoint.pop(k).view(1, 1)
                     )
-                else:
-                    kv_b_proj_weight = checkpoint.pop(
-                        f"{prefix}.kv_b_proj.{tensor_name}"
+                elif tensor_name == "scale" and use_blockfp8_absorb64:
+                    continue
+                elif tensor_name == "weight" and use_blockfp8_absorb64:
+                    absorb_block_size = 64
+                    assert self.params.qk_nope_head_dim % absorb_block_size == 0
+                    assert self.params.v_head_dim % absorb_block_size == 0
+                    assert self.params.kv_lora_rank % absorb_block_size == 0
+                    kv_b_proj_weight = checkpoint.pop(src_key)
+                    kv_b_proj_scale = checkpoint.pop(f"{prefix}.kv_b_proj.scale")
+                    kv_b_proj_in_features = kv_b_proj_weight.shape[-1]
+                    kv_b_proj_weight = kv_b_proj_weight.view(
+                        n_local_heads,
+                        absorbed_dim,
+                        kv_b_proj_in_features,
                     )
+                    if kv_b_proj_scale.dim() == 2:
+                        kv_b_proj_scale = kv_b_proj_scale.repeat_interleave(
+                            2, dim=0
+                        ).repeat_interleave(2, dim=1)
+                        kv_b_proj_scale = kv_b_proj_scale[
+                            : n_local_heads * (absorbed_dim // absorb_block_size),
+                            : kv_b_proj_in_features // absorb_block_size,
+                        ].reshape(
+                            n_local_heads,
+                            absorbed_dim // absorb_block_size,
+                            kv_b_proj_in_features // absorb_block_size,
+                        )
+                    else:
+                        assert kv_b_proj_scale.dim() == 3
+                        kv_b_proj_scale = kv_b_proj_scale.repeat_interleave(
+                            2, dim=1
+                        ).repeat_interleave(2, dim=2)
+                        kv_b_proj_scale = kv_b_proj_scale[
+                            :,
+                            : absorbed_dim // absorb_block_size,
+                            : kv_b_proj_in_features // absorb_block_size,
+                        ]
+                    qk_nope_scale_blocks = (
+                        self.params.qk_nope_head_dim // absorb_block_size
+                    )
+                    kv_b_proj_absorb_1_weight = (
+                        kv_b_proj_weight[:, : self.params.qk_nope_head_dim]
+                        .permute(0, 2, 1)
+                        .contiguous()
+                    )
+                    kv_b_proj_absorb_2_weight = kv_b_proj_weight[
+                        :, self.params.qk_nope_head_dim :
+                    ]
+                    kv_b_proj_absorb_1_scale = kv_b_proj_scale[
+                        :, :qk_nope_scale_blocks
+                    ].permute(0, 2, 1)
+                    kv_b_proj_absorb_2_scale = kv_b_proj_scale[:, qk_nope_scale_blocks:]
+                    checkpoint[f"{prefix}.kv_b_proj_absorb_1.weight"] = (
+                        kv_b_proj_absorb_1_weight.reshape(
+                            n_local_heads,
+                            self.params.kv_lora_rank,
+                            self.params.qk_nope_head_dim,
+                        )
+                    )
+                    checkpoint[f"{prefix}.kv_b_proj_absorb_1.scale"] = (
+                        kv_b_proj_absorb_1_scale.reshape(
+                            n_local_heads,
+                            self.params.kv_lora_rank // absorb_block_size,
+                            self.params.qk_nope_head_dim // absorb_block_size,
+                        ).contiguous()
+                    )
+                    checkpoint[f"{prefix}.kv_b_proj_absorb_2.weight"] = (
+                        kv_b_proj_absorb_2_weight.reshape(
+                            n_local_heads,
+                            self.params.v_head_dim,
+                            self.params.kv_lora_rank,
+                        )
+                    )
+                    checkpoint[f"{prefix}.kv_b_proj_absorb_2.scale"] = (
+                        kv_b_proj_absorb_2_scale.reshape(
+                            n_local_heads,
+                            self.params.v_head_dim // absorb_block_size,
+                            self.params.kv_lora_rank // absorb_block_size,
+                        ).contiguous()
+                    )
+                else:
+                    kv_b_proj_weight = checkpoint.pop(src_key)
                     kv_b_proj_weight = kv_b_proj_weight.view(
                         n_local_heads, -1, kv_b_proj_weight.shape[-1]
                     )
-                    absorbed_dim = self.params.qk_nope_head_dim + self.params.v_head_dim
                     assert absorbed_dim % kv_b_proj_weight.shape[1] == 0
                     ratio = absorbed_dim // kv_b_proj_weight.shape[1]
                     kv_b_proj_absorb_1_weight = kv_b_proj_weight[

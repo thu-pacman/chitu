@@ -923,11 +923,7 @@ def chitu_init(args):
 
     if args.infer.mla_absorb == "auto":
         if args.models.type == ModelType.DEEPSEEK_V3:
-            if args.models.name.lower() in {"GLM-5-FP8".lower(), "GLM-5.1-FP8".lower()}:
-                # GLM-5-FP8's quantization blocking stops using absorb-without-precomp
-                args.infer.mla_absorb = "absorb"
-            else:
-                args.infer.mla_absorb = "absorb-without-precomp"
+            args.infer.mla_absorb = "absorb-without-precomp"
         else:
             args.infer.mla_absorb = "none"
 

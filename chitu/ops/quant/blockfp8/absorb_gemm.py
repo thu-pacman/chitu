@@ -76,7 +76,12 @@ def _einsum_shc_hdc_shd_triton(
     assert group_B.dim() == 3
     assert group_A.shape[1] == group_B.shape[0]
     assert group_A.shape[2] == group_B.shape[2]
-    assert block_size == 128
+    assert block_size in [64, 128]
     return blockfp8_einsum_shc_hdc_shd_triton(
-        group_A, group_B, group_b_s, group_n=group_n, group_k=group_k, soft_fp8=soft_fp8
+        group_A,
+        group_B,
+        group_b_s,
+        group_n=group_n,
+        group_k=group_k,
+        soft_fp8=soft_fp8,
     )
