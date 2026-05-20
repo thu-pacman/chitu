@@ -23,7 +23,7 @@ from chitu.kv_cache.registry import (
     default_paged_block_size_policy,
     get_kv_cache_spec,
 )
-from chitu.kv_cache.utils import build_layer_id_map
+from chitu.kv_cache.utils import build_layer_id_map, build_layer_id_map_lastlayer
 from chitu.models.registry import ModelType
 from chitu.utils import ceil_div
 
@@ -225,6 +225,18 @@ def _build_linear_cache(args, *, layer_filter_fn=lambda x: x):
     )
 
 
+def build_mtp_cache(args):
+    device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
+    layer_id_map = build_layer_id_map_lastlayer(args)
+    spec = get_kv_cache_spec(args, None, cache_name="mtp")
+    return SingletonPagedKVCache(
+        layer_id_map,
+        num_hot_req=ceil_div(args.infer.max_batch_size, args.infer.dp_size),
+        shape_per_token_dict=spec.kvargs["shape_per_token_dict"],
+        device=device,
+    )
+
+
 def _build_indexer_cache(args):
     device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
     layer_id_map = build_layer_id_map(args)
@@ -360,6 +372,7 @@ def _build_qwen3_next_cache_managers(args, attn_backend_type) -> CacheBuildBundl
         "main": main_cache,
         "linear": _build_linear_cache(args, layer_filter_fn=filter_linear),
     }
+
     return CacheBuildBundle(
         cache_type=args.infer.cache_type,
         cache_dict=cache_dict,

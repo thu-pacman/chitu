@@ -116,7 +116,7 @@ class DPTokenSender:
     def send_token(
         self,
         request_id: str,
-        token: Optional[int],
+        tokens: list[int],
         top_logprobs: Optional[list[float]] = None,
         top_token_idx: Optional[list[int]] = None,
         task: Task | None = None,  # Add task parameter to record ttft
@@ -130,7 +130,7 @@ class DPTokenSender:
         data = dict(
             type="token",
             request_id=request_id,
-            token=token,
+            tokens=tokens,
             top_logprobs=top_logprobs,
             top_token_idx=top_token_idx,
             scheduler_id=self.dp_group_id,
@@ -144,7 +144,7 @@ class DPTokenSender:
             if _created_ts is not None:
                 observe_ttft(time.time() - _created_ts)
             logger.debug(
-                f"DP Token Sender: [request {request_id}] first token, prompt_len={task.req.prompt_len}, token={token}"
+                f"DP Token Sender: [request {request_id}] first token, prompt_len={task.req.prompt_len}, tokens={tokens}"
             )
         self._send_data(data)
 
@@ -156,7 +156,7 @@ class DPTokenSender:
     ):
         """Send request finish signal"""
         # Clean up caches for this request
-        self.send_token(request_id, None)
+        self.send_token(request_id, [])
         self.request_token_cache.pop(request_id, None)
         self._chars_len.pop(request_id, None)
         self._first_token_sent.discard(request_id)
@@ -227,15 +227,15 @@ class DPTaskWrapper:
         self._original_update_decode_status = original_task.update_decode_status
         original_task.update_decode_status = self._dp_update_decode_status
 
-    def _dp_update_response_sync(self, token: int):
+    def _dp_update_response_sync(self, tokens: list[int]):
         """Override update_response_sync to also send token to Router"""
-        self._original_update_response_sync(token)
+        self._original_update_response_sync(tokens)
         # Enqueue in order to keep relative order with finish
-        self._send_token_to_router(token)
+        self._send_token_to_router(tokens)
 
-    def _dp_update_decode_status(self):
+    def _dp_update_decode_status(self, tokens: list[int]):
         """Override update_decode_status to detect finish and send signal"""
-        result = self._original_update_decode_status()
+        result = self._original_update_decode_status(tokens)
 
         # Check if task just finished and we haven't sent finish yet
         if not self._finish_sent and self.original_task.need_remove():
@@ -244,7 +244,7 @@ class DPTaskWrapper:
             self.token_sender.send_finish(
                 request_id,
                 finish_reason,
-                getattr(self.original_task.req, "num_hit_tokens", 0),
+                self.original_task.req.num_hit_tokens,
             )
             self._finish_sent = True
             self.original_task.pd_exec_end_logged = True
@@ -257,20 +257,20 @@ class DPTaskWrapper:
 
         return result
 
-    def _send_token_to_router(self, token: int):
+    def _send_token_to_router(self, tokens: list[int]):
         """Synchronously enqueue current token to Router sending queue (lightweight, keep order)"""
         request_id = self.original_task.req.request_id
 
         self.token_sender.send_token(
             request_id=request_id,
-            token=token,
+            tokens=tokens,
             top_logprobs=None,
             top_token_idx=None,
             task=self.original_task,
         )
 
         logger.debug(
-            f"[DPTaskWrapper] Token sent successfully: {request_id} -> {token}"
+            f"[DPTaskWrapper] Token sent successfully: {request_id} -> {tokens}"
         )
 
     def __getattr__(self, name):

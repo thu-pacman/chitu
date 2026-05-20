@@ -2028,11 +2028,6 @@ class TransformerDeepSeekV3(Transformer):
         return h
 
     @override
-    def _get_prefill_previous_hidden_states(self, h):
-        self.prefill_main_last_hidden_states = self.norm(h, compute_dtype=h.dtype)
-        return torch.roll(self.prefill_main_last_hidden_states, shifts=1, dims=0)
-
-    @override
     def _post_layers_mtp(self, h):
         if not getattr(self.params, "mtp_tie_lm_head", False):
             return self.layers[-1].shared_head(h)

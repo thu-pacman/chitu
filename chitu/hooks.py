@@ -40,7 +40,7 @@ class KVTransferHook(Protocol):
     receive KV before decode. Default (NoopKVTransferHook) does nothing.
     """
 
-    def on_prefill_done(self, tokens: torch.Tensor | None, tasks: PackedTasksBase):
+    def on_prefill_done(self, tasks: PackedTasksBase):
         pass
 
     def before_decode_step(
@@ -53,7 +53,7 @@ class KVTransferHook(Protocol):
 
 
 class NoopKVTransferHook:
-    def on_prefill_done(self, tokens: torch.Tensor | None, tasks: PackedTasksBase):
+    def on_prefill_done(self, tasks: PackedTasksBase):
         return
 
     def before_decode_step(
@@ -75,10 +75,9 @@ class TokenSink(Protocol):
     def emit_batch(
         self,
         task_list: list[Task],
-        token_list: list[int],
+        token_list: list[list[int]],
         logprobs_list: Optional[list[list[float]]] = None,
         token_idxs_list: Optional[list[list[int]]] = None,
-        mtp_token_list: Optional[list[list[int]]] = None,
     ) -> None:
         pass
 
@@ -87,20 +86,13 @@ class LocalTokenSink:
     def emit_batch(
         self,
         task_list: list[Task],
-        token_list: list[int],
+        token_list: list[list[int]],
         logprobs_list: Optional[list[list[float]]] = None,
         token_idxs_list: Optional[list[list[int]]] = None,
-        mtp_token_list: Optional[list[list[int]]] = None,
     ) -> None:
         if logprobs_list is None or token_idxs_list is None:
-            if mtp_token_list is None:
-                for task, token in zip(task_list, token_list):
-                    task.req.add_data(token, notify_server=False)
-            else:
-                for task, token, value_list in zip(
-                    task_list, token_list, mtp_token_list
-                ):
-                    task.req.add_data(value_list + [token], notify_server=False)
+            for task, token in zip(task_list, token_list):
+                task.req.add_data(token, notify_server=False)
         else:
             for task, token, logprobs, token_idxs in zip(
                 task_list, token_list, logprobs_list, token_idxs_list
@@ -129,10 +121,9 @@ class DPTokenSink:
     def emit_batch(
         self,
         task_list: list[Task],
-        token_list: list[int],
+        token_list: list[list[int]],
         logprobs_list: Optional[list[list[float]]] = None,
         token_idxs_list: Optional[list[list[int]]] = None,
-        mtp_token_list: Optional[list[list[int]]] = None,
     ) -> None:
         return
 
@@ -149,13 +140,20 @@ class MooncakeKVTransferHook:
         self.kv_manager = kv_manager
         self.mode = disaggregation_mode
 
-    def on_prefill_done(self, send_tokens: torch.Tensor | None, tasks: PackedTasksBase):
+    def on_prefill_done(self, tasks: PackedTasksBase):
         if self.kv_manager is None:
             return
         if self.mode != "prefill":
             return
         if tasks.num_tasks == 0 and not DPTaskCollector.available():
             return
+
+        send_tokens = None
+        if isinstance(tasks, PackedTasks) and tasks.generated_result is not None:
+            send_tokens = tasks.generated_result.tokens
+
+        # Send KV cache and first-token metadata to decode side.
+        kv_cache = self.kv_manager.kv_cache
 
         if tasks.num_tasks > 0:
             # Send KV cache and first-token metadata to decode side.
@@ -166,9 +164,7 @@ class MooncakeKVTransferHook:
             for t in getattr(tasks, "output_tasks", []):
                 if t is None or getattr(t, "req", None) is None:
                     continue
-                request_cached_tokens[str(t.req.request_id)] = int(
-                    getattr(t.req, "num_hit_tokens", 0)
-                )
+                request_cached_tokens[str(t.req.request_id)] = int(t.req.num_hit_tokens)
             if pd_verbose_enabled():
                 if send_tokens is None:
                     # 看到该日志表示：该 rank 只传输 KV Cache（不包含首 token）
@@ -335,16 +331,15 @@ class MooncakeKVTransferHook:
             # Worker rank 的 task 没有 req；先把值挂在 task 上，后续由主 rank 汇聚回传。
             task._pd_cached_hit_tokens_for_dp_emit = int(cached_hit_tokens_i)
             if not task.has_next_token():
-                task.update_response_sync(int(token))
+                task.update_response_sync([int(token)])
                 # DP worker rank 的 task 没有被 DPTaskWrapper 替换 update_response_sync，
                 # 上面的 update_response_sync 只更新了本地状态，不会把 token 发给 Router。
                 # 在 task 上标记这个 token，后续 collect_token 会把它带回 rank 0 补发。
-                task._pd_first_token_for_dp_emit = int(token)
-            if getattr(task, "req", None) is not None and not getattr(
-                task, "_pd_first_token_applied", False
-            ):
+                if Backend.executor.rank != 0:
+                    task._pd_first_token_for_dp_emit = int(token)
+            if task.req is not None and not task._pd_first_token_applied:
                 task.req.num_hit_tokens = max(
-                    int(getattr(task.req, "num_hit_tokens", 0)),
+                    int(task.req.num_hit_tokens),
                     int(cached_hit_tokens_i),
                 )
                 task._pd_first_token_applied = True

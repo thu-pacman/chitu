@@ -9,7 +9,7 @@ import torch
 
 from chitu.static_tensor import StaticTensor
 from chitu.cuda_graph import cuda_graph_safe_cached_property
-from chitu.utils import invalidate_cached_property
+from chitu.utils import invalidate_cached_property, create_tensor
 
 
 class BatchedSeqLen:
@@ -115,7 +115,7 @@ class BatchedSeqLen:
     def copy_from_list(self, lens_list: list[int]):
         self.lens_list = lens_list
         self.lens_static_tensor_device.set(
-            torch.tensor(self.lens_list, device=self.device, dtype=torch.int32)
+            create_tensor(self.lens_list, device=self.device, dtype=torch.int32)
         )
 
         if self.cache_prefix_lens_tensor_device:

@@ -70,6 +70,10 @@ from chitu.quantization import (
 )
 from chitu.hybrid_device import CPUParameter
 from chitu.static_tensor import StaticTensor
+from chitu.ops.kv_cache import (
+    read_from_singleton_paged_kv_cache,
+    update_singleton_paged_kv_cache,
+)
 
 triton, has_triton = try_import_platform_dep("triton")
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
@@ -311,22 +315,15 @@ class Transformer(nn.Module):
         self.moe_impl = get_moe_impl()
 
         if self.mtp_size > 1:
-            self.token_offset_list = None
-            self.mtp_token_list = None
-            self.prefill_main_last_hidden_states = None
-            self.last_hidden_states_4_postprocess = None
-            self.main_last_hidden_states_static = StaticTensor(
-                max_nelem=self.max_batch_size_per_dp * self.params.dim * self.mtp_size,
-                dtype=torch.bfloat16,
+            self.mtp_accept_indices = StaticTensor(
+                max_nelem=self.max_batch_size_per_dp,
+                dtype=torch.int64,
                 device=self.device,
             )
-            self.mtp_last_hidden_states_static = StaticTensor(
-                max_nelem=self.max_batch_size_per_dp * self.params.dim,
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            self.main_last_hidden_states_up_to_date = False
-            self.lhs_ = None
+            self.draft_tokens: torch.Tensor | None = None
+            """ draft tokens, with shape (bs, mtp_size - 1) """
+            self.draft_logits: torch.Tensor | None = None
+            """ draft token logits, with shape (bs, mtp_size - 1, vocab_size) """
 
         dummy_input_shape = [0, self.params.dim]
         self.dummy_input = torch.empty(
@@ -1085,9 +1082,6 @@ class Transformer(nn.Module):
         """NOTE: _post_layers is assumed to be a token-wise computation"""
         raise NotImplementedError
 
-    def _get_prefill_previous_hidden_states(self, h):
-        raise NotImplementedError
-
     def _post_layers_mtp(self, h):
         raise NotImplementedError
 
@@ -1175,11 +1169,47 @@ class Transformer(nn.Module):
             self.global_embed_num_tokens = self.global_lm_head_num_tokens = None
             self.embed_tokens_cum_num_tokens = self.lm_head_cum_num_tokens = None
 
-    @cuda_graph_safe_cached_property(
-        "main_last_hidden_states_static", "main_last_hidden_states_up_to_date"
-    )
-    def set_main_last_hidden_states_static(self):
-        return self.lhs_
+    def read_mtp_hidden_states(self, is_mtp=False) -> torch.Tensor:
+        cache_accessor = self.cache_dict["mtp"].get_accessor(len(self.layers) - 1)
+        tensor = read_from_singleton_paged_kv_cache(
+            cache_accessor.kv["hidden_states"],
+            cache_accessor.block_table,
+            self.mtp_accept_indices.get() if is_mtp else None,
+        )
+        return tensor
+
+    def update_mtp_hidden_states(self, mtp_hidden_states: torch.Tensor, is_mtp=False):
+        cache_accessor = self.cache_dict["mtp"].get_accessor(len(self.layers) - 1)
+        cache = cache_accessor.kv["hidden_states"]
+        if is_mtp:
+            mtp_hidden_states = mtp_hidden_states.view(
+                -1, self.mtp_size, self.params.dim
+            )
+            mtp_size = self.mtp_size
+        else:
+            cache = cache[:, :1]
+            mtp_size = 1
+        update_singleton_paged_kv_cache(
+            cache,
+            cache_accessor.block_table,
+            mtp_hidden_states,
+            mtp_size,
+        )
+
+    @torch.inference_mode()
+    def mtp_prefill_no_pipeline(self, x, h, freqs_cis):
+        last_token_offsets = (
+            self.cache_dict["mtp"].mtp_seq_len_delta.delta_prefix_lens_tensor_device[1:]
+            - 1
+        )
+        h = self.norm(h, compute_dtype=h.dtype)
+        self.update_mtp_hidden_states(h[last_token_offsets])
+        x[
+            self.cache_dict["main"].mtp_seq_len_delta.delta_position_ids_tensor_device
+            == 0
+        ] = 0
+        h = torch.roll(h, shifts=1, dims=0)
+        _ = self.layers[-1](x, freqs_cis, h, False)
 
     @torch.inference_mode()
     def prefill_no_pipeline(
@@ -1192,23 +1222,13 @@ class Transformer(nn.Module):
         if self.mtp_size > 1:
             for mgr in self.cache_dict.values():
                 mgr.seq_len_delta.is_decode_stage = False
-            self.token_offset_list = None
-            self.mtp_token_list = None
             for it, layer in enumerate(self.layers[0:-1]):
                 h = layer(h, freqs_cis, False)
-            prefill_previous_hidden_states = self._get_prefill_previous_hidden_states(h)
-            h_mtp = self._pre_layers_mtp(tokens, **args)
-            h_mtp[
-                self.cache_dict[
-                    "main"
-                ].mtp_seq_len_delta.delta_position_ids_tensor_device
-                == 0
-            ] = 0
-            h_mtp = self.layers[-1](
-                h_mtp, freqs_cis, prefill_previous_hidden_states, False
-            )
-            self.last_hidden_states_4_postprocess = (
-                self.prefill_main_last_hidden_states[output_token_offsets]
+
+            self.mtp_prefill_no_pipeline(
+                x=self._pre_layers_mtp(tokens, **args),
+                h=h,
+                freqs_cis=freqs_cis,
             )
         else:
             for it, layer in enumerate(self.layers):
@@ -1228,8 +1248,9 @@ class Transformer(nn.Module):
         else:
             for it, layer in enumerate(self.layers[0:-1]):
                 h = layer(h, freqs_cis, False)
-            self.lhs_ = self.norm(h, compute_dtype=h.dtype)
-            self.set_main_last_hidden_states_static
+            self.update_mtp_hidden_states(
+                self.norm(h, compute_dtype=h.dtype), is_mtp=True
+            )
         h = self._post_layers(h)
         h = h.float()
         return h
@@ -1237,10 +1258,8 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def mtp_decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
         h = self._pre_layers_mtp(tokens)
-        h = self.layers[-1](
-            h, freqs_cis, self.mtp_last_hidden_states_static.get(), True
-        )
-        self.mtp_last_hidden_states_static.set(h)
+        h = self.layers[-1](h, freqs_cis, self.read_mtp_hidden_states(), True)
+        self.update_mtp_hidden_states(h)
         h = self._post_layers_mtp(h)
         h = h.float()
         return h
@@ -1256,22 +1275,24 @@ class Transformer(nn.Module):
         extra_inputs: tuple[torch.Tensor, ...] = (),
         extra_inputs_mtp: tuple[torch.Tensor, ...] = (),
     ):
-        token_list = []
-        token_list.append(tokens)
-        for i in range(0, self.mtp_size):
+        self.update_mtp_hidden_states(self.read_mtp_hidden_states(is_mtp=True))
+        bs = tokens.shape[0]
+        draft_logits = []
+        token_list = [tokens]
+        for i in range(1, self.mtp_size):
             for cache in self.cache_dict.values():
                 cache.prepare_mtp_cache_decode(i)
                 if isinstance(cache, PagedKVCache):
                     cache.update_page_offs()
             self.prepare_decoding_attn_mtp()
-            h = func_mtp(key_mtp, tokens, *extra_inputs_mtp)
-            tokens = torch.argmax(h, dim=-1)
+            logits = func_mtp(key_mtp, tokens, *extra_inputs_mtp)
+            draft_logits.append(logits)
+            tokens = torch.argmax(logits, dim=-1)
             token_list.append(tokens)
         for cache in self.cache_dict.values():
             if isinstance(cache, PagedKVCache):
                 cache.update_page_offs()
-        self.main_last_hidden_states_up_to_date = False
-        tokens_proposal = torch.stack(token_list[:-1], dim=1).view(-1)
+        tokens = torch.stack(token_list, dim=1)
         if self.use_cuda_graph:
             self.prepare_decoding_attn()
         else:
@@ -1283,39 +1304,13 @@ class Transformer(nn.Module):
                 and self.moe_impl.ep_size > 1
                 and self.moe_impl.decode_token_dispatcher_impl == "allgather"
             ):
-                self.moe_impl.prepare(TaskType.Decode, tokens_proposal.shape[0])
-        h = func(key, tokens_proposal, *extra_inputs)
-        tokens_proposal = tokens_proposal.view(-1, self.mtp_size)
-        tokens_verify = torch.argmax(h, dim=-1).view(-1, self.mtp_size)
-        h = h.view(-1, self.mtp_size, h.shape[-1])
-        mlh_ = self.main_last_hidden_states_static.get()
-        mtp_last_hidden_states = mlh_.view(-1, self.mtp_size, mlh_.shape[-1])
-        assert h.shape[0] == mtp_last_hidden_states.shape[0]
-        matches = tokens_proposal[:, 1:] == tokens_verify[:, :-1]
+                self.moe_impl.prepare(TaskType.Decode, bs * self.mtp_size)
+        h = func(key, tokens.view(-1), *extra_inputs)
+        self.draft_tokens = tokens[:, 1:]
+        # self.draft_logits = torch.stack(draft_logits, dim=1)
 
-        all_accept = matches.all(dim=1)
-        first_mismatch_idx = torch.argmax((~matches).int(), dim=1)
-        accept_idx = torch.where(
-            all_accept,
-            torch.full_like(first_mismatch_idx, self.mtp_size - 1),
-            first_mismatch_idx,
-        )
-
-        batch_indices = torch.arange(tokens_proposal.shape[0], device=h.device)
-        h_selected = h[batch_indices, accept_idx]
-        mtp_selected = mtp_last_hidden_states[batch_indices, accept_idx]
-        token_offset = (accept_idx + 1).tolist()
-        tokens_proposal_accepted = [
-            tokens_proposal[i, 1 : accept_idx[i] + 1].tolist()
-            for i in range(tokens_proposal.size(0))
-        ]
-
-        for cache in self.cache_dict.values():
-            cache.update_mtp_cache_decode(token_offset)
-        self.token_offset_list = token_offset
-        self.mtp_token_list = tokens_proposal_accepted
-        self.last_hidden_states_4_postprocess = mtp_selected
-        return h_selected
+        h = h.view(bs, self.mtp_size, h.shape[-1])
+        return h
 
     @torch.inference_mode()
     def prefill_pipeline(
@@ -1426,7 +1421,7 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def empty_mtp_decode_total(self, func, key, func_mtp, key_mtp):
-        for i in range(0, self.mtp_size):
+        for i in range(1, self.mtp_size):
             func_mtp(key_mtp)
 
         if (

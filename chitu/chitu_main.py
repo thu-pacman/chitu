@@ -898,9 +898,8 @@ def chitu_init(args):
         else:
             args.infer.use_cuda_graph = True
 
-    if args.infer.schedule_overlap == "auto":
-        # MTP does synchronize after model run and overlap has no effect
-        args.infer.schedule_overlap = args.infer.mtp_size <= 1
+    if args.infer.mtp_size <= 0:
+        args.infer.mtp_size = 1
 
     if args.infer.full_warmup == "auto":
         if args.infer.pp_size > 1 and args.infer.use_cuda_graph:

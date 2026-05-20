@@ -89,6 +89,12 @@ class Qwen3NextRMSNormGated(nn.Module):
         return out
 
 
+def get_mtp_accept_indices():
+    from chitu.backend import Backend
+
+    return Backend.model.mtp_accept_indices.get()
+
+
 class Qwen3NextGatedDeltaNet(nn.Module):
     def __init__(self, args, layer_id, cache, *, checkpoint_prefix: str):
         super().__init__()
@@ -195,18 +201,17 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         is_mtp_decode_stage = (
             self.cache.is_mtp_decode_stage if self.mtp_size > 1 else False
         )
-        mtp_offset_tensor = (
-            self.cache.mtp_offset_tensor.get() if self.mtp_size > 1 else None
-        )
+
+        mtp_accept_indices = get_mtp_accept_indices() if is_mtp_decode_stage else None
         conv_state = read_from_singleton_paged_kv_cache(
             cache_accessor.kv["conv_state"],
             cache_accessor.block_table,
-            mtp_offset=mtp_offset_tensor,
+            mtp_accept_indices=mtp_accept_indices,
         )
         recurrent_state = read_from_singleton_paged_kv_cache(
             cache_accessor.kv["recurrent_state"],
             cache_accessor.block_table,
-            mtp_offset=mtp_offset_tensor,
+            mtp_accept_indices=mtp_accept_indices,
         )
 
         qkvz = self.in_proj_qkvz(x)

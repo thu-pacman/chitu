@@ -174,11 +174,12 @@ class TokenRouter:
         # Process based on token type
         if token_data.get("type") == "token":
             # token contains decoded text
-            token = token_data.get("token")
+            tokens = token_data.get("tokens")
             top_logprobs = token_data.get("top_logprobs")
             top_token_idx = token_data.get("top_token_idx")
             is_first_token = req.async_stream.tokens_len == 0
-            req.async_stream.add_data(token, top_logprobs, top_token_idx)
+            for token in tokens:
+                req.async_stream.add_data(token, top_logprobs, top_token_idx)
 
             self.total_tokens_received += 1
             # per-dp 统计

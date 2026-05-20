@@ -437,11 +437,6 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         return h
 
     @override
-    def _get_prefill_previous_hidden_states(self, h):
-        self.prefill_main_last_hidden_states = self.norm(h, compute_dtype=h.dtype)
-        return torch.roll(self.prefill_main_last_hidden_states, shifts=1, dims=0)
-
-    @override
     @torch.inference_mode()
     def _pre_layers(
         self,
@@ -747,47 +742,21 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         freqs_cis = self.prepare_freqs_cis()
         self._last_position_ids = None
 
-        deepstack_visual_embeds = self._deepstack_visual_embeds
-        visual_pos_mask = self._visual_pos_mask
-
         if self.mtp_size > 1:
-            h_mtp = h
+            mtp_x = h
             for mgr in self.cache_dict.values():
                 mgr.seq_len_delta.is_decode_stage = False
-            self.token_offset_list = None
-            self.mtp_token_list = None
             for it, layer in enumerate(self.layers[0:-1]):
                 h = layer(h, freqs_cis, False)
-            prefill_previous_hidden_states = self._get_prefill_previous_hidden_states(h)
-            h_mtp[
-                self.cache_dict[
-                    "main"
-                ].mtp_seq_len_delta.delta_position_ids_tensor_device
-                == 0
-            ] = 0
-            h_mtp = self.layers[-1](
-                h_mtp, freqs_cis, prefill_previous_hidden_states, False
-            )
-            self.last_hidden_states_4_postprocess = (
-                self.prefill_main_last_hidden_states[output_token_offsets]
+
+            self.mtp_prefill_no_pipeline(
+                x=mtp_x,
+                h=h,
+                freqs_cis=freqs_cis,
             )
         else:
             for it, layer in enumerate(self.layers):
                 h = layer(h, freqs_cis)
-                if (
-                    deepstack_visual_embeds is not None
-                    and visual_pos_mask is not None
-                    and it < len(deepstack_visual_embeds)
-                ):
-                    ds = deepstack_visual_embeds[it]
-                    if ds is None:
-                        continue
-                    n_vis = int(visual_pos_mask.sum().item())
-                    if ds.shape[0] != n_vis:
-                        continue
-                    ds = ds.to(device=h.device, dtype=h.dtype)
-                    h = h.clone()
-                    h[visual_pos_mask, :] = h[visual_pos_mask, :] + ds
 
         h = h[output_token_offsets]
         h = self._post_layers(h)

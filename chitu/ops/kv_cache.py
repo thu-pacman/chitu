@@ -449,7 +449,7 @@ if has_triton_impl:
 def read_from_singleton_paged_kv_cache(
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
-    mtp_offset: torch.Tensor = None,
+    mtp_accept_indices: torch.Tensor | None = None,
     impl: str = "auto",
 ) -> torch.Tensor:
     """
@@ -469,12 +469,14 @@ def _auto_read_from_singleton_paged_kv_cache():
 
 @read_from_singleton_paged_kv_cache.register("torch")
 def read_from_singleton_paged_kv_cache_torch(
-    kv_cache: torch.Tensor, page_table: torch.Tensor, mtp_offset: torch.Tensor = None
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    mtp_accept_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if mtp_offset is None:
-        return kv_cache[page_table.squeeze(1)].squeeze(1)
+    if mtp_accept_indices is None:
+        return kv_cache[page_table.squeeze(1), 0]
     else:
-        return kv_cache[page_table.squeeze(1), mtp_offset]
+        return kv_cache[page_table.squeeze(1), mtp_accept_indices]
 
 
 @make_op_dispatcher

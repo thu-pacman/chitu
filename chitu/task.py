@@ -12,6 +12,7 @@ from datetime import datetime
 from enum import Enum
 from logging import getLogger
 from typing import Any, ClassVar, Deque, Optional, Union, Iterable
+from functools import cached_property
 import random
 
 import torch
@@ -308,7 +309,7 @@ class UserRequest:
 
     def add_data(
         self,
-        value: Union[int, list[int]],
+        tokens: Union[int, list[int]],
         top_logprobs=None,
         top_token_idx=None,
         *,
@@ -316,15 +317,16 @@ class UserRequest:
     ):
         if self.finished:
             return
-        if not isinstance(value, list):
-            value = [value]
-        for i in value:
+        if not isinstance(tokens, list):
+            tokens = [tokens]
+        for token in tokens:
             self.async_stream.add_data(
-                i, top_logprobs, top_token_idx, notify_server=notify_server
+                token, top_logprobs, top_token_idx, notify_server=notify_server
             )
-            logger.debug(f"add data: {i}")
-
-        self.num_output_tokens += len(value)
+            logger.debug(f"add data: {token}")
+            self.num_output_tokens += 1
+            if token in Backend.tokenizer.stop_tokens:
+                break
 
     def notify_server_data_added_from_server_thread(self):
         self.async_stream.notify_server_from_server_thread()
@@ -332,15 +334,14 @@ class UserRequest:
     def notify_server_data_added_threadsafe(self):
         self.async_stream.notify_server_threadsafe()
 
-    def _test_add_logit(self, logit):
+    def _test_add_logit(self, logit: torch.Tensor):
         # Only use top100 logits to compare in single_req_compare to save disk footprint.
         topk_logits, topk_tokens = torch.topk(logit, k=100, dim=-1)
         self._test_topk_logits.append(topk_logits)
         self._test_topk_tokens.append(topk_tokens)
 
-    def _test_add_token(self, token):
-        self._test_tokens.append(token)
-        # logger.warning(f"add token {token}")
+    def _test_add_token(self, tokens: list[int]):
+        self._test_tokens.extend(tokens)
 
 
 class Task:
@@ -377,6 +378,9 @@ class Task:
         self.prompt_len = (
             prompt_len if prompt_len is not None else len(self.prefix_tokens)
         )
+        self.mtp_accept_index: int = -1
+        """ last mtp accept index, equals to (number of last accept token) - 1, -1 means last round is not mtp decode """
+
         # Decode worker 可能只携带 prompt_len 而不携带 prefix_tokens，
         # 需要用 base_len 还原真实 prefix 长度。
         # 计算 prefix_token_len 会同时考虑到 prefix_tokens 和 prefix_token_base_len，
@@ -420,8 +424,6 @@ class Task:
         self.num_new_tokens: int = 0
         self.next_token: int = -1  # Only effective when num_new_tokens > 0
         self.num_new_tokens_single_step: int = 1
-        self.mtp_token_list: list[int] = []
-        self.generated_result: Optional[torch.Tensor] = None
 
         # task states
         # has_unsync_new_token is used to estimate the prefix_tokens_len
@@ -458,7 +460,6 @@ class Task:
         self.priority = priority
         self.sched_score = 0
         self.max_output_tokens = 1024  # TODO: replace hardcode by parameter
-        self._last_hidden_states = None
         self.sched_ddl = (
             time.perf_counter_ns()
             + self.prefix_tokens_len * 1000 * 1000
@@ -471,8 +472,13 @@ class Task:
         # Warmup bookkeeping: ensure each task participates in at most one prefill schedule per warmup
         self._warmup_prefill_seen = False
 
-        # PD prefill info
+        # PD related
         self.pd_prefill_engine_rank: Optional[int] = None
+        self._pd_first_token_applied = False
+        self._pd_first_token_for_dp_emit: int | None = None
+        """ prefill output token on decode instance dp rank that need to send to router """
+        self._pd_cached_hit_tokens_for_dp_emit: int | None = None
+        """ cached hit tokens on decode instance dp rank that need to send to router """
 
     def set_inc_hit_tokens(self, num: int) -> None:
         # Per-step incremental hit tokens; clamp negatives to avoid metric drift.
@@ -498,19 +504,12 @@ class Task:
         else:
             return not TaskCollector.is_current_running(self.task_id)
 
-    def update_decode_status(self):
+    def update_decode_status(self, tokens: list[int]):
         if self.status == TaskStatus.Stopped:
             return
         if self.req is None:
             return
-        if (
-            self.stop_with_eos
-            and self.num_new_tokens > 0
-            and (
-                self.next_token in Backend.tokenizer.stop_tokens
-                or (set(self.mtp_token_list) & Backend.tokenizer.stop_tokens)
-            )
-        ):
+        if self.stop_with_eos and (set(tokens) & Backend.tokenizer.stop_tokens):
             self.set_stopped()
             self.req.finish_reason = "stop"
         elif (
@@ -539,50 +538,12 @@ class Task:
                     f"[PD_STAGE][decode.exec.end] req_id={request_id} finish_reason={finish_reason}"
                 )
 
-    def update_response_no_sync(self, token: Union[int, torch.Tensor]):
-        """
-        Update task state with a generated token (for Decode phase).
-
-        This method will NOT synchronize token to CPU if the new token is a tensor.
-
-        This method will NOT append the new token to the prefix.
-
-        If needed, use update_prefix to sync the new token and append it to prefix.
-
-        For rank > 0, prefix is not used and update_prefix is not necessary.
-
-        This method:
-        1. Records the generated token
-        2. Increments generation counter
-
-        Usage: Call this during Decode phase after sampling a token.
-
-        Args:
-            token: The generated token ID
-        """
-        assert token is not None, "Token cannot be None"
-        self.next_token = token
-        self.num_new_tokens += self.num_new_tokens_single_step
-        self.has_unsync_new_token = True
-
-    def update_prefix(self):
-        """
-        Update prefix tokens by the next_token and synchronize the next_token to CPU if necessary
-        """
-        if not self.has_unsync_new_token:
-            return
-        if not isinstance(self.next_token, int):
-            self.next_token = int(self.next_token.cpu().item())
-        if not self.has_next_token():
-            return
-        if get_global_args().infer.mtp_size > 1:
-            self.prefix_tokens.extend(self.mtp_token_list)
-        self.prefix_tokens.append(self.next_token)
+    def update_response_sync(self, tokens: list[int]):
+        assert tokens, "tokens cannot be empty"
+        self.next_token = tokens[-1]
+        self.num_new_tokens += len(tokens)
+        self.prefix_tokens.extend(tokens)
         self.has_unsync_new_token = False
-
-    def update_response_sync(self, token: Union[int, torch.Tensor]):
-        self.update_response_no_sync(token)
-        self.update_prefix()
 
     def wait(self):
         if self.status == TaskStatus.AvailableForSchedule:
@@ -781,11 +742,10 @@ class BatchResult:
     num_tasks: int = 0
     tasks: list[Task] = field(default_factory=list)
 
-    next_tokens: list[int] = field(default_factory=list)
+    tokens: list[list[int]] = field(default_factory=list)
     return_logprobs: bool = False
     logprobs: Optional[torch.Tensor] = None
     token_idxs: Optional[torch.Tensor] = None
-    mtp_token_list: Optional[list[list[int]]] = None
 
     @property
     def task_ids(self):
@@ -870,6 +830,38 @@ def is_normal_payload(payload_type: SerializedPackedTasksPayloadType):
 
 
 @dataclass
+class PackedTasksResult:
+    tokens: torch.Tensor
+    """ sampled tokens, (bs, mtp_size) of int32 """
+    accept_indices: torch.Tensor | None = None
+    """ accept indices for mtp tokens, (bs,) of int32 if mtp decode, otherwise None. Equals to number of accepted tokens - 1 """
+    logprobs: torch.Tensor | None = None
+    """ logprobs, (bs, vocab_size) of float32 """
+    token_idxs: torch.Tensor | None = None
+    """ token_idxs, (bs, vocab_size) of int32 """
+    logits: torch.Tensor | None = None
+    """ logits, (bs, vocab_size) of int32 """
+
+    def cpu(self):
+        to_cpu = lambda t: t.cpu() if t is not None else None
+        return PackedTasksResult(
+            tokens=to_cpu(self.tokens),
+            accept_indices=to_cpu(self.accept_indices),
+            logprobs=to_cpu(self.logprobs),
+            token_idxs=to_cpu(self.token_idxs),
+            logits=to_cpu(self.logits),
+        )
+
+    @cached_property
+    def accepted_tokens(self) -> list[list[int]]:
+        tokens = self.tokens.tolist()
+        if self.accept_indices is None:
+            return tokens
+        accept_lens = (self.accept_indices + 1).tolist()
+        return [t[:l] for t, l in zip(tokens, accept_lens)]
+
+
+@dataclass
 class PackedTasksBase:
     """
     Base class for PackedTasks with serializable fields.
@@ -937,16 +929,14 @@ class PackedTasks(PackedTasksBase):
             self.tasks = tasks
         self.output_tasks = [task for task in self.tasks if task.has_output()]
         self.return_logprobs = any(
-            getattr(task.req, "logprobs", False) for task in self.output_tasks
+            task.req.logprobs for task in self.output_tasks if task.req
         )
 
         # test only
-        self._test_flag = any(getattr(task, "_test_flag", False) for task in self.tasks)
+        self._test_flag = any(task._test_flag for task in self.tasks)
 
         # user request related
-        self.generated_result: Optional[torch.Tensor] = None
-        self.logprobs: Optional[torch.Tensor] = None
-        self.token_idxs: Optional[torch.Tensor] = None
+        self.generated_result: PackedTasksResult | None = None
 
         if not task_ids:  # empty PackedTasks, only dp/dp+pp use this method
             self.task_type = (
@@ -1013,125 +1003,44 @@ class PackedTasks(PackedTasksBase):
             if task.grid_thw is not None:
                 self.grid_thw.append(task.grid_thw)
 
-    def get_result_len(self) -> int:
-        """
-        Get the length of generated_result of each task task
-        """
-        result_length_per_task = (
-            Backend.executor.mtp_size
-            + Backend.model.vocab_size
-            * ((2 if self.return_logprobs else 0) + (1 if self._test_flag else 0))
-        )
-        return result_length_per_task
-
-    def pack_result(
-        self,
-        tokens: torch.Tensor,
-        logprobs: Optional[torch.Tensor] = None,
-        token_idxs: Optional[torch.Tensor] = None,
-        logits: Optional[torch.Tensor] = None,
-    ):
-        """
-        Result format: [num_tasks, result_length] = num_tasks x (tokens, logprobs, token_idxs, logits)
-        """
-        results = tokens.to(dtype=torch.int32).view(len(self.output_tasks), -1)
-        if self.return_logprobs:
-            logprobs = logprobs.view(dtype=torch.int32)
-            token_idxs = token_idxs.to(dtype=torch.int32)
-            results = torch.cat((results, logprobs, token_idxs), dim=-1)
-        if self._test_flag:
-            logits = logits.view(dtype=torch.int32)
-            results = torch.cat((results, logits), dim=-1)
-        return results
-
-    def unpack_result(self, result: torch.Tensor) -> tuple[
-        torch.Tensor,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-    ]:
-        if not self.return_logprobs and not self._test_flag:
-            return result.view(-1).to(dtype=torch.int64), None, None, None
-        result = result.view(len(self.output_tasks), -1)
-        len_logprobs, len_token_idxs, len_logits = 0, 0, 0
-        if self.return_logprobs:
-            len_logprobs = Backend.model.vocab_size
-            len_token_idxs = Backend.model.vocab_size
-        if self._test_flag:
-            len_logits = Backend.model.vocab_size
-        tokens, logprobs, token_idxs, logits = result.split(
-            (1, len_logprobs, len_token_idxs, len_logits), dim=-1
-        )
-        tokens = tokens.view(-1).to(dtype=torch.int64)
-        if self.return_logprobs:
-            logprobs = logprobs.view(dtype=torch.float)
-            token_idxs = token_idxs.to(dtype=torch.int64)
-        else:
-            logprobs, token_idxs = None, None
-        if self._test_flag:
-            logits = logits.view(dtype=torch.float)
-        else:
-            logits = None
-        return tokens, logprobs, token_idxs, logits
-
-    def get_batch_result(
-        self, tasks: Optional[list[Task]] = None, tokens: Optional[list[int]] = None
-    ) -> BatchResult:
-        if tasks is None:
-            tasks = [task for task in self.output_tasks if task.has_next_token()]
-        if tokens is None:
-            tokens = [task.prefix_tokens[-1] for task in tasks]
-        if not self.return_logprobs:
-            logprobs, token_idxs = None, None
-        else:
-            logprobs = self.logprobs
-            token_idxs = self.token_idxs
-        if get_global_args().infer.mtp_size <= 1:
-            mtp_token_list = None
-        else:
-            mtp_token_list = [task.mtp_token_list for task in tasks]
-        return BatchResult(
-            num_tasks=len(tasks),
-            tasks=tasks,
-            next_tokens=tokens,
-            return_logprobs=self.return_logprobs,
-            logprobs=logprobs,
-            token_idxs=token_idxs,
-            mtp_token_list=mtp_token_list,
-        )
-
-    def add_task_to_batch_result(
-        self, result: Optional[list[int] | torch.Tensor] = None
-    ):
-        if result is None:
-            result = self.generated_result
-            self.generated_result = None
-        if len(self.output_tasks) == 0 or result is None:
+    def batch_update_test_result(self):
+        if not self._test_flag:
             return
-        if isinstance(result, torch.Tensor):
-            assert result.device == torch.device("cpu")
-        if not isinstance(result, list):
-            tokens, logprobs, token_idxs, logits = self.unpack_result(result)
-            tokens = tokens.tolist()
-        else:
-            tokens = result
-            logprobs, token_idxs, logits = None, None, None
+        result = self.generated_result
         for it, task in enumerate(self.output_tasks):
-            task.update_response_sync(tokens[it])
-        if torch.distributed.get_rank() > 0:
+            task.req._test_add_logit(result.logits[it])
+            task.req._test_add_token(result.accepted_tokens[it])
+
+    def batch_update_mtp_accept_index(self):
+        if self.generated_result.accept_indices is None:
             return
-        if self._test_flag:
-            for it, task in enumerate(self.output_tasks):
-                task.req._test_add_logit(logits[it])
-                task.req._test_add_token(tokens[it])
-        if self.return_logprobs:
-            self.logprobs = logprobs.cpu()
-            self.token_idxs = token_idxs.cpu()
-        TaskCollector.append_to_last_batch_results(self.get_batch_result(tokens=tokens))
+        accept_indices = self.generated_result.accept_indices.tolist()
+        for i, task in enumerate(self.output_tasks):
+            task.mtp_accept_index = accept_indices[i]
+
+    def batch_update_response_sync(self, extra_first_token: dict[str, int]):
+        accepted_tokens = self.generated_result.accepted_tokens
+        for i, task in enumerate(self.output_tasks):
+            tokens = accepted_tokens[i]
+            if task.task_id in extra_first_token:
+                tokens = [extra_first_token[task.task_id]] + tokens
+            task.update_response_sync(tokens)
+
+    def create_batch_result(self):
+        result = self.generated_result
+        return BatchResult(
+            num_tasks=len(self.output_tasks),
+            tasks=self.output_tasks,
+            tokens=result.accepted_tokens,
+            return_logprobs=result.logprobs is not None,
+            logprobs=result.logprobs,
+            token_idxs=result.token_idxs,
+        )
 
     def batch_update_decode_status(self):
-        for task in self.tasks:
-            task.update_decode_status()
+        accepted_tokens = self.generated_result.accepted_tokens
+        for i, task in enumerate(self.output_tasks):
+            task.update_decode_status(accepted_tokens[i])
 
 
 class TaskCollector:
@@ -1166,7 +1075,10 @@ class TaskCollector:
 
     # Running tasks
     @staticmethod
-    def collect(new_tasks: Optional[PackedTasks] = None):
+    def collect(new_tasks: Optional[PackedTasks] = None) -> PackedTasks | None:
+        if not TaskCollector.available():
+            return None
+
         if not isinstance(new_tasks, PackedTasks):
             new_tasks = None
         if len(TaskCollector._waiting_queue) == 0:
@@ -1201,22 +1113,14 @@ class TaskCollector:
         TaskCollector._last_batch_results.append(result)
 
     @staticmethod
-    def process_last_batch_results(current_tasks: Optional[PackedTasksBase] = None):
+    def process_last_batch_results(current_tasks: PackedTasks):
         for tasks in TaskCollector._last_batch_results:
             Backend.executor.postprocess_async_part(tasks)
         TaskCollector._last_batch_results.clear()
 
     # Update (remove taskpool & remove kvcache)
     @staticmethod
-    def set_update_task_ids(tasks: Optional[PackedTasks | Iterable]):
-        if tasks is None:
-            task_ids = []
-        elif isinstance(tasks, PackedTasks):
-            task_ids = tasks.task_ids
-        elif isinstance(tasks, Iterable):
-            task_ids = list(tasks)
-        else:
-            assert False, f"Unsupport type for updating task_ids: {type(tasks)}"
+    def set_update_task_ids(task_ids: list[str]):
         TaskCollector._update_task_ids = task_ids
 
     @staticmethod
@@ -1224,6 +1128,11 @@ class TaskCollector:
         task_ids = TaskCollector._update_task_ids
         TaskCollector._update_task_ids = []
         return task_ids
+
+    @staticmethod
+    def add_update_task_ids(task_ids: list[str]):
+        task_ids_set = set(task_ids) | set(TaskCollector._update_task_ids)
+        TaskCollector._update_task_ids = list(task_ids_set)
 
 
 class DPTaskCollector:

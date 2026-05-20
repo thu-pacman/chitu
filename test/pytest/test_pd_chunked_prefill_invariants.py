@@ -274,6 +274,7 @@ class TestPrefillOnlyHookFinalization:
         tasks.tasks = all_tasks
         tasks.output_tasks = output_tasks
         tasks.output_task_ids = [t.task_id for t in output_tasks]
+        tasks.generated_result = None
         return tasks
 
     def test_output_task_finalized_with_prefill_only_reason(self, monkeypatch):
@@ -286,7 +287,7 @@ class TestPrefillOnlyHookFinalization:
             max_new_tokens=1,
         )
         tasks = self._make_packed_tasks([output], [output])
-        hook.on_prefill_done(send_tokens=None, tasks=tasks)
+        hook.on_prefill_done(tasks=tasks)
         assert output.status == TaskStatus.Stopped
         assert output.req.finish_reason == "prefill_only"
 
@@ -307,7 +308,7 @@ class TestPrefillOnlyHookFinalization:
             max_new_tokens=1,
         )
         tasks = self._make_packed_tasks([output, middle], [output])
-        hook.on_prefill_done(send_tokens=None, tasks=tasks)
+        hook.on_prefill_done(tasks=tasks)
         assert output.status == TaskStatus.Stopped
         assert middle.status != TaskStatus.Stopped
         assert middle.req.finish_reason is None
@@ -320,7 +321,7 @@ class TestPrefillOnlyHookFinalization:
         tasks.output_tasks = []
         tasks.output_task_ids = []
         # Should not raise
-        hook.on_prefill_done(send_tokens=None, tasks=tasks)
+        hook.on_prefill_done(tasks=tasks)
 
 
 # ---------------------------------------------------------------------------
