@@ -100,6 +100,7 @@ def get_extensions():
         os.path.join(this_dir, "cuda/moe/moe_align_kernel.cu"),
         os.path.join(this_dir, "cuda/moe/fused_shared_experts_kernel.cu"),
         os.path.join(this_dir, "cuda/moe/group_topk.cu"),
+        os.path.join(this_dir, "cuda/moe/hash_route_gate.cu"),
         os.path.join(this_dir, "cuda/moe/vllm_topk_softmax.cu"),
         os.path.join(this_dir, "cuda/rotary/rotary_pos_emb_llama.cu"),
         os.path.join(this_dir, "cuda/topk/topk.cu"),

@@ -63,6 +63,15 @@ class alignas(Alignment) AlignedArray {
     T data[N];
 };
 
+template <typename T,
+          /// Number of elements in the array
+          int N,
+          /// Alignment requirement in bytes
+          int Alignment = sizeof(T) * N>
+struct alignas(Alignment) StoreArray {
+    T data[N];
+};
+
 template <typename T, int EXPERTS, int BYTES_PER_LDG> struct TopkConstants {
     static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
     static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 ||
@@ -78,13 +87,26 @@ template <typename T, int EXPERTS, int BYTES_PER_LDG> struct TopkConstants {
     //   static const int ROWS_PER_WARP = WARP_SIZE / THREADS_PER_ROW;
 };
 
+__device__ __forceinline__ float sqrt_softplus(float x) {
+    const float softplus = fmaxf(x, 0.0f) + log1pf(expf(-fabsf(x)));
+    return sqrtf(softplus);
+}
+
+__device__ __forceinline__ float compute_gate_score(float x, int score_fun) {
+    if (score_fun == 1) {
+        return 1.0f / (1.0f + expf(-x));
+    }
+    return sqrt_softplus(x);
+}
+
 template <typename T, typename BIAS_T, int VPT, int NUM_EXPERTS, int BLOCK_SIZE,
           int BYTES_PER_LDG, int topK>
 __global__ void __launch_bounds__(BLOCK_SIZE)
-    fused_sigmoid_topk_kernel(const T *input, const int batchSize,
-                              const int n_groups, const int topK_groups,
-                              int topInGroup, int *expertsIds,
-                              T *selectedExpertsWeights, const BIAS_T *bias) {
+    fused_sigmoid_topk_kernel(const T *input, const int score_fun,
+                              const int batchSize, const int n_groups,
+                              const int topK_groups, int topInGroup,
+                              int *expertsIds, T *selectedExpertsWeights,
+                              const BIAS_T *bias) {
     static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
     static constexpr int ELTS_PER_LDG_BIAS = BYTES_PER_LDG / sizeof(BIAS_T);
     static constexpr int ELTS_PER_ROW = NUM_EXPERTS;
@@ -115,15 +137,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     // ===== Load data into register =====
     using AccessType = AlignedArray<T, ELTS_PER_LDG>;
     using AccessTypeBias = AlignedArray<BIAS_T, ELTS_PER_LDG_BIAS>;
-    using INT4 = AlignedArray<int, 4>;
     T row_chunk[VPT];
     AccessType *row_chunk_vec_ptr = reinterpret_cast<AccessType *>(&row_chunk);
     const AccessType *vec_thread_read_ptr =
         reinterpret_cast<const AccessType *>(threadReadPtr);
-    AccessType *weightOutputPtr = reinterpret_cast<AccessType *>(
-        selectedExpertsWeights + threadRow * topK);
-    INT4 *expertIdsOutputPtr =
-        reinterpret_cast<INT4 *>(expertsIds + threadRow * topK);
 
     // Invalid threads load zeros to participate in shuffle ops without
     // affecting results
@@ -138,10 +155,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
         }
     }
 
-    // ===== compute sigmoid values =====
+    // ===== compute gate scores =====
     for (int i = 0; i < VPT; ++i) {
         row_chunk[i] =
-            to_scalar<T>(1.0f / (1.0f + expf(-to_float(row_chunk[i]))));
+            to_scalar<T>(compute_gate_score(to_float(row_chunk[i]), score_fun));
     }
 
     // Add the bias to softmax values.
@@ -265,7 +282,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     // ===== Now softmax compute finished, we can find the topK by argmax
     // first.
     int start_expert_id = firstEleReadByThread;
-    static constexpr int EXPERTS_PER_GROUP_LDG = ELTS_PER_LDG * THREADS_PER_ROW;
 
     T topK_weights[topK];
     int topK_expert_ids[topK];
@@ -318,13 +334,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
 
         // Finally, clear the max value in buffer for next iteration
         if (kid + 1 < topK) {
-            const int ldg_group_for_expert = expert_id / EXPERTS_PER_GROUP_LDG;
-            const int thread_to_clear_in_group =
-                (expert_id / ELTS_PER_LDG) % THREADS_PER_ROW;
+            const int thread_to_clear_in_group = expert_id / VPT;
             if (threadIdInGroup == thread_to_clear_in_group) {
-                const int offset_for_expert = expert_id % ELTS_PER_LDG;
-                row_chunk_bias_original[ldg_group_for_expert * ELTS_PER_LDG +
-                                        offset_for_expert] =
+                const int offset_for_expert = expert_id % VPT;
+                row_chunk_bias_original[offset_for_expert] =
                     to_scalar<BIAS_T>(0.0f);
             }
         }
@@ -337,23 +350,48 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     // A more efficient sorting algorithm may be needed if the dataset is very
     // large.
     if (threadIdInGroup == 0 && isValidThread) {
-        int index_t = 0, int_t = 0;
         int output_offset = threadRow * topK;
-        for (index_t = 0; index_t < topK / ELTS_PER_LDG; ++index_t) {
-            weightOutputPtr[index_t] = *reinterpret_cast<AccessType *>(
-                &topK_weights[index_t * ELTS_PER_LDG]);
-        }
-        for (int_t = 0; int_t < topK / (BYTES_PER_LDG / sizeof(int)); ++int_t) {
-            expertIdsOutputPtr[int_t] = *reinterpret_cast<INT4 *>(
-                &topK_expert_ids[int_t * (BYTES_PER_LDG / sizeof(int))]);
-        }
-        for (index_t = index_t * ELTS_PER_LDG; index_t < topK; ++index_t) {
-            selectedExpertsWeights[output_offset + index_t] =
-                topK_weights[index_t];
-        }
-        for (int_t = int_t * (BYTES_PER_LDG / sizeof(int)); int_t < topK;
-             ++int_t) {
-            expertsIds[output_offset + int_t] = topK_expert_ids[int_t];
+        if constexpr (topK == 6) {
+            using WeightVec2 = StoreArray<T, 2>;
+            using IdVec2 = StoreArray<int, 2>;
+#pragma unroll
+            for (int i = 0; i < 3; ++i) {
+                const int base = i * 2;
+                WeightVec2 weight_vec = {
+                    {topK_weights[base], topK_weights[base + 1]}};
+                IdVec2 id_vec = {
+                    {topK_expert_ids[base], topK_expert_ids[base + 1]}};
+                *reinterpret_cast<WeightVec2 *>(
+                    selectedExpertsWeights + output_offset + base) = weight_vec;
+                *reinterpret_cast<IdVec2 *>(expertsIds + output_offset + base) =
+                    id_vec;
+            }
+        } else if constexpr (topK == 8) {
+            using WeightVec8 = StoreArray<T, 8>;
+            using IdVec4 = StoreArray<int, 4>;
+            WeightVec8 weight_vec;
+            IdVec4 id_vec_0;
+            IdVec4 id_vec_1;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                weight_vec.data[i] = topK_weights[i];
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                id_vec_0.data[i] = topK_expert_ids[i];
+                id_vec_1.data[i] = topK_expert_ids[i + 4];
+            }
+            *reinterpret_cast<WeightVec8 *>(selectedExpertsWeights +
+                                            output_offset) = weight_vec;
+            *reinterpret_cast<IdVec4 *>(expertsIds + output_offset) = id_vec_0;
+            *reinterpret_cast<IdVec4 *>(expertsIds + output_offset + 4) =
+                id_vec_1;
+        } else {
+#pragma unroll
+            for (int i = 0; i < topK; ++i) {
+                selectedExpertsWeights[output_offset + i] = topK_weights[i];
+                expertsIds[output_offset + i] = topK_expert_ids[i];
+            }
         }
     }
 }
@@ -384,15 +422,19 @@ void fused_gate_dispatcher(const T *input, const int score_fun,
     fused_sigmoid_topk_kernel<T, BIAS_T, VPT, EXPERTS, BLOCK_SIZE,             \
                               BYTES_PER_LDG, TOPK>                             \
         <<<numBlocks, block_dim, 0, stream>>>(                                 \
-            input, batchSize, n_groups, topK_groups, topInGroup, expertsIds,   \
-            selectedExpertsWeights, bias);
+            input, score_fun, batchSize, n_groups, topK_groups, topInGroup,    \
+            expertsIds, selectedExpertsWeights, bias);
     switch (topK) {
+    case 6:
+        LAUNCH_FUSED_TOPK(6);
+        break;
     case 8:
         LAUNCH_FUSED_TOPK(8);
         break;
 
     default:
-        assert(false && "Unsupported topK value, just 8 are supported now.");
+        assert(false &&
+               "Unsupported topK value, just 6 and 8 are supported now.");
         break;
     }
 }
@@ -474,8 +516,9 @@ void route_gate(torch::Tensor &linear_output, int score_fun, int batchSize,
     int num_experts = linear_output.numel() / seq_length;
     auto dtype = linear_output.dtype();
 
-    TORCH_CHECK(score_fun == 1, "0 for softmax 1 for sigmoid  now we only "
-                                "support sigmoid Invalid score_fun value.");
+    TORCH_CHECK(score_fun == 1 || score_fun == 2,
+                "0 for softmax, 1 for sigmoid, 2 for sqrtsoftplus. "
+                "route_gate only supports sigmoid and sqrtsoftplus.");
 
     TORCH_CHECK(
         linear_output.dtype() == selectedExpertsWeights.dtype(),
@@ -487,10 +530,11 @@ void route_gate(torch::Tensor &linear_output, int score_fun, int batchSize,
                     "Mismatched dtypes: bias and linear_output.");
     }
 
-    TORCH_CHECK(
-        linear_output.dtype() == torch::kFloat16 ||
-            linear_output.dtype() == torch::kBFloat16,
-        "Invalid dtype for linear_output: must be kFloat16 or kBFloat16.");
+    TORCH_CHECK(linear_output.dtype() == torch::kFloat ||
+                    linear_output.dtype() == torch::kFloat16 ||
+                    linear_output.dtype() == torch::kBFloat16,
+                "Invalid dtype for linear_output: must be kFloat, kFloat16, or "
+                "kBFloat16.");
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(linear_output));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();

@@ -16,7 +16,6 @@ from chitu.serve.api_server import (
 )
 from chitu.serve.openai_api import ChatRequest, Message, StreamOptions
 
-
 # ============================================================
 # Message model tests
 # ============================================================

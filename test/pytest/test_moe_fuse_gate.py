@@ -20,7 +20,7 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
     "seq_length",
     [0, 1, 16, 128, 256, 512, 1024],
 )
-@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
     "num_experts,num_expert_group,topk_group,topk_as_topk_group_criteria,topk,score_func,has_bias,bias_is_float32",
     [
@@ -28,6 +28,7 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
         (256, 8, 4, 2, 8, "sigmoid", True, False),
         (256, 8, 4, 2, 8, "sigmoid", False, None),
         (128, 1, 1, None, 8, "sigmoid", True, False),
+        (256, 1, 1, None, 6, "sqrtsoftplus", True, True),
         (128, 1, 1, None, 8, "softmax", False, None),
     ],
 )
@@ -50,6 +51,9 @@ def test_moe_fused_gate(
     impl,
     record_benchmark,
 ):
+    if dtype == torch.float32 and not (impl == "cuda" and score_func == "sqrtsoftplus"):
+        pytest.skip("float32 coverage is only needed for CUDA sqrtsoftplus gate")
+
     if impl == "cuda" and not has_chitu_backend:
         pytest.skip("chitu_backend is not available, skipping CUDA tests")
     if impl == "muxi":
@@ -69,6 +73,8 @@ def test_moe_fused_gate(
     if impl == "npu_moe_gating_top_k":
         if not has_torch_npu:
             pytest.skip("torch_npu is missing")
+        if score_func not in ["softmax", "sigmoid"]:
+            pytest.skip("npu_moe_gating_top_k does not support this score_func")
         if num_experts not in [256, 384]:
             pytest.skip("npu_moe_gating_top_k only supports 256 and 384 experts")
         if not norm_prob:
@@ -116,7 +122,7 @@ def test_moe_fused_gate(
         seq_length=seq_length,
         impl=impl,
     )
-    indices_ref, weights_ref = moe_gate(
+    ref_fn = lambda: moe_gate(
         scores,
         topk,
         num_expert_group=num_expert_group,
@@ -127,6 +133,14 @@ def test_moe_fused_gate(
         norm_prob=norm_prob,
         impl="torch",
     )
+    if score_func == "sqrtsoftplus" and impl == "cuda":
+        indices_ref, weights_ref = record_benchmark.run(
+            ref_fn,
+            seq_length=seq_length,
+            impl="torch",
+        )
+    else:
+        indices_ref, weights_ref = ref_fn()
 
     # We tolerate some of the items mismatch due to numerical instability. This is
     # especially common when we use expert grouping, because the numerical error on
@@ -156,19 +170,24 @@ def test_moe_fused_gate(
         )
     if weights_ref.numel() > 0:
         if dtype == torch.bfloat16 or dtype == torch.float16:
-            assert (
-                len(
-                    torch.nonzero(
-                        ~torch.isclose(
-                            weights.sort()[0],
-                            weights_ref.sort()[0],
-                            rtol=1e-2,
-                            atol=1e-2,
-                        )
+            rtol = 1e-2
+            atol = 1e-2
+        elif dtype == torch.float32:
+            rtol = 1e-4
+            atol = 1e-5
+        else:
+            assert False, "not implemented for type besides bfloat16, float16, float32"
+        assert (
+            len(
+                torch.nonzero(
+                    ~torch.isclose(
+                        weights.sort()[0],
+                        weights_ref.sort()[0],
+                        rtol=rtol,
+                        atol=atol,
                     )
                 )
-                / weights.nelement()
-                < tolerate_ratio
             )
-        else:
-            assert False, "not implemented for type besides bfloat16, float16"
+            / weights.nelement()
+            < tolerate_ratio
+        )
