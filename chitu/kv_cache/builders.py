@@ -243,16 +243,7 @@ def _build_indexer_cache(args):
             else default_paged_block_size_policy(args)
         )
 
-        mtp_extra = args.infer.mtp_size if args.infer.mtp_size > 1 else 0
-        auto_num_blocks = (
-            ceil_div(args.infer.max_seq_len + mtp_extra, block_size) * num_hot_req
-        )
-
-        resolved_num_blocks = (
-            int(args.infer.num_blocks)
-            if args.infer.num_blocks != -1
-            else int(auto_num_blocks)
-        )
+        resolved_num_blocks = _resolve_default_num_blocks(args, block_size, None)
 
         return PagedKVCache(
             layer_id_map,
@@ -456,6 +447,11 @@ def _build_deepseek_v3_with_indexer_cache_managers(
                         manager_name="indexer",
                     )
         cache_dict["indexer"] = indexer
+
+    if indexer.block_size == main_cache.block_size:
+        assert (
+            indexer.num_blocks == main_cache.num_blocks
+        ), f"{indexer.num_blocks} vs {main_cache.num_blocks}"
 
     return CacheBuildBundle(
         cache_type=args.infer.cache_type,
