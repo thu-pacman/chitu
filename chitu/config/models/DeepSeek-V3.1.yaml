@@ -11,6 +11,8 @@ defaults:
 # Access info
 name: DeepSeek-V3.1
 source: "https://huggingface.co/deepseek-ai/DeepSeek-V3.1" # Just for displaying. No automatic download.
+
+# Overrides
 tokenizer_type: "hf" # one of: hf, tiktoken
 tool_parser: DeepSeekV31ToolParser
 reasoning_type: switchable

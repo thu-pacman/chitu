@@ -9,7 +9,6 @@ import triton.language as tl
 from chitu.ops.triton_ops.utils import auto_retry_triton_compilation, autotune_compat
 from chitu.lazy import single_dispatch_lazy_tensor
 
-
 mhc_pre_map_configs = [
     Config(
         {"BLOCK_K": block_k},

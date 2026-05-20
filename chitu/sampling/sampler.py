@@ -10,7 +10,8 @@ from xgrammar import (
     GrammarMatcher,
     BatchGrammarMatcher,
 )
-from chitu.task import Task, SampleParams
+from chitu.global_vars import get_global_args
+from chitu.task import Task, SampleParams, PackedTasks, PackedTasksResult, TaskType
 from chitu.ops.sampling import (
     apply_bitmask,
     apply_frequency_penalty,
@@ -18,11 +19,14 @@ from chitu.ops.sampling import (
     batch_append_tokens,
 )
 from chitu.utils import ceil_div, create_tensor, AsyncCPUTensor
+from chitu.backend import Backend
+
 from .utils import get_tokenizer_info, get_op_device
 
 logger = logging.getLogger(__name__)
 
 TOKEN_BLOCK_SIZE = 256
+"token block size for frequency penalty"
 
 
 @dataclass
@@ -145,6 +149,9 @@ class TaskSampleState:
 
 class Sampler:
     def __init__(self):
+        args = get_global_args()
+        self.mtp_size = args.infer.mtp_size
+
         self.states: dict[str, TaskSampleState] = {}
         self.event: torch.cuda.Event | None = None
         self.last_tokens: AsyncCPUTensor | None = None
@@ -273,18 +280,62 @@ class Sampler:
         if self.last_tokens_mapping:
             self.last_tokens = AsyncCPUTensor(tokens)
 
-    def sample(self, logits: torch.Tensor, tasks: list[Task]):
-        logits = logits.view(len(tasks), logits.shape[-1]).contiguous()
-        states = self._get_states(tasks)
-        self._sync_tokens()
-        self._update_tokens(states)
-        self._apply_grammars(logits, states)
-        self._apply_frequency_penalty(logits, states)
-        tokens = self._sample_tokens(logits, states)
-        self._apply_test_tokens(tokens, states)
-        self._update_output_len(states)
-        self._store_tokens(tokens, states)
-        return tokens
+    def _mtp_accept(
+        self, logits: torch.Tensor, tasks: PackedTasks, return_selected_logits=False
+    ):
+        logits = logits.view(len(tasks.output_tasks), self.mtp_size, logits.shape[-1])
+        tokens = torch.argmax(logits, dim=-1)
+        if len(logits) == 0:
+            draft_tokens = tokens[:, :-1]
+        else:
+            draft_tokens = Backend.model.draft_tokens
+
+        match = tokens[:, :-1] == draft_tokens
+        accept_indices = torch.argmin(match.int(), dim=1)
+        accept_indices[match.all(dim=1)] = self.mtp_size - 1
+        batch_idx = torch.arange(tokens.shape[0], device=tokens.device)
+
+        # clear mtp output
+        Backend.model.draft_tokens = None
+        Backend.model.draft_logits = None
+
+        if return_selected_logits:
+            logits = logits[batch_idx, accept_indices]
+
+        return logits, tokens, accept_indices
+
+    def sample(self, logits: torch.Tensor, tasks: PackedTasks):
+        if self.mtp_size > 1 and tasks.task_type == TaskType.Decode:
+            # TODO: support mtp with stateful sampling
+            return_selected_logits = tasks.return_logprobs or tasks._test_flag
+            logits, tokens, accept_indices = self._mtp_accept(
+                logits, tasks, return_selected_logits=return_selected_logits
+            )
+        else:
+            logits = logits.view(len(tasks.output_tasks), logits.shape[-1]).contiguous()
+            states = self._get_states(tasks.output_tasks)
+            self._sync_tokens()
+            self._update_tokens(states)
+            self._apply_grammars(logits, states)
+            self._apply_frequency_penalty(logits, states)
+            tokens = self._sample_tokens(logits, states)
+            self._apply_test_tokens(tokens, states)
+            self._update_output_len(states)
+            self._store_tokens(tokens, states)
+            accept_indices = None
+            tokens = tokens.unsqueeze(-1)
+
+        result = PackedTasksResult(tokens)
+        result.accept_indices = accept_indices
+        if tasks.return_logprobs:
+            logprobs = torch.log_softmax(logits, dim=-1)
+            logprobs, token_idxs = logprobs.sort(dim=-1, descending=True)
+            result.logprobs = logprobs
+            result.token_idxs = token_idxs
+        if tasks._test_flag:
+            result.logits = logits
+
+        return result
 
     def end_tasks(self, task_ids: list[str]):
         for task_id in task_ids:

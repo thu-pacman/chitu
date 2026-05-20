@@ -2,17 +2,25 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from hashlib import sha256
-from typing import Optional, Any, Callable
+from typing import TYPE_CHECKING, Any, Optional
 import pickle
+from chitu.global_vars import get_global_args
+import functools
+
+if TYPE_CHECKING:
+    from task import Task
 
 # NONE_BLK_HASH must be deterministic across processes/ranks.
 NONE_BLK_HASH = "0" * 64
+_HASH_FN_CACHE_MAX = 2048
 
 
-def _hash_fn(inputs: tuple[Any, ...]) -> str:
+@functools.lru_cache(maxsize=_HASH_FN_CACHE_MAX)
+def hash_fn_cached(inputs: tuple[Any, ...]) -> str:
     byte_inputs = pickle.dumps(inputs)
     return sha256(byte_inputs).hexdigest()
 
@@ -31,25 +39,6 @@ class BlockIdentity:
     blk_size: int = 0
     pre_blk_hash: str = NONE_BLK_HASH
     blk_hash: Optional[str] = None
-
-    @classmethod
-    def from_tokens(
-        cls,
-        tokens: list[int],
-        *,
-        blk_size: int,
-        pre_blk_hash: str,
-        blk_hash: Optional[str] = None,
-        auto_hash: bool = True,
-    ) -> "BlockIdentity":
-        if auto_hash and blk_hash is None and len(tokens) == blk_size:
-            blk_hash = _hash_fn((pre_blk_hash, tuple(tokens)))
-        return cls(
-            tokens=tuple(tokens),
-            blk_size=blk_size,
-            pre_blk_hash=pre_blk_hash,
-            blk_hash=blk_hash,
-        )
 
     @property
     def is_full(self) -> bool:
@@ -80,60 +69,28 @@ class TokenBlock:
 
     def __init__(
         self,
-        tokens: Optional[list[int]] = None,
-        blk_hash: Optional[str] = None,
-        pre_blk_hash: str = NONE_BLK_HASH,
-        blk_size: int = 0,
-        cache_idx: Optional[int] = None,
-        active_cnt: int = 0,
-        *,
         identity: Optional[BlockIdentity] = None,
         runtime: Optional[BlockRuntime] = None,
     ):
-        self.identity = identity or BlockIdentity.from_tokens(
-            list(tokens or []),
-            blk_size=blk_size,
-            pre_blk_hash=pre_blk_hash,
-            blk_hash=blk_hash,
-            auto_hash=False,
-        )
-        self.runtime = runtime or BlockRuntime(
-            cache_idx=cache_idx,
-            active_cnt=active_cnt,
-        )
+        self.identity = identity if identity is not None else BlockIdentity()
+        self.runtime = runtime if runtime is not None else BlockRuntime()
         assert self.identity is not None and self.runtime is not None
 
     @property
-    def tokens(self) -> list[int]:
-        return list(self.identity.tokens)
-
-    @tokens.setter
-    def tokens(self, value: list[int]) -> None:
-        self.update_identity(tokens=value, blk_hash=None)
+    def tokens(self) -> tuple[int]:
+        return self.identity.tokens
 
     @property
     def blk_hash(self) -> Optional[str]:
         return self.identity.blk_hash
 
-    @blk_hash.setter
-    def blk_hash(self, value: Optional[str]) -> None:
-        self.update_identity(blk_hash=value)
-
     @property
     def pre_blk_hash(self) -> str:
         return self.identity.pre_blk_hash
 
-    @pre_blk_hash.setter
-    def pre_blk_hash(self, value: str) -> None:
-        self.update_identity(pre_blk_hash=value, blk_hash=None)
-
     @property
     def blk_size(self) -> int:
         return self.identity.blk_size
-
-    @blk_size.setter
-    def blk_size(self, value: int) -> None:
-        self.update_identity(blk_size=value, blk_hash=None)
 
     @property
     def cache_idx(self) -> Optional[int]:
@@ -151,51 +108,11 @@ class TokenBlock:
     def active_cnt(self, value: int) -> None:
         self.runtime.active_cnt = value
 
-    def update_identity(
-        self,
-        *,
-        tokens: Optional[list[int]] = None,
-        pre_blk_hash: Optional[str] = None,
-        blk_hash: Optional[str] = None,
-        blk_size: Optional[int] = None,
-    ) -> None:
-        """Update block identity when identity info changed."""
-        assert self.identity is not None
-        changed = tokens is not None or pre_blk_hash is not None or blk_size is not None
-        tokens = list(self.identity.tokens) if tokens is None else list(tokens)
-        blk_size = self.identity.blk_size if blk_size is None else blk_size
-        pre_blk_hash = (
-            self.identity.pre_blk_hash if pre_blk_hash is None else pre_blk_hash
-        )
-        if blk_hash is None and changed:
-            blk_hash = None
-        else:
-            blk_hash = self.identity.blk_hash if blk_hash is None else blk_hash
-        self.identity = BlockIdentity.from_tokens(
-            tokens,
-            blk_size=blk_size,
-            pre_blk_hash=pre_blk_hash,
-            blk_hash=blk_hash,
-        )
-
     def set_identity(self, identity: BlockIdentity) -> None:
         self.identity = identity
 
     def set_runtime(self, runtime: BlockRuntime) -> None:
         self.runtime = runtime
-
-    @classmethod
-    def hash_fn(cls, inputs: tuple[Any, ...]) -> str:
-        return _hash_fn(inputs)
-
-    def generate_blk_hash(self) -> None:
-        assert len(self.tokens) == self.blk_size, (
-            "blk_hash can only be generated when the block is full, "
-            f"got tokens length ({len(self.tokens)}) but block size is ({self.blk_size}) "
-        )
-        self.update_identity(
-            blk_hash=self.hash_fn((self.pre_blk_hash, tuple(self.tokens)))
-        )
 
     @property
     def state(self) -> KVBlockState:
@@ -208,10 +125,12 @@ class TokenBlock:
         return len(self.identity.tokens)
 
     def __repr__(self):
+        bh = self.blk_hash
+        ph = self.pre_blk_hash
         return (
             f"TokenBlock(length={self.__len__()}, "
-            f"blk_hash={self.blk_hash[:6]}, "
-            f"pre_blk_hash={self.pre_blk_hash[:6]}, "
+            f"blk_hash={(bh[:6] if bh else None)}, "
+            f"pre_blk_hash={ph[:6]}, "
             f"blk_size={self.blk_size}, "
             f"cache_idx={self.cache_idx}, "
             f"active_cnt={self.active_cnt})"
@@ -221,101 +140,170 @@ class TokenBlock:
 class BlockIdentityChainBuilder:
     """
     将 token 序列按 block_size 切分并构建带前缀哈希链的 BlockIdentity 列表。
-
-    existing_identities 可选，用于做 identity 复用和哈希冲突检查。
     """
 
-    def __init__(
-        self,
-        block_size: int,
-        existing_identities: Any = None,
-    ):
-        self.block_size = block_size
-        self.existing_identities: Any = (
-            existing_identities if existing_identities is not None else {}
-        )
+    _registry: dict[tuple[str, int], "BlockIdentityChainBuilder"] = {}
 
-    def _resolve_hash(self, identity: BlockIdentity) -> str:
-        """解决哈希冲突，返回 identity 的唯一哈希值。"""
-        blk_hash = identity.blk_hash or TokenBlock.hash_fn(
-            (identity.pre_blk_hash, identity.tokens)
-        )
-        collision_count = 0
-        while blk_hash in self.existing_identities:
-            existing = self.existing_identities[blk_hash]
-            if (
-                existing.tokens == identity.tokens
-                and existing.pre_blk_hash == identity.pre_blk_hash
-            ):
-                break  # 同一个 block，无冲突
-            collision_count += 1
-            blk_hash = TokenBlock.hash_fn(
-                (identity.pre_blk_hash, identity.tokens, collision_count)
-            )
-        return blk_hash
+    def __init__(self, manager_name: str, block_size: int):
+        self.manager_name = manager_name
+        self.block_size = block_size
+        self.hashed_block_pool: dict[str, BlockIdentity] = dict()
+        self.tid_to_identities: dict[str, list[BlockIdentity]] = dict()
+
+        # 优化不开启前缀缓存/不计算块哈希时的耗时
+        max_seq_len = getattr(get_global_args().infer, "max_seq_len", 8192)
+
+        self._placeholder_identity = BlockIdentity(blk_size=block_size)
+        self._placeholder_identity_chain = [
+            self._placeholder_identity
+            for _ in range((max_seq_len + self.block_size - 1) // self.block_size)
+        ]
+
+    @classmethod
+    def acquire(cls, manager_name: str, block_size: int) -> "BlockIdentityChainBuilder":
+        """同一进程内按 (manager_name, block_size) 共享实例；hashed_block_pool 维护满块
+        canonical identity，供哈希冲突消解与复用。
+        """
+        key = (manager_name, block_size)
+        if key not in cls._registry:
+            cls._registry[key] = cls(manager_name, block_size)
+        return cls._registry[key]
+
+    @classmethod
+    def clear_registry(cls) -> None:
+        """清空按 acquire 缓存的 builder 实例。"""
+        cls._registry.clear()
+
+    def forget_hash(self, blk_hash: Optional[str]):
+        if blk_hash is None:
+            return
+        self.hashed_block_pool.pop(blk_hash, None)
 
     def make_identity(
         self,
         token_chunk: list[int],
-        pre_blk_hash: str,
-        auto_register: bool = False,
+        pre_blk_hash: Optional[str] = None,
+        *,
+        canonical_prefix_hashes: bool = True,
     ) -> BlockIdentity:
-        """将一个 token块（长度 ≤ block_size）封装为 BlockIdentity。"""
+        """将一个长度不超过 ``block_size`` 的 token 块封装为 ``BlockIdentity``。
+
+        Args:
+            token_chunk: 当前块的 token id；长度可为小于 ``block_size`` 的尾部块。
+            pre_blk_hash: 上一满块的 ``blk_hash``；为首块时可使用 ``NONE_BLK_HASH``。
+            canonical_prefix_hashes: 为 False，或当前块未满（``len(token_chunk) < block_size``）时，
+                不计算 ``blk_hash``、不访问 ``hashed_block_pool``，且 ``identity.tokens`` 为空元组；
+                为 True 且块满时，计算哈希、做碰撞消解并写入或复用 ``hashed_block_pool``。
+
+        Returns:
+            对应块的 ``BlockIdentity``。
+        """
         if len(token_chunk) > self.block_size:
             raise ValueError(
                 f"Input tokens length ({len(token_chunk)}) shouldn't bigger than block size ({self.block_size})"
             )
+        if pre_blk_hash is None:
+            pre_blk_hash = NONE_BLK_HASH
 
-        identity = BlockIdentity.from_tokens(
-            list(token_chunk),
-            blk_hash=None,
+        want_hash = canonical_prefix_hashes and len(token_chunk) == self.block_size
+
+        if not want_hash:
+            return (
+                self._placeholder_identity
+            )  # 不计算块哈希时返回占位identity，减少耗时
+
+        tokens = tuple(token_chunk)
+        blk_hash = hash_fn_cached((pre_blk_hash, tokens))
+        collision_count = 0
+        while True:
+            existing = self.hashed_block_pool.get(blk_hash)
+            if existing is None:
+                break
+            if existing.tokens == tokens and existing.pre_blk_hash == pre_blk_hash:
+                return existing
+            collision_count += 1
+            blk_hash = hash_fn_cached((pre_blk_hash, tokens, collision_count))
+
+        identity = BlockIdentity(
+            tokens=tokens,
             blk_size=self.block_size,
             pre_blk_hash=pre_blk_hash,
-        )
-        if identity.blk_hash is None:
-            return identity
-
-        blk_hash = self._resolve_hash(identity)
-        identity = BlockIdentity.from_tokens(
-            list(identity.tokens),
-            blk_size=identity.blk_size,
-            pre_blk_hash=identity.pre_blk_hash,
             blk_hash=blk_hash,
         )
-
-        if blk_hash in self.existing_identities:
-            return self.existing_identities[blk_hash]
-
-        if auto_register:
-            self.existing_identities[blk_hash] = identity
-
+        self.hashed_block_pool[blk_hash] = identity
         return identity
 
-    def build(
+    def make_identity_chain_from_tokens(
         self,
         tokens: list[int],
+        *,
         initial_pre_hash: str = NONE_BLK_HASH,
-        auto_register: bool = False,
+        canonical_prefix_hashes: bool = True,
     ) -> list[BlockIdentity]:
-        """
-        Build block identities from a token sequence.
+        """按 block_size 切分 token 序列并构建前缀哈希链（无 Task / tid 缓存）。
+
+        供 Router 等仅有 prompt token 列表、不与 Task 生命周期绑定的调用方使用；
+        与同参数的 ``make_identity_chain`` 在重建链条时的语义一致。
+
         Args:
-            tokens: Token sequence to partition into blocks
-            initial_pre_hash: Starting hash for prefix chain (default: NONE_BLK_HASH)
-            auto_register: whether to insert new generated identity into store
+            tokens: prompt 的 token id 序列。
+            initial_pre_hash: 前缀哈希链起始值，默认 ``NONE_BLK_HASH``。
+            canonical_prefix_hashes: 为 False 时跳过满块的哈希计算及 ``hashed_block_pool`` 读写。
+
         Returns:
-            list[BlockIdentity]: List of identities with established prefix hash chain
+            各块的 ``BlockIdentity`` 列表（满块上的前缀哈希链已建立）。
         """
         identities: list[BlockIdentity] = []
-        pre_blk_hash = initial_pre_hash
-
+        pre_blk_hash: Optional[str] = initial_pre_hash
         for i in range(0, len(tokens), self.block_size):
             chunk = tokens[i : i + self.block_size]
-            identity = self.make_identity(chunk, pre_blk_hash, auto_register)
+            identity = self.make_identity(
+                chunk,
+                pre_blk_hash,
+                canonical_prefix_hashes=canonical_prefix_hashes,
+            )
             identities.append(identity)
+            pre_blk_hash = identity.blk_hash
+        return identities
 
-            # Only full blocks have valid hash for chaining
-            if len(chunk) == self.block_size and identity.blk_hash:
-                pre_blk_hash = identity.blk_hash
+    def forget_task(self, task: "Task"):
+        self.tid_to_identities.pop(task.task_id, None)
 
+    def make_identity_chain(
+        self,
+        task: "Task",
+        *,
+        initial_pre_hash: str = NONE_BLK_HASH,
+        canonical_prefix_hashes: bool = True,
+    ) -> list[BlockIdentity]:
+        """根据 ``task.prefix_tokens`` 构建块身份链。
+
+        结果按 ``task.task_id`` 缓存在 ``tid_to_identities``；若当前缓存块数少于
+        ``task.prefix_tokens`` 所需块数，则丢弃旧缓存并整条重建。
+
+        Args:
+            task: 推理任务，切分所用序列为 ``task.prefix_tokens``。
+            initial_pre_hash: 前缀哈希链起始值，默认 ``NONE_BLK_HASH``。
+            canonical_prefix_hashes: 为 False 时跳过满块的哈希计算及 ``hashed_block_pool`` 读写。
+
+        Returns:
+            ``task.prefix_tokens`` 对应的 ``BlockIdentity`` 列表（满块上的前缀哈希链已建立）。
+        """
+        if not canonical_prefix_hashes:
+            return self._placeholder_identity_chain[
+                : (len(task.prefix_tokens) + self.block_size - 1) // self.block_size
+            ]
+
+        identities: list[BlockIdentity] = self.tid_to_identities.get(task.task_id, [])
+
+        if (
+            len(identities)
+            < (len(task.prefix_tokens) + self.block_size - 1) // self.block_size
+        ):
+            identities = self.make_identity_chain_from_tokens(
+                task.prefix_tokens,
+                initial_pre_hash=initial_pre_hash,
+                canonical_prefix_hashes=canonical_prefix_hashes,
+            )
+            self.tid_to_identities[task.task_id] = identities
         return identities

@@ -90,16 +90,18 @@ def auto_tuning_logger(args, *, name: str, **kwargs):
     )
 
 
-def autotune_compat(*, configs, key, cache_results=False):
+def autotune_compat(*, configs, key, cache_results=False, **kwargs):
     if _support_cache_results:
         return triton.autotune(
             configs=configs,
             key=key,
             cache_results=cache_results,
+            **kwargs,
         )
     else:
         # Make triton autotune compatible with the muxi platform.
         return triton.autotune(
             configs=configs,
             key=key,
+            **kwargs,
         )

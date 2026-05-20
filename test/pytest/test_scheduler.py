@@ -247,7 +247,7 @@ def test_priority_prefill_first():
         num_scheduler_groups=1,
     )
 
-    main_manager = Backend.cache_managers[0]["main"]
+    main_manager: PagedKVCacheManager = Backend.cache_managers[0]["main"]
 
     tasks = []
     for i in range(9):
@@ -260,7 +260,7 @@ def test_priority_prefill_first():
     # 让task_2, task_5, task_6为decode状态
     for task in [tasks[2], tasks[5], tasks[6]]:
         task.dp_rank = 0
-        main_manager.ensure_task_token_blocks(task)
+        assert main_manager.num_cached_blocks(task) == 0
         task.set_prefill_chunk_size_for_one_step(task.prefix_tokens_len)
         scheduler._prepare_prefill_metadata(task, cached_len=0)
         task.consume_req_tokens()
@@ -439,7 +439,7 @@ def test_priority_fcfs():
         }
     ]
 
-    main_manager = Backend.cache_managers[0]["main"]
+    main_manager: PagedKVCacheManager = Backend.cache_managers[0]["main"]
 
     scheduler = Scheduler(
         max_runing_tasks=100,
@@ -462,7 +462,7 @@ def test_priority_fcfs():
     # 让task_6, task_7, task_8为decode状态
     for task in [tasks[6], tasks[7], tasks[8]]:
         task.dp_rank = 0
-        main_manager.ensure_task_token_blocks(task)
+        main_manager.num_cached_blocks(task) == 0
         task.set_prefill_chunk_size_for_one_step(task.prefix_tokens_len)
         scheduler._prepare_prefill_metadata(task, cached_len=0)
         task.consume_req_tokens()
@@ -655,7 +655,7 @@ def test_priority_request_preset_over_prefill_first():
     # 让task_2, task_5, task_6为decode状态
     for task in [tasks[2], tasks[5], tasks[6]]:
         task.dp_rank = 0
-        main_manager.ensure_task_token_blocks(task)
+        main_manager.num_cached_blocks(task) == 0
         task.set_prefill_chunk_size_for_one_step(task.prefix_tokens_len)
         scheduler._prepare_prefill_metadata(task, cached_len=0)
         task.consume_req_tokens()
@@ -1080,7 +1080,7 @@ def test_evict_task():
         TaskPool.add(task)  # pool: ['req_0', 'req_1', 'req_2', 'req_3']
 
         task.dp_rank = 0
-        main_manager.ensure_task_token_blocks(task)
+        main_manager.num_cached_blocks(task) == 0
         task.set_prefill_chunk_size_for_one_step(BLOCK_SIZE)
         scheduler._prepare_prefill_metadata(task, cached_len=0)
         task.consume_req_tokens()
@@ -1162,8 +1162,8 @@ def test_scheduler_group():
     Backend.cache_managers = [
         {
             "main": PagedKVCacheManager(
-                num_blocks=10,
-                num_hot_req=10,
+                num_blocks=100,
+                num_hot_req=100,
                 max_seq_len=1024,
                 dp_rank=0,
                 block_size=512,
@@ -1175,7 +1175,7 @@ def test_scheduler_group():
     scheduler = Scheduler(
         100,
         4,
-        2,
+        4,
         "prefill_first",
         cache_manager_dict=Backend.cache_managers[0],
         num_scheduler_groups=2,
@@ -1192,7 +1192,7 @@ def test_scheduler_group():
     # 让task_2, task_5为decode状态
     for task in [tasks[2], tasks[5]]:
         task.dp_rank = 0
-        Backend.cache_managers[0]["main"].ensure_task_token_blocks(task)
+        scheduler.cache_manager_dict["main"].num_cached_blocks(task) == 0
         task.set_prefill_chunk_size_for_one_step(task.prefix_tokens_len)
         scheduler._prepare_prefill_metadata(task, cached_len=0)
         task.consume_req_tokens()
@@ -1212,6 +1212,10 @@ def test_scheduler_group():
         "req_1",
     ]  # scheduler prefill tasks, num_tasks <= prefill_mbs == 4
 
+    # 在下一次调度前，executor.step中会更新task.consumed_req_tokens, 此处需模拟executor中的更新, cache_managers和scheduler依赖此值
+    for task_id in batch1_ids:
+        TaskPool.pool[task_id].consume_req_tokens()
+
     # TaskPool: {'req_7':waiting, 'req_2', 'req_1':waiting, 'req_5'}
     # sgroup head at: 1, empty sgroup: [0]
     scheduler.prepare_for_schedule()
@@ -1221,19 +1225,19 @@ def test_scheduler_group():
         "req_5",
     ]  # scheduler decode tasks, num_tasks <=decode_mbs == 4
 
-    # Add another 5 tasks
-    TaskPool.add(tasks[3])
-    TaskPool.add(tasks[8])
-    TaskPool.add(tasks[0])
-    TaskPool.add(tasks[4])
-    TaskPool.add(tasks[6])
+    # 在下一次调度前，executor.step中会更新task.consumed_req_tokens, 此处需模拟executor中的更新,  cache_managers和scheduler依赖此值
+    for task_id in batch2_ids:
+        TaskPool.pool[task_id].consume_req_tokens()
 
-    # 让task_6为decode状态
-    tasks[6].dp_rank = 0
-    Backend.cache_managers[0]["main"].ensure_task_token_blocks(tasks[6])
-    tasks[6].set_prefill_chunk_size_for_one_step(tasks[6].prefix_tokens_len)
-    scheduler._prepare_prefill_metadata(tasks[6], cached_len=0)
-    tasks[6].consume_req_tokens()
+    # Add another 5 decode tasks
+    for i in [3, 8, 0, 4, 6]:
+        TaskPool.add(tasks[i])
+        tasks[i].dp_rank = 0
+        assert scheduler.cache_manager_dict["main"].num_cached_blocks(tasks[i]) == 0
+        tasks[i].set_prefill_chunk_size_for_one_step(tasks[i].prefix_tokens_len)
+        scheduler._prepare_prefill_metadata(tasks[i], cached_len=0)
+        tasks[i].consume_req_tokens()
+        assert tasks[i].task_type == TaskType.Decode
 
     # sgroup head at: 0, empty sgroup: []
     scheduler.update(batch1_ids)
@@ -1259,7 +1263,7 @@ def test_scheduler_group():
     # sgroup_0 release earlier than sgroup_1, so it will be scheduled earlier than sgroup_1
     scheduler.prepare_for_schedule()
     batch4_ids = scheduler.schedule()
-    assert batch4_ids == ["req_0", "req_4"]
+    assert batch4_ids == ["req_0", "req_4", "req_6"]
     # remove tasks in scheduler_group_0, release scheduler_group_0
     for task_id in batch3_ids:
         TaskPool.pool[task_id].num_new_tokens = 1025
@@ -1269,19 +1273,12 @@ def test_scheduler_group():
     # sgroup head at: 0, empty sgroup: []
     scheduler.update(batch3_ids)
 
-    # TaskPool: ['req_0':waiting, 'req_4':waiting, 'req_6']
-    # sgroup head at: 0, empty sgroup: [1]
-    scheduler.prepare_for_schedule()
-    batch5_ids = scheduler.schedule()
-    assert batch5_ids == ["req_6"]
-
-    for task_id in batch4_ids + batch5_ids:
+    for task_id in batch4_ids:
         TaskPool.pool[task_id].num_new_tokens = 1025
         TaskPool.pool[task_id].next_token = 2
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch4_ids)
-    scheduler.update(batch5_ids)
 
     # TaskPool: []
     scheduler.prepare_for_schedule()
@@ -1500,22 +1497,6 @@ def test_pp_chunked_prefill():
         scheduler.update(batch_ids)
 
 
-def _build_scheduler_for_helper_tests(cache_manager_dict: dict, *, main_threshold=None):
-    scheduler = Scheduler(
-        100,
-        12,
-        12,
-        "prefill_first",
-        cache_manager_dict=cache_manager_dict,
-        num_scheduler_groups=1,
-        prefill_chunk_size=20000,
-    )
-    if main_threshold is not None:
-        scheduler.kvcache_block_threshold = main_threshold
-
-    return scheduler
-
-
 def test_prepare_prefill_metadata_multi_cache_managers():
     set_global_args(
         OmegaConf.create(
@@ -1561,7 +1542,7 @@ def test_prepare_prefill_metadata_multi_cache_managers():
     task0 = Task("req_prefill_0", UserRequest.create_mock(512, "req_prefill_0"))
 
     for manager in (main, indexer):
-        manager.ensure_task_token_blocks(task0)
+        assert manager.num_cached_blocks(task0) == 0
     task0.set_prefill_chunk_size_for_one_step(128)
 
     scheduler._prepare_prefill_metadata(task0, cached_len=0)
@@ -1571,13 +1552,10 @@ def test_prepare_prefill_metadata_multi_cache_managers():
     assert len(task0.new_cache_ids["indexer"]) == 2
     assert task0.inc_hit_tokens == 0
     assert task0.consumed_req_tokens == 128
-    assert main.tid_to_cached_len[task0.task_id] == 128
-    assert indexer.tid_to_cached_len[task0.task_id] == 128
+    assert task0.kv_cache_len_used_in_completed_steps == 128
 
     # 测试task1的prompt被main和indexer manager全部击中
     task1 = Task("req_prefill_1", UserRequest.create_mock(128, "req_prefill_1"))
-    for manager in (main, indexer):
-        manager.ensure_task_token_blocks(task1)
     assert main.num_cached_blocks(task1) == 1
     assert indexer.num_cached_blocks(task1) == 2
 
@@ -1590,14 +1568,14 @@ def test_prepare_prefill_metadata_multi_cache_managers():
     assert len(task1.new_cache_ids["indexer"]) == 2
     assert task1.inc_hit_tokens == 127
     assert task1.consumed_req_tokens == 127
-    assert main.tid_to_cached_len[task1.task_id] == 128
-    assert indexer.tid_to_cached_len[task1.task_id] == 128
+    assert task1.prefill_chunk_size == 1
 
     # 测试test1的prepare_decode_metadata过程
     task1.consume_req_tokens()
     task1.prefix_tokens.append(1)
     assert task1.task_type == TaskType.Decode
     assert task1.prefix_tokens_len == 129
+    assert task1.kv_cache_len_used_in_completed_steps == 128
 
     assert main.task_to_cache_ids[task1.task_id] == {0}
     assert indexer.task_to_cache_ids[task1.task_id] == {0, 1}

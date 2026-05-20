@@ -23,7 +23,7 @@ from chitu.models.model import (
     get_linear_layout_contig_y,
 )
 from chitu.models.registry import ModelType, register_model
-from chitu.ops import apply_rotary_pos_emb_partial
+from chitu.ops import apply_rotary_pos_emb_partial, moe_gate, moe_hash_gate
 from chitu.ops.hadamard import hadamard_transform
 from chitu.ops.mhc import mhc_pre, mhc_post
 from chitu.ops.quant import (
@@ -1062,7 +1062,34 @@ class GateDeepSeekV4(MoeGate):
             )
 
     def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor]):
+        if self.hash and input_ids is None:
+            raise RuntimeError("DeepSeek-V4 hash gate requires input_ids")
+
+        if self.hash and self.score_func == "sqrtsoftplus":
+            weights, indices = moe_hash_gate(
+                x,
+                self.weight,
+                input_ids,
+                self.tid2eid,
+                self.topk,
+                score_func=self.score_func,
+            )
+            return weights * self.route_scale, indices.long()
+
         scores = F.linear(x.float(), self.weight.float())
+        if not self.hash:
+            indices, weights = moe_gate(
+                scores,
+                self.topk,
+                num_expert_group=self.n_groups,
+                topk_group=self.topk_groups,
+                topk_as_topk_group_criteria=self.topk_as_topk_group_criteria,
+                e_score_correction_bias=self.bias,
+                score_func=self.score_func,
+                norm_prob=self.score_func != "softmax",
+            )
+            return weights * self.route_scale, indices.long()
+
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
         elif self.score_func == "sigmoid":
@@ -1070,14 +1097,7 @@ class GateDeepSeekV4(MoeGate):
         else:
             scores = F.softplus(scores).sqrt()
         original_scores = scores
-        if self.bias is not None:
-            scores = scores + self.bias
-        if self.hash:
-            if input_ids is None:
-                raise RuntimeError("DeepSeek-V4 hash gate requires input_ids")
-            indices = self.tid2eid[input_ids.to(torch.long)]
-        else:
-            indices = scores.topk(self.topk, dim=-1)[1]
+        indices = self.tid2eid[input_ids.to(torch.long)]
         indices = indices.long()
         weights = original_scores.gather(1, indices)
         if self.score_func != "softmax":

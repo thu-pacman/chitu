@@ -28,6 +28,11 @@ void route_gate(torch::Tensor &linear_output, int score_fun, int batchSize,
                 torch::Tensor &selectedExpertsWeights, int topK,
                 c10::optional<torch::Tensor> bias = c10::nullopt);
 
+void hash_route_gate(torch::Tensor &x, torch::Tensor &weight,
+                     torch::Tensor &input_ids, torch::Tensor &tid2eid,
+                     torch::Tensor &expertsIds,
+                     torch::Tensor &selectedExpertsWeights, int topK);
+
 void topk_softmax(torch::Tensor &topk_weights, torch::Tensor &topk_indices,
                   torch::Tensor &token_expert_indices,
                   torch::Tensor &gating_output);

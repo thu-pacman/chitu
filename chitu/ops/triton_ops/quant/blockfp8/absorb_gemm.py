@@ -29,8 +29,6 @@ def blockfp8_einsum_shc_hdc_shd_triton(
     group_k: int = 128,
     soft_fp8: bool = False,
 ):
-    assert group_B.shape[1] == group_b_s.shape[1] * group_k
-    assert group_B.shape[2] == group_b_s.shape[2] * group_n
     s, h, c, d = (
         group_A.shape[0],
         group_A.shape[1],
@@ -45,6 +43,12 @@ def blockfp8_einsum_shc_hdc_shd_triton(
     stride_B_group, stride_B_1 = group_B.stride()[0], group_B.stride()[1]
     stride_C_group, stride_C_m = d, h * d
     assert group_b_s.is_contiguous()
+    assert group_A.stride()[2] == 1
+    assert group_B.stride()[2] == 1
+    assert group_B.shape[1] == group_b_s.shape[1] * group_n
+    assert group_B.shape[2] == group_b_s.shape[2] * group_k
+    assert group_n in [64, 128]
+    assert group_k in [64, 128]
     group_C = torch.empty((s, h, d), dtype=group_A.dtype, device=group_A.device)
 
     if soft_fp8:
@@ -91,7 +95,11 @@ def blockfp8_einsum_shc_hdc_shd_config_filter(*, block_m, block_n, num_stages):
 
 blockfp8_einsum_shc_hdc_shd_configs = [
     Config(
-        {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": 128},
+        {
+            "BLOCK_SIZE_M": block_m,
+            "BLOCK_SIZE_N": block_n,
+            "BLOCK_SIZE_K": block_k,
+        },
         num_stages=num_stages,
         num_warps=8,
         pre_hook=functools.partial(
@@ -99,9 +107,11 @@ blockfp8_einsum_shc_hdc_shd_configs = [
             name="blockfp8_einsum_shc_hdc_shd_kernel",
             block_m=block_m,
             block_n=block_n,
+            block_k=block_k,
             num_stages=num_stages,
         ),
     )
+    for block_k in [64, 128]
     for block_m in [16, 32, 64]
     for block_n in [32, 64, 128]
     for num_stages in [1, 3, 5]
@@ -111,11 +121,17 @@ blockfp8_einsum_shc_hdc_shd_configs = [
 ]
 
 
-@autotune_compat(
-    configs=blockfp8_einsum_shc_hdc_shd_configs,
-    key=["N", "K", "fp8_to_fp32_scale"],
-    cache_results=True,
-)
+def _prune_blockfp8_einsum_shc_hdc_shd_configs(configs, named_args, **_):
+    group_n = named_args["group_n"]
+    group_k = named_args["group_k"]
+    return [
+        config
+        for config in configs
+        if config.kwargs["BLOCK_SIZE_N"] <= group_n
+        and config.kwargs["BLOCK_SIZE_K"] <= group_k
+    ]
+
+
 @triton.jit
 def blockfp8_einsum_shc_hdc_shd_kernel(
     # Pointers:
@@ -211,3 +227,13 @@ def blockfp8_einsum_shc_hdc_shd_kernel(
     )
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(c_ptrs, c, mask=mask)
+
+
+blockfp8_einsum_shc_hdc_shd_kernel = autotune_compat(
+    configs=blockfp8_einsum_shc_hdc_shd_configs,
+    key=["N", "K", "group_n", "group_k", "fp8_to_fp32_scale"],
+    cache_results=True,
+    prune_configs_by={
+        "early_config_prune": _prune_blockfp8_einsum_shc_hdc_shd_configs,
+    },
+)(blockfp8_einsum_shc_hdc_shd_kernel)

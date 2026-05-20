@@ -1030,6 +1030,8 @@ class Blockfp8AbsorbGemm(QuantizedAbsorbGemmBase):
             self.weight,
             self.scale,
             block_size=self.block_size,
+            group_n=self.block_size,
+            group_k=self.block_size,
             soft_fp8=(get_global_args().infer.raise_lower_bit_float_to == "bfloat16"),
         )
 

@@ -65,7 +65,7 @@ from chitu.moe import init_moe_impl
 from chitu.global_vars import set_slot_handle
 from chitu.numa_utils import bind_process_to_numa
 from chitu.kv_cache.providers import register_all_providers
-from chitu.kv_cache.builders import build_cache_managers
+from chitu.kv_cache.builders import build_cache_managers, build_mtp_cache
 
 if TYPE_CHECKING:
     from chitu.executor import Executor
@@ -1070,6 +1070,8 @@ class Backend:
 
         # Initialize cache managers
         bundle = build_cache_managers(args, attn_backend_type)
+        if args.infer.mtp_size > 1:
+            bundle.cache_dict["mtp"] = build_mtp_cache(args)
         Backend.cache_type = bundle.cache_type
         Backend.cache_dict = bundle.cache_dict
         Backend.cache_managers = bundle.cache_managers

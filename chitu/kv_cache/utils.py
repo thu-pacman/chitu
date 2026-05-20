@@ -59,6 +59,15 @@ def build_layer_id_map(
     return GlobalLocalMap.from_list(local_layers)
 
 
+def build_layer_id_map_lastlayer(args):
+    layer_ids = []
+    if get_pp_group().is_last_rank:
+        mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
+        total_n_layers = int(args.models.n_layers) + (1 if mtp_size > 1 else 0)
+        layer_ids = [total_n_layers - 1]
+    return GlobalLocalMap.from_list(layer_ids)
+
+
 def plan_kv_cache_blocks_after_warmup(args, cache_managers):
     """
     Structure-driven pre-plan:

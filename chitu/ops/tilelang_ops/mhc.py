@@ -8,7 +8,6 @@ import tilelang
 import tilelang.language as T
 import torch
 
-
 # SPDX-SnippetBegin
 # SPDX-License-Identifier: MIT
 # SPDX-SnippetCopyrightText: 2024-2025 Tile-AI

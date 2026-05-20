@@ -1160,8 +1160,6 @@ class DecodeOnlyScheduler(PDScheduler):
                 cache_manager_dict: dict[str, PagedKVCacheManager] = (
                     Backend.cache_managers[target_dp_rank]
                 )
-                for cache_manager in cache_manager_dict.values():
-                    cache_manager.ensure_task_token_blocks(task)
 
                 num_cached_tokens = min(
                     cache_manager.num_cached_blocks(task) * cache_manager.block_size
@@ -1220,16 +1218,14 @@ class DecodeOnlyScheduler(PDScheduler):
                 if num_cached_tokens == task.prefix_tokens_len:
                     num_cached_tokens = task.prefix_tokens_len - 1
 
-                for name, cache_manager in cache_manager_dict.items():
-                    task.new_cache_ids[name] = (
-                        cache_manager.prepare_metadata_before_prefill(
-                            task,
-                            max_cached_token_len=num_cached_tokens,
-                        )
-                    )
-
                 task.inc_hit_tokens = num_cached_tokens - task.consumed_req_tokens
                 task.consumed_req_tokens = num_cached_tokens
+
+                for name, cache_manager in cache_manager_dict.items():
+                    task.new_cache_ids[name] = (
+                        cache_manager.prepare_metadata_before_prefill(task)
+                    )
+
                 task.consume_req_tokens()
 
                 assert (

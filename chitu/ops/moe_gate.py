@@ -5,6 +5,7 @@
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 from chitu.utils import (
     try_import_opt_dep,
@@ -53,9 +54,9 @@ def moe_gate(
             experts. Set to 1 if there is no expert grouping.
         topk_as_topk_group_criteria (int): Select this number of experts per group, as the criteria
             to select `topk_group` groups.
-        e_score_correction_bias (torch.Tensor): Bias added after normalization (softmax/sigmoid)
-            and before selecting.
-        score_func (str): "softmax" or "sigmoid"
+        e_score_correction_bias (torch.Tensor): Bias added after normalization
+            (softmax/sigmoid/sqrtsoftplus) and before selecting.
+        score_func (str): "softmax", "sigmoid", or "sqrtsoftplus"
         norm_prob (bool): True if the output weight need to be normalized. Default False.
 
     Returns:
@@ -104,11 +105,19 @@ def _auto_moe_gate(
     if (
         has_chitu_backend
         and scores.shape[-1] <= 256
-        and topk == 8
         and is_power_of_two(scores.shape[-1])
+        and (
+            (score_func == "softmax" and topk == 8)
+            or (score_func in ["sigmoid", "sqrtsoftplus"] and topk in [6, 8])
+        )
     ):
         return "cuda"
-    if has_torch_npu and scores.shape[-1] in [256, 384] and norm_prob:
+    if (
+        has_torch_npu
+        and scores.shape[-1] in [256, 384]
+        and norm_prob
+        and score_func in ["softmax", "sigmoid"]
+    ):
         return "npu_moe_gating_top_k"
     if (
         has_torch_npu
@@ -137,6 +146,9 @@ def moe_gate_torch(
         scores = scores.softmax(dim=-1, dtype=torch.float32).to(dtype)
     elif score_func == "sigmoid":
         scores = scores.sigmoid()
+    elif score_func == "sqrtsoftplus":
+        dtype = scores.dtype
+        scores = F.softplus(scores.float()).sqrt().to(dtype)
     else:
         raise ValueError(f"Unsupported score function: {score_func}")
     original_scores = scores
@@ -211,12 +223,13 @@ def moe_gate_cuda(
             topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
         return topk_ids, topk_weights
 
-    elif score_func == "sigmoid":
+    elif score_func in ["sigmoid", "sqrtsoftplus"]:
+        score_fun = 1 if score_func == "sigmoid" else 2
         topk_ids = torch.empty(bs, topk, dtype=torch.int, device=scores.device)
         topk_weights = torch.empty(bs, topk, dtype=scores.dtype, device=scores.device)
         chitu_backend.cuda_route_gate(
             scores,
-            1,  # Actually only 1 is supported, which means "sigmoid".
+            score_fun,
             # TODO: Merge the score_func == "softmax" branch into this C function
             bs,
             num_expert_group,

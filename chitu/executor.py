@@ -9,6 +9,7 @@ from logging import getLogger
 import weakref
 from typing import Optional
 from abc import ABC, abstractmethod
+from io import BytesIO
 
 import numpy as np
 import torch
@@ -20,6 +21,7 @@ from chitu.models.registry import ModelType
 from chitu.task import (
     PackedTasks,
     PackedTasksBase,
+    PackedTasksResult,
     SerializedPackedTasksPayloadType,
     BatchResult,
     TaskType,
@@ -42,6 +44,9 @@ from chitu.moe import get_moe_impl
 from chitu.hooks import TokenSink, LocalTokenSink, KVTransferHook, NoopKVTransferHook
 from chitu.utils import (
     try_import_and_setup_torch_npu,
+    dataclass_from_dict,
+    dataclass_to_dict,
+    create_tensor,
 )
 from chitu.moe.load_balancer import get_moe_load_planner  # added
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
@@ -378,27 +383,53 @@ class PipeDispatcher(TasksDispatcher):
             )
 
     def recv_results(self, tasks: Optional[PackedTasks] = None):
-        num_output_tasks = len(tasks.output_tasks)
-        results = torch.empty(
-            (num_output_tasks, tasks.get_result_len()),
-            device=self.device,
-            dtype=torch.int32,
-        )
-        torch.distributed.recv(
-            results,
-            src=self.prev_rank,
-            tag=RESULT_TAG,
-            group=self.prev_pair_group,
-        )
-        tasks.generated_result = results
+        bs = len(tasks.output_tasks)
+        mtp_size = Backend.executor.mtp_size
+        vocab_size = Backend.model.vocab_size
+
+        def recv(shape, dtype=torch.int64):
+            tensor = torch.empty(shape, dtype=dtype, device=self.device)
+            if tensor.numel() == 0:
+                return tensor
+            torch.distributed.recv(
+                tensor,
+                src=self.prev_rank,
+                tag=RESULT_TAG,
+                group=self.prev_pair_group,
+            )
+            return tensor
+
+        result = PackedTasksResult(tokens=recv((bs, mtp_size)))
+        if mtp_size > 1 and tasks.task_type == TaskType.Decode:
+            result.accept_indices = recv((bs,))
+        if tasks.return_logprobs:
+            result.logprobs = recv((bs, vocab_size), torch.float32)
+            result.token_idxs = recv((bs, vocab_size))
+        if tasks._test_flag:
+            result.logits = recv((bs, vocab_size), torch.float32)
+
+        tasks.generated_result = result
 
     def send_results(self, tasks: Optional[PackedTasks] = None):
-        torch.distributed.send(
-            tensor=tasks.generated_result,
-            dst=self.next_rank,
-            tag=RESULT_TAG,
-            group=self.next_pair_group,
-        )
+        def send(tensor: torch.Tensor):
+            if tensor.numel() == 0:
+                return
+            torch.distributed.send(
+                tensor=tensor,
+                dst=self.next_rank,
+                tag=RESULT_TAG,
+                group=self.next_pair_group,
+            )
+
+        result = tasks.generated_result
+        send(result.tokens)
+        if Backend.executor.mtp_size > 1 and tasks.task_type == TaskType.Decode:
+            send(result.accept_indices)
+        if tasks.return_logprobs:
+            send(result.logprobs)
+            send(result.token_idxs)
+        if tasks._test_flag:
+            send(result.logits)
 
     def collect_results(self, tasks: Optional[PackedTasks] = None):
         # PD Prefill-only:
@@ -411,7 +442,7 @@ class PipeDispatcher(TasksDispatcher):
         # round-trip to rank0, which would add latency and bandwidth overhead.
         if getattr(self.get_executor(), "_pd_prefill_only", False):
             return
-        if tasks is None or len(tasks.output_tasks) == 0:
+        if tasks is None:
             return
         if self.is_first_stage:
             self.recv_results(tasks)
@@ -481,6 +512,19 @@ class TensorDispatcher(TasksDispatcher):
             if slot_handle and slot_idx is not None:
                 slot_handle.set_slot_idx(slot_idx)
             return payload_type, tasks
+
+    def broadcast_data(self, data):
+        if self.is_main_rank:
+            for rank_in_group in range(1, self.group_size):
+                msgs = [
+                    f"{rank_in_group}".encode(),
+                    msgpack.packb(data),
+                ]
+                self.socket.send_multipart(msgs)
+            return data
+        else:
+            msgs = self.socket.recv_multipart()
+            return msgpack.unpackb(msgs[0])
 
     def recv_payload(self, payload: torch.Tensor) -> torch.Tensor:
         torch.distributed.broadcast(
@@ -644,79 +688,48 @@ class ExpertDataDispatcher(TasksDispatcher):
         except Exception:
             return True
 
-    def collect_token(
+    def collect_results(
         self,
-        token_list: list[list[int]],
-        mtp_token_list: Optional[list[list[int]]] = None,
-        pd_first_tokens: Optional[dict[str, int]] = None,
-        pd_cached_hit_tokens: Optional[dict[str, int]] = None,
-    ) -> tuple[
-        list[list[int]],
-        Optional[list[list[int]]],
-        dict[str, int],
-        dict[str, int],
-    ]:
-        if pd_first_tokens is None:
-            pd_first_tokens = {}
-        if pd_cached_hit_tokens is None:
-            pd_cached_hit_tokens = {}
+        results: PackedTasksResult,
+        pd_first_tokens: dict[str, int],
+        pd_cached_hit_tokens: dict[str, int],
+    ):
+        """
+        collect results through zmq.
+        """
+        payload = dataclass_to_dict(results)
+        payload["pd_first_tokens"] = pd_first_tokens
+        payload["pd_cached_hit_tokens"] = pd_cached_hit_tokens
+
         if self.is_main_rank:
-            all_tokens = [[] for _ in range(self.group_size)]
-            if self.mtp_size > 1:
-                all_tokens_mtp = [[] for _ in range(self.group_size)]
-            all_first_tokens: dict[str, int] = {}
-            all_cached_hit_tokens: dict[str, int] = {}
-            base_frame_count = 2 + (1 if self.mtp_size > 1 else 0)
+            all_payload = [None for _ in range(self.group_size)]
             for _ in range(1, self.group_size):
                 msgs = self.socket.recv_multipart()
                 rank_in_group = int(msgs[0].decode())  # zmq identity prepend by ROUTER
-                all_tokens[rank_in_group] = msgpack.unpackb(msgs[1])
-                if self.mtp_size > 1:
-                    all_tokens_mtp[rank_in_group] = msgpack.unpackb(msgs[2])
-                if len(msgs) > base_frame_count:
-                    ext = msgpack.unpackb(msgs[base_frame_count])
-                    # Backward compatibility: old workers may still send first_tokens dict directly.
-                    if isinstance(ext, dict) and (
-                        "first_tokens" in ext or "cached_hit_tokens" in ext
-                    ):
-                        all_first_tokens.update(ext.get("first_tokens", {}))
-                        all_cached_hit_tokens.update(ext.get("cached_hit_tokens", {}))
-                    elif isinstance(ext, dict):
-                        all_first_tokens.update(ext)
-            if not self.mtp_size > 1:
-                return (
-                    sum(all_tokens, token_list),
-                    None,
-                    all_first_tokens,
-                    all_cached_hit_tokens,
-                )
-            else:
-                return (
-                    sum(all_tokens, token_list),
-                    sum(all_tokens_mtp, mtp_token_list),
-                    all_first_tokens,
-                    all_cached_hit_tokens,
-                )
-        else:
-            msg = [msgpack.packb(token_list)]
-            if self.mtp_size > 1:
-                msg.append(msgpack.packb(mtp_token_list))
-            if pd_first_tokens or pd_cached_hit_tokens:
-                msg.append(
-                    msgpack.packb(
-                        {
-                            "first_tokens": pd_first_tokens,
-                            "cached_hit_tokens": pd_cached_hit_tokens,
-                        }
-                    )
-                )
-            self.socket.send_multipart(msg)
+                buffer = BytesIO(msgs[1])
+                all_payload[rank_in_group] = torch.load(buffer)
+            all_payload[0] = payload
+
+            for k in payload.keys():
+                if k == "pd_first_tokens":
+                    for p in all_payload:
+                        pd_first_tokens.update(p[k])
+                elif k == "pd_cached_hit_tokens":
+                    for p in all_payload:
+                        pd_cached_hit_tokens.update(p[k])
+                else:
+                    tensors = [p[k] for p in all_payload if p[k] is not None]
+                    payload[k] = torch.cat(tensors) if tensors else None
             return (
-                token_list,
-                (mtp_token_list if self.mtp_size > 1 else None),
-                {},
-                {},
+                dataclass_from_dict(payload, PackedTasksResult),
+                pd_first_tokens,
+                pd_cached_hit_tokens,
             )
+        else:
+            buffer = BytesIO()
+            torch.save(payload, buffer)
+            self.socket.send(buffer.getvalue())
+            return results, pd_first_tokens, pd_cached_hit_tokens
 
     def send_payload(self, payload: torch.Tensor, tasks=None):
         pass
@@ -742,15 +755,13 @@ class Executor:
         self.embed_tokens_lm_head_tp_size = int(args.infer.embed_tokens_lm_head_tp_size)
         self.dim_ = args.models.dim
         self.mtp_size = args.infer.mtp_size
+        self.tp_dispatcher = None
         self.pipe_dispatcher = None
         self.dp_dispatcher = None
         self.task_dispatchers = []
         self.tp_group = None
         self.pp_stage = get_pp_group().rank_in_group
         self.is_pp_first_stage = self.pp_size <= 1 or self.pp_stage == 0
-        self.is_sample_stage = (
-            self.pp_size <= 1 or self.pp_stage + 1 == self.pp_size
-        ) and self.rank % self.tp_size == 0
         self.has_schedule_overlap = args.infer.schedule_overlap
         pd_cfg = getattr(getattr(args, "dp_config", None), "router", None)
         pd_cfg = getattr(pd_cfg, "pd_disaggregation", None)
@@ -771,7 +782,8 @@ class Executor:
 
         rank_filter = True
         if rank_filter and self.tp_size > 1:
-            self._prepend_dispatcher(TensorDispatcher(self.device, weakref.ref(self)))
+            self.tp_dispatcher = TensorDispatcher(self.device, weakref.ref(self))
+            self._prepend_dispatcher(self.tp_dispatcher)
             self.tp_group = get_tp_group()
             rank_filter = rank_filter and get_tp_group().is_first_rank
         if rank_filter and self.pp_size > 1:
@@ -782,9 +794,10 @@ class Executor:
             self.dp_dispatcher = ExpertDataDispatcher(self.device, weakref.ref(self))
             self._prepend_dispatcher(self.dp_dispatcher)
 
-        self.is_main_rank = self.tp_size <= 1 or (
-            self.tp_group is not None and self.tp_group.is_first_rank
-        )
+        self.is_main_rank = get_tp_group().is_first_rank
+        """ is tp main rank """
+        self.is_sample_rank = self.is_main_rank and get_pp_group().is_last_rank
+        self.is_dp_rank = self.is_main_rank and get_pp_group().is_first_rank
 
         if self.rank == 0 or self.dp_dispatcher:
             # PP 下的循环节长度为 pp_size
@@ -830,6 +843,11 @@ class Executor:
         self.dummy_output = torch.empty(
             [0, args.models.vocab_size], dtype=torch.float32, device=self.device
         )
+        self.dummy_mtp_output = torch.empty(
+            [0, self.mtp_size, args.models.vocab_size],
+            dtype=torch.float32,
+            device=self.device,
+        )
 
         self.moe_impl = get_moe_impl()
         # Hooks for token streaming and KV transfer. Defaults keep existing behavior.
@@ -867,7 +885,7 @@ class Executor:
         self._lb_step = 0
         self._pending_dllm_block = None
 
-        if self.is_sample_stage:
+        if self.is_sample_rank:
             self.sampler = Sampler()
 
         self.process_queue = []
@@ -937,7 +955,7 @@ class Executor:
             pass
 
     def _prepare_new_tokens_for_decode(self, tasks: PackedTasks):
-        return torch.tensor(
+        return create_tensor(
             [task.next_token for task in tasks.tasks],
             device=self.device,
             dtype=torch.long,
@@ -955,9 +973,6 @@ class Executor:
                 mask_id = Backend.model.decoder.mask_id
                 blocks.extend([mask_id] * block_length)
         return torch.tensor(blocks, device=self.device, dtype=torch.long)
-
-    def _prepare_lhs_for_decode(self, tasks: PackedTasks):
-        return torch.cat([task._last_hidden_states for task in tasks.tasks], dim=0)
 
     def vision_tensor_broadcast(
         self,
@@ -1057,7 +1072,7 @@ class Executor:
 
         # Payload Type: EndTask, remove given tasks
         if payload_type == SerializedPackedTasksPayloadType.EndTask:
-            if self.is_sample_stage:
+            if self.is_sample_rank:
                 self.sampler.end_tasks(tasks.task_ids)
             # Delete item from KV cache
             for cache in Backend.cache_dict.values():
@@ -1104,7 +1119,7 @@ class Executor:
     def model_run(self, tasks: PackedTasksBase):
         if tasks.payload_type == SerializedPackedTasksPayloadType.Empty:
             if not self.is_pp_first_stage:
-                self.postprocess_sync_part(tasks)
+                self._collect_task_and_pp_results(tasks)
             return
 
         if self.moe_impl is not None:
@@ -1156,21 +1171,8 @@ class Executor:
                 for task in update_tasks.output_tasks:
                     task.has_unsync_new_token = True
 
-        tokens = None
-        if (
-            self.is_sample_stage
-            and len(tasks.output_tasks) > 0
-            and self.model_type != ModelType.LLADA2
-        ):
-            tokens = self.sampler.sample(out, tasks.output_tasks)
-            if tasks.return_logprobs:
-                logprobs = torch.log_softmax(out, dim=-1)
-                logprobs, token_idxs = logprobs.sort(dim=-1, descending=True)
-            else:
-                logprobs, token_idxs = None, None
-            tasks.generated_result = tasks.pack_result(
-                tokens, logprobs, token_idxs, out
-            )
+        if self.is_sample_rank and self.model_type != ModelType.LLADA2:
+            tasks.generated_result = self.sampler.sample(out, tasks)
 
         # For DLLM: convert finished block results into BatchResults
         if self.model_type == ModelType.LLADA2:
@@ -1178,8 +1180,7 @@ class Executor:
 
         # Notify KV transfer hook after prefill completes.
         if tasks.task_type == TaskType.Prefill:
-            self._kv_hook.on_prefill_done(tokens, tasks)
-        self.postprocess_before_sync(tasks)
+            self._kv_hook.on_prefill_done(tasks)
 
     def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         is_empty_step = tasks.num_tasks == 0
@@ -1214,7 +1215,7 @@ class Executor:
                 payload = dispatcher.recv_payload(self.dummy_logits)
 
         if not self.is_pp_first_stage:
-            self.postprocess_sync_part(tasks)
+            self._collect_task_and_pp_results(tasks)
 
         self.timers("prefill").start()
         out = Backend.model.prefill(
@@ -1260,6 +1261,12 @@ class Executor:
                 new_cache_ids_list=getattr(tasks, "new_cache_ids_list", []),
                 prefix_lens=getattr(tasks, "prefix_lens", None),
             )
+
+            if self.mtp_size > 1:
+                mtp_token_indices = self._prepare_mtp_token_indices(tasks)
+                for cache in Backend.cache_dict.values():
+                    cache.update_mtp_cache_accept(tasks, mtp_token_indices)
+
             for cache in Backend.cache_dict.values():
                 cache.prepare_cache_decode(tasks)
 
@@ -1267,30 +1274,17 @@ class Executor:
 
             # prepare payload tensor
             if self.rank == 0 or self.dp_size > 1 and self.dp_dispatcher is not None:
-                payload = self._prepare_new_tokens_for_decode(tasks)  # tensor
-                if self.mtp_size > 1:
-                    payload_lhs = self._prepare_lhs_for_decode(tasks)
+                payload = self._prepare_new_tokens_for_decode(tasks)
             else:
                 payload = torch.empty(
                     self.get_payload_shape(num_tokens),
                     dtype=self.get_payload_dtype(),
                     device=self.device,
                 )
-                if self.mtp_size > 1:
-                    payload_lhs = torch.empty(
-                        [num_tokens, self.dim_],
-                        dtype=torch.get_default_dtype(),
-                        device=self.device,
-                    )
 
             # payload recv
             for dispatcher in self.task_dispatchers:
                 payload = dispatcher.recv_payload(payload)
-                if self.mtp_size > 1:
-                    payload_lhs = dispatcher.recv_payload(payload_lhs)
-
-            if self.mtp_size > 1:
-                Backend.model.mtp_last_hidden_states_static.set(payload_lhs)
 
         else:
             if self.rank == 0 or self.dp_size > 1 and self.dp_dispatcher is not None:
@@ -1306,7 +1300,7 @@ class Executor:
                 dispatcher.recv_payload(self.dummy_logits)
 
         if not self.is_pp_first_stage:
-            self.postprocess_sync_part(tasks)
+            self._collect_task_and_pp_results(tasks)
 
         payload_bs = len(tasks.req_ids) if not is_empty_step else 0
         self.timers("decode").start()
@@ -1314,13 +1308,6 @@ class Executor:
         self.timers("decode").stop()
 
         if not is_empty_step:
-            # Collect metrics for Prometheus
-            PrometheusMetricsCollector.inc_generated_tokens(tasks.num_tasks)
-            if self.mtp_size > 1 and Backend.model.mtp_token_list:
-                mtp_proposed = (self.mtp_size - 1) * tasks.num_tasks
-                mtp_accepted = sum(len(t) for t in Backend.model.mtp_token_list)
-                PrometheusMetricsCollector.inc_mtp_tokens(mtp_proposed, mtp_accepted)
-
             # payload send
             for dispatcher in self.task_dispatchers:
                 dispatcher.send_payload(out, tasks)
@@ -1330,7 +1317,19 @@ class Executor:
             for dispatcher in self.task_dispatchers:
                 dispatcher.send_payload(self.dummy_logits, tasks=tasks)
 
-            return self.dummy_output
+            return self.dummy_mtp_output if self.mtp_size > 1 else self.dummy_output
+
+    def _prepare_mtp_token_indices(self, tasks) -> list[int]:
+        indices = None
+        if self.is_main_rank:
+            assert isinstance(tasks, PackedTasks)
+            indices = [task.mtp_accept_index for task in tasks.tasks]
+        if self.tp_dispatcher:
+            indices = self.tp_dispatcher.broadcast_data(indices)
+        indices_device = create_tensor(indices, device=self.device, dtype=torch.int64)
+        indices_device = torch.clamp(indices_device, min=0)
+        Backend.model.mtp_accept_indices.set(indices_device)
+        return indices
 
     def prefill_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         is_empty_step = tasks.num_tasks == 0
@@ -1539,7 +1538,9 @@ class Executor:
 
             if block_finished_tasks:
                 block_tasks = PackedTasks([], tasks=block_finished_tasks)
-                block_tasks.generated_result = torch.stack(block_tokens_tensors)
+                block_tasks.generated_result = PackedTasksResult(
+                    torch.stack(block_tokens_tensors)
+                )
                 block_tasks.skip_prompt_tokens = block_skip_prompt_tokens
                 self._pending_dllm_block = block_tasks
             else:
@@ -1550,32 +1551,6 @@ class Executor:
         for dispatcher in self.task_dispatchers:
             dispatcher.send_payload(logits[:, -1, :], tasks)
         return logits[:, -1, :]
-
-    def postprocess_before_sync(self, tasks: PackedTasksBase):
-        """
-        This part is always after sample and before sync.
-        Can use to store data to task before sync.
-        """
-        # mtp
-        if (
-            isinstance(tasks, PackedTasks)
-            and self.mtp_size > 1
-            and (self.rank == 0 or self.dp_dispatcher)
-        ):
-            for it, task in enumerate(tasks.tasks):
-                task.num_new_tokens_single_step = (
-                    1
-                    if not Backend.model.token_offset_list
-                    else Backend.model.token_offset_list[it]
-                )
-                task.mtp_token_list = (
-                    []
-                    if not Backend.model.mtp_token_list
-                    else Backend.model.mtp_token_list[it]
-                )
-                task._last_hidden_states = (
-                    Backend.model.last_hidden_states_4_postprocess[it : it + 1, :]
-                )
 
     def _process_dllm_block_results(self):
         """Push finished DLLM block tokens directly to user requests.
@@ -1595,7 +1570,7 @@ class Executor:
         result = block_tasks.generated_result
         if result is None:
             return
-        result = result.cpu()
+        result = result.cpu().tokens
         block_length = result.shape[1]
         tasks_list = block_tasks.tasks
         skip_prompt_tokens = getattr(
@@ -1609,11 +1584,11 @@ class Executor:
             skip = skip_prompt_tokens[i]
             if skip >= block_length:
                 continue
-            tokens_to_output = result[i, skip:].tolist()
-            for token in tokens_to_output:
-                task.update_response_sync(token)
+            tokens = result[i, skip:].tolist()
+            task.update_response_sync(tokens)
+            task.update_decode_status(tokens)
             if task.req is not None:
-                task.req.add_data(tokens_to_output, notify_server=False)
+                task.req.add_data(tokens, notify_server=False)
 
         # Step 2: now that ALL tokens have been added, finish stopped tasks
         #         (finish() sends the stop signal + notifies the server).
@@ -1625,132 +1600,123 @@ class Executor:
                 task.req.stop_stream()
             else:
                 task.req.notify_server_data_added_threadsafe()
+        TaskCollector.set_update_task_ids(block_tasks.task_ids)
 
-    def postprocess_sync_part(self, tasks: PackedTasksBase):
+    def _collect_task_and_pp_results(self, tasks: PackedTasksBase):
+        """collect tasks to run `postprocess_sync_part` at this step, send/recv pp results if needed"""
+        tasks = TaskCollector.collect(tasks)
+        if self.pipe_dispatcher:
+            self.pipe_dispatcher.collect_results(tasks)
+            if self.mtp_size > 1:
+                raise NotImplementedError("pp+mtp is not supported")
+        return tasks
+
+    def _update_token_statistics(self, tasks: PackedTasks):
+        bs = len(tasks.generated_result.tokens)
+        if tasks.generated_result.accept_indices is not None:
+            mtp_proposed = (self.mtp_size - 1) * bs
+            mtp_accepted = torch.sum(tasks.generated_result.accept_indices).item()
+            PrometheusMetricsCollector.inc_generated_tokens(bs + mtp_accepted)
+            PrometheusMetricsCollector.inc_mtp_tokens(mtp_proposed, mtp_accepted)
+        else:
+            PrometheusMetricsCollector.inc_generated_tokens(bs)
+
+    def _collect_pd_extra_data(self, tasks: PackedTasks):
+        pd_first_tokens: dict[str, int] = {}
+        pd_num_hit_tokens: dict[str, int] = {}
+        for task in tasks.output_tasks:
+            if task._pd_first_token_for_dp_emit is not None:
+                pd_first_tokens[task.task_id] = task._pd_first_token_for_dp_emit
+                task._pd_first_token_for_dp_emit = None
+            if task._pd_cached_hit_tokens_for_dp_emit is not None:
+                pd_num_hit_tokens[task.task_id] = task._pd_cached_hit_tokens_for_dp_emit
+                task._pd_cached_hit_tokens_for_dp_emit = None
+        return pd_first_tokens, pd_num_hit_tokens
+
+    def _dp_collect_result(self, tasks: PackedTasks):
+        pd_first_tokens, pd_num_hit_tokens = self._collect_pd_extra_data(tasks)
+        if not self.dp_dispatcher:
+            return tasks, pd_first_tokens, pd_num_hit_tokens
+
+        dp_results, pd_first_tokens, pd_num_hit_tokens = (
+            self.dp_dispatcher.collect_results(
+                tasks.generated_result, pd_first_tokens, pd_num_hit_tokens
+            )
+        )
+        if self.rank == 0:
+            tasks = DPTaskCollector.get_last_packedtasks()
+            tasks.generated_result = dp_results
+        return tasks, pd_first_tokens, pd_num_hit_tokens
+
+    def _update_pd_num_hit_tokens(self, pd_num_hit_tokens: dict[str, int]):
+        for task_id, num_hit_tokens in pd_num_hit_tokens.items():
+            task = TaskPool.pool.get(task_id)
+            if task is not None:
+                task.req.num_hit_tokens = max(task.req.num_hit_tokens, num_hit_tokens)
+
+    def _predict_tasks_stop_after_this_step(self, tasks: PackedTasks):
+        """predict tasks may stop after this step when schedule overlap"""
+        if len(tasks.output_tasks) == 0:
+            return
+
+        # when schedule overlap, tokens generated later in this step may cause stop by length
+        for task in tasks.output_tasks:
+            task.has_unsync_new_token = True
+            task.update_decode_status([])
+        TaskCollector.add_update_task_ids(tasks.output_task_ids)
+
+    def postprocess_sync_part(self, current_tasks: PackedTasksBase):
         """
         schedule -> model -> sample -> ***sync*** -> send
 
-        Synchronize next tokens from GPU to CPU.
+        Synchronize generated result to cpu.
 
-        After synchronizing, collect result from the PP last stage and each DP rank.
-
-        By default, this part is after the async postprocess.
-
-        When schedule overlap is enable, this part will execute before the model run.
+        After synchronizing, collect result across dp workers to dp main rank and update tasks.
         """
-        collect_tasks: Optional[PackedTasks] = None
-        pd_first_tokens_from_workers: dict[str, int] = {}
-        pd_cached_hit_tokens_from_workers: dict[str, int] = {}
-        # get the collect packed tasks (tasks that finished this step)
-        if TaskCollector.available():
-            collect_tasks = TaskCollector.collect(tasks)
-        # pp collect result from last stage
-        if self.pipe_dispatcher:
-            self.pipe_dispatcher.collect_results(collect_tasks)
-        if collect_tasks is None:
-            collect_tasks = PackedTasks([], task_type=TaskType.Special)
-        # dp collect result from each dp rank
-        if self.rank == 0 or self.dp_dispatcher:
-            local_output_tasks = collect_tasks.output_tasks
-            if self.rank == 0 and self.dp_dispatcher:
-                all_tasks = DPTaskCollector.get_last_packedtasks()
-                if all_tasks is not None:
-                    all_tasks.generated_result = collect_tasks.generated_result
-                    collect_tasks.generated_result = None
-                    collect_tasks = all_tasks
-                else:
-                    assert collect_tasks.num_tasks == 0
-            if collect_tasks.generated_result is not None:
-                collect_tasks.generated_result = collect_tasks.generated_result.cpu()
-            if self.dp_dispatcher:
-                if collect_tasks.generated_result is not None:
-                    assert collect_tasks.generated_result.dtype == torch.int32
-                    result_list = collect_tasks.generated_result.tolist()
-                else:
-                    result_list = []
-                mtp_token_list = (
-                    [task.mtp_token_list for task in local_output_tasks]
-                    if self.mtp_size > 1
-                    else None
-                )
-                local_first_tokens: dict[str, int] = {}
-                local_cached_hit_tokens: dict[str, int] = {}
-                for task in collect_tasks.output_tasks:
-                    ft = getattr(task, "_pd_first_token_for_dp_emit", None)
-                    if ft is not None:
-                        local_first_tokens[task.task_id] = ft
-                        del task._pd_first_token_for_dp_emit
-                    cached = getattr(task, "_pd_cached_hit_tokens_for_dp_emit", None)
-                    if cached is not None:
-                        local_cached_hit_tokens[task.task_id] = int(cached)
-                        del task._pd_cached_hit_tokens_for_dp_emit
-                (
-                    result_list,
-                    mtp_token_list,
-                    pd_first_tokens_from_workers,
-                    pd_cached_hit_tokens_from_workers,
-                ) = self.dp_dispatcher.collect_token(
-                    result_list,
-                    mtp_token_list,
-                    pd_first_tokens=local_first_tokens,
-                    pd_cached_hit_tokens=local_cached_hit_tokens,
-                )
-                if len(result_list) > 0:
-                    collect_tasks.generated_result = torch.tensor(
-                        result_list, device="cpu", dtype=torch.int32
-                    )
-                    if self.mtp_size > 1:
-                        for it, task in enumerate(collect_tasks.output_tasks):
-                            task.num_new_tokens_single_step = (
-                                len(mtp_token_list[it]) + 1
-                            )
-                            task.mtp_token_list = mtp_token_list[it]
-            # PD 分离 DP 场景下，只有 rank 0 的 task 被 DPTaskWrapper
-            # 替换了 update_response_sync，调用时会把 token 发给 Router。
-            # Worker rank 的 task 没有这层替换，第一个 token 只更新了本地状态。
-            # 这里在 rank 0 上补发 worker rank 的第一个 token，确保它们在第二个 token 之前到达 Router。
-            if (
-                pd_first_tokens_from_workers
-                and self.dp_dispatcher
-                and self.dp_dispatcher.is_main_rank
-            ):
-                for rid, token in pd_first_tokens_from_workers.items():
-                    task = TaskPool.pool.get(rid)
-                    if task is not None:
-                        task.update_response_sync(token)
-            if (
-                pd_cached_hit_tokens_from_workers
-                and self.dp_dispatcher
-                and self.dp_dispatcher.is_main_rank
-            ):
-                for rid, cached in pd_cached_hit_tokens_from_workers.items():
-                    task = TaskPool.pool.get(rid)
-                    if task is not None and getattr(task, "req", None) is not None:
-                        task.req.num_hit_tokens = max(
-                            int(getattr(task.req, "num_hit_tokens", 0)),
-                            int(cached),
-                        )
-            collect_tasks.add_task_to_batch_result()
+        tasks = self._collect_task_and_pp_results(current_tasks)
+        if self.model_type == ModelType.LLADA2:
+            # dllm use `_process_dllm_block_results`
+            return
+        if not self.is_dp_rank:
+            return
+
+        if self._pd_prefill_only:
             if self.rank == 0:
-                collect_tasks.batch_update_decode_status()
-                if self.has_schedule_overlap and is_normal_payload(tasks.payload_type):
-                    all_current_tasks = (
-                        tasks
-                        if self.dp_size <= 1
-                        else DPTaskCollector.get_total_packedtasks()
-                    )
-                    if (
-                        isinstance(all_current_tasks, PackedTasks)
-                        and all_current_tasks.task_type == TaskType.Decode
-                    ):
-                        for task in all_current_tasks.tasks:
-                            task.has_unsync_new_token = True
-                            task.update_decode_status()
-                    TaskCollector.set_update_task_ids(
-                        list(set(collect_tasks.task_ids + all_current_tasks.task_ids))
-                    )
-                else:
-                    TaskCollector.set_update_task_ids(collect_tasks)
+                tasks = DPTaskCollector.get_last_packedtasks()
+            TaskCollector.set_update_task_ids(
+                tasks.output_task_ids if tasks is not None else []
+            )
+            return
+
+        if tasks is not None:
+            assert isinstance(tasks, PackedTasks)
+            assert tasks.generated_result is not None
+
+            tasks.generated_result = tasks.generated_result.cpu()
+
+            self._update_token_statistics(tasks)
+            tasks.batch_update_mtp_accept_index()
+            tasks, pd_first_tokens, pd_cached_hit_tokens = self._dp_collect_result(
+                tasks
+            )
+            tasks.batch_update_response_sync(extra_first_token=pd_first_tokens)
+
+        if self.rank != 0:
+            return
+
+        if tasks is not None:
+            self._update_pd_num_hit_tokens(pd_cached_hit_tokens)
+            tasks.batch_update_test_result()
+            TaskCollector.append_to_last_batch_results(tasks.create_batch_result())
+            tasks.batch_update_decode_status()
+            TaskCollector.set_update_task_ids(tasks.output_task_ids)
+        else:
+            TaskCollector.set_update_task_ids([])
+
+        if self.has_schedule_overlap and current_tasks.task_type != TaskType.Special:
+            if self.dp_dispatcher:
+                current_tasks = DPTaskCollector.get_total_packedtasks()
+            self._predict_tasks_stop_after_this_step(current_tasks)
 
     def postprocess_async_part(self, batch_result: BatchResult) -> None:
         """
@@ -1760,28 +1726,15 @@ class Executor:
 
         This part is after the sample step because it is fully CPU computation and can overlap with the GPU model run.
         """
-        next_token_list: list[int] = []
-        logprobs_list: list[list[float]] = []
-        token_idxs_list: list[list[int]] = []
-        mtp_token_list: Optional[list[list[int]]] = None if self.mtp_size <= 1 else []
-        for it, task in enumerate(batch_result.tasks):
-            next_token_list.append(batch_result.next_tokens[it])
-            if self.mtp_size > 1:
-                mtp_tokens = batch_result.mtp_token_list[it]
-                # check if stop token is in mtp_tokens, if yes, cut mtp_tokens and set next_token to stop token
-                if task.stop_with_eos and (
-                    set(mtp_tokens) & Backend.tokenizer.stop_tokens
-                ):
-                    stop_idx = next(
-                        i
-                        for i, x in enumerate(mtp_tokens)
-                        if x in Backend.tokenizer.stop_tokens
-                    )
-                    mtp_tokens = mtp_tokens[:stop_idx]
-                    next_token_list[-1] = next(iter(Backend.tokenizer.stop_tokens))
-                mtp_token_list.append(mtp_tokens)
+        next_token_list: list[list[int]] = [
+            batch_result.tokens[it] for it, task in enumerate(batch_result.tasks)
+        ]
+        logprobs_list: list[list[float]] | None = None
+        token_idxs_list: list[list[int]] | None = None
 
         if batch_result.return_logprobs:
+            logprobs_list = []
+            token_idxs_list = []
             for it, task in enumerate(batch_result.tasks):
                 logprobs, token_idxs = (
                     batch_result.logprobs[it],
@@ -1791,13 +1744,6 @@ class Executor:
                 token_idxs_list.append(
                     token_idxs[: max(1, task.req.top_logprobs)].tolist()
                 )
-            self.get_token_sink().emit_batch(
-                batch_result.tasks, next_token_list, logprobs_list, token_idxs_list
-            )
-        else:
-            if self.mtp_size > 1:
-                self.get_token_sink().emit_batch(
-                    batch_result.tasks, next_token_list, mtp_token_list=mtp_token_list
-                )
-            else:
-                self.get_token_sink().emit_batch(batch_result.tasks, next_token_list)
+        self.get_token_sink().emit_batch(
+            batch_result.tasks, next_token_list, logprobs_list, token_idxs_list
+        )

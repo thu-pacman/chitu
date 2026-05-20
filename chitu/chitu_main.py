@@ -898,9 +898,8 @@ def chitu_init(args):
         else:
             args.infer.use_cuda_graph = True
 
-    if args.infer.schedule_overlap == "auto":
-        # MTP does synchronize after model run and overlap has no effect
-        args.infer.schedule_overlap = args.infer.mtp_size <= 1
+    if args.infer.mtp_size <= 0:
+        args.infer.mtp_size = 1
 
     if args.infer.full_warmup == "auto":
         if args.infer.pp_size > 1 and args.infer.use_cuda_graph:
@@ -923,11 +922,7 @@ def chitu_init(args):
 
     if args.infer.mla_absorb == "auto":
         if args.models.type == ModelType.DEEPSEEK_V3:
-            if args.models.name.lower() in {"GLM-5-FP8".lower(), "GLM-5.1-FP8".lower()}:
-                # GLM-5-FP8's quantization blocking stops using absorb-without-precomp
-                args.infer.mla_absorb = "absorb"
-            else:
-                args.infer.mla_absorb = "absorb-without-precomp"
+            args.infer.mla_absorb = "absorb-without-precomp"
         else:
             args.infer.mla_absorb = "none"
 
@@ -936,33 +931,6 @@ def chitu_init(args):
             f"infer.dp_size ({args.infer.dp_size}) cannot be greater than infer.max_batch_size ({args.infer.max_batch_size})"
         )
 
-    if (
-        args.models.type == ModelType.DEEPSEEK_V3
-        and args.models.get("index_topk", None) is not None
-    ):
-        assert args.infer.indexer_type in ("auto", "deepgemm", "triton")
-        from chitu.dsa_indexer import support_indexer_deepgemm
-
-        if args.infer.indexer_type == "auto":
-            if (
-                support_indexer_deepgemm
-                and args.infer.cache_type == "paged"
-                and args.infer.mtp_size < 3
-            ):
-                args.infer.indexer_type = "deepgemm"
-            else:
-                args.infer.indexer_type = "triton"
-
-        elif args.infer.indexer_type == "deepgemm":
-            if not support_indexer_deepgemm:
-                raise ValueError("indexer_type=deepgemm is not supported ")
-            if args.infer.mtp_size > 2:
-                raise ValueError("indexer_type=deepgemm does not support mtp_size > 2")
-            if args.infer.cache_type != "paged":
-                raise ValueError(
-                    f"indexer_type=deepgemm only supports cache_type=paged, but got {args.infer.cache_type}"
-                )
-
     # Check checkpoint exists
     check_checkpoint_path(args)
 
@@ -970,6 +938,37 @@ def chitu_init(args):
     # Uses $(config.json:field_name) syntax, e.g., n_heads: "$(config.json:head_dim)"
     model_resolver = ModelConfigResolver()
     args.models = model_resolver.process_config_dict(args.models, args.models.ckpt_dir)
+
+    if (
+        args.models.type == ModelType.DEEPSEEK_V3
+        and args.models.get("index_topk", None) is not None
+    ):
+        assert args.infer.indexer_type in ("auto", "deepgemm", "hygon", "triton")
+        from chitu.dsa_indexer import (
+            support_indexer_deepgemm,
+            support_indexer_hygon,
+            validate_indexer_config,
+        )
+
+        if args.infer.indexer_type == "auto":
+            if (
+                support_indexer_hygon
+                and args.infer.cache_type == "paged"
+                and args.infer.mtp_size < 3
+                and int(args.models.index_head_dim) == 128
+                and int(args.models.index_n_heads) in (32, 64)
+            ):
+                args.infer.indexer_type = "hygon"
+            elif (
+                support_indexer_deepgemm
+                and args.infer.cache_type == "paged"
+                and args.infer.mtp_size < 3
+            ):
+                args.infer.indexer_type = "deepgemm"
+            else:
+                args.infer.indexer_type = "triton"
+        else:
+            validate_indexer_config(args, args.infer.indexer_type)
 
     set_quant_variables(args)
     set_backend_variables(args)
@@ -1055,7 +1054,7 @@ def _update_tasks_preferred_dp_rank():
         # paged kv cache
         projected_running_tasks_per_dp = [
             len(
-                Backend.schedulers[dp_rank].cache_manager_dict["main"].tid_to_cached_len
+                Backend.schedulers[dp_rank].cache_manager_dict["main"].task_to_cache_ids
             )
             for dp_rank in range(dp_size)
         ]
@@ -1082,7 +1081,6 @@ def _update_tasks_preferred_dp_rank():
                 cache_managers = list(Backend.cache_managers[dp_rank].values())
                 cached_tokens = task.prefix_tokens_len
                 for cache_manager in cache_managers:
-                    cache_manager.ensure_task_token_blocks(task)
                     manager_cached_tokens = (
                         cache_manager.num_cached_blocks(task) * cache_manager.block_size
                     )
@@ -1104,11 +1102,6 @@ def _update_tasks_preferred_dp_rank():
                 best_dp_rank = dp_rank
 
         task.preferred_dp_rank = best_dp_rank
-        if enable_prefix_caching:
-            for dp_rank in range(dp_size):
-                if dp_rank != best_dp_rank:
-                    for cache_manager in Backend.cache_managers[dp_rank].values():
-                        cache_manager.drop_task_token_blocks(task)
         if best_dp_rank is not None:
             projected_running_tasks_per_dp[best_dp_rank] += 1
 

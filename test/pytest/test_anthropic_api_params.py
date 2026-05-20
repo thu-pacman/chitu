@@ -24,7 +24,6 @@ from chitu.serve.anthropic_api import (
 )
 from chitu.serve.common import parse_api_key_from_headers
 
-
 # ============================================================
 # AnthropicThinking model tests
 # ============================================================

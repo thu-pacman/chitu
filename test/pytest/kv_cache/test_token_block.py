@@ -2,83 +2,110 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Any
+
+
 import pytest
-from chitu.kv_cache import TokenBlock, NONE_BLK_HASH
 
-"""Tests for TokenBlock class."""
+from chitu.kv_cache import (
+    BlockIdentity,
+    BlockIdentityChainBuilder,
+    BlockRuntime,
+    KVBlockState,
+    NONE_BLK_HASH,
+    TokenBlock,
+)
+
+_BUILDER_NAME = "__pytest_token_block__"
+_BLOCK_SIZE = 4
 
 
-def test_token_block_creation():
-    """创建token block"""
-    tokens = [1, 2, 3, 4]
-    block = TokenBlock(tokens=tokens, blk_size=4, pre_blk_hash=NONE_BLK_HASH)
+@pytest.fixture(autouse=True)
+def _clear_block_identity_builder_registry():
+    BlockIdentityChainBuilder.clear_registry()
+    yield
+    BlockIdentityChainBuilder.clear_registry()
 
-    assert block.tokens == tokens
-    assert block.blk_size == 4
+
+def test_token_block_default_identity_and_runtime():
+    block = TokenBlock()
+    assert block.tokens == tuple[int]()
+    assert block.blk_size == 0
     assert block.blk_hash is None
+    assert block.pre_blk_hash == NONE_BLK_HASH
     assert block.cache_idx is None
     assert block.active_cnt == 0
+    assert block.state == KVBlockState.MISSING
 
 
-def test_token_block_hash_generation():
-    """测试生成blk_hash"""
-    tokens = [1, 2, 3, 4]
-    block = TokenBlock(tokens=tokens, blk_size=4, pre_blk_hash=NONE_BLK_HASH)
-    block.generate_blk_hash()
+def test_token_block_wraps_identity_and_runtime():
+    identity = BlockIdentity(
+        tokens=(1, 2),
+        blk_size=_BLOCK_SIZE,
+        pre_blk_hash=NONE_BLK_HASH,
+        blk_hash="a" * 64,
+    )
+    runtime = BlockRuntime(cache_idx=7, active_cnt=1)
+    block = TokenBlock(identity=identity, runtime=runtime)
+    assert block.tokens == (1, 2)
+    assert block.blk_size == _BLOCK_SIZE
+    assert block.blk_hash == "a" * 64
+    assert block.cache_idx == 7
+    assert block.active_cnt == 1
+    assert block.state == KVBlockState.ACTIVE
+
+
+def test_full_block_blk_hash_via_make_identity():
+    builder = BlockIdentityChainBuilder.acquire(_BUILDER_NAME, _BLOCK_SIZE)
+    identity = builder.make_identity([1, 2, 3, 4], NONE_BLK_HASH)
+    block = TokenBlock(
+        identity=identity, runtime=BlockRuntime(cache_idx=0, active_cnt=1)
+    )
 
     assert block.blk_hash is not None
-    assert len(block.blk_hash) == 64  # SHA-256 produces 64 hex characters
+    assert len(block.blk_hash) == 64
+    assert block.tokens == (1, 2, 3, 4)
+    assert len(block) == _BLOCK_SIZE
 
 
-def test_token_block_hash_deterministic():
-    """测试相同的tokens和pre_blk_hash会生成相同的blk_hash"""
-    tokens = [1, 2, 3, 4]
-
-    block1 = TokenBlock(tokens=tokens, blk_size=4, pre_blk_hash=NONE_BLK_HASH)
-    block1.generate_blk_hash()
-
-    block2 = TokenBlock(tokens=tokens, blk_size=4, pre_blk_hash=NONE_BLK_HASH)
-    block2.generate_blk_hash()
-
-    assert block1.blk_hash == block2.blk_hash
+def test_make_identity_reuses_canonical_identity_same_pool():
+    """同一 (pre_blk_hash, tokens) 在 hashed_block_pool 中复用同一 BlockIdentity。"""
+    builder = BlockIdentityChainBuilder.acquire(_BUILDER_NAME, _BLOCK_SIZE)
+    a = builder.make_identity([1, 2, 3, 4], NONE_BLK_HASH)
+    b = builder.make_identity([1, 2, 3, 4], NONE_BLK_HASH)
+    assert a is b
+    assert a.blk_hash == b.blk_hash
 
 
-def test_token_block_hash_different_for_different_tokens():
-    """测试不同的tokens生成不同的blk_hash"""
-    block1 = TokenBlock(tokens=[1, 2, 3, 4], blk_size=4, pre_blk_hash=NONE_BLK_HASH)
-    block1.generate_blk_hash()
-
-    block2 = TokenBlock(tokens=[5, 6, 7, 8], blk_size=4, pre_blk_hash=NONE_BLK_HASH)
-    block2.generate_blk_hash()
-
-    assert block1.blk_hash != block2.blk_hash
+def test_make_identity_different_tokens_different_blk_hash():
+    builder = BlockIdentityChainBuilder.acquire(_BUILDER_NAME, _BLOCK_SIZE)
+    i1 = builder.make_identity([1, 2, 3, 4], NONE_BLK_HASH)
+    i2 = builder.make_identity([5, 6, 7, 8], NONE_BLK_HASH)
+    assert i1.blk_hash != i2.blk_hash
 
 
-def test_token_block_hash_different_for_different_pre_blk_hash():
-    """测试不同的pre_blk_hash生成不同的blk_hash"""
-    tokens = [1, 2, 3, 4]
-
-    block1 = TokenBlock(tokens=tokens, blk_size=4, pre_blk_hash=NONE_BLK_HASH)
-    block1.generate_blk_hash()
-
-    block2 = TokenBlock(tokens=tokens, blk_size=4, pre_blk_hash="some_hash")
-    block2.generate_blk_hash()
-
-    assert block1.blk_hash != block2.blk_hash
+def test_make_identity_different_pre_blk_hash_different_blk_hash():
+    builder = BlockIdentityChainBuilder.acquire(_BUILDER_NAME, _BLOCK_SIZE)
+    i1 = builder.make_identity([1, 2, 3, 4], NONE_BLK_HASH)
+    i2 = builder.make_identity([1, 2, 3, 4], "b" * 64)
+    assert i1.blk_hash != i2.blk_hash
 
 
-def test_token_block_len():
-    """测试TokenBlock的len功能"""
-    tokens = [1, 2, 3, 4, 5]
-    block = TokenBlock(tokens=tokens, blk_size=10, pre_blk_hash=NONE_BLK_HASH)
+def test_partial_block_no_blk_hash_and_empty_token_view():
+    """未满块：make_identity 不填 blk_hash，且为省拷贝 identity.tokens 为空。"""
+    builder = BlockIdentityChainBuilder.acquire(_BUILDER_NAME, _BLOCK_SIZE)
+    identity = builder.make_identity([1, 2, 3], NONE_BLK_HASH)
+    block = TokenBlock(identity=identity, runtime=BlockRuntime())
 
-    assert len(block) == 5
+    assert identity.blk_hash is None
+    assert block.blk_hash is None
+    assert block.blk_size == _BLOCK_SIZE
+    assert len(block) == 0
+    assert block.tokens == tuple[int]()
 
 
-def test_token_block_hash_only_for_full_block():
-    """测试仅当tokens长度为blk_size时可以生成blk_hash"""
-    tokens = [1, 2, 3]  # Not full
-    block = TokenBlock(tokens=tokens, blk_size=4, pre_blk_hash=NONE_BLK_HASH)
-
-    with pytest.raises(AssertionError):
-        block.generate_blk_hash()
+def test_token_block_len_full_block():
+    builder = BlockIdentityChainBuilder.acquire(_BUILDER_NAME, _BLOCK_SIZE)
+    identity = builder.make_identity([1, 2, 3, 4], NONE_BLK_HASH)
+    block = TokenBlock(identity=identity, runtime=BlockRuntime())
+    assert len(block) == _BLOCK_SIZE

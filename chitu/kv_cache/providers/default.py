@@ -26,3 +26,18 @@ def default_kv_cache_spec(args, attn_backend_type) -> KVCacheSpec:
         "head_dim": head_dim,
     }
     return KVCacheSpec(kvargs=kvargs, kv_keys=["k", "v"])
+
+
+@register_kv_cache_spec(
+    cache_name="mtp",
+    priority=-1000,
+)
+def default_mtp_cache_spec(args, attn_backend_type) -> KVCacheSpec:
+
+    return KVCacheSpec(
+        kvargs={
+            "shape_per_token_dict": {
+                "hidden_states": (args.models.dim,),
+            }
+        }
+    )

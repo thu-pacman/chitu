@@ -18,16 +18,19 @@ from chitu.moe.batched_routed_activation import (
 )
 from chitu.moe.batched_expert_result import PerTokenBatchedExpertResult
 from chitu.utils import try_import_platform_dep
-from chitu.quantization.gptqmodel import (
-    marlin_make_empty_g_idx,
-    marlin_permute_scales,
-    replace_tensor,
+from chitu.native_layout import (
+    enable_native_layout_weight,
+    BlockInt4MarlinQWeight,
+    BlockInt4MarlinScale,
 )
+from chitu.quantization.gptqmodel import marlin_make_empty_g_idx
+from chitu.device_type import is_hygon
 
 logger = logging.getLogger(__name__)
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
+has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
 
 # aiter (AMD ROCm backend)
 aiter, has_aiter = try_import_platform_dep("aiter")
@@ -44,12 +47,23 @@ if has_triton:
 UINT4B8_TYPE_ID = 1125899907892224
 
 
+# Conditionally include Marlin enable_native_layout_weight mixins.
+_marlin_mixins = []
+if has_marlin:
+    _marlin_mixins = [
+        enable_native_layout_weight("gate_proj_qweight", BlockInt4MarlinQWeight),
+        enable_native_layout_weight("gate_proj_scales", BlockInt4MarlinScale),
+        enable_native_layout_weight("up_proj_qweight", BlockInt4MarlinQWeight),
+        enable_native_layout_weight("up_proj_scales", BlockInt4MarlinScale),
+        enable_native_layout_weight("down_proj_qweight", BlockInt4MarlinQWeight),
+        enable_native_layout_weight("down_proj_scales", BlockInt4MarlinScale),
+    ]
+
+
 @QuantizationRegistry.register_moe_experts(
     "blockint4", merge_gate_up=False, when=lambda _: has_chitu_backend or has_aiter
 )
-class BlockInt4MoeExpertsUnmerged(
-    QuantizedMoeExpertsUnmerged
-):  # TODO: Extract Marlin repack logic into a NativeLayoutTensor subclass
+class BlockInt4MoeExpertsUnmerged(*_marlin_mixins, QuantizedMoeExpertsUnmerged):
     """
     Marlin INT4 quantized MoE experts with unmerged gate and up projection.
     Supports compressed-tensors pack-quantized format (4-bit symmetric, group quantization).
@@ -142,62 +156,22 @@ class BlockInt4MoeExpertsUnmerged(
             requires_grad=False,
         )
 
-        self._marlin_repacked = False
         self._aiter_repacked = False
 
-    def _repack_to_marlin(self):
-        """Repack all expert weights from compressed-tensors to Marlin tiled layout."""
-        device = self.gate_proj_qweight.device
-        empty_g_idx = marlin_make_empty_g_idx(device)
-
-        # MoE kernel workspace: min(max_n_tiles * n_blocks, sms * 4).
-        # Allocate max(non_moe_workspace, sms * 4) to cover both paths.
-        non_moe_ws_size = max(self.dim, self.moe_inter_dim) // 64 * 16
-        sms = torch.cuda.get_device_properties(device).multi_processor_count
-        moe_ws_size = sms * 4
-        ws_size = max(non_moe_ws_size, moe_ws_size)
-        self.workspace = torch.zeros(
-            ws_size, dtype=torch.int, device=device, requires_grad=False
-        )
-        self._g_idx = marlin_make_empty_g_idx(device)
-        self._g_idx_sort_indices = marlin_make_empty_g_idx(device)
-        self._zp = marlin_make_empty_g_idx(device)
-
-        proj_configs = [
-            ("gate_proj", self.dim, self.moe_inter_dim),
-            ("up_proj", self.dim, self.moe_inter_dim),
-            ("down_proj", self.moe_inter_dim, self.dim),
-        ]
-
-        for proj_name, in_features, out_features in proj_configs:
-            qweight_3d = getattr(self, f"{proj_name}_qweight")
-            scales_3d = getattr(self, f"{proj_name}_scales")
-
-            repacked_list = []
-            permuted_scales_list = []
-            for i in range(self.group_size):
-                # Transpose from (out, packed_in) to (packed_in, out) for Marlin repack
-                qw = qweight_3d[i].T.contiguous()
-                sc = scales_3d[i].T.contiguous()
-
-                repacked = chitu_backend.gptq_marlin_repack(
-                    qw, empty_g_idx, in_features, out_features, self.bits
-                )
-                perm_scales = marlin_permute_scales(
-                    sc, in_features, out_features, self.quant_group_size
-                )
-
-                repacked_list.append(repacked)
-                permuted_scales_list.append(perm_scales)
-
-            replace_tensor(
-                self, f"{proj_name}_qweight", torch.stack(repacked_list, dim=0)
+    def _ensure_marlin_workspace(self):
+        """Allocate Marlin workspace and sentinel tensors lazily."""
+        if not hasattr(self, "workspace"):
+            device = self.gate_proj_qweight.device
+            non_moe_ws_size = max(self.dim, self.moe_inter_dim) // 64 * 16
+            sms = torch.cuda.get_device_properties(device).multi_processor_count
+            moe_ws_size = sms * 4
+            ws_size = max(non_moe_ws_size, moe_ws_size)
+            self.workspace = torch.zeros(
+                ws_size, dtype=torch.int, device=device, requires_grad=False
             )
-            replace_tensor(
-                self, f"{proj_name}_scales", torch.stack(permuted_scales_list, dim=0)
-            )
-
-        self._marlin_repacked = True
+            self._g_idx = marlin_make_empty_g_idx(device)
+            self._g_idx_sort_indices = marlin_make_empty_g_idx(device)
+            self._zp = marlin_make_empty_g_idx(device)
 
     def _repack_to_aiter(self):
         """Convert weights from chitu int32 pack8 to aiter uint8 pack2.
@@ -487,8 +461,7 @@ class BlockInt4MoeExpertsUnmerged(
         """
         MoE forward using Marlin CUDA kernel (for NVIDIA platform).
         """
-        if not self._marlin_repacked:
-            self._repack_to_marlin()
+        self._ensure_marlin_workspace()
 
         routed_x = routed_x.as_local_expert_ids(
             self.experts_start_idx, self.experts_end_idx
@@ -737,8 +710,7 @@ class BlockInt4MoeExpertsUnmerged(
         self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         assert x_scale is None
-        if not self._marlin_repacked:
-            self._repack_to_marlin()
+        self._ensure_marlin_workspace()
         return self._marlin_gemm(
             x,
             self.gate_proj_qweight[i],
@@ -752,8 +724,7 @@ class BlockInt4MoeExpertsUnmerged(
         self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         assert x_scale is None
-        if not self._marlin_repacked:
-            self._repack_to_marlin()
+        self._ensure_marlin_workspace()
         return self._marlin_gemm(
             x,
             self.up_proj_qweight[i],
@@ -764,8 +735,7 @@ class BlockInt4MoeExpertsUnmerged(
 
     @override
     def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
-        if not self._marlin_repacked:
-            self._repack_to_marlin()
+        self._ensure_marlin_workspace()
         return self._marlin_gemm(
             x,
             self.down_proj_qweight[i],

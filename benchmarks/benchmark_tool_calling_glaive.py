@@ -16,7 +16,6 @@ from typing import Any
 
 from datasets import load_dataset
 
-
 DEFAULT_API_KEY = os.getenv("API_KEY", "example_key")
 DEFAULT_CACHE_ROOT = (
     Path.home()

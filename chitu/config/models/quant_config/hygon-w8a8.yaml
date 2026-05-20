@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Hygon W8A8 checkpoints use `weight_scale` naming and are loaded through
+# `w8a8_dynamic`. Change `moe_backend` to switch between Aiter and DeepGEMM MoE.
+quant:
+- model: '.'
+  rules:
+    - regex: 'kv_b_proj'
+      type: null
+    - regex: '(\.self_attn|\.mlp\.(shared_experts\.)?(gate_proj|gate_up_proj|up_proj|down_proj))'
+      type: w8a8_dynamic
+      kwargs:
+        linear_backend: blaslt
+    - regex: '\.mlp\.(moe|experts)'
+      type: w8a8_dynamic
+      kwargs:
+        moe_backend: aiter

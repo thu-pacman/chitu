@@ -375,20 +375,22 @@ class KVCacheBase:
         for tid in tasks.task_ids:
             self.tid_to_cached_len[tid] += self.mtp_size
 
-    def update_mtp_cache_decode(self, mtp_offset: list[int]):
-        task_ids = self.curr_tids
-        for tid, off_set in zip(task_ids, mtp_offset):
-            self.tid_to_cached_len[tid] += off_set - self.mtp_size
+    def update_mtp_cache_accept(
+        self, tasks: "PackedTasksBase", mtp_accept_indices: list[int]
+    ):
+        for tid, accept_index in zip(tasks.task_ids, mtp_accept_indices):
+            if accept_index >= 0:
+                self.tid_to_cached_len[tid] += -self.mtp_size + accept_index + 1
 
-    def prepare_mtp_cache_decode(self, mtp_offset: int):
+    def prepare_mtp_cache_decode(self, draft_offset: int):
         task_ids = self.curr_tids
         self.mtp_seq_len_delta.copy_from_list(
             [
-                self.tid_to_cached_len[tid] - self.mtp_size + mtp_offset
+                self.tid_to_cached_len[tid] - self.mtp_size + draft_offset
                 for tid in task_ids
             ],
             [
-                self.tid_to_cached_len[tid] - self.mtp_size + mtp_offset + 1
+                self.tid_to_cached_len[tid] - self.mtp_size + draft_offset + 1
                 for tid in task_ids
             ],
         )
@@ -859,12 +861,7 @@ class SingletonPagedKVCache(PagedKVCache):
         self.free_blocks = deque(range(self.num_blocks))
 
         if self.mtp_size > 1:
-            self.tid_to_mtp_offset: dict[str, int] = {}
-            self.mtp_offset = []
             self.is_mtp_decode_stage = False
-            self.mtp_offset_tensor = StaticTensor(
-                max_nelem=self.num_hot_req, device=device, dtype=torch.int32
-            )
 
     def realloc(self, num_blocks):
         super().realloc(num_blocks)
@@ -876,15 +873,6 @@ class SingletonPagedKVCache(PagedKVCache):
         return len(self.free_blocks)
 
     @override
-    def update_mtp_cache_decode(self, mtp_offset: list[int]):
-        super().update_mtp_cache_decode(mtp_offset)
-
-        if self.mtp_size > 1:
-            task_ids = self.curr_tids
-            for task_id, off_set in zip(task_ids, mtp_offset):
-                self.tid_to_mtp_offset[task_id] = off_set - 1
-
-    @override
     def prepare_cache_prefill(self, tasks: "PackedTasksBase"):
         KVCacheBase.prepare_cache_prefill(self, tasks)
 
@@ -894,14 +882,7 @@ class SingletonPagedKVCache(PagedKVCache):
         self._upd_gpu_block_table(tasks.task_ids)
 
         if self.mtp_size > 1:
-            self.mtp_offset.clear()
-            for task_id in tasks.task_ids:
-                self.tid_to_mtp_offset[task_id] = -1
-                self.mtp_offset.append(-1)
             self.is_mtp_decode_stage = False
-            self.mtp_offset_tensor.set(
-                torch.tensor(self.mtp_offset, dtype=torch.int32, device=self.device)
-            )
 
     @override
     def prepare_cache_decode(self, tasks: "PackedTasksBase"):
@@ -909,11 +890,7 @@ class SingletonPagedKVCache(PagedKVCache):
         self._upd_gpu_block_table(tasks.task_ids)
 
         if self.mtp_size > 1:
-            self.mtp_offset = list(self.tid_to_mtp_offset.values())
             self.is_mtp_decode_stage = True
-            self.mtp_offset_tensor.set(
-                torch.tensor(self.mtp_offset, dtype=torch.int32, device=self.device)
-            )
 
     @override
     def finalize_cache_all_decode(self, tasks: "PackedTasksBase"):
@@ -922,11 +899,6 @@ class SingletonPagedKVCache(PagedKVCache):
             if tid not in self.block_table:
                 continue
             self.free_req_cache_blocks(tid)
-
-        if self.mtp_size > 1:
-            for tid in tasks.task_ids:
-                if tid in self.tid_to_mtp_offset:
-                    self.tid_to_mtp_offset.pop(tid)
 
     def free_req_cache_blocks(self, tid: str):
         for block in self.block_table[tid]:
@@ -1214,11 +1186,13 @@ class MMPagedKVCache(PagedKVCache):
         pass
 
     @override
-    def prepare_mtp_cache_decode(self, mtp_offset: int):
+    def prepare_mtp_cache_decode(self, draft_offset: int):
         pass
 
     @override
-    def update_mtp_cache_decode(self, mtp_offset: list[int]):
+    def update_mtp_cache_accept(
+        self, tasks: "PackedTasksBase", mtp_accept_indices: list[int]
+    ):
         pass
 
     def free_req_cache_blocks(self, tid: str):

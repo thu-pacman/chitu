@@ -29,6 +29,9 @@ from chitu.native_layout.metax import (
     MuxiNativeLayoutGroupWeight,
 )
 from chitu.native_layout.hygon import (
+    AiterMoeCInt8Gemm1Weight,
+    AiterMoeCInt8Gemm2Weight,
+    HygonDeepGemmW8A8MarlinWeight,
     HygonW4A8Int4TileTensor,
     HygonW4A8Int8TileTensor,
     HygonMixQIntTileTensor,
@@ -41,5 +44,7 @@ from chitu.native_layout.marlin import (
     MarlinNativeLayoutWeight,
     MarlinNativeLayoutScale,
     MarlinNativeLayoutGroupWeight,
+    BlockInt4MarlinQWeight,
+    BlockInt4MarlinScale,
 )
 from chitu.native_layout.deep_gemm import DeepGemmScale

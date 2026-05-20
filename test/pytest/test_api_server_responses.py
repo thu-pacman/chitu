@@ -105,6 +105,7 @@ def test_responses_endpoint_returns_text_response(monkeypatch):
             ],
             tokens_len=2,
         ),
+        num_hit_tokens=0,
     )
 
     monkeypatch.setattr(
@@ -140,6 +141,7 @@ def test_responses_endpoint_streams_sse_events(monkeypatch):
             ],
             tokens_len=2,
         ),
+        num_hit_tokens=0,
     )
 
     monkeypatch.setattr(
@@ -183,6 +185,7 @@ def test_responses_endpoint_returns_function_call_item(monkeypatch):
             [("tool", False, (None, None))],
             tokens_len=1,
         ),
+        num_hit_tokens=0,
     )
 
     monkeypatch.setattr(

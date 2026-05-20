@@ -13,7 +13,6 @@
 Benchmark runner for Chitu performance testing.
 """
 
-
 import requests
 import os
 import sys

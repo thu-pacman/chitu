@@ -21,7 +21,6 @@ from chitu.kv_cache import (
 from chitu.task import PackedTasksBase
 from chitu.task_type import TaskType
 
-
 _PD_UNIT_JOB_NAME = "pd_unit_test_h20"
 _JOB_NAME = os.environ.get("CI_JOB_NAME") or os.environ.get("JOB_NAME")
 if _JOB_NAME and _JOB_NAME != _PD_UNIT_JOB_NAME:

@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from chitu.dp_request_router import RequestRouter, SchedulerStats
 from chitu.schemas.serve_config import DpAddressesConfig, RouterConfig
-from chitu.kv_cache import BlockIdentity, NONE_BLK_HASH
+from chitu.kv_cache import BlockIdentity, NONE_BLK_HASH, BlockIdentityChainBuilder
 from dataclasses import dataclass, field
 
 
@@ -148,9 +148,11 @@ def test_local_evict_moves_hash_to_buffer():
 
 def test_apply_instance_evicts():
     router = _build_router(algorithm="prefix_cache_aware")
-    block = BlockIdentity.from_tokens(
-        [1, 2, 3, 4], blk_size=4, pre_blk_hash=NONE_BLK_HASH
-    )
+
+    block = BlockIdentityChainBuilder.acquire(
+        manager_name="router", block_size=4
+    ).make_identity([1, 2, 3, 4], pre_blk_hash=NONE_BLK_HASH)
+
     assert block.blk_hash is not None
 
     # remove from cached_blocks
