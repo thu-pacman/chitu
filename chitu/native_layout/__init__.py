@@ -44,5 +44,7 @@ from chitu.native_layout.marlin import (
     MarlinNativeLayoutWeight,
     MarlinNativeLayoutScale,
     MarlinNativeLayoutGroupWeight,
+    BlockInt4MarlinQWeight,
+    BlockInt4MarlinScale,
 )
 from chitu.native_layout.deep_gemm import DeepGemmScale

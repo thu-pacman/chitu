@@ -118,7 +118,11 @@ def enable_native_layout_weight(
                 )
 
             # skip_model_load=True时立刻处理，否则加载后处理
-            if get_global_args().debug.skip_model_load:
+            try:
+                debug = getattr(get_global_args(), "debug", None)
+            except AssertionError:
+                debug = None
+            if debug is not None and debug.skip_model_load:
                 _preprocess_layout(self, None)
             else:
                 self.register_load_state_dict_post_hook(_preprocess_layout)

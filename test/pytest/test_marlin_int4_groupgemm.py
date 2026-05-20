@@ -102,8 +102,8 @@ def test_groupgemm_matches_iterative(
     module = _make_experts_module(dim, moe_inter_dim, n_experts, group_size)
     routed_x = _make_routed_activation(M, dim, n_experts, topk)
 
-    # Force repack once
-    module._repack_to_marlin()
+    # Trigger native layout repack via load_state_dict post-hooks
+    module.load_state_dict(module.state_dict())
 
     # --- Iterative path (base class fallback) ---
     iterative_result = QuantizedMoeExpertsUnmerged.forward_no_sum(module, routed_x)

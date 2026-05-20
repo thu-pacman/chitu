@@ -116,3 +116,70 @@ class MarlinNativeLayoutGroupWeight(NativeLayoutTensor):
             raise TypeError(
                 f"Cannot convert from {type(tensor)} to MarlinNativeLayoutGroupWeight"
             )
+
+
+@dataclass
+class BlockInt4MarlinQWeight(NativeLayoutTensor):
+    """
+    Convert blockint4 3D qweight [E, N, K//8] int32 to Marlin tiled format.
+    E = number of expert groups, N = out_features, K = in_features.
+    """
+
+    @classmethod
+    @override
+    def convert_from(cls, tensor: torch.Tensor) -> "BlockInt4MarlinQWeight":
+        if isinstance(tensor, torch.Tensor):
+            if not has_marlin:
+                raise RuntimeError(
+                    "Marlin backend (chitu_backend) is not available for blockint4 repack"
+                )
+            e, n, k_packed = tensor.shape
+            in_features = k_packed * 8
+            out_features = n
+
+            repacked_list = []
+            for i in range(e):
+                qw = tensor[i].T.contiguous()
+                # gptq_marlin_repack requires GPU
+                if qw.device.type != "cuda":
+                    qw = qw.cuda()
+                empty_g_idx = torch.empty(0, dtype=torch.int, device=qw.device)
+                repacked = gptq_marlin_repack(
+                    qw, empty_g_idx, in_features, out_features, 4
+                )
+                repacked_list.append(repacked)
+
+            return cls(tensor.shape, torch.stack(repacked_list, dim=0))
+        else:
+            raise TypeError(
+                f"Cannot convert from {type(tensor)} to BlockInt4MarlinQWeight"
+            )
+
+
+@dataclass
+class BlockInt4MarlinScale(NativeLayoutTensor):
+    """
+    Convert blockint4 3D scales [E, N, K//G] bf16 to Marlin permuted scale format.
+    E = number of expert groups, N = out_features, K = in_features, G = group_size.
+    """
+
+    @classmethod
+    @override
+    def convert_from(cls, tensor: torch.Tensor) -> "BlockInt4MarlinScale":
+        if isinstance(tensor, torch.Tensor):
+            e, n, num_groups = tensor.shape
+            scale_perm, scale_perm_single = get_scale_perms()
+            perm = scale_perm if num_groups > 1 else scale_perm_single
+
+            permuted_list = []
+            for i in range(e):
+                sc = tensor[i].T.contiguous()
+                sc = sc.reshape((-1, len(perm)))[:, perm]
+                sc = sc.reshape((-1, n)).contiguous()
+                permuted_list.append(sc)
+
+            return cls(tensor.shape, torch.stack(permuted_list, dim=0))
+        else:
+            raise TypeError(
+                f"Cannot convert from {type(tensor)} to BlockInt4MarlinScale"
+            )
