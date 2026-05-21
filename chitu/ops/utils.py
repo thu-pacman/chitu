@@ -183,6 +183,7 @@ def make_op_dispatcher(
 
     def decorator(dispatch_func: Callable):
         handlers: Dict[str, Callable] = {}
+        handlers_have_impl_param: Dict[str, bool] = {}
         impl_availability: Dict[str, bool] = {}
         # None  -> pass *args/**kwargs directly (exact match or variadic handler)
         # frozenset -> filter bound args by these names (handler is a name-subset)
@@ -237,8 +238,9 @@ def make_op_dispatcher(
             impl = resolve_impl(*args, **kwargs)
             _record_selected_op_impl(dispatch_name, impl)
 
-            params = inspect.signature(handlers[impl]).parameters
-            if "impl" in params:
+            # NOTE: This function is in the critical path. Don't call `inspect.signature` here.
+            # Use the pre-computed `handlers_have_impl_param`.
+            if handlers_have_impl_param[impl]:
                 kwargs["impl"] = impl
             elif "impl" in kwargs:
                 del kwargs["impl"]
@@ -263,6 +265,7 @@ def make_op_dispatcher(
 
         def register(name: str, *, available: bool = True, check_params: bool = True):
             def register_decorator(impl_func: Callable = None):
+                impl_func_has_impl_param = False
                 if check_params:
                     dispatcher_params = OrderedDict(
                         inspect.signature(dispatch_func).parameters
@@ -272,6 +275,7 @@ def make_op_dispatcher(
                         del dispatcher_params["impl"]
                     if "impl" in impl_params:
                         del impl_params["impl"]
+                        impl_func_has_impl_param = True
 
                     # The registered implementation should accpet all parameters of the dispatcher
                     dispatcher_params_set = set(dispatcher_params)
@@ -301,6 +305,7 @@ def make_op_dispatcher(
                         )
 
                 handlers[name] = impl_func
+                handlers_have_impl_param[name] = impl_func_has_impl_param
                 impl_availability[name] = available
                 _record_op_impl_availability(dispatch_name, name, available)
                 return impl_func
