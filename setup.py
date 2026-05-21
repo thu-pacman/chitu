@@ -118,7 +118,7 @@ if os.environ.get("CHITU_SETUP_JOBS") is not None:
 # logic and declaration, and simpler if you include description/version in a file.
 setup(
     name="chitu",
-    version="0.5.5",
+    version="0.5.6",
     python_requires=">=3.10",
     install_requires=install_requires,
     extras_require=extras_require,
