@@ -44,8 +44,14 @@ from chitu.kv_cache.kv_cache import (
     DenseKVCache,
     DeepSeekV4DenseKVCache,
     DeepSeekV4PagedKVCache,
+    DeepSeekV4SlidingWindowPagedKVCache,
     KVCacheAccessor,
     PagedKVCacheAccessor,
     DenseKVCacheAccessor,
 )
-from chitu.kv_cache.cache_manager import KVCacheManagerBase, PagedKVCacheManager
+from chitu.kv_cache.cache_manager import (
+    KVCacheManagerBase,
+    PagedKVCacheManager,
+    DeepSeekV4SlidingKVCacheManager,
+    DeepSeekV4CompressedKVCacheManager,
+)

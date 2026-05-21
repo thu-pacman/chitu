@@ -53,6 +53,7 @@ from chitu.tokenizer import (
     ChatFormat,
     ChatFormatHF,
     ChatFormatHF_dsv32,
+    ChatFormatHF_dsv4,
     ChatFormatLLaDA,
     Tokenizer,
     TokenizerHF,
@@ -449,6 +450,8 @@ class Backend:
         chatformat_type = getattr(args.models, "chatformat_type", tokenizer_type)
         if chatformat_type == "dsv32":
             return ChatFormatHF_dsv32(Backend.tokenizer, Backend.processor)
+        elif chatformat_type == "dsv4":
+            return ChatFormatHF_dsv4(Backend.tokenizer, Backend.processor)
         elif chatformat_type == "llada":
             return ChatFormatLLaDA(Backend.tokenizer, Backend.processor)
         elif chatformat_type == "hf":

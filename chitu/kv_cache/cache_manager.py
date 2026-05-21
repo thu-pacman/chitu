@@ -95,6 +95,14 @@ class PagedKVCacheManager(KVCacheManagerBase):
     def get_allocatable_max_num_blocks(self) -> int:
         return int(getattr(self, "allocatable_max_num_blocks", self.max_num_blocks))
 
+    def num_blocks_for_seq_len(self, seq_len: int) -> int:
+        return ceil_div(int(seq_len), self.block_size)
+
+    def _make_task_identities(self, task: "Task", *, min_blocks: Optional[int] = None):
+        return self.identity_builder.make_identity_chain(
+            task, canonical_prefix_hashes=self.enable_prefix_caching
+        )
+
     @property
     def num_active_blocks(self):
         return len(self.active_blocks)
@@ -139,14 +147,10 @@ class PagedKVCacheManager(KVCacheManagerBase):
             return num_computed_blocks
 
         # 二分查找第一个cache_idx为None的block序号（LRU逐出策略确保cached blocks连续）
-        task_identities = [
-            identity
-            for identity in self.identity_builder.make_identity_chain(
-                task, canonical_prefix_hashes=self.enable_prefix_caching
-            )
-        ]
+        num_needed_blocks = self.num_blocks_for_seq_len(task.prefix_tokens_len)
+        task_identities = self._make_task_identities(task, min_blocks=num_needed_blocks)
         left = num_computed_blocks
-        right = len(task_identities)
+        right = min(num_needed_blocks, len(task_identities))
         while left < right:
             mid = (left + right) // 2
             if task_identities[mid].blk_hash not in self.identity_runtime_pool:
@@ -168,7 +172,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
         num_computed_blocks = len(self.task_to_cache_ids[task.task_id])
         num_cached_blocks = min(
-            ceil_div(max_cached_token_len, self.block_size),
+            self.num_blocks_for_seq_len(max_cached_token_len),
             self.num_cached_blocks(task),
         )
 
@@ -176,12 +180,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             return 0
 
         # 二分查找第一个idle block序号（同一任务前缀中的active/idle块连续）
-        task_identities = [
-            identity
-            for identity in self.identity_builder.make_identity_chain(
-                task, canonical_prefix_hashes=self.enable_prefix_caching
-            )
-        ]
+        task_identities = self._make_task_identities(task, min_blocks=num_cached_blocks)
 
         left = num_computed_blocks
         right = num_cached_blocks
@@ -264,13 +263,17 @@ class PagedKVCacheManager(KVCacheManagerBase):
             New cache indices allocated or reactivated for this step.
         """
         new_cache_ids: list[int] = []
-        task_identities = self.identity_builder.make_identity_chain(
-            task, canonical_prefix_hashes=self.enable_prefix_caching
+        task_num_cached_blocks = self.num_blocks_for_seq_len(task.consumed_req_tokens)
+        target_seq_len = task.kv_cache_len_used_in_completed_steps_and_next_step
+        num_target_blocks = self.num_blocks_for_seq_len(target_seq_len)
+        num_identity_blocks = max(task_num_cached_blocks, num_target_blocks)
+        task_identities = self._make_task_identities(
+            task, min_blocks=num_identity_blocks
         )
-        task_num_cached_blocks = ceil_div(task.consumed_req_tokens, self.block_size)
-        assert task_num_cached_blocks <= len(
-            task_identities
-        ), f"{task_num_cached_blocks} vs {len(task_identities)}, task_id={task.task_id}"
+        assert num_identity_blocks <= len(task_identities), (
+            f"{num_identity_blocks} vs {len(task_identities)}, "
+            f"task_id={task.task_id}"
+        )
 
         if self.enable_prefix_caching:
             # 被prefix caching击中block不占chunk prefill size的容量，也不增加额外的kv cache block需求
@@ -302,10 +305,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
             == task_num_cached_blocks
         ), f"task_id={task.task_id}: {len(self.task_to_cache_ids.get(task.task_id,set()))} vs {task_num_cached_blocks}"
 
-        # [0,num_target_blocks)区间内的block均需要分配cache块索引
-        target_seq_len = task.kv_cache_len_used_in_completed_steps_and_next_step
-        num_target_blocks = ceil_div(target_seq_len, self.block_size)
-
         for idx in range(
             len(self.task_to_cache_ids[task.task_id]), num_target_blocks, 1
         ):
@@ -327,7 +326,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         new_cache_ids: list[int] = []
 
         target_seq_len = task.kv_cache_len_used_in_completed_steps_and_next_step
-        num_target_blocks = ceil_div(target_seq_len, self.block_size)
+        num_target_blocks = self.num_blocks_for_seq_len(target_seq_len)
         token_blocks = self.task_to_token_blocks.get(task.task_id, [])
         assert len(token_blocks) == len(
             self.task_to_cache_ids[task.task_id]
@@ -360,11 +359,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # 便于后续请求的 prefix cache 命中 identity_builder.hashed_block_pool / identity_runtime_pool。
 
         # 由于decode阶段未维护哈希链，因此需要重建
-        identities = self.identity_builder.make_identity_chain(
-            task, canonical_prefix_hashes=self.enable_prefix_caching
-        )
         cached_blocks = self.task_to_token_blocks[task.task_id]
         num_cached_blocks = len(cached_blocks)
+        identities = self._make_task_identities(task, min_blocks=num_cached_blocks)
         assert num_cached_blocks <= len(
             identities
         ), f"{num_cached_blocks} vs {len(identities)}"
@@ -409,3 +406,112 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.task_to_cache_ids.pop(task.task_id)
         self.task_to_token_blocks.pop(task.task_id)
         self.identity_builder.forget_task(task)
+
+
+class _DeepSeekV4LogicalBlockMetadataMixin:
+    def _make_task_identities(self, task: "Task", *, min_blocks: Optional[int] = None):
+        if self.enable_prefix_caching:
+            return super()._make_task_identities(task, min_blocks=min_blocks)
+        if min_blocks is None:
+            min_blocks = self.num_blocks_for_seq_len(task.prefix_tokens_len)
+        placeholder = self.identity_builder.make_identity(
+            [], canonical_prefix_hashes=False
+        )
+        return [placeholder for _ in range(max(0, int(min_blocks)))]
+
+
+class DeepSeekV4SlidingKVCacheManager(
+    _DeepSeekV4LogicalBlockMetadataMixin, PagedKVCacheManager
+):
+    """Scheduler-side allocator for DeepSeek-V4 sliding-window KV pages.
+
+    V4 sliding-window cache uses one physical page per active request. The page
+    size is the model window size, and model code writes tokens into that page
+    as a ring buffer with ``position % window_size`` offsets.
+    """
+
+    def __init__(
+        self,
+        num_blocks: int,
+        *,
+        window_size: int,
+        **kwargs,
+    ):
+        self.window_size = int(window_size)
+        if int(kwargs["block_size"]) != self.window_size:
+            raise ValueError(
+                "DeepSeek-V4 sliding-window manager requires "
+                f"block_size == window_size, got block_size={kwargs['block_size']}, "
+                f"window_size={self.window_size}"
+            )
+        fixed_num_blocks = int(kwargs["num_hot_req"])
+        if int(num_blocks) != fixed_num_blocks:
+            logger.info(
+                "DeepSeek-V4 sliding-window manager uses one page per hot "
+                "request; ignoring num_blocks=%s and using num_hot_req=%s",
+                int(num_blocks),
+                fixed_num_blocks,
+            )
+        super().__init__(num_blocks, **kwargs)
+        self.max_blocks_per_req = 1
+        self.page_table_max_num_blocks = self.max_blocks_per_req * int(
+            kwargs["num_hot_req"]
+        )
+        self.max_num_blocks = self.page_table_max_num_blocks
+        self.num_blocks = fixed_num_blocks
+        self.free_cache_ids = deque(range(self.num_blocks))
+        self.fixed_num_blocks = True
+        if not self.enable_prefix_caching:
+            self.allocatable_max_num_blocks = self.page_table_max_num_blocks
+
+    def num_blocks_for_seq_len(self, seq_len: int) -> int:
+        seq_len = max(0, int(seq_len))
+        if seq_len == 0:
+            return 0
+        return 1
+
+    def realloc(self, num_blocks):
+        if int(num_blocks) != self.page_table_max_num_blocks:
+            logger.info(
+                "DeepSeek-V4 sliding-window manager keeps one page per hot "
+                "request; requested num_blocks=%s, using %s",
+                int(num_blocks),
+                self.page_table_max_num_blocks,
+            )
+        super().realloc(self.page_table_max_num_blocks)
+
+
+class DeepSeekV4CompressedKVCacheManager(
+    _DeepSeekV4LogicalBlockMetadataMixin, PagedKVCacheManager
+):
+    """Scheduler-side allocator for one DeepSeek-V4 compressed KV stream."""
+
+    def __init__(
+        self,
+        num_blocks: int,
+        *,
+        compress_ratio: int,
+        **kwargs,
+    ):
+        self.compress_ratio = int(compress_ratio)
+        super().__init__(num_blocks, **kwargs)
+        self.max_blocks_per_req = max(
+            1,
+            ceil_div(
+                int(kwargs["max_seq_len"]) // self.compress_ratio,
+                self.block_size,
+            ),
+        )
+        self.page_table_max_num_blocks = self.max_blocks_per_req * int(
+            kwargs["num_hot_req"]
+        )
+        self.max_num_blocks = self.page_table_max_num_blocks
+        if not self.enable_prefix_caching:
+            self.allocatable_max_num_blocks = self.page_table_max_num_blocks
+
+    def num_blocks_for_seq_len(self, seq_len: int) -> int:
+        seq_len = max(0, int(seq_len))
+        compressed_len = seq_len // self.compress_ratio
+        if compressed_len == 0:
+            return 0
+        return ceil_div(compressed_len, self.block_size)

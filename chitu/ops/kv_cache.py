@@ -55,6 +55,71 @@ def append_to_paged_kv_cache(
     raise NotImplementedError
 
 
+def append_to_sliding_window_paged_kv_cache(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    this_kv: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_ids: torch.Tensor,
+    window_size: int,
+    *,
+    final_lens: Optional[torch.Tensor] = None,
+    use_i64_offsets: bool = False,
+    impl: str = "auto",
+):
+    """Append KV to a one-page-per-request sliding-window paged cache.
+
+    The cache page size must be the sliding-window size. Logical token positions
+    are remapped to ring-buffer offsets by ``position % window_size`` before
+    calling the generic paged append op, so the page-table lookup always uses the
+    single page assigned to each request.
+
+    For prefill, callers may pass ``final_lens`` to keep only the tokens that
+    remain in the final window. This avoids duplicate writes to the same ring
+    offset and does not rely on scatter write ordering.
+    """
+    if this_kv.numel() == 0:
+        return
+
+    window_size = int(window_size)
+    if window_size <= 0:
+        raise ValueError(f"window_size must be > 0, got {window_size}")
+    if int(kv_cache.shape[1]) != window_size:
+        raise ValueError(
+            f"sliding-window page size ({kv_cache.shape[1]}) must equal "
+            f"window_size ({window_size})"
+        )
+
+    position_ids = position_ids.to(device=this_kv.device, dtype=torch.long)
+    seq_ids = seq_ids.to(device=this_kv.device, dtype=torch.long)
+    if position_ids.ndim > 1 and seq_ids.ndim == 1:
+        seq_ids = seq_ids.unsqueeze(1).expand_as(position_ids)
+
+    position_ids = position_ids.reshape(-1)
+    seq_ids = seq_ids.reshape(-1)
+    this_kv = this_kv.reshape(position_ids.numel(), *kv_cache.shape[2:])
+
+    if final_lens is not None:
+        final_lens = final_lens.to(device=this_kv.device, dtype=torch.long)
+        keep_start = torch.clamp(final_lens[seq_ids] - window_size, min=0)
+        keep_mask = position_ids >= keep_start
+        if not bool(keep_mask.any()):
+            return
+        this_kv = this_kv[keep_mask]
+        position_ids = position_ids[keep_mask]
+        seq_ids = seq_ids[keep_mask]
+
+    append_to_paged_kv_cache(
+        kv_cache,
+        page_table,
+        this_kv.contiguous(),
+        (position_ids % window_size).to(torch.int32).contiguous(),
+        seq_ids.to(torch.int32).contiguous(),
+        use_i64_offsets=use_i64_offsets,
+        impl=impl,
+    )
+
+
 @append_to_paged_kv_cache.register_auto
 def _auto_append_to_paged_kv_cache(
     kv_cache: torch.Tensor,

@@ -1170,8 +1170,8 @@ class DecodeOnlyScheduler(PDScheduler):
                 has_capacity = True
                 failed_cache_manager = None
                 for cache_manager in cache_manager_dict.values():
-                    cur_blocks = ceil_div(num_cached_tokens, cache_manager.block_size)
-                    target_blocks = ceil_div(prefix_len, cache_manager.block_size)
+                    cur_blocks = cache_manager.num_blocks_for_seq_len(num_cached_tokens)
+                    target_blocks = cache_manager.num_blocks_for_seq_len(prefix_len)
                     idle_hit_blocks = cache_manager.num_cached_idle_blocks(
                         task, max_cached_token_len=num_cached_tokens
                     )

@@ -10,7 +10,7 @@ name: DeepSeek-V4-Flash-Base
 type: deepseek-v4
 source: "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base"
 tokenizer_type: "hf"
-chatformat_type: dsv32
+chatformat_type: dsv4
 
 vocab_size: 129280
 bos_token_id: 0
