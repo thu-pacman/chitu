@@ -70,6 +70,7 @@ from chitu.kv_cache.utils import (
     estimate_indexer_blocks_from_main,
     solve_main_target_after_shrink,
     solve_main_target_from_current,
+    get_peak_live_and_target_bytes,
     cleanup_cuda_if_needed,
     allreduce_min_int,
     clamp_int,
@@ -100,6 +101,320 @@ def init_cache_static():
     if has_accelerator():
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
+
+
+def _deepseek_v4_compressed_ratio_from_manager_name(manager_name: str) -> Optional[int]:
+    if manager_name == "compressed_csa":
+        return 4
+    if manager_name == "compressed_hca":
+        return 128
+    match = re.fullmatch(r"compressed_(\d+)", str(manager_name))
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _deepseek_v4_compressed_blocks_for_seq_len(
+    seq_len: int,
+    *,
+    ratio: int,
+    block_size: int,
+    num_reqs: int,
+) -> int:
+    compressed_len = max(0, int(seq_len)) // int(ratio)
+    if compressed_len == 0:
+        return 0
+    return int(num_reqs) * ceil_div(compressed_len, int(block_size))
+
+
+def _deepseek_v4_effective_seq_len_for_targets(
+    max_seq_len: int,
+    compressed_groups: dict[str, dict],
+    targets: dict[str, int],
+    *,
+    num_reqs: int,
+) -> int:
+    if not compressed_groups:
+        return int(max_seq_len)
+
+    lo, hi = 0, int(max_seq_len)
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        enough_blocks = True
+        for manager_name, group in compressed_groups.items():
+            needed = _deepseek_v4_compressed_blocks_for_seq_len(
+                mid,
+                ratio=int(group["ratio"]),
+                block_size=int(group["block_size"]),
+                num_reqs=int(num_reqs),
+            )
+            if int(needed) > int(targets[manager_name]):
+                enough_blocks = False
+                break
+        if enough_blocks:
+            best = int(mid)
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return int(min(best, int(max_seq_len)))
+
+
+def _solve_deepseek_v4_kv_targets_from_seq_len(
+    args,
+    group_infos: dict[str, dict],
+    allowed_group_bytes: int,
+) -> tuple[dict[str, int], int, dict[str, int], int]:
+    """Solve DeepSeek-V4 KV blocks by logical sequence length.
+
+    The solver keeps sliding-window groups fixed at one page per hot request and
+    sizes compressed groups from a single effective logical sequence length.
+    It also enforces a one-request max_seq_len floor for each compressed group.
+    """
+
+    max_seq_len = int(args.infer.max_seq_len)
+    num_hot_req = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
+
+    min_targets: dict[str, int] = {}
+    compressed_groups: dict[str, dict] = {}
+
+    for manager_name, info in group_infos.items():
+        cap = int(info["cap"])
+        ratio = info.get("compress_ratio")
+        if ratio is None:
+            ratio = _deepseek_v4_compressed_ratio_from_manager_name(manager_name)
+        if ratio is not None:
+            block_size = int(info["block_size"])
+            one_req_blocks = _deepseek_v4_compressed_blocks_for_seq_len(
+                max_seq_len,
+                ratio=int(ratio),
+                block_size=block_size,
+                num_reqs=1,
+            )
+            # PagedKVCache cannot be reallocated to zero blocks. Even when
+            # max_seq_len < ratio, keep a minimal physical allocation.
+            min_targets[manager_name] = clamp_int(max(1, one_req_blocks), 1, cap)
+            compressed_groups[manager_name] = {
+                "ratio": int(ratio),
+                "block_size": block_size,
+            }
+            continue
+
+        if info["fixed_num_blocks"] or manager_name == "main":
+            min_targets[manager_name] = cap
+            continue
+
+        logger.warning(
+            "DeepSeek-V4 KV solve found unknown non-compressed manager group %s; "
+            "keeping its current blocks as the minimum target",
+            manager_name,
+        )
+        min_targets[manager_name] = clamp_int(int(info["blocks"]), 1, cap)
+
+    def target_for_seq_len(seq_len: int) -> dict[str, int]:
+        targets = dict(min_targets)
+        for manager_name, group in compressed_groups.items():
+            info = group_infos[manager_name]
+            batch_blocks = _deepseek_v4_compressed_blocks_for_seq_len(
+                seq_len,
+                ratio=int(group["ratio"]),
+                block_size=int(group["block_size"]),
+                num_reqs=int(num_hot_req),
+            )
+            targets[manager_name] = clamp_int(
+                max(int(min_targets[manager_name]), int(batch_blocks)),
+                1,
+                int(info["cap"]),
+            )
+        return targets
+
+    def target_bytes(targets: dict[str, int]) -> int:
+        return sum(
+            int(targets[manager_name])
+            * int(group_infos[manager_name]["bytes_per_block"])
+            for manager_name in group_infos
+        )
+
+    targets = dict(min_targets)
+    if target_bytes(targets) <= int(allowed_group_bytes):
+        lo, hi = 0, max_seq_len
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = target_for_seq_len(mid)
+            if target_bytes(candidate) <= int(allowed_group_bytes):
+                targets = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+    else:
+        logger.warning(
+            "DeepSeek-V4 KV warmup budget %.2fGB is below one-request max_seq_len "
+            "floor %.2fGB; using one-request floor targets",
+            float(allowed_group_bytes) / 1e9,
+            float(target_bytes(targets)) / 1e9,
+        )
+
+    effective_max_seq_len = _deepseek_v4_effective_seq_len_for_targets(
+        max_seq_len,
+        compressed_groups,
+        targets,
+        num_reqs=1,
+    )
+    batch_effective_max_seq_len = _deepseek_v4_effective_seq_len_for_targets(
+        max_seq_len,
+        compressed_groups,
+        targets,
+        num_reqs=num_hot_req,
+    )
+
+    return (
+        targets,
+        int(effective_max_seq_len),
+        min_targets,
+        int(batch_effective_max_seq_len),
+    )
+
+
+def _auto_set_deepseek_v4_num_blocks_after_warmup(
+    args,
+    paged_caches,
+):
+    reserve_bytes = 512 << 20
+    cache_groups = {}
+    for name, cache in paged_caches.items():
+        manager_name = getattr(cache, "manager_name", name)
+        cache_groups.setdefault(manager_name, []).append((name, cache))
+
+    group_infos = {}
+    num_hot_req = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
+    for manager_name, caches in cache_groups.items():
+        block_counts = {int(cache.num_blocks) for _, cache in caches}
+        if len(block_counts) != 1:
+            logger.warning(
+                "DeepSeek-V4 manager group %s has mismatched cache block counts: %s; "
+                "using the minimum for warmup solve",
+                manager_name,
+                sorted(block_counts),
+            )
+        cap = min(int(cache.get_allocatable_max_num_blocks()) for _, cache in caches)
+        block_sizes = {int(cache.block_size) for _, cache in caches}
+        if len(block_sizes) != 1:
+            logger.warning(
+                "DeepSeek-V4 manager group %s has mismatched block sizes: %s; "
+                "using the maximum for warmup solve",
+                manager_name,
+                sorted(block_sizes),
+            )
+        group_infos[manager_name] = {
+            "caches": caches,
+            "blocks": min(block_counts),
+            "bytes_per_block": sum(
+                int(cache.estimate_bytes_per_block()) for _, cache in caches
+            ),
+            "cap": int(cap),
+            "block_size": max(block_sizes),
+            "compress_ratio": _deepseek_v4_compressed_ratio_from_manager_name(
+                manager_name
+            ),
+            "fixed_num_blocks": any(
+                bool(getattr(cache, "fixed_num_blocks", False)) for _, cache in caches
+            ),
+            "max_blocks_per_req": max(1, ceil_div(int(cap), int(num_hot_req))),
+        }
+
+    if not group_infos:
+        logger.warning(
+            "skip DeepSeek-V4 KV resize because no paged cache groups were found"
+        )
+        return
+
+    for manager_name, info in group_infos.items():
+        if info["bytes_per_block"] <= 0:
+            logger.warning(
+                "skip DeepSeek-V4 KV resize because manager group %s has zero bytes_per_block",
+                manager_name,
+            )
+            return
+
+    live_bytes, target_budget_bytes, allocator_debug_bytes = (
+        get_peak_live_and_target_bytes(
+            memory_utilization=args.infer.memory_utilization,
+            reserve_bytes=reserve_bytes,
+        )
+    )
+    current_group_bytes = sum(
+        info["blocks"] * info["bytes_per_block"] for info in group_infos.values()
+    )
+    baseline_bytes = max(0, int(live_bytes) - int(current_group_bytes))
+    allowed_group_bytes = max(0, int(target_budget_bytes) - int(baseline_bytes))
+
+    targets, effective_max_seq_len, min_targets, batch_effective_max_seq_len = (
+        _solve_deepseek_v4_kv_targets_from_seq_len(
+            args,
+            group_infos,
+            allowed_group_bytes,
+        )
+    )
+
+    targets = reduce_num_block_plan_across_ranks(targets)
+    effective_max_seq_len = allreduce_min_int(int(effective_max_seq_len))
+    batch_effective_max_seq_len = allreduce_min_int(int(batch_effective_max_seq_len))
+
+    logger.info(
+        "DeepSeek-V4 KV solve: live=%.2fGB target_budget=%.2fGB "
+        "baseline=%.2fGB allowed_group=%.2fGB effective_max_seq_len=%d "
+        "batch_effective_max_seq_len=%d num_hot_req=%d targets=%s "
+        "min_targets=%s caps=%s bytes_per_block=%s reserved_peak_gap=%.2fGB",
+        float(live_bytes) / 1e9,
+        float(target_budget_bytes) / 1e9,
+        float(baseline_bytes) / 1e9,
+        float(allowed_group_bytes) / 1e9,
+        int(effective_max_seq_len),
+        int(batch_effective_max_seq_len),
+        int(num_hot_req),
+        targets,
+        min_targets,
+        {name: info["cap"] for name, info in group_infos.items()},
+        {name: info["bytes_per_block"] for name, info in group_infos.items()},
+        float(allocator_debug_bytes["reserved_peak_gap_bytes"]) / 1e9,
+    )
+
+    for manager_name, info in group_infos.items():
+        target_blocks = int(targets[manager_name])
+        for cache_name, cache in info["caches"]:
+            current_blocks = int(cache.num_blocks)
+            if current_blocks != target_blocks:
+                cache.realloc(target_blocks)
+                logger.info(
+                    "DeepSeek-V4 %s cache resized from %d to %d blocks for manager %s",
+                    cache_name,
+                    current_blocks,
+                    target_blocks,
+                    manager_name,
+                )
+                cleanup_cuda_if_needed()
+
+    get_global_args().infer.num_blocks = int(
+        targets.get("main", next(iter(targets.values())))
+    )
+    if Backend.cache_managers:
+        for dp_rank, dp_rank_managers in enumerate(Backend.cache_managers):
+            for manager_name, target_blocks in targets.items():
+                manager = dp_rank_managers.get(manager_name)
+                if manager is None:
+                    continue
+                if int(manager.num_blocks) != int(target_blocks):
+                    manager.realloc(int(target_blocks))
+                    logger.info(
+                        "scheduler dp_rank=%d DeepSeek-V4 %s cache manager synced to %d blocks",
+                        dp_rank,
+                        manager_name,
+                        int(target_blocks),
+                    )
+
+    if torch.distributed.get_rank() == 0:
+        for scheduler in Backend.schedulers:
+            scheduler.reset_kvcache_block_threshold()
 
 
 def _auto_set_num_blocks_after_warmup(args):
@@ -133,28 +448,43 @@ def _auto_set_num_blocks_after_warmup(args):
         return
 
     if is_pd_decode_only and not full_warmup:
-        current_main_blocks = int(paged_caches["main"].num_blocks)
+        if args.models.type == ModelType.DEEPSEEK_V4:
+            current_targets = {}
+            for name, cache in paged_caches.items():
+                manager_name = getattr(cache, "manager_name", name)
+                current_targets[manager_name] = min(
+                    int(cache.num_blocks),
+                    current_targets.get(manager_name, int(cache.num_blocks)),
+                )
+            current_main_blocks = int(
+                current_targets.get("main", next(iter(current_targets.values())))
+            )
+        else:
+            current_targets = {"main": int(paged_caches["main"].num_blocks)}
+            current_main_blocks = int(current_targets["main"])
         get_global_args().infer.num_blocks = int(current_main_blocks)
         if Backend.cache_managers:
             for dp_rank_managers in Backend.cache_managers:
-                main_mgr = dp_rank_managers.get("main")
-                if main_mgr is None:
-                    continue
-                mgr_current = int(main_mgr.num_blocks)
-                if int(current_main_blocks) != int(mgr_current):
-                    main_mgr.realloc(int(current_main_blocks))
-                    logger.info(
-                        "scheduler main cache manager synced to %d blocks after warmup skip",
-                        int(current_main_blocks),
-                    )
+                for manager_name, target_blocks in current_targets.items():
+                    manager = dp_rank_managers.get(manager_name)
+                    if manager is None:
+                        continue
+                    mgr_current = int(manager.num_blocks)
+                    if int(target_blocks) != int(mgr_current):
+                        manager.realloc(int(target_blocks))
+                        logger.info(
+                            "scheduler %s cache manager synced to %d blocks after warmup skip",
+                            manager_name,
+                            int(target_blocks),
+                        )
         if torch.distributed.get_rank() == 0:
             for scheduler in Backend.schedulers:
                 scheduler.reset_kvcache_block_threshold()
         logger.warning(
             "skip auto set num blocks after warmup for PD decode-only without "
             "full_warmup; direct warmup only exercises batch_size=1 and seq_len=1, "
-            "so keeping current main KV blocks=%d",
-            int(current_main_blocks),
+            "so keeping current KV blocks=%s",
+            current_targets,
         )
         return
 
@@ -174,6 +504,13 @@ def _auto_set_num_blocks_after_warmup(args):
             int(cache.max_num_blocks),
             int(effective_cap),
         )
+
+    if args.models.type == ModelType.DEEPSEEK_V4 and len(paged_caches) > 1:
+        _auto_set_deepseek_v4_num_blocks_after_warmup(
+            args,
+            paged_caches,
+        )
+        return
 
     plan = plan_kv_cache_blocks_after_warmup(args, paged_caches)
     plan = reduce_num_block_plan_across_ranks(plan)

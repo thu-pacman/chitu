@@ -476,6 +476,7 @@ class PagedKVCache(KVCacheBase):
         num_hot_req: int,
         max_seq_len: int,
         num_blocks: int,
+        page_table_max_seq_len: Optional[int] = None,
         shape_per_token_dict: Optional[dict[str, torch.Size | Sequence[int]]] = None,
         dtype_dict: Optional[dict[str, torch.dtype]] = None,
         n_local_kv_heads: Optional[int] = None,
@@ -498,7 +499,17 @@ class PagedKVCache(KVCacheBase):
             device=device,
         )
         mtp_extra = self.mtp_size if (self.mtp_size > 1 and not is_singleton) else 0
-        self.max_blocks_per_req = ceil_div(max_seq_len + mtp_extra, block_size)
+        if page_table_max_seq_len is None:
+            page_table_max_seq_len = max_seq_len + mtp_extra
+        else:
+            page_table_max_seq_len = int(page_table_max_seq_len)
+            if page_table_max_seq_len < 0:
+                raise ValueError(
+                    "page_table_max_seq_len must be >= 0, "
+                    f"got {page_table_max_seq_len}"
+                )
+        self.page_table_max_seq_len = page_table_max_seq_len
+        self.max_blocks_per_req = ceil_div(page_table_max_seq_len, block_size)
         self.page_table_max_num_blocks = self.max_blocks_per_req * num_hot_req
         self.max_num_blocks = self.page_table_max_num_blocks
 
@@ -1490,4 +1501,205 @@ class DeepSeekV4DenseKVCache(DenseKVCache):
 
 
 class DeepSeekV4PagedKVCache(PagedKVCache):
-    pass
+    """Paged KV cache with block-backed DeepSeek-V4 compressor request state."""
+
+    def __init__(self, *args, **kwargs):
+        self.request_shape_dict = kwargs.pop("request_shape_dict", {})
+        self.request_dtype_dict = kwargs.pop("request_dtype_dict", {})
+        super().__init__(*args, **kwargs)
+        self.request_buffer: dict[str, torch.Tensor] = {}
+        self._allocate_request_buffer()
+
+    def _allocate_request_buffer(self):
+        self.request_buffer.clear()
+        for key, shape in self.request_shape_dict.items():
+            dtype = self.request_dtype_dict.get(key, torch.get_default_dtype())
+            # Pending compressor state follows the same block lifecycle as the
+            # sliding-window KV page. The first block of each request is the
+            # anchor slot used by model_deepseek_v4.py.
+            self.request_buffer[key] = torch.zeros(
+                (self.num_layers, self.num_blocks) + tuple(shape),
+                dtype=dtype,
+                device=self.device,
+            )
+
+    def _zero_request_blocks(self, block_ids):
+        if not self.request_buffer:
+            return
+        block_ids = [int(block_id) for block_id in block_ids]
+        if not block_ids:
+            return
+        block_ids_tensor = torch.tensor(block_ids, dtype=torch.long, device=self.device)
+        for key in self.request_buffer:
+            self.request_buffer[key].index_fill_(1, block_ids_tensor, 0)
+
+    def _zero_new_request_blocks(self, tasks: "PackedTasksBase"):
+        if not tasks.new_cache_ids_list:
+            return
+        new_block_ids = []
+        for item in tasks.new_cache_ids_list:
+            new_block_ids.extend(item.get(self.manager_name, []))
+        self._zero_request_blocks(new_block_ids)
+
+    @override
+    def prepare_cache_prefill(self, tasks: "PackedTasksBase"):
+        super().prepare_cache_prefill(tasks)
+        self._zero_new_request_blocks(tasks)
+
+    @override
+    def prepare_cache_decode(self, tasks: "PackedTasksBase"):
+        super().prepare_cache_decode(tasks)
+        self._zero_new_request_blocks(tasks)
+
+    @override
+    def realloc(self, num_blocks):
+        super().realloc(num_blocks)
+        self._allocate_request_buffer()
+
+    @override
+    def estimate_bytes_per_block(self) -> int:
+        total = super().estimate_bytes_per_block()
+        for key, shape in self.request_shape_dict.items():
+            n_elem_per_block = 1
+            for dim in tuple(shape):
+                n_elem_per_block *= int(dim)
+            dtype = self.request_dtype_dict.get(key, torch.get_default_dtype())
+            elem_size = torch.empty((), dtype=dtype).element_size()
+            total += int(self.num_layers) * n_elem_per_block * elem_size
+        return int(total)
+
+    @override
+    def finalize_cache_all_decode(self, tasks: "PackedTasksBase"):
+        block_ids_to_zero = []
+        for tid in tasks.task_ids:
+            block_ids_to_zero.extend(self.block_table.get(tid, []))
+        super().finalize_cache_all_decode(tasks)
+        self._zero_request_blocks(block_ids_to_zero)
+
+    @override
+    def get_accessor(self, layer_id: int, is_mtp: bool = False) -> PagedKVCacheAccessor:
+        accessor = super().get_accessor(layer_id, is_mtp)
+        local_layer_id = self.layer_id_map.to_local(layer_id)
+        accessor.kv.update(
+            {key: cache[local_layer_id] for key, cache in self.request_buffer.items()}
+        )
+        return accessor
+
+    def get_deepseek_v4_cache_slots(self, seq_delta) -> list[int]:
+        curr_tids = self.curr_tids
+        if curr_tids is None or len(curr_tids) != seq_delta.batch_size:
+            if self.request_buffer:
+                raise RuntimeError(
+                    "DeepSeek-V4 paged request state requires current task ids "
+                    "to resolve block-backed slots"
+                )
+            return list(range(seq_delta.batch_size))
+        slots = []
+        for tid in curr_tids:
+            blocks = self.block_table.get(tid, [])
+            if not blocks:
+                raise RuntimeError(f"DeepSeek-V4 paged cache has no block for {tid}")
+            slots.append(int(blocks[0]))
+        return slots
+
+
+class DeepSeekV4SlidingWindowPagedKVCache(DeepSeekV4PagedKVCache):
+    """One-page-per-request paged cache for DeepSeek-V4 sliding-window KV.
+
+    This is the DeepSeek-V4 sliding-window variant of singleton paged cache:
+    each active request owns exactly one physical page, and that page is a
+    ring buffer with ``window_size`` token slots. Unlike ``SingletonPagedKVCache``
+    for MTP/linear states, the in-page offset is not always zero; it is
+    ``logical_position % window_size``.
+
+    The cache still consumes block ids from Chitu's normal ``main`` paged cache
+    manager, because the scheduler currently requires a ``main`` manager for
+    capacity accounting and request lifecycle metadata.
+    """
+
+    def __init__(
+        self,
+        *args,
+        num_hot_req: int,
+        max_seq_len: int,
+        window_size: int,
+        num_blocks: Optional[int] = None,
+        block_size: Optional[int] = None,
+        **kwargs,
+    ):
+        self.window_size = int(window_size)
+        if self.window_size <= 0:
+            raise ValueError(f"window_size must be > 0, got {window_size}")
+        if block_size is not None and int(block_size) != self.window_size:
+            raise ValueError(
+                "DeepSeek-V4 sliding-window paged cache requires "
+                f"block_size == window_size, got block_size={block_size}, "
+                f"window_size={self.window_size}"
+            )
+
+        fixed_num_blocks = int(num_hot_req)
+        if num_blocks is not None and int(num_blocks) != fixed_num_blocks:
+            logger.info(
+                "DeepSeek-V4 sliding-window paged cache uses one page per hot "
+                "request; ignoring num_blocks=%s and using num_hot_req=%s",
+                int(num_blocks),
+                fixed_num_blocks,
+            )
+
+        super().__init__(
+            *args,
+            num_hot_req=num_hot_req,
+            max_seq_len=max_seq_len,
+            num_blocks=fixed_num_blocks,
+            page_table_max_seq_len=self.window_size,
+            block_size=self.window_size,
+            is_singleton=True,
+            **kwargs,
+        )
+
+        # The logical sequence can be longer than the window, but the page table
+        # has exactly one entry per request. The parent sees page_table_max_seq_len
+        # as one window, so it already builds the correct one-entry table.
+        self.allocatable_max_num_blocks = self.page_table_max_num_blocks
+        self.fixed_num_blocks = True
+
+    @override
+    def realloc(self, num_blocks):
+        if int(num_blocks) != self.num_hot_req:
+            logger.info(
+                "DeepSeek-V4 sliding-window paged cache keeps one page per hot "
+                "request; requested num_blocks=%s, using num_hot_req=%s",
+                int(num_blocks),
+                self.num_hot_req,
+            )
+        super().realloc(self.num_hot_req)
+
+    @override
+    @cuda_graph_safe_cached_property("_page_ids_static_tensor", "_page_ids_up_to_date")
+    def page_ids(self):
+        return self.gpu_block_table.get()[
+            self.seq_len_delta.delta_seq_ids_tensor_device, 0
+        ]
+
+    @override
+    @cuda_graph_safe_cached_property("_page_ids_static_tensor", "_page_ids_up_to_date")
+    def page_ids_mtp(self):
+        return self.gpu_block_table.get()[
+            self.mtp_seq_len_delta.delta_seq_ids_tensor_device, 0
+        ]
+
+    @override
+    @cuda_graph_safe_cached_property(
+        "_offs_in_page_static_tensor", "_offs_in_page_up_to_date"
+    )
+    def offs_in_page(self):
+        return self.seq_len_delta.delta_position_ids_tensor_device % self.window_size
+
+    @override
+    @cuda_graph_safe_cached_property(
+        "_offs_in_page_static_tensor", "_offs_in_page_up_to_date"
+    )
+    def offs_in_page_mtp(self):
+        return (
+            self.mtp_seq_len_delta.delta_position_ids_tensor_device % self.window_size
+        )

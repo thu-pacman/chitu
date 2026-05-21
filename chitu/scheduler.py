@@ -112,9 +112,6 @@ class Scheduler:
             decode_num_tasks = max_reqs_per_dp
 
         cache_manager_dict = Backend.cache_managers[dp_rank]
-        assert (
-            type(cache_manager_dict["main"]) == PagedKVCacheManager
-        ), f"Scheduler only support PagedKVCacheManager, found {type(cache_manager_dict['main'])}"
 
         return Scheduler(
             max_reqs_per_dp,
@@ -274,10 +271,9 @@ class Scheduler:
 
     def _check_prefill_capacity(self, task, cached_len: int) -> bool:
         for name, cache_manager in self.cache_manager_dict.items():
-            cur_blocks = ceil_div(cached_len, cache_manager.block_size)
-            target_blocks = ceil_div(
-                cached_len + task.next_req_tokens_len,
-                cache_manager.block_size,
+            cur_blocks = cache_manager.num_blocks_for_seq_len(cached_len)
+            target_blocks = cache_manager.num_blocks_for_seq_len(
+                cached_len + task.next_req_tokens_len
             )
             block_threshold = (
                 self.kvcache_block_threshold
@@ -301,9 +297,8 @@ class Scheduler:
                 cache_manager.num_blocks - cache_manager.num_active_blocks
             )
             cur_blocks = len(cache_manager.task_to_cache_ids[task.task_id])
-            target_blocks = ceil_div(
-                task.kv_cache_len_used_in_completed_steps_and_next_step,
-                cache_manager.block_size,
+            target_blocks = cache_manager.num_blocks_for_seq_len(
+                task.kv_cache_len_used_in_completed_steps_and_next_step
             )
             if target_blocks - cur_blocks > available_blocks:
                 return False

@@ -11,7 +11,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.kv_cache import DenseKVCache, KVCacheBase
+from chitu.kv_cache import DenseKVCache, KVCacheBase, PagedKVCache, PagedKVCacheAccessor
 from chitu.global_vars import get_global_args
 from chitu.models.model import (
     Attention,
@@ -23,7 +23,12 @@ from chitu.models.model import (
     get_linear_layout_contig_y,
 )
 from chitu.models.registry import ModelType, register_model
-from chitu.ops import apply_rotary_pos_emb_partial, moe_gate, moe_hash_gate
+from chitu.ops import (
+    apply_rotary_pos_emb_partial,
+    moe_gate,
+    moe_hash_gate,
+    append_to_sliding_window_paged_kv_cache,
+)
 from chitu.ops.hadamard import hadamard_transform
 from chitu.ops.mhc import mhc_pre, mhc_post
 from chitu.ops.quant import (
@@ -36,6 +41,22 @@ from chitu.distributed.parallel_state import get_tp_group, get_tp_size
 
 FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 FE8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
+
+
+def _compressed_cache_name_deepseek_v4(ratio: int) -> str:
+    if ratio == 4:
+        return "compressed_csa"
+    if ratio == 128:
+        return "compressed_hca"
+    return f"compressed_{ratio}"
+
+
+def _main_cache_name_for_compress_ratio_deepseek_v4(ratio: int) -> str:
+    if ratio == 4:
+        return "main_csa"
+    if ratio == 128:
+        return "main_hca"
+    return f"main_compressed_{ratio}"
 
 
 class Blockfp8LinearRoundScaleToPow2(Blockfp8Linear):
@@ -331,15 +352,58 @@ class CompressorDeepSeekV4(nn.Module):
         )
         self.norm = RMSNorm(self.head_dim, args.norm_eps, dtype=torch.float32)
         self.kv_cache: Optional[torch.Tensor] = None
+        self.kv_cache_is_paged = False
+        self.kv_block_table: Optional[torch.Tensor] = None
         self.register_buffer("kv_state", torch.empty(0), persistent=False)
         self.register_buffer("score_state", torch.empty(0), persistent=False)
         self.freqs_cis: Optional[torch.Tensor] = None
 
     def reset_runtime_buffers(self, device: torch.device | str):
         self.kv_cache = None
+        self.kv_cache_is_paged = False
+        self.kv_block_table = None
         self.freqs_cis = None
         self.kv_state = torch.empty(0, dtype=torch.float32, device=device)
         self.score_state = torch.empty(0, dtype=torch.float32, device=device)
+
+    def bind_kv_cache(
+        self,
+        kv_cache: torch.Tensor,
+        *,
+        block_table: Optional[torch.Tensor] = None,
+    ):
+        self.kv_cache = kv_cache
+        self.kv_block_table = block_table
+        self.kv_cache_is_paged = block_table is not None
+
+    def _write_kv_cache(
+        self,
+        cache_slice: slice,
+        positions: torch.Tensor,
+        values: torch.Tensor,
+        *,
+        cache_seq_id: int,
+    ):
+        assert self.kv_cache is not None
+        if not self.kv_cache_is_paged:
+            self.kv_cache[cache_slice, positions] = values
+            return
+
+        assert self.kv_block_table is not None
+        positions = positions.to(device=values.device, dtype=torch.long)
+        if positions.ndim == 1:
+            positions = positions.unsqueeze(0).expand(values.size(0), -1)
+        seq_ids = torch.arange(
+            cache_seq_id,
+            cache_seq_id + values.size(0),
+            device=values.device,
+            dtype=torch.long,
+        ).unsqueeze(1)
+        page_size = self.kv_cache.shape[1]
+        page_ids = self.kv_block_table[
+            seq_ids.expand_as(positions), positions // page_size
+        ]
+        self.kv_cache[page_ids, positions % page_size] = values
 
     def overlap_transform(self, tensor: torch.Tensor, value=0):
         bsz, seqlen, _, _ = tensor.size()
@@ -349,7 +413,14 @@ class CompressorDeepSeekV4(nn.Module):
         new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :head_dim]
         return new_tensor
 
-    def forward(self, x: torch.Tensor, start_pos: int, cache_slot: int = 0):
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        cache_slot: int = 0,
+        *,
+        cache_seq_id: int = 0,
+    ):
         assert self.kv_cache is not None
         assert self.freqs_cis is not None
         bsz, seqlen, _ = x.size()
@@ -437,9 +508,21 @@ class CompressorDeepSeekV4(nn.Module):
         if self.rotate:
             kv = hadamard_transform(kv, scale=kv.size(-1) ** -0.5)
         if start_pos == 0:
-            self.kv_cache[cache_slice, : seqlen // ratio] = kv
+            positions = torch.arange(seqlen // ratio, device=x.device)
+            self._write_kv_cache(
+                cache_slice,
+                positions,
+                kv,
+                cache_seq_id=cache_seq_id,
+            )
         else:
-            self.kv_cache[cache_slice, start_pos // ratio] = kv.squeeze(1)
+            positions = torch.tensor([start_pos // ratio], device=x.device)
+            self._write_kv_cache(
+                cache_slice,
+                positions,
+                kv,
+                cache_seq_id=cache_seq_id,
+            )
         return kv
 
 
@@ -485,12 +568,48 @@ class IndexerDeepSeekV4(nn.Module):
             rotate=True,
         )
         self.register_buffer("kv_cache", torch.empty(0), persistent=False)
+        self.kv_cache_is_paged = False
+        self.kv_block_table: Optional[torch.Tensor] = None
         self.freqs_cis: Optional[torch.Tensor] = None
 
     def reset_runtime_buffers(self, device: torch.device | str):
         self.kv_cache = torch.empty(0, dtype=torch.bfloat16, device=device)
+        self.kv_cache_is_paged = False
+        self.kv_block_table = None
         self.freqs_cis = None
         self.compressor.reset_runtime_buffers(device)
+
+    def bind_kv_cache(
+        self,
+        kv_cache: torch.Tensor,
+        *,
+        block_table: Optional[torch.Tensor] = None,
+    ):
+        self.kv_cache = kv_cache
+        self.kv_block_table = block_table
+        self.kv_cache_is_paged = block_table is not None
+        self.compressor.bind_kv_cache(kv_cache, block_table=block_table)
+
+    def _read_kv_cache(
+        self,
+        cache_slice: slice,
+        length: int,
+        *,
+        cache_seq_id: int,
+    ) -> torch.Tensor:
+        if not self.kv_cache_is_paged:
+            return self.kv_cache[cache_slice, :length]
+
+        assert self.kv_block_table is not None
+        if length == 0:
+            return self.kv_cache.new_empty((1, 0, self.kv_cache.shape[-1]))
+        positions = torch.arange(length, device=self.kv_cache.device, dtype=torch.long)
+        seq_ids = torch.tensor(
+            [cache_seq_id], device=self.kv_cache.device, dtype=torch.long
+        )
+        page_size = self.kv_cache.shape[1]
+        page_ids = self.kv_block_table[seq_ids.unsqueeze(1), positions // page_size]
+        return self.kv_cache[page_ids, positions % page_size]
 
     def forward(
         self,
@@ -499,6 +618,8 @@ class IndexerDeepSeekV4(nn.Module):
         start_pos: int,
         offset: int,
         cache_slot: int = 0,
+        *,
+        cache_seq_id: int = 0,
     ):
         bsz, seqlen, _ = x.size()
         assert self.freqs_cis is not None
@@ -511,11 +632,12 @@ class IndexerDeepSeekV4(nn.Module):
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
         apply_rotary_emb_v4(q, freqs_cis, rope_dim=rope_dim)
         q = hadamard_transform(q, scale=q.size(-1) ** -0.5)
-        self.compressor(x, start_pos, cache_slot)
+        self.compressor(x, start_pos, cache_slot, cache_seq_id=cache_seq_id)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
-        index_score = torch.einsum(
-            "bshd,btd->bsht", q, self.kv_cache[cache_slice, : end_pos // ratio]
+        index_kv = self._read_kv_cache(
+            cache_slice, end_pos // ratio, cache_seq_id=cache_seq_id
         )
+        index_score = torch.einsum("bshd,btd->bsht", q, index_kv)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         if get_tp_size() > 1:
             _all_reduce_tp(index_score)
@@ -639,10 +761,17 @@ class AttentionDeepSeekV4(Attention):
             else (0, args.rope_theta)
         )
         self.register_buffer("freqs_cis", torch.empty(0), persistent=False)
+        self.kv_cache_is_paged = False
+        self.kv_block_table: Optional[torch.Tensor] = None
 
     def _uses_skew_kv_cache(self) -> bool:
         return isinstance(self.cache, DenseKVCache) and (
             not self.compress_ratio or isinstance(self.compressed_cache, DenseKVCache)
+        )
+
+    def _uses_paged_kv_cache(self) -> bool:
+        return isinstance(self.cache, PagedKVCache) and (
+            not self.compress_ratio or isinstance(self.compressed_cache, PagedKVCache)
         )
 
     def reset_runtime_buffers(self, device: torch.device | str):
@@ -656,10 +785,9 @@ class AttentionDeepSeekV4(Attention):
             self.beta_slow,
             device=device,
         )
-        if not self._uses_skew_kv_cache():
+        if not (self._uses_skew_kv_cache() or self._uses_paged_kv_cache()):
             raise NotImplementedError(
-                "DeepSeek-V4 currently wires KV cache through Dense/skew cache only; "
-                "paged KV cache needs a provider/cache-manager design before use."
+                "DeepSeek-V4 requires Dense/skew or paged KV cache providers."
             )
         self.kv_cache = torch.empty(0, dtype=torch.bfloat16, device=device)
         if self.compress_ratio:
@@ -667,15 +795,25 @@ class AttentionDeepSeekV4(Attention):
             if self.indexer is not None:
                 self.indexer.reset_runtime_buffers(device)
 
-    def _bind_skew_kv_cache(self):
+    def _bind_runtime_kv_cache(self):
         main_accessor = self.cache.get_accessor(self.layer_id)
+        self.kv_cache_is_paged = isinstance(main_accessor, PagedKVCacheAccessor)
+        self.kv_block_table = (
+            main_accessor.block_table if self.kv_cache_is_paged else None
+        )
         self.kv_cache = main_accessor.kv["sliding_window"]
         if not self.compress_ratio:
             return
         if self.compressed_cache is None:
-            raise RuntimeError("DeepSeek-V4 skew mode requires compressed KV cache")
+            raise RuntimeError("DeepSeek-V4 requires compressed KV cache")
         compressed_accessor = self.compressed_cache.get_accessor(self.layer_id)
-        self.compressor.kv_cache = compressed_accessor.kv["compressed"]
+        compressed_is_paged = isinstance(compressed_accessor, PagedKVCacheAccessor)
+        self.compressor.bind_kv_cache(
+            compressed_accessor.kv["compressed"],
+            block_table=(
+                compressed_accessor.block_table if compressed_is_paged else None
+            ),
+        )
         pending_rows = self.compressor.coff * self.compressor.compress_ratio
         pending_width = self.compressor.coff * self.compressor.head_dim
         self.compressor.kv_state = main_accessor.kv["pending_kv_state"][
@@ -693,11 +831,13 @@ class AttentionDeepSeekV4(Attention):
             indexer_pending_width = (
                 indexer_compressor.coff * indexer_compressor.head_dim
             )
-            self.indexer.kv_cache = compressed_accessor.kv["indexer_compressed"]
+            self.indexer.bind_kv_cache(
+                compressed_accessor.kv["indexer_compressed"],
+                block_table=(
+                    compressed_accessor.block_table if compressed_is_paged else None
+                ),
+            )
             self.indexer.freqs_cis = self.freqs_cis
-            self.indexer.compressor.kv_cache = compressed_accessor.kv[
-                "indexer_compressed"
-            ]
             self.indexer.compressor.kv_state = main_accessor.kv[
                 "indexer_pending_kv_state"
             ][:, :indexer_pending_rows, :indexer_pending_width]
@@ -705,6 +845,122 @@ class AttentionDeepSeekV4(Attention):
                 "indexer_pending_score_state"
             ][:, :indexer_pending_rows, :indexer_pending_width]
             self.indexer.compressor.freqs_cis = self.freqs_cis
+
+    def _read_paged_cache(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        positions = positions.to(device=kv_cache.device, dtype=torch.long)
+        seq_ids = seq_ids.to(device=kv_cache.device, dtype=torch.long)
+        if positions.ndim == 1:
+            positions = positions.unsqueeze(0).expand(seq_ids.numel(), -1)
+        if seq_ids.ndim == 1:
+            seq_ids = seq_ids.unsqueeze(1).expand_as(positions)
+        page_size = kv_cache.shape[1]
+        page_ids = block_table[seq_ids, positions // page_size]
+        return kv_cache[page_ids, positions % page_size]
+
+    def _write_sliding_cache(
+        self,
+        seq_ids: torch.Tensor,
+        positions: torch.Tensor,
+        values: torch.Tensor,
+    ):
+        if self.kv_cache_is_paged:
+            assert self.kv_block_table is not None
+            append_to_sliding_window_paged_kv_cache(
+                self.kv_cache,
+                self.kv_block_table,
+                values,
+                positions,
+                seq_ids,
+                self.window_size,
+            )
+        else:
+            self.kv_cache[seq_ids, positions % self.window_size] = values
+
+    def _materialize_sliding_cache(
+        self,
+        cache_slots: torch.Tensor,
+        cache_seq_ids: torch.Tensor,
+        start_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        base_positions = torch.arange(
+            self.window_size, device=cache_seq_ids.device, dtype=torch.long
+        )
+        positions = base_positions.unsqueeze(0).expand(cache_seq_ids.numel(), -1)
+        valid_lens = torch.minimum(
+            start_positions + 1,
+            torch.full_like(start_positions, self.window_size),
+        )
+        valid_mask = base_positions.unsqueeze(0) < valid_lens.unsqueeze(1)
+        safe_positions = torch.where(valid_mask, positions, torch.zeros_like(positions))
+        if self.kv_cache_is_paged:
+            assert self.kv_block_table is not None
+            sliding = self._read_paged_cache(
+                self.kv_cache,
+                self.kv_block_table,
+                cache_seq_ids,
+                safe_positions,
+            )
+        else:
+            sliding = self.kv_cache[cache_slots, : self.window_size]
+        return torch.where(valid_mask.unsqueeze(-1), sliding, torch.zeros_like(sliding))
+
+    def _materialize_compressed_cache(
+        self,
+        cache_slots: torch.Tensor,
+        cache_seq_ids: torch.Tensor,
+        compressed_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.compress_ratio
+        assert self.compressor.kv_cache is not None
+        max_compressed_len = (
+            int(compressed_lens.max().item()) if compressed_lens.numel() else 0
+        )
+        if max_compressed_len == 0:
+            return self.compressor.kv_cache.new_empty(
+                (cache_slots.numel(), 0, self.head_dim)
+            )
+        base_positions = torch.arange(
+            max_compressed_len, device=cache_seq_ids.device, dtype=torch.long
+        )
+        positions = base_positions.unsqueeze(0).expand(cache_seq_ids.numel(), -1)
+        valid_mask = base_positions.unsqueeze(0) < compressed_lens.unsqueeze(1)
+        safe_positions = torch.where(valid_mask, positions, torch.zeros_like(positions))
+        if self.compressor.kv_cache_is_paged:
+            assert self.compressor.kv_block_table is not None
+            compressed = self._read_paged_cache(
+                self.compressor.kv_cache,
+                self.compressor.kv_block_table,
+                cache_seq_ids,
+                safe_positions,
+            )
+        else:
+            compressed = self.compressor.kv_cache[cache_slots, :max_compressed_len]
+        return torch.where(
+            valid_mask.unsqueeze(-1), compressed, torch.zeros_like(compressed)
+        )
+
+    def _materialize_decode_attn_kv(
+        self,
+        cache_slots: torch.Tensor,
+        cache_seq_ids: torch.Tensor,
+        start_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        sliding = self._materialize_sliding_cache(
+            cache_slots, cache_seq_ids, start_positions
+        )
+        if not self.compress_ratio:
+            return sliding
+        compressed_lens = (start_positions + 1) // self.compress_ratio
+        compressed = self._materialize_compressed_cache(
+            cache_slots, cache_seq_ids, compressed_lens
+        )
+        return torch.cat([sliding, compressed], dim=1)
 
     def _dequant_wo_a(self) -> torch.Tensor:
         if isinstance(self.wo_a, NormalLinear):
@@ -729,8 +985,8 @@ class AttentionDeepSeekV4(Attention):
         freqs_cis: BatchedFreqsCis,
     ):
         seq_len_delta = self.cache.seq_len_delta
-        if self._uses_skew_kv_cache():
-            self._bind_skew_kv_cache()
+        if self._uses_skew_kv_cache() or self._uses_paged_kv_cache():
+            self._bind_runtime_kv_cache()
         if self._uses_skew_kv_cache():
             cache_slots = list(range(seq_len_delta.batch_size))
         else:
@@ -762,6 +1018,7 @@ class AttentionDeepSeekV4(Attention):
                 x[begin:end],
                 start_pos,
                 cache_slot,
+                i,
                 wo_a,
             )
         if decode_indices:
@@ -774,6 +1031,7 @@ class AttentionDeepSeekV4(Attention):
                 torch.tensor(
                     decode_cache_slots, device=decode_device, dtype=torch.long
                 ),
+                torch.tensor(decode_indices, device=decode_device, dtype=torch.long),
                 wo_a,
             )
             for row, output_index in enumerate(decode_indices):
@@ -788,6 +1046,7 @@ class AttentionDeepSeekV4(Attention):
         x: torch.Tensor,
         start_positions: torch.Tensor,
         cache_slots: torch.Tensor,
+        cache_seq_ids: torch.Tensor,
         wo_a: torch.Tensor,
     ):
         x = x.unsqueeze(1)
@@ -821,6 +1080,7 @@ class AttentionDeepSeekV4(Attention):
                             int(start_positions[row].item()),
                             offset,
                             int(cache_slots[row].item()),
+                            cache_seq_id=int(cache_seq_ids[row].item()),
                         )
                     )
                 compress_topk_idxs = pad_topk_idxs_v4(compress_topk_idxs)
@@ -831,24 +1091,32 @@ class AttentionDeepSeekV4(Attention):
             topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
         topk_idxs = topk_idxs.int()
 
-        self.kv_cache[cache_slots, start_positions % win] = kv.squeeze(1)
+        self._write_sliding_cache(cache_seq_ids, start_positions, kv.squeeze(1))
         if ratio:
             for row in range(bsz):
                 self.compressor(
                     x[row : row + 1],
                     int(start_positions[row].item()),
                     int(cache_slots[row].item()),
+                    cache_seq_id=int(cache_seq_ids[row].item()),
                 )
-        if self._uses_skew_kv_cache() and ratio:
-            attn_kv = torch.cat(
-                [
-                    self.kv_cache[cache_slots, :win],
-                    self.compressor.kv_cache[cache_slots],
-                ],
-                dim=1,
-            )
+        if self._uses_skew_kv_cache():
+            if ratio:
+                attn_kv = torch.cat(
+                    [
+                        self.kv_cache[cache_slots, :win],
+                        self.compressor.kv_cache[cache_slots],
+                    ],
+                    dim=1,
+                )
+            else:
+                attn_kv = self.kv_cache[cache_slots]
         else:
-            attn_kv = self.kv_cache[cache_slots]
+            attn_kv = self._materialize_decode_attn_kv(
+                cache_slots,
+                cache_seq_ids,
+                start_positions,
+            )
         o = self.attn_backend.sparse_attn(
             q,
             attn_kv,
@@ -867,6 +1135,7 @@ class AttentionDeepSeekV4(Attention):
         x: torch.Tensor,
         start_pos: int,
         cache_slot: int,
+        cache_seq_id: int,
         wo_a: torch.Tensor,
     ):
         x = x.unsqueeze(0)
@@ -881,7 +1150,7 @@ class AttentionDeepSeekV4(Attention):
                 self.indexer.freqs_cis = self.freqs_cis
         cache_slice = slice(cache_slot, cache_slot + bsz)
         if start_pos == 0 and ratio:
-            if self._uses_skew_kv_cache():
+            if self._uses_skew_kv_cache() or self._uses_paged_kv_cache():
                 self.compressor.kv_state[cache_slice].zero_()
                 self.compressor.score_state[cache_slice].fill_(float("-inf"))
                 if self.indexer is not None:
@@ -890,7 +1159,7 @@ class AttentionDeepSeekV4(Attention):
                         float("-inf")
                     )
             else:
-                raise NotImplementedError("DeepSeek-V4 non-skew KV cache is not wired")
+                raise NotImplementedError("DeepSeek-V4 KV cache is not wired")
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
@@ -902,7 +1171,14 @@ class AttentionDeepSeekV4(Attention):
         if ratio:
             offset = kv.size(1) if start_pos == 0 else win
             if self.indexer is not None:
-                compress_topk_idxs = self.indexer(x, qr, start_pos, offset, cache_slot)
+                compress_topk_idxs = self.indexer(
+                    x,
+                    qr,
+                    start_pos,
+                    offset,
+                    cache_slot,
+                    cache_seq_id=cache_seq_id,
+                )
             else:
                 compress_topk_idxs = get_compress_topk_idxs_v4(
                     ratio, seqlen, start_pos, offset, x.device
@@ -911,17 +1187,23 @@ class AttentionDeepSeekV4(Attention):
         topk_idxs = topk_idxs.int()
 
         if start_pos == 0:
-            if seqlen <= win:
-                self.kv_cache[cache_slice, :seqlen] = kv
-            else:
-                cutoff = seqlen % win
-                (
-                    self.kv_cache[cache_slice, cutoff:win],
-                    self.kv_cache[cache_slice, :cutoff],
-                ) = kv[:, -win:].split([win - cutoff, cutoff], dim=1)
+            kept = min(seqlen, win)
+            sliding_positions = torch.arange(seqlen - kept, seqlen, device=x.device)
+            self._write_sliding_cache(
+                torch.tensor([cache_seq_id], device=x.device, dtype=torch.long),
+                sliding_positions.unsqueeze(0),
+                kv[:, -kept:],
+            )
             if (
                 ratio
-                and (kv_compress := self.compressor(x, start_pos, cache_slot))
+                and (
+                    kv_compress := self.compressor(
+                        x,
+                        start_pos,
+                        cache_slot,
+                        cache_seq_id=cache_seq_id,
+                    )
+                )
                 is not None
             ):
                 kv = torch.cat([kv, kv_compress], dim=1)
@@ -930,19 +1212,44 @@ class AttentionDeepSeekV4(Attention):
             )
         else:
             assert seqlen == 1, "DeepSeek-V4 chunked prefill is not implemented yet"
-            self.kv_cache[cache_slice, start_pos % win] = kv.squeeze(1)
+            self._write_sliding_cache(
+                torch.tensor([cache_seq_id], device=x.device, dtype=torch.long),
+                torch.tensor([start_pos], device=x.device, dtype=torch.long),
+                kv.squeeze(1),
+            )
             if ratio:
-                self.compressor(x, start_pos, cache_slot)
-            if self._uses_skew_kv_cache() and ratio:
-                attn_kv = torch.cat(
-                    [
-                        self.kv_cache[cache_slice, :win],
-                        self.compressor.kv_cache[cache_slice],
-                    ],
-                    dim=1,
+                self.compressor(
+                    x,
+                    start_pos,
+                    cache_slot,
+                    cache_seq_id=cache_seq_id,
                 )
+            cache_slots_tensor = torch.tensor(
+                [cache_slot], device=x.device, dtype=torch.long
+            )
+            cache_seq_ids_tensor = torch.tensor(
+                [cache_seq_id], device=x.device, dtype=torch.long
+            )
+            start_positions = torch.tensor(
+                [start_pos], device=x.device, dtype=torch.long
+            )
+            if self._uses_skew_kv_cache():
+                if ratio:
+                    attn_kv = torch.cat(
+                        [
+                            self.kv_cache[cache_slice, :win],
+                            self.compressor.kv_cache[cache_slice],
+                        ],
+                        dim=1,
+                    )
+                else:
+                    attn_kv = self.kv_cache[cache_slice]
             else:
-                attn_kv = self.kv_cache[cache_slice]
+                attn_kv = self._materialize_decode_attn_kv(
+                    cache_slots_tensor,
+                    cache_seq_ids_tensor,
+                    start_positions,
+                )
             o = self.attn_backend.sparse_attn(
                 q,
                 attn_kv,
@@ -1312,10 +1619,18 @@ class TransformerBlockDeepSeekV4(TransformerBlock):
         )
         compress_ratio = int(args.compress_ratios[layer_id])
         if compress_ratio:
-            main_cache = cache_dict.get(f"main_compressed_{compress_ratio}")
+            main_cache = cache_dict.get(
+                _main_cache_name_for_compress_ratio_deepseek_v4(compress_ratio)
+            )
+            if main_cache is None:
+                main_cache = cache_dict.get(f"main_compressed_{compress_ratio}")
             if main_cache is None:
                 main_cache = cache_dict["main"]
-            compressed_cache = cache_dict.get(f"compressed_{compress_ratio}")
+            compressed_cache = cache_dict.get(
+                _compressed_cache_name_deepseek_v4(compress_ratio)
+            )
+            if compressed_cache is None:
+                compressed_cache = cache_dict.get(f"compressed_{compress_ratio}")
             if compressed_cache is None:
                 compressed_cache = cache_dict["compressed"]
         else:

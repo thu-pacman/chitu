@@ -1,5 +1,7 @@
 import pytest
 from chitu.kv_cache import (
+    DeepSeekV4CompressedKVCacheManager,
+    DeepSeekV4SlidingKVCacheManager,
     PagedKVCacheManager,
     TokenBlock,
     BlockIdentityChainBuilder,
@@ -69,6 +71,96 @@ class TestPagedKVCacheManager:
         assert len(cache_manager.active_blocks) == 0
         assert len(cache_manager.cached_idle_blocks) == 0
         assert cache_manager.enable_prefix_caching is False
+
+    def test_deepseek_v4_sliding_manager_uses_window_length(self):
+        manager = DeepSeekV4SlidingKVCacheManager(
+            num_blocks=4,
+            num_hot_req=2,
+            max_seq_len=4096,
+            window_size=384,
+            dp_rank=0,
+            block_size=384,
+            enable_prefix_caching=False,
+        )
+
+        assert manager.max_blocks_per_req == 1
+        assert manager.max_num_blocks == 2
+        assert manager.num_blocks == 2
+        assert manager.num_blocks_for_seq_len(0) == 0
+        assert manager.num_blocks_for_seq_len(1) == 1
+        assert manager.num_blocks_for_seq_len(128) == 1
+        assert manager.num_blocks_for_seq_len(129) == 1
+        assert manager.num_blocks_for_seq_len(384) == 1
+        assert manager.num_blocks_for_seq_len(4096) == 1
+
+        manager.realloc(100)
+        assert manager.num_blocks == 2
+
+    def test_deepseek_v4_sliding_manager_allocates_one_metadata_block(self):
+        manager = DeepSeekV4SlidingKVCacheManager(
+            num_blocks=2,
+            num_hot_req=2,
+            max_seq_len=4096,
+            window_size=384,
+            dp_rank=0,
+            block_size=384,
+            enable_prefix_caching=False,
+        )
+        req = UserRequest.create_mock(
+            input_len=4096, request_id="req", enable_thinking=False
+        )
+        task = Task(task_id=req.request_id, req=req)
+
+        new_cache_ids = manager.prepare_metadata_before_prefill(task)
+
+        assert len(new_cache_ids) == 1
+        assert len(manager.task_to_cache_ids[task.task_id]) == 1
+        assert len(manager.task_to_token_blocks[task.task_id]) == 1
+
+    def test_deepseek_v4_compressed_manager_uses_compressed_length(self):
+        manager = DeepSeekV4CompressedKVCacheManager(
+            num_blocks=8,
+            num_hot_req=2,
+            max_seq_len=4096,
+            compress_ratio=4,
+            dp_rank=0,
+            block_size=128,
+            enable_prefix_caching=False,
+        )
+
+        assert manager.max_blocks_per_req == 8
+        assert manager.max_num_blocks == 16
+        assert manager.num_blocks_for_seq_len(0) == 0
+        assert manager.num_blocks_for_seq_len(3) == 0
+        assert manager.num_blocks_for_seq_len(4) == 1
+        assert manager.num_blocks_for_seq_len(512) == 1
+        assert manager.num_blocks_for_seq_len(516) == 2
+        assert manager.num_blocks_for_seq_len(4096) == 8
+
+        manager.realloc(100)
+        assert manager.num_blocks == 16
+
+    def test_deepseek_v4_compressed_manager_allocates_compressed_metadata_blocks(self):
+        manager = DeepSeekV4CompressedKVCacheManager(
+            num_blocks=8,
+            num_hot_req=2,
+            max_seq_len=4096,
+            compress_ratio=4,
+            dp_rank=0,
+            block_size=128,
+            enable_prefix_caching=False,
+        )
+        req = UserRequest.create_mock(
+            input_len=516, request_id="req", enable_thinking=False
+        )
+        task = Task(task_id=req.request_id, req=req)
+
+        new_cache_ids = manager.prepare_metadata_before_prefill(task)
+
+        assert len(new_cache_ids) == 2
+        assert len(manager.task_to_cache_ids[task.task_id]) == 2
+        assert len(manager.task_to_token_blocks[task.task_id]) == 2
+        assert len(manager.task_to_token_blocks[task.task_id]) < ceil_div(516, 128)
 
     def test_realloc(self):
         """测试重新分配block数量"""

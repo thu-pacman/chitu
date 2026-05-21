@@ -512,7 +512,9 @@ class ChatFormatHF:
             return tokens
 
 
-from chitu.encoding_dsv32 import encode_messages
+from chitu.encoding_dsv32 import encode_messages as encode_messages_dsv32
+from chitu.encoding_dsv4 import encode_messages as encode_messages_dsv4
+from chitu.reasoning import get_reasoning_params
 
 
 class ChatFormatHF_dsv32(ChatFormatHF):
@@ -528,12 +530,38 @@ class ChatFormatHF_dsv32(ChatFormatHF):
         if tools:
             messages = [dict(role="system", tools=tools), *messages]
         enable_thinking = chat_template_kwargs.get("enable_thinking", True)
+        enable_thinking = get_reasoning_params(enable_thinking).enable_reasoning
         thinking_mode = "thinking" if enable_thinking else "chat"
         drop_thinking = messages[-1]["role"] == "user"
-        prompt = encode_messages(
+        prompt = encode_messages_dsv32(
             messages=messages,
             thinking_mode=thinking_mode,
             drop_thinking=drop_thinking,
+        )
+        return self.tokenizer.encode(prompt, bos=False, eos=False)
+
+
+class ChatFormatHF_dsv4(ChatFormatHF):
+    def __init__(self, tokenizer: TokenizerHF, processor: Processor):
+        super().__init__(tokenizer, processor)
+
+    def encode_dialog_prompt(
+        self,
+        messages: Dialog,
+        chat_template_kwargs: Mapping[str, Any] = {},
+    ):
+        tools = chat_template_kwargs.get("tools", None)
+        if tools:
+            messages = [dict(role="system", tools=tools), *messages]
+        enable_thinking = chat_template_kwargs.get("enable_thinking", True)
+        enable_thinking = get_reasoning_params(enable_thinking).enable_reasoning
+        thinking_mode = "thinking" if enable_thinking else "chat"
+        drop_thinking = messages[-1]["role"] == "user"
+        prompt = encode_messages_dsv4(
+            messages=messages,
+            thinking_mode=thinking_mode,
+            drop_thinking=drop_thinking,
+            reasoning_effort=chat_template_kwargs.get("reasoning_effort", None),
         )
         return self.tokenizer.encode(prompt, bos=False, eos=False)
 
