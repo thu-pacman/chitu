@@ -43,6 +43,7 @@ from chitu.serve.common import (
 from chitu.serve.router import start_dp_components
 from chitu.tool_call import adjust_message_for_tool_calls
 from chitu.serve import openai_api, anthropic_api, responses_api
+from chitu.serve.middleware import RejectOverloadMiddleware
 
 logger = getLogger(__name__)
 
@@ -52,33 +53,7 @@ _uvicorn_server: Optional["uvicorn.Server"] = None
 # Create FastAPI app
 app = FastAPI()  # Unified API
 
-# Inference endpoint prefixes that are subject to overload rejection
-_INFERENCE_PATH_PREFIXES = (
-    "/v1/chat/completions",
-    "/v1/completions",
-    "/v1/messages",
-    "/v1/responses",
-)
-
-
-@app.middleware("http")
-async def reject_overload(request: Request, call_next):
-    if request.url.path.startswith(_INFERENCE_PATH_PREFIXES):
-        args = get_global_args()
-        max_total = getattr(args.infer, "max_concurrent_requests", None)
-        if max_total is not None:
-            current = len(TaskPool.pool) + len(TaskPool.pending_queue)
-            if current >= max_total:
-                logger.warning(
-                    f"Overloaded: {current} requests in flight (limit {max_total}), rejecting"
-                )
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": {"message": "Server overloaded", "type": "overloaded"}
-                    },
-                )
-    return await call_next(request)
+app.add_middleware(RejectOverloadMiddleware)
 
 
 server_status = False

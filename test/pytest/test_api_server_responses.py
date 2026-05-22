@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 import chitu.serve.api_server as api_server
 import chitu.serve.common as serve_common
+import chitu.serve.middleware as serve_middleware
 import chitu.serve.responses_api as responses_api
 from chitu.tool_call import ChoiceDelta
 
@@ -56,7 +57,7 @@ class DummyToolParser:
 def create_client(monkeypatch):
     monkeypatch.setattr(api_server, "server_status", True)
     monkeypatch.setattr(
-        api_server,
+        serve_middleware,
         "get_global_args",
         lambda: SimpleNamespace(
             infer=SimpleNamespace(max_concurrent_requests=None),
