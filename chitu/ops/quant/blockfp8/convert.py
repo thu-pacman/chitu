@@ -198,6 +198,7 @@ def silu_and_mul_and_blockfp8_act_quant(
     x: torch.Tensor,
     *,
     expert_n_tokens: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[float] = None,
     block_size: int = 128,
     round_scale_to_pow2: bool = False,
     eps: float = 1e-4,

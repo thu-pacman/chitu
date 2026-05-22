@@ -123,6 +123,7 @@ def _(
     return silu_and_mul_and_blockfp8_act_quant_triton(
         x.kwargs["x"],
         expert_n_tokens=x.kwargs["expert_n_tokens"],
+        swiglu_limit=x.kwargs["swiglu_limit"],
         block_size=block_size,
         round_scale_to_pow2=round_scale_to_pow2,
         eps=eps,
@@ -216,6 +217,7 @@ def silu_and_mul_and_blockfp8_act_quant_triton(
     x: torch.Tensor,
     *,
     expert_n_tokens: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[float] = None,
     block_size: int = 128,
     round_scale_to_pow2: bool = False,
     eps: float = 1e-4,
@@ -237,6 +239,7 @@ def silu_and_mul_and_blockfp8_act_quant_triton(
             output_scale,
             block_size,
             expert_n_tokens,
+            swiglu_limit=swiglu_limit,
             scale_ue8m0=round_scale_to_pow2,
             eps=eps,
         )
@@ -271,6 +274,8 @@ def silu_and_mul_and_blockfp8_act_quant_triton(
         SCALE_IS_UE8M0=round_scale_to_pow2,
         EPS=eps,
         INDEX_DTYPE=INDEX_DTYPE,
+        HAS_SWIGLU_LIMIT=swiglu_limit is not None,
+        SWIGLU_LIMIT=float(swiglu_limit) if swiglu_limit is not None else 0.0,
     )
     return y, s
 
@@ -285,6 +290,8 @@ def silu_and_mul_and_blockfp8_act_quant_kernel(
     SCALE_IS_UE8M0: tl.constexpr,
     EPS: tl.constexpr,
     INDEX_DTYPE: tl.constexpr,
+    HAS_SWIGLU_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     dim_id = pid // (HIDDEN_DIM // BLOCK_SIZE)
@@ -304,9 +311,13 @@ def silu_and_mul_and_blockfp8_act_quant_kernel(
     x2 = tl.load(x_ptr + x2_offs).to(tl.float32)
 
     x1_fp32 = x1.to(tl.float32)
+    x2_fp32 = x2.to(tl.float32)
+    if HAS_SWIGLU_LIMIT:
+        x1_fp32 = tl.minimum(x1_fp32, SWIGLU_LIMIT)
+        x2_fp32 = tl.minimum(tl.maximum(x2_fp32, -SWIGLU_LIMIT), SWIGLU_LIMIT)
     silu_x1_fp32 = x1_fp32 / (1 + tl.exp(-1 * x1_fp32))
     silu_x1 = silu_x1_fp32.to(x1.dtype)
-    x = silu_x1 * x2
+    x = silu_x1 * x2_fp32.to(x2.dtype)
 
     s = tl.maximum(tl.max(tl.abs(x)), EPS)
     if SCALE_IS_UE8M0:
@@ -349,6 +360,8 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask_kernel(
     NUM_STAGE: tl.constexpr,
     SCALE_UE8M0: tl.constexpr,
     EPS: tl.constexpr,
+    HAS_SWIGLU_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -384,10 +397,13 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask_kernel(
             input_ptr_offs + token_index * stride_input_1 + size_n,
             mask=offs_in_d < size_n,
             other=0.0,
-        )
+        ).to(tl.float32)
+        if HAS_SWIGLU_LIMIT:
+            gate = tl.minimum(gate, SWIGLU_LIMIT)
+            up = tl.minimum(tl.maximum(up, -SWIGLU_LIMIT), SWIGLU_LIMIT)
         gate = gate / (1 + tl.exp(-gate))
         gate = gate.to(input_ptr.dtype.element_ty)
-        gate_up = up * gate
+        gate_up = up.to(input_ptr.dtype.element_ty) * gate
         _absmax = tl.maximum(tl.max(tl.abs(gate_up)), EPS)
         output_s = _absmax / fp8_max
         if SCALE_UE8M0:
@@ -425,6 +441,7 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
     output_scale: torch.Tensor,
     quant_group_size: int,
     masked_m: torch.Tensor,
+    swiglu_limit: Optional[float] = None,
     scale_ue8m0: bool = False,
     eps: float = 1e-4,
 ):
@@ -485,6 +502,8 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
         num_warps=num_warps,
         SCALE_UE8M0=scale_ue8m0,
         EPS=eps,
+        HAS_SWIGLU_LIMIT=swiglu_limit is not None,
+        SWIGLU_LIMIT=float(swiglu_limit) if swiglu_limit is not None else 0.0,
     )
 
 

@@ -520,6 +520,7 @@ def triton_batched_experts(
     hidden_states: PerExpertDenseBatchedRoutedActivationMinimal,
     w1: torch.Tensor,
     w2: torch.Tensor,
+    swiglu_limit: Optional[float] = None,
 ) -> PerExpertDenseBatchedExpertResultMinimal:
     """
     Simplified version of batched fused experts only support bfloat16 inputs and parameters
@@ -566,6 +567,7 @@ def triton_batched_experts(
     intermediate_cache2 = silu_and_mul(
         intermediate_cache1,
         expert_n_tokens=hidden_states.n_tokens_per_expert,
+        swiglu_limit=swiglu_limit,
         impl="triton",
     ).evaluate()
 
@@ -592,6 +594,7 @@ def triton_batched_experts_ref(
     hidden_states: PerExpertDenseBatchedRoutedActivationMinimal,
     w1: torch.Tensor,
     w2: torch.Tensor,
+    swiglu_limit: Optional[float] = None,
 ) -> PerExpertDenseBatchedExpertResultMinimal:
     assert (
         hidden_states.activation_per_expert.dim() == 3
@@ -618,7 +621,11 @@ def triton_batched_experts_ref(
             ],
             w1[i].T,
         )
-    intermediate_output2 = silu_and_mul(intermediate_output1.view(-1, N), impl="torch")
+    intermediate_output2 = silu_and_mul(
+        intermediate_output1.view(-1, N),
+        swiglu_limit=swiglu_limit,
+        impl="torch",
+    )
     intermediate_output2 = intermediate_output2.view(E, M, N // 2)
     for i in range(E):
         output[i][: hidden_states.n_tokens_per_expert[i]] = torch.matmul(

@@ -4,7 +4,7 @@
 
 import math
 from functools import lru_cache
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 import torch
 from torch import nn
@@ -24,7 +24,9 @@ from chitu.models.model import (
 )
 from chitu.models.registry import ModelType, register_model
 from chitu.ops import (
+    add_shared_experts,
     apply_rotary_pos_emb_partial,
+    silu_and_mul,
     moe_gate,
     moe_hash_gate,
     append_to_sliding_window_paged_kv_cache,
@@ -35,9 +37,17 @@ from chitu.ops.quant import (
     blockfp8_weight_dequant,
     soft_fp8_blockfp8_weight_dequant,
 )
-from chitu.quantization import NormalLinear, Blockfp8Linear, QuantizedMoeExpertsBase
+from chitu.quantization import (
+    NormalLinear,
+    Blockfp8Linear,
+    QuantizationRegistry,
+    QuantizedMoeExpertsBase,
+    get_quant_from_checkpoint_prefix,
+)
 from chitu.tensor_parallel import ColumnParallelLinear, LocalLinear, RowParallelLinear
-from chitu.distributed.parallel_state import get_tp_group, get_tp_size
+from chitu.distributed.parallel_state import get_tp_group, get_tp_size, get_etp_size
+from chitu.distributed.partition import compute_expert_dist_in_ep
+from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 
 FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 FE8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
@@ -1285,31 +1295,47 @@ class MLPDeepSeekV4(nn.Module):
             raise ValueError(
                 f"Invalid role: {role}. Expected 'standalone' or 'shared_experts'."
             )
-        if merge_gate_up:
-            raise NotImplementedError("DeepSeek-V4 SwiGLU clamp requires split gate/up")
+        if merge_gate_up is None:
+            merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
+                checkpoint_prefix
+            )
+        self.merge_gate_up = merge_gate_up
         self.swiglu_limit = getattr(args, "swiglu_limit", 0.0)
-        self.gate_proj = ColumnParallelLinear(
-            args.dim,
-            inter_dim,
-            has_bias=False,
-            gather_output=False,
-            base_linear_class=get_linear_layout_contig_y(
-                op_impl,
+        if self.merge_gate_up:
+            self.gate_up_proj = ColumnParallelLinear(
+                args.dim,
+                inter_dim * 2,
+                has_bias=False,
+                gather_output=False,
+                base_linear_class=get_linear_layout_contig_y(
+                    op_impl,
+                    checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
+                ),
+                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
+            )
+        else:
+            self.gate_proj = ColumnParallelLinear(
+                args.dim,
+                inter_dim,
+                has_bias=False,
+                gather_output=False,
+                base_linear_class=get_linear_layout_contig_y(
+                    op_impl,
+                    checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
+                ),
                 checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
-            ),
-            checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
-        )
-        self.up_proj = ColumnParallelLinear(
-            args.dim,
-            inter_dim,
-            has_bias=False,
-            gather_output=False,
-            base_linear_class=get_linear_layout_contig_y(
-                op_impl,
+            )
+            self.up_proj = ColumnParallelLinear(
+                args.dim,
+                inter_dim,
+                has_bias=False,
+                gather_output=False,
+                base_linear_class=get_linear_layout_contig_y(
+                    op_impl,
+                    checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
+                ),
                 checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
-            ),
-            checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
-        )
+            )
         self.down_proj = RowParallelLinear(
             inter_dim,
             args.dim,
@@ -1324,6 +1350,11 @@ class MLPDeepSeekV4(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.merge_gate_up:
+            gate_up = self.gate_up_proj(x)
+            swiglu_limit = self.swiglu_limit if self.swiglu_limit > 0 else None
+            return self.down_proj(silu_and_mul(gate_up, swiglu_limit=swiglu_limit))
+
         dtype = x.dtype
         gate = self.gate_proj(x).float()
         up = self.up_proj(x).float()
@@ -1334,7 +1365,14 @@ class MLPDeepSeekV4(nn.Module):
 
 
 class GateDeepSeekV4(MoeGate):
-    def __init__(self, layer_id: int, args, op_impl: str = "torch"):
+    def __init__(
+        self,
+        layer_id: int,
+        args,
+        op_impl: str = "torch",
+        n_fused_shared_experts: int = 0,
+        runtime_context: Optional["DeepSeekV4RuntimeContext"] = None,
+    ):
         super().__init__(
             op_impl=op_impl,
             dim=args.dim,
@@ -1348,10 +1386,11 @@ class GateDeepSeekV4(MoeGate):
             bias=None,
             e_score_correction_bias=None,
             norm_prob=args.score_func != "softmax",
-            n_fused_shared_experts=0,
+            n_fused_shared_experts=n_fused_shared_experts,
             _debug_force_moe_balance=False,
         )
         self.hash = layer_id < args.n_hash_layers
+        self.runtime_context = runtime_context
         self.weight.requires_grad_(False)
         if self.hash:
             self.tid2eid = nn.Parameter(
@@ -1368,7 +1407,25 @@ class GateDeepSeekV4(MoeGate):
                 requires_grad=False,
             )
 
-    def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor]):
+    def _finalize_routing(
+        self, x: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
+    ):
+        weights = (weights * self.route_scale).type_as(x)
+        indices = indices.to(torch.int32)
+        if self.n_fused_shared_experts > 0:
+            weights, indices = add_shared_experts(
+                weights,
+                indices,
+                self.n_experts,
+                self.n_fused_shared_experts,
+            )
+        return weights, indices
+
+    def forward(self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
+        if input_ids is None and self.runtime_context is not None:
+            input_ids = self.runtime_context.input_ids
+        if input_ids is not None:
+            input_ids = input_ids.flatten()
         if self.hash and input_ids is None:
             raise RuntimeError("DeepSeek-V4 hash gate requires input_ids")
 
@@ -1381,7 +1438,7 @@ class GateDeepSeekV4(MoeGate):
                 self.topk,
                 score_func=self.score_func,
             )
-            return weights * self.route_scale, indices.long()
+            return self._finalize_routing(x, weights, indices)
 
         scores = F.linear(x.float(), self.weight.float())
         if not self.hash:
@@ -1395,7 +1452,7 @@ class GateDeepSeekV4(MoeGate):
                 score_func=self.score_func,
                 norm_prob=self.score_func != "softmax",
             )
-            return weights * self.route_scale, indices.long()
+            return self._finalize_routing(x, weights, indices)
 
         if self.score_func == "softmax":
             scores = scores.softmax(dim=-1)
@@ -1409,63 +1466,42 @@ class GateDeepSeekV4(MoeGate):
         weights = original_scores.gather(1, indices)
         if self.score_func != "softmax":
             weights = weights / weights.sum(dim=-1, keepdim=True)
-        return weights * self.route_scale, indices
+        return self._finalize_routing(x, weights, indices)
 
 
-class MoeExpertsDeepSeekV4(QuantizedMoeExpertsBase):
-    def __init__(
-        self,
-        args,
-        experts_start_idx: int,
-        experts_end_idx: int,
-        *,
-        checkpoint_prefix: str,
-        op_impl: str,
-    ):
-        super().__init__(
-            dim=args.dim,
-            moe_inter_dim=args.moe_inter_dim,
-            global_n_experts=args.n_routed_experts,
-            experts_start_idx=experts_start_idx,
-            experts_end_idx=experts_end_idx,
-            n_activated_experts=args.n_activated_experts,
-            checkpoint_prefix=checkpoint_prefix,
-        )
-        for i in range(self.global_n_experts):
-            expert = (
-                MLPDeepSeekV4(
-                    args,
-                    role="shared_experts",
-                    op_impl=op_impl,
-                    checkpoint_prefix=f"{checkpoint_prefix}.{i}",
-                    merge_gate_up=False,
-                )
-                if self.experts_start_idx <= i < self.experts_end_idx
-                else None
+def MoeExpertsDeepSeekV4(
+    args,
+    global_n_experts: int,
+    experts_start_idx: int,
+    experts_end_idx: int,
+    *,
+    checkpoint_prefix: str,
+    base_moe_experts_class: Optional[type] = None,
+    quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+) -> QuantizedMoeExpertsBase:
+    merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(checkpoint_prefix)
+    if base_moe_experts_class is None:
+        base_moe_experts_class = (
+            QuantizationRegistry.get_quantized_moe_experts_class_from_global_args(
+                merge_gate_up=merge_gate_up,
+                quant_kwargs=quant_kwargs,
+                checkpoint_prefix=checkpoint_prefix,
             )
-            self.add_module(str(i), expert)
+        )
 
-    def __getitem__(self, expert_id: int) -> Optional[MLPDeepSeekV4]:
-        return self._modules[str(expert_id)]
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        indices: torch.Tensor,
-        weights: torch.Tensor,
-    ) -> torch.Tensor:
-        y = torch.zeros_like(x, dtype=torch.float32)
-        counts = torch.bincount(
-            indices.flatten(), minlength=self.global_n_experts
-        ).tolist()
-        for i in range(self.experts_start_idx, self.experts_end_idx):
-            if counts[i] == 0:
-                continue
-            idx, top = torch.where(indices == i)
-            expert = self[i]
-            assert expert is not None
-            y[idx] += weights[idx, top, None] * expert(x[idx])
-        return y
+    assert args.moe_inter_dim % get_etp_size() == 0
+    experts = base_moe_experts_class(
+        dim=args.dim,
+        moe_inter_dim=args.moe_inter_dim // get_etp_size(),
+        global_n_experts=global_n_experts,
+        experts_start_idx=experts_start_idx,
+        experts_end_idx=experts_end_idx,
+        n_activated_experts=args.n_activated_experts,
+        checkpoint_prefix=checkpoint_prefix,
+    )
+    swiglu_limit = getattr(args, "swiglu_limit", 0.0)
+    experts.swiglu_limit = swiglu_limit if swiglu_limit > 0 else None
+    return experts
 
 
 class ParallelMoeBlockDeepSeekV4(ParallelMoeBlock):
@@ -1474,53 +1510,63 @@ class ParallelMoeBlockDeepSeekV4(ParallelMoeBlock):
         layer_id: int,
         args,
         op_impl: str,
+        base_moe_experts_class: Optional[type] = None,
+        quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+        moe_impl: Optional[MoEImplBase] = None,
         *,
         checkpoint_prefix: str,
         runtime_context,
     ):
-        if int(getattr(get_global_args().infer, "ep_size", 1)) != 1:
-            raise NotImplementedError(
-                "DeepSeek-V4 MoE currently supports TP-sharded experts only and "
-                "does not support EP"
-            )
-        experts_start_idx = 0
-        experts_end_idx = args.n_routed_experts
+        if moe_impl is None:
+            moe_impl = get_moe_impl()
+
         assert args.n_shared_experts == 1
-        super().__init__(
-            gate=GateDeepSeekV4(layer_id, args, op_impl=op_impl),
-            experts=MoeExpertsDeepSeekV4(
-                args,
-                experts_start_idx,
-                experts_end_idx,
-                checkpoint_prefix=f"{checkpoint_prefix}.experts",
-                op_impl=op_impl,
-            ),
-            non_fused_shared_experts=MLPDeepSeekV4(
+        if not get_global_args().infer.fuse_shared_experts:
+            merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
+                checkpoint_prefix
+            )
+            non_fused_shared_experts = MLPDeepSeekV4(
                 args,
                 role="shared_experts",
                 op_impl=op_impl,
                 checkpoint_prefix=f"{checkpoint_prefix}.shared_experts",
-                merge_gate_up=False,
-            ),
-            layer_id=layer_id,
-            checkpoint_prefix=checkpoint_prefix,
-            enable_dynamic_load_balance=False,
-        )
-        self.dim = args.dim
-        self.runtime_context = runtime_context
+                merge_gate_up=merge_gate_up,
+            )
+            n_fused_shared_experts = 0
+        else:
+            non_fused_shared_experts = None
+            n_fused_shared_experts = args.n_shared_experts
 
-    def forward(self, x: torch.Tensor):
-        shape = x.size()
-        x = x.view(-1, self.dim)
-        input_ids = self.runtime_context.input_ids
-        gate_input_ids = input_ids.flatten() if input_ids is not None else None
-        weights, indices = self.gate(x, gate_input_ids)
-        y = self.experts(x, indices, weights)
-        if self.shared_experts is not None:
-            y = y + self.shared_experts(x)
-        if get_tp_size() > 1:
-            _all_reduce_tp(y)
-        return y.type_as(x).view(shape)
+        if isinstance(moe_impl, MoEImplEP):
+            num_local_slots = moe_impl.load_balancer[layer_id].get_num_local_slots()
+            experts_start_idx = moe_impl.ep_group.rank_in_group * num_local_slots
+            experts_end_idx = experts_start_idx + num_local_slots
+        else:
+            experts_start_idx = 0
+            experts_end_idx = args.n_routed_experts + n_fused_shared_experts
+
+        super().__init__(
+            gate=GateDeepSeekV4(
+                layer_id,
+                args,
+                op_impl=op_impl,
+                n_fused_shared_experts=n_fused_shared_experts,
+                runtime_context=runtime_context,
+            ),
+            experts=MoeExpertsDeepSeekV4(
+                args,
+                args.n_routed_experts,
+                experts_start_idx,
+                experts_end_idx,
+                checkpoint_prefix=f"{checkpoint_prefix}.experts",
+                base_moe_experts_class=base_moe_experts_class,
+                quant_kwargs=quant_kwargs,
+            ),
+            non_fused_shared_experts=non_fused_shared_experts,
+            layer_id=layer_id,
+            moe_impl=moe_impl,
+            checkpoint_prefix=checkpoint_prefix,
+        )
 
 
 class mHCSubLayer(nn.Module):
@@ -1753,6 +1799,7 @@ class TransformerDeepSeekV4(Transformer):
             "weights_proj",
             "gate_proj",
             "up_proj",
+            "gate_up_proj",
         ]
 
     def _get_tensor_row_parallel_layer_names(self) -> list[str]:
@@ -1790,6 +1837,131 @@ class TransformerDeepSeekV4(Transformer):
 
     def _get_layer_mtp_prefix_mapping(self, i: int):
         raise NotImplementedError
+
+    def process_state_dict_for_merging_gate_up(self, checkpoint: dict[str, Any]):
+        return self.process_state_dict_for_merging_tensors(
+            checkpoint,
+            tgt_layer="gate_up_proj",
+            src_layers=["gate_proj", "up_proj"],
+            enable_callback=QuantizationRegistry.allowed_merge_gate_up,
+        )
+
+    def process_state_dict_for_fusing_shared_experts(
+        self, checkpoint: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not get_global_args().infer.fuse_shared_experts:
+            return checkpoint
+
+        assert self.params.n_shared_experts == 1
+        shared_expert_id = self.params.n_routed_experts
+        for k in list(checkpoint.keys()):
+            if ".ffn.shared_experts." not in k:
+                continue
+            new_key = k.replace(
+                ".ffn.shared_experts.",
+                f".ffn.experts.{shared_expert_id}.",
+                1,
+            )
+            assert new_key not in checkpoint
+            checkpoint[new_key] = checkpoint.pop(k)
+        return checkpoint
+
+    def _chunk_checkpoint_for_expert_parallel(
+        self, checkpoint: dict[str, Any], rank: int, ep_size: int
+    ):
+        n_dense_layers = int(getattr(self.params, "n_dense_layers", 0))
+        local_experts = compute_expert_dist_in_ep(
+            self.global_n_layers - n_dense_layers,
+            self.moe_impl,
+        )[rank]
+
+        for key in list(checkpoint.keys()):
+            parts = key.split(".")
+            if len(parts) < 5 or parts[0] != "layers" or parts[2] != "ffn":
+                continue
+            layer_id = int(parts[1])
+            moe_layer_id = layer_id - n_dense_layers
+            if moe_layer_id < 0 or moe_layer_id >= len(local_experts):
+                continue
+            if parts[3] == "experts" and all(
+                f"{layer_id}.ffn.experts.{expert_id}." not in key
+                for expert_id in local_experts[moe_layer_id]
+            ):
+                checkpoint.pop(key, None)
+
+        return checkpoint
+
+    def process_state_dict_for_merging_experts(self, checkpoint: dict[str, Any]):
+        n_dense_layers = int(getattr(self.params, "n_dense_layers", 0))
+        local_experts = compute_expert_dist_in_ep(
+            self.global_n_layers - n_dense_layers,
+            self.moe_impl,
+        )[self.ep_group.rank_in_group]
+        checkpoint_keys = list(checkpoint.keys())
+        tensor_names_by_quant: dict[Any, list[str]] = {}
+        merged: set[tuple[int, str, str]] = set()
+
+        for k in checkpoint_keys:
+            parts = k.split(".")
+            if (
+                len(parts) < 7
+                or parts[0] != "layers"
+                or parts[2] != "ffn"
+                or parts[3] != "experts"
+            ):
+                continue
+            try:
+                expert_id = int(parts[4])
+            except ValueError:
+                continue
+
+            weight_name, tensor_name = parts[-2], parts[-1]
+            if weight_name not in (
+                "gate_proj",
+                "up_proj",
+                "gate_up_proj",
+                "down_proj",
+            ):
+                continue
+
+            quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            if quant not in tensor_names_by_quant:
+                tensor_names_by_quant[quant] = (
+                    self._get_2d_out_x_in_tensor_names(quant)
+                    + self._get_2d_in_x_out_tensor_names(quant)
+                    + self._get_1d_in_tensor_names(quant)
+                    + self._get_1d_out_tensor_names(quant)
+                )
+            if tensor_name not in tensor_names_by_quant[quant]:
+                continue
+
+            layer_id = int(parts[1])
+            global_layer_id = layer_id + self.local_begin_layer_id
+            moe_layer_id = global_layer_id - n_dense_layers
+            if moe_layer_id < 0 or moe_layer_id >= len(local_experts):
+                continue
+            if expert_id not in local_experts[moe_layer_id]:
+                continue
+            merge_key = (layer_id, weight_name, tensor_name)
+            if merge_key in merged:
+                continue
+
+            prefix = f"layers.{layer_id}.ffn"
+            keys = [
+                f"{prefix}.experts.{i}.{weight_name}.{tensor_name}"
+                for i in local_experts[moe_layer_id]
+            ]
+            if not all(key in checkpoint for key in keys):
+                continue
+
+            checkpoint[f"{prefix}.experts.{weight_name}_{tensor_name}"] = torch.stack(
+                [checkpoint[key] for key in keys], dim=0
+            )
+            for key in set(keys):
+                checkpoint.pop(key)
+            merged.add(merge_key)
+
+        return checkpoint
 
     def _init_pre_layers(self):
         self.embed = ParallelEmbeddingDeepSeekV4(
@@ -1893,6 +2065,11 @@ class TransformerDeepSeekV4(Transformer):
         if skip_preprocess:
             return self.preprocess_state_dict(state_dict, skip_preprocess=True)
         state_dict = self._normalize_hf_state_dict_keys(state_dict)
+        state_dict = self.process_state_dict_for_fusing_shared_experts(state_dict)
+        if self.ep_size > 1:
+            state_dict = self._chunk_checkpoint_for_expert_parallel(
+                state_dict, self.ep_group.rank_in_group, self.ep_size
+            )
         if self.pp_size > 1:
             state_dict = self._chunk_checkpoint_for_pipeline_parallel(
                 state_dict, self.global_n_layers, self.pp_stage, self.pp_size
@@ -1905,6 +2082,8 @@ class TransformerDeepSeekV4(Transformer):
                 self.tp_size,
                 self.etp_size,
             )
+        state_dict = self.process_state_dict_for_merging_gate_up(state_dict)
+        state_dict = self.process_state_dict_for_merging_experts(state_dict)
         return self.preprocess_state_dict(state_dict, skip_preprocess=True)
 
     def _normalize_hf_state_dict_keys(

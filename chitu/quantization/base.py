@@ -60,6 +60,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         experts_end_idx: int,  # fused shared experts included
         n_activated_experts: int,
         checkpoint_prefix: str,
+        swiglu_limit: Optional[float] = None,
     ):
         super().__init__()
 
@@ -70,6 +71,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         self.experts_end_idx = experts_end_idx
         self.n_activated_experts = n_activated_experts
         self.checkpoint_prefix = checkpoint_prefix
+        self.swiglu_limit = swiglu_limit
 
         self.group_size = self.experts_end_idx - self.experts_start_idx
 
@@ -163,6 +165,9 @@ class QuantizedMoeExpertsUnmerged(QuantizedMoeExpertsBase):
         this method if you only do fused forward for all experts altogether.
         """
 
+        if self.swiglu_limit is not None:
+            gate_out = torch.clamp(gate_out, max=self.swiglu_limit)
+            up_out = torch.clamp(up_out, min=-self.swiglu_limit, max=self.swiglu_limit)
         return torch.nn.functional.silu(gate_out) * up_out
 
     def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
@@ -330,7 +335,7 @@ class QuantizedMoeExpertsMerged(QuantizedMoeExpertsBase):
         this method if you only do fused forward for all experts altogether.
         """
 
-        return silu_and_mul(gate_up_out)
+        return silu_and_mul(gate_up_out, swiglu_limit=self.swiglu_limit)
 
     def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
         """

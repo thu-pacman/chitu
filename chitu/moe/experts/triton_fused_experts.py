@@ -547,6 +547,7 @@ def fused_experts_key(
     w2: torch.Tensor,
     *,
     activation: str = "silu",
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ):
@@ -562,6 +563,7 @@ def fused_experts_config_candidates(
     w2: torch.Tensor,
     *,
     activation: str = "silu",
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ):
@@ -581,6 +583,7 @@ def fused_experts(
     w2: torch.Tensor,
     *,
     activation: str = "silu",
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
     config: Optional[dict[str, Any]] = None,
@@ -638,7 +641,9 @@ def fused_experts(
         compute_type,
     )
     if activation == "silu":
-        intermediate_cache2 = silu_and_mul(intermediate_cache1.view(-1, N))
+        intermediate_cache2 = silu_and_mul(
+            intermediate_cache1.view(-1, N), swiglu_limit=swiglu_limit
+        )
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
     fused_moe_kernel_wrapper(
@@ -669,6 +674,7 @@ def fused_experts_int8_key(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     use_int8_w8a8: bool = False,
+    swiglu_limit: Optional[float] = None,
     experts_start_idx: int = 0,
 ):
     M = int(hidden_states.activation.shape[0])
@@ -688,6 +694,7 @@ def fused_experts_int8_config_candidates(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     use_int8_w8a8: bool = False,
+    swiglu_limit: Optional[float] = None,
     experts_start_idx: int = 0,
 ):
     M = int(hidden_states.activation.shape[0])
@@ -711,6 +718,7 @@ def fused_experts_int8(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     use_int8_w8a8: bool = False,
+    swiglu_limit: Optional[float] = None,
     experts_start_idx: int = 0,
     config: Optional[dict[str, Any]] = None,
 ) -> PerTokenBatchedExpertResult:
@@ -780,7 +788,9 @@ def fused_experts_int8(
     )
 
     if activation == "silu":
-        intermediate_cache2 = silu_and_mul(intermediate_cache1.view(-1, N))
+        intermediate_cache2 = silu_and_mul(
+            intermediate_cache1.view(-1, N), swiglu_limit=swiglu_limit
+        )
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
@@ -819,6 +829,7 @@ def fused_experts_fp8_key(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ):
@@ -845,6 +856,7 @@ def fused_experts_fp8_config_candidates(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ):
@@ -870,6 +882,7 @@ def fused_experts_fp8(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
     config: Optional[dict[str, Any]] = None,
@@ -953,7 +966,9 @@ def fused_experts_fp8(
     )
 
     if activation == "silu":
-        intermediate_cache2 = silu_and_mul(intermediate_cache1.view(-1, N))
+        intermediate_cache2 = silu_and_mul(
+            intermediate_cache1.view(-1, N), swiglu_limit=swiglu_limit
+        )
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
@@ -995,6 +1010,7 @@ def fused_experts_fp8_per_channel(
     activation: str = "silu",
     w1_scale: Optional[torch.Tensor] = None,
     w2_scale: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[float] = None,
     experts_start_idx: int = 0,
     config: Optional[dict[str, Any]] = _DEFAULT_MOE_CONFIG,
 ) -> PerTokenBatchedExpertResult:
@@ -1049,7 +1065,7 @@ def fused_experts_fp8_per_channel(
         per_channel_quant=True,
     )
 
-    if activation == "silu":
+    if activation == "silu" and swiglu_limit is None:
         # Fused silu_and_mul + per-token FP8 quant: one kernel instead of
         # two, plus skips materializing the (M*topk, N) bf16 intermediate.
         from chitu.ops.triton_ops.quant.fp8_per_token import silu_mul_quant_fp8
@@ -1057,6 +1073,11 @@ def fused_experts_fp8_per_channel(
         intermediate_cache2, a2_scale = silu_mul_quant_fp8(
             intermediate_cache1.view(-1, N)
         )
+    elif activation == "silu":
+        intermediate_cache2 = silu_and_mul(
+            intermediate_cache1.view(-1, N), swiglu_limit=swiglu_limit
+        )
+        intermediate_cache2, a2_scale = per_token_quant_fp8(intermediate_cache2)
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 
@@ -1096,6 +1117,7 @@ def fused_experts_soft_fp4_key(
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
 ):
     M = int(hidden_states.activation.shape[0])
     m_bucket = _bucket_m_for_autotune_key(M)
@@ -1123,6 +1145,7 @@ def fused_experts_soft_fp4_config_candidates(
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
 ):
     M = int(hidden_states.activation.shape[0])
     E = int(w1.shape[0])
@@ -1144,6 +1167,7 @@ def fused_experts_soft_fp4_default_config(
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
 ):
     # Keep historical behavior: when block shape is known, align tile K/N with it.
     if block_shape is not None:
@@ -1176,6 +1200,7 @@ def fused_experts_soft_fp4(
     soft_fp8: bool = False,
     experts_start_idx: int = 0,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     config: Optional[dict[str, Any]] = None,
 ) -> PerTokenBatchedExpertResult:
     n_local_experts = w1.shape[0]
@@ -1249,7 +1274,9 @@ def fused_experts_soft_fp4(
     )
 
     if activation == "silu":
-        intermediate_cache2 = silu_and_mul(intermediate_cache1.view(-1, N))
+        intermediate_cache2 = silu_and_mul(
+            intermediate_cache1.view(-1, N), swiglu_limit=swiglu_limit
+        )
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}")
 

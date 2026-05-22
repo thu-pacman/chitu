@@ -311,6 +311,7 @@ def fused_experts_no_sum_blockfp8_indexed(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ): ...
@@ -343,6 +344,7 @@ def fused_experts_sum_blockfp8_indexed(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ): ...
@@ -386,6 +388,7 @@ def _fused_experts_sum_blockfp8_indexed_any(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
     impl: str,
@@ -401,6 +404,7 @@ def _fused_experts_sum_blockfp8_indexed_any(
         block_shape=block_shape,
         soft_fp8=soft_fp8,
         round_scale_to_pow2=round_scale_to_pow2,
+        swiglu_limit=swiglu_limit,
         global_num_experts=global_num_experts,
         experts_start_idx=experts_start_idx,
     )
@@ -421,6 +425,7 @@ def fused_experts_no_sum_blockfp8_per_expert_dense(
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     experts_start_idx: int = 0,
 ): ...
 
@@ -453,6 +458,7 @@ def fused_experts_sum_blockfp8_per_expert_dense(
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     experts_start_idx: int = 0,
 ): ...
 
@@ -479,6 +485,7 @@ def _fused_experts_sum_blockfp8_per_expert_dense_deepgemm(
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     experts_start_idx: int = 0,
     impl: str,
 ):
@@ -492,6 +499,7 @@ def _fused_experts_sum_blockfp8_per_expert_dense_deepgemm(
         w2_scale=w2_scale,
         block_shape=block_shape,
         round_scale_to_pow2=round_scale_to_pow2,
+        swiglu_limit=swiglu_limit,
         experts_start_idx=experts_start_idx,
     )
     return _finalize_fused_experts_sum_output(
@@ -798,6 +806,7 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             block_shape=[self.block_size, self.block_size],
             round_scale_to_pow2=self.round_scale_to_pow2,
             soft_fp8=fused_soft_fp8,
+            swiglu_limit=self.swiglu_limit,
             global_num_experts=self.global_n_experts,
             experts_start_idx=self.experts_start_idx,
             impl=impl,
@@ -838,6 +847,7 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             w2_scale=down_proj_scale,
             block_shape=[self.block_size, self.block_size],
             round_scale_to_pow2=self.round_scale_to_pow2,
+            swiglu_limit=self.swiglu_limit,
             experts_start_idx=self.experts_start_idx,
             impl=impl,
         )
@@ -884,6 +894,7 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             block_shape=[self.block_size, self.block_size],
             round_scale_to_pow2=self.round_scale_to_pow2,
             soft_fp8=fused_soft_fp8,
+            swiglu_limit=self.swiglu_limit,
             global_num_experts=self.global_n_experts,
             experts_start_idx=self.experts_start_idx,
             impl=impl,
@@ -926,6 +937,7 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             w2_scale=down_proj_scale,
             block_shape=[self.block_size, self.block_size],
             round_scale_to_pow2=self.round_scale_to_pow2,
+            swiglu_limit=self.swiglu_limit,
             experts_start_idx=self.experts_start_idx,
             impl=impl,
         )

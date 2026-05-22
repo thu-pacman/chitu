@@ -12,11 +12,11 @@ from chitu.device_type import is_muxi
 
 
 @auto_retry_triton_compilation
-def silu_and_mul_triton(x):
+def silu_and_mul_triton(x, swiglu_limit=None):
     if isinstance(x, Vector):
         return Vector(
             list(x.plain_shape[:-1]) + [x.plain_shape[-1] // 2],
-            silu_and_mul_triton(x.layout_tensor),
+            silu_and_mul_triton(x.layout_tensor, swiglu_limit=swiglu_limit),
         )
 
     assert isinstance(x, torch.Tensor)
@@ -75,6 +75,8 @@ def silu_and_mul_triton(x):
         n_cols // 2,
         BLOCK_SIZE=BLOCK_SIZE,
         INDEX_DTYPE=INDEX_DTYPE,
+        HAS_SWIGLU_LIMIT=swiglu_limit is not None,
+        SWIGLU_LIMIT=float(swiglu_limit) if swiglu_limit is not None else 0.0,
     )
     return output
 
@@ -98,6 +100,8 @@ def silu_and_mul_kernel(
     output_n_cols,
     BLOCK_SIZE: tl.constexpr,
     INDEX_DTYPE: tl.constexpr,
+    HAS_SWIGLU_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
 ):
     row_idx = tl.program_id(0)
     row_start_ptr = x_ptr + tl.cast(row_idx, INDEX_DTYPE) * output_n_cols * 2
@@ -107,9 +111,13 @@ def silu_and_mul_kernel(
         row_start_ptr + output_n_cols + offsets, mask=(offsets < output_n_cols), other=0
     )
     part1_fp32 = part1.to(tl.float32)
+    part2_fp32 = part2.to(tl.float32)
+    if HAS_SWIGLU_LIMIT:
+        part1_fp32 = tl.minimum(part1_fp32, SWIGLU_LIMIT)
+        part2_fp32 = tl.minimum(tl.maximum(part2_fp32, -SWIGLU_LIMIT), SWIGLU_LIMIT)
     silu_part1_fp32 = part1_fp32 / (1 + tl.exp(-1 * part1_fp32))
     silu_part1 = silu_part1_fp32.to(part1.dtype)
-    result = silu_part1 * part2
+    result = silu_part1 * part2_fp32.to(part2.dtype)
     output = output_ptr + tl.cast(row_idx, INDEX_DTYPE) * output_n_cols + offsets
     tl.store(output, result, mask=(offsets < output_n_cols))
 
@@ -127,6 +135,8 @@ def silu_and_mul_with_expert_mask_kernel(
     stride_y1,
     BLOCK_N: tl.constexpr,
     NUM_STAGES: tl.constexpr,
+    HAS_SWIGLU_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
 ):
     # grid = (ceil_div(H, BLOCK_N), TOKEN_WORKERS_PER_EXPERT, E)
     pid_h = tl.program_id(0)
@@ -154,6 +164,9 @@ def silu_and_mul_with_expert_mask_kernel(
         # gate: x[..., :H], up: x[..., H:2H]
         gate = tl.load(x_eh + t * stride_x1, mask=h_mask, other=0).to(tl.float32)
         up = tl.load(x_eh + t * stride_x1 + H, mask=h_mask, other=0).to(tl.float32)
+        if HAS_SWIGLU_LIMIT:
+            gate = tl.minimum(gate, SWIGLU_LIMIT)
+            up = tl.minimum(tl.maximum(up, -SWIGLU_LIMIT), SWIGLU_LIMIT)
 
         # SiLU(gate) = gate * sigmoid(gate)
         sig = 1.0 / (1.0 + tl.exp(-gate))
@@ -166,6 +179,7 @@ def silu_and_mul_with_expert_mask_kernel(
 def silu_and_mul_triton_with_expert_mask(
     x: torch.Tensor,
     masked_m: torch.Tensor,
+    swiglu_limit=None,
 ) -> torch.Tensor:
     assert isinstance(x, torch.Tensor)
     assert x.is_contiguous(), "Input must be contiguous"
@@ -202,6 +216,8 @@ def silu_and_mul_triton_with_expert_mask(
         stride_y1=y.stride(1),
         BLOCK_N=BLOCK_N,
         NUM_STAGES=NUM_STAGES,
+        HAS_SWIGLU_LIMIT=swiglu_limit is not None,
+        SWIGLU_LIMIT=float(swiglu_limit) if swiglu_limit is not None else 0.0,
         num_warps=num_warps,
     )
     return y
