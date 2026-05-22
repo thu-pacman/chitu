@@ -42,6 +42,9 @@ class TypeDispatchArgumentGrammar(AbstractArgumentGrammar):
         self.default = default
 
     def build(self, arg_name: str, arg_schema: dict) -> TagFormat:
-        arg_type = arg_schema["type"]
-        template = self.mapping.get(arg_type, self.default)
+        arg_type = arg_schema.get("type", None)
+        if isinstance(arg_type, str) and arg_type in self.mapping:
+            template = self.mapping[arg_type]
+        else:
+            template = self.default
         return template.build(arg_name, arg_schema)
