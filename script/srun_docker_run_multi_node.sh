@@ -107,15 +107,6 @@ echo prepare torchrun on node $(hostname)
 echo SLURM_STEP_GPUS: $SLURM_STEP_GPUS
 echo CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES
 
-# 自动检测并配置 InfiniBand
-SCRIPT_DIR=$(dirname "$THIS_SCRIPT")
-if [ -f "$SCRIPT_DIR/detect_ib_config.sh" ]; then
-    source "$SCRIPT_DIR/detect_ib_config.sh"
-    auto_configure_ib
-else
-    echo "No detect_ib_config.sh found in $SCRIPT_DIR, skipping InfiniBand configuration"
-fi
-
 # 构建 IB 相关的环境变量参数
 IB_ENV_ARGS=()
 [ -n "$NCCL_IB_HCA" ] && IB_ENV_ARGS+=("-e" "NCCL_IB_HCA=$NCCL_IB_HCA")
@@ -124,6 +115,19 @@ IB_ENV_ARGS=()
 [ -n "$NCCL_SOCKET_IFNAME" ] && IB_ENV_ARGS+=("-e" "NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME")
 [ -n "$HCCL_SOCKET_IFNAME" ] && IB_ENV_ARGS+=("-e" "HCCL_SOCKET_IFNAME=$HCCL_SOCKET_IFNAME")
 [ -n "$NVSHMEM_IB_DEVICE" ] && IB_ENV_ARGS+=("-e" "NVSHMEM_IB_DEVICE=$NVSHMEM_IB_DEVICE")
+
+# If /dev/infiniband and/or /sbin/ibdev2netdev exist, mount them.
+IB_MOUNT_ARGS=()
+if [ -d "/dev/infiniband" ]; then
+    IB_MOUNT_ARGS+=("-v" "/dev/infiniband:/dev/infiniband")
+    echo "Adding /dev/infiniband to mounts" >&2
+fi
+if [ -f "/sbin/ibdev2netdev" ]; then
+    # NOTE: Although there is a `https://github.com/Mellanox/container_scripts/blob/master/ibdev2netdev`
+    # for container use, but it is too old. So we prefer the script installed on the host.
+    IB_MOUNT_ARGS+=("-v" "/sbin/ibdev2netdev:/sbin/ibdev2netdev")
+    echo "Adding /sbin/ibdev2netdev to mounts" >&2
+fi
 
 DOCKER_RUN_CMD="docker run --network host"
 if which nvidia-smi >/dev/null 2>&1; then
@@ -166,7 +170,7 @@ else
     exit -1
 fi
 
-FULL_CMD="${DOCKER_RUN_CMD} ${IB_ENV_ARGS[@]} ${DOCKER_ARGS[@]} torchrun \
+FULL_CMD="${DOCKER_RUN_CMD} ${IB_ENV_ARGS[@]} ${IB_MOUNT_ARGS[@]} ${DOCKER_ARGS[@]} torchrun \
     --nnodes $SLURM_NNODES \
     --nproc-per-node $NUM_GPUS \
     --master_addr $MASTER_ADDR \

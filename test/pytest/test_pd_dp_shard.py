@@ -6,6 +6,7 @@ from omegaconf import OmegaConf
 
 from chitu.backend import Backend
 from chitu.kv_cache import PagedKVCacheManager
+from chitu.distributed.infiniband import auto_set_ib_envs
 from chitu.distributed.parallel_state import initialize_parallel_groups
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 import chitu.global_vars as global_vars
@@ -25,6 +26,7 @@ def _maybe_init_dist():
     if os.environ.get("RANK") is None or os.environ.get("WORLD_SIZE") is None:
         return
     backend = "nccl" if torch.cuda.is_available() else "gloo"
+    auto_set_ib_envs()
     torch.distributed.init_process_group(backend=backend, init_method="env://")
 
 

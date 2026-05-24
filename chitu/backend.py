@@ -41,6 +41,7 @@ from chitu.distributed.parallel_state import (
     initialize_parallel_groups,
 )
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
+from chitu.distributed.infiniband import auto_set_ib_envs
 from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
 from chitu.quantization import (
@@ -242,6 +243,9 @@ class Backend:
         Arguments:
             args: Configuration object with distributed parameters
         """
+
+        auto_set_ib_envs()
+
         is_router_process = os.environ.get("CHITU_ROUTER_PROCESS", "0") == "1"
         if is_router_process:
             # Router process: as independent subprocess, skip CUDA device binding

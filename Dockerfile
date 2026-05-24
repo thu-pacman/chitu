@@ -67,7 +67,7 @@ ENV TORCH_CUDA_ARCH_LIST="${torch_cuda_arch_list}"
 
 RUN apt update -y && apt install -y \
     git gcc-11 g++-11 libnuma-dev build-essential cmake ninja-build \
-    libibverbs1 ibverbs-providers libibverbs-dev rdma-core curl
+    libibverbs1 ibverbs-providers libibverbs-dev rdma-core infiniband-diags curl
 
 # Backward compatibily of include path for software developed for CUDA 12
 RUN if python3 -c "import torch; print(int(torch.version.cuda.split('.')[0]) >= 13)" | grep -q "True"; then \
