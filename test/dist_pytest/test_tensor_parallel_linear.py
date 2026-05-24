@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from chitu.distributed.comm_group import CommGroup
+from chitu.distributed.infiniband import auto_set_ib_envs
 from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from chitu.quantization.normal import NormalLinear
 from chitu.testing import assert_close
@@ -17,6 +18,7 @@ def test_column_parallel_linear(
     tp_group_size, batch_size, in_features, out_features, has_bias, record_benchmark
 ):
     if not torch.distributed.is_initialized():
+        auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
     if tp_group_size > torch.distributed.get_world_size():
         pytest.skip(
@@ -89,6 +91,7 @@ def test_row_parallel_linear(
     tp_group_size, batch_size, in_features, out_features, has_bias, record_benchmark
 ):
     if not torch.distributed.is_initialized():
+        auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
     if tp_group_size > torch.distributed.get_world_size():
         pytest.skip(

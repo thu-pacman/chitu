@@ -89,12 +89,13 @@ def test_blockfp8_act_quant(
 @pytest.mark.parametrize("bs,dim", [[0, 256], [1, 256], [256, 256], [409472, 6144]])
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("swiglu_limit", [None, 10.0])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
 def test_silu_and_mul_and_blockfp8_act_quant(
-    bs, dim, block_size, dtype: torch.dtype, record_benchmark
+    bs, dim, block_size, dtype: torch.dtype, swiglu_limit, record_benchmark
 ):
     if (
         torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
@@ -110,13 +111,15 @@ def test_silu_and_mul_and_blockfp8_act_quant(
     a = torch.randn(bs, dim * 2, dtype=dtype, device="cuda")
 
     a_fp8, a_s = record_benchmark.run(
-        lambda: silu_and_mul_and_blockfp8_act_quant(a, block_size=block_size),
+        lambda: silu_and_mul_and_blockfp8_act_quant(
+            a, block_size=block_size, swiglu_limit=swiglu_limit
+        ),
         bs=bs,
         dim=dim,
         impl="fused",
     )
     a_fp8_ref, a_s_ref = blockfp8_act_quant(
-        eval_lazy(silu_and_mul(a)), block_size=block_size
+        eval_lazy(silu_and_mul(a, swiglu_limit=swiglu_limit)), block_size=block_size
     )
 
     assert_close(a_fp8.float(), a_fp8_ref.float(), atol=0.15, rtol=0.15)
@@ -128,12 +131,13 @@ def test_silu_and_mul_and_blockfp8_act_quant(
 @pytest.mark.parametrize("N", [1024])
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("swiglu_limit", [None, 10.0])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
 def test_silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
-    E, M, N, block_size, dtype: torch.dtype, record_benchmark
+    E, M, N, block_size, dtype: torch.dtype, swiglu_limit, record_benchmark
 ):
     set_global_args(
         OmegaConf.create({"infer": {"op_impl": "torch"}}), need_ensure=False
@@ -147,13 +151,18 @@ def test_silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
 
     a_fp8, a_s = record_benchmark.run(
         lambda: silu_and_mul_and_blockfp8_act_quant(
-            a, expert_n_tokens=expert_n_tokens, block_size=block_size
+            a,
+            expert_n_tokens=expert_n_tokens,
+            block_size=block_size,
+            swiglu_limit=swiglu_limit,
         ),
         N=N,
         impl="fused",
     )
     a_fp8_ref, a_s_ref = blockfp8_act_quant(
-        eval_lazy(silu_and_mul(a, expert_n_tokens=expert_n_tokens)),
+        eval_lazy(
+            silu_and_mul(a, expert_n_tokens=expert_n_tokens, swiglu_limit=swiglu_limit)
+        ),
         block_size=block_size,
     )
 

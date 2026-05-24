@@ -186,6 +186,7 @@ class Fp8PerChannelMoeExpertsMerged(QuantizedMoeExpertsMerged):
             activation="silu",
             w1_scale=self.gate_up_proj_weight_scale.squeeze(-1),  # (E, N, 1) -> (E, N)
             w2_scale=self.down_proj_weight_scale.squeeze(-1),  # (E, N, 1) -> (E, N)
+            swiglu_limit=self.swiglu_limit,
             experts_start_idx=self.experts_start_idx,
         )
 

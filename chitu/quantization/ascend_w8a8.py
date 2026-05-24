@@ -262,6 +262,7 @@ def fused_experts_no_sum_ascend_w8a8_indexed(
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
     use_int8_w8a8: bool = False,
+    swiglu_limit: Optional[float] = None,
 ): ...
 
 
@@ -290,6 +291,7 @@ def fused_experts_no_sum_ascend_w8a8_concat_permuted(
     w2_scale: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,
     use_int8_w8a8: bool = False,
+    swiglu_limit: Optional[float] = None,
 ): ...
 
 
@@ -391,6 +393,7 @@ class AscendW8A8DynamicMoeExperts(
             impl=impl,
             global_num_experts=self.global_n_experts,
             experts_start_idx=self.experts_start_idx,
+            swiglu_limit=self.swiglu_limit,
         )
 
     @override
@@ -423,6 +426,7 @@ class AscendW8A8DynamicMoeExperts(
             impl=impl,
             global_num_experts=self.global_n_experts,
             experts_start_idx=self.experts_start_idx,
+            swiglu_limit=self.swiglu_limit,
         )
 
     @forward_no_sum.register
@@ -441,6 +445,7 @@ class AscendW8A8DynamicMoeExperts(
             impl=impl,
             global_num_experts=self.global_n_experts,
             experts_start_idx=self.experts_start_idx,
+            swiglu_limit=self.swiglu_limit,
         )
 
     @forward.register
@@ -462,6 +467,7 @@ class AscendW8A8DynamicMoeExperts(
             impl=impl,
             global_num_experts=self.global_n_experts,
             experts_start_idx=self.experts_start_idx,
+            swiglu_limit=self.swiglu_limit,
         )
 
 
@@ -479,6 +485,7 @@ def fused_experts_sum_ascend_w8a8_indexed(
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
     use_int8_w8a8: bool = False,
+    swiglu_limit: Optional[float] = None,
 ): ...
 
 
@@ -502,6 +509,7 @@ def _run_sum_indexed_torch_npu(
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
     use_int8_w8a8: bool = False,
+    swiglu_limit: Optional[float] = None,
     impl: str,
 ):
     output = fused_experts_no_sum_ascend_w8a8_indexed(
@@ -514,6 +522,7 @@ def _run_sum_indexed_torch_npu(
         global_num_experts=global_num_experts,
         experts_start_idx=experts_start_idx,
         use_int8_w8a8=use_int8_w8a8,
+        swiglu_limit=swiglu_limit,
     )
     return _finalize_fused_experts_sum_output(
         output, hidden_states, topk_weights=topk_weights, inplace=inplace
@@ -533,6 +542,7 @@ def fused_experts_sum_ascend_w8a8_concat_permuted(
     w2_scale: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,
     use_int8_w8a8: bool = False,
+    swiglu_limit: Optional[float] = None,
 ): ...
 
 
@@ -555,6 +565,7 @@ def _run_sum_concat_torch_npu(
     w2_scale: Optional[torch.Tensor] = None,
     experts_start_idx: int = 0,
     use_int8_w8a8: bool = False,
+    swiglu_limit: Optional[float] = None,
     impl: str,
 ):
     output = fused_experts_no_sum_ascend_w8a8_concat_permuted(
@@ -566,6 +577,7 @@ def _run_sum_concat_torch_npu(
         w2_scale=w2_scale,
         experts_start_idx=experts_start_idx,
         use_int8_w8a8=use_int8_w8a8,
+        swiglu_limit=swiglu_limit,
     )
     return _finalize_fused_experts_sum_output(
         output, hidden_states, topk_weights=topk_weights, inplace=inplace

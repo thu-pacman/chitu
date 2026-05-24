@@ -143,6 +143,7 @@ def fused_experts_no_sum_normal_indexed(
     w2,
     *,
     activation: str = "silu",
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
     impl: str = "auto",
@@ -178,6 +179,7 @@ def fused_experts_sum_normal_indexed(
     inplace: bool = False,
     impl: str = "auto",
     activation: str = "silu",
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ): ...
@@ -202,6 +204,7 @@ def _fused_experts_sum_normal_indexed_any(
     *,
     inplace: bool = False,
     activation: str = "silu",
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
     impl: str,
@@ -212,6 +215,7 @@ def _fused_experts_sum_normal_indexed_any(
         w2,
         impl=impl,
         activation=activation,
+        swiglu_limit=swiglu_limit,
         global_num_experts=global_num_experts,
         experts_start_idx=experts_start_idx,
     )
@@ -222,7 +226,7 @@ def _fused_experts_sum_normal_indexed_any(
 
 @make_op_dispatcher
 def fused_experts_no_sum_normal_per_expert_dense(
-    hidden_states, w1, w2, *, impl: str = "auto"
+    hidden_states, w1, w2, *, swiglu_limit: Optional[float] = None, impl: str = "auto"
 ): ...
 
 
@@ -235,9 +239,11 @@ def _auto_fused_experts_no_sum_normal_per_expert_dense():
 
 @fused_experts_no_sum_normal_per_expert_dense.register("triton", available=has_triton)
 def _fused_experts_no_sum_normal_per_expert_dense_triton(
-    hidden_states, w1, w2, *, impl: str = "triton"
+    hidden_states, w1, w2, *, swiglu_limit: Optional[float] = None, impl: str = "triton"
 ):
-    return triton_batched_experts(hidden_states, w1=w1, w2=w2)
+    return triton_batched_experts(
+        hidden_states, w1=w1, w2=w2, swiglu_limit=swiglu_limit
+    )
 
 
 @make_op_dispatcher
@@ -248,6 +254,7 @@ def fused_experts_sum_normal_per_expert_dense(
     topk_weights: Optional[torch.Tensor],
     *,
     inplace: bool = False,
+    swiglu_limit: Optional[float] = None,
     impl: str = "auto",
 ): ...
 
@@ -267,10 +274,11 @@ def _fused_experts_sum_normal_per_expert_dense_triton(
     topk_weights: Optional[torch.Tensor],
     *,
     inplace: bool = False,
+    swiglu_limit: Optional[float] = None,
     impl: str,
 ):
     output = fused_experts_no_sum_normal_per_expert_dense(
-        hidden_states, w1, w2, impl=impl
+        hidden_states, w1, w2, swiglu_limit=swiglu_limit, impl=impl
     )
     return _finalize_fused_experts_sum_output(
         output, hidden_states, topk_weights=topk_weights, inplace=inplace
@@ -279,7 +287,13 @@ def _fused_experts_sum_normal_per_expert_dense_triton(
 
 @make_op_dispatcher
 def fused_experts_no_sum_normal_concat_permuted(
-    hidden_states, w1, w2, *, impl: str = "auto", experts_start_idx: int = 0
+    hidden_states,
+    w1,
+    w2,
+    *,
+    swiglu_limit: Optional[float] = None,
+    impl: str = "auto",
+    experts_start_idx: int = 0,
 ): ...
 
 
@@ -305,6 +319,7 @@ def fused_experts_sum_normal_concat_permuted(
     topk_weights: Optional[torch.Tensor],
     *,
     inplace: bool = False,
+    swiglu_limit: Optional[float] = None,
     impl: str = "auto",
     experts_start_idx: int = 0,
 ): ...
@@ -325,11 +340,17 @@ def _fused_experts_sum_normal_concat_permuted_torch_npu(
     topk_weights: Optional[torch.Tensor],
     *,
     inplace: bool = False,
+    swiglu_limit: Optional[float] = None,
     experts_start_idx: int = 0,
     impl: str,
 ):
     output = fused_experts_no_sum_normal_concat_permuted(
-        hidden_states, w1, w2, impl=impl, experts_start_idx=experts_start_idx
+        hidden_states,
+        w1,
+        w2,
+        swiglu_limit=swiglu_limit,
+        impl=impl,
+        experts_start_idx=experts_start_idx,
     )
     return _finalize_fused_experts_sum_output(
         output, hidden_states, topk_weights=topk_weights, inplace=inplace
@@ -465,6 +486,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
                 w1=self.gate_up_proj_weight,
                 w2=self.down_proj_weight,
                 impl=impl,
+                swiglu_limit=self.swiglu_limit,
                 global_num_experts=self.global_n_experts,
                 experts_start_idx=self.experts_start_idx,
             )
@@ -480,6 +502,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
                 w1=self.gate_up_proj_weight,
                 w2=self.down_proj_weight,
                 impl=impl,
+                swiglu_limit=self.swiglu_limit,
             )
         return super().forward_no_sum(routed_x, impl=impl)
 
@@ -494,6 +517,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
                 w1=self.gate_up_proj_weight,
                 w2=self.down_proj_weight,
                 impl=impl,
+                swiglu_limit=self.swiglu_limit,
                 experts_start_idx=self.experts_start_idx,
             )
         return super().forward_no_sum(routed_x, impl=impl)
@@ -525,6 +549,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
                 w2=self.down_proj_weight,
                 impl=impl,
                 inplace=inplace,
+                swiglu_limit=self.swiglu_limit,
                 global_num_experts=self.global_n_experts,
                 experts_start_idx=self.experts_start_idx,
             )
@@ -546,6 +571,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
                 w2=self.down_proj_weight,
                 impl=impl,
                 inplace=inplace,
+                swiglu_limit=self.swiglu_limit,
             )
         return super().forward(routed_x, weights, inplace=inplace, impl=impl)
 
@@ -565,6 +591,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
                 w2=self.down_proj_weight,
                 impl=impl,
                 inplace=inplace,
+                swiglu_limit=self.swiglu_limit,
                 experts_start_idx=self.experts_start_idx,
             )
         return super().forward(routed_x, weights, inplace=inplace, impl=impl)

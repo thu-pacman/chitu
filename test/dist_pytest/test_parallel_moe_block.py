@@ -15,6 +15,7 @@ from chitu.quantization import (
 )
 from chitu.quantization.blockfp8 import linear_blockfp8
 from chitu.distributed.comm_group import CommGroup
+from chitu.distributed.infiniband import auto_set_ib_envs
 from chitu.distributed.parallel_state import (
     get_tp_rank_lists,
     get_dp_rank_lists,
@@ -129,6 +130,7 @@ def test_parallel_moe_block(
 
     # Filter distributed settings
     if not torch.distributed.is_initialized():
+        auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
 
     assert tp_size * dp_size == etp_size * ep_size
@@ -536,6 +538,7 @@ def test_parallel_moe_block_blockfp8(
 
     # Filter distributed settings
     if not torch.distributed.is_initialized():
+        auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
 
     assert tp_size * dp_size == etp_size * ep_size

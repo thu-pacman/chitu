@@ -34,26 +34,40 @@ if has_triton_impl:
 logger = getLogger(__name__)
 
 
-def silu_and_mul_torch(x: torch.Tensor):
+def silu_and_mul_torch(x: torch.Tensor, swiglu_limit: Optional[float] = None):
     if isinstance(x, torch.Tensor):
         d = x.shape[-1] // 2
-        return torch.nn.functional.silu(x[..., :d]) * x[..., d:]
+        gate = x[..., :d]
+        up = x[..., d:]
+        if swiglu_limit is not None:
+            gate = torch.clamp(gate, max=swiglu_limit)
+            up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+        return torch.nn.functional.silu(gate) * up
 
     elif isinstance(x, Vector):
         d = x.plain_shape[-1] // 2
+        gate = x.layout_tensor[..., :d]
+        up = x.layout_tensor[..., d:]
+        if swiglu_limit is not None:
+            gate = torch.clamp(gate, max=swiglu_limit)
+            up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
         return Vector(
             list(x.plain_shape[:-1]) + [d],
-            torch.nn.functional.silu(x.layout_tensor[..., :d])
-            * x.layout_tensor[..., d:],
+            torch.nn.functional.silu(gate) * up,
         )
 
     elif isinstance(x, MuxiNativeLayoutActivation):
         assert x.plain_shape[-1] % 2 == 0
         assert x.layout_tensor.shape[0] % 2 == 0
         d = x.layout_tensor.shape[0] // 2
+        gate = x.layout_tensor[:d]
+        up = x.layout_tensor[d:]
+        if swiglu_limit is not None:
+            gate = torch.clamp(gate, max=swiglu_limit)
+            up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
         return MuxiNativeLayoutActivation(
             list(x.plain_shape[:-1]) + [x.plain_shape[-1] // 2],
-            torch.nn.functional.silu(x.layout_tensor[:d]) * x.layout_tensor[d:],
+            torch.nn.functional.silu(gate) * up,
         )
 
     else:
@@ -62,13 +76,15 @@ def silu_and_mul_torch(x: torch.Tensor):
         )
 
 
-def silu_and_mul_cpu(x: torch.Tensor):
+def silu_and_mul_cpu(x: torch.Tensor, swiglu_limit: Optional[float] = None):
     if x.shape[-1] % 2 != 0:
         raise ValueError(f"Last dimension must be even, got {x.shape[-1]}")
     if x.device.type != "cpu":
         raise ValueError(
             f"silu_and_mul input tensor must be on CPU, got device: {x.device}"
         )
+    if swiglu_limit is not None:
+        return silu_and_mul_torch(x, swiglu_limit=swiglu_limit)
 
     input_size = x.shape[-1]
     batch_size = x.numel() // input_size
@@ -93,13 +109,20 @@ def silu_and_mul_cpu(x: torch.Tensor):
 @make_lazy_op
 @make_op_dispatcher
 def silu_and_mul(
-    x: torch.Tensor, expert_n_tokens: Optional[torch.Tensor] = None, impl="auto"
+    x: torch.Tensor,
+    expert_n_tokens: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[float] = None,
+    impl="auto",
 ):
     raise NotImplementedError
 
 
 @silu_and_mul.register_auto
-def _auto_silu_and_mul(x: torch.Tensor, expert_n_tokens: Optional[torch.Tensor] = None):
+def _auto_silu_and_mul(
+    x: torch.Tensor,
+    expert_n_tokens: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[float] = None,
+):
     if isinstance(x, MuxiNativeLayoutActivation):
         return "torch"
     if has_torch_npu:
@@ -118,37 +141,48 @@ def _auto_silu_and_mul(x: torch.Tensor, expert_n_tokens: Optional[torch.Tensor] 
 
 
 @silu_and_mul.register("triton", available=has_triton_impl)
-def _silu_and_mul_triton(x, expert_n_tokens=None):
+def _silu_and_mul_triton(x, expert_n_tokens=None, swiglu_limit=None):
     if expert_n_tokens is not None:
-        return silu_and_mul_triton_with_expert_mask(x, expert_n_tokens)
-    return silu_and_mul_triton(x)
+        return silu_and_mul_triton_with_expert_mask(
+            x, expert_n_tokens, swiglu_limit=swiglu_limit
+        )
+    return silu_and_mul_triton(x, swiglu_limit=swiglu_limit)
 
 
 @silu_and_mul.register("torch_npu", available=has_torch_npu)
-def _silu_and_mul_npu(x, expert_n_tokens=None):
+def _silu_and_mul_npu(x, expert_n_tokens=None, swiglu_limit=None):
     if expert_n_tokens is not None:
         logger.warning_once(
             "silu_and_mul(impl=torch_npu) does not support expert_n_tokens, "
             "falling back to computing the whole tensor"
         )
+    if swiglu_limit is not None:
+        d = x.shape[-1] // 2
+        x = torch.cat(
+            [
+                torch.clamp(x[..., :d], max=swiglu_limit),
+                torch.clamp(x[..., d:], min=-swiglu_limit, max=swiglu_limit),
+            ],
+            dim=-1,
+        )
     return torch_npu.npu_swiglu(x)
 
 
 @silu_and_mul.register("cpu", available=has_cpuinfer)
-def _silu_and_mul_cpu_handler(x, expert_n_tokens=None):
+def _silu_and_mul_cpu_handler(x, expert_n_tokens=None, swiglu_limit=None):
     if expert_n_tokens is not None:
         logger.warning_once(
             "silu_and_mul(impl=cpu) does not support expert_n_tokens, "
             "falling back to computing the whole tensor"
         )
-    return silu_and_mul_cpu(x)
+    return silu_and_mul_cpu(x, swiglu_limit=swiglu_limit)
 
 
 @silu_and_mul.register("torch")
-def _silu_and_mul_torch_handler(x, expert_n_tokens=None):
+def _silu_and_mul_torch_handler(x, expert_n_tokens=None, swiglu_limit=None):
     if expert_n_tokens is not None:
         logger.warning_once(
             "silu_and_mul(impl=torch) does not support expert_n_tokens, "
             "falling back to computing the whole tensor"
         )
-    return silu_and_mul_torch(x)
+    return silu_and_mul_torch(x, swiglu_limit=swiglu_limit)

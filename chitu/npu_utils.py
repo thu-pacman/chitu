@@ -119,6 +119,7 @@ def fused_experts_npu_for_ep(
     w2_scale=None,
     experts_start_idx=0,
     use_int8_w8a8=False,
+    swiglu_limit=None,
 ) -> ConcatPermutedBatchedExpertResultMinimal:
     if isinstance(w1, torch.Tensor):
         w1 = w1.transpose(1, 2)
@@ -150,6 +151,11 @@ def fused_experts_npu_for_ep(
         output_dtype=(torch.int32 if use_int8_w8a8 else None),
     )[0]
 
+    if swiglu_limit is not None and use_int8_w8a8:
+        raise NotImplementedError(
+            "swiglu_limit is not implemented for Chitu's NPU int8 fused MoE wrapper"
+        )
+
     if use_int8_w8a8:
         w1_scale_fp32 = w1_scale.to(torch.float32).contiguous()
         hidden_states, gate_up_out_scale = torch_npu.npu_dequant_swiglu_quant(
@@ -166,6 +172,19 @@ def fused_experts_npu_for_ep(
             quant_mode=1,
         )
     else:
+        if swiglu_limit is not None:
+            d = hidden_states.shape[-1] // 2
+            hidden_states = torch.cat(
+                [
+                    torch.clamp(hidden_states[..., :d], max=swiglu_limit),
+                    torch.clamp(
+                        hidden_states[..., d:],
+                        min=-swiglu_limit,
+                        max=swiglu_limit,
+                    ),
+                ],
+                dim=-1,
+            )
         hidden_states = torch_npu.npu_swiglu(hidden_states)
 
     hidden_states = torch_npu.npu_grouped_matmul(
@@ -197,6 +216,7 @@ def fused_experts_no_sum_npu(
     global_num_experts: int,
     experts_start_idx: int = 0,
     use_int8_w8a8=False,
+    swiglu_limit=None,
 ) -> BatchedExpertResult:
     raise ValueError(f"Unsupported hidden_states type: {type(hidden_states)}")
 
@@ -213,6 +233,7 @@ def _(
     global_num_experts: int,
     experts_start_idx: int = 0,
     use_int8_w8a8=False,
+    swiglu_limit=None,
 ) -> BatchedExpertResult:
     assert activation == "silu"
     n_local_experts = w1.shape[0] if isinstance(w1, torch.Tensor) else w1.plain_shape[0]
@@ -230,6 +251,7 @@ def _(
         global_num_experts=global_num_experts,
         experts_start_idx=experts_start_idx,
         use_int8_w8a8=use_int8_w8a8,
+        swiglu_limit=swiglu_limit,
     )
     if hidden_states.expert_ids_are_local:
         expert_result.indices_maybe_invalid = False
@@ -248,6 +270,7 @@ def _(
     global_num_experts: int,
     experts_start_idx: int = 0,
     use_int8_w8a8=False,
+    swiglu_limit=None,
 ) -> ConcatPermutedBatchedExpertResult:
     # Check constraints.
     if not get_global_args().infer.npu_fusion_fp4 and not use_int8_w8a8:
@@ -312,6 +335,11 @@ def _(
             ),  # None means output dytpe same as input dtype
         )[0]
 
+    if swiglu_limit is not None and use_int8_w8a8:
+        raise NotImplementedError(
+            "swiglu_limit is not implemented for Chitu's NPU int8 fused MoE wrapper"
+        )
+
     if use_int8_w8a8:
         w1_scale_fp32 = w1_scale.to(torch.float32).contiguous()
         gate_up_out, gate_up_out_scale = torch_npu.npu_dequant_swiglu_quant(
@@ -326,6 +354,19 @@ def _(
             quant_mode=1,
         )
     else:
+        if swiglu_limit is not None:
+            d = gate_up_out.shape[-1] // 2
+            gate_up_out = torch.cat(
+                [
+                    torch.clamp(gate_up_out[..., :d], max=swiglu_limit),
+                    torch.clamp(
+                        gate_up_out[..., d:],
+                        min=-swiglu_limit,
+                        max=swiglu_limit,
+                    ),
+                ],
+                dim=-1,
+            )
         gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
     if get_global_args().infer.npu_fusion_fp4:

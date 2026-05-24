@@ -42,7 +42,7 @@ RUN if [ "${enable_test}" = "true" ]; then \
     apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping && \
     pip install pytest matplotlib; \
 fi
-RUN apt update -y && apt install -y curl
+RUN apt update -y && apt install -y infiniband-diags curl
 
 # Download prometheus
 # NOTE: Always download from Github, because docker on our platform does not support mounting secret

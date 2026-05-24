@@ -89,13 +89,6 @@ echo prepare torchrun on node $(hostname)
 echo SLURM_STEP_GPUS: $SLURM_STEP_GPUS
 echo CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES
 
-# 自动检测并配置 InfiniBand
-SCRIPT_DIR=$(dirname "$THIS_SCRIPT")
-if [ -f "$SCRIPT_DIR/detect_ib_config.sh" ]; then
-    source "$SCRIPT_DIR/detect_ib_config.sh"
-    auto_configure_ib
-fi
-
 # optimize nccl for multi-node
 export NCCL_GRAPH_MIXING_SUPPORT=0
 export NCCL_GRAPH_REGISTER=0

@@ -57,7 +57,7 @@ RUN printf '%s\n' \
 # NOTE: g++-11 a downgrading of g++, which is required by compiling muxi_layout_kernels. This is
 #       because mxcc can't compile C++20 when g++ is too new.
 RUN apt-get update; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g++-11 curl; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends g++-11 infiniband-diags curl; \
     rm -rf /var/lib/apt/lists/*
 
 # Download prometheus

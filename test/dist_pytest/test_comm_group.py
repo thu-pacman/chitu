@@ -3,10 +3,12 @@ import os
 import torch
 
 from chitu.distributed.comm_group import CommGroup
+from chitu.distributed.infiniband import auto_set_ib_envs
 
 
 def test_communicates():
     if not torch.distributed.is_initialized():
+        auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
     world_size = torch.distributed.get_world_size()
     global_rank = torch.distributed.get_rank()
@@ -28,6 +30,7 @@ def test_communicates():
 
 def test_is_orthogonal_to_1():
     if not torch.distributed.is_initialized():
+        auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
     world_size = torch.distributed.get_world_size()
     global_rank = torch.distributed.get_rank()
@@ -53,6 +56,7 @@ def test_is_orthogonal_to_1():
 
 def test_is_orthogonal_to_2():
     if not torch.distributed.is_initialized():
+        auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
     world_size = torch.distributed.get_world_size()
     global_rank = torch.distributed.get_rank()
@@ -80,6 +84,7 @@ def test_is_orthogonal_to_2():
 
 def test_cartesian_product_1():
     if not torch.distributed.is_initialized():
+        auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
     world_size = torch.distributed.get_world_size()
     global_rank = torch.distributed.get_rank()
@@ -102,6 +107,7 @@ def test_cartesian_product_1():
 
 def test_cartesian_product_2():
     if not torch.distributed.is_initialized():
+        auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
     world_size = torch.distributed.get_world_size()
     global_rank = torch.distributed.get_rank()

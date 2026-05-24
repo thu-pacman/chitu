@@ -107,15 +107,6 @@ echo prepare torchrun on node $(hostname)
 echo SLURM_STEP_GPUS: $SLURM_STEP_GPUS
 echo CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES
 
-# 自动检测并配置 InfiniBand
-SCRIPT_DIR=$(dirname "$THIS_SCRIPT")
-if [ -f "$SCRIPT_DIR/detect_ib_config.sh" ]; then
-    source "$SCRIPT_DIR/detect_ib_config.sh"
-    auto_configure_ib
-else
-    echo "No detect_ib_config.sh found in $SCRIPT_DIR, skipping InfiniBand configuration"
-fi
-
 # 构建 IB 相关的环境变量参数
 IB_ENV_ARGS=()
 [ -n "$NCCL_IB_HCA" ] && IB_ENV_ARGS+=("--env" "NCCL_IB_HCA=$NCCL_IB_HCA")
@@ -125,11 +116,17 @@ IB_ENV_ARGS=()
 [ -n "$HCCL_SOCKET_IFNAME" ] && IB_ENV_ARGS+=("--env" "HCCL_SOCKET_IFNAME=$HCCL_SOCKET_IFNAME")
 [ -n "$NVSHMEM_IB_DEVICE" ] && IB_ENV_ARGS+=("--env" "NVSHMEM_IB_DEVICE=$NVSHMEM_IB_DEVICE")
 
-# 检查是否需要挂载 /dev/infiniband
+# If /dev/infiniband and/or /sbin/ibdev2netdev exist, mount them.
 IB_MOUNT_ARGS=()
 if [ -d "/dev/infiniband" ]; then
     IB_MOUNT_ARGS+=("-B" "/dev/infiniband:/dev/infiniband")
     echo "Adding /dev/infiniband to mounts" >&2
+fi
+if [ -f "/sbin/ibdev2netdev" ]; then
+    # NOTE: Although there is a `https://github.com/Mellanox/container_scripts/blob/master/ibdev2netdev`
+    # for container use, but it is too old. So we prefer the script installed on the host.
+    IB_MOUNT_ARGS+=("-B" "/sbin/ibdev2netdev:/sbin/ibdev2netdev")
+    echo "Adding /sbin/ibdev2netdev to mounts" >&2
 fi
 
 apptainer run \

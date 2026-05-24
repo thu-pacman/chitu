@@ -42,6 +42,7 @@ def deepgemm_masked_fused_expert(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
     raise NotImplementedError(
@@ -60,6 +61,7 @@ def _(
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     experts_start_idx: int = 0,
 ) -> PerExpertDenseBatchedExpertResult:
     hidden_states = hidden_states.as_local_expert_ids(
@@ -91,6 +93,7 @@ def _(
             w2_scale=w2_scale,
             block_shape=block_shape,
             round_scale_to_pow2=round_scale_to_pow2,
+            swiglu_limit=swiglu_limit,
             experts_start_idx=experts_start_idx,
         )
 
@@ -104,6 +107,7 @@ def _(
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         block_shape=block_shape,
+        swiglu_limit=swiglu_limit,
         experts_start_idx=experts_start_idx,
     )
 
@@ -121,6 +125,7 @@ def _(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     experts_start_idx: int = 0,
 ) -> PerExpertDenseBatchedExpertResult:
     hidden_states = hidden_states.as_local_expert_ids(
@@ -141,6 +146,7 @@ def _(
         a2_scale=a2_scale,
         block_shape=block_shape,
         round_scale_to_pow2=round_scale_to_pow2,
+        swiglu_limit=swiglu_limit,
         experts_start_idx=experts_start_idx,
     )
 
@@ -155,6 +161,7 @@ def _(
     w2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     experts_start_idx: int = 0,
 ) -> PerExpertDenseBatchedExpertResultMinimal:
     # dtype check
@@ -201,7 +208,9 @@ def _(
 
         intermediate_cache2 = eval_lazy(
             silu_and_mul(
-                intermediate_cache1, expert_n_tokens=hidden_states.n_tokens_per_expert
+                intermediate_cache1,
+                expert_n_tokens=hidden_states.n_tokens_per_expert,
+                swiglu_limit=swiglu_limit,
             )
         )
         del intermediate_cache1
@@ -260,6 +269,7 @@ def _(
         qintermediate_cache2, a2q_scale = silu_and_mul_and_blockfp8_act_quant(
             intermediate_cache1,
             expert_n_tokens=hidden_states.n_tokens_per_expert,
+            swiglu_limit=swiglu_limit,
             block_size=block_shape[0],
             round_scale_to_pow2=round_scale_to_pow2,
         )

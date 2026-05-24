@@ -423,49 +423,6 @@ split_overrides_to_array() {
   for _x in "${_out[@]}"; do [ -n "${_x}" ] && printf '%s\n' "${_x}"; done
 }
 
-pd_configure_ib_env_from_detect_script() {
-  local script_dir="$1"
-  local ib_cards=""
-  local ib_iface=""
-
-  if [ ! -f "${script_dir}/detect_ib_config.sh" ]; then
-    echo "No detect_ib_config.sh found in ${script_dir}, skipping InfiniBand configuration" >&2
-    return 1
-  fi
-
-  source "${script_dir}/detect_ib_config.sh"
-
-  if declare -F detect_ib_cards >/dev/null; then
-    if ib_cards="$(detect_ib_cards)"; then
-      if [ -n "${ib_cards}" ]; then
-        export NCCL_IB_HCA="${ib_cards}"
-        export NVSHMEM_HCA_LIST="${ib_cards}"
-        echo "Detected IB cards: ${ib_cards}" >&2
-        echo "Set NCCL_IB_HCA=${ib_cards}" >&2
-        echo "Set NVSHMEM_HCA_LIST=${ib_cards}" >&2
-      fi
-    fi
-  fi
-
-  if declare -F detect_ib_network_interface >/dev/null; then
-    if ib_iface="$(detect_ib_network_interface)"; then
-      if [ -n "${ib_iface}" ]; then
-        export GLOO_SOCKET_IFNAME="${ib_iface}"
-        export NCCL_SOCKET_IFNAME="${ib_iface}"
-        export HCCL_SOCKET_IFNAME="${ib_iface}"
-        export NVSHMEM_IB_DEVICE="${ib_iface}"
-        echo "Detected IB network interface: ${ib_iface}" >&2
-        echo "Set GLOO_SOCKET_IFNAME=${ib_iface}" >&2
-        echo "Set NCCL_SOCKET_IFNAME=${ib_iface}" >&2
-        echo "Set HCCL_SOCKET_IFNAME=${ib_iface}" >&2
-        echo "Set NVSHMEM_IB_DEVICE=${ib_iface}" >&2
-      fi
-    fi
-  fi
-
-  return 0
-}
-
 pd_detect_mooncake_gpu_ib_map() {
   local active_cards="$1"
   local topo_output=""
@@ -621,9 +578,6 @@ pd_node_main() {
 
   local script_dir
   script_dir="$(dirname "${THIS_SCRIPT}")"
-  if ! pd_configure_ib_env_from_detect_script "${script_dir}"; then
-    echo "Proceeding without detected InfiniBand environment overrides" >&2
-  fi
 
   PD_ACTIVE_IB_CARDS="${NCCL_IB_HCA:-}"
   PD_GPU_IB_DEVICE_MAP=""

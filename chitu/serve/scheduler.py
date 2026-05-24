@@ -17,6 +17,7 @@ import torch.distributed
 from chitu.chitu_main import chitu_init, warmup_engine, start_enhanced_scheduler_service
 from chitu.serve.common import start_worker
 from chitu.task import TaskPool
+from chitu.distributed.infiniband import auto_set_ib_envs
 
 logger = getLogger(__name__)
 
@@ -32,6 +33,7 @@ def init_dp_scheduler(args, rank):
 
     # Initialize torch.distributed (if not already initialized)
     if not torch.distributed.is_initialized():
+        auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
 
     world_size = torch.distributed.get_world_size()

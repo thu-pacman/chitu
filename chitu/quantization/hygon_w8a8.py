@@ -443,6 +443,10 @@ class HygonW8A8AiterMoeExpertsMerged(
         routed_x: IndexedBatchedRoutedActivation,
         weights: torch.Tensor,
     ) -> torch.Tensor:
+        if self.swiglu_limit is not None:
+            raise NotImplementedError(
+                "swiglu_limit is not implemented for Chitu's Aiter W8A8 MoE wrapper"
+            )
         topk = weights.shape[1]
         if not (
             self.experts_start_idx == 0
@@ -698,7 +702,9 @@ class HygonW8A8DeepGemmMoeExpertsMerged(
             gate_up_out,
         )
 
-        intermediate = eval_lazy(silu_and_mul(gate_up_out))
+        intermediate = eval_lazy(
+            silu_and_mul(gate_up_out, swiglu_limit=self.swiglu_limit)
+        )
         q_intermediate, intermediate_scale = a8_per_token_act_quant(intermediate)
         down_weight = (
             self.get_native_layout_down_proj_weight().layout_tensor.contiguous()

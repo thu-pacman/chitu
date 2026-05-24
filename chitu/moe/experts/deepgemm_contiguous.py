@@ -39,6 +39,7 @@ def deepgemm_contiguous_fused_expert(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
@@ -56,6 +57,7 @@ def _(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
@@ -87,6 +89,7 @@ def _(
             w2_scale=w2_scale,
             block_shape=block_shape,
             round_scale_to_pow2=round_scale_to_pow2,
+            swiglu_limit=swiglu_limit,
             experts_start_idx=experts_start_idx,
         )
 
@@ -102,6 +105,7 @@ def _(
         w1=w1,
         w2=w2,
         activation=activation,
+        swiglu_limit=swiglu_limit,
         experts_start_idx=experts_start_idx,
     )
 
@@ -117,6 +121,7 @@ def _(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> ExpertBlockPermutedBatchedExpertResult:
@@ -154,7 +159,11 @@ def _(
     )
     del blocked_activation
 
-    intermediate_cache2 = silu_and_mul(x=intermediate_cache1.view(-1, N), impl="triton")
+    intermediate_cache2 = silu_and_mul(
+        x=intermediate_cache1.view(-1, N),
+        swiglu_limit=swiglu_limit,
+        impl="triton",
+    )
     del intermediate_cache1
     intermediate_cache2 = eval_lazy(intermediate_cache2)
 
@@ -184,6 +193,7 @@ def _(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
@@ -206,6 +216,7 @@ def _(
         w2_scale=w2_scale,
         block_shape=block_shape,
         round_scale_to_pow2=round_scale_to_pow2,
+        swiglu_limit=swiglu_limit,
         experts_start_idx=experts_start_idx,
     )
 
@@ -221,6 +232,7 @@ def _(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> ExpertBlockPermutedBatchedExpertResult:
@@ -277,7 +289,11 @@ def _(
     del blocked_activation
     del blocked_activation_scale
 
-    intermediate_cache2 = silu_and_mul(intermediate_cache1.view(-1, N), impl="triton")
+    intermediate_cache2 = silu_and_mul(
+        intermediate_cache1.view(-1, N),
+        swiglu_limit=swiglu_limit,
+        impl="triton",
+    )
     del intermediate_cache1
 
     qintermediate_cache2, a2q_scale = blockfp8_act_quant(
@@ -315,6 +331,7 @@ def _(
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
+    swiglu_limit: Optional[float] = None,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
@@ -358,6 +375,7 @@ def _(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             block_shape=block_shape,
+            swiglu_limit=swiglu_limit,
             experts_start_idx=experts_start_idx,
         )
     else:
@@ -371,5 +389,6 @@ def _(
             w1=w1,
             w2=w2,
             activation=activation,
+            swiglu_limit=swiglu_limit,
             experts_start_idx=experts_start_idx,
         )

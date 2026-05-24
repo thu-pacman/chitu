@@ -221,12 +221,18 @@ class TypeDispatchParser(AbstractParser):
 
     def parse(self, ctx, string):
         arg_type = ctx.get_arg_type()
-        parser = self.mapping.get(arg_type, self.default)
+        if isinstance(arg_type, str) and arg_type in self.mapping:
+            parser = self.mapping[arg_type]
+        else:
+            parser = self.default
         parser.parse(ctx, string)
 
     def stream_parse(self, ctx, stream):
         arg_type = ctx.get_arg_type()
-        parser = self.mapping.get(arg_type, self.default)
+        if isinstance(arg_type, str) and arg_type in self.mapping:
+            parser = self.mapping[arg_type]
+        else:
+            parser = self.default
         return parser.stream_parse(ctx, stream)
 
 
