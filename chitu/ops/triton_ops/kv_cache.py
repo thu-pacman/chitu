@@ -311,6 +311,102 @@ def append_to_paged_kv_cache_blockfp8_deepgemm_kernel(
     tl.store(k_scale_tar_ptr.to(tl.pointer_type(tl.float32)), k_scale_src)
 
 
+@auto_retry_triton_compilation
+def read_from_paged_kv_cache_triton(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_ids: torch.Tensor,
+    use_i64_offsets: bool = False,
+) -> torch.Tensor:
+
+    page_size = kv_cache.shape[1]
+    num_tokens = position_ids.shape[0]
+    _, num_pages_per_sample = page_table.shape
+    out_shape = (num_tokens, *kv_cache.shape[2:])
+
+    kv_cache = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], -1)
+    dim_size = kv_cache.shape[2]
+    out = torch.empty(
+        (num_tokens, dim_size), dtype=kv_cache.dtype, device=kv_cache.device
+    )
+
+    block_m = 8
+    block_d = triton.next_power_of_2(dim_size)
+
+    index_dtype = tl.int64 if use_i64_offsets else tl.int32
+    grid = (triton.cdiv(num_tokens, block_m), triton.cdiv(dim_size, block_d))
+    read_from_paged_kv_cache_kernel[grid](
+        kv_cache_ptr=kv_cache,
+        page_table_ptr=page_table,
+        position_ids_ptr=position_ids,
+        seq_ids_ptr=seq_ids,
+        out_ptr=out,
+        NUM_TOKENS=num_tokens,
+        NUM_PAGES_PER_SAMPLE=num_pages_per_sample,
+        PAGE_SIZE=page_size,
+        DIM_SIZE=dim_size,
+        KV_CACHE_STRIDE0=kv_cache.stride(0),
+        KV_CACHE_STRIDE1=kv_cache.stride(1),
+        OUT_STRIDE0=out.stride(0),
+        BLOCK_M=block_m,
+        BLOCK_D=block_d,
+        INDEX_DTYPE=index_dtype,
+        num_warps=4,
+    )
+    return out.view(out_shape)
+
+
+@triton.jit
+def read_from_paged_kv_cache_kernel(
+    kv_cache_ptr,
+    page_table_ptr,
+    position_ids_ptr,
+    seq_ids_ptr,
+    out_ptr,
+    NUM_TOKENS: tl.constexpr,
+    NUM_PAGES_PER_SAMPLE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DIM_SIZE: tl.constexpr,
+    KV_CACHE_STRIDE0: tl.constexpr,
+    KV_CACHE_STRIDE1: tl.constexpr,
+    OUT_STRIDE0: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    INDEX_DTYPE: tl.constexpr,
+):
+    token_block = tl.program_id(axis=0)
+    dim_block = tl.program_id(axis=1)
+
+    token_offsets = (token_block * BLOCK_M + tl.arange(0, BLOCK_M)).to(INDEX_DTYPE)
+    dim_offsets = (dim_block * BLOCK_D + tl.arange(0, BLOCK_D)).to(INDEX_DTYPE)
+
+    token_mask = token_offsets < NUM_TOKENS
+    positions = tl.load(position_ids_ptr + token_offsets, mask=token_mask, other=0).to(
+        INDEX_DTYPE
+    )
+    seqs = tl.load(seq_ids_ptr + token_offsets, mask=token_mask, other=0).to(
+        INDEX_DTYPE
+    )
+
+    page_table_offsets = seqs * NUM_PAGES_PER_SAMPLE + positions // PAGE_SIZE
+    page_ids = tl.load(
+        page_table_ptr + page_table_offsets, mask=token_mask, other=0
+    ).to(INDEX_DTYPE)
+
+    dim_mask = dim_offsets < DIM_SIZE
+    kv_offsets = (
+        page_ids[:, None] * KV_CACHE_STRIDE0
+        + (positions[:, None] % PAGE_SIZE) * KV_CACHE_STRIDE1
+        + dim_offsets[None, :]
+    )
+    out_offsets = token_offsets[:, None] * OUT_STRIDE0 + dim_offsets[None, :]
+    mask = token_mask[:, None] & dim_mask[None, :]
+
+    data = tl.load(kv_cache_ptr + kv_offsets, mask=mask, other=0.0)
+    tl.store(out_ptr + out_offsets, data, mask=mask)
+
+
 def read_from_paged_indexer_kv_cache_deepgemm_triton(
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
