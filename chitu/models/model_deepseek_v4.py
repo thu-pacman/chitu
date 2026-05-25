@@ -26,6 +26,7 @@ from chitu.models.registry import ModelType, register_model
 from chitu.ops import (
     add_shared_experts,
     apply_rotary_pos_emb_partial,
+    apply_rotary_pos_emb_single_partial,
     silu_and_mul,
     moe_gate,
     moe_hash_gate,
@@ -207,12 +208,6 @@ def apply_rotary_emb_v4(
     if rope_dim is None:
         rope_dim = q_for_rotary.shape[-1]
 
-    if k is None:
-        k_for_rotary = q_for_rotary[:, :0, :]
-    else:
-        k_for_rotary, k_bsz, k_seqlen = _flatten_rope_input_v4(k)
-        assert q_bsz == k_bsz and q_seqlen == k_seqlen
-
     batched_freqs_cis = _batched_freqs_cis_v4(
         freqs_cis,
         device=q.device,
@@ -220,6 +215,19 @@ def apply_rotary_emb_v4(
         seqlen=q_seqlen,
         inverse=inverse,
     )
+    if k is None:
+        q_out, _, _, _ = apply_rotary_pos_emb_single_partial(
+            q_for_rotary,
+            batched_freqs_cis,
+            rotary_begin=q_for_rotary.shape[-1] - rope_dim,
+            rotary_type="interleaved",
+            inplace=True,
+        )
+        return q_out.reshape_as(q)
+    else:
+        k_for_rotary, k_bsz, k_seqlen = _flatten_rope_input_v4(k)
+        assert q_bsz == k_bsz and q_seqlen == k_seqlen
+
     q_out, k_out, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
         q_for_rotary,
         k_for_rotary,
@@ -228,10 +236,8 @@ def apply_rotary_emb_v4(
         k_rotary_begin=k_for_rotary.shape[-1] - rope_dim,
         rotary_type="interleaved",
         inplace=True,
-        impl="auto" if k is not None else "torch",
+        impl="auto",
     )
-    if k is None:
-        return q_out.reshape_as(q)
     return q_out.reshape_as(q), k_out.reshape_as(k)
 
 

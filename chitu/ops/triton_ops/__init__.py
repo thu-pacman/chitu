@@ -2,7 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from chitu.ops.triton_ops.rotary import apply_rotary_pos_emb_triton
+from chitu.ops.triton_ops.rotary import (
+    apply_rotary_pos_emb_single_triton,
+    apply_rotary_pos_emb_triton,
+)
 from chitu.ops.triton_ops.activation import (
     silu_and_mul_triton,
     silu_and_mul_triton_with_expert_mask,

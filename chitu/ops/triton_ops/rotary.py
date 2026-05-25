@@ -12,6 +12,198 @@ from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
 
 
+def apply_rotary_pos_emb_single_triton(
+    x: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
+    out: Optional[torch.Tensor] = None,
+    rotary_type: str = "separated",
+) -> torch.Tensor:
+    if rotary_type == "interleaved" and not hasattr(tl, "interleave"):
+        raise RuntimeError(
+            "triton.language.interleave is not supported, please check triton version"
+        )
+
+    x_embed = apply_rotary_pos_emb_single_triton_out_of_place(x, freqs_cis, rotary_type)
+    if out is not None:
+        out.copy_(x_embed)
+    else:
+        out = x_embed
+    return out
+
+
+@auto_retry_triton_compilation
+def apply_rotary_pos_emb_single_triton_out_of_place(
+    x: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
+    rotary_type: str = "separated",
+    block_size=128,
+) -> torch.Tensor:
+    x_out = torch.empty_like(x)
+
+    if x.numel() == 0:
+        return x_out
+
+    x_shape = x.shape
+    if x.dim() == 4:
+        x = x.view(-1, x_shape[-2], x_shape[-1])
+        x_out = x_out.view(-1, x_shape[-2], x_shape[-1])
+    elif x.dim() == 3:
+        pass
+    elif x.dim() == 2:
+        x = x.view(-1, 1, x_shape[-1])
+        x_out = x_out.view(-1, 1, x_shape[-1])
+    else:
+        assert False
+
+    assert x.shape[-1] // 2 == freqs_cis.cos.shape[-1]
+    assert x.shape[-1] // 2 == freqs_cis.sin.shape[-1]
+
+    if rotary_type == "separated":
+        bs, head_num, rotary_dim = x.shape
+
+        assert freqs_cis.cos.is_contiguous()
+        assert freqs_cis.sin.is_contiguous()
+
+        grid = (bs, head_num, triton.cdiv(rotary_dim, block_size))
+        rotary_embedding_single_kernel_separated[grid](
+            x,
+            freqs_cis.cos,
+            freqs_cis.sin,
+            x_out,
+            head_num,
+            rotary_dim,
+            x.stride(0),
+            x.stride(1),
+            freqs_cis.cos.stride(0),
+            freqs_cis.sin.stride(0),
+            x_out.stride(0),
+            x_out.stride(1),
+            BLOCK_SIZE=block_size,
+        )
+
+    elif rotary_type == "interleaved":
+        bs, head_num, rotary_dim = x.shape
+
+        assert freqs_cis.cos.is_contiguous()
+        assert freqs_cis.sin.is_contiguous()
+
+        BLOCK_H = min(triton.cdiv(triton.next_power_of_2(bs), 128), head_num)
+        grid = (bs, triton.cdiv(head_num, BLOCK_H), 1)
+        rotary_embedding_single_kernel_interleaved[grid](
+            x,
+            x_out,
+            freqs_cis.cos,
+            freqs_cis.sin,
+            x.stride(0),
+            x.stride(1),
+            x_out.stride(0),
+            x_out.stride(1),
+            head_num,
+            rotary_dim,
+            BLOCK_H,
+        )
+
+    else:
+        raise NotImplementedError(
+            f"Unsupported rotary type: {rotary_type} for Triton implementation"
+        )
+
+    return x_out.view(x_shape)
+
+
+@triton.jit
+def rotary_embedding_single_kernel_separated(
+    X,
+    COS,
+    SIN,
+    X_OUTPUT,
+    head_num,
+    head_dim,
+    stride_x1,
+    stride_x2,
+    stride_cos1,
+    stride_sin1,
+    stride_x_out1,
+    stride_x_out2,
+    BLOCK_SIZE: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    block_id = tl.program_id(axis=2)
+
+    offsets_0 = block_id * (BLOCK_SIZE // 2) + tl.arange(0, BLOCK_SIZE // 2)
+    offsets_1 = offsets_0 + head_dim // 2
+
+    COS_ptr = COS + batch_idx * stride_cos1
+    SIN_ptr = SIN + batch_idx * stride_sin1
+    cos0 = tl.load(COS_ptr + offsets_0, mask=offsets_0 < head_dim // 2)
+    sin0 = tl.load(SIN_ptr + offsets_0, mask=offsets_0 < head_dim // 2)
+
+    if head_idx < head_num:
+        X_ptr = X + batch_idx * stride_x1 + head_idx * stride_x2
+        X_OUTPUT_ptr = X_OUTPUT + batch_idx * stride_x_out1 + head_idx * stride_x_out2
+
+        x0 = tl.load(X_ptr + offsets_0, mask=offsets_0 < head_dim // 2)
+        x1 = tl.load(X_ptr + offsets_1, mask=offsets_1 < head_dim)
+
+        x_embed0 = x0 * cos0 - x1 * sin0
+        x_embed1 = x1 * cos0 + x0 * sin0
+
+        tl.store(X_OUTPUT_ptr + offsets_0, x_embed0, mask=offsets_0 < head_dim // 2)
+        tl.store(X_OUTPUT_ptr + offsets_1, x_embed1, mask=offsets_1 < head_dim)
+
+
+@triton.jit
+def rotary_embedding_single_kernel_interleaved(
+    X,
+    Out_x,
+    COS,
+    SIN,
+    stride_x_b: tl.constexpr,
+    stride_x_h: tl.constexpr,
+    stride_ox_b: tl.constexpr,
+    stride_ox_h: tl.constexpr,
+    HEAD_NUM: tl.constexpr,
+    ROTARY_DIM: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_block_head_id = tl.program_id(1)
+
+    cos_ptr = COS + cur_batch * ROTARY_DIM // 2 + tl.arange(0, ROTARY_DIM // 2)
+    sin_ptr = SIN + cur_batch * ROTARY_DIM // 2 + tl.arange(0, ROTARY_DIM // 2)
+    cos = tl.load(cos_ptr)
+    sin = tl.load(sin_ptr)
+
+    for block_head_start in range(BLOCK_H):
+        cur_head_id = cur_block_head_id * BLOCK_H + block_head_start
+
+        if cur_head_id < HEAD_NUM:
+            offs_ox = (
+                cur_batch * stride_ox_b
+                + cur_head_id * stride_ox_h
+                + tl.arange(0, ROTARY_DIM)
+            )
+            offs_x_0 = (
+                cur_batch * stride_x_b
+                + cur_head_id * stride_x_h
+                + tl.arange(0, ROTARY_DIM // 2) * 2
+            )
+            offs_x_1 = (
+                cur_batch * stride_x_b
+                + cur_head_id * stride_x_h
+                + tl.arange(0, ROTARY_DIM // 2) * 2
+                + 1
+            )
+            x_0 = tl.load(X + offs_x_0)
+            x_1 = tl.load(X + offs_x_1)
+            o_x_0 = x_0 * cos - x_1 * sin
+            o_x_1 = x_1 * cos + x_0 * sin
+            o_x = tl.interleave(o_x_0, o_x_1)
+
+            tl.store(Out_x + offs_ox, o_x)
+
+
 def apply_rotary_pos_emb_triton(
     q: torch.Tensor,
     k: torch.Tensor,
