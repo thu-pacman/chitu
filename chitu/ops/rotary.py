@@ -30,7 +30,10 @@ chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 has_triton_impl = has_triton and has_accelerator()
 
 if has_triton_impl:
-    from chitu.ops.triton_ops import apply_rotary_pos_emb_triton
+    from chitu.ops.triton_ops import (
+        apply_rotary_pos_emb_single_triton,
+        apply_rotary_pos_emb_triton,
+    )
 
 
 def rotate_half(x):
@@ -112,6 +115,43 @@ def _auto_apply_rotary_pos_emb(
 _dispatch_apply_rotary_pos_emb.register_candidate("triton")
 if has_triton_impl:
     _dispatch_apply_rotary_pos_emb.register("triton")(apply_rotary_pos_emb_triton)
+
+
+@make_op_dispatcher(op_name="apply_rotary_pos_emb_single")
+def _dispatch_apply_rotary_pos_emb_single(
+    x: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
+    out: Optional[torch.Tensor] = None,
+    rotary_type: str = "separated",
+    impl: str = "auto",
+) -> torch.Tensor:
+    raise NotImplementedError
+
+
+@_dispatch_apply_rotary_pos_emb_single.register_auto
+def _auto_apply_rotary_pos_emb_single(
+    x: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
+    out: Optional[torch.Tensor] = None,
+    rotary_type: str = "separated",
+):
+    if (
+        x.is_cuda
+        and has_triton_impl
+        and (
+            rotary_type == "separated"
+            or (rotary_type == "interleaved" and hasattr(triton.language, "interleave"))
+        )
+    ):
+        return "triton"
+    return "torch"
+
+
+_dispatch_apply_rotary_pos_emb_single.register_candidate("triton")
+if has_triton_impl:
+    _dispatch_apply_rotary_pos_emb_single.register("triton")(
+        apply_rotary_pos_emb_single_triton
+    )
 
 
 @_dispatch_apply_rotary_pos_emb.register("cuda", available=has_chitu_backend)
@@ -424,6 +464,59 @@ def apply_rotary_pos_emb_torch(
     return q_out, k_out
 
 
+@_dispatch_apply_rotary_pos_emb_single.register("torch")
+def apply_rotary_pos_emb_single_torch(
+    x: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
+    out: Optional[torch.Tensor] = None,
+    rotary_type: str = "separated",
+) -> torch.Tensor:
+    if rotary_type == "separated":
+        cos = freqs_cis.separatedly_doubled_cos
+        sin = freqs_cis.separatedly_doubled_sin
+        cos_x = reshape_rotary_for_broadcast(cos, x)
+        sin_x = reshape_rotary_for_broadcast(sin, x)
+        x_embed = (x * cos_x) + (rotate_half(x) * sin_x)
+        x_embed = x_embed.to(x.dtype)
+
+    elif rotary_type == "interleaved":
+        cos = freqs_cis.interleavedly_doubled_cos
+        sin = freqs_cis.interleavedly_doubled_sin
+        cos_x = reshape_rotary_for_broadcast(cos, x)
+        sin_x = reshape_rotary_for_broadcast(sin, x)
+        x_embed = (x * cos_x) + (rotate_pairwise(x) * sin_x)
+        x_embed = x_embed.to(x.dtype)
+
+    else:
+        raise ValueError(f"Unknown rotary type: {rotary_type}")
+
+    if out is not None:
+        out.copy_(x_embed)
+    else:
+        out = x_embed
+    return out
+
+
+def apply_rotary_pos_emb_single(
+    x: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
+    out: Optional[torch.Tensor] = None,
+    rotary_type: str = "separated",
+    impl: str = "auto",
+) -> torch.Tensor:
+    """
+    Rotary positional embedding for one tensor.
+
+    This is used by paths where query and key are generated at different
+    positions or cardinalities, so the paired q/k RoPE API cannot express the
+    operation without fabricating a dummy tensor.
+    """
+    assert freqs_cis.cos.dtype == freqs_cis.sin.dtype
+    return _dispatch_apply_rotary_pos_emb_single(
+        x, freqs_cis, out=out, rotary_type=rotary_type, impl=impl
+    )
+
+
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -492,6 +585,74 @@ def apply_rotary_pos_emb(
 
 def _uses_torch_npu_output_layout_impl(impl: str) -> bool:
     return impl == "torch_npu_with_output_layout"
+
+
+def apply_rotary_pos_emb_single_partial(
+    x: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
+    rotary_begin: Optional[int] = None,
+    rotary_end: Optional[int] = None,
+    rotary_type: str = "separated",
+    inplace: bool = True,
+    impl: str = "auto",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Run RoPE on one slice of one tensor.
+
+    Returns:
+        [0]: Partially rotated tensor
+        [1]: Leading non-rotated part of the result
+        [2]: Rotated part of the result
+        [3]: Trailing non-rotated part of the result
+    """
+    if rotary_begin is None:
+        rotary_begin = 0
+    if rotary_end is None:
+        rotary_end = x.shape[-1]
+
+    rotary_dim = rotary_end - rotary_begin
+    assert rotary_dim == freqs_cis.cos.shape[-1] * 2
+    assert rotary_dim == freqs_cis.sin.shape[-1] * 2
+    assert freqs_cis.cos.dtype == freqs_cis.sin.dtype
+
+    rotary_part = x[..., rotary_begin:rotary_end]
+    impl = _dispatch_apply_rotary_pos_emb_single.resolve_impl(
+        rotary_part,
+        freqs_cis,
+        out=None,
+        rotary_type=rotary_type,
+        impl=impl,
+    )
+
+    if inplace:
+        rotary_part_out = rotary_part
+        apply_rotary_pos_emb_single(
+            rotary_part,
+            freqs_cis,
+            out=rotary_part_out,
+            rotary_type=rotary_type,
+            impl=impl,
+        )
+        out = x
+    else:
+        rotary_part_out = apply_rotary_pos_emb_single(
+            rotary_part,
+            freqs_cis,
+            rotary_type=rotary_type,
+            impl=impl,
+        )
+        if x.shape[-1] == rotary_dim:
+            out = rotary_part_out
+        else:
+            out = x.clone()
+            out[..., rotary_begin:rotary_end] = rotary_part_out
+
+    return (
+        out,
+        out[..., :rotary_begin],
+        rotary_part_out,
+        out[..., rotary_end:],
+    )
 
 
 def apply_rotary_pos_emb_partial(

@@ -361,15 +361,13 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # 由于decode阶段未维护哈希链，因此需要重建
         cached_blocks = self.task_to_token_blocks[task.task_id]
         num_cached_blocks = len(cached_blocks)
-        identities = self._make_task_identities(task, min_blocks=num_cached_blocks)
-        assert num_cached_blocks <= len(
-            identities
-        ), f"{num_cached_blocks} vs {len(identities)}"
+        identities = self._make_task_identities(task)
 
         # 更新blockruntime、self.active_blocks、self.cached_idle_blocks以及self.identity_runtime_pool
         for i in range(num_cached_blocks - 1, -1, -1):
             # 倒序遍历cached_blocks，确保lru逐出顺序为: 先逐出后缀、再逐出前缀
-            blk_hash = identities[i].blk_hash
+            # decode 按 mtp 可能多预分配块，超出 prefix identity 链的块不入 prefix pool
+            blk_hash = identities[i].blk_hash if i < len(identities) else None
             runtime = cached_blocks[i].runtime
 
             runtime.active_cnt -= 1

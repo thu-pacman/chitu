@@ -21,6 +21,7 @@ if has_triton_impl:
         fp8_e4m3fn_quant_per_tensor_triton,
         quant_pertoken_kvcache_dsa,  # only for DSV32 fp8 cache
         append_to_paged_kv_cache_blockfp8_deepgemm_triton,
+        read_from_paged_kv_cache_triton,
         read_from_paged_indexer_kv_cache_deepgemm_triton,
     )
 
@@ -409,6 +410,7 @@ def read_from_paged_kv_cache(
     page_table: torch.Tensor,
     position_ids: torch.Tensor,
     seq_ids: torch.Tensor,
+    use_i64_offsets: bool = False,
     impl: str = "auto",
 ) -> torch.Tensor:
     """
@@ -429,6 +431,8 @@ def read_from_paged_kv_cache(
 
 @read_from_paged_kv_cache.register_auto
 def _auto_read_from_paged_kv_cache():
+    if has_triton_impl and get_global_args().infer.op_impl != "cpu":
+        return "triton"
     return "torch"
 
 
@@ -438,11 +442,17 @@ def read_from_paged_kv_cache_torch(
     page_table: torch.Tensor,
     position_ids: torch.Tensor,
     seq_ids: torch.Tensor,
+    use_i64_offsets: bool = False,
 ) -> torch.Tensor:
     return kv_cache[
         page_table[seq_ids, position_ids // kv_cache.shape[1]],
         position_ids % kv_cache.shape[1],
     ]
+
+
+read_from_paged_kv_cache.register_candidate("triton")
+if has_triton_impl:
+    read_from_paged_kv_cache.register("triton")(read_from_paged_kv_cache_triton)
 
 
 @make_op_dispatcher

@@ -3,7 +3,11 @@ import math
 import torch
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.ops import apply_rotary_pos_emb
+from chitu.ops import (
+    apply_rotary_pos_emb,
+    apply_rotary_pos_emb_single,
+    apply_rotary_pos_emb_single_partial,
+)
 from chitu.native_layout import NativeLayoutTensor, ColumnOddEvenSeparatedTensor
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 from chitu.testing import assert_close
@@ -236,3 +240,103 @@ def test_apply_rotary_pos_emb_in_place(
     atol = 5e-3
     assert_close(out_q, out_q_torch, rtol=rtol, atol=atol)
     assert_close(out_k, out_k_torch, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("rotary_type", ["separated", "interleaved"])
+@pytest.mark.parametrize("batch_size", [0, 16])
+@pytest.mark.parametrize("impl", ["triton", "torch"])
+@pytest.mark.parametrize("qk_dtype", [torch.float16, torch.bfloat16])
+def test_apply_rotary_pos_emb_single(
+    rotary_type,
+    batch_size,
+    impl,
+    qk_dtype,
+    record_benchmark,
+):
+    if impl == "triton":
+        if not has_triton:
+            pytest.skip("triton is missing")
+        if rotary_type == "interleaved" and not hasattr(triton.language, "interleave"):
+            pytest.skip("This op require Triton to support tl.interleave")
+
+    n_local_heads, head_dim = 32, 128
+    x = torch.randn(batch_size, n_local_heads, head_dim, device="cuda", dtype=qk_dtype)
+    complex_freqs = torch.polar(
+        torch.ones(batch_size, head_dim // 2, device="cuda", dtype=torch.float32),
+        torch.rand(batch_size, head_dim // 2, device="cuda", dtype=torch.float32)
+        * 2
+        * math.pi,
+    )
+    freqs_cis = BatchedFreqsCis(
+        complex_freqs.real.contiguous(),
+        complex_freqs.imag.contiguous(),
+    )
+
+    out = record_benchmark.run(
+        lambda: apply_rotary_pos_emb_single(
+            x, freqs_cis, rotary_type=rotary_type, impl=impl
+        ),
+        batch_size=batch_size,
+        impl=impl,
+    )
+    out_q_torch, _ = apply_rotary_pos_emb(
+        x, x, freqs_cis, rotary_type=rotary_type, impl="torch"
+    )
+
+    assert_close(out, out_q_torch, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("rotary_type", ["separated", "interleaved"])
+@pytest.mark.parametrize("impl", ["triton", "torch"])
+def test_apply_rotary_pos_emb_single_partial_in_place(
+    rotary_type,
+    impl,
+    record_benchmark,
+):
+    if impl == "triton":
+        if not has_triton:
+            pytest.skip("triton is missing")
+        if rotary_type == "interleaved" and not hasattr(triton.language, "interleave"):
+            pytest.skip("This op require Triton to support tl.interleave")
+
+    batch_size, n_local_heads, head_dim = 16, 32, 128
+    rotary_dim = head_dim // 2
+    x = torch.randn(
+        batch_size, n_local_heads, head_dim, device="cuda", dtype=torch.float16
+    )
+    complex_freqs = torch.polar(
+        torch.ones(batch_size, rotary_dim // 2, device="cuda", dtype=torch.float32),
+        torch.rand(batch_size, rotary_dim // 2, device="cuda", dtype=torch.float32)
+        * 2
+        * math.pi,
+    )
+    freqs_cis = BatchedFreqsCis(
+        complex_freqs.real.contiguous(),
+        complex_freqs.imag.contiguous(),
+    )
+
+    x_in_place = x.clone()
+
+    def do_rotary_inplace():
+        out, _, _, _ = apply_rotary_pos_emb_single_partial(
+            x_in_place,
+            freqs_cis,
+            rotary_end=rotary_dim,
+            rotary_type=rotary_type,
+            inplace=True,
+            impl=impl,
+        )
+        return out
+
+    out = record_benchmark.run(
+        do_rotary_inplace,
+        batch_size=batch_size,
+        impl=impl,
+    )
+
+    ref = x.clone()
+    ref[..., :rotary_dim] = apply_rotary_pos_emb_single(
+        x[..., :rotary_dim], freqs_cis, rotary_type=rotary_type, impl="torch"
+    )
+    assert out is x_in_place
+    assert_close(out, ref, rtol=5e-3, atol=5e-3)
