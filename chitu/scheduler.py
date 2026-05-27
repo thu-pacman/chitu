@@ -4,24 +4,33 @@
 
 import time
 import math
+from enum import Enum, auto
 from logging import getLogger
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from typing_extensions import override
-from collections import deque, defaultdict
+from collections import deque
 
 from chitu.task import TaskPool, TaskType, Task
 from chitu.global_vars import get_global_args, SlotHandle
 from chitu.utils import ceil_div
 from chitu.backend import Backend
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
-from chitu.kv_cache import KVCacheManagerBase, PagedKVCacheManager
 from chitu.metrics.prometheus_collector import (
     PrometheusMetricsCollector,
     inc_completed_requests,
 )
 from chitu.distributed.pd_disaggregation.pd_log_utils import pd_verbose_enabled
 
+if TYPE_CHECKING:
+    from chitu.kv_cache import KVCacheManagerBase
+
 logger = getLogger(__name__)
+
+
+class KVCacheCapacityStatus(Enum):
+    OK = auto()
+    CONGESTED = auto()
+    EXCEEDS_CAPACITY = auto()
 
 
 class SchedulerGroupList:
@@ -152,7 +161,7 @@ class Scheduler:
         prefill_num_tasks: int,
         decode_num_tasks: int,
         scheduler_type: str,
-        cache_manager_dict: Optional[dict[str, KVCacheManagerBase]],
+        cache_manager_dict: Optional[dict[str, "KVCacheManagerBase"]],
         *,
         num_scheduler_groups: int,
         dp_rank: int = 0,
@@ -255,6 +264,13 @@ class Scheduler:
         return tuple(fn(task) for fn in self.scorers)
 
     def _num_prefill_cached_tokens(self, task: Task) -> int:
+        """获取任务在所有manager中已缓存最小长度
+        Args:
+            task: 要获取已缓存最小长度的任务
+        Return:
+            不开启prefix caching时，返回当前任务已计算长度
+            开启prefix caching时，返回当前任务在各manager中的最小击中长度
+        """
         completed_tokens = task.kv_cache_len_used_in_completed_steps
         if not self.cache_manager_dict["main"].enable_prefix_caching:
             return completed_tokens
@@ -269,12 +285,20 @@ class Scheduler:
 
         return num_cached_tokens
 
-    def _check_prefill_capacity(self, task, cached_len: int) -> bool:
+    def _check_prefill_capacity(self, task, cached_len: int) -> KVCacheCapacityStatus:
+        """检查是否所有cache_manager容量都足以容纳当前Prefill任务(task已缓存token长度为cached_len)
+        Args:
+            task: 当前正在检查kv cache容量的Prefill任务
+            cached_len: 当前任务已缓存的长度
+        """
         for name, cache_manager in self.cache_manager_dict.items():
-            cur_blocks = cache_manager.num_blocks_for_seq_len(cached_len)
             target_blocks = cache_manager.num_blocks_for_seq_len(
                 cached_len + task.next_req_tokens_len
             )
+            if target_blocks > cache_manager.num_blocks:
+                return KVCacheCapacityStatus.EXCEEDS_CAPACITY
+
+            cur_blocks = cache_manager.num_blocks_for_seq_len(cached_len)
             block_threshold = (
                 self.kvcache_block_threshold
                 if name == "main"
@@ -288,23 +312,66 @@ class Scheduler:
                 )
             )
             if target_blocks - cur_blocks > available_blocks:
-                return False
-        return True
+                return KVCacheCapacityStatus.CONGESTED
+        return KVCacheCapacityStatus.OK
 
-    def _check_decode_capacity(self, task) -> bool:
+    def _check_decode_capacity(self, task) -> KVCacheCapacityStatus:
+        """检查是否所有cache_manager容量都可容纳decode任务
+        Args:
+            task: 当前正在检查kv cache容量的Decode任务
+        """
         for _, cache_manager in self.cache_manager_dict.items():
+            target_blocks = cache_manager.num_blocks_for_seq_len(
+                task.kv_cache_len_used_in_completed_steps_and_next_step
+            )
+            if target_blocks > cache_manager.num_blocks:
+                return KVCacheCapacityStatus.EXCEEDS_CAPACITY
+
             available_blocks = (
                 cache_manager.num_blocks - cache_manager.num_active_blocks
             )
             cur_blocks = len(cache_manager.task_to_cache_ids[task.task_id])
-            target_blocks = cache_manager.num_blocks_for_seq_len(
-                task.kv_cache_len_used_in_completed_steps_and_next_step
-            )
             if target_blocks - cur_blocks > available_blocks:
-                return False
-        return True
+                return KVCacheCapacityStatus.CONGESTED
+        return KVCacheCapacityStatus.OK
+
+    def _terminate_task_exceeds_capacity(self, task_id: str) -> None:
+        """Stop a task whose sequence exceeds KV cache physical capacity."""
+        task = TaskPool.pool.get(task_id)
+        if task is None:
+            return
+
+        task.set_stopped()
+        if task.req is not None:
+            task.req.finish_reason = "length"
+            if not task.req.finished:
+                task.req.stop_stream()
+
+        has_kv_cache = any(
+            task_id in cache_manager.task_to_cache_ids
+            for cache_manager in self.cache_manager_dict.values()
+        )
+        if has_kv_cache:
+            for cache_manager in self.cache_manager_dict.values():
+                cache_manager.finalize_metadata_all_decode(task)
+            Backend.executor.special_step([task_id], type="EndTask")
+
+        TaskPool.remove(task_id)
+        inc_completed_requests("worker", 1)
+        logger.warning(
+            f"Task {task_id} exceeds KV cache capacity and was terminated",
+            extra={
+                "task_id": task_id,
+                "event": "scheduler_task_exceeds_capacity",
+                "finish_reason": "length: exceeds_capacity",
+            },
+        )
 
     def _prepare_prefill_metadata(self, task, cached_len: int) -> None:
+        """task进行prefill前的元数据准备: 维护本次新增击中长度、本次结束后已消费的token，
+        调用prepare_metadata_before_prefill维护所有cache_manager中的元信息，
+        维护本次cache_manager为任务新新分配的kv block ids
+        """
         assert (
             task.consumed_req_tokens <= cached_len <= task.prefix_tokens_len
         ), f"{task.consumed_req_tokens} vs {cached_len} vs {task.prefix_tokens_len}"
@@ -320,12 +387,16 @@ class Scheduler:
             )
 
     def _prepare_decode_metadata(self, task) -> None:
+        """task进行Decode前的元数据准备: 调用prepare_metadata_before_decode维护所有cache_manager中的元信息，
+        维护本次cache_manager为任务新新分配的kv block ids
+        """
         for name, cache_manager in self.cache_manager_dict.items():
             task.new_cache_ids[name] = cache_manager.prepare_metadata_before_decode(
                 task
             )
 
     def prepare_for_schedule(self) -> None:
+        """为本次调度准备sgroup"""
         self.sgroup_list.switch_to_next_sgroup()
 
     def schedule(
@@ -484,10 +555,10 @@ class Scheduler:
         """
         sched_out_task_ids = []
         prefill_tokens = 0
-        kv_cache_manager = self.cache_manager_dict["main"]
-        block_size = kv_cache_manager.block_size
 
         for task_id in task_ids:
+            if task_id not in TaskPool.pool:
+                continue
             if len(sched_out_task_ids) >= self.prefill_num_tasks:
                 break
 
@@ -530,7 +601,12 @@ class Scheduler:
             task_origin_prefill_chunk_size = task.prefill_chunk_size
             task.set_prefill_chunk_size_for_one_step(task_prefill_chunk_size)
 
-            if not self._check_prefill_capacity(task, num_cached_tokens):
+            capacity_status = self._check_prefill_capacity(task, num_cached_tokens)
+            if capacity_status is KVCacheCapacityStatus.EXCEEDS_CAPACITY:
+                task.prefill_chunk_size = task_origin_prefill_chunk_size
+                self._terminate_task_exceeds_capacity(task_id)
+                continue
+            if capacity_status is KVCacheCapacityStatus.CONGESTED:
                 task.prefill_chunk_size = task_origin_prefill_chunk_size
                 break
 
@@ -538,19 +614,6 @@ class Scheduler:
             sched_out_task_ids.append(task_id)
             self._prepare_prefill_metadata(task, num_cached_tokens)
 
-        if (
-            len(sched_out_task_ids) == 0
-            and self.kvcache_block_threshold == kv_cache_manager.num_blocks
-            and kv_cache_manager.num_active_blocks == 0
-        ):
-            raise RuntimeError(
-                "KV cache capacity is insufficient to support prefilling.\n"
-                f"  - Block size: {block_size}\n"
-                f"  - available blocks: {self.kvcache_block_threshold - kv_cache_manager.num_active_blocks}\n"
-                f"  - Prefill chunk size: {self.prefill_chunk_size if self.prefill_chunk_size is not None else 'inf'}\n"
-                "However, all prefill prompts are too long:\n"
-                f"{[TaskPool.pool[idx].prefix_tokens_len for idx in task_ids if TaskPool.pool[idx].task_type == TaskType.Prefill]}"
-            )
         return sched_out_task_ids
 
     def _schedule_decode_tasks(self, task_ids: list[str]) -> list[str]:
@@ -565,6 +628,8 @@ class Scheduler:
         cached_prefill_task_ids = []  # 已开始prefill但未完成的任务
 
         for tid in task_ids:
+            if tid not in TaskPool.pool:
+                continue
             task = TaskPool.pool[tid]
             if task.task_type == TaskType.Decode:
                 decode_task_ids.append(tid)
@@ -584,9 +649,13 @@ class Scheduler:
             candidate_task_id = decode_task_ids.popleft()
             candidate_task = TaskPool.pool[candidate_task_id]
 
-            if self._check_decode_capacity(candidate_task):
+            capacity_status = self._check_decode_capacity(candidate_task)
+            if capacity_status is KVCacheCapacityStatus.OK:
                 sched_out_task_ids.append(candidate_task_id)
                 self._prepare_decode_metadata(candidate_task)
+                continue
+            if capacity_status is KVCacheCapacityStatus.EXCEEDS_CAPACITY:
+                self._terminate_task_exceeds_capacity(candidate_task_id)
                 continue
 
             if not decode_task_ids and not cached_prefill_task_ids:
@@ -601,15 +670,6 @@ class Scheduler:
                 evict_task_id = decode_task_ids.pop()
             evict_tasks.append(evict_task_id)
             self.evict_task(evict_task_id)
-
-        if not sched_out_task_ids and len(self.sgroup_list) == 0:
-            if len(decode_task_ids) > 0:
-                prefix_len = TaskPool.pool[decode_task_ids[0]].prefix_tokens_len
-            else:
-                prefix_len = -1
-            raise Exception(
-                f"KV_cache capacity is insufficient to support decoding completion (batch_size=1, prefix_len={prefix_len})."
-            )
 
         if len(evict_tasks) > 0:
             logger.warning(

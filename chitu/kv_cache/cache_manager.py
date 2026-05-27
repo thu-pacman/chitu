@@ -14,9 +14,7 @@ from chitu.kv_cache.prefix_caching import (
     BlockIdentityChainBuilder,
     BlockRuntime,
     KVBlockState,
-    NONE_BLK_HASH,
 )
-from weakref import WeakValueDictionary
 from collections import defaultdict
 
 if TYPE_CHECKING:
