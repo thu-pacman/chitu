@@ -307,15 +307,13 @@ class KVCacheBase:
         # patterns.
         assert self.quant_type is not KVCacheQuantType.NONE
         if self.quant_type is KVCacheQuantType.FP8_PERTENSOR:
-            assert q_scale is None and n_local_kv_heads is not None
+            assert q_scale is None
             return fp8_pertensor_kvcache_quant(
                 q,
                 k,
                 v,
                 k_scale,
                 v_scale,
-                self.seq_len_delta.batch_size,
-                n_local_kv_heads,
             )
         elif self.quant_type is KVCacheQuantType.FP8_PERTOKEN_DSA:
             assert k is not None and kv_lora_rank is not None

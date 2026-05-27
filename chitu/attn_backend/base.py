@@ -494,7 +494,6 @@ class AttnBackend(abc.ABC):
             descales = dict(
                 q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
             )
-
         return self.prefill_ragged_qkvo(
             q,
             k,

@@ -931,12 +931,11 @@ def test_single_prompt_seq_bigger_than_scheduler_capacity():
         cache_manager_dict=Backend.cache_managers[0],
         num_scheduler_groups=1,
     )
-    with pytest.raises(Exception) as exc_info:
-        scheduler.prepare_for_schedule()
-        scheduler.schedule()
-    assert "KV cache capacity is insufficient to support prefilling" in str(exc_info)
-
-    TaskPool.remove(task.task_id)
+    scheduler.prepare_for_schedule()
+    task_ids = scheduler.schedule()
+    # The task should be terminated, so it should be removed from TaskPool
+    assert task.task_id not in TaskPool.pool
+    assert task_ids == []
     scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(task)
 
 
@@ -1005,13 +1004,11 @@ def test_single_decode_prompt_seq_bigger_than_kvcache_capacity():
         task.prefix_tokens.append(1)
         scheduler.update(task_ids)
 
-    with pytest.raises(Exception) as exc_info:
-        scheduler.prepare_for_schedule()
-        scheduler.schedule()
-    assert "KV_cache capacity is insufficient to support decoding completion" in str(
-        exc_info
-    )
-    TaskPool.remove(task.task_id)
+    scheduler.prepare_for_schedule()
+    task_ids = scheduler.schedule()
+    # The task should be terminated when it exceeds capacity
+    assert task.task_id not in TaskPool.pool
+    assert task_ids == []
     scheduler.cache_manager_dict["main"].finalize_metadata_all_decode(task)
 
 
@@ -1616,11 +1613,11 @@ def test_check_prefill_capacity_requires_all_cache_managers():
         max_seq_len=2048,
         dp_rank=0,
         block_size=128,
-        num_blocks=5,
+        num_blocks=10,
         enable_prefix_caching=False,
     )
     main.active_blocks = {i: object() for i in range(6)}
-    indexer.active_blocks = {i: object() for i in range(4)}
+    indexer.active_blocks = {i: object() for i in range(9)}
     scheduler = Scheduler(
         100,
         12,
@@ -1631,7 +1628,55 @@ def test_check_prefill_capacity_requires_all_cache_managers():
         prefill_chunk_size=20000,
     )
     scheduler.kvcache_block_threshold = 8
-    assert not scheduler._check_prefill_capacity(task, cached_len=512)
+    from chitu.scheduler import KVCacheCapacityStatus
+
+    assert (
+        scheduler._check_prefill_capacity(task, cached_len=512)
+        is KVCacheCapacityStatus.CONGESTED
+    )
+
+
+def test_check_prefill_capacity_exceeds_physical_blocks():
+    from chitu.scheduler import KVCacheCapacityStatus
+
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 2048,
+                    "cache_type": "paged",
+                    "op_impl": "torch",
+                    "schedule_overlap": True,
+                    "mtp_size": 1,
+                }
+            }
+        ),
+        need_ensure=False,
+    )
+    task = Task("req_exceeds", UserRequest.create_mock(4096, "req_exceeds"))
+    task.set_prefill_chunk_size_for_one_step(4096)
+    main = PagedKVCacheManager(
+        num_hot_req=4,
+        max_seq_len=2048,
+        dp_rank=0,
+        block_size=256,
+        num_blocks=4,
+        enable_prefix_caching=False,
+    )
+    scheduler = Scheduler(
+        100,
+        12,
+        12,
+        "prefill_first",
+        cache_manager_dict={"main": main},
+        num_scheduler_groups=1,
+        prefill_chunk_size=20000,
+    )
+    scheduler.kvcache_block_threshold = 4
+    assert (
+        scheduler._check_prefill_capacity(task, cached_len=0)
+        is KVCacheCapacityStatus.EXCEEDS_CAPACITY
+    )
 
 
 def test_check_decode_capacity_requires_all_cache_managers():
@@ -1665,14 +1710,14 @@ def test_check_decode_capacity_requires_all_cache_managers():
     main.active_blocks = {i: object() for i in range(5)}
     main.task_to_cache_ids[task.task_id] = {0, 1}
     indexer = PagedKVCacheManager(
-        num_blocks=3,
+        num_blocks=8,
         num_hot_req=8,
         max_seq_len=2048,
         dp_rank=0,
         block_size=128,
         enable_prefix_caching=False,
     )
-    indexer.active_blocks = {i: object() for i in range(2)}
+    indexer.active_blocks = {i: object() for i in range(7)}
     indexer.task_to_cache_ids[task.task_id] = {0, 1}
     scheduler = Scheduler(
         100,
@@ -1684,4 +1729,6 @@ def test_check_decode_capacity_requires_all_cache_managers():
         prefill_chunk_size=20000,
     )
 
-    assert not scheduler._check_decode_capacity(task)
+    from chitu.scheduler import KVCacheCapacityStatus
+
+    assert scheduler._check_decode_capacity(task) is KVCacheCapacityStatus.CONGESTED

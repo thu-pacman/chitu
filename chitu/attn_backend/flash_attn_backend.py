@@ -18,6 +18,14 @@ flash_attn3, has_flash_attn3 = try_import_opt_dep(
 )
 
 
+def _expand_fa3_descale(descale, batch_size, num_kv_heads):
+    # FA3 expects q/k/v_descale of shape (batch_size, num_kv_heads); we receive
+    # a scalar (per-tensor) descale from kvcache_quant and broadcast it here.
+    if descale is None:
+        return None
+    return descale.view(1, 1).expand(batch_size, num_kv_heads)
+
+
 class FlashAttnBackend(AttnBackend):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
@@ -86,9 +94,15 @@ class FlashAttnBackend(AttnBackend):
             **extra_kvargs,
         )
         if self._use_fa3:
-            kwargs["q_descale"] = q_descale
-            kwargs["k_descale"] = k_descale
-            kwargs["v_descale"] = v_descale
+            kwargs["q_descale"] = _expand_fa3_descale(
+                q_descale, seq_len_delta.batch_size, k.shape[-2]
+            )
+            kwargs["k_descale"] = _expand_fa3_descale(
+                k_descale, seq_len_delta.batch_size, k.shape[-2]
+            )
+            kwargs["v_descale"] = _expand_fa3_descale(
+                v_descale, seq_len_delta.batch_size, v.shape[-2]
+            )
 
         return self._fa.flash_attn_varlen_func(**kwargs)
 
@@ -125,9 +139,15 @@ class FlashAttnBackend(AttnBackend):
             extra_kvargs["softcap"] = softcap
 
         if self._use_fa3:
-            extra_kvargs["q_descale"] = q_descale
-            extra_kvargs["k_descale"] = k_descale
-            extra_kvargs["v_descale"] = v_descale
+            extra_kvargs["q_descale"] = _expand_fa3_descale(
+                q_descale, seq_len_delta.batch_size, kv_cache.k.shape[-2]
+            )
+            extra_kvargs["k_descale"] = _expand_fa3_descale(
+                k_descale, seq_len_delta.batch_size, kv_cache.k.shape[-2]
+            )
+            extra_kvargs["v_descale"] = _expand_fa3_descale(
+                v_descale, seq_len_delta.batch_size, kv_cache.v.shape[-2]
+            )
 
         bsz = seq_len_delta.batch_size
         s_q = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
@@ -194,9 +214,15 @@ class FlashAttnBackend(AttnBackend):
         )
         if self._use_fa3:
             kwargs["page_table"] = kv_cache.block_table
-            kwargs["q_descale"] = q_descale
-            kwargs["k_descale"] = k_descale
-            kwargs["v_descale"] = v_descale
+            kwargs["q_descale"] = _expand_fa3_descale(
+                q_descale, seq_len_delta.batch_size, kv_cache.k.shape[-2]
+            )
+            kwargs["k_descale"] = _expand_fa3_descale(
+                k_descale, seq_len_delta.batch_size, kv_cache.k.shape[-2]
+            )
+            kwargs["v_descale"] = _expand_fa3_descale(
+                v_descale, seq_len_delta.batch_size, kv_cache.v.shape[-2]
+            )
         else:
             kwargs["block_table"] = kv_cache.block_table
 

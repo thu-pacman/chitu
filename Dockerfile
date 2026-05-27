@@ -251,7 +251,7 @@ COPY ./pypi-links ./pypi-links
 # 2. pytorch 一般都要使用和具体卡以及其他基础软件（如 cuda）版本相关的版本。
 # 3. 如果没有 --no-build-isolation ，pip 会在构建时用单独的环境重新下载所有构建时依赖，此时无法指定上述版本。
 RUN pip install --no-build-isolation -r /tmp/requirements.txt \
-        -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "pytest") \
+        -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "pytest" -e "build") \
         --find-links ./pypi-links \
         --timeout 60 --retries 10
 
@@ -273,7 +273,6 @@ print(next((d.version for d in m.distributions() if (d.metadata.get('Name') or '
     else \
         echo "flashinfer-python not installed; skip installing flashinfer_jit_cache"; \
     fi
-
 #####################################
 # Wheel build Stage
 #
@@ -306,7 +305,7 @@ COPY --from=wheel_builder /tmp/ /tmp/
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
 RUN pip install /tmp/*.whl \
-    -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "numpy" -e "transformers" -e "pytest" -e 'typing-extensions' -e 'typing_extensions')
+    -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "numpy" -e "transformers" -e "pytest" -e 'typing-extensions' -e 'typing_extensions' -e "build")
 
 RUN rm -rf /tmp/*
 COPY ./test ./test

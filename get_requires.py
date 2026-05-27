@@ -48,6 +48,7 @@ install_requires = [
     "xgrammar>=0.1.31",
     "openai",
     "anthropic",
+    "build==1.4.0",
     "aiohttp",
     "pynvml>=13.0.1",
 ]
@@ -129,6 +130,9 @@ extras_require = {
     "fast_hadamard_transform": [
         "fast-hadamard-transform @ file://localhost"
         + os.path.join(setup_dir, "third_party/fast-hadamard-transform")
+    ],
+    "hpc_ops": [
+        "hpc-ops @ file://localhost" + os.path.join(setup_dir, "third_party/hpc-ops"),
     ],
     "numa": ["numa"],
     "mooncake": [mooncake],

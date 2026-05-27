@@ -29,8 +29,16 @@ from chitu.attn_backend import (
     NpuAttnBackend,
     RefAttnBackend,
     TritonAttnBackend,
+    NpuAttnBackend,
+    HybridAttnBackend,
+    DLLMAttnBackend,
+    HunyuanAttnBackend,
 )
-from chitu.kv_cache.registry import should_use_hopper_mixed_backend
+
+from chitu.kv_cache.registry import (
+    should_use_hopper_mixed_backend,
+    can_use_hunyuan_attn,
+)
 from chitu.kv_cache import KVCacheManagerBase, PagedKVCache, KVCacheBase
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
@@ -466,7 +474,6 @@ class Backend:
     @staticmethod
     def _get_attention_backend_type(args):
         if args.infer.attn_type == "auto":
-            # TODO auto use hunyuan attn
             if is_ascend():
                 return NpuAttnBackend
             elif args.infer.op_impl == "cpu":
@@ -495,11 +502,18 @@ class Backend:
             return RefAttnBackend
         elif args.infer.attn_type == "hopper_mixed":
             return HopperMixedBackend
+        elif args.infer.attn_type == "hunyuan_attn":
+            if can_use_hunyuan_attn(args):
+                return HunyuanAttnBackend
+            else:
+                raise ValueError(
+                    "HunyuanAttnBackend is not compatible with the current model/configuration"
+                )
         else:
             raise ValueError(f"Unknown attn type {args.infer.attn_type}")
 
     @staticmethod
-    def _init_attention_backend(attn_backend_type):
+    def _init_attention_backend(attn_backend_type, args):
         # Yes, use `type` instead of `isinstance` here, because `AttnBackend`s inherit each other
         if attn_backend_type is FlashInferBackend:
             max_num_blocks = 0
@@ -510,6 +524,21 @@ class Backend:
                     )
                 max_num_blocks = max(max_num_blocks, cache.max_num_blocks)
             return attn_backend_type(max_num_blocks)
+        if attn_backend_type is HunyuanAttnBackend:
+            HunyuanAttnBackend.validate_model_config(args)
+            for cache in Backend.cache_dict.values():
+                if not isinstance(cache, PagedKVCache):
+                    raise NotImplementedError(
+                        "`infer.attn_type=hunyuan_attn` is only compatible with `infer.cache_type=paged`"
+                    )
+            head_dim = getattr(args, "head_dim", None)
+            if head_dim is None:
+                head_dim = args.dim // args.n_heads
+            return attn_backend_type(
+                head_dim=head_dim,
+                n_heads=args.n_heads,
+                n_kv_heads=getattr(args, "n_kv_heads", None),
+            )
         else:
             return attn_backend_type()
 
@@ -1084,7 +1113,7 @@ class Backend:
         Backend.cache_managers = bundle.cache_managers
 
         # Initialize attention backend
-        attn_backend = Backend._init_attention_backend(attn_backend_type)
+        attn_backend = Backend._init_attention_backend(attn_backend_type, args.models)
 
         Backend._build_and_setup_model(args, attn_backend)
 

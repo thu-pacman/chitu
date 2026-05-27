@@ -14,3 +14,4 @@ from chitu.attn_backend.flash_infer_backend import FlashInferBackend
 from chitu.attn_backend.npu_attn_backend import NpuAttnBackend
 from chitu.attn_backend.hybrid_attn_backend import HybridAttnBackend
 from chitu.attn_backend.dllm_backend import DLLMAttnBackend
+from chitu.attn_backend.hunyuan_attn_backend import HunyuanAttnBackend

@@ -596,15 +596,15 @@ def read_from_dense_kv_cache_torch(
 # ---------------------------------------------------------------------------
 
 
-def fp8_pertensor_kvcache_quant(xq, xk, xv, k_scale, v_scale, batch_size, head_num):
+def fp8_pertensor_kvcache_quant(xq, xk, xv, k_scale, v_scale):
     q_scale = (xq.abs().amax() / 448).to(torch.float32)
     xq = fp8_e4m3fn_quant_per_tensor_triton(xq, q_scale)
     xk = fp8_e4m3fn_quant_per_tensor_triton(xk, k_scale)
     xv = fp8_e4m3fn_quant_per_tensor_triton(xv, v_scale)
     descales = {
-        "q_descale": q_scale.view(1, 1).expand(batch_size, head_num),
-        "k_descale": k_scale.view(1, 1).expand(batch_size, head_num),
-        "v_descale": v_scale.view(1, 1).expand(batch_size, head_num),
+        "q_descale": q_scale,
+        "k_descale": k_scale,
+        "v_descale": v_scale,
     }
     return xq, xk, xv, descales
 
