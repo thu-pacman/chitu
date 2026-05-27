@@ -11,6 +11,7 @@ from chitu.attn_backend import (
     FlashMLABackend,
     HopperMixedBackend,
     NpuAttnBackend,
+    HunyuanAttnBackend,
 )
 from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.global_vars import set_global_args
@@ -38,6 +39,7 @@ flash_attn3, has_flash_attn3 = try_import_opt_dep(
     "flash_attn_interface", "flash_attn_interface"
 )
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
+hunyuan_ops, has_hunyuan_ops = try_import_opt_dep("hpc", "hpc_ops")
 
 
 @pytest.mark.parametrize("bs", [0, 1, 5])
@@ -1312,9 +1314,11 @@ def test_decode_dense_kv(
 @pytest.mark.parametrize("prev_seq_len_list", [[], [509, 19, 15, 282]])
 @pytest.mark.parametrize("n_heads", [4])
 @pytest.mark.parametrize("n_kv_heads", [1])
-@pytest.mark.parametrize("head_dim", [256])
+@pytest.mark.parametrize("head_dim", [256, 128])
 @pytest.mark.parametrize("softmax_scale", [None, 0.13])
-@pytest.mark.parametrize("impl", ["triton", "flash_attn", "flashinfer", "npu"])
+@pytest.mark.parametrize(
+    "impl", ["triton", "flash_attn", "flashinfer", "npu", "hunyuan_attn"]
+)
 def test_decode_paged_kv(
     prev_seq_len_list,
     n_heads,
@@ -1336,31 +1340,47 @@ def test_decode_paged_kv(
         pytest.skip("flash_attn is missing")
     if impl == "npu" and not has_torch_npu:
         pytest.skip("torch_npu is missing")
+    if impl == "hunyuan_attn":
+        if not has_hunyuan_ops:
+            pytest.skip("hunyuan_ops is missing")
+        if not has_accelerator():
+            pytest.skip("CUDA accelerator is required")
+        if head_dim != 128:
+            pytest.skip("hunyuan_attn only supports head_dim=128")
+        if softmax_scale is not None:
+            pytest.skip("hunyuan_attn does not support softmax_scale")
+        if n_kv_heads <= 0 or n_heads % n_kv_heads != 0:
+            pytest.skip("hunyuan_attn requires n_heads divisible by n_kv_heads")
+        head_group_size = n_heads // n_kv_heads
+        if head_group_size not in HunyuanAttnBackend.SUPPORTED_HEAD_GROUP_SIZES:
+            pytest.skip(
+                "hunyuan_attn only supports head group size in "
+                f"{sorted(HunyuanAttnBackend.SUPPORTED_HEAD_GROUP_SIZES)}"
+            )
 
     torch.set_default_dtype(torch.float16)
-    set_global_args(
-        OmegaConf.create(
-            {
-                "infer": {
-                    "mla_absorb": "none",
-                    "op_impl": "torch",
-                    "max_batch_size": 4,
-                    "use_cuda_graph": True if impl == "flashinfer" else False,
-                    "tp_size": 1,
-                    "cache_type": "paged",
-                    "dp_size": 1,
-                    "max_seq_len": 1024,
-                },
-                "models": {
-                    "n_heads": n_heads,
-                    "n_kv_heads": n_kv_heads,
-                    "head_dim": head_dim,
-                    "type": None,
-                },
-            }
-        ),
-        need_ensure=False,
-    )
+    global_args = {
+        "infer": {
+            "mla_absorb": "none",
+            "op_impl": "torch",
+            "max_batch_size": 4,
+            "use_cuda_graph": True if impl == "flashinfer" else False,
+            "tp_size": 1,
+            "cache_type": "paged",
+            "dp_size": 1,
+            "max_seq_len": 1024,
+        },
+        "models": {
+            "n_heads": n_heads,
+            "n_kv_heads": n_kv_heads,
+            "head_dim": head_dim,
+            "type": None,
+        },
+    }
+    if impl == "hunyuan_attn":
+        global_args["float_16bit_variant"] = "bfloat16"
+        torch.set_default_dtype(torch.bfloat16)
+    set_global_args(OmegaConf.create(global_args), need_ensure=False)
 
     seq_len_delta = BatchedSeqLenDelta(
         prev_seq_len_list,
@@ -1383,6 +1403,11 @@ def test_decode_paged_kv(
         attn_backend = FlashInferBackend(tot_num_blocks=num_blocks)
     elif impl == "npu":
         attn_backend = NpuAttnBackend()
+    elif impl == "hunyuan_attn":
+        block_size = 64
+        attn_backend = HunyuanAttnBackend(
+            head_dim=head_dim, n_heads=n_heads, n_kv_heads=n_kv_heads
+        )
     else:
         raise NotImplementedError()
     ref_backend = RefAttnBackend()
@@ -1401,6 +1426,10 @@ def test_decode_paged_kv(
     attn_backend.prepare_metadata_for_decode(
         seq_len_delta, block_table, block_size, softmax_scale=softmax_scale
     )
+    out = None
+    ref_out = None
+    k_cache2 = k_cache.clone()
+    v_cache2 = v_cache.clone()
     out = record_benchmark.run(
         lambda: attn_backend.decode_paged_kv(
             q,
@@ -1415,11 +1444,6 @@ def test_decode_paged_kv(
         head_dim=head_dim,
         impl=impl,
     )
-    if impl == "npu":
-        out = out.view(out.shape[0], n_heads, head_dim)
-
-    k_cache2 = k_cache.clone()
-    v_cache2 = v_cache.clone()
     ref_out = ref_backend.decode_paged_kv(
         q,
         PagedKVCacheAccessor(block_table, {"k": k_cache2, "v": v_cache2}),
@@ -1430,9 +1454,185 @@ def test_decode_paged_kv(
         softcap=0.0,
         softmax_scale=softmax_scale,
     )
+    if impl == "npu":
+        out = out.view(out.shape[0], n_heads, head_dim)
 
     cos_sim_tol = 0.0
     if impl == "triton" and is_muxi():
         # Results of impl="triton" on muxi is not stable.
         cos_sim_tol = 0.002  # TODO: Does it make sense?
+    assert_close(out, ref_out, atol=1e-2, rtol=1e-2, cos_sim_tol=cos_sim_tol)
+
+
+@pytest.mark.parametrize("bs", [0, 1, 4])
+@pytest.mark.parametrize("n_heads,n_kv_heads", [(4, 1), (8, 2)])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("is_increment", [False, True])
+@pytest.mark.parametrize("softmax_scale", [None, 0.13])
+@pytest.mark.parametrize(
+    "impl", ["triton", "flash_attn", "flashinfer", "npu", "hunyuan_attn"]
+)
+def test_prefill_ragged_qo_paged_kv(
+    bs,
+    n_heads,
+    n_kv_heads,
+    head_dim,
+    is_increment,
+    softmax_scale,
+    impl,
+    record_benchmark,
+):
+    if impl == "triton" and not has_triton:
+        pytest.skip("triton is missing")
+    if impl == "flashinfer":
+        if not has_flashinfer or packaging.version.parse(
+            flashinfer.__version__
+        ) < packaging.version.parse("0.2.0"):
+            pytest.skip("flashinfer is missing or too old")
+    if impl == "flash_attn":
+        if not has_flash_attn:
+            pytest.skip("flash_attn is missing")
+        if head_dim > 256:
+            pytest.skip("FlashAttention only supports head dimension at most 256")
+    if impl == "npu" and not has_torch_npu:
+        pytest.skip("torch_npu is missing")
+
+    if impl == "hunyuan_attn":
+        if not has_hunyuan_ops:
+            pytest.skip("hunyuan_ops is missing")
+        if not has_accelerator():
+            pytest.skip("CUDA accelerator is required")
+        if head_dim != 128:
+            pytest.skip("hunyuan_attn only supports head_dim=128")
+        if softmax_scale is not None:
+            pytest.skip("hunyuan_attn does not support softmax_scale")
+        if n_kv_heads <= 0 or n_heads % n_kv_heads != 0:
+            pytest.skip("hunyuan_attn requires n_heads divisible by n_kv_heads")
+        head_group_size = n_heads // n_kv_heads
+        if head_group_size not in HunyuanAttnBackend.SUPPORTED_HEAD_GROUP_SIZES:
+            pytest.skip(
+                "hunyuan_attn only supports head group size in "
+                f"{sorted(HunyuanAttnBackend.SUPPORTED_HEAD_GROUP_SIZES)}"
+            )
+
+    torch.set_default_dtype(torch.float16)
+    global_args = {
+        "infer": {
+            "mla_absorb": "none",
+            "max_batch_size": 4,
+            "op_impl": "torch",
+            "use_cuda_graph": False,
+            "tp_size": 1,
+            "cache_type": "paged",
+            "dp_size": 1,
+            "max_seq_len": 1024,
+        },
+        "models": {
+            "n_heads": n_heads,
+            "n_kv_heads": n_kv_heads,
+            "head_dim": head_dim,
+            "type": None,
+        },
+    }
+    if impl == "hunyuan_attn":
+        global_args["float_16bit_variant"] = "bfloat16"
+        torch.set_default_dtype(torch.bfloat16)
+
+    set_global_args(
+        OmegaConf.create(global_args),
+        need_ensure=False,
+    )
+
+    if not is_increment:
+        old_seq_len_list = [0 for _ in range(bs)]
+        new_seq_len_list = [torch.randint(1, 128, (1,)).item() for _ in range(bs)]
+    else:
+        old_seq_len_list = [torch.randint(1, 127, (1,)).item() for _ in range(bs)]
+        new_seq_len_list = [
+            x + torch.randint(1, 128, (1,)).item() for x in old_seq_len_list
+        ]
+    seq_len_delta = BatchedSeqLenDelta(
+        old_seq_len_list,
+        new_seq_len_list,
+        device="cuda",
+        cache_prefix_lens_tensor_device=False,
+        cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
+        cache_delta_position_ids_tensor_device=False,
+        cache_delta_seq_ids_tensor_device=False,
+    )
+
+    block_size = 64 if impl == "hunyuan_attn" else 256
+    page_cnt_per_sample = ceil_div(seq_len_delta.new.max_len, block_size)
+    num_pages = max(1, max(bs, 1) * max(page_cnt_per_sample, 1))
+    block_table = torch.arange(num_pages, device="cuda", dtype=torch.int32)[
+        : max(bs, 1) * page_cnt_per_sample
+    ].view(max(bs, 1), page_cnt_per_sample)
+    if bs == 0:
+        block_table = block_table[:0]
+
+    if impl == "triton":
+        attn_backend = TritonAttnBackend()
+    elif impl == "flash_attn":
+        attn_backend = FlashAttnBackend()
+    elif impl == "flashinfer":
+        attn_backend = FlashInferBackend(tot_num_blocks=num_pages)
+    elif impl == "npu":
+        attn_backend = NpuAttnBackend()
+        attn_backend.prepare_metadata_for_prefill(seq_len_delta)
+    elif impl == "hunyuan_attn":
+        attn_backend = HunyuanAttnBackend(
+            head_dim=head_dim, n_heads=n_heads, n_kv_heads=n_kv_heads
+        )
+    else:
+        raise NotImplementedError()
+    ref_backend = RefAttnBackend()
+
+    q = torch.randn((seq_len_delta.delta_total_len, n_heads, head_dim), device="cuda")
+    k = torch.randn(
+        (seq_len_delta.delta_total_len, n_kv_heads, head_dim), device="cuda"
+    )
+    v = torch.randn(
+        (seq_len_delta.delta_total_len, n_kv_heads, head_dim), device="cuda"
+    )
+    k_cache = torch.randn((num_pages, block_size, n_kv_heads, head_dim), device="cuda")
+    v_cache = torch.randn((num_pages, block_size, n_kv_heads, head_dim), device="cuda")
+
+    k_cache1 = k_cache.clone()
+    v_cache1 = v_cache.clone()
+    out = record_benchmark.run(
+        lambda: attn_backend.prefill_ragged_qo_paged_kv(
+            q,
+            PagedKVCacheAccessor(block_table, {"k": k_cache1, "v": v_cache1}),
+            k,
+            v,
+            seq_len_delta=seq_len_delta,
+            causal=True,
+            window_size=(-1, -1),
+            softcap=0.0,
+            softmax_scale=softmax_scale,
+        ),
+        bs=bs,
+        impl=impl,
+    )
+
+    k_cache2 = k_cache.clone()
+    v_cache2 = v_cache.clone()
+    ref_out = ref_backend.prefill_ragged_qo_paged_kv(
+        q,
+        PagedKVCacheAccessor(block_table, {"k": k_cache2, "v": v_cache2}),
+        k,
+        v,
+        seq_len_delta=seq_len_delta,
+        causal=True,
+        window_size=(-1, -1),
+        softcap=0.0,
+        softmax_scale=softmax_scale,
+    )
+
+    cos_sim_tol = 0.0
+    if impl == "npu":
+        # Results of impl="npu" is not stable. You may find a small number of items have
+        # a large error after multiple runs.
+        cos_sim_tol = 0.002
     assert_close(out, ref_out, atol=1e-2, rtol=1e-2, cos_sim_tol=cos_sim_tol)

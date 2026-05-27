@@ -44,13 +44,14 @@ class ServeConfigRules(Callback):
             "flash_mla",
             "flash_infer",
             "dllm",
+            "hunyuan_attn",
             "triton",
             "npu",
             "hopper_mixed",
             "ref",
         }:
             self._exit_with_error(
-                f"attn_type must be one of [auto, flash_attn, flash_mla, flash_infer, triton, npu, hopper_mixed, ref], got {attn_type}"
+                f"attn_type must be one of [auto, flash_attn, flash_mla, flash_infer, hunyuan_attn, triton, npu, hopper_mixed, ref], got {attn_type}"
             )
 
         model_name = config.models.name

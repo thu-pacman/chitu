@@ -12,6 +12,7 @@ from chitu.models.registry import ModelType
 from chitu.utils import try_import_opt_dep
 
 _, has_flash_attn3 = try_import_opt_dep("flash_attn_interface", "flash_attn_interface")
+_, has_hunyuan_ops = try_import_opt_dep("hpc", "hpc_ops")
 
 KVArgs = Dict[str, Any]
 KVKeys = List[str]
@@ -103,6 +104,36 @@ def should_use_hopper_mixed_backend(args) -> bool:
     ):
         return False
     return has_flash_attn3
+
+
+def can_use_hunyuan_attn(args) -> bool:
+    if not has_hunyuan_ops:
+        return False
+
+    models = getattr(args, "models", args)
+    infer = getattr(args, "infer", args)
+    fp16_variant = getattr(args, "float_16bit_variant", None)
+    quant_config = getattr(models, "quant_config", None)
+    kv_cache_cfg = getattr(quant_config, "kv_cache", None) if quant_config else None
+    kv_quant_type = getattr(kv_cache_cfg, "type", None)
+
+    head_dim = getattr(models, "head_dim", None)
+    if head_dim is None:
+        head_dim = int(models.dim) // int(models.n_heads)
+    if int(head_dim) != 128:
+        return False
+    if kv_quant_type not in {None, "fp8_pertensor"}:
+        return False
+    if kv_quant_type is None and fp16_variant != "bfloat16":
+        return False
+    cache_type = getattr(infer, "cache_type", None)
+    if cache_type != "paged":
+        return False
+    n_heads = int(models.n_heads)
+    n_kv_heads = int(getattr(models, "n_kv_heads", n_heads) or n_heads)
+    return (
+        n_kv_heads > 0 and n_heads % n_kv_heads == 0 and n_heads // n_kv_heads in {4, 8}
+    )
 
 
 def default_paged_block_size_policy(args) -> int:
