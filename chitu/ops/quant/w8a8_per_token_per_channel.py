@@ -5,6 +5,7 @@
 from typing import Optional
 import torch
 
+from chitu.native_layout import NpuFractalZnTensor
 from chitu.ops.activation import silu_and_mul
 from chitu.ops.utils import make_op_dispatcher
 from chitu.import_utils import try_import_platform_dep, try_import_and_setup_torch_npu
@@ -14,6 +15,12 @@ triton, has_triton = try_import_platform_dep("triton")
 lmslim, has_lmslim = try_import_platform_dep("lmslim")
 lightop, has_lightop = try_import_platform_dep("lightop")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+
+# Although imported lmslim and lightop, some version of them does not contain the following
+# sub-package. So treat the following with `try_import_platform_dep`, too.
+lmslim_quant_ops, has_lmslim_quant_ops = try_import_platform_dep(
+    "lmslim.quantize.quant_ops"
+)
 
 if has_triton:
     from chitu.ops.triton_ops import w8a8_gemm_per_token_per_channel_triton
@@ -36,7 +43,116 @@ def w8a8_gemm_per_token_per_channel(
 
 @w8a8_gemm_per_token_per_channel.register_auto
 def _auto_w8a8_gemm_per_token_per_channel():
-    return "triton"
+    if has_lmslim_quant_ops and hasattr(lmslim_quant_ops, "hipblaslt_w8a8_gemm"):
+        return "hipblaslt_w8a8_gemm"
+    if has_lightop and hasattr(lightop, "gemm_w8a8_smooth"):
+        return "lightop_gemm_w8a8_smooth"
+    if has_torch_npu:
+        return "torch_npu"
+    if has_triton:
+        return "triton"
+    raise NotImplementedError(
+        "No available implementation for w8a8_gemm_per_token_per_channel"
+    )
+
+
+@w8a8_gemm_per_token_per_channel.register(
+    "hipblaslt_w8a8_gemm",
+    available=has_lmslim_quant_ops and hasattr(lmslim_quant_ops, "hipblaslt_w8a8_gemm"),
+)
+@single_dispatch_lazy_tensor
+def w8a8_gemm_per_token_per_channel_hipblaslt_w8a8_gemm(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+):
+    assert a.ndim == 2  # bs * in
+    assert b.ndim == 2  # out * in
+    if a.numel() == 0:
+        return torch.empty(
+            (0, b.shape[0]), dtype=torch.get_default_dtype(), device=a.device
+        )
+    a_s = a_s.view(a.shape[0], 1)
+    b_s = b_s.view(b_s.shape[0], 1)
+
+    # BLASLt contract: input [M, K], weight [N, K], trans="NT".
+    m = a.shape[0]
+    k = a.shape[1]
+    n = b.shape[0]
+    status, out = lmslim_quant_ops.hipblaslt_w8a8_gemm(
+        a, b, a_s, b_s, m, n, k, "NT", torch.get_default_dtype()
+    )
+    if status is False or out is None:
+        raise RuntimeError(
+            f"hipblaslt_w8a8_gemm failed: {a.shape=} {b.shape=} {a_s.shape=} {b_s.shape=}"
+        )
+    return out
+
+
+@w8a8_gemm_per_token_per_channel.register(
+    "lightop_gemm_w8a8_smooth",
+    available=has_lightop and hasattr(lightop, "gemm_w8a8_smooth"),
+)
+@single_dispatch_lazy_tensor
+def w8a8_gemm_per_token_per_channel_lightop_gemm_w8a8_smooth(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+):
+    assert a.ndim == 2  # bs * in
+    assert b.ndim == 2  # out * in
+    if a.numel() == 0:
+        return torch.empty(
+            (0, b.shape[0]), dtype=torch.get_default_dtype(), device=a.device
+        )
+    a_s = a_s.view(a.shape[0], 1)
+    b_s = b_s.view(b_s.shape[0], 1)
+
+    # LightOp contract: input [M, K], weight view [K, N] with TN layout.
+    status, out = lightop.gemm_w8a8_smooth(
+        a,
+        b.t(),
+        a_s,
+        b_s,
+        None,
+        torch.get_default_dtype(),
+    )
+    if status is False or out is None:
+        raise RuntimeError(
+            f"lightop.gemm_w8a8_smooth failed: {a.shape=} {b.shape=} {a_s.shape=} {b_s.shape=}"
+        )
+    return out
+
+
+@w8a8_gemm_per_token_per_channel.register("torch_npu", available=has_torch_npu)
+@single_dispatch_lazy_tensor
+def w8a8_gemm_per_token_per_channel_torch_npu(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor | NpuFractalZnTensor,
+    b_s: torch.Tensor,
+):
+    assert a.ndim == 2  # bs * in
+    assert b.ndim == 2  # out * in
+    if a.numel() == 0:
+        return torch.empty(
+            (0, b.shape[0]), dtype=torch.get_default_dtype(), device=a.device
+        )
+    a_s = a_s.view(a.shape[0])
+    b_s = b_s.view(b_s.shape[0])
+
+    if isinstance(b, torch.Tensor):
+        b = b.T
+    elif isinstance(b, NpuFractalZnTensor):
+        b = b.layout_tensor
+    else:
+        raise NotImplementedError(f"Unsupported b type: {type(b)}")
+
+    return torch_npu.npu_quant_matmul(
+        a, b, b_s, pertoken_scale=a_s, bias=None, output_dtype=torch.get_default_dtype()
+    )
 
 
 w8a8_gemm_per_token_per_channel.register_candidate("triton")

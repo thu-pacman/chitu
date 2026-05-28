@@ -23,7 +23,7 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
     ConcatPermutedBatchedRoutedActivationMinimal,
 )
-from chitu.ops import a8_per_token_act_quant
+from chitu.ops import a8_per_token_act_quant, w8a8_gemm_per_token_per_channel
 from chitu.ops.utils import make_op_dispatcher
 from chitu.lazy import eval_lazy
 
@@ -182,9 +182,7 @@ class AscendW8A8Linear(
 
 @QuantizationRegistry.register_linear("ascend_w8a8_dynamic")
 class AscendW8A8DynamicLinear(
-    enable_native_layout_weight("weight", NpuFractalZnTensor),
-    enable_native_layout_weight("weight_scale", SqueezeLastSingleton),
-    QuantizedLinearBase,
+    enable_native_layout_weight("weight", NpuFractalZnTensor), QuantizedLinearBase
 ):
     def __init__(
         self,
@@ -222,23 +220,18 @@ class AscendW8A8DynamicLinear(
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = eval_lazy(x)
-
         if x.shape[0] == 0:
             return torch.empty([0, self.out_features], dtype=x.dtype, device=x.device)
-        output_dtype = x.dtype
         quantized_x, dynamic_scale = a8_per_token_act_quant(
             x.view(-1, self.in_features)
         )
-        output = torch_npu.npu_quant_matmul(
+        y = w8a8_gemm_per_token_per_channel(
             quantized_x,
-            self.weight,
+            dynamic_scale,
+            self.get_native_layout_weight(),
             self.weight_scale,
-            pertoken_scale=dynamic_scale,
-            bias=None,
-            output_dtype=output_dtype,
         )
-        return output
+        return y.view(*x.shape[-1], y.shape[-1])
 
 
 def _finalize_fused_experts_sum_output(
