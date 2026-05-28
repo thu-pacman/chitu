@@ -19,7 +19,7 @@ from chitu.lazy import eval_lazy
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.utils import try_import_platform_dep, ceil_div
 from chitu.global_vars import set_global_args
-from chitu.testing import assert_close
+from chitu.testing import assert_close, AssertOpCalled
 
 triton, has_triton = try_import_platform_dep("triton")
 
@@ -90,18 +90,21 @@ def test_blockfp8_act_quant(
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("swiglu_limit", [None, 10.0])
+@pytest.mark.parametrize("impl", ["torch", "triton"])
 @pytest.mark.skipif(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
 def test_silu_and_mul_and_blockfp8_act_quant(
-    bs, dim, block_size, dtype: torch.dtype, swiglu_limit, record_benchmark
+    bs, dim, block_size, dtype: torch.dtype, swiglu_limit, impl, record_benchmark
 ):
     if (
         torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
         < bs * dim * dtype.itemsize * 20
     ):
         pytest.skip("No enough device memory on this platform")
+    if impl == "triton" and not has_triton:
+        pytest.skip("Triton is not available")
 
     set_global_args(
         OmegaConf.create({"infer": {"op_impl": "torch"}}), need_ensure=False
@@ -110,16 +113,25 @@ def test_silu_and_mul_and_blockfp8_act_quant(
     assert dim % block_size == 0, "dim must be divisible by block_size"
     a = torch.randn(bs, dim * 2, dtype=dtype, device="cuda")
 
-    a_fp8, a_s = record_benchmark.run(
-        lambda: silu_and_mul_and_blockfp8_act_quant(
-            a, block_size=block_size, swiglu_limit=swiglu_limit
-        ),
-        bs=bs,
-        dim=dim,
-        impl="fused",
-    )
+    # Tested: maybe fused op via lazy
+    def testee():
+        with AssertOpCalled(
+            "silu_and_mul_and_blockfp8_act_quant",
+            expected_call_cnt=1 if impl == "triton" else 0,
+        ):
+            return blockfp8_act_quant(
+                silu_and_mul(a, swiglu_limit=swiglu_limit, impl=impl),
+                block_size=block_size,
+                impl=impl,
+            )
+
+    a_fp8, a_s = record_benchmark.run(testee, bs=bs, dim=dim, impl=impl)
+
+    # Reference: explicitly non-fused op
     a_fp8_ref, a_s_ref = blockfp8_act_quant(
-        eval_lazy(silu_and_mul(a, swiglu_limit=swiglu_limit)), block_size=block_size
+        eval_lazy(silu_and_mul(a, swiglu_limit=swiglu_limit, impl="torch")),
+        block_size=block_size,
+        impl="torch",
     )
 
     assert_close(a_fp8.float(), a_fp8_ref.float(), atol=0.15, rtol=0.15)

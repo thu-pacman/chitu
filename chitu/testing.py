@@ -17,6 +17,7 @@ from typing import Any, Callable, Hashable, Optional, Sequence, TypeVar
 import torch
 
 from chitu.device_type import has_accelerator
+from chitu.ops.utils import add_op_callback, remove_op_callback
 from chitu.utils import try_import_and_setup_torch_npu
 
 TConfig = TypeVar("TConfig")
@@ -347,6 +348,46 @@ def assert_close(
             if 1 - sim <= cos_sim_tol:
                 return
         torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+
+class AssertOpCalled:
+    """
+    A context manager to help assert a specific op is called for a specific times.
+
+    Usage:
+
+    ```
+    with AssertOpCalled("op_name", "impl_name", expected_call_cnt=1):
+        ... # Do some computation
+    ```
+    """
+
+    def __init__(
+        self, op_name: str, impl_name: Optional[str] = None, expected_call_cnt: int = 1
+    ):
+        self.op_name = op_name
+        self.impl_name = impl_name
+        self.expected_call_cnt = expected_call_cnt
+        self.actual_call_cnt = 0
+
+        def callback(actual_op_name: str, actual_impl_name: str):
+            if actual_op_name == self.op_name:
+                if self.impl_name is None or actual_impl_name == self.impl_name:
+                    self.actual_call_cnt += 1
+
+        self.callback = callback
+
+    def __enter__(self):
+        add_op_callback(self.callback)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        remove_op_callback(self.callback)
+        if exc_type is None:
+            if self.impl_name is not None:
+                err_msg = f"Expected {self.expected_call_cnt} calls on op {self.op_name}'s impl {self.impl_name}, but got {self.actual_call_cnt}"
+            else:
+                err_msg = f"Expected {self.expected_call_cnt} calls on op {self.op_name}'s any impl, but got {self.actual_call_cnt}"
+            assert self.actual_call_cnt == self.expected_call_cnt, err_msg
 
 
 def gen_token_to_expert_indices(

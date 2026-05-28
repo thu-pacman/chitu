@@ -43,6 +43,7 @@ from chitu.ops.quant import (
     blockfp8_einsum_shc_hdc_shd,
     w8a8_gemm_per_token_per_channel,
     a8_per_token_act_quant,
+    silu_and_mul_and_a8_per_token_act_quant,
     w4a8_gemm_per_token_per_channel_asymm,
     w4a8_gemm_per_token_per_group_asymm,
     blockfp8_gemm,

@@ -23,6 +23,7 @@ class _ObservedOpImplState:
 
 _observed_op_impls: Dict[str, _ObservedOpImplState] = {}
 _observed_op_impl_summary_emitted = False
+_op_callbacks: set[Callable[[str, str], None]] = set()  # set[fn[op_name, impl_name]]
 
 
 def compatible_with_inplace(fn):
@@ -61,6 +62,14 @@ def compatible_with_inplace(fn):
     return wrapper
 
 
+def add_op_callback(callback: Callable[[str, str], None]):
+    _op_callbacks.add(callback)
+
+
+def remove_op_callback(callback: Callable[[str, str], None]):
+    _op_callbacks.discard(callback)
+
+
 def _get_observed_op_impl_state(op_name: str) -> _ObservedOpImplState:
     state = _observed_op_impls.get(op_name)
     if state is None:
@@ -77,6 +86,8 @@ def _record_op_impl_availability(op_name: str, impl_name: str, available: bool):
 def _record_selected_op_impl(op_name: str, impl_name: str):
     state = _get_observed_op_impl_state(op_name)
     state.selected_impls.add(impl_name)
+    for callback in _op_callbacks:
+        callback(op_name, impl_name)
 
 
 def format_observed_op_impl_summary_lines(pretty: bool = True) -> list[str]:
@@ -207,7 +218,7 @@ def make_op_dispatcher(
             if impl == "auto":
                 if auto_resolver is None:
                     raise NotImplementedError(
-                        f"{dispatch_name}: auto impl is not registered"
+                        f"Implementation selection for {dispatch_name} is missing. Please register with {dispatch_name}.register_auto."
                     )
                 if _auto_kw_filter is None:
                     fwd = {k: v for k, v in kwargs.items() if k != "impl"}
