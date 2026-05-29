@@ -1,6 +1,7 @@
 import os
 import math
 import pytest
+import functools
 import itertools
 from omegaconf import OmegaConf
 
@@ -40,6 +41,138 @@ triton, has_triton = try_import_platform_dep("triton")
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+
+
+@functools.cache
+def get_singleton_group(rank):
+    return CommGroup([[r] for r in range(torch.distributed.get_world_size())], rank)
+
+
+@functools.cache
+def gen_parallel_moe_block_input(
+    *,
+    batch_size,
+    hidden_dim,
+    n_routed_experts,
+    moe_inter_dim,
+    n_fused_shared_experts,
+    dtype,
+):
+    x = torch.randn(batch_size, hidden_dim, dtype=dtype, device="cuda")
+    global_gate_weight = torch.randn(
+        n_routed_experts, hidden_dim, dtype=dtype, device="cuda"
+    )
+    global_experts_gate_weight = torch.randn(
+        n_routed_experts + n_fused_shared_experts,
+        moe_inter_dim,
+        hidden_dim,
+        dtype=dtype,
+        device="cuda",
+    )
+    global_experts_up_weight = torch.randn(
+        n_routed_experts + n_fused_shared_experts,
+        moe_inter_dim,
+        hidden_dim,
+        dtype=dtype,
+        device="cuda",
+    )
+    global_experts_down_weight = torch.randn(
+        n_routed_experts + n_fused_shared_experts,
+        hidden_dim,
+        moe_inter_dim,
+        dtype=dtype,
+        device="cuda",
+    )
+
+    ret = [
+        x,
+        global_gate_weight,
+        global_experts_gate_weight,
+        global_experts_up_weight,
+        global_experts_down_weight,
+    ]
+    for tensor in ret:
+        if tensor is not None:
+            torch.distributed.broadcast(tensor, src=0)
+    return ret
+
+
+@functools.cache
+def ref_parallel_moe_block(
+    *,
+    singleton_group,
+    n_routed_experts,
+    topk,
+    n_fused_shared_experts,
+    task_type,
+    batch_size,
+    hidden_dim,
+    moe_inter_dim,
+    x,
+    global_gate_weight,
+    global_experts_gate_weight,
+    global_experts_up_weight,
+    global_experts_down_weight,
+):
+    ref_moe_impl = MoEImplNoEP(
+        n_routed_experts=n_routed_experts,
+        n_activated_experts=topk,
+        n_fused_shared_experts=n_fused_shared_experts,
+        tp_group=singleton_group,
+        dp_group=singleton_group,
+        etp_group=singleton_group,
+        ep_group=singleton_group,
+    )
+    ref_moe_impl.prepare(task_type, batch_size)
+    ref_moe_block = ParallelMoeBlock(
+        MoeGate(
+            op_impl="torch",
+            dim=hidden_dim,
+            topk=topk,
+            n_groups=1,
+            topk_groups=1,
+            topk_as_topk_group_criteria=None,
+            score_func="softmax",
+            route_scale=1,
+            n_experts=n_routed_experts,
+            bias=None,
+            e_score_correction_bias=None,
+            norm_prob=True,
+            n_fused_shared_experts=0,
+            _debug_force_moe_balance=False,
+        ),
+        NormalMoeExpertsUnmerged(
+            dim=hidden_dim,
+            moe_inter_dim=moe_inter_dim,
+            global_n_experts=n_routed_experts,
+            experts_start_idx=0,
+            experts_end_idx=n_routed_experts,
+            n_activated_experts=topk,
+            checkpoint_prefix="ffn.experts",
+        ),
+        non_fused_shared_experts=None,
+        layer_id=0,
+        moe_impl=ref_moe_impl,
+        enable_dynamic_load_balance=False,
+        prefill_memory_tolerance=float("inf"),
+        checkpoint_prefix="ffn",
+    )
+    ref_state_dict = {
+        "gate.weight": global_gate_weight,
+        "experts.gate_proj_weight": global_experts_gate_weight[:n_routed_experts],
+        "experts.up_proj_weight": global_experts_up_weight[:n_routed_experts],
+        "experts.down_proj_weight": global_experts_down_weight[:n_routed_experts],
+    }
+    ref_moe_block.load_state_dict(ref_state_dict, strict=True, assign=True)
+
+    ref_x = x.clone()
+    ref_y = ref_moe_block(ref_x.clone())
+    for i in range(n_routed_experts, n_routed_experts + n_fused_shared_experts):
+        shared_gate = torch.nn.functional.linear(ref_x, global_experts_gate_weight[i])
+        shared_up = torch.nn.functional.linear(ref_x, global_experts_up_weight[i])
+        shared_act = torch.nn.functional.silu(shared_gate) * shared_up
+        ref_y += torch.nn.functional.linear(shared_act, global_experts_down_weight[i])
+    return ref_y
 
 
 @pytest.mark.parametrize(
@@ -169,42 +302,20 @@ def test_parallel_moe_block(
     torch.set_default_dtype(dtype)
     torch.cuda.set_device(local_rank)
 
-    x = torch.randn(batch_size, hidden_dim, dtype=dtype, device="cuda")
-    global_gate_weight = torch.randn(
-        n_routed_experts, hidden_dim, dtype=dtype, device="cuda"
-    )
-    global_experts_gate_weight = torch.randn(
-        n_routed_experts + n_fused_shared_experts,
-        moe_inter_dim,
-        hidden_dim,
-        dtype=dtype,
-        device="cuda",
-    )
-    global_experts_up_weight = torch.randn(
-        n_routed_experts + n_fused_shared_experts,
-        moe_inter_dim,
-        hidden_dim,
-        dtype=dtype,
-        device="cuda",
-    )
-    global_experts_down_weight = torch.randn(
-        n_routed_experts + n_fused_shared_experts,
-        hidden_dim,
-        moe_inter_dim,
-        dtype=dtype,
-        device="cuda",
-    )
-
-    for tensor in [
+    (
         x,
         global_gate_weight,
         global_experts_gate_weight,
         global_experts_up_weight,
         global_experts_down_weight,
-    ]:
-        if tensor is not None:
-            torch.distributed.broadcast(tensor, src=0)
-    ref_x = x.clone()  # In case of in-place ops
+    ) = gen_parallel_moe_block_input(
+        batch_size=batch_size,
+        hidden_dim=hidden_dim,
+        n_routed_experts=n_routed_experts,
+        moe_inter_dim=moe_inter_dim,
+        n_fused_shared_experts=n_fused_shared_experts,
+        dtype=dtype,
+    )
 
     tp_rank_lists = get_tp_rank_lists(tp_size=tp_size, world_size=test_world_size)
     dp_rank_lists = get_dp_rank_lists(
@@ -232,8 +343,22 @@ def test_parallel_moe_block(
     dp_group = CommGroup(dp_rank_lists, rank)
     etp_group = CommGroup(etp_rank_lists, rank)
     ep_group = CommGroup(ep_rank_lists, rank)
-    singleton_group = CommGroup(
-        [[r] for r in range(torch.distributed.get_world_size())], rank
+    singleton_group = get_singleton_group(rank)
+
+    ref_y = ref_parallel_moe_block(
+        singleton_group=singleton_group,
+        n_routed_experts=n_routed_experts,
+        topk=topk,
+        n_fused_shared_experts=n_fused_shared_experts,
+        task_type=task_type,
+        batch_size=batch_size,
+        hidden_dim=hidden_dim,
+        moe_inter_dim=moe_inter_dim,
+        x=x,
+        global_gate_weight=global_gate_weight,
+        global_experts_gate_weight=global_experts_gate_weight,
+        global_experts_up_weight=global_experts_up_weight,
+        global_experts_down_weight=global_experts_down_weight,
     )
 
     ############################################################################
@@ -365,62 +490,11 @@ def test_parallel_moe_block(
             )
         parallel_moe_block.load_state_dict(state_dict, strict=True, assign=True)
 
-        ref_moe_impl = MoEImplNoEP(
-            n_routed_experts=n_routed_experts,
-            n_activated_experts=topk,
-            n_fused_shared_experts=n_fused_shared_experts,
-            tp_group=singleton_group,
-            dp_group=singleton_group,
-            etp_group=singleton_group,
-            ep_group=singleton_group,
-        )
-        ref_moe_impl.prepare(task_type, local_batch_size)
-        ref_moe_block = ParallelMoeBlock(
-            MoeGate(
-                op_impl="torch",
-                dim=hidden_dim,
-                topk=topk,
-                n_groups=1,
-                topk_groups=1,
-                topk_as_topk_group_criteria=None,
-                score_func="softmax",
-                route_scale=1,
-                n_experts=n_routed_experts,
-                bias=None,
-                e_score_correction_bias=None,
-                norm_prob=True,
-                n_fused_shared_experts=0,
-                _debug_force_moe_balance=False,
-            ),
-            NormalMoeExpertsUnmerged(
-                dim=hidden_dim,
-                moe_inter_dim=moe_inter_dim,
-                global_n_experts=n_routed_experts,
-                experts_start_idx=0,
-                experts_end_idx=n_routed_experts,
-                n_activated_experts=topk,
-                checkpoint_prefix="ffn.experts",
-            ),
-            non_fused_shared_experts=None,
-            layer_id=0,
-            moe_impl=ref_moe_impl,
-            enable_dynamic_load_balance=False,
-            prefill_memory_tolerance=float("inf"),
-            checkpoint_prefix="ffn",
-        )
-        ref_state_dict = {
-            "gate.weight": global_gate_weight,
-            "experts.gate_proj_weight": global_experts_gate_weight[:n_routed_experts],
-            "experts.up_proj_weight": global_experts_up_weight[:n_routed_experts],
-            "experts.down_proj_weight": global_experts_down_weight[:n_routed_experts],
-        }
-        ref_moe_block.load_state_dict(ref_state_dict, strict=True, assign=True)
-
         local_bs_list = compute_local_batch_size_dist_in_dp(x.shape[0], dp_size)
         cumulative_local_bs_list = list(itertools.accumulate(local_bs_list, initial=0))
         dp_token_start = cumulative_local_bs_list[dp_group.rank_in_group]
         dp_token_end = cumulative_local_bs_list[dp_group.rank_in_group + 1]
-        local_x = x[dp_token_start:dp_token_end]
+        local_x = x[dp_token_start:dp_token_end].clone()
         local_y = record_benchmark.run(
             lambda: parallel_moe_block(local_x, experts_impl=experts_impl),
             batch_size=batch_size,
@@ -439,16 +513,6 @@ def test_parallel_moe_block(
             dtype=dtype,
             impl=f"{token_dispatcher_impl}+{experts_impl}",
         )
-        ref_y = ref_moe_block(ref_x.clone())
-        for i in range(n_routed_experts, n_routed_experts + n_fused_shared_experts):
-            shared_gate = torch.nn.functional.linear(
-                ref_x, global_experts_gate_weight[i]
-            )
-            shared_up = torch.nn.functional.linear(ref_x, global_experts_up_weight[i])
-            shared_act = torch.nn.functional.silu(shared_gate) * shared_up
-            ref_y += torch.nn.functional.linear(
-                shared_act, global_experts_down_weight[i]
-            )
         ref_local_y = ref_y[dp_token_start:dp_token_end]
 
         assert_close(local_y, ref_local_y, cos_sim_tol=0.002)
@@ -458,6 +522,185 @@ def test_parallel_moe_block(
     torch.distributed.barrier(
         device_ids=[torch.cuda.current_device()]
     )  # Non-working ranks should not exit too early
+
+
+@functools.cache
+def gen_parallel_moe_block_input_blockfp8(
+    *,
+    batch_size,
+    hidden_dim,
+    quant_block_size,
+    n_routed_experts,
+    moe_inter_dim,
+    n_fused_shared_experts,
+    dtype,
+):
+    assert hidden_dim % quant_block_size == 0
+    x = torch.randn(batch_size, hidden_dim, dtype=dtype, device="cuda")
+    global_gate_weight = torch.randn(
+        n_routed_experts, hidden_dim, dtype=dtype, device="cuda"
+    )
+    global_experts_gate_weight = torch.randn(
+        n_routed_experts + n_fused_shared_experts,
+        moe_inter_dim,
+        hidden_dim,
+        dtype=dtype,
+        device="cuda",
+    ).to(torch.float8_e4m3fn)
+    global_experts_gate_scale = torch.randn(
+        n_routed_experts + n_fused_shared_experts,
+        moe_inter_dim // quant_block_size,
+        hidden_dim // quant_block_size,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    global_experts_up_weight = torch.randn(
+        n_routed_experts + n_fused_shared_experts,
+        moe_inter_dim,
+        hidden_dim,
+        dtype=dtype,
+        device="cuda",
+    ).to(torch.float8_e4m3fn)
+    global_experts_up_scale = torch.randn(
+        n_routed_experts + n_fused_shared_experts,
+        moe_inter_dim // quant_block_size,
+        hidden_dim // quant_block_size,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    global_experts_down_weight = torch.randn(
+        n_routed_experts + n_fused_shared_experts,
+        hidden_dim,
+        moe_inter_dim,
+        dtype=dtype,
+        device="cuda",
+    ).to(torch.float8_e4m3fn)
+    global_experts_down_scale = torch.randn(
+        n_routed_experts + n_fused_shared_experts,
+        hidden_dim // quant_block_size,
+        moe_inter_dim // quant_block_size,
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    ret = [
+        x,
+        global_gate_weight,
+        global_experts_gate_weight,
+        global_experts_gate_scale,
+        global_experts_up_weight,
+        global_experts_up_scale,
+        global_experts_down_weight,
+        global_experts_down_scale,
+    ]
+    for tensor in ret:
+        if tensor is not None:
+            torch.distributed.broadcast(tensor, src=0)
+    return ret
+
+
+@functools.cache
+def ref_parallel_moe_block_blockfp8(
+    *,
+    singleton_group,
+    n_routed_experts,
+    topk,
+    n_fused_shared_experts,
+    task_type,
+    batch_size,
+    hidden_dim,
+    quant_block_size,
+    moe_inter_dim,
+    x,
+    global_gate_weight,
+    global_experts_gate_weight,
+    global_experts_gate_scale,
+    global_experts_up_weight,
+    global_experts_up_scale,
+    global_experts_down_weight,
+    global_experts_down_scale,
+):
+    ref_moe_impl = MoEImplNoEP(
+        n_routed_experts=n_routed_experts,
+        n_activated_experts=topk,
+        n_fused_shared_experts=n_fused_shared_experts,
+        tp_group=singleton_group,
+        dp_group=singleton_group,
+        etp_group=singleton_group,
+        ep_group=singleton_group,
+    )
+    ref_moe_impl.prepare(task_type, batch_size)
+    ref_moe_block = ParallelMoeBlock(
+        MoeGate(
+            op_impl="torch",
+            dim=hidden_dim,
+            topk=topk,
+            n_groups=1,
+            topk_groups=1,
+            topk_as_topk_group_criteria=None,
+            score_func="softmax",
+            route_scale=1,
+            n_experts=n_routed_experts,
+            bias=None,
+            e_score_correction_bias=None,
+            norm_prob=True,
+            n_fused_shared_experts=0,
+            _debug_force_moe_balance=False,
+        ),
+        Blockfp8MoeExpertsUnmerged(
+            dim=hidden_dim,
+            moe_inter_dim=moe_inter_dim,
+            global_n_experts=n_routed_experts,
+            experts_start_idx=0,
+            experts_end_idx=n_routed_experts,
+            n_activated_experts=topk,
+            checkpoint_prefix="ffn.experts",
+            block_size=quant_block_size,
+        ),
+        non_fused_shared_experts=None,
+        layer_id=0,
+        moe_impl=ref_moe_impl,
+        enable_dynamic_load_balance=False,
+        prefill_memory_tolerance=float("inf"),
+        checkpoint_prefix="ffn",
+    )
+    ref_state_dict = {
+        "gate.weight": global_gate_weight,
+        "experts.gate_proj_weight": global_experts_gate_weight[:n_routed_experts],
+        "experts.gate_proj_scale": global_experts_gate_scale[:n_routed_experts],
+        "experts.up_proj_weight": global_experts_up_weight[:n_routed_experts],
+        "experts.up_proj_scale": global_experts_up_scale[:n_routed_experts],
+        "experts.down_proj_weight": global_experts_down_weight[:n_routed_experts],
+        "experts.down_proj_scale": global_experts_down_scale[:n_routed_experts],
+    }
+    ref_moe_block.load_state_dict(ref_state_dict, strict=True, assign=True)
+
+    ref_x = x.clone()
+    ref_y = ref_moe_block(ref_x.clone())
+    for i in range(n_routed_experts, n_routed_experts + n_fused_shared_experts):
+        shared_gate = linear_blockfp8(
+            ref_x,
+            global_experts_gate_weight[i],
+            global_experts_gate_scale[i],
+            block_size=quant_block_size,
+            round_scale_to_pow2=False,
+        )
+        shared_up = linear_blockfp8(
+            ref_x,
+            global_experts_up_weight[i],
+            global_experts_up_scale[i],
+            block_size=quant_block_size,
+            round_scale_to_pow2=False,
+        )
+        shared_act = torch.nn.functional.silu(shared_gate) * shared_up
+        ref_y += linear_blockfp8(
+            shared_act,
+            global_experts_down_weight[i],
+            global_experts_down_scale[i],
+            block_size=quant_block_size,
+            round_scale_to_pow2=False,
+        )
+    return ref_y
 
 
 @pytest.mark.parametrize(
@@ -581,55 +824,7 @@ def test_parallel_moe_block_blockfp8(
     torch.set_default_dtype(dtype)
     torch.cuda.set_device(local_rank)
 
-    assert hidden_dim % quant_block_size == 0
-    x = torch.randn(batch_size, hidden_dim, dtype=dtype, device="cuda")
-    global_gate_weight = torch.randn(
-        n_routed_experts, hidden_dim, dtype=dtype, device="cuda"
-    )
-    global_experts_gate_weight = torch.randn(
-        n_routed_experts + n_fused_shared_experts,
-        moe_inter_dim,
-        hidden_dim,
-        dtype=dtype,
-        device="cuda",
-    ).to(torch.float8_e4m3fn)
-    global_experts_gate_scale = torch.randn(
-        n_routed_experts + n_fused_shared_experts,
-        moe_inter_dim // quant_block_size,
-        hidden_dim // quant_block_size,
-        dtype=torch.float32,
-        device="cuda",
-    )
-    global_experts_up_weight = torch.randn(
-        n_routed_experts + n_fused_shared_experts,
-        moe_inter_dim,
-        hidden_dim,
-        dtype=dtype,
-        device="cuda",
-    ).to(torch.float8_e4m3fn)
-    global_experts_up_scale = torch.randn(
-        n_routed_experts + n_fused_shared_experts,
-        moe_inter_dim // quant_block_size,
-        hidden_dim // quant_block_size,
-        dtype=torch.float32,
-        device="cuda",
-    )
-    global_experts_down_weight = torch.randn(
-        n_routed_experts + n_fused_shared_experts,
-        hidden_dim,
-        moe_inter_dim,
-        dtype=dtype,
-        device="cuda",
-    ).to(torch.float8_e4m3fn)
-    global_experts_down_scale = torch.randn(
-        n_routed_experts + n_fused_shared_experts,
-        hidden_dim // quant_block_size,
-        moe_inter_dim // quant_block_size,
-        dtype=torch.float32,
-        device="cuda",
-    )
-
-    for tensor in [
+    (
         x,
         global_gate_weight,
         global_experts_gate_weight,
@@ -638,10 +833,15 @@ def test_parallel_moe_block_blockfp8(
         global_experts_up_scale,
         global_experts_down_weight,
         global_experts_down_scale,
-    ]:
-        if tensor is not None:
-            torch.distributed.broadcast(tensor, src=0)
-    ref_x = x.clone()  # In case of in-place ops
+    ) = gen_parallel_moe_block_input_blockfp8(
+        batch_size=batch_size,
+        hidden_dim=hidden_dim,
+        quant_block_size=quant_block_size,
+        n_routed_experts=n_routed_experts,
+        moe_inter_dim=moe_inter_dim,
+        n_fused_shared_experts=n_fused_shared_experts,
+        dtype=dtype,
+    )
 
     tp_rank_lists = get_tp_rank_lists(tp_size=tp_size, world_size=test_world_size)
     dp_rank_lists = get_dp_rank_lists(
@@ -669,8 +869,26 @@ def test_parallel_moe_block_blockfp8(
     dp_group = CommGroup(dp_rank_lists, rank)
     etp_group = CommGroup(etp_rank_lists, rank)
     ep_group = CommGroup(ep_rank_lists, rank)
-    singleton_group = CommGroup(
-        [[r] for r in range(torch.distributed.get_world_size())], rank
+    singleton_group = get_singleton_group(rank)
+
+    ref_y = ref_parallel_moe_block_blockfp8(
+        singleton_group=singleton_group,
+        n_routed_experts=n_routed_experts,
+        topk=topk,
+        n_fused_shared_experts=n_fused_shared_experts,
+        task_type=task_type,
+        batch_size=batch_size,
+        hidden_dim=hidden_dim,
+        quant_block_size=quant_block_size,
+        moe_inter_dim=moe_inter_dim,
+        x=x,
+        global_gate_weight=global_gate_weight,
+        global_experts_gate_weight=global_experts_gate_weight,
+        global_experts_gate_scale=global_experts_gate_scale,
+        global_experts_up_weight=global_experts_up_weight,
+        global_experts_up_scale=global_experts_up_scale,
+        global_experts_down_weight=global_experts_down_weight,
+        global_experts_down_scale=global_experts_down_scale,
     )
 
     ############################################################################
@@ -833,66 +1051,11 @@ def test_parallel_moe_block_blockfp8(
             )
         parallel_moe_block.load_state_dict(state_dict, strict=True, assign=True)
 
-        ref_moe_impl = MoEImplNoEP(
-            n_routed_experts=n_routed_experts,
-            n_activated_experts=topk,
-            n_fused_shared_experts=n_fused_shared_experts,
-            tp_group=singleton_group,
-            dp_group=singleton_group,
-            etp_group=singleton_group,
-            ep_group=singleton_group,
-        )
-        ref_moe_impl.prepare(task_type, local_batch_size)
-        ref_moe_block = ParallelMoeBlock(
-            MoeGate(
-                op_impl="torch",
-                dim=hidden_dim,
-                topk=topk,
-                n_groups=1,
-                topk_groups=1,
-                topk_as_topk_group_criteria=None,
-                score_func="softmax",
-                route_scale=1,
-                n_experts=n_routed_experts,
-                bias=None,
-                e_score_correction_bias=None,
-                norm_prob=True,
-                n_fused_shared_experts=0,
-                _debug_force_moe_balance=False,
-            ),
-            Blockfp8MoeExpertsUnmerged(
-                dim=hidden_dim,
-                moe_inter_dim=moe_inter_dim,
-                global_n_experts=n_routed_experts,
-                experts_start_idx=0,
-                experts_end_idx=n_routed_experts,
-                n_activated_experts=topk,
-                checkpoint_prefix="ffn.experts",
-                block_size=quant_block_size,
-            ),
-            non_fused_shared_experts=None,
-            layer_id=0,
-            moe_impl=ref_moe_impl,
-            enable_dynamic_load_balance=False,
-            prefill_memory_tolerance=float("inf"),
-            checkpoint_prefix="ffn",
-        )
-        ref_state_dict = {
-            "gate.weight": global_gate_weight,
-            "experts.gate_proj_weight": global_experts_gate_weight[:n_routed_experts],
-            "experts.gate_proj_scale": global_experts_gate_scale[:n_routed_experts],
-            "experts.up_proj_weight": global_experts_up_weight[:n_routed_experts],
-            "experts.up_proj_scale": global_experts_up_scale[:n_routed_experts],
-            "experts.down_proj_weight": global_experts_down_weight[:n_routed_experts],
-            "experts.down_proj_scale": global_experts_down_scale[:n_routed_experts],
-        }
-        ref_moe_block.load_state_dict(ref_state_dict, strict=True, assign=True)
-
         local_bs_list = compute_local_batch_size_dist_in_dp(x.shape[0], dp_size)
         cumulative_local_bs_list = list(itertools.accumulate(local_bs_list, initial=0))
         dp_token_start = cumulative_local_bs_list[dp_group.rank_in_group]
         dp_token_end = cumulative_local_bs_list[dp_group.rank_in_group + 1]
-        local_x = x[dp_token_start:dp_token_end]
+        local_x = x[dp_token_start:dp_token_end].clone()
         local_y = record_benchmark.run(
             lambda: parallel_moe_block(local_x, experts_impl=experts_impl),
             batch_size=batch_size,
@@ -911,30 +1074,6 @@ def test_parallel_moe_block_blockfp8(
             dtype=dtype,
             impl=f"{token_dispatcher_impl}+{experts_impl}",
         )
-        ref_y = ref_moe_block(ref_x.clone())
-        for i in range(n_routed_experts, n_routed_experts + n_fused_shared_experts):
-            shared_gate = linear_blockfp8(
-                ref_x,
-                global_experts_gate_weight[i],
-                global_experts_gate_scale[i],
-                block_size=quant_block_size,
-                round_scale_to_pow2=False,
-            )
-            shared_up = linear_blockfp8(
-                ref_x,
-                global_experts_up_weight[i],
-                global_experts_up_scale[i],
-                block_size=quant_block_size,
-                round_scale_to_pow2=False,
-            )
-            shared_act = torch.nn.functional.silu(shared_gate) * shared_up
-            ref_y += linear_blockfp8(
-                shared_act,
-                global_experts_down_weight[i],
-                global_experts_down_scale[i],
-                block_size=quant_block_size,
-                round_scale_to_pow2=False,
-            )
         ref_local_y = ref_y[dp_token_start:dp_token_end]
 
         assert_close(local_y, ref_local_y, cos_sim_tol=0.002)
