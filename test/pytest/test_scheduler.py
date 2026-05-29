@@ -25,6 +25,57 @@ class MockTokenizer:
         self.stop_tokens = [2]
 
 
+def test_prefix_cache_probe_does_not_fill_single_slot_scheduler():
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 2048,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                    "schedule_overlap": True,
+                    "mtp_size": 1,
+                }
+            }
+        ),
+        need_ensure=False,
+    )
+    TaskPool.reset()
+    cache_manager = PagedKVCacheManager(
+        num_blocks=100,
+        num_hot_req=1,
+        max_seq_len=2048,
+        dp_rank=0,
+        block_size=512,
+        enable_prefix_caching=True,
+    )
+    Backend.cache_managers = [{"main": cache_manager}]
+    Backend.executor = MockExecutor()
+
+    req = UserRequest.create_mock(
+        input_len=600, request_id="req_prefix_probe", enable_thinking=False
+    )
+    task = Task(req.request_id, req)
+    TaskPool.add(task)
+
+    assert cache_manager.num_cached_blocks(task) == 0
+    assert task.task_id not in cache_manager.task_to_cache_ids
+
+    scheduler = Scheduler(
+        max_runing_tasks=1,
+        prefill_num_tasks=1,
+        decode_num_tasks=1,
+        scheduler_type="prefill_first",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=1,
+        prefill_chunk_size=None,
+    )
+
+    scheduler.prepare_for_schedule()
+    assert scheduler.schedule() == [task.task_id]
+    TaskPool.reset()
+
+
 def test_chunked_prefill():
     set_global_args(
         OmegaConf.create(

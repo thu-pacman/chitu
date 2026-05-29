@@ -140,7 +140,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
     def num_cached_blocks(self, task: "Task") -> int:
         """Number of contiguous cached blocks hit from prompt start."""
-        num_computed_blocks = len(self.task_to_cache_ids[task.task_id])
+        num_computed_blocks = len(self.task_to_cache_ids.get(task.task_id, set()))
         if not self.enable_prefix_caching or task.task_type == TaskType.Decode:
             return num_computed_blocks
 
@@ -168,7 +168,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         if max_cached_token_len <= 0:
             return 0
 
-        num_computed_blocks = len(self.task_to_cache_ids[task.task_id])
+        num_computed_blocks = len(self.task_to_cache_ids.get(task.task_id, set()))
         num_cached_blocks = min(
             self.num_blocks_for_seq_len(max_cached_token_len),
             self.num_cached_blocks(task),
