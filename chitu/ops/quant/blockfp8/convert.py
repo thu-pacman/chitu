@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 
+from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.ops.utils import make_op_dispatcher
 from chitu.utils import try_import_platform_dep
 
@@ -150,6 +151,7 @@ def _auto_blockfp8_act_quant():
 
 
 @blockfp8_act_quant.register("torch")
+@single_dispatch_lazy_tensor
 def blockfp8_act_quant_torch(
     x: torch.Tensor,
     *,

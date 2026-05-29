@@ -19,7 +19,6 @@ from typing_extensions import override
 
 from chitu.device_type import is_hygon
 from chitu.import_utils import try_import_platform_dep
-from chitu.lazy import eval_lazy
 from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
     ExpertBlockPermutedBatchedExpertResult,
@@ -36,7 +35,7 @@ from chitu.native_layout import (
     HygonDeepGemmW8A8MarlinWeight,
     enable_native_layout_weight,
 )
-from chitu.ops import silu_and_mul
+from chitu.ops import silu_and_mul, w8a8_gemm_per_token_per_channel
 from chitu.ops.quant import a8_per_token_act_quant
 from chitu.quantization.base import QuantizedLinearBase, QuantizedMoeExpertsMerged
 from chitu.quantization.registry import QuantizationRegistry
@@ -205,27 +204,11 @@ class HygonW8A8BlasltLinear(QuantizedLinearBase):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = eval_lazy(x)
         out_leading = x.shape[:-1]
-        x2 = x.reshape(-1, x.shape[-1])
-        q_x, act_scale = a8_per_token_act_quant(x2)
-        m = q_x.shape[0]
-        scale_a = act_scale.reshape(m, 1).to(torch.float32)
-        scale_b = self.weight_scale
-        ok, out = _call_hipblaslt_w8a8_gemm(
-            q_x,
-            self.weight,
-            scale_a,
-            scale_b,
-            x.dtype,
+        q_x, act_scale = a8_per_token_act_quant(x.reshape(-1, x.shape[-1]))
+        out = w8a8_gemm_per_token_per_channel(
+            q_x, act_scale.to(torch.float32), self.weight, self.weight_scale
         )
-        if not ok:
-            raise RuntimeError(
-                "hipblaslt_w8a8_gemm failed for explicit "
-                f"linear_backend=blaslt: q_x={tuple(q_x.shape)} "
-                f"weight={tuple(self.weight.shape)} "
-                f"scale_a={tuple(scale_a.shape)} scale_b={tuple(scale_b.shape)}"
-            )
         if self.bias is not None:
             out += self.bias
         return out.view(*out_leading, self.out_features)
@@ -702,9 +685,7 @@ class HygonW8A8DeepGemmMoeExpertsMerged(
             gate_up_out,
         )
 
-        intermediate = eval_lazy(
-            silu_and_mul(gate_up_out, swiglu_limit=self.swiglu_limit)
-        )
+        intermediate = silu_and_mul(gate_up_out, swiglu_limit=self.swiglu_limit)
         q_intermediate, intermediate_scale = a8_per_token_act_quant(intermediate)
         down_weight = (
             self.get_native_layout_down_proj_weight().layout_tensor.contiguous()

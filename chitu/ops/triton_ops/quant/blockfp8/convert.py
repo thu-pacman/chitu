@@ -120,13 +120,16 @@ def _(
     round_scale_to_pow2: bool = False,
     eps: float = 1e-4,
 ):
-    return silu_and_mul_and_blockfp8_act_quant_triton(
+    from chitu.ops import silu_and_mul_and_blockfp8_act_quant
+
+    return silu_and_mul_and_blockfp8_act_quant(
         x.kwargs["x"],
         expert_n_tokens=x.kwargs["expert_n_tokens"],
         swiglu_limit=x.kwargs["swiglu_limit"],
         block_size=block_size,
         round_scale_to_pow2=round_scale_to_pow2,
         eps=eps,
+        impl="triton",
     )
 
 

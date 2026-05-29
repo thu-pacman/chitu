@@ -72,6 +72,26 @@ class TestPagedKVCacheManager:
         assert len(cache_manager.cached_idle_blocks) == 0
         assert cache_manager.enable_prefix_caching is False
 
+    def test_prefix_cache_probe_does_not_register_unscheduled_task(self):
+        cache_manager = PagedKVCacheManager(
+            num_blocks=100,
+            num_hot_req=100,
+            max_seq_len=2048,
+            dp_rank=0,
+            block_size=512,
+            enable_prefix_caching=True,
+        )
+        req = UserRequest.create_mock(
+            input_len=600, request_id="unscheduled", enable_thinking=False
+        )
+        task = Task(task_id=req.request_id, req=req)
+
+        assert task.task_id not in cache_manager.task_to_cache_ids
+        assert cache_manager.num_cached_blocks(task) == 0
+        assert task.task_id not in cache_manager.task_to_cache_ids
+        assert cache_manager.num_cached_idle_blocks(task) == 0
+        assert task.task_id not in cache_manager.task_to_cache_ids
+
     def test_deepseek_v4_sliding_manager_uses_window_length(self):
         manager = DeepSeekV4SlidingKVCacheManager(
             num_blocks=4,

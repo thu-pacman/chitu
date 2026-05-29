@@ -411,7 +411,13 @@ class Scheduler:
         self.scheduling_ts = time.perf_counter_ns()
 
         # collect ready task ids
-        n_running = len(self.cache_manager_dict["main"].task_to_cache_ids)
+        # task_to_cache_ids is a defaultdict; only tasks with allocated cache
+        # blocks should count against the per-DP running-request limit.
+        n_running = sum(
+            1
+            for cache_ids in self.cache_manager_dict["main"].task_to_cache_ids.values()
+            if cache_ids
+        )
 
         task_ids: list[str] = []
         for task_id in TaskPool.id_list:
