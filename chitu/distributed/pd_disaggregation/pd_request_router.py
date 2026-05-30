@@ -13,6 +13,7 @@ import os
 import time
 from collections import OrderedDict
 from typing import Optional
+from typing_extensions import override
 
 import msgpack
 import zmq
@@ -55,8 +56,8 @@ def _policy_algorithm(policy) -> str:
     return str(getattr(policy, "algorithm", "unknown"))
 
 
-def _policy_stats(policy, scheduler_id: int) -> str:
-    stats = getattr(policy, "scheduler_stats", {}).get(scheduler_id)
+def _policy_stats(policy, local_instance_id: int) -> str:
+    stats = getattr(policy, "scheduler_stats", {}).get(local_instance_id)
     if stats is None:
         return "stats=missing"
     return (
@@ -82,8 +83,8 @@ class PDRequestRouter(RequestRouter):
 
             # PD disaggregation related state
             self.pending_pd_requests: dict[str, PendingPDRequest] = {}
-            self.prefill_schedulers: dict[int, dict] = {}  # scheduler_id -> info
-            self.decode_schedulers: dict[int, dict] = {}  # scheduler_id -> info
+            self.prefill_schedulers: dict[int, dict] = {}  # local_instance_id -> info
+            self.decode_schedulers: dict[int, dict] = {}  # local_instance_id -> info
 
             # PD coordination service
             if hasattr(config.pd_disaggregation, "coordination_port"):
@@ -108,7 +109,7 @@ class PDRequestRouter(RequestRouter):
             # Bootstrap Server (Mooncake)
             self.bootstrap_server: Optional[MooncakeBootstrapServer] = None
 
-            # Keep P/D stats in separate policy instances so scheduler_id spaces can overlap.
+            # Keep P/D stats in separate policy instances so local_instance_id spaces can overlap.
             routing_algorithm = getattr(self.config, "routing_algorithm", "")
             if routing_algorithm == "prefix_cache_aware":
                 self.prefill_policy = PrefixCacheAwarePolicy(self.config)
@@ -145,29 +146,30 @@ class PDRequestRouter(RequestRouter):
             )
 
             now = time.time()
-            for scheduler_id in self.prefill_schedulers:
+            # To avoid heartbeat log before first collect, here initialize last_heartbeat_time to inf
+            for local_instance_id in self.prefill_schedulers:
                 self.prefill_policy.update_stats(
                     SchedulerStats(
-                        scheduler_id=scheduler_id,
+                        local_instance_id=local_instance_id,
                         running_requests=0,
                         waiting_requests=0,
                         pending_tokens=0,
                         throughput_tokens_per_sec=0.0,
                         last_update_time=now,
-                        last_heartbeat_time=now,
+                        last_heartbeat_time=float("inf"),
                         is_alive=True,
                     )
                 )
-            for scheduler_id in self.decode_schedulers:
+            for local_instance_id in self.decode_schedulers:
                 self.decode_policy.update_stats(
                     SchedulerStats(
-                        scheduler_id=scheduler_id,
+                        local_instance_id=local_instance_id,
                         running_requests=0,
                         waiting_requests=0,
                         pending_tokens=0,
                         throughput_tokens_per_sec=0.0,
                         last_update_time=now,
-                        last_heartbeat_time=now,
+                        last_heartbeat_time=float("inf"),
                         is_alive=True,
                     )
                 )
@@ -221,14 +223,20 @@ class PDRequestRouter(RequestRouter):
                 await self.pd_coordination_service.start()
 
                 # Register all schedulers to coordination service
-                for scheduler_id, info in self.prefill_schedulers.items():
+                for local_instance_id, info in self.prefill_schedulers.items():
                     await self.pd_coordination_service.register_scheduler(
-                        scheduler_id, SchedulerType.PREFILL, info["host"], info["port"]
+                        local_instance_id,
+                        SchedulerType.PREFILL,
+                        info["host"],
+                        info["port"],
                     )
 
-                for scheduler_id, info in self.decode_schedulers.items():
+                for local_instance_id, info in self.decode_schedulers.items():
                     await self.pd_coordination_service.register_scheduler(
-                        scheduler_id, SchedulerType.DECODE, info["host"], info["port"]
+                        local_instance_id,
+                        SchedulerType.DECODE,
+                        info["host"],
+                        info["port"],
                     )
 
             # Start Mooncake Bootstrap (HTTP)
@@ -256,26 +264,26 @@ class PDRequestRouter(RequestRouter):
     async def _init_pd_sockets(self):
         """Initialize PD specific ZMQ socket"""
         # Create sockets to Prefill Schedulers
-        for scheduler_id, info in self.prefill_schedulers.items():
+        for local_instance_id, info in self.prefill_schedulers.items():
             socket = self.context.socket(zmq.PUSH)
             # Fail immdediately if peer not connected to avoid silent drops.
             socket.setsockopt(zmq.IMMEDIATE, 1)
             socket.connect(info["address"])
-            self.prefill_sockets[scheduler_id] = socket
+            self.prefill_sockets[local_instance_id] = socket
             logger.info(
-                f"connected to prefill scheduler {scheduler_id}: {info['address']}"
+                f"connected to prefill instance {local_instance_id}: {info['address']}"
             )
 
         self._init_prefill_policy_shadow_caches()
 
         # Create sockets to Decode Schedulers
-        for scheduler_id, info in self.decode_schedulers.items():
+        for local_instance_id, info in self.decode_schedulers.items():
             socket = self.context.socket(zmq.PUSH)
             socket.setsockopt(zmq.IMMEDIATE, 1)
             socket.connect(info["address"])
-            self.decode_sockets[scheduler_id] = socket
+            self.decode_sockets[local_instance_id] = socket
             logger.info(
-                f"connected to decode scheduler {scheduler_id}: {info['address']}"
+                f"connected to decode instance {local_instance_id}: {info['address']}"
             )
 
         # Create statistics collection socket
@@ -296,6 +304,73 @@ class PDRequestRouter(RequestRouter):
             for sid in self.prefill_schedulers:
                 self.prefill_policy.evict_buffer.setdefault(sid, OrderedDict())
 
+    @override
+    async def _heartbeat_monitor_task(self, timeout: float = 20.0):
+        if not self.pd_enabled:
+            return super()._heartbeat_monitor_task(timeout)
+
+        HEARTBEAT_TIMEOUT = timeout  # 20s timeout threshold
+        while True:
+            current_time = time.time()
+
+            # Check heartbeat status for all schedulers
+            for role in ["prefill", "decode"]:
+                policy = getattr(self, role + "_policy", None)
+                if policy is None:
+                    raise ValueError(f"{role} policy not found")
+                for local_instance_id, stats in policy.scheduler_stats.items():
+                    if current_time - stats.last_heartbeat_time > HEARTBEAT_TIMEOUT:
+                        logger.warning(
+                            f"--- [HEARTBEAT_MONITOR] {role} instance {local_instance_id} heartbeat timeout! ---"
+                            f"Last heartbeat: {current_time - stats.last_heartbeat_time:.2f}s ago"
+                        )
+                        # Mark as dead
+                        stats.is_alive = False
+            await asyncio.sleep(5.0)  # Check every 5 seconds
+
+    @override
+    async def _health_monitor_task(self):
+        if not self.pd_enabled:
+            return super()._health_monitor_task()
+
+        while True:
+            try:
+                await asyncio.sleep(30)  # Log every 30 seconds
+
+                current_time = time.time()
+                elapsed_time = current_time - self.start_time
+
+                if elapsed_time > 0:
+                    requests_per_sec = self.total_requests / elapsed_time
+                    tokens_per_sec = self.total_tokens / elapsed_time
+
+                    logger.info(
+                        f"Router Performance: {requests_per_sec:.2f} req/s, "
+                        f"{tokens_per_sec:.2f} tokens/s, "
+                        f"Total: {self.total_requests} requests, {self.total_tokens} tokens"
+                    )
+
+                    # Log scheduler stats
+                    for role in ["prefill", "decode"]:
+                        policy = getattr(self, role + "_policy", None)
+                        if policy is None:
+                            raise ValueError(f"{role} policy not found")
+                        for local_instance_id, stats in policy.scheduler_stats.items():
+                            instance_id = local_instance_id + (
+                                0 if role == "prefill" else len(self.prefill_schedulers)
+                            )
+                            logger.debug(
+                                f"Instance {role} {local_instance_id}: "
+                                f"running={stats.running_requests}, "
+                                f"waiting={stats.waiting_requests}, "
+                                f"pending_tokens={stats.pending_tokens}, "
+                                f"throughput={stats.throughput_tokens_per_sec:.2f} tokens/s, "
+                                f"Prometheus "
+                                f"{'online' if self.collector_addrs.get(instance_id, None) is not None else 'offline'}"
+                            )
+            except Exception as e:
+                logger.error(f"Error in health monitor: {e}")
+
     async def _stats_collector_task(self):
         """PD mode: keep prefill/decode stats in separate policies."""
         if self.pd_enabled:
@@ -313,14 +388,14 @@ class PDRequestRouter(RequestRouter):
                     scheduler_type = stats_dict.get("scheduler_type") or stats_dict.get(
                         "pd_mode"
                     )
-                    scheduler_id = int(stats_dict.get("scheduler_id", -1))
+                    local_instance_id = int(stats_dict.get("local_instance_id", -1))
                     if scheduler_type == PDSchedulerMode.PREFILL_ONLY.value:
-                        if scheduler_id not in self.prefill_schedulers:
+                        if local_instance_id not in self.prefill_schedulers:
                             continue
                         policy = self.prefill_policy
                         role = "prefill"
                     elif scheduler_type == PDSchedulerMode.DECODE_ONLY.value:
-                        if scheduler_id not in self.decode_schedulers:
+                        if local_instance_id not in self.decode_schedulers:
                             continue
                         policy = self.decode_policy
                         role = "decode"
@@ -328,7 +403,7 @@ class PDRequestRouter(RequestRouter):
                         continue
 
                     stats = SchedulerStats(
-                        scheduler_id=scheduler_id,
+                        local_instance_id=local_instance_id,
                         running_requests=stats_dict.get("running_requests", 0),
                         waiting_requests=stats_dict.get("waiting_requests", 0),
                         pending_tokens=stats_dict.get("pending_tokens", 0),
@@ -345,7 +420,7 @@ class PDRequestRouter(RequestRouter):
                         evicted_blk_hashes=stats_dict.get("evicted_blk_hashes", []),
                     )
                     policy.update_stats(stats)
-                    stats_log_key = (role, scheduler_id)
+                    stats_log_key = (role, local_instance_id)
                     if stats_log_key not in self._pd_stats_logged:
                         self._pd_stats_logged.add(stats_log_key)
                         logger.info(
@@ -353,7 +428,7 @@ class PDRequestRouter(RequestRouter):
                             "algorithm=%s alive=%s running=%s waiting=%s "
                             "pending_tokens=%s block_size=%s num_blocks=%s",
                             role,
-                            scheduler_id,
+                            local_instance_id,
                             _policy_name(policy),
                             _policy_algorithm(policy),
                             stats.is_alive,
@@ -363,6 +438,40 @@ class PDRequestRouter(RequestRouter):
                             stats.block_size,
                             stats.num_blocks,
                         )
+                    prometheus_collector_addrs = stats_dict.get(
+                        "prometheus_collector_addrs", []
+                    )
+                    if (
+                        self.collector_addrs.get(local_instance_id, None) is None
+                        and len(prometheus_collector_addrs) > 0
+                    ):
+                        if role == "prefill":
+                            instance_id = local_instance_id
+                        elif role == "decode":
+                            instance_id = local_instance_id + len(
+                                self.prefill_schedulers
+                            )
+                        else:
+                            instance_id = local_instance_id
+                        logger.debug(
+                            f"[PD_ROUTER] received Prometheus collector addresses from {role} {local_instance_id} (instance {instance_id})"
+                        )
+                        self.collector_addrs[instance_id] = prometheus_collector_addrs
+                        prefill_instance_ids = [
+                            instance_id
+                            for instance_id in self.prefill_schedulers.keys()
+                        ]
+                        decode_instance_ids = [
+                            instance_id + len(self.prefill_schedulers)
+                            for instance_id in self.decode_schedulers.keys()
+                        ]
+                        all_scheduler_ids = prefill_instance_ids + decode_instance_ids
+                        if all(
+                            self.collector_addrs.get(instance_id, None) is not None
+                            for instance_id in all_scheduler_ids
+                        ):
+                            logger.info(f"[PD_ROUTER] starting Prometheus manager")
+                            self._start_prometheus_manager()
 
             except KeyError as e:
                 logger.error(f"[PD_ROUTER] missing field in stats data: {e}")
@@ -534,53 +643,55 @@ class PDRequestRouter(RequestRouter):
         # Update router performance counters on successful dispatch
         self.total_requests += 1
 
-    async def _send_to_prefill_scheduler(self, scheduler_id: int, request_data: dict):
+    async def _send_to_prefill_scheduler(
+        self, local_instance_id: int, request_data: dict
+    ):
         """Send request to Prefill Scheduler"""
-        if scheduler_id not in self.prefill_sockets:
-            raise ValueError(f"prefill scheduler {scheduler_id} not found")
+        if local_instance_id not in self.prefill_sockets:
+            raise ValueError(f"prefill scheduler {local_instance_id} not found")
 
         # Add Prefill-specific information
         prefill_data = request_data.copy()
         prefill_data["scheduler_type"] = "prefill"
-        prefill_data["scheduler_id"] = scheduler_id
+        prefill_data["local_instance_id"] = local_instance_id
 
         packed_data = msgpack.packb(prefill_data)
         logger.debug(
-            f"[PD_TRACE][router.send_prefill] req_id={prefill_data.get('request_id')} sid={scheduler_id} "
-            f"addr={self.prefill_schedulers.get(scheduler_id, {}).get('address')} packed_bytes={len(packed_data)} "
+            f"[PD_TRACE][router.send_prefill] req_id={prefill_data.get('request_id')} sid={local_instance_id} "
+            f"addr={self.prefill_schedulers.get(local_instance_id, {}).get('address')} packed_bytes={len(packed_data)} "
             f"fields={sorted(list(prefill_data.keys()))}"
         )
         await self._send_with_retry(
-            self.prefill_sockets[scheduler_id],
+            self.prefill_sockets[local_instance_id],
             packed_data,
-            f"prefill:{scheduler_id}",
+            f"prefill:{local_instance_id}",
         )
 
-        logger.debug(f"request sent to prefill scheduler {scheduler_id}")
+        logger.debug(f"request sent to prefill scheduler {local_instance_id}")
 
     async def _send_to_decode_scheduler(
-        self, scheduler_id: int, request_data: dict, prefill_scheduler_id: int
+        self, local_instance_id: int, request_data: dict, prefill_scheduler_id: int
     ):
         """Send request to Decode Scheduler"""
-        if scheduler_id not in self.decode_sockets:
-            raise ValueError(f"decode scheduler {scheduler_id} not found")
+        if local_instance_id not in self.decode_sockets:
+            raise ValueError(f"decode instance {local_instance_id} not found")
 
         # Add Decode-specific information
         decode_data = request_data.copy()
         decode_data["scheduler_type"] = "decode"
-        decode_data["scheduler_id"] = scheduler_id
+        decode_data["local_instance_id"] = local_instance_id
         decode_data["prefill_scheduler_id"] = prefill_scheduler_id
 
         packed_data = msgpack.packb(decode_data)
         logger.debug(
-            f"[PD_TRACE][router.send_decode] req_id={decode_data.get('request_id')} sid={scheduler_id} "
-            f"addr={self.decode_schedulers.get(scheduler_id, {}).get('address')} prefill_sid={prefill_scheduler_id} "
+            f"[PD_TRACE][router.send_decode] req_id={decode_data.get('request_id')} sid={local_instance_id} "
+            f"addr={self.decode_schedulers.get(local_instance_id, {}).get('address')} prefill_sid={prefill_scheduler_id} "
             f"packed_bytes={len(packed_data)} fields={sorted(list(decode_data.keys()))}"
         )
         await self._send_with_retry(
-            self.decode_sockets[scheduler_id],
+            self.decode_sockets[local_instance_id],
             packed_data,
-            f"decode:{scheduler_id}",
+            f"decode:{local_instance_id}",
         )
 
     async def _send_with_retry(self, socket, payload: bytes, label: str):

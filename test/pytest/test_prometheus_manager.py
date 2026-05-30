@@ -6,28 +6,27 @@ import time
 from omegaconf import OmegaConf
 import multiprocessing as mp
 
+from chitu.backend import Backend
 from chitu.global_vars import set_global_args, get_global_args
 import chitu.metrics
 from chitu.metrics import PrometheusMetricsCollector
 from chitu.metrics import PrometheusServerManager
 
 
-class Backend:
-    cache_dict = None
-
-
 class MockGroup:
     def __init__(self, global_rank, rank_in_group):
-        self.rank_in_group = rank_in_group
+        self._rank_in_group = rank_in_group
         self.global_rank = global_rank
+        self.rank_list = {rank_in_group: global_rank}
         self.device = "cpu"
-        self.is_first_rank = True
 
+    @property
     def is_first_rank(self):
         return True
 
+    @property
     def rank_in_group(self):
-        return 0
+        return self._rank_in_group
 
 
 class Monkcachemanager:
@@ -40,7 +39,7 @@ class Monkcachemanager:
         return self.num_blocks - self.num_free_blocks
 
 
-def run_PrometheusServerManager(rank, dp_id, result_queue, stop_event):
+def run_PrometheusServerManager(instance_id, dp_id, rank, result_queue, stop_event):
     chitu.metrics.prometheus_collector.Backend = Backend
     chitu.metrics.prometheus_collector.get_dp_group = lambda: MockGroup(rank, dp_id)
     chitu.metrics.prometheus_collector.get_tp_group = lambda: MockGroup(rank, 0)
@@ -60,13 +59,13 @@ def run_PrometheusServerManager(rank, dp_id, result_queue, stop_event):
             PrometheusMetricsCollector.inc_prompt_tokens(10)
             PrometheusMetricsCollector.inc_generated_tokens(100)
             PrometheusMetricsCollector.inc_task_eviction()
-            PrometheusMetricsCollector.update_kvcache_usage()  # 5/10
+            PrometheusMetricsCollector.update_kvcache_usage()
         if dp_id == 1:
             PrometheusMetricsCollector.inc_prompt_tokens(20)
             PrometheusMetricsCollector.inc_generated_tokens(200)
             PrometheusMetricsCollector.inc_task_eviction()
             PrometheusMetricsCollector.inc_task_eviction()
-            PrometheusMetricsCollector.update_kvcache_usage()  # 8/10
+            PrometheusMetricsCollector.update_kvcache_usage()
         time.sleep(1)
 
 
@@ -98,7 +97,7 @@ def test_PrometheusServerManager():
         dp_id = rank // dp_size
         p = mp.Process(
             target=run_PrometheusServerManager,
-            args=(rank, dp_id, result_queue, stop_event),
+            args=(0, dp_id, rank, result_queue, stop_event),
         )
         p.start()
         processes.append(p)
@@ -121,56 +120,94 @@ def test_PrometheusServerManager():
         prompt_tps_each_rank = manager.query_metric_rate_each_rank(
             "chitu_total_prompt_tokens_total", time_window=f"{log_interval}s"
         )
-        for rank_str, dp_id_str in prompt_tps_each_rank:
+        for instance_str, dp_id_str, rank_str in prompt_tps_each_rank:
             if dp_id_str == "0":
                 assert (
-                    abs(float(prompt_tps_each_rank[(rank_str, dp_id_str)]) - 10) < 1
-                ), f"prompt_tps_each_rank[{(rank_str,dp_id_str)}]:{prompt_tps_each_rank[(rank_str,dp_id_str)]}, expect 10"
+                    abs(
+                        float(prompt_tps_each_rank[(instance_str, dp_id_str, rank_str)])
+                        - 10
+                    )
+                    < 1
+                ), f"prompt_tps_each_rank[{(instance_str, dp_id_str, rank_str)}]:{prompt_tps_each_rank[(instance_str, dp_id_str, rank_str)]}, expect 10"
             if dp_id_str == "1":
                 assert (
-                    abs(float(prompt_tps_each_rank[(rank_str, dp_id_str)]) - 20) < 1
-                ), f"prompt_tps_each_rank[{(rank_str,dp_id_str)}]:{prompt_tps_each_rank[(rank_str,dp_id_str)]}, expect 20"
+                    abs(
+                        float(prompt_tps_each_rank[(instance_str, dp_id_str, rank_str)])
+                        - 20
+                    )
+                    < 1
+                ), f"prompt_tps_each_rank[{(instance_str, dp_id_str, rank_str)}]:{prompt_tps_each_rank[(instance_str, dp_id_str, rank_str)]}, expect 20"
 
         gen_tps_each_rank = manager.query_metric_rate_each_rank(
             "chitu_total_generated_tokens_total", time_window=f"{log_interval}s"
         )
-        for rank_str, dp_id_str in gen_tps_each_rank:
+        for instance_str, dp_id_str, rank_str in gen_tps_each_rank:
             if dp_id_str == "0":
                 assert (
-                    abs(float(gen_tps_each_rank[(rank_str, dp_id_str)]) - 100) < 1
-                ), f"gen_tps_each_rank[{dp_id_str}]:{gen_tps_each_rank[(rank_str,dp_id_str)]}, expect 100"
+                    abs(
+                        float(gen_tps_each_rank[(instance_str, dp_id_str, rank_str)])
+                        - 100
+                    )
+                    < 1
+                ), f"gen_tps_each_rank[{dp_id_str}]:{gen_tps_each_rank[(instance_str, dp_id_str, rank_str)]}, expect 100"
             if dp_id_str == "1":
                 assert (
-                    abs(float(gen_tps_each_rank[(rank_str, dp_id_str)]) - 200) < 1
-                ), f"gen_tps_each_rank[{dp_id_str}]:{gen_tps_each_rank[(rank_str,dp_id_str)]}, expect 200"
+                    abs(
+                        float(gen_tps_each_rank[(instance_str, dp_id_str, rank_str)])
+                        - 200
+                    )
+                    < 1
+                ), f"gen_tps_each_rank[{dp_id_str}]:{gen_tps_each_rank[(instance_str, dp_id_str, rank_str)]}, expect 200"
 
         eviction_rate_each_rank = manager.query_metric_rate_each_rank(
             "chitu_total_task_evictions_total", time_window=f"{log_interval}s"
         )
-        for rank_str, dp_id_str in eviction_rate_each_rank:
+        for instance_str, dp_id_str, rank_str in eviction_rate_each_rank:
             if dp_id_str == "0":
                 assert (
-                    abs(float(eviction_rate_each_rank[(rank_str, dp_id_str)]) - 1) < 1
-                ), f"eviction_rate_each_rank[{dp_id_str}]:{eviction_rate_each_rank[(rank_str,dp_id_str)]}, expect 1"
+                    abs(
+                        float(
+                            eviction_rate_each_rank[(instance_str, dp_id_str, rank_str)]
+                        )
+                        - 1
+                    )
+                    < 1
+                ), f"eviction_rate_each_rank[{dp_id_str}]:{eviction_rate_each_rank[(instance_str, dp_id_str, rank_str)]}, expect 1"
             if dp_id_str == "1":
                 assert (
-                    abs(float(eviction_rate_each_rank[(rank_str, dp_id_str)]) - 2) < 1
-                ), f"eviction_rate_each_rank[{dp_id_str}]:{eviction_rate_each_rank[(rank_str,dp_id_str)]}, expect 2"
+                    abs(
+                        float(
+                            eviction_rate_each_rank[(instance_str, dp_id_str, rank_str)]
+                        )
+                        - 2
+                    )
+                    < 1
+                ), f"eviction_rate_each_rank[{dp_id_str}]:{eviction_rate_each_rank[(instance_str, dp_id_str, rank_str)]}, expect 2"
 
         kvcache_usage_each_rank = manager.query_metric_latest_value_each_rank(
             "chitu_kv_cache_usage_ratio"
         )
-        for rank_str, dp_id_str in kvcache_usage_each_rank:
+        for instance_str, dp_id_str, rank_str in kvcache_usage_each_rank:
             if dp_id_str == "0":
                 assert (
-                    abs(float(kvcache_usage_each_rank[(rank_str, dp_id_str)]) - 0.5)
+                    abs(
+                        float(
+                            kvcache_usage_each_rank[(instance_str, dp_id_str, rank_str)]
+                        )
+                        - 0.5
+                    )
                     < 1e-5
-                ), f"kvcache_usage_each_rank[rank{rank_str},dp{dp_id_str}]:{kvcache_usage_each_rank[(rank_str,dp_id_str)]}, expect 0.5"
+                ), f"kvcache_usage_each_rank[rank{rank_str},dp{dp_id_str}]:{kvcache_usage_each_rank[(instance_str, dp_id_str, rank_str)]}, expect 0.5"
             if dp_id_str == "1":
                 assert (
-                    abs(float(kvcache_usage_each_rank[(rank_str, dp_id_str)]) - 0.8)
+                    abs(
+                        float(
+                            kvcache_usage_each_rank[(instance_str, dp_id_str, rank_str)]
+                        )
+                        - 0.8
+                    )
                     < 1e-5
-                ), f"kvcache_usage_each_rank[{dp_id_str}]:{kvcache_usage_each_rank[(rank_str,dp_id_str)]}, expect 0.8"
+                ), f"kvcache_usage_each_rank[{dp_id_str}]:{kvcache_usage_each_rank[(instance_str, dp_id_str, rank_str)]}, expect 0.8"
     except Exception:
         raise
     finally:

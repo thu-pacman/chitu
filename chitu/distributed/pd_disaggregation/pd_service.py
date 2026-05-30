@@ -12,7 +12,7 @@ PD disaggregation Service
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 import os
 import threading
 
@@ -26,10 +26,10 @@ import chitu.serve.event_loop as event_loop_module
 from chitu.backend import Backend
 from chitu.distributed.parallel_state import get_dp_group, get_tp_group, get_pp_group
 from chitu.distributed.pd_disaggregation.pd_scheduler import (
-    PDScheduler,
+    PDInstanceRequestManager,
     PDSchedulerMode,
-    PrefillOnlyScheduler,
-    DecodeOnlyScheduler,
+    PrefillOnlyManager,
+    DecodeOnlyManager,
     set_pd_scheduler_instance,
 )
 from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
@@ -41,7 +41,13 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
 )
 from chitu.distributed.tcp_ip import get_port_from_zmq_socket
 from chitu.dp_token_sender import start_dp_token_manager
-from chitu.hooks import DPTokenSink, MooncakeKVTransferHook, NoopKVTransferHook
+from chitu.hooks import (
+    DPTokenSink,
+    MooncakeKVTransferHook,
+    NoopKVTransferHook,
+    PDTaskEvictHook,
+)
+from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 from chitu.serve.common import (
     enqueue_profile_payload,
     start_worker,
@@ -69,12 +75,12 @@ def _determine_pd_scheduler_id(args, pd_mode: PDSchedulerMode, rank: int) -> int
             return scheduler_id
 
     # Backward-compatible fallback for configs that do not pass scheduler lists to workers.
-    dp_id = int(getattr(args.dp_config, "dp_id", rank))
+    instance_id = int(getattr(args.dp_config, "dp_id", rank))
     if pd_mode == PDSchedulerMode.DECODE_ONLY:
         prefill_schedulers = getattr(args.dp_config.router, "prefill_schedulers", [])
         prefill_count = len(prefill_schedulers or [])
-        return dp_id - prefill_count if prefill_count > 0 else dp_id
-    return dp_id
+        return instance_id - prefill_count if prefill_count > 0 else instance_id
+    return instance_id
 
 
 def start_decode_prepare_listener_thread(
@@ -167,9 +173,9 @@ class PDSchedulerService:
     def __init__(self, args, rank: int = 0):
         self.args = args
         self.rank = rank
-        self.scheduler: Optional[PDScheduler] = None
+        self.scheduler: Optional[PDInstanceRequestManager] = None
         self.pd_mode = self._determine_pd_mode()
-        self.scheduler_id = self._determine_scheduler_id()
+        self.local_instance_id = self._determine_scheduler_id()
         # Only TP main rank should expose ZMQ service
         self.is_tp_main_rank = self._determine_tp_main_rank()
 
@@ -186,8 +192,14 @@ class PDSchedulerService:
         self.ready_event: Optional[threading.Event] = None
         self.external_compute_loop = False
 
+        self.send_collector_addrs = False
+
         # Initialize scheduler
         self._init_scheduler()
+
+        if self.pd_mode == PDSchedulerMode.DECODE_ONLY or PDSchedulerMode.UNIFIED:
+            for dp_rank in range(len(Backend.schedulers)):
+                Backend.schedulers[dp_rank].set_task_evict_hook(PDTaskEvictHook())
 
         logger.info(f"pd scheduler service initialized in {self.pd_mode.value} mode")
 
@@ -209,18 +221,17 @@ class PDSchedulerService:
         elif "decode_only" in scheduler_type.lower():
             return PDSchedulerMode.DECODE_ONLY
         else:
-            # NOTE：这个 dp_id 是最开始排需求排了 batch 间 DP，所以这么叫，后续需要统一换成更准确的名字，比如 instance_id，避免跟真正的 DP 混淆
-            dp_id = dp_config.dp_id
-            if dp_id == 0:
+            instance_id = dp_config.dp_id
+            if instance_id == 0:
                 # First instance defaults to Prefill
                 logger.info(
-                    "pd disaggregation enabled, dp_id=0, defaulting to prefill mode"
+                    "pd disaggregation enabled, instance_id=0, defaulting to prefill mode"
                 )
                 return PDSchedulerMode.PREFILL_ONLY
-            elif dp_id == 1:
+            elif instance_id == 1:
                 # Second instance defaults to Decode
                 logger.info(
-                    "pd disaggregation enabled, dp_id=1, defaulting to decode mode"
+                    "pd disaggregation enabled, instance_id=1, defaulting to decode mode"
                 )
                 return PDSchedulerMode.DECODE_ONLY
             else:
@@ -242,25 +253,25 @@ class PDSchedulerService:
         scheduler_type = self.args.scheduler.type
 
         if self.pd_mode == PDSchedulerMode.PREFILL_ONLY:
-            self.scheduler = PrefillOnlyScheduler(
+            self.scheduler = PrefillOnlyManager(
                 prefill_num_tasks=max_batch_size,
                 scheduler_type=scheduler_type,
-                scheduler_id=self.scheduler_id,
+                local_instance_id=self.local_instance_id,
             )
         elif self.pd_mode == PDSchedulerMode.DECODE_ONLY:
-            self.scheduler = DecodeOnlyScheduler(
+            self.scheduler = DecodeOnlyManager(
                 decode_num_tasks=max_batch_size,
                 scheduler_type=scheduler_type,
-                scheduler_id=self.scheduler_id,
+                local_instance_id=self.local_instance_id,
             )
         else:
-            # Unified mode - use regular scheduler but wrapped in PDScheduler
-            self.scheduler = PDScheduler(
+            # Unified mode - use regular scheduler but wrapped in PDInstanceRequestManager
+            self.scheduler = PDInstanceRequestManager(
                 prefill_num_tasks=max_batch_size,
                 decode_num_tasks=max_batch_size,
                 scheduler_type=scheduler_type,
                 pd_mode=PDSchedulerMode.UNIFIED,
-                scheduler_id=self.scheduler_id,
+                local_instance_id=self.local_instance_id,
             )
 
         set_pd_scheduler_instance(self.scheduler)
@@ -308,7 +319,7 @@ class PDSchedulerService:
             )
             router_address = f"tcp://{connect_host}:{router_token_port}"
             token_manager = await start_dp_token_manager(
-                self.scheduler.scheduler_id, router_address
+                self.local_instance_id, router_address
             )
             self.scheduler.set_token_manager(token_manager)
             # Inject hooks into executor
@@ -331,7 +342,7 @@ class PDSchedulerService:
                     self._pd_prepare_listener_thread = (
                         start_decode_prepare_listener_thread(
                             kv_manager=self.scheduler.kv_manager,
-                            decode_scheduler_id=self.scheduler.scheduler_id,
+                            decode_scheduler_id=self.local_instance_id,
                             dp_rank=dp_rank,
                         )
                     )
@@ -480,14 +491,14 @@ class PDSchedulerService:
                 logger.info(
                     "[PD_STATS_IDENTITY] mode=%s torch_rank=%s dp_config.dp_id=%s "
                     "scheduler_base_port=%s "
-                    "scheduler.scheduler_id=%s stats.scheduler_id=%s "
+                    "scheduler.local_instance_id=%s stats.local_instance_id=%s "
                     "is_tp_main_rank=%s",
                     self.pd_mode.value,
                     self.rank,
                     getattr(self.args.dp_config, "dp_id", None),
                     getattr(self.args.dp_config, "scheduler_base_port", None),
-                    getattr(self.scheduler, "scheduler_id", None),
-                    stats.get("scheduler_id"),
+                    getattr(self.scheduler, "local_instance_id", None),
+                    stats.get("local_instance_id"),
                     self.is_tp_main_rank,
                 )
 
@@ -503,7 +514,7 @@ class PDSchedulerService:
         last_update_ts = get_server_event_loop().time()
 
         stats = {
-            "scheduler_id": self.scheduler.scheduler_id,
+            "local_instance_id": self.scheduler.local_instance_id,
             "scheduler_type": self.pd_mode.value,
             # 目前仅透传 scheduler.get_pd_stats()，以下字段暂不统计，固定为 0。
             "running_requests": 0,
@@ -513,24 +524,18 @@ class PDSchedulerService:
             "last_update_time": last_update_ts,
             "heartbeat": True,
         }
+        if (
+            not self.send_collector_addrs
+            and PrometheusMetricsCollector.addrs is not None
+        ):
+            stats["prometheus_collector_addrs"] = PrometheusMetricsCollector.addrs
+            self.send_collector_addrs = True
 
         if self.scheduler:
             pd_stats = self.scheduler.get_pd_stats()
             stats.update(pd_stats)
 
         return stats
-
-
-async def start_pd_scheduler_service(args, rank: int = 0):
-    """Start PD scheduler service"""
-    # Initialize the global server event loop reference for this process
-    # In PD worker mode, we don't start the full HTTP server, so the global loop isn't set.
-    # We set it manually to the current running loop.
-    loop = asyncio.get_running_loop()
-    event_loop_module._server_event_loop = loop
-
-    service = PDSchedulerService(args, rank)
-    await service.start()
 
 
 def init_pd_scheduler(args, rank: int = 0):

@@ -34,16 +34,15 @@ class TokenRouter:
         self.active_requests: dict[str, UserRequest] = {}
 
         # Socket(s) for receiving tokens from DP groups
-        self.token_receiver = None  # legacy single-socket mode
         self.token_receivers: dict[int, zmq.asyncio.Socket] = {}
 
         # Performance statistics
         self.total_tokens_received = 0
         self.start_time = time.time()
         self._last_stats_log_ts = time.time()
-        self._per_dp_tokens: dict[int, int] = defaultdict(
+        self._per_instance_tokens: dict[int, int] = defaultdict(
             int
-        )  # dp_id -> tokens in window
+        )  # instance_id -> tokens in window
         self._cleanup_timeout_s = float(os.getenv("ROUTER_CLEANUP_TIMEOUT_S", "2400"))
 
         logger.info("TokenRouter initialized")
@@ -57,8 +56,8 @@ class TokenRouter:
         # Start background tasks
         logger.info("Token Router: Starting background tasks...")
         tasks = [self._cleanup_task()]
-        for dp_id, sock in self.token_receivers.items():
-            tasks.append(self._recv_loop(dp_id, sock))
+        for instance_id, sock in self.token_receivers.items():
+            tasks.append(self._recv_loop(instance_id, sock))
         await asyncio.gather(*tasks)
 
     async def _init_sockets(self):
@@ -67,7 +66,8 @@ class TokenRouter:
         base_port = int(self.config.router.token_port)
 
         # get dp_size from dp_config
-        dp_size = max(1, self.config.dp_size)
+        # dp_config.dp_size, not infer.dp_size
+        num_instances = max(1, self.config.dp_size)
 
         def create_and_bind(port: int):
             sock = self.context.socket(zmq.PULL)
@@ -83,16 +83,10 @@ class TokenRouter:
             sock.bind(addr)
             return sock, addr
 
-        if dp_size <= 1:
-            # Backward compatibility: keep token_receiver but also normalize to token_receivers[0]
-            self.token_receiver, addr = create_and_bind(base_port)
-            self.token_receivers[0] = self.token_receiver
-            logger.info(f"Router token receiver listening on {addr}")
-        else:
-            for dp_id in range(dp_size):
-                sock, addr = create_and_bind(base_port + dp_id)
-                self.token_receivers[dp_id] = sock
-                logger.info(f"Router token receiver[{dp_id}] listening on {addr}")
+        for instance_id in range(num_instances):
+            sock, addr = create_and_bind(base_port + instance_id)
+            self.token_receivers[instance_id] = sock
+            logger.info(f"Router token receiver[{instance_id}] listening on {addr}")
 
     async def register_request(self, req: UserRequest):
         """Register new request"""
@@ -108,7 +102,7 @@ class TokenRouter:
             f"Token Router: Request {req.request_id} registered, active requests: {len(self.active_requests)}"
         )
 
-    async def _recv_loop(self, dp_id: int, sock):
+    async def _recv_loop(self, instance_id: int, sock):
         # 批量排空
         try:
             rcv_batch = max(1, int(os.getenv("ROUTER_RCV_BATCH", "256")))
@@ -123,14 +117,14 @@ class TokenRouter:
                             break
                         data = await sock.recv()
                         token_data = msgpack.unpackb(data, raw=False)
-                        if dp_id is not None:
-                            token_data.setdefault("scheduler_id", dp_id)
+                        if instance_id is not None:
+                            token_data.setdefault("instance_id", instance_id)
                         await self._process_token_data(token_data)
                         drained += 1
                 else:
                     await asyncio.sleep(0.001)
             except Exception as e:
-                logger.error(f"Error in token receiver[{dp_id}]: {e}")
+                logger.error(f"Error in token receiver[{instance_id}]: {e}")
                 await asyncio.sleep(0.01)
 
     async def _process_token_data(self, token_data: dict[str, Any]):
@@ -182,10 +176,10 @@ class TokenRouter:
                 req.async_stream.add_data(token, top_logprobs, top_token_idx)
 
             self.total_tokens_received += 1
-            # per-dp 统计
-            dp_id = int(token_data.get("scheduler_id", -1))
-            if dp_id >= 0:
-                self._per_dp_tokens[dp_id] += 1
+            # per-instance 统计
+            instance_id = token_data.get("instance_id", -1)
+            if instance_id >= 0:
+                self._per_instance_tokens[instance_id] += 1
             router = get_request_router()
             if router is not None and hasattr(router, "record_generated_token"):
                 router.record_generated_token(request_id, 1)
@@ -199,11 +193,11 @@ class TokenRouter:
 
                 observe_ttft(ttft_s)
                 logger.debug(
-                    f"[TTFT] request={request_id} ttft_ms={ttft_s * 1000.0:.1f} dp={token_data.get('scheduler_id')}"
+                    f"[TTFT] request={request_id} ttft_ms={ttft_s * 1000.0:.1f} instance={instance_id}"
                 )
                 if ttft_s > 10000.0:
                     logger.warning(
-                        f"[TTFT] dp={token_data.get('scheduler_id')}, request={request_id}, has long ttft_s={ttft_s:.1f}"
+                        f"[TTFT] instance={instance_id}, request={request_id}, has long ttft_s={ttft_s:.1f}"
                     )
 
                 # 首token返回时将request_id对应的TokenBlocks插入到对应的cache_blocks[instance_id]
@@ -220,13 +214,13 @@ class TokenRouter:
             # Periodically print per-dp throughput, help locate if all channels are flowing
             now = time.time()
             if now - self._last_stats_log_ts >= 5.0:
-                per_dp = ", ".join(
-                    [f"dp{d}:{n}" for d, n in sorted(self._per_dp_tokens.items())]
+                per_instance = ", ".join(
+                    [f"dp{d}:{n}" for d, n in sorted(self._per_instance_tokens.items())]
                 )
                 logger.info(
-                    f"[PER_DP_TOKENS] {per_dp} total={self.total_tokens_received}"
+                    f"[PER_DP_TOKENS] {per_instance} total={self.total_tokens_received}"
                 )
-                self._per_dp_tokens.clear()
+                self._per_instance_tokens.clear()
                 self._last_stats_log_ts = now
 
         elif token_data.get("type") == "finish":

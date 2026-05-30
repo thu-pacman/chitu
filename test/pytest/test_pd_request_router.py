@@ -8,10 +8,12 @@ Exercises ``PrefixCacheAwarePolicy`` / ``LoadBalancer`` via ``policy.update_stat
 selection helpers — no ZMQ or ``_pd_stats_collector_task`` integration.
 """
 
+from omegaconf import OmegaConf
 from dataclasses import dataclass, field
 
 from chitu.distributed.pd_disaggregation.pd_request_router import PDRequestRouter
 from chitu.dp_request_router import LoadBalancer, PrefixCacheAwarePolicy, SchedulerStats
+from chitu.global_vars import set_global_args
 from chitu.schemas.serve_config import (
     DecodeSchedulerConfig,
     DpAddressesConfig,
@@ -22,11 +24,19 @@ from chitu.schemas.serve_config import (
 
 
 @dataclass
-class MonkReq:
+class MockReq:
     """Minimal stand-in for :class:`~chitu.task.UserRequest` in routing tests."""
 
     request_id: str
     prompt_tokens: list[int] = field(default_factory=list)
+
+
+def set_default_global_args():
+    # global_args here is useless, but it must exists
+    set_global_args(
+        OmegaConf.create({"infer": {}}),
+        need_ensure=False,
+    )
 
 
 def _pd_router_config(
@@ -35,6 +45,7 @@ def _pd_router_config(
     routing_algorithm_for_decode: str = "power_of_two_choices",
     router_cache_miss_fallback_algorithm: str = "least_loaded",
 ) -> RouterConfig:
+    set_default_global_args()
     return RouterConfig(
         is_router=True,
         host="127.0.0.1",
@@ -87,7 +98,7 @@ def test_pd_prefill_prefix_among_prefers_more_prefix_hits():
 
     policy.update_stats(
         SchedulerStats(
-            scheduler_id=0,
+            local_instance_id=0,
             running_requests=20,
             waiting_requests=0,
             pending_tokens=0,
@@ -100,7 +111,7 @@ def test_pd_prefill_prefix_among_prefers_more_prefix_hits():
     )
     policy.update_stats(
         SchedulerStats(
-            scheduler_id=1,
+            local_instance_id=1,
             running_requests=0,
             waiting_requests=0,
             pending_tokens=0,
@@ -112,8 +123,8 @@ def test_pd_prefill_prefix_among_prefers_more_prefix_hits():
         )
     )
 
-    req = MonkReq("r1", [1, 2, 3, 4, 5, 6, 7, 8])
-    policy.remember_request(req, scheduler_id=0)
+    req = MockReq("r1", [1, 2, 3, 4, 5, 6, 7, 8])
+    policy.remember_request(req, local_instance_id=0)
     policy.insert_req_blocks(req.request_id)
 
     chosen = policy.select_scheduler(req)
@@ -127,7 +138,7 @@ def test_pd_prefill_prefix_among_prefers_higher_hit_prefill_with_real_block_size
 
     policy.update_stats(
         SchedulerStats(
-            scheduler_id=0,
+            local_instance_id=0,
             running_requests=0,
             waiting_requests=0,
             pending_tokens=0,
@@ -140,7 +151,7 @@ def test_pd_prefill_prefix_among_prefers_higher_hit_prefill_with_real_block_size
     )
     policy.update_stats(
         SchedulerStats(
-            scheduler_id=1,
+            local_instance_id=1,
             running_requests=20,
             waiting_requests=0,
             pending_tokens=0,
@@ -157,15 +168,15 @@ def test_pd_prefill_prefix_among_prefers_higher_hit_prefill_with_real_block_size
     block2 = list(range(block_size * 2, block_size * 3))
     block3 = list(range(block_size * 3, block_size * 4))
 
-    p0_warm_req = MonkReq("p0-warm", block0)
-    policy.remember_request(p0_warm_req, scheduler_id=0)
+    p0_warm_req = MockReq("p0-warm", block0)
+    policy.remember_request(p0_warm_req, local_instance_id=0)
     policy.insert_req_blocks(p0_warm_req.request_id)
 
-    p1_warm_req = MonkReq("p1-warm", block0 + block1 + block2)
-    policy.remember_request(p1_warm_req, scheduler_id=1)
+    p1_warm_req = MockReq("p1-warm", block0 + block1 + block2)
+    policy.remember_request(p1_warm_req, local_instance_id=1)
     policy.insert_req_blocks(p1_warm_req.request_id)
 
-    req = MonkReq("pick-best-prefix", block0 + block1 + block2 + block3)
+    req = MockReq("pick-best-prefix", block0 + block1 + block2 + block3)
 
     assert policy.num_hit_blocks(0, policy.build_req_token_blocks(req, 0)) == 1
     assert policy.num_hit_blocks(1, policy.build_req_token_blocks(req, 1)) == 3
@@ -178,7 +189,7 @@ def test_pd_prefill_prefix_among_fallback_least_loaded_when_no_hits():
 
     policy.update_stats(
         SchedulerStats(
-            scheduler_id=0,
+            local_instance_id=0,
             running_requests=3,
             waiting_requests=0,
             pending_tokens=200,
@@ -191,7 +202,7 @@ def test_pd_prefill_prefix_among_fallback_least_loaded_when_no_hits():
     )
     policy.update_stats(
         SchedulerStats(
-            scheduler_id=1,
+            local_instance_id=1,
             running_requests=1,
             waiting_requests=0,
             pending_tokens=0,
@@ -203,7 +214,7 @@ def test_pd_prefill_prefix_among_fallback_least_loaded_when_no_hits():
         )
     )
 
-    req = MonkReq("r2", [11, 12, 13, 14])
+    req = MockReq("r2", [11, 12, 13, 14])
     assert policy.select_scheduler(req) == 1
 
 
@@ -213,7 +224,7 @@ def test_pd_load_balancer_least_loaded_with_eligible_subset():
     policy = LoadBalancer(cfg)
     policy.update_stats(
         SchedulerStats(
-            scheduler_id=0,
+            local_instance_id=0,
             running_requests=10,
             waiting_requests=0,
             pending_tokens=0,
@@ -224,7 +235,7 @@ def test_pd_load_balancer_least_loaded_with_eligible_subset():
     )
     policy.update_stats(
         SchedulerStats(
-            scheduler_id=1,
+            local_instance_id=1,
             running_requests=1,
             waiting_requests=0,
             pending_tokens=0,
@@ -234,7 +245,7 @@ def test_pd_load_balancer_least_loaded_with_eligible_subset():
         )
     )
 
-    req = MonkReq("lb", [])
+    req = MockReq("lb", [])
     assert policy.select_scheduler(req, eligible_ids=[0, 1]) == 1
 
 
@@ -250,8 +261,8 @@ def test_pd_router_round_robin_policies():
     assert router.prefill_policy.algorithm == "round_robin"
     assert router.decode_policy.algorithm == "round_robin"
 
-    assert router.prefill_policy.select_scheduler(MonkReq("r1")) == 0
-    assert router.prefill_policy.select_scheduler(MonkReq("r2")) == 1
+    assert router.prefill_policy.select_scheduler(MockReq("r1")) == 0
+    assert router.prefill_policy.select_scheduler(MockReq("r2")) == 1
 
 
 def test_pd_router_prefix_prefill_decode_uses_decode_policy():

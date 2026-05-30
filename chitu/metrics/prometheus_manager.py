@@ -234,7 +234,7 @@ class PrometheusServerManager:
 
     def query_metric_rate_each_rank(
         self, metric_name: str, time_window: str = "10s"
-    ) -> dict[tuple[str, str], str]:
+    ) -> dict[tuple[str, str, str], str]:
         """
         Query metric rate for each rank
 
@@ -243,7 +243,7 @@ class PrometheusServerManager:
         :param time_window: 1s means 10 seconds, 1m means 1 minutes
         :type time_window: str
         Returns:
-            {(rank, dp_id): metric_rate}
+            {(instance_id, dp_id, rank): metric_rate}
         """
         try:
             query = f"rate({metric_name}[{time_window}])"
@@ -260,7 +260,11 @@ class PrometheusServerManager:
             ans = {}
             for result in data["data"]["result"]:
                 if result["metric"]["job"] == _DEFAULT_JOB_NAME:
-                    key = (result["metric"]["rank"], result["metric"]["dp_id"])
+                    key = (
+                        result["metric"]["instance_id"],
+                        result["metric"]["dp_id"],
+                        result["metric"]["rank"],
+                    )
                     val = result["value"][1]
                     ans[key] = val
             return ans
@@ -268,7 +272,9 @@ class PrometheusServerManager:
             logger.error(f"query_metric_rate_each_rank failed: {e}")
             return {}
 
-    def query_metric_latest_value_each_rank(self, metric_name: str) -> dict[str, str]:
+    def query_metric_latest_value_each_rank(
+        self, metric_name: str
+    ) -> dict[tuple[str, str, str], str]:
         """
         Query metric value for each dp rank
 
@@ -278,7 +284,7 @@ class PrometheusServerManager:
         :type time_window: str
 
         Returns:
-            {(rank, dp_id): metric_value}
+            {(instance_id, dp_id, rank): metric_value}
         """
         try:
             query = f"{metric_name} offset 0s"
@@ -296,7 +302,11 @@ class PrometheusServerManager:
             ans = {}
             for result in data["data"]["result"]:
                 if result["metric"]["job"] == _DEFAULT_JOB_NAME:
-                    key = (result["metric"]["rank"], result["metric"]["dp_id"])
+                    key = (
+                        result["metric"]["instance_id"],
+                        result["metric"]["dp_id"],
+                        result["metric"]["rank"],
+                    )
                     val = result["value"][1]
                     ans[key] = val
             return ans

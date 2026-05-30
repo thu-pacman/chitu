@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import threading
 import time
+import re
 from pathlib import Path
 from string import Template
 from typing import Optional
@@ -46,7 +47,7 @@ class GrafanaManager:
                     cls._instance = cls(
                         prometheus_url=prometheus_url,
                         grafana_host=metrics_args.grafana_host,
-                        grafana_port=metrics_args.grafana_port,
+                        server_port=metrics_args.grafana_port,
                     )
         return cls._instance
 
@@ -57,16 +58,16 @@ class GrafanaManager:
             return "127.0.0.1"
         return bind_host
 
-    def __init__(self, prometheus_url: str, grafana_host: str, grafana_port: int):
+    def __init__(self, prometheus_url: str, grafana_host: str, server_port: int):
         self.prometheus_url = prometheus_url
         self.grafana_host = grafana_host
-        self.grafana_port = grafana_port
+        self.server_port = server_port
         self.process: Optional[subprocess.Popen] = None
 
         pid = os.getpid()
         self.work_dir = Path(os.path.abspath(f"grafana_data_{pid}"))
         self._prepare_work_dir()
-        self._start()
+        self.start()
         atexit.register(GrafanaManager.cleanup)
 
     # ------------------------------------------------------------------
@@ -109,14 +110,7 @@ class GrafanaManager:
     # Start / stop
     # ------------------------------------------------------------------
 
-    def _start(self, timeout: int = 60):
-        if not is_port_available(self.grafana_port):
-            self.grafana_port = get_free_port()
-            logger.warning(
-                f"Grafana default port occupied, switching to {self.grafana_port}"
-            )
-
-        prov_path = str(self.work_dir / "provisioning")
+    def start(self, timeout: int = 60, max_retries: int = 8):
         data_path = str(self.work_dir / "data")
         logs_path = str(self.work_dir / "log")
         os.makedirs(data_path, exist_ok=True)
@@ -124,6 +118,27 @@ class GrafanaManager:
         logger.info(f"Grafana work dir: {self.work_dir}")
         logger.info(f"Grafana log dir: {logs_path}")
 
+        for attempt in range(max_retries + 1):
+            if attempt > 0 or not is_port_available(self.server_port):
+                port = get_free_port()
+                logger.warning(
+                    f"Port[{self.server_port}] is unavailable, change Grafana server port to {port}"
+                )
+                self.server_port = port
+
+            if self._start_once(timeout):
+                return True
+
+        logger.error(f"Failed to start Grafana server after {max_retries + 1} attempts")
+        self._cleanup_files()
+        return False
+
+    def _start_once(self, timeout=60):
+        """Start Grafana once on self.server_port and wait until it is ready."""
+
+        prov_path = str(self.work_dir / "provisioning")
+        data_path = str(self.work_dir / "data")
+        logs_path = str(self.work_dir / "log")
         cmd = [
             "grafana-server",
             f"--homepath={self._find_grafana_home()}",
@@ -135,42 +150,52 @@ class GrafanaManager:
 
         try:
             self.process = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
             )
-        except FileNotFoundError:
+        except FileNotFoundError as e:
             logger.error(
-                "grafana-server not found in $PATH. "
-                "Grafana dashboard will not be available."
+                f"Error occurred while starting Grafana, please verify whether the Grafana binary path is included in the current $PATH variable: {e}"
             )
-            return
+            return False
 
-        check_host = self._health_check_host(self.grafana_host)
-        health_url = f"http://{check_host}:{self.grafana_port}/api/health"
         start_time = time.time()
-        logger.info("Waiting for Grafana server to be ready ...")
+        check_host = self._health_check_host(self.grafana_host)
+        health_url = f"http://{check_host}:{self.server_port}/api/health"
+        logger.info(f"Waiting Grafana server ready ...")
         while time.time() - start_time < timeout:
-            try:
-                resp = requests.get(health_url, timeout=1)
-                if resp.status_code == 200:
-                    logger.info(
-                        f"Grafana is running: http://{self.grafana_host}:{self.grafana_port} "
-                        f"(PID: {self.process.pid})"
-                    )
-                    return
-            except requests.exceptions.RequestException:
-                pass
-
             if self.process and self.process.poll() is not None:
                 stderr = self.process.stderr.read() if self.process.stderr else ""
                 logger.error(
-                    f"Grafana exited unexpectedly "
-                    f"(exit_code={self.process.returncode}):\n{stderr}"
+                    f"Grafana server process exited unexpectedly (exit_code={self.process.returncode}):\n{stderr}"
                 )
                 self.process = None
-                return
+                return False
+
+            try:
+                response = requests.get(health_url, timeout=1)
+                if response.status_code == 200:
+                    # double check
+                    time.sleep(0.5)
+                    if not self._read_server_start_log():
+                        logger.error(
+                            f"Grafana server is detected but no server starting log was found. "
+                            f"This maybe because other Grafana server takes this port."
+                        )
+                        self._stop_current_process()
+                        self._clean_log_file()
+                        return False
+                    logger.info(
+                        f"Grafana is running: http://{self.grafana_host}:{self.server_port} "
+                        f"(PID: {self.process.pid})"
+                    )
+                    return True
+            except requests.exceptions.RequestException:
+                pass
             time.sleep(0.5)
 
-        logger.error("Grafana server start timeout")
+        logger.error(f"Start Grafana server timeout")
+        self._stop_current_process()
+        return False
 
     def _find_grafana_home(self) -> str:
         """Best-effort locate grafana home directory."""
@@ -190,7 +215,7 @@ class GrafanaManager:
         ini_path.write_text(
             "[server]\n"
             f"http_addr = {self.grafana_host}\n"
-            f"http_port = {self.grafana_port}\n"
+            f"http_port = {self.server_port}\n"
             "protocol = http\n"
             "\n"
             "[auth.anonymous]\n"
@@ -212,13 +237,13 @@ class GrafanaManager:
         try:
             check_host = self._health_check_host(self.grafana_host)
             resp = requests.get(
-                f"http://{check_host}:{self.grafana_port}/api/health", timeout=1
+                f"http://{check_host}:{self.server_port}/api/health", timeout=1
             )
             return resp.status_code == 200
         except requests.exceptions.RequestException:
             return False
 
-    def stop(self):
+    def _stop_current_process(self):
         if self.process:
             logger.info(f"Stopping Grafana server (PID: {self.process.pid}) ...")
             try:
@@ -234,6 +259,35 @@ class GrafanaManager:
             finally:
                 self.process = None
 
+    def _read_server_start_log(self):
+        """
+        NOTE: Set the stdout=PIPE for Grafana subprocess will cause timeout.
+        Here directly reads the status from the log file.
+        """
+        hosts = (
+            ["127.0.0.1", "0.0.0.0", "", "::", "[::]"]
+            if GrafanaManager._health_check_host(self.grafana_host) == "127.0.0.1"
+            else [self.grafana_host]
+        )
+        hosts_pattern = "(" + "|".join([re.escape(host) for host in hosts]) + ")"
+        pattern = re.compile(
+            f'level=info msg="HTTP Server Listen" address={hosts_pattern}:{self.server_port} protocol=http subUrl= socket='
+        )
+        log_file_path = str(self.work_dir / "log" / "grafana.log")
+        with open(log_file_path, "r") as LOG_FILE:
+            full_log = LOG_FILE.read()
+            if pattern.search(full_log) is not None:
+                return True
+        return False
+
+    def _clean_log_file(self):
+        log_file_path = str(self.work_dir / "log" / "grafana.log")
+        try:
+            os.remove(log_file_path)
+        except OSError as e:
+            logger.warning(f"Failed to remove Grafana log file: {e}")
+
+    def _cleanup_files(self):
         if self.work_dir.exists():
             try:
                 shutil.rmtree(self.work_dir)
@@ -245,5 +299,6 @@ class GrafanaManager:
         with cls._lock:
             if cls._instance is None:
                 return
-            cls._instance.stop()
+            cls._instance._stop_current_process()
+            cls._instance._cleanup_files()
             cls._instance = None

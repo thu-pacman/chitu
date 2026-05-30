@@ -13,8 +13,16 @@ import atexit
 import torch
 
 from chitu.backend import Backend
-from chitu.distributed.parallel_state import get_dp_group, get_tp_group, get_pp_group
+from chitu.distributed.parallel_state import (
+    get_dp_group,
+    get_tp_group,
+    get_pp_group,
+    get_dp_size,
+)
 from chitu.distributed.tcp_ip import get_local_ip, get_free_port
+from chitu.global_vars import get_global_args
+from chitu.metrics.cache_stats import kvcache_stats, get_prealloc_blocks
+from chitu.metrics.task_stats import count_tasks_for_dp_rank, count_tasks_non_dp
 
 logger = logging.getLogger(__name__)
 
@@ -278,9 +286,12 @@ class PrometheusMetricsCollector:
     _instance: Optional["PrometheusMetricsCollector"] = None
     _lock = threading.RLock()
     _shutting_down = False  # 正在关闭为True，未关闭和关闭完成为False
+    addrs: Optional[list[str]] = None
 
     @classmethod
-    def get_instance(cls, is_create: bool = False):
+    def get_instance(
+        cls, is_create: bool = False
+    ) -> Optional["PrometheusMetricsCollector"]:
         if cls._shutting_down:
             return None
 
@@ -293,13 +304,19 @@ class PrometheusMetricsCollector:
         with cls._lock:
             if cls._instance is None:
                 dp_id = get_dp_group().rank_in_group
+                dp_config = getattr(get_global_args(), "dp_config", None)
+                instance_id = (
+                    0 if dp_config is None or not dp_config.enabled else dp_config.dp_id
+                )
                 rank = get_dp_group().global_rank
-                cls._instance = cls(rank, dp_id)
+                cls._instance = cls(rank, dp_id, instance_id)
+                cls.addrs = [cls._instance.addr]
         return cls._instance
 
-    def __init__(self, rank, dp_id):
-        self.rank = rank
-        self.dp_id = dp_id
+    def __init__(self, rank: int = 0, dp_id: int = 0, instance_id: int = 0):
+        self.rank: int = rank
+        self.dp_id: int = dp_id
+        self.instance_id: int = instance_id
 
         tp_group = get_tp_group()
         dp_group = get_dp_group()
@@ -308,6 +325,7 @@ class PrometheusMetricsCollector:
             tp_group.rank_in_group == 0 and pp_group.rank_in_group == 0
         )
         self.is_main_rank = dp_group.is_first_rank
+        self.dp_size = get_dp_size()
 
         self.total_generated_tokens: Optional[Counter] = None
         self.total_prompt_tokens: Optional[Counter] = None
@@ -324,6 +342,7 @@ class PrometheusMetricsCollector:
         self.torch_reserved_bytes: Optional[Gauge] = None
         self.running_requests: Optional[Gauge] = None
         self.waiting_requests: Optional[Gauge] = None
+        self.prealloc_blocks: Optional[Gauge] = None
         self.collector_server = None
         self.collector_thread = None
         self.addr = None
@@ -333,99 +352,128 @@ class PrometheusMetricsCollector:
             self.kv_cache_usage = Gauge(
                 "chitu_kv_cache_usage_ratio",
                 "KV cache usage ratio (used_blocks / total_blocks)",
-                ["rank", "dp_id"],
+                ["rank", "dp_id", "instance_id"],
             )
             self.used_blocks = Gauge(
                 "chitu_used_blocks",
                 "KV cache used blocks",
-                ["rank", "dp_id"],
+                ["rank", "dp_id", "instance_id"],
             )
             self.total_blocks = Gauge(
                 "chitu_total_blocks",
                 "KV cache total blocks",
-                ["rank", "dp_id"],
+                ["rank", "dp_id", "instance_id"],
             )
             self.cuda_total_bytes = Gauge(
                 "chitu_cuda_total_bytes",
                 "CUDA total memory (bytes)",
-                ["rank", "dp_id"],
+                ["rank", "dp_id", "instance_id"],
             )
             self.cuda_used_bytes = Gauge(
                 "chitu_cuda_used_bytes",
                 "CUDA used memory (bytes), including torch allocated memory, torch "
                 "reserved but unused memory, and other CUDA memory",
-                ["rank", "dp_id"],
+                ["rank", "dp_id", "instance_id"],
             )
             self.torch_allocated_bytes = Gauge(
                 "chitu_torch_allocated_bytes",
                 "torch allocated GPU memory (bytes)",
-                ["rank", "dp_id"],
+                ["rank", "dp_id", "instance_id"],
             )
             self.torch_reserved_bytes = Gauge(
                 "chitu_torch_reserved_bytes",
                 "torch reserved GPU memory (bytes), including torch allocated memory, "
                 "and torch reserved but unused memory",
-                ["rank", "dp_id"],
+                ["rank", "dp_id", "instance_id"],
             )
 
-            self.kv_cache_usage.labels(rank=rank, dp_id=dp_id).set(0)
-            self.used_blocks.labels(rank=rank, dp_id=dp_id).set(0)
-            self.total_blocks.labels(rank=rank, dp_id=dp_id).set(0)
-            self.cuda_total_bytes.labels(rank=rank, dp_id=dp_id).set(0)
-            self.cuda_used_bytes.labels(rank=rank, dp_id=dp_id).set(0)
-            self.torch_allocated_bytes.labels(rank=rank, dp_id=dp_id).set(0)
-            self.torch_reserved_bytes.labels(rank=rank, dp_id=dp_id).set(0)
+            self.cuda_total_bytes.labels(
+                rank=rank, dp_id=dp_id, instance_id=instance_id
+            ).set(0)
+            self.cuda_used_bytes.labels(
+                rank=rank, dp_id=dp_id, instance_id=instance_id
+            ).set(0)
+            self.torch_allocated_bytes.labels(
+                rank=rank, dp_id=dp_id, instance_id=instance_id
+            ).set(0)
+            self.torch_reserved_bytes.labels(
+                rank=rank, dp_id=dp_id, instance_id=instance_id
+            ).set(0)
 
             # --- Per-dp metrics (throughput, task counts)
             if self.is_dp_metrics_rank:
                 self.total_generated_tokens = Counter(
                     "chitu_total_generated_tokens",
                     "Total tokens generated by executor",
-                    ["rank", "dp_id"],
+                    ["rank", "dp_id", "instance_id"],
                 )
                 self.total_prompt_tokens = Counter(
                     "chitu_total_prompt_tokens",
                     "Total prompt tokens processed by executor",
-                    ["rank", "dp_id"],
+                    ["rank", "dp_id", "instance_id"],
                 )
                 self.total_hit_tokens = Counter(
                     "chitu_total_hit_tokens",
                     "total prompt tokens hit by prefix caching",
-                    ["rank", "dp_id"],
+                    ["rank", "dp_id", "instance_id"],
                 )
                 self.total_task_evictions = Counter(
                     "chitu_total_task_evictions",
                     "Total number of tasks evicted due to insufficient KV cache",
-                    ["rank", "dp_id"],
+                    ["rank", "dp_id", "instance_id"],
                 )
                 self.mtp_proposed_tokens = Counter(
                     "chitu_mtp_proposed_tokens",
                     "Total MTP proposed tokens (mtp_size-1 per task per decode step)",
-                    ["rank", "dp_id"],
+                    ["rank", "dp_id", "instance_id"],
                 )
                 self.mtp_accepted_tokens = Counter(
                     "chitu_mtp_accepted_tokens",
                     "Total MTP accepted tokens after verification",
-                    ["rank", "dp_id"],
+                    ["rank", "dp_id", "instance_id"],
                 )
                 self.running_requests = Gauge(
                     "chitu_running_requests",
                     "Number of currently running requests",
-                    ["rank", "dp_id"],
+                    ["rank", "dp_id", "instance_id"],
                 )
                 self.waiting_requests = Gauge(
                     "chitu_waiting_requests",
                     "Number of currently waiting requests",
-                    ["rank", "dp_id"],
+                    ["rank", "dp_id", "instance_id"],
                 )
-                self.total_generated_tokens.labels(rank=rank, dp_id=dp_id).inc(0)
-                self.total_prompt_tokens.labels(rank=rank, dp_id=dp_id).inc(0)
-                self.total_hit_tokens.labels(rank=rank, dp_id=dp_id).inc(0)
-                self.total_task_evictions.labels(rank=rank, dp_id=dp_id).inc(0)
-                self.mtp_proposed_tokens.labels(rank=rank, dp_id=dp_id).inc(0)
-                self.mtp_accepted_tokens.labels(rank=rank, dp_id=dp_id).inc(0)
-                self.running_requests.labels(rank=rank, dp_id=dp_id).set(0)
-                self.waiting_requests.labels(rank=rank, dp_id=dp_id).set(0)
+                self.total_generated_tokens.labels(
+                    rank=rank, dp_id=dp_id, instance_id=instance_id
+                ).inc(0)
+                self.total_prompt_tokens.labels(
+                    rank=rank, dp_id=dp_id, instance_id=instance_id
+                ).inc(0)
+                self.total_hit_tokens.labels(
+                    rank=rank, dp_id=dp_id, instance_id=instance_id
+                ).inc(0)
+                self.total_task_evictions.labels(
+                    rank=rank, dp_id=dp_id, instance_id=instance_id
+                ).inc(0)
+                self.mtp_proposed_tokens.labels(
+                    rank=rank, dp_id=dp_id, instance_id=instance_id
+                ).inc(0)
+                self.mtp_accepted_tokens.labels(
+                    rank=rank, dp_id=dp_id, instance_id=instance_id
+                ).inc(0)
+                self.running_requests.labels(
+                    rank=rank, dp_id=dp_id, instance_id=instance_id
+                ).set(0)
+                self.waiting_requests.labels(
+                    rank=rank, dp_id=dp_id, instance_id=instance_id
+                ).set(0)
+            if self.is_main_rank:
+                self.prealloc_blocks = Gauge(
+                    "chitu_prealloc_blocks",
+                    "Number of pre-allocated blocks for PD disaggrigation",
+                    ["rank", "dp_id", "instance_id"],
+                )
+            # init kv cache and prealloc blocks via update_kvcache_usage
+            self.update_kvcache_usage()
 
             try:
                 ip = get_local_ip()
@@ -454,7 +502,9 @@ class PrometheusMetricsCollector:
             return
         try:
             collector.total_generated_tokens.labels(
-                rank=collector.rank, dp_id=collector.dp_id
+                rank=collector.rank,
+                dp_id=collector.dp_id,
+                instance_id=collector.instance_id,
             ).inc(count)
         except Exception as e:
             logger.error(f"inc_generated_tokens failed: {e}")
@@ -469,10 +519,14 @@ class PrometheusMetricsCollector:
             return
         try:
             collector.mtp_proposed_tokens.labels(
-                rank=collector.rank, dp_id=collector.dp_id
+                rank=collector.rank,
+                dp_id=collector.dp_id,
+                instance_id=collector.instance_id,
             ).inc(proposed)
             collector.mtp_accepted_tokens.labels(
-                rank=collector.rank, dp_id=collector.dp_id
+                rank=collector.rank,
+                dp_id=collector.dp_id,
+                instance_id=collector.instance_id,
             ).inc(accepted)
         except Exception as e:
             logger.error(f"inc_mtp_tokens failed: {e}")
@@ -487,7 +541,9 @@ class PrometheusMetricsCollector:
             return
         try:
             collector.total_prompt_tokens.labels(
-                rank=collector.rank, dp_id=collector.dp_id
+                rank=collector.rank,
+                dp_id=collector.dp_id,
+                instance_id=collector.instance_id,
             ).inc(count)
         except Exception as e:
             logger.error(f"inc_prompt_tokens failed: {e}")
@@ -503,7 +559,9 @@ class PrometheusMetricsCollector:
 
         try:
             collector.total_hit_tokens.labels(
-                rank=collector.rank, dp_id=collector.dp_id
+                rank=collector.rank,
+                dp_id=collector.dp_id,
+                instance_id=collector.instance_id,
             ).inc(count)
         except Exception as e:
             logger.error(f"inc_hit_tokens failed: {e}")
@@ -516,18 +574,18 @@ class PrometheusMetricsCollector:
             return
         try:
             if collector.is_main_rank:
-                from chitu.metrics.task_stats import count_tasks_for_dp_rank
-
                 running, waiting = count_tasks_for_dp_rank(collector.dp_id)
             else:
-                from chitu.metrics.task_stats import count_tasks_non_dp
-
                 running, waiting = count_tasks_non_dp()
             collector.running_requests.labels(
-                rank=collector.rank, dp_id=collector.dp_id
+                rank=collector.rank,
+                dp_id=collector.dp_id,
+                instance_id=collector.instance_id,
             ).set(running)
             collector.waiting_requests.labels(
-                rank=collector.rank, dp_id=collector.dp_id
+                rank=collector.rank,
+                dp_id=collector.dp_id,
+                instance_id=collector.instance_id,
             ).set(waiting)
         except Exception as e:
             logger.error(f"update_task_counts failed: {e}")
@@ -535,39 +593,38 @@ class PrometheusMetricsCollector:
     @classmethod
     def update_kvcache_usage(cls):
         """Update KV cache usage metrics."""
-        from chitu.kv_cache import PagedKVCache
-
-        if (
-            Backend.cache_dict is None
-            or type(Backend.cache_dict["main"]) == PagedKVCache
-        ):
-            # Get KV cache usage of PagedKVCache from cache_manager in rank0
-            return
-
         collector = cls.get_instance()
-        if not collector:
+        if not collector or Backend.cache_dict is None:
             return
 
         try:
-            num_blocks = Backend.cache_dict["main"].num_blocks
-            num_used_blocks = Backend.cache_dict["main"].num_used_blocks
-
-            collector.total_blocks.labels(
-                rank=collector.rank, dp_id=collector.dp_id
-            ).set(num_blocks)
-            collector.used_blocks.labels(
-                rank=collector.rank, dp_id=collector.dp_id
-            ).set(num_used_blocks)
-
-            if num_blocks > 0:
-                usage_ratio = num_used_blocks / num_blocks
-                collector.kv_cache_usage.labels(
-                    rank=collector.rank, dp_id=collector.dp_id
-                ).set(usage_ratio)
-            else:
-                logger.error(
-                    f"Unexpected {type(Backend.cache_dict['main']).__name__}.num_blocks({num_blocks}), update_kvcache_usage failed. "
-                )
+            kvcache_stats_dict = kvcache_stats(collector.is_main_rank, collector.dp_id)
+            for dp_id in kvcache_stats_dict:
+                rank = get_dp_group().rank_list[dp_id]
+                total_blocks, used_blocks, kvcache_usage = kvcache_stats_dict[dp_id]
+                collector.total_blocks.labels(
+                    rank=rank, dp_id=dp_id, instance_id=collector.instance_id
+                ).set(total_blocks)
+                collector.used_blocks.labels(
+                    rank=rank, dp_id=dp_id, instance_id=collector.instance_id
+                ).set(used_blocks)
+                if kvcache_usage >= 0:
+                    collector.kv_cache_usage.labels(
+                        rank=rank, dp_id=dp_id, instance_id=collector.instance_id
+                    ).set(kvcache_usage)
+                else:
+                    logger.error(
+                        f"Unexpected {type(Backend.cache_dict['main']).__name__}.num_blocks({total_blocks}), update_kvcache_usage failed. "
+                    )
+            if collector.prealloc_blocks is not None:
+                prealloc_blocks_dict = get_prealloc_blocks(collector.dp_size)
+                if prealloc_blocks_dict:
+                    for dp_id in prealloc_blocks_dict:
+                        rank = get_dp_group().rank_list[dp_id]
+                        prealloc_blocks = prealloc_blocks_dict[dp_id]
+                        collector.prealloc_blocks.labels(
+                            rank=rank, dp_id=dp_id, instance_id=collector.instance_id
+                        ).set(prealloc_blocks)
         except Exception as e:
             logger.error(f"update_kvcache_usage failed: {e}")
 
@@ -602,16 +659,24 @@ class PrometheusMetricsCollector:
             torch_allocated = memory_stats["allocated_bytes.all.current"]
             torch_reserved = memory_stats["reserved_bytes.all.current"]
             collector.cuda_total_bytes.labels(
-                rank=collector.rank, dp_id=collector.dp_id
+                rank=collector.rank,
+                dp_id=collector.dp_id,
+                instance_id=collector.instance_id,
             ).set(cuda_total_bytes)
             collector.cuda_used_bytes.labels(
-                rank=collector.rank, dp_id=collector.dp_id
+                rank=collector.rank,
+                dp_id=collector.dp_id,
+                instance_id=collector.instance_id,
             ).set(cuda_used_bytes)
             collector.torch_allocated_bytes.labels(
-                rank=collector.rank, dp_id=collector.dp_id
+                rank=collector.rank,
+                dp_id=collector.dp_id,
+                instance_id=collector.instance_id,
             ).set(torch_allocated)
             collector.torch_reserved_bytes.labels(
-                rank=collector.rank, dp_id=collector.dp_id
+                rank=collector.rank,
+                dp_id=collector.dp_id,
+                instance_id=collector.instance_id,
             ).set(torch_reserved)
 
         except Exception as e:
@@ -627,7 +692,9 @@ class PrometheusMetricsCollector:
 
         try:
             collector.total_task_evictions.labels(
-                rank=collector.rank, dp_id=collector.dp_id
+                rank=collector.rank,
+                dp_id=collector.dp_id,
+                instance_id=collector.instance_id,
             ).inc()
         except Exception as e:
             logger.error(f"inc_task_eviction failed: {e}")

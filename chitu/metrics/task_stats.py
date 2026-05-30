@@ -59,16 +59,19 @@ def count_tasks_for_dp_rank(dp_id: int) -> tuple[int, int]:
 
     try:
         # Count running tasks assigned to this DP rank
-        running = sum(
-            1
-            for task in TaskPool.pool.values()
-            if getattr(task, "dp_rank", None) == dp_id
-        )
-
+        running = 0
         # Waiting tasks (unassigned) only counted on DP 0
         waiting = 0
         if dp_id == 0:
+            running = sum(
+                1
+                for task in TaskPool.pool.values()
+                if getattr(task, "dp_rank", None) == dp_id
+            )
             waiting = _count_unassigned_waiting_in_pool()
+        else:
+            # For other DP rank, all tasks in the local TaskPool are running on this DP rank
+            running = len(TaskPool.pool)
 
         return running, waiting
     except Exception as e:
@@ -100,19 +103,3 @@ def count_tasks_non_dp() -> tuple[int, int]:
     except Exception as e:
         logger.warning(f"Failed to count tasks in non-DP mode: {e}")
         return 0, 0
-
-
-def count_tasks(dp_id=None) -> tuple[int, int]:
-    """
-    Unified interface to count running and waiting tasks.
-
-    Args:
-        dp_id: If specified, count tasks for this DP rank; if None, count all tasks (non-DP mode)
-
-    Returns:
-        Tuple of (running_count, waiting_count)
-    """
-    if dp_id is not None:
-        return count_tasks_for_dp_rank(dp_id)
-    else:
-        return count_tasks_non_dp()

@@ -26,6 +26,7 @@ from chitu.kv_cache.prefix_caching import (
     BlockIdentity,
     BlockIdentityChainBuilder,
 )
+from chitu.metrics import start_prometheus_server_and_metrics_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 class SchedulerStats:
     """Statistics from Enhanced Schedulers for load balancing."""
 
-    scheduler_id: int
+    local_instance_id: int
     running_requests: int
     waiting_requests: int
     pending_tokens: int
@@ -76,9 +77,9 @@ class RoutePolicy:
 
     def update_stats(self, stats: SchedulerStats):
         """Update statistics from Enhanced Schedulers."""
-        self.scheduler_stats[stats.scheduler_id] = stats
+        self.scheduler_stats[stats.local_instance_id] = stats
         logger.debug(
-            f"Updated stats for scheduler {stats.scheduler_id}, stats: {stats}"
+            f"Updated stats for scheduler {stats.local_instance_id}, stats: {stats}"
         )
 
     def eligible_schedulers(self) -> list[int]:
@@ -95,7 +96,7 @@ class RoutePolicy:
                     under_cap.append(s_id)
         return under_cap if under_cap else alive
 
-    def remember_request(self, request: UserRequest, scheduler_id: int) -> None:
+    def remember_request(self, request: UserRequest, local_instance_id: int) -> None:
         pass
 
     def forget_request(self, request_id: str) -> None:
@@ -213,15 +214,15 @@ class PrefixCacheAwarePolicy(LoadBalancer):
     def update_stats(self, stats: SchedulerStats):
         super().update_stats(stats)
         if isinstance(stats.num_blocks, int) and stats.num_blocks > 0:
-            self.instances_num_total_blocks[stats.scheduler_id] = stats.num_blocks
+            self.instances_num_total_blocks[stats.local_instance_id] = stats.num_blocks
         if isinstance(stats.block_size, int) and stats.block_size > 0:
-            self.instances_block_size[stats.scheduler_id] = stats.block_size
-        self.apply_instance_evicts(stats.scheduler_id, stats.evicted_blk_hashes)
+            self.instances_block_size[stats.local_instance_id] = stats.block_size
+        self.apply_instance_evicts(stats.local_instance_id, stats.evicted_blk_hashes)
 
     def build_req_token_blocks(
-        self, request: UserRequest, scheduler_id: int
+        self, request: UserRequest, local_instance_id: int
     ) -> list[BlockIdentity]:
-        block_size = self.instances_block_size.get(scheduler_id)
+        block_size = self.instances_block_size.get(local_instance_id)
         if not block_size or block_size <= 0:
             return []
         prompt_tokens = list(getattr(request, "prompt_tokens", []) or [])
@@ -232,11 +233,13 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             ROUTER_BLOCK_IDENTITY_MANAGER_NAME, block_size
         ).make_identity_chain_from_tokens(prompt_tokens)
 
-    def num_hit_blocks(self, scheduler_id: int, req_blocks: list[BlockIdentity]) -> int:
+    def num_hit_blocks(
+        self, local_instance_id: int, req_blocks: list[BlockIdentity]
+    ) -> int:
         # Count contiguous prefix hits from the beginning of block chain.
         if not req_blocks:
             return 0
-        lru = self.cached_blocks.get(scheduler_id)
+        lru = self.cached_blocks.get(local_instance_id)
         num_hits = 0
         if not lru:
             return num_hits
@@ -249,8 +252,8 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             num_hits += 1
         return num_hits
 
-    def _load_score(self, scheduler_id: int) -> float:
-        stats = self.scheduler_stats.get(scheduler_id)
+    def _load_score(self, local_instance_id: int) -> float:
+        stats = self.scheduler_stats.get(local_instance_id)
         if stats is None:
             return float("inf")
         return stats.pending_tokens * PENDING_TOKENS_WEIGHT + stats.running_requests
@@ -265,19 +268,21 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         best_score = float("-inf")
         max_num_hits = 0
         logger.debug(f"Select chain for request[{request.request_id}]:")
-        for scheduler_id in eligible_ids:
-            req_blocks = self.build_req_token_blocks(request, scheduler_id)
-            num_hits = self.num_hit_blocks(scheduler_id, req_blocks)
+        for local_instance_id in eligible_ids:
+            req_blocks = self.build_req_token_blocks(request, local_instance_id)
+            num_hits = self.num_hit_blocks(local_instance_id, req_blocks)
             max_num_hits = max(max_num_hits, num_hits)
-            score = self.w_hit * num_hits - self.w_load * self._load_score(scheduler_id)
+            score = self.w_hit * num_hits - self.w_load * self._load_score(
+                local_instance_id
+            )
             logger.debug(
-                f"  - scheduler_id={scheduler_id}: "
+                f"  - local_instance_id={local_instance_id}: "
                 f"score = w_hit({self.w_hit})*num_hits({num_hits}) - "
-                f"w_load({self.w_load})*_load_score({self._load_score(scheduler_id)})"
+                f"w_load({self.w_load})*_load_score({self._load_score(local_instance_id)})"
             )
             if score > best_score:
                 best_score = score
-                best_scheduler = scheduler_id
+                best_scheduler = local_instance_id
 
         if max_num_hits == 0:
             logger.debug(
@@ -291,22 +296,22 @@ class PrefixCacheAwarePolicy(LoadBalancer):
 
         return best_scheduler
 
-    def remember_request(self, request: UserRequest, scheduler_id: int) -> None:
-        self.req_to_scheduler[request.request_id] = scheduler_id
+    def remember_request(self, request: UserRequest, local_instance_id: int) -> None:
+        self.req_to_scheduler[request.request_id] = local_instance_id
         self.req_to_request[request.request_id] = request
 
     def insert_req_blocks(self, request_id: str) -> None:
         # Insert request blocks into cached_blocks when the first token arrived.
-        scheduler_id = self.req_to_scheduler.get(request_id)
+        local_instance_id = self.req_to_scheduler.get(request_id)
         request = self.req_to_request.get(request_id)
-        if scheduler_id is None or request is None:
+        if local_instance_id is None or request is None:
             logger.error(
                 f"[REQUEST_ROUTER] skip insert_req_blocks for unknown request_id={request_id}"
             )
             return
-        req_blocks = self.build_req_token_blocks(request, scheduler_id)
-        lru = self.cached_blocks.setdefault(scheduler_id, OrderedDict())
-        cap = self.instances_num_total_blocks.get(scheduler_id, 0)
+        req_blocks = self.build_req_token_blocks(request, local_instance_id)
+        lru = self.cached_blocks.setdefault(local_instance_id, OrderedDict())
+        cap = self.instances_num_total_blocks.get(local_instance_id, 0)
         if cap <= 0:
             return
         for block in req_blocks:
@@ -321,18 +326,18 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             while len(lru) > cap:
                 # Router local LRU eviction (shadow cache only).
                 evicted_hash, _ = lru.popitem(last=False)
-                self._push_evict_buffer(scheduler_id, evicted_hash)
+                self._push_evict_buffer(local_instance_id, evicted_hash)
 
     def forget_request(self, request_id: str) -> None:
         self.req_to_request.pop(request_id, None)
         self.req_to_scheduler.pop(request_id, None)
 
-    def apply_instance_evicts(self, scheduler_id: int, evicted_hashes) -> None:
+    def apply_instance_evicts(self, local_instance_id: int, evicted_hashes) -> None:
         """Evict hash blocks based on the stats information returned by the instance."""
         if not isinstance(evicted_hashes, list) or not evicted_hashes:
             return
-        lru = self.cached_blocks.setdefault(scheduler_id, OrderedDict())
-        buffer = self.evict_buffer.setdefault(scheduler_id, OrderedDict())
+        lru = self.cached_blocks.setdefault(local_instance_id, OrderedDict())
+        buffer = self.evict_buffer.setdefault(local_instance_id, OrderedDict())
         for blk_hash in evicted_hashes:
             if blk_hash in buffer or blk_hash in lru:
                 buffer.pop(blk_hash, None)
@@ -340,20 +345,20 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             else:
                 logger.warning(
                     "[REQUEST_ROUTER] instance evict hash not found in cached_blocks "
-                    f"or evicted block buffer, scheduler_id={scheduler_id}, blk_hash={blk_hash}. "
+                    f"or evicted block buffer, local_instance_id={local_instance_id}, blk_hash={blk_hash}. "
                     "If this warning is frequent, router/instance cache states may drift; "
                     "try increasing dp_config.router.router_evict_buffer_size."
                 )
 
-    def _push_evict_buffer(self, scheduler_id: int, blk_hash: str) -> None:
-        buffer = self.evict_buffer.setdefault(scheduler_id, OrderedDict())
+    def _push_evict_buffer(self, local_instance_id: int, blk_hash: str) -> None:
+        buffer = self.evict_buffer.setdefault(local_instance_id, OrderedDict())
         buffer[blk_hash] = time.time()
         buffer.move_to_end(blk_hash, last=True)
         if len(buffer) > self.evict_buffer_size:
             overflow_hash, _ = buffer.popitem(last=False)
             logger.warning(
                 "[REQUEST_ROUTER] evicted block buffer overflow, dropping oldest buffer block hash, "
-                f"scheduler_id={scheduler_id}, dropped_blk_hash={overflow_hash}, "
+                f"local_instance_id={local_instance_id}, dropped_blk_hash={overflow_hash}, "
                 f"capacity={self.evict_buffer_size}. "
                 "If this warning is frequent, router/instance cache states may drift."
             )
@@ -403,6 +408,7 @@ class RequestRouter:
             logger.info(
                 f"RequestRouter initialized with {len(self._scheduler_addresses)} schedulers"
             )
+        self.collector_addrs: dict[int, list[str]] = {}
 
     @property
     def scheduler_addresses(self) -> list[str]:
@@ -453,10 +459,11 @@ class RequestRouter:
                 ):  # 100ms timeout
                     data = await self.stats_socket.recv()
                     stats_dict = msgpack.unpackb(data, raw=False)
+                    local_instance_id = stats_dict.get("local_instance_id", 0)
 
                     # Safely get statistics data with default values
                     stats = SchedulerStats(
-                        scheduler_id=stats_dict.get("scheduler_id", 0),
+                        local_instance_id=local_instance_id,
                         running_requests=stats_dict.get("running_requests", 0),
                         waiting_requests=stats_dict.get("waiting_requests", 0),
                         pending_tokens=stats_dict.get("pending_tokens", 0),
@@ -474,6 +481,21 @@ class RequestRouter:
                     )
 
                     self.policy.update_stats(stats)
+                    prometheus_collector_addrs = stats_dict.get(
+                        "prometheus_collector_addrs", []
+                    )
+                    if (
+                        self.collector_addrs.get(local_instance_id, None) is None
+                        and len(prometheus_collector_addrs) > 0
+                    ):
+                        self.collector_addrs[local_instance_id] = (
+                            prometheus_collector_addrs
+                        )
+                        if all(
+                            self.collector_addrs.get(i, None) is not None
+                            for i in range(len(self._scheduler_addresses))
+                        ):
+                            self._start_prometheus_manager()
 
             except KeyError as e:
                 logger.error(f"Missing required field in stats data: {e}")
@@ -496,7 +518,7 @@ class RequestRouter:
                     # Admission + selection delegated to LoadBalancer (soft admission inside)
                     start_time = time.time()
                     try:
-                        scheduler_id = self.policy.select_scheduler(request)
+                        local_instance_id = self.policy.select_scheduler(request)
                     except Exception:
                         # No eligible/alive schedulers currently; push back briefly
                         self.pending_requests.appendleft(request)
@@ -507,14 +529,14 @@ class RequestRouter:
                         continue
                     selection_time = time.time() - start_time
                     logger.info(
-                        f"[REQUEST_ROUTER] Scheduler id: {scheduler_id}, processing request #{request_counter}: {request.request_id}"
+                        f"[REQUEST_ROUTER] Scheduler id: {local_instance_id}, processing request #{request_counter}: {request.request_id}"
                     )
 
                     # Send request to selected scheduler
                     send_start_time = time.time()
-                    self.policy.remember_request(request, scheduler_id)
+                    self.policy.remember_request(request, local_instance_id)
                     try:
-                        await self._send_request(scheduler_id, request)
+                        await self._send_request(local_instance_id, request)
                     except Exception:
                         self.pending_requests.appendleft(request)
                         self.policy.forget_request(request.request_id)
@@ -532,7 +554,7 @@ class RequestRouter:
                     self.total_tokens += estimated_tokens
 
                     logger.debug(
-                        f"[REQUEST_ROUTER] Request {request.request_id} routed to Scheduler {scheduler_id} in {(send_time + selection_time)*1000:.1f}ms"
+                        f"[REQUEST_ROUTER] Request {request.request_id} routed to Instance {local_instance_id} in {(send_time + selection_time)*1000:.1f}ms"
                     )
 
                 else:
@@ -544,17 +566,17 @@ class RequestRouter:
                 logger.error(f"[REQUEST_ROUTER] Stack trace: {traceback.format_exc()}")
                 await asyncio.sleep(0.1)
 
-    async def _heartbeat_monitor_task(self):
+    async def _heartbeat_monitor_task(self, timeout: float = 20.0):
         """Monitor scheduler heartbeat status"""
-        HEARTBEAT_TIMEOUT = 20.0  # 20s timeout threshold
+        HEARTBEAT_TIMEOUT = timeout  # 20s timeout threshold
         while True:
             current_time = time.time()
 
             # Check heartbeat status for all schedulers
-            for scheduler_id, stats in self.policy.scheduler_stats.items():
+            for local_instance_id, stats in self.policy.scheduler_stats.items():
                 if current_time - stats.last_heartbeat_time > HEARTBEAT_TIMEOUT:
                     logger.warning(
-                        f"--- [HEARTBEAT_MONITOR] Scheduler {scheduler_id} heartbeat timeout! ---"
+                        f"--- [HEARTBEAT_MONITOR] Scheduler {local_instance_id} heartbeat timeout! ---"
                         f"Last heartbeat: {current_time - stats.last_heartbeat_time:.2f}s ago"
                     )
                     # Mark as dead
@@ -582,15 +604,17 @@ class RequestRouter:
 
                     # Log scheduler stats
                     for (
-                        scheduler_id,
+                        local_instance_id,
                         stats,
                     ) in self.policy.scheduler_stats.items():
                         logger.debug(
-                            f"Scheduler {scheduler_id}: "
+                            f"Instance {local_instance_id}: "
                             f"running={stats.running_requests}, "
                             f"waiting={stats.waiting_requests}, "
                             f"pending_tokens={stats.pending_tokens}, "
-                            f"throughput={stats.throughput_tokens_per_sec:.2f} tokens/s"
+                            f"throughput={stats.throughput_tokens_per_sec:.2f} tokens/s, "
+                            f"Prometheus "
+                            f"{'online' if self.collector_addrs.get(local_instance_id, None) is not None else 'offline'}"
                         )
 
             except Exception as e:
@@ -606,13 +630,13 @@ class RequestRouter:
 
         logger.debug(f"Submitted request {request.request_id} to queue")
 
-    async def _send_request(self, scheduler_id: int, request: UserRequest):
+    async def _send_request(self, local_instance_id: int, request: UserRequest):
         """Send request to specified Enhanced Scheduler."""
         logger.debug(
-            f"[REQUEST_ROUTER] Sending request {request.request_id} to scheduler {scheduler_id}"
+            f"[REQUEST_ROUTER] Sending request {request.request_id} to instance {local_instance_id}"
         )
 
-        socket = self.scheduler_sockets[scheduler_id]
+        socket = self.scheduler_sockets[local_instance_id]
 
         request_data = request.to_dict()
         try:
@@ -622,7 +646,7 @@ class RequestRouter:
             send_elapsed_ms = (time.time() - send_t0) * 1000.0
             if send_elapsed_ms > 10.0:
                 logger.warning(
-                    f"[REQUEST_ROUTER] slow send to sched {scheduler_id}: {send_elapsed_ms:.1f} ms, bytes={len(data)}"
+                    f"[REQUEST_ROUTER] slow send to sched {local_instance_id}: {send_elapsed_ms:.1f} ms, bytes={len(data)}"
                 )
 
             logger.debug(
@@ -631,7 +655,7 @@ class RequestRouter:
 
         except Exception as e:
             logger.error(
-                f"[REQUEST_ROUTER] Failed to send request {request.request_id} to scheduler {scheduler_id}: {e}"
+                f"[REQUEST_ROUTER] Failed to send request {request.request_id} to instance {local_instance_id}: {e}"
             )
             raise
 
@@ -666,6 +690,11 @@ class RequestRouter:
             "elapsed_time": elapsed_time,
             "scheduler_stats": dict(self.policy.scheduler_stats),
         }
+
+    def _start_prometheus_manager(self):
+        start_prometheus_server_and_metrics_monitor(
+            [addr for addr_list in self.collector_addrs.values() for addr in addr_list]
+        )
 
     async def shutdown(self):
         """Gracefully shutdown the Request Router."""
@@ -747,15 +776,15 @@ async def start_request_router():
 
         # Prefer using dp_config.router; if no dp_addresses configured, fallback to localhost ports
         router_cfg = dp_config.router
-        dp_addrs = getattr(router_cfg, "dp_addresses", None)
-        if dp_addrs:
-            scheduler_addresses = [
-                f"tcp://{addr.host}:{addr.port}" for addr in dp_addrs
+        instance_addrs = getattr(router_cfg, "dp_addresses", None)
+        if instance_addrs:
+            formatted_instance_addrs = [
+                f"tcp://{addr.host}:{addr.port}" for addr in instance_addrs
             ]
-            logger.info(f"Scheduler addresses: {scheduler_addresses}")
+            logger.info(f"Instance addresses: {formatted_instance_addrs}")
             router = RequestRouter(router_cfg)
         else:
-            raise RuntimeError(f"Failed to get scheduler addresses from dp_config")
+            raise RuntimeError(f"Failed to get instance addresses from dp_config")
 
     set_global_request_router(router)
     logger.info("Request Router configured successfully")

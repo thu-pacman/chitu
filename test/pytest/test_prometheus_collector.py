@@ -2,25 +2,38 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 import pytest
+from chitu.backend import Backend
 from chitu.metrics import PrometheusMetricsCollector
 import re
+from omegaconf import OmegaConf
+from chitu.global_vars import set_global_args
 
 
-class Backend:
-    cache_dict = None
+def set_default_global_args():
+    # global_args here is useless, but it must exists
+    set_global_args(
+        OmegaConf.create({"infer": {}}),
+        need_ensure=False,
+    )
+
+
+RANK_LIST = [0, 1, 2, 3, 5, 6, 4, 7]
+RANK_DP = [(rank, dp) for dp, rank in enumerate(RANK_LIST)]
 
 
 class MockGroup:
     def __init__(self, global_rank, rank_in_group):
-        self.rank_in_group = rank_in_group
+        self._rank_in_group = rank_in_group
         self.global_rank = global_rank
-        self.is_first_rank = True
+        self.rank_list = RANK_LIST
 
+    @property
     def is_first_rank(self):
         return True
 
+    @property
     def rank_in_group(self):
-        return 0
+        return self._rank_in_group
 
 
 class Monkcachemanager:
@@ -34,11 +47,11 @@ class Monkcachemanager:
         return self.num_blocks - self.num_free_blocks
 
 
-@pytest.mark.parametrize("rank", [0, 1, 2, 3, 4, 5, 6, 7])
-@pytest.mark.parametrize("dp_id", [0, 1, 2, 3])
-def test_PrometheusMetricsCollector(rank, dp_id, monkeypatch):
+@pytest.mark.parametrize("rank_dp", RANK_DP)
+def test_PrometheusMetricsCollector(rank_dp, monkeypatch):
+    rank, dp_id = rank_dp
+    set_default_global_args()
     # 模拟依赖
-    monkeypatch.setattr("chitu.metrics.prometheus_collector.Backend", Backend)
     monkeypatch.setattr(
         "chitu.metrics.prometheus_collector.get_dp_group",
         lambda: MockGroup(rank, dp_id),

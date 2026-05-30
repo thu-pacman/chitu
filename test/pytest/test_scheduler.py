@@ -114,7 +114,7 @@ def test_chunked_prefill():
         TaskPool.add(task)
 
     scheduler = Scheduler(
-        max_runing_tasks=100,
+        max_running_tasks=100,
         prefill_num_tasks=4,
         decode_num_tasks=4,
         scheduler_type="prefill_first",
@@ -290,7 +290,7 @@ def test_priority_prefill_first():
     ]
 
     scheduler = Scheduler(
-        max_runing_tasks=100,
+        max_running_tasks=100,
         prefill_num_tasks=4,
         decode_num_tasks=2,
         cache_manager_dict=Backend.cache_managers[0],
@@ -493,7 +493,7 @@ def test_priority_fcfs():
     main_manager: PagedKVCacheManager = Backend.cache_managers[0]["main"]
 
     scheduler = Scheduler(
-        max_runing_tasks=100,
+        max_running_tasks=100,
         prefill_num_tasks=4,
         decode_num_tasks=4,
         scheduler_type="fcfs",
