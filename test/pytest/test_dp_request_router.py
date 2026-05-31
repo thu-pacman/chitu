@@ -41,7 +41,7 @@ def test_hit_aware_select_scheduler_prefers_instance_with_more_prefix_hits():
     # mark two schedulers alive
     router.policy.update_stats(
         SchedulerStats(
-            scheduler_id=0,
+            local_instance_id=0,
             running_requests=20,  # higher load on purpose
             waiting_requests=0,
             pending_tokens=0,
@@ -54,7 +54,7 @@ def test_hit_aware_select_scheduler_prefers_instance_with_more_prefix_hits():
     )
     router.policy.update_stats(
         SchedulerStats(
-            scheduler_id=1,
+            local_instance_id=1,
             running_requests=0,
             waiting_requests=0,
             pending_tokens=0,
@@ -68,10 +68,10 @@ def test_hit_aware_select_scheduler_prefers_instance_with_more_prefix_hits():
 
     # request has two full blocks: [1,2,3,4], [5,6,7,8]
     req = MonkReq("req-hit", [1, 2, 3, 4, 5, 6, 7, 8])
-    req_blocks = router.policy.build_req_token_blocks(req, scheduler_id=0)
+    req_blocks = router.policy.build_req_token_blocks(req, local_instance_id=0)
     assert len(req_blocks) == 2
     # instance 0 hits two blocks; instance 1 hits zero.
-    router.policy.remember_request(req, scheduler_id=0)
+    router.policy.remember_request(req, local_instance_id=0)
     router.policy.insert_req_blocks(req.request_id)
 
     selected = router.policy.select_scheduler(req)
@@ -82,7 +82,7 @@ def test_select_scheduler_falls_back_to_lb_when_all_hit_zero():
     router = _build_router(algorithm="prefix_cache_aware")
     router.policy.update_stats(
         SchedulerStats(
-            scheduler_id=0,
+            local_instance_id=0,
             running_requests=3,
             waiting_requests=0,
             pending_tokens=200,
@@ -95,7 +95,7 @@ def test_select_scheduler_falls_back_to_lb_when_all_hit_zero():
     )
     router.policy.update_stats(
         SchedulerStats(
-            scheduler_id=1,
+            local_instance_id=1,
             running_requests=1,
             waiting_requests=0,
             pending_tokens=0,
@@ -119,7 +119,7 @@ def test_remember_req_and_insert_req_blocks_and_forget_req():
     router.policy.instances_block_size[0] = 4
 
     req = MonkReq("req-test", [1, 2, 3, 4, 5, 6, 7, 8])
-    router.policy.remember_request(req, scheduler_id=0)
+    router.policy.remember_request(req, local_instance_id=0)
     assert req.request_id in router.policy.req_to_request
     assert router.policy.req_to_scheduler[req.request_id] == 0
 
@@ -137,8 +137,8 @@ def test_local_evict_moves_hash_to_buffer():
     router.policy.instances_block_size[0] = 4
 
     req = MonkReq("req-evict", [1, 2, 3, 4, 5, 6, 7, 8])
-    req_blocks = router.policy.build_req_token_blocks(req, scheduler_id=0)
-    router.policy.remember_request(req, scheduler_id=0)
+    req_blocks = router.policy.build_req_token_blocks(req, local_instance_id=0)
+    router.policy.remember_request(req, local_instance_id=0)
     router.policy.insert_req_blocks(req.request_id)
 
     # first block should be evicted from cached_blocks and moved to recycle pool

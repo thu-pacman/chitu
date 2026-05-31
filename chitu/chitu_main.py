@@ -1331,21 +1331,22 @@ def chitu_init(args):
 
         collector = PrometheusMetricsCollector.get_instance(is_create=True)
 
-        collector_addrs = [collector.addr]
+        collector_addrs = PrometheusMetricsCollector.addrs
         if type(get_world_group().gpu_group) != SingletonGroupPlaceholder:
             try:
                 collector_addrs = gather_str_to_dst_rank(
-                    collector.addr, dst=0, group=get_world_group().gpu_group
+                    collector_addrs[0], dst=0, group=get_world_group().gpu_group
                 )
             except Exception as e:
                 logger.error(
                     f"An error occurred while gathering collector addresses to rank 0. Prometheus will monitor metrics only on rank 0: {e}"
                 )
+        PrometheusMetricsCollector.addrs = collector_addrs
 
-        logger.debug(f"collector_addrs:{collector_addrs}")
+        logger.info(f"Prometheus collector addresses:{collector_addrs}")
 
         # Only rank 0 monitors (it has all TaskPool data)
-        should_start_monitor = rank == 0
+        should_start_monitor = rank == 0 and not args.dp_config.enabled
         if should_start_monitor:
             start_prometheus_server_and_metrics_monitor(collector_addrs)
     except Exception as e:
@@ -1592,14 +1593,14 @@ def check_alloc_retries():
 
 async def start_enhanced_scheduler_service(rank: int, dp_config, args):
     # only main rank of dp group start enhanced scheduler service
-    dp_id = args.dp_config.dp_id
+    instance_id = args.dp_config.dp_id
     if rank != 0:
         logger.warning(
-            f"[Enhanced Scheduler {dp_id}] only main rank of dp group start Enhanced Scheduler service"
+            f"[Enhanced Scheduler {instance_id}] only main rank of dp group start Enhanced Scheduler service"
         )
         return
 
-    logger.warning(f"[Enhanced Scheduler {dp_id}] Starting...")
+    logger.warning(f"[Enhanced Scheduler {instance_id}] Starting...")
 
     # Initialize ZMQ
     context = zmq.asyncio.Context()
@@ -1610,7 +1611,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
     request_address = f"tcp://{dp_config.scheduler_base_host}:{request_port}"
     request_socket.bind(request_address)
     logger.warning(
-        f"[Enhanced Scheduler {dp_id}] Listening to requests: {request_address}"
+        f"[Enhanced Scheduler {instance_id}] Listening to requests: {request_address}"
     )
 
     # Send statistics socket
@@ -1618,24 +1619,23 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
     stats_address = f"tcp://{dp_config.router.host}:{dp_config.router.stats_port}"  # Router stats port
     stats_socket.connect(stats_address)
     logger.warning(
-        f"[Enhanced Scheduler {dp_id}] connected to stats service: {stats_address}"
+        f"[Enhanced Scheduler {instance_id}] connected to stats service: {stats_address}"
     )
 
     # Start DP Token Manager
     try:
-        dp_id = get_global_args().dp_config.dp_id
         router_token_address = f"tcp://{dp_config.router.host}:{dp_config.router.token_port}"  # Token Router listen address
 
         logger.warning(
-            f"[Enhanced Scheduler {dp_id}] Starting DP Token Manager, group ID={dp_id}"
+            f"[Enhanced Scheduler {instance_id}] Starting DP Token Manager, group ID={instance_id}"
         )
-        await start_dp_token_manager(dp_id, router_token_address)
+        await start_dp_token_manager(instance_id, router_token_address)
         logger.warning(
-            f"[Enhanced Scheduler {dp_id}] DP Token Manager started successfully"
+            f"[Enhanced Scheduler {instance_id}] DP Token Manager started successfully"
         )
     except Exception as e:
         logger.exception(
-            f"[Enhanced Scheduler {dp_id}] DP Token Manager failed to start"
+            f"[Enhanced Scheduler {instance_id}] DP Token Manager failed to start"
         )
         return
 
@@ -1644,7 +1644,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
     start_time = time.time()
 
     logger.warning(
-        f"[Enhanced Scheduler {dp_id}] Starting to process requests, scheduler listening to requests on {request_address}"
+        f"[Enhanced Scheduler {instance_id}] Starting to process requests, scheduler listening to requests on {request_address}"
     )
     last_num_blocks = 0
     last_block_size = 0
@@ -1658,7 +1658,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
                     request_data = msgpack.unpackb(data, raw=False)
 
                     logger.info(
-                        f"[Enhanced Scheduler {dp_id}] Received request: {request_data.get('request_id', 'unknown')}"
+                        f"[Enhanced Scheduler {instance_id}] Received request: {request_data.get('request_id', 'unknown')}"
                     )
 
                     # Process request
@@ -1667,7 +1667,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
 
                 except Exception as e:
                     logger.error(
-                        f"[Enhanced Scheduler {dp_id}] Failed to process request: {e}"
+                        f"[Enhanced Scheduler {instance_id}] Failed to process request: {e}"
                     )
 
             # Send statistics periodically
@@ -1707,12 +1707,12 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
 
                 except Exception as cache_e:
                     logger.error(
-                        f"[Enhanced Scheduler {dp_id}] collect cache stats failed: {cache_e}"
+                        f"[Enhanced Scheduler {instance_id}] collect cache stats failed: {cache_e}"
                     )
 
                 try:
                     stats = {
-                        "scheduler_id": dp_config.dp_id,
+                        "local_instance_id": instance_id,
                         "running_requests": int(running_requests),
                         "waiting_requests": int(waiting_requests),
                         "pending_tokens": 0,  # TODO: calculate pending tokens
@@ -1734,11 +1734,11 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
                     stats_data = msgpack.packb(stats)
                     await stats_socket.send(stats_data)
                     logger.debug(
-                        f"[Enhanced Scheduler {dp_id}] throughput: {throughput:.2f}"
+                        f"[Enhanced Scheduler {instance_id}] throughput: {throughput:.2f}"
                     )
                 except Exception as e:
                     logger.error(
-                        f"[Enhanced Scheduler {dp_id}] throughput send failed: {e}"
+                        f"[Enhanced Scheduler {instance_id}] throughput send failed: {e}"
                     )
 
                 # Reset counter
@@ -1746,15 +1746,15 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
                 start_time = current_time
 
     except KeyboardInterrupt:
-        logger.warning(f"[Enhanced Scheduler {dp_id}] Received interrupt signal")
+        logger.warning(f"[Enhanced Scheduler {instance_id}] Received interrupt signal")
     except Exception as e:
-        logger.error(f"[Enhanced Scheduler {dp_id}] Service exception: {e}")
+        logger.error(f"[Enhanced Scheduler {instance_id}] Service exception: {e}")
     finally:
         # Clean up resources
         request_socket.close()
         stats_socket.close()
         context.term()
-        logger.warning(f"[Enhanced Scheduler {dp_id}] Service stopped")
+        logger.warning(f"[Enhanced Scheduler {instance_id}] Service stopped")
 
 
 async def process_scheduler_request(rank: int, request_data: dict):
@@ -1774,8 +1774,8 @@ async def process_scheduler_request(rank: int, request_data: dict):
         task = Task(task_id=request_id, req=user_request, stop_with_eos=stop_with_eos)
 
         try:
-            dp_id = get_global_args().dp_config.dp_id
-            token_manager = get_dp_token_manager(dp_id)
+            instance_id = get_global_args().dp_config.dp_id
+            token_manager = get_dp_token_manager(instance_id)
             # ensure token manager started
             await token_manager.start()
             if token_manager is not None:
@@ -1789,19 +1789,24 @@ async def process_scheduler_request(rank: int, request_data: dict):
         except Exception as e:
             # If DP Token Manager acquisition fails, fall back to original Task
             logger.error(
-                f"[Enhanced Scheduler {dp_id}] Failed to get DP Token Manager: {e}"
+                f"[Enhanced Scheduler {instance_id}] Failed to get DP Token Manager: {e}"
             )
             TaskPool.add(task)
             logger.warning(
-                f"[Enhanced Scheduler {dp_id}] Fallback to original task: {request_id}"
+                f"[Enhanced Scheduler {instance_id}] Fallback to original task: {request_id}"
             )
 
-        logger.debug(f"[Enhanced Scheduler {dp_id}] Request handled: {request_id}")
+        logger.debug(
+            f"[Enhanced Scheduler {instance_id}] Request handled: {request_id}"
+        )
 
     except Exception as e:
-        logger.error(f"[Enhanced Scheduler {dp_id}] Failed to process request: {e}")
+        instance_id = get_global_args().dp_config.dp_id
         logger.error(
-            f"[Enhanced Scheduler {dp_id}] Error details: {traceback.format_exc()}"
+            f"[Enhanced Scheduler {instance_id}] Failed to process request: {e}"
+        )
+        logger.error(
+            f"[Enhanced Scheduler {instance_id}] Error details: {traceback.format_exc()}"
         )
 
 

@@ -13,7 +13,11 @@ from chitu.kv_cache import KVCacheBase
 from chitu.models.model import MoeGate, ParallelMoeBlock
 from chitu.models.model_hf_llama import TransformerBlockHFLlama, TransformerHFLlama
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
-from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
+from chitu.quantization import (
+    QuantizationRegistry,
+    get_quant_from_checkpoint_prefix,
+    get_quant_kwargs_from_checkpoint_prefix,
+)
 from chitu.distributed.parallel_state import get_etp_size
 from chitu.distributed.partition import compute_expert_dist_in_ep
 from chitu.models.registry import ModelType, register_model
@@ -213,6 +217,9 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            quant_kwargs = get_quant_kwargs_from_checkpoint_prefix(
+                k, self.params.quant_config.rules
+            )
             key_split = k.split(".")
             if key_split[0] != "layers":
                 continue
@@ -222,10 +229,10 @@ class TransformerHFQwen3Moe(TransformerHFLlama):
                     f"{layer_id}.mlp.experts.{local_experts[layer_id][0]}.{w}.{part}"
                 )
                 for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
-                for part in self._get_2d_out_x_in_tensor_names(quant)
+                for part in self._get_2d_out_x_in_tensor_names(quant, quant_kwargs)
                 + self._get_2d_in_x_out_tensor_names(quant)
                 + self._get_1d_in_tensor_names(quant)
-                + self._get_1d_out_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant, quant_kwargs)
             ):
                 w, part = k.split(".")[-2:]
                 prefix = f"layers.{layer_id}.mlp."

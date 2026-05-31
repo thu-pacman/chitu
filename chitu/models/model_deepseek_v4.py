@@ -5,6 +5,7 @@
 import math
 from functools import lru_cache
 from typing import Any, Callable, Mapping, Optional
+from typing_extensions import override
 
 import torch
 from torch import nn
@@ -44,6 +45,7 @@ from chitu.quantization import (
     QuantizationRegistry,
     QuantizedMoeExpertsBase,
     get_quant_from_checkpoint_prefix,
+    get_quant_kwargs_from_checkpoint_prefix,
 )
 from chitu.tensor_parallel import ColumnParallelLinear, LocalLinear, RowParallelLinear
 from chitu.distributed.parallel_state import get_tp_group, get_tp_size, get_etp_size
@@ -1811,11 +1813,18 @@ class TransformerDeepSeekV4(Transformer):
     def _get_tensor_row_parallel_layer_names(self) -> list[str]:
         return ["wo_b", "down_proj"]
 
-    def _get_2d_out_x_in_tensor_names(self, quant) -> list[str]:
+    @override
+    def _get_2d_out_x_in_tensor_names(
+        self, quant: Optional[str], quant_kwargs: dict[str, Any]
+    ) -> list[str]:
+        # FIXME: respect tensors of each possible quantization
         return ["weight", "scale"]
 
-    def _get_1d_out_tensor_names(self, quant) -> list[str]:
-        return super()._get_1d_out_tensor_names(quant) + [
+    @override
+    def _get_1d_out_tensor_names(
+        self, quant: Optional[str], quant_kwargs: dict[str, Any]
+    ) -> list[str]:
+        return super()._get_1d_out_tensor_names(quant, quant_kwargs) + [
             "attn_sink",
         ]
 
@@ -1931,12 +1940,15 @@ class TransformerDeepSeekV4(Transformer):
                 continue
 
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            quant_kwargs = get_quant_kwargs_from_checkpoint_prefix(
+                k, self.params.quant_config.rules
+            )
             if quant not in tensor_names_by_quant:
                 tensor_names_by_quant[quant] = (
-                    self._get_2d_out_x_in_tensor_names(quant)
+                    self._get_2d_out_x_in_tensor_names(quant, quant_kwargs)
                     + self._get_2d_in_x_out_tensor_names(quant)
                     + self._get_1d_in_tensor_names(quant)
-                    + self._get_1d_out_tensor_names(quant)
+                    + self._get_1d_out_tensor_names(quant, quant_kwargs)
                 )
             if tensor_name not in tensor_names_by_quant[quant]:
                 continue

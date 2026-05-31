@@ -10,18 +10,73 @@ from chitu.backend import Backend
 from chitu.metrics import PrometheusServerManager
 from chitu.metrics.grafana_manager import GrafanaManager
 from chitu.global_vars import get_global_args
-from chitu.metrics.task_stats import count_tasks
-from chitu.metrics.cache_stats import paged_kvcache_stats
-from chitu.utils import ceil_div
-
-try:
-    from chitu.distributed.pd_disaggregation.pd_scheduler import (
-        get_pd_scheduler_instance,
-    )
-except Exception:  # pragma: no cover - optional PD dependency
-    get_pd_scheduler_instance = None
 
 logger = getLogger(__name__)
+
+
+class MetricsFormatter:
+    """
+    MetricsFormatter
+    """
+
+    def __init__(self):
+        args = get_global_args()
+        dp_enabled = (
+            getattr(args, "dp_config", None) is not None and args.dp_config.enabled
+        )
+
+        self.use_instance_info: bool = dp_enabled
+        self.use_dp_info: bool = dp_enabled or (
+            getattr(args, "infer", None) is not None and args.infer.dp_size > 1
+        )
+        self.use_rank_info: bool = True
+
+        self.pd_enabled: bool = (
+            dp_enabled and args.dp_config.router.pd_disaggregation.enabled
+        )
+        self.num_prefill_instances: int = -1
+        if self.pd_enabled:
+            self.num_prefill_instances = len(args.dp_config.router.prefill_schedulers)
+
+        self.prefix_format = self._get_prefix_format_str()
+
+    def _rank_format_str(self) -> Optional[str]:
+        return "Rank{rank}" if self.use_rank_info else None
+
+    def _dp_format_str(self) -> Optional[str]:
+        return "DP{dp_id}" if self.use_dp_info else None
+
+    def _instance_format_str(self) -> Optional[str]:
+        return "{instance_id}" if self.use_instance_info else None
+
+    def _get_prefix_format_str(self) -> str:
+        prefix_formats = [
+            self._instance_format_str(),
+            self._dp_format_str(),
+            self._rank_format_str(),
+        ]
+        prefix_formats = [s for s in prefix_formats if s is not None]
+        return "[" + ", ".join(prefix_formats) + "]: "
+
+    def _format_instance(self, instance_id) -> str:
+        if not self.use_instance_info:
+            return ""
+        if self.pd_enabled:
+            if instance_id < self.num_prefill_instances:
+                return f"Prefill{instance_id}"
+            else:
+                return f"Decode{instance_id - self.num_prefill_instances}"
+        return f"Instance{instance_id}"
+
+    def __call__(self, metadata, stats) -> str:
+        instance_id = int(metadata[0])
+        dp_id = int(metadata[1])
+        rank = int(metadata[2])
+        return self.prefix_format.format(
+            instance_id=self._format_instance(instance_id),
+            dp_id=dp_id,
+            rank=rank,
+        ) + ", ".join(stats)
 
 
 class MetricsMonitor:
@@ -41,6 +96,8 @@ class MetricsMonitor:
             log_interval: Logging interval in seconds (sleep time in monitor loop)
         """
         self.manager = manager
+        self.metrics_formatter = MetricsFormatter()
+        self.enable_multi_instance = get_global_args().dp_config.enabled
         self.log_interval = log_interval
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -136,6 +193,15 @@ class MetricsMonitor:
                 total_prompt_tokens = self.manager.query_metric_latest_value_each_rank(
                     "chitu_total_prompt_tokens_total"
                 )
+                running_requests = self.manager.query_metric_latest_value_each_rank(
+                    "chitu_running_requests"
+                )
+                waiting_requests = self.manager.query_metric_latest_value_each_rank(
+                    "chitu_waiting_requests"
+                )
+                prealloc_blocks = self.manager.query_metric_latest_value_each_rank(
+                    "chitu_prealloc_blocks"
+                )
                 self._print_stats(
                     prompt_tps,
                     gen_tps,
@@ -151,58 +217,64 @@ class MetricsMonitor:
                     total_prompt_tokens,
                     mtp_proposed_rate,
                     mtp_accepted_rate,
+                    running_requests,
+                    waiting_requests,
+                    prealloc_blocks,
                 )
             except Exception as e:
                 logger.error(f"Metrics query failed: {e}")
 
     def _print_stats(
         self,
-        prompt_tps: dict[tuple[str, str], str],
-        gen_tps: dict[tuple[str, str], str],
-        eviction_rate: dict[tuple[str, str], str],
-        kvcache_usage: dict[tuple[str, str], str],
-        used_blocks: dict[tuple[str, str], str],
-        total_blocks: dict[tuple[str, str], str],
-        cuda_total_bytes: dict[tuple[str, str], str],
-        cuda_used_bytes: dict[tuple[str, str], str],
-        torch_allocated_bytes: dict[tuple[str, str], str],
-        torch_reserved_bytes: dict[tuple[str, str], str],
-        total_hit_tokens: dict[tuple[str, str], str],
-        total_prompt_tokens: dict[tuple[str, str], str],
-        mtp_proposed_rate: dict[tuple[str, str], str] = None,
-        mtp_accepted_rate: dict[tuple[str, str], str] = None,
+        prompt_tps: dict[tuple[str, str, str], str],
+        gen_tps: dict[tuple[str, str, str], str],
+        eviction_rate: dict[tuple[str, str, str], str],
+        kvcache_usage: dict[tuple[str, str, str], str],
+        used_blocks: dict[tuple[str, str, str], str],
+        total_blocks: dict[tuple[str, str, str], str],
+        cuda_total_bytes: dict[tuple[str, str, str], str],
+        cuda_used_bytes: dict[tuple[str, str, str], str],
+        torch_allocated_bytes: dict[tuple[str, str, str], str],
+        torch_reserved_bytes: dict[tuple[str, str, str], str],
+        total_hit_tokens: dict[tuple[str, str, str], str],
+        total_prompt_tokens: dict[tuple[str, str, str], str],
+        mtp_proposed_rate: dict[tuple[str, str, str], str] = None,
+        mtp_accepted_rate: dict[tuple[str, str, str], str] = None,
+        running_requests: dict[tuple[str, str, str], str] = None,
+        waiting_requests: dict[tuple[str, str, str], str] = None,
+        prealloc_blocks: dict[tuple[str, str, str], str] = None,
     ):
-        stats_parts: dict[tuple[str, str], list[str]] = {}
+        stats_parts: dict[tuple[str, str, str], list[str]] = {}
 
-        def append_part(rank_dp: tuple[str, str], part: str):
+        def append_part(rank_dp: tuple[str, str, str], part: str):
             stats_parts.setdefault(rank_dp, []).append(part)
 
-        for rank_dp, value in prompt_tps.items():
-            append_part(rank_dp, f"Avg prompt throughput: {float(value):.1f} tokens/s")
+        for source, value in prompt_tps.items():
+            append_part(source, f"Avg prompt throughput: {float(value):.1f} tokens/s")
 
-        for rank_dp, value in gen_tps.items():
+        for source, value in gen_tps.items():
             append_part(
-                rank_dp, f"Avg generation throughput: {float(value):.1f} tokens/s"
+                source, f"Avg generation throughput: {float(value):.1f} tokens/s"
             )
 
-        for rank_dp, value in eviction_rate.items():
-            append_part(rank_dp, f"Task evictions: {float(value):.2f}/s")
+        for source, value in eviction_rate.items():
+            append_part(source, f"Task evictions: {float(value):.2f}/s")
 
-        for rank_dp in total_prompt_tokens:
-            prompt_tokens = int(total_prompt_tokens[rank_dp])
-            hit_tokens = int(total_hit_tokens.get(rank_dp, "0"))
+        for source in total_prompt_tokens:
+            prompt_tokens = int(total_prompt_tokens[source])
+            hit_tokens = int(total_hit_tokens.get(source, "0"))
             hit_rate = hit_tokens / prompt_tokens if prompt_tokens != 0 else 0
             append_part(
-                rank_dp, f"Hit rate: {hit_rate*100:.1f}%({hit_tokens}/{prompt_tokens})"
+                source, f"Hit rate: {hit_rate*100:.1f}%({hit_tokens}/{prompt_tokens})"
             )
 
         if mtp_proposed_rate and mtp_accepted_rate:
-            for rank_dp, proposed_value in mtp_proposed_rate.items():
+            for source, proposed_value in mtp_proposed_rate.items():
                 proposed = float(proposed_value)
                 if proposed <= 0:
                     continue
-                accepted = float(mtp_accepted_rate.get(rank_dp, "0"))
-                append_part(rank_dp, f"MTP hit rate: {accepted/proposed*100:.1f}%")
+                accepted = float(mtp_accepted_rate.get(source, "0"))
+                append_part(source, f"MTP hit rate: {accepted/proposed*100:.1f}%")
 
         task_metric_dicts = [
             prompt_tps,
@@ -210,6 +282,9 @@ class MetricsMonitor:
             eviction_rate,
             total_hit_tokens,
             total_prompt_tokens,
+            running_requests,
+            waiting_requests,
+            prealloc_blocks,
         ]
         if mtp_proposed_rate:
             task_metric_dicts.append(mtp_proposed_rate)
@@ -218,21 +293,15 @@ class MetricsMonitor:
         task_rank_dp_pairs = {
             key for metric_dict in task_metric_dicts for key in metric_dict
         }
-        dp_ids = {int(rank_dp[1]) for rank_dp in task_rank_dp_pairs}
-        dp_size = max(dp_ids) + 1 if dp_ids else 1
-        prealloc_blocks_by_dp = (
-            self._get_prealloc_blocks_by_dp(dp_size) if task_rank_dp_pairs else None
-        )
 
         for rank_dp in sorted(task_rank_dp_pairs):
-            dp_id = int(rank_dp[1])
-            running, waiting = count_tasks(dp_id=dp_id)
+            running = int(running_requests.get(rank_dp, "0"))
+            waiting = int(waiting_requests.get(rank_dp, "0"))
+            prealloced = int(prealloc_blocks.get(rank_dp, "-1"))
             append_part(rank_dp, f"Running: {running} reqs")
             append_part(rank_dp, f"Waiting: {waiting} reqs")
-            if prealloc_blocks_by_dp and dp_id in prealloc_blocks_by_dp:
-                append_part(
-                    rank_dp, f"KV blocks prealloc: {int(prealloc_blocks_by_dp[dp_id])}"
-                )
+            if prealloced >= 0:
+                append_part(rank_dp, f"KV blocks prealloc: {prealloced}")
 
         kvcache_rank_dp_pairs = (
             set(kvcache_usage) | set(used_blocks) | set(total_blocks)
@@ -240,12 +309,7 @@ class MetricsMonitor:
         for rank_dp in sorted(kvcache_rank_dp_pairs):
             used_blocks_value = int(used_blocks.get(rank_dp, "0"))
             total_blocks_value = int(total_blocks.get(rank_dp, "0"))
-            kv_cache_usage_value = float(kvcache_usage.get(rank_dp, "0"))
-            if total_blocks_value == 0 and rank_dp in task_rank_dp_pairs:
-                dp_id = int(rank_dp[1])
-                used_blocks_value, total_blocks_value, kv_cache_usage_value = (
-                    paged_kvcache_stats(dp_id=dp_id)
-                )
+            kv_cache_usage_value = float(kvcache_usage.get(rank_dp, "-1"))
             if total_blocks_value > 0:
                 append_part(
                     rank_dp,
@@ -254,14 +318,14 @@ class MetricsMonitor:
                 )
 
         gpu_rank_dp_pairs = set(cuda_total_bytes) | set(cuda_used_bytes)
-        for rank_dp in sorted(gpu_rank_dp_pairs):
-            cuda_total = float(cuda_total_bytes.get(rank_dp, "0"))
-            cuda_used = float(cuda_used_bytes.get(rank_dp, "0"))
+        for source in sorted(gpu_rank_dp_pairs):
+            cuda_total = float(cuda_total_bytes.get(source, "0"))
+            cuda_used = float(cuda_used_bytes.get(source, "0"))
             if cuda_total <= 0 or cuda_used < 0:
                 continue
-            parts = stats_parts.setdefault(rank_dp, [])
-            torch_allocated = float(torch_allocated_bytes.get(rank_dp, "-1"))
-            torch_reserved = float(torch_reserved_bytes.get(rank_dp, "-1"))
+            parts = stats_parts.setdefault(source, [])
+            torch_allocated = float(torch_allocated_bytes.get(source, "-1"))
+            torch_reserved = float(torch_reserved_bytes.get(source, "-1"))
             used_gib = cuda_used / 1024**3
             total_gib = cuda_total / 1024**3
             if torch_allocated >= 0 and torch_reserved >= 0:
@@ -278,39 +342,8 @@ class MetricsMonitor:
             else:
                 parts.append(f"GPU mem: {used_gib:.2f}/{total_gib:.2f} GiB")
 
-        for rank_dp in sorted(stats_parts):
-            rank = int(rank_dp[0])
-            dp_id = int(rank_dp[1])
-            logger.info(f"[rank{rank}, DP{dp_id}]: {', '.join(stats_parts[rank_dp])}")
-
-    def _get_prealloc_blocks_by_dp(self, dp_size: int) -> Optional[dict[int, int]]:
-        """Get prealloc KV blocks per DP rank from PD scheduler."""
-        if get_pd_scheduler_instance is None:
-            return None
-        scheduler = get_pd_scheduler_instance()
-        if scheduler is None:
-            return None
-        if Backend.cache_dict["main"] is None:
-            return None
-        if not hasattr(Backend.cache_dict["main"], "block_size"):
-            return None
-        block_size = Backend.cache_dict["main"].block_size
-        if block_size <= 0:
-            return None
-        tokens_by_dp = getattr(
-            scheduler, "_decode_prealloc_tokens_inflight_by_dp", None
-        )
-        if not tokens_by_dp:
-            return None
-        prealloc_blocks: dict[int, int] = {}
-        for dp_id in range(dp_size):
-            tokens = 0
-            if dp_id < len(tokens_by_dp):
-                tokens = int(tokens_by_dp[dp_id])
-            prealloc_blocks[dp_id] = (
-                int(ceil_div(tokens, block_size)) if tokens > 0 else 0
-            )
-        return prealloc_blocks
+        for source in sorted(stats_parts):
+            logger.info(self.metrics_formatter(source, stats_parts[source]))
 
 
 _global_monitor: Optional[MetricsMonitor] = None

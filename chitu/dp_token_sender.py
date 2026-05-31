@@ -27,10 +27,10 @@ class DPTokenSender:
     """Token sender in DP mode, responsible for sending tokens to the Router"""
 
     def __init__(
-        self, router_address: str = "tcp://localhost:29700", dp_group_id: int = 0
+        self, router_address: str = "tcp://localhost:29700", instance_id: int = 0
     ):
         self.router_address = router_address
-        self.dp_group_id = dp_group_id
+        self.instance_id = instance_id
         self.socket = None
         self.context = None
         self._send_queue = None
@@ -38,9 +38,8 @@ class DPTokenSender:
         self._started = False
         self._start_lock = threading.Lock()
 
-        self.instance_id = id(self)
         logger.info(
-            f"DPTokenSender created: group={dp_group_id}, instance_id={self.instance_id}, router={router_address}"
+            f"DPTokenSender created: instance={instance_id}, router={router_address}"
         )
 
         self.request_token_cache: dict[str, list[int]] = {}
@@ -55,7 +54,7 @@ class DPTokenSender:
             self._init_socket()
             self._start_sender_thread()
             self._started = True
-            logger.info(f"DPTokenSender started for group {self.dp_group_id}")
+            logger.info(f"DPTokenSender started for instance {self.instance_id}")
 
     def _init_socket(self):
         """Initialize synchronous ZMQ socket"""
@@ -79,12 +78,12 @@ class DPTokenSender:
         router_token_base_port = get_global_args().dp_config.router.token_port
         router_addr = self.router_address
         if router_host and router_token_base_port is not None:
-            port = int(router_token_base_port) + int(self.dp_group_id)
+            port = int(router_token_base_port) + int(self.instance_id)
             router_addr = f"tcp://{router_host}:{port}"
             logger.info(f"port: {port}, router_addr: {router_addr}")
         self.socket.connect(router_addr)
         logger.info(
-            f"[DPTokenSender] group={self.dp_group_id} connect={router_addr} host_cfg={router_host} base_cfg={router_token_base_port}"
+            f"[DPTokenSender] group={self.instance_id} connect={router_addr} host_cfg={router_host} base_cfg={router_token_base_port}"
         )
         if self._send_queue is None:
             self._send_queue = queue.Queue(maxsize=10000)
@@ -133,7 +132,7 @@ class DPTokenSender:
             tokens=tokens,
             top_logprobs=top_logprobs,
             top_token_idx=top_token_idx,
-            scheduler_id=self.dp_group_id,
+            instance_id=self.instance_id,
             timestamp=time.time(),
         )
 
@@ -160,14 +159,14 @@ class DPTokenSender:
         self.request_token_cache.pop(request_id, None)
         self._chars_len.pop(request_id, None)
         self._first_token_sent.discard(request_id)
-        data = {
-            "type": "finish",
-            "request_id": request_id,
-            "finish_reason": finish_reason,
-            "num_hit_tokens": int(num_hit_tokens),
-            "scheduler_id": self.dp_group_id,
-            "timestamp": time.time(),
-        }
+        data = dict(
+            type="finish",
+            request_id=request_id,
+            finish_reason=finish_reason,
+            num_hit_tokens=num_hit_tokens,
+            instance_id=self.instance_id,
+            timestamp=time.time(),
+        )
 
         self._send_data(data)
 
@@ -177,13 +176,13 @@ class DPTokenSender:
         self.request_token_cache.pop(request_id, None)
         self._chars_len.pop(request_id, None)
         self._first_token_sent.discard(request_id)
-        data = {
-            "type": "error",
-            "request_id": request_id,
-            "error": error_message,
-            "scheduler_id": self.dp_group_id,
-            "timestamp": time.time(),
-        }
+        data = dict(
+            type="error",
+            request_id=request_id,
+            error_message=error_message,
+            instance_id=self.instance_id,
+            timestamp=time.time(),
+        )
 
         self._send_data(data)
 
@@ -208,7 +207,7 @@ class DPTokenSender:
         # do not term the shared context
         self.request_token_cache.clear()
         self._started = False
-        logger.info(f"DPTokenSender closed for group {self.dp_group_id}")
+        logger.info(f"DPTokenSender closed for group {self.instance_id}")
 
 
 class DPTaskWrapper:
@@ -281,21 +280,20 @@ class DPTaskWrapper:
 class DPTokenManager:
     """DP Token Manager: manages token sending for the whole DP group"""
 
-    def __init__(self, dp_group_id: int, router_address: str = "tcp://localhost:29700"):
-        self.dp_group_id = dp_group_id
+    def __init__(self, instance_id: int, router_address: str = "tcp://localhost:29700"):
+        self.instance_id = instance_id
         self.router_address = router_address
-        self.token_sender = DPTokenSender(router_address, dp_group_id)
+        self.token_sender = DPTokenSender(router_address, instance_id)
         self.wrapped_tasks: dict[str, DPTaskWrapper] = {}
 
-        self.instance_id = id(self)
         logger.info(
-            f"DPTokenManager created: group={dp_group_id}, instance_id={self.instance_id}, router={router_address}"
+            f"DPTokenManager created: group={instance_id}, router={router_address}"
         )
 
     async def start(self):
         """Start Token Manager"""
         await self.token_sender.start()
-        logger.debug(f"DP Token Manager started for group {self.dp_group_id}")
+        logger.debug(f"DP Token Manager started for group {self.instance_id}")
 
     def wrap_task(self, task: Task) -> DPTaskWrapper:
         """Wrap Task to enable token sending"""
@@ -327,21 +325,21 @@ _dp_token_managers: dict[int, DPTokenManager] = {}
 
 
 def get_dp_token_manager(
-    dp_group_id: int, router_address: str = "tcp://localhost:29700"
+    instance_id: int, router_address: str = "tcp://localhost:29700"
 ) -> DPTokenManager:
     """Get DP Token Manager instance"""
     global _dp_token_managers
 
-    if dp_group_id not in _dp_token_managers:
-        _dp_token_managers[dp_group_id] = DPTokenManager(dp_group_id, router_address)
+    if instance_id not in _dp_token_managers:
+        _dp_token_managers[instance_id] = DPTokenManager(instance_id, router_address)
 
-    return _dp_token_managers[dp_group_id]
+    return _dp_token_managers[instance_id]
 
 
 async def start_dp_token_manager(
-    dp_group_id: int, router_address: str = "tcp://localhost:29700"
+    instance_id: int, router_address: str = "tcp://localhost:29700"
 ):
     """Start Token Manager for the specified DP group"""
-    manager = get_dp_token_manager(dp_group_id, router_address)
+    manager = get_dp_token_manager(instance_id, router_address)
     await manager.start()
     return manager

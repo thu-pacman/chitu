@@ -128,7 +128,7 @@ class PDCoordinationMessage:
 class SchedulerInfo:
     """Scheduler information"""
 
-    scheduler_id: int
+    local_instance_id: int
     scheduler_type: SchedulerType
     host: str
     port: int

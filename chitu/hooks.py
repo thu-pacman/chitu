@@ -25,44 +25,13 @@ from chitu.distributed.pd_disaggregation.pd_log_utils import (
     pd_trace_enabled,
     pd_verbose_enabled,
 )
+from chitu.distributed.pd_disaggregation.pd_scheduler import get_pd_scheduler_instance
 
 logger = logging.getLogger(__name__)
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import KVManager
-
-
-class KVTransferHook(Protocol):
-    """Hook for KV transfer across prefill/decode engines in PD mode.
-
-    Implementations may send KV + first-token metadata after prefill, and/or
-    receive KV before decode. Default (NoopKVTransferHook) does nothing.
-    """
-
-    def on_prefill_done(self, tasks: PackedTasksBase):
-        pass
-
-    def before_decode_step(
-        self,
-        req_ids: list[str],
-        new_cache_ids_list: Optional[list[dict[str, list[int]]]] = None,
-        prefix_lens: Optional[list[int]] = None,
-    ):
-        pass
-
-
-class NoopKVTransferHook:
-    def on_prefill_done(self, tasks: PackedTasksBase):
-        return
-
-    def before_decode_step(
-        self,
-        req_ids: list[str],
-        new_cache_ids_list: Optional[list[dict[str, list[int]]]] = None,
-        prefix_lens: Optional[list[int]] = None,
-    ):
-        return
 
 
 class TokenSink(Protocol):
@@ -125,6 +94,38 @@ class DPTokenSink:
         logprobs_list: Optional[list[list[float]]] = None,
         token_idxs_list: Optional[list[list[int]]] = None,
     ) -> None:
+        return
+
+
+class KVTransferHook(Protocol):
+    """Hook for KV transfer across prefill/decode engines in PD mode.
+
+    Implementations may send KV + first-token metadata after prefill, and/or
+    receive KV before decode. Default (NoopKVTransferHook) does nothing.
+    """
+
+    def on_prefill_done(self, tasks: PackedTasksBase):
+        pass
+
+    def before_decode_step(
+        self,
+        req_ids: list[str],
+        new_cache_ids_list: Optional[list[dict[str, list[int]]]] = None,
+        prefix_lens: Optional[list[int]] = None,
+    ):
+        pass
+
+
+class NoopKVTransferHook:
+    def on_prefill_done(self, tasks: PackedTasksBase):
+        return
+
+    def before_decode_step(
+        self,
+        req_ids: list[str],
+        new_cache_ids_list: Optional[list[dict[str, list[int]]]] = None,
+        prefix_lens: Optional[list[int]] = None,
+    ):
         return
 
 
@@ -349,3 +350,40 @@ class MooncakeKVTransferHook:
         from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 
         PrometheusMetricsCollector.inc_generated_tokens(len(tokens_cpu))
+
+
+class TaskEvictHook(Protocol):
+    """Hook for handling task evicting event in Scheduler
+
+    Default hook does nothing
+    """
+
+    def before_evict(self, task: Task):
+        pass
+
+    def on_evict_done(self, task: Task):
+        pass
+
+
+class NoopTaskEvictHook:
+    def before_evict(self, task: Task):
+        pass
+
+    def on_evict_done(self, task: Task):
+        pass
+
+
+class PDTaskEvictHook:
+    def before_evict(self, task: Task):
+        pass
+
+    def on_evict_done(self, task: Task):
+        # Mark stopped so need_remove() returns True and update() drops it
+        task.set_stopped()
+        if getattr(task, "req", None) is not None and not task.req.finished:
+            task.req.finish_reason = "evicted"
+            token_manager = get_pd_scheduler_instance().token_manager
+            if token_manager is not None:
+                token_manager.token_sender.send_finish(
+                    task.req.request_id, finish_reason="evicted"
+                )

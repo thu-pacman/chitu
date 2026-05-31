@@ -545,8 +545,6 @@ request.max_new_tokens=100
 #   export TASK_QUEUE_ENABLE=2        # Offload some operator adaptation tasks to the secondary pipeline to balance load and reduce dequeue wake-up latency
 #   export CPU_AFFINITY_CONF=2        # Bind tasks to CPUs within the same NUMA node to avoid cross-NUMA memory access and lower scheduling overhead
 #   export HCCL_OP_EXPANSION_MODE=AIV # Leverage the device’s AI Vector Core units to accelerate AllReduce operations
-# 3. For multi-node inference, specify the local ip
-#   export HCCL_IF_IP=$LOCAL_IP
 
 # Start service at localhost:21002
 export WORLD_SIZE=8

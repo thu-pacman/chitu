@@ -547,7 +547,6 @@ torchrun --nproc_per_node 1 \
 #   export TASK_QUEUE_ENABLE=2  # 将部分算子适配任务迁移至二级流水，使两级流水负载更均衡，并减少dequeue唤醒时间
 #   export CPU_AFFINITY_CONF=2  # 优化任务的执行效率，避免跨NUMA（非统一内存访问架构）节点的内存访问，减少任务调度开销
 #   export HCCL_OP_EXPANSION_MODE=AIV  # 利用Device的AI Vector Core计算单元来加速AllReduce
-# 3. 多机推理设置 export HCCL_IF_IP=$LOCAL_IP
 
 # 在 localhost:21002 启动服务
 export WORLD_SIZE=8

@@ -6,4 +6,4 @@ quant:
 - model: '.'
   rules:
     - regex : 'layers\.'
-      type : simple_w8a8
+      type : w8a8_per_token_per_channel_dyn

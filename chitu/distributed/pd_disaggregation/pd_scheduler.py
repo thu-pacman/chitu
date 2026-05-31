@@ -22,18 +22,13 @@ import torch
 import msgpack
 import zmq
 
-from chitu.scheduler import Scheduler
-from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 from chitu.task import (
-    DPTaskCollector,
-    PackedTasks,
     Task,
     TaskPool,
     TaskType,
     UserRequest,
 )
 from chitu.global_vars import get_global_args
-from chitu.utils import ceil_div
 from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
     KVManager,
     DisaggregationMode,
@@ -55,16 +50,16 @@ if TYPE_CHECKING:
 
 logger = getLogger(__name__)
 
-_PD_SCHEDULER_INSTANCE: Optional["PDScheduler"] = None
+_PD_SCHEDULER_INSTANCE: Optional["PDInstanceRequestManager"] = None
 
 
-def set_pd_scheduler_instance(scheduler: Optional["PDScheduler"]) -> None:
+def set_pd_scheduler_instance(scheduler: Optional["PDInstanceRequestManager"]) -> None:
     """Expose PD scheduler instance for diagnostics/metrics."""
     global _PD_SCHEDULER_INSTANCE
     _PD_SCHEDULER_INSTANCE = scheduler
 
 
-def get_pd_scheduler_instance() -> Optional["PDScheduler"]:
+def get_pd_scheduler_instance() -> Optional["PDInstanceRequestManager"]:
     """Return the global PD scheduler instance if available."""
     return _PD_SCHEDULER_INSTANCE
 
@@ -183,10 +178,11 @@ class PDQueue:
             return list(self._items.items())[: int(max_items)]
 
 
-class PDScheduler(Scheduler):
+class PDInstanceRequestManager:
     """
     PD disaggregation Scheduler
     Supports Prefill-only, Decode-only, and unified modes
+    Each Prefill/Decode instance only has one Main Scheduler
     """
 
     def __init__(
@@ -195,53 +191,19 @@ class PDScheduler(Scheduler):
         decode_num_tasks: int,
         scheduler_type: str,
         pd_mode: PDSchedulerMode = PDSchedulerMode.UNIFIED,
-        scheduler_id: int = 0,
+        local_instance_id: int = 0,
     ):
-        # Filter out PD-specific scheduler types before passing to parent
-        filtered_scheduler_type = self._filter_scheduler_type(scheduler_type)
         args = get_global_args()
         cache_managers = Backend.cache_managers
         if cache_managers is None:
             raise RuntimeError("Backend.cache_managers is not initialized")
-        max_running_tasks = compute_local_batch_size_dist_in_dp(
-            args.infer.max_batch_size, args.infer.dp_size
-        )[0]
-        super().__init__(
-            max_running_tasks,
-            prefill_num_tasks,
-            decode_num_tasks,
-            filtered_scheduler_type,
-            cache_managers[0],
-            num_scheduler_groups=args.infer.pp_size,
-            dp_rank=0,
-            original_scheduler_type=scheduler_type,
-        )
+        self.prefill_num_tasks = prefill_num_tasks
+        self.decode_num_tasks = decode_num_tasks
 
         self.pd_mode = pd_mode
-        self.scheduler_id = scheduler_id
+        self.local_instance_id = local_instance_id
         self.original_scheduler_type = scheduler_type
-
-        # Initialize per-dp schedulers for Decode mode if needed
-        self.dp_scheduler = None  # legacy field kept for compatibility
-        self.dp_schedulers: list[Scheduler] = []
-        if self.pd_mode == PDSchedulerMode.DECODE_ONLY and args.infer.dp_size > 1:
-            dp_size = args.infer.dp_size
-            max_running_tasks_dist = compute_local_batch_size_dist_in_dp(
-                args.infer.max_batch_size, dp_size
-            )
-            for dp_rank in range(dp_size):
-                self.dp_schedulers.append(
-                    Scheduler(
-                        max_running_tasks_dist[dp_rank],
-                        prefill_num_tasks=decode_num_tasks,
-                        decode_num_tasks=decode_num_tasks,
-                        scheduler_type=filtered_scheduler_type,
-                        cache_manager_dict=cache_managers[dp_rank],
-                        num_scheduler_groups=args.infer.pp_size,
-                        dp_rank=dp_rank,
-                        original_scheduler_type=scheduler_type,
-                    )
-                )
+        self.dp_size: int = args.infer.dp_size
 
         # PD disaggregation related state
         self.pending_decode_requests: dict[str, dict] = {}  # request_id -> request_info
@@ -303,29 +265,6 @@ class PDScheduler(Scheduler):
                         f"req_id={request_id} dp_rank={int(dp_rank)} endpoint={endpoint_addr}"
                     )
                     return False
-
-    def _filter_scheduler_type(self, scheduler_type: str) -> str:
-        """Filter out PD-specific scheduler types"""
-        # Remove PD-specific types and map to valid base scheduler types
-        parts = scheduler_type.split(",")
-        filtered_parts = []
-
-        for part in parts:
-            part = part.strip().lower()
-            if part in ["prefill_only", "decode_only"]:
-                # Replace with a valid base scheduler type
-                if part == "prefill_only":
-                    filtered_parts.append("prefill_first")
-                elif part == "decode_only":
-                    filtered_parts.append("fcfs")
-            else:
-                filtered_parts.append(part)
-
-        # Ensure we have at least one valid scheduler type
-        if not filtered_parts:
-            filtered_parts = ["fcfs"]
-
-        return ",".join(filtered_parts)
 
     def _init_pd_components(self):
         """Initialize PD disaggregation components"""
@@ -433,7 +372,7 @@ class PDScheduler(Scheduler):
             raise RuntimeError(
                 "coordination metadata addr not configured; cannot discover decode prepare endpoints"
             )
-        decode_scheduler_id = self.scheduler_id
+        decode_scheduler_id = self.local_instance_id
         wait_until = time.time() + max(float(timeout_s), 0.1)
         last = None
         while time.time() < wait_until:
@@ -552,7 +491,7 @@ class PDScheduler(Scheduler):
         if pd_trace_enabled():
             logger.debug(
                 f"[PD_TRACE][sched.recv] mode={self.pd_mode.value} "
-                f"sched_id={self.scheduler_id} req_id={request_id} type={request_type} "
+                f"local_instance_id={self.local_instance_id} req_id={request_id} type={request_type} "
                 f"scheduler_type={scheduler_type} keys={sorted(list(request_data.keys()))}"
             )
 
@@ -625,11 +564,11 @@ class PDScheduler(Scheduler):
 
         # DP Scheduling: Determine target DP rank
         target_dp_rank = 0
-        if self.dp_schedulers:
+        if self.dp_size > 1:
             args = get_global_args()
             if not hasattr(self, "_dp_cursor"):
                 self._dp_cursor = 0
-            target_dp_rank = self._dp_cursor % args.infer.dp_size
+            target_dp_rank = self._dp_cursor % self.dp_size
             self._dp_cursor += 1
             if pd_verbose_enabled():
                 logger.debug(
@@ -639,7 +578,7 @@ class PDScheduler(Scheduler):
         if pd_trace_enabled():
             logger.debug(
                 f"[PD_TRACE][decode.dispatch] req_id={request_id} prefill_sid={prefill_scheduler_id} "
-                f"target_dp_rank={int(target_dp_rank)} infer_dp_size={int(args.infer.dp_size)} "
+                f"target_dp_rank={int(target_dp_rank)} infer_dp_size={int(self.dp_size)} "
                 f"infer_ep_size={int(args.infer.ep_size)}"
             )
 
@@ -660,7 +599,6 @@ class PDScheduler(Scheduler):
             decode_info["original_request"], enqueue=False
         )
         # Bind request to the target DP rank for compute placement.
-        task.cache_owner = target_dp_rank
         task.dp_rank = target_dp_rank
         # Carry PD binding so KV hook can route to the correct prefill engine_rank.
         if prefill_scheduler_id is not None:
@@ -680,35 +618,6 @@ class PDScheduler(Scheduler):
                 f"[PD_QUEUE][decode.enqueue] req_id={request_id} cache_owner={target_dp_rank}"
             )
         logger.debug(f"[PD_STAGE][decode.enqueue.start] req_id={request_id}")
-
-    def schedule(self) -> list[list[str]]:
-        """Schedule tasks for execution.
-
-        In PD decode-only mode, KV pull is performed inside Executor.decode_step via KV hook.
-        This scheduler only selects task ids for the next step.
-        """
-        if self.dp_schedulers:
-            task_ids_list: list[list[str]] = []
-            strict_allowed_task_type = {TaskType.Decode}
-            for sched in self.dp_schedulers:
-                task_ids = sched.schedule(
-                    strict_allowed_task_type=strict_allowed_task_type
-                )
-                if len(task_ids) > 0:
-                    strict_allowed_task_type = strict_allowed_task_type.intersection(
-                        {TaskPool.pool[task_ids[0]].task_type}
-                    )
-                task_ids_list.append(task_ids)
-            if any((len(task_ids) > 0 for task_ids in task_ids_list)):
-                all_task_ids: list[str] = []
-                for task_ids in task_ids_list:
-                    all_task_ids.extend(task_ids)
-                if all_task_ids:
-                    self._record_decode_ready_exec_latency(all_task_ids)
-                DPTaskCollector.prepare_dp_tasks(task_ids_list)
-                return task_ids_list[0]
-            return []
-        return super().schedule()
 
     def _create_task_from_request(
         self, request_data: dict, *, enqueue: bool = True
@@ -749,7 +658,7 @@ class PDScheduler(Scheduler):
         """Get PD disaggregation statistics"""
         stats = {
             "pd_mode": self.pd_mode.value,
-            "scheduler_id": self.scheduler_id,
+            "local_instance_id": self.local_instance_id,
             "pending_decode_requests": len(self.pending_decode_requests),
         }
 
@@ -820,21 +729,21 @@ class PDScheduler(Scheduler):
         return stats
 
 
-class PrefillOnlyScheduler(PDScheduler):
+class PrefillOnlyManager(PDInstanceRequestManager):
     """Prefill-only Scheduler"""
 
     def __init__(
         self,
         prefill_num_tasks: int,
         scheduler_type: str = "prefill_first",
-        scheduler_id: int = 0,
+        local_instance_id: int = 0,
     ):
         super().__init__(
             prefill_num_tasks=prefill_num_tasks,
             decode_num_tasks=1,  # Not used in prefill-only mode
             scheduler_type=scheduler_type,
             pd_mode=PDSchedulerMode.PREFILL_ONLY,
-            scheduler_id=scheduler_id,
+            local_instance_id=local_instance_id,
         )
 
         # Prefill 分层队列
@@ -1021,27 +930,22 @@ class PrefillOnlyScheduler(PDScheduler):
         set_queue_size("prefill", "bootstrap_wait", self._prefill_bootstrap_q.size())
         set_queue_size("prefill", "ready", self._prefill_ready_q.size())
 
-    def schedule(
-        self,
-        strict_allowed_task_type: set[TaskType] = {TaskType.Prefill, TaskType.Decode},
-    ) -> list[str]:
-        # Ensure pending bootstrap requests are promoted when ready before scheduling.
-        self._bootstrap_check_and_promote()
-        return super().schedule(strict_allowed_task_type=strict_allowed_task_type)
 
-
-class DecodeOnlyScheduler(PDScheduler):
+class DecodeOnlyManager(PDInstanceRequestManager):
     """Decode-only Scheduler"""
 
     def __init__(
-        self, decode_num_tasks: int, scheduler_type: str = "fcfs", scheduler_id: int = 0
+        self,
+        decode_num_tasks: int,
+        scheduler_type: str = "fcfs",
+        local_instance_id: int = 0,
     ):
         super().__init__(
             prefill_num_tasks=1,  # Not used in decode-only mode
             decode_num_tasks=decode_num_tasks,
             scheduler_type=scheduler_type,
             pd_mode=PDSchedulerMode.DECODE_ONLY,
-            scheduler_id=scheduler_id,
+            local_instance_id=local_instance_id,
         )
 
         # Decode 分层队列：
@@ -1082,8 +986,7 @@ class DecodeOnlyScheduler(PDScheduler):
         self._decode_max_running_tasks_per_dp = int(run_limit)
         # Track tokens in prealloc + ready queues.
         self._decode_prealloc_tokens_inflight = 0
-        dp_size = getattr(get_global_args().infer, "dp_size", 1)
-        self._decode_prealloc_tokens_inflight_by_dp = [0] * dp_size
+        self._decode_prealloc_tokens_inflight_by_dp = [0] * self.dp_size
         self._decode_prealloc_promoted_total = 0
         self._decode_ready_promoted_total = 0
         self._decode_ready_wait_total_s = 0.0
@@ -1355,8 +1258,7 @@ class DecodeOnlyScheduler(PDScheduler):
             max_ready_promote = min(max_ready_promote, int(max_promote))
         running_per_dp = None
         if self._decode_max_running_tasks_per_dp > 0:
-            args = get_global_args()
-            dp_size = int(getattr(args.infer, "dp_size", 1))
+            dp_size = self.dp_size
             running_per_dp = [0] * dp_size
             for task_id in TaskPool.id_list:
                 task = TaskPool.pool.get(task_id)
@@ -1533,65 +1435,3 @@ class DecodeOnlyScheduler(PDScheduler):
                 f"p50_ms={_pct(50):.2f} p90_ms={_pct(90):.2f} "
                 f"p95_ms={_pct(95):.2f} p99_ms={_pct(99):.2f}"
             )
-
-    def evict_task(self, task_id: str) -> None:
-        """Override evict_task for decode-only PD mode.
-
-        In PD disaggregation, a task that arrives at the decode node has already
-        completed prefill on the prefill node.  The base-class evict_task() resets
-        the task back to TaskType.Prefill so it can be re-prefilled locally, but on
-        a decode-only node there is no prefill engine — the task would sit forever as
-        a zombie Prefill task, causing forcing every
-        schedule() call to return [] across ALL DP ranks, deadlocking the service.
-
-        Instead we free the KV cache and mark the task as stopped so that update()
-        removes it from TaskPool on the next step.  The client receives an error
-        (finish_reason="evicted") and can retry.
-        """
-        from chitu.backend import Backend
-        from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
-
-        task = TaskPool.pool[task_id]
-
-        # Free KV cache metadata (same as base class)
-        task.next_token = -1
-        task.evicting = True
-        for cache_manager in self.cache_manager_dict.values():
-            cache_manager.finalize_metadata_all_decode(task)
-        Backend.executor.special_step([task.task_id], type="EndTask")
-
-        logger.warning(
-            f"[PD] Evicted decode task {task_id} due to insufficient KV cache; "
-            f"task will be failed (cannot re-prefill on decode-only node)",
-            extra={
-                "task_id": task_id,
-                "event": "scheduler_task_evicted",
-                "kvcache_block_threshold": self.kvcache_block_threshold,
-                "total_blocks": self.cache_manager_dict["main"].num_blocks,
-            },
-        )
-
-        PrometheusMetricsCollector.inc_task_eviction()
-
-        # Mark stopped so need_remove() returns True and update() drops it
-        task.set_stopped()
-        if getattr(task, "req", None) is not None and not task.req.finished:
-            task.req.finish_reason = "evicted"
-            task.req.finish()
-
-        # For congestion control
-        self.kvcache_block_threshold = max(1, self.kvcache_block_threshold // 2)
-
-    def schedule(
-        self,
-        strict_allowed_task_type: set[TaskType] = {TaskType.Prefill, TaskType.Decode},
-    ) -> list[str]:
-        # Ensure decode-ready tasks are promoted before scheduling.
-        self._decode_check_and_promote(
-            max_check=self._decode_prealloc_max_pending * 2,
-            max_promote=self._decode_prealloc_max_pending,
-        )
-        task_ids = super().schedule(strict_allowed_task_type=strict_allowed_task_type)
-        self._record_decode_ready_exec_latency(task_ids)
-        self._log_decode_ready_exec_latency(time.time())
-        return task_ids

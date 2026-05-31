@@ -39,8 +39,12 @@ class PDCoordinationService:
         self.kv_transfer_metadata: dict[str, KVTransferMetadata] = (
             {}
         )  # request_id -> metadata
-        self.prefill_schedulers: dict[int, SchedulerInfo] = {}  # scheduler_id -> info
-        self.decode_schedulers: dict[int, SchedulerInfo] = {}  # scheduler_id -> info
+        self.prefill_schedulers: dict[int, SchedulerInfo] = (
+            {}
+        )  # local_instance_id -> info
+        self.decode_schedulers: dict[int, SchedulerInfo] = (
+            {}
+        )  # local_instance_id -> info
         # Prefill control-plane endpoints per engine_rank (dp_id).
         # Used by Prefill PP/TP ranks to discover their control rank's ZMQ ports
         # 之前是 Prefill 启动的时候通过 torch broadcast 告诉其他 Prefill rank main rank 的端口，现在改用 coordination service 来同步
@@ -129,24 +133,30 @@ class PDCoordinationService:
         )
 
     async def register_scheduler(
-        self, scheduler_id: int, scheduler_type: SchedulerType, host: str, port: int
+        self,
+        local_instance_id: int,
+        scheduler_type: SchedulerType,
+        host: str,
+        port: int,
     ):
         """Register Scheduler"""
         scheduler_info = SchedulerInfo(
-            scheduler_id=scheduler_id,
+            local_instance_id=local_instance_id,
             scheduler_type=scheduler_type,
             host=host,
             port=port,
         )
 
         if scheduler_type == SchedulerType.PREFILL:
-            self.prefill_schedulers[scheduler_id] = scheduler_info
+            self.prefill_schedulers[local_instance_id] = scheduler_info
             logger.info(
-                f"registered prefill scheduler: {scheduler_id} at {host}:{port}"
+                f"registered prefill instance: {local_instance_id} at {host}:{port}"
             )
         elif scheduler_type == SchedulerType.DECODE:
-            self.decode_schedulers[scheduler_id] = scheduler_info
-            logger.info(f"registered decode scheduler: {scheduler_id} at {host}:{port}")
+            self.decode_schedulers[local_instance_id] = scheduler_info
+            logger.info(
+                f"registered decode instance: {local_instance_id} at {host}:{port}"
+            )
 
     async def handle_prefill_complete(
         self, request_id: str, prefill_scheduler_id: int, kv_metadata: dict
@@ -392,10 +402,13 @@ class PDCoordinationService:
 
         elif request_type == "get_scheduler_info":
             scheduler_type = request_data.get("scheduler_type")
-            scheduler_id = request_data.get("scheduler_id")
+            local_instance_id = request_data.get("local_instance_id")
 
-            if scheduler_type == "prefill" and scheduler_id in self.prefill_schedulers:
-                info = self.prefill_schedulers[scheduler_id]
+            if (
+                scheduler_type == "prefill"
+                and local_instance_id in self.prefill_schedulers
+            ):
+                info = self.prefill_schedulers[local_instance_id]
                 return {
                     "status": "success",
                     "info": {
@@ -404,8 +417,11 @@ class PDCoordinationService:
                         "status": info.status,
                     },
                 }
-            elif scheduler_type == "decode" and scheduler_id in self.decode_schedulers:
-                info = self.decode_schedulers[scheduler_id]
+            elif (
+                scheduler_type == "decode"
+                and local_instance_id in self.decode_schedulers
+            ):
+                info = self.decode_schedulers[local_instance_id]
                 return {
                     "status": "success",
                     "info": {
@@ -417,7 +433,7 @@ class PDCoordinationService:
             else:
                 return {
                     "status": "not_found",
-                    "message": f"scheduler {scheduler_type}:{scheduler_id} not found",
+                    "message": f"scheduler {scheduler_type}:{local_instance_id} not found",
                 }
 
         else:

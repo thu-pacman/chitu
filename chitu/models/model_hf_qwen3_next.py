@@ -41,7 +41,11 @@ from chitu.ops import (
     rms_norm_gate,
     fused_g,
 )
-from chitu.quantization import QuantizationRegistry, get_quant_from_checkpoint_prefix
+from chitu.quantization import (
+    QuantizationRegistry,
+    get_quant_from_checkpoint_prefix,
+    get_quant_kwargs_from_checkpoint_prefix,
+)
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -872,7 +876,12 @@ class TransformerHFQwen3Next(TransformerHFQwen3Moe):
         }
         for k in list(checkpoint.keys()):
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
-            _2d_out_x_in_tensor_names = self._get_2d_out_x_in_tensor_names(quant)
+            quant_kwargs = get_quant_kwargs_from_checkpoint_prefix(
+                k, self.params.quant_config.rules
+            )
+            _2d_out_x_in_tensor_names = self._get_2d_out_x_in_tensor_names(
+                quant, quant_kwargs
+            )
             for layer_name in split_args.keys():
                 if any(
                     k.endswith(f".{layer_name}.{tensor_name}")

@@ -28,7 +28,7 @@
       "targets": [
         {
           "expr": "rate(chitu_total_generated_tokens_total{job=\"chitu_service\"}[$__rate_interval])",
-          "legendFormat": "dp{{dp_id}}",
+          "legendFormat": "instance{{instance_id}} dp{{dp_id}}",
           "refId": "A"
         }
       ]
@@ -48,7 +48,7 @@
       "targets": [
         {
           "expr": "rate(chitu_total_prompt_tokens_total{job=\"chitu_service\"}[$__rate_interval])",
-          "legendFormat": "dp{{dp_id}}",
+          "legendFormat": "instance{{instance_id}} dp{{dp_id}}",
           "refId": "A"
         }
       ]
@@ -69,7 +69,7 @@
       "targets": [
         {
           "expr": "rate(chitu_mtp_accepted_tokens_total{job=\"chitu_service\"}[$__rate_interval]) / clamp_min(rate(chitu_mtp_proposed_tokens_total{job=\"chitu_service\"}[$__rate_interval]), 1)",
-          "legendFormat": "dp{{dp_id}}",
+          "legendFormat": "instance{{instance_id}} dp{{dp_id}}",
           "refId": "A"
         }
       ]
@@ -89,7 +89,7 @@
       "targets": [
         {
           "expr": "rate(chitu_total_task_evictions_total{job=\"chitu_service\"}[$__rate_interval])",
-          "legendFormat": "dp{{dp_id}}",
+          "legendFormat": "instance{{instance_id}} dp{{dp_id}}",
           "refId": "A"
         }
       ]
@@ -123,7 +123,7 @@
       "targets": [
         {
           "expr": "chitu_kv_cache_usage_ratio{job=\"chitu_service\"}",
-          "legendFormat": "rank{{rank}} dp{{dp_id}}",
+          "legendFormat": "instance{{instance_id}} dp{{dp_id}} rank{{rank}}",
           "refId": "A"
         }
       ]
@@ -143,12 +143,12 @@
       "targets": [
         {
           "expr": "chitu_used_blocks{job=\"chitu_service\"}",
-          "legendFormat": "used rank{{rank}} dp{{dp_id}}",
+          "legendFormat": "used instance{{instance_id}} dp{{dp_id}} rank{{rank}}",
           "refId": "A"
         },
         {
           "expr": "chitu_total_blocks{job=\"chitu_service\"}",
-          "legendFormat": "total rank{{rank}} dp{{dp_id}}",
+          "legendFormat": "total instance{{instance_id}} dp{{dp_id}} rank{{rank}}",
           "refId": "B"
         }
       ]
@@ -168,17 +168,17 @@
       "targets": [
         {
           "expr": "chitu_cuda_used_bytes{job=\"chitu_service\"}",
-          "legendFormat": "used rank{{rank}} dp{{dp_id}}",
+          "legendFormat": "used instance{{instance_id}} dp{{dp_id}} rank{{rank}}",
           "refId": "A"
         },
         {
           "expr": "chitu_cuda_total_bytes{job=\"chitu_service\"}",
-          "legendFormat": "total rank{{rank}} dp{{dp_id}}",
+          "legendFormat": "total instance{{instance_id}} dp{{dp_id}} rank{{rank}}",
           "refId": "B"
         },
         {
           "expr": "chitu_torch_allocated_bytes{job=\"chitu_service\"}",
-          "legendFormat": "torch rank{{rank}} dp{{dp_id}}",
+          "legendFormat": "torch instance{{instance_id}} dp{{dp_id}} rank{{rank}}",
           "refId": "C"
         }
       ]
@@ -205,12 +205,12 @@
       "targets": [
         {
           "expr": "chitu_running_requests{job=\"chitu_service\"}",
-          "legendFormat": "running dp{{dp_id}}",
+          "legendFormat": "running instance{{instance_id}} dp{{dp_id}}",
           "refId": "A"
         },
         {
           "expr": "chitu_waiting_requests{job=\"chitu_service\"}",
-          "legendFormat": "waiting dp{{dp_id}}",
+          "legendFormat": "waiting instance{{instance_id}} dp{{dp_id}}",
           "refId": "B"
         },
         {

@@ -12,6 +12,7 @@ from collections import deque
 
 from chitu.task import TaskPool, TaskType, Task
 from chitu.global_vars import get_global_args, SlotHandle
+from chitu.hooks import TaskEvictHook, NoopTaskEvictHook
 from chitu.utils import ceil_div
 from chitu.backend import Backend
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
@@ -157,7 +158,7 @@ class Scheduler:
 
     def __init__(
         self,
-        max_runing_tasks: int,
+        max_running_tasks: int,
         prefill_num_tasks: int,
         decode_num_tasks: int,
         scheduler_type: str,
@@ -198,7 +199,7 @@ class Scheduler:
         super().__init__()
         assert prefill_num_tasks > 0, "prefill_num_tasks must be greater than 0"
         assert decode_num_tasks > 0, "decode_num_tasks must be greater than 0"
-        self.max_runing_tasks = max_runing_tasks
+        self.max_running_tasks = max_running_tasks
         self.prefill_num_tasks = prefill_num_tasks
         self.decode_num_tasks = decode_num_tasks
         self.prefill_chunk_size = prefill_chunk_size
@@ -240,6 +241,7 @@ class Scheduler:
         self.reset_kvcache_block_threshold()
         self.is_warmup_stage = False
         self.has_schedule_overlap = get_global_args().infer.schedule_overlap
+        self._task_evict_hook: TaskEvictHook = NoopTaskEvictHook()
         self._pd_ready_exec_delays_ms: list[float] = []
         self._pd_ready_exec_last_log_ts = 0.0
         self._pd_ready_exec_log_interval_s = 5.0
@@ -254,6 +256,9 @@ class Scheduler:
 
     def end_warmup(self):
         self.is_warmup_stage = False
+
+    def set_task_evict_hook(self, hook: TaskEvictHook):
+        self._task_evict_hook = hook
 
     def scorer(self, task: Task):
         if self.is_warmup_stage:
@@ -433,7 +438,7 @@ class Scheduler:
                 or self.dp_rank == task.dp_rank
                 and task.can_schedule()
             ):
-                if n_running == self.max_runing_tasks and task.dp_rank is None:
+                if n_running == self.max_running_tasks and task.dp_rank is None:
                     continue
                 if task.dp_rank is None:
                     n_running += 1
@@ -694,6 +699,7 @@ class Scheduler:
         - For PP>1, raise error when current DP rank has no tasks
         """
         task = TaskPool.pool[task_id]
+        self._task_evict_hook.before_evict(task)
 
         # Remove kvcache of this task
         if task.has_unsync_new_token:
@@ -730,6 +736,7 @@ class Scheduler:
 
         # For congestion control
         self.kvcache_block_threshold = max(1, self.kvcache_block_threshold // 2)
+        self._task_evict_hook.on_evict_done(task)
 
     @staticmethod
     def _extract_strict_task_type(scheduler_type: str) -> set[TaskType]:

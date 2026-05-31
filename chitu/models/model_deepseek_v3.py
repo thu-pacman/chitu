@@ -59,6 +59,7 @@ from chitu.dsa_indexer import DSAIndexer
 from chitu.quantization import (
     QuantizationRegistry,
     get_quant_from_checkpoint_prefix,
+    get_quant_kwargs_from_checkpoint_prefix,
     get_layer_id_from_checkpoint_prefix,
 )
 from chitu.quantization.normal import (
@@ -275,7 +276,7 @@ class AttentionDeepSeekV3(Attention):
             and get_quant_from_checkpoint_prefix(
                 checkpoint_prefix + ".q_b_proj", args.quant_config.rules
             )
-            == "ascend_w8a8_dynamic"
+            == "w8a8_per_token_per_channel_dyn"
         )
         self.mla_prologue_int8_full = (
             get_quant_from_checkpoint_prefix(
@@ -285,15 +286,15 @@ class AttentionDeepSeekV3(Attention):
             and get_quant_from_checkpoint_prefix(
                 checkpoint_prefix + ".q_a_proj", args.quant_config.rules
             )
-            == "ascend_w8a8_dynamic"
+            == "w8a8_per_token_per_channel_dyn"
             and get_quant_from_checkpoint_prefix(
                 checkpoint_prefix + ".kv_a_proj_with_mqa", args.quant_config.rules
             )
-            == "ascend_w8a8_dynamic"
+            == "w8a8_per_token_per_channel_dyn"
             and get_quant_from_checkpoint_prefix(
                 checkpoint_prefix + ".q_b_proj", args.quant_config.rules
             )
-            == "ascend_w8a8_dynamic"
+            == "w8a8_per_token_per_channel_dyn"
         )
         self.merge_qkv = QuantizationRegistry.allowed_merge_qkv(
             checkpoint_prefix,
@@ -550,6 +551,13 @@ class AttentionDeepSeekV3(Attention):
         bs_seq, _ = x.size()
 
         if self.can_use_mla_prologue_torch_npu:
+
+            def try_get_scale(module):
+                if hasattr(module, "weight_scale"):
+                    return module.weight_scale.view(module.out_features)
+                else:
+                    return None
+
             if self.mla_prologue_int8_full:
                 x_int8, scale_w_x = a8_per_token_act_quant(x.view(-1, x.shape[-1]))
                 q_nope, q_pe, kv = mla_prologue(
@@ -564,10 +572,10 @@ class AttentionDeepSeekV3(Attention):
                     self.q_a_layernorm.eps,
                     self.kv_a_layernorm.eps,
                     dequant_scale_x=scale_w_x,
-                    dequant_scale_q_a_proj=getattr(self.q_a_proj, "weight_scale", None),
-                    dequant_scale_q_b_proj=getattr(self.q_b_proj, "weight_scale", None),
-                    dequant_scale_kv_a_proj_with_mqa=getattr(
-                        self.kv_a_proj_with_mqa, "weight_scale", None
+                    dequant_scale_q_a_proj=try_get_scale(self.q_a_proj),
+                    dequant_scale_q_b_proj=try_get_scale(self.q_b_proj),
+                    dequant_scale_kv_a_proj_with_mqa=try_get_scale(
+                        self.kv_a_proj_with_mqa
                     ),
                     smooth_scales=None,
                     impl="torch_npu",
@@ -584,7 +592,7 @@ class AttentionDeepSeekV3(Attention):
                     freqs_cis,
                     self.q_a_layernorm.eps,
                     self.kv_a_layernorm.eps,
-                    dequant_scale_q_b_proj=getattr(self.q_b_proj, "weight_scale", None),
+                    dequant_scale_q_b_proj=try_get_scale(self.q_b_proj),
                     smooth_scales=None,
                     impl="torch_npu",
                 )
@@ -1310,6 +1318,9 @@ class TransformerDeepSeekV3(Transformer):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            quant_kwargs = get_quant_kwargs_from_checkpoint_prefix(
+                k, self.params.quant_config.rules
+            )
             key_split = k.split(".")
             if key_split[0] != "layers":
                 continue
@@ -1319,10 +1330,10 @@ class TransformerDeepSeekV3(Transformer):
                     f"{layer_id}.mlp.experts.{local_experts[layer_id - n_dense_layers][0]}.{w}.{part}"
                 )
                 for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
-                for part in self._get_2d_out_x_in_tensor_names(quant)
+                for part in self._get_2d_out_x_in_tensor_names(quant, quant_kwargs)
                 + self._get_2d_in_x_out_tensor_names(quant)
                 + self._get_1d_in_tensor_names(quant)
-                + self._get_1d_out_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant, quant_kwargs)
             ):
                 w, part = k.split(".")[-2:]
                 prefix = f"layers.{layer_id}.mlp."
@@ -1381,9 +1392,14 @@ class TransformerDeepSeekV3(Transformer):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            quant_kwargs = get_quant_kwargs_from_checkpoint_prefix(
+                k, self.params.quant_config.rules
+            )
             if any(
                 k.endswith(f".kv_b_proj.{tensor_name}")
-                for tensor_name in self._get_2d_out_x_in_tensor_names(quant)
+                for tensor_name in self._get_2d_out_x_in_tensor_names(
+                    quant, quant_kwargs
+                )
             ):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".kv_b_proj.{tensor_name}")]
@@ -1526,7 +1542,7 @@ class TransformerDeepSeekV3(Transformer):
 
             elif any(
                 k.endswith(f".kv_b_proj.{tensor_name}")
-                for tensor_name in self._get_1d_out_tensor_names(quant)
+                for tensor_name in self._get_1d_out_tensor_names(quant, quant_kwargs)
             ):
                 raise NotImplementedError(
                     f"infer.mla_absorb=absorb-without-precomp is not implemented for 1D (out,) tensor {tensor_name}"

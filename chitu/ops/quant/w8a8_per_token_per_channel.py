@@ -134,11 +134,17 @@ def w8a8_gemm_per_token_per_channel_torch_npu(
     b: torch.Tensor | NpuFractalZnTensor,
     b_s: torch.Tensor,
 ):
-    assert a.ndim == 2  # bs * in
-    assert b.ndim == 2  # out * in
+    bs, in_dim = a.shape
+    if isinstance(b, torch.Tensor):
+        out_dim, in_dim_2 = b.shape
+    elif isinstance(b, NpuFractalZnTensor):
+        out_dim, in_dim_2 = b.plain_shape
+    else:
+        raise NotImplementedError(f"Unsupported b type: {type(b)}")
+    assert in_dim == in_dim_2
     if a.numel() == 0:
         return torch.empty(
-            (0, b.shape[0]), dtype=torch.get_default_dtype(), device=a.device
+            (0, out_dim), dtype=torch.get_default_dtype(), device=a.device
         )
     a_s = a_s.view(a.shape[0])
     b_s = b_s.view(b_s.shape[0])

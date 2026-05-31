@@ -409,8 +409,8 @@ class KVManager:
         self.kv_cache = kv_cache
         self.metadata_buffers = metadata_buffers
         self.pd_coordination_service = pd_coordination_service
-        # dp_id identifies each Prefill/Decode instance (Bootstrap engine_rank).
-        self.dp_id = int(args.dp_config.dp_id)
+        # instance_id identifies each Prefill/Decode instance (Bootstrap engine_rank).
+        self.instance_id = int(args.dp_config.dp_id)
         # Target Prefill engine_rank for each request (set by the Decode scheduler).
         self.prefill_target_rank_by_room: dict[UUID, int] = {}
         # Per-request trace mapping: room(UUID) -> request_id(str).
@@ -878,7 +878,7 @@ class KVManager:
         # Publish the control endpoint.
         if self._is_prefill_ctrl_rank:
             self._coordination_set_prefill_ctrl_endpoint(
-                engine_rank=self.dp_id,
+                engine_rank=self.instance_id,
                 ip=self.local_ip,
                 port=self.rank_port,
                 internal_port=self.internal_rank_port,
@@ -887,7 +887,7 @@ class KVManager:
 
         # All ranks fetch the endpoint and send STAGE_DONE to it.
         endpoint = self._coordination_get_prefill_ctrl_endpoint(
-            engine_rank=self.dp_id,
+            engine_rank=self.instance_id,
             timeout_s=float(
                 getattr(self.kv_transfer_cfg, "prefill_ctrl_endpoint_timeout_s", 30.0)
                 if self.kv_transfer_cfg
@@ -977,8 +977,8 @@ class KVManager:
             parts.append(f"pp={pp_stage}/{pp_size}")
         if tp_rank is not None and tp_size is not None:
             parts.append(f"tp={tp_rank}/{tp_size}")
-        if self.dp_id is not None:
-            parts.append(f"dp_id={int(self.dp_id)}")
+        if self.instance_id is not None:
+            parts.append(f"instance_id={int(self.instance_id)}")
         for k, v in fields.items():
             if v is None:
                 continue
@@ -2076,8 +2076,8 @@ class KVManager:
             "dp_size": 1,
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
-            # Use dp_id as engine_rank to distinguish multiple Prefill instances.
-            "engine_rank": int(self.dp_id),
+            # Use instance_id as engine_rank to distinguish multiple Prefill instances.
+            "engine_rank": int(self.instance_id),
             "tp_size": int(getattr(get_global_args().infer, "tp_size", 1) or 1),
             "pp_size": int(getattr(get_global_args().infer, "pp_size", 1) or 1),
         }

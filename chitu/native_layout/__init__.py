@@ -15,7 +15,6 @@ from chitu.native_layout.common import (
     ColumnOddEvenSeparatedTensor,
     PartialColumnOddEvenSeparatedTensor,
     Repeat1ToLength,
-    SqueezeLastSingleton,
     InXOutWeight,
 )
 from chitu.native_layout.npu import (
