@@ -31,7 +31,11 @@ from chitu.quantization.hygon_w8a8 import (
     HygonW8A8BlasltLinear,
     HygonW8A8AiterMoeExpertsMerged,
 )
-from chitu.quantization.simple_w8a8 import W8A8Linear
+from chitu.quantization.w8a8_per_token_per_channel_dyn import (
+    W8A8PerTokenPerChannelDynLinear,
+    AscendW8A8PerTokenPerChannelDynLinear,
+    AscendW8A8PerTokenPerChannelDynMoeExperts,
+)
 from chitu.quantization.simple_w8a8_muxi import W8A8MuxiLinear
 from chitu.quantization.w4a8_per_token_per_channel_asymm import (
     W4A8PerTokenPerChannelAsymmLinear,
@@ -42,11 +46,7 @@ from chitu.quantization.w4a8_per_token_per_group_asymm import (
 from chitu.quantization.w4_g128_symm_a8_symm import (
     HygonW4G128SymmA8Linear,
 )
-from chitu.quantization.ascend_w8a8 import (
-    AscendW8A8Linear,
-    AscendW8A8DynamicLinear,
-    AscendW8A8DynamicMoeExperts,
-)
+from chitu.quantization.ascend_w8a8 import AscendW8A8Linear
 from chitu.quantization.mixq import MixQLinear
 from chitu.quantization.fp8_per_channel import (
     Fp8PerChannelLinear,

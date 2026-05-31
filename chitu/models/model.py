@@ -370,7 +370,9 @@ class Transformer(nn.Module):
     def _get_layer_mtp_prefix_mapping(self, i: int) -> tuple[str, str, dict[str, str]]:
         raise NotImplementedError
 
-    def _get_2d_out_x_in_tensor_names(self, quant) -> list[str]:
+    def _get_2d_out_x_in_tensor_names(
+        self, quant: Optional[str], quant_kwargs: dict[str, Any]
+    ) -> list[str]:
         ret = ["weight"]
         if quant == "blockfp8" or quant == "q4km":
             ret += ["scale", "weight_scale_inv"]
@@ -378,15 +380,18 @@ class Transformer(nn.Module):
             ret += ["weight_scale"]
         elif quant == "blockfp4" or quant == "blockfp4_merged":
             ret += ["weight_scale", "weight_scale_2", "input_scale"]
-        elif quant == "w4a8_per_token_per_channel_asymm":
+        elif quant in (
+            "w4a8_per_token_per_channel_asymm",
+            "w4a8_per_token_per_group_asymm",
+        ):
             ret += ["qweight"]
-        elif quant == "w4a8_per_token_per_group_asymm":
-            ret += ["qweight"]
-        elif quant == "w4_g128_symm_a8":
-            ret += ["weight"]
         elif quant == "mixq":
             ret += ["fp_weight"]
-        elif quant in ("ascend_w8a8_dynamic", "w8a8_dynamic"):
+        elif quant == "w8a8_per_token_per_channel_dyn" and quant_kwargs.get(
+            "weight_scale_has_singleton_last_dim", False
+        ):
+            ret += ["weight_scale"]
+        elif quant == "w8a8_dynamic":
             ret += ["weight_scale", "weight_offset"]
         elif quant == "blockint4":
             ret += ["qweight", "scales"]
@@ -406,10 +411,14 @@ class Transformer(nn.Module):
             ret += ["g_idx"]
         return ret
 
-    def _get_1d_out_tensor_names(self, quant) -> list[str]:
+    def _get_1d_out_tensor_names(
+        self, quant: Optional[str], quant_kwargs: dict[str, Any]
+    ) -> list[str]:
         ret = ["bias"]
-        if quant == "simple_w8a8":
-            ret += ["scale_channel"]
+        if quant == "w8a8_per_token_per_channel_dyn" and not quant_kwargs.get(
+            "weight_scale_has_singleton_last_dim", False
+        ):
+            ret += ["weight_scale"]
         elif quant == "simple_w8a8_muxi":
             ret += ["scale_channel"]
         elif quant == "w4a8_per_token_per_channel_asymm":
@@ -525,6 +534,7 @@ class Transformer(nn.Module):
 
         for name, param in checkpoint.items():
             quant = get_quant_from_checkpoint_prefix(name)
+            quant_kwargs = get_quant_kwargs_from_checkpoint_prefix(name)
             backend = get_backend_from_checkpoint_prefix(name)
             if ".experts." in name:
                 tp_or_etp_size = etp_size
@@ -536,7 +546,9 @@ class Transformer(nn.Module):
                 if tp_or_etp_rank == 0:
                     partial_checkpoint[name] = param
             elif any(is_layer(s, name) for s in cpl_names):
-                if name.split(".")[-1] in self._get_1d_out_tensor_names(quant):
+                if name.split(".")[-1] in self._get_1d_out_tensor_names(
+                    quant, quant_kwargs
+                ):
                     assert (
                         param.dim() == 1
                     ), f"{name} is expected to be 1D, but got {param.dim()}D"
@@ -555,7 +567,9 @@ class Transformer(nn.Module):
                     ), f"{name} is expected to be 1D, but got {param.dim()}D"
                     if get_tp_group().rank_in_group == 0:
                         partial_checkpoint[name] = param
-                elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(quant):
+                elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(
+                    quant, quant_kwargs
+                ):
                     assert (
                         param.dim() >= 2
                     ), f"{name} is expected to be >=2D, but got {param.dim()}D"
@@ -599,7 +613,9 @@ class Transformer(nn.Module):
                             )
                         chunks = torch.chunk(param, tp_or_etp_size, dim=-1)
                         partial_checkpoint[name] = chunks[tp_or_etp_rank]
-                elif name.split(".")[-1] in self._get_1d_out_tensor_names(quant):
+                elif name.split(".")[-1] in self._get_1d_out_tensor_names(
+                    quant, quant_kwargs
+                ):
                     assert (
                         param.dim() == 1
                     ), f"{name} is expected to be 1D, but got {param.dim()}D"
@@ -607,7 +623,9 @@ class Transformer(nn.Module):
                         if get_tp_group().rank_in_group != 0:
                             continue
                     partial_checkpoint[name] = param
-                elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(quant):
+                elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(
+                    quant, quant_kwargs
+                ):
                     assert (
                         param.dim() >= 2
                     ), f"{name} is expected to be >=2D, but got {param.dim()}D"
@@ -807,10 +825,15 @@ class Transformer(nn.Module):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            quant_kwargs = get_quant_kwargs_from_checkpoint_prefix(
+                k, self.params.quant_config.rules
+            )
 
-            _2d_out_x_in_tensor_names = self._get_2d_out_x_in_tensor_names(quant)
+            _2d_out_x_in_tensor_names = self._get_2d_out_x_in_tensor_names(
+                quant, quant_kwargs
+            )
             _2d_in_x_out_tensor_names = self._get_2d_in_x_out_tensor_names(quant)
-            _1d_out_tensor_names = self._get_1d_out_tensor_names(quant)
+            _1d_out_tensor_names = self._get_1d_out_tensor_names(quant, quant_kwargs)
             _1d_in_tensor_names = self._get_1d_in_tensor_names(quant)
             all_tensor_names = (
                 _2d_out_x_in_tensor_names
@@ -885,10 +908,15 @@ class Transformer(nn.Module):
         checkpoint_keys = list(checkpoint.keys())
         for k in checkpoint_keys:
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            quant_kwargs = get_quant_kwargs_from_checkpoint_prefix(
+                k, self.params.quant_config.rules
+            )
 
-            _2d_out_x_in_tensor_names = self._get_2d_out_x_in_tensor_names(quant)
+            _2d_out_x_in_tensor_names = self._get_2d_out_x_in_tensor_names(
+                quant, quant_kwargs
+            )
             _2d_in_x_out_tensor_names = self._get_2d_in_x_out_tensor_names(quant)
-            _1d_out_tensor_names = self._get_1d_out_tensor_names(quant)
+            _1d_out_tensor_names = self._get_1d_out_tensor_names(quant, quant_kwargs)
             _1d_in_tensor_names = self._get_1d_in_tensor_names(quant)
             all_tensor_names = (
                 _2d_out_x_in_tensor_names

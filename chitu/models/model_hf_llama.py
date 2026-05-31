@@ -59,7 +59,7 @@ def get_rms_norm_impl():
         impl = "ref"
     if (
         hasattr(args.models, "quant_config")
-        and args.models.quant_config.type == "simple_w8a8"
+        and args.models.quant_config.type == "w8a8_per_token_per_channel_dyn"
     ):
         impl = "ref"
     if (
@@ -606,15 +606,20 @@ class TransformerHFLlama(Transformer):
 
         for name, param in checkpoint.items():
             quant = get_quant_from_checkpoint_prefix(name)
+            quant_kwargs = get_quant_kwargs_from_checkpoint_prefix(name)
             if any(is_layer(s, name) for s in repeat_kv_head_names):
-                if name.split(".")[-1] in self._get_1d_out_tensor_names(quant):
+                if name.split(".")[-1] in self._get_1d_out_tensor_names(
+                    quant, quant_kwargs
+                ):
                     assert (
                         param.dim() == 1
                     ), f"{name} is expected to be 1D, but got {param.dim()}D"
                     param = param.view([n_kv_heads, -1])
                     param = param.repeat_interleave(repeats, dim=0)
                     checkpoint[name] = param.view(-1)
-                elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(quant):
+                elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(
+                    quant, quant_kwargs
+                ):
                     assert (
                         param.dim() == 2
                     ), f"{name} is expected to be 2D, but got {param.dim()}D"

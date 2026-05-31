@@ -542,33 +542,6 @@ class Repeat1ToLength(NativeLayoutTensor):
 
 
 @dataclass
-class SqueezeLastSingleton(NativeLayoutTensor):
-    """
-    Remove the trailing singleton dimension of a tensor.
-
-    Shape transform: [..., K, 1] -> [..., K]
-
-    This only changes the view (no data copy) and does not alter the underlying data.
-    """
-
-    @classmethod
-    @override
-    @plum.dispatch
-    def convert_from(cls, tensor: torch.Tensor) -> "SqueezeLastSingleton":
-        if tensor.shape[-1] != 1:
-            raise ValueError(
-                f"SqueezeLastSingleton expects last dim == 1, but got shape {tuple(tensor.shape)}"
-            )
-        return cls(
-            plain_shape=tensor.shape, layout_tensor=tensor.view(*tensor.shape[:-1])
-        )
-
-    @override
-    def convert_to_plain(self) -> torch.Tensor:
-        return self.layout_tensor.view(*self.plain_shape)
-
-
-@dataclass
 class InXOutWeight(NativeLayoutTensor):
     @classmethod
     @override

@@ -89,7 +89,10 @@ class MoENpuDistributeTokenDispatcher(MoETokenDispatcher):
         hidden_states = x.activation
         topk_ids = x.token_to_expert_indices
 
-        use_int8_w8a8 = may_fuse_quant in ["ascend_w8a8", "ascend_w8a8_dynamic"]
+        use_int8_w8a8 = may_fuse_quant in [
+            "ascend_w8a8",
+            "w8a8_per_token_per_channel_dyn",
+        ]
 
         origin_bs = hidden_states.shape[0]
 

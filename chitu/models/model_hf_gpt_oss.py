@@ -25,6 +25,7 @@ from chitu.ops import linear
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.quantization import (
     get_quant_from_checkpoint_prefix,
+    get_quant_kwargs_from_checkpoint_prefix,
     QuantizedMoeExpertsUnmerged,
     QuantizedMoeExpertsMerged,
 )
@@ -406,8 +407,11 @@ class TransformerHFGptOss(TransformerHFLlama):
             **kvargs,
         )
 
-    def _get_1d_out_tensor_names(self, quant) -> list[str]:
-        return super()._get_1d_out_tensor_names(quant) + [
+    @override
+    def _get_1d_out_tensor_names(
+        self, quant: Optional[str], quant_kwargs: dict[str, Any]
+    ) -> list[str]:
+        return super()._get_1d_out_tensor_names(quant, quant_kwargs) + [
             "sinks",
         ]
 
@@ -486,13 +490,16 @@ class TransformerHFGptOss(TransformerHFLlama):
         new_checkpoint = {}
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            quant_kwargs = get_quant_kwargs_from_checkpoint_prefix(
+                k, self.params.quant_config.rules
+            )
             if any(
                 k.endswith(f".experts.{w}.{part}")
                 for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
-                for part in self._get_2d_out_x_in_tensor_names(quant)
+                for part in self._get_2d_out_x_in_tensor_names(quant, quant_kwargs)
                 + self._get_2d_in_x_out_tensor_names(quant)
                 + self._get_1d_in_tensor_names(quant)
-                + self._get_1d_out_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant, quant_kwargs)
             ):
                 w, part = k.split(".")[-2:]
                 prefix = k[: -len(f"experts.{w}.{part}")]
@@ -533,13 +540,16 @@ class TransformerHFGptOss(TransformerHFLlama):
                 continue
             layer_id = int(key_split[1])
             quant = get_quant_from_checkpoint_prefix(k, self.params.quant_config.rules)
+            quant_kwargs = get_quant_kwargs_from_checkpoint_prefix(
+                k, self.params.quant_config.rules
+            )
             if any(
                 k.endswith(f".experts.{local_experts[layer_id][0]}.{w}.{part}")
                 for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
-                for part in self._get_2d_out_x_in_tensor_names(quant)
+                for part in self._get_2d_out_x_in_tensor_names(quant, quant_kwargs)
                 + self._get_2d_in_x_out_tensor_names(quant)
                 + self._get_1d_in_tensor_names(quant)
-                + self._get_1d_out_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant, quant_kwargs)
             ):
                 w, part = k.split(".")[-2:]
                 prefix = k[: -len(f"experts.{local_experts[layer_id][0]}.{w}.{part}")]
@@ -552,10 +562,10 @@ class TransformerHFGptOss(TransformerHFLlama):
             elif any(
                 k.endswith(f".experts.{w}.{part}")
                 for w in ["gate_proj", "down_proj", "up_proj", "gate_up_proj"]
-                for part in self._get_2d_out_x_in_tensor_names(quant)
+                for part in self._get_2d_out_x_in_tensor_names(quant, quant_kwargs)
                 + self._get_2d_in_x_out_tensor_names(quant)
                 + self._get_1d_in_tensor_names(quant)
-                + self._get_1d_out_tensor_names(quant)
+                + self._get_1d_out_tensor_names(quant, quant_kwargs)
             ):
                 w, part = k.split(".")[-2:]
                 prefix = k[: -len(f"experts.{w}.{part}")]

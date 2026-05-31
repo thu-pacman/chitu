@@ -44,6 +44,7 @@ class LazyTensor:
         )
         self.dtype = meta_tensor.dtype
         self.device = self._get_first_device(self.kwargs)
+        self.ndim = len(self.shape)
 
         self.evaluation = LazyTensorEvaluation()
         self.result_view_shape = self.shape

@@ -62,7 +62,7 @@ def test_prefix_cache_probe_does_not_fill_single_slot_scheduler():
     assert task.task_id not in cache_manager.task_to_cache_ids
 
     scheduler = Scheduler(
-        max_runing_tasks=1,
+        max_running_tasks=1,
         prefill_num_tasks=1,
         decode_num_tasks=1,
         scheduler_type="prefill_first",
