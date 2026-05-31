@@ -994,6 +994,21 @@ class SingletonPagedKVCache(PagedKVCache):
         self.block_table[tid] = [int(page_index)]
         self.tid_to_cached_len[tid] = prefix_length
 
+    def insert_mtp_state_from_transfer(
+        self, tid: str, page_index: int, prefix_length: int
+    ):
+        """
+        Register transferred MTP hidden state into block table.
+        For MTP, each request uses exactly one block.
+        Unlike insert_kv_cache_from_transfer, this doesn't require empty block_table
+        since SingletonPagedKVCache may have allocated a block during prepare_cache_prefill.
+        """
+        assert (
+            0 <= int(page_index) < self.num_blocks
+        ), f"invalid page index: {page_index}"
+        self.block_table[tid] = [int(page_index)]
+        self.tid_to_cached_len[tid] = prefix_length
+
 
 class MMPagedKVCache(PagedKVCache):
     """Paged KV cache  with multimodal chunk-consumption helpers.

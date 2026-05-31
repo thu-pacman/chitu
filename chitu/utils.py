@@ -17,6 +17,7 @@ import importlib.resources
 from types import UnionType
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from chitu.global_vars import get_global_args
@@ -486,7 +487,8 @@ def gather_str_to_dst_rank(strings: str, dst: int, group=None) -> Optional[list]
 
 def create_tensor(data, device, dtype=None, sync_free=True):
     if sync_free:
-        return torch.tensor(data, dtype=dtype, pin_memory=True).to(
+        pin_memory = not isinstance(data, np.ndarray)
+        return torch.tensor(data, dtype=dtype, pin_memory=pin_memory).to(
             device=device, non_blocking=True
         )
     return torch.tensor(data, dtype=dtype, device=device)

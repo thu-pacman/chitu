@@ -873,30 +873,19 @@ def _warmup_backend_direct(
     init_cache_static()
 
     req_ids = [f"__warmup_{i}__" for i in range(local_max_bs)]
-    is_pp_first_rank = get_pp_group() is None or get_pp_group().is_first_rank
-    is_deepseek_v4 = args.models.type == ModelType.DEEPSEEK_V4
-    if is_pp_first_rank:
-        tokens = torch.randint(
-            1,
-            args.models.vocab_size,
-            size=(local_max_bs,),
+    tokens = torch.randint(
+        1,
+        args.models.vocab_size,
+        size=(local_max_bs,),
+        device="cuda",
+        dtype=torch.int64,
+    )
+    hiddens = None
+    if not get_pp_group().is_first_rank:
+        hiddens = torch.randn(
+            Backend.executor.get_payload_shape(local_max_bs),
             device="cuda",
-            dtype=torch.int64,
-        )
-    elif is_deepseek_v4:
-        tokens = torch.randn(
-            local_max_bs,
-            args.models.hc_mult,
-            args.models.dim,
-            device="cuda",
-            dtype=torch.bfloat16,
-        )
-    else:
-        tokens = torch.randn(
-            local_max_bs,
-            args.models.dim,
-            device="cuda",
-            dtype=torch.get_default_dtype(),
+            dtype=Backend.executor.get_payload_dtype(),
         )
 
     all_tasks = PackedTasksBase(local_max_bs, task_ids=req_ids)
@@ -921,8 +910,14 @@ def _warmup_backend_direct(
     output_token_offsets = torch.arange(
         local_max_bs, dtype=torch.int32, device=tokens.device
     )
+    if args.infer.mtp_size > 1:
+        mtp_accept_indices = torch.zeros(
+            local_max_bs, dtype=torch.int64, device=tokens.device
+        )
+        Backend.model.mtp_accept_indices.set(mtp_accept_indices)
+
     if not skip_model_prefill:
-        Backend.model.prefill(tokens, output_token_offsets)
+        Backend.model.prefill(tokens, hiddens, output_token_offsets)
 
     # Decode steps
     if not skip_model_decode:
@@ -947,30 +942,18 @@ def _warmup_backend_direct(
             ):
                 Backend.model.moe_impl.prepare(TaskType.Decode, curr_bs)
 
-            if is_pp_first_rank:
-                step_token = torch.randint(
-                    1,
-                    args.models.vocab_size,
-                    size=(curr_bs,),
-                    device="cuda",
-                    dtype=torch.int64,
+            if args.infer.mtp_size > 1:
+                mtp_accept_indices = torch.zeros(
+                    curr_bs, dtype=torch.int64, device=tokens.device
                 )
-            elif is_deepseek_v4:
-                step_token = torch.randn(
-                    curr_bs,
-                    args.models.hc_mult,
-                    args.models.dim,
-                    device="cuda",
-                    dtype=torch.bfloat16,
-                )
+                Backend.model.mtp_accept_indices.set(mtp_accept_indices)
+
+            if get_pp_group().is_first_rank:
+                payload = tokens[:curr_bs]
             else:
-                step_token = torch.randn(
-                    curr_bs,
-                    args.models.dim,
-                    device="cuda",
-                    dtype=torch.get_default_dtype(),
-                )
-            _ = Backend.model.decode(step_token, curr_bs)
+                payload = hiddens[:curr_bs]
+
+            _ = Backend.model.decode(payload)
 
     # Clean KV for this request
     for cache in Backend.cache_dict.values():

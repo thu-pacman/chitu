@@ -1285,8 +1285,6 @@ class TransformerDeepSeekV3(Transformer):
     @override
     def _get_post_layer_prefixes(self) -> list[str]:
         ret = ["lm_head.", "norm."]
-        if self.mtp_size > 1 and getattr(self.params, "mtp_tie_word_embeddings", False):
-            ret += ["embed_tokens."]
         return ret
 
     @override
@@ -2018,7 +2016,7 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def _pre_layers_mtp(self, h, **args):
-        if not getattr(self.params, "mtp_tie_word_embeddings", False):
+        if not self.mtp_tie_word_embeddings:
             embed_tokens = self.layers[-1].embed_tokens
         else:
             embed_tokens = self.embed_tokens

@@ -319,6 +319,16 @@ class PDInstanceRequestManager:
             self.kv_manager.set_indexer_cache(indexer_cache)
             logger.info("indexer cache manager set for pd scheduler")
 
+    def set_mtp_cache(self, mtp_cache):
+        """Set MTP hidden states cache for Multi-Token Prediction PD disaggregation.
+
+        Args:
+            mtp_cache: SingletonPagedKVCache for MTP hidden states
+        """
+        if self.kv_manager is not None and mtp_cache is not None:
+            self.kv_manager.set_mtp_cache(mtp_cache)
+            logger.info("MTP cache manager set for pd scheduler")
+
     def set_token_manager(self, token_manager):
         """Attach DP token manager so we can stream tokens back to Router."""
         self.token_manager = token_manager

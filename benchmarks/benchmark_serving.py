@@ -53,6 +53,8 @@ class BenchmarkConfig:
     dataset: str
     request_interval: float
     force_max_min_bs: bool
+    stop_with_eos: bool
+    print_generated: bool
     tokenizer_path: Optional[str] = None
     dataset_path: Optional[str] = None
 
@@ -464,8 +466,8 @@ class BenchmarkServing:
                     "min_batch_size": (
                         self.config.batch_size if self.config.force_max_min_bs else 1
                     ),
-                    "stop_with_eos": False,
-                    "ignore_eos": True,
+                    "stop_with_eos": self.config.stop_with_eos,
+                    "ignore_eos": not self.config.stop_with_eos,
                     "stream_options": {"include_usage": True},
                 }
 
@@ -705,6 +707,8 @@ def main():
     parser.add_argument("--tokenizer-path")
     parser.add_argument("--request-interval", type=float, default=0.0)
     parser.add_argument("--force-max-min-bs", action="store_true")
+    parser.add_argument("--stop-with-eos", action="store_true", default=False)
+    parser.add_argument("--print-generated", action="store_true")
 
     args = parser.parse_args()
 
@@ -720,6 +724,8 @@ def main():
         dataset_path=args.dataset_path,
         request_interval=args.request_interval,
         force_max_min_bs=args.force_max_min_bs,
+        stop_with_eos=args.stop_with_eos,
+        print_generated=args.print_generated,
     )
 
     runner = BenchmarkServing(config, base_url=args.base_url)
@@ -778,6 +784,13 @@ def main():
         "start_timestamps": [output.start_timestamp for output in outputs],
         "response_timestamp": [output.response_timestamp for output in outputs],
     }
+
+    if config.print_generated:
+        print("{s:{c}^{n}}".format(s=" Generated Texts ", n=50, c="="))
+        for i, output in enumerate(outputs):
+            print(f"\n--- Request {i} (success={output.success}) ---")
+            print(output.generated_text)
+        print("=" * 50)
 
     selected_percentile_metrics = args.percentile_metrics.split(",")
 
