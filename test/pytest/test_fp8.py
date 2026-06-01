@@ -34,7 +34,8 @@ def init_b_and_b_s(dim, block_size):
         dtype=torch.float32,
         device="cuda",
     )
-    b_s = b.amax(dim=1, keepdim=True).amax(dim=3, keepdim=True)
+    b_s = torch.abs(b).amax(dim=1, keepdim=True).amax(dim=3, keepdim=True)
+    b_s.clamp_(min=1e-5).div_(448.0)
     b /= b_s
     return b.view(dim, dim).to(torch.float8_e4m3fn), b_s.view(
         dim // block_size, dim // block_size

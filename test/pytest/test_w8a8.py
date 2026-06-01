@@ -26,7 +26,8 @@ lmslim_quant_ops, has_lmslim_quant_ops = try_import_platform_dep(
 
 def init_b_and_b_s(dim):
     b = torch.randn(dim, dim, dtype=torch.float32, device="cuda")
-    b_s = b.amax(dim=-1, keepdim=True)
+    b_s = torch.abs(b).amax(dim=-1, keepdim=True)
+    b_s.clamp_(min=1e-5).div_(127.0)
     b /= b_s
     return b.to(torch.int8), b_s
 
