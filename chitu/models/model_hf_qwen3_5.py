@@ -744,19 +744,10 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
 
         if self.mtp_size > 1:
             mtp_x = h
-            for mgr in self.cache_dict.values():
-                mgr.seq_len_delta.is_decode_stage = False
-            for it, layer in enumerate(self.layers[0:-1]):
-                h = layer(h, freqs_cis, False)
-
-            self.mtp_prefill_no_pipeline(
-                x=mtp_x,
-                h=h,
-                freqs_cis=freqs_cis,
-            )
-        else:
-            for it, layer in enumerate(self.layers):
-                h = layer(h, freqs_cis)
+        for it, layer in enumerate(self.non_mtp_layers):
+            h = layer(h, freqs_cis)
+        if self.mtp_size > 1:
+            self.mtp_prefill(x=mtp_x, h=h, freqs_cis=freqs_cis)
 
         h = h[output_token_offsets]
         h = self._post_layers(h)

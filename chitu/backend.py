@@ -46,6 +46,7 @@ from chitu.distributed.parallel_state import (
     get_world_group,
     get_ep_group,
     get_dp_group,
+    get_pp_group,
     initialize_parallel_groups,
 )
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
@@ -1106,7 +1107,7 @@ class Backend:
 
         # Initialize cache managers
         bundle = build_cache_managers(args, attn_backend_type)
-        if args.infer.mtp_size > 1:
+        if args.infer.mtp_size > 1 and get_pp_group().is_last_rank:
             bundle.cache_dict["mtp"] = build_mtp_cache(args)
         Backend.cache_type = bundle.cache_type
         Backend.cache_dict = bundle.cache_dict

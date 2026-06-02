@@ -302,8 +302,13 @@ class PDSchedulerService:
                 if indexer_cache is not None:
                     self.scheduler.set_indexer_cache(indexer_cache)
                     logger.info("[PD] indexer cache set for PD transfer")
+            if "mtp" in Backend.cache_dict:
+                mtp_cache = Backend.cache_dict["mtp"]
+                if mtp_cache is not None:
+                    self.scheduler.set_mtp_cache(mtp_cache)
+                    logger.info("[PD] MTP cache set for PD transfer")
             for keys in Backend.cache_dict:
-                if keys not in {"main", "linear", "indexer"}:
+                if keys not in {"main", "linear", "indexer", "mtp"}:
                     raise NotImplementedError(
                         f"cache {keys} is not supported for PD-disaggregation"
                     )
@@ -608,14 +613,14 @@ async def start_pd_worker_service(args, rank: int = 0):
     kv_manager.register_buffer_to_engine()
     # Register auxiliary caches for RDMA transfer
     model_type = args.models.type
-    # Linear attention cache (Qwen3-next)
+    # Linear attention cache (Qwen3-next, Qwen3.5, and other linear attention models)
     has_linear_cache = (
         "linear" in Backend.cache_dict and Backend.cache_dict["linear"] is not None
     )
     logger.info(
         f"[PD_WORKER] linear cache check: model_type={model_type}, has_linear_cache={has_linear_cache}"
     )
-    if model_type == "hf-qwen3-next" and has_linear_cache:
+    if has_linear_cache:
         kv_manager.set_linear_attn_cache(Backend.cache_dict["linear"])
         logger.info("[PD_WORKER] linear attention cache set for kv_manager")
 
@@ -629,6 +634,15 @@ async def start_pd_worker_service(args, rank: int = 0):
     if has_indexer_cache:
         kv_manager.set_indexer_cache(Backend.cache_dict["indexer"])
         logger.info("[PD_WORKER] indexer cache set for kv_manager")
+
+    has_mtp_cache = (
+        "mtp" in Backend.cache_dict and Backend.cache_dict["mtp"] is not None
+    )
+    logger.info(f"[PD_WORKER] MTP cache check: has_mtp_cache={has_mtp_cache}")
+    if has_mtp_cache:
+        kv_manager.set_mtp_cache(Backend.cache_dict["mtp"])
+        logger.info("[PD_WORKER] MTP cache set for kv_manager")
+
     logger.info("KVManager initialized and registered with Cache")
 
     kv_hook = MooncakeKVTransferHook(kv_manager, mode)

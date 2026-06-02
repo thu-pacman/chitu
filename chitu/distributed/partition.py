@@ -18,8 +18,9 @@ def compute_local_batch_size_dist_in_dp(
     ]
 
 
-def compute_layer_dist_in_pp(num_layers: int, pp_size: int):
+def compute_layer_dist_in_pp(pp_size: int):
     args = get_global_args()
+    num_layers = args.models.n_layers + int(args.infer.mtp_size > 1)
     if args.infer.pp_layer_partition is not None:
         assert (
             len(args.infer.pp_layer_partition) == pp_size

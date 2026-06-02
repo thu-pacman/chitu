@@ -210,7 +210,7 @@ def _patch_parallel_groups(
     )
     monkeypatch.setattr(
         "chitu.distributed.pd_disaggregation.kv_transfer.kv_manager.compute_layer_dist_in_pp",
-        lambda n, pp_sz: list(layer_dist),
+        lambda pp_sz: list(layer_dist),
     )
 
 
@@ -342,7 +342,7 @@ def test_kv_cache_transfer(
         )
         monkeypatch.setattr(
             "chitu.distributed.pd_disaggregation.kv_transfer.kv_manager.compute_layer_dist_in_pp",
-            lambda n, pp_sz: [num_layers],
+            lambda pp_sz: [num_layers],
         )
 
         p_kvmanager.send_kvcache(
@@ -373,7 +373,7 @@ def test_kv_cache_transfer(
     )
     monkeypatch.setattr(
         "chitu.distributed.pd_disaggregation.kv_transfer.kv_manager.compute_layer_dist_in_pp",
-        lambda n, pp_sz: [num_layers],
+        lambda pp_sz: [num_layers],
     )
 
     room_ids = ["test_req"]
@@ -441,7 +441,7 @@ def test_kv_cache_transfer_prefill_tp1_to_decode_tp2(monkeypatch):
     )
     monkeypatch.setattr(
         "chitu.distributed.pd_disaggregation.kv_transfer.kv_manager.compute_layer_dist_in_pp",
-        lambda n, pp_sz: [num_layers],
+        lambda pp_sz: [num_layers],
     )
 
     decode_local_heads = num_heads // decode_tp_size
@@ -530,7 +530,7 @@ def test_kv_cache_transfer_prefill_tp1_to_decode_tp2_with_real_kv_keys(monkeypat
     )
     monkeypatch.setattr(
         "chitu.distributed.pd_disaggregation.kv_transfer.kv_manager.compute_layer_dist_in_pp",
-        lambda n, pp_sz: [num_layers],
+        lambda pp_sz: [num_layers],
     )
 
     decode_local_heads = num_heads // decode_tp_size
@@ -632,7 +632,7 @@ def test_kv_cache_transfer_prefill_tp2_to_decode_tp2(monkeypatch):
         )
         monkeypatch.setattr(
             "chitu.distributed.pd_disaggregation.kv_transfer.kv_manager.compute_layer_dist_in_pp",
-            lambda n, pp_sz: [num_layers],
+            lambda pp_sz: [num_layers],
         )
 
         for decode_tp_rank, decode_kvmanager in enumerate(decode_kvmanagers):
@@ -734,7 +734,7 @@ def test_kv_cache_transfer_prefill_tp2_pp2_to_decode_tp2_pp2(monkeypatch):
         )
         monkeypatch.setattr(
             "chitu.distributed.pd_disaggregation.kv_transfer.kv_manager.compute_layer_dist_in_pp",
-            lambda n, pp_sz: list(layer_dist),
+            lambda pp_sz: list(layer_dist),
         )
 
         for (

@@ -104,6 +104,7 @@ class DecodeRegisterFrame(IntEnum):
     PP_SIZE_ASCII = 11  # decode-side PP size as ASCII, b"" if absent (default 1)
     TP_RANK_ASCII = 12  # decode-side TP rank as ASCII, b"" if absent (default 0)
     PACKED_KV_ITEM_LENS = 13  # packed decode KV block byte lengths, b"" if absent
+    PACKED_MTP_PTRS = 14  # packed MTP hidden states buffer ptrs, b"" if absent
 
 
 class TransferInfoFrame(IntEnum):
@@ -122,6 +123,7 @@ class TransferInfoFrame(IntEnum):
     AUX_INDEX_ASCII = 6
     LINEAR_INDICES_BYTES = 7  # linear-attention dst indices (int32), b"" if absent
     INDEXER_INDICES_BYTES = 8  # indexer KV cache dst indices (int32), b"" if absent
+    MTP_INDICES_BYTES = 9  # MTP hidden states dst indices (int32), b"" if absent
 
 
 class DisaggregationMode(Enum):
@@ -216,6 +218,8 @@ class TransferKVChunk:
     prefill_linear_indices: Optional[npt.NDArray[np.int32]] = None
     # Optional indexer KV cache indices
     prefill_indexer_indices: Optional[npt.NDArray[np.int32]] = None
+    # Optional MTP hidden states indices
+    prefill_mtp_indices: Optional[npt.NDArray[np.int32]] = None
 
 
 @dataclasses.dataclass
@@ -241,6 +245,8 @@ class KVArgsRegisterInfo:
     # Decode-side PP rank and PP size for layer partitioning in KV transfer.
     dst_pp_rank: int = 0
     dst_pp_size: int = 1
+    # MTP hidden states buffer ptrs
+    dst_mtp_ptrs: list[int] = dataclasses.field(default_factory=list)
 
     @classmethod
     def _unpack_ptrs_frame(cls, frame: bytes) -> list[int]:
@@ -303,6 +309,12 @@ class KVArgsRegisterInfo:
         if len(msg) > idx_kv_item_lens:
             dst_kv_item_lens = cls._unpack_ptrs_frame(msg[idx_kv_item_lens])
 
+        # Parse MTP ptrs
+        dst_mtp_ptrs: list[int] = []
+        idx_mtp = int(DecodeRegisterFrame.PACKED_MTP_PTRS)
+        if len(msg) > idx_mtp:
+            dst_mtp_ptrs = cls._unpack_ptrs_frame(msg[idx_mtp])
+
         return cls(
             room=UUID(bytes=msg[int(DecodeRegisterFrame.ROOM)]),
             endpoint=msg[int(DecodeRegisterFrame.DECODE_IP)].decode("ascii"),
@@ -326,6 +338,7 @@ class KVArgsRegisterInfo:
             dst_indexer_ptrs=dst_indexer_ptrs,
             dst_pp_rank=dst_pp_rank,
             dst_pp_size=dst_pp_size,
+            dst_mtp_ptrs=dst_mtp_ptrs,
         )
 
 
@@ -343,6 +356,8 @@ class TransferInfo:
     dst_linear_indices: Optional[npt.NDArray[np.int32]] = None
     # Optional destination indices for indexer KV cache transfer (DeepSeek-V3.2)
     dst_indexer_indices: Optional[npt.NDArray[np.int32]] = None
+    # Optional destination indices for MTP hidden states transfer
+    dst_mtp_indices: Optional[npt.NDArray[np.int32]] = None
 
     @classmethod
     def from_zmq(cls, msg: list[bytes]):
@@ -350,7 +365,8 @@ class TransferInfo:
         #   [room, b"TRANSFER_INFO", ip, port, session_id,
         #    dst_kv_indices_bytes, aux_index_ascii,
         #    linear_indices_bytes | b"",
-        #    indexer_indices_bytes | b""]
+        #    indexer_indices_bytes | b"",
+        #    mtp_indices_bytes | b""]
         if (
             len(msg) < int(TransferInfoFrame.AUX_INDEX_ASCII) + 1
             or msg[int(TransferInfoFrame.TYPE)] != CtrlMsgType.TRANSFER_INFO.value
@@ -376,6 +392,11 @@ class TransferInfo:
         if len(msg) > idx_indexer and len(msg[idx_indexer]) > 0:
             dst_indexer_indices = np.frombuffer(msg[idx_indexer], dtype=np.int32)
 
+        dst_mtp_indices = None
+        idx_mtp = int(TransferInfoFrame.MTP_INDICES_BYTES)
+        if len(msg) > idx_mtp and len(msg[idx_mtp]) > 0:
+            dst_mtp_indices = np.frombuffer(msg[idx_mtp], dtype=np.int32)
+
         return cls(
             room=UUID(bytes=msg[int(TransferInfoFrame.ROOM)]),
             endpoint=msg[int(TransferInfoFrame.DECODE_IP)].decode("ascii"),
@@ -385,6 +406,7 @@ class TransferInfo:
             dst_aux_index=dst_aux_index,
             dst_linear_indices=dst_linear_indices,
             dst_indexer_indices=dst_indexer_indices,
+            dst_mtp_indices=dst_mtp_indices,
         )
 
 
@@ -525,6 +547,12 @@ class KVManager:
         self.indexer_data_ptrs = []
         self.indexer_data_lens = []
         self.indexer_item_lens = []
+
+        # MTP hidden states cache (Multi-Token Prediction)
+        self.mtp_cache = None
+        self.mtp_data_ptrs = []
+        self.mtp_data_lens = []
+        self.mtp_item_lens = []
 
         # Cache buffer pointers for CUDA-safe access.
         # Clear after kv_cache.realloc() and refresh on the next decode step.
@@ -1294,6 +1322,16 @@ class KVManager:
                     logger.debug("Waiting for indexer_data_ptrs to be registered")
                     time.sleep(0.1)
 
+            # Wait for MTP buffers if enabled.
+            if getattr(self, "mtp_cache", None) is not None:
+                wait_start = time.time()
+                while (
+                    not hasattr(self, "mtp_data_ptrs")
+                    or len(getattr(self, "mtp_data_ptrs", [])) == 0
+                ) and (time.time() - wait_start) < 5.0:
+                    logger.debug("Waiting for mtp_data_ptrs to be registered")
+                    time.sleep(0.1)
+
             status_ip, status_port = self._get_decode_public_status_endpoint()
             ranks = self._discover_prefill_engine_ranks()
             for er in ranks:
@@ -1314,6 +1352,7 @@ class KVManager:
                 packed_indexer_ptrs = self._pack_ptrs(
                     getattr(self, "indexer_data_ptrs", [])
                 )
+                packed_mtp_ptrs = self._pack_ptrs(getattr(self, "mtp_data_ptrs", []))
                 _tp_size = int(get_tp_group().group_size)
                 _tp_rank = int(get_tp_group().rank_in_group)
                 _pp_group = get_pp_group()
@@ -1335,6 +1374,7 @@ class KVManager:
                     str(_pp_size).encode("ascii"),
                     str(_tp_rank).encode("ascii"),
                     packed_kv_item_lens or b"",
+                    packed_mtp_ptrs or b"",
                 ]
                 self._send_zmq_to_prefill(endpoint, parts)
                 self._decode_registered_remote_set.add(er)
@@ -1551,6 +1591,74 @@ class KVManager:
             logger.warning(
                 f"indexer cache manager does not support get_contiguous_buf_infos: "
                 f"{type(self.indexer_cache).__name__}"
+            )
+
+    def set_mtp_cache(self, mtp_cache):
+        """Set MTP hidden states cache manager for Multi-Token Prediction.
+
+        For MTP models, the prefill stage produces hidden states from the last
+        normal layer, which need to be transferred to decode for MTP draft token
+        generation. Each request stores [1, hidden_dim] hidden state.
+
+        Args:
+            mtp_cache: SingletonPagedKVCache instance for MTP hidden states
+        """
+        self.mtp_cache = mtp_cache
+        if mtp_cache is not None:
+            self.register_mtp_buffer_to_engine()
+            logger.info("MTP cache manager set for kv manager")
+
+    def register_mtp_buffer_to_engine(self):
+        """Register MTP hidden states buffer for RDMA transfer.
+
+        MTP cache stores hidden states from the last normal layer during prefill.
+        Shape per request: [1, hidden_dim].
+        Block size = mtp_size, each request uses 1 block.
+        """
+        if self.mtp_cache is None:
+            logger.debug("MTP cache manager not set, skip registration")
+            return
+
+        if hasattr(self.mtp_cache, "get_contiguous_buf_infos"):
+            mtp_ptrs, mtp_lens, mtp_item_lens = (
+                self.mtp_cache.get_contiguous_buf_infos()
+            )
+
+            # Check if buffer pointers have changed (e.g., after realloc)
+            old_ptrs = set(getattr(self, "mtp_data_ptrs", []))
+            new_ptrs = set(mtp_ptrs)
+            if old_ptrs != new_ptrs:
+                logger.debug(
+                    f"MTP buffer pointers changed: "
+                    f"old={len(old_ptrs)} new={len(new_ptrs)} "
+                    f"added={len(new_ptrs - old_ptrs)}"
+                )
+                if (
+                    getattr(self, "disaggregation_mode", None)
+                    == DisaggregationMode.DECODE
+                ):
+                    self._decode_registered_remote_set.clear()
+                    logger.debug(
+                        "decode mtp buffer pointers changed; clearing decode->prefill registration cache"
+                    )
+
+            self.mtp_data_ptrs = mtp_ptrs
+            self.mtp_data_lens = mtp_lens
+            self.mtp_item_lens = mtp_item_lens
+
+            newly_registered = 0
+            for ptr, length in zip(mtp_ptrs, mtp_lens):
+                if ptr not in self._registered_ptrs:
+                    self.transfer_engine.register(ptr, length)
+                    self._registered_ptrs.add(ptr)
+                    newly_registered += 1
+            logger.debug(
+                f"registered {newly_registered} MTP hidden state buffers to transfer engine"
+            )
+        else:
+            logger.warning(
+                f"MTP cache does not support get_contiguous_buf_infos: "
+                f"{type(self.mtp_cache).__name__}"
             )
 
     def start_prefill_thread(self):
@@ -2184,6 +2292,27 @@ class KVManager:
                 )
                 return False, False
 
+        has_mtp = (
+            "dst_mtp_ptrs" in meta
+            and "dst_mtp_indices" in meta
+            and kv_chunk.prefill_mtp_indices is not None
+            and isinstance(meta.get("dst_mtp_ptrs"), list)
+            and meta.get("dst_mtp_indices") is not None
+        )
+        if has_mtp:
+            ret = self.send_mtp_hidden_states(
+                mooncake_session_id=meta["session_id"],
+                prefill_mtp_indices=kv_chunk.prefill_mtp_indices,
+                dst_mtp_ptrs=meta["dst_mtp_ptrs"],
+                dst_mtp_indices=meta["dst_mtp_indices"],
+                executor=executor,
+            )
+            if ret != 0:
+                logger.error(
+                    f"MTP hidden states transfer failed for {kv_chunk.room} pp={decode_pp_rank}"
+                )
+                return False, False
+
         aux_done = False
         if decode_pp_rank == 0 and int(getattr(kv_chunk, "prefill_aux_index", -1)) >= 0:
             ret = self.send_aux(
@@ -2399,6 +2528,16 @@ class KVManager:
         ):
             meta["dst_indexer_ptrs"] = dst_indexer_ptrs
             meta["dst_indexer_indices"] = dst_indexer_indices
+        dst_mtp_ptrs = reg_info.dst_mtp_ptrs
+        dst_mtp_indices = t_info.dst_mtp_indices
+        if (
+            isinstance(dst_mtp_ptrs, list)
+            and len(dst_mtp_ptrs) > 0
+            and dst_mtp_indices is not None
+            and dst_mtp_indices.size > 0
+        ):
+            meta["dst_mtp_ptrs"] = dst_mtp_ptrs
+            meta["dst_mtp_indices"] = dst_mtp_indices
         return meta
 
     def get_cached_transfer_infos(self, request_ids: list[str]) -> list[Optional[dict]]:
@@ -2989,9 +3128,7 @@ class KVManager:
         prefill_begin_layer_id = 0
 
         if int(pp_sz) > 1:
-            layer_dist = compute_layer_dist_in_pp(
-                get_global_args().models.n_layers, pp_sz
-            )
+            layer_dist = compute_layer_dist_in_pp(pp_sz)
             prefill_begin_layer_id = sum(layer_dist[:pp_rank])
 
         kv_layer_offset = int(prefill_begin_layer_id)
@@ -3009,10 +3146,7 @@ class KVManager:
         decode_begin_layer = 0
         decode_layer_dist = None
         if decode_pp_size > 1:
-            total_model_layers = int(get_global_args().models.n_layers)
-            decode_layer_dist = compute_layer_dist_in_pp(
-                total_model_layers, decode_pp_size
-            )
+            decode_layer_dist = compute_layer_dist_in_pp(decode_pp_size)
             decode_begin_layer = sum(decode_layer_dist[:decode_pp_rank])
 
         # Validate that the selected prefill layers fit in the decode buffer.
@@ -3434,6 +3568,110 @@ class KVManager:
         )
         return 0
 
+    def send_mtp_hidden_states(
+        self,
+        mooncake_session_id: str,
+        prefill_mtp_indices: npt.NDArray[np.int32],
+        dst_mtp_ptrs: list[int],
+        dst_mtp_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ):
+        """Send MTP hidden states to decode instance.
+
+        MTP hidden states are stored in SingletonPagedKVCache and transferred as
+        paged blocks. Each request uses 1 block.
+
+        Args:
+            mooncake_session_id: Transfer session ID
+            prefill_mtp_indices: Source block indices in prefill's MTP cache
+            dst_mtp_ptrs: Destination buffer pointers in decode's MTP cache
+            dst_mtp_indices: Destination block indices in decode's MTP cache
+            executor: Thread pool for parallel transfers
+        """
+        # Validate required attributes
+        if not getattr(self, "mtp_data_ptrs", None):
+            logger.error(
+                "mtp_data_ptrs is empty while attempting MTP hidden states transfer"
+            )
+            return -1
+        if not dst_mtp_ptrs:
+            logger.error(
+                "dst_mtp_ptrs is empty while attempting MTP hidden states transfer"
+            )
+            return -1
+        if not getattr(self, "mtp_item_lens", None):
+            logger.error(
+                "mtp_item_lens is missing while attempting MTP hidden states transfer"
+            )
+            return -1
+
+        mtp_cache = self.mtp_cache
+        if mtp_cache is None:
+            logger.warning("MTP cache manager not set, skipping MTP transfer")
+            return 0
+
+        # Validate indices match
+        if len(prefill_mtp_indices) != len(dst_mtp_indices):
+            logger.error(
+                f"MTP indices length mismatch: prefill={len(prefill_mtp_indices)} "
+                f"decode={len(dst_mtp_indices)}"
+            )
+            return -1
+
+        # Get MTP cache buffer info
+        src_ptr = self.mtp_data_ptrs[0] if self.mtp_data_ptrs else 0
+        dst_ptr = dst_mtp_ptrs[0] if dst_mtp_ptrs else 0
+
+        if src_ptr == 0 or dst_ptr == 0:
+            logger.warning(
+                f"Zero pointer for MTP transfer: src={src_ptr} dst={dst_ptr}"
+            )
+            return 0
+
+        # Get the block byte length
+        block_bytes = int(self.mtp_item_lens[0]) if self.mtp_item_lens else 0
+        if block_bytes == 0:
+            logger.warning("MTP block byte length is 0")
+            return 0
+
+        # Build transfer slices
+        transfer_slices: list[TransferSlice] = []
+
+        for i, (src_idx, dst_idx) in enumerate(
+            zip(prefill_mtp_indices, dst_mtp_indices)
+        ):
+            if src_idx < 0 or dst_idx < 0:
+                continue
+
+            transfer_slices.append(
+                TransferSlice(
+                    src_addr=src_ptr + int(src_idx) * block_bytes,
+                    dst_addr=dst_ptr + int(dst_idx) * block_bytes,
+                    length=block_bytes,
+                    desc=f"mtp_block_{i}",
+                )
+            )
+
+        # Execute transfers
+        if not transfer_slices:
+            return 0
+
+        futures = [
+            executor.submit(self._transfer_slice, mooncake_session_id, ts)
+            for ts in transfer_slices
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            status = future.result()
+            if status != 0:
+                for f in futures:
+                    f.cancel()
+                return status
+
+        logger.debug(
+            f"MTP hidden states transfer completed: {len(transfer_slices)} RDMA calls"
+        )
+        return 0
+
     def send_aux(
         self,
         mooncake_session_id: str,
@@ -3543,6 +3781,8 @@ class KVManager:
                 self.register_linear_attn_buffer_to_engine()
             if getattr(self, "indexer_cache", None) is not None:
                 self.register_indexer_buffer_to_engine()
+            if getattr(self, "mtp_cache", None) is not None:
+                self.register_mtp_buffer_to_engine()
             self._warmup_completed = True
             self._buffer_ptrs_valid = True
 
@@ -3682,6 +3922,26 @@ class KVManager:
                         f"empty indexer_indices for request_id={request_id}"
                     )
 
+            # Optional: MTP hidden states indices
+            mtp_indices = None
+            _mtp_cond_meta = isinstance(meta, dict) and meta.get("valid", False)
+            _mtp_cond_ptrs = _mtp_cond_meta and "dst_mtp_ptrs" in meta
+            _mtp_cond_indices = _mtp_cond_meta and "dst_mtp_indices" in meta
+            _mtp_cond_cache = getattr(self, "mtp_cache", None) is not None
+            if _mtp_cond_ptrs and _mtp_cond_indices and _mtp_cond_cache:
+                if not hasattr(self.mtp_cache, "get_page_indices"):
+                    raise RuntimeError(
+                        f"MTP cache does not support get_page_indices for {request_id}"
+                    )
+                mtp_idx_list = self.mtp_cache.get_page_indices(request_id)
+                if mtp_idx_list is None:
+                    raise RuntimeError(
+                        f"MTP get_page_indices returned None for request_id={request_id}"
+                    )
+                mtp_indices = np.asarray(mtp_idx_list, dtype=np.int32)
+                if mtp_indices.size == 0:
+                    raise RuntimeError(f"empty mtp_indices for request_id={request_id}")
+
             # Add transfer request to queue with resolved meta
             chunk = TransferKVChunk(
                 room,
@@ -3691,6 +3951,7 @@ class KVManager:
                 meta,
                 linear_indices,
                 indexer_indices,
+                mtp_indices,
             )
             self._trace(
                 "prefill_enqueue_transfer",
@@ -3763,6 +4024,8 @@ class KVManager:
                     self.register_linear_attn_buffer_to_engine()
                 if getattr(self, "indexer_cache", None) is not None:
                     self.register_indexer_buffer_to_engine()
+                if getattr(self, "mtp_cache", None) is not None:
+                    self.register_mtp_buffer_to_engine()
 
             # Step 0: Register on all discovered Prefill ranks.
             discovered = self._discover_prefill_engine_ranks()
@@ -3907,7 +4170,7 @@ class KVManager:
                             "PD linear state transfer requires linear_attn_cache methods"
                         )
                     # Linear attention: always reserve max_blocks_per_req (typically 1)
-                    linear_blocks_to_reserve = int(linear_cache.max_blocks_per_req())
+                    linear_blocks_to_reserve = int(linear_cache.max_blocks_per_req)
                     linear_free = getattr(linear_cache, "num_free_blocks", None)
                     if (
                         linear_free is not None
@@ -3924,6 +4187,36 @@ class KVManager:
                     if linear_dst_np.size == 0:
                         raise RuntimeError(
                             f"reserve_blocks_for_transfer returned empty for linear state "
+                            f"request_id={request_id}"
+                        )
+
+                # Reserve destination blocks for MTP hidden states
+                mtp_dst_np = None
+                mtp_cache = getattr(self, "mtp_cache", None)
+                mtp_ptrs = getattr(self, "mtp_data_ptrs", [])
+                mtp_enabled = mtp_cache is not None and len(mtp_ptrs) > 0
+
+                if mtp_enabled:
+                    if not (
+                        hasattr(mtp_cache, "max_blocks_per_req")
+                        and hasattr(mtp_cache, "reserve_blocks_for_transfer")
+                    ):
+                        raise RuntimeError("PD MTP transfer requires mtp_cache methods")
+                    # MTP cache: always reserve 1 block per request
+                    mtp_blocks_to_reserve = 1
+                    mtp_free = getattr(mtp_cache, "num_free_blocks", None)
+                    if mtp_free is not None and mtp_free < mtp_blocks_to_reserve:
+                        raise KVTransferBackpressure(
+                            f"Not enough free blocks for MTP state: req_id={request_id} "
+                            f"need={mtp_blocks_to_reserve} free={mtp_free}"
+                        )
+                    mtp_indices = mtp_cache.reserve_blocks_for_transfer(
+                        request_id, mtp_blocks_to_reserve
+                    )
+                    mtp_dst_np = np.asarray(mtp_indices, dtype=np.int32)
+                    if mtp_dst_np.size == 0:
+                        raise RuntimeError(
+                            f"reserve_blocks_for_transfer returned empty for MTP state "
                             f"request_id={request_id}"
                         )
 
@@ -3958,6 +4251,7 @@ class KVManager:
                     "dst_indices_np": dst_indices_np,
                     "linear_dst_np": linear_dst_np,
                     "indexer_dst_np": indexer_dst_np,
+                    "mtp_dst_np": mtp_dst_np,
                     "prefix_len": prefix_len,
                     "prefill_tp_size": prefill_tp_size,
                     "decode_tp_size": int(get_tp_group().group_size),
@@ -3978,6 +4272,7 @@ class KVManager:
                 session_id = self.get_session_id().encode("ascii")
                 dst_bytes = dst_indices_np.tobytes()
                 indexer_dst_np = self._prepared_transfers[room].get("indexer_dst_np")
+                mtp_dst_np = self._prepared_transfers[room].get("mtp_dst_np")
                 parts = [
                     room.bytes,
                     CtrlMsgType.TRANSFER_INFO.value,
@@ -3989,6 +4284,7 @@ class KVManager:
                     # Fixed-position optional frames (b"" as placeholder when absent)
                     linear_dst_np.tobytes() if linear_dst_np is not None else b"",
                     indexer_dst_np.tobytes() if indexer_dst_np is not None else b"",
+                    mtp_dst_np.tobytes() if mtp_dst_np is not None else b"",
                 ]
 
                 logger.debug(
@@ -4053,6 +4349,8 @@ class KVManager:
                 self.register_linear_attn_buffer_to_engine()
             if getattr(self, "indexer_cache", None) is not None:
                 self.register_indexer_buffer_to_engine()
+            if getattr(self, "mtp_cache", None) is not None:
+                self.register_mtp_buffer_to_engine()
             self._warmup_completed = True
             self._buffer_ptrs_valid = True
 
@@ -4064,6 +4362,7 @@ class KVManager:
         reserved_dst_indices_list: list[list[int]] = []
         reserved_dst_linear_indices_list: list[list[int]] = []
         reserved_dst_indexer_indices_list: list[list[int]] = []
+        reserved_dst_mtp_indices_list: list[list[int]] = []
 
         for idx, request_id in enumerate(request_ids):
             room = self._to_uuid(request_id)
@@ -4080,6 +4379,10 @@ class KVManager:
                 indexer_np = prep_info.get("indexer_dst_np")
                 reserved_dst_indexer_indices_list.append(
                     indexer_np.tolist() if indexer_np is not None else []
+                )
+                mtp_np = prep_info.get("mtp_dst_np")
+                reserved_dst_mtp_indices_list.append(
+                    mtp_np.tolist() if mtp_np is not None else []
                 )
                 logger.debug(
                     f"[recv_kv_cache_and_insert] using prepared transfer for {request_id}"
@@ -4120,6 +4423,7 @@ class KVManager:
             reserved_dst_indices_list = []
             reserved_dst_linear_indices_list = []
             reserved_dst_indexer_indices_list = []
+            reserved_dst_mtp_indices_list = []
             for idx, request_id in enumerate(request_ids):
                 room = self._to_uuid(request_id)
                 prep_info = self._prepared_transfers.get(room)
@@ -4137,6 +4441,10 @@ class KVManager:
                 indexer_np = prep_info.get("indexer_dst_np")
                 reserved_dst_indexer_indices_list.append(
                     indexer_np.tolist() if indexer_np is not None else []
+                )
+                mtp_np = prep_info.get("mtp_dst_np")
+                reserved_dst_mtp_indices_list.append(
+                    mtp_np.tolist() if mtp_np is not None else []
                 )
         else:
             logger.debug(
@@ -4209,6 +4517,9 @@ class KVManager:
                     _pp_grp_resend = get_pp_group()
                     _pp_rank_resend = int(getattr(_pp_grp_resend, "rank_in_group", 0))
                     _pp_size_resend = int(getattr(_pp_grp_resend, "group_size", 1))
+                    packed_mtp_ptrs = self._pack_ptrs(
+                        getattr(self, "mtp_data_ptrs", [])
+                    )
                     reg_parts = [
                         ctrl_room.bytes,
                         CtrlMsgType.DECODE_REGISTER.value,
@@ -4225,6 +4536,7 @@ class KVManager:
                         str(_pp_size_resend).encode("ascii"),
                         str(_tp_rank).encode("ascii"),
                         packed_kv_item_lens or b"",
+                        packed_mtp_ptrs or b"",
                     ]
                     for er in discovered:
                         info = self._get_bootstrap_info(engine_rank=er)
@@ -4295,6 +4607,19 @@ class KVManager:
                             indexer_dst_indices, dtype=np.int32
                         )
 
+                    # MTP indices (if enabled)
+                    mtp_dst_indices_np = None
+                    mtp_cache = getattr(self, "mtp_cache", None)
+                    mtp_ptrs = getattr(self, "mtp_data_ptrs", [])
+                    mtp_enabled = mtp_cache is not None and len(mtp_ptrs) > 0
+                    if mtp_enabled:
+                        mtp_dst_indices = (
+                            mtp_cache.block_table.get(req_id, [])
+                            if hasattr(mtp_cache, "block_table")
+                            else []
+                        )
+                        mtp_dst_indices_np = np.asarray(mtp_dst_indices, dtype=np.int32)
+
                     session_id = self.get_session_id().encode("ascii")
                     dst_bytes = dst_indices_np.tobytes()
                     parts = [
@@ -4316,6 +4641,12 @@ class KVManager:
                             indexer_dst_indices_np.tobytes()
                             if indexer_dst_indices_np is not None
                             and indexer_dst_indices_np.size > 0
+                            else b""
+                        ),
+                        (
+                            mtp_dst_indices_np.tobytes()
+                            if mtp_dst_indices_np is not None
+                            and mtp_dst_indices_np.size > 0
                             else b""
                         ),
                     ]
@@ -4416,6 +4747,26 @@ class KVManager:
                     logger.debug(
                         f"[PD_TRACE][decode.insert_indexer] req_id={req_id} room={str(room)} "
                         f"page_indices={len(idx_indices)} prefix_len={prefix_length}"
+                    )
+
+        # Insert transferred MTP hidden states
+        if getattr(self, "mtp_cache", None) is not None:
+            mtp_cache = self.mtp_cache
+            for idx, room in enumerate(room_ids):
+                req_id = request_ids[idx]
+                mtp_indices = reserved_dst_mtp_indices_list[idx]
+                if not mtp_indices:
+                    continue
+                prefix_length = int(prefix_lens[idx])
+                # Insert MTP hidden states - use insert_mtp_state_from_transfer
+                # since SingletonPagedKVCache may have pre-allocated a block
+                mtp_cache.insert_mtp_state_from_transfer(
+                    req_id, mtp_indices[0], prefix_length
+                )
+                if pd_trace_enabled():
+                    logger.debug(
+                        f"[PD_TRACE][decode.insert_mtp] req_id={req_id} room={str(room)} "
+                        f"page_index={int(mtp_indices[0])} prefix_len={prefix_length}"
                     )
 
         # Free aux buffer slots

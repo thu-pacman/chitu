@@ -69,11 +69,12 @@ class TasksDispatcher(ABC):
     General workflow:
     1. `Executor` calls `dispatch_metadata` of this interface to let all corresponding
         ranks know the task meta data.
-    2. `Executor` calls `recv_payload` of this interface to let all corresponding ranks
-        know their input tensor.
+    2. for each model input:
+        1. on source rank, `Executor` generates model input, then calls `send_payload` of
+            this interface to send model input to other ranks.
+        2. on other ranks, `Executor` calls `recv_payload` of this interface to receive
+        model input from source rank.
     3. `Executor` computes the model on every corresponding rank.
-    4. `Exectuor` calls `send_payload` of this interface to collect the output tensor
-        from every corresponding rank.
 
     When combining multiple parallelism, generally we want a fused dispatcher dedicatedly
     designed for this combined parallelism in order for higher performance. But if we don't
@@ -251,14 +252,15 @@ class TasksDispatcher(ABC):
     @abstractmethod
     def recv_payload(self, *args, **kwargs) -> torch.Tensor:
         """
-        Let all corresponding ranks know their input tensor.
+        Receive the tensor on non-source ranks from the source rank (e.g. rank 0).
         """
         raise NotImplementedError()
 
     @abstractmethod
     def send_payload(self, *args, **kwargs):
         """
-        Collect the output tensor from every corresponding rank.
+        Send/broadcast the tensor from the source rank (e.g. rank 0) to all other
+        corresponding ranks.
         """
         raise NotImplementedError()
 
@@ -533,6 +535,9 @@ class TensorDispatcher(TasksDispatcher):
         return payload
 
     def send_payload(self, payload: torch.Tensor, tasks=None):
+        torch.distributed.broadcast(
+            tensor=payload, src=self.tp_main_rank, group=self.gpu_group
+        )
         return
 
 
@@ -954,12 +959,24 @@ class Executor:
             )
             pass
 
-    def _prepare_new_tokens_for_decode(self, tasks: PackedTasks):
-        return create_tensor(
-            [task.next_token for task in tasks.tasks],
-            device=self.device,
-            dtype=torch.long,
-        )
+    def _prepare_tokens_decode(self, tasks: PackedTasks):
+        if not get_pp_group().is_first_rank:
+            return None
+        if tasks.num_tasks == 0:
+            return torch.empty((0,), device=self.device, dtype=torch.int64)
+
+        if self.is_main_rank:
+            tokens = create_tensor(
+                [task.next_token for task in tasks.tasks],
+                device=self.device,
+                dtype=torch.int64,
+            )
+            if self.tp_dispatcher:
+                self.tp_dispatcher.send_payload(tokens)
+        else:
+            tokens = torch.empty(tasks.num_tasks, device=self.device, dtype=torch.int64)
+            tokens = self.tp_dispatcher.recv_payload(tokens)
+        return tokens
 
     def _prepare_blocks_for_decode_dllm(self, tasks: PackedTasks) -> torch.Tensor:
         """Prepare payload as concatenated blocks for DLLM decode. Each task's next_block is [block_length] tokens."""
@@ -1110,7 +1127,7 @@ class Executor:
                 cnt += len(tasks.tokens[i])
                 if tasks.has_outputs[i]:
                     output_token_offsets.append(cnt - 1)
-            return torch.tensor(
+            return create_tensor(
                 output_token_offsets, dtype=torch.int32, device=self.device
             )
         else:
@@ -1182,6 +1199,54 @@ class Executor:
         if tasks.task_type == TaskType.Prefill:
             self._kv_hook.on_prefill_done(tasks)
 
+    def _prepare_tokens_prefill(self, tasks: PackedTasksBase):
+        if not (
+            get_pp_group().is_first_rank
+            or self.mtp_size > 1
+            and get_pp_group().is_last_rank
+        ):
+            return None
+        if tasks.num_tokens == 0:
+            return torch.empty((0,), device=self.device, dtype=torch.int64)
+
+        if self.is_main_rank:
+            # only tp main rank have tokens after dispatch metadata
+            tokens = create_tensor(
+                np.concatenate(tasks.tokens), device=self.device, dtype=torch.int64
+            )
+            if self.tp_dispatcher:
+                self.tp_dispatcher.send_payload(tokens)
+        else:
+            tokens = torch.empty(
+                tasks.num_tokens, device=self.device, dtype=torch.int64
+            )
+            tokens = self.tp_dispatcher.recv_payload(tokens)
+        return tokens
+
+    def _prepare_hiddens(self, tasks: PackedTasksBase):
+        if get_pp_group().is_first_rank:
+            return None
+        if tasks.num_tokens == 0:
+            return torch.empty(
+                self.get_payload_shape(0),
+                device=self.device,
+                dtype=self.get_payload_dtype(),
+            )
+
+        # receive hiddens on tp main rank and broadcast in tp group
+        hiddens = torch.empty(
+            self.get_payload_shape(tasks.num_tokens),
+            device=self.device,
+            dtype=self.get_payload_dtype(),
+        )
+        if self.is_main_rank:
+            hiddens = self.pipe_dispatcher.recv_payload(hiddens)
+            if self.tp_dispatcher:
+                self.tp_dispatcher.send_payload(hiddens)
+        else:
+            hiddens = self.tp_dispatcher.recv_payload(hiddens)
+        return hiddens
+
     def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         is_empty_step = tasks.num_tasks == 0
         if not is_empty_step:
@@ -1190,37 +1255,18 @@ class Executor:
             PrometheusMetricsCollector.update_GPU_usage()
             PrometheusMetricsCollector.update_task_counts()
 
-            num_tokens = tasks.num_tokens
-
-            if (self.rank == 0 and num_tokens > 0) or (
-                self.dp_size > 1 and self.pp_stage == 0
-            ):  # check if num_toekns needs to be validated
-                payload = (
-                    torch.from_numpy(np.concatenate(tasks.tokens))
-                    .to(self.device)
-                    .to(torch.int64)
-                )
-            else:
-                payload = torch.empty(
-                    self.get_payload_shape(num_tokens),
-                    dtype=self.get_payload_dtype(),
-                    device=self.device,
-                )
-
-            # payload recv
-            for dispatcher in self.task_dispatchers:
-                payload = dispatcher.recv_payload(payload)
-        else:
-            for dispatcher in self.task_dispatchers:
-                payload = dispatcher.recv_payload(self.dummy_logits)
+        tokens = self._prepare_tokens_prefill(tasks)
+        hiddens = self._prepare_hiddens(tasks)
+        output_token_offsets = self._get_output_token_offsets(tasks)
 
         if not self.is_pp_first_stage:
             self._collect_task_and_pp_results(tasks)
 
         self.timers("prefill").start()
         out = Backend.model.prefill(
-            payload,
-            self._get_output_token_offsets(tasks),
+            tokens=tokens,
+            hiddens=hiddens,
+            output_token_offsets=output_token_offsets,
             pixel_values=self.vision_tensor_broadcast(
                 getattr(tasks, "pixel_values", None), 2, torch.bfloat16, stack=False
             ),
@@ -1233,7 +1279,9 @@ class Executor:
         if not is_empty_step:
             # Collect prompt tokens metrics
             inc_hit_tokens = sum(tasks.inc_hit_tokens_list)
-            PrometheusMetricsCollector.inc_prompt_tokens(num_tokens + inc_hit_tokens)
+            PrometheusMetricsCollector.inc_prompt_tokens(
+                tasks.num_tokens + inc_hit_tokens
+            )
             PrometheusMetricsCollector.inc_hit_tokens(inc_hit_tokens)
 
             # payload send
@@ -1241,14 +1289,11 @@ class Executor:
             # NOTE: send hidden states to the next PP stage BEFORE triggering KV transfer.
             # Otherwise intermediate stages can block in KV transfer collectives, while the last
             # stage is still waiting for payload from upstream, causing a deadlock.
-            for dispatcher in self.task_dispatchers:
-                dispatcher.send_payload(out, tasks)
+            if not get_pp_group().is_last_rank and self.is_main_rank:
+                self.pipe_dispatcher.send_payload(out, tasks)
 
             return out
         else:
-            for dispatcher in self.task_dispatchers:
-                dispatcher.send_payload(self.dummy_logits, tasks=tasks)
-
             return self.dummy_output
 
     def decode_step(self, tasks: PackedTasksBase, is_empty_step: bool = False):
@@ -1270,53 +1315,24 @@ class Executor:
             for cache in Backend.cache_dict.values():
                 cache.prepare_cache_decode(tasks)
 
-            num_tokens = tasks.num_tasks
-
-            # prepare payload tensor
-            if self.rank == 0 or self.dp_size > 1 and self.dp_dispatcher is not None:
-                payload = self._prepare_new_tokens_for_decode(tasks)
-            else:
-                payload = torch.empty(
-                    self.get_payload_shape(num_tokens),
-                    dtype=self.get_payload_dtype(),
-                    device=self.device,
-                )
-
-            # payload recv
-            for dispatcher in self.task_dispatchers:
-                payload = dispatcher.recv_payload(payload)
-
+        if get_pp_group().is_first_rank:
+            payload = self._prepare_tokens_decode(tasks)
         else:
-            if self.rank == 0 or self.dp_size > 1 and self.dp_dispatcher is not None:
-                payload = torch.empty(0, device=self.device, dtype=torch.long)
-            else:
-                payload = torch.empty(
-                    self.get_payload_shape(0),
-                    dtype=self.get_payload_dtype(),
-                    device=self.device,
-                )
-
-            for dispatcher in self.task_dispatchers:
-                dispatcher.recv_payload(self.dummy_logits)
+            payload = self._prepare_hiddens(tasks)
 
         if not self.is_pp_first_stage:
             self._collect_task_and_pp_results(tasks)
 
-        payload_bs = len(tasks.req_ids) if not is_empty_step else 0
         self.timers("decode").start()
-        out = Backend.model.decode(payload, payload_bs)
+        out = Backend.model.decode(payload)
         self.timers("decode").stop()
 
         if not is_empty_step:
-            # payload send
-            for dispatcher in self.task_dispatchers:
-                dispatcher.send_payload(out, tasks)
+            if not get_pp_group().is_last_rank and self.is_main_rank:
+                self.pipe_dispatcher.send_payload(out, tasks)
 
             return out
         else:
-            for dispatcher in self.task_dispatchers:
-                dispatcher.send_payload(self.dummy_logits, tasks=tasks)
-
             return self.dummy_mtp_output if self.mtp_size > 1 else self.dummy_output
 
     def _prepare_mtp_token_indices(self, tasks) -> list[int]:
@@ -1421,39 +1437,32 @@ class Executor:
         batch_size = tasks.num_tasks
 
         # 1) Get decoding_start tensor (broadcast for TP>1)
-        if self.tp_size > 1:
-            tp_group = get_tp_group()
-            if isinstance(tasks, PackedTasks):
-                decoding_start = torch.tensor(
-                    [getattr(t, "decoding_start", 0) for t in tasks.tasks],
-                    device=self.device,
-                    dtype=torch.long,
-                )
-            else:
-                decoding_start = torch.empty(
-                    batch_size, device=self.device, dtype=torch.long
-                )
-            torch.distributed.broadcast(
-                decoding_start, src=tp_group.rank_list[0], group=tp_group.gpu_group
-            )
-        else:
+
+        if self.is_main_rank:
+            assert isinstance(tasks, PackedTasks)
             decoding_start = torch.tensor(
                 [getattr(t, "decoding_start", 0) for t in tasks.tasks],
                 device=self.device,
                 dtype=torch.long,
             )
+            if self.tp_dispatcher:
+                self.tp_dispatcher.send_payload(decoding_start)
+        else:
+            decoding_start = torch.empty(
+                batch_size, device=self.device, dtype=torch.long
+            )
+            self.tp_dispatcher.recv_payload(decoding_start)
 
         # 2) Prepare payload
-        if (
-            self.is_main_rank or (self.dp_size > 1 and self.dp_dispatcher is not None)
-        ) and isinstance(tasks, PackedTasks):
+        if self.is_main_rank:
             payload = self._prepare_blocks_for_decode_dllm(tasks)
+            if self.tp_dispatcher:
+                self.tp_dispatcher.send_payload(payload)
         else:
             payload = torch.empty(
                 [batch_size * block_length], dtype=torch.long, device=self.device
             )
-        for dispatcher in self.task_dispatchers:
-            payload = dispatcher.recv_payload(payload)
+            self.tp_dispatcher.recv_payload(payload)
 
         # 3) Prepare cache
         self._kv_hook.before_decode_step(tasks.req_ids)
@@ -1548,8 +1557,6 @@ class Executor:
         else:
             self._pending_dllm_block = None
 
-        for dispatcher in self.task_dispatchers:
-            dispatcher.send_payload(logits[:, -1, :], tasks)
         return logits[:, -1, :]
 
     def _process_dllm_block_results(self):
@@ -1607,8 +1614,6 @@ class Executor:
         tasks = TaskCollector.collect(tasks)
         if self.pipe_dispatcher:
             self.pipe_dispatcher.collect_results(tasks)
-            if self.mtp_size > 1:
-                raise NotImplementedError("pp+mtp is not supported")
         return tasks
 
     def _update_token_statistics(self, tasks: PackedTasks):

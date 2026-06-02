@@ -2090,7 +2090,7 @@ class TransformerDeepSeekV4(Transformer):
             )
         if self.pp_size > 1:
             state_dict = self._chunk_checkpoint_for_pipeline_parallel(
-                state_dict, self.global_n_layers, self.pp_stage, self.pp_size
+                state_dict, self.pp_stage, self.pp_size
             )
         if self.tp_size > 1:
             state_dict = self._chunk_checkpoint_for_tensor_parallel(

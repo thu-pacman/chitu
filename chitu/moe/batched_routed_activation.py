@@ -25,15 +25,22 @@ def _compute_padded_per_expert_counts(
     n_experts: int,
     pad_block_size: int,
 ) -> torch.Tensor:
-    """Return per-expert padded token counts as a device-side tensor (no D2H sync)."""
+    """Return per-expert padded token counts as a device-side tensor.
+
+    Invalid expert IDs are counted into an extra sentinel bucket instead of
+    being filtered out. This keeps the index tensor fixed-size and avoids a
+    data-dependent D2H sync from materializing the number of valid IDs.
+    """
     token_cnt_per_expert = torch.zeros(
-        n_experts, device=token_to_expert_indices.device, dtype=torch.int32
+        n_experts + 1, device=token_to_expert_indices.device, dtype=torch.int32
     )
-    expert_ids = token_to_expert_indices.view(-1)
-    expert_ids = expert_ids[(expert_ids >= 0) & (expert_ids < n_experts)]
+    expert_ids = token_to_expert_indices.reshape(-1).clone()
+    expert_ids[(expert_ids < 0) | (expert_ids >= n_experts)] = n_experts
     token_cnt_per_expert.index_add_(
         0, expert_ids, torch.ones_like(expert_ids, dtype=torch.int32)
     )
+    # Drop the sentinel bucket before padding the real per-expert counts.
+    token_cnt_per_expert = token_cnt_per_expert[:-1]
     del expert_ids
     n_tokens_per_expert_padded = (
         (token_cnt_per_expert + pad_block_size - 1) // pad_block_size * pad_block_size

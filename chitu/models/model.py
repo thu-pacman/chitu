@@ -274,6 +274,8 @@ class Transformer(nn.Module):
 
         # `get_global_args()` can be a Hydra/OmegaConf object; force to plain int for type checkers.
         self.mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
+        self.mtp_tie_word_embeddings = getattr(params, "mtp_tie_word_embeddings", False)
+        """ share word embedding between main model and mtp model """
 
         self.params = params
         self.vocab_size = params.vocab_size
@@ -282,9 +284,7 @@ class Transformer(nn.Module):
             int(getattr(get_global_args().infer, "max_batch_size", 1)), get_dp_size()
         )
         if self.pp_size > 1:
-            num_layers_of_each_rank = compute_layer_dist_in_pp(
-                self.global_n_layers, self.pp_size
-            )
+            num_layers_of_each_rank = compute_layer_dist_in_pp(self.pp_size)
             first_layer_id_of_each_rank = list(
                 itertools.accumulate([0] + num_layers_of_each_rank)
             )
@@ -294,7 +294,12 @@ class Transformer(nn.Module):
             self.local_begin_layer_id = 0
             self.local_end_layer_id = self.global_n_layers
 
-        if self.pp_size == 1 or self.pp_stage == 0:
+        mtp_dup_pre_layer = (
+            self.mtp_size > 1
+            and self.mtp_tie_word_embeddings
+            and self.pp_stage == self.pp_size - 1
+        )
+        if self.pp_size == 1 or self.pp_stage == 0 or mtp_dup_pre_layer:
             self._init_pre_layers()
         self._init_layers(cache_dict, attn_backend=attn_backend, op_impl=op_impl)
         if self.pp_size == 1 or self.pp_stage == self.pp_size - 1:
@@ -489,12 +494,12 @@ class Transformer(nn.Module):
         return checkpoint
 
     def _chunk_checkpoint_for_pipeline_parallel(
-        self, checkpoint: dict[str, Any], num_layers: int, rank: int, pp_size: int
+        self, checkpoint: dict[str, Any], rank: int, pp_size: int
     ):
         keys = checkpoint.keys()
         partial_checkpoint = {}
 
-        num_layers_of_each_rank = compute_layer_dist_in_pp(num_layers, pp_size)
+        num_layers_of_each_rank = compute_layer_dist_in_pp(pp_size)
         first_layer_id_of_each_rank = list(
             itertools.accumulate([0] + num_layers_of_each_rank)
         )
@@ -513,10 +518,19 @@ class Transformer(nn.Module):
                         partial_checkpoint[
                             key.replace(f"layers.{i}.", f"layers.{local_i}.", 1)
                         ] = checkpoint[key]
-                if i == num_layers - 1:
+                if i == self.params.n_layers - 1:
                     for prefix in self._get_post_layer_prefixes():
                         if key.startswith(prefix):
                             partial_checkpoint[key] = checkpoint[key]
+                if (
+                    self.mtp_size > 1
+                    and self.mtp_tie_word_embeddings
+                    and i == self.params.n_layers
+                ):
+                    for prefix in self._get_pre_layer_mtp_prefixes():
+                        if key.startswith(prefix):
+                            partial_checkpoint[key] = checkpoint[key]
+
         return partial_checkpoint
 
     def _chunk_checkpoint_for_tensor_parallel(
@@ -999,7 +1013,7 @@ class Transformer(nn.Module):
                 )
             if self.pp_size > 1:
                 state_dict = self._chunk_checkpoint_for_pipeline_parallel(
-                    state_dict, self.global_n_layers, self.pp_stage, self.pp_size
+                    state_dict, self.pp_stage, self.pp_size
                 )
             if self.tp_size > 1:
                 # QKV and gate/up layers might already be merged in the checkpoint, but they should be split
@@ -1198,7 +1212,7 @@ class Transformer(nn.Module):
             self.embed_tokens_cum_num_tokens = self.lm_head_cum_num_tokens = None
 
     def read_mtp_hidden_states(self, is_mtp=False) -> torch.Tensor:
-        cache_accessor = self.cache_dict["mtp"].get_accessor(len(self.layers) - 1)
+        cache_accessor = self.cache_dict["mtp"].get_accessor(self.global_n_layers - 1)
         tensor = read_from_singleton_paged_kv_cache(
             cache_accessor.kv["hidden_states"],
             cache_accessor.block_table,
@@ -1207,7 +1221,7 @@ class Transformer(nn.Module):
         return tensor
 
     def update_mtp_hidden_states(self, mtp_hidden_states: torch.Tensor, is_mtp=False):
-        cache_accessor = self.cache_dict["mtp"].get_accessor(len(self.layers) - 1)
+        cache_accessor = self.cache_dict["mtp"].get_accessor(self.global_n_layers - 1)
         cache = cache_accessor.kv["hidden_states"]
         if is_mtp:
             mtp_hidden_states = mtp_hidden_states.view(
@@ -1225,7 +1239,10 @@ class Transformer(nn.Module):
         )
 
     @torch.inference_mode()
-    def mtp_prefill_no_pipeline(self, x, h, freqs_cis):
+    def mtp_prefill(self, x, h, freqs_cis):
+        for mgr in self.cache_dict.values():
+            mgr.seq_len_delta.is_decode_stage = False
+
         last_token_offsets = (
             self.cache_dict["mtp"].mtp_seq_len_delta.delta_prefix_lens_tensor_device[1:]
             - 1
@@ -1237,30 +1254,29 @@ class Transformer(nn.Module):
             == 0
         ] = 0
         h = torch.roll(h, shifts=1, dims=0)
-        _ = self.layers[-1](x, freqs_cis, h, False)
+        _ = self.layers[-1](x, freqs_cis, h, is_mtp=False)
+
+    @property
+    def non_mtp_layers(self):
+        return self.layers[:-1] if self.mtp_size > 1 else self.layers
 
     @torch.inference_mode()
     def prefill_no_pipeline(
-        self, tokens, output_token_offsets: torch.Tensor, **args
+        self, tokens: torch.Tensor, output_token_offsets: torch.Tensor, **args
     ) -> torch.Tensor:
         freqs_cis = self.prepare_freqs_cis()
         if self.moe_impl is not None:
             self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
         h = self._pre_layers(tokens, **args)
-        if self.mtp_size > 1:
-            for mgr in self.cache_dict.values():
-                mgr.seq_len_delta.is_decode_stage = False
-            for it, layer in enumerate(self.layers[0:-1]):
-                h = layer(h, freqs_cis, False)
 
-            self.mtp_prefill_no_pipeline(
+        for it, layer in enumerate(self.non_mtp_layers):
+            h = layer(h, freqs_cis)
+        if self.mtp_size > 1:
+            self.mtp_prefill(
                 x=self._pre_layers_mtp(tokens, **args),
                 h=h,
                 freqs_cis=freqs_cis,
             )
-        else:
-            for it, layer in enumerate(self.layers):
-                h = layer(h, freqs_cis)
         # Exec post layers AFTER cutting the last token off
         h = h[output_token_offsets]
         h = self._post_layers(h)
@@ -1270,12 +1286,9 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
         h = self._pre_layers(tokens)
-        if not self.mtp_size > 1:
-            for it, layer in enumerate(self.layers):
-                h = layer(h, freqs_cis)
-        else:
-            for it, layer in enumerate(self.layers[0:-1]):
-                h = layer(h, freqs_cis, False)
+        for it, layer in enumerate(self.non_mtp_layers):
+            h = layer(h, freqs_cis)
+        if self.mtp_size > 1:
             self.update_mtp_hidden_states(
                 self.norm(h, compute_dtype=h.dtype), is_mtp=True
             )
@@ -1286,7 +1299,7 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def mtp_decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
         h = self._pre_layers_mtp(tokens)
-        h = self.layers[-1](h, freqs_cis, self.read_mtp_hidden_states(), True)
+        h = self.layers[-1](h, freqs_cis, self.read_mtp_hidden_states(), is_mtp=True)
         self.update_mtp_hidden_states(h)
         h = self._post_layers_mtp(h)
         h = h.float()
@@ -1342,26 +1355,41 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def prefill_pipeline(
-        self, tokens, output_token_offsets: torch.Tensor, **args
+        self,
+        tokens: torch.Tensor | None,
+        hiddens: torch.Tensor | None,
+        output_token_offsets: torch.Tensor,
+        **args,
     ) -> torch.Tensor:
         freqs_cis = self.prepare_freqs_cis()
 
         # start of model
         if self.pp_stage == 0:
+            batch_size = tokens.shape[0]
+            assert hiddens is None
             h = self._pre_layers(tokens, **args)
         else:
-            h = tokens
+            batch_size = hiddens.shape[0]
+            h = hiddens
+            del hiddens
 
         # Ensure MoE impl is primed before layer execution in prefill.
         if self.moe_impl is not None:
-            self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
+            self.moe_impl.prepare(TaskType.Prefill, batch_size)
 
         # layers
-        for it, layer in enumerate(self.layers):
+        for it, layer in enumerate(self.non_mtp_layers):
             h = layer(h, freqs_cis)
 
         # end of model
         if self.pp_stage == self.pp_end_stage:
+            if self.mtp_size > 1:
+                assert tokens is not None
+                self.mtp_prefill(
+                    x=self._pre_layers_mtp(tokens, **args),
+                    h=h,
+                    freqs_cis=freqs_cis,
+                )
             # Exec post layers AFTER cutting the last token off
             h = h[output_token_offsets]
             h = self._post_layers(h)
@@ -1374,9 +1402,13 @@ class Transformer(nn.Module):
             h = self._pre_layers(tokens)
         else:
             h = tokens
-        for it, layer in enumerate(self.layers):
+        for it, layer in enumerate(self.non_mtp_layers):
             h = layer(h, freqs_cis)
         if self.pp_stage == self.pp_end_stage:
+            if self.mtp_size > 1:
+                self.update_mtp_hidden_states(
+                    self.norm(h, compute_dtype=h.dtype), is_mtp=True
+                )
             h = self._post_layers(h)
             h = h.float()
         return h
@@ -1462,9 +1494,15 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def prefill(
-        self, tokens, output_token_offsets: torch.Tensor, **args
+        self,
+        tokens: torch.Tensor | None,
+        hiddens: torch.Tensor | None,
+        output_token_offsets: torch.Tensor,
+        **args,
     ) -> torch.Tensor:
-        if tokens.shape[0] == 0:
+        if hiddens is not None and len(hiddens) == 0:
+            return self.empty_prefill()
+        if tokens is not None and len(tokens) == 0:
             return self.empty_prefill()
 
         for cache in self.cache_dict.values():
@@ -1473,8 +1511,9 @@ class Transformer(nn.Module):
             self.cache_dict["main"].seq_len_delta
         )
         if self.pp_size > 1:
-            return self.prefill_pipeline(tokens, output_token_offsets, **args)
+            return self.prefill_pipeline(tokens, hiddens, output_token_offsets, **args)
         else:
+            assert hiddens is None
             return self.prefill_no_pipeline(tokens, output_token_offsets, **args)
 
     def prepare_decoding_attn(self):
@@ -1542,7 +1581,9 @@ class Transformer(nn.Module):
         return self.prepare_freqs_cis_mtp()
 
     @torch.inference_mode()
-    def decode(self, tokens, batch_size):
+    def decode(self, tokens: torch.Tensor):
+        batch_size = len(tokens)
+
         if isinstance(self.cache_dict["main"], DenseKVCache):
             key = (batch_size, self.cache_dict["main"].get_start_and_end_idx()[0])
         elif isinstance(self.cache_dict["main"], PagedKVCache):

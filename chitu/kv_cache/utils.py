@@ -47,7 +47,7 @@ def build_layer_id_map(
     total_n_layers = int(args.models.n_layers) + (1 if mtp_size > 1 else 0)
 
     if pp_size > 1:
-        layer_dist = compute_layer_dist_in_pp(args.models.n_layers, pp_size)
+        layer_dist = compute_layer_dist_in_pp(pp_size)
         pp_rank = get_pp_group().rank_in_group
         local_begin = sum(layer_dist[:pp_rank])
         local_end = local_begin + layer_dist[pp_rank]
@@ -121,6 +121,9 @@ def plan_kv_cache_blocks_after_warmup(args, cache_managers):
             continue
         plan[name] = min(int(info["current_blocks"]), int(info["max_num_blocks"]))
 
+    # mtp cache only exists in pp last stage, causing stuck in `reduce_num_block_plan_across_ranks`
+    # mtp cache size only depends on request num, shrinking is not required
+    plan.pop("mtp", None)
     return plan
 
 
