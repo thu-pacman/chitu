@@ -6,6 +6,7 @@ from typing import Any, Sequence, Optional, Callable, Iterable, TYPE_CHECKING
 from typing_extensions import override
 from dataclasses import dataclass
 from logging import getLogger
+import numpy as np
 import torch
 import functools
 from enum import Enum
@@ -526,6 +527,8 @@ class PagedKVCache(KVCacheBase):
         self.gpu_block_table = StaticTensor(
             max_nelem=self.max_num_blocks, dtype=torch.int32, device=self.device
         )
+        self.cpu_block_table_array = np.empty(self.max_num_blocks, dtype=np.int32)
+        self.cpu_block_table_tensor = torch.from_numpy(self.cpu_block_table_array)
         self.paged_kv_cache: dict[str, torch.Tensor] = {}
         logger.info(
             f"Allocating KV cache of {','.join(self.shape_per_token_dict.keys())} with "
@@ -628,7 +631,7 @@ class PagedKVCache(KVCacheBase):
         return self.mtp_seq_len_delta.delta_position_ids_tensor_device % self.block_size
 
     def _upd_gpu_block_table(self, task_ids: list[str]):
-        block_lists = [list(self.block_table[tid]) for tid in task_ids]
+        block_lists = [self.block_table[tid] for tid in task_ids]
         max_len = max(len(blocks) for blocks in block_lists)
         if get_global_args().infer.use_cuda_graph:
             if max_len > self.max_blocks_per_req:
@@ -642,12 +645,14 @@ class PagedKVCache(KVCacheBase):
         else:
             max_block_num = max_len
 
-        all_block_ids = [
-            # pad the block ids to max_block_num
-            blocks + [0] * (max_block_num - len(blocks))
-            for blocks in block_lists
-        ]
-        cpu_block_table_tensor = torch.tensor(all_block_ids, dtype=torch.int32)
+        table_shape = (len(task_ids), max_block_num)
+        numel = table_shape[0] * table_shape[1]
+        cpu_block_table_array = self.cpu_block_table_array[:numel].reshape(table_shape)
+        cpu_block_table_array.fill(0)
+        for row, blocks in enumerate(block_lists):
+            if blocks:
+                cpu_block_table_array[row, : len(blocks)] = blocks
+        cpu_block_table_tensor = self.cpu_block_table_tensor[:numel].reshape(table_shape)
         self.gpu_block_table.set_shape(cpu_block_table_tensor.shape)
         self.gpu_block_table.get().copy_(cpu_block_table_tensor, non_blocking=True)
 
