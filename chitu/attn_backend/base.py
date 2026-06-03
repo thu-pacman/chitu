@@ -215,6 +215,94 @@ class AttnBackend(abc.ABC):
                 topk_indices=topk_indices,
             )
 
+    def csa_hca(
+        self,
+        q: torch.Tensor,
+        slidingwindow_kv_or_cache: torch.Tensor | KVCacheAccessor,
+        attn_sink: torch.Tensor,
+        slidingwindow_topk_idxs: torch.Tensor,
+        softmax_scale: float,
+        *,
+        compressed_kv: Optional[torch.Tensor] = None,
+        compressed_cache: Optional[KVCacheAccessor] = None,
+        compressed_topk_idxs: Optional[torch.Tensor] = None,
+        split_offset: Optional[int] = None,
+        start_positions: Optional[torch.Tensor] = None,
+        cache_slots: Optional[torch.Tensor] = None,
+        cache_seq_ids: Optional[torch.Tensor] = None,
+        window_size: Optional[int] = None,
+        compress_ratio: Optional[int] = None,
+    ) -> torch.Tensor:
+        if start_positions is None:
+            if not isinstance(slidingwindow_kv_or_cache, torch.Tensor):
+                raise TypeError("csa_hca prefill requires dense slidingwindow_kv")
+            return self.csa_hca_prefill(
+                q,
+                slidingwindow_kv_or_cache,
+                attn_sink,
+                slidingwindow_topk_idxs,
+                softmax_scale,
+                compressed_kv=compressed_kv,
+                compressed_topk_idxs=compressed_topk_idxs,
+                split_offset=split_offset,
+                compress_ratio=compress_ratio,
+            )
+        if not isinstance(slidingwindow_kv_or_cache, KVCacheAccessor):
+            raise TypeError("csa_hca decode requires slidingwindow_cache accessor")
+        return self.csa_hca_decode(
+            q,
+            slidingwindow_kv_or_cache,
+            attn_sink,
+            slidingwindow_topk_idxs,
+            softmax_scale,
+            compressed_cache=compressed_cache,
+            compressed_topk_idxs=compressed_topk_idxs,
+            split_offset=split_offset,
+            start_positions=start_positions,
+            cache_slots=cache_slots,
+            cache_seq_ids=cache_seq_ids,
+            window_size=window_size,
+            compress_ratio=compress_ratio,
+        )
+
+    def csa_hca_prefill(
+        self,
+        q: torch.Tensor,
+        slidingwindow_kv: torch.Tensor,
+        attn_sink: torch.Tensor,
+        slidingwindow_topk_idxs: torch.Tensor,
+        softmax_scale: float,
+        *,
+        compressed_kv: Optional[torch.Tensor] = None,
+        compressed_topk_idxs: Optional[torch.Tensor] = None,
+        split_offset: Optional[int] = None,
+        compress_ratio: Optional[int] = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement DeepSeek-V4 MLA prefill"
+        )
+
+    def csa_hca_decode(
+        self,
+        q: torch.Tensor,
+        slidingwindow_cache: KVCacheAccessor,
+        attn_sink: torch.Tensor,
+        slidingwindow_topk_idxs: torch.Tensor,
+        softmax_scale: float,
+        *,
+        compressed_cache: Optional[KVCacheAccessor] = None,
+        compressed_topk_idxs: Optional[torch.Tensor] = None,
+        split_offset: Optional[int] = None,
+        start_positions: torch.Tensor,
+        cache_slots: Optional[torch.Tensor] = None,
+        cache_seq_ids: Optional[torch.Tensor] = None,
+        window_size: Optional[int] = None,
+        compress_ratio: Optional[int] = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement DeepSeek-V4 MLA decode"
+        )
+
     def prefill(
         self,
         q,

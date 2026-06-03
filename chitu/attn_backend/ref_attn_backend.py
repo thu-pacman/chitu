@@ -11,7 +11,7 @@ import torch
 
 from chitu.attn_backend.base import AttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
+from chitu.kv_cache import KVCacheAccessor, PagedKVCacheAccessor, DenseKVCacheAccessor
 
 
 # SPDX-SnippetBegin
@@ -26,7 +26,7 @@ class RefAttnBackend(AttnBackend):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
-    def sparse_attn(
+    def _csa_hca_dense_topk_attention(
         self,
         q: torch.Tensor,
         kv: torch.Tensor,
@@ -49,6 +49,216 @@ class RefAttnBackend(AttnBackend):
             topk_indices_batch=topk_idxs.long(),
         )
         return output.contiguous()
+
+    @override
+    def csa_hca_prefill(
+        self,
+        q: torch.Tensor,
+        slidingwindow_kv: torch.Tensor,
+        attn_sink: torch.Tensor,
+        slidingwindow_topk_idxs: torch.Tensor,
+        softmax_scale: float,
+        *,
+        compressed_kv: Optional[torch.Tensor] = None,
+        compressed_topk_idxs: Optional[torch.Tensor] = None,
+        split_offset: Optional[int] = None,
+        compress_ratio: Optional[int] = None,
+    ) -> torch.Tensor:
+        return self._csa_hca_ref_attention(
+            q,
+            slidingwindow_kv,
+            attn_sink,
+            slidingwindow_topk_idxs,
+            softmax_scale,
+            compressed_kv=compressed_kv,
+            compressed_topk_idxs=compressed_topk_idxs,
+            split_offset=split_offset,
+            compress_ratio=compress_ratio,
+        )
+
+    def _csa_hca_ref_attention(
+        self,
+        q: torch.Tensor,
+        slidingwindow_kv: torch.Tensor,
+        attn_sink: torch.Tensor,
+        slidingwindow_topk_idxs: torch.Tensor,
+        softmax_scale: float,
+        *,
+        compressed_kv: Optional[torch.Tensor] = None,
+        compressed_topk_idxs: Optional[torch.Tensor] = None,
+        split_offset: Optional[int] = None,
+        compress_ratio: Optional[int] = None,
+    ) -> torch.Tensor:
+        if compressed_topk_idxs is None or compressed_topk_idxs.size(-1) == 0:
+            return self._csa_hca_dense_topk_attention(
+                q,
+                slidingwindow_kv,
+                attn_sink,
+                slidingwindow_topk_idxs,
+                softmax_scale,
+            )
+        if compressed_kv is None or compressed_kv.size(1) == 0:
+            raise ValueError("compressed_topk_idxs requires non-empty compressed_kv")
+
+        if split_offset is None:
+            split_offset = slidingwindow_kv.size(1)
+        shifted_compressed_topk_idxs = torch.where(
+            compressed_topk_idxs < 0,
+            compressed_topk_idxs,
+            compressed_topk_idxs + split_offset,
+        )
+        kv = torch.cat([slidingwindow_kv, compressed_kv], dim=1)
+        topk_idxs = torch.cat(
+            [slidingwindow_topk_idxs, shifted_compressed_topk_idxs], dim=-1
+        )
+        return self._csa_hca_dense_topk_attention(
+            q, kv, attn_sink, topk_idxs, softmax_scale
+        )
+
+    @override
+    def csa_hca_decode(
+        self,
+        q: torch.Tensor,
+        slidingwindow_cache: KVCacheAccessor,
+        attn_sink: torch.Tensor,
+        slidingwindow_topk_idxs: torch.Tensor,
+        softmax_scale: float,
+        *,
+        compressed_cache: Optional[KVCacheAccessor] = None,
+        compressed_topk_idxs: Optional[torch.Tensor] = None,
+        split_offset: Optional[int] = None,
+        start_positions: torch.Tensor,
+        cache_slots: Optional[torch.Tensor] = None,
+        cache_seq_ids: Optional[torch.Tensor] = None,
+        window_size: Optional[int] = None,
+        compress_ratio: Optional[int] = None,
+    ) -> torch.Tensor:
+        if cache_slots is None:
+            raise ValueError("csa_hca_decode requires cache_slots")
+        if cache_seq_ids is None:
+            cache_seq_ids = cache_slots
+        if window_size is None:
+            window_size = slidingwindow_cache.kv["sliding_window"].size(1)
+        if split_offset is None:
+            split_offset = window_size
+
+        slidingwindow_lens = torch.minimum(
+            start_positions + 1,
+            torch.full_like(start_positions, window_size),
+        )
+        slidingwindow_kv = self._materialize_v4_cache(
+            slidingwindow_cache,
+            "sliding_window",
+            cache_slots,
+            cache_seq_ids,
+            slidingwindow_lens,
+            max_len=window_size,
+        )
+        if (
+            compressed_cache is not None
+            and compressed_topk_idxs is not None
+            and compressed_topk_idxs.size(-1) > 0
+        ):
+            if compress_ratio is None:
+                raise ValueError("compressed csa_hca_decode requires compress_ratio")
+            compressed_kv = self._materialize_v4_cache(
+                compressed_cache,
+                "compressed",
+                cache_slots,
+                cache_seq_ids,
+                (start_positions + 1) // compress_ratio,
+            )
+        else:
+            compressed_kv = None
+
+        return self._csa_hca_ref_attention(
+            q,
+            slidingwindow_kv,
+            attn_sink,
+            slidingwindow_topk_idxs,
+            softmax_scale,
+            compressed_kv=compressed_kv,
+            compressed_topk_idxs=compressed_topk_idxs,
+            split_offset=split_offset,
+            compress_ratio=compress_ratio,
+        )
+
+    def _read_v4_cache(
+        self,
+        cache_accessor: KVCacheAccessor,
+        cache_key: str,
+        cache_slots: torch.Tensor,
+        cache_seq_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(cache_accessor, DenseKVCacheAccessor):
+            kv_cache = cache_accessor.kv[cache_key]
+            positions = positions.to(device=kv_cache.device, dtype=torch.long)
+            cache_slots = cache_slots.to(device=kv_cache.device, dtype=torch.long)
+            if positions.ndim == 1:
+                return kv_cache[cache_slots, positions]
+            return kv_cache[cache_slots.unsqueeze(1), positions]
+        if isinstance(cache_accessor, PagedKVCacheAccessor):
+            return self._read_v4_paged_cache(
+                cache_accessor.kv[cache_key],
+                cache_accessor.block_table,
+                cache_seq_ids,
+                positions,
+            )
+        raise NotImplementedError(
+            f"Unsupported KV cache accessor {type(cache_accessor)}"
+        )
+
+    def _read_v4_paged_cache(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        positions = positions.to(device=kv_cache.device, dtype=torch.long)
+        seq_ids = seq_ids.to(device=kv_cache.device, dtype=torch.long)
+        if positions.ndim == 1:
+            positions = positions.unsqueeze(0).expand(seq_ids.numel(), -1)
+        if seq_ids.ndim == 1:
+            seq_ids = seq_ids.unsqueeze(1).expand_as(positions)
+        page_size = kv_cache.shape[1]
+        page_ids = block_table[seq_ids, positions // page_size]
+        return kv_cache[page_ids, positions % page_size]
+
+    def _materialize_v4_cache(
+        self,
+        cache_accessor: KVCacheAccessor,
+        cache_key: str,
+        cache_slots: torch.Tensor,
+        cache_seq_ids: torch.Tensor,
+        valid_lens: torch.Tensor,
+        *,
+        max_len: Optional[int] = None,
+    ) -> torch.Tensor:
+        kv_cache = cache_accessor.kv[cache_key]
+        if max_len is None:
+            max_len = int(valid_lens.max().item()) if valid_lens.numel() else 0
+        if max_len == 0:
+            return kv_cache.new_empty((cache_slots.numel(), 0, kv_cache.shape[-1]))
+        base_positions = torch.arange(
+            max_len, device=valid_lens.device, dtype=torch.long
+        )
+        positions = base_positions.unsqueeze(0).expand(cache_seq_ids.numel(), -1)
+        valid_mask = base_positions.unsqueeze(0) < valid_lens.unsqueeze(1)
+        safe_positions = torch.where(valid_mask, positions, torch.zeros_like(positions))
+        values = self._read_v4_cache(
+            cache_accessor,
+            cache_key,
+            cache_slots,
+            cache_seq_ids,
+            safe_positions,
+        )
+        return torch.where(
+            valid_mask.unsqueeze(-1),
+            values,
+            torch.zeros_like(values),
+        )
 
     def _construct_local_mask(
         self,
