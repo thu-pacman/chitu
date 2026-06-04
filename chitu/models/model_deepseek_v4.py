@@ -86,12 +86,60 @@ def _all_reduce_tp(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def _check_deepseek_v4_parallel_divisible(
+    value: int,
+    divisor: int,
+    value_name: str,
+    divisor_name: str,
+):
+    if value % divisor != 0:
+        raise ValueError(
+            f"DeepSeek-V4 requires {value_name} ({value}) to be divisible by "
+            f"{divisor_name} ({divisor}) for parallel inference."
+        )
+
+
+def _validate_deepseek_v4_parallel_config(
+    args,
+    *,
+    tp_size: Optional[int] = None,
+    etp_size: Optional[int] = None,
+):
+    if tp_size is None:
+        tp_size = get_tp_size()
+    if etp_size is None:
+        etp_size = get_etp_size()
+
+    if tp_size > 1:
+        _check_deepseek_v4_parallel_divisible(
+            int(args.vocab_size), tp_size, "vocab_size", "tp_size"
+        )
+        _check_deepseek_v4_parallel_divisible(
+            int(args.n_heads), tp_size, "n_heads", "tp_size"
+        )
+        _check_deepseek_v4_parallel_divisible(
+            int(args.o_groups), tp_size, "o_groups", "tp_size"
+        )
+        index_n_heads = getattr(args, "index_n_heads", None)
+        if index_n_heads is not None:
+            _check_deepseek_v4_parallel_divisible(
+                int(index_n_heads), tp_size, "index_n_heads", "tp_size"
+            )
+
+    if etp_size > 1:
+        _check_deepseek_v4_parallel_divisible(
+            int(args.moe_inter_dim), etp_size, "moe_inter_dim", "etp_size"
+        )
+
+
 class ParallelEmbeddingDeepSeekV4(nn.Module):
     def __init__(self, vocab_size: int, dim: int):
         super().__init__()
         self.vocab_size = vocab_size
         self.dim = dim
-        assert vocab_size % get_tp_size() == 0
+        _check_deepseek_v4_parallel_divisible(
+            vocab_size, get_tp_size(), "vocab_size", "tp_size"
+        )
         self.part_vocab_size = vocab_size // get_tp_size()
         self.vocab_start_idx = _tp_rank() * self.part_vocab_size
         self.vocab_end_idx = self.vocab_start_idx + self.part_vocab_size
@@ -785,6 +833,9 @@ class IndexerDeepSeekV4(nn.Module):
         compress_ratio: int = 4,
     ):
         super().__init__()
+        _check_deepseek_v4_parallel_divisible(
+            int(args.index_n_heads), get_tp_size(), "index_n_heads", "tp_size"
+        )
         self.n_heads = args.index_n_heads
         self.n_local_heads = args.index_n_heads // get_tp_size()
         self.head_dim = args.index_head_dim
@@ -1063,6 +1114,12 @@ class AttentionDeepSeekV4(Attention):
         attn_backend,
     ):
         super().__init__(layer_id, cache, attn_backend)
+        _check_deepseek_v4_parallel_divisible(
+            int(args.n_heads), get_tp_size(), "n_heads", "tp_size"
+        )
+        _check_deepseek_v4_parallel_divisible(
+            int(args.o_groups), get_tp_size(), "o_groups", "tp_size"
+        )
         self.dim = args.dim
         self.n_heads = args.n_heads
         self.n_local_heads = args.n_heads // get_tp_size()
@@ -1894,7 +1951,9 @@ def MoeExpertsDeepSeekV4(
             )
         )
 
-    assert args.moe_inter_dim % get_etp_size() == 0
+    _check_deepseek_v4_parallel_divisible(
+        int(args.moe_inter_dim), get_etp_size(), "moe_inter_dim", "etp_size"
+    )
     experts = base_moe_experts_class(
         dim=args.dim,
         moe_inter_dim=args.moe_inter_dim // get_etp_size(),
@@ -2140,7 +2199,9 @@ class TransformerBlockDeepSeekV4(TransformerBlock):
 class ParallelHeadDeepSeekV4(nn.Module):
     def __init__(self, vocab_size: int, dim: int):
         super().__init__()
-        assert vocab_size % get_tp_size() == 0
+        _check_deepseek_v4_parallel_divisible(
+            vocab_size, get_tp_size(), "vocab_size", "tp_size"
+        )
         self.part_vocab_size = vocab_size // get_tp_size()
         self.weight = nn.Parameter(
             torch.empty(self.part_vocab_size, dim, dtype=torch.float32),
@@ -2180,6 +2241,7 @@ class TransformerDeepSeekV4(Transformer):
             params.max_seq_len = max_position_embeddings
         else:
             params.max_seq_len = min(int(params.max_seq_len), max_position_embeddings)
+        _validate_deepseek_v4_parallel_config(params)
         self._max_position_embeddings = max_position_embeddings
         self.runtime_context = DeepSeekV4RuntimeContext()
         super().__init__(
