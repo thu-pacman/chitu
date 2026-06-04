@@ -109,6 +109,168 @@ def quant_pertoken_kvcache_dsa(
 
 
 @triton.jit
+def _append_paged_kvcache_dsv4_flashmla_kernel(
+    k_ptr,  # (N, 512) bf16
+    k_cache_ptr,  # (num_blocks, block_size, 584) uint8, flattened by block
+    block_table_ptr,
+    positions_ptr,
+    seq_ids_ptr,
+    D: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_TABLE_STRIDE: tl.constexpr,
+    KV_BLOCK_STRIDE: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    TOKEN_DATA_BYTES: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    SCALE_DIM: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    token_id = tl.program_id(axis=0)
+    position = tl.load(positions_ptr + token_id).to(tl.int64)
+    seq_id = tl.load(seq_ids_ptr + token_id).to(tl.int64)
+    block_idx = tl.load(
+        block_table_ptr + seq_id * BLOCK_TABLE_STRIDE + position // PAGE_SIZE
+    ).to(tl.int64)
+    pos_in_block = position % PAGE_SIZE
+
+    block_base = k_cache_ptr + block_idx * KV_BLOCK_STRIDE
+    token_data_base = block_base + pos_in_block * TOKEN_DATA_BYTES
+    scale_base = block_base + PAGE_SIZE * TOKEN_DATA_BYTES + pos_in_block * SCALE_DIM
+
+    offs_d = tl.arange(0, D)
+    kv = tl.load(k_ptr + token_id * D + offs_d).to(tl.float32)
+
+    n_quant_blocks: tl.constexpr = D // QUANT_BLOCK
+    n_nope_blocks: tl.constexpr = NOPE_DIM // QUANT_BLOCK
+    quant_2d = tl.reshape(
+        kv.to(tl.bfloat16).to(tl.float32), (n_quant_blocks, QUANT_BLOCK)
+    )
+    abs_2d = tl.abs(quant_2d)
+    block_absmax = tl.max(abs_2d, axis=1)
+    block_absmax = tl.maximum(block_absmax, 1e-4)
+
+    raw_scales = block_absmax / FP8_MAX
+    exponents = tl.ceil(tl.log2(raw_scales))
+    inv_scales = tl.exp2(-exponents)
+    inv_scales_col = tl.reshape(inv_scales, (n_quant_blocks, 1))
+    x_scaled = quant_2d * inv_scales_col
+    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
+    x_fp8 = x_clamped.to(tl.float8e4nv)
+    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    x_uint8_flat = tl.reshape(x_uint8, (D,))
+
+    tl.store(token_data_base + offs_d, x_uint8_flat, mask=offs_d < NOPE_DIM)
+
+    bf16_ptr = (token_data_base + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+    rope_local = offs_d - NOPE_DIM
+    tl.store(
+        bf16_ptr + tl.maximum(rope_local, 0),
+        kv.to(tl.bfloat16),
+        mask=(offs_d >= NOPE_DIM) & (offs_d < NOPE_DIM + ROPE_DIM),
+    )
+
+    scale_idx = tl.arange(0, SCALE_DIM)
+    encoded = exponents + 127.0
+    encoded = tl.maximum(tl.minimum(encoded, 255.0), 0.0)
+    tl.store(
+        scale_base + scale_idx,
+        encoded.to(tl.uint8),
+        mask=scale_idx < n_nope_blocks,
+    )
+    tl.store(scale_base + n_nope_blocks, tl.zeros((), dtype=tl.uint8))
+
+
+def _prepare_dsv4_flashmla_append_inputs(
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    seq_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if values.dtype != torch.bfloat16:
+        values = values.to(torch.bfloat16)
+    assert values.shape[-1] == 512
+
+    token_shape = values.shape[:-1]
+    positions = positions.to(device=values.device, dtype=torch.long)
+    seq_ids = seq_ids.to(device=values.device, dtype=torch.long)
+
+    if positions.shape != token_shape:
+        if (
+            positions.ndim == 1
+            and len(token_shape) == 2
+            and positions.numel() == token_shape[1]
+        ):
+            positions = positions.unsqueeze(0).expand(token_shape)
+        else:
+            positions = positions.expand(token_shape)
+    if seq_ids.shape != token_shape:
+        if (
+            seq_ids.ndim == 1
+            and len(token_shape) == 2
+            and seq_ids.numel() == token_shape[0]
+        ):
+            seq_ids = seq_ids.unsqueeze(1).expand(token_shape)
+        else:
+            seq_ids = seq_ids.expand(token_shape)
+
+    return (
+        values.contiguous().view(-1, values.shape[-1]),
+        positions.contiguous().view(-1),
+        seq_ids.contiguous().view(-1),
+    )
+
+
+def append_to_paged_kv_cache_flashmla_dsv4(
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    seq_ids: torch.Tensor,
+    *,
+    window_size: int | None = None,
+) -> None:
+    """Append bf16 DSV4 KV into FlashMLA's paged 584B physical layout."""
+    if kv_cache.dtype != torch.uint8 or kv_cache.shape[-1] != 584:
+        raise ValueError(
+            "DeepSeek-V4 FlashMLA KV cache must be uint8 with last dim 584"
+        )
+    if kv_cache.dim() == 4:
+        assert kv_cache.shape[-2] == 1
+        kv_cache = kv_cache.squeeze(-2)
+    assert kv_cache.dim() == 3
+
+    if window_size is not None:
+        positions = positions.to(device=values.device, dtype=torch.long) % int(
+            window_size
+        )
+
+    values, positions, seq_ids = _prepare_dsv4_flashmla_append_inputs(
+        values, positions, seq_ids
+    )
+    if values.numel() == 0:
+        return
+
+    page_size = kv_cache.shape[1]
+    _append_paged_kvcache_dsv4_flashmla_kernel[(values.shape[0],)](
+        values,
+        kv_cache,
+        block_table,
+        positions,
+        seq_ids,
+        D=values.shape[-1],
+        PAGE_SIZE=page_size,
+        BLOCK_TABLE_STRIDE=block_table.stride(0),
+        KV_BLOCK_STRIDE=kv_cache.stride(0),
+        NOPE_DIM=448,
+        ROPE_DIM=64,
+        TOKEN_DATA_BYTES=576,
+        QUANT_BLOCK=64,
+        SCALE_DIM=8,
+        FP8_MAX=448.0,
+    )
+
+
+@triton.jit
 def _quant_pertoken_kvcache_dsa_kernel_with_scales(
     k_ptr,  # (N, D), D=d_v+d_pe=512+64=576 bf16
     k_quant_ptr,  # (N, 656), 656=512 (fp8) + 16 (4*fp32 scales) + 128 (6*bf16 pe)
@@ -252,7 +414,7 @@ def _convert_req_index_to_global_paged_index_kernel(
     ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
     tok = tl.load(ti_ptr)  # int32
 
-    # Only token == -1 should propagate as -1
+    # Invalid local positions become -1 in the output.
     upper = tl.load(upper_idx_bound_per_token + token_id)
     is_invalid_tok = (tok < 0) | (tok >= upper)
 
@@ -262,7 +424,7 @@ def _convert_req_index_to_global_paged_index_kernel(
 
     # Guard block_table access
     max_num_blocks_per_req = tl.cdiv(upper, BLOCK_SIZE)
-    valid_block = block_id < max_num_blocks_per_req
+    valid_block = (~is_invalid_tok) & (block_id < max_num_blocks_per_req)
     bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
     base = tl.load(bt_ptr, mask=valid_block, other=0)
 
@@ -291,9 +453,9 @@ def convert_req_index_to_global_paged_index_triton(
             token_indices[token_id, indice_id] // BLOCK_SIZE] * BLOCK_SIZE
         + token_indices[token_id, indice_id] % BLOCK_SIZE
 
-    Only when token_indices[token_id, indice_id] == -1 do we output -1.
-    For safety, we also output -1 if the derived block_id would be
-        out-of-bounds.
+    Outputs -1 when token_indices[token_id, indice_id] is negative or exceeds
+    upper_idx_bound_per_token[token_id]. For safety, we also output -1 if the
+    derived block_id would be out-of-bounds.
     """
     assert req_id.dtype == torch.int32
     assert block_table.dtype == torch.int32

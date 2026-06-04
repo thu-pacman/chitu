@@ -64,7 +64,7 @@ class ServeConfigRules(Callback):
                     f"n_kv_heads ({config.models.n_kv_heads})"
                 )
         elif attn_type == "flash_mla":
-            if model_type not in ["deepseek-v3", "kimi-k2-5"]:
+            if model_type not in ["deepseek-v3", "deepseek-v4", "kimi-k2-5"]:
                 self._exit_with_error(
                     f"model {model_name} is not compatible with flash_mla"
                 )

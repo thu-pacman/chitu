@@ -28,8 +28,34 @@ from chitu.models.registry import ModelType
 from chitu.utils import ceil_div
 
 
+_DEEPSEEK_V4_FLASHMLA_TOKEN_BYTES = 584
+
+
+def _is_deepseek_v4_flash_mla_backend(attn_backend_type) -> bool:
+    return getattr(attn_backend_type, "__name__", "") == "FlashMLABackend"
+
+
+def _uses_deepseek_v4_flashmla_packed_cache(args, attn_backend_type) -> bool:
+    return (
+        _is_deepseek_v4_flash_mla_backend(attn_backend_type)
+        and getattr(args.infer, "cache_type", None) == "paged"
+    )
+
+
 @register_kv_cache_spec(model_types=[ModelType.DEEPSEEK_V4], priority=2)
 def deepseek_v4_pre_compress_cache_spec(args, attn_backend_type) -> KVCacheSpec:
+    if _uses_deepseek_v4_flashmla_packed_cache(args, attn_backend_type):
+        return KVCacheSpec(
+            kvargs={
+                "shape_per_token_dict": {
+                    "sliding_window": (_DEEPSEEK_V4_FLASHMLA_TOKEN_BYTES,),
+                },
+                "dtype_dict": {
+                    "sliding_window": torch.uint8,
+                },
+            },
+            kv_keys=["sliding_window"],
+        )
     return KVCacheSpec(
         kvargs={
             "shape_per_token_dict": {
@@ -47,11 +73,20 @@ def deepseek_v4_pre_compress_cache_spec(args, attn_backend_type) -> KVCacheSpec:
     model_types=[ModelType.DEEPSEEK_V4], priority=2, cache_name="compressed"
 )
 def deepseek_v4_compressed_cache_spec(args, attn_backend_type) -> KVCacheSpec:
+    use_flashmla_packed = _uses_deepseek_v4_flashmla_packed_cache(
+        args, attn_backend_type
+    )
     shape_per_token_dict = {
-        "compressed": (int(args.models.head_dim),),
+        "compressed": (
+            (
+                _DEEPSEEK_V4_FLASHMLA_TOKEN_BYTES
+                if use_flashmla_packed
+                else int(args.models.head_dim)
+            ),
+        ),
     }
     dtype_dict = {
-        "compressed": torch.bfloat16,
+        "compressed": torch.uint8 if use_flashmla_packed else torch.bfloat16,
     }
     kv_keys = ["compressed"]
     index_head_dim = getattr(args.models, "index_head_dim", None)
@@ -137,17 +172,30 @@ def _deepseek_v4_initial_num_blocks(args, block_size: int, cap: int) -> int:
 
 @register_cache_manager_builder(model_types=[ModelType.DEEPSEEK_V4], priority=4)
 def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
+    if _is_deepseek_v4_flash_mla_backend(attn_backend_type) and (
+        args.infer.cache_type != "paged"
+    ):
+        raise NotImplementedError(
+            "DeepSeek-V4 FlashMLA backend requires paged KV cache"
+        )
+
     full_layer_id_map = build_layer_id_map(
         args,
         layer_filter_fn=_layer_filter_for_compress_ratios(args, compressed=False),
     )
     device = _device_from_args(args)
     spec = get_kv_cache_spec(args, attn_backend_type, cache_name="main")
-    kvargs = apply_kv_cache_quantization_rules(
-        spec.kvargs,
-        kv_keys=spec.kv_keys,
-        quant_config=getattr(args.models, "quant_config", None),
+    use_flashmla_packed = _uses_deepseek_v4_flashmla_packed_cache(
+        args, attn_backend_type
     )
+    if use_flashmla_packed:
+        kvargs = spec.kvargs
+    else:
+        kvargs = apply_kv_cache_quantization_rules(
+            spec.kvargs,
+            kv_keys=spec.kv_keys,
+            quant_config=getattr(args.models, "quant_config", None),
+        )
     num_hot_req = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
 
     if args.infer.cache_type == "skew":
@@ -156,11 +204,14 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
         compressed_spec = get_kv_cache_spec(
             args, attn_backend_type, cache_name="compressed"
         )
-        compressed_kvargs = apply_kv_cache_quantization_rules(
-            compressed_spec.kvargs,
-            kv_keys=compressed_spec.kv_keys,
-            quant_config=getattr(args.models, "quant_config", None),
-        )
+        if use_flashmla_packed:
+            compressed_kvargs = compressed_spec.kvargs
+        else:
+            compressed_kvargs = apply_kv_cache_quantization_rules(
+                compressed_spec.kvargs,
+                kv_keys=compressed_spec.kv_keys,
+                quant_config=getattr(args.models, "quant_config", None),
+            )
         head_dim = int(args.models.head_dim)
         window_size = int(args.models.window_size)
         cache_dict = {}
@@ -247,11 +298,14 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
             if compressed_spec.block_size is not None
             else default_paged_block_size_policy(args)
         )
-        compressed_kvargs = apply_kv_cache_quantization_rules(
-            compressed_spec.kvargs,
-            kv_keys=compressed_spec.kv_keys,
-            quant_config=getattr(args.models, "quant_config", None),
-        )
+        if use_flashmla_packed:
+            compressed_kvargs = compressed_spec.kvargs
+        else:
+            compressed_kvargs = apply_kv_cache_quantization_rules(
+                compressed_spec.kvargs,
+                kv_keys=compressed_spec.kv_keys,
+                quant_config=getattr(args.models, "quant_config", None),
+            )
         head_dim = int(args.models.head_dim)
         window_size = int(args.models.window_size)
         # Sliding-window KV is a fixed one-page-per-request ring buffer. The

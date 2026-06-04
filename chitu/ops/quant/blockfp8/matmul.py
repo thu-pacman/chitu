@@ -198,9 +198,13 @@ def soft_fp8_blockfp8_gemm_marlin(
     scale: torch.Tensor,
 ) -> torch.Tensor:
     assert has_marlin == True, "Current Device doesn't support marlin gemm"
+    x_shape = x.shape
+    x = x.reshape(-1, x_shape[-1]).contiguous()
     w = weight.layout_tensor
     s = scale.layout_tensor
     n, k = weight.plain_shape
+    if x.shape[1] != k:
+        raise ValueError(f"Input feature size {x.shape[1]} does not match weight K {k}")
     workspace = get_marlin_workspace(x.device)
     # torch.distributed.breakpoint()
     output = gptq_marlin_gemm(
@@ -224,4 +228,5 @@ def soft_fp8_blockfp8_gemm_marlin(
         False,
         True,
     )
-    return output[:, : -(n % 128)] if n % 128 != 0 else output
+    output = output[:, : -(n % 128)] if n % 128 != 0 else output
+    return output.reshape(*x_shape[:-1], output.shape[-1])

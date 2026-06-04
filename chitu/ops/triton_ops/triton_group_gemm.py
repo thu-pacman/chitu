@@ -661,7 +661,7 @@ def fused_moe_kernel_int8(
         b_scale_ptrs = (
             b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
         )
-        a_scale = tl.load(a_scale_ptrs)
+        a_scale = tl.load(a_scale_ptrs, mask=token_mask, other=0.0)
         b_scale = tl.load(b_scale_ptrs)
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)

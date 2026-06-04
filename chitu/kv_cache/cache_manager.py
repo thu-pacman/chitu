@@ -96,7 +96,20 @@ class PagedKVCacheManager(KVCacheManagerBase):
     def num_blocks_for_seq_len(self, seq_len: int) -> int:
         return ceil_div(int(seq_len), self.block_size)
 
-    def _make_task_identities(self, task: "Task", *, min_blocks: Optional[int] = None):
+    def _make_task_identities(
+        self,
+        task: "Task",
+        *,
+        required_identity_blocks: Optional[int] = None,
+    ):
+        """Build logical KV block identities for a task.
+
+        The default manager derives identities from ``task.prefix_tokens``. Some
+        logical managers, such as DeepSeek-V4 sliding/compressed caches, may need
+        placeholder identities even when the task token list is shorter than the
+        number of metadata blocks being prepared; those managers honor
+        ``required_identity_blocks`` in their override.
+        """
         return self.identity_builder.make_identity_chain(
             task, canonical_prefix_hashes=self.enable_prefix_caching
         )
@@ -146,7 +159,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
         # 二分查找第一个cache_idx为None的block序号（LRU逐出策略确保cached blocks连续）
         num_needed_blocks = self.num_blocks_for_seq_len(task.prefix_tokens_len)
-        task_identities = self._make_task_identities(task, min_blocks=num_needed_blocks)
+        task_identities = self._make_task_identities(
+            task, required_identity_blocks=num_needed_blocks
+        )
         left = num_computed_blocks
         right = min(num_needed_blocks, len(task_identities))
         while left < right:
@@ -178,7 +193,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
             return 0
 
         # 二分查找第一个idle block序号（同一任务前缀中的active/idle块连续）
-        task_identities = self._make_task_identities(task, min_blocks=num_cached_blocks)
+        task_identities = self._make_task_identities(
+            task, required_identity_blocks=num_cached_blocks
+        )
 
         left = num_computed_blocks
         right = num_cached_blocks
@@ -266,7 +283,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         num_target_blocks = self.num_blocks_for_seq_len(target_seq_len)
         num_identity_blocks = max(task_num_cached_blocks, num_target_blocks)
         task_identities = self._make_task_identities(
-            task, min_blocks=num_identity_blocks
+            task, required_identity_blocks=num_identity_blocks
         )
         assert num_identity_blocks <= len(task_identities), (
             f"{num_identity_blocks} vs {len(task_identities)}, "
@@ -405,15 +422,24 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
 
 class _DeepSeekV4LogicalBlockMetadataMixin:
-    def _make_task_identities(self, task: "Task", *, min_blocks: Optional[int] = None):
+    def _make_task_identities(
+        self,
+        task: "Task",
+        *,
+        required_identity_blocks: Optional[int] = None,
+    ):
         if self.enable_prefix_caching:
-            return super()._make_task_identities(task, min_blocks=min_blocks)
-        if min_blocks is None:
-            min_blocks = self.num_blocks_for_seq_len(task.prefix_tokens_len)
+            return super()._make_task_identities(
+                task, required_identity_blocks=required_identity_blocks
+            )
+        if required_identity_blocks is None:
+            required_identity_blocks = self.num_blocks_for_seq_len(
+                task.prefix_tokens_len
+            )
         placeholder = self.identity_builder.make_identity(
             [], canonical_prefix_hashes=False
         )
-        return [placeholder for _ in range(max(0, int(min_blocks)))]
+        return [placeholder for _ in range(max(0, int(required_identity_blocks)))]
 
 
 class DeepSeekV4SlidingKVCacheManager(
