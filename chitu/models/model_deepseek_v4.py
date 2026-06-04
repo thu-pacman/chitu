@@ -2519,7 +2519,7 @@ class TransformerDeepSeekV4(Transformer):
         self.runtime_context.input_ids = None
         return BatchedFreqsCis(self.freqs_cis_real, self.freqs_cis_imag)
 
-    def prepare_decoding_attn(self):
+    def prepare_decoding_attn(self, is_mtp=False):
         return None
 
     def get_pipeline_payload_shape(self, num_tokens: int) -> list[int]:

@@ -269,10 +269,7 @@ class AttentionHFLlama(Attention):
         else:
             descales = {}
 
-        if is_mtp:
-            seq_len_delta = self.cache.mtp_seq_len_delta
-        else:
-            seq_len_delta = self.cache.seq_len_delta
+        seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
         output = self.attn_backend(
             xq,
             self.cache.get_accessor(self.layer_id, is_mtp),

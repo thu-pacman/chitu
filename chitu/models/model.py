@@ -527,7 +527,7 @@ class Transformer(nn.Module):
                     and self.mtp_tie_word_embeddings
                     and i == self.params.n_layers
                 ):
-                    for prefix in self._get_pre_layer_mtp_prefixes():
+                    for prefix in self._get_pre_layer_prefixes():
                         if key.startswith(prefix):
                             partial_checkpoint[key] = checkpoint[key]
 
@@ -1325,7 +1325,7 @@ class Transformer(nn.Module):
                 cache.prepare_mtp_cache_decode(i)
                 if isinstance(cache, PagedKVCache):
                     cache.update_page_offs()
-            self.prepare_decoding_attn_mtp()
+            self.prepare_decoding_attn(is_mtp=True)
             logits = func_mtp(key_mtp, tokens, *extra_inputs_mtp)
             draft_logits.append(logits)
             tokens = torch.argmax(logits, dim=-1)
@@ -1516,16 +1516,9 @@ class Transformer(nn.Module):
             assert hiddens is None
             return self.prefill_no_pipeline(tokens, output_token_offsets, **args)
 
-    def prepare_decoding_attn(self):
+    def prepare_decoding_attn(self, is_mtp=False):
         self.attn_backend.prepare_metadata_for_decode(
-            self.cache_dict["main"].seq_len_delta,
-            self.cache_dict["main"].get_gpu_block_table(),
-            self.cache_dict["main"].block_size,
-        )
-
-    def prepare_decoding_attn_mtp(self):
-        self.attn_backend.prepare_metadata_for_decode(
-            self.cache_dict["main"].mtp_seq_len_delta,
+            self.cache_dict["main"].get_seq_len_delta(is_mtp),
             self.cache_dict["main"].get_gpu_block_table(),
             self.cache_dict["main"].block_size,
         )
@@ -1670,7 +1663,9 @@ class Transformer(nn.Module):
                     args_max_nelem=(tokens_max_nelem, *extra_inputs_mtp_max_nelem),
                     kwargs_max_nelem={},
                     output_max_nelem_callback=output_max_nelem_callback,
-                    before_capture_callback=lambda: self.prepare_decoding_attn_mtp(),
+                    before_capture_callback=lambda: self.prepare_decoding_attn(
+                        is_mtp=True
+                    ),
                     before_replay_callback=before_replay_callback,
                     enable=self.use_cuda_graph,
                 )
