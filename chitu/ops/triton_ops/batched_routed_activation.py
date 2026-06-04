@@ -370,7 +370,6 @@ def ep_scatter(
     output_index: torch.Tensor,
 ):
     BLOCK_E = 128  # token num of per expert is aligned to 128
-    BLOCK_D = 128  # block size of quantization
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
     hidden_size = recv_x.shape[1]
@@ -378,9 +377,12 @@ def ep_scatter(
 
     if recv_x_scale is not None:
         assert output_tensor_scale is not None
+        assert recv_x_scale.dim() == 2
         has_scale = True
+        scale_hidden_size = recv_x_scale.shape[1]
     else:
         has_scale = False
+        scale_hidden_size = 1
 
     # One threadblock for each expert to fill their own parts of `m_indices`.
     # An additional threadblock to fill -1 to invalid blocks.
@@ -424,8 +426,8 @@ def ep_scatter(
         num_warps=num_warps,
         HIDDEN_SIZE=hidden_size,
         HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
-        SCALE_HIDDEN_SIZE=hidden_size // BLOCK_D,
-        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size // BLOCK_D),
+        SCALE_HIDDEN_SIZE=scale_hidden_size,
+        SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
         HAS_SCALE=has_scale,
         USE_I64_OFFSET=use_i64,
     )
@@ -434,7 +436,7 @@ def ep_scatter(
 # SPDX-SnippetEnd
 
 
-def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton(
+def batched_routed_activation_indexed_to_expert_block_permuted_with_scale_triton(
     activation: torch.Tensor,
     activation_scale: torch.Tensor,
     token_to_expert_indices: torch.Tensor,
@@ -524,7 +526,7 @@ def batched_routed_activation_indexed_to_expert_block_permuted_triton(
     n_tokens_per_expert_padded: torch.Tensor,
     n_tokens_padded: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # See blockfp8 variant above for the `n_tokens_padded` contract.
+    # See the scaled variant above for the `n_tokens_padded` contract.
     if n_tokens_padded is None:
         n_tokens_padded = _conservative_n_tokens_padded_upper_bound(
             token_to_expert_indices, num_experts=num_experts, block_size=block_size
@@ -739,7 +741,7 @@ def batched_routed_activation_indexed_to_per_expert_dense_triton(
     return activation_per_expert, n_tokens_per_expert, token_pos_in_expert
 
 
-def batched_routed_activation_indexed_to_per_expert_dense_blockfp8_triton(
+def batched_routed_activation_indexed_to_per_expert_dense_with_scale_triton(
     activation: torch.Tensor,
     activation_scale: torch.Tensor,
     token_to_expert_indices: torch.Tensor,

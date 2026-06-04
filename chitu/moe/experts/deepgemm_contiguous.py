@@ -10,10 +10,10 @@ from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     ExpertBlockPermutedBatchedRoutedActivationNormal,
     IndexedBatchedRoutedActivation,
-    IndexedBatchedRoutedActivationBlockfp8,
+    IndexedBatchedRoutedActivationWithScale,
     IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
-    IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
-    ExpertBlockPermutedBatchedRoutedActivationBlockfp8,
+    IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
+    ExpertBlockPermutedBatchedRoutedActivationWithScale,
 )
 from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
@@ -72,10 +72,11 @@ def _(
             round_scale_to_pow2=round_scale_to_pow2,
         )
         return deepgemm_contiguous_fused_expert(
-            IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
+            IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt(
                 activation=hidden_states_fp8,
                 activation_scale=scale,
                 token_to_expert_indices=hidden_states.token_to_expert_indices,
+                quant_method="blockfp8",
                 n_tokens_per_expert_padded=hidden_states.n_tokens_per_expert_padded,
                 pad_block_size=hidden_states.pad_block_size,
                 n_tokens_padded=hidden_states.n_tokens_padded,
@@ -184,7 +185,7 @@ def _(
 
 @deepgemm_contiguous_fused_expert.register
 def _(
-    hidden_states: IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
+    hidden_states: IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
@@ -202,7 +203,7 @@ def _(
         experts_start_idx, experts_start_idx + w1.shape[0]
     )
     temp_hidden_states = (
-        ExpertBlockPermutedBatchedRoutedActivationBlockfp8.convert_from(
+        ExpertBlockPermutedBatchedRoutedActivationWithScale.convert_from(
             hidden_states, block_size=128, num_experts=w1.shape[0]
         )
     )
@@ -223,7 +224,7 @@ def _(
 
 @deepgemm_contiguous_fused_expert.register
 def _(
-    hidden_states: ExpertBlockPermutedBatchedRoutedActivationBlockfp8,
+    hidden_states: ExpertBlockPermutedBatchedRoutedActivationWithScale,
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
@@ -346,7 +347,7 @@ def _(
     )
 
     if w1.dtype == torch.float8_e4m3fn:
-        if isinstance(hidden_states, IndexedBatchedRoutedActivationBlockfp8):
+        if isinstance(hidden_states, IndexedBatchedRoutedActivationWithScale):
             hidden_states_fp8 = hidden_states.activation
             scale = hidden_states.activation_scale
         else:
@@ -355,15 +356,16 @@ def _(
                 block_size=quant_block_size,
                 round_scale_to_pow2=round_scale_to_pow2,
             )
-        hidden_states = IndexedBatchedRoutedActivationBlockfp8(
+        hidden_states = IndexedBatchedRoutedActivationWithScale(
             activation=hidden_states_fp8,
             activation_scale=scale,
             token_to_expert_indices=hidden_states.token_to_expert_indices,
+            quant_method="blockfp8",
             expected_n_tokens_per_expert=hidden_states.expected_n_tokens_per_expert,
             expert_ids_are_local=hidden_states.expert_ids_are_local,
         )
         hidden_states = (
-            IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt.convert_from(
+            IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt.convert_from(
                 hidden_states, pad_block_size=pad_block_size, n_experts=n_experts
             )
         )

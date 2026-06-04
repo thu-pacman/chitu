@@ -19,8 +19,8 @@ from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
     IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
-    IndexedBatchedRoutedActivationBlockfp8,
-    IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
+    IndexedBatchedRoutedActivationWithScale,
+    IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
 )
 
 # replace the buffer setting with DeepEP to concurrently enbale ll mode and normal mode, need more test to verify.
@@ -124,10 +124,11 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                 x.activation, block_size=128, round_scale_to_pow2=round_scale_to_pow2
             )
             return self.enter_moe(
-                IndexedBatchedRoutedActivationBlockfp8(
+                IndexedBatchedRoutedActivationWithScale(
                     activation=hidden_states_fp8,
                     token_to_expert_indices=x.token_to_expert_indices,
                     activation_scale=scale,
+                    quant_method="blockfp8",
                     expected_n_tokens_per_expert=x.expected_n_tokens_per_expert,
                     expert_ids_are_local=True,
                 ),
@@ -180,14 +181,14 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
     @enter_moe.register
     def _(
         self,
-        x: IndexedBatchedRoutedActivationBlockfp8,
+        x: IndexedBatchedRoutedActivationWithScale,
         topk_weights: torch.Tensor,
         *,
         may_fuse_quant: Optional[str] = None,
         may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
     ) -> tuple[
-        IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
+        IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
         Optional[torch.Tensor],
     ]:
         dp_local_bs = topk_weights.shape[0]
@@ -207,10 +208,11 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         self.dispatch_ctx = (handle, recv_topk_idx, recv_topk_weights, dp_local_bs)
         n_tokens_padded = sum(num_recv_tokens_per_expert_list)
         return (
-            IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
+            IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt(
                 activation=recv_activation,
                 activation_scale=recv_activation_scale,
                 token_to_expert_indices=recv_topk_idx.to(torch.int32),
+                quant_method=x.quant_method,
                 n_tokens_per_expert_padded=torch.tensor(
                     num_recv_tokens_per_expert_list,
                     dtype=torch.int32,
