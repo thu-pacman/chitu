@@ -49,7 +49,7 @@ def get_quant_from_checkpoint_prefix(checkpoint_prefix: str, rules={}) -> Option
                     layer_id = int(match.group(1))
                     if layer_id not in layers:
                         continue
-            return rule["type"]
+            return rule.get("type")
     return None
 
 

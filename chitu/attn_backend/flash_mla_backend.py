@@ -666,6 +666,15 @@ class FlashMLABackend(TritonAttnBackend):
 
         metadata_decode, _ = flash_mla.get_mla_metadata()
 
+        bsz, q_len, local_h_q, head_dim = q.shape
+        q = self.pad_h_q(q.flatten(0, 1), bsz * q_len, local_h_q).view(
+            bsz, q_len, -1, head_dim
+        )
+        if attn_sink.numel() != q.shape[-2]:
+            padded_attn_sink = attn_sink.new_full((q.shape[-2],), float("-inf"))
+            padded_attn_sink[:local_h_q] = attn_sink
+            attn_sink = padded_attn_sink
+
         output, _ = flash_mla.flash_mla_with_kvcache(
             q=q,
             k_cache=slidingwindow_k_cache,
@@ -682,7 +691,7 @@ class FlashMLABackend(TritonAttnBackend):
             extra_indices_in_kvcache=compressed_indices,
             extra_topk_length=compressed_topk_length,
         )
-        return output.contiguous()
+        return output[:, :, :local_h_q, :].contiguous()
 
     @override
     def mla_prefill_ragged_qkvo(
