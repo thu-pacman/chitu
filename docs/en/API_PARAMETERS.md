@@ -36,6 +36,8 @@ POST /v1/chat/completions
 | `ignore_eos` | `boolean` | `null` | vLLM-compatible flag. Inverse of `stop_with_eos`. Cannot conflict with `stop_with_eos`. |
 | `min_batch_size` | `integer` | `1` | Minimum batch size for processing. |
 
+For adapting `tools`, `tool_choice`, and constrained decoding to a new model, see the [Tool Calling Adaptation Guide](./TOOL_CALL_ADAPTATION.md).
+
 ### Message Object
 
 | Field | Type | Default | Description |
@@ -92,6 +94,8 @@ Minimal subset of the OpenAI Responses API. This endpoint is intended to work wi
 | `tool_choice` | `string \| object` | `"auto"` | Supports `"auto"`, `"none"`, `"required"`, or `{ "type": "function", "name": "..." }`. |
 | `parallel_tool_calls` | `boolean` | `true` | Whether the model can make multiple tool calls in parallel. |
 | `metadata` | `object` | `{}` | Arbitrary metadata echoed back in the response. |
+
+Responses tool definitions are normalized into Chitu's internal function tool format. For new model adaptation, see the [Tool Calling Adaptation Guide](./TOOL_CALL_ADAPTATION.md).
 
 #### Supported Input Content Blocks
 
@@ -155,6 +159,8 @@ Note: In DP mode, Anthropic `tools` / `tool_choice` requests are currently rejec
 | `type` | `string` | **required** | One of `"auto"`, `"any"`, `"tool"`, `"none"`. `"any"` maps to OpenAI's `"required"`. |
 | `name` | `string` | `null` | Tool name (required when `type="tool"`). |
 | `disable_parallel_tool_use` | `boolean` | `false` | Whether to disable parallel tool execution. |
+
+Anthropic tool definitions are converted into Chitu's internal function tool format. For new model adaptation, see the [Tool Calling Adaptation Guide](./TOOL_CALL_ADAPTATION.md).
 
 ### Completions Endpoint (Legacy)
 
