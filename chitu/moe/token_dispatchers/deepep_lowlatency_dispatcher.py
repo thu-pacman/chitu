@@ -22,7 +22,7 @@ from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
     PerExpertDenseBatchedRoutedActivationMinimal,
-    PerExpertDenseBatchedRoutedActivationBlockfp8Minimal,
+    PerExpertDenseBatchedRoutedActivationWithScaleMinimal,
 )
 from chitu.moe.load_balancer import get_moe_load_planner
 from chitu.global_vars import get_global_args
@@ -260,9 +260,10 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         else:
             recv_activation, recv_activation_scale = recv_activation
             return (
-                PerExpertDenseBatchedRoutedActivationBlockfp8Minimal(
+                PerExpertDenseBatchedRoutedActivationWithScaleMinimal(
                     activation_per_expert=recv_activation,
                     activation_scale_per_expert=recv_activation_scale,
+                    quant_method="blockfp8",
                     # NOTE on expected_n_tokens_per_expert: Although the estimation here is based
                     # on information per DP rank and not global, we have to use it because our
                     # CUDA graph is also captured per DP rank. It should be close enough. But a

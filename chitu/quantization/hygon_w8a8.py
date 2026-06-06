@@ -25,9 +25,10 @@ from chitu.moe.batched_expert_result import (
 )
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
-    ExpertBlockPermutedBatchedRoutedActivationNormal,
+    ExpertBlockPermutedBatchedRoutedActivationWithScale,
     IndexedBatchedRoutedActivation,
-    IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
+    IndexedBatchedRoutedActivationWithScale,
+    IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
 )
 from chitu.native_layout import (
     AiterMoeCInt8Gemm1Weight,
@@ -622,32 +623,29 @@ class HygonW8A8DeepGemmMoeExpertsMerged(
         routed_x: IndexedBatchedRoutedActivation,
         weights: torch.Tensor,
     ) -> torch.Tensor:
-        if not (
-            self.experts_start_idx == 0
-            and self.experts_end_idx == self.global_n_experts
-        ):
-            raise RuntimeError(
-                "DeepGEMM MoE requires all experts to be local in prefill path."
-            )
-        if routed_x.activation.shape[-1] != self.dim:
-            raise RuntimeError(
-                f"DeepGEMM MoE activation dim mismatch: "
-                f"got {routed_x.activation.shape[-1]}, expected {self.dim}."
-            )
-
         local_routed_x = routed_x.as_local_expert_ids(
             self.experts_start_idx,
             self.experts_end_idx,
         )
+        q_activation, act_scale = a8_per_token_act_quant(local_routed_x.activation)
+        act_scale = act_scale.unsqueeze(-1)
+        quantized_routed_x = IndexedBatchedRoutedActivationWithScale(
+            activation=q_activation,
+            activation_scale=act_scale,
+            token_to_expert_indices=local_routed_x.token_to_expert_indices,
+            quant_method="w8a8_dynamic",
+            expert_ids_are_local=local_routed_x.expert_ids_are_local,
+            expected_n_tokens_per_expert=local_routed_x.expected_n_tokens_per_expert,
+        )
         padded_routed_x = (
-            IndexedBatchedRoutedActivationWithPaddedPerExpertCnt.convert_from(
-                local_routed_x,
+            IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt.convert_from(
+                quantized_routed_x,
                 n_experts=self.group_size,
                 pad_block_size=_DEEPGEMM_MOE_BLOCK_SIZE,
             )
         )
         blocked_routed_x = (
-            ExpertBlockPermutedBatchedRoutedActivationNormal.convert_from(
+            ExpertBlockPermutedBatchedRoutedActivationWithScale.convert_from(
                 padded_routed_x,
                 block_size=_DEEPGEMM_MOE_BLOCK_SIZE,
                 num_experts=self.group_size,
@@ -655,6 +653,11 @@ class HygonW8A8DeepGemmMoeExpertsMerged(
         )
 
         blocked_activation = blocked_routed_x.blocked_activation.contiguous()
+        blocked_activation_scale = (
+            blocked_routed_x.blocked_activation_scale.reshape(-1)
+            .to(torch.float32)
+            .contiguous()
+        )
         n_blocks, block_size, _ = blocked_activation.shape
         block_to_expert_indices = blocked_routed_x.block_to_expert_indices.to(
             torch.int32
@@ -664,8 +667,7 @@ class HygonW8A8DeepGemmMoeExpertsMerged(
             num_experts=self.group_size,
         )
         m_indices = block_to_expert_indices.reshape(-1).contiguous()
-        flat_activation = blocked_activation.view(-1, self.dim)
-        q_x, act_scale = a8_per_token_act_quant(flat_activation)
+        q_x = blocked_activation.view(-1, self.dim).contiguous()
 
         gate_up_weight = (
             self.get_native_layout_gate_up_proj_weight().layout_tensor.contiguous()
@@ -677,8 +679,8 @@ class HygonW8A8DeepGemmMoeExpertsMerged(
             device=routed_x.activation.device,
         )
         _call_deepgemm_w8a8_grouped_gemm(
-            q_x.contiguous(),
-            act_scale.reshape(-1).to(torch.float32).contiguous(),
+            q_x,
+            blocked_activation_scale,
             gate_up_weight,
             gate_up_scale,
             m_indices,

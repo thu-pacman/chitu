@@ -36,6 +36,8 @@ POST /v1/chat/completions
 | `ignore_eos` | `boolean` | `null` | vLLM 兼容标志，`stop_with_eos` 的反义。不能与 `stop_with_eos` 冲突。 |
 | `min_batch_size` | `integer` | `1` | 最小处理批大小。 |
 
+为新模型适配 `tools`、`tool_choice` 和约束解码时，请参见 [工具调用适配指南](./TOOL_CALL_ADAPTATION.md)。
+
 ### Message 对象
 
 | 字段 | 类型 | 默认值 | 说明 |
@@ -92,6 +94,8 @@ POST /v1/responses
 | `tool_choice` | `string \| object` | `"auto"` | 支持 `"auto"`、`"none"`、`"required"`，以及 `{ "type": "function", "name": "..." }`。 |
 | `parallel_tool_calls` | `boolean` | `true` | 是否允许模型并行发起多个工具调用。 |
 | `metadata` | `object` | `{}` | 原样回显到响应里的元数据。 |
+
+Responses 工具定义最终会归一成 Chitu 内部 function tool；新模型适配方式请参见 [工具调用适配指南](./TOOL_CALL_ADAPTATION.md)。
 
 #### 已支持的输入内容块
 
@@ -155,6 +159,8 @@ POST /v1/messages
 | `type` | `string` | **必填** | `"auto"`、`"any"`、`"tool"`、`"none"` 之一。`"any"` 映射为 OpenAI 的 `"required"`。 |
 | `name` | `string` | `null` | 工具名称（当 `type="tool"` 时必填）。 |
 | `disable_parallel_tool_use` | `boolean` | `false` | 是否禁用并行工具执行。 |
+
+Anthropic 工具定义会转换成 Chitu 内部 function tool；新模型适配方式请参见 [工具调用适配指南](./TOOL_CALL_ADAPTATION.md)。
 
 ### Completions 接口（旧版）
 

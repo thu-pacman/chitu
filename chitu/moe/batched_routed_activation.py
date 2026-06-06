@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
+from typing import Literal, Optional
 from typing_extensions import override
 import dataclasses
 from dataclasses import dataclass
@@ -11,12 +11,16 @@ import torch
 
 from chitu.ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_expert_block_indexed,
-    batched_routed_activation_indexed_to_expert_block_permuted_blockfp8,
+    batched_routed_activation_indexed_to_expert_block_permuted_with_scale,
     batched_routed_activation_indexed_to_concat_permuted,
     batched_routed_activation_indexed_to_expert_block_permuted,
     batched_routed_activation_indexed_to_per_expert_dense,
-    batched_routed_activation_indexed_to_per_expert_dense_blockfp8,
+    batched_routed_activation_indexed_to_per_expert_dense_with_scale,
 )
+
+# Scale tensors keep one scale row per routed token. The trailing scale dimension
+# is hidden_size // quant_block_size for blockfp8 and 1 for w8a8_dynamic.
+RoutedActivationQuantMethod = Literal["blockfp8", "w8a8_dynamic"]
 
 
 def _compute_padded_per_expert_counts(
@@ -240,8 +244,14 @@ class IndexedBatchedRoutedActivation(BatchedRoutedActivation):
 
 
 @dataclass
-class IndexedBatchedRoutedActivationBlockfp8(IndexedBatchedRoutedActivation):
-    activation_scale: torch.Tensor  # [batch_size, hidden_size // quant_block_size]
+class IndexedBatchedRoutedActivationWithScale(IndexedBatchedRoutedActivation):
+    activation_scale: (
+        torch.Tensor
+    )  # e.g. blockfp8 [batch_size, hidden_size // quant_block_size]
+
+    _: dataclasses.KW_ONLY
+
+    quant_method: RoutedActivationQuantMethod
 
     @override
     def get_chunks_no_larger_than(
@@ -251,7 +261,7 @@ class IndexedBatchedRoutedActivationBlockfp8(IndexedBatchedRoutedActivation):
         global_n_experts: int,
         experts_start_idx: int,
         experts_end_idx: int,
-    ) -> list[tuple["IndexedBatchedRoutedActivationBlockfp8", torch.Tensor]]:
+    ) -> list[tuple["IndexedBatchedRoutedActivationWithScale", torch.Tensor]]:
         # Esitimate the real chunk size
         avg_experts_per_token = max(
             int(
@@ -265,17 +275,18 @@ class IndexedBatchedRoutedActivationBlockfp8(IndexedBatchedRoutedActivation):
 
         if self.token_to_expert_indices.shape[0] <= max_n_tokens:
             # Early return without creating new objects. This is performance-critical for
-            # IndexedBatchedRoutedActivationBlockfp8's subclasses, because they reuse
-            # get_chunks_no_larger_than from IndexedBatchedRoutedActivationBlockfp8, and
+            # IndexedBatchedRoutedActivationWithScale's subclasses, because they reuse
+            # get_chunks_no_larger_than from IndexedBatchedRoutedActivationWithScale, and
             # returning the original object prevents the type relaxing.
             return [(self, topk_weights)]
 
         return [
             (
-                IndexedBatchedRoutedActivationBlockfp8(
+                IndexedBatchedRoutedActivationWithScale(
                     a,
                     t,
                     s,
+                    quant_method=self.quant_method,
                     expected_n_tokens_per_expert=self.expected_n_tokens_per_expert,
                     expert_ids_are_local=self.expert_ids_are_local,
                 ),
@@ -357,10 +368,10 @@ class IndexedBatchedRoutedActivationWithPaddedPerExpertCnt(
 
 
 @dataclass
-class IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
-    IndexedBatchedRoutedActivationBlockfp8
+class IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt(
+    IndexedBatchedRoutedActivationWithScale
 ):
-    """Blockfp8 indexed routed activation with exact padded per-expert counts."""
+    """Scaled indexed routed activation with exact padded per-expert counts."""
 
     n_tokens_per_expert_padded: torch.Tensor
     pad_block_size: int
@@ -376,7 +387,7 @@ class IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
         experts_end_idx: int,
     ) -> list[
         tuple[
-            "IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt",
+            "IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt",
             torch.Tensor,
         ]
     ]:
@@ -394,11 +405,11 @@ class IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
     @plum.dispatch
     def convert_from(
         cls,
-        old: IndexedBatchedRoutedActivationBlockfp8,
+        old: IndexedBatchedRoutedActivationWithScale,
         *,
         n_experts: int,
         pad_block_size: int,
-    ) -> "IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt":
+    ) -> "IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt":
         _require_local_expert_ids(old)
         if (
             isinstance(old, cls)
@@ -418,6 +429,7 @@ class IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt(
             activation=old.activation,
             activation_scale=old.activation_scale,
             token_to_expert_indices=old.token_to_expert_indices,
+            quant_method=old.quant_method,
             n_tokens_per_expert_padded=n_tokens_per_expert_padded,
             pad_block_size=pad_block_size,
             n_tokens_padded=n_tokens_padded,
@@ -527,7 +539,7 @@ class ExpertBlockPermutedBatchedRoutedActivationNormal(
     """
     ExpertBlockPermuted variant without quantization
 
-    Same layout as ExpertBlockPermutedBatchedRoutedActivationBlockfp8 but
+    Same layout as ExpertBlockPermutedBatchedRoutedActivationWithScale but
     without quantization scales. All tensors are expected to be 16-bit.
     """
 
@@ -564,29 +576,33 @@ class ExpertBlockPermutedBatchedRoutedActivationNormal(
 
 
 @dataclass
-class ExpertBlockPermutedBatchedRoutedActivationBlockfp8(
+class ExpertBlockPermutedBatchedRoutedActivationWithScale(
     ExpertBlockPermutedBatchedRoutedActivation
 ):
     blocked_activation_scale: (
         torch.Tensor
-    )  # [n_blocks, block_size, hidden_size // quant_block_size]
+    )  # e.g. blockfp8 [n_blocks, block_size, hidden_size // quant_block_size]
+
+    _: dataclasses.KW_ONLY
+
+    quant_method: RoutedActivationQuantMethod
 
     @classmethod
     @override
     @plum.dispatch
     def convert_from(
         cls,
-        old: IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
+        old: IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
         *,
         block_size: int,
         num_experts: int,
-    ) -> "ExpertBlockPermutedBatchedRoutedActivationBlockfp8":
+    ) -> "ExpertBlockPermutedBatchedRoutedActivationWithScale":
         (
             blocked_activation,
             blocked_activation_scale,
             token_comma_topk_to_block_x_item_indices,
             block_to_expert_indices,
-        ) = batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
+        ) = batched_routed_activation_indexed_to_expert_block_permuted_with_scale(
             old.activation,
             old.activation_scale,
             old.token_to_expert_indices,
@@ -600,6 +616,7 @@ class ExpertBlockPermutedBatchedRoutedActivationBlockfp8(
             blocked_activation_scale=blocked_activation_scale,
             token_comma_topk_to_block_x_item_indices=token_comma_topk_to_block_x_item_indices,
             block_to_expert_indices=block_to_expert_indices,
+            quant_method=old.quant_method,
             expert_ids_are_local=old.expert_ids_are_local,
         )
 
@@ -659,17 +676,21 @@ class PerExpertDenseBatchedRoutedActivation(
 
 
 @dataclass
-class PerExpertDenseBatchedRoutedActivationBlockfp8Minimal(
+class PerExpertDenseBatchedRoutedActivationWithScaleMinimal(
     PerExpertDenseBatchedRoutedActivationMinimal
 ):
     activation_scale_per_expert: (
         torch.Tensor
-    )  # [n_experts, max_n_tokens_per_expert, hidden_size // quant_block_size]
+    )  # e.g. blockfp8 [n_experts, max_n_tokens_per_expert, hidden_size // quant_block_size]
+
+    _: dataclasses.KW_ONLY
+
+    quant_method: RoutedActivationQuantMethod
 
 
 @dataclass
-class PerExpertDenseBatchedRoutedActivationBlockfp8(
-    PerExpertDenseBatchedRoutedActivationBlockfp8Minimal
+class PerExpertDenseBatchedRoutedActivationWithScale(
+    PerExpertDenseBatchedRoutedActivationWithScaleMinimal
 ):
     token_to_expert_indices: torch.Tensor  # [batch_size, topk]
     token_pos_in_expert: torch.Tensor  # [batch_size, topk]
@@ -678,14 +699,14 @@ class PerExpertDenseBatchedRoutedActivationBlockfp8(
     @override
     @plum.dispatch
     def convert_from(
-        cls, old: IndexedBatchedRoutedActivationBlockfp8, *, num_experts: int
-    ) -> "PerExpertDenseBatchedRoutedActivationBlockfp8":
+        cls, old: IndexedBatchedRoutedActivationWithScale, *, num_experts: int
+    ) -> "PerExpertDenseBatchedRoutedActivationWithScale":
         (
             activation_per_expert,
             activation_scale_per_expert,
             n_tokens_per_expert,
             token_pos_in_expert,
-        ) = batched_routed_activation_indexed_to_per_expert_dense_blockfp8(
+        ) = batched_routed_activation_indexed_to_per_expert_dense_with_scale(
             old.activation,
             old.activation_scale,
             old.token_to_expert_indices,
@@ -694,6 +715,7 @@ class PerExpertDenseBatchedRoutedActivationBlockfp8(
         return cls(
             activation_per_expert=activation_per_expert,
             activation_scale_per_expert=activation_scale_per_expert,
+            quant_method=old.quant_method,
             expected_n_tokens_per_expert=old.expected_n_tokens_per_expert,
             n_tokens_per_expert=n_tokens_per_expert,
             token_to_expert_indices=old.token_to_expert_indices,

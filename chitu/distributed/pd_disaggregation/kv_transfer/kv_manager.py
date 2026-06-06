@@ -152,6 +152,7 @@ _REPLICATED_BLOCK_KV_KEYS = frozenset(
         "kv_lora_k_pe",
         "indexer_k",
         "indexer_ks",
+        "indexer_k_ks",
     }
 )
 

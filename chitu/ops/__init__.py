@@ -73,9 +73,9 @@ from chitu.ops.mla_prologue import mla_prologue
 from chitu.ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_expert_block_indexed,
     batched_routed_activation_indexed_to_expert_block_permuted,
-    batched_routed_activation_indexed_to_expert_block_permuted_blockfp8,
+    batched_routed_activation_indexed_to_expert_block_permuted_with_scale,
     batched_routed_activation_indexed_to_per_expert_dense,
-    batched_routed_activation_indexed_to_per_expert_dense_blockfp8,
+    batched_routed_activation_indexed_to_per_expert_dense_with_scale,
     batched_routed_activation_indexed_to_concat_permuted,
 )
 from chitu.ops.hadamard import hadamard_transform

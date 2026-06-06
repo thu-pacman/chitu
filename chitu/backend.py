@@ -559,7 +559,7 @@ class Backend:
                 if not isinstance(param, CPUParameter):
                     if param.device == torch.device("meta"):
                         if not ignore_not_loaded:
-                            assert False, f"Unexpected unloaded parameter {key}"
+                            assert False, f"Unexpected unloaded parameter {m}.{key}"
                         else:
                             continue
                     if is_muxi():
@@ -1104,6 +1104,7 @@ class Backend:
         Backend.formatter = Backend._init_formatter(args)
 
         attn_backend_type = Backend._get_attention_backend_type(args)
+        logger.info(f"attn_backend_type={attn_backend_type.__name__}")
 
         # Initialize cache managers
         bundle = build_cache_managers(args, attn_backend_type)
@@ -1130,7 +1131,7 @@ class Backend:
             f"Backend initialized with CUDA mem at {torch.cuda.memory_allocated()/1024**3:.2f} GB"
         )
         logger.info(
-            f"Using {len(c10d._pg_map)} communication gruops. If this number is too high, there may be too much memory reserved for underlying communication libraries."
+            f"Using {len(c10d._pg_map)} communication groups. If this number is too high, there may be too much memory reserved for underlying communication libraries."
         )
         return Backend
 

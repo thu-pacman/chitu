@@ -41,9 +41,9 @@ from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
-    IndexedBatchedRoutedActivationBlockfp8,
+    IndexedBatchedRoutedActivationWithScale,
     IndexedBatchedRoutedActivationWithPaddedPerExpertCnt,
-    IndexedBatchedRoutedActivationBlockfp8WithPaddedPerExpertCnt,
+    IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
     PerExpertDenseBatchedRoutedActivationMinimal,
 )
 

@@ -637,7 +637,7 @@ curl localhost:21002/terminate_engine \
   -d '{"confirm": true}'
 ```
 
-For OpenAI-compatible, OpenAI Responses, and Anthropic-compatible API parameters, see [API Parameters](./API_PARAMETERS.md).
+For OpenAI-compatible, OpenAI Responses, and Anthropic-compatible API parameters, see [API Parameters](./API_PARAMETERS.md). To adapt tool calling for a new model, see the [Tool Calling Adaptation Guide](./TOOL_CALL_ADAPTATION.md).
 
 ### Grafana Dashboard
 

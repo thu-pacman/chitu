@@ -638,7 +638,7 @@ curl localhost:21002/terminate_engine \
   -d '{"confirm": true}'
 ```
 
-OpenAI 兼容、OpenAI Responses 兼容和 Anthropic 兼容接口的参数说明请参见 [API_PARAMETERS.md](./API_PARAMETERS.md)。
+OpenAI 兼容、OpenAI Responses 兼容和 Anthropic 兼容接口的参数说明请参见 [API_PARAMETERS.md](./API_PARAMETERS.md)。如果需要为新模型适配工具调用，请参见 [工具调用适配指南](./TOOL_CALL_ADAPTATION.md)。
 
 ### Grafana 监控面板
 

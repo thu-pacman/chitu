@@ -10,11 +10,11 @@ import torch
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
-    IndexedBatchedRoutedActivationBlockfp8,
+    IndexedBatchedRoutedActivationWithScale,
     PerExpertDenseBatchedRoutedActivation,
     PerExpertDenseBatchedRoutedActivationMinimal,
-    PerExpertDenseBatchedRoutedActivationBlockfp8,
-    PerExpertDenseBatchedRoutedActivationBlockfp8Minimal,
+    PerExpertDenseBatchedRoutedActivationWithScale,
+    PerExpertDenseBatchedRoutedActivationWithScaleMinimal,
 )
 from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
@@ -69,7 +69,7 @@ def _(
     )
 
     if w1.dtype == torch.float8_e4m3fn:
-        assert not isinstance(hidden_states, IndexedBatchedRoutedActivationBlockfp8)
+        assert not isinstance(hidden_states, IndexedBatchedRoutedActivationWithScale)
         assert len(block_shape) == 2
         assert block_shape[0] == block_shape[1]
         activation_fp8, activation_scale = blockfp8_act_quant(
@@ -78,10 +78,11 @@ def _(
             round_scale_to_pow2=round_scale_to_pow2,
         )
         return deepgemm_masked_fused_expert(
-            IndexedBatchedRoutedActivationBlockfp8(
+            IndexedBatchedRoutedActivationWithScale(
                 activation=activation_fp8,
                 activation_scale=activation_scale,
                 token_to_expert_indices=hidden_states.token_to_expert_indices,
+                quant_method="blockfp8",
                 expected_n_tokens_per_expert=hidden_states.expected_n_tokens_per_expert,
                 expert_ids_are_local=True,
             ),
@@ -114,7 +115,7 @@ def _(
 
 @deepgemm_masked_fused_expert.register
 def _(
-    hidden_states: IndexedBatchedRoutedActivationBlockfp8,
+    hidden_states: IndexedBatchedRoutedActivationWithScale,
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation: str = "silu",
@@ -133,7 +134,7 @@ def _(
     )
 
     return deepgemm_masked_fused_expert(
-        PerExpertDenseBatchedRoutedActivationBlockfp8.convert_from(
+        PerExpertDenseBatchedRoutedActivationWithScale.convert_from(
             hidden_states, num_experts=w1.shape[0]
         ),
         w1=w1,
@@ -242,7 +243,7 @@ def _(
             )
 
         if isinstance(
-            hidden_states, PerExpertDenseBatchedRoutedActivationBlockfp8Minimal
+            hidden_states, PerExpertDenseBatchedRoutedActivationWithScaleMinimal
         ):
             hidden_states_fp8 = hidden_states.activation_per_expert
             a1_scale = hidden_states.activation_scale_per_expert
@@ -290,10 +291,10 @@ def _(
         hidden_states,
         (
             PerExpertDenseBatchedRoutedActivation,
-            PerExpertDenseBatchedRoutedActivationBlockfp8,
+            PerExpertDenseBatchedRoutedActivationWithScale,
         ),
     ):
-        # PerExpertDenseBatchedRoutedActivation and PerExpertDenseBatchedRoutedActivationBlockfp8
+        # PerExpertDenseBatchedRoutedActivation and PerExpertDenseBatchedRoutedActivationWithScale
         # are subclasses of PerExpertDenseBatchedRoutedActivationMinimal
         return PerExpertDenseBatchedExpertResult(
             intermediate_cache3,

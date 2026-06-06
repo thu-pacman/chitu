@@ -543,10 +543,7 @@ class AttentionDeepSeekV3(Attention):
     def forward(
         self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
     ):
-        if is_mtp:
-            seq_len_delta = self.cache.mtp_seq_len_delta
-        else:
-            seq_len_delta = self.cache.seq_len_delta
+        seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
 
         bs_seq, _ = x.size()
 
@@ -1298,6 +1295,8 @@ class TransformerDeepSeekV3(Transformer):
             prefix_mappings.extend([("model.embed_tokens.", "embed_tokens.")])
         if self.pp_stage == self.pp_end_stage:
             prefix_mappings.extend([("model.norm.", "norm."), ("lm_head.", "lm_head.")])
+            if self.mtp_size > 1 and self.mtp_tie_word_embeddings:
+                prefix_mappings.append(("model.embed_tokens.", "embed_tokens."))
         return prefix_mappings
 
     @override
@@ -2071,16 +2070,16 @@ class TransformerDeepSeekV3(Transformer):
         return BatchedFreqsCis(self.freqs_cis_real[index], self.freqs_cis_imag[index])
 
     @override
-    def prepare_decoding_attn(self):
+    def prepare_decoding_attn(self, is_mtp=False):
         self.attn_backend.prepare_metadata_for_decode(
-            self.cache_dict["main"].seq_len_delta,
+            self.cache_dict["main"].get_seq_len_delta(is_mtp),
             self.cache_dict["main"].get_gpu_block_table(),
             self.cache_dict["main"].block_size,
             softmax_scale=compute_softmax_scale_deepseek_v3(self.params),
         )
         if self.indexer_backend is not None:
             self.indexer_backend.prepare_metadata_for_decode(
-                self.cache_dict["main"].seq_len_delta
+                self.cache_dict["main"].get_seq_len_delta(is_mtp),
             )
 
 

@@ -465,6 +465,9 @@ class KVCacheBase:
     def get_gpu_block_table(self):
         return None
 
+    def get_seq_len_delta(self, is_mtp=False):
+        return self.mtp_seq_len_delta if is_mtp else self.seq_len_delta
+
 
 class PagedKVCache(KVCacheBase):
     def __init__(

@@ -1054,7 +1054,7 @@ class FlashMLABackend(TritonAttnBackend):
             seq_len_delta,
             block_table=kv_cache.block_table,
             block_size=kv_lora_k_pe.size(1),
-            causal=(True if seq_len_delta.is_classic_decoding else False),
+            causal=True,
         )
 
         if self.use_fp8_cache:

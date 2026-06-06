@@ -887,13 +887,14 @@ def _warmup_backend_direct(
             device="cuda",
             dtype=Backend.executor.get_payload_dtype(),
         )
-
     all_tasks = PackedTasksBase(local_max_bs, task_ids=req_ids)
-    if Backend.cache_managers:
-        new_cache_ids = {}
-        for name, manager in Backend.cache_managers[0].items():
-            new_cache_ids[name] = [random.randrange(manager.num_blocks)]
-        all_tasks.new_cache_ids_list = [new_cache_ids for _ in range(local_max_bs)]
+    new_cache_ids = {}
+    for _name, _cache in Backend.cache_dict.items():
+        manager_name = getattr(_cache, "manager_name", None)
+        num_blocks = getattr(_cache, "num_blocks", None)
+        if manager_name is not None and num_blocks is not None:
+            new_cache_ids[manager_name] = [random.randrange(num_blocks)]
+    all_tasks.new_cache_ids_list = [new_cache_ids for _ in range(local_max_bs)]
     all_tasks.tokens = [[1] for _ in range(local_max_bs)]
 
     # Prefill

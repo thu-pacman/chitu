@@ -4,9 +4,9 @@ import pytest
 from chitu.ops import (
     batched_routed_activation_indexed_to_expert_block_indexed,
     batched_routed_activation_indexed_to_expert_block_permuted,
-    batched_routed_activation_indexed_to_expert_block_permuted_blockfp8,
+    batched_routed_activation_indexed_to_expert_block_permuted_with_scale,
     batched_routed_activation_indexed_to_per_expert_dense,
-    batched_routed_activation_indexed_to_per_expert_dense_blockfp8,
+    batched_routed_activation_indexed_to_per_expert_dense_with_scale,
     batched_routed_activation_indexed_to_concat_permuted,
     moe_sum_per_expert_dense,
 )
@@ -72,7 +72,7 @@ def _run_blockfp8_expert_block_permuted(
         blocked_activation_scale,
         token_comma_topk_to_block_x_item_indices,
         block_to_expert_indices,
-    ) = batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
+    ) = batched_routed_activation_indexed_to_expert_block_permuted_with_scale(
         activation,
         activation_scale,
         token_to_expert_indices,
@@ -234,7 +234,7 @@ def test_batched_routed_activation_indexed_to_expert_block_indexed(
     not has_native_fp8(),
     reason="This test requires the GPU to have native FP8 support",
 )
-def test_batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
+def test_batched_routed_activation_indexed_to_expert_block_permuted_with_scale(
     num_experts,
     block_size,
     num_tokens,
@@ -507,7 +507,7 @@ def test_batched_routed_activation_indexed_to_per_expert_dense(
 @pytest.mark.parametrize("quant_block_size", [128])
 @pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
 @pytest.mark.parametrize("impl", ["ref", "triton"])
-def test_batched_routed_activation_indexed_to_per_expert_dense_blockfp8(
+def test_batched_routed_activation_indexed_to_per_expert_dense_with_scale(
     num_experts, num_tokens, hidden_size, topk, quant_block_size, distribution, impl
 ):
     if impl == "triton" and not has_triton:
@@ -529,7 +529,7 @@ def test_batched_routed_activation_indexed_to_per_expert_dense_blockfp8(
         activation_scale_per_expert,
         n_tokens_per_expert,
         token_pos_in_expert,
-    ) = batched_routed_activation_indexed_to_per_expert_dense_blockfp8(
+    ) = batched_routed_activation_indexed_to_per_expert_dense_with_scale(
         activation=activation,
         activation_scale=activation_scale,
         token_to_expert_indices=token_to_expert_indices,

@@ -15,7 +15,7 @@ from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
     ExpertBlockIndexedBatchedRoutedActivation,
-    IndexedBatchedRoutedActivationBlockfp8,
+    IndexedBatchedRoutedActivationWithScale,
 )
 from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
@@ -935,7 +935,7 @@ def fused_experts_fp8(
     compute_type = to_triton_dtype(hidden_states.activation.dtype)
     # Add bs as a tuning key if in graph, because bs is also a key for graph
     # capturing and thus fixed per graph.
-    if isinstance(hidden_states, IndexedBatchedRoutedActivationBlockfp8):
+    if isinstance(hidden_states, IndexedBatchedRoutedActivationWithScale):
         hidden_states_activation = hidden_states.activation
         a1_scale = hidden_states.activation_scale
     elif not soft_fp8:

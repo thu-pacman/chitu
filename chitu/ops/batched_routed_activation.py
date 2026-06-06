@@ -27,9 +27,9 @@ if has_triton_impl:
     from chitu.ops.triton_ops import (
         batched_routed_activation_indexed_to_expert_block_indexed_triton,
         batched_routed_activation_indexed_to_expert_block_permuted_triton,
-        batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton,
+        batched_routed_activation_indexed_to_expert_block_permuted_with_scale_triton,
         batched_routed_activation_indexed_to_per_expert_dense_triton,
-        batched_routed_activation_indexed_to_per_expert_dense_blockfp8_triton,
+        batched_routed_activation_indexed_to_per_expert_dense_with_scale_triton,
     )
 
 
@@ -223,7 +223,7 @@ def batched_routed_activation_indexed_to_expert_block_indexed_muxi(
 
 
 @make_op_dispatcher
-def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
+def batched_routed_activation_indexed_to_expert_block_permuted_with_scale(
     activation: torch.Tensor,
     activation_scale: torch.Tensor,
     token_to_expert_indices: torch.Tensor,
@@ -235,13 +235,13 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
     impl: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Transform from IndexedBatchedRoutedActivationBlockfp8 to
-    ExpertBlockPermutedBatchedRoutedActivationBlockfp8
+    Transform from IndexedBatchedRoutedActivationWithScale to
+    ExpertBlockPermutedBatchedRoutedActivationWithScale
 
     Args:
-        activation: IndexedBatchedRoutedActivationBlockfp8.activation.
-        activation_scale (torch.Tensor): IndexedBatchedRoutedActivationBlockfp8.activation_scale.
-        token_to_expert_indices (torch.Tensor): IndexedBatchedRoutedActivationBlockfp8.token_to_expert_indices.
+        activation: IndexedBatchedRoutedActivationWithScale.activation.
+        activation_scale (torch.Tensor): IndexedBatchedRoutedActivationWithScale.activation_scale.
+        token_to_expert_indices (torch.Tensor): IndexedBatchedRoutedActivationWithScale.token_to_expert_indices.
         block_size: Block size of ExpertBlockPermutedBatchedRoutedActivation.
         n_tokens_per_expert_padded: Number of tokens assigned to each expert, padded to be multiple
             of block_size.
@@ -259,23 +259,23 @@ def batched_routed_activation_indexed_to_expert_block_permuted_blockfp8(
     raise NotImplementedError
 
 
-@batched_routed_activation_indexed_to_expert_block_permuted_blockfp8.register_auto
-def _auto_batched_routed_activation_indexed_to_expert_block_permuted_blockfp8():
+@batched_routed_activation_indexed_to_expert_block_permuted_with_scale.register_auto
+def _auto_batched_routed_activation_indexed_to_expert_block_permuted_with_scale():
     if has_triton_impl:
         return "triton"
     raise NotImplementedError(
         "No available implementation found for "
-        "batched_routed_activation_indexed_to_expert_block_permuted_blockfp8"
+        "batched_routed_activation_indexed_to_expert_block_permuted_with_scale"
     )
 
 
-batched_routed_activation_indexed_to_expert_block_permuted_blockfp8.register_candidate(
+batched_routed_activation_indexed_to_expert_block_permuted_with_scale.register_candidate(
     "triton"
 )
 if has_triton_impl:
-    batched_routed_activation_indexed_to_expert_block_permuted_blockfp8.register(
+    batched_routed_activation_indexed_to_expert_block_permuted_with_scale.register(
         "triton"
-    )(batched_routed_activation_indexed_to_expert_block_permuted_blockfp8_triton)
+    )(batched_routed_activation_indexed_to_expert_block_permuted_with_scale_triton)
 
 
 @make_op_dispatcher
@@ -293,9 +293,9 @@ def batched_routed_activation_indexed_to_expert_block_permuted(
     16-bit version of indexed -> expert-block-permuted.
 
     This mirrors the layout transformation of
-    `batched_routed_activation_indexed_to_expert_block_permuted_blockfp8` but
+    `batched_routed_activation_indexed_to_expert_block_permuted_with_scale` but
     without using real quantization scales. `n_tokens_padded` follows the same
-    contract as the blockfp8 path.
+    contract as the scaled path.
 
     Returns:
         [0]: blocked_activation            (16-bit) [n_blocks, block_size, hidden]
@@ -386,7 +386,7 @@ if has_triton_impl:
 
 
 @make_op_dispatcher
-def batched_routed_activation_indexed_to_per_expert_dense_blockfp8(
+def batched_routed_activation_indexed_to_per_expert_dense_with_scale(
     activation: torch.Tensor,
     activation_scale: torch.Tensor,
     token_to_expert_indices: torch.Tensor,
@@ -395,36 +395,36 @@ def batched_routed_activation_indexed_to_per_expert_dense_blockfp8(
     impl: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Transform from IndexedBatchedRoutedActivationBlockfp8 to PerExpertDenseBatchedRoutedActivationBlockfp8
+    Transform from IndexedBatchedRoutedActivationWithScale to PerExpertDenseBatchedRoutedActivationWithScale
 
     Args:
-        activation: IndexedBatchedRoutedActivationBlockfp8.activation.
-        activation_scale: IndexedBatchedRoutedActivationBlockfp8.activation_scale.
-        token_to_expert_indices (torch.Tensor): IndexedBatchedRoutedActivationBlockfp8.token_to_expert_indices.
+        activation: IndexedBatchedRoutedActivationWithScale.activation.
+        activation_scale: IndexedBatchedRoutedActivationWithScale.activation_scale.
+        token_to_expert_indices (torch.Tensor): IndexedBatchedRoutedActivationWithScale.token_to_expert_indices.
         num_experts: Number of experts.
 
     Returns:
-        [0]: PerExpertDenseBatchedRoutedActivationBlockfp8.activation_per_expert
-        [0]: PerExpertDenseBatchedRoutedActivationBlockfp8.activation_scale_per_expert
-        [1]: PerExpertDenseBatchedRoutedActivationBlockfp8.n_tokens_per_expert
-        [2]: PerExpertDenseBatchedRoutedActivationBlockfp8.token_pos_in_expert
+        [0]: PerExpertDenseBatchedRoutedActivationWithScale.activation_per_expert
+        [0]: PerExpertDenseBatchedRoutedActivationWithScale.activation_scale_per_expert
+        [1]: PerExpertDenseBatchedRoutedActivationWithScale.n_tokens_per_expert
+        [2]: PerExpertDenseBatchedRoutedActivationWithScale.token_pos_in_expert
     """
     raise NotImplementedError
 
 
-@batched_routed_activation_indexed_to_per_expert_dense_blockfp8.register_auto
-def _auto_batched_routed_activation_indexed_to_per_expert_dense_blockfp8():
+@batched_routed_activation_indexed_to_per_expert_dense_with_scale.register_auto
+def _auto_batched_routed_activation_indexed_to_per_expert_dense_with_scale():
     if has_triton_impl:
         return "triton"
     return "ref"
 
 
-batched_routed_activation_indexed_to_per_expert_dense_blockfp8.register_candidate(
+batched_routed_activation_indexed_to_per_expert_dense_with_scale.register_candidate(
     "triton"
 )
 if has_triton_impl:
-    batched_routed_activation_indexed_to_per_expert_dense_blockfp8.register("triton")(
-        batched_routed_activation_indexed_to_per_expert_dense_blockfp8_triton
+    batched_routed_activation_indexed_to_per_expert_dense_with_scale.register("triton")(
+        batched_routed_activation_indexed_to_per_expert_dense_with_scale_triton
     )
 
 
@@ -457,8 +457,8 @@ def batched_routed_activation_indexed_to_per_expert_dense_ref(
     return activation_per_expert, write_pos, token_pos_in_expert
 
 
-@batched_routed_activation_indexed_to_per_expert_dense_blockfp8.register("ref")
-def batched_routed_activation_indexed_to_per_expert_dense_blockfp8_ref(
+@batched_routed_activation_indexed_to_per_expert_dense_with_scale.register("ref")
+def batched_routed_activation_indexed_to_per_expert_dense_with_scale_ref(
     activation: torch.Tensor,
     activation_scale: torch.Tensor,
     token_to_expert_indices: torch.Tensor,

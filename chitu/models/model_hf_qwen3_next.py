@@ -396,10 +396,7 @@ class AttentionQwen3Next(AttentionHFLlama):
     def forward(
         self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
     ):
-        if is_mtp:
-            seq_len_delta = self.cache.mtp_seq_len_delta
-        else:
-            seq_len_delta = self.cache.seq_len_delta
+        seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
 
         xq, xk, xv = self._run_linear(x)
         gate = self.attn_gate(x)
