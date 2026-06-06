@@ -134,6 +134,7 @@ The following models are part of chitu-pro. Please concat [solution@chitu.ai](so
 | DeepSeek-R1-MXFP4 | ✓ | `models=DeepSeek-R1-mxfp4` |
 | DeepSeek-V3-ascend-int8 | ✓ | `models=DeepSeek-V3-int8-ascend` |
 | DeepSeek-V3.1-Terminus-ascend-int8 | ✓ | `models=DeepSeek-V3.1-Terminus-int8-ascend` |
+| DeepSeek-V4-Flash |  | `models=DeepSeek-V4-Flash` |
 | GLM-4.5-Air-qc-fp8 | ✓ | `models=GLM-4.5-Air-qc-fp8` |
 | GLM-4.5-qc-fp8 | ✓ | `models=GLM-4.5-qc-fp8` |
 | QwQ-32B-simple-w8a8 |  | `models=QwQ-32B-simple-w8a8` |

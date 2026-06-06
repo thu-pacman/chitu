@@ -58,6 +58,7 @@ from chitu.distributed.partition import compute_expert_dist_in_ep
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 
 FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
+FE8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
 
 
 def _compressed_cache_name_deepseek_v4(ratio: int) -> str:
@@ -2269,11 +2270,9 @@ class TransformerDeepSeekV4(Transformer):
     def _get_tensor_row_parallel_layer_names(self) -> list[str]:
         return ["wo_b", "down_proj"]
 
-    @override
-    def _get_2d_out_x_in_tensor_names(
-        self, quant: Optional[str], quant_kwargs: dict[str, Any]
-    ) -> list[str]:
-        # FIXME: respect tensors of each possible quantization
+    def _get_2d_out_x_in_tensor_names(self, quant, quant_kwargs=None) -> list[str]:
+        if quant == "mxfp4":
+            return ["weight", "weight_scale"]
         return ["weight", "scale"]
 
     @override
@@ -2578,5 +2577,16 @@ class TransformerDeepSeekV4(Transformer):
             name = name.replace(".w1.", ".gate_proj.")
             name = name.replace(".w2.", ".down_proj.")
             name = name.replace(".w3.", ".up_proj.")
+            if ".ffn.experts." in name:
+                prefix, _, tensor_name = name.rpartition(".")
+                quant = get_quant_from_checkpoint_prefix(prefix)
+                if tensor_name == "scale":
+                    if quant == "mxfp4":
+                        name = f"{prefix}.weight_scale"
+                        if FE8M0_DTYPE is not None and value.dtype == FE8M0_DTYPE:
+                            value = value.view(torch.uint8)
+                elif tensor_name == "weight":
+                    if quant == "mxfp4" and value.dtype == torch.int8:
+                        value = value.view(torch.uint8)
             normalized[name] = value
         return normalized
