@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from chitu.device_type import is_hygon
 from chitu.models.registry import ModelType
 from chitu.utils import try_import_opt_dep
 
@@ -143,6 +144,9 @@ def default_paged_block_size_policy(args) -> int:
         return 128
 
     if attn_type == "hunyuan_attn":
+        return 64
+
+    if is_hygon() and attn_type in ("flash_attn", "auto"):
         return 64
 
     if attn_type == "hopper_mixed" or (
