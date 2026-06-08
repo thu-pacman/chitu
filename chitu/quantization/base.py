@@ -250,11 +250,12 @@ class QuantizedMoeExpertsUnmerged(QuantizedMoeExpertsBase):
             indices.shape[1],
             x.shape[-1],
             device=x.device,
-            dtype=x.dtype,
-        )
+            dtype=torch.get_default_dtype(),
+        )  # NOTE: Don't use x.dtype beause it may be quantized by subclasses
         for i in range(self.experts_end_idx - self.experts_start_idx):
             if i in activated_expert_ids:
                 idx, top = torch.where(indices == i)
+                assert y.dtype == down_proj_outs[i].dtype
                 y[idx, top] = down_proj_outs[i]
         return PerTokenBatchedExpertResult(y)
 
@@ -300,12 +301,15 @@ class QuantizedMoeExpertsUnmerged(QuantizedMoeExpertsBase):
                 )
             act.append(out)
 
-        y = torch.empty_like(routed_x.activation_per_expert)
+        y = torch.empty_like(
+            routed_x.activation_per_expert,
+            dtype=torch.get_default_dtype(),
+        )  # NOTE: Don't use routed_x.activation_per_expert.dtype beause it may be quantized by subclasses
         for i, acti in enumerate(act):
             if acti is not None:
-                y[i, : n_tokens_per_expert_cpu[i]] = self.forward_ith_expert_down(
-                    i, acti
-                )
+                yi = self.forward_ith_expert_down(i, acti)
+                assert y.dtype == yi.dtype
+                y[i, : n_tokens_per_expert_cpu[i]] = yi
 
         return PerExpertDenseBatchedExpertResultMinimal(y)
 
@@ -417,11 +421,12 @@ class QuantizedMoeExpertsMerged(QuantizedMoeExpertsBase):
             indices.shape[1],
             x.shape[-1],
             device=x.device,
-            dtype=x.dtype,
-        )
+            dtype=torch.get_default_dtype(),
+        )  # NOTE: Don't use x.dtype beause it may be quantized by subclasses
         for i in range(self.experts_end_idx - self.experts_start_idx):
             if i in activated_expert_ids:
                 idx, top = torch.where(indices == i)
+                assert y.dtype == down_proj_outs[i].dtype
                 y[idx, top] = down_proj_outs[i]
         return PerTokenBatchedExpertResult(y)
 
@@ -466,12 +471,15 @@ class QuantizedMoeExpertsMerged(QuantizedMoeExpertsBase):
                 )
             act.append(out)
 
-        y = torch.empty_like(routed_x.activation_per_expert)
+        y = torch.empty_like(
+            routed_x.activation_per_expert,
+            dtype=torch.get_default_dtype(),
+        )  # NOTE: Don't use routed_x.activation_per_expert.dtype beause it may be quantized by subclasses
         for i, acti in enumerate(act):
             if acti is not None:
-                y[i, : n_tokens_per_expert_cpu[i]] = self.forward_ith_expert_down(
-                    i, acti
-                )
+                yi = self.forward_ith_expert_down(i, acti)
+                assert y.dtype == yi.dtype
+                y[i, : n_tokens_per_expert_cpu[i]] = yi
 
         return PerExpertDenseBatchedExpertResultMinimal(y)
 

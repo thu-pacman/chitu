@@ -99,6 +99,7 @@ def test_groupgemm_matches_iterative(
     should produce the same result as the per-expert iterative path.
     """
     torch.manual_seed(42)
+    torch.set_default_dtype(torch.bfloat16)
     module = _make_experts_module(dim, moe_inter_dim, n_experts, group_size)
     routed_x = _make_routed_activation(M, dim, n_experts, topk)
 
@@ -126,6 +127,7 @@ def test_groupgemm_matches_iterative(
 @pytest.mark.parametrize("M", [0])
 def test_groupgemm_empty_batch(M):
     """Groupgemm should handle empty batch gracefully."""
+    torch.set_default_dtype(torch.bfloat16)
     dim, moe_inter_dim, n_experts, topk = 256, 128, 8, 2
     module = _make_experts_module(dim, moe_inter_dim, n_experts)
     module = module.cuda()
