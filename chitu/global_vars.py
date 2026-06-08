@@ -438,7 +438,7 @@ class SlotHandle:
         self.slot_end_idx = res[1:]
 
     def split_slots(self, total, parts):
-        result = [0] * min(total, parts)
+        result = [0] * parts
         for i in range(total):
             result[i % parts] += 1
         return result
