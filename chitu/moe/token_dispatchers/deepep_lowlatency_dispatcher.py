@@ -28,6 +28,7 @@ from chitu.moe.load_balancer import get_moe_load_planner
 from chitu.global_vars import get_global_args
 from chitu.device_type import is_blackwell, is_muxi, is_hygon
 from contextlib import nullcontext
+from chitu.device_type import is_hygon
 
 # replace the buffer setting with DeepEP to concurrently enbale ll mode and normal mode, need more test to verify.
 from chitu.moe.token_dispatchers.buffercontroller import DeepEPBuffer
@@ -175,6 +176,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         dp_local_bs = topk_weights.shape[0]
 
         dispatch_use_fp8 = False
+        dispatch_use_int8 = may_fuse_quant == "w8a8_dynamic"
         round_scale_to_pow2 = False
         if (
             may_fuse_quant == "blockfp8"
@@ -225,6 +227,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                     topk_ids,
                     return_recv_hook=True,
                     dispatch_use_fp8=dispatch_use_fp8,
+                    dispatch_use_int8=dispatch_use_int8,
                     round_scale_to_pow2=round_scale_to_pow2,
                     cumulative_local_expert_recv_stats=(
                         self.cumulative_local_expert_recv_stats.get(layer_id, None)
@@ -242,7 +245,26 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                 layer_id=layer_id, local_slot_stats=recv_expert_count
             )
 
-        if not dispatch_use_fp8:
+        if dispatch_use_int8:
+            recv_activation, recv_activation_scale = recv_activation
+            return (
+                PerExpertDenseBatchedRoutedActivationWithScaleMinimal(
+                    activation_per_expert=recv_activation,
+                    activation_scale_per_expert=recv_activation_scale,
+                    quant_method="w8a8_dynamic",
+                    output_dtype=x.activation.dtype,
+                    # NOTE on expected_n_tokens_per_expert: Although the estimation here is based
+                    # on information per DP rank and not global, we have to use it because our
+                    # CUDA graph is also captured per DP rank. It should be close enough. But a
+                    # DP rank may have 0 tokens, so we have to max with 1 here.
+                    expected_n_tokens_per_expert=max(x.expected_n_tokens_per_expert, 1),
+                    n_tokens_per_expert=recv_expert_count,
+                    expert_ids_are_local=True,
+                ),
+                None,
+                self.dispatch_stream,
+            )
+        elif not dispatch_use_fp8:
             return (
                 PerExpertDenseBatchedRoutedActivationMinimal(
                     activation_per_expert=recv_activation,
@@ -264,6 +286,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                     activation_per_expert=recv_activation,
                     activation_scale_per_expert=recv_activation_scale,
                     quant_method="blockfp8",
+                    output_dtype=None,
                     # NOTE on expected_n_tokens_per_expert: Although the estimation here is based
                     # on information per DP rank and not global, we have to use it because our
                     # CUDA graph is also captured per DP rank. It should be close enough. But a
@@ -330,11 +353,17 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         dispatch_use_fp8: bool = False,
+        dispatch_use_int8: bool = False,
         round_scale_to_pow2: bool = False,
         cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
+        if dispatch_use_fp8 and dispatch_use_int8:
+            raise ValueError(
+                "DeepEP low-latency dispatch cannot use FP8 and INT8 together"
+            )
+
         assert not (async_finish and return_recv_hook)
         # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
         # ---- _chitu_hygon_lowlatency_dispatch_marker_ ----
@@ -344,22 +373,28 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             # 4=fp8_e5m2) and a renamed fp8_round_scale arg.
             # cumulative_local_expert_recv_stats is not implemented in this build
             # (profiling-only on the upstream path).
+            quant_type = 1 if dispatch_use_int8 else (2 if dispatch_use_fp8 else 0)
+            quant_group_size = (
+                0 if dispatch_use_int8 else (128 if dispatch_use_fp8 else 0)
+            )
             recv_hidden_states, recv_expert_count, handle, event, hook = (
                 self._buffer.low_latency_dispatch(
                     hidden_states,
                     topk_idx,
                     DeepEPBuffer._lowlatency_num_max_dispatch_tokens_per_rank,
                     self.num_global_experts * self.etp_group.group_size,
-                    quant_type=(
-                        2 if dispatch_use_fp8 else 0
-                    ),  # fp8_e4m3 (UE8M0 not used here)
-                    quant_group_size=128,  # cinfer only enables fp8 when block_size == 128
+                    quant_type=quant_type,
+                    quant_group_size=quant_group_size,
                     fp8_round_scale=round_scale_to_pow2,
                     async_finish=async_finish,
                     return_recv_hook=return_recv_hook,
                 )
             )
         else:
+            if dispatch_use_int8:
+                raise NotImplementedError(
+                    "DeepEP low-latency INT8 dispatch is only implemented for Hygon"
+                )
             recv_hidden_states, recv_expert_count, handle, event, hook = (
                 self._buffer.low_latency_dispatch(
                     hidden_states,

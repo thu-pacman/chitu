@@ -681,11 +681,12 @@ class PerExpertDenseBatchedRoutedActivationWithScaleMinimal(
 ):
     activation_scale_per_expert: (
         torch.Tensor
-    )  # e.g. blockfp8 [n_experts, max_n_tokens_per_expert, hidden_size // quant_block_size]
+    )  # e.g. blockfp8 [..., hidden_size // quant_block_size], w8a8_dynamic [..., 1]
 
     _: dataclasses.KW_ONLY
 
     quant_method: RoutedActivationQuantMethod
+    output_dtype: Optional[torch.dtype]
 
 
 @dataclass
@@ -716,6 +717,7 @@ class PerExpertDenseBatchedRoutedActivationWithScale(
             activation_per_expert=activation_per_expert,
             activation_scale_per_expert=activation_scale_per_expert,
             quant_method=old.quant_method,
+            output_dtype=None,
             expected_n_tokens_per_expert=old.expected_n_tokens_per_expert,
             n_tokens_per_expert=n_tokens_per_expert,
             token_to_expert_indices=old.token_to_expert_indices,
