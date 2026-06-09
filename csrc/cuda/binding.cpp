@@ -17,6 +17,9 @@
 #include "frequency_penalty/frequency_penalty.h"
 #include "hard_fp4/nvfp4_quant_entry.h"
 #include "hard_fp4/nvfp4_scaled_mm_entry.h"
+#if defined(CHITU_ENABLE_DSA_FP8_KV_DEQUANT) && CHITU_ENABLE_DSA_FP8_KV_DEQUANT
+#include "dequant/dequant_kv.h"
+#endif
 #include "marlin/marlin_gemm/gptq_marlin.h"
 #include "marlin/marlin_group_gemm/ops.h"
 #if !defined(CHITU_HYGON_BUILD) || CHITU_HYGON_BUILD != 1
@@ -84,6 +87,15 @@ void init_compute(py::module &m) {
 #if !defined(CHITU_HYGON_BUILD) || CHITU_HYGON_BUILD != 1
     m.def("w4a8_per_group_gemm_forward_cuda", &w4a8_per_group_gemm_forward_cuda,
           "");
+#endif
+#if defined(CHITU_ENABLE_DSA_FP8_KV_DEQUANT) && CHITU_ENABLE_DSA_FP8_KV_DEQUANT
+    m.def("cuda_dsa_fp8_kvcache_dequant", &dsa_fp8_kvcache_dequant, "kv_fp8"_a,
+          "out"_a = std::nullopt,
+          "Dequantize FlashMLA DSA FP8 KV cache layout to bf16.");
+    m.def("cuda_dsa_fp8_paged_kvcache_read_dequant",
+          &dsa_fp8_paged_kvcache_read_dequant, "kv_fp8"_a, "page_table"_a,
+          "position_ids"_a, "seq_ids"_a, "out"_a = std::nullopt,
+          "Read FlashMLA DSA FP8 paged KV cache and dequantize to ragged bf16.");
 #endif
 #if defined ENABLE_MARLIN && ENABLE_MARLIN
     m.def("gptq_marlin_gemm", &gptq_marlin_gemm, "VLLM Marlin GEMM");

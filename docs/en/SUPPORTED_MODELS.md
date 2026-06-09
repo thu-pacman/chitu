@@ -21,8 +21,8 @@
 | DeepSeek-V3.2-Exp | ✓ | `models=DeepSeek-V3.2-Exp` | https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp |
 | DeepSeek-V3.2-Exp-kv-fp8 | ✓ | `models=DeepSeek-V3.2-Exp-kv-fp8` | https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp |
 | DeepSeek-V3.2-kv-fp8 | ✓ | `models=DeepSeek-V3.2-kv-fp8` | https://huggingface.co/deepseek-ai/DeepSeek-V3.2 |
-| DeepSeek-V4-Flash-Base |  | `models=DeepSeek-V4-Flash-Base` | https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base |
-| DeepSeek-V4-Flash-FP8 |  | `models=DeepSeek-V4-Flash-FP8` | https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8 |
+| DeepSeek-V4-Flash-Base | ✓ | `models=DeepSeek-V4-Flash-Base` | https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base |
+| DeepSeek-V4-Flash-FP8 | ✓ | `models=DeepSeek-V4-Flash-FP8` | https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8 |
 | glm-4-32b |  | `models=GLM-4-32B-0414` | https://modelscope.cn/models/ZhipuAI/GLM-4-32B-0414 |
 | glm-4-9b |  | `models=GLM-4-9B-0414` | https://www.modelscope.cn/models/ZhipuAI/GLM-4-9B-0414 |
 | GLM-4.5 | ✓ | `models=GLM-4.5` | https://huggingface.co/zai-org/GLM-4.5 |
@@ -134,7 +134,7 @@ The following models are part of chitu-pro. Please concat [solution@chitu.ai](so
 | DeepSeek-R1-MXFP4 | ✓ | `models=DeepSeek-R1-mxfp4` |
 | DeepSeek-V3-ascend-int8 | ✓ | `models=DeepSeek-V3-int8-ascend` |
 | DeepSeek-V3.1-Terminus-ascend-int8 | ✓ | `models=DeepSeek-V3.1-Terminus-int8-ascend` |
-| DeepSeek-V4-Flash |  | `models=DeepSeek-V4-Flash` |
+| DeepSeek-V4-Flash | ✓ | `models=DeepSeek-V4-Flash` |
 | GLM-4.5-Air-qc-fp8 | ✓ | `models=GLM-4.5-Air-qc-fp8` |
 | GLM-4.5-qc-fp8 | ✓ | `models=GLM-4.5-qc-fp8` |
 | QwQ-32B-simple-w8a8 |  | `models=QwQ-32B-simple-w8a8` |

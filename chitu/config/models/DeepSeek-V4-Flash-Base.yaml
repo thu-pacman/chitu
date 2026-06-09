@@ -11,6 +11,8 @@ type: deepseek-v4
 source: "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base"
 tokenizer_type: "hf"
 chatformat_type: dsv4
+tool_parser: DeepSeekV4ToolParser
+reasoning_type: switchable
 
 vocab_size: 129280
 bos_token_id: 0

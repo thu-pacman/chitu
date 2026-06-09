@@ -11,6 +11,7 @@ from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 from chitu.global_vars import get_global_args
 
 triton, has_triton = try_import_platform_dep("triton")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 has_triton_impl = has_triton and has_accelerator()
 
@@ -23,6 +24,7 @@ if has_triton_impl:
         append_to_paged_kv_cache_blockfp8_deepgemm_triton,
         read_from_paged_kv_cache_triton,
         read_from_paged_indexer_kv_cache_deepgemm_triton,
+        convert_req_index_to_global_ragged_index_triton,
     )
 
 
@@ -456,6 +458,86 @@ if has_triton_impl:
 
 
 @make_op_dispatcher
+def convert_req_index_to_global_ragged_index(
+    req_id: torch.Tensor,
+    position_id: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    lens: torch.Tensor,
+    token_indices: torch.Tensor,
+    causal: bool = True,
+    num_topk_tokens: Optional[int] = None,
+    impl: str = "auto",
+) -> torch.Tensor:
+    """
+    Convert per-request token indices to row indices in a ragged KV tensor.
+
+    Invalid indices are written as -1. For causal prefill, an index is valid
+    only if it is <= the query position. For non-causal prefill, it must be
+    within the request length.
+    """
+    raise NotImplementedError
+
+
+@convert_req_index_to_global_ragged_index.register_auto
+def _auto_convert_req_index_to_global_ragged_index():
+    if has_triton_impl and get_global_args().infer.op_impl != "cpu":
+        return "triton"
+    return "torch"
+
+
+@convert_req_index_to_global_ragged_index.register("torch")
+def convert_req_index_to_global_ragged_index_torch(
+    req_id: torch.Tensor,
+    position_id: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    lens: torch.Tensor,
+    token_indices: torch.Tensor,
+    causal: bool = True,
+    num_topk_tokens: Optional[int] = None,
+) -> torch.Tensor:
+    if num_topk_tokens is not None:
+        token_indices = token_indices[..., :num_topk_tokens]
+
+    req_id = req_id.to(torch.long)
+    prefix = prefix_lens[req_id]
+    upper = position_id + 1 if causal else lens[req_id]
+
+    out = prefix.unsqueeze(-1) + token_indices
+    invalid = (token_indices < 0) | (token_indices >= upper.unsqueeze(-1))
+    out[invalid] = -1
+    return out.to(torch.int32)
+
+
+def convert_req_index_to_global_ragged_index_triton_impl(
+    req_id: torch.Tensor,
+    position_id: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    lens: torch.Tensor,
+    token_indices: torch.Tensor,
+    causal: bool = True,
+    num_topk_tokens: Optional[int] = None,
+) -> torch.Tensor:
+    if num_topk_tokens is None:
+        num_topk_tokens = token_indices.size(-1)
+    return convert_req_index_to_global_ragged_index_triton(
+        req_id,
+        position_id,
+        prefix_lens,
+        lens,
+        token_indices,
+        causal=causal,
+        NUM_TOPK_TOKENS=num_topk_tokens,
+    )
+
+
+convert_req_index_to_global_ragged_index.register_candidate("triton")
+if has_triton_impl:
+    convert_req_index_to_global_ragged_index.register("triton")(
+        convert_req_index_to_global_ragged_index_triton_impl
+    )
+
+
+@make_op_dispatcher
 def read_from_paged_indexer_kv_cache_deepgemm(
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -611,3 +693,54 @@ def fp8_pertensor_kvcache_quant(xq, xk, xv, k_scale, v_scale):
 
 def fp8_pertoken_kvcache_quant_dsa(kv_lora_k_pe, kv_lora_rank):
     return quant_pertoken_kvcache_dsa(kv_lora_k_pe, kv_lora_rank)
+
+
+def dsa_fp8_kvcache_dequant(kv_fp8: torch.Tensor, out: Optional[torch.Tensor] = None):
+    """Dequantize FlashMLA DSA FP8 KV cache layout to bf16.
+
+    The packed last dim is 656 bytes:
+    512 FP8 NoPE values, 4 FP32 scales, and 64 BF16 RoPE values.
+    The returned tensor has the same leading shape and a 576-wide bf16 last dim.
+    """
+    if not kv_fp8.is_cuda:
+        raise NotImplementedError("DSA FP8 KV dequant only supports CUDA tensors")
+    if not has_chitu_backend or not hasattr(
+        chitu_backend, "cuda_dsa_fp8_kvcache_dequant"
+    ):
+        raise NotImplementedError(
+            "DSA FP8 KV dequant requires chitu_backend built with "
+            "cuda_dsa_fp8_kvcache_dequant"
+        )
+    return chitu_backend.cuda_dsa_fp8_kvcache_dequant(kv_fp8.contiguous(), out)
+
+
+def dsa_fp8_paged_kvcache_read_dequant(
+    kv_fp8: torch.Tensor,
+    page_table: torch.Tensor,
+    position_ids: torch.Tensor,
+    seq_ids: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+):
+    """Read FlashMLA DSA FP8 paged KV cache and dequantize to ragged bf16."""
+    if (
+        has_chitu_backend
+        and hasattr(chitu_backend, "cuda_dsa_fp8_paged_kvcache_read_dequant")
+        and kv_fp8.is_cuda
+    ):
+        index_dtype = page_table.dtype
+        return chitu_backend.cuda_dsa_fp8_paged_kvcache_read_dequant(
+            kv_fp8.contiguous(),
+            page_table.contiguous(),
+            position_ids.to(device=kv_fp8.device, dtype=index_dtype).contiguous(),
+            seq_ids.to(device=kv_fp8.device, dtype=index_dtype).contiguous(),
+            out,
+        )
+
+    if not kv_fp8.is_cuda:
+        raise NotImplementedError(
+            "DSA FP8 paged KV read-dequant only supports CUDA tensors"
+        )
+    raise NotImplementedError(
+        "DSA FP8 paged KV read-dequant requires chitu_backend built with "
+        "cuda_dsa_fp8_paged_kvcache_read_dequant"
+    )

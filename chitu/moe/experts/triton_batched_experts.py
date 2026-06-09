@@ -72,7 +72,8 @@ def moe_mmk(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     compute_type: tl.constexpr,
-    use_w8a8: tl.constexpr,
+    use_fp8_w8a8: tl.constexpr,
+    use_int8_w8a8: tl.constexpr,
     use_w8a16: tl.constexpr,
     per_act_token_quant: tl.constexpr,
 ):
@@ -85,7 +86,7 @@ def moe_mmk(
         )
         b_scale = tl.load(b_scale_ptrs)
 
-    if use_w8a8:
+    if use_fp8_w8a8 or use_int8_w8a8:
         # block-wise
         if group_k > 0 and group_n > 0:
             a_scale_ptrs = a_scale_ptr + offs_m * stride_asm
@@ -108,10 +109,13 @@ def moe_mmk(
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
-    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
-    # of fp32 values for higher accuracy.
-    # `accumulator` will be converted back to fp16 after the loop.
-    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block. FP paths use
+    # fp32 for higher accuracy; int8 W8A8 accumulates integer dot products first
+    # and applies activation/weight scales after the K reduction.
+    if use_int8_w8a8:
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    else:
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
@@ -124,7 +128,7 @@ def moe_mmk(
         # We accumulate along the K dimension.
         if use_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
-        elif use_w8a8:
+        elif use_fp8_w8a8 or use_int8_w8a8:
             if group_k > 0 and group_n > 0:
                 k_start = k * BLOCK_K
                 offs_ks = k_start // group_k
@@ -136,7 +140,10 @@ def moe_mmk(
                 accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
                 # acc used to enable fp8_fast_accum
-                accumulator = tl.dot(a, b, acc=accumulator)
+                if use_fp8_w8a8:
+                    accumulator = tl.dot(a, b, acc=accumulator, out_dtype=tl.float32)
+                elif use_int8_w8a8:
+                    accumulator = tl.dot(a, b, acc=accumulator, out_dtype=tl.int32)
         else:
             accumulator += tl.dot(a, b)
 
@@ -146,7 +153,7 @@ def moe_mmk(
 
     if use_w8a16:
         accumulator = (accumulator * b_scale).to(compute_type)
-    elif use_w8a8:
+    elif use_fp8_w8a8 or use_int8_w8a8:
         if group_k > 0 and group_n > 0:
             accumulator = accumulator.to(compute_type)
         else:
@@ -188,10 +195,11 @@ def expert_triton_kernel(
     # offsets
     offs_bn,
     # Blockwise quantization data
-    group_n,
-    group_k,
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
     # Quantization schemes
     use_fp8_w8a8: tl.constexpr,
+    use_int8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     per_act_token_quant: tl.constexpr,
     # Kernel config
@@ -242,6 +250,7 @@ def expert_triton_kernel(
         BLOCK_K,
         compute_type,
         use_fp8_w8a8,
+        use_int8_w8a8,
         use_int8_w8a16,
         per_act_token_quant,
     )
@@ -292,6 +301,7 @@ def batched_triton_kernel(
     group_k: tl.constexpr,
     # Quantization schemes
     use_fp8_w8a8: tl.constexpr,
+    use_int8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     per_act_token_quant: tl.constexpr,
     # Kernel config
@@ -341,7 +351,7 @@ def batched_triton_kernel(
 
     offs_bn = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N).to(tl.int64)) % N
 
-    if use_fp8_w8a8:
+    if use_fp8_w8a8 or use_int8_w8a8:
         a_scale_ptr = a_scale_ptr + expert_id * stride_ase
         b_scale_ptr = b_scale_ptr + expert_id * stride_bse
 
@@ -381,6 +391,7 @@ def batched_triton_kernel(
         group_k,
         # Quantization schemes
         use_fp8_w8a8,
+        use_int8_w8a8,
         use_int8_w8a16,
         per_act_token_quant,
         # Kernel config
@@ -402,6 +413,7 @@ def invoke_moe_batched_triton_kernel(
     B_zp: Optional[torch.Tensor],
     # Quantization schemes
     use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
     config: dict[str, int],
@@ -410,6 +422,9 @@ def invoke_moe_batched_triton_kernel(
 ):
 
     assert not use_int4_w4a16
+    assert not (use_fp8_w8a8 and use_int8_w8a8)
+    assert not (use_int8_w8a8 and use_int8_w8a16)
+    assert not (use_fp8_w8a8 and use_int8_w8a16)
     max_num_tokens = A.size(1)
     K = A.size(2)
     N = C.size(2)
@@ -503,6 +518,7 @@ def invoke_moe_batched_triton_kernel(
         0 if block_shape is None else block_shape[1],
         # Quantization schemes
         use_fp8_w8a8,
+        use_int8_w8a8,
         use_int8_w8a16,
         per_act_token_quant,
         # Kernel config
@@ -558,6 +574,7 @@ def triton_batched_experts(
         B_scale=None,
         B_zp=None,
         use_fp8_w8a8=False,
+        use_int8_w8a8=False,
         use_int8_w8a16=False,
         use_int4_w4a16=False,
         config=config,
@@ -581,6 +598,7 @@ def triton_batched_experts(
         B_scale=None,
         B_zp=None,
         use_fp8_w8a8=False,
+        use_int8_w8a8=False,
         use_int8_w8a16=False,
         use_int4_w4a16=False,
         config=config,
