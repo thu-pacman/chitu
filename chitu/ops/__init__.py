@@ -20,8 +20,11 @@ from chitu.ops.kv_cache import (
     read_from_dense_kv_cache,
     append_to_paged_kv_cache_blockfp8_deepgemm,
     read_from_paged_indexer_kv_cache_deepgemm,
+    convert_req_index_to_global_ragged_index,
     fp8_pertensor_kvcache_quant,
     fp8_pertoken_kvcache_quant_dsa,
+    dsa_fp8_kvcache_dequant,
+    dsa_fp8_paged_kvcache_read_dequant,
 )
 from chitu.ops.norm import rms_norm
 from chitu.ops.moe_gate import moe_gate

@@ -60,6 +60,9 @@ def get_extensions():
     enable_custom_all_reduce = (
         (hygon_build == "0") and (muxi_build == "0") and (ascend_build == "0")
     )
+    enable_dsa_fp8_kv_dequant = (
+        (hygon_build == "0") and (muxi_build == "0") and (ascend_build == "0")
+    )
 
     if enable_nvfp4:
         cutlass_path = os.path.join(this_dir, "../third_party/cutlass")
@@ -95,6 +98,13 @@ def get_extensions():
             os.path.join(this_dir, "cuda/allreduce/vllm_custom_all_reduce.cu"),
         ]
 
+    if enable_dsa_fp8_kv_dequant:
+        cxx_extra_args += ["-DCHITU_ENABLE_DSA_FP8_KV_DEQUANT=1"]
+        nvcc_extra_args += ["-DCHITU_ENABLE_DSA_FP8_KV_DEQUANT=1"]
+        extra_sources += [
+            os.path.join(this_dir, "cuda/dequant/dequant_kv.cu"),
+        ]
+
     base_sources = [
         os.path.join(this_dir, "cuda/binding.cpp"),
         os.path.join(this_dir, "cuda/moe/moe_align_kernel.cu"),
@@ -114,7 +124,6 @@ def get_extensions():
         base_sources.append(
             os.path.join(this_dir, "cuda/gemm/w4a8_per_group_gemm_cuda.cu")
         )
-
     if hygon_build == "1":
         cxx_extra_args += ["-DCHITU_HYGON_BUILD=1"]
         nvcc_extra_args += ["-DCHITU_HYGON_BUILD=1"]

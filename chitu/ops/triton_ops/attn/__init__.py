@@ -15,6 +15,7 @@ from chitu.ops.triton_ops.attn.mla_decode import (
 from chitu.ops.triton_ops.attn.flashmla_ops import (
     append_to_paged_kv_cache_flashmla_dsv4,
     convert_req_index_to_global_paged_index_triton,
+    convert_req_index_to_global_ragged_index_triton,
     quant_pertoken_kvcache_dsa,
     quant_with_gt_scales,
 )

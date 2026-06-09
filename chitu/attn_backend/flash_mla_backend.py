@@ -11,7 +11,12 @@ import torch
 from chitu.attn_backend.triton_attn_backend import TritonAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import PagedKVCacheAccessor
-from chitu.ops import append_to_paged_kv_cache, read_from_paged_kv_cache
+from chitu.ops import (
+    append_to_paged_kv_cache,
+    convert_req_index_to_global_ragged_index,
+    dsa_fp8_paged_kvcache_read_dequant,
+    read_from_paged_kv_cache,
+)
 from chitu.utils import try_import_opt_dep, ceil_div
 from chitu.distributed.parallel_state import get_dp_size
 from chitu.device_type import has_accelerator, is_hygon, is_muxi
@@ -219,6 +224,27 @@ class FlashMLABackend(TritonAttnBackend):
                 "Converting indices with triton in ragged format is not supported yet"
             )
 
+    def convert_indices_ragged(
+        self,
+        topk_indices,
+        seq_len_delta,
+        causal=True,
+        format="ragged",
+    ):
+        if format == "paged":
+            raise NotImplementedError()
+        if topk_indices.size(-1) < self.index_topk:
+            topk_indices = self.pad_indices(topk_indices)
+        return convert_req_index_to_global_ragged_index(
+            seq_len_delta.delta_seq_ids_tensor_device,
+            seq_len_delta.delta_position_ids_tensor_device,
+            seq_len_delta.new.prefix_lens_tensor_device,
+            seq_len_delta.new.lens_tensor_device,
+            topk_indices.to(torch.int32),
+            causal=causal,
+            num_topk_tokens=topk_indices.size(-1),
+        )
+
     def pad_h_q(
         self,
         q: torch.Tensor,
@@ -363,7 +389,10 @@ class FlashMLABackend(TritonAttnBackend):
         q = self.pad_h_q(q, num_tokens, local_h_q)
 
         if not is_decode:  # mixed (prefill) batch: add batch_dim=1
-            q = q.unsqueeze(0)
+            q = q.as_strided(
+                (1, q.shape[0], q.shape[1], q.shape[2]),
+                (0, q.stride(0), q.stride(1), q.stride(2)),
+            )
             topk_indices = topk_indices.unsqueeze(0)
             cache_seqlens = seq_len_delta.new.lens_tensor_device.sum(
                 0, keepdim=True, dtype=torch.int32
@@ -723,8 +752,7 @@ class FlashMLABackend(TritonAttnBackend):
         if q_nope.numel() == 0:
             return torch.empty_like(q_nope)
 
-        # TODO: leverage triton kernel to accelerate converting
-        topk_indices = self.convert_indices_ragged_torch(
+        topk_indices = self.convert_indices_ragged(
             topk_indices,
             seq_len_delta,
             causal,
@@ -908,32 +936,46 @@ class FlashMLABackend(TritonAttnBackend):
             seq_len_delta,
         )
 
-        topk_indices = self.convert_indices_paged_triton(
-            topk_indices.to(torch.int32),
-            seq_len_delta,
-            block_table=kv_cache.block_table,
-            block_size=paged_kv.shape[-2],
-            causal=causal,
-        )
-        topk_indices.squeeze_(1)
+        topk_indices = topk_indices.to(torch.int32)
 
         if softmax_scale is None:
             softmax_scale = 1.0 / ((q_pe.shape[-1] + self.qk_nope_head_dim) ** 0.5)
 
         if self.use_fp8_cache:
-            return self.flashmla_sparse_fwd_fp8(
-                q,
+            # For FP8 KV prefill, use dequantized BF16 KV intentionally rather
+            # than the FP8 sparse attention path. Sparse MLA prefill can visit
+            # the same KV entries multiple times, so doing dequant inside the
+            # attention kernel would repeat that work. The BF16 sparse prefill
+            # kernel is also the path tuned for prefill behavior. Decode still
+            # keeps the FP8 sparse attention path.
+            attn_kv = dsa_fp8_paged_kvcache_read_dequant(
                 paged_kv,
-                topk_indices,
                 kv_cache.block_table,
-                seq_len_delta,
-                softmax_scale=softmax_scale,
-                is_decode=False,
+                seq_len_delta.new.position_ids_tensor_device,
+                seq_len_delta.new.seq_ids_tensor_device,
             )
+            topk_indices = self.convert_indices_ragged(
+                topk_indices,
+                seq_len_delta,
+                causal,
+            )
+        else:
+            # BF16 paged KV and dequantized BF16 ragged KV can both use the
+            # same FlashMLA sparse prefill wrapper, but their index layouts must
+            # match their KV layouts.
+            attn_kv = paged_kv
+            topk_indices = self.convert_indices_paged_triton(
+                topk_indices,
+                seq_len_delta,
+                block_table=kv_cache.block_table,
+                block_size=paged_kv.shape[-2],
+                causal=causal,
+            )
+            topk_indices.squeeze_(1)
 
         output = self.flashmla_sparse_fwd_bf16(
             q,
-            paged_kv,
+            attn_kv,
             softmax_scale,
             topk_indices,
         )

@@ -27,6 +27,9 @@ from chitu.testing import assert_close
 from chitu.ops import (
     append_to_paged_kv_cache,
     append_to_paged_kv_cache_blockfp8_deepgemm,
+    convert_req_index_to_global_ragged_index,
+    dsa_fp8_paged_kvcache_read_dequant,
+    read_from_paged_kv_cache,
 )
 from chitu.dsa_indexer import DSAIndexer, support_indexer_deepgemm
 
@@ -40,6 +43,54 @@ flash_attn3, has_flash_attn3 = try_import_opt_dep(
 )
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 hunyuan_ops, has_hunyuan_ops = try_import_opt_dep("hpc", "hpc_ops")
+
+
+def _dequant_dsa_fp8_kv_cache(kv_fp8: torch.Tensor) -> torch.Tensor:
+    """Dequantize DeepSeek/GLM DSA FP8 MLA KV layout to bf16.
+
+    The packed last dim is 656 bytes:
+      512 float8 latent KV values + 4 fp32 scales + 64 bf16 RoPE values.
+    """
+    d_nope = 512
+    d_rope = 64
+    tile_size = 128
+    num_tiles = d_nope // tile_size
+
+    assert kv_fp8.shape[-1] == d_nope + num_tiles * 4 + d_rope * 2
+    packed = kv_fp8.view(*kv_fp8.shape[:-1], -1)
+    nope_fp8 = packed[..., :d_nope]
+    scales = (
+        packed[..., d_nope : d_nope + num_tiles * 4]
+        .view(torch.float32)
+        .view(
+            *packed.shape[:-1],
+            num_tiles,
+        )
+    )
+    rope = (
+        packed[..., d_nope + num_tiles * 4 :]
+        .view(torch.bfloat16)
+        .view(
+            *packed.shape[:-1],
+            d_rope,
+        )
+    )
+
+    kv_bf16 = torch.empty(
+        *packed.shape[:-1],
+        d_nope + d_rope,
+        dtype=torch.bfloat16,
+        device=kv_fp8.device,
+    )
+    for tile_idx in range(num_tiles):
+        begin = tile_idx * tile_size
+        end = begin + tile_size
+        kv_bf16[..., begin:end] = (
+            nope_fp8[..., begin:end].to(torch.float32)
+            * scales[..., tile_idx].to(torch.float32).unsqueeze(-1)
+        ).to(torch.bfloat16)
+    kv_bf16[..., d_nope:] = rope
+    return kv_bf16
 
 
 @pytest.mark.parametrize("bs", [0, 1, 5])
@@ -549,6 +600,248 @@ def test_mla_prefill_ragged_qo_paged_kv(
     assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
 
     # this test is complex, not add record benchmark now
+
+
+@pytest.mark.parametrize("bs,seq_len", [(1, 40960)])
+def test_flash_mla_fp8_kvcache_dequant_bf16_prefill(
+    bs,
+    seq_len,
+    record_benchmark,
+):
+    if not has_accelerator() or not has_flash_mla:
+        pytest.skip("flash_mla is missing")
+    if not hasattr(flash_mla, "flash_mla_sparse_fwd"):
+        pytest.skip("flash_mla is too old to have `flash_mla_sparse_fwd`")
+    if not has_triton:
+        pytest.skip("triton is required for DSA FP8 KV quantization")
+
+    torch.set_default_dtype(torch.bfloat16)
+
+    local_n_heads = 8  # GLM-5 TP8 shape
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 192
+    topk = 128
+    page_size = 64
+    page_cnt_per_sample = ceil_div(seq_len, page_size)
+    max_num_pages = bs * page_cnt_per_sample
+
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_batch_size": bs,
+                    "op_impl": "torch",
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "cache_type": "paged",
+                    "dp_size": 1,
+                    "mla_absorb": "absorb-without-precomp",
+                    "max_seq_len": seq_len,
+                    "mtp_size": 1,
+                },
+                "models": {
+                    "n_heads": local_n_heads,
+                    "kv_lora_rank": kv_lora_rank,
+                    "qk_rope_head_dim": qk_rope_head_dim,
+                    "qk_nope_head_dim": qk_nope_head_dim,
+                    "dim": 7168,
+                    "type": "deepseek-v3",
+                    "index_topk": topk,
+                },
+            }
+        ),
+        need_ensure=False,
+    )
+
+    seq_len_delta = BatchedSeqLenDelta(
+        [0 for _ in range(bs)],
+        [seq_len for _ in range(bs)],
+        device="cuda",
+        cache_prefix_lens_tensor_device=False,
+        cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
+        cache_delta_position_ids_tensor_device=False,
+        cache_delta_seq_ids_tensor_device=False,
+    )
+    page_table = torch.arange(max_num_pages, device="cuda", dtype=torch.int32).view(
+        bs, page_cnt_per_sample
+    )
+
+    q_nope = torch.randn(
+        seq_len_delta.delta_total_len,
+        local_n_heads,
+        kv_lora_rank,
+        device="cuda",
+    )
+    q_pe = torch.randn(
+        seq_len_delta.delta_total_len,
+        local_n_heads,
+        qk_rope_head_dim,
+        device="cuda",
+    )
+    this_kv = torch.randn(
+        seq_len_delta.delta_total_len,
+        1,
+        kv_lora_rank + qk_rope_head_dim,
+        device="cuda",
+    )
+
+    positions = torch.arange(1, seq_len + 1, device="cuda", dtype=torch.float32).view(
+        1, seq_len, 1
+    )
+    topk_indices = (
+        torch.rand(bs, seq_len, topk, device="cuda").mul_(positions).to(torch.int32)
+    ).view(bs * seq_len, topk)
+
+    fp8_backend = FlashMLABackend(
+        qk_nope_head_dim=qk_nope_head_dim,
+        index_topk=topk,
+        use_fp8=True,
+    )
+    bf16_backend = FlashMLABackend(
+        qk_nope_head_dim=qk_nope_head_dim,
+        index_topk=topk,
+        use_fp8=False,
+    )
+
+    softmax_scale = 1.0 / ((qk_rope_head_dim + qk_nope_head_dim) ** 0.5)
+    fp8_cache = torch.empty(
+        max_num_pages,
+        page_size,
+        656,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+
+    out = fp8_backend.mla_prefill_ragged_qo_paged_kv(
+        q_nope,
+        q_pe,
+        PagedKVCacheAccessor(page_table, {"kv_lora_k_pe": fp8_cache}),
+        this_kv,
+        seq_len_delta,
+        causal=True,
+        softmax_scale=softmax_scale,
+        topk_indices=topk_indices,
+    )
+
+    q = torch.cat([q_nope, q_pe], dim=-1)
+    topk_indices_ragged = convert_req_index_to_global_ragged_index(
+        seq_len_delta.delta_seq_ids_tensor_device,
+        seq_len_delta.delta_position_ids_tensor_device,
+        seq_len_delta.new.prefix_lens_tensor_device,
+        seq_len_delta.new.lens_tensor_device,
+        topk_indices.to(torch.int32),
+        causal=True,
+        num_topk_tokens=topk_indices.size(-1),
+        impl="torch",
+    )
+    topk_indices_ragged_dispatched = convert_req_index_to_global_ragged_index(
+        seq_len_delta.delta_seq_ids_tensor_device,
+        seq_len_delta.delta_position_ids_tensor_device,
+        seq_len_delta.new.prefix_lens_tensor_device,
+        seq_len_delta.new.lens_tensor_device,
+        topk_indices.to(torch.int32),
+        causal=True,
+        num_topk_tokens=topk_indices.size(-1),
+    )
+    assert_close(topk_indices_ragged_dispatched, topk_indices_ragged, atol=0, rtol=0)
+
+    ragged_fp8_kv = read_from_paged_kv_cache(
+        fp8_cache,
+        page_table,
+        seq_len_delta.new.position_ids_tensor_device,
+        seq_len_delta.new.seq_ids_tensor_device,
+    )
+    ragged_bf16_kv = dsa_fp8_paged_kvcache_read_dequant(
+        fp8_cache,
+        page_table,
+        seq_len_delta.new.position_ids_tensor_device,
+        seq_len_delta.new.seq_ids_tensor_device,
+    )
+    ragged_bf16_kv_ref = _dequant_dsa_fp8_kv_cache(ragged_fp8_kv)
+    assert_close(ragged_bf16_kv, ragged_bf16_kv_ref, atol=0, rtol=0)
+
+    ref_out = bf16_backend.flashmla_sparse_fwd_bf16(
+        q,
+        ragged_bf16_kv,
+        softmax_scale=softmax_scale,
+        topk_indices=topk_indices_ragged_dispatched,
+    )
+    assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+
+    def run_dequant_bf16_prefill_from_cache():
+        this_ragged_bf16_kv = dsa_fp8_paged_kvcache_read_dequant(
+            fp8_cache,
+            page_table,
+            seq_len_delta.new.position_ids_tensor_device,
+            seq_len_delta.new.seq_ids_tensor_device,
+        )
+        this_topk_indices_ragged = bf16_backend.convert_indices_ragged(
+            topk_indices,
+            seq_len_delta,
+            causal=True,
+        )
+        return bf16_backend.flashmla_sparse_fwd_bf16(
+            q,
+            this_ragged_bf16_kv,
+            softmax_scale=softmax_scale,
+            topk_indices=this_topk_indices_ragged,
+        )
+
+    def run_fp8_prefill_from_cache():
+        this_topk_indices_paged = fp8_backend.convert_indices_paged_triton(
+            topk_indices,
+            seq_len_delta,
+            block_table=page_table,
+            block_size=page_size,
+            causal=True,
+        )
+        this_topk_indices_paged.squeeze_(1)
+        return fp8_backend.flashmla_sparse_fwd_fp8(
+            q,
+            fp8_cache,
+            this_topk_indices_paged,
+            page_table,
+            seq_len_delta,
+            softmax_scale=softmax_scale,
+            is_decode=False,
+        )
+
+    padded_local_n_heads = local_n_heads
+    while padded_local_n_heads in fp8_backend.sparse_attn_unsupported_h_q_set:
+        padded_local_n_heads += 1
+    fp8_output_batch_stride = seq_len * padded_local_n_heads * kv_lora_rank
+    can_run_fp8_prefill_baseline = (
+        fp8_output_batch_stride <= torch.iinfo(torch.int32).max
+    )
+
+    # Keep the benchmark fair when pytest is invoked with --warmup-round=0:
+    # correctness checks above already exercised the dequant+bf16 path, while
+    # this is the first direct fp8 FlashMLA call in this test.
+    warmup_bf16_out = run_dequant_bf16_prefill_from_cache()
+    assert_close(warmup_bf16_out, ref_out, atol=1e-2, rtol=1e-2)
+    benchmark_impls = {
+        "dequant_bf16_prefill_from_cache": run_dequant_bf16_prefill_from_cache,
+    }
+    if can_run_fp8_prefill_baseline:
+        fp8_backend.prepare_metadata_for_prefill(seq_len_delta)
+        warmup_fp8_out = run_fp8_prefill_from_cache()
+        assert_close(warmup_fp8_out, ref_out, atol=5e-2, rtol=5e-2, cos_sim_tol=2e-3)
+        benchmark_impls["fp8_prefill_from_cache"] = run_fp8_prefill_from_cache
+    else:
+        print(
+            "Skip fp8_prefill_from_cache benchmark because FlashMLA "
+            f"output batch stride {fp8_output_batch_stride} exceeds int32 limit"
+        )
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    record_benchmark(
+        x_val=f"bs={bs},seq={seq_len}",
+        x_name="scenario",
+        impls=benchmark_impls,
+    )
 
 
 @pytest.mark.parametrize("bs", [0, 1, 64])

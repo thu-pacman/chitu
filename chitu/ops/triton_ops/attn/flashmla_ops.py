@@ -502,4 +502,103 @@ def convert_req_index_to_global_paged_index_triton(
     return out
 
 
+@triton.jit
+def _convert_req_index_to_global_ragged_index_kernel(
+    req_id_ptr,  # int32 [num_tokens]
+    position_id_ptr,  # int32 [num_tokens]
+    prefix_lens_ptr,  # int32 [num_requests + 1]
+    lens_ptr,  # int32 [num_requests]
+    token_indices_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    out_ptr,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    CAUSAL: tl.constexpr,
+    ti_stride0,
+    ti_stride1,
+    out_stride0,
+    out_stride1,
+):
+    token_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+    indice_id = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = indice_id < NUM_TOPK_TOKENS
+
+    req = tl.load(req_id_ptr + token_id)
+    prefix = tl.load(prefix_lens_ptr + req)
+    if CAUSAL:
+        upper = tl.load(position_id_ptr + token_id) + 1
+    else:
+        upper = tl.load(lens_ptr + req)
+
+    ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
+    tok = tl.load(ti_ptr, mask=mask, other=-1)
+    invalid = (tok < 0) | (tok >= upper)
+    out_val = tl.where(invalid, -1, prefix + tok)
+
+    out_ptr_ij = out_ptr + token_id * out_stride0 + indice_id * out_stride1
+    tl.store(out_ptr_ij, out_val, mask=mask)
+
+
+def convert_req_index_to_global_ragged_index_triton(
+    req_id: torch.Tensor,  # int32 [num_tokens]
+    position_id: torch.Tensor,  # int32 [num_tokens]
+    prefix_lens: torch.Tensor,  # int32 [num_requests + 1]
+    lens: torch.Tensor,  # int32 [num_requests]
+    token_indices: torch.Tensor,  # int32 [num_tokens, NUM_TOPK_TOKENS]
+    *,
+    causal: bool = True,
+    NUM_TOPK_TOKENS: int = 2048,
+    BLOCK_N: int = 128,
+):
+    """
+    Convert per-request token indices to row indices in a ragged KV tensor.
+
+    out[token_id, indice_id] =
+        prefix_lens[req_id[token_id]] + token_indices[token_id, indice_id]
+
+    Invalid indices are written as -1. For causal prefill, a token is valid only
+    if it is <= the query position. For non-causal prefill, it must be within
+    the request length.
+    """
+    assert req_id.dtype == torch.int32
+    assert position_id.dtype == torch.int32
+    assert prefix_lens.dtype == torch.int32
+    assert lens.dtype == torch.int32
+    assert token_indices.dtype == torch.int32
+    assert token_indices.shape[1] == NUM_TOPK_TOKENS
+
+    num_tokens = req_id.shape[0]
+    token_indices_c = token_indices.contiguous()
+    out = torch.empty_like(token_indices_c)
+    if num_tokens == 0:
+        return out
+
+    req_id_c = req_id.contiguous()
+    position_id_c = position_id.contiguous()
+    prefix_lens_c = prefix_lens.contiguous()
+    lens_c = lens.contiguous()
+
+    tiles_per_row = triton.cdiv(NUM_TOPK_TOKENS, BLOCK_N)
+    ti_stride0, ti_stride1 = token_indices_c.stride()
+    out_stride0, out_stride1 = out.stride()
+    grid = (num_tokens, tiles_per_row)
+
+    _convert_req_index_to_global_ragged_index_kernel[grid](
+        req_id_c,
+        position_id_c,
+        prefix_lens_c,
+        lens_c,
+        token_indices_c,
+        out,
+        NUM_TOPK_TOKENS,
+        BLOCK_N,
+        causal,
+        ti_stride0,
+        ti_stride1,
+        out_stride0,
+        out_stride1,
+    )
+    return out
+
+
 # SPDX-SnippetEnd
