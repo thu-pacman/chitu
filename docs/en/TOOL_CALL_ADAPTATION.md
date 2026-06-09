@@ -295,23 +295,25 @@ When implementing and testing a new model, verify the mapping from `tool_choice`
 
 ## Example: Check Prompt and Parser Alignment with DeepSeek
 
-This section is not a DeepSeek V4-specific adaptation reference. It uses the current DeepSeek V4 config and DeepSeek V3.2 parser as an example of how to check protocol differences for any new model. For another model, follow the same order: check what `chatformat_type` or chat template does, what format an existing parser accepts, and whether the model yaml sets the correct `tool_parser`.
+This section uses DeepSeek V4's reuse of the DeepSeek V3.2 DSML components as an example of how to check protocol differences for any new model. For another model, follow the same order: check what `chatformat_type` or chat template does, what format an existing parser accepts, and whether the model yaml sets the correct `tool_parser`.
 
-In this example, the current DeepSeek V4 model config contains:
+The DeepSeek V4 model config should contain:
 
 ```yaml
 chatformat_type: dsv4
+tool_parser: DeepSeekV4ToolParser
+reasoning_type: switchable
 ```
 
 This makes the tokenizer use `ChatFormatHF_dsv4` and `encoding_dsv4.py` to build the DeepSeek V4 prompt. When `tools` are present, that path injects the tool list as a system message before running the DSV4 encoding logic.
 
-However, `chatformat_type: dsv4` only solves prompt formatting. It does not enable server-side tool calling by itself. The DeepSeek V4 config still needs an explicit `tool_parser`; otherwise the server uses `DummyToolParser`, which means:
+However, `chatformat_type: dsv4` only solves prompt formatting. It does not enable server-side tool calling by itself. `tool_parser` selects the grammar and parser. If no valid `tool_parser` is configured, the server uses `DummyToolParser`, which means:
 
 - No `xgrammar` constrained decoding.
 - Model output is not parsed into API `tool_calls`.
 - Streaming responses treat tool-call text as plain content.
 
-The current DSV4 prompt uses `<｜DSML｜tool_calls>` as the tool-call block name, while `DeepSeekV32ToolParser` expects `<｜DSML｜function_calls>`. Do not assume that setting `DeepSeekV32ToolParser` is enough for DeepSeek V4; first confirm and align the block name, tags, argument encoding, thinking rules, and termination behavior.
+The DSV4 prompt uses `<｜DSML｜tool_calls>` as the tool-call block name, while `DeepSeekV32ToolParser` expects `<｜DSML｜function_calls>`. Therefore, do not assume that configuring DeepSeek V4 with `DeepSeekV32ToolParser` is enough; first confirm and align the block name, tags, argument encoding, thinking rules, and termination behavior. The current `DeepSeekV4ToolParser` does this by reusing the DeepSeek V3.2 `invoke` / `parameter` tag structure and argument encoding rules, while aligning the outer block name to `<｜DSML｜tool_calls>` on both the grammar and parser sides. The model config also uses `reasoning_type: switchable` to align the `<think>...</think>` behavior when `enable_thinking` is enabled. For other DSML-style models, verify each of these protocol details in the same order instead of relying on superficial tag similarity.
 
 The general rule is: whatever format the prompt asks the model to emit must be accepted by both `root_grammar` and `root_parser`. If the only visible difference is the block name, a DSML-style parser for a new model would still need to update both grammar and parser sides. The following sketch is not a complete adaptation for any specific model:
 

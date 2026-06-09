@@ -24,3 +24,4 @@ from .qwen3_coder_parser import Qwen3CoderToolParser
 from .glm47_parser import GLM47ToolParser
 from .glm45_parser import GLM45ToolParser
 from .deepseekv32_parser import DeepSeekV32ToolParser
+from .deepseekv4_parser import DeepSeekV4ToolParser

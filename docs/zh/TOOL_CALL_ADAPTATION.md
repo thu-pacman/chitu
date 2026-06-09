@@ -295,23 +295,25 @@ Chitu 的三个兼容 API 都会进入同一套内部工具调用链路，但输
 
 ## 以 DeepSeek 为例：检查 prompt 和 parser 是否一致
 
-这一节以 DeepSeek V4 配置和 DeepSeek V3.2 parser 做例子，说明适配任意新模型时应该怎么检查协议差异。换成其他模型时，也按同样顺序检查：`chatformat_type` 或 chat template 负责什么、已有 parser 接受什么格式、模型 yaml 是否设置了正确的 `tool_parser`。
+这一节以 DeepSeek V4 parser 如何复用 DeepSeek V3.2 DSML 组件做例子，说明适配任意新模型时应该怎么检查协议差异。换成其他模型时，也按同样顺序检查：`chatformat_type` 或 chat template 负责什么、已有 parser 接受什么格式、模型 yaml 是否设置了正确的 `tool_parser`。
 
-例子中，DeepSeek V4 的现有模型配置包含：
+DeepSeek V4 的模型配置应同时包含：
 
 ```yaml
 chatformat_type: dsv4
+tool_parser: DeepSeekV4ToolParser
+reasoning_type: switchable
 ```
 
 这会让 tokenizer 走 `ChatFormatHF_dsv4`，并通过 `encoding_dsv4.py` 生成 DeepSeek V4 的 prompt。该路径在有 `tools` 时会把工具列表插入成一个 system 消息，再交给 DSV4 编码逻辑处理。
 
-但 `chatformat_type: dsv4` 只解决 prompt 格式，不等于启用了服务层工具调用。当前 DeepSeek V4 配置还需要明确设置 `tool_parser`，否则服务层会使用 `DummyToolParser`，表现为：
+但 `chatformat_type: dsv4` 只解决 prompt 格式，不等于启用了服务层工具调用。`tool_parser` 负责选择 grammar 和 parser；如果缺少有效的 `tool_parser`，服务层会使用 `DummyToolParser`，表现为：
 
 - 没有 `xgrammar` 约束解码。
 - 模型输出不会被解析成 API `tool_calls`。
 - 流式返回只会把工具调用文本当普通 content。
 
-当前 DSV4 prompt 使用的工具调用块名是 `<｜DSML｜tool_calls>`，而 `DeepSeekV32ToolParser` 期望的是 `<｜DSML｜function_calls>`。因此不能直接把 DeepSeek V4 配成 `DeepSeekV32ToolParser` 就认为适配完成；至少要先确认并统一块名、标签、参数编码、thinking 规则和终止条件。
+DSV4 prompt 使用的工具调用块名是 `<｜DSML｜tool_calls>`，而 `DeepSeekV32ToolParser` 期望的是 `<｜DSML｜function_calls>`。因此不能直接把 DeepSeek V4 配成 `DeepSeekV32ToolParser` 就认为适配完成；至少要先确认并统一块名、标签、参数编码、thinking 规则和终止条件。当前 `DeepSeekV4ToolParser` 的处理方式是：复用 DeepSeek V3.2 的 `invoke` / `parameter` 标签结构和参数编码规则，只把外层块名在 grammar 和 parser 两侧统一为 `<｜DSML｜tool_calls>`；同时通过模型配置里的 `reasoning_type: switchable` 对齐 `enable_thinking` 下的 `<think>...</think>` 规则。适配其他 DSML 风格模型时，也应按同样顺序逐项确认，而不是只看表面标签是否相似。
 
 这类差异的通用处理方式是：prompt 要求模型输出什么，`root_grammar` 和 `root_parser` 就必须接受同一种格式。如果只看块名差异，一个 DSML 风格新模型的 parser 至少需要同时改 grammar 和 parser 两侧。下面是示意片段，不代表任何具体模型的完整适配已经完成：
 

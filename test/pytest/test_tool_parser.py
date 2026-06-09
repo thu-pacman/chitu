@@ -214,6 +214,29 @@ def test_deepseekv32():
     run_parse(parser, data, "begin--end", std_tools)
 
 
+def test_deepseekv4():
+    parser = "DeepSeekV4ToolParser"
+    data = (
+        "begin-<｜DSML｜tool_calls>\n"
+        '<｜DSML｜invoke name="test_type">\n'
+        '<｜DSML｜parameter name="ks" string="true">vs</｜DSML｜parameter>\n'
+        '<｜DSML｜parameter name="ko" string="false">{"kb": true}</｜DSML｜parameter>\n'
+        '<｜DSML｜parameter name="ka" string="false">[1, 2, 3]</｜DSML｜parameter>\n'
+        "</｜DSML｜invoke>\n"
+        '<｜DSML｜invoke name="test_empty">\n</｜DSML｜invoke>\n'
+        "</｜DSML｜tool_calls>-end"
+    )
+    run_match(parser, data, True)
+    run_parse(parser, data, "begin--end", std_tools)
+
+    wrong_block = (
+        "<｜DSML｜function_calls>\n"
+        '<｜DSML｜invoke name="test_empty">\n</｜DSML｜invoke>\n'
+        "</｜DSML｜function_calls>"
+    )
+    run_match(parser, wrong_block, False, tool_choice="required")
+
+
 def test_glm47():
     parser = "GLM47ToolParser"
     data = (
@@ -294,6 +317,7 @@ if __name__ == "__main__":
     test_deepseekv3()
     test_deepseekv31()
     test_deepseekv32()
+    test_deepseekv4()
     test_glm45()
     test_glm47()
     test_qwen3()
