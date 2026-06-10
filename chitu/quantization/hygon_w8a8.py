@@ -63,16 +63,105 @@ _DEEPGEMM_MOE_BLOCK_SIZE = 256
 logger = logging.getLogger(__name__)
 
 
+def _prepare_w8a8_dynamic_per_expert_activation(
+    routed_x: PerExpertDenseBatchedRoutedActivationWithScaleMinimal,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if routed_x.quant_method != "w8a8_dynamic":
+        raise RuntimeError(
+            "DeepGEMM MoE only supports w8a8_dynamic pre-quantized "
+            f"activations, got {routed_x.quant_method}."
+        )
+
+    activation_per_expert = routed_x.activation_per_expert.contiguous()
+    if activation_per_expert.dtype != torch.int8:
+        raise RuntimeError(
+            "w8a8_dynamic pre-quantized DeepGEMM MoE activation must be "
+            f"torch.int8, got {activation_per_expert.dtype}."
+        )
+
+    activation_scale_per_expert = routed_x.activation_scale_per_expert.contiguous()
+    if activation_scale_per_expert.ndim == 2:
+        activation_scale_per_expert = activation_scale_per_expert.unsqueeze(-1)
+
+    E, M, _ = activation_per_expert.shape
+    if (
+        activation_scale_per_expert.ndim != 3
+        or tuple(activation_scale_per_expert.shape[:2]) != (E, M)
+        or activation_scale_per_expert.shape[-1] != 1
+    ):
+        raise RuntimeError(
+            "w8a8_dynamic pre-quantized DeepGEMM MoE activation scale must "
+            f"have shape ({E}, {M}, 1), got "
+            f"{tuple(activation_scale_per_expert.shape)}."
+        )
+
+    return activation_per_expert, activation_scale_per_expert
+
+
 def _lightop_gemm_w8a8_smooth_available() -> bool:
     if not has_lightop:
         return False
     return callable(getattr(lightop, "gemm_w8a8_smooth", None))
 
 
+def _lightop_fuse_silu_mul_quant_ep_available() -> bool:
+    if not has_lightop:
+        return False
+    return callable(getattr(lightop, "fuse_silu_mul_quant_ep", None))
+
+
 def _lightop_moe_gemm_w8a8_available() -> bool:
     if not has_lightop:
         return False
     return callable(getattr(lightop, "moe_gemm_w8a8", None))
+
+
+def _a8_per_token_act_quant_with_expert_mask(
+    activation_per_expert: torch.Tensor,
+    n_tokens_per_expert: torch.Tensor,
+    *,
+    scale_dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Fallback for non-prequantized per-expert inputs: only valid rows are
+    # quantized, while padded rows are left zero for masked GEMM.
+    E, M, hidden = activation_per_expert.shape
+    q_activation = torch.zeros(
+        (E, M, hidden),
+        dtype=torch.int8,
+        device=activation_per_expert.device,
+    )
+    activation_scale = torch.zeros(
+        (E, M, 1),
+        dtype=scale_dtype,
+        device=activation_per_expert.device,
+    )
+    if M == 0:
+        return q_activation, activation_scale
+
+    n_tokens_per_expert_cpu = n_tokens_per_expert.detach().cpu().tolist()
+    for expert_id, n_tokens in enumerate(n_tokens_per_expert_cpu):
+        n_tokens = min(max(int(n_tokens), 0), M)
+        if n_tokens == 0:
+            continue
+        q_valid, scale_valid = a8_per_token_act_quant(
+            activation_per_expert[expert_id, :n_tokens].contiguous(),
+            scale_dtype=scale_dtype,
+        )
+        q_activation[expert_id, :n_tokens].copy_(q_valid.view(n_tokens, hidden))
+        activation_scale[expert_id, :n_tokens].copy_(scale_valid.reshape(n_tokens, 1))
+
+    return q_activation.contiguous(), activation_scale.contiguous()
+
+
+def _pad_deepgemm_masked_m(tensor: torch.Tensor, layout_m: int) -> torch.Tensor:
+    if tensor.shape[1] >= layout_m:
+        return tensor.contiguous()
+    return torch.nn.functional.pad(
+        tensor,
+        (0, 0, 0, layout_m - tensor.shape[1]),
+        "constant",
+        0,
+    ).contiguous()
 
 
 def _call_deepgemm_w8a8_grouped_gemm(
@@ -153,6 +242,9 @@ class HygonW8A8Linear(W8A8PerTokenPerChannelDynLinear):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[0] == 0:
+            output_shape = (*x.shape[:-1], self.out_features)
+            return torch.empty(output_shape, dtype=x.dtype, device=x.device)
         return super().forward(x)
 
 
@@ -1122,47 +1214,54 @@ class HygonW8A8DeepGemmMoeExpertsMerged(
             w2_plain_shape=down_native.plain_shape,
         )
 
-        activation_per_expert = routed_x.activation_per_expert.contiguous()
-        E, M, _ = activation_per_expert.shape
-        if M == 0:
+        E, output_m, _ = routed_x.activation_per_expert.shape
+        device = routed_x.activation_per_expert.device
+
+        if output_m == 0:
             return PerExpertDenseBatchedExpertResultMinimal(
                 torch.empty(
                     (E, 0, self.dim),
-                    dtype=activation_per_expert.dtype,
-                    device=activation_per_expert.device,
+                    dtype=torch.bfloat16,
+                    device=device,
                 )
             )
 
         masked_m = routed_x.n_tokens_per_expert.to(torch.int32).contiguous()
         layout_m = max(
-            M,
+            output_m,
             int(routed_x.expected_n_tokens_per_expert),
             _DEEPGEMM_MASKED_MIN_LAYOUT_M,
             1,
         )
-        if M < layout_m:
-            activation_per_expert = torch.nn.functional.pad(
-                activation_per_expert,
-                (0, 0, 0, layout_m - M),
-                "constant",
-                0,
+
+        if isinstance(routed_x, PerExpertDenseBatchedRoutedActivationWithScaleMinimal):
+            activation_per_expert, activation_scale_per_expert = (
+                _prepare_w8a8_dynamic_per_expert_activation(routed_x)
             )
-            M = layout_m
+            activation_per_expert = _pad_deepgemm_masked_m(
+                activation_per_expert, layout_m
+            )
+            activation_scale_per_expert = _pad_deepgemm_masked_m(
+                activation_scale_per_expert, layout_m
+            )
+            q_x = activation_per_expert
+            act_scale = activation_scale_per_expert.to(torch.float32).contiguous()
+        else:
+            q_x, act_scale = _a8_per_token_act_quant_with_expert_mask(
+                routed_x.activation_per_expert.contiguous(),
+                masked_m,
+                scale_dtype=torch.float32,
+            )
+            q_x = _pad_deepgemm_masked_m(q_x, layout_m)
+            act_scale = _pad_deepgemm_masked_m(act_scale, layout_m)
 
-        flat_activation = activation_per_expert.view(-1, self.dim)
-        q_x, act_scale = a8_per_token_act_quant(
-            flat_activation,
-            scale_dtype=torch.float32,
-        )
-        q_x = q_x.view(E, M, self.dim).contiguous()
-        act_scale = act_scale.reshape(E, M, 1).contiguous()
-
+        M = layout_m
         expected_m = M
         gate_up_scale = self.gate_up_proj_weight_scale.to(torch.float32).contiguous()
         gate_up_out = torch.empty(
             (E, M, self.moe_inter_dim * 2),
-            dtype=activation_per_expert.dtype,
-            device=activation_per_expert.device,
+            dtype=torch.bfloat16,
+            device=device,
         )
         deepgemm.m_grouped_w8a8_gemm_nt_masked_impl(
             (q_x, act_scale),
@@ -1173,18 +1272,39 @@ class HygonW8A8DeepGemmMoeExpertsMerged(
             0,
         )
 
-        intermediate = silu_and_mul(gate_up_out, swiglu_limit=self.swiglu_limit)
-        q_intermediate, intermediate_scale = a8_per_token_act_quant(
-            intermediate.view(-1, self.moe_inter_dim),
-            scale_dtype=torch.float32,
-        )
-        q_intermediate = q_intermediate.view(E, M, self.moe_inter_dim).contiguous()
-        intermediate_scale = intermediate_scale.reshape(E, M, 1).contiguous()
+        if self.swiglu_limit is None and _lightop_fuse_silu_mul_quant_ep_available():
+            # Hygon lightop EP fused path consumes the per-expert token counts
+            # and avoids doing SiLU+quant work on layout padding.
+            q_intermediate, intermediate_scale = lightop.fuse_silu_mul_quant_ep(
+                gate_up_out,
+                tokens_per_expert=masked_m,
+                expect_m=M,
+            )
+            q_intermediate = q_intermediate.contiguous()
+            intermediate_scale = intermediate_scale.to(torch.float32)
+            if intermediate_scale.ndim == 2:
+                intermediate_scale = intermediate_scale.unsqueeze(-1)
+            intermediate_scale = intermediate_scale.contiguous()
+        else:
+            intermediate = eval_lazy(
+                silu_and_mul(
+                    gate_up_out,
+                    expert_n_tokens=masked_m,
+                    swiglu_limit=self.swiglu_limit,
+                )
+            )
+            q_intermediate, intermediate_scale = (
+                _a8_per_token_act_quant_with_expert_mask(
+                    intermediate,
+                    masked_m,
+                    scale_dtype=torch.float32,
+                )
+            )
         down_scale = self.down_proj_weight_scale.to(torch.float32).contiguous()
         down_out = torch.empty(
             (E, M, self.dim),
-            dtype=activation_per_expert.dtype,
-            device=activation_per_expert.device,
+            dtype=torch.bfloat16,
+            device=device,
         )
         deepgemm.m_grouped_w8a8_gemm_nt_masked_impl(
             (q_intermediate, intermediate_scale),
@@ -1194,4 +1314,6 @@ class HygonW8A8DeepGemmMoeExpertsMerged(
             expected_m,
             0,
         )
+        if output_m != M:
+            down_out = down_out[:, :output_m, :].contiguous()
         return PerExpertDenseBatchedExpertResultMinimal(down_out)
