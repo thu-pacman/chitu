@@ -18,7 +18,11 @@ import msgpack
 import logging
 
 from chitu.task import UserRequest
-from chitu.dp_request_router import get_request_router
+from chitu.dp_router import (
+    get_request_router,
+    get_token_router,
+    set_global_token_router,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -300,36 +304,25 @@ class TokenRouter:
                 await asyncio.sleep(60)
 
 
-# Global Token Router instance
-_token_router = None
-
-
-def get_token_router() -> TokenRouter:
-    """Get global Token Router instance"""
-    global _token_router
-    if _token_router is None:
-        # Use default configuration
-        config = {}
-        _token_router = TokenRouter(config)
-    return _token_router
-
-
 async def start_token_router(dp_config=None):
     """Start Token Router"""
     logger.info("Starting Token Router...")
+    existing_token_router = get_token_router(check_exist=False)
+    if existing_token_router is not None:
+        await existing_token_router.start()
+        return
 
     if dp_config:
         router = TokenRouter(dp_config)
         logger.info(f"Token Router port={dp_config.router.token_port}")
     else:
         # Use default Token Router
-        router = get_token_router()
+        router = TokenRouter({})
         logger.info("Default config Token Router started")
 
     # dp_chat_completions uses the same instance
-    global _token_router
-    _token_router = router
     logger.info("Set global Token Router instance")
+    set_global_token_router(router)
 
     logger.info("Starting Token Router service...")
     await router.start()

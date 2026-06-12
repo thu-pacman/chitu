@@ -27,6 +27,11 @@ from chitu.kv_cache.prefix_caching import (
     BlockIdentityChainBuilder,
 )
 from chitu.metrics import start_prometheus_server_and_metrics_monitor
+from chitu.dp_router import (
+    get_request_router,
+    get_token_router,
+    set_global_request_router,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +48,7 @@ class SchedulerStats:
     last_update_time: float
     last_heartbeat_time: float = 0.0  # last heartbeat timestamp
     is_alive: bool = True  # alive status flag
+    max_seq_len: Optional[int] = None
     num_blocks: Optional[int] = (
         None  # total number of blocks of cache_managers in instance
     )
@@ -74,6 +80,28 @@ class RoutePolicy:
         self.max_inflight_per_scheduler = max(
             1, int(getattr(config, "max_inflight_per_instance", "24"))
         )
+
+    @property
+    def max_support_prompt_length(self):
+        """The max supported length of prompt tokens."""
+
+        def max_prompt_length_from_stats(stats: SchedulerStats):
+            return min(
+                (stats.num_blocks or 0) * (stats.block_size or 0),
+                stats.max_seq_len or 0,
+            )
+
+        max_prompt_lengths = [
+            max_prompt_length_from_stats(stats)
+            for stats in self.scheduler_stats.values()
+        ]
+        max_support_prompt_length = max(max_prompt_lengths + [0])
+        if max_support_prompt_length == 0:
+            logger.warning_once(
+                f"KV Cache num_block and block_size are unknown, skip checking prompt token length"
+            )
+            max_support_prompt_length = float("inf")
+        return max_support_prompt_length
 
     def update_stats(self, stats: SchedulerStats):
         """Update statistics from Enhanced Schedulers."""
@@ -475,6 +503,7 @@ class RequestRouter:
                         ),
                         last_heartbeat_time=time.time(),  # update heartbeat timestamp
                         is_alive=stats_dict.get("heartbeat", False),  # mark alive
+                        max_seq_len=stats_dict.get("max_seq_len", None),
                         num_blocks=stats_dict.get("num_blocks", None),
                         block_size=stats_dict.get("block_size", None),
                         evicted_blk_hashes=stats_dict.get("evicted_blk_hashes", []),
@@ -504,6 +533,16 @@ class RequestRouter:
                 logger.error(f"Error in stats collector: {e}")
                 await asyncio.sleep(0.1)
 
+    def finish_request_before_send(
+        self, req: UserRequest, finish_reason: str = "stopped"
+    ):
+        """Finish request before sending to an instance."""
+        req.finish_reason = finish_reason
+        req.stop_stream()
+        token_router = get_token_router()
+        if token_router is not None:
+            token_router.active_requests.pop(req.request_id)
+
     async def _request_processor_task(self):
         """Process pending requests and route them to schedulers."""
         logger.info(f"[REQUEST_ROUTER] Request processor task started")
@@ -514,6 +553,15 @@ class RequestRouter:
                 if self.pending_requests:
                     request_counter += 1
                     request = self.pending_requests.popleft()
+                    if (
+                        len(request.prompt_tokens)
+                        > self.policy.max_support_prompt_length
+                    ):
+                        # Prompt length exceeds the prefill kv cache capacity, stop request with finish_reason=length
+                        self.finish_request_before_send(request, finish_reason="length")
+                        self.total_requests += 1
+                        await asyncio.sleep(0.001)
+                        continue
 
                     # Admission + selection delegated to LoadBalancer (soft admission inside)
                     start_time = time.time()
@@ -710,43 +758,18 @@ class RequestRouter:
         logger.info("Request Router shutdown complete")
 
 
-# Global Request Router instance
-_request_router = None
-
-
-def get_request_router() -> RequestRouter:
-    """Get global Request Router instance"""
-    global _request_router
-    if _request_router is None:
-        args = get_global_args()
-        dp_config = args.dp_config
-        router_cfg = getattr(dp_config, "router", None)
-        if router_cfg is not None:
-            _request_router = RequestRouter(router_cfg)
-        else:
-            raise RuntimeError("dp_config.router not available")
-    return _request_router
-
-
-def set_global_request_router(router: RequestRouter):
-    """Set global Request Router instance"""
-    global _request_router
-    _request_router = router
-
-
 async def start_request_router():
     """Start Request Router"""
-    # Fix: Use already created global Request Router instance instead of recreating
-    global _request_router
 
     # Check if there's already a created router instance
-    if _request_router is not None:
+    existing_request_router = get_request_router(check_exist=False)
+    if existing_request_router is not None:
         logger.info(
-            f"Using existing Request Router instance with {len(getattr(_request_router, 'scheduler_addresses', []))} schedulers"
+            f"Using existing Request Router instance with {len(getattr(existing_request_router, 'scheduler_addresses', []))} schedulers"
         )
 
         # Start the existing Router
-        await _request_router.start()
+        await existing_request_router.start()
         return
 
     # If no pre-created instance, create according to original logic (backward compatibility)

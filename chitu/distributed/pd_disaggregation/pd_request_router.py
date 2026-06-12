@@ -418,6 +418,7 @@ class PDRequestRouter(RequestRouter):
                         ),
                         last_heartbeat_time=time.time(),
                         is_alive=stats_dict.get("heartbeat", False),
+                        max_seq_len=stats_dict.get("max_seq_len", None),
                         num_blocks=stats_dict.get("num_blocks", None),
                         block_size=stats_dict.get("block_size", None),
                         evicted_blk_hashes=stats_dict.get("evicted_blk_hashes", []),
@@ -602,10 +603,21 @@ class PDRequestRouter(RequestRouter):
         pd_request.status = PDRequestStatus.DISPATCHED
         pd_request.prefill_start_time = time.time()
 
+        # Router side request checking
+        req = pd_request.original_request
+        if len(req.prompt_tokens) > min(
+            self.prefill_policy.max_support_prompt_length,
+            self.decode_policy.max_support_prompt_length,
+        ):
+            self.finish_request_before_send(req, finish_reason="length")
+            pd_request.status = PDRequestStatus.FAILED
+            self.total_requests += 1
+            return
+
         # Prepare request data
         request_data = {
             "request_id": pd_request.request_id,
-            "request": pd_request.original_request.to_dict(),
+            "request": req.to_dict(),
             "type": "pd_request",
         }
 

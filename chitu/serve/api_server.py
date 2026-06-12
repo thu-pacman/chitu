@@ -23,8 +23,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 
 from chitu.backend import Backend
-from chitu.dp_request_router import get_request_router
-from chitu.dp_token_router import get_token_router
+from chitu.dp_router import get_request_router, get_token_router
 from chitu.global_vars import get_global_args, set_global_args
 from chitu.task import TaskPool
 from chitu.profiler import MemoryRecorder

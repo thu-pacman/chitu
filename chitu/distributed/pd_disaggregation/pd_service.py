@@ -41,6 +41,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
 )
 from chitu.distributed.tcp_ip import get_port_from_zmq_socket
 from chitu.dp_token_sender import start_dp_token_manager
+from chitu.global_vars import get_global_args
 from chitu.hooks import (
     DPTokenSink,
     MooncakeKVTransferHook,
@@ -521,6 +522,9 @@ class PDSchedulerService:
         stats = {
             "local_instance_id": self.scheduler.local_instance_id,
             "scheduler_type": self.pd_mode.value,
+            "max_seq_len": getattr(get_global_args().infer, "max_seq_len", None),
+            "num_blocks": self.scheduler.kv_manager.kv_cache.num_blocks,
+            "block_size": self.scheduler.kv_manager.kv_cache.block_size,
             # 目前仅透传 scheduler.get_pd_stats()，以下字段暂不统计，固定为 0。
             "running_requests": 0,
             "waiting_requests": 0,
