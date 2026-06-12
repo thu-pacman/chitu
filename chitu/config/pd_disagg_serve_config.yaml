@@ -26,6 +26,7 @@ dp_config:
     port: 21003
     stats_port: 29600
     token_port: 29700
+    launch_timeout: 3600
     max_inflight_per_instance: 24 # max number of inflight requests per dp instance
     # Used by unified DP routing, and by PD prefill routing when PD disaggregation is enabled.
     routing_algorithm: "prefix_cache_aware" # option: round_robin, power_of_two_choices, prefix_cache_aware

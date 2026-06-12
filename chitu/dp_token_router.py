@@ -171,9 +171,9 @@ class TokenRouter:
             tokens = token_data.get("tokens")
             top_logprobs = token_data.get("top_logprobs")
             top_token_idx = token_data.get("top_token_idx")
-            is_first_token = req.async_stream.tokens_len == 0
+            is_first_token = req.num_output_tokens == 0
             for token in tokens:
-                req.async_stream.add_data(token, top_logprobs, top_token_idx)
+                req.add_data(token, top_logprobs, top_token_idx)
 
             self.total_tokens_received += 1
             # per-instance 统计
