@@ -1008,7 +1008,6 @@ SRUN_CMD=(
   --ntasks="${PD_NODES}"
   --ntasks-per-node=1
   --cpus-per-task=$((PD_GPUS_PER_NODE * PD_CPUS_PER_GPU))
-  -l
 )
 
 if [ -n "${PD_SLURM_JOB_ID}" ]; then
