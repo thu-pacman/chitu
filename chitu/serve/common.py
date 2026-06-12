@@ -26,8 +26,7 @@ from chitu.task import (
     TaskCollector,
 )
 from chitu.task_type import TaskType
-from chitu.dp_request_router import get_request_router
-from chitu.dp_token_router import get_token_router
+from chitu.dp_router import get_request_router, get_token_router
 
 logger = getLogger(__name__)
 

@@ -39,7 +39,9 @@ from chitu.metrics.prometheus_collector import (
     chitu_router_pending_requests,
     observe_pd_stage,
 )
+from chitu.global_vars import get_global_args
 from chitu.task import UserRequest
+from chitu.testing.pd_utils import PDTestRunner
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +258,7 @@ class PDRequestRouter(RequestRouter):
                     if self.pd_coordination_service
                     else asyncio.sleep(0)
                 ),
+                self._wait_for_pd_instances(),
             )
         else:
             # Use parent class start logic
@@ -415,6 +418,7 @@ class PDRequestRouter(RequestRouter):
                         ),
                         last_heartbeat_time=time.time(),
                         is_alive=stats_dict.get("heartbeat", False),
+                        max_seq_len=stats_dict.get("max_seq_len", None),
                         num_blocks=stats_dict.get("num_blocks", None),
                         block_size=stats_dict.get("block_size", None),
                         evicted_blk_hashes=stats_dict.get("evicted_blk_hashes", []),
@@ -599,10 +603,21 @@ class PDRequestRouter(RequestRouter):
         pd_request.status = PDRequestStatus.DISPATCHED
         pd_request.prefill_start_time = time.time()
 
+        # Router side request checking
+        req = pd_request.original_request
+        if len(req.prompt_tokens) > min(
+            self.prefill_policy.max_support_prompt_length,
+            self.decode_policy.max_support_prompt_length,
+        ):
+            self.finish_request_before_send(req, finish_reason="length")
+            pd_request.status = PDRequestStatus.FAILED
+            self.total_requests += 1
+            return
+
         # Prepare request data
         request_data = {
             "request_id": pd_request.request_id,
-            "request": pd_request.original_request.to_dict(),
+            "request": req.to_dict(),
             "type": "pd_request",
         }
 
@@ -770,6 +785,50 @@ class PDRequestRouter(RequestRouter):
                     logger.warning(f"pd request timeout: {request_id}")
                     pd_request.status = PDRequestStatus.FAILED
                     pd_request.error_message = "request timeout"
+
+    # ------------------------------------------------------------------
+    # PD instance readiness (always active in PD mode)
+    # ------------------------------------------------------------------
+
+    async def _wait_for_pd_instances(self, poll_interval_s: float = 0.5):
+        """Block until all configured P/D instances have sent at least one stats update."""
+        expected_prefill = set(self.prefill_schedulers.keys())
+        expected_decode = set(self.decode_schedulers.keys())
+        expected = {("prefill", pid) for pid in expected_prefill} | {
+            ("decode", did) for did in expected_decode
+        }
+
+        dp_router_config = get_global_args().dp_config.router
+        launch_timeout = dp_router_config.launch_timeout
+
+        logger.info(
+            f"[PD_LAUNCH] waiting for instances: prefill={sorted(expected_prefill)} "
+            f"decode={sorted(expected_decode)} timeout={launch_timeout:.1f}s"
+        )
+
+        started = time.time()
+        while True:
+            connected = self._pd_stats_logged & expected
+            if connected >= expected:
+                elapsed = time.time() - started
+                logger.info(
+                    f"[PD_LAUNCH][READY] all {len(expected)} instances connected "
+                    f"after {elapsed:.1f}s: {sorted(connected)}"
+                )
+                break
+
+            if time.time() - started > launch_timeout:
+                missing = expected - connected
+                logger.error(
+                    f"[PD_LAUNCH][TIMEOUT] {len(missing)}/{len(expected)} instances "
+                    f"missing after {launch_timeout:.1f}s: {sorted(missing)}"
+                )
+                os._exit(1)
+
+            await asyncio.sleep(poll_interval_s)
+
+        if get_global_args().pd_test.enable:
+            await PDTestRunner(self).run()
 
     def get_performance_stats(self) -> dict:
         """Get performance statistics"""

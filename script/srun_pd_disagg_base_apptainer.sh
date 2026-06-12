@@ -165,6 +165,7 @@ parse_model_spec() {
 }
 
 # --pd-spec: PD kv_transfer 参数 → COMMON_OVERRIDES
+# Keys with '.' are passed through as Hydra overrides directly.
 parse_pd_spec() {
   local spec="$1"; [ -z "${spec}" ] && return 0
   local pfx="dp_config.router.pd_disaggregation.kv_transfer"
@@ -177,6 +178,8 @@ parse_pd_spec() {
       decode_prealloc_token_budget|decode_prealloc_reserved_tokens|\
       decode_max_running_tasks_per_dp)
         COMMON_OVERRIDES+=("${pfx}.${key}=${val}");;
+      *.*)
+        COMMON_OVERRIDES+=("${_kv}");;
       *) die "pd-spec unknown key: ${key}";;
     esac
   done
@@ -838,11 +841,43 @@ pd_node_main() {
   launch_instances prefill
   launch_instances decode
 
-  # 等待退出
+  echo "===== router log ====="
+  # ── Forward router log to slurm stdout (node 0 only) ──
   if [ "${SLURM_PROCID}" = "0" ]; then
-    wait "${ROUTER_PID}" "${LOCAL_PIDS[@]}"
+    tail -n0 -f "${LOG_DIR_INNER}/router.${MODEL_NAME_TAG}.log" &
+    TAIL_PID=$!
+  fi
+
+  # ── Exit handling ──
+  # Exit-code convention (propagated through srun → return code):
+  #   200  Router exited 0 — normal completion.  Mapped to 0 by the caller.
+  #   N    Any other exit code = abnormal, propagated as-is.
+  #
+  # srun returns max(task_exit_codes).  --kill-on-bad-exit ensures a
+  # non-zero exit on any task terminates all others across the cluster.
+  #
+  # Node0: Router exit 0 → 200 (success); Router exit N → N; P/D crash → N.
+  # Other nodes: propagate whatever P/D exits with (0=normal, N=crash).
+  if [ "${SLURM_PROCID}" = "0" ]; then
+    set +e
+    wait -n "${ROUTER_PID}" "${LOCAL_PIDS[@]}"
+    first_code=$?
+    set -e
+    if ! kill -0 "${ROUTER_PID}" 2>/dev/null; then
+      # Router was the first to exit.
+      if [ "${first_code}" = "0" ]; then
+        exit 200
+      fi
+      exit "${first_code}"
+    fi
+    # A P/D instance exited first — propagate its exit code.
+    exit "${first_code}"
   else
-    wait "${LOCAL_PIDS[@]}"
+    set +e
+    wait -n "${LOCAL_PIDS[@]}"
+    code=$?
+    set -e
+    exit $code
   fi
 }
 
@@ -969,7 +1004,6 @@ SRUN_CMD=(
   srun
   --export=ALL
   --kill-on-bad-exit=1
-  --wait=0
   --nodes="${PD_NODES}"
   --ntasks="${PD_NODES}"
   --ntasks-per-node=1
@@ -987,4 +1021,26 @@ else
 fi
 
 SRUN_CMD+=(bash "${THIS_SCRIPT}" --node)
+# srun returns the maximum exit code across all tasks.
+# 200 = clean shutdown (Router exited 0) → map to 0 for callers.
+# Any other code = error, propagated as-is.
+set +e
 "${SRUN_CMD[@]}"
+ret=$?
+set -e
+
+if [ "$ret" != "0" ] && [ "$ret" != "200" ]; then
+  echo "=== srun returned $ret, dumping last 100 lines of P/D logs ==="
+  for _f in "${LOG_DIR}"/prefill."${PD_MODEL_NAME_SAFE}".*.log "${LOG_DIR}"/decode."${PD_MODEL_NAME_SAFE}".*.log; do
+    [ -f "${_f}" ] || continue
+    echo "===== tail -100 ${_f} ====="
+    tail -100 "${_f}" || true
+  done
+  echo "=== end of P/D log dump ==="
+fi
+
+if [ "$ret" = "200" ]; then
+  echo PD ended normally
+  exit 0
+fi
+exit $ret

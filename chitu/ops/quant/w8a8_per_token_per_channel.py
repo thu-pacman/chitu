@@ -74,7 +74,7 @@ def w8a8_gemm_per_token_per_channel_hipblaslt_w8a8_gemm(
             (0, b.shape[0]), dtype=torch.get_default_dtype(), device=a.device
         )
     a_s = a_s.view(a.shape[0], 1)
-    b_s = b_s.view(b_s.shape[0], 1)
+    b_s = b_s.view(b_s.shape[0], 1).to(torch.float32)
 
     # BLASLt contract: input [M, K], weight [N, K], trans="NT".
     m = a.shape[0]

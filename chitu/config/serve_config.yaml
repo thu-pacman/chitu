@@ -32,6 +32,8 @@ defaults:
   # Sub-configs for `test/single_req_test.py` and `test/single_req_compare.py`. Ignored for serving.
   - request: default
 
+  - test
+
   # Indicates that values in this file has higher priority than values in other files.
   # Don't touch if you are not sure.
   - _self_

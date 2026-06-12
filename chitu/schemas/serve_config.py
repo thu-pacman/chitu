@@ -155,6 +155,16 @@ class KvTransferConfig:
 
 
 @dataclass
+class PDTestConfig:
+    """PD smoke-test configuration."""
+
+    enable: bool = False  # PD_TEST_ENABLE
+    req_num: int = 8  # number of test requests
+    req_timeout: float = 300.0  # per-request timeout (seconds)
+    output_len: int = 128  # max_new_tokens for each test request
+
+
+@dataclass
 class PDDisaggregationConfig:
     """PD disaggregation configuration"""
 
@@ -205,6 +215,7 @@ class RouterConfig:
     router_hit_weight: float = 1.0
     router_load_penalty_weight: float = 0.02
     router_evict_buffer_size: int = 64
+    launch_timeout: float = 3600.0  # PD_LAUNCH_TIMEOUT
     dp_addresses: list[DpAddressesConfig] = MISSING
     # PD disaggregation configuration
     pd_disaggregation: PDDisaggregationConfig = field(
@@ -346,6 +357,7 @@ class ServeConfig(ServeConfigLegacy):
     request: RequestConfig = field(default_factory=RequestConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     dp_config: DpConfig = field(default_factory=DpConfig)
+    pd_test: PDTestConfig = field(default_factory=PDTestConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     quant: Optional[str] = MISSING
