@@ -1686,7 +1686,7 @@ class Executor:
             return
 
         if self._pd_prefill_only:
-            if self.rank == 0:
+            if self.rank == 0 and DPTaskCollector.available():
                 tasks = DPTaskCollector.get_last_packedtasks()
             TaskCollector.set_update_task_ids(
                 tasks.output_task_ids if tasks is not None else []
