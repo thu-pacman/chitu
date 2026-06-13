@@ -187,6 +187,7 @@ esac
 
 TOOL_DIR="$HOME/.chitu"
 APPIMAGETOOL="$TOOL_DIR/appimagetool-$ARCH.AppImage"
+RUNTIME_FILE="$TOOL_DIR/runtime-$ARCH"
 
 mkdir -p "$TOOL_DIR"
 
@@ -194,9 +195,15 @@ if [ ! -x "$APPIMAGETOOL" ]; then
     wget -O "$APPIMAGETOOL" "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-$ARCH.AppImage"
     chmod +x "$APPIMAGETOOL"
 fi
+if [ ! -f "$RUNTIME_FILE" ]; then
+    wget -O "$RUNTIME_FILE" "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-$ARCH"
+fi
 
 #################################################################
 # Build AppImage
 
 rm "$OUTPUT_FILE" 2>/dev/null || true
-ARCH="$ARCH" "$APPIMAGETOOL" "$APPDIR" "$OUTPUT_FILE"
+
+# NOTE: We set `--runtime-file` even if it is optional, because if it is omitted,
+# it will be downloaded every time this command is executed.
+ARCH="$ARCH" "$APPIMAGETOOL" --runtime-file "$RUNTIME_FILE" "$APPDIR" "$OUTPUT_FILE"
