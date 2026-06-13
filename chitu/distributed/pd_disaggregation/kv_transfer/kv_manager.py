@@ -28,6 +28,7 @@ import requests
 import torch
 import zmq
 
+from chitu.boot.tcp_ip import get_port_from_zmq_socket, get_local_ip
 from chitu.global_vars import get_global_args
 from chitu.backend import Backend
 from chitu.task import TaskPool
@@ -45,7 +46,6 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.utils import (
     align_intervals,
     get_tp_splits,
 )
-from chitu.distributed.tcp_ip import get_port_from_zmq_socket, get_local_ip
 from chitu.distributed.partition import compute_layer_dist_in_pp
 from chitu.distributed.pd_disaggregation.pd_log_utils import (
     pd_trace_enabled,

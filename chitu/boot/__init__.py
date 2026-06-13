@@ -1,6 +1,3 @@
 # SPDX-FileCopyrightText: 2025 Qingcheng.AI
 #
 # SPDX-License-Identifier: Apache-2.0
-
-serve_config_rules:
-  _target_: chitu.schemas.serve_config_rules.ServeConfigRules

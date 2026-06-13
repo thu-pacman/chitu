@@ -10,13 +10,12 @@ import subprocess
 import threading
 import time
 import re
+import requests
 from pathlib import Path
 from string import Template
 from typing import Optional
 
-import requests
-
-from chitu.distributed.tcp_ip import get_free_port, is_port_available
+from chitu.boot.tcp_ip import get_free_port, is_port_available
 from chitu.global_vars import get_global_args
 
 logger = logging.getLogger(__name__)

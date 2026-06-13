@@ -12,7 +12,7 @@ import torch.distributed
 from logging import getLogger
 
 from chitu.distributed.custom_ar_chitu import create_chitu_custom_allreduce
-from chitu.distributed.tcp_ip import get_local_ip, reserve_free_port
+from chitu.boot.tcp_ip import get_local_ip, reserve_free_port
 
 logger = getLogger(__name__)
 

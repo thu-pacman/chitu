@@ -51,7 +51,7 @@ from chitu.utils import (
 from chitu.moe.load_balancer import get_moe_load_planner  # added
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 from chitu.sampling.sampler import Sampler
-from chitu.distributed.tcp_ip import release_reserved_port
+from chitu.boot.tcp_ip import release_reserved_port
 
 logger = getLogger(__name__)
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()

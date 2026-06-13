@@ -13,7 +13,7 @@ import threading
 import logging
 
 from chitu.global_vars import get_global_args
-from chitu.distributed.tcp_ip import is_port_available, get_free_port
+from chitu.boot.tcp_ip import is_port_available, get_free_port
 
 logger = logging.getLogger(__name__)
 

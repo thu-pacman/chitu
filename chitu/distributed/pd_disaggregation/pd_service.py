@@ -39,7 +39,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
 )
-from chitu.distributed.tcp_ip import get_port_from_zmq_socket
+from chitu.boot.tcp_ip import get_port_from_zmq_socket
 from chitu.dp_token_sender import start_dp_token_manager
 from chitu.global_vars import get_global_args
 from chitu.hooks import (

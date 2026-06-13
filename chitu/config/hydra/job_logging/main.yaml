@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+# SPDX-FileCopyrightText: Copyright (c) Facebook, Inc. and its affiliates.
+#
+# SPDX-License-Identifier: MIT
+
+# This file is a modification to Hydra's logger configuration, aimed as full
+# functionality for the main service. Please refer to
+# https://github.com/facebookresearch/hydra/blob/c2c00ab363c7b64023d7c3755c4ecc6f1ae6fef5/hydra/conf/hydra/job_logging/default.yaml f
+# for the original one. To view the full configuration combined with Hydra's
+# default configuration, run chitu with `--cfg hydra`.
+
+version: 1
+formatters:
+  simple:
+    class: "chitu.logging_utils.ChituFormatter"
+    format: "%(levelname)s %(asctime)s %(rank)s [%(name)s:%(lineno)d] %(context)s %(message)s%(stack_trace)s"
+    datefmt: "%m-%d %H:%M:%S"
+handlers:
+  console:
+    class: logging.StreamHandler
+    formatter: simple
+    stream: ext://sys.stdout
+  file:
+    class: logging.FileHandler
+    formatter: simple
+    # absolute file path
+    filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log
+root:
+  level: INFO
+  handlers: [console, file]
+
+disable_existing_loggers: false

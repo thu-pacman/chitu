@@ -224,7 +224,7 @@ TORCH_CUDA_ARCH_LIST=9.0 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
 Note:
 - You won't get the "editable" feature if you set both `-e` and `CHITU_WITH_CYTHON=1`. If you have accidentally done this and want to switch back, you will need to do `rm chitu/*.so`.
 
-### Build for Distribution
+### Build for `.whl` Distribution
 
 Run the following to build wheel files:
 
@@ -241,6 +241,158 @@ Example:
 This will create a `dist/` directory containing the wheel files. Copy them to your desired location and install them with `pip install <wheel_file>`. If you have to use custom dependencies (e.g. `torch`) of your platform, append `--no-deps` to the `pip install` command.
 
 Optionally, you can also copy `test/` directories to your desired location to run them.
+
+### Build for Docker Image Distribution
+
+For better reproducibility, you can optionally build container images.
+
+#### NVIDIA GPU
+
+Build the image directly with the root `Dockerfile`:
+
+```bash
+docker build \
+  --build-arg torch_cuda_arch_list='<your_arch_list>' \
+  --build-arg optional_deps='<comma_separated_optional_deps>' \
+  --build-arg enable_cython='<true_or_false>' \
+  --build-arg enable_test='<true_or_false>' \
+  --build-arg pypi_mirror='<your_pypi_mirror>' \
+  -t <your_image_name> \
+  .
+```
+
+#### MetaX GPU
+
+Some dependencies must be installed with device visible, so they must be installed with `docker run` rather than `docker build`. Therefore please prepare the build environment with at least one device, and use the two-stage build script with `muxi.Dockerfile`:
+
+```bash
+bash ./script/two-stage-docker-build.sh \
+  'muxi.Dockerfile' \
+  '<comma_separated_optional_deps>' \
+  '<extra_build_args>' \
+  '<enable_cython_true_or_false>' \
+  '<enable_test_true_or_false>' \
+  '<another_flag_true_or_false>' \
+  '<your_pypi_mirror>' \
+  '<your_image_name>' \
+  '<your_image_tag>' \
+  docker run \
+    --device=/dev/dri \
+    --device=/dev/mxcd \
+    --group-add video \
+    --privileged=true \
+    --security-opt seccomp=unconfined \
+    --security-opt apparmor=unconfined \
+    --shm-size '<your_shm_size>' \
+    --ulimit memlock=-1 \
+    -w /workspace/chitu
+```
+
+#### Ascend NPU
+
+Some dependencies must be installed with device visible, so they must be installed with `docker run` rather than `docker build`. Therefore please prepare the build environment with at least one device, and use the two-stage build script with `ascend.Dockerfile`:
+
+```bash
+bash ./script/two-stage-docker-build.sh \
+  'ascend.Dockerfile' \
+  '<comma_separated_optional_deps>' \
+  '<extra_build_args>' \
+  '<enable_cython_true_or_false>' \
+  '<enable_test_true_or_false>' \
+  '<another_flag_true_or_false>' \
+  '<your_pypi_mirror>' \
+  '<your_image_name>' \
+  '<your_image_tag>' \
+  docker run \
+    --privileged \
+    --device /dev/devmm_svm \
+    --device /dev/hisi_hdc \
+    -v /usr/local/dcmi:/usr/local/dcmi \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+    -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+    -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+    -v /etc/ascend_install.info:/etc/ascend_install.info \
+    -v /dev/davinci<npu_id>:/dev/davinci<npu_id>
+    -w /workspace/chitu
+```
+
+#### Hygon DCU
+
+Some dependencies must be installed with device visible, so they must be installed with `docker run` rather than `docker build`. Therefore please prepare the build environment with at least one device, and use the two-stage build script with `hygon.Dockerfile`:
+
+```bash
+bash ./script/two-stage-docker-build.sh \
+  'hygon.Dockerfile' \
+  '<comma_separated_optional_deps>' \
+  '<extra_build_args>' \
+  '<enable_cython_true_or_false>' \
+  '<enable_test_true_or_false>' \
+  '<another_flag_true_or_false>' \
+  '<your_pypi_mirror>' \
+  '<your_image_name>' \
+  '<your_image_tag>' \
+  docker run \
+    -u root \
+    --network=host \
+    --privileged \
+    --device=/dev/kfd \
+    --device=/dev/dri \
+    --ipc=host \
+    --shm-size='<your_shm_size>' \
+    --group-add video \
+    --cap-add=SYS_PTRACE \
+    --security-opt seccomp=unconfined \
+    --ulimit stack=-1:-1 \
+    --ulimit memlock=-1:-1 \
+    -v /opt/hyhal:/opt/hyhal:ro \
+    -w /workspace/chitu
+```
+
+### Build for Apptainer Image Distribution
+
+You can convert a Docker image to an Apptainer image. Apptainer is a good choice for deamonless execution.
+
+```bash
+apptainer build <your_apptainer_image.sif> <your_docker_image>
+```
+
+### Build for Self-Contained Executable Distribution
+
+Even with a Docker or Apptainer image, you still need some complex commands or scripts to launch them with proper hardware-related settings, and to launch them distributedly to multiple GPUs on multiple nodes. In order to tackle this problem, Chitu further supports building a self-contained executable distribution, which can be run with a single command.
+
+To build a self-contained executable, please first prepare a Docker image or an Apptainer image, and then run the following command:
+
+From an Apptainer image (`.sif` file):
+
+```bash
+./boot/build.sh <your_apptainer_image.sif> -o <output_file>
+```
+
+From a Docker image (bundles the image inside):
+
+```bash
+./boot/build.sh <your_docker_image:tag> -o <output_file>
+```
+
+From a Docker image without bundling the image inside (a smaller bundle; users will pull the image from an online resource at run time):
+
+```bash
+./boot/build.sh <your_docker_image:tag> -o <output_file> --online
+```
+
+Options:
+
+| Option | Description |
+| :--- | :--- |
+| `-o`, `--output-file <file>` | Path to the AppImage output file (required). |
+| `--online` | Make a smaller bundle without the container image inside. Users will pull the image from an online resource. |
+| `-h`, `--help` | Show the help message. |
+
+The output is a self-contained AppImage executable, which can be run directly. All its arguments are defined in [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml).
+
+```bash
+./<output_file> [arguments]...
+```
 
 ## Running and Testing without Starting a Service
 
@@ -378,6 +530,75 @@ Example 2 (interactive with node 0):
 ```
 
 ### Multi-Node Parallelism with Slurm and Docker/Apptainer
+
+#### Use Self-Contained Executable (Recommended)
+
+After building a self-contained executable (see [Build for Self-Contained Executable Distribution](#build-for-self-contained-executable-distribution)), you can launch it across multiple nodes with a single command. The executable bundles the container image (Docker or Apptainer) and uses `srun` to dispatch the job to all nodes.
+
+All arguments are defined in [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml). The most relevant options for multi-node launching are under the `boot` section:
+
+| Parameter | Default | Description |
+| :--- | :------ | :--- |
+| `boot.n_nodes` | `1` | Number of nodes (servers) to use. |
+| `boot.n_gpus_per_node` | `1` | Number of GPUs per node to use. |
+| `boot.target` | `["-m", "chitu"]` | Target chitu program or script to run inside the container. |
+| `boot.remote_launcher` | `"local"` | How to run on multiple nodes. Set to `srun` to use Slurm. |
+| `boot.interactive_node_0` | `"auto"` | Make the first node interactive. `"auto"` decides automatically. |
+| `boot.extra_srun_args` | `[]` | Additional arguments passed to `srun`. |
+| `boot.extra_apptainer_args` | `[]` | Additional arguments passed to `apptainer run` (e.g. bind mounts). |
+| `boot.extra_docker_args` | `[]` | Additional arguments passed to `docker run` (e.g. volume mounts). |
+
+**Example 1 (local Apptainer, single node):**
+
+```bash
+./<output_file> boot.n_gpus_per_node=8 \
+    "boot.target=[test/single_req_test.py]" \
+    "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
+    models=Qwen3-235B-A22B \
+    models.ckpt_dir=/path/to/Qwen3-235B-A22B \
+    infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+**Example 2 (srun + Apptainer, multi-node):**
+
+```bash
+./<output_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+    boot.remote_launcher=srun \
+    "boot.target=[test/single_req_test.py]" \
+    "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
+    models=Qwen3-235B-A22B \
+    models.ckpt_dir=/path/to/Qwen3-235B-A22B \
+    infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+**Example 3 (srun + Docker, interactive with node 0):**
+
+```bash
+./<output_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+    boot.remote_launcher=srun \
+    "boot.target=[test/single_req_test.py]" \
+    "boot.interactive_node_0=True" \
+    "boot.extra_apptainer_args=[-v,/path/to/models:/path/to/models]" \
+    models=Qwen3-235B-A22B \
+    models.ckpt_dir=/path/to/Qwen3-235B-A22B \
+    infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+**Example 4 (mount chitu code into the container):**
+
+```bash
+./<output_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+    boot.remote_launcher=srun \
+    "boot.target=[test/single_req_test.py]" \
+    "boot.extra_apptainer_args=[-B,.:/workspace/chitu,-B,/path/to/models:/path/to/models,--env,PYTHONPATH=/workspace/chitu]" \
+    models=Qwen3-235B-A22B \
+    models.ckpt_dir=/path/to/Qwen3-235B-A22B \
+    infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+> Note: Whether Docker or Apptainer is used at run time depends on how the executable was built (see [Build for Self-Contained Executable Distribution](#build-for-self-contained-executable-distribution)). If a Docker image was bundled, `docker run` is used; otherwise `apptainer run` is used.
+
+#### Directly Invoke Slurm and Docker/Apptainer
 
 You can use the following script for Docker:
 
