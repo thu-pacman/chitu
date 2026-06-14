@@ -228,7 +228,7 @@ TORCH_CUDA_ARCH_LIST=9.0 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
 注意：
 - 同时设置了 `-e` 和 `CHITU_WITH_CYTHON=1` 时，`-e` 不会起作用。如果已经这么做了，需要 `rm chitu/*.so` 恢复。
 
-### 构建分发产物
+### 构建 `.whl` 分发产物
 
 可按如下步骤构建分发产物：
 
@@ -245,6 +245,158 @@ TORCH_CUDA_ARCH_LIST=9.0 CHITU_WITH_CYTHON=1 pip install --no-build-isolation .
 这将创建一个包含 wheel 文件的 `dist/` 目录。将它们复制到您想要的位置，然后使用 `pip install <wheel_file>` 安装它们。如果您必须使用平台的自定义依赖项（例如 `torch`），请在 `pip install` 命令后附加 `--no-deps`。
 
 您也可以选择将 `test/` 目录复制到您想要的位置以运行它们。
+
+### 构建 Docker 镜像分发产物
+
+为了更好的可复现性，可以选择构建容器镜像作为分发产物。
+
+#### 英伟达 GPU
+
+直接使用根目录的 `Dockerfile` 构建镜像：
+
+```bash
+docker build \
+  --build-arg torch_cuda_arch_list='<your_arch_list>' \
+  --build-arg optional_deps='<comma_separated_optional_deps>' \
+  --build-arg enable_cython='<true_or_false>' \
+  --build-arg enable_test='<true_or_false>' \
+  --build-arg pypi_mirror='<your_pypi_mirror>' \
+  -t <your_image_name> \
+  .
+```
+
+#### 沐曦 GPU
+
+由于部分依赖需要在构建时访问设备，因此这些依赖必须在 `docker run` 中安装，而不是 `docker build`。因此请在构建环境中至少准备一个设备，然后向两阶段构建脚本传入 `muxi.Dockerfile` 安装：
+
+```bash
+bash ./script/two-stage-docker-build.sh \
+  'muxi.Dockerfile' \
+  '<comma_separated_optional_deps>' \
+  '<extra_build_args>' \
+  '<enable_cython_true_or_false>' \
+  '<enable_test_true_or_false>' \
+  '<another_flag_true_or_false>' \
+  '<your_pypi_mirror>' \
+  '<your_image_name>' \
+  '<your_image_tag>' \
+  docker run \
+    --device=/dev/dri \
+    --device=/dev/mxcd \
+    --group-add video \
+    --privileged=true \
+    --security-opt seccomp=unconfined \
+    --security-opt apparmor=unconfined \
+    --shm-size '<your_shm_size>' \
+    --ulimit memlock=-1 \
+    -w /workspace/chitu
+```
+
+#### 昇腾 NPU
+
+由于部分依赖需要在构建时访问设备，因此这些依赖必须在 `docker run` 中安装，而不是 `docker build`。因此请在构建环境中至少准备一个设备，然后向两阶段构建脚本传入 `ascend.Dockerfile` 安装：
+
+```bash
+bash ./script/two-stage-docker-build.sh \
+  'ascend.Dockerfile' \
+  '<comma_separated_optional_deps>' \
+  '<extra_build_args>' \
+  '<enable_cython_true_or_false>' \
+  '<enable_test_true_or_false>' \
+  '<another_flag_true_or_false>' \
+  '<your_pypi_mirror>' \
+  '<your_image_name>' \
+  '<your_image_tag>' \
+  docker run \
+    --privileged \
+    --device /dev/devmm_svm \
+    --device /dev/hisi_hdc \
+    -v /usr/local/dcmi:/usr/local/dcmi \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+    -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+    -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+    -v /etc/ascend_install.info:/etc/ascend_install.info \
+    -v /dev/davinci<npu_id>:/dev/davinci<npu_id>
+    -w /workspace/chitu
+```
+
+#### 海光 DCU
+
+由于部分依赖需要在构建时访问设备，因此这些依赖必须在 `docker run` 中安装，而不是 `docker build`。因此请在构建环境中至少准备一个设备，然后向两阶段构建脚本传入 `hygon.Dockerfile` 安装：
+
+```bash
+bash ./script/two-stage-docker-build.sh \
+  'hygon.Dockerfile' \
+  '<comma_separated_optional_deps>' \
+  '<extra_build_args>' \
+  '<enable_cython_true_or_false>' \
+  '<enable_test_true_or_false>' \
+  '<another_flag_true_or_false>' \
+  '<your_pypi_mirror>' \
+  '<your_image_name>' \
+  '<your_image_tag>' \
+  docker run \
+    -u root \
+    --network=host \
+    --privileged \
+    --device=/dev/kfd \
+    --device=/dev/dri \
+    --ipc=host \
+    --shm-size='<your_shm_size>' \
+    --group-add video \
+    --cap-add=SYS_PTRACE \
+    --security-opt seccomp=unconfined \
+    --ulimit stack=-1:-1 \
+    --ulimit memlock=-1:-1 \
+    -v /opt/hyhal:/opt/hyhal:ro \
+    -w /workspace/chitu
+```
+
+### 构建 Apptainer 镜像分发产物
+
+您可以将 Docker 镜像转换为 Apptainer 镜像。使用 Apptainer 运行可免于与守护进程交互。
+
+```bash
+apptainer build <your_apptainer_image.sif> <your_docker_image>
+```
+
+### 构建自包含可执行文件分发产物
+
+即使有了 Docker 或 Apptainer 镜像，你仍然需要通过复杂的命令或脚本来在启动时配置硬件相关设置，并分布式地在多个节点的多个 GPU 上启动。为了解决这个问题，Chitu 支持构建自包含的可执行文件分发产物，支持可以通过单条命令启动。
+
+要构建自包含的可执行文件，请先构建 Docker 镜像或 Apptainer 镜像，然后运行以下命令：
+
+从 Apptainer 镜像（`.sif` 文件）构建：
+
+```bash
+./boot/build.sh <your_apptainer_image.sif> -o <output_file>
+```
+
+从 Docker 镜像构建（将镜像打包到内部）：
+
+```bash
+./boot/build.sh <your_docker_image:tag> -o <output_file>
+```
+
+从 Docker 镜像构建但不将镜像打包到内部（生成更小的包；用户将在运行时从在线资源拉取镜像）：
+
+```bash
+./boot/build.sh <your_docker_image:tag> -o <output_file> --online
+```
+
+选项：
+
+| 选项 | 说明 |
+| :--- | :--- |
+| `-o`, `--output-file <file>` | AppImage 输出文件的路径（必需）。 |
+| `--online` | 生成不包含容器镜像的更小的包。用户将从在线资源拉取镜像。 |
+| `-h`, `--help` | 显示帮助信息。 |
+
+输出是一个自包含的 AppImage 可执行文件，可直接运行。其中所有的参数均在 [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml) 定义。
+
+```bash
+./<output_file> [参数]...
+```
 
 ## 运行和测试（非部署服务）
 
@@ -384,6 +536,75 @@ torchrun --nnodes 1 \
 ```
 
 ### 使用 slurm 在多个节点上的 Docker/Apptainer 容器内运行
+
+#### 使用自包含可执行文件（推荐）
+
+在构建自包含可执行文件后（参见 [构建自包含可执行文件分发产物](#构建自包含可执行文件分发产物)），你可以用一条命令在多个节点上启动它。该可执行文件捆绑了容器镜像（Docker 或 Apptainer），并使用 `srun` 将任务分发到所有节点。
+
+所有参数都定义在 [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml) 中。与多节点启动最相关的选项位于 `boot` 部分：
+
+| 参数 | 默认值 | 说明 |
+| :--- | :------ | :--- |
+| `boot.n_nodes` | `1` | 要使用的节点（服务器）数量。 |
+| `boot.n_gpus_per_node` | `1` | 每个节点要使用的 GPU 数量。 |
+| `boot.target` | `["-m", "chitu"]` | 在容器内运行的目标 chitu 程序或脚本。 |
+| `boot.remote_launcher` | `"local"` | 如何在多个节点上运行。设置为 `srun` 以使用 Slurm。 |
+| `boot.interactive_node_0` | `"auto"` | 使第一个节点进入交互模式。`"auto"` 表示自动决定。 |
+| `boot.extra_srun_args` | `[]` | 传递给 `srun` 的额外参数。 |
+| `boot.extra_apptainer_args` | `[]` | 传递给 `apptainer run` 的额外参数（例如绑定挂载）。 |
+| `boot.extra_docker_args` | `[]` | 传递给 `docker run` 的额外参数（例如卷挂载）。 |
+
+**示例 1（本地 Apptainer，单节点）：**
+
+```bash
+./<output_file> boot.n_gpus_per_node=8 \
+    "boot.target=[test/single_req_test.py]" \
+    "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
+    models=Qwen3-235B-A22B \
+    models.ckpt_dir=/path/to/Qwen3-235B-A22B \
+    infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+**示例 2（srun + Apptainer，多节点）：**
+
+```bash
+./<output_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+    boot.remote_launcher=srun \
+    "boot.target=[test/single_req_test.py]" \
+    "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
+    models=Qwen3-235B-A22B \
+    models.ckpt_dir=/path/to/Qwen3-235B-A22B \
+    infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+**示例 3（srun + Docker，与 node 0 交互）：**
+
+```bash
+./<output_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+    boot.remote_launcher=srun \
+    "boot.target=[test/single_req_test.py]" \
+    "boot.interactive_node_0=True" \
+    "boot.extra_apptainer_args=[-v,/path/to/models:/path/to/models]" \
+    models=Qwen3-235B-A22B \
+    models.ckpt_dir=/path/to/Qwen3-235B-A22B \
+    infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+**示例 4（将 chitu 代码挂载到容器中）：**
+
+```bash
+./<output_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+    boot.remote_launcher=srun \
+    "boot.target=[test/single_req_test.py]" \
+    "boot.extra_apptainer_args=[-B,.:/workspace/chitu,-B,/path/to/models:/path/to/models,--env,PYTHONPATH=/workspace/chitu]" \
+    models=Qwen3-235B-A22B \
+    models.ckpt_dir=/path/to/Qwen3-235B-A22B \
+    infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+> 注：运行时使用 Docker 还是 Apptainer 取决于可执行文件的构建方式（参见 [构建自包含可执行文件分发产物](#构建自包含可执行文件分发产物)）。如果捆绑了 Docker 镜像，则使用 `docker run`；否则使用 `apptainer run`。
+
+#### 直接调用 Slurm 和 Docker/Apptainer
 
 可以使用以下脚本命令运行 Docker：
 

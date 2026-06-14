@@ -5,13 +5,6 @@
 # `defaults` are other config files or scripts included into this config file. See
 # https://hydra.cc/docs/tutorials/basic/your_first_app/defaults/ for details.
 defaults:
-  # Config loggers. Only for chitu developers.
-  - logger
-
-  # Config validating scripts. Only for chitu developers.
-  - hydra/callbacks: 
-    - serve_config_rules
-
   # Include model configs into this file. Please set it to the model you want to run.
   #
   # Acceptable values: One of the model names listed in `docs/en/SUPPORTED_MODELS.md`,
@@ -34,9 +27,98 @@ defaults:
 
   - test
 
+  # Config loggers. Only for chitu developers.
+  - override hydra/job_logging: main
+
+  # Config validating scripts. Only for chitu developers.
+  - override hydra/callbacks: serve_config_rules
+
   # Indicates that values in this file has higher priority than values in other files.
   # Don't touch if you are not sure.
   - _self_
+
+# Configs for how chitu get to run on multiple servers or multiple GPUs
+boot:
+  # Number of nodes (servers) to use
+  n_nodes: 1
+
+  # Number of GPUs per node to use
+  n_gpus_per_node: 1
+
+  # Target chitu program or script
+  #
+  # Acceptable values:
+  # - A list of arguments.
+  # - A space-separated string for arguments.
+  target: ["-m", "chitu"]
+
+  # Relay Hydra arguments from chitu-boot to inner chitu service
+  #
+  # Acceptable values:
+  # - True: Usually you choose this, to make chitu-boot and chitu service consistent.
+  # - False: Choose this if you want to explicitly pass arguments to inner chitu service in
+  #   `boot.target`, or if you want to boot non-chitu programs.
+  relay_args: True
+
+  # How to run on multiple nodes
+  #
+  # Acceptable values:
+  # - local: Only run on the current node.
+  # - srun: Use `srun` from Slurm.
+  remote_launcher: "local"
+
+  # Make the first node interactive, but output from the other nodes will NOT be printed
+  # onto the terminal.
+  #
+  # Acceptable values:
+  # - "auto": Decide automatically.
+  # - True: Make the first node interactive, but output from the other nodes will NOT be
+  #   printed onto the terminal.
+  # - False: Do not make the first node interactive, but output from all nodes will be
+  #   printed onto the terminal.
+  interactive_node_0: "auto"
+
+  # Only mount devices selected by `ASCEND_RT_VISIBLE_DEVICES` to the container
+  #
+  # Acceptable values:
+  # - True: Only mount devices selected by `ASCEND_RT_VISIBLE_DEVICES`.
+  # - False: Mount all devices detected as `/dev/davinci<npu_id>`.
+  ascend_only_mount_visible_dev: False
+
+  # Additional arguments passed to `srun`
+  #
+  # Acceptable values:
+  # - A list of arguments.
+  # - A space-separated string for arguments.
+  extra_srun_args: []
+
+  # Additional arguments passed to `apptainer run`
+  #
+  # Acceptable values:
+  # - A list of arguments.
+  # - A space-separated string for arguments.
+  extra_apptainer_args: []
+
+  # Additional arguments passed to `docker run`
+  #
+  # Acceptable values:
+  # - A list of arguments.
+  # - A space-separated string for arguments.
+  extra_docker_args: []
+
+  # Additional arguments passed to `torchrun`
+  #
+  # Acceptable values:
+  # - A list of arguments.
+  # - A space-separated string for arguments.
+  extra_torchrun_args: []
+
+  # Optional arguments to appear before `torchrun`
+  #
+  # Acceptable values:
+  # - A list of arguments.
+  # - A space-separated string for arguments.
+  torchrun_wrapper: []
 
 # Configs for the model to inference.
 models:
@@ -314,6 +396,13 @@ infer:
   # Penalty weight for running task count of each DP rank when selecting preferred DP rank.
   # Higher value means stronger load balancing pressure.
   dp_prefix_caching_running_penalty_weight: 0.1
+
+  max_multimodal_blocks: -1
+  experts_stats_path: null
+  num_experts_slots: null
+  moe_lb_trigger: -1
+  moe_lb_threshold: 3.0
+  dllm_block_length: 32
 
   # The followings are legacy parameters. They are to be removed in the future.
   do_load: True

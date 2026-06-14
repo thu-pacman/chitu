@@ -77,7 +77,7 @@ class InferConfig(InferConfigLegacy):
     use_cuda_graph: bool | str = MISSING
     npu_fusion_fp4: bool = MISSING
     num_blocks: int = MISSING
-    max_multimodal_blocks: int = -1
+    max_multimodal_blocks: int = MISSING
     bind_process_to_cpu: str = MISSING
     bind_thread_to_cpu: str = MISSING
     memory_utilization: float = MISSING
@@ -85,14 +85,14 @@ class InferConfig(InferConfigLegacy):
     schedule_overlap: bool | str = MISSING
     full_warmup: bool | str = MISSING
     embed_tokens_lm_head_tp_size: str = MISSING
-    experts_stats_path: Optional[str] = None
-    num_experts_slots: Optional[int] = None
-    moe_lb_trigger: int = -1
-    moe_lb_threshold: float = 3.0
-    dllm_block_length: int = 32  # block length for dLLM decode
+    experts_stats_path: Optional[str] = MISSING
+    num_experts_slots: Optional[int] = MISSING
+    moe_lb_trigger: int = MISSING
+    moe_lb_threshold: float = MISSING
+    dllm_block_length: int = MISSING  # block length for dLLM decode
     enable_prefix_caching: bool = MISSING
-    dp_prefix_caching_hit_rate_weight: float = 0.01
-    dp_prefix_caching_running_penalty_weight: float = 0.01
+    dp_prefix_caching_hit_rate_weight: float = MISSING
+    dp_prefix_caching_running_penalty_weight: float = MISSING
 
     @dataclass
     class MoEConfig:
@@ -350,6 +350,7 @@ class StaticConfig:
 
 @dataclass
 class ServeConfig(ServeConfigLegacy):
+    boot: Any = MISSING
     serve: ServeAddrConfig = field(default_factory=ServeAddrConfig)
     models: Any = MISSING
     benchmark: Any = MISSING

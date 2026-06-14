@@ -147,9 +147,9 @@ elif which npu-smi >/dev/null 2>&1; then
         -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
         -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
         -v /etc/ascend_install.info:/etc/ascend_install.info"
-    # Mount files including /dev/davinci{integer} and /dev/davinci_manager
+    # Mount devices including /dev/davinci{integer} and /dev/davinci_manager
     for dev in /dev/davinci*; do
-        DOCKER_RUN_CMD="${DOCKER_RUN_CMD} -v $dev:$dev"
+        DOCKER_RUN_CMD="${DOCKER_RUN_CMD} --device $dev"
     done
 elif which hy-smi >/dev/null 2>&1; then
     DOCKER_RUN_CMD="${DOCKER_RUN_CMD} \

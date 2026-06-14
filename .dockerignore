@@ -3,6 +3,7 @@
 
 # No CI scripts
 **/.gitlab-ci.yml
+/ci/
 
 # Dockerfile is not needed inside the images
 **/Dockerfile

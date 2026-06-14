@@ -19,7 +19,7 @@ from chitu.distributed.parallel_state import (
     get_pp_group,
     get_dp_size,
 )
-from chitu.distributed.tcp_ip import get_local_ip, get_free_port
+from chitu.boot.tcp_ip import get_local_ip, get_free_port
 from chitu.global_vars import get_global_args
 from chitu.metrics.cache_stats import kvcache_stats, get_prealloc_blocks
 from chitu.metrics.task_stats import count_tasks_for_dp_rank, count_tasks_non_dp
