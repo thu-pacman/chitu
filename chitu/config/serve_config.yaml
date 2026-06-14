@@ -42,6 +42,14 @@ boot:
   # Number of nodes (servers) to use
   n_nodes: 1
 
+  # List of nodes (servers) to use. Please fill with hostnames or IPs.
+  #
+  # This field is only for, and must only be set for `boot.remote_launcher=ssh`.
+  # If set, the length of this list must equal to `n_nodes`.
+  #
+  # E.g., ["node1", "node2"]
+  ssh_node_list: null
+
   # Number of GPUs per node to use
   n_gpus_per_node: 1
 
@@ -65,6 +73,7 @@ boot:
   # Acceptable values:
   # - local: Only run on the current node.
   # - srun: Use `srun` from Slurm.
+  # - ssh: Directly use SSH to connect to remote nodes.
   remote_launcher: "local"
 
   # Make the first node interactive, but output from the other nodes will NOT be printed

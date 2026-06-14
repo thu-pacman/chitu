@@ -655,7 +655,45 @@ Apptainer:
 ./script/srun_apptainer_run_multi_node.sh 2 8 -B .:/workspace/chitu -B /path/to/models:/path/to/models --env PYTHONPATH=/workspace/chitu /path/to/image.sif torchrun test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
 ```
 
-### Multi-Node Parallelism with Direct SSH Connection
+### Multi-Node Parallelism with Direct SSH Connection and Docker/Apptainer
+
+Please first make sure you can connect to each host via SSH without a password.
+
+#### Use Self-Contained Executable (Recommended)
+
+This is similar to the [Slurm usage](#use-self-contained-executable-recommended) above, except that you set `boot.remote_launcher=ssh` instead of `srun`, and provide the list of hosts via `boot.ssh_node_list` instead of relying on Slurm to allocate nodes. All other options remain the same.
+
+Example:
+
+```bash
+./<output_file> boot.n_nodes=2 \
+    "boot.ssh_node_list=[host1,host2]" \
+    boot.n_gpus_per_node=8 \
+    boot.remote_launcher=ssh \
+    "boot.target=[test/single_req_test.py]" \
+    "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
+    models=Qwen3-235B-A22B \
+    models.ckpt_dir=/path/to/Qwen3-235B-A22B \
+    infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+#### Directly Invoke SSH and Docker
+
+Please start a docker container (not just preparing a image) on each node with the same container name. Then you can use the following script:
+
+```bash
+./script/ssh_docker_exec_multi_node.sh <docker-container-name> <pwd-in-container> <comma-separated-hosts> <num_gpus_per_node> [your command after torchrun]...
+```
+
+Example:
+
+```bash
+./script/ssh_docker_exec_multi_node.sh my_container /workspace "host1,host2" 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
+```
+
+Apptainer is not supported in this direct script.
+
+### Multi-Node Parallelism with Direct SSH Connection and host-installed Chitu
 
 Please first make sure you can connect to each host via SSH without a password. Then you can use the following script:
 
@@ -667,20 +705,6 @@ Example:
 
 ```bash
 ./script/ssh_multi_node.sh "host1,host2" 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
-```
-
-### Multi-Node Parallelism with Direct SSH Connection and a Docker Container
-
-Please first make sure you can connect to each host via SSH without a password, and please also start a docker container on each node with the same container name. Then you can use the following script:
-
-```bash
-./script/ssh_docker_exec_multi_node.sh <docker-container-name> <pwd-in-container> <comma-separated-hosts> <num_gpus_per_node> [your command after torchrun]...
-```
-
-Example:
-
-```bash
-./script/ssh_docker_exec_multi_node.sh my_container /workspace "host1,host2" 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
 ```
 
 ### Fixing Input and Output Lengths for Performance Testing
