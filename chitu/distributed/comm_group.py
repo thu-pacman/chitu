@@ -5,6 +5,7 @@
 import copy
 import itertools
 import os
+from datetime import timedelta
 from typing import Optional, List, Tuple, Sequence, Any
 
 import torch
@@ -12,12 +13,26 @@ import torch.distributed
 from logging import getLogger
 
 from chitu.distributed.custom_ar_chitu import create_chitu_custom_allreduce
+from chitu.global_vars import get_global_args
 from chitu.boot.tcp_ip import get_local_ip, reserve_free_port
 
 logger = getLogger(__name__)
 
 _torch_group_dedup_dict_device: dict[tuple[tuple[int, ...], ...], list[Any]] = {}
 _torch_group_dedup_dict_host: dict[tuple[tuple[int, ...], ...], list[Any]] = {}
+
+
+def _get_pg_timeout() -> Optional[timedelta]:
+    """Process-group collective timeout.
+    DeepGEMM JIT warmup compiles many kernels during the first
+    forward pass (each (n,k) shape sweeps m=[1, DG_WARMUP_MAX_M] building
+    15-29 distinct kernels), which can take well over the NCCL default
+    600 s watchdog timeout.
+    Use a generous timeout that covers the warmup compilation window when enable full_warmup
+    """
+    if getattr(get_global_args().infer, "full_warmup", False):
+        return timedelta(seconds=3600)
+    return None
 
 
 class SingletonGroupPlaceholder:
@@ -33,6 +48,7 @@ def new_torch_group_dedup(
     """
 
     rank_tuples = tuple(tuple(rank_list) for rank_list in rank_lists)
+    pg_timeout = _get_pg_timeout()
     if is_device:
         if len(rank_lists) == 1:
             return [torch.distributed.group.WORLD]
@@ -43,7 +59,7 @@ def new_torch_group_dedup(
                 (
                     SingletonGroupPlaceholder()
                     if len(rank_list) == 1
-                    else torch.distributed.new_group(rank_list)
+                    else torch.distributed.new_group(rank_list, timeout=pg_timeout)
                 )
                 for rank_list in rank_lists
             ]
@@ -57,7 +73,9 @@ def new_torch_group_dedup(
                 (
                     SingletonGroupPlaceholder()
                     if len(rank_list) == 1
-                    else torch.distributed.new_group(rank_list, backend="gloo")
+                    else torch.distributed.new_group(
+                        rank_list, backend="gloo", timeout=pg_timeout
+                    )
                 )
                 for rank_list in rank_lists
             ]
@@ -106,6 +124,7 @@ class CommGroup:
         this_rank_idx = contains_this_rank.index(True)
         self.cpu_group = cpu_groups[this_rank_idx]
         self.gpu_group = gpu_groups[this_rank_idx]
+        self.all_gpu_groups = gpu_groups  # Expose to get_pp_pair_group call
 
         if type(self.gpu_group) != SingletonGroupPlaceholder:
             # fix random graph capture stuck on cm384, in tp2

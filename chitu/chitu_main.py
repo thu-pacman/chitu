@@ -970,6 +970,26 @@ def warmup_engine(args):
 
     clear_observed_op_impl_selections()
 
+    # 告知 DeepGEMM 预热范围，使其在首次遇到某个 (n,k) 时提前编译所有可能的 m 值对应的 kernel，
+    # 避免推理过程中因 m 变化触发 JIT 编译导致延迟波动。
+    # DG_WARMUP_MAX_M 若已由外部设置则不覆盖。
+    if "DG_WARMUP_MAX_M" not in os.environ and getattr(
+        args.infer, "full_warmup", False
+    ):
+        _pcs = getattr(args.infer, "prefill_chunk_size", None)
+        if not (_pcs and isinstance(_pcs, int) and _pcs > 0):
+            _pcs = getattr(args.infer, "max_seq_len", 0) * getattr(
+                args.infer, "max_batch_size", 0
+            )
+        if _pcs and isinstance(_pcs, int) and _pcs > 0:
+            _dp_size = max(getattr(args.infer, "dp_size", 1), 1)
+            _warmup_max_m = _pcs // _dp_size
+            os.environ["DG_WARMUP_MAX_M"] = str(_warmup_max_m)
+            logger.info(
+                f"[warmup] Set DG_WARMUP_MAX_M={_warmup_max_m} "
+                f"(prefill_chunk_size={_pcs} / dp_size={_dp_size})"
+            )
+
     # PD分离→direct，非PD→taskpool
     pd_enabled = args.dp_config.router.pd_disaggregation.enabled
 

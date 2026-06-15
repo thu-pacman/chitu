@@ -13,6 +13,7 @@ from omegaconf import DictConfig
 from logging import getLogger
 
 from chitu.boot.srun import srun
+from chitu.boot.ssh import ssh
 from chitu.boot.apptainer_run import apptainer_run
 from chitu.boot.docker_run import docker_run
 from chitu.boot.appimage_utils import appdir
@@ -70,6 +71,8 @@ def main(cfg: DictConfig):
         )
     elif cfg.boot.remote_launcher == "srun":
         srun(cfg, raw_argv, local_run_callback)
+    elif cfg.boot.remote_launcher == "ssh":
+        ssh(cfg, raw_argv, local_run_callback)
     else:
         raise NotImplementedError(
             f"Unrecognized remote launcher: {cfg.boot.remote_launcher}"

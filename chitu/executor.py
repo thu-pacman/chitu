@@ -287,7 +287,8 @@ class PipeDispatcher(TasksDispatcher):
         self.next_rank = self.pp_group.next_rank
         self.prev_rank = self.pp_group.prev_rank
 
-        # Compatible with NPU platforms logic. Otherwise, pair_group is None
+        # Get existed and initialized pp ProcessGroup(which created in initialize_pp_group)
+        # to avoild nccl timeout during deepgemm warmup.
         self.next_pair_group = get_pp_pair_group(self.rank, self.next_rank)
         self.prev_pair_group = get_pp_pair_group(self.rank, self.prev_rank)
 

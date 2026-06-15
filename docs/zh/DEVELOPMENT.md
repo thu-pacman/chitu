@@ -660,7 +660,45 @@ Apptainer:
 ./script/srun_apptainer_run_multi_node.sh 2 8 -B .:/workspace/chitu -B /path/to/models:/path/to/models --env PYTHONPATH=/workspace/chitu /path/to/image.sif torchrun test/single_req_test.py models=Qwen3-235B-A22B models.ckpt_dir=/path/to/Qwen3-235B-A22B infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
 ```
 
-### 基于 SSH 连接的多节点运行
+### 使用 SSH 在多个节点上的 Docker/Apptainer 容器内运行
+
+首先确保各节点直接可以相互无密码 ssh 访问。
+
+#### 使用自包含可执行文件（推荐）
+
+这与上文的 [Slurm 用法](#使用自包含可执行文件推荐) 类似，区别在于将 `boot.remote_launcher` 设置为 `ssh` 而非 `srun`，并通过 `boot.ssh_node_list` 提供主机列表，而不是依赖 Slurm 分配节点。其余选项保持不变。
+
+示例：
+
+```bash
+./<output_file> boot.n_nodes=2 \
+    "boot.ssh_node_list=[host1,host2]" \
+    boot.n_gpus_per_node=8 \
+    boot.remote_launcher=ssh \
+    "boot.target=[test/single_req_test.py]" \
+    "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
+    models=Qwen3-235B-A22B \
+    models.ckpt_dir=/path/to/Qwen3-235B-A22B \
+    infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
+```
+
+#### 直接调用 SSH 和 Docker
+
+请在各个节点上启动（而非仅准备镜像）同名的 Docker 容器，然后执行以下脚本命令：
+
+```bash
+./script/ssh_docker_exec_multi_node.sh <docker-container-name> <pwd-in-container> <comma-separated-hosts> <num_gpus_per_node> [your command after torchrun]...
+```
+
+示例：
+
+```bash
+./script/ssh_docker_exec_multi_node.sh my_container /workspace "host1,host2" 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
+```
+
+此直接脚本不支持 Apptainer。
+
+### 使用 SSH 在多个节点上运行在宿主机上安装的赤兔
 
 首先确保各节点直接可以相互无密码 ssh 访问，然后执行以下脚本命令：
 
@@ -672,20 +710,6 @@ Apptainer:
 
 ```bash
 ./script/ssh_multi_node.sh "host1,host2" 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
-```
-
-### 基于 Docker 容器和 SSH 连接的多节点运行
-
-首先确保各节点直接可以相互无密码 ssh 访问，然后在各个节点上启动同名的容器，最后执行以下脚本命令：
-
-```bash
-./script/ssh_docker_exec_multi_node.sh <docker-container-name> <pwd-in-container> <comma-separated-hosts> <num_gpus_per_node> [your command after torchrun]...
-```
-
-示例：
-
-```bash
-./script/ssh_docker_exec_multi_node.sh my_container /workspace "host1,host2" 2 test/single_req_test.py models=<model-name> models.ckpt_dir=<path/to/checkpoint> request.max_new_tokens=64 infer.cache_type=paged infer.tp_size=2
 ```
 
 ### 固定输入输出长度用于性能测试

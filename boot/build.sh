@@ -113,18 +113,25 @@ pip install --upgrade pip
 pip install -r "$THIS_SCRIPT_DIR"/requirements.txt
 pip install pyinstaller
 
-# 3) Pack the boot script as a single file into the temporary directory
+# 3) Copy the boot module to the temporary `chitu` directory. Therefore, we can ensure
+# that: i. no redundant files are included into the bundle; and ii. the boot module
+# has a `chitu.boot` import path, which is consistent with other module.
+mkdir -p "$BUILD_DIR/src/chitu"
+touch "$BUILD_DIR/src/chitu/__init__.py"
+cp -r "$THIS_SCRIPT_DIR"/../chitu/boot "$BUILD_DIR/src/chitu/boot"
+
+# 4) Pack the boot script as a single file into the temporary directory
 pyinstaller --onefile \
     --name chitu-boot \
-    --path "$THIS_SCRIPT_DIR"/.. \
+    --path "$BUILD_DIR/src" \
     --distpath "$BUILD_DIR/dist" \
     --workpath "$BUILD_DIR/work" \
     --specpath "$BUILD_DIR" \
-    "$THIS_SCRIPT_DIR"/../chitu/boot/main.py
+    "$BUILD_DIR/src/chitu/boot/main.py"
 
 PACKED_BINARY="$BUILD_DIR/dist/chitu-boot"
 
-# 4) Deactivate the venv
+# 5) Deactivate the venv
 deactivate
 
 #################################################################

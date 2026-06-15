@@ -1,15 +1,25 @@
 import pytest
 import os
 import torch
+from omegaconf import OmegaConf
 
 from chitu.distributed.comm_group import CommGroup
 from chitu.distributed.infiniband import auto_set_ib_envs
+from chitu.global_vars import set_global_args
+
+
+def _init_global_args():
+    set_global_args(
+        OmegaConf.create({"infer": {}, "models": {"quant_config": {"rules": []}}}),
+        need_ensure=False,
+    )
 
 
 def test_communicates():
     if not torch.distributed.is_initialized():
         auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
+    _init_global_args()
     world_size = torch.distributed.get_world_size()
     global_rank = torch.distributed.get_rank()
     if world_size < 4:
@@ -32,6 +42,7 @@ def test_is_orthogonal_to_1():
     if not torch.distributed.is_initialized():
         auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
+    _init_global_args()
     world_size = torch.distributed.get_world_size()
     global_rank = torch.distributed.get_rank()
     if world_size < 4:
@@ -58,6 +69,7 @@ def test_is_orthogonal_to_2():
     if not torch.distributed.is_initialized():
         auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
+    _init_global_args()
     world_size = torch.distributed.get_world_size()
     global_rank = torch.distributed.get_rank()
     if world_size < 8:
@@ -86,6 +98,7 @@ def test_cartesian_product_1():
     if not torch.distributed.is_initialized():
         auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
+    _init_global_args()
     world_size = torch.distributed.get_world_size()
     global_rank = torch.distributed.get_rank()
     if world_size < 4:
@@ -109,6 +122,7 @@ def test_cartesian_product_2():
     if not torch.distributed.is_initialized():
         auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
+    _init_global_args()
     world_size = torch.distributed.get_world_size()
     global_rank = torch.distributed.get_rank()
     if world_size < 8:
