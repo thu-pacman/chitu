@@ -8,6 +8,7 @@ import os
 import time
 import re
 from collections import deque
+from datetime import timedelta
 from enum import Enum
 from glob import glob
 from logging import getLogger
@@ -273,6 +274,7 @@ class Backend:
                 torch.distributed.init_process_group("gloo")
             else:
                 torch.distributed.init_process_group("nccl")
+
         if Backend.use_gloo:
             Backend.group_gloo = torch.distributed.new_group(backend="gloo")
 

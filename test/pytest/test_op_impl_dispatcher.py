@@ -171,7 +171,7 @@ def test_warmup_engine_emits_impl_summary_after_auto_set(monkeypatch):
             )
         ),
         scheduler=SimpleNamespace(type="default"),
-        infer=SimpleNamespace(full_warmup=False),
+        infer=SimpleNamespace(full_warmup=False, prefill_chunk_size=100),
     )
 
     chitu_main.warmup_engine(args)

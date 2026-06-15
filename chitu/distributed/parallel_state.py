@@ -230,17 +230,61 @@ def initialize_pp_group(
     pp_rank_lists = get_pp_rank_lists(pp_size=pp_size, world_size=world_size)
     _PP_GROUP = CommGroup(pp_rank_lists, rank)
 
-    if is_ascend():
-        assert len(_PP_PAIR_GROUP_DICT) == 0
-        if pp_size < 2:
-            return
-        ranks = pp_rank_lists[0]
+    # _PP_PAIR_GROUP_DICT reuse the ProcessGroup objects already created
+    # and initialized by CommGroup above (stored in CommGroup().all_gpu_groups).
+    assert len(_PP_PAIR_GROUP_DICT) == 0
+    if pp_size < 2:
+        return
+
+    for pp_rank_list, pg in zip(pp_rank_lists, _PP_GROUP.all_gpu_groups):
         for i in range(pp_size):
             next_i = (i + 1) % pp_size
-            rank_pair = [ranks[i], ranks[next_i]]
-            pg = torch.distributed.new_group(rank_pair)
-            _PP_PAIR_GROUP_DICT[(ranks[i], ranks[next_i])] = pg
-            _PP_PAIR_GROUP_DICT[(ranks[next_i], ranks[i])] = pg
+            r_i, r_next = pp_rank_list[i], pp_rank_list[next_i]
+            if (r_i, r_next) not in _PP_PAIR_GROUP_DICT:
+                _PP_PAIR_GROUP_DICT[(r_i, r_next)] = pg
+                _PP_PAIR_GROUP_DICT[(r_next, r_i)] = pg
+
+    if not is_ascend():
+        _warmup_pp_pair_p2p(rank, pp_rank_lists)
+
+
+def _warmup_pp_pair_p2p(rank: int, pp_rank_lists):
+    """Force NCCL point-to-point communicators for every adjacent PP pair to be
+    created, while all ranks are synchronized at init time.
+
+    This function runs dummy P2P ops(pipeline paralism) to avoid the situation:
+        NCCL lazily creates a separate communicator for send/recv on the first P2P op.
+    That first P2P op happens inside the inference loop right after DeepGEMM JIT
+    warmup, when the sender rank may be busy compiling kernels and unable to response
+    the P2P op, the receiver then times out after 600 s and the whole job dies.
+    """
+    pp_size = len(pp_rank_lists[0]) if pp_rank_lists else 0
+    if pp_size < 2:
+        return
+
+    # Collect unordered edges of every PP ring, deterministically ordered.
+    edges = []
+    seen = set()
+    for pp_rank_list in pp_rank_lists:
+        for i in range(pp_size):
+            a, b = pp_rank_list[i], pp_rank_list[(i + 1) % pp_size]
+            edge = (min(a, b), max(a, b))
+            if edge not in seen:
+                seen.add(edge)
+                edges.append(edge)
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    for low, high in edges:
+        if rank == low:
+            pg = _PP_PAIR_GROUP_DICT[(low, high)]
+            send_buf = torch.zeros(1, dtype=torch.float32, device=device)
+            torch.distributed.send(send_buf, dst=high, group=pg)
+        elif rank == high:
+            pg = _PP_PAIR_GROUP_DICT[(high, low)]
+            recv_buf = torch.empty(1, dtype=torch.float32, device=device)
+            torch.distributed.recv(recv_buf, src=low, group=pg)
+    torch.cuda.synchronize()
+    logger.info("PP pair P2P communicators warmed up")
 
 
 def initialize_dp_group(

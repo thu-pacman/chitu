@@ -28,8 +28,12 @@ def rms_norm_triton(
 
     x_shape = x.shape
     num_cols = x.shape[-1]
-    num_heads = x.shape[-2]
-    num_seqs = x.numel() // (num_cols * num_heads)
+    if x.ndim >= 3:
+        num_heads = x.shape[-2]
+        num_seqs = x.numel() // (num_cols * num_heads)
+    else:
+        num_heads = 1
+        num_seqs = x.numel() // num_cols
 
     # Assume the batch dimensions are contiguous, but it can be non-contiguous
     # in the last two dimensions.

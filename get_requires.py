@@ -137,6 +137,6 @@ extras_require = {
     ],
     "numa": ["numa"],
     "mooncake": [mooncake],
-    "tilelang": ["tilelang<=0.1.9"],
+    "tilelang": ["tilelang<=0.1.9", "apache-tvm-ffi<=0.1.11"],
     **operators.get_extras_require(),
 }
