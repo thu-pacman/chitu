@@ -114,6 +114,7 @@ def test_decode_prepare_listener(
     meta = MetadataBuffers(size=4)
     kv_manager = KVManager(
         kv_cache=cache,
+        host="127.0.0.1",
         metadata_buffers=meta,
         disaggregation_mode=DisaggregationMode.DECODE,
     )
@@ -175,6 +176,7 @@ def test_decode_status_endpoint_publishes_broadcast_port(
     meta = MetadataBuffers(size=4)
     kv_manager = KVManager(
         kv_cache=cache,
+        host="127.0.0.1",
         metadata_buffers=meta,
         disaggregation_mode=DisaggregationMode.DECODE,
     )
@@ -217,6 +219,7 @@ def test_handle_prepare_transfer_message_relays_to_internal_broadcast(
     meta = MetadataBuffers(size=4)
     kv_manager = KVManager(
         kv_cache=cache,
+        host="127.0.0.1",
         metadata_buffers=meta,
         disaggregation_mode=DisaggregationMode.DECODE,
     )
@@ -259,6 +262,7 @@ def test_handle_decode_internal_status_message_relays_to_internal_broadcast(
     meta = MetadataBuffers(size=4)
     kv_manager = KVManager(
         kv_cache=cache,
+        host="127.0.0.1",
         metadata_buffers=meta,
         disaggregation_mode=DisaggregationMode.DECODE,
     )

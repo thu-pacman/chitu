@@ -1,19 +1,14 @@
 import requests
 import json
-import sys
 import threading
+import hydra
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 
-if len(sys.argv) == 4:
-    url = sys.argv[1]
-    req_nums = int(sys.argv[2])
-    max_completion_tokens = int(sys.argv[3])
-else:
-    print(
-        f"Usage: {sys.argv[0]} <url> <req_nums> <max_completion_tokens>. \n"
-        f"Example: python3 {sys.argv[0]} http://localhost:25123/v1/chat/completions 1 256"
-    )
-    sys.exit(1)
+from chitu.schemas import ServeConfig
+from chitu.utils import get_config_dir_path
+
+req_nums = 2
+max_completion_tokens = 256
 
 headers = {"Content-Type": "application/json"}
 msgs = [
@@ -29,7 +24,7 @@ lock = threading.Lock()
 indices_received = []
 
 
-def send_request(index: int):
+def send_request(url: str, index: int):
     body = {
         "messages": msgs[index],
         "max_completion_tokens": max_completion_tokens,
@@ -68,25 +63,35 @@ def send_request(index: int):
             print(f"Request failed with status code: {response.status_code}")
 
 
-all_text = {}
-all_reasoning_text = {}
-total_tokens = 0
-with ThreadPoolExecutor(max_workers=req_nums) as executor:
-    futures = []
-    for i in range(req_nums):
-        futures.append(executor.submit(send_request, i))
-    for future in as_completed(futures):
-        result = future.result()
-        total_tokens += result[3]
-        text = result[1].replace("\n", "")
-        reasoning_text = result[2].replace("\n", "")
-        all_text[result[0]] = text
-        all_reasoning_text[result[0]] = reasoning_text
-print(
-    f"Response received order (interleaved indices are expected for true concurrency): {indices_received}"
+@hydra.main(
+    version_base=None, config_path=get_config_dir_path(), config_name="serve_config"
 )
-print("All responses:")
-for i in range(req_nums):
-    print(f"Response {i}: {all_text[i]}")
-    print(f"Reasoning {i}: {all_reasoning_text[i]}")
-print(f"Total tokens: {total_tokens}")
+def main(args: ServeConfig):
+    print("Begin streaming test")
+    all_text = {}
+    all_reasoning_text = {}
+    total_tokens = 0
+    with ThreadPoolExecutor(max_workers=req_nums) as executor:
+        url = f"http://{args.serve.host}:{args.serve.port}/v1/chat/completions"
+        futures = []
+        for i in range(req_nums):
+            futures.append(executor.submit(send_request, url, i))
+        for future in as_completed(futures):
+            result = future.result()
+            total_tokens += result[3]
+            text = result[1].replace("\n", "")
+            reasoning_text = result[2].replace("\n", "")
+            all_text[result[0]] = text
+            all_reasoning_text[result[0]] = reasoning_text
+    print(
+        f"Response received order (interleaved indices are expected for true concurrency): {indices_received}"
+    )
+    print("All responses:")
+    for i in range(req_nums):
+        print(f"Response {i}: {all_text[i]}")
+        print(f"Reasoning {i}: {all_reasoning_text[i]}")
+    print(f"Total tokens: {total_tokens}")
+
+
+if __name__ == "__main__":
+    main()

@@ -55,7 +55,6 @@ class DummyToolParser:
 
 
 def create_client(monkeypatch):
-    monkeypatch.setattr(api_server, "server_status", True)
     monkeypatch.setattr(
         serve_middleware,
         "get_global_args",
@@ -85,6 +84,7 @@ def create_client(monkeypatch):
         "resolve_requested_model_or_error",
         lambda model: model or "test-model",
     )
+    api_server.set_server_status(initialized=True)
     return TestClient(api_server.app)
 
 

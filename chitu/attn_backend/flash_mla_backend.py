@@ -10,7 +10,7 @@ import torch
 
 from chitu.attn_backend.triton_attn_backend import TritonAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.kv_cache import PagedKVCacheAccessor
+from chitu.kv_cache import KVCacheAccessor, PagedKVCacheAccessor
 from chitu.ops import (
     append_to_paged_kv_cache,
     convert_req_index_to_global_ragged_index,
@@ -39,6 +39,103 @@ if has_flash_mla and has_accelerator():
 
 
 logger = getLogger(__name__)
+
+_DEEPSEEK_V4_FLASHMLA_TOKEN_BYTES = 584
+_FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
+
+
+def _is_deepseek_v4_flashmla_packed_cache(kv_cache: torch.Tensor) -> bool:
+    return (
+        kv_cache.dtype == torch.uint8
+        and kv_cache.ndim >= 3
+        and kv_cache.shape[-1] == _DEEPSEEK_V4_FLASHMLA_TOKEN_BYTES
+    )
+
+
+def _append_deepseek_v4_flashmla_paged_cache(
+    kv_cache: torch.Tensor,
+    block_table: Optional[torch.Tensor],
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    seq_ids: torch.Tensor,
+    *,
+    window_size: Optional[int] = None,
+) -> bool:
+    if not _is_deepseek_v4_flashmla_packed_cache(kv_cache):
+        return False
+    if block_table is None:
+        raise RuntimeError("DeepSeek-V4 FlashMLA packed cache requires paged KV cache")
+
+    from chitu.ops.triton_ops import append_to_paged_kv_cache_flashmla_dsv4
+
+    append_to_paged_kv_cache_flashmla_dsv4(
+        kv_cache,
+        block_table,
+        values,
+        positions,
+        seq_ids,
+        window_size=window_size,
+    )
+    return True
+
+
+def _read_deepseek_v4_flashmla_paged_cache(
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_ids: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    if _FP8_DTYPE is None:
+        raise RuntimeError("DeepSeek-V4 FlashMLA packed cache requires FP8 support")
+    if kv_cache.dim() == 4:
+        assert kv_cache.shape[-2] == 1
+        kv_cache = kv_cache.squeeze(-2)
+
+    positions = positions.to(device=kv_cache.device, dtype=torch.long)
+    seq_ids = seq_ids.to(device=kv_cache.device, dtype=torch.long)
+    if positions.ndim == 1:
+        positions = positions.unsqueeze(0).expand(seq_ids.numel(), -1)
+    if seq_ids.ndim == 1:
+        seq_ids = seq_ids.unsqueeze(1).expand_as(positions)
+
+    out_shape = positions.shape
+    positions_flat = positions.reshape(-1)
+    seq_ids_flat = seq_ids.reshape(-1)
+    if positions_flat.numel() == 0:
+        return torch.empty(
+            *out_shape,
+            512,
+            dtype=torch.bfloat16,
+            device=kv_cache.device,
+        )
+
+    page_size = kv_cache.shape[1]
+    block_ids = block_table[seq_ids_flat, positions_flat // page_size].to(torch.long)
+    pos_in_block = positions_flat % page_size
+    flat = kv_cache.reshape(-1)
+    block_base = block_ids * kv_cache.stride(0)
+    token_base = block_base + pos_in_block * 576
+    scale_base = block_base + page_size * 576 + pos_in_block * 8
+
+    nope_offsets = token_base.unsqueeze(1) + torch.arange(
+        448, device=kv_cache.device, dtype=torch.long
+    )
+    nope = flat[nope_offsets].contiguous().view(_FP8_DTYPE).to(torch.float32)
+
+    scale_offsets = scale_base.unsqueeze(1) + torch.arange(
+        7, device=kv_cache.device, dtype=torch.long
+    )
+    exponents = flat[scale_offsets].to(torch.float32) - 127.0
+    scales = torch.exp2(exponents).unsqueeze(-1)
+    nope = (nope.view(-1, 7, 64) * scales).reshape(-1, 448).to(torch.bfloat16)
+
+    rope_offsets = (
+        token_base.unsqueeze(1)
+        + 448
+        + torch.arange(128, device=kv_cache.device, dtype=torch.long)
+    )
+    rope = flat[rope_offsets].contiguous().view(torch.bfloat16).reshape(-1, 64)
+    return torch.cat([nope, rope], dim=-1).reshape(*out_shape, 512)
 
 
 class FlashMLABackend(TritonAttnBackend):
@@ -446,70 +543,39 @@ class FlashMLABackend(TritonAttnBackend):
         return output[:, :local_h_q, :]
 
     @override
-    def csa_hca_prefill(
+    def csa_hca_prefill_ragged_qkvo(
         self,
         q: torch.Tensor,
-        slidingwindow_kv: torch.Tensor,
+        kv: torch.Tensor,
         attn_sink: torch.Tensor,
-        slidingwindow_topk_idxs: torch.Tensor,
+        topk_idxs: torch.Tensor,
         softmax_scale: float,
         *,
-        compressed_kv: Optional[torch.Tensor] = None,
-        compressed_topk_idxs: Optional[torch.Tensor] = None,
-        split_offset: Optional[int] = None,
         compress_ratio: Optional[int] = None,
     ) -> torch.Tensor:
-        if q.dim() != 4 or q.size(0) != 1:
-            raise NotImplementedError(
-                "DeepSeek-V4 FlashMLA prefill currently expects one request"
-            )
-        if slidingwindow_kv.dim() != 3 or slidingwindow_kv.size(0) != 1:
+        if q.dim() == 4 and q.size(0) == 1:
+            q = q.squeeze(0)
+        if kv.dim() == 2:
+            kv = kv.unsqueeze(1)
+        elif kv.dim() == 3 and kv.size(1) != 1:
             raise ValueError(
-                f"DeepSeek-V4 FlashMLA prefill expects 3D slidingwindow_kv, "
-                f"got {slidingwindow_kv.shape}"
+                f"DeepSeek-V4 FlashMLA prefill expects kv [S, 1, D], got {kv.shape}"
             )
-
-        kv = slidingwindow_kv
-        topk_idxs = slidingwindow_topk_idxs
-        has_compressed = (
-            compressed_kv is not None
-            and compressed_topk_idxs is not None
-            and compressed_topk_idxs.size(-1) > 0
-        )
-        if has_compressed:
-            assert compressed_kv is not None
-            assert compressed_topk_idxs is not None
-            if compressed_kv.dim() != 3 or compressed_kv.size(0) != 1:
-                raise ValueError(
-                    f"DeepSeek-V4 FlashMLA prefill expects 3D compressed_kv, "
-                    f"got {compressed_kv.shape}"
-                )
-            if split_offset is None:
-                split_offset = slidingwindow_kv.size(1)
-            shifted_compressed_topk_idxs = torch.where(
-                compressed_topk_idxs < 0,
-                compressed_topk_idxs,
-                compressed_topk_idxs + split_offset,
-            )
-            kv = torch.cat([slidingwindow_kv, compressed_kv], dim=1)
-            topk_idxs = torch.cat(
-                [slidingwindow_topk_idxs, shifted_compressed_topk_idxs],
-                dim=-1,
-            )
+        if topk_idxs.dim() == 3 and topk_idxs.size(0) == 1:
+            topk_idxs = topk_idxs.squeeze(0)
 
         topk_idxs, topk_length = self._csa_hca_prepare_flash_mla_indices(
-            topk_idxs.squeeze(0).to(torch.int32)
+            topk_idxs.to(torch.int32)
         )
-
         output = self.flashmla_sparse_fwd_bf16(
-            q.squeeze(0),
-            kv.squeeze(0),
+            q,
+            kv,
             softmax_scale=softmax_scale,
             topk_indices=topk_idxs,
             attn_sink=attn_sink,
             topk_length=topk_length,
         )
-        return output.unsqueeze(0).contiguous()
+        return output
 
     def _csa_hca_cache_as_flash_mla_k_cache(
         self,
@@ -551,6 +617,76 @@ class FlashMLABackend(TritonAttnBackend):
             padded[..., :topk] = indices
             indices = padded
         return indices.contiguous(), topk_length
+
+    def _read_dsv4_cache_flat(
+        self,
+        cache_accessor: KVCacheAccessor,
+        cache_key: str,
+        cache_slots: torch.Tensor,
+        cache_seq_ids: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        head_dim: int,
+        dtype: torch.dtype,
+        window_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        cache = cache_accessor.kv[cache_key]
+        if isinstance(cache_accessor, PagedKVCacheAccessor) and (
+            _is_deepseek_v4_flashmla_packed_cache(cache)
+        ):
+            positions = positions.to(device=cache.device, dtype=torch.long)
+            if window_size is not None:
+                positions = positions % int(window_size)
+            if positions.numel() == 0:
+                return torch.empty(0, head_dim, dtype=dtype, device=cache.device)
+            return _read_deepseek_v4_flashmla_paged_cache(
+                cache,
+                cache_accessor.block_table,
+                cache_seq_ids.to(device=cache.device, dtype=torch.long),
+                positions.unsqueeze(1),
+            ).squeeze(1)
+        return super()._read_dsv4_cache_flat(
+            cache_accessor,
+            cache_key,
+            cache_slots,
+            cache_seq_ids,
+            positions,
+            head_dim=head_dim,
+            dtype=dtype,
+            window_size=window_size,
+        )
+
+    def _write_dsv4_sliding_cache_flat(
+        self,
+        cache_accessor: KVCacheAccessor,
+        cache_slots: torch.Tensor,
+        cache_seq_ids: torch.Tensor,
+        positions: torch.Tensor,
+        values: torch.Tensor,
+        *,
+        window_size: int,
+    ):
+        cache = cache_accessor.kv["sliding_window"]
+        if isinstance(cache_accessor, PagedKVCacheAccessor) and (
+            _is_deepseek_v4_flashmla_packed_cache(cache)
+        ):
+            _append_deepseek_v4_flashmla_paged_cache(
+                cache,
+                cache_accessor.block_table,
+                values,
+                positions,
+                cache_seq_ids,
+                window_size=window_size,
+            )
+            return
+        return super()._write_dsv4_sliding_cache_flat(
+            cache_accessor,
+            cache_slots,
+            cache_seq_ids,
+            positions,
+            values,
+            window_size=window_size,
+        )
 
     def _csa_hca_global_kvcache_indices(
         self,
@@ -616,6 +752,7 @@ class FlashMLABackend(TritonAttnBackend):
         slidingwindow_topk_idxs: torch.Tensor,
         softmax_scale: float,
         *,
+        current_kv: Optional[torch.Tensor] = None,
         compressed_cache: Optional[PagedKVCacheAccessor] = None,
         compressed_topk_idxs: Optional[torch.Tensor] = None,
         split_offset: Optional[int] = None,
@@ -645,6 +782,14 @@ class FlashMLABackend(TritonAttnBackend):
             cache_seq_ids = cache_slots
         if window_size is None:
             window_size = slidingwindow_topk_idxs.size(-1)
+        self._write_dsv4_decode_current_kv(
+            slidingwindow_cache,
+            current_kv,
+            start_positions=start_positions,
+            cache_slots=cache_slots,
+            cache_seq_ids=cache_seq_ids,
+            window_size=window_size,
+        )
         has_compressed = (
             compressed_cache is not None
             and compressed_topk_idxs is not None

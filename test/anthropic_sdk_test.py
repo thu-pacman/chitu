@@ -23,7 +23,7 @@ from anthropic import Anthropic  # type: ignore
 
 from chitu.chitu_main import chitu_init, warmup_engine
 from chitu.schemas import ServeConfig
-from chitu.serve.api_server import start_uvicorn
+from chitu.serve.api_server import start_uvicorn, set_server_status
 from chitu.serve.common import start_worker
 from chitu.utils import get_config_dir_path, get_chitu_env
 
@@ -349,9 +349,7 @@ def hydra_main(args: ServeConfig):
     torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
     warmup_engine(args)
 
-    import chitu.serve.api_server as api_server
-
-    api_server.server_status = True
+    set_server_status(initialized=True)
     worker_thread = Thread(target=start_worker, daemon=True)
     worker_thread.start()
 

@@ -290,11 +290,38 @@ class Scheduler:
 
         return num_cached_tokens
 
-    def _check_prefill_capacity(self, task, cached_len: int) -> KVCacheCapacityStatus:
+    def _inflight_prefill_reserved_blocks(
+        self, cache_manager, exclude_task_id: str
+    ) -> int:
+        """已开始prefill但未完成（仍持有块、task_type仍为Prefill）的任务，跑到完整
+        prompt长度还需要的块数之和。准入新prefill时必须为它们预留这些块，否则会出现
+        多个在途prefill互相占用、谁都无法跑完、谁都到不了decode释放块的死锁。
+        Args:
+            cache_manager: 当前正在统计预留块的cache_manager
+            exclude_task_id: 排除的task_id（通常是当前正在检查容量的任务自身）
+        """
+        reserved = 0
+        for tid, cache_ids in cache_manager.task_to_cache_ids.items():
+            if not cache_ids or tid == exclude_task_id:
+                continue
+            task = TaskPool.pool.get(tid)
+            if task is None or task.task_type != TaskType.Prefill:
+                continue
+            need = cache_manager.num_blocks_for_seq_len(task.prefix_tokens_len) - len(
+                cache_ids
+            )
+            reserved += max(0, need)
+        return reserved
+
+    def _check_prefill_capacity(
+        self, task, cached_len: int, *, is_new_task: bool = False
+    ) -> KVCacheCapacityStatus:
         """检查是否所有cache_manager容量都足以容纳当前Prefill任务(task已缓存token长度为cached_len)
         Args:
             task: 当前正在检查kv cache容量的Prefill任务
             cached_len: 当前任务已缓存的长度
+            is_new_task: 是否为尚未开始prefill的新任务。新任务准入时需为所有在途
+                prefill任务预留其完成所需容量，以避免互相占用导致的调度死锁。
         """
         for name, cache_manager in self.cache_manager_dict.items():
             target_blocks = cache_manager.num_blocks_for_seq_len(
@@ -316,6 +343,12 @@ class Scheduler:
                     task, max_cached_token_len=cached_len
                 )
             )
+            # 准入「新」prefill任务时，必须为所有在途prefill任务的完成预留容量，
+            # 否则会出现两个部分完成的prefill互相占块、谁都无法完成的死锁。
+            if is_new_task:
+                available_blocks -= self._inflight_prefill_reserved_blocks(
+                    cache_manager, exclude_task_id=task.task_id
+                )
             if target_blocks - cur_blocks > available_blocks:
                 return KVCacheCapacityStatus.CONGESTED
         return KVCacheCapacityStatus.OK
@@ -434,10 +467,8 @@ class Scheduler:
             ):
                 continue
             if (
-                task.dp_rank is None
-                or self.dp_rank == task.dp_rank
-                and task.can_schedule()
-            ):
+                task.dp_rank is None or self.dp_rank == task.dp_rank
+            ) and task.can_schedule():
                 if n_running == self.max_running_tasks and task.dp_rank is None:
                     continue
                 if task.dp_rank is None:
@@ -567,7 +598,10 @@ class Scheduler:
         sched_out_task_ids = []
         prefill_tokens = 0
 
-        for task_id in task_ids:
+        idx = 0
+        while idx < len(task_ids):
+            task_id = task_ids[idx]
+            idx += 1
             if task_id not in TaskPool.pool:
                 continue
             if len(sched_out_task_ids) >= self.prefill_num_tasks:
@@ -612,13 +646,30 @@ class Scheduler:
             task_origin_prefill_chunk_size = task.prefill_chunk_size
             task.set_prefill_chunk_size_for_one_step(task_prefill_chunk_size)
 
-            capacity_status = self._check_prefill_capacity(task, num_cached_tokens)
+            is_new_task = task.consumed_req_tokens == 0
+            capacity_status = self._check_prefill_capacity(
+                task, num_cached_tokens, is_new_task=is_new_task
+            )
             if capacity_status is KVCacheCapacityStatus.EXCEEDS_CAPACITY:
                 task.prefill_chunk_size = task_origin_prefill_chunk_size
                 self._terminate_task_exceeds_capacity(task_id)
                 continue
             if capacity_status is KVCacheCapacityStatus.CONGESTED:
                 task.prefill_chunk_size = task_origin_prefill_chunk_size
+                if is_new_task:
+                    # 全新任务被拥塞（含为在途prefill预留容量导致）：跳过它继续检查
+                    # 排序靠后的、已在途的部分完成任务，让后者有机会推进而不被挡住。
+                    continue
+                # 已在途的部分任务被拥塞：此时已无容量再准入任何新prefill，僵局只能靠
+                # 逐出更低优先级的在途prefill来打破。
+                # 逐出后原地重试当前任务，避免空调度、避免再等一轮。
+                scheduled_set = set(sched_out_task_ids)
+                if self._evict_lowest_priority_inflight_prefill(
+                    keep_task_id=task_id, scheduled_set=scheduled_set
+                ):
+                    idx -= 1  # 重试当前任务（每次逐出一个更低优先级任务，逐步腾出容量）
+                    continue
+                # 没有可逐出的更低优先级任务：当前KV容量确实不足，停止本轮prefill调度。
                 break
 
             prefill_tokens += task_prefill_chunk_size
@@ -626,6 +677,48 @@ class Scheduler:
             self._prepare_prefill_metadata(task, num_cached_tokens)
 
         return sched_out_task_ids
+
+    def _evict_lowest_priority_inflight_prefill(
+        self, keep_task_id: str, scheduled_set: set[str]
+    ) -> bool:
+        """逐出优先级最低的、持有块的在途prefill任务以释放容量，用于
+        打破多个正在prefill的任务互相占块，导致谁都无法跑完的僵局。
+
+        Args:
+            keep_task_id: 当前正试图推进的任务，不可被逐出（它优先级更高）。
+            scheduled_set: 本轮已调度出去、即将运行的任务，不可被逐出。
+        Return:
+            是否成功逐出了一个任务。
+        """
+        main = self.cache_manager_dict["main"]
+        candidates = [
+            TaskPool.pool[tid]
+            for tid, cache_ids in main.task_to_cache_ids.items()
+            if cache_ids
+            and tid != keep_task_id
+            and tid not in scheduled_set
+            and tid in TaskPool.pool
+            and TaskPool.pool[tid].task_type == TaskType.Prefill
+        ]
+        if not candidates:
+            return False
+        keep_score = self.scorer(TaskPool.pool[keep_task_id])
+        # scorer越大越优先；只逐出优先级严格低于当前任务的，避免逐出更该跑的任务。
+        victim = min(candidates, key=lambda t: self.scorer(t))
+        if self.scorer(victim) >= keep_score:
+            return False
+        logger.warning(
+            f"Prefill congestion: evicting lower-priority in-flight prefill "
+            f"{victim.task_id} to let {keep_task_id} make progress and avoid deadlock.",
+            extra={
+                "event": "scheduler_prefill_congestion_evict",
+                "evicted_task_id": victim.task_id,
+                "keep_task_id": keep_task_id,
+            },
+        )
+        # 主动让位式逐出：不施加拥塞控制(阈值折半)，否则刚释放的容量会被重新挤占
+        self.evict_task(victim.task_id, congestion_control=False)
+        return True
 
     def _schedule_decode_tasks(self, task_ids: list[str]) -> list[str]:
         """Decode tasks scheduling, evicting the last prioriety decode task when these is no more block
@@ -689,10 +782,14 @@ class Scheduler:
 
         return sched_out_task_ids
 
-    def evict_task(self, task_id: str):
+    def evict_task(self, task_id: str, congestion_control: bool = True):
         """Evicting kv cache in kv_cache manager of the given task_id, restore task state to its pre-prefilling state
         Args:
             task_id: the task_id that need to be evicted
+            congestion_control: 是否施加拥塞控制(将kvcache_block_threshold折半)。
+                decode因容量不足被动逐出时为True；为打破prefill僵局而主动逐出低优先级
+                在途任务以让位给更高优先级任务时应为False——此时折半阈值会重新挤占刚释放
+                的容量，反而令被让位的任务无法推进，把临时拥塞变成永久死锁。
 
         Evicting Rules
         - For PP=1, raise error when current tasks list is empty
@@ -735,7 +832,8 @@ class Scheduler:
         task.dp_rank = None
 
         # For congestion control
-        self.kvcache_block_threshold = max(1, self.kvcache_block_threshold // 2)
+        if congestion_control:
+            self.kvcache_block_threshold = max(1, self.kvcache_block_threshold // 2)
         self._task_evict_hook.on_evict_done(task)
 
     @staticmethod

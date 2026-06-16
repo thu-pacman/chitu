@@ -6,7 +6,7 @@
 Hygon DCU W8A8 kernels for imported W8A8 linear and MoE layers.
 
 The external GLM-5 W8A8 checkpoint uses Chitu's `w8a8_dynamic`
-tensor naming. 
+tensor naming.
 """
 
 import functools

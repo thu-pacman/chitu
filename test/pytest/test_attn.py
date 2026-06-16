@@ -45,6 +45,32 @@ deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 hunyuan_ops, has_hunyuan_ops = try_import_opt_dep("hpc", "hpc_ops")
 
 
+def _make_csa_hca_attn_backend(
+    impl: str,
+    *,
+    head_dim: int,
+    index_topk: int = 128,
+    use_fp8: bool = False,
+):
+    if impl == "ref":
+        return RefAttnBackend(qk_nope_head_dim=head_dim)
+    if impl == "flash_mla":
+        return FlashMLABackend(
+            qk_nope_head_dim=head_dim,
+            index_topk=index_topk,
+            use_fp8=use_fp8,
+        )
+    raise NotImplementedError()
+
+
+def _skip_unsupported_csa_hca_impl(impl: str):
+    if impl == "flash_mla":
+        if not has_flash_mla:
+            pytest.skip("flash_mla is missing")
+        if not hasattr(flash_mla, "flash_mla_sparse_fwd"):
+            pytest.skip("flash_mla is too old to have `flash_mla_sparse_fwd`")
+
+
 def _dequant_dsa_fp8_kv_cache(kv_fp8: torch.Tensor) -> torch.Tensor:
     """Dequantize DeepSeek/GLM DSA FP8 MLA KV layout to bf16.
 
@@ -745,7 +771,9 @@ def test_flash_mla_fp8_kvcache_dequant_bf16_prefill(
         causal=True,
         num_topk_tokens=topk_indices.size(-1),
     )
-    assert_close(topk_indices_ragged_dispatched, topk_indices_ragged, atol=0, rtol=0)
+    assert_close(
+        topk_indices_ragged_dispatched, topk_indices_ragged, atol=0.0, rtol=0.0
+    )
 
     ragged_fp8_kv = read_from_paged_kv_cache(
         fp8_cache,
@@ -760,7 +788,7 @@ def test_flash_mla_fp8_kvcache_dequant_bf16_prefill(
         seq_len_delta.new.seq_ids_tensor_device,
     )
     ragged_bf16_kv_ref = _dequant_dsa_fp8_kv_cache(ragged_fp8_kv)
-    assert_close(ragged_bf16_kv, ragged_bf16_kv_ref, atol=0, rtol=0)
+    assert_close(ragged_bf16_kv, ragged_bf16_kv_ref, atol=0.0, rtol=0.0)
 
     ref_out = bf16_backend.flashmla_sparse_fwd_bf16(
         q,
@@ -1204,15 +1232,13 @@ def test_mla_decode_paged_kv(
 
 @pytest.mark.parametrize("q_len", [1, 7])
 @pytest.mark.parametrize("has_compressed", [False, True])
-@pytest.mark.parametrize("bs", [1])
 @pytest.mark.parametrize("local_n_heads,head_dim", [(16, 512)])
 @pytest.mark.parametrize("window_size,compress_ratio,start_pos", [(16, 4, 16)])
 @pytest.mark.parametrize("softmax_scale", [None, 0.13])
 @pytest.mark.parametrize("impl", ["ref", "flash_mla"])
-def test_csa_hca_prefill(
+def test_csa_hca_prefill_ragged_qkvo(
     q_len,
     has_compressed,
-    bs,
     local_n_heads,
     head_dim,
     window_size,
@@ -1224,15 +1250,322 @@ def test_csa_hca_prefill(
 ):
     if not has_accelerator():
         pytest.skip("cuda is missing")
-    if impl == "flash_mla":
-        if not has_flash_mla:
-            pytest.skip("flash_mla is missing")
-        if not hasattr(flash_mla, "flash_mla_sparse_fwd"):
-            pytest.skip("flash_mla is too old to have `flash_mla_sparse_fwd`")
+    _skip_unsupported_csa_hca_impl(impl)
 
     torch.set_default_dtype(torch.bfloat16)
     history_len = min(start_pos, window_size)
-    sliding_len = history_len + q_len
+    if softmax_scale is None:
+        softmax_scale = head_dim**-0.5
+
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_batch_size": 1,
+                    "op_impl": "torch",
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "cache_type": "paged",
+                    "dp_size": 1,
+                    "mla_absorb": "absorb",
+                    "max_seq_len": 1024,
+                    "mtp_size": 1,
+                },
+                "models": {
+                    "n_heads": local_n_heads,
+                    "head_dim": head_dim,
+                    "dim": 7168,
+                    "type": "deepseek-v4",
+                    "index_topk": 128,
+                },
+            }
+        ),
+        need_ensure=False,
+    )
+
+    from chitu.models.model_deepseek_v4 import get_chunked_prefill_topk_idxs_v4
+
+    q = torch.randn(q_len, local_n_heads, head_dim, device="cuda")
+    history_kv = torch.randn(history_len, head_dim, device="cuda")
+    current_kv = torch.randn(q_len, head_dim, device="cuda")
+    attn_sink = torch.randn(local_n_heads, device="cuda", dtype=torch.float32)
+
+    kv_parts = [history_kv, current_kv]
+    if has_compressed:
+        compressed_len = (start_pos + q_len - 1) // compress_ratio
+        kv_parts.append(torch.randn(compressed_len, head_dim, device="cuda"))
+
+    kv = torch.cat(kv_parts, dim=0).unsqueeze(1)
+    topk_idxs, _ = get_chunked_prefill_topk_idxs_v4(
+        window_size,
+        q_len,
+        start_pos,
+        q.device,
+        ratio=compress_ratio if has_compressed else 0,
+        compress_offset=history_len + q_len,
+    )
+
+    attn_backend = _make_csa_hca_attn_backend(impl, head_dim=head_dim)
+    ref_backend = RefAttnBackend(qk_nope_head_dim=head_dim)
+    out = record_benchmark.run(
+        lambda: attn_backend.csa_hca_prefill_ragged_qkvo(
+            q,
+            kv,
+            attn_sink,
+            topk_idxs,
+            softmax_scale,
+            compress_ratio=compress_ratio if has_compressed else None,
+        ),
+        q_len=q_len,
+        impl=impl,
+    )
+    ref_out = ref_backend.csa_hca_prefill_ragged_qkvo(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        softmax_scale,
+        compress_ratio=compress_ratio if has_compressed else None,
+    )
+
+    atol = 2e-2 if impl == "flash_mla" else 1e-5
+    rtol = 2e-2 if impl == "flash_mla" else 1e-5
+    assert_close(out, ref_out, atol=atol, rtol=rtol)
+
+
+def _run_csa_hca_prefill_cache_wrapper(cache_kind, impl, record_benchmark):
+    if not has_accelerator():
+        pytest.skip("cuda is missing")
+    _skip_unsupported_csa_hca_impl(impl)
+
+    torch.set_default_dtype(torch.bfloat16)
+    local_n_heads = 16
+    head_dim = 512
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_batch_size": 2,
+                    "op_impl": "torch",
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "cache_type": cache_kind,
+                    "dp_size": 1,
+                    "mla_absorb": "absorb",
+                    "max_seq_len": 32,
+                    "mtp_size": 1,
+                },
+                "models": {
+                    "n_heads": local_n_heads,
+                    "head_dim": head_dim,
+                    "dim": 7168,
+                    "type": "deepseek-v4",
+                    "index_topk": 128,
+                },
+            }
+        ),
+        need_ensure=False,
+    )
+
+    from chitu.models.model_deepseek_v4 import get_chunked_prefill_topk_idxs_v4
+
+    torch.manual_seed(0)
+    device = "cuda"
+    backend = _make_csa_hca_attn_backend(impl, head_dim=head_dim)
+    ref_backend = RefAttnBackend(qk_nope_head_dim=head_dim)
+    window_size = 4
+    compress_ratio = 4
+    seqlens = torch.tensor([2, 3], device=device, dtype=torch.long)
+    start_positions = torch.tensor([3, 8], device=device, dtype=torch.long)
+    cache_slots = torch.tensor([0, 1], device=device, dtype=torch.long)
+    cache_seq_ids = torch.tensor([0, 1], device=device, dtype=torch.long)
+    compressed_lens = torch.div(
+        start_positions + seqlens - 1,
+        compress_ratio,
+        rounding_mode="floor",
+    )
+
+    total_q = int(seqlens.sum().item())
+    q = torch.randn(total_q, local_n_heads, head_dim, device=device)
+    kv = torch.randn(total_q, head_dim, device=device)
+    attn_sink = torch.randn(local_n_heads, device=device, dtype=torch.float32)
+    sliding_cache = torch.zeros(2, window_size, head_dim, device=device)
+    compressed_cache = torch.randn(
+        2, int(compressed_lens.max().item()), head_dim, device=device
+    )
+
+    expected_kv_parts = []
+    local_topk_parts = []
+    q_req_ids = []
+    token_offset = 0
+    for req, (start_pos, seqlen) in enumerate(
+        zip(start_positions.tolist(), seqlens.tolist())
+    ):
+        history_len = min(start_pos, window_size)
+        history = torch.randn(history_len, head_dim, device=device)
+        history_positions = torch.arange(
+            start_pos - history_len,
+            start_pos,
+            device=device,
+        )
+        sliding_cache[req, history_positions % window_size] = history
+
+        current = kv[token_offset : token_offset + seqlen]
+        compressed_len = int(compressed_lens[req].item())
+        compressed = compressed_cache[req, :compressed_len]
+        expected_kv_parts.append(torch.cat([history, current, compressed], dim=0))
+
+        local_topk, _ = get_chunked_prefill_topk_idxs_v4(
+            window_size,
+            seqlen,
+            start_pos,
+            q.device,
+            ratio=compress_ratio if compressed_len > 0 else 0,
+            compress_offset=history_len + seqlen,
+        )
+        local_topk_parts.append(local_topk)
+        q_req_ids.extend([req] * seqlen)
+        token_offset += seqlen
+
+    kv_offsets = torch.tensor(
+        [0] + [part.size(0) for part in expected_kv_parts],
+        device=device,
+        dtype=torch.long,
+    ).cumsum(0)
+    expected_kv = torch.cat(expected_kv_parts, dim=0)
+    max_topk = max(part.size(-1) for part in local_topk_parts)
+    local_topk = local_topk_parts[0].new_full((total_q, max_topk), -1)
+    token_offset = 0
+    for seqlen, part in zip(seqlens.tolist(), local_topk_parts):
+        local_topk[token_offset : token_offset + seqlen, : part.size(-1)] = part
+        token_offset += seqlen
+    q_req_ids = torch.tensor(q_req_ids, device=device, dtype=torch.long)
+    expected_topk = torch.where(
+        local_topk >= 0,
+        local_topk + kv_offsets[q_req_ids].unsqueeze(1),
+        local_topk,
+    )
+
+    expected = ref_backend.csa_hca_prefill_ragged_qkvo(
+        q,
+        expected_kv.unsqueeze(1),
+        attn_sink,
+        expected_topk,
+        0.5,
+        compress_ratio=compress_ratio,
+    )
+    if cache_kind == "dense":
+        prefill_impl = backend.csa_hca_prefill_ragged_qo_dense_kv
+
+        def make_accessors():
+            sliding_cache_for_backend = sliding_cache.clone()
+            compressed_cache_for_backend = compressed_cache.clone()
+            return (
+                sliding_cache_for_backend,
+                DenseKVCacheAccessor({"sliding_window": sliding_cache_for_backend}),
+                DenseKVCacheAccessor({"compressed": compressed_cache_for_backend}),
+            )
+
+    else:
+        block_table = torch.arange(2, device=device, dtype=torch.long).view(2, 1)
+        prefill_impl = backend.csa_hca_prefill_ragged_qo_paged_kv
+
+        def make_accessors():
+            sliding_cache_for_backend = sliding_cache.clone()
+            compressed_cache_for_backend = compressed_cache.clone()
+            return (
+                sliding_cache_for_backend,
+                PagedKVCacheAccessor(
+                    block_table,
+                    {"sliding_window": sliding_cache_for_backend},
+                ),
+                PagedKVCacheAccessor(
+                    block_table,
+                    {"compressed": compressed_cache_for_backend},
+                ),
+            )
+
+    def run_prefill():
+        sliding_cache_for_backend, sliding_accessor, compressed_accessor = (
+            make_accessors()
+        )
+        out = prefill_impl(
+            q,
+            kv,
+            sliding_accessor,
+            attn_sink,
+            local_topk,
+            0.5,
+            seqlens=seqlens,
+            start_positions=start_positions,
+            cache_slots=cache_slots,
+            cache_seq_ids=cache_seq_ids,
+            window_size=window_size,
+            compressed_cache=compressed_accessor,
+            compressed_lens=compressed_lens,
+            compress_ratio=compress_ratio,
+        )
+        return out, sliding_cache_for_backend
+
+    out, sliding_cache_for_backend = record_benchmark.run(
+        run_prefill,
+        impl=impl,
+    )
+
+    atol = 2e-2 if impl == "flash_mla" else 1e-5
+    rtol = 2e-2 if impl == "flash_mla" else 1e-5
+    assert_close(out, expected, atol=atol, rtol=rtol)
+    token_offset = 0
+    for req, (start_pos, seqlen) in enumerate(
+        zip(start_positions.tolist(), seqlens.tolist())
+    ):
+        positions = torch.arange(start_pos, start_pos + seqlen, device=device)
+        keep_start = max(start_pos + seqlen - window_size, 0)
+        keep = positions >= keep_start
+        assert_close(
+            sliding_cache_for_backend[req, positions[keep] % window_size],
+            kv[token_offset : token_offset + seqlen][keep],
+            atol=0.0,
+            rtol=0.0,
+        )
+        token_offset += seqlen
+
+
+@pytest.mark.parametrize("impl", ["ref", "flash_mla"])
+def test_csa_hca_prefill_ragged_qo_dense_kv(impl, record_benchmark):
+    _run_csa_hca_prefill_cache_wrapper("dense", impl, record_benchmark)
+
+
+@pytest.mark.parametrize("impl", ["ref", "flash_mla"])
+def test_csa_hca_prefill_ragged_qo_paged_kv(impl, record_benchmark):
+    _run_csa_hca_prefill_cache_wrapper("paged", impl, record_benchmark)
+
+
+@pytest.mark.parametrize("q_len", [1, 7])
+@pytest.mark.parametrize("has_compressed", [False, True])
+@pytest.mark.parametrize("local_n_heads,head_dim", [(16, 512)])
+@pytest.mark.parametrize("window_size,compress_ratio,start_pos", [(16, 4, 16)])
+@pytest.mark.parametrize("softmax_scale", [None, 0.13])
+@pytest.mark.parametrize("impl", ["ref", "flash_mla"])
+def test_csa_hca_prefill_paged_kv_dispatch(
+    q_len,
+    has_compressed,
+    local_n_heads,
+    head_dim,
+    window_size,
+    compress_ratio,
+    start_pos,
+    softmax_scale,
+    impl,
+    record_benchmark,
+):
+    if not has_accelerator():
+        pytest.skip("cuda is missing")
+    _skip_unsupported_csa_hca_impl(impl)
+
+    torch.set_default_dtype(torch.bfloat16)
+    bs = 1
+    history_len = min(start_pos, window_size)
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
     set_global_args(
@@ -1261,65 +1594,114 @@ def test_csa_hca_prefill(
         need_ensure=False,
     )
 
-    from chitu.models.model_deepseek_v4 import (
-        get_compress_topk_idxs_v4,
-        get_window_topk_idxs_v4,
-    )
+    from chitu.models.model_deepseek_v4 import get_chunked_prefill_topk_idxs_v4
 
-    q = torch.randn(bs, q_len, local_n_heads, head_dim, device="cuda")
-    slidingwindow_kv = torch.randn(bs, sliding_len, head_dim, device="cuda")
+    seqlens = torch.tensor([q_len], device="cuda", dtype=torch.long)
+    start_positions = torch.tensor([start_pos], device="cuda", dtype=torch.long)
+    cache_slots = torch.tensor([0], device="cuda", dtype=torch.long)
+    cache_seq_ids = torch.tensor([0], device="cuda", dtype=torch.long)
+
+    q = torch.randn(q_len, local_n_heads, head_dim, device="cuda")
+    history_kv = torch.randn(history_len, head_dim, device="cuda")
+    current_kv = torch.randn(q_len, head_dim, device="cuda")
     attn_sink = torch.randn(local_n_heads, device="cuda", dtype=torch.float32)
-    slidingwindow_topk_idxs = get_window_topk_idxs_v4(
-        window_size, q_len, start_pos, q.device
-    ).int()
 
     if has_compressed:
-        compressed_topk_idxs = get_compress_topk_idxs_v4(
-            compress_ratio, q_len, start_pos, q.device
-        ).int()
+        compressed_len = int(
+            torch.div(
+                start_positions + seqlens - 1,
+                compress_ratio,
+                rounding_mode="floor",
+            )[0].item()
+        )
         compressed_kv = torch.randn(
-            bs, compressed_topk_idxs.size(-1), head_dim, device="cuda"
+            compressed_len,
+            head_dim,
+            device="cuda",
+        )
+        compressed_lens = torch.tensor(
+            [compressed_len],
+            device="cuda",
+            dtype=torch.long,
         )
     else:
         compressed_kv = None
-        compressed_topk_idxs = None
+        compressed_lens = torch.zeros(1, device="cuda", dtype=torch.long)
 
-    if impl == "ref":
-        attn_backend = RefAttnBackend(qk_nope_head_dim=head_dim)
-    elif impl == "flash_mla":
-        attn_backend = FlashMLABackend(qk_nope_head_dim=head_dim, index_topk=128)
-    else:
-        raise NotImplementedError()
-    ref_backend = RefAttnBackend(qk_nope_head_dim=head_dim)
-
-    out = record_benchmark.run(
-        lambda: attn_backend.csa_hca(
-            q,
-            slidingwindow_kv,
-            attn_sink,
-            slidingwindow_topk_idxs,
-            softmax_scale,
-            compressed_kv=compressed_kv,
-            compressed_topk_idxs=compressed_topk_idxs,
-            split_offset=sliding_len,
-            compress_ratio=compress_ratio if has_compressed else None,
-        ),
-        q_len=q_len,
-        impl=impl,
+    local_topk, _ = get_chunked_prefill_topk_idxs_v4(
+        window_size,
+        q_len,
+        start_pos,
+        q.device,
+        ratio=compress_ratio if has_compressed else 0,
+        compress_offset=history_len + q_len,
     )
-    ref_out = ref_backend.csa_hca(
+
+    expected_parts = [history_kv, current_kv]
+    if compressed_kv is not None:
+        expected_parts.append(compressed_kv)
+    expected_kv = torch.cat(expected_parts, dim=0)
+
+    attn_backend = _make_csa_hca_attn_backend(impl, head_dim=head_dim)
+    ref_backend = RefAttnBackend(qk_nope_head_dim=head_dim)
+    ref_out = ref_backend.csa_hca_prefill_ragged_qkvo(
         q,
-        slidingwindow_kv,
+        expected_kv.unsqueeze(1),
         attn_sink,
-        slidingwindow_topk_idxs,
+        local_topk,
         softmax_scale,
-        compressed_kv=compressed_kv,
-        compressed_topk_idxs=compressed_topk_idxs,
-        split_offset=sliding_len,
         compress_ratio=compress_ratio if has_compressed else None,
     )
 
-    assert_close(out, ref_out, atol=2e-2, rtol=2e-2)
+    block_table = torch.tensor([[0]], device="cuda", dtype=torch.long)
+
+    def run_prefill():
+        sliding_cache_for_backend = history_kv.unsqueeze(0).clone()
+        sliding_accessor = PagedKVCacheAccessor(
+            block_table,
+            {"sliding_window": sliding_cache_for_backend},
+        )
+        if compressed_kv is None:
+            compressed_accessor_for_backend = None
+        else:
+            compressed_accessor_for_backend = PagedKVCacheAccessor(
+                block_table,
+                {"compressed": compressed_kv.unsqueeze(0).clone()},
+            )
+        out = attn_backend.csa_hca(
+            q,
+            sliding_accessor,
+            attn_sink,
+            local_topk,
+            softmax_scale,
+            current_kv=current_kv,
+            seqlens=seqlens,
+            start_positions=start_positions,
+            cache_slots=cache_slots,
+            cache_seq_ids=cache_seq_ids,
+            window_size=window_size,
+            compressed_cache=compressed_accessor_for_backend,
+            compressed_lens=compressed_lens,
+            compress_ratio=compress_ratio if has_compressed else None,
+        )
+        return out, sliding_cache_for_backend
+
+    out, sliding_cache_for_backend = record_benchmark.run(
+        run_prefill,
+        q_len=q_len,
+        impl=impl,
+    )
+
+    atol = 2e-2 if impl == "flash_mla" else 1e-5
+    rtol = 2e-2 if impl == "flash_mla" else 1e-5
+    assert_close(out, ref_out, atol=atol, rtol=rtol)
+    current_positions = (start_pos + torch.arange(q_len, device="cuda")) % window_size
+    assert_close(
+        sliding_cache_for_backend[0, current_positions],
+        current_kv,
+        atol=0.0,
+        rtol=0.0,
+    )
 
 
 @pytest.mark.parametrize("bs", [1, 4])
@@ -1327,7 +1709,8 @@ def test_csa_hca_prefill(
 @pytest.mark.parametrize("local_n_heads,head_dim", [(8, 512)])
 @pytest.mark.parametrize("window_size,compress_ratio", [(8, 4)])
 @pytest.mark.parametrize("softmax_scale", [None, 0.13])
-def test_csa_hca_decode_skew_kv(
+@pytest.mark.parametrize("impl", ["ref"])
+def test_csa_hca_decode_dense_kv(
     bs,
     has_compressed,
     local_n_heads,
@@ -1335,10 +1718,12 @@ def test_csa_hca_decode_skew_kv(
     window_size,
     compress_ratio,
     softmax_scale,
+    impl,
     record_benchmark,
 ):
     if not has_accelerator():
         pytest.skip("cuda is missing")
+    _skip_unsupported_csa_hca_impl(impl)
 
     torch.set_default_dtype(torch.bfloat16)
     if softmax_scale is None:
@@ -1386,6 +1771,11 @@ def test_csa_hca_decode_skew_kv(
     cache_seq_ids = torch.arange(bs, device="cuda")
     q = torch.randn(bs, 1, local_n_heads, head_dim, device="cuda")
     slidingwindow_kv = torch.randn(bs, window_size, head_dim, device="cuda")
+    current_kv = torch.randn(bs, head_dim, device="cuda")
+    expected_slidingwindow_kv = slidingwindow_kv.clone()
+    expected_slidingwindow_kv[
+        torch.arange(bs, device="cuda"), start_positions % window_size
+    ] = current_kv
     attn_sink = torch.randn(local_n_heads, device="cuda", dtype=torch.float32)
     slidingwindow_topk_idxs = get_decode_window_topk_idxs_v4(
         window_size, start_positions
@@ -1404,16 +1794,18 @@ def test_csa_hca_decode_skew_kv(
         compressed_kv = None
         compressed_cache = None
 
-    attn_backend = RefAttnBackend(qk_nope_head_dim=head_dim)
+    attn_backend = _make_csa_hca_attn_backend(impl, head_dim=head_dim)
     ref_backend = RefAttnBackend(qk_nope_head_dim=head_dim)
+    slidingwindow_cache_for_backend = slidingwindow_kv.clone()
 
     out = record_benchmark.run(
         lambda: attn_backend.csa_hca(
             q,
-            DenseKVCacheAccessor({"sliding_window": slidingwindow_kv.clone()}),
+            DenseKVCacheAccessor({"sliding_window": slidingwindow_cache_for_backend}),
             attn_sink,
             slidingwindow_topk_idxs,
             softmax_scale,
+            current_kv=current_kv,
             compressed_cache=compressed_cache,
             compressed_topk_idxs=compressed_topk_idxs,
             split_offset=window_size,
@@ -1424,11 +1816,11 @@ def test_csa_hca_decode_skew_kv(
             compress_ratio=compress_ratio if has_compressed else None,
         ),
         bs=bs,
-        impl="ref",
+        impl=impl,
     )
     ref_out = ref_backend.csa_hca(
         q,
-        slidingwindow_kv,
+        expected_slidingwindow_kv,
         attn_sink,
         slidingwindow_topk_idxs,
         softmax_scale,
@@ -1439,6 +1831,14 @@ def test_csa_hca_decode_skew_kv(
     )
 
     assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+    assert_close(
+        slidingwindow_cache_for_backend[
+            torch.arange(bs, device="cuda"), start_positions % window_size
+        ],
+        current_kv,
+        atol=0.0,
+        rtol=0.0,
+    )
 
 
 @pytest.mark.parametrize("has_compressed", [False, True])
@@ -1462,10 +1862,9 @@ def test_csa_hca_decode_paged_kv(
     if not has_accelerator():
         pytest.skip("cuda is missing")
     if impl == "flash_mla":
+        _skip_unsupported_csa_hca_impl(impl)
         if not has_triton:
             pytest.skip("triton is missing")
-        if not has_flash_mla:
-            pytest.skip("flash_mla is missing")
         if not has_native_fp8():
             pytest.skip("FlashMLA DeepSeek-V4 csa_hca decode requires native FP8")
         if is_hygon() or is_muxi():
@@ -1513,6 +1912,11 @@ def test_csa_hca_decode_paged_kv(
     cache_seq_ids = torch.arange(bs, device="cuda")
     q = torch.randn(bs, 1, local_n_heads, head_dim, device="cuda")
     slidingwindow_kv = torch.randn(bs, window_size, head_dim, device="cuda")
+    current_kv = torch.randn(bs, head_dim, device="cuda")
+    expected_slidingwindow_kv = slidingwindow_kv.clone()
+    expected_slidingwindow_kv[
+        torch.arange(bs, device="cuda"), start_positions % window_size
+    ] = current_kv
     attn_sink = torch.randn(local_n_heads, device="cuda", dtype=torch.float32)
     slidingwindow_topk_idxs = get_decode_window_topk_idxs_v4(
         window_size, start_positions
@@ -1555,7 +1959,7 @@ def test_csa_hca_decode_paged_kv(
     ref_backend = RefAttnBackend(qk_nope_head_dim=head_dim)
     ref_out = ref_backend.csa_hca(
         q,
-        slidingwindow_kv,
+        expected_slidingwindow_kv,
         attn_sink,
         slidingwindow_topk_idxs,
         softmax_scale,
@@ -1566,13 +1970,13 @@ def test_csa_hca_decode_paged_kv(
     )
 
     if impl == "ref":
-        attn_backend = RefAttnBackend(qk_nope_head_dim=head_dim)
+        attn_backend = _make_csa_hca_attn_backend(impl, head_dim=head_dim)
     elif impl == "flash_mla":
         from chitu.ops.triton_ops import append_to_paged_kv_cache_flashmla_dsv4
 
-        attn_backend = FlashMLABackend(
-            qk_nope_head_dim=head_dim,
-            index_topk=128,
+        attn_backend = _make_csa_hca_attn_backend(
+            impl,
+            head_dim=head_dim,
             use_fp8=True,
         )
         packed_slidingwindow_kv = torch.empty(
@@ -1641,6 +2045,7 @@ def test_csa_hca_decode_paged_kv(
             attn_sink,
             slidingwindow_topk_idxs,
             softmax_scale,
+            current_kv=current_kv,
             compressed_cache=compressed_cache,
             compressed_topk_idxs=compressed_topk_idxs,
             split_offset=window_size,
@@ -2209,8 +2614,8 @@ def test_decode_paged_kv(
         out = out.view(out.shape[0], n_heads, head_dim)
 
     cos_sim_tol = 0.0
-    if impl == "triton" and is_muxi():
-        # Results of impl="triton" on muxi is not stable.
+    if impl in {"flash_attn", "triton"} and is_muxi():
+        # Results of impl="flash_attn" or impl="triton" on muxi is not stable.
         cos_sim_tol = 0.002  # TODO: Does it make sense?
     assert_close(out, ref_out, atol=1e-2, rtol=1e-2, cos_sim_tol=cos_sim_tol)
 

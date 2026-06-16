@@ -420,6 +420,7 @@ class KVManager:
     def __init__(
         self,
         kv_cache: Optional["KVCacheBase"],
+        host: str,
         metadata_buffers: MetadataBuffers,
         disaggregation_mode: DisaggregationMode,
         pd_coordination_service=None,  # Optional PD coordination service
@@ -467,12 +468,9 @@ class KVManager:
         )
         # Router metadata sync endpoint (the REP socket in PDCoordinationService).
         # Used to discover the ZMQ port of the Prefill control rank.
-        router_host = str(args.dp_config.router.host)
-        if router_host in ["0.0.0.0", "::", ""]:
-            router_host = "localhost"
         metadata_port = int(pd_config.metadata_sync_port) if pd_config else 0
         self._coordination_metadata_addr: Optional[str] = (
-            f"tcp://{router_host}:{metadata_port}" if metadata_port > 0 else None
+            f"tcp://{host}:{metadata_port}" if metadata_port > 0 else None
         )
 
         # Initialize transfer engine

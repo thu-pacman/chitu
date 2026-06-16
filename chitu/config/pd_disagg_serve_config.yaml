@@ -17,13 +17,9 @@ dp_config:
   scheduler_base_port: 29610
   dp_size: 2           # P + D 总实例数（启动时覆盖）
   dp_id: 0
-  tp_size: 1
-  pp_size: 1
 
   router:
     is_router: True
-    host: 0.0.0.0
-    port: 21003
     stats_port: 29600
     token_port: 29700
     launch_timeout: 3600

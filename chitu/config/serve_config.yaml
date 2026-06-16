@@ -68,6 +68,26 @@ boot:
   #   `boot.target`, or if you want to boot non-chitu programs.
   relay_args: True
 
+  # Invoke this command once chitu service starts
+  #
+  # This command will run alongside Rank 0. The process will run on a dedicated container,
+  # started with the same argument as the chitu service.
+  #
+  # Acceptable values:
+  # - null: No command will run.
+  # - A list of arguments.
+  # - A space-separated string for arguments.
+  on_ready: null
+
+  # Relay Hydra arguments from chitu-boot to the command in `boot.on_ready`
+  #
+  # Acceptable values: True or False.
+  on_ready_relay_args: True
+
+  # Terminate chitu service once the command in `boot.on_ready` finishes (either successfully
+  # or not)
+  on_ready_shutdown: False
+
   # How to run on multiple nodes
   #
   # Acceptable values:
@@ -468,13 +488,9 @@ dp_config:
   scheduler_base_port: 29610
   dp_size: 1
   dp_id: 0
-  tp_size: 1
-  pp_size: 1
   # Router configuration
   router:
     is_router: False
-    host: 0.0.0.0
-    port: 21003              # HTTP service port
     stats_port: 29600        # ZMQ port
     token_port: 29700        # ZMQ port
     max_inflight_per_instance: 24 # max number of inflight requests per dp instance

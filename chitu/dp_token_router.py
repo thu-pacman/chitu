@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 class TokenRouter:
     """Token Router - Handle token returns in DP scenarios"""
 
-    def __init__(self, config):
+    def __init__(self, host, config):
+        self.host = host
         self.config = config
         self.context = zmq.asyncio.Context()
 
@@ -66,7 +67,6 @@ class TokenRouter:
 
     async def _init_sockets(self):
         """Initialize ZMQ sockets (support multi-PULL via ROUTER_DP_SIZE)"""
-        router_host = self.config.router.host
         base_port = int(self.config.router.token_port)
 
         # get dp_size from dp_config
@@ -83,7 +83,7 @@ class TokenRouter:
             sock.setsockopt(zmq.RCVHWM, rcvhwm)
             sock.setsockopt(zmq.RCVBUF, rcvbuf)
             sock.setsockopt(zmq.TCP_KEEPALIVE, tcp_keepalive)
-            addr = f"tcp://{router_host}:{port}"
+            addr = f"tcp://{self.host}:{port}"
             sock.bind(addr)
             return sock, addr
 
@@ -304,7 +304,7 @@ class TokenRouter:
                 await asyncio.sleep(60)
 
 
-async def start_token_router(dp_config=None):
+async def start_token_router(host: str, dp_config):
     """Start Token Router"""
     logger.info("Starting Token Router...")
     existing_token_router = get_token_router(check_exist=False)
@@ -312,13 +312,8 @@ async def start_token_router(dp_config=None):
         await existing_token_router.start()
         return
 
-    if dp_config:
-        router = TokenRouter(dp_config)
-        logger.info(f"Token Router port={dp_config.router.token_port}")
-    else:
-        # Use default Token Router
-        router = TokenRouter({})
-        logger.info("Default config Token Router started")
+    router = TokenRouter(host, dp_config)
+    logger.info(f"Token Router port={dp_config.router.token_port}")
 
     # dp_chat_completions uses the same instance
     logger.info("Set global Token Router instance")

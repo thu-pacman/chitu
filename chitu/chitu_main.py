@@ -7,7 +7,6 @@ import time
 import traceback
 from logging import getLogger
 from typing import Optional
-import random
 import re
 import traceback
 from tqdm import tqdm
@@ -125,6 +124,131 @@ def _deepseek_v4_compressed_blocks_for_seq_len(
     if compressed_len == 0:
         return 0
     return int(num_reqs) * ceil_div(compressed_len, int(block_size))
+
+
+def _direct_warmup_target_lens(
+    local_max_bs: int,
+    decode_steps: int,
+    bs_descend: int,
+    skip_model_decode: bool,
+) -> list[int]:
+    local_max_bs = int(local_max_bs)
+    if local_max_bs <= 0:
+        return []
+
+    # _warmup_backend_direct always runs prepare_cache_prefill with one token per
+    # request, even when model.prefill itself is skipped for decode-only workers.
+    target_lens = [1 for _ in range(local_max_bs)]
+    if skip_model_decode:
+        return target_lens
+
+    mtp_size = int(get_global_args().infer.mtp_size)
+    for i in range(max(1, int(decode_steps))):
+        curr_bs = local_max_bs - i * int(bs_descend)
+        if curr_bs <= 0:
+            break
+        curr_bs = min(curr_bs, local_max_bs)
+        for req_idx in range(curr_bs):
+            target_lens[req_idx] += mtp_size
+    return target_lens
+
+
+def _cache_consumes_direct_warmup_new_cache_ids(cache) -> bool:
+    if not all(
+        hasattr(cache, attr)
+        for attr in ("block_table", "block_size", "num_blocks", "manager_name")
+    ):
+        return False
+
+    # These cache types manage their own block allocation and do not consume
+    # PackedTasks.new_cache_ids_list in prepare_cache_prefill/decode.
+    if type(cache).__name__ in {"SingletonPagedKVCache", "MMPagedKVCache"}:
+        return False
+
+    return True
+
+
+def _direct_warmup_num_blocks_for_cache(
+    cache,
+    manager_name: str,
+    target_len: int,
+) -> int:
+    target_len = int(target_len)
+    if target_len <= 0:
+        return 0
+
+    # DeepSeek-V4 sliding-window cache is scheduler-managed even though each
+    # request owns exactly one ring-buffer page.
+    if bool(getattr(cache, "fixed_num_blocks", False)):
+        return 1
+
+    ratio = _deepseek_v4_compressed_ratio_from_manager_name(manager_name)
+    storage_len = target_len // int(ratio) if ratio is not None else target_len
+    if storage_len <= 0:
+        return 0
+    return ceil_div(storage_len, int(cache.block_size))
+
+
+def _build_direct_warmup_new_cache_ids_list(
+    local_max_bs: int,
+    decode_steps: int,
+    bs_descend: int,
+    skip_model_decode: bool,
+) -> list[dict[str, list[int]]]:
+    """Build scheduler-style cache block metadata for direct warmup.
+
+    Direct warmup bypasses the scheduler, but PagedKVCache.prepare_cache_* still
+    expects the scheduler-produced request -> block ids mapping.  Allocate that
+    metadata deterministically here, grouped by manager_name, so all caches owned
+    by the same logical manager share the same block ids.
+    """
+
+    local_max_bs = int(local_max_bs)
+    target_lens = _direct_warmup_target_lens(
+        local_max_bs,
+        decode_steps,
+        bs_descend,
+        skip_model_decode,
+    )
+    new_cache_ids_list: list[dict[str, list[int]]] = [{} for _ in range(local_max_bs)]
+
+    manager_groups = {}
+    for cache in Backend.cache_dict.values():
+        if not _cache_consumes_direct_warmup_new_cache_ids(cache):
+            continue
+        manager_name = str(cache.manager_name)
+        manager_groups.setdefault(manager_name, []).append(cache)
+
+    for manager_name, caches in manager_groups.items():
+        capacity = min(int(cache.num_blocks) for cache in caches)
+        blocks_per_req = [0 for _ in range(local_max_bs)]
+        for cache in caches:
+            for req_idx, target_len in enumerate(target_lens):
+                blocks_per_req[req_idx] = max(
+                    blocks_per_req[req_idx],
+                    _direct_warmup_num_blocks_for_cache(
+                        cache, manager_name, target_len
+                    ),
+                )
+
+        total_blocks = sum(blocks_per_req)
+        if total_blocks > capacity:
+            raise RuntimeError(
+                "direct warmup needs "
+                f"{total_blocks} blocks for cache manager {manager_name}, "
+                f"but only {capacity} are allocated; "
+                f"blocks_per_req={blocks_per_req}, target_lens={target_lens}"
+            )
+
+        next_block = 0
+        for req_idx, num_blocks in enumerate(blocks_per_req):
+            if num_blocks > 0:
+                new_cache_ids_list[req_idx][manager_name] = list(
+                    range(next_block, next_block + num_blocks)
+                )
+            next_block += num_blocks
+
+    return new_cache_ids_list
 
 
 def _deepseek_v4_effective_seq_len_for_targets(
@@ -888,13 +1012,12 @@ def _warmup_backend_direct(
             dtype=Backend.executor.get_payload_dtype(),
         )
     all_tasks = PackedTasksBase(local_max_bs, task_ids=req_ids)
-    new_cache_ids = {}
-    for _name, _cache in Backend.cache_dict.items():
-        manager_name = getattr(_cache, "manager_name", None)
-        num_blocks = getattr(_cache, "num_blocks", None)
-        if manager_name is not None and num_blocks is not None:
-            new_cache_ids[manager_name] = [random.randrange(num_blocks)]
-    all_tasks.new_cache_ids_list = [new_cache_ids for _ in range(local_max_bs)]
+    all_tasks.new_cache_ids_list = _build_direct_warmup_new_cache_ids_list(
+        local_max_bs,
+        decode_steps,
+        bs_descend,
+        bool(skip_model_decode),
+    )
     all_tasks.tokens = [[1] for _ in range(local_max_bs)]
 
     # Prefill
@@ -1620,7 +1743,9 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
 
     # Send statistics socket
     stats_socket = context.socket(zmq.PUSH)
-    stats_address = f"tcp://{dp_config.router.host}:{dp_config.router.stats_port}"  # Router stats port
+    stats_address = (
+        f"tcp://{args.serve.host}:{dp_config.router.stats_port}"  # Router stats port
+    )
     stats_socket.connect(stats_address)
     logger.warning(
         f"[Enhanced Scheduler {instance_id}] connected to stats service: {stats_address}"
@@ -1628,7 +1753,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
 
     # Start DP Token Manager
     try:
-        router_token_address = f"tcp://{dp_config.router.host}:{dp_config.router.token_port}"  # Token Router listen address
+        router_token_address = f"tcp://{args.serve.host}:{dp_config.router.token_port}"  # Token Router listen address
 
         logger.warning(
             f"[Enhanced Scheduler {instance_id}] Starting DP Token Manager, group ID={instance_id}"

@@ -51,30 +51,27 @@ class RefAttnBackend(AttnBackend):
         return output.contiguous()
 
     @override
-    def csa_hca_prefill(
+    def csa_hca_prefill_ragged_qkvo(
         self,
         q: torch.Tensor,
-        slidingwindow_kv: torch.Tensor,
+        kv: torch.Tensor,
         attn_sink: torch.Tensor,
-        slidingwindow_topk_idxs: torch.Tensor,
+        topk_idxs: torch.Tensor,
         softmax_scale: float,
         *,
-        compressed_kv: Optional[torch.Tensor] = None,
-        compressed_topk_idxs: Optional[torch.Tensor] = None,
-        split_offset: Optional[int] = None,
         compress_ratio: Optional[int] = None,
     ) -> torch.Tensor:
-        return self._csa_hca_ref_attention(
-            q,
-            slidingwindow_kv,
+        q_batched = q.unsqueeze(0) if q.dim() == 3 else q
+        kv_flat = kv.squeeze(1) if kv.dim() == 3 and kv.size(1) == 1 else kv
+        kv_batched = kv_flat.unsqueeze(0) if kv_flat.dim() == 2 else kv_flat
+        topk_batched = topk_idxs.unsqueeze(0) if topk_idxs.dim() == 2 else topk_idxs
+        return self._csa_hca_dense_topk_attention(
+            q_batched,
+            kv_batched,
             attn_sink,
-            slidingwindow_topk_idxs,
+            topk_batched,
             softmax_scale,
-            compressed_kv=compressed_kv,
-            compressed_topk_idxs=compressed_topk_idxs,
-            split_offset=split_offset,
-            compress_ratio=compress_ratio,
-        )
+        ).squeeze(0)
 
     def _csa_hca_ref_attention(
         self,
@@ -124,6 +121,7 @@ class RefAttnBackend(AttnBackend):
         slidingwindow_topk_idxs: torch.Tensor,
         softmax_scale: float,
         *,
+        current_kv: Optional[torch.Tensor] = None,
         compressed_cache: Optional[KVCacheAccessor] = None,
         compressed_topk_idxs: Optional[torch.Tensor] = None,
         split_offset: Optional[int] = None,
@@ -141,6 +139,15 @@ class RefAttnBackend(AttnBackend):
             window_size = slidingwindow_cache.kv["sliding_window"].size(1)
         if split_offset is None:
             split_offset = window_size
+
+        self._write_dsv4_decode_current_kv(
+            slidingwindow_cache,
+            current_kv,
+            start_positions=start_positions,
+            cache_slots=cache_slots,
+            cache_seq_ids=cache_seq_ids,
+            window_size=window_size,
+        )
 
         slidingwindow_lens = torch.minimum(
             start_positions + 1,

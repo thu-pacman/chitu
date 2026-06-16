@@ -48,8 +48,6 @@ def _pd_router_config(
     set_default_global_args()
     return RouterConfig(
         is_router=True,
-        host="127.0.0.1",
-        port=29500,
         stats_port=29600,
         token_port=29700,
         max_inflight_per_instance=24,

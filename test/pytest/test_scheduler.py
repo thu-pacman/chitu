@@ -1783,3 +1783,198 @@ def test_check_decode_capacity_requires_all_cache_managers():
     from chitu.scheduler import KVCacheCapacityStatus
 
     assert scheduler._check_decode_capacity(task) is KVCacheCapacityStatus.CONGESTED
+
+
+def _make_partial_prefill_task(
+    scheduler: Scheduler,
+    *,
+    request_id: str,
+    prompt_len: int,
+    consumed: int,
+) -> Task:
+    """构造正在prefill的任务: 已consumed了部分prompt(consumed_req_tokens=consumed)、持有KV块、
+    状态为AvailableForSchedule的Prefill任务。
+    """
+    req = UserRequest.create_mock(
+        input_len=prompt_len,
+        request_id=request_id,
+    )
+    task = Task(request_id, req)
+    TaskPool.add(task)
+    task.dp_rank = 0
+    # Drive a single prefill chunk to allocate KV blocks for `consumed` tokens.
+    task.set_prefill_chunk_size_for_one_step(consumed)
+    scheduler._prepare_prefill_metadata(task, cached_len=0)
+    task.consume_req_tokens()  # consumed_req_tokens = consumed, prefill_chunk_size=None
+    assert task.task_type == TaskType.Prefill
+    assert task.consumed_req_tokens == consumed
+    return task
+
+
+def test_schedule_prefill_tasks_eviction_breaks_deadlock():
+    """模拟死锁场景：
+    cache_manager容量=2*block，chunk=1*block，两个长为2-block的prompt各完成1个block长度处于
+    在途返回状态，互相占块导致谁都长不到 prompt 末尾。
+    期望:
+    调度器逐出低优先级在途任务，高优先级任务在本轮就被调度出去，且阈值未被折半（让位式逐出不施加
+    拥塞控制，避免临时拥塞变永久死锁）。
+    """
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 4096,
+                    "cache_type": "paged",
+                    "op_impl": "torch",
+                    "schedule_overlap": True,
+                    "mtp_size": 1,
+                }
+            }
+        ),
+        need_ensure=False,
+    )
+    TaskPool.reset()
+
+    NUM_BLOCKS = 2
+    BLOCK_SIZE = 1024
+    Backend.executor = MockExecutor()
+    Backend.tokenizer = MockTokenizer()
+    Backend.cache_managers = [
+        {
+            "main": PagedKVCacheManager(
+                num_blocks=NUM_BLOCKS,
+                num_hot_req=4,
+                max_seq_len=4096,
+                dp_rank=0,
+                block_size=BLOCK_SIZE,
+                enable_prefix_caching=False,
+            )
+        }
+    ]
+    main = Backend.cache_managers[0]["main"]
+
+    scheduler = Scheduler(
+        max_running_tasks=4,
+        prefill_num_tasks=4,
+        decode_num_tasks=4,
+        scheduler_type="prefill_first,fcfs",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=1,
+        prefill_chunk_size=BLOCK_SIZE,
+    )
+    initial_threshold = scheduler.kvcache_block_threshold
+
+    # task1 arrives first, task2 after, both are 2-block prompts.
+    # Both have already prefilled 1 block.
+    task1 = _make_partial_prefill_task(
+        scheduler, request_id="req_high", prompt_len=2 * BLOCK_SIZE, consumed=BLOCK_SIZE
+    )
+    task2 = _make_partial_prefill_task(
+        scheduler, request_id="req_low", prompt_len=2 * BLOCK_SIZE, consumed=BLOCK_SIZE
+    )
+    # Both tasks now hold 1 KV block each; manager is full.
+    assert len(main.task_to_cache_ids[task1.task_id]) == 1
+    assert len(main.task_to_cache_ids[task2.task_id]) == 1
+    assert main.num_active_blocks == NUM_BLOCKS
+
+    scheduler.prepare_for_schedule()
+    sched_ids = scheduler.schedule()
+
+    # The high-priority task should be scheduled this very round (no empty schedule).
+    assert sched_ids == [task1.task_id]
+    # The low-priority in-flight task was evicted: rolled back to fresh prefill state,
+    # its KV block freed.
+    assert task2.task_id in TaskPool.pool  # not removed, just evicted
+    assert task2.task_type == TaskType.Prefill
+    assert task2.consumed_req_tokens == 0
+    assert task2.task_id not in main.task_to_cache_ids
+    # kvcache_block_threshold must not be halved — otherwise the freed capacity would be re-blocked and the task we
+    # tried to unblock would still be congested next round.
+    assert scheduler.kvcache_block_threshold == initial_threshold
+
+    TaskPool.reset()
+
+
+def test_prefill_capacity_reserves_for_inflight_prefill():
+    """准入预留：当存在持有块的在途prefill任务时，新prefill任务的容量检查需为它们
+    完成所需的容量预留，否则会被准入并触发互相占块的死锁。
+    """
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 4096,
+                    "cache_type": "paged",
+                    "op_impl": "torch",
+                    "schedule_overlap": True,
+                    "mtp_size": 1,
+                }
+            }
+        ),
+        need_ensure=False,
+    )
+    TaskPool.reset()
+
+    NUM_BLOCKS = 2
+    BLOCK_SIZE = 1024
+    Backend.executor = MockExecutor()
+    Backend.tokenizer = MockTokenizer()
+    Backend.cache_managers = [
+        {
+            "main": PagedKVCacheManager(
+                num_blocks=NUM_BLOCKS,
+                num_hot_req=4,
+                max_seq_len=4096,
+                dp_rank=0,
+                block_size=BLOCK_SIZE,
+                enable_prefix_caching=False,
+            )
+        }
+    ]
+    main = Backend.cache_managers[0]["main"]
+
+    scheduler = Scheduler(
+        max_running_tasks=4,
+        prefill_num_tasks=4,
+        decode_num_tasks=4,
+        scheduler_type="prefill_first,fcfs",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=1,
+        prefill_chunk_size=BLOCK_SIZE,
+    )
+
+    # An in-flight prefill holding 1 block, still needing 1 more block to finish.
+    inflight = _make_partial_prefill_task(
+        scheduler,
+        request_id="req_inflight",
+        prompt_len=2 * BLOCK_SIZE,
+        consumed=BLOCK_SIZE,
+    )
+
+    # A new prefill candidate; manager has 1 free block, which would naively look
+    # like enough room for 1 chunk — but reserving for the in-flight task should make
+    # the new task be marked CONGESTED.
+    new_task = Task("req_new", UserRequest.create_mock(2 * BLOCK_SIZE, "req_new"))
+    new_task.set_prefill_chunk_size_for_one_step(BLOCK_SIZE)
+
+    from chitu.scheduler import KVCacheCapacityStatus
+
+    # is_new_task为True时，表示新prefill任务，需要考虑为正在prefill的任务预留容量，防止进入自锁状态
+    assert (
+        scheduler._check_prefill_capacity(new_task, cached_len=0, is_new_task=True)
+        is KVCacheCapacityStatus.CONGESTED
+    )
+
+    # is_new_task为False时，表示非新prefill任务，容量足够（不扣除为正在prefill任务预留的容量）
+    assert (
+        scheduler._check_prefill_capacity(new_task, cached_len=0, is_new_task=False)
+        is KVCacheCapacityStatus.OK
+    )
+    assert (
+        scheduler._check_prefill_capacity(
+            inflight, cached_len=BLOCK_SIZE, is_new_task=False
+        )
+        is KVCacheCapacityStatus.OK
+    )
+
+    TaskPool.reset()

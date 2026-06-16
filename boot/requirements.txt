@@ -1,3 +1,4 @@
 hydra-core
 pyzmq>=27.0.0
 netifaces
+requests
