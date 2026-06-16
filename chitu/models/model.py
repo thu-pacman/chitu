@@ -1422,6 +1422,8 @@ class Transformer(nn.Module):
                 self.embed_tokens_cum_num_tokens,
             )
         if self.ep_size > 1:
+            if self.moe_impl is not None:
+                self.moe_impl.prepare(TaskType.Prefill, int(self.dummy_input.shape[0]))
             for it, layer in enumerate(self.layers):
                 if self.local_begin_layer_id + it < self.moe_impl.n_dense_layers:
                     continue
