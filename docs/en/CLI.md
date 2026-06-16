@@ -1,0 +1,726 @@
+# Chitu CLI Arguments
+
+This document is automatically generated from `chitu/config/serve_config.yaml` by `script/generate_cli_docs.py`. Do not edit it by hand.
+
+## `defaults`
+
+`defaults` are other config files or scripts included into this config file. See
+https://hydra.cc/docs/tutorials/basic/your_first_app/defaults/ for details.
+
+### Argument `defaults.models`
+
+Include model configs into this file. Please set it to the model you want to run.
+
+Acceptable values: One of the model names listed in `docs/en/SUPPORTED_MODELS.md`,
+which is essentially one of the file names without suffix in `chitu/config/models`.
+
+E.g., `Qwen2-7B-Instruct` means including `chitu/config/models/Qwen2-7B-Instruct.yaml`
+into this file.
+
+IMPORTANT: You always need to set this field.
+
+*Default: `???`.*
+
+## `boot`
+
+Configs for how chitu get to run on multiple servers or multiple GPUs
+
+### Argument `boot.n_nodes`
+
+Number of nodes (servers) to use
+
+*Default: `1`.*
+
+### Argument `boot.ssh_node_list`
+
+List of nodes (servers) to use. Please fill with hostnames or IPs.
+
+This field is only for, and must only be set for `boot.remote_launcher=ssh`.
+If set, the length of this list must equal to `n_nodes`.
+
+E.g., ["node1", "node2"]
+
+*Default: `null`.*
+
+### Argument `boot.n_gpus_per_node`
+
+Number of GPUs per node to use
+
+*Default: `1`.*
+
+### Argument `boot.target`
+
+Target chitu program or script
+
+Acceptable values:
+- A list of arguments.
+- A space-separated string for arguments.
+
+*Default: `["-m", "chitu"]`.*
+
+### Argument `boot.relay_args`
+
+Relay Hydra arguments from chitu-boot to inner chitu service
+
+Acceptable values:
+- True: Usually you choose this, to make chitu-boot and chitu service consistent.
+- False: Choose this if you want to explicitly pass arguments to inner chitu service in
+  `boot.target`, or if you want to boot non-chitu programs.
+
+*Default: `True`.*
+
+### Argument `boot.remote_launcher`
+
+How to run on multiple nodes
+
+Acceptable values:
+- local: Only run on the current node.
+- srun: Use `srun` from Slurm.
+- ssh: Directly use SSH to connect to remote nodes.
+
+*Default: `"local"`.*
+
+### Argument `boot.interactive_node_0`
+
+Make the first node interactive, but output from the other nodes will NOT be printed
+onto the terminal.
+
+Acceptable values:
+- "auto": Decide automatically.
+- True: Make the first node interactive, but output from the other nodes will NOT be
+  printed onto the terminal.
+- False: Do not make the first node interactive, but output from all nodes will be
+  printed onto the terminal.
+
+*Default: `"auto"`.*
+
+### Argument `boot.ascend_only_mount_visible_dev`
+
+Only mount devices selected by `ASCEND_RT_VISIBLE_DEVICES` to the container
+
+Acceptable values:
+- True: Only mount devices selected by `ASCEND_RT_VISIBLE_DEVICES`.
+- False: Mount all devices detected as `/dev/davinci<npu_id>`.
+
+*Default: `False`.*
+
+### Argument `boot.extra_srun_args`
+
+Additional arguments passed to `srun`
+
+Acceptable values:
+- A list of arguments.
+- A space-separated string for arguments.
+
+*Default: `[]`.*
+
+### Argument `boot.extra_apptainer_args`
+
+Additional arguments passed to `apptainer run`
+
+Acceptable values:
+- A list of arguments.
+- A space-separated string for arguments.
+
+*Default: `[]`.*
+
+### Argument `boot.extra_docker_args`
+
+Additional arguments passed to `docker run`
+
+Acceptable values:
+- A list of arguments.
+- A space-separated string for arguments.
+
+*Default: `[]`.*
+
+### Argument `boot.extra_torchrun_args`
+
+Additional arguments passed to `torchrun`
+
+Acceptable values:
+- A list of arguments.
+- A space-separated string for arguments.
+
+*Default: `[]`.*
+
+### Argument `boot.torchrun_wrapper`
+
+Optional arguments to appear before `torchrun`
+
+Acceptable values:
+- A list of arguments.
+- A space-separated string for arguments.
+
+*Default: `[]`.*
+
+## `models`
+
+Configs for the model to inference.
+
+### Argument `models.ckpt_dir`
+
+Path to the model checkpoint directory.
+
+Acceptable values: /path/to/your/checkpoint
+
+Note to developers: We use `null` instead of `???` here because we have better error messages
+for value missing in `chitu_main.py`, while missing values to a `???` field will always triggers
+Hydra's default error message.
+
+IMPORTANT: You always need to set this field.
+
+*Default: `null`.*
+
+### Argument `models.tokenizer_path`
+
+Path to the tokenizer.
+
+If null, the tokenizer will be loaded from `ckpt_dir`.
+
+Acceptable values: null, /path/to/your/tokenizer
+
+*Default: `null`.*
+
+## `serve`
+
+Configs for how chitu responses to HTTP requests.
+
+### Argument `serve.host`
+
+HTTP service IP. Set this according to your network.
+
+*Default: `0.0.0.0`.*
+
+### Argument `serve.port`
+
+HTTP service port. Set this according to your network.
+
+*Default: `21002`.*
+
+### Argument `serve.api_keys`
+
+If the request has a api_key field found in this dict, the request will be prioritized
+according to the `priority` field. The higher the value of the field, the higher the
+priority. Ordinary request has a priority of 1.
+
+## `infer`
+
+Configs for how chitu do the LLM inference computation.
+
+### Argument `infer.max_batch_size`
+
+Maximum number of concurrent inference tasks (the actual batch size limit).
+The actual batch size may be smaller due to memory limit, or insufficient
+requests. If the number of concurrent requests exceeds this value, some
+of the requests will wait.
+
+This value is the global (total) value across DP ranks.
+
+If not set, defaults to max_reqs for backward compatibility.
+
+IMPORTANT: Typically, you need to set this field.
+
+*Default: `8`.*
+
+### Argument `infer.max_concurrent_requests`
+
+Maximum concurrent requests (running + queued). When exceeded, new inference
+requests are rejected with HTTP 503. If not set, defaults to max_batch_size * 2.
+
+*Default: `null`.*
+
+### Argument `infer.max_seq_len`
+
+Hard sequence length limit of a single request, WITHOUT considering memory limit. This
+is the maximum number of input and output tokens in total.
+
+IMPORTANT: Typically, you need to set this field.
+
+*Default: `10240`.*
+
+### Argument `infer.cache_type`
+
+Data structure for KV cache. Set it to "page" for paged KV cache
+
+Acceptable values:
+- "skew": For better performance when the memory is sufficient. This is a legacy name for
+  dense KV cache.
+- "paged": To better handling requests with different lengths.
+
+IMPORTANT: Typically, you need to set this field.
+
+*Default: `skew`.*
+
+### Argument `infer.tp_size`
+
+Number of Tensor Parallel ranks for non-MoE models or non-MoE modules in MoE models.
+See `docs/en/DEVELOPMENT.md#parallelism` for details.
+
+*Default: `1`.*
+
+### Argument `infer.pp_size`
+
+Number of Pipeline Parallel ranks for non-MoE models or non-MoE modules in MoE models.
+See `docs/en/DEVELOPMENT.md#parallelism` for details.
+
+*Default: `1`.*
+
+### Argument `infer.dp_size`
+
+Number of Data Parallel ranks for non-MoE models or non-MoE modules in MoE models.
+See `docs/en/DEVELOPMENT.md#parallelism` for details.
+
+*Default: `1`.*
+
+### Argument `infer.ep_size`
+
+Number of Expert Parallel ranks for MoE modules in MoE models. See
+`docs/en/DEVELOPMENT.md#parallelism` for details.
+
+*Default: `1`.*
+
+### Argument `infer.etp_size`
+
+Number of Expert Parallel ranks for MoE modules in MoE models. See
+`docs/en/DEVELOPMENT.md#parallelism` for details.
+
+*Default: `null`.*
+
+### Argument `infer.embed_tokens_lm_head_tp_size`
+
+Number of Tensor Parallel ranks for embed_tokens and lm_head.
+
+*Default: `auto`.*
+
+### Argument `infer.seed`
+
+Random seed
+
+*Default: `0`.*
+
+### Argument `infer.attn_type`
+
+Attention backend.
+
+Acceptable values:
+- "auto": Automatically choose a good backend.
+- "flash_attn": Use flash_attn. This requires installing chitu with `chitu[flash_attn]`
+  for extra dependency.
+- "flash_mla": Use flash_mla. This requires installing chitu with `chitu[flash_mla]`
+  for extra dependency.
+- "flash_infer": Use flashinfer. This requires installing chitu with `chitu[flashinfer]`
+  for extra dependency.
+- "triton": Use chitu's built-in triton backend. This requires running on a platform
+  supporting Triton.
+- "npu": Use operators dedicated for Ascend NPUs.
+- "hopper_mixed": Special hybrid backend for running sparse attention on Hopper GPUs.
+- "ref": Use chitu's built-in reference backend. This is backend has full support for
+  different types of attention, but it is very slow and consumes much memory.
+
+*Default: `auto`.*
+
+### Argument `infer.indexer_type`
+
+Indexer impl type, only valid for models with DSA (DeepSeek Sparse Attention).
+
+Accetable values:
+- "auto": Automatically choose.
+- "deepgemm": use deep_gemm mqa logits and fused paged indexer-kv layout (requires deep_gemm).
+- "triton": use triton impl when computing index_score and separate (paged/skew) indexer-kv layout.
+- "hygon": use bf16 indexer dtype in hygon platform
+
+*Default: `auto`.*
+
+### Argument `infer.op_impl`
+
+Currently this option is only for enabling/disabling muxi_custom_kernel.
+
+Acceptable values:
+- "torch": Ordinary implementation.
+- "muxi_custom_kernel": Use additional kernels for running on MetaX GPUs, optimized for
+  small batches. This requires installing chitu with `chitu[muxi_custom_kernel]` for
+  extra dependency.
+
+*Default: `torch`.*
+
+### Argument `infer.mla_absorb`
+
+Absorption mode for MLA. This field is ignored when the model does not contain MLA.
+
+Acceptable values:
+- "auto": Decide automatically.
+- "none": No absorption. This is an optimization for lower FLOP counts, which matches the
+  typical need for prefilling.
+- "absorb-without-precomp": exchange some matrices in the order of multiplication. This is
+  an optimization for smaller memory footprint and lower memory occupancy for KV cache,
+  which matches the typical need for decoding.
+- "absorb": exchange some matrices in the order of multiplication, and precompute all the
+  multiplications that can be computed before inference. This is an optimization for fewer
+  operator counts, which may be useful for low-latency + low-concurrency cases.
+
+*Default: `"auto"`.*
+
+### Argument `infer.raise_lower_bit_float_to`
+
+The hardware-supported data type used for software implementation for lower-bit data types
+that are not supported by the hardware. For example, when you want to run a float8_e4m3fn
+typed model with GPUs only supporting bfloat16 instructions, set this field to bfloat16.
+
+*Default: `float8_e4m3fn`.*
+
+### Argument `infer.fuse_shared_experts`
+
+Whether to fuse shared experts and routed experts into the same operators. This field is
+ignored for non-MoE models, or for MoE models with no shared experts.
+
+Acceptable values: True, False
+
+*Default: `False`.*
+
+### Argument `infer.device_ids`
+
+If not null, override device IDs assgiend to each rank.
+
+Acceptable values:
+- null: Each rank is assigned with the local-rank-id-th device.
+- a list of integers: E.g, [2, 1, 3] means device 2, 1, 3 are assigned to ranks 0, 1, 2,
+  respectively.
+
+*Default: `null`.*
+
+### Argument `infer.pp_layer_partition`
+
+If not null, override the automatic layer partitioning for Pipeline Parallelism.
+
+Acceptable values: null or a list of integers, e.g., [10, 12, 12, 10].
+
+*Default: `null`.*
+
+### Argument `infer.use_cuda_graph`
+
+Whether to use CUDA graph or equivalent technologies on non-CUDA platforms.
+
+Acceptable values:
+- "auto": Decide automatically.
+- True: Use CUDA graph.
+- False: Do not use CUDA graph.
+
+*Default: `auto`.*
+
+### Argument `infer.memory_utilization`
+
+Device memory utilization rate for automatic page allocation for paged KV cache.
+
+Chitu will try to allocate as many pages as possible, satisfying that
+`kv_cache_mem + weight_mem + estimated_activation_mem <= memory_utilization * total_gpu_mem`,
+where `estimated_activation_mem` is estimated during engine warmup. Since the
+esitimation may not be accurate enough, `memory_utilization` may be needed to be
+tuned.
+
+Acceptable values: 0.0 to 1.0, e.g., 0.98 means 98% of GPU memory will be used.
+
+*Default: `0.98`.*
+
+### Argument `infer.num_blocks`
+
+If not -1, override the automatic page allocation for paged KV cache, and disables the
+`memory_utilization` field.
+
+Acceptable values: -1 or a positive integer.
+
+*Default: `-1`.*
+
+### Argument `infer.prefill_chunk_size`
+
+Prefill chunk size. A higher value will increase prefilling throughput, but also increase
+memory usage for intermediate tensors.
+
+Acceptable values:
+- "auto": Decide automatically.
+- null: Disable prefill chunking.
+- a positive integer: The global (total) prefill chunk size across DP ranks.
+
+*Default: `auto`.*
+
+### Argument `infer.mtp_size`
+
+Number of total tokens generated by the main model and then MTP layers in a single step,
+which means 1 token is generated by the main model and (mtp_size - 1) tokens are generated
+by MTP layers. Setting to 1 means disabling MTP. This field is ignored when the model does
+not support MTP.
+
+This value needs to be tuned. If it is too low, the MTP layers are under-utilized. If it is
+too high, there may be too much tokens that cannot pass the validation and then be dropped.
+
+Acceptable values: A positive integer.
+
+*Default: `1`.*
+
+### Argument `infer.language_model_only`
+
+This parameter is only used for Qwen3.5 model family. If this parameter is true,
+you can skip loading the vision encoder and only start the language model.
+
+*Default: `False`.*
+
+### Argument `infer.schedule_overlap`
+
+Whether to overlap scheduling with tensor computation. We recommand to keep this feature
+on whenever supported.
+
+Acceptable values:
+- "auto": Decide automatically.
+- True: Enable overlapping.
+- False: Disable overlapping.
+
+*Default: `auto`.*
+
+### Argument `infer.full_warmup`
+
+If True, try to fully warmup each operator before launching the service. It will take more
+time before the service is ready, but useful for reduce the performance loss for the first
+several requests.
+
+Acceptable values:
+- "auto": Decide automatically.
+- True: Fully warmup.
+- False: Skip full warmup.
+
+*Default: `auto`.*
+
+### Argument `infer.bind_process_to_cpu`
+
+Whether and how to bind the currenct process to a CPU. If binding, it requires installing
+chitu with `chitu[numa]` for extra dependency.
+
+Acceptable values:
+- "auto": Decide automatically.
+- "none": Do not bind.
+- "one_numa_per_rank": Bind each rank to a different NUMA node. This is helpful for CPU
+  inference, where each rank is responsible for computing on a dedicated NUMA.
+- "numa_near_device": Bind each rank to a NUMA node that is closest to the device this
+  rank is responsible for. This is helpful for reducing CPU-GPU synchronizing latency.
+
+*Default: `auto`.*
+
+### Argument `infer.bind_thread_to_cpu`
+
+How to bind threads to CPU cores for CPU inference. This field is ignored when CPUs are not
+used for computing.
+
+Acceptable values:
+- "physical_core": Bind each thread to a physical core.
+- "logical_core": Bind each thread to a logical core.
+
+*Default: `physical_core`.*
+
+### Argument `infer.enable_prefix_caching`
+
+Whether to enable prefix caching
+- True: enable
+- False: not enable
+-default: False
+
+*Default: `False`.*
+
+### Argument `infer.dp_prefix_caching_hit_rate_weight`
+
+The weight of the prefix cache hit rate during router routing tasks.
+
+*Default: `0.01`.*
+
+### Argument `infer.dp_prefix_caching_running_penalty_weight`
+
+Penalty weight for running task count of each DP rank when selecting preferred DP rank.
+Higher value means stronger load balancing pressure.
+
+*Default: `0.1`.*
+
+## `scheduler`
+
+Configs for how chitu schedules multiple requests.
+
+### Argument `scheduler.type`
+
+Priority strategy. This field accepts an ordered comma separated list of stratigies. Requests
+are first sorted by the leading strategy, and then by the next, and so on.
+
+Acceptable values: An ordered comma separated list of scheduler types among:
+- "fcfs": First come, first serve.
+- "request_preset": Use priorities bound to API keys, set by `serve.api_keys`.
+- "prefill_first": Priorities prefill first, then decode.
+- "stride": Each task has a priority value P, and a score S (starts from 0), at scheduling point,
+  update the scores: S += P * elapsed_time. Select the tasks with top scores and reset their
+  scores back to 0.
+- "deadline": Each task has a deadline time `DDL = request_arrival_time + prefix_tokens_len * alpha +
+  max_output_tokens * beta`. Select the tasks with nearest DDL. Alpha and beta are arbitary value,
+  defaults to 1ms.
+- "prefix_align": Batch tasks with similar input lengths togather.
+
+*Default: `"request_preset,prefill_first"`.*
+
+### `scheduler.pp_config`
+
+Configs how to schedule for micro batches use for Pipeline Parallelism. Ignore when `pp_size == 1`.
+
+#### Argument `scheduler.pp_config.pp_micro_batch_size_prefill`
+
+Micro batching strategy for prefilling. This field has effect only when `pp_size > 1` and `cache_type`
+is `paged`.
+
+Acceptable values:
+- "max": The maximum value of `prefill micro batch size` is limited to `max_reqs_per_dp / pp_size`.
+- An integer: The maximum value of `prefill micro batch size` is limited to the value.
+- "auto": Currently this means "max".
+
+*Default: `auto`.*
+
+#### Argument `scheduler.pp_config.pp_micro_batch_size_decode`
+
+Micro batching strategy for decoding. This field has effect only when `pp_size > 1` and `cache_type`
+is `paged`.
+
+Acceptable values:
+- "max": The maximum value of `decode micro batch size` is limited to `max_reqs_per_dp / pp_size`.
+- An integer: The maximum value of `decode micro batch size` is limited to the number.
+- "auto": Currently this means "max".
+
+*Default: `auto`.*
+
+## `metrics`
+
+Configs how chitu is monitored and logged.
+
+### Argument `metrics.prometheus_listening_host`
+
+Access prometheus server at this address
+
+*Default: `0.0.0.0`.*
+
+### Argument `metrics.prometheus_listening_port`
+
+Access prometheus server at this port
+
+*Default: `9090`.*
+
+### Argument `metrics.prometheus_scrape_interval`
+
+Prometheus server scrapes PrometheusMetricsCollectors every ${prometheus_scrape_interval} seconds.
+
+*Default: `1`.*
+
+### Argument `metrics.log_interval`
+
+Print metrics every this seconds to terminal
+
+*Default: `10`.*
+
+### Argument `metrics.grafana_enabled`
+
+Set to true to auto-start a Grafana server on rank 0
+
+*Default: `false`.*
+
+### Argument `metrics.grafana_host`
+
+Grafana server bind address
+
+*Default: `0.0.0.0`.*
+
+### Argument `metrics.grafana_port`
+
+Grafana HTTP port
+
+*Default: `9095`.*
+
+## `debug`
+
+Debugging options. These options have negative effect on performance and correctness, so please
+don't set them in production.
+
+### Argument `debug.skip_model_load`
+
+Skip model loading and run on uninitialized weights. You will NOT get correct output with this
+enabled. This is useful for quick debugging.
+
+Acceptable values:
+- False: Normal behavior.
+- True: Skip model loading.
+
+*Default: `False`.*
+
+### Argument `debug.force_moe_balance`
+
+Force MoE gate to chose some balanced experts. You will NOT get correct output with this enabled.
+This is useful for analyze the performance inpact of MoE load inbalance, by comparing performance
+with this option on and off.
+
+Acceptable values:
+- False: Normal behavior.
+- True: Force balance.
+
+*Default: `False`.*
+
+### Argument `debug.save_trace_dir`
+
+Save trace to a directory. The trace can be replayed with `benchmarks/benchmark_serving.py` with
+additional `--dataset chitu-trace --dataset-path <path/to/trace>` arguments.
+
+Acceptable values:
+- null: No trace will be saved.
+- /path/to/directory: Save trace to this directory.
+
+*Default: `null`.*
+
+### Argument `debug.disable_inter_op_auto_tune`
+
+If true, skip heavy inter-op auto-tuning. The service will start quickly but the performance
+may be worse.
+
+Acceptable values:
+- False: Normal behavior.
+- True: Skip inter-op auto-tuning.
+
+*Default: `False`.*
+
+## Argument `float_16bit_variant`
+
+The data type for 16-bit floating point data type. This field is orthogonal to quantization.
+
+Acceptable values:
+- "bfloat16": Wider range, less precision. There may be accuracy loss for small (<= ~7B) models.
+- "float16": Narrower range, higher precision. But some models will result in NaN.
+
+*Default: `bfloat16`.*
+
+## Argument `use_float32_rotary`
+
+Data type for RoPE (rotary positional encoding). Setting to float32 may be helpful if the
+context length is very long.
+
+Acceptable values:
+- True: Use float32 for RoPE.
+- False: Use the same dtype as `float_16bit_variant`.
+
+*Default: `False`.*
+
+## Argument `keep_dtype_in_checkpoint`
+
+What to do if the data type mismatches between the model definition (the code) and the checkpoint
+(the model file on disk). Whatever is this field, you will receive a warning when the data type
+mismatches.
+
+Acceptable values:
+- True: Use the data type in the checkpoint.
+- False: Use the data type in the model definition.
+
+*Default: `False`.*
+
+## Argument `skip_preprocess`
+
+When using `script/preprocess_and_save.py` to preprocess a model's state dict, the preprocessed
+file can be loaded via setting this field to True. This is useful if the running node has constrained
+file system size. See `docs/en/DEVELOPMENT.md` for details.
+
+*Default: `False`.*
