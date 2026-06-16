@@ -115,6 +115,7 @@ def srun(cfg, raw_argv, local_run_callback):
         master_addr = hostnames.splitlines()[0] if hostnames.splitlines() else ""
         master_port = (slurm_job_id % 10000) + 52000
         rdvz_port = (slurm_job_id % 10000) + 53000
+        is_master_node = socket.gethostname() == master_addr
     else:
         # NOTE: If running on single node, let torchrun pick a random port. It's still
         # sufficiently unique across jobs on this node. See
@@ -122,6 +123,9 @@ def srun(cfg, raw_argv, local_run_callback):
         master_addr = "127.0.0.1"
         master_port = 0
         rdvz_port = 0
+        is_master_node = True
     rdvz_id = "chitu"
 
-    local_run_callback(cfg, raw_argv, master_addr, master_port, rdvz_port, rdvz_id)
+    local_run_callback(
+        cfg, raw_argv, master_addr, master_port, rdvz_port, rdvz_id, is_master_node
+    )

@@ -11,6 +11,7 @@ import logging
 import os
 import time
 import traceback
+from dataclasses import dataclass, asdict
 from logging import getLogger
 from typing import Optional, Annotated
 from contextlib import suppress
@@ -55,7 +56,12 @@ app = FastAPI()  # Unified API
 app.add_middleware(RejectOverloadMiddleware)
 
 
-server_status = False
+@dataclass
+class ServerStatus:
+    initialized: bool
+
+
+server_status = ServerStatus(initialized=False)
 
 
 def get_server_status():
@@ -63,9 +69,9 @@ def get_server_status():
     return server_status
 
 
-def set_server_status(new_status: bool):
-    global server_status
-    server_status = new_status
+def set_server_status(*, initialized: Optional[bool] = None):
+    if initialized is not None:
+        server_status.initialized = initialized
 
 
 class TokenizeRequest(BaseModel):
@@ -197,7 +203,7 @@ async def init_chitu_service():
     from chitu.chitu_main import chitu_init
 
     chitu_init(args)
-    set_server_status(True)
+    set_server_status(initialized=True)
     return {"message": "Service initial done."}
 
 
@@ -224,7 +230,7 @@ async def terminate_engine(request: TerminateRequest):
     logger.info(
         "[terminate_engine] Termination requested, draining in-flight requests..."
     )
-    set_server_status(False)
+    set_server_status(initialized=False)
 
     # Set Terminating (not Terminated) so the worker thread finishes
     # in-flight requests before broadcasting TerminateBackend.
@@ -239,9 +245,15 @@ async def terminate_engine(request: TerminateRequest):
     return {"message": "Terminate signal sent. Engine and server are shutting down."}
 
 
-@app.post("/status")
+@app.post("/status", deprecated=True)
 async def get_chitu_status():
-    return {"message": f"{get_server_status()}"}
+    logger.warning("/status endpoint is deprecated. Please use /server_status instead.")
+    return {"message": f"{get_server_status().initialized}"}
+
+
+@app.get("/server_status")
+async def get_server_status_endpoint():
+    return asdict(get_server_status())
 
 
 @app.post("/load_status")
@@ -260,11 +272,6 @@ async def get_chitu_load_status():
 @app.post("/ping")
 async def get_chitu_ping():
     return {"message": "Connection succeeded"}
-
-
-@app.post("/health")
-async def health():
-    pass  # TODO Check the inference service
 
 
 def _is_pd_router_process() -> bool:
@@ -751,8 +758,7 @@ async def start_router_components_and_serve():
         await start_dp_components()
         logger.info("[ROUTER] DP components startup completed")
 
-        # Critical fix: set service status to available
-        set_server_status(True)
+        set_server_status(initialized=True)
         logger.info(
             "[ROUTER] Service status set to available, can accept inference requests"
         )

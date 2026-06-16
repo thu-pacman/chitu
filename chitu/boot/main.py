@@ -68,6 +68,7 @@ def main(cfg: DictConfig):
             master_port=0,
             rdvz_port=0,
             rdvz_id="chitu",
+            is_master_node=True,
         )
     elif cfg.boot.remote_launcher == "srun":
         srun(cfg, raw_argv, local_run_callback)

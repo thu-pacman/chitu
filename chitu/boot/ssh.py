@@ -157,6 +157,8 @@ def ssh(cfg, raw_argv, local_run_callback):
     logger.debug(f"Running on node {socket.gethostname()}")
 
     master_addr = os.environ.get("CHITU_BOOT_MASTER_ADDR", node_list[0])
+    node_rank = int(os.environ.get("CHITU_BOOT_NODE_RANK", "0"))
+    is_master_node = node_rank == 0
 
     if n_nodes > 1:
         # Currently we use fixed ports for the rendezvous across all nodes (FIXME).
@@ -171,4 +173,6 @@ def ssh(cfg, raw_argv, local_run_callback):
         rdvz_port = 0
     rdvz_id = "chitu"
 
-    local_run_callback(cfg, raw_argv, master_addr, master_port, rdvz_port, rdvz_id)
+    local_run_callback(
+        cfg, raw_argv, master_addr, master_port, rdvz_port, rdvz_id, is_master_node
+    )
