@@ -29,6 +29,7 @@ from chitu.models.model import (
     get_linear_layout_contig_y,
 )
 from chitu.models.registry import ModelType, register_model
+from chitu.import_utils import try_import_platform_dep
 from chitu.ops import (
     add_shared_experts,
     apply_rotary_pos_emb_partial,
@@ -36,9 +37,49 @@ from chitu.ops import (
     silu_and_mul,
     moe_gate,
     moe_hash_gate,
-    append_to_sliding_window_paged_kv_cache,
+)
+from chitu.attn_backend.flash_mla_backend import (
+    _append_deepseek_v4_flashmla_paged_cache as _append_flashmla_v4_paged_cache,
+    _is_deepseek_v4_flashmla_packed_cache as _is_flashmla_packed_v4_cache,
+    _read_deepseek_v4_flashmla_paged_cache as _read_flashmla_v4_paged_cache,
 )
 from chitu.ops.hadamard import hadamard_transform
+
+from chitu.ops.deepseek_compressor import (
+    build_compress_metadata,
+    gather_pending_and_new as _gather_pending_and_new_torch,
+    compress_hca as _compress_hca_torch,
+    compress_csa as _compress_csa_torch,
+    writeback_pending as _writeback_pending_torch,
+)
+
+_, _has_triton = try_import_platform_dep("triton")
+
+if _has_triton:
+    from chitu.ops.triton_ops.deepseek_compressor import (
+        gather_pending_and_new as _gather_pending_and_new_triton,
+        compress_hca as _compress_hca_triton,
+        compress_csa as _compress_csa_triton,
+        writeback_pending as _writeback_pending_triton,
+        pack_prefill_kv as _pack_prefill_kv_triton,
+    )
+
+    _TRITON_COMPRESS_AVAILABLE = True
+else:
+    _pack_prefill_kv_triton = None
+    _TRITON_COMPRESS_AVAILABLE = False
+
+if _TRITON_COMPRESS_AVAILABLE:
+    _gather_pending_and_new_backend = _gather_pending_and_new_triton
+    _compress_hca_backend = _compress_hca_triton
+    _compress_csa_backend = _compress_csa_triton
+    _writeback_pending_backend = _writeback_pending_triton
+else:
+    _gather_pending_and_new_backend = _gather_pending_and_new_torch
+    _compress_hca_backend = _compress_hca_torch
+    _compress_csa_backend = _compress_csa_torch
+    _writeback_pending_backend = _writeback_pending_torch
+
 from chitu.ops.mhc import mhc_pre, mhc_post
 from chitu.ops.quant import (
     blockfp8_weight_dequant,
@@ -57,7 +98,6 @@ from chitu.distributed.parallel_state import get_tp_group, get_tp_size, get_etp_
 from chitu.distributed.partition import compute_expert_dist_in_ep
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 
-FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 FE8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
 
 
@@ -216,7 +256,7 @@ def _flatten_rope_input_v4(x: torch.Tensor) -> tuple[torch.Tensor, int, int]:
     raise ValueError(f"DeepSeek-V4 RoPE expects a 3D or 4D tensor, got {x.ndim}D")
 
 
-def _batched_freqs_cis_v4(
+def _prepare_freqs_cis_v4(
     freqs_cis: torch.Tensor,
     *,
     device: torch.device,
@@ -257,7 +297,7 @@ def apply_rotary_emb_v4(
     if rope_dim is None:
         rope_dim = q_for_rotary.shape[-1]
 
-    batched_freqs_cis = _batched_freqs_cis_v4(
+    prepared_freqs_cis = _prepare_freqs_cis_v4(
         freqs_cis,
         device=q.device,
         bsz=q_bsz,
@@ -267,7 +307,7 @@ def apply_rotary_emb_v4(
     if k is None:
         q_out, _, _, _ = apply_rotary_pos_emb_single_partial(
             q_for_rotary,
-            batched_freqs_cis,
+            prepared_freqs_cis,
             rotary_begin=q_for_rotary.shape[-1] - rope_dim,
             rotary_type="interleaved",
             inplace=True,
@@ -280,7 +320,7 @@ def apply_rotary_emb_v4(
     q_out, k_out, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
         q_for_rotary,
         k_for_rotary,
-        batched_freqs_cis,
+        prepared_freqs_cis,
         q_rotary_begin=q_for_rotary.shape[-1] - rope_dim,
         k_rotary_begin=k_for_rotary.shape[-1] - rope_dim,
         rotary_type="interleaved",
@@ -288,27 +328,6 @@ def apply_rotary_emb_v4(
         impl="auto",
     )
     return q_out.reshape_as(q), k_out.reshape_as(k)
-
-
-def get_window_topk_idxs_v4(window_size: int, seqlen: int, start_pos: int, device):
-    history_len = min(start_pos, window_size)
-    width = min(window_size, history_len + seqlen)
-    base = history_len + torch.arange(seqlen, device=device)
-    matrix = (base - window_size + 1).clamp(0).unsqueeze(1) + torch.arange(
-        width, device=device
-    )
-    matrix = torch.where(matrix > base.unsqueeze(1), -1, matrix)
-    return matrix.unsqueeze(0)
-
-
-def get_compress_topk_idxs_v4(ratio: int, seqlen: int, start_pos: int, device):
-    lengths = (start_pos + torch.arange(1, seqlen + 1, device=device)) // ratio
-    max_len = int(lengths.max().item()) if lengths.numel() else 0
-    if max_len == 0:
-        return torch.empty((1, seqlen, 0), device=device, dtype=torch.long)
-    matrix = torch.arange(max_len, device=device).repeat(seqlen, 1)
-    matrix = torch.where(matrix >= lengths.unsqueeze(1), -1, matrix)
-    return matrix.unsqueeze(0)
 
 
 def get_decode_window_topk_idxs_v4(
@@ -344,98 +363,67 @@ def get_decode_compress_topk_idxs_v4(
     return matrix.unsqueeze(1)
 
 
-_DEEPSEEK_V4_FLASHMLA_TOKEN_BYTES = 584
+def get_chunked_prefill_topk_idxs_v4(
+    window_size: int,
+    seqlen: int,
+    start_pos: int,
+    device,
+    ratio: int = 0,
+    compress_offset: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build left-packed topk indices and per-token valid counts for prefill.
 
+    attn_kv layout: [sliding_kv(h + seqlen) | compressed_kv(c)]
+    Returns:
+        indices:     [seqlen, max_topk]  int32, left-packed, -1 for padding
+        topk_length: [seqlen]            int32, number of valid entries per row
+    """
+    h = min(start_pos, window_size)
+    rows = torch.arange(seqlen, device=device)
+    base = rows + h  # attn_kv index of current token j
 
-def _is_flashmla_packed_v4_cache(kv_cache: torch.Tensor) -> bool:
-    return (
-        kv_cache.dtype == torch.uint8
-        and kv_cache.ndim >= 3
-        and kv_cache.shape[-1] == _DEEPSEEK_V4_FLASHMLA_TOKEN_BYTES
-    )
+    # --- window part ---
+    window_start = (base - window_size + 1).clamp(min=0)  # [seqlen]
+    win_count = (base - window_start + 1).clamp(max=window_size)  # [seqlen]
+    window_cols = window_start.unsqueeze(1) + torch.arange(
+        window_size, device=device
+    )  # [seqlen, win]
+    win_idxs = torch.where(window_cols > base.unsqueeze(1), -1, window_cols)
 
+    if ratio == 0:
+        topk_length = win_count.int()
+        return win_idxs.int(), topk_length
 
-def _append_flashmla_v4_paged_cache(
-    kv_cache: torch.Tensor,
-    block_table: Optional[torch.Tensor],
-    values: torch.Tensor,
-    positions: torch.Tensor,
-    seq_ids: torch.Tensor,
-    *,
-    window_size: Optional[int] = None,
-) -> bool:
-    if not _is_flashmla_packed_v4_cache(kv_cache):
-        return False
-    if block_table is None:
-        raise RuntimeError("DeepSeek-V4 FlashMLA packed cache requires paged KV cache")
-    from chitu.ops.triton_ops import (
-        append_to_paged_kv_cache_flashmla_dsv4,
-    )
+    # --- compress part ---
+    # query j (abs pos start_pos+j) sees compressed tokens with idx < (start_pos+j)//ratio
+    abs_pos = start_pos + rows  # [seqlen]
+    comp_count = (abs_pos // ratio).clamp(min=0)  # [seqlen]
+    max_c = int(comp_count.max().item()) if comp_count.numel() else 0
+    if max_c == 0:
+        topk_length = win_count.int()
+        return win_idxs.int(), topk_length
 
-    append_to_paged_kv_cache_flashmla_dsv4(
-        kv_cache,
-        block_table,
-        values,
-        positions,
-        seq_ids,
-        window_size=window_size,
-    )
-    return True
+    comp_cols = torch.arange(max_c, device=device)  # [max_c]
+    comp_idxs = torch.where(
+        comp_cols.unsqueeze(0) < comp_count.unsqueeze(1),
+        comp_cols + compress_offset,
+        torch.full((seqlen, max_c), -1, device=device, dtype=torch.long),
+    )  # [seqlen, max_c]
 
+    # left-pack: window valid | compress valid | -1 padding
+    max_topk = window_size + max_c
+    indices = torch.full((seqlen, max_topk), -1, device=device, dtype=torch.long)
+    # window entries are already left-packed (valid from col 0 up to win_count[j]-1)
+    indices[:, :window_size] = win_idxs
+    # shift compress entries left by (window_size - win_count) to close the gap
+    for j in range(seqlen):
+        wc = int(win_count[j].item())
+        cc = int(comp_count[j].item())
+        if cc > 0:
+            indices[j, wc : wc + cc] = comp_idxs[j, :cc]
 
-def _read_flashmla_v4_paged_cache(
-    kv_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    seq_ids: torch.Tensor,
-    positions: torch.Tensor,
-) -> torch.Tensor:
-    if FP8_DTYPE is None:
-        raise RuntimeError("DeepSeek-V4 FlashMLA packed cache requires FP8 support")
-    if kv_cache.dim() == 4:
-        assert kv_cache.shape[-2] == 1
-        kv_cache = kv_cache.squeeze(-2)
-    positions = positions.to(device=kv_cache.device, dtype=torch.long)
-    seq_ids = seq_ids.to(device=kv_cache.device, dtype=torch.long)
-    if positions.ndim == 1:
-        positions = positions.unsqueeze(0).expand(seq_ids.numel(), -1)
-    if seq_ids.ndim == 1:
-        seq_ids = seq_ids.unsqueeze(1).expand_as(positions)
-
-    out_shape = positions.shape
-    positions_flat = positions.reshape(-1)
-    seq_ids_flat = seq_ids.reshape(-1)
-    if positions_flat.numel() == 0:
-        return torch.empty(
-            *out_shape, 512, dtype=torch.bfloat16, device=kv_cache.device
-        )
-
-    page_size = kv_cache.shape[1]
-    block_ids = block_table[seq_ids_flat, positions_flat // page_size].to(torch.long)
-    pos_in_block = positions_flat % page_size
-    flat = kv_cache.reshape(-1)
-    block_base = block_ids * kv_cache.stride(0)
-    token_base = block_base + pos_in_block * 576
-    scale_base = block_base + page_size * 576 + pos_in_block * 8
-
-    nope_offsets = token_base.unsqueeze(1) + torch.arange(
-        448, device=kv_cache.device, dtype=torch.long
-    )
-    nope = flat[nope_offsets].contiguous().view(FP8_DTYPE).to(torch.float32)
-
-    scale_offsets = scale_base.unsqueeze(1) + torch.arange(
-        7, device=kv_cache.device, dtype=torch.long
-    )
-    exponents = flat[scale_offsets].to(torch.float32) - 127.0
-    scales = torch.exp2(exponents).unsqueeze(-1)
-    nope = (nope.view(-1, 7, 64) * scales).reshape(-1, 448).to(torch.bfloat16)
-
-    rope_offsets = (
-        token_base.unsqueeze(1)
-        + 448
-        + torch.arange(128, device=kv_cache.device, dtype=torch.long)
-    )
-    rope = flat[rope_offsets].contiguous().view(torch.bfloat16).reshape(-1, 64)
-    return torch.cat([nope, rope], dim=-1).reshape(*out_shape, 512)
+    topk_length = (win_count + comp_count).int()
+    return indices.int(), topk_length
 
 
 class CompressorDeepSeekV4(nn.Module):
@@ -499,59 +487,7 @@ class CompressorDeepSeekV4(nn.Module):
         self.kv_block_table = block_table
         self.kv_cache_is_paged = block_table is not None
 
-    def _write_kv_cache(
-        self,
-        cache_slice: slice,
-        positions: torch.Tensor,
-        values: torch.Tensor,
-        *,
-        cache_seq_id: int,
-    ):
-        assert self.kv_cache is not None
-        if _is_flashmla_packed_v4_cache(self.kv_cache):
-            if not self.kv_cache_is_paged:
-                raise RuntimeError(
-                    "DeepSeek-V4 FlashMLA packed cache requires paged KV cache"
-                )
-            assert self.kv_block_table is not None
-            positions = positions.to(device=values.device, dtype=torch.long)
-            if positions.ndim == 1:
-                positions = positions.unsqueeze(0).expand(values.size(0), -1)
-            seq_ids = torch.arange(
-                cache_seq_id,
-                cache_seq_id + values.size(0),
-                device=values.device,
-                dtype=torch.long,
-            )
-            _append_flashmla_v4_paged_cache(
-                self.kv_cache,
-                self.kv_block_table,
-                values,
-                positions,
-                seq_ids,
-            )
-            return
-        if not self.kv_cache_is_paged:
-            self.kv_cache[cache_slice, positions] = values
-            return
-
-        assert self.kv_block_table is not None
-        positions = positions.to(device=values.device, dtype=torch.long)
-        if positions.ndim == 1:
-            positions = positions.unsqueeze(0).expand(values.size(0), -1)
-        seq_ids = torch.arange(
-            cache_seq_id,
-            cache_seq_id + values.size(0),
-            device=values.device,
-            dtype=torch.long,
-        ).unsqueeze(1)
-        page_size = self.kv_cache.shape[1]
-        page_ids = self.kv_block_table[
-            seq_ids.expand_as(positions), positions // page_size
-        ]
-        self.kv_cache[page_ids, positions % page_size] = values
-
-    def _write_kv_cache_batch(
+    def _write_kv_cache_flat(
         self,
         cache_slots: torch.Tensor,
         positions: torch.Tensor,
@@ -585,141 +521,194 @@ class CompressorDeepSeekV4(nn.Module):
         page_ids = self.kv_block_table[cache_seq_ids, positions // page_size]
         self.kv_cache[page_ids, positions % page_size] = values
 
-    def overlap_transform(self, tensor: torch.Tensor, value=0):
-        bsz, seqlen, _, _ = tensor.size()
-        ratio, head_dim = self.compress_ratio, self.head_dim
-        new_tensor = tensor.new_full((bsz, seqlen, 2 * ratio, head_dim), value)
-        new_tensor[:, :, ratio:] = tensor[:, :, :, head_dim:]
-        new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :head_dim]
-        return new_tensor
-
-    def _prefill_forward_batch(
+    def _forward_prefill(
         self,
-        xs: list[torch.Tensor],
-        start_poses: list[int],
-        cache_slots: list[int],
-        cache_seq_ids: list[int],
-    ) -> list[Optional[torch.Tensor]]:
-        """Batched prefill compressor: one wkv/wgate Linear for all requests,
-        then per-request compress with ragged pending_len support."""
-        n = len(xs)
-        ratio, overlap = self.compress_ratio, self.overlap
-        head_dim, rope_dim = self.head_dim, self.rope_head_dim
-        offset = ratio if overlap else 0
-        device = xs[0].device
-        dtype = xs[0].dtype
+        x: torch.Tensor,
+        seqlens: torch.Tensor,
+        start_positions: torch.Tensor,
+        cache_slots: torch.Tensor,
+        cache_seq_ids: torch.Tensor,
+    ) -> None:
+        """Prefill compressor with shared ragged flow for torch/Triton backends."""
+        seqlens = seqlens.to(device=x.device, dtype=torch.long)
+        start_positions = start_positions.to(device=x.device, dtype=torch.long)
+        cache_slots = cache_slots.to(device=x.device, dtype=torch.long)
+        cache_seq_ids = cache_seq_ids.to(device=x.device, dtype=torch.long)
+        n = int(seqlens.numel())
 
-        seqlens = [x.size(0) for x in xs]
+        total_tokens = int(seqlens.sum().item()) if n else 0
+        assert x.size(0) == total_tokens
 
-        # Single batched Linear over all tokens from all requests.
-        x_cat = torch.cat(xs, dim=0).float()  # [total_tokens, dim]
-        kv_cat = self.wkv(x_cat)  # [total_tokens, coff*head_dim]
-        score_cat = self.wgate(x_cat)  # [total_tokens, coff*head_dim]
+        # Single Linear over all tokens from all requests.
+        x_float = x.float()  # [total_tokens, dim]
+        kv_cat = self.wkv(x_float)  # [total_tokens, coff*head_dim]
+        score_cat = self.wgate(x_float)  # [total_tokens, coff*head_dim]
 
-        kv_list = kv_cat.split(seqlens, dim=0)
-        score_list = score_cat.split(seqlens, dim=0)
+        return self._forward_prefill_backend(
+            x,
+            seqlens,
+            start_positions,
+            cache_slots,
+            cache_seq_ids,
+            kv_cat,
+            score_cat,
+        )
 
-        # Per-request compress (ragged pending_len, ragged n_groups).
-        compressed_kvs: list[Optional[torch.Tensor]] = []
-        write_slots: list[torch.Tensor] = []
-        write_positions: list[torch.Tensor] = []
-        write_values: list[torch.Tensor] = []
-        write_seq_ids: list[int] = []
+    def _forward_prefill_backend(
+        self,
+        x: torch.Tensor,
+        seqlens: torch.Tensor,
+        start_positions: torch.Tensor,
+        cache_slots: torch.Tensor,
+        cache_seq_ids: torch.Tensor,
+        kv_cat: torch.Tensor,  # [total_new_tokens, coff*head_dim]  already computed
+        score_cat: torch.Tensor,
+    ) -> None:
+        """Backend-compressed path for both HCA (overlap=False) and CSA."""
+        seqlens = seqlens.to(device=x.device, dtype=torch.long)
+        start_positions = start_positions.to(device=x.device, dtype=torch.long)
+        cache_slots = cache_slots.to(device=x.device, dtype=torch.long)
+        cache_seq_ids = cache_seq_ids.to(device=x.device, dtype=torch.long)
+        n = int(seqlens.numel())
+        ratio = self.compress_ratio
+        overlap = self.overlap
+        head_dim = self.head_dim
+        dtype = x.dtype
+        rope_dim = self.rope_head_dim
+        device = x.device
+        # pending_offset: for CSA kv_state[slot, :ratio] is prev-group ref,
+        # pending tokens live at [ratio:ratio+pending_len]
+        pending_offset = ratio if overlap else 0
 
-        for i in range(n):
-            slot = cache_slots[i]
-            start_pos = start_poses[i]
-            cache_seq_id = cache_seq_ids[i]
-            seqlen = seqlens[i]
-            kv = kv_list[i]  # [seqlen, coff*head_dim]
-            score = score_list[i]
+        seqlens_list = [int(v) for v in seqlens.tolist()]
+        start_positions_list = [int(v) for v in start_positions.tolist()]
+        meta = build_compress_metadata(
+            start_positions_list, seqlens_list, ratio, device
+        )
+        total_eff = meta["total_eff"]
+        total_groups = meta["total_groups"]
+        D = kv_cat.shape[1]  # coff * head_dim
 
-            pending_len = start_pos % ratio
+        cache_slots_t = cache_slots.to(device=device, dtype=torch.int32)
 
-            if pending_len > 0:
-                pending_kv = self.kv_state[slot, offset : offset + pending_len]
-                pending_score = (
-                    self.score_state[slot, offset : offset + pending_len]
-                    - self.ape[:pending_len]
+        # ---- backend op 1: gather pending + new tokens into flat buffer ----
+        flat_kv = torch.empty(total_eff, D, device=device, dtype=torch.float32)
+        flat_score = torch.empty(total_eff, D, device=device, dtype=torch.float32)
+        _gather_pending_and_new_backend(
+            self.kv_state,
+            self.score_state,
+            kv_cat,
+            score_cat,
+            self.ape,
+            flat_kv,
+            flat_score,
+            meta["cu_eff"],
+            meta["cu_new"],
+            meta["pending_lens"],
+            cache_slots_t,
+            ratio,
+            pending_offset=pending_offset,
+        )
+
+        # ---- backend op 2: compress ----
+        # HCA: out_kv is [total_groups, D=head_dim]
+        # CSA: out_kv is [total_groups, head_dim] (only first head output)
+        out_kv = torch.empty(total_groups, head_dim, device=device, dtype=torch.float32)
+        if not overlap:
+            _compress_hca_backend(
+                flat_kv,
+                flat_score,
+                self.ape,
+                out_kv,
+                meta["cu_eff"],
+                meta["cu_groups"],
+                meta["group_to_req"],
+                ratio,
+            )
+        else:
+            # CSA compress also updates kv_state/score_state[:ratio] in-place
+            # with the last complete group's first head for the next chunk.
+            # The backend op owns that state update; the outer flow stays shared.
+            # ape for CSA compress is the first-half ape: [ratio, head_dim]
+            ape_first_half = self.ape[:, :head_dim]  # [ratio, head_dim]
+            n_groups_list_t = torch.tensor(
+                meta["n_groups_list"], device=device, dtype=torch.int32
+            )
+            _compress_csa_backend(
+                flat_kv,
+                flat_score,
+                ape_first_half,
+                self.kv_state,
+                self.score_state,
+                out_kv,
+                meta["cu_eff"],
+                meta["cu_groups"],
+                meta["group_to_req"],
+                meta["pending_lens"],
+                cache_slots_t,
+                meta["cutoffs"],
+                n_groups_list_t,
+                ratio,
+                head_dim,
+            )
+
+        # ---- backend op 3: writeback remainder to kv_state ----
+        _writeback_pending_backend(
+            flat_kv,
+            flat_score,
+            self.kv_state,
+            self.score_state,
+            self.ape,
+            meta["cu_eff"],
+            meta["cutoffs"],
+            meta["remainders"],
+            cache_slots_t,
+            pending_offset=pending_offset,
+            ratio=ratio,
+        )
+
+        # ---- shared post-processing: norm + rope + hadamard ----
+        if total_groups == 0:
+            return
+
+        out_kv_typed = self.norm(out_kv.to(dtype), compute_dtype=out_kv.dtype)
+
+        pending_lens_cpu = [sp % ratio for sp in start_positions_list]
+        group_abs_positions = []
+        for i, ng in enumerate(meta["n_groups_list"]):
+            eff_start = start_positions_list[i] - pending_lens_cpu[i]
+            for g in range(ng):
+                group_abs_positions.append(eff_start + g * ratio)
+        freqs_cis_all = self.freqs_cis[group_abs_positions]
+        out_kv_b = out_kv_typed.unsqueeze(0)
+        apply_rotary_emb_v4(out_kv_b, freqs_cis_all, rope_dim=rope_dim)
+        out_kv_typed = out_kv_b.squeeze(0)
+
+        if self.rotate:
+            out_kv_typed = hadamard_transform(
+                out_kv_typed, scale=out_kv_typed.size(-1) ** -0.5
+            )
+
+        # ---- final cache write: shared for torch and Triton backends ----
+        positions = torch.empty(total_groups, device=device, dtype=torch.long)
+        offset = 0
+        for i, ng in enumerate(meta["n_groups_list"]):
+            if ng > 0:
+                start_pos_div_ratio_i = start_positions_list[i] // ratio
+                positions[offset : offset + ng] = torch.arange(
+                    start_pos_div_ratio_i,
+                    start_pos_div_ratio_i + ng,
+                    device=device,
+                    dtype=torch.long,
                 )
-                kv = torch.cat([pending_kv, kv], dim=0)
-                score = torch.cat([pending_score, score], dim=0)
-
-            effective_len = pending_len + seqlen
-            should_compress = effective_len >= ratio
-            remainder = effective_len % ratio
-            cutoff = effective_len - remainder
-
-            new_kv_state_main = None
-            new_score_state_main = None
-            if overlap and cutoff >= ratio:
-                new_kv_state_main = kv[cutoff - ratio : cutoff].clone()
-                new_score_state_main = score[cutoff - ratio : cutoff] + self.ape
-
-            if remainder > 0:
-                self.kv_state[slot, offset : offset + remainder] = kv[cutoff:]
-                self.score_state[slot, offset : offset + remainder] = (
-                    score[cutoff:] + self.ape[:remainder]
-                )
-                kv = kv[:cutoff]
-                score = score[:cutoff]
-
-            if not should_compress:
-                compressed_kvs.append(None)
-                continue
-
-            # [n_groups, ratio, coff*head_dim]
-            kv = kv.unflatten(0, (-1, ratio))
-            score = score.unflatten(0, (-1, ratio)) + self.ape
-
-            if overlap:
-                # overlap_transform expects [bsz, n_groups, ratio, head_dim]
-                kv = self.overlap_transform(kv.unsqueeze(0), 0).squeeze(0)
-                score = self.overlap_transform(
-                    score.unsqueeze(0), float("-inf")
-                ).squeeze(0)
-                if pending_len > 0:
-                    kv[0, :ratio] = self.kv_state[slot, :ratio, :head_dim]
-                    score[0, :ratio] = self.score_state[slot, :ratio, :head_dim]
-                if new_kv_state_main is not None:
-                    self.kv_state[slot, :ratio] = new_kv_state_main
-                    self.score_state[slot, :ratio] = new_score_state_main
-
-            kv = (kv * score.softmax(dim=1)).sum(dim=1)  # [n_groups, head_dim]
-
-            kv = self.norm(kv.to(dtype), compute_dtype=kv.dtype)  # [n_groups, head_dim]
-            effective_start = start_pos - pending_len
-            freqs_cis = self.freqs_cis[
-                effective_start : effective_start + cutoff : ratio
-            ]
-            kv_b = kv.unsqueeze(0)  # [1, n_groups, head_dim] for apply_rotary_emb_v4
-            apply_rotary_emb_v4(kv_b, freqs_cis, rope_dim=rope_dim)
-            kv = kv_b.squeeze(0)
-            if self.rotate:
-                kv = hadamard_transform(kv, scale=kv.size(-1) ** -0.5)
-
-            n_groups = kv.size(0)
-            positions = torch.arange(
-                start_pos // ratio, start_pos // ratio + n_groups, device=device
-            )
-            write_slots.append(
-                torch.full((n_groups,), slot, device=device, dtype=torch.long)
-            )
-            write_positions.append(positions)
-            write_values.append(kv)
-            write_seq_ids.extend([cache_seq_id] * n_groups)
-            compressed_kvs.append(kv.unsqueeze(0))  # [1, n_groups, head_dim]
-
-        # Batch-write all compressed tokens to the KV cache in one call.
-        if write_slots:
-            self._write_kv_cache_batch(
-                torch.cat(write_slots),
-                torch.cat(write_positions),
-                torch.cat(write_values),
-                torch.tensor(write_seq_ids, device=device, dtype=torch.long),
-            )
-
-        return compressed_kvs
+            offset += ng
+        group_to_req = meta["group_to_req"].to(torch.long)
+        self._write_kv_cache_flat(
+            cache_slots[group_to_req],
+            positions,
+            out_kv_typed,
+            cache_seq_ids[group_to_req],
+        )
 
     def _decode_forward(
         self,
@@ -789,7 +778,7 @@ class CompressorDeepSeekV4(nn.Module):
                 kv_compress, scale=kv_compress.size(-1) ** -0.5
             )
         write_kv_pos = start_positions[ci] // ratio  # [n]
-        self._write_kv_cache_batch(
+        self._write_kv_cache_flat(
             cs,
             write_kv_pos,
             kv_compress.squeeze(1),
@@ -812,15 +801,32 @@ class CompressorDeepSeekV4(nn.Module):
         assert self.kv_cache is not None
         assert self.freqs_cis is not None
         if is_prefill:
-            # start_pos, cache_slots, cache_seq_ids are list[int] in prefill mode.
             # x: [bsz, seqlen, dim]
-            bsz = x.size(0)
-            return self._prefill_forward_batch(
-                [x[i] for i in range(bsz)],
-                list(start_pos),
-                list(cache_slots),
-                list(cache_seq_ids),
+            bsz, seqlen, _ = x.size()
+            seqlens = torch.full((bsz,), seqlen, device=x.device, dtype=torch.long)
+            start_positions = torch.as_tensor(
+                start_pos, device=x.device, dtype=torch.long
             )
+            cache_slots = torch.as_tensor(
+                cache_slots, device=x.device, dtype=torch.long
+            )
+            cache_seq_ids = torch.as_tensor(
+                cache_seq_ids, device=x.device, dtype=torch.long
+            )
+            if start_positions.ndim == 0:
+                start_positions = start_positions.expand(bsz)
+            if cache_slots.ndim == 0:
+                cache_slots = cache_slots.expand(bsz)
+            if cache_seq_ids.ndim == 0:
+                cache_seq_ids = cache_seq_ids.expand(bsz)
+            self._forward_prefill(
+                x.reshape(bsz * seqlen, x.size(-1)),
+                seqlens,
+                start_positions,
+                cache_slots,
+                cache_seq_ids,
+            )
+            return None
         # decode: start_pos, cache_slots, cache_seq_ids are Tensors.
         return self._decode_forward(x, start_pos, cache_slots, cache_seq_ids)
 
@@ -909,7 +915,7 @@ class IndexerDeepSeekV4(nn.Module):
         page_ids = self.kv_block_table[seq_ids.unsqueeze(1), positions // page_size]
         return self.kv_cache[page_ids, positions % page_size]
 
-    def _read_kv_cache_batch(
+    def _read_kv_cache_ranges(
         self,
         cache_slots: torch.Tensor,
         lengths: torch.Tensor,
@@ -955,7 +961,7 @@ class IndexerDeepSeekV4(nn.Module):
         out[valid_mask] = self.kv_cache[page_ids, positions_flat % page_size]
         return out
 
-    def forward_decode_batch(
+    def forward_decode(
         self,
         x: torch.Tensor,
         qr: torch.Tensor,
@@ -1007,7 +1013,7 @@ class IndexerDeepSeekV4(nn.Module):
                     (active_idx.numel(),), chunk_start + chunk_size
                 ),
             )
-            index_kv = self._read_kv_cache_batch(
+            index_kv = self._read_kv_cache_ranges(
                 cache_slots[active_idx],
                 chunk_lengths,
                 cache_seq_ids[active_idx],
@@ -1293,138 +1299,6 @@ class AttentionDeepSeekV4(Attention):
             ][:, :indexer_pending_rows, :indexer_pending_width]
             self.indexer.compressor.freqs_cis = self.freqs_cis
 
-    def _write_sliding_cache(
-        self,
-        seq_ids: torch.Tensor,
-        positions: torch.Tensor,
-        values: torch.Tensor,
-    ):
-        if _append_flashmla_v4_paged_cache(
-            self.kv_cache,
-            self.kv_block_table,
-            values,
-            positions,
-            seq_ids,
-            window_size=self.window_size,
-        ):
-            return
-        if self.kv_cache_is_paged:
-            assert self.kv_block_table is not None
-            append_to_sliding_window_paged_kv_cache(
-                self.kv_cache,
-                self.kv_block_table,
-                values,
-                positions,
-                seq_ids,
-                self.window_size,
-            )
-        else:
-            self.kv_cache[seq_ids, positions % self.window_size] = values
-
-    def _read_paged_cache(
-        self,
-        kv_cache: torch.Tensor,
-        block_table: torch.Tensor,
-        seq_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
-        if _is_flashmla_packed_v4_cache(kv_cache):
-            return _read_flashmla_v4_paged_cache(
-                kv_cache,
-                block_table,
-                seq_ids,
-                positions,
-            )
-        positions = positions.to(device=kv_cache.device, dtype=torch.long)
-        seq_ids = seq_ids.to(device=kv_cache.device, dtype=torch.long)
-        if positions.ndim == 1:
-            positions = positions.unsqueeze(0).expand(seq_ids.numel(), -1)
-        if seq_ids.ndim == 1:
-            seq_ids = seq_ids.unsqueeze(1).expand_as(positions)
-        page_size = kv_cache.shape[1]
-        page_ids = block_table[seq_ids, positions // page_size]
-        return kv_cache[page_ids, positions % page_size]
-
-    def _materialize_sliding_cache(
-        self,
-        cache_slots: torch.Tensor,
-        cache_seq_ids: torch.Tensor,
-        last_positions: torch.Tensor,
-    ) -> torch.Tensor:
-        history_lens = torch.clamp(last_positions + 1, min=0, max=self.window_size)
-        max_history_len = int(history_lens.max().item()) if history_lens.numel() else 0
-        if max_history_len == 0:
-            return torch.empty(
-                cache_slots.numel(),
-                0,
-                self.head_dim,
-                dtype=torch.bfloat16,
-                device=self.kv_cache.device,
-            )
-
-        cols = torch.arange(
-            max_history_len, device=cache_seq_ids.device, dtype=torch.long
-        )
-        first_positions = last_positions + 1 - history_lens
-        logical_positions = first_positions.unsqueeze(1) + cols.unsqueeze(0)
-        valid_mask = cols.unsqueeze(0) < history_lens.unsqueeze(1)
-        ring_positions = logical_positions % self.window_size
-        safe_positions = torch.where(
-            valid_mask, ring_positions, torch.zeros_like(ring_positions)
-        )
-        if self.kv_cache_is_paged:
-            assert self.kv_block_table is not None
-            sliding = self._read_paged_cache(
-                self.kv_cache,
-                self.kv_block_table,
-                cache_seq_ids,
-                safe_positions,
-            )
-        else:
-            sliding = self.kv_cache[cache_slots.unsqueeze(1), safe_positions]
-        return torch.where(valid_mask.unsqueeze(-1), sliding, torch.zeros_like(sliding))
-
-    def _materialize_compressed_cache(
-        self,
-        cache_slots: torch.Tensor,
-        cache_seq_ids: torch.Tensor,
-        compressed_lens: torch.Tensor,
-    ) -> torch.Tensor:
-        assert self.compress_ratio
-        assert self.compressor.kv_cache is not None
-        max_compressed_len = (
-            int(compressed_lens.max().item()) if compressed_lens.numel() else 0
-        )
-        if max_compressed_len == 0:
-            return torch.empty(
-                cache_slots.numel(),
-                0,
-                self.head_dim,
-                dtype=torch.bfloat16,
-                device=self.compressor.kv_cache.device,
-            )
-        cols = torch.arange(
-            max_compressed_len, device=cache_seq_ids.device, dtype=torch.long
-        )
-        positions = cols.unsqueeze(0).expand(cache_seq_ids.numel(), -1)
-        valid_mask = cols.unsqueeze(0) < compressed_lens.unsqueeze(1)
-        safe_positions = torch.where(valid_mask, positions, torch.zeros_like(positions))
-        if self.compressor.kv_cache_is_paged:
-            assert self.compressor.kv_block_table is not None
-            compressed = self._read_paged_cache(
-                self.compressor.kv_cache,
-                self.compressor.kv_block_table,
-                cache_seq_ids,
-                safe_positions,
-            )
-        else:
-            compressed = self.compressor.kv_cache[
-                cache_slots.unsqueeze(1), safe_positions
-            ]
-        return torch.where(
-            valid_mask.unsqueeze(-1), compressed, torch.zeros_like(compressed)
-        )
-
     def _dequant_wo_a(self) -> torch.Tensor:
         if isinstance(self.wo_a, NormalLinear):
             return self.wo_a.weight
@@ -1463,8 +1337,9 @@ class AttentionDeepSeekV4(Attention):
         decode_start_positions = []
         decode_cache_slots = []
         prefill_indices = []
-        prefill_xs = []
-        prefill_start_poses = []
+        prefill_begins = []
+        prefill_seqlens = []
+        prefill_start_positions = []
         prefill_cache_slots = []
         prefill_cache_seq_ids = []
         prefix_lens = seq_len_delta.delta_prefix_lens_list
@@ -1483,23 +1358,69 @@ class AttentionDeepSeekV4(Attention):
                 decode_cache_slots.append(cache_slot)
                 continue
             prefill_indices.append(i)
-            prefill_xs.append(x[begin:end])
-            prefill_start_poses.append(start_pos)
+            prefill_begins.append(begin)
+            prefill_seqlens.append(end - begin)
+            prefill_start_positions.append(start_pos)
             prefill_cache_slots.append(cache_slot)
             prefill_cache_seq_ids.append(i)
         if prefill_indices:
-            prefill_outputs = self._forward_prefill_batch(
-                prefill_xs,
-                prefill_start_poses,
-                prefill_cache_slots,
-                prefill_cache_seq_ids,
+            prefill_device = x.device
+            prefill_seqlens_t = torch.tensor(
+                prefill_seqlens, device=prefill_device, dtype=torch.long
+            )
+            prefill_start_positions_t = torch.tensor(
+                prefill_start_positions, device=prefill_device, dtype=torch.long
+            )
+            prefill_cache_slots_t = torch.tensor(
+                prefill_cache_slots, device=prefill_device, dtype=torch.long
+            )
+            prefill_cache_seq_ids_t = torch.tensor(
+                prefill_cache_seq_ids, device=prefill_device, dtype=torch.long
+            )
+            total_prefill = sum(prefill_seqlens)
+            expected_begin = prefill_begins[0]
+            prefill_is_contiguous = True
+            for begin, seqlen in zip(prefill_begins, prefill_seqlens):
+                if begin != expected_begin:
+                    prefill_is_contiguous = False
+                    break
+                expected_begin += seqlen
+            if prefill_is_contiguous:
+                prefill_x = x[prefill_begins[0] : prefill_begins[0] + total_prefill]
+            else:
+                prefill_offsets = torch.empty(
+                    len(prefill_seqlens) + 1, device=prefill_device, dtype=torch.long
+                )
+                prefill_offsets[0] = 0
+                prefill_offsets[1:] = torch.cumsum(prefill_seqlens_t, dim=0)
+                prefill_req_ids = torch.repeat_interleave(
+                    torch.arange(
+                        len(prefill_seqlens), device=prefill_device, dtype=torch.long
+                    ),
+                    prefill_seqlens_t,
+                    output_size=total_prefill,
+                )
+                prefill_token_offsets = (
+                    torch.arange(total_prefill, device=prefill_device, dtype=torch.long)
+                    - prefill_offsets[prefill_req_ids]
+                )
+                prefill_begins_t = torch.tensor(
+                    prefill_begins, device=prefill_device, dtype=torch.long
+                )
+                prefill_x = x[prefill_begins_t[prefill_req_ids] + prefill_token_offsets]
+            prefill_outputs = self._forward_prefill(
+                prefill_x,
+                prefill_seqlens_t,
+                prefill_start_positions_t,
+                prefill_cache_slots_t,
+                prefill_cache_seq_ids_t,
                 wo_a,
             )
             for out_idx, batch_idx in enumerate(prefill_indices):
                 outputs[batch_idx] = prefill_outputs[out_idx]
         if decode_indices:
             decode_device = x.device
-            decode_output = self._forward_decode_batch(
+            decode_output = self._forward_decode(
                 x[torch.tensor(decode_begins, device=decode_device)],
                 torch.tensor(
                     decode_start_positions, device=decode_device, dtype=torch.long
@@ -1517,7 +1438,7 @@ class AttentionDeepSeekV4(Attention):
             return x.new_empty((0, self.dim))
         return torch.cat(ordered_outputs, dim=0)
 
-    def _forward_decode_batch(
+    def _forward_decode(
         self,
         x: torch.Tensor,
         start_positions: torch.Tensor,
@@ -1547,7 +1468,7 @@ class AttentionDeepSeekV4(Attention):
         compressed_topk_idxs = None
         if ratio:
             if self.indexer is not None:
-                compressed_topk_idxs = self.indexer.forward_decode_batch(
+                compressed_topk_idxs = self.indexer.forward_decode(
                     x,
                     qr,
                     start_positions,
@@ -1562,7 +1483,6 @@ class AttentionDeepSeekV4(Attention):
         if compressed_topk_idxs is not None:
             compressed_topk_idxs = compressed_topk_idxs.int()
 
-        self._write_sliding_cache(cache_seq_ids, start_positions, kv.squeeze(1))
         if ratio:
             self.compressor(
                 x, start_positions, cache_slots, cache_seq_ids=cache_seq_ids
@@ -1576,6 +1496,7 @@ class AttentionDeepSeekV4(Attention):
             self.attn_sink,
             slidingwindow_topk_idxs,
             self.softmax_scale,
+            current_kv=kv.squeeze(1),
             compressed_cache=self.compressed_cache_accessor if ratio else None,
             compressed_topk_idxs=compressed_topk_idxs,
             split_offset=win,
@@ -1591,150 +1512,228 @@ class AttentionDeepSeekV4(Attention):
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a.to(o.dtype))
         return self.wo_b(o.flatten(2)).squeeze(1)
 
-    def _forward_prefill_one(
+    def _forward_prefill(
         self,
         x: torch.Tensor,
-        start_pos: int,
-        cache_slot: int,
-        cache_seq_id: int,
+        seqlens: torch.Tensor,
+        start_positions: torch.Tensor,
+        cache_slots: torch.Tensor,
+        cache_seq_ids: torch.Tensor,
         wo_a: torch.Tensor,
-    ) -> torch.Tensor:
-        bsz, seqlen, _ = x.size()
-        assert bsz == 1
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+    ) -> list[torch.Tensor]:
+        """Prefill via one packed attn_backend.csa_hca call.
+
+        Handles both first-chunk (start_pos=0) and continuation chunks
+        (start_pos>0, seqlen>1).
+        """
         win, ratio, rope_dim = self.window_size, self.compress_ratio, self.rope_head_dim
+        device = x.device
+        seqlens = seqlens.to(device=device, dtype=torch.long)
+        start_positions = start_positions.to(device=device, dtype=torch.long)
+        cache_slots = cache_slots.to(device=device, dtype=torch.long)
+        cache_seq_ids = cache_seq_ids.to(device=device, dtype=torch.long)
 
         if ratio:
             assert self.compressor.kv_cache is not None
             self.compressor.freqs_cis = self.freqs_cis
-            if start_pos == 0:
-                self.compressor.kv_state[cache_slot].zero_()
-                self.compressor.score_state[cache_slot].fill_(float("-inf"))
-            if self.indexer is not None:
+            if getattr(self, "indexer", None) is not None:
                 assert self.indexer.kv_cache.numel() > 0
                 self.indexer.freqs_cis = self.freqs_cis
-                if start_pos == 0:
-                    self.indexer.compressor.kv_state[cache_slot].zero_()
-                    self.indexer.compressor.score_state[cache_slot].fill_(float("-inf"))
+
+        n = int(seqlens.numel())
+        total_q = int(seqlens.sum().item()) if n else 0
+        assert x.size(0) == total_q
+        seqlens_list = [int(v) for v in seqlens.tolist()]
+        start_positions_list = [int(v) for v in start_positions.tolist()]
+        cache_slots_list = [int(v) for v in cache_slots.tolist()]
+        cache_seq_ids_list = [int(v) for v in cache_seq_ids.tolist()]
+
+        def _left_pack_window_and_compress_topk(
+            window_topk: torch.Tensor,
+            window_lengths: torch.Tensor,
+            compress_topk: torch.Tensor,
+            split_offset: int,
+        ) -> torch.Tensor:
+            if compress_topk.numel() == 0 or compress_topk.size(-1) == 0:
+                return window_topk
+            shifted_compress_topk = torch.where(
+                compress_topk >= 0,
+                compress_topk + split_offset,
+                compress_topk,
+            )
+            combined = window_topk.new_full(
+                (
+                    window_topk.size(0),
+                    window_topk.size(-1) + shifted_compress_topk.size(-1),
+                ),
+                -1,
+            )
+            combined[:, : window_topk.size(-1)] = window_topk
+            for row in range(window_topk.size(0)):
+                window_len = int(window_lengths[row].item())
+                valid_compress = shifted_compress_topk[row][
+                    shifted_compress_topk[row] >= 0
+                ]
+                if valid_compress.numel() > 0:
+                    combined[row, window_len : window_len + valid_compress.numel()] = (
+                        valid_compress
+                    )
+            return combined
+
+        # Reset kv_state/score_state for first-chunk requests before compressor.
+        if ratio:
+            for i in range(n):
+                if start_positions_list[i] == 0:
+                    slot = cache_slots_list[i]
+                    self.compressor.kv_state[slot].zero_()
+                    self.compressor.score_state[slot].fill_(float("-inf"))
+                    if getattr(self, "indexer", None) is not None:
+                        self.indexer.compressor.kv_state[slot].zero_()
+                        self.indexer.compressor.score_state[slot].fill_(float("-inf"))
+
+        # Run all compressors in one call (single wkv/wgate Linear).
+        if ratio:
+            self.compressor._forward_prefill(
+                x, seqlens, start_positions, cache_slots, cache_seq_ids
+            )
+
+        req_range = torch.arange(n, device=device, dtype=torch.long)
+
+        def _exclusive_offsets(lengths: torch.Tensor) -> torch.Tensor:
+            offsets = torch.empty(lengths.numel() + 1, device=device, dtype=torch.long)
+            offsets[0] = 0
+            offsets[1:] = torch.cumsum(lengths, dim=0)
+            return offsets
+
+        current_offsets = _exclusive_offsets(seqlens)
+        current_req_ids = torch.repeat_interleave(
+            req_range, seqlens, output_size=total_q
+        )
+        current_token_offsets = (
+            torch.arange(total_q, device=device, dtype=torch.long)
+            - current_offsets[current_req_ids]
+        )
+        freq_positions = start_positions[current_req_ids] + current_token_offsets
+        freqs_cis = self.freqs_cis[freq_positions]
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
-
         kv = self.kv_norm(self.wkv(x))
-        apply_rotary_emb_v4(q, freqs_cis, rope_dim=rope_dim, k=kv)
-        if start_pos > 0:
-            cache_slot_t = torch.tensor([cache_slot], device=x.device, dtype=torch.long)
-            cache_seq_id_t = torch.tensor(
-                [cache_seq_id], device=x.device, dtype=torch.long
-            )
-            sliding_history = self._materialize_sliding_cache(
-                cache_slot_t,
-                cache_seq_id_t,
-                torch.tensor([start_pos - 1], device=x.device, dtype=torch.long),
-            )
-        else:
-            sliding_history = kv.new_empty(1, 0, self.head_dim)
-        sliding_kv = torch.cat([sliding_history, kv], dim=1)
-        slidingwindow_topk_idxs = get_window_topk_idxs_v4(
-            win, seqlen, start_pos, x.device
-        ).int()
+        q_for_rope = q.unsqueeze(0)
+        kv_for_rope = kv.unsqueeze(0)
+        apply_rotary_emb_v4(q_for_rope, freqs_cis, rope_dim=rope_dim, k=kv_for_rope)
+        q = q_for_rope.squeeze(0)
+        kv = kv_for_rope.squeeze(0)
 
-        compressed_topk_idxs = None
-        compressed_kv = None
-        if ratio:
-            cache_slot_t = torch.tensor([cache_slot], device=x.device, dtype=torch.long)
-            cache_seq_id_t = torch.tensor(
-                [cache_seq_id], device=x.device, dtype=torch.long
-            )
-            previous_compressed_len = start_pos // ratio
-            previous_compressed_kv = self._materialize_compressed_cache(
-                cache_slot_t,
-                cache_seq_id_t,
-                torch.tensor(
-                    [previous_compressed_len], device=x.device, dtype=torch.long
-                ),
-            )
-            if self.indexer is not None:
-                compressed_topk_idxs = self.indexer(
-                    x,
-                    qr,
+        history_lens = torch.minimum(
+            start_positions,
+            torch.full_like(start_positions, win),
+        )
+        sliding_lens = history_lens + seqlens
+
+        indexer = getattr(self, "indexer", None)
+        compress_topk_parts: list[Optional[torch.Tensor]] = [None] * n
+        if ratio and indexer is not None:
+            token_offset = 0
+            for i, (start_pos, seqlen, cache_slot, cache_seq_id) in enumerate(
+                zip(
+                    start_positions_list,
+                    seqlens_list,
+                    cache_slots_list,
+                    cache_seq_ids_list,
+                )
+            ):
+                token_slice = slice(token_offset, token_offset + seqlen)
+                compress_topk_parts[i] = indexer(
+                    x[token_slice].unsqueeze(0),
+                    qr[token_slice].unsqueeze(0),
                     start_pos,
                     cache_slot,
                     cache_seq_id=cache_seq_id,
                 )
-            else:
-                compressed_topk_idxs = get_compress_topk_idxs_v4(
-                    ratio, seqlen, start_pos, x.device
-                )
-            compressed_topk_idxs = compressed_topk_idxs.int()
-            compressed_results = self.compressor(
-                x,
-                [start_pos],
-                [cache_slot],
-                cache_seq_ids=[cache_seq_id],
-                is_prefill=True,
-            )
-            current_compressed_kv = (
-                compressed_results[0]
-                if compressed_results[0] is not None
-                else previous_compressed_kv.new_empty(1, 0, self.head_dim)
-            )
-            compressed_kv = torch.cat(
-                [previous_compressed_kv, current_compressed_kv], dim=1
-            )
+                token_offset += seqlen
 
-        o = self.attn_backend.csa_hca(
-            q,
-            sliding_kv,
-            self.attn_sink,
-            slidingwindow_topk_idxs,
-            self.softmax_scale,
-            compressed_kv=compressed_kv,
-            compressed_topk_idxs=compressed_topk_idxs,
-            split_offset=sliding_kv.size(1),
-            compress_ratio=ratio if ratio else None,
-        )
-        apply_rotary_emb_v4(o, freqs_cis, rope_dim=rope_dim, inverse=True)
-
-        write_start = max(start_pos, start_pos + seqlen - win)
-        write_offset = write_start - start_pos
-        if write_offset < seqlen:
-            sliding_positions = torch.arange(
-                write_start, start_pos + seqlen, device=x.device
+        if ratio:
+            compressed_visible_end = start_positions + seqlens
+            if indexer is None:
+                compressed_visible_end = compressed_visible_end - 1
+            compressed_lens = torch.div(
+                torch.clamp(compressed_visible_end, min=0),
+                ratio,
+                rounding_mode="floor",
             )
-            self._write_sliding_cache(
-                torch.tensor([cache_seq_id], device=x.device, dtype=torch.long),
-                sliding_positions.unsqueeze(0),
-                kv[:, write_offset:],
-            )
+        else:
+            compressed_lens = torch.zeros_like(seqlens)
 
-        o = o.view(bsz, seqlen, self.n_local_groups, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a.to(o.dtype))
-        return self.wo_b(o.flatten(2)).squeeze(0)
-
-    def _forward_prefill_batch(
-        self,
-        xs: list[torch.Tensor],
-        start_poses: list[int],
-        cache_slots: list[int],
-        cache_seq_ids: list[int],
-        wo_a: torch.Tensor,
-    ) -> list[torch.Tensor]:
-        results: list[torch.Tensor] = []
-        for x_i, start_pos, cache_slot, cache_seq_id in zip(
-            xs, start_poses, cache_slots, cache_seq_ids
+        topk_parts: list[torch.Tensor] = []
+        for i, (start_pos, seqlen) in enumerate(
+            zip(start_positions_list, seqlens_list)
         ):
-            results.append(
-                self._forward_prefill_one(
-                    x_i.unsqueeze(0),
-                    start_pos,
-                    cache_slot,
-                    cache_seq_id,
-                    wo_a,
+            slidingwindow_len = int(sliding_lens[i].item())
+            compressed_len_i = int(compressed_lens[i].item())
+            compress_topk_idxs_i = compress_topk_parts[i]
+
+            if indexer is not None and compress_topk_idxs_i is not None:
+                # indexer returns arbitrary top-k compress indices; left-pack manually
+                win_idxs_i, win_len_i = get_chunked_prefill_topk_idxs_v4(
+                    win, seqlen, start_pos, device
                 )
-            )
-        return results
+                comp_i = compress_topk_idxs_i.squeeze(0)  # [seqlen, n_comp]
+                local_topk_i = _left_pack_window_and_compress_topk(
+                    win_idxs_i,
+                    win_len_i,
+                    comp_i,
+                    slidingwindow_len,
+                )
+            else:
+                local_topk_i, _ = get_chunked_prefill_topk_idxs_v4(
+                    win,
+                    seqlen,
+                    start_pos,
+                    device,
+                    ratio=ratio if compressed_len_i > 0 else 0,
+                    compress_offset=slidingwindow_len if ratio else 0,
+                )
+
+            topk_parts.append(local_topk_i)
+
+        max_topk = max(t.size(-1) for t in topk_parts)
+        topk_idxs = topk_parts[0].new_full((total_q, max_topk), -1)
+        token_offset = 0
+        for seqlen, topk_i in zip(seqlens_list, topk_parts):
+            topk_idxs[token_offset : token_offset + seqlen, : topk_i.size(-1)] = topk_i
+            token_offset += seqlen
+
+        assert self.slidingwindow_cache_accessor is not None
+        if ratio:
+            assert self.compressed_cache_accessor is not None
+        outputs = self.attn_backend.csa_hca(
+            q,
+            self.slidingwindow_cache_accessor,
+            self.attn_sink,
+            topk_idxs,
+            self.softmax_scale,
+            current_kv=kv,
+            seqlens=seqlens,
+            start_positions=start_positions,
+            cache_slots=cache_slots,
+            cache_seq_ids=cache_seq_ids,
+            window_size=win,
+            compressed_cache=self.compressed_cache_accessor if ratio else None,
+            compressed_lens=compressed_lens,
+            pack_prefill_kv=_pack_prefill_kv_triton,
+            compress_ratio=ratio or None,
+        )
+
+        outputs_for_rope = outputs.unsqueeze(0)
+        apply_rotary_emb_v4(
+            outputs_for_rope, freqs_cis, rope_dim=rope_dim, inverse=True
+        )
+        outputs = outputs_for_rope.squeeze(0).view(total_q, self.n_local_groups, -1)
+        outputs = torch.einsum("sgd,grd->sgr", outputs, wo_a.to(outputs.dtype))
+        outputs = self.wo_b(outputs.flatten(1))
+        return list(outputs.split(seqlens_list, dim=0))
 
 
 class MLPDeepSeekV4(nn.Module):

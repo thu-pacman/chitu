@@ -18,6 +18,13 @@ from chitu.ops.triton_ops.kv_cache import (
     read_from_paged_kv_cache_triton,
     read_from_paged_indexer_kv_cache_deepgemm_triton,
 )
+from chitu.ops.triton_ops.deepseek_compressor import (
+    build_compress_metadata,
+    gather_pending_and_new,
+    compress_hca,
+    compress_csa,
+    writeback_pending,
+)
 from chitu.ops.triton_ops.norm import rms_norm_triton
 from chitu.ops.triton_ops.quant import (
     blockfp8_einsum_shc_hdc_shd_triton,
