@@ -318,7 +318,7 @@ class PDSchedulerService:
         # Only needed for Decode-only or Unified mode. Prefill-only does NOT send tokens.
         if self.pd_mode in (PDSchedulerMode.DECODE_ONLY, PDSchedulerMode.UNIFIED):
             dp_cfg = self.args.dp_config
-            router_host = dp_cfg.router.host
+            router_host = self.args.serve.host
             router_token_port = dp_cfg.router.token_port
             connect_host = (
                 "localhost" if router_host in ["0.0.0.0", "::", ""] else router_host
@@ -452,7 +452,7 @@ class PDSchedulerService:
         self.stats_socket = self.context.socket(zmq.PUSH)
         stats_port = self.args.dp_config.router.stats_port
 
-        router_host = self.args.dp_config.router.host
+        router_host = self.args.serve.host
         if router_host in ["0.0.0.0", "::", "", None]:
             connect_host = os.environ.get("PD_MASTER_ADDR", "localhost")
         else:
@@ -608,6 +608,7 @@ async def start_pd_worker_service(args, rank: int = 0):
     )
     kv_manager = KVManager(
         kv_cache=None,  # set below
+        host=args.serve.host,
         metadata_buffers=metadata_buffers,
         disaggregation_mode=disaggregation_mode,
     )

@@ -1743,7 +1743,9 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
 
     # Send statistics socket
     stats_socket = context.socket(zmq.PUSH)
-    stats_address = f"tcp://{dp_config.router.host}:{dp_config.router.stats_port}"  # Router stats port
+    stats_address = (
+        f"tcp://{args.serve.host}:{dp_config.router.stats_port}"  # Router stats port
+    )
     stats_socket.connect(stats_address)
     logger.warning(
         f"[Enhanced Scheduler {instance_id}] connected to stats service: {stats_address}"
@@ -1751,7 +1753,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
 
     # Start DP Token Manager
     try:
-        router_token_address = f"tcp://{dp_config.router.host}:{dp_config.router.token_port}"  # Token Router listen address
+        router_token_address = f"tcp://{args.serve.host}:{dp_config.router.token_port}"  # Token Router listen address
 
         logger.warning(
             f"[Enhanced Scheduler {instance_id}] Starting DP Token Manager, group ID={instance_id}"

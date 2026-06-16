@@ -17,8 +17,6 @@ class MonkReq:
 def _build_router(algorithm: str = "prefix_cache_aware") -> RequestRouter:
     cfg = RouterConfig(
         is_router=True,
-        host="127.0.0.1",
-        port=29500,
         stats_port=29600,
         token_port=29700,
         max_inflight_per_instance=24,

@@ -346,7 +346,7 @@ mi_node_main() {
     "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
     "infer.cache_type=${MI_CACHE_TYPE}"
     "dp_config.enabled=True" "dp_config.router.is_router=False"
-    "dp_config.router.host=${ROUTER_IP}" "dp_config.scheduler_base_host=0.0.0.0"
+    "serve.host=${ROUTER_IP}" "dp_config.scheduler_base_host=0.0.0.0"
     "infer.use_cuda_graph=${MODEL_USE_CUDA_GRAPH}" "infer.schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
     "float_16bit_variant=${MODEL_FLOAT16_VARIANT}"
     "dp_config.dp_size=${INSTANCE_COUNT}"
@@ -366,7 +366,7 @@ mi_node_main() {
       python -m chitu --config-name="${MI_CONFIG_NAME}"
       "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
       dp_config.enabled=True dp_config.dp_size="${INSTANCE_COUNT}"
-      dp_config.router.is_router=True dp_config.router.host=0.0.0.0 dp_config.router.port="${MI_ROUTER_PORT}"
+      dp_config.router.is_router=True serve.port="${MI_ROUTER_PORT}"
       "dp_config.router.pd_disaggregation.enabled=False"
       "dp_config.router.routing_algorithm=${MI_LB_ALGORITHM}"
       "dp_config.router.dp_addresses=[$(IFS=,; echo "${dp_addr_list[*]}")]"
@@ -395,19 +395,15 @@ mi_node_main() {
   [ "${#LOCAL_INST_IDX[@]}" -gt 0 ] || \
     die "cannot map SLURM_PROCID=${SLURM_PROCID} to any instance"
 
-  # ── GPU 分配 ──
-  local -a local_gpu_free=()
-  if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
-    IFS=',' read -r -a local_gpu_free <<< "${CUDA_VISIBLE_DEVICES// /}"
-  else
-    for ((g=0; g<MI_GPUS_PER_NODE; g++)); do local_gpu_free+=("${g}"); done
-  fi
+  # ── Allocate GPUs per instance (with relative IDs always starting from 0) ──
+  local _gpu_next=0
 
   alloc_gpu_list() {
     local need="$1" __out="$2" k
-    [ "${#local_gpu_free[@]}" -ge "${need}" ] || die "node ${SLURM_PROCID}: need ${need} GPUs, have ${#local_gpu_free[@]}"
+    [ $((_gpu_next + need)) -le "${MI_GPUS_PER_NODE}" ] || \
+      die "node ${SLURM_PROCID}: need ${need} GPUs starting at ${_gpu_next}, exceeds gpus-per-node=${MI_GPUS_PER_NODE}"
     local -a list=()
-    for ((k=0; k<need; k++)); do list+=("${local_gpu_free[0]}"); local_gpu_free=("${local_gpu_free[@]:1}"); done
+    for ((k=0; k<need; k++)); do list+=("${_gpu_next}"); _gpu_next=$((_gpu_next + 1)); done
     printf -v "${__out}" '%s' "$(IFS=,; echo "${list[*]}")"
   }
 
@@ -439,11 +435,12 @@ mi_node_main() {
       "request.max_new_tokens=${INST_MAX_NEW_TOKENS[_idx]}"
       "dp_config.scheduler_base_port=${INST_PORT[_idx]}" "dp_config.dp_id=${_idx}"
       "infer.tp_size=${INST_TP[_idx]}" "infer.pp_size=${INST_PP[_idx]}" "infer.dp_size=${INST_DP[_idx]}" "infer.ep_size=${INST_EP[_idx]}"
+      "infer.device_ids=[${_gpu}]"
       "${COMMON_OVERRIDES[@]}" "${_ovr[@]}"
     )
     [ -n "${MI_SCHEDULER_TYPE}" ] && _CMD+=("scheduler.type=${MI_SCHEDULER_TYPE}")
 
-    apptainer run "${APPTAINER_BASE_ARGS[@]}" --env CUDA_VISIBLE_DEVICES="${_gpu}" "${MI_SIF_FILE}" "${_CMD[@]}" \
+    apptainer run "${APPTAINER_BASE_ARGS[@]}" "${MI_SIF_FILE}" "${_CMD[@]}" \
       > "${LOG_DIR_INNER}/instance.${MODEL_NAME_TAG}.i${_idx}.node${SLURM_PROCID}.log" 2>&1 &
     LOCAL_PIDS+=("$!")
   done

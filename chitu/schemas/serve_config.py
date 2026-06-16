@@ -204,8 +204,6 @@ class DecodeSchedulerConfig:
 @dataclass
 class RouterConfig:
     is_router: bool = MISSING
-    host: str = MISSING
-    port: int = MISSING
     stats_port: int = MISSING
     token_port: int = MISSING
     max_inflight_per_instance: int = 24
@@ -232,8 +230,6 @@ class DpConfig:
     scheduler_base_port: int = MISSING
     dp_size: int = MISSING
     dp_id: int = MISSING
-    tp_size: int = MISSING
-    pp_size: int = MISSING
     router: RouterConfig = MISSING
 
 

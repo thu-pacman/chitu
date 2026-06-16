@@ -488,13 +488,9 @@ dp_config:
   scheduler_base_port: 29610
   dp_size: 1
   dp_id: 0
-  tp_size: 1
-  pp_size: 1
   # Router configuration
   router:
     is_router: False
-    host: 0.0.0.0
-    port: 21003              # HTTP service port
     stats_port: 29600        # ZMQ port
     token_port: 29700        # ZMQ port
     max_inflight_per_instance: 24 # max number of inflight requests per dp instance

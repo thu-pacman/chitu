@@ -765,7 +765,7 @@ async def start_router_components_and_serve():
 
         # Start HTTP service
         logger.info(
-            f"[ROUTER] Preparing to start HTTP service on port {args.dp_config.router.port}..."
+            f"[ROUTER] Preparing to start HTTP service on port {args.serve.port}..."
         )
 
         # Use unified app for DP Router
@@ -792,8 +792,8 @@ async def start_router_components_and_serve():
 
         config = uvicorn.Config(
             app,
-            host=args.dp_config.router.host,
-            port=args.dp_config.router.port,
+            host=args.serve.host,
+            port=args.serve.port,
             log_level="info",
             access_log=True,
             backlog=backlog,

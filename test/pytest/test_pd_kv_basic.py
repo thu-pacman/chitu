@@ -98,6 +98,7 @@ def test_pd_transfer_end_to_end(
     prefill_meta = MetadataBuffers(size=4)
     prefill_kv = KVManager(
         kv_cache=prefill_cache,
+        host="127.0.0.1",
         metadata_buffers=prefill_meta,
         disaggregation_mode=DisaggregationMode.PREFILL,
     )
@@ -107,6 +108,7 @@ def test_pd_transfer_end_to_end(
     decode_meta = MetadataBuffers(size=4)
     decode_kv = KVManager(
         kv_cache=decode_cache,
+        host="127.0.0.1",
         metadata_buffers=decode_meta,
         disaggregation_mode=DisaggregationMode.DECODE,
     )

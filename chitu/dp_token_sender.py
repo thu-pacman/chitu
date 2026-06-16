@@ -74,7 +74,7 @@ class DPTokenSender:
         self.socket.setsockopt(zmq.CONFLATE, conflate)
         self.socket.setsockopt(zmq.TCP_KEEPALIVE, tcp_keepalive)
 
-        router_host = get_global_args().dp_config.router.host
+        router_host = get_global_args().serve.host
         router_token_base_port = get_global_args().dp_config.router.token_port
         router_addr = self.router_address
         if router_host and router_token_base_port is not None:
