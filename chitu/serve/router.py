@@ -21,11 +21,11 @@ logger = getLogger(__name__)
 async def start_dp_components():
     """Start DP related components"""
     args = get_global_args()
-    dp_config = args.dp_config
+    multi_inst = args.multi_inst
 
     try:
         logger.info("Starting DP components...")
-        logger.debug(f"DP config details: {dp_config}")
+        logger.debug(f"DP config details: {multi_inst}")
 
         # Start Request Router
         logger.info("Starting Request Router...")
@@ -35,7 +35,7 @@ async def start_dp_components():
         # Start Token Router
         logger.info("Starting Token Router...")
         token_router_task = asyncio.create_task(
-            start_token_router(args.serve.host, dp_config)
+            start_token_router(args.serve.host, multi_inst)
         )
         logger.debug("Token Router task created")
 

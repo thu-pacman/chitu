@@ -642,8 +642,8 @@ def global_args(pd_ports):
                     "decode_num_tasks": None,
                 },
             },
-            "dp_config": {
-                "dp_id": 0,
+            "multi_inst": {
+                "inst_id": 0,
                 "router": {
                     "host": "127.0.0.1",
                     "pd_disaggregation": {

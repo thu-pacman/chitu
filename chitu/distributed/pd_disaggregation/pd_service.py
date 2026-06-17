@@ -63,11 +63,11 @@ logger = logging.getLogger(__name__)
 
 def _determine_pd_scheduler_id(args, pd_mode: PDSchedulerMode, rank: int) -> int:
     """Return the scheduler id used by PDRequestRouter for this role."""
-    scheduler_base_port = int(getattr(args.dp_config, "scheduler_base_port", -1))
+    scheduler_base_port = int(getattr(args.multi_inst, "scheduler_base_port", -1))
     if pd_mode == PDSchedulerMode.PREFILL_ONLY:
-        schedulers = getattr(args.dp_config.router, "prefill_schedulers", [])
+        schedulers = getattr(args.multi_inst.router, "prefill_schedulers", [])
     elif pd_mode == PDSchedulerMode.DECODE_ONLY:
-        schedulers = getattr(args.dp_config.router, "decode_schedulers", [])
+        schedulers = getattr(args.multi_inst.router, "decode_schedulers", [])
     else:
         schedulers = []
 
@@ -76,9 +76,9 @@ def _determine_pd_scheduler_id(args, pd_mode: PDSchedulerMode, rank: int) -> int
             return scheduler_id
 
     # Backward-compatible fallback for configs that do not pass scheduler lists to workers.
-    instance_id = int(getattr(args.dp_config, "dp_id", rank))
+    instance_id = int(getattr(args.multi_inst, "inst_id", rank))
     if pd_mode == PDSchedulerMode.DECODE_ONLY:
-        prefill_schedulers = getattr(args.dp_config.router, "prefill_schedulers", [])
+        prefill_schedulers = getattr(args.multi_inst.router, "prefill_schedulers", [])
         prefill_count = len(prefill_schedulers or [])
         return instance_id - prefill_count if prefill_count > 0 else instance_id
     return instance_id
@@ -207,10 +207,10 @@ class PDSchedulerService:
     def _determine_pd_mode(self) -> PDSchedulerMode:
         """Determine PD mode from configuration"""
         # Check if PD disaggregation is enabled
-        dp_config = self.args.dp_config
+        multi_inst = self.args.multi_inst
         if (
-            not hasattr(dp_config.router, "pd_disaggregation")
-            or not dp_config.router.pd_disaggregation.enabled
+            not hasattr(multi_inst.router, "pd_disaggregation")
+            or not multi_inst.router.pd_disaggregation.enabled
         ):
             return PDSchedulerMode.UNIFIED
 
@@ -222,7 +222,7 @@ class PDSchedulerService:
         elif "decode_only" in scheduler_type.lower():
             return PDSchedulerMode.DECODE_ONLY
         else:
-            instance_id = dp_config.dp_id
+            instance_id = multi_inst.inst_id
             if instance_id == 0:
                 # First instance defaults to Prefill
                 logger.info(
@@ -317,7 +317,7 @@ class PDSchedulerService:
         # Initialize DP token manager for streaming tokens back to Router
         # Only needed for Decode-only or Unified mode. Prefill-only does NOT send tokens.
         if self.pd_mode in (PDSchedulerMode.DECODE_ONLY, PDSchedulerMode.UNIFIED):
-            dp_cfg = self.args.dp_config
+            dp_cfg = self.args.multi_inst
             router_host = self.args.serve.host
             router_token_port = dp_cfg.router.token_port
             connect_host = (
@@ -437,9 +437,9 @@ class PDSchedulerService:
             base_port = 29610  # default traditional base port
 
         cfg_base_port = (
-            self.args.dp_config.scheduler_base_port
-            if hasattr(self.args.dp_config, "scheduler_base_port")
-            and self.args.dp_config.scheduler_base_port is not None
+            self.args.multi_inst.scheduler_base_port
+            if hasattr(self.args.multi_inst, "scheduler_base_port")
+            and self.args.multi_inst.scheduler_base_port is not None
             else None
         )
         if isinstance(cfg_base_port, int) and cfg_base_port > 0:
@@ -450,7 +450,7 @@ class PDSchedulerService:
 
         # Stats reporting socket
         self.stats_socket = self.context.socket(zmq.PUSH)
-        stats_port = self.args.dp_config.router.stats_port
+        stats_port = self.args.multi_inst.router.stats_port
 
         router_host = self.args.serve.host
         if router_host in ["0.0.0.0", "::", "", None]:
@@ -495,14 +495,14 @@ class PDSchedulerService:
             if not self._stats_identity_logged:
                 self._stats_identity_logged = True
                 logger.info(
-                    "[PD_STATS_IDENTITY] mode=%s torch_rank=%s dp_config.dp_id=%s "
+                    "[PD_STATS_IDENTITY] mode=%s torch_rank=%s multi_inst.inst_id=%s "
                     "scheduler_base_port=%s "
                     "scheduler.local_instance_id=%s stats.local_instance_id=%s "
                     "is_tp_main_rank=%s",
                     self.pd_mode.value,
                     self.rank,
-                    getattr(self.args.dp_config, "dp_id", None),
-                    getattr(self.args.dp_config, "scheduler_base_port", None),
+                    getattr(self.args.multi_inst, "inst_id", None),
+                    getattr(self.args.multi_inst, "scheduler_base_port", None),
                     getattr(self.scheduler, "local_instance_id", None),
                     stats.get("local_instance_id"),
                     self.is_tp_main_rank,
@@ -591,7 +591,7 @@ async def start_pd_worker_service(args, rank: int = 0):
 
     logger.info(f"pd worker rank {rank} detected mode: {mode}")
 
-    pd_cfg = args.dp_config.router.pd_disaggregation
+    pd_cfg = args.multi_inst.router.pd_disaggregation
     if pd_cfg is None or not pd_cfg.enabled:
         raise RuntimeError(
             "start_pd_worker_service called but pd_disaggregation is not enabled"

@@ -277,7 +277,7 @@ async def get_chitu_ping():
 def _is_pd_router_process() -> bool:
     """Detect whether this process is a PD-mode Router."""
     args = get_global_args()
-    router_cfg = getattr(getattr(args, "dp_config", None), "router", None)
+    router_cfg = getattr(getattr(args, "multi_inst", None), "router", None)
     pd_cfg = getattr(router_cfg, "pd_disaggregation", None)
     if pd_cfg is None or not getattr(pd_cfg, "enabled", False):
         return False
@@ -529,7 +529,7 @@ async def get_dp_config():
 
         request_router = get_request_router()
         config = {
-            "dp_enabled": args.dp_config.enabled,
+            "dp_enabled": args.multi_inst.enabled,
             "server_status": get_server_status(),
             "mode": "full",
             "scheduler_count": len(getattr(request_router, "scheduler_addresses", [])),
@@ -555,20 +555,20 @@ async def get_dp_debug_info():
         # Get global args safely
         try:
             args = get_global_args()
-            dp_enabled = args.dp_config.enabled
-            dp_config = args.dp_config
+            dp_enabled = args.multi_inst.enabled
+            multi_inst = args.multi_inst
             args_status = "Available"
         except Exception:
             # In Router process, global_args may not be set yet
             logger.warning("global_args not available, using default status check")
             dp_enabled = True  # Router process always enables DP
-            dp_config = {"enabled": True, "simple_mode": False}  # Default config
+            multi_inst = {"enabled": True, "simple_mode": False}  # Default config
             args_status = "None (Router process)"
 
         debug_info = {
             "dp_enabled": dp_enabled,
             "server_status": get_server_status(),
-            "dp_config": dp_config if dp_enabled else None,
+            "dp_config": multi_inst if dp_enabled else None,
             "global_args_status": args_status,
         }
 
@@ -691,7 +691,7 @@ async def test_dp_system():
 async def get_dp_status():
     """Get DP service status"""
     status = {
-        "dp_enabled": get_global_args().dp_config.enabled,
+        "dp_enabled": get_global_args().multi_inst.enabled,
         "server_status": get_server_status(),
     }
     return status
@@ -837,8 +837,8 @@ def init_dp_router(args):
 
     # Check if PD disaggregation is enabled
     pd_enabled = (
-        hasattr(args.dp_config.router, "pd_disaggregation")
-        and args.dp_config.router.pd_disaggregation.enabled
+        hasattr(args.multi_inst.router, "pd_disaggregation")
+        and args.multi_inst.router.pd_disaggregation.enabled
     )
 
     if pd_enabled:

@@ -435,7 +435,7 @@ class KVManager:
         self.metadata_buffers = metadata_buffers
         self.pd_coordination_service = pd_coordination_service
         # instance_id identifies each Prefill/Decode instance (Bootstrap engine_rank).
-        self.instance_id = int(args.dp_config.dp_id)
+        self.instance_id = int(args.multi_inst.inst_id)
         # Target Prefill engine_rank for each request (set by the Decode scheduler).
         self.prefill_target_rank_by_room: dict[UUID, int] = {}
         # Per-request trace mapping: room(UUID) -> request_id(str).
@@ -445,8 +445,8 @@ class KVManager:
 
         # Get PD disaggregation config
         pd_config = (
-            args.dp_config.router.pd_disaggregation
-            if hasattr(args.dp_config.router, "pd_disaggregation")
+            args.multi_inst.router.pd_disaggregation
+            if hasattr(args.multi_inst.router, "pd_disaggregation")
             else None
         )
         # Auto-detect the active IB device(s) with the highest rate. This may be

@@ -125,7 +125,7 @@ class SchedulerConfig:
 
 
 @dataclass
-class DpAddressesConfig:
+class InstAddressesConfig:
     host: str = MISSING
     port: int = MISSING
 
@@ -213,7 +213,7 @@ class RouterConfig:
     router_load_penalty_weight: float = 0.02
     router_evict_buffer_size: int = 64
     launch_timeout: float = 3600.0  # PD_LAUNCH_TIMEOUT
-    dp_addresses: list[DpAddressesConfig] = MISSING
+    inst_addresses: list[InstAddressesConfig] = MISSING
     # PD disaggregation configuration
     pd_disaggregation: PDDisaggregationConfig = field(
         default_factory=PDDisaggregationConfig
@@ -223,12 +223,12 @@ class RouterConfig:
 
 
 @dataclass
-class DpConfig:
+class MultiInstConfig:
     enabled: bool = MISSING
     scheduler_base_host: str = MISSING
     scheduler_base_port: int = MISSING
-    dp_size: int = MISSING
-    dp_id: int = MISSING
+    n_insts: int = MISSING
+    inst_id: int = MISSING
     router: RouterConfig = MISSING
 
 
@@ -352,7 +352,7 @@ class ServeConfig(ServeConfigLegacy):
     infer: InferConfig = field(default_factory=InferConfig)
     request: RequestConfig = field(default_factory=RequestConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
-    dp_config: DpConfig = field(default_factory=DpConfig)
+    multi_inst: MultiInstConfig = field(default_factory=MultiInstConfig)
     pd_test: PDTestConfig = field(default_factory=PDTestConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)

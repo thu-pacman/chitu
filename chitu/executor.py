@@ -601,7 +601,7 @@ class ExpertDataDispatcher(TasksDispatcher):
 
             for rank_in_group in range(1, self.group_size):
                 target_is_pd_decode_rank = (
-                    get_global_args().dp_config.router.pd_disaggregation.enabled
+                    get_global_args().multi_inst.router.pd_disaggregation.enabled
                 ) and current_task_type == TaskType.Decode
                 task_ids = task_ids_list[rank_in_group]
                 if current_task_type == TaskType.Special:
@@ -769,7 +769,7 @@ class Executor:
         self.pp_stage = get_pp_group().rank_in_group
         self.is_pp_first_stage = self.pp_size <= 1 or self.pp_stage == 0
         self.has_schedule_overlap = args.infer.schedule_overlap
-        pd_cfg = getattr(getattr(args, "dp_config", None), "router", None)
+        pd_cfg = getattr(getattr(args, "multi_inst", None), "router", None)
         pd_cfg = getattr(pd_cfg, "pd_disaggregation", None)
         pd_log_verbose = False
         env_pd_verbose = os.getenv("CHITU_PD_LOG_VERBOSE")
@@ -874,7 +874,7 @@ class Executor:
         # Decode is responsible for sampling and subsequent token generation.
         # If keep PP sampling enabled, last PP stage would sample and send results
         # back to rank0, adding latency and overhead.
-        pd_cfg = getattr(getattr(args, "dp_config", None), "router", None)
+        pd_cfg = getattr(getattr(args, "multi_inst", None), "router", None)
         pd_cfg = getattr(pd_cfg, "pd_disaggregation", None)
         sched_type = str(getattr(getattr(args, "scheduler", None), "type", "")).lower()
         self._pd_prefill_only = bool(

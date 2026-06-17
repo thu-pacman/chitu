@@ -548,7 +548,7 @@ def _auto_set_num_blocks_after_warmup(args):
         )
         return
 
-    pd_cfg = args.dp_config.router.pd_disaggregation
+    pd_cfg = args.multi_inst.router.pd_disaggregation
     if pd_cfg.enabled:
         sched_type = args.scheduler.type.lower()
         is_pd_decode_only = "decode_only" in sched_type
@@ -1088,7 +1088,7 @@ def _warmup_backend_direct(
 
 def warmup_engine(args):
     # Router 进程不做 warmup
-    if args.dp_config.router.is_router:
+    if args.multi_inst.router.is_router:
         return
 
     clear_observed_op_impl_selections()
@@ -1114,7 +1114,7 @@ def warmup_engine(args):
             )
 
     # PD分离→direct，非PD→taskpool
-    pd_enabled = args.dp_config.router.pd_disaggregation.enabled
+    pd_enabled = args.multi_inst.router.pd_disaggregation.enabled
 
     runner = "direct" if pd_enabled else "taskpool"
     sched_type = str(args.scheduler.type).lower()
@@ -1473,7 +1473,7 @@ def chitu_init(args):
         logger.info(f"Prometheus collector addresses:{collector_addrs}")
 
         # Only rank 0 monitors (it has all TaskPool data)
-        should_start_monitor = rank == 0 and not args.dp_config.enabled
+        should_start_monitor = rank == 0 and not args.multi_inst.enabled
         if should_start_monitor:
             start_prometheus_server_and_metrics_monitor(collector_addrs)
     except Exception as e:
@@ -1718,9 +1718,9 @@ def check_alloc_retries():
     _last_alloc_retries = cur_alloc_retries
 
 
-async def start_enhanced_scheduler_service(rank: int, dp_config, args):
+async def start_enhanced_scheduler_service(rank: int, multi_inst, args):
     # only main rank of dp group start enhanced scheduler service
-    instance_id = args.dp_config.dp_id
+    instance_id = args.multi_inst.inst_id
     if rank != 0:
         logger.warning(
             f"[Enhanced Scheduler {instance_id}] only main rank of dp group start Enhanced Scheduler service"
@@ -1734,8 +1734,8 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
 
     # Receive request socket
     request_socket = context.socket(zmq.PULL)
-    request_port = dp_config.scheduler_base_port
-    request_address = f"tcp://{dp_config.scheduler_base_host}:{request_port}"
+    request_port = multi_inst.scheduler_base_port
+    request_address = f"tcp://{multi_inst.scheduler_base_host}:{request_port}"
     request_socket.bind(request_address)
     logger.warning(
         f"[Enhanced Scheduler {instance_id}] Listening to requests: {request_address}"
@@ -1744,7 +1744,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
     # Send statistics socket
     stats_socket = context.socket(zmq.PUSH)
     stats_address = (
-        f"tcp://{args.serve.host}:{dp_config.router.stats_port}"  # Router stats port
+        f"tcp://{args.serve.host}:{multi_inst.router.stats_port}"  # Router stats port
     )
     stats_socket.connect(stats_address)
     logger.warning(
@@ -1753,7 +1753,7 @@ async def start_enhanced_scheduler_service(rank: int, dp_config, args):
 
     # Start DP Token Manager
     try:
-        router_token_address = f"tcp://{args.serve.host}:{dp_config.router.token_port}"  # Token Router listen address
+        router_token_address = f"tcp://{args.serve.host}:{multi_inst.router.token_port}"  # Token Router listen address
 
         logger.warning(
             f"[Enhanced Scheduler {instance_id}] Starting DP Token Manager, group ID={instance_id}"
@@ -1903,7 +1903,7 @@ async def process_scheduler_request(rank: int, request_data: dict):
         task = Task(task_id=request_id, req=user_request, stop_with_eos=stop_with_eos)
 
         try:
-            instance_id = get_global_args().dp_config.dp_id
+            instance_id = get_global_args().multi_inst.inst_id
             token_manager = get_dp_token_manager(instance_id)
             # ensure token manager started
             await token_manager.start()
@@ -1930,7 +1930,7 @@ async def process_scheduler_request(rank: int, request_data: dict):
         )
 
     except Exception as e:
-        instance_id = get_global_args().dp_config.dp_id
+        instance_id = get_global_args().multi_inst.inst_id
         logger.error(
             f"[Enhanced Scheduler {instance_id}] Failed to process request: {e}"
         )

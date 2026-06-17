@@ -36,14 +36,14 @@ logger = getLogger(__name__)
 )
 def main(args: ServeConfig):
     """Main entry point for serve module"""
-    dp_config = args.dp_config
+    multi_inst = args.multi_inst
 
-    if dp_config.router.is_router:
+    if multi_inst.router.is_router:
         # Use DP Router module
         init_dp_router(args)
         return
 
-    if dp_config.enabled:
+    if multi_inst.enabled:
         # Use DP Scheduler module
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         init_dp_scheduler(args, rank)

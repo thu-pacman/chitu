@@ -238,13 +238,13 @@ class PagedKVCacheManager(KVCacheManagerBase):
         blk_hash = self.cache_idx_to_hash.pop(cache_idx, None)
         self.identity_runtime_pool.pop(blk_hash, None)
         self.identity_builder.forget_hash(blk_hash)
-        dp_config = getattr(get_global_args(), "dp_config", None)
+        multi_inst = getattr(get_global_args(), "multi_inst", None)
         if (
             blk_hash is not None
-            and dp_config
-            and getattr(dp_config, "enabled", False)
+            and multi_inst
+            and getattr(multi_inst, "enabled", False)
             and not getattr(
-                getattr(getattr(dp_config, "router", None), "pd_disaggregation", None),
+                getattr(getattr(multi_inst, "router", None), "pd_disaggregation", None),
                 "enabled",
                 True,
             )

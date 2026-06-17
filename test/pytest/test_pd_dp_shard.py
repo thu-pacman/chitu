@@ -66,8 +66,8 @@ def test_pd_dp_shard_round_robin():
                 "max_batch_size": 8,
                 "use_cuda_graph": False,
             },
-            "dp_config": {
-                "dp_id": 0,
+            "multi_inst": {
+                "inst_id": 0,
                 "router": {
                     "host": "127.0.0.1",
                     "pd_disaggregation": {

@@ -375,7 +375,7 @@ class PrefixCacheAwarePolicy(LoadBalancer):
                     "[REQUEST_ROUTER] instance evict hash not found in cached_blocks "
                     f"or evicted block buffer, local_instance_id={local_instance_id}, blk_hash={blk_hash}. "
                     "If this warning is frequent, router/instance cache states may drift; "
-                    "try increasing dp_config.router.router_evict_buffer_size."
+                    "try increasing multi_inst.router.router_evict_buffer_size."
                 )
 
     def _push_evict_buffer(self, local_instance_id: int, blk_hash: str) -> None:
@@ -415,10 +415,10 @@ class RequestRouter:
         # Resolve scheduler addresses from config
         self._scheduler_addresses: list[str] = []
         try:
-            if hasattr(self.config, "dp_addresses") and self.config.dp_addresses:
+            if hasattr(self.config, "inst_addresses") and self.config.inst_addresses:
                 self._scheduler_addresses = [
                     f"tcp://{addr.host}:{addr.port}"
-                    for addr in self.config.dp_addresses
+                    for addr in self.config.inst_addresses
                 ]
             elif hasattr(self.config, "scheduler_addresses"):
                 # Backward compatibility for legacy configs
@@ -776,12 +776,12 @@ async def start_request_router():
     logger.info("Creating new Request Router instance...")
 
     args = get_global_args()
-    dp_config = args.dp_config
+    multi_inst = args.multi_inst
 
     # Check if PD disaggregation is enabled
     pd_enabled = (
-        hasattr(dp_config.router, "pd_disaggregation")
-        and dp_config.router.pd_disaggregation.enabled
+        hasattr(multi_inst.router, "pd_disaggregation")
+        and multi_inst.router.pd_disaggregation.enabled
     )
 
     if pd_enabled:
@@ -792,14 +792,14 @@ async def start_request_router():
             PDRequestRouter,
         )
 
-        # Create PD router configuration - directly use dp_config.router
-        router = PDRequestRouter(dp_config.router)
+        # Create PD router configuration - directly use multi_inst.router
+        router = PDRequestRouter(multi_inst.router)
     else:
         logger.info("Creating DP unified router...")
 
-        # Prefer using dp_config.router; if no dp_addresses configured, fallback to localhost ports
-        router_cfg = dp_config.router
-        instance_addrs = getattr(router_cfg, "dp_addresses", None)
+        # Prefer using multi_inst.router; if no inst_addresses configured, fallback to localhost ports
+        router_cfg = multi_inst.router
+        instance_addrs = getattr(router_cfg, "inst_addresses", None)
         if instance_addrs:
             formatted_instance_addrs = [
                 f"tcp://{addr.host}:{addr.port}" for addr in instance_addrs
@@ -807,7 +807,7 @@ async def start_request_router():
             logger.info(f"Instance addresses: {formatted_instance_addrs}")
             router = RequestRouter(router_cfg)
         else:
-            raise RuntimeError(f"Failed to get instance addresses from dp_config")
+            raise RuntimeError(f"Failed to get instance addresses from multi_inst")
 
     set_global_request_router(router)
     logger.info("Request Router configured successfully")

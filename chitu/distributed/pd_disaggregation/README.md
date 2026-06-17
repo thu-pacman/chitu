@@ -302,12 +302,12 @@ defaults:
   - serve_config      # 继承模型/推理/校验等通用配置
   - _self_
 
-dp_config:
+multi_inst:
   enabled: True
   scheduler_base_host: 0.0.0.0
   scheduler_base_port: 29610       # Scheduler ZMQ 基础端口
-  dp_size: 2                       # P + D 总实例数（启动时覆盖）
-  dp_id: 0                         # 当前进程的 DP ID（启动时覆盖）
+  n_insts: 2                       # P + D 总实例数（启动时覆盖）
+  inst_id: 0                       # 当前进程的实例 ID（启动时覆盖）
 
   router:
     is_router: True                # Router 进程设为 True，P/D 设为 False
@@ -347,7 +347,7 @@ dp_config:
         scheduling_strategy: "immediate"
 ```
 
-启动脚本 `srun_pd_disagg_base_apptainer.sh` 会根据 `--prefill` / `--decode` 参数自动生成 `prefill_schedulers=[{host:...,port:...},...]` 和 `decode_schedulers=[...]` 的 Hydra override 传给 Router，同时为每个 P/D 实例设置对应的 `dp_config.dp_id` 和 `dp_config.scheduler_base_port`。`--pd-spec` 中的参数（如 `decode_wait_timeout_s`）会覆盖上面 `kv_transfer` 下的默认值。
+启动脚本 `srun_pd_disagg_base_apptainer.sh` 会根据 `--prefill` / `--decode` 参数自动生成 `prefill_schedulers=[{host:...,port:...},...]` 和 `decode_schedulers=[...]` 的 Hydra override 传给 Router，同时为每个 P/D 实例设置对应的 `multi_inst.inst_id` 和 `multi_inst.scheduler_base_port`。`--pd-spec` 中的参数（如 `decode_wait_timeout_s`）会覆盖上面 `kv_transfer` 下的默认值。
 
 ### 端口矩阵（2P3D 示例）
 
@@ -531,7 +531,7 @@ observe_stage_duration("decode", "kv_recv", duration_s)
 | `created pd request: <rid> -> P{k}-D{m}` | Router            | 请求分配到具体 P/D     |
 
 
-启用详细日志：配置 `dp_config.router.pd_disaggregation.log_verbose=True`。
+启用详细日志：配置 `multi_inst.router.pd_disaggregation.log_verbose=True`。
 
 ### Prometheus Server 集成
 

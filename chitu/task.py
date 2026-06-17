@@ -521,7 +521,7 @@ class Task:
             self.req.finish_reason = "length"
         if self.status == TaskStatus.Stopped:
             pd_cfg = getattr(
-                getattr(get_global_args(), "dp_config", None), "router", None
+                getattr(get_global_args(), "multi_inst", None), "router", None
             )
             pd_cfg = getattr(pd_cfg, "pd_disaggregation", None)
             if (

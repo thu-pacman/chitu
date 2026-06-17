@@ -5,18 +5,18 @@
 # PD disaggregation base config overlay
 # 仅保留 PD 分离相关配置；其余模型/推理通用项从基础 serve_config 继承
 # 适用于任意 XP-YD 拓扑：启动脚本通过 Hydra override 动态覆盖
-# prefill_schedulers / decode_schedulers 列表与 dp_size 等字段
+# prefill_schedulers / decode_schedulers 列表与 n_insts 等字段
 
 defaults:
   - serve_config
   - _self_
 
-dp_config:
+multi_inst:
   enabled: True
   scheduler_base_host: 0.0.0.0
   scheduler_base_port: 29610
-  dp_size: 2           # P + D 总实例数（启动时覆盖）
-  dp_id: 0
+  n_insts: 2           # P + D 总实例数（启动时覆盖）
+  inst_id: 0
 
   router:
     is_router: True

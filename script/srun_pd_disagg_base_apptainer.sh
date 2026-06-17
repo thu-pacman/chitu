@@ -168,7 +168,7 @@ parse_model_spec() {
 # Keys with '.' are passed through as Hydra overrides directly.
 parse_pd_spec() {
   local spec="$1"; [ -z "${spec}" ] && return 0
-  local pfx="dp_config.router.pd_disaggregation.kv_transfer"
+  local pfx="multi_inst.router.pd_disaggregation.kv_transfer"
   IFS=',' read -r -a _kvs <<< "${spec}"
   for _kv in "${_kvs[@]}"; do
     [ -n "${_kv}" ] || continue
@@ -503,29 +503,29 @@ pd_node_main() {
     _ip="$(to_ip "${NODE_ARR[${PREFILL_START_NODE[i]}]}")"
     prefill_list+=("{host:${_ip},port:${PREFILL_PORT[i]},max_batch_size:${ROUTER_PREFILL_MAX_BATCH_SIZE},max_total_tokens:${ROUTER_PREFILL_MAX_TOTAL_TOKENS},batching_strategy:${ROUTER_PREFILL_BATCHING_STRATEGY}}")
   done
-  PD_PREFILL_SCHEDULERS_OVERRIDE="dp_config.router.prefill_schedulers=[$(IFS=,; echo "${prefill_list[*]}")]"
+  PD_PREFILL_SCHEDULERS_OVERRIDE="multi_inst.router.prefill_schedulers=[$(IFS=,; echo "${prefill_list[*]}")]"
 
   decode_list=()
   for i in "${!DECODE_START_NODE[@]}"; do
     _ip="$(to_ip "${NODE_ARR[${DECODE_START_NODE[i]}]}")"
     decode_list+=("{host:${_ip},port:${DECODE_PORT[i]},scheduling_strategy:${ROUTER_DECODE_SCHEDULING_STRATEGY}}")
   done
-  PD_DECODE_SCHEDULERS_OVERRIDE="dp_config.router.decode_schedulers=[$(IFS=,; echo "${decode_list[*]}")]"
+  PD_DECODE_SCHEDULERS_OVERRIDE="multi_inst.router.decode_schedulers=[$(IFS=,; echo "${decode_list[*]}")]"
 
   # Prefill/Decode 共用参数
   COMMON_ARGS=(
     --config-name="${PD_CONFIG_NAME}"
     "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
     "infer.cache_type=${PD_CACHE_TYPE}"
-    "dp_config.enabled=True" "dp_config.router.is_router=False"
-    "serve.host=${ROUTER_IP}" "dp_config.scheduler_base_host=0.0.0.0"
-    "dp_config.router.stats_port=${PD_ROUTER_STATS_PORT}" "dp_config.router.token_port=${PD_ROUTER_TOKEN_PORT}"
-    "dp_config.router.pd_disaggregation.coordination_port=${PD_COORDINATION_PORT}"
-    "dp_config.router.pd_disaggregation.metadata_sync_port=${PD_METADATA_SYNC_PORT}"
-    "dp_config.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
+    "multi_inst.enabled=True" "multi_inst.router.is_router=False"
+    "serve.host=${ROUTER_IP}" "multi_inst.scheduler_base_host=0.0.0.0"
+    "multi_inst.router.stats_port=${PD_ROUTER_STATS_PORT}" "multi_inst.router.token_port=${PD_ROUTER_TOKEN_PORT}"
+    "multi_inst.router.pd_disaggregation.coordination_port=${PD_COORDINATION_PORT}"
+    "multi_inst.router.pd_disaggregation.metadata_sync_port=${PD_METADATA_SYNC_PORT}"
+    "multi_inst.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
     "infer.use_cuda_graph=${MODEL_USE_CUDA_GRAPH}" "infer.schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
     "float_16bit_variant=${MODEL_FLOAT16_VARIANT}"
-    "dp_config.dp_size=${PD_TOTAL_INSTANCES}"
+    "multi_inst.n_insts=${PD_TOTAL_INSTANCES}"
     "${PD_PREFILL_SCHEDULERS_OVERRIDE}" "${PD_DECODE_SCHEDULERS_OVERRIDE}"
   )
 
@@ -535,12 +535,12 @@ pd_node_main() {
     ROUTER_CMD=(
       python -m chitu --config-name="${PD_CONFIG_NAME}"
       "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
-      dp_config.enabled=True dp_config.dp_size="${PD_TOTAL_INSTANCES}"
-      dp_config.router.is_router=True serve.port="${PD_ROUTER_PORT}"
-      "dp_config.router.stats_port=${PD_ROUTER_STATS_PORT}" "dp_config.router.token_port=${PD_ROUTER_TOKEN_PORT}"
-      "dp_config.router.pd_disaggregation.coordination_port=${PD_COORDINATION_PORT}"
-      "dp_config.router.pd_disaggregation.metadata_sync_port=${PD_METADATA_SYNC_PORT}"
-      "dp_config.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
+      multi_inst.enabled=True multi_inst.n_insts="${PD_TOTAL_INSTANCES}"
+      multi_inst.router.is_router=True serve.port="${PD_ROUTER_PORT}"
+      "multi_inst.router.stats_port=${PD_ROUTER_STATS_PORT}" "multi_inst.router.token_port=${PD_ROUTER_TOKEN_PORT}"
+      "multi_inst.router.pd_disaggregation.coordination_port=${PD_COORDINATION_PORT}"
+      "multi_inst.router.pd_disaggregation.metadata_sync_port=${PD_METADATA_SYNC_PORT}"
+      "multi_inst.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
     )
     ROUTER_CMD+=("${PD_PREFILL_SCHEDULERS_OVERRIDE}" "${PD_DECODE_SCHEDULERS_OVERRIDE}")
     ROUTER_CMD+=("${COMMON_OVERRIDES[@]}")
@@ -642,7 +642,7 @@ pd_node_main() {
         "infer.max_seq_len=${_a_msl[_idx]}"
         "${_batch_args[@]}"
         "request.max_new_tokens=${_a_mnt[_idx]}"
-        "dp_config.scheduler_base_port=${_a_pt[_idx]}" "dp_config.dp_id=$((dp_offset + _idx))"
+        "multi_inst.scheduler_base_port=${_a_pt[_idx]}" "multi_inst.inst_id=$((dp_offset + _idx))"
         "scheduler.type=${sched_type}"
         "infer.tp_size=${_a_tp[_idx]}" "infer.pp_size=${_a_pp[_idx]}" "infer.dp_size=${_a_dp[_idx]}" "infer.ep_size=${_a_ep[_idx]}"
         "infer.device_ids=[${_gpu}]"

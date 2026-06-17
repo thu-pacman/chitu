@@ -69,9 +69,9 @@ class TokenRouter:
         """Initialize ZMQ sockets (support multi-PULL via ROUTER_DP_SIZE)"""
         base_port = int(self.config.router.token_port)
 
-        # get dp_size from dp_config
-        # dp_config.dp_size, not infer.dp_size
-        num_instances = max(1, self.config.dp_size)
+        # get number of instances from multi_inst
+        # multi_inst.n_insts, not infer.dp_size
+        num_instances = max(1, self.config.n_insts)
 
         def create_and_bind(port: int):
             sock = self.context.socket(zmq.PULL)
@@ -304,7 +304,7 @@ class TokenRouter:
                 await asyncio.sleep(60)
 
 
-async def start_token_router(host: str, dp_config):
+async def start_token_router(host: str, multi_inst):
     """Start Token Router"""
     logger.info("Starting Token Router...")
     existing_token_router = get_token_router(check_exist=False)
@@ -312,8 +312,8 @@ async def start_token_router(host: str, dp_config):
         await existing_token_router.start()
         return
 
-    router = TokenRouter(host, dp_config)
-    logger.info(f"Token Router port={dp_config.router.token_port}")
+    router = TokenRouter(host, multi_inst)
+    logger.info(f"Token Router port={multi_inst.router.token_port}")
 
     # dp_chat_completions uses the same instance
     logger.info("Set global Token Router instance")

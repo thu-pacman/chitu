@@ -798,7 +798,7 @@ class PDRequestRouter(RequestRouter):
             ("decode", did) for did in expected_decode
         }
 
-        dp_router_config = get_global_args().dp_config.router
+        dp_router_config = get_global_args().multi_inst.router
         launch_timeout = dp_router_config.launch_timeout
 
         logger.info(

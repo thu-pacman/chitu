@@ -22,7 +22,7 @@ class MetricsFormatter:
     def __init__(self):
         args = get_global_args()
         dp_enabled = (
-            getattr(args, "dp_config", None) is not None and args.dp_config.enabled
+            getattr(args, "multi_inst", None) is not None and args.multi_inst.enabled
         )
 
         self.use_instance_info: bool = dp_enabled
@@ -32,11 +32,11 @@ class MetricsFormatter:
         self.use_rank_info: bool = True
 
         self.pd_enabled: bool = (
-            dp_enabled and args.dp_config.router.pd_disaggregation.enabled
+            dp_enabled and args.multi_inst.router.pd_disaggregation.enabled
         )
         self.num_prefill_instances: int = -1
         if self.pd_enabled:
-            self.num_prefill_instances = len(args.dp_config.router.prefill_schedulers)
+            self.num_prefill_instances = len(args.multi_inst.router.prefill_schedulers)
 
         self.prefix_format = self._get_prefix_format_str()
 
@@ -97,7 +97,7 @@ class MetricsMonitor:
         """
         self.manager = manager
         self.metrics_formatter = MetricsFormatter()
-        self.enable_multi_instance = get_global_args().dp_config.enabled
+        self.enable_multi_instance = get_global_args().multi_inst.enabled
         self.log_interval = log_interval
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()

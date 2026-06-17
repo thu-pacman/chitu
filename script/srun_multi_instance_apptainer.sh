@@ -7,7 +7,7 @@
 # 多实例启动脚本（Apptainer + srun）— 非 PD 分离模式
 # - 支持 Router + 多个 unified chitu 实例
 # - Node0 运行 Router；各实例按 GPU 数量分配节点
-# - Router 通过 dp_addresses 做请求路由
+# - Router 通过 inst_addresses 做请求路由
 #
 
 set -euo pipefail
@@ -345,31 +345,31 @@ mi_node_main() {
     --config-name="${MI_CONFIG_NAME}"
     "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
     "infer.cache_type=${MI_CACHE_TYPE}"
-    "dp_config.enabled=True" "dp_config.router.is_router=False"
-    "serve.host=${ROUTER_IP}" "dp_config.scheduler_base_host=0.0.0.0"
+    "multi_inst.enabled=True" "multi_inst.router.is_router=False"
+    "serve.host=${ROUTER_IP}" "multi_inst.scheduler_base_host=0.0.0.0"
     "infer.use_cuda_graph=${MODEL_USE_CUDA_GRAPH}" "infer.schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
     "float_16bit_variant=${MODEL_FLOAT16_VARIANT}"
-    "dp_config.dp_size=${INSTANCE_COUNT}"
+    "multi_inst.n_insts=${INSTANCE_COUNT}"
   )
 
   # ── 启动 Router (仅 Node0) ──
   if [ "${SLURM_PROCID}" = "0" ]; then
     echo "=== Node0: Router ==="
 
-    dp_addr_list=()
+    inst_addr_list=()
     for i in "${!INST_START_NODE[@]}"; do
       _ip="$(to_ip "${NODE_ARR[${INST_START_NODE[i]}]}")"
-      dp_addr_list+=("{host:${_ip},port:${INST_PORT[i]}}")
+      inst_addr_list+=("{host:${_ip},port:${INST_PORT[i]}}")
     done
 
     ROUTER_CMD=(
       python -m chitu --config-name="${MI_CONFIG_NAME}"
       "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
-      dp_config.enabled=True dp_config.dp_size="${INSTANCE_COUNT}"
-      dp_config.router.is_router=True serve.port="${MI_ROUTER_PORT}"
-      "dp_config.router.pd_disaggregation.enabled=False"
-      "dp_config.router.routing_algorithm=${MI_LB_ALGORITHM}"
-      "dp_config.router.dp_addresses=[$(IFS=,; echo "${dp_addr_list[*]}")]"
+      multi_inst.enabled=True multi_inst.n_insts="${INSTANCE_COUNT}"
+      multi_inst.router.is_router=True serve.port="${MI_ROUTER_PORT}"
+      "multi_inst.router.pd_disaggregation.enabled=False"
+      "multi_inst.router.routing_algorithm=${MI_LB_ALGORITHM}"
+      "multi_inst.router.inst_addresses=[$(IFS=,; echo "${inst_addr_list[*]}")]"
       "${COMMON_OVERRIDES[@]}"
     )
 
@@ -433,7 +433,7 @@ mi_node_main() {
       "infer.max_reqs=${INST_MAX_REQS[_idx]}"
       "infer.max_batch_size=${INST_MAX_BATCH_SIZE[_idx]}"
       "request.max_new_tokens=${INST_MAX_NEW_TOKENS[_idx]}"
-      "dp_config.scheduler_base_port=${INST_PORT[_idx]}" "dp_config.dp_id=${_idx}"
+      "multi_inst.scheduler_base_port=${INST_PORT[_idx]}" "multi_inst.inst_id=${_idx}"
       "infer.tp_size=${INST_TP[_idx]}" "infer.pp_size=${INST_PP[_idx]}" "infer.dp_size=${INST_DP[_idx]}" "infer.ep_size=${INST_EP[_idx]}"
       "infer.device_ids=[${_gpu}]"
       "${COMMON_OVERRIDES[@]}" "${_ovr[@]}"
