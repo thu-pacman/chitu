@@ -323,7 +323,6 @@ dp_config:
       coordination_port: 29800     # PDCoordination 协调端口
       metadata_sync_port: 29801    # 元数据同步端口
       kv_transfer_backend: "mooncake"
-      ib_device: "mlx5_0"         # RDMA 设备名
       bootstrap_port: 8080         # Bootstrap HTTP 端口
 
       kv_transfer:
@@ -570,7 +569,7 @@ Router 进程可选启动内置的 Prometheus Server（`PrometheusServerManager`
 | 现象                    | 排查方向                                                                        |
 | --------------------- | --------------------------------------------------------------------------- |
 | P/D 启动卡在 Bootstrap 连接 | 确认 Router 已启动 Bootstrap（:8080）；`PD_MASTER_ADDR` 指向 Router IP，非回环地址          |
-| Decode 长时间 WAITING    | 检查 Prefill 是否收到 TRANSFER_INFO；查看 Prefill 传输线程日志；确认 RDMA 设备 `ib_device` 配置正确 |
+| Decode 长时间 WAITING    | 检查 Prefill 是否收到 TRANSFER_INFO；查看 Prefill 传输线程日志；确认 RDMA 设备已正确检测（见 `chitu/distributed/infiniband.py`） |
 | RDMA "Bad address"    | 确认 `register_buffer_to_engine()` 在 CacheManager 注入后调用；检查各层 base_ptr/len 无重叠 |
 | Router 序列化报错          | 确保请求 `messages` 是纯 dict 列表（非 pydantic 对象）                                   |
 | 同节点多进程端口冲突            | 为每个 torchrun 进程指定不同的 `scheduler_base_port` 和 `--master_port`                |

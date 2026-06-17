@@ -33,6 +33,7 @@ from chitu.global_vars import get_global_args
 from chitu.backend import Backend
 from chitu.task import TaskPool
 from chitu.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
+from chitu.distributed.infiniband import detect_ib_devices
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
 )
@@ -448,20 +449,10 @@ class KVManager:
             if hasattr(args.dp_config.router, "pd_disaggregation")
             else None
         )
-        ib_device = pd_config.ib_device if pd_config else None
-        # Support per-rank IB device selection via comma-separated list.
-        # e.g. ib_device: "mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_0,mlx5_1,mlx5_2,mlx5_3"
-        # maps each local GPU rank to the IB NIC with the best NUMA affinity.
-        # If only a single device is given all ranks use it (legacy behavior).
-        if ib_device and "," in ib_device:
-            local_rank = torch.cuda.current_device()
-            device_list = [d.strip() for d in ib_device.split(",") if d.strip()]
-            ib_device = device_list[local_rank % len(device_list)]
-            logger.info(
-                "Per-rank IB device selection: local_rank=%d -> ib_device=%s",
-                local_rank,
-                ib_device,
-            )
+        # Auto-detect the active IB device(s) with the highest rate. This may be
+        # a comma-separated list of multiple NICs, which MooncakeTransferEngine
+        # accepts directly.
+        ib_device = detect_ib_devices()
         bootstrap_port = pd_config.bootstrap_port if pd_config else 29888
         self.kv_transfer_cfg = (
             getattr(pd_config, "kv_transfer", None) if pd_config else None

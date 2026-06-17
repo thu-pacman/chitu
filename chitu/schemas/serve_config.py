@@ -172,7 +172,6 @@ class PDDisaggregationConfig:
     coordination_port: int = 29800  # P-D coordination port
     metadata_sync_port: int = 29801  # metadata sync port
     kv_transfer_backend: str = "mooncake"  # kv transfer backend: mooncake, nccl
-    ib_device: Optional[str] = "mlx5_0"  # IB device name
     bootstrap_port: int = 8080  # Bootstrap server port
     # High-frequency PD logs (PD_QUEUE/PD_STATS/PD_TRACE)
     log_verbose: bool = False

@@ -613,7 +613,6 @@ def bootstrap_server(pd_ports):
 
 @pytest.fixture(scope="session")
 def global_args(pd_ports):
-    ib_device = os.environ.get("PD_IB_DEVICE", "mlx5_0")
     cfg = OmegaConf.create(
         {
             "models": {
@@ -652,7 +651,6 @@ def global_args(pd_ports):
                         "coordination_port": pd_ports["coordination_port"],
                         "metadata_sync_port": pd_ports["metadata_port"],
                         "bootstrap_port": pd_ports["bootstrap_port"],
-                        "ib_device": ib_device,
                         "kv_transfer": {
                             "decode_wait_timeout_s": 5.0,
                             "decode_resend_interval_s": 0.2,

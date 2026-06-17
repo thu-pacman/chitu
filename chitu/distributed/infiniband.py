@@ -8,6 +8,7 @@ Detect and configure InfiniBand environment variables.
 
 from typing import Optional
 from logging import getLogger
+import functools
 import os
 import re
 import subprocess
@@ -16,6 +17,7 @@ import sys
 logger = getLogger(__name__)
 
 
+@functools.cache
 def detect_ib_devices() -> Optional[str]:
     """Detect active IB devices with highest rate, return comma-separated list (e.g. ``mlx5_0,mlx5_3``)."""
     try:
@@ -51,6 +53,7 @@ def detect_ib_devices() -> Optional[str]:
     return ",".join(devices) if devices else None
 
 
+@functools.cache
 def detect_ib_network_interface() -> Optional[str]:
     """Detect active (Up) IB network interface. Prioritize bond interface."""
     try:
@@ -81,6 +84,7 @@ def detect_ib_network_interface() -> Optional[str]:
     return up_ifaces[0]
 
 
+@functools.cache
 def get_recommended_ib_envs() -> dict[str, str]:
     """Detect and configure InfiniBand environment variables, return the variables in a dict."""
     envs: dict[str, str] = {}
