@@ -169,8 +169,6 @@ class PDDisaggregationConfig:
     """PD disaggregation configuration"""
 
     enabled: bool = False
-    coordination_port: int = 29800  # P-D coordination port
-    metadata_sync_port: int = 29801  # metadata sync port
     kv_transfer_backend: str = "mooncake"  # kv transfer backend: mooncake, nccl
     bootstrap_port: int = 8080  # Bootstrap server port
     # High-frequency PD logs (PD_QUEUE/PD_STATS/PD_TRACE)
@@ -203,8 +201,6 @@ class DecodeSchedulerConfig:
 @dataclass
 class RouterConfig:
     is_router: bool = MISSING
-    stats_port: int = MISSING
-    token_port: int = MISSING
     max_inflight_per_instance: int = 24
     routing_algorithm: str = MISSING
     routing_algorithm_for_decode: str = "power_of_two_choices"
@@ -220,6 +216,12 @@ class RouterConfig:
     )
     prefill_schedulers: list[PrefillSchedulerConfig] = field(default_factory=list)
     decode_schedulers: list[DecodeSchedulerConfig] = field(default_factory=list)
+
+
+@dataclass
+class CoordinatorConfig:
+    host: str = MISSING
+    port: int = MISSING
 
 
 @dataclass
@@ -352,6 +354,7 @@ class ServeConfig(ServeConfigLegacy):
     infer: InferConfig = field(default_factory=InferConfig)
     request: RequestConfig = field(default_factory=RequestConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    coordinator: CoordinatorConfig = field(default_factory=CoordinatorConfig)
     multi_inst: MultiInstConfig = field(default_factory=MultiInstConfig)
     pd_test: PDTestConfig = field(default_factory=PDTestConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)

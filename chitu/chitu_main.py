@@ -62,6 +62,7 @@ from chitu.ops.utils import (
     emit_observed_op_impl_summary,
 )
 from chitu.distributed.comm_group import SingletonGroupPlaceholder
+from chitu.distributed.coordinator import get_endpoint
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
 from chitu.kv_cache.utils import (
     plan_kv_cache_blocks_after_warmup,
@@ -1743,9 +1744,9 @@ async def start_enhanced_scheduler_service(rank: int, multi_inst, args):
 
     # Send statistics socket
     stats_socket = context.socket(zmq.PUSH)
-    stats_address = (
-        f"tcp://{args.serve.host}:{multi_inst.router.stats_port}"  # Router stats port
-    )
+    # Get the router stats endpoint from the coordinator, then connect to it.
+    stats_ip, stats_port = get_endpoint("router", "stats_port")
+    stats_address = f"tcp://{stats_ip}:{stats_port}"  # Router stats endpoint
     stats_socket.connect(stats_address)
     logger.warning(
         f"[Enhanced Scheduler {instance_id}] connected to stats service: {stats_address}"
@@ -1753,12 +1754,10 @@ async def start_enhanced_scheduler_service(rank: int, multi_inst, args):
 
     # Start DP Token Manager
     try:
-        router_token_address = f"tcp://{args.serve.host}:{multi_inst.router.token_port}"  # Token Router listen address
-
         logger.warning(
             f"[Enhanced Scheduler {instance_id}] Starting DP Token Manager, group ID={instance_id}"
         )
-        await start_dp_token_manager(instance_id, router_token_address)
+        await start_dp_token_manager(instance_id)
         logger.warning(
             f"[Enhanced Scheduler {instance_id}] DP Token Manager started successfully"
         )

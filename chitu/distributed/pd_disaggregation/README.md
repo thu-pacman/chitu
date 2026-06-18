@@ -224,13 +224,12 @@ class KVPoll(Enum):
 
 运行在 Router 进程中，负责服务发现和meta data同步。
 
-**两个 ZMQ Socket**
+**ZMQ Socket**
 
 
-| Socket              | 类型   | 端口    | 用途                                                |
-| ------------------- | ---- | ----- | ------------------------------------------------- |
-| coordination_socket | PULL | 29800 | 接收 P/D 的协调消息（prefill_complete, decode_complete 等） |
-| metadata_socket     | REP  | 29801 | 同步meta data请求（endpoint注册/查询）                      |
+| Socket          | 类型  | 端口            | 用途                            |
+| --------------- | --- | ------------- | ----------------------------- |
+| metadata_socket | REP | 随机（动态分配） | 同步meta data请求（endpoint注册/查询） |
 
 
 **元数据同步请求类型**
@@ -313,15 +312,11 @@ multi_inst:
     is_router: True                # Router 进程设为 True，P/D 设为 False
     host: 0.0.0.0
     port: 21003                    # HTTP 推理入口端口
-    stats_port: 29600              # 统计上报端口
-    token_port: 29700              # Token 回传端口
     routing_algorithm: "power_of_two_choices"
 
     pd_disaggregation:
       enabled: True
       log_verbose: False
-      coordination_port: 29800     # PDCoordination 协调端口
-      metadata_sync_port: 29801    # 元数据同步端口
       kv_transfer_backend: "mooncake"
       bootstrap_port: 8080         # Bootstrap HTTP 端口
 

@@ -187,6 +187,20 @@ serve:
       priority: -1 
   validate_api_key: false
 
+#: Config of a TCP store used for coordinating internal TCP connections.
+#:
+#: This coordinator is responsible for managing TCP ports, but the port for itself
+#: must be set here.
+coordinator:
+  #: IP for the coordinator.
+  #:
+  #: `coordinator.host` must be recognized from all nodes, and therefore it
+  #: must NOT be wildcards like 0.0.0.0. Please set concrete IP addresses.
+  host: 127.0.0.1
+
+  #: Port for the coordinator.
+  port: 21001
+
 #: Configs for how chitu do the LLM inference computation.
 infer:
   #: Maximum number of concurrent inference tasks (the actual batch size limit).
@@ -493,8 +507,6 @@ multi_inst:
   # Router configuration
   router:
     is_router: False
-    stats_port: 29600        # ZMQ port
-    token_port: 29700        # ZMQ port
     max_inflight_per_instance: 24 # max number of inflight requests per dp instance
     # Used by unified DP routing, and by PD prefill routing when PD disaggregation is enabled.
     routing_algorithm: "power_of_two_choices" # option: prefix_cache_aware, power_of_two_choices, round_robin, least_loaded

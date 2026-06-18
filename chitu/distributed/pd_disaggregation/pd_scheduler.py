@@ -204,7 +204,6 @@ class PDInstanceRequestManager:
         self.local_instance_id = local_instance_id
         self.original_scheduler_type = scheduler_type
         self.dp_size: int = args.infer.dp_size
-        self.host = args.serve.host
 
         # PD disaggregation related state
         self.pending_decode_requests: dict[str, dict] = {}  # request_id -> request_info
@@ -289,7 +288,6 @@ class PDInstanceRequestManager:
         # Note: kv_cache will be set later in the initialization process
         self.kv_manager = KVManager(
             kv_cache=None,  # Will be set later
-            host=self.host,
             metadata_buffers=self.metadata_buffers,
             disaggregation_mode=disaggregation_mode,
         )

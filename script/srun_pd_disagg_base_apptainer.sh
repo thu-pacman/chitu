@@ -96,10 +96,6 @@ MODEL_SCHEDULE_OVERLAP="${MODEL_SCHEDULE_OVERLAP:-False}"
 # Router
 PD_CONFIG_NAME="${PD_CONFIG_NAME:-pd_disagg_serve_config}"
 PD_ROUTER_PORT="${PD_ROUTER_PORT:-}"
-PD_ROUTER_STATS_PORT="${PD_ROUTER_STATS_PORT:-}"
-PD_ROUTER_TOKEN_PORT="${PD_ROUTER_TOKEN_PORT:-}"
-PD_COORDINATION_PORT="${PD_COORDINATION_PORT:-}"
-PD_METADATA_SYNC_PORT="${PD_METADATA_SYNC_PORT:-}"
 PD_BOOTSTRAP_PORT="${PD_BOOTSTRAP_PORT:-}"
 PD_CACHE_TYPE="${PD_CACHE_TYPE:-paged}"
 ROUTER_PREFILL_MAX_BATCH_SIZE="${ROUTER_PREFILL_MAX_BATCH_SIZE:-32}"
@@ -234,18 +230,6 @@ apply_job_port_defaults() {
   PD_JOB_PORT_OFFSET="$(calc_job_port_offset "${job_id}")"
   if [ -z "${PD_ROUTER_PORT}" ]; then
     PD_ROUTER_PORT=$((21003 + PD_JOB_PORT_OFFSET))
-  fi
-  if [ -z "${PD_ROUTER_STATS_PORT}" ]; then
-    PD_ROUTER_STATS_PORT=$((29600 + PD_JOB_PORT_OFFSET))
-  fi
-  if [ -z "${PD_ROUTER_TOKEN_PORT}" ]; then
-    PD_ROUTER_TOKEN_PORT=$((29700 + PD_JOB_PORT_OFFSET))
-  fi
-  if [ -z "${PD_COORDINATION_PORT}" ]; then
-    PD_COORDINATION_PORT=$((29800 + PD_JOB_PORT_OFFSET))
-  fi
-  if [ -z "${PD_METADATA_SYNC_PORT}" ]; then
-    PD_METADATA_SYNC_PORT=$((29801 + PD_JOB_PORT_OFFSET))
   fi
   if [ -z "${PD_BOOTSTRAP_PORT}" ]; then
     PD_BOOTSTRAP_PORT=$((8080 + PD_JOB_PORT_OFFSET))
@@ -518,10 +502,7 @@ pd_node_main() {
     "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
     "infer.cache_type=${PD_CACHE_TYPE}"
     "multi_inst.enabled=True" "multi_inst.router.is_router=False"
-    "serve.host=${ROUTER_IP}" "multi_inst.scheduler_base_host=0.0.0.0"
-    "multi_inst.router.stats_port=${PD_ROUTER_STATS_PORT}" "multi_inst.router.token_port=${PD_ROUTER_TOKEN_PORT}"
-    "multi_inst.router.pd_disaggregation.coordination_port=${PD_COORDINATION_PORT}"
-    "multi_inst.router.pd_disaggregation.metadata_sync_port=${PD_METADATA_SYNC_PORT}"
+    "coordinator.host=${ROUTER_IP}" "multi_inst.scheduler_base_host=0.0.0.0"
     "multi_inst.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
     "infer.use_cuda_graph=${MODEL_USE_CUDA_GRAPH}" "infer.schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
     "float_16bit_variant=${MODEL_FLOAT16_VARIANT}"
@@ -537,9 +518,6 @@ pd_node_main() {
       "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
       multi_inst.enabled=True multi_inst.n_insts="${PD_TOTAL_INSTANCES}"
       multi_inst.router.is_router=True serve.port="${PD_ROUTER_PORT}"
-      "multi_inst.router.stats_port=${PD_ROUTER_STATS_PORT}" "multi_inst.router.token_port=${PD_ROUTER_TOKEN_PORT}"
-      "multi_inst.router.pd_disaggregation.coordination_port=${PD_COORDINATION_PORT}"
-      "multi_inst.router.pd_disaggregation.metadata_sync_port=${PD_METADATA_SYNC_PORT}"
       "multi_inst.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
     )
     ROUTER_CMD+=("${PD_PREFILL_SCHEDULERS_OVERRIDE}" "${PD_DECODE_SCHEDULERS_OVERRIDE}")
@@ -794,7 +772,7 @@ export PD_PREFILL_DEFAULT_SPEC="${PREFILL_DEFAULT_SPEC}" PD_DECODE_DEFAULT_SPEC=
 # ── 打印摘要 ──
 echo "=== PD Disagg (nodes=${PD_NODES} gpus=${PD_GPUS_PER_NODE}) ==="
 echo "router_port=${PD_ROUTER_PORT:-auto} job_port_offset=${PD_JOB_PORT_OFFSET}"
-echo "stats_port=${PD_ROUTER_STATS_PORT} token_port=${PD_ROUTER_TOKEN_PORT} coordination_port=${PD_COORDINATION_PORT} metadata_sync_port=${PD_METADATA_SYNC_PORT} bootstrap_port=${PD_BOOTSTRAP_PORT}"
+echo "bootstrap_port=${PD_BOOTSTRAP_PORT}"
 echo "model=${MODEL_CONFIG}  ckpt=${MODEL_CKPT_DIR}  sif=${PD_SIF_FILE}"
 echo "model: float16=${MODEL_FLOAT16_VARIANT} cuda_graph=${MODEL_USE_CUDA_GRAPH} schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
 echo "instances: prefill=${PREFILL_COUNT} decode=${DECODE_COUNT}"

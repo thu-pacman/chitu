@@ -113,18 +113,6 @@ class DecodeReadyMessage:
 
 
 @dataclass
-class PDCoordinationMessage:
-    """PD coordination message"""
-
-    message_type: str  # "prefill_complete", "decode_ready", "kv_transfer_complete"
-    request_id: str
-    sender_type: SchedulerType
-    sender_id: int
-    payload: dict[str, Any] = field(default_factory=dict)
-    timestamp: float = field(default_factory=time.time)
-
-
-@dataclass
 class SchedulerInfo:
     """Scheduler information"""
 

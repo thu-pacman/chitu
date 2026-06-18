@@ -20,8 +20,6 @@ multi_inst:
 
   router:
     is_router: True
-    stats_port: 29600
-    token_port: 29700
     launch_timeout: 3600
     max_inflight_per_instance: 24 # max number of inflight requests per dp instance
     # Used by unified DP routing, and by PD prefill routing when PD disaggregation is enabled.
@@ -38,8 +36,6 @@ multi_inst:
     pd_disaggregation:
       enabled: True
       log_verbose: False
-      coordination_port: 29800
-      metadata_sync_port: 29801
       kv_transfer_backend: "mooncake"
       bootstrap_port: 8080
 

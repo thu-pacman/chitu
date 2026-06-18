@@ -16,6 +16,8 @@ import traceback
 from collections import deque, OrderedDict
 from dataclasses import dataclass, field
 from chitu.global_vars import get_global_args
+from chitu.distributed.coordinator import set_endpoint
+from chitu.boot.tcp_ip import get_local_ip
 import zmq
 import zmq.asyncio
 import msgpack
@@ -472,10 +474,14 @@ class RequestRouter:
 
         # Create socket for receiving stats
         self.stats_socket = self.context.socket(zmq.PULL)
-        stats_port = int(getattr(self.config, "stats_port", 29600))
-        stats_address = f"tcp://*:{stats_port}"  # Router stats listening port
-        self.stats_socket.bind(stats_address)
-        logger.info(f"[REQUEST_ROUTER] Listening for statistics: {stats_address}")
+        # Bind the TCP server to a random port on the non-wildcard ip, then
+        # register it in the coordinator.
+        stats_ip = get_local_ip()
+        stats_port = self.stats_socket.bind_to_random_port(f"tcp://{stats_ip}")
+        set_endpoint("router", "stats_port", stats_ip, stats_port)
+        logger.info(
+            f"[REQUEST_ROUTER] Listening for statistics: tcp://{stats_ip}:{stats_port}"
+        )
 
     async def _stats_collector_task(self):
         """Collect statistics from Enhanced Schedulers."""

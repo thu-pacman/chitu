@@ -18,6 +18,8 @@ import msgpack
 import logging
 
 from chitu.task import UserRequest
+from chitu.distributed.coordinator import set_endpoint
+from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_router import (
     get_request_router,
     get_token_router,
@@ -30,8 +32,7 @@ logger = logging.getLogger(__name__)
 class TokenRouter:
     """Token Router - Handle token returns in DP scenarios"""
 
-    def __init__(self, host, config):
-        self.host = host
+    def __init__(self, config):
         self.config = config
         self.context = zmq.asyncio.Context()
 
@@ -67,13 +68,11 @@ class TokenRouter:
 
     async def _init_sockets(self):
         """Initialize ZMQ sockets (support multi-PULL via ROUTER_DP_SIZE)"""
-        base_port = int(self.config.router.token_port)
-
         # get number of instances from multi_inst
         # multi_inst.n_insts, not infer.dp_size
         num_instances = max(1, self.config.n_insts)
 
-        def create_and_bind(port: int):
+        def create_and_bind(instance_id: int):
             sock = self.context.socket(zmq.PULL)
 
             rcvhwm = int(os.getenv("ROUTER_RCV_HWM", "200000"))
@@ -83,12 +82,16 @@ class TokenRouter:
             sock.setsockopt(zmq.RCVHWM, rcvhwm)
             sock.setsockopt(zmq.RCVBUF, rcvbuf)
             sock.setsockopt(zmq.TCP_KEEPALIVE, tcp_keepalive)
-            addr = f"tcp://{self.host}:{port}"
-            sock.bind(addr)
+            # Bind the TCP server to a random port on the non-wildcard ip,
+            # then register it in the coordinator.
+            ip = get_local_ip()
+            port = sock.bind_to_random_port(f"tcp://{ip}")
+            set_endpoint("router", f"token_port_{instance_id}", ip, port)
+            addr = f"tcp://{ip}:{port}"
             return sock, addr
 
         for instance_id in range(num_instances):
-            sock, addr = create_and_bind(base_port + instance_id)
+            sock, addr = create_and_bind(instance_id)
             self.token_receivers[instance_id] = sock
             logger.info(f"Router token receiver[{instance_id}] listening on {addr}")
 
@@ -304,7 +307,7 @@ class TokenRouter:
                 await asyncio.sleep(60)
 
 
-async def start_token_router(host: str, multi_inst):
+async def start_token_router(multi_inst):
     """Start Token Router"""
     logger.info("Starting Token Router...")
     existing_token_router = get_token_router(check_exist=False)
@@ -312,8 +315,7 @@ async def start_token_router(host: str, multi_inst):
         await existing_token_router.start()
         return
 
-    router = TokenRouter(host, multi_inst)
-    logger.info(f"Token Router port={multi_inst.router.token_port}")
+    router = TokenRouter(multi_inst)
 
     # dp_chat_completions uses the same instance
     logger.info("Set global Token Router instance")

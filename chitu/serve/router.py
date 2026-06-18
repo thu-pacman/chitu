@@ -34,9 +34,7 @@ async def start_dp_components():
 
         # Start Token Router
         logger.info("Starting Token Router...")
-        token_router_task = asyncio.create_task(
-            start_token_router(args.serve.host, multi_inst)
-        )
+        token_router_task = asyncio.create_task(start_token_router(multi_inst))
         logger.debug("Token Router task created")
 
         # Wait for components to start and check status

@@ -74,7 +74,8 @@ def _wait_until(cond, timeout_s: float = 5.0):
 def test_pd_transfer_end_to_end(
     cuda_available,
     global_args,
-    coordination_service,
+    singleton_coordinator,
+    pd_coordination_service,
     bootstrap_server,
     init_distributed,
 ):
@@ -98,7 +99,6 @@ def test_pd_transfer_end_to_end(
     prefill_meta = MetadataBuffers(size=4)
     prefill_kv = KVManager(
         kv_cache=prefill_cache,
-        host="127.0.0.1",
         metadata_buffers=prefill_meta,
         disaggregation_mode=DisaggregationMode.PREFILL,
     )
@@ -108,7 +108,6 @@ def test_pd_transfer_end_to_end(
     decode_meta = MetadataBuffers(size=4)
     decode_kv = KVManager(
         kv_cache=decode_cache,
-        host="127.0.0.1",
         metadata_buffers=decode_meta,
         disaggregation_mode=DisaggregationMode.DECODE,
     )

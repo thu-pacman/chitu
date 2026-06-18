@@ -204,6 +204,28 @@ If the request has a api_key field found in this dict, the request will be prior
 according to the `priority` field. The higher the value of the field, the higher the
 priority. Ordinary request has a priority of 1.
 
+## `coordinator`
+
+Config of a TCP store used for coordinating internal TCP connections.
+
+This coordinator is responsible for managing TCP ports, but the port for itself
+must be set here.
+
+### Argument `coordinator.host`
+
+IP for the coordinator.
+
+`coordinator.host` must be recognized from all nodes, and therefore it
+must NOT be wildcards like 0.0.0.0. Please set concrete IP addresses.
+
+*Default: `127.0.0.1`.*
+
+### Argument `coordinator.port`
+
+Port for the coordinator.
+
+*Default: `21001`.*
+
 ## `infer`
 
 Configs for how chitu do the LLM inference computation.

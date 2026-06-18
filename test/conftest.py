@@ -73,6 +73,7 @@ from chitu.distributed.parallel_state import (
     parallel_groups_initialized,
     destroy_parallel_groups,
 )
+from chitu.distributed.coordinator import init_coordinator
 from chitu.distributed.pd_disaggregation.pd_coordination import PDCoordinationService
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.transfer_engine import (
     MooncakeBootstrapServer,
@@ -556,25 +557,23 @@ def cuda_available():
 
 @pytest.fixture(scope="session")
 def pd_ports():
-    coordination_port = int(os.environ.get("PD_COORDINATION_PORT", "29800"))
-    metadata_port = int(os.environ.get("PD_METADATA_PORT", "29801"))
     bootstrap_port = int(os.environ.get("PD_BOOTSTRAP_PORT", "8080"))
     return {
-        "coordination_port": coordination_port,
-        "metadata_port": metadata_port,
         "bootstrap_port": bootstrap_port,
     }
 
 
 @pytest.fixture(scope="session")
-def coordination_service(pd_ports):
+def singleton_coordinator():
+    init_coordinator("127.0.0.1", 0, is_coordinator_host=True)
+
+
+@pytest.fixture(scope="session")
+def pd_coordination_service(pd_ports):
     if os.environ.get("PD_COORDINATION_EXTERNAL", "0") == "1":
         yield None
         return
-    service = PDCoordinationService(
-        coordination_port=pd_ports["coordination_port"],
-        metadata_sync_port=pd_ports["metadata_port"],
-    )
+    service = PDCoordinationService()
     loop = asyncio.new_event_loop()
     started = threading.Event()
 
@@ -648,8 +647,6 @@ def global_args(pd_ports):
                     "host": "127.0.0.1",
                     "pd_disaggregation": {
                         "enabled": True,
-                        "coordination_port": pd_ports["coordination_port"],
-                        "metadata_sync_port": pd_ports["metadata_port"],
                         "bootstrap_port": pd_ports["bootstrap_port"],
                         "kv_transfer": {
                             "decode_wait_timeout_s": 5.0,

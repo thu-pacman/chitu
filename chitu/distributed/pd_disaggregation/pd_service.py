@@ -13,7 +13,6 @@ PD disaggregation Service
 import asyncio
 import logging
 from typing import Optional, Tuple
-import os
 import threading
 
 import msgpack
@@ -42,6 +41,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
 from chitu.boot.tcp_ip import get_port_from_zmq_socket
 from chitu.dp_token_sender import start_dp_token_manager
 from chitu.global_vars import get_global_args
+from chitu.distributed.coordinator import get_endpoint
 from chitu.hooks import (
     DPTokenSink,
     MooncakeKVTransferHook,
@@ -317,16 +317,7 @@ class PDSchedulerService:
         # Initialize DP token manager for streaming tokens back to Router
         # Only needed for Decode-only or Unified mode. Prefill-only does NOT send tokens.
         if self.pd_mode in (PDSchedulerMode.DECODE_ONLY, PDSchedulerMode.UNIFIED):
-            dp_cfg = self.args.multi_inst
-            router_host = self.args.serve.host
-            router_token_port = dp_cfg.router.token_port
-            connect_host = (
-                "localhost" if router_host in ["0.0.0.0", "::", ""] else router_host
-            )
-            router_address = f"tcp://{connect_host}:{router_token_port}"
-            token_manager = await start_dp_token_manager(
-                self.local_instance_id, router_address
-            )
+            token_manager = await start_dp_token_manager(self.local_instance_id)
             self.scheduler.set_token_manager(token_manager)
             # Inject hooks into executor
             kv_hook = MooncakeKVTransferHook(self.scheduler.kv_manager, "decode")
@@ -450,14 +441,10 @@ class PDSchedulerService:
 
         # Stats reporting socket
         self.stats_socket = self.context.socket(zmq.PUSH)
-        stats_port = self.args.multi_inst.router.stats_port
 
-        router_host = self.args.serve.host
-        if router_host in ["0.0.0.0", "::", "", None]:
-            connect_host = os.environ.get("PD_MASTER_ADDR", "localhost")
-        else:
-            connect_host = router_host
-        self.stats_socket.connect(f"tcp://{connect_host}:{stats_port}")
+        # Get the router stats endpoint from the coordinator, then connect to it.
+        stats_ip, stats_port = get_endpoint("router", "stats_port")
+        self.stats_socket.connect(f"tcp://{stats_ip}:{stats_port}")
 
         logger.info(
             f"bound to request port {request_port}, connected to stats port {stats_port}"
@@ -608,7 +595,6 @@ async def start_pd_worker_service(args, rank: int = 0):
     )
     kv_manager = KVManager(
         kv_cache=None,  # set below
-        host=args.serve.host,
         metadata_buffers=metadata_buffers,
         disaggregation_mode=disaggregation_mode,
     )

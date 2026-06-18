@@ -29,6 +29,7 @@ import torch
 import zmq
 
 from chitu.boot.tcp_ip import get_port_from_zmq_socket, get_local_ip
+from chitu.distributed.coordinator import get_endpoint
 from chitu.global_vars import get_global_args
 from chitu.backend import Backend
 from chitu.task import TaskPool
@@ -421,7 +422,6 @@ class KVManager:
     def __init__(
         self,
         kv_cache: Optional["KVCacheBase"],
-        host: str,
         metadata_buffers: MetadataBuffers,
         disaggregation_mode: DisaggregationMode,
         pd_coordination_service=None,  # Optional PD coordination service
@@ -458,11 +458,14 @@ class KVManager:
             getattr(pd_config, "kv_transfer", None) if pd_config else None
         )
         # Router metadata sync endpoint (the REP socket in PDCoordinationService).
-        # Used to discover the ZMQ port of the Prefill control rank.
-        metadata_port = int(pd_config.metadata_sync_port) if pd_config else 0
-        self._coordination_metadata_addr: Optional[str] = (
-            f"tcp://{host}:{metadata_port}" if metadata_port > 0 else None
-        )
+        # Discover the router's non-wildcard ip and port from the coordinator.
+        if pd_config:
+            meta_ip, meta_port = get_endpoint("router", "metadata_sync_port")
+            self._coordination_metadata_addr: Optional[str] = (
+                f"tcp://{meta_ip}:{meta_port}"
+            )
+        else:
+            self._coordination_metadata_addr = None
 
         # Initialize transfer engine
         self.transfer_engine = MooncakeTransferEngine(

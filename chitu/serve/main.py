@@ -10,10 +10,12 @@ This allows the serve package to be executed as a module: python -m chitu.serve
 from logging import getLogger
 from threading import Thread
 import hydra
+import os
 import torch
 import torch.distributed
 
 import chitu.serve.api_server as api_server
+from chitu.distributed.coordinator import init_coordinator
 from chitu.chitu_main import chitu_init, warmup_engine
 from chitu.profiler import MemoryRecorder
 from chitu.schemas import ServeConfig
@@ -38,6 +40,17 @@ def main(args: ServeConfig):
     """Main entry point for serve module"""
     multi_inst = args.multi_inst
 
+    # We need to get rank here, but torch.distributed is not yet initialized, so we get it directly
+    # from environment variable.
+    rank = int(os.environ["RANK"]) if "RANK" in os.environ else None
+
+    init_coordinator(
+        args.coordinator.host,
+        args.coordinator.port,
+        is_coordinator_host=multi_inst.router.is_router
+        or (not multi_inst.enabled and rank == 0),
+    )
+
     if multi_inst.router.is_router:
         # Use DP Router module
         init_dp_router(args)
@@ -57,7 +70,6 @@ def main(args: ServeConfig):
         rec.install_oom_hook(rec.snapshot_dir)
 
         torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
-        rank = torch.distributed.get_rank()
 
         checkpoint("before warmup_engine")
         warmup_engine(args)

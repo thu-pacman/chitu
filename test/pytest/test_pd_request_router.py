@@ -48,8 +48,6 @@ def _pd_router_config(
     set_default_global_args()
     return RouterConfig(
         is_router=True,
-        stats_port=29600,
-        token_port=29700,
         max_inflight_per_instance=24,
         routing_algorithm=routing_algorithm,
         routing_algorithm_for_decode=routing_algorithm_for_decode,
@@ -61,8 +59,6 @@ def _pd_router_config(
         ],
         pd_disaggregation=PDDisaggregationConfig(
             enabled=True,
-            coordination_port=29800,
-            metadata_sync_port=29801,
         ),
         prefill_schedulers=[
             PrefillSchedulerConfig(

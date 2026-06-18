@@ -346,7 +346,7 @@ mi_node_main() {
     "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
     "infer.cache_type=${MI_CACHE_TYPE}"
     "multi_inst.enabled=True" "multi_inst.router.is_router=False"
-    "serve.host=${ROUTER_IP}" "multi_inst.scheduler_base_host=0.0.0.0"
+    "coordinator.host=${ROUTER_IP}" "multi_inst.scheduler_base_host=0.0.0.0"
     "infer.use_cuda_graph=${MODEL_USE_CUDA_GRAPH}" "infer.schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
     "float_16bit_variant=${MODEL_FLOAT16_VARIANT}"
     "multi_inst.n_insts=${INSTANCE_COUNT}"

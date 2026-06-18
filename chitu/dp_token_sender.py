@@ -16,7 +16,7 @@ import queue
 import zmq
 import os
 
-from chitu.global_vars import get_global_args
+from chitu.distributed.coordinator import get_endpoint
 from chitu.metrics.prometheus_collector import inc_completed_requests, observe_ttft
 from chitu.task import Task
 
@@ -74,17 +74,11 @@ class DPTokenSender:
         self.socket.setsockopt(zmq.CONFLATE, conflate)
         self.socket.setsockopt(zmq.TCP_KEEPALIVE, tcp_keepalive)
 
-        router_host = get_global_args().serve.host
-        router_token_base_port = get_global_args().multi_inst.router.token_port
-        router_addr = self.router_address
-        if router_host and router_token_base_port is not None:
-            port = int(router_token_base_port) + int(self.instance_id)
-            router_addr = f"tcp://{router_host}:{port}"
-            logger.info(f"port: {port}, router_addr: {router_addr}")
+        # Get this instance's token endpoint from the coordinator, then connect to it.
+        ip, port = get_endpoint("router", f"token_port_{self.instance_id}")
+        router_addr = f"tcp://{ip}:{port}"
         self.socket.connect(router_addr)
-        logger.info(
-            f"[DPTokenSender] group={self.instance_id} connect={router_addr} host_cfg={router_host} base_cfg={router_token_base_port}"
-        )
+        logger.info(f"[DPTokenSender] group={self.instance_id} connect={router_addr}")
         if self._send_queue is None:
             self._send_queue = queue.Queue(maxsize=10000)
 

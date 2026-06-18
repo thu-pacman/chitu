@@ -129,8 +129,8 @@ srun $SRUN_PARTITION_ARG \
         trap cleanup INT TERM
 
         # Common args (multi_inst.n_insts=2 means Router only sees 1P + 1D)
-        # COMMON_ARGS=\"--config-name=pd_disagg_serve_config models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=4096 infer.max_batch_size=64 request.max_new_tokens=4096 multi_inst.enabled=True multi_inst.router.is_router=False serve.host=\$ROUTER_IP multi_inst.scheduler_base_host=0.0.0.0 infer.use_cuda_graph=True infer.schedule_overlap=False float_16bit_variant=bfloat16 multi_inst.n_insts=2\"
-        COMMON_ARGS=\"--config-name=pd_disagg_serve_config models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=6144 infer.max_batch_size=288 request.max_new_tokens=4096 multi_inst.enabled=True multi_inst.router.is_router=False serve.host=\$ROUTER_IP multi_inst.scheduler_base_host=0.0.0.0 infer.use_cuda_graph=True infer.schedule_overlap=False float_16bit_variant=bfloat16 multi_inst.n_insts=2\"
+        # COMMON_ARGS=\"--config-name=pd_disagg_serve_config models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=4096 infer.max_batch_size=64 request.max_new_tokens=4096 multi_inst.enabled=True multi_inst.router.is_router=False coordinator.host=\$ROUTER_IP multi_inst.scheduler_base_host=0.0.0.0 infer.use_cuda_graph=True infer.schedule_overlap=False float_16bit_variant=bfloat16 multi_inst.n_insts=2\"
+        COMMON_ARGS=\"--config-name=pd_disagg_serve_config models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=6144 infer.max_batch_size=288 request.max_new_tokens=4096 multi_inst.enabled=True multi_inst.router.is_router=False coordinator.host=\$ROUTER_IP multi_inst.scheduler_base_host=0.0.0.0 infer.use_cuda_graph=True infer.schedule_overlap=False float_16bit_variant=bfloat16 multi_inst.n_insts=2\"
 
         if [ \"\$SLURM_PROCID\" = \"0\" ]; then
             # === Node 0: Router + Prefill (TP4+PP2) ===

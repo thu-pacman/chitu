@@ -72,7 +72,6 @@ def test_pd_dp_shard_round_robin():
                     "host": "127.0.0.1",
                     "pd_disaggregation": {
                         "enabled": True,
-                        "metadata_sync_port": 0,
                         "bootstrap_port": 0,
                     },
                 },
