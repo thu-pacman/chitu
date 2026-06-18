@@ -164,7 +164,7 @@ def test_warmup_engine_emits_impl_summary_after_auto_set(monkeypatch):
     )
 
     args = SimpleNamespace(
-        dp_config=SimpleNamespace(
+        multi_inst=SimpleNamespace(
             router=SimpleNamespace(
                 is_router=False,
                 pd_disaggregation=SimpleNamespace(enabled=False),

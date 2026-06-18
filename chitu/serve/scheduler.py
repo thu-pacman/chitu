@@ -49,7 +49,7 @@ def init_dp_scheduler(args, rank):
     warmup_engine(args)
 
     # Check if PD disaggregation is enabled
-    pd_enabled = args.dp_config.router.pd_disaggregation.enabled
+    pd_enabled = args.multi_inst.router.pd_disaggregation.enabled
 
     # Determine actual distributed rank
     actual_rank = (
@@ -94,4 +94,4 @@ def init_dp_scheduler(args, rank):
     t.start()
 
     # Run Enhanced Scheduler ZMQ service on the main asyncio loop
-    asyncio.run(start_enhanced_scheduler_service(actual_rank, args.dp_config, args))
+    asyncio.run(start_enhanced_scheduler_service(actual_rank, args.multi_inst, args))

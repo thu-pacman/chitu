@@ -40,6 +40,8 @@ from chitu.metrics.prometheus_collector import (
     observe_pd_stage,
 )
 from chitu.global_vars import get_global_args
+from chitu.distributed.coordinator import set_endpoint
+from chitu.boot.tcp_ip import get_local_ip
 from chitu.task import UserRequest
 from chitu.testing.pd_utils import PDTestRunner
 
@@ -89,17 +91,7 @@ class PDRequestRouter(RequestRouter):
             self.decode_schedulers: dict[int, dict] = {}  # local_instance_id -> info
 
             # PD coordination service
-            if hasattr(config.pd_disaggregation, "coordination_port"):
-                coordination_port = config.pd_disaggregation.coordination_port
-                metadata_sync_port = config.pd_disaggregation.metadata_sync_port
-                self.pd_coordination_service = PDCoordinationService(
-                    coordination_port, metadata_sync_port
-                )
-            else:
-                self.pd_coordination_service = None
-                logger.warning(
-                    "pd coordination service not configured, using simplified mode"
-                )
+            self.pd_coordination_service = PDCoordinationService()
 
             # Parse Prefill and Decode Scheduler configs
             self._parse_pd_scheduler_configs()
@@ -292,9 +284,12 @@ class PDRequestRouter(RequestRouter):
         # Create statistics collection socket
         if not self.stats_socket:
             self.stats_socket = self.context.socket(zmq.PULL)
-            stats_address = f"tcp://*:{self.config.stats_port}"
-            self.stats_socket.bind(stats_address)
-            logger.info(f"listening for stats: {stats_address}")
+            # Bind the TCP server to a random port on the non-wildcard ip, then
+            # register it in the coordinator.
+            stats_ip = get_local_ip()
+            stats_port = self.stats_socket.bind_to_random_port(f"tcp://{stats_ip}")
+            set_endpoint("router", "stats_port", stats_ip, stats_port)
+            logger.info(f"listening for stats: tcp://{stats_ip}:{stats_port}")
 
     def _init_prefill_policy_shadow_caches(self) -> None:
         """Mirror RequestRouter._init_sockets prefix-cache bookkeeping for each prefill slot."""
@@ -798,7 +793,7 @@ class PDRequestRouter(RequestRouter):
             ("decode", did) for did in expected_decode
         }
 
-        dp_router_config = get_global_args().dp_config.router
+        dp_router_config = get_global_args().multi_inst.router
         launch_timeout = dp_router_config.launch_timeout
 
         logger.info(

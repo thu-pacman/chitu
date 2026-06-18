@@ -388,7 +388,7 @@ Options:
 | `--online` | Make a smaller bundle without the container image inside. Users will pull the image from an online resource. |
 | `-h`, `--help` | Show the help message. |
 
-The output is a self-contained AppImage executable, which can be run directly. All its arguments are defined in [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml).
+The output is a self-contained AppImage executable, which can be run directly. All its arguments are defined in [Chitu CLI Arguments](CLI.md).
 
 ```bash
 ./<output_file> [arguments]...
@@ -396,7 +396,7 @@ The output is a self-contained AppImage executable, which can be run directly. A
 
 ## Running and Testing without Starting a Service
 
-The following command run with settings in [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml). Definitions of all runtime config fields of chitu can be checked in this file. You may override them with command line arguments (See [Hydra documents](https://hydra.cc/docs/advanced/override_grammar/basic/) for details). You may also override the entire config file with environment variable `CHITU_CONFIG_PATH=<path/to/config/directory>` and `CHITU_CONFIG_NAME=<your_config_file.yaml>`. The overriding config directory should contain all the config files directly or indirectly nested, including model config files.
+The following command run with settings in [Chitu CLI Arguments](CLI.md). Definitions of all runtime config fields of chitu can be checked in that document. You may override them with command line arguments (See [Hydra documents](https://hydra.cc/docs/advanced/override_grammar/basic/) for details). You may also override the entire config file with environment variable `CHITU_CONFIG_PATH=<path/to/config/directory>` and `CHITU_CONFIG_NAME=<your_config_file.yaml>`. The overriding config directory should contain all the config files directly or indirectly nested, including model config files.
 
 ### Example: Running DeepSeek-R1
 
@@ -535,7 +535,7 @@ Example 2 (interactive with node 0):
 
 After building a self-contained executable (see [Build for Self-Contained Executable Distribution](#build-for-self-contained-executable-distribution)), you can launch it across multiple nodes with a single command. The executable bundles the container image (Docker or Apptainer) and uses `srun` to dispatch the job to all nodes.
 
-All arguments are defined in [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml). The most relevant options for multi-node launching are under the `boot` section:
+All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant options for multi-node launching are under the `boot` section:
 
 | Parameter | Default | Description |
 | :--- | :------ | :--- |

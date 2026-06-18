@@ -224,13 +224,12 @@ class KVPoll(Enum):
 
 运行在 Router 进程中，负责服务发现和meta data同步。
 
-**两个 ZMQ Socket**
+**ZMQ Socket**
 
 
-| Socket              | 类型   | 端口    | 用途                                                |
-| ------------------- | ---- | ----- | ------------------------------------------------- |
-| coordination_socket | PULL | 29800 | 接收 P/D 的协调消息（prefill_complete, decode_complete 等） |
-| metadata_socket     | REP  | 29801 | 同步meta data请求（endpoint注册/查询）                      |
+| Socket          | 类型  | 端口            | 用途                            |
+| --------------- | --- | ------------- | ----------------------------- |
+| metadata_socket | REP | 随机（动态分配） | 同步meta data请求（endpoint注册/查询） |
 
 
 **元数据同步请求类型**
@@ -302,28 +301,23 @@ defaults:
   - serve_config      # 继承模型/推理/校验等通用配置
   - _self_
 
-dp_config:
+multi_inst:
   enabled: True
   scheduler_base_host: 0.0.0.0
   scheduler_base_port: 29610       # Scheduler ZMQ 基础端口
-  dp_size: 2                       # P + D 总实例数（启动时覆盖）
-  dp_id: 0                         # 当前进程的 DP ID（启动时覆盖）
+  n_insts: 2                       # P + D 总实例数（启动时覆盖）
+  inst_id: 0                       # 当前进程的实例 ID（启动时覆盖）
 
   router:
     is_router: True                # Router 进程设为 True，P/D 设为 False
     host: 0.0.0.0
     port: 21003                    # HTTP 推理入口端口
-    stats_port: 29600              # 统计上报端口
-    token_port: 29700              # Token 回传端口
     routing_algorithm: "power_of_two_choices"
 
     pd_disaggregation:
       enabled: True
       log_verbose: False
-      coordination_port: 29800     # PDCoordination 协调端口
-      metadata_sync_port: 29801    # 元数据同步端口
       kv_transfer_backend: "mooncake"
-      ib_device: "mlx5_0"         # RDMA 设备名
       bootstrap_port: 8080         # Bootstrap HTTP 端口
 
       kv_transfer:
@@ -348,7 +342,7 @@ dp_config:
         scheduling_strategy: "immediate"
 ```
 
-启动脚本 `srun_pd_disagg_base_apptainer.sh` 会根据 `--prefill` / `--decode` 参数自动生成 `prefill_schedulers=[{host:...,port:...},...]` 和 `decode_schedulers=[...]` 的 Hydra override 传给 Router，同时为每个 P/D 实例设置对应的 `dp_config.dp_id` 和 `dp_config.scheduler_base_port`。`--pd-spec` 中的参数（如 `decode_wait_timeout_s`）会覆盖上面 `kv_transfer` 下的默认值。
+启动脚本 `srun_pd_disagg_base_apptainer.sh` 会根据 `--prefill` / `--decode` 参数自动生成 `prefill_schedulers=[{host:...,port:...},...]` 和 `decode_schedulers=[...]` 的 Hydra override 传给 Router，同时为每个 P/D 实例设置对应的 `multi_inst.inst_id` 和 `multi_inst.scheduler_base_port`。`--pd-spec` 中的参数（如 `decode_wait_timeout_s`）会覆盖上面 `kv_transfer` 下的默认值。
 
 ### 端口矩阵（2P3D 示例）
 
@@ -532,7 +526,7 @@ observe_stage_duration("decode", "kv_recv", duration_s)
 | `created pd request: <rid> -> P{k}-D{m}` | Router            | 请求分配到具体 P/D     |
 
 
-启用详细日志：配置 `dp_config.router.pd_disaggregation.log_verbose=True`。
+启用详细日志：配置 `multi_inst.router.pd_disaggregation.log_verbose=True`。
 
 ### Prometheus Server 集成
 
@@ -570,7 +564,7 @@ Router 进程可选启动内置的 Prometheus Server（`PrometheusServerManager`
 | 现象                    | 排查方向                                                                        |
 | --------------------- | --------------------------------------------------------------------------- |
 | P/D 启动卡在 Bootstrap 连接 | 确认 Router 已启动 Bootstrap（:8080）；`PD_MASTER_ADDR` 指向 Router IP，非回环地址          |
-| Decode 长时间 WAITING    | 检查 Prefill 是否收到 TRANSFER_INFO；查看 Prefill 传输线程日志；确认 RDMA 设备 `ib_device` 配置正确 |
+| Decode 长时间 WAITING    | 检查 Prefill 是否收到 TRANSFER_INFO；查看 Prefill 传输线程日志；确认 RDMA 设备已正确检测（见 `chitu/distributed/infiniband.py`） |
 | RDMA "Bad address"    | 确认 `register_buffer_to_engine()` 在 CacheManager 注入后调用；检查各层 base_ptr/len 无重叠 |
 | Router 序列化报错          | 确保请求 `messages` 是纯 dict 列表（非 pydantic 对象）                                   |
 | 同节点多进程端口冲突            | 为每个 torchrun 进程指定不同的 `scheduler_base_port` 和 `--master_port`                |

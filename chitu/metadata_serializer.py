@@ -559,8 +559,8 @@ class MetadataSerializer:
                 return MetadataConfig.for_special()
 
         pd_enabled = (
-            get_global_args().dp_config.router.pd_disaggregation.enabled
-            if getattr(get_global_args(), "dp_config", None) is not None
+            get_global_args().multi_inst.router.pd_disaggregation.enabled
+            if getattr(get_global_args(), "multi_inst", None) is not None
             else False
         )
         if tasks.task_type == TaskType.Prefill:

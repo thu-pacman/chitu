@@ -125,7 +125,7 @@ class SchedulerConfig:
 
 
 @dataclass
-class DpAddressesConfig:
+class InstAddressesConfig:
     host: str = MISSING
     port: int = MISSING
 
@@ -169,10 +169,7 @@ class PDDisaggregationConfig:
     """PD disaggregation configuration"""
 
     enabled: bool = False
-    coordination_port: int = 29800  # P-D coordination port
-    metadata_sync_port: int = 29801  # metadata sync port
     kv_transfer_backend: str = "mooncake"  # kv transfer backend: mooncake, nccl
-    ib_device: Optional[str] = "mlx5_0"  # IB device name
     bootstrap_port: int = 8080  # Bootstrap server port
     # High-frequency PD logs (PD_QUEUE/PD_STATS/PD_TRACE)
     log_verbose: bool = False
@@ -204,8 +201,6 @@ class DecodeSchedulerConfig:
 @dataclass
 class RouterConfig:
     is_router: bool = MISSING
-    stats_port: int = MISSING
-    token_port: int = MISSING
     max_inflight_per_instance: int = 24
     routing_algorithm: str = MISSING
     routing_algorithm_for_decode: str = "power_of_two_choices"
@@ -214,7 +209,7 @@ class RouterConfig:
     router_load_penalty_weight: float = 0.02
     router_evict_buffer_size: int = 64
     launch_timeout: float = 3600.0  # PD_LAUNCH_TIMEOUT
-    dp_addresses: list[DpAddressesConfig] = MISSING
+    inst_addresses: list[InstAddressesConfig] = MISSING
     # PD disaggregation configuration
     pd_disaggregation: PDDisaggregationConfig = field(
         default_factory=PDDisaggregationConfig
@@ -224,12 +219,18 @@ class RouterConfig:
 
 
 @dataclass
-class DpConfig:
+class CoordinatorConfig:
+    host: str = MISSING
+    port: int = MISSING
+
+
+@dataclass
+class MultiInstConfig:
     enabled: bool = MISSING
     scheduler_base_host: str = MISSING
     scheduler_base_port: int = MISSING
-    dp_size: int = MISSING
-    dp_id: int = MISSING
+    n_insts: int = MISSING
+    inst_id: int = MISSING
     router: RouterConfig = MISSING
 
 
@@ -353,7 +354,8 @@ class ServeConfig(ServeConfigLegacy):
     infer: InferConfig = field(default_factory=InferConfig)
     request: RequestConfig = field(default_factory=RequestConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
-    dp_config: DpConfig = field(default_factory=DpConfig)
+    coordinator: CoordinatorConfig = field(default_factory=CoordinatorConfig)
+    multi_inst: MultiInstConfig = field(default_factory=MultiInstConfig)
     pd_test: PDTestConfig = field(default_factory=PDTestConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)

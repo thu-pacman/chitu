@@ -36,7 +36,7 @@ def setup_global_args():
                     "mtp_size": 1,
                     "dp_size": 1,
                 },
-                "dp_config": {
+                "multi_inst": {
                     "enabled": True,
                     "router": {
                         "pd_disaggregation": {

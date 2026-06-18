@@ -392,7 +392,7 @@ apptainer build <your_apptainer_image.sif> <your_docker_image>
 | `--online` | 生成不包含容器镜像的更小的包。用户将从在线资源拉取镜像。 |
 | `-h`, `--help` | 显示帮助信息。 |
 
-输出是一个自包含的 AppImage 可执行文件，可直接运行。其中所有的参数均在 [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml) 定义。
+输出是一个自包含的 AppImage 可执行文件，可直接运行。其中所有的参数均在 [赤兔 CLI 参数](../en/CLI.md) 定义。
 
 ```bash
 ./<output_file> [参数]...
@@ -402,7 +402,7 @@ apptainer build <your_apptainer_image.sif> <your_docker_image>
 
 **如果您与他人共享测试环境，请合理使用作业管理工具进行资源分配，避免资源冲突。**
 
-默认的配置文件为 [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml) 。此文件中包含了赤兔所使用的所有运行时配置项的定义。您可以使用命令行参数覆盖相关的参数设置（参考 [Hydra 文档](https://hydra.cc/docs/advanced/override_grammar/basic/)），也可以使用环境变量 `CHITU_CONFIG_PATH=<path/to/config/directory>` 及 `CHITU_CONFIG_NAME=<your_config_file.yaml>` 另行指定配置文件。需要提醒的是，`chitu/config/models/` 目录中的 yaml 文件并非完整的配置文件，切勿直接将 `CHITU_CONFIG_NAME` 指向它们。新指定的配置文件目录应该包含所有直接或间接被使用的配置文件，包括模型配置文件。
+赤兔所使用的所有运行时配置项的定义可参考 [赤兔 CLI 参数](../en/CLI.md)。您可以使用命令行参数覆盖相关的参数设置（参考 [Hydra 文档](https://hydra.cc/docs/advanced/override_grammar/basic/)），也可以使用环境变量 `CHITU_CONFIG_PATH=<path/to/config/directory>` 及 `CHITU_CONFIG_NAME=<your_config_file.yaml>` 另行指定配置文件。需要提醒的是，`chitu/config/models/` 目录中的 yaml 文件并非完整的配置文件，切勿直接将 `CHITU_CONFIG_NAME` 指向它们。新指定的配置文件目录应该包含所有直接或间接被使用的配置文件，包括模型配置文件。
 
 ### 示例：运行 DeepSeek-R1
 
@@ -541,7 +541,7 @@ torchrun --nnodes 1 \
 
 在构建自包含可执行文件后（参见 [构建自包含可执行文件分发产物](#构建自包含可执行文件分发产物)），你可以用一条命令在多个节点上启动它。该可执行文件捆绑了容器镜像（Docker 或 Apptainer），并使用 `srun` 将任务分发到所有节点。
 
-所有参数都定义在 [`chitu/config/serve_config.yaml`](../../chitu/config/serve_config.yaml) 中。与多节点启动最相关的选项位于 `boot` 部分：
+所有参数都定义在 [赤兔 CLI 参数](../en/CLI.md) 中。与多节点启动最相关的选项位于 `boot` 部分：
 
 | 参数 | 默认值 | 说明 |
 | :--- | :------ | :--- |

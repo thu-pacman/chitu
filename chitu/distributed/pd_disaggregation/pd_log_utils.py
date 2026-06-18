@@ -24,8 +24,8 @@ def _get_pd_cfg():
         args = get_global_args()
     except Exception:
         return None
-    dp_config = getattr(args, "dp_config", None)
-    router = getattr(dp_config, "router", None)
+    multi_inst = getattr(args, "multi_inst", None)
+    router = getattr(multi_inst, "router", None)
     return getattr(router, "pd_disaggregation", None)
 
 

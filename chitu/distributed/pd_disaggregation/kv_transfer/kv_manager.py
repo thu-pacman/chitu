@@ -29,10 +29,12 @@ import torch
 import zmq
 
 from chitu.boot.tcp_ip import get_port_from_zmq_socket, get_local_ip
+from chitu.distributed.coordinator import get_endpoint
 from chitu.global_vars import get_global_args
 from chitu.backend import Backend
 from chitu.task import TaskPool
 from chitu.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
+from chitu.distributed.infiniband import detect_ib_devices
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
 )
@@ -420,7 +422,6 @@ class KVManager:
     def __init__(
         self,
         kv_cache: Optional["KVCacheBase"],
-        host: str,
         metadata_buffers: MetadataBuffers,
         disaggregation_mode: DisaggregationMode,
         pd_coordination_service=None,  # Optional PD coordination service
@@ -434,7 +435,7 @@ class KVManager:
         self.metadata_buffers = metadata_buffers
         self.pd_coordination_service = pd_coordination_service
         # instance_id identifies each Prefill/Decode instance (Bootstrap engine_rank).
-        self.instance_id = int(args.dp_config.dp_id)
+        self.instance_id = int(args.multi_inst.inst_id)
         # Target Prefill engine_rank for each request (set by the Decode scheduler).
         self.prefill_target_rank_by_room: dict[UUID, int] = {}
         # Per-request trace mapping: room(UUID) -> request_id(str).
@@ -444,34 +445,27 @@ class KVManager:
 
         # Get PD disaggregation config
         pd_config = (
-            args.dp_config.router.pd_disaggregation
-            if hasattr(args.dp_config.router, "pd_disaggregation")
+            args.multi_inst.router.pd_disaggregation
+            if hasattr(args.multi_inst.router, "pd_disaggregation")
             else None
         )
-        ib_device = pd_config.ib_device if pd_config else None
-        # Support per-rank IB device selection via comma-separated list.
-        # e.g. ib_device: "mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_0,mlx5_1,mlx5_2,mlx5_3"
-        # maps each local GPU rank to the IB NIC with the best NUMA affinity.
-        # If only a single device is given all ranks use it (legacy behavior).
-        if ib_device and "," in ib_device:
-            local_rank = torch.cuda.current_device()
-            device_list = [d.strip() for d in ib_device.split(",") if d.strip()]
-            ib_device = device_list[local_rank % len(device_list)]
-            logger.info(
-                "Per-rank IB device selection: local_rank=%d -> ib_device=%s",
-                local_rank,
-                ib_device,
-            )
+        # Auto-detect the active IB device(s) with the highest rate. This may be
+        # a comma-separated list of multiple NICs, which MooncakeTransferEngine
+        # accepts directly.
+        ib_device = detect_ib_devices()
         bootstrap_port = pd_config.bootstrap_port if pd_config else 29888
         self.kv_transfer_cfg = (
             getattr(pd_config, "kv_transfer", None) if pd_config else None
         )
         # Router metadata sync endpoint (the REP socket in PDCoordinationService).
-        # Used to discover the ZMQ port of the Prefill control rank.
-        metadata_port = int(pd_config.metadata_sync_port) if pd_config else 0
-        self._coordination_metadata_addr: Optional[str] = (
-            f"tcp://{host}:{metadata_port}" if metadata_port > 0 else None
-        )
+        # Discover the router's non-wildcard ip and port from the coordinator.
+        if pd_config:
+            meta_ip, meta_port = get_endpoint("router", "metadata_sync_port")
+            self._coordination_metadata_addr: Optional[str] = (
+                f"tcp://{meta_ip}:{meta_port}"
+            )
+        else:
+            self._coordination_metadata_addr = None
 
         # Initialize transfer engine
         self.transfer_engine = MooncakeTransferEngine(

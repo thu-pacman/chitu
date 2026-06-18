@@ -96,10 +96,6 @@ MODEL_SCHEDULE_OVERLAP="${MODEL_SCHEDULE_OVERLAP:-False}"
 # Router
 PD_CONFIG_NAME="${PD_CONFIG_NAME:-pd_disagg_serve_config}"
 PD_ROUTER_PORT="${PD_ROUTER_PORT:-}"
-PD_ROUTER_STATS_PORT="${PD_ROUTER_STATS_PORT:-}"
-PD_ROUTER_TOKEN_PORT="${PD_ROUTER_TOKEN_PORT:-}"
-PD_COORDINATION_PORT="${PD_COORDINATION_PORT:-}"
-PD_METADATA_SYNC_PORT="${PD_METADATA_SYNC_PORT:-}"
 PD_BOOTSTRAP_PORT="${PD_BOOTSTRAP_PORT:-}"
 PD_CACHE_TYPE="${PD_CACHE_TYPE:-paged}"
 ROUTER_PREFILL_MAX_BATCH_SIZE="${ROUTER_PREFILL_MAX_BATCH_SIZE:-32}"
@@ -168,7 +164,7 @@ parse_model_spec() {
 # Keys with '.' are passed through as Hydra overrides directly.
 parse_pd_spec() {
   local spec="$1"; [ -z "${spec}" ] && return 0
-  local pfx="dp_config.router.pd_disaggregation.kv_transfer"
+  local pfx="multi_inst.router.pd_disaggregation.kv_transfer"
   IFS=',' read -r -a _kvs <<< "${spec}"
   for _kv in "${_kvs[@]}"; do
     [ -n "${_kv}" ] || continue
@@ -234,18 +230,6 @@ apply_job_port_defaults() {
   PD_JOB_PORT_OFFSET="$(calc_job_port_offset "${job_id}")"
   if [ -z "${PD_ROUTER_PORT}" ]; then
     PD_ROUTER_PORT=$((21003 + PD_JOB_PORT_OFFSET))
-  fi
-  if [ -z "${PD_ROUTER_STATS_PORT}" ]; then
-    PD_ROUTER_STATS_PORT=$((29600 + PD_JOB_PORT_OFFSET))
-  fi
-  if [ -z "${PD_ROUTER_TOKEN_PORT}" ]; then
-    PD_ROUTER_TOKEN_PORT=$((29700 + PD_JOB_PORT_OFFSET))
-  fi
-  if [ -z "${PD_COORDINATION_PORT}" ]; then
-    PD_COORDINATION_PORT=$((29800 + PD_JOB_PORT_OFFSET))
-  fi
-  if [ -z "${PD_METADATA_SYNC_PORT}" ]; then
-    PD_METADATA_SYNC_PORT=$((29801 + PD_JOB_PORT_OFFSET))
   fi
   if [ -z "${PD_BOOTSTRAP_PORT}" ]; then
     PD_BOOTSTRAP_PORT=$((8080 + PD_JOB_PORT_OFFSET))
@@ -426,147 +410,6 @@ split_overrides_to_array() {
   for _x in "${_out[@]}"; do [ -n "${_x}" ] && printf '%s\n' "${_x}"; done
 }
 
-pd_detect_mooncake_gpu_ib_map() {
-  local active_cards="$1"
-  local topo_output=""
-
-  [ -n "${active_cards}" ] || return 1
-  command -v nvidia-smi >/dev/null 2>&1 || return 1
-
-  topo_output="$(nvidia-smi topo -m 2>/dev/null | sed -r 's/\x1B\[[0-9;]*[[:alpha:]]//g')"
-  [ -n "${topo_output}" ] || return 1
-
-  printf '%s\n' "${topo_output}" | awk -v active_cards="${active_cards}" '
-    function trim(s) {
-      sub(/^[[:space:]]+/, "", s)
-      sub(/[[:space:]]+$/, "", s)
-      return s
-    }
-    function affinity_score(rel) {
-      if (rel == "PIX") return 0
-      if (rel == "PXB") return 1
-      if (rel == "PHB") return 2
-      if (rel == "NODE") return 3
-      if (rel == "SYS") return 4
-      return 100
-    }
-    BEGIN {
-      n_cards = split(active_cards, cards, ",")
-      for (i = 1; i <= n_cards; i++) {
-        card = trim(cards[i])
-        if (card != "") active[card] = 1
-      }
-    }
-    /GPU0/ && /NIC0/ && /CPU/ {
-      nic_count = 0
-      matrix_count = 0
-      for (i = 1; i <= NF; i++) {
-        if ($i ~ /^(GPU[0-9]+|NIC[0-9]+)$/) {
-          matrix_count++
-          if ($i ~ /^NIC[0-9]+$/) {
-            nic_count++
-            nic_label[nic_count] = $i
-            nic_matrix_pos[nic_count] = matrix_count
-          }
-        }
-        if ($i == "CPU") break
-      }
-      next
-    }
-    /^GPU[0-9]+[[:space:]]+/ {
-      gpu_id = substr($1, 4) + 0
-      if (gpu_id > max_gpu) max_gpu = gpu_id
-      for (i = 1; i <= nic_count; i++) {
-        field_idx = nic_matrix_pos[i] + 1
-        nic_rel[gpu_id, nic_label[i]] = $(field_idx)
-      }
-      next
-    }
-    /^[[:space:]]*NIC[0-9]+:/ {
-      legend = $1
-      sub(/:$/, "", legend)
-      nic_to_device[legend] = $2
-      next
-    }
-    END {
-      if (nic_count == 0) exit 1
-
-      for (gpu_id = 0; gpu_id <= max_gpu; gpu_id++) {
-        best_score = 1000
-        candidate_count = 0
-        delete candidates
-
-        for (i = 1; i <= nic_count; i++) {
-          device = nic_to_device[nic_label[i]]
-          if (!(device in active)) continue
-
-          rel = nic_rel[gpu_id, nic_label[i]]
-          score = affinity_score(rel)
-          if (score < best_score) {
-            best_score = score
-            candidate_count = 1
-            candidates[1] = device
-          } else if (score == best_score) {
-            candidate_count++
-            candidates[candidate_count] = device
-          }
-        }
-
-        if (candidate_count == 0) continue
-
-        chosen = candidates[1]
-        if (gpu_id % 2 == 1 && resolved[gpu_id - 1] != "") {
-          for (i = 1; i <= candidate_count; i++) {
-            if (candidates[i] == resolved[gpu_id - 1]) {
-              chosen = candidates[i]
-              break
-            }
-          }
-        }
-
-        resolved[gpu_id] = chosen
-        print gpu_id, chosen
-      }
-    }
-  '
-}
-
-pd_detect_mooncake_ib_devices_for_gpu_list() {
-  local gpu_list="$1"
-  local gpu_ib_map="${PD_GPU_IB_DEVICE_MAP:-}"
-  local -A gpu_to_ib=()
-  local -a gpus=()
-  local -a ib_devices=()
-  local gpu_id=""
-  local ib_device=""
-  local old_ifs="$IFS"
-
-  [ -n "${gpu_list}" ] || return 1
-  [ -n "${gpu_ib_map}" ] || return 1
-
-  while read -r gpu_id ib_device; do
-    [ -n "${gpu_id}" ] && [ -n "${ib_device}" ] || continue
-    gpu_to_ib["${gpu_id}"]="${ib_device}"
-  done <<< "${gpu_ib_map}"
-
-  IFS=','
-  read -r -a gpus <<< "${gpu_list// /}"
-  IFS="${old_ifs}"
-
-  for gpu_id in "${gpus[@]}"; do
-    [ -n "${gpu_id}" ] || continue
-    ib_device="${gpu_to_ib[${gpu_id}]:-}"
-    [ -n "${ib_device}" ] || return 1
-    ib_devices+=("${ib_device}")
-  done
-
-  [ "${#ib_devices[@]}" -gt 0 ] || return 1
-
-  IFS=','
-  printf '%s\n' "${ib_devices[*]}"
-  IFS="${old_ifs}"
-}
-
 ################################################################################
 # Per-node worker
 ################################################################################
@@ -581,20 +424,6 @@ pd_node_main() {
 
   local script_dir
   script_dir="$(dirname "${THIS_SCRIPT}")"
-
-  PD_ACTIVE_IB_CARDS="${NCCL_IB_HCA:-}"
-  PD_GPU_IB_DEVICE_MAP=""
-  if [ -n "${PD_ACTIVE_IB_CARDS}" ]; then
-    if PD_GPU_IB_DEVICE_MAP="$(pd_detect_mooncake_gpu_ib_map "${PD_ACTIVE_IB_CARDS}")"; then
-      echo "Detected GPU/IB topology map for Mooncake:" >&2
-      while read -r _gpu_id _ib_device; do
-        [ -n "${_gpu_id}" ] && [ -n "${_ib_device}" ] || continue
-        echo "  GPU${_gpu_id} -> ${_ib_device}" >&2
-      done <<< "${PD_GPU_IB_DEVICE_MAP}"
-    else
-      echo "Warning: failed to detect GPU/IB topology map for Mooncake" >&2
-    fi
-  fi
 
   # 从环境恢复序列化的数组
   COMMON_OVERRIDES=()
@@ -658,29 +487,26 @@ pd_node_main() {
     _ip="$(to_ip "${NODE_ARR[${PREFILL_START_NODE[i]}]}")"
     prefill_list+=("{host:${_ip},port:${PREFILL_PORT[i]},max_batch_size:${ROUTER_PREFILL_MAX_BATCH_SIZE},max_total_tokens:${ROUTER_PREFILL_MAX_TOTAL_TOKENS},batching_strategy:${ROUTER_PREFILL_BATCHING_STRATEGY}}")
   done
-  PD_PREFILL_SCHEDULERS_OVERRIDE="dp_config.router.prefill_schedulers=[$(IFS=,; echo "${prefill_list[*]}")]"
+  PD_PREFILL_SCHEDULERS_OVERRIDE="multi_inst.router.prefill_schedulers=[$(IFS=,; echo "${prefill_list[*]}")]"
 
   decode_list=()
   for i in "${!DECODE_START_NODE[@]}"; do
     _ip="$(to_ip "${NODE_ARR[${DECODE_START_NODE[i]}]}")"
     decode_list+=("{host:${_ip},port:${DECODE_PORT[i]},scheduling_strategy:${ROUTER_DECODE_SCHEDULING_STRATEGY}}")
   done
-  PD_DECODE_SCHEDULERS_OVERRIDE="dp_config.router.decode_schedulers=[$(IFS=,; echo "${decode_list[*]}")]"
+  PD_DECODE_SCHEDULERS_OVERRIDE="multi_inst.router.decode_schedulers=[$(IFS=,; echo "${decode_list[*]}")]"
 
   # Prefill/Decode 共用参数
   COMMON_ARGS=(
     --config-name="${PD_CONFIG_NAME}"
     "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
     "infer.cache_type=${PD_CACHE_TYPE}"
-    "dp_config.enabled=True" "dp_config.router.is_router=False"
-    "serve.host=${ROUTER_IP}" "dp_config.scheduler_base_host=0.0.0.0"
-    "dp_config.router.stats_port=${PD_ROUTER_STATS_PORT}" "dp_config.router.token_port=${PD_ROUTER_TOKEN_PORT}"
-    "dp_config.router.pd_disaggregation.coordination_port=${PD_COORDINATION_PORT}"
-    "dp_config.router.pd_disaggregation.metadata_sync_port=${PD_METADATA_SYNC_PORT}"
-    "dp_config.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
+    "multi_inst.enabled=True" "multi_inst.router.is_router=False"
+    "coordinator.host=${ROUTER_IP}" "multi_inst.scheduler_base_host=0.0.0.0"
+    "multi_inst.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
     "infer.use_cuda_graph=${MODEL_USE_CUDA_GRAPH}" "infer.schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
     "float_16bit_variant=${MODEL_FLOAT16_VARIANT}"
-    "dp_config.dp_size=${PD_TOTAL_INSTANCES}"
+    "multi_inst.n_insts=${PD_TOTAL_INSTANCES}"
     "${PD_PREFILL_SCHEDULERS_OVERRIDE}" "${PD_DECODE_SCHEDULERS_OVERRIDE}"
   )
 
@@ -690,12 +516,9 @@ pd_node_main() {
     ROUTER_CMD=(
       python -m chitu --config-name="${PD_CONFIG_NAME}"
       "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
-      dp_config.enabled=True dp_config.dp_size="${PD_TOTAL_INSTANCES}"
-      dp_config.router.is_router=True serve.port="${PD_ROUTER_PORT}"
-      "dp_config.router.stats_port=${PD_ROUTER_STATS_PORT}" "dp_config.router.token_port=${PD_ROUTER_TOKEN_PORT}"
-      "dp_config.router.pd_disaggregation.coordination_port=${PD_COORDINATION_PORT}"
-      "dp_config.router.pd_disaggregation.metadata_sync_port=${PD_METADATA_SYNC_PORT}"
-      "dp_config.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
+      multi_inst.enabled=True multi_inst.n_insts="${PD_TOTAL_INSTANCES}"
+      multi_inst.router.is_router=True serve.port="${PD_ROUTER_PORT}"
+      "multi_inst.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
     )
     ROUTER_CMD+=("${PD_PREFILL_SCHEDULERS_OVERRIDE}" "${PD_DECODE_SCHEDULERS_OVERRIDE}")
     ROUTER_CMD+=("${COMMON_OVERRIDES[@]}")
@@ -732,19 +555,15 @@ pd_node_main() {
   [ "${#LOCAL_PREFILL_IDX[@]}" -gt 0 ] || [ "${#LOCAL_DECODE_IDX[@]}" -gt 0 ] || \
     die "cannot map SLURM_PROCID=${SLURM_PROCID} to any instance"
 
-  # ── GPU 分配 ──
-  local -a local_gpu_free=()
-  if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
-    IFS=',' read -r -a local_gpu_free <<< "${CUDA_VISIBLE_DEVICES// /}"
-  else
-    for ((g=0; g<PD_GPUS_PER_NODE; g++)); do local_gpu_free+=("${g}"); done
-  fi
+  # ── GPU 分配（相对 GPU ID，始终从 0 开始）──
+  local _gpu_next=0
 
   alloc_gpu_list() {
     local need="$1" __out="$2" k
-    [ "${#local_gpu_free[@]}" -ge "${need}" ] || die "node ${SLURM_PROCID}: need ${need} GPUs, have ${#local_gpu_free[@]}"
+    [ $((_gpu_next + need)) -le "${PD_GPUS_PER_NODE}" ] || \
+      die "node ${SLURM_PROCID}: need ${need} GPUs starting at ${_gpu_next}, exceeds gpus-per-node=${PD_GPUS_PER_NODE}"
     local -a list=()
-    for ((k=0; k<need; k++)); do list+=("${local_gpu_free[0]}"); local_gpu_free=("${local_gpu_free[@]:1}"); done
+    for ((k=0; k<need; k++)); do list+=("${_gpu_next}"); _gpu_next=$((_gpu_next + 1)); done
     printf -v "${__out}" '%s' "$(IFS=,; echo "${list[*]}")"
   }
 
@@ -763,23 +582,6 @@ pd_node_main() {
   LOCAL_PREFILL_GPU_LIST=(); LOCAL_DECODE_GPU_LIST=()
   alloc_gpus_for prefill
   alloc_gpus_for decode
-
-  resolve_instance_mooncake_ib_devices() {
-    local gpu_list="$1"
-    local resolved=""
-
-    if resolved="$(pd_detect_mooncake_ib_devices_for_gpu_list "${gpu_list}")"; then
-      printf '%s\n' "${resolved}"
-      return 0
-    fi
-
-    if [ -n "${PD_MOONCAKE_IB_DEVICE:-}" ]; then
-      printf '%s\n' "${PD_MOONCAKE_IB_DEVICE}"
-      return 0
-    fi
-
-    return 1
-  }
 
   # ── 启动 Prefill/Decode 实例（统一逻辑）──
   LOCAL_PIDS=()
@@ -809,14 +611,6 @@ pd_node_main() {
         _batch_args+=("infer.max_batch_size=${_a_mr[_idx]}")
       fi
 
-      local _mc_ib=""
-      if _mc_ib="$(resolve_instance_mooncake_ib_devices "${_gpu}")"; then
-        echo "Resolved Mooncake IB devices for gpus=${_gpu}: ${_mc_ib}"
-        _ovr+=("dp_config.router.pd_disaggregation.ib_device='${_mc_ib}'")
-      else
-        echo "Warning: failed to resolve Mooncake IB devices for gpus=${_gpu}, leaving ib_device unset" >&2
-      fi
-
       echo "=== ${kind^} ${label^^}${_idx}: rank=${_rank}/${_a_nn[_idx]} master=${_master_addr}:${_a_mpt[_idx]} gpus=${_gpu} ==="
       local -a _CMD=(
         python -m torch.distributed.run
@@ -826,13 +620,14 @@ pd_node_main() {
         "infer.max_seq_len=${_a_msl[_idx]}"
         "${_batch_args[@]}"
         "request.max_new_tokens=${_a_mnt[_idx]}"
-        "dp_config.scheduler_base_port=${_a_pt[_idx]}" "dp_config.dp_id=$((dp_offset + _idx))"
+        "multi_inst.scheduler_base_port=${_a_pt[_idx]}" "multi_inst.inst_id=$((dp_offset + _idx))"
         "scheduler.type=${sched_type}"
         "infer.tp_size=${_a_tp[_idx]}" "infer.pp_size=${_a_pp[_idx]}" "infer.dp_size=${_a_dp[_idx]}" "infer.ep_size=${_a_ep[_idx]}"
+        "infer.device_ids=[${_gpu}]"
         "${COMMON_OVERRIDES[@]}" "${_ovr[@]}"
       )
 
-      apptainer run "${APPTAINER_BASE_ARGS[@]}" --env CUDA_VISIBLE_DEVICES="${_gpu}" "${PD_SIF_FILE}" "${_CMD[@]}" \
+      apptainer run "${APPTAINER_BASE_ARGS[@]}" "${PD_SIF_FILE}" "${_CMD[@]}" \
         > "${LOG_DIR_INNER}/${kind}.${MODEL_NAME_TAG}.${label}${_idx}.node${SLURM_PROCID}.log" 2>&1 &
       LOCAL_PIDS+=("$!")
     done
@@ -965,9 +760,6 @@ export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-}"
 export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-}"
 export NVSHMEM_IB_DEVICE="${NVSHMEM_IB_DEVICE:-}"
 
-# 手工兜底：仅在自动拓扑探测不可用时使用。
-export PD_MOONCAKE_IB_DEVICE="${PD_MOONCAKE_IB_DEVICE:-}"
-
 PD_COMMON_OVERRIDES_STR=""
 for _x in "${COMMON_OVERRIDES[@]}"; do PD_COMMON_OVERRIDES_STR+="${_x}"$'\n'; done
 PD_PREFILL_SPECS_STR=""
@@ -980,7 +772,7 @@ export PD_PREFILL_DEFAULT_SPEC="${PREFILL_DEFAULT_SPEC}" PD_DECODE_DEFAULT_SPEC=
 # ── 打印摘要 ──
 echo "=== PD Disagg (nodes=${PD_NODES} gpus=${PD_GPUS_PER_NODE}) ==="
 echo "router_port=${PD_ROUTER_PORT:-auto} job_port_offset=${PD_JOB_PORT_OFFSET}"
-echo "stats_port=${PD_ROUTER_STATS_PORT} token_port=${PD_ROUTER_TOKEN_PORT} coordination_port=${PD_COORDINATION_PORT} metadata_sync_port=${PD_METADATA_SYNC_PORT} bootstrap_port=${PD_BOOTSTRAP_PORT}"
+echo "bootstrap_port=${PD_BOOTSTRAP_PORT}"
 echo "model=${MODEL_CONFIG}  ckpt=${MODEL_CKPT_DIR}  sif=${PD_SIF_FILE}"
 echo "model: float16=${MODEL_FLOAT16_VARIANT} cuda_graph=${MODEL_USE_CUDA_GRAPH} schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
 echo "instances: prefill=${PREFILL_COUNT} decode=${DECODE_COUNT}"

@@ -304,9 +304,11 @@ class PrometheusMetricsCollector:
         with cls._lock:
             if cls._instance is None:
                 dp_id = get_dp_group().rank_in_group
-                dp_config = getattr(get_global_args(), "dp_config", None)
+                multi_inst = getattr(get_global_args(), "multi_inst", None)
                 instance_id = (
-                    0 if dp_config is None or not dp_config.enabled else dp_config.dp_id
+                    0
+                    if multi_inst is None or not multi_inst.enabled
+                    else multi_inst.inst_id
                 )
                 rank = get_dp_group().global_rank
                 cls._instance = cls(rank, dp_id, instance_id)

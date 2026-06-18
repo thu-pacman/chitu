@@ -106,7 +106,8 @@ def _wait_until(cond, timeout_s: float = 5.0):
 def test_decode_prepare_listener(
     cuda_available,
     global_args,
-    coordination_service,
+    singleton_coordinator,
+    pd_coordination_service,
     init_distributed,
 ):
     device = "cuda"
@@ -114,7 +115,6 @@ def test_decode_prepare_listener(
     meta = MetadataBuffers(size=4)
     kv_manager = KVManager(
         kv_cache=cache,
-        host="127.0.0.1",
         metadata_buffers=meta,
         disaggregation_mode=DisaggregationMode.DECODE,
     )
@@ -168,7 +168,8 @@ def test_decode_prepare_listener(
 def test_decode_status_endpoint_publishes_broadcast_port(
     cuda_available,
     global_args,
-    coordination_service,
+    singleton_coordinator,
+    pd_coordination_service,
     init_distributed,
 ):
     device = "cuda"
@@ -176,7 +177,6 @@ def test_decode_status_endpoint_publishes_broadcast_port(
     meta = MetadataBuffers(size=4)
     kv_manager = KVManager(
         kv_cache=cache,
-        host="127.0.0.1",
         metadata_buffers=meta,
         disaggregation_mode=DisaggregationMode.DECODE,
     )
@@ -211,7 +211,8 @@ class _DummyBroadcastSock:
 def test_handle_prepare_transfer_message_relays_to_internal_broadcast(
     cuda_available,
     global_args,
-    coordination_service,
+    singleton_coordinator,
+    pd_coordination_service,
     init_distributed,
 ):
     device = "cuda"
@@ -219,7 +220,6 @@ def test_handle_prepare_transfer_message_relays_to_internal_broadcast(
     meta = MetadataBuffers(size=4)
     kv_manager = KVManager(
         kv_cache=cache,
-        host="127.0.0.1",
         metadata_buffers=meta,
         disaggregation_mode=DisaggregationMode.DECODE,
     )
@@ -254,7 +254,8 @@ def test_handle_prepare_transfer_message_relays_to_internal_broadcast(
 def test_handle_decode_internal_status_message_relays_to_internal_broadcast(
     cuda_available,
     global_args,
-    coordination_service,
+    singleton_coordinator,
+    pd_coordination_service,
     init_distributed,
 ):
     device = "cuda"
@@ -262,7 +263,6 @@ def test_handle_decode_internal_status_message_relays_to_internal_broadcast(
     meta = MetadataBuffers(size=4)
     kv_manager = KVManager(
         kv_cache=cache,
-        host="127.0.0.1",
         metadata_buffers=meta,
         disaggregation_mode=DisaggregationMode.DECODE,
     )
