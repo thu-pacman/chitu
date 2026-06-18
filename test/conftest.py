@@ -565,7 +565,7 @@ def pd_ports():
 
 @pytest.fixture(scope="session")
 def singleton_coordinator():
-    init_coordinator("127.0.0.1", 0, is_coordinator_host=True)
+    init_coordinator("127.0.0.1", 0, is_coordinator_host=True, override_existing=True)
 
 
 @pytest.fixture(scope="session")

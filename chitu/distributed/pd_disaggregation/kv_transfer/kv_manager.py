@@ -29,7 +29,7 @@ import torch
 import zmq
 
 from chitu.boot.tcp_ip import get_port_from_zmq_socket, get_local_ip
-from chitu.distributed.coordinator import get_endpoint
+from chitu.distributed.coordinator import get_endpoint, set_endpoint
 from chitu.global_vars import get_global_args
 from chitu.backend import Backend
 from chitu.task import TaskPool
@@ -413,6 +413,18 @@ class TransferInfo:
         )
 
 
+def prefill_ctrl_role(engine_rank: int) -> str:
+    return f"prefill_ctrl_{int(engine_rank)}"
+
+
+def decode_status_role(decode_scheduler_id: int, dp_rank: int) -> str:
+    return f"decode_status_{int(decode_scheduler_id)}_{int(dp_rank)}"
+
+
+def decode_prepare_role(decode_scheduler_id: int, dp_rank: int) -> str:
+    return f"decode_prepare_{int(decode_scheduler_id)}_{int(dp_rank)}"
+
+
 class KVManager:
     """
     Chitu KV Cache Manager for PD disaggregation
@@ -457,15 +469,10 @@ class KVManager:
         self.kv_transfer_cfg = (
             getattr(pd_config, "kv_transfer", None) if pd_config else None
         )
-        # Router metadata sync endpoint (the REP socket in PDCoordinationService).
-        # Discover the router's non-wildcard ip and port from the coordinator.
-        if pd_config:
-            meta_ip, meta_port = get_endpoint("router", "metadata_sync_port")
-            self._coordination_metadata_addr: Optional[str] = (
-                f"tcp://{meta_ip}:{meta_port}"
-            )
-        else:
-            self._coordination_metadata_addr = None
+        # Endpoint coordination uses the coordinator TCPStore (see
+        # `chitu/distributed/coordinator.py`), which is available whenever PD
+        # disaggregation is enabled.
+        self._coordination_enabled: bool = pd_config is not None
 
         # Initialize transfer engine
         self.transfer_engine = MooncakeTransferEngine(
@@ -890,9 +897,9 @@ class KVManager:
                 "prefill-only: non-control rank, skip ZMQ thread and bootstrap registration"
             )
 
-        if not self._coordination_metadata_addr:
+        if not self._coordination_enabled:
             raise RuntimeError(
-                "pd_coordination_service metadata endpoint is not configured; "
+                "coordinator is not configured; "
                 "cannot discover prefill control endpoint without torch.distributed broadcast"
             )
 
@@ -1009,22 +1016,6 @@ class KVManager:
                 parts.append(f"{k}={v}")
         logger.debug(" ".join(parts))
 
-    def _coordination_req(self, payload: dict, timeout_ms: int = 3000) -> dict:
-        """Send a synchronous metadata request to PDCoordinationService (router side)."""
-        if not self._coordination_metadata_addr:
-            raise RuntimeError("coordination metadata addr not configured")
-        sock = self.zmq_ctx.socket(zmq.REQ)
-        try:
-            sock.connect(self._coordination_metadata_addr)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.setsockopt(zmq.RCVTIMEO, int(timeout_ms))
-            sock.setsockopt(zmq.SNDTIMEO, int(timeout_ms))
-            sock.send(msgpack.packb(payload, use_bin_type=True))
-            resp = sock.recv()
-            return msgpack.unpackb(resp, raw=False)
-        finally:
-            sock.close()
-
     def _coordination_set_prefill_ctrl_endpoint(
         self,
         engine_rank: int,
@@ -1033,49 +1024,24 @@ class KVManager:
         internal_port: int,
         broadcast_port: int = 0,
     ) -> None:
-        resp = self._coordination_req(
-            {
-                "type": "set_prefill_ctrl_endpoint",
-                "engine_rank": int(engine_rank),
-                "ip": str(ip),
-                "port": int(port),
-                "internal_port": int(internal_port),
-                "broadcast_port": broadcast_port,
-            },
-            timeout_ms=3000,
-        )
-        if str(resp.get("status", "")) != "success":
-            raise RuntimeError(f"failed to set prefill ctrl endpoint: {resp}")
+        role = prefill_ctrl_role(engine_rank)
+        set_endpoint(role, "ctrl_port", str(ip), int(port))
+        set_endpoint(role, "internal_ctrl_port", str(ip), int(internal_port or 0))
+        set_endpoint(role, "ctrl_broadcast_port", str(ip), int(broadcast_port or 0))
 
     def _coordination_get_prefill_ctrl_endpoint(
         self, engine_rank: int, timeout_s: float = 30.0
     ) -> dict:
-        deadline = time.time() + max(float(timeout_s), 0.1)
-        last_err = None
-        while time.time() < deadline:
-            try:
-                resp = self._coordination_req(
-                    {
-                        "type": "get_prefill_ctrl_endpoint",
-                        "engine_rank": int(engine_rank),
-                    },
-                    timeout_ms=3000,
-                )
-                if str(resp.get("status", "")) == "success":
-                    ep = resp.get("endpoint", {}) or {}
-                    if (
-                        isinstance(ep, dict)
-                        and ep.get("ip")
-                        and int(ep.get("port", 0) or 0) > 0
-                    ):
-                        return ep
-                last_err = resp
-            except Exception as e:
-                last_err = {"status": "error", "message": str(e)}
-            time.sleep(0.1)
-        raise RuntimeError(
-            f"timeout waiting prefill ctrl endpoint from coordination service: {last_err}"
-        )
+        role = prefill_ctrl_role(engine_rank)
+        ip, port = get_endpoint(role, "ctrl_port", timeout=timeout_s)
+        _, internal_port = get_endpoint(role, "internal_ctrl_port", timeout=timeout_s)
+        _, broadcast_port = get_endpoint(role, "ctrl_broadcast_port", timeout=timeout_s)
+        return {
+            "ip": ip,
+            "port": int(port),
+            "internal_port": int(internal_port),
+            "broadcast_port": int(broadcast_port),
+        }
 
     def _coordination_set_decode_status_endpoint(
         self,
@@ -1086,58 +1052,25 @@ class KVManager:
         port: int,
         broadcast_port: int = 0,
     ) -> None:
-        """Register the public decode status endpoint to coordination service."""
-        if not self._coordination_metadata_addr:
-            return
-        resp = self._coordination_req(
-            {
-                "type": "set_decode_status_endpoint",
-                "decode_scheduler_id": decode_scheduler_id,
-                "dp_rank": dp_rank,
-                "ip": ip,
-                "port": port,
-                "broadcast_port": broadcast_port,
-            },
-            timeout_ms=3000,
-        )
-        if str(resp.get("status", "")) != "success":
-            logger.warning(f"[PD_STATUS] register_endpoint_failed resp={resp}")
+        """Register the public decode status endpoint to the coordinator."""
+        role = decode_status_role(decode_scheduler_id, dp_rank)
+        set_endpoint(role, "status_port", str(ip), int(port))
+        set_endpoint(role, "status_broadcast_port", str(ip), int(broadcast_port or 0))
 
     def _coordination_get_decode_status_endpoint(
         self, *, decode_scheduler_id: int, dp_rank: int, timeout_s: float = 10.0
     ) -> Optional[dict]:
-        """Get decode status endpoint for a dp_rank from coordination service."""
-        if not self._coordination_metadata_addr:
-            return None
-        timeout_until = time.time() + max(timeout_s, 0.1)
-        last_err = None
-        while time.time() < timeout_until:
-            try:
-                resp = self._coordination_req(
-                    {
-                        "type": "get_decode_status_endpoint",
-                        "decode_scheduler_id": decode_scheduler_id,
-                        "dp_rank": dp_rank,
-                    },
-                    timeout_ms=3000,
-                )
-                if str(resp.get("status", "")) == "success":
-                    endpoint = resp.get("endpoint", {}) or {}
-                    if (
-                        isinstance(endpoint, dict)
-                        and endpoint.get("ip")
-                        and int(endpoint.get("port", 0) or 0) > 0
-                    ):
-                        return endpoint
-                last_err = resp
-            except Exception as e:
-                last_err = {"status": "error", "message": str(e)}
-            time.sleep(0.1)
-        logger.warning(
-            f"[PD_STATUS] timeout waiting decode status endpoint: decode_sid={int(decode_scheduler_id)} "
-            f"dp_rank={int(dp_rank)} last={last_err}"
+        """Get decode status endpoint for a dp_rank from the coordinator."""
+        role = decode_status_role(decode_scheduler_id, dp_rank)
+        ip, port = get_endpoint(role, "status_port", timeout=timeout_s)
+        _, broadcast_port = get_endpoint(
+            role, "status_broadcast_port", timeout=timeout_s
         )
-        return None
+        return {
+            "ip": ip,
+            "port": int(port),
+            "broadcast_port": int(broadcast_port),
+        }
 
     def _get_decode_public_status_endpoint(self) -> tuple[str, int]:
         ip = str(self.decode_public_status_ip or "")

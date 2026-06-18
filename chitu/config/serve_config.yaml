@@ -507,6 +507,7 @@ multi_inst:
   # Router configuration
   router:
     is_router: False
+    launch_timeout: 3600
     max_inflight_per_instance: 24 # max number of inflight requests per dp instance
     # Used by unified DP routing, and by PD prefill routing when PD disaggregation is enabled.
     routing_algorithm: "power_of_two_choices" # option: prefix_cache_aware, power_of_two_choices, round_robin, least_loaded
@@ -524,42 +525,18 @@ multi_inst:
     # It addresses the asynchrony in eviction timing between the router and its downstream instances.
     router_evict_buffer_size: 64 
 
-    # Scheduler zmq address, there many scheduler, use inst_id to identify the scheduler
-    # inst_id = 0, scheduler_address = tcp://0.0.0.0:29610
-    # inst_id = 1, scheduler_address = tcp://0.0.0.0:29611
-    inst_addresses:
-      - host: 0.0.0.0
-        port: 29610
-      - host: 0.0.0.0
-        port: 29611
-      - host: 0.0.0.0
-        port: 29612
-      - host: 0.0.0.0
-        port: 29613
-      - host: 0.0.0.0
-        port: 29614
-      - host: 0.0.0.0
-        port: 29615
-      - host: 0.0.0.0
-        port: 29616
-      - host: 0.0.0.0
-        port: 29617
     # PD disaggregation configuration
     pd_disaggregation:
       enabled: False            # whether to enable PD disaggregation
       log_verbose: False        # enable high-frequency PD logs
     # Prefill Scheduler list
     prefill_schedulers:
-      - host: 0.0.0.0
-        port: 29620
-        max_batch_size: 32
+      - max_batch_size: 32
         max_total_tokens: 8192
         batching_strategy: "varlen"
     # Decode Scheduler list  
     decode_schedulers:
-      - host: 0.0.0.0
-        port: 29630
-        scheduling_strategy: "immediate"
+      - scheduling_strategy: "immediate"
 
 #: Configs how chitu is monitored and logged.
 metrics:

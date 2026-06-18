@@ -139,10 +139,6 @@ srun $SRUN_PARTITION_ARG \
                    --config-name=pd_disagg_serve_config \
                    multi_inst.router.is_router=True \
                    serve.port=\$ROUTER_HTTP_PORT \
-                   multi_inst.router.prefill_schedulers.0.host=\$NODE_0_IP \
-                   multi_inst.router.prefill_schedulers.0.port=29620 \
-                   multi_inst.router.decode_schedulers.0.host=\$NODE_1_IP \
-                   multi_inst.router.decode_schedulers.0.port=29630 \
                    multi_inst.enabled=True \
                     > \"\$LOG_DIR_INNER/router.log\" 2>&1 &
             ROUTER_PID=\$!

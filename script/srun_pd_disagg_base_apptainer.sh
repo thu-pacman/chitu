@@ -484,15 +484,13 @@ pd_node_main() {
 
   prefill_list=()
   for i in "${!PREFILL_START_NODE[@]}"; do
-    _ip="$(to_ip "${NODE_ARR[${PREFILL_START_NODE[i]}]}")"
-    prefill_list+=("{host:${_ip},port:${PREFILL_PORT[i]},max_batch_size:${ROUTER_PREFILL_MAX_BATCH_SIZE},max_total_tokens:${ROUTER_PREFILL_MAX_TOTAL_TOKENS},batching_strategy:${ROUTER_PREFILL_BATCHING_STRATEGY}}")
+    prefill_list+=("{max_batch_size:${ROUTER_PREFILL_MAX_BATCH_SIZE},max_total_tokens:${ROUTER_PREFILL_MAX_TOTAL_TOKENS},batching_strategy:${ROUTER_PREFILL_BATCHING_STRATEGY}}")
   done
   PD_PREFILL_SCHEDULERS_OVERRIDE="multi_inst.router.prefill_schedulers=[$(IFS=,; echo "${prefill_list[*]}")]"
 
   decode_list=()
   for i in "${!DECODE_START_NODE[@]}"; do
-    _ip="$(to_ip "${NODE_ARR[${DECODE_START_NODE[i]}]}")"
-    decode_list+=("{host:${_ip},port:${DECODE_PORT[i]},scheduling_strategy:${ROUTER_DECODE_SCHEDULING_STRATEGY}}")
+    decode_list+=("{scheduling_strategy:${ROUTER_DECODE_SCHEDULING_STRATEGY}}")
   done
   PD_DECODE_SCHEDULERS_OVERRIDE="multi_inst.router.decode_schedulers=[$(IFS=,; echo "${decode_list[*]}")]"
 

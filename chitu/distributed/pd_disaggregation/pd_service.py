@@ -34,14 +34,15 @@ from chitu.distributed.pd_disaggregation.pd_scheduler import (
 from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
     DisaggregationMode,
     KVManager,
+    decode_prepare_role,
 )
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
 )
-from chitu.boot.tcp_ip import get_port_from_zmq_socket
+from chitu.boot.tcp_ip import get_port_from_zmq_socket, get_local_ip
 from chitu.dp_token_sender import start_dp_token_manager
 from chitu.global_vars import get_global_args
-from chitu.distributed.coordinator import get_endpoint
+from chitu.distributed.coordinator import get_endpoint, set_endpoint
 from chitu.hooks import (
     DPTokenSink,
     MooncakeKVTransferHook,
@@ -62,20 +63,14 @@ logger = logging.getLogger(__name__)
 
 
 def _determine_pd_scheduler_id(args, pd_mode: PDSchedulerMode, rank: int) -> int:
-    """Return the scheduler id used by PDRequestRouter for this role."""
-    scheduler_base_port = int(getattr(args.multi_inst, "scheduler_base_port", -1))
-    if pd_mode == PDSchedulerMode.PREFILL_ONLY:
-        schedulers = getattr(args.multi_inst.router, "prefill_schedulers", [])
-    elif pd_mode == PDSchedulerMode.DECODE_ONLY:
-        schedulers = getattr(args.multi_inst.router, "decode_schedulers", [])
-    else:
-        schedulers = []
+    """Return the scheduler id used by PDRequestRouter for this role.
 
-    for scheduler_id, scheduler_config in enumerate(schedulers or []):
-        if int(getattr(scheduler_config, "port", -1)) == scheduler_base_port:
-            return scheduler_id
-
-    # Backward-compatible fallback for configs that do not pass scheduler lists to workers.
+    The id is the index of this scheduler within its kind (prefill or decode).
+    Each P/D worker is launched with `multi_inst.inst_id` set to its global
+    instance index, where prefill instances come first (ids 0..P-1) and decode
+    instances follow (ids P..P+D-1). The router-facing scheduler id is therefore
+    `inst_id` for prefill, and `inst_id - prefill_count` for decode.
+    """
     instance_id = int(getattr(args.multi_inst, "inst_id", rank))
     if pd_mode == PDSchedulerMode.DECODE_ONLY:
         prefill_schedulers = getattr(args.multi_inst.router, "prefill_schedulers", [])
@@ -112,40 +107,14 @@ def start_decode_prepare_listener_thread(
             f"bind=tcp://{ip}:{port}"
         )
 
-        # 将 ip&port 上报给 Router 的 PDCoordinationService
-        meta_addr = kv_manager._coordination_metadata_addr
-        if meta_addr:
-            req = ctx.socket(zmq.REQ)
-            req.setsockopt(zmq.LINGER, 0)
-            req.setsockopt(zmq.SNDTIMEO, 2000)
-            req.setsockopt(zmq.RCVTIMEO, 2000)
-            req.connect(meta_addr)
-            try:
-                req.send(
-                    msgpack.packb(
-                        {
-                            "type": "set_decode_prepare_endpoint",
-                            "decode_scheduler_id": decode_scheduler_id,
-                            "dp_rank": dp_rank,
-                            "ip": ip,
-                            "port": port,
-                        },
-                        use_bin_type=True,
-                    )
-                )
-                resp = msgpack.unpackb(req.recv(), raw=False)
-                if not isinstance(resp, dict) or resp.get("status") != "success":
-                    logger.warning(f"[PD_PREPARE] register_endpoint_failed resp={resp}")
-            except zmq.error.Again:
-                logger.warning(
-                    f"[PD_PREPARE] register_endpoint_timeout addr={meta_addr}"
-                )
-            finally:
-                req.close()
-        else:
-            logger.warning(
-                "[PD_PREPARE] coordination metadata addr not configured, scheduler cannot discover prepare endpoints"
-            )
+        # Register the prepare-listener endpoint in the coordinator so the
+        # Decode scheduler can discover it.
+        set_endpoint(
+            decode_prepare_role(decode_scheduler_id, dp_rank),
+            "prepare_port",
+            ip,
+            port,
+        )
 
         while True:
             payload = sock.recv()
@@ -194,6 +163,15 @@ class PDSchedulerService:
         self.external_compute_loop = False
 
         self.send_collector_addrs = False
+
+        # Bind the request socket and register its endpoint in the coordinator
+        # before initializing the scheduler. The scheduler initialization
+        # creates the KVManager, which contacts the router's coordination
+        # service; the router only starts serving that service after it has
+        # discovered this scheduler's request endpoint, so the endpoint must be
+        # registered first to avoid a startup deadlock.
+        if self.is_tp_main_rank:
+            self._init_request_socket()
 
         # Initialize scheduler
         self._init_scheduler()
@@ -414,32 +392,37 @@ class PDSchedulerService:
 
         logger.info("pd scheduler service stopped")
 
-    async def _init_sockets(self):
-        """Initialize ZMQ sockets"""
+    def _init_request_socket(self):
+        """Bind the request socket and register its endpoint in the coordinator.
+
+        The request socket binds to a random port on the non-wildcard ip and is
+        registered under the role `prefill_instance_<id>` / `decode_instance_<id>`
+        depending on the PD mode; unified mode reuses the `instance_<id>` role.
+        The router discovers this endpoint from the coordinator.
+        """
         # Request receiving socket
         self.request_socket = self.context.socket(zmq.PULL)
+        request_ip = get_local_ip()
+        request_port = self.request_socket.bind_to_random_port(f"tcp://{request_ip}")
 
-        # Determine port based on scheduler mode and rank
         if self.pd_mode == PDSchedulerMode.PREFILL_ONLY:
-            base_port = 29620  # default prefill base port
+            host_role = f"prefill_instance_{self.local_instance_id}"
         elif self.pd_mode == PDSchedulerMode.DECODE_ONLY:
-            base_port = 29630  # default decode base port
+            host_role = f"decode_instance_{self.local_instance_id}"
         else:
-            base_port = 29610  # default traditional base port
-
-        cfg_base_port = (
-            self.args.multi_inst.scheduler_base_port
-            if hasattr(self.args.multi_inst, "scheduler_base_port")
-            and self.args.multi_inst.scheduler_base_port is not None
-            else None
+            host_role = f"instance_{self.local_instance_id}"
+        set_endpoint(host_role, "request_port", request_ip, request_port)
+        self._request_host_role = host_role
+        self._request_ip = request_ip
+        self._request_port = request_port
+        logger.info(
+            f"registered request endpoint {host_role} at {request_ip}:{request_port}"
         )
-        if isinstance(cfg_base_port, int) and cfg_base_port > 0:
-            base_port = cfg_base_port
 
-        request_port = base_port + self.rank
-        self.request_socket.bind(f"tcp://*:{request_port}")
-
-        # Stats reporting socket
+    async def _init_sockets(self):
+        """Initialize ZMQ sockets"""
+        # The request socket is bound earlier in `_init_request_socket` (before
+        # the KVManager is created). Connect the stats reporting socket here.
         self.stats_socket = self.context.socket(zmq.PUSH)
 
         # Get the router stats endpoint from the coordinator, then connect to it.
@@ -447,7 +430,9 @@ class PDSchedulerService:
         self.stats_socket.connect(f"tcp://{stats_ip}:{stats_port}")
 
         logger.info(
-            f"bound to request port {request_port}, connected to stats port {stats_port}"
+            f"request endpoint {self._request_host_role} at "
+            f"{self._request_ip}:{self._request_port}, "
+            f"connected to stats port {stats_port}"
         )
 
     async def _request_handler(self):

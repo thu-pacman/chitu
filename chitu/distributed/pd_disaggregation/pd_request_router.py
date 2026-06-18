@@ -40,7 +40,7 @@ from chitu.metrics.prometheus_collector import (
     observe_pd_stage,
 )
 from chitu.global_vars import get_global_args
-from chitu.distributed.coordinator import set_endpoint
+from chitu.distributed.coordinator import set_endpoint, get_endpoint
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.task import UserRequest
 from chitu.testing.pd_utils import PDTestRunner
@@ -172,12 +172,15 @@ class PDRequestRouter(RequestRouter):
             logger.info("using traditional unified scheduler mode")
 
     def _parse_pd_scheduler_configs(self):
-        """Parse PD Scheduler configuration"""
+        """Parse PD Scheduler configuration.
+
+        The request endpoint (ip/port) of each scheduler is discovered from the
+        coordinator in `_init_pd_sockets`; only the per-scheduler parameters are
+        read here.
+        """
         if hasattr(self.config, "prefill_schedulers"):
             for i, scheduler_config in enumerate(self.config.prefill_schedulers):
                 self.prefill_schedulers[i] = {
-                    "host": scheduler_config.host,
-                    "port": scheduler_config.port,
                     "max_batch_size": getattr(scheduler_config, "max_batch_size", 32),
                     "max_total_tokens": getattr(
                         scheduler_config, "max_total_tokens", 8192
@@ -185,27 +188,19 @@ class PDRequestRouter(RequestRouter):
                     "batching_strategy": getattr(
                         scheduler_config, "batching_strategy", "varlen"
                     ),
-                    "address": f"tcp://{scheduler_config.host}:{scheduler_config.port}",
                     "status": "online",
                 }
-                logger.info(
-                    f"configuring prefill scheduler {i}: {self.prefill_schedulers[i]['address']}"
-                )
+                logger.info(f"configuring prefill scheduler {i}")
 
         if hasattr(self.config, "decode_schedulers"):
             for i, scheduler_config in enumerate(self.config.decode_schedulers):
                 self.decode_schedulers[i] = {
-                    "host": scheduler_config.host,
-                    "port": scheduler_config.port,
                     "scheduling_strategy": getattr(
                         scheduler_config, "scheduling_strategy", "immediate"
                     ),
-                    "address": f"tcp://{scheduler_config.host}:{scheduler_config.port}",
                     "status": "online",
                 }
-                logger.info(
-                    f"configuring decode scheduler {i}: {self.decode_schedulers[i]['address']}"
-                )
+                logger.info(f"configuring decode scheduler {i}")
 
     async def start(self):
         """Start router service"""
@@ -216,27 +211,12 @@ class PDRequestRouter(RequestRouter):
             if self.pd_coordination_service:
                 await self.pd_coordination_service.start()
 
-                # Register all schedulers to coordination service
-                for local_instance_id, info in self.prefill_schedulers.items():
-                    await self.pd_coordination_service.register_scheduler(
-                        local_instance_id,
-                        SchedulerType.PREFILL,
-                        info["host"],
-                        info["port"],
-                    )
-
-                for local_instance_id, info in self.decode_schedulers.items():
-                    await self.pd_coordination_service.register_scheduler(
-                        local_instance_id,
-                        SchedulerType.DECODE,
-                        info["host"],
-                        info["port"],
-                    )
-
             # Start Mooncake Bootstrap (HTTP)
             await self._start_bootstrap_server_if_needed()
 
-            # Initialize PD-specific sockets
+            # Initialize PD-specific sockets. This discovers each scheduler's
+            # request endpoint from the coordinator and registers it with the
+            # coordination service.
             await self._init_pd_sockets()
 
             # Launch PD-specific tasks
@@ -257,9 +237,29 @@ class PDRequestRouter(RequestRouter):
             await super().start()
 
     async def _init_pd_sockets(self):
-        """Initialize PD specific ZMQ socket"""
+        """Initialize PD specific ZMQ socket.
+
+        Each scheduler registers its request endpoint in the coordinator under
+        the role `prefill_instance_<id>` / `decode_instance_<id>`. Schedulers
+        need to initialize their model first, so wait up to `launch_timeout`
+        seconds for each endpoint to be registered.
+        """
+        launch_timeout = getattr(self.config, "launch_timeout", None)
+
         # Create sockets to Prefill Schedulers
         for local_instance_id, info in self.prefill_schedulers.items():
+            ip, port = get_endpoint(
+                f"prefill_instance_{local_instance_id}",
+                "request_port",
+                timeout=launch_timeout,
+            )
+            info["host"] = ip
+            info["port"] = port
+            info["address"] = f"tcp://{ip}:{port}"
+            if self.pd_coordination_service:
+                await self.pd_coordination_service.register_scheduler(
+                    local_instance_id, SchedulerType.PREFILL, ip, port
+                )
             socket = self.context.socket(zmq.PUSH)
             # Fail immdediately if peer not connected to avoid silent drops.
             socket.setsockopt(zmq.IMMEDIATE, 1)
@@ -273,6 +273,18 @@ class PDRequestRouter(RequestRouter):
 
         # Create sockets to Decode Schedulers
         for local_instance_id, info in self.decode_schedulers.items():
+            ip, port = get_endpoint(
+                f"decode_instance_{local_instance_id}",
+                "request_port",
+                timeout=launch_timeout,
+            )
+            info["host"] = ip
+            info["port"] = port
+            info["address"] = f"tcp://{ip}:{port}"
+            if self.pd_coordination_service:
+                await self.pd_coordination_service.register_scheduler(
+                    local_instance_id, SchedulerType.DECODE, ip, port
+                )
             socket = self.context.socket(zmq.PUSH)
             socket.setsockopt(zmq.IMMEDIATE, 1)
             socket.connect(info["address"])

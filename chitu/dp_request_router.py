@@ -16,7 +16,7 @@ import traceback
 from collections import deque, OrderedDict
 from dataclasses import dataclass, field
 from chitu.global_vars import get_global_args
-from chitu.distributed.coordinator import set_endpoint
+from chitu.distributed.coordinator import set_endpoint, get_endpoint
 from chitu.boot.tcp_ip import get_local_ip
 import zmq
 import zmq.asyncio
@@ -414,19 +414,14 @@ class RequestRouter:
         # Request queues and routing state
         self.pending_requests: deque[UserRequest] = deque()
 
-        # Resolve scheduler addresses from config
+        # Scheduler addresses are resolved lazily from the coordinator in
+        # `_init_sockets`, after instance schedulers have registered their
+        # endpoints under roles `instance_0`, `instance_1`, ...
         self._scheduler_addresses: list[str] = []
         try:
-            if hasattr(self.config, "inst_addresses") and self.config.inst_addresses:
-                self._scheduler_addresses = [
-                    f"tcp://{addr.host}:{addr.port}"
-                    for addr in self.config.inst_addresses
-                ]
-            elif hasattr(self.config, "scheduler_addresses"):
-                # Backward compatibility for legacy configs
-                self._scheduler_addresses = list(self.config.scheduler_addresses)
+            self._n_insts = max(1, int(get_global_args().multi_inst.n_insts))
         except Exception:
-            self._scheduler_addresses = []
+            self._n_insts = 1
 
         # Performance monitoring
         self.total_requests = 0
@@ -435,9 +430,7 @@ class RequestRouter:
         pd_disagg = getattr(self.config, "pd_disaggregation", None)
         pd_enabled = getattr(pd_disagg, "enabled", False) if pd_disagg else False
         if not pd_enabled:
-            logger.info(
-                f"RequestRouter initialized with {len(self._scheduler_addresses)} schedulers"
-            )
+            logger.info(f"RequestRouter initialized for {self._n_insts} instance(s)")
         self.collector_addrs: dict[int, list[str]] = {}
 
     @property
@@ -459,6 +452,19 @@ class RequestRouter:
 
     async def _init_sockets(self):
         """Initialize ZMQ sockets for communication."""
+        # Resolve each instance scheduler's request endpoint from the coordinator.
+        # Instance schedulers register their endpoint under roles
+        # `instance_0`, `instance_1`, ... before the router connects. Instances
+        # need to initialize their model first, so wait up to `launch_timeout`
+        # seconds for each endpoint to be registered.
+        launch_timeout = getattr(self.config, "launch_timeout", None)
+        self._scheduler_addresses = []
+        for instance_id in range(self._n_insts):
+            ip, port = get_endpoint(
+                f"instance_{instance_id}", "request_port", timeout=launch_timeout
+            )
+            self._scheduler_addresses.append(f"tcp://{ip}:{port}")
+
         # Create sockets to Enhanced Schedulers
         for i, address in enumerate(self._scheduler_addresses):
             socket = self.context.socket(zmq.PUSH)
@@ -803,17 +809,9 @@ async def start_request_router():
     else:
         logger.info("Creating DP unified router...")
 
-        # Prefer using multi_inst.router; if no inst_addresses configured, fallback to localhost ports
-        router_cfg = multi_inst.router
-        instance_addrs = getattr(router_cfg, "inst_addresses", None)
-        if instance_addrs:
-            formatted_instance_addrs = [
-                f"tcp://{addr.host}:{addr.port}" for addr in instance_addrs
-            ]
-            logger.info(f"Instance addresses: {formatted_instance_addrs}")
-            router = RequestRouter(router_cfg)
-        else:
-            raise RuntimeError(f"Failed to get instance addresses from multi_inst")
+        # Instance scheduler endpoints are resolved from the coordinator at
+        # socket-init time (roles `instance_0`, `instance_1`, ...).
+        router = RequestRouter(multi_inst.router)
 
     set_global_request_router(router)
     logger.info("Request Router configured successfully")

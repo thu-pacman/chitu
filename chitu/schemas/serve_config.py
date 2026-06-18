@@ -125,12 +125,6 @@ class SchedulerConfig:
 
 
 @dataclass
-class InstAddressesConfig:
-    host: str = MISSING
-    port: int = MISSING
-
-
-@dataclass
 class KvTransferConfig:
     buffer_size: int = 2048
     transfer_timeout: float = 30.0
@@ -178,10 +172,13 @@ class PDDisaggregationConfig:
 
 @dataclass
 class PrefillSchedulerConfig:
-    """Prefill Scheduler configuration"""
+    """Prefill Scheduler configuration
 
-    host: str = MISSING
-    port: int = MISSING
+    Each prefill scheduler binds to a random port and registers it in the
+    coordinator under the role ``prefill_instance_<id>``; the router discovers
+    it via the coordinator. See ``chitu/distributed/coordinator.py``.
+    """
+
     max_batch_size: int = MISSING
     max_total_tokens: int = MISSING
     batching_strategy: str = MISSING  # varlen, fixed
@@ -190,10 +187,13 @@ class PrefillSchedulerConfig:
 
 @dataclass
 class DecodeSchedulerConfig:
-    """Decode Scheduler configuration"""
+    """Decode Scheduler configuration
 
-    host: str = MISSING
-    port: int = MISSING
+    Each decode scheduler binds to a random port and registers it in the
+    coordinator under the role ``decode_instance_<id>``; the router discovers
+    it via the coordinator. See ``chitu/distributed/coordinator.py``.
+    """
+
     scheduling_strategy: str = MISSING  # immediate, batched
     # kv_config: KvTransferConfig = MISSING
 
@@ -209,7 +209,6 @@ class RouterConfig:
     router_load_penalty_weight: float = 0.02
     router_evict_buffer_size: int = 64
     launch_timeout: float = 3600.0  # PD_LAUNCH_TIMEOUT
-    inst_addresses: list[InstAddressesConfig] = MISSING
     # PD disaggregation configuration
     pd_disaggregation: PDDisaggregationConfig = field(
         default_factory=PDDisaggregationConfig
