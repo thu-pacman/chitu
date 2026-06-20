@@ -165,8 +165,6 @@ class PDDisaggregationConfig:
     enabled: bool = False
     kv_transfer_backend: str = "mooncake"  # kv transfer backend: mooncake, nccl
     bootstrap_port: int = 8080  # Bootstrap server port
-    # High-frequency PD logs (PD_QUEUE/PD_STATS/PD_TRACE)
-    log_verbose: bool = False
     kv_transfer: KvTransferConfig = field(default_factory=KvTransferConfig)
 
 

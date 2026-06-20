@@ -305,7 +305,6 @@ multi_inst:
 
     pd_disaggregation:
       enabled: True
-      log_verbose: False
       kv_transfer_backend: "mooncake"
       bootstrap_port: 8080         # Bootstrap HTTP 端口
 
@@ -511,7 +510,7 @@ observe_stage_duration("decode", "kv_recv", duration_s)
 | `created pd request: <rid> -> P{k}-D{m}` | Router            | 请求分配到具体 P/D     |
 
 
-启用详细日志：配置 `multi_inst.router.pd_disaggregation.log_verbose=True`。
+启用详细日志：设置环境变量 `CHITU_LOGGING_LEVEL=chitu.distributed.pd_disaggregation:DEBUG;chitu.hooks:DEBUG;chitu.scheduler:DEBUG`。
 
 ### Prometheus Server 集成
 

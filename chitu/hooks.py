@@ -21,10 +21,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from chitu.task import PackedTasksBase
-from chitu.distributed.pd_disaggregation.pd_log_utils import (
-    pd_trace_enabled,
-    pd_verbose_enabled,
-)
+from chitu.distributed.pd_disaggregation.pd_log_utils import pd_trace_enabled
 from chitu.distributed.pd_disaggregation.pd_scheduler import get_pd_scheduler_instance
 
 logger = logging.getLogger(__name__)
@@ -166,17 +163,14 @@ class MooncakeKVTransferHook:
                 if t is None or getattr(t, "req", None) is None:
                     continue
                 request_cached_tokens[str(t.req.request_id)] = int(t.req.num_hit_tokens)
-            if pd_verbose_enabled():
-                if send_tokens is None:
-                    # 看到该日志表示：该 rank 只传输 KV Cache（不包含首 token）
-                    logger.debug(
-                        f"[KVHook] sending KV-only for requests: {req_ids_output}"
-                    )
-                else:
-                    # 看到该日志表示：该 rank 传输 KV Cache + first-token
-                    logger.debug(
-                        f"[KVHook] sending KV+token for requests: {req_ids_output}"
-                    )
+            if send_tokens is None:
+                # 看到该日志表示：该 rank 只传输 KV Cache（不包含首 token）
+                logger.debug(f"[KVHook] sending KV-only for requests: {req_ids_output}")
+            else:
+                # 看到该日志表示：该 rank 传输 KV Cache + first-token
+                logger.debug(
+                    f"[KVHook] sending KV+token for requests: {req_ids_output}"
+                )
 
             _kv_send_start = time.monotonic()
             for rid in req_ids_output:
@@ -251,8 +245,7 @@ class MooncakeKVTransferHook:
             return
 
         # 看到该日志表示：Decode 即将阻塞等待 KV pull succ
-        if pd_verbose_enabled():
-            logger.debug(f"[KVHook] receiving KV for requests: {pending}")
+        logger.debug(f"[KVHook] receiving KV for requests: {pending}")
         if pd_trace_enabled():
             logger.debug(
                 f"[PD_TRACE][decode.kv_pull_start] pending={pending} total_req_ids={len(req_ids)} "

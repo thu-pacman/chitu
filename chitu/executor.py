@@ -752,22 +752,6 @@ class Executor:
         self.pp_stage = get_pp_group().rank_in_group
         self.is_pp_first_stage = self.pp_size <= 1 or self.pp_stage == 0
         self.has_schedule_overlap = args.infer.schedule_overlap
-        pd_cfg = getattr(getattr(args, "multi_inst", None), "router", None)
-        pd_cfg = getattr(pd_cfg, "pd_disaggregation", None)
-        pd_log_verbose = False
-        env_pd_verbose = os.getenv("CHITU_PD_LOG_VERBOSE")
-        if env_pd_verbose is not None:
-            if env_pd_verbose.strip().lower() in ("1", "true", "yes", "y", "on"):
-                pd_log_verbose = True
-            elif env_pd_verbose.strip().lower() in ("0", "false", "no", "n", "off"):
-                pd_log_verbose = False
-        elif pd_cfg is not None:
-            pd_log_verbose = bool(getattr(pd_cfg, "log_verbose", False))
-        self._step_timing_enabled = (
-            os.getenv("CHITU_STEP_TIMING", "0") == "1" or pd_log_verbose
-        )
-        self._step_timing_min_ms = float(os.getenv("CHITU_STEP_TIMING_MIN_MS", "0"))
-        self._decode_first_step_logged: set[str] = set()
 
         rank_filter = True
         if rank_filter and self.tp_size > 1:

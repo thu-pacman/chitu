@@ -535,9 +535,10 @@ multi_inst:
     router_evict_buffer_size: 64 
 
     # PD disaggregation configuration
+    # NOTE: To enable verbose logging for PD disaggregation, set the following:
+    # CHITU_LOGGING_LEVEL=chitu.distributed.pd_disaggregation:DEBUG;chitu.hooks:DEBUG;chitu.scheduler:DEBUG
     pd_disaggregation:
       enabled: False            # whether to enable PD disaggregation
-      log_verbose: False        # enable high-frequency PD logs
     # Prefill Scheduler list
     prefill_schedulers:
       - max_batch_size: 32
