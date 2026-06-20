@@ -44,12 +44,12 @@ from chitu.kv_cache import KVCacheManagerBase, PagedKVCache, KVCacheBase
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
 from chitu.distributed.parallel_state import (
-    get_world_group,
     get_ep_group,
     get_dp_group,
     get_pp_group,
     initialize_parallel_groups,
 )
+from chitu.distributed.coordinator import init_coordinator
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 from chitu.distributed.infiniband import auto_set_ib_envs
 from chitu.hybrid_device import CPUParameter
@@ -111,8 +111,6 @@ class Backend:
     pp_stage = None
     pp_end_stage = None
     pp_main_rank = None
-    # Unique session ID for IPC paths (to prevent conflicts on shared /tmp)
-    ipc_session_id: str = ""
 
     # components
     schedulers: Optional[list["Scheduler"]] = None  # One per each DP rank
@@ -347,21 +345,31 @@ class Backend:
             pp_size=pipeline_parallel_size,
             embed_tokens_lm_head_tp_size=embed_tokens_lm_head_tp_size,
         )
-        world_group = get_world_group()
-        Backend.ip_port_list = world_group.gather_all_rank_ip_port()
-        Backend.ipc_session_id = world_group.generate_ipc_session_id()
-
-        Backend.pp_stage = (
-            global_rank
-            % (world_size // non_expert_data_parallel_size)
-            // tensor_parallel_size
-        )
-        Backend.pp_end_stage = (
-            world_size // non_expert_data_parallel_size - 1
-        ) // tensor_parallel_size
-        Backend.pp_main_rank = (
-            global_rank // tensor_parallel_size
-        ) * tensor_parallel_size
+        if args.multi_inst.enabled:
+            if args.coordinator.host is None:
+                raise ValueError(
+                    "coordinator.host is required when multi_inst is enabled"
+                )
+            if args.coordinator.port is None:
+                raise ValueError(
+                    "coordinator.port is required when multi_inst is enabled"
+                )
+            init_coordinator(
+                args.coordinator.host, args.coordinator.port, is_coordinator_host=False
+            )
+        elif args.coordinator.host is None or args.coordinator.port is None:
+            init_coordinator(
+                None,
+                None,
+                is_coordinator_host=global_rank == 0,
+                reuse_from_torchrun=True,
+            )
+        else:
+            init_coordinator(
+                args.coordinator.host,
+                args.coordinator.port,
+                is_coordinator_host=global_rank == 0,
+            )
 
     @staticmethod
     def _setup_environment(args):

@@ -44,22 +44,6 @@ class FreeTCPPortHolder:
         return port
 
 
-_reserved_tcp_port_holders: dict[int, FreeTCPPortHolder] = {}
-
-
-def reserve_free_port():
-    holder = FreeTCPPortHolder()
-    port = holder.port
-    _reserved_tcp_port_holders[port] = holder
-    return port
-
-
-def release_reserved_port(port: int):
-    holder = _reserved_tcp_port_holders.pop(port, None)
-    if holder is not None and holder.alive:
-        holder.pop()
-
-
 def get_free_port():
     """
     Get free TCP port, but may be used by other process later
@@ -83,6 +67,10 @@ def is_port_available(port: int):
 
 def get_port_from_zmq_socket(zmq_socket):
     return int(zmq_socket.getsockopt(zmq.LAST_ENDPOINT).decode().split(":")[-1])
+
+
+def is_localhost(host: str):
+    return host in {"localhost", "127.0.0.1", "::1"}
 
 
 @functools.cache

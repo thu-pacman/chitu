@@ -219,8 +219,8 @@ class RouterConfig:
 
 @dataclass
 class CoordinatorConfig:
-    host: str = MISSING
-    port: int = MISSING
+    host: Optional[str] = MISSING
+    port: Optional[int] = MISSING
 
 
 @dataclass

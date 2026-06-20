@@ -51,7 +51,8 @@ from chitu.utils import (
 from chitu.moe.load_balancer import get_moe_load_planner  # added
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 from chitu.sampling.sampler import Sampler
-from chitu.boot.tcp_ip import release_reserved_port
+from chitu.boot.tcp_ip import get_local_ip, is_localhost
+from chitu.distributed.coordinator import get_endpoint, set_endpoint
 
 logger = getLogger(__name__)
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -101,9 +102,8 @@ class TasksDispatcher(ABC):
         # No loop reference: Use weak refence to objects not owned by this object
         self.get_executor = get_executor  # executor owns this object
 
-    # ip_port_list 中的端口索引
-    # (IP, TP_port, DP_port, PP_port) - 系统启动时动态分配的空闲端口
-    PORT_INDEX = {"TP": 1, "DP": 2, "PP": 3}
+    # Coordinator connection names for ZMQ TCP endpoints.
+    CONNECTION_NAME = {"TP": "tp_port", "DP": "dp_port", "PP": "pp_port"}
     supports_profile_payload = True
     CONTROL_FRAME_TYPE_PROFILE = "profile"
 
@@ -142,50 +142,41 @@ class TasksDispatcher(ABC):
             receive_profile_payload(control["payload"])
         return metadata_frame
 
-    def _is_same_node_with_rank(self, other_rank: int) -> bool:
-        """判断当前 rank 与另一个 rank 是否在同一节点
+    def _rank_role(self, rank: int) -> str:
+        args = get_global_args()
+        inst_id = getattr(getattr(args, "multi_inst", None), "inst_id", 0)
+        return f"instance_{inst_id}_rank_{rank}"
 
-        通过 Backend.ip_port_list 中的 IP 地址判断
+    def _get_ipc_url(self, rank: int, group_name: str, ipc_suffix: str = "") -> str:
+        # NOTE: master_port is used as a unique ID of the current instance, so as to
+        # avoid conflict with other instances or services on the same node.
+        master_port = os.environ["MASTER_PORT"]
+        return f"ipc://@chitu_{master_port}_{group_name}_{rank}{ipc_suffix}"
 
-        Args:
-            other_rank: 目标 rank 的全局 rank
-
-        Returns:
-            True: 同一节点，应使用 ipc://
-            False: 不同节点，应使用 tcp://
-        """
-        my_ip = Backend.ip_port_list[self.rank][0]
-        other_ip = Backend.ip_port_list[other_rank][0]
-        return my_ip == other_ip
+    def _is_same_node_with_ip(self, ip: str) -> bool:
+        return is_localhost(ip) or get_local_ip() == ip
 
     def _get_zmq_urls(
         self, rank: int, group_name: str, ipc_suffix: str = ""
-    ) -> tuple[str, str]:
-        """获取 ZMQ 的 IPC 和 TCP URL
+    ) -> tuple[str, str, str]:
+        """Get ZMQ IPC URL, TCP IP, and TCP URL for a rank."""
+        ipc_url = self._get_ipc_url(rank, group_name, ipc_suffix)
+        tcp_ip, tcp_port = get_endpoint(
+            self._rank_role(rank), self.CONNECTION_NAME[group_name]
+        )
+        tcp_url = f"tcp://{tcp_ip}:{tcp_port}"
+        return ipc_url, tcp_ip, tcp_url
 
-        端口使用系统启动时动态分配的空闲端口：
-        - DP: ip_port_list[rank][1] (DP_port)
-        - PP: ip_port_list[rank][2] (PP_port)
-        - TP: 只用 IPC，不需要 TCP 端口
-
-        Args:
-            rank: 目标 rank
-            group_name: dispatcher 类型 ("TP", "DP", "PP")
-            ipc_suffix: IPC 路径的额外后缀（用于 PP 的点对点连接）
-
-        Returns:
-            (ipc_url, tcp_url)
-        """
-        session_id = Backend.ipc_session_id
-        # Use abstract unix socket (@ prefix): no file created, auto-cleanup on exit
-        ipc_url = f"ipc://@chitu_{session_id}_{group_name}_{rank}{ipc_suffix}"
-        ip_port_info = Backend.ip_port_list[rank]
-        tcp_addr = ip_port_info[0]
-        # 使用动态分配的端口：DP用[1]，PP用[2]
-        port_idx = self.PORT_INDEX.get(group_name, 1)
-        tcp_port = ip_port_info[port_idx]
-        tcp_url = f"tcp://{tcp_addr}:{tcp_port}"
-        return ipc_url, tcp_url
+    def _bind_zmq_tcp_endpoint(self, socket, rank: int, group_name: str) -> str:
+        local_ip = get_local_ip()
+        port = socket.bind_to_random_port(f"tcp://{local_ip}")
+        set_endpoint(
+            self._rank_role(rank),
+            self.CONNECTION_NAME[group_name],
+            local_ip,
+            port,
+        )
+        return f"tcp://{local_ip}:{port}"
 
     def _init_zmq_router_dealer(
         self,
@@ -210,16 +201,14 @@ class TasksDispatcher(ABC):
         """
         self.ctx = zmq.Context.instance()
 
-        ipc_url, tcp_url = self._get_zmq_urls(main_rank, group_name)
+        ipc_url = self._get_ipc_url(main_rank, group_name)
 
         if is_main_rank:
             self.socket = self.ctx.socket(zmq.ROUTER)
             self.socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
 
             self.socket.bind(ipc_url)
-            tcp_port = Backend.ip_port_list[main_rank][self.PORT_INDEX[group_name]]
-            release_reserved_port(tcp_port)
-            self.socket.bind(tcp_url)
+            tcp_url = self._bind_zmq_tcp_endpoint(self.socket, main_rank, group_name)
             logger.info(f"{group_name} ROUTER bind: {ipc_url} + {tcp_url}")
 
             for _ in range(1, group.group_size):
@@ -230,9 +219,8 @@ class TasksDispatcher(ABC):
             self.socket = self.ctx.socket(zmq.DEALER)
             self.socket.setsockopt(zmq.IDENTITY, f"{rank_in_group}".encode())
 
-            # 每个连接独立判断：同节点用 ipc，跨节点用 tcp
-            use_ipc = self._is_same_node_with_rank(main_rank)
-            url = ipc_url if use_ipc else tcp_url
+            ipc_url, tcp_ip, tcp_url = self._get_zmq_urls(main_rank, group_name)
+            url = ipc_url if self._is_same_node_with_ip(tcp_ip) else tcp_url
 
             self.socket.connect(url)
             self.socket.send(b"connect")
@@ -313,25 +301,21 @@ class PipeDispatcher(TasksDispatcher):
         self.ctx = zmq.Context.instance()
 
         if not self.is_last_stage:
-            # 使用统一的 URL 生成逻辑（带后缀区分不同连接）
-            use_ipc = self._is_same_node_with_rank(self.next_rank)
-            ipc_url, tcp_url = self._get_zmq_urls(
-                self.rank, "PP", f"_to_{self.next_rank}"
-            )
-            self.send_url = ipc_url if use_ipc else tcp_url
+            ipc_url = self._get_ipc_url(self.rank, "PP", f"_to_{self.next_rank}")
 
             self.send_socket = self.ctx.socket(zmq.PUSH)
-            tcp_port = Backend.ip_port_list[self.rank][self.PORT_INDEX["PP"]]
-            release_reserved_port(tcp_port)
-            self.send_socket.bind(self.send_url)
-            logger.info(f"PP stage {self.rank} → {self.next_rank}: " f"{self.send_url}")
+            self.send_socket.bind(ipc_url)
+            tcp_url = self._bind_zmq_tcp_endpoint(self.send_socket, self.rank, "PP")
+
+            logger.info(
+                f"PP stage {self.rank} → {self.next_rank}: {ipc_url} + {tcp_url}"
+            )
 
         if not self.is_first_stage:
-            use_ipc = self._is_same_node_with_rank(self.prev_rank)
-            ipc_url, tcp_url = self._get_zmq_urls(
+            ipc_url, tcp_ip, tcp_url = self._get_zmq_urls(
                 self.prev_rank, "PP", f"_to_{self.rank}"
             )
-            self.recv_url = ipc_url if use_ipc else tcp_url
+            self.recv_url = ipc_url if self._is_same_node_with_ip(tcp_ip) else tcp_url
 
             self.recv_socket = self.ctx.socket(zmq.PULL)
             self.recv_socket.connect(self.recv_url)
@@ -469,7 +453,6 @@ class TensorDispatcher(TasksDispatcher):
         self.group_size = self.tp_group.group_size
 
         self.gpu_group = self.tp_group.gpu_group
-        self.cpu_group = self.tp_group.cpu_group
 
         self.tp_main_rank = self.tp_group.rank_list[0]
         self.is_main_rank = self.tp_group.is_first_rank

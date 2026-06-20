@@ -191,10 +191,6 @@ def get_pp_pair_group(
     return _PP_PAIR_GROUP_DICT.get((rank0, rank1), None)
 
 
-def get_cpu_tp_group() -> Optional[torch.distributed.ProcessGroup]:
-    return get_global_var("_TP_GROUP").cpu_group
-
-
 def initialize_world_group(rank: int, world_size: int):
     global _WORLD_GROUP
     assert _WORLD_GROUP is None

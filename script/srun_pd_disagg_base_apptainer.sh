@@ -500,7 +500,9 @@ pd_node_main() {
     "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
     "infer.cache_type=${PD_CACHE_TYPE}"
     "multi_inst.enabled=True" "multi_inst.router.is_router=False"
-    "coordinator.host=${ROUTER_IP}" "multi_inst.scheduler_base_host=0.0.0.0"
+    "coordinator.host=${ROUTER_IP}"
+    "coordinator.port=21001"
+    "multi_inst.scheduler_base_host=0.0.0.0"
     "multi_inst.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
     "infer.use_cuda_graph=${MODEL_USE_CUDA_GRAPH}" "infer.schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
     "float_16bit_variant=${MODEL_FLOAT16_VARIANT}"
@@ -516,6 +518,8 @@ pd_node_main() {
       "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
       multi_inst.enabled=True multi_inst.n_insts="${PD_TOTAL_INSTANCES}"
       multi_inst.router.is_router=True serve.port="${PD_ROUTER_PORT}"
+      "coordinator.host=${ROUTER_IP}"
+      "coordinator.port=21001"
       "multi_inst.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
     )
     ROUTER_CMD+=("${PD_PREFILL_SCHEDULERS_OVERRIDE}" "${PD_DECODE_SCHEDULERS_OVERRIDE}")

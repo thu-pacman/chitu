@@ -29,7 +29,7 @@ from chitu.distributed.pd_disaggregation.pd_service import (
 )
 
 
-def init_dp_scheduler(args, rank):
+def init_dp_scheduler(args):
     """Initialize DP Enhanced Scheduler"""
     logger.info(f"[SCHEDULER] Starting DP Enhanced Scheduler...")
 
@@ -52,21 +52,19 @@ def init_dp_scheduler(args, rank):
     pd_enabled = args.multi_inst.router.pd_disaggregation.enabled
 
     # Determine actual distributed rank
-    actual_rank = (
-        torch.distributed.get_rank() if torch.distributed.is_initialized() else rank
-    )
+    rank = torch.distributed.get_rank()
 
     if pd_enabled:
         logger.info("[SCHEDULER] PD disaggregation enabled, using PD Scheduler")
         # Use PD disaggregation scheduler
-        if actual_rank == 0:
+        if rank == 0:
             if init_pd_scheduler is None:
                 raise RuntimeError("PD scheduler service not available")
-            init_pd_scheduler(args, actual_rank)
+            init_pd_scheduler(args, rank)
         else:
             if init_pd_worker is None:
                 raise RuntimeError("PD worker service not available")
-            init_pd_worker(args, actual_rank)
+            init_pd_worker(args, rank)
         return
 
     # Traditional DP scheduler
@@ -78,9 +76,9 @@ def init_dp_scheduler(args, rank):
 
     # For non-zero ranks (TP peers), block on compute loop in main thread so that
     # chitu_run() triggers Backend.executor.step(None) and keeps TP comm alive.
-    if actual_rank != 0:
+    if rank != 0:
         logger.info(
-            f"[SCHEDULER] rank={actual_rank} running process_queue on main thread (no ZMQ service)"
+            f"[SCHEDULER] rank={rank} running process_queue on main thread (no ZMQ service)"
         )
         start_worker()
         return
@@ -94,4 +92,4 @@ def init_dp_scheduler(args, rank):
     t.start()
 
     # Run Enhanced Scheduler ZMQ service on the main asyncio loop
-    asyncio.run(start_enhanced_scheduler_service(actual_rank, args.multi_inst, args))
+    asyncio.run(start_enhanced_scheduler_service(rank, args.multi_inst, args))

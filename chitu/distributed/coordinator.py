@@ -19,33 +19,62 @@
 # 1. Get the (ip, port) from the TCPStore.
 # 2. Connect to the TCP server with that ip and port.
 
+from typing import Optional
+from logging import getLogger
+import os
 import torch
 import datetime
 
+from chitu.boot.tcp_ip import is_localhost
+
+logger = getLogger(__name__)
+
 _coordinator = None
+_coordinator_host = None
 _coordinator_override_existing = False
 
 
 def init_coordinator(
-    host: str, port: int, is_coordinator_host: bool, *, override_existing: bool = False
+    host: Optional[str],
+    port: Optional[int],
+    is_coordinator_host: bool,
+    *,
+    reuse_from_torchrun: bool = False,
+    override_existing: bool = False,
 ):
     """
     Initialize the TCPStore that records TCP endpoints allocation on each host.
 
     Args:
-        host (str): The host where the TCPStore is running.
-        port (int): The port where the TCPStore is running.
+        host (Optional[str]): The host where the TCPStore is running. Ignored when
+            `reuse_from_torchrun` is true.
+        port (Optional[int]): The port where the TCPStore is running. Ignored when
+            `reuse_from_torchrun` is true.
         is_coordinator_host (bool): If true, this process hosts the TCPStore service.
+        reuse_from_torchrun (bool): If true, ignore `host` and `port`. Reuse from
+            torchrun's key-value store with a `torch.distributed.PrefixStore` instead.
         override_existing (bool): If true, `set_endpoint` will overwrite the possibly
             existing endpoint of the same name. You are NOT expected to override any
             endpoint in production, but this is useful for running multiple test cases
-            in one proceese. If false, `set_endpoint` will raise a `RuntimeError` if
+            in one process. If false, `set_endpoint` will raise a `RuntimeError` if
             the endpoint has already been registered, to catch role/connection name
             conflicts.
     """
 
     global _coordinator
+    global _coordinator_host
     global _coordinator_override_existing
+
+    if reuse_from_torchrun:
+        if not torch.distributed.is_initialized():
+            raise RuntimeError(
+                "reuse_from_torchrun=True requires torch.distributed to be initialized"
+            )
+        default_store = torch.distributed.distributed_c10d._get_default_store()
+        _coordinator = torch.distributed.PrefixStore("chitu_coordinator", default_store)
+        _coordinator_host = os.environ["MASTER_ADDR"]
+        _coordinator_override_existing = override_existing
+        return
 
     if host in {"0.0.0.0", "::", ""}:
         raise ValueError(
@@ -55,6 +84,7 @@ def init_coordinator(
     _coordinator = torch.distributed.TCPStore(
         host, port, is_master=is_coordinator_host, wait_for_workers=False
     )
+    _coordinator_host = host
     _coordinator_override_existing = override_existing
 
 
@@ -69,6 +99,12 @@ def set_endpoint(host_role: str, connection_name: str, ip: str, port: int):
         port (int): The TCP port ID.
     """
 
+    if not is_localhost(_coordinator_host) and is_localhost(ip):
+        logger.warning(
+            f"The coordinator hosts at {_coordinator_host} indicating there might be "
+            f"inter-node connection, but the endpoint {ip}:{port} is on localhost, which "
+            f"may cause the inter-node connection to fail."
+        )
     key = f"{host_role}:{connection_name}"
     if not _coordinator_override_existing and _coordinator.check([key]):
         existing = _coordinator.get(key).decode()

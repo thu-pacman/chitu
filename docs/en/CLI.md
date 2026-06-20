@@ -215,16 +215,27 @@ must be set here.
 
 IP for the coordinator.
 
-`coordinator.host` must be recognized from all nodes, and therefore it
-must NOT be wildcards like 0.0.0.0. Please set concrete IP addresses.
+Acceptable values:
+- null: This filed can be omitted if `multi_inst.enabled` is False. If either
+  `coordinator.host` or `coordinator.port` is null, `coordinator` will reuse
+  key-value store from `torchrun`, and do not start a new key-value store.
+- A string: E.g., "1.2.3.4" or "host1". It must be recognized from all nodes,
+  and therefore it must NOT be wildcards like 0.0.0.0. Please set concrete IP
+  addresses.
 
-*Default: `127.0.0.1`.*
+*Default: `null`.*
 
 ### Argument `coordinator.port`
 
 Port for the coordinator.
 
-*Default: `21001`.*
+Acceptable values:
+- null: This filed can be omitted if `multi_inst.enabled` is False. If either
+  `coordinator.host` or `coordinator.port` is null, `coordinator` will reuse
+  key-value store from `torchrun`, and do not start a new key-value store.
+- An integer: E.g., 21001. The TCP port ID.
+
+*Default: `null`.*
 
 ## `infer`
 

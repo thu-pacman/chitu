@@ -426,7 +426,14 @@ class PDSchedulerService:
         self.stats_socket = self.context.socket(zmq.PUSH)
 
         # Get the router stats endpoint from the coordinator, then connect to it.
-        stats_ip, stats_port = get_endpoint("router", "stats_port")
+        # Use the PD launch timeout here because the router publishes this endpoint
+        # only after PD scheduler endpoints are discovered.
+        launch_timeout = getattr(
+            get_global_args().multi_inst.router, "launch_timeout", None
+        )
+        stats_ip, stats_port = get_endpoint(
+            "router", "stats_port", timeout=launch_timeout
+        )
         self.stats_socket.connect(f"tcp://{stats_ip}:{stats_port}")
 
         logger.info(
