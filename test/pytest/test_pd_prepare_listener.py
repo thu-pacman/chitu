@@ -12,7 +12,10 @@ from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
     KVManager,
     DisaggregationMode,
     KVPoll,
+    decode_prepare_role,
+    decode_status_role,
 )
+from chitu.distributed.coordinator import get_endpoint
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
 )
@@ -54,51 +57,21 @@ def _build_paged_cache(device="cuda"):
     )
 
 
-def _coordination_get_decode_prepare_endpoint(addr: str, decode_sid: int, dp_rank: int):
-    ctx = zmq.Context.instance()
-    sock = ctx.socket(zmq.REQ)
-    sock.connect(addr)
-    sock.send(
-        msgpack.packb(
-            {
-                "type": "get_decode_prepare_endpoint",
-                "decode_scheduler_id": decode_sid,
-                "dp_rank": dp_rank,
-            },
-            use_bin_type=True,
-        )
+def _coordination_get_decode_prepare_endpoint(decode_sid: int, dp_rank: int):
+    ip, port = get_endpoint(
+        decode_prepare_role(decode_sid, dp_rank), "prepare_port", timeout=5.0
     )
-    resp = msgpack.unpackb(sock.recv(), raw=False)
-    sock.close()
-    return resp
+    return {"ip": ip, "port": int(port)}
 
 
-def _coordination_get_decode_status_endpoint(addr: str, decode_sid: int, dp_rank: int):
-    ctx = zmq.Context.instance()
-    sock = ctx.socket(zmq.REQ)
-    sock.connect(addr)
-    sock.send(
-        msgpack.packb(
-            {
-                "type": "get_decode_status_endpoint",
-                "decode_scheduler_id": decode_sid,
-                "dp_rank": dp_rank,
-            },
-            use_bin_type=True,
-        )
+def _coordination_get_decode_status_endpoint(decode_sid: int, dp_rank: int):
+    ip, port = get_endpoint(
+        decode_status_role(decode_sid, dp_rank), "status_port", timeout=5.0
     )
-    resp = msgpack.unpackb(sock.recv(), raw=False)
-    sock.close()
-    return resp
-
-
-def _wait_until(cond, timeout_s: float = 5.0):
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if cond():
-            return True
-        time.sleep(0.02)
-    return False
+    _, broadcast_port = get_endpoint(
+        decode_status_role(decode_sid, dp_rank), "status_broadcast_port", timeout=5.0
+    )
+    return {"ip": ip, "port": int(port), "broadcast_port": int(broadcast_port)}
 
 
 @pytest.mark.pd_unit
@@ -124,19 +97,11 @@ def test_decode_prepare_listener(
         kv_manager=kv_manager, decode_scheduler_id=0, dp_rank=0
     )
 
-    addr = kv_manager._coordination_metadata_addr
-    assert addr is not None
-    assert _wait_until(
-        lambda: _coordination_get_decode_prepare_endpoint(
-            addr, decode_sid=0, dp_rank=0
-        ).get("status")
-        == "success"
-    )
-    resp = _coordination_get_decode_prepare_endpoint(addr, decode_sid=0, dp_rank=0)
-    endpoint = resp.get("endpoint", {})
+    endpoint = _coordination_get_decode_prepare_endpoint(decode_sid=0, dp_rank=0)
     ip = endpoint.get("ip")
-    port = int(endpoint.get("port", 0))
-    assert ip and port > 0
+    port = endpoint.get("port")
+    assert ip
+    assert port is not None and port > 0
 
     # Send PD_PREPARE_TRANSFER message
     ctx = zmq.Context.instance()
@@ -181,22 +146,13 @@ def test_decode_status_endpoint_publishes_broadcast_port(
         disaggregation_mode=DisaggregationMode.DECODE,
     )
 
-    addr = kv_manager._coordination_metadata_addr
-    assert addr is not None
-    assert _wait_until(
-        lambda: _coordination_get_decode_status_endpoint(
-            addr, decode_sid=0, dp_rank=0
-        ).get("status")
-        == "success"
-    )
     endpoint = _coordination_get_decode_status_endpoint(
-        addr,
         decode_sid=0,
         dp_rank=0,
-    ).get("endpoint", {})
+    )
     assert endpoint.get("ip")
-    assert int(endpoint.get("port", 0) or 0) > 0
-    assert int(endpoint.get("broadcast_port", 0) or 0) > 0
+    assert endpoint.get("port") is not None and endpoint["port"] > 0
+    assert endpoint.get("broadcast_port") is not None and endpoint["broadcast_port"] > 0
 
 
 class _DummyBroadcastSock:

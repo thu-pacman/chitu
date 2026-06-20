@@ -222,27 +222,18 @@ class KVPoll(Enum):
 
 ### PDCoordinationService（`pd_coordination.py`）
 
-运行在 Router 进程中，负责服务发现和meta data同步。
+运行在 Router 进程中，负责调度器注册与 P/D 配对的状态管理（`register_scheduler` / `register_pd_pair` / `get_pd_stats`）。
 
-**ZMQ Socket**
+**服务发现**
 
-
-| Socket          | 类型  | 端口            | 用途                            |
-| --------------- | --- | ------------- | ----------------------------- |
-| metadata_socket | REP | 随机（动态分配） | 同步meta data请求（endpoint注册/查询） |
+控制面 endpoint（Prefill control rank、Decode 准备与状态 endpoint）的注册与查询统一通过 coordinator TCPStore（`chitu/distributed/coordinator.py` 的 `set_endpoint`/`get_endpoint`）完成，不再使用专门的 ZMQ 服务。使用的角色：
 
 
-**元数据同步请求类型**
-
-
-| 类型                            | 方向                     | 作用                               |
-| ----------------------------- | ---------------------- | -------------------------------- |
-| `set_prefill_ctrl_endpoint`   | Prefill → Coordination | 注册 Prefill control rank 的 ZMQ 端口 |
-| `get_prefill_ctrl_endpoint`   | P/D → Coordination     | 查询 Prefill control rank endpoint |
-| `set_decode_prepare_endpoint` | Decode → Coordination  | 注册 Decode 准备 endpoint            |
-| `get_decode_prepare_endpoint` | Prefill → Coordination | 查询 Decode 准备 endpoint            |
-| `set_decode_status_endpoint`  | Decode → Coordination  | 注册 Decode 状态 endpoint（附带 internal broadcast port） |
-| `get_decode_status_endpoint`  | Prefill / Decode → Coordination | 查询 Decode 状态 endpoint与 internal broadcast |
+| 角色                                | 连接名                                             | 作用                          |
+| --------------------------------- | ------------------------------------------------ | --------------------------- |
+| `prefill_ctrl_<engine_rank>`      | `ctrl_port` / `internal_ctrl_port` / `ctrl_broadcast_port` | Prefill control rank 的控制面端口 |
+| `decode_prepare_<sid>_<dp_rank>`  | `prepare_port`                                   | Decode 准备监听 endpoint        |
+| `decode_status_<sid>_<dp_rank>`   | `status_port` / `status_broadcast_port`          | Decode 状态 endpoint（含 internal broadcast port） |
 
 
 ### MooncakeBootstrapServer（`kv_transfer/mooncake/transfer_engine.py`）
@@ -303,8 +294,6 @@ defaults:
 
 multi_inst:
   enabled: True
-  scheduler_base_host: 0.0.0.0
-  scheduler_base_port: 29610       # Scheduler ZMQ 基础端口
   n_insts: 2                       # P + D 总实例数（启动时覆盖）
   inst_id: 0                       # 当前进程的实例 ID（启动时覆盖）
 
@@ -328,21 +317,17 @@ multi_inst:
         decode_resend_interval_s: 0.5  # Decode 重发 TRANSFER_INFO 间隔
         decode_poll_interval_s: 0.05   # Decode 轮询 KV 状态间隔
 
-    # 以下列表在启动时由脚本动态覆盖（host/port 按实际节点 IP 和实例索引填充）
+    # 以下列表在启动时由脚本动态覆盖
     prefill_schedulers:
-      - host: 0.0.0.0
-        port: 29620
-        max_batch_size: 32
+      - max_batch_size: 32
         max_total_tokens: 8192
         batching_strategy: "varlen"
 
     decode_schedulers:
-      - host: 0.0.0.0
-        port: 29630
-        scheduling_strategy: "immediate"
+      - scheduling_strategy: "immediate"
 ```
 
-启动脚本 `srun_pd_disagg_base_apptainer.sh` 会根据 `--prefill` / `--decode` 参数自动生成 `prefill_schedulers=[{host:...,port:...},...]` 和 `decode_schedulers=[...]` 的 Hydra override 传给 Router，同时为每个 P/D 实例设置对应的 `multi_inst.inst_id` 和 `multi_inst.scheduler_base_port`。`--pd-spec` 中的参数（如 `decode_wait_timeout_s`）会覆盖上面 `kv_transfer` 下的默认值。
+每个 P/D 调度器启动后绑定随机端口，并通过 coordinator 以角色 `prefill_instance_<id>` / `decode_instance_<id>` 注册 endpoint；Router 从 coordinator 发现各调度器地址，无需在配置中填写 host/port。启动脚本 `srun_pd_disagg_base_apptainer.sh` 会根据 `--prefill` / `--decode` 参数自动生成 `prefill_schedulers` 和 `decode_schedulers` 的 Hydra override 传给 Router，同时为每个 P/D 实例设置对应的 `multi_inst.inst_id`。`--pd-spec` 中的参数（如 `decode_wait_timeout_s`）会覆盖上面 `kv_transfer` 下的默认值。
 
 ### 端口矩阵（2P3D 示例）
 
@@ -350,16 +335,16 @@ multi_inst:
 | 组件             | 端口    | 协议   | 节点  | 用途                          |
 | -------------- | ----- | ---- | --- | --------------------------- |
 | Router API     | 21003 | HTTP | A   | 推理入口 `/v1/chat/completions` |
-| Router Stats   | 29600 | ZMQ  | A   | P/D 统计心跳                    |
-| Router Token   | 29700 | ZMQ  | A   | Decode → Router token 回传    |
-| PDCoordination | 29800 | ZMQ  | A   | 协调消息                        |
-| MetadataSync   | 29801 | ZMQ  | A   | 元数据同步                       |
+| Router Stats   | 随机    | ZMQ  | A   | P/D 统计心跳（coordinator 发现）    |
+| Router Token   | 随机    | ZMQ  | A   | Decode → Router token 回传（coordinator 发现）    |
+| Coordinator    | 21001 | TCP  | A   | 端口发现 TCPStore  |
+| MetadataSync   | 随机    | ZMQ  | A   | 元数据同步（coordinator 发现）       |
 | Bootstrap      | 8080  | HTTP | A   | Mooncake endpoint目录         |
-| Prefill P0     | 29620 | ZMQ  | B   | Router → P0 请求              |
-| Prefill P1     | 29621 | ZMQ  | B   | Router → P1 请求              |
-| Decode D0      | 29630 | ZMQ  | A   | Router → D0 请求              |
-| Decode D1      | 29631 | ZMQ  | A   | Router → D1 请求              |
-| Decode D2      | 29632 | ZMQ  | A   | Router → D2 请求              |
+| Prefill P0     | 随机    | ZMQ  | B   | Router → P0 请求（coordinator 发现）  |
+| Prefill P1     | 随机    | ZMQ  | B   | Router → P1 请求（coordinator 发现）  |
+| Decode D0      | 随机    | ZMQ  | A   | Router → D0 请求（coordinator 发现）  |
+| Decode D1      | 随机    | ZMQ  | A   | Router → D1 请求（coordinator 发现）  |
+| Decode D2      | 随机    | ZMQ  | A   | Router → D2 请求（coordinator 发现）  |
 | P ↔ D RDMA     | —     | RDMA | —   | KV/aux 显存直传                 |
 
 
@@ -567,6 +552,9 @@ Router 进程可选启动内置的 Prometheus Server（`PrometheusServerManager`
 | Decode 长时间 WAITING    | 检查 Prefill 是否收到 TRANSFER_INFO；查看 Prefill 传输线程日志；确认 RDMA 设备已正确检测（见 `chitu/distributed/infiniband.py`） |
 | RDMA "Bad address"    | 确认 `register_buffer_to_engine()` 在 CacheManager 注入后调用；检查各层 base_ptr/len 无重叠 |
 | Router 序列化报错          | 确保请求 `messages` 是纯 dict 列表（非 pydantic 对象）                                   |
-| 同节点多进程端口冲突            | 为每个 torchrun 进程指定不同的 `scheduler_base_port` 和 `--master_port`                |
+| 同节点多进程端口冲突            | 调度器请求端口现为随机分配并通过 coordinator 发现；仅需为每个 torchrun 进程指定不同的 `--master_port`                |
+
+
+| 调度器请求端口现为随机分配并通过 coordinator 发现；仅需为每个 torchrun 进程指定不同的 `--master_port`                |
 
 

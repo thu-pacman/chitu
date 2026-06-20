@@ -3,7 +3,7 @@ from collections import OrderedDict
 from unittest.mock import patch
 
 from chitu.dp_request_router import RequestRouter, SchedulerStats
-from chitu.schemas.serve_config import InstAddressesConfig, RouterConfig
+from chitu.schemas.serve_config import RouterConfig
 from chitu.kv_cache import BlockIdentity, NONE_BLK_HASH, BlockIdentityChainBuilder
 from dataclasses import dataclass, field
 
@@ -22,10 +22,6 @@ def _build_router(algorithm: str = "prefix_cache_aware") -> RequestRouter:
         router_cache_miss_fallback_algorithm="least_loaded",
         router_hit_weight=1.0,
         router_load_penalty_weight=0.02,
-        inst_addresses=[
-            InstAddressesConfig(host="127.0.0.1", port=30000),
-            InstAddressesConfig(host="127.0.0.1", port=30001),
-        ],
     )
     router = RequestRouter(cfg)
     return router

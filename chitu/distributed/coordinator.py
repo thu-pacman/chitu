@@ -8,7 +8,7 @@
 # key="router:token_port", value=1.2.3.4:12345.
 #
 # Only the host knows its non-wildcard ip (not something like 0.0.0.0), and
-# clients only know its role (currently all use cases are "router").
+# clients only know its role (e.g., "router", "instance_0").
 #
 # Steps for establishing a new TCP server:
 # 1. Bind TCP server to a random port (port=0).
@@ -19,13 +19,63 @@
 # 1. Get the (ip, port) from the TCPStore.
 # 2. Connect to the TCP server with that ip and port.
 
+from typing import Optional
+from logging import getLogger
+import os
 import torch
+import datetime
+
+from chitu.boot.tcp_ip import is_localhost
+
+logger = getLogger(__name__)
 
 _coordinator = None
+_coordinator_host = None
+_coordinator_override_existing = False
 
 
-def init_coordinator(host: str, port: int, is_coordinator_host: bool):
+def init_coordinator(
+    host: Optional[str],
+    port: Optional[int],
+    is_coordinator_host: bool,
+    *,
+    reuse_from_torchrun: bool = False,
+    override_existing: bool = False,
+):
+    """
+    Initialize the TCPStore that records TCP endpoints allocation on each host.
+
+    Args:
+        host (Optional[str]): The host where the TCPStore is running. Ignored when
+            `reuse_from_torchrun` is true.
+        port (Optional[int]): The port where the TCPStore is running. Ignored when
+            `reuse_from_torchrun` is true.
+        is_coordinator_host (bool): If true, this process hosts the TCPStore service.
+        reuse_from_torchrun (bool): If true, ignore `host` and `port`. Reuse from
+            torchrun's key-value store with a `torch.distributed.PrefixStore` instead.
+        override_existing (bool): If true, `set_endpoint` will overwrite the possibly
+            existing endpoint of the same name. You are NOT expected to override any
+            endpoint in production, but this is useful for running multiple test cases
+            in one process. If false, `set_endpoint` will raise a `RuntimeError` if
+            the endpoint has already been registered, to catch role/connection name
+            conflicts.
+    """
+
     global _coordinator
+    global _coordinator_host
+    global _coordinator_override_existing
+
+    if reuse_from_torchrun:
+        if not torch.distributed.is_initialized():
+            raise RuntimeError(
+                "reuse_from_torchrun=True requires torch.distributed to be initialized"
+            )
+        default_store = torch.distributed.distributed_c10d._get_default_store()
+        _coordinator = torch.distributed.PrefixStore("chitu_coordinator", default_store)
+        _coordinator_host = os.environ["MASTER_ADDR"]
+        _coordinator_override_existing = override_existing
+        return
+
     if host in {"0.0.0.0", "::", ""}:
         raise ValueError(
             f"The coordinator host must be recognized from all nodes, and therefore "
@@ -34,23 +84,59 @@ def init_coordinator(host: str, port: int, is_coordinator_host: bool):
     _coordinator = torch.distributed.TCPStore(
         host, port, is_master=is_coordinator_host, wait_for_workers=False
     )
+    _coordinator_host = host
+    _coordinator_override_existing = override_existing
 
 
 def set_endpoint(host_role: str, connection_name: str, ip: str, port: int):
     """Register a server endpoint under the given host role.
 
-    `ip` should be the host's non-wildcard ip (e.g. from `get_local_ip`),
-    not a wildcard address like "0.0.0.0".
+    Args:
+        host_role (str): The role of the host, e.g., "router", "instance_0".
+        connection_name (str): The name of the connection, e.g., "token_port".
+        ip (str): The host's non-wildcard ip, e.g., from `get_local_ip()`. not a wildcard
+            address like "0.0.0.0".
+        port (int): The TCP port ID.
     """
-    _coordinator.set(f"{host_role}:{connection_name}", f"{ip}:{port}")
+
+    if not is_localhost(_coordinator_host) and is_localhost(ip):
+        logger.warning(
+            f"The coordinator hosts at {_coordinator_host} indicating there might be "
+            f"inter-node connection, but the endpoint {ip}:{port} is on localhost, which "
+            f"may cause the inter-node connection to fail."
+        )
+    key = f"{host_role}:{connection_name}"
+    if not _coordinator_override_existing and _coordinator.check([key]):
+        existing = _coordinator.get(key).decode()
+        raise RuntimeError(
+            f"Endpoint {key!r} is already registered (existing value: "
+            f"{existing!r}, new value: {ip}:{port}). This indicates a "
+            f"host_role/connection_name conflict."
+        )
+    _coordinator.set(key, f"{ip}:{port}")
 
 
-def get_endpoint(host_role: str, connection_name: str) -> tuple[str, int]:
+def get_endpoint(
+    host_role: str, connection_name: str, timeout: float = None
+) -> tuple[str, int]:
     """Get a server endpoint registered under the given host role.
+
+    If `timeout` (in seconds) is given, wait at most that long for the endpoint
+    to be registered. Otherwise the store's default timeout is used.
 
     Returns a (ip, port) tuple.
     """
-    value = _coordinator.get(f"{host_role}:{connection_name}")
+
+    if timeout is not None:
+        # Temporarily override the store's wait timeout for this lookup.
+        prev_timeout = _coordinator.timeout
+        _coordinator.set_timeout(datetime.timedelta(seconds=timeout))
+        try:
+            value = _coordinator.get(f"{host_role}:{connection_name}")
+        finally:
+            _coordinator.set_timeout(prev_timeout)
+    else:
+        value = _coordinator.get(f"{host_role}:{connection_name}")
     assert isinstance(value, bytes)
     ip, port = value.decode().rsplit(":", 1)
     return ip, int(port)

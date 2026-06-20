@@ -10,7 +10,6 @@ This allows the serve package to be executed as a module: python -m chitu.serve
 from logging import getLogger
 from threading import Thread
 import hydra
-import os
 import torch
 import torch.distributed
 
@@ -40,26 +39,20 @@ def main(args: ServeConfig):
     """Main entry point for serve module"""
     multi_inst = args.multi_inst
 
-    # We need to get rank here, but torch.distributed is not yet initialized, so we get it directly
-    # from environment variable.
-    rank = int(os.environ["RANK"]) if "RANK" in os.environ else None
-
-    init_coordinator(
-        args.coordinator.host,
-        args.coordinator.port,
-        is_coordinator_host=multi_inst.router.is_router
-        or (not multi_inst.enabled and rank == 0),
-    )
-
-    if multi_inst.router.is_router:
-        # Use DP Router module
-        init_dp_router(args)
-        return
-
     if multi_inst.enabled:
-        # Use DP Scheduler module
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        init_dp_scheduler(args, rank)
+        if multi_inst.router.is_router:
+            if args.coordinator.host is None:
+                raise ValueError("coordinator.host is required when router is enabled")
+            if args.coordinator.port is None:
+                raise ValueError("coordinator.port is required when router is enabled")
+            init_coordinator(
+                args.coordinator.host, args.coordinator.port, is_coordinator_host=True
+            )
+            # Use DP Router module
+            init_dp_router(args)
+        else:
+            # Use DP Scheduler module
+            init_dp_scheduler(args)
 
     else:
         checkpoint = MemoryRecorder.checkpoint
@@ -74,6 +67,7 @@ def main(args: ServeConfig):
         checkpoint("before warmup_engine")
         warmup_engine(args)
         checkpoint("after warmup_engine")
+        rank = torch.distributed.get_rank()
         if rank == 0:
             uvicorn_thread = Thread(target=start_uvicorn, args=(args,))
             uvicorn_thread.start()

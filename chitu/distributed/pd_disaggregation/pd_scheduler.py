@@ -29,10 +29,12 @@ from chitu.task import (
     UserRequest,
 )
 from chitu.global_vars import get_global_args
+from chitu.distributed.coordinator import get_endpoint
 from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
     KVManager,
     DisaggregationMode,
     KVPoll,
+    decode_prepare_role,
 )
 from chitu.distributed.pd_disaggregation.pd_log_utils import (
     pd_trace_enabled,
@@ -373,53 +375,14 @@ class PDInstanceRequestManager:
     def _get_decode_prepare_endpoint(
         self, dp_rank: int, timeout_s: float = 5.0
     ) -> dict:
-        """Fetch decode prepare endpoint for a given dp_rank from PDCoordinationService."""
-        kv_manager = self.kv_manager
-        meta_addr = (
-            kv_manager._coordination_metadata_addr if kv_manager is not None else None
-        )
-        if not meta_addr:
-            raise RuntimeError(
-                "coordination metadata addr not configured; cannot discover decode prepare endpoints"
-            )
+        """Fetch decode prepare endpoint for a given dp_rank from the coordinator."""
         decode_scheduler_id = self.local_instance_id
-        wait_until = time.time() + max(float(timeout_s), 0.1)
-        last = None
-        while time.time() < wait_until:
-            ctx = zmq.Context.instance()
-            req = ctx.socket(zmq.REQ)
-            try:
-                req.setsockopt(zmq.LINGER, 0)
-                req.setsockopt(zmq.SNDTIMEO, 2000)  # ms
-                req.setsockopt(zmq.RCVTIMEO, 2000)  # ms
-                req.connect(meta_addr)
-                req.send(
-                    msgpack.packb(
-                        {
-                            "type": "get_decode_prepare_endpoint",
-                            "decode_scheduler_id": decode_scheduler_id,
-                            "dp_rank": dp_rank,
-                        },
-                        use_bin_type=True,
-                    )
-                )
-                resp = msgpack.unpackb(req.recv(), raw=False)
-                if isinstance(resp, dict) and resp.get("status") == "success":
-                    endpoint = resp.get("endpoint", {}) or {}
-                    if (
-                        isinstance(endpoint, dict)
-                        and endpoint.get("ip")
-                        and int(endpoint.get("port", 0) or 0) > 0
-                    ):
-                        return endpoint
-            except zmq.error.Again:
-                last = {"status": "timeout"}
-            finally:
-                req.close()
-            time.sleep(0.1)
-        raise RuntimeError(
-            f"timeout waiting decode prepare endpoint: decode_sid={decode_scheduler_id} dp_rank={dp_rank} last={last}"
+        ip, port = get_endpoint(
+            decode_prepare_role(decode_scheduler_id, dp_rank),
+            "prepare_port",
+            timeout=timeout_s,
         )
+        return {"ip": ip, "port": int(port)}
 
     def _send_pd_prepare_transfer(
         self,

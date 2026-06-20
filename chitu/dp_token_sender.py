@@ -17,6 +17,7 @@ import zmq
 import os
 
 from chitu.distributed.coordinator import get_endpoint
+from chitu.global_vars import get_global_args
 from chitu.metrics.prometheus_collector import inc_completed_requests, observe_ttft
 from chitu.task import Task
 
@@ -74,8 +75,13 @@ class DPTokenSender:
         self.socket.setsockopt(zmq.CONFLATE, conflate)
         self.socket.setsockopt(zmq.TCP_KEEPALIVE, tcp_keepalive)
 
-        # Get this instance's token endpoint from the coordinator, then connect to it.
-        ip, port = get_endpoint("router", f"token_port_{self.instance_id}")
+        # Wait for the router token endpoint of this instance, then connect to it.
+        launch_timeout = getattr(
+            get_global_args().multi_inst.router, "launch_timeout", None
+        )
+        ip, port = get_endpoint(
+            "router", f"token_port_{self.instance_id}", timeout=launch_timeout
+        )
         router_addr = f"tcp://{ip}:{port}"
         self.socket.connect(router_addr)
         logger.info(f"[DPTokenSender] group={self.instance_id} connect={router_addr}")

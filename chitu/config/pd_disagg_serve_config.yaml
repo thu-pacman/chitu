@@ -13,8 +13,6 @@ defaults:
 
 multi_inst:
   enabled: True
-  scheduler_base_host: 0.0.0.0
-  scheduler_base_port: 29610
   n_insts: 2           # P + D 总实例数（启动时覆盖）
   inst_id: 0
 
@@ -50,13 +48,9 @@ multi_inst:
 
     # Prefill/Decode Scheduler 默认各 1 个；启动时按实际拓扑覆盖
     prefill_schedulers:
-      - host: 0.0.0.0
-        port: 29620
-        max_batch_size: 32
+      - max_batch_size: 32
         max_total_tokens: 8192
         batching_strategy: "varlen"
 
     decode_schedulers:
-      - host: 0.0.0.0
-        port: 29630
-        scheduling_strategy: "immediate"
+      - scheduling_strategy: "immediate"

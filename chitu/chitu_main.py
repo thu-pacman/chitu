@@ -62,7 +62,8 @@ from chitu.ops.utils import (
     emit_observed_op_impl_summary,
 )
 from chitu.distributed.comm_group import SingletonGroupPlaceholder
-from chitu.distributed.coordinator import get_endpoint
+from chitu.distributed.coordinator import get_endpoint, set_endpoint
+from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
 from chitu.kv_cache.utils import (
     plan_kv_cache_blocks_after_warmup,
@@ -1735,9 +1736,12 @@ async def start_enhanced_scheduler_service(rank: int, multi_inst, args):
 
     # Receive request socket
     request_socket = context.socket(zmq.PULL)
-    request_port = multi_inst.scheduler_base_port
-    request_address = f"tcp://{multi_inst.scheduler_base_host}:{request_port}"
-    request_socket.bind(request_address)
+    # Bind the TCP server to a random port on the non-wildcard ip, then
+    # register it in the coordinator under role `instance_<id>`.
+    request_ip = get_local_ip()
+    request_port = request_socket.bind_to_random_port(f"tcp://{request_ip}")
+    set_endpoint(f"instance_{instance_id}", "request_port", request_ip, request_port)
+    request_address = f"tcp://{request_ip}:{request_port}"
     logger.warning(
         f"[Enhanced Scheduler {instance_id}] Listening to requests: {request_address}"
     )

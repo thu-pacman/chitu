@@ -129,8 +129,8 @@ srun $SRUN_PARTITION_ARG \
         trap cleanup INT TERM
 
         # Common args (multi_inst.n_insts=2 means Router only sees 1P + 1D)
-        # COMMON_ARGS=\"--config-name=pd_disagg_serve_config models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=4096 infer.max_batch_size=64 request.max_new_tokens=4096 multi_inst.enabled=True multi_inst.router.is_router=False coordinator.host=\$ROUTER_IP multi_inst.scheduler_base_host=0.0.0.0 infer.use_cuda_graph=True infer.schedule_overlap=False float_16bit_variant=bfloat16 multi_inst.n_insts=2\"
-        COMMON_ARGS=\"--config-name=pd_disagg_serve_config models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=6144 infer.max_batch_size=288 request.max_new_tokens=4096 multi_inst.enabled=True multi_inst.router.is_router=False coordinator.host=\$ROUTER_IP multi_inst.scheduler_base_host=0.0.0.0 infer.use_cuda_graph=True infer.schedule_overlap=False float_16bit_variant=bfloat16 multi_inst.n_insts=2\"
+        # COMMON_ARGS=\"--config-name=pd_disagg_serve_config models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=4096 infer.max_batch_size=64 request.max_new_tokens=4096 multi_inst.enabled=True multi_inst.router.is_router=False coordinator.host=\$ROUTER_IP coordinator.port=21001 infer.use_cuda_graph=True infer.schedule_overlap=False float_16bit_variant=bfloat16 multi_inst.n_insts=2\"
+        COMMON_ARGS=\"--config-name=pd_disagg_serve_config models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=6144 infer.max_batch_size=288 request.max_new_tokens=4096 multi_inst.enabled=True multi_inst.router.is_router=False coordinator.host=\$ROUTER_IP coordinator.port=21001 infer.use_cuda_graph=True infer.schedule_overlap=False float_16bit_variant=bfloat16 multi_inst.n_insts=2\"
 
         if [ \"\$SLURM_PROCID\" = \"0\" ]; then
             # === Node 0: Router + Prefill (TP4+PP2) ===
@@ -139,11 +139,9 @@ srun $SRUN_PARTITION_ARG \
                    --config-name=pd_disagg_serve_config \
                    multi_inst.router.is_router=True \
                    serve.port=\$ROUTER_HTTP_PORT \
-                   multi_inst.router.prefill_schedulers.0.host=\$NODE_0_IP \
-                   multi_inst.router.prefill_schedulers.0.port=29620 \
-                   multi_inst.router.decode_schedulers.0.host=\$NODE_1_IP \
-                   multi_inst.router.decode_schedulers.0.port=29630 \
                    multi_inst.enabled=True \
+                   coordinator.host=\$ROUTER_IP \
+                   coordinator.port=21001 \
                     > \"\$LOG_DIR_INNER/router.log\" 2>&1 &
             ROUTER_PID=\$!
 
@@ -164,7 +162,7 @@ srun $SRUN_PARTITION_ARG \
                 --master_port=29510 \
                 -m chitu \
                 \$COMMON_ARGS \
-                multi_inst.scheduler_base_port=29620 multi_inst.inst_id=0 \
+                multi_inst.inst_id=0 \
                 scheduler.type=\"prefill_only\" \
                 infer.tp_size=2 infer.pp_size=4 infer.dp_size=1 infer.ep_size=1 \
                 > \"\$LOG_DIR_INNER/prefill_tp2pp4.log\" 2>&1 &
@@ -193,7 +191,7 @@ srun $SRUN_PARTITION_ARG \
                 --master_port=29520 \
                 -m chitu \
                 \$COMMON_ARGS \
-                multi_inst.scheduler_base_port=29630 multi_inst.inst_id=1 \
+                multi_inst.inst_id=1 \
                 scheduler.type=\"decode_only\" \
                 infer.tp_size=1 infer.dp_size=16 infer.ep_size=16 \
                 > \"\$LOG_DIR_INNER/decode_dp16_ep16.node\${SLURM_PROCID}.log\" 2>&1 &

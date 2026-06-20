@@ -16,7 +16,6 @@ from chitu.dp_request_router import LoadBalancer, PrefixCacheAwarePolicy, Schedu
 from chitu.global_vars import set_global_args
 from chitu.schemas.serve_config import (
     DecodeSchedulerConfig,
-    InstAddressesConfig,
     PDDisaggregationConfig,
     PrefillSchedulerConfig,
     RouterConfig,
@@ -54,23 +53,16 @@ def _pd_router_config(
         router_cache_miss_fallback_algorithm=router_cache_miss_fallback_algorithm,
         router_hit_weight=1.0,
         router_load_penalty_weight=0.02,
-        inst_addresses=[
-            InstAddressesConfig(host="127.0.0.1", port=30000),
-        ],
         pd_disaggregation=PDDisaggregationConfig(
             enabled=True,
         ),
         prefill_schedulers=[
             PrefillSchedulerConfig(
-                host="127.0.0.1",
-                port=29620,
                 max_batch_size=32,
                 max_total_tokens=8192,
                 batching_strategy="varlen",
             ),
             PrefillSchedulerConfig(
-                host="127.0.0.1",
-                port=29621,
                 max_batch_size=32,
                 max_total_tokens=8192,
                 batching_strategy="varlen",
@@ -78,8 +70,6 @@ def _pd_router_config(
         ],
         decode_schedulers=[
             DecodeSchedulerConfig(
-                host="127.0.0.1",
-                port=29630,
                 scheduling_strategy="immediate",
             ),
         ],

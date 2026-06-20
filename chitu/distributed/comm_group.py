@@ -4,9 +4,8 @@
 
 import copy
 import itertools
-import os
 from datetime import timedelta
-from typing import Optional, List, Tuple, Sequence, Any
+from typing import Optional, Sequence, Any
 
 import torch
 import torch.distributed
@@ -14,7 +13,6 @@ from logging import getLogger
 
 from chitu.distributed.custom_ar_chitu import create_chitu_custom_allreduce
 from chitu.global_vars import get_global_args
-from chitu.boot.tcp_ip import get_local_ip, reserve_free_port
 
 logger = getLogger(__name__)
 
@@ -415,73 +413,6 @@ class CommGroup:
         torch.distributed.all_gather(output_tensor_list, input, group=self.gpu_group)
 
         return torch.cat(output_tensor_list, dim=0)
-
-    def gather_all_rank_ip_port(self) -> List[Tuple[str, int, int, int]]:
-        """
-        Find IP and three free TCP ports of each rank for TP, DP, PP respectively.
-
-        Returns:
-            List[Tuple[str, int, int, int]]: List of tuples of the form (IP, TP_port, DP_port, PP_port)
-        """
-        if self.group_size == 1:
-            return [("localhost", 0, 0, 0)]
-
-        local_ip_fail_reason = None
-        try:
-            local_ip = get_local_ip()
-        except Exception as e:
-            local_ip = "localhost"
-            local_ip_fail_reason = e
-            logger.warning(
-                "Fail to retrieve local ip, using localhost instead, which may cause an error."
-            )
-
-        ip_list = [None] * self.group_size
-        torch.distributed.all_gather_object(ip_list, local_ip, self.cpu_group)
-        if "localhost" in ip_list and not all(ip == "localhost" for ip in ip_list):
-            raise RuntimeError(
-                "Some ranks uses localhost as IP but some does not. To establish the communication, "
-                "either of the following should be true: 1) all ranks use their own out-going IP, "
-                "2) if all ranks are in a single server, all ranks use localhost as IP."
-            ) from local_ip_fail_reason
-
-        # 为 TP, DP, PP 各保留一个空闲端口，直到对应 ZMQ ROUTER bind 前再释放。
-        local_port_tp = reserve_free_port()
-        port_tp_list = [None] * self.group_size
-        torch.distributed.all_gather_object(port_tp_list, local_port_tp, self.cpu_group)
-
-        local_port_dp = reserve_free_port()
-        port_dp_list = [None] * self.group_size
-        torch.distributed.all_gather_object(port_dp_list, local_port_dp, self.cpu_group)
-
-        local_port_pp = reserve_free_port()
-        port_pp_list = [None] * self.group_size
-        torch.distributed.all_gather_object(port_pp_list, local_port_pp, self.cpu_group)
-
-        logger.debug(
-            f"ZMQ IP: {local_ip}, TP port: {local_port_tp}, DP port: {local_port_dp}, PP port: {local_port_pp}"
-        )
-        return list(zip(ip_list, port_tp_list, port_dp_list, port_pp_list))
-
-    def generate_ipc_session_id(self) -> str:
-        """
-        Generate a unique IPC session ID based on MASTER_PORT.
-
-        torchrun always sets MASTER_PORT with a random available port,
-        making it unique per launch on the same machine.
-
-        Returns:
-            str: Session ID (e.g., "29500")
-
-        Raises:
-            RuntimeError: If MASTER_PORT is not set (not launched via torchrun)
-        """
-        master_port = os.environ.get("MASTER_PORT")
-        if not master_port:
-            raise RuntimeError(
-                "MASTER_PORT not set. Please launch with torchrun or set MASTER_PORT manually."
-            )
-        return master_port
 
     def destroy(self):
         if self.gpu_group and type(self.gpu_group) != SingletonGroupPlaceholder:
