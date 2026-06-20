@@ -226,8 +226,6 @@ class CoordinatorConfig:
 @dataclass
 class MultiInstConfig:
     enabled: bool = MISSING
-    scheduler_base_host: str = MISSING
-    scheduler_base_port: int = MISSING
     n_insts: int = MISSING
     inst_id: int = MISSING
     router: RouterConfig = MISSING

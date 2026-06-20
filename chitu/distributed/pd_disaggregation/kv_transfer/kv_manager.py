@@ -28,7 +28,7 @@ import requests
 import torch
 import zmq
 
-from chitu.boot.tcp_ip import get_port_from_zmq_socket, get_local_ip
+from chitu.boot.tcp_ip import get_local_ip
 from chitu.distributed.coordinator import get_endpoint, set_endpoint
 from chitu.global_vars import get_global_args
 from chitu.backend import Backend
@@ -1091,9 +1091,10 @@ class KVManager:
 
         broadcast_pub = self.zmq_ctx.socket(zmq.PUB)
         broadcast_pub.setsockopt(zmq.LINGER, 0)
-        broadcast_pub.bind("tcp://*:0")
+        self.decode_internal_broadcast_port = broadcast_pub.bind_to_random_port(
+            "tcp://*"
+        )
         self._decode_internal_pub_socket = broadcast_pub
-        self.decode_internal_broadcast_port = get_port_from_zmq_socket(broadcast_pub)
         self._decode_internal_ready.set()
         logger.info(
             "[DECODE_BROADCAST] owner publisher ready at tcp://%s:%s",
@@ -1590,18 +1591,18 @@ class KVManager:
     def start_prefill_thread(self):
         """Start Prefill communication thread"""
         # Bind to all interfaces. Peers connect via the published IP.
-        self.server_socket.bind(f"tcp://*:0")
         # External control-plane port for Decode -> Prefill:
         # - DECODE_REGISTER (decode buffer registration)
         # - TRANSFER_INFO   (per-request transfer info)
-        self.rank_port = get_port_from_zmq_socket(self.server_socket)
+        self.rank_port = self.server_socket.bind_to_random_port("tcp://*")
 
         # Internal control-plane port for Prefill shards -> Prefill control rank:
         # - STAGE_DONE (completion notification)
         self._internal_server_socket = self.zmq_ctx.socket(zmq.PULL)
         # Bind the internal control port on all interfaces.
-        self._internal_server_socket.bind(f"tcp://*:0")
-        self.internal_rank_port = get_port_from_zmq_socket(self._internal_server_socket)
+        self.internal_rank_port = self._internal_server_socket.bind_to_random_port(
+            "tcp://*"
+        )
 
         # Internal broadcast port for Prefill control rank -> all PP/TP ranks:
         # - DECODE_REGISTER
@@ -1609,9 +1610,8 @@ class KVManager:
         #
         # Use PUB/SUB for control-plane fan-out instead of tensor broadcast.
         self._broadcast_pub_socket = self.zmq_ctx.socket(zmq.PUB)
-        self._broadcast_pub_socket.bind(f"tcp://*:0")
-        self.prefill_ctrl_broadcast_port = get_port_from_zmq_socket(
-            self._broadcast_pub_socket
+        self.prefill_ctrl_broadcast_port = (
+            self._broadcast_pub_socket.bind_to_random_port("tcp://*")
         )
 
         def bootstrap_thread():
@@ -1912,8 +1912,7 @@ class KVManager:
     def start_decode_thread(self):
         """Start Decode public status thread on the public TP0/PP0 rank."""
         # Bind to all interfaces so peers can reach the published IP.
-        self.server_socket.bind(f"tcp://*:0")
-        self.rank_port = get_port_from_zmq_socket(self.server_socket)
+        self.rank_port = self.server_socket.bind_to_random_port("tcp://*")
         dp_rank = get_dp_group().rank_in_group
 
         self._coordination_set_decode_status_endpoint(

@@ -39,7 +39,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
 )
-from chitu.boot.tcp_ip import get_port_from_zmq_socket, get_local_ip
+from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_token_sender import start_dp_token_manager
 from chitu.global_vars import get_global_args
 from chitu.distributed.coordinator import get_endpoint, set_endpoint
@@ -95,8 +95,7 @@ def start_decode_prepare_listener_thread(
     def _listener_loop() -> None:
         ctx = zmq.Context.instance()
         sock = ctx.socket(zmq.PULL)
-        sock.bind(f"tcp://*:0")
-        port = get_port_from_zmq_socket(sock)
+        port = sock.bind_to_random_port("tcp://*")
         ip = kv_manager.local_ip if kv_manager.local_ip else "localhost"
         if not kv_manager.wait_decode_internal_broadcast_ready():
             raise RuntimeError(
@@ -475,13 +474,11 @@ class PDSchedulerService:
                 self._stats_identity_logged = True
                 logger.info(
                     "[PD_STATS_IDENTITY] mode=%s torch_rank=%s multi_inst.inst_id=%s "
-                    "scheduler_base_port=%s "
                     "scheduler.local_instance_id=%s stats.local_instance_id=%s "
                     "is_tp_main_rank=%s",
                     self.pd_mode.value,
                     self.rank,
                     getattr(self.args.multi_inst, "inst_id", None),
-                    getattr(self.args.multi_inst, "scheduler_base_port", None),
                     getattr(self.scheduler, "local_instance_id", None),
                     stats.get("local_instance_id"),
                     self.is_tp_main_rank,

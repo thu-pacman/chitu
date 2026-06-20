@@ -294,8 +294,6 @@ defaults:
 
 multi_inst:
   enabled: True
-  scheduler_base_host: 0.0.0.0
-  scheduler_base_port: 29610       # Scheduler ZMQ 基础端口
   n_insts: 2                       # P + D 总实例数（启动时覆盖）
   inst_id: 0                       # 当前进程的实例 ID（启动时覆盖）
 

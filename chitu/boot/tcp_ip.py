@@ -5,7 +5,6 @@
 import functools
 import netifaces
 import socket
-import zmq
 
 
 class FreeTCPPortHolder:
@@ -63,10 +62,6 @@ def is_port_available(port: int):
             return True
     except Exception:
         return False
-
-
-def get_port_from_zmq_socket(zmq_socket):
-    return int(zmq_socket.getsockopt(zmq.LAST_ENDPOINT).decode().split(":")[-1])
 
 
 def is_localhost(host: str):

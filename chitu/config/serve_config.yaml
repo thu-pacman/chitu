@@ -511,8 +511,6 @@ scheduler:
 
 multi_inst:
   enabled: False
-  scheduler_base_host: 0.0.0.0
-  scheduler_base_port: 29610
   n_insts: 1
   inst_id: 0
   # Router configuration
