@@ -20,6 +20,7 @@ from chitu.chitu_main import chitu_init, warmup_engine, start_enhanced_scheduler
 from chitu.serve.common import start_worker
 from chitu.task import TaskPool
 from chitu.distributed.infiniband import auto_set_ib_envs
+from chitu.global_vars import is_classic_pd_disagg, is_independent_multi_inst
 
 logger = getLogger(__name__)
 
@@ -42,20 +43,16 @@ def init_dp_scheduler(args):
 
     logger.info(f"[SCHEDULER] Starting DP Enhanced Scheduler, world_size={world_size}")
 
-    chitu_init(args)
+    args = chitu_init(args)
     torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
     # Router process will skip warmup in unified
     warmup_engine(args)
 
-    # Check if PD disaggregation is enabled
-    pd_enabled = args.multi_inst.router.pd_disaggregation.enabled
-
-    # Determine actual distributed rank
     rank = torch.distributed.get_rank()
 
-    if pd_enabled:
-        logger.info("[SCHEDULER] PD disaggregation enabled, using PD Scheduler")
+    if is_classic_pd_disagg():
+        logger.info("[SCHEDULER] Using classic PD Scheduler")
         # Use PD disaggregation scheduler
         if rank == 0:
             if init_pd_scheduler is None:
@@ -66,6 +63,11 @@ def init_dp_scheduler(args):
                 raise RuntimeError("PD worker service not available")
             init_pd_worker(args, rank)
         return
+
+    if not is_independent_multi_inst():
+        raise NotImplementedError(
+            "Mixing prefill_and_decode with prefill/decode roles is not supported"
+        )
 
     # Traditional DP scheduler
     logger.info("[SCHEDULER] Using traditional DP Enhanced Scheduler")

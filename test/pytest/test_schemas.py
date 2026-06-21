@@ -46,6 +46,10 @@ class TestServeConfigRules:
                     "bind_thread_to_cpu": "physical_core",
                 },
                 "scheduler": {"type": "prefill_first"},
+                "multi_inst": {
+                    "n_insts": 1,
+                    "router": {"is_router": False},
+                },
             }
         )
 
@@ -60,6 +64,12 @@ class TestServeConfigRules:
 
     def test_invalid_attn_type(self, callback, config):
         config.infer.attn_type = "not_in_valid_range"
+        with pytest.raises(SystemExit) as exc_info:
+            callback.on_job_start(config=config)
+        assert exc_info.value.code == 1
+
+    def test_router_requires_multiple_instances(self, callback, config):
+        config.multi_inst.router.is_router = True
         with pytest.raises(SystemExit) as exc_info:
             callback.on_job_start(config=config)
         assert exc_info.value.code == 1

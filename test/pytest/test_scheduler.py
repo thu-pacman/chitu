@@ -39,6 +39,7 @@ def test_prefix_cache_probe_does_not_fill_single_slot_scheduler():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     TaskPool.reset()
     cache_manager = PagedKVCacheManager(
@@ -90,6 +91,7 @@ def test_chunked_prefill():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     TaskPool.reset()
     Backend.cache_managers = [
@@ -178,6 +180,7 @@ def test_chunked_prefill_skew():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     infer_args = get_global_args().infer
@@ -275,6 +278,7 @@ def test_priority_prefill_first():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     TaskPool.reset()
     Backend.cache_managers = [
@@ -376,6 +380,7 @@ def test_priority_prefill_first_skew():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     infer_args = get_global_args().infer
@@ -475,6 +480,7 @@ def test_priority_fcfs():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     TaskPool.reset()
 
@@ -572,6 +578,7 @@ def test_priority_fcfs_skew():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     infer_args = get_global_args().infer
     set_slot_handle(
@@ -670,6 +677,7 @@ def test_priority_request_preset_over_prefill_first():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     TaskPool.reset()
     Backend.cache_managers = [
@@ -775,6 +783,7 @@ def test_priority_request_preset_over_prefill_first_skew():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     infer_args = get_global_args().infer
     set_slot_handle(
@@ -874,6 +883,7 @@ def test_max_running_tasks():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     TaskPool.reset()
     Backend.cache_managers = [
@@ -949,6 +959,7 @@ def test_single_prompt_seq_bigger_than_scheduler_capacity():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     TaskPool.reset()
 
@@ -1007,6 +1018,7 @@ def test_single_decode_prompt_seq_bigger_than_kvcache_capacity():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     TaskPool.reset()
 
@@ -1077,6 +1089,7 @@ def test_evict_task():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     TaskPool.reset()
 
@@ -1204,6 +1217,7 @@ def test_scheduler_group():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     TaskPool.reset()
 
@@ -1351,6 +1365,7 @@ def test_slot_group_skew():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     infer_args = get_global_args().infer
     set_slot_handle(
@@ -1483,6 +1498,7 @@ def test_pp_chunked_prefill():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     TaskPool.reset()
     Backend.cache_managers = [
@@ -1559,6 +1575,7 @@ def test_prepare_prefill_metadata_multi_cache_managers():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     main = PagedKVCacheManager(
@@ -1646,6 +1663,7 @@ def test_check_prefill_capacity_requires_all_cache_managers():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     task = Task("req_capacity", UserRequest.create_mock(1024, "req_capacity"))
     task.set_prefill_chunk_size_for_one_step(256)
@@ -1703,6 +1721,7 @@ def test_check_prefill_capacity_exceeds_physical_blocks():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     task = Task("req_exceeds", UserRequest.create_mock(4096, "req_exceeds"))
     task.set_prefill_chunk_size_for_one_step(4096)
@@ -1744,6 +1763,7 @@ def test_check_decode_capacity_requires_all_cache_managers():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     task = Task(
         "req_decode_capacity", UserRequest.create_mock(400, "req_decode_capacity")
@@ -1832,6 +1852,7 @@ def test_schedule_prefill_tasks_eviction_breaks_deadlock():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     TaskPool.reset()
 
@@ -1912,6 +1933,7 @@ def test_prefill_capacity_reserves_for_inflight_prefill():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
     TaskPool.reset()
 

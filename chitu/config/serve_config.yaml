@@ -195,7 +195,7 @@ coordinator:
   #: IP for the coordinator.
   #:
   #: Acceptable values:
-  #: - null: This filed can be omitted if `multi_inst.enabled` is False. If either
+  #: - null: This filed can be omitted if `multi_inst.n_insts == 1`. If either
   #:   `coordinator.host` or `coordinator.port` is null, `coordinator` will reuse
   #:   key-value store from `torchrun`, and do not start a new key-value store.
   #: - A string: E.g., "1.2.3.4" or "host1". It must be recognized from all nodes,
@@ -206,7 +206,7 @@ coordinator:
   #: Port for the coordinator.
   #:
   #: Acceptable values:
-  #: - null: This filed can be omitted if `multi_inst.enabled` is False. If either
+  #: - null: This filed can be omitted if `multi_inst.n_insts == 1`. If either
   #:   `coordinator.host` or `coordinator.port` is null, `coordinator` will reuse
   #:   key-value store from `torchrun`, and do not start a new key-value store.
   #: - An integer: E.g., 21001. The TCP port ID.
@@ -334,6 +334,10 @@ infer:
   fuse_shared_experts: False
 
   #: If not null, override device IDs assgiend to each rank.
+  #:
+  #: Please note that the ranks are global ranks, but the device IDs are local to node.
+  #: Therefore, if you want to use all 16 GPUs on two 8-GPU nodes, you can set
+  #: `device_ids: [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7]`.
   #:
   #: Acceptable values:
   #: - null: Each rank is assigned with the local-rank-id-th device.
@@ -509,14 +513,100 @@ scheduler:
     enforce_decode_num_tasks_max: True
     decode_num_tasks: null
 
+#: Configs for multi-instance depolyment including PD-disaggregation.
+#:
+#: Note for per-instance config:
+#: - `multi_inst.inst_id` and `multi_inst.router.is_router` should be set
+#:    respectively for each instance.
+#: -  In order for one instance to see other instances' config, all the other
+#:    per-instance configs should be set via `multi_inst.inst_overrides` with
+#:    their instance IDs.
+#: -  All the other fields should be set to be the same during launch, but
+#:    they will be overriden at run time according to
+#:    `multi_inst.inst_overrides[multi_instinst_id]`.
 multi_inst:
-  enabled: False
+  #: Number of instances.
   n_insts: 1
+
+  #: ID of the current instance.
+  #:
+  #: This field should be set respectively for each instance.
+  #:
+  #: It should be null for the router.
   inst_id: 0
-  # Router configuration
+
+  #: Role of the current instance.
+  #:
+  #: Acceptable values: "prefill_and_decode", "prefill", or "decode".
+  role: "prefill_and_decode"
+
+  #: Additional configs for PD disaggregation.
+  #:
+  #: > TIPS: To enable verbose logging for PD disaggregation, set the following:
+  #: > `CHITU_LOGGING_LEVEL=chitu.distributed.pd_disaggregation:DEBUG;chitu.hooks:DEBUG;chitu.scheduler:DEBUG`
+  pd_disaggregation:
+    # Only needed when the instance role is prefill.
+    prefill_scheduler: null
+    # Only needed when the instance role is decode.
+    decode_scheduler: null
+    kv_transfer_backend: "mooncake"
+    bootstrap_port: 8080
+
+  #: Per-instance config overrides keyed by instance ID.
+  #:
+  #: In order for one instance to see other instances' config, all per-instance
+  #: configs should be set in this override, except for torchrun arguments,
+  #: `multi_inst.inst_id`, and `multi_inst.router.is_router`.
+  #:
+  #: Example:
+  #:
+  #: ```yaml
+  #: inst_overrides:
+  #:   0:
+  #:     infer:
+  #:       tp_size: 8
+  #:     multi_inst:
+  #:       role: "prefill"
+  #:       pd_disaggregation:
+  #:         prefill_scheduler:
+  #:           max_batch_size: 32
+  #:           max_total_tokens: 8192
+  #:           batching_strategy: "varlen"
+  #:   1:
+  #:     infer:
+  #:       dp_size: 8
+  #:       ep_size: 8
+  #:     multi_inst:
+  #:       role: "decode"
+  #:       pd_disaggregation:
+  #:         decode_scheduler:
+  #:           scheduling_strategy: "immediate"
+  #: ```
+  #:
+  #: Since passing a very-long dict may be a bad idea in CLI, you can pass this field
+  #: in either of the following two ways:
+  #:
+  #: 1. Passing a dict:
+  #:    ```
+  #:    'multi_inst.inst_overrides="{0: {infer: {tp_size: 8}, multi_inst: {role: "prefill", pd_disaggregation: {prefill_scheduler: {max_batch_size: 32}}}}}"'
+  #:    ```
+  #: 2. First passing an empty dict, and then append to it:
+  #:    ```
+  #:    multi_inst.inst_overrides={} \
+  #:    +multi_inst.inst_overrides.0.infer.tp_size=8 \
+  #:    +multi_inst.inst_overrides.0.multi_inst.role="prefill" \
+  #:    +multi_inst.inst_overrides.0.multi_inst.pd_disaggregation.prefill_scheduler.max_batch_size=32
+  #:    ```
+  inst_overrides: null
+
+  #: Configs for router
   router:
+    #: Set this to True if the current process is a router.
     is_router: False
+
+    #: When the router is ready, wait for this time untill the instances are ready.
     launch_timeout: 3600
+
     max_inflight_per_instance: 24 # max number of inflight requests per dp instance
     # Used by unified DP routing, and by PD prefill routing when PD disaggregation is enabled.
     routing_algorithm: "power_of_two_choices" # option: prefix_cache_aware, power_of_two_choices, round_robin, least_loaded
@@ -533,20 +623,6 @@ multi_inst:
     # The buffer temporarily holds cache blocks evicted from the router's local cache.
     # It addresses the asynchrony in eviction timing between the router and its downstream instances.
     router_evict_buffer_size: 64 
-
-    # PD disaggregation configuration
-    # NOTE: To enable verbose logging for PD disaggregation, set the following:
-    # CHITU_LOGGING_LEVEL=chitu.distributed.pd_disaggregation:DEBUG;chitu.hooks:DEBUG;chitu.scheduler:DEBUG
-    pd_disaggregation:
-      enabled: False            # whether to enable PD disaggregation
-    # Prefill Scheduler list
-    prefill_schedulers:
-      - max_batch_size: 32
-        max_total_tokens: 8192
-        batching_strategy: "varlen"
-    # Decode Scheduler list  
-    decode_schedulers:
-      - scheduling_strategy: "immediate"
 
 #: Configs how chitu is monitored and logged.
 metrics:

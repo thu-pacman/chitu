@@ -400,7 +400,7 @@ def build_chat_template_kwargs(enable_thinking: bool) -> dict[str, Any]:
 
 
 async def submit_request(req: UserRequest):
-    if get_global_args().multi_inst.enabled:
+    if get_global_args().multi_inst.n_insts > 1:
         logger.debug(f"[HTTP] Using DP mode for request: {req.request_id}")
         token_router = get_token_router()
         request_router = get_request_router()

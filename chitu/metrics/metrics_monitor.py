@@ -9,7 +9,12 @@ from typing import Optional
 from chitu.backend import Backend
 from chitu.metrics import PrometheusServerManager
 from chitu.metrics.grafana_manager import GrafanaManager
-from chitu.global_vars import get_global_args
+from chitu.global_vars import (
+    get_global_args,
+    get_multi_inst_ids_by_role,
+    is_classic_pd_disagg,
+    is_independent_multi_inst,
+)
 
 logger = getLogger(__name__)
 
@@ -22,7 +27,8 @@ class MetricsFormatter:
     def __init__(self):
         args = get_global_args()
         dp_enabled = (
-            getattr(args, "multi_inst", None) is not None and args.multi_inst.enabled
+            getattr(args, "multi_inst", None) is not None
+            and args.multi_inst.n_insts > 1
         )
 
         self.use_instance_info: bool = dp_enabled
@@ -31,12 +37,20 @@ class MetricsFormatter:
         )
         self.use_rank_info: bool = True
 
-        self.pd_enabled: bool = (
-            dp_enabled and args.multi_inst.router.pd_disaggregation.enabled
-        )
+        if dp_enabled:
+            if is_classic_pd_disagg():
+                self.pd_enabled = True
+            elif is_independent_multi_inst():
+                self.pd_enabled = False
+            else:
+                raise NotImplementedError(
+                    "Mixing prefill_and_decode with prefill/decode roles is not supported"
+                )
+        else:
+            self.pd_enabled = False
         self.num_prefill_instances: int = -1
         if self.pd_enabled:
-            self.num_prefill_instances = len(args.multi_inst.router.prefill_schedulers)
+            self.num_prefill_instances = len(get_multi_inst_ids_by_role("prefill"))
 
         self.prefix_format = self._get_prefix_format_str()
 
@@ -97,7 +111,7 @@ class MetricsMonitor:
         """
         self.manager = manager
         self.metrics_formatter = MetricsFormatter()
-        self.enable_multi_instance = get_global_args().multi_inst.enabled
+        self.enable_multi_instance = get_global_args().multi_inst.n_insts > 1
         self.log_interval = log_interval
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()

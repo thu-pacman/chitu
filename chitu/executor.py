@@ -16,7 +16,13 @@ import torch
 import torch.distributed
 
 from chitu.backend import Backend, BackendState
-from chitu.global_vars import get_global_args, get_slot_handle, get_timers
+from chitu.global_vars import (
+    get_global_args,
+    get_slot_handle,
+    get_timers,
+    is_classic_pd_disagg,
+    is_independent_multi_inst,
+)
 from chitu.models.registry import ModelType
 from chitu.task import (
     PackedTasks,
@@ -583,9 +589,14 @@ class ExpertDataDispatcher(TasksDispatcher):
                 task_ids_list = [tasks.task_ids] * self.group_size
 
             for rank_in_group in range(1, self.group_size):
-                target_is_pd_decode_rank = (
-                    get_global_args().multi_inst.router.pd_disaggregation.enabled
-                ) and current_task_type == TaskType.Decode
+                if is_classic_pd_disagg():
+                    target_is_pd_decode_rank = current_task_type == TaskType.Decode
+                elif is_independent_multi_inst():
+                    target_is_pd_decode_rank = False
+                else:
+                    raise NotImplementedError(
+                        "Mixing prefill_and_decode with prefill/decode roles is not supported"
+                    )
                 task_ids = task_ids_list[rank_in_group]
                 if current_task_type == TaskType.Special:
                     rank_tasks = tasks
@@ -841,13 +852,9 @@ class Executor:
         # Decode is responsible for sampling and subsequent token generation.
         # If keep PP sampling enabled, last PP stage would sample and send results
         # back to rank0, adding latency and overhead.
-        pd_cfg = getattr(getattr(args, "multi_inst", None), "router", None)
-        pd_cfg = getattr(pd_cfg, "pd_disaggregation", None)
         sched_type = str(getattr(getattr(args, "scheduler", None), "type", "")).lower()
         self._pd_prefill_only = bool(
-            pd_cfg is not None
-            and bool(getattr(pd_cfg, "enabled", False))
-            and ("prefill_only" in sched_type)
+            is_classic_pd_disagg() and ("prefill_only" in sched_type)
         )
 
         # ---- Load balancer concurrent scheduling ----

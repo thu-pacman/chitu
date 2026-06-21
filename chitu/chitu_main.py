@@ -8,7 +8,6 @@ import traceback
 from logging import getLogger
 from typing import Optional
 import re
-import traceback
 from tqdm import tqdm
 
 import torch
@@ -23,6 +22,8 @@ from chitu.executor import Executor
 from chitu.global_vars import (
     get_global_args,
     get_slot_handle,
+    is_classic_pd_disagg,
+    is_independent_multi_inst,
     set_global_variables,
     set_quant_variables,
     set_backend_variables,
@@ -43,13 +44,11 @@ from chitu.task import (
 )
 from chitu.utils import (
     gen_req_id,
-    try_import_opt_dep,
     try_import_and_setup_torch_npu,
     ceil_div,
     gather_str_to_dst_rank,
     get_chitu_bool_env,
 )
-from chitu.schemas.utils import ModelConfigResolver
 from chitu.distributed.parallel_state import get_pp_group, get_world_group
 from chitu.logging_utils import setup_chitu_logging
 from chitu.metrics import (
@@ -77,10 +76,7 @@ from chitu.kv_cache.utils import (
     clamp_int,
 )
 
-numa, has_numa = try_import_opt_dep("numa", "cpu")
-cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
-torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
+try_import_and_setup_torch_npu()
 
 
 logger = getLogger(__name__)
@@ -550,8 +546,7 @@ def _auto_set_num_blocks_after_warmup(args):
         )
         return
 
-    pd_cfg = args.multi_inst.router.pd_disaggregation
-    if pd_cfg.enabled:
+    if is_classic_pd_disagg():
         sched_type = args.scheduler.type.lower()
         is_pd_decode_only = "decode_only" in sched_type
     else:
@@ -1115,10 +1110,15 @@ def warmup_engine(args):
                 f"(prefill_chunk_size={_pcs} / dp_size={_dp_size})"
             )
 
-    # PD分离→direct，非PD→taskpool
-    pd_enabled = args.multi_inst.router.pd_disaggregation.enabled
+    if is_classic_pd_disagg():
+        runner = "direct"
+    elif is_independent_multi_inst():
+        runner = "taskpool"
+    else:
+        raise NotImplementedError(
+            "Mixing prefill_and_decode with prefill/decode roles is not supported"
+        )
 
-    runner = "direct" if pd_enabled else "taskpool"
     sched_type = str(args.scheduler.type).lower()
     skip_model_prefill = "decode_only" in sched_type
     skip_model_decode = "prefill_only" in sched_type
@@ -1169,47 +1169,18 @@ def warmup_engine(args):
     _emit_observed_op_impl_summary_after_warmup()
 
 
-def check_checkpoint_path(args):
-    if args.models.ckpt_dir is None:
-        if not getattr(args.models, "is_pro", False):
-            raise ValueError(
-                f"No checkpoint path provided. You can set it in command line by adding "
-                f"`models.ckpt_dir=<path>`. The model {args.models.name} can be downloaded "
-                f"from {args.models.source}"
-            )
-        else:
-            raise ValueError(
-                f"No checkpoint path provided. You can set it in command line by adding "
-                f"`models.ckpt_dir=<path>`. The model {args.models.name} is part of "
-                f"chitu-pro, which may be obtained by concatting solution@chitu.ai"
-            )
-    if args.models.tokenizer_path is None:
-        logger.info(
-            f"Using {args.models.ckpt_dir} as the path to tokenizer. If the tokenizer has a different path, please set in command line by adding `models.tokenizer_path=<path>`"
-        )
-        args.models.tokenizer_path = args.models.ckpt_dir
-    if hasattr(args.models, "processor_path") and args.models.processor_path is None:
-        logger.info(
-            f"Using {args.models.ckpt_dir} as the path to processor. If the processor has a different path, please set in command line by adding `models.processor_path=<path>`"
-        )
-        args.models.processor_path = args.models.ckpt_dir
-
-
-def _has_cpu_layer(args) -> bool:
-    if (backend_config := args.models.get("backend_config")) is not None:
-        for config in backend_config.get("backend", []):
-            if (pattern := config.get("model")) is not None:
-                if re.match(pattern, args.models.name.lower()):
-                    for rule in config.rules:
-                        if rule.get("backend") == "cpuinfer":
-                            return True
-    return False
-
-
 def chitu_init(args):
+    """
+    Initialize the computation thread of Chitu.
+
+    Args:
+        args: Hydra config.
+
+    Returns:
+        Preprocessed config.
+    """
+
     debug = get_chitu_bool_env("CHITU_DEBUG", False)
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
 
     if (
         is_nvidia()
@@ -1220,232 +1191,15 @@ def chitu_init(args):
 
     init_logger()
 
-    ###################################################################
-    # Deal with legacy arguments
-    if hasattr(args.infer, "soft_fp8") and args.infer.soft_fp8:
-        logger.warning(
-            "Argument `infer.soft_fp8=True` is deprecated. Use `infer.raise_lower_bit_float_to=bfloat16` instead."
-        )
-        args.infer.raise_lower_bit_float_to = "bfloat16"
-    if hasattr(args, "dtype") and args.dtype is not None:
-        logger.warning(
-            "Argument `dtype` is deprecated. Use `float_16bit_variant` instead."
-        )
-        args.float_16bit_variant = args.dtype
-    if hasattr(args.infer, "do_load") and not args.infer.do_load:
-        logger.warning(
-            "Argument `infer.do_load=False` is deprecated. Use `debug.skip_model_load=True` instead."
-        )
-        args.debug.skip_model_load = True
-    if hasattr(args.infer, "max_reqs") and args.infer.max_reqs is not None:
-        args.infer.max_batch_size = args.infer.max_reqs
-        logger.warning(
-            f"Argument `infer.max_reqs={args.infer.max_reqs}` is deprecated. Use `infer.max_batch_size={args.infer.max_batch_size}` instead."
-        )
-    # max_concurrent_requests default: max_batch_size * 2
-    if getattr(args.infer, "max_concurrent_requests", None) is not None:
-        pass
-    else:
-        args.infer.max_concurrent_requests = args.infer.max_batch_size * 2
-        logger.info(
-            f"infer.max_concurrent_requests not set, defaulting to max_batch_size * 2 ({args.infer.max_concurrent_requests})"
-        )
-
-    if (
-        hasattr(args.scheduler.pp_config, "prefill_num_tasks_divided_by_pp")
-        and not args.scheduler.pp_config.prefill_num_tasks_divided_by_pp
-    ):
-        logger.warning(
-            "Argument `scheduler.pp_config.prefill_num_tasks_divided_by_pp=False` is deprecated. Use `scheduler.pp_config.pp_micro_batch_size_prefill=<num>` instead."
-        )
-        assert (
-            hasattr(args.scheduler.pp_config, "prefill_num_tasks")
-            and args.scheduler.pp_config.prefill_num_tasks
-        )
-        args.scheduler.pp_config.pp_micro_batch_size_prefill = (
-            args.scheduler.pp_config.prefill_num_tasks
-        )
-    if (
-        hasattr(args.scheduler.pp_config, "enforce_decode_num_tasks_max")
-        and not args.scheduler.pp_config.enforce_decode_num_tasks_max
-    ):
-        logger.warning(
-            "Argument `scheduler.pp_config.enforce_decode_num_tasks_max=False` is deprecated. Use `scheduler.pp_config.pp_micro_batch_size_decode=<num>` instead."
-        )
-        assert (
-            hasattr(args.scheduler.pp_config, "decode_num_tasks")
-            and args.scheduler.pp_config.decode_num_tasks
-        )
-        args.scheduler.pp_config.pp_micro_batch_size_decode = (
-            args.scheduler.pp_config.decode_num_tasks
-        )
-
-    ###################################################################
-    # Deal with automatic arguments
-
-    if args.infer.device_ids is None:
-        args.infer.device_ids = [i % local_world_size for i in range(world_size)]
-    if len(args.infer.device_ids) != world_size:
-        raise ValueError(
-            f"len(infer.device_ids) ({len(args.infer.device_ids)}) must be equalt to world_size ({world_size})"
-        )
-
-    # prefill_chunk_size default value: 4096 * dp_size
-    if args.infer.prefill_chunk_size == "auto":
-        args.infer.prefill_chunk_size = 4096 * args.infer.dp_size
-
-    if (
-        args.infer.prefill_chunk_size is not None
-        and args.infer.prefill_chunk_size
-        > args.infer.max_batch_size * args.infer.max_seq_len
-    ):
-        logger.warning(
-            f"infer.prefill_chunk_size ({args.infer.prefill_chunk_size}) is larger than "
-            f"infer.max_batch_size ({args.infer.max_batch_size}) * infer.max_seq_len "
-            f"({args.infer.max_seq_len}), which has no effect. Reducing it to "
-            f"infer.max_batch_size * infer.max_seq_len."
-        )
-        args.infer.prefill_chunk_size = (
-            args.infer.max_batch_size * args.infer.max_seq_len
-        )
-
-    if args.infer.prefill_chunk_size is not None:
-        if args.infer.pp_size > 1 and args.infer.cache_type == "skew":
-            logger.warning(
-                "Disabling infer.prefill_chunk_size because it is not compatible with PP+skew yet"
-            )
-            args.infer.prefill_chunk_size = None
-
-    # Auto setting for binding process to CPU NUMA
-    if args.infer.bind_process_to_cpu == "auto":
-        if not has_numa:
-            logger.warning(
-                "Optional dependency '[numa]' is mising. Disabling NUMA binding."
-            )
-            args.infer.bind_process_to_cpu = "none"
-        elif not numa.available():
-            logger.warning(
-                "NUMA is not support on this OS or hardware platform. Disabling NUMA binding."
-            )
-            args.infer.bind_process_to_cpu = "none"
-        elif _has_cpu_layer(args):
-            if numa.get_max_node() + 1 < local_world_size:
-                logger.warning(
-                    "Disable NUMA binding due to insufficient NUMA nodes. Is is an inefficient setting of CPU inference."
-                )
-                args.infer.bind_process_to_cpu = "none"
-            else:
-                args.infer.bind_process_to_cpu = "one_numa_per_rank"
-        else:
-            args.infer.bind_process_to_cpu = "numa_near_device"
-
-    if args.infer.use_cuda_graph == "auto":
-        if args.models.name in [
-            "Mixtral-8x7B-Instruct-v0.1",
-            "Qwen3-30B-A3B-mix-fp4-fp8",
-            "Qwen3-Next-80B-A3B-Instruct",
-        ]:
-            args.infer.use_cuda_graph = False
-        elif (
-            args.infer.ep_size > 1
-            and args.infer.dp_size > 1
-            and (args.infer.tp_size > 1 or not has_deep_ep)
-        ):
-            args.infer.use_cuda_graph = False
-        elif args.infer.attn_type == "ref":
-            args.infer.use_cuda_graph = False
-        elif args.infer.op_impl is not None and args.infer.op_impl == "cpu":
-            args.infer.use_cuda_graph = False
-        elif (
-            args.models is not None
-            and str(args.models).find("'backend': 'cpuinfer'") != -1
-        ):
-            args.infer.use_cuda_graph = False
-        else:
-            args.infer.use_cuda_graph = True
-
-    if args.infer.mtp_size <= 0:
-        args.infer.mtp_size = 1
-
-    if args.infer.full_warmup == "auto":
-        if args.infer.pp_size > 1 and args.infer.use_cuda_graph:
-            args.infer.full_warmup = True
-        else:
-            args.infer.full_warmup = False
-
-    if args.scheduler.pp_config.pp_micro_batch_size_prefill == "auto":
-        args.scheduler.pp_config.pp_micro_batch_size_prefill = "max"
-
-    if args.scheduler.pp_config.pp_micro_batch_size_decode == "auto":
-        args.scheduler.pp_config.pp_micro_batch_size_decode = "max"
-
-    if args.infer.embed_tokens_lm_head_tp_size == "auto":
-        args.infer.embed_tokens_lm_head_tp_size = args.infer.tp_size
-    else:
-        assert (
-            args.infer.embed_tokens_lm_head_tp_size.isdigit()
-        ), "embed_tokens_lm_head_tp_size must be auto or an integer"
-
-    if args.infer.mla_absorb == "auto":
-        if args.models.type == ModelType.DEEPSEEK_V3:
-            args.infer.mla_absorb = "absorb-without-precomp"
-        else:
-            args.infer.mla_absorb = "none"
-
-    if args.infer.dp_size > args.infer.max_batch_size:
-        raise ValueError(
-            f"infer.dp_size ({args.infer.dp_size}) cannot be greater than infer.max_batch_size ({args.infer.max_batch_size})"
-        )
-
-    # Check checkpoint exists
-    check_checkpoint_path(args)
-
-    # Parse model configuration, supporting dynamic reading from config.json files
-    # Uses $(config.json:field_name) syntax, e.g., n_heads: "$(config.json:head_dim)"
-    model_resolver = ModelConfigResolver()
-    args.models = model_resolver.process_config_dict(args.models, args.models.ckpt_dir)
-
-    if (
-        args.models.type == ModelType.DEEPSEEK_V3
-        and args.models.get("index_topk", None) is not None
-    ):
-        assert args.infer.indexer_type in ("auto", "deepgemm", "hygon", "triton")
-        from chitu.dsa_indexer import (
-            support_indexer_deepgemm,
-            support_indexer_hygon,
-            validate_indexer_config,
-        )
-
-        if args.infer.indexer_type == "auto":
-            if (
-                support_indexer_hygon
-                and args.infer.cache_type == "paged"
-                and args.infer.mtp_size < 3
-                and int(args.models.index_head_dim) == 128
-                and int(args.models.index_n_heads) in (32, 64)
-            ):
-                args.infer.indexer_type = "hygon"
-            elif (
-                support_indexer_deepgemm
-                and args.infer.cache_type == "paged"
-                and args.infer.mtp_size < 3
-            ):
-                args.infer.indexer_type = "deepgemm"
-            else:
-                args.infer.indexer_type = "triton"
-        else:
-            validate_indexer_config(args, args.infer.indexer_type)
-
     set_quant_variables(args)
     set_backend_variables(args)
     set_global_variables(args, debug=debug)
-    logger.debug(f"Auto setting configs done. Full configs are: {args}")
+    args = get_global_args()  # Get the pre-processed global args
 
     ###################################################################
     # Initialize backend
 
     try:
-        args = get_global_args()
         Backend.build(args)
         rank = torch.distributed.get_rank()
         if rank == 0:
@@ -1475,7 +1229,7 @@ def chitu_init(args):
         logger.info(f"Prometheus collector addresses:{collector_addrs}")
 
         # Only rank 0 monitors (it has all TaskPool data)
-        should_start_monitor = rank == 0 and not args.multi_inst.enabled
+        should_start_monitor = rank == 0 and args.multi_inst.n_insts == 1
         if should_start_monitor:
             start_prometheus_server_and_metrics_monitor(collector_addrs)
     except Exception as e:
@@ -1489,6 +1243,8 @@ def chitu_init(args):
         raise Exception(
             msg
         ) from None  # `msg` already contains traceback, so raise from None
+
+    return args
 
 
 def _update_tasks_preferred_dp_rank():

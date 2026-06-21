@@ -38,8 +38,14 @@ logger = getLogger(__name__)
 def main(args: ServeConfig):
     """Main entry point for serve module"""
     multi_inst = args.multi_inst
+    multi_inst_enabled = multi_inst.n_insts > 1
 
-    if multi_inst.enabled:
+    if multi_inst.router.is_router and not multi_inst_enabled:
+        raise ValueError(
+            "multi_inst.n_insts must be greater than 1 when router is enabled"
+        )
+
+    if multi_inst_enabled:
         if multi_inst.router.is_router:
             if args.coordinator.host is None:
                 raise ValueError("coordinator.host is required when router is enabled")
@@ -57,7 +63,7 @@ def main(args: ServeConfig):
     else:
         checkpoint = MemoryRecorder.checkpoint
         checkpoint("before chitu_init")
-        chitu_init(args)
+        args = chitu_init(args)
         checkpoint("after chitu_init (model loaded)")
         rec = MemoryRecorder.get()
         rec.install_oom_hook(rec.snapshot_dir)

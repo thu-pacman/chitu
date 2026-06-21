@@ -48,9 +48,10 @@ usage() {
      --decode  "tp=1,pp=1,dp=16,ep=16,max_seq_len=6144,max_batch_size=512,full_warmup=True"
      --prefill-default "tp=4,pp=2,..."    (批量设置 prefill 默认值)
      --decode-default  "tp=1,pp=1,..."    (批量设置 decode 默认值)
-       实例 key: tp, pp, dp, ep, max_seq_len, max_batch_size, max_new_tokens,
-                 chunk(仅prefill), full_warmup, nnodes, nproc, port, master_port
-       含 . 的 key 自动当作 hydra override，如 infer.memory_utilization=0.90
+      实例 key: tp, pp, dp, ep, max_seq_len, max_batch_size, max_new_tokens,
+                chunk(仅prefill), full_warmup, nnodes, nproc, master_port
+      含 . 的 key 写入该实例的 multi_inst.inst_overrides，如 infer.memory_utilization=0.90
+
 
   5. Router / Apptainer 相关参数:
      --router-port PORT                     (默认 21003)
@@ -109,8 +110,6 @@ PD_APPTAINER_EXTRA_ARGS_STR="${PD_APPTAINER_EXTRA_ARGS_STR:-}"
 PD_APPTAINER_CWD="${PD_APPTAINER_CWD:-/workspace/chitu}"
 
 PD_JOB_PORT_OFFSET="${PD_JOB_PORT_OFFSET:-0}"
-PREFILL_BASE_PORT="${PREFILL_BASE_PORT:-29620}"
-DECODE_BASE_PORT="${DECODE_BASE_PORT:-29630}"
 PREFILL_MASTER_BASE_PORT="${PREFILL_MASTER_BASE_PORT:-29510}"
 DECODE_MASTER_BASE_PORT="${DECODE_MASTER_BASE_PORT:-29520}"
 
@@ -164,7 +163,7 @@ parse_model_spec() {
 # Keys with '.' are passed through as Hydra overrides directly.
 parse_pd_spec() {
   local spec="$1"; [ -z "${spec}" ] && return 0
-  local pfx="multi_inst.router.pd_disaggregation.kv_transfer"
+  local pfx="multi_inst.pd_disaggregation.kv_transfer"
   IFS=',' read -r -a _kvs <<< "${spec}"
   for _kv in "${_kvs[@]}"; do
     [ -n "${_kv}" ] || continue
@@ -267,7 +266,10 @@ print_existing_slurm_job_summary() {
   echo "reuse_slurm_job_id=${job_id} state=${job_state:-unknown} alloc_nodes=${alloc_nodes:-unknown} node_list=${node_list:-unknown}"
 }
 
-# 统一解析 prefill/decode 实例规格（替代原来两个独立函数）
+# --prefill / --decode instance-specific settings are materialized into
+# multi_inst.inst_overrides so every process can inspect every instance's
+# effective config. Only torchrun metadata and the current inst_id differ per
+# worker process.
 parse_instance_spec() {
   local kind="$1" idx="$2" spec="$3"
   local KIND="${kind^^}"
@@ -282,7 +284,7 @@ parse_instance_spec() {
   _v="${KIND}_DEFAULT_MAX_BATCH_SIZE";     local max_batch_size="${!_v}"
   _v="${KIND}_DEFAULT_MAX_NEW_TOKENS";     local max_new_tokens="${!_v}"
   _v="${KIND}_DEFAULT_FULL_WARMUP";        local def_full_warmup="${!_v}"
-  local nnodes="" port="" master_port="" nproc="" overrides="" chunk="" full_warmup=""
+  local nnodes="" master_port="" nproc="" overrides="" chunk="" full_warmup=""
   local max_reqs_explicit=0 max_batch_size_explicit=0
 
   IFS=',' read -r -a _kvs <<< "${spec}"
@@ -295,7 +297,6 @@ parse_instance_spec() {
       max_reqs=*)                 max_reqs="${_kv#*=}"; max_reqs_explicit=1;;
       max_batch_size=*)           max_batch_size="${_kv#*=}"; max_batch_size_explicit=1;;
       max_new_tokens=*)           max_new_tokens="${_kv#*=}";;
-      port=*|base_port=*)         port="${_kv#*=}";;
       master_port=*)              master_port="${_kv#*=}";;
       nproc=*|nproc_per_node=*)   nproc="${_kv#*=}";;
       chunk=*|prefill_chunk_size=*) chunk="${_kv#*=}";;
@@ -319,7 +320,6 @@ parse_instance_spec() {
   fi
 
   # 自动端口
-  _v="${KIND}_BASE_PORT";        [ -n "${port}" ]        || port=$(( ${!_v} + PD_JOB_PORT_OFFSET + idx ))
   _v="${KIND}_MASTER_BASE_PORT"; [ -n "${master_port}" ] || master_port=$(( ${!_v} + PD_JOB_PORT_OFFSET + idx ))
 
   # 推导 nnodes / nproc
@@ -330,7 +330,7 @@ parse_instance_spec() {
   local -n _o_nn="${KIND}_NNODES"      _o_tp="${KIND}_TP"       _o_pp="${KIND}_PP"
   local -n _o_dp="${KIND}_DP"          _o_ep="${KIND}_EP"
   local -n _o_msl="${KIND}_MAX_SEQ_LEN"   _o_mr="${KIND}_MAX_REQS" _o_mbs="${KIND}_MAX_BATCH_SIZE"  _o_mnt="${KIND}_MAX_NEW_TOKENS"
-  local -n _o_pt="${KIND}_PORT"           _o_mpt="${KIND}_MASTER_PORT"
+  local -n _o_mpt="${KIND}_MASTER_PORT"
   local -n _o_np="${KIND}_NPROC_PER_NODE" _o_ov="${KIND}_OVERRIDES_SPEC"
   _o_nn[idx]="${nnodes}";  _o_tp[idx]="${tp}";  _o_pp[idx]="${pp}"
   _o_dp[idx]="${dp}";      _o_ep[idx]="${ep}"
@@ -338,12 +338,12 @@ parse_instance_spec() {
   _o_mr[idx]="${max_reqs}"
   _o_mbs[idx]="${max_batch_size}"
   _o_mnt[idx]="${max_new_tokens}"
-  _o_pt[idx]="${port}";  _o_mpt[idx]="${master_port}"
+  _o_mpt[idx]="${master_port}"
   _o_np[idx]="${nproc}";  _o_ov[idx]="${overrides}"
 }
 
 reset_instance_arrays() {
-  for _a in NNODES TP PP DP EP MAX_SEQ_LEN MAX_REQS MAX_BATCH_SIZE MAX_NEW_TOKENS PORT MASTER_PORT NPROC_PER_NODE OVERRIDES_SPEC; do
+  for _a in NNODES TP PP DP EP MAX_SEQ_LEN MAX_REQS MAX_BATCH_SIZE MAX_NEW_TOKENS MASTER_PORT NPROC_PER_NODE DEVICE_IDS OVERRIDES_SPEC; do
     eval "PREFILL_${_a}=(); DECODE_${_a}=()"
   done
   PREFILL_START_NODE=(); DECODE_START_NODE=()
@@ -369,6 +369,16 @@ allocate_nodes() {
   local i
   for ((i=0; i<PD_NODES; i++)); do node_free[i]="${PD_GPUS_PER_NODE}"; done
 
+  block_device_ids() {
+    local start="$1" nnodes="$2" nproc="$3" j k used
+    local -a list=()
+    for ((j=0; j<nnodes; j++)); do
+      used=$((PD_GPUS_PER_NODE - node_free[start+j]))
+      for ((k=0; k<nproc; k++)); do list+=("$((used + k))"); done
+    done
+    IFS=,; echo "${list[*]}"
+  }
+
   find_block() {
     local nnodes="$1" nproc="$2" prefer_empty="$3" start ok j
     [ "${nnodes}" -le "${PD_NODES}" ] || return 1
@@ -392,22 +402,29 @@ allocate_nodes() {
   }
 
   for i in "${!PREFILL_NNODES[@]}"; do
-    local nnodes="${PREFILL_NNODES[i]}" nproc="${PREFILL_NPROC_PER_NODE[i]}" start j
+    local nnodes="${PREFILL_NNODES[i]}" nproc="${PREFILL_NPROC_PER_NODE[i]}" start j gpu_list
     start="$(find_block "${nnodes}" "${nproc}" 0)" || die "prefill ${i}: cannot place nnodes=${nnodes} nproc=${nproc}"
+    gpu_list="$(block_device_ids "${start}" "${nnodes}" "${nproc}")"
     PREFILL_START_NODE[i]="${start}"
+    PREFILL_DEVICE_IDS[i]="${gpu_list}"
     for ((j=0; j<nnodes; j++)); do node_free[start+j]=$((node_free[start+j] - nproc)); done
   done
   for i in "${!DECODE_NNODES[@]}"; do
-    local nnodes="${DECODE_NNODES[i]}" nproc="${DECODE_NPROC_PER_NODE[i]}" start j
+    local nnodes="${DECODE_NNODES[i]}" nproc="${DECODE_NPROC_PER_NODE[i]}" start j gpu_list
     start="$(find_block "${nnodes}" "${nproc}" 1)" || die "decode ${i}: cannot place nnodes=${nnodes} nproc=${nproc}"
+    gpu_list="$(block_device_ids "${start}" "${nnodes}" "${nproc}")"
     DECODE_START_NODE[i]="${start}"
+    DECODE_DEVICE_IDS[i]="${gpu_list}"
     for ((j=0; j<nnodes; j++)); do node_free[start+j]=$((node_free[start+j] - nproc)); done
   done
 }
 
-split_overrides_to_array() {
-  IFS=';' read -r -a _out <<< "$1"
-  for _x in "${_out[@]}"; do [ -n "${_x}" ] && printf '%s\n' "${_x}"; done
+append_inst_override_args() {
+  local inst_id="$1" spec="$2" _kv
+  IFS=';' read -r -a _kvs <<< "${spec}"
+  for _kv in "${_kvs[@]}"; do
+    [ -n "${_kv}" ] && PD_INST_OVERRIDES_ARGS+=("++multi_inst.inst_overrides.${inst_id}.${_kv}")
+  done
 }
 
 ################################################################################
@@ -481,47 +498,68 @@ pd_node_main() {
   fi
   APPTAINER_BASE_ARGS+=("${APPTAINER_EXTRA_ARGS[@]}")
 
-  prefill_list=()
+  PD_INST_OVERRIDES_ARGS=("multi_inst.inst_overrides={}")
   for i in "${!PREFILL_START_NODE[@]}"; do
-    prefill_list+=("{max_batch_size:${ROUTER_PREFILL_MAX_BATCH_SIZE},max_total_tokens:${ROUTER_PREFILL_MAX_TOTAL_TOKENS},batching_strategy:${ROUTER_PREFILL_BATCHING_STRATEGY}}")
+    _inst_id="$((i))"
+    PD_INST_OVERRIDES_ARGS+=(
+      "+multi_inst.inst_overrides.${_inst_id}.multi_inst.role=prefill"
+      "+multi_inst.inst_overrides.${_inst_id}.multi_inst.pd_disaggregation.prefill_scheduler.max_batch_size=${ROUTER_PREFILL_MAX_BATCH_SIZE}"
+      "+multi_inst.inst_overrides.${_inst_id}.multi_inst.pd_disaggregation.prefill_scheduler.max_total_tokens=${ROUTER_PREFILL_MAX_TOTAL_TOKENS}"
+      "+multi_inst.inst_overrides.${_inst_id}.multi_inst.pd_disaggregation.prefill_scheduler.batching_strategy=${ROUTER_PREFILL_BATCHING_STRATEGY}"
+      "+multi_inst.inst_overrides.${_inst_id}.scheduler.type=prefill_only"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.max_seq_len=${PREFILL_MAX_SEQ_LEN[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.max_batch_size=${PREFILL_MAX_BATCH_SIZE[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.request.max_new_tokens=${PREFILL_MAX_NEW_TOKENS[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.tp_size=${PREFILL_TP[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.pp_size=${PREFILL_PP[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.dp_size=${PREFILL_DP[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.ep_size=${PREFILL_EP[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.device_ids=[${PREFILL_DEVICE_IDS[i]}]"
+    )
+    append_inst_override_args "${_inst_id}" "${PREFILL_OVERRIDES_SPEC[i]}"
   done
-  PD_PREFILL_SCHEDULERS_OVERRIDE="multi_inst.router.prefill_schedulers=[$(IFS=,; echo "${prefill_list[*]}")]"
-
-  decode_list=()
   for i in "${!DECODE_START_NODE[@]}"; do
-    decode_list+=("{scheduling_strategy:${ROUTER_DECODE_SCHEDULING_STRATEGY}}")
+    _inst_id="$((PREFILL_COUNT + i))"
+    PD_INST_OVERRIDES_ARGS+=(
+      "+multi_inst.inst_overrides.${_inst_id}.multi_inst.role=decode"
+      "+multi_inst.inst_overrides.${_inst_id}.multi_inst.pd_disaggregation.decode_scheduler.scheduling_strategy=${ROUTER_DECODE_SCHEDULING_STRATEGY}"
+      "+multi_inst.inst_overrides.${_inst_id}.scheduler.type=decode_only"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.max_seq_len=${DECODE_MAX_SEQ_LEN[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.max_batch_size=${DECODE_MAX_BATCH_SIZE[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.request.max_new_tokens=${DECODE_MAX_NEW_TOKENS[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.tp_size=${DECODE_TP[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.pp_size=${DECODE_PP[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.dp_size=${DECODE_DP[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.ep_size=${DECODE_EP[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.device_ids=[${DECODE_DEVICE_IDS[i]}]"
+    )
+    append_inst_override_args "${_inst_id}" "${DECODE_OVERRIDES_SPEC[i]}"
   done
-  PD_DECODE_SCHEDULERS_OVERRIDE="multi_inst.router.decode_schedulers=[$(IFS=,; echo "${decode_list[*]}")]"
 
-  # Prefill/Decode 共用参数
+  # Router and workers receive the same model and instance override map.
   COMMON_ARGS=(
     --config-name="${PD_CONFIG_NAME}"
     "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
     "infer.cache_type=${PD_CACHE_TYPE}"
-    "multi_inst.enabled=True" "multi_inst.router.is_router=False"
     "coordinator.host=${ROUTER_IP}"
     "coordinator.port=21001"
-    "multi_inst.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
+    "multi_inst.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
+    "serve.port=${PD_ROUTER_PORT}"
     "infer.use_cuda_graph=${MODEL_USE_CUDA_GRAPH}" "infer.schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
     "float_16bit_variant=${MODEL_FLOAT16_VARIANT}"
     "multi_inst.n_insts=${PD_TOTAL_INSTANCES}"
-    "${PD_PREFILL_SCHEDULERS_OVERRIDE}" "${PD_DECODE_SCHEDULERS_OVERRIDE}"
+    "${PD_INST_OVERRIDES_ARGS[@]}"
+    "${COMMON_OVERRIDES[@]}"
   )
 
   # ── 启动 Router (仅 Node0) ──
   if [ "${SLURM_PROCID}" = "0" ]; then
     echo "=== Node0: Router ==="
     ROUTER_CMD=(
-      python -m chitu --config-name="${PD_CONFIG_NAME}"
-      "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
-      multi_inst.enabled=True multi_inst.n_insts="${PD_TOTAL_INSTANCES}"
-      multi_inst.router.is_router=True serve.port="${PD_ROUTER_PORT}"
-      "coordinator.host=${ROUTER_IP}"
-      "coordinator.port=21001"
-      "multi_inst.router.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
+      python -m chitu "${COMMON_ARGS[@]}"
+      multi_inst.inst_id=null
+      multi_inst.router.is_router=True
     )
-    ROUTER_CMD+=("${PD_PREFILL_SCHEDULERS_OVERRIDE}" "${PD_DECODE_SCHEDULERS_OVERRIDE}")
-    ROUTER_CMD+=("${COMMON_OVERRIDES[@]}")
 
     apptainer run "${APPTAINER_BASE_ARGS[@]}" "${ROUTER_ENV_ARGS[@]}" "${PD_SIF_FILE}" "${ROUTER_CMD[@]}" \
       > "${LOG_DIR_INNER}/router.${MODEL_NAME_TAG}.log" 2>&1 &
@@ -555,76 +593,31 @@ pd_node_main() {
   [ "${#LOCAL_PREFILL_IDX[@]}" -gt 0 ] || [ "${#LOCAL_DECODE_IDX[@]}" -gt 0 ] || \
     die "cannot map SLURM_PROCID=${SLURM_PROCID} to any instance"
 
-  # ── GPU 分配（相对 GPU ID，始终从 0 开始）──
-  local _gpu_next=0
-
-  alloc_gpu_list() {
-    local need="$1" __out="$2" k
-    [ $((_gpu_next + need)) -le "${PD_GPUS_PER_NODE}" ] || \
-      die "node ${SLURM_PROCID}: need ${need} GPUs starting at ${_gpu_next}, exceeds gpus-per-node=${PD_GPUS_PER_NODE}"
-    local -a list=()
-    for ((k=0; k<need; k++)); do list+=("${_gpu_next}"); _gpu_next=$((_gpu_next + 1)); done
-    printf -v "${__out}" '%s' "$(IFS=,; echo "${list[*]}")"
-  }
-
-  alloc_gpus_for() {
-    local kind="$1"
-    local KIND="${kind^^}"
-    local -n _li="LOCAL_${KIND}_IDX" _lg="LOCAL_${KIND}_GPU_LIST"
-    local -n _np="${KIND}_NPROC_PER_NODE"
-    _lg=()
-    for _p in "${!_li[@]}"; do
-      local _gl=""
-      alloc_gpu_list "${_np[${_li[_p]}]}" _gl
-      _lg[_p]="${_gl}"
-    done
-  }
-  LOCAL_PREFILL_GPU_LIST=(); LOCAL_DECODE_GPU_LIST=()
-  alloc_gpus_for prefill
-  alloc_gpus_for decode
-
   # ── 启动 Prefill/Decode 实例（统一逻辑）──
   LOCAL_PIDS=()
 
   launch_instances() {
     local kind="$1"
-    local KIND="${kind^^}" sched_type dp_offset label
-    [ "${kind}" = "prefill" ] && { sched_type="prefill_only"; dp_offset=0; label="p"; } \
-                               || { sched_type="decode_only"; dp_offset="${PREFILL_COUNT}"; label="d"; }
+    local KIND="${kind^^}" dp_offset label
+    [ "${kind}" = "prefill" ] && { dp_offset=0; label="p"; } \
+                               || { dp_offset="${PREFILL_COUNT}"; label="d"; }
 
-    local -n _li="LOCAL_${KIND}_IDX" _lg="LOCAL_${KIND}_GPU_LIST" _lr="LOCAL_${KIND}_NODE_RANK"
-    local -n _a_nn="${KIND}_NNODES"  _a_tp="${KIND}_TP"  _a_pp="${KIND}_PP"  _a_dp="${KIND}_DP"  _a_ep="${KIND}_EP"
-    local -n _a_msl="${KIND}_MAX_SEQ_LEN" _a_mr="${KIND}_MAX_REQS" _a_mbs="${KIND}_MAX_BATCH_SIZE" _a_mnt="${KIND}_MAX_NEW_TOKENS"
-    local -n _a_pt="${KIND}_PORT" _a_mpt="${KIND}_MASTER_PORT" _a_np="${KIND}_NPROC_PER_NODE"
-    local -n _a_sn="${KIND}_START_NODE" _a_ovr="${KIND}_OVERRIDES_SPEC"
+    local -n _li="LOCAL_${KIND}_IDX" _lr="LOCAL_${KIND}_NODE_RANK"
+    local -n _a_nn="${KIND}_NNODES" _a_mpt="${KIND}_MASTER_PORT" _a_np="${KIND}_NPROC_PER_NODE"
+    local -n _a_sn="${KIND}_START_NODE" _a_dev="${KIND}_DEVICE_IDS"
 
     for _pos in "${!_li[@]}"; do
-      local _idx="${_li[_pos]}" _gpu="${_lg[_pos]}" _rank="${_lr[_pos]}"
+      local _idx="${_li[_pos]}" _rank="${_lr[_pos]}"
       local _master_addr="$(to_ip "${NODE_ARR[${_a_sn[_idx]}]}")"
 
-      local -a _ovr=()
-      while IFS= read -r _o; do [ -n "${_o}" ] && _ovr+=("${_o}"); done < <(split_overrides_to_array "${_a_ovr[_idx]}")
-      local -a _batch_args=()
-      if [ -n "${_a_mbs[_idx]}" ] && [ "${_a_mbs[_idx]}" != "null" ]; then
-        _batch_args+=("infer.max_batch_size=${_a_mbs[_idx]}")
-      elif [ -n "${_a_mr[_idx]}" ] && [ "${_a_mr[_idx]}" != "null" ]; then
-        _batch_args+=("infer.max_batch_size=${_a_mr[_idx]}")
-      fi
-
-      echo "=== ${kind^} ${label^^}${_idx}: rank=${_rank}/${_a_nn[_idx]} master=${_master_addr}:${_a_mpt[_idx]} gpus=${_gpu} ==="
+      echo "=== ${kind^} ${label^^}${_idx}: rank=${_rank}/${_a_nn[_idx]} master=${_master_addr}:${_a_mpt[_idx]} device_ids=[${_a_dev[_idx]}] ==="
       local -a _CMD=(
         python -m torch.distributed.run
         --nnodes="${_a_nn[_idx]}" --nproc_per_node="${_a_np[_idx]}"
         --node_rank="${_rank}" --master_addr="${_master_addr}" --master_port="${_a_mpt[_idx]}"
         -m chitu "${COMMON_ARGS[@]}"
-        "infer.max_seq_len=${_a_msl[_idx]}"
-        "${_batch_args[@]}"
-        "request.max_new_tokens=${_a_mnt[_idx]}"
         "multi_inst.inst_id=$((dp_offset + _idx))"
-        "scheduler.type=${sched_type}"
-        "infer.tp_size=${_a_tp[_idx]}" "infer.pp_size=${_a_pp[_idx]}" "infer.dp_size=${_a_dp[_idx]}" "infer.ep_size=${_a_ep[_idx]}"
-        "infer.device_ids=[${_gpu}]"
-        "${COMMON_OVERRIDES[@]}" "${_ovr[@]}"
+        "multi_inst.router.is_router=False"
       )
 
       apptainer run "${APPTAINER_BASE_ARGS[@]}" "${PD_SIF_FILE}" "${_CMD[@]}" \

@@ -15,7 +15,11 @@ import time
 import traceback
 from collections import deque, OrderedDict
 from dataclasses import dataclass, field
-from chitu.global_vars import get_global_args
+from chitu.global_vars import (
+    get_global_args,
+    is_classic_pd_disagg,
+    is_independent_multi_inst,
+)
 from chitu.distributed.coordinator import set_endpoint, get_endpoint
 from chitu.boot.tcp_ip import get_local_ip
 import zmq
@@ -427,9 +431,7 @@ class RequestRouter:
         self.total_requests = 0
         self.total_tokens = 0
         self.start_time = time.time()
-        pd_disagg = getattr(self.config, "pd_disaggregation", None)
-        pd_enabled = getattr(pd_disagg, "enabled", False) if pd_disagg else False
-        if not pd_enabled:
+        if not is_classic_pd_disagg():
             logger.info(f"RequestRouter initialized for {self._n_insts} instance(s)")
         self.collector_addrs: dict[int, list[str]] = {}
 
@@ -790,13 +792,7 @@ async def start_request_router():
     args = get_global_args()
     multi_inst = args.multi_inst
 
-    # Check if PD disaggregation is enabled
-    pd_enabled = (
-        hasattr(multi_inst.router, "pd_disaggregation")
-        and multi_inst.router.pd_disaggregation.enabled
-    )
-
-    if pd_enabled:
+    if is_classic_pd_disagg():
         logger.info("Creating PD disaggregation router...")
         # NOTE: keep local import to avoid circular dependency:
         # pd_request_router.py imports RequestRouter from this module.
@@ -804,14 +800,18 @@ async def start_request_router():
             PDRequestRouter,
         )
 
-        # Create PD router configuration - directly use multi_inst.router
-        router = PDRequestRouter(multi_inst.router)
-    else:
+        # The PD router uses router policy settings and PD transfer settings.
+        router = PDRequestRouter(multi_inst.router, multi_inst.pd_disaggregation)
+    elif is_independent_multi_inst():
         logger.info("Creating DP unified router...")
 
         # Instance scheduler endpoints are resolved from the coordinator at
         # socket-init time (roles `instance_0`, `instance_1`, ...).
         router = RequestRouter(multi_inst.router)
+    else:
+        raise NotImplementedError(
+            "Mixing prefill_and_decode with prefill/decode roles is not supported"
+        )
 
     set_global_request_router(router)
     logger.info("Request Router configured successfully")

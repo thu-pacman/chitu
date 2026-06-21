@@ -37,16 +37,13 @@ def setup_global_args():
                     "dp_size": 1,
                 },
                 "multi_inst": {
-                    "enabled": True,
-                    "router": {
-                        "pd_disaggregation": {
-                            "enabled": False,
-                        }
-                    },
+                    "n_insts": 2,
+                    "router": {},
                 },
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
 
@@ -373,6 +370,7 @@ class TestPagedKVCacheManager:
                 }
             ),
             need_ensure=False,
+            need_preprocess=False,
         )  # task计算kv_cache_len_used_in_completed_steps_and_next_step时会用到全局的mtp_size信息
         cache_manager.mtp_size = 500  # 设定mtp_size为500
 

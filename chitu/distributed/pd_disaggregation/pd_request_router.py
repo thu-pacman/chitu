@@ -25,7 +25,10 @@ from chitu.dp_request_router import (
     RequestRouter,
     SchedulerStats,
 )
-from chitu.schemas.serve_config import RouterConfig as ServeRouterConfig
+from chitu.schemas.serve_config import (
+    PDDisaggregationConfig,
+    RouterConfig as ServeRouterConfig,
+)
 from chitu.distributed.pd_disaggregation.pd_coordination import PDCoordinationService
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.transfer_engine import (
     MooncakeBootstrapServer,
@@ -39,7 +42,7 @@ from chitu.metrics.prometheus_collector import (
     chitu_router_pending_requests,
     observe_pd_stage,
 )
-from chitu.global_vars import get_global_args
+from chitu.global_vars import get_global_args, get_multi_inst_ids_by_role
 from chitu.distributed.coordinator import set_endpoint, get_endpoint
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.task import UserRequest
@@ -73,103 +76,87 @@ def _policy_stats(policy, local_instance_id: int) -> str:
 class PDRequestRouter(RequestRouter):
     """PD disaggregation request router"""
 
-    def __init__(self, config: ServeRouterConfig):
+    def __init__(self, config: ServeRouterConfig, pd_config: PDDisaggregationConfig):
         super().__init__(config)
+        self.pd_config = pd_config
 
-        # PD disaggregation related configuration
-        self.pd_enabled = (
-            getattr(config, "pd_disaggregation", None)
-            and config.pd_disaggregation.enabled
+        logger.info("using classic pd disaggregation")
+
+        self.pending_pd_requests: dict[str, PendingPDRequest] = {}
+        self.prefill_schedulers: dict[int, dict] = {}  # local_instance_id -> info
+        self.decode_schedulers: dict[int, dict] = {}  # local_instance_id -> info
+
+        self.pd_coordination_service = PDCoordinationService()
+        self._parse_pd_scheduler_configs()
+
+        self.prefill_sockets = {}
+        self.decode_sockets = {}
+        self.bootstrap_server: Optional[MooncakeBootstrapServer] = None
+
+        # Keep P/D stats in separate policy instances so local_instance_id spaces can overlap.
+        routing_algorithm = getattr(self.config, "routing_algorithm", "")
+        if routing_algorithm == "prefix_cache_aware":
+            self.prefill_policy = PrefixCacheAwarePolicy(self.config)
+        elif routing_algorithm in ("round_robin", "power_of_two_choices"):
+            self.prefill_policy = LoadBalancer(self.config)
+            self.prefill_policy.algorithm = routing_algorithm
+        else:
+            raise ValueError(
+                "pd_disaggregation routing_algorithm only supports "
+                "round_robin, power_of_two_choices, or prefix_cache_aware "
+                f"(got {routing_algorithm!r})"
+            )
+
+        decode_algorithm = getattr(
+            self.config, "routing_algorithm_for_decode", "power_of_two_choices"
+        )
+        if decode_algorithm not in ("round_robin", "power_of_two_choices"):
+            raise ValueError(
+                "pd_disaggregation decode routing only supports "
+                "round_robin or power_of_two_choices "
+                f"(got {decode_algorithm!r})"
+            )
+        self.decode_policy = LoadBalancer(self.config)
+        self.decode_policy.algorithm = decode_algorithm
+        self.policy = self.prefill_policy
+        self._pd_stats_logged: set[tuple[str, int]] = set()
+        logger.info(
+            "[PD_ROUTER][policy_config] prefill_policy=%s prefill_algorithm=%s "
+            "decode_policy=%s decode_algorithm=%s",
+            _policy_name(self.prefill_policy),
+            _policy_algorithm(self.prefill_policy),
+            _policy_name(self.decode_policy),
+            _policy_algorithm(self.decode_policy),
         )
 
-        if self.pd_enabled:
-            logger.info("pd disaggregation enabled")
-
-            # PD disaggregation related state
-            self.pending_pd_requests: dict[str, PendingPDRequest] = {}
-            self.prefill_schedulers: dict[int, dict] = {}  # local_instance_id -> info
-            self.decode_schedulers: dict[int, dict] = {}  # local_instance_id -> info
-
-            # PD coordination service
-            self.pd_coordination_service = PDCoordinationService()
-
-            # Parse Prefill and Decode Scheduler configs
-            self._parse_pd_scheduler_configs()
-
-            # PD-specific sockets
-            self.prefill_sockets = {}
-            self.decode_sockets = {}
-
-            # Bootstrap Server (Mooncake)
-            self.bootstrap_server: Optional[MooncakeBootstrapServer] = None
-
-            # Keep P/D stats in separate policy instances so local_instance_id spaces can overlap.
-            routing_algorithm = getattr(self.config, "routing_algorithm", "")
-            if routing_algorithm == "prefix_cache_aware":
-                self.prefill_policy = PrefixCacheAwarePolicy(self.config)
-            elif routing_algorithm in ("round_robin", "power_of_two_choices"):
-                self.prefill_policy = LoadBalancer(self.config)
-                self.prefill_policy.algorithm = routing_algorithm
-            else:
-                raise ValueError(
-                    "pd_disaggregation routing_algorithm only supports "
-                    "round_robin, power_of_two_choices, or prefix_cache_aware "
-                    f"(got {routing_algorithm!r})"
+        now = time.time()
+        # To avoid heartbeat log before first collect, initialize last_heartbeat_time to inf.
+        for local_instance_id in self.prefill_schedulers:
+            self.prefill_policy.update_stats(
+                SchedulerStats(
+                    local_instance_id=local_instance_id,
+                    running_requests=0,
+                    waiting_requests=0,
+                    pending_tokens=0,
+                    throughput_tokens_per_sec=0.0,
+                    last_update_time=now,
+                    last_heartbeat_time=float("inf"),
+                    is_alive=True,
                 )
-
-            decode_algorithm = getattr(
-                self.config, "routing_algorithm_for_decode", "power_of_two_choices"
             )
-            if decode_algorithm not in ("round_robin", "power_of_two_choices"):
-                raise ValueError(
-                    "pd_disaggregation decode routing only supports "
-                    "round_robin or power_of_two_choices "
-                    f"(got {decode_algorithm!r})"
+        for local_instance_id in self.decode_schedulers:
+            self.decode_policy.update_stats(
+                SchedulerStats(
+                    local_instance_id=local_instance_id,
+                    running_requests=0,
+                    waiting_requests=0,
+                    pending_tokens=0,
+                    throughput_tokens_per_sec=0.0,
+                    last_update_time=now,
+                    last_heartbeat_time=float("inf"),
+                    is_alive=True,
                 )
-            self.decode_policy = LoadBalancer(self.config)
-            self.decode_policy.algorithm = decode_algorithm
-            self.policy = self.prefill_policy
-            self._pd_stats_logged: set[tuple[str, int]] = set()
-            logger.info(
-                "[PD_ROUTER][policy_config] prefill_policy=%s prefill_algorithm=%s "
-                "decode_policy=%s decode_algorithm=%s",
-                _policy_name(self.prefill_policy),
-                _policy_algorithm(self.prefill_policy),
-                _policy_name(self.decode_policy),
-                _policy_algorithm(self.decode_policy),
             )
-
-            now = time.time()
-            # To avoid heartbeat log before first collect, here initialize last_heartbeat_time to inf
-            for local_instance_id in self.prefill_schedulers:
-                self.prefill_policy.update_stats(
-                    SchedulerStats(
-                        local_instance_id=local_instance_id,
-                        running_requests=0,
-                        waiting_requests=0,
-                        pending_tokens=0,
-                        throughput_tokens_per_sec=0.0,
-                        last_update_time=now,
-                        last_heartbeat_time=float("inf"),
-                        is_alive=True,
-                    )
-                )
-            for local_instance_id in self.decode_schedulers:
-                self.decode_policy.update_stats(
-                    SchedulerStats(
-                        local_instance_id=local_instance_id,
-                        running_requests=0,
-                        waiting_requests=0,
-                        pending_tokens=0,
-                        throughput_tokens_per_sec=0.0,
-                        last_update_time=now,
-                        last_heartbeat_time=float("inf"),
-                        is_alive=True,
-                    )
-                )
-
-        else:
-            logger.info("using traditional unified scheduler mode")
 
     def _parse_pd_scheduler_configs(self):
         """Parse PD Scheduler configuration.
@@ -178,63 +165,40 @@ class PDRequestRouter(RequestRouter):
         coordinator in `_init_pd_sockets`; only the per-scheduler parameters are
         read here.
         """
-        if hasattr(self.config, "prefill_schedulers"):
-            for i, scheduler_config in enumerate(self.config.prefill_schedulers):
-                self.prefill_schedulers[i] = {
-                    "max_batch_size": getattr(scheduler_config, "max_batch_size", 32),
-                    "max_total_tokens": getattr(
-                        scheduler_config, "max_total_tokens", 8192
-                    ),
-                    "batching_strategy": getattr(
-                        scheduler_config, "batching_strategy", "varlen"
-                    ),
-                    "status": "online",
-                }
-                logger.info(f"configuring prefill scheduler {i}")
+        for i, inst_id in enumerate(get_multi_inst_ids_by_role("prefill")):
+            self.prefill_schedulers[i] = {
+                "global_instance_id": inst_id,
+                "status": "online",
+            }
+            logger.info(f"configuring prefill scheduler {i} for instance {inst_id}")
 
-        if hasattr(self.config, "decode_schedulers"):
-            for i, scheduler_config in enumerate(self.config.decode_schedulers):
-                self.decode_schedulers[i] = {
-                    "scheduling_strategy": getattr(
-                        scheduler_config, "scheduling_strategy", "immediate"
-                    ),
-                    "status": "online",
-                }
-                logger.info(f"configuring decode scheduler {i}")
+        for i, inst_id in enumerate(get_multi_inst_ids_by_role("decode")):
+            self.decode_schedulers[i] = {
+                "global_instance_id": inst_id,
+                "status": "online",
+            }
+            logger.info(f"configuring decode scheduler {i} for instance {inst_id}")
 
     async def start(self):
         """Start router service"""
-        if self.pd_enabled:
-            logger.info("starting pd disaggregation router...")
+        logger.info("starting pd disaggregation router...")
 
-            # Start PD coordination service
-            if self.pd_coordination_service:
-                await self.pd_coordination_service.start()
+        await self.pd_coordination_service.start()
+        await self._start_bootstrap_server_if_needed()
 
-            # Start Mooncake Bootstrap (HTTP)
-            await self._start_bootstrap_server_if_needed()
+        # Initialize PD-specific sockets. This discovers each scheduler's
+        # request endpoint from the coordinator and registers it with the
+        # coordination service.
+        await self._init_pd_sockets()
 
-            # Initialize PD-specific sockets. This discovers each scheduler's
-            # request endpoint from the coordinator and registers it with the
-            # coordination service.
-            await self._init_pd_sockets()
-
-            # Launch PD-specific tasks
-            await asyncio.gather(
-                self._stats_collector_task(),
-                self._pd_request_processor_task(),
-                self._health_monitor_task(),
-                self._heartbeat_monitor_task(),
-                (
-                    self._pd_coordination_task()
-                    if self.pd_coordination_service
-                    else asyncio.sleep(0)
-                ),
-                self._wait_for_pd_instances(),
-            )
-        else:
-            # Use parent class start logic
-            await super().start()
+        await asyncio.gather(
+            self._stats_collector_task(),
+            self._pd_request_processor_task(),
+            self._health_monitor_task(),
+            self._heartbeat_monitor_task(),
+            self._pd_coordination_task(),
+            self._wait_for_pd_instances(),
+        )
 
     async def _init_pd_sockets(self):
         """Initialize PD specific ZMQ socket.
@@ -305,8 +269,6 @@ class PDRequestRouter(RequestRouter):
 
     def _init_prefill_policy_shadow_caches(self) -> None:
         """Mirror RequestRouter._init_sockets prefix-cache bookkeeping for each prefill slot."""
-        if not getattr(self, "pd_enabled", False):
-            return
         if hasattr(self.prefill_policy, "cached_blocks"):
             for sid in self.prefill_schedulers:
                 self.prefill_policy.cached_blocks.setdefault(sid, OrderedDict())
@@ -316,9 +278,6 @@ class PDRequestRouter(RequestRouter):
 
     @override
     async def _heartbeat_monitor_task(self, timeout: float = 20.0):
-        if not self.pd_enabled:
-            return super()._heartbeat_monitor_task(timeout)
-
         HEARTBEAT_TIMEOUT = timeout  # 20s timeout threshold
         while True:
             current_time = time.time()
@@ -340,9 +299,6 @@ class PDRequestRouter(RequestRouter):
 
     @override
     async def _health_monitor_task(self):
-        if not self.pd_enabled:
-            return super()._health_monitor_task()
-
         while True:
             try:
                 await asyncio.sleep(30)  # Log every 30 seconds
@@ -366,9 +322,9 @@ class PDRequestRouter(RequestRouter):
                         if policy is None:
                             raise ValueError(f"{role} policy not found")
                         for local_instance_id, stats in policy.scheduler_stats.items():
-                            instance_id = local_instance_id + (
-                                0 if role == "prefill" else len(self.prefill_schedulers)
-                            )
+                            instance_id = get_multi_inst_ids_by_role(role)[
+                                local_instance_id
+                            ]
                             logger.debug(
                                 f"Instance {role} {local_instance_id}: "
                                 f"running={stats.running_requests}, "
@@ -382,11 +338,8 @@ class PDRequestRouter(RequestRouter):
                 logger.error(f"Error in health monitor: {e}")
 
     async def _stats_collector_task(self):
-        """PD mode: keep prefill/decode stats in separate policies."""
-        if self.pd_enabled:
-            await self._pd_stats_collector_task()
-        else:
-            await super()._stats_collector_task()
+        """Keep prefill/decode stats in separate policies."""
+        await self._pd_stats_collector_task()
 
     async def _pd_stats_collector_task(self):
         while True:
@@ -452,30 +405,17 @@ class PDRequestRouter(RequestRouter):
                     prometheus_collector_addrs = stats_dict.get(
                         "prometheus_collector_addrs", []
                     )
+                    instance_id = get_multi_inst_ids_by_role(role)[local_instance_id]
                     if (
-                        self.collector_addrs.get(local_instance_id, None) is None
+                        self.collector_addrs.get(instance_id, None) is None
                         and len(prometheus_collector_addrs) > 0
                     ):
-                        if role == "prefill":
-                            instance_id = local_instance_id
-                        elif role == "decode":
-                            instance_id = local_instance_id + len(
-                                self.prefill_schedulers
-                            )
-                        else:
-                            instance_id = local_instance_id
                         logger.debug(
                             f"[PD_ROUTER] received Prometheus collector addresses from {role} {local_instance_id} (instance {instance_id})"
                         )
                         self.collector_addrs[instance_id] = prometheus_collector_addrs
-                        prefill_instance_ids = [
-                            instance_id
-                            for instance_id in self.prefill_schedulers.keys()
-                        ]
-                        decode_instance_ids = [
-                            instance_id + len(self.prefill_schedulers)
-                            for instance_id in self.decode_schedulers.keys()
-                        ]
+                        prefill_instance_ids = get_multi_inst_ids_by_role("prefill")
+                        decode_instance_ids = get_multi_inst_ids_by_role("decode")
                         all_scheduler_ids = prefill_instance_ids + decode_instance_ids
                         if all(
                             self.collector_addrs.get(instance_id, None) is not None
@@ -493,16 +433,8 @@ class PDRequestRouter(RequestRouter):
 
     async def _start_bootstrap_server_if_needed(self):
         """Start Mooncake Bootstrap HTTP server on Router if configured"""
-        if (
-            hasattr(self.config, "pd_disaggregation")
-            and getattr(
-                self.config.pd_disaggregation, "kv_transfer_backend", "mooncake"
-            )
-            == "mooncake"
-        ):
-            bootstrap_port = getattr(
-                self.config.pd_disaggregation, "bootstrap_port", 29888
-            )
+        if getattr(self.pd_config, "kv_transfer_backend", "mooncake") == "mooncake":
+            bootstrap_port = getattr(self.pd_config, "bootstrap_port", 29888)
             # Start only once
             if self.bootstrap_server is None:
                 logger.info(
@@ -514,11 +446,7 @@ class PDRequestRouter(RequestRouter):
 
     async def add_request(self, request: UserRequest):
         """Add request to router"""
-        if self.pd_enabled:
-            await self._add_pd_request(request)
-        else:
-            # 使用父类的逻辑
-            await super().add_request(request)
+        await self._add_pd_request(request)
 
     async def _add_pd_request(self, request: UserRequest):
         """Add PD disaggregation request"""
@@ -733,9 +661,6 @@ class PDRequestRouter(RequestRouter):
 
     async def broadcast_profile(self, payload: dict) -> dict:
         """Broadcast a profile command to schedulers."""
-        if not self.pd_enabled:
-            raise RuntimeError("broadcast_profile called outside PD mode")
-
         control_msg = {"__chitu_msg_type": "profile", "payload": payload}
         packed = msgpack.packb(control_msg)
 
@@ -841,28 +766,21 @@ class PDRequestRouter(RequestRouter):
         """Get performance statistics"""
         stats = super().get_performance_stats()
 
-        if self.pd_enabled:
-            # Add PD-specific statistics
-            pd_stats = {
-                "pd_enabled": True,
-                "pending_pd_requests": len(self.pending_pd_requests),
-                "prefill_schedulers": len(self.prefill_schedulers),
-                "decode_schedulers": len(self.decode_schedulers),
-            }
+        pd_stats = {
+            "pd_enabled": True,
+            "pending_pd_requests": len(self.pending_pd_requests),
+            "prefill_schedulers": len(self.prefill_schedulers),
+            "decode_schedulers": len(self.decode_schedulers),
+        }
 
-            # Count number of requests by status
-            status_counts = {}
-            for pd_request in self.pending_pd_requests.values():
-                status = pd_request.status.value
-                status_counts[status] = status_counts.get(status, 0) + 1
+        status_counts = {}
+        for pd_request in self.pending_pd_requests.values():
+            status = pd_request.status.value
+            status_counts[status] = status_counts.get(status, 0) + 1
 
-            pd_stats["status_counts"] = status_counts
-
-            if self.pd_coordination_service:
-                coordination_stats = self.pd_coordination_service.get_pd_stats()
-                pd_stats["coordination"] = coordination_stats
-
-            stats.update(pd_stats)
+        pd_stats["status_counts"] = status_counts
+        pd_stats["coordination"] = self.pd_coordination_service.get_pd_stats()
+        stats.update(pd_stats)
 
         return stats
 
@@ -870,8 +788,7 @@ class PDRequestRouter(RequestRouter):
         """PD Router Shutdown"""
         logger.info("closing pd router...")
 
-        if self.pd_enabled and self.pd_coordination_service:
-            await self.pd_coordination_service.stop()
+        await self.pd_coordination_service.stop()
 
         # Close PD-specific sockets
         for socket in self.prefill_sockets.values():

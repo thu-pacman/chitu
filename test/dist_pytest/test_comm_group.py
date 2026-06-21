@@ -12,6 +12,7 @@ def _init_global_args():
     set_global_args(
         OmegaConf.create({"infer": {}, "models": {"quant_config": {"rules": []}}}),
         need_ensure=False,
+        need_preprocess=False,
     )
 
 

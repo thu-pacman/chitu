@@ -57,20 +57,8 @@ def cleanup_task_pool():
 
 @pytest.fixture
 def ensure_global_args():
-    """Ensure global_args is initialized with minimal config for Task creation.
-
-    If global_args is already set (by another test), we don't re-set it.
-    This avoids AssertionError from set_global_args when running in a shared pytest session.
-    """
+    """Ensure global_args is initialized with minimal config for Task creation."""
     from chitu.global_vars import get_global_args, set_global_args
-
-    # Check if already initialized
-    try:
-        get_global_args()
-        return  # Already initialized, don't try to re-set
-    except AssertionError:
-        pass  # Not initialized, we can set it
-
     from omegaconf import OmegaConf
 
     set_global_args(
@@ -87,7 +75,9 @@ def ensure_global_args():
                     "schedule_overlap": False,
                 }
             }
-        )
+        ),
+        need_ensure=False,
+        need_preprocess=False,
     )
 
 

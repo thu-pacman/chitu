@@ -74,7 +74,7 @@ def create_client(monkeypatch):
         responses_api,
         "get_global_args",
         lambda: SimpleNamespace(
-            multi_inst=SimpleNamespace(enabled=False),
+            multi_inst=SimpleNamespace(n_insts=1),
             request=SimpleNamespace(max_new_tokens=64),
             debug=SimpleNamespace(save_trace_dir=None),
         ),

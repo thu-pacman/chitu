@@ -453,11 +453,7 @@ class KVManager:
         self._trace_room_to_request_id: dict[UUID, str] = {}
 
         # Get PD disaggregation config
-        pd_config = (
-            args.multi_inst.router.pd_disaggregation
-            if hasattr(args.multi_inst.router, "pd_disaggregation")
-            else None
-        )
+        pd_config = args.multi_inst.pd_disaggregation
         # Auto-detect the active IB device(s) with the highest rate. This may be
         # a comma-separated list of multiple NICs, which MooncakeTransferEngine
         # accepts directly.

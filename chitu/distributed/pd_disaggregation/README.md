@@ -35,6 +35,8 @@
      └────────────────────────┘              └────────────────────────────┘
 ```
 
+运行模式由所有实例的有效 `multi_inst.role` 推导：所有实例均为 `prefill_and_decode` 时使用独立多实例模式；所有实例均为 `prefill` 或 `decode` 时使用经典 PD 分离模式。
+
 ## 通信分层
 
 系统通信分为**控制面**和**数据面**两层：
@@ -283,7 +285,7 @@ MooncakeBootstrapServer vs PDCoordinationService：
 
 ## 配置
 
-不论什么拓扑（1P1D、2P3D、XP YD），统一使用 `pd_disagg_serve_config.yaml` 作为基础配置。启动脚本通过 Hydra 命令行 override 动态覆盖 `prefill_schedulers` / `decode_schedulers` 列表和 `dp_size` 等字段，无需为每种拓扑维护单独的配置文件。
+不论什么拓扑（1P1D、2P3D、XP YD），统一使用 `pd_disagg_serve_config.yaml` 作为基础配置。启动脚本通过 Hydra 命令行 override 动态覆盖 `multi_inst.inst_overrides` 和 `dp_size` 等字段，无需为每种拓扑维护单独的配置文件。
 
 配置文件位于 `chitu/config/pd_disagg_serve_config.yaml`，继承 `serve_config.yaml` 的通用项：
 
@@ -293,9 +295,24 @@ defaults:
   - _self_
 
 multi_inst:
-  enabled: True
   n_insts: 2                       # P + D 总实例数（启动时覆盖）
-  inst_id: 0                       # 当前进程的实例 ID（启动时覆盖）
+  inst_id: 0                       # 当前实例 ID；Router 启动时设为 null
+  role: "prefill_and_decode"
+  inst_overrides: {}               # 启动时覆盖为每个实例的有效配置
+
+  pd_disaggregation:
+    prefill_scheduler: null
+    decode_scheduler: null
+    kv_transfer_backend: "mooncake"
+    bootstrap_port: 8080           # Bootstrap HTTP 端口
+
+    kv_transfer:
+      buffer_size: 2048
+      transfer_timeout: 30.0
+      max_concurrent_transfers: 8
+      decode_wait_timeout_s: 300.0   # Decode 等待 KV 传输完成的超时
+      decode_resend_interval_s: 0.5  # Decode 重发 TRANSFER_INFO 间隔
+      decode_poll_interval_s: 0.05   # Decode 轮询 KV 状态间隔
 
   router:
     is_router: True                # Router 进程设为 True，P/D 设为 False
@@ -303,30 +320,25 @@ multi_inst:
     port: 21003                    # HTTP 推理入口端口
     routing_algorithm: "power_of_two_choices"
 
-    pd_disaggregation:
-      enabled: True
-      kv_transfer_backend: "mooncake"
-      bootstrap_port: 8080         # Bootstrap HTTP 端口
-
-      kv_transfer:
-        buffer_size: 2048
-        transfer_timeout: 30.0
-        max_concurrent_transfers: 8
-        decode_wait_timeout_s: 300.0   # Decode 等待 KV 传输完成的超时
-        decode_resend_interval_s: 0.5  # Decode 重发 TRANSFER_INFO 间隔
-        decode_poll_interval_s: 0.05   # Decode 轮询 KV 状态间隔
-
-    # 以下列表在启动时由脚本动态覆盖
-    prefill_schedulers:
-      - max_batch_size: 32
-        max_total_tokens: 8192
-        batching_strategy: "varlen"
-
-    decode_schedulers:
-      - scheduling_strategy: "immediate"
+  # 启动脚本会生成以下形式的实例覆盖配置
+  inst_overrides:
+    0:
+      multi_inst:
+        role: "prefill"
+        pd_disaggregation:
+          prefill_scheduler:
+            max_batch_size: 32
+            max_total_tokens: 8192
+            batching_strategy: "varlen"
+    1:
+      multi_inst:
+        role: "decode"
+        pd_disaggregation:
+          decode_scheduler:
+            scheduling_strategy: "immediate"
 ```
 
-每个 P/D 调度器启动后绑定随机端口，并通过 coordinator 以角色 `prefill_instance_<id>` / `decode_instance_<id>` 注册 endpoint；Router 从 coordinator 发现各调度器地址，无需在配置中填写 host/port。启动脚本 `srun_pd_disagg_base_apptainer.sh` 会根据 `--prefill` / `--decode` 参数自动生成 `prefill_schedulers` 和 `decode_schedulers` 的 Hydra override 传给 Router，同时为每个 P/D 实例设置对应的 `multi_inst.inst_id`。`--pd-spec` 中的参数（如 `decode_wait_timeout_s`）会覆盖上面 `kv_transfer` 下的默认值。
+每个 P/D 调度器启动后绑定随机端口，并通过 coordinator 以角色 `prefill_instance_<id>` / `decode_instance_<id>` 注册 endpoint；Router 从 coordinator 发现各调度器地址，无需在配置中填写 host/port。启动脚本 `srun_pd_disagg_base_apptainer.sh` 会根据 `--prefill` / `--decode` 参数自动生成 `multi_inst.inst_overrides` 的 Hydra override 传给 Router 和每个 P/D 实例，同时为 Router 设置 `multi_inst.inst_id=null`，为每个 P/D 实例设置对应的 `multi_inst.inst_id`。`--pd-spec` 中的参数（如 `decode_wait_timeout_s`）会覆盖上面 `kv_transfer` 下的默认值。
 
 ### 端口矩阵（2P3D 示例）
 

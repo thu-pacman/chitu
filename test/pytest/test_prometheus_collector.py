@@ -12,8 +12,7 @@ from chitu.global_vars import set_global_args
 def set_default_global_args():
     # global_args here is useless, but it must exists
     set_global_args(
-        OmegaConf.create({"infer": {}}),
-        need_ensure=False,
+        OmegaConf.create({"infer": {}}), need_ensure=False, need_preprocess=False
     )
 
 

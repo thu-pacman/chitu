@@ -276,6 +276,7 @@ def test_kv_cache_transfer(
     set_global_args(
         OmegaConf.create({"models": {"n_kv_heads": num_heads}}),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     cache_blocks = torch.zeros(
@@ -405,6 +406,7 @@ def test_kv_cache_transfer_prefill_tp1_to_decode_tp2(monkeypatch):
     set_global_args(
         OmegaConf.create({"models": {"n_kv_heads": num_heads}}),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     cache_blocks = torch.zeros(
@@ -487,6 +489,7 @@ def test_kv_cache_transfer_prefill_tp1_to_decode_tp2_with_real_kv_keys(monkeypat
     set_global_args(
         OmegaConf.create({"models": {"n_kv_heads": num_heads}}),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     k_cache_blocks = _build_cache_blocks(
@@ -587,6 +590,7 @@ def test_kv_cache_transfer_prefill_tp2_to_decode_tp2(monkeypatch):
     set_global_args(
         OmegaConf.create({"models": {"n_kv_heads": num_heads}}),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     cache_blocks = _build_cache_blocks(
@@ -671,6 +675,7 @@ def test_kv_cache_transfer_prefill_tp2_pp2_to_decode_tp2_pp2(monkeypatch):
     set_global_args(
         OmegaConf.create({"models": {"n_kv_heads": num_heads, "n_layers": num_layers}}),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     cache_blocks = _build_cache_blocks(
@@ -780,6 +785,7 @@ def test_mla_kv_cache_transfer_prefill_tp2_to_decode_tp1(monkeypatch):
     set_global_args(
         OmegaConf.create({"models": {"n_kv_heads": 4, "n_layers": num_layers}}),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     cache_blocks = _build_replicated_cache_blocks(
@@ -842,6 +848,7 @@ def test_mla_kv_cache_transfer_prefill_tp2_pp2_to_decode_tp2_pp2(monkeypatch):
     set_global_args(
         OmegaConf.create({"models": {"n_kv_heads": 4, "n_layers": num_layers}}),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     cache_blocks = _build_replicated_cache_blocks(
@@ -930,6 +937,7 @@ def test_mla_kv_cache_transfer_rejects_tp_sharded_decode_layout(monkeypatch):
     set_global_args(
         OmegaConf.create({"models": {"n_kv_heads": 4, "n_layers": num_layers}}),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     prefill_cache = MonkPagedCache(
@@ -988,6 +996,7 @@ def test_mla_kv_cache_transfer_rejects_decode_pp_layer_mismatch(monkeypatch):
     set_global_args(
         OmegaConf.create({"models": {"n_kv_heads": 4, "n_layers": num_layers}}),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     prefill_cache = MonkPagedCache(
@@ -1048,6 +1057,7 @@ def test_reorder_kvcache_skips_when_decode_tp_gt1(monkeypatch):
     set_global_args(
         OmegaConf.create({"models": {"n_kv_heads": num_heads}}),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     local_heads = num_heads // tp_size

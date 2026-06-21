@@ -211,7 +211,7 @@ class PDInstanceRequestManager:
         self.token_manager = None  # DP token manager for streaming back to Router
 
         # Queue config
-        pd_cfg = args.multi_inst.router.pd_disaggregation
+        pd_cfg = args.multi_inst.pd_disaggregation
         self._kv_cfg = pd_cfg.kv_transfer
         self._queue_max_pending = int(
             self._kv_cfg.queue_max_pending

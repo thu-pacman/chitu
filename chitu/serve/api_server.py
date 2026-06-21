@@ -25,7 +25,12 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from chitu.backend import Backend
 from chitu.dp_router import get_request_router, get_token_router
-from chitu.global_vars import get_global_args, set_global_args
+from chitu.global_vars import (
+    get_global_args,
+    is_classic_pd_disagg,
+    is_independent_multi_inst,
+    set_global_args,
+)
 from chitu.task import TaskPool
 from chitu.profiler import MemoryRecorder
 from chitu.serve.event_loop import start_server_in_new_event_loop
@@ -202,7 +207,7 @@ async def init_chitu_service():
     args = get_global_args()
     from chitu.chitu_main import chitu_init
 
-    chitu_init(args)
+    args = chitu_init(args)
     set_server_status(initialized=True)
     return {"message": "Service initial done."}
 
@@ -278,10 +283,13 @@ def _is_pd_router_process() -> bool:
     """Detect whether this process is a PD-mode Router."""
     args = get_global_args()
     router_cfg = getattr(getattr(args, "multi_inst", None), "router", None)
-    pd_cfg = getattr(router_cfg, "pd_disaggregation", None)
-    if pd_cfg is None or not getattr(pd_cfg, "enabled", False):
+    if is_classic_pd_disagg():
+        return bool(getattr(router_cfg, "is_router", False))
+    if is_independent_multi_inst():
         return False
-    return bool(getattr(router_cfg, "is_router", False))
+    raise NotImplementedError(
+        "Mixing prefill_and_decode with prefill/decode roles is not supported"
+    )
 
 
 def _validate_pd_profile_request(request: "ProfileRequest") -> None:
@@ -520,8 +528,6 @@ async def get_dp_config():
                 "process_type": "Router Process",
                 "note": "Router process, global_args not set",
                 "config": {
-                    "enabled": True,
-                    "simple_mode": False,
                     "inter_dp_size": 1,
                     "scheduler_addresses": ["tcp://localhost:29610"],
                 },
@@ -529,7 +535,7 @@ async def get_dp_config():
 
         request_router = get_request_router()
         config = {
-            "dp_enabled": args.multi_inst.enabled,
+            "dp_enabled": args.multi_inst.n_insts > 1,
             "server_status": get_server_status(),
             "mode": "full",
             "scheduler_count": len(getattr(request_router, "scheduler_addresses", [])),
@@ -555,14 +561,14 @@ async def get_dp_debug_info():
         # Get global args safely
         try:
             args = get_global_args()
-            dp_enabled = args.multi_inst.enabled
+            dp_enabled = args.multi_inst.n_insts > 1
             multi_inst = args.multi_inst
             args_status = "Available"
         except Exception:
             # In Router process, global_args may not be set yet
             logger.warning("global_args not available, using default status check")
             dp_enabled = True  # Router process always enables DP
-            multi_inst = {"enabled": True, "simple_mode": False}  # Default config
+            multi_inst = {"n_insts": 2}  # Default router config
             args_status = "None (Router process)"
 
         debug_info = {
@@ -691,7 +697,7 @@ async def test_dp_system():
 async def get_dp_status():
     """Get DP service status"""
     status = {
-        "dp_enabled": get_global_args().multi_inst.enabled,
+        "dp_enabled": get_global_args().multi_inst.n_insts > 1,
         "server_status": get_server_status(),
     }
     return status
@@ -819,6 +825,7 @@ def init_dp_router(args):
 
     init_logger()
     set_global_args(args)
+    args = get_global_args()  # Get the pre-processed global args
 
     Backend.args = args
 
@@ -835,16 +842,14 @@ def init_dp_router(args):
             "[ROUTER] No tokenizer path available, /tokenize endpoint will be unavailable"
         )
 
-    # Check if PD disaggregation is enabled
-    pd_enabled = (
-        hasattr(args.multi_inst.router, "pd_disaggregation")
-        and args.multi_inst.router.pd_disaggregation.enabled
-    )
-
-    if pd_enabled:
-        logger.info("[ROUTER] PD Disaggregation mode enabled")
-    else:
+    if is_classic_pd_disagg():
+        logger.info("[ROUTER] Using classic PD disaggregation mode")
+    elif is_independent_multi_inst():
         logger.info("[ROUTER] Using DP unified Scheduler mode")
+    else:
+        raise NotImplementedError(
+            "Mixing prefill_and_decode with prefill/decode roles is not supported"
+        )
 
     # start dp components
     logger.info("[ROUTER] Starting DP components...")

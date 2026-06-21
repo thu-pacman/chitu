@@ -100,3 +100,9 @@ class ServeConfigRules(Callback):
             self._exit_with_error(
                 f"bind_thread_to_cpu must be one of [physical_core, logical_core], got {bind_thread_to_cpu}"
             )
+
+        multi_inst = config.multi_inst
+        if multi_inst.router.is_router and multi_inst.n_insts <= 1:
+            self._exit_with_error(
+                f"multi_inst.n_insts must be greater than 1 when multi_inst.router.is_router is true, got {multi_inst.n_insts}"
+            )

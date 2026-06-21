@@ -108,7 +108,9 @@ def test_silu_and_mul_and_blockfp8_act_quant(
         pytest.skip("Triton is not available")
 
     set_global_args(
-        OmegaConf.create({"infer": {"op_impl": "torch"}}), need_ensure=False
+        OmegaConf.create({"infer": {"op_impl": "torch"}}),
+        need_ensure=False,
+        need_preprocess=False,
     )
     torch.set_default_dtype(dtype)
     assert dim % block_size == 0, "dim must be divisible by block_size"
@@ -153,7 +155,9 @@ def test_silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
     E, M, N, block_size, dtype: torch.dtype, swiglu_limit, record_benchmark
 ):
     set_global_args(
-        OmegaConf.create({"infer": {"op_impl": "torch"}}), need_ensure=False
+        OmegaConf.create({"infer": {"op_impl": "torch"}}),
+        need_ensure=False,
+        need_preprocess=False,
     )
     torch.set_default_dtype(dtype)
     assert N % (2 * block_size) == 0

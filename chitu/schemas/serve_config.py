@@ -2,10 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Any, Optional, Union
-
-from omegaconf import MISSING
+from omegaconf import MISSING, OmegaConf
 
 ######################################################################################
 # The following are legacy configs. They might be removed at any time in the future.
@@ -159,16 +158,6 @@ class PDTestConfig:
 
 
 @dataclass
-class PDDisaggregationConfig:
-    """PD disaggregation configuration"""
-
-    enabled: bool = False
-    kv_transfer_backend: str = "mooncake"  # kv transfer backend: mooncake, nccl
-    bootstrap_port: int = 8080  # Bootstrap server port
-    kv_transfer: KvTransferConfig = field(default_factory=KvTransferConfig)
-
-
-@dataclass
 class PrefillSchedulerConfig:
     """Prefill Scheduler configuration
 
@@ -197,6 +186,17 @@ class DecodeSchedulerConfig:
 
 
 @dataclass
+class PDDisaggregationConfig:
+    """PD disaggregation configuration"""
+
+    prefill_scheduler: Optional[PrefillSchedulerConfig] = None
+    decode_scheduler: Optional[DecodeSchedulerConfig] = None
+    kv_transfer_backend: str = "mooncake"  # kv transfer backend: mooncake, nccl
+    bootstrap_port: int = 8080  # Bootstrap server port
+    kv_transfer: KvTransferConfig = field(default_factory=KvTransferConfig)
+
+
+@dataclass
 class RouterConfig:
     is_router: bool = MISSING
     max_inflight_per_instance: int = 24
@@ -207,12 +207,6 @@ class RouterConfig:
     router_load_penalty_weight: float = 0.02
     router_evict_buffer_size: int = 64
     launch_timeout: float = 3600.0  # PD_LAUNCH_TIMEOUT
-    # PD disaggregation configuration
-    pd_disaggregation: PDDisaggregationConfig = field(
-        default_factory=PDDisaggregationConfig
-    )
-    prefill_schedulers: list[PrefillSchedulerConfig] = field(default_factory=list)
-    decode_schedulers: list[DecodeSchedulerConfig] = field(default_factory=list)
 
 
 @dataclass
@@ -223,9 +217,20 @@ class CoordinatorConfig:
 
 @dataclass
 class MultiInstConfig:
-    enabled: bool = MISSING
     n_insts: int = MISSING
-    inst_id: int = MISSING
+    inst_id: Optional[int] = MISSING
+    role: str = "prefill_and_decode"
+    pd_disaggregation: PDDisaggregationConfig = field(
+        default_factory=PDDisaggregationConfig
+    )
+
+    # NOTE 1: Although this is a dict, please keep typing of this field as Any
+    #         so Hydra can override arbitrary instance-ID keys without requiring
+    #         `+`.
+    # NOTE 2: Keys are cast to int at runtime, so passing either "1" or 1 from
+    #         YAML or CLI is fine.
+    inst_overrides: Any = field(default_factory=dict)
+
     router: RouterConfig = MISSING
 
 
@@ -255,24 +260,17 @@ class DebugConfig:
 class StaticConfig:
     def __init__(self, config_obj):
         if hasattr(config_obj, "__dataclass_fields__"):
-            from dataclasses import asdict
-
             self._data = asdict(config_obj)
-        elif hasattr(config_obj, "__dict__"):
-            self._data = config_obj.__dict__
         elif isinstance(config_obj, dict):
             self._data = config_obj
         else:
-            try:
-                from omegaconf import OmegaConf
-
-                self._data = OmegaConf.to_container(config_obj, resolve=True)
-            except Exception:
-                self._data = {}
+            self._data = OmegaConf.to_container(config_obj, resolve=True)
         self._convert_nested_structures()
 
     def _convert_nested_structures(self):
         for k, v in self._data.items():
+            if not isinstance(k, str):
+                continue
             if isinstance(v, dict):
                 setattr(self, k, StaticConfig(v))
             elif isinstance(v, list):

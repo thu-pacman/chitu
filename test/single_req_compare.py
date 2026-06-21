@@ -232,7 +232,7 @@ def gen_reqs(num_reqs, max_new_tokens, frequency_penalty):
 
 def run(args: ServeConfig, results_ref):
     logger.info(f"Run with args: {args}")
-    chitu_init(args)
+    args = chitu_init(args)
     logger.info("finish init")
     timers = get_timers()
     warmup_engine(args)
