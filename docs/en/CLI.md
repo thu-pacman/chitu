@@ -285,6 +285,13 @@ IMPORTANT: Typically, you need to set this field.
 
 *Default: `skew`.*
 
+### Argument `infer.pcp_size`
+
+Number of Prefill Context Parallel ranks. See `docs/en/DEVELOPMENT.md#parallelism`
+for details.
+
+*Default: `1`.*
+
 ### Argument `infer.tp_size`
 
 Number of Tensor Parallel ranks for non-MoE models or non-MoE modules in MoE models.

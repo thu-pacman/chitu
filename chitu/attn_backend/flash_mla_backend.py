@@ -7,9 +7,11 @@ from typing_extensions import override
 from logging import getLogger
 
 import torch
+import torch.distributed as dist
 
 from chitu.attn_backend.triton_attn_backend import TritonAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
+from chitu.cp_utils import get_cp_context
 from chitu.kv_cache import KVCacheAccessor, PagedKVCacheAccessor
 from chitu.ops import (
     append_to_paged_kv_cache,
@@ -289,17 +291,34 @@ class FlashMLABackend(TritonAttnBackend):
         causal=False,
         format="paged",
     ):
+        cp_ctx = get_cp_context()
+        local_lengths = cp_ctx.local_lengths
+        local_seq_ids = cp_ctx.local_seq_ids
+
         if format == "paged":
             assert (
                 block_table is not None
             ), "Converting indices with triton in paged format requires block_table"
-            if (
+            if local_lengths is not None:
+                # CP path: use pre-computed local Q global positions for causal bound.
+                num_tokens = local_lengths.shape[0]
+                req_id = (
+                    local_seq_ids
+                    if local_seq_ids is not None
+                    else torch.zeros(
+                        num_tokens, dtype=torch.int32, device=topk_indices.device
+                    )
+                )
+                upper_idx_bound_per_token = local_lengths
+            elif (
                 not causal
             ):  # not causal, the upper bound of indices for each query is the s_kv of the req
+                req_id = seq_len_delta.delta_seq_ids_tensor_device
                 upper_idx_bound_per_token = seq_len_delta.new.lens_tensor_device[
                     seq_len_delta.delta_seq_ids_tensor_device
                 ]
             else:  # causal, the upper bound of indices is the correpsonding position_idx
+                req_id = seq_len_delta.delta_seq_ids_tensor_device
                 upper_idx_bound_per_token = (
                     seq_len_delta.delta_position_ids_tensor_device + 1
                 )
@@ -308,7 +327,7 @@ class FlashMLABackend(TritonAttnBackend):
                 topk_indices = self.pad_indices(topk_indices)
 
             topk_indices = convert_req_index_to_global_paged_index_triton(
-                seq_len_delta.delta_seq_ids_tensor_device,
+                req_id,
                 block_table,
                 topk_indices,
                 upper_idx_bound_per_token,
@@ -1039,6 +1058,10 @@ class FlashMLABackend(TritonAttnBackend):
         softmax_scale=None,
         topk_indices=None,
     ):
+        cp_ctx = get_cp_context()
+        local_lengths = cp_ctx.local_lengths
+        local_seq_ids = cp_ctx.local_seq_ids
+
         # process empty batch
         if q_nope.numel() == 0:
             return torch.empty_like(q_nope)
@@ -1054,6 +1077,35 @@ class FlashMLABackend(TritonAttnBackend):
                 seq_len_delta,
                 return_ragged=True,
             )
+
+            # CP mode: build CP-local BatchedSeqLenDelta
+            if local_lengths is not None:
+                n_local = q_nope.shape[0]
+                batch_size = seq_len_delta.batch_size
+
+                if local_seq_ids is not None:
+                    local_delta_lens = [
+                        int((local_seq_ids == i).sum().item())
+                        for i in range(batch_size)
+                    ]
+                else:
+                    local_delta_lens = [n_local]
+
+                local_old_lens = [
+                    n - d for n, d in zip(seq_len_delta.new.lens_list, local_delta_lens)
+                ]
+
+                seq_len_delta = BatchedSeqLenDelta(
+                    old_len_list=local_old_lens,
+                    new_len_list=seq_len_delta.new.lens_list,
+                    device=seq_len_delta.device,
+                    max_batch_size=batch_size,
+                    max_total_len=seq_len_delta.new.total_len,
+                    max_total_delta_len=n_local,
+                    cache_delta_position_ids_tensor_device=False,
+                    cache_delta_seq_ids_tensor_device=False,
+                )
+
             # NOTE: current FlashMLA backend does not support dense bf16 prefill
             # call triton backend for dense bf16 prefill
             return super().mla_prefill_ragged_qkvo(

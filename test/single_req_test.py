@@ -290,7 +290,12 @@ def main(args: ServeConfig):
 
     timers = get_timers()
     logger.debug("finish init")
-    if args.infer.pp_size > 1 or args.infer.tp_size > 1 or args.infer.dp_size > 1:
+    if (
+        args.infer.pp_size > 1
+        or args.infer.tp_size > 1
+        or args.infer.dp_size > 1
+        or args.infer.pcp_size > 1
+    ):
         run_pipe_or_tensor_parallelism(args, timers)
     else:
         run_normal(args, timers)

@@ -33,7 +33,12 @@ from chitu.distributed.coordinator import get_endpoint, set_endpoint
 from chitu.global_vars import get_global_args
 from chitu.backend import Backend
 from chitu.task import TaskPool
-from chitu.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
+from chitu.distributed.parallel_state import (
+    get_dp_group,
+    get_pp_group,
+    get_tp_group,
+    get_cp_group,
+)
 from chitu.distributed.infiniband import detect_ib_devices
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
@@ -3705,19 +3710,24 @@ class KVManager:
 
         tp_group = get_tp_group()
         pp_group = get_pp_group()
+        cp_group = get_cp_group()
         tp_size = int(tp_group.group_size)
         tp_rank = int(tp_group.rank_in_group)
+        pcp_size = int(cp_group.group_size)
+        cp_rank = int(cp_group.rank_in_group)
         pp_size = int(pp_group.group_size)
         pp_stage = int(pp_group.rank_in_group)
         is_ctrl = bool(self._is_prefill_ctrl_rank)
 
         logger.debug(
-            f"send_kv_cache ctrl={is_ctrl} pp_stage={pp_stage}/{pp_size} tp_rank={tp_rank}/{tp_size}"
+            f"send_kv_cache ctrl={is_ctrl} pp_stage={pp_stage}/{pp_size} "
+            f"tp_rank={tp_rank}/{tp_size} cp_rank={cp_rank}/{pcp_size}"
         )
         if pd_trace_enabled():
             logger.debug(
                 f"[PD_TRACE][prefill.send_kv_cache] batch={len(request_ids)} "
                 f"tp_size={tp_size} tp_rank={tp_rank} pp_size={pp_size} pp_stage={pp_stage} "
+                f"pcp_size={pcp_size} cp_rank={cp_rank} "
                 f"first_tokens_shape={list(first_tokens.shape) if isinstance(first_tokens, torch.Tensor) else None}"
             )
 

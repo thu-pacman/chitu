@@ -246,6 +246,10 @@ infer:
   #: IMPORTANT: Typically, you need to set this field.
   cache_type: skew
 
+  #: Number of Prefill Context Parallel ranks. See `docs/en/DEVELOPMENT.md#parallelism`
+  #: for details.
+  pcp_size: 1
+
   #: Number of Tensor Parallel ranks for non-MoE models or non-MoE modules in MoE models.
   #: See `docs/en/DEVELOPMENT.md#parallelism` for details.
   tp_size: 1

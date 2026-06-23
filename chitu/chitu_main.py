@@ -49,6 +49,7 @@ from chitu.utils import (
     gather_str_to_dst_rank,
     get_chitu_bool_env,
 )
+from chitu.cp_utils import get_cp_context
 from chitu.distributed.parallel_state import get_pp_group, get_world_group
 from chitu.logging_utils import setup_chitu_logging
 from chitu.metrics import (
@@ -890,12 +891,16 @@ def _warmup_via_taskpool(args):
 
     # Prefill phase
     # In DP chunk prefill, each schedule processes approximately `prefill_chunk_size` tokens across the whole DP group.
+    # In PCP mode, the effective per-step budget is `prefill_chunk_size * pcp_size` because each CP
+    # rank only processes 1/pcp_size of the global tokens.
     # Due to per-rank budget constraints and uneven task distribution, some tokens may be left unprocessed.
     # Example: DP2, chunk=16, max_batch_size=5 (创建 5 个 warmup 任务), 每任务 3 tokens
     #   - Budget: Rank0=8, Rank1=8 (chunk_size 均分给各 rank)
     #   - Tasks: Rank0 分到 3 个任务 (round robin), Rank1 分到 2 个任务
     #   - Actual: Rank0 处理 8 tokens (3+3+2, task4 剩 1 token), Rank1 处理 6 tokens (3+3)
     #   - Result: 需要 2 轮迭代来处理完所有 15 tokens
+    _cp_context = get_cp_context()
+    effective_prefill_chunk_size = prefill_chunk_size * _cp_context.pcp_size
     total_tokens = warmup_seq_len * num_warmup_reqs
 
     # Calculate required iterations considering DP task distribution
@@ -910,17 +915,20 @@ def _warmup_via_taskpool(args):
         # max_tokens_per_rank = 3 × 3 = 9
         # num_required = ceil_div(9, 8) = 2
         dp_size = get_global_args().infer.dp_size
-        per_rank_budget = prefill_chunk_size // dp_size
+        per_rank_budget = effective_prefill_chunk_size // dp_size
         max_tasks_per_rank = ceil_div(num_warmup_reqs, dp_size)
         max_tokens_per_rank = max_tasks_per_rank * warmup_seq_len
         # Iterations needed for the busiest rank (usually rank 0)
         num_required_prefill_schedules = ceil_div(max_tokens_per_rank, per_rank_budget)
     else:
-        num_required_prefill_schedules = ceil_div(total_tokens, prefill_chunk_size)
+        num_required_prefill_schedules = ceil_div(
+            total_tokens, effective_prefill_chunk_size
+        )
     num_required_decode_schedules = _n_decode_steps * _mtp_size
 
     logger.info(
         f"Warmup: total_tokens={total_tokens}, chunk_size={prefill_chunk_size}, "
+        f"effective_chunk_size={effective_prefill_chunk_size}, "
         f"prefill_iters={num_required_prefill_schedules}"
     )
 
@@ -991,6 +999,13 @@ def _warmup_backend_direct(
     logger.info(
         f"Starting local backend warmup (direct) with local max batch size {local_max_bs}..."
     )
+    _cp_context = get_cp_context()
+    if _cp_context.is_active:
+        local_max_bs = max(local_max_bs, _cp_context.pcp_size)
+        # Round up to multiple of pcp_size for clean interleaved split
+        local_max_bs = (
+            (local_max_bs + _cp_context.pcp_size - 1) // _cp_context.pcp_size
+        ) * _cp_context.pcp_size
     init_cache_static()
 
     req_ids = [f"__warmup_{i}__" for i in range(local_max_bs)]

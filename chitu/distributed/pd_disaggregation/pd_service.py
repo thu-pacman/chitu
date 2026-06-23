@@ -23,7 +23,13 @@ import zmq.asyncio
 import chitu.serve.event_loop as event_loop_module
 
 from chitu.backend import Backend
-from chitu.distributed.parallel_state import get_dp_group, get_tp_group, get_pp_group
+from chitu.distributed.parallel_state import (
+    get_cp_group,
+    get_cp_size,
+    get_dp_group,
+    get_pp_group,
+    get_tp_group,
+)
 from chitu.distributed.pd_disaggregation.pd_scheduler import (
     PDInstanceRequestManager,
     PDSchedulerMode,
@@ -145,6 +151,10 @@ class PDSchedulerService:
         self.local_instance_id = self._determine_scheduler_id()
         # Only TP main rank should expose ZMQ service
         self.is_tp_main_rank = self._determine_tp_main_rank()
+        # In CP mode TP size is forced to 1, so every CP rank looks like TP-main.
+        # PD control-plane ownership must still be unique inside the CP group.
+        self.is_cp_main_rank = self._determine_cp_main_rank()
+        self.is_pd_public_rank = self.is_tp_main_rank and self.is_cp_main_rank
 
         # ZMQ for communication
         self.context = zmq.asyncio.Context()
@@ -204,6 +214,11 @@ class PDSchedulerService:
         tp_group = get_tp_group()
         return tp_group.global_rank == tp_group.rank_list[0]
 
+    def _determine_cp_main_rank(self) -> bool:
+        """Return True if current rank is the first rank in its CP group."""
+        cp_group = get_cp_group()
+        return cp_group.global_rank == cp_group.rank_list[0]
+
     def _init_scheduler(self):
         """Initialize the appropriate scheduler"""
         max_batch_size = self.args.infer.max_batch_size
@@ -238,10 +253,10 @@ class PDSchedulerService:
         """Start the PD scheduler service"""
         logger.info("starting pd scheduler service...")
 
-        # Non-TP-main ranks do not expose ZMQ service; they only run worker loop
-        if not self.is_tp_main_rank:
+        # Non-public ranks do not expose ZMQ service; they only run worker loop.
+        if not self.is_pd_public_rank:
             logger.info(
-                "tp non-main rank: skip binding ZMQ sockets; entering worker loop"
+                "neither TP nor CP main rank: skip binding ZMQ sockets; entering worker loop"
             )
             await self._worker_loop()
             return
@@ -302,8 +317,10 @@ class PDSchedulerService:
                 self._pd_prepare_listener_started = True
         else:
             logger.info("prefill-only mode: skip initializing token manager")
-            # Inject prefill-side KV hook only on TP main rank to avoid duplicate sends
-            if self.is_tp_main_rank:
+            # In CP-prefill, only the CP-main rank should send. CP KV is stored as
+            # a full replica after CP all-gather, so CP non-main sends would
+            # duplicate writes into the same Decode DP cache.
+            if self.is_tp_main_rank and self.is_cp_main_rank:
                 kv_hook = MooncakeKVTransferHook(self.scheduler.kv_manager, "prefill")
             else:
                 kv_hook = NoopKVTransferHook()
@@ -454,13 +471,14 @@ class PDSchedulerService:
                 logger.info(
                     "[PD_STATS_IDENTITY] mode=%s torch_rank=%s multi_inst.inst_id=%s "
                     "scheduler.local_instance_id=%s stats.local_instance_id=%s "
-                    "is_tp_main_rank=%s",
+                    "is_tp_main_rank=%s is_cp_main_rank=%s",
                     self.pd_mode.value,
                     self.rank,
                     getattr(self.args.multi_inst, "inst_id", None),
                     getattr(self.scheduler, "local_instance_id", None),
                     stats.get("local_instance_id"),
                     self.is_tp_main_rank,
+                    self.is_cp_main_rank,
                 )
 
             # Send stats to router
@@ -507,7 +525,7 @@ def init_pd_scheduler(args, rank: int = 0):
     logger.info(f"initializing pd scheduler for rank {rank}")
 
     service = PDSchedulerService(args, rank)
-    if not service.is_tp_main_rank:
+    if not service.is_pd_public_rank:
         asyncio.run(_run_existing_service_async(service))
         return
 
