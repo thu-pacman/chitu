@@ -345,7 +345,7 @@ def _wait_http_ready(host: str, port: int, timeout: float) -> None:
     ),
 )
 def hydra_main(args: ServeConfig):
-    chitu_init(args)
+    args = chitu_init(args)
     torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
     warmup_engine(args)
 

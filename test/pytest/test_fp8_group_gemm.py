@@ -19,7 +19,11 @@ triton, has_triton = try_import_platform_dep("triton")
 def test_blockfp8_einsum_shc_hdc_shd(
     n_heads, batch_size, in_feats, out_feats, compute_dtype, soft_fp8, record_benchmark
 ):
-    set_global_args(OmegaConf.create({"infer": {"soft_fp8": False}}), need_ensure=False)
+    set_global_args(
+        OmegaConf.create({"infer": {"soft_fp8": False}}),
+        need_ensure=False,
+        need_preprocess=False,
+    )
     torch.set_default_dtype(compute_dtype)
     if not soft_fp8 and (
         not is_nvidia() or not torch.cuda.get_device_capability() >= (9, 0)

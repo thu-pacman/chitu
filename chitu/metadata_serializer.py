@@ -11,7 +11,7 @@ from typing import Optional, List, Dict, Set, Literal, Union, Any
 from dataclasses import dataclass
 from logging import getLogger
 
-from chitu.global_vars import get_global_args
+from chitu.global_vars import is_classic_pd_disagg, is_independent_multi_inst
 from chitu.task import (
     Task,
     PackedTasks,
@@ -558,11 +558,14 @@ class MetadataSerializer:
             else:
                 return MetadataConfig.for_special()
 
-        pd_enabled = (
-            get_global_args().multi_inst.router.pd_disaggregation.enabled
-            if getattr(get_global_args(), "multi_inst", None) is not None
-            else False
-        )
+        if is_classic_pd_disagg():
+            pd_enabled = True
+        elif is_independent_multi_inst():
+            pd_enabled = False
+        else:
+            raise NotImplementedError(
+                "Mixing prefill_and_decode with prefill/decode roles is not supported"
+            )
         if tasks.task_type == TaskType.Prefill:
             return MetadataConfig.for_prefill()
         elif tasks.task_type == TaskType.Decode:

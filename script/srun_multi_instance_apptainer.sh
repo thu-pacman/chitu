@@ -231,7 +231,7 @@ parse_instance_spec() {
 reset_instance_arrays() {
   INST_NNODES=(); INST_TP=(); INST_PP=(); INST_DP=(); INST_EP=()
   INST_MAX_SEQ_LEN=(); INST_MAX_REQS=(); INST_MAX_BATCH_SIZE=(); INST_MAX_NEW_TOKENS=()
-  INST_PORT=(); INST_MASTER_PORT=(); INST_NPROC_PER_NODE=(); INST_OVERRIDES_SPEC=()
+  INST_PORT=(); INST_MASTER_PORT=(); INST_NPROC_PER_NODE=(); INST_DEVICE_IDS=(); INST_OVERRIDES_SPEC=()
   INST_START_NODE=()
 }
 
@@ -250,6 +250,16 @@ allocate_nodes() {
   local i
   for ((i=0; i<MI_NODES; i++)); do node_free[i]="${MI_GPUS_PER_NODE}"; done
 
+  block_device_ids() {
+    local start="$1" nnodes="$2" nproc="$3" j k used
+    local -a list=()
+    for ((j=0; j<nnodes; j++)); do
+      used=$((MI_GPUS_PER_NODE - node_free[start+j]))
+      for ((k=0; k<nproc; k++)); do list+=("$((used + k))"); done
+    done
+    IFS=,; echo "${list[*]}"
+  }
+
   find_block() {
     local nnodes="$1" nproc="$2" start ok j
     [ "${nnodes}" -le "${MI_NODES}" ] || return 1
@@ -264,9 +274,11 @@ allocate_nodes() {
   }
 
   for i in "${!INST_NNODES[@]}"; do
-    local nnodes="${INST_NNODES[i]}" nproc="${INST_NPROC_PER_NODE[i]}" start j
+    local nnodes="${INST_NNODES[i]}" nproc="${INST_NPROC_PER_NODE[i]}" start j gpu_list
     start="$(find_block "${nnodes}" "${nproc}")" || die "instance ${i}: cannot place nnodes=${nnodes} nproc=${nproc}"
+    gpu_list="$(block_device_ids "${start}" "${nnodes}" "${nproc}")"
     INST_START_NODE[i]="${start}"
+    INST_DEVICE_IDS[i]="${gpu_list}"
     for ((j=0; j<nnodes; j++)); do node_free[start+j]=$((node_free[start+j] - nproc)); done
   done
 }
@@ -345,7 +357,7 @@ mi_node_main() {
     --config-name="${MI_CONFIG_NAME}"
     "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
     "infer.cache_type=${MI_CACHE_TYPE}"
-    "multi_inst.enabled=True" "multi_inst.router.is_router=False"
+    "multi_inst.router.is_router=False"
     "coordinator.host=${ROUTER_IP}"
     "coordinator.port=21001"
     "infer.use_cuda_graph=${MODEL_USE_CUDA_GRAPH}" "infer.schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
@@ -360,11 +372,10 @@ mi_node_main() {
     ROUTER_CMD=(
       python -m chitu --config-name="${MI_CONFIG_NAME}"
       "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
-      multi_inst.enabled=True multi_inst.n_insts="${INSTANCE_COUNT}"
+      multi_inst.n_insts="${INSTANCE_COUNT}"
       multi_inst.router.is_router=True serve.port="${MI_ROUTER_PORT}"
       "coordinator.host=${ROUTER_IP}"
       "coordinator.port=21001"
-      "multi_inst.router.pd_disaggregation.enabled=False"
       "multi_inst.router.routing_algorithm=${MI_LB_ALGORITHM}"
       "${COMMON_OVERRIDES[@]}"
     )
@@ -391,35 +402,18 @@ mi_node_main() {
   [ "${#LOCAL_INST_IDX[@]}" -gt 0 ] || \
     die "cannot map SLURM_PROCID=${SLURM_PROCID} to any instance"
 
-  # ── Allocate GPUs per instance (with relative IDs always starting from 0) ──
-  local _gpu_next=0
-
-  alloc_gpu_list() {
-    local need="$1" __out="$2" k
-    [ $((_gpu_next + need)) -le "${MI_GPUS_PER_NODE}" ] || \
-      die "node ${SLURM_PROCID}: need ${need} GPUs starting at ${_gpu_next}, exceeds gpus-per-node=${MI_GPUS_PER_NODE}"
-    local -a list=()
-    for ((k=0; k<need; k++)); do list+=("${_gpu_next}"); _gpu_next=$((_gpu_next + 1)); done
-    printf -v "${__out}" '%s' "$(IFS=,; echo "${list[*]}")"
-  }
-
-  LOCAL_INST_GPU_LIST=()
-  for _p in "${!LOCAL_INST_IDX[@]}"; do
-    local _gl=""
-    alloc_gpu_list "${INST_NPROC_PER_NODE[${LOCAL_INST_IDX[_p]}]}" _gl
-    LOCAL_INST_GPU_LIST[_p]="${_gl}"
-  done
-
   # ── 启动实例 ──
   LOCAL_PIDS=()
   for _pos in "${!LOCAL_INST_IDX[@]}"; do
-    local _idx="${LOCAL_INST_IDX[_pos]}" _gpu="${LOCAL_INST_GPU_LIST[_pos]}" _rank="${LOCAL_INST_NODE_RANK[_pos]}"
+    local _idx="${LOCAL_INST_IDX[_pos]}" _rank="${LOCAL_INST_NODE_RANK[_pos]}"
     local _master_addr="$(to_ip "${NODE_ARR[${INST_START_NODE[_idx]}]}")"
 
     local -a _ovr=()
     while IFS= read -r _o; do [ -n "${_o}" ] && _ovr+=("${_o}"); done < <(split_overrides_to_array "${INST_OVERRIDES_SPEC[_idx]}")
 
-    echo "=== Instance I${_idx}: rank=${_rank}/${INST_NNODES[_idx]} master=${_master_addr}:${INST_MASTER_PORT[_idx]} gpus=${_gpu} ==="
+    local _device_ids="${INST_DEVICE_IDS[_idx]}"
+
+    echo "=== Instance I${_idx}: rank=${_rank}/${INST_NNODES[_idx]} master=${_master_addr}:${INST_MASTER_PORT[_idx]} device_ids=[${_device_ids}] ==="
     local -a _CMD=(
       python -m torch.distributed.run
       --nnodes="${INST_NNODES[_idx]}" --nproc_per_node="${INST_NPROC_PER_NODE[_idx]}"
@@ -431,7 +425,7 @@ mi_node_main() {
       "request.max_new_tokens=${INST_MAX_NEW_TOKENS[_idx]}"
       "multi_inst.inst_id=${_idx}"
       "infer.tp_size=${INST_TP[_idx]}" "infer.pp_size=${INST_PP[_idx]}" "infer.dp_size=${INST_DP[_idx]}" "infer.ep_size=${INST_EP[_idx]}"
-      "infer.device_ids=[${_gpu}]"
+      "infer.device_ids=[${_device_ids}]"
       "${COMMON_OVERRIDES[@]}" "${_ovr[@]}"
     )
     [ -n "${MI_SCHEDULER_TYPE}" ] && _CMD+=("scheduler.type=${MI_SCHEDULER_TYPE}")

@@ -345,14 +345,14 @@ class Backend:
             pp_size=pipeline_parallel_size,
             embed_tokens_lm_head_tp_size=embed_tokens_lm_head_tp_size,
         )
-        if args.multi_inst.enabled:
+        if args.multi_inst.n_insts > 1:
             if args.coordinator.host is None:
                 raise ValueError(
-                    "coordinator.host is required when multi_inst is enabled"
+                    "coordinator.host is required when multi_inst.n_insts > 1"
                 )
             if args.coordinator.port is None:
                 raise ValueError(
-                    "coordinator.port is required when multi_inst is enabled"
+                    "coordinator.port is required when multi_inst.n_insts > 1"
                 )
             init_coordinator(
                 args.coordinator.host, args.coordinator.port, is_coordinator_host=False

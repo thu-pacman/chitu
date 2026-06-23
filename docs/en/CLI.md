@@ -216,7 +216,7 @@ must be set here.
 IP for the coordinator.
 
 Acceptable values:
-- null: This filed can be omitted if `multi_inst.enabled` is False. If either
+- null: This filed can be omitted if `multi_inst.n_insts == 1`. If either
   `coordinator.host` or `coordinator.port` is null, `coordinator` will reuse
   key-value store from `torchrun`, and do not start a new key-value store.
 - A string: E.g., "1.2.3.4" or "host1". It must be recognized from all nodes,
@@ -230,7 +230,7 @@ Acceptable values:
 Port for the coordinator.
 
 Acceptable values:
-- null: This filed can be omitted if `multi_inst.enabled` is False. If either
+- null: This filed can be omitted if `multi_inst.n_insts == 1`. If either
   `coordinator.host` or `coordinator.port` is null, `coordinator` will reuse
   key-value store from `torchrun`, and do not start a new key-value store.
 - An integer: E.g., 21001. The TCP port ID.
@@ -414,6 +414,10 @@ Acceptable values: True, False
 ### Argument `infer.device_ids`
 
 If not null, override device IDs assgiend to each rank.
+
+Please note that the ranks are global ranks, but the device IDs are local to node.
+Therefore, if you want to use all 16 GPUs on two 8-GPU nodes, you can set
+`device_ids: [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7]`.
 
 Acceptable values:
 - null: Each rank is assigned with the local-rank-id-th device.
@@ -620,6 +624,117 @@ Acceptable values:
 - "auto": Currently this means "max".
 
 *Default: `auto`.*
+
+## `multi_inst`
+
+Configs for multi-instance depolyment including PD-disaggregation.
+
+Note for per-instance config:
+- `multi_inst.inst_id` and `multi_inst.router.is_router` should be set
+   respectively for each instance.
+-  In order for one instance to see other instances' config, all the other
+   per-instance configs should be set via `multi_inst.inst_overrides` with
+   their instance IDs.
+-  All the other fields should be set to be the same during launch, but
+   they will be overriden at run time according to
+   `multi_inst.inst_overrides[multi_instinst_id]`.
+
+### Argument `multi_inst.n_insts`
+
+Number of instances.
+
+*Default: `1`.*
+
+### Argument `multi_inst.inst_id`
+
+ID of the current instance.
+
+This field should be set respectively for each instance.
+
+It should be null for the router.
+
+*Default: `0`.*
+
+### Argument `multi_inst.role`
+
+Role of the current instance.
+
+Acceptable values: "prefill_and_decode", "prefill", or "decode".
+
+*Default: `"prefill_and_decode"`.*
+
+### Argument `multi_inst.pd_disaggregation`
+
+Additional configs for PD disaggregation.
+
+> TIPS: To enable verbose logging for PD disaggregation, set the following:
+> `CHITU_LOGGING_LEVEL=chitu.distributed.pd_disaggregation:DEBUG;chitu.hooks:DEBUG;chitu.scheduler:DEBUG`
+
+### Argument `multi_inst.inst_overrides`
+
+Per-instance config overrides keyed by instance ID.
+
+In order for one instance to see other instances' config, all per-instance
+configs should be set in this override, except for torchrun arguments,
+`multi_inst.inst_id`, and `multi_inst.router.is_router`.
+
+Example:
+
+```yaml
+inst_overrides:
+  0:
+    infer:
+      tp_size: 8
+    multi_inst:
+      role: "prefill"
+      pd_disaggregation:
+        prefill_scheduler:
+          max_batch_size: 32
+          max_total_tokens: 8192
+          batching_strategy: "varlen"
+  1:
+    infer:
+      dp_size: 8
+      ep_size: 8
+    multi_inst:
+      role: "decode"
+      pd_disaggregation:
+        decode_scheduler:
+          scheduling_strategy: "immediate"
+```
+
+Since passing a very-long dict may be a bad idea in CLI, you can pass this field
+in either of the following two ways:
+
+1. Passing a dict:
+   ```
+   'multi_inst.inst_overrides="{0: {infer: {tp_size: 8}, multi_inst: {role: "prefill", pd_disaggregation: {prefill_scheduler: {max_batch_size: 32}}}}}"'
+   ```
+2. First passing an empty dict, and then append to it:
+   ```
+   multi_inst.inst_overrides={} \
+   +multi_inst.inst_overrides.0.infer.tp_size=8 \
+   +multi_inst.inst_overrides.0.multi_inst.role="prefill" \
+   +multi_inst.inst_overrides.0.multi_inst.pd_disaggregation.prefill_scheduler.max_batch_size=32
+   ```
+
+*Default: `null`.*
+
+### `multi_inst.router`
+
+Configs for router
+
+#### Argument `multi_inst.router.is_router`
+
+Set this to True if the current process is a router.
+
+*Default: `False`.*
+
+#### Argument `multi_inst.router.launch_timeout`
+
+When the router is ready, wait for this time untill the instances are ready.
+
+*Default: `3600`.*
 
 ## `metrics`
 

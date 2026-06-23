@@ -12,7 +12,7 @@
 # - Node 2: Decode (DP16+EP16) node_rank=1 -> 占用 8 卡
 #
 # 用法:
-#   bash script/srun_pd_disagg_qwen3_235b_fp8_1p1d_tp4pp2_dp16ep16_3n.sh [MODEL_CONFIG] [MODEL_CKPT_DIR]
+#   bash script/qwen3-next-pd-disagg.sh [MODEL_CONFIG] [MODEL_CKPT_DIR]
 #
 
 set -e
@@ -49,11 +49,12 @@ srun $SRUN_PARTITION_ARG \
      --ntasks-per-node=1 \
      --gres=gpu:${GPUS_PER_NODE} \
      --cpus-per-task=$((GPUS_PER_NODE * CPUS_PER_GPU)) \
-     --job-name=pd_disagg_qwen235b_fp8_tp4pp2_dp16ep16_3n \
+     --job-name=pd_disagg_qwen3_next_1p1d_tp2pp4_dp16ep16_3n \
      --time=01:00:00 \
      -l \
      bash -c "
         set -e
+        set -f
         ulimit -l unlimited || true
 
         export PYTHONPATH=\"\${PYTHONPATH}:\$(pwd)\"
@@ -62,21 +63,12 @@ srun $SRUN_PARTITION_ARG \
         export MODEL_CKPT_DIR=\"${MODEL_CKPT_DIR}\"
 
         # NCCL / IB / NVSHMEM
-        export IB_HCA=\"mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_8\"
         export NCCL_DEBUG=INFO
-        export NCCL_IB_HCA=\${IB_HCA}
         export NCCL_NET_GDR_LEVEL=2
         export NCCL_IB_MTU=8192
         export NCCL_IB_TC=106
         export NCCL_GRAPH_MIXING_SUPPORT=0
         export NCCL_GRAPH_REGISTER=0
-
-        export GLOO_SOCKET_IFNAME=ibp210s0
-        export NCCL_SOCKET_IFNAME=ibp210s0
-
-        # NVSHMEM 配置
-        export NVSHMEM_IB_DEVICE=ibp210s0
-        export NVSHMEM_HCA_LIST=\${IB_HCA}
 
         # DeepGemm JIT cache: use local /tmp to avoid NFS stale file handle issue
         export DG_JIT_CACHE_DIR=\"/tmp/.deep_gemm_cache_\${SLURM_PROCID}_\$(hostname)\"
@@ -128,21 +120,42 @@ srun $SRUN_PARTITION_ARG \
         cleanup(){ echo 'Cleaning up...'; pkill -P \$\$ || true; wait || true; }
         trap cleanup INT TERM
 
-        # Common args (multi_inst.n_insts=2 means Router only sees 1P + 1D)
-        # COMMON_ARGS=\"--config-name=pd_disagg_serve_config models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=4096 infer.max_batch_size=64 request.max_new_tokens=4096 multi_inst.enabled=True multi_inst.router.is_router=False coordinator.host=\$ROUTER_IP coordinator.port=21001 infer.use_cuda_graph=True infer.schedule_overlap=False float_16bit_variant=bfloat16 multi_inst.n_insts=2\"
-        COMMON_ARGS=\"--config-name=pd_disagg_serve_config models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} infer.pp_size=1 infer.cache_type=paged infer.max_seq_len=6144 infer.max_batch_size=288 request.max_new_tokens=4096 multi_inst.enabled=True multi_inst.router.is_router=False coordinator.host=\$ROUTER_IP coordinator.port=21001 infer.use_cuda_graph=True infer.schedule_overlap=False float_16bit_variant=bfloat16 multi_inst.n_insts=2\"
+        PD_INST_OVERRIDES_ARGS=\"multi_inst.inst_overrides={} \
+          +multi_inst.inst_overrides.0.multi_inst.role=prefill \
+          +multi_inst.inst_overrides.0.multi_inst.pd_disaggregation.prefill_scheduler.max_batch_size=32 \
+          +multi_inst.inst_overrides.0.multi_inst.pd_disaggregation.prefill_scheduler.max_total_tokens=8192 \
+          +multi_inst.inst_overrides.0.multi_inst.pd_disaggregation.prefill_scheduler.batching_strategy=varlen \
+          +multi_inst.inst_overrides.0.scheduler.type=prefill_only \
+          +multi_inst.inst_overrides.0.infer.max_seq_len=6144 \
+          +multi_inst.inst_overrides.0.infer.max_batch_size=288 \
+          +multi_inst.inst_overrides.0.request.max_new_tokens=4096 \
+          +multi_inst.inst_overrides.0.infer.tp_size=2 \
+          +multi_inst.inst_overrides.0.infer.pp_size=4 \
+          +multi_inst.inst_overrides.0.infer.dp_size=1 \
+          +multi_inst.inst_overrides.0.infer.ep_size=1 \
+          +multi_inst.inst_overrides.0.infer.device_ids=[0,1,2,3,4,5,6,7] \
+          +multi_inst.inst_overrides.1.multi_inst.role=decode \
+          +multi_inst.inst_overrides.1.multi_inst.pd_disaggregation.decode_scheduler.scheduling_strategy=immediate \
+          +multi_inst.inst_overrides.1.scheduler.type=decode_only \
+          +multi_inst.inst_overrides.1.infer.max_seq_len=6144 \
+          +multi_inst.inst_overrides.1.infer.max_batch_size=288 \
+          +multi_inst.inst_overrides.1.request.max_new_tokens=4096 \
+          +multi_inst.inst_overrides.1.infer.tp_size=1 \
+          +multi_inst.inst_overrides.1.infer.pp_size=1 \
+          +multi_inst.inst_overrides.1.infer.dp_size=16 \
+          +multi_inst.inst_overrides.1.infer.ep_size=16 \
+          +multi_inst.inst_overrides.1.infer.device_ids=[0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7]\"
+        COMMON_ARGS=\"--config-name=pd_disagg_serve_config models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} infer.cache_type=paged coordinator.host=\$ROUTER_IP coordinator.port=21001 serve.port=\$ROUTER_HTTP_PORT infer.use_cuda_graph=True infer.schedule_overlap=False float_16bit_variant=bfloat16 multi_inst.n_insts=2 \$PD_INST_OVERRIDES_ARGS\"
 
         if [ \"\$SLURM_PROCID\" = \"0\" ]; then
-            # === Node 0: Router + Prefill (TP4+PP2) ===
+            # === Node 0: Router + Prefill (TP2+PP4) ===
             echo '=== Node 0: Starting Router ==='
-            python -m chitu \
-                   --config-name=pd_disagg_serve_config \
+            python3 -m chitu \
+                   \$COMMON_ARGS \
+                   multi_inst.inst_id=null \
                    multi_inst.router.is_router=True \
-                   serve.port=\$ROUTER_HTTP_PORT \
-                   multi_inst.enabled=True \
-                   coordinator.host=\$ROUTER_IP \
-                   coordinator.port=21001 \
                     > \"\$LOG_DIR_INNER/router.log\" 2>&1 &
+
             ROUTER_PID=\$!
 
             echo 'Waiting for Router...'
@@ -157,15 +170,15 @@ srun $SRUN_PARTITION_ARG \
             export PD_MASTER_ADDR=\$ROUTER_IP
             PREFILL_NPROC_PER_NODE=8
             export PREFILL_NPROC_PER_NODE
-            CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.run \
+            python3 -m torch.distributed.run \
                 --nproc_per_node=\$PREFILL_NPROC_PER_NODE \
                 --master_port=29510 \
                 -m chitu \
                 \$COMMON_ARGS \
                 multi_inst.inst_id=0 \
-                scheduler.type=\"prefill_only\" \
-                infer.tp_size=2 infer.pp_size=4 infer.dp_size=1 infer.ep_size=1 \
+                multi_inst.router.is_router=False \
                 > \"\$LOG_DIR_INNER/prefill_tp2pp4.log\" 2>&1 &
+
             P_PID=\$!
 
             wait \$ROUTER_PID \$P_PID
@@ -183,7 +196,7 @@ srun $SRUN_PARTITION_ARG \
             export DECODE_NODE_RANK
 
             echo \"=== Node \${SLURM_PROCID}: Starting Decode (DP16+EP16, node_rank=\${DECODE_NODE_RANK}) ===\"
-            CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.run \
+            python3 -m torch.distributed.run \
                 --nnodes=\$DECODE_NNODES \
                 --nproc_per_node=\$DECODE_NPROC_PER_NODE \
                 --node_rank=\$DECODE_NODE_RANK \
@@ -192,9 +205,9 @@ srun $SRUN_PARTITION_ARG \
                 -m chitu \
                 \$COMMON_ARGS \
                 multi_inst.inst_id=1 \
-                scheduler.type=\"decode_only\" \
-                infer.tp_size=1 infer.dp_size=16 infer.ep_size=16 \
+                multi_inst.router.is_router=False \
                 > \"\$LOG_DIR_INNER/decode_dp16_ep16.node\${SLURM_PROCID}.log\" 2>&1 &
+
             D_PID=\$!
 
             wait \$D_PID

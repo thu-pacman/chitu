@@ -180,6 +180,7 @@ def test_dsa_indexer_paged_kv(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     is_decode = s_q <= 2
@@ -397,6 +398,7 @@ def test_mla_prefill_ragged_qkvo(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     if not is_increment:
@@ -538,6 +540,7 @@ def test_mla_prefill_ragged_qo_paged_kv(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     num_pages = 1024
@@ -678,6 +681,7 @@ def test_flash_mla_fp8_kvcache_dequant_bf16_prefill(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     seq_len_delta = BatchedSeqLenDelta(
@@ -937,6 +941,7 @@ def test_mla_decode_dense_kv(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     prev_seq_len_list = [torch.randint(1, 4096, (1,)).item() for _ in range(bs)]
@@ -1131,6 +1136,7 @@ def test_mla_decode_paged_kv(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     page_cnt_per_sample = ceil_div(4096, page_size)
@@ -1281,6 +1287,7 @@ def test_csa_hca_prefill_ragged_qkvo(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     from chitu.models.model_deepseek_v4 import get_chunked_prefill_topk_idxs_v4
@@ -1365,6 +1372,7 @@ def _run_csa_hca_prefill_cache_wrapper(cache_kind, impl, record_benchmark):
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     from chitu.models.model_deepseek_v4 import get_chunked_prefill_topk_idxs_v4
@@ -1592,6 +1600,7 @@ def test_csa_hca_prefill_paged_kv_dispatch(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     from chitu.models.model_deepseek_v4 import get_chunked_prefill_topk_idxs_v4
@@ -1751,6 +1760,7 @@ def test_csa_hca_decode_dense_kv(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     from chitu.models.model_deepseek_v4 import (
@@ -1897,6 +1907,7 @@ def test_csa_hca_decode_paged_kv(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     from chitu.models.model_deepseek_v4 import (
@@ -2120,6 +2131,7 @@ def test_hopper_mixed_decode_paged_kv(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     # HopperMixedBackend requires page_size == 1 (block_size == 1)
@@ -2255,6 +2267,7 @@ def test_prefill_ragged_qkvo(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     if not is_increment:
@@ -2373,6 +2386,7 @@ def test_decode_dense_kv(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     seq_len_delta = BatchedSeqLenDelta(
@@ -2536,7 +2550,9 @@ def test_decode_paged_kv(
     if impl == "hunyuan_attn":
         global_args["float_16bit_variant"] = "bfloat16"
         torch.set_default_dtype(torch.bfloat16)
-    set_global_args(OmegaConf.create(global_args), need_ensure=False)
+    set_global_args(
+        OmegaConf.create(global_args), need_ensure=False, need_preprocess=False
+    )
 
     seq_len_delta = BatchedSeqLenDelta(
         prev_seq_len_list,
@@ -2695,8 +2711,7 @@ def test_prefill_ragged_qo_paged_kv(
         torch.set_default_dtype(torch.bfloat16)
 
     set_global_args(
-        OmegaConf.create(global_args),
-        need_ensure=False,
+        OmegaConf.create(global_args), need_ensure=False, need_preprocess=False
     )
 
     if not is_increment:

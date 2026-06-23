@@ -294,6 +294,7 @@ def test_parallel_moe_block(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     rank = torch.distributed.get_rank()
@@ -816,6 +817,7 @@ def test_parallel_moe_block_blockfp8(
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     rank = torch.distributed.get_rank()

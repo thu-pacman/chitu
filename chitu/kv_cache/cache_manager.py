@@ -6,7 +6,7 @@ from typing import Optional, TYPE_CHECKING
 from logging import getLogger
 from collections import deque, OrderedDict
 
-from chitu.global_vars import get_global_args
+from chitu.global_vars import get_global_args, is_independent_multi_inst
 from chitu.task_type import TaskType
 from chitu.utils import ceil_div
 from chitu.kv_cache.prefix_caching import (
@@ -242,12 +242,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
         if (
             blk_hash is not None
             and multi_inst
-            and getattr(multi_inst, "enabled", False)
-            and not getattr(
-                getattr(getattr(multi_inst, "router", None), "pd_disaggregation", None),
-                "enabled",
-                True,
-            )
+            and getattr(multi_inst, "n_insts", 1) > 1
+            and is_independent_multi_inst()
         ):
             self.evicted_blk_hashes.append(blk_hash)
         if (

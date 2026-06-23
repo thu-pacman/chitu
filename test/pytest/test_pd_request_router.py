@@ -15,9 +15,7 @@ from chitu.distributed.pd_disaggregation.pd_request_router import PDRequestRoute
 from chitu.dp_request_router import LoadBalancer, PrefixCacheAwarePolicy, SchedulerStats
 from chitu.global_vars import set_global_args
 from chitu.schemas.serve_config import (
-    DecodeSchedulerConfig,
     PDDisaggregationConfig,
-    PrefillSchedulerConfig,
     RouterConfig,
 )
 
@@ -31,10 +29,62 @@ class MockReq:
 
 
 def set_default_global_args():
-    # global_args here is useless, but it must exists
     set_global_args(
-        OmegaConf.create({"infer": {}}),
+        OmegaConf.create(
+            {
+                "infer": {},
+                "multi_inst": {
+                    "n_insts": 3,
+                    "inst_id": None,
+                    "role": "prefill_and_decode",
+                    "pd_disaggregation": {
+                        "prefill_scheduler": None,
+                        "decode_scheduler": None,
+                    },
+                    "inst_overrides": {
+                        0: {
+                            "multi_inst": {
+                                "role": "prefill",
+                                "pd_disaggregation": {
+                                    "prefill_scheduler": {
+                                        "max_batch_size": 32,
+                                        "max_total_tokens": 8192,
+                                        "batching_strategy": "varlen",
+                                    },
+                                },
+                            }
+                        },
+                        1: {
+                            "multi_inst": {
+                                "role": "prefill",
+                                "pd_disaggregation": {
+                                    "prefill_scheduler": {
+                                        "max_batch_size": 32,
+                                        "max_total_tokens": 8192,
+                                        "batching_strategy": "varlen",
+                                    },
+                                },
+                            }
+                        },
+                        2: {
+                            "multi_inst": {
+                                "role": "decode",
+                                "pd_disaggregation": {
+                                    "decode_scheduler": {
+                                        "scheduling_strategy": "immediate",
+                                    },
+                                },
+                            }
+                        },
+                    },
+                    "router": {
+                        "is_router": True,
+                    },
+                },
+            }
+        ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
 
@@ -53,26 +103,6 @@ def _pd_router_config(
         router_cache_miss_fallback_algorithm=router_cache_miss_fallback_algorithm,
         router_hit_weight=1.0,
         router_load_penalty_weight=0.02,
-        pd_disaggregation=PDDisaggregationConfig(
-            enabled=True,
-        ),
-        prefill_schedulers=[
-            PrefillSchedulerConfig(
-                max_batch_size=32,
-                max_total_tokens=8192,
-                batching_strategy="varlen",
-            ),
-            PrefillSchedulerConfig(
-                max_batch_size=32,
-                max_total_tokens=8192,
-                batching_strategy="varlen",
-            ),
-        ],
-        decode_schedulers=[
-            DecodeSchedulerConfig(
-                scheduling_strategy="immediate",
-            ),
-        ],
     )
 
 
@@ -239,7 +269,7 @@ def test_pd_router_round_robin_policies():
         routing_algorithm_for_decode="round_robin",
         router_cache_miss_fallback_algorithm="power_of_two_choices",
     )
-    router = PDRequestRouter(cfg)
+    router = PDRequestRouter(cfg, PDDisaggregationConfig())
 
     assert isinstance(router.prefill_policy, LoadBalancer)
     assert router.prefill_policy.algorithm == "round_robin"
@@ -254,7 +284,7 @@ def test_pd_router_prefix_prefill_decode_uses_decode_policy():
         routing_algorithm="prefix_cache_aware",
         routing_algorithm_for_decode="round_robin",
     )
-    router = PDRequestRouter(cfg)
+    router = PDRequestRouter(cfg, PDDisaggregationConfig())
 
     assert isinstance(router.prefill_policy, PrefixCacheAwarePolicy)
     assert router.decode_policy.algorithm == "round_robin"

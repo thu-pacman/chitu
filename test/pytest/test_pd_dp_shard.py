@@ -67,13 +67,13 @@ def test_pd_dp_shard_round_robin():
                 "use_cuda_graph": False,
             },
             "multi_inst": {
+                "n_insts": 1,
                 "inst_id": 0,
+                "pd_disaggregation": {
+                    "bootstrap_port": 0,
+                },
                 "router": {
                     "host": "127.0.0.1",
-                    "pd_disaggregation": {
-                        "enabled": True,
-                        "bootstrap_port": 0,
-                    },
                 },
             },
             "scheduler": {
@@ -87,7 +87,7 @@ def test_pd_dp_shard_round_robin():
             },
         }
     )
-    set_global_args(cfg, need_ensure=False)
+    set_global_args(cfg, need_ensure=False, need_preprocess=False)
     if global_vars._GLOBAL_TIMERS is None:
         global_vars._set_timers()
     Backend.args = global_vars.get_global_args()

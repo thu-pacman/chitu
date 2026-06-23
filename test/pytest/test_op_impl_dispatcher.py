@@ -163,12 +163,13 @@ def test_warmup_engine_emits_impl_summary_after_auto_set(monkeypatch):
         lambda: events.append("emit"),
     )
 
+    monkeypatch.setattr(chitu_main, "is_classic_pd_disagg", lambda: False)
+    monkeypatch.setattr(chitu_main, "is_independent_multi_inst", lambda: True)
+
     args = SimpleNamespace(
         multi_inst=SimpleNamespace(
-            router=SimpleNamespace(
-                is_router=False,
-                pd_disaggregation=SimpleNamespace(enabled=False),
-            )
+            n_insts=2,
+            router=SimpleNamespace(is_router=False),
         ),
         scheduler=SimpleNamespace(type="default"),
         infer=SimpleNamespace(full_warmup=False, prefill_chunk_size=100),

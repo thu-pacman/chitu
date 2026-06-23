@@ -20,7 +20,6 @@ from chitu.metrics.prometheus_collector import (
     PrometheusMetricsCollector,
     inc_completed_requests,
 )
-from chitu.distributed.pd_disaggregation.pd_log_utils import pd_verbose_enabled
 
 if TYPE_CHECKING:
     from chitu.kv_cache import KVCacheManagerBase
@@ -580,13 +579,12 @@ class Scheduler:
             idx = max(0, min(n - 1, idx))
             return delays[idx]
 
-        if pd_verbose_enabled():
-            logger.info(
-                "[PD_STATS][decode.ready_to_exec] "
-                f"count={n} avg_ms={avg:.2f} "
-                f"p50_ms={_pct(50):.2f} p90_ms={_pct(90):.2f} "
-                f"p95_ms={_pct(95):.2f} p99_ms={_pct(99):.2f}"
-            )
+        logger.debug(
+            "[PD_STATS][decode.ready_to_exec] "
+            f"count={n} avg_ms={avg:.2f} "
+            f"p50_ms={_pct(50):.2f} p90_ms={_pct(90):.2f} "
+            f"p95_ms={_pct(95):.2f} p99_ms={_pct(99):.2f}"
+        )
 
     def _schedule_prefill_tasks(self, task_ids: list[str]) -> list[str]:
         """Prefill tasks scheduling with congestion control

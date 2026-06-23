@@ -34,7 +34,7 @@ def main(args: ServeConfig):
 
     os.makedirs(target_dir, exist_ok=True)
 
-    chitu_init(args)
+    args = chitu_init(args)
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     local_rank = int(os.environ.get("LOCAL_RANK", 0))

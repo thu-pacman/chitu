@@ -4,11 +4,12 @@
 
 import re
 from typing import Optional, Any
+from omegaconf import ListConfig
 from chitu.global_vars import get_global_args
 
 
 def get_quant_kwargs_from_checkpoint_prefix(
-    checkpoint_prefix: str, rules: Optional[list] = None
+    checkpoint_prefix: str, rules: Optional[list | ListConfig] = None
 ) -> dict[str, Any]:
     if not rules:
         rules = get_global_args().models.quant_config.rules
@@ -89,7 +90,7 @@ def get_layer_id_from_checkpoint_prefix(checkpoint_prefix: str, rules={}) -> int
     return -1
 
 
-def collect_layers_by_type(type_list: list[str], rules) -> list[int]:
+def collect_layers_by_type(type_list: list[str] | ListConfig, rules) -> list[int]:
     layer_set = set()
     for rule in rules:
         if rule.get("type") in type_list:

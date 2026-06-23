@@ -20,7 +20,7 @@ import torch
 from chitu.models.registry import ModelType
 from chitu.async_stream import AsyncDataStream
 from chitu.backend import Backend
-from chitu.global_vars import get_slot_handle, get_global_args
+from chitu.global_vars import get_slot_handle, get_global_args, is_classic_pd_disagg
 from chitu.task_type import TaskType
 from chitu.tool_call import (
     ToolCallParams,
@@ -520,13 +520,8 @@ class Task:
             self.set_stopped()
             self.req.finish_reason = "length"
         if self.status == TaskStatus.Stopped:
-            pd_cfg = getattr(
-                getattr(get_global_args(), "multi_inst", None), "router", None
-            )
-            pd_cfg = getattr(pd_cfg, "pd_disaggregation", None)
             if (
-                pd_cfg is not None
-                and bool(getattr(pd_cfg, "enabled", False))
+                is_classic_pd_disagg()
                 and self.task_type == TaskType.Decode
                 and getattr(self, "req", None) is not None
                 and not getattr(self, "pd_exec_end_logged", False)

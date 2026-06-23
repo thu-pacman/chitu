@@ -41,7 +41,12 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
 )
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_token_sender import start_dp_token_manager
-from chitu.global_vars import get_global_args
+from chitu.global_vars import (
+    get_global_args,
+    get_multi_inst_ids_by_role,
+    is_classic_pd_disagg,
+    is_independent_multi_inst,
+)
 from chitu.distributed.coordinator import get_endpoint, set_endpoint
 from chitu.hooks import (
     DPTokenSink,
@@ -63,19 +68,12 @@ logger = logging.getLogger(__name__)
 
 
 def _determine_pd_scheduler_id(args, pd_mode: PDSchedulerMode, rank: int) -> int:
-    """Return the scheduler id used by PDRequestRouter for this role.
-
-    The id is the index of this scheduler within its kind (prefill or decode).
-    Each P/D worker is launched with `multi_inst.inst_id` set to its global
-    instance index, where prefill instances come first (ids 0..P-1) and decode
-    instances follow (ids P..P+D-1). The router-facing scheduler id is therefore
-    `inst_id` for prefill, and `inst_id - prefill_count` for decode.
-    """
+    """Return the role-local scheduler ID used by PDRequestRouter."""
     instance_id = int(getattr(args.multi_inst, "inst_id", rank))
+    if pd_mode == PDSchedulerMode.PREFILL_ONLY:
+        return get_multi_inst_ids_by_role("prefill").index(instance_id)
     if pd_mode == PDSchedulerMode.DECODE_ONLY:
-        prefill_schedulers = getattr(args.multi_inst.router, "prefill_schedulers", [])
-        prefill_count = len(prefill_schedulers or [])
-        return instance_id - prefill_count if prefill_count > 0 else instance_id
+        return get_multi_inst_ids_by_role("decode").index(instance_id)
     return instance_id
 
 
@@ -182,39 +180,20 @@ class PDSchedulerService:
         logger.info(f"pd scheduler service initialized in {self.pd_mode.value} mode")
 
     def _determine_pd_mode(self) -> PDSchedulerMode:
-        """Determine PD mode from configuration"""
-        # Check if PD disaggregation is enabled
-        multi_inst = self.args.multi_inst
-        if (
-            not hasattr(multi_inst.router, "pd_disaggregation")
-            or not multi_inst.router.pd_disaggregation.enabled
-        ):
+        """Determine PD mode from effective instance roles."""
+        if is_independent_multi_inst():
             return PDSchedulerMode.UNIFIED
+        if not is_classic_pd_disagg():
+            raise NotImplementedError(
+                "Mixing prefill_and_decode with prefill/decode roles is not supported"
+            )
 
-        # Check scheduler type from command line or environment
-        scheduler_type = str(self.args.scheduler.type)
-
-        if "prefill_only" in scheduler_type.lower():
+        role = getattr(self.args.multi_inst, "role", "prefill_and_decode")
+        if role == "prefill":
             return PDSchedulerMode.PREFILL_ONLY
-        elif "decode_only" in scheduler_type.lower():
+        if role == "decode":
             return PDSchedulerMode.DECODE_ONLY
-        else:
-            instance_id = multi_inst.inst_id
-            if instance_id == 0:
-                # First instance defaults to Prefill
-                logger.info(
-                    "pd disaggregation enabled, instance_id=0, defaulting to prefill mode"
-                )
-                return PDSchedulerMode.PREFILL_ONLY
-            elif instance_id == 1:
-                # Second instance defaults to Decode
-                logger.info(
-                    "pd disaggregation enabled, instance_id=1, defaulting to decode mode"
-                )
-                return PDSchedulerMode.DECODE_ONLY
-            else:
-                # Other instances default to unified mode
-                return PDSchedulerMode.UNIFIED
+        return PDSchedulerMode.UNIFIED
 
     def _determine_scheduler_id(self) -> int:
         """Return the Router-facing scheduler id for this PD role."""
@@ -567,10 +546,10 @@ async def start_pd_worker_service(args, rank: int = 0):
 
     logger.info(f"pd worker rank {rank} detected mode: {mode}")
 
-    pd_cfg = args.multi_inst.router.pd_disaggregation
-    if pd_cfg is None or not pd_cfg.enabled:
+    pd_cfg = args.multi_inst.pd_disaggregation
+    if pd_cfg is None or not is_classic_pd_disagg():
         raise RuntimeError(
-            "start_pd_worker_service called but pd_disaggregation is not enabled"
+            "start_pd_worker_service requires classic PD disaggregation roles"
         )
 
     logger.info("Initializing KVManager for worker")

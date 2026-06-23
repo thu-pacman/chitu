@@ -36,10 +36,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
     KVPoll,
     decode_prepare_role,
 )
-from chitu.distributed.pd_disaggregation.pd_log_utils import (
-    pd_trace_enabled,
-    pd_verbose_enabled,
-)
+from chitu.distributed.pd_disaggregation.pd_log_utils import pd_trace_enabled
 from chitu.backend import Backend
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
@@ -214,7 +211,7 @@ class PDInstanceRequestManager:
         self.token_manager = None  # DP token manager for streaming back to Router
 
         # Queue config
-        pd_cfg = args.multi_inst.router.pd_disaggregation
+        pd_cfg = args.multi_inst.pd_disaggregation
         self._kv_cfg = pd_cfg.kv_transfer
         self._queue_max_pending = int(
             self._kv_cfg.queue_max_pending
@@ -253,11 +250,10 @@ class PDInstanceRequestManager:
                 return True
             except zmq.error.Again:
                 if time.monotonic() >= end:
-                    if pd_verbose_enabled():
-                        logger.warning(
-                            f"[PD_PREPARE][send_drop] backpressure timeout, will retry later: "
-                            f"req_id={request_id} dp_rank={int(dp_rank)} endpoint={endpoint_addr}"
-                        )
+                    logger.debug(
+                        f"[PD_PREPARE][send_drop] backpressure timeout, will retry later: "
+                        f"req_id={request_id} dp_rank={int(dp_rank)} endpoint={endpoint_addr}"
+                    )
                     return False
                 try:
                     sock.poll(timeout=int(poll_step_ms), flags=zmq.POLLOUT)
@@ -491,8 +487,7 @@ class PDInstanceRequestManager:
         request_id = request_data["request_id"]
         original_request = request_data["request"]
 
-        if pd_verbose_enabled():
-            logger.debug(f"processing prefill request: {request_id}")
+        logger.debug(f"processing prefill request: {request_id}")
         logger.debug(f"[PD_STAGE][prefill.queue.start] req_id={request_id}")
 
         # Create task from request and enqueue. Actual batched prefill compute is driven by
@@ -504,10 +499,9 @@ class PDInstanceRequestManager:
                 f"prefix_tokens_len={int(task.prefix_tokens_len)} "
                 f"max_new_tokens={int(task.req.max_new_tokens)}"
             )
-        if pd_verbose_enabled():
-            logger.debug(
-                f"prefill task enqueued for request: {request_id}; compute will be handled by worker loop"
-            )
+        logger.debug(
+            f"prefill task enqueued for request: {request_id}; compute will be handled by worker loop"
+        )
         logger.debug(f"[PD_STAGE][prefill.queue.end] req_id={request_id}")
 
     async def _process_decode_request(self, request_data: dict[str, Any]):
@@ -516,10 +510,9 @@ class PDInstanceRequestManager:
         original_request = request_data["request"]
         prefill_scheduler_id = request_data.get("prefill_scheduler_id")
 
-        if pd_verbose_enabled():
-            logger.debug(
-                f"processing decode request: {request_id} from prefill scheduler {prefill_scheduler_id}"
-            )
+        logger.debug(
+            f"processing decode request: {request_id} from prefill scheduler {prefill_scheduler_id}"
+        )
 
         # Idempotent: Router may resend the same request.
         if request_id in self.pending_decode_requests:
@@ -543,10 +536,7 @@ class PDInstanceRequestManager:
                 self._dp_cursor = 0
             target_dp_rank = self._dp_cursor % self.dp_size
             self._dp_cursor += 1
-            if pd_verbose_enabled():
-                logger.debug(
-                    f"Scheduled request {request_id} to DP rank {target_dp_rank}"
-                )
+            logger.debug(f"Scheduled request {request_id} to DP rank {target_dp_rank}")
         args = get_global_args()
         if pd_trace_enabled():
             logger.debug(
@@ -586,10 +576,9 @@ class PDInstanceRequestManager:
         # 入口队列允许 overflow
         self._decode_incoming_q.enqueue(request_id, info, allow_overflow=True)
         decode_info["status"] = PDRequestStatus.KV_TRANSFERRING
-        if pd_verbose_enabled():
-            logger.debug(
-                f"[PD_QUEUE][decode.enqueue] req_id={request_id} cache_owner={target_dp_rank}"
-            )
+        logger.debug(
+            f"[PD_QUEUE][decode.enqueue] req_id={request_id} cache_owner={target_dp_rank}"
+        )
         logger.debug(f"[PD_STAGE][decode.enqueue.start] req_id={request_id}")
 
     def _create_task_from_request(
@@ -786,10 +775,7 @@ class PrefillOnlyManager(PDInstanceRequestManager):
 
         # 该日志表示 Prefill scheduler 已接收该请求，但尚未进入 prefill executor.step 流程
         # 在等待 Decode schedule 该请求并发送 TransferInfo
-        if pd_verbose_enabled():
-            logger.debug(
-                f"[PD_QUEUE][prefill.enqueue] request queued: req_id={request_id}"
-            )
+        logger.debug(f"[PD_QUEUE][prefill.enqueue] request queued: req_id={request_id}")
         logger.debug(f"[PD_STAGE][prefill.queue.start] req_id={request_id}")
 
     def _bootstrap_check_and_promote(
@@ -834,11 +820,10 @@ class PrefillOnlyManager(PDInstanceRequestManager):
                 waited = now - created_ts
                 if (now - last_log_ts) >= 1.0 and waited >= 1.0:
                     info["last_log_ts"] = now
-                    if pd_verbose_enabled():
-                        logger.info(
-                            f"[PD_BOOTSTRAP][prefill.wait] still waiting TransferInfo: req_id={rid} "
-                            f"waited={waited:.1f}s"
-                        )
+                    logger.debug(
+                        f"[PD_BOOTSTRAP][prefill.wait] still waiting TransferInfo: req_id={rid} "
+                        f"waited={waited:.1f}s"
+                    )
                 if (
                     self._bootstrap_timeout_s > 0
                     and waited >= self._bootstrap_timeout_s
@@ -869,10 +854,9 @@ class PrefillOnlyManager(PDInstanceRequestManager):
                     logger.warning(
                         f"[PD_SLOW] prefill.transfer_info_wait req_id={rid} waited={waited:.1f}s"
                     )
-                if pd_verbose_enabled():
-                    logger.debug(
-                        f"[PD_QUEUE][prefill.ready] req_id={rid} TransferInfo ready waited={waited:.1f}s"
-                    )
+                logger.debug(
+                    f"[PD_QUEUE][prefill.ready] req_id={rid} TransferInfo ready waited={waited:.1f}s"
+                )
                 logger.debug(f"[PD_STAGE][prefill.transfer_info.end] req_id={rid}")
 
         # 3) ready -> TaskPool
@@ -891,10 +875,9 @@ class PrefillOnlyManager(PDInstanceRequestManager):
             waited = time.time() - created_ts
             # Record prefill queue duration
             observe_stage_duration("prefill", "queue", waited)
-            if pd_verbose_enabled():
-                logger.debug(
-                    f"[PD_BOOTSTRAP][prefill.promote] promoted req_id={rid} to Prefill task waited={waited:.1f}s"
-                )
+            logger.debug(
+                f"[PD_BOOTSTRAP][prefill.promote] promoted req_id={rid} to Prefill task waited={waited:.1f}s"
+            )
             logger.debug(f"[PD_STAGE][prefill.queue.end] req_id={rid}")
             logger.debug(f"[PD_STAGE][prefill.exec.start] req_id={rid}")
 
@@ -1136,10 +1119,9 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 observe_stage_duration("decode", "enqueue", waited)
                 logger.debug(f"[PD_STAGE][decode.enqueue.end] req_id={rid}")
                 logger.debug(f"[PD_STAGE][decode.prealloc.start] req_id={rid}")
-                if pd_verbose_enabled():
-                    logger.debug(
-                        f"[PD_QUEUE][decode.prealloc] req_id={rid} cache_owner={target_dp_rank} waited={waited:.1f}s"
-                    )
+                logger.debug(
+                    f"[PD_QUEUE][decode.prealloc] req_id={rid} cache_owner={target_dp_rank} waited={waited:.1f}s"
+                )
 
         # 2) prealloc -> ready (wait KVPoll.Success)
         for rid, info in self._decode_prealloc_q.peek(max_check):
@@ -1186,11 +1168,10 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 last_log_ts = float(info.get("last_log_ts", 0.0))
                 if (now - last_log_ts) >= 1.0 and (now - created_ts) >= 1.0:
                     info["last_log_ts"] = now
-                    if pd_verbose_enabled():
-                        logger.info(
-                            f"[PD_BOOTSTRAP][decode.wait] still waiting KV ready: req_id={rid} "
-                            f"waited={now - created_ts:.1f}s"
-                        )
+                    logger.debug(
+                        f"[PD_BOOTSTRAP][decode.wait] still waiting KV ready: req_id={rid} "
+                        f"waited={now - created_ts:.1f}s"
+                    )
                 continue
 
             if self._decode_ready_q.is_full():
@@ -1219,10 +1200,9 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                     )
                 logger.debug(f"[PD_STAGE][decode.prealloc.end] req_id={rid}")
                 logger.debug(f"[PD_STAGE][decode.ready.start] req_id={rid}")
-                if pd_verbose_enabled():
-                    logger.debug(
-                        f"[PD_QUEUE][decode.ready] req_id={rid} KV ready waited={waited:.1f}s"
-                    )
+                logger.debug(
+                    f"[PD_QUEUE][decode.ready] req_id={rid} KV ready waited={waited:.1f}s"
+                )
 
         # 3) ready -> TaskPool
         promoted = 0
@@ -1317,11 +1297,10 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 decode_info["decode_start_time"] = time.time()
             created_ts = float(info.get("created_ts", time.time()))
             waited = time.time() - created_ts
-            if pd_verbose_enabled():
-                logger.debug(
-                    f"[PD_BOOTSTRAP][decode.promote] promoted req_id={rid} to Decode task "
-                    f"waited={waited:.1f}s"
-                )
+            logger.debug(
+                f"[PD_BOOTSTRAP][decode.promote] promoted req_id={rid} to Decode task "
+                f"waited={waited:.1f}s"
+            )
             logger.debug(f"[PD_STAGE][decode.sched_wait.start] req_id={rid}")
 
         # Update decode queue size gauges
@@ -1349,20 +1328,19 @@ class DecodeOnlyManager(PDInstanceRequestManager):
         self._decode_prealloc_promoted_snapshot = self._decode_prealloc_promoted_total
         self._decode_ready_promoted_snapshot = self._decode_ready_promoted_total
         self._decode_ready_wait_total_snapshot_s = self._decode_ready_wait_total_s
-        if pd_verbose_enabled():
-            logger.debug(
-                "[PD_STATS][decode.prealloc] "
-                f"prealloc_promoted={prealloc_delta} ready_promoted={ready_delta} "
-                f"ready_wait_avg_s={avg_wait:.3f} ready_wait_max_s={self._decode_ready_wait_max_s:.3f} "
-                f"queues={{incoming:{self._decode_incoming_q.size()}, "
-                f"prealloc:{self._decode_prealloc_q.size()}, ready:{self._decode_ready_q.size()}}} "
-                f"budget={{tokens_inflight:{self._decode_prealloc_tokens_inflight}, "
-                f"token_budget:{self._decode_prealloc_token_budget}, "
-                f"reserved:{self._decode_prealloc_reserved_tokens}}} "
-                f"limits={{prealloc_max:{self._decode_prealloc_max_pending}, "
-                f"run_max:{self.decode_num_tasks}, "
-                f"run_limit:{self._decode_max_running_tasks_per_dp}}}"
-            )
+        logger.debug(
+            "[PD_STATS][decode.prealloc] "
+            f"prealloc_promoted={prealloc_delta} ready_promoted={ready_delta} "
+            f"ready_wait_avg_s={avg_wait:.3f} ready_wait_max_s={self._decode_ready_wait_max_s:.3f} "
+            f"queues={{incoming:{self._decode_incoming_q.size()}, "
+            f"prealloc:{self._decode_prealloc_q.size()}, ready:{self._decode_ready_q.size()}}} "
+            f"budget={{tokens_inflight:{self._decode_prealloc_tokens_inflight}, "
+            f"token_budget:{self._decode_prealloc_token_budget}, "
+            f"reserved:{self._decode_prealloc_reserved_tokens}}} "
+            f"limits={{prealloc_max:{self._decode_prealloc_max_pending}, "
+            f"run_max:{self.decode_num_tasks}, "
+            f"run_limit:{self._decode_max_running_tasks_per_dp}}}"
+        )
 
     def _record_decode_ready_exec_latency(self, task_ids: list[str]) -> None:
         now = time.perf_counter()
@@ -1401,10 +1379,9 @@ class DecodeOnlyManager(PDInstanceRequestManager):
         for d_ms in delays:
             observe_stage_duration("decode", "sched_wait", d_ms / 1000.0)
 
-        if pd_verbose_enabled():
-            logger.debug(
-                "[PD_STATS][decode.ready_to_exec] "
-                f"count={n} avg_ms={avg:.2f} "
-                f"p50_ms={_pct(50):.2f} p90_ms={_pct(90):.2f} "
-                f"p95_ms={_pct(95):.2f} p99_ms={_pct(99):.2f}"
-            )
+        logger.debug(
+            "[PD_STATS][decode.ready_to_exec] "
+            f"count={n} avg_ms={avg:.2f} "
+            f"p50_ms={_pct(50):.2f} p90_ms={_pct(90):.2f} "
+            f"p95_ms={_pct(95):.2f} p99_ms={_pct(99):.2f}"
+        )

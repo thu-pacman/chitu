@@ -7,21 +7,27 @@
 # - https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/training/global_vars.py
 
 import operator
+import os
 import time
-from functools import lru_cache, reduce
+import functools
 from logging import getLogger
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from omegaconf import OmegaConf
 import re
 
+from chitu.import_utils import try_import_opt_dep
 from chitu.schemas.serve_config import ServeConfig, StaticConfig
+from chitu.schemas.utils import ModelConfigResolver
 
 logger = getLogger(__name__)
 
+numa, has_numa = try_import_opt_dep("numa", "cpu")
+deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 
-_GLOBAL_ARGS: Optional[ServeConfig] = None
+_RAW_GLOBAL_ARGS: Optional[ServeConfig] = None
+_GLOBAL_ARGS = None
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_TIMERS = None
 _GLOBAL_MEMORY_BUFFER = None
@@ -211,6 +217,263 @@ def set_backend_variables(global_args=None):
     models.backend_config = backend_config
 
 
+def _check_checkpoint_path(args):
+    if args.models.ckpt_dir is None:
+        if not getattr(args.models, "is_pro", False):
+            raise ValueError(
+                f"No checkpoint path provided. You can set it in command line by adding "
+                f"`models.ckpt_dir=<path>`. The model {args.models.name} can be downloaded "
+                f"from {args.models.source}"
+            )
+        else:
+            raise ValueError(
+                f"No checkpoint path provided. You can set it in command line by adding "
+                f"`models.ckpt_dir=<path>`. The model {args.models.name} is part of "
+                f"chitu-pro, which may be obtained by concatting solution@chitu.ai"
+            )
+    if args.models.tokenizer_path is None:
+        logger.info(
+            f"Using {args.models.ckpt_dir} as the path to tokenizer. If the tokenizer has a different path, please set in command line by adding `models.tokenizer_path=<path>`"
+        )
+        args.models.tokenizer_path = args.models.ckpt_dir
+    if hasattr(args.models, "processor_path") and args.models.processor_path is None:
+        logger.info(
+            f"Using {args.models.ckpt_dir} as the path to processor. If the processor has a different path, please set in command line by adding `models.processor_path=<path>`"
+        )
+        args.models.processor_path = args.models.ckpt_dir
+
+
+def _has_cpu_layer(args) -> bool:
+    if (backend_config := args.models.get("backend_config")) is not None:
+        for config in backend_config.get("backend", []):
+            if (pattern := config.get("model")) is not None:
+                if re.match(pattern, args.models.name.lower()):
+                    for rule in config.rules:
+                        if rule.get("backend") == "cpuinfer":
+                            return True
+    return False
+
+
+def resolve_default_args(args):
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+
+    ###################################################################
+    # Deal with legacy arguments
+    if hasattr(args.infer, "soft_fp8") and args.infer.soft_fp8:
+        logger.warning(
+            "Argument `infer.soft_fp8=True` is deprecated. Use `infer.raise_lower_bit_float_to=bfloat16` instead."
+        )
+        args.infer.raise_lower_bit_float_to = "bfloat16"
+    if hasattr(args, "dtype") and args.dtype is not None:
+        logger.warning(
+            "Argument `dtype` is deprecated. Use `float_16bit_variant` instead."
+        )
+        args.float_16bit_variant = args.dtype
+    if hasattr(args.infer, "do_load") and not args.infer.do_load:
+        logger.warning(
+            "Argument `infer.do_load=False` is deprecated. Use `debug.skip_model_load=True` instead."
+        )
+        args.debug.skip_model_load = True
+    if hasattr(args.infer, "max_reqs") and args.infer.max_reqs is not None:
+        args.infer.max_batch_size = args.infer.max_reqs
+        logger.warning(
+            f"Argument `infer.max_reqs={args.infer.max_reqs}` is deprecated. Use `infer.max_batch_size={args.infer.max_batch_size}` instead."
+        )
+    if getattr(args.infer, "max_concurrent_requests", None) is None:
+        args.infer.max_concurrent_requests = args.infer.max_batch_size * 2
+        logger.info(
+            f"infer.max_concurrent_requests not set, defaulting to max_batch_size * 2 ({args.infer.max_concurrent_requests})"
+        )
+
+    if (
+        hasattr(args.scheduler.pp_config, "prefill_num_tasks_divided_by_pp")
+        and not args.scheduler.pp_config.prefill_num_tasks_divided_by_pp
+    ):
+        logger.warning(
+            "Argument `scheduler.pp_config.prefill_num_tasks_divided_by_pp=False` is deprecated. Use `scheduler.pp_config.pp_micro_batch_size_prefill=<num>` instead."
+        )
+        assert (
+            hasattr(args.scheduler.pp_config, "prefill_num_tasks")
+            and args.scheduler.pp_config.prefill_num_tasks
+        )
+        args.scheduler.pp_config.pp_micro_batch_size_prefill = (
+            args.scheduler.pp_config.prefill_num_tasks
+        )
+    if (
+        hasattr(args.scheduler.pp_config, "enforce_decode_num_tasks_max")
+        and not args.scheduler.pp_config.enforce_decode_num_tasks_max
+    ):
+        logger.warning(
+            "Argument `scheduler.pp_config.enforce_decode_num_tasks_max=False` is deprecated. Use `scheduler.pp_config.pp_micro_batch_size_decode=<num>` instead."
+        )
+        assert (
+            hasattr(args.scheduler.pp_config, "decode_num_tasks")
+            and args.scheduler.pp_config.decode_num_tasks
+        )
+        args.scheduler.pp_config.pp_micro_batch_size_decode = (
+            args.scheduler.pp_config.decode_num_tasks
+        )
+
+    ###################################################################
+    # Deal with automatic arguments
+
+    if args.infer.device_ids is None:
+        args.infer.device_ids = [i % local_world_size for i in range(world_size)]
+    if len(args.infer.device_ids) != world_size:
+        raise ValueError(
+            f"len(infer.device_ids) ({len(args.infer.device_ids)}) must be equalt to world_size ({world_size})"
+        )
+
+    if args.infer.prefill_chunk_size == "auto":
+        args.infer.prefill_chunk_size = 4096 * args.infer.dp_size
+
+    if (
+        args.infer.prefill_chunk_size is not None
+        and args.infer.prefill_chunk_size
+        > args.infer.max_batch_size * args.infer.max_seq_len
+    ):
+        logger.warning(
+            f"infer.prefill_chunk_size ({args.infer.prefill_chunk_size}) is larger than "
+            f"infer.max_batch_size ({args.infer.max_batch_size}) * infer.max_seq_len "
+            f"({args.infer.max_seq_len}), which has no effect. Reducing it to "
+            f"infer.max_batch_size * infer.max_seq_len."
+        )
+        args.infer.prefill_chunk_size = (
+            args.infer.max_batch_size * args.infer.max_seq_len
+        )
+
+    if args.infer.prefill_chunk_size is not None:
+        if args.infer.pp_size > 1 and args.infer.cache_type == "skew":
+            logger.warning(
+                "Disabling infer.prefill_chunk_size because it is not compatible with PP+skew yet"
+            )
+            args.infer.prefill_chunk_size = None
+
+    if args.infer.bind_process_to_cpu == "auto":
+        if not has_numa:
+            logger.warning(
+                "Optional dependency '[numa]' is mising. Disabling NUMA binding."
+            )
+            args.infer.bind_process_to_cpu = "none"
+        elif not numa.available():
+            logger.warning(
+                "NUMA is not support on this OS or hardware platform. Disabling NUMA binding."
+            )
+            args.infer.bind_process_to_cpu = "none"
+        elif _has_cpu_layer(args):
+            if numa.get_max_node() + 1 < local_world_size:
+                logger.warning(
+                    "Disable NUMA binding due to insufficient NUMA nodes. Is is an inefficient setting of CPU inference."
+                )
+                args.infer.bind_process_to_cpu = "none"
+            else:
+                args.infer.bind_process_to_cpu = "one_numa_per_rank"
+        else:
+            args.infer.bind_process_to_cpu = "numa_near_device"
+
+    if args.infer.use_cuda_graph == "auto":
+        if args.models.name in [
+            "Mixtral-8x7B-Instruct-v0.1",
+            "Qwen3-30B-A3B-mix-fp4-fp8",
+            "Qwen3-Next-80B-A3B-Instruct",
+        ]:
+            args.infer.use_cuda_graph = False
+        elif (
+            args.infer.ep_size > 1
+            and args.infer.dp_size > 1
+            and (args.infer.tp_size > 1 or not has_deep_ep)
+        ):
+            args.infer.use_cuda_graph = False
+        elif args.infer.attn_type == "ref":
+            args.infer.use_cuda_graph = False
+        elif args.infer.op_impl is not None and args.infer.op_impl == "cpu":
+            args.infer.use_cuda_graph = False
+        elif (
+            args.models is not None
+            and str(args.models).find("'backend': 'cpuinfer'") != -1
+        ):
+            args.infer.use_cuda_graph = False
+        else:
+            args.infer.use_cuda_graph = True
+
+    if args.infer.mtp_size <= 0:
+        args.infer.mtp_size = 1
+
+    if args.infer.full_warmup == "auto":
+        if args.infer.pp_size > 1 and args.infer.use_cuda_graph:
+            args.infer.full_warmup = True
+        else:
+            args.infer.full_warmup = False
+
+    if args.scheduler.pp_config.pp_micro_batch_size_prefill == "auto":
+        args.scheduler.pp_config.pp_micro_batch_size_prefill = "max"
+
+    if args.scheduler.pp_config.pp_micro_batch_size_decode == "auto":
+        args.scheduler.pp_config.pp_micro_batch_size_decode = "max"
+
+    if args.infer.embed_tokens_lm_head_tp_size == "auto":
+        args.infer.embed_tokens_lm_head_tp_size = args.infer.tp_size
+    else:
+        assert (
+            args.infer.embed_tokens_lm_head_tp_size.isdigit()
+        ), "embed_tokens_lm_head_tp_size must be auto or an integer"
+
+    from chitu.models.registry import ModelType
+
+    if args.infer.mla_absorb == "auto":
+        if args.models.type == ModelType.DEEPSEEK_V3:
+            args.infer.mla_absorb = "absorb-without-precomp"
+        else:
+            args.infer.mla_absorb = "none"
+
+    if args.infer.dp_size > args.infer.max_batch_size:
+        raise ValueError(
+            f"infer.dp_size ({args.infer.dp_size}) cannot be greater than infer.max_batch_size ({args.infer.max_batch_size})"
+        )
+
+    _check_checkpoint_path(args)
+
+    model_resolver = ModelConfigResolver()
+    args.models = StaticConfig(
+        model_resolver.process_config_dict(args.models, args.models.ckpt_dir)
+    )
+
+    if (
+        args.models.type == ModelType.DEEPSEEK_V3
+        and args.models.get("index_topk", None) is not None
+    ):
+        assert args.infer.indexer_type in ("auto", "deepgemm", "hygon", "triton")
+        from chitu.dsa_indexer import (
+            support_indexer_deepgemm,
+            support_indexer_hygon,
+            validate_indexer_config,
+        )
+
+        if args.infer.indexer_type == "auto":
+            if (
+                support_indexer_hygon
+                and args.infer.cache_type == "paged"
+                and args.infer.mtp_size < 3
+                and int(args.models.index_head_dim) == 128
+                and int(args.models.index_n_heads) in (32, 64)
+            ):
+                args.infer.indexer_type = "hygon"
+            elif (
+                support_indexer_deepgemm
+                and args.infer.cache_type == "paged"
+                and args.infer.mtp_size < 3
+            ):
+                args.infer.indexer_type = "deepgemm"
+            else:
+                args.infer.indexer_type = "triton"
+        else:
+            validate_indexer_config(args, args.infer.indexer_type)
+
+    logger.debug(f"Auto setting configs done. Full configs are: {args}")
+    return args
+
+
 def _set_debug(debug: bool):
     global _GLOBAL_DEBUG
     _GLOBAL_DEBUG = debug
@@ -252,26 +515,100 @@ def _set_tensorboard_writer(args):
             )
 
 
-@lru_cache(maxsize=1)
+def _apply_multi_inst_override(cfg: Any, override_inst_id: Optional[int] = None) -> Any:
+    """Apply a multi-instance override to a config object."""
+    multi_inst = getattr(cfg, "multi_inst", None)
+    if multi_inst is None:
+        return cfg
+
+    normalized_overrides = {
+        int(key): value
+        for key, value in (getattr(multi_inst, "inst_overrides", None) or {}).items()
+    }
+
+    inst_id_value = getattr(multi_inst, "inst_id", None)
+    assert (
+        override_inst_id is not None or inst_id_value is not None
+    ), "multi_inst.inst_id must be set when applying an instance config"
+
+    inst_id = int(inst_id_value if override_inst_id is None else override_inst_id)
+    if inst_id not in normalized_overrides:
+        return cfg
+
+    return OmegaConf.merge(cfg, normalized_overrides[inst_id])
+
+
+@functools.cache
+def get_multi_inst_ids_by_role(role: str) -> list[int]:
+    """Return global instance IDs whose effective config has the given role."""
+    _ensure_var_is_initialized(_RAW_GLOBAL_ARGS, "global args")
+    base_cfg = _RAW_GLOBAL_ARGS
+    base_multi_inst = getattr(base_cfg, "multi_inst", None)
+    role_ids = []
+    for inst_id in range(int(getattr(base_multi_inst, "n_insts", 1))):
+        cfg = _apply_multi_inst_override(base_cfg, override_inst_id=inst_id)
+        multi_inst = getattr(cfg, "multi_inst", None)
+        if getattr(multi_inst, "role", "prefill_and_decode") == role:
+            role_ids.append(inst_id)
+    return role_ids
+
+
+@functools.cache
+def _get_effective_multi_inst_roles() -> tuple[str, ...]:
+    """Return effective roles for all configured instances."""
+    _ensure_var_is_initialized(_RAW_GLOBAL_ARGS, "global args")
+    base_cfg = _RAW_GLOBAL_ARGS
+    base_multi_inst = getattr(base_cfg, "multi_inst", None)
+    return tuple(
+        getattr(
+            getattr(
+                _apply_multi_inst_override(base_cfg, override_inst_id=inst_id),
+                "multi_inst",
+                None,
+            ),
+            "role",
+            "prefill_and_decode",
+        )
+        for inst_id in range(int(getattr(base_multi_inst, "n_insts", 1)))
+    )
+
+
+def is_independent_multi_inst() -> bool:
+    """Return True when every instance independently handles prefill and decode."""
+    return all(
+        role == "prefill_and_decode" for role in _get_effective_multi_inst_roles()
+    )
+
+
+def is_classic_pd_disagg() -> bool:
+    """Return True when all instances are split into prefill-only or decode-only roles."""
+    roles = _get_effective_multi_inst_roles()
+    return all(role in ("prefill", "decode") for role in roles)
+
+
 def get_global_args():
     _ensure_var_is_initialized(_GLOBAL_ARGS, "global args")
-    cfg: ServeConfig = OmegaConf.to_object(_GLOBAL_ARGS)
-
-    if isinstance(cfg, dict) and "models" in cfg and isinstance(cfg["models"], dict):
-        cfg["models"] = StaticConfig(cfg["models"])
-    elif hasattr(cfg, "models") and isinstance(cfg.models, dict):
-        cfg.models = StaticConfig(cfg.models)
-    if isinstance(cfg, dict):
-        return StaticConfig(cfg)
-    return cfg
+    return _GLOBAL_ARGS
 
 
-def set_global_args(args, need_ensure=True):
+def set_global_args(raw_args, need_ensure=True, need_preprocess=True):
+    global _RAW_GLOBAL_ARGS
     global _GLOBAL_ARGS
     if need_ensure == True:
+        _ensure_var_is_not_initialized(_RAW_GLOBAL_ARGS, "raw global args")
         _ensure_var_is_not_initialized(_GLOBAL_ARGS, "global args")
+    _RAW_GLOBAL_ARGS = raw_args
+    get_multi_inst_ids_by_role.cache_clear()
+    _get_effective_multi_inst_roles.cache_clear()
+
+    args = raw_args
+    if need_preprocess:
+        if (multi_inst := getattr(args, "multi_inst", None)) and getattr(
+            multi_inst, "inst_id", None
+        ) is not None:
+            args = _apply_multi_inst_override(args)
+        args = resolve_default_args(StaticConfig(args))
     _GLOBAL_ARGS = args
-    get_global_args.cache_clear()
 
 
 def get_timers():
@@ -403,7 +740,7 @@ class GlobalMemoryBuffer:
         self.buffer = {}
 
     def get_tensor(self, tensor_shape, dtype, name):
-        required_len = reduce(operator.mul, tensor_shape, 1)
+        required_len = functools.reduce(operator.mul, tensor_shape, 1)
         if (
             self.buffer.get((name, dtype), None) is None
             or self.buffer[(name, dtype)].numel() < required_len

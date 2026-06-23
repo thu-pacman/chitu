@@ -66,7 +66,9 @@ def test_silu_and_mul_and_a8_per_token_act_quant(
         pytest.skip("lmslim is missing")
 
     set_global_args(
-        OmegaConf.create({"infer": {"op_impl": "torch"}}), need_ensure=False
+        OmegaConf.create({"infer": {"op_impl": "torch"}}),
+        need_ensure=False,
+        need_preprocess=False,
     )
 
     x = torch.rand(M, N * 2, device="cuda", dtype=torch.bfloat16)

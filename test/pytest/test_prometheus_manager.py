@@ -84,6 +84,7 @@ def test_PrometheusServerManager():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
     log_interval = get_global_args().metrics.log_interval

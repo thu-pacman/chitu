@@ -49,10 +49,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.utils import (
     get_tp_splits,
 )
 from chitu.distributed.partition import compute_layer_dist_in_pp
-from chitu.distributed.pd_disaggregation.pd_log_utils import (
-    pd_trace_enabled,
-    pd_verbose_enabled,
-)
+from chitu.distributed.pd_disaggregation.pd_log_utils import pd_trace_enabled
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -456,11 +453,7 @@ class KVManager:
         self._trace_room_to_request_id: dict[UUID, str] = {}
 
         # Get PD disaggregation config
-        pd_config = (
-            args.multi_inst.router.pd_disaggregation
-            if hasattr(args.multi_inst.router, "pd_disaggregation")
-            else None
-        )
+        pd_config = args.multi_inst.pd_disaggregation
         # Auto-detect the active IB device(s) with the highest rate. This may be
         # a comma-separated list of multiple NICs, which MooncakeTransferEngine
         # accepts directly.
@@ -1953,10 +1946,9 @@ class KVManager:
 
                     # Store numeric status for polling and log the enum name.
                     self.request_status[bootstrap_room] = status_val
-                    if pd_verbose_enabled():
-                        logger.debug(
-                            f"received status update for room {bootstrap_room}: {status_enum} (raw={status_str})"
-                        )
+                    logger.debug(
+                        f"received status update for room {bootstrap_room}: {status_enum} (raw={status_str})"
+                    )
                     if status_val == int(KVPoll.Success.value):
                         req_id = self._trace_room_to_request_id.get(bootstrap_room)
                         if pd_trace_enabled():

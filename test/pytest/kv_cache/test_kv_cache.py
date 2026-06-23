@@ -34,6 +34,7 @@ def setup_global_args():
             }
         ),
         need_ensure=False,
+        need_preprocess=False,
     )
 
 
