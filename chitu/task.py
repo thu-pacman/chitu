@@ -1038,6 +1038,19 @@ class PackedTasks(PackedTasksBase):
             task.update_decode_status(accepted_tokens[i])
 
 
+class DPPackedTasks(PackedTasks):
+    """PackedTasks subclass for DP parallelism, carrying per-rank batch info."""
+
+    def set_dp_info(self, task_ids_list: list[list[str]]):
+        self.dp_task_ids = task_ids_list
+        self.dp_tasks = [[TaskPool.pool[tid] for tid in ids] for ids in task_ids_list]
+        self.dp_output_tasks = [
+            [task for task in tasks if task.has_output()] for tasks in self.dp_tasks
+        ]
+        self.dp_num_tasks = [len(tasks) for tasks in self.dp_tasks]
+        self.dp_num_output_tasks = [len(tasks) for tasks in self.dp_output_tasks]
+
+
 class TaskCollector:
     """
     Used to handle global tasks lists / queues
@@ -1141,7 +1154,7 @@ class DPTaskCollector:
     """
 
     _total_waiting_steps: int = -1
-    _total_packedtasks_queue: Deque[Optional[PackedTasks]] = deque()
+    _total_packedtasks_queue: Deque[Optional[DPPackedTasks]] = deque()
     _task_ids_list: Optional[list[list[str]]] = None
 
     @staticmethod
@@ -1170,10 +1183,11 @@ class DPTaskCollector:
         if not DPTaskCollector.available():
             return
         if any(len(task_ids) > 0 for task_ids in task_ids_list):
-            all_tasks = PackedTasks(
+            all_tasks = DPPackedTasks(
                 [task_id for task_ids in task_ids_list for task_id in task_ids],
                 metadata_only=True,
             )
+            all_tasks.set_dp_info(task_ids_list)
             assert (
                 all_tasks.return_logprobs is False
             ), "DP mode does not support return logprobs"

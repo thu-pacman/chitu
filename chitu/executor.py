@@ -9,7 +9,6 @@ from logging import getLogger
 import weakref
 from typing import Optional
 from abc import ABC, abstractmethod
-from io import BytesIO
 
 import numpy as np
 import torch
@@ -29,6 +28,7 @@ from chitu.task import (
     PackedTasks,
     PackedTasksBase,
     PackedTasksResult,
+    DPPackedTasks,
     SerializedPackedTasksPayloadType,
     BatchResult,
     TaskType,
@@ -718,6 +718,32 @@ class ExpertDataDispatcher(TasksDispatcher):
         except Exception:
             return True
 
+    def _create_empty_recv_results(self, tasks: DPPackedTasks) -> PackedTasksResult:
+        """Return a PackedTasksResult pre-allocated to total bs across all DP ranks.
+
+        Field presence mirrors PipeDispatcher.recv_results.  collect_results fills
+        per-rank slices directly so that no torch.cat is needed afterwards.
+        """
+        bs = len(tasks.output_tasks)
+        # mtp tokens only exist in Decode, see ``Sampler.sample()``
+        mtp_size = (
+            Backend.executor.mtp_size if tasks.task_type == TaskType.Decode else 1
+        )
+        vocab_size = Backend.model.vocab_size
+
+        def create(shape, dtype=torch.int64):
+            return torch.empty(shape, dtype=dtype, device="cpu")
+
+        result = PackedTasksResult(tokens=create((bs, mtp_size)))
+        if mtp_size > 1:
+            result.accept_indices = create((bs,))
+        if tasks.return_logprobs:
+            result.logprobs = create((bs, vocab_size), torch.float32)
+            result.token_idxs = create((bs, vocab_size))
+        if tasks._test_flag:
+            result.logits = create((bs, vocab_size), torch.float32)
+        return result
+
     def collect_results(
         self,
         results: PackedTasksResult,
@@ -727,38 +753,52 @@ class ExpertDataDispatcher(TasksDispatcher):
         """
         collect results through zmq.
         """
-        payload = dataclass_to_dict(results)
-        payload["pd_first_tokens"] = pd_first_tokens
-        payload["pd_cached_hit_tokens"] = pd_cached_hit_tokens
 
         if self.is_main_rank:
-            all_payload = [None for _ in range(self.group_size)]
+            dp_tasks = DPTaskCollector.get_last_packedtasks()
+            merged_results = self._create_empty_recv_results(dp_tasks)
+            merged = dataclass_to_dict(merged_results)
+            merged["pd_first_tokens"] = pd_first_tokens
+            merged["pd_cached_hit_tokens"] = pd_cached_hit_tokens
+
+            all_data = [None for _ in range(self.group_size)]
+            all_data[0] = dataclass_to_dict(results)
             for _ in range(1, self.group_size):
                 msgs = self.socket.recv_multipart()
-                rank_in_group = int(msgs[0].decode())  # zmq identity prepend by ROUTER
-                buffer = BytesIO(msgs[1])
-                all_payload[rank_in_group] = torch.load(buffer)
-            all_payload[0] = payload
+                rank_in_group = int(msgs[0].decode())
+                data = msgpack.loads(msgs[1])
+                for k, v in data.items():
+                    if isinstance(v, bytes):
+                        if len(v) == 0:
+                            data[k] = torch.empty(0, dtype=merged[k].dtype)
+                        else:
+                            data[k] = torch.frombuffer(v, dtype=merged[k].dtype)
+                all_data[rank_in_group] = data
 
-            for k in payload.keys():
-                if k == "pd_first_tokens":
-                    for p in all_payload:
-                        pd_first_tokens.update(p[k])
-                elif k == "pd_cached_hit_tokens":
-                    for p in all_payload:
-                        pd_cached_hit_tokens.update(p[k])
-                else:
-                    tensors = [p[k] for p in all_payload if p[k] is not None]
-                    payload[k] = torch.cat(tensors) if tensors else None
+            offset = 0
+            for data, bs in zip(all_data, dp_tasks.dp_num_output_tasks):
+                if bs == 0:
+                    continue
+                slicing = range(offset, offset + bs)
+                for k, v in merged.items():
+                    if isinstance(v, dict) and k in data:
+                        v.update(data[k])
+                    elif isinstance(v, torch.Tensor):
+                        v[slicing] = data[k].reshape(v[slicing].shape)
+                offset += bs
             return (
-                dataclass_from_dict(payload, PackedTasksResult),
-                pd_first_tokens,
-                pd_cached_hit_tokens,
+                merged_results,
+                merged["pd_first_tokens"],
+                merged["pd_cached_hit_tokens"],
             )
         else:
-            buffer = BytesIO()
-            torch.save(payload, buffer)
-            self.socket.send(buffer.getvalue())
+            data = dataclass_to_dict(results)
+            for k in list(data.keys()):
+                if isinstance(data[k], torch.Tensor):
+                    data[k] = data[k].numpy().tobytes()
+            data["pd_first_tokens"] = pd_first_tokens
+            data["pd_cached_hit_tokens"] = pd_cached_hit_tokens
+            self.socket.send(msgpack.dumps(data))
             return results, pd_first_tokens, pd_cached_hit_tokens
 
     def send_payload(self, payload: torch.Tensor, tasks=None):
