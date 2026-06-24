@@ -63,6 +63,7 @@ from chitu.ops.triton_ops.batched_routed_activation import (
 )
 from chitu.ops.triton_ops.attn import (
     append_to_paged_kv_cache_flashmla_dsv4,
+    build_dsv4_mtp_sliding_window_global_indices_triton,
     prefill_ragged_qkvo_triton,
     decode_paged_kv_triton,
     decode_dense_kv_triton,

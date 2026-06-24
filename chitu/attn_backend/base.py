@@ -233,6 +233,7 @@ class AttnBackend(abc.ABC):
         cache_slots: Optional[torch.Tensor] = None,
         cache_seq_ids: Optional[torch.Tensor] = None,
         window_size: Optional[int] = None,
+        physical_window_size: Optional[int] = None,
         compress_ratio: Optional[int] = None,
         seqlens: Optional[torch.Tensor] = None,
         compressed_lens: Optional[torch.Tensor] = None,
@@ -255,6 +256,7 @@ class AttnBackend(abc.ABC):
                 cache_slots=cache_slots,
                 cache_seq_ids=cache_seq_ids,
                 window_size=window_size,
+                physical_window_size=physical_window_size,
                 compressed_lens=compressed_lens,
                 pack_prefill_kv=pack_prefill_kv,
                 compress_ratio=compress_ratio,
@@ -290,6 +292,7 @@ class AttnBackend(abc.ABC):
             cache_slots=cache_slots,
             cache_seq_ids=cache_seq_ids,
             window_size=window_size,
+            physical_window_size=physical_window_size,
             compress_ratio=compress_ratio,
         )
 
@@ -311,6 +314,7 @@ class AttnBackend(abc.ABC):
         cache_slots: Optional[torch.Tensor] = None,
         cache_seq_ids: Optional[torch.Tensor] = None,
         window_size: Optional[int] = None,
+        physical_window_size: Optional[int] = None,
         compressed_lens: Optional[torch.Tensor] = None,
         pack_prefill_kv: Optional[Callable] = None,
         compress_ratio: Optional[int] = None,
@@ -349,6 +353,7 @@ class AttnBackend(abc.ABC):
                 cache_slots=cache_slots,
                 cache_seq_ids=cache_seq_ids,
                 window_size=window_size,
+                physical_window_size=physical_window_size,
                 compressed_cache=compressed_cache,
                 compressed_lens=compressed_lens,
                 pack_prefill_kv=pack_prefill_kv,
@@ -441,6 +446,7 @@ class AttnBackend(abc.ABC):
         cache_slots: torch.Tensor,
         cache_seq_ids: torch.Tensor,
         window_size: int,
+        physical_window_size: Optional[int] = None,
         compressed_cache: Optional[KVCacheAccessor] = None,
         compressed_lens: Optional[torch.Tensor] = None,
         pack_prefill_kv: Optional[Callable] = None,
@@ -459,6 +465,7 @@ class AttnBackend(abc.ABC):
                 cache_slots=cache_slots,
                 cache_seq_ids=cache_seq_ids,
                 window_size=window_size,
+                physical_window_size=physical_window_size,
                 compressed_cache=compressed_cache,
                 compressed_lens=compressed_lens,
                 pack_prefill_kv=pack_prefill_kv,
@@ -477,6 +484,7 @@ class AttnBackend(abc.ABC):
                 cache_slots=cache_slots,
                 cache_seq_ids=cache_seq_ids,
                 window_size=window_size,
+                physical_window_size=physical_window_size,
                 compressed_cache=compressed_cache,
                 compressed_lens=compressed_lens,
                 pack_prefill_kv=pack_prefill_kv,
@@ -500,6 +508,7 @@ class AttnBackend(abc.ABC):
         cache_slots: torch.Tensor,
         cache_seq_ids: torch.Tensor,
         window_size: int,
+        physical_window_size: Optional[int] = None,
         compressed_cache: Optional[KVCacheAccessor] = None,
         compressed_lens: Optional[torch.Tensor] = None,
         pack_prefill_kv: Optional[Callable] = None,
@@ -517,6 +526,7 @@ class AttnBackend(abc.ABC):
             cache_slots=cache_slots,
             cache_seq_ids=cache_seq_ids,
             window_size=window_size,
+            physical_window_size=physical_window_size,
             compressed_cache=compressed_cache,
             compressed_lens=compressed_lens,
             pack_prefill_kv=pack_prefill_kv,
@@ -537,6 +547,7 @@ class AttnBackend(abc.ABC):
         cache_slots: torch.Tensor,
         cache_seq_ids: torch.Tensor,
         window_size: int,
+        physical_window_size: Optional[int] = None,
         compressed_cache: Optional[KVCacheAccessor] = None,
         compressed_lens: Optional[torch.Tensor] = None,
         pack_prefill_kv: Optional[Callable] = None,
@@ -554,6 +565,7 @@ class AttnBackend(abc.ABC):
             cache_slots=cache_slots,
             cache_seq_ids=cache_seq_ids,
             window_size=window_size,
+            physical_window_size=physical_window_size,
             compressed_cache=compressed_cache,
             compressed_lens=compressed_lens,
             pack_prefill_kv=pack_prefill_kv,
@@ -574,6 +586,7 @@ class AttnBackend(abc.ABC):
         cache_slots: torch.Tensor,
         cache_seq_ids: torch.Tensor,
         window_size: int,
+        physical_window_size: Optional[int],
         compressed_cache: Optional[KVCacheAccessor],
         compressed_lens: Optional[torch.Tensor],
         pack_prefill_kv: Optional[Callable],
@@ -618,9 +631,16 @@ class AttnBackend(abc.ABC):
             - current_offsets[current_req_ids]
         )
 
+        logical_window_size = int(window_size)
+        physical_window_size = int(
+            physical_window_size
+            if physical_window_size is not None
+            else slidingwindow_cache.kv["sliding_window"].shape[1]
+        )
+
         history_lens = torch.minimum(
             start_positions,
-            torch.full_like(start_positions, int(window_size)),
+            torch.full_like(start_positions, logical_window_size),
         )
         history_offsets = self._dsv4_exclusive_offsets(history_lens)
         total_history = int(history_offsets[-1].item())
@@ -646,7 +666,7 @@ class AttnBackend(abc.ABC):
                 history_positions,
                 head_dim=kv.shape[-1],
                 dtype=kv.dtype,
-                window_size=window_size,
+                window_size=physical_window_size,
             )
         else:
             history_req_ids = req_range.new_empty(0)
@@ -655,7 +675,9 @@ class AttnBackend(abc.ABC):
 
         write_positions = start_positions[current_req_ids] + current_token_offsets
         write_keep_start = torch.clamp(
-            start_positions[current_req_ids] + seqlens[current_req_ids] - window_size,
+            start_positions[current_req_ids]
+            + seqlens[current_req_ids]
+            - logical_window_size,
             min=0,
         )
         write_mask = write_positions >= write_keep_start
@@ -665,7 +687,7 @@ class AttnBackend(abc.ABC):
             cache_seq_ids[current_req_ids][write_mask],
             write_positions[write_mask],
             kv[write_mask],
-            window_size=window_size,
+            window_size=physical_window_size,
         )
 
         if compressed_cache is None:
@@ -943,10 +965,34 @@ class AttnBackend(abc.ABC):
         cache_slots: Optional[torch.Tensor] = None,
         cache_seq_ids: Optional[torch.Tensor] = None,
         window_size: Optional[int] = None,
+        physical_window_size: Optional[int] = None,
         compress_ratio: Optional[int] = None,
     ) -> torch.Tensor:
         raise NotImplementedError(
             f"{type(self).__name__} does not implement DeepSeek-V4 MLA decode"
+        )
+
+    def csa_hca_decode_mtp(
+        self,
+        q: torch.Tensor,
+        slidingwindow_cache: KVCacheAccessor,
+        attn_sink: torch.Tensor,
+        slidingwindow_topk_idxs: Optional[torch.Tensor],
+        softmax_scale: float,
+        *,
+        current_kv: torch.Tensor,
+        compressed_cache: Optional[KVCacheAccessor] = None,
+        compressed_topk_idxs: Optional[torch.Tensor] = None,
+        start_positions: torch.Tensor,
+        cache_slots: Optional[torch.Tensor] = None,
+        cache_seq_ids: Optional[torch.Tensor] = None,
+        window_size: Optional[int] = None,
+        physical_window_size: Optional[int] = None,
+        prewrite_current: bool = False,
+        compress_ratio: Optional[int] = None,
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement DeepSeek-V4 MTP decode"
         )
 
     def prefill(

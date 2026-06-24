@@ -221,6 +221,7 @@ def _build_linear_cache(args, *, layer_filter_fn=lambda x: x):
         layer_id_map,
         num_hot_req=ceil_div(args.infer.max_batch_size, args.infer.dp_size),
         shape_per_token_dict=spec.kvargs["shape_per_token_dict"],
+        dtype_dict=spec.kvargs.get("dtype_dict"),
         device=device,
     )
 
@@ -233,6 +234,7 @@ def build_mtp_cache(args):
         layer_id_map,
         num_hot_req=ceil_div(args.infer.max_batch_size, args.infer.dp_size),
         shape_per_token_dict=spec.kvargs["shape_per_token_dict"],
+        dtype_dict=spec.kvargs.get("dtype_dict"),
         device=device,
     )
 

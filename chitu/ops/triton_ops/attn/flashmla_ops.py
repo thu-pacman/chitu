@@ -526,6 +526,107 @@ def convert_req_index_to_global_paged_index_triton(
 
 
 @triton.jit
+def _build_dsv4_mtp_sliding_window_global_indices_kernel(
+    cache_seq_ids_ptr,  # int32 [B]
+    block_table_ptr,  # int32 [num_requests, max_num_blocks_per_req]
+    start_positions_ptr,  # int64 [B]
+    out_ptr,  # int32 [B * Q, NUM_TOPK_TOKENS]
+    Q_LEN: tl.constexpr,
+    LOGICAL_WINDOW_SIZE: tl.constexpr,
+    PHYSICAL_WINDOW_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    BT_STRIDE0: tl.constexpr,
+    BT_STRIDE1: tl.constexpr,
+    OUT_STRIDE0: tl.constexpr,
+    OUT_STRIDE1: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile_id = tl.program_id(1)
+    cols = tile_id * BLOCK_N + tl.arange(0, BLOCK_N)
+    req_row = row // Q_LEN
+    q_offset = row - req_row * Q_LEN
+
+    seq_id = tl.load(cache_seq_ids_ptr + req_row).to(tl.int64)
+    start_pos = tl.load(start_positions_ptr + req_row).to(tl.int64)
+    query_pos = start_pos + q_offset
+    first_pos = tl.maximum(query_pos - LOGICAL_WINDOW_SIZE + 1, 0)
+    history_len = tl.minimum(query_pos + 1, LOGICAL_WINDOW_SIZE)
+
+    valid = cols < history_len
+    logical_pos = first_pos + cols
+    ring_pos = logical_pos % PHYSICAL_WINDOW_SIZE
+    block_id = ring_pos // BLOCK_SIZE
+    inblock_off = ring_pos - block_id * BLOCK_SIZE
+    block = tl.load(
+        block_table_ptr + seq_id * BT_STRIDE0 + block_id * BT_STRIDE1,
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    out_val = tl.where(valid, block * BLOCK_SIZE + inblock_off, -1)
+    tl.store(
+        out_ptr + row * OUT_STRIDE0 + cols * OUT_STRIDE1,
+        out_val.to(tl.int32),
+        mask=cols < NUM_TOPK_TOKENS,
+    )
+
+
+def build_dsv4_mtp_sliding_window_global_indices_triton(
+    cache_seq_ids: torch.Tensor,
+    block_table: torch.Tensor,
+    start_positions: torch.Tensor,
+    *,
+    q_len: int,
+    logical_window_size: int,
+    physical_window_size: int,
+    block_size: int,
+    BLOCK_N: int = 128,
+) -> torch.Tensor:
+    """
+    Build FlashMLA global paged-cache indices for DeepSeek-V4 MTP slidingwindow decode.
+
+    The output is [B, q_len, padded_window], int32. It directly materializes the
+    causal sliding-window rows that get_decode_mtp_window_topk_idxs_v4 would
+    produce, but skips the intermediate local-index tensor and the generic
+    local-to-global conversion.
+    """
+    assert cache_seq_ids.dtype == torch.int32
+    assert block_table.dtype == torch.int32
+    assert start_positions.dtype == torch.long
+    assert q_len > 0
+    bsz = cache_seq_ids.numel()
+    padded_topk = triton.cdiv(int(logical_window_size), BLOCK_N) * BLOCK_N
+    out = torch.empty(
+        bsz * int(q_len),
+        padded_topk,
+        device=start_positions.device,
+        dtype=torch.int32,
+    )
+    grid = (bsz * int(q_len), padded_topk // BLOCK_N)
+    cache_seq_ids_c = cache_seq_ids.contiguous()
+    block_table_c = block_table.contiguous()
+    start_positions_c = start_positions.contiguous()
+    _build_dsv4_mtp_sliding_window_global_indices_kernel[grid](
+        cache_seq_ids_c,
+        block_table_c,
+        start_positions_c,
+        out,
+        Q_LEN=int(q_len),
+        LOGICAL_WINDOW_SIZE=int(logical_window_size),
+        PHYSICAL_WINDOW_SIZE=int(physical_window_size),
+        BLOCK_SIZE=int(block_size),
+        BLOCK_N=BLOCK_N,
+        NUM_TOPK_TOKENS=padded_topk,
+        BT_STRIDE0=block_table_c.stride(0),
+        BT_STRIDE1=block_table_c.stride(1),
+        OUT_STRIDE0=out.stride(0),
+        OUT_STRIDE1=out.stride(1),
+    )
+    return out.view(bsz, int(q_len), padded_topk)
+
+
+@triton.jit
 def _convert_req_index_to_global_ragged_index_kernel(
     req_id_ptr,  # int32 [num_tokens]
     position_id_ptr,  # int32 [num_tokens]

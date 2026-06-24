@@ -1029,13 +1029,17 @@ class Backend:
 
         # Load transformer layers
         is_print_rank = int(os.environ.get("LOCAL_RANK", 0)) == 0
-        is_qwen3_5_mtp = (
-            args.models.type == ModelType.HF_QWEN3_5 and args.infer.mtp_size > 1
+        has_separate_mtp_layer = (
+            args.infer.mtp_size > 1
+            and args.models.type in {ModelType.HF_QWEN3_5, ModelType.DEEPSEEK_V4}
+            and model.local_begin_layer_id
+            <= args.models.n_layers
+            < model.local_end_layer_id
         )
         local_main_end_layer_id = (
-            model.local_end_layer_id
-            if not is_qwen3_5_mtp
-            else model.local_end_layer_id - 1
+            model.local_end_layer_id - 1
+            if has_separate_mtp_layer
+            else model.local_end_layer_id
         )
         for global_layer_id in tqdm(
             range(model.local_begin_layer_id, local_main_end_layer_id),
@@ -1056,7 +1060,7 @@ class Backend:
                 local_layer_prefix=local_layer_prefix,
             )
 
-        if is_qwen3_5_mtp:
+        if has_separate_mtp_layer:
             for global_layer_id in tqdm(
                 range(local_main_end_layer_id, model.local_end_layer_id),
                 disable=not is_print_rank,

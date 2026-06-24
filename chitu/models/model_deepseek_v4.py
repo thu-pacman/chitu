@@ -34,9 +34,11 @@ from chitu.ops import (
     add_shared_experts,
     apply_rotary_pos_emb_partial,
     apply_rotary_pos_emb_single_partial,
+    read_from_singleton_paged_kv_cache,
     silu_and_mul,
     moe_gate,
     moe_hash_gate,
+    update_singleton_paged_kv_cache,
 )
 from chitu.attn_backend.flash_mla_backend import (
     _append_deepseek_v4_flashmla_paged_cache as _append_flashmla_v4_paged_cache,
@@ -62,11 +64,15 @@ if _has_triton:
         compress_csa as _compress_csa_triton,
         writeback_pending as _writeback_pending_triton,
         pack_prefill_kv as _pack_prefill_kv_triton,
+        decode_mtp_hca as _decode_mtp_hca_triton,
+        decode_mtp_csa as _decode_mtp_csa_triton,
     )
 
     _TRITON_COMPRESS_AVAILABLE = True
 else:
     _pack_prefill_kv_triton = None
+    _decode_mtp_hca_triton = None
+    _decode_mtp_csa_triton = None
     _TRITON_COMPRESS_AVAILABLE = False
 
 if _TRITON_COMPRESS_AVAILABLE:
@@ -331,18 +337,22 @@ def apply_rotary_emb_v4(
 
 
 def get_decode_window_topk_idxs_v4(
-    window_size: int, start_positions: torch.Tensor
+    window_size: int,
+    start_positions: torch.Tensor,
+    physical_window_size: Optional[int] = None,
 ) -> torch.Tensor:
-    cols = torch.arange(window_size, device=start_positions.device)
-    write_pos = start_positions % window_size
-    ring = (write_pos.unsqueeze(1) + 1 + cols) % window_size
-    prefix = torch.where(
-        cols.unsqueeze(0) <= start_positions.unsqueeze(1),
-        cols.unsqueeze(0),
-        -1,
+    physical_window_size = int(physical_window_size or window_size)
+    cols = torch.arange(window_size, device=start_positions.device, dtype=torch.long)
+    history_lens = torch.minimum(
+        start_positions + 1,
+        torch.full_like(start_positions, window_size),
     )
+    first_positions = torch.clamp(start_positions - window_size + 1, min=0)
+    positions = first_positions.unsqueeze(1) + cols.unsqueeze(0)
     matrix = torch.where(
-        (start_positions >= window_size - 1).unsqueeze(1), ring, prefix
+        cols.unsqueeze(0) < history_lens.unsqueeze(1),
+        positions % physical_window_size,
+        -1,
     )
     return matrix.unsqueeze(1)
 
@@ -361,6 +371,69 @@ def get_decode_compress_topk_idxs_v4(
         -1,
     )
     return matrix.unsqueeze(1)
+
+
+def get_decode_mtp_window_topk_idxs_v4(
+    window_size: int,
+    start_positions: torch.Tensor,
+    q_len: int,
+    physical_window_size: Optional[int] = None,
+    include_current: bool = False,
+) -> torch.Tensor:
+    physical_window_size = int(physical_window_size or window_size)
+    query_offsets = torch.arange(q_len, device=start_positions.device, dtype=torch.long)
+    query_positions = start_positions.unsqueeze(1) + query_offsets.unsqueeze(0)
+    history_first = torch.clamp(query_positions - window_size + 1, min=0)
+    if include_current:
+        history_last = query_positions
+    else:
+        history_last = start_positions.unsqueeze(1) - 1
+    history_lens = torch.clamp(history_last - history_first + 1, min=0)
+    max_history_len = (
+        window_size
+        if include_current
+        else (int(history_lens.max().item()) if history_lens.numel() else 0)
+    )
+    if max_history_len == 0:
+        return start_positions.new_empty((start_positions.numel(), q_len, 0))
+
+    cols = torch.arange(
+        max_history_len, device=start_positions.device, dtype=torch.long
+    )
+    history_positions = history_first.unsqueeze(-1) + cols.view(1, 1, -1)
+    valid = cols.view(1, 1, -1) < history_lens.unsqueeze(-1)
+    return torch.where(
+        valid,
+        history_positions % physical_window_size,
+        torch.full_like(history_positions, -1),
+    ).int()
+
+
+def get_decode_mtp_compress_topk_idxs_v4(
+    ratio: int,
+    start_positions: torch.Tensor,
+    q_len: int,
+    *,
+    max_len: Optional[int] = None,
+) -> torch.Tensor:
+    query_offsets = torch.arange(q_len, device=start_positions.device, dtype=torch.long)
+    visible_lens = (
+        start_positions.unsqueeze(1) + query_offsets.unsqueeze(0) + 1
+    ) // ratio
+    if max_len is None:
+        max_len = int(visible_lens.max().item()) if visible_lens.numel() else 0
+    else:
+        max_len = max(0, int(max_len))
+    if max_len == 0:
+        return start_positions.new_empty((start_positions.numel(), q_len, 0))
+    cols = torch.arange(max_len, device=start_positions.device, dtype=torch.long).view(
+        1, 1, -1
+    )
+    return torch.where(
+        cols < visible_lens.unsqueeze(-1),
+        cols,
+        torch.full_like(cols, -1),
+    ).int()
 
 
 def get_chunked_prefill_topk_idxs_v4(
@@ -528,6 +601,9 @@ class CompressorDeepSeekV4(nn.Module):
         start_positions: torch.Tensor,
         cache_slots: torch.Tensor,
         cache_seq_ids: torch.Tensor,
+        *,
+        seqlens_list: Optional[list[int]] = None,
+        start_positions_list: Optional[list[int]] = None,
     ) -> None:
         """Prefill compressor with shared ragged flow for torch/Triton backends."""
         seqlens = seqlens.to(device=x.device, dtype=torch.long)
@@ -536,7 +612,15 @@ class CompressorDeepSeekV4(nn.Module):
         cache_seq_ids = cache_seq_ids.to(device=x.device, dtype=torch.long)
         n = int(seqlens.numel())
 
-        total_tokens = int(seqlens.sum().item()) if n else 0
+        if seqlens_list is None:
+            total_tokens = int(seqlens.sum().item()) if n else 0
+        else:
+            seqlens_list = [int(v) for v in seqlens_list]
+            if len(seqlens_list) != n:
+                raise ValueError(
+                    f"seqlens_list length {len(seqlens_list)} != tensor length {n}"
+                )
+            total_tokens = sum(seqlens_list)
         assert x.size(0) == total_tokens
 
         # Single Linear over all tokens from all requests.
@@ -552,6 +636,8 @@ class CompressorDeepSeekV4(nn.Module):
             cache_seq_ids,
             kv_cat,
             score_cat,
+            seqlens_list=seqlens_list,
+            start_positions_list=start_positions_list,
         )
 
     def _forward_prefill_backend(
@@ -563,6 +649,9 @@ class CompressorDeepSeekV4(nn.Module):
         cache_seq_ids: torch.Tensor,
         kv_cat: torch.Tensor,  # [total_new_tokens, coff*head_dim]  already computed
         score_cat: torch.Tensor,
+        *,
+        seqlens_list: Optional[list[int]] = None,
+        start_positions_list: Optional[list[int]] = None,
     ) -> None:
         """Backend-compressed path for both HCA (overlap=False) and CSA."""
         seqlens = seqlens.to(device=x.device, dtype=torch.long)
@@ -580,8 +669,23 @@ class CompressorDeepSeekV4(nn.Module):
         # pending tokens live at [ratio:ratio+pending_len]
         pending_offset = ratio if overlap else 0
 
-        seqlens_list = [int(v) for v in seqlens.tolist()]
-        start_positions_list = [int(v) for v in start_positions.tolist()]
+        if seqlens_list is None:
+            seqlens_list = [int(v) for v in seqlens.tolist()]
+        else:
+            seqlens_list = [int(v) for v in seqlens_list]
+            if len(seqlens_list) != n:
+                raise ValueError(
+                    f"seqlens_list length {len(seqlens_list)} != tensor length {n}"
+                )
+        if start_positions_list is None:
+            start_positions_list = [int(v) for v in start_positions.tolist()]
+        else:
+            start_positions_list = [int(v) for v in start_positions_list]
+            if len(start_positions_list) != n:
+                raise ValueError(
+                    "start_positions_list length "
+                    f"{len(start_positions_list)} != tensor length {n}"
+                )
         meta = build_compress_metadata(
             start_positions_list, seqlens_list, ratio, device
         )
@@ -608,6 +712,7 @@ class CompressorDeepSeekV4(nn.Module):
             cache_slots_t,
             ratio,
             pending_offset=pending_offset,
+            max_eff=total_eff,
         )
 
         # ---- backend op 2: compress ----
@@ -708,6 +813,173 @@ class CompressorDeepSeekV4(nn.Module):
             positions,
             out_kv_typed,
             cache_seq_ids[group_to_req],
+        )
+
+    def forward_decode_mtp(
+        self,
+        x: torch.Tensor,
+        start_positions: torch.Tensor,
+        cache_slots: torch.Tensor,
+        cache_seq_ids: torch.Tensor,
+        *,
+        q_len: int,
+        start_positions_list: Optional[list[int]] = None,
+        cache_slots_i32: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Append a uniform MTP decode chunk without the generic prefill pack path."""
+        assert self.kv_cache is not None
+        assert self.freqs_cis is not None
+        device = x.device
+        dtype = x.dtype
+        ratio = self.compress_ratio
+        head_dim = self.head_dim
+        rope_dim = self.rope_head_dim
+        bsz = int(start_positions.numel())
+        if bsz == 0:
+            return
+        q_len = int(q_len)
+        if x.dim() == 3:
+            if x.size(0) != bsz or x.size(1) != q_len:
+                raise ValueError(
+                    "forward_decode_mtp expected x shape "
+                    f"[{bsz}, {q_len}, dim], got {tuple(x.shape)}"
+                )
+            x_flat = x.reshape(bsz * q_len, x.size(-1))
+        else:
+            if x.size(0) != bsz * q_len:
+                raise ValueError(
+                    "forward_decode_mtp expected flat x first dim "
+                    f"{bsz * q_len}, got {x.size(0)}"
+                )
+            x_flat = x
+
+        if start_positions.device != device or start_positions.dtype != torch.long:
+            start_positions = start_positions.to(device=device, dtype=torch.long)
+        if cache_slots.device != device or cache_slots.dtype != torch.long:
+            cache_slots = cache_slots.to(device=device, dtype=torch.long)
+        if cache_seq_ids.device != device or cache_seq_ids.dtype != torch.long:
+            cache_seq_ids = cache_seq_ids.to(device=device, dtype=torch.long)
+
+        x_float = x_flat.float()
+        kv_cat = self.wkv(x_float)
+        score_cat = self.wgate(x_float)
+
+        # The fast path relies on CPU-side decode metadata that the caller
+        # already owns. Without it, use the shared fallback instead of adding a
+        # hidden tensor-to-Python sync here.
+        if (
+            start_positions_list is None
+            or q_len > ratio
+            or not _TRITON_COMPRESS_AVAILABLE
+        ):
+            seqlens = torch.full((bsz,), q_len, device=device, dtype=torch.long)
+            return self._forward_prefill_backend(
+                x_flat,
+                seqlens,
+                start_positions,
+                cache_slots,
+                cache_seq_ids,
+                kv_cat,
+                score_cat,
+                seqlens_list=[q_len] * bsz,
+                start_positions_list=start_positions_list,
+            )
+
+        start_positions_list = [int(v) for v in start_positions_list]
+        if len(start_positions_list) != bsz:
+            raise ValueError(
+                "start_positions_list length "
+                f"{len(start_positions_list)} != batch size {bsz}"
+            )
+
+        compressed_reqs = [
+            i
+            for i, sp in enumerate(start_positions_list)
+            if sp % ratio + q_len >= ratio
+        ]
+        compressed_idx = (
+            torch.tensor(compressed_reqs, device=device, dtype=torch.long)
+            if compressed_reqs
+            else None
+        )
+        if cache_slots_i32 is None:
+            cache_slots_i32 = cache_slots.to(device=device, dtype=torch.int32)
+
+        if self.overlap:
+            out_kv = torch.empty(bsz, head_dim, device=device, dtype=torch.float32)
+            _decode_mtp_csa_triton(
+                kv_cat,
+                score_cat,
+                self.kv_state,
+                self.score_state,
+                self.ape,
+                out_kv,
+                start_positions,
+                cache_slots_i32,
+                ratio,
+                q_len,
+                head_dim,
+            )
+        else:
+            if compressed_idx is not None:
+                out_kv = torch.empty(
+                    len(compressed_reqs), head_dim, device=device, dtype=torch.float32
+                )
+            else:
+                out_kv = None
+            _decode_mtp_hca_triton(
+                kv_cat,
+                score_cat,
+                self.kv_state,
+                self.score_state,
+                self.ape,
+                out_kv,
+                compressed_idx,
+                start_positions,
+                cache_slots_i32,
+                ratio,
+                q_len,
+            )
+
+        if compressed_idx is None:
+            return
+
+        if self.overlap:
+            out_kv = out_kv.index_select(0, compressed_idx)
+        assert out_kv is not None
+        out_kv_typed = self.norm(out_kv.to(dtype), compute_dtype=out_kv.dtype)
+
+        group_abs_positions = torch.tensor(
+            [
+                start_positions_list[i] - start_positions_list[i] % ratio
+                for i in compressed_reqs
+            ],
+            device=device,
+            dtype=torch.long,
+        )
+        out_kv_b = out_kv_typed.unsqueeze(0)
+        apply_rotary_emb_v4(
+            out_kv_b,
+            self.freqs_cis[group_abs_positions],
+            rope_dim=rope_dim,
+        )
+        out_kv_typed = out_kv_b.squeeze(0)
+
+        if self.rotate:
+            out_kv_typed = hadamard_transform(
+                out_kv_typed, scale=out_kv_typed.size(-1) ** -0.5
+            )
+
+        positions = torch.tensor(
+            [start_positions_list[i] // ratio for i in compressed_reqs],
+            device=device,
+            dtype=torch.long,
+        )
+        self._write_kv_cache_flat(
+            cache_slots.index_select(0, compressed_idx),
+            positions,
+            out_kv_typed,
+            cache_seq_ids.index_select(0, compressed_idx),
         )
 
     def _decode_forward(
@@ -922,11 +1194,15 @@ class IndexerDeepSeekV4(nn.Module):
         cache_seq_ids: torch.Tensor,
         *,
         start_position: int = 0,
+        max_len: Optional[int] = None,
     ) -> torch.Tensor:
         assert self.kv_cache.numel() > 0
         bsz = cache_slots.numel()
         block_lengths = (lengths - start_position).clamp(min=0)
-        max_len = int(block_lengths.max().item()) if block_lengths.numel() else 0
+        if max_len is None:
+            max_len = int(block_lengths.max().item()) if block_lengths.numel() else 0
+        else:
+            max_len = max(0, int(max_len))
         if max_len == 0:
             return self.kv_cache.new_empty((bsz, 0, self.head_dim))
 
@@ -1053,6 +1329,104 @@ class IndexerDeepSeekV4(nn.Module):
         topk_idxs = best_indices.unsqueeze(1)
         topk_idxs = torch.where(
             topk_idxs < visible_lengths.view(bsz, 1, 1),
+            topk_idxs,
+            -1,
+        )
+        return topk_idxs
+
+    def forward_decode_mtp(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        start_positions: torch.Tensor,
+        cache_slots: torch.Tensor,
+        *,
+        cache_seq_ids: torch.Tensor,
+        start_positions_list: Optional[list[int]] = None,
+        query_offsets: Optional[torch.Tensor] = None,
+        cache_slots_i32: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        bsz, q_len, _ = x.size()
+        assert self.freqs_cis is not None
+        ratio, rope_dim = self.compress_ratio, self.rope_head_dim
+        device = x.device
+        if start_positions.device != device or start_positions.dtype != torch.long:
+            start_positions = start_positions.to(device=device, dtype=torch.long)
+        if cache_slots.device != device or cache_slots.dtype != torch.long:
+            cache_slots = cache_slots.to(device=device, dtype=torch.long)
+        if cache_seq_ids.device != device or cache_seq_ids.dtype != torch.long:
+            cache_seq_ids = cache_seq_ids.to(device=device, dtype=torch.long)
+
+        if query_offsets is None:
+            query_offsets = torch.arange(q_len, device=device, dtype=torch.long)
+        query_positions = start_positions.unsqueeze(1) + query_offsets.unsqueeze(0)
+        visible_lengths = (query_positions + 1) // ratio
+        max_visible_lengths = visible_lengths[:, -1]
+
+        assert self.compressor.kv_cache is not None
+        self.compressor.freqs_cis = self.freqs_cis
+        q = self.wq_b(qr.reshape(bsz * q_len, qr.size(-1))).unflatten(
+            -1, (self.n_local_heads, self.head_dim)
+        )
+        q = q.view(bsz, q_len, self.n_local_heads, self.head_dim)
+        apply_rotary_emb_v4(
+            q,
+            self.freqs_cis[query_positions.reshape(-1)],
+            rope_dim=rope_dim,
+        )
+        q = hadamard_transform(q, scale=q.size(-1) ** -0.5)
+
+        if start_positions_list is not None:
+            start_positions_list = [int(v) for v in start_positions_list]
+            if len(start_positions_list) != bsz:
+                raise ValueError(
+                    "start_positions_list length "
+                    f"{len(start_positions_list)} != batch size {bsz}"
+                )
+            max_index_kv_len = max(
+                0,
+                max((start_pos + q_len) // ratio for start_pos in start_positions_list),
+            )
+        else:
+            max_index_kv_len = None
+
+        self.compressor.forward_decode_mtp(
+            x,
+            start_positions,
+            cache_slots,
+            cache_seq_ids,
+            q_len=q_len,
+            start_positions_list=start_positions_list,
+            cache_slots_i32=cache_slots_i32,
+        )
+
+        index_kv = self._read_kv_cache_ranges(
+            cache_slots,
+            max_visible_lengths,
+            cache_seq_ids,
+            max_len=max_index_kv_len,
+        )
+        max_len = index_kv.size(1)
+        if max_len == 0:
+            return torch.empty(bsz, q_len, 0, dtype=torch.long, device=device)
+
+        topk = min(self.index_topk, max_len)
+        weights = self.weights_proj(x.reshape(bsz * q_len, x.size(-1))).view(
+            bsz, q_len, -1
+        ) * (self.softmax_scale * self.n_heads**-0.5)
+        index_score = torch.einsum("bshd,btd->bsht", q, index_kv)
+        index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        if get_tp_size() > 1:
+            _all_reduce_tp(index_score)
+
+        cols = torch.arange(index_kv.size(1), device=device, dtype=torch.long)
+        index_score = index_score.masked_fill(
+            cols.view(1, 1, -1) >= visible_lengths.unsqueeze(-1),
+            float("-inf"),
+        )
+        topk_idxs = index_score.topk(topk, dim=-1)[1]
+        topk_idxs = torch.where(
+            topk_idxs < visible_lengths.unsqueeze(-1),
             topk_idxs,
             -1,
         )
@@ -1245,8 +1619,8 @@ class AttentionDeepSeekV4(Attention):
             if self.indexer is not None:
                 self.indexer.reset_runtime_buffers(device)
 
-    def _bind_runtime_kv_cache(self):
-        main_accessor = self.cache.get_accessor(self.layer_id)
+    def _bind_runtime_kv_cache(self, is_mtp: bool = False):
+        main_accessor = self.cache.get_accessor(self.layer_id, is_mtp)
         self.slidingwindow_cache_accessor = main_accessor
         self.kv_cache_is_paged = isinstance(main_accessor, PagedKVCacheAccessor)
         self.kv_block_table = (
@@ -1258,7 +1632,7 @@ class AttentionDeepSeekV4(Attention):
             return
         if self.compressed_cache is None:
             raise RuntimeError("DeepSeek-V4 requires compressed KV cache")
-        compressed_accessor = self.compressed_cache.get_accessor(self.layer_id)
+        compressed_accessor = self.compressed_cache.get_accessor(self.layer_id, is_mtp)
         self.compressed_cache_accessor = compressed_accessor
         compressed_is_paged = isinstance(compressed_accessor, PagedKVCacheAccessor)
         self.compressor.bind_kv_cache(
@@ -1320,10 +1694,11 @@ class AttentionDeepSeekV4(Attention):
         self,
         x: torch.Tensor,
         freqs_cis: BatchedFreqsCis,
+        is_mtp: bool = False,
     ):
-        seq_len_delta = self.cache.seq_len_delta
+        seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
         if self._uses_skew_kv_cache() or self._uses_paged_kv_cache():
-            self._bind_runtime_kv_cache()
+            self._bind_runtime_kv_cache(is_mtp)
         if self._uses_skew_kv_cache():
             cache_slots = list(range(seq_len_delta.batch_size))
         else:
@@ -1334,6 +1709,7 @@ class AttentionDeepSeekV4(Attention):
         outputs: list[Optional[torch.Tensor]] = [None] * seq_len_delta.batch_size
         decode_indices = []
         decode_begins = []
+        decode_seqlens = []
         decode_start_positions = []
         decode_cache_slots = []
         prefill_indices = []
@@ -1351,15 +1727,17 @@ class AttentionDeepSeekV4(Attention):
                 continue
             start_pos = int(old_lens[i])
             cache_slot = int(cache_slots[i])
-            if seq_len_delta.is_decode_stage and end - begin == 1 and start_pos > 0:
+            seqlen = end - begin
+            if seq_len_delta.is_decode_stage and start_pos > 0:
                 decode_indices.append(i)
                 decode_begins.append(begin)
+                decode_seqlens.append(seqlen)
                 decode_start_positions.append(start_pos)
                 decode_cache_slots.append(cache_slot)
                 continue
             prefill_indices.append(i)
             prefill_begins.append(begin)
-            prefill_seqlens.append(end - begin)
+            prefill_seqlens.append(seqlen)
             prefill_start_positions.append(start_pos)
             prefill_cache_slots.append(cache_slot)
             prefill_cache_seq_ids.append(i)
@@ -1420,8 +1798,43 @@ class AttentionDeepSeekV4(Attention):
                 outputs[batch_idx] = prefill_outputs[out_idx]
         if decode_indices:
             decode_device = x.device
-            decode_output = self._forward_decode(
-                x[torch.tensor(decode_begins, device=decode_device)],
+            decode_seqlens_t = torch.tensor(
+                decode_seqlens, device=decode_device, dtype=torch.long
+            )
+            total_decode = sum(decode_seqlens)
+            expected_begin = decode_begins[0]
+            decode_is_contiguous = True
+            for begin, seqlen in zip(decode_begins, decode_seqlens):
+                if begin != expected_begin:
+                    decode_is_contiguous = False
+                    break
+                expected_begin += seqlen
+            if decode_is_contiguous:
+                decode_x = x[decode_begins[0] : decode_begins[0] + total_decode]
+            else:
+                decode_offsets = torch.empty(
+                    len(decode_seqlens) + 1, device=decode_device, dtype=torch.long
+                )
+                decode_offsets[0] = 0
+                decode_offsets[1:] = torch.cumsum(decode_seqlens_t, dim=0)
+                decode_req_ids = torch.repeat_interleave(
+                    torch.arange(
+                        len(decode_seqlens), device=decode_device, dtype=torch.long
+                    ),
+                    decode_seqlens_t,
+                    output_size=total_decode,
+                )
+                decode_token_offsets = (
+                    torch.arange(total_decode, device=decode_device, dtype=torch.long)
+                    - decode_offsets[decode_req_ids]
+                )
+                decode_begins_t = torch.tensor(
+                    decode_begins, device=decode_device, dtype=torch.long
+                )
+                decode_x = x[decode_begins_t[decode_req_ids] + decode_token_offsets]
+            decode_outputs = self._forward_decode(
+                decode_x,
+                decode_seqlens_t,
                 torch.tensor(
                     decode_start_positions, device=decode_device, dtype=torch.long
                 ),
@@ -1430,9 +1843,11 @@ class AttentionDeepSeekV4(Attention):
                 ),
                 torch.tensor(decode_indices, device=decode_device, dtype=torch.long),
                 wo_a,
+                seqlens_list=decode_seqlens,
+                start_positions_list=decode_start_positions,
             )
-            for row, output_index in enumerate(decode_indices):
-                outputs[output_index] = decode_output[row : row + 1]
+            for out_idx, output_index in enumerate(decode_indices):
+                outputs[output_index] = decode_outputs[out_idx]
         ordered_outputs = [output for output in outputs if output is not None]
         if not ordered_outputs:
             return x.new_empty((0, self.dim))
@@ -1441,11 +1856,68 @@ class AttentionDeepSeekV4(Attention):
     def _forward_decode(
         self,
         x: torch.Tensor,
+        seqlens: torch.Tensor,
         start_positions: torch.Tensor,
         cache_slots: torch.Tensor,
         cache_seq_ids: torch.Tensor,
         wo_a: torch.Tensor,
-    ):
+        *,
+        seqlens_list: Optional[list[int]] = None,
+        start_positions_list: Optional[list[int]] = None,
+    ) -> list[torch.Tensor]:
+        device = x.device
+        if seqlens.device != device or seqlens.dtype != torch.long:
+            seqlens = seqlens.to(device=device, dtype=torch.long)
+        if start_positions.device != device or start_positions.dtype != torch.long:
+            start_positions = start_positions.to(device=device, dtype=torch.long)
+        if cache_slots.device != device or cache_slots.dtype != torch.long:
+            cache_slots = cache_slots.to(device=device, dtype=torch.long)
+        if cache_seq_ids.device != device or cache_seq_ids.dtype != torch.long:
+            cache_seq_ids = cache_seq_ids.to(device=device, dtype=torch.long)
+        n = int(seqlens.numel())
+        if n == 0:
+            return []
+        if seqlens_list is None:
+            total_q = int(seqlens.sum().item())
+            seqlens_list = [int(v) for v in seqlens.tolist()]
+        else:
+            seqlens_list = [int(v) for v in seqlens_list]
+            if len(seqlens_list) != n:
+                raise ValueError(
+                    f"seqlens_list length {len(seqlens_list)} != tensor length {n}"
+                )
+            total_q = sum(seqlens_list)
+        assert x.size(0) == total_q
+
+        if all(seqlen == 1 for seqlen in seqlens_list):
+            out = self._forward_decode_single(
+                x,
+                start_positions,
+                cache_slots,
+                cache_seq_ids,
+                wo_a,
+            )
+            return list(out.split(seqlens_list, dim=0))
+
+        return self._forward_decode_multi(
+            x,
+            seqlens,
+            start_positions,
+            cache_slots,
+            cache_seq_ids,
+            wo_a,
+            seqlens_list=seqlens_list,
+            start_positions_list=start_positions_list,
+        )
+
+    def _forward_decode_single(
+        self,
+        x: torch.Tensor,
+        start_positions: torch.Tensor,
+        cache_slots: torch.Tensor,
+        cache_seq_ids: torch.Tensor,
+        wo_a: torch.Tensor,
+    ) -> torch.Tensor:
         x = x.unsqueeze(1)
         bsz, seqlen, _ = x.size()
         assert seqlen == 1
@@ -1464,7 +1936,11 @@ class AttentionDeepSeekV4(Attention):
 
         kv = self.kv_norm(self.wkv(x))
         apply_rotary_emb_v4(q, freqs_cis, rope_dim=rope_dim, k=kv)
-        slidingwindow_topk_idxs = get_decode_window_topk_idxs_v4(win, start_positions)
+        assert self.slidingwindow_cache_accessor is not None
+        physical_win = self.slidingwindow_cache_accessor.kv["sliding_window"].shape[1]
+        slidingwindow_topk_idxs = get_decode_window_topk_idxs_v4(
+            win, start_positions, physical_window_size=physical_win
+        )
         compressed_topk_idxs = None
         if ratio:
             if self.indexer is not None:
@@ -1487,7 +1963,6 @@ class AttentionDeepSeekV4(Attention):
             self.compressor(
                 x, start_positions, cache_slots, cache_seq_ids=cache_seq_ids
             )
-        assert self.slidingwindow_cache_accessor is not None
         if ratio:
             assert self.compressed_cache_accessor is not None
         o = self.attn_backend.csa_hca(
@@ -1499,18 +1974,178 @@ class AttentionDeepSeekV4(Attention):
             current_kv=kv.squeeze(1),
             compressed_cache=self.compressed_cache_accessor if ratio else None,
             compressed_topk_idxs=compressed_topk_idxs,
-            split_offset=win,
+            split_offset=physical_win,
             start_positions=start_positions,
             cache_slots=cache_slots,
             cache_seq_ids=cache_seq_ids,
             window_size=win,
+            physical_window_size=physical_win,
             compress_ratio=ratio if ratio else None,
         )
         apply_rotary_emb_v4(o, freqs_cis, rope_dim=rope_dim, inverse=True)
 
         o = o.view(bsz, seqlen, self.n_local_groups, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a.to(o.dtype))
+        wo_a_typed = wo_a if wo_a.dtype == o.dtype else wo_a.to(o.dtype)
+        o = torch.einsum("bsgd,grd->bsgr", o, wo_a_typed)
         return self.wo_b(o.flatten(2)).squeeze(1)
+
+    def _forward_decode_multi(
+        self,
+        x: torch.Tensor,
+        seqlens: torch.Tensor,
+        start_positions: torch.Tensor,
+        cache_slots: torch.Tensor,
+        cache_seq_ids: torch.Tensor,
+        wo_a: torch.Tensor,
+        *,
+        seqlens_list: Optional[list[int]] = None,
+        start_positions_list: Optional[list[int]] = None,
+    ) -> list[torch.Tensor]:
+        device = x.device
+        seqlens = seqlens.to(device=device, dtype=torch.long)
+        start_positions = start_positions.to(device=device, dtype=torch.long)
+        cache_slots = cache_slots.to(device=device, dtype=torch.long)
+        cache_seq_ids = cache_seq_ids.to(device=device, dtype=torch.long)
+        n = int(seqlens.numel())
+        if seqlens_list is None:
+            seqlens_list = [int(v) for v in seqlens.tolist()]
+        else:
+            seqlens_list = [int(v) for v in seqlens_list]
+            if len(seqlens_list) != n:
+                raise ValueError(
+                    f"seqlens_list length {len(seqlens_list)} != tensor length {n}"
+                )
+        if start_positions_list is not None:
+            start_positions_list = [int(v) for v in start_positions_list]
+            if len(start_positions_list) != n:
+                raise ValueError(
+                    "start_positions_list length "
+                    f"{len(start_positions_list)} != tensor length {n}"
+                )
+        if not seqlens_list:
+            return []
+        q_len = seqlens_list[0]
+        if any(seqlen != q_len for seqlen in seqlens_list):
+            return self._forward_prefill(
+                x,
+                seqlens,
+                start_positions,
+                cache_slots,
+                cache_seq_ids,
+                wo_a,
+            )
+
+        bsz = len(seqlens_list)
+        total_q = bsz * q_len
+        assert x.size(0) == total_q
+        win, ratio, rope_dim = self.window_size, self.compress_ratio, self.rope_head_dim
+        cache_slots_i32 = None
+        if ratio:
+            assert self.compressor.kv_cache is not None
+            self.compressor.freqs_cis = self.freqs_cis
+            cache_slots_i32 = cache_slots.to(device=device, dtype=torch.int32)
+            if getattr(self, "indexer", None) is not None:
+                assert self.indexer.kv_cache.numel() > 0
+                self.indexer.freqs_cis = self.freqs_cis
+
+        query_offsets = torch.arange(q_len, device=device, dtype=torch.long)
+        freq_positions = start_positions.unsqueeze(1) + query_offsets.unsqueeze(0)
+        freqs_cis = self.freqs_cis[freq_positions.reshape(-1)]
+
+        qr = self.q_norm(self.wq_a(x))
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+        kv = self.kv_norm(self.wkv(x))
+        q = q.view(bsz, q_len, self.n_local_heads, self.head_dim)
+        kv = kv.view(bsz, q_len, self.head_dim)
+        apply_rotary_emb_v4(q, freqs_cis, rope_dim=rope_dim, k=kv)
+
+        if ratio:
+            self.compressor.forward_decode_mtp(
+                x,
+                start_positions,
+                cache_slots,
+                cache_seq_ids,
+                q_len=q_len,
+                start_positions_list=start_positions_list,
+                cache_slots_i32=cache_slots_i32,
+            )
+
+        compressed_topk_idxs = None
+        indexer = getattr(self, "indexer", None)
+        if ratio:
+            if indexer is not None:
+                x_batched = x.view(bsz, q_len, x.size(-1))
+                qr_batched = qr.view(bsz, q_len, qr.size(-1))
+                compressed_topk_idxs = indexer.forward_decode_mtp(
+                    x_batched,
+                    qr_batched,
+                    start_positions,
+                    cache_slots,
+                    cache_seq_ids=cache_seq_ids,
+                    start_positions_list=start_positions_list,
+                    query_offsets=query_offsets,
+                    cache_slots_i32=cache_slots_i32,
+                )
+            else:
+                compressed_topk_idxs = get_decode_mtp_compress_topk_idxs_v4(
+                    ratio,
+                    start_positions,
+                    q_len,
+                    max_len=(
+                        max((sp + q_len) // ratio for sp in start_positions_list)
+                        if start_positions_list is not None
+                        else None
+                    ),
+                )
+
+        assert self.slidingwindow_cache_accessor is not None
+        physical_win = self.slidingwindow_cache_accessor.kv["sliding_window"].shape[1]
+        prewrite_current = physical_win >= win + q_len
+        use_fused_sliding_indices = prewrite_current and getattr(
+            self.attn_backend,
+            "supports_dsv4_mtp_slidingwindow_index_fusion",
+            False,
+        )
+        slidingwindow_topk_idxs = (
+            None
+            if use_fused_sliding_indices
+            else get_decode_mtp_window_topk_idxs_v4(
+                win,
+                start_positions,
+                q_len,
+                physical_window_size=physical_win,
+                include_current=prewrite_current,
+            )
+        )
+        if ratio:
+            assert self.compressed_cache_accessor is not None
+        outputs = self.attn_backend.csa_hca_decode_mtp(
+            q,
+            self.slidingwindow_cache_accessor,
+            self.attn_sink,
+            slidingwindow_topk_idxs,
+            self.softmax_scale,
+            current_kv=kv,
+            compressed_cache=self.compressed_cache_accessor if ratio else None,
+            compressed_topk_idxs=(
+                compressed_topk_idxs.int() if compressed_topk_idxs is not None else None
+            ),
+            start_positions=start_positions,
+            cache_slots=cache_slots,
+            cache_seq_ids=cache_seq_ids,
+            window_size=win,
+            physical_window_size=physical_win,
+            prewrite_current=prewrite_current,
+            compress_ratio=ratio if ratio else None,
+        )
+
+        apply_rotary_emb_v4(outputs, freqs_cis, rope_dim=rope_dim, inverse=True)
+        outputs = outputs.view(total_q, self.n_local_groups, -1)
+        wo_a_typed = wo_a if wo_a.dtype == outputs.dtype else wo_a.to(outputs.dtype)
+        outputs = torch.einsum("sgd,grd->sgr", outputs, wo_a_typed)
+        outputs = self.wo_b(outputs.flatten(1))
+        return list(outputs.split(seqlens_list, dim=0))
 
     def _forward_prefill(
         self,
@@ -1706,6 +2341,7 @@ class AttentionDeepSeekV4(Attention):
             token_offset += seqlen
 
         assert self.slidingwindow_cache_accessor is not None
+        physical_win = self.slidingwindow_cache_accessor.kv["sliding_window"].shape[1]
         if ratio:
             assert self.compressed_cache_accessor is not None
         outputs = self.attn_backend.csa_hca(
@@ -1720,6 +2356,7 @@ class AttentionDeepSeekV4(Attention):
             cache_slots=cache_slots,
             cache_seq_ids=cache_seq_ids,
             window_size=win,
+            physical_window_size=physical_win,
             compressed_cache=self.compressed_cache_accessor if ratio else None,
             compressed_lens=compressed_lens,
             pack_prefill_kv=_pack_prefill_kv_triton,
@@ -1731,7 +2368,8 @@ class AttentionDeepSeekV4(Attention):
             outputs_for_rope, freqs_cis, rope_dim=rope_dim, inverse=True
         )
         outputs = outputs_for_rope.squeeze(0).view(total_q, self.n_local_groups, -1)
-        outputs = torch.einsum("sgd,grd->sgr", outputs, wo_a.to(outputs.dtype))
+        wo_a_typed = wo_a if wo_a.dtype == outputs.dtype else wo_a.to(outputs.dtype)
+        outputs = torch.einsum("sgd,grd->sgr", outputs, wo_a_typed)
         outputs = self.wo_b(outputs.flatten(1))
         return list(outputs.split(seqlens_list, dim=0))
 
@@ -2184,16 +2822,98 @@ class TransformerBlockDeepSeekV4(TransformerBlock):
         self,
         x: torch.Tensor,
         freqs_cis: BatchedFreqsCis,
+        is_mtp: bool = False,
     ):
         x = self.hc_attn(
             x,
-            lambda layer_input: self.attn(self.attn_norm(layer_input), freqs_cis),
+            lambda layer_input: self.attn(
+                self.attn_norm(layer_input), freqs_cis, is_mtp=is_mtp
+            ),
         )
         x = self.hc_ffn(
             x,
             lambda layer_input: self.ffn(self.ffn_norm(layer_input)),
         )
         return x
+
+
+class TransformerBlockDeepSeekV4MTP(TransformerBlockDeepSeekV4):
+    def __init__(
+        self,
+        layer_id: int,
+        args,
+        cache_dict: dict[str, KVCacheBase],
+        attn_backend,
+        op_impl,
+        runtime_context: DeepSeekV4RuntimeContext,
+    ):
+        super().__init__(
+            layer_id,
+            args,
+            cache_dict,
+            attn_backend,
+            op_impl,
+            runtime_context,
+        )
+        self.e_proj = LocalLinear(
+            args.dim,
+            args.dim,
+            has_bias=False,
+            checkpoint_prefix=f"layers.{layer_id}.e_proj",
+        )
+        self.h_proj = LocalLinear(
+            args.dim,
+            args.dim,
+            has_bias=False,
+            checkpoint_prefix=f"layers.{layer_id}.h_proj",
+        )
+        self.enorm = RMSNorm(args.dim, args.norm_eps, dtype=torch.float32)
+        self.hnorm = RMSNorm(args.dim, args.norm_eps, dtype=torch.float32)
+        self.norm = RMSNorm(args.dim, args.norm_eps, dtype=torch.float32)
+        self.norm_eps = args.norm_eps
+        self.hc_eps = args.hc_eps
+        hc_dim = args.hc_mult * args.dim
+        self.hc_head = nn.ParameterDict(
+            {
+                "fn": nn.Parameter(
+                    torch.empty(args.hc_mult, hc_dim, dtype=torch.float32),
+                    requires_grad=False,
+                ),
+                "base": nn.Parameter(
+                    torch.empty(args.hc_mult, dtype=torch.float32),
+                    requires_grad=False,
+                ),
+                "scale": nn.Parameter(
+                    torch.empty(1, dtype=torch.float32), requires_grad=False
+                ),
+            }
+        )
+
+    def _hc_head(self, x: torch.Tensor) -> torch.Tensor:
+        shape, dtype = x.size(), x.dtype
+        x_flat = x.flatten(1).float()
+        rsqrt = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(x_flat, self.hc_head["fn"]) * rsqrt
+        pre = (
+            torch.sigmoid(mixes * self.hc_head["scale"] + self.hc_head["base"])
+            + self.hc_eps
+        )
+        y = torch.sum(pre.unsqueeze(-1) * x_flat.view(shape), dim=1)
+        return y.to(dtype)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        previous_hidden_states: torch.Tensor,
+        is_mtp: bool = False,
+    ):
+        inputs_embeds = self.enorm(x)
+        previous_hidden_states = self.hnorm(previous_hidden_states)
+        x = self.e_proj(inputs_embeds).unsqueeze(1) + self.h_proj(
+            previous_hidden_states
+        )
+        return super().forward(x, freqs_cis, is_mtp=is_mtp)
 
 
 class ParallelHeadDeepSeekV4(nn.Module):
@@ -2231,10 +2951,21 @@ class TransformerDeepSeekV4(Transformer):
         op_impl: str,
         **kwargs,
     ):
-        if int(getattr(get_global_args().infer, "mtp_size", 1)) != 1:
-            raise NotImplementedError(
-                "DeepSeek-V4 initial support requires infer.mtp_size=1"
-            )
+        mtp_size = int(getattr(get_global_args().infer, "mtp_size", 1))
+        if mtp_size > 1:
+            if int(getattr(params, "n_mtp_layers", 1)) != 1:
+                raise NotImplementedError("DeepSeek-V4 supports one MTP layer")
+            if len(params.compress_ratios) <= int(params.n_layers):
+                raise ValueError(
+                    "DeepSeek-V4 MTP requires compress_ratios to include the MTP layer"
+                )
+            mtp_compress_ratio = int(params.compress_ratios[int(params.n_layers)])
+            if mtp_compress_ratio != 0:
+                raise NotImplementedError(
+                    "DeepSeek-V4 MTP currently supports only compress_ratio=0 "
+                    f"for the MTP layer, got {mtp_compress_ratio}"
+                )
+            params.mtp_tie_word_embeddings = True
         if not hasattr(params, "scale_dtype"):
             params.scale_dtype = "fp8"
         if not hasattr(params, "max_seq_len"):
@@ -2299,13 +3030,15 @@ class TransformerDeepSeekV4(Transformer):
             prefix_mappings.extend(
                 [("norm.", "norm."), ("head.", "head."), ("hc_head_", "hc_head.")]
             )
+            if self.mtp_size > 1 and self.mtp_tie_word_embeddings:
+                prefix_mappings.append(("embed.", "embed."))
         return prefix_mappings
 
     def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
         return (f"layers.{i}.", f"layers.{i}.")
 
     def _get_layer_mtp_prefix_mapping(self, i: int):
-        raise NotImplementedError
+        return (f"mtp.{i - self.params.n_layers}.", f"layers.{i}.", {})
 
     def process_state_dict_for_merging_gate_up(self, checkpoint: dict[str, Any]):
         return self.process_state_dict_for_merging_tensors(
@@ -2443,8 +3176,13 @@ class TransformerDeepSeekV4(Transformer):
     def _init_layers(self, cache_dict, attn_backend, op_impl):
         self.layers = nn.ModuleList()
         for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
+            block_cls = (
+                TransformerBlockDeepSeekV4MTP
+                if self.mtp_size > 1 and layer_id >= self.params.n_layers
+                else TransformerBlockDeepSeekV4
+            )
             self.layers.append(
-                TransformerBlockDeepSeekV4(
+                block_cls(
                     layer_id,
                     self.params,
                     cache_dict,
@@ -2480,7 +3218,8 @@ class TransformerDeepSeekV4(Transformer):
         return h.unsqueeze(1).repeat(1, self.params.hc_mult, 1)
 
     def _pre_layers_mtp(self, h, **args):
-        raise NotImplementedError
+        self.runtime_context.input_ids = args.get("input_ids", h)
+        return self.embed(h)
 
     def _hc_head(self, x: torch.Tensor) -> torch.Tensor:
         shape, dtype = x.size(), x.dtype
@@ -2502,10 +3241,127 @@ class TransformerDeepSeekV4(Transformer):
         return self.head(h)
 
     def _get_prefill_previous_hidden_states(self, h):
-        raise NotImplementedError
+        return h
 
     def _post_layers_mtp(self, h):
-        raise NotImplementedError
+        mtp_layer = self.layers[-1]
+        h = mtp_layer._hc_head(h)
+        h = mtp_layer.norm(h)
+        return self.head(h)
+
+    @property
+    def non_mtp_layers(self):
+        has_local_mtp_layer = (
+            self.mtp_size > 1
+            and self.local_begin_layer_id
+            <= self.params.n_layers
+            < self.local_end_layer_id
+        )
+        return self.layers[:-1] if has_local_mtp_layer else self.layers
+
+    def read_mtp_hidden_states(self, is_mtp=False) -> torch.Tensor:
+        cache_accessor = self.cache_dict["mtp"].get_accessor(self.global_n_layers - 1)
+        return read_from_singleton_paged_kv_cache(
+            cache_accessor.kv["hidden_states"],
+            cache_accessor.block_table,
+            self.mtp_accept_indices.get() if is_mtp else None,
+        )
+
+    def update_mtp_hidden_states(self, mtp_hidden_states: torch.Tensor, is_mtp=False):
+        cache_accessor = self.cache_dict["mtp"].get_accessor(self.global_n_layers - 1)
+        cache = cache_accessor.kv["hidden_states"]
+        if is_mtp:
+            mtp_hidden_states = mtp_hidden_states.view(
+                -1,
+                self.mtp_size,
+                self.params.hc_mult,
+                self.params.dim,
+            )
+            mtp_size = self.mtp_size
+        else:
+            cache = cache[:, :1]
+            mtp_size = 1
+        update_singleton_paged_kv_cache(
+            cache,
+            cache_accessor.block_table,
+            mtp_hidden_states,
+            mtp_size,
+        )
+
+    @torch.inference_mode()
+    def mtp_prefill(self, x, h, freqs_cis):
+        for mgr in self.cache_dict.values():
+            mgr.seq_len_delta.is_decode_stage = False
+
+        last_token_offsets = (
+            self.cache_dict["mtp"].mtp_seq_len_delta.delta_prefix_lens_tensor_device[1:]
+            - 1
+        )
+        self.update_mtp_hidden_states(h[last_token_offsets])
+        x[
+            self.cache_dict["main"].mtp_seq_len_delta.delta_position_ids_tensor_device
+            == 0
+        ] = 0
+        previous_hidden_states = torch.roll(h, shifts=1, dims=0)
+        _ = self.layers[-1](x, freqs_cis, previous_hidden_states, is_mtp=False)
+
+    @torch.inference_mode()
+    def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
+        h = self._pre_layers(tokens)
+        for layer in self.non_mtp_layers:
+            h = layer(h, freqs_cis)
+        if self.mtp_size > 1:
+            self.update_mtp_hidden_states(h, is_mtp=True)
+        h = self._post_layers(h)
+        return h.float()
+
+    @torch.inference_mode()
+    def decode_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
+        if self.pp_stage == 0:
+            h = self._pre_layers(tokens)
+        else:
+            h = tokens
+        for layer in self.non_mtp_layers:
+            h = layer(h, freqs_cis)
+        if self.pp_stage == self.pp_end_stage:
+            if self.mtp_size > 1:
+                self.update_mtp_hidden_states(h, is_mtp=True)
+            h = self._post_layers(h)
+            h = h.float()
+        return h
+
+    @torch.inference_mode()
+    def empty_decode(self):
+        previous_input_ids = self.runtime_context.input_ids
+        self.runtime_context.input_ids = torch.empty(
+            (0,), dtype=torch.int64, device=self.device
+        )
+        try:
+            for layer in self.non_mtp_layers:
+                layer.ffn(self.dummy_input)
+        finally:
+            self.runtime_context.input_ids = previous_input_ids
+        return self.graph_dummy_output
+
+    @torch.inference_mode()
+    def empty_mtp_decode(self):
+        has_local_mtp_layer = (
+            self.mtp_size > 1
+            and self.local_begin_layer_id
+            <= self.params.n_layers
+            < self.local_end_layer_id
+        )
+        if not has_local_mtp_layer:
+            return self.graph_dummy_output
+        previous_input_ids = self.runtime_context.input_ids
+        self.runtime_context.input_ids = torch.empty(
+            (0,), dtype=torch.int64, device=self.device
+        )
+        try:
+            self.layers[-1].ffn(self.dummy_input)
+        finally:
+            self.runtime_context.input_ids = previous_input_ids
+        return self.graph_dummy_output
 
     def precompute_freqs_cis(self, max_position_embeddings, device):
         self.freqs_cis_real = torch.empty(0, device=device)
@@ -2514,6 +3370,10 @@ class TransformerDeepSeekV4(Transformer):
             layer.attn.reset_runtime_buffers(device)
 
     def prepare_freqs_cis(self) -> BatchedFreqsCis:
+        self.runtime_context.input_ids = None
+        return BatchedFreqsCis(self.freqs_cis_real, self.freqs_cis_imag)
+
+    def prepare_freqs_cis_mtp(self) -> BatchedFreqsCis:
         self.runtime_context.input_ids = None
         return BatchedFreqsCis(self.freqs_cis_real, self.freqs_cis_imag)
 
@@ -2562,13 +3422,33 @@ class TransformerDeepSeekV4(Transformer):
     ) -> dict[str, Any]:
         normalized = {}
         for name, value in state_dict.items():
-            if name.startswith("mtp."):
-                continue
             if name.startswith("model."):
                 name = name[len("model.") :]
+            if name.startswith("mtp."):
+                if self.mtp_size <= 1:
+                    continue
+                parts = name.split(".", 2)
+                if len(parts) < 3:
+                    continue
+                mtp_layer_id = int(parts[1])
+                # Official MTP keeps embed/head as shared module references. If
+                # those duplicate keys are present in a checkpoint, they are
+                # loaded through the normal non-layer mappings instead.
+                if parts[2].startswith(("embed.", "head.")):
+                    continue
+                name = f"layers.{self.params.n_layers + mtp_layer_id}.{parts[2]}"
+            if self.mtp_size > 1:
+                mtp_layer_prefix = f"layers.{self.params.n_layers}."
+                if name.startswith(mtp_layer_prefix) and name[
+                    len(mtp_layer_prefix) :
+                ].startswith(("embed.", "head.")):
+                    continue
             name = name.replace(".weight_scale_inv", ".scale")
             if name.startswith("hc_head_"):
                 name = name.replace("hc_head_", "hc_head.", 1)
+            name = name.replace(".hc_head_fn", ".hc_head.fn")
+            name = name.replace(".hc_head_base", ".hc_head.base")
+            name = name.replace(".hc_head_scale", ".hc_head.scale")
             for hc_prefix in ("hc_attn", "hc_ffn"):
                 name = name.replace(f".{hc_prefix}_fn", f".{hc_prefix}.fn")
                 name = name.replace(f".{hc_prefix}_base", f".{hc_prefix}.hc_base")

@@ -444,8 +444,9 @@ class DeepSeekV4SlidingKVCacheManager(
     """Scheduler-side allocator for DeepSeek-V4 sliding-window KV pages.
 
     V4 sliding-window cache uses one physical page per active request. The page
-    size is the model window size, and model code writes tokens into that page
-    as a ring buffer with ``position % window_size`` offsets.
+    size is the paged-cache block size, and model code writes tokens into that
+    page as a ring buffer with ``position % window_size`` offsets. The model's
+    logical visible SWA window may be smaller than this physical page.
     """
 
     def __init__(

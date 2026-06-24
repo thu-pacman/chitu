@@ -147,12 +147,18 @@ def gather_pending_and_new(
     cache_slots: torch.Tensor,  # [n]   int32 on GPU
     ratio: int,
     pending_offset: int = 0,  # = ratio for CSA (overlap), 0 for HCA
+    max_eff: int | None = None,
 ):
     n = pending_lens.shape[0]
     D = kv_cat.shape[1]
     BLOCK_T = 32
     BLOCK_D = triton.next_power_of_2(D)
-    max_eff = int((cu_eff[-1] - cu_eff[0]).item()) if n > 0 else 0
+    if max_eff is None:
+        # Prefer passing this from CPU-built metadata. Falling back keeps the
+        # helper usable for generic callers, but it synchronizes the stream.
+        max_eff = int((cu_eff[-1] - cu_eff[0]).item()) if n > 0 else 0
+    else:
+        max_eff = int(max_eff)
     grid = (n, triton.cdiv(max_eff, BLOCK_T))
     if n == 0 or max_eff == 0:
         return
@@ -292,12 +298,16 @@ def _compress_csa_kernel(
     flat_kv_ptr,  # [total_eff, 2*HEAD_DIM]
     flat_score_ptr,  # [total_eff, 2*HEAD_DIM]
     ape_ptr,  # [RATIO, HEAD_DIM]  contiguous first-half ape
-    prev_ref_kv_ptr,  # [n, RATIO, HEAD_DIM]  per-request group-0 prev, precomputed in Python
-    prev_ref_score_ptr,  # [n, RATIO, HEAD_DIM]  raw score (ape already subtracted)
+    kv_state_ptr,  # [max_batch, coff*RATIO, coff*HEAD_DIM]
+    score_state_ptr,
     out_kv_ptr,  # [total_groups, HEAD_DIM]
     cu_eff_ptr,  # [n+1] int32
     cu_groups_ptr,  # [n+1] int32
     group_to_req_ptr,  # [total_groups] int32
+    pending_lens_ptr,  # [n] int32
+    cache_slots_ptr,  # [n] int32
+    state_s0,
+    state_s1,
     RATIO: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     FULL_D: tl.constexpr,
@@ -330,9 +340,16 @@ def _compress_csa_kernel(
         other=0.0,
     )
 
+    ape_r = tl.load(
+        ape_ptr + r_offs[:, None] * HEAD_DIM + d_offs[None, :],
+        mask=d_mask[None, :],
+        other=0.0,
+    )
+
     # ---- prev group's first head ----
     # group > 0: read from flat_kv[token_start - RATIO, :HEAD_DIM]
-    # group == 0: read from prev_ref[req] (precomputed in Python, no conditional needed)
+    # group == 0: read from kv_state[slot, :RATIO, :HEAD_DIM] if there is pending
+    # state, otherwise use zero kv / -inf score.
     is_group_zero = grp_in_req == 0
     safe_flat_prev = tl.where(is_group_zero, token_start, token_start - RATIO)
 
@@ -347,33 +364,27 @@ def _compress_csa_kernel(
         other=0.0,
     )
 
-    # prev_ref is valid for all requests (Python fills zeros/-inf when no prev)
+    pending = tl.load(pending_lens_ptr + req)
+    slot = tl.load(cache_slots_ptr + req)
+    has_prev_ref = is_group_zero & (pending > 0)
     ref_prev_kv = tl.load(
-        prev_ref_kv_ptr
-        + req * RATIO * HEAD_DIM
-        + r_offs[:, None] * HEAD_DIM
-        + d_offs[None, :],
-        mask=d_mask[None, :],
+        kv_state_ptr + slot * state_s0 + r_offs[:, None] * state_s1 + d_offs[None, :],
+        mask=d_mask[None, :] & has_prev_ref,
         other=0.0,
     )
     ref_prev_score = tl.load(
-        prev_ref_score_ptr
-        + req * RATIO * HEAD_DIM
-        + r_offs[:, None] * HEAD_DIM
+        score_state_ptr
+        + slot * state_s0
+        + r_offs[:, None] * state_s1
         + d_offs[None, :],
-        mask=d_mask[None, :],
-        other=0.0,
+        mask=d_mask[None, :] & has_prev_ref,
+        other=-float("inf"),
     )
 
     prev_kv = tl.where(is_group_zero, ref_prev_kv, flat_prev_kv)
-    prev_score = tl.where(is_group_zero, ref_prev_score, flat_prev_score)
+    prev_score = tl.where(is_group_zero, ref_prev_score - ape_r, flat_prev_score)
 
     # ---- apply ape and softmax over 2*RATIO ----
-    ape_r = tl.load(
-        ape_ptr + r_offs[:, None] * HEAD_DIM + d_offs[None, :],
-        mask=d_mask[None, :],
-        other=0.0,
-    )
     score_prev_final = prev_score + ape_r
     score_cur_final = cur_score + ape_r
 
@@ -498,36 +509,21 @@ def compress_csa(
     BLOCK_HD = triton.next_power_of_2(head_dim)
     ape = ape.contiguous()
 
-    # Build prev_ref[n, ratio, head_dim] on Python side to avoid scalar bool in kernel.
-    # For each request:
-    #   pending > 0: use kv_state[slot, :ratio, :head_dim] as prev (raw score = state - ape)
-    #   pending == 0: zeros kv, -inf score (softmax → weight 0)
-    pending_lens_cpu = pending_lens.cpu().tolist()
-    cache_slots_cpu = cache_slots.cpu().tolist()
-    device = flat_kv.device
-    prev_ref_kv = torch.zeros(n, ratio, head_dim, device=device, dtype=torch.float32)
-    prev_ref_score = torch.full(
-        (n, ratio, head_dim), float("-inf"), device=device, dtype=torch.float32
-    )
-    for i in range(n):
-        if pending_lens_cpu[i] > 0:
-            slot = cache_slots_cpu[i]
-            prev_ref_kv[i] = kv_state[slot, :ratio, :head_dim]
-            prev_ref_score[i] = score_state[slot, :ratio, :head_dim] - ape
-    prev_ref_kv = prev_ref_kv.contiguous()
-    prev_ref_score = prev_ref_score.contiguous()
-
     if total_groups > 0:
         _compress_csa_kernel[(total_groups,)](
             flat_kv,
             flat_score,
             ape,
-            prev_ref_kv,
-            prev_ref_score,
+            kv_state,
+            score_state,
             out_kv,
             cu_eff,
             cu_groups,
             group_to_req,
+            pending_lens,
+            cache_slots,
+            kv_state.stride(0),
+            kv_state.stride(1),
             RATIO=ratio,
             HEAD_DIM=head_dim,
             FULL_D=FULL_D,
@@ -662,6 +658,454 @@ def writeback_pending(
         RATIO=ratio,
         BLOCK_R=BLOCK_R,
         BLOCK_D=BLOCK_D,
+    )
+
+
+# ---------------------------------------------------------------------------
+# MTP decode compressor fast path
+#
+# MTP decode appends a uniform short chunk per request. For DeepSeek-V4 the
+# chunk length is <= compress ratio in the supported fast path, so each request
+# can produce at most one compressed row. These kernels avoid the generic
+# prefill flow's flat gather buffers for the hot decode path.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _decode_mtp_hca_compress_kernel(
+    kv_cat_ptr,  # [bsz * Q_LEN, D] raw wkv output
+    score_cat_ptr,  # [bsz * Q_LEN, D] raw gate output
+    kv_state_ptr,  # [max_batch, RATIO, D]
+    score_state_ptr,
+    ape_ptr,  # [RATIO, D]
+    out_kv_ptr,  # [n_compressed, D]
+    compressed_reqs_ptr,  # [n_compressed] int64 request ids
+    start_positions_ptr,  # [bsz]
+    cache_slots_ptr,  # [bsz]
+    state_s0: tl.constexpr,
+    state_s1: tl.constexpr,
+    RATIO: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    out_req = tl.program_id(0)
+    req = tl.load(compressed_reqs_ptr + out_req)
+    sp = tl.load(start_positions_ptr + req)
+    slot = tl.load(cache_slots_ptr + req)
+    pending = sp % RATIO
+
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < D
+
+    r_offs = tl.arange(0, RATIO)
+    is_pending = r_offs < pending
+    new_idx = r_offs - pending
+
+    state_kv = tl.load(
+        kv_state_ptr + slot * state_s0 + r_offs[:, None] * state_s1 + d_offs[None, :],
+        mask=d_mask[None, :] & is_pending[:, None],
+        other=0.0,
+    )
+    state_score = tl.load(
+        score_state_ptr
+        + slot * state_s0
+        + r_offs[:, None] * state_s1
+        + d_offs[None, :],
+        mask=d_mask[None, :] & is_pending[:, None],
+        other=0.0,
+    )
+
+    new_rows = req * Q_LEN + new_idx
+    new_mask = (~is_pending)[:, None] & d_mask[None, :]
+    new_kv = tl.load(
+        kv_cat_ptr + new_rows[:, None] * D + d_offs[None, :],
+        mask=new_mask,
+        other=0.0,
+    )
+    new_score = tl.load(
+        score_cat_ptr + new_rows[:, None] * D + d_offs[None, :],
+        mask=new_mask,
+        other=0.0,
+    )
+    ape = tl.load(
+        ape_ptr + r_offs[:, None] * D + d_offs[None, :],
+        mask=d_mask[None, :],
+        other=0.0,
+    )
+
+    kv = tl.where(is_pending[:, None], state_kv, new_kv)
+    score = tl.where(is_pending[:, None], state_score, new_score + ape)
+
+    score_max = tl.max(score, axis=0)
+    score_exp = tl.exp(score - score_max[None, :])
+    score_sum = tl.sum(score_exp, axis=0)
+    compressed = tl.sum(kv * score_exp, axis=0) / score_sum
+
+    tl.store(out_kv_ptr + out_req * D + d_offs, compressed, mask=d_mask)
+
+
+@triton.jit
+def _decode_mtp_hca_update_kernel(
+    kv_cat_ptr,  # [bsz * Q_LEN, D]
+    score_cat_ptr,  # [bsz * Q_LEN, D]
+    kv_state_ptr,  # [max_batch, RATIO, D]
+    score_state_ptr,
+    ape_ptr,  # [RATIO, D]
+    start_positions_ptr,  # [bsz]
+    cache_slots_ptr,  # [bsz]
+    state_s0: tl.constexpr,
+    state_s1: tl.constexpr,
+    RATIO: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    req = tl.program_id(0)
+    sp = tl.load(start_positions_ptr + req)
+    slot = tl.load(cache_slots_ptr + req)
+    pending = sp % RATIO
+    has_group = pending + Q_LEN >= RATIO
+
+    t_offs = tl.arange(0, BLOCK_Q)
+    d_offs = tl.arange(0, BLOCK_D)
+    t_mask = t_offs < Q_LEN
+    d_mask = d_offs < D
+    first_remainder_new = tl.where(has_group, RATIO - pending, 0)
+    is_remainder = t_mask & (t_offs >= first_remainder_new)
+    dst_rows = tl.where(has_group, t_offs - first_remainder_new, pending + t_offs)
+    src_rows = req * Q_LEN + t_offs
+    rem_kv = tl.load(
+        kv_cat_ptr + src_rows[:, None] * D + d_offs[None, :],
+        mask=is_remainder[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    rem_score = tl.load(
+        score_cat_ptr + src_rows[:, None] * D + d_offs[None, :],
+        mask=is_remainder[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    rem_ape = tl.load(
+        ape_ptr + dst_rows[:, None] * D + d_offs[None, :],
+        mask=is_remainder[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    tl.store(
+        kv_state_ptr + slot * state_s0 + dst_rows[:, None] * state_s1 + d_offs[None, :],
+        rem_kv,
+        mask=is_remainder[:, None] & d_mask[None, :],
+    )
+    tl.store(
+        score_state_ptr
+        + slot * state_s0
+        + dst_rows[:, None] * state_s1
+        + d_offs[None, :],
+        rem_score + rem_ape,
+        mask=is_remainder[:, None] & d_mask[None, :],
+    )
+
+
+@triton.jit
+def _decode_mtp_csa_kernel(
+    kv_cat_ptr,  # [bsz * Q_LEN, 2 * HEAD_DIM]
+    score_cat_ptr,
+    kv_state_ptr,  # [max_batch, 2 * RATIO, 2 * HEAD_DIM]
+    score_state_ptr,
+    ape_ptr,  # [RATIO, 2 * HEAD_DIM]
+    out_kv_ptr,  # [bsz, HEAD_DIM]
+    start_positions_ptr,
+    cache_slots_ptr,
+    state_s0: tl.constexpr,
+    state_s1: tl.constexpr,
+    RATIO: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    FULL_D: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    BLOCK_FULL_D: tl.constexpr,
+):
+    req = tl.program_id(0)
+    sp = tl.load(start_positions_ptr + req)
+    slot = tl.load(cache_slots_ptr + req)
+    pending = sp % RATIO
+    has_group = pending + Q_LEN >= RATIO
+
+    hd_offs = tl.arange(0, BLOCK_HD)
+    hd_mask = hd_offs < HEAD_DIM
+    r_offs = tl.arange(0, RATIO)
+    is_pending = r_offs < pending
+    new_idx = r_offs - pending
+
+    # Current group's second head. Pending rows are stored at kv_state[:, RATIO:].
+    pending_cur_kv = tl.load(
+        kv_state_ptr
+        + slot * state_s0
+        + (RATIO + r_offs[:, None]) * state_s1
+        + (HEAD_DIM + hd_offs[None, :]),
+        mask=is_pending[:, None] & hd_mask[None, :] & has_group,
+        other=0.0,
+    )
+    pending_cur_score = tl.load(
+        score_state_ptr
+        + slot * state_s0
+        + (RATIO + r_offs[:, None]) * state_s1
+        + (HEAD_DIM + hd_offs[None, :]),
+        mask=is_pending[:, None] & hd_mask[None, :] & has_group,
+        other=0.0,
+    )
+    pending_cur_ape = tl.load(
+        ape_ptr + r_offs[:, None] * FULL_D + (HEAD_DIM + hd_offs[None, :]),
+        mask=is_pending[:, None] & hd_mask[None, :] & has_group,
+        other=0.0,
+    )
+
+    new_rows = req * Q_LEN + new_idx
+    new_mask = (~is_pending)[:, None] & hd_mask[None, :] & has_group
+    new_cur_kv = tl.load(
+        kv_cat_ptr + new_rows[:, None] * FULL_D + (HEAD_DIM + hd_offs[None, :]),
+        mask=new_mask,
+        other=0.0,
+    )
+    new_cur_score = tl.load(
+        score_cat_ptr + new_rows[:, None] * FULL_D + (HEAD_DIM + hd_offs[None, :]),
+        mask=new_mask,
+        other=0.0,
+    )
+
+    ape_first = tl.load(
+        ape_ptr + r_offs[:, None] * FULL_D + hd_offs[None, :],
+        mask=hd_mask[None, :] & has_group,
+        other=0.0,
+    )
+    cur_kv = tl.where(is_pending[:, None], pending_cur_kv, new_cur_kv)
+    cur_score_raw = tl.where(
+        is_pending[:, None],
+        pending_cur_score - pending_cur_ape,
+        new_cur_score,
+    )
+    cur_score = cur_score_raw + ape_first
+
+    has_prev_ref = has_group & (pending > 0)
+    prev_kv = tl.load(
+        kv_state_ptr + slot * state_s0 + r_offs[:, None] * state_s1 + hd_offs[None, :],
+        mask=hd_mask[None, :] & has_prev_ref,
+        other=0.0,
+    )
+    prev_score = tl.load(
+        score_state_ptr
+        + slot * state_s0
+        + r_offs[:, None] * state_s1
+        + hd_offs[None, :],
+        mask=hd_mask[None, :] & has_prev_ref,
+        other=-float("inf"),
+    )
+
+    cur_score = tl.where(has_group, cur_score, -float("inf"))
+    prev_score = tl.where(has_group, prev_score, -float("inf"))
+    s_max = tl.maximum(tl.max(prev_score, axis=0), tl.max(cur_score, axis=0))
+    exp_prev = tl.exp(prev_score - s_max[None, :])
+    exp_cur = tl.exp(cur_score - s_max[None, :])
+    s_sum = tl.sum(exp_prev, axis=0) + tl.sum(exp_cur, axis=0)
+    compressed = (
+        tl.sum(prev_kv * exp_prev, axis=0) + tl.sum(cur_kv * exp_cur, axis=0)
+    ) / s_sum
+    tl.store(
+        out_kv_ptr + req * HEAD_DIM + hd_offs,
+        compressed,
+        mask=hd_mask & has_group,
+    )
+
+    # Save the complete group's first head as the next chunk's overlap ref.
+    group_first_kv_pending = tl.load(
+        kv_state_ptr
+        + slot * state_s0
+        + (RATIO + r_offs[:, None]) * state_s1
+        + hd_offs[None, :],
+        mask=is_pending[:, None] & hd_mask[None, :] & has_group,
+        other=0.0,
+    )
+    group_first_score_pending = tl.load(
+        score_state_ptr
+        + slot * state_s0
+        + (RATIO + r_offs[:, None]) * state_s1
+        + hd_offs[None, :],
+        mask=is_pending[:, None] & hd_mask[None, :] & has_group,
+        other=0.0,
+    )
+    group_first_kv_new = tl.load(
+        kv_cat_ptr + new_rows[:, None] * FULL_D + hd_offs[None, :],
+        mask=new_mask,
+        other=0.0,
+    )
+    group_first_score_new = tl.load(
+        score_cat_ptr + new_rows[:, None] * FULL_D + hd_offs[None, :],
+        mask=new_mask,
+        other=0.0,
+    )
+    group_first_kv = tl.where(
+        is_pending[:, None], group_first_kv_pending, group_first_kv_new
+    )
+    group_first_score = tl.where(
+        is_pending[:, None],
+        group_first_score_pending,
+        group_first_score_new + ape_first,
+    )
+    tl.store(
+        kv_state_ptr + slot * state_s0 + r_offs[:, None] * state_s1 + hd_offs[None, :],
+        group_first_kv,
+        mask=hd_mask[None, :] & has_group,
+    )
+    tl.store(
+        score_state_ptr
+        + slot * state_s0
+        + r_offs[:, None] * state_s1
+        + hd_offs[None, :],
+        group_first_score,
+        mask=hd_mask[None, :] & has_group,
+    )
+
+    # Write trailing incomplete group to kv_state[:, RATIO:].
+    t_offs = tl.arange(0, BLOCK_Q)
+    d_offs = tl.arange(0, BLOCK_FULL_D)
+    t_mask = t_offs < Q_LEN
+    d_mask = d_offs < FULL_D
+    first_remainder_new = tl.where(has_group, RATIO - pending, 0)
+    is_remainder = t_mask & (t_offs >= first_remainder_new)
+    dst_rows = RATIO + tl.where(
+        has_group,
+        t_offs - first_remainder_new,
+        pending + t_offs,
+    )
+    src_rows = req * Q_LEN + t_offs
+    rem_kv = tl.load(
+        kv_cat_ptr + src_rows[:, None] * FULL_D + d_offs[None, :],
+        mask=is_remainder[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    rem_score = tl.load(
+        score_cat_ptr + src_rows[:, None] * FULL_D + d_offs[None, :],
+        mask=is_remainder[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    rem_ape = tl.load(
+        ape_ptr + (dst_rows[:, None] - RATIO) * FULL_D + d_offs[None, :],
+        mask=is_remainder[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    tl.store(
+        kv_state_ptr + slot * state_s0 + dst_rows[:, None] * state_s1 + d_offs[None, :],
+        rem_kv,
+        mask=is_remainder[:, None] & d_mask[None, :],
+    )
+    tl.store(
+        score_state_ptr
+        + slot * state_s0
+        + dst_rows[:, None] * state_s1
+        + d_offs[None, :],
+        rem_score + rem_ape,
+        mask=is_remainder[:, None] & d_mask[None, :],
+    )
+
+
+@auto_retry_triton_compilation
+def decode_mtp_hca(
+    kv_cat: torch.Tensor,
+    score_cat: torch.Tensor,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    ape: torch.Tensor,
+    out_kv: torch.Tensor | None,
+    compressed_reqs: torch.Tensor | None,
+    start_positions: torch.Tensor,
+    cache_slots: torch.Tensor,
+    ratio: int,
+    q_len: int,
+):
+    bsz = start_positions.shape[0]
+    if bsz == 0:
+        return
+    D = kv_cat.shape[1]
+    BLOCK_Q = triton.next_power_of_2(q_len)
+    BLOCK_D = triton.next_power_of_2(D)
+    n_compressed = 0 if compressed_reqs is None else compressed_reqs.shape[0]
+    if n_compressed > 0:
+        assert out_kv is not None
+        _decode_mtp_hca_compress_kernel[(n_compressed,)](
+            kv_cat,
+            score_cat,
+            kv_state,
+            score_state,
+            ape,
+            out_kv,
+            compressed_reqs,
+            start_positions,
+            cache_slots,
+            state_s0=kv_state.stride(0),
+            state_s1=kv_state.stride(1),
+            RATIO=ratio,
+            Q_LEN=q_len,
+            D=D,
+            BLOCK_D=BLOCK_D,
+        )
+    _decode_mtp_hca_update_kernel[(bsz,)](
+        kv_cat,
+        score_cat,
+        kv_state,
+        score_state,
+        ape,
+        start_positions,
+        cache_slots,
+        state_s0=kv_state.stride(0),
+        state_s1=kv_state.stride(1),
+        RATIO=ratio,
+        Q_LEN=q_len,
+        D=D,
+        BLOCK_Q=BLOCK_Q,
+        BLOCK_D=BLOCK_D,
+    )
+
+
+@auto_retry_triton_compilation
+def decode_mtp_csa(
+    kv_cat: torch.Tensor,
+    score_cat: torch.Tensor,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    ape: torch.Tensor,
+    out_kv: torch.Tensor,
+    start_positions: torch.Tensor,
+    cache_slots: torch.Tensor,
+    ratio: int,
+    q_len: int,
+    head_dim: int,
+):
+    bsz = start_positions.shape[0]
+    if bsz == 0:
+        return
+    full_d = kv_cat.shape[1]
+    BLOCK_Q = triton.next_power_of_2(q_len)
+    BLOCK_HD = triton.next_power_of_2(head_dim)
+    BLOCK_FULL_D = triton.next_power_of_2(full_d)
+    _decode_mtp_csa_kernel[(bsz,)](
+        kv_cat,
+        score_cat,
+        kv_state,
+        score_state,
+        ape,
+        out_kv,
+        start_positions,
+        cache_slots,
+        state_s0=kv_state.stride(0),
+        state_s1=kv_state.stride(1),
+        RATIO=ratio,
+        Q_LEN=q_len,
+        HEAD_DIM=head_dim,
+        FULL_D=full_d,
+        BLOCK_Q=BLOCK_Q,
+        BLOCK_HD=BLOCK_HD,
+        BLOCK_FULL_D=BLOCK_FULL_D,
     )
 
 
