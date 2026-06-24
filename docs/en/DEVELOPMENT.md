@@ -367,19 +367,19 @@ To build chitu.run, please first prepare a Docker image or an Apptainer image, a
 From an Apptainer image (`.sif` file):
 
 ```bash
-./boot/build.sh <your_apptainer_image.sif> -o <exe_file>
+./boot/build.sh <your_apptainer_image.sif> -o chitu.run
 ```
 
 From a Docker image (bundles the image inside):
 
 ```bash
-./boot/build.sh <your_docker_image:tag> -o <exe_file>
+./boot/build.sh <your_docker_image:tag> -o chitu.run
 ```
 
 From a Docker image without bundling the image inside (a smaller bundle; users will pull the image from an online resource at run time):
 
 ```bash
-./boot/build.sh <your_docker_image:tag> -o <exe_file> --online
+./boot/build.sh <your_docker_image:tag> -o chitu.run --online
 ```
 
 Options:
@@ -393,7 +393,7 @@ Options:
 The output is a self-contained AppImage executable, which can be run directly. All its arguments are defined in [Chitu CLI Arguments](CLI.md).
 
 ```bash
-./<exe_file> [arguments]...
+./chitu.run [arguments]...
 ```
 
 ## Running and Testing without Starting a Service
@@ -480,7 +480,7 @@ torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_t
 Example of deploying 4 single-GPU instances using chitu.run (see [Build for chitu.run](#build-for-chiturun)):
 
 ```bash
-./<exe_file> boot.remote_launcher=srun boot.n_nodes=1 boot.n_gpus_per_node=4 models=<model-name> models.ckpt_dir=<path/to/checkpoint> multi_inst.n_insts=4
+./chitu.run boot.remote_launcher=srun boot.n_nodes=1 boot.n_gpus_per_node=4 models=<model-name> models.ckpt_dir=<path/to/checkpoint> multi_inst.n_insts=4
 ```
 
 Please refer to [here](../../chitu/distributed/pd_disaggregation/README.md) for further multi-instance designs.
@@ -559,7 +559,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 **Example 1 (local Apptainer, single node):**
 
 ```bash
-./<exe_file> boot.n_gpus_per_node=8 \
+./chitu.run boot.n_gpus_per_node=8 \
     "boot.target=[test/single_req_test.py]" \
     "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
     models=Qwen3-235B-A22B \
@@ -570,7 +570,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 **Example 2 (srun + Apptainer, multi-node):**
 
 ```bash
-./<exe_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+./chitu.run boot.n_nodes=2 boot.n_gpus_per_node=8 \
     boot.remote_launcher=srun \
     "boot.target=[test/single_req_test.py]" \
     "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
@@ -582,7 +582,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 **Example 3 (srun + Docker, interactive with node 0):**
 
 ```bash
-./<exe_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+./chitu.run boot.n_nodes=2 boot.n_gpus_per_node=8 \
     boot.remote_launcher=srun \
     "boot.target=[test/single_req_test.py]" \
     "boot.interactive_node_0=True" \
@@ -595,7 +595,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 **Example 4 (mount chitu code into the container):**
 
 ```bash
-./<exe_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+./chitu.run boot.n_nodes=2 boot.n_gpus_per_node=8 \
     boot.remote_launcher=srun \
     "boot.target=[test/single_req_test.py]" \
     "boot.extra_apptainer_args=[-B,.:/workspace/chitu,-B,/path/to/models:/path/to/models,--env,PYTHONPATH=/workspace/chitu]" \
@@ -674,7 +674,7 @@ This is similar to the [Slurm usage](#use-chiturun-recommended) above, except th
 Example:
 
 ```bash
-./<exe_file> boot.n_nodes=2 \
+./chitu.run boot.n_nodes=2 \
     "boot.ssh_node_list=[host1,host2]" \
     boot.n_gpus_per_node=8 \
     boot.remote_launcher=ssh \
