@@ -427,7 +427,7 @@ def _build_qwen3_5_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
 @register_cache_manager_builder(
     predicate=lambda args: (
         _normalize_model_type(getattr(args.models, "type", None))
-        in {ModelType.DEEPSEEK_V3}
+        in {ModelType.DEEPSEEK_V3, ModelType.GLM_5_2}
         and getattr(args.models, "index_head_dim", None)
     ),
     priority=1,

@@ -510,7 +510,11 @@ class Backend:
                 return RefAttnBackend
             elif should_use_hopper_mixed_backend(args):
                 return HopperMixedBackend
-            elif args.models.type in [ModelType.DEEPSEEK_V3, ModelType.KIMI_K2_5]:
+            elif args.models.type in [
+                ModelType.DEEPSEEK_V3,
+                ModelType.KIMI_K2_5,
+                ModelType.GLM_5_2,
+            ]:
                 return FlashMLABackend
             else:
                 return HybridAttnBackend
@@ -855,6 +859,7 @@ class Backend:
                 ModelType.HF_MIXTRAL,
                 ModelType.DEEPSEEK_V3,
                 ModelType.KIMI_K2_5,
+                ModelType.GLM_5_2,
                 ModelType.HF_QWEN2_VL,
                 ModelType.HF_QWEN3_NEXT,
                 ModelType.HF_QWEN3_5,
@@ -912,7 +917,12 @@ class Backend:
                 return False
             if args.infer.mtp_size == 1:
                 if (
-                    args.models.type in [ModelType.DEEPSEEK_V3, ModelType.HF_GLM_4_MOE]
+                    args.models.type
+                    in [
+                        ModelType.DEEPSEEK_V3,
+                        ModelType.HF_GLM_4_MOE,
+                        ModelType.GLM_5_2,
+                    ]
                     and f"model.layers.{args.models.n_layers}" in k
                 ):
                     return False

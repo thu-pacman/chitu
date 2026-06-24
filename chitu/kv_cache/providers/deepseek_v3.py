@@ -36,7 +36,7 @@ def _deepseek_v3_paged_block_size(args, attn_backend_type, *, cache_name: str):
     predicate=lambda args, cache_name: bool(
         cache_name == "indexer"
         and _normalize_model_type(getattr(getattr(args, "models", args), "type", None))
-        == ModelType.DEEPSEEK_V3
+        in (ModelType.DEEPSEEK_V3, ModelType.GLM_5_2)
         and getattr(getattr(args, "models", args), "index_head_dim", None)
     ),
     priority=2,
@@ -90,7 +90,8 @@ def deepseek_v3_indexer_cache_spec(args, attn_backend_type) -> KVCacheSpec:
 
 
 @register_kv_cache_spec(
-    model_types=[ModelType.DEEPSEEK_V3, ModelType.KIMI_K2_5], priority=1
+    model_types=[ModelType.DEEPSEEK_V3, ModelType.KIMI_K2_5, ModelType.GLM_5_2],
+    priority=1,
 )
 def deepseek_v3_kv_cache_spec(args, attn_backend_type) -> KVCacheSpec:
     tp = int(args.infer.tp_size)

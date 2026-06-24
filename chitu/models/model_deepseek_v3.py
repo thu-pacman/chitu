@@ -120,7 +120,15 @@ def ParallelAbsorbGemm(
 
 
 class Indexer(torch.nn.Module):
-    def __init__(self, args, *, checkpoint_prefix: str, indexer_impl: DSAIndexer):
+    """DSA indexer head."""
+
+    def __init__(
+        self,
+        args,
+        *,
+        checkpoint_prefix: str,
+        indexer_impl: DSAIndexer,
+    ):
         super().__init__()
         self.dim: int = args.dim
         self.n_heads: int = args.index_n_heads
@@ -132,6 +140,10 @@ class Indexer(torch.nn.Module):
         max_seq_len = get_global_args().infer.max_seq_len
         self.index_topk: int = min(args.index_topk, max_seq_len)
         self.q_lora_rank: int = args.q_lora_rank
+        self.softmax_scale = self.head_dim**-0.5
+        self.block_size = 128
+        self.indexer_impl = indexer_impl
+
         self.k_norm = LayerNorm(
             self.head_dim,
             dtype=parse_dtype(getattr(args, "index_norm_dtype", "float32")),
@@ -144,9 +156,6 @@ class Indexer(torch.nn.Module):
             has_bias=False,
             checkpoint_prefix=f"{checkpoint_prefix}.weights_proj",
         )
-        self.softmax_scale = self.head_dim**-0.5
-        self.block_size = 128
-        self.indexer_impl = indexer_impl
 
     def _build_index_qk(
         self,
@@ -380,11 +389,17 @@ class AttentionDeepSeekV3(Attention):
         checkpoint_prefix: str,
         indexer_cache: Optional[KVCacheBase] = None,
         indexer_impl: Optional[DSAIndexer],
+        has_local_indexer: bool = True,
     ):
         super().__init__(layer_id, cache, attn_backend)
         self.op_impl = op_impl
         self.mla_absorb = mla_absorb
         self.indexer_cache = indexer_cache
+        # When False, this layer reuses topk from another layer's indexer via a
+        # shared buffer (GLM-5.2 "shared" indexer role). It must NOT allocate
+        # any of its own indexer projection weights, and the forward path skips
+        # the indexer_q/indexer_k computation.
+        self.has_local_indexer = has_local_indexer
         # Set dynamically by ModelDeepSeekV3 after construction for CP mode
         self._freqs_cis_real: torch.Tensor | None = None
         self._freqs_cis_imag: torch.Tensor | None = None
@@ -477,7 +492,8 @@ class AttentionDeepSeekV3(Attention):
             # fp8 gemm can handle weights not divisible by block_size, but it does not hold
             # after merging for the output dimension, except for the last weight.
             assert self.q_lora_rank % block_size == 0
-            if self.index_topk is None:
+            has_indexer_weights = self.index_topk is not None and self.has_local_indexer
+            if not has_indexer_weights:
                 self.wqkv_a = LocalLinear(
                     self.dim,
                     self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
@@ -520,7 +536,7 @@ class AttentionDeepSeekV3(Attention):
                     else None
                 ),
             )  # FIXME: Run this layer with muxi_layout_kernels
-            if self.index_topk is not None:
+            if self.index_topk is not None and self.has_local_indexer:
                 self.indexer_wk = LocalLinear(
                     self.dim,
                     self.index_head_dim,
@@ -538,7 +554,7 @@ class AttentionDeepSeekV3(Attention):
             eps=getattr(args, "rms_norm_eps", 1e-6),
         )
 
-        if self.merge_qkv and self.index_topk is not None:
+        if self.merge_qkv and self.index_topk is not None and self.has_local_indexer:
             # fp8 gemm can handle weights not divisible by block_size, but it does not hold
             # after merging for the output dimension, except for the last weight.
             assert self.index_n_heads * self.index_head_dim % block_size == 0
@@ -581,7 +597,7 @@ class AttentionDeepSeekV3(Attention):
                 ),
                 checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
             )
-            if self.index_topk is not None:
+            if self.index_topk is not None and self.has_local_indexer:
                 self.indexer_wq_b = LocalLinear(
                     self.q_lora_rank,
                     self.index_n_heads * self.index_head_dim,
@@ -775,8 +791,12 @@ class AttentionDeepSeekV3(Attention):
         else:  # standard path (non-CP w/o torch_npu, or CP mode)
             assert self.q_lora_rank > 0
             indexer_k = None
+            # Whether the wqkv_a / q_b_proj weights include the indexer slice.
+            # Shared-indexer layers do not own indexer weights and read top-k
+            # from the shared buffer instead.
+            has_indexer_weights = self.index_topk is not None and self.has_local_indexer
             if self.merge_qkv:
-                if self.index_topk is None:
+                if not has_indexer_weights:
                     q_a_kv = self.wqkv_a(x)
                     q_a, kv = torch.split(
                         q_a_kv,
@@ -797,7 +817,7 @@ class AttentionDeepSeekV3(Attention):
             else:
                 q_a = self.q_a_proj(x)
                 kv = self.kv_a_proj_with_mqa(x)
-                if self.index_topk is not None:
+                if has_indexer_weights:
                     indexer_k = self.indexer_wk(x)
                 else:
                     indexer_k = None
@@ -805,7 +825,7 @@ class AttentionDeepSeekV3(Attention):
             qr = self.q_a_layernorm(q_a, compute_dtype=q_a.dtype)
 
             indexer_q = None
-            if self.merge_qkv and self.index_topk is not None:
+            if self.merge_qkv and has_indexer_weights:
                 q_indexer_q = self.wq_b_indexer_q_b(qr)
                 indexer_q, q = torch.split(
                     q_indexer_q,
@@ -818,7 +838,7 @@ class AttentionDeepSeekV3(Attention):
                 )
             else:
                 q = self.q_b_proj(qr)
-                if self.index_topk is not None:
+                if has_indexer_weights:
                     indexer_q = self.indexer_wq_b(qr)
                 else:
                     indexer_q = None
@@ -1341,6 +1361,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
             indexer_cache=cache_dict.get("indexer", None),
             indexer_impl=indexer_impl,
+            has_local_indexer=True,
         )
         base_moe_experts_class = None
         if op_impl == "muxi_custom_kernel":
@@ -2142,12 +2163,13 @@ class TransformerDeepSeekV3(Transformer):
                 src_layers=["indexer_wk", "q_a_proj", "kv_a_proj_with_mqa"],
                 enable_callback=enable_callback,
             )
-            return self.process_state_dict_for_merging_tensors(
+            checkpoint = self.process_state_dict_for_merging_tensors(
                 checkpoint,
                 tgt_layer="wq_b_indexer_q_b",
                 src_layers=["indexer_wq_b", "q_b_proj"],
                 enable_callback=enable_callback,
             )
+            return checkpoint
 
     @override
     def process_state_dict_for_merging_gate_up(self, checkpoint: dict[str, Any]):
@@ -2215,36 +2237,37 @@ class TransformerDeepSeekV3(Transformer):
         import resource
 
         memory_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
         for layer_id in range(self.local_begin_layer_id, self.local_end_layer_id):
             logger.debug(
                 f"initing layer : {layer_id}  cpu memory usage: {memory_usage / 1024**2} GB  gpu memory usage : RANK : {torch.cuda.current_device()} {torch.cuda.memory_allocated()/(1024**3)} GB"
             )
-            if not (self.mtp_size > 1 and layer_id >= self.params.n_layers):
-                self.layers.append(
-                    TransformerBlockDeepSeekV3(
-                        layer_id,
-                        self.params,
-                        cache_dict,
-                        attn_backend,
-                        self.op_impl,
-                        mla_absorb=self.mla_absorb,
-                        checkpoint_prefix=f"layers.{layer_id}",
-                        indexer_impl=self.indexer_backend,
-                    )
+            is_mtp_layer = self.mtp_size > 1 and layer_id >= self.params.n_layers
+
+            if not is_mtp_layer:
+                block = TransformerBlockDeepSeekV3(
+                    layer_id,
+                    self.params,
+                    cache_dict,
+                    attn_backend,
+                    self.op_impl,
+                    mla_absorb=self.mla_absorb,
+                    checkpoint_prefix=f"layers.{layer_id}",
+                    indexer_impl=self.indexer_backend,
                 )
             else:
-                self.layers.append(
-                    TransformerBlockDeepSeekV3MTP(
-                        layer_id,
-                        self.params,
-                        cache_dict,
-                        attn_backend,
-                        self.op_impl,
-                        mla_absorb=self.mla_absorb,
-                        checkpoint_prefix=f"layers.{layer_id}",
-                        indexer_impl=self.indexer_backend,
-                    )
+                block = TransformerBlockDeepSeekV3MTP(
+                    layer_id,
+                    self.params,
+                    cache_dict,
+                    attn_backend,
+                    self.op_impl,
+                    mla_absorb=self.mla_absorb,
+                    checkpoint_prefix=f"layers.{layer_id}",
+                    indexer_impl=self.indexer_backend,
                 )
+
+            self.layers.append(block)
 
     @override
     def _init_post_layers(self):
