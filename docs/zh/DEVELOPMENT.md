@@ -360,11 +360,13 @@ bash ./script/two-stage-docker-build.sh \
 apptainer build <your_apptainer_image.sif> <your_docker_image>
 ```
 
-### 构建自包含可执行文件分发产物
+### 构建 chitu.run
 
-即使有了 Docker 或 Apptainer 镜像，你仍然需要通过复杂的命令或脚本来在启动时配置硬件相关设置，并分布式地在多个节点的多个 GPU 上启动。为了解决这个问题，Chitu 支持构建自包含的可执行文件分发产物，支持可以通过单条命令启动。
+chitu.run 是赤兔的一种独立可执行文件形式的分发产物。
 
-要构建自包含的可执行文件，请先构建 Docker 镜像或 Apptainer 镜像，然后运行以下命令：
+即使有了 Docker 或 Apptainer 镜像，你仍然需要通过复杂的命令或脚本来在启动时配置硬件相关设置，并分布式地在多个节点的多个 GPU 上启动。为了解决这个问题，Chitu 支持构建 chitu.run，支持可以通过单条命令启动。
+
+要构建 chitu.run，请先构建 Docker 镜像或 Apptainer 镜像，然后运行以下命令：
 
 从 Apptainer 镜像（`.sif` 文件）构建：
 
@@ -392,7 +394,7 @@ apptainer build <your_apptainer_image.sif> <your_docker_image>
 | `--online` | 生成不包含容器镜像的更小的包。用户将从在线资源拉取镜像。 |
 | `-h`, `--help` | 显示帮助信息。 |
 
-输出是一个自包含的 AppImage 可执行文件，可直接运行。其中所有的参数均在 [赤兔 CLI 参数](../en/CLI.md) 定义。
+输出是一个可独立使用的 AppImage 可执行文件，可直接运行。其中所有的参数均在 [赤兔 CLI 参数](../en/CLI.md) 定义。
 
 ```bash
 ./<exe_file> [参数]...
@@ -481,7 +483,7 @@ TP+PP 混合的样例参数：
 torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=8 models=<model-name> models.ckpt_dir=<path/to/checkpoint>
 ```
 
-利用自包含可执行文件（参见 [构建自包含可执行文件分发产物](#构建自包含可执行文件分发产物)）部署 4 个单卡实例样例参数：
+利用 chitu.run（参见 [构建 chitu.run](#构建-chiturun)）部署 4 个单卡实例样例参数：
 
 ```bash
 ./<exe_file> boot.remote_launcher=srun boot.n_nodes=1 boot.n_gpus_per_node=4 models=<model-name> models.ckpt_dir=<path/to/checkpoint> multi_inst.n_insts=4
@@ -543,9 +545,9 @@ torchrun --nnodes 1 \
 
 ### 使用 slurm 在多个节点上的 Docker/Apptainer 容器内运行
 
-#### 使用自包含可执行文件（推荐）
+#### 使用 chitu.run（推荐）
 
-在构建自包含可执行文件后（参见 [构建自包含可执行文件分发产物](#构建自包含可执行文件分发产物)），你可以用一条命令在多个节点上启动它。该可执行文件捆绑了容器镜像（Docker 或 Apptainer），并使用 `srun` 将任务分发到所有节点。
+在构建 chitu.run 后（参见 [构建 chitu.run](#构建-chiturun)），你可以用一条命令在多个节点上启动它。chitu.run 捆绑了容器镜像（Docker 或 Apptainer），并使用 `srun` 将任务分发到所有节点。
 
 所有参数都定义在 [赤兔 CLI 参数](../en/CLI.md) 中。与多节点启动最相关的选项位于 `boot` 部分：
 
@@ -608,7 +610,7 @@ torchrun --nnodes 1 \
     infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
 ```
 
-> 注：运行时使用 Docker 还是 Apptainer 取决于可执行文件的构建方式（参见 [构建自包含可执行文件分发产物](#构建自包含可执行文件分发产物)）。如果捆绑了 Docker 镜像，则使用 `docker run`；否则使用 `apptainer run`。
+> 注：运行时使用 Docker 还是 Apptainer 取决于 chitu.run 的构建方式（参见 [构建 chitu.run](#构建-chiturun)）。如果捆绑了 Docker 镜像，则使用 `docker run`；否则使用 `apptainer run`。
 
 #### 直接调用 Slurm 和 Docker/Apptainer
 
@@ -670,9 +672,9 @@ Apptainer:
 
 首先确保各节点直接可以相互无密码 ssh 访问。
 
-#### 使用自包含可执行文件（推荐）
+#### 使用 chitu.run（推荐）
 
-这与上文的 [Slurm 用法](#使用自包含可执行文件推荐) 类似，区别在于将 `boot.remote_launcher` 设置为 `ssh` 而非 `srun`，并通过 `boot.ssh_node_list` 提供主机列表，而不是依赖 Slurm 分配节点。其余选项保持不变。
+这与上文的 [Slurm 用法](#使用-chiturun推荐) 类似，区别在于将 `boot.remote_launcher` 设置为 `ssh` 而非 `srun`，并通过 `boot.ssh_node_list` 提供主机列表，而不是依赖 Slurm 分配节点。其余选项保持不变。
 
 示例：
 
