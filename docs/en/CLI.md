@@ -702,12 +702,24 @@ Acceptable values: "prefill_and_decode", "prefill", or "decode".
 
 *Default: `"prefill_and_decode"`.*
 
-### Argument `multi_inst.pd_disaggregation`
+### `multi_inst.pd_disaggregation`
 
 Additional configs for PD disaggregation.
 
 > TIPS: To enable verbose logging for PD disaggregation, set the following:
 > `CHITU_LOGGING_LEVEL=chitu.distributed.pd_disaggregation:DEBUG;chitu.hooks:DEBUG;chitu.scheduler:DEBUG`
+
+#### Argument `multi_inst.pd_disaggregation.kv_transfer_backend`
+
+KV transfer backend
+
+Acceptable values: mooncake, nccl
+
+*Default: `"mooncake"`.*
+
+#### Argument `multi_inst.pd_disaggregation.kv_transfer`
+
+Additional configs for KV transfer
 
 ### Argument `multi_inst.inst_overrides`
 

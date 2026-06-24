@@ -1,11 +1,13 @@
 import types
 from collections import OrderedDict
 from unittest.mock import patch
+from dataclasses import dataclass, field
+from omegaconf import OmegaConf
 
 from chitu.dp_request_router import RequestRouter, SchedulerStats
+from chitu.global_vars import set_global_args
 from chitu.schemas.serve_config import RouterConfig
 from chitu.kv_cache import BlockIdentity, NONE_BLK_HASH, BlockIdentityChainBuilder
-from dataclasses import dataclass, field
 
 
 @dataclass
@@ -15,6 +17,11 @@ class MonkReq:
 
 
 def _build_router(algorithm: str = "prefix_cache_aware") -> RequestRouter:
+    set_global_args(
+        OmegaConf.create({"infer": {"max_seq_len": 8192}}),
+        need_ensure=False,
+        need_preprocess=False,
+    )
     cfg = RouterConfig(
         is_router=True,
         max_inflight_per_instance=24,
@@ -22,6 +29,7 @@ def _build_router(algorithm: str = "prefix_cache_aware") -> RequestRouter:
         router_cache_miss_fallback_algorithm="least_loaded",
         router_hit_weight=1.0,
         router_load_penalty_weight=0.02,
+        router_evict_buffer_size=64,
     )
     router = RequestRouter(cfg)
     return router

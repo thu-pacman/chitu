@@ -285,15 +285,9 @@ MooncakeBootstrapServer vs PDCoordinationService：
 
 ## 配置
 
-不论什么拓扑（1P1D、2P3D、XP YD），统一使用 `pd_disagg_serve_config.yaml` 作为基础配置。启动脚本通过 Hydra 命令行 override 动态覆盖 `multi_inst.inst_overrides` 和 `dp_size` 等字段，无需为每种拓扑维护单独的配置文件。
-
-配置文件位于 `chitu/config/pd_disagg_serve_config.yaml`，继承 `serve_config.yaml` 的通用项：
+不论什么拓扑（1P1D、2P3D、XP YD），统一使用 `serve_config.yaml` 作为基础配置。启动脚本通过 Hydra 命令行 override 动态覆盖 `multi_inst.inst_overrides` 和 `dp_size` 等字段，无需为每种拓扑维护单独的配置文件。
 
 ```yaml
-defaults:
-  - serve_config      # 继承模型/推理/校验等通用配置
-  - _self_
-
 multi_inst:
   n_insts: 2                       # P + D 总实例数（启动时覆盖）
   inst_id: 0                       # 当前实例 ID；Router 启动时设为 null
@@ -304,7 +298,6 @@ multi_inst:
     prefill_scheduler: null
     decode_scheduler: null
     kv_transfer_backend: "mooncake"
-    bootstrap_port: 8080           # Bootstrap HTTP 端口
 
     kv_transfer:
       buffer_size: 2048
@@ -318,7 +311,7 @@ multi_inst:
     is_router: True                # Router 进程设为 True，P/D 设为 False
     host: 0.0.0.0
     port: 21003                    # HTTP 推理入口端口
-    routing_algorithm: "power_of_two_choices"
+    routing_algorithm: "prefix_cache_aware"
 
   # 启动脚本会生成以下形式的实例覆盖配置
   inst_overrides:
@@ -366,7 +359,6 @@ multi_inst:
 
 | 变量                     | 必须       | 说明                           |
 | ---------------------- | -------- | ---------------------------- |
-| `PD_MASTER_ADDR`       | P/D 节点必设 | Router 的可达 IP（不要用 127.0.0.1） |
 | `CUDA_VISIBLE_DEVICES` | 按需       | 控制 GPU 分配                    |
 
 
@@ -549,7 +541,7 @@ Router 进程可选启动内置的 Prometheus Server（`PrometheusServerManager`
 | Metadata        | `kv_transfer/mooncake/metadata.py`        | 首 token aux buffer 管理                    |
 | Hook            | `hooks.py`                                | `MooncakeKVTransferHook`，prefill 完成后触发传输 |
 | 监控              | `metrics/prometheus_collector.py`         | Prometheus 指标定义与辅助函数                     |
-| 配置              | `config/pd_disagg_*.yaml`                 | 各拓扑配置模板                                  |
+| 配置              | `config/serve_config.yaml`                   | 服务和 PD 分离的统一基础配置                         |
 | 脚本              | `script/start_pd_disagg_*.sh`             | 本地启动脚本                                   |
 | 脚本              | `script/srun_pd_disagg_*.sh`              | SLURM 多机启动脚本                             |
 
@@ -559,7 +551,7 @@ Router 进程可选启动内置的 Prometheus Server（`PrometheusServerManager`
 
 | 现象                    | 排查方向                                                                        |
 | --------------------- | --------------------------------------------------------------------------- |
-| P/D 启动卡在 Bootstrap 连接 | 确认 Router 已启动 Bootstrap（:8080）；`PD_MASTER_ADDR` 指向 Router IP，非回环地址          |
+| P/D 启动卡在 Bootstrap 连接 | 确认 Router 已启动 Bootstrap，且 coordinator.host/port 对 P/D 节点可达 |
 | Decode 长时间 WAITING    | 检查 Prefill 是否收到 TRANSFER_INFO；查看 Prefill 传输线程日志；确认 RDMA 设备已正确检测（见 `chitu/distributed/infiniband.py`） |
 | RDMA "Bad address"    | 确认 `register_buffer_to_engine()` 在 CacheManager 注入后调用；检查各层 base_ptr/len 无重叠 |
 | Router 序列化报错          | 确保请求 `messages` 是纯 dict 列表（非 pydantic 对象）                                   |

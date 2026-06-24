@@ -154,13 +154,15 @@ class MooncakeBootstrapServer:
       - GET /health: health check
     """
 
-    def __init__(self, port: int):
-        self.port = port
+    def __init__(self):
+        self.port = 0
         self.dp_size = 1  # fallback for 1P1D; can be extended to config-driven
         self.prefill_port_table: dict[int, dict[str, str | int]] = {}
         self._loop = None
         self._runner = None
         self._lock = threading.Lock()
+        self._started = threading.Event()
+        self._startup_error: Optional[BaseException] = None
 
     def _setup_routes(self, app):
 
@@ -224,16 +226,29 @@ class MooncakeBootstrapServer:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
 
-        app = web.Application()
-        self._setup_routes(app)
-        self._runner = web.AppRunner(app, access_log=None)
-        self._loop.run_until_complete(self._runner.setup())
-        site = web.TCPSite(self._runner, port=self.port)
-        self._loop.run_until_complete(site.start())
-        logger.info(f"Mooncake Bootstrap HTTP server started on port {self.port}")
-        self._loop.run_forever()
+        try:
+            app = web.Application()
+            self._setup_routes(app)
+            self._runner = web.AppRunner(app, access_log=None)
+            self._loop.run_until_complete(self._runner.setup())
+            site = web.TCPSite(self._runner, port=self.port)
+            self._loop.run_until_complete(site.start())
+            socket = site._server.sockets[0]
+            self.port = int(socket.getsockname()[1])
+            logger.info(f"Mooncake Bootstrap HTTP server started on port {self.port}")
+            self._started.set()
+            self._loop.run_forever()
+        except BaseException as exc:
+            self._startup_error = exc
+            self._started.set()
+            raise
 
     def start_in_background(self):
         t = threading.Thread(target=self._run_server, daemon=True)
         t.start()
+        self._started.wait()
+        if self._startup_error is not None:
+            raise RuntimeError(
+                "Mooncake Bootstrap HTTP server failed to start"
+            ) from self._startup_error
         return t

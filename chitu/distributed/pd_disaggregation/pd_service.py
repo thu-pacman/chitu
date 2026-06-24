@@ -68,7 +68,8 @@ from chitu.serve.common import (
     step_profiler,
 )
 from chitu.serve.event_loop import get_server_event_loop
-from chitu.task import SerializedPackedTasksPayloadType
+from chitu.chitu_main import chitu_terminate
+from chitu.task import SerializedPackedTasksPayloadType, TaskPool
 from chitu.task_type import TaskType
 
 logger = logging.getLogger(__name__)
@@ -438,6 +439,27 @@ class PDSchedulerService:
             f"connected to stats port {stats_port}"
         )
 
+    async def _send_termination_ack(self):
+        """Notify the router that this PD public rank has drained and is exiting."""
+        if self.stats_socket is None:
+            return
+        try:
+            stats = self._collect_stats()
+            stats.update(
+                {
+                    "running_requests": 0,
+                    "waiting_requests": 0,
+                    "pending_tokens": 0,
+                    "throughput_tokens_per_sec": 0.0,
+                    "heartbeat": False,
+                    "terminated": True,
+                }
+            )
+            await self.stats_socket.send(msgpack.packb(stats))
+            logger.info("sent PD termination ack to router")
+        except Exception:
+            logger.exception("failed to send PD termination ack")
+
     async def _request_handler(self):
         """Handle incoming requests"""
         logger.info("starting request handler")
@@ -455,6 +477,11 @@ class PDSchedulerService:
                         logger.info(
                             "Terminate_engine received. Draining in-flight requests"
                         )
+                        if TaskPool.all_finished():
+                            chitu_terminate()
+                            await self._send_termination_ack()
+                            self.running = False
+                            break
                     elif (
                         isinstance(request_data, dict)
                         and request_data.get("__chitu_msg_type") == "profile"
@@ -492,6 +519,10 @@ class PDSchedulerService:
             # Send stats to router
             stats_bytes = msgpack.packb(stats)
             await self.stats_socket.send(stats_bytes)
+            if stats.get("terminated", False):
+                logger.info("PD termination ack sent via stats reporter")
+                self.running = False
+                break
 
             await asyncio.sleep(1.0)  # Report every second
 
@@ -512,7 +543,8 @@ class PDSchedulerService:
             "pending_tokens": 0,
             "throughput_tokens_per_sec": 0.0,
             "last_update_time": last_update_ts,
-            "heartbeat": True,
+            "heartbeat": Backend.state != BackendState.Terminated,
+            "terminated": Backend.state == BackendState.Terminated,
         }
         if (
             not self.send_collector_addrs
@@ -670,9 +702,21 @@ async def start_pd_worker_service(args, rank: int = 0):
                     and hasattr(dp_dispatcher, "has_pending_metadata")
                     and not dp_dispatcher.has_pending_metadata()
                 ):
+                    if Backend.state == BackendState.Terminating:
+                        chitu_terminate()
+                        break
                     await asyncio.sleep(0)
                     continue
             status = Backend.executor.step(None)
+            if status == SerializedPackedTasksPayloadType.TerminateBackend:
+                break
+            if Backend.state == BackendState.Terminating:
+                chitu_terminate()
+                if Backend.state == BackendState.Terminating:
+                    Backend.state = BackendState.Terminated
+                break
+            if Backend.state == BackendState.Terminated:
+                break
             if mode == "prefill" and status == SerializedPackedTasksPayloadType.Prefill:
                 step_profiler(task_type=TaskType.Prefill)
         await asyncio.sleep(0)

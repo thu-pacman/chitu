@@ -145,7 +145,7 @@ srun $SRUN_PARTITION_ARG \
           +multi_inst.inst_overrides.1.infer.dp_size=16 \
           +multi_inst.inst_overrides.1.infer.ep_size=16 \
           +multi_inst.inst_overrides.1.infer.device_ids=[0,1,2,3,4,5,6,7,0,1,2,3,4,5,6,7]\"
-        COMMON_ARGS=\"--config-name=pd_disagg_serve_config models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} infer.cache_type=paged coordinator.host=\$ROUTER_IP coordinator.port=21001 serve.port=\$ROUTER_HTTP_PORT infer.use_cuda_graph=True infer.schedule_overlap=False float_16bit_variant=bfloat16 multi_inst.n_insts=2 \$PD_INST_OVERRIDES_ARGS\"
+        COMMON_ARGS=\"--config-name=serve_config models=${MODEL_CONFIG} models.ckpt_dir=${MODEL_CKPT_DIR} infer.cache_type=paged coordinator.host=\$ROUTER_IP coordinator.port=21001 serve.port=\$ROUTER_HTTP_PORT infer.use_cuda_graph=True infer.schedule_overlap=False float_16bit_variant=bfloat16 multi_inst.n_insts=2 \$PD_INST_OVERRIDES_ARGS\"
 
         if [ \"\$SLURM_PROCID\" = \"0\" ]; then
             # === Node 0: Router + Prefill (TP2+PP4) ===
@@ -161,7 +161,6 @@ srun $SRUN_PARTITION_ARG \
             echo \"ROUTER_READY host=\$NODE_0_HOST ip=\$ROUTER_IP port=\$ROUTER_HTTP_PORT\" | tee \"\$LOG_DIR_INNER/router.ready\"
 
             echo '=== Node 0: Starting Prefill (TP2+PP4) ==='
-            export PD_MASTER_ADDR=\$ROUTER_IP
             PREFILL_NPROC_PER_NODE=8
             export PREFILL_NPROC_PER_NODE
             python3 -m torch.distributed.run \
@@ -179,7 +178,6 @@ srun $SRUN_PARTITION_ARG \
 
         elif [ \"\$SLURM_PROCID\" = \"1\" ] || [ \"\$SLURM_PROCID\" = \"2\" ]; then
             # === Node 1-2: Decode (DP16+EP16 across 2 nodes) ===
-            export PD_MASTER_ADDR=\$ROUTER_IP
 
             DECODE_NODE_RANK=\$((SLURM_PROCID - 1))
             export DECODE_NODE_RANK

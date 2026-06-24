@@ -126,36 +126,36 @@ class SchedulerConfig:
 
 @dataclass
 class KvTransferConfig:
-    buffer_size: int = 2048
-    transfer_timeout: float = 30.0
-    max_concurrent_transfers: int = 8
+    buffer_size: int = MISSING
+    transfer_timeout: float = MISSING
+    max_concurrent_transfers: int = MISSING
     # Settings for how long Decode waits for the Success signal from Prefill
     # (see kv_manager.recv_kv_cache_and_insert).
-    decode_wait_timeout_s: float = 20.0
-    decode_resend_interval_s: float = 0.5
-    decode_poll_interval_s: float = 0.05
+    decode_wait_timeout_s: float = MISSING
+    decode_resend_interval_s: float = MISSING
+    decode_poll_interval_s: float = MISSING
     # Decode preallocation settings. These separate preallocation from runtime work.
-    decode_prealloc_max_pending: Optional[int] = None
-    decode_prealloc_poll_interval_s: float = 0.01
+    decode_prealloc_max_pending: Optional[int] = MISSING
+    decode_prealloc_poll_interval_s: float = MISSING
     # Decode preallocation budget. Limits the number of tokens that can be
     # preallocated at the same time. A value <= 0 disables this limit.
-    decode_prealloc_token_budget: Optional[int] = None
-    decode_prealloc_reserved_tokens: int = 0
+    decode_prealloc_token_budget: Optional[int] = MISSING
+    decode_prealloc_reserved_tokens: int = MISSING
     # Decode runtime concurrency limit, per DP rank. This separates the block
     # limit from the runtime concurrency limit. A value <= 0 means no limit.
-    decode_max_running_tasks_per_dp: Optional[int] = None
+    decode_max_running_tasks_per_dp: Optional[int] = MISSING
     # Log throttling interval for Decode prepare backpressure, in seconds.
-    prepare_backpressure_log_interval_s: float = 5.0
+    prepare_backpressure_log_interval_s: float = MISSING
 
 
 @dataclass
 class PDTestConfig:
     """PD smoke-test configuration."""
 
-    enable: bool = False  # PD_TEST_ENABLE
-    req_num: int = 8  # number of test requests
-    req_timeout: float = 300.0  # per-request timeout (seconds)
-    output_len: int = 128  # max_new_tokens for each test request
+    enable: bool = MISSING
+    req_num: int = MISSING  # number of test requests
+    req_timeout: float = MISSING  # per-request timeout (seconds)
+    output_len: int = MISSING  # max_new_tokens for each test request
 
 
 @dataclass
@@ -170,7 +170,6 @@ class PrefillSchedulerConfig:
     max_batch_size: int = MISSING
     max_total_tokens: int = MISSING
     batching_strategy: str = MISSING  # varlen, fixed
-    # kv_config: KvTransferConfig = MISSING
 
 
 @dataclass
@@ -183,31 +182,29 @@ class DecodeSchedulerConfig:
     """
 
     scheduling_strategy: str = MISSING  # immediate, batched
-    # kv_config: KvTransferConfig = MISSING
 
 
 @dataclass
 class PDDisaggregationConfig:
     """PD disaggregation configuration"""
 
-    prefill_scheduler: Optional[PrefillSchedulerConfig] = None
-    decode_scheduler: Optional[DecodeSchedulerConfig] = None
-    kv_transfer_backend: str = "mooncake"  # kv transfer backend: mooncake, nccl
-    bootstrap_port: int = 8080  # Bootstrap server port
+    prefill_scheduler: Optional[PrefillSchedulerConfig] = MISSING
+    decode_scheduler: Optional[DecodeSchedulerConfig] = MISSING
+    kv_transfer_backend: str = MISSING  # kv transfer backend: mooncake, nccl
     kv_transfer: KvTransferConfig = field(default_factory=KvTransferConfig)
 
 
 @dataclass
 class RouterConfig:
     is_router: bool = MISSING
-    max_inflight_per_instance: int = 24
+    max_inflight_per_instance: int = MISSING
     routing_algorithm: str = MISSING
-    routing_algorithm_for_decode: str = "power_of_two_choices"
+    routing_algorithm_for_decode: str = MISSING
     router_cache_miss_fallback_algorithm: str = MISSING
-    router_hit_weight: float = 1.0
-    router_load_penalty_weight: float = 0.02
-    router_evict_buffer_size: int = 64
-    launch_timeout: float = 3600.0  # PD_LAUNCH_TIMEOUT
+    router_hit_weight: float = MISSING
+    router_load_penalty_weight: float = MISSING
+    router_evict_buffer_size: int = MISSING
+    launch_timeout: float = MISSING
 
 
 @dataclass
@@ -220,7 +217,7 @@ class CoordinatorConfig:
 class MultiInstConfig:
     n_insts: int = MISSING
     inst_id: Optional[int] = MISSING
-    role: str = "prefill_and_decode"
+    role: str = MISSING
     pd_disaggregation: PDDisaggregationConfig = field(
         default_factory=PDDisaggregationConfig
     )

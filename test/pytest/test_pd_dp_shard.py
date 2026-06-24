@@ -69,9 +69,7 @@ def test_pd_dp_shard_round_robin():
             "multi_inst": {
                 "n_insts": 1,
                 "inst_id": 0,
-                "pd_disaggregation": {
-                    "bootstrap_port": 0,
-                },
+                "pd_disaggregation": {},
                 "router": {
                     "host": "127.0.0.1",
                 },
