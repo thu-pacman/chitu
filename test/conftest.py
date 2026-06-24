@@ -57,7 +57,6 @@ import sys
 import math
 import atexit
 import threading
-import time
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional
 
@@ -73,7 +72,7 @@ from chitu.distributed.parallel_state import (
     parallel_groups_initialized,
     destroy_parallel_groups,
 )
-from chitu.distributed.coordinator import init_coordinator
+from chitu.distributed.coordinator import init_coordinator, set_endpoint
 from chitu.distributed.pd_disaggregation.pd_coordination import PDCoordinationService
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.transfer_engine import (
     MooncakeBootstrapServer,
@@ -544,8 +543,6 @@ def _set_mooncake_env():
             os.environ["MOONCAKE_MOCK_MODE"] = "0"
         else:
             os.environ["MOONCAKE_MOCK_MODE"] = "1"
-    master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("PD_MASTER_ADDR", master_addr)
     yield
 
 
@@ -556,20 +553,12 @@ def cuda_available():
 
 
 @pytest.fixture(scope="session")
-def pd_ports():
-    bootstrap_port = int(os.environ.get("PD_BOOTSTRAP_PORT", "8080"))
-    return {
-        "bootstrap_port": bootstrap_port,
-    }
-
-
-@pytest.fixture(scope="session")
 def singleton_coordinator():
     init_coordinator("127.0.0.1", 0, is_coordinator_host=True, override_existing=True)
 
 
 @pytest.fixture(scope="session")
-def pd_coordination_service(pd_ports):
+def pd_coordination_service():
     if os.environ.get("PD_COORDINATION_EXTERNAL", "0") == "1":
         yield None
         return
@@ -597,21 +586,18 @@ def pd_coordination_service(pd_ports):
 
 
 @pytest.fixture(scope="session")
-def bootstrap_server(pd_ports):
+def bootstrap_server(singleton_coordinator):
     if os.environ.get("PD_BOOTSTRAP_EXTERNAL", "0") == "1":
         yield None
         return
-    master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("PD_MASTER_ADDR", master_addr)
-    server = MooncakeBootstrapServer(port=pd_ports["bootstrap_port"])
+    server = MooncakeBootstrapServer()
     server.start_in_background()
-    # Give server a moment to bind.
-    time.sleep(0.2)
+    set_endpoint("router", "pd_disagg_boot_port", "127.0.0.1", server.port)
     yield server
 
 
 @pytest.fixture(scope="session")
-def global_args(pd_ports):
+def global_args():
     cfg = OmegaConf.create(
         {
             "models": {
@@ -646,7 +632,6 @@ def global_args(pd_ports):
                 "n_insts": 2,
                 "inst_id": 0,
                 "pd_disaggregation": {
-                    "bootstrap_port": pd_ports["bootstrap_port"],
                     "kv_transfer": {
                         "decode_wait_timeout_s": 5.0,
                         "decode_resend_interval_s": 0.2,

@@ -103,6 +103,7 @@ def _pd_router_config(
         router_cache_miss_fallback_algorithm=router_cache_miss_fallback_algorithm,
         router_hit_weight=1.0,
         router_load_penalty_weight=0.02,
+        router_evict_buffer_size=64,
     )
 
 

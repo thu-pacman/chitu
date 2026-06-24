@@ -17,3 +17,4 @@ from chitu.models import model_llama  # NOQA
 from chitu.models import model_llada2  # NOQA
 from chitu.models import model_hf_qwen3_5  # NOQA
 from chitu.models import model_kimi_k25  # NOQA
+from chitu.models import model_glm52  # NOQA

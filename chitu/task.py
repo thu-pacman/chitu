@@ -1006,10 +1006,16 @@ class PackedTasks(PackedTasksBase):
             task.req._test_add_logit(result.logits[it])
             task.req._test_add_token(result.accepted_tokens[it])
 
-    def batch_update_mtp_accept_index(self):
+    def batch_update_mtp_accept_index(
+        self, accept_indices_list: list[int] | None = None
+    ):
         if self.generated_result.accept_indices is None:
             return
-        accept_indices = self.generated_result.accept_indices.tolist()
+        accept_indices = (
+            [int(v) for v in self.generated_result.accept_indices.tolist()]
+            if accept_indices_list is None
+            else accept_indices_list
+        )
         for i, task in enumerate(self.output_tasks):
             task.mtp_accept_index = accept_indices[i]
 

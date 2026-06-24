@@ -359,6 +359,7 @@ class KVCacheBase:
         self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
         if self.mtp_size > 1:
             self.mtp_seq_len_delta.copy_from(prev_seq_len, next_seq_len)
+            self.mtp_seq_len_delta.is_decode_stage = False
 
         for tid, seq_len in zip(tasks.task_ids, next_seq_len.lens_list):
             self.tid_to_cached_len[tid] = seq_len
@@ -395,6 +396,7 @@ class KVCacheBase:
                 for tid in task_ids
             ],
         )
+        self.mtp_seq_len_delta.is_decode_stage = True
 
     def prepare_cache_prefill_dllm(
         self,
@@ -1627,8 +1629,10 @@ class DeepSeekV4SlidingWindowPagedKVCache(DeepSeekV4PagedKVCache):
 
     This is the DeepSeek-V4 sliding-window variant of singleton paged cache:
     each active request owns exactly one physical page, and that page is a
-    ring buffer with ``window_size`` token slots. Unlike ``SingletonPagedKVCache``
-    for MTP/linear states, the in-page offset is not always zero; it is
+    ring buffer with ``window_size`` token slots. ``window_size`` here is the
+    physical page width used by the cache manager; the model's logical visible
+    window may be smaller. Unlike ``SingletonPagedKVCache`` for MTP/linear
+    states, the in-page offset is not always zero; it is
     ``logical_position % window_size``.
 
     The cache still consumes block ids from Chitu's normal ``main`` paged cache

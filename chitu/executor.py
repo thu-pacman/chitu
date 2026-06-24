@@ -1725,11 +1725,19 @@ class Executor:
             self.pipe_dispatcher.collect_results(tasks)
         return tasks
 
-    def _update_token_statistics(self, tasks: PackedTasks):
+    def _update_token_statistics(
+        self,
+        tasks: PackedTasks,
+        accept_indices_list: list[int] | None = None,
+    ):
         bs = len(tasks.generated_result.tokens)
         if tasks.generated_result.accept_indices is not None:
             mtp_proposed = (self.mtp_size - 1) * bs
-            mtp_accepted = torch.sum(tasks.generated_result.accept_indices).item()
+            if accept_indices_list is None:
+                accept_indices_list = [
+                    int(v) for v in tasks.generated_result.accept_indices.tolist()
+                ]
+            mtp_accepted = sum(accept_indices_list)
             PrometheusMetricsCollector.inc_generated_tokens(bs + mtp_accepted)
             PrometheusMetricsCollector.inc_mtp_tokens(mtp_proposed, mtp_accepted)
         else:
@@ -1808,8 +1816,13 @@ class Executor:
 
             tasks.generated_result = tasks.generated_result.cpu()
 
-            self._update_token_statistics(tasks)
-            tasks.batch_update_mtp_accept_index()
+            accept_indices_list = (
+                [int(v) for v in tasks.generated_result.accept_indices.tolist()]
+                if tasks.generated_result.accept_indices is not None
+                else None
+            )
+            self._update_token_statistics(tasks, accept_indices_list)
+            tasks.batch_update_mtp_accept_index(accept_indices_list)
             tasks, pd_first_tokens, pd_cached_hit_tokens = self._dp_collect_result(
                 tasks
             )

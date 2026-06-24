@@ -2076,6 +2076,205 @@ def test_csa_hca_decode_paged_kv(
     assert_close(out, ref_out, atol=atol, rtol=rtol, cos_sim_tol=cos_sim_tol)
 
 
+@pytest.mark.parametrize("has_compressed", [False, True])
+@pytest.mark.parametrize("bs,q_len", [(2, 2), (2, 3), (2, 4), (2, 5)])
+@pytest.mark.parametrize("local_n_heads,head_dim", [(16, 512)])
+@pytest.mark.parametrize("window_size,compressed_page_size,compress_ratio", [(8, 4, 4)])
+@pytest.mark.parametrize("softmax_scale", [0.13])
+def test_csa_hca_decode_mtp_paged_kv(
+    has_compressed,
+    bs,
+    q_len,
+    local_n_heads,
+    head_dim,
+    window_size,
+    compressed_page_size,
+    compress_ratio,
+    softmax_scale,
+):
+    if not has_accelerator():
+        pytest.skip("cuda is missing")
+    _skip_unsupported_csa_hca_impl("flash_mla")
+    if not has_triton:
+        pytest.skip("triton is missing")
+    if not has_native_fp8():
+        pytest.skip("FlashMLA DeepSeek-V4 csa_hca decode requires native FP8")
+    if is_hygon() or is_muxi():
+        pytest.skip("DeepSeek-V4 FlashMLA csa_hca decode is CUDA-only")
+
+    torch.set_default_dtype(torch.bfloat16)
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_batch_size": bs,
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                    "dp_size": 1,
+                    "mla_absorb": "absorb",
+                    "max_seq_len": 1024,
+                    "mtp_size": q_len,
+                },
+                "models": {
+                    "n_heads": local_n_heads,
+                    "head_dim": head_dim,
+                    "dim": 7168,
+                    "type": "deepseek-v4",
+                    "index_topk": 128,
+                },
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+
+    from chitu.models.model_deepseek_v4 import (
+        get_decode_mtp_compress_topk_idxs_v4,
+        get_decode_mtp_window_topk_idxs_v4,
+    )
+    from chitu.ops.triton_ops import append_to_paged_kv_cache_flashmla_dsv4
+
+    start_positions = torch.tensor(
+        [window_size - 1, 2 * window_size - 1][:bs],
+        device="cuda",
+    )
+    cache_slots = torch.arange(bs, device="cuda")
+    cache_seq_ids = torch.arange(bs, device="cuda")
+    q = torch.randn(bs, q_len, local_n_heads, head_dim, device="cuda")
+    slidingwindow_kv = torch.randn(bs, window_size, head_dim, device="cuda")
+    current_kv = torch.randn(bs, q_len, head_dim, device="cuda")
+    attn_sink = torch.randn(local_n_heads, device="cuda", dtype=torch.float32)
+    slidingwindow_topk_idxs = get_decode_mtp_window_topk_idxs_v4(
+        window_size, start_positions, q_len
+    ).int()
+
+    if has_compressed:
+        compressed_topk_idxs = get_decode_mtp_compress_topk_idxs_v4(
+            compress_ratio, start_positions, q_len
+        ).int()
+        compressed_len = compressed_topk_idxs.size(-1)
+        compressed_kv = torch.randn(bs, compressed_len, head_dim, device="cuda")
+        compressed_page_cnt_per_sample = ceil_div(compressed_len, compressed_page_size)
+        compressed_max_num_pages = compressed_page_cnt_per_sample * bs
+        compressed_page_table = torch.arange(
+            compressed_max_num_pages, device="cuda", dtype=torch.int32
+        ).view(bs, compressed_page_cnt_per_sample)
+        compressed_paged_kv = compressed_kv.new_zeros(
+            compressed_max_num_pages, compressed_page_size, head_dim
+        )
+        for i in range(bs):
+            for page_idx in range(compressed_page_cnt_per_sample):
+                begin = page_idx * compressed_page_size
+                end = min(begin + compressed_page_size, compressed_len)
+                page_id = i * compressed_page_cnt_per_sample + page_idx
+                compressed_paged_kv[page_id, : end - begin] = compressed_kv[
+                    i,
+                    begin:end,
+                ]
+    else:
+        compressed_topk_idxs = None
+        compressed_kv = None
+
+    ref_backend = RefAttnBackend(qk_nope_head_dim=head_dim)
+    ref_out = ref_backend.csa_hca_decode_mtp(
+        q,
+        DenseKVCacheAccessor({"sliding_window": slidingwindow_kv.clone()}),
+        attn_sink,
+        slidingwindow_topk_idxs,
+        softmax_scale,
+        current_kv=current_kv,
+        compressed_cache=(
+            DenseKVCacheAccessor({"compressed": compressed_kv.clone()})
+            if has_compressed
+            else None
+        ),
+        compressed_topk_idxs=compressed_topk_idxs,
+        start_positions=start_positions,
+        cache_slots=cache_slots,
+        cache_seq_ids=cache_seq_ids,
+        window_size=window_size,
+        compress_ratio=compress_ratio if has_compressed else None,
+    )
+
+    slidingwindow_page_table = torch.arange(bs, device="cuda", dtype=torch.int32).view(
+        bs, 1
+    )
+    packed_slidingwindow_kv = torch.empty(
+        bs, window_size, 584, device="cuda", dtype=torch.uint8
+    )
+    packed_slidingwindow_kv.zero_()
+    positions = (
+        torch.arange(window_size, device="cuda").unsqueeze(0).expand(bs, window_size)
+    )
+    seq_ids = torch.arange(bs, device="cuda").unsqueeze(1).expand(bs, window_size)
+    append_to_paged_kv_cache_flashmla_dsv4(
+        packed_slidingwindow_kv,
+        slidingwindow_page_table,
+        slidingwindow_kv,
+        positions,
+        seq_ids,
+        window_size=window_size,
+    )
+
+    if has_compressed:
+        packed_compressed_kv = torch.empty(
+            compressed_max_num_pages,
+            compressed_page_size,
+            584,
+            device="cuda",
+            dtype=torch.uint8,
+        )
+        packed_compressed_kv.zero_()
+        positions = (
+            torch.arange(compressed_len, device="cuda")
+            .unsqueeze(0)
+            .expand(bs, compressed_len)
+        )
+        seq_ids = (
+            torch.arange(bs, device="cuda").unsqueeze(1).expand(bs, compressed_len)
+        )
+        append_to_paged_kv_cache_flashmla_dsv4(
+            packed_compressed_kv,
+            compressed_page_table,
+            compressed_kv,
+            positions,
+            seq_ids,
+        )
+
+    flash_backend = _make_csa_hca_attn_backend(
+        "flash_mla", head_dim=head_dim, use_fp8=True
+    )
+    out = flash_backend.csa_hca_decode_mtp(
+        q,
+        PagedKVCacheAccessor(
+            slidingwindow_page_table,
+            {"sliding_window": packed_slidingwindow_kv.clone()},
+        ),
+        attn_sink,
+        slidingwindow_topk_idxs,
+        softmax_scale,
+        current_kv=current_kv,
+        compressed_cache=(
+            PagedKVCacheAccessor(
+                compressed_page_table,
+                {"compressed": packed_compressed_kv.clone()},
+            )
+            if has_compressed
+            else None
+        ),
+        compressed_topk_idxs=compressed_topk_idxs,
+        start_positions=start_positions,
+        cache_slots=cache_slots,
+        cache_seq_ids=cache_seq_ids,
+        window_size=window_size,
+        compress_ratio=compress_ratio if has_compressed else None,
+    )
+
+    assert_close(out, ref_out, atol=3e-2, rtol=3e-2, cos_sim_tol=0.002)
+
+
 @pytest.mark.parametrize("bs", [0, 1, 4])
 @pytest.mark.parametrize(
     "local_n_heads,kv_lora_rank,qk_rope_head_dim,qk_nope_head_dim",

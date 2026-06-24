@@ -440,12 +440,12 @@ class RequestRouter:
         self.total_requests = 0
         self.total_tokens = 0
         self.start_time = time.time()
-        if not is_classic_pd_disagg():
-            logger.info(f"RequestRouter initialized for {self._n_insts} instance(s)")
         self.collector_addrs: dict[int, list[str]] = {}
         self._shutdown = False
         self._drain_complete: dict[int, bool] = {i: False for i in range(self._n_insts)}
         self._tasks: list[asyncio.Task] = []
+
+        logger.info(f"RequestRouter initialized for {self._n_insts} instance(s)")
 
     @property
     def scheduler_addresses(self) -> list[str]:

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from chitu.dp_token_router import get_token_router
 from chitu.global_vars import get_global_args
+from chitu.metrics import stop_metrics_monitor
 from chitu.task import UserRequest
 
 if TYPE_CHECKING:
@@ -196,7 +197,18 @@ class PDTestRunner:
             )
 
         await asyncio.sleep(1.0)
+
+        token_router = get_token_router(check_exist=False)
+        if token_router is not None:
+            await token_router.begin_termination()
+
+        await self._router.terminate_instances()
+        await self._router.wait_for_instances_terminated()
+
+        if token_router is not None:
+            await token_router.shutdown()
         await self._router.shutdown()
+        stop_metrics_monitor()
 
         logger.info("[PD_TEST] exiting process")
         os._exit(0 if self.num_failed == 0 else 1)

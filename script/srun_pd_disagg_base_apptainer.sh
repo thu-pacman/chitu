@@ -59,7 +59,7 @@ usage() {
      --router-prefill-max-total-tokens N    (默认 8192)
      --router-prefill-batching-strategy S   (默认 varlen)
      --router-decode-scheduling-strategy S  (默认 immediate)
-     --config-name NAME                     (默认 pd_disagg_serve_config)
+     --config-name NAME                     (默认 serve_config)
      --cache-type TYPE                      (默认 paged)
      --bind-code 0|1                        (默认 1)
      --apptainer-extra STR                  (额外 apptainer 参数)
@@ -95,9 +95,8 @@ MODEL_USE_CUDA_GRAPH="${MODEL_USE_CUDA_GRAPH:-True}"
 MODEL_SCHEDULE_OVERLAP="${MODEL_SCHEDULE_OVERLAP:-False}"
 
 # Router
-PD_CONFIG_NAME="${PD_CONFIG_NAME:-pd_disagg_serve_config}"
+PD_CONFIG_NAME="${PD_CONFIG_NAME:-serve_config}"
 PD_ROUTER_PORT="${PD_ROUTER_PORT:-}"
-PD_BOOTSTRAP_PORT="${PD_BOOTSTRAP_PORT:-}"
 PD_CACHE_TYPE="${PD_CACHE_TYPE:-paged}"
 ROUTER_PREFILL_MAX_BATCH_SIZE="${ROUTER_PREFILL_MAX_BATCH_SIZE:-32}"
 ROUTER_PREFILL_MAX_TOTAL_TOKENS="${ROUTER_PREFILL_MAX_TOTAL_TOKENS:-8192}"
@@ -229,9 +228,6 @@ apply_job_port_defaults() {
   PD_JOB_PORT_OFFSET="$(calc_job_port_offset "${job_id}")"
   if [ -z "${PD_ROUTER_PORT}" ]; then
     PD_ROUTER_PORT=$((21003 + PD_JOB_PORT_OFFSET))
-  fi
-  if [ -z "${PD_BOOTSTRAP_PORT}" ]; then
-    PD_BOOTSTRAP_PORT=$((8080 + PD_JOB_PORT_OFFSET))
   fi
 }
 
@@ -469,7 +465,6 @@ pd_node_main() {
 
   NODE_0_IP="$(to_ip "${NODE_ARR[0]}")"
   ROUTER_IP="${NODE_0_IP}"
-  export PD_MASTER_ADDR="${ROUTER_IP}"
 
   echo "HOST: $(hostname)  SLURM_PROCID: ${SLURM_PROCID}"
   local _idx=0
@@ -484,7 +479,6 @@ pd_node_main() {
   APPTAINER_BASE_ARGS=(
     --nv --contain --writable-tmpfs --cwd "${PD_APPTAINER_CWD}" --cleanenv
     -B "${MODEL_CKPT_DIR}:${MODEL_CKPT_DIR}"
-    --env PD_MASTER_ADDR="${PD_MASTER_ADDR}"
     --env NCCL_GRAPH_MIXING_SUPPORT=0 --env NCCL_GRAPH_REGISTER=0
     --env NCCL_DEBUG="${NCCL_DEBUG}" --env NCCL_IB_HCA="${NCCL_IB_HCA}"
     --env NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL}" --env NCCL_IB_MTU="${NCCL_IB_MTU}"
@@ -550,7 +544,6 @@ pd_node_main() {
     "infer.cache_type=${PD_CACHE_TYPE}"
     "coordinator.host=${ROUTER_IP}"
     "coordinator.port=21001"
-    "multi_inst.pd_disaggregation.bootstrap_port=${PD_BOOTSTRAP_PORT}"
     "serve.port=${PD_ROUTER_PORT}"
     "infer.use_cuda_graph=${MODEL_USE_CUDA_GRAPH}" "infer.schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
     "float_16bit_variant=${MODEL_FLOAT16_VARIANT}"
@@ -766,7 +759,6 @@ export PD_PREFILL_DEFAULT_SPEC="${PREFILL_DEFAULT_SPEC}" PD_DECODE_DEFAULT_SPEC=
 # ── 打印摘要 ──
 echo "=== PD Disagg (nodes=${PD_NODES} gpus=${PD_GPUS_PER_NODE}) ==="
 echo "router_port=${PD_ROUTER_PORT:-auto} job_port_offset=${PD_JOB_PORT_OFFSET}"
-echo "bootstrap_port=${PD_BOOTSTRAP_PORT}"
 echo "model=${MODEL_CONFIG}  ckpt=${MODEL_CKPT_DIR}  sif=${PD_SIF_FILE}"
 echo "model: float16=${MODEL_FLOAT16_VARIANT} cuda_graph=${MODEL_USE_CUDA_GRAPH} schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
 echo "instances: prefill=${PREFILL_COUNT} decode=${DECODE_COUNT}"

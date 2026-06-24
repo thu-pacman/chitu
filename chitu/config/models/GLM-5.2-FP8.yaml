@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# GLM-5.2-FP8 shares the same model structure with GLM-5.2 (block-FP8 quant).
+defaults:
+  - GLM-5.2
+  - quant_config: blockfp8
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: GLM-5.2-FP8
+source: "https://huggingface.co/zai-org/GLM-5.2-FP8" # Just for displaying. No automatic download.

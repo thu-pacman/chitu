@@ -103,8 +103,27 @@ def deepseek_v4_compressed_cache_spec(args, attn_backend_type) -> KVCacheSpec:
     )
 
 
+@register_kv_cache_spec(
+    model_types=[ModelType.DEEPSEEK_V4], priority=2, cache_name="mtp"
+)
+def deepseek_v4_mtp_cache_spec(args, attn_backend_type) -> KVCacheSpec:
+    return KVCacheSpec(
+        kvargs={
+            "shape_per_token_dict": {
+                "hidden_states": (
+                    int(args.models.hc_mult),
+                    int(args.models.dim),
+                ),
+            },
+            "dtype_dict": {
+                "hidden_states": torch.bfloat16,
+            },
+        }
+    )
+
+
 def _layer_filter_for_compress_ratios(args, *, compressed: bool):
-    compress_ratios = [int(ratio) for ratio in args.models.compress_ratios]
+    compress_ratios = _deepseek_v4_compress_ratios(args)
 
     def layer_filter(layers):
         return [
@@ -117,7 +136,7 @@ def _layer_filter_for_compress_ratios(args, *, compressed: bool):
 
 
 def _layer_filter_for_compress_ratio(args, compress_ratio: int):
-    compress_ratios = [int(ratio) for ratio in args.models.compress_ratios]
+    compress_ratios = _deepseek_v4_compress_ratios(args)
 
     def layer_filter(layers):
         return [
@@ -169,6 +188,24 @@ def _deepseek_v4_initial_num_blocks(args, block_size: int, cap: int) -> int:
     return min(_resolve_default_num_blocks(args, block_size, None), int(cap))
 
 
+def _deepseek_v4_compress_ratios(args) -> list[int]:
+    compress_ratios = [int(ratio) for ratio in args.models.compress_ratios]
+    mtp_size = int(getattr(args.infer, "mtp_size", 1))
+    if mtp_size > 1:
+        n_layers = int(args.models.n_layers)
+        if len(compress_ratios) <= n_layers:
+            raise ValueError(
+                "DeepSeek-V4 MTP requires compress_ratios to include the MTP layer"
+            )
+        mtp_compress_ratio = compress_ratios[n_layers]
+        if mtp_compress_ratio != 0:
+            raise NotImplementedError(
+                "DeepSeek-V4 MTP currently supports only compress_ratio=0 "
+                f"for the MTP layer, got {mtp_compress_ratio}"
+            )
+    return compress_ratios
+
+
 @register_cache_manager_builder(model_types=[ModelType.DEEPSEEK_V4], priority=4)
 def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
     if _is_deepseek_v4_flash_mla_backend(attn_backend_type) and (
@@ -198,7 +235,9 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
     num_hot_req = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
 
     if args.infer.cache_type == "skew":
-        compress_ratios = [int(ratio) for ratio in args.models.compress_ratios if ratio]
+        compress_ratios = [
+            ratio for ratio in _deepseek_v4_compress_ratios(args) if ratio
+        ]
         unique_compress_ratios = sorted(set(compress_ratios))
         compressed_spec = get_kv_cache_spec(
             args, attn_backend_type, cache_name="compressed"
@@ -287,7 +326,9 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
                 "DeepSeek-V4 paged KV cache does not support prefix caching yet."
             )
 
-        compress_ratios = [int(ratio) for ratio in args.models.compress_ratios if ratio]
+        compress_ratios = [
+            ratio for ratio in _deepseek_v4_compress_ratios(args) if ratio
+        ]
         unique_compress_ratios = sorted(set(compress_ratios))
         compressed_spec = get_kv_cache_spec(
             args, attn_backend_type, cache_name="compressed"
@@ -307,9 +348,22 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
             )
         head_dim = int(args.models.head_dim)
         window_size = int(args.models.window_size)
+        sliding_block_size = (
+            int(spec.block_size)
+            if spec.block_size is not None
+            else default_paged_block_size_policy(args)
+        )
+        if use_flashmla_packed and int(getattr(args.infer, "mtp_size", 1)) > 1:
+            min_sliding_block_size = window_size + int(args.infer.mtp_size)
+            if min_sliding_block_size > sliding_block_size:
+                raise ValueError(
+                    "DeepSeek-V4 MTP sliding-window cache block size is too small: "
+                    f"window_size({window_size}) + mtp_size({args.infer.mtp_size}) "
+                    f"> block_size({sliding_block_size})"
+                )
         # Sliding-window KV is a fixed one-page-per-request ring buffer. The
-        # page size is the window size; compressed KV streams below keep using
-        # the configured paged block size.
+        # model's logical sliding window is args.models.window_size; the physical
+        # page/block size follows Chitu's paged cache policy.
         main_num_blocks_cap = int(num_hot_req)
         main_num_blocks = main_num_blocks_cap
         compressed_storage_len_by_ratio = {}
@@ -334,10 +388,10 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
             cache_dict["main"] = DeepSeekV4SlidingWindowPagedKVCache(
                 full_layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
-                window_size=window_size,
+                window_size=sliding_block_size,
                 num_hot_req=num_hot_req,
                 num_blocks=main_num_blocks,
-                block_size=window_size,
+                block_size=sliding_block_size,
                 device=device,
                 manager_name="main",
                 **kvargs,
@@ -373,10 +427,10 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
             sliding_cache = DeepSeekV4SlidingWindowPagedKVCache(
                 compress_layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
-                window_size=window_size,
+                window_size=sliding_block_size,
                 num_hot_req=num_hot_req,
                 num_blocks=main_num_blocks,
-                block_size=window_size,
+                block_size=sliding_block_size,
                 device=device,
                 manager_name="main",
                 request_shape_dict=request_shape_dict,
@@ -419,9 +473,9 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
                         dp_rank=i,
                         mtp_size=args.infer.mtp_size,
                         enable_prefix_caching=args.infer.enable_prefix_caching,
-                        block_size=window_size,
+                        block_size=sliding_block_size,
                         manager_name="main",
-                        window_size=window_size,
+                        window_size=sliding_block_size,
                     ),
                     **{
                         _deepseek_v4_compressed_cache_name(

@@ -129,6 +129,7 @@ class RefAttnBackend(AttnBackend):
         cache_slots: Optional[torch.Tensor] = None,
         cache_seq_ids: Optional[torch.Tensor] = None,
         window_size: Optional[int] = None,
+        physical_window_size: Optional[int] = None,
         compress_ratio: Optional[int] = None,
     ) -> torch.Tensor:
         if cache_slots is None:
@@ -136,9 +137,19 @@ class RefAttnBackend(AttnBackend):
         if cache_seq_ids is None:
             cache_seq_ids = cache_slots
         if window_size is None:
+            if slidingwindow_topk_idxs is None:
+                raise ValueError(
+                    "Ref csa_hca_decode_mtp requires slidingwindow_topk_idxs "
+                    "when window_size is omitted"
+                )
             window_size = slidingwindow_cache.kv["sliding_window"].size(1)
+        physical_window_size = int(
+            physical_window_size
+            if physical_window_size is not None
+            else slidingwindow_cache.kv["sliding_window"].size(1)
+        )
         if split_offset is None:
-            split_offset = window_size
+            split_offset = physical_window_size
 
         self._write_dsv4_decode_current_kv(
             slidingwindow_cache,
@@ -146,20 +157,17 @@ class RefAttnBackend(AttnBackend):
             start_positions=start_positions,
             cache_slots=cache_slots,
             cache_seq_ids=cache_seq_ids,
-            window_size=window_size,
+            window_size=physical_window_size,
         )
 
-        slidingwindow_lens = torch.minimum(
-            start_positions + 1,
-            torch.full_like(start_positions, window_size),
-        )
+        slidingwindow_lens = torch.full_like(start_positions, physical_window_size)
         slidingwindow_kv = self._materialize_v4_cache(
             slidingwindow_cache,
             "sliding_window",
             cache_slots,
             cache_seq_ids,
             slidingwindow_lens,
-            max_len=window_size,
+            max_len=physical_window_size,
         )
         if (
             compressed_cache is not None
@@ -189,6 +197,151 @@ class RefAttnBackend(AttnBackend):
             split_offset=split_offset,
             compress_ratio=compress_ratio,
         )
+
+    @override
+    def csa_hca_decode_mtp(
+        self,
+        q: torch.Tensor,
+        slidingwindow_cache: KVCacheAccessor,
+        attn_sink: torch.Tensor,
+        slidingwindow_topk_idxs: Optional[torch.Tensor],
+        softmax_scale: float,
+        *,
+        current_kv: torch.Tensor,
+        compressed_cache: Optional[KVCacheAccessor] = None,
+        compressed_topk_idxs: Optional[torch.Tensor] = None,
+        start_positions: torch.Tensor,
+        cache_slots: Optional[torch.Tensor] = None,
+        cache_seq_ids: Optional[torch.Tensor] = None,
+        window_size: Optional[int] = None,
+        physical_window_size: Optional[int] = None,
+        prewrite_current: bool = False,
+        compress_ratio: Optional[int] = None,
+    ) -> torch.Tensor:
+        if cache_slots is None:
+            raise ValueError("csa_hca_decode_mtp requires cache_slots")
+        if cache_seq_ids is None:
+            cache_seq_ids = cache_slots
+        if window_size is None:
+            window_size = slidingwindow_cache.kv["sliding_window"].size(1)
+        logical_window_size = int(window_size)
+        physical_window_size = int(
+            physical_window_size
+            if physical_window_size is not None
+            else slidingwindow_cache.kv["sliding_window"].size(1)
+        )
+
+        bsz, q_len, _, _ = q.shape
+        if current_kv.shape[:2] != (bsz, q_len):
+            raise ValueError(
+                f"current_kv must be [B, S, D] matching q, got {current_kv.shape}"
+            )
+        if slidingwindow_topk_idxs is None:
+            raise ValueError("Ref csa_hca_decode_mtp requires explicit SWA indices")
+
+        current_cols = torch.arange(q_len, device=q.device, dtype=torch.long)
+        req_ids = (
+            torch.arange(bsz, device=q.device, dtype=torch.long)
+            .unsqueeze(1)
+            .expand(bsz, q_len)
+        )
+        write_positions = start_positions.unsqueeze(1) + current_cols.unsqueeze(0)
+
+        if prewrite_current:
+            self._write_dsv4_sliding_cache_flat(
+                slidingwindow_cache,
+                cache_slots[req_ids],
+                cache_seq_ids[req_ids],
+                write_positions,
+                current_kv,
+                window_size=physical_window_size,
+            )
+
+        slidingwindow_lens = torch.full_like(start_positions, physical_window_size)
+        slidingwindow_kv = self._materialize_v4_cache(
+            slidingwindow_cache,
+            "sliding_window",
+            cache_slots,
+            cache_seq_ids,
+            slidingwindow_lens,
+            max_len=physical_window_size,
+        )
+
+        topk_parts = [slidingwindow_topk_idxs]
+        kv_parts = [slidingwindow_kv]
+        compressed_offset = physical_window_size
+        if not prewrite_current:
+            current_topk_idxs = torch.where(
+                current_cols.view(1, 1, q_len) <= current_cols.view(1, q_len, 1),
+                current_cols.view(1, 1, q_len).expand(bsz, q_len, q_len),
+                torch.full((bsz, q_len, q_len), -1, device=q.device, dtype=torch.long),
+            )
+            topk_parts.append(
+                torch.where(
+                    current_topk_idxs >= 0,
+                    current_topk_idxs + physical_window_size,
+                    -1,
+                )
+            )
+            kv_parts.append(current_kv)
+            compressed_offset += q_len
+
+        if (
+            compressed_cache is not None
+            and compressed_topk_idxs is not None
+            and compressed_topk_idxs.size(-1) > 0
+        ):
+            if compress_ratio is None:
+                raise ValueError(
+                    "compressed csa_hca_decode_mtp requires compress_ratio"
+                )
+            valid_compressed = compressed_topk_idxs[compressed_topk_idxs >= 0]
+            max_compressed_len = (
+                int(valid_compressed.max().item()) + 1
+                if valid_compressed.numel() > 0
+                else 0
+            )
+            if max_compressed_len > 0:
+                compressed_lens = torch.full_like(start_positions, max_compressed_len)
+                compressed_kv = self._materialize_v4_cache(
+                    compressed_cache,
+                    "compressed",
+                    cache_slots,
+                    cache_seq_ids,
+                    compressed_lens,
+                    max_len=max_compressed_len,
+                )
+                topk_parts.append(
+                    torch.where(
+                        compressed_topk_idxs >= 0,
+                        compressed_topk_idxs + compressed_offset,
+                        -1,
+                    )
+                )
+                kv_parts.append(compressed_kv)
+
+        output = self._csa_hca_dense_topk_attention(
+            q,
+            torch.cat(kv_parts, dim=1),
+            attn_sink,
+            torch.cat(topk_parts, dim=-1),
+            softmax_scale,
+        )
+
+        if not prewrite_current:
+            write_keep_start = torch.clamp(
+                start_positions + q_len - logical_window_size, min=0
+            )
+            write_mask = write_positions >= write_keep_start.unsqueeze(1)
+            self._write_dsv4_sliding_cache_flat(
+                slidingwindow_cache,
+                cache_slots[req_ids][write_mask],
+                cache_seq_ids[req_ids][write_mask],
+                write_positions[write_mask],
+                current_kv[write_mask],
+                window_size=physical_window_size,
+            )
+        return output
 
     def _read_v4_cache(
         self,

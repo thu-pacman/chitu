@@ -463,7 +463,6 @@ class KVManager:
         # a comma-separated list of multiple NICs, which MooncakeTransferEngine
         # accepts directly.
         ib_device = detect_ib_devices()
-        bootstrap_port = pd_config.bootstrap_port if pd_config else 29888
         self.kv_transfer_cfg = (
             getattr(pd_config, "kv_transfer", None) if pd_config else None
         )
@@ -483,7 +482,6 @@ class KVManager:
         self.server_socket = self.zmq_ctx.socket(zmq.PULL)
         # Prefill-only: only used for Prefill internal communication: Non control rank send STAGE_DONE to control rank
         self._internal_server_socket = None
-        self.bootstrap_port = bootstrap_port
         self.request_status: dict[UUID, KVPoll] = {}
 
         # Prefill-side control plane (PP>1):
@@ -595,6 +593,10 @@ class KVManager:
             os.getenv("PD_BOOTSTRAP_CACHE_FAIL_TTL_S", "0.2")
         )
         self._bootstrap_session_local = threading.local()
+        self._bootstrap_endpoint_url: Optional[str] = None
+        self._bootstrap_endpoint_timeout_s = float(
+            getattr(args.multi_inst.router, "launch_timeout", 3600.0)
+        )
         if self.kv_cache is not None:
             self.register_buffer_to_engine()
             self._buffer_ptrs_valid = True
@@ -2009,12 +2011,20 @@ class KVManager:
         threading.Thread(target=decode_thread, daemon=True).start()
         logger.info(f"started decode communication thread on port {self.rank_port}")
 
+    def _get_bootstrap_server_url(self) -> str:
+        """Return the Mooncake bootstrap server URL published by the router."""
+        if self._bootstrap_endpoint_url is None:
+            ip, port = get_endpoint(
+                "router",
+                "pd_disagg_boot_port",
+                timeout=self._bootstrap_endpoint_timeout_s,
+            )
+            self._bootstrap_endpoint_url = f"http://{ip}:{port}"
+        return self._bootstrap_endpoint_url
+
     def _get_bootstrap_info(self, engine_rank: int) -> Optional[dict[str, str | int]]:
         """Fetch prefill endpoint info from bootstrap server"""
-        ip_address = os.environ.get("PD_MASTER_ADDR", None)
-        if ip_address is None:
-            logger.warning("PD_MASTER_ADDR not set, cannot query bootstrap")
-            return None
+        bootstrap_server_url = self._get_bootstrap_server_url()
         now = time.time()
         with self._bootstrap_cache_lock:
             cached = self._bootstrap_cache.get(engine_rank)
@@ -2028,9 +2038,7 @@ class KVManager:
             if (now - cached_ts) < ttl_s:
                 return cached_info
 
-        url = (
-            f"http://{ip_address}:{self.bootstrap_port}/route?engine_rank={engine_rank}"
-        )
+        url = f"{bootstrap_server_url}/route?engine_rank={engine_rank}"
         session = self._get_bootstrap_session()
         try:
             resp = session.get(url, timeout=2)
@@ -2087,18 +2095,9 @@ class KVManager:
             sock.close()
 
     def _register_to_bootstrap(self):
-        """Register to the bootstrap server when coordination is unavailable."""
-        # Fallback path when the coordination service is unavailable.
-        logger.info("registering to bootstrap server (fallback mode)")
-
-        # Get master address from environment
-        ip_address = os.environ.get("PD_MASTER_ADDR", None)
-        if ip_address is None:
-            logger.warning("PD_MASTER_ADDR not set, skipping bootstrap registration")
-            return
-
-        bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
-        url = f"http://{bootstrap_server_url}/route"
+        """Register the Prefill control endpoint with the bootstrap server."""
+        bootstrap_server_url = self._get_bootstrap_server_url()
+        url = f"{bootstrap_server_url}/route"
         logger.info(f"registering to bootstrap server at {url}")
 
         payload = {

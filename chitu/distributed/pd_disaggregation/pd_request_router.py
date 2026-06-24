@@ -366,6 +366,10 @@ class PDRequestRouter(RequestRouter):
                     else:
                         continue
 
+                    instance_id = get_multi_inst_ids_by_role(role)[local_instance_id]
+                    if stats_dict.get("terminated", False):
+                        self._drain_complete[instance_id] = True
+
                     stats = SchedulerStats(
                         local_instance_id=local_instance_id,
                         running_requests=stats_dict.get("running_requests", 0),
@@ -406,7 +410,6 @@ class PDRequestRouter(RequestRouter):
                     prometheus_collector_addrs = stats_dict.get(
                         "prometheus_collector_addrs", []
                     )
-                    instance_id = get_multi_inst_ids_by_role(role)[local_instance_id]
                     if (
                         self.collector_addrs.get(instance_id, None) is None
                         and len(prometheus_collector_addrs) > 0
@@ -433,17 +436,21 @@ class PDRequestRouter(RequestRouter):
                 await asyncio.sleep(0.1)
 
     async def _start_bootstrap_server_if_needed(self):
-        """Start Mooncake Bootstrap HTTP server on Router if configured"""
+        """Start Mooncake Bootstrap HTTP server on Router when Mooncake transfer is enabled."""
         if getattr(self.pd_config, "kv_transfer_backend", "mooncake") == "mooncake":
-            bootstrap_port = getattr(self.pd_config, "bootstrap_port", 29888)
             # Start only once
             if self.bootstrap_server is None:
-                logger.info(
-                    f"starting mooncake bootstrap server on port {bootstrap_port}"
-                )
-                self.bootstrap_server = MooncakeBootstrapServer(bootstrap_port)
+                logger.info("starting mooncake bootstrap server")
+                self.bootstrap_server = MooncakeBootstrapServer()
                 self.bootstrap_server.start_in_background()
-                logger.info("mooncake bootstrap server started")
+                bootstrap_ip = get_local_ip()
+                bootstrap_port = self.bootstrap_server.port
+                set_endpoint(
+                    "router", "pd_disagg_boot_port", bootstrap_ip, bootstrap_port
+                )
+                logger.info(
+                    f"mooncake bootstrap server started at {bootstrap_ip}:{bootstrap_port}"
+                )
 
     async def add_request(self, request: UserRequest):
         """Add request to router"""
