@@ -24,6 +24,7 @@ from chitu.dp_request_router import (
     PrefixCacheAwarePolicy,
     RequestRouter,
     SchedulerStats,
+    build_terminate_engine_message,
 )
 from chitu.schemas.serve_config import (
     PDDisaggregationConfig,
@@ -658,6 +659,22 @@ class PDRequestRouter(RequestRouter):
                         f"send to {label} timed out after {timeout_s:.1f}s: {e}"
                     ) from e
                 await asyncio.sleep(retry_s)
+
+    async def terminate_instances(self) -> None:
+        payload = msgpack.packb(build_terminate_engine_message())
+
+        async def _send_one(socket, role: str, local_instance_id: int) -> None:
+            label = f"{role}:{local_instance_id}"
+            try:
+                await self._send_with_retry(socket, payload, label)
+                logger.info(f"[PD_ROUTER] terminate_engine sent to {label}")
+            except Exception:
+                logger.exception(f"[PD_ROUTER] terminate_engine failed for {label}")
+
+        for local_instance_id, socket in list(self.prefill_sockets.items()):
+            await _send_one(socket, "prefill", local_instance_id)
+        for local_instance_id, socket in list(self.decode_sockets.items()):
+            await _send_one(socket, "decode", local_instance_id)
 
     async def broadcast_profile(self, payload: dict) -> dict:
         """Broadcast a profile command to schedulers."""

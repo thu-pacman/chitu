@@ -196,13 +196,19 @@ class DPTokenSender:
 
     def close(self):
         """Close connection"""
-        if hasattr(self, "_send_queue"):
-            self._send_queue.put(None)
+        if hasattr(self, "_send_queue") and self._send_queue is not None:
+            try:
+                self._send_queue.put_nowait(None)
+            except queue.Full:
+                logger.warning(
+                    "DPTokenSender queue full during close; skipping sentinel"
+                )
         if hasattr(self, "_sender_thread") and self._sender_thread.is_alive():
             self._sender_thread.join(timeout=1)
 
         if self.socket:
             self.socket.close(0)
+            self.socket = None
 
         # do not term the shared context
         self.request_token_cache.clear()
@@ -322,6 +328,19 @@ class DPTokenManager:
 
 # Global instances (one per DP group)
 _dp_token_managers: dict[int, DPTokenManager] = {}
+
+
+def close_dp_token_managers():
+    """Close all DP token managers."""
+    global _dp_token_managers
+
+    for manager in list(_dp_token_managers.values()):
+        try:
+            manager.close()
+        except Exception:
+            logger.exception("Failed to close DP token manager")
+
+    _dp_token_managers.clear()
 
 
 def get_dp_token_manager(

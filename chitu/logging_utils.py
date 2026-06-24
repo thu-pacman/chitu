@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from contextlib import contextmanager
 from logging import getLogger
 
+from chitu.global_vars import get_global_args
 from chitu.utils import get_chitu_env, get_chitu_bool_env
 
 try:
@@ -70,15 +71,21 @@ _COLORS = [
     "\033[0;34m",  # Blue (ID 3)
     "\033[0;35m",  # Magenta (ID 4)
     "\033[0;36m",  # Cyan (ID 5)
-    "\033[1;31m",  # Bright Red/Bold Red (ID 6)
-    "\033[1;32m",  # Bright Green/Bold Green (ID 7)
-    "\033[1;33m",  # Bright Yellow/Bold Yellow (ID 8)
-    "\033[1;34m",  # Bright Blue/Bold Blue (ID 9)
-    "\033[1;35m",  # Bright Magenta/Bold Magenta (ID 10)
-    "\033[1;36m",  # Bright Cyan/Bold Cyan (ID 11)
-    "\033[1;37m",  # Bright White/Bold White (ID 12)
+    "\033[0;91m",  # Light Red (ID 6)
+    "\033[0;92m",  # Light Green (ID 7)
+    "\033[0;93m",  # Light Yellow (ID 8)
 ]
+_UNDERLINE = "\033[4m"
 _RESET = "\033[0m"
+
+
+def maybe_colored_by_idx(s: str, idx: int, underline: bool = False):
+    if sys.stdout.isatty() and idx < len(_COLORS):
+        # Apply underline after color because color escape codes include `0`,
+        # which resets previously applied text attributes.
+        s = _COLORS[idx] + (_UNDERLINE if underline else "") + s
+        s += _RESET
+    return s
 
 
 class ChituFormatter(logging.Formatter):
@@ -91,13 +98,25 @@ class ChituFormatter(logging.Formatter):
 
         original_msg = record.getMessage()
 
+        record.rank = ""
+        if (args := get_global_args(need_ensure=False)) is not None and hasattr(
+            args, "multi_inst"
+        ):
+            if hasattr(args.multi_inst, "router") and getattr(
+                args.multi_inst.router, "is_router", False
+            ):
+                record.rank += maybe_colored_by_idx("[Router]", 0, underline=True)
+            elif hasattr(args.multi_inst, "inst_id"):
+                record.rank += maybe_colored_by_idx(
+                    f"[Inst {args.multi_inst.inst_id}]",
+                    args.multi_inst.inst_id + 1,
+                    underline=True,
+                )
         if IS_DIST and dist.is_initialized():
             rank = dist.get_rank()
-            record.rank = f"[Rank {rank}]"
-            if sys.stdout.isatty() and rank < len(_COLORS):
-                record.rank = _COLORS[rank] + record.rank + _RESET
-        else:
-            record.rank = ""
+            if record.rank != "":
+                record.rank += " "
+            record.rank += maybe_colored_by_idx(f"[Rank {rank}]", rank + 1)
 
         context = _log_context.get()
         if context:

@@ -65,6 +65,7 @@ from chitu.distributed.comm_group import SingletonGroupPlaceholder
 from chitu.distributed.coordinator import get_endpoint, set_endpoint
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
+from chitu.dp_request_router import is_terminate_engine_message
 from chitu.kv_cache.utils import (
     plan_kv_cache_blocks_after_warmup,
     reduce_num_block_plan_across_ranks,
@@ -1252,8 +1253,14 @@ def chitu_init(args):
             raise e
         rank = torch.distributed.get_rank()
         # Prepend rank ID before the message
+        header = ""
+        if args.multi_inst.router.is_router:
+            header += "[Router]"
+        else:
+            header += f"[Inst {args.multi_inst.inst_id}]"
+        header += f" [Rank {rank}]"
         msg = "\n".join(
-            [f"[Rank {rank}] {line}" for line in traceback.format_exc().split("\n")]
+            [f"{header} {line}" for line in traceback.format_exc().split("\n")]
         )
         raise Exception(
             msg
@@ -1507,6 +1514,7 @@ async def start_enhanced_scheduler_service(rank: int, multi_inst, args):
 
     # Receive request socket
     request_socket = context.socket(zmq.PULL)
+    request_socket.setsockopt(zmq.LINGER, 0)
     # Bind the TCP server to a random port on the non-wildcard ip, then
     # register it in the coordinator under role `instance_<id>`.
     request_ip = get_local_ip()
@@ -1519,6 +1527,7 @@ async def start_enhanced_scheduler_service(rank: int, multi_inst, args):
 
     # Send statistics socket
     stats_socket = context.socket(zmq.PUSH)
+    stats_socket.setsockopt(zmq.LINGER, 0)
     # Get the router stats endpoint from the coordinator, then connect to it.
     stats_ip, stats_port = get_endpoint("router", "stats_port")
     stats_address = f"tcp://{stats_ip}:{stats_port}"  # Router stats endpoint
@@ -1553,6 +1562,9 @@ async def start_enhanced_scheduler_service(rank: int, multi_inst, args):
     last_block_size = 0
     try:
         while True:
+            if Backend.state == BackendState.Terminated:
+                break
+
             # Check if there are requests
             if await request_socket.poll(timeout=100):  # 100ms timeout
                 try:
@@ -1653,16 +1665,41 @@ async def start_enhanced_scheduler_service(rank: int, multi_inst, args):
     except Exception as e:
         logger.error(f"[Enhanced Scheduler {instance_id}] Service exception: {e}")
     finally:
+        # Notify the router that this instance has fully drained before tearing
+        # down sockets. This lets /terminate_engine keep token/request routers
+        # alive until late tokens and finish messages have been received.
+        try:
+            terminated_stats = {
+                "local_instance_id": instance_id,
+                "running_requests": 0,
+                "waiting_requests": 0,
+                "pending_tokens": 0,
+                "throughput_tokens_per_sec": 0.0,
+                "last_update_time": time.time(),
+                "heartbeat": False,
+                "terminated": True,
+            }
+            await stats_socket.send(msgpack.packb(terminated_stats))
+        except Exception:
+            logger.exception(
+                f"[Enhanced Scheduler {instance_id}] failed to send termination ack"
+            )
+
         # Clean up resources
-        request_socket.close()
-        stats_socket.close()
-        context.term()
+        request_socket.close(0)
+        stats_socket.close(0)
+        context.destroy(linger=0)
         logger.warning(f"[Enhanced Scheduler {instance_id}] Service stopped")
 
 
 async def process_scheduler_request(rank: int, request_data: dict):
     """Handle scheduling requests from Router"""
     try:
+        if is_terminate_engine_message(request_data):
+            Backend.state = BackendState.Terminating
+            logger.info("Terminate_engine received. Draining in-flight requests")
+            return
+
         # Create UserRequest
         user_request = UserRequest.from_dict(request_data)
         request_id = user_request.request_id
@@ -1725,6 +1762,13 @@ def chitu_terminate():
             payload_type=SerializedPackedTasksPayloadType.TerminateBackend,
         )
         Backend.executor.step(terminated_task)
+
+        try:
+            from chitu.dp_token_sender import close_dp_token_managers
+
+            close_dp_token_managers()
+        except Exception:
+            logger.exception("Failed to close DP token managers")
     stop_metrics_monitor()
     PrometheusMetricsCollector.stop_instance()
 

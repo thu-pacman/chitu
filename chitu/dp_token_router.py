@@ -50,6 +50,9 @@ class TokenRouter:
             int
         )  # instance_id -> tokens in window
         self._cleanup_timeout_s = float(os.getenv("ROUTER_CLEANUP_TIMEOUT_S", "2400"))
+        self._shutdown = False
+        self._terminating = False
+        self._tasks: list[asyncio.Task] = []
 
         logger.info("TokenRouter initialized")
 
@@ -61,10 +64,10 @@ class TokenRouter:
 
         # Start background tasks
         logger.info("Token Router: Starting background tasks...")
-        tasks = [self._cleanup_task()]
+        self._tasks = [asyncio.create_task(self._cleanup_task())]
         for instance_id, sock in self.token_receivers.items():
-            tasks.append(self._recv_loop(instance_id, sock))
-        await asyncio.gather(*tasks)
+            self._tasks.append(asyncio.create_task(self._recv_loop(instance_id, sock)))
+        await asyncio.gather(*self._tasks)
 
     async def _init_sockets(self):
         """Initialize ZMQ sockets (support multi-PULL via ROUTER_DP_SIZE)"""
@@ -74,6 +77,7 @@ class TokenRouter:
 
         def create_and_bind(instance_id: int):
             sock = self.context.socket(zmq.PULL)
+            sock.setsockopt(zmq.LINGER, 0)
 
             rcvhwm = int(os.getenv("ROUTER_RCV_HWM", "200000"))
             rcvbuf = int(os.getenv("ROUTER_RCVBUF", "4194304"))
@@ -115,7 +119,7 @@ class TokenRouter:
             rcv_batch = max(1, int(os.getenv("ROUTER_RCV_BATCH", "256")))
         except Exception:
             rcv_batch = 256
-        while True:
+        while not self._shutdown:
             try:
                 if await sock.poll(timeout=1):
                     drained = 0
@@ -147,11 +151,18 @@ class TokenRouter:
             logger.error("Token Router: Invalid token data, missing request_id")
             return
 
-        # Safety check 2: request must exist in mapping table
+        # Safety check 2: request must exist in mapping table. During shutdown,
+        # late tokens can arrive after streams are intentionally stopped; drop
+        # them quietly to avoid noisy false alarms while draining instances.
         if request_id not in self.active_requests:
-            logger.warning(
-                f"Token Router: Received token from unknown request: {request_id}"
-            )
+            if self._terminating:
+                logger.debug(
+                    f"Token Router: Dropping late token during shutdown: {request_id}"
+                )
+            else:
+                logger.warning(
+                    f"Token Router: Received token from unknown request: {request_id}"
+                )
             return
 
         req = self.active_requests[request_id]
@@ -281,7 +292,7 @@ class TokenRouter:
 
     async def _cleanup_task(self):
         """Clean up timed out requests"""
-        while True:
+        while not self._shutdown:
             try:
                 current_time = time.monotonic()
                 timeout_requests = []
@@ -305,6 +316,36 @@ class TokenRouter:
             except Exception as e:
                 logger.error(f"Token Router: Error in cleanup task: {e}")
                 await asyncio.sleep(60)
+
+    async def begin_termination(self):
+        """Stop active streams but keep token receivers alive during instance drain."""
+        self._terminating = True
+        for req in list(self.active_requests.values()):
+            req.stop_stream()
+        self.active_requests.clear()
+
+    async def shutdown(self):
+        """Gracefully shutdown the Token Router."""
+        logger.info("Shutting down Token Router...")
+        self._shutdown = True
+        self._terminating = True
+
+        for req in list(self.active_requests.values()):
+            req.stop_stream()
+        self.active_requests.clear()
+
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
+
+        for sock in self.token_receivers.values():
+            sock.close(0)
+        self.token_receivers.clear()
+
+        self.context.destroy(linger=0)
+        logger.info("Token Router shutdown complete")
 
 
 async def start_token_router(multi_inst):

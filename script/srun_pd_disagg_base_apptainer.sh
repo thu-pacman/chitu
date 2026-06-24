@@ -573,12 +573,6 @@ pd_node_main() {
     ROUTER_PID=$!
   fi
 
-  echo "Waiting for Router..."
-  for _ in $(seq 1 120); do
-    nc -z "${ROUTER_IP}" "${PD_ROUTER_PORT}" >/dev/null 2>&1 && { echo "Router OK"; break; }
-    sleep 1
-  done
-
   # ── 确定本节点运行哪些实例 ──
   detect_local_instances() {
     local kind="$1"

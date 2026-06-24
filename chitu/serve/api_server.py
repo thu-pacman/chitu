@@ -237,13 +237,24 @@ async def terminate_engine(request: TerminateRequest):
     )
     set_server_status(initialized=False)
 
-    # Set Terminating (not Terminated) so the worker thread finishes
-    # in-flight requests before broadcasting TerminateBackend.
-    from chitu.backend import Backend, BackendState
+    if _is_router_process():
+        router = get_request_router()
+        token_router = get_token_router(check_exist=False)
+        if token_router is not None:
+            await token_router.begin_termination()
 
-    Backend.state = BackendState.Terminating
+        await router.terminate_instances()
+        await router.wait_for_instances_terminated()
 
-    # Signal uvicorn to shut down gracefully
+        if token_router is not None:
+            await token_router.shutdown()
+        await router.shutdown()
+    else:
+        # The local backend drains in-flight requests before broadcasting TerminateBackend.
+        from chitu.backend import Backend, BackendState
+
+        Backend.state = BackendState.Terminating
+
     if _uvicorn_server is not None:
         _uvicorn_server.should_exit = True
 
@@ -279,12 +290,17 @@ async def get_chitu_ping():
     return {"message": "Connection succeeded"}
 
 
-def _is_pd_router_process() -> bool:
-    """Detect whether this process is a PD-mode Router."""
+def _is_router_process() -> bool:
+    """Detect whether this process is the multi-instance Router."""
     args = get_global_args()
     router_cfg = getattr(getattr(args, "multi_inst", None), "router", None)
+    return bool(getattr(router_cfg, "is_router", False))
+
+
+def _is_pd_router_process() -> bool:
+    """Detect whether this process is a PD-mode Router."""
     if is_classic_pd_disagg():
-        return bool(getattr(router_cfg, "is_router", False))
+        return _is_router_process()
     if is_independent_multi_inst():
         return False
     raise NotImplementedError(
@@ -762,20 +778,11 @@ async def start_router_components_and_serve():
     try:
         # Start DP components
         await start_dp_components()
-        logger.info("[ROUTER] DP components startup completed")
-
         set_server_status(initialized=True)
         logger.info(
-            "[ROUTER] Service status set to available, can accept inference requests"
+            "[ROUTER] DP components startup completed. Service status set to available, can accept inference requests"
         )
 
-        # Start HTTP service
-        logger.info(
-            f"[ROUTER] Preparing to start HTTP service on port {args.serve.port}..."
-        )
-
-        # Use unified app for DP Router
-        # Use uvicorn.Server instead of uvicorn.run to avoid event loop conflicts
         # 大 Batch Size(>1024) 会 too many open files，这里是为了避免这个问题
         try:
             soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -796,6 +803,7 @@ async def start_router_components_and_serve():
         limit_conc = int(os.getenv("UVICORN_LIMIT_CONCURRENCY", "10240"))
         keepalive = float(os.getenv("UVICORN_TIMEOUT_KEEP_ALIVE", "2"))
 
+        # Use uvicorn.Server instead of uvicorn.run to avoid event loop conflicts
         config = uvicorn.Config(
             app,
             host=args.serve.host,
@@ -806,7 +814,9 @@ async def start_router_components_and_serve():
             limit_concurrency=limit_conc,
             timeout_keep_alive=keepalive,
         )
+        global _uvicorn_server
         server = uvicorn.Server(config)
+        _uvicorn_server = server
         # Run server in current event loop - use await instead of asyncio.run!
         await server.serve()
 

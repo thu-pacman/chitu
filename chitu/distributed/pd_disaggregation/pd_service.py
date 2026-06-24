@@ -22,7 +22,7 @@ import zmq.asyncio
 
 import chitu.serve.event_loop as event_loop_module
 
-from chitu.backend import Backend
+from chitu.backend import Backend, BackendState
 from chitu.distributed.parallel_state import (
     get_cp_group,
     get_cp_size,
@@ -47,6 +47,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
 )
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_token_sender import start_dp_token_manager
+from chitu.dp_request_router import is_terminate_engine_message
 from chitu.global_vars import (
     get_global_args,
     get_multi_inst_ids_by_role,
@@ -447,7 +448,14 @@ class PDSchedulerService:
                     request_bytes = await self.request_socket.recv()
                     request_data = msgpack.unpackb(request_bytes, raw=False)
 
-                    if (
+                    if isinstance(request_data, dict) and is_terminate_engine_message(
+                        request_data
+                    ):
+                        Backend.state = BackendState.Terminating
+                        logger.info(
+                            "Terminate_engine received. Draining in-flight requests"
+                        )
+                    elif (
                         isinstance(request_data, dict)
                         and request_data.get("__chitu_msg_type") == "profile"
                         and "payload" in request_data

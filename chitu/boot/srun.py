@@ -9,8 +9,12 @@ import subprocess
 from logging import getLogger
 
 from chitu.boot.appimage_utils import appimage
-from chitu.boot.apptainer_run import apptainer_run
 from chitu.boot.arg_utils import args_as_list
+from chitu.boot.multi_instance import (
+    build_instance_launch_plans,
+    launch_multi_instance_on_node,
+    multi_instance_enabled,
+)
 
 logger = getLogger(__name__)
 
@@ -108,6 +112,48 @@ def srun(cfg, raw_argv, local_run_callback):
     logger.debug(f"SLURM_STEP_GPUS: {os.environ.get('SLURM_STEP_GPUS', '')}")
     logger.debug(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
 
+    if multi_instance_enabled(cfg):
+        slurm_job_id = int(os.environ.get("SLURM_JOB_ID", "0"))
+        node_list = os.environ.get("SLURM_JOB_NODELIST", "")
+        hostnames_raw = run_capture(["scontrol", "show", "hostnames", node_list])
+        hostnames = hostnames_raw.splitlines()
+        if len(hostnames) != n_nodes:
+            raise ValueError(
+                f"Expected {n_nodes} Slurm hostnames, got {len(hostnames)}: {hostnames}"
+            )
+        node_rank = int(os.environ.get("SLURM_NODEID", "-1"))
+        if node_rank < 0:
+            node_rank = hostnames.index(socket.gethostname())
+
+        if cfg.coordinator.host is not None and cfg.coordinator.port is not None:
+            coordinator_host = cfg.coordinator.host
+            coordinator_port = int(cfg.coordinator.port)
+            logger.warning(
+                f"Skipping automatic coordinator host and port selection. "
+                f"Using the user setting of coordinator.host={coordinator_host} "
+                f"and coordiantor.port={coordinator_port}"
+            )
+        else:
+            coordinator_host = hostnames[0]
+            coordinator_port = (slurm_job_id % 10000) + 54000
+
+        instance_plans = build_instance_launch_plans(
+            cfg,
+            hostnames,
+            master_port_base=(slurm_job_id % 10000) + 52000,
+            rdvz_port_base=(slurm_job_id % 10000) + 53000,
+        )
+        launch_multi_instance_on_node(
+            cfg,
+            raw_argv,
+            local_run_callback,
+            instance_plans=instance_plans,
+            node_rank=node_rank,
+            coordinator_host=coordinator_host,
+            coordinator_port=coordinator_port,
+        )
+        return
+
     if n_nodes > 1:
         slurm_job_id = int(os.environ.get("SLURM_JOB_ID", "0"))
         node_list = os.environ.get("SLURM_JOB_NODELIST", "")
@@ -127,5 +173,15 @@ def srun(cfg, raw_argv, local_run_callback):
     rdvz_id = "chitu"
 
     local_run_callback(
-        cfg, raw_argv, master_addr, master_port, rdvz_port, rdvz_id, is_master_node
+        cfg,
+        raw_argv,
+        master_addr,
+        master_port,
+        rdvz_port,
+        rdvz_id,
+        is_multi_inst=False,
+        is_router=False,
+        is_master_node=is_master_node,
+        torchrun_n_nodes=n_nodes,
+        torchrun_nproc_per_node=n_gpus_per_node,
     )

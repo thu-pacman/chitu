@@ -71,6 +71,15 @@ PENDING_TOKENS_WEIGHT = 1 / NUM_ESTIMATED_TOKENS_PER_REQ  # 0.01
 
 # Router-side prefix scoring shares BlockIdentityChainBuilder with this logical name.
 ROUTER_BLOCK_IDENTITY_MANAGER_NAME = "router"
+TERMINATE_ENGINE_MESSAGE_TYPE = "terminate_engine"
+
+
+def is_terminate_engine_message(request_data: dict) -> bool:
+    return request_data.get("type") == TERMINATE_ENGINE_MESSAGE_TYPE
+
+
+def build_terminate_engine_message() -> dict:
+    return {"type": TERMINATE_ENGINE_MESSAGE_TYPE}
 
 
 class RoutePolicy:
@@ -434,6 +443,9 @@ class RequestRouter:
         if not is_classic_pd_disagg():
             logger.info(f"RequestRouter initialized for {self._n_insts} instance(s)")
         self.collector_addrs: dict[int, list[str]] = {}
+        self._shutdown = False
+        self._drain_complete: dict[int, bool] = {i: False for i in range(self._n_insts)}
+        self._tasks: list[asyncio.Task] = []
 
     @property
     def scheduler_addresses(self) -> list[str]:
@@ -445,12 +457,13 @@ class RequestRouter:
         await self._init_sockets()
 
         # Start background tasks
-        await asyncio.gather(
-            self._stats_collector_task(),
-            self._request_processor_task(),
-            # self._health_monitor_task(),
-            # self._heartbeat_monitor_task(),
-        )
+        self._tasks = [
+            asyncio.create_task(self._stats_collector_task()),
+            asyncio.create_task(self._request_processor_task()),
+            # asyncio.create_task(self._health_monitor_task()),
+            # asyncio.create_task(self._heartbeat_monitor_task()),
+        ]
+        await asyncio.gather(*self._tasks)
 
     async def _init_sockets(self):
         """Initialize ZMQ sockets for communication."""
@@ -470,6 +483,8 @@ class RequestRouter:
         # Create sockets to Enhanced Schedulers
         for i, address in enumerate(self._scheduler_addresses):
             socket = self.context.socket(zmq.PUSH)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.IMMEDIATE, 1)
             socket.connect(address)
             self.scheduler_sockets[i] = socket
             logger.info(
@@ -482,6 +497,7 @@ class RequestRouter:
 
         # Create socket for receiving stats
         self.stats_socket = self.context.socket(zmq.PULL)
+        self.stats_socket.setsockopt(zmq.LINGER, 0)
         # Bind the TCP server to a random port on the non-wildcard ip, then
         # register it in the coordinator.
         stats_ip = get_local_ip()
@@ -493,7 +509,7 @@ class RequestRouter:
 
     async def _stats_collector_task(self):
         """Collect statistics from Enhanced Schedulers."""
-        while True:
+        while not self._shutdown:
             try:
                 # Receive stats with timeout
                 if self.stats_socket and await self.stats_socket.poll(
@@ -522,6 +538,12 @@ class RequestRouter:
                         block_size=stats_dict.get("block_size", None),
                         evicted_blk_hashes=stats_dict.get("evicted_blk_hashes", []),
                     )
+
+                    # Termination acknowledgement from an instance.  The router
+                    # keeps receiving stats while /terminate_engine drains so it
+                    # can avoid shutting down token/request sockets too early.
+                    if stats_dict.get("terminated", False):
+                        self._drain_complete[local_instance_id] = True
 
                     self.policy.update_stats(stats)
                     prometheus_collector_addrs = stats_dict.get(
@@ -562,7 +584,7 @@ class RequestRouter:
         logger.info(f"[REQUEST_ROUTER] Request processor task started")
         request_counter = 0
 
-        while True:
+        while not self._shutdown:
             try:
                 if self.pending_requests:
                     request_counter += 1
@@ -721,6 +743,35 @@ class RequestRouter:
             )
             raise
 
+    async def _send_control_message(
+        self, socket, payload: bytes, label: str, timeout_s: float = 5.0
+    ) -> None:
+        start_time = time.time()
+        retry_s = 0.01
+        while True:
+            try:
+                await socket.send(payload, flags=zmq.DONTWAIT)
+                logger.info(f"[REQUEST_ROUTER] control message sent to {label}")
+                return
+            except zmq.Again:
+                if time.time() - start_time > timeout_s:
+                    logger.exception(
+                        f"[REQUEST_ROUTER] control message timed out for {label}"
+                    )
+                    return
+                await asyncio.sleep(retry_s)
+            except Exception:
+                logger.exception(f"[REQUEST_ROUTER] control message failed for {label}")
+                return
+
+    async def terminate_instances(self) -> None:
+        payload = msgpack.packb(build_terminate_engine_message())
+
+        for local_instance_id, socket in list(self.scheduler_sockets.items()):
+            await self._send_control_message(
+                socket, payload, f"instance:{local_instance_id}"
+            )
+
     async def add_request(self, request: UserRequest):
         """Add new request to processing queue."""
         self.pending_requests.append(request)
@@ -758,17 +809,42 @@ class RequestRouter:
             [addr for addr_list in self.collector_addrs.values() for addr in addr_list]
         )
 
+    async def wait_for_instances_terminated(self, timeout_s: float = 30.0) -> bool:
+        """Wait until all instances report termination through the stats channel."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if all(self._drain_complete.get(i, False) for i in range(self._n_insts)):
+                return True
+            await asyncio.sleep(0.05)
+
+        pending = [
+            i for i in range(self._n_insts) if not self._drain_complete.get(i, False)
+        ]
+        logger.warning(
+            f"[REQUEST_ROUTER] timed out waiting for instance termination: {pending}"
+        )
+        return False
+
     async def shutdown(self):
         """Gracefully shutdown the Request Router."""
         logger.info("Shutting down Request Router...")
+        self._shutdown = True
+
+        for task in self._tasks:
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        self._tasks.clear()
 
         # Close ZMQ sockets
         for socket in self.scheduler_sockets.values():
-            socket.close()
+            socket.close(0)
+        self.scheduler_sockets.clear()
         if self.stats_socket:
-            self.stats_socket.close()
+            self.stats_socket.close(0)
+            self.stats_socket = None
 
-        self.context.term()
+        self.context.destroy(linger=0)
         logger.info("Request Router shutdown complete")
 
 

@@ -586,8 +586,9 @@ def is_classic_pd_disagg() -> bool:
     return all(role in ("prefill", "decode") for role in roles)
 
 
-def get_global_args():
-    _ensure_var_is_initialized(_GLOBAL_ARGS, "global args")
+def get_global_args(need_ensure=True):
+    if need_ensure:
+        _ensure_var_is_initialized(_GLOBAL_ARGS, "global args")
     return _GLOBAL_ARGS
 
 

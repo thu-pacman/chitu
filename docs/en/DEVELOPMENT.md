@@ -365,19 +365,19 @@ To build a self-contained executable, please first prepare a Docker image or an 
 From an Apptainer image (`.sif` file):
 
 ```bash
-./boot/build.sh <your_apptainer_image.sif> -o <output_file>
+./boot/build.sh <your_apptainer_image.sif> -o <exe_file>
 ```
 
 From a Docker image (bundles the image inside):
 
 ```bash
-./boot/build.sh <your_docker_image:tag> -o <output_file>
+./boot/build.sh <your_docker_image:tag> -o <exe_file>
 ```
 
 From a Docker image without bundling the image inside (a smaller bundle; users will pull the image from an online resource at run time):
 
 ```bash
-./boot/build.sh <your_docker_image:tag> -o <output_file> --online
+./boot/build.sh <your_docker_image:tag> -o <exe_file> --online
 ```
 
 Options:
@@ -391,7 +391,7 @@ Options:
 The output is a self-contained AppImage executable, which can be run directly. All its arguments are defined in [Chitu CLI Arguments](CLI.md).
 
 ```bash
-./<output_file> [arguments]...
+./<exe_file> [arguments]...
 ```
 
 ## Running and Testing without Starting a Service
@@ -472,10 +472,16 @@ torchrun --nproc_per_node 2 test/single_req_test.py models=<model-name> models.c
 Example arguments for hybrid TP+PP:
 
 ```bash
-torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=8 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1
+torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=8 models=<model-name> models.ckpt_dir=<path/to/checkpoint>
 ```
 
-Please refer to [here](../../chitu/distributed/pd_disaggregation/README.md) for multi-instance deployment.
+Example of deploying 4 single-GPU instances using self-contained executable (see [Build for Self-Contained Executable Distribution](#build-for-self-contained-executable-distribution)):
+
+```bash
+./<exe_file> boot.remote_launcher=srun boot.n_nodes=1 boot.n_gpus_per_node=4 models=<model-name> models.ckpt_dir=<path/to/checkpoint> multi_inst.n_insts=4
+```
+
+Please refer to [here](../../chitu/distributed/pd_disaggregation/README.md) for further multi-instance designs.
 
 For PP, there are additional arguments for micro batching:
 
@@ -551,7 +557,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 **Example 1 (local Apptainer, single node):**
 
 ```bash
-./<output_file> boot.n_gpus_per_node=8 \
+./<exe_file> boot.n_gpus_per_node=8 \
     "boot.target=[test/single_req_test.py]" \
     "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
     models=Qwen3-235B-A22B \
@@ -562,7 +568,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 **Example 2 (srun + Apptainer, multi-node):**
 
 ```bash
-./<output_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+./<exe_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
     boot.remote_launcher=srun \
     "boot.target=[test/single_req_test.py]" \
     "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
@@ -574,7 +580,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 **Example 3 (srun + Docker, interactive with node 0):**
 
 ```bash
-./<output_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+./<exe_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
     boot.remote_launcher=srun \
     "boot.target=[test/single_req_test.py]" \
     "boot.interactive_node_0=True" \
@@ -587,7 +593,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 **Example 4 (mount chitu code into the container):**
 
 ```bash
-./<output_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+./<exe_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
     boot.remote_launcher=srun \
     "boot.target=[test/single_req_test.py]" \
     "boot.extra_apptainer_args=[-B,.:/workspace/chitu,-B,/path/to/models:/path/to/models,--env,PYTHONPATH=/workspace/chitu]" \
@@ -666,7 +672,7 @@ This is similar to the [Slurm usage](#use-self-contained-executable-recommended)
 Example:
 
 ```bash
-./<output_file> boot.n_nodes=2 \
+./<exe_file> boot.n_nodes=2 \
     "boot.ssh_node_list=[host1,host2]" \
     boot.n_gpus_per_node=8 \
     boot.remote_launcher=ssh \

@@ -158,12 +158,6 @@ srun $SRUN_PARTITION_ARG \
 
             ROUTER_PID=\$!
 
-            echo 'Waiting for Router...'
-            for i in \$(seq 1 120); do
-              if nc -z \"\$ROUTER_IP\" \$ROUTER_HTTP_PORT; then echo 'Router OK'; break; fi
-              sleep 1
-            done
-
             echo \"ROUTER_READY host=\$NODE_0_HOST ip=\$ROUTER_IP port=\$ROUTER_HTTP_PORT\" | tee \"\$LOG_DIR_INNER/router.ready\"
 
             echo '=== Node 0: Starting Prefill (TP2+PP4) ==='
@@ -186,11 +180,6 @@ srun $SRUN_PARTITION_ARG \
         elif [ \"\$SLURM_PROCID\" = \"1\" ] || [ \"\$SLURM_PROCID\" = \"2\" ]; then
             # === Node 1-2: Decode (DP16+EP16 across 2 nodes) ===
             export PD_MASTER_ADDR=\$ROUTER_IP
-            echo 'Waiting for Router...'
-            for i in \$(seq 1 120); do
-              if nc -z \"\$ROUTER_IP\" \$ROUTER_HTTP_PORT; then echo 'OK'; break; fi
-              sleep 1
-            done
 
             DECODE_NODE_RANK=\$((SLURM_PROCID - 1))
             export DECODE_NODE_RANK

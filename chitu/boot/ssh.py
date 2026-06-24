@@ -13,6 +13,11 @@ import threading
 from logging import getLogger
 
 from chitu.boot.appimage_utils import appimage
+from chitu.boot.multi_instance import (
+    build_instance_launch_plans,
+    launch_multi_instance_on_node,
+    multi_instance_enabled,
+)
 
 logger = getLogger(__name__)
 
@@ -160,6 +165,36 @@ def ssh(cfg, raw_argv, local_run_callback):
     node_rank = int(os.environ.get("CHITU_BOOT_NODE_RANK", "0"))
     is_master_node = node_rank == 0
 
+    if cfg.coordinator.host is not None and cfg.coordinator.port is not None:
+        coordinator_host = cfg.coordinator.host
+        coordinator_port = int(cfg.coordinator.port)
+        logger.warning(
+            f"Skipping automatic coordinator host and port selection. "
+            f"Using the user setting of coordinator.host={coordinator_host} "
+            f"and coordiantor.port={coordinator_port}"
+        )
+    else:
+        coordinator_host = master_addr
+        coordinator_port = 54000
+
+    if multi_instance_enabled(cfg):
+        instance_plans = build_instance_launch_plans(
+            cfg,
+            node_list,
+            master_port_base=52000,
+            rdvz_port_base=53000,
+        )
+        launch_multi_instance_on_node(
+            cfg,
+            raw_argv,
+            local_run_callback,
+            instance_plans=instance_plans,
+            node_rank=node_rank,
+            coordinator_host=coordinator_host,
+            coordinator_port=coordinator_port,
+        )
+        return
+
     if n_nodes > 1:
         # Currently we use fixed ports for the rendezvous across all nodes (FIXME).
         master_port = 52000
@@ -174,5 +209,15 @@ def ssh(cfg, raw_argv, local_run_callback):
     rdvz_id = "chitu"
 
     local_run_callback(
-        cfg, raw_argv, master_addr, master_port, rdvz_port, rdvz_id, is_master_node
+        cfg,
+        raw_argv,
+        master_addr,
+        master_port,
+        rdvz_port,
+        rdvz_id,
+        is_multi_inst=False,
+        is_router=False,
+        is_master_node=is_master_node,
+        torchrun_n_nodes=n_nodes,
+        torchrun_nproc_per_node=int(cfg.boot.n_gpus_per_node),
     )
