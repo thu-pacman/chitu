@@ -1033,6 +1033,7 @@ class Transformer(nn.Module):
                 # TODO: 与后面的chunk tp合并，消除可能的内存复制，否则prefetch会失效
                 state_dict = self.process_state_dict_for_repeat_kv_head(state_dict)
 
+            if self.tp_size > 1 or self.etp_size > 1:
                 state_dict = self._chunk_checkpoint_for_tensor_parallel(
                     state_dict,
                     self.tp_group.rank_in_group,
