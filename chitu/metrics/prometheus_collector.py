@@ -23,6 +23,9 @@ from chitu.boot.tcp_ip import get_local_ip, get_free_port
 from chitu.global_vars import get_global_args
 from chitu.metrics.cache_stats import kvcache_stats, get_prealloc_blocks
 from chitu.metrics.task_stats import count_tasks_for_dp_rank, count_tasks_non_dp
+from chitu.import_utils import try_import_opt_dep
+
+pynvml, has_pynvml = try_import_opt_dep("pynvml", "nvidia-ml-py")
 
 logger = logging.getLogger(__name__)
 
@@ -203,26 +206,7 @@ def inc_request_timeouts(stage: str, count: int = 1):
     chitu_request_timeouts_total.labels(stage=stage).inc(count)
 
 
-_pynvml = None
-_pynvml_failed = False
-
-
-def _import_pynvml():
-    global _pynvml, _pynvml_failed
-    if _pynvml_failed:
-        return None
-    if _pynvml is not None:
-        return _pynvml
-    try:
-        import pynvml  # type: ignore
-    except Exception:
-        _pynvml_failed = True
-        return None
-    _pynvml = pynvml
-    return _pynvml
-
-
-def _nvml_handle_for_device(pynvml, device_index: int):
+def _nvml_handle_for_device(device_index: int):
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cuda_visible_devices:
         device_tokens = [
@@ -240,14 +224,13 @@ def _nvml_handle_for_device(pynvml, device_index: int):
 
 
 def _get_nvml_memory_bytes(device_index: int, pid: int):
-    pynvml = _import_pynvml()
-    if pynvml is None:
+    if not has_pynvml:
         return None
     initialized = False
     try:
         pynvml.nvmlInit()
         initialized = True
-        handle = _nvml_handle_for_device(pynvml, device_index)
+        handle = _nvml_handle_for_device(device_index)
         mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
         total = int(mem_info.total)
         used = int(mem_info.used)
