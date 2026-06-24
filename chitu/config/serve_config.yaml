@@ -197,7 +197,7 @@ serve:
 #: - They can be omitted if `multi_inst.n_insts == 1`. If either `coordinator.host` or
 #:   `coordinator.port` is null, `coordinator` will reuse key-value store from `torchrun`, and
 #:   do not start a new key-value store.
-#: - They can be omitted when launching from the self-contained executable (`chitu.boot`).
+#: - They can be omitted when launching from chitu.run (via `chitu.boot` module).
 coordinator:
   #: IP for the coordinator.
   #:
@@ -540,6 +540,8 @@ multi_inst:
   #: This field should be set respectively for each instance.
   #:
   #: It should be null for the router.
+  #:
+  #: **This field can be omitted when launching from chitu.run (via `chitu.boot` module).**
   inst_id: 0
 
   #: Role of the current instance.
@@ -627,6 +629,8 @@ multi_inst:
   #: Configs for router
   router:
     #: Set this to True if the current process is a router.
+    #:
+    #: **This field can be omitted when launching from chitu.run (via `chitu.boot` module).**
     is_router: False
 
     #: When the router is ready, wait for this time untill the instances are ready.

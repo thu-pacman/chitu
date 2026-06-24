@@ -356,28 +356,30 @@ You can convert a Docker image to an Apptainer image. Apptainer is a good choice
 apptainer build <your_apptainer_image.sif> <your_docker_image>
 ```
 
-### Build for Self-Contained Executable Distribution
+### Build for chitu.run
 
-Even with a Docker or Apptainer image, you still need some complex commands or scripts to launch them with proper hardware-related settings, and to launch them distributedly to multiple GPUs on multiple nodes. In order to tackle this problem, Chitu further supports building a self-contained executable distribution, which can be run with a single command.
+Chitu.run is a self-contained executable distribution of Chitu.
 
-To build a self-contained executable, please first prepare a Docker image or an Apptainer image, and then run the following command:
+Even with a Docker or Apptainer image, you still need some complex commands or scripts to launch them with proper hardware-related settings, and to launch them distributedly to multiple GPUs on multiple nodes. In order to tackle this problem, Chitu further supports building chitu.run, which can be run with a single command.
+
+To build chitu.run, please first prepare a Docker image or an Apptainer image, and then run the following command:
 
 From an Apptainer image (`.sif` file):
 
 ```bash
-./boot/build.sh <your_apptainer_image.sif> -o <exe_file>
+./boot/build.sh <your_apptainer_image.sif> -o chitu.run
 ```
 
 From a Docker image (bundles the image inside):
 
 ```bash
-./boot/build.sh <your_docker_image:tag> -o <exe_file>
+./boot/build.sh <your_docker_image:tag> -o chitu.run
 ```
 
 From a Docker image without bundling the image inside (a smaller bundle; users will pull the image from an online resource at run time):
 
 ```bash
-./boot/build.sh <your_docker_image:tag> -o <exe_file> --online
+./boot/build.sh <your_docker_image:tag> -o chitu.run --online
 ```
 
 Options:
@@ -391,7 +393,7 @@ Options:
 The output is a self-contained AppImage executable, which can be run directly. All its arguments are defined in [Chitu CLI Arguments](CLI.md).
 
 ```bash
-./<exe_file> [arguments]...
+./chitu.run [arguments]...
 ```
 
 ## Running and Testing without Starting a Service
@@ -475,10 +477,10 @@ Example arguments for hybrid TP+PP:
 torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=8 models=<model-name> models.ckpt_dir=<path/to/checkpoint>
 ```
 
-Example of deploying 4 single-GPU instances using self-contained executable (see [Build for Self-Contained Executable Distribution](#build-for-self-contained-executable-distribution)):
+Example of deploying 4 single-GPU instances using chitu.run (see [Build for chitu.run](#build-for-chiturun)):
 
 ```bash
-./<exe_file> boot.remote_launcher=srun boot.n_nodes=1 boot.n_gpus_per_node=4 models=<model-name> models.ckpt_dir=<path/to/checkpoint> multi_inst.n_insts=4
+./chitu.run boot.remote_launcher=srun boot.n_nodes=1 boot.n_gpus_per_node=4 models=<model-name> models.ckpt_dir=<path/to/checkpoint> multi_inst.n_insts=4
 ```
 
 Please refer to [here](../../chitu/distributed/pd_disaggregation/README.md) for further multi-instance designs.
@@ -537,9 +539,9 @@ Example 2 (interactive with node 0):
 
 ### Multi-Node Parallelism with Slurm and Docker/Apptainer
 
-#### Use Self-Contained Executable (Recommended)
+#### Use chitu.run (Recommended)
 
-After building a self-contained executable (see [Build for Self-Contained Executable Distribution](#build-for-self-contained-executable-distribution)), you can launch it across multiple nodes with a single command. The executable bundles the container image (Docker or Apptainer) and uses `srun` to dispatch the job to all nodes.
+After building chitu.run (see [Build for chitu.run](#build-for-chiturun)), you can launch it across multiple nodes with a single command. The executable bundles the container image (Docker or Apptainer) and uses `srun` to dispatch the job to all nodes.
 
 All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant options for multi-node launching are under the `boot` section:
 
@@ -557,7 +559,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 **Example 1 (local Apptainer, single node):**
 
 ```bash
-./<exe_file> boot.n_gpus_per_node=8 \
+./chitu.run boot.n_gpus_per_node=8 \
     "boot.target=[test/single_req_test.py]" \
     "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
     models=Qwen3-235B-A22B \
@@ -568,7 +570,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 **Example 2 (srun + Apptainer, multi-node):**
 
 ```bash
-./<exe_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+./chitu.run boot.n_nodes=2 boot.n_gpus_per_node=8 \
     boot.remote_launcher=srun \
     "boot.target=[test/single_req_test.py]" \
     "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
@@ -580,7 +582,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 **Example 3 (srun + Docker, interactive with node 0):**
 
 ```bash
-./<exe_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+./chitu.run boot.n_nodes=2 boot.n_gpus_per_node=8 \
     boot.remote_launcher=srun \
     "boot.target=[test/single_req_test.py]" \
     "boot.interactive_node_0=True" \
@@ -593,7 +595,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 **Example 4 (mount chitu code into the container):**
 
 ```bash
-./<exe_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+./chitu.run boot.n_nodes=2 boot.n_gpus_per_node=8 \
     boot.remote_launcher=srun \
     "boot.target=[test/single_req_test.py]" \
     "boot.extra_apptainer_args=[-B,.:/workspace/chitu,-B,/path/to/models:/path/to/models,--env,PYTHONPATH=/workspace/chitu]" \
@@ -602,7 +604,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
     infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
 ```
 
-> Note: Whether Docker or Apptainer is used at run time depends on how the executable was built (see [Build for Self-Contained Executable Distribution](#build-for-self-contained-executable-distribution)). If a Docker image was bundled, `docker run` is used; otherwise `apptainer run` is used.
+> Note: Whether Docker or Apptainer is used at run time depends on how the executable was built (see [Build for chitu.run](#build-for-chiturun)). If a Docker image was bundled, `docker run` is used; otherwise `apptainer run` is used.
 
 #### Directly Invoke Slurm and Docker/Apptainer
 
@@ -665,14 +667,14 @@ Apptainer:
 
 Please first make sure you can connect to each host via SSH without a password.
 
-#### Use Self-Contained Executable (Recommended)
+#### Use chitu.run (Recommended)
 
-This is similar to the [Slurm usage](#use-self-contained-executable-recommended) above, except that you set `boot.remote_launcher=ssh` instead of `srun`, and provide the list of hosts via `boot.ssh_node_list` instead of relying on Slurm to allocate nodes. All other options remain the same.
+This is similar to the [Slurm usage](#use-chiturun-recommended) above, except that you set `boot.remote_launcher=ssh` instead of `srun`, and provide the list of hosts via `boot.ssh_node_list` instead of relying on Slurm to allocate nodes. All other options remain the same.
 
 Example:
 
 ```bash
-./<exe_file> boot.n_nodes=2 \
+./chitu.run boot.n_nodes=2 \
     "boot.ssh_node_list=[host1,host2]" \
     boot.n_gpus_per_node=8 \
     boot.remote_launcher=ssh \
