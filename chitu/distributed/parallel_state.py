@@ -9,6 +9,7 @@ import torch
 
 from chitu.distributed.comm_group import CommGroup
 from chitu.device_type import is_ascend
+from chitu.cp_utils import CPContext, NoOpCPContext, _set_cp_context, _reset_cp_context
 
 logger = getLogger(__name__)
 
@@ -16,6 +17,7 @@ _PARALLEL_GROUPS_INITIALIZED = False
 
 _WORLD_GROUP: Optional[CommGroup] = None
 _TP_GROUP: Optional[CommGroup] = None
+_CP_GROUP: Optional[CommGroup] = None
 _DP_GROUP: Optional[CommGroup] = None
 _ETP_GROUP: Optional[CommGroup] = None
 _EP_GROUP: Optional[CommGroup] = None
@@ -37,6 +39,10 @@ def get_world_group() -> CommGroup:
 
 def get_tp_group() -> CommGroup:
     return get_global_var("_TP_GROUP")
+
+
+def get_cp_group() -> CommGroup:
+    return get_global_var("_CP_GROUP")
 
 
 def get_dp_group() -> CommGroup:
@@ -65,6 +71,14 @@ def get_tp_size() -> int:
     if _TP_GROUP is None:
         return 1
     return _TP_GROUP.group_size
+
+
+def get_cp_size() -> int:
+    """return 1 if CP not initialized"""
+    global _CP_GROUP
+    if _CP_GROUP is None:
+        return 1
+    return _CP_GROUP.group_size
 
 
 def get_dp_size() -> int:
@@ -214,6 +228,21 @@ def initialize_tp_group(
     logger.info(f"tp group: {_TP_GROUP}")
 
 
+def initialize_cp_group(
+    rank: int,
+    *,
+    pcp_size: int,
+    world_size: int,
+):
+    global _CP_GROUP
+    assert _CP_GROUP is None
+    _CP_GROUP = CommGroup(
+        get_tp_rank_lists(tp_size=pcp_size, world_size=world_size),
+        rank,
+    )
+    logger.info(f"cp group: {_CP_GROUP}")
+
+
 def initialize_pp_group(
     rank: int,
     *,
@@ -348,19 +377,33 @@ def initialize_parallel_groups(
     etp_size: int = 1,
     ep_size: int = 1,
     pp_size: int,
+    pcp_size: int = 1,
     embed_tokens_lm_head_tp_size: int = 1,
 ):
     global _PARALLEL_GROUPS_INITIALIZED
     assert not _PARALLEL_GROUPS_INITIALIZED
 
     logger.info(
-        f"initialize_parallel_groups: {tp_size=}, {pp_size=}, {dp_size=} {ep_size=}"
+        f"initialize_parallel_groups: {tp_size=}, {pp_size=}, {dp_size=} {ep_size=} {pcp_size=}"
     )
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
     initialize_world_group(rank, world_size)
     initialize_tp_group(rank, tp_size=tp_size, world_size=world_size)
-    initialize_dp_group(rank, tp_size=tp_size, dp_size=dp_size, world_size=world_size)
+    initialize_cp_group(rank, pcp_size=pcp_size, world_size=world_size)
+
+    if pcp_size > 1:
+        # CP mode: CP replaces TP as the intra-node parallel dimension.
+        # CP group = contiguous ranks within same PP stage.
+        # DP group = each rank alone (dp_size=1). This ensures the executor
+        # dispatches ALL tokens to every CP rank (no batch-item splitting).
+        # For MoE CP→DP mapping, cp_group is passed separately (see Phase 3).
+        initialize_dp_group(rank, tp_size=1, dp_size=1, world_size=world_size)
+    else:
+        initialize_dp_group(
+            rank, tp_size=tp_size, dp_size=dp_size, world_size=world_size
+        )
+
     initialize_etp_group(rank, etp_size=etp_size, world_size=world_size)
     initialize_ep_group(rank, etp_size=etp_size, ep_size=ep_size, world_size=world_size)
     initialize_pp_group(rank, pp_size=pp_size, world_size=world_size)
@@ -373,13 +416,21 @@ def initialize_parallel_groups(
 
     _PARALLEL_GROUPS_INITIALIZED = True
 
+    # Initialize CPContext singleton after parallel groups are set up
+    if pcp_size > 1:
+        _set_cp_context(CPContext(pcp_size, _CP_GROUP))
+    else:
+        _set_cp_context(NoOpCPContext())
+
 
 def parallel_groups_initialized():
     return _PARALLEL_GROUPS_INITIALIZED
 
 
 def destroy_parallel_groups():
+    _reset_cp_context()
     get_tp_group().destroy()
+    get_cp_group().destroy()
     get_pp_group().destroy()
     get_world_group().destroy()
     get_dp_group().destroy()

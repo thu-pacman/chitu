@@ -398,6 +398,9 @@ def _convert_req_index_to_global_paged_index_kernel(
     ti_stride1,
     out_stride0,
     out_stride1,
+    # bounds for req_id guarding
+    num_requests,  # block_table.shape[0], used to guard req_id OOB
+    max_num_blocks_per_req_arg,  # block_table.shape[1], used to guard block_id OOB
 ):
     # program_id(0) -> token_id (row)
     # program_id(1) -> tile index along columns
@@ -409,6 +412,9 @@ def _convert_req_index_to_global_paged_index_kernel(
 
     # Load request id for this token (no mask: grid is exact)
     req = tl.load(req_id_ptr + token_id)
+
+    # Guard: if req_id is out of bounds for block_table, output -1 for entire row
+    is_invalid_req = (req < 0) | (req >= num_requests)
 
     # Load token indices for this tile
     ti_ptr = token_indices_ptr + token_id * ti_stride0 + indice_id * ti_stride1
@@ -422,15 +428,26 @@ def _convert_req_index_to_global_paged_index_kernel(
     block_id = tok // BLOCK_SIZE
     inblock_off = tok % BLOCK_SIZE
 
-    # Guard block_table access
-    max_num_blocks_per_req = tl.cdiv(upper, BLOCK_SIZE)
-    valid_block = (~is_invalid_tok) & (block_id < max_num_blocks_per_req)
-    bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
+    # Guard block_table access: block_id must be within the actual row length
+    valid_block = (
+        (~is_invalid_tok)
+        & (~is_invalid_req)
+        & (block_id < max_num_blocks_per_req_arg)
+        & (block_id >= 0)
+    )
+
+    # Safe pointer computation: even if req is invalid, we compute a clamped
+    # pointer to row 0 to avoid OOB. The load is masked by valid_block so the
+    # value is only used when valid.
+    safe_req = tl.where(is_invalid_req, 0, req)
+    bt_ptr = block_table_ptr + safe_req * bt_stride0 + block_id * bt_stride1
     base = tl.load(bt_ptr, mask=valid_block, other=0)
 
-    # If token == -1 OR block_id OOB, output -1; else base * BLOCK_SIZE + offset
+    # If token == -1 OR invalid req OR block_id OOB, output -1
     out_val = tl.where(
-        is_invalid_tok | (~valid_block), -1, base * BLOCK_SIZE + inblock_off
+        is_invalid_tok | is_invalid_req | (~valid_block),
+        -1,
+        base * BLOCK_SIZE + inblock_off,
     )
 
     # Store results
@@ -468,6 +485,9 @@ def convert_req_index_to_global_paged_index_triton(
     num_tokens = req_id.shape[0]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
 
+    num_requests = block_table.shape[0]
+    max_num_blocks_per_req = block_table.shape[1]
+
     # Ensure contiguous tensors on the same device
     req_id_c = req_id.contiguous()
     block_table_c = block_table.contiguous()
@@ -498,6 +518,9 @@ def convert_req_index_to_global_paged_index_triton(
         ti_stride1,
         out_stride0,
         out_stride1,
+        # bounds
+        num_requests,
+        max_num_blocks_per_req,
     )
     return out
 

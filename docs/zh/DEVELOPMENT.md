@@ -369,19 +369,19 @@ apptainer build <your_apptainer_image.sif> <your_docker_image>
 从 Apptainer 镜像（`.sif` 文件）构建：
 
 ```bash
-./boot/build.sh <your_apptainer_image.sif> -o <output_file>
+./boot/build.sh <your_apptainer_image.sif> -o <exe_file>
 ```
 
 从 Docker 镜像构建（将镜像打包到内部）：
 
 ```bash
-./boot/build.sh <your_docker_image:tag> -o <output_file>
+./boot/build.sh <your_docker_image:tag> -o <exe_file>
 ```
 
 从 Docker 镜像构建但不将镜像打包到内部（生成更小的包；用户将在运行时从在线资源拉取镜像）：
 
 ```bash
-./boot/build.sh <your_docker_image:tag> -o <output_file> --online
+./boot/build.sh <your_docker_image:tag> -o <exe_file> --online
 ```
 
 选项：
@@ -395,7 +395,7 @@ apptainer build <your_apptainer_image.sif> <your_docker_image>
 输出是一个自包含的 AppImage 可执行文件，可直接运行。其中所有的参数均在 [赤兔 CLI 参数](../en/CLI.md) 定义。
 
 ```bash
-./<output_file> [参数]...
+./<exe_file> [参数]...
 ```
 
 ## 运行和测试（非部署服务）
@@ -478,10 +478,16 @@ torchrun --nproc_per_node 2 test/single_req_test.py models=<model-name> models.c
 TP+PP 混合的样例参数：
 
 ```bash
-torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=8 models=DeepSeek-R1 models.ckpt_dir=/data/DeepSeek-R1
+torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 infer.pp_size=2 infer.tp_size=8 models=<model-name> models.ckpt_dir=<path/to/checkpoint>
 ```
 
-关于多实例部署，请参阅[此文档](../../chitu/distributed/pd_disaggregation/README.md)。
+利用自包含可执行文件（参见 [构建自包含可执行文件分发产物](#构建自包含可执行文件分发产物)）部署 4 个单卡实例样例参数：
+
+```bash
+./<exe_file> boot.remote_launcher=srun boot.n_nodes=1 boot.n_gpus_per_node=4 models=<model-name> models.ckpt_dir=<path/to/checkpoint> multi_inst.n_insts=4
+```
+
+关于多实例的更多设计，请参阅[此文档](../../chitu/distributed/pd_disaggregation/README.md)。
 
 对于 PP，还可以进一步控制 micro batch：
 
@@ -557,7 +563,7 @@ torchrun --nnodes 1 \
 **示例 1（本地 Apptainer，单节点）：**
 
 ```bash
-./<output_file> boot.n_gpus_per_node=8 \
+./<exe_file> boot.n_gpus_per_node=8 \
     "boot.target=[test/single_req_test.py]" \
     "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
     models=Qwen3-235B-A22B \
@@ -568,7 +574,7 @@ torchrun --nnodes 1 \
 **示例 2（srun + Apptainer，多节点）：**
 
 ```bash
-./<output_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+./<exe_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
     boot.remote_launcher=srun \
     "boot.target=[test/single_req_test.py]" \
     "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
@@ -580,7 +586,7 @@ torchrun --nnodes 1 \
 **示例 3（srun + Docker，与 node 0 交互）：**
 
 ```bash
-./<output_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+./<exe_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
     boot.remote_launcher=srun \
     "boot.target=[test/single_req_test.py]" \
     "boot.interactive_node_0=True" \
@@ -593,7 +599,7 @@ torchrun --nnodes 1 \
 **示例 4（将 chitu 代码挂载到容器中）：**
 
 ```bash
-./<output_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
+./<exe_file> boot.n_nodes=2 boot.n_gpus_per_node=8 \
     boot.remote_launcher=srun \
     "boot.target=[test/single_req_test.py]" \
     "boot.extra_apptainer_args=[-B,.:/workspace/chitu,-B,/path/to/models:/path/to/models,--env,PYTHONPATH=/workspace/chitu]" \
@@ -671,7 +677,7 @@ Apptainer:
 示例：
 
 ```bash
-./<output_file> boot.n_nodes=2 \
+./<exe_file> boot.n_nodes=2 \
     "boot.ssh_node_list=[host1,host2]" \
     boot.n_gpus_per_node=8 \
     boot.remote_launcher=ssh \

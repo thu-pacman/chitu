@@ -48,7 +48,7 @@ usage() {
      --decode  "tp=1,pp=1,dp=16,ep=16,max_seq_len=6144,max_batch_size=512,full_warmup=True"
      --prefill-default "tp=4,pp=2,..."    (批量设置 prefill 默认值)
      --decode-default  "tp=1,pp=1,..."    (批量设置 decode 默认值)
-      实例 key: tp, pp, dp, ep, max_seq_len, max_batch_size, max_new_tokens,
+      实例 key: tp, pcp, pp, dp, ep, max_seq_len, max_batch_size, max_new_tokens,
                 chunk(仅prefill), full_warmup, nnodes, nproc, master_port
       含 . 的 key 写入该实例的 multi_inst.inst_overrides，如 infer.memory_utilization=0.90
 
@@ -114,13 +114,13 @@ PREFILL_MASTER_BASE_PORT="${PREFILL_MASTER_BASE_PORT:-29510}"
 DECODE_MASTER_BASE_PORT="${DECODE_MASTER_BASE_PORT:-29520}"
 
 # 实例默认值
-PREFILL_DEFAULT_TP=4;  PREFILL_DEFAULT_PP=2;  PREFILL_DEFAULT_DP=1;  PREFILL_DEFAULT_EP=1
+PREFILL_DEFAULT_TP=4;  PREFILL_DEFAULT_PCP=1;  PREFILL_DEFAULT_PP=2;  PREFILL_DEFAULT_DP=1;  PREFILL_DEFAULT_EP=1
 PREFILL_DEFAULT_MAX_SEQ_LEN=4096
 PREFILL_DEFAULT_MAX_REQS=null
 PREFILL_DEFAULT_MAX_BATCH_SIZE=64
 PREFILL_DEFAULT_MAX_NEW_TOKENS=4096
 PREFILL_DEFAULT_FULL_WARMUP=""
-DECODE_DEFAULT_TP=1;   DECODE_DEFAULT_PP=1;   DECODE_DEFAULT_DP=16;  DECODE_DEFAULT_EP=16
+DECODE_DEFAULT_TP=1;   DECODE_DEFAULT_PCP=1;   DECODE_DEFAULT_PP=1;   DECODE_DEFAULT_DP=16;  DECODE_DEFAULT_EP=16
 DECODE_DEFAULT_MAX_SEQ_LEN=4096
 DECODE_DEFAULT_MAX_REQS=null
 DECODE_DEFAULT_MAX_BATCH_SIZE=64
@@ -189,7 +189,7 @@ apply_default_spec() {
     [ -n "${_kv}" ] || continue
     local key="${_kv%%=*}" val="${_kv#*=}"
     case "${key}" in
-      tp|pp|dp|ep|max_seq_len|max_batch_size|max_reqs|max_new_tokens)
+      tp|pcp|pp|dp|ep|max_seq_len|max_batch_size|max_reqs|max_new_tokens)
         printf -v "${KIND}_DEFAULT_${key^^}" '%s' "${val}";;
       full_warmup|warmup)
         printf -v "${KIND}_DEFAULT_FULL_WARMUP" '%s' "${val}";;
@@ -276,6 +276,7 @@ parse_instance_spec() {
 
   # 读取默认值（间接展开，安全无 eval）
   local _v="${KIND}_DEFAULT_TP";           local tp="${!_v}"
+  _v="${KIND}_DEFAULT_PCP";                local pcp="${!_v}"
   _v="${KIND}_DEFAULT_PP";                 local pp="${!_v}"
   _v="${KIND}_DEFAULT_DP";                 local dp="${!_v}"
   _v="${KIND}_DEFAULT_EP";                 local ep="${!_v}"
@@ -292,7 +293,7 @@ parse_instance_spec() {
     [ -n "${_kv}" ] || continue
     case "${_kv}" in
       nnodes=*|nodes=*)           nnodes="${_kv#*=}";;
-      tp=*) tp="${_kv#*=}";; pp=*) pp="${_kv#*=}";; dp=*) dp="${_kv#*=}";; ep=*) ep="${_kv#*=}";;
+      tp=*) tp="${_kv#*=}";; pcp=*) pcp="${_kv#*=}";; pp=*) pp="${_kv#*=}";; dp=*) dp="${_kv#*=}";; ep=*) ep="${_kv#*=}";;
       max_seq_len=*)              max_seq_len="${_kv#*=}";;
       max_reqs=*)                 max_reqs="${_kv#*=}"; max_reqs_explicit=1;;
       max_batch_size=*)           max_batch_size="${_kv#*=}"; max_batch_size_explicit=1;;
@@ -322,17 +323,21 @@ parse_instance_spec() {
   # 自动端口
   _v="${KIND}_MASTER_BASE_PORT"; [ -n "${master_port}" ] || master_port=$(( ${!_v} + PD_JOB_PORT_OFFSET + idx ))
 
-  # 推导 nnodes / nproc
-  local world=$((tp * pp * dp))
+  if [ "${pcp}" -gt 1 ] && [ "${dp}" -ne 1 ]; then
+    die "${kind} ${idx}: pcp=${pcp} with dp=${dp} is not supported yet"
+  fi
+
+  # 推导 nnodes / nproc. Dense runtime topology is TP * PCP * DP * PP.
+  local world=$((tp * pcp * pp * dp))
   read -r nnodes nproc < <(infer_nnodes_and_nproc "${kind} ${idx}" "${world}" "${nnodes}" "${nproc}" "${PD_GPUS_PER_NODE}")
 
   # 写入数组（nameref，安全无 eval）
-  local -n _o_nn="${KIND}_NNODES"      _o_tp="${KIND}_TP"       _o_pp="${KIND}_PP"
+  local -n _o_nn="${KIND}_NNODES"      _o_tp="${KIND}_TP"       _o_pcp="${KIND}_PCP"      _o_pp="${KIND}_PP"
   local -n _o_dp="${KIND}_DP"          _o_ep="${KIND}_EP"
   local -n _o_msl="${KIND}_MAX_SEQ_LEN"   _o_mr="${KIND}_MAX_REQS" _o_mbs="${KIND}_MAX_BATCH_SIZE"  _o_mnt="${KIND}_MAX_NEW_TOKENS"
   local -n _o_mpt="${KIND}_MASTER_PORT"
   local -n _o_np="${KIND}_NPROC_PER_NODE" _o_ov="${KIND}_OVERRIDES_SPEC"
-  _o_nn[idx]="${nnodes}";  _o_tp[idx]="${tp}";  _o_pp[idx]="${pp}"
+  _o_nn[idx]="${nnodes}";  _o_tp[idx]="${tp}";  _o_pcp[idx]="${pcp}";  _o_pp[idx]="${pp}"
   _o_dp[idx]="${dp}";      _o_ep[idx]="${ep}"
   _o_msl[idx]="${max_seq_len}"
   _o_mr[idx]="${max_reqs}"
@@ -343,7 +348,7 @@ parse_instance_spec() {
 }
 
 reset_instance_arrays() {
-  for _a in NNODES TP PP DP EP MAX_SEQ_LEN MAX_REQS MAX_BATCH_SIZE MAX_NEW_TOKENS MASTER_PORT NPROC_PER_NODE DEVICE_IDS OVERRIDES_SPEC; do
+  for _a in NNODES TP PCP PP DP EP MAX_SEQ_LEN MAX_REQS MAX_BATCH_SIZE MAX_NEW_TOKENS MASTER_PORT NPROC_PER_NODE DEVICE_IDS OVERRIDES_SPEC; do
     eval "PREFILL_${_a}=(); DECODE_${_a}=()"
   done
   PREFILL_START_NODE=(); DECODE_START_NODE=()
@@ -511,6 +516,7 @@ pd_node_main() {
       "+multi_inst.inst_overrides.${_inst_id}.infer.max_batch_size=${PREFILL_MAX_BATCH_SIZE[i]}"
       "+multi_inst.inst_overrides.${_inst_id}.request.max_new_tokens=${PREFILL_MAX_NEW_TOKENS[i]}"
       "+multi_inst.inst_overrides.${_inst_id}.infer.tp_size=${PREFILL_TP[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.pcp_size=${PREFILL_PCP[i]}"
       "+multi_inst.inst_overrides.${_inst_id}.infer.pp_size=${PREFILL_PP[i]}"
       "+multi_inst.inst_overrides.${_inst_id}.infer.dp_size=${PREFILL_DP[i]}"
       "+multi_inst.inst_overrides.${_inst_id}.infer.ep_size=${PREFILL_EP[i]}"
@@ -528,6 +534,7 @@ pd_node_main() {
       "+multi_inst.inst_overrides.${_inst_id}.infer.max_batch_size=${DECODE_MAX_BATCH_SIZE[i]}"
       "+multi_inst.inst_overrides.${_inst_id}.request.max_new_tokens=${DECODE_MAX_NEW_TOKENS[i]}"
       "+multi_inst.inst_overrides.${_inst_id}.infer.tp_size=${DECODE_TP[i]}"
+      "+multi_inst.inst_overrides.${_inst_id}.infer.pcp_size=${DECODE_PCP[i]}"
       "+multi_inst.inst_overrides.${_inst_id}.infer.pp_size=${DECODE_PP[i]}"
       "+multi_inst.inst_overrides.${_inst_id}.infer.dp_size=${DECODE_DP[i]}"
       "+multi_inst.inst_overrides.${_inst_id}.infer.ep_size=${DECODE_EP[i]}"
@@ -565,12 +572,6 @@ pd_node_main() {
       > "${LOG_DIR_INNER}/router.${MODEL_NAME_TAG}.log" 2>&1 &
     ROUTER_PID=$!
   fi
-
-  echo "Waiting for Router..."
-  for _ in $(seq 1 120); do
-    nc -z "${ROUTER_IP}" "${PD_ROUTER_PORT}" >/dev/null 2>&1 && { echo "Router OK"; break; }
-    sleep 1
-  done
 
   # ── 确定本节点运行哪些实例 ──
   detect_local_instances() {
@@ -770,10 +771,10 @@ echo "model=${MODEL_CONFIG}  ckpt=${MODEL_CKPT_DIR}  sif=${PD_SIF_FILE}"
 echo "model: float16=${MODEL_FLOAT16_VARIANT} cuda_graph=${MODEL_USE_CUDA_GRAPH} schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
 echo "instances: prefill=${PREFILL_COUNT} decode=${DECODE_COUNT}"
 for i in "${!PREFILL_NNODES[@]}"; do
-  echo "  P${i}: nn=${PREFILL_NNODES[i]} tp=${PREFILL_TP[i]} pp=${PREFILL_PP[i]} dp=${PREFILL_DP[i]} ep=${PREFILL_EP[i]} max_seq_len=${PREFILL_MAX_SEQ_LEN[i]} max_reqs=${PREFILL_MAX_REQS[i]} max_batch_size=${PREFILL_MAX_BATCH_SIZE[i]}"
+  echo "  P${i}: nn=${PREFILL_NNODES[i]} tp=${PREFILL_TP[i]} pcp=${PREFILL_PCP[i]} pp=${PREFILL_PP[i]} dp=${PREFILL_DP[i]} ep=${PREFILL_EP[i]} max_seq_len=${PREFILL_MAX_SEQ_LEN[i]} max_reqs=${PREFILL_MAX_REQS[i]} max_batch_size=${PREFILL_MAX_BATCH_SIZE[i]}"
 done
 for i in "${!DECODE_NNODES[@]}"; do
-  echo "  D${i}: nn=${DECODE_NNODES[i]} tp=${DECODE_TP[i]} pp=${DECODE_PP[i]} dp=${DECODE_DP[i]} ep=${DECODE_EP[i]} max_seq_len=${DECODE_MAX_SEQ_LEN[i]} max_reqs=${DECODE_MAX_REQS[i]} max_batch_size=${DECODE_MAX_BATCH_SIZE[i]}"
+  echo "  D${i}: nn=${DECODE_NNODES[i]} tp=${DECODE_TP[i]} pcp=${DECODE_PCP[i]} pp=${DECODE_PP[i]} dp=${DECODE_DP[i]} ep=${DECODE_EP[i]} max_seq_len=${DECODE_MAX_SEQ_LEN[i]} max_reqs=${DECODE_MAX_REQS[i]} max_batch_size=${DECODE_MAX_BATCH_SIZE[i]}"
 done
 [ -n "${PD_EXCLUDE}" ] && echo "exclude=${PD_EXCLUDE}"
 echo "bind_code=${PD_APPTAINER_BIND_CODE}  log=${LOG_DIR}"

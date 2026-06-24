@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+from typing import Optional
+
 from chitu.ops import (
     blockfp8_index_score_ragged_q_dense_k_dsv32,
     blockfp8_index_score_ragged_q_paged_k_dsv32,
@@ -127,21 +129,34 @@ class DSAIndexer:
         k_s: torch.Tensor,  # [s_k, n=1, d/block_size=1], fp32
         seq_len_delta: BatchedSeqLenDelta,
         causal: bool,
+        ks: Optional[torch.Tensor] = None,
+        ke_override: Optional[torch.Tensor] = None,
     ):
         """
-        Indexer score by deep_gemm.fp8_mqa_logits() for ragged_qk in prefill stage
+        Indexer score by deep_gemm.fp8_mqa_logits() for ragged_qk in prefill stage.
+
+        In CP mode, ks and ke_override are provided with LOCAL sizes matching q,
+        so that deep_gemm.fp8_mqa_logits receives per-query ks/ke aligned with the
+        local query count (n_local), not the global token count (pcp_size * n_local).
         """
         weights = weights.view(q.shape[0], q.shape[1])  # [s_q, h=64]
         k = k.view(k.shape[0], -1)  # [s_k, h=1, d=128]
         k_s = k_s.reshape(k.shape[0])  # [s_k,]
 
-        ks = seq_len_delta.new.prefix_lens_tensor_device[
-            seq_len_delta.delta_seq_ids_tensor_device
-        ].contiguous()
-        if causal:
-            ke = seq_len_delta.delta_position_ids_tensor_device + ks + 1
+        # CP mode: use caller-provided local ks and ke (local_lengths)
+        # to keep deep_gemm.fp8_mqa_logits ks/ke aligned with local q.
+        if ks is not None and ke_override is not None:
+            # ke_override = delta_position_ids[local] + 1
+            # Full ke for deep_gemm = ke_override + ks (delta_pos + 1 + prefix_len)
+            ke = ke_override + ks
         else:
-            ke = seq_len_delta.new.lens_tensor_device + ks
+            ks = seq_len_delta.new.prefix_lens_tensor_device[
+                seq_len_delta.delta_seq_ids_tensor_device
+            ].contiguous()
+            if causal:
+                ke = seq_len_delta.delta_position_ids_tensor_device + ks + 1
+            else:
+                ke = seq_len_delta.new.lens_tensor_device + ks
 
         # TODO: chunk to avoid OOM
         index_score = deep_gemm.fp8_mqa_logits(
@@ -163,27 +178,37 @@ class DSAIndexer:
         k: torch.Tensor,  # [s_k, d=128] or [s_k, 1, d=128], bf16
         seq_len_delta: BatchedSeqLenDelta,
         causal: bool,
+        ke: Optional[torch.Tensor] = None,  # [s_q], int32, pre-computed ke for CP
     ):
         """
         Indexer score by Hygon lightop.op.mqa_logits() for ragged qk in prefill stage.
+
+        In CP mode, `ke` should be pre-computed from local_lengths (correct global
+        positions of local Q tokens). When provided, `ks` is set to all zeros
+        (single-batch prefix), and the seq_len_delta computation is bypassed.
         """
         s_q, h, _ = q.shape
         assert k.dim() == 2
 
         weights = weights.reshape(s_q, h)
 
-        ks = seq_len_delta.new.prefix_lens_tensor_device[
-            seq_len_delta.delta_seq_ids_tensor_device
-        ]
-        if causal:
-            ke = seq_len_delta.delta_position_ids_tensor_device + ks + 1
+        if ke is not None:
+            # CP path: use pre-computed ke with zero prefix
+            ks = torch.zeros(s_q, dtype=torch.int32, device=q.device)
         else:
-            ke = (
-                seq_len_delta.new.lens_tensor_device[
-                    seq_len_delta.delta_seq_ids_tensor_device
-                ]
-                + ks
-            )
+            # Standard path: compute from seq_len_delta
+            ks = seq_len_delta.new.prefix_lens_tensor_device[
+                seq_len_delta.delta_seq_ids_tensor_device
+            ]
+            if causal:
+                ke = seq_len_delta.delta_position_ids_tensor_device + ks + 1
+            else:
+                ke = (
+                    seq_len_delta.new.lens_tensor_device[
+                        seq_len_delta.delta_seq_ids_tensor_device
+                    ]
+                    + ks
+                )
 
         index_score = lightop.op.mqa_logits(
             q,
@@ -297,6 +322,9 @@ class DSAIndexer:
         seq_len_delta: BatchedSeqLenDelta,
         cache_accessor: KVCacheAccessor,
         is_causal=True,
+        ke: Optional[torch.Tensor] = None,
+        k_append: Optional[torch.Tensor] = None,
+        ks: Optional[torch.Tensor] = None,
     ):
         # save to paged kv cache
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
@@ -339,6 +367,8 @@ class DSAIndexer:
                 k_s,
                 seq_len_delta,
                 is_causal,
+                ks=ks,
+                ke_override=ke,
             )
 
         return index_score
@@ -421,12 +451,20 @@ class DSAIndexer:
         seq_len_delta: BatchedSeqLenDelta,
         cache_accessor: KVCacheAccessor,
         is_causal=True,
+        ke: Optional[torch.Tensor] = None,
+        k_append: Optional[torch.Tensor] = None,
     ):
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
+        # CP: k is allgathered global K (n_local*pcp_size tokens), k_append is local K (n_local tokens).
+        # When k's size doesn't match delta_position_ids (warmup/decode with few tokens),
+        # fall back to k_append which has the matching size.
+        k_size = k.shape[0]
+        pos_size = seq_len_delta.delta_position_ids_tensor_device.shape[0]
+        append_k = k_append if (k_append is not None and k_size != pos_size) else k
         append_to_paged_kv_cache(
             cache_accessor.kv["indexer_k"],
             cache_accessor.block_table,
-            k,
+            append_k,
             seq_len_delta.delta_position_ids_tensor_device,
             seq_len_delta.delta_seq_ids_tensor_device,
             get_page_ids=cache_accessor.get_page_ids,
@@ -456,6 +494,7 @@ class DSAIndexer:
                 k,
                 seq_len_delta,
                 is_causal,
+                ke=ke,
             )
 
         return index_score
@@ -471,6 +510,9 @@ class DSAIndexer:
         is_causal,
         index_topk=2048,
         return_indices=True,
+        ke: Optional[torch.Tensor] = None,
+        k_append: Optional[torch.Tensor] = None,
+        ks: Optional[torch.Tensor] = None,
     ):
         if q_fp8.numel() == 0:
             return torch.randn(0, self.static_max_n)
@@ -484,6 +526,9 @@ class DSAIndexer:
                 seq_len_delta,
                 cache_accessor,
                 is_causal,
+                ke=ke,
+                k_append=k_append,
+                ks=ks,
             )
         elif self.impl == "hygon":
             logits = self.bf16_index_score_dsa_hygon(
@@ -493,6 +538,8 @@ class DSAIndexer:
                 seq_len_delta,
                 cache_accessor,
                 is_causal,
+                ke=ke,
+                k_append=k_append,
             )
         else:  # triton and torch impl share a same kv layout
             logits = self.blockfp8_index_score_dsa_triton(
@@ -511,8 +558,11 @@ class DSAIndexer:
         ### get topk_indices
         # Ensure k does not exceed the actual size of index_score
         k = min(index_topk, logits.size(-1))
-        indices = topk_indices(
-            logits, k, lengths=seq_len_delta.delta_position_ids_tensor_device + 1
+        lengths = (
+            ke
+            if ke is not None
+            else (seq_len_delta.delta_position_ids_tensor_device + 1)
         )
+        indices = topk_indices(logits, k, lengths=lengths)
         # shape: [bs_seq_q, k]. May select some out-of-range items as -inf, which is fine
         return indices

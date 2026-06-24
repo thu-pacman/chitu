@@ -11,6 +11,7 @@ from typing_extensions import override
 
 import einops
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -22,6 +23,7 @@ from chitu.kv_cache import (
     KVCacheAccessor,
     PagedKVCacheAccessor,
 )
+from chitu.cp_utils import get_cp_context
 from chitu.global_vars import get_global_args
 from chitu.models.model import (
     Attention,
@@ -74,7 +76,11 @@ from chitu.tensor_parallel import (
     VocabParallelEmbedding,
     LmHeadColumnParallelLinear,
 )
-from chitu.distributed.parallel_state import get_tp_size, get_etp_size, get_dp_size
+from chitu.distributed.parallel_state import (
+    get_tp_size,
+    get_etp_size,
+    get_dp_size,
+)
 from chitu.distributed.partition import compute_expert_dist_in_ep
 from chitu.utils import ceil_div, parse_dtype, try_import_and_setup_torch_npu
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
@@ -148,26 +154,59 @@ class Indexer(torch.nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         freqs_cis: BatchedFreqsCis,
+        freqs_cis_k: Optional[BatchedFreqsCis] = None,
+        k_pre_normed: bool = False,
     ):
+        """Build indexer Q and K with optional separate RoPE for CP mode.
+
+        Args:
+            freqs_cis: RoPE for unified Q/K (non-CP), or for Q only (CP, when freqs_cis_k is set).
+            freqs_cis_k: When not None, apply separate RoPE to K (CP mode with global K positions).
+            k_pre_normed: When True, skip k_norm (K already normalized on global K).
+        """
         assert x.ndim == 2
         q = einops.rearrange(q, "s (h d) -> s h d", d=self.head_dim)
-        k = self.k_norm(k)
-        q, k, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
-            q,
-            k,
-            freqs_cis,
-            q_rotary_end=self.rope_head_dim,
-            k_rotary_end=self.rope_head_dim,
-            rotary_type=self.index_rope_layout,
-        )
+        if not k_pre_normed:
+            k = self.k_norm(k)
 
-        q = self._rotate_activation(q)
-        k = self._rotate_activation(k)
+        if freqs_cis_k is not None:
+            # CP mode: separate RoPE for Q (local) and K (global)
+            q_rot, _, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
+                q,
+                q,
+                freqs_cis,
+                q_rotary_end=self.rope_head_dim,
+                k_rotary_end=self.rope_head_dim,
+                rotary_type=self.index_rope_layout,
+            )
+            _, k_rot, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
+                k,
+                k,
+                freqs_cis_k,
+                q_rotary_end=self.rope_head_dim,
+                k_rotary_end=self.rope_head_dim,
+                rotary_type=self.index_rope_layout,
+            )
+        else:
+            # Non-CP mode: unified RoPE for Q and K
+            q, k, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
+                q,
+                k,
+                freqs_cis,
+                q_rotary_end=self.rope_head_dim,
+                k_rotary_end=self.rope_head_dim,
+                rotary_type=self.index_rope_layout,
+            )
+            q_rot = q
+            k_rot = k
+
+        q_rot = self._rotate_activation(q_rot)
+        k_rot = self._rotate_activation(k_rot)
         if self.indexer_impl.impl == "hygon":
-            return (q, None), (k, None)
-        return blockfp8_act_quant(q, block_size=self.block_size), blockfp8_act_quant(
-            k, block_size=self.block_size
-        )
+            return (q_rot, None), (k_rot, None)
+        return blockfp8_act_quant(
+            q_rot, block_size=self.block_size
+        ), blockfp8_act_quant(k_rot, block_size=self.block_size)
 
     def _build_index_score(
         self,
@@ -178,8 +217,30 @@ class Indexer(torch.nn.Module):
         freqs_cis: BatchedFreqsCis,
         is_causal: bool,
         cache_accessor: KVCacheAccessor,
+        freqs_cis_k: Optional[BatchedFreqsCis] = None,
+        k_pre_normed: bool = False,
     ) -> torch.Tensor:
-        q_pack, k_pack = self._build_index_qk(x, q, k, freqs_cis)
+        """Build index score. In CP mode, uses get_cp_context() for CP-specific params."""
+        cp_ctx = get_cp_context()
+        # Only apply CP logic when freqs_cis_k is provided (CP indexer path).
+        # In non-CP path, override to pcp_size=1 so k_append etc. stay None.
+        if freqs_cis_k is not None:
+            pcp_size = cp_ctx.pcp_size
+            cp_rank = cp_ctx.cp_rank
+            local_lengths = cp_ctx.local_lengths
+        else:
+            pcp_size = 1
+            cp_rank = 0
+            local_lengths = None
+
+        q_pack, k_pack = self._build_index_qk(
+            x,
+            q,
+            k,
+            freqs_cis,
+            freqs_cis_k,
+            k_pre_normed=k_pre_normed,
+        )
         q_indexer, q_scale = q_pack
         k_indexer, k_scale = k_pack
         weights = self.weights_proj(x) * self.n_heads**-0.5
@@ -187,6 +248,36 @@ class Indexer(torch.nn.Module):
             weights = (weights * self.softmax_scale).to(torch.float32).contiguous()
         else:
             weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+
+        # CP-specific: extract k_append and local_ks
+        k_append = k_indexer[cp_rank::pcp_size] if pcp_size > 1 else None
+        local_ks = None
+        if (
+            pcp_size > 1
+            and local_lengths is not None
+            and not seq_len_delta.is_decode_stage
+        ):
+            seq_ids = seq_len_delta.delta_seq_ids_tensor_device
+            total_tokens = seq_len_delta.delta_position_ids_tensor_device.shape[0]
+            local_len_idx = torch.arange(
+                cp_rank,
+                total_tokens,
+                pcp_size,
+                device=seq_ids.device,
+                dtype=torch.long,
+            )
+            local_seq_ids = torch.index_select(seq_ids, 0, local_len_idx)
+            local_ks = seq_len_delta.new.prefix_lens_tensor_device[
+                local_seq_ids
+            ].contiguous()
+            if local_ks.shape[0] < local_lengths.shape[0]:
+                pad_ks = torch.zeros(
+                    local_lengths.shape[0] - local_ks.shape[0],
+                    dtype=local_ks.dtype,
+                    device=local_ks.device,
+                )
+                local_ks = torch.cat([local_ks, pad_ks])
+
         return self.indexer_impl.dsa_indexer(
             q_indexer,
             k_indexer,
@@ -197,6 +288,9 @@ class Indexer(torch.nn.Module):
             is_causal,
             self.index_topk,
             return_indices=False,
+            ke=local_lengths,
+            k_append=k_append,
+            ks=local_ks,
         )
 
     def build_decode_topk_page_table(
@@ -209,9 +303,23 @@ class Indexer(torch.nn.Module):
         is_causal: bool,
         cache_accessor: KVCacheAccessor,
         source_page_table: torch.Tensor,
+        freqs_cis_k: Optional[BatchedFreqsCis] = None,
+        k_pre_normed: bool = False,
     ) -> torch.Tensor:
+        """Build decode topk page table with optional CP support.
+
+        When freqs_cis_k is not None, uses separate Q/K RoPE (CP mode).
+        """
         index_score = self._build_index_score(
-            x, q, k, seq_len_delta, freqs_cis, is_causal, cache_accessor
+            x,
+            q,
+            k,
+            seq_len_delta,
+            freqs_cis,
+            is_causal,
+            cache_accessor,
+            freqs_cis_k=freqs_cis_k,
+            k_pre_normed=k_pre_normed,
         )
         lengths = seq_len_delta.delta_position_ids_tensor_device + 1
         return topk_page_table_decode_cuda(index_score, lengths, source_page_table)
@@ -225,12 +333,32 @@ class Indexer(torch.nn.Module):
         freqs_cis: BatchedFreqsCis,
         is_causal: bool,
         cache_accessor: KVCacheAccessor,
+        freqs_cis_k: Optional[BatchedFreqsCis] = None,
+        k_pre_normed: bool = False,
     ):
         index_score = self._build_index_score(
-            x, q, k, seq_len_delta, freqs_cis, is_causal, cache_accessor
+            x,
+            q,
+            k,
+            seq_len_delta,
+            freqs_cis,
+            is_causal,
+            cache_accessor,
+            freqs_cis_k=freqs_cis_k,
+            k_pre_normed=k_pre_normed,
         )
         topk = min(self.index_topk, index_score.size(-1))
-        lengths = seq_len_delta.delta_position_ids_tensor_device + 1
+        # Use cached local_lengths only in CP path (freqs_cis_k is not None).
+        # In non-CP path, always use seq_len_delta.
+        if freqs_cis_k is not None:
+            cp_ctx = get_cp_context()
+            lengths = (
+                cp_ctx.local_lengths
+                if cp_ctx.local_lengths is not None
+                else (seq_len_delta.delta_position_ids_tensor_device + 1)
+            )
+        else:
+            lengths = seq_len_delta.delta_position_ids_tensor_device + 1
         return topk_indices(index_score, topk, lengths=lengths)
 
     def _rotate_activation(self, x: torch.Tensor) -> torch.Tensor:
@@ -257,6 +385,9 @@ class AttentionDeepSeekV3(Attention):
         self.op_impl = op_impl
         self.mla_absorb = mla_absorb
         self.indexer_cache = indexer_cache
+        # Set dynamically by ModelDeepSeekV3 after construction for CP mode
+        self._freqs_cis_real: torch.Tensor | None = None
+        self._freqs_cis_imag: torch.Tensor | None = None
         quant = get_quant_from_checkpoint_prefix(
             checkpoint_prefix, args.quant_config.rules
         )
@@ -304,6 +435,7 @@ class AttentionDeepSeekV3(Attention):
         self.dim = args.dim
         self.n_heads = args.n_heads
         self.n_local_heads = args.n_heads // get_tp_size()
+        self.cp_context = get_cp_context()
         self.q_lora_rank = args.q_lora_rank
         self.kv_lora_rank = args.kv_lora_rank
         self.qk_nope_head_dim = args.qk_nope_head_dim
@@ -541,13 +673,48 @@ class AttentionDeepSeekV3(Attention):
             )
 
     def forward(
-        self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
+        self,
+        x: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        is_mtp: bool = False,
     ):
+        cp_ctx = self.cp_context
+        if cp_ctx.is_active:
+            seq_len_delta = (
+                self.cache.mtp_seq_len_delta if is_mtp else self.cache.seq_len_delta
+            )
+            use_cp = (
+                not seq_len_delta.is_decode_stage
+                and x.shape[0] != seq_len_delta.batch_size
+            )
+        else:
+            use_cp = False
+        return self._forward_impl(x, freqs_cis, is_mtp=is_mtp, cp_active=use_cp)
+
+    def _forward_impl(
+        self,
+        x: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        is_mtp: bool = False,
+        cp_active: bool = False,
+    ):
+        """Unified forward for DeepSeek V3 MLA attention.
+
+        When cp_active=True, allgathers KV and uses local_lengths for causal bounds.
+        """
         seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
 
-        bs_seq, _ = x.size()
+        n_tokens, _ = x.size()
+        cp_ctx = get_cp_context()
 
-        if self.can_use_mla_prologue_torch_npu:
+        # Clear stale CP cache from previous steps (e.g., prefill's local_lengths
+        # should not leak into decode). When cp_active=True, prepare_local_lengths
+        # will set fresh values before downstream methods read them.
+        if not cp_active:
+            cp_ctx.clear_step_cache()
+
+        # ---- torch_npu MLA prologue fast path (only non-CP) ----
+        if not cp_active and self.can_use_mla_prologue_torch_npu:
 
             def try_get_scale(module):
                 if hasattr(module, "weight_scale"):
@@ -605,7 +772,7 @@ class AttentionDeepSeekV3(Attention):
 
             x = self.kv_b_proj_absorb_2(x)
 
-        else:  # not self.can_use_mla_prologue_torch_npu:
+        else:  # standard path (non-CP w/o torch_npu, or CP mode)
             assert self.q_lora_rank > 0
             indexer_k = None
             if self.merge_qkv:
@@ -656,9 +823,10 @@ class AttentionDeepSeekV3(Attention):
                 else:
                     indexer_q = None
 
-            q = q.view(bs_seq, self.n_local_heads, -1)
-            kv = kv.view(bs_seq, 1, -1)
+            q = q.view(n_tokens, self.n_local_heads, -1)
+            kv = kv.view(n_tokens, 1, -1)
 
+            # ---- RoPE ----
             q, kv, q_nope, q_pe, _, kv_lora, k_pe, _ = apply_rotary_pos_emb_partial(
                 q,
                 kv,
@@ -668,22 +836,44 @@ class AttentionDeepSeekV3(Attention):
                 rotary_type="interleaved",
             )
 
+            # ---- CP allgather KV ----
+            indexer_k_global: torch.Tensor | None = None
+            if cp_active:
+                kv_global, indexer_k_global = cp_ctx.allgather_kv(
+                    n_tokens,
+                    kv,
+                    indexer_k,
+                    self.index_head_dim,
+                    seq_len_delta,
+                )
+                kv = kv_global.unsqueeze(1)  # [total, 1, kv_lora_rank + rope]
+                kv_lora = kv[..., : self.kv_lora_rank]
+                k_pe = kv[..., self.kv_lora_rank :]
+
+            # ---- MLA absorb ----
             if self.mla_absorb == "none":
+                # absorb="none" is incompatible with CP mode (no allgather KV support).
+                assert not cp_active
+
                 if isinstance(k_pe, NativeLayoutTensor):
                     k_pe = k_pe.convert_to_plain()
 
                 kv = self.kv_b_proj(self.kv_a_layernorm(kv_lora))
 
                 kv = kv.view(
-                    bs_seq, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim
+                    n_tokens,
+                    self.n_local_heads,
+                    self.qk_nope_head_dim + self.v_head_dim,
                 )
                 k_nope, v = torch.split(
                     kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
                 )
                 k = torch.cat(
                     [
-                        k_nope.view(bs_seq, self.n_local_heads, self.qk_nope_head_dim),
-                        k_pe.view(bs_seq, 1, self.qk_rope_head_dim).expand(
+                        k_nope.view(
+                            n_tokens, self.n_local_heads, self.qk_nope_head_dim
+                        ),
+                        k_pe.view(n_tokens, 1, self.qk_rope_head_dim).expand(
                             -1, self.n_local_heads, -1
                         ),
                     ],
@@ -692,6 +882,7 @@ class AttentionDeepSeekV3(Attention):
 
                 if self.index_topk is not None:
                     assert self.indexer_cache is not None
+                    assert indexer_q is not None and indexer_k is not None
                     topk_indices = self.indexer(
                         x,
                         indexer_q,
@@ -718,43 +909,101 @@ class AttentionDeepSeekV3(Attention):
                 if self.mla_absorb == "absorb-without-precomp":
                     q_nope = self.kv_b_proj_absorb_1(q_nope)
 
-                # In-place update to `kv_lora`, which is part of `kv`
+                # KV layernorm
                 self.kv_a_layernorm(kv_lora, compute_dtype=kv.dtype, out=kv_lora)
 
                 main_cache_accessor = self.cache.get_accessor(self.layer_id, is_mtp)
                 topk_indices = None
                 topk_page_table = None
+
+                # ---- CP: build local_lengths for attention causal bounds ----
+                if cp_active:
+                    cp_ctx.prepare_local_lengths(
+                        seq_len_delta, n_tokens, seq_len_delta.is_decode_stage
+                    )
+
                 if self.index_topk is not None:
                     assert self.indexer_cache is not None
                     indexer_cache_accessor = self.indexer_cache.get_accessor(
                         self.layer_id
                     )
-                    if (
-                        self.attn_backend.requires_sparse_decode_page_table()
-                        and seq_len_delta.is_classic_decoding
-                        and isinstance(main_cache_accessor, PagedKVCacheAccessor)
-                    ):
-                        topk_page_table = self.indexer.build_decode_topk_page_table(
-                            x,
-                            indexer_q,
-                            indexer_k,
-                            seq_len_delta,
-                            freqs_cis,
-                            is_causal=True,
-                            cache_accessor=indexer_cache_accessor,
-                            source_page_table=main_cache_accessor.block_table,
-                        )
-                    else:
-                        topk_indices = self.indexer(
-                            x,
-                            indexer_q,
-                            indexer_k,
-                            seq_len_delta,
-                            freqs_cis,
-                            is_causal=True,
-                            cache_accessor=indexer_cache_accessor,
-                        )
 
+                    if cp_active:
+                        # CP indexer: separate Q/K RoPE, local Q × global K
+                        assert indexer_q is not None
+                        assert (
+                            self._freqs_cis_real is not None
+                            and self._freqs_cis_imag is not None
+                        )
+                        assert indexer_k_global is not None
+                        global_positions = (
+                            seq_len_delta.delta_position_ids_tensor_device
+                        )
+                        freqs_cis_k_global = BatchedFreqsCis(
+                            self._freqs_cis_real[global_positions],
+                            self._freqs_cis_imag[global_positions],
+                        )
+                        indexer_k_normed = self.indexer.k_norm(indexer_k_global)
+
+                        if (
+                            self.attn_backend.requires_sparse_decode_page_table()
+                            and seq_len_delta.is_classic_decoding
+                            and isinstance(main_cache_accessor, PagedKVCacheAccessor)
+                        ):
+                            topk_page_table = self.indexer.build_decode_topk_page_table(
+                                x,
+                                indexer_q,
+                                indexer_k_normed,
+                                seq_len_delta,
+                                freqs_cis,
+                                is_causal=True,
+                                cache_accessor=indexer_cache_accessor,
+                                source_page_table=main_cache_accessor.block_table,
+                                freqs_cis_k=freqs_cis_k_global,
+                                k_pre_normed=True,
+                            )
+                        else:
+                            topk_indices = self.indexer.forward(
+                                x,
+                                indexer_q,
+                                indexer_k_normed,
+                                seq_len_delta,
+                                freqs_cis,
+                                is_causal=True,
+                                cache_accessor=indexer_cache_accessor,
+                                freqs_cis_k=freqs_cis_k_global,
+                                k_pre_normed=True,
+                            )
+                    else:
+                        # Non-CP indexer: unified RoPE
+                        assert indexer_q is not None and indexer_k is not None
+                        if (
+                            self.attn_backend.requires_sparse_decode_page_table()
+                            and seq_len_delta.is_classic_decoding
+                            and isinstance(main_cache_accessor, PagedKVCacheAccessor)
+                        ):
+                            topk_page_table = self.indexer.build_decode_topk_page_table(
+                                x,
+                                indexer_q,
+                                indexer_k,
+                                seq_len_delta,
+                                freqs_cis,
+                                is_causal=True,
+                                cache_accessor=indexer_cache_accessor,
+                                source_page_table=main_cache_accessor.block_table,
+                            )
+                        else:
+                            topk_indices = self.indexer(
+                                x,
+                                indexer_q,
+                                indexer_k,
+                                seq_len_delta,
+                                freqs_cis,
+                                is_causal=True,
+                                cache_accessor=indexer_cache_accessor,
+                            )
+
+                # ---- MLA attention ----
                 x = self.attn_backend.mla(
                     q_nope,
                     q_pe,
@@ -775,7 +1024,7 @@ class AttentionDeepSeekV3(Attention):
                     f"MLA absorb mode {self.mla_absorb} not supported"
                 )
 
-        return self.o_proj(x.flatten(-2)).view(bs_seq, -1)
+        return self.o_proj(x.flatten(-2)).view(n_tokens, -1)
 
 
 class SharedHeadDeepSeekV3(nn.Module):
@@ -1145,10 +1394,15 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
 
     @override
     def forward(
-        self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
+        self,
+        x: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        is_mtp: bool = False,
     ):
         x = x + self.self_attn(
-            self.input_layernorm(x, compute_dtype=x.dtype), freqs_cis, is_mtp
+            self.input_layernorm(x, compute_dtype=x.dtype),
+            freqs_cis,
+            is_mtp,
         )
         x = x + self.mlp(self.post_attention_layernorm(x, compute_dtype=x.dtype))
         return x
@@ -1246,6 +1500,14 @@ class TransformerDeepSeekV3(Transformer):
             op_impl=op_impl,
             mla_absorb=mla_absorb,
         )
+
+        # CP mode: share global RoPE tables with attention layers for indexer
+        if self.cp_context.is_active:
+            for layer in self.layers:
+                attn = getattr(layer, "self_attn", None)
+                if attn is not None and attn.index_topk is not None:
+                    attn._freqs_cis_real = self.freqs_cis_real
+                    attn._freqs_cis_imag = self.freqs_cis_imag
 
     @override
     def _get_tensor_column_parallel_layer_names(self) -> list[str]:

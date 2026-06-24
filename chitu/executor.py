@@ -9,12 +9,12 @@ from logging import getLogger
 import weakref
 from typing import Optional
 from abc import ABC, abstractmethod
-from io import BytesIO
 
 import numpy as np
 import torch
 import torch.distributed
 
+from chitu.cp_utils import get_cp_context
 from chitu.backend import Backend, BackendState
 from chitu.global_vars import (
     get_global_args,
@@ -28,6 +28,7 @@ from chitu.task import (
     PackedTasks,
     PackedTasksBase,
     PackedTasksResult,
+    DPPackedTasks,
     SerializedPackedTasksPayloadType,
     BatchResult,
     TaskType,
@@ -39,6 +40,8 @@ from chitu.task import (
 from chitu.metadata_serializer import MetadataSerializer, MetadataConfig
 from chitu.distributed.parallel_state import (
     get_tp_group,
+    get_cp_group,
+    get_cp_size,
     get_pp_group,
     get_pp_pair_group,
     get_dp_group,
@@ -46,6 +49,7 @@ from chitu.distributed.parallel_state import (
     get_world_group,
     get_embed_tokens_lm_head_tp_group,
 )
+from chitu.distributed.comm_group import CommGroup
 from chitu.moe import get_moe_impl
 from chitu.hooks import TokenSink, LocalTokenSink, KVTransferHook, NoopKVTransferHook
 from chitu.utils import (
@@ -291,8 +295,21 @@ class PipeDispatcher(TasksDispatcher):
             get_world_group().group_size // get_dp_group().group_size
         )
 
-        # PP 使用 PUSH/PULL 模式（仅在 TP Main Rank 上初始化）
-        self._init_zmq_push_pull()
+        # Only the "main" rank within each PP stage should handle metadata dispatch via ZMQ.
+        # - TP mode (pcp_size=1): only TP first rank (main rank) handles ZMQ;
+        #   non-main ranks receive tasks via TP broadcast (tp_dispatcher).
+        # - PCP mode (pcp_size>1): only CP first rank handles ZMQ;
+        #   non-CP-main ranks receive tasks via CP broadcast (cp_dispatcher).
+        # This matches Executor.is_main_rank logic (set later in __init__).
+        _cp_context = self.get_executor().cp_context
+        if _cp_context.is_active:
+            self._do_metadata_dispatch = _cp_context.is_first_rank
+        else:
+            self._do_metadata_dispatch = get_tp_group().is_first_rank
+
+        # PP 使用 PUSH/PULL 模式（仅在参与 metadata dispatch 的 ranks 上初始化 ZMQ）
+        if self._do_metadata_dispatch:
+            self._init_zmq_push_pull()
 
         # 初始化统一的 metadata serializer
         self.metadata_serializer = MetadataSerializer(mode="PP")
@@ -332,8 +349,13 @@ class PipeDispatcher(TasksDispatcher):
     def dispatch_metadata(
         self, tasks: Optional[PackedTasks | PackedTasksBase]
     ) -> tuple[SerializedPackedTasksPayloadType, PackedTasks | PackedTasksBase]:
+        # Non-CP-main ranks: metadata is handled by CP broadcast, skip ZMQ.
+        if not self._do_metadata_dispatch:
+            payload_type = tasks.payload_type if tasks is not None else None
+            return payload_type, tasks
+
         if self.is_first_stage:
-            payload_type = tasks.payload_type
+            payload_type = tasks.payload_type if tasks is not None else None
         else:
             # Recv task from previous PP stage.
             msgs = self.recv_socket.recv_multipart()
@@ -346,7 +368,7 @@ class PipeDispatcher(TasksDispatcher):
                 slot_handle.set_slot_idx(slot_idx)
 
         # Send task to next PP stage.
-        if not self.is_last_stage:
+        if not self.is_last_stage and tasks is not None:
             slot_handle = get_slot_handle()
             slot_idx = slot_handle.get_slot_idx() if slot_handle else None
             tasks_msg = self.metadata_serializer.serialize_metadata(
@@ -437,23 +459,31 @@ class PipeDispatcher(TasksDispatcher):
             return
         if tasks is None:
             return
-        if self.is_first_stage:
-            self.recv_results(tasks)
-        elif self.is_last_stage:
-            self.send_results(tasks)
+        # In TP mode (pcp_size=1), only the main rank (TP first rank) handles
+        # PP result exchange via P2P. Non-main ranks don't have generated_result
+        # (not is_sample_rank) and don't need the result data.
+        # In PCP mode (pcp_size>1), every rank has its own PP pair and exchanges
+        # results independently via P2P.
+        _cp_context = self.get_executor().cp_context
+        if _cp_context.is_active or get_tp_group().is_first_rank:
+            if self.is_first_stage:
+                self.recv_results(tasks)
+            elif self.is_last_stage:
+                self.send_results(tasks)
 
 
 class TensorDispatcher(TasksDispatcher):
-    """TP (Tensor Parallelism) Dispatcher"""
+    """TP (Tensor Parallelism) Dispatcher — also used for CP task dispatch."""
 
     def __init__(
         self,
         device: torch.device | str,
         get_executor: weakref.ReferenceType["Executor"],
+        group: Optional[CommGroup] = None,
     ):
         super().__init__(device, get_executor)
 
-        self.tp_group = get_tp_group()
+        self.tp_group = group if group is not None else get_tp_group()
         self.rank = self.tp_group.global_rank
         self.rank_in_group = self.tp_group.rank_in_group
         self.group_size = self.tp_group.group_size
@@ -688,6 +718,32 @@ class ExpertDataDispatcher(TasksDispatcher):
         except Exception:
             return True
 
+    def _create_empty_recv_results(self, tasks: DPPackedTasks) -> PackedTasksResult:
+        """Return a PackedTasksResult pre-allocated to total bs across all DP ranks.
+
+        Field presence mirrors PipeDispatcher.recv_results.  collect_results fills
+        per-rank slices directly so that no torch.cat is needed afterwards.
+        """
+        bs = len(tasks.output_tasks)
+        # mtp tokens only exist in Decode, see ``Sampler.sample()``
+        mtp_size = (
+            Backend.executor.mtp_size if tasks.task_type == TaskType.Decode else 1
+        )
+        vocab_size = Backend.model.vocab_size
+
+        def create(shape, dtype=torch.int64):
+            return torch.empty(shape, dtype=dtype, device="cpu")
+
+        result = PackedTasksResult(tokens=create((bs, mtp_size)))
+        if mtp_size > 1:
+            result.accept_indices = create((bs,))
+        if tasks.return_logprobs:
+            result.logprobs = create((bs, vocab_size), torch.float32)
+            result.token_idxs = create((bs, vocab_size))
+        if tasks._test_flag:
+            result.logits = create((bs, vocab_size), torch.float32)
+        return result
+
     def collect_results(
         self,
         results: PackedTasksResult,
@@ -697,38 +753,52 @@ class ExpertDataDispatcher(TasksDispatcher):
         """
         collect results through zmq.
         """
-        payload = dataclass_to_dict(results)
-        payload["pd_first_tokens"] = pd_first_tokens
-        payload["pd_cached_hit_tokens"] = pd_cached_hit_tokens
 
         if self.is_main_rank:
-            all_payload = [None for _ in range(self.group_size)]
+            dp_tasks = DPTaskCollector.get_last_packedtasks()
+            merged_results = self._create_empty_recv_results(dp_tasks)
+            merged = dataclass_to_dict(merged_results)
+            merged["pd_first_tokens"] = pd_first_tokens
+            merged["pd_cached_hit_tokens"] = pd_cached_hit_tokens
+
+            all_data = [None for _ in range(self.group_size)]
+            all_data[0] = dataclass_to_dict(results)
             for _ in range(1, self.group_size):
                 msgs = self.socket.recv_multipart()
-                rank_in_group = int(msgs[0].decode())  # zmq identity prepend by ROUTER
-                buffer = BytesIO(msgs[1])
-                all_payload[rank_in_group] = torch.load(buffer)
-            all_payload[0] = payload
+                rank_in_group = int(msgs[0].decode())
+                data = msgpack.loads(msgs[1])
+                for k, v in data.items():
+                    if isinstance(v, bytes):
+                        if len(v) == 0:
+                            data[k] = torch.empty(0, dtype=merged[k].dtype)
+                        else:
+                            data[k] = torch.frombuffer(v, dtype=merged[k].dtype)
+                all_data[rank_in_group] = data
 
-            for k in payload.keys():
-                if k == "pd_first_tokens":
-                    for p in all_payload:
-                        pd_first_tokens.update(p[k])
-                elif k == "pd_cached_hit_tokens":
-                    for p in all_payload:
-                        pd_cached_hit_tokens.update(p[k])
-                else:
-                    tensors = [p[k] for p in all_payload if p[k] is not None]
-                    payload[k] = torch.cat(tensors) if tensors else None
+            offset = 0
+            for data, bs in zip(all_data, dp_tasks.dp_num_output_tasks):
+                if bs == 0:
+                    continue
+                slicing = range(offset, offset + bs)
+                for k, v in merged.items():
+                    if isinstance(v, dict) and k in data:
+                        v.update(data[k])
+                    elif isinstance(v, torch.Tensor):
+                        v[slicing] = data[k].reshape(v[slicing].shape)
+                offset += bs
             return (
-                dataclass_from_dict(payload, PackedTasksResult),
-                pd_first_tokens,
-                pd_cached_hit_tokens,
+                merged_results,
+                merged["pd_first_tokens"],
+                merged["pd_cached_hit_tokens"],
             )
         else:
-            buffer = BytesIO()
-            torch.save(payload, buffer)
-            self.socket.send(buffer.getvalue())
+            data = dataclass_to_dict(results)
+            for k in list(data.keys()):
+                if isinstance(data[k], torch.Tensor):
+                    data[k] = data[k].numpy().tobytes()
+            data["pd_first_tokens"] = pd_first_tokens
+            data["pd_cached_hit_tokens"] = pd_cached_hit_tokens
+            self.socket.send(msgpack.dumps(data))
             return results, pd_first_tokens, pd_cached_hit_tokens
 
     def send_payload(self, payload: torch.Tensor, tasks=None):
@@ -748,6 +818,7 @@ class Executor:
         self.timers = get_timers()
         self.rank = torch.distributed.get_rank()
         self.device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
+        self.cp_context = get_cp_context()
         self.pp_size = args.infer.pp_size
         self.tp_size = args.infer.tp_size
         self.dp_size = args.infer.dp_size
@@ -770,16 +841,41 @@ class Executor:
             self._prepend_dispatcher(self.tp_dispatcher)
             self.tp_group = get_tp_group()
             rank_filter = rank_filter and get_tp_group().is_first_rank
-        if rank_filter and self.pp_size > 1:
+        elif rank_filter and self.cp_context.is_active:
+            # CP mode: use TensorDispatcher over the CP group to broadcast
+            # tasks from rank 0 to all CP ranks (compensates for tp_size=1).
+            cp_group = self.cp_context.cp_group
+            self.cp_dispatcher = TensorDispatcher(
+                self.device, weakref.ref(self), group=cp_group
+            )
+            self._prepend_dispatcher(self.cp_dispatcher)
+            self.tp_group = cp_group
+            rank_filter = rank_filter and cp_group.is_first_rank
+        if self.pp_size > 1:
             self.pipe_dispatcher = PipeDispatcher(self.device, weakref.ref(self))
             self._prepend_dispatcher(self.pipe_dispatcher)
-            rank_filter = rank_filter and get_pp_group().is_first_rank
+            if rank_filter:
+                rank_filter = rank_filter and get_pp_group().is_first_rank
         if rank_filter and self.dp_size > 1:
             self.dp_dispatcher = ExpertDataDispatcher(self.device, weakref.ref(self))
             self._prepend_dispatcher(self.dp_dispatcher)
 
         self.is_main_rank = get_tp_group().is_first_rank
         """ is tp main rank """
+        # In CP mode (tp_size=1), every rank is its own TP group so is_main_rank
+        # is True for all ranks. But only the CP-main rank (cp_group.is_first_rank)
+        # should act as the "main" rank for sampling and result collection.
+        # Adjust is_main_rank to be CP-aware.
+        if self.cp_context.is_active:
+            self.is_main_rank = self.cp_context.is_first_rank
+        # The dispatcher used for tensor broadcast within TP/CP group.
+        # In TP mode this is tp_dispatcher; in CP mode (tp_size=1) this is cp_dispatcher.
+        # When neither TP nor CP is active (tp_size=1, no CP), both are None.
+        self.tensor_broadcast_dispatcher = (
+            self.tp_dispatcher
+            if self.tp_dispatcher is not None
+            else getattr(self, "cp_dispatcher", None)
+        )
         self.is_sample_rank = self.is_main_rank and get_pp_group().is_last_rank
         self.is_dp_rank = self.is_main_rank and get_pp_group().is_first_rank
 
@@ -794,6 +890,9 @@ class Executor:
         elif self.pipe_dispatcher and self.pipe_dispatcher.is_last_stage:
             # PP last stage 相比于 PP first stage 在运行同一组 tasks 时延迟了 pp_size-1 步
             # 需要发送 1 步前的结果
+            TaskCollector.init(length=1)
+        elif self.pipe_dispatcher and self.pipe_dispatcher.is_first_stage:
+            # PP non-main first stage: receive results from paired last stage.
             TaskCollector.init(length=1)
 
         if self.pp_size > 1 and not get_pp_group().is_first_rank:
@@ -940,17 +1039,17 @@ class Executor:
         if tasks.num_tasks == 0:
             return torch.empty((0,), device=self.device, dtype=torch.int64)
 
-        if self.is_main_rank:
+        if isinstance(tasks, PackedTasks):
             tokens = create_tensor(
                 [task.next_token for task in tasks.tasks],
                 device=self.device,
                 dtype=torch.int64,
             )
-            if self.tp_dispatcher:
-                self.tp_dispatcher.send_payload(tokens)
+            if self.tensor_broadcast_dispatcher:
+                self.tensor_broadcast_dispatcher.send_payload(tokens)
         else:
             tokens = torch.empty(tasks.num_tasks, device=self.device, dtype=torch.int64)
-            tokens = self.tp_dispatcher.recv_payload(tokens)
+            self.tensor_broadcast_dispatcher.recv_payload(tokens)
         return tokens
 
     def _prepare_blocks_for_decode_dllm(self, tasks: PackedTasks) -> torch.Tensor:
@@ -1184,18 +1283,18 @@ class Executor:
         if tasks.num_tokens == 0:
             return torch.empty((0,), device=self.device, dtype=torch.int64)
 
-        if self.is_main_rank:
-            # only tp main rank have tokens after dispatch metadata
+        if isinstance(tasks, PackedTasks):
+            # only the rank that holds PackedTasks has real tokens after dispatch metadata
             tokens = create_tensor(
                 np.concatenate(tasks.tokens), device=self.device, dtype=torch.int64
             )
-            if self.tp_dispatcher:
-                self.tp_dispatcher.send_payload(tokens)
+            if self.tensor_broadcast_dispatcher:
+                self.tensor_broadcast_dispatcher.send_payload(tokens)
         else:
             tokens = torch.empty(
                 tasks.num_tokens, device=self.device, dtype=torch.int64
             )
-            tokens = self.tp_dispatcher.recv_payload(tokens)
+            self.tensor_broadcast_dispatcher.recv_payload(tokens)
         return tokens
 
     def _prepare_hiddens(self, tasks: PackedTasksBase):
@@ -1208,18 +1307,33 @@ class Executor:
                 dtype=self.get_payload_dtype(),
             )
 
-        # receive hiddens on tp main rank and broadcast in tp group
+        # receive hiddens from previous PP stage
+        # In PCP+PP prefill, each CP rank only processes ceil(num_tokens/pcp_size)
+        # local tokens. The recv buffer must match the size that the sender
+        # (PP stage 0) actually sends, which is the CP-split local size.
+        # In PCP+PP decode, each CP rank has the full batch — no CP-split is applied.
+        if tasks.task_type == TaskType.Decode:
+            pp_num_tokens = tasks.num_tokens
+        else:
+            pp_num_tokens = self.cp_context.compute_pp_num_tokens(tasks.num_tokens)
         hiddens = torch.empty(
-            self.get_payload_shape(tasks.num_tokens),
+            self.get_payload_shape(pp_num_tokens),
             device=self.device,
             dtype=self.get_payload_dtype(),
         )
-        if self.is_main_rank:
+        # In CP+PP mode, each CP rank has its own PP pair and receives
+        # hiddens directly from pipe — no TP/CP broadcast needed.
+        # In TP mode, only the TP main rank receives from pipe, then
+        # broadcasts to other TP ranks.
+        if self.cp_context.should_recv_directly(self.tp_size):
+            # CP mode (or no TP): every rank receives from its PP pair directly
             hiddens = self.pipe_dispatcher.recv_payload(hiddens)
-            if self.tp_dispatcher:
-                self.tp_dispatcher.send_payload(hiddens)
+        elif self.is_main_rank:
+            hiddens = self.pipe_dispatcher.recv_payload(hiddens)
+            if self.tensor_broadcast_dispatcher:
+                self.tensor_broadcast_dispatcher.send_payload(hiddens)
         else:
-            hiddens = self.tp_dispatcher.recv_payload(hiddens)
+            self.tensor_broadcast_dispatcher.recv_payload(hiddens)
         return hiddens
 
     def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
@@ -1227,6 +1341,7 @@ class Executor:
         if not is_empty_step:
             for cache in Backend.cache_dict.values():
                 cache.prepare_cache_prefill(tasks)
+                cache.seq_len_delta.is_decode_stage = False
             PrometheusMetricsCollector.update_GPU_usage()
             PrometheusMetricsCollector.update_task_counts()
 
@@ -1264,11 +1379,16 @@ class Executor:
             # NOTE: send hidden states to the next PP stage BEFORE triggering KV transfer.
             # Otherwise intermediate stages can block in KV transfer collectives, while the last
             # stage is still waiting for payload from upstream, causing a deadlock.
-            if not get_pp_group().is_last_rank and self.is_main_rank:
-                self.pipe_dispatcher.send_payload(out, tasks)
+            self._send_pp_payload(out, tasks)
 
             return out
         else:
+            # Empty step: send dummy hiddens to next PP stage to avoid deadlock
+            # in CP+PP mode where the paired rank may be waiting on recv.
+            # Only needed when CP is active; without CP, the old behavior was
+            # to never send PP payloads on empty steps.
+            if self.cp_context.is_active:
+                self._send_pp_payload(self.dummy_logits, tasks=tasks)
             return self.dummy_output
 
     def decode_step(self, tasks: PackedTasksBase, is_empty_step: bool = False):
@@ -1303,20 +1423,35 @@ class Executor:
         self.timers("decode").stop()
 
         if not is_empty_step:
-            if not get_pp_group().is_last_rank and self.is_main_rank:
-                self.pipe_dispatcher.send_payload(out, tasks)
+            self._send_pp_payload(out, tasks)
 
             return out
         else:
+            # Empty step: send dummy hiddens to next PP stage to avoid deadlock
+            # in CP+PP mode where the paired rank may be waiting on recv.
+            # Only needed when CP is active; without CP, the old behavior was
+            # to never send PP payloads on empty steps.
+            if self.cp_context.is_active:
+                self._send_pp_payload(self.dummy_logits, tasks=tasks)
             return self.dummy_mtp_output if self.mtp_size > 1 else self.dummy_output
+
+    def _send_pp_payload(self, tensor, tasks):
+        """Send payload to next PP stage if this rank should send.
+
+        CP mode: every rank has its own PP pair and sends independently.
+        TP mode: only the main rank sends (hiddens already synced via TP broadcast).
+        """
+        if not get_pp_group().is_last_rank:
+            if self.cp_context.should_send_directly() or self.is_main_rank:
+                assert self.pipe_dispatcher is not None
+                self.pipe_dispatcher.send_payload(tensor, tasks)
 
     def _prepare_mtp_token_indices(self, tasks) -> list[int]:
         indices = None
-        if self.is_main_rank:
-            assert isinstance(tasks, PackedTasks)
+        if isinstance(tasks, PackedTasks):
             indices = [task.mtp_accept_index for task in tasks.tasks]
-        if self.tp_dispatcher:
-            indices = self.tp_dispatcher.broadcast_data(indices)
+        if self.tensor_broadcast_dispatcher:
+            indices = self.tensor_broadcast_dispatcher.broadcast_data(indices)
         indices_device = create_tensor(indices, device=self.device, dtype=torch.int64)
         indices_device = torch.clamp(indices_device, min=0)
         Backend.model.mtp_accept_indices.set(indices_device)
@@ -1413,31 +1548,30 @@ class Executor:
 
         # 1) Get decoding_start tensor (broadcast for TP>1)
 
-        if self.is_main_rank:
-            assert isinstance(tasks, PackedTasks)
+        if isinstance(tasks, PackedTasks):
             decoding_start = torch.tensor(
                 [getattr(t, "decoding_start", 0) for t in tasks.tasks],
                 device=self.device,
                 dtype=torch.long,
             )
-            if self.tp_dispatcher:
-                self.tp_dispatcher.send_payload(decoding_start)
+            if self.tensor_broadcast_dispatcher:
+                self.tensor_broadcast_dispatcher.send_payload(decoding_start)
         else:
             decoding_start = torch.empty(
                 batch_size, device=self.device, dtype=torch.long
             )
-            self.tp_dispatcher.recv_payload(decoding_start)
+            self.tensor_broadcast_dispatcher.recv_payload(decoding_start)
 
         # 2) Prepare payload
-        if self.is_main_rank:
+        if isinstance(tasks, PackedTasks):
             payload = self._prepare_blocks_for_decode_dllm(tasks)
-            if self.tp_dispatcher:
-                self.tp_dispatcher.send_payload(payload)
+            if self.tensor_broadcast_dispatcher:
+                self.tensor_broadcast_dispatcher.send_payload(payload)
         else:
             payload = torch.empty(
                 [batch_size * block_length], dtype=torch.long, device=self.device
             )
-            self.tp_dispatcher.recv_payload(payload)
+            self.tensor_broadcast_dispatcher.recv_payload(payload)
 
         # 3) Prepare cache
         self._kv_hook.before_decode_step(tasks.req_ids)

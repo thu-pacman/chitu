@@ -69,6 +69,36 @@ Acceptable values:
 
 *Default: `True`.*
 
+### Argument `boot.on_ready`
+
+Invoke this command once chitu service starts
+
+This command will run alongside Rank 0 for single-instance deployment, or run alongside
+the router for multi-instance deployment. The process will run on a dedicated container,
+started with the same argument as the chitu service.
+
+Acceptable values:
+- null: No command will run.
+- A list of arguments.
+- A space-separated string for arguments.
+
+*Default: `null`.*
+
+### Argument `boot.on_ready_relay_args`
+
+Relay Hydra arguments from chitu-boot to the command in `boot.on_ready`
+
+Acceptable values: True or False.
+
+*Default: `True`.*
+
+### Argument `boot.on_ready_shutdown`
+
+Terminate chitu service once the command in `boot.on_ready` finishes (either successfully
+or not)
+
+*Default: `False`.*
+
 ### Argument `boot.remote_launcher`
 
 How to run on multiple nodes
@@ -208,17 +238,21 @@ priority. Ordinary request has a priority of 1.
 
 Config of a TCP store used for coordinating internal TCP connections.
 
-This coordinator is responsible for managing TCP ports, but the port for itself
-must be set here.
+This coordinator is responsible for managing TCP ports, but the address and port for itself
+must be set here sometime.
+
+The address and port can be omitted in the following cases:
+- They can be omitted if `multi_inst.n_insts == 1`. If either `coordinator.host` or
+  `coordinator.port` is null, `coordinator` will reuse key-value store from `torchrun`, and
+  do not start a new key-value store.
+- They can be omitted when launching from the self-contained executable (`chitu.boot`).
 
 ### Argument `coordinator.host`
 
 IP for the coordinator.
 
 Acceptable values:
-- null: This filed can be omitted if `multi_inst.n_insts == 1`. If either
-  `coordinator.host` or `coordinator.port` is null, `coordinator` will reuse
-  key-value store from `torchrun`, and do not start a new key-value store.
+- null: This field can be omitted in cases described above.
 - A string: E.g., "1.2.3.4" or "host1". It must be recognized from all nodes,
   and therefore it must NOT be wildcards like 0.0.0.0. Please set concrete IP
   addresses.
@@ -230,9 +264,7 @@ Acceptable values:
 Port for the coordinator.
 
 Acceptable values:
-- null: This filed can be omitted if `multi_inst.n_insts == 1`. If either
-  `coordinator.host` or `coordinator.port` is null, `coordinator` will reuse
-  key-value store from `torchrun`, and do not start a new key-value store.
+- null: This field can be omitted in cases described above.
 - An integer: E.g., 21001. The TCP port ID.
 
 *Default: `null`.*
@@ -284,6 +316,13 @@ Acceptable values:
 IMPORTANT: Typically, you need to set this field.
 
 *Default: `skew`.*
+
+### Argument `infer.pcp_size`
+
+Number of Prefill Context Parallel ranks. See `docs/en/DEVELOPMENT.md#parallelism`
+for details.
+
+*Default: `1`.*
 
 ### Argument `infer.tp_size`
 

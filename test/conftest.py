@@ -621,6 +621,7 @@ def global_args(pd_ports):
                 "head_dim": 8,
             },
             "infer": {
+                "pcp_size": 1,
                 "tp_size": 1,
                 "pp_size": 1,
                 "dp_size": 1,

@@ -357,7 +357,10 @@ def start_worker():
     """Start worker for processing queue in a new event loop"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(process_queue())
+    try:
+        loop.run_until_complete(process_queue())
+    finally:
+        loop.close()
 
 
 def get_priority_from_api_key(api_key: str) -> int:

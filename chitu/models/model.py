@@ -31,6 +31,7 @@ from chitu.muxi_utils import (
     LinearMuxiLayoutNativeY,
 )
 from chitu.ops import apply_rotary_pos_emb, rms_norm, moe_gate, add_shared_experts
+from chitu.cp_utils import get_cp_context
 from chitu.distributed.comm_group import CommGroup
 from chitu.distributed.parallel_state import (
     get_tp_group,
@@ -258,6 +259,7 @@ class Transformer(nn.Module):
 
         self.tp_size = get_tp_size()
         self.tp_group = get_tp_group()
+        self.cp_context = get_cp_context()
         self.pp_size = get_pp_size()
         self.dp_size = get_dp_size()
         self.ep_group = get_ep_group()
@@ -269,7 +271,13 @@ class Transformer(nn.Module):
             get_embed_tokens_lm_head_tp_group().rank_in_group
         )
         self.pp_stage = get_pp_group().rank_in_group
-        self.pp_main_rank = (self.rank // self.tp_size) * self.tp_size
+        if self.cp_context.is_active:
+            # CP mode: use pcp_size for PP main rank (same as Backend.pp_main_rank)
+            self.pp_main_rank = (
+                self.rank // self.cp_context.pcp_size
+            ) * self.cp_context.pcp_size
+        else:
+            self.pp_main_rank = (self.rank // self.tp_size) * self.tp_size
         self.pp_end_stage = self.pp_size - 1
 
         # `get_global_args()` can be a Hydra/OmegaConf object; force to plain int for type checkers.
@@ -1243,16 +1251,24 @@ class Transformer(nn.Module):
         for mgr in self.cache_dict.values():
             mgr.seq_len_delta.is_decode_stage = False
 
-        last_token_offsets = (
-            self.cache_dict["mtp"].mtp_seq_len_delta.delta_prefix_lens_tensor_device[1:]
-            - 1
+        mtp_delta = self.cache_dict["mtp"].mtp_seq_len_delta
+        cp_ctx = self.cp_context
+        cp_active = (
+            cp_ctx.is_active
+            and mtp_delta.delta_total_len >= cp_ctx.pcp_size
+            and h.shape[0] != mtp_delta.delta_total_len
         )
+        if cp_active:
+            self._mtp_prefill_cp(x, h, freqs_cis)
+            return
+
+        last_token_offsets = mtp_delta.delta_prefix_lens_tensor_device[1:] - 1
         h = self.norm(h, compute_dtype=h.dtype)
         self.update_mtp_hidden_states(h[last_token_offsets])
-        x[
-            self.cache_dict["main"].mtp_seq_len_delta.delta_position_ids_tensor_device
-            == 0
-        ] = 0
+        # For the first token of each request, set the embedding to zero to avoid using the wrong hidden state
+        x[mtp_delta.delta_position_ids_tensor_device == 0] = 0
+        # match embedding of token i with hidden of token i-1, so roll h by 1
+        # NOTE: h should contain at least 2 tokens, otherwise the rolled h will be the same as original h
         h = torch.roll(h, shifts=1, dims=0)
         _ = self.layers[-1](x, freqs_cis, h, is_mtp=False)
 
@@ -1260,13 +1276,72 @@ class Transformer(nn.Module):
     def non_mtp_layers(self):
         return self.layers[:-1] if self.mtp_size > 1 else self.layers
 
+    def _mtp_prefill_cp(self, x, h, freqs_cis):
+        """CP-aware MTP prefill for interleaved context parallel shards."""
+        cp_ctx = self.cp_context
+        mtp_delta = self.cache_dict["mtp"].mtp_seq_len_delta
+        total_tokens = int(mtp_delta.delta_total_len)
+        n_local = h.shape[0]
+
+        h = self.norm(h, compute_dtype=h.dtype)
+
+        last_token_offsets = mtp_delta.delta_prefix_lens_tensor_device[1:] - 1
+        last_token_owner_ranks = torch.remainder(last_token_offsets, cp_ctx.pcp_size)
+        last_token_offsets_local = torch.div(
+            last_token_offsets, cp_ctx.pcp_size, rounding_mode="floor"
+        ).to(torch.long)
+        owned_mask = last_token_owner_ranks == cp_ctx.cp_rank
+        last_token_num = last_token_offsets.shape[0]
+        hidden_dim = h.shape[-1]
+        mtp_hidden_states = torch.zeros(
+            last_token_num,
+            hidden_dim,
+            device=h.device,
+            dtype=h.dtype,
+        )
+
+        if bool(owned_mask.any()):
+            mtp_hidden_states[owned_mask] = h[last_token_offsets_local[owned_mask]]
+        cp_ctx.cp_group.all_reduce(mtp_hidden_states)
+        # gather last tokens' hidden states from all CP ranks
+        self.update_mtp_hidden_states(mtp_hidden_states)
+
+        # get local embeddings and freqs(padded to n_local) for MTP prefill
+        if x.shape[0] != n_local:
+            x = self.cp_context.slice_for_local(x, n_local, total_tokens)
+        if freqs_cis.cos.shape[0] != n_local:
+            freqs_cis = BatchedFreqsCis(
+                self.cp_context.slice_for_local(freqs_cis.cos, n_local, total_tokens),
+                self.cp_context.slice_for_local(freqs_cis.sin, n_local, total_tokens),
+            )
+
+        local_flat_indices, valid_mask = self.cp_context.local_flat_indices(
+            n_local, total_tokens, x.device
+        )
+        main_mtp_delta = self.cache_dict["main"].mtp_seq_len_delta
+        local_position_ids = main_mtp_delta.delta_position_ids_tensor_device[
+            local_flat_indices
+        ]
+        # zero the padding embedding and first token embedding of each request
+        x[valid_mask & (local_position_ids == 0)] = 0
+
+        h_full = self.cp_context.allgather_interleaved(h, total_tokens)
+        prev_h_full = torch.roll(h_full, shifts=1, dims=0)
+        prev_h = prev_h_full[local_flat_indices]
+        _ = self.layers[-1](x, freqs_cis, prev_h, is_mtp=False)
+
     @torch.inference_mode()
     def prefill_no_pipeline(
         self, tokens: torch.Tensor, output_token_offsets: torch.Tensor, **args
     ) -> torch.Tensor:
         freqs_cis = self.prepare_freqs_cis()
+
+        # CP: split tokens before embedding
+        tokens, freqs_cis = self.cp_context.split_stage0(tokens, freqs_cis)
+
         if self.moe_impl is not None:
             self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
+
         h = self._pre_layers(tokens, **args)
 
         for it, layer in enumerate(self.non_mtp_layers):
@@ -1277,11 +1352,14 @@ class Transformer(nn.Module):
                 h=h,
                 freqs_cis=freqs_cis,
             )
-        # Exec post layers AFTER cutting the last token off
-        h = h[output_token_offsets]
-        h = self._post_layers(h)
-        h = h.float()
-        return h
+
+        # CP: allgather back to full token order before output selection
+        return self.cp_context.gather(
+            h,
+            output_token_offsets,
+            self._post_layers,
+            cp_active=self.cp_context.is_active,
+        )
 
     @torch.inference_mode()
     def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
@@ -1363,6 +1441,27 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         freqs_cis = self.prepare_freqs_cis()
 
+        # CP: split tokens before embedding (stage 0) or split freqs_cis
+        # for local hidden states from previous PP stage.
+        if self.pp_stage == 0:
+            num_tokens = tokens.shape[0]
+            delta_total = 0
+        else:
+            num_tokens = 0
+            delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
+        # CP: split token IDs before embedding (stage 0) or split freqs_cis
+        # to match local hidden states from previous PP stage.
+        # Skip CP when the actual prefill delta is smaller than pcp_size -- the
+        # flash_mla kernel requires a minimum number of work items per launch.
+        # Prefix caching can make the delta shorter than the original prompt,
+        delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
+        cp_active = self.cp_context.is_active and self.cp_context.should_split_prefill(
+            delta_total
+        )
+        tokens, freqs_cis = self.cp_context.split_prefill(
+            tokens, freqs_cis, hiddens, self.pp_stage, cp_active
+        )
+
         # start of model
         if self.pp_stage == 0:
             batch_size = tokens.shape[0]
@@ -1377,11 +1476,10 @@ class Transformer(nn.Module):
         if self.moe_impl is not None:
             self.moe_impl.prepare(TaskType.Prefill, batch_size)
 
-        # layers
         for it, layer in enumerate(self.non_mtp_layers):
             h = layer(h, freqs_cis)
 
-        # end of model
+        # end of model: allgather before output selection + post_layers
         if self.pp_stage == self.pp_end_stage:
             if self.mtp_size > 1:
                 assert tokens is not None
@@ -1390,10 +1488,18 @@ class Transformer(nn.Module):
                     h=h,
                     freqs_cis=freqs_cis,
                 )
-            # Exec post layers AFTER cutting the last token off
-            h = h[output_token_offsets]
-            h = self._post_layers(h)
-            h = h.float()
+            seq_len_delta = (
+                self.cache_dict["main"].seq_len_delta if self.pp_size > 1 else None
+            )
+            return self.cp_context.gather(
+                h,
+                output_token_offsets,
+                self._post_layers,
+                cp_active=cp_active,
+                pp_size=self.pp_size,
+                pp_stage=self.pp_stage,
+                seq_len_delta=seq_len_delta,
+            )
         return h
 
     @torch.inference_mode()

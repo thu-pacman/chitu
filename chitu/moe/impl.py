@@ -22,10 +22,13 @@ from chitu.moe.load_balancer import (
 )
 from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import BatchedRoutedActivation
+from chitu.cp_utils import get_cp_context
 from chitu.device_type import is_ascend_910b
 from chitu.distributed.parallel_state import (
     get_tp_group,
     get_dp_group,
+    get_cp_group,
+    get_cp_size,
     get_etp_group,
     get_ep_group,
 )
@@ -78,6 +81,26 @@ def init_moe_impl(args) -> None:
             )
         if int(getattr(args.infer, "mtp_size", 1)) > 1:
             n_layers += 1
+
+        # CP→DP mapping: when pcp_size > 1, MoE treats the CP domain as DP domain.
+        # Pass cp_group as dp_group so MoE allgather dispatcher operates across all CP ranks.
+        # BUT only for prefill — in decode, all ranks hold the full batch (no CP split),
+        # so the decode dispatcher must NOT allgather.
+        cp_context = get_cp_context()
+        dp_group_for_moe_prefill = cp_context.cp_group if cp_context.is_active else None
+        dp_group_for_moe_decode = (
+            get_dp_group() if cp_context.is_active else None
+        )  # size=1, no allgather
+        effective_dp_size = (
+            cp_context.pcp_size if cp_context.is_active else args.infer.dp_size
+        )
+
+        # CP mode: force "allgather" dispatcher (DeepEP not compatible with CP).
+        if cp_context.is_active:
+            if args.infer.ep_size == 1:
+                args.infer.moe.prefill_token_dispatcher = "allgather"
+            args.infer.moe.decode_token_dispatcher = "allgather"
+
         MOE_IMPL_INSTANCE = MoEImplEP(
             n_layers=n_layers,
             n_dense_layers=(
@@ -86,7 +109,7 @@ def init_moe_impl(args) -> None:
                 else 0
             ),
             hidden_dim=args.models.dim,
-            max_bs_per_dp_rank=ceil_div(args.infer.max_batch_size, args.infer.dp_size),
+            max_bs_per_dp_rank=ceil_div(args.infer.max_batch_size, effective_dp_size),
             n_routed_experts=n_routed_experts,
             n_activated_experts=n_activated_experts,
             n_fused_shared_experts=n_fused_shared_experts,
@@ -94,6 +117,8 @@ def init_moe_impl(args) -> None:
             prefill_token_dispatcher_impl=args.infer.moe.prefill_token_dispatcher,
             decode_token_dispatcher_impl=args.infer.moe.decode_token_dispatcher,
             use_cuda_graph=args.infer.use_cuda_graph,
+            dp_group=dp_group_for_moe_prefill,
+            decode_dp_group=dp_group_for_moe_decode,
             expert_stats_path=getattr(args.infer, "expert_stats_path", None),
             moe_lb_trigger=args.infer.moe_lb_trigger,
             moe_lb_threshold=args.infer.moe_lb_threshold,
@@ -208,6 +233,7 @@ class MoEImplEP(MoEImplBase):
         n_fused_shared_experts: int,
         tp_group: Optional[CommGroup] = None,
         dp_group: Optional[CommGroup] = None,
+        decode_dp_group: Optional[CommGroup] = None,
         etp_group: Optional[CommGroup] = None,
         ep_group: Optional[CommGroup] = None,
         n_global_experts_slots: Optional[int] = None,
@@ -232,6 +258,7 @@ class MoEImplEP(MoEImplBase):
         self.n_dense_layers = n_dense_layers
         self.hidden_dim = hidden_dim
         self.max_bs_per_dp_rank = max_bs_per_dp_rank
+        self.decode_dp_group = decode_dp_group
 
         self.task_type: Optional[TaskType] = None
 
@@ -370,11 +397,16 @@ class MoEImplEP(MoEImplBase):
                 ep_group=self.ep_group,
             )
         elif self.decode_token_dispatcher_impl == "allgather":
+            decode_dp = (
+                self.decode_dp_group
+                if self.decode_dp_group is not None
+                else self.dp_group
+            )
             self.decode_token_dispatcher = MoEAllGatherTokenDispatcher(
                 self.n_global_experts_slots,
                 use_cuda_graph=self.use_cuda_graph,
                 tp_group=self.tp_group,
-                dp_group=self.dp_group,
+                dp_group=decode_dp,
                 etp_group=self.etp_group,
                 ep_group=self.ep_group,
             )

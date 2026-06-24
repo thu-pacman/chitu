@@ -6,12 +6,12 @@
 
 import os
 import sys
-import traceback
 import hydra
 from hydra.core.config_store import ConfigStore
 from omegaconf import DictConfig
 from logging import getLogger
 
+from chitu.boot.local import local
 from chitu.boot.srun import srun
 from chitu.boot.ssh import ssh
 from chitu.boot.apptainer_run import apptainer_run
@@ -54,22 +54,7 @@ def main(cfg: DictConfig):
         local_run_callback = apptainer_run
 
     if cfg.boot.remote_launcher == "local":
-        if cfg.boot.n_nodes > 1:
-            raise ValueError(
-                f"boot.n_nodes must be 1 (got {cfg.boot.n_nodes}) for local launcher"
-            )
-        # NOTE: If running on single node, let torchrun pick a random port. It's still
-        # sufficiently unique across jobs on this node. See
-        # https://docs.pytorch.org/docs/stable/elastic/run.html#stacked-single-node-multi-worker
-        local_run_callback(
-            cfg,
-            raw_argv,
-            master_addr="127.0.0.1",
-            master_port=0,
-            rdvz_port=0,
-            rdvz_id="chitu",
-            is_master_node=True,
-        )
+        local(cfg, raw_argv, local_run_callback)
     elif cfg.boot.remote_launcher == "srun":
         srun(cfg, raw_argv, local_run_callback)
     elif cfg.boot.remote_launcher == "ssh":

@@ -10,28 +10,47 @@ import shutil
 import socket
 import subprocess
 import threading
-import time
 import traceback
 import requests
 from logging import getLogger
 
 from chitu.boot.appimage_utils import appdir
 from chitu.boot.arg_utils import args_as_list
+from chitu.boot.poll import wait_for_server_initialized
 from chitu.boot.tcp_ip import get_local_ip
 
 logger = getLogger(__name__)
 
 
+def host_on_this_node(host):
+    if host in {"0.0.0.0", "::", ""}:
+        return "127.0.0.1"
+    return host
+
+
 def docker_run(
-    cfg, raw_argv, master_addr, master_port, rdvz_port, rdvz_id, is_master_node
+    cfg,
+    raw_argv,
+    master_addr,
+    master_port,
+    rdvz_port,
+    rdvz_id,
+    *,
+    is_multi_inst,
+    is_router,
+    is_master_node,
+    torchrun_n_nodes,
+    torchrun_nproc_per_node,
 ):
-    n_nodes = int(cfg.boot.n_nodes)
-    n_gpus_per_node = int(cfg.boot.n_gpus_per_node)
+    n_nodes = int(torchrun_n_nodes)
+    nproc_per_node = int(torchrun_nproc_per_node)
     docker_args = args_as_list(cfg.boot.extra_docker_args)
     torchrun_args = args_as_list(cfg.boot.extra_torchrun_args)
     target_args = args_as_list(cfg.boot.target)
     torchrun_wrapper = args_as_list(cfg.boot.torchrun_wrapper)
-    if is_master_node and cfg.boot.on_ready is not None:
+    if cfg.boot.on_ready is not None and (
+        is_router or (not is_multi_inst and is_master_node)
+    ):
         on_ready_args = args_as_list(cfg.boot.on_ready)
     else:
         on_ready_args = None
@@ -191,7 +210,7 @@ def docker_run(
         "--nnodes",
         str(n_nodes),
         "--nproc-per-node",
-        str(n_gpus_per_node),
+        str(nproc_per_node),
         "--master_addr",
         master_addr,
         "--master_port",
@@ -210,40 +229,12 @@ def docker_run(
     on_ready_thread = None
     on_ready_error = []
     if on_ready_args is not None:
-        status_url = f"http://{cfg.serve.host}:{cfg.serve.port}/server_status"
+        http_host = host_on_this_node(cfg.serve.host)
+        status_url = f"http://{http_host}:{cfg.serve.port}/server_status"
 
         def wait_and_run_on_ready():
             try:
-                # First, wait for 10s before entering the polling loop.
-                time.sleep(10)
-
-                # Poll the status endpoint until the service is initialized.
-                while True:
-                    try:
-                        resp = requests.get(status_url)
-                        resp.raise_for_status()
-                        data = resp.json()
-                    except Exception as e:
-                        logger.debug(
-                            f"[on_ready hook] Polling {status_url}: {e}. Retrying"
-                        )
-                        time.sleep(10)
-                        continue
-
-                    if not isinstance(data, dict) or "initialized" not in data:
-                        raise RuntimeError(
-                            f"Unexpected response from {status_url}: {data}"
-                        )
-
-                    if data["initialized"] is True:
-                        break
-                    elif data["initialized"] is False:
-                        time.sleep(10)
-                        continue
-                    else:
-                        raise RuntimeError(
-                            f"Unexpected response from {status_url}: {data}"
-                        )
+                wait_for_server_initialized(status_url)
 
                 on_ready_cmd = list(docker_cmd) + on_ready_args
                 if cfg.boot.on_ready_relay_args:
@@ -257,7 +248,7 @@ def docker_run(
                 if cfg.boot.on_ready_shutdown:
                     logger.error("Terminating the main service")
                     requests.post(
-                        f"http://{cfg.serve.host}:{cfg.serve.port}/terminate_engine",
+                        f"http://{http_host}:{cfg.serve.port}/terminate_engine",
                         json={"confirm": True},
                     )
 

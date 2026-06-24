@@ -245,7 +245,10 @@ class KVCacheBase:
 
         prefill_chunk_size_global = get_global_args().infer.prefill_chunk_size
         prefill_chunk_size_per_dp = (
-            ceil_div(prefill_chunk_size_global, get_global_args().infer.dp_size)
+            ceil_div(
+                prefill_chunk_size_global * get_global_args().infer.pcp_size,
+                get_global_args().infer.dp_size,
+            )
             if prefill_chunk_size_global is not None
             else None
         )

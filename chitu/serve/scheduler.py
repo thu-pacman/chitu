@@ -90,8 +90,24 @@ def init_dp_scheduler(args):
     )
 
     # Start the compute loop in a dedicated thread/event loop to avoid blocking asyncio
-    t = threading.Thread(target=start_worker, daemon=True)
+    device_id = torch.cuda.current_device()
+
+    def set_device_id_again_and_start_worker():
+        torch.cuda.set_device(device_id)
+        start_worker()
+
+    t = threading.Thread(target=set_device_id_again_and_start_worker)
     t.start()
 
-    # Run Enhanced Scheduler ZMQ service on the main asyncio loop
-    asyncio.run(start_enhanced_scheduler_service(rank, args.multi_inst, args))
+    # Run Enhanced Scheduler ZMQ service on the main asyncio loop.
+    # The compute loop owns CUDA/NCCL teardown; do not leave it as a daemon
+    # thread during interpreter shutdown, otherwise native destructors can abort
+    # with "terminate called without an active exception".
+    try:
+        asyncio.run(start_enhanced_scheduler_service(rank, args.multi_inst, args))
+    finally:
+        logger.info(
+            f"[SCHEDULER] rank={rank} waiting for compute worker thread to stop"
+        )
+        t.join()
+        logger.info(f"[SCHEDULER] rank={rank} compute worker thread stopped")
