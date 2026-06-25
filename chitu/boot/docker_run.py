@@ -9,6 +9,7 @@ import glob
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import traceback
 import requests
@@ -103,6 +104,7 @@ def docker_run(
     else:
         logger.info(f"Image {image_name} already exists in docker")
 
+    hosts_tmp_file = None
     docker_cmd = ["docker", "run", "--network", "host"]
 
     # Detect the type of device and add the corresponding docker arguments.
@@ -196,10 +198,16 @@ def docker_run(
         docker_cmd += ["-it"]
     try:
         # In some environment, /etc/hosts does not contain the hostname of the local node, which will
-        # cause `torchrun` to fail. Just add it explicitly.
-        docker_cmd += ["--add-host", socket.gethostname() + ":" + get_local_ip()]
+        # cause `torchrun` to fail. Copy /etc/hosts, add the hostname explicitly, and mount it.
+        # Do not use --add-host because it does not preserve the content in the host's /etc/hosts.
+        fd, hosts_tmp_file = tempfile.mkstemp(prefix="chitu-hosts-", dir="/tmp")
+        os.close(fd)
+        shutil.copyfile("/etc/hosts", hosts_tmp_file)
+        with open(hosts_tmp_file, "a") as f:
+            f.write(f"\n{get_local_ip()} {socket.gethostname()}\n")
+        docker_cmd += ["-v", f"{hosts_tmp_file}:/etc/hosts:ro"]
     except Exception as e:
-        logger.warning(f"Failed to get local ip or hostname: {e}")
+        logger.warning(f"Failed to add local ip to /etc/hosts: {e}")
     docker_cmd += docker_args
     docker_cmd += [image_name]
 
@@ -256,7 +264,16 @@ def docker_run(
         on_ready_thread.start()
 
     logger.info(f"Running: {service_docker_cmd}")
-    subprocess.run(service_docker_cmd, check=True)
+    try:
+        subprocess.run(service_docker_cmd, check=True)
+    finally:
+        if hosts_tmp_file is not None:
+            try:
+                os.unlink(hosts_tmp_file)
+            except OSError as e:
+                logger.warning(
+                    f"Failed to remove temporary hosts file {hosts_tmp_file}: {e}"
+                )
 
     if on_ready_thread is not None:
         on_ready_thread.join()
