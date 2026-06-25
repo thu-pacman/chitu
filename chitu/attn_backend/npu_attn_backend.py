@@ -73,6 +73,54 @@ class NpuAttnBackend(RefAttnBackend):
             max_nelem=max_batch_size * 8 * max_seq_len, dtype=torch.bool, device="npu"
         )
 
+        # --- DSA sparse MLA metadata (shared across all layers) ---
+        # sparse_mla_block_size is a host constant: decided by torch_npu.npu_fused_infer_attention_score
+        self.sparse_mla_block_size = 128
+        # Host list `actual_seq_lengths_kv`. Updated every step before graph replay
+        #  via `cpu_update_input` (see model.py decode `before_replay_callback`).
+        self.actual_seq_lengths_kv = None
+        self.sparse_mla_block_table = None
+        if hasattr(self.args.models, "index_topk") and self.args.models.index_topk:
+            index_topk = self.args.models.index_topk
+            mtp_size = int(getattr(self.args.infer, "mtp_size", 1))
+            n_blocks_per_token = (
+                index_topk + self.sparse_mla_block_size - 1
+            ) // self.sparse_mla_block_size
+            self.sparse_mla_block_table_static = StaticTensor(
+                max_nelem=max_batch_size * mtp_size * n_blocks_per_token,
+                dtype=torch.int32,
+                device="npu",
+            )
+        else:
+            self.sparse_mla_block_table_static = None
+
+    def prepare_sparse_mla_metadata(self, seq_len_delta):
+        """Compute DSA sparse-MLA metadata for one step."""
+        model_args = self.args.models
+        if not (hasattr(model_args, "index_topk") and model_args.index_topk):
+            return
+        index_topk = model_args.index_topk
+        # Per-token causal context length. Each delta (query) token attends to its own
+        # causal window [0, position], so its sparse read length is
+        # min(position + 1, index_topk)
+        context_lengths = seq_len_delta.delta_position_ids_tensor_device + 1
+        capped = context_lengths.clamp(max=index_topk)
+        self.actual_seq_lengths_kv = capped.to(torch.int32).cpu().tolist()
+
+        n_total_tokens = len(self.actual_seq_lengths_kv)
+        n_blocks_per_token = (
+            index_topk + self.sparse_mla_block_size - 1
+        ) // self.sparse_mla_block_size
+        self.sparse_mla_block_table = torch.arange(
+            0,
+            n_blocks_per_token * n_total_tokens,
+            dtype=torch.int32,
+            device=context_lengths.device,
+        ).reshape(n_total_tokens, n_blocks_per_token)
+        if not self.mla_routes_to_decode(seq_len_delta):
+            return
+        self.sparse_mla_block_table_static.set(self.sparse_mla_block_table)
+
     @override
     def decode_op_supports_mtp(self) -> bool:
         return True
@@ -117,6 +165,8 @@ class NpuAttnBackend(RefAttnBackend):
                 ).bool()
             q_start += q_len
             k_start += k_len
+
+        self.prepare_sparse_mla_metadata(seq_len_delta)
 
     def prepare_metadata_for_decode(
         self,
@@ -193,6 +243,8 @@ class NpuAttnBackend(RefAttnBackend):
                     torch.empty(0, dtype=torch.bool, device=seqlen.device)
                 )
 
+        self.prepare_sparse_mla_metadata(seq_len_delta)
+
     @override
     def prefill_ragged_qkvo(
         self,
@@ -208,7 +260,10 @@ class NpuAttnBackend(RefAttnBackend):
         topk_indices: Optional[torch.Tensor] = None,
     ):
         if topk_indices is not None:
-            raise NotImplementedError()
+            raise NotImplementedError(
+                "Sparse prefill_ragged_qkvo should be handled by "
+                "NpuAttnBackend.mla_prefill_ragged_qkvo; got topk_indices here."
+            )
 
         if q.numel() == 0:
             return torch.empty(
@@ -279,6 +334,156 @@ class NpuAttnBackend(RefAttnBackend):
             ),
             sparse_mode=1,
         )[0]
+
+    @override
+    def mla_prefill_ragged_qkvo(
+        self,
+        q_nope,
+        q_pe,
+        kv,
+        seq_len_delta: BatchedSeqLenDelta,
+        causal: bool = False,
+        softmax_scale=None,
+        topk_indices: Optional[torch.Tensor] = None,
+    ):
+        if topk_indices is not None:
+            return self._sparse_prefill_ragged_qkvo_npu(
+                q_nope,
+                q_pe,
+                kv,
+                topk_indices=topk_indices,
+                seq_len_delta=seq_len_delta,
+                causal=causal,
+                softmax_scale=softmax_scale,
+            )
+        return super().mla_prefill_ragged_qkvo(
+            q_nope,
+            q_pe,
+            kv,
+            seq_len_delta,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            topk_indices=topk_indices,
+        )
+
+    def _sparse_prefill_ragged_qkvo_npu(
+        self,
+        q_nope: torch.Tensor,  # [s_q, n_heads, kv_lora_rank]
+        q_pe: torch.Tensor,  # [s_q, n_heads, qk_rope_head_dim]
+        kv: torch.Tensor,  # [s_k, 1, kv_lora_rank + qk_rope_head_dim] — holistic latent
+        *,
+        topk_indices: torch.Tensor,  # [s_q, topk], int — seq-local k indices, -1 for pad
+        seq_len_delta: BatchedSeqLenDelta,
+        causal: bool,
+        softmax_scale: Optional[float],
+    ) -> torch.Tensor:
+        """
+        Sparse MLA-prefill for Ascend NPU via npu_fused_infer_attention_score.
+        """
+        s_q, n_heads, d_v = q_nope.shape  # d_v == kv_lora_rank
+        rope_dim = q_pe.shape[-1]  # qk_rope_head_dim
+        d_qk = d_v + rope_dim
+        s_k = kv.shape[0]
+
+        if s_q == 0:
+            return torch.empty(
+                0, n_heads, d_v, device=q_nope.device, dtype=q_nope.dtype
+            )
+
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(d_qk)
+
+        topk = topk_indices.shape[-1]
+
+        # Per-query global K offset.
+        ks = seq_len_delta.new.prefix_lens_tensor_device[
+            seq_len_delta.delta_seq_ids_tensor_device
+        ].to(
+            torch.long
+        )  # [s_q]
+
+        idx = topk_indices.to(torch.long)  # [s_q, topk]
+
+        # Validity: original index was a non-negative seq-local k offset and
+        # within [0, position+1) for causal (in [0, lens) for non-causal).
+        assert causal, f"_sparse_prefill_ragged_qkvo_npu only support causal"
+        # Per-token causal read length: min(position+1, index_topk), precomputed in
+        # prepare_sparse_mla_metadata. The indexer front-packs the valid causal
+        # indices (see Indexer.forward / ops.topk.topk_indices), so the operator
+        # reads exactly the valid set from the front of each row.
+        actual_seq_lengths_kv = self.actual_seq_lengths_kv
+
+        # Convert seq-local -> global K index. idx = -1 is clamped then bounded by
+        # actual_seq_lengths_kv (the operator ignores positions past valid_count).
+        global_idx = ks.unsqueeze(1) + idx.clamp(min=0)
+        global_idx = global_idx.clamp(min=0, max=max(s_k - 1, 0))
+        flat_idx = global_idx.reshape(-1)
+
+        # Slice the holistic latent into c_kv / k_pe via views (no copy), then gather
+        # the topk positions separately. value == c_kv for MLA, so it is reused.
+        kv_flat = kv.reshape(s_k, d_qk)
+        c_kv_flat = kv_flat[:, :d_v]  # [s_k, d_v]  (view)
+        k_pe_flat = kv_flat[:, d_v:]  # [s_k, rope_dim]  (view)
+        c_kv_sparse = c_kv_flat.index_select(0, flat_idx).view(s_q, topk, d_v)
+        k_pe_sparse = k_pe_flat.index_select(0, flat_idx).view(s_q, topk, rope_dim)
+
+        sps_mla_blk_size = self.sparse_mla_block_size
+        sps_mla_block_table = self.sparse_mla_block_table
+
+        # Query stays separated: nope -> query, pe -> query_rope. [s_q, 1, n_heads, *]
+        q_nope_bsnd = q_nope.unsqueeze(1).contiguous()
+        q_pe_bsnd = q_pe.unsqueeze(1).contiguous()
+
+        # Paged KV blocks: [total_blocks, sps_mla_blk_size, dim]
+        total_blocks = sps_mla_block_table.numel()
+        k_nope = c_kv_sparse.reshape(total_blocks, sps_mla_blk_size, d_v).contiguous()
+        k_rope = k_pe_sparse.reshape(
+            total_blocks, sps_mla_blk_size, rope_dim
+        ).contiguous()
+        v_cache = k_nope  # MLA value == c_kv
+
+        output = torch.empty_like(q_nope_bsnd)
+        softmax_lse = torch.empty(1, dtype=q_nope.dtype, device=q_nope.device)
+
+        workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+            q_nope_bsnd,
+            k_nope,
+            v_cache,
+            query_rope=q_pe_bsnd,
+            key_rope=k_rope,
+            num_heads=n_heads,
+            num_key_value_heads=1,
+            block_table=sps_mla_block_table,
+            block_size=sps_mla_blk_size,
+            input_layout="BSND",
+            scale=softmax_scale,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            sparse_mode=0,
+            antiquant_mode=0,
+            antiquant_scale=None,
+        )
+
+        torch_npu.npu_fused_infer_attention_score.out(
+            q_nope_bsnd,
+            k_nope,
+            v_cache,
+            query_rope=q_pe_bsnd,
+            key_rope=k_rope,
+            num_heads=n_heads,
+            num_key_value_heads=1,
+            block_table=sps_mla_block_table,
+            block_size=sps_mla_blk_size,
+            input_layout="BSND",
+            scale=softmax_scale,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            antiquant_mode=0,
+            antiquant_scale=None,
+            sparse_mode=0,
+            workspace=workspace,
+            out=[output, softmax_lse],
+        )
+
+        return output.view(s_q, n_heads, d_v)
 
     @override
     def prefill_ragged_qo_dense_kv(
@@ -534,9 +739,22 @@ class NpuAttnBackend(RefAttnBackend):
         topk_page_table: Optional[torch.Tensor] = None,
     ):
         if topk_page_table is not None:
-            raise NotImplementedError()
+            logger.warning_once(
+                "NPU mla_decode_paged_kv received topk_page_table but sparse "
+                "attention via topk_page_table is not implemented; expecting "
+                "topk_indices instead."
+            )
+            topk_page_table = None
         if topk_indices is not None:
-            raise NotImplementedError()
+            return self._sparse_mla_decode_paged_kv_npu(
+                q_nope,
+                q_pe,
+                kv_cache,
+                kv,
+                topk_indices=topk_indices,
+                seq_len_delta=seq_len_delta,
+                softmax_scale=softmax_scale,
+            )
 
         bsz, local_n_heads, kv_lora_rank = q_nope.shape
         _, _, qk_rope_head_dim = q_pe.shape
@@ -622,6 +840,163 @@ class NpuAttnBackend(RefAttnBackend):
             num_key_value_heads=self.local_n_kv_heads,
             block_table=kv_cache.block_table,
             block_size=block_size,
+            input_layout="BSND",
+            scale=softmax_scale,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            antiquant_mode=0,
+            antiquant_scale=None,
+            sparse_mode=0,
+            workspace=workspace,
+            out=[output, softmax_lse],
+        )
+
+        return output.view(bsz, local_n_heads, kv_lora_rank)
+
+    def _sparse_mla_decode_paged_kv_npu(
+        self,
+        q_nope: torch.Tensor,  # [bsz, n_heads, kv_lora_rank]
+        q_pe: torch.Tensor,  # [bsz, n_heads, qk_rope_head_dim]
+        kv_cache: PagedKVCacheAccessor,
+        kv: torch.Tensor,  # [bsz, 1, kv_lora_rank + qk_rope_head_dim]
+        *,
+        topk_indices: torch.Tensor,  # [bsz * mtp_size, topk], int — seq-local k indices, -1 for invalid
+        seq_len_delta: BatchedSeqLenDelta,
+        softmax_scale: Optional[float],
+    ) -> torch.Tensor:
+        """
+        Sparse MLA decode for Ascend NPU.
+        """
+        bsz, local_n_heads, kv_lora_rank = q_nope.shape
+        _, _, qk_rope_head_dim = q_pe.shape
+
+        if bsz == 0:
+            return torch.zeros(
+                bsz,
+                local_n_heads,
+                kv_lora_rank,
+                device=q_nope.device,
+                dtype=q_nope.dtype,
+            )
+
+        if softmax_scale is None:
+            assert self.qk_nope_head_dim is not None
+            softmax_scale = 1.0 / ((qk_rope_head_dim + self.qk_nope_head_dim) ** 0.5)
+
+        # Append the new KV before reading
+        assert "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv, (
+            f"NpuAttnBackend MLA requires KV cache contains 'kv_lora' and 'k_pe', "
+            f"current keys: {list(kv_cache.kv.keys())}"
+        )
+        append_to_paged_kv_cache(
+            kv_cache.kv["kv_lora"],
+            kv_cache.block_table,
+            kv[..., :kv_lora_rank],
+            seq_len_delta.old.lens_tensor_device,
+            get_page_ids=kv_cache.get_page_ids,
+            get_offs_in_page=kv_cache.get_offs_in_page,
+        )
+        append_to_paged_kv_cache(
+            kv_cache.kv["k_pe"],
+            kv_cache.block_table,
+            kv[..., kv_lora_rank:],
+            seq_len_delta.old.lens_tensor_device,
+            get_page_ids=kv_cache.get_page_ids,
+            get_offs_in_page=kv_cache.get_offs_in_page,
+        )
+
+        c_kv_cache = kv_cache.kv["kv_lora"]  # [n_pages, block_size, kv_lora_rank]
+        k_rope_cache = kv_cache.kv["k_pe"]  # [n_pages, block_size, qk_rope_head_dim]
+        block_size = c_kv_cache.shape[1]
+
+        # topk_indices is [bsz, topk] for classic (no-MTP) decode
+        # mla_decode_paged_kv is the classic-decoding path.
+        bsz_q, topk = topk_indices.shape
+        if bsz_q != bsz:
+            raise NotImplementedError(
+                f"sparse MLA decode expects topk_indices first-dim == bsz "
+                f"({bsz}); got {bsz_q}."
+            )
+
+        idx = topk_indices.to(torch.long)  # [bsz, topk]
+        # Token-level index -> (block_id, offset_in_block).
+        block_id_local = idx.clamp(min=0) // block_size  # [bsz, topk]
+        offs_in_block = idx.clamp(min=0) % block_size  # [bsz, topk]
+
+        # maskout invilia index: -1 or beyond seq_len
+        seq_lens = seq_len_delta.new.lens_tensor_device.to(torch.long)  # [bsz]
+        invalid_mask = (idx < 0) | (idx >= seq_lens.unsqueeze(1))  # [bsz,topk]
+        max_blocks = kv_cache.block_table.shape[1]
+        block_id_local = block_id_local.clamp(min=0, max=max(max_blocks - 1, 0))
+
+        # Translate per-seq local block id to physical page id.
+        page_id = kv_cache.block_table.to(torch.long).gather(
+            1, block_id_local
+        )  # [bsz,tok_k]
+
+        # [n_pages, block_size, kv_lora_rank] -> [n_pages*block_size, kv_lora_rank]
+        # [n_pages, block_size, qk_rope_head_dim] -> [n_pages*block_size, qk_rope_head_dim]
+        c_kv_flat_2d = c_kv_cache.reshape(-1, kv_lora_rank)
+        k_rope_flat_2d = k_rope_cache.reshape(-1, qk_rope_head_dim)
+
+        # Gather absorbed c_kv, k_rope
+        gathered_idx = (page_id * block_size + offs_in_block).reshape(-1)
+        c_kv_topk = c_kv_flat_2d.index_select(0, gathered_idx).view(
+            bsz, topk, kv_lora_rank
+        )
+        k_rope_topk = k_rope_flat_2d.index_select(0, gathered_idx).view(
+            bsz, topk, qk_rope_head_dim
+        )
+
+        sps_mla_blk_size = self.sparse_mla_block_size
+        sps_mla_block_table = self.sparse_mla_block_table_static.get()
+        actual_seq_lengths_kv = self.actual_seq_lengths_kv
+
+        # Query stays separated: nope -> query, pe -> query_rope. [s_q, 1, n_heads, *]
+        q_nope_bsnd = q_nope.unsqueeze(1).contiguous()
+        q_pe_bsnd = q_pe.unsqueeze(1).contiguous()
+
+        # Paged KV blocks: [total_blocks, sps_mla_blk_size, dim]
+        # total_blocks = bsz * n_blocks_per_q
+        total_blocks = sps_mla_block_table.numel()
+        k_nope = c_kv_topk.reshape(
+            total_blocks, sps_mla_blk_size, kv_lora_rank
+        ).contiguous()
+        k_rope = k_rope_topk.reshape(
+            total_blocks, sps_mla_blk_size, qk_rope_head_dim
+        ).contiguous()
+        v_cache = k_nope  # MLA value == c_kv
+
+        output = torch.empty_like(q_nope_bsnd)
+        softmax_lse = torch.empty(1, dtype=q_nope.dtype, device=q_nope.device)
+
+        workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+            q_nope_bsnd,
+            k_nope,
+            v_cache,
+            query_rope=q_pe_bsnd,
+            key_rope=k_rope,
+            num_heads=local_n_heads,
+            num_key_value_heads=1,
+            block_table=sps_mla_block_table,
+            block_size=sps_mla_blk_size,
+            input_layout="BSND",
+            scale=softmax_scale,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            sparse_mode=0,
+            antiquant_mode=0,
+            antiquant_scale=None,
+        )
+
+        torch_npu.npu_fused_infer_attention_score.out(
+            q_nope_bsnd,
+            k_nope,
+            v_cache,
+            query_rope=q_pe_bsnd,
+            key_rope=k_rope,
+            num_heads=local_n_heads,
+            num_key_value_heads=1,
+            block_table=sps_mla_block_table,
+            block_size=sps_mla_blk_size,
             input_layout="BSND",
             scale=softmax_scale,
             actual_seq_lengths_kv=actual_seq_lengths_kv,

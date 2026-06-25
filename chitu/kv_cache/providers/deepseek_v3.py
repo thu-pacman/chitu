@@ -58,8 +58,10 @@ def deepseek_v3_indexer_cache_spec(args, attn_backend_type) -> KVCacheSpec:
             },
         )
 
-    # Hygon BF16 indexer-kv layout keeps only K.
-    if args.infer.indexer_type == "hygon":
+    # BF16 indexer-kv layout keeps only K. Used by:
+    #   - Hygon (lightop.op.mqa_logits / paged_mqa_logits)
+    #   - Ascend NPU (pure-torch bf16 mqa_logits)
+    if args.infer.indexer_type in ("hygon", "torch_bf16"):
         return KVCacheSpec(
             block_size=64,
             kvargs={

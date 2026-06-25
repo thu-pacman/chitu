@@ -117,6 +117,10 @@ def _auto_moe_gate(
         and scores.shape[-1] in [256, 384]
         and norm_prob
         and score_func in ["softmax", "sigmoid"]
+        # aclnnMoeGatingTopK requires group_count == k_count == k.
+        # Models like GLM-5/5.1 use n_group=1, topk_group=1, topk=8, so we
+        # have to fall back to the pure-torch path on NPU there.
+        and num_expert_group == topk_group == topk
     ):
         return "npu_moe_gating_top_k"
     if (

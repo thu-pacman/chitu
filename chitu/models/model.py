@@ -1721,13 +1721,21 @@ class Transformer(nn.Module):
                     self.args.models.type, infer_args.max_batch_size
                 )
             ):
+                if hasattr(self.args.models, "index_topk"):
+                    # DSA sparse MLA read only min(seq_len, topk) KV positions, NOT the full context length.
+                    # `prepare_decoding_attn` -> `prepare_sparse_mla_metadata` recomputes this host list on
+                    # every decode step (before each replay).
+                    actual_seq_lengths_kv_fn = (
+                        lambda: self.attn_backend.actual_seq_lengths_kv
+                    )
+                else:
+                    actual_seq_lengths_kv_fn = lambda: self.cache_dict[
+                        "main"
+                    ].seq_len_delta.new.lens_list
+
                 before_replay_callback = lambda graph: graph.update(
                     cpu_update_input=[
-                        {
-                            "actual_seq_lengths_kv": self.cache_dict[
-                                "main"
-                            ].seq_len_delta.new.lens_list
-                        }
+                        {"actual_seq_lengths_kv": actual_seq_lengths_kv_fn()}
                     ]
                 )
 

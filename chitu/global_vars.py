@@ -443,10 +443,17 @@ def resolve_default_args(args):
         args.models.type == ModelType.DEEPSEEK_V3
         and args.models.get("index_topk", None) is not None
     ):
-        assert args.infer.indexer_type in ("auto", "deepgemm", "hygon", "triton")
+        assert args.infer.indexer_type in (
+            "auto",
+            "deepgemm",
+            "hygon",
+            "torch_bf16",
+            "triton",
+        )
         from chitu.dsa_indexer import (
             support_indexer_deepgemm,
             support_indexer_hygon,
+            support_indexer_torch_bf16,
             validate_indexer_config,
         )
 
@@ -459,6 +466,12 @@ def resolve_default_args(args):
                 and int(args.models.index_n_heads) in (32, 64)
             ):
                 args.infer.indexer_type = "hygon"
+            elif (
+                support_indexer_torch_bf16
+                and args.infer.cache_type == "paged"
+                and args.infer.mtp_size < 3
+            ):
+                args.infer.indexer_type = "torch_bf16"
             elif (
                 support_indexer_deepgemm
                 and args.infer.cache_type == "paged"

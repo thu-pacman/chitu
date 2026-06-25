@@ -19,7 +19,7 @@ from chitu.kv_cache import (
     PagedKVCacheAccessor,
     DenseKVCacheAccessor,
 )
-from chitu.device_type import is_hygon, is_nvidia
+from chitu.device_type import is_ascend, is_hygon, is_nvidia
 from chitu.utils import try_import_opt_dep, try_import_platform_dep, get_global_args
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.ops.topk import topk_indices
@@ -50,6 +50,8 @@ support_indexer_hygon = (
     and hasattr(lightop.gemmopt, "paged_mqa_logits")
     and hasattr(lightop.gemmopt, "get_paged_mqa_logits_metadata")
 )
+# torch_bf16 uses a pure-torch bf16 mqa_logits.
+support_indexer_torch_bf16 = is_ascend()
 
 
 def validate_indexer_config(args, indexer_type):
@@ -59,6 +61,8 @@ def validate_indexer_config(args, indexer_type):
         _validate_deepgemm_indexer_config(args)
     elif indexer_type == "hygon":
         _validate_hygon_indexer_config(args)
+    elif indexer_type == "torch_bf16":
+        _validate_torch_bf16_indexer_config(args)
 
 
 def _validate_deepgemm_indexer_config(args):
@@ -93,6 +97,17 @@ def _validate_hygon_indexer_config(args):
         )
 
 
+def _validate_torch_bf16_indexer_config(args):
+    if not support_indexer_torch_bf16:
+        raise ValueError("indexer_type=torch_bf16 requires running on an Ascend NPU")
+    if args.infer.cache_type != "paged":
+        raise ValueError(
+            f"indexer_type=torch_bf16 only supports cache_type=paged, but got {args.infer.cache_type}"
+        )
+    if args.infer.mtp_size > 2:
+        raise ValueError("indexer_type=torch_bf16 does not support mtp_size > 2")
+
+
 class DSAIndexer:
     def __init__(self, impl="auto"):
         args = get_global_args()
@@ -103,6 +118,7 @@ class DSAIndexer:
             assert impl in [
                 "deepgemm",
                 "hygon",
+                "torch_bf16",
                 "triton",
                 "torch",
             ], f"Unsupported {impl=}"
@@ -226,6 +242,67 @@ class DSAIndexer:
 
         return index_score
 
+    @staticmethod
+    def _bf16_mqa_logits_torch(
+        q: torch.Tensor,  # [s_q, h, d], bf16
+        k: torch.Tensor,  # [s_k, d], bf16
+        weights: torch.Tensor,  # [s_q, h], fp32
+        ks: torch.Tensor,  # [s_q], int32 — start of valid k range in concat K per query
+        ke: torch.Tensor,  # [s_q], int32 — end (exclusive) of valid k range in concat K
+        out_max_n: int,
+    ) -> torch.Tensor:
+        """
+        Pure-torch MQA logits for ragged QK on NPU.
+        """
+        s_q, h, _ = q.shape
+
+        # bmm: q [s_q, h, d] · k.T [d, s_k] -> [s_q, h, s_k]
+        qk = torch.matmul(q, k.transpose(0, 1))
+        qk = torch.relu(qk)
+        # weighted sum over heads: [s_q, s_k]
+        score_global = (qk * weights.to(qk.dtype).unsqueeze(-1)).sum(dim=1)
+
+        # Remap each query's [ks, ke) slice to local offsets [0, ke-ks).
+        s_k = k.shape[0]
+
+        # Build per-query column indices: clamp to [0, s_k-1], invalid positions get
+        # -inf score below.
+        j_local = torch.arange(out_max_n, device=score_global.device, dtype=ks.dtype)
+        j_global = ks.unsqueeze(1) + j_local.unsqueeze(0)  # [s_q, out_max_n]
+        in_range = j_global < ke.unsqueeze(1)  # [s_q, out_max_n]
+        j_clamped = j_global.clamp(min=0, max=max(s_k - 1, 0)).to(torch.long)
+        gathered = score_global.gather(1, j_clamped)  # [s_q, out_max_n]
+        score = torch.where(
+            in_range, gathered, torch.full_like(gathered, float("-inf"))
+        )
+        return score
+
+    def bf16_index_score_ragged_qk_dsv32_torch_bf16(
+        self,
+        q: torch.Tensor,  # [s_q, h, d=128], bf16
+        weights: torch.Tensor,  # [s_q, h], fp32
+        k: torch.Tensor,  # [s_k, d=128], bf16
+        seq_len_delta: BatchedSeqLenDelta,
+        causal: bool,
+    ):
+        """Pure-torch bf16 mqa_logits for ragged qk (prefill)."""
+        s_q, h, _ = q.shape
+        assert k.dim() == 2
+        weights = weights.reshape(s_q, h)
+        ks = seq_len_delta.new.prefix_lens_tensor_device[
+            seq_len_delta.delta_seq_ids_tensor_device
+        ]
+        if causal:
+            ke = seq_len_delta.delta_position_ids_tensor_device + ks + 1
+        else:
+            ke = (
+                seq_len_delta.new.lens_tensor_device[
+                    seq_len_delta.delta_seq_ids_tensor_device
+                ]
+                + ks
+            )
+        return self._bf16_mqa_logits_torch(q, k, weights, ks, ke, self.static_max_n)
+
     def bf16_index_score_ragged_q_paged_k_dsv32_hygon(
         self,
         q: torch.Tensor,  # [s_q, h, d=128], bf16
@@ -264,6 +341,57 @@ class DSAIndexer:
             self.static_max_n,
             clean_logits=True,
         )
+
+    def bf16_index_score_ragged_q_paged_k_dsv32_torch_bf16(
+        self,
+        q: torch.Tensor,  # [s_q, h, d]  bf16
+        weights: torch.Tensor,  # [s_q, h]      fp32
+        k_cache: torch.Tensor,  # [n_pages, page_size, d]  bf16
+        seq_len_delta: BatchedSeqLenDelta,
+        k_page_table: torch.Tensor,  # [b, n_pages_per_seq]
+    ):
+        s_q, h, d = q.shape
+        batch_size = seq_len_delta.batch_size
+        page_size = k_cache.shape[1]
+        n_pages_per_seq = k_page_table.shape[1]
+        max_ctx = n_pages_per_seq * page_size
+        out_max_n = self.static_max_n
+
+        # Gather paged KV → [b, max_ctx, d]
+        page_ids = k_page_table.to(torch.long).reshape(-1)  # [b*n_pages]
+        gathered = k_cache[page_ids].view(batch_size, max_ctx, d)  # [b, max_ctx, d]
+
+        # 展开 q/weights 到 [b, mtp, h, d]
+        mtp = self.mtp_size
+        q_b = q.view(batch_size, mtp, h, d)  # [b, mtp, h, d]
+        w_b = weights.view(batch_size, mtp, h)  # [b, mtp, h]
+
+        # QK matmul: [b, mtp, h, d] × [b, max_ctx, d].T → [b, mtp, h, max_ctx]
+        # gathered: [b, max_ctx, d] → [b, 1, d, max_ctx] (broadcast over mtp & h)
+        k_t = gathered.transpose(1, 2).unsqueeze(1)  # [b, 1, d, max_ctx]
+        # q_b: [b, mtp, h, d]
+        # torch.matmul broadcasts: [b, mtp, h, d] × [b, 1, d, max_ctx] → [b, mtp, h, max_ctx]
+        qk = torch.matmul(q_b, k_t)  # [b, mtp, h, max_ctx]  bf16
+        qk = torch.relu(qk)
+
+        # Weighted head reduction: Σ_h qk * weights
+        # w_b: [b, mtp, h] → [b, mtp, h, 1]
+        score = (qk * w_b.to(qk.dtype).unsqueeze(-1)).sum(dim=2)  # [b, mtp, max_ctx]
+
+        # 应用 context_lens mask
+        context_lens = seq_len_delta.new.lens_tensor_device  # [b]
+        # j_idx: [1, 1, max_ctx]  context_lens: [b, 1, 1]
+        j_idx = torch.arange(max_ctx, device=score.device, dtype=torch.long)
+        mask = j_idx.view(1, 1, max_ctx) < context_lens.view(batch_size, 1, 1)
+        score = score.masked_fill(~mask, float("-inf"))  # [b, mtp, max_ctx]
+
+        # 截断到 out_max_n 并 reshape 回 [s_q, out_max_n]
+        n = min(max_ctx, out_max_n)
+        score_out = torch.full(
+            (s_q, out_max_n), float("-inf"), dtype=q.dtype, device=q.device
+        )
+        score_out[:, :n] = score.view(s_q, max_ctx)[:, :n]
+        return score_out
 
     def prepare_metadata_for_decode(
         self,
@@ -499,6 +627,47 @@ class DSAIndexer:
 
         return index_score
 
+    def bf16_index_score_dsa_torch_bf16(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        seq_len_delta: BatchedSeqLenDelta,
+        cache_accessor: KVCacheAccessor,
+        is_causal=True,
+    ):
+        """Pure-torch bf16 equivalent of bf16_index_score_dsa: bf16 KV cache, pure-torch mqa."""
+        assert isinstance(cache_accessor, PagedKVCacheAccessor)
+        append_to_paged_kv_cache(
+            cache_accessor.kv["indexer_k"],
+            cache_accessor.block_table,
+            k,
+            seq_len_delta.delta_position_ids_tensor_device,
+            seq_len_delta.delta_seq_ids_tensor_device,
+            get_page_ids=cache_accessor.get_page_ids,
+            get_offs_in_page=cache_accessor.get_offs_in_page,
+            use_i64_offsets=cache_accessor.use_i64_offsets,
+        )
+
+        if seq_len_delta.is_decode_stage:
+            return self.bf16_index_score_ragged_q_paged_k_dsv32_torch_bf16(
+                q,
+                weights,
+                cache_accessor.kv["indexer_k"],
+                seq_len_delta,
+                cache_accessor.block_table,
+            )
+
+        k_full = read_from_paged_kv_cache(
+            cache_accessor.kv["indexer_k"],
+            cache_accessor.block_table,
+            seq_len_delta.new.position_ids_tensor_device,
+            seq_len_delta.new.seq_ids_tensor_device,
+        )
+        return self.bf16_index_score_ragged_qk_dsv32_torch_bf16(
+            q, weights, k_full, seq_len_delta, is_causal
+        )
+
     def dsa_indexer(
         self,
         q_fp8,
@@ -540,6 +709,15 @@ class DSAIndexer:
                 is_causal,
                 ke=ke,
                 k_append=k_append,
+            )
+        elif self.impl == "torch_bf16":
+            logits = self.bf16_index_score_dsa_torch_bf16(
+                q_fp8,
+                k_fp8,
+                weights,
+                seq_len_delta,
+                cache_accessor,
+                is_causal,
             )
         else:  # triton and torch impl share a same kv layout
             logits = self.blockfp8_index_score_dsa_triton(
