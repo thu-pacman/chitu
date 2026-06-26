@@ -39,6 +39,7 @@
 | GLM-5-W8A8 | ✓ | `models=GLM-5-W8A8` | https://huggingface.co/zai-org/GLM-5 |
 | GLM-5.1 | ✓ | `models=GLM-5.1` | https://huggingface.co/zai-org/GLM-5.1 |
 | GLM-5.1-FP8 | ✓ | `models=GLM-5.1-FP8` | https://huggingface.co/zai-org/GLM-5.1-FP8 |
+| GLM-5.1-W8A8 | ✓ | `models=GLM-5.1-W8A8` | https://modelscope.cn/models/metax-tech/GLM-5.1-W8A8 |
 | GLM-5.2 | ✓ | `models=GLM-5.2` | https://huggingface.co/zai-org/GLM-5.2 |
 | GLM-5.2-FP8 | ✓ | `models=GLM-5.2-FP8` | https://huggingface.co/zai-org/GLM-5.2-FP8 |
 | glm-z1-32b |  | `models=GLM-Z1-32B-0414` | https://modelscope.cn/models/ZhipuAI/GLM-Z1-32B-0414/ |

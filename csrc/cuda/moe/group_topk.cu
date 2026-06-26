@@ -100,7 +100,7 @@ __device__ __forceinline__ float compute_gate_score(float x, int score_fun) {
 }
 
 template <typename T, typename BIAS_T, int VPT, int NUM_EXPERTS, int BLOCK_SIZE,
-          int BYTES_PER_LDG, int topK>
+          int BYTES_PER_LDG, int topK, bool NORMALIZE_TOPK>
 __global__ void __launch_bounds__(BLOCK_SIZE)
     fused_sigmoid_topk_kernel(const T *input, const int score_fun,
                               const int batchSize, const int n_groups,
@@ -350,6 +350,21 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     // A more efficient sorting algorithm may be needed if the dataset is very
     // large.
     if (threadIdInGroup == 0 && isValidThread) {
+        if constexpr (NORMALIZE_TOPK) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < topK; ++i) {
+                sum += to_float(topK_weights[i]);
+            }
+            if (sum != 0.0f) {
+                const float inv_sum = 1.0f / sum;
+#pragma unroll
+                for (int i = 0; i < topK; ++i) {
+                    topK_weights[i] =
+                        to_scalar<T>(to_float(topK_weights[i]) * inv_sum);
+                }
+            }
+        }
         int output_offset = threadRow * topK;
         if constexpr (topK == 6) {
             using WeightVec2 = StoreArray<T, 2>;
@@ -396,7 +411,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     }
 }
 
-template <typename T, typename BIAS_T, int EXPERTS>
+template <typename T, typename BIAS_T, int EXPERTS, bool NORMALIZE_TOPK>
 void fused_gate_dispatcher(const T *input, const int score_fun,
                            const int batchSize, const int n_groups,
                            const int topK_groups, int topInGroup,
@@ -420,7 +435,7 @@ void fused_gate_dispatcher(const T *input, const int score_fun,
 
 #define LAUNCH_FUSED_TOPK(TOPK)                                                \
     fused_sigmoid_topk_kernel<T, BIAS_T, VPT, EXPERTS, BLOCK_SIZE,             \
-                              BYTES_PER_LDG, TOPK>                             \
+                              BYTES_PER_LDG, TOPK, NORMALIZE_TOPK>             \
         <<<numBlocks, block_dim, 0, stream>>>(                                 \
             input, score_fun, batchSize, n_groups, topK_groups, topInGroup,    \
             expertsIds, selectedExpertsWeights, bias);
@@ -440,11 +455,11 @@ void fused_gate_dispatcher(const T *input, const int score_fun,
 }
 
 #define LAUNCH_GATE(NUM_EXPERTS)                                               \
-    fused_gate_dispatcher<T, BIAS_T, NUM_EXPERTS>(                             \
+    fused_gate_dispatcher<T, BIAS_T, NUM_EXPERTS, NORMALIZE_TOPK>(             \
         input, score_fun, batchSize, n_groups, topK_groups, topInGroup,        \
         expertsIds, selectedExpertsWeights, topK, bias, stream)
 
-template <typename T, typename BIAS_T>
+template <typename T, typename BIAS_T, bool NORMALIZE_TOPK>
 void fused_gate_launcher(const T *input, int score_fun, const int batchSize,
                          const int n_groups, const int topK_groups,
                          int topInGroup, int *expertsIds,
@@ -485,7 +500,7 @@ void fused_gate_launcher(const T *input, int score_fun, const int batchSize,
     }
 }
 
-template <typename T, typename BIAS_T>
+template <typename T, typename BIAS_T, bool NORMALIZE_TOPK>
 void fused_gate_launcher_wrapper(const torch::Tensor &input, int score_fun,
                                  const int batchSize, const int n_groups,
                                  const int topK_groups, int topInGroup,
@@ -501,17 +516,18 @@ void fused_gate_launcher_wrapper(const torch::Tensor &input, int score_fun,
     BIAS_T *bias_ptr = bias.has_value()
                            ? reinterpret_cast<BIAS_T *>(bias.value().data_ptr())
                            : nullptr;
-    fused_gate_launcher<T, BIAS_T>(input_ptr, score_fun, batchSize, n_groups,
-                                   topK_groups, topInGroup, expertsIds_ptr,
-                                   selectedExpertsWeights_ptr, topK, numExperts,
-                                   bias_ptr, stream);
+    fused_gate_launcher<T, BIAS_T, NORMALIZE_TOPK>(
+        input_ptr, score_fun, batchSize, n_groups, topK_groups, topInGroup,
+        expertsIds_ptr, selectedExpertsWeights_ptr, topK, numExperts, bias_ptr,
+        stream);
 }
 
-void route_gate(torch::Tensor &linear_output, int score_fun, int batchSize,
-                int n_groups, int topK_groups, int topInGroup,
-                torch::Tensor &expertsIds,
-                torch::Tensor &selectedExpertsWeights, int topK,
-                c10::optional<torch::Tensor> bias) {
+template <bool NORMALIZE_TOPK>
+void route_gate_impl(torch::Tensor &linear_output, int score_fun, int batchSize,
+                     int n_groups, int topK_groups, int topInGroup,
+                     torch::Tensor &expertsIds,
+                     torch::Tensor &selectedExpertsWeights, int topK,
+                     c10::optional<torch::Tensor> bias) {
     int seq_length = linear_output.size(0);
     int num_experts = linear_output.numel() / seq_length;
     auto dtype = linear_output.dtype();
@@ -543,24 +559,44 @@ void route_gate(torch::Tensor &linear_output, int score_fun, int batchSize,
         using kernel_t = typename map_to_cuda_type<input_t>::type;
         if (bias.has_value()) {
             if (bias.value().scalar_type() == at::ScalarType::Float) {
-                fused_gate_launcher_wrapper<kernel_t, float>(
+                fused_gate_launcher_wrapper<kernel_t, float, NORMALIZE_TOPK>(
                     linear_output, score_fun, batchSize, n_groups, topK_groups,
                     topInGroup, expertsIds, selectedExpertsWeights, topK,
                     num_experts, bias, stream);
             } else {
                 using bias_t = typename map_to_cuda_type<input_t>::type;
-                fused_gate_launcher_wrapper<kernel_t, bias_t>(
+                fused_gate_launcher_wrapper<kernel_t, bias_t, NORMALIZE_TOPK>(
                     linear_output, score_fun, batchSize, n_groups, topK_groups,
                     topInGroup, expertsIds, selectedExpertsWeights, topK,
                     num_experts, bias, stream);
             }
         } else {
-            fused_gate_launcher_wrapper<kernel_t, kernel_t>(
+            fused_gate_launcher_wrapper<kernel_t, kernel_t, NORMALIZE_TOPK>(
                 linear_output, score_fun, batchSize, n_groups, topK_groups,
                 topInGroup, expertsIds, selectedExpertsWeights, topK,
                 num_experts, bias, stream);
         }
     });
+}
+
+void route_gate(torch::Tensor &linear_output, int score_fun, int batchSize,
+                int n_groups, int topK_groups, int topInGroup,
+                torch::Tensor &expertsIds,
+                torch::Tensor &selectedExpertsWeights, int topK,
+                c10::optional<torch::Tensor> bias) {
+    route_gate_impl<false>(linear_output, score_fun, batchSize, n_groups,
+                           topK_groups, topInGroup, expertsIds,
+                           selectedExpertsWeights, topK, bias);
+}
+
+void route_gate_norm(torch::Tensor &linear_output, int score_fun, int batchSize,
+                     int n_groups, int topK_groups, int topInGroup,
+                     torch::Tensor &expertsIds,
+                     torch::Tensor &selectedExpertsWeights, int topK,
+                     c10::optional<torch::Tensor> bias) {
+    route_gate_impl<true>(linear_output, score_fun, batchSize, n_groups,
+                          topK_groups, topInGroup, expertsIds,
+                          selectedExpertsWeights, topK, bias);
 }
 
 } // namespace chitu

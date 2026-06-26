@@ -28,6 +28,12 @@ void route_gate(torch::Tensor &linear_output, int score_fun, int batchSize,
                 torch::Tensor &selectedExpertsWeights, int topK,
                 c10::optional<torch::Tensor> bias = c10::nullopt);
 
+void route_gate_norm(torch::Tensor &linear_output, int score_fun, int batchSize,
+                     int n_groups, int topK_groups, int topInGroup,
+                     torch::Tensor &expertsIds,
+                     torch::Tensor &selectedExpertsWeights, int topK,
+                     c10::optional<torch::Tensor> bias = c10::nullopt);
+
 void hash_route_gate(torch::Tensor &x, torch::Tensor &weight,
                      torch::Tensor &input_ids, torch::Tensor &tid2eid,
                      torch::Tensor &expertsIds,

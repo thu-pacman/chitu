@@ -36,7 +36,7 @@ from chitu.models.model import (
     get_linear_layout_contig_y,
 )
 from chitu.models.registry import ModelType, register_model
-from chitu.device_type import is_hygon
+from chitu.device_type import is_ascend, is_hygon
 from chitu.native_layout import NativeLayoutTensor
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.ops import (
@@ -178,6 +178,21 @@ class Indexer(torch.nn.Module):
         if not k_pre_normed:
             k = self.k_norm(k)
 
+        # On NPU the partial-rotary kernel may return a
+        # PartialColumnOddEvenSeparatedTensor.
+        # The downstream operators here (hadamard, matmul,
+        # append_to_paged_kv_cache) all expect a plain
+        # tensor, so unwrap it back to mathematical layout.
+        if isinstance(q, NativeLayoutTensor):
+            q = q.layout_tensor
+        if isinstance(k, NativeLayoutTensor):
+            k = k.layout_tensor
+
+        q = self._rotate_activation(q)
+        k = self._rotate_activation(k)
+        if self.indexer_impl.impl in ("hygon", "torch_bf16"):
+            return (q, None), (k, None)
+
         if freqs_cis_k is not None:
             # CP mode: separate RoPE for Q (local) and K (global)
             q_rot, _, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
@@ -253,7 +268,7 @@ class Indexer(torch.nn.Module):
         q_indexer, q_scale = q_pack
         k_indexer, k_scale = k_pack
         weights = self.weights_proj(x) * self.n_heads**-0.5
-        if self.indexer_impl.impl == "hygon":
+        if self.indexer_impl.impl in ("hygon", "torch_bf16"):
             weights = (weights * self.softmax_scale).to(torch.float32).contiguous()
         else:
             weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
@@ -355,7 +370,7 @@ class Indexer(torch.nn.Module):
             cache_accessor,
             freqs_cis_k=freqs_cis_k,
             k_pre_normed=k_pre_normed,
-        )
+        )  # [s_q, out_max_n]
         topk = min(self.index_topk, index_score.size(-1))
         # Use cached local_lengths only in CP path (freqs_cis_k is not None).
         # In non-CP path, always use seq_len_delta.
@@ -1639,9 +1654,7 @@ class TransformerDeepSeekV3(Transformer):
 
         return checkpoint
 
-    def _normalize_hygon_w8a8_kv_b_proj_checkpoint(
-        self, state_dict: dict[str, Any]
-    ) -> None:
+    def _normalize_w8a8_kv_b_proj_checkpoint(self, state_dict: dict[str, Any]) -> None:
         if self.mla_absorb != "absorb-without-precomp":
             return
 
@@ -2189,8 +2202,8 @@ class TransformerDeepSeekV3(Transformer):
         replace: bool = True,
     ) -> dict[str, Any]:
         if not skip_preprocess and replace:
-            if is_hygon():
-                self._normalize_hygon_w8a8_kv_b_proj_checkpoint(state_dict)
+            if is_hygon() or is_ascend():
+                self._normalize_w8a8_kv_b_proj_checkpoint(state_dict)
 
             for k in list(state_dict.keys()):
                 value = state_dict.pop(k)

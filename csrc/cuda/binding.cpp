@@ -42,6 +42,7 @@ void init_compute(py::module &m) {
           &batched_routed_activation_indexed_to_expert_block_indexed, "");
     m.def("cuda_add_shared_experts", &add_shared_experts, "");
     m.def("cuda_route_gate", &route_gate, "");
+    m.def("cuda_route_gate_norm", &route_gate_norm, "");
     m.def("cuda_hash_route_gate", &hash_route_gate, "");
     m.def("cuda_rotary_pos_emb_llama", &rotary_pos_emb_llama, "q"_a, "k"_a,
           "freqs_cis_cos"_a, "freqs_cis_sin"_a, "q_out"_a = std::nullopt,

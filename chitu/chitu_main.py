@@ -883,6 +883,7 @@ def _warmup_via_taskpool(args):
                 max_new_tokens=_warmup_max_new_tokens,
                 temperature=0.7,
                 top_k=1,
+                random_tokens=True,
             )
             task = Task(f"{req.request_id}", req, stop_with_eos=False)
             TaskPool.add(task)

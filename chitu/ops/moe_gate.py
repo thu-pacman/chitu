@@ -117,6 +117,10 @@ def _auto_moe_gate(
         and scores.shape[-1] in [256, 384]
         and norm_prob
         and score_func in ["softmax", "sigmoid"]
+        # aclnnMoeGatingTopK requires group_count == k_count == k.
+        # Models like GLM-5/5.1 use n_group=1, topk_group=1, topk=8, so we
+        # have to fall back to the pure-torch path on NPU there.
+        and num_expert_group == topk_group == topk
     ):
         return "npu_moe_gating_top_k"
     if (
@@ -227,21 +231,36 @@ def moe_gate_cuda(
         score_fun = 1 if score_func == "sigmoid" else 2
         topk_ids = torch.empty(bs, topk, dtype=torch.int, device=scores.device)
         topk_weights = torch.empty(bs, topk, dtype=scores.dtype, device=scores.device)
-        chitu_backend.cuda_route_gate(
-            scores,
-            score_fun,
-            # TODO: Merge the score_func == "softmax" branch into this C function
-            bs,
-            num_expert_group,
-            topk_group,
-            -1 if num_expert_group == 1 else topk_as_topk_group_criteria,
-            topk_ids,
-            topk_weights,
-            topk,
-            e_score_correction_bias,
-        )
-        if norm_prob:
-            topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
+        if norm_prob and topk == 8:
+            chitu_backend.cuda_route_gate_norm(
+                scores,
+                score_fun,
+                # TODO: Merge the score_func == "softmax" branch into this C function
+                bs,
+                num_expert_group,
+                topk_group,
+                -1 if num_expert_group == 1 else topk_as_topk_group_criteria,
+                topk_ids,
+                topk_weights,
+                topk,
+                e_score_correction_bias,
+            )
+        else:
+            chitu_backend.cuda_route_gate(
+                scores,
+                score_fun,
+                # TODO: Merge the score_func == "softmax" branch into this C function
+                bs,
+                num_expert_group,
+                topk_group,
+                -1 if num_expert_group == 1 else topk_as_topk_group_criteria,
+                topk_ids,
+                topk_weights,
+                topk,
+                e_score_correction_bias,
+            )
+            if norm_prob:
+                topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
         return topk_ids, topk_weights
 
     else:

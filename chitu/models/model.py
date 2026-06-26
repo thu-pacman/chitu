@@ -1033,6 +1033,7 @@ class Transformer(nn.Module):
                 # TODO: 与后面的chunk tp合并，消除可能的内存复制，否则prefetch会失效
                 state_dict = self.process_state_dict_for_repeat_kv_head(state_dict)
 
+            if self.tp_size > 1 or self.etp_size > 1:
                 state_dict = self._chunk_checkpoint_for_tensor_parallel(
                     state_dict,
                     self.tp_group.rank_in_group,
@@ -1721,13 +1722,21 @@ class Transformer(nn.Module):
                     self.args.models.type, infer_args.max_batch_size
                 )
             ):
+                if hasattr(self.args.models, "index_topk"):
+                    # DSA sparse MLA read only min(seq_len, topk) KV positions, NOT the full context length.
+                    # `prepare_decoding_attn` -> `prepare_sparse_mla_metadata` recomputes this host list on
+                    # every decode step (before each replay).
+                    actual_seq_lengths_kv_fn = (
+                        lambda: self.attn_backend.actual_seq_lengths_kv
+                    )
+                else:
+                    actual_seq_lengths_kv_fn = lambda: self.cache_dict[
+                        "main"
+                    ].seq_len_delta.new.lens_list
+
                 before_replay_callback = lambda graph: graph.update(
                     cpu_update_input=[
-                        {
-                            "actual_seq_lengths_kv": self.cache_dict[
-                                "main"
-                            ].seq_len_delta.new.lens_list
-                        }
+                        {"actual_seq_lengths_kv": actual_seq_lengths_kv_fn()}
                     ]
                 )
 

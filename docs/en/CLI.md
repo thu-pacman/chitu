@@ -401,6 +401,7 @@ Accetable values:
 - "deepgemm": use deep_gemm mqa logits and fused paged indexer-kv layout (requires deep_gemm).
 - "triton": use triton impl when computing index_score and separate (paged/skew) indexer-kv layout.
 - "hygon": use bf16 indexer dtype in hygon platform
+- "torch_bf16": pure-torch bf16 mqa logits (auto-selected on Ascend NPU)
 
 *Default: `auto`.*
 

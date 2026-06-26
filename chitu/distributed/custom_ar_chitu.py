@@ -3,31 +3,32 @@
 
 from contextlib import contextmanager
 from typing import List, Optional, Union
+from logging import getLogger
 import os
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from logging import getLogger
+from chitu.import_utils import try_import_platform_dep, try_import_opt_dep
 
-from chitu.import_utils import try_import_platform_dep
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+pynvml, has_pynvml = try_import_opt_dep("pynvml", "nvidia-ml-py")
 
-ops = None
-has_chitu_backend = False
+logger = getLogger(__name__)
+
 custom_ar = False
 _backend_checked = False
 
 
 def _init_backend():
-    global ops, has_chitu_backend, custom_ar, _backend_checked
+    global custom_ar, _backend_checked
     if _backend_checked:
         return
     _backend_checked = True
-    ops, has_chitu_backend = try_import_platform_dep("chitu_backend")
     try:
         if has_chitu_backend:
-            ops.meta_size()
+            chitu_backend.meta_size()
             custom_ar = True
         else:
             custom_ar = False
@@ -50,8 +51,6 @@ CUSTOM_ALL_REDUCE_MAX_SIZES = {
         8: 1 * MiB,
     },
 }
-
-logger = getLogger(__name__)
 
 
 def is_weak_contiguous(inp: torch.Tensor):
@@ -77,16 +76,14 @@ def _check_full_nvlink(physical_device_ids) -> bool:
     """Every pair of GPUs is connected by NVLink (1 hop).
 
     Matches vLLM's `is_fully_connected` (vllm/platforms/cuda.py): query NVML
-    via pynvml for each pair with `NVML_P2P_CAPS_INDEX_NVLINK`. Only returns
+    via nvidia-ml-py for each pair with `NVML_P2P_CAPS_INDEX_NVLINK`. Only returns
     True if every pair reports `NVML_P2P_STATUS_OK`. PCIe-only hosts will see
     `NOT_SUPPORTED` and correctly yield False — which is the condition the
     custom AR spin-barrier kernel relies on.
     """
-    try:
-        import pynvml
-    except ImportError:
+    if not has_pynvml:
         logger.warning(
-            "pynvml not available; cannot verify NVLink. Disabling custom AR."
+            "nvidia-ml-py not available; cannot verify NVLink. Disabling custom AR."
         )
         return False
     try:
@@ -213,7 +210,7 @@ class ChituCustomAllreduce:
         try:
             # Metadata buffer
             self.meta_ptrs = self.create_shared_buffer(
-                ops.meta_size() + max_size, group=group, uncached=True
+                chitu_backend.meta_size() + max_size, group=group, uncached=True
             )
 
             # Data buffer (IPC)
@@ -232,15 +229,15 @@ class ChituCustomAllreduce:
                     "Found invalid (0) pointers in shared buffer initialization"
                 )
 
-            self._ptr = ops.init_custom_ar(
+            self._ptr = chitu_backend.init_custom_ar(
                 self.meta_ptrs, self.rank_data, self.rank, self.fully_connected
             )
 
             if self._ptr == 0:
-                logger.warning("ops.init_custom_ar returned 0 handle.")
+                logger.warning("chitu_backend.init_custom_ar returned 0 handle.")
                 self.disabled = True
             else:
-                ops.register_buffer(self._ptr, self.buffer_ptrs)
+                chitu_backend.register_buffer(self._ptr, self.buffer_ptrs)
                 logger.info("ChituCustomAllreduce initialized successfully.")
 
         except Exception as e:
@@ -278,7 +275,7 @@ class ChituCustomAllreduce:
         if self.disabled or self._ptr == 0:
             return
 
-        handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
+        handle, offset = chitu_backend.get_graph_buffer_ipc_meta(self._ptr)
 
         local_data = [handle, offset]
         all_data = [None for _ in range(self.world_size)]
@@ -291,7 +288,7 @@ class ChituCustomAllreduce:
             logger.error("Failed to gather graph buffers metadata")
             return
 
-        ops.register_graph_buffers(self._ptr, handles, offsets)
+        chitu_backend.register_graph_buffers(self._ptr, handles, offsets)
 
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
@@ -317,9 +314,9 @@ class ChituCustomAllreduce:
             out = torch.empty_like(inp)
 
         if registered:
-            ops.all_reduce(self._ptr, inp, out, 0, 0)
+            chitu_backend.all_reduce(self._ptr, inp, out, 0, 0)
         else:
-            ops.all_reduce(
+            chitu_backend.all_reduce(
                 self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
             )
         return out
@@ -349,8 +346,8 @@ class ChituCustomAllreduce:
                 return
 
             if self._ptr:
-                if ops is not None:
-                    dispose_fn = getattr(ops, "dispose", None)
+                if has_chitu_backend:
+                    dispose_fn = getattr(chitu_backend, "dispose", None)
                     if callable(dispose_fn):
                         dispose_fn(self._ptr)
                 self._ptr = 0
@@ -374,8 +371,10 @@ class ChituCustomAllreduce:
         uncached: bool = False,
     ) -> List[int]:
         try:
-            if hasattr(ops, "allocate_shared_buffer_and_handle"):
-                pointer, handle = ops.allocate_shared_buffer_and_handle(size_in_bytes)
+            if hasattr(chitu_backend, "allocate_shared_buffer_and_handle"):
+                pointer, handle = chitu_backend.allocate_shared_buffer_and_handle(
+                    size_in_bytes
+                )
 
                 world_size = dist.get_world_size(group=group)
                 rank = dist.get_rank(group=group)
@@ -388,8 +387,8 @@ class ChituCustomAllreduce:
                     if i == rank:
                         pointers.append(pointer)
                     else:
-                        if hasattr(ops, "open_mem_handle") and h is not None:
-                            ptr = ops.open_mem_handle(h)
+                        if hasattr(chitu_backend, "open_mem_handle") and h is not None:
+                            ptr = chitu_backend.open_mem_handle(h)
                             if ptr == 0:
                                 raise RuntimeError(
                                     f"Rank {rank}: Failed to open IPC handle from Rank {i}"
@@ -402,7 +401,9 @@ class ChituCustomAllreduce:
                             pointers.append(0)
                 return pointers
             else:
-                logger.warning("ops missing allocate_shared_buffer_and_handle")
+                logger.warning(
+                    "chitu_backend missing allocate_shared_buffer_and_handle"
+                )
                 return [0] * dist.get_world_size(group=group)
 
         except Exception as e:
@@ -417,10 +418,10 @@ class ChituCustomAllreduce:
     ) -> None:
         if rank is None:
             rank = dist.get_rank(group=group)
-        if ops is not None:
+        if has_chitu_backend:
             try:
                 if pointers[rank] != 0:
-                    free_fn = getattr(ops, "free_shared_buffer", None)
+                    free_fn = getattr(chitu_backend, "free_shared_buffer", None)
                     if callable(free_fn):
                         free_fn(pointers[rank])
                     pointers[rank] = 0

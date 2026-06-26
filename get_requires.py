@@ -51,7 +51,6 @@ install_requires = [
     "anthropic",
     "build==1.4.0",
     "aiohttp",
-    "pynvml>=13.0.1",
 ]
 
 
@@ -139,4 +138,5 @@ extras_require = {
     "mooncake": [mooncake],
     "tilelang": ["tilelang<=0.1.9", "apache-tvm-ffi<=0.1.11"],
     **operators.get_extras_require(),
+    "nvidia-ml-py": ["nvidia-ml-py"],
 }

@@ -14,6 +14,11 @@ namespace {
 
 constexpr int WARP_SIZE = 32;
 constexpr int WARPS_PER_BLOCK = 8;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+#define WARP_SHFL_MASK 0xffffffffffffffffULL
+#else
+#define WARP_SHFL_MASK 0xffffffff
+#endif
 
 __device__ __forceinline__ float sqrt_softplus(float x) {
     const float softplus = fmaxf(x, 0.0f) + log1pf(expf(-fabsf(x)));
@@ -23,7 +28,7 @@ __device__ __forceinline__ float sqrt_softplus(float x) {
 template <typename T> __device__ __forceinline__ T warp_sum(T value) {
 #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-        value += __shfl_down_sync(0xffffffff, value, offset);
+        value += __shfl_down_sync(WARP_SHFL_MASK, value, offset);
     }
     return value;
 }

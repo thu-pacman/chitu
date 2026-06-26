@@ -85,6 +85,7 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> tuple[Any, bool]:
         "sugon_w4a8_kernels",
         "mooncake",
         "hpc_ops",
+        "nvidia-ml-py",
     }
     assert (
         opt_dep_name in opt_deps

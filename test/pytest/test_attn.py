@@ -31,7 +31,12 @@ from chitu.ops import (
     dsa_fp8_paged_kvcache_read_dequant,
     read_from_paged_kv_cache,
 )
-from chitu.dsa_indexer import DSAIndexer, support_indexer_deepgemm
+from chitu.dsa_indexer import (
+    DSAIndexer,
+    support_indexer_deepgemm,
+    support_indexer_hygon,
+    support_indexer_torch_bf16,
+)
 
 triton, has_triton = try_import_platform_dep("triton")
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
@@ -325,6 +330,247 @@ def test_dsa_indexer_paged_kv(
     assert_close(logits.to(ref_logits.dtype), ref_logits, rtol=1e-2, atol=1e-2)
 
 
+def _ref_bf16_index_score(
+    q,  # [s_q, h, d], bf16
+    weights,  # [s_q, h], fp32
+    k_ragged,  # [s_k_total, d], bf16 — new-ragged layout: each seq's keys contiguous
+    seq_len_delta: BatchedSeqLenDelta,
+    static_max_n,
+    is_causal,
+):
+    """fp32 ground truth for the bf16 lightning indexer.
+
+    ``index_type=torch`` would need fp8, which 910B2 does not support
+    (Float8_e4m3fn), so this independent fp32 reference is used instead.
+    """
+    s_q = q.shape[0]
+    out = torch.full(
+        (s_q, static_max_n), float("-inf"), dtype=torch.float32, device=q.device
+    )
+    if s_q == 0:
+        return out
+
+    q_f = q.to(torch.float32)
+    w_f = weights.to(torch.float32)
+    k_f = k_ragged.to(torch.float32)
+
+    delta_pos_ids = seq_len_delta.delta_position_ids_tensor_device
+    prefix_new = seq_len_delta.new.prefix_lens_list  # [bs + 1]
+    new_lens = seq_len_delta.new.lens_list  # [bs]
+
+    # Each query attends only to its own sequence's keys; process one sequence at
+    # a time (bs iterations, not s_q).
+    delta_seq_ids_t = seq_len_delta.delta_seq_ids_tensor_device
+    for seq_id, seq_len in enumerate(new_lens):
+        rows = (delta_seq_ids_t == seq_id).nonzero(as_tuple=True)[0]
+        if rows.numel() == 0 or seq_len == 0:
+            continue
+        n = min(seq_len, static_max_n)
+        k_start = prefix_new[seq_id]
+        k_seq = k_f[k_start : k_start + n]  # [n, d]
+        qi = q_f[rows]  # [m, h, d]
+        # [m, h, n] -> ReLU -> weighted sum over heads -> [m, n]
+        qk = torch.relu(torch.matmul(qi, k_seq.transpose(0, 1)))
+        score = (qk * w_f[rows].unsqueeze(-1)).sum(dim=1)  # [m, n]
+        col = torch.arange(n, device=q.device)
+        if is_causal:
+            pos = delta_pos_ids[rows].to(torch.long)  # [m]
+            score = score.masked_fill(
+                col.unsqueeze(0) > pos.unsqueeze(1), float("-inf")
+            )
+        out[rows.unsqueeze(1), col.unsqueeze(0)] = score
+    return out
+
+
+@pytest.mark.parametrize("bs", [0, 1, 5])
+@pytest.mark.parametrize(
+    "s_q, s_k",
+    [
+        (1, 4096),  # mtp=1 decode
+        (2, 4096),  # mtp=2 decode
+        (4096, 4096),  # prefill
+        (2048, 4096),  # chunked prefill
+    ],
+)
+@pytest.mark.parametrize("n_heads", [64])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("impl", ["torch_bf16", "hygon"])
+def test_dsa_indexer_paged_kv_bf16(
+    bs,
+    s_q,
+    s_k,
+    n_heads,
+    head_dim,
+    impl,
+    record_benchmark,
+):
+    if impl == "torch_bf16":
+        if not support_indexer_torch_bf16:
+            pytest.skip("torch_bf16 indexer requires an Ascend NPU")
+    elif impl == "hygon":
+        if not support_indexer_hygon:
+            pytest.skip("hygon indexer requires Hygon lightop")
+    else:
+        pytest.skip(f"{impl=} is not supported")
+
+    device = "npu" if impl == "torch_bf16" else "cuda"
+    torch.set_default_dtype(torch.bfloat16)
+
+    max_seq_len = 8192
+    mtp_size = s_q if s_q <= 2 else 1
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_batch_size": 4,
+                    "op_impl": "torch",
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "cache_type": "paged",
+                    "dp_size": 1,
+                    "mla_absorb": "absorb",
+                    "max_seq_len": max_seq_len,
+                    "mtp_size": mtp_size,
+                },
+                "models": {
+                    "index_n_heads": n_heads,
+                    "index_head_dim": head_dim,
+                },
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+
+    is_decode = s_q <= 2
+    if is_decode:
+        old_seq_len_list = [torch.randint(1, s_k - s_q, (1,)).item() for _ in range(bs)]
+        new_seq_len_list = [ol + s_q for ol in old_seq_len_list]
+    elif s_q == s_k:  # prefill
+        old_seq_len_list = [0] * bs
+        new_seq_len_list = [torch.randint(1, s_k, (1,)).item() for _ in range(bs)]
+    else:  # chunked-prefill
+        old_seq_len_list = [torch.randint(1, s_k - s_q, (1,)).item() for _ in range(bs)]
+        new_seq_len_list = [
+            torch.randint(s_k - s_q, s_k, (1,)).item() for _ in range(bs)
+        ]
+
+    seq_len_delta = BatchedSeqLenDelta(
+        old_seq_len_list,
+        new_seq_len_list,
+        device=device,
+        cache_prefix_lens_tensor_device=False,
+        cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
+        cache_delta_position_ids_tensor_device=False,
+        cache_delta_seq_ids_tensor_device=False,
+    )
+
+    page_size = 64
+    n_pages_per_req = ceil_div(max_seq_len, page_size)
+    max_num_pages = n_pages_per_req * bs
+    page_table = torch.randperm(max_num_pages, device=device, dtype=torch.int32)[
+        : bs * n_pages_per_req
+    ].view(bs, n_pages_per_req)
+
+    # bf16 q / k
+    q = torch.randn(seq_len_delta.delta_total_len, n_heads, head_dim, device=device)
+    weights = torch.randn(
+        seq_len_delta.delta_total_len, n_heads, dtype=torch.float32, device=device
+    )
+    k_ragged = torch.randn(seq_len_delta.new.total_len, head_dim, device=device)
+
+    prefix_new_t = (
+        seq_len_delta.new.prefix_lens_tensor_device
+    )  # [bs + 1], eg: [0,seq1_len,seq2_len,...]
+
+    delta_gidx = (
+        prefix_new_t[seq_len_delta.delta_seq_ids_tensor_device.long()]
+        + seq_len_delta.delta_position_ids_tensor_device
+    ).long()  # eg: [0+seq1_pos2,...,seq1_len+seq2_pos3,seq1_len+seq2_pos4,...]
+    k_delta = k_ragged[
+        delta_gidx
+    ]  # eg: k_ragged for [seq1_pos2,..., seq2_pos3, seq2_pos4,...]
+
+    has_old = seq_len_delta.old.total_len > 0
+    if has_old:
+        old_gidx = (
+            prefix_new_t[seq_len_delta.old.seq_ids_tensor_device.long()]
+            + seq_len_delta.old.position_ids_tensor_device
+        ).long()
+        k_old = k_ragged[
+            old_gidx
+        ]  # eg: k_ragged for [seq1_pos0, seq1_pos1, seq2_pos0, seq2_pos1, seq2_pos2]
+    else:
+        k_old = None
+
+    indexer_backend = DSAIndexer(impl)
+
+    def init_indexer_paged_kv_accessor(k_old=None):
+        k_paged = torch.zeros(max_num_pages, page_size, head_dim, device=device)
+        if k_old is not None:
+            append_to_paged_kv_cache(
+                k_paged,
+                page_table,
+                k_old,
+                seq_len_delta.old.position_ids_tensor_device,
+                seq_len_delta.old.seq_ids_tensor_device,
+            )
+        return PagedKVCacheAccessor(page_table, {"indexer_k": k_paged})
+
+    if is_decode:
+        indexer_backend.prepare_metadata_for_decode(seq_len_delta)
+
+    logits = record_benchmark.run(
+        lambda: indexer_backend.dsa_indexer(
+            q,
+            k_delta,
+            None,  # k_scale unused for bf16 paths
+            weights,
+            seq_len_delta,
+            init_indexer_paged_kv_accessor(k_old),
+            is_causal=True,
+            return_indices=False,
+        ),
+        x_val=f"bs={bs} sq={s_q} sk={s_k}",
+        impl=impl,
+    )
+
+    ref_logits = _ref_bf16_index_score(
+        q,
+        weights,
+        k_ragged,
+        seq_len_delta,
+        static_max_n=max_seq_len,
+        is_causal=True,
+    )
+
+    if logits.numel() == 0:
+        assert logits.shape == ref_logits.shape
+        return
+
+    # The decode path masks only by context length (not causal among mtp tokens),
+    # so apply causal masking to the impl output before comparison.
+    mask = torch.arange(0, max_seq_len, device=device).unsqueeze(
+        0
+    ) <= seq_len_delta.delta_position_ids_tensor_device.unsqueeze(1)
+    logits = logits.clone()
+    logits[~mask] = float("-inf")
+
+    logits_f = logits.to(torch.float32)
+
+    # Valid (finite) positions must agree between impl and reference.
+    finite = torch.isfinite(ref_logits)
+    assert torch.equal(finite, torch.isfinite(logits_f)), "valid-region mask mismatch"
+    assert_close(
+        logits_f[finite],
+        ref_logits[finite],
+        rtol=1e-2,
+        atol=1e-2,
+        cos_sim_tol=1e-3,
+    )
+
+
 @pytest.mark.parametrize("bs", [0, 1, 3])
 @pytest.mark.parametrize("local_n_heads", [16, 32, 64, 128])
 @pytest.mark.parametrize("kv_lora_rank", [512])
@@ -354,8 +600,8 @@ def test_mla_prefill_ragged_qkvo(
     if impl == "npu":
         if not has_torch_npu:
             pytest.skip("torch_npu is missing")
-        if topk is not None:
-            pytest.skip("torch_npu does not support topk")
+        # if topk is not None:
+        #     pytest.skip("torch_npu does not support topk")
     if impl == "flash_mla":
         if not has_accelerator() or not has_flash_mla:
             pytest.skip("flash_mla is missing")
@@ -420,15 +666,21 @@ def test_mla_prefill_ragged_qkvo(
 
     if topk is not None and bs > 0:
         # NOTE: topk_indices may be out of the range of sequence length, and
-        # the attention backend being tested should handle that.
+        # the attention backend being tested should handle that. To mimic the real
+        # indexer (chitu/ops/topk.py::topk_indices, which runs torch.topk over
+        # logits masked to -inf beyond the causal length), each row is front-packed:
+        # valid causal indices (< j, the token's causal length) come first, and the
+        # out-of-range indices (only present when j < topk) follow at the tail.
         topk_indices_list = []
         for i in range(bs):
             for j in range(
                 seq_len_delta.old.lens_list[i] + 1, seq_len_delta.new.lens_list[i] + 1
             ):
-                topk_indices_list.append(
-                    torch.randperm(max(topk, j), device="cuda")[:topk]
+                row = torch.randperm(max(topk, j), device="cuda")[:topk]
+                valid_first = torch.argsort(
+                    (row < j).to(torch.int32), descending=True, stable=True
                 )
+                topk_indices_list.append(row[valid_first])
         topk_indices = torch.stack(topk_indices_list, dim=0)
     else:
         topk_indices = None
@@ -1072,8 +1324,6 @@ def test_mla_decode_paged_kv(
     if impl == "npu":
         if not has_torch_npu:
             pytest.skip("torch_npu is missing")
-        if topk is not None:
-            pytest.skip("torch_npu does not support topk")
         if not use_separated_kv_lora_k_pe:
             pytest.skip("NpuAttnBackend only supports separated kv_lora/k_pe storage")
         # NPU MLA 算子 block_size 仅支持 {16, 128}（ND layout）
@@ -1161,14 +1411,19 @@ def test_mla_decode_paged_kv(
     this_kv = torch.randn(bs, 1, kv_lora_rank + qk_rope_head_dim, device="cuda")
     if topk is not None and bs > 0:
         # NOTE: topk_indices may be out of the range of sequence length, and
-        # the attention backend being tested should handle that.
+        # the attention backend being tested should handle that. To mimic the real
+        # indexer (chitu/ops/topk.py::topk_indices, which runs torch.topk over
+        # logits masked to -inf beyond the causal length), each row is front-packed:
+        # valid indices (< the sequence length) come first, the out-of-range ones
+        # (only present when the sequence is shorter than topk) follow at the tail.
         topk_indices_list = []
         for i in range(bs):
-            topk_indices_list.append(
-                torch.randperm(
-                    max(topk, seq_len_delta.new.lens_list[i]), device="cuda"
-                )[:topk]
+            seq_len = seq_len_delta.new.lens_list[i]
+            row = torch.randperm(max(topk, seq_len), device="cuda")[:topk]
+            valid_first = torch.argsort(
+                (row < seq_len).to(torch.int32), descending=True, stable=True
             )
+            topk_indices_list.append(row[valid_first])
         topk_indices = torch.stack(topk_indices_list, dim=0)
     else:
         topk_indices = None
