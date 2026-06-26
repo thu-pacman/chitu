@@ -132,7 +132,7 @@ def _prune_blockfp8_einsum_shc_hdc_shd_configs(configs, named_args, **_):
     ]
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def blockfp8_einsum_shc_hdc_shd_kernel(
     # Pointers:
     group_a_ptrs,

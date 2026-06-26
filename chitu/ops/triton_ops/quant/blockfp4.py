@@ -177,7 +177,7 @@ blockfp4_gemm_configs = [
 
 
 @autotune_compat(configs=blockfp4_gemm_configs, key=["N", "K"], cache_results=True)
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def soft_fp4_raise_to_fp8_blockfp4_gemm_kernel(
     a_ptr,
     b_ptr,
@@ -296,7 +296,7 @@ soft_fp4_blockfp4_gemm_configs = [
 @autotune_compat(
     configs=soft_fp4_blockfp4_gemm_configs, key=["N", "K"], cache_results=True
 )
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def soft_fp4_raise_to_bf16_blockfp4_gemm_kernel(
     a_ptr,
     b_ptr,

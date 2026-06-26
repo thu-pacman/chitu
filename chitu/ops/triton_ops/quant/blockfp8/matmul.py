@@ -130,7 +130,7 @@ blockfp8_gemm_configs = [
 
 
 @autotune_compat(configs=blockfp8_gemm_configs, key=["N", "K"], cache_results=True)
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def blockfp8_gemm_kernel(
     a_ptr,
     b_ptr,
@@ -218,7 +218,7 @@ soft_fp8_blockfp8_gemm_configs = [
 @autotune_compat(
     configs=soft_fp8_blockfp8_gemm_configs, key=["N", "K"], cache_results=True
 )
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def soft_fp8_blockfp8_gemm_kernel(
     A,
     B,

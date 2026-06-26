@@ -73,7 +73,7 @@ w8a8_gemm_per_token_per_channel_configs = [
 @autotune_compat(
     configs=w8a8_gemm_per_token_per_channel_configs, key=["N", "K"], cache_results=True
 )
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def w8a8_gemm_per_token_per_channel_kernel(
     a_ptr,
     b_ptr,
