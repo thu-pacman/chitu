@@ -36,6 +36,10 @@ from chitu.utils import gen_req_id
 
 logger = getLogger(__name__)
 
+# Model name prefixes whose chat template / encoder consumes reasoning_effort.
+# Matching is prefix-based: "GLM-5.2" matches "GLM-5.2", "GLM-5.2-FP8", etc.
+_REASONING_EFFORT_MODELS = ("GLM-5.2", "DeepSeek-V4")
+
 
 class ResponsesStreamOptions(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -343,6 +347,27 @@ def enable_thinking_from_request(request: ResponsesCreateRequest) -> bool:
     if request.reasoning is None or request.reasoning.effort is None:
         return True
     return request.reasoning.effort != "none"
+
+
+def reasoning_effort_from_request(request: ResponsesCreateRequest) -> Optional[str]:
+    if request.reasoning is None or request.reasoning.effort is None:
+        return None
+    effort = request.reasoning.effort
+    if effort == "none":
+        return None
+    # Only GLM-5.2 and DeepSeek-V4 templates/encoders consume reasoning_effort.
+    # Other models silently ignore the kwarg, but we return None early to avoid
+    # passing a meaningless value.
+    model_name = get_global_args().models.name
+    if not any(model_name.startswith(prefix) for prefix in _REASONING_EFFORT_MODELS):
+        return None
+    # Both templates recognise exactly two tiers:
+    #   "high"  -> lighter reasoning  (GLM: "Reasoning Effort: High")
+    #   "max"   -> heavier reasoning  (GLM: "Reasoning Effort: Max", default)
+    # Map OpenAI's ascending five-value scale monotonically onto those two tiers.
+    if effort in ("low", "medium"):
+        return "high"
+    return "max"
 
 
 def _make_message_item(item_id: str, text: str) -> dict[str, Any]:
@@ -864,7 +889,9 @@ async def handle_responses_request(
 
     args = get_global_args()
     enable_thinking = enable_thinking_from_request(request)
-    chat_template_kwargs = build_chat_template_kwargs(enable_thinking)
+    chat_template_kwargs = build_chat_template_kwargs(
+        enable_thinking, reasoning_effort_from_request(request)
+    )
 
     req_params = RequestParams(
         messages=internal_messages,

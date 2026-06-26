@@ -331,6 +331,15 @@ class TestChatRequest:
         req = ChatRequest(enable_thinking=False, **self.MINIMAL_PAYLOAD)
         assert req.enable_thinking is False
 
+    # --- reasoning_effort ---
+    def test_reasoning_effort_default_none(self):
+        req = ChatRequest(**self.MINIMAL_PAYLOAD)
+        assert req.reasoning_effort is None
+
+    def test_reasoning_effort_explicit(self):
+        req = ChatRequest(reasoning_effort="high", **self.MINIMAL_PAYLOAD)
+        assert req.reasoning_effort == "high"
+
     # --- extra_body ---
     def test_extra_body_default_empty(self):
         req = ChatRequest(**self.MINIMAL_PAYLOAD)
@@ -450,3 +459,78 @@ class TestDetokenizeRequest:
     def test_missing_tokens_raises(self):
         with pytest.raises(ValidationError):
             DetokenizeRequest()
+
+
+# ============================================================
+# build_user_request: enable_thinking / reasoning_effort wiring
+# ============================================================
+
+
+class TestBuildUserRequestReasoningEffort:
+    """build_user_request must forward reasoning_effort into chat_template_kwargs
+    with the priority chain: extra_body > chat_template_kwargs > top-level field."""
+
+    @staticmethod
+    def _captured_kwargs(monkeypatch, **chat_request_fields):
+        from types import SimpleNamespace
+
+        import chitu.serve.openai_api as openai_api
+        import chitu.serve.common as serve_common
+
+        # build_user_request reads args.request.max_new_tokens / debug.save_trace_dir
+        monkeypatch.setattr(
+            openai_api,
+            "get_global_args",
+            lambda: SimpleNamespace(
+                request=SimpleNamespace(max_new_tokens=64),
+                debug=SimpleNamespace(save_trace_dir=None),
+            ),
+        )
+        # build_chat_template_kwargs reads models.name
+        monkeypatch.setattr(
+            serve_common,
+            "get_global_args",
+            lambda: SimpleNamespace(models=SimpleNamespace(name="GLM-5.2")),
+        )
+        # Capture the RequestParams instead of constructing a real UserRequest.
+        captured = {}
+
+        def _capture(params):
+            captured["params"] = params
+            return params
+
+        monkeypatch.setattr(
+            openai_api.UserRequest, "from_request_params", staticmethod(_capture)
+        )
+
+        req = openai_api.ChatRequest(
+            messages=[{"role": "user", "content": "hi"}], **chat_request_fields
+        )
+        openai_api.build_user_request(req)
+        return captured["params"].chat_template_kwargs
+
+    def test_no_reasoning_effort_absent_from_kwargs(self, monkeypatch):
+        kwargs = self._captured_kwargs(monkeypatch)
+        assert "reasoning_effort" not in kwargs
+        assert kwargs == {"enable_thinking": True}
+
+    def test_top_level_field_forwarded(self, monkeypatch):
+        kwargs = self._captured_kwargs(monkeypatch, reasoning_effort="high")
+        assert kwargs["reasoning_effort"] == "high"
+
+    def test_chat_template_kwargs_overrides_field(self, monkeypatch):
+        kwargs = self._captured_kwargs(
+            monkeypatch,
+            reasoning_effort="high",
+            chat_template_kwargs={"reasoning_effort": "max"},
+        )
+        assert kwargs["reasoning_effort"] == "max"
+
+    def test_extra_body_has_highest_priority(self, monkeypatch):
+        kwargs = self._captured_kwargs(
+            monkeypatch,
+            reasoning_effort="high",
+            chat_template_kwargs={"reasoning_effort": "max"},
+            extra_body={"reasoning_effort": "low"},
+        )
+        assert kwargs["reasoning_effort"] == "low"

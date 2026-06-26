@@ -71,6 +71,7 @@ class ChatRequest(BaseModel):
     ignore_eos: Optional[bool] = None  # Compatible with vLLM. Not a OpenAI standard
     chat_template_kwargs: Mapping[str, Any] = {}
     enable_thinking: bool = True
+    reasoning_effort: Optional[str] = None
     extra_body: Mapping[str, Any] = {}
 
     @model_validator(mode="after")
@@ -295,8 +296,12 @@ def build_user_request(req: ChatRequest, priority: int = 1) -> UserRequest:
         "enable_thinking",
         req.chat_template_kwargs.get("enable_thinking", req.enable_thinking),
     )
+    reasoning_effort = req.extra_body.get(
+        "reasoning_effort",
+        req.chat_template_kwargs.get("reasoning_effort", req.reasoning_effort),
+    )
     # Reconstruct chat_template_kwargs to prevent injection attacks
-    chat_template_kwargs = build_chat_template_kwargs(enable_thinking)
+    chat_template_kwargs = build_chat_template_kwargs(enable_thinking, reasoning_effort)
     if isinstance(req.tool_choice, ToolChoiceNamedTool):
         tool_config = ToolConfig(
             "required", not req.parallel_tool_calls, [req.tool_choice.function.name]
