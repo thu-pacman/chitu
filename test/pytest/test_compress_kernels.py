@@ -77,6 +77,7 @@ def _reference_gather_and_compress(
     pending_lens = [sp % ratio for sp in start_poses]
     kv_list = kv_cat.split(seqlens, dim=0)
     score_list = score_cat.split(seqlens, dim=0)
+    state_rows = kv_state.shape[1]
 
     flat_kv_parts = []
     flat_score_parts = []
@@ -90,8 +91,15 @@ def _reference_gather_and_compress(
         kv = kv_list[i]
         score = score_list[i]
         if p > 0:
-            pending_kv = kv_state[slot, :p]
-            pending_score = score_state[slot, :p] - ape[:p]
+            positions = torch.arange(
+                start_poses[i] - p,
+                start_poses[i],
+                device=kv_state.device,
+                dtype=torch.long,
+            )
+            rows = positions.remainder(state_rows)
+            pending_kv = kv_state[slot, rows]
+            pending_score = score_state[slot, rows] - ape[positions.remainder(ratio)]
             kv = torch.cat([pending_kv, kv], dim=0)
             score = torch.cat([pending_score, score], dim=0)
         flat_kv_parts.append(kv)
@@ -116,6 +124,48 @@ def _reference_gather_and_compress(
         torch.cat(flat_score_parts, dim=0) if flat_score_parts else score_cat[:0]
     )
     return flat_kv, flat_score, out_parts, remainders, cutoffs
+
+
+def _assert_logical_suffix_written(
+    flat_kv,
+    flat_score,
+    kv_state_after,
+    score_state_after,
+    ape,
+    meta,
+    start_poses,
+    cache_slots,
+    ratio,
+):
+    state_rows = kv_state_after.shape[1]
+    for i, slot in enumerate(cache_slots):
+        eff_start = int(meta["cu_eff"][i].item())
+        eff_len = int(meta["cu_eff"][i + 1].item()) - eff_start
+        if eff_len == 0:
+            continue
+
+        pending = int(meta["pending_lens"][i].item())
+        suffix_len = min(eff_len, state_rows)
+        src_start = eff_start + eff_len - suffix_len
+        abs_start = start_poses[i] - pending + eff_len - suffix_len
+        positions = torch.arange(
+            abs_start,
+            abs_start + suffix_len,
+            device=flat_kv.device,
+            dtype=torch.long,
+        )
+        rows = positions.remainder(state_rows)
+        src = slice(src_start, src_start + suffix_len)
+
+        torch.testing.assert_close(
+            kv_state_after[slot, rows], flat_kv[src], atol=1e-5, rtol=1e-5
+        )
+        torch.testing.assert_close(
+            score_state_after[slot, rows],
+            flat_score[src] + ape[positions.remainder(ratio)],
+            atol=1e-5,
+            rtol=1e-5,
+        )
 
 
 def test_hca_gather_compress_and_writeback_matches_reference(compress_backend):
@@ -149,6 +199,7 @@ def test_hca_gather_compress_and_writeback_matches_reference(compress_backend):
     ape = torch.randn(ratio, head_dim, device=device, dtype=torch.float32)
 
     meta = build_compress_metadata(start_poses, seqlens, ratio, torch.device(device))
+    start_positions_t = torch.tensor(start_poses, device=device, dtype=torch.long)
     cache_slots_t = torch.tensor(cache_slots, device=device, dtype=torch.int32)
 
     flat_kv = torch.empty(
@@ -170,6 +221,7 @@ def test_hca_gather_compress_and_writeback_matches_reference(compress_backend):
         meta["cu_eff"],
         meta["cu_new"],
         meta["pending_lens"],
+        start_positions_t,
         cache_slots_t,
         ratio,
     )
@@ -184,7 +236,7 @@ def test_hca_gather_compress_and_writeback_matches_reference(compress_backend):
         ratio,
     )
 
-    flat_kv_ref, flat_score_ref, out_parts_ref, remainders_ref, cutoffs_ref = (
+    flat_kv_ref, flat_score_ref, out_parts_ref, _remainders_ref, _cutoffs_ref = (
         _reference_gather_and_compress(
             kv_state,
             score_state,
@@ -212,33 +264,30 @@ def test_hca_gather_compress_and_writeback_matches_reference(compress_backend):
         score_state_after,
         ape,
         meta["cu_eff"],
-        meta["cutoffs"],
-        meta["remainders"],
+        meta["pending_lens"],
+        start_positions_t,
         cache_slots_t,
         pending_offset=0,
         ratio=ratio,
     )
 
-    for i, slot in enumerate(cache_slots):
-        r = remainders_ref[i]
-        c = cutoffs_ref[i]
-        if r == 0:
-            continue
-        req_eff_start = int(meta["cu_eff"][i].item())
-        src_kv = flat_kv_ref[req_eff_start + c : req_eff_start + c + r]
-        src_score = flat_score_ref[req_eff_start + c : req_eff_start + c + r] + ape[:r]
-        torch.testing.assert_close(
-            kv_state_after[slot, :r], src_kv, atol=1e-5, rtol=1e-5
-        )
-        torch.testing.assert_close(
-            score_state_after[slot, :r], src_score, atol=1e-5, rtol=1e-5
-        )
+    _assert_logical_suffix_written(
+        flat_kv_ref,
+        flat_score_ref,
+        kv_state_after,
+        score_state_after,
+        ape,
+        meta,
+        start_poses,
+        cache_slots,
+        ratio,
+    )
 
 
 def _reference_csa_compress(
     flat_kv,  # [total_eff, 2*head_dim]
     flat_score,  # [total_eff, 2*head_dim]
-    ape,  # [ratio, head_dim]  first-half ape
+    ape,  # [ratio, 2*head_dim]
     kv_state,  # [max_batch, coff*ratio, coff*head_dim]
     score_state,
     start_poses,
@@ -255,6 +304,9 @@ def _reference_csa_compress(
     cu_eff_cpu = [0]
     for e in effective_lens:
         cu_eff_cpu.append(cu_eff_cpu[-1] + e)
+    state_rows = kv_state.shape[1]
+    ape_prev = ape[:, :head_dim]
+    ape_cur = ape[:, head_dim:]
 
     out_parts = []
     for i in range(len(start_poses)):
@@ -267,18 +319,29 @@ def _reference_csa_compress(
             token_start = eff_start + grp * ratio
             # current group second head
             cur_kv = flat_kv[token_start : token_start + ratio, head_dim:]
-            cur_score = flat_score[token_start : token_start + ratio, head_dim:]
+            cur_score = (
+                flat_score[token_start : token_start + ratio, head_dim:] + ape_cur
+            )
             # prev group first head
             if grp > 0:
                 prev_start = token_start - ratio
                 prev_kv = flat_kv[prev_start : prev_start + ratio, :head_dim]
-                prev_score = flat_score[prev_start : prev_start + ratio, :head_dim]
+                prev_score = (
+                    flat_score[prev_start : prev_start + ratio, :head_dim] + ape_prev
+                )
             else:
-                if pending > 0:
-                    prev_kv = kv_state[
-                        slot, :ratio, :head_dim
-                    ]  # kv_state[slot, :ratio] = prev-group reference
-                    prev_score = score_state[slot, :ratio, :head_dim] - ape
+                group_abs_start = start_poses[i] - pending
+                prev_abs_start = group_abs_start - ratio
+                if prev_abs_start >= 0:
+                    positions = torch.arange(
+                        prev_abs_start,
+                        prev_abs_start + ratio,
+                        device=flat_kv.device,
+                        dtype=torch.long,
+                    )
+                    rows = positions.remainder(state_rows)
+                    prev_kv = kv_state[slot, rows, :head_dim]
+                    prev_score = score_state[slot, rows, :head_dim]
                 else:
                     prev_kv = torch.zeros(ratio, head_dim, device=flat_kv.device)
                     prev_score = torch.full(
@@ -286,7 +349,7 @@ def _reference_csa_compress(
                     )
             # concat and softmax over 2*ratio
             kv_all = torch.cat([prev_kv, cur_kv], dim=0)  # [2*ratio, head_dim]
-            score_all = torch.cat([prev_score + ape, cur_score + ape], dim=0)
+            score_all = torch.cat([prev_score, cur_score], dim=0)
             weights = score_all.softmax(dim=0)
             compressed = (kv_all * weights).sum(dim=0)  # [head_dim]
             grps.append(compressed)
@@ -333,9 +396,10 @@ def test_csa_compress_matches_reference(compress_backend):
     ape = torch.randn(ratio, D, device=device, dtype=torch.float32)
 
     meta = build_compress_metadata(start_poses, seqlens, ratio, torch.device(device))
+    start_positions_t = torch.tensor(start_poses, device=device, dtype=torch.long)
     cache_slots_t = torch.tensor(cache_slots, device=device, dtype=torch.int32)
 
-    # Build flat buffer — CSA pending tokens live at kv_state[slot, ratio:ratio+pending]
+    # Build flat buffer from the logical-position pending-state ring.
     flat_kv = torch.empty(meta["total_eff"], D, device=device, dtype=torch.float32)
     flat_score = torch.empty_like(flat_kv)
     gather_pending_and_new(
@@ -349,9 +413,10 @@ def test_csa_compress_matches_reference(compress_backend):
         meta["cu_eff"],
         meta["cu_new"],
         meta["pending_lens"],
+        start_positions_t,
         cache_slots_t,
         ratio,
-        pending_offset=ratio,  # CSA: pending tokens at offset ratio in kv_state
+        pending_offset=ratio,
     )
 
     out_kv = torch.zeros(
@@ -360,15 +425,13 @@ def test_csa_compress_matches_reference(compress_backend):
     n_groups_list_t = torch.tensor(
         meta["n_groups_list"], device=device, dtype=torch.int32
     )
-    ape_first = ape[:, :head_dim]
-    # Snapshot kv_state before compress_csa, because _writeback_csa_prev_kernel
-    # overwrites kv_state[slot, :ratio] in-place during the call.
+    # Reference uses the pre-compress state for group-0 overlap reads.
     kv_state_snapshot = kv_state.clone()
     score_state_snapshot = score_state.clone()
     compress_csa(
         flat_kv,
         flat_score,
-        ape_first,
+        ape,
         kv_state,
         score_state,
         out_kv,
@@ -376,8 +439,8 @@ def test_csa_compress_matches_reference(compress_backend):
         meta["cu_groups"],
         meta["group_to_req"],
         meta["pending_lens"],
+        start_positions_t,
         cache_slots_t,
-        meta["cutoffs"],
         n_groups_list_t,
         ratio,
         head_dim,
@@ -387,7 +450,7 @@ def test_csa_compress_matches_reference(compress_backend):
     out_ref = _reference_csa_compress(
         flat_kv,
         flat_score,
-        ape_first,
+        ape,
         kv_state_snapshot,
         score_state_snapshot,
         start_poses,
@@ -400,14 +463,14 @@ def test_csa_compress_matches_reference(compress_backend):
     torch.testing.assert_close(out_kv, out_ref, atol=1e-4, rtol=1e-4)
 
 
-def test_csa_writeback_prev_group(compress_backend):
-    """Verify that compress_csa correctly updates kv_state[:ratio] for next chunk."""
+def test_csa_writeback_updates_logical_suffix(compress_backend):
+    """Verify that CSA writeback updates the logical-position pending-state ring."""
     (
         _backend_name,
         gather_pending_and_new,
         _compress_hca,
-        compress_csa,
-        _writeback_pending,
+        _compress_csa,
+        writeback_pending,
     ) = compress_backend
     torch.manual_seed(7)
     device = "cuda"
@@ -434,6 +497,7 @@ def test_csa_writeback_prev_group(compress_backend):
     ape = torch.randn(ratio, D, device=device, dtype=torch.float32)
 
     meta = build_compress_metadata(start_poses, seqlens, ratio, torch.device(device))
+    start_positions_t = torch.tensor(start_poses, device=device, dtype=torch.long)
     cache_slots_t = torch.tensor(cache_slots, device=device, dtype=torch.int32)
 
     flat_kv = torch.empty(meta["total_eff"], D, device=device, dtype=torch.float32)
@@ -449,6 +513,7 @@ def test_csa_writeback_prev_group(compress_backend):
         meta["cu_eff"],
         meta["cu_new"],
         meta["pending_lens"],
+        start_positions_t,
         cache_slots_t,
         ratio,
         pending_offset=ratio,
@@ -456,57 +521,31 @@ def test_csa_writeback_prev_group(compress_backend):
 
     kv_state_after = kv_state.clone()
     score_state_after = score_state.clone()
-    out_kv = torch.zeros(
-        meta["total_groups"], head_dim, device=device, dtype=torch.float32
-    )
-    n_groups_list_t = torch.tensor(
-        meta["n_groups_list"], device=device, dtype=torch.int32
-    )
-    ape_first = ape[:, :head_dim]
-    compress_csa(
+    writeback_pending(
         flat_kv,
         flat_score,
-        ape_first,
         kv_state_after,
         score_state_after,
-        out_kv,
+        ape,
         meta["cu_eff"],
-        meta["cu_groups"],
-        meta["group_to_req"],
         meta["pending_lens"],
+        start_positions_t,
         cache_slots_t,
-        meta["cutoffs"],
-        n_groups_list_t,
-        ratio,
-        head_dim,
+        pending_offset=ratio,
+        ratio=ratio,
     )
 
-    # req0: n_groups=4 (pending=0, seqlen=8 → eff=8 → 2 groups)
-    # Wait — pending=8%4=0, eff=8, cutoff=8, n_groups=2
-    # kv_state[slot=0, :ratio, :head_dim] should equal last group's first head
-    ng0 = meta["n_groups_list"][0]
-    slot0 = cache_slots[0]
-    if ng0 > 0:
-        eff_start0 = int(meta["cu_eff"][0].item())
-        cutoff0 = int(meta["cutoffs"][0].item())
-        last_grp_start = eff_start0 + cutoff0 - ratio
-        expected_kv = flat_kv[last_grp_start : last_grp_start + ratio, :head_dim]
-        expected_score = (
-            flat_score[last_grp_start : last_grp_start + ratio, :head_dim] + ape_first
-        )
-        torch.testing.assert_close(
-            kv_state_after[slot0, :ratio, :head_dim], expected_kv, atol=1e-5, rtol=1e-5
-        )
-        torch.testing.assert_close(
-            score_state_after[slot0, :ratio, :head_dim],
-            expected_score,
-            atol=1e-5,
-            rtol=1e-5,
-        )
-
-    # req1: n_groups=0, kv_state should be unchanged
-    slot1 = cache_slots[1]
-    torch.testing.assert_close(kv_state_after[slot1], kv_state[slot1], atol=0, rtol=0)
+    _assert_logical_suffix_written(
+        flat_kv,
+        flat_score,
+        kv_state_after,
+        score_state_after,
+        ape,
+        meta,
+        start_poses,
+        cache_slots,
+        ratio,
+    )
 
 
 def _exclusive_offsets(lengths: torch.Tensor) -> torch.Tensor:

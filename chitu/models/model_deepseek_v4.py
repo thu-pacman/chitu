@@ -709,6 +709,7 @@ class CompressorDeepSeekV4(nn.Module):
             meta["cu_eff"],
             meta["cu_new"],
             meta["pending_lens"],
+            start_positions,
             cache_slots_t,
             ratio,
             pending_offset=pending_offset,
@@ -731,18 +732,13 @@ class CompressorDeepSeekV4(nn.Module):
                 ratio,
             )
         else:
-            # CSA compress also updates kv_state/score_state[:ratio] in-place
-            # with the last complete group's first head for the next chunk.
-            # The backend op owns that state update; the outer flow stays shared.
-            # ape for CSA compress is the first-half ape: [ratio, head_dim]
-            ape_first_half = self.ape[:, :head_dim]  # [ratio, head_dim]
             n_groups_list_t = torch.tensor(
                 meta["n_groups_list"], device=device, dtype=torch.int32
             )
             _compress_csa_backend(
                 flat_kv,
                 flat_score,
-                ape_first_half,
+                self.ape,
                 self.kv_state,
                 self.score_state,
                 out_kv,
@@ -750,8 +746,8 @@ class CompressorDeepSeekV4(nn.Module):
                 meta["cu_groups"],
                 meta["group_to_req"],
                 meta["pending_lens"],
+                start_positions,
                 cache_slots_t,
-                meta["cutoffs"],
                 n_groups_list_t,
                 ratio,
                 head_dim,
@@ -765,8 +761,8 @@ class CompressorDeepSeekV4(nn.Module):
             self.score_state,
             self.ape,
             meta["cu_eff"],
-            meta["cutoffs"],
-            meta["remainders"],
+            meta["pending_lens"],
+            start_positions,
             cache_slots_t,
             pending_offset=pending_offset,
             ratio=ratio,
@@ -1002,42 +998,53 @@ class CompressorDeepSeekV4(nn.Module):
         score = score + self.ape[start_positions % ratio].unsqueeze(
             1
         )  # [bsz, 1, head_dim*coff]
+        state_rows = self.kv_state.size(1)
+        write_pos = start_positions % state_rows
+        self.kv_state[cache_slots, write_pos] = kv.squeeze(1)
+        self.score_state[cache_slots, write_pos] = score.squeeze(1)
         if overlap:
-            write_pos = ratio + start_positions % ratio  # [bsz]
-            self.kv_state[cache_slots, write_pos] = kv.squeeze(1)
-            self.score_state[cache_slots, write_pos] = score.squeeze(1)
             ci = compress_mask.nonzero(as_tuple=True)[0]
             if ci.numel() == 0:
                 return None
             cs = cache_slots[ci]
-            kv_state = torch.cat(
-                [
-                    self.kv_state[cs, :ratio, :head_dim],
-                    self.kv_state[cs, ratio:, head_dim:],
-                ],
-                dim=1,
+            gather_positions = (
+                start_positions[ci, None]
+                - (2 * ratio - 1)
+                + torch.arange(2 * ratio, device=x.device, dtype=torch.long)
             )
-            score_state = torch.cat(
-                [
-                    self.score_state[cs, :ratio, :head_dim],
-                    self.score_state[cs, ratio:, head_dim:],
-                ],
-                dim=1,
+            gather_rows = gather_positions.remainder(state_rows)
+            gather_mask = gather_positions >= 0
+            kv_prev = self.kv_state[cs[:, None], gather_rows[:, :ratio], :head_dim]
+            kv_cur = self.kv_state[cs[:, None], gather_rows[:, ratio:], head_dim:]
+            score_prev = self.score_state[
+                cs[:, None], gather_rows[:, :ratio], :head_dim
+            ]
+            score_cur = self.score_state[cs[:, None], gather_rows[:, ratio:], head_dim:]
+            kv_state = torch.cat([kv_prev, kv_cur], dim=1)
+            score_state = torch.cat([score_prev, score_cur], dim=1)
+            score_state = score_state.masked_fill(
+                ~gather_mask.unsqueeze(-1), float("-inf")
             )
             kv_compress = (kv_state * score_state.softmax(dim=1)).sum(
                 dim=1
             )  # [n, head_dim]
-            self.kv_state[cs, :ratio] = self.kv_state[cs, ratio:]
-            self.score_state[cs, :ratio] = self.score_state[cs, ratio:]
         else:
-            write_pos = start_positions % ratio  # [bsz]
-            self.kv_state[cache_slots, write_pos] = kv.squeeze(1)
-            self.score_state[cache_slots, write_pos] = score.squeeze(1)
             ci = compress_mask.nonzero(as_tuple=True)[0]
             if ci.numel() == 0:
                 return None
             cs = cache_slots[ci]
-            kv_compress = (self.kv_state[cs] * self.score_state[cs].softmax(dim=1)).sum(
+            gather_positions = (
+                start_positions[ci, None]
+                - (ratio - 1)
+                + torch.arange(ratio, device=x.device, dtype=torch.long)
+            )
+            gather_rows = gather_positions.remainder(state_rows)
+            gather_mask = gather_positions >= 0
+            kv_state = self.kv_state[cs[:, None], gather_rows]
+            score_state = self.score_state[cs[:, None], gather_rows].masked_fill(
+                ~gather_mask.unsqueeze(-1), float("-inf")
+            )
+            kv_compress = (kv_state * score_state.softmax(dim=1)).sum(
                 dim=1
             )  # [n, head_dim]
 
@@ -1641,7 +1648,10 @@ class AttentionDeepSeekV4(Attention):
                 compressed_accessor.block_table if compressed_is_paged else None
             ),
         )
-        pending_rows = self.compressor.coff * self.compressor.compress_ratio
+        mtp_lookahead_rows = max(self.cache.mtp_size - 1, 0)
+        pending_rows = (
+            self.compressor.coff * self.compressor.compress_ratio + mtp_lookahead_rows
+        )
         pending_width = self.compressor.coff * self.compressor.head_dim
         self.compressor.kv_state = main_accessor.kv["pending_kv_state"][
             :, :pending_rows, :pending_width
@@ -1654,6 +1664,7 @@ class AttentionDeepSeekV4(Attention):
             indexer_compressor = self.indexer.compressor
             indexer_pending_rows = (
                 indexer_compressor.coff * indexer_compressor.compress_ratio
+                + mtp_lookahead_rows
             )
             indexer_pending_width = (
                 indexer_compressor.coff * indexer_compressor.head_dim
