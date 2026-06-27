@@ -91,6 +91,23 @@ def test_tokenize_prompt_still_uses_plain_text_encode(monkeypatch):
             },
             {"enable_thinking": False},
         ),
+        (
+            # reasoning_effort top-level field is forwarded
+            {
+                "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_effort": "high",
+            },
+            {"enable_thinking": True, "reasoning_effort": "high"},
+        ),
+        (
+            # reasoning_effort via extra_body overrides everything
+            {
+                "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_effort": "high",
+                "extra_body": {"reasoning_effort": "max"},
+            },
+            {"enable_thinking": True, "reasoning_effort": "max"},
+        ),
     ],
 )
 def test_tokenize_messages_use_chat_template(monkeypatch, payload, expected_kwargs):

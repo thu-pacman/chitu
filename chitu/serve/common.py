@@ -392,13 +392,18 @@ def parse_api_key_from_headers(
     return value[len("bearer") :].strip()
 
 
-def build_chat_template_kwargs(enable_thinking: bool) -> dict[str, Any]:
+def build_chat_template_kwargs(
+    enable_thinking: bool,
+    reasoning_effort: Optional[str] = None,
+) -> dict[str, Any]:
     chat_template_kwargs = {}
     if "DeepSeek-V3.1" in get_global_args().models.name:
         # DeepSeek-V3.1 tokenizer uses `thinking` instead of `enable_thinking`
         chat_template_kwargs["thinking"] = enable_thinking
     else:
         chat_template_kwargs["enable_thinking"] = enable_thinking
+    if reasoning_effort is not None:
+        chat_template_kwargs["reasoning_effort"] = reasoning_effort
     return chat_template_kwargs
 
 

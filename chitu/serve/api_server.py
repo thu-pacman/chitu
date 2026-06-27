@@ -470,6 +470,8 @@ async def tokenize(raw_request: Request):
             )
         tools = []
         tool_choice = "auto"
+        enable_thinking = request.enable_thinking  # TokenizeRequest fallback
+        reasoning_effort = None
         with suppress(ValidationError):
             chat_request = openai_api.ChatRequest.model_validate(data)
             enable_thinking = chat_request.extra_body.get(
@@ -478,9 +480,17 @@ async def tokenize(raw_request: Request):
                     "enable_thinking", chat_request.enable_thinking
                 ),
             )
+            reasoning_effort = chat_request.extra_body.get(
+                "reasoning_effort",
+                chat_request.chat_template_kwargs.get(
+                    "reasoning_effort", chat_request.reasoning_effort
+                ),
+            )
             tools = chat_request.tools
             tool_choice = chat_request.tool_choice
-        chat_template_kwargs = build_chat_template_kwargs(enable_thinking)
+        chat_template_kwargs = build_chat_template_kwargs(
+            enable_thinking, reasoning_effort
+        )
         if tools and tool_choice != "none":
             chat_template_kwargs["tools"] = tools
         message = [message.model_dump() for message in request.messages]

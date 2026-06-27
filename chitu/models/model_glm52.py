@@ -358,6 +358,10 @@ class AttentionGLM52(AttentionDeepSeekV3):
                         share_buffer_to=share_buffer_to,
                         read_buffer_from=read_buffer_from,
                     )
+                elif read_buffer_from is not None:
+                    # Shared layer: reuse topk produced by the latest full layer.
+                    assert read_buffer_from.topk is not None
+                    topk_indices = read_buffer_from.topk
                 else:
                     topk_indices = None
 
@@ -415,6 +419,18 @@ class AttentionGLM52(AttentionDeepSeekV3):
                             share_buffer_to=share_buffer_to,
                             read_buffer_from=read_buffer_from,
                         )
+                elif read_buffer_from is not None:
+                    # Shared layer: reuse topk produced by the latest full layer.
+                    if (
+                        self.attn_backend.requires_sparse_decode_page_table()
+                        and seq_len_delta.is_classic_decoding
+                        and isinstance(main_cache_accessor, PagedKVCacheAccessor)
+                    ):
+                        assert read_buffer_from.topk_page_table is not None
+                        topk_page_table = read_buffer_from.topk_page_table
+                    else:
+                        assert read_buffer_from.topk is not None
+                        topk_indices = read_buffer_from.topk
 
                 x = self.attn_backend.mla(
                     q_nope,
@@ -714,15 +730,88 @@ class TransformerGLM52(TransformerDeepSeekV3):
 
             self.layers.append(block)
 
+        # Determine whether topk must be transmitted across stage boundaries.
+        #
+        # _cross_stage_send_topk — this stage owns at least one "full" layer, and
+        #   there is a downstream "shared" layer on the next stage (i.e. a "shared"
+        #   layer exists globally beyond local_end_layer_id).
+        # _cross_stage_recv_topk — this stage owns at least one "shared" layer
+        #   whose corresponding "full" layer lives on the previous stage (i.e. a
+        #   "full" layer exists globally before local_begin_layer_id).
+        self._cross_stage_send_topk: bool = False
+        self._cross_stage_recv_topk: bool = False
+        if share_index_cache and self.pp_size > 1:
+            global_indexer_types = self.params.indexer_types  # full global array
+            n_backbone_layers = self.params.n_layers
+            has_shared_after = any(
+                global_indexer_types[global_layer_id] == "shared"
+                for global_layer_id in range(self.local_end_layer_id, n_backbone_layers)
+            )
+            has_full_local = any(
+                self._layer_indexer_roles[global_layer_id] == "full"
+                for global_layer_id in range(
+                    self.local_begin_layer_id, self.local_end_layer_id
+                )
+                if global_layer_id < n_backbone_layers
+            )
+            self._cross_stage_send_topk = has_full_local and has_shared_after
+
+            has_shared_local = any(
+                self._layer_indexer_roles[global_layer_id] == "shared"
+                for global_layer_id in range(
+                    self.local_begin_layer_id, self.local_end_layer_id
+                )
+            )
+            has_full_before = any(
+                global_indexer_types[global_layer_id] == "full"
+                for global_layer_id in range(0, self.local_begin_layer_id)
+            )
+            self._cross_stage_recv_topk = has_shared_local and has_full_before
+
     def _indexer_buffers_for(self, layer_id: int):
         """Return (share_buffer_to, read_buffer_from) for the given layer."""
         if not self._share_index_cache:
             return None, None
-        role = self._layer_indexer_roles.get(layer_id, "full")
+        role = self._layer_indexer_roles[layer_id]
         if role == "full":
             return self._backbone_buf, None
         else:
             return None, self._backbone_buf
+
+    # ------------------------------------------------------------------
+    # PP cross-stage topk transport: pack into / unpack from hidden state
+    # ------------------------------------------------------------------
+
+    def _payload_index_topk(self) -> int:
+        """Return the top-k width actually produced by the Indexer."""
+        return min(
+            int(self.params.index_topk),
+            int(getattr(get_global_args().infer, "max_seq_len")),
+        )
+
+    def get_pipeline_payload_shape(self, num_tokens: int) -> list[int]:
+        """Extend payload cols when this stage must receive topk from prev stage."""
+        topk_bf16_cols = (
+            self._payload_index_topk() * 2 if self._cross_stage_recv_topk else 0
+        )
+        return [num_tokens, self.params.dim + topk_bf16_cols]
+
+    def get_pipeline_payload_dtype(self) -> torch.dtype:
+        return torch.get_default_dtype()
+
+    def _pack_topk(self, h: torch.Tensor, topk: torch.Tensor) -> torch.Tensor:
+        # topk: [T, effective_index_topk] int32 — reinterpret as BF16 columns.
+        # view() is zero-copy; contiguous() ensures the layout is compatible.
+        assert topk.dtype == torch.int32
+        assert topk.shape[-1] == self._payload_index_topk()
+        topk_bf16 = topk.contiguous().view(torch.bfloat16)
+        return torch.cat([h, topk_bf16], dim=-1)
+
+    def _unpack_topk(self, packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        topk_bf16_cols = self._payload_index_topk() * 2
+        h = packed[:, :-topk_bf16_cols].contiguous()
+        topk = packed[:, -topk_bf16_cols:].contiguous().view(torch.int32)
+        return h, topk
 
     # ------------------------------------------------------------------
     # Override all five layer-loop methods to inject buffer kwargs
@@ -810,6 +899,11 @@ class TransformerGLM52(TransformerDeepSeekV3):
             h = self._pre_layers(tokens, **args)
         else:
             batch_size = hiddens.shape[0]
+            # Unpack topk from the incoming hidden payload when the previous
+            # stage produced it (its last "full" layer crossed the stage boundary).
+            if self._cross_stage_recv_topk:
+                hiddens, topk = self._unpack_topk(hiddens)
+                self._backbone_buf.topk = topk
             h = hiddens
             del hiddens
 
@@ -834,15 +928,24 @@ class TransformerGLM52(TransformerDeepSeekV3):
             h = h[output_token_offsets]
             h = self._post_layers(h)
             h = h.float()
+        else:
+            # Pack topk into hidden state so the next stage can recover it.
+            if self._cross_stage_send_topk and self._backbone_buf.topk is not None:
+                h = self._pack_topk(h, self._backbone_buf.topk)
         return h
 
     @override
     @torch.inference_mode()
-    def decode_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
+    def decode_pipeline(self, middle_state, freqs_cis: BatchedFreqsCis):
         if self.pp_stage == 0:
-            h = self._pre_layers(tokens)
+            h = self._pre_layers(middle_state)
         else:
-            h = tokens
+            # middle_state is the pipeline payload from the previous stage
+            # (hidden states, optionally with packed topk appended).
+            if self._cross_stage_recv_topk:
+                middle_state, topk = self._unpack_topk(middle_state)
+                self._backbone_buf.topk = topk
+            h = middle_state
         for it, layer in enumerate(self.non_mtp_layers):
             layer_id = self.local_begin_layer_id + it
             share_buf, read_buf = self._indexer_buffers_for(layer_id)
@@ -856,6 +959,10 @@ class TransformerGLM52(TransformerDeepSeekV3):
                 )
             h = self._post_layers(h)
             h = h.float()
+        else:
+            # Pack topk into hidden state for the next stage.
+            if self._cross_stage_send_topk and self._backbone_buf.topk is not None:
+                h = self._pack_topk(h, self._backbone_buf.topk)
         return h
 
     # ------------------------------------------------------------------

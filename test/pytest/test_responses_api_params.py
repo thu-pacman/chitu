@@ -2,17 +2,29 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
 from pydantic import ValidationError
 
+import chitu.serve.responses_api as responses_api
 from chitu.serve.responses_api import (
     ResponsesCreateRequest,
     ResponsesTextConfig,
     flatten_response_content,
     normalize_response_tools,
     normalize_text_config,
+    reasoning_effort_from_request,
     responses_input_to_internal,
 )
+
+
+def _patch_model_name(monkeypatch, name):
+    monkeypatch.setattr(
+        responses_api,
+        "get_global_args",
+        lambda: SimpleNamespace(models=SimpleNamespace(name=name)),
+    )
 
 
 class TestResponsesCreateRequest:
@@ -129,6 +141,42 @@ def test_normalize_response_tools_accepts_flat_and_chat_shapes(tools):
             "strict": True,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "effort,expected",
+    [
+        ("none", None),  # thinking disabled -> no header
+        # GLM template recognises only "high" (lighter) vs "max" (heavier).
+        # OpenAI's ascending scale maps monotonically onto those two tiers.
+        ("low", "high"),  # lighter half -> GLM "high"
+        ("medium", "high"),
+        ("high", "max"),  # heavier half -> GLM "max"
+        ("max", "max"),
+        ("totally-unknown", "max"),  # unknown values fall through to max
+    ],
+)
+def test_reasoning_effort_from_request_maps_openai_to_glm(
+    monkeypatch, effort, expected
+):
+    _patch_model_name(monkeypatch, "GLM-5.2-FP8")
+    request = ResponsesCreateRequest(
+        model="m", input="hi", reasoning={"effort": effort}
+    )
+    assert reasoning_effort_from_request(request) == expected
+
+
+def test_reasoning_effort_from_request_no_reasoning_block(monkeypatch):
+    _patch_model_name(monkeypatch, "GLM-5.2-FP8")
+    request = ResponsesCreateRequest(model="m", input="hi")
+    assert request.reasoning is None
+    assert reasoning_effort_from_request(request) is None
+
+
+def test_reasoning_effort_unsupported_model_returns_none(monkeypatch):
+    _patch_model_name(monkeypatch, "GLM-5.1-FP8")
+    request = ResponsesCreateRequest(model="m", input="hi", reasoning={"effort": "max"})
+    assert reasoning_effort_from_request(request) is None
 
 
 def test_normalize_text_config_keeps_json_schema_shape():

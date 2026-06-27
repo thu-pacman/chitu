@@ -269,9 +269,12 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
                 layer_filter_fn=_layer_filter_for_compress_ratio(args, ratio),
             )
             coff = 1 + int(ratio == 4)
+            pending_rows = coff * ratio + max(
+                int(getattr(args.infer, "mtp_size", 1)) - 1, 0
+            )
             request_shape_dict = {
-                "pending_kv_state": (coff * ratio, coff * head_dim),
-                "pending_score_state": (coff * ratio, coff * head_dim),
+                "pending_kv_state": (pending_rows, coff * head_dim),
+                "pending_score_state": (pending_rows, coff * head_dim),
             }
             request_dtype_dict = {
                 "pending_kv_state": torch.float32,
@@ -279,11 +282,11 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
             }
             if index_head_dim is not None and ratio == 4:
                 request_shape_dict["indexer_pending_kv_state"] = (
-                    coff * ratio,
+                    pending_rows,
                     coff * int(index_head_dim),
                 )
                 request_shape_dict["indexer_pending_score_state"] = (
-                    coff * ratio,
+                    pending_rows,
                     coff * int(index_head_dim),
                 )
                 request_dtype_dict["indexer_pending_kv_state"] = torch.float32
@@ -404,9 +407,12 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
                 layer_filter_fn=_layer_filter_for_compress_ratio(args, ratio),
             )
             coff = 1 + int(ratio == 4)
+            pending_rows = coff * ratio + max(
+                int(getattr(args.infer, "mtp_size", 1)) - 1, 0
+            )
             request_shape_dict = {
-                "pending_kv_state": (coff * ratio, coff * head_dim),
-                "pending_score_state": (coff * ratio, coff * head_dim),
+                "pending_kv_state": (pending_rows, coff * head_dim),
+                "pending_score_state": (pending_rows, coff * head_dim),
             }
             request_dtype_dict = {
                 "pending_kv_state": torch.float32,
@@ -414,11 +420,11 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
             }
             if index_head_dim is not None and ratio == 4:
                 request_shape_dict["indexer_pending_kv_state"] = (
-                    coff * ratio,
+                    pending_rows,
                     coff * int(index_head_dim),
                 )
                 request_shape_dict["indexer_pending_score_state"] = (
-                    coff * ratio,
+                    pending_rows,
                     coff * int(index_head_dim),
                 )
                 request_dtype_dict["indexer_pending_kv_state"] = torch.float32

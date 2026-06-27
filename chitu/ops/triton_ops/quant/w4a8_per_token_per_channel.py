@@ -72,7 +72,7 @@ w4a8_gemm_per_token_per_channel_asymm_configs = [
     key=["N", "K"],
     cache_results=True,
 )
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def w4a8_gemm_per_token_per_channel_asymm_kernel(
     a_ptr,
     b_ptr,
