@@ -9,6 +9,6 @@ def args_as_list(args) -> List[str]:
     if isinstance(args, str):
         return args.split()
     elif isinstance(args, Sequence):
-        return list(args)
+        return [str(arg) for arg in args]
     else:
         raise ValueError(f"Unsupported argument type: {type(args)}")

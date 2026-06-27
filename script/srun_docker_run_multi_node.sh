@@ -119,7 +119,7 @@ IB_ENV_ARGS=()
 # If /dev/infiniband and/or /sbin/ibdev2netdev exist, mount them.
 IB_MOUNT_ARGS=()
 if [ -d "/dev/infiniband" ]; then
-    IB_MOUNT_ARGS+=("-v" "/dev/infiniband:/dev/infiniband")
+    IB_MOUNT_ARGS+=("--device=/dev/infiniband")
     echo "Adding /dev/infiniband to mounts" >&2
 fi
 if [ -f "/sbin/ibdev2netdev" ]; then
