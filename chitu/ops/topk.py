@@ -95,9 +95,9 @@ def topk_indices_cuda(
     if logits.numel() == 0:
         return torch.empty(0, k, dtype=out_dtype, device=logits.device)
     if k == logits.shape[-1]:
-        return torch.arange(logits.shape[-1], device=logits.device).repeat(
-            *logits.shape[:-1], 1
-        )
+        return torch.arange(
+            logits.shape[-1], device=logits.device, dtype=out_dtype
+        ).repeat(*logits.shape[:-1], 1)
 
     assert len(logits.shape) == 2
     assert k == 2048, "fast_topk only supports k=2048"
