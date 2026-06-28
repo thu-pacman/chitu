@@ -983,7 +983,7 @@ class Blockfp8AbsorbGemm(QuantizedAbsorbGemmBase):
         block_size: int = 128,
         round_scale_to_pow2: bool = False,
     ):
-        super().__init__()
+        super().__init__(n_heads, in_features_per_head, out_features_per_head)
 
         # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
         # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
@@ -1024,9 +1024,6 @@ class Blockfp8AbsorbGemm(QuantizedAbsorbGemmBase):
             requires_grad=False,
         )
 
-        self.n_heads = n_heads
-        self.in_features_per_head = in_features_per_head
-        self.out_features_per_head = out_features_per_head
         self.block_size = block_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

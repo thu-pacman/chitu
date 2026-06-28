@@ -622,7 +622,7 @@ class NormalAbsorbGemm(QuantizedAbsorbGemmBase):
         # Parameters specific to this quantization
         dtype=None,
     ):
-        super().__init__()
+        super().__init__(n_heads, in_features_per_head, out_features_per_head)
 
         self.weight = torch.nn.Parameter(
             torch.empty(
@@ -630,10 +630,6 @@ class NormalAbsorbGemm(QuantizedAbsorbGemmBase):
             ),
             requires_grad=False,
         )
-
-        self.n_heads = n_heads
-        self.in_features_per_head = in_features_per_head
-        self.out_features_per_head = out_features_per_head
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 3:

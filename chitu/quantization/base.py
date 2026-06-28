@@ -491,4 +491,19 @@ class QuantizedAbsorbGemmBase(torch.nn.Module):
     Inherit from this class for quantization.
     """
 
-    pass
+    def __init__(
+        self, n_heads: int, in_features_per_head: int, out_features_per_head: int
+    ):
+        super().__init__()
+        self.n_heads = n_heads
+        self.in_features_per_head = in_features_per_head
+        self.out_features_per_head = out_features_per_head
+
+    def __repr__(self):
+        inheritance_order = []
+        for cls in self.__class__.__mro__:
+            if cls is torch.nn.Module:
+                break
+            inheritance_order.append(cls.__name__)
+        inheritance_order_str = " <- ".join(inheritance_order)
+        return f"{inheritance_order_str}(n_heads={self.n_heads}, in_features_per_head={self.in_features_per_head}, out_features_per_head={self.out_features_per_head})"
