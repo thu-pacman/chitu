@@ -1074,10 +1074,7 @@ def _warmup_backend_direct(
             PrometheusMetricsCollector.update_GPU_usage()
 
             # direct warmup 绕过了 executor，因此必须在这里显式设置
-            if (
-                hasattr(Backend.model, "moe_impl")
-                and Backend.model.moe_impl is not None
-            ):
+            if Backend.model.moe_impl is not None:
                 Backend.model.moe_impl.prepare(TaskType.Decode, curr_bs)
 
             if args.infer.mtp_size > 1:
@@ -1107,12 +1104,12 @@ def warmup_engine(args):
 
     clear_observed_op_impl_selections()
 
+    full_warmup = args.infer.full_warmup
+
     # 告知 DeepGEMM 预热范围，使其在首次遇到某个 (n,k) 时提前编译所有可能的 m 值对应的 kernel，
     # 避免推理过程中因 m 变化触发 JIT 编译导致延迟波动。
     # DG_WARMUP_MAX_M 若已由外部设置则不覆盖。
-    if "DG_WARMUP_MAX_M" not in os.environ and getattr(
-        args.infer, "full_warmup", False
-    ):
+    if "DG_WARMUP_MAX_M" not in os.environ and full_warmup:
         _pcs = getattr(args.infer, "prefill_chunk_size", None)
         if not (_pcs and isinstance(_pcs, int) and _pcs > 0):
             _pcs = getattr(args.infer, "max_seq_len", 0) * getattr(
@@ -1127,6 +1124,8 @@ def warmup_engine(args):
                 f"(prefill_chunk_size={_pcs} / dp_size={_dp_size})"
             )
 
+    #######################################################################################
+    # Warmup with maximal possible prefill chunk or batch, to estimate GPU memory usage
     if is_classic_pd_disagg():
         runner = "direct"
     elif is_independent_multi_inst():
@@ -1139,7 +1138,6 @@ def warmup_engine(args):
     sched_type = str(args.scheduler.type).lower()
     skip_model_prefill = "decode_only" in sched_type
     skip_model_decode = "prefill_only" in sched_type
-    full_warmup = args.infer.full_warmup
 
     def _log_skip_prefill():
         if skip_model_prefill:
@@ -1149,7 +1147,7 @@ def warmup_engine(args):
 
     if runner == "taskpool":
         _warmup_via_taskpool(args)
-    elif not full_warmup:
+    elif runner == "direct":
         _log_skip_prefill()
         _warmup_backend_direct(
             args,
@@ -1157,10 +1155,20 @@ def warmup_engine(args):
             skip_model_prefill=bool(skip_model_prefill),
             skip_model_decode=bool(skip_model_decode),
         )
+    else:
+        assert False
 
+    #######################################################################################
+    # Reallocate KV cache with respect to the estimated GPU memory usage
+    #
+    # Captured CUDA graph will be reset after KV cache reallocation since the base pointer
+    # has been changed.
+    _auto_set_num_blocks_after_warmup(args)
+
+    #######################################################################################
+    # If full_warmup is enabled, run for all possible batch sizes, to ensure the operators
+    # are tuned, and to re-capture all CUDA graphs.
     if full_warmup:
-        if runner == "direct":
-            logger.info("[warmup] full_warmup enabled, skip base warmup")
         _log_skip_prefill()
         max_reqs_per_dp = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
         if args.infer.pp_size > 1:
@@ -1182,7 +1190,6 @@ def warmup_engine(args):
             skip_model_decode=bool(skip_model_decode),
         )
 
-    _auto_set_num_blocks_after_warmup(args)
     _emit_observed_op_impl_summary_after_warmup()
 
 

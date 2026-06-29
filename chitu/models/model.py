@@ -1424,12 +1424,8 @@ class Transformer(nn.Module):
             self.attn_backend.prepare_metadata_for_prefill(
                 self.cache_dict["main"].seq_len_delta
             )
-            if (
-                self.moe_impl is not None
-                and self.moe_impl.ep_size > 1
-                and self.moe_impl.decode_token_dispatcher_impl == "allgather"
-            ):
-                self.moe_impl.prepare(TaskType.Decode, bs * self.mtp_size)
+        if self.moe_impl is not None:
+            self.moe_impl.prepare(TaskType.Decode, bs * self.mtp_size)
         h = func(key, tokens.view(-1), *extra_inputs)
         self.draft_tokens = tokens[:, 1:]
         # self.draft_logits = torch.stack(draft_logits, dim=1)
@@ -1519,6 +1515,8 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def empty_prefill(self) -> torch.Tensor:
+        if self.moe_impl is not None:
+            self.moe_impl.prepare(TaskType.Prefill, int(self.dummy_input.shape[0]))
         if self.specialize_embed_tokens_lm_head_parallel:
             self.embed_tokens(
                 self.dummy_embed_tokens_input,
@@ -1526,8 +1524,6 @@ class Transformer(nn.Module):
                 self.embed_tokens_cum_num_tokens,
             )
         if self.ep_size > 1:
-            if self.moe_impl is not None:
-                self.moe_impl.prepare(TaskType.Prefill, int(self.dummy_input.shape[0]))
             for it, layer in enumerate(self.layers):
                 if self.local_begin_layer_id + it < self.moe_impl.n_dense_layers:
                     continue
@@ -1549,6 +1545,8 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def empty_decode(self):
+        if self.moe_impl is not None:
+            self.moe_impl.prepare(TaskType.Decode, int(self.dummy_input.shape[0]))
         if self.specialize_embed_tokens_lm_head_parallel:
             self.embed_tokens(
                 self.dummy_embed_tokens_input,

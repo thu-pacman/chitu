@@ -1214,15 +1214,10 @@ class Executor:
             return
 
         if self.moe_impl is not None:
-            tasks_num_tokens = (
-                tasks.num_tokens * self.mtp_size
-                if (
-                    self.moe_impl.ep_size > 1
-                    and self.moe_impl.decode_token_dispatcher_impl == "deepep-ll"
-                )
-                else tasks.num_tokens
-            )
-            self.moe_impl.prepare(tasks.task_type, tasks_num_tokens)
+            if tasks.task_type == TaskType.Prefill:
+                self.moe_impl.prepare(TaskType.Prefill, tasks.num_tokens)
+            elif tasks.task_type == TaskType.Decode:
+                self.moe_impl.prepare(TaskType.Decode, tasks.num_tokens * self.mtp_size)
 
         if self.specialize_embed_tokens_lm_head_parallel:
             Backend.model.prepare_global_num_tokens(
