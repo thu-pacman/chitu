@@ -9,6 +9,7 @@ import plum
 import torch
 
 from chitu.native_layout.base import NativeLayoutTensor
+from chitu.native_layout.common import Packed4BitWeightAlongKContig
 from chitu.import_utils import try_import_opt_dep
 from chitu.utils import ceil_div
 
@@ -282,7 +283,10 @@ class HygonW4A8Int4TileTensor(NativeLayoutTensor):
     @classmethod
     @override
     @plum.dispatch
-    def convert_from(cls, tensor: torch.Tensor):
+    def convert_from(cls, packed: Packed4BitWeightAlongKContig):
+        tensor = packed.layout_tensor.view(torch.int8)
+        if tensor.device.type == "meta":
+            return cls(plain_shape=packed.plain_shape, layout_tensor=tensor)
         assert has_hygon_w4a8, "Hygon/Sugon w4a8 kernels are unavailable."
         assert hasattr(
             hygon_w4a8_kernels, "native_layout_of_weights_tile_int4_opt"
@@ -291,7 +295,7 @@ class HygonW4A8Int4TileTensor(NativeLayoutTensor):
         layout_tensor = hygon_w4a8_kernels.native_layout_of_weights_tile_int4_opt(
             tensor
         )
-        return cls(plain_shape=tensor.shape, layout_tensor=layout_tensor)
+        return cls(plain_shape=packed.plain_shape, layout_tensor=layout_tensor)
 
     @override
     def convert_to_plain(self):
@@ -313,6 +317,8 @@ class HygonW4A8Int8TileTensor(NativeLayoutTensor):
     @override
     @plum.dispatch
     def convert_from(cls, tensor: torch.Tensor):
+        if tensor.device.type == "meta":
+            return cls(plain_shape=tensor.shape, layout_tensor=tensor)
         assert has_hygon_w4a8, "Hygon/Sugon w4a8 kernels are unavailable."
         assert hasattr(
             hygon_w4a8_kernels, "native_layout_of_scale_tile_i8"
@@ -334,16 +340,26 @@ class HygonMixQIntTileTensor(NativeLayoutTensor):
     """
     Hygon tiled layout for mixQ integer weights (e.g., W4/W8).
 
-    This class only wraps the forward conversion:
-      plain torch.Tensor -> hygon native tiled layout (int path).
+    This class support twn conversion:
+      1. plain torch.Tensor (int8) -> hygon native tiled layout (W8 path)
+      2. Packed4BitWeightAlongKContig -> hygon native tiled layout (W4 path)
     """
 
     @classmethod
     @override
     @plum.dispatch
     def convert_from(
-        cls, tensor: torch.Tensor, *, weight_bits: int
-    ):  # weights_bits for debug more easy
+        cls, tensor: torch.Tensor | Packed4BitWeightAlongKContig, *, weight_bits: int
+    ):
+        if isinstance(tensor, Packed4BitWeightAlongKContig):
+            assert weight_bits == 4
+            plain_shape = tensor.plain_shape
+            tensor = tensor.layout_tensor
+        else:
+            assert weight_bits == 8
+            plain_shape = tensor.shape
+        if tensor.device.type == "meta":
+            return cls(plain_shape=plain_shape, layout_tensor=tensor)
         assert has_hygon, "Hygon/Sugon kernels are unavailable."
         assert hasattr(
             hygon_mixq_kernels, "native_layout_of_weights_tile_int"
@@ -351,7 +367,7 @@ class HygonMixQIntTileTensor(NativeLayoutTensor):
         layout_tensor = hygon_mixq_kernels.native_layout_of_weights_tile_int(
             tensor.contiguous()
         )
-        return cls(plain_shape=tensor.shape, layout_tensor=layout_tensor)
+        return cls(plain_shape=plain_shape, layout_tensor=layout_tensor)
 
     @override
     def convert_to_plain(self):
@@ -381,7 +397,7 @@ class HygonMixQFp16TileTensor(NativeLayoutTensor):
         ), "Kernel 'native_layout_of_weights_tile_fp16' not found."
 
         src = tensor.contiguous()
-        if tensor.numel() == 0:
+        if tensor.numel() == 0 or tensor.device.type == "meta":
             return cls(plain_shape=tensor.shape, layout_tensor=tensor)
         layout_tensor = hygon_mixq_kernels.native_layout_of_weights_tile_fp16(src)
         return cls(plain_shape=tensor.shape, layout_tensor=layout_tensor)

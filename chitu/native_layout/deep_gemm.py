@@ -38,9 +38,18 @@ class DeepGemmScale(NativeLayoutTensor):
         num_groups: Optional[int] = None,
         disable_ue8m0_cast: bool,
     ) -> "DeepGemmScale":
+        if tensor.device.type == "meta":
+            return cls(
+                plain_shape=tensor.shape,
+                layout_tensor=torch.empty_like(tensor, dtype=torch.float32),
+                mn=mn,
+                k=k,
+                num_groups=num_groups,
+                disable_ue8m0_cast=disable_ue8m0_cast,
+            )
         device = tensor.device
         layout_tensor = deep_gemm.transform_sf_into_required_layout(
-            tensor.cuda(),
+            tensor.float().cuda(),
             mn,
             k,
             num_groups=num_groups,

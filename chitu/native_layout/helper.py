@@ -2,132 +2,280 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from chitu.native_layout.base import NATIVE_LAYOUT_TENSOR_PROPERTY_NAME
-from chitu.global_vars import get_global_args
+import torch
+
+from chitu.native_layout.base import (
+    NativeLayoutTensor,
+    NativeLayoutTemplate,
+    TensorWithNativeLayout,
+)
+from logging import getLogger
+
+logger = getLogger(__name__)
 
 
-def enable_native_layout_weight(
-    key: str,
-    native_layout_tensor_class: type,
-    *static_args,
-    **static_kwargs,
-) -> type:
-    """
-    Return a mix-in class that can be inherit by a Module class, which will enable the Module class to
-    preprocess its weight and use it in a native layout.
+class NativeLayoutMixin:
+    """Mixin that provides :meth:`apply_native_layout` and
+    :meth:`init_native_layout` for deferred native-layout conversion.
 
-    Example usage:
-    ```
-    class YourModule(enable_native_layout_weight("weight", MyNativeLayout), torch.nn.Module):
-        ...
-    your_module = YourModule()
-    ```
-    , where `MyNativeLayout` is a subclass of `NativeLayout`.
+    Subclasses override :meth:`init_native_layout` to
+    call :meth:`apply_native_layout` on each parameter that needs
+    conversion::
 
-    After `your_module` loads state dict, the weight will automatically be transformed into the layout of
-    `MyNativeLayout`, still stored in the original `Parameter`. Besides, `your_module.get_native_layout_weight()`
-    will be available for getting an `MyNativeLayout` instance for the weight.
+        class MyLinear(NativeLayoutMixin, nn.Module):
+            def __init__():
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.empty(PLAIN_SHAPE))
 
-    `enable_native_layout_weight` also supports preprocessing the weight from another layout. To do this,
-    you can set `_{key}_layout_class`, `_{key}_plain_shape`, `_{key}_layout_args` (optional) and
-    `_{key}_layout_kwargs` (optional) attributes in the Module class so the layout can be recognized. For
-    example:
+            def init_native_layout(self):
+                super().init_native_layout()
+                self.apply_native_layout(self.weight, Layout1, state_dict_convert=False)
+                self.apply_native_layout(self.weight, Layout2, state_dict_convert=False)
+                self.apply_native_layout(self.weight, Layout3)
+                self.apply_native_layout(self.weight, Layout4)
 
-    ```
-    class YourModule(enable_native_layout_weight("weight", MyNativeLayout), torch.nn.Module):
-        def __init__(self):
-            self.weight = torch.nn.Parameter(torch.randn(2, 5, 2, 5, 2))  # Native shape
-            self._weight_layout_class = MyNativeLayout
-            self._weight_plain_shape = (10, 20)  # Mathematical shape
-    ```
+    When calling ``init_native_layout``, weight is converted as
+    `Plain -> Layout1 -> Layout2 -> Layout3 -> Layout4`.
 
-    Args:
-        key: The module will process `self.{key}` for its weight `Parameter`, and the native layout tensor
-             getter will be named after `self.get_native_layout_{key}`.
-        native_layout_tensor_class: A subclass of `NativeLayoutTensor` representing the layout.
-        static_args: Other positional arguments passed to `NativeLayoutTensor`.
-        static_kwargs: Other keyword arguments passed to `NativeLayoutTensor`.
+    When load_state_dict, state_dict["weight"] is assume to have shape and dtype
+    as `Layout2`, and converted as `Layout2 -> Layout3 -> Layout4`.
+
+    init_native_layout also build a getter `get_native_layout_weight()`, returns
+    self.weight wrapped with Layout4.
+
+    You can call Layout4.check_tensor(self.weight) to run an isinstance-like check.
     """
 
-    class EnableNativeLayoutWeightMixIn:
-        # NOTE: In Python, super().__init__ calls the next base class in the full inheritance graph
-        # of the final class, so we can append a class to the base class, to make it act like a
-        # further base class of the original base class.
-        # See https://docs.python.org/3/tutorial/classes.html#multiple-inheritance
+    def apply_native_layout(
+        self,
+        param: torch.nn.Parameter,
+        layout_cls: type[NativeLayoutTensor],
+        *args,
+        state_dict_convert: bool = True,
+        **kwargs,
+    ) -> None:
+        """Record (and eagerly apply) a native-layout conversion on *param*.
 
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
+        Called from :meth:`init_native_layout`.  The conversion is always
+        applied to ``param.data`` in-place via
+        :meth:`NativeLayoutTemplate.convert`.
 
-            # NOTE: Look up parameters (dynamically handled by torch.nn.Module) with __getattr__, but
-            # look up real Python attributes with __getattribute__.
+        Parameters
+        ----------
+        param :
+            The parameter to convert.  Its initial shape is taken as the
+            mathematical *plain_shape* for the first call in a chain.
+        layout_cls :
+            Target :class:`NativeLayoutTensor` subclass.
+        *args, **kwargs :
+            Forwarded to ``layout_cls.convert_from``.
+        state_dict_convert :
+            If ``True`` (default), this step participates in the
+            ``load_state_dict`` pre-hook — the hook converts incoming
+            ``state_dict`` data through this step on its way to the
+            final layout.  If ``False``, the pre-hook assumes the
+            ``state_dict`` data is already in this layout's format
+            and skips conversion.  A ``False`` step must come before
+            any ``True`` step on the same parameter.
+        """
 
-            def _get_native_layout_tensor():
-                layout_args = (
-                    self.__getattribute__(f"_{key}_layout_args")
-                    if hasattr(self, f"_{key}_layout_args")
-                    else ()
+        # ---- walk existing chain ----
+        existing: NativeLayoutTemplate | None = None
+        if isinstance(param, TensorWithNativeLayout) and isinstance(
+            param.native_layout, NativeLayoutTemplate
+        ):
+            existing = param.native_layout
+
+        if (
+            existing is not None
+            and not state_dict_convert
+            and existing.state_dict_convert
+        ):
+            raise ValueError(
+                f"{type(self).__name__}: state_dict_convert=False "
+                f"must come before state_dict_convert=True"
+            )
+
+        # ---- plain_shape ----
+        plain_shape = existing.plain_shape if existing else param.shape
+
+        # ---- state_dict_shape / state_dict_dtype ----
+        if existing is not None:
+            state_dict_shape = existing.state_dict_shape
+            state_dict_dtype = existing.state_dict_dtype
+        else:
+            state_dict_shape = param.shape
+            state_dict_dtype = param.dtype
+
+        # ---- build template ----
+        template = NativeLayoutTemplate(
+            layout_cls=layout_cls,
+            plain_shape=plain_shape,
+            args=args,
+            kwargs=kwargs,
+            state_dict_convert=state_dict_convert,
+            state_dict_shape=state_dict_shape,
+            state_dict_dtype=state_dict_dtype,
+            previous=existing,
+        )
+
+        # ---- eager conversion ----
+        try:
+            converted = template.convert(param.data)
+        except Exception:
+            if param.data.device.type == "meta":
+                logger.error(
+                    "convert failed for %s. Tip: %s must support meta " "tensor input.",
+                    type(self).__name__,
+                    layout_cls.__name__,
                 )
-                layout_kwargs = (
-                    self.__getattribute__(f"_{key}_layout_kwargs")
-                    if hasattr(self, f"_{key}_layout_kwargs")
-                    else {}
-                )
-                return self.__getattribute__(f"_{key}_layout_class")(
-                    self.__getattribute__(f"_{key}_plain_shape"),
-                    self.__getattr__(key).data,
-                    *layout_args,
-                    **layout_kwargs,
-                )
+            raise
+        param.data = converted.layout_tensor
 
-            def _preprocess_layout(module, incompatible_keys):
-                if hasattr(module, f"_{key}_layout_class"):
-                    old_tensor = _get_native_layout_tensor()
-                else:
-                    old_tensor = module.__getattr__(key)
+        # ---- update state_dict_shape/dtype after conversion ----
+        if existing is None and not state_dict_convert:
+            # First call, state_dict_convert=False: capture checkpoint
+            # format after conversion (plain → packed).
+            template.state_dict_shape = param.shape
+            template.state_dict_dtype = param.dtype
 
-                inst_args = getattr(module, f"_{key}_layout_args", None)
-                inst_kwargs = getattr(module, f"_{key}_layout_kwargs", None)
-                other_args = inst_args if inst_args is not None else static_args
-                other_kwargs = inst_kwargs if inst_kwargs is not None else static_kwargs
+        param.native_layout = template
 
-                def _eval(p):
-                    if callable(p):
-                        try:
-                            return p(module)  # e.g. lambda m: m.in_features
-                        except TypeError:
-                            return p()  # e.g. torch.get_default_dtype
-                    return p
+    def init_native_layout(self):
+        """Override in subclasses to call :meth:`apply_native_layout`.
 
-                other_args = tuple(_eval(a) for a in other_args)
-                other_kwargs = {k: _eval(v) for k, v in other_kwargs.items()}
+        The default implementation is a no-op so that
+        ``super().init_native_layout()`` chains end here.
+        """
+        pass
 
-                native_layout = native_layout_tensor_class.convert_from(
-                    old_tensor,
-                    *other_args,
-                    **other_kwargs,
-                )
-                module.__setattr__(f"_{key}_layout_class", native_layout_tensor_class)
-                module.__setattr__(f"_{key}_plain_shape", native_layout.plain_shape)
-                module.__setattr__(f"_{key}_layout_args", other_args)
-                module.__setattr__(f"_{key}_layout_kwargs", other_kwargs)
-                module.__getattr__(key).data = native_layout.layout_tensor
-                setattr(
-                    module.__getattr__(key),
-                    NATIVE_LAYOUT_TENSOR_PROPERTY_NAME,
-                    type(native_layout),
-                )
 
-            # skip_model_load=True时立刻处理，否则加载后处理
-            try:
-                debug = getattr(get_global_args(), "debug", None)
-            except AssertionError:
-                debug = None
-            if debug is not None and debug.skip_model_load:
-                _preprocess_layout(self, None)
-            else:
-                self.register_load_state_dict_post_hook(_preprocess_layout)
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
-            # register get_native_layout_{key}
-            self.__setattr__(f"get_native_layout_{key}", _get_native_layout_tensor)
 
-    return EnableNativeLayoutWeightMixIn
+def init_native_layout(model: torch.nn.Module):
+    """Walk *model*, apply native-layout conversions and install hooks.
+
+    For every sub-module that is a :class:`NativeLayoutMixin`:
+
+    1. Call ``module.init_native_layout()`` — subclasses call
+       :meth:`~NativeLayoutMixin.apply_native_layout`, which converts
+       parameter data and attaches a :class:`NativeLayoutTemplate`.
+    2. Iterate over *module*'s own parameters (non-recursive).  For each
+       whose ``native_layout`` is a :class:`NativeLayoutTemplate`, install
+       the ``get_native_layout_<name>`` getter and ``load_state_dict``
+       hooks.
+
+    Call this **once** after the full model tree is built but before the
+    first ``load_state_dict``.
+    """
+    for module in model.modules():
+        if not isinstance(module, NativeLayoutMixin):
+            continue
+        module.init_native_layout()
+        for name, param in module.named_parameters(recurse=False):
+            if not isinstance(param, TensorWithNativeLayout):
+                continue
+            template = param.native_layout
+            if isinstance(template, NativeLayoutTemplate):
+                _register_native_layout(module, name, template)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _register_native_layout(
+    module: torch.nn.Module,
+    name: str,
+    template: NativeLayoutTemplate,
+):
+    """Install getter and state-dict hooks for a native-layout parameter.
+
+    Raises :class:`RuntimeError` on duplicate registration.
+    """
+    if hasattr(module, f"get_native_layout_{name}"):
+        raise RuntimeError(
+            f"Duplicate native-layout registration for "
+            f"{type(module).__name__}.{name}"
+        )
+    _install_getter(module, name, template)
+    _install_state_dict_hooks(module, name, template)
+
+
+def _install_getter(module: torch.nn.Module, name: str, template: NativeLayoutTemplate):
+    """Install a ``get_native_layout_<name>`` method on *module*."""
+
+    def getter(self):
+        p = getattr(self, name)
+        return template.build(p.data)
+
+    setattr(module, f"get_native_layout_{name}", getter.__get__(module))
+
+
+def _install_state_dict_hooks(
+    module: torch.nn.Module, name: str, template: NativeLayoutTemplate
+):
+    """Install ``load_state_dict`` pre- and post-hooks.
+
+    The pre-hook intercepts incoming ``state_dict`` entries, walks the
+    template chain to find the first (deepest) template, and converts
+    the data through all ``state_dict_convert=True`` steps.  If the
+    deepest template has ``state_dict_convert=False`` the incoming data
+    is assumed to already be in that layout's format and that step is
+    skipped.
+
+    The post-hook restores ``param.native_layout`` after
+    ``load_state_dict(assign=True)`` replaces the ``Parameter`` object.
+    """
+
+    def pre_hook(
+        module,
+        state_dict: dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs: list[str],
+    ):
+        key = prefix + name
+        if key not in state_dict:
+            missing_keys.append(key)
+            return
+        try:
+            data = state_dict[key]
+
+            # Walk to the first template in the chain
+            current = template
+            chain = [current]
+            while current.previous is not None:
+                current = current.previous
+                chain.insert(0, current)
+
+            # If the first template has state_dict_convert=False,
+            # the state_dict data is already in that intermediate
+            # layout — wrap and skip the conversion step.
+            if not chain[0].state_dict_convert:
+                data = chain[0].build(data)
+                chain = chain[1:]
+
+            # Convert through all remaining (state_dict_convert=True)
+            # templates.
+            for t in chain:
+                data = t.layout_cls.convert_from(data, *t.args, **t.kwargs)
+
+            state_dict[key] = data.layout_tensor
+        except Exception as e:
+            logger.exception("Failed to convert native layout tensor")
+            error_msgs.append(f"{key} convert failed: {e}")
+
+    module.register_load_state_dict_pre_hook(pre_hook)
+
+    def post_hook(module, _incompatible_keys):
+        getattr(module, name).native_layout = template
+
+    module.register_load_state_dict_post_hook(post_hook)

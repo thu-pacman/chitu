@@ -70,6 +70,7 @@ from chitu.quantization import (
     get_backend_from_checkpoint_prefix,
 )
 from chitu.hybrid_device import CPUParameter
+from chitu.native_layout.base import TensorWithNativeLayout
 from chitu.static_tensor import StaticTensor
 from chitu.ops.kv_cache import (
     read_from_singleton_paged_kv_cache,
@@ -1072,23 +1073,27 @@ class Transformer(nn.Module):
         # Check inconsistent dtype
         keep_dtype_in_checkpoint = get_global_args().keep_dtype_in_checkpoint
         for name, param in self.named_parameters():
-            if name in state_dict and param.dtype != state_dict[name].dtype:
+            if isinstance(param, TensorWithNativeLayout):
+                model_dtype = param.native_layout.state_dict_dtype
+            else:
+                model_dtype = param.dtype
+            if name in state_dict and model_dtype != state_dict[name].dtype:
                 if keep_dtype_in_checkpoint:
                     logger.info(
                         f"Parameter {name} has inconsistent dtype in the checkpoint "
-                        f"({state_dict[name].dtype}) and the model ({param.dtype}), "
+                        f"({state_dict[name].dtype}) and the model ({model_dtype}), "
                         f"using the dtype in the checkpoint. Set `keep_dtype_in_checkpoint=False` "
                         f"when starting chitu if you want to use the dtype in the model."
                     )
                 else:
                     logger.info(
                         f"Parameter {name} has inconsistent dtype in the checkpoint "
-                        f"({state_dict[name].dtype}) and the model ({param.dtype}), "
+                        f"({state_dict[name].dtype}) and the model ({model_dtype}), "
                         f"converting the checkpoint dtype to the model dtype. Set "
                         f"`keep_dtype_in_checkpoint=True` when starting chitu if you "
                         f"want to use the dtype in the checkpoint."
                     )
-                    state_dict[name] = state_dict[name].to(param.dtype)
+                    state_dict[name] = state_dict[name].to(model_dtype)
 
         for k in state_dict:
             if isinstance(self.get_parameter(k), CPUParameter):

@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from chitu.native_layout.base import NativeLayoutTensor
-from chitu.native_layout.common import Packed4BitWeightAlongK
+from chitu.native_layout.common import Packed4BitWeightAlongKContig
 
 
 def nvfp4_moe_pad_n_for_group_mm_b_scale(n: int, k_logical: int) -> int:
@@ -190,23 +190,12 @@ class BlackwellMXFP4MOEPadWeight(NativeLayoutTensor):
     @classmethod
     @override
     @plum.dispatch
-    def convert_from(cls, tensor: torch.Tensor, *, padded_shape: tuple):
-        tensor = _mxfp4_moe_pad_weight_to_shape(tensor, padded_shape)
-        return cls(
-            plain_shape=tensor.shape,
-            layout_tensor=tensor,
-            padded_shape=tuple(padded_shape),
-        )
-
-    @classmethod
-    @override
-    @plum.dispatch
-    def convert_from(cls, packed: Packed4BitWeightAlongK, *, padded_shape: tuple):
+    def convert_from(cls, packed: Packed4BitWeightAlongKContig, *, padded_shape: tuple):
 
         assert packed.layout_tensor.ndim == 3, packed.layout_tensor.shape
         tensor = _mxfp4_moe_pad_weight_to_shape(packed.layout_tensor, padded_shape)
         return cls(
-            plain_shape=tensor.shape,
+            plain_shape=packed.plain_shape,
             layout_tensor=tensor,
             padded_shape=tuple(padded_shape),
         )
@@ -223,11 +212,10 @@ class BlackwellMXFP4MOEPadWeight(NativeLayoutTensor):
                 f"Indexing {type(self)} with {type(index)} is not supported."
             )
         sl = self.layout_tensor[index]
-        plain = (sl.shape[0], sl.shape[1] * 2)
-        return Packed4BitWeightAlongK(
+        plain = tuple(self.plain_shape[1:])
+        return Packed4BitWeightAlongKContig(
             plain_shape=plain,
             layout_tensor=sl,
-            k_stride=1,
         )
 
 

@@ -32,12 +32,13 @@ from chitu.utils import (
 )
 from chitu.global_vars import get_global_args
 from chitu.native_layout import (
-    enable_native_layout_weight,
+    NativeLayoutMixin,
     BlackwellMXFP4MOEPadWeight,
     BlackwellMXFP4MOEScalePadToSwizzled,
     Blockfp4LinearPackedWeightPadToShape,
     Blockfp4LinearScalePadToSwizzled,
     Packed4BitWeightAlongK,
+    Packed4BitWeightAlongKContig,
     Packed4BitWeightNPUNative,
     LinearScaleToSwizzled,
     nvfp4_moe_down_proj_n_padded,
@@ -196,7 +197,7 @@ def _linear_block_fp4_fp8(
     return y.view(x_shape[:-1] + y.shape[-1:])
 
 
-class Blockfp4LinearBase(QuantizedLinearBase):
+class Blockfp4LinearBase(NativeLayoutMixin, QuantizedLinearBase):
     """
     block 4-bit weight and activation quantized linear layer.
 
@@ -235,26 +236,15 @@ class Blockfp4LinearBase(QuantizedLinearBase):
 
         self.act_block_size = act_block_size
 
-        # In the checkpoint, self.weight is in Packed4BitWeightAlongK layout with
-        # `k_stride = 1`. Here we mark the layout via `self._weight_layout_class`
-        # and `self._weight_plain_shape`, so `enable_native_layout_weight` can recognize
-        # it. After loading, `enable_native_layout_weight` will convert it to
-        # other layouts.
-        self.register_parameter(
-            "weight",
-            torch.nn.Parameter(
-                torch.empty(
-                    (
-                        out_features,
-                        in_features // 2,  # Every 2 float4 is packed into 1 uint8
-                    ),
-                    dtype=torch.uint8,
+        self.weight = torch.nn.Parameter(
+            torch.empty(
+                (
+                    out_features,
+                    in_features,
                 ),
-                requires_grad=False,
             ),
+            requires_grad=False,
         )
-        self._weight_layout_class = Packed4BitWeightAlongK
-        self._weight_plain_shape = (out_features, in_features)
 
         block_in, block_out = block_shape
         self.block_shape = block_shape
@@ -319,16 +309,23 @@ class Blockfp4LinearBase(QuantizedLinearBase):
         else:
             self.register_parameter("bias", None)
 
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(
+            self.weight, Packed4BitWeightAlongKContig, state_dict_convert=False
+        )
+
 
 @QuantizationRegistry.register_linear("blockfp4", when=lambda _: is_nvidia())
 @QuantizationRegistry.register_linear("blockfp4_merged", when=lambda _: is_nvidia())
-class Blockfp4LinearPackKStride64(
-    enable_native_layout_weight("weight", Packed4BitWeightAlongK, k_stride=64),
-    Blockfp4LinearBase,
-):
+class Blockfp4LinearPackKStride64(Blockfp4LinearBase):
     """
     Blockfp4Linear with weight in Packed4BitWeightAlongK (k_stride=64) layout.
     """
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.weight, Packed4BitWeightAlongK, k_stride=64)
 
     @torch.no_grad()
     def forward(self, x) -> torch.Tensor:
@@ -348,35 +345,35 @@ class Blockfp4LinearPackKStride64(
 @QuantizationRegistry.register_linear(
     "blockfp4_merged", when=lambda _: is_blackwell(), priority=1
 )
-class Blockfp4LinearPackKStride1(
-    enable_native_layout_weight(
-        "weight",
-        Blockfp4LinearPackedWeightPadToShape,
-        k_stride=1,
-        padded_shape=lambda m: [
-            m.weight.shape[0],
-            ((m.weight.shape[1] * 2 + 255) // 256 * 256) // 2,
-        ],
-    ),
-    enable_native_layout_weight(
-        "weight_scale",
-        Blockfp4LinearScalePadToSwizzled,
-        padded_shape=lambda m: [
-            m.weight_scale.shape[0],
-            max(
-                (m.weight_scale.shape[1] + 7) // 8 * 8,
-                ceil_div(
-                    ((m.weight.shape[1] * 2 + 255) // 256 * 256),
-                    m.block_shape[0],
-                ),
-            ),
-        ],
-    ),
-    Blockfp4LinearBase,
-):
+class Blockfp4LinearPackKStride1(Blockfp4LinearBase):
     """
     Blockfp4Linear with weight in Packed4BitWeightAlongK (k_stride=1) layout.
     """
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(
+            self.weight,
+            Blockfp4LinearPackedWeightPadToShape,
+            padded_shape=[
+                self.weight.shape[0],
+                ((self.weight.shape[1] * 2 + 255) // 256 * 256) // 2,
+            ],
+        )
+        self.apply_native_layout(
+            self.weight_scale,
+            Blockfp4LinearScalePadToSwizzled,
+            padded_shape=[
+                self.weight_scale.shape[0],
+                max(
+                    (self.weight_scale.shape[1] + 7) // 8 * 8,
+                    ceil_div(
+                        ((self.weight.shape[1] * 2 + 255) // 256 * 256),
+                        self.block_shape[0],
+                    ),
+                ),
+            ],
+        )
 
     @torch.no_grad()
     def forward(self, x) -> torch.Tensor:
@@ -393,13 +390,14 @@ class Blockfp4LinearPackKStride1(
 @QuantizationRegistry.register_linear(
     "blockfp4", when=lambda _: has_torch_npu, priority=2
 )
-class Blockfp4LinearPackNPUNative(
-    enable_native_layout_weight("weight", Packed4BitWeightNPUNative),
-    Blockfp4LinearBase,
-):
+class Blockfp4LinearPackNPUNative(Blockfp4LinearBase):
     """
     Blockfp4Linear with weight in Packed4BitWeightNPUNative layout.
     """
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.weight, Packed4BitWeightNPUNative)
 
     @torch.no_grad()
     def forward(self, x) -> torch.Tensor:
@@ -558,7 +556,7 @@ def _fused_experts_sum_blockfp4_indexed_triton(
     )
 
 
-class Blockfp4MoeExpertsUnmergedBase(QuantizedMoeExpertsUnmerged):
+class Blockfp4MoeExpertsUnmergedBase(NativeLayoutMixin, QuantizedMoeExpertsUnmerged):
     """
     blockfp4 quantized MoeExperts with weights in Packed4BitWeightAlongK (k_stride=1) layout,
     and unmerged gate and up projection.
@@ -592,23 +590,15 @@ class Blockfp4MoeExpertsUnmergedBase(QuantizedMoeExpertsUnmerged):
 
         quant_scale_stride = 16
 
-        # In the checkpoint, the weights are in Packed4BitWeightAlongK layout with
-        # `stride = 1`. Here we mark the layout via `self._{key}_layout_class` and
-        # `self._{key}_plain_shape`, so `enable_native_layout_weight` can recognize it.
-        # After loading, `enable_native_layout_weight` will convert them to other
-        # layouts.
         scale_in_features = ceil_div(dim, quant_scale_stride)
         self.gate_proj_weight = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
                 moe_inter_dim,
-                dim // 2,
-                dtype=torch.uint8,
+                dim,
             ),
             requires_grad=False,
         )
-        self._gate_proj_weight_layout_class = Packed4BitWeightAlongK
-        self._gate_proj_weight_plain_shape = (self.group_size, moe_inter_dim, dim)
         self.gate_proj_weight_scale = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
@@ -641,13 +631,10 @@ class Blockfp4MoeExpertsUnmergedBase(QuantizedMoeExpertsUnmerged):
             torch.empty(
                 self.group_size,
                 moe_inter_dim,
-                dim // 2,
-                dtype=torch.uint8,
+                dim,
             ),
             requires_grad=False,
         )
-        self._up_proj_weight_layout_class = Packed4BitWeightAlongK
-        self._up_proj_weight_plain_shape = (self.group_size, moe_inter_dim, dim)
         self.up_proj_weight_scale = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
@@ -682,13 +669,10 @@ class Blockfp4MoeExpertsUnmergedBase(QuantizedMoeExpertsUnmerged):
             torch.empty(
                 self.group_size,
                 dim,
-                moe_inter_dim // 2,
-                dtype=torch.uint8,
+                moe_inter_dim,
             ),
             requires_grad=False,
         )
-        self._down_proj_weight_layout_class = Packed4BitWeightAlongK
-        self._down_proj_weight_plain_shape = (self.group_size, dim, moe_inter_dim)
         self.down_proj_weight_scale = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
@@ -717,6 +701,22 @@ class Blockfp4MoeExpertsUnmergedBase(QuantizedMoeExpertsUnmerged):
                 ),
                 requires_grad=False,
             )
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(
+            self.gate_proj_weight,
+            Packed4BitWeightAlongKContig,
+            state_dict_convert=False,
+        )
+        self.apply_native_layout(
+            self.up_proj_weight, Packed4BitWeightAlongKContig, state_dict_convert=False
+        )
+        self.apply_native_layout(
+            self.down_proj_weight,
+            Packed4BitWeightAlongKContig,
+            state_dict_convert=False,
+        )
 
     @override
     def forward_ith_expert_gate(
@@ -758,7 +758,7 @@ class Blockfp4MoeExpertsUnmergedBase(QuantizedMoeExpertsUnmerged):
         )
 
 
-class Blockfp4MoeExpertsMergedBase(QuantizedMoeExpertsMerged):
+class Blockfp4MoeExpertsMergedBase(NativeLayoutMixin, QuantizedMoeExpertsMerged):
     """
     blockfp4 quantized MoeExperts with weights in Packed4BitWeightAlongK (k_stride=1) layout,
     and merged gate and up projection.
@@ -792,26 +792,14 @@ class Blockfp4MoeExpertsMergedBase(QuantizedMoeExpertsMerged):
 
         quant_scale_stride = 16
 
-        # In the checkpoint, the weights are in Packed4BitWeightAlongK layout with
-        # `stride = 1`. Here we mark the layout via `self._{key}_layout_class` and
-        # `self._{key}_plain_shape`, so `enable_native_layout_weight` can recognize it.
-        # After loading, `enable_native_layout_weight` will convert them to other
-        # layouts.
         scale_in_features = ceil_div(dim, quant_scale_stride)
         self.gate_up_proj_weight = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
                 moe_inter_dim * 2,
-                dim // 2,
-                dtype=torch.uint8,
+                dim,
             ),
             requires_grad=False,
-        )
-        self._gate_up_proj_weight_layout_class = Packed4BitWeightAlongK
-        self._gate_up_proj_weight_plain_shape = (
-            self.group_size,
-            moe_inter_dim * 2,
-            dim,
         )
         self.gate_up_proj_weight_scale = torch.nn.Parameter(
             torch.empty(
@@ -846,13 +834,10 @@ class Blockfp4MoeExpertsMergedBase(QuantizedMoeExpertsMerged):
             torch.empty(
                 self.group_size,
                 dim,
-                moe_inter_dim // 2,
-                dtype=torch.uint8,
+                moe_inter_dim,
             ),
             requires_grad=False,
         )
-        self._down_proj_weight_layout_class = Packed4BitWeightAlongK
-        self._down_proj_weight_plain_shape = (self.group_size, dim, moe_inter_dim)
         self.down_proj_weight_scale = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
@@ -881,6 +866,19 @@ class Blockfp4MoeExpertsMergedBase(QuantizedMoeExpertsMerged):
                 ),
                 requires_grad=False,
             )
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(
+            self.gate_up_proj_weight,
+            Packed4BitWeightAlongKContig,
+            state_dict_convert=False,
+        )
+        self.apply_native_layout(
+            self.down_proj_weight,
+            Packed4BitWeightAlongKContig,
+            state_dict_convert=False,
+        )
 
     @override
     def forward_ith_expert_gate_up(
@@ -920,49 +918,51 @@ class Blockfp4MoeExpertsMergedBase(QuantizedMoeExpertsMerged):
     when=lambda _: is_blackwell() and has_hard_fp4_kernels,
     priority=1,
 )
-class Blockfp4MoeExpertsBlackwell(
-    enable_native_layout_weight(
-        "gate_up_proj_weight",
-        BlackwellMXFP4MOEPadWeight,
-        padded_shape=lambda m: [
-            m.gate_up_proj_weight.shape[0],
-            (m.gate_up_proj_weight.shape[1] // 2 + 255) // 256 * 256 * 2,
-            ((m.gate_up_proj_weight.shape[2] * 2 + 255) // 256 * 256) // 2,
-        ],
-    ),
-    enable_native_layout_weight(
-        "down_proj_weight",
-        BlackwellMXFP4MOEPadWeight,
-        padded_shape=lambda m: [
-            m.down_proj_weight.shape[0],
-            nvfp4_moe_down_proj_n_padded(
-                m.down_proj_weight.shape[1], m.down_proj_weight.shape[2]
-            ),
-            ((m.down_proj_weight.shape[2] * 2 + 255) // 256 * 256) // 2,
-        ],
-    ),
-    enable_native_layout_weight(
-        "gate_up_proj_weight_scale",
-        BlackwellMXFP4MOEScalePadToSwizzled,
-        padded_shape=lambda m: [
-            m.gate_up_proj_weight_scale.shape[0],
-            (m.gate_up_proj_weight_scale.shape[1] // 2 + 255) // 256 * 256 * 2,
-            (m.gate_up_proj_weight_scale.shape[2] + 7) // 8 * 8,
-        ],
-    ),
-    enable_native_layout_weight(
-        "down_proj_weight_scale",
-        BlackwellMXFP4MOEScalePadToSwizzled,
-        padded_shape=lambda m: [
-            m.down_proj_weight_scale.shape[0],
-            nvfp4_moe_down_proj_n_padded(
-                m.down_proj_weight.shape[1], m.down_proj_weight.shape[2]
-            ),
-            ((m.down_proj_weight.shape[2] * 2 + 255) // 256 * 256) // 16,
-        ],
-    ),
-    Blockfp4MoeExpertsMergedBase,
-):
+class Blockfp4MoeExpertsBlackwell(Blockfp4MoeExpertsMergedBase):
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(
+            self.gate_up_proj_weight,
+            BlackwellMXFP4MOEPadWeight,
+            padded_shape=[
+                self.gate_up_proj_weight.shape[0],
+                (self.gate_up_proj_weight.shape[1] // 2 + 255) // 256 * 256 * 2,
+                ((self.gate_up_proj_weight.shape[2] * 2 + 255) // 256 * 256) // 2,
+            ],
+        )
+        self.apply_native_layout(
+            self.down_proj_weight,
+            BlackwellMXFP4MOEPadWeight,
+            padded_shape=[
+                self.down_proj_weight.shape[0],
+                nvfp4_moe_down_proj_n_padded(
+                    self.down_proj_weight.shape[1], self.down_proj_weight.shape[2]
+                ),
+                ((self.down_proj_weight.shape[2] * 2 + 255) // 256 * 256) // 2,
+            ],
+        )
+        self.apply_native_layout(
+            self.gate_up_proj_weight_scale,
+            BlackwellMXFP4MOEScalePadToSwizzled,
+            padded_shape=[
+                self.gate_up_proj_weight_scale.shape[0],
+                (self.gate_up_proj_weight_scale.shape[1] // 2 + 255) // 256 * 256 * 2,
+                (self.gate_up_proj_weight_scale.shape[2] + 7) // 8 * 8,
+            ],
+        )
+        self.apply_native_layout(
+            self.down_proj_weight_scale,
+            BlackwellMXFP4MOEScalePadToSwizzled,
+            padded_shape=[
+                self.down_proj_weight_scale.shape[0],
+                nvfp4_moe_down_proj_n_padded(
+                    self.down_proj_weight.shape[1], self.down_proj_weight.shape[2]
+                ),
+                ((self.down_proj_weight.shape[2] * 2 + 255) // 256 * 256) // 16,
+            ],
+        )
+
     @override
     def forward(
         self,
@@ -1033,18 +1033,19 @@ class Blockfp4MoeExpertsBlackwell(
 @QuantizationRegistry.register_moe_experts(
     "blockfp4_merged", merge_gate_up=True, when=lambda _: is_nvidia() and has_triton
 )
-class Blockfp4MoeExpertsPackKStride64(
-    enable_native_layout_weight(
-        "gate_up_proj_weight", Packed4BitWeightAlongK, k_stride=64
-    ),
-    enable_native_layout_weight(
-        "down_proj_weight", Packed4BitWeightAlongK, k_stride=64
-    ),
-    Blockfp4MoeExpertsMergedBase,
-):
+class Blockfp4MoeExpertsPackKStride64(Blockfp4MoeExpertsMergedBase):
     """
     blockfp4 quantized MoeExperts with weights in Packed4BitWeightAlongK (k_stride=64) layout.
     """
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(
+            self.gate_up_proj_weight, Packed4BitWeightAlongK, k_stride=64
+        )
+        self.apply_native_layout(
+            self.down_proj_weight, Packed4BitWeightAlongK, k_stride=64
+        )
 
     @override
     def forward_no_sum(
@@ -1105,16 +1106,17 @@ class Blockfp4MoeExpertsPackKStride64(
     when=lambda _: has_torch_npu,
     priority=2,
 )
-class Blockfp4MoeExpertsUnmergedPackNPUNative(
-    enable_native_layout_weight("gate_proj_weight", Packed4BitWeightNPUNative),
-    enable_native_layout_weight("up_proj_weight", Packed4BitWeightNPUNative),
-    enable_native_layout_weight("down_proj_weight", Packed4BitWeightNPUNative),
-    Blockfp4MoeExpertsMergedBase,
-):
+class Blockfp4MoeExpertsUnmergedPackNPUNative(Blockfp4MoeExpertsMergedBase):
     """
     blockfp4 quantized MoeExperts with weights in Packed4BitWeightNPUNative layout,
     with unmerged gate and up projection.
     """
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.gate_proj_weight, Packed4BitWeightNPUNative)
+        self.apply_native_layout(self.up_proj_weight, Packed4BitWeightNPUNative)
+        self.apply_native_layout(self.down_proj_weight, Packed4BitWeightNPUNative)
 
     @override
     def forward_ith_expert_gate(
@@ -1153,15 +1155,16 @@ class Blockfp4MoeExpertsUnmergedPackNPUNative(
     when=lambda _: has_torch_npu,
     priority=2,
 )
-class Blockfp4MoeExpertsMergedPackNPUNative(
-    enable_native_layout_weight("gate_up_proj_weight", Packed4BitWeightNPUNative),
-    enable_native_layout_weight("down_proj_weight", Packed4BitWeightNPUNative),
-    Blockfp4MoeExpertsMergedBase,
-):
+class Blockfp4MoeExpertsMergedPackNPUNative(Blockfp4MoeExpertsMergedBase):
     """
     blockfp4 quantized MoeExperts with weights in Packed4BitWeightNPUNative layout,
     with merged gate and up projection.
     """
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.gate_up_proj_weight, Packed4BitWeightNPUNative)
+        self.apply_native_layout(self.down_proj_weight, Packed4BitWeightNPUNative)
 
     @override
     def forward_no_sum(

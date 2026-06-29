@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Sequence
 from typing_extensions import override
 import functools
@@ -142,59 +142,18 @@ class Packed4BitWeightAlongK(NativeLayoutTensor):
         *,
         k_stride: int = 1,
     ) -> "Packed4BitWeightAlongK":
+        """Build from a plain tensor (meta-only).
+
+        Plain shape ``(..., K)`` is packed to ``(..., K/2)`` uint8 storage.
         """
-        Build a ``Packed4BitWeightAlongK`` from a raw uint8 tensor storing packed 4-bit
-        values along the K dimension.
-
-        This overload assumes the input uses the canonical ``k_stride = 1`` layout, i.e.:
-
-            - Mathematical shape: (..., K)
-            - Storage shape:      (..., K / 2)  (two 4-bit values per byte)
-
-        It first wraps the raw tensor into a ``Packed4BitWeightAlongK`` with
-        ``k_stride = 1`` and then, if a different ``k_stride`` is requested, delegates
-        to the existing ``convert_from(Packed4BitWeightAlongK, k_stride=...)`` overload.
-
-        Args:
-            tensor:
-                Raw packed 4-bit weights with shape ``[..., K/2]`` and dtype
-                ``torch.uint8``. Each byte encodes two 4-bit values along K.
-            k_stride:
-                Desired stride (in bytes) along the K dimension in the internal layout.
-                A value of ``1`` corresponds to the canonical tightly packed layout.
-
-        Returns:
-            Packed4BitWeightAlongK:
-                Layout object representing weights with mathematical shape ``[..., K]``
-                and the requested ``k_stride``.
-
-        Raises:
-            AssertionError:
-                If ``tensor`` does not have dtype ``torch.uint8``.
-        """
-        assert (
-            tensor.dtype == torch.uint8
-        ), "Packed4BitWeightAlongK expects a uint8 tensor for packed 4-bit weights"
-
-        # Storage shape: [..., K_half] where K_half = K / 2 (two 4-bit values per byte).
-        *batch_dims, k_half = tensor.shape
-        k = k_half * 2
-        plain_shape = (*batch_dims, k)
-
-        # Wrap the raw storage as a canonical k_stride = 1 layout.
-        base_k1 = cls(
-            plain_shape=plain_shape,
-            layout_tensor=tensor.contiguous(),
-            k_stride=1,
+        assert tensor.device.type == "meta"
+        *batch_dims, k = tensor.shape
+        layout_tensor = tensor.new_empty(*batch_dims, k // 2, dtype=torch.uint8)
+        return cls(
+            plain_shape=(*batch_dims, k),
+            layout_tensor=layout_tensor,
+            k_stride=k_stride,
         )
-
-        # Fast path: the caller wants the canonical layout.
-        if k_stride == 1:
-            return base_k1
-
-        # Otherwise, reuse the Packed4BitWeightAlongK to Packed4BitWeightAlongK
-        # converter that handles arbitrary k_stride layouts.
-        return cls.convert_from(base_k1, k_stride=k_stride)
 
     @classmethod
     @override
@@ -207,7 +166,12 @@ class Packed4BitWeightAlongK(NativeLayoutTensor):
         k = tensor.plain_shape[-1]
         assert k % (2 * tensor.k_stride) == 0
         assert k % (2 * k_stride) == 0
-        if has_chitu_backend and tensor.k_stride == 1 and k_stride == 64:
+        if (
+            has_chitu_backend
+            and tensor.k_stride == 1
+            and k_stride == 64
+            and tensor.layout_tensor.device.type != "meta"
+        ):
             device = tensor.layout_tensor.device
             weight = chitu_backend.weight_layout_change(tensor.layout_tensor.cuda()).to(
                 device
@@ -278,72 +242,58 @@ class Packed4BitWeightAlongK(NativeLayoutTensor):
 
 
 @dataclass
-class Blockfp4LinearPackedWeightPadToShape(Packed4BitWeightAlongK):
+class Packed4BitWeightAlongKContig(Packed4BitWeightAlongK):
+    """Packed4BitWeightAlongK with ``k_stride=1`` guaranteed.
+
+    Used where a downstream ``NativeLayoutTensor`` expects contiguous
+    packing along K (``layout_tensor`` shape ``[..., K//2]`` uint8).
+    Passing ``k_stride`` is not allowed — the value is always 1.
     """
-    Pad 2D packed blockfp4 weights to ``padded_shape`` (MoE Hygon-style target sizes), then
-    ``Packed4BitWeightAlongK``.
+
+    def __post_init__(self):
+        if self.k_stride != 1:
+            raise ValueError(
+                f"Packed4BitWeightAlongKContig requires k_stride=1, got {self.k_stride}"
+            )
+
+    def __getitem__(self, index):
+        if not isinstance(index, int):
+            raise NotImplementedError(
+                f"Indexing {type(self)} with {type(index)} is not supported."
+            )
+        if len(self.plain_shape) <= 1:
+            raise ValueError(
+                "Cannot index a Packed4BitWeightAlongKContig tensor's K dimension."
+            )
+        return Packed4BitWeightAlongKContig(
+            self.plain_shape[1:], self.layout_tensor[index]
+        )
+
+
+@dataclass
+class Blockfp4LinearPackedWeightPadToShape(Packed4BitWeightAlongKContig):
+    """
+    Pad 2D packed blockfp4 weights to ``padded_shape`` (MoE Hygon-style target sizes).
+
+    Accepts only contiguous-along-K packing (``k_stride=1``), i.e.
+    :class:`Packed4BitWeightAlongKContig`.
     """
 
     padded_shape: Optional[tuple] = None
-    """
-    Stored for ``enable_native_layout_weight`` reconstruction: ``get_native_layout_*`` passes
-    ``_weight_layout_kwargs`` (including ``padded_shape``) into ``__init__``.
-    """
 
     @classmethod
     @override
     @plum.dispatch
     def convert_from(
         cls,
-        tensor: torch.Tensor,
+        packed: Packed4BitWeightAlongKContig,
         *,
         padded_shape: tuple,
-        k_stride: int = 1,
     ) -> "Blockfp4LinearPackedWeightPadToShape":
-        assert (
-            tensor.dtype == torch.uint8
-        ), "Blockfp4LinearPackedWeightPadToShape expects uint8 packed weights"
-        assert tensor.ndim == 2, f"expected 2D linear weight, got shape {tensor.shape}"
-        n, k_half = tensor.shape[0], tensor.shape[1]
-        padded_n, padded_k_half = padded_shape[0], padded_shape[1]
-        assert padded_n == n, f"out dim mismatch: {n} vs {padded_n}"
-        if k_half != padded_k_half:
-            if k_half > padded_k_half:
-                raise ValueError(
-                    f"packed K {k_half} larger than padded target {padded_k_half}"
-                )
-            tensor = F.pad(tensor, (0, padded_k_half - k_half), value=0)
-            tensor = tensor.contiguous()
-        inner = Packed4BitWeightAlongK.convert_from(tensor, k_stride=k_stride)
-        return cls(
-            plain_shape=inner.plain_shape,
-            layout_tensor=inner.layout_tensor,
-            k_stride=inner.k_stride,
-            padded_shape=tuple(padded_shape),
-        )
-
-    @classmethod
-    @override
-    @plum.dispatch
-    def convert_from(
-        cls,
-        packed: Packed4BitWeightAlongK,
-        *,
-        padded_shape: tuple,
-        k_stride: int = 1,
-    ) -> "Blockfp4LinearPackedWeightPadToShape":
-        """
-        ``Blockfp4LinearBase`` sets ``_weight_layout_class = Packed4BitWeightAlongK``, so the
-        load_state_dict hook often receives a ``Packed4BitWeightAlongK`` from
-        ``get_native_layout_weight()`` instead of a raw ``torch.Tensor``.
-        """
         assert packed.layout_tensor.ndim == 2, packed.layout_tensor.shape
-        n, k_half = packed.layout_tensor.shape[0], packed.layout_tensor.shape[1]
+        n, k_half = packed.layout_tensor.shape
         padded_n, padded_k_half = padded_shape[0], padded_shape[1]
         assert padded_n == n, f"out dim mismatch: {n} vs {padded_n}"
-        if packed.k_stride != k_stride:
-            packed = Packed4BitWeightAlongK.convert_from(packed, k_stride=k_stride)
-            k_half = packed.layout_tensor.shape[1]
         lt = packed.layout_tensor
         if k_half > padded_k_half:
             raise ValueError(
@@ -355,7 +305,6 @@ class Blockfp4LinearPackedWeightPadToShape(Packed4BitWeightAlongK):
         return cls(
             plain_shape=(n, k_log),
             layout_tensor=lt.contiguous(),
-            k_stride=k_stride,
             padded_shape=tuple(padded_shape),
         )
 
@@ -375,54 +324,11 @@ class Packed4BitWeightAlongN(NativeLayoutTensor):
     @override
     @plum.dispatch
     def convert_from(
-        cls,
-        tensor: torch.Tensor,
-        *,
-        k_stride: int = 1,
+        cls, packed: "Packed4BitWeightAlongKContig", *, k_stride: int = 1
     ) -> "Packed4BitWeightAlongN":
-        """
-        Build a ``Packed4BitWeightAlongN`` from a raw uint8 tensor storing packed 4-bit
-        values along the K dimension.
-
-        This overload assumes the input uses the canonical ``k_stride = 1`` layout, i.e.:
-
-            - Mathematical shape: (..., K)
-            - Storage shape:      (..., K / 2)  (two 4-bit values per byte)
-
-        It first wraps the raw tensor into a ``Packed4BitWeightAlongN`` with
-        ``k_stride = 1`` and then, if a different ``k_stride`` is requested, delegates
-        to the existing ``convert_from(Packed4BitWeightAlongN, k_stride=...)`` overload.
-
-        Args:
-            tensor:
-                Raw packed 4-bit weights with shape ``[..., K/2]`` and dtype
-                ``torch.uint8``. Each byte encodes two 4-bit values along K.
-            k_stride:
-                Desired stride (in bytes) along the K dimension in the internal layout.
-                A value of ``1`` corresponds to the canonical tightly packed layout.
-
-        Returns:
-            Packed4BitWeightAlongN:
-                Layout object representing weights with mathematical shape ``[..., K]``
-                and the requested ``k_stride``.
-
-        Raises:
-            AssertionError:
-                If ``tensor`` does not have dtype ``torch.uint8``.
-        """
-        assert (
-            tensor.dtype == torch.uint8
-        ), "Packed4BitWeightAlongN expects a uint8 tensor for packed 4-bit weights"
-
-        # Storage shape: [..., K_half] where K_half = K / 2 (two 4-bit values per byte).
-        *batch_dims, k_half = tensor.shape
-        k = k_half * 2
-        plain_shape = (*batch_dims, k)
-
-        # Wrap the raw storage as a canonical k_stride = 1 layout.
         base_k1 = cls(
-            plain_shape=plain_shape,
-            layout_tensor=tensor.contiguous(),
+            plain_shape=packed.plain_shape,
+            layout_tensor=packed.layout_tensor,
             k_stride=1,
         )
 
@@ -496,7 +402,63 @@ class Packed4BitWeightQServe(NativeLayoutTensor):
     for the format details.
     """
 
-    pass
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(cls, tensor: torch.Tensor) -> "Packed4BitWeightQServe":
+        """Build from a plain tensor (meta-only).
+
+        Plain shape ``(..., K)`` is packed to ``(..., K/2)`` uint8 storage.
+        """
+        assert tensor.device.type == "meta"
+        *batch_dims, k = tensor.shape
+        layout_tensor = tensor.new_empty(*batch_dims, k // 2, dtype=torch.uint8)
+        return cls(
+            plain_shape=(*batch_dims, k),
+            layout_tensor=layout_tensor,
+        )
+
+
+@dataclass
+class Packed4BitWeightAlongKInt32(NativeLayoutTensor):
+    """4-bit weight packed into int32 storage.
+
+    Used for blockint4 checkpoint format where 8 4-bit values are
+    packed per int32 element (K / 8 storage).  Packing is always
+    contiguous along K (equivalent to ``k_stride=1``).
+    """
+
+    storage_dtype: torch.dtype = torch.int32
+
+    def __getitem__(self, index):
+        if not isinstance(index, int):
+            raise NotImplementedError(
+                f"Indexing {type(self)} with {type(index)} is not supported."
+            )
+        if len(self.plain_shape) <= 1:
+            raise ValueError(
+                "Cannot index a Packed4BitWeightAlongKInt32 tensor's K dimension."
+            )
+        return Packed4BitWeightAlongKInt32(
+            self.plain_shape[1:],
+            self.layout_tensor[index],
+        )
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(cls, tensor: torch.Tensor) -> "Packed4BitWeightAlongKInt32":
+        """Build from a plain tensor (meta-only).
+
+        Plain shape ``(..., K)`` is packed to ``(..., K/8)`` int32 storage.
+        """
+        assert tensor.device.type == "meta"
+        *batch_dims, k = tensor.shape
+        layout_tensor = tensor.new_empty(*batch_dims, k // 8, dtype=torch.int32)
+        return cls(
+            plain_shape=(*batch_dims, k),
+            layout_tensor=layout_tensor,
+        )
 
 
 @dataclass

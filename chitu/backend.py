@@ -55,6 +55,9 @@ from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 from chitu.distributed.infiniband import auto_set_ib_envs
 from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
+from chitu.native_layout import init_native_layout
+from chitu.native_layout.base import TensorWithNativeLayout
+from chitu.native_layout.npu import NpuFractalNzTensor, NpuFractalZnTensor
 from chitu.quantization import (
     QuantizationRegistry,
     QuantizedMoeExpertsBase,
@@ -640,6 +643,32 @@ class Backend:
                         m._buffers[key] = m._buffers[key].contiguous()
 
     @staticmethod
+    def _create_empty_model(model: torch.nn.Module, skip_preprocess: bool):
+        if skip_preprocess:
+            model.to_empty(device=torch.cuda.current_device())
+            for p in model.parameters():
+                # NPU format (FRACTAL_NZ / FRACTAL_ZN) cannot exist on
+                # meta or CPU tensors — convert_from on meta only
+                # produces a stub (ND format).  After to_empty we have
+                # real NPU memory, so re-run convert_from to apply the
+                # hardware format cast.
+                if NpuFractalNzTensor.check_tensor(p):
+                    p.data = NpuFractalNzTensor.convert_from(p.data).layout_tensor
+                elif NpuFractalZnTensor.check_tensor(p):
+                    p.data = NpuFractalZnTensor.convert_from(p.data).layout_tensor
+        else:
+            state_dict = {}
+            for name, param in model.named_parameters():
+                if isinstance(param, TensorWithNativeLayout):
+                    t = param.native_layout
+                    state_dict[name] = torch.empty(
+                        t.state_dict_shape, dtype=t.state_dict_dtype
+                    )
+                else:
+                    state_dict[name] = torch.empty(param.shape, dtype=param.dtype)
+            model.load_state_dict(state_dict, assign=True)
+
+    @staticmethod
     def _build_and_setup_model(args, attn_backend):
         """
         Build model architecture, load checkpoints, and apply quantization.
@@ -653,16 +682,14 @@ class Backend:
         """
         Backend.args = args
 
-        if not args.debug.skip_model_load:
-            # Build the model. Don't allocate memory yet.
-            with torch.device("meta"):
-                model = Backend._build_model_architecture(args, attn_backend)
-            # Load model parameters
-            Backend._load_checkpoint(model, args)
-
-        else:
-            # Use initialized weights
+        with torch.device("meta"):
             model = Backend._build_model_architecture(args, attn_backend)
+            init_native_layout(model)
+
+        if args.debug.skip_model_load:
+            Backend._create_empty_model(model, args.skip_preprocess)
+        else:
+            Backend._load_checkpoint(model, args)
 
         # Move model to appropriate device
         model.apply(Backend._move_one_module_to_device)

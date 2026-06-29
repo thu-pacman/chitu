@@ -9,18 +9,15 @@ from chitu.quantization.base import QuantizedLinearBase
 from chitu.ops.quant import a8_per_token_act_quant, w4_g128_symm_a8_symm
 
 from chitu.native_layout import (
-    enable_native_layout_weight,
+    NativeLayoutMixin,
+    Packed4BitWeightAlongKContig,
     HygonW4A8Int4TileTensor,
     HygonW4A8Int8TileTensor,
 )
 
 
 @QuantizationRegistry.register_linear("w4_g128_symm_a8_symm")
-class HygonW4G128SymmA8Linear(
-    enable_native_layout_weight("weight", HygonW4A8Int4TileTensor),
-    enable_native_layout_weight("s2_scales", HygonW4A8Int8TileTensor),
-    QuantizedLinearBase,
-):
+class HygonW4G128SymmA8Linear(NativeLayoutMixin, QuantizedLinearBase):
     def __init__(
         self,
         ############################################
@@ -40,8 +37,7 @@ class HygonW4G128SymmA8Linear(
         self.weight = torch.nn.Parameter(
             torch.zeros(
                 self.out_features,
-                self.in_features // 2,
-                dtype=torch.int8,
+                self.in_features,
             ),
             requires_grad=False,
         )
@@ -72,6 +68,14 @@ class HygonW4G128SymmA8Linear(
             )
         else:
             self.register_parameter("bias", None)
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(
+            self.weight, Packed4BitWeightAlongKContig, state_dict_convert=False
+        )
+        self.apply_native_layout(self.weight, HygonW4A8Int4TileTensor)
+        self.apply_native_layout(self.s2_scales, HygonW4A8Int8TileTensor)
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:

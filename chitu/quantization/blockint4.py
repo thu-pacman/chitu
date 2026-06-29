@@ -19,7 +19,8 @@ from chitu.moe.batched_routed_activation import (
 from chitu.moe.batched_expert_result import PerTokenBatchedExpertResult
 from chitu.utils import try_import_platform_dep
 from chitu.native_layout import (
-    enable_native_layout_weight,
+    NativeLayoutMixin,
+    Packed4BitWeightAlongKInt32,
     BlockInt4MarlinQWeight,
     BlockInt4MarlinScale,
 )
@@ -47,23 +48,10 @@ if has_triton:
 UINT4B8_TYPE_ID = 1125899907892224
 
 
-# Conditionally include Marlin enable_native_layout_weight mixins.
-_marlin_mixins = []
-if has_marlin:
-    _marlin_mixins = [
-        enable_native_layout_weight("gate_proj_qweight", BlockInt4MarlinQWeight),
-        enable_native_layout_weight("gate_proj_scales", BlockInt4MarlinScale),
-        enable_native_layout_weight("up_proj_qweight", BlockInt4MarlinQWeight),
-        enable_native_layout_weight("up_proj_scales", BlockInt4MarlinScale),
-        enable_native_layout_weight("down_proj_qweight", BlockInt4MarlinQWeight),
-        enable_native_layout_weight("down_proj_scales", BlockInt4MarlinScale),
-    ]
-
-
 @QuantizationRegistry.register_moe_experts(
     "blockint4", merge_gate_up=False, when=lambda _: has_chitu_backend or has_aiter
 )
-class BlockInt4MoeExpertsUnmerged(*_marlin_mixins, QuantizedMoeExpertsUnmerged):
+class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged):
     """
     Marlin INT4 quantized MoE experts with unmerged gate and up projection.
     Supports compressed-tensors pack-quantized format (4-bit symmetric, group quantization).
@@ -104,8 +92,7 @@ class BlockInt4MoeExpertsUnmerged(*_marlin_mixins, QuantizedMoeExpertsUnmerged):
             torch.empty(
                 self.group_size,
                 moe_inter_dim,
-                dim // self.pack_factor,
-                dtype=torch.int32,
+                dim,
             ),
             requires_grad=False,
         )
@@ -122,8 +109,7 @@ class BlockInt4MoeExpertsUnmerged(*_marlin_mixins, QuantizedMoeExpertsUnmerged):
             torch.empty(
                 self.group_size,
                 moe_inter_dim,
-                dim // self.pack_factor,
-                dtype=torch.int32,
+                dim,
             ),
             requires_grad=False,
         )
@@ -141,8 +127,7 @@ class BlockInt4MoeExpertsUnmerged(*_marlin_mixins, QuantizedMoeExpertsUnmerged):
             torch.empty(
                 self.group_size,
                 dim,
-                moe_inter_dim // self.pack_factor,
-                dtype=torch.int32,
+                moe_inter_dim,
             ),
             requires_grad=False,
         )
@@ -157,6 +142,30 @@ class BlockInt4MoeExpertsUnmerged(*_marlin_mixins, QuantizedMoeExpertsUnmerged):
         )
 
         self._aiter_repacked = False
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        if not has_marlin:
+            return
+        self.apply_native_layout(
+            self.gate_proj_qweight,
+            Packed4BitWeightAlongKInt32,
+            state_dict_convert=False,
+        )
+        self.apply_native_layout(
+            self.up_proj_qweight, Packed4BitWeightAlongKInt32, state_dict_convert=False
+        )
+        self.apply_native_layout(
+            self.down_proj_qweight,
+            Packed4BitWeightAlongKInt32,
+            state_dict_convert=False,
+        )
+        self.apply_native_layout(self.gate_proj_qweight, BlockInt4MarlinQWeight)
+        self.apply_native_layout(self.gate_proj_scales, BlockInt4MarlinScale)
+        self.apply_native_layout(self.up_proj_qweight, BlockInt4MarlinQWeight)
+        self.apply_native_layout(self.up_proj_scales, BlockInt4MarlinScale)
+        self.apply_native_layout(self.down_proj_qweight, BlockInt4MarlinQWeight)
+        self.apply_native_layout(self.down_proj_scales, BlockInt4MarlinScale)
 
     def _ensure_marlin_workspace(self):
         """Allocate Marlin workspace and sentinel tensors lazily."""

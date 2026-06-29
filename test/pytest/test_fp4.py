@@ -2,7 +2,7 @@ import packaging.version
 import torch
 import pytest
 
-from chitu.native_layout import Packed4BitWeightAlongK
+from chitu.native_layout import Packed4BitWeightAlongK, Packed4BitWeightAlongKContig
 from chitu.ops import (
     fp4_rtn,
     soft_fp4_raise_to_fp8_blockfp4_gemm,
@@ -85,7 +85,7 @@ def test_fp4_raise_to_bf16_gemm_is_close_to_dequanted_gemm(dim, record_benchmark
 
     std_y = torch.nn.functional.linear(a, dequant_b)
     preprocessed_b = Packed4BitWeightAlongK.convert_from(
-        Packed4BitWeightAlongK((dim, dim), b),
+        Packed4BitWeightAlongKContig((dim, dim), b),
         k_stride=64,
     )
 
@@ -132,7 +132,7 @@ def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm(dim, record_benchmark)
 
     std_y = torch.nn.functional.linear(dequant_a, dequant_b)
     preprocessed_b = Packed4BitWeightAlongK.convert_from(
-        Packed4BitWeightAlongK((dim, dim), b), k_stride=64
+        Packed4BitWeightAlongKContig((dim, dim), b), k_stride=64
     )
 
     y = record_benchmark.run(

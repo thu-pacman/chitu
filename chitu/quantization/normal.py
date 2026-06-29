@@ -26,7 +26,7 @@ from chitu.utils import (
 )
 from chitu.static_tensor import StaticTensor
 from chitu.native_layout import (
-    enable_native_layout_weight,
+    NativeLayoutMixin,
     PermutedTensor,
     NpuFractalNzTensor,
     NpuFractalZnTensor,
@@ -100,18 +100,22 @@ class NormalLinear(QuantizedLinearBase):
         return linear(x, self.weight, self.bias)
 
 
-class NormalLinearNpuFractalNz(
-    enable_native_layout_weight("weight", NpuFractalNzTensor), NormalLinear
-):
+class NormalLinearNpuFractalNz(NativeLayoutMixin, NormalLinear):
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.weight, NpuFractalNzTensor)
+
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert torch_npu.get_npu_format(self.weight) == ACL_FORMAT_FRACTAL_NZ
         return super().forward(x)
 
 
-class NormalLinearNpuFractalZn(
-    enable_native_layout_weight("weight", NpuFractalZnTensor), NormalLinear
-):
+class NormalLinearNpuFractalZn(NativeLayoutMixin, NormalLinear):
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.weight, NpuFractalZnTensor)
+
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise RuntimeError(
@@ -646,10 +650,11 @@ class NormalAbsorbGemm(QuantizedAbsorbGemmBase):
         return y
 
 
-class NormalAbsorbGemmPermuted021(
-    enable_native_layout_weight("weight", PermutedTensor, perm=(0, 2, 1)),
-    NormalAbsorbGemm,
-):
+class NormalAbsorbGemmPermuted021(NativeLayoutMixin, NormalAbsorbGemm):
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.weight, PermutedTensor, perm=(0, 2, 1))
+
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 3:

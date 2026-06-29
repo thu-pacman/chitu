@@ -15,7 +15,7 @@ from chitu.quantization import (
     Blockfp8MoeExpertsMerged,
 )
 from chitu.native_layout import (
-    enable_native_layout_weight,
+    NativeLayoutMixin,
     MuxiNativeLayoutActivation,
     MuxiNativeLayoutWeight,
     MuxiNativeLayoutGroupWeight,
@@ -415,9 +415,11 @@ def _(
     return y.view(shape)
 
 
-class LinearMuxiLayoutNativeY(
-    enable_native_layout_weight("weight", MuxiNativeLayoutWeight), NormalLinear
-):
+class LinearMuxiLayoutNativeY(NativeLayoutMixin, NormalLinear):
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.weight, MuxiNativeLayoutWeight)
+
     def forward(
         self,
         x: torch.Tensor | Vector | BatchPaddedActivation | MuxiNativeLayoutActivation,
@@ -427,9 +429,11 @@ class LinearMuxiLayoutNativeY(
         )
 
 
-class LinearMuxiLayoutContigY(
-    enable_native_layout_weight("weight", MuxiNativeLayoutWeight), NormalLinear
-):
+class LinearMuxiLayoutContigY(NativeLayoutMixin, NormalLinear):
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.weight, MuxiNativeLayoutWeight)
+
     def forward(
         self,
         x: torch.Tensor | Vector | BatchPaddedActivation | MuxiNativeLayoutActivation,
@@ -439,20 +443,18 @@ class LinearMuxiLayoutContigY(
         ).convert_to_plain()
 
 
-class Blockfp8LinearMuxiLayoutContigY(
-    enable_native_layout_weight("weight", MuxiNativeLayoutWeight), Blockfp8Linear
-):
+class Blockfp8LinearMuxiLayoutContigY(NativeLayoutMixin, Blockfp8Linear):
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.weight, MuxiNativeLayoutWeight)
+
     def forward(self, x: torch.Tensor | Vector | BatchPaddedActivation) -> torch.Tensor:
         return blockfp8_linear_muxi_layout_contig_y(
             x, self.get_native_layout_weight(), self.bias, self.scale
         ).convert_to_plain()
 
 
-class NormalMoeExpertsMuxiLayout(
-    enable_native_layout_weight("gate_up_proj_weight", MuxiNativeLayoutGroupWeight),
-    enable_native_layout_weight("down_proj_weight", MuxiNativeLayoutGroupWeight),
-    NormalMoeExpertsMerged,
-):
+class NormalMoeExpertsMuxiLayout(NativeLayoutMixin, NormalMoeExpertsMerged):
     def __init__(
         self,
         ############################################
@@ -487,6 +489,11 @@ class NormalMoeExpertsMuxiLayout(
             checkpoint_prefix=checkpoint_prefix,
         )
 
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.gate_up_proj_weight, MuxiNativeLayoutGroupWeight)
+        self.apply_native_layout(self.down_proj_weight, MuxiNativeLayoutGroupWeight)
+
     @override
     def forward(
         self,
@@ -506,11 +513,7 @@ class NormalMoeExpertsMuxiLayout(
         )
 
 
-class Blockfp8MoeExpertsMuxiLayout(
-    enable_native_layout_weight("gate_up_proj_weight", MuxiNativeLayoutGroupWeight),
-    enable_native_layout_weight("down_proj_weight", MuxiNativeLayoutGroupWeight),
-    Blockfp8MoeExpertsMerged,
-):
+class Blockfp8MoeExpertsMuxiLayout(NativeLayoutMixin, Blockfp8MoeExpertsMerged):
     def __init__(
         self,
         ############################################
@@ -534,6 +537,11 @@ class Blockfp8MoeExpertsMuxiLayout(
             n_activated_experts=n_activated_experts,
             checkpoint_prefix=checkpoint_prefix,
         )
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.gate_up_proj_weight, MuxiNativeLayoutGroupWeight)
+        self.apply_native_layout(self.down_proj_weight, MuxiNativeLayoutGroupWeight)
 
     def forward(
         self,

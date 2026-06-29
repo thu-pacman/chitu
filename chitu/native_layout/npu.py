@@ -9,7 +9,7 @@ import plum
 import torch
 
 from chitu.native_layout.base import NativeLayoutTensor
-from chitu.native_layout.common import Packed4BitWeightAlongK
+from chitu.native_layout.common import Packed4BitWeightAlongKContig
 from chitu.import_utils import try_import_and_setup_torch_npu
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -31,18 +31,17 @@ class Packed4BitWeightNPUNative(NativeLayoutTensor):
     @override
     @plum.dispatch
     def convert_from(
-        cls, tensor: Packed4BitWeightAlongK
+        cls, tensor: Packed4BitWeightAlongKContig
     ) -> "Packed4BitWeightNPUNative":
-        if tensor.k_stride == 1:
+        if tensor.layout_tensor.device.type == "meta":
             return cls(
                 plain_shape=tensor.plain_shape,
-                layout_tensor=cls._repack_weight(tensor.layout_tensor),
+                layout_tensor=torch.empty_like(tensor.layout_tensor),
             )
-
-        else:
-            raise TypeError(
-                f"Cannot convert from {type(tensor)} to Packed4BitWeightAlongK with k_stride={tensor.k_stride}"
-            )
+        return cls(
+            plain_shape=tensor.plain_shape,
+            layout_tensor=cls._repack_weight(tensor.layout_tensor),
+        )
 
     # Designed for NPU de-quantization + matmul fused operator
     @classmethod
@@ -89,7 +88,9 @@ class Packed4BitWeightNPUNative(NativeLayoutTensor):
             raise ValueError(
                 "Cannot index a Packed4BitWeightAlongK tensor's last 2 dimensions."
             )
-        return Packed4BitWeightAlongK(self.plain_shape[1:], self.layout_tensor[index])
+        return Packed4BitWeightNPUNative(
+            self.plain_shape[1:], self.layout_tensor[index]
+        )
 
 
 # See https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/API/appdevgapi/aclpythondevg_01_0914.html
@@ -119,6 +120,8 @@ class NpuFractalNzTensor(NativeLayoutTensor):
     @override
     @plum.dispatch
     def convert_from(cls, tensor: torch.Tensor) -> "NpuFractalNzTensor":
+        if tensor.device.type == "meta":
+            return cls(plain_shape=tensor.shape, layout_tensor=tensor)
         layout_tensor = torch_npu.npu_format_cast(
             tensor.npu().contiguous(), ACL_FORMAT_FRACTAL_NZ
         )
@@ -158,6 +161,11 @@ class NpuFractalZnTensor(NativeLayoutTensor):
     @override
     @plum.dispatch
     def convert_from(cls, tensor: torch.Tensor) -> "NpuFractalZnTensor":
+        if tensor.device.type == "meta":
+            return cls(
+                plain_shape=tensor.shape,
+                layout_tensor=tensor.transpose(-1, -2),
+            )
         layout_tensor = torch_npu.npu_format_cast(
             tensor.npu().transpose(-1, -2).contiguous(), ACL_FORMAT_FRACTAL_NZ
         )

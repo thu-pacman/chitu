@@ -9,7 +9,8 @@ from chitu.quantization.base import QuantizedLinearBase
 from chitu.utils import try_import_platform_dep
 from chitu.ops.quant import mixq_gemm
 from chitu.native_layout import (
-    enable_native_layout_weight,
+    NativeLayoutMixin,
+    Packed4BitWeightAlongKContig,
     HygonMixQIntTileTensor,
     HygonMixQFp16TileTensor,
 )
@@ -17,7 +18,7 @@ from chitu.native_layout import (
 hygon_mixq_kernels, has_hygon = try_import_platform_dep("sugon_mixQ4_kernels")
 
 
-class MixQLinear(QuantizedLinearBase):
+class MixQLinear(NativeLayoutMixin, QuantizedLinearBase):
     def __init__(
         self,
         ############################################
@@ -55,7 +56,9 @@ class MixQLinear(QuantizedLinearBase):
 
         self.weight = torch.nn.Parameter(
             torch.zeros(
-                self.out_features, self.quantized_in_features, dtype=torch.int8
+                self.out_features,
+                in_features,
+                dtype=torch.int8,
             ),
             requires_grad=False,
         )
@@ -63,7 +66,6 @@ class MixQLinear(QuantizedLinearBase):
             torch.zeros(
                 self.out_features,
                 self.fp_features_num,
-                dtype=torch.get_default_dtype(),
             ),
             requires_grad=False,
         )
@@ -85,6 +87,12 @@ class MixQLinear(QuantizedLinearBase):
         else:
             self.register_parameter("bias", None)
 
+    def init_native_layout(self):
+        if self.w_bits == 4:
+            self.apply_native_layout(
+                self.weight, Packed4BitWeightAlongKContig, state_dict_convert=False
+            )
+
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = mixq_gemm(
@@ -103,15 +111,7 @@ class MixQLinear(QuantizedLinearBase):
         return out
 
 
-class HygonMixQLinear(
-    enable_native_layout_weight(
-        "weight",
-        HygonMixQIntTileTensor,
-        weight_bits=lambda m: m.w_bits,
-    ),
-    enable_native_layout_weight("fp_weight", HygonMixQFp16TileTensor),
-    MixQLinear,
-):
+class HygonMixQLinear(MixQLinear):
     def __init__(
         self,
         ############################################
@@ -144,6 +144,15 @@ class HygonMixQLinear(
             torch.zeros((self.process_block_size + 1,), dtype=torch.int32),
             requires_grad=False,
         )
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(
+            self.weight,
+            HygonMixQIntTileTensor,
+            weight_bits=self.w_bits,
+        )
+        self.apply_native_layout(self.fp_weight, HygonMixQFp16TileTensor)
 
 
 if has_hygon:

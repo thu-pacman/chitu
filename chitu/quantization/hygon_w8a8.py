@@ -40,7 +40,7 @@ from chitu.native_layout import (
     AiterMoeCInt8Gemm1Weight,
     AiterMoeCInt8Gemm2Weight,
     HygonDeepGemmW8A8MarlinWeight,
-    enable_native_layout_weight,
+    NativeLayoutMixin,
 )
 from chitu.ops import silu_and_mul
 from chitu.ops.quant import a8_per_token_act_quant
@@ -796,11 +796,7 @@ class W8A8MoeExpertsMergedHygonLightop(QuantizedMoeExpertsMerged):
     when=lambda _: is_hygon() and has_aiter,
     priority=10,
 )
-class HygonW8A8AiterMoeExpertsMerged(
-    enable_native_layout_weight("gate_up_proj_weight", AiterMoeCInt8Gemm1Weight),
-    enable_native_layout_weight("down_proj_weight", AiterMoeCInt8Gemm2Weight),
-    QuantizedMoeExpertsMerged,
-):
+class HygonW8A8AiterMoeExpertsMerged(NativeLayoutMixin, QuantizedMoeExpertsMerged):
     """
     Imported W8A8 MoE on Hygon using Aiter MOE_C.
 
@@ -866,6 +862,11 @@ class HygonW8A8AiterMoeExpertsMerged(
             ),
             requires_grad=False,
         )
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.gate_up_proj_weight, AiterMoeCInt8Gemm1Weight)
+        self.apply_native_layout(self.down_proj_weight, AiterMoeCInt8Gemm2Weight)
 
     @override
     @functools.singledispatchmethod
@@ -993,11 +994,7 @@ class HygonW8A8AiterMoeExpertsMerged(
     when=lambda _: is_hygon() and has_deepgemm,
     priority=13,
 )
-class HygonW8A8DeepGemmMoeExpertsMerged(
-    enable_native_layout_weight("gate_up_proj_weight", HygonDeepGemmW8A8MarlinWeight),
-    enable_native_layout_weight("down_proj_weight", HygonDeepGemmW8A8MarlinWeight),
-    QuantizedMoeExpertsMerged,
-):
+class HygonW8A8DeepGemmMoeExpertsMerged(NativeLayoutMixin, QuantizedMoeExpertsMerged):
     """
     Imported W8A8 MoE on Hygon using DeepGEMM contiguous grouped GEMM.
 
@@ -1057,6 +1054,13 @@ class HygonW8A8DeepGemmMoeExpertsMerged(
             ),
             requires_grad=False,
         )
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(
+            self.gate_up_proj_weight, HygonDeepGemmW8A8MarlinWeight
+        )
+        self.apply_native_layout(self.down_proj_weight, HygonDeepGemmW8A8MarlinWeight)
 
     @override
     @functools.singledispatchmethod

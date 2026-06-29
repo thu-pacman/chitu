@@ -2,8 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from chitu.native_layout.base import NativeLayoutTensor
-from chitu.native_layout.helper import enable_native_layout_weight
+from chitu.native_layout.base import NativeLayoutTensor, NativeLayoutTemplate
+from chitu.native_layout.helper import (
+    NativeLayoutMixin,
+    init_native_layout,
+)
 from chitu.native_layout.common import (
     Vector,
     PermutedTensor,
@@ -11,8 +14,10 @@ from chitu.native_layout.common import (
     BatchPaddedActivation,
     Blockfp4LinearPackedWeightPadToShape,
     Packed4BitWeightAlongK,
+    Packed4BitWeightAlongKContig,
     Packed4BitWeightAlongN,
     Packed4BitWeightQServe,
+    Packed4BitWeightAlongKInt32,
     ColumnOddEvenSeparatedTensor,
     PartialColumnOddEvenSeparatedTensor,
     Repeat1ToLength,

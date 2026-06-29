@@ -9,7 +9,10 @@ import plum
 import torch
 
 from chitu.native_layout.base import NativeLayoutTensor
-from chitu.native_layout.common import BatchPaddedActivation
+from chitu.native_layout.common import (
+    BatchPaddedActivation,
+    Packed4BitWeightAlongKContig,
+)
 from chitu.import_utils import try_import_opt_dep
 
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
@@ -27,6 +30,8 @@ class MuxiNativeLayoutActivation(NativeLayoutTensor):
     def convert_from(
         cls, tensor: BatchPaddedActivation
     ) -> "MuxiNativeLayoutActivation":
+        if tensor.layout_tensor.device.type == "meta":
+            return cls(tensor.plain_shape, tensor.layout_tensor)
         assert tensor.multiple_of == 16
         return cls(
             tensor.plain_shape, muxi_layout_kernels.layoutB(tensor.layout_tensor)
