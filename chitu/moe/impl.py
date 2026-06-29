@@ -109,7 +109,9 @@ def init_moe_impl(args) -> None:
                 else 0
             ),
             hidden_dim=args.models.dim,
-            max_bs_per_dp_rank=ceil_div(args.infer.max_batch_size, effective_dp_size),
+            max_bs_per_dp_rank=ceil_div(
+                args.infer.max_batch_size * args.infer.mtp_size, effective_dp_size
+            ),
             n_routed_experts=n_routed_experts,
             n_activated_experts=n_activated_experts,
             n_fused_shared_experts=n_fused_shared_experts,
