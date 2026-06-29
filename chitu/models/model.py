@@ -1447,14 +1447,6 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         freqs_cis = self.prepare_freqs_cis()
 
-        # CP: split tokens before embedding (stage 0) or split freqs_cis
-        # for local hidden states from previous PP stage.
-        if self.pp_stage == 0:
-            num_tokens = tokens.shape[0]
-            delta_total = 0
-        else:
-            num_tokens = 0
-            delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
         # CP: split token IDs before embedding (stage 0) or split freqs_cis
         # to match local hidden states from previous PP stage.
         # Skip CP when the actual prefill delta is smaller than pcp_size -- the

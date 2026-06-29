@@ -70,7 +70,7 @@ class PrometheusServerManager:
             data_dir: Prometheus data stoarge path
         """
         self.collector_addrs = collector_addrs
-        self.server_addr = server_addr
+        self.server_addr = self._parse_host(server_addr)
         self.server_port = server_port
         # Use PID to isolate config/data per instance, avoiding TSDB lock
         # conflicts when multiple instances run on the same machine.
@@ -85,6 +85,12 @@ class PrometheusServerManager:
         self.start()
 
         atexit.register(self.cleanup)
+
+    @staticmethod
+    def _parse_host(bind_host: str) -> str:
+        if bind_host in {"", "0.0.0.0", "::", "[::]"}:
+            return "127.0.0.1"
+        return bind_host
 
     def create_config(
         self,

@@ -690,6 +690,10 @@ def convert_req_index_to_global_ragged_index_triton(
     assert lens.dtype == torch.int32
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
+    assert (
+        token_indices.shape[0] == req_id.shape[0] == position_id.shape[0]
+    ), f"{token_indices.shape[0]} vs {req_id.shape[0]} vs {position_id.shape[0]}"
+    assert prefix_lens.shape[0] == lens.shape[0] + 1
 
     num_tokens = req_id.shape[0]
     token_indices_c = token_indices.contiguous()
