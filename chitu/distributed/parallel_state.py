@@ -17,7 +17,7 @@ _PARALLEL_GROUPS_INITIALIZED = False
 
 _WORLD_GROUP: Optional[CommGroup] = None
 _TP_GROUP: Optional[CommGroup] = None
-_CP_GROUP: Optional[CommGroup] = None
+_PCP_GROUP: Optional[CommGroup] = None
 _DP_GROUP: Optional[CommGroup] = None
 _ETP_GROUP: Optional[CommGroup] = None
 _EP_GROUP: Optional[CommGroup] = None
@@ -41,8 +41,8 @@ def get_tp_group() -> CommGroup:
     return get_global_var("_TP_GROUP")
 
 
-def get_cp_group() -> CommGroup:
-    return get_global_var("_CP_GROUP")
+def get_pcp_group() -> CommGroup:
+    return get_global_var("_PCP_GROUP")
 
 
 def get_dp_group() -> CommGroup:
@@ -73,12 +73,12 @@ def get_tp_size() -> int:
     return _TP_GROUP.group_size
 
 
-def get_cp_size() -> int:
-    """return 1 if CP not initialized"""
-    global _CP_GROUP
-    if _CP_GROUP is None:
+def get_pcp_size() -> int:
+    """return 1 if PCP not initialized"""
+    global _PCP_GROUP
+    if _PCP_GROUP is None:
         return 1
-    return _CP_GROUP.group_size
+    return _PCP_GROUP.group_size
 
 
 def get_dp_size() -> int:
@@ -122,7 +122,7 @@ def get_embed_tokens_lm_head_tp_size() -> int:
 
 
 # Order of parallelism (from near to far):
-# - Dense: TP -> DP -> PP
+# - Dense: TP -> CP -> DP -> PP
 # - MoE: ETP -> EP -> PP
 #
 # Please note that DP communicates nearer ranks than PP, this is for converting
@@ -158,6 +158,33 @@ def _get_second_level_rank_lists(
     return rank_lists
 
 
+def _get_third_level_rank_lists(
+    first_level_size: int,
+    second_level_size: int,
+    third_level_size: int,
+    world_size: int,
+):
+    assert world_size % (first_level_size * second_level_size * third_level_size) == 0
+
+    rank_lists = []
+    block_size = first_level_size * second_level_size * third_level_size
+
+    for i in range(world_size // block_size):
+        for j in range(second_level_size):
+            for k in range(first_level_size):
+                rank_lists.append(
+                    list(
+                        range(
+                            i * block_size + j * first_level_size + k,
+                            (i + 1) * block_size + j * first_level_size + k,
+                            first_level_size * second_level_size,
+                        )
+                    )
+                )
+
+    return rank_lists
+
+
 def _get_last_level_rank_lists(last_level_size: int, world_size: int):
     assert world_size % last_level_size == 0
     return [
@@ -170,9 +197,20 @@ def get_tp_rank_lists(*, tp_size: int, world_size: int):
     return _get_first_level_rank_lists(first_level_size=tp_size, world_size=world_size)
 
 
-def get_dp_rank_lists(*, tp_size: int, dp_size: int, world_size: int):
+def get_pcp_rank_lists(*, tp_size: int, pcp_size: int, world_size: int):
     return _get_second_level_rank_lists(
-        first_level_size=tp_size, second_level_size=dp_size, world_size=world_size
+        first_level_size=tp_size, second_level_size=pcp_size, world_size=world_size
+    )
+
+
+def get_dp_rank_lists(
+    *, tp_size: int, dp_size: int, world_size: int, pcp_size: int = 1
+):
+    return _get_third_level_rank_lists(
+        first_level_size=tp_size,
+        second_level_size=pcp_size,
+        third_level_size=dp_size,
+        world_size=world_size,
     )
 
 
@@ -228,19 +266,20 @@ def initialize_tp_group(
     logger.info(f"tp group: {_TP_GROUP}")
 
 
-def initialize_cp_group(
+def initialize_pcp_group(
     rank: int,
     *,
+    tp_size: int,
     pcp_size: int,
     world_size: int,
 ):
-    global _CP_GROUP
-    assert _CP_GROUP is None
-    _CP_GROUP = CommGroup(
-        get_tp_rank_lists(tp_size=pcp_size, world_size=world_size),
+    global _PCP_GROUP
+    assert _PCP_GROUP is None
+    _PCP_GROUP = CommGroup(
+        get_pcp_rank_lists(tp_size=tp_size, pcp_size=pcp_size, world_size=world_size),
         rank,
     )
-    logger.info(f"cp group: {_CP_GROUP}")
+    logger.info(f"pcp group: {_PCP_GROUP}")
 
 
 def initialize_pp_group(
@@ -316,13 +355,17 @@ def initialize_dp_group(
     rank: int,
     *,
     tp_size: int,
+    pcp_size: int,
     dp_size: int,
     world_size: int,
 ):
     global _DP_GROUP
     assert _DP_GROUP is None
     _DP_GROUP = CommGroup(
-        get_dp_rank_lists(tp_size=tp_size, dp_size=dp_size, world_size=world_size), rank
+        get_dp_rank_lists(
+            tp_size=tp_size, pcp_size=pcp_size, dp_size=dp_size, world_size=world_size
+        ),
+        rank,
     )
 
 
@@ -390,20 +433,12 @@ def initialize_parallel_groups(
     world_size = torch.distributed.get_world_size()
     initialize_world_group(rank, world_size)
     initialize_tp_group(rank, tp_size=tp_size, world_size=world_size)
-    initialize_cp_group(rank, pcp_size=pcp_size, world_size=world_size)
-
-    if pcp_size > 1:
-        # CP mode: CP replaces TP as the intra-node parallel dimension.
-        # CP group = contiguous ranks within same PP stage.
-        # DP group = each rank alone (dp_size=1). This ensures the executor
-        # dispatches ALL tokens to every CP rank (no batch-item splitting).
-        # For MoE CP→DP mapping, cp_group is passed separately (see Phase 3).
-        initialize_dp_group(rank, tp_size=1, dp_size=1, world_size=world_size)
-    else:
-        initialize_dp_group(
-            rank, tp_size=tp_size, dp_size=dp_size, world_size=world_size
-        )
-
+    initialize_pcp_group(
+        rank, tp_size=tp_size, pcp_size=pcp_size, world_size=world_size
+    )
+    initialize_dp_group(
+        rank, tp_size=tp_size, pcp_size=pcp_size, dp_size=dp_size, world_size=world_size
+    )
     initialize_etp_group(rank, etp_size=etp_size, world_size=world_size)
     initialize_ep_group(rank, etp_size=etp_size, ep_size=ep_size, world_size=world_size)
     initialize_pp_group(rank, pp_size=pp_size, world_size=world_size)
@@ -418,7 +453,7 @@ def initialize_parallel_groups(
 
     # Initialize CPContext singleton after parallel groups are set up
     if pcp_size > 1:
-        _set_cp_context(CPContext(pcp_size, _CP_GROUP))
+        _set_cp_context(CPContext(pcp_size, _PCP_GROUP))
     else:
         _set_cp_context(NoOpCPContext())
 
@@ -430,7 +465,7 @@ def parallel_groups_initialized():
 def destroy_parallel_groups():
     _reset_cp_context()
     get_tp_group().destroy()
-    get_cp_group().destroy()
+    get_pcp_group().destroy()
     get_pp_group().destroy()
     get_world_group().destroy()
     get_dp_group().destroy()

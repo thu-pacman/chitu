@@ -272,13 +272,8 @@ class Transformer(nn.Module):
             get_embed_tokens_lm_head_tp_group().rank_in_group
         )
         self.pp_stage = get_pp_group().rank_in_group
-        if self.cp_context.is_active:
-            # CP mode: use pcp_size for PP main rank (same as Backend.pp_main_rank)
-            self.pp_main_rank = (
-                self.rank // self.cp_context.pcp_size
-            ) * self.cp_context.pcp_size
-        else:
-            self.pp_main_rank = (self.rank // self.tp_size) * self.tp_size
+        non_pp_size = self.tp_size * self.cp_context.pcp_size * self.dp_size
+        self.pp_main_rank = (self.rank // non_pp_size) * non_pp_size
         self.pp_end_stage = self.pp_size - 1
 
         # `get_global_args()` can be a Hydra/OmegaConf object; force to plain int for type checkers.

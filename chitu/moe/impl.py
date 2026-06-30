@@ -27,8 +27,6 @@ from chitu.device_type import is_ascend_910b
 from chitu.distributed.parallel_state import (
     get_tp_group,
     get_dp_group,
-    get_cp_group,
-    get_cp_size,
     get_etp_group,
     get_ep_group,
 )
@@ -91,9 +89,7 @@ def init_moe_impl(args) -> None:
         dp_group_for_moe_decode = (
             get_dp_group() if cp_context.is_active else None
         )  # size=1, no allgather
-        effective_dp_size = (
-            cp_context.pcp_size if cp_context.is_active else args.infer.dp_size
-        )
+        effective_dp_size = args.infer.dp_size
 
         # CP mode: force "allgather" dispatcher (DeepEP not compatible with CP).
         if cp_context.is_active:

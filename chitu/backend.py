@@ -47,7 +47,6 @@ from chitu.distributed.parallel_state import (
     get_ep_group,
     get_dp_group,
     get_pp_group,
-    get_cp_group,
     initialize_parallel_groups,
 )
 from chitu.distributed.coordinator import init_coordinator
@@ -112,7 +111,6 @@ class Backend:
     # ---
     use_gloo = True
     group_gloo = None
-    pp_stage = None
     pp_end_stage = None
     pp_main_rank = None
 
@@ -287,33 +285,31 @@ class Backend:
         non_expert_data_parallel_size = args.infer.dp_size
         expert_parallel_size = args.infer.ep_size
         expert_tensor_parallel_size = args.infer.etp_size
-        prefill_context_parallel_size = getattr(args.infer, "pcp_size", 1)
+        prefill_context_parallel_size = args.infer.pcp_size
         global_rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
 
-        # CP mode overrides: CP replaces TP as intra-node parallel dimension
-        if prefill_context_parallel_size > 1:
-            assert (
-                tensor_parallel_size == 1
-            ), "CP and TP are currently incompatible; set tp_size=1 when pcp_size>1"
-            expert_tensor_parallel_size = (
-                1
-                if expert_tensor_parallel_size is None
-                else expert_tensor_parallel_size
+        if prefill_context_parallel_size > 1 and non_expert_data_parallel_size > 1:
+            raise ValueError(
+                "infer.pcp_size > 1 cannot be used with infer.dp_size > 1 yet. "
+                "Prefill CP currently uses the MoE allgather dispatcher group slot, "
+                "so it cannot also express attention DP allgather."
             )
-        else:
-            if expert_tensor_parallel_size is None:
-                assert (
-                    tensor_parallel_size
-                    * non_expert_data_parallel_size
-                    % expert_parallel_size
-                    == 0
-                )
-                expert_tensor_parallel_size = (
-                    tensor_parallel_size
-                    * non_expert_data_parallel_size
-                    // expert_parallel_size
-                )
+
+        if expert_tensor_parallel_size is None:
+            assert (
+                tensor_parallel_size
+                * non_expert_data_parallel_size
+                * prefill_context_parallel_size
+                % expert_parallel_size
+                == 0
+            )
+            expert_tensor_parallel_size = (
+                tensor_parallel_size
+                * prefill_context_parallel_size
+                * non_expert_data_parallel_size
+                // expert_parallel_size
+            )
         embed_tokens_lm_head_tp_size = int(args.infer.embed_tokens_lm_head_tp_size)
         if tensor_parallel_size > 1:
             assert (
@@ -328,20 +324,17 @@ class Backend:
                 embed_tokens_lm_head_tp_size == 1
             ), "embed_tokens_lm_head_tp_size must be 1 when tensor_parallel_size == 1 and non_expert_data_parallel_size == 1"
 
-        effective_tp_size = (
-            prefill_context_parallel_size
-            if prefill_context_parallel_size > 1
-            else tensor_parallel_size
-        )
         if (
             world_size
-            != effective_tp_size
+            != tensor_parallel_size
+            * prefill_context_parallel_size
             * non_expert_data_parallel_size
             * pipeline_parallel_size
         ):
             raise ValueError(
                 f"Inconsistent parallelism: world_size({world_size}) should be equal to "
-                f"effective_tp_size({effective_tp_size}) "
+                f"tensor_parallel_size({tensor_parallel_size}) "
+                f"* prefill_context_parallel_size({prefill_context_parallel_size}) "
                 f"* non_expert_data_parallel_size({non_expert_data_parallel_size}) "
                 f"* pipeline_parallel_size({pipeline_parallel_size}) "
             )
