@@ -22,6 +22,7 @@ from typing_extensions import override
 from chitu.attn_backend import AttnBackend, RefAttnBackend, FlashAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import KVCacheBase
+from chitu.models.model import LayerNorm
 from chitu.models.model_deepseek_v3 import TransformerDeepSeekV3
 from chitu.models.registry import ModelType, register_model
 from chitu.tensor_parallel import LocalLinear
@@ -347,8 +348,8 @@ class MoonViTEncoderLayer(nn.Module):
         attn_bias: bool = True,
     ):
         super().__init__()
-        self.norm0 = nn.LayerNorm(hidden_dim)
-        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm0 = LayerNorm(hidden_dim)
+        self.norm1 = LayerNorm(hidden_dim)
         self.attn = MoonVisionAttention(hidden_dim, num_heads, has_bias=attn_bias)
         self.mlp = MoonVisionMLP(hidden_dim, mlp_dim, activation)
 
@@ -389,7 +390,7 @@ class MoonViT3dEncoder(nn.Module):
                 for _ in range(num_layers)
             ]
         )
-        self.final_layernorm = nn.LayerNorm(hidden_dim)
+        self.final_layernorm = LayerNorm(hidden_dim)
 
     def forward(
         self, hidden_states: torch.Tensor, grid_thws: torch.Tensor
@@ -460,7 +461,7 @@ class K2VLMultiModalProjector(nn.Module):
         merge_h, merge_w = config.merge_kernel_size
         self.hidden_size = config.hidden_size * merge_h * merge_w
 
-        self.pre_norm = nn.LayerNorm(config.hidden_size, eps=1e-5)
+        self.pre_norm = LayerNorm(config.hidden_size, eps=1e-5)
         self.linear_1 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.linear_2 = nn.Linear(self.hidden_size, config.text_hidden_size, bias=True)
 
