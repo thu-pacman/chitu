@@ -101,6 +101,10 @@ class StaticTensor:
         """
         self._cur_nelem = functools.reduce(lambda x, y: x * y, shape, 1)
         self._cur_shape = shape
+        if self._cur_nelem > self._buffer.numel():
+            raise ValueError(
+                f"The assigned shape ({shape}) cannot be larger than the buffer ({self._buffer.shape})"
+            )
 
     def get(self) -> torch.Tensor:
         """
