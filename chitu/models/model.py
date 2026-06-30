@@ -30,7 +30,13 @@ from chitu.muxi_utils import (
     LinearMuxiLayoutContigY,
     LinearMuxiLayoutNativeY,
 )
-from chitu.ops import apply_rotary_pos_emb, rms_norm, moe_gate, add_shared_experts
+from chitu.ops import (
+    apply_rotary_pos_emb,
+    rms_norm,
+    layer_norm,
+    moe_gate,
+    add_shared_experts,
+)
 from chitu.cp_utils import get_cp_context
 from chitu.distributed.comm_group import CommGroup
 from chitu.distributed.parallel_state import (
@@ -105,13 +111,13 @@ class LayerNorm(nn.Module):
             compute_dtype = torch.float32
         else:
             compute_dtype = self.weight.dtype
-        return torch.nn.functional.layer_norm(
-            x.to(compute_dtype),
-            (self.dim,),
-            self.weight.to(compute_dtype),
-            self.bias.to(compute_dtype),
-            self.eps,
-        ).type_as(x)
+        return layer_norm(
+            x,
+            self.weight,
+            self.bias,
+            eps=self.eps,
+            compute_dtype=compute_dtype,
+        )
 
 
 class RMSNorm(nn.Module):

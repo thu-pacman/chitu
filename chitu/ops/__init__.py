@@ -26,7 +26,7 @@ from chitu.ops.kv_cache import (
     dsa_fp8_kvcache_dequant,
     dsa_fp8_paged_kvcache_read_dequant,
 )
-from chitu.ops.norm import rms_norm
+from chitu.ops.norm import rms_norm, layer_norm
 from chitu.ops.moe_gate import moe_gate
 from chitu.ops.moe_hash_gate import moe_hash_gate
 from chitu.ops.moe_sum import (

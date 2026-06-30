@@ -21,11 +21,65 @@ from chitu.ops.utils import compatible_with_inplace, make_op_dispatcher
 triton, has_triton = try_import_platform_dep("triton")
 has_triton_impl = has_triton and has_accelerator()
 if has_triton_impl:
-    from chitu.ops.triton_ops import rms_norm_triton
+    from chitu.ops.triton_ops import rms_norm_triton, layer_norm_triton
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 tbsgemm, has_tbsgemm = try_import_opt_dep("tbsgemm", "muxi_w8a8_kernels")
+
+
+@make_op_dispatcher
+def layer_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    eps,
+    compute_dtype: torch.dtype,
+    impl: str = "auto",
+):
+    raise NotImplementedError
+
+
+@layer_norm.register_auto
+def _auto_layer_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    eps,
+    compute_dtype: torch.dtype,
+):
+    if has_triton_impl:
+        return "triton"
+    return "torch"
+
+
+layer_norm.register_candidate("triton")
+if has_triton_impl:
+    layer_norm.register("triton")(layer_norm_triton)
+
+
+@layer_norm.register("torch")
+@compatible_with_inplace
+def layer_norm_torch(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    *,
+    eps,
+    compute_dtype: torch.dtype,
+):
+    dtype = x.dtype
+    return F.layer_norm(
+        x.to(compute_dtype),
+        (weight.numel(),),
+        weight.to(compute_dtype),
+        bias.to(compute_dtype),
+        eps,
+    ).to(dtype)
 
 
 @make_op_dispatcher
