@@ -3,12 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass
-from typing import Sequence, Any
+from typing import Sequence, Any, Protocol, runtime_checkable
 from typing_extensions import final
 
 import torch
-
-NATIVE_LAYOUT_TENSOR_PROPERTY_NAME = "native_layout"
 
 
 @dataclass
@@ -31,11 +29,12 @@ class NativeLayoutTensor:
 
     @classmethod
     def check_tensor(cls, tensor: torch.Tensor):
-        layout_type = getattr(tensor, NATIVE_LAYOUT_TENSOR_PROPERTY_NAME, None)
-        try:
-            return issubclass(layout_type, cls)
-        except TypeError:  # layout_type is None or not a class
+        if not isinstance(tensor, TensorWithNativeLayout):
             return False
+        template = tensor.native_layout
+        if not isinstance(template, NativeLayoutTemplate):
+            return False
+        return issubclass(template.layout_cls, cls)
 
     @classmethod
     def convert_from(
@@ -116,3 +115,66 @@ class NativeLayoutTensor:
 
     def is_contiguous(self):
         return self.layout_tensor.is_contiguous()
+
+
+@dataclass
+class NativeLayoutTemplate:
+    """A node in a chain of native-layout conversions.
+
+    Each template represents one conversion step.  Templates are linked via
+    ``previous`` so that a parameter can pass through multiple layouts
+    (e.g. checkpoint-format → intermediate → final native layout).
+    """
+
+    layout_cls: type[NativeLayoutTensor]
+    """Target layout class."""
+
+    plain_shape: torch.Size
+    """Mathematical shape (from the first ``apply_native_layout`` call)."""
+
+    args: tuple
+    """Positional args forwarded to ``layout_cls.convert_from``."""
+
+    kwargs: dict
+    """Keyword args forwarded to ``layout_cls.convert_from``."""
+
+    state_dict_convert: bool
+    """Whether this layout participates in state-dict conversion hooks."""
+
+    state_dict_shape: torch.Size
+    """Shape of the parameter as it appears in ``state_dict``."""
+
+    state_dict_dtype: torch.dtype
+    """Dtype of the parameter as it appears in ``state_dict``."""
+
+    previous: "NativeLayoutTemplate | None" = None
+    """Previous template in the chain (for chained registrations)."""
+
+    def build(self, src: torch.Tensor) -> NativeLayoutTensor:
+        """Wrap a tensor in this layout's type (no chaining, no conversion).
+
+        Constructs the ``layout_cls`` directly, using *src* as the
+        ``layout_tensor``.
+        """
+        return self.layout_cls(
+            plain_shape=self.plain_shape,
+            layout_tensor=src,
+            *self.args,
+            **self.kwargs,
+        )
+
+    def convert(self, src: torch.Tensor | NativeLayoutTensor) -> NativeLayoutTensor:
+        """Run this conversion step.
+
+        If :attr:`previous` is set, the source is first wrapped via
+        ``previous.build`` before being passed to this template's
+        ``layout_cls.convert_from``.
+        """
+        if self.previous is not None:
+            src = self.previous.build(src)
+        return self.layout_cls.convert_from(src, *self.args, **self.kwargs)
+
+
+@runtime_checkable
+class TensorWithNativeLayout(Protocol):
+    native_layout: NativeLayoutTemplate

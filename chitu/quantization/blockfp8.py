@@ -32,7 +32,7 @@ from chitu.import_utils import try_import_platform_dep, try_import_opt_dep
 from chitu.global_vars import get_global_args
 from chitu.cuda_graph import is_warming_up_or_cuda_graph_capture
 from chitu.native_layout import (
-    enable_native_layout_weight,
+    NativeLayoutMixin,
     MarlinNativeLayoutWeight,
     MarlinNativeLayoutScale,
     DeepGemmScale,
@@ -232,11 +232,12 @@ class Blockfp8Linear(QuantizedLinearBase):
     and parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize > 1,
     priority=1,
 )
-class Blockfp8LinearMarlinLayout(
-    enable_native_layout_weight("weight", MarlinNativeLayoutWeight),
-    enable_native_layout_weight("scale", MarlinNativeLayoutScale),
-    Blockfp8Linear,
-):
+class Blockfp8LinearMarlinLayout(NativeLayoutMixin, Blockfp8Linear):
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.weight, MarlinNativeLayoutWeight)
+        self.apply_native_layout(self.scale, MarlinNativeLayoutScale)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return soft_fp8_blockfp8_gemm_marlin(
             x,
@@ -259,16 +260,17 @@ class Blockfp8LinearMarlinLayout(
     ),
     priority=1,
 )
-class Blockfp8LinearDeepGemm(
-    enable_native_layout_weight(
-        "scale",
-        DeepGemmScale,
-        mn=lambda m: m.out_features,
-        k=lambda m: m.in_features,
-        disable_ue8m0_cast=lambda m: not m.round_scale_to_pow2,
-    ),
-    Blockfp8Linear,
-):
+class Blockfp8LinearDeepGemm(NativeLayoutMixin, Blockfp8Linear):
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(
+            self.scale,
+            DeepGemmScale,
+            mn=self.out_features,
+            k=self.in_features,
+            disable_ue8m0_cast=not self.round_scale_to_pow2,
+        )
+
     @override
     def forward(self, x) -> torch.Tensor:
         return linear_blockfp8(
@@ -983,7 +985,7 @@ class Blockfp8AbsorbGemm(QuantizedAbsorbGemmBase):
         block_size: int = 128,
         round_scale_to_pow2: bool = False,
     ):
-        super().__init__()
+        super().__init__(n_heads, in_features_per_head, out_features_per_head)
 
         # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
         # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
@@ -1024,9 +1026,6 @@ class Blockfp8AbsorbGemm(QuantizedAbsorbGemmBase):
             requires_grad=False,
         )
 
-        self.n_heads = n_heads
-        self.in_features_per_head = in_features_per_head
-        self.out_features_per_head = out_features_per_head
         self.block_size = block_size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

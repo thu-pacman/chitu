@@ -29,13 +29,13 @@ def get_cp_context() -> CPContext | NoOpCPContext:
     global _CP_CONTEXT_INSTANCE
     if _CP_CONTEXT_INSTANCE is None:
         # Lazy init from parallel_state (only if parallel groups not yet set up)
-        from chitu.distributed.parallel_state import get_cp_size, get_cp_group
+        from chitu.distributed.parallel_state import get_pcp_size, get_pcp_group
 
-        pcp_size = get_cp_size()
+        pcp_size = get_pcp_size()
         if pcp_size <= 1:
             _CP_CONTEXT_INSTANCE = NoOpCPContext()
         else:
-            _CP_CONTEXT_INSTANCE = CPContext(pcp_size, get_cp_group())
+            _CP_CONTEXT_INSTANCE = CPContext(pcp_size, get_pcp_group())
     return _CP_CONTEXT_INSTANCE
 
 

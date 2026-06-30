@@ -7,7 +7,7 @@ from chitu.quantization import (
     NormalLinear,
 )
 from chitu.native_layout import (
-    enable_native_layout_weight,
+    NativeLayoutMixin,
     InXOutWeight,
 )
 from chitu.lazy import single_dispatch_lazy_tensor
@@ -25,9 +25,10 @@ def hygon_native_linear(
 
 
 @QuantizationRegistry.register_linear(None, when=lambda _: is_hygon(), priority=1)
-class InXOutLinear(
-    enable_native_layout_weight("weight", InXOutWeight),
-    NormalLinear,
-):
+class InXOutLinear(NativeLayoutMixin, NormalLinear):
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.weight, InXOutWeight)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return hygon_native_linear(x, self.get_native_layout_weight())

@@ -1,5 +1,6 @@
 from chitu.distributed.parallel_state import (
     get_tp_rank_lists,
+    get_pcp_rank_lists,
     get_dp_rank_lists,
     get_etp_rank_lists,
     get_ep_rank_lists,
@@ -26,6 +27,30 @@ def test_tp4_dp4_rank_lists():
         [1, 5, 9, 13],
         [2, 6, 10, 14],
         [3, 7, 11, 15],
+    ]
+
+
+def test_tp2_pcp2_dp2_rank_lists():
+    tp_rank_lists = get_tp_rank_lists(tp_size=2, world_size=8)
+    pcp_rank_lists = get_pcp_rank_lists(tp_size=2, pcp_size=2, world_size=8)
+    dp_rank_lists = get_dp_rank_lists(tp_size=2, pcp_size=2, dp_size=2, world_size=8)
+    assert tp_rank_lists == [
+        [0, 1],
+        [2, 3],
+        [4, 5],
+        [6, 7],
+    ]
+    assert pcp_rank_lists == [
+        [0, 2],
+        [1, 3],
+        [4, 6],
+        [5, 7],
+    ]
+    assert dp_rank_lists == [
+        [0, 4],
+        [1, 5],
+        [2, 6],
+        [3, 7],
     ]
 
 

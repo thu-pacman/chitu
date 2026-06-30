@@ -356,9 +356,31 @@ class FlashMLABackend(TritonAttnBackend):
             raise NotImplementedError()
         if topk_indices.size(-1) < self.index_topk:
             topk_indices = self.pad_indices(topk_indices)
+
+        cp_ctx = get_cp_context()
+        local_lengths = cp_ctx.local_lengths
+        local_seq_ids = cp_ctx.local_seq_ids
+
+        if local_lengths is not None:
+            # CP path: topk_indices 只包含本 CP rank 的 local tokens，需
+            # 取出local tokens对应的req_id 和 position_id
+            req_id = (
+                local_seq_ids
+                if local_seq_ids is not None
+                else torch.zeros(
+                    local_lengths.shape[0],
+                    dtype=torch.int32,
+                    device=topk_indices.device,
+                )  # cp_ctx.build_local_lengths在bs=1时，会将self._local_seq_ids设为None
+            )
+            position_id = local_lengths - 1
+        else:
+            req_id = seq_len_delta.delta_seq_ids_tensor_device
+            position_id = seq_len_delta.delta_position_ids_tensor_device
+
         return convert_req_index_to_global_ragged_index(
-            seq_len_delta.delta_seq_ids_tensor_device,
-            seq_len_delta.delta_position_ids_tensor_device,
+            req_id,
+            position_id,
             seq_len_delta.new.prefix_lens_tensor_device,
             seq_len_delta.new.lens_tensor_device,
             topk_indices.to(torch.int32),

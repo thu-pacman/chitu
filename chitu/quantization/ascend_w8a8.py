@@ -11,7 +11,7 @@ from chitu.quantization.base import QuantizedLinearBase
 from chitu.distributed.parallel_state import get_tp_group
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.native_layout import (
-    enable_native_layout_weight,
+    NativeLayoutMixin,
     NpuFractalZnTensor,
     Repeat1ToLength,
 )
@@ -21,22 +21,7 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
 
 @QuantizationRegistry.register_linear("ascend_w8a8")
-class AscendW8A8Linear(
-    enable_native_layout_weight("weight", NpuFractalZnTensor),
-    enable_native_layout_weight(
-        "input_scale",
-        Repeat1ToLength,
-        length=(lambda m: m.in_features),
-        out_dtype=(lambda m: torch.get_default_dtype()),
-    ),
-    enable_native_layout_weight(
-        "input_offset",
-        Repeat1ToLength,
-        length=(lambda m: m.in_features),
-        out_dtype=(lambda m: torch.get_default_dtype()),
-    ),
-    QuantizedLinearBase,
-):
+class AscendW8A8Linear(NativeLayoutMixin, QuantizedLinearBase):
     def __init__(
         self,
         ############################################
@@ -89,12 +74,6 @@ class AscendW8A8Linear(
             requires_grad=False,
         )
         self.is_rpl = is_rpl
-        self._input_scale_layout_kwargs = dict(
-            length=self.in_features, out_dtype=torch.get_default_dtype()
-        )
-        self._input_offset_layout_kwargs = dict(
-            length=self.in_features, out_dtype=torch.get_default_dtype()
-        )
         if has_bias:
             self.register_parameter(
                 "bias",
@@ -107,6 +86,22 @@ class AscendW8A8Linear(
             self.register_parameter("bias", None)
 
         self._ready = False
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.weight, NpuFractalZnTensor)
+        self.apply_native_layout(
+            self.input_scale,
+            Repeat1ToLength,
+            length=self.in_features,
+            out_dtype=torch.get_default_dtype(),
+        )
+        self.apply_native_layout(
+            self.input_offset,
+            Repeat1ToLength,
+            length=self.in_features,
+            out_dtype=torch.get_default_dtype(),
+        )
 
     @torch.no_grad()
     def _maybe_build_quant_params(self):

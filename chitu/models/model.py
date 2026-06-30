@@ -70,6 +70,7 @@ from chitu.quantization import (
     get_backend_from_checkpoint_prefix,
 )
 from chitu.hybrid_device import CPUParameter
+from chitu.native_layout.base import TensorWithNativeLayout
 from chitu.static_tensor import StaticTensor
 from chitu.ops.kv_cache import (
     read_from_singleton_paged_kv_cache,
@@ -271,13 +272,8 @@ class Transformer(nn.Module):
             get_embed_tokens_lm_head_tp_group().rank_in_group
         )
         self.pp_stage = get_pp_group().rank_in_group
-        if self.cp_context.is_active:
-            # CP mode: use pcp_size for PP main rank (same as Backend.pp_main_rank)
-            self.pp_main_rank = (
-                self.rank // self.cp_context.pcp_size
-            ) * self.cp_context.pcp_size
-        else:
-            self.pp_main_rank = (self.rank // self.tp_size) * self.tp_size
+        non_pp_size = self.tp_size * self.cp_context.pcp_size * self.dp_size
+        self.pp_main_rank = (self.rank // non_pp_size) * non_pp_size
         self.pp_end_stage = self.pp_size - 1
 
         # `get_global_args()` can be a Hydra/OmegaConf object; force to plain int for type checkers.
@@ -1072,23 +1068,27 @@ class Transformer(nn.Module):
         # Check inconsistent dtype
         keep_dtype_in_checkpoint = get_global_args().keep_dtype_in_checkpoint
         for name, param in self.named_parameters():
-            if name in state_dict and param.dtype != state_dict[name].dtype:
+            if isinstance(param, TensorWithNativeLayout):
+                model_dtype = param.native_layout.state_dict_dtype
+            else:
+                model_dtype = param.dtype
+            if name in state_dict and model_dtype != state_dict[name].dtype:
                 if keep_dtype_in_checkpoint:
                     logger.info(
                         f"Parameter {name} has inconsistent dtype in the checkpoint "
-                        f"({state_dict[name].dtype}) and the model ({param.dtype}), "
+                        f"({state_dict[name].dtype}) and the model ({model_dtype}), "
                         f"using the dtype in the checkpoint. Set `keep_dtype_in_checkpoint=False` "
                         f"when starting chitu if you want to use the dtype in the model."
                     )
                 else:
                     logger.info(
                         f"Parameter {name} has inconsistent dtype in the checkpoint "
-                        f"({state_dict[name].dtype}) and the model ({param.dtype}), "
+                        f"({state_dict[name].dtype}) and the model ({model_dtype}), "
                         f"converting the checkpoint dtype to the model dtype. Set "
                         f"`keep_dtype_in_checkpoint=True` when starting chitu if you "
                         f"want to use the dtype in the checkpoint."
                     )
-                    state_dict[name] = state_dict[name].to(param.dtype)
+                    state_dict[name] = state_dict[name].to(model_dtype)
 
         for k in state_dict:
             if isinstance(self.get_parameter(k), CPUParameter):
@@ -1419,12 +1419,8 @@ class Transformer(nn.Module):
             self.attn_backend.prepare_metadata_for_prefill(
                 self.cache_dict["main"].seq_len_delta
             )
-            if (
-                self.moe_impl is not None
-                and self.moe_impl.ep_size > 1
-                and self.moe_impl.decode_token_dispatcher_impl == "allgather"
-            ):
-                self.moe_impl.prepare(TaskType.Decode, bs * self.mtp_size)
+        if self.moe_impl is not None:
+            self.moe_impl.prepare(TaskType.Decode, bs * self.mtp_size)
         h = func(key, tokens.view(-1), *extra_inputs)
         self.draft_tokens = tokens[:, 1:]
         # self.draft_logits = torch.stack(draft_logits, dim=1)
@@ -1442,14 +1438,6 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         freqs_cis = self.prepare_freqs_cis()
 
-        # CP: split tokens before embedding (stage 0) or split freqs_cis
-        # for local hidden states from previous PP stage.
-        if self.pp_stage == 0:
-            num_tokens = tokens.shape[0]
-            delta_total = 0
-        else:
-            num_tokens = 0
-            delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
         # CP: split token IDs before embedding (stage 0) or split freqs_cis
         # to match local hidden states from previous PP stage.
         # Skip CP when the actual prefill delta is smaller than pcp_size -- the
@@ -1522,6 +1510,8 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def empty_prefill(self) -> torch.Tensor:
+        if self.moe_impl is not None:
+            self.moe_impl.prepare(TaskType.Prefill, int(self.dummy_input.shape[0]))
         if self.specialize_embed_tokens_lm_head_parallel:
             self.embed_tokens(
                 self.dummy_embed_tokens_input,
@@ -1529,8 +1519,6 @@ class Transformer(nn.Module):
                 self.embed_tokens_cum_num_tokens,
             )
         if self.ep_size > 1:
-            if self.moe_impl is not None:
-                self.moe_impl.prepare(TaskType.Prefill, int(self.dummy_input.shape[0]))
             for it, layer in enumerate(self.layers):
                 if self.local_begin_layer_id + it < self.moe_impl.n_dense_layers:
                     continue
@@ -1552,6 +1540,8 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def empty_decode(self):
+        if self.moe_impl is not None:
+            self.moe_impl.prepare(TaskType.Decode, int(self.dummy_input.shape[0]))
         if self.specialize_embed_tokens_lm_head_parallel:
             self.embed_tokens(
                 self.dummy_embed_tokens_input,

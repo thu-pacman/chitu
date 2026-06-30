@@ -14,7 +14,7 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivation,
     ConcatPermutedBatchedRoutedActivationMinimal,
 )
-from chitu.native_layout import enable_native_layout_weight, NpuFractalZnTensor
+from chitu.native_layout import NativeLayoutMixin, NpuFractalZnTensor
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase, QuantizedMoeExpertsMerged
 from chitu.ops.quant import w8a8_gemm_per_token_per_channel, a8_per_token_act_quant
@@ -102,13 +102,16 @@ class W8A8PerTokenPerChannelDynLinear(QuantizedLinearBase):
     "w8a8_per_token_per_channel_dyn", when=lambda _: has_torch_npu, priority=1
 )
 class AscendW8A8PerTokenPerChannelDynLinear(
-    enable_native_layout_weight("weight", NpuFractalZnTensor),
-    W8A8PerTokenPerChannelDynLinear,
+    NativeLayoutMixin, W8A8PerTokenPerChannelDynLinear
 ):
     """
     Ascend implementation of W8A8PerTokenPerChannelDynLinear using NpuFuFractalZnTensor
     layout.
     """
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.weight, NpuFractalZnTensor)
 
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -317,9 +320,7 @@ def _run_sum_concat_torch_npu(
     "w8a8_per_token_per_channel_dyn", merge_gate_up=True
 )
 class AscendW8A8PerTokenPerChannelDynMoeExperts(
-    enable_native_layout_weight("gate_up_proj_weight", NpuFractalZnTensor),
-    enable_native_layout_weight("down_proj_weight", NpuFractalZnTensor),
-    QuantizedMoeExpertsMerged,
+    NativeLayoutMixin, QuantizedMoeExpertsMerged
 ):
     """
     AscendW8A8Dynamic quantized MoeExperts
@@ -392,6 +393,11 @@ class AscendW8A8PerTokenPerChannelDynMoeExperts(
             ),
             requires_grad=False,
         )
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.gate_up_proj_weight, NpuFractalZnTensor)
+        self.apply_native_layout(self.down_proj_weight, NpuFractalZnTensor)
 
     @override
     @functools.singledispatchmethod

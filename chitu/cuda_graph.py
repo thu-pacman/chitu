@@ -3,12 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import Callable, Sequence, Mapping, Any, Optional
+from logging import getLogger
 import functools
 import gc
 import torch
 
 from chitu.static_tensor import StaticTensor
 from chitu.device_type import is_ascend
+
+logger = getLogger(__name__)
 
 _is_warming_up_before_cuda_graph_capture = False
 _currently_capturing_graph_object = None
@@ -103,6 +106,7 @@ def make_dispatched_graphed_callables(
 
             if key not in graph_dict:
                 # Warmup
+                logger.debug(f"Warming-up before capturing new graph with key {key}")
                 assert _is_warming_up_before_cuda_graph_capture is False
                 try:
                     _is_warming_up_before_cuda_graph_capture = True
@@ -148,6 +152,7 @@ def make_dispatched_graphed_callables(
                     before_capture_callback()
 
                 # Capture the graph
+                logger.debug(f"Capturing new graph with key {key}")
                 graph_dict[key] = torch.cuda.CUDAGraph()
                 gc.disable()  # Disable GC to prevent mid-capture tensor destruction
                 try:
@@ -193,6 +198,7 @@ def make_dispatched_graphed_callables(
                     cuda_graph_pool = graph_dict[key].pool()
 
             else:
+                logger.debug(f"Replaying graph with key {key}")
                 assert args_static_tensors is not None
                 assert kwargs_static_tensors is not None
                 assert output_static_tensor is not None

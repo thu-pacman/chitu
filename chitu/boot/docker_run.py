@@ -73,7 +73,7 @@ def docker_run(
     # If /dev/infiniband and/or /sbin/ibdev2netdev exist, mount them.
     ib_mount_args = []
     if os.path.isdir("/dev/infiniband"):
-        ib_mount_args += ["-v", "/dev/infiniband:/dev/infiniband"]
+        ib_mount_args += ["--device=/dev/infiniband"]
         logger.info("Adding /dev/infiniband to mounts")
     if os.path.isfile("/sbin/ibdev2netdev"):
         # NOTE: Although there is a

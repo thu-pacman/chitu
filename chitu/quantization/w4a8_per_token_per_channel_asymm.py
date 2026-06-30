@@ -11,17 +11,14 @@ from chitu.ops.quant import (
     a8_per_token_act_quant,
 )
 from chitu.native_layout import (
-    enable_native_layout_weight,
+    NativeLayoutMixin,
     Packed4BitWeightAlongK,
     Packed4BitWeightQServe,
 )
 
 
 @QuantizationRegistry.register_linear("w4a8_per_token_per_channel_asymm")
-class W4A8PerTokenPerChannelAsymmLinear(
-    enable_native_layout_weight("qweight", Packed4BitWeightAlongK, k_stride=64),
-    QuantizedLinearBase,
-):
+class W4A8PerTokenPerChannelAsymmLinear(NativeLayoutMixin, QuantizedLinearBase):
     def __init__(
         self,
         ############################################
@@ -35,21 +32,14 @@ class W4A8PerTokenPerChannelAsymmLinear(
 
         super().__init__(in_features, out_features, has_bias)
 
-        # In the checkpoint, self.qweight is in Packed4BitWeightQServe layout. Here we
-        # mark the layout via `self._qweight_layout_class` and `self._qweight_plain_shape`,
-        # so `enable_native_layout_weight` can recognize it. After loading,
-        # `enable_native_layout_weight` will convert it to other layouts.
         assert self.in_features % 2 == 0, "in_features must be even for int4 packing"
         self.qweight = torch.nn.Parameter(
             torch.zeros(
                 self.out_features,
-                self.in_features // 2,
-                dtype=torch.uint8,
+                self.in_features,
             ),
             requires_grad=False,
         )
-        self._qweight_layout_class = Packed4BitWeightQServe
-        self._qweight_plain_shape = (out_features, in_features)
 
         self.s1_scales = torch.nn.Parameter(
             torch.ones(
@@ -75,6 +65,13 @@ class W4A8PerTokenPerChannelAsymmLinear(
             )
         else:
             self.register_parameter("bias", None)
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(
+            self.qweight, Packed4BitWeightQServe, state_dict_convert=False
+        )
+        self.apply_native_layout(self.qweight, Packed4BitWeightAlongK, k_stride=64)
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:

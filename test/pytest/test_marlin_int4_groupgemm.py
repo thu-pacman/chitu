@@ -12,6 +12,7 @@ import torch
 
 from chitu.quantization import QuantizedMoeExpertsUnmerged, BlockInt4MoeExpertsUnmerged
 from chitu.utils import try_import_platform_dep
+from chitu.native_layout import init_native_layout
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 has_marlin_moe = has_chitu_backend and hasattr(chitu_backend, "moe_wna16_marlin_gemm")
@@ -43,6 +44,11 @@ def _make_experts_module(
         group_size=group_size,
     )
 
+    module = module.to("meta")
+    # Apply native-layout conversion and install hooks.
+    init_native_layout(module)
+
+    module = module.to_empty(device="cuda")
     # Fill with random int32 data (simulates packed 4-bit weights)
     with torch.no_grad():
         for name in ["gate_proj_qweight", "up_proj_qweight", "down_proj_qweight"]:
@@ -56,7 +62,6 @@ def _make_experts_module(
                 torch.randn(param.shape, dtype=torch.bfloat16, device="cuda") * 0.01
             )
 
-    module = module.cuda()
     return module
 
 
@@ -103,9 +108,6 @@ def test_groupgemm_matches_iterative(
     module = _make_experts_module(dim, moe_inter_dim, n_experts, group_size)
     routed_x = _make_routed_activation(M, dim, n_experts, topk)
 
-    # Trigger native layout repack via load_state_dict post-hooks
-    module.load_state_dict(module.state_dict())
-
     # --- Iterative path (base class fallback) ---
     iterative_result = QuantizedMoeExpertsUnmerged.forward_no_sum(module, routed_x)
 
@@ -130,7 +132,6 @@ def test_groupgemm_empty_batch(M):
     torch.set_default_dtype(torch.bfloat16)
     dim, moe_inter_dim, n_experts, topk = 256, 128, 8, 2
     module = _make_experts_module(dim, moe_inter_dim, n_experts)
-    module = module.cuda()
 
     from chitu.moe.batched_routed_activation import IndexedBatchedRoutedActivation
 

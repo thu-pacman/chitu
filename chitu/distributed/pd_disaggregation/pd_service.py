@@ -24,8 +24,7 @@ import chitu.serve.event_loop as event_loop_module
 
 from chitu.backend import Backend, BackendState
 from chitu.distributed.parallel_state import (
-    get_cp_group,
-    get_cp_size,
+    get_pcp_group,
     get_dp_group,
     get_pp_group,
     get_tp_group,
@@ -218,8 +217,8 @@ class PDSchedulerService:
 
     def _determine_cp_main_rank(self) -> bool:
         """Return True if current rank is the first rank in its CP group."""
-        cp_group = get_cp_group()
-        return cp_group.global_rank == cp_group.rank_list[0]
+        pcp_group = get_pcp_group()
+        return pcp_group.global_rank == pcp_group.rank_list[0]
 
     def _init_scheduler(self):
         """Initialize the appropriate scheduler"""

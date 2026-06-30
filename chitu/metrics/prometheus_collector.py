@@ -240,7 +240,7 @@ def _get_nvml_memory_bytes(device_index: int, pid: int):
             try:
                 processes = pynvml.nvmlDeviceGetComputeRunningProcesses_v2(handle)
             except Exception:
-                logger.warning(
+                logger.warning_once(
                     "Failed to get compute running processes, use empty list as default"
                 )
                 processes = []
@@ -253,7 +253,7 @@ def _get_nvml_memory_bytes(device_index: int, pid: int):
             break
         return used, total
     except Exception as e:
-        logger.warning(f"Failed to get NVML memory bytes: {e}")
+        logger.warning_once(f"Failed to get NVML memory bytes: {e}")
         return None
     finally:
         if initialized:

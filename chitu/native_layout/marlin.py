@@ -4,10 +4,15 @@
 
 from dataclasses import dataclass
 from typing_extensions import override
+import plum
 
 import torch
 
 from chitu.native_layout.base import NativeLayoutTensor
+from chitu.native_layout.common import (
+    Packed4BitWeightAlongKContig,
+    Packed4BitWeightAlongKInt32,
+)
 from chitu.import_utils import try_import_platform_dep
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
@@ -24,7 +29,7 @@ class MarlinNativeLayoutWeight(NativeLayoutTensor):
             tensor = tensor.view(torch.uint8)
             if n % 128 != 0:
                 tensor = torch.cat(
-                    [tensor, torch.zeros((128 - n % 128, k), dtype=torch.uint8)], dim=0
+                    [tensor, tensor.new_zeros((128 - n % 128, k))], dim=0
                 )
             assert tensor.dim() == 2
             b16_tensor = tensor.to(torch.int16)
@@ -127,33 +132,28 @@ class BlockInt4MarlinQWeight(NativeLayoutTensor):
 
     @classmethod
     @override
-    def convert_from(cls, tensor: torch.Tensor) -> "BlockInt4MarlinQWeight":
-        if isinstance(tensor, torch.Tensor):
-            if not has_marlin:
-                raise RuntimeError(
-                    "Marlin backend (chitu_backend) is not available for blockint4 repack"
-                )
-            e, n, k_packed = tensor.shape
-            in_features = k_packed * 8
-            out_features = n
-
-            repacked_list = []
-            for i in range(e):
-                qw = tensor[i].T.contiguous()
-                # gptq_marlin_repack requires GPU
-                if qw.device.type != "cuda":
-                    qw = qw.cuda()
-                empty_g_idx = torch.empty(0, dtype=torch.int, device=qw.device)
-                repacked = gptq_marlin_repack(
-                    qw, empty_g_idx, in_features, out_features, 4
-                )
-                repacked_list.append(repacked)
-
-            return cls(tensor.shape, torch.stack(repacked_list, dim=0))
-        else:
-            raise TypeError(
-                f"Cannot convert from {type(tensor)} to BlockInt4MarlinQWeight"
+    def convert_from(
+        cls, packed: Packed4BitWeightAlongKInt32
+    ) -> "BlockInt4MarlinQWeight":
+        """Convert from int32-packed checkpoint format."""
+        tensor = packed.layout_tensor
+        e, n, k = packed.plain_shape
+        if tensor.device.type == "meta":
+            return cls(
+                packed.plain_shape,
+                torch.empty(e, k // 8 // 2, n * 2, dtype=torch.int32, device="meta"),
             )
+
+        repacked_list = []
+        for i in range(e):
+            qw = tensor[i].T.contiguous()
+            if qw.device.type != "cuda":
+                qw = qw.cuda()
+            empty_g_idx = torch.empty(0, dtype=torch.int, device=qw.device)
+            repacked = gptq_marlin_repack(qw, empty_g_idx, k, n, 4)
+            repacked_list.append(repacked)
+
+        return cls(packed.plain_shape, torch.stack(repacked_list, dim=0))
 
 
 @dataclass

@@ -47,7 +47,6 @@ from chitu.distributed.parallel_state import (
     get_ep_group,
     get_dp_group,
     get_pp_group,
-    get_cp_group,
     initialize_parallel_groups,
 )
 from chitu.distributed.coordinator import init_coordinator
@@ -55,6 +54,9 @@ from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 from chitu.distributed.infiniband import auto_set_ib_envs
 from chitu.hybrid_device import CPUParameter
 from chitu.models.registry import ModelType, get_model_class
+from chitu.native_layout import init_native_layout
+from chitu.native_layout.base import TensorWithNativeLayout
+from chitu.native_layout.npu import NpuFractalNzTensor, NpuFractalZnTensor
 from chitu.quantization import (
     QuantizationRegistry,
     QuantizedMoeExpertsBase,
@@ -109,7 +111,6 @@ class Backend:
     # ---
     use_gloo = True
     group_gloo = None
-    pp_stage = None
     pp_end_stage = None
     pp_main_rank = None
 
@@ -284,33 +285,31 @@ class Backend:
         non_expert_data_parallel_size = args.infer.dp_size
         expert_parallel_size = args.infer.ep_size
         expert_tensor_parallel_size = args.infer.etp_size
-        prefill_context_parallel_size = getattr(args.infer, "pcp_size", 1)
+        prefill_context_parallel_size = args.infer.pcp_size
         global_rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
 
-        # CP mode overrides: CP replaces TP as intra-node parallel dimension
-        if prefill_context_parallel_size > 1:
-            assert (
-                tensor_parallel_size == 1
-            ), "CP and TP are currently incompatible; set tp_size=1 when pcp_size>1"
-            expert_tensor_parallel_size = (
-                1
-                if expert_tensor_parallel_size is None
-                else expert_tensor_parallel_size
+        if prefill_context_parallel_size > 1 and non_expert_data_parallel_size > 1:
+            raise ValueError(
+                "infer.pcp_size > 1 cannot be used with infer.dp_size > 1 yet. "
+                "Prefill CP currently uses the MoE allgather dispatcher group slot, "
+                "so it cannot also express attention DP allgather."
             )
-        else:
-            if expert_tensor_parallel_size is None:
-                assert (
-                    tensor_parallel_size
-                    * non_expert_data_parallel_size
-                    % expert_parallel_size
-                    == 0
-                )
-                expert_tensor_parallel_size = (
-                    tensor_parallel_size
-                    * non_expert_data_parallel_size
-                    // expert_parallel_size
-                )
+
+        if expert_tensor_parallel_size is None:
+            assert (
+                tensor_parallel_size
+                * non_expert_data_parallel_size
+                * prefill_context_parallel_size
+                % expert_parallel_size
+                == 0
+            )
+            expert_tensor_parallel_size = (
+                tensor_parallel_size
+                * prefill_context_parallel_size
+                * non_expert_data_parallel_size
+                // expert_parallel_size
+            )
         embed_tokens_lm_head_tp_size = int(args.infer.embed_tokens_lm_head_tp_size)
         if tensor_parallel_size > 1:
             assert (
@@ -325,20 +324,17 @@ class Backend:
                 embed_tokens_lm_head_tp_size == 1
             ), "embed_tokens_lm_head_tp_size must be 1 when tensor_parallel_size == 1 and non_expert_data_parallel_size == 1"
 
-        effective_tp_size = (
-            prefill_context_parallel_size
-            if prefill_context_parallel_size > 1
-            else tensor_parallel_size
-        )
         if (
             world_size
-            != effective_tp_size
+            != tensor_parallel_size
+            * prefill_context_parallel_size
             * non_expert_data_parallel_size
             * pipeline_parallel_size
         ):
             raise ValueError(
                 f"Inconsistent parallelism: world_size({world_size}) should be equal to "
-                f"effective_tp_size({effective_tp_size}) "
+                f"tensor_parallel_size({tensor_parallel_size}) "
+                f"* prefill_context_parallel_size({prefill_context_parallel_size}) "
                 f"* non_expert_data_parallel_size({non_expert_data_parallel_size}) "
                 f"* pipeline_parallel_size({pipeline_parallel_size}) "
             )
@@ -640,6 +636,32 @@ class Backend:
                         m._buffers[key] = m._buffers[key].contiguous()
 
     @staticmethod
+    def _create_empty_model(model: torch.nn.Module, skip_preprocess: bool):
+        if skip_preprocess:
+            model.to_empty(device=torch.cuda.current_device())
+            for p in model.parameters():
+                # NPU format (FRACTAL_NZ / FRACTAL_ZN) cannot exist on
+                # meta or CPU tensors — convert_from on meta only
+                # produces a stub (ND format).  After to_empty we have
+                # real NPU memory, so re-run convert_from to apply the
+                # hardware format cast.
+                if NpuFractalNzTensor.check_tensor(p):
+                    p.data = NpuFractalNzTensor.convert_from(p.data).layout_tensor
+                elif NpuFractalZnTensor.check_tensor(p):
+                    p.data = NpuFractalZnTensor.convert_from(p.data).layout_tensor
+        else:
+            state_dict = {}
+            for name, param in model.named_parameters():
+                if isinstance(param, TensorWithNativeLayout):
+                    t = param.native_layout
+                    state_dict[name] = torch.empty(
+                        t.state_dict_shape, dtype=t.state_dict_dtype
+                    )
+                else:
+                    state_dict[name] = torch.empty(param.shape, dtype=param.dtype)
+            model.load_state_dict(state_dict, assign=True)
+
+    @staticmethod
     def _build_and_setup_model(args, attn_backend):
         """
         Build model architecture, load checkpoints, and apply quantization.
@@ -653,16 +675,14 @@ class Backend:
         """
         Backend.args = args
 
-        if not args.debug.skip_model_load:
-            # Build the model. Don't allocate memory yet.
-            with torch.device("meta"):
-                model = Backend._build_model_architecture(args, attn_backend)
-            # Load model parameters
-            Backend._load_checkpoint(model, args)
-
-        else:
-            # Use initialized weights
+        with torch.device("meta"):
             model = Backend._build_model_architecture(args, attn_backend)
+            init_native_layout(model)
+
+        if args.debug.skip_model_load:
+            Backend._create_empty_model(model, args.skip_preprocess)
+        else:
+            Backend._load_checkpoint(model, args)
 
         # Move model to appropriate device
         model.apply(Backend._move_one_module_to_device)
