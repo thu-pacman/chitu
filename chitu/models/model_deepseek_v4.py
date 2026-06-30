@@ -49,6 +49,7 @@ from chitu.ops.hadamard import hadamard_transform
 
 from chitu.ops.deepseek_compressor import (
     build_compress_metadata,
+    build_compress_metadata_from_tensors,
     gather_pending_and_new as _gather_pending_and_new_torch,
     compress_hca as _compress_hca_torch,
     compress_csa as _compress_csa_torch,
@@ -476,27 +477,158 @@ def get_chunked_prefill_topk_idxs_v4(
         topk_length = win_count.int()
         return win_idxs.int(), topk_length
 
-    comp_cols = torch.arange(max_c, device=device)  # [max_c]
-    comp_idxs = torch.where(
-        comp_cols.unsqueeze(0) < comp_count.unsqueeze(1),
-        comp_cols + compress_offset,
-        torch.full((seqlen, max_c), -1, device=device, dtype=torch.long),
-    )  # [seqlen, max_c]
-
     # left-pack: window valid | compress valid | -1 padding
     max_topk = window_size + max_c
-    indices = torch.full((seqlen, max_topk), -1, device=device, dtype=torch.long)
-    # window entries are already left-packed (valid from col 0 up to win_count[j]-1)
-    indices[:, :window_size] = win_idxs
-    # shift compress entries left by (window_size - win_count) to close the gap
-    for j in range(seqlen):
-        wc = int(win_count[j].item())
-        cc = int(comp_count[j].item())
-        if cc > 0:
-            indices[j, wc : wc + cc] = comp_idxs[j, :cc]
+    out_cols = torch.arange(max_topk, device=device)
+    win_valid = out_cols.unsqueeze(0) < win_count.unsqueeze(1)
+    comp_offsets = out_cols.unsqueeze(0) - win_count.unsqueeze(1)
+    comp_valid = (comp_offsets >= 0) & (comp_offsets < comp_count.unsqueeze(1))
+    window_values = window_start.unsqueeze(1) + out_cols.unsqueeze(0)
+    comp_values = comp_offsets + compress_offset
+    indices = torch.where(
+        win_valid,
+        window_values,
+        torch.where(
+            comp_valid,
+            comp_values,
+            torch.full((seqlen, max_topk), -1, device=device, dtype=torch.long),
+        ),
+    )
 
     topk_length = (win_count + comp_count).int()
     return indices.int(), topk_length
+
+
+def get_chunked_prefill_topk_idxs_v4_flat(
+    window_size: int,
+    start_positions: torch.Tensor,
+    current_req_ids: torch.Tensor,
+    current_token_offsets: torch.Tensor,
+    sliding_lens: torch.Tensor,
+    *,
+    ratio: int = 0,
+) -> torch.Tensor:
+    """Build prefill topk indices for a flat ragged batch."""
+    device = current_req_ids.device
+    total_q = int(current_req_ids.numel())
+    if total_q == 0:
+        return torch.empty(0, window_size, device=device, dtype=torch.int32)
+
+    start_positions = start_positions.to(device=device, dtype=torch.long)
+    current_req_ids = current_req_ids.to(device=device, dtype=torch.long)
+    current_token_offsets = current_token_offsets.to(device=device, dtype=torch.long)
+    sliding_lens = sliding_lens.to(device=device, dtype=torch.long)
+
+    req_start_positions = start_positions.index_select(0, current_req_ids)
+    history_lens = torch.minimum(
+        req_start_positions,
+        torch.full_like(req_start_positions, window_size),
+    )
+    base = current_token_offsets + history_lens
+    window_start = (base - window_size + 1).clamp(min=0)
+    win_count = (base - window_start + 1).clamp(max=window_size)
+
+    if ratio == 0:
+        out_cols = torch.arange(window_size, device=device, dtype=torch.long)
+        window_values = window_start.unsqueeze(1) + out_cols.unsqueeze(0)
+        return torch.where(
+            out_cols.unsqueeze(0) < win_count.unsqueeze(1),
+            window_values,
+            torch.full((total_q, window_size), -1, device=device, dtype=torch.long),
+        ).int()
+
+    abs_positions = req_start_positions + current_token_offsets
+    comp_count = (abs_positions // ratio).clamp(min=0)
+    max_c = int(comp_count.max().item()) if comp_count.numel() else 0
+    if max_c == 0:
+        out_cols = torch.arange(window_size, device=device, dtype=torch.long)
+        window_values = window_start.unsqueeze(1) + out_cols.unsqueeze(0)
+        return torch.where(
+            out_cols.unsqueeze(0) < win_count.unsqueeze(1),
+            window_values,
+            torch.full((total_q, window_size), -1, device=device, dtype=torch.long),
+        ).int()
+
+    max_topk = window_size + max_c
+    out_cols = torch.arange(max_topk, device=device, dtype=torch.long)
+    win_valid = out_cols.unsqueeze(0) < win_count.unsqueeze(1)
+    comp_offsets = out_cols.unsqueeze(0) - win_count.unsqueeze(1)
+    comp_valid = (comp_offsets >= 0) & (comp_offsets < comp_count.unsqueeze(1))
+    window_values = window_start.unsqueeze(1) + out_cols.unsqueeze(0)
+    comp_values = comp_offsets + sliding_lens.index_select(
+        0, current_req_ids
+    ).unsqueeze(1)
+    return torch.where(
+        win_valid,
+        window_values,
+        torch.where(
+            comp_valid,
+            comp_values,
+            torch.full((total_q, max_topk), -1, device=device, dtype=torch.long),
+        ),
+    ).int()
+
+
+def left_pack_prefill_window_and_compress_topk_v4_flat(
+    window_size: int,
+    start_positions: torch.Tensor,
+    current_req_ids: torch.Tensor,
+    current_token_offsets: torch.Tensor,
+    sliding_lens: torch.Tensor,
+    compress_topk: torch.Tensor,
+) -> torch.Tensor:
+    device = current_req_ids.device
+    total_q = int(current_req_ids.numel())
+    n_comp = int(compress_topk.size(-1)) if compress_topk.ndim > 1 else 0
+    if total_q == 0:
+        return torch.empty(0, window_size + n_comp, device=device, dtype=torch.int32)
+    if n_comp == 0:
+        return get_chunked_prefill_topk_idxs_v4_flat(
+            window_size,
+            start_positions,
+            current_req_ids,
+            current_token_offsets,
+            sliding_lens,
+            ratio=0,
+        )
+
+    start_positions = start_positions.to(device=device, dtype=torch.long)
+    current_req_ids = current_req_ids.to(device=device, dtype=torch.long)
+    current_token_offsets = current_token_offsets.to(device=device, dtype=torch.long)
+    sliding_lens = sliding_lens.to(device=device, dtype=torch.long)
+    compress_topk = compress_topk.to(device=device, dtype=torch.long)
+
+    req_start_positions = start_positions.index_select(0, current_req_ids)
+    history_lens = torch.minimum(
+        req_start_positions,
+        torch.full_like(req_start_positions, window_size),
+    )
+    base = current_token_offsets + history_lens
+    window_start = (base - window_size + 1).clamp(min=0)
+    win_count = (base - window_start + 1).clamp(max=window_size)
+
+    max_topk = window_size + n_comp
+    out_cols = torch.arange(max_topk, device=device, dtype=torch.long)
+    win_valid = out_cols.unsqueeze(0) < win_count.unsqueeze(1)
+    comp_offsets = out_cols.unsqueeze(0) - win_count.unsqueeze(1)
+    comp_offsets_clamped = comp_offsets.clamp(min=0, max=n_comp - 1)
+    shifted_comp = torch.where(
+        compress_topk >= 0,
+        compress_topk + sliding_lens.index_select(0, current_req_ids).unsqueeze(1),
+        compress_topk,
+    )
+    comp_values = shifted_comp.gather(1, comp_offsets_clamped)
+    comp_valid = (comp_offsets >= 0) & (comp_offsets < n_comp) & (comp_values >= 0)
+    window_values = window_start.unsqueeze(1) + out_cols.unsqueeze(0)
+    return torch.where(
+        win_valid,
+        window_values,
+        torch.where(
+            comp_valid,
+            comp_values,
+            torch.full((total_q, max_topk), -1, device=device, dtype=torch.long),
+        ),
+    ).int()
 
 
 class CompressorDeepSeekV4(nn.Module):
@@ -613,7 +745,7 @@ class CompressorDeepSeekV4(nn.Module):
         n = int(seqlens.numel())
 
         if seqlens_list is None:
-            total_tokens = int(seqlens.sum().item()) if n else 0
+            total_tokens = x.size(0)
         else:
             seqlens_list = [int(v) for v in seqlens_list]
             if len(seqlens_list) != n:
@@ -669,26 +801,31 @@ class CompressorDeepSeekV4(nn.Module):
         # pending tokens live at [ratio:ratio+pending_len]
         pending_offset = ratio if overlap else 0
 
-        if seqlens_list is None:
-            seqlens_list = [int(v) for v in seqlens.tolist()]
+        if seqlens_list is None and start_positions_list is None:
+            meta = build_compress_metadata_from_tensors(
+                start_positions, seqlens, ratio, device
+            )
         else:
-            seqlens_list = [int(v) for v in seqlens_list]
-            if len(seqlens_list) != n:
-                raise ValueError(
-                    f"seqlens_list length {len(seqlens_list)} != tensor length {n}"
-                )
-        if start_positions_list is None:
-            start_positions_list = [int(v) for v in start_positions.tolist()]
-        else:
-            start_positions_list = [int(v) for v in start_positions_list]
-            if len(start_positions_list) != n:
-                raise ValueError(
-                    "start_positions_list length "
-                    f"{len(start_positions_list)} != tensor length {n}"
-                )
-        meta = build_compress_metadata(
-            start_positions_list, seqlens_list, ratio, device
-        )
+            if seqlens_list is None:
+                seqlens_list = [int(v) for v in seqlens.tolist()]
+            else:
+                seqlens_list = [int(v) for v in seqlens_list]
+                if len(seqlens_list) != n:
+                    raise ValueError(
+                        f"seqlens_list length {len(seqlens_list)} != tensor length {n}"
+                    )
+            if start_positions_list is None:
+                start_positions_list = [int(v) for v in start_positions.tolist()]
+            else:
+                start_positions_list = [int(v) for v in start_positions_list]
+                if len(start_positions_list) != n:
+                    raise ValueError(
+                        "start_positions_list length "
+                        f"{len(start_positions_list)} != tensor length {n}"
+                    )
+            meta = build_compress_metadata(
+                start_positions_list, seqlens_list, ratio, device
+            )
         total_eff = meta["total_eff"]
         total_groups = meta["total_groups"]
         D = kv_cat.shape[1]  # coff * head_dim
@@ -732,9 +869,7 @@ class CompressorDeepSeekV4(nn.Module):
                 ratio,
             )
         else:
-            n_groups_list_t = torch.tensor(
-                meta["n_groups_list"], device=device, dtype=torch.int32
-            )
+            n_groups_list_t = meta["cu_groups"][1:] - meta["cu_groups"][:-1]
             _compress_csa_backend(
                 flat_kv,
                 flat_score,
@@ -774,12 +909,17 @@ class CompressorDeepSeekV4(nn.Module):
 
         out_kv_typed = self.norm(out_kv.to(dtype), compute_dtype=out_kv.dtype)
 
-        pending_lens_cpu = [sp % ratio for sp in start_positions_list]
-        group_abs_positions = []
-        for i, ng in enumerate(meta["n_groups_list"]):
-            eff_start = start_positions_list[i] - pending_lens_cpu[i]
-            for g in range(ng):
-                group_abs_positions.append(eff_start + g * ratio)
+        group_to_req = meta["group_to_req"].to(torch.long)
+        group_offsets = torch.arange(
+            total_groups, device=device, dtype=torch.long
+        ) - meta["cu_groups"].to(torch.long).index_select(0, group_to_req)
+        group_start_positions = start_positions.index_select(0, group_to_req)
+        group_pending_lens = (
+            meta["pending_lens"].to(torch.long).index_select(0, group_to_req)
+        )
+        group_abs_positions = (
+            group_start_positions - group_pending_lens + group_offsets * ratio
+        )
         freqs_cis_all = self.freqs_cis[group_abs_positions]
         out_kv_b = out_kv_typed.unsqueeze(0)
         apply_rotary_emb_v4(out_kv_b, freqs_cis_all, rope_dim=rope_dim)
@@ -791,19 +931,7 @@ class CompressorDeepSeekV4(nn.Module):
             )
 
         # ---- final cache write: shared for torch and Triton backends ----
-        positions = torch.empty(total_groups, device=device, dtype=torch.long)
-        offset = 0
-        for i, ng in enumerate(meta["n_groups_list"]):
-            if ng > 0:
-                start_pos_div_ratio_i = start_positions_list[i] // ratio
-                positions[offset : offset + ng] = torch.arange(
-                    start_pos_div_ratio_i,
-                    start_pos_div_ratio_i + ng,
-                    device=device,
-                    dtype=torch.long,
-                )
-            offset += ng
-        group_to_req = meta["group_to_req"].to(torch.long)
+        positions = group_start_positions // ratio + group_offsets
         self._write_kv_cache_flat(
             cache_slots[group_to_req],
             positions,
@@ -860,14 +988,7 @@ class CompressorDeepSeekV4(nn.Module):
         kv_cat = self.wkv(x_float)
         score_cat = self.wgate(x_float)
 
-        # The fast path relies on CPU-side decode metadata that the caller
-        # already owns. Without it, use the shared fallback instead of adding a
-        # hidden tensor-to-Python sync here.
-        if (
-            start_positions_list is None
-            or q_len > ratio
-            or not _TRITON_COMPRESS_AVAILABLE
-        ):
+        if q_len > ratio or not _TRITON_COMPRESS_AVAILABLE:
             seqlens = torch.full((bsz,), q_len, device=device, dtype=torch.long)
             return self._forward_prefill_backend(
                 x_flat,
@@ -877,27 +998,12 @@ class CompressorDeepSeekV4(nn.Module):
                 cache_seq_ids,
                 kv_cat,
                 score_cat,
-                seqlens_list=[q_len] * bsz,
-                start_positions_list=start_positions_list,
             )
 
-        start_positions_list = [int(v) for v in start_positions_list]
-        if len(start_positions_list) != bsz:
-            raise ValueError(
-                "start_positions_list length "
-                f"{len(start_positions_list)} != batch size {bsz}"
-            )
-
-        compressed_reqs = [
-            i
-            for i, sp in enumerate(start_positions_list)
-            if sp % ratio + q_len >= ratio
-        ]
-        compressed_idx = (
-            torch.tensor(compressed_reqs, device=device, dtype=torch.long)
-            if compressed_reqs
-            else None
-        )
+        compressed_mask = start_positions.remainder(ratio) + q_len >= ratio
+        compressed_idx = compressed_mask.nonzero(as_tuple=True)[0]
+        n_compressed = int(compressed_idx.numel())
+        compressed_idx_or_none = compressed_idx if n_compressed > 0 else None
         if cache_slots_i32 is None:
             cache_slots_i32 = cache_slots.to(device=device, dtype=torch.int32)
 
@@ -917,9 +1023,9 @@ class CompressorDeepSeekV4(nn.Module):
                 head_dim,
             )
         else:
-            if compressed_idx is not None:
+            if n_compressed > 0:
                 out_kv = torch.empty(
-                    len(compressed_reqs), head_dim, device=device, dtype=torch.float32
+                    n_compressed, head_dim, device=device, dtype=torch.float32
                 )
             else:
                 out_kv = None
@@ -930,14 +1036,14 @@ class CompressorDeepSeekV4(nn.Module):
                 self.score_state,
                 self.ape,
                 out_kv,
-                compressed_idx,
+                compressed_idx_or_none,
                 start_positions,
                 cache_slots_i32,
                 ratio,
                 q_len,
             )
 
-        if compressed_idx is None:
+        if n_compressed == 0:
             return
 
         if self.overlap:
@@ -945,13 +1051,9 @@ class CompressorDeepSeekV4(nn.Module):
         assert out_kv is not None
         out_kv_typed = self.norm(out_kv.to(dtype), compute_dtype=out_kv.dtype)
 
-        group_abs_positions = torch.tensor(
-            [
-                start_positions_list[i] - start_positions_list[i] % ratio
-                for i in compressed_reqs
-            ],
-            device=device,
-            dtype=torch.long,
+        compressed_start_positions = start_positions.index_select(0, compressed_idx)
+        group_abs_positions = (
+            compressed_start_positions - compressed_start_positions.remainder(ratio)
         )
         out_kv_b = out_kv_typed.unsqueeze(0)
         apply_rotary_emb_v4(
@@ -966,11 +1068,7 @@ class CompressorDeepSeekV4(nn.Module):
                 out_kv_typed, scale=out_kv_typed.size(-1) ** -0.5
             )
 
-        positions = torch.tensor(
-            [start_positions_list[i] // ratio for i in compressed_reqs],
-            device=device,
-            dtype=torch.long,
-        )
+        positions = compressed_start_positions // ratio
         self._write_kv_cache_flat(
             cache_slots.index_select(0, compressed_idx),
             positions,
@@ -1253,93 +1351,13 @@ class IndexerDeepSeekV4(nn.Module):
         *,
         cache_seq_ids: torch.Tensor,
     ) -> torch.Tensor:
-        bsz, seqlen, _ = x.size()
-        assert seqlen == 1
-        assert self.freqs_cis is not None
-        ratio, rope_dim = self.compress_ratio, self.rope_head_dim
-        visible_lengths = (start_positions + 1) // ratio
-        max_len = int(visible_lengths.max().item()) if visible_lengths.numel() else 0
-
-        assert self.compressor.kv_cache is not None
-        self.compressor.freqs_cis = self.freqs_cis
-        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rotary_emb_v4(q, self.freqs_cis[start_positions], rope_dim=rope_dim)
-        q = hadamard_transform(q, scale=q.size(-1) ** -0.5)
-
-        self.compressor(
+        return self.forward_decode_mtp(
             x,
+            qr,
             start_positions,
             cache_slots,
             cache_seq_ids=cache_seq_ids,
         )
-
-        if max_len == 0:
-            return torch.empty(bsz, seqlen, 0, dtype=torch.long, device=x.device)
-
-        topk = min(self.index_topk, max_len)
-        weights = self.weights_proj(x).squeeze(1) * (
-            self.softmax_scale * self.n_heads**-0.5
-        )
-        q = q.squeeze(1)
-        best_scores = x.new_full((bsz, topk), float("-inf"), dtype=torch.float32)
-        best_indices = torch.full((bsz, topk), -1, dtype=torch.long, device=x.device)
-        chunk_size = min(max_len, max(1024, self.index_topk))
-
-        for chunk_start in range(0, max_len, chunk_size):
-            active = visible_lengths > chunk_start
-            if not active.any():
-                continue
-            active_idx = active.nonzero(as_tuple=True)[0]
-            chunk_lengths = torch.minimum(
-                visible_lengths[active_idx],
-                visible_lengths.new_full(
-                    (active_idx.numel(),), chunk_start + chunk_size
-                ),
-            )
-            index_kv = self._read_kv_cache_ranges(
-                cache_slots[active_idx],
-                chunk_lengths,
-                cache_seq_ids[active_idx],
-                start_position=chunk_start,
-            )
-            block_width = index_kv.size(1)
-            if block_width == 0:
-                continue
-
-            index_score = torch.einsum("bhd,btd->bht", q[active_idx], index_kv)
-            index_score = (index_score.relu_() * weights[active_idx].unsqueeze(-1)).sum(
-                dim=1
-            )
-            if get_tp_size() > 1:
-                _all_reduce_tp(index_score)
-
-            cols = torch.arange(block_width, device=x.device, dtype=torch.long)
-            valid_widths = chunk_lengths - chunk_start
-            index_score = index_score.masked_fill(
-                cols.unsqueeze(0) >= valid_widths.unsqueeze(1),
-                float("-inf"),
-            )
-            chunk_topk = min(topk, block_width)
-            chunk_scores, chunk_indices = index_score.topk(chunk_topk, dim=-1)
-            chunk_indices = chunk_indices + chunk_start
-
-            candidate_scores = torch.cat(
-                [best_scores[active_idx], chunk_scores.float()], dim=-1
-            )
-            candidate_indices = torch.cat(
-                [best_indices[active_idx], chunk_indices], dim=-1
-            )
-            next_scores, next_order = candidate_scores.topk(topk, dim=-1)
-            best_scores[active_idx] = next_scores
-            best_indices[active_idx] = candidate_indices.gather(1, next_order)
-
-        topk_idxs = best_indices.unsqueeze(1)
-        topk_idxs = torch.where(
-            topk_idxs < visible_lengths.view(bsz, 1, 1),
-            topk_idxs,
-            -1,
-        )
-        return topk_idxs
 
     def forward_decode_mtp(
         self,
@@ -1383,20 +1401,6 @@ class IndexerDeepSeekV4(nn.Module):
         )
         q = hadamard_transform(q, scale=q.size(-1) ** -0.5)
 
-        if start_positions_list is not None:
-            start_positions_list = [int(v) for v in start_positions_list]
-            if len(start_positions_list) != bsz:
-                raise ValueError(
-                    "start_positions_list length "
-                    f"{len(start_positions_list)} != batch size {bsz}"
-                )
-            max_index_kv_len = max(
-                0,
-                max((start_pos + q_len) // ratio for start_pos in start_positions_list),
-            )
-        else:
-            max_index_kv_len = None
-
         self.compressor.forward_decode_mtp(
             x,
             start_positions,
@@ -1411,7 +1415,6 @@ class IndexerDeepSeekV4(nn.Module):
             cache_slots,
             max_visible_lengths,
             cache_seq_ids,
-            max_len=max_index_kv_len,
         )
         max_len = index_kv.size(1)
         if max_len == 0:
@@ -1438,6 +1441,111 @@ class IndexerDeepSeekV4(nn.Module):
             -1,
         )
         return topk_idxs
+
+    def forward_prefill(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        seqlens: torch.Tensor,
+        start_positions: torch.Tensor,
+        cache_slots: torch.Tensor,
+        *,
+        cache_seq_ids: torch.Tensor,
+        current_req_ids: torch.Tensor,
+        current_token_offsets: torch.Tensor,
+        seqlens_list: Optional[list[int]] = None,
+        start_positions_list: Optional[list[int]] = None,
+    ) -> torch.Tensor:
+        assert self.freqs_cis is not None
+        assert self.compressor.kv_cache is not None
+        device = x.device
+        ratio, rope_dim = self.compress_ratio, self.rope_head_dim
+        seqlens = seqlens.to(device=device, dtype=torch.long)
+        start_positions = start_positions.to(device=device, dtype=torch.long)
+        cache_slots = cache_slots.to(device=device, dtype=torch.long)
+        cache_seq_ids = cache_seq_ids.to(device=device, dtype=torch.long)
+        current_req_ids = current_req_ids.to(device=device, dtype=torch.long)
+        current_token_offsets = current_token_offsets.to(
+            device=device, dtype=torch.long
+        )
+
+        total_q = int(current_req_ids.numel())
+        if total_q == 0:
+            return torch.empty(0, 0, dtype=torch.long, device=device)
+        if x.size(0) != total_q or qr.size(0) != total_q:
+            raise ValueError(
+                "forward_prefill expected flat x/qr first dim "
+                f"{total_q}, got x={x.size(0)} qr={qr.size(0)}"
+            )
+
+        query_positions = (
+            start_positions.index_select(0, current_req_ids) + current_token_offsets
+        )
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        q_batched = q.unsqueeze(0)
+        apply_rotary_emb_v4(
+            q_batched,
+            self.freqs_cis[query_positions],
+            rope_dim=rope_dim,
+        )
+        q = hadamard_transform(q_batched, scale=q_batched.size(-1) ** -0.5).squeeze(0)
+
+        self.compressor._forward_prefill(
+            x,
+            seqlens,
+            start_positions,
+            cache_slots,
+            cache_seq_ids,
+            seqlens_list=seqlens_list,
+            start_positions_list=start_positions_list,
+        )
+
+        max_visible_lengths = torch.div(
+            start_positions + seqlens,
+            ratio,
+            rounding_mode="floor",
+        )
+        index_kv = self._read_kv_cache_ranges(
+            cache_slots,
+            max_visible_lengths,
+            cache_seq_ids,
+        )
+        max_len = index_kv.size(1)
+        if max_len == 0:
+            return torch.empty(total_q, 0, dtype=torch.long, device=device)
+
+        topk = min(self.index_topk, max_len)
+        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+        max_seqlen = int(seqlens.max().item()) if seqlens.numel() else 0
+        bsz = int(seqlens.numel())
+        q_padded = q.new_zeros((bsz, max_seqlen, self.n_local_heads, self.head_dim))
+        weights_padded = weights.new_zeros((bsz, max_seqlen, weights.size(-1)))
+        q_padded[current_req_ids, current_token_offsets] = q
+        weights_padded[current_req_ids, current_token_offsets] = weights
+        index_score = torch.einsum("bshd,btd->bsht", q_padded, index_kv)
+        index_score = (index_score.relu_() * weights_padded.unsqueeze(-1)).sum(dim=2)
+        if get_tp_size() > 1:
+            _all_reduce_tp(index_score)
+
+        token_cols = torch.arange(max_seqlen, device=device, dtype=torch.long)
+        token_valid = token_cols.unsqueeze(0) < seqlens.unsqueeze(1)
+        query_positions_padded = start_positions.unsqueeze(1) + token_cols.unsqueeze(0)
+        visible_lengths = torch.div(
+            query_positions_padded + 1, ratio, rounding_mode="floor"
+        )
+        cols = torch.arange(max_len, device=device, dtype=torch.long)
+        index_score = index_score.masked_fill(
+            (cols.view(1, 1, -1) >= visible_lengths.unsqueeze(-1))
+            | ~token_valid.unsqueeze(-1),
+            float("-inf"),
+        )
+        topk_idxs = index_score.topk(topk, dim=-1)[1]
+        topk_idxs = torch.where(
+            topk_idxs < visible_lengths.unsqueeze(-1),
+            topk_idxs,
+            -1,
+        )
+        return topk_idxs[current_req_ids, current_token_offsets]
 
     def forward(
         self,
@@ -1717,152 +1825,51 @@ class AttentionDeepSeekV4(Attention):
             if not callable(get_slots):
                 raise RuntimeError("DeepSeek-V4 requires its KV cache provider")
             cache_slots = get_slots(seq_len_delta)
-        outputs: list[Optional[torch.Tensor]] = [None] * seq_len_delta.batch_size
-        decode_indices = []
-        decode_begins = []
-        decode_seqlens = []
-        decode_start_positions = []
-        decode_cache_slots = []
-        prefill_indices = []
-        prefill_begins = []
-        prefill_seqlens = []
-        prefill_start_positions = []
-        prefill_cache_slots = []
-        prefill_cache_seq_ids = []
-        prefix_lens = seq_len_delta.delta_prefix_lens_list
-        old_lens = seq_len_delta.old.lens_list
         wo_a = self._dequant_wo_a().view(self.n_local_groups, self.o_lora_rank, -1)
-        for i in range(seq_len_delta.batch_size):
-            begin, end = prefix_lens[i], prefix_lens[i + 1]
-            if begin == end:
-                continue
-            start_pos = int(old_lens[i])
-            cache_slot = int(cache_slots[i])
-            seqlen = end - begin
-            if seq_len_delta.is_decode_stage and start_pos > 0:
-                decode_indices.append(i)
-                decode_begins.append(begin)
-                decode_seqlens.append(seqlen)
-                decode_start_positions.append(start_pos)
-                decode_cache_slots.append(cache_slot)
-                continue
-            prefill_indices.append(i)
-            prefill_begins.append(begin)
-            prefill_seqlens.append(seqlen)
-            prefill_start_positions.append(start_pos)
-            prefill_cache_slots.append(cache_slot)
-            prefill_cache_seq_ids.append(i)
-        if prefill_indices:
-            prefill_device = x.device
-            prefill_seqlens_t = torch.tensor(
-                prefill_seqlens, device=prefill_device, dtype=torch.long
-            )
-            prefill_start_positions_t = torch.tensor(
-                prefill_start_positions, device=prefill_device, dtype=torch.long
-            )
-            prefill_cache_slots_t = torch.tensor(
-                prefill_cache_slots, device=prefill_device, dtype=torch.long
-            )
-            prefill_cache_seq_ids_t = torch.tensor(
-                prefill_cache_seq_ids, device=prefill_device, dtype=torch.long
-            )
-            total_prefill = sum(prefill_seqlens)
-            expected_begin = prefill_begins[0]
-            prefill_is_contiguous = True
-            for begin, seqlen in zip(prefill_begins, prefill_seqlens):
-                if begin != expected_begin:
-                    prefill_is_contiguous = False
-                    break
-                expected_begin += seqlen
-            if prefill_is_contiguous:
-                prefill_x = x[prefill_begins[0] : prefill_begins[0] + total_prefill]
-            else:
-                prefill_offsets = torch.empty(
-                    len(prefill_seqlens) + 1, device=prefill_device, dtype=torch.long
-                )
-                prefill_offsets[0] = 0
-                prefill_offsets[1:] = torch.cumsum(prefill_seqlens_t, dim=0)
-                prefill_req_ids = torch.repeat_interleave(
-                    torch.arange(
-                        len(prefill_seqlens), device=prefill_device, dtype=torch.long
-                    ),
-                    prefill_seqlens_t,
-                    output_size=total_prefill,
-                )
-                prefill_token_offsets = (
-                    torch.arange(total_prefill, device=prefill_device, dtype=torch.long)
-                    - prefill_offsets[prefill_req_ids]
-                )
-                prefill_begins_t = torch.tensor(
-                    prefill_begins, device=prefill_device, dtype=torch.long
-                )
-                prefill_x = x[prefill_begins_t[prefill_req_ids] + prefill_token_offsets]
-            prefill_outputs = self._forward_prefill(
-                prefill_x,
-                prefill_seqlens_t,
-                prefill_start_positions_t,
-                prefill_cache_slots_t,
-                prefill_cache_seq_ids_t,
-                wo_a,
-            )
-            for out_idx, batch_idx in enumerate(prefill_indices):
-                outputs[batch_idx] = prefill_outputs[out_idx]
-        if decode_indices:
-            decode_device = x.device
-            decode_seqlens_t = torch.tensor(
-                decode_seqlens, device=decode_device, dtype=torch.long
-            )
-            total_decode = sum(decode_seqlens)
-            expected_begin = decode_begins[0]
-            decode_is_contiguous = True
-            for begin, seqlen in zip(decode_begins, decode_seqlens):
-                if begin != expected_begin:
-                    decode_is_contiguous = False
-                    break
-                expected_begin += seqlen
-            if decode_is_contiguous:
-                decode_x = x[decode_begins[0] : decode_begins[0] + total_decode]
-            else:
-                decode_offsets = torch.empty(
-                    len(decode_seqlens) + 1, device=decode_device, dtype=torch.long
-                )
-                decode_offsets[0] = 0
-                decode_offsets[1:] = torch.cumsum(decode_seqlens_t, dim=0)
-                decode_req_ids = torch.repeat_interleave(
-                    torch.arange(
-                        len(decode_seqlens), device=decode_device, dtype=torch.long
-                    ),
-                    decode_seqlens_t,
-                    output_size=total_decode,
-                )
-                decode_token_offsets = (
-                    torch.arange(total_decode, device=decode_device, dtype=torch.long)
-                    - decode_offsets[decode_req_ids]
-                )
-                decode_begins_t = torch.tensor(
-                    decode_begins, device=decode_device, dtype=torch.long
-                )
-                decode_x = x[decode_begins_t[decode_req_ids] + decode_token_offsets]
-            decode_outputs = self._forward_decode(
-                decode_x,
-                decode_seqlens_t,
-                torch.tensor(
-                    decode_start_positions, device=decode_device, dtype=torch.long
-                ),
-                torch.tensor(
-                    decode_cache_slots, device=decode_device, dtype=torch.long
-                ),
-                torch.tensor(decode_indices, device=decode_device, dtype=torch.long),
-                wo_a,
-                seqlens_list=decode_seqlens,
-                start_positions_list=decode_start_positions,
-            )
-            for out_idx, output_index in enumerate(decode_indices):
-                outputs[output_index] = decode_outputs[out_idx]
-        ordered_outputs = [output for output in outputs if output is not None]
-        if not ordered_outputs:
+        if seq_len_delta.batch_size == 0:
             return x.new_empty((0, self.dim))
-        return torch.cat(ordered_outputs, dim=0)
+
+        device = x.device
+        seqlens = seq_len_delta.delta_lens_tensor_device.to(
+            device=device, dtype=torch.long
+        )
+        start_positions = seq_len_delta.old.lens_tensor_device.to(
+            device=device, dtype=torch.long
+        )
+        cache_seq_ids = torch.arange(
+            seq_len_delta.batch_size, device=device, dtype=torch.long
+        )
+        if self._uses_skew_kv_cache():
+            cache_slots_t = cache_seq_ids
+        elif isinstance(cache_slots, torch.Tensor):
+            cache_slots_t = cache_slots.to(device=device, dtype=torch.long)
+        else:
+            cache_slots_t = torch.as_tensor(
+                cache_slots, device=device, dtype=torch.long
+            )
+
+        if seq_len_delta.is_decode_stage:
+            return self._forward_decode(
+                x,
+                seqlens,
+                start_positions,
+                cache_slots_t,
+                cache_seq_ids,
+                wo_a,
+                seqlens_list=seq_len_delta.delta_lens_list,
+                start_positions_list=seq_len_delta.old.lens_list,
+                return_tensor=True,
+            )
+
+        return self._forward_prefill(
+            x,
+            seqlens,
+            start_positions,
+            cache_slots_t,
+            cache_seq_ids,
+            wo_a,
+            return_tensor=True,
+        )
 
     def _forward_decode(
         self,
@@ -1875,7 +1882,8 @@ class AttentionDeepSeekV4(Attention):
         *,
         seqlens_list: Optional[list[int]] = None,
         start_positions_list: Optional[list[int]] = None,
-    ) -> list[torch.Tensor]:
+        return_tensor: bool = False,
+    ) -> list[torch.Tensor] | torch.Tensor:
         device = x.device
         if seqlens.device != device or seqlens.dtype != torch.long:
             seqlens = seqlens.to(device=device, dtype=torch.long)
@@ -1887,9 +1895,11 @@ class AttentionDeepSeekV4(Attention):
             cache_seq_ids = cache_seq_ids.to(device=device, dtype=torch.long)
         n = int(seqlens.numel())
         if n == 0:
+            if return_tensor:
+                return x.new_empty((0, self.dim))
             return []
         if seqlens_list is None:
-            total_q = int(seqlens.sum().item())
+            total_q = x.size(0)
             seqlens_list = [int(v) for v in seqlens.tolist()]
         else:
             seqlens_list = [int(v) for v in seqlens_list]
@@ -1898,6 +1908,10 @@ class AttentionDeepSeekV4(Attention):
                     f"seqlens_list length {len(seqlens_list)} != tensor length {n}"
                 )
             total_q = sum(seqlens_list)
+        if total_q == 0:
+            if return_tensor:
+                return x.new_empty((0, self.dim))
+            return []
         assert x.size(0) == total_q
 
         if all(seqlen == 1 for seqlen in seqlens_list):
@@ -1908,6 +1922,8 @@ class AttentionDeepSeekV4(Attention):
                 cache_seq_ids,
                 wo_a,
             )
+            if return_tensor:
+                return out
             return list(out.split(seqlens_list, dim=0))
 
         return self._forward_decode_multi(
@@ -1919,6 +1935,7 @@ class AttentionDeepSeekV4(Attention):
             wo_a,
             seqlens_list=seqlens_list,
             start_positions_list=start_positions_list,
+            return_tensor=return_tensor,
         )
 
     def _forward_decode_single(
@@ -2011,7 +2028,8 @@ class AttentionDeepSeekV4(Attention):
         *,
         seqlens_list: Optional[list[int]] = None,
         start_positions_list: Optional[list[int]] = None,
-    ) -> list[torch.Tensor]:
+        return_tensor: bool = False,
+    ) -> list[torch.Tensor] | torch.Tensor:
         device = x.device
         seqlens = seqlens.to(device=device, dtype=torch.long)
         start_positions = start_positions.to(device=device, dtype=torch.long)
@@ -2044,6 +2062,7 @@ class AttentionDeepSeekV4(Attention):
                 cache_slots,
                 cache_seq_ids,
                 wo_a,
+                return_tensor=return_tensor,
             )
 
         bsz = len(seqlens_list)
@@ -2103,11 +2122,6 @@ class AttentionDeepSeekV4(Attention):
                     ratio,
                     start_positions,
                     q_len,
-                    max_len=(
-                        max((sp + q_len) // ratio for sp in start_positions_list)
-                        if start_positions_list is not None
-                        else None
-                    ),
                 )
 
         assert self.slidingwindow_cache_accessor is not None
@@ -2156,6 +2170,8 @@ class AttentionDeepSeekV4(Attention):
         wo_a_typed = wo_a if wo_a.dtype == outputs.dtype else wo_a.to(outputs.dtype)
         outputs = torch.einsum("sgd,grd->sgr", outputs, wo_a_typed)
         outputs = self.wo_b(outputs.flatten(1))
+        if return_tensor:
+            return outputs
         return list(outputs.split(seqlens_list, dim=0))
 
     def _forward_prefill(
@@ -2166,7 +2182,9 @@ class AttentionDeepSeekV4(Attention):
         cache_slots: torch.Tensor,
         cache_seq_ids: torch.Tensor,
         wo_a: torch.Tensor,
-    ) -> list[torch.Tensor]:
+        *,
+        return_tensor: bool = False,
+    ) -> list[torch.Tensor] | torch.Tensor:
         """Prefill via one packed attn_backend.csa_hca call.
 
         Handles both first-chunk (start_pos=0) and continuation chunks
@@ -2178,69 +2196,45 @@ class AttentionDeepSeekV4(Attention):
         start_positions = start_positions.to(device=device, dtype=torch.long)
         cache_slots = cache_slots.to(device=device, dtype=torch.long)
         cache_seq_ids = cache_seq_ids.to(device=device, dtype=torch.long)
+        indexer = getattr(self, "indexer", None)
 
         if ratio:
             assert self.compressor.kv_cache is not None
             self.compressor.freqs_cis = self.freqs_cis
-            if getattr(self, "indexer", None) is not None:
+            if indexer is not None:
                 assert self.indexer.kv_cache.numel() > 0
                 self.indexer.freqs_cis = self.freqs_cis
 
         n = int(seqlens.numel())
-        total_q = int(seqlens.sum().item()) if n else 0
-        assert x.size(0) == total_q
-        seqlens_list = [int(v) for v in seqlens.tolist()]
-        start_positions_list = [int(v) for v in start_positions.tolist()]
-        cache_slots_list = [int(v) for v in cache_slots.tolist()]
-        cache_seq_ids_list = [int(v) for v in cache_seq_ids.tolist()]
-
-        def _left_pack_window_and_compress_topk(
-            window_topk: torch.Tensor,
-            window_lengths: torch.Tensor,
-            compress_topk: torch.Tensor,
-            split_offset: int,
-        ) -> torch.Tensor:
-            if compress_topk.numel() == 0 or compress_topk.size(-1) == 0:
-                return window_topk
-            shifted_compress_topk = torch.where(
-                compress_topk >= 0,
-                compress_topk + split_offset,
-                compress_topk,
-            )
-            combined = window_topk.new_full(
-                (
-                    window_topk.size(0),
-                    window_topk.size(-1) + shifted_compress_topk.size(-1),
-                ),
-                -1,
-            )
-            combined[:, : window_topk.size(-1)] = window_topk
-            for row in range(window_topk.size(0)):
-                window_len = int(window_lengths[row].item())
-                valid_compress = shifted_compress_topk[row][
-                    shifted_compress_topk[row] >= 0
-                ]
-                if valid_compress.numel() > 0:
-                    combined[row, window_len : window_len + valid_compress.numel()] = (
-                        valid_compress
-                    )
-            return combined
+        total_q = x.size(0)
+        if total_q == 0:
+            if return_tensor:
+                return x.new_empty((0, self.dim))
+            return []
+        needs_request_lists = not return_tensor
+        seqlens_list = (
+            [int(v) for v in seqlens.tolist()] if needs_request_lists else None
+        )
 
         # Reset kv_state/score_state for first-chunk requests before compressor.
         if ratio:
-            for i in range(n):
-                if start_positions_list[i] == 0:
-                    slot = cache_slots_list[i]
-                    self.compressor.kv_state[slot].zero_()
-                    self.compressor.score_state[slot].fill_(float("-inf"))
-                    if getattr(self, "indexer", None) is not None:
-                        self.indexer.compressor.kv_state[slot].zero_()
-                        self.indexer.compressor.score_state[slot].fill_(float("-inf"))
+            first_chunk_idx = (start_positions == 0).nonzero(as_tuple=True)[0]
+            if first_chunk_idx.numel() > 0:
+                reset_slots = cache_slots.index_select(0, first_chunk_idx)
+                self.compressor.kv_state[reset_slots] = 0
+                self.compressor.score_state[reset_slots] = float("-inf")
+                if indexer is not None:
+                    self.indexer.compressor.kv_state[reset_slots] = 0
+                    self.indexer.compressor.score_state[reset_slots] = float("-inf")
 
         # Run all compressors in one call (single wkv/wgate Linear).
         if ratio:
             self.compressor._forward_prefill(
-                x, seqlens, start_positions, cache_slots, cache_seq_ids
+                x,
+                seqlens,
+                start_positions,
+                cache_slots,
+                cache_seq_ids,
             )
 
         req_range = torch.arange(n, device=device, dtype=torch.long)
@@ -2278,27 +2272,18 @@ class AttentionDeepSeekV4(Attention):
         )
         sliding_lens = history_lens + seqlens
 
-        indexer = getattr(self, "indexer", None)
-        compress_topk_parts: list[Optional[torch.Tensor]] = [None] * n
+        compress_topk_idxs = None
         if ratio and indexer is not None:
-            token_offset = 0
-            for i, (start_pos, seqlen, cache_slot, cache_seq_id) in enumerate(
-                zip(
-                    start_positions_list,
-                    seqlens_list,
-                    cache_slots_list,
-                    cache_seq_ids_list,
-                )
-            ):
-                token_slice = slice(token_offset, token_offset + seqlen)
-                compress_topk_parts[i] = indexer(
-                    x[token_slice].unsqueeze(0),
-                    qr[token_slice].unsqueeze(0),
-                    start_pos,
-                    cache_slot,
-                    cache_seq_id=cache_seq_id,
-                )
-                token_offset += seqlen
+            compress_topk_idxs = indexer.forward_prefill(
+                x,
+                qr,
+                seqlens,
+                start_positions,
+                cache_slots,
+                cache_seq_ids=cache_seq_ids,
+                current_req_ids=current_req_ids,
+                current_token_offsets=current_token_offsets,
+            )
 
         if ratio:
             compressed_visible_end = start_positions + seqlens
@@ -2312,44 +2297,25 @@ class AttentionDeepSeekV4(Attention):
         else:
             compressed_lens = torch.zeros_like(seqlens)
 
-        topk_parts: list[torch.Tensor] = []
-        for i, (start_pos, seqlen) in enumerate(
-            zip(start_positions_list, seqlens_list)
-        ):
-            slidingwindow_len = int(sliding_lens[i].item())
-            compressed_len_i = int(compressed_lens[i].item())
-            compress_topk_idxs_i = compress_topk_parts[i]
-
-            if indexer is not None and compress_topk_idxs_i is not None:
-                # indexer returns arbitrary top-k compress indices; left-pack manually
-                win_idxs_i, win_len_i = get_chunked_prefill_topk_idxs_v4(
-                    win, seqlen, start_pos, device
-                )
-                comp_i = compress_topk_idxs_i.squeeze(0)  # [seqlen, n_comp]
-                local_topk_i = _left_pack_window_and_compress_topk(
-                    win_idxs_i,
-                    win_len_i,
-                    comp_i,
-                    slidingwindow_len,
-                )
-            else:
-                local_topk_i, _ = get_chunked_prefill_topk_idxs_v4(
-                    win,
-                    seqlen,
-                    start_pos,
-                    device,
-                    ratio=ratio if compressed_len_i > 0 else 0,
-                    compress_offset=slidingwindow_len if ratio else 0,
-                )
-
-            topk_parts.append(local_topk_i)
-
-        max_topk = max(t.size(-1) for t in topk_parts)
-        topk_idxs = topk_parts[0].new_full((total_q, max_topk), -1)
-        token_offset = 0
-        for seqlen, topk_i in zip(seqlens_list, topk_parts):
-            topk_idxs[token_offset : token_offset + seqlen, : topk_i.size(-1)] = topk_i
-            token_offset += seqlen
+        if indexer is None:
+            topk_idxs = get_chunked_prefill_topk_idxs_v4_flat(
+                win,
+                start_positions,
+                current_req_ids,
+                current_token_offsets,
+                sliding_lens,
+                ratio=ratio,
+            )
+        else:
+            assert compress_topk_idxs is not None
+            topk_idxs = left_pack_prefill_window_and_compress_topk_v4_flat(
+                win,
+                start_positions,
+                current_req_ids,
+                current_token_offsets,
+                sliding_lens,
+                compress_topk_idxs,
+            )
 
         assert self.slidingwindow_cache_accessor is not None
         physical_win = self.slidingwindow_cache_accessor.kv["sliding_window"].shape[1]
@@ -2382,6 +2348,9 @@ class AttentionDeepSeekV4(Attention):
         wo_a_typed = wo_a if wo_a.dtype == outputs.dtype else wo_a.to(outputs.dtype)
         outputs = torch.einsum("sgd,grd->sgr", outputs, wo_a_typed)
         outputs = self.wo_b(outputs.flatten(1))
+        if return_tensor:
+            return outputs
+        assert seqlens_list is not None
         return list(outputs.split(seqlens_list, dim=0))
 
 
