@@ -68,6 +68,68 @@ def build_compress_metadata(
     )
 
 
+def build_compress_metadata_from_tensors(
+    start_positions: torch.Tensor,
+    seqlens: torch.Tensor,
+    ratio: int,
+    device: torch.device,
+) -> dict:
+    """Build ragged compressor metadata with tensor ops.
+
+    Shape fields stay int32 to match the Triton compressor wrappers.
+    ``total_eff`` and ``total_groups`` are Python ints because callers use them
+    for tensor allocation and Triton grid sizes.
+    """
+    start_positions = start_positions.to(device=device, dtype=torch.long)
+    seqlens = seqlens.to(device=device, dtype=torch.long)
+    n = int(seqlens.numel())
+
+    pending_lens_l = start_positions.remainder(ratio)
+    effective_lens_l = pending_lens_l + seqlens
+    remainders_l = effective_lens_l.remainder(ratio)
+    cutoffs_l = effective_lens_l - remainders_l
+    n_groups_l = torch.div(cutoffs_l, ratio, rounding_mode="floor")
+
+    cu_eff_l = torch.empty(n + 1, dtype=torch.long, device=device)
+    cu_new_l = torch.empty(n + 1, dtype=torch.long, device=device)
+    cu_groups_l = torch.empty(n + 1, dtype=torch.long, device=device)
+    cu_eff_l[0] = 0
+    cu_new_l[0] = 0
+    cu_groups_l[0] = 0
+    if n > 0:
+        cu_eff_l[1:] = torch.cumsum(effective_lens_l, dim=0)
+        cu_new_l[1:] = torch.cumsum(seqlens, dim=0)
+        cu_groups_l[1:] = torch.cumsum(n_groups_l, dim=0)
+
+    total_eff = int(cu_eff_l[-1].item()) if n > 0 else 0
+    total_groups = int(cu_groups_l[-1].item()) if n > 0 else 0
+    if total_groups > 0:
+        group_to_req = torch.repeat_interleave(
+            torch.arange(n, dtype=torch.int32, device=device),
+            n_groups_l.to(torch.long),
+            output_size=total_groups,
+        )
+    else:
+        group_to_req = torch.zeros(0, dtype=torch.int32, device=device)
+
+    return dict(
+        pending_lens=pending_lens_l.to(torch.int32),
+        effective_lens=effective_lens_l,
+        remainders=remainders_l.to(torch.int32),
+        cutoffs=cutoffs_l.to(torch.int32),
+        n_groups_list=n_groups_l.to(torch.int32),
+        cu_eff=cu_eff_l.to(torch.int32),
+        cu_new=cu_new_l.to(torch.int32),
+        cu_groups=cu_groups_l.to(torch.int32),
+        group_to_req=group_to_req,
+        start_pos_div_ratio=torch.div(start_positions, ratio, rounding_mode="floor").to(
+            torch.int32
+        ),
+        total_groups=total_groups,
+        total_eff=total_eff,
+    )
+
+
 def gather_pending_and_new(
     kv_state: torch.Tensor,
     score_state: torch.Tensor,

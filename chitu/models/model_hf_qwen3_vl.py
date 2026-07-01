@@ -18,6 +18,7 @@ from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.kv_cache import KVCacheBase, MMPagedKVCache
 from chitu.distributed.parallel_state import get_etp_size
 from chitu.global_vars import get_global_args
+from chitu.models.model import LayerNorm
 from chitu.models.model_hf_llama import TransformerBlockHFLlama, TransformerHFLlama
 from chitu.models.model_hf_qwen2_vl import (
     VisionAttention as Qwen25VisionAttention,
@@ -124,7 +125,7 @@ class Qwen3VLVisionPatchMerger(nn.Module):
             int(config.spatial_merge_size) ** 2
         )
         self.use_postshuffle_norm = bool(use_postshuffle_norm)
-        self.norm = nn.LayerNorm(
+        self.norm = LayerNorm(
             self.hidden_size if self.use_postshuffle_norm else int(config.hidden_size),
             eps=1e-6,
         )
@@ -165,8 +166,8 @@ class Qwen3VLVisionBlock(nn.Module):
     def __init__(self, config, *, checkpoint_prefix: str) -> None:
         super().__init__()
         _require_attrs(config, ["hidden_size"], what="vision_config")
-        self.norm1 = nn.LayerNorm(int(config.hidden_size), eps=1e-6)
-        self.norm2 = nn.LayerNorm(int(config.hidden_size), eps=1e-6)
+        self.norm1 = LayerNorm(int(config.hidden_size), eps=1e-6)
+        self.norm2 = LayerNorm(int(config.hidden_size), eps=1e-6)
         self.attn = Qwen3VLVisionAttention(
             config=config, checkpoint_prefix=f"{checkpoint_prefix}.attn"
         )

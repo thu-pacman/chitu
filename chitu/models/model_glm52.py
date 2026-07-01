@@ -6,10 +6,10 @@
 
 Backbone layers are tagged "full" or "shared" via config.json
 ``indexer_types``.  A "full" layer computes top-k and writes the result into a
-per-request ``_IndexerBuffer``; "shared" layers read from that buffer without
-recomputation.  Buffer routing is passed through forward kwargs
-``share_buffer_to`` / ``read_buffer_from`` so no routing state sits on the
-attention or indexer modules themselves.
+per-step ``_IndexerBuffer``; "shared" layers read from that buffer without
+recomputation.  Backbone buffer routing is bound once during layer
+initialization; MTP decode temporarily switches the same indexer hook at call
+time because its skip state is runtime-controlled.
 """
 
 from __future__ import annotations
@@ -21,10 +21,8 @@ import torch
 from typing_extensions import override
 
 from chitu.kv_cache import KVCacheBase
-from chitu.kv_cache import PagedKVCacheAccessor
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.native_layout import NativeLayoutTensor
-from chitu.ops import apply_rotary_pos_emb_partial, mla_prologue, a8_per_token_act_quant
+from chitu.dsa_indexer import DSAIndexer
 from chitu.task_type import TaskType
 from chitu.models.registry import ModelType, register_model
 from chitu.quantization import QuantizationRegistry
@@ -33,8 +31,6 @@ from chitu.models.model import TransformerBlock, RMSNorm
 from chitu.models.model_deepseek_v3 import (
     Indexer,
     AttentionDeepSeekV3,
-    TransformerBlockDeepSeekV3,
-    TransformerBlockDeepSeekV3MTP,
     TransformerDeepSeekV3,
     MLPDeepSeekV3,
     ParallelMoeBlockDeepSeekV3,
@@ -45,6 +41,7 @@ from chitu.tensor_parallel import VocabParallelEmbedding
 from chitu.utils import parse_dtype, ceil_div
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.distributed.parallel_state import get_dp_size
+from chitu.distributed.partition import compute_layer_dist_in_pp
 from chitu.global_vars import get_global_args
 
 # ---------------------------------------------------------------------------
@@ -59,8 +56,8 @@ class _IndexerBuffer:
     ``topk_page_table`` — filled by
     :py:meth:`IndexerGLM52.build_decode_topk_page_table`.
 
-    Both slots are overwritten on every full-layer call; shared layers read
-    back the most recently produced value.
+    A full layer writes the slot used by the current path and clears the other;
+    shared layers read back the most recently produced value.
     """
 
     __slots__ = ("topk", "topk_page_table")
@@ -76,11 +73,47 @@ class _IndexerBuffer:
 
 
 class IndexerGLM52(Indexer):
-    """Indexer subclass with buffer-routing kwargs passed explicitly per call.
+    """Indexer subclass with GLM-5.2 top-k buffer routing."""
 
-    Buffer state is never stored on the module itself; it flows purely as
-    function arguments so the module remains stateless between calls.
-    """
+    def __init__(
+        self,
+        args,
+        *,
+        checkpoint_prefix: str,
+        indexer_impl: DSAIndexer,
+        buffer_mode: Optional[str] = None,
+        indexer_buffer: Optional[_IndexerBuffer] = None,
+    ):
+        super().__init__(
+            args,
+            checkpoint_prefix=checkpoint_prefix,
+            indexer_impl=indexer_impl,
+        )
+        self.set_indexer_buffer(buffer_mode, indexer_buffer)
+
+    def set_indexer_buffer(
+        self,
+        mode: Optional[str],
+        buffer: Optional[_IndexerBuffer],
+    ) -> None:
+        assert mode in (None, "write", "read")
+        assert (mode is None) == (buffer is None)
+        self._indexer_buffer_mode = mode
+        self._indexer_buffer = buffer
+
+    def must_materialize_topk_indices(self) -> bool:
+        return self._indexer_buffer_mode is not None
+
+    def read_reused_topk_for_mla(
+        self, *, use_page_table: bool
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        assert self._indexer_buffer_mode == "read"
+        buffer = self._indexer_buffer
+        assert buffer is not None
+        if use_page_table and buffer.topk_page_table is not None:
+            return None, buffer.topk_page_table
+        assert buffer.topk is not None
+        return buffer.topk, None
 
     def build_decode_topk_page_table(
         self,
@@ -92,13 +125,14 @@ class IndexerGLM52(Indexer):
         is_causal: bool,
         cache_accessor,
         source_page_table: torch.Tensor,
-        *,
-        share_buffer_to: Optional[_IndexerBuffer] = None,
-        read_buffer_from: Optional[_IndexerBuffer] = None,
+        freqs_cis_k: Optional[BatchedFreqsCis] = None,
+        k_pre_normed: bool = False,
     ) -> torch.Tensor:
-        if read_buffer_from is not None:
-            assert read_buffer_from.topk_page_table is not None
-            return read_buffer_from.topk_page_table
+        mode = self._indexer_buffer_mode
+        buffer = self._indexer_buffer
+        if mode == "read":
+            assert buffer is not None and buffer.topk_page_table is not None
+            return buffer.topk_page_table
         out = super().build_decode_topk_page_table(
             x,
             q,
@@ -108,9 +142,13 @@ class IndexerGLM52(Indexer):
             is_causal,
             cache_accessor,
             source_page_table,
+            freqs_cis_k=freqs_cis_k,
+            k_pre_normed=k_pre_normed,
         )
-        if share_buffer_to is not None:
-            share_buffer_to.topk_page_table = out
+        if mode == "write":
+            assert buffer is not None
+            buffer.topk_page_table = out
+            buffer.topk = None
         return out
 
     def forward(
@@ -122,18 +160,29 @@ class IndexerGLM52(Indexer):
         freqs_cis: BatchedFreqsCis,
         is_causal: bool,
         cache_accessor,
-        *,
-        share_buffer_to: Optional[_IndexerBuffer] = None,
-        read_buffer_from: Optional[_IndexerBuffer] = None,
+        freqs_cis_k: Optional[BatchedFreqsCis] = None,
+        k_pre_normed: bool = False,
     ):
-        if read_buffer_from is not None:
-            assert read_buffer_from.topk is not None
-            return read_buffer_from.topk
+        mode = self._indexer_buffer_mode
+        buffer = self._indexer_buffer
+        if mode == "read":
+            assert buffer is not None and buffer.topk is not None
+            return buffer.topk
         out = super().forward(
-            x, q, k, seq_len_delta, freqs_cis, is_causal, cache_accessor
+            x,
+            q,
+            k,
+            seq_len_delta,
+            freqs_cis,
+            is_causal,
+            cache_accessor,
+            freqs_cis_k=freqs_cis_k,
+            k_pre_normed=k_pre_normed,
         )
-        if share_buffer_to is not None:
-            share_buffer_to.topk = out
+        if mode == "write":
+            assert buffer is not None
+            buffer.topk = out
+            buffer.topk_page_table = None
         return out
 
 
@@ -143,12 +192,7 @@ class IndexerGLM52(Indexer):
 
 
 class AttentionGLM52(AttentionDeepSeekV3):
-    """MLA attention with GLM-5.2 shared-indexer buffer routing.
-
-    Buffer kwargs ``share_buffer_to`` / ``read_buffer_from`` are accepted in
-    ``forward`` and passed directly to the two ``IndexerGLM52`` call sites.
-    No buffer state is stored on the module itself.
-    """
+    """MLA attention with GLM-5.2 shared-indexer buffer routing."""
 
     def __init__(
         self,
@@ -160,10 +204,14 @@ class AttentionGLM52(AttentionDeepSeekV3):
         mla_absorb,
         *,
         checkpoint_prefix: str,
-        indexer_cache=None,
-        indexer_impl=None,
-        has_local_indexer: bool = True,
+        indexer_cache,
+        indexer_impl,
+        indexer_role: str,
+        indexer_buffer: Optional[_IndexerBuffer] = None,
     ):
+        has_local_indexer = indexer_role == "full"
+        self._indexer_role_for_make = indexer_role
+        self._indexer_buffer_for_make = indexer_buffer
         super().__init__(
             args,
             layer_id,
@@ -176,283 +224,41 @@ class AttentionGLM52(AttentionDeepSeekV3):
             indexer_impl=indexer_impl,
             has_local_indexer=has_local_indexer,
         )
-        # Upgrade the Indexer class in-place so it accepts buffer kwargs.
-        # __class__ mutation is safe: all parameters, buffers, and sub-modules
-        # are preserved; only the method resolution changes.
-        if hasattr(self, "indexer") and self.indexer is not None:
-            self.indexer.__class__ = IndexerGLM52
-            if not has_local_indexer:
-                # Shared layer: checkpoint has no k_norm/weights_proj weights.
-                # Remove them so strict load_state_dict passes.
-                del self.indexer.k_norm
-                del self.indexer.weights_proj
+        if not has_local_indexer:
+            # Shared layer: checkpoint has no k_norm/weights_proj weights.
+            # Remove them so strict load_state_dict passes.
+            del self.indexer.k_norm
+            del self.indexer.weights_proj
+        del self._indexer_role_for_make
+        del self._indexer_buffer_for_make
 
     @override
-    def forward(
+    def make_indexer(
         self,
-        x: torch.Tensor,
-        freqs_cis: BatchedFreqsCis,
-        is_mtp: bool = False,
+        args,
         *,
-        share_buffer_to: Optional[_IndexerBuffer] = None,
-        read_buffer_from: Optional[_IndexerBuffer] = None,
-    ):
-        """Full override of AttentionDeepSeekV3.forward.
+        checkpoint_prefix: str,
+        indexer_impl: DSAIndexer,
+    ) -> IndexerGLM52:
+        indexer_role = self._indexer_role_for_make
+        indexer_buffer = self._indexer_buffer_for_make
+        buffer_mode = None
+        if indexer_role == "shared":
+            buffer_mode = "read"
+        elif indexer_buffer is not None:
+            buffer_mode = "write"
+        return IndexerGLM52(
+            args,
+            checkpoint_prefix=checkpoint_prefix,
+            indexer_impl=indexer_impl,
+            buffer_mode=buffer_mode,
+            indexer_buffer=indexer_buffer,
+        )
 
-        Identical logic except the two indexer call sites pass
-        share_buffer_to / read_buffer_from directly as kwargs.
-        Shared layers (has_local_indexer=False) skip the indexer branch and
-        run dense attention; the buffer topk is not yet wired into attn_backend.
-        """
-        seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
-        bs_seq, _ = x.size()
-
-        if self.can_use_mla_prologue_torch_npu:
-
-            def try_get_scale(module):
-                if hasattr(module, "weight_scale"):
-                    return module.weight_scale.view(module.out_features)
-                return None
-
-            if self.mla_prologue_int8_full:
-                x_int8, scale_w_x = a8_per_token_act_quant(x.view(-1, x.shape[-1]))
-                q_nope, q_pe, kv = mla_prologue(
-                    x_int8,
-                    self.q_a_proj.get_native_layout_weight(),
-                    self.q_b_proj.get_native_layout_weight(),
-                    self.kv_b_proj_absorb_1.get_native_layout_weight(),
-                    self.kv_a_proj_with_mqa.get_native_layout_weight(),
-                    self.q_a_layernorm.weight,
-                    self.kv_a_layernorm.weight,
-                    freqs_cis,
-                    self.q_a_layernorm.eps,
-                    self.kv_a_layernorm.eps,
-                    dequant_scale_x=scale_w_x,
-                    dequant_scale_q_a_proj=try_get_scale(self.q_a_proj),
-                    dequant_scale_q_b_proj=try_get_scale(self.q_b_proj),
-                    dequant_scale_kv_a_proj_with_mqa=try_get_scale(
-                        self.kv_a_proj_with_mqa
-                    ),
-                    smooth_scales=None,
-                    impl="torch_npu",
-                )
-            else:
-                q_nope, q_pe, kv = mla_prologue(
-                    x,
-                    self.q_a_proj.get_native_layout_weight(),
-                    self.q_b_proj.get_native_layout_weight(),
-                    self.kv_b_proj_absorb_1.get_native_layout_weight(),
-                    self.kv_a_proj_with_mqa.get_native_layout_weight(),
-                    self.q_a_layernorm.weight,
-                    self.kv_a_layernorm.weight,
-                    freqs_cis,
-                    self.q_a_layernorm.eps,
-                    self.kv_a_layernorm.eps,
-                    dequant_scale_q_b_proj=try_get_scale(self.q_b_proj),
-                    smooth_scales=None,
-                    impl="torch_npu",
-                )
-            x = self.attn_backend.mla(
-                q_nope,
-                q_pe,
-                self.cache.get_accessor(self.layer_id, is_mtp),
-                kv,
-                seq_len_delta=seq_len_delta,
-                causal=True,
-                softmax_scale=self.softmax_scale,
-            )
-            x = self.kv_b_proj_absorb_2(x)
-
-        else:
-            assert self.q_lora_rank > 0
-            indexer_k = None
-            has_indexer_weights = self.index_topk is not None and self.has_local_indexer
-            if self.merge_qkv:
-                if not has_indexer_weights:
-                    q_a_kv = self.wqkv_a(x)
-                    q_a, kv = torch.split(
-                        q_a_kv,
-                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                        dim=-1,
-                    )
-                else:
-                    q_a_kv_indexer_k = self.wqkv_a_indexer_k(x)
-                    indexer_k, q_a, kv = torch.split(
-                        q_a_kv_indexer_k,
-                        [
-                            self.index_head_dim,
-                            self.q_lora_rank,
-                            self.kv_lora_rank + self.qk_rope_head_dim,
-                        ],
-                        dim=-1,
-                    )
-            else:
-                q_a = self.q_a_proj(x)
-                kv = self.kv_a_proj_with_mqa(x)
-                if has_indexer_weights:
-                    indexer_k = self.indexer_wk(x)
-
-            qr = self.q_a_layernorm(q_a, compute_dtype=q_a.dtype)
-
-            indexer_q = None
-            if self.merge_qkv and has_indexer_weights:
-                q_indexer_q = self.wq_b_indexer_q_b(qr)
-                indexer_q, q = torch.split(
-                    q_indexer_q,
-                    [
-                        self.index_n_heads * self.index_head_dim,
-                        q_indexer_q.shape[-1]
-                        - self.index_n_heads * self.index_head_dim,
-                    ],
-                    dim=-1,
-                )
-            else:
-                q = self.q_b_proj(qr)
-                if has_indexer_weights:
-                    indexer_q = self.indexer_wq_b(qr)
-
-            q = q.view(bs_seq, self.n_local_heads, -1)
-            kv = kv.view(bs_seq, 1, -1)
-
-            q, kv, q_nope, q_pe, _, kv_lora, k_pe, _ = apply_rotary_pos_emb_partial(
-                q,
-                kv,
-                freqs_cis,
-                q_rotary_begin=q.shape[-1] - self.qk_rope_head_dim,
-                k_rotary_begin=self.kv_lora_rank,
-                rotary_type="interleaved",
-            )
-
-            if self.mla_absorb == "none":
-                if isinstance(k_pe, NativeLayoutTensor):
-                    k_pe = k_pe.convert_to_plain()
-
-                kv = self.kv_b_proj(self.kv_a_layernorm(kv_lora))
-                kv = kv.view(
-                    bs_seq, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim
-                )
-                k_nope, v = torch.split(
-                    kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-                )
-                k = torch.cat(
-                    [
-                        k_nope.view(bs_seq, self.n_local_heads, self.qk_nope_head_dim),
-                        k_pe.view(bs_seq, 1, self.qk_rope_head_dim).expand(
-                            -1, self.n_local_heads, -1
-                        ),
-                    ],
-                    dim=-1,
-                )
-
-                if has_indexer_weights:
-                    # Full layer: compute and optionally write buffer.
-                    assert self.indexer_cache is not None
-                    topk_indices = self.indexer(
-                        x,
-                        indexer_q,
-                        indexer_k,
-                        seq_len_delta,
-                        freqs_cis,
-                        is_causal=True,
-                        cache_accessor=self.indexer_cache.get_accessor(self.layer_id),
-                        share_buffer_to=share_buffer_to,
-                        read_buffer_from=read_buffer_from,
-                    )
-                elif read_buffer_from is not None:
-                    # Shared layer: reuse topk produced by the latest full layer.
-                    assert read_buffer_from.topk is not None
-                    topk_indices = read_buffer_from.topk
-                else:
-                    topk_indices = None
-
-                x = self.attn_backend(
-                    q,
-                    self.cache.get_accessor(self.layer_id),
-                    k,
-                    v,
-                    seq_len_delta=seq_len_delta,
-                    causal=True,
-                    softmax_scale=self.softmax_scale,
-                )
-
-            elif self.mla_absorb in ["absorb-without-precomp", "absorb"]:
-                if self.mla_absorb == "absorb-without-precomp":
-                    q_nope = self.kv_b_proj_absorb_1(q_nope)
-
-                self.kv_a_layernorm(kv_lora, compute_dtype=kv.dtype, out=kv_lora)
-
-                main_cache_accessor = self.cache.get_accessor(self.layer_id, is_mtp)
-                topk_indices = None
-                topk_page_table = None
-                if has_indexer_weights:
-                    # Full layer: compute and optionally write buffer.
-                    assert self.indexer_cache is not None
-                    indexer_cache_accessor = self.indexer_cache.get_accessor(
-                        self.layer_id
-                    )
-                    if (
-                        self.attn_backend.requires_sparse_decode_page_table()
-                        and seq_len_delta.is_classic_decoding
-                        and isinstance(main_cache_accessor, PagedKVCacheAccessor)
-                    ):
-                        topk_page_table = self.indexer.build_decode_topk_page_table(
-                            x,
-                            indexer_q,
-                            indexer_k,
-                            seq_len_delta,
-                            freqs_cis,
-                            is_causal=True,
-                            cache_accessor=indexer_cache_accessor,
-                            source_page_table=main_cache_accessor.block_table,
-                            share_buffer_to=share_buffer_to,
-                            read_buffer_from=read_buffer_from,
-                        )
-                    else:
-                        topk_indices = self.indexer(
-                            x,
-                            indexer_q,
-                            indexer_k,
-                            seq_len_delta,
-                            freqs_cis,
-                            is_causal=True,
-                            cache_accessor=indexer_cache_accessor,
-                            share_buffer_to=share_buffer_to,
-                            read_buffer_from=read_buffer_from,
-                        )
-                elif read_buffer_from is not None:
-                    # Shared layer: reuse topk produced by the latest full layer.
-                    if (
-                        self.attn_backend.requires_sparse_decode_page_table()
-                        and seq_len_delta.is_classic_decoding
-                        and isinstance(main_cache_accessor, PagedKVCacheAccessor)
-                    ):
-                        assert read_buffer_from.topk_page_table is not None
-                        topk_page_table = read_buffer_from.topk_page_table
-                    else:
-                        assert read_buffer_from.topk is not None
-                        topk_indices = read_buffer_from.topk
-
-                x = self.attn_backend.mla(
-                    q_nope,
-                    q_pe,
-                    main_cache_accessor,
-                    kv,
-                    seq_len_delta=seq_len_delta,
-                    causal=True,
-                    softmax_scale=self.softmax_scale,
-                    topk_indices=topk_indices,
-                    topk_page_table=topk_page_table,
-                )
-
-                if self.mla_absorb == "absorb-without-precomp":
-                    x = self.kv_b_proj_absorb_2(x)
-
-            else:
-                raise NotImplementedError(
-                    f"MLA absorb mode {self.mla_absorb} not supported"
-                )
-
-        return self.o_proj(x.flatten(-2)).view(bs_seq, -1)
+    def set_indexer_buffer(
+        self, mode: Optional[str], buffer: Optional[_IndexerBuffer]
+    ) -> None:
+        self.indexer.set_indexer_buffer(mode, buffer)
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +267,7 @@ class AttentionGLM52(AttentionDeepSeekV3):
 
 
 class TransformerBlockGLM52(TransformerBlock):
-    """Transformer block that passes buffer kwargs to AttentionGLM52.
+    """Transformer block that constructs AttentionGLM52 directly.
 
     Inherits directly from TransformerBlock (not TransformerBlockDeepSeekV3)
     so that AttentionGLM52 is constructed exactly once — avoiding the double
@@ -480,13 +286,13 @@ class TransformerBlockGLM52(TransformerBlock):
         *,
         checkpoint_prefix,
         indexer_impl,
-        indexer_role: str = "full",
+        indexer_role: str,
+        indexer_buffer: Optional[_IndexerBuffer] = None,
     ):
         super().__init__(
             layer_id, args, cache_dict, attn_backend=attn_backend, op_impl=op_impl
         )
         self.layer_id = layer_id
-        has_local_indexer = indexer_role != "shared"
         self.self_attn = AttentionGLM52(
             args,
             layer_id,
@@ -495,9 +301,10 @@ class TransformerBlockGLM52(TransformerBlock):
             op_impl=op_impl,
             mla_absorb=mla_absorb,
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
-            indexer_cache=cache_dict.get("indexer", None),
+            indexer_cache=cache_dict["indexer"],
             indexer_impl=indexer_impl,
-            has_local_indexer=has_local_indexer,
+            indexer_role=indexer_role,
+            indexer_buffer=indexer_buffer,
         )
         base_moe_experts_class = None
         if op_impl == "muxi_custom_kernel":
@@ -532,21 +339,13 @@ class TransformerBlockGLM52(TransformerBlock):
         )
         self.input_layernorm = RMSNorm(
             args.dim,
-            dtype=(
-                parse_dtype(args.rms_norm_dtype)
-                if hasattr(args, "rms_norm_dtype")
-                else None
-            ),
-            eps=getattr(args, "rms_norm_eps", 1e-6),
+            dtype=parse_dtype(args.rms_norm_dtype),
+            eps=args.rms_norm_eps,
         )
         self.post_attention_layernorm = RMSNorm(
             args.dim,
-            dtype=(
-                parse_dtype(args.rms_norm_dtype)
-                if hasattr(args, "rms_norm_dtype")
-                else None
-            ),
-            eps=getattr(args, "rms_norm_eps", 1e-6),
+            dtype=parse_dtype(args.rms_norm_dtype),
+            eps=args.rms_norm_eps,
         )
 
     @override
@@ -555,19 +354,19 @@ class TransformerBlockGLM52(TransformerBlock):
         x: torch.Tensor,
         freqs_cis: BatchedFreqsCis,
         is_mtp: bool = False,
-        *,
-        share_buffer_to: Optional[_IndexerBuffer] = None,
-        read_buffer_from: Optional[_IndexerBuffer] = None,
     ):
         x = x + self.self_attn(
             self.input_layernorm(x, compute_dtype=x.dtype),
             freqs_cis,
             is_mtp,
-            share_buffer_to=share_buffer_to,
-            read_buffer_from=read_buffer_from,
         )
         x = x + self.mlp(self.post_attention_layernorm(x, compute_dtype=x.dtype))
         return x
+
+    def set_indexer_buffer(
+        self, mode: Optional[str], buffer: Optional[_IndexerBuffer]
+    ) -> None:
+        self.self_attn.set_indexer_buffer(mode, buffer)
 
 
 # ---------------------------------------------------------------------------
@@ -604,28 +403,20 @@ class TransformerBlockGLM52MTP(TransformerBlockGLM52):
         )
         self.enorm = RMSNorm(
             args.dim,
-            dtype=(
-                parse_dtype(args.rms_norm_dtype)
-                if hasattr(args, "rms_norm_dtype")
-                else None
-            ),
-            eps=getattr(args, "rms_norm_eps", 1e-6),
+            dtype=parse_dtype(args.rms_norm_dtype),
+            eps=args.rms_norm_eps,
         )
         self.hnorm = RMSNorm(
             args.dim,
-            dtype=(
-                parse_dtype(args.rms_norm_dtype)
-                if hasattr(args, "rms_norm_dtype")
-                else None
-            ),
-            eps=getattr(args, "rms_norm_eps", 1e-6),
+            dtype=parse_dtype(args.rms_norm_dtype),
+            eps=args.rms_norm_eps,
         )
         self.eh_proj = torch.nn.Linear(args.dim * 2, args.dim, bias=False)
         self.max_batch_size_per_dp = ceil_div(
-            int(getattr(get_global_args().infer, "max_batch_size", 1)), get_dp_size()
+            int(get_global_args().infer.max_batch_size), get_dp_size()
         )
         self.shared_head = SharedHeadDeepSeekV3(args, self.max_batch_size_per_dp)
-        if not getattr(args, "mtp_tie_word_embeddings", False):
+        if not args.mtp_tie_word_embeddings:
             self.embed_tokens = VocabParallelEmbedding(
                 args.vocab_size,
                 args.dim,
@@ -639,9 +430,6 @@ class TransformerBlockGLM52MTP(TransformerBlockGLM52):
         freqs_cis: BatchedFreqsCis,
         previous_hidden_states: torch.Tensor,
         is_mtp: bool = False,
-        *,
-        share_buffer_to: Optional[_IndexerBuffer] = None,
-        read_buffer_from: Optional[_IndexerBuffer] = None,
     ):
         inputs_embeds = self.enorm(x)
         previous_hidden_states = self.hnorm(previous_hidden_states)
@@ -650,8 +438,6 @@ class TransformerBlockGLM52MTP(TransformerBlockGLM52):
             self.input_layernorm(x, compute_dtype=x.dtype),
             freqs_cis,
             is_mtp,
-            share_buffer_to=share_buffer_to,
-            read_buffer_from=read_buffer_from,
         )
         x = x + self.mlp(self.post_attention_layernorm(x, compute_dtype=x.dtype))
         return x
@@ -675,11 +461,7 @@ class TransformerGLM52(TransformerDeepSeekV3):
         self.layers = torch.nn.ModuleList()
         memory_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
-        share_index_cache = bool(getattr(self.params, "share_index_cache", False))
-        self._share_index_cache = share_index_cache
-
-        # Map layer_id → role ("full" / "shared") for the buffer-routing helper.
-        self._layer_indexer_roles: dict[int, str] = {}
+        indexer_types = self.params.indexer_types
 
         # Backbone buffer (written by "full" layers, read by "shared" layers).
         self._backbone_buf = _IndexerBuffer()
@@ -695,16 +477,7 @@ class TransformerGLM52(TransformerDeepSeekV3):
                 f"{torch.cuda.current_device()} "
                 f"{torch.cuda.memory_allocated()/(1024**3)} GB"
             )
-            is_mtp_layer = self.mtp_size > 1 and layer_id >= self.params.n_layers
-
-            if share_index_cache and not is_mtp_layer:
-                indexer_role = self.params.indexer_types[layer_id]
-            else:
-                indexer_role = "full"
-
-            self._layer_indexer_roles[layer_id] = indexer_role
-
-            if not is_mtp_layer:
+            if layer_id < self.params.n_layers:
                 block = TransformerBlockGLM52(
                     layer_id,
                     self.params,
@@ -714,7 +487,8 @@ class TransformerGLM52(TransformerDeepSeekV3):
                     mla_absorb=self.mla_absorb,
                     checkpoint_prefix=f"layers.{layer_id}",
                     indexer_impl=self.indexer_backend,
-                    indexer_role=indexer_role,
+                    indexer_role=indexer_types[layer_id],
+                    indexer_buffer=self._backbone_buf,
                 )
             else:
                 block = TransformerBlockGLM52MTP(
@@ -730,53 +504,42 @@ class TransformerGLM52(TransformerDeepSeekV3):
 
             self.layers.append(block)
 
-        # Determine whether topk must be transmitted across stage boundaries.
-        #
-        # _cross_stage_send_topk — this stage owns at least one "full" layer, and
-        #   there is a downstream "shared" layer on the next stage (i.e. a "shared"
-        #   layer exists globally beyond local_end_layer_id).
-        # _cross_stage_recv_topk — this stage owns at least one "shared" layer
-        #   whose corresponding "full" layer lives on the previous stage (i.e. a
-        #   "full" layer exists globally before local_begin_layer_id).
+        # Determine whether topk must be transmitted across adjacent PP stage
+        # boundaries. Payload shape is declared by the receiving stage, so the
+        # sending stage must pack topk exactly when the next stage will unpack it.
         self._cross_stage_send_topk: bool = False
         self._cross_stage_recv_topk: bool = False
-        if share_index_cache and self.pp_size > 1:
-            global_indexer_types = self.params.indexer_types  # full global array
+        if self.pp_size > 1:
+            global_indexer_types = indexer_types  # complete global role array
             n_backbone_layers = self.params.n_layers
-            has_shared_after = any(
-                global_indexer_types[global_layer_id] == "shared"
-                for global_layer_id in range(self.local_end_layer_id, n_backbone_layers)
-            )
-            has_full_local = any(
-                self._layer_indexer_roles[global_layer_id] == "full"
-                for global_layer_id in range(
-                    self.local_begin_layer_id, self.local_end_layer_id
-                )
-                if global_layer_id < n_backbone_layers
-            )
-            self._cross_stage_send_topk = has_full_local and has_shared_after
 
-            has_shared_local = any(
-                self._layer_indexer_roles[global_layer_id] == "shared"
-                for global_layer_id in range(
-                    self.local_begin_layer_id, self.local_end_layer_id
+            pp_layer_dist = compute_layer_dist_in_pp(self.pp_size)
+            first_layer_id_of_each_stage = [0]
+            for num_layers in pp_layer_dist:
+                first_layer_id_of_each_stage.append(
+                    first_layer_id_of_each_stage[-1] + num_layers
                 )
-            )
-            has_full_before = any(
-                global_indexer_types[global_layer_id] == "full"
-                for global_layer_id in range(0, self.local_begin_layer_id)
-            )
-            self._cross_stage_recv_topk = has_shared_local and has_full_before
 
-    def _indexer_buffers_for(self, layer_id: int):
-        """Return (share_buffer_to, read_buffer_from) for the given layer."""
-        if not self._share_index_cache:
-            return None, None
-        role = self._layer_indexer_roles[layer_id]
-        if role == "full":
-            return self._backbone_buf, None
-        else:
-            return None, self._backbone_buf
+            def stage_backbone_range(stage: int) -> tuple[int, int]:
+                begin = first_layer_id_of_each_stage[stage]
+                end = first_layer_id_of_each_stage[stage + 1]
+                return begin, min(end, n_backbone_layers)
+
+            def stage_needs_initial_topk(stage: int) -> bool:
+                begin, end = stage_backbone_range(stage)
+                return begin < end and global_indexer_types[begin] == "shared"
+
+            self._cross_stage_recv_topk = (
+                self.pp_stage > 0 and stage_needs_initial_topk(self.pp_stage)
+            )
+            self._cross_stage_send_topk = (
+                self.pp_stage < self.pp_end_stage
+                and stage_needs_initial_topk(self.pp_stage + 1)
+            )
+
+    def _clear_backbone_indexer_buffer(self) -> None:
+        self._backbone_buf.topk = None
+        self._backbone_buf.topk_page_table = None
 
     # ------------------------------------------------------------------
     # PP cross-stage topk transport: pack into / unpack from hidden state
@@ -786,11 +549,11 @@ class TransformerGLM52(TransformerDeepSeekV3):
         """Return the top-k width actually produced by the Indexer."""
         return min(
             int(self.params.index_topk),
-            int(getattr(get_global_args().infer, "max_seq_len")),
+            int(get_global_args().infer.max_seq_len),
         )
 
     def get_pipeline_payload_shape(self, num_tokens: int) -> list[int]:
-        """Extend payload cols when this stage must receive topk from prev stage."""
+        """Declare hidden payload cols, including incoming topk when needed."""
         topk_bf16_cols = (
             self._payload_index_topk() * 2 if self._cross_stage_recv_topk else 0
         )
@@ -814,7 +577,7 @@ class TransformerGLM52(TransformerDeepSeekV3):
         return h, topk
 
     # ------------------------------------------------------------------
-    # Override all five layer-loop methods to inject buffer kwargs
+    # Override layer loops to support CP split/gather and PP topk payloads.
     # ------------------------------------------------------------------
 
     @override
@@ -822,17 +585,24 @@ class TransformerGLM52(TransformerDeepSeekV3):
     def prefill_no_pipeline(
         self, tokens: torch.Tensor, output_token_offsets: torch.Tensor, **args
     ) -> torch.Tensor:
+        self._clear_backbone_indexer_buffer()
         freqs_cis = self.prepare_freqs_cis()
+        delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
+        cp_active = self.cp_context.is_active and self.cp_context.should_split_prefill(
+            delta_total
+        )
+
+        if cp_active:
+            tokens, freqs_cis = self.cp_context.split_stage0(tokens, freqs_cis)
+        else:
+            self.cp_context.set_step_active(False)
+
         if self.moe_impl is not None:
             self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
         h = self._pre_layers(tokens, **args)
 
-        for it, layer in enumerate(self.non_mtp_layers):
-            layer_id = self.local_begin_layer_id + it
-            share_buf, read_buf = self._indexer_buffers_for(layer_id)
-            h = layer(
-                h, freqs_cis, share_buffer_to=share_buf, read_buffer_from=read_buf
-            )
+        for layer in self.non_mtp_layers:
+            h = layer(h, freqs_cis)
 
         if self.mtp_size > 1:
             self.mtp_prefill(
@@ -840,21 +610,19 @@ class TransformerGLM52(TransformerDeepSeekV3):
                 h=h,
                 freqs_cis=freqs_cis,
             )
-        h = h[output_token_offsets]
-        h = self._post_layers(h)
-        h = h.float()
-        return h
+        return self.cp_context.gather(
+            h,
+            output_token_offsets,
+            self._post_layers,
+        )
 
     @override
     @torch.inference_mode()
     def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
+        self._clear_backbone_indexer_buffer()
         h = self._pre_layers(tokens)
-        for it, layer in enumerate(self.non_mtp_layers):
-            layer_id = self.local_begin_layer_id + it
-            share_buf, read_buf = self._indexer_buffers_for(layer_id)
-            h = layer(
-                h, freqs_cis, share_buffer_to=share_buf, read_buffer_from=read_buf
-            )
+        for layer in self.non_mtp_layers:
+            h = layer(h, freqs_cis)
         if self.mtp_size > 1:
             self.update_mtp_hidden_states(
                 self.norm(h, compute_dtype=h.dtype), is_mtp=True
@@ -867,16 +635,19 @@ class TransformerGLM52(TransformerDeepSeekV3):
     @torch.inference_mode()
     def mtp_decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
         h = self._pre_layers_mtp(tokens)
-        share_buf = None if self._mtp_skip else self._mtp_buf
-        read_buf = self._mtp_buf if self._mtp_skip else None
-        h = self.layers[-1](
-            h,
-            freqs_cis,
-            self.read_mtp_hidden_states(),
-            is_mtp=True,
-            share_buffer_to=share_buf,
-            read_buffer_from=read_buf,
+        mtp_layer = self.layers[-1]
+        mtp_layer.set_indexer_buffer(
+            "read" if self._mtp_skip else "write", self._mtp_buf
         )
+        try:
+            h = mtp_layer(
+                h,
+                freqs_cis,
+                self.read_mtp_hidden_states(),
+                is_mtp=True,
+            )
+        finally:
+            mtp_layer.set_indexer_buffer(None, None)
         self.update_mtp_hidden_states(h)
         h = self._post_layers_mtp(h)
         h = h.float()
@@ -891,31 +662,40 @@ class TransformerGLM52(TransformerDeepSeekV3):
         output_token_offsets: torch.Tensor,
         **args,
     ) -> torch.Tensor:
+        self._clear_backbone_indexer_buffer()
         freqs_cis = self.prepare_freqs_cis()
+        delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
+        cp_active = self.cp_context.is_active and self.cp_context.should_split_prefill(
+            delta_total
+        )
 
         if self.pp_stage == 0:
-            batch_size = tokens.shape[0]
+            assert tokens is not None
             assert hiddens is None
+            tokens, freqs_cis = self.cp_context.split_prefill(
+                tokens, freqs_cis, hiddens, self.pp_stage, cp_active
+            )
+            batch_size = tokens.shape[0]
             h = self._pre_layers(tokens, **args)
         else:
-            batch_size = hiddens.shape[0]
+            assert hiddens is not None
             # Unpack topk from the incoming hidden payload when the previous
             # stage produced it (its last "full" layer crossed the stage boundary).
             if self._cross_stage_recv_topk:
                 hiddens, topk = self._unpack_topk(hiddens)
                 self._backbone_buf.topk = topk
+            tokens, freqs_cis = self.cp_context.split_prefill(
+                tokens, freqs_cis, hiddens, self.pp_stage, cp_active
+            )
+            batch_size = hiddens.shape[0]
             h = hiddens
             del hiddens
 
         if self.moe_impl is not None:
             self.moe_impl.prepare(TaskType.Prefill, batch_size)
 
-        for it, layer in enumerate(self.non_mtp_layers):
-            layer_id = self.local_begin_layer_id + it
-            share_buf, read_buf = self._indexer_buffers_for(layer_id)
-            h = layer(
-                h, freqs_cis, share_buffer_to=share_buf, read_buffer_from=read_buf
-            )
+        for layer in self.non_mtp_layers:
+            h = layer(h, freqs_cis)
 
         if self.pp_stage == self.pp_end_stage:
             if self.mtp_size > 1:
@@ -925,18 +705,29 @@ class TransformerGLM52(TransformerDeepSeekV3):
                     h=h,
                     freqs_cis=freqs_cis,
                 )
-            h = h[output_token_offsets]
-            h = self._post_layers(h)
-            h = h.float()
+            seq_len_delta = (
+                self.cache_dict["main"].seq_len_delta if self.pp_size > 1 else None
+            )
+            h = self.cp_context.gather(
+                h,
+                output_token_offsets,
+                self._post_layers,
+                pp_size=self.pp_size,
+                pp_stage=self.pp_stage,
+                seq_len_delta=seq_len_delta,
+            )
         else:
             # Pack topk into hidden state so the next stage can recover it.
-            if self._cross_stage_send_topk and self._backbone_buf.topk is not None:
+            if self._cross_stage_send_topk:
+                assert self._backbone_buf.topk is not None
+                assert self._backbone_buf.topk.shape[0] == h.shape[0]
                 h = self._pack_topk(h, self._backbone_buf.topk)
         return h
 
     @override
     @torch.inference_mode()
     def decode_pipeline(self, middle_state, freqs_cis: BatchedFreqsCis):
+        self._clear_backbone_indexer_buffer()
         if self.pp_stage == 0:
             h = self._pre_layers(middle_state)
         else:
@@ -946,12 +737,8 @@ class TransformerGLM52(TransformerDeepSeekV3):
                 middle_state, topk = self._unpack_topk(middle_state)
                 self._backbone_buf.topk = topk
             h = middle_state
-        for it, layer in enumerate(self.non_mtp_layers):
-            layer_id = self.local_begin_layer_id + it
-            share_buf, read_buf = self._indexer_buffers_for(layer_id)
-            h = layer(
-                h, freqs_cis, share_buffer_to=share_buf, read_buffer_from=read_buf
-            )
+        for layer in self.non_mtp_layers:
+            h = layer(h, freqs_cis)
         if self.pp_stage == self.pp_end_stage:
             if self.mtp_size > 1:
                 self.update_mtp_hidden_states(
@@ -961,7 +748,9 @@ class TransformerGLM52(TransformerDeepSeekV3):
             h = h.float()
         else:
             # Pack topk into hidden state for the next stage.
-            if self._cross_stage_send_topk and self._backbone_buf.topk is not None:
+            if self._cross_stage_send_topk:
+                assert self._backbone_buf.topk is not None
+                assert self._backbone_buf.topk.shape[0] == h.shape[0]
                 h = self._pack_topk(h, self._backbone_buf.topk)
         return h
 
@@ -970,8 +759,6 @@ class TransformerGLM52(TransformerDeepSeekV3):
     # ------------------------------------------------------------------
 
     def set_mtp_skip_topk(self, skip: bool) -> None:
-        if self.mtp_size <= 1:
-            return
         self._mtp_skip = skip
 
     # ------------------------------------------------------------------
@@ -1006,7 +793,7 @@ class TransformerGLM52(TransformerDeepSeekV3):
             layer_id = _layer_id_from_key(k)
             if layer_id < 0 or layer_id >= len(self.layers):
                 return True
-            return getattr(self.layers[layer_id].self_attn, "has_local_indexer", True)
+            return self.layers[layer_id].self_attn.has_local_indexer
 
         def enable_for_shared_indexer_layer(k: str) -> bool:
             if not enable_callback(k):
@@ -1014,34 +801,24 @@ class TransformerGLM52(TransformerDeepSeekV3):
             layer_id = _layer_id_from_key(k)
             if layer_id < 0 or layer_id >= len(self.layers):
                 return False
-            return not getattr(
-                self.layers[layer_id].self_attn, "has_local_indexer", True
-            )
+            return not self.layers[layer_id].self_attn.has_local_indexer
 
-        if not hasattr(self.params, "index_topk"):
-            return self.process_state_dict_for_merging_tensors(
-                checkpoint,
-                tgt_layer="wqkv_a",
-                src_layers=["q_a_proj", "kv_a_proj_with_mqa"],
-                enable_callback=enable_callback,
-            )
-        else:
-            checkpoint = self.process_state_dict_for_merging_tensors(
-                checkpoint,
-                tgt_layer="wqkv_a_indexer_k",
-                src_layers=["indexer_wk", "q_a_proj", "kv_a_proj_with_mqa"],
-                enable_callback=enable_for_local_indexer_layer,
-            )
-            checkpoint = self.process_state_dict_for_merging_tensors(
-                checkpoint,
-                tgt_layer="wq_b_indexer_q_b",
-                src_layers=["indexer_wq_b", "q_b_proj"],
-                enable_callback=enable_for_local_indexer_layer,
-            )
-            checkpoint = self.process_state_dict_for_merging_tensors(
-                checkpoint,
-                tgt_layer="wqkv_a",
-                src_layers=["q_a_proj", "kv_a_proj_with_mqa"],
-                enable_callback=enable_for_shared_indexer_layer,
-            )
-            return checkpoint
+        checkpoint = self.process_state_dict_for_merging_tensors(
+            checkpoint,
+            tgt_layer="wqkv_a_indexer_k",
+            src_layers=["indexer_wk", "q_a_proj", "kv_a_proj_with_mqa"],
+            enable_callback=enable_for_local_indexer_layer,
+        )
+        checkpoint = self.process_state_dict_for_merging_tensors(
+            checkpoint,
+            tgt_layer="wq_b_indexer_q_b",
+            src_layers=["indexer_wq_b", "q_b_proj"],
+            enable_callback=enable_for_local_indexer_layer,
+        )
+        checkpoint = self.process_state_dict_for_merging_tensors(
+            checkpoint,
+            tgt_layer="wqkv_a",
+            src_layers=["q_a_proj", "kv_a_proj_with_mqa"],
+            enable_callback=enable_for_shared_indexer_layer,
+        )
+        return checkpoint

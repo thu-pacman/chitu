@@ -30,7 +30,13 @@ from chitu.muxi_utils import (
     LinearMuxiLayoutContigY,
     LinearMuxiLayoutNativeY,
 )
-from chitu.ops import apply_rotary_pos_emb, rms_norm, moe_gate, add_shared_experts
+from chitu.ops import (
+    apply_rotary_pos_emb,
+    rms_norm,
+    layer_norm,
+    moe_gate,
+    add_shared_experts,
+)
 from chitu.cp_utils import get_cp_context
 from chitu.distributed.comm_group import CommGroup
 from chitu.distributed.parallel_state import (
@@ -105,13 +111,13 @@ class LayerNorm(nn.Module):
             compute_dtype = torch.float32
         else:
             compute_dtype = self.weight.dtype
-        return torch.nn.functional.layer_norm(
-            x.to(compute_dtype),
-            (self.dim,),
-            self.weight.to(compute_dtype),
-            self.bias.to(compute_dtype),
-            self.eps,
-        ).type_as(x)
+        return layer_norm(
+            x,
+            self.weight,
+            self.bias,
+            eps=self.eps,
+            compute_dtype=compute_dtype,
+        )
 
 
 class RMSNorm(nn.Module):
@@ -1359,7 +1365,6 @@ class Transformer(nn.Module):
             h,
             output_token_offsets,
             self._post_layers,
-            cp_active=self.cp_context.is_active,
         )
 
     @torch.inference_mode()
@@ -1442,7 +1447,7 @@ class Transformer(nn.Module):
         # to match local hidden states from previous PP stage.
         # Skip CP when the actual prefill delta is smaller than pcp_size -- the
         # flash_mla kernel requires a minimum number of work items per launch.
-        # Prefix caching can make the delta shorter than the original prompt,
+        # Prefix caching can make the delta shorter than the original prompt.
         delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
         cp_active = self.cp_context.is_active and self.cp_context.should_split_prefill(
             delta_total
@@ -1484,7 +1489,6 @@ class Transformer(nn.Module):
                 h,
                 output_token_offsets,
                 self._post_layers,
-                cp_active=cp_active,
                 pp_size=self.pp_size,
                 pp_stage=self.pp_stage,
                 seq_len_delta=seq_len_delta,
@@ -1675,6 +1679,7 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def decode(self, tokens: torch.Tensor):
         batch_size = len(tokens)
+        self.cp_context.set_step_active(False)
 
         if isinstance(self.cache_dict["main"], DenseKVCache):
             key = (batch_size, self.cache_dict["main"].get_start_and_end_idx()[0])

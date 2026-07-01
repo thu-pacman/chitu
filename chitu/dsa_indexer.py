@@ -614,8 +614,8 @@ class DSAIndexer:
                 cache_accessor.block_table,
                 seq_len_delta.new.position_ids_tensor_device,
                 seq_len_delta.new.seq_ids_tensor_device,
+                use_i64_offsets=cache_accessor.use_i64_offsets,
             )
-
             index_score = self.bf16_index_score_ragged_qk_dsv32_hygon(
                 q,
                 weights,
@@ -663,6 +663,7 @@ class DSAIndexer:
             cache_accessor.block_table,
             seq_len_delta.new.position_ids_tensor_device,
             seq_len_delta.new.seq_ids_tensor_device,
+            use_i64_offsets=cache_accessor.use_i64_offsets,
         )
         return self.bf16_index_score_ragged_qk_dsv32_torch_bf16(
             q, weights, k_full, seq_len_delta, is_causal

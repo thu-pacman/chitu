@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.kv_cache import KVCacheBase
-from chitu.models.model import RMSNorm, get_linear_layout_native_y
+from chitu.models.model import RMSNorm, LayerNorm, get_linear_layout_native_y
 from chitu.models.model_hf_llama import TransformerBlockHFLlama
 from chitu.models.model_hf_qwen2_vl import (
     VisionMLP,
@@ -170,7 +170,7 @@ class Glm4vVisionPatchMerger(VisionMLP):
             ),
             checkpoint_prefix=f"{checkpoint_prefix}.proj",
         )
-        self.post_projection_norm = nn.LayerNorm(in_features)
+        self.post_projection_norm = LayerNorm(in_features)
         self.act1 = nn.GELU()
 
     def forward(self, x):

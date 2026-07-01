@@ -41,7 +41,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-
 # Marker that distinguishes a documentation comment from an ordinary one.
 DOC_COMMENT_MARKER = "#:"
 

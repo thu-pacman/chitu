@@ -14,11 +14,6 @@ name: GLM-5.2
 type: glm-5-2
 source: "https://huggingface.co/zai-org/GLM-5.2" # Just for displaying. No automatic download.
 
-# Enables the shared top-k buffer + per-layer "full"/"shared" indexer
-# scheduling in TransformerGLM52. Required for GLM-5.2; vanilla
-# DeepSeek-V3 leaves this unset (false).
-share_index_cache: true
-
 # GLM-5.2 fields read directly from config.json. ``indexer_types`` is the
 # per-layer ``"full"`` / ``"shared"`` schedule driving the shared top-k
 # buffer; the others are passed through so future code can reference them

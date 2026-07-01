@@ -697,11 +697,24 @@ class AttentionDeepSeekV3(Attention):
             assert isinstance(
                 indexer_impl, DSAIndexer
             ), f"DSA is enabled, but got impl={type(indexer_impl)}"
-            self.indexer = Indexer(
+            self.indexer = self.make_indexer(
                 args,
                 checkpoint_prefix=f"{checkpoint_prefix}.indexer",
                 indexer_impl=indexer_impl,
             )
+
+    def make_indexer(
+        self,
+        args,
+        *,
+        checkpoint_prefix: str,
+        indexer_impl: DSAIndexer,
+    ) -> Indexer:
+        return Indexer(
+            args,
+            checkpoint_prefix=checkpoint_prefix,
+            indexer_impl=indexer_impl,
+        )
 
     def forward(
         self,
@@ -709,37 +722,18 @@ class AttentionDeepSeekV3(Attention):
         freqs_cis: BatchedFreqsCis,
         is_mtp: bool = False,
     ):
-        cp_ctx = self.cp_context
-        if cp_ctx.is_active:
-            seq_len_delta = (
-                self.cache.mtp_seq_len_delta if is_mtp else self.cache.seq_len_delta
-            )
-            use_cp = (
-                not seq_len_delta.is_decode_stage
-                and x.shape[0] != seq_len_delta.batch_size
-            )
-        else:
-            use_cp = False
-        return self._forward_impl(x, freqs_cis, is_mtp=is_mtp, cp_active=use_cp)
-
-    def _forward_impl(
-        self,
-        x: torch.Tensor,
-        freqs_cis: BatchedFreqsCis,
-        is_mtp: bool = False,
-        cp_active: bool = False,
-    ):
         """Unified forward for DeepSeek V3 MLA attention.
 
-        When cp_active=True, allgathers KV and uses local_lengths for causal bounds.
+        When CP step is active, allgathers KV and uses local_lengths for causal bounds.
         """
         seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
 
         n_tokens, _ = x.size()
         cp_ctx = get_cp_context()
+        cp_active = cp_ctx.step_active and not seq_len_delta.is_decode_stage
 
         # Clear stale CP cache from previous steps (e.g., prefill's local_lengths
-        # should not leak into decode). When cp_active=True, prepare_local_lengths
+        # should not leak into decode). When CP is active, prepare_local_lengths
         # will set fresh values before downstream methods read them.
         if not cp_active:
             cp_ctx.clear_step_cache()
@@ -915,7 +909,7 @@ class AttentionDeepSeekV3(Attention):
                     dim=-1,
                 )
 
-                if self.index_topk is not None:
+                if has_indexer_weights:
                     assert self.indexer_cache is not None
                     assert indexer_q is not None and indexer_k is not None
                     topk_indices = self.indexer(
@@ -957,10 +951,17 @@ class AttentionDeepSeekV3(Attention):
                         seq_len_delta, n_tokens, seq_len_delta.is_decode_stage
                     )
 
-                if self.index_topk is not None:
+                if has_indexer_weights:
                     assert self.indexer_cache is not None
                     indexer_cache_accessor = self.indexer_cache.get_accessor(
                         self.layer_id
+                    )
+                    force_topk_indices = bool(
+                        getattr(
+                            self.indexer,
+                            "must_materialize_topk_indices",
+                            lambda: False,
+                        )()
                     )
 
                     if cp_active:
@@ -984,6 +985,7 @@ class AttentionDeepSeekV3(Attention):
                             self.attn_backend.requires_sparse_decode_page_table()
                             and seq_len_delta.is_classic_decoding
                             and isinstance(main_cache_accessor, PagedKVCacheAccessor)
+                            and not force_topk_indices
                         ):
                             topk_page_table = self.indexer.build_decode_topk_page_table(
                                 x,
@@ -1016,6 +1018,7 @@ class AttentionDeepSeekV3(Attention):
                             self.attn_backend.requires_sparse_decode_page_table()
                             and seq_len_delta.is_classic_decoding
                             and isinstance(main_cache_accessor, PagedKVCacheAccessor)
+                            and not force_topk_indices
                         ):
                             topk_page_table = self.indexer.build_decode_topk_page_table(
                                 x,
@@ -1037,6 +1040,22 @@ class AttentionDeepSeekV3(Attention):
                                 is_causal=True,
                                 cache_accessor=indexer_cache_accessor,
                             )
+                else:
+                    read_reused_topk = getattr(
+                        getattr(self, "indexer", None),
+                        "read_reused_topk_for_mla",
+                        None,
+                    )
+                    if read_reused_topk is not None:
+                        topk_indices, topk_page_table = read_reused_topk(
+                            use_page_table=(
+                                self.attn_backend.requires_sparse_decode_page_table()
+                                and seq_len_delta.is_classic_decoding
+                                and isinstance(
+                                    main_cache_accessor, PagedKVCacheAccessor
+                                )
+                            )
+                        )
 
                 # ---- MLA attention ----
                 x = self.attn_backend.mla(
