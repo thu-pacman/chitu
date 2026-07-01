@@ -99,10 +99,19 @@ class CPContext:
         # Internal state for tracking split/gather across stages
         self._orig_num_tokens: int = 0
         self._n_local: int = 0
+        self._step_active: bool = False
 
         # Per-step cached values (set by prepare_local_lengths, read by layers)
         self._local_lengths: Optional[torch.Tensor] = None
         self._local_seq_ids: Optional[torch.Tensor] = None
+
+    def set_step_active(self, active: bool) -> None:
+        self._step_active = bool(active)
+        self.clear_step_cache()
+
+    @property
+    def step_active(self) -> bool:
+        return self._step_active
 
     def split_stage0(
         self, tokens: torch.Tensor, freqs_cis: BatchedFreqsCis
@@ -112,6 +121,7 @@ class CPContext:
         Pads to ceil(num_tokens/pcp_size) so all ranks have equal local length,
         which is required by CP allgather collectives.
         """
+        self.set_step_active(True)
         local_indices = torch.arange(
             self.cp_rank, tokens.shape[0], self.pcp_size, device=tokens.device
         )
@@ -139,6 +149,7 @@ class CPContext:
 
         Only splits freqs_cis; pads freqs_cis if stage 0 padded tokens.
         """
+        self.set_step_active(True)
         n_local = h.shape[0]
         bs_seq_full = n_local * self.pcp_size
         orig_len = freqs_cis.cos.shape[0]
@@ -180,6 +191,7 @@ class CPContext:
         Returns:
             (tokens, freqs_cis) after CP split. tokens unchanged at stage 1+.
         """
+        self.set_step_active(cp_active)
         if not cp_active:
             return tokens, freqs_cis
         if pp_stage == 0:
@@ -194,7 +206,7 @@ class CPContext:
         h: torch.Tensor,
         output_token_offsets: torch.Tensor,
         post_layers_fn,
-        cp_active: bool = False,
+        cp_active: Optional[bool] = None,
         pp_size: int = 1,
         pp_stage: int = 0,
         seq_len_delta: Optional[BatchedSeqLenDelta] = None,
@@ -213,11 +225,12 @@ class CPContext:
         Returns:
             Logits tensor [num_outputs, dim]
         """
-        # Decide whether CP gather is needed:
-        # - Stage 0 / no-PP: use cp_active (local tokens >= pcp_size)
-        # - Stage 1+: use delta_total_len because stage 0 may have CP-split
-        #   the batch even when this stage's n_local < pcp_size.
-        need_gather = cp_active
+        # Decide whether CP gather is needed. By default attention and the
+        # final gather share the per-step CP state set by split_prefill().
+        # For later PP stages, also consult the global delta length because
+        # stage 0 may have CP-split the batch even when this stage's local
+        # token count is smaller than pcp_size.
+        need_gather = self.step_active if cp_active is None else cp_active
         if not need_gather and pp_size > 1 and pp_stage != 0:
             if seq_len_delta is not None:
                 delta_total = seq_len_delta.delta_total_len
@@ -492,6 +505,10 @@ class NoOpCPContext:
     cp_group: None = None
     local_lengths = None
     local_seq_ids = None
+    step_active: bool = False
+
+    def set_step_active(self, active: bool):
+        self.step_active = False
 
     def split_stage0(self, tokens, freqs_cis):
         return tokens, freqs_cis
@@ -507,7 +524,7 @@ class NoOpCPContext:
         h,
         output_token_offsets,
         post_layers_fn,
-        cp_active=False,
+        cp_active=None,
         pp_size=1,
         pp_stage=0,
         seq_len_delta=None,
@@ -534,7 +551,7 @@ class NoOpCPContext:
     def barrier_if_pp(self, pp_size):
         pass
 
-    def should_split_prefill(self, num_tokens, pp_stage, delta_total=0):
+    def should_split_prefill(self, delta_total: int = 0) -> bool:
         return False
 
     def compute_pp_num_tokens(self, num_tokens):

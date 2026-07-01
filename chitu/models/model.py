@@ -1365,7 +1365,6 @@ class Transformer(nn.Module):
             h,
             output_token_offsets,
             self._post_layers,
-            cp_active=self.cp_context.is_active,
         )
 
     @torch.inference_mode()
@@ -1448,7 +1447,7 @@ class Transformer(nn.Module):
         # to match local hidden states from previous PP stage.
         # Skip CP when the actual prefill delta is smaller than pcp_size -- the
         # flash_mla kernel requires a minimum number of work items per launch.
-        # Prefix caching can make the delta shorter than the original prompt,
+        # Prefix caching can make the delta shorter than the original prompt.
         delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
         cp_active = self.cp_context.is_active and self.cp_context.should_split_prefill(
             delta_total
@@ -1490,7 +1489,6 @@ class Transformer(nn.Module):
                 h,
                 output_token_offsets,
                 self._post_layers,
-                cp_active=cp_active,
                 pp_size=self.pp_size,
                 pp_stage=self.pp_stage,
                 seq_len_delta=seq_len_delta,
@@ -1681,6 +1679,7 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def decode(self, tokens: torch.Tensor):
         batch_size = len(tokens)
+        self.cp_context.set_step_active(False)
 
         if isinstance(self.cache_dict["main"], DenseKVCache):
             key = (batch_size, self.cache_dict["main"].get_start_and_end_idx()[0])

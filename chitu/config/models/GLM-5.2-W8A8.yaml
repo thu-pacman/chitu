@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# GLM-5.2-W8A8 shares the GLM-5.2 shared-indexer model structure and uses
+# the existing GLM-5 W8A8 quantization config.
+defaults:
+  - GLM-5.2
+  - quant_config: glm-5-ascend-w8a8
+  - _self_ # Config in this file overrides configs in defaults
+
+name: GLM-5.2-W8A8
