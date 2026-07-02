@@ -417,19 +417,27 @@ def parse_api_key_from_headers(
 ) -> str:
     if x_api_key:
         return x_api_key
-    if authorization is None:
+
+    if not authorization:
         return ""
 
     value = authorization.strip()
-    if value == "":
+    if not value:
         return ""
 
-    if not value.lower().startswith("bearer"):
-        raise HTTPException(
-            status_code=400, detail="Authorization header must start with 'Bearer'"
-        )
-    return value[len("bearer") :].strip()
+    scheme, sep, token = value.partition(" ")
 
+    if sep:
+        if scheme.lower() != "bearer":
+            return ""
+        return token.strip()
+
+    # Handle legacy case where the token is provided without a scheme
+    if value.lower().startswith("bearer"):
+        legacy_token = value[6:].strip()  # len("Bearer") == 6
+        return legacy_token
+
+    return ""
 
 def build_chat_template_kwargs(
     enable_thinking: bool,
