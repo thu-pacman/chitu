@@ -178,21 +178,6 @@ class Indexer(torch.nn.Module):
         if not k_pre_normed:
             k = self.k_norm(k)
 
-        # On NPU the partial-rotary kernel may return a
-        # PartialColumnOddEvenSeparatedTensor.
-        # The downstream operators here (hadamard, matmul,
-        # append_to_paged_kv_cache) all expect a plain
-        # tensor, so unwrap it back to mathematical layout.
-        if isinstance(q, NativeLayoutTensor):
-            q = q.layout_tensor
-        if isinstance(k, NativeLayoutTensor):
-            k = k.layout_tensor
-
-        q = self._rotate_activation(q)
-        k = self._rotate_activation(k)
-        if self.indexer_impl.impl in ("hygon", "torch_bf16"):
-            return (q, None), (k, None)
-
         if freqs_cis_k is not None:
             # CP mode: separate RoPE for Q (local) and K (global)
             q_rot, _, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
@@ -202,6 +187,7 @@ class Indexer(torch.nn.Module):
                 q_rotary_end=self.rope_head_dim,
                 k_rotary_end=self.rope_head_dim,
                 rotary_type=self.index_rope_layout,
+                impl="torch_npu" if has_torch_npu else "auto",
             )
             _, k_rot, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
                 k,
@@ -210,6 +196,7 @@ class Indexer(torch.nn.Module):
                 q_rotary_end=self.rope_head_dim,
                 k_rotary_end=self.rope_head_dim,
                 rotary_type=self.index_rope_layout,
+                impl="torch_npu" if has_torch_npu else "auto",
             )
         else:
             # Non-CP mode: unified RoPE for Q and K
@@ -220,13 +207,14 @@ class Indexer(torch.nn.Module):
                 q_rotary_end=self.rope_head_dim,
                 k_rotary_end=self.rope_head_dim,
                 rotary_type=self.index_rope_layout,
+                impl="torch_npu" if has_torch_npu else "auto",
             )
             q_rot = q
             k_rot = k
 
         q_rot = self._rotate_activation(q_rot)
         k_rot = self._rotate_activation(k_rot)
-        if self.indexer_impl.impl == "hygon":
+        if self.indexer_impl.impl in ("hygon", "torch_bf16"):
             return (q_rot, None), (k_rot, None)
         return blockfp8_act_quant(
             q_rot, block_size=self.block_size
