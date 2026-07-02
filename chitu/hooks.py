@@ -5,7 +5,6 @@
 
 from typing import Protocol, Optional
 import logging
-import torch
 import time
 
 from chitu.global_vars import get_global_args
@@ -23,12 +22,16 @@ if TYPE_CHECKING:
     from chitu.task import PackedTasksBase
 from chitu.distributed.pd_disaggregation.pd_log_utils import pd_trace_enabled
 from chitu.distributed.pd_disaggregation.pd_scheduler import get_pd_scheduler_instance
-
-logger = logging.getLogger(__name__)
+from chitu.distributed.parallel_state import get_dp_group
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import KVManager
+    from chitu.distributed.pd_disaggregation.kv_transfer import (
+        KVManagerPrefill,
+        KVManagerDecode,
+    )
+
+logger = logging.getLogger(__name__)
 
 
 class TokenSink(Protocol):
@@ -107,8 +110,6 @@ class KVTransferHook(Protocol):
     def before_decode_step(
         self,
         req_ids: list[str],
-        new_cache_ids_list: Optional[list[dict[str, list[int]]]] = None,
-        prefix_lens: Optional[list[int]] = None,
     ):
         pass
 
@@ -120,8 +121,6 @@ class NoopKVTransferHook:
     def before_decode_step(
         self,
         req_ids: list[str],
-        new_cache_ids_list: Optional[list[dict[str, list[int]]]] = None,
-        prefix_lens: Optional[list[int]] = None,
     ):
         return
 
@@ -134,7 +133,9 @@ class MooncakeKVTransferHook:
       - "decode" : receive KV before decode
     """
 
-    def __init__(self, kv_manager: "KVManager", disaggregation_mode: str):
+    def __init__(
+        self, kv_manager: "KVManagerPrefill|KVManagerDecode", disaggregation_mode: str
+    ):
         self.kv_manager = kv_manager
         self.mode = disaggregation_mode
 
@@ -146,24 +147,22 @@ class MooncakeKVTransferHook:
         if tasks.num_tasks == 0 and not DPTaskCollector.available():
             return
 
-        send_tokens = None
+        first_tokens = None
         if isinstance(tasks, PackedTasks) and tasks.generated_result is not None:
-            send_tokens = tasks.generated_result.tokens
+            first_tokens = tasks.generated_result.tokens.flatten().tolist()
 
         # Send KV cache and first-token metadata to decode side.
-        kv_cache = self.kv_manager.kv_cache
-
         if tasks.num_tasks > 0:
-            # Send KV cache and first-token metadata to decode side.
-            kv_cache = self.kv_manager.kv_cache
-
             req_ids_output = tasks.output_task_ids
             request_cached_tokens = {}
             for t in getattr(tasks, "output_tasks", []):
                 if t is None or getattr(t, "req", None) is None:
                     continue
                 request_cached_tokens[str(t.req.request_id)] = int(t.req.num_hit_tokens)
-            if send_tokens is None:
+            num_hit_tokens = [
+                request_cached_tokens.get(rid, 0) for rid in req_ids_output
+            ]
+            if first_tokens is None:
                 # 看到该日志表示：该 rank 只传输 KV Cache（不包含首 token）
                 logger.debug(f"[KVHook] sending KV-only for requests: {req_ids_output}")
             else:
@@ -179,15 +178,14 @@ class MooncakeKVTransferHook:
             if pd_trace_enabled():
                 logger.debug(
                     f"[PD_TRACE][prefill.kv_send] req_ids={req_ids_output} batch={len(req_ids_output)} "
-                    f"token_shape={list(send_tokens.shape) if isinstance(send_tokens, torch.Tensor) else None} "
+                    f"first_tokens={first_tokens} "
                     f"cache_type={get_global_args().infer.cache_type}"
                 )
 
             self.kv_manager.send_kv_cache(
-                first_tokens=send_tokens,
+                first_tokens=first_tokens,
                 request_ids=req_ids_output,
-                kv_cache=kv_cache,
-                request_cached_tokens=request_cached_tokens,
+                num_hit_tokens=num_hit_tokens,
             )
 
             # Record KV send duration (covers enqueue; actual RDMA transfer is async)
@@ -213,8 +211,6 @@ class MooncakeKVTransferHook:
     def before_decode_step(
         self,
         req_ids: list[str],
-        new_cache_ids_list: Optional[list[dict[str, list[int]]]] = None,
-        prefix_lens: Optional[list[int]] = None,
     ):
         if self.kv_manager is None:
             return
@@ -223,126 +219,44 @@ class MooncakeKVTransferHook:
         # Receive KV cache from prefill side and insert into local engine.
         from chitu.backend import Backend  # local import to avoid cycles
 
-        # FIXME: Managers other than "main"
-        kv_cache = self.kv_manager.kv_cache
         if len(req_ids) == 0:
             return
         # Short-circuit if KV already present for all requests.
-        # NOTE: Must check kv_cache, not just block_table!
-        # reserve_blocks_for_transfer() allocates blocks but doesn't set seq_len.
-        # Only insert_kv_cache_from_transfer() sets kv_cache after KV data transfer.
         pending: list[str] = []
         for rid in req_ids:
-            has_kv = False
-            # Check if seq_len is set (indicates KV was fully transferred and inserted)
-            if hasattr(kv_cache, "tid_to_cached_len"):
-                has_kv = rid in kv_cache.tid_to_cached_len
-            elif hasattr(kv_cache, "block_table"):
-                has_kv = rid in kv_cache.block_table
-            if not has_kv:
+            if self.kv_manager._info(rid, create=False) is not None:
                 pending.append(rid)
         if not pending:
             return
 
-        # 看到该日志表示：Decode 即将阻塞等待 KV pull succ
-        logger.debug(f"[KVHook] receiving KV for requests: {pending}")
-        if pd_trace_enabled():
-            logger.debug(
-                f"[PD_TRACE][decode.kv_pull_start] pending={pending} total_req_ids={len(req_ids)} "
-                f"rank={Backend.executor.rank} tp={Backend.executor.tp_size} "
-                f"dp={Backend.executor.dp_size} ep={Backend.executor.ep_size}"
-            )
-        provided_prefix_lens = (
-            prefix_lens
-            if prefix_lens is not None and len(prefix_lens) == len(req_ids)
-            else None
-        )
-        provided_new_cache_ids_list = (
-            new_cache_ids_list
-            if new_cache_ids_list is not None
-            and len(new_cache_ids_list) == len(req_ids)
-            else None
-        )
-        pending_prefix_lens = []
-        pending_new_cache_ids_list = []
-        for idx, rid in enumerate(req_ids):
-            if rid not in pending:
-                continue
-            t = TaskPool.pool.get(rid)
-            prefix_len = (
-                int(provided_prefix_lens[idx])
-                if provided_prefix_lens is not None
-                else (int(t.prefix_tokens_len) if t is not None else 0)
-            )
-            pending_prefix_lens.append(prefix_len)
-            new_cache_ids = (
-                provided_new_cache_ids_list[idx]
-                if provided_new_cache_ids_list is not None
-                else getattr(t, "new_cache_ids", None)
-            )
-            pending_new_cache_ids_list.append(new_cache_ids)
-        if pd_trace_enabled():
-            logger.debug(
-                f"[PD_TRACE][decode.kv_pull_prefix] pending={pending} prefix_lens={pending_prefix_lens}"
+        for req_id in pending:
+            first_token, num_hit_tokens = self.kv_manager.recv_kv_cache_and_insert(
+                req_id
             )
 
-        # Ensure the local decode rank knows which prefill engine_rank to talk to.
-        # In PD decode-only, the scheduler runs only on dp main rank and sets the binding there.
-        # Worker ranks must recover this binding from Task bootstrap metadata.
-        for rid in pending:
-            task = TaskPool.pool.get(rid)
-            if task is None or not hasattr(task, "pd_prefill_engine_rank"):
-                continue
-            prefill_rank = task.pd_prefill_engine_rank
-            if prefill_rank is None:
-                continue
-            room = self.kv_manager._to_uuid(rid)
-            if self.kv_manager.prefill_target_rank_by_room.get(room) is None:
-                self.kv_manager.set_prefill_target_engine_rank(rid, prefill_rank)
-
-        first_tokens, cached_hit_tokens = self.kv_manager.recv_kv_cache_and_insert(
-            request_ids=pending,
-            kv_cache=kv_cache,
-            prefix_lens=pending_prefix_lens,
-            new_cache_ids_list=pending_new_cache_ids_list,
-        )
-        if pd_trace_enabled():
-            logger.debug(
-                f"[PD_TRACE][decode.kv_pull_done] pending={pending} token_shape={list(first_tokens.shape)}"
-            )
-        if len(pending) == 0:
-            return
-        tokens_cpu = first_tokens.to(dtype=torch.int64, device="cpu").tolist()
-        cached_hit_tokens_cpu = cached_hit_tokens.to(
-            dtype=torch.int64, device="cpu"
-        ).tolist()
-        for rid, token, cached_hit_tokens_i in zip(
-            pending, tokens_cpu, cached_hit_tokens_cpu
-        ):
-            task = TaskPool.pool.get(rid)
+            task = TaskPool.pool.get(req_id)
             if task is None:
                 continue
             # Worker rank 的 task 没有 req；先把值挂在 task 上，后续由主 rank 汇聚回传。
-            task._pd_cached_hit_tokens_for_dp_emit = int(cached_hit_tokens_i)
+            task._pd_cached_hit_tokens_for_dp_emit = num_hit_tokens
             if not task.has_next_token():
-                task.update_response_sync([int(token)])
+                task.update_response_sync([first_token])
                 # DP worker rank 的 task 没有被 DPTaskWrapper 替换 update_response_sync，
                 # 上面的 update_response_sync 只更新了本地状态，不会把 token 发给 Router。
                 # 在 task 上标记这个 token，后续 collect_token 会把它带回 rank 0 补发。
                 if Backend.executor.rank != 0:
-                    task._pd_first_token_for_dp_emit = int(token)
+                    task._pd_first_token_for_dp_emit = first_token
             if task.req is not None and not task._pd_first_token_applied:
-                task.req.num_hit_tokens = max(
-                    int(task.req.num_hit_tokens),
-                    int(cached_hit_tokens_i),
-                )
+                task.req.num_hit_tokens = max(task.req.num_hit_tokens, num_hit_tokens)
                 task._pd_first_token_applied = True
                 max_seq_len = get_global_args().infer.max_seq_len
                 remaining = max(0, int(max_seq_len) - int(task.prefix_tokens_len))
                 task.req.max_new_tokens = min(int(task.req.max_new_tokens), remaining)
-        from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 
-        PrometheusMetricsCollector.inc_generated_tokens(len(tokens_cpu))
+        if get_dp_group().group_id == 0:
+            from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
+
+            PrometheusMetricsCollector.inc_generated_tokens(len(pending))
 
 
 class TaskEvictHook(Protocol):

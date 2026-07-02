@@ -129,6 +129,7 @@ class KvTransferConfig:
     buffer_size: int = MISSING
     transfer_timeout: float = MISSING
     max_concurrent_transfers: int = MISSING
+    pd_tp_ratio: int = MISSING
     # Settings for how long Decode waits for the Success signal from Prefill
     # (see kv_manager.recv_kv_cache_and_insert).
     decode_wait_timeout_s: float = MISSING

@@ -7,7 +7,6 @@ from typing_extensions import override
 from dataclasses import dataclass
 from logging import getLogger
 import torch
-import functools
 from enum import Enum
 from collections import deque, defaultdict
 
@@ -492,6 +491,7 @@ class PagedKVCache(KVCacheBase):
         block_size: int = 512,  # must be a multiple of 256 for FlashAttention
         is_singleton: bool = False,
         manager_name: str = "main",
+        split_size: int = 0,
     ):
         super().__init__(
             layer_id_map,
@@ -527,6 +527,7 @@ class PagedKVCache(KVCacheBase):
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.manager_name = manager_name
+        self.split_size = split_size
 
         self.block_table: dict[str, list[int]] = defaultdict(
             list
@@ -547,6 +548,14 @@ class PagedKVCache(KVCacheBase):
                 dtype=self.dtype_dict[key],
                 device=device,
             )
+
+        from chitu.distributed.pd_disaggregation.kv_transfer.cache_info import (
+            build_cache_transfer_info_map,
+        )
+
+        self._cache_transfer_infos = build_cache_transfer_info_map(
+            self.paged_kv_cache, self.split_size
+        )
 
         self._page_ids_static_tensor = StaticTensor(
             max_nelem=self.max_total_delta_len, device=device, dtype=torch.int32
@@ -794,32 +803,6 @@ class PagedKVCache(KVCacheBase):
     def get_gpu_block_table(self):
         return self.gpu_block_table.get()
 
-    # --- PD disaggregation support ---
-    def get_contiguous_buf_infos(self):
-        """
-        Return contiguous buffer info for RDMA registration.
-        For each layer, provide base pointer, total length (bytes), and per-item length (bytes) of one page.
-        """
-        kv_data_ptrs = []
-        kv_data_lens = []
-        kv_item_lens = []
-        for key in self.paged_kv_cache:
-            logger.info(f"Getting contiguous buffer info for key: {key}")
-            item_len = (
-                int(self.block_size)
-                * functools.reduce(
-                    lambda x, y: x * y, self.shape_per_token_dict[key], 1
-                )
-                * self.paged_kv_cache[key].element_size()
-            )
-            total_len = int(self.num_blocks) * item_len
-            for layer in range(self.num_layers):
-                layer_ptr = self.paged_kv_cache[key][layer].data_ptr()
-                kv_data_ptrs.append(layer_ptr)
-                kv_data_lens.append(total_len)
-                kv_item_lens.append(item_len)
-        return kv_data_ptrs, kv_data_lens, kv_item_lens
-
     def get_page_indices(self, req_id):
         """Return current allocated page indices for a request, empty if not found."""
         return self.block_table.get(req_id, [])
@@ -840,6 +823,64 @@ class PagedKVCache(KVCacheBase):
         self.block_table[tid] = list(int(x) for x in page_indices)
         self.tid_to_cached_len[tid] = int(prefix_length)
 
+    def get_kv_transfer_buffers(
+        self,
+        buffers,
+        req_id: str,
+        block_indices: list[int],
+    ):
+        """Register block entries for send or recv into TransferBuffers."""
+
+        if not block_indices:
+            return
+
+        for key, cache in self.paged_kv_cache.items():
+            ci = self._cache_transfer_infos[key]
+
+            for i, block_id in enumerate(block_indices):
+                for local_layer in range(self.num_layers):
+                    global_layer = self.layer_id_map.to_global(local_layer)
+                    block = cache[local_layer, block_id]
+                    if not block.is_contiguous():
+                        block = block.contiguous()
+                    chunks = block.view(-1).chunk(ci.n_chunks)
+                    for j, chunk in enumerate(chunks):
+                        buffers.add(
+                            chunk.data_ptr(),
+                            chunk.numel() * chunk.element_size(),
+                            cache_name=key,
+                            req_id=req_id,
+                            layer_id=global_layer,
+                            block_id=i,
+                            split_id=ci.split_id(j),
+                            split_num=ci.split_num,
+                            replica_id=ci.replica_id,
+                            replica_size=ci.replica_size,
+                        )
+
+    def kv_recv_reorder(self, new_block_ids: list[int]):
+        """Permute chunk-interleaved layout back to T-major.
+
+        ``view(-1).chunk(n_chunks)`` splits flat memory by T, yielding
+        n_chunks groups.  Permute from ``(n_chunks, T, -1)`` to ``(T, -1)``.
+        """
+        for key, cache in self.paged_kv_cache.items():
+            if self.split_size == 0:
+                continue
+            ci = self._cache_transfer_infos[key]
+            if ci.n_chunks <= 1:
+                continue
+
+            for block_id in new_block_ids:
+                for layer in range(cache.shape[0]):
+                    block = cache[layer, block_id].contiguous()
+                    cache[layer, block_id] = (
+                        block.view(ci.n_chunks, block.shape[0], -1)
+                        .permute(1, 0, 2)
+                        .reshape(block.shape)
+                        .contiguous()
+                    )
+
 
 class SingletonPagedKVCache(PagedKVCache):
     """
@@ -858,6 +899,7 @@ class SingletonPagedKVCache(PagedKVCache):
         n_local_kv_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
         device="cuda",
+        split_size: int = 0,
     ):
         self.mtp_size = get_global_args().infer.mtp_size
         super().__init__(
@@ -871,7 +913,9 @@ class SingletonPagedKVCache(PagedKVCache):
             device=device,
             block_size=self.mtp_size,
             num_blocks=num_hot_req,
+            manager_name="",
             is_singleton=True,
+            split_size=split_size,
         )
         self.max_blocks_per_req = 1
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
@@ -957,14 +1001,10 @@ class SingletonPagedKVCache(PagedKVCache):
     def offs_in_page_mtp(self):
         return torch.zeros_like(self.mtp_seq_len_delta.delta_lens_tensor_device)
 
-    # NOTE: get_contiguous_buf_infos is inherited from PagedKVCache.
-    # The implementation is generic and works correctly for singleton cache
-    # (block_size=1, num_blocks=num_hot_req).
-
     def reserve_blocks_for_transfer(self, tid: str, num_blocks: int) -> list[int]:
         """Reserve a number of free blocks for an incoming transfer on decode side.
         The reserved blocks are removed from the free list immediately to avoid
-        collision and are recorded in `block_table[req_id]`.
+        collision
         SingletonPagedKVCache没有对应的SingletonPagedKVCacheManager，因此需要自行分配和管理kv cache block索引
         """
         reserved: list[int] = []
@@ -986,7 +1026,6 @@ class SingletonPagedKVCache(PagedKVCache):
         for _ in range(num_blocks):
             reserved.append(self.get_free_block())
 
-        self.block_table[tid] = list(reserved)
         return reserved
 
     def insert_linear_state_from_transfer(

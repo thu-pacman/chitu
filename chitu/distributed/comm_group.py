@@ -119,9 +119,9 @@ class CommGroup:
             )
         if contains_this_rank.count(True) > 1:
             raise ValueError("One rank can not participate in multiple sub-groups.")
-        this_rank_idx = contains_this_rank.index(True)
-        self.cpu_group = cpu_groups[this_rank_idx]
-        self.gpu_group = gpu_groups[this_rank_idx]
+        self.group_id = contains_this_rank.index(True)
+        self.cpu_group = cpu_groups[self.group_id]
+        self.gpu_group = gpu_groups[self.group_id]
         self.all_gpu_groups = gpu_groups  # Expose to get_pp_pair_group call
 
         if type(self.gpu_group) != SingletonGroupPlaceholder:
@@ -131,7 +131,7 @@ class CommGroup:
 
         # NOTE: `self.rank_list` is local, which includes only the ranks communicating with
         # the current rank. This is different from `self.rank_lists`.
-        self.rank_list: Sequence[int] = rank_lists[this_rank_idx]
+        self.rank_list: Sequence[int] = rank_lists[self.group_id]
 
         self.rank_in_group = self.rank_list.index(global_rank)
         self.group_size = len(self.rank_list)

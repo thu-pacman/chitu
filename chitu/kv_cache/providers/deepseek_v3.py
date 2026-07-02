@@ -148,6 +148,11 @@ def deepseek_v3_kv_cache_spec(args, attn_backend_type) -> KVCacheSpec:
             "k": (n_local_heads, k_head_dim),
             "v": (n_local_heads, v_head_dim),
         }
-        return KVCacheSpec(kvargs=kvargs, kv_keys=["k", "v"])
+        assert args.models.n_heads % n_local_heads == 0
+        return KVCacheSpec(
+            kvargs=kvargs,
+            kv_keys=["k", "v"],
+            split_size=args.models.n_heads // n_local_heads,
+        )
 
     raise NotImplementedError(f"Unsupported mla_absorb {mla_absorb}")

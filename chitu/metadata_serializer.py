@@ -55,7 +55,6 @@ class MetadataConfig:
     include_prompt_len: bool = False
     include_next_token: bool = False
     include_pd_prefill_engine_rank: bool = False
-    include_boot_ids: bool = False
 
     # 辅助信息
     include_has_outputs: bool = False  # 状态信息
@@ -178,27 +177,6 @@ class MetadataConfig:
             include_prompt_len=True,
             include_pd_prefill_engine_rank=True,
             include_next_token=True,
-        )
-
-    @classmethod
-    def for_pd_dp_decode_rank(cls) -> "MetadataConfig":
-        """PD 对 decode rank 通信专用配置（DP 版）
-
-        比常规的 PD 分离配置多传输一个 boot_ids，用于接收 bootstrap 信息
-        """
-        return cls(
-            include_task_ids=True,
-            include_payload_type=True,
-            include_task_type=True,
-            include_has_outputs=True,
-            include_slot_idx=True,
-            include_sample_params=True,
-            include_return_params=True,
-            include_prompt_len=True,
-            include_pd_prefill_engine_rank=True,
-            include_next_token=True,
-            include_boot_ids=True,
-            include_tokens=True,
         )
 
     # 目前未使用，保留
@@ -371,14 +349,6 @@ class MetadataSerializer:
         # 辅助信息
         if config.include_slot_idx and slot_idx is not None:
             msg_dict["slot_idx"] = slot_idx
-        if config.include_boot_ids and len(new_task_ids) > 0:
-            # Decode task meta：首次下发时发送 MsgPackableTask
-            # 让 worker rank 本地 TaskPool 可以构造 PackedTasks，并在收到 bootstrap 时发送 TransferInfo
-            msg_dict["boot_ids"] = new_task_ids
-            logger.debug(
-                f"[PD_TRACE][dp.send_decode_bootstrap] to_rank={int(target_rank)} "
-                f"scheduled_task_ids_len={len(tasks.task_ids)} bootstrap_tasks={new_task_ids}"
-            )
 
         if tasks.new_cache_ids_list:
             msg_dict["new_cache_ids_list"] = tasks.new_cache_ids_list
@@ -491,10 +461,6 @@ class MetadataSerializer:
         packed_tasks.inc_hit_tokens_list = msg_dict.get("inc_hit_tokens_list", [])
         packed_tasks.prefix_lens = msg_dict.get("prefix_lens", [])
 
-        boot_ids = msg_dict.get("boot_ids", None)
-        if boot_ids:
-            extra_info["boot_ids"] = boot_ids
-
         return payload_type, packed_tasks, slot_idx, extra_info
 
     def _create_task_from_data(
@@ -570,8 +536,6 @@ class MetadataSerializer:
             return MetadataConfig.for_prefill()
         elif tasks.task_type == TaskType.Decode:
             if pd_enabled:
-                if self.mode == "DP":
-                    return MetadataConfig.for_pd_dp_decode_rank()
                 return MetadataConfig.for_pd_decode_rank()
             else:
                 return MetadataConfig.for_decode_with_status()

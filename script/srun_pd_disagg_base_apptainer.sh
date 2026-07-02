@@ -54,7 +54,7 @@ usage() {
 
 
   5. Router / Apptainer 相关参数:
-     --router-port PORT                     (默认 21003)
+     --router-port PORT                     (默认 22001)
      --router-prefill-max-batch-size N      (默认 32)
      --router-prefill-max-total-tokens N    (默认 8192)
      --router-prefill-batching-strategy S   (默认 varlen)
@@ -227,7 +227,7 @@ apply_job_port_defaults() {
   local job_id="${1:-}"
   PD_JOB_PORT_OFFSET="$(calc_job_port_offset "${job_id}")"
   if [ -z "${PD_ROUTER_PORT}" ]; then
-    PD_ROUTER_PORT=$((21003 + PD_JOB_PORT_OFFSET))
+    PD_ROUTER_PORT=$((22001 + PD_JOB_PORT_OFFSET))
   fi
 }
 
@@ -543,7 +543,7 @@ pd_node_main() {
     "models=${MODEL_CONFIG}" "models.ckpt_dir=${MODEL_CKPT_DIR}"
     "infer.cache_type=${PD_CACHE_TYPE}"
     "coordinator.host=${ROUTER_IP}"
-    "coordinator.port=21001"
+    "coordinator.port=$((21001 + PD_JOB_PORT_OFFSET))"
     "serve.port=${PD_ROUTER_PORT}"
     "infer.use_cuda_graph=${MODEL_USE_CUDA_GRAPH}" "infer.schedule_overlap=${MODEL_SCHEDULE_OVERLAP}"
     "float_16bit_variant=${MODEL_FLOAT16_VARIANT}"

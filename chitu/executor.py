@@ -652,48 +652,6 @@ class ExpertDataDispatcher(TasksDispatcher):
             payload_type, tasks, slot_idx, extra_info = (
                 self.metadata_serializer.deserialize_metadata(tasks_msg)
             )
-            if extra_info.get("boot_ids", None) is not None:
-                logger.debug(f"DP rank {self.rank_in_group} received decode bootstrap")
-                boot_ids = extra_info["boot_ids"]
-                assert all(
-                    task_id in TaskPool.pool for task_id in boot_ids
-                ), "Bootstrap ID not in task pool"
-                # PD decode-only: prepare TransferInfo on worker ranks immediately upon bootstrap.
-                kv_hook = self.get_executor().get_kv_hook()
-                kv_manager = getattr(kv_hook, "kv_manager", None)
-                if (
-                    kv_manager is not None
-                    and getattr(kv_hook, "mode", None) == "decode"
-                ):
-                    kv_cache = getattr(kv_manager, "kv_cache", None)
-                    if kv_cache is not None and boot_ids:
-                        prefix_lens = []
-                        rid_to_pos = {
-                            rid: pos for pos, rid in enumerate(tasks.task_ids)
-                        }
-                        new_cache_ids_list = []
-                        for rid in boot_ids:
-                            t = TaskPool.pool[rid]
-                            prefix_lens.append(t.prefix_tokens_len)
-                            if tasks.new_cache_ids_list:
-                                new_cache_ids_list.append(
-                                    tasks.new_cache_ids_list[rid_to_pos[rid]]
-                                )
-                            else:
-                                new_cache_ids_list.append({})
-                            prefill_rank = t.pd_prefill_engine_rank
-                            kv_manager.set_prefill_target_engine_rank(rid, prefill_rank)
-                        kv_manager.prepare_kv_transfer(
-                            request_ids=list(boot_ids),
-                            kv_cache=kv_cache,
-                            prefix_lens=prefix_lens,
-                            new_cache_ids_list=new_cache_ids_list,
-                        )
-                logger.debug(
-                    f"[PD_TRACE][dp.recv_decode_bootstrap] rank_in_group={int(self.rank_in_group)} "
-                    f"boot_ids_len={len(boot_ids)} frames={len(msgs)} "
-                    f"frame_bytes={[len(m) for m in msgs]}"
-                )
             slot_handle = get_slot_handle()
             if slot_handle and slot_idx is not None:
                 slot_handle.set_slot_idx(slot_idx)
@@ -1383,11 +1341,7 @@ class Executor:
             is_empty_step = True
         if not is_empty_step:
             # Ensure KV cache is present for PD decode-only before updating CacheManager state.
-            self._kv_hook.before_decode_step(
-                tasks.req_ids,
-                new_cache_ids_list=getattr(tasks, "new_cache_ids_list", []),
-                prefix_lens=getattr(tasks, "prefix_lens", None),
-            )
+            self._kv_hook.before_decode_step(tasks.req_ids)
 
             if self.mtp_size > 1:
                 mtp_token_indices = self._prepare_mtp_token_indices(tasks)

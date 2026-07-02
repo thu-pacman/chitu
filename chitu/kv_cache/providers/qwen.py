@@ -19,6 +19,8 @@ def qwen3_linear_cache_spec(args, attn_backend_type) -> KVCacheSpec:
     head_dim = args.models.linear_head_dim
     conv_kernel_size = args.models.linear_conv_kernel_dim
 
+    assert n_v_heads % tp == 0
+    assert (n_qk_heads * 2 + n_v_heads) * head_dim % tp == 0
     n_local_v_heads = n_v_heads // tp
     local_conv_dim = (n_qk_heads * 2 + n_v_heads) * head_dim // tp
 
@@ -28,7 +30,8 @@ def qwen3_linear_cache_spec(args, attn_backend_type) -> KVCacheSpec:
                 "conv_state": (local_conv_dim, conv_kernel_size),
                 "recurrent_state": (n_local_v_heads, head_dim, head_dim),
             }
-        }
+        },
+        split_size=tp,
     )
 
 

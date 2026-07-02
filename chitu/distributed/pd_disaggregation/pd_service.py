@@ -36,14 +36,6 @@ from chitu.distributed.pd_disaggregation.pd_scheduler import (
     DecodeOnlyManager,
     set_pd_scheduler_instance,
 )
-from chitu.distributed.pd_disaggregation.kv_transfer.kv_manager import (
-    DisaggregationMode,
-    KVManager,
-    decode_prepare_role,
-)
-from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
-    MetadataBuffers,
-)
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_token_sender import start_dp_token_manager
 from chitu.dp_request_router import is_terminate_engine_message
@@ -57,7 +49,6 @@ from chitu.distributed.coordinator import get_endpoint, set_endpoint
 from chitu.hooks import (
     DPTokenSink,
     MooncakeKVTransferHook,
-    NoopKVTransferHook,
     PDTaskEvictHook,
 )
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
@@ -66,6 +57,7 @@ from chitu.serve.common import (
     start_worker,
     step_profiler,
 )
+from .kv_transfer import KVManagerPrefill, KVManagerDecode
 from chitu.serve.event_loop import get_server_event_loop
 from chitu.chitu_main import chitu_terminate
 from chitu.task import SerializedPackedTasksPayloadType, TaskPool
@@ -82,60 +74,6 @@ def _determine_pd_scheduler_id(args, pd_mode: PDSchedulerMode, rank: int) -> int
     if pd_mode == PDSchedulerMode.DECODE_ONLY:
         return get_multi_inst_ids_by_role("decode").index(instance_id)
     return instance_id
-
-
-def start_decode_prepare_listener_thread(
-    *,
-    kv_manager: KVManager,
-    decode_scheduler_id: int,
-    dp_rank: int,
-) -> threading.Thread:
-    """Decode prepare listener 线程（ZMQ PULL）
-
-    该线程接收 Scheduler 发来的 PD_PREPARE_TRANSFER，执行：
-    - 预分配该请求 Decode 的 KV cache/aux buffer 地址
-    - 向 Prefill 发送 TransferInfo
-    """
-
-    def _listener_loop() -> None:
-        ctx = zmq.Context.instance()
-        sock = ctx.socket(zmq.PULL)
-        port = sock.bind_to_random_port("tcp://*")
-        ip = kv_manager.local_ip if kv_manager.local_ip else "localhost"
-        if not kv_manager.wait_decode_internal_broadcast_ready():
-            raise RuntimeError(
-                "decode internal broadcast is not ready; refusing to publish prepare endpoint"
-            )
-        logger.info(
-            f"[PD_PREPARE] listener_ready decode_sid={decode_scheduler_id} dp_rank={dp_rank} "
-            f"bind=tcp://{ip}:{port}"
-        )
-
-        # Register the prepare-listener endpoint in the coordinator so the
-        # Decode scheduler can discover it.
-        set_endpoint(
-            decode_prepare_role(decode_scheduler_id, dp_rank),
-            "prepare_port",
-            ip,
-            port,
-        )
-
-        while True:
-            payload = sock.recv()
-            try:
-                msg = msgpack.unpackb(payload, raw=False)
-            except Exception:
-                continue
-            kv_manager.handle_prepare_transfer_message(
-                msg,
-                payload=payload,
-                relay_internal=True,
-            )
-            continue
-
-    t = threading.Thread(target=_listener_loop, daemon=True)
-    t.start()
-    return t
 
 
 class PDSchedulerService:
@@ -267,19 +205,6 @@ class PDSchedulerService:
 
         # Set cache for KVManager so that PD path can access KV buffers
         if self.scheduler is not None:
-            self.scheduler.set_kv_cache(Backend.cache_dict["main"])
-            if "linear" in Backend.cache_dict:
-                self.scheduler.set_linear_attn_cache(Backend.cache_dict["linear"])
-            if "indexer" in Backend.cache_dict:
-                indexer_cache = Backend.cache_dict["indexer"]
-                if indexer_cache is not None:
-                    self.scheduler.set_indexer_cache(indexer_cache)
-                    logger.info("[PD] indexer cache set for PD transfer")
-            if "mtp" in Backend.cache_dict:
-                mtp_cache = Backend.cache_dict["mtp"]
-                if mtp_cache is not None:
-                    self.scheduler.set_mtp_cache(mtp_cache)
-                    logger.info("[PD] MTP cache set for PD transfer")
             for keys in Backend.cache_dict:
                 if keys not in {"main", "linear", "indexer", "mtp"}:
                     raise NotImplementedError(
@@ -296,35 +221,10 @@ class PDSchedulerService:
             Backend.executor.set_kv_hook(kv_hook)
             # Decode side streams via DP Token Manager wrapper, avoid duplication
             Backend.executor.set_token_sink(DPTokenSink())
-
-            # 每个 DP rank 启动一个，这么写是因为不排除 Decode 会有 PP 或者 TP 的情况
-            if not getattr(self, "_pd_prepare_listener_started", False):
-                dp_group = get_dp_group()
-                tp_group = get_tp_group()
-                pp_group = get_pp_group()
-
-                dp_rank = int(dp_group.rank_in_group)
-                should_start_listener = (
-                    tp_group.is_first_rank and pp_group.is_first_rank
-                )
-                if should_start_listener:
-                    self._pd_prepare_listener_thread = (
-                        start_decode_prepare_listener_thread(
-                            kv_manager=self.scheduler.kv_manager,
-                            decode_scheduler_id=self.local_instance_id,
-                            dp_rank=dp_rank,
-                        )
-                    )
-                self._pd_prepare_listener_started = True
         else:
             logger.info("prefill-only mode: skip initializing token manager")
-            # In CP-prefill, only the CP-main rank should send. CP KV is stored as
-            # a full replica after CP all-gather, so CP non-main sends would
-            # duplicate writes into the same Decode DP cache.
-            if self.is_tp_main_rank and self.is_cp_main_rank:
-                kv_hook = MooncakeKVTransferHook(self.scheduler.kv_manager, "prefill")
-            else:
-                kv_hook = NoopKVTransferHook()
+            # Inject prefill-side KV hook on all ranks
+            kv_hook = MooncakeKVTransferHook(self.scheduler.kv_manager, "prefill")
             Backend.executor.set_kv_hook(kv_hook)
 
         # Start the main compute loop in a dedicated background thread.
@@ -356,14 +256,18 @@ class PDSchedulerService:
         logger.info("starting tp worker loop (no ZMQ service)")
 
         while True:
-            # Step with None to receive tasks via dispatchers' collectives
-            status = Backend.executor.step(None)
-            if (
-                self.pd_mode == PDSchedulerMode.PREFILL_ONLY
-                and status == SerializedPackedTasksPayloadType.Prefill
-            ):
-                step_profiler(task_type=TaskType.Prefill)
-            await asyncio.sleep(0)  # avoid busy-waiting
+            try:
+                # Step with None to receive tasks via dispatchers' collectives
+                status = Backend.executor.step(None)
+                if (
+                    self.pd_mode == PDSchedulerMode.PREFILL_ONLY
+                    and status == SerializedPackedTasksPayloadType.Prefill
+                ):
+                    step_profiler(task_type=TaskType.Prefill)
+                await asyncio.sleep(0)  # avoid busy-waiting
+            except:
+                logger.exception("_worker_loop exception")
+                raise
 
     async def stop(self):
         """Stop the PD scheduler service"""
@@ -529,13 +433,15 @@ class PDSchedulerService:
         """Collect scheduler statistics"""
         # Use event loop time if present; fallback to wall clock
         last_update_ts = get_server_event_loop().time()
+        main_cache = Backend.cache_dict["main"]
 
         stats = {
             "local_instance_id": self.scheduler.local_instance_id,
             "scheduler_type": self.pd_mode.value,
             "max_seq_len": getattr(get_global_args().infer, "max_seq_len", None),
-            "num_blocks": self.scheduler.kv_manager.kv_cache.num_blocks,
-            "block_size": self.scheduler.kv_manager.kv_cache.block_size,
+            # FIXME: stats from all cache?
+            "num_blocks": main_cache.num_blocks,
+            "block_size": main_cache.block_size,
             # 目前仅透传 scheduler.get_pd_stats()，以下字段暂不统计，固定为 0。
             "running_requests": 0,
             "waiting_requests": 0,
@@ -611,55 +517,14 @@ async def start_pd_worker_service(args, rank: int = 0):
 
     logger.info("Initializing KVManager for worker")
 
-    max_batch_size = args.infer.max_batch_size
-    buffer_size = max_batch_size * 2
-    metadata_buffers = MetadataBuffers(buffer_size)
+    if mode == "prefill":
+        kv_manager = KVManagerPrefill()
+    else:
+        kv_manager = KVManagerDecode()
 
-    disaggregation_mode = (
-        DisaggregationMode.DECODE if mode == "decode" else DisaggregationMode.PREFILL
-    )
-    kv_manager = KVManager(
-        kv_cache=None,  # set below
-        metadata_buffers=metadata_buffers,
-        disaggregation_mode=disaggregation_mode,
-    )
+    Backend.kv_manager = kv_manager
 
-    # FIXME: Manager other than "main"
-    kv_manager.kv_cache = Backend.cache_dict["main"]
-    kv_manager.register_buffer_to_engine()
-    # Register auxiliary caches for RDMA transfer
-    model_type = args.models.type
-    # Linear attention cache (Qwen3-next, Qwen3.5, and other linear attention models)
-    has_linear_cache = (
-        "linear" in Backend.cache_dict and Backend.cache_dict["linear"] is not None
-    )
-    logger.info(
-        f"[PD_WORKER] linear cache check: model_type={model_type}, has_linear_cache={has_linear_cache}"
-    )
-    if has_linear_cache:
-        kv_manager.set_linear_attn_cache(Backend.cache_dict["linear"])
-        logger.info("[PD_WORKER] linear attention cache set for kv_manager")
-
-    # Indexer KV cache (DeepSeek-V3.2)
-    has_indexer_cache = (
-        "indexer" in Backend.cache_dict and Backend.cache_dict["indexer"] is not None
-    )
-    logger.info(
-        f"[PD_WORKER] indexer cache check: model_type={model_type}, has_indexer_cache={has_indexer_cache}"
-    )
-    if has_indexer_cache:
-        kv_manager.set_indexer_cache(Backend.cache_dict["indexer"])
-        logger.info("[PD_WORKER] indexer cache set for kv_manager")
-
-    has_mtp_cache = (
-        "mtp" in Backend.cache_dict and Backend.cache_dict["mtp"] is not None
-    )
-    logger.info(f"[PD_WORKER] MTP cache check: has_mtp_cache={has_mtp_cache}")
-    if has_mtp_cache:
-        kv_manager.set_mtp_cache(Backend.cache_dict["mtp"])
-        logger.info("[PD_WORKER] MTP cache set for kv_manager")
-
-    logger.info("KVManager initialized and registered with Cache")
+    logger.info("KVManager initialized")
 
     kv_hook = MooncakeKVTransferHook(kv_manager, mode)
     Backend.executor.set_kv_hook(kv_hook)
@@ -674,51 +539,33 @@ async def start_pd_worker_service(args, rank: int = 0):
         dp_group = get_dp_group()
         tp_group = get_tp_group()
         pp_group = get_pp_group()
-        should_start_listener = tp_group.is_first_rank and pp_group.is_first_rank
-        dp_rank = dp_group.rank_in_group
-        decode_scheduler_id = _determine_pd_scheduler_id(
-            args, PDSchedulerMode.DECODE_ONLY, rank
-        )
 
-        if should_start_listener:
-            start_decode_prepare_listener_thread(
-                kv_manager=kv_manager,
-                decode_scheduler_id=decode_scheduler_id,
-                dp_rank=dp_rank,
-            )
     logger.info("PD Worker hooks initialized")
 
     logger.info("Entering PD Worker Loop")
 
     while True:
-        with torch.inference_mode():
-            if mode == "decode":
-                # Drain prepare queue enqueued by the ZMQ prepare listener thread.
-                kv_manager.process_pending_prepare_transfers()
-                dp_dispatcher = getattr(Backend.executor, "dp_dispatcher", None)
-                if (
-                    dp_dispatcher is not None
-                    and hasattr(dp_dispatcher, "has_pending_metadata")
-                    and not dp_dispatcher.has_pending_metadata()
-                ):
-                    if Backend.state == BackendState.Terminating:
-                        chitu_terminate()
-                        break
-                    await asyncio.sleep(0)
-                    continue
-            status = Backend.executor.step(None)
-            if status == SerializedPackedTasksPayloadType.TerminateBackend:
-                break
-            if Backend.state == BackendState.Terminating:
-                chitu_terminate()
+        try:
+            with torch.inference_mode():
+                status = Backend.executor.step(None)
+                if status == SerializedPackedTasksPayloadType.TerminateBackend:
+                    break
                 if Backend.state == BackendState.Terminating:
-                    Backend.state = BackendState.Terminated
-                break
-            if Backend.state == BackendState.Terminated:
-                break
-            if mode == "prefill" and status == SerializedPackedTasksPayloadType.Prefill:
-                step_profiler(task_type=TaskType.Prefill)
-        await asyncio.sleep(0)
+                    chitu_terminate()
+                    if Backend.state == BackendState.Terminating:
+                        Backend.state = BackendState.Terminated
+                    break
+                if Backend.state == BackendState.Terminated:
+                    break
+                if (
+                    mode == "prefill"
+                    and status == SerializedPackedTasksPayloadType.Prefill
+                ):
+                    step_profiler(task_type=TaskType.Prefill)
+            await asyncio.sleep(0)
+        except:
+            logger.exception("start_pd_worker_service exception")
+            raise
 
 
 def init_pd_worker(args, rank: int = 0):
