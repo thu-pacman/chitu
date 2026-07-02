@@ -99,8 +99,9 @@ def docker_run(
         logger.info(f"Image {image_name} not found, loading from the bundle")
         image_file = os.path.join(appdir, "usr/share/chitu/image.docker")
         if not os.path.isfile(image_file):
-            raise RuntimeError(f"bundled image file not found at {image_file}")
-        subprocess.run(["docker", "load", "-i", image_file], check=True)
+            logger.info("Pulling the image")
+        else:
+            subprocess.run(["docker", "load", "-i", image_file], check=True)
     else:
         logger.info(f"Image {image_name} already exists in docker")
 

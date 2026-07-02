@@ -9,7 +9,7 @@ import functools
 
 import torch
 
-from chitu.device_type import is_blackwell
+from chitu.device_type import is_blackwell, is_hygon
 from chitu.global_vars import get_global_args
 from chitu.utils import parse_dtype, ceil_div
 from chitu.import_utils import try_import_opt_dep
@@ -22,6 +22,7 @@ from chitu.moe.batched_routed_activation import (
     IndexedBatchedRoutedActivationWithScale,
     IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
 )
+from chitu.ops.quant import a8_per_token_act_quant
 
 # replace the buffer setting with DeepEP to concurrently enbale ll mode and normal mode, need more test to verify.
 from chitu.moe.token_dispatchers.buffercontroller import DeepEPBuffer
@@ -100,9 +101,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         may_fuse_quant: Optional[str] = None,
         may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
-    ) -> tuple[
-        IndexedBatchedRoutedActivationWithPaddedPerExpertCnt, Optional[torch.Tensor]
-    ]:
+    ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
         dispatch_use_fp8 = False
         round_scale_to_pow2 = False
         if (
@@ -137,6 +136,9 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                 may_fuse_quant_kwargs=may_fuse_quant_kwargs,
                 layer_id=layer_id,
             )
+
+        if may_fuse_quant == "w8a8_dynamic" and is_hygon():
+            return self._enter_moe_hygon_w8a8(x, topk_weights)
 
         dp_local_bs = topk_weights.shape[0]
         (
@@ -178,20 +180,43 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             recv_topk_weights,
         )
 
-    @enter_moe.register
-    def _(
+    def _enter_moe_hygon_w8a8(
+        self,
+        x: IndexedBatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+    ) -> tuple[
+        IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
+        Optional[torch.Tensor],
+    ]:
+        q_x, scale = a8_per_token_act_quant(x.activation)
+        scaled_x = IndexedBatchedRoutedActivationWithScale(
+            activation=q_x.contiguous(),
+            activation_scale=scale.reshape(q_x.shape[0], 1),
+            token_to_expert_indices=x.token_to_expert_indices,
+            quant_method="w8a8_dynamic",
+            expected_n_tokens_per_expert=x.expected_n_tokens_per_expert,
+            expert_ids_are_local=True,
+        )
+        return self._enter_moe_with_scale(
+            scaled_x,
+            topk_weights,
+            expert_alignment=256,
+            pad_block_size=256,
+        )
+
+    def _enter_moe_with_scale(
         self,
         x: IndexedBatchedRoutedActivationWithScale,
         topk_weights: torch.Tensor,
         *,
-        may_fuse_quant: Optional[str] = None,
-        may_fuse_quant_kwargs: dict = {},
-        layer_id: Optional[int] = None,
+        expert_alignment: int = 128,
+        pad_block_size: int = 128,
     ) -> tuple[
         IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
         Optional[torch.Tensor],
     ]:
         dp_local_bs = topk_weights.shape[0]
+
         (
             (recv_activation, recv_activation_scale),
             recv_topk_idx,
@@ -203,6 +228,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             (x.activation, x.activation_scale),
             x.token_to_expert_indices.to(torch.int64),
             topk_weights.to(torch.float32),
+            expert_alignment=expert_alignment,
         )
 
         self.dispatch_ctx = (handle, recv_topk_idx, recv_topk_weights, dp_local_bs)
@@ -218,7 +244,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                     dtype=torch.int32,
                     device=recv_topk_idx.device,
                 ),
-                pad_block_size=128,
+                pad_block_size=pad_block_size,
                 n_tokens_padded=n_tokens_padded,
                 # NOTE on expected_n_tokens_per_expert: Recompute using info local to EP,
                 # because DP ranks may be inbalance, and cannot reflect EP reality.
@@ -229,6 +255,21 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             ),
             recv_topk_weights,
         )
+
+    @enter_moe.register
+    def _(
+        self,
+        x: IndexedBatchedRoutedActivationWithScale,
+        topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
+        layer_id: Optional[int] = None,
+    ) -> tuple[
+        IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
+        Optional[torch.Tensor],
+    ]:
+        return self._enter_moe_with_scale(x, topk_weights)
 
     @override
     def exit_moe_prefer_before_local_sum(self) -> bool:
@@ -258,6 +299,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         topk_weights: torch.Tensor,
         async_finish: bool = False,
         previous_event: Optional["deep_ep.EventOverlap"] = None,
+        expert_alignment: int = 128,
     ):
         if self.tp_group.group_size > 1:
             if self.etp_group.group_size == 1:
@@ -319,7 +361,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             previous_event=previous_event,
             async_finish=async_finish,
             allocate_on_comm_stream=(previous_event is not None) and async_finish,
-            expert_alignment=128,
+            expert_alignment=expert_alignment,
         )
         return (
             recv_x,

@@ -357,14 +357,14 @@ def read_from_paged_kv_cache_triton(
     return out.view(out_shape)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["NUM_TOKENS"])
 def read_from_paged_kv_cache_kernel(
     kv_cache_ptr,
     page_table_ptr,
     position_ids_ptr,
     seq_ids_ptr,
     out_ptr,
-    NUM_TOKENS: tl.constexpr,
+    NUM_TOKENS,
     NUM_PAGES_PER_SAMPLE: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     DIM_SIZE: tl.constexpr,

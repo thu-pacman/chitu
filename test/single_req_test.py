@@ -68,6 +68,96 @@ def use_long_context_msgs(model_name: str) -> bool:
     return "DeepSeek-V3" in model_name or "DeepSeek-V4" in model_name
 
 
+# --- “电话本”测试 ---------------------------------
+# This builds a phone book far longer than index_topk and asks for one
+# specific entry's number. The correct answer can only be produced if the
+# indexer selects the right tokens, so a wrong answer flags an indexer
+# regression. Enabled by setting the ``CHITU_TEST_NEEDLE`` env var.
+_BASE_NAMES = [
+    "张三",
+    "李四",
+    "王五",
+    "赤兔",
+    "八卦炉",
+    "刘备",
+    "关羽",
+    "张飞",
+    "赵云",
+    "曹操",
+    "曹丕",
+    "曹植",
+    "吕布",
+    "貂蝉",
+    "孙尚香",
+    "孙权",
+]
+
+
+def gen_phonebook_prompt(num_entries: int, exp_idx: int, seed: int = 1234):
+    """Build a phone-book prompt and return ``(prompt, expected_number)``.
+
+    ``num_entries`` should be large enough that the tokenized prompt exceeds
+    ``index_topk`` (2048 for DeepSeek-V3.2), forcing the indexer's top-k to
+    actually prune. ``exp_idx`` picks which entry is asked about.
+    """
+    rng = random.Random(seed)
+    entries = []
+    numbers = []
+    used = set()
+    for i in range(num_entries):
+        name = f"{_BASE_NAMES[i % len(_BASE_NAMES)]}{i:04d}"
+        # 11-digit phone number, unique per entry.
+        while True:
+            number = "1" + "".join(str(rng.randint(0, 9)) for _ in range(10))
+            if number not in used:
+                used.add(number)
+                break
+        numbers.append(number)
+        entries.append(f"{name}\t{number}")
+
+    needle_name = f"{_BASE_NAMES[exp_idx % len(_BASE_NAMES)]}{exp_idx:04d}"
+    expected_number = numbers[exp_idx]
+
+    body = "\n".join(entries)
+    prompt = (
+        "下面是一份电话簿，每行是一个联系人的姓名和电话号码，用制表符分隔。\n"
+        "请仔细阅读，然后回答末尾的问题。\n\n"
+        f"{body}\n\n"
+        f"问题：{needle_name} 的电话号码是多少？请只输出这一串数字，不要输出其它内容。"
+    )
+    return prompt, expected_number
+
+
+def phonebook_test_enabled() -> bool:
+    """Whether to run the phone-book needle request instead of the usual msgs."""
+    return os.environ.get("CHITU_TEST_PHONEBOOK", "false") == "true"
+
+
+def check_phonebook_test_results(reqs):
+    """Assert every request's output contains its expected number.
+
+    Raises AssertionError on a miss so the failure propagates to a nonzero
+    exit code and fails CI.
+    """
+    misses = []
+    for i, req in enumerate(reqs):
+        expected = getattr(req, "_needle_expected", None)
+        if expected is None:
+            continue
+        output = req.output or ""
+        hit = expected in output
+        logger.info(
+            f"[needle] req[{i}] expected={expected} hit={hit} output={output!r}"
+        )
+        if not hit:
+            misses.append((i, expected, output))
+    if misses:
+        raise AssertionError(
+            "phone-book needle test failed; the indexer likely selected the "
+            f"wrong tokens. misses={misses}"
+        )
+
+
 USE_TOOLS = False
 msg_tools = [
     {
@@ -162,8 +252,37 @@ def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
     return reqs
 
 
+def gen_reqs_needle(num_reqs, max_new_tokens):
+    """Generate phone-book test requests.
+
+    Uses greedy decoding (temperature 0) and a large phone book
+    so the tokenized prompt exceeds `index_topk` and the
+    indexer's top-k actually prunes.
+    """
+    num_entries = 500
+    reqs: list[UserRequest] = []
+    for i in range(num_reqs):
+        exp_idx = (i * 7 + 3) % num_entries
+        prompt, expected = gen_phonebook_prompt(num_entries, exp_idx, seed=1234 + i)
+        msg = [{"role": "user", "content": prompt}]
+        req = UserRequest.create(
+            msg,
+            f"{gen_req_id()}",
+            max_new_tokens=max_new_tokens,
+            frequency_penalty=0.0,
+            temperature=0,
+        )
+        req.messages = msg
+        req._needle_expected = expected
+        reqs.append(req)
+    return reqs
+
+
 def gen_reqs(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
     global local_args, msgs
+    if phonebook_test_enabled():
+        return gen_reqs_needle(num_reqs, max_new_tokens)
+
     if (
         use_long_context_msgs(local_args.models.name)
         and local_args.infer.max_seq_len >= 4096
@@ -186,6 +305,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
     rank = torch.distributed.get_rank()
     warmup_engine(args)
 
+    needle_reqs = []
     for i in range(2):
         chitu_start()
         if rank == 0:
@@ -229,14 +349,20 @@ def run_pipe_or_tensor_parallelism(args, timers):
                     f"Response in rank {rank}: reqs[{i}].output={req.output}, {GRAY}reqs[{i}].input={req.messages}{RESET}"
                 )
 
+            if phonebook_test_enabled():
+                needle_reqs.extend(reqs)
             timers.log()
         chitu_terminate()
+
+    if rank == 0 and phonebook_test_enabled():
+        check_phonebook_test_results(needle_reqs)
 
 
 def run_normal(args, timers):
     rank = torch.distributed.get_rank()
     warmup_engine(args)
 
+    needle_reqs = []
     for i in range(2):
         reqs = gen_reqs(
             num_reqs=args.infer.max_batch_size,
@@ -267,7 +393,12 @@ def run_normal(args, timers):
         for i, req in enumerate(reqs):
             logger.info(f"Response in rank {rank}: reqs[{i}].output={req.output}")
 
+        if phonebook_test_enabled():
+            needle_reqs.extend(reqs)
         timers.log()
+
+    if phonebook_test_enabled():
+        check_phonebook_test_results(needle_reqs)
 
 
 @hydra.main(
