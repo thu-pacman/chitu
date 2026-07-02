@@ -441,8 +441,8 @@ def resolve_default_args(args):
 
     if (
         args.models.type == ModelType.DEEPSEEK_V3
-        and args.models.get("index_topk", None) is not None
-    ):
+        or args.models.type == ModelType.GLM_5_2
+    ) and args.models.get("index_topk", None) is not None:
         assert args.infer.indexer_type in (
             "auto",
             "deepgemm",

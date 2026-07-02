@@ -91,12 +91,6 @@ def init_moe_impl(args) -> None:
         )  # size=1, no allgather
         effective_dp_size = args.infer.dp_size
 
-        # CP mode: force "allgather" dispatcher (DeepEP not compatible with CP).
-        if cp_context.is_active:
-            if args.infer.ep_size == 1:
-                args.infer.moe.prefill_token_dispatcher = "allgather"
-            args.infer.moe.decode_token_dispatcher = "allgather"
-
         MOE_IMPL_INSTANCE = MoEImplEP(
             n_layers=n_layers,
             n_dense_layers=(
