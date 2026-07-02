@@ -129,37 +129,36 @@ def _linear_block_fp4_blackwell(
     x_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Note: blackwell impl need swizzled weights, while others weights are linear
-    if impl == "blackwell":
-        # FIXME: Add fp4 option to infer.raise_lower_bit_float_to and use it here
-        k_w = weight.layout_tensor.shape[-1] * 2
-        k_x = x.shape[-1]
-        if k_x < k_w:
-            x = eval_lazy(x)
-            x = torch.nn.functional.pad(x, (0, k_w - k_x), value=0).contiguous()
-        elif k_x > k_w:
-            raise AssertionError(
-                f"activation K {k_x} exceeds weight K {k_w} (packed last dim "
-                f"{weight.layout_tensor.shape[-1]})"
-            )
-        assert (
-            x.shape[-1] == weight.layout_tensor.shape[-1] * 2
-        ), f"{x.shape=}, {weight.layout_tensor.shape=}"
-        y = blockfp4_gemm(
-            x,
-            weight.layout_tensor,
-            weight_scale,
-            weight_scale_2,
-            alpha=None,
-            out_dtype=parse_dtype(get_global_args().infer.raise_lower_bit_float_to),
+
+    # FIXME: Add fp4 option to infer.raise_lower_bit_float_to and use it here
+    if x.dtype not in {torch.float16, torch.bfloat16}:
+        raise ValueError(f"Unsupported input type: {x.dtype}")
+    if x_scale is not None:
+        raise ValueError(f"No x_scale is supported for {x.dtype=}")
+    k_w = weight.layout_tensor.shape[-1] * 2
+    k_x = x.shape[-1]
+    if k_x < k_w:
+        x = eval_lazy(x)
+        x = torch.nn.functional.pad(x, (0, k_w - k_x), value=0).contiguous()
+    elif k_x > k_w:
+        raise AssertionError(
+            f"activation K {k_x} exceeds weight K {k_w} (packed last dim "
+            f"{weight.layout_tensor.shape[-1]})"
         )
-        if bias is not None:
-            y += bias
-        return y
-    else:
-        raise NotImplementedError(
-            f"Soft-fp8 fused gemm not implemented for {get_device_name()}"
-        )
-        # FIXME: Use a dequant-then-compute approach
+    assert (
+        x.shape[-1] == weight.layout_tensor.shape[-1] * 2
+    ), f"{x.shape=}, {weight.layout_tensor.shape=}"
+    y = blockfp4_gemm(
+        x,
+        weight.layout_tensor,
+        weight_scale,
+        weight_scale_2,
+        alpha=None,
+        out_dtype=parse_dtype(get_global_args().infer.raise_lower_bit_float_to),
+    )
+    if bias is not None:
+        y += bias
+    return y
 
 
 @linear_block_fp4.register("fp8")
