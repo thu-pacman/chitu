@@ -77,7 +77,7 @@ from chitu.tool_call import patch_chat_template
 from chitu.utils import parse_dtype
 from chitu.import_utils import try_import_opt_dep
 from chitu.moe import init_moe_impl
-from chitu.global_vars import set_slot_handle
+from chitu.global_vars import set_slot_handle, set_cuda_device
 from chitu.numa_utils import bind_process_to_numa
 from chitu.kv_cache.providers import register_all_providers
 from chitu.kv_cache.builders import build_cache_managers, build_mtp_cache
@@ -120,6 +120,7 @@ class Backend:
         None  # One per each DP rank
     )
     executor: Optional["Executor"] = None
+    kv_manager = None  # KVManager instance for PD disaggregation
 
     # mutable
     state = BackendState.Running
@@ -263,11 +264,10 @@ class Backend:
             return
 
         # Get rank from environment variable because we have not initialize torch.distributed yet
-        rank = int(os.environ.get("RANK", 0))
 
         # Bind process to GPU. Please put it before init_process_group
         if args.infer.op_impl != "cpu":
-            torch.cuda.set_device(args.infer.device_ids[rank])
+            set_cuda_device()
 
         if not torch.distributed.is_initialized():
             if args.infer.op_impl == "cpu":

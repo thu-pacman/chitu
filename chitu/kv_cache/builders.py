@@ -176,6 +176,7 @@ def _build_main_cache_bundle(
             num_blocks=resolved_num_blocks,
             block_size=block_size,
             device=device,
+            split_size=spec.split_size,
             **kvargs,
         )
 
@@ -223,6 +224,7 @@ def _build_linear_cache(args, *, layer_filter_fn=lambda x: x):
         shape_per_token_dict=spec.kvargs["shape_per_token_dict"],
         dtype_dict=spec.kvargs.get("dtype_dict"),
         device=device,
+        split_size=spec.split_size,
     )
 
 
@@ -236,6 +238,7 @@ def build_mtp_cache(args):
         shape_per_token_dict=spec.kvargs["shape_per_token_dict"],
         dtype_dict=spec.kvargs.get("dtype_dict"),
         device=device,
+        split_size=spec.split_size,
     )
 
 
@@ -266,6 +269,7 @@ def _build_indexer_cache(args):
             num_blocks=resolved_num_blocks,
             block_size=block_size,
             device=device,
+            split_size=spec.split_size,
             **spec.kvargs,
         )
 

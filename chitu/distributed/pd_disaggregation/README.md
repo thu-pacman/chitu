@@ -6,7 +6,6 @@
 
 系统由三类进程组成：
 
-
 | 进程          | 职责                                                    | 入口                                                  |
 | ----------- | ----------------------------------------------------- | --------------------------------------------------- |
 | **Router**  | HTTP 入口，接收请求后同时分发给 P 和 D；托管协调服务和 Bootstrap 服务         | `chitu/serve/api_server.py`                         |
@@ -18,9 +17,8 @@
                           ┌──────────────────────────────┐
                           │         Router (节点 A)       │
                           │                              │
-                          │  API Server (HTTP :21003)    │
-                          │  PDCoordination (ZMQ :29800) │
-                          │  MetadataSync   (ZMQ :29801) │
+                          │  API Server (HTTP :22001)    │
+                          │  PDCoordination (ZMQ)        │
                           │  Bootstrap      (HTTP :8080) │
                           └──────┬────────────┬──────────┘
                       ZMQ PUSH  │            │  ZMQ PUSH
@@ -30,197 +28,264 @@
      │   Prefill (节点 B)     │              │    Decode (节点 A)         │
      │                        │    RDMA      │                            │
      │  PDSchedulerService    │─────────────▶│  PDSchedulerService        │
-     │  PrefillOnlyScheduler  │  KV + Token  │  DecodeOnlyScheduler       │
-     │  KVManager (PREFILL)   │              │  KVManager (DECODE)        │
+     │  PrefillOnlyManager    │  KV Cache    │  DecodeOnlyManager         │
+     │  KVManagerPrefill      │              │  KVManagerDecode           │
      └────────────────────────┘              └────────────────────────────┘
 ```
 
 运行模式由所有实例的有效 `multi_inst.role` 推导：所有实例均为 `prefill_and_decode` 时使用独立多实例模式；所有实例均为 `prefill` 或 `decode` 时使用经典 PD 分离模式。
 
+> Prefill / Decode 框内列出的是同一进程内的三个层次（由上到下为包含关系）：`PDSchedulerService`（进程入口）→ `PrefillOnlyManager` / `DecodeOnlyManager`（调度器）→ `KVManagerPrefill` / `KVManagerDecode`（KV 传输）。
+
 ## 通信分层
 
 系统通信分为**控制面**和**数据面**两层：
 
-### 控制面（ZMQ + HTTP）
+### 控制面（ZMQ）
 
+所有控制面消息使用 msgpack 单帧序列化的 dataclass 协议，通过 `type` 字段自动分发。
 
-| 通信路径                         | 协议             | 作用                          |
-| ---------------------------- | -------------- | --------------------------- |
-| Router → P/D Scheduler       | ZMQ PUSH/PULL  | 分发请求                        |
-| Router ↔ P/D（PDCoordination） | ZMQ PULL + REP | endpoint发现、元数据同步            |
-| D → P（DECODE_REGISTER）       | ZMQ multipart  | Decode 向 Prefill 注册本地显存指针   |
-| D → P（TRANSFER_INFO）         | ZMQ multipart  | Decode 发送 per-request 目标页索引 |
-| P → D（Status Update）         | ZMQ PUSH       | Prefill 通知 Decode 传输完成      |
-| P/D → Bootstrap              | HTTP PUT/GET   | Prefill endpoint注册与查询       |
+| 消息                           | 方向             | 作用                              |
+| ---------------------------- | -------------- | ------------------------------- |
+| DecodePrepare                | Scheduler → Decode | Scheduler 通知 Decode 预分配 KV block |
+| DecodeAllocated              | Decode → Prefill | Decode 发送 recv_buffers 和 session_id |
+| RankTransferDone             | Prefill rank → Prefill ctrl | 单 rank RDMA 传输完成           |
+| PrefillDone                  | Prefill ctrl → Decode | 全部传输完成，携带 first_token 等      |
+| Router → P/D 请求             | ZMQ PUSH/PULL  | 分发请求                            |
+| P/D 统计心跳                   | ZMQ PUSH       | 向 Router 上报 stats               |
 
+ZMQ 端点通过 `KVManagerEndpoint` 统一抽象，支持三种模式：
+- **master**（ctrl rank）：PULL 接收外部消息 + PUB/SUB relay 广播到同组 slave
+- **slave**（非 ctrl rank）：SUB 订阅 ctrl rank 广播
+- **remote**（对端）：PUSH 发送到远程 endpoint
 
 ### 数据面（RDMA）
 
-Prefill 通过 Mooncake Transfer Engine 执行Device到Device的 RDMA 写入：
+Prefill 通过 Mooncake Transfer Engine 执行 Device-to-Device 的 RDMA 写入：
 
-- **KV Cache**：按层、按页索引映射，支持连续块聚合以减少 RDMA 调用
-- **First Token**：通过 MetadataBuffers 的 aux buffer 传输（包含 first token id）
+- **内存注册**：整个 KV cache tensor 一次性注册，由 `KVManagerBase.register_buffer_to_engine()` 在初始化时完成
+- **传输规划**：`create_transfer_plan()` 基于 key 等值匹配生成 `TransferPlan`，自动处理 split/replica 过滤和连续地址合并
+- **首 token**：通过 `PrefillDone` 消息直接携带
+
+### KV Cache 的 split/replica 模型
+
+每个 cache 由 `split_size` 字段描述 dim3 在 TP ranks 间的分布：
+
+- `split_size = 0`（replica）：所有 rank 持有完整副本。每 rank 为独立 replica。
+- `split_size > 0`（split）：dim3 被切分为 `split_size` 份，分布在 TP ranks 间。
+
+`pd_tp_ratio = prefill_tp_size // decode_tp_size` 参数用于 cross-TP 场景（仅 Decode 端）。当 `pd_tp_ratio > 1` 时，Decode 端会将 block 按 `view(-1).chunk(pd_tp_ratio)` 拆分为多个 chunk，使每份 chunk 的 head 范围与一个 Prefill rank 对应，实现 key 自然匹配。收到后通过 `kv_recv_reorder` 将 chunk-interleaved 布局 permute 回 T-major。
 
 ## 请求生命周期
 
-以 1P1D 为例：
+以 1P1D 为例（Prefill/Decode 各一个 ctrl rank + 若干 worker rank）：
 
 ```
- Client                Router                 Prefill                  Decode
-   │                     │                       │                       │
-   │─── HTTP Request ──▶ │                       │                       │
-   │                     │── ZMQ prefill req ──▶ │                       │
-   │                     │── ZMQ decode req ────────────────────────────▶│
-   │                     │                       │                       │
-   │                     │                       │   ◄─ DECODE_REGISTER ─│ (一次性注册显存指针)
-   │                     │                       │    ◄─ TRANSFER_INFO ──│ (目标页索引 + aux index)
-   │                     │                       │                       │
-   │                     │                    prefill 计算                │
-   │                     │                    产出 KV + logits            │
-   │                     │                       │                       │
-   │                     │                       │── RDMA: KV Cache ───▶ │
-   │                     │                       │── RDMA: aux (token) ─▶│
-   │                     │                       │── ZMQ: Success ──────▶│
-   │                     │                       │                       │
-   │                     │                       │              插入 KV 到 CacheManager
-   │                     │                       │              开始 decode 循环
-   │◀── stream tokens ── │◀──────────── ZMQ token ───────────────────────│
-   │                     │                       │                       │
+ Router          Prefill Ctrl        Prefill Rank       Decode Ctrl         Decode Rank
+   │                 │                   │                   │                   │
+   │── prefill req ─▶│                   │                   │                   │
+   │── decode req ──────────────────────────────────────────▶│                   │
+   │                 │                   │                   │                   │
+   │                 │                   │   DecodePrepare   │                   │
+   │                 │                   │                   │◀── scheduler      │
+   │                 │                   │                   │── PUB relay ────▶│
+   │                 │                   │                   │                   │
+   │                 │                   │                   │          分配 block
+   │                 │                   │                   │    get_kv_transfer_buffers
+   │                 │                   │                   │                   │
+   │                 │    DecodeAllocated│                   │                   │
+   │                 │◀──────────────────────────────────────────────────────────│ (dp_rank 匹配的)
+   │                 │── PUB relay ─────▶│                   │                   │
+   │                 │                   │                   │                   │
+   │                 │            is_decode_allocated = True  │                   │
+   │                 │            scheduler promote → TaskPool│                   │
+   │                 │            prefill 计算                 │                   │
+   │                 │            产出 KV + logits             │                   │
+   │                 │                   │                   │                   │
+   │                 │            send_kv_cache               │                   │
+   │                 │            create_transfer_plan        │                   │
+   │                 │                   │                   │                   │
+   │                 │                   │── RDMA write ═══════════════════════▶│
+   │                 │                   │                   │                   │
+   │                 │  RankTransferDone │                   │                   │
+   │                 │◀──────────────────│                   │                   │
+   │                 │                   │                   │                   │
+   │                 │  (收齐 dp_way_size 个)                  │                   │
+   │                 │                   │                   │                   │
+   │                 │                   │    PrefillDone    │                   │
+   │                 │──────────────────────────────────────▶│── PUB relay ────▶│
+   │                 │                   │                   │                   │
+   │                 │                   │                   │   校验 rank_bytes
+   │                 │                   │                   │   is_prefill_done = True
+   │                 │                   │                   │                   │
+   │                 │                   │           recv_kv_cache_and_insert   │
+   │                 │                   │           insert_kv_cache_from_transfer
+   │                 │                   │           kv_recv_reorder           │
+   │                 │                   │                   │                   │
+   │                 │                   │        scheduler promote → TaskPool  │
+   │                 │                   │        Decode 循环                   │
+   │                 │                   │                   │                   │
+   │◀── tokens ────────────────────────────────────────────────────────────────│
+   │                 │                   │                   │                   │
 ```
+
+### 角色说明
+
+| 角色 | 职责 |
+|------|------|
+| **Prefill Ctrl Rank**（rank=0） | 接收 `DecodeAllocated`，通过 PUB/SUB relay 广播；收集各 rank 的 `RankTransferDone`，汇总后发送 `PrefillDone` |
+| **Prefill Rank** | 接收 relay 的 `DecodeAllocated`，执行 prefill 计算，调用 `send_kv_cache` → `create_transfer_plan` → RDMA 写入 → 发送 `RankTransferDone` |
+| **Decode Ctrl Rank**（rank=0） | 接收 scheduler 的 `DecodePrepare`，通过 PUB/SUB relay 广播；接收 `PrefillDone`，通过 relay 广播给所有 rank |
+| **Decode Rank** | 接收 relay 的 `DecodePrepare`，dp_rank 匹配时分配 block 并发送 `DecodeAllocated`；接收 `PrefillDone` 后调用 `recv_kv_cache_and_insert` |
 
 ### 详细步骤
 
 **1. Router 分发**
 
-`PDRequestRouter._add_pd_request()` 为请求生成 `request_id`，通过轮询选择一个 Prefill 和一个 Decode Scheduler，将同一请求同时发给 P&D。Decode 侧的消息额外携带 `prefill_scheduler_id`，用于后续PD配对。
+`PDRequestRouter._add_pd_request()` 为请求生成 `request_id`，通过轮询选择一个 Prefill 和一个 Decode Scheduler，将同一请求同时发给 P&D。Decode 侧的消息额外携带 `prefill_scheduler_id`，用于后续 PD 配对。
 
 **2. Decode 准备**
 
-Decode Scheduler 收到请求后入队到 `_decode_incoming_q`。后台推进线程将请求推入 `_decode_prealloc_q`，同时通过 `PDScheduler._send_pd_prepare_transfer()` 向 Decode 的 KVManager 发送准备指令。KVManager 执行：
+Decode Scheduler 收到请求后入队到 `_decode_incoming_q`。后台推进线程将请求推入 `_decode_prealloc_q`，同时分配 KV cache block 并通过 `KVManagerDecode.send_decode_prepare()` 向 Decode ctrl rank 发送 `DecodePrepare`。
 
-- 首次连接时，通过 Bootstrap/Coordination 发现 Prefill endpoint
-- 向目标 Prefill 发送 `DECODE_REGISTER`（本地 KV/aux 显存指针，一次性、幂等）
-- 为本请求分配page index和 aux index
-- 向目标 Prefill 发送 `TRANSFER_INFO`（page index + aux index）
+Decode ctrl rank 通过 PUB/SUB relay 广播 `DecodePrepare` 到所有 Decode rank。dp_rank 匹配的 rank 调用 `prepare_kv_transfer()`：
+- 为每个 cache 分配 block（`PagedKVCache` 或 `SingletonPagedKVCache`）
+- 调用 `cache.get_kv_transfer_buffers()` 收集 recv_buffers（物理地址 + key）
+- 记录 `recv_bytes` 用于后续字节校验
+- 发送 `DecodeAllocated` 到 Prefill ctrl rank
 
 **3. Prefill 计算与传输**
 
-Prefill Scheduler 收到请求后经过 `_prefill_incoming_q → _prefill_bootstrap_q → _prefill_ready_q` 的队列推进，等待对应的 `TRANSFER_INFO` 就绪后创建 Task 执行 prefill。
+Prefill ctrl rank 收到 `DecodeAllocated` 后通过 PUB/SUB relay 广播到所有 Prefill rank。Scheduler 侧的队列推进（`_prefill_incoming_q → _prefill_bootstrap_q → _prefill_ready_q`）等待 `is_decode_allocated` 就绪后创建 Task 执行 prefill。
 
-Prefill 完成后触发 `MooncakeKVTransferHook.on_prefill_done()`，调用 `KVManager.send_kv_cache()`：
+Prefill 完成后触发 `MooncakeKVTransferHook.on_prefill_done()`，每个 Prefill rank 调用 `KVManagerPrefill.send_kv_cache()`：
+- 遍历 `Backend.cache_dict` 中所有 cache，调用 `cache.get_kv_transfer_buffers()` 收集 send_buffers
+- `create_transfer_plan(send_buffers, recv_buffers)` 生成 `TransferPlan`
+- 提交到 `ThreadPoolExecutor` 异步执行 RDMA
 
-- 从 CacheManager 获取源端页索引
-- 在 MetadataBuffers 分配 aux index，写入first token
-- 入队 `TransferKVChunk` 给后台传输线程
+`transfer_worker` 线程：
+- `TransferPlan.execute_send()` 批量 RDMA 写入
+- 发送 `RankTransferDone` 到 Prefill ctrl rank
 
-传输线程从队列取出任务，按层通过 `ThreadPoolExecutor` 并行执行 RDMA 传输，完成后通过 ZMQ 发送 `KVPoll.Success` 给 Decode。
+Prefill ctrl rank 收齐 `dp_way_size` 个 `RankTransferDone` 后，发送 `PrefillDone`（含 `first_token`、`num_hit_tokens`、`rank_bytes`）到 Decode ctrl rank。
 
 **4. Decode 执行**
 
-Decode 的 KVManager 轮询 `request_status`，收到 Success 后：
+Decode ctrl rank 收到 `PrefillDone` 后通过 PUB/SUB relay 广播到所有 Decode rank。每个 Decode rank：
+- 校验 `rank_bytes[session_id] == recv_bytes`（不一致记录 error）
+- 设置 `is_prefill_done = True`
 
-- 从 aux buffer 取回first token
-- 调用 `CacheManager.insert_kv_cache_from_transfer()` 登记 KV 页表
+Decode hook `before_decode_step` 调用 `recv_kv_cache_and_insert()`：
+- 断言 `is_prefill_done`
+- 调用 `cache.insert_kv_cache_from_transfer()` 登记 KV 页表
+- 调用 `cache.kv_recv_reorder()`（仅 `split_size > 0` 且 `n_chunks > 1` 时）
 - 请求从 `_decode_prealloc_q` 推入 `_decode_ready_q`，创建 Task 进入 decode 循环
 - Token 通过 `DPTokenManager` 经 ZMQ 回传给 Router，Router 流式返回给 Client
 
 ## 核心组件
 
-### KVManager（`kv_transfer/kv_manager.py`）
+### KVManager（`kv_transfer/` 目录）
 
-KV 传输的核心管理器，根据 `DisaggregationMode` 区分 Prefill/Decode 行为。
+KV 传输模块，由以下文件组成：
 
-**关键枚举**
+```
+kv_transfer/
+├── __init__.py              # 公开 KVManagerPrefill, KVManagerDecode
+├── base.py                  # KVManagerBase: TransferEngine + TaskInfo + trace + buffer 注册
+├── prefill.py               # KVManagerPrefill: send 侧完整逻辑
+├── decode.py                # KVManagerDecode: recv 侧完整逻辑
+├── endpoint.py              # KVManagerEndpoint: ZMQ master/slave/remote 三模式
+├── protocol.py              # 4 种协议消息 dataclass + ProtocolSerializer (msgpack)
+├── transfer_buffers.py      # TransferBuffer + TransferBuffers
+├── transfer_plan.py         # TransferPair + TransferMatcher + TransferPlan + create_transfer_plan
+├── cache_info.py            # CacheTransferInfo: 预计算 split/chunk/replica 元数据
+├── task_info.py             # TaskInfo: per-request 状态聚合
+└── mooncake/
+    ├── transfer_engine.py   # MooncakeTransferEngine: RDMA 封装 + MooncakeBootstrapServer
+    ├── metadata.py          # MetadataBuffers
+    └── utils.py             # FastQueue 等工具函数
+```
+
+**DisaggregationMode**（`base.py`）：
 
 ```python
 class DisaggregationMode(Enum):
     NULL = "null"       # 未启用
     PREFILL = "prefill" # Prefill 模式
     DECODE = "decode"   # Decode 模式
-
-class KVPoll(Enum):
-    Waiting = 0  # 等待传输
-    Success = 1  # 传输完成
 ```
 
-**Prefill 模式线程模型**
+请求状态通过 `TaskInfo` 中的 `is_decode_allocated` / `is_prefill_done` 等标志位管理。
+
+**Prefill 模式**
 
 ```
-                   ┌─── control rank (pp=0, tp=0) ─────┐
-                   │                                   │
-  Decode ─ZMQ──▶   │  外部端口: DECODE_REGISTER /       │  ──ZMQ PUB──▶ 所有 PP/TP ranks
-                   │            TRANSFER_INFO          │
-                   │                                   │
-  PP/TP ranks      │  内部端口: STAGE_DONE 收集          │  ──ZMQ PUSH─▶ Decode (Success)
-  ──ZMQ PUSH──▶    │                                   │
-                   └───────────────────────────────────┘
+                   ┌─── control rank (rank=0) ──────────┐
+                   │                                     │
+  Decode ─ZMQ──▶   │  外部端口: decode_allocated (接收     │  ──ZMQ PUB──▶ 所有 ranks
+                   │              DecodeAllocated)       │
+                   │                                     │
+  Prefill ranks    │  内部端口: rank_transfer_done        │  ──ZMQ PUSH─▶ Decode (PrefillDone)
+  ──ZMQ PUSH──▶    │  (汇总各 rank 的传输完成)            │
+                   └─────────────────────────────────────┘
 ```
 
-- **control rank**（pp=0, tp=0）：对外暴露 ZMQ 端口，接收 Decode 的注册和传输请求，通过 PUB/SUB 广播给所有 PP/TP ranks
-- **传输线程**（每个 rank）：从 `transfer_queue` 取 `TransferKVChunk`，执行 RDMA 传输，完成后发送 `STAGE_DONE` 给 control rank
-- **control rank 汇总**：收齐所有 shard 的 `STAGE_DONE` 后，向 Decode 发送 `KVPoll.Success`
+- **control rank**（rank=0）：接收 Decode 的 `DecodeAllocated`，通过 PUB/SUB relay 广播；收集各 rank 的 `RankTransferDone`，汇总后发送 `PrefillDone`
+- **传输线程**（ThreadPoolExecutor）：每个 rank 执行 `transfer_worker`，调用 `TransferPlan.execute_send()` 完成 RDMA 传输，然后发送 `RankTransferDone`
 
 **Decode 模式**
 
-- 后台线程发现所有 Prefill engine_rank，对每个执行一次性endpoint注册
-- per-request 向目标 Prefill 发送 `TRANSFER_INFO`
-- `(tp=0, pp=0)` owner rank 对外暴露 prepare/status endpoint，并通过一个 decode-local ZMQ broadcast 将 `PD_PREPARE_TRANSFER` / `KVPoll.Success` 同步给本地其他 TP/PP ranks
-- 轮询 `request_status` 等待 `KVPoll.Success`
+- ctrl rank（rank=0）接收 scheduler 的 `send_decode_prepare()` → 通过 PUB/SUB relay 广播给所有 ranks
+- dp_rank 匹配的 rank 执行 `prepare_kv_transfer()` → 分配 block → 发送 `DecodeAllocated` 到 Prefill
+- 收到 `PrefillDone` 后校验字节 → `is_prefill_done = True` → hook 触发 `recv_kv_cache_and_insert()`
 
-### ZMQ 消息协议（`kv_manager.py`）
+### 协议消息（`protocol.py`）
 
-所有控制面消息使用 ZMQ multipart 格式，固定位置索引，可选字段用空字节 `b""` 作为 placeholder。
+所有控制面消息使用 msgpack 单帧序列化，通过 `type` 字段分派到对应 dataclass。
 
-**DECODE_REGISTER**（Decode → Prefill，一次性注册）
+| 消息 | 方向 | 关键字段 |
+|------|------|----------|
+| `DecodePrepare` | Scheduler → Decode rank | `req_id`, `prefill_sid`, `prefix_len`, `new_cache_ids`, `dp_rank` |
+| `DecodeAllocated` | Decode → Prefill | `req_id`, `session_id`, `buffers: TransferBuffers`, `dp_rank`, `rank_num` |
+| `RankTransferDone` | Prefill rank → ctrl | `req_id`, `first_token`, `rank_bytes: dict[str,int]` |
+| `PrefillDone` | Prefill ctrl → Decode | `req_id`, `first_token`, `num_hit_tokens`, `rank_bytes: dict[str,int]` |
 
+### 传输匹配与规划（`transfer_plan.py`）
 
-| Frame索引 | 名称                  | 内容                              |
-| ------- | ------------------- | ------------------------------- |
-| 0       | ROOM                | `UUID(int=0)` 的 bytes（表示注册而非请求） |
-| 1       | TYPE                | `b"DECODE_REGISTER"`            |
-| 2       | DECODE_IP           | ASCII 字符串                       |
-| 3       | DECODE_PORT         | ASCII 字符串                       |
-| 4       | SESSION_ID          | Mooncake session ID（ASCII）      |
-| 5       | PACKED_KV_PTRS      | uint64 数组 bytes（各层 KV 地址）       |
-| 6       | PACKED_AUX_PTR      | uint64 bytes（aux buffer 地址）     |
-| 7       | PACKED_LINEAR_PTRS  | uint64 数组 bytes                 |
-| 8       | TP_SIZE_ASCII       | Decode 侧 TP 大小                  |
-| 9       | PACKED_INDEXER_PTRS | uint64 数组 bytes                 |
+**Key 格式**：`{req_id}[{cache_name}]_L{layer_id}_B{block_id}_S{split_id}+{split_num}_R{replica_id}/{replica_size}`
 
+**`create_transfer_plan` 流程**：
+1. 从 send key 中剥离 `_R...` 后缀得到 match_prefix
+2. 构建 `TransferMatcher` per prefix
+3. 按 `replica_ratio = send_replica_size // recv_replica_size` 过滤：仅 `send_replica_id == recv_replica_id * replica_ratio` 时匹配
+4. 双向长度一致性断言
+5. 按 recv.ptr 排序 + `_contiguous_address_merge` 合并相邻连续地址
+6. 构建 `TransferPlan`（per-session `TransferPlanPerRank`）
 
-**TRANSFER_INFO**（Decode → Prefill，per-request）
+**字节校验**：`PrefillDone.rank_bytes` 汇总所有 Prefill rank 的 per-session 传输字节数，Decode 侧对比 `recv_bytes`，不一致记录 error。
 
+### CacheTransferInfo（`cache_info.py`）
 
-| Frame索引 | 名称                    | 内容                      |
-| ------- | --------------------- | ----------------------- |
-| 0       | ROOM                  | request_id 的 UUID bytes |
-| 1       | TYPE                  | `b"TRANSFER_INFO"`      |
-| 2       | DECODE_IP             | ASCII 字符串               |
-| 3       | DECODE_PORT           | ASCII 字符串               |
-| 4       | SESSION_ID            | Mooncake session ID     |
-| 5       | DST_KV_INDICES_BYTES  | int32 数组 bytes（目标页索引）   |
-| 6       | AUX_INDEX_ASCII       | aux buffer 槽位索引         |
-| 7       | LINEAR_INDICES_BYTES  | int32 数组 bytes          |
-| 8       | INDEXER_INDICES_BYTES | int32 数组 bytes          |
+`frozen dataclass`，在 `PagedKVCache.__init__` 时预计算，后续查询零开销：
 
-
-**STAGE_DONE**（Prefill PP/TP rank → control rank）
-
-
-| Frame索引 | 名称       | 内容                         |
-| ------- | -------- | -------------------------- |
-| 0       | ROOM     | request_id 的 UUID bytes    |
-| 1       | TYPE     | `b"STAGE_DONE"`            |
-| 2       | PP_STAGE | PP stage 索引                |
-| 3       | TP_RANK  | TP rank 索引                 |
-| 4       | AUX_DONE | `"0"` 或 `"1"`（是否完成 aux 传输） |
-
-
-**Status Update**（Prefill control rank → Decode）
-
+```python
+@dataclass(frozen=True)
+class CacheTransferInfo:
+    split_id_base: int  # 本 rank 在 dim3 中的起始 head 偏移
+    n_chunks: int       # flat-memory chunk 数量
+    split_num: int      # 每个 chunk 覆盖的逻辑 head 数
+    replica_id: int     # 本 replica 在组内的序号
+    replica_size: int   # replica 组大小
 ```
-[room.bytes, "1"]    # "1" = KVPoll.Success
+
+统一计算逻辑（`compute_cache_transfer_info`）：
+```python
+replica_size = group_size // split_size
+split_id_base = (rank // replica_size) * n_local
+replica_id = rank % replica_size
 ```
+
+`pd_tp_ratio` 决定 `n_chunks`：`pd_tp_ratio > 1` 时 Decode 端将 block 拆分为多个 chunk，使每份 chunk 的 head 范围与一个 Prefill rank 对应。
 
 ### PDCoordinationService（`pd_coordination.py`）
 
@@ -228,26 +293,25 @@ class KVPoll(Enum):
 
 **服务发现**
 
-控制面 endpoint（Prefill control rank、Decode 准备与状态 endpoint）的注册与查询统一通过 coordinator TCPStore（`chitu/distributed/coordinator.py` 的 `set_endpoint`/`get_endpoint`）完成，不再使用专门的 ZMQ 服务。使用的角色：
+控制面 endpoint 的注册与查询统一通过 coordinator TCPStore（`chitu/distributed/coordinator.py` 的 `set_endpoint` / `get_endpoint`）完成。
 
+使用的角色：
 
 | 角色                                | 连接名                                             | 作用                          |
 | --------------------------------- | ------------------------------------------------ | --------------------------- |
-| `prefill_ctrl_<engine_rank>`      | `ctrl_port` / `internal_ctrl_port` / `ctrl_broadcast_port` | Prefill control rank 的控制面端口 |
-| `decode_prepare_<sid>_<dp_rank>`  | `prepare_port`                                   | Decode 准备监听 endpoint        |
-| `decode_status_<sid>_<dp_rank>`   | `status_port` / `status_broadcast_port`          | Decode 状态 endpoint（含 internal broadcast port） |
+| `prefill{sid}`                    | `decode_allocated` / `rank_transfer_done`        | Prefill 控制面 endpoint       |
+| `decode{sid}`                     | `decode_prepare` / `prefill_done`                | Decode 控制面 endpoint        |
 
+### MooncakeBootstrapServer（`mooncake/transfer_engine.py`）
 
-### MooncakeBootstrapServer（`kv_transfer/mooncake/transfer_engine.py`）
-
-运行在 Router 进程中的轻量 HTTP 服务。Router 启动时只要 `kv_transfer_backend == "mooncake"` 即**启动**。
+运行在 Router 进程中的轻量 HTTP 服务。Router 启动时只要 `kv_transfer_backend == "mooncake"` 即启动。
 
 MooncakeBootstrapServer vs PDCoordinationService：
 
-- **MooncakeBootstrapServer**：Prefill endpoint 集合。Decode 通过 `_get_bootstrap_info()` 查询 Bootstrap 来发现 Prefill 的 ZMQ 地址，通过 `_discover_prefill_engine_ranks()` 探测有多少个 Prefill。这是 Decode 找到 Prefill 的手段。
-- **PDCoordinationService：**：内部控制面端点同步。用于 Prefill PP/TP ranks 之间发现 control rank 的广播端口、Decode prepare/status endpoint，以及 Decode 内部 broadcast endpoint。
+- **MooncakeBootstrapServer**：Prefill endpoint 集合。Decode 通过 Bootstrap 来发现 Prefill 的 Mooncake session 地址。这是 Decode 找到 Prefill 的手段。
+- **PDCoordinationService**：内部控制面端点同步。用于 Prefill/Decode 内部 ranks 之间发现 endpoint。
 
-唯一存在 fallback 的地方是 Prefill **注册自身** endpoint 这一步：优先通过 Coordination Service 注册，仅当 Coordination 不可用时才 fallback 到 Bootstrap 的 `PUT /route`（`_register_to_bootstrap()`）。
+唯一存在 fallback 的地方是 Prefill **注册自身** endpoint 这一步：优先通过 Coordination Service 注册，仅当 Coordination 不可用时才 fallback 到 Bootstrap 的 `PUT /route`。
 
 
 | 方法  | 路径                          | 作用                                                                                |
@@ -260,28 +324,33 @@ MooncakeBootstrapServer vs PDCoordinationService：
 
 ### PDScheduler（`pd_scheduler.py`）
 
-继承自 `Scheduler`，根据模式分为 `PrefillOnlyScheduler` 和 `DecodeOnlyScheduler`。
+根据模式分为 `PrefillOnlyManager` 和 `DecodeOnlyManager`。
 
 **Prefill 队列模型**
 
 ```
 请求到达 → _prefill_incoming_q → _prefill_bootstrap_q → _prefill_ready_q → TaskPool → 执行
-                                   (等待 TRANSFER_INFO)    (可调度)
+                                   (等待 DecodeAllocated)    (可调度)
 ```
 
 **Decode 队列模型**
 
 ```
 请求到达 → _decode_incoming_q → _decode_prealloc_q → _decode_ready_q → TaskPool → 执行
-             (发送 PREPARE)      (等待 KVPoll.Success)   (可调度)
+             (分配 block, 发送       (等待 PrefillDone)        (可调度)
+              DecodePrepare)
 ```
+
+Decode 侧支持 token budget（`decode_prealloc_token_budget`）和 per-DP 并发限制（`decode_max_running_tasks_per_dp`），控制 prealloc 阶段的内存压力。`DecodePrepare` 每 1 秒重发直到 PrefillDone 就绪。
 
 ### MooncakeKVTransferHook（`hooks.py`）
 
-注入到 Executor 中的 Hook，在 prefill 完成后自动触发 KV 发送：
+注入到 Executor 中的 Hook：
 
-- `on_prefill_done(req_ids, logits, tasks)`：Prefill 模式下，对 logits 做 sample 得到首 token，调用 `KVManager.send_kv_cache()`
-- PP>1 时，非最后一个 PP stage 只发送 KV（不含First token）
+- `on_prefill_done(tasks)`：Prefill 模式下调用 `kv_manager.send_kv_cache()`
+- `before_decode_step(req_ids)`：Decode 模式下逐请求调用 `kv_manager.recv_kv_cache_and_insert()` 并更新 task 的首 token
+
+PP>1 时，非最后一个 PP stage 只发送 KV（不含首 token）。
 
 ## 配置
 
@@ -303,14 +372,23 @@ multi_inst:
       buffer_size: 2048
       transfer_timeout: 30.0
       max_concurrent_transfers: 8
-      decode_wait_timeout_s: 300.0   # Decode 等待 KV 传输完成的超时
-      decode_resend_interval_s: 0.5  # Decode 重发 TRANSFER_INFO 间隔
-      decode_poll_interval_s: 0.05   # Decode 轮询 KV 状态间隔
+      decode_wait_timeout_s: 300.0     # Decode 等待 KV 传输完成的超时
+      decode_resend_interval_s: 0.5    # Decode 重发 DecodePrepare 间隔
+      decode_poll_interval_s: 0.05     # Decode 轮询 KV 状态间隔
+      queue_max_pending: 32            # 队列最大 pending 数
+      queue_log_interval_s: 1.0        # 队列背压日志间隔
+      decode_prealloc_max_pending: null # prealloc 并发上限
+      decode_prealloc_token_budget: 0  # prealloc token 预算
+      decode_prealloc_reserved_tokens: 0
+      decode_max_running_tasks_per_dp: null
+      prefill_bootstrap_poll_interval_s: 0.01
+      prefill_wait_transfer_info_timeout_s: 2400.0
+      pd_tp_ratio: 1                   # prefill_tp / decode_tp，仅 Decode 端按需设置 >1
 
   router:
     is_router: True                # Router 进程设为 True，P/D 设为 False
     host: 0.0.0.0
-    port: 21003                    # HTTP 推理入口端口
+    port: 22001                    # HTTP 推理入口端口
     routing_algorithm: "prefix_cache_aware"
 
   # 启动脚本会生成以下形式的实例覆盖配置
@@ -338,18 +416,17 @@ multi_inst:
 
 | 组件             | 端口    | 协议   | 节点  | 用途                          |
 | -------------- | ----- | ---- | --- | --------------------------- |
-| Router API     | 21003 | HTTP | A   | 推理入口 `/v1/chat/completions` |
+| Router API     | 22001 | HTTP | A   | 推理入口 `/v1/chat/completions` |
 | Router Stats   | 随机    | ZMQ  | A   | P/D 统计心跳（coordinator 发现）    |
 | Router Token   | 随机    | ZMQ  | A   | Decode → Router token 回传（coordinator 发现）    |
-| Coordinator    | 21001 | TCP  | A   | 端口发现 TCPStore  |
-| MetadataSync   | 随机    | ZMQ  | A   | 元数据同步（coordinator 发现）       |
+| Coordinator    | 21001+offset | TCP  | A   | 端口发现 TCPStore  |
 | Bootstrap      | 8080  | HTTP | A   | Mooncake endpoint目录         |
 | Prefill P0     | 随机    | ZMQ  | B   | Router → P0 请求（coordinator 发现）  |
 | Prefill P1     | 随机    | ZMQ  | B   | Router → P1 请求（coordinator 发现）  |
 | Decode D0      | 随机    | ZMQ  | A   | Router → D0 请求（coordinator 发现）  |
 | Decode D1      | 随机    | ZMQ  | A   | Router → D1 请求（coordinator 发现）  |
 | Decode D2      | 随机    | ZMQ  | A   | Router → D2 请求（coordinator 发现）  |
-| P ↔ D RDMA     | —     | RDMA | —   | KV/aux 显存直传                 |
+| P ↔ D RDMA     | —     | RDMA | —   | KV cache 显存直传                 |
 
 
 ## 运行方式
@@ -382,7 +459,7 @@ bash script/srun_pd_disagg_base_apptainer.sh <MODEL_CONFIG> <MODEL_CKPT_DIR> <SI
 | Router | `--router-port PORT` `--config-name NAME` `--bind-code 0|1`                       | Router 配置                                                 |
 
 
-**实例参数支持的 key：** `tp`, `pp`, `dp`, `ep`, `max_seq_len`, `max_batch_size`, `max_new_tokens`, `chunk`(仅 prefill), `full_warmup`, `nnodes`, `nproc`。含 `.` 的 key 自动作为 Hydra override（如 `infer.memory_utilization=0.90`）。
+**实例参数支持的 key：** `tp`, `pcp`, `pp`, `dp`, `ep`, `max_seq_len`, `max_batch_size`, `max_new_tokens`, `chunk`(仅 prefill), `full_warmup`, `nnodes`, `nproc`。含 `.` 的 key 自动作为 Hydra override（如 `infer.memory_utilization=0.90`）。
 
 #### 示例 1：DeepSeek-R1（4 节点，1P1D，PP=2）
 
@@ -391,7 +468,7 @@ bash script/srun_pd_disagg_base_apptainer.sh <MODEL_CONFIG> <MODEL_CKPT_DIR> <SI
 ```bash
 bash script/srun_pd_disagg_base_apptainer.sh \
   DeepSeek-R1 /data/nfs/DeepSeek-R1 /path/to/chitu-mooncake.sif \
-  --nodes 4 --router-port 21006 \
+  --nodes 4 --router-port 22006 \
   --model-spec "attn_type=flash_mla,mla_absorb=absorb-without-precomp" \
   --pd-spec "decode_wait_timeout_s=1200,decode_prealloc_max_pending=256,decode_prealloc_token_budget=350000,decode_prealloc_reserved_tokens=1024,decode_max_running_tasks_per_dp=30" \
   --prefill "tp=8,pp=2,dp=1,ep=1,max_seq_len=6144,max_batch_size=256,full_warmup=True,infer.memory_utilization=0.90" \
@@ -406,7 +483,7 @@ bash script/srun_pd_disagg_base_apptainer.sh \
 ```bash
 bash script/srun_pd_disagg_base_apptainer.sh \
   Qwen3-235B-A22B-fp8 /data/nfs/Qwen3-235B-A22B-FP8 /path/to/chitu-mooncake.sif \
-  --nodes 4 --router-port 21006 \
+  --nodes 4 --router-port 22006 \
   --model-spec "attn_type=flash_mla" \
   --pd-spec "decode_wait_timeout_s=1200,decode_prealloc_max_pending=256,decode_prealloc_token_budget=350000,decode_prealloc_reserved_tokens=1024,decode_max_running_tasks_per_dp=30" \
   --prefill "tp=4,pp=2,dp=1,ep=1,max_seq_len=6144,max_batch_size=256,full_warmup=True,infer.memory_utilization=0.90" \
@@ -434,10 +511,81 @@ bash script/start_pd_disagg_1p2d_local.sh <MODEL_CONFIG> <MODEL_CKPT_DIR>
 ### 请求测试
 
 ```bash
-curl -X POST http://<Router_IP>:21003/v1/chat/completions \
+curl -X POST http://<Router_IP>:22001/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"你好"}],"max_tokens":64,"stream":true}'
 ```
+
+## 内置测试
+
+Router 内置了 `pd.test` 冒烟测试模式。当所有 P/D 实例连接就绪后，Router 自动注入一批 mock 请求，监控其完整经过 prefill→decode→finish 流水线，输出每请求结果后退出。
+
+### 配置参数
+
+配置位于 `pd_test` 节点（`chitu/config/test.yaml`）：
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `enable` | bool | `False` | 是否启用测试模式 |
+| `req_num` | int | `8` | 注入的测试请求数量 |
+| `req_timeout` | float | `300` | 单请求超时（秒），超时记为失败 |
+| `output_len` | int | `128` | 每个请求的 `max_new_tokens` |
+
+### 命令行用法
+
+通过 Hydra override 开启：
+
+```bash
+bash script/srun_pd_disagg_base_apptainer.sh <MODEL_CONFIG> <MODEL_CKPT_DIR> <SIF_FILE> \
+  --prefill "tp=2,pp=1,dp=1" \
+  --decode "tp=1,pp=1,dp=2,ep=2" \
+  --pd-spec "pd_test.enable=1,pd_test.req_num=8,pd_test.req_timeout=300,pd_test.output_len=256"
+```
+
+### 工作原理
+
+1. Router 启动后等待所有 P/D 实例连接（`_wait_for_pd_instances`）
+2. 实例全部就绪后，`PDTestRunner.run()` 启动：
+   - **创建请求**：以 `pd_test_000000` ~ `pd_test_000007` 为 `request_id`，从内置问题池中轮询选择 prompt，通过 `PDRequestRouter.add_request()` 分发
+   - **监控完成**：每 0.5s 轮询 `pending_pd_requests`，通过 Token Router 的 `active_requests` 判断请求是否完成；超时记为失败
+   - **输出结果**：所有请求完成后，逐条打印 `[PD_TEST][result]` 日志（`request_id` / `status` / `input_len` / `output_tokens` / 生成文本）
+3. 全部请求成功 → `os._exit(0)`；有任何失败 → `os._exit(1)`
+
+### 日志示例
+
+```
+[PD_TEST] test mode enabled: num_requests=8 timeout=300.0s output_len=128
+[PD_TEST] creating 8 test requests
+[PD_TEST] all 8 test requests dispatched, start_time=1719600000.123
+[PD_TEST] monitoring 8 requests, timeout=300.0s
+[PD_TEST] all requests finished: completed=8 failed=0 total_elapsed=45.678s
+[PD_TEST] all 8 requests completed successfully
+[PD_TEST][result] rid=pd_test_000000 status=COMPLETED input_len=22 max_new_tokens=128 output_tokens=128 output=宫保鸡丁是一道著名的川菜...
+[PD_TEST][result] rid=pd_test_000001 status=COMPLETED input_len=49 max_new_tokens=128 output_tokens=128 output=Kung Pao chicken is a spicy...
+...
+[PD_TEST] exiting process
+```
+
+### CI 集成
+
+CI 中使用 Hydra 命令行 override 直接覆盖 `pd_test.*` 参数，无需修改配置文件：
+
+```yaml
+# 示例：ci/platforms/h20/pd_test.yml
+CHITU_CMDLINE: |
+  models=GLM-4.7-Flash \
+  models.ckpt_dir=/data/nfs2/GLM-4.7-Flash \
+  pd_test.enable=1 \
+  pd_test.req_num=8 \
+  pd_test.req_timeout=600 \
+  pd_test.output_len=1024 \
+  multi_inst.n_insts=2 \
+  +multi_inst.inst_overrides.0.multi_inst.role=prefill \
+  +multi_inst.inst_overrides.0.infer.tp_size=2 \
+  +multi_inst.inst_overrides.1.multi_inst.role=decode \
+  ...
+```
+
 
 ## 监控与观测
 
@@ -507,10 +655,9 @@ observe_stage_duration("decode", "kv_recv", duration_s)
 | `[PD_STAGE][prefill.kv_send.start]`      | Prefill Hook      | KV 发送开始         |
 | `processing prefill request`             | Prefill Scheduler | 收到 prefill 请求   |
 | `processing decode request`              | Decode Scheduler  | 收到 decode 请求    |
-| `decode endpoint registered to prefill`  | Decode KVManager  | 完成endpoint注册    |
-| `finished kv cache transfer`             | Prefill KVManager | KV RDMA 传输完成    |
-| `finished aux transfer`                  | Prefill KVManager | aux 传输完成        |
-| `received kv cache`                      | Decode KVManager  | 收到 KV，准备 decode |
+| `[PD_BOOTSTRAP][prefill.wait]`           | Prefill Scheduler | 等待 DecodeAllocated |
+| `[PD_BOOTSTRAP][decode.wait]`            | Decode Scheduler  | 等待 PrefillDone   |
+| `[PD_QUEUE][decode.ready]`               | Decode Scheduler  | KV ready，准备 decode |
 | `created pd request: <rid> -> P{k}-D{m}` | Router            | 请求分配到具体 P/D     |
 
 
@@ -522,10 +669,17 @@ Router 进程可选启动内置的 Prometheus Server（`PrometheusServerManager`
 
 ## TP 并行
 
-- 仅 TP 主 rank（rank 0）对外暴露 ZMQ 端口，处理控制面消息
-- 非主 rank 通过 PUB/SUB 接收 control rank 广播的注册和传输信息
+- 仅 rank 0 对外暴露 ZMQ 端口，处理控制面消息
+- 非 rank 0 通过 PUB/SUB 接收 ctrl rank 广播的 `DecodeAllocated` / `DecodePrepare` / `PrefillDone` 等消息
 - 每个 TP rank 独立执行自己负责的 KV 层的 RDMA 传输
-- 所有 rank 完成后由 control rank 汇总发送 Success
+- 所有 rank 完成后由 Prefill ctrl rank 汇总 `dp_way_size` 个 `RankTransferDone`，发送 `PrefillDone`
+- head-repeat 场景（n_head < tp_size）下，同 head 的连续 rank 产生相同 match_prefix，`TransferMatcher` 自动过滤重复匹配
+
+## CP（Context Parallelism）支持
+
+- `pcp_size > 1` 时 TP 强制为 1，CP group 替代 TP group 参与 split 计算
+- `dp_way_size = world_size // dp_group_size` 自动覆盖 CP 场景
+- `cp_rank` 记录在 trace 日志中
 
 ## 代码导航
 
@@ -534,12 +688,20 @@ Router 进程可选启动内置的 Prometheus Server（`PrometheusServerManager`
 | --------------- | ----------------------------------------- | ---------------------------------------- |
 | Router          | `pd_request_router.py`                    | 请求路由与 P/D 分发                             |
 | Coordination    | `pd_coordination.py`                      | endpoint发现与元数据同步                         |
-| Scheduler       | `pd_scheduler.py`                         | Prefill/Decode 调度器与队列管理                  |
+| Scheduler       | `pd_scheduler.py`                         | Prefill/Decode 调度器与分层队列管理                  |
 | Service         | `pd_service.py`                           | 进程入口与初始化                                 |
-| KV Manager      | `kv_transfer/kv_manager.py`               | KV 传输核心逻辑                                |
+| KV Manager Base | `kv_transfer/base.py`                     | 共享基类：TransferEngine + TaskInfo + trace     |
+| KV Manager Prefill | `kv_transfer/prefill.py`               | Send 侧：DecodeAllocated 接收 + RDMA 发送 + RankTransferDone |
+| KV Manager Decode  | `kv_transfer/decode.py`                | Recv 侧：DecodePrepare → block 分配 → DecodeAllocated → 等待 PrefillDone |
+| Endpoint        | `kv_transfer/endpoint.py`                 | ZMQ master/slave/remote 三模式抽象              |
+| Protocol        | `kv_transfer/protocol.py`                 | 4 种协议消息 dataclass + msgpack 序列化           |
+| Transfer Buffers | `kv_transfer/transfer_buffers.py`        | TransferBuffer + TransferBuffers            |
+| Transfer Plan   | `kv_transfer/transfer_plan.py`            | TransferMatcher + TransferPlan + create_transfer_plan |
+| Cache Info      | `kv_transfer/cache_info.py`               | CacheTransferInfo 预计算 split/chunk/replica 元数据 |
+| Task Info       | `kv_transfer/task_info.py`                | TaskInfo: per-request 状态聚合                |
 | Transfer Engine | `kv_transfer/mooncake/transfer_engine.py` | Mooncake RDMA 引擎封装 + Bootstrap Server    |
-| Metadata        | `kv_transfer/mooncake/metadata.py`        | 首 token aux buffer 管理                    |
-| Hook            | `hooks.py`                                | `MooncakeKVTransferHook`，prefill 完成后触发传输 |
+| Metadata        | `kv_transfer/mooncake/metadata.py`        | MetadataBuffers（辅助 buffer 管理）             |
+| Hook            | `hooks.py`                                | `MooncakeKVTransferHook`，prefill/decode 时触发传输 |
 | 监控              | `metrics/prometheus_collector.py`         | Prometheus 指标定义与辅助函数                     |
 | 配置              | `config/serve_config.yaml`                   | 服务和 PD 分离的统一基础配置                         |
 | 脚本              | `script/start_pd_disagg_*.sh`             | 本地启动脚本                                   |
@@ -552,12 +714,9 @@ Router 进程可选启动内置的 Prometheus Server（`PrometheusServerManager`
 | 现象                    | 排查方向                                                                        |
 | --------------------- | --------------------------------------------------------------------------- |
 | P/D 启动卡在 Bootstrap 连接 | 确认 Router 已启动 Bootstrap，且 coordinator.host/port 对 P/D 节点可达 |
-| Decode 长时间 WAITING    | 检查 Prefill 是否收到 TRANSFER_INFO；查看 Prefill 传输线程日志；确认 RDMA 设备已正确检测（见 `chitu/distributed/infiniband.py`） |
-| RDMA "Bad address"    | 确认 `register_buffer_to_engine()` 在 CacheManager 注入后调用；检查各层 base_ptr/len 无重叠 |
-| Router 序列化报错          | 确保请求 `messages` 是纯 dict 列表（非 pydantic 对象）                                   |
-| 同节点多进程端口冲突            | 调度器请求端口现为随机分配并通过 coordinator 发现；仅需为每个 torchrun 进程指定不同的 `--master_port`                |
-
-
-| 调度器请求端口现为随机分配并通过 coordinator 发现；仅需为每个 torchrun 进程指定不同的 `--master_port`                |
-
-
+| Decode 长时间 WAITING    | 检查 Prefill 是否收到 `DecodeAllocated`；查看 Prefill 传输线程日志；确认 RDMA 设备已正确检测（见 `chitu/distributed/infiniband.py`） |
+| RDMA "Bad address"    | 确认 `register_buffer_to_engine()` 在 cache 创建后调用；检查各层 ptr/len 无重叠 |
+| transfer bytes mismatch | Decode 日志出现 `rank_bytes` vs `recv_bytes` 不一致；检查 Prefill/Decode 的 `split_size` / `pd_tp_ratio` 配置是否匹配 |
+| GLM-5 + auto attn_type + MTP>1 乱码 | `HopperMixedBackend` 与 MTP 不兼容，设置 `attn_type=flash_mla` |
+| 同节点多进程端口冲突            | 调度器请求端口为随机分配并通过 coordinator 发现；仅需为每个 torchrun 进程指定不同的 `--master_port`；Router port 使用 22001 + job_offset 基础 |
+| head-repeat 模型乱码          | 检查 `compute_cache_transfer_info` 中的 `replica_size` / `split_id_base` 计算是否正确（head 按连续分组分布，同 head 的 rank 相邻）；确认 `TransferMatcher` replica_ratio 过滤逻辑 |

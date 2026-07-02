@@ -1,6 +1,24 @@
 # 开发者手册
 ## 安装指引
-### 使用官方镜像
+### 使用 chitu.run（推荐）
+
+1. 安装与所用设备兼容的 Docker。
+2. 从 [Releases](https://github.com/thu-pacman/chitu/releases) 中的 Assets 页面下载与所用平台相符的 `chitu-<version>.run` 的文件。
+3. 为其添加可执行权限：
+   ```
+   chmod +x chitu-<version>.run
+   ```
+4. 运行：
+   ```
+   ./chitu-<version>.run <arguments>
+   ```
+
+关于运行参数，请参阅 [赤兔 CLI 参数](../en/CLI.md) 。
+
+此可执行文件会在内部使用 Docker 容器运行赤兔。
+
+### 显式使用 Docker
+
 #### 英伟达
 
 ```bash

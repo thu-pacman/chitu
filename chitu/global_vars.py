@@ -605,6 +605,14 @@ def get_global_args(need_ensure=True):
     return _GLOBAL_ARGS
 
 
+def get_kv_transfer_args():
+    """Return the KvTransferConfig for PD disaggregation KV transfer.
+
+    No fallback — crashes if config is missing (expected in PD mode).
+    """
+    return get_global_args().multi_inst.pd_disaggregation.kv_transfer
+
+
 def set_global_args(raw_args, need_ensure=True, need_preprocess=True):
     global _RAW_GLOBAL_ARGS
     global _GLOBAL_ARGS
@@ -808,3 +816,14 @@ class SlotHandle:
 
     def get_current_slot_start_end_idx(self):
         return self.get_slot_start_end_idx(self.slot_idx)
+
+
+def set_cuda_device():
+    """Set the CUDA device for the current process/thread.
+
+    Uses ``infer.device_ids[global_rank]`` to determine the device
+    Must be called in every new thread entry point that interacts with CUDA.
+    """
+    rank = int(os.environ.get("RANK", 0))
+    args = get_global_args()
+    torch.cuda.set_device(args.infer.device_ids[rank])

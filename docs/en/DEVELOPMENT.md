@@ -1,6 +1,24 @@
 # Developer Guide
 ## Installation
-### Using Docker
+### Using chitu.run (recommended)
+
+1. Install Docker that is compatible with your device.
+2. Download a `chitu-<version>.run` file suitable for your platform from the Assets section in [Releases](https://github.com/thu-pacman/chitu/releases).
+3. Assign the executable permission to it:
+   ```
+   chmod +x chitu-<version>.run
+   ```
+4. Run it:
+   ```
+   ./chitu-<version>.run <arguments>
+   ```
+
+Please refer to  [Chitu CLI Arguments](CLI.md) for arguments.
+
+This executable will run Chitu with a Docker container internally.
+
+### Explicitly Using Docker
+
 #### NVIDIA GPU
 
 ```bash

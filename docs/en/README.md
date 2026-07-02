@@ -34,12 +34,9 @@ The project team appreciates valuable feedback from users and the open-source co
 Please refer to our self-tested [performance data](/docs/en/PERFORMANCE.md). Results may vary based on your hardware configuration, software versions, and test workloads, with possible fluctuations across multiple tests. Welcome to [share your test results](https://github.com/thu-pacman/chitu/discussions/104).
 
 ## Installation & Usage
-Refer to the [Developer Manual](DEVELOPMENT.md) for complete installation instructions. For quick validation in standalone environments, we recommend using official images currently available for:
-* NVIDIA (arch 8.0, 8.9): `qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-nvidia_arch_80_89:latest`
-* NVIDIA (arch 9.0): `qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-nvidia_arch_90:latest`
-* MetaX: `qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-muxi:latest`
-* Ascend (A2): `qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-ascend_a2:latest`
-* ~~Ascend (A3): `qingcheng-ai-cn-beijing.cr.volces.com/public/chitu-ascend_a3:v0.5.4`~~ (no longer maintained since v0.5.5 due to lack of hardware)
+We recommend using chitu.run for deployment. Please download from the Assets section in [Releases](https://github.com/thu-pacman/chitu/releases).
+
+Refer to the [Developer Manual](DEVELOPMENT.md) for complete installation instructions.
 
 ### Supported Models
 

@@ -26,6 +26,12 @@ class KVCacheSpec:
     kvargs: KVArgs
     kv_keys: Optional[KVKeys] = None
     block_size: Optional[int] = None
+    split_size: int = 0
+    """
+    Number of ways the full dimension is split across TP ranks.
+    * 0: replica — all ranks hold identical data.
+    * others: split  — dim3 partitioned into this many parts across TP.
+    """
 
 
 # (priority, matcher(args, cache_name), fn)
@@ -95,6 +101,7 @@ def should_use_hopper_mixed_backend(args) -> bool:
         getattr(args.models, "type", None) != ModelType.DEEPSEEK_V3
         or getattr(args.infer, "mla_absorb", "none") == "none"
         or not getattr(args.models, "index_topk", None)
+        or getattr(args.infer, "mtp_size", 1) > 1
     ):
         return False
     quant_config = getattr(args.models, "quant_config", None)

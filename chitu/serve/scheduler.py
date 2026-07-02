@@ -20,7 +20,11 @@ from chitu.chitu_main import chitu_init, warmup_engine, start_enhanced_scheduler
 from chitu.serve.common import start_worker
 from chitu.task import TaskPool
 from chitu.distributed.infiniband import auto_set_ib_envs
-from chitu.global_vars import is_classic_pd_disagg, is_independent_multi_inst
+from chitu.global_vars import (
+    is_classic_pd_disagg,
+    is_independent_multi_inst,
+    set_cuda_device,
+)
 
 logger = getLogger(__name__)
 
@@ -89,11 +93,8 @@ def init_dp_scheduler(args):
         f"[SCHEDULER] rank=0 starting process_queue in background thread and Enhanced Scheduler service(for zmq service) on main loop..."
     )
 
-    # Start the compute loop in a dedicated thread/event loop to avoid blocking asyncio
-    device_id = torch.cuda.current_device()
-
     def set_device_id_again_and_start_worker():
-        torch.cuda.set_device(device_id)
+        set_cuda_device()
         start_worker()
 
     t = threading.Thread(target=set_device_id_again_and_start_worker)

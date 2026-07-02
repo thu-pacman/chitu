@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Per-request transfer state for PD disaggregation.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+from enum import IntEnum
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from chitu.distributed.pd_disaggregation.kv_transfer.transfer_buffers import (
+        TransferBuffers,
+    )
+
+
+class TransferStatus(IntEnum):
+    """Per-request transfer status."""
+
+    Waiting = 0
+    Success = 1
+
+
+@dataclass
+class TaskInfo:
+    """Per-request state for a single PD disaggregation transfer."""
+
+    # ===============================
+    #     Prefill & Decode shared
+    # ===============================
+
+    req_id: str = ""
+    first_token: int = 0
+    num_hit_tokens: int = 0
+
+    # ===============================
+    #            Prefill
+    # ===============================
+
+    decode_sid: int = -1
+    decode_dp_rank: int = -1
+
+    recv_buffers: dict[str, TransferBuffers] = field(default_factory=dict)
+    """Per decode session_id (P side, from DecodeAllocated)."""
+    decode_allocated_cnt: int = 0
+    is_decode_allocated: bool = False
+
+    done_count: int = 0
+    """RankTransferDone counter."""
+
+    rank_bytes: dict[str, int] = field(default_factory=dict)
+    """Per-session sent bytes, accumulated from RankTransferDone (P side)."""
+
+    # ===============================
+    #            Decode
+    # ===============================
+
+    prefill_sid: Optional[int] = None
+
+    cache_new_block_ids: dict[str, list[int]] = field(default_factory=dict)
+    """cache name -> list of new block ids."""
+
+    cache_manager_new_block_ids: dict[str, list[int]] = field(default_factory=dict)
+    """cache manager name -> list of new block ids."""
+
+    is_prefill_done: bool = False
+    is_decode_prepare_received: bool = False
+    is_decode_allocated_sent: bool = False
+
+    prefix_len: int = 0
+    dp_rank: int = -1
+    """dp_rank that owns this request on the decode side."""
+
+    recv_bytes: int = 0
+    """Expected total recv bytes, set during prepare_kv_transfer (D side)."""

@@ -25,7 +25,12 @@ def default_kv_cache_spec(args, attn_backend_type) -> KVCacheSpec:
         "n_local_kv_heads": n_local_kv_heads,
         "head_dim": head_dim,
     }
-    return KVCacheSpec(kvargs=kvargs, kv_keys=["k", "v"])
+    assert n_kv_heads % n_local_kv_heads == 0
+    return KVCacheSpec(
+        kvargs=kvargs,
+        kv_keys=["k", "v"],
+        split_size=n_kv_heads // n_local_kv_heads,
+    )
 
 
 @register_kv_cache_spec(

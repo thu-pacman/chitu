@@ -635,6 +635,7 @@ def global_args():
                     "kv_transfer": {
                         "decode_wait_timeout_s": 5.0,
                         "decode_resend_interval_s": 0.2,
+                        "pd_tp_ratio": 1,
                     },
                 },
                 "router": {
