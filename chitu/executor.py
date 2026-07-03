@@ -1102,8 +1102,12 @@ class Executor:
             payload_type, tasks = dispatcher.dispatch_metadata(tasks)
 
         if self.task_dispatchers:
-            from chitu.serve.common import clear_pending_profile_payload
+            from chitu.serve.common import (
+                apply_pending_profile_command,
+                clear_pending_profile_payload,
+            )
 
+            apply_pending_profile_command(clear_after_apply=False)
             clear_pending_profile_payload()
 
         # Payload Type: Terminated
@@ -1128,8 +1132,21 @@ class Executor:
             return payload_type
 
         process_queue = self.process_queue
-        for process_step in process_queue:
-            process_step(tasks)
+        from chitu.serve.common import begin_profiler_step, end_profiler_step
+
+        profiler_step_started = begin_profiler_step(
+            getattr(tasks, "task_type", None),
+            int(getattr(tasks, "num_tasks", 0) or 0),
+        )
+        try:
+            for process_step in process_queue:
+                process_step(tasks)
+        finally:
+            if profiler_step_started:
+                end_profiler_step(
+                    getattr(tasks, "task_type", None),
+                    int(getattr(tasks, "num_tasks", 0) or 0),
+                )
 
         return payload_type
 

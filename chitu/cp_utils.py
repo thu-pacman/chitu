@@ -173,26 +173,15 @@ class CPContext:
 
     def split_prefill(
         self,
-        tokens: torch.Tensor,
+        tokens: Optional[torch.Tensor],
         freqs_cis: BatchedFreqsCis,
         hiddens: Optional[torch.Tensor],
         pp_stage: int,
-        cp_active: bool,
-    ) -> Tuple[torch.Tensor, BatchedFreqsCis]:
-        """Unified CP split for prefill pipeline: dispatch to stage0/stage1 based on pp_stage.
-
-        Args:
-            tokens: token IDs (used at stage 0)
-            freqs_cis: frequency cos/sin
-            hiddens: hidden states from previous PP stage (used at stage 1+)
-            pp_stage: current PP stage index
-            cp_active: whether CP split should be performed
-
-        Returns:
-            (tokens, freqs_cis) after CP split. tokens unchanged at stage 1+.
-        """
-        self.set_step_active(cp_active)
-        if not cp_active:
+        delta_total: int,
+    ) -> Tuple[Optional[torch.Tensor], BatchedFreqsCis]:
+        """Split stage-0 token IDs or later-stage freqs_cis for CP prefill."""
+        if not self.should_split_prefill(delta_total):
+            self.set_step_active(False)
             return tokens, freqs_cis
         if pp_stage == 0:
             tokens, freqs_cis = self.split_stage0(tokens, freqs_cis)
@@ -225,12 +214,8 @@ class CPContext:
         Returns:
             Logits tensor [num_outputs, dim]
         """
-        # Decide whether CP gather is needed. By default attention and the
-        # final gather share the per-step CP state set by split_prefill().
-        # For later PP stages, also consult the global delta length because
-        # stage 0 may have CP-split the batch even when this stage's local
-        # token count is smaller than pcp_size.
         need_gather = self.step_active if cp_active is None else cp_active
+        # Later PP stages decide by global delta, not local hidden length.
         if not need_gather and pp_size > 1 and pp_stage != 0:
             if seq_len_delta is not None:
                 delta_total = seq_len_delta.delta_total_len
@@ -240,7 +225,6 @@ class CPContext:
             h = post_layers_fn(h)
             return h.float()
 
-        # Determine the original (global) token count for trim
         orig = self._orig_num_tokens
         if orig <= 0 and pp_size > 1:
             if seq_len_delta is not None:
@@ -516,7 +500,7 @@ class NoOpCPContext:
     def split_stage1(self, h, freqs_cis):
         return freqs_cis
 
-    def split_prefill(self, tokens, freqs_cis, hiddens, pp_stage, cp_active):
+    def split_prefill(self, tokens, freqs_cis, hiddens, pp_stage, delta_total):
         return tokens, freqs_cis
 
     def gather(

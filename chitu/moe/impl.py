@@ -12,6 +12,7 @@ from chitu.utils import try_import_opt_dep, try_import_and_setup_torch_npu, ceil
 from chitu.moe.token_dispatchers import (
     MoETokenDispatcher,
     MoEAllGatherTokenDispatcher,
+    MoECPETPTokenDispatcher,
     MoENpuAllToAllTokenDispatcher,
     MoENpuDistributeTokenDispatcher,
 )
@@ -165,8 +166,15 @@ class MoEImplBase:
         self.task_type: Optional[TaskType] = None
         self.load_balancer = {}
 
-    def prepare(self, task_type: TaskType, num_tokens: int) -> None:
+    def prepare(
+        self,
+        task_type: TaskType,
+        num_tokens: int,
+    ) -> None:
         self.task_type = task_type
+
+    def need_token_dispatch(self) -> bool:
+        return False
 
     def get_expert_mapping(self, layer_id: int):
         raise NotImplementedError()
@@ -417,9 +425,17 @@ class MoEImplEP(MoEImplBase):
             raise ValueError(f"Invalid task type: {self.task_type}")
 
     @override
-    def prepare(self, task_type: TaskType, num_tokens: int) -> None:
+    def prepare(
+        self,
+        task_type: TaskType,
+        num_tokens: int,
+    ) -> None:
         super().prepare(task_type, num_tokens)
         self._get_current_token_dispatcher().prepare(num_tokens)
+
+    @override
+    def need_token_dispatch(self) -> bool:
+        return self.ep_size > 1
 
     @override
     def enter_moe(
@@ -540,6 +556,67 @@ class MoEImplNoEP(MoEImplBase):
         )
 
         assert self.ep_size == 1
+        self.cp_etp_dispatcher = None
+        self.cp_etp_unsupported_reason = None
+        self._init_cp_etp_dispatcher()
+
+    def _init_cp_etp_dispatcher(self) -> None:
+        cp_context = get_cp_context()
+        unsupported_reason = None
+        if not cp_context.is_active:
+            unsupported_reason = "CP context is not active"
+        elif self.tp_size != 1:
+            unsupported_reason = f"tp_size must be 1, got {self.tp_size}"
+        elif self.dp_size != 1:
+            unsupported_reason = f"dp_size must be 1, got {self.dp_size}"
+        elif self.etp_size != cp_context.pcp_size:
+            unsupported_reason = (
+                f"etp_size({self.etp_size}) must equal pcp_size({cp_context.pcp_size})"
+            )
+        elif cp_context.cp_group.rank_list != self.etp_group.rank_list:
+            unsupported_reason = "CP group and ETP group rank lists differ"
+        elif cp_context.cp_group.rank_in_group != self.etp_group.rank_in_group:
+            unsupported_reason = "CP group and ETP group rank positions differ"
+
+        if unsupported_reason is not None:
+            self.cp_etp_unsupported_reason = unsupported_reason
+            return
+
+        self.cp_etp_dispatcher = MoECPETPTokenDispatcher(
+            self.n_experts,
+            cp_group=cp_context.cp_group,
+            tp_group=self.tp_group,
+            dp_group=self.dp_group,
+            etp_group=self.etp_group,
+            ep_group=self.ep_group,
+        )
+
+    @override
+    def prepare(
+        self,
+        task_type: TaskType,
+        num_tokens: int,
+    ) -> None:
+        super().prepare(task_type, num_tokens)
+        enabled = (
+            task_type == TaskType.Prefill
+            and get_cp_context().step_active
+            and self.etp_size > 1
+        )
+        if enabled and self.cp_etp_dispatcher is None:
+            raise ValueError(
+                "CP+ETP MoE dispatcher requested but unavailable: "
+                f"{self.cp_etp_unsupported_reason}"
+            )
+        if self.cp_etp_dispatcher is not None:
+            self.cp_etp_dispatcher.prepare(num_tokens, enabled=enabled)
+
+    @override
+    def need_token_dispatch(self) -> bool:
+        return (
+            self.cp_etp_dispatcher is not None
+            and self.cp_etp_dispatcher.enabled_for_step
+        )
 
     @override
     def enter_moe(
@@ -551,6 +628,14 @@ class MoEImplNoEP(MoEImplBase):
         may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
     ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
+        if self.need_token_dispatch():
+            return self.cp_etp_dispatcher.enter_moe(
+                x,
+                topk_weights,
+                may_fuse_quant=may_fuse_quant,
+                may_fuse_quant_kwargs=may_fuse_quant_kwargs,
+                layer_id=layer_id,
+            )
         return x, topk_weights
 
     @override
@@ -565,6 +650,14 @@ class MoEImplNoEP(MoEImplBase):
     ) -> tuple[
         BatchedRoutedActivation, Optional[torch.Tensor], Optional[torch.cuda.Stream]
     ]:
+        if self.need_token_dispatch():
+            return self.cp_etp_dispatcher.enter_moe_dispatch_streaming(
+                x,
+                topk_weights,
+                may_fuse_quant=may_fuse_quant,
+                may_fuse_quant_kwargs=may_fuse_quant_kwargs,
+                layer_id=layer_id,
+            )
         return x, topk_weights, None
 
     @override
@@ -573,6 +666,8 @@ class MoEImplNoEP(MoEImplBase):
 
     @override
     def exit_moe_after_local_sum(self, local_sum_result: torch.Tensor) -> torch.Tensor:
+        if self.need_token_dispatch():
+            return self.cp_etp_dispatcher.exit_moe_after_local_sum(local_sum_result)
         if self.etp_size > 1:
             self.etp_group.all_reduce(local_sum_result)
         return local_sum_result

@@ -123,7 +123,7 @@ class NpuAttnBackend(RefAttnBackend):
 
     @override
     def decode_op_supports_mtp(self) -> bool:
-        return True
+        return self.args.infer.cache_type != "paged"
 
     @classmethod
     def should_use_attn_from_cinfer_ascendc(cls, model_type, batch_size):

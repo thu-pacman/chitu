@@ -1343,11 +1343,20 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         freqs_cis = self.prepare_freqs_cis()
 
-        # CP: split tokens before embedding
-        tokens, freqs_cis = self.cp_context.split_stage0(tokens, freqs_cis)
+        delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
+        tokens, freqs_cis = self.cp_context.split_prefill(
+            tokens,
+            freqs_cis,
+            hiddens=None,
+            pp_stage=0,
+            delta_total=delta_total,
+        )
 
         if self.moe_impl is not None:
-            self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
+            self.moe_impl.prepare(
+                TaskType.Prefill,
+                int(tokens.shape[0]),
+            )
 
         h = self._pre_layers(tokens, **args)
 
@@ -1443,20 +1452,15 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         freqs_cis = self.prepare_freqs_cis()
 
-        # CP: split token IDs before embedding (stage 0) or split freqs_cis
-        # to match local hidden states from previous PP stage.
-        # Skip CP when the actual prefill delta is smaller than pcp_size -- the
-        # flash_mla kernel requires a minimum number of work items per launch.
-        # Prefix caching can make the delta shorter than the original prompt.
         delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
-        cp_active = self.cp_context.is_active and self.cp_context.should_split_prefill(
-            delta_total
-        )
         tokens, freqs_cis = self.cp_context.split_prefill(
-            tokens, freqs_cis, hiddens, self.pp_stage, cp_active
+            tokens,
+            freqs_cis,
+            hiddens,
+            self.pp_stage,
+            delta_total=delta_total,
         )
 
-        # start of model
         if self.pp_stage == 0:
             batch_size = tokens.shape[0]
             assert hiddens is None
@@ -1466,14 +1470,15 @@ class Transformer(nn.Module):
             h = hiddens
             del hiddens
 
-        # Ensure MoE impl is primed before layer execution in prefill.
         if self.moe_impl is not None:
-            self.moe_impl.prepare(TaskType.Prefill, batch_size)
+            self.moe_impl.prepare(
+                TaskType.Prefill,
+                batch_size,
+            )
 
         for it, layer in enumerate(self.non_mtp_layers):
             h = layer(h, freqs_cis)
 
-        # end of model: allgather before output selection + post_layers
         if self.pp_stage == self.pp_end_stage:
             if self.mtp_size > 1:
                 assert tokens is not None
@@ -1514,6 +1519,7 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def empty_prefill(self) -> torch.Tensor:
+        self.cp_context.set_step_active(False)
         if self.moe_impl is not None:
             self.moe_impl.prepare(TaskType.Prefill, int(self.dummy_input.shape[0]))
         if self.specialize_embed_tokens_lm_head_parallel:
@@ -2075,7 +2081,9 @@ class ParallelMoeBlock(nn.Module):
 
         shared_y = None
         x_in_use_simultenously = False
-        if self.moe_impl.ep_size > 1:
+        need_token_dispatch = self.moe_impl.need_token_dispatch()
+        dispatch_stream = None
+        if need_token_dispatch:
             routed_x_old = routed_x
             routed_x, weights, dispatch_stream = (
                 self.moe_impl.enter_moe_dispatch_streaming(
@@ -2100,17 +2108,14 @@ class ParallelMoeBlock(nn.Module):
             with ctx:
                 shared_y = self.shared_experts(x)
 
-        if self.moe_impl.ep_size > 1:
+        if need_token_dispatch:
             if dispatch_stream is not None:
                 torch.cuda.current_stream().wait_stream(dispatch_stream)
             x_in_use_simultenously = x_in_use_simultenously and (
                 routed_x_old is routed_x
             )
 
-        if (
-            self.moe_impl.ep_size > 1
-            and self.moe_impl.exit_moe_prefer_before_local_sum()
-        ):
+        if need_token_dispatch and self.moe_impl.exit_moe_prefer_before_local_sum():
             if (
                 self.moe_impl.task_type == TaskType.Prefill
                 and self.prefill_memory_tolerance < self.moe_impl.ep_size

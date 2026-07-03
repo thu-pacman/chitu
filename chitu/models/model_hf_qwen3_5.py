@@ -32,7 +32,7 @@ from chitu.models.model_hf_qwen3_vl import Qwen3VLVisionModel
 from chitu.models.model_hf_qwen3_vl import TransformerQwen3VL
 from chitu.models.model_hf_llama import FeedForwardHFLlama
 
-from chitu.device_type import has_accelerator
+from chitu.device_type import has_accelerator, is_ascend
 from typing import Any, Optional, cast
 
 from transformers.models.qwen3_5.configuration_qwen3_5 import (
@@ -1032,6 +1032,8 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
         skip_preprocess: bool = False,
         replace: bool = True,
     ) -> dict[str, Any]:
+        from chitu.backend import Backend
+
         if not skip_preprocess:
             state_dict = self.process_state_dict_for_splitting_q_gate(state_dict)
 
@@ -1055,6 +1057,18 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
                     new_k = new_k.replace(
                         ".shared_expert_gate.", ".shared_experts.gate."
                     )
+                    state_dict[new_k] = v
+
+            if self.mtp_size > 1 and not Backend._support_layerwise_loading():
+                old_prefix_layer, new_prefix_layer, extra_prefix_dict = (
+                    self._get_layer_mtp_prefix_mapping(self.global_n_layers - 1)
+                )
+                for k in list(state_dict.keys()):
+                    v = state_dict.pop(k)
+                    new_k = k
+                    new_k = new_k.replace(old_prefix_layer, new_prefix_layer)
+                    for old_prefix, new_prefix in extra_prefix_dict.items():
+                        new_k = new_k.replace(old_prefix, new_prefix)
                     state_dict[new_k] = v
 
         return super(TransformerHFQwen3Next, self).preprocess_state_dict_parallel(

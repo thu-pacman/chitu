@@ -566,7 +566,10 @@ class TransformerGLM52(TransformerDeepSeekV3):
         # topk: [T, effective_index_topk] int32 — reinterpret as BF16 columns.
         # view() is zero-copy; contiguous() ensures the layout is compatible.
         assert topk.dtype == torch.int32
-        assert topk.shape[-1] == self._payload_index_topk()
+        target_topk = self._payload_index_topk()
+        if topk.shape[-1] < target_topk:
+            pad = topk.new_full((*topk.shape[:-1], target_topk - topk.shape[-1]), -1)
+            topk = torch.cat([topk, pad], dim=-1)
         topk_bf16 = topk.contiguous().view(torch.bfloat16)
         return torch.cat([h, topk_bf16], dim=-1)
 
@@ -588,14 +591,13 @@ class TransformerGLM52(TransformerDeepSeekV3):
         self._clear_backbone_indexer_buffer()
         freqs_cis = self.prepare_freqs_cis()
         delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
-        cp_active = self.cp_context.is_active and self.cp_context.should_split_prefill(
-            delta_total
+        tokens, freqs_cis = self.cp_context.split_prefill(
+            tokens,
+            freqs_cis,
+            hiddens=None,
+            pp_stage=0,
+            delta_total=delta_total,
         )
-
-        if cp_active:
-            tokens, freqs_cis = self.cp_context.split_stage0(tokens, freqs_cis)
-        else:
-            self.cp_context.set_step_active(False)
 
         if self.moe_impl is not None:
             self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
@@ -665,27 +667,31 @@ class TransformerGLM52(TransformerDeepSeekV3):
         self._clear_backbone_indexer_buffer()
         freqs_cis = self.prepare_freqs_cis()
         delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
-        cp_active = self.cp_context.is_active and self.cp_context.should_split_prefill(
-            delta_total
-        )
 
         if self.pp_stage == 0:
             assert tokens is not None
             assert hiddens is None
             tokens, freqs_cis = self.cp_context.split_prefill(
-                tokens, freqs_cis, hiddens, self.pp_stage, cp_active
+                tokens,
+                freqs_cis,
+                hiddens,
+                self.pp_stage,
+                delta_total=delta_total,
             )
             batch_size = tokens.shape[0]
             h = self._pre_layers(tokens, **args)
         else:
             assert hiddens is not None
-            # Unpack topk from the incoming hidden payload when the previous
-            # stage produced it (its last "full" layer crossed the stage boundary).
+            # Incoming payload may include topk for this stage.
             if self._cross_stage_recv_topk:
                 hiddens, topk = self._unpack_topk(hiddens)
                 self._backbone_buf.topk = topk
             tokens, freqs_cis = self.cp_context.split_prefill(
-                tokens, freqs_cis, hiddens, self.pp_stage, cp_active
+                tokens,
+                freqs_cis,
+                hiddens,
+                self.pp_stage,
+                delta_total=delta_total,
             )
             batch_size = hiddens.shape[0]
             h = hiddens
@@ -717,7 +723,7 @@ class TransformerGLM52(TransformerDeepSeekV3):
                 seq_len_delta=seq_len_delta,
             )
         else:
-            # Pack topk into hidden state so the next stage can recover it.
+            # Pack topk for the next PP stage.
             if self._cross_stage_send_topk:
                 assert self._backbone_buf.topk is not None
                 assert self._backbone_buf.topk.shape[0] == h.shape[0]
@@ -747,7 +753,7 @@ class TransformerGLM52(TransformerDeepSeekV3):
             h = self._post_layers(h)
             h = h.float()
         else:
-            # Pack topk into hidden state for the next stage.
+            # Pack topk for the next PP stage.
             if self._cross_stage_send_topk:
                 assert self._backbone_buf.topk is not None
                 assert self._backbone_buf.topk.shape[0] == h.shape[0]

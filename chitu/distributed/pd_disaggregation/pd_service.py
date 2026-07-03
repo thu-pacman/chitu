@@ -55,13 +55,11 @@ from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 from chitu.serve.common import (
     enqueue_profile_payload,
     start_worker,
-    step_profiler,
 )
 from .kv_transfer import KVManagerPrefill, KVManagerDecode
 from chitu.serve.event_loop import get_server_event_loop
 from chitu.chitu_main import chitu_terminate
 from chitu.task import SerializedPackedTasksPayloadType, TaskPool
-from chitu.task_type import TaskType
 
 logger = logging.getLogger(__name__)
 
@@ -256,18 +254,9 @@ class PDSchedulerService:
         logger.info("starting tp worker loop (no ZMQ service)")
 
         while True:
-            try:
-                # Step with None to receive tasks via dispatchers' collectives
-                status = Backend.executor.step(None)
-                if (
-                    self.pd_mode == PDSchedulerMode.PREFILL_ONLY
-                    and status == SerializedPackedTasksPayloadType.Prefill
-                ):
-                    step_profiler(task_type=TaskType.Prefill)
-                await asyncio.sleep(0)  # avoid busy-waiting
-            except:
-                logger.exception("_worker_loop exception")
-                raise
+            # Step with None to receive tasks via dispatchers' collectives
+            status = Backend.executor.step(None)
+            await asyncio.sleep(0)  # avoid busy-waiting
 
     async def stop(self):
         """Stop the PD scheduler service"""
@@ -557,11 +546,6 @@ async def start_pd_worker_service(args, rank: int = 0):
                     break
                 if Backend.state == BackendState.Terminated:
                     break
-                if (
-                    mode == "prefill"
-                    and status == SerializedPackedTasksPayloadType.Prefill
-                ):
-                    step_profiler(task_type=TaskType.Prefill)
             await asyncio.sleep(0)
         except:
             logger.exception("start_pd_worker_service exception")
