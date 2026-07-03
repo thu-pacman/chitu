@@ -111,6 +111,16 @@ class ProfileRequest(BaseModel):
     pd_stage: Optional[str] = None
 
 
+_DEFAULT_PD_DECODE_PROFILE_START_STEP = 5
+
+
+def _resolve_profile_start_step(request: "ProfileRequest") -> int:
+    start_step = max(request.start_step, 0)
+    if request.pd_stage == "decode":
+        return max(start_step, _DEFAULT_PD_DECODE_PROFILE_START_STEP)
+    return start_step
+
+
 # ====== FastAPI Utils ======
 
 
@@ -309,10 +319,10 @@ def _is_pd_router_process() -> bool:
 
 
 def _validate_pd_profile_request(request: "ProfileRequest") -> None:
-    if request.pd_stage not in (None, "prefill"):
+    if request.pd_stage not in (None, "prefill", "decode", "all"):
         raise HTTPException(
             status_code=400,
-            detail='pd_stage must be omitted or set to "prefill".',
+            detail='pd_stage must be omitted or set to "prefill", "decode", or "all".',
         )
 
 
@@ -327,7 +337,8 @@ def _build_profile_start_payload(request: "ProfileRequest") -> tuple[dict, str]:
     payload: dict = {
         "action": "start",
         "output_dir": output_dir,
-        "start_step": max(request.start_step, 0),
+        "pd_stage": request.pd_stage or "prefill",
+        "start_step": _resolve_profile_start_step(request),
         "num_steps": max(request.num_steps, 1),
         "with_stack": bool(request.with_stack),
         "profile_by_stage": bool(request.profile_by_stage),
@@ -344,9 +355,11 @@ async def start_profile(request: ProfileRequest):
             _validate_pd_profile_request(request)
             payload, output_dir = _build_profile_start_payload(request)
             payload["profile_by_stage"] = True
+            response_start_step = payload["start_step"]
             router = get_request_router()
             broadcast_result = await router.broadcast_profile(payload)
         else:
+            response_start_step = request.start_step
             output_dir = queue_profile_start(
                 output_dir=request.output_dir,
                 activities=request.activities,
@@ -372,11 +385,12 @@ async def start_profile(request: ProfileRequest):
         "runtime_cwd": os.getcwd(),
         "output_root": get_profile_output_root(),
         "activities": request.activities,
-        "start_step": request.start_step,
+        "start_step": response_start_step,
         "num_steps": request.num_steps,
         "with_stack": request.with_stack,
         "profile_by_stage": request.profile_by_stage,
         "memory_max_entries": request.memory_max_entries,
+        "pd_stage": request.pd_stage,
     }
     if broadcast_result is not None:
         response["pd_broadcast"] = broadcast_result

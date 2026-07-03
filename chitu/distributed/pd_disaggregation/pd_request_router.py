@@ -688,9 +688,21 @@ class PDRequestRouter(RequestRouter):
         control_msg = {"__chitu_msg_type": "profile", "payload": payload}
         packed = msgpack.packb(control_msg)
 
-        prefill_targets = list(self.prefill_sockets.items())
+        action = payload.get("action")
+        pd_stage = payload.get("pd_stage")
+        if action == "start":
+            pd_stage = pd_stage or "prefill"
+        else:
+            pd_stage = pd_stage or "all"
 
-        sent = {"prefill": []}
+        prefill_targets = (
+            list(self.prefill_sockets.items()) if pd_stage in ("prefill", "all") else []
+        )
+        decode_targets = (
+            list(self.decode_sockets.items()) if pd_stage in ("decode", "all") else []
+        )
+
+        sent = {"prefill": [], "decode": []}
         errors: list[str] = []
 
         async def _send_one(socket, label):
@@ -707,8 +719,14 @@ class PDRequestRouter(RequestRouter):
             if await _send_one(socket, label):
                 sent["prefill"].append(sid)
 
+        for sid, socket in decode_targets:
+            label = f"decode:{sid}"
+            if await _send_one(socket, label):
+                sent["decode"].append(sid)
+
         return {
-            "action": payload.get("action"),
+            "action": action,
+            "pd_stage": pd_stage,
             "sent_to": sent,
             "errors": errors,
         }

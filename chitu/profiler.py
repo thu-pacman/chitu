@@ -182,6 +182,9 @@ class ProfilerBase(ABC):
     @abstractmethod
     def stop(self) -> None: ...
 
+    def finish_collection(self) -> None:
+        pass
+
     def step(self) -> None:
         pass
 
@@ -197,6 +200,10 @@ class ProfilerList(ProfilerBase):
     def stop(self) -> None:
         for p in self.inners:
             p.stop()
+
+    def finish_collection(self) -> None:
+        for p in self.inners:
+            p.finish_collection()
 
     def step(self) -> None:
         for p in self.inners:
@@ -215,6 +222,7 @@ class ProfilerTorch(ProfilerBase):
         self.output_suffix = output_suffix
         self.with_stack = with_stack
         self._profiler: torch.profiler.profile | None = None
+        self._collection_finished = False
 
     def start(self) -> None:
         self._profiler = torch.profiler.profile(
@@ -228,27 +236,30 @@ class ProfilerTorch(ProfilerBase):
             with_flops=False,
         )
         self._profiler.start()
+        self._collection_finished = False
+
+    def finish_collection(self) -> None:
+        if self._profiler is None or self._collection_finished:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._profiler.stop()
+        self._collection_finished = True
 
     def stop(self) -> None:
         if self._profiler is None:
             return
         os.makedirs(self.output_dir, exist_ok=True)
         trace_path = _build_trace_path(self.output_dir, self.output_suffix)
-        # Sync before stop so every launched kernel finishes and CUPTI
-        # records it; sync again after stop to let CUPTI's async flush
-        # drain its activity buffers before chrome trace export.
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        self._profiler.stop()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        self.finish_collection()
         self._profiler.export_chrome_trace(trace_path)
         logger.warning("Profiler trace saved: %s", trace_path)
         self._profiler = None
+        self._collection_finished = False
 
     def step(self) -> None:
-        if self._profiler is not None:
-            self._profiler.step()
+        # ProfileManager owns the real-step window; torch profiler runs continuously.
+        return
 
 
 class ProfilerMemory(ProfilerBase):
@@ -437,6 +448,7 @@ class ProfileManager:
         self._steps_seen: int = 0
         self._recorded_steps: int = 0
         self._completed: bool = False
+        self._collection_finished: bool = False
 
     @property
     def active(self) -> bool:
@@ -469,6 +481,7 @@ class ProfileManager:
         self._steps_seen = 0
         self._recorded_steps = 0
         self._completed = False
+        self._collection_finished = False
         self._trigger = None
         self._current_profiler = None
 
@@ -494,7 +507,7 @@ class ProfileManager:
 
     def step(self, stage: str | None):
         """Call once per inference step. stage is "Prefill" or "Decode" (or None)."""
-        if not self.active:
+        if not self.active or self._collection_finished:
             return
 
         cfg = self._config
@@ -516,9 +529,11 @@ class ProfileManager:
                     self._do_start()
                 self._current_profiler.step()
                 self._recorded_steps += 1
-                if self._recorded_steps >= cfg.num_steps:
-                    self._do_stop()
-                    self._completed = True
+                if self._recorded_steps == cfg.num_steps:
+                    self._finish_collection()
+                    logger.warning(
+                        "Profiling collected requested steps; call /profile/stop to export."
+                    )
         except Exception:
             logger.exception("ProfileManager: error during step, disabling profiler")
             if self._current_profiler is not None:
@@ -533,6 +548,60 @@ class ProfileManager:
         """Force-stop profiling (e.g. via API /profile/stop)."""
         self._do_stop()
         self._completed = True
+
+    def begin_step(self, stage: str | None, num_tasks: int) -> bool:
+        """Start or resume collection for a real local inference step.
+
+        Empty DP/EP padding steps must not consume num_steps. Once collection
+        starts, the profiler stays active until the requested real steps finish.
+        """
+        if not self.active or self._collection_finished:
+            return False
+
+        cfg = self._config
+        if cfg.profile_by_stage and stage not in ("Prefill", "Decode"):
+            return False
+        if num_tasks <= 0:
+            return False
+
+        self._steps_seen += 1
+        if self._steps_seen <= cfg.start_step:
+            return False
+
+        try:
+            if self._current_profiler is None:
+                self._do_start(stage=stage if cfg.profile_by_stage else None)
+            return True
+        except Exception:
+            logger.exception("ProfileManager: error starting step, disabling profiler")
+            self._completed = True
+            return False
+
+    def end_step(self, stage: str | None, num_tasks: int) -> None:
+        if not self.active or self._current_profiler is None or num_tasks <= 0:
+            return
+
+        cfg = self._config
+        if cfg.profile_by_stage and stage not in ("Prefill", "Decode"):
+            return
+
+        try:
+            self._current_profiler.step()
+            self._recorded_steps += 1
+            if self._recorded_steps == cfg.num_steps:
+                self._finish_collection()
+                logger.warning(
+                    "Profiling collected requested steps; call /profile/stop to export."
+                )
+        except Exception:
+            logger.exception("ProfileManager: error ending step, disabling profiler")
+            if self._current_profiler is not None:
+                try:
+                    self._current_profiler.stop()
+                except Exception:
+                    pass
+                self._current_profiler = None
+            self._completed = True
 
     def _do_start(self, stage: str | None = None):
         cfg = self._config
@@ -550,6 +619,11 @@ class ProfileManager:
             f" for {stage}" if stage else "",
             cfg.output_dir,
         )
+
+    def _finish_collection(self):
+        if self._current_profiler is not None:
+            self._current_profiler.finish_collection()
+        self._collection_finished = True
 
     def _do_stop(self):
         if self._current_profiler is None:

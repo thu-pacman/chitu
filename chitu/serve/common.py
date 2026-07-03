@@ -253,12 +253,18 @@ def clear_pending_profile_payload() -> None:
     _pending_profile_applied = False
 
 
-def apply_pending_profile_command(clear_after_apply: bool) -> None:
+def apply_pending_profile_command(
+    clear_after_apply: bool, defer_stop: bool = False
+) -> None:
     """Apply the newest queued profile command once on the inference thread."""
     global _pending_profile_payload, _pending_profile_applied
 
     _drain_profile_queue_to_pending()
     if _pending_profile_payload is None or _pending_profile_applied:
+        return
+
+    if defer_stop and _pending_profile_payload.get("action") == "stop":
+        # Forward stop to worker ranks before rank0 performs profiler stop/export.
         return
 
     _apply_profile_command(_pending_profile_payload)
@@ -300,12 +306,46 @@ def step_profiler(task_type: Optional[TaskType] = None):
         _profile_manager = None
 
 
+def _task_type_to_profile_stage(task_type: Optional[TaskType]) -> Optional[str]:
+    if task_type == TaskType.Prefill:
+        return "Prefill"
+    if task_type == TaskType.Decode:
+        return "Decode"
+    return None
+
+
+def begin_profiler_step(
+    task_type: Optional[TaskType] = None, num_tasks: int = 0
+) -> bool:
+    global _profile_manager
+
+    mgr = _profile_manager
+    if mgr is None or not mgr.active:
+        return False
+
+    started = mgr.begin_step(_task_type_to_profile_stage(task_type), num_tasks)
+    if mgr.completed:
+        _profile_manager = None
+    return started
+
+
+def end_profiler_step(task_type: Optional[TaskType] = None, num_tasks: int = 0) -> None:
+    global _profile_manager
+
+    mgr = _profile_manager
+    if mgr is None or not mgr.active:
+        return
+
+    mgr.end_step(_task_type_to_profile_stage(task_type), num_tasks)
+    if mgr.completed:
+        _profile_manager = None
+
+
 async def process_queue():
     """Process the task queue - common function used by both normal and DP modes"""
     from chitu.backend import Backend, BackendState
     from chitu.chitu_main import (
         chitu_run,
-        get_last_step_task_type,
         chitu_is_terminated,
         chitu_terminate,
     )
@@ -321,7 +361,8 @@ async def process_queue():
                 for dispatcher in Backend.executor.task_dispatchers
             )
             apply_pending_profile_command(
-                clear_after_apply=not can_forward_profile_payload
+                clear_after_apply=not can_forward_profile_payload,
+                defer_stop=can_forward_profile_payload,
             )
             if Backend.state == BackendState.Terminating and TaskPool.all_finished():
                 chitu_terminate()
@@ -340,11 +381,6 @@ async def process_queue():
         ):
             min_batch_size = 1
             status = chitu_run()
-            if status != SerializedPackedTasksPayloadType.NoneType:
-                if _profile_manager is not None:
-                    task_type = get_last_step_task_type()
-                    if task_type is not None:
-                        step_profiler(task_type=task_type)
             if status == SerializedPackedTasksPayloadType.NoneType:
                 await asyncio.sleep(0.01)
         elif TaskCollector.has_batch_results():
