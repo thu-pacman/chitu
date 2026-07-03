@@ -4,6 +4,7 @@
 
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.moe.token_dispatchers.allgather_dispatcher import MoEAllGatherTokenDispatcher
+from chitu.moe.token_dispatchers.cp_etp_dispatcher import MoECPETPTokenDispatcher
 from chitu.moe.token_dispatchers.deepep_lowlatency_dispatcher import (
     MoELowLatencyTokenDispatcher,
 )
