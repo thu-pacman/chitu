@@ -163,6 +163,7 @@ class KVManagerDecode(KVManagerBase):
         info.first_token = msg.first_token
         info.num_hit_tokens = msg.num_hit_tokens
         info.is_prefill_done = True
+        info.prefill_done_event.set()
 
         self._trace("handle_prefill_done", req_id=msg.req_id)
 
@@ -174,10 +175,12 @@ class KVManagerDecode(KVManagerBase):
         """
         logger.info(f"recv_kv_cache_and_insert {req_id=}")
 
-        # Wait for all rooms to receive PrefillDone
+        # Wait for the recv thread to process PrefillDone.
         info = self._info(req_id)
-        # FIXME: potential concurrent bug if compute thread call this faster than ``handle_prefill_done``, maybe use a thread.Event?
-        assert info.is_prefill_done, f"prefill not done for {req_id}"
+        if not info.prefill_done_event.wait(timeout=10.0):
+            raise RuntimeError(
+                f"Timed out waiting for PrefillDone after 10s: req_id={req_id}"
+            )
 
         for cache_name, cache in Backend.cache_dict.items():
             assert isinstance(cache, PagedKVCache)

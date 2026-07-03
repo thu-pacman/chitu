@@ -973,21 +973,6 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                         f"prealloc:{self._decode_prealloc_q.size()}, ready:{self._decode_ready_q.size()}}} "
                         f"prefix_len={int(getattr(task, 'prefix_tokens_len', 0)) if task is not None else 0}"
                     )
-                if (now - last_prepare_ts) >= 1.0:
-                    task = info.get("task")
-                    if task is not None:
-                        target_dp_rank = int(task.dp_rank)
-                        prefill_sid = task.pd_prefill_engine_rank
-                        self.kv_manager.send_decode_prepare(
-                            req_id=rid,
-                            prefill_sid=task.pd_prefill_engine_rank,
-                            prefix_len=task.prefix_tokens_len,
-                            new_cache_ids=task.new_cache_ids,
-                            dp_rank=task.dp_rank,
-                        )
-                        info["last_prepare_ts"] = now
-                        if float(info.get("first_prepare_ts", 0.0)) <= 0.0:
-                            info["first_prepare_ts"] = now
                 last_log_ts = float(info.get("last_log_ts", 0.0))
                 if (now - last_log_ts) >= 1.0 and (now - created_ts) >= 1.0:
                     info["last_log_ts"] = now
