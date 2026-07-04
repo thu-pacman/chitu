@@ -153,7 +153,8 @@ class KvTransferConfig:
 class PDTestConfig:
     """PD smoke-test configuration."""
 
-    enable: bool = MISSING
+    # 0=off, 1=basic test, 2=test with shared system prompt (prefix-cache-friendly)
+    enable: int = MISSING
     req_num: int = MISSING  # number of test requests
     req_timeout: float = MISSING  # per-request timeout (seconds)
     output_len: int = MISSING  # max_new_tokens for each test request

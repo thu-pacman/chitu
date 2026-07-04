@@ -23,12 +23,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Shared system prompt long enough to fill ≥1 full KV block (block_size=64 tokens).
+_SHARED_SYSTEM_PROMPT = (
+    "你是一位知识渊博、经验丰富的人工智能助手，擅长回答各种类型的问题，"
+    "包括但不限于烹饪食谱、编程技术、科学知识、生活建议、历史文化、数学计算、"
+    "语言翻译、创意写作等领域。你的回答应该详细、专业、条理清晰，确保内容"
+    "准确、全面且易于理解。在回答之前，请先仔细分析用户的问题意图和需求，"
+    "然后组织你的思考过程，最后给出结构化的高质量回答。"
+)
+
 
 class PDTestRunner:
     """Orchestrates PD-disaggregation smoke-test requests.
 
     Called from ``PDRequestRouter._wait_for_pd_instances()`` when
-    ``pd_test.enable=True``.  The runner dispatches ``req_num`` mock
+    ``pd_test.enable`` is non-zero.  The runner dispatches ``req_num`` mock
     requests, monitors them via the Token Router, prints per-request
     results, and finally shuts the router down.
     """
@@ -46,9 +55,14 @@ class PDTestRunner:
         self.num_failed = 0
         self.start_time = 0.0
 
+        # enable == 2 → inject a shared system prompt so that later
+        # requests can hit the prefix cache.
+        self._inject_system_prompt = test_cfg.enable == 2
+
         logger.info(
             f"[PD_TEST] test mode enabled: num_requests={self.num_requests} "
-            f"timeout={self.req_timeout:.1f}s output_len={self.output_len}"
+            f"timeout={self.req_timeout:.1f}s output_len={self.output_len} "
+            f"inject_system_prompt={self._inject_system_prompt}"
         )
 
     # ------------------------------------------------------------------
@@ -77,13 +91,24 @@ class PDTestRunner:
         [{"role": "user", "content": "what is the recipe of mayonnaise?"}],
     ]
 
+    def _build_message(self, i: int) -> list[dict[str, str]]:
+        """Build one test message.
+
+        When ``pd_test.enable == 2``, every message is prefixed with a
+        shared system prompt so that later requests hit the prefix cache.
+        """
+        msg = self._TEST_MESSAGES[i % len(self._TEST_MESSAGES)]
+        if self._inject_system_prompt:
+            return [{"role": "system", "content": _SHARED_SYSTEM_PROMPT}] + msg
+        return msg
+
     async def _create_requests(self) -> list[str]:
         logger.info(f"[PD_TEST] creating {self.num_requests} test requests")
         request_ids: list[str] = []
         token_router = get_token_router()
 
         for i in range(self.num_requests):
-            msg = self._TEST_MESSAGES[i % len(self._TEST_MESSAGES)]
+            msg = self._build_message(i)
             req = UserRequest.create(
                 msg,
                 request_id=f"pd_test_{i:06d}",
@@ -193,8 +218,32 @@ class PDTestRunner:
             logger.warning(
                 f"[PD_TEST][result] rid={rid} status={status_text} "
                 f"input_len={req.prompt_len} max_new_tokens={req.max_new_tokens} "
-                f"output_tokens={req.num_output_tokens} output={req.output}"
+                f"output_tokens={req.num_output_tokens} "
+                f"cached_tokens={req.num_hit_tokens} "
+                f"output={req.output}"
             )
+
+        # When prefix caching is enabled and test mode is 2 (shared system
+        # prompt), verify that at least one request hit the prefix cache.
+        if get_global_args().infer.enable_prefix_caching and self._inject_system_prompt:
+            num_cache_hit = sum(
+                1
+                for rid, pd_req in self._router.pending_pd_requests.items()
+                if rid.startswith("pd_test_")
+                and pd_req.original_request.num_hit_tokens > 0
+            )
+            if num_cache_hit == 0:
+                logger.error(
+                    "[PD_TEST] prefix caching check FAILED: no request has "
+                    "num_hit_tokens > 0 despite enable_prefix_caching=True "
+                    "and pd_test.enable=2"
+                )
+                self.num_failed += 1
+            else:
+                logger.info(
+                    f"[PD_TEST] prefix caching check PASSED: "
+                    f"{num_cache_hit} request(s) hit the prefix cache"
+                )
 
         await asyncio.sleep(1.0)
 

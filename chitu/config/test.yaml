@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 pd_test:
-  enable: False
+  enable: 0
   req_num: 8
   req_timeout: 300
   output_len: 128

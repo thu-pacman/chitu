@@ -896,7 +896,7 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 if num_cached_tokens == task.prefix_tokens_len:
                     num_cached_tokens = task.prefix_tokens_len - 1
 
-                task.inc_hit_tokens = num_cached_tokens - task.consumed_req_tokens
+                task.set_inc_hit_tokens(num_cached_tokens - task.consumed_req_tokens)
                 task.consumed_req_tokens = num_cached_tokens
 
                 for name, cache_manager in cache_manager_dict.items():
