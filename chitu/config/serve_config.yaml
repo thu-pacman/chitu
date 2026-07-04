@@ -416,12 +416,14 @@ infer:
   #: - False: Disable overlapping.
   schedule_overlap: auto
 
-  #: If True, try to fully warmup each operator before launching the service. It will take more
-  #: time before the service is ready, but useful for reduce the performance loss for the first
-  #: several requests.
+  #: If True, try to fully warmup each operator with many possible cases before launching the
+  #: service. It will take more time before the service is ready, but useful for reduce the
+  #: performance loss for the first several requests.
   #:
   #: Acceptable values:
-  #: - "auto": Decide automatically.
+  #: - "auto": Decide automatically by the following rules: Suppose you are benchmarking Chitu
+  #:   with a fixed context length, if will end up always running the decode stage with full
+  #:   batch size, then we set `infer.full_warmup=False`. Otherwise, we set `infer.full_warmup=True`.
   #: - True: Fully warmup.
   #: - False: Skip full warmup.
   full_warmup: auto

@@ -654,19 +654,9 @@ class CompressorDeepSeekV4(nn.Module):
             torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32),
             requires_grad=False,
         )
-        self.wkv = NormalLinear(
-            self.dim,
-            coff * self.head_dim,
-            has_bias=False,
-            dtype=torch.float32,
-        )
-        self.wgate = NormalLinear(
-            self.dim,
-            coff * self.head_dim,
-            has_bias=False,
-            dtype=torch.float32,
-        )
-        self.norm = RMSNorm(self.head_dim, args.norm_eps, dtype=torch.float32)
+        self.wkv = NormalLinear(self.dim, coff * self.head_dim, has_bias=False)
+        self.wgate = NormalLinear(self.dim, coff * self.head_dim, has_bias=False)
+        self.norm = RMSNorm(self.head_dim, args.norm_eps)
         self.kv_cache: Optional[torch.Tensor] = None
         self.kv_cache_is_paged = False
         self.kv_block_table: Optional[torch.Tensor] = None
@@ -679,7 +669,7 @@ class CompressorDeepSeekV4(nn.Module):
         self.kv_cache_is_paged = False
         self.kv_block_table = None
         self.freqs_cis = None
-        self.kv_state = torch.empty(0, dtype=torch.float32, device=device)
+        self.kv_state = torch.empty(0, device=device)
         self.score_state = torch.empty(0, dtype=torch.float32, device=device)
 
     def bind_kv_cache(
@@ -756,9 +746,10 @@ class CompressorDeepSeekV4(nn.Module):
         assert x.size(0) == total_tokens
 
         # Single Linear over all tokens from all requests.
-        x_float = x.float()  # [total_tokens, dim]
-        kv_cat = self.wkv(x_float)  # [total_tokens, coff*head_dim]
-        score_cat = self.wgate(x_float)  # [total_tokens, coff*head_dim]
+        kv_cat = self.wkv(x)  # [total_tokens, dim] -> [total_tokens, coff*head_dim]
+        score_cat = self.wgate(
+            x
+        )  # [total_tokens, dim] -> [total_tokens, coff*head_dim]
 
         return self._forward_prefill_backend(
             x,
@@ -984,9 +975,8 @@ class CompressorDeepSeekV4(nn.Module):
         if cache_seq_ids.device != device or cache_seq_ids.dtype != torch.long:
             cache_seq_ids = cache_seq_ids.to(device=device, dtype=torch.long)
 
-        x_float = x_flat.float()
-        kv_cat = self.wkv(x_float)
-        score_cat = self.wgate(x_float)
+        kv_cat = self.wkv(x)
+        score_cat = self.wgate(x)
 
         if q_len > ratio or not _TRITON_COMPRESS_AVAILABLE:
             seqlens = torch.full((bsz,), q_len, device=device, dtype=torch.long)
@@ -1088,7 +1078,6 @@ class CompressorDeepSeekV4(nn.Module):
         ratio, overlap = self.compress_ratio, self.overlap
         head_dim, rope_dim = self.head_dim, self.rope_head_dim
         dtype = x.dtype
-        x = x.float()
 
         kv = self.wkv(x)
         score = self.wgate(x)
@@ -1639,7 +1628,7 @@ class AttentionDeepSeekV4(Attention):
             has_bias=False,
             checkpoint_prefix=f"{checkpoint_prefix}.wq_a",
         )
-        self.q_norm = RMSNorm(args.q_lora_rank, self.eps, dtype=torch.float32)
+        self.q_norm = RMSNorm(args.q_lora_rank, self.eps)
         self.wq_b = ColumnParallelLinear(
             args.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -1653,7 +1642,7 @@ class AttentionDeepSeekV4(Attention):
             has_bias=False,
             checkpoint_prefix=f"{checkpoint_prefix}.wkv",
         )
-        self.kv_norm = RMSNorm(self.head_dim, self.eps, dtype=torch.float32)
+        self.kv_norm = RMSNorm(self.head_dim, self.eps)
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // args.o_groups,
             args.o_groups * args.o_lora_rank,
@@ -2520,7 +2509,7 @@ class GateDeepSeekV4(MoeGate):
             )
             return self._finalize_routing(x, weights, indices)
 
-        scores = F.linear(x.float(), self.weight.float())
+        scores = F.linear(x, self.weight)
         if not self.hash:
             indices, weights = moe_gate(
                 scores,
@@ -2777,8 +2766,8 @@ class TransformerBlockDeepSeekV4(TransformerBlock):
             checkpoint_prefix=f"layers.{layer_id}.ffn",
             runtime_context=runtime_context,
         )
-        self.attn_norm = RMSNorm(args.dim, args.norm_eps, dtype=torch.float32)
-        self.ffn_norm = RMSNorm(args.dim, args.norm_eps, dtype=torch.float32)
+        self.attn_norm = RMSNorm(args.dim, args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, args.norm_eps)
         self.hc_attn = mHCSubLayer(
             args.hc_mult,
             args.dim,
@@ -2847,9 +2836,9 @@ class TransformerBlockDeepSeekV4MTP(TransformerBlockDeepSeekV4):
             has_bias=False,
             checkpoint_prefix=f"layers.{layer_id}.h_proj",
         )
-        self.enorm = RMSNorm(args.dim, args.norm_eps, dtype=torch.float32)
-        self.hnorm = RMSNorm(args.dim, args.norm_eps, dtype=torch.float32)
-        self.norm = RMSNorm(args.dim, args.norm_eps, dtype=torch.float32)
+        self.enorm = RMSNorm(args.dim, args.norm_eps)
+        self.hnorm = RMSNorm(args.dim, args.norm_eps)
+        self.norm = RMSNorm(args.dim, args.norm_eps)
         self.norm_eps = args.norm_eps
         self.hc_eps = args.hc_eps
         hc_dim = args.hc_mult * args.dim
@@ -2904,12 +2893,11 @@ class ParallelHeadDeepSeekV4(nn.Module):
         )
         self.part_vocab_size = vocab_size // get_tp_size()
         self.weight = nn.Parameter(
-            torch.empty(self.part_vocab_size, dim, dtype=torch.float32),
-            requires_grad=False,
+            torch.empty(self.part_vocab_size, dim), requires_grad=False
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        logits = F.linear(x.float(), self.weight)
+        logits = F.linear(x, self.weight)
         if get_tp_size() > 1:
             all_logits = [torch.empty_like(logits) for _ in range(get_tp_size())]
             torch.distributed.all_gather(
@@ -3173,7 +3161,7 @@ class TransformerDeepSeekV4(Transformer):
             )
 
     def _init_post_layers(self):
-        self.norm = RMSNorm(self.params.dim, self.params.norm_eps, dtype=torch.float32)
+        self.norm = RMSNorm(self.params.dim, self.params.norm_eps)
         self.head = ParallelHeadDeepSeekV4(self.params.vocab_size, self.params.dim)
         hc_dim = self.params.hc_mult * self.params.dim
         self.hc_head = nn.ParameterDict(

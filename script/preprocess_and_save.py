@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from logging import getLogger
 import os
 import subprocess
 import hydra
@@ -12,6 +13,8 @@ from chitu.chitu_main import chitu_init
 from chitu.backend import Backend
 from chitu.schemas import ServeConfig
 from chitu.utils import get_config_dir_path, get_chitu_env
+
+logger = getLogger(__name__)
 
 
 @hydra.main(
@@ -61,9 +64,11 @@ def main(args: ServeConfig):
             check=True,
         )
 
+    logger.info("Start writing model files")
     safetensors.torch.save_file(
         Backend.model.state_dict(), target_dir + f"/model.rank{rank}.safetensors"
     )
+    logger.info("Writen model files")
 
 
 if __name__ == "__main__":
