@@ -43,7 +43,7 @@ class MonkCommGroup:
         self.is_first_rank = rank_in_group == 0
 
 
-def _set_global_config(*, pd_tp_ratio=1):
+def _set_global_config():
     cfg = {
         "models": {"n_kv_heads": 4, "n_layers": 2},
         "infer": {
@@ -64,7 +64,7 @@ def _set_global_config(*, pd_tp_ratio=1):
             "n_insts": 2,
             "inst_id": 0,
             "pd_disaggregation": {
-                "kv_transfer": {"pd_tp_ratio": pd_tp_ratio},
+                "kv_transfer": {},
             },
             "router": {"host": "127.0.0.1"},
         },
@@ -101,6 +101,40 @@ def _build_cache(
     )
 
 
+def _make_remote_dists(name, local_heads, remote_heads, split_size, rank=0, gsize=1):
+    """Build a remote CacheDistributions matching the given parameters."""
+    from chitu.distributed.pd_disaggregation.kv_transfer.cache_info import (
+        CacheDistribution,
+        CacheDistributions,
+    )
+
+    if split_size == 0:
+        return CacheDistributions(
+            dists={
+                name: CacheDistribution(
+                    split_len=remote_heads,
+                    split_id=0,
+                    split_size=0,
+                    replica_id=rank,
+                    replica_size=gsize,
+                )
+            }
+        )
+    replica_size = gsize // split_size if gsize > 0 else 1
+    split_id_base = (rank // replica_size) * remote_heads
+    return CacheDistributions(
+        dists={
+            name: CacheDistribution(
+                split_len=remote_heads,
+                split_id=split_id_base,
+                split_size=split_size,
+                replica_id=rank % replica_size,
+                replica_size=replica_size,
+            )
+        }
+    )
+
+
 # =============================================================================
 # Test: insert_kv_cache_from_transfer
 # =============================================================================
@@ -108,7 +142,7 @@ def _build_cache(
 
 def test_insert_kv_cache_from_transfer_basic(monkeypatch):
     """PagedKVCache.insert_kv_cache_from_transfer sets block_table and tid_to_cached_len."""
-    _set_global_config(pd_tp_ratio=1)
+    _set_global_config()
     monkeypatch.setattr(
         "chitu.distributed.parallel_state.get_tp_group", lambda: MonkCommGroup(0, 1)
     )
@@ -130,7 +164,7 @@ def test_insert_kv_cache_from_transfer_basic(monkeypatch):
 
 def test_insert_kv_cache_from_transfer_rejects_duplicate(monkeypatch):
     """Cannot insert into a tid that already has a block_table entry."""
-    _set_global_config(pd_tp_ratio=1)
+    _set_global_config()
     monkeypatch.setattr(
         "chitu.distributed.parallel_state.get_tp_group", lambda: MonkCommGroup(0, 1)
     )
@@ -148,13 +182,13 @@ def test_insert_kv_cache_from_transfer_rejects_duplicate(monkeypatch):
 
 
 # =============================================================================
-# finalize_kv_recv on real PagedKVCache
+# kv_recv_reorder on real PagedKVCache
 # =============================================================================
 
 
-def test_finalize_kv_recv_skips_when_pd_tp_ratio_1(monkeypatch):
-    """No-op when pd_tp_ratio <= 1."""
-    _set_global_config(pd_tp_ratio=1)
+def test_kv_recv_reorder_skips_when_n_chunks_1(monkeypatch):
+    """No-op when remote has same split_len (gcd → n_chunks=1)."""
+    _set_global_config()
     pp = MonkCommGroup(0, 1)
     tp = MonkCommGroup(0, 1)
     monkeypatch.setattr("chitu.distributed.parallel_state.get_tp_group", lambda: tp)
@@ -166,15 +200,18 @@ def test_finalize_kv_recv_skips_when_pd_tp_ratio_1(monkeypatch):
     c.block_table["req"] = [0]
     c.tid_to_cached_len["req"] = 4
     before = c.paged_kv_cache["kv_cache"].clone()
-    c.kv_recv_reorder([0])
+    # Same split_len on both sides → n_chunks=1 → no-op
+    ld = _make_remote_dists("kv_cache", 2, 2, split_size=c.split_size)
+    rd = _make_remote_dists("kv_cache", 2, 2, split_size=c.split_size)
+    c.kv_recv_reorder([0], local_dists=ld, remote_dists=rd)
     assert torch.all(c.paged_kv_cache["kv_cache"] == before)
 
 
-def test_finalize_kv_recv_tp2_permute(monkeypatch):
-    """(P,T,Hp,D) → T-major (T,Hd,D) permute."""
+def test_kv_recv_reorder_tp2_permute(monkeypatch):
+    """(P,T,Hp,D) → T-major (T,Hd,D) permute via gcd alignment."""
     prefill_tp, nh = 2, 4
     T, D = 4, 2
-    _set_global_config(pd_tp_ratio=prefill_tp)
+    _set_global_config()
 
     pp = MonkCommGroup(0, 1)
     tp = MonkCommGroup(0, 1)
@@ -217,7 +254,11 @@ def test_finalize_kv_recv_tp2_permute(monkeypatch):
                                 + d * 0.1
                             )
 
-    c.kv_recv_reorder(list(bi))
+    # Remote (Prefill) has split_len = nh // prefill_tp = 2; local = 4
+    # gcd(4, 2) = 2 → n_chunks = 4/2 = 2
+    ld = _make_remote_dists("kv_cache", nh, nh, split_size=1)
+    rd = _make_remote_dists("kv_cache", nh, nh // prefill_tp, split_size=1)
+    c.kv_recv_reorder(list(bi), local_dists=ld, remote_dists=rd)
 
     for layer in range(2):
         for bid in bi:
@@ -291,7 +332,7 @@ def test_create_transfer_plan_cpu():
         layer_id=0,
         block_id=0,
         split_id=0,
-        split_num=1,
+        split_len=1,
         replica_id=0,
         replica_size=1,
     )
@@ -303,7 +344,7 @@ def test_create_transfer_plan_cpu():
         layer_id=0,
         block_id=0,
         split_id=0,
-        split_num=1,
+        split_len=1,
         replica_id=0,
         replica_size=1,
     )

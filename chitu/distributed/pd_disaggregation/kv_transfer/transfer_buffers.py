@@ -50,7 +50,7 @@ class TransferBuffers:
         buffers: dict[key_str: str, list[TransferBuffer]]
 
     Keys are composite strings
-    ``cache_name,req_id,layer_id,block_id,split_id,split_num,replica_id,replica_size``
+    ``cache_name,req_id,layer_id,block_id,split_id,split_len,replica_id,replica_size``
     so the whole structure is natively msgpack-serializable.
 
     Session ownership is tracked externally (e.g. ``TaskInfo.recv_buffers``
@@ -71,7 +71,7 @@ class TransferBuffers:
         layer_id: int,
         block_id: int,
         split_id: int,
-        split_num: int,
+        split_len: int,
         replica_id: int,
         replica_size: int,
     ):
@@ -85,11 +85,11 @@ class TransferBuffers:
             layer_id:      **global** layer id.
             block_id:      **logical** position in the block table.
             split_id:      starting index in split-space.
-            split_num:     number of split units this region covers.
+            split_len:     number of split units this region covers.
             replica_id:    which replica group this belongs to.
             replica_size:  total number of replica groups.
         """
-        key_str = f"{req_id}[{cache_name}]_L{layer_id}_B{block_id}_S{split_id}+{split_num}_R{replica_id}/{replica_size}"
+        key_str = f"{req_id}[{cache_name}]_L{layer_id}_B{block_id}_S{split_id}+{split_len}_R{replica_id}/{replica_size}"
         logger.debug(f"[PD_KV_TRANSFER] {key_str} ptr={ptr} len={length}")
         self.buffers.setdefault(key_str, []).append(TransferBuffer(ptr, length))
 

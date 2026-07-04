@@ -39,16 +39,16 @@ def _k(**kw):
         layer_id=0,
         block_id=0,
         split_id=0,
-        split_num=1,
+        split_len=1,
         replica_id=0,
         replica_size=1,
     )
     d.update(kw)
     # Key format used by TransferBuffers.add():
-    # {req_id}[{cache_name}]_L{layer_id}_B{block_id}_S{split_id}+{split_num}_R{replica_id}/{replica_size}
+    # {req_id}[{cache_name}]_L{layer_id}_B{block_id}_S{split_id}+{split_len}_R{replica_id}/{replica_size}
     return (
         f"{d['req_id']}[{d['cache_name']}]_L{d['layer_id']}_B{d['block_id']}"
-        f"_S{d['split_id']}+{d['split_num']}_R{d['replica_id']}/{d['replica_size']}"
+        f"_S{d['split_id']}+{d['split_len']}_R{d['replica_id']}/{d['replica_size']}"
     )
 
 
@@ -60,7 +60,7 @@ def _add(bufs, data, **kw):
         layer_id=0,
         block_id=0,
         split_id=0,
-        split_num=1,
+        split_len=1,
         replica_id=0,
         replica_size=1,
     )
@@ -84,7 +84,7 @@ class TestKeyStr:
             layer_id=3,
             block_id=7,
             split_id=0,
-            split_num=2,
+            split_len=2,
             replica_id=0,
             replica_size=2,
         )
@@ -124,7 +124,7 @@ class TestTransferBuffers:
             layer_id=0,
             block_id=0,
             split_id=0,
-            split_num=1,
+            split_len=1,
             replica_id=0,
             replica_size=1,
         )

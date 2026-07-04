@@ -7,7 +7,6 @@ import concurrent.futures
 from logging import getLogger
 
 from chitu.backend import Backend
-from chitu.global_vars import get_kv_transfer_args
 from chitu.kv_cache.kv_cache import PagedKVCache
 from .base import KVManagerBase, DisaggregationMode
 from .endpoint import PrefillEndpoints, DecodeEndpoints
@@ -22,10 +21,6 @@ class KVManagerPrefill(KVManagerBase):
     def __init__(self):
         super().__init__(DisaggregationMode.PREFILL)
         logger.info("initializing kv manager in prefill mode")
-
-        assert (
-            get_kv_transfer_args().pd_tp_ratio == 1
-        ), "Prefill must use pd_tp_ratio=1; set on Decode only"
 
         self.is_ctrl_rank = self.rank == 0
         self.prefill_scheduler_id = self._prefill_inst_ids.index(self.instance_id)
@@ -125,13 +120,18 @@ class KVManagerPrefill(KVManagerBase):
                 info.first_token = first_tokens[i]
 
             # Gather send buffers from all caches.
+            inst_id = self._decode_inst_ids[info.decode_sid]
+            remote_dists = self.remote_cache_dists[inst_id]
+            local_dists = self._local_cache_dists
             send_buffers = TransferBuffers()
-            for cache in Backend.cache_dict.values():
+            for cache_name, cache in Backend.cache_dict.items():
                 assert isinstance(cache, PagedKVCache)
                 cache.get_kv_transfer_buffers(
                     send_buffers,
                     req_id,
                     cache.block_table.get(req_id, []),
+                    local_dists=local_dists,
+                    remote_dists=remote_dists,
                 )
 
             plan = create_transfer_plan(send_buffers, info.recv_buffers)

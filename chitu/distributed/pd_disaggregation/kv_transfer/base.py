@@ -32,8 +32,12 @@ from chitu.distributed.parallel_state import (
 )
 from chitu.distributed.infiniband import detect_ib_devices
 from chitu.distributed.pd_disaggregation.pd_log_utils import pd_trace_enabled
+from chitu.distributed.coordinator import set_value, get_value
+from chitu.kv_cache.kv_cache import PagedKVCache
+from .cache_info import CacheDistributions
 from .mooncake.transfer_engine import MooncakeTransferEngine
 from .task_info import TaskInfo
+from .protocol import ProtocolSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -91,12 +95,43 @@ class KVManagerBase:
     def register_buffer_to_engine(self):
         """Register all KV cache tensors with Mooncake for RDMA.
 
-        Each whole tensor is registered once instead of block-by-block,
-        since PyTorch tensors are contiguous in memory.  This covers all
-        block-level addresses used later for RDMA transfers.
+        Exchanges ``CacheDistributions`` via coordinator first, then registers
+        each whole tensor once instead of block-by-block, since PyTorch tensors
+        are contiguous in memory.  This covers all block-level addresses used
+        later for RDMA transfers.
 
         Call after all caches have been created (both Prefill and Decode).
         """
+
+        # --- compute local CacheDistributions ---
+        self._local_cache_dists = CacheDistributions()
+        for cache in Backend.cache_dict.values():
+            if not isinstance(cache, PagedKVCache) or cache.paged_kv_cache is None:
+                continue
+            for tensor_name, tensor in cache.paged_kv_cache.items():
+                self._local_cache_dists.register(
+                    tensor_name, int(tensor.shape[3]), cache.split_size
+                )
+
+        # --- exchange CacheDistributions (only instance control rank writes) ---
+        if self.rank == 0:
+            if get_global_args().infer.mtp_size > 1 and "mtp" not in Backend.cache_dict:
+                self._local_cache_dists.register_mtp_by_spec()
+            set_value(
+                f"inst{self.instance_id}:cache_dists",
+                ProtocolSerializer.pack(self._local_cache_dists),
+            )
+
+        self.remote_cache_dists: dict[int, CacheDistributions] = {}
+        remote_inst_ids = (
+            self._prefill_inst_ids if self.is_decode else self._decode_inst_ids
+        )
+        for inst_id in remote_inst_ids:
+            self.remote_cache_dists[inst_id] = ProtocolSerializer.unpack(
+                get_value(f"inst{inst_id}:cache_dists"), CacheDistributions
+            )
+
+        # --- RDMA registration ---
         if torch.cuda.is_available():
             set_cuda_device()
 

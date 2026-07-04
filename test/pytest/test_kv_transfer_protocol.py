@@ -26,7 +26,7 @@ _KW = dict(
     layer_id=0,
     block_id=0,
     split_id=0,
-    split_num=1,
+    split_len=1,
     replica_id=0,
     replica_size=1,
 )
@@ -41,7 +41,7 @@ def _add(bufs, data, **kw):
     kd = dict(_KW)
     kd.update(kw)
     bufs.add(data.data_ptr(), data.numel() * data.element_size(), **kd)
-    return f"{kd['req_id']}[{kd['cache_name']}]_L{kd['layer_id']}_B{kd['block_id']}_S{kd['split_id']}+{kd['split_num']}_R{kd['replica_id']}/{kd['replica_size']}"
+    return f"{kd['req_id']}[{kd['cache_name']}]_L{kd['layer_id']}_B{kd['block_id']}_S{kd['split_id']}+{kd['split_len']}_R{kd['replica_id']}/{kd['replica_size']}"
 
 
 class TestDecodeAllocated:
