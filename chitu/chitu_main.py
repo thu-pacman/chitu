@@ -160,9 +160,9 @@ def _cache_consumes_direct_warmup_new_cache_ids(cache) -> bool:
     ):
         return False
 
-    # These cache types manage their own block allocation and do not consume
+    # MMPagedKVCache manages its own block allocation and does not consume
     # PackedTasks.new_cache_ids_list in prepare_cache_prefill/decode.
-    if type(cache).__name__ in {"SingletonPagedKVCache", "MMPagedKVCache"}:
+    if type(cache).__name__ in {"MMPagedKVCache"}:
         return False
 
     return True
@@ -176,6 +176,10 @@ def _direct_warmup_num_blocks_for_cache(
     target_len = int(target_len)
     if target_len <= 0:
         return 0
+
+    # SingletonPagedKVCache: each request owns exactly one block.
+    if type(cache).__name__ == "SingletonPagedKVCache":
+        return 1
 
     # DeepSeek-V4 sliding-window cache is scheduler-managed even though each
     # request owns exactly one ring-buffer page.

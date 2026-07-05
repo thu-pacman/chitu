@@ -46,7 +46,6 @@ from chitu.device_type import is_ascend, is_muxi
 from chitu.distributed.parallel_state import (
     get_ep_group,
     get_dp_group,
-    get_pp_group,
     initialize_parallel_groups,
 )
 from chitu.distributed.coordinator import init_coordinator
@@ -80,7 +79,7 @@ from chitu.moe import init_moe_impl
 from chitu.global_vars import set_slot_handle, set_cuda_device
 from chitu.numa_utils import bind_process_to_numa
 from chitu.kv_cache.providers import register_all_providers
-from chitu.kv_cache.builders import build_cache_managers, build_mtp_cache
+from chitu.kv_cache.builders import build_cache_managers
 
 if TYPE_CHECKING:
     from chitu.executor import Executor
@@ -1171,8 +1170,6 @@ class Backend:
 
         # Initialize cache managers
         bundle = build_cache_managers(args, attn_backend_type)
-        if args.infer.mtp_size > 1 and get_pp_group().is_last_rank:
-            bundle.cache_dict["mtp"] = build_mtp_cache(args)
         Backend.cache_type = bundle.cache_type
         Backend.cache_dict = bundle.cache_dict
         Backend.cache_managers = bundle.cache_managers

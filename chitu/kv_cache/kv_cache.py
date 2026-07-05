@@ -916,37 +916,38 @@ class SingletonPagedKVCache(PagedKVCache):
             device=device,
             block_size=self.mtp_size,
             num_blocks=num_hot_req,
-            manager_name="",
+            manager_name="singleton",
             is_singleton=True,
             split_size=split_size,
         )
         self.max_blocks_per_req = 1
         self.max_num_blocks = self.max_blocks_per_req * num_hot_req
-        self.free_blocks = deque(range(self.num_blocks))
 
         if self.mtp_size > 1:
             self.is_mtp_decode_stage = False
-
-    def realloc(self, num_blocks):
-        super().realloc(num_blocks)
-        self.free_blocks = deque(range(self.num_blocks))
-
-    @property
-    def num_free_blocks(self):
-        """Return number of free blocks"""
-        return len(self.free_blocks)
 
     @override
     def prepare_cache_prefill(self, tasks: "PackedTasksBase"):
         KVCacheBase.prepare_cache_prefill(self, tasks)
 
-        for task_id in tasks.task_ids:
-            if task_id not in self.block_table:
-                self.block_table[task_id] = [self.get_free_block()]
-        self._upd_gpu_block_table(tasks.task_ids)
-
         if self.mtp_size > 1:
             self.is_mtp_decode_stage = False
+
+        if not tasks.new_cache_ids_list:
+            self._upd_gpu_block_table(tasks.task_ids)
+            return
+
+        for tid, item in zip(tasks.task_ids, tasks.new_cache_ids_list):
+            new_cache_ids = item.get(self.manager_name, [])
+            if new_cache_ids:
+                self.block_table[tid] = list(new_cache_ids)
+                # Zero the block tensor so linear recurrent state
+                # starts fresh.  Without this, stale state from a
+                # previous request can corrupt generation quality.
+                for cache_id in new_cache_ids:
+                    for key in self.paged_kv_cache:
+                        self.paged_kv_cache[key][:, cache_id] = 0
+        self._upd_gpu_block_table(tasks.task_ids)
 
     @override
     def prepare_cache_decode(self, tasks: "PackedTasksBase"):
@@ -960,25 +961,8 @@ class SingletonPagedKVCache(PagedKVCache):
     def finalize_cache_all_decode(self, tasks: "PackedTasksBase"):
         KVCacheBase.finalize_cache_all_decode(self, tasks)
         for tid in tasks.task_ids:
-            if tid not in self.block_table:
-                continue
-            self.free_req_cache_blocks(tid)
-
-    def free_req_cache_blocks(self, tid: str):
-        for block in self.block_table[tid]:
-            self.free_blocks.append(block)
-        del self.block_table[tid]
-
-    @override
-    def get_free_block(self):
-        if len(self.free_blocks) == 0:
-            raise Exception(
-                f"No more free blocks: cache manager has total {self.num_blocks} blocks, {self.num_blocks - len(self.free_blocks)} blocks has been used."
-            )
-        idx = self.free_blocks.popleft()
-        for key in self.paged_kv_cache:
-            self.paged_kv_cache[key][:, idx] = 0
-        return idx
+            if tid in self.block_table:
+                del self.block_table[tid]
 
     @override
     @cuda_graph_safe_cached_property("_page_ids_static_tensor", "_page_ids_up_to_date")
@@ -1003,33 +987,6 @@ class SingletonPagedKVCache(PagedKVCache):
     )
     def offs_in_page_mtp(self):
         return torch.zeros_like(self.mtp_seq_len_delta.delta_lens_tensor_device)
-
-    def reserve_blocks_for_transfer(self, tid: str, num_blocks: int) -> list[int]:
-        """Reserve a number of free blocks for an incoming transfer on decode side.
-        The reserved blocks are removed from the free list immediately to avoid
-        collision
-        SingletonPagedKVCache没有对应的SingletonPagedKVCacheManager，因此需要自行分配和管理kv cache block索引
-        """
-        reserved: list[int] = []
-        num_blocks = int(num_blocks)
-        if num_blocks <= 0:
-            return reserved
-
-        # NOTE:
-        # PD disaggregation relies on destination block_table having enough blocks
-        # to cover prefix_length. Partially reserving blocks will trigger
-        # CUDA device-side asserts when indexing page table by position_ids//block_size.
-        if num_blocks > len(self.free_blocks):
-            raise RuntimeError(
-                f"Not enough free KV blocks for transfer: req_id={tid} "
-                f"need={num_blocks} free={len(self.free_blocks)} "
-                f"total={self.num_blocks} used={self.num_blocks - len(self.free_blocks)}"
-            )
-
-        for _ in range(num_blocks):
-            reserved.append(self.get_free_block())
-
-        return reserved
 
     def insert_linear_state_from_transfer(
         self, tid: str, page_index: int, prefix_length: int

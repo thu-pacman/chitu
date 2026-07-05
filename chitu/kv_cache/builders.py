@@ -15,6 +15,7 @@ from chitu.kv_cache import (
     MMPagedKVCache,
     SingletonPagedKVCache,
     PagedKVCacheManager,
+    SingletonPagedKVCacheManager,
     KVCacheManagerBase,
 )
 from chitu.kv_cache.registry import (
@@ -102,7 +103,10 @@ def register_cache_manager_builder(
 def build_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
     for _prio, pred, fn in _BUILDER_REGISTRY:
         if pred(args):
-            return fn(args, attn_backend_type)
+            bundle = fn(args, attn_backend_type)
+            _inject_mtp_cache(args, bundle)
+            _inject_singleton_manager(args, bundle)
+            return bundle
     raise RuntimeError("No cache manager builder matched (registry empty?)")
 
 
@@ -346,6 +350,41 @@ def _build_multimodal_cache(
         quant_type="None",
         **spec.kvargs,
     )
+
+
+def _inject_mtp_cache(args, bundle: CacheBuildBundle) -> None:
+    """Build MTP cache and add it to the bundle (last PP stage only)."""
+    if not (args.infer.mtp_size > 1):
+        return
+
+    from chitu.distributed.parallel_state import get_pp_group
+
+    if not get_pp_group().is_last_rank:
+        return
+
+    bundle.cache_dict["mtp"] = build_mtp_cache(args)
+
+
+def _inject_singleton_manager(args, bundle: CacheBuildBundle) -> None:
+    has_singleton = any(
+        isinstance(c, SingletonPagedKVCache) for c in bundle.cache_dict.values()
+    )
+    if args.infer.mtp_size > 1:
+        # MTP cache exists only on the last PP stage; on other stages the
+        # cache_dict scan above returns false, but the singleton manager
+        # must still be created
+        has_singleton = True
+    if not has_singleton:
+        return
+    if bundle.cache_managers is None:
+        return
+
+    num_hot_req = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
+    for mgr_dict in bundle.cache_managers:
+        mgr_dict["singleton"] = SingletonPagedKVCacheManager(
+            num_hot_req=num_hot_req,
+            manager_name="singleton",
+        )
 
 
 @register_cache_manager_builder(model_types=[ModelType.HF_QWEN3_NEXT], priority=2)

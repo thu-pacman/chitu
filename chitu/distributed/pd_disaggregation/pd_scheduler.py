@@ -34,6 +34,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer import (
     KVManagerPrefill,
 )
 from chitu.distributed.pd_disaggregation.pd_log_utils import pd_trace_enabled
+from chitu.kv_cache.cache_manager import SingletonPagedKVCacheManager
 from chitu.backend import Backend
 from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
@@ -273,7 +274,7 @@ class PDInstanceRequestManager:
             task.set_stopped()
             if not task.req.finished:
                 task.req.finish_reason = "error"
-                task.req.finish()
+                task.req.stop_stream()
 
         if self.token_manager is not None:
             self.token_manager.token_sender.send_error(rid, error_message)
@@ -840,8 +841,14 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 )
 
                 num_cached_tokens = min(
-                    cache_manager.num_cached_blocks(task) * cache_manager.block_size
-                    for cache_manager in cache_manager_dict.values()
+                    (
+                        cache_manager.num_cached_blocks(task) * cache_manager.block_size
+                        for cache_manager in cache_manager_dict.values()
+                        if not isinstance(
+                            cache_manager, SingletonPagedKVCacheManager
+                        )  # singleton managers don't participate in prefix caching
+                    ),
+                    default=0,
                 )
                 remain_prefix_len = prefix_len - num_cached_tokens
 
