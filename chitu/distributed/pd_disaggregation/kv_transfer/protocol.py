@@ -156,12 +156,14 @@ class ProtocolSerializer:
         return msgpack.packb(d, use_bin_type=True)
 
     @classmethod
-    def unpack(cls, data: bytes):
+    def unpack(cls, data: bytes, target_cls: type = None):
         """Deserialize msgpack bytes to the appropriate protocol dataclass.
 
-        Dispatches by the "type" field.  If the target class has
-        ``from_msgpackable()``, delegates directly; otherwise uses
-        ``dict_to_dataclass``.
+        If *target_cls* is given, it is used directly (bypassing the registry).
+        Otherwise dispatches by the ``"type"`` field via ``_PROTOCOL_TYPE_REGISTRY``.
+
+        If the target class has ``from_msgpackable()``, delegates directly;
+        otherwise uses ``dict_to_dataclass``.
         """
         if not data:
             raise ValueError("empty protocol message")
@@ -170,13 +172,13 @@ class ProtocolSerializer:
         if not isinstance(d, dict):
             raise ValueError(f"protocol message must be a dict, got {type(d)}")
 
-        msg_type = d.get("type")
-        if not msg_type:
-            raise ValueError("protocol message missing 'type' field")
-
-        target_cls = _PROTOCOL_TYPE_REGISTRY.get(msg_type)
         if target_cls is None:
-            raise ValueError(f"unknown protocol message type: {msg_type}")
+            msg_type = d.get("type")
+            if not msg_type:
+                raise ValueError("protocol message missing 'type' field")
+            target_cls = _PROTOCOL_TYPE_REGISTRY.get(msg_type)
+            if target_cls is None:
+                raise ValueError(f"unknown protocol message type: {msg_type}")
 
         if hasattr(target_cls, "from_msgpackable"):
             return target_cls.from_msgpackable(d)

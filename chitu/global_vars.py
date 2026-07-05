@@ -373,11 +373,12 @@ def resolve_default_args(args):
             args.infer.bind_process_to_cpu = "numa_near_device"
 
     if args.infer.use_cuda_graph == "auto":
-        if args.models.name in [
+        if args.models.name in {
             "Mixtral-8x7B-Instruct-v0.1",
             "Qwen3-30B-A3B-mix-fp4-fp8",
-            "Qwen3-Next-80B-A3B-Instruct",
-        ]:
+        }:
+            args.infer.use_cuda_graph = False
+        elif args.models.type in {"deepseek-v4"}:
             args.infer.use_cuda_graph = False
         elif (
             args.infer.ep_size > 1
@@ -401,7 +402,15 @@ def resolve_default_args(args):
         args.infer.mtp_size = 1
 
     if args.infer.full_warmup == "auto":
-        if args.infer.pp_size > 1 and args.infer.use_cuda_graph:
+        # Suppose you are benchmarking Chitu with a fixed context length, if will end up
+        # always running the decode stage with full batch size, then we set
+        # `infer.full_warmup=False`. Otherwise, we set `infer.full_warmup=True`.
+        if args.infer.pp_size > 1:
+            # The actual batch size is affected by micro-batching
+            args.infer.full_warmup = True
+        elif args.infer.mtp_size > 1:
+            # Some requests will end sooner depending on the success rate of MTP, so some
+            # final batches will be unfull.
             args.infer.full_warmup = True
         else:
             args.infer.full_warmup = False

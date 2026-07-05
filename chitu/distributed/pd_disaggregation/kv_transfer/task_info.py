@@ -7,6 +7,7 @@ Per-request transfer state for PD disaggregation.
 """
 
 from __future__ import annotations
+import threading
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Optional, TYPE_CHECKING
@@ -67,6 +68,9 @@ class TaskInfo:
     """cache manager name -> list of new block ids."""
 
     is_prefill_done: bool = False
+    prefill_done_event: threading.Event = field(default_factory=threading.Event)
+    """Set when PrefillDone is received; used for thread-safe synchronization
+    between the ZMQ recv thread and the compute thread."""
     is_decode_prepare_received: bool = False
     is_decode_allocated_sent: bool = False
 

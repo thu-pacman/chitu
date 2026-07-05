@@ -19,6 +19,9 @@ from chitu.ops import fp8_pertensor_kvcache_quant, fp8_pertoken_kvcache_quant_ds
 
 if TYPE_CHECKING:
     from chitu.task import PackedTasksBase
+    from chitu.distributed.pd_disaggregation.kv_transfer.cache_info import (
+        CacheDistributions,
+    )
 
 
 logger = getLogger(__name__)
@@ -549,14 +552,6 @@ class PagedKVCache(KVCacheBase):
                 device=device,
             )
 
-        from chitu.distributed.pd_disaggregation.kv_transfer.cache_info import (
-            build_cache_transfer_info_map,
-        )
-
-        self._cache_transfer_infos = build_cache_transfer_info_map(
-            self.paged_kv_cache, self.split_size
-        )
-
         self._page_ids_static_tensor = StaticTensor(
             max_nelem=self.max_total_delta_len, device=device, dtype=torch.int32
         )
@@ -828,14 +823,18 @@ class PagedKVCache(KVCacheBase):
         buffers,
         req_id: str,
         block_indices: list[int],
+        *,
+        local_dists: "CacheDistributions",
+        remote_dists: "CacheDistributions",
     ):
         """Register block entries for send or recv into TransferBuffers."""
-
         if not block_indices:
             return
 
         for key, cache in self.paged_kv_cache.items():
-            ci = self._cache_transfer_infos[key]
+            ld = local_dists.dists[key]
+            rd = remote_dists.dists[key]
+            n_chunks, split_len = ld.calc_chunking(rd)
 
             for i, block_id in enumerate(block_indices):
                 for local_layer in range(self.num_layers):
@@ -843,7 +842,7 @@ class PagedKVCache(KVCacheBase):
                     block = cache[local_layer, block_id]
                     if not block.is_contiguous():
                         block = block.contiguous()
-                    chunks = block.view(-1).chunk(ci.n_chunks)
+                    chunks = block.view(-1).chunk(n_chunks)
                     for j, chunk in enumerate(chunks):
                         buffers.add(
                             chunk.data_ptr(),
@@ -852,30 +851,34 @@ class PagedKVCache(KVCacheBase):
                             req_id=req_id,
                             layer_id=global_layer,
                             block_id=i,
-                            split_id=ci.split_id(j),
-                            split_num=ci.split_num,
-                            replica_id=ci.replica_id,
-                            replica_size=ci.replica_size,
+                            split_id=ld.split_id + j * split_len,
+                            split_len=split_len,
+                            replica_id=ld.replica_id,
+                            replica_size=ld.replica_size,
                         )
 
-    def kv_recv_reorder(self, new_block_ids: list[int]):
-        """Permute chunk-interleaved layout back to T-major.
-
-        ``view(-1).chunk(n_chunks)`` splits flat memory by T, yielding
-        n_chunks groups.  Permute from ``(n_chunks, T, -1)`` to ``(T, -1)``.
-        """
+    def kv_recv_reorder(
+        self,
+        new_block_ids: list[int],
+        *,
+        local_dists: "CacheDistributions",
+        remote_dists: "CacheDistributions",
+    ):
+        """Permute chunk-interleaved layout back to T-major."""
         for key, cache in self.paged_kv_cache.items():
             if self.split_size == 0:
                 continue
-            ci = self._cache_transfer_infos[key]
-            if ci.n_chunks <= 1:
+            ld = local_dists.dists[key]
+            rd = remote_dists.dists[key]
+            n_chunks, _ = ld.calc_chunking(rd)
+            if n_chunks <= 1:
                 continue
 
             for block_id in new_block_ids:
                 for layer in range(cache.shape[0]):
                     block = cache[layer, block_id].contiguous()
                     cache[layer, block_id] = (
-                        block.view(ci.n_chunks, block.shape[0], -1)
+                        block.view(n_chunks, block.shape[0], -1)
                         .permute(1, 0, 2)
                         .reshape(block.shape)
                         .contiguous()

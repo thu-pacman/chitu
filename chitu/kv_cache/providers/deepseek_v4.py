@@ -277,7 +277,7 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
                 "pending_score_state": (pending_rows, coff * head_dim),
             }
             request_dtype_dict = {
-                "pending_kv_state": torch.float32,
+                "pending_kv_state": torch.get_default_dtype(),
                 "pending_score_state": torch.float32,
             }
             if index_head_dim is not None and ratio == 4:

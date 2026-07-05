@@ -74,8 +74,6 @@ Prefill 通过 Mooncake Transfer Engine 执行 Device-to-Device 的 RDMA 写入�
 - `split_size = 0`（replica）：所有 rank 持有完整副本。每 rank 为独立 replica。
 - `split_size > 0`（split）：dim3 被切分为 `split_size` 份，分布在 TP ranks 间。
 
-`pd_tp_ratio = prefill_tp_size // decode_tp_size` 参数用于 cross-TP 场景（仅 Decode 端）。当 `pd_tp_ratio > 1` 时，Decode 端会将 block 按 `view(-1).chunk(pd_tp_ratio)` 拆分为多个 chunk，使每份 chunk 的 head 范围与一个 Prefill rank 对应，实现 key 自然匹配。收到后通过 `kv_recv_reorder` 将 chunk-interleaved 布局 permute 回 T-major。
-
 ## 请求生命周期
 
 以 1P1D 为例（Prefill/Decode 各一个 ctrl rank + 若干 worker rank）：
@@ -198,7 +196,7 @@ kv_transfer/
 ├── protocol.py              # 4 种协议消息 dataclass + ProtocolSerializer (msgpack)
 ├── transfer_buffers.py      # TransferBuffer + TransferBuffers
 ├── transfer_plan.py         # TransferPair + TransferMatcher + TransferPlan + create_transfer_plan
-├── cache_info.py            # CacheTransferInfo: 预计算 split/chunk/replica 元数据
+├── cache_info.py            # CacheDistribution / CacheDistributions: per-cache distribution 与 chunk 计算
 ├── task_info.py             # TaskInfo: per-request 状态聚合
 └── mooncake/
     ├── transfer_engine.py   # MooncakeTransferEngine: RDMA 封装 + MooncakeBootstrapServer
@@ -252,7 +250,7 @@ class DisaggregationMode(Enum):
 
 ### 传输匹配与规划（`transfer_plan.py`）
 
-**Key 格式**：`{req_id}[{cache_name}]_L{layer_id}_B{block_id}_S{split_id}+{split_num}_R{replica_id}/{replica_size}`
+**Key 格式**：`{req_id}[{cache_name}]_L{layer_id}_B{block_id}_S{split_id}+{split_len}_R{replica_id}/{replica_size}`
 
 **`create_transfer_plan` 流程**：
 1. 从 send key 中剥离 `_R...` 后缀得到 match_prefix
@@ -264,28 +262,35 @@ class DisaggregationMode(Enum):
 
 **字节校验**：`PrefillDone.rank_bytes` 汇总所有 Prefill rank 的 per-session 传输字节数，Decode 侧对比 `recv_bytes`，不一致记录 error。
 
-### CacheTransferInfo（`cache_info.py`）
+### CacheDistribution / CacheDistributions（`cache_info.py`）
 
-`frozen dataclass`，在 `PagedKVCache.__init__` 时预计算，后续查询零开销：
+`CacheDistribution`（frozen dataclass）描述单个 cache tensor 在 TP/PCP ranks 间的分布信息，在 `register_buffer_to_engine()` 初始化时根据 tensor shape 自动计算，无需外部配置：
 
 ```python
 @dataclass(frozen=True)
-class CacheTransferInfo:
-    split_id_base: int  # 本 rank 在 dim3 中的起始 head 偏移
-    n_chunks: int       # flat-memory chunk 数量
-    split_num: int      # 每个 chunk 覆盖的逻辑 head 数
-    replica_id: int     # 本 replica 在组内的序号
-    replica_size: int   # replica 组大小
+class CacheDistribution:
+    split_len: int       # 本地 head 数（cache tensor dim3）
+    split_id: int        # 全局 head 起始偏移
+    split_size: int      # 0 = replica; >0 = 在 TP/PCP ranks 间 split
+    replica_id: int      # 本 rank 在 replica 组内的序号
+    replica_size: int    # replica 组总大小
+
+    def calc_chunking(self, remote: CacheDistribution) -> tuple[int, int]:
+        """基于 gcd(local.split_len, remote.split_len) 计算 chunk 数与每 chunk 的 split 长度"""
+        align = math.gcd(self.split_len, remote.split_len)
+        return self.split_len // align, align
 ```
 
-统一计算逻辑（`compute_cache_transfer_info`）：
+统一计算逻辑（`CacheDistributions.register`）：
 ```python
 replica_size = group_size // split_size
-split_id_base = (rank // replica_size) * n_local
+split_id = (rank // replica_size) * split_len
 replica_id = rank % replica_size
 ```
 
-`pd_tp_ratio` 决定 `n_chunks`：`pd_tp_ratio > 1` 时 Decode 端将 block 拆分为多个 chunk，使每份 chunk 的 head 范围与一个 Prefill rank 对应。
+`CacheDistributions` 收集每个实例所有 cache 的 `CacheDistribution`（以 tensor name 为 key），在 `register_buffer_to_engine()` 中通过 coordinator 进行 P/D 两端交换，使 `get_kv_transfer_buffers()` 和 `kv_recv_reorder()` 能在运行时根据本地和对端的分布信息动态计算 chunking 策略（`calc_chunking`）。msgpack 序列化由 `ProtocolSerializer` 统一处理。
+
+通过 `gcd(local.split_len, remote.split_len)` 动态对齐——无论 P/D 两端的 TP 大小如何，chunking 总能自动匹配。
 
 ### PDCoordinationService（`pd_coordination.py`）
 
@@ -383,7 +388,6 @@ multi_inst:
       decode_max_running_tasks_per_dp: null
       prefill_bootstrap_poll_interval_s: 0.01
       prefill_wait_transfer_info_timeout_s: 2400.0
-      pd_tp_ratio: 1                   # prefill_tp / decode_tp，仅 Decode 端按需设置 >1
 
   router:
     is_router: True                # Router 进程设为 True，P/D 设为 False
@@ -697,7 +701,7 @@ Router 进程可选启动内置的 Prometheus Server（`PrometheusServerManager`
 | Protocol        | `kv_transfer/protocol.py`                 | 4 种协议消息 dataclass + msgpack 序列化           |
 | Transfer Buffers | `kv_transfer/transfer_buffers.py`        | TransferBuffer + TransferBuffers            |
 | Transfer Plan   | `kv_transfer/transfer_plan.py`            | TransferMatcher + TransferPlan + create_transfer_plan |
-| Cache Info      | `kv_transfer/cache_info.py`               | CacheTransferInfo 预计算 split/chunk/replica 元数据 |
+| Cache Info      | `kv_transfer/cache_info.py`               | CacheDistribution / CacheDistributions: per-cache distribution 与 chunk 计算 |
 | Task Info       | `kv_transfer/task_info.py`                | TaskInfo: per-request 状态聚合                |
 | Transfer Engine | `kv_transfer/mooncake/transfer_engine.py` | Mooncake RDMA 引擎封装 + Bootstrap Server    |
 | Metadata        | `kv_transfer/mooncake/metadata.py`        | MetadataBuffers（辅助 buffer 管理）             |
@@ -716,7 +720,7 @@ Router 进程可选启动内置的 Prometheus Server（`PrometheusServerManager`
 | P/D 启动卡在 Bootstrap 连接 | 确认 Router 已启动 Bootstrap，且 coordinator.host/port 对 P/D 节点可达 |
 | Decode 长时间 WAITING    | 检查 Prefill 是否收到 `DecodeAllocated`；查看 Prefill 传输线程日志；确认 RDMA 设备已正确检测（见 `chitu/distributed/infiniband.py`） |
 | RDMA "Bad address"    | 确认 `register_buffer_to_engine()` 在 cache 创建后调用；检查各层 ptr/len 无重叠 |
-| transfer bytes mismatch | Decode 日志出现 `rank_bytes` vs `recv_bytes` 不一致；检查 Prefill/Decode 的 `split_size` / `pd_tp_ratio` 配置是否匹配 |
+| transfer bytes mismatch | Decode 日志出现 `rank_bytes` vs `recv_bytes` 不一致；检查 Prefill/Decode 的 `split_size` 配置是否匹配 |
 | GLM-5 + auto attn_type + MTP>1 乱码 | `HopperMixedBackend` 与 MTP 不兼容，设置 `attn_type=flash_mla` |
 | 同节点多进程端口冲突            | 调度器请求端口为随机分配并通过 coordinator 发现；仅需为每个 torchrun 进程指定不同的 `--master_port`；Router port 使用 22001 + job_offset 基础 |
-| head-repeat 模型乱码          | 检查 `compute_cache_transfer_info` 中的 `replica_size` / `split_id_base` 计算是否正确（head 按连续分组分布，同 head 的 rank 相邻）；确认 `TransferMatcher` replica_ratio 过滤逻辑 |
+| head-repeat 模型乱码          | 检查 `CacheDistribution` 中的 `replica_size` / `split_id` 计算是否正确（head 按连续分组分布，同 head 的 rank 相邻）；确认 `TransferMatcher` replica_ratio 过滤逻辑 |

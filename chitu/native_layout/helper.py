@@ -4,6 +4,7 @@
 
 import torch
 
+from chitu.global_vars import get_global_args
 from chitu.native_layout.base import (
     NativeLayoutTensor,
     NativeLayoutTemplate,
@@ -38,7 +39,9 @@ class NativeLayoutMixin:
     `Plain -> Layout1 -> Layout2 -> Layout3 -> Layout4`.
 
     When load_state_dict, state_dict["weight"] is assume to have shape and dtype
-    as `Layout2`, and converted as `Layout2 -> Layout3 -> Layout4`.
+    as `Layout2`, and converted as `Layout2 -> Layout3 -> Layout4`. But if
+    `skip_preprocess`, we assume the checkpoint provide tensors already in the
+    final layout and bypass the conversion hook.
 
     init_native_layout also build a getter `get_native_layout_weight()`, returns
     self.weight wrapped with Layout4.
@@ -226,7 +229,9 @@ def _install_state_dict_hooks(
     the data through all ``state_dict_convert=True`` steps.  If the
     deepest template has ``state_dict_convert=False`` the incoming data
     is assumed to already be in that layout's format and that step is
-    skipped.
+    skipped. If `skip_preprocess`, we assume the checkpoint already store
+    tensors in the final runtime layout, so the pre-hook does not convert
+    them.
 
     The post-hook restores ``param.native_layout`` after
     ``load_state_dict(assign=True)`` replaces the ``Parameter`` object.
@@ -247,6 +252,11 @@ def _install_state_dict_hooks(
             missing_keys.append(key)
             return
         try:
+            if get_global_args().skip_preprocess:
+                # Checkpoints preprocessed by script/preprocess_and_save.py store
+                # native-layout tensors exactly as the model consumes them at runtime.
+                return
+
             data = state_dict[key]
 
             # Walk to the first template in the chain

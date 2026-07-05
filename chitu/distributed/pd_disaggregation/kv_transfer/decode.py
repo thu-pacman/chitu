@@ -88,6 +88,8 @@ class KVManagerDecode(KVManagerBase):
             return
         info.is_decode_allocated_sent = True
 
+        remote_dists = self.remote_cache_dists[self._prefill_inst_ids[info.prefill_sid]]
+
         # Gather recv buffers
         recv_buffers = TransferBuffers()
         for cache_name, cache in Backend.cache_dict.items():
@@ -110,6 +112,8 @@ class KVManagerDecode(KVManagerBase):
                 recv_buffers,
                 req_id,
                 new_block_ids,
+                local_dists=self._local_cache_dists,
+                remote_dists=remote_dists,
             )
 
         # Record expected recv bytes for later verification.
@@ -163,6 +167,7 @@ class KVManagerDecode(KVManagerBase):
         info.first_token = msg.first_token
         info.num_hit_tokens = msg.num_hit_tokens
         info.is_prefill_done = True
+        info.prefill_done_event.set()
 
         self._trace("handle_prefill_done", req_id=msg.req_id)
 
@@ -172,18 +177,26 @@ class KVManagerDecode(KVManagerBase):
         Waits for PrefillDone, then insert transferred pages.
         Returns (first_tokens, cached_hit_tokens).
         """
-        logger.info(f"recv_kv_cache_and_insert {req_id=}")
+        logger.debug(f"recv_kv_cache_and_insert {req_id=}")
 
-        # Wait for all rooms to receive PrefillDone
+        # Wait for the recv thread to process PrefillDone.
         info = self._info(req_id)
-        # FIXME: potential concurrent bug if compute thread call this faster than ``handle_prefill_done``, maybe use a thread.Event?
-        assert info.is_prefill_done, f"prefill not done for {req_id}"
+        if not info.prefill_done_event.wait(timeout=10.0):
+            raise RuntimeError(
+                f"Timed out waiting for PrefillDone after 10s: req_id={req_id}"
+            )
+
+        remote_dists = self.remote_cache_dists[self._prefill_inst_ids[info.prefill_sid]]
 
         for cache_name, cache in Backend.cache_dict.items():
             assert isinstance(cache, PagedKVCache)
             new_block_ids = info.cache_new_block_ids[cache_name]
             cache.insert_kv_cache_from_transfer(req_id, new_block_ids, info.prefix_len)
-            cache.kv_recv_reorder(new_block_ids)
+            cache.kv_recv_reorder(
+                new_block_ids,
+                local_dists=self._local_cache_dists,
+                remote_dists=remote_dists,
+            )
 
         self._remove_info(req_id)
 

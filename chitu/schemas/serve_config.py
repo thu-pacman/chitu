@@ -129,7 +129,6 @@ class KvTransferConfig:
     buffer_size: int = MISSING
     transfer_timeout: float = MISSING
     max_concurrent_transfers: int = MISSING
-    pd_tp_ratio: int = MISSING
     # Settings for how long Decode waits for the Success signal from Prefill
     # (see kv_manager.recv_kv_cache_and_insert).
     decode_wait_timeout_s: float = MISSING
@@ -153,7 +152,8 @@ class KvTransferConfig:
 class PDTestConfig:
     """PD smoke-test configuration."""
 
-    enable: bool = MISSING
+    # 0=off, 1=basic test, 2=test with shared system prompt (prefix-cache-friendly)
+    enable: int = MISSING
     req_num: int = MISSING  # number of test requests
     req_timeout: float = MISSING  # per-request timeout (seconds)
     output_len: int = MISSING  # max_new_tokens for each test request
