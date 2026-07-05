@@ -431,7 +431,11 @@ def resolve_default_args(args):
     from chitu.models.registry import ModelType
 
     if args.infer.mla_absorb == "auto":
-        if args.models.type == ModelType.DEEPSEEK_V3:
+        if args.models.type in {
+            ModelType.DEEPSEEK_V3,
+            ModelType.KIMI_K2_5,
+            ModelType.GLM_5_2,
+        }:
             args.infer.mla_absorb = "absorb-without-precomp"
         else:
             args.infer.mla_absorb = "none"
