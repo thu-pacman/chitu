@@ -16,7 +16,7 @@ from chitu.boot.srun import srun
 from chitu.boot.ssh import ssh
 from chitu.boot.apptainer_run import apptainer_run
 from chitu.boot.docker_run import docker_run
-from chitu.boot.appimage_utils import appdir
+from chitu.boot.appimage_utils import appdir, appimage
 
 logger = getLogger(__name__)
 
@@ -38,20 +38,32 @@ cs.store(name="serve_config_schema", node={})
 
 @hydra.main(
     version_base=None,
-    config_path=os.path.join(appdir, "usr/share/chitu/config"),
+    config_path=(
+        os.path.join(appdir, "usr/share/chitu/config")
+        if appimage != "SOURCE"
+        else os.path.join(appdir, "chitu", "config")
+    ),
     config_name="serve_config",
 )
 def main(cfg: DictConfig):
     if cfg.boot.interactive_node_0 == "auto":
         cfg.boot.interactive_node_0 = sys.stdout.isatty() and cfg.boot.n_nodes == 1
 
-    image_name_file = os.path.join(appdir, "usr/share/chitu/image_name.txt")
-    if os.path.isfile(image_name_file):
-        logger.info("Using docker image from the bundle")
-        local_run_callback = docker_run
+    if cfg.boot.container_image is not None:
+        if os.path.isfile(cfg.boot.container_image):
+            logger.info("Using apptainer runtime")
+            local_run_callback = apptainer_run
+        else:
+            logger.info("Using docker runtime")
+            local_run_callback = docker_run
     else:
-        logger.info("Using apptainer image from the bundle")
-        local_run_callback = apptainer_run
+        image_name_file = os.path.join(appdir, "usr/share/chitu/image_name.txt")
+        if os.path.isfile(image_name_file):
+            logger.info("Using docker image from the bundle")
+            local_run_callback = docker_run
+        else:
+            logger.info("Using apptainer image from the bundle")
+            local_run_callback = apptainer_run
 
     if cfg.boot.remote_launcher == "local":
         local(cfg, raw_argv, local_run_callback)

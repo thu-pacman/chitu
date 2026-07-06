@@ -534,3 +534,109 @@ class DeepSeekV4CompressedKVCacheManager(
         if compressed_len == 0:
             return 0
         return ceil_div(compressed_len, self.block_size)
+
+
+class SingletonPagedKVCacheManager(KVCacheManagerBase):
+    """Block allocator for SingletonPagedKVCache.
+
+    Each active request owns exactly one block. Allocation happens once in
+    ``prepare_metadata_before_prefill``; decode phase reuses the same block
+    and ``prepare_metadata_before_decode`` returns an empty list (no
+    incremental allocation).
+
+    The pool size is ``num_hot_req``, which exactly matches the physical
+    capacity of ``SingletonPagedKVCache`` (one block per hot request).
+    """
+
+    def __init__(
+        self,
+        *,
+        num_hot_req: int,
+        manager_name: str,
+    ):
+        self.num_blocks = int(num_hot_req)
+        self.manager_name = manager_name
+        self.block_size = 1
+        self.max_blocks_per_req = 1
+
+        self.free_cache_ids: deque[int] = deque(range(self.num_blocks))
+        self.task_to_cache_ids: defaultdict[str, set[int]] = defaultdict(set)
+        """task_id -> set of allocated cache block ids.
+
+        Stored as ``defaultdict[str, set[int]]`` for interface compatibility
+        with ``PagedKVCacheManager.task_to_cache_ids`` which is consumed
+        directly by ``scheduler.py``.
+        """
+
+        # —— interface alignment with PagedKVCacheManager ——
+        self.max_num_blocks = self.num_blocks
+        self.page_table_max_num_blocks = self.num_blocks
+        self.allocatable_max_num_blocks = self.num_blocks
+        self.enable_prefix_caching = False
+
+    # ========================
+    #   Capacity / queries
+    # ========================
+
+    @property
+    def num_active_blocks(self) -> int:
+        return len(self.task_to_cache_ids)
+
+    def num_blocks_for_seq_len(self, seq_len: int) -> int:
+        return 1 if seq_len > 0 else 0
+
+    def num_cached_blocks(self, task) -> int:
+        return 0  # linear / mtp caches do not participate in prefix caching
+
+    def num_cached_idle_blocks(self, task, *, max_cached_token_len=None) -> int:
+        return 0
+
+    # ========================
+    #   Allocation / release
+    # ========================
+
+    def prepare_metadata_before_prefill(self, task) -> list[int]:
+        """Allocate the single block for the full request lifetime."""
+        tid = task.task_id
+        if tid not in self.task_to_cache_ids:
+            cache_id = self._get_free_cache_id()
+            self.task_to_cache_ids[tid] = {cache_id}
+            return [cache_id]
+        return []
+
+    def prepare_metadata_before_decode(self, task) -> list[int]:
+        """Decode phase reuses the block allocated during prefill.
+
+        Returns an empty list — no incremental allocation.  Raises
+        ``RuntimeError`` if the task was never seen by
+        ``prepare_metadata_before_prefill`` (programmer error).
+        """
+        tid = task.task_id
+        if tid not in self.task_to_cache_ids:
+            raise RuntimeError(
+                f"SingletonPagedKVCacheManager '{self.manager_name}': "
+                f"task '{tid}' reached decode without prefill allocation"
+            )
+        return []
+
+    def finalize_metadata_all_decode(self, task):
+        tid = task.task_id
+        cache_ids = self.task_to_cache_ids.pop(tid, None)
+        if cache_ids is not None:
+            for cache_id in cache_ids:
+                self.free_cache_ids.append(cache_id)
+
+    def _get_free_cache_id(self) -> int:
+        if not self.free_cache_ids:
+            raise RuntimeError(
+                f"SingletonPagedKVCacheManager '{self.manager_name}': "
+                f"no free blocks (total={self.num_blocks}, "
+                f"active={len(self.task_to_cache_ids)})"
+            )
+        return self.free_cache_ids.popleft()
+
+    def realloc(self, num_blocks: int):
+        self.num_blocks = int(num_blocks)
+        self.free_cache_ids = deque(range(self.num_blocks))
+        self.task_to_cache_ids.clear()
+        self.max_num_blocks = self.num_blocks

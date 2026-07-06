@@ -154,8 +154,11 @@ class KVManagerPrefill(KVManagerBase):
             if not self.is_ctrl_rank:
                 self._remove_info(req_id)
             logger.debug(f"transfer_worker.done {req_id=}")
-        except:
-            logger.exception(f"transfer_worker failed {req_id=}")
+        except Exception:
+            logger.exception(
+                f"transfer_worker fatal error req_id={req_id}, exiting process"
+            )
+            os._exit(1)
 
     def is_decode_allocated(self, req_id: str):
         info = self._info(req_id, create=False)

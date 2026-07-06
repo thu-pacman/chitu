@@ -2,11 +2,15 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import sys
 
-# If this attribute exists, we are running inside a PyInstaller bundle, then
-# we skip import unneeded dependencies.
-if not getattr(sys, "frozen", False):
+# Skip heavy dependencies when running as chitu.boot (boot-time only, no torch).
+# - PyInstaller (frozen) already skips.
+# - APPIMAGE=SOURCE is the source-mode marker set by the boot test scripts.
+_is_boot = getattr(sys, "frozen", False) or (os.environ.get("APPIMAGE") == "SOURCE")
+
+if not _is_boot:
     # Some special logging functions like `logger.warning_once` are used
     # across chitu functions. In order to make those functions functional,
     # we configure the logging functions here.

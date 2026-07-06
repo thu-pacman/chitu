@@ -67,7 +67,10 @@ def ssh(cfg, raw_argv, local_run_callback):
         # overrides (raw_argv[1:]) to the inner invocation. The master address
         # is passed via an environment variable so the inner branch can set up
         # the rendezvous.
-        inner_argv = [appimage] + list(raw_argv[1:])
+        reexec = [appimage]
+        if appimage == "SOURCE":
+            reexec = [sys.executable, "-m", "chitu.boot.main"]
+        inner_argv = reexec + list(raw_argv[1:])
         remote_command = " ".join(shlex.quote(str(a)) for a in inner_argv)
 
         cwd = os.getcwd()

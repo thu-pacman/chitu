@@ -395,6 +395,9 @@ def start_worker():
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(process_queue())
+    except Exception:
+        logger.exception("compute worker fatal error, exiting process")
+        os._exit(1)
     finally:
         loop.close()
 

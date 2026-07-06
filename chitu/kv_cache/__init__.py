@@ -54,4 +54,5 @@ from chitu.kv_cache.cache_manager import (
     PagedKVCacheManager,
     DeepSeekV4SlidingKVCacheManager,
     DeepSeekV4CompressedKVCacheManager,
+    SingletonPagedKVCacheManager,
 )

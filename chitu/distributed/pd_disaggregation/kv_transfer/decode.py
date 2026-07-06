@@ -5,7 +5,7 @@
 from logging import getLogger
 
 from chitu.backend import Backend
-from chitu.kv_cache.kv_cache import PagedKVCache, SingletonPagedKVCache
+from chitu.kv_cache.kv_cache import PagedKVCache
 
 from .base import KVManagerBase, DisaggregationMode
 from .endpoint import PrefillEndpoints, DecodeEndpoints
@@ -94,18 +94,7 @@ class KVManagerDecode(KVManagerBase):
         recv_buffers = TransferBuffers()
         for cache_name, cache in Backend.cache_dict.items():
             assert isinstance(cache, PagedKVCache)
-
-            if isinstance(cache, SingletonPagedKVCache):
-                if cache.num_free_blocks < 1:
-                    raise RuntimeError(
-                        f"Not enough free blocks for {cache_name}: req_id={req_id}"
-                    )
-                # FIXME: may failed and need handle?
-                # FIXME: concurrent bug with compute thread?
-                # FIXME: a cache manager for SingletonPagedKVCache may be a better plan
-                new_block_ids = cache.reserve_blocks_for_transfer(req_id, 1)
-            else:
-                new_block_ids = info.cache_manager_new_block_ids[cache.manager_name]
+            new_block_ids = info.cache_manager_new_block_ids[cache.manager_name]
             info.cache_new_block_ids[cache_name] = new_block_ids
 
             cache.get_kv_transfer_buffers(

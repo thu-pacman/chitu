@@ -48,6 +48,27 @@ Number of GPUs per node to use
 
 *Default: `1`.*
 
+### Argument `boot.container_image`
+
+Path to container image (override bundled image).
+
+For apptainer: absolute path to a .sif file.
+For docker: image name (e.g. "chitu-ci-build:main").
+When null, uses the image bundled in the AppImage.
+
+*Default: `null`.*
+
+### Argument `boot.source_path`
+
+Path to source tree to mount into the container at /workspace/chitu.
+
+When set, the directory is bind-mounted into the container, so code changes
+take effect without rebuilding the image. Requires the source tree to be
+accessible at the same path on all nodes (e.g. on NFS).
+When null, uses the code baked into the container image.
+
+*Default: `null`.*
+
 ### Argument `boot.target`
 
 Target chitu program or script

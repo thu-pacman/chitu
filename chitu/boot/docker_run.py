@@ -42,6 +42,7 @@ def docker_run(
     is_master_node,
     torchrun_n_nodes,
     torchrun_nproc_per_node,
+    _proc_registry=None,
 ):
     n_nodes = int(torchrun_n_nodes)
     nproc_per_node = int(torchrun_nproc_per_node)
@@ -83,27 +84,31 @@ def docker_run(
         ib_mount_args += ["-v", "/sbin/ibdev2netdev:/sbin/ibdev2netdev"]
         logger.info("Adding /sbin/ibdev2netdev to mounts")
 
-    image_name_file = os.path.join(appdir, "usr/share/chitu/image_name.txt")
-    if not os.path.isfile(image_name_file):
-        raise RuntimeError(f"image name file not found at {image_name_file}")
-    with open(image_name_file) as f:
-        image_name = f.read().strip()
-
-    # Check if the image already exists in the current docker. If not, load it.
-    inspect_result = subprocess.run(
-        ["docker", "image", "inspect", image_name],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if inspect_result.returncode != 0:
-        logger.info(f"Image {image_name} not found, loading from the bundle")
-        image_file = os.path.join(appdir, "usr/share/chitu/image.docker")
-        if not os.path.isfile(image_file):
-            logger.info("Pulling the image")
-        else:
-            subprocess.run(["docker", "load", "-i", image_file], check=True)
+    if cfg.boot.container_image is not None:
+        image_name = cfg.boot.container_image
+        logger.info(f"Using docker image from boot.container_image: {image_name}")
     else:
-        logger.info(f"Image {image_name} already exists in docker")
+        image_name_file = os.path.join(appdir, "usr/share/chitu/image_name.txt")
+        if not os.path.isfile(image_name_file):
+            raise RuntimeError(f"image name file not found at {image_name_file}")
+        with open(image_name_file) as f:
+            image_name = f.read().strip()
+
+        # Check if the image already exists in the current docker. If not, load it.
+        inspect_result = subprocess.run(
+            ["docker", "image", "inspect", image_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if inspect_result.returncode != 0:
+            logger.info(f"Image {image_name} not found, loading from the bundle")
+            image_file = os.path.join(appdir, "usr/share/chitu/image.docker")
+            if not os.path.isfile(image_file):
+                logger.info("Pulling the image")
+            else:
+                subprocess.run(["docker", "load", "-i", image_file], check=True)
+        else:
+            logger.info(f"Image {image_name} already exists in docker")
 
     hosts_tmp_file = None
     docker_cmd = ["docker", "run", "--network", "host"]
@@ -210,6 +215,13 @@ def docker_run(
     except Exception as e:
         logger.warning(f"Failed to add local ip to /etc/hosts: {e}")
     docker_cmd += docker_args
+    if cfg.boot.source_path is not None:
+        docker_cmd += [
+            "-v",
+            f"{cfg.boot.source_path}:/workspace/chitu",
+            "-e",
+            "PYTHONPATH=/workspace/chitu",
+        ]
     docker_cmd += [image_name]
 
     service_docker_cmd = copy.copy(docker_cmd)
@@ -265,8 +277,14 @@ def docker_run(
         on_ready_thread.start()
 
     logger.info(f"Running: {service_docker_cmd}")
+    proc = subprocess.Popen(service_docker_cmd)
+    if _proc_registry is not None:
+        _proc_registry.append(proc)
+    ret = proc.wait()
+
     try:
-        subprocess.run(service_docker_cmd, check=True)
+        if ret != 0:
+            raise subprocess.CalledProcessError(ret, service_docker_cmd)
     finally:
         if hosts_tmp_file is not None:
             try:
@@ -276,7 +294,7 @@ def docker_run(
                     f"Failed to remove temporary hosts file {hosts_tmp_file}: {e}"
                 )
 
-    if on_ready_thread is not None:
+    if on_ready_thread is not None and ret == 0:
         on_ready_thread.join()
     if on_ready_error:
         raise on_ready_error[0]

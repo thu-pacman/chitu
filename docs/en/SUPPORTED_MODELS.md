@@ -38,6 +38,7 @@
 | GLM-5-FP8-kv | ✓ | `models=GLM-5-FP8-kv` | https://huggingface.co/zai-org/GLM-5-FP8 |
 | GLM-5-W8A8 | ✓ | `models=GLM-5-W8A8` | https://huggingface.co/zai-org/GLM-5 |
 | GLM-5.1 | ✓ | `models=GLM-5.1` | https://huggingface.co/zai-org/GLM-5.1 |
+| GLM-5.1-Channel-INT4-w4a8 | ✓ | `models=GLM-5.1-Channel-INT4-w4a8` | https://modelscope.cn/models/hygon/GLM-5.1-Channel-INT4-w4a8 |
 | GLM-5.1-FP8 | ✓ | `models=GLM-5.1-FP8` | https://huggingface.co/zai-org/GLM-5.1-FP8 |
 | GLM-5.1-W8A8 | ✓ | `models=GLM-5.1-W8A8` | https://modelscope.cn/models/metax-tech/GLM-5.1-W8A8 |
 | GLM-5.2 | ✓ | `models=GLM-5.2` | https://huggingface.co/zai-org/GLM-5.2 |
@@ -136,6 +137,7 @@ The following models are part of chitu-pro. Please concat [solution@chitu.ai](so
 | DeepSeek-R1-Distill-Qwen-14B-fp8 |  | `models=DeepSeek-R1-Distill-Qwen-14B-fp8` |
 | DeepSeek-R1-ascend-int8 | ✓ | `models=DeepSeek-R1-int8-ascend` |
 | DeepSeek-R1-MXFP4 | ✓ | `models=DeepSeek-R1-mxfp4` |
+| DeepSeek-R1-w4a8-hygon | ✓ | `models=DeepSeek-R1-w4a8-hygon` |
 | DeepSeek-V3-ascend-int8 | ✓ | `models=DeepSeek-V3-int8-ascend` |
 | DeepSeek-V3.1-Terminus-ascend-int8 | ✓ | `models=DeepSeek-V3.1-Terminus-int8-ascend` |
 | DeepSeek-V4-Flash | ✓ | `models=DeepSeek-V4-Flash` |

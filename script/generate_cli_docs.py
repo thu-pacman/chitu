@@ -243,7 +243,8 @@ def generate_docs(input_path: Path, output_path: Path) -> None:
     output_text = render_docs(input_path)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(output_text, encoding="utf-8")
+    with open(output_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(output_text)
 
     print(f"Generated {output_path} from {input_path}")
 
@@ -287,7 +288,8 @@ def main() -> int:
 
     if changed:
         OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        OUTPUT_PATH.write_text(new_doc, encoding="utf-8")
+        with open(OUTPUT_PATH, "w", encoding="utf-8", newline="\n") as f:
+            f.write(new_doc)
         print(f"Updated CLI docs at {OUTPUT_PATH}.")
     else:
         print("No changes needed.")

@@ -53,6 +53,7 @@ class QuantizationRegistry:
         "mixq",
         "w8a8_dynamic",
         "w4_g128_symm_a8_symm",
+        "hygon_w4a8",
         None,
     ]
     _allowed_quant_for_merge_qkv: list = [
@@ -64,6 +65,7 @@ class QuantizationRegistry:
         "mixq",
         "w8a8_dynamic",
         "w4_g128_symm_a8_symm",
+        "hygon_w4a8",
         None,
     ]
 

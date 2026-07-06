@@ -67,3 +67,4 @@ from chitu.quantization.blockfp4 import (
 )
 from chitu.quantization.q4km import MoeExpertsDeepSeekV3CPUInfer
 from chitu.quantization.hygon_utils import InXOutLinear
+from chitu.quantization.hygon_w4a8 import HygonW4A8MoeExpertsMerged

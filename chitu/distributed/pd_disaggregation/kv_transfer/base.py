@@ -152,7 +152,7 @@ class KVManagerBase:
         return info
 
     def _remove_info(self, req_id: str):
-        self._task_infos.pop(req_id)
+        self._task_infos.pop(req_id, None)
 
     def _trace(
         self,
