@@ -410,6 +410,8 @@ class Transformer(nn.Module):
             ret += ["weight_scale", "weight_offset"]
         elif quant == "blockint4":
             ret += ["qweight", "scales"]
+        elif quant == "hygon_w4a8":
+            ret += ["weight_scale"]
         return ret
 
     def _get_2d_in_x_out_tensor_names(self, quant) -> list[str]:
