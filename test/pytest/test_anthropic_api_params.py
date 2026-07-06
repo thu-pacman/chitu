@@ -688,10 +688,16 @@ class TestParseApiKeyFromHeaders:
     def test_missing_headers_returns_empty_string(self):
         assert parse_api_key_from_headers(None, None) == ""
 
-    def test_bearer_without_space_is_accepted_as_empty_key(self):
+    def test_empty_authorization_returns_empty_string(self):
+        assert parse_api_key_from_headers("", None) == ""
+
+    def test_whitespace_authorization_returns_empty_string(self):
+        assert parse_api_key_from_headers("   ", None) == ""
+
+    def test_bearer_without_space_is_ignored(self):
         assert parse_api_key_from_headers("Bearer", None) == ""
 
-    def test_bearer_with_trailing_space_is_accepted_as_empty_key(self):
+    def test_bearer_with_trailing_space_returns_empty(self):
         assert parse_api_key_from_headers("Bearer ", None) == ""
 
     def test_bearer_token_is_extracted(self):
@@ -700,6 +706,32 @@ class TestParseApiKeyFromHeaders:
     def test_bearer_without_space_before_token_is_accepted(self):
         assert parse_api_key_from_headers("Bearerabc", None) == "abc"
 
-    def test_non_bearer_scheme_raises(self):
-        with pytest.raises(HTTPException, match="must start with 'Bearer'"):
-            parse_api_key_from_headers("Basic abc", None)
+    def test_bearer_case_insensitive(self):
+        assert parse_api_key_from_headers("bEaReR abc", None) == "abc"
+
+    def test_multiple_spaces_between_bearer_and_token(self):
+        assert parse_api_key_from_headers("Bearer    abc", None) == "abc"
+
+    def test_token_with_leading_trailing_spaces(self):
+        assert parse_api_key_from_headers("Bearer   abc   ", None) == "abc"
+
+    def test_token_with_internal_spaces(self):
+        assert parse_api_key_from_headers("Bearer abc def", None) == "abc def"
+
+    def test_non_bearer_scheme_returns_empty(self):
+        assert parse_api_key_from_headers("Basic abc", None) == ""
+
+    def test_authorization_without_scheme_returns_empty(self):
+        assert parse_api_key_from_headers("12345678", None) == ""
+
+    def test_bearer_with_newlines_and_tabs(self):
+        assert parse_api_key_from_headers("\tBearer abc\n", None) == "abc"
+
+    def test_unicode_token(self):
+        assert parse_api_key_from_headers("Bearer 你好abc", None) == "你好abc"
+
+    def test_x_api_key_overrides_invalid_bearer(self):
+        assert parse_api_key_from_headers("Basic abc", "x-key") == "x-key"
+
+    def test_x_api_key_overrides_even_empty_bearer(self):
+        assert parse_api_key_from_headers("Bearer", "x-key") == "x-key"
