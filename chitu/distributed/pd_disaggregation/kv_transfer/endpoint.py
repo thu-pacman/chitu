@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import os
 import threading
 import zmq
 
@@ -75,17 +76,28 @@ class KVManagerEndpoint:
     def relay_thread(self):
         try:
             zmq.proxy(self._relay_socket, self._pub_socket)
-        except:
-            logger.exception(f"{self.role}:{self.name} relay_thread exception")
+        except Exception:
+            logger.exception(
+                f"{self.role}:{self.name} relay_thread fatal error, exiting process"
+            )
+            os._exit(1)
 
     def recv_thread(self, handler):
         while True:
             try:
                 raw = self.socket.recv()
+            except Exception:
+                logger.exception(
+                    f"{self.role}:{self.name} recv_thread socket error, exiting process"
+                )
+                os._exit(1)
+            try:
                 handler(raw)
-                pass
-            except:
-                logger.exception(f"{self.role}:{self.name} recv_thread exception")
+            except Exception:
+                logger.exception(
+                    f"{self.role}:{self.name} recv_thread handler error, exiting process"
+                )
+                os._exit(1)
 
     def send(self, data: bytes):
         return self.send_socket.send(data)

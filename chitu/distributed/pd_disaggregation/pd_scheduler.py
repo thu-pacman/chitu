@@ -10,6 +10,7 @@ PD disaggregation Scheduler
 - Decode-only：只做 decode 计算；KV pull 与首 token 处理由 KV hook 触发。
 """
 
+import os
 import time
 import threading
 import math
@@ -561,11 +562,15 @@ class PrefillOnlyManager(PDInstanceRequestManager):
         # 这里用一个后台轮询线程，确保即使 TaskPool 为空也能及时promote
         def _bootstrap_poller_loop() -> None:
             while True:
-                self._bootstrap_check_and_promote(
-                    max_check=self.prefill_num_tasks * 2,
-                    max_promote=self.prefill_num_tasks,
-                )
-                time.sleep(self._bootstrap_poll_interval_s)
+                try:
+                    self._bootstrap_check_and_promote(
+                        max_check=self.prefill_num_tasks * 2,
+                        max_promote=self.prefill_num_tasks,
+                    )
+                    time.sleep(self._bootstrap_poll_interval_s)
+                except Exception:
+                    logger.exception("bootstrap_poller fatal error, exiting process")
+                    os._exit(1)
 
         threading.Thread(target=_bootstrap_poller_loop, daemon=True).start()
 
@@ -777,12 +782,16 @@ class DecodeOnlyManager(PDInstanceRequestManager):
 
         def _decode_wait_poller() -> None:
             while True:
-                # 独立于 TaskPool/schedule() 的轮询：即使 TaskPool 为空也要推进 waiting->ready
-                self._decode_check_and_promote(
-                    max_check=self._decode_prealloc_max_pending * 2,
-                    max_promote=self._decode_prealloc_max_pending,
-                )
-                time.sleep(self._decode_prealloc_poll_interval_s)
+                try:
+                    # 独立于 TaskPool/schedule() 的轮询：即使 TaskPool 为空也要推进 waiting->ready
+                    self._decode_check_and_promote(
+                        max_check=self._decode_prealloc_max_pending * 2,
+                        max_promote=self._decode_prealloc_max_pending,
+                    )
+                    time.sleep(self._decode_prealloc_poll_interval_s)
+                except Exception:
+                    logger.exception("decode_wait_poller fatal error, exiting process")
+                    os._exit(1)
 
         threading.Thread(target=_decode_wait_poller, daemon=True).start()
 

@@ -239,9 +239,16 @@ class MooncakeBootstrapServer:
             self._started.set()
             self._loop.run_forever()
         except BaseException as exc:
-            self._startup_error = exc
-            self._started.set()
-            raise
+            if not self._started.is_set():
+                # Startup error: propagate to caller via start_in_background
+                self._startup_error = exc
+                self._started.set()
+                raise
+            # Runtime error after successful startup: fail-fast
+            logger.exception(
+                "Mooncake Bootstrap HTTP server runtime error, exiting process"
+            )
+            os._exit(1)
 
     def start_in_background(self):
         t = threading.Thread(target=self._run_server, daemon=True)

@@ -12,6 +12,7 @@ PD disaggregation Service
 
 import asyncio
 import logging
+import os
 from typing import Optional, Tuple
 import threading
 
@@ -468,7 +469,11 @@ def init_pd_scheduler(args, rank: int = 0):
     service.external_compute_loop = True
 
     def _run_service():
-        asyncio.run(_run_existing_service_async(service))
+        try:
+            asyncio.run(_run_existing_service_async(service))
+        except Exception:
+            logger.exception("PD scheduler service fatal error, exiting process")
+            os._exit(1)
 
     threading.Thread(target=_run_service, daemon=True).start()
     ready_event.wait()

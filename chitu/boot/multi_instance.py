@@ -181,6 +181,7 @@ def launch_multi_instance_on_node(
     coordinator_port: int,
 ) -> None:
     errors: list[Exception] = []
+    procs: list = []  # shared registry of subprocess handles for fail-fast termination
     launch = catch_into_errors(errors, local_run_callback)
 
     router_thread = None
@@ -209,6 +210,7 @@ def launch_multi_instance_on_node(
                 "is_master_node": True,
                 "torchrun_n_nodes": 1,
                 "torchrun_nproc_per_node": 1,
+                "_proc_registry": procs,
             },
             daemon=True,
         )
@@ -244,16 +246,47 @@ def launch_multi_instance_on_node(
                 "is_master_node": inst_node_rank == 0,
                 "torchrun_n_nodes": instance_plan.nnodes,
                 "torchrun_nproc_per_node": instance_plan.nproc_per_node,
+                "_proc_registry": procs,
             },
         )
         thread.start()
         instance_threads.append(thread)
 
-    for thread in instance_threads:
-        thread.join()
+    # Poll threads so we can terminate siblings when any instance fails.
+    alive = list(instance_threads)
+    while alive:
+        for t in list(alive):
+            t.join(timeout=1.0)
+            if not t.is_alive():
+                alive.remove(t)
+        if errors:
+            for p in procs:
+                if p.poll() is None:
+                    try:
+                        p.terminate()
+                    except ProcessLookupError:
+                        pass
+            # Wait up to 30 s for graceful shutdown, then force-kill.
+            import time
+
+            deadline = time.monotonic() + 30
+            pending = [p for p in procs if p.poll() is None]
+            while pending and time.monotonic() < deadline:
+                time.sleep(0.5)
+                pending = [p for p in pending if p.poll() is None]
+            for p in pending:
+                try:
+                    p.kill()
+                except ProcessLookupError:
+                    pass
+            break
+
+    for t in instance_threads:
+        t.join(timeout=10)
+
     if errors:
         raise errors[0]
-    if router_thread is not None:
+    if router_thread is not None and not errors:
         router_thread.join()
 
 

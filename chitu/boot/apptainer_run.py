@@ -37,6 +37,7 @@ def apptainer_run(
     is_master_node,
     torchrun_n_nodes,
     torchrun_nproc_per_node,
+    _proc_registry=None,
 ):
     n_nodes = int(torchrun_n_nodes)
     nproc_per_node = int(torchrun_nproc_per_node)
@@ -78,9 +79,14 @@ def apptainer_run(
         ib_mount_args += ["-B", "/sbin/ibdev2netdev:/sbin/ibdev2netdev"]
         logger.info("Adding /sbin/ibdev2netdev to mounts")
 
-    image_file = os.path.join(appdir, "usr/share/chitu/image.sif")
-    if not os.path.isfile(image_file):
-        raise RuntimeError(f"bundled image file not found at {image_file}")
+    if cfg.boot.container_image is not None:
+        image_file = cfg.boot.container_image
+        if not os.path.isfile(image_file):
+            raise RuntimeError(f"boot.container_image does not exist: {image_file}")
+    else:
+        image_file = os.path.join(appdir, "usr/share/chitu/image.sif")
+        if not os.path.isfile(image_file):
+            raise RuntimeError(f"bundled image file not found at {image_file}")
 
     apptainer_cmd = [
         "apptainer",
@@ -100,6 +106,13 @@ def apptainer_run(
     apptainer_cmd += ib_mount_args
     apptainer_cmd += ib_env_args
     apptainer_cmd += apptainer_args
+    if cfg.boot.source_path is not None:
+        apptainer_cmd += [
+            "-B",
+            f"{cfg.boot.source_path}:/workspace/chitu",
+            "--env",
+            "PYTHONPATH=/workspace/chitu",
+        ]
     apptainer_cmd += [image_file]
 
     service_apptainer_cmd = copy.copy(apptainer_cmd)
@@ -155,9 +168,14 @@ def apptainer_run(
         on_ready_thread.start()
 
     logger.info(f"Running: {service_apptainer_cmd}")
-    subprocess.run(service_apptainer_cmd, check=True)
+    proc = subprocess.Popen(service_apptainer_cmd)
+    if _proc_registry is not None:
+        _proc_registry.append(proc)
+    ret = proc.wait()
+    if ret != 0:
+        raise subprocess.CalledProcessError(ret, service_apptainer_cmd)
 
-    if on_ready_thread is not None:
+    if on_ready_thread is not None and ret == 0:
         on_ready_thread.join()
     if on_ready_error:
         raise on_ready_error[0]

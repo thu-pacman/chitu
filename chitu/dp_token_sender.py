@@ -105,9 +105,11 @@ class DPTokenSender:
                     except zmq.Again:
                         # Socket full, use blocking send
                         self.socket.send(data, flags=0)
-                except Exception as e:
-                    logger.error(f"DPTokenSender sender thread error: {e}")
-                    time.sleep(0.01)
+                except Exception:
+                    logger.exception(
+                        "DPTokenSender sender thread fatal error, exiting process"
+                    )
+                    os._exit(1)
 
         self._sender_thread = threading.Thread(target=_loop, daemon=True)
         self._sender_thread.start()

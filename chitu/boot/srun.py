@@ -6,6 +6,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 from logging import getLogger
 
 from chitu.boot.appimage_utils import appimage
@@ -101,7 +102,10 @@ def srun(cfg, raw_argv, local_run_callback):
         # invocation. The internal re-exec marker is passed via the
         # CHITU_BOOT_IS_IN_NODE environment variable so it takes the
         # apptainer branch.
-        cmd = ["srun"] + full_srun_args + [appimage] + raw_argv[1:]
+        reexec = [appimage]
+        if appimage == "SOURCE":
+            reexec = [sys.executable, "-m", "chitu.boot.main"]
+        cmd = ["srun"] + full_srun_args + reexec + raw_argv[1:]
         env = dict(os.environ)
         env["CHITU_BOOT_IS_IN_NODE"] = "1"
         logger.info(f"Running: {cmd}")
