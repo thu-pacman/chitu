@@ -405,8 +405,6 @@ class Transformer(nn.Module):
         elif quant == "w8a8_per_token_per_channel_dyn" and quant_kwargs.get(
             "weight_scale_has_singleton_last_dim", False
         ):
-            ret += ["weight_scale"]
-        elif quant == "w8a8_dynamic":
             ret += ["weight_scale", "weight_offset"]
         elif quant == "blockint4":
             ret += ["qweight", "scales"]

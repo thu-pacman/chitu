@@ -176,7 +176,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         dp_local_bs = topk_weights.shape[0]
 
         dispatch_use_fp8 = False
-        dispatch_use_int8 = may_fuse_quant == "w8a8_dynamic"
+        dispatch_use_int8 = may_fuse_quant == "w8a8_per_token_per_channel_dyn"
         round_scale_to_pow2 = False
         if (
             may_fuse_quant == "blockfp8"
@@ -251,7 +251,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                 PerExpertDenseBatchedRoutedActivationWithScaleMinimal(
                     activation_per_expert=recv_activation,
                     activation_scale_per_expert=recv_activation_scale,
-                    quant_method="w8a8_dynamic",
+                    quant_method="w8a8_per_token_per_channel_dyn",
                     output_dtype=x.activation.dtype,
                     # NOTE on expected_n_tokens_per_expert: Although the estimation here is based
                     # on information per DP rank and not global, we have to use it because our

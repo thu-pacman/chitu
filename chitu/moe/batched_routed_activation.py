@@ -19,8 +19,8 @@ from chitu.ops.batched_routed_activation import (
 )
 
 # Scale tensors keep one scale row per routed token. The trailing scale dimension
-# is hidden_size // quant_block_size for blockfp8 and 1 for w8a8_dynamic.
-RoutedActivationQuantMethod = Literal["blockfp8", "w8a8_dynamic"]
+# is hidden_size // quant_block_size for blockfp8 and 1 for w8a8_per_token_per_channel_dyn.
+RoutedActivationQuantMethod = Literal["blockfp8", "w8a8_per_token_per_channel_dyn"]
 
 
 def _compute_padded_per_expert_counts(
@@ -681,7 +681,7 @@ class PerExpertDenseBatchedRoutedActivationWithScaleMinimal(
 ):
     activation_scale_per_expert: (
         torch.Tensor
-    )  # e.g. blockfp8 [..., hidden_size // quant_block_size], w8a8_dynamic [..., 1]
+    )  # e.g. blockfp8 [..., hidden_size // quant_block_size], w8a8_per_token_per_channel_dyn [..., 1]
 
     _: dataclasses.KW_ONLY
 

@@ -27,15 +27,14 @@ from chitu.quantization.llmint8 import LLMInt8Linear
 from chitu.quantization.autoawq import AutoAWQLinear
 from chitu.quantization.gptqmodel import GPTQLinear
 from chitu.quantization.blockint4 import BlockInt4MoeExpertsUnmerged
-from chitu.quantization.hygon_w8a8 import (
-    HygonW8A8Linear,
-    HygonW8A8AiterMoeExpertsMerged,
-    W8A8MoeExpertsMergedHygonLightop,
-)
 from chitu.quantization.w8a8_per_token_per_channel_dyn import (
     W8A8PerTokenPerChannelDynLinear,
     AscendW8A8PerTokenPerChannelDynLinear,
     AscendW8A8PerTokenPerChannelDynMoeExperts,
+    HygonW8A8PerTokenPerChannelDynLinear,
+    HygonAiterW8A8PerTokenPerChannelDynMoeExpertsMerged,
+    HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged,
+    HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged,
 )
 from chitu.quantization.simple_w8a8_muxi import W8A8MuxiLinear
 from chitu.quantization.w4a8_per_token_per_channel_asymm import (

@@ -12,7 +12,7 @@ import chitu.moe.batched_routed_activation as batched_routed_activation_mod
 import chitu.ops.moe_sum as moe_sum_mod
 from chitu.device_type import is_hygon
 from chitu.moe.batched_routed_activation import IndexedBatchedRoutedActivation
-import chitu.quantization.hygon_w8a8 as hygon_w8a8
+import chitu.quantization.w8a8_per_token_per_channel_dyn as w8a8_per_token_per_channel_dyn
 
 pytestmark = pytest.mark.skipif(not is_hygon(), reason="requires Hygon platform")
 
@@ -57,14 +57,14 @@ def test_hygon_deepgemm_moe_contiguous_forward_matches_reference(monkeypatch):
                 scale = w_scale[expert_id].to(torch.float32).view(-1, 1)
                 out[row_idx].copy_(a_fp[row_idx] @ (weight * scale).t())
 
-    monkeypatch.setattr(hygon_w8a8, "is_hygon", lambda: True)
-    monkeypatch.setattr(hygon_w8a8, "has_deepgemm", True)
-    monkeypatch.setattr(hygon_w8a8, "deepgemm", _FakeDeepGemm())
-    monkeypatch.setattr(hygon_w8a8, "has_lightop", False)
-    monkeypatch.setattr(hygon_w8a8, "lightop", SimpleNamespace())
-    monkeypatch.setattr(hygon_w8a8, "_DEEPGEMM_MOE_BLOCK_SIZE", 2)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_deepgemm", True)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "deepgemm", _FakeDeepGemm())
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_lightop", False)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "lightop", SimpleNamespace())
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "_DEEPGEMM_MOE_BLOCK_SIZE", 2)
     monkeypatch.setattr(
-        hygon_w8a8,
+        w8a8_per_token_per_channel_dyn,
         "a8_per_token_act_quant",
         lambda x, scale_dtype=torch.float32: (
             x.to(torch.int8).contiguous(),
@@ -72,7 +72,7 @@ def test_hygon_deepgemm_moe_contiguous_forward_matches_reference(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        hygon_w8a8,
+        w8a8_per_token_per_channel_dyn,
         "silu_and_mul",
         lambda x, *, swiglu_limit=None: (
             torch.nn.functional.silu(x[..., : x.shape[-1] // 2])
@@ -114,12 +114,12 @@ def test_hygon_deepgemm_moe_contiguous_forward_matches_reference(monkeypatch):
         )
 
     monkeypatch.setattr(
-        hygon_w8a8.IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
+        w8a8_per_token_per_channel_dyn.IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
         "convert_from",
         classmethod(_fake_padded_convert_from),
     )
     monkeypatch.setattr(
-        hygon_w8a8.ExpertBlockPermutedBatchedRoutedActivationWithScale,
+        w8a8_per_token_per_channel_dyn.ExpertBlockPermutedBatchedRoutedActivationWithScale,
         "convert_from",
         classmethod(_fake_blocked_convert_from),
     )
@@ -134,7 +134,7 @@ def test_hygon_deepgemm_moe_contiguous_forward_matches_reference(monkeypatch):
         _ref_moe_sum_expert_block_permuted,
     )
 
-    module = hygon_w8a8.HygonW8A8DeepGemmMoeExpertsMerged(
+    module = w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
         dim=4,
         moe_inter_dim=2,
         global_n_experts=4,
@@ -277,12 +277,12 @@ def test_hygon_deepgemm_moe_forward_no_sum_pads_small_masked_layout(monkeypatch)
             )
             out.zero_()
 
-    monkeypatch.setattr(hygon_w8a8, "is_hygon", lambda: True)
-    monkeypatch.setattr(hygon_w8a8, "has_deepgemm", True)
-    monkeypatch.setattr(hygon_w8a8, "deepgemm", _FakeDeepGemm())
-    monkeypatch.setattr(hygon_w8a8, "has_lightop", False)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_deepgemm", True)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "deepgemm", _FakeDeepGemm())
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_lightop", False)
     monkeypatch.setattr(
-        hygon_w8a8,
+        w8a8_per_token_per_channel_dyn,
         "a8_per_token_act_quant",
         lambda x, scale_dtype=torch.float32: (
             torch.zeros_like(x, dtype=torch.int8),
@@ -290,12 +290,12 @@ def test_hygon_deepgemm_moe_forward_no_sum_pads_small_masked_layout(monkeypatch)
         ),
     )
     monkeypatch.setattr(
-        hygon_w8a8,
+        w8a8_per_token_per_channel_dyn,
         "silu_and_mul",
         lambda x, *, swiglu_limit=None: x[..., : x.shape[-1] // 2].contiguous(),
     )
 
-    module = hygon_w8a8.HygonW8A8DeepGemmMoeExpertsMerged(
+    module = w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
         dim=16,
         moe_inter_dim=16,
         global_n_experts=2,
@@ -304,11 +304,15 @@ def test_hygon_deepgemm_moe_forward_no_sum_pads_small_masked_layout(monkeypatch)
         n_activated_experts=2,
         checkpoint_prefix="",
     )
-    gate_up_native = hygon_w8a8.HygonDeepGemmW8A8MarlinWeight.convert_from(
-        module.gate_up_proj_weight.data.clone()
+    gate_up_native = (
+        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8MarlinWeight.convert_from(
+            module.gate_up_proj_weight.data.clone()
+        )
     )
-    down_native = hygon_w8a8.HygonDeepGemmW8A8MarlinWeight.convert_from(
-        module.down_proj_weight.data.clone()
+    down_native = (
+        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8MarlinWeight.convert_from(
+            module.down_proj_weight.data.clone()
+        )
     )
     module.gate_up_proj_weight.data = gate_up_native.layout_tensor
     module.down_proj_weight.data = down_native.layout_tensor
@@ -369,11 +373,12 @@ def test_hygon_deepgemm_moe_masked_forward_no_sum_matches_reference(monkeypatch)
                 scale = w_scale[expert_id].to(torch.float32).view(-1, 1)
                 out[expert_id].copy_(a_fp[expert_id] @ (weight * scale).t())
 
-    monkeypatch.setattr(hygon_w8a8, "is_hygon", lambda: True)
-    monkeypatch.setattr(hygon_w8a8, "has_deepgemm", True)
-    monkeypatch.setattr(hygon_w8a8, "deepgemm", _FakeDeepGemm())
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_deepgemm", True)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "deepgemm", _FakeDeepGemm())
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_lightop", False)
     monkeypatch.setattr(
-        hygon_w8a8,
+        w8a8_per_token_per_channel_dyn,
         "a8_per_token_act_quant",
         lambda x, scale_dtype=torch.float32: (
             x.to(torch.int8).contiguous(),
@@ -381,7 +386,7 @@ def test_hygon_deepgemm_moe_masked_forward_no_sum_matches_reference(monkeypatch)
         ),
     )
     monkeypatch.setattr(
-        hygon_w8a8,
+        w8a8_per_token_per_channel_dyn,
         "silu_and_mul",
         lambda x, *, swiglu_limit=None: (
             torch.nn.functional.silu(x[..., : x.shape[-1] // 2])
@@ -389,7 +394,7 @@ def test_hygon_deepgemm_moe_masked_forward_no_sum_matches_reference(monkeypatch)
         ),
     )
 
-    module = hygon_w8a8.HygonW8A8DeepGemmMoeExpertsMerged(
+    module = w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
         dim=4,
         moe_inter_dim=2,
         global_n_experts=2,
@@ -499,11 +504,11 @@ def test_hygon_lightop_forward_no_sum_accepts_withscale_w8a8(monkeypatch):
             w_fp = weight_t.to(torch.float32) * scale_b.to(torch.float32).view(1, -1)
             return True, a_fp @ w_fp
 
-    monkeypatch.setattr(hygon_w8a8, "is_hygon", lambda: True)
-    monkeypatch.setattr(hygon_w8a8, "has_lightop", True)
-    monkeypatch.setattr(hygon_w8a8, "lightop", _FakeLightop())
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_lightop", True)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "lightop", _FakeLightop())
     monkeypatch.setattr(
-        hygon_w8a8,
+        w8a8_per_token_per_channel_dyn,
         "a8_per_token_act_quant",
         lambda x, scale_dtype=torch.float32: (
             x.to(torch.int8).contiguous(),
@@ -511,7 +516,7 @@ def test_hygon_lightop_forward_no_sum_accepts_withscale_w8a8(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        hygon_w8a8,
+        w8a8_per_token_per_channel_dyn,
         "silu_and_mul",
         lambda x, *, swiglu_limit=None: (
             torch.nn.functional.silu(x[..., : x.shape[-1] // 2])
@@ -519,7 +524,7 @@ def test_hygon_lightop_forward_no_sum_accepts_withscale_w8a8(monkeypatch):
         ),
     )
 
-    module = hygon_w8a8.W8A8MoeExpertsMergedHygonLightop(
+    module = w8a8_per_token_per_channel_dyn.HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged(
         dim=4,
         moe_inter_dim=2,
         global_n_experts=2,
@@ -580,7 +585,7 @@ def test_hygon_lightop_forward_no_sum_accepts_withscale_w8a8(monkeypatch):
             dtype=torch.int8,
         ),
         activation_scale_per_expert=torch.ones((2, 3, 1), dtype=torch.float32),
-        quant_method="w8a8_dynamic",
+        quant_method="w8a8_per_token_per_channel_dyn",
         output_dtype=torch.float32,
         n_tokens_per_expert=torch.tensor([2, 1], dtype=torch.int32),
         expected_n_tokens_per_expert=3,
@@ -612,9 +617,9 @@ def test_hygon_lightop_forward_no_sum_accepts_withscale_w8a8(monkeypatch):
 
 
 def test_hygon_lightop_forward_no_sum_rejects_blockfp8_withscale(monkeypatch):
-    monkeypatch.setattr(hygon_w8a8, "is_hygon", lambda: True)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
 
-    module = hygon_w8a8.W8A8MoeExpertsMergedHygonLightop(
+    module = w8a8_per_token_per_channel_dyn.HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged(
         dim=4,
         moe_inter_dim=2,
         global_n_experts=1,
@@ -633,7 +638,7 @@ def test_hygon_lightop_forward_no_sum_rejects_blockfp8_withscale(monkeypatch):
         expert_ids_are_local=True,
     )
 
-    with pytest.raises(NotImplementedError, match="w8a8_dynamic"):
+    with pytest.raises(NotImplementedError, match="w8a8_per_token_per_channel_dyn"):
         module.forward_no_sum(routed_x)
 
 
@@ -655,11 +660,11 @@ def test_hygon_deepgemm_contiguous_quantizes_intermediate_after_silu_mul(
             del a_pair, w_pair, m_indices, cfg
             out.zero_()
 
-    monkeypatch.setattr(hygon_w8a8, "is_hygon", lambda: True)
-    monkeypatch.setattr(hygon_w8a8, "has_deepgemm", True)
-    monkeypatch.setattr(hygon_w8a8, "deepgemm", _FakeDeepGemm())
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_deepgemm", True)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "deepgemm", _FakeDeepGemm())
     monkeypatch.setattr(
-        hygon_w8a8,
+        w8a8_per_token_per_channel_dyn,
         "a8_per_token_act_quant",
         lambda x, scale_dtype=torch.float32: (
             quant_calls.append(tuple(x.shape))
@@ -670,7 +675,7 @@ def test_hygon_deepgemm_contiguous_quantizes_intermediate_after_silu_mul(
         ),
     )
     monkeypatch.setattr(
-        hygon_w8a8,
+        w8a8_per_token_per_channel_dyn,
         "silu_and_mul",
         lambda x, *, swiglu_limit=None: (
             silu_calls.append(tuple(x.shape)) or x[..., : x.shape[-1] // 2].contiguous()
@@ -703,12 +708,12 @@ def test_hygon_deepgemm_contiguous_quantizes_intermediate_after_silu_mul(
         )
 
     monkeypatch.setattr(
-        hygon_w8a8.IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
+        w8a8_per_token_per_channel_dyn.IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt,
         "convert_from",
         classmethod(_fake_padded_convert_from),
     )
     monkeypatch.setattr(
-        hygon_w8a8.ExpertBlockPermutedBatchedRoutedActivationWithScale,
+        w8a8_per_token_per_channel_dyn.ExpertBlockPermutedBatchedRoutedActivationWithScale,
         "convert_from",
         classmethod(_fake_blocked_convert_from),
     )
@@ -723,7 +728,7 @@ def test_hygon_deepgemm_contiguous_quantizes_intermediate_after_silu_mul(
         _ref_moe_sum_expert_block_permuted,
     )
 
-    module = hygon_w8a8.HygonW8A8DeepGemmMoeExpertsMerged(
+    module = w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
         dim=4,
         moe_inter_dim=2,
         global_n_experts=2,
@@ -830,17 +835,21 @@ def test_hygon_aiter_moe_forward_matches_reference(monkeypatch):
                     )
             return ref.to(output_dtype)
 
-    monkeypatch.setattr(hygon_w8a8, "is_hygon", lambda: True)
-    monkeypatch.setattr(hygon_w8a8, "has_aiter", True)
-    monkeypatch.setattr(hygon_w8a8, "aiter", _FakeAiter())
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_aiter", True)
+    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "aiter", _FakeAiter())
     monkeypatch.setattr(
-        hygon_w8a8.AiterMoeCInt8Gemm1Weight, "check_tensor", lambda tensor: True
+        w8a8_per_token_per_channel_dyn.AiterMoeCInt8Gemm1Weight,
+        "check_tensor",
+        lambda tensor: True,
     )
     monkeypatch.setattr(
-        hygon_w8a8.AiterMoeCInt8Gemm2Weight, "check_tensor", lambda tensor: True
+        w8a8_per_token_per_channel_dyn.AiterMoeCInt8Gemm2Weight,
+        "check_tensor",
+        lambda tensor: True,
     )
 
-    module = hygon_w8a8.HygonW8A8AiterMoeExpertsMerged(
+    module = w8a8_per_token_per_channel_dyn.HygonAiterW8A8PerTokenPerChannelDynMoeExpertsMerged(
         dim=256,
         moe_inter_dim=64,
         global_n_experts=2,
@@ -932,14 +941,18 @@ def test_hygon_aiter_moe_forward_matches_reference(monkeypatch):
 
 
 def test_hygon_deepgemm_moe_shape_validation_accepts_packed_weights_with_empty_activation():
-    gate_up_native = hygon_w8a8.HygonDeepGemmW8A8MarlinWeight.convert_from(
-        torch.zeros((2, 32, 16), dtype=torch.int8)
+    gate_up_native = (
+        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8MarlinWeight.convert_from(
+            torch.zeros((2, 32, 16), dtype=torch.int8)
+        )
     )
-    down_native = hygon_w8a8.HygonDeepGemmW8A8MarlinWeight.convert_from(
-        torch.zeros((2, 16, 16), dtype=torch.int8)
+    down_native = (
+        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8MarlinWeight.convert_from(
+            torch.zeros((2, 16, 16), dtype=torch.int8)
+        )
     )
 
-    e, n1, k1, n2, k2 = hygon_w8a8._validate_indexed_moe_shapes(
+    e, n1, k1, n2, k2 = w8a8_per_token_per_channel_dyn._validate_indexed_moe_shapes(
         label="DeepGEMM masked MoE",
         activation=torch.empty((0, 16), dtype=torch.bfloat16),
         w1=gate_up_native.layout_tensor,

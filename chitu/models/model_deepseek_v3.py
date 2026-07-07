@@ -1876,10 +1876,10 @@ class TransformerDeepSeekV3(Transformer):
                 o_proj_quant = get_quant_from_checkpoint_prefix(
                     prefix + "o_proj.weight", self.params.quant_config.rules
                 )
-                if "w8a8_dynamic" in (q_b_proj_quant, o_proj_quant):
+                if "w8a8_per_token_per_channel_dyn" in (q_b_proj_quant, o_proj_quant):
                     raise NotImplementedError(
                         "infer.mla_absorb=absorb is not implemented for "
-                        "w8a8_dynamic q_b_proj/o_proj weights. Use "
+                        "w8a8_per_token_per_channel_dyn q_b_proj/o_proj weights. Use "
                         "infer.mla_absorb=absorb-without-precomp."
                     )
                 assert prefix + "kv_b_proj.weight" in checkpoint

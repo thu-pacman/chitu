@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Compressed-tensors W8A8 (per-channel weight + per-token dynamic activation)
-# checkpoint for GLM-5 / GLM-5.1 on Ascend NPU.
+# checkpoint for GLM-5.x.
 #
 # - All quantized linears use the bf16 `weight_scale` of shape (out, 1) in 
 # the checkpoint.
@@ -16,15 +16,11 @@ quant:
   rules:
     - regex: 'kv_b_proj'
       type: null
-    - regex: '\.self_attn'
+    - regex: '(\.self_attn|\.mlp\.(shared_experts\.)?(gate_proj|gate_up_proj|up_proj|down_proj))'
       type: w8a8_per_token_per_channel_dyn
       kwargs:
         weight_scale_has_singleton_last_dim: True
-    - regex: '\.mlp\.(shared_experts\.|experts\.|moe)'
-      type: w8a8_per_token_per_channel_dyn
-      kwargs:
-        weight_scale_has_singleton_last_dim: True
-    - regex: '\.mlp\.(gate_proj|gate_up_proj|up_proj|down_proj)'
+    - regex: '\.mlp\.(moe|experts)'
       type: w8a8_per_token_per_channel_dyn
       kwargs:
         weight_scale_has_singleton_last_dim: True
