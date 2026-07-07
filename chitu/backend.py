@@ -115,6 +115,7 @@ class Backend:
 
     # components
     schedulers: Optional[list["Scheduler"]] = None  # One per each DP rank
+    schedule_task_type_order = None
     cache_managers: Optional[list[dict[str, "KVCacheManagerBase"]]] = (
         None  # One per each DP rank
     )

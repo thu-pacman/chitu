@@ -92,6 +92,19 @@ def get_last_step_task_type() -> Optional[TaskType]:
     return _last_step_task_type
 
 
+def _infer_schedule_task_type_order(scheduler_type: str) -> tuple[TaskType, ...]:
+    scheduler_type_parts = {
+        part.strip().lower() for part in str(scheduler_type).split(",") if part.strip()
+    }
+    has_prefill_only = "prefill_only" in scheduler_type_parts
+    has_decode_only = "decode_only" in scheduler_type_parts
+    if has_decode_only and not has_prefill_only:
+        return (TaskType.Decode,)
+    if has_prefill_only and not has_decode_only:
+        return (TaskType.Prefill,)
+    return (TaskType.Prefill, TaskType.Decode)
+
+
 def init_logger():
     setup_chitu_logging()
 
@@ -1235,6 +1248,9 @@ def chitu_init(args):
                 Scheduler.build(args.scheduler, args.infer, dp_rank=i)
                 for i in range(args.infer.dp_size)
             ]
+            Backend.schedule_task_type_order = _infer_schedule_task_type_order(
+                args.scheduler.type
+            )
         executor = Executor.build(args)
         Backend.executor = executor
         PackedTasks.configure(max_num_tasks=args.infer.max_batch_size)
@@ -1363,6 +1379,32 @@ def _update_tasks_preferred_dp_rank():
             projected_running_tasks_per_dp[best_dp_rank] += 1
 
 
+def _collect_ready_task_ids_by_dp(task_type: TaskType) -> list[list[str]]:
+    dp_size = int(Backend.args.infer.dp_size)
+    task_ids_by_dp: list[list[str]] = [[] for _ in range(dp_size)]
+
+    for task_id in TaskPool.id_list:
+        task = TaskPool.pool.get(task_id)
+        if task is None or task.task_type != task_type or not task.can_schedule():
+            continue
+
+        dp_rank = task.dp_rank
+        if dp_rank is None:
+            dp_rank = task.preferred_dp_rank
+
+        # A schedulable task should have a DP owner by this point: prefill tasks
+        # get preferred_dp_rank from _update_tasks_preferred_dp_rank() before
+        # collection, and decode tasks keep the dp_rank assigned by the scheduler
+        # or by the PD decode queue before entering TaskPool.
+        assert dp_rank is not None, f"Task {task_id} has no DP assignment"
+
+        dp_rank = int(dp_rank)
+        if 0 <= dp_rank < dp_size:
+            task_ids_by_dp[dp_rank].append(task_id)
+
+    return task_ids_by_dp
+
+
 @torch.inference_mode()
 def chitu_run_main_rank():
     # 1. Schedule
@@ -1373,14 +1415,23 @@ def chitu_run_main_rank():
         assert len(Backend.schedulers) == 1
         task_ids = Backend.schedulers[0].schedule()
     else:
-        _update_tasks_preferred_dp_rank()  # 按击中率和负载均衡路由
+        schedule_task_type_order = Backend.schedule_task_type_order or (
+            TaskType.Prefill,
+            TaskType.Decode,
+        )
+        if TaskType.Prefill in schedule_task_type_order:
+            _update_tasks_preferred_dp_rank()  # Update DP preference for prefill.
 
         # New prefill tasks are routed by DP preference assignment above.
         id_and_scheduler_list = list(enumerate(Backend.schedulers))
         task_ids_list = [[]] * len(id_and_scheduler_list)
-        for task_type in (TaskType.Prefill, TaskType.Decode):
+        for task_type in schedule_task_type_order:
+            ready_task_ids_by_dp = _collect_ready_task_ids_by_dp(task_type)
             for i, scheduler in id_and_scheduler_list:
-                task_ids = scheduler.schedule(strict_allowed_task_type={task_type})
+                task_ids = scheduler.schedule(
+                    strict_allowed_task_type={task_type},
+                    ready_task_ids=ready_task_ids_by_dp[i],
+                )
                 task_ids_list[i] = task_ids
             if any((len(task_ids) > 0 for task_ids in task_ids_list)):
                 DPTaskCollector.prepare_dp_tasks(task_ids_list)

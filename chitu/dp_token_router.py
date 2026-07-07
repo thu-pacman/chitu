@@ -175,14 +175,6 @@ class TokenRouter:
             )
             return
 
-        # Safety check 3: timestamp validation (prevent replay attacks)
-        timestamp = token_data.get("timestamp", 0)
-        if timestamp > 0 and time.time() - timestamp > 30:  # 30 second timeout
-            logger.error(
-                f"Token Router: Received expired token, request_id={request_id}"
-            )
-            return
-
         # Process based on token type
         if token_data.get("type") == "token":
             # token contains decoded text
