@@ -55,7 +55,7 @@ class TransferPlan:
                 per_rank.remote_ptrs,
                 per_rank.lengths,
             )
-            assert batch_ids != 0, "batch_transfer_async_write failed"
+            assert batch_id != 0, "batch_transfer_async_write failed"
             batch_ids.append(batch_id)
         assert (
             engine.get_batch_transfer_status(batch_ids) == 0

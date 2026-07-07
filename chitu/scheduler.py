@@ -287,6 +287,9 @@ class Scheduler:
 
         num_cached_tokens = task.prefix_tokens_len
         for manager in list(self.cache_manager_dict.values()):
+            # Skip Cache that does not support prefix caching e.g. singleton
+            if not manager.enable_prefix_caching:
+                continue
             num_cached_tokens = min(
                 num_cached_tokens, manager.num_cached_blocks(task) * manager.block_size
             )
