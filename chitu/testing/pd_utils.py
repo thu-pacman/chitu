@@ -252,7 +252,13 @@ class PDTestRunner:
             await token_router.begin_termination()
 
         await self._router.terminate_instances()
-        await self._router.wait_for_instances_terminated()
+        drained = await self._router.wait_for_instances_terminated()
+        if not drained:
+            logger.error(
+                "[PD_TEST] graceful shutdown timed out — instances did not "
+                "terminate within the drain window"
+            )
+            self.num_failed += 1
 
         if token_router is not None:
             await token_router.shutdown()
