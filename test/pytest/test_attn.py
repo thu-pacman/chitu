@@ -1,8 +1,10 @@
+import os
 import torch
 import pytest
 import packaging.version
 from omegaconf import OmegaConf
 
+from chitu import global_vars
 from chitu.attn_backend import (
     RefAttnBackend,
     TritonAttnBackend,
@@ -13,8 +15,20 @@ from chitu.attn_backend import (
     NpuAttnBackend,
     HunyuanAttnBackend,
 )
-from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
+from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.kv_cache import (
+    DenseKVCacheAccessor,
+    GlobalLocalMap,
+    PagedKVCache,
+    PagedKVCacheAccessor,
+)
+from chitu.boot.tcp_ip import get_free_port
+from chitu.distributed.parallel_state import (
+    initialize_parallel_groups,
+    parallel_groups_initialized,
+)
 from chitu.global_vars import set_global_args
+from chitu.models.model_deepseek_v3 import AttentionDeepSeekV3
 from chitu.utils import (
     ceil_div,
     try_import_opt_dep,
@@ -3261,3 +3275,182 @@ def test_prefill_ragged_qo_paged_kv(
         # a large error after multiple runs.
         cos_sim_tol = 0.002
     assert_close(out, ref_out, atol=1e-2, rtol=1e-2, cos_sim_tol=cos_sim_tol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is missing")
+@pytest.mark.parametrize("chunk_lens", [(7,), (5, 6)])
+def test_reconstruct_prefill_matches_full_kv_attention(chunk_lens):
+    prev_default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+    torch.manual_seed(0)
+
+    device = "cuda"
+    n_heads = 2
+    kv_lora_rank = 16
+    qk_rope_head_dim = 8
+    qk_nope_head_dim = 8
+    v_head_dim = 8
+    q_lora_rank = 128
+    dim = 32
+    max_seq_len = sum(chunk_lens)
+    block_size = 4
+
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_reqs": 1,
+                    "max_batch_size": 1,
+                    "op_impl": "torch",
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "cache_type": "paged",
+                    "dp_size": 1,
+                    "pp_size": 1,
+                    "ep_size": 1,
+                    "pcp_size": 1,
+                    "mla_absorb": "absorb-kv-only",
+                    "max_seq_len": max_seq_len,
+                    "prefill_chunk_size": None,
+                    "mtp_size": 1,
+                    "enable_prefix_caching": False,
+                },
+                "models": {
+                    "n_heads": n_heads,
+                    "kv_lora_rank": kv_lora_rank,
+                    "qk_rope_head_dim": qk_rope_head_dim,
+                    "qk_nope_head_dim": qk_nope_head_dim,
+                    "v_head_dim": v_head_dim,
+                    "dim": dim,
+                    "q_lora_rank": q_lora_rank,
+                    "type": None,
+                    "index_topk": None,
+                    "quant_config": {"rules": []},
+                    "backend_config": {"rules": []},
+                },
+                "dtype": "float32",
+                "use_float32_rotary": False,
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    if global_vars._GLOBAL_TIMERS is None:
+        global_vars._set_timers()
+    if not torch.distributed.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", str(get_free_port()))
+        torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1)
+    if not parallel_groups_initialized():
+        initialize_parallel_groups(
+            tp_size=1, pp_size=1, dp_size=1, ep_size=1, etp_size=1
+        )
+
+    num_blocks = ceil_div(max_seq_len, block_size) + 1
+    latent_cache = PagedKVCache(
+        GlobalLocalMap.from_range(0, 1),
+        num_hot_req=1,
+        max_seq_len=max_seq_len,
+        shape_per_token_dict={"kv_lora_k_pe": (kv_lora_rank + qk_rope_head_dim,)},
+        block_size=block_size,
+        num_blocks=num_blocks,
+        quant_type="None",
+        device=device,
+    )
+    full_kv_cache = PagedKVCache(
+        GlobalLocalMap.from_range(0, 1),
+        num_hot_req=1,
+        max_seq_len=max_seq_len,
+        shape_per_token_dict={
+            "k": (n_heads, qk_nope_head_dim + qk_rope_head_dim),
+            "v": (n_heads, v_head_dim),
+        },
+        block_size=block_size,
+        num_blocks=num_blocks,
+        quant_type="None",
+        device=device,
+    )
+
+    attn_backend = RefAttnBackend(qk_nope_head_dim=qk_nope_head_dim)
+    model_args = OmegaConf.create(
+        {
+            "n_heads": n_heads,
+            "kv_lora_rank": kv_lora_rank,
+            "qk_rope_head_dim": qk_rope_head_dim,
+            "qk_nope_head_dim": qk_nope_head_dim,
+            "v_head_dim": v_head_dim,
+            "dim": dim,
+            "q_lora_rank": q_lora_rank,
+            "rope_theta": 10000.0,
+            "rope_factor": 1.0,
+            "index_topk": None,
+            "quant_config": {"rules": []},
+        }
+    )
+    attn = AttentionDeepSeekV3(
+        model_args,
+        layer_id=0,
+        cache=latent_cache,
+        attn_backend=attn_backend,
+        op_impl="torch",
+        mla_absorb="absorb-kv-only",
+        checkpoint_prefix="layers.0.self_attn",
+    ).to(device)
+    with torch.no_grad():
+        for param in attn.parameters():
+            if param.ndim == 1:
+                param.fill_(1.0)
+            else:
+                torch.nn.init.normal_(param, mean=0.0, std=0.02)
+
+    all_x = torch.randn(max_seq_len, dim, device=device)
+    all_freqs = BatchedFreqsCis(
+        cos=torch.randn(max_seq_len, qk_rope_head_dim // 2, device=device),
+        sin=torch.randn(max_seq_len, qk_rope_head_dim // 2, device=device),
+    )
+
+    class _PrefillTasks:
+        def __init__(self, chunk_len, block_ids):
+            self.task_ids = ["req"]
+            self.tokens = [list(range(chunk_len))]
+            self.inc_hit_tokens_list = []
+            self.new_cache_ids_list = [{"main": block_ids}]
+
+    prev_len = 0
+    for chunk_len in chunk_lens:
+        new_len = prev_len + chunk_len
+        block_ids = list(
+            range(ceil_div(prev_len, block_size), ceil_div(new_len, block_size))
+        )
+        tasks = _PrefillTasks(chunk_len, block_ids)
+        x = all_x[prev_len:new_len]
+        freqs_cis = BatchedFreqsCis(
+            cos=all_freqs.cos[prev_len:new_len],
+            sin=all_freqs.sin[prev_len:new_len],
+        )
+
+        full_kv_cache.prepare_cache_prefill(tasks)
+        n_tokens = x.size(0)
+        q, _, _, _, kv_lora, k_pe, _, _, _ = attn._project_mla_q_latent_kv(
+            x, freqs_cis, n_tokens
+        )
+        q = attn._as_plain_tensor(q)
+        k, v = attn._expand_latent_kv_to_full_kv(
+            kv_lora, k_pe, n_tokens, normalize=True
+        )
+        ref = attn_backend.prefill_ragged_qo_paged_kv(
+            q,
+            full_kv_cache.get_accessor(0),
+            k.contiguous(),
+            v.contiguous(),
+            seq_len_delta=full_kv_cache.seq_len_delta,
+            causal=True,
+            softmax_scale=attn.softmax_scale,
+        )
+        ref = attn.o_proj(ref.flatten(-2)).view(chunk_len, -1)
+
+        latent_cache.prepare_cache_prefill(tasks)
+        out = attn(x, freqs_cis)
+        assert_close(out, ref, atol=1e-4, rtol=1e-4)
+        prev_len = new_len
+    torch.set_default_dtype(prev_default_dtype)

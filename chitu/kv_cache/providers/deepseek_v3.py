@@ -108,7 +108,7 @@ def deepseek_v3_kv_cache_spec(args, attn_backend_type) -> KVCacheSpec:
 
     kvargs: dict[str, Any] = {}
 
-    if mla_absorb in ["absorb", "absorb-without-precomp"]:
+    if mla_absorb in ["absorb", "absorb-without-precomp", "absorb-kv-only"]:
         use_separated = attn_backend_type in [FlashInferBackend, TritonAttnBackend] or (
             attn_backend_type is NpuAttnBackend and args.infer.cache_type == "paged"
         )

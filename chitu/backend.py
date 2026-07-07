@@ -767,6 +767,25 @@ class Backend:
         ]:
             QuantizationRegistry._allowed_quant_for_merge_gate_up.append("blockfp4")
 
+        if (
+            args.infer.mla_absorb == "absorb-kv-only"
+            and args.scheduler.type == "decode_only"
+        ):
+            raise ValueError(
+                "infer.mla_absorb=absorb-kv-only is only valid for Prefill instances, "
+                f"but scheduler.type={args.scheduler.type}."
+            )
+
+        if args.infer.mla_absorb == "absorb-kv-only":
+            logger.warning(
+                "infer.mla_absorb=absorb-kv-only keeps the KV cache latent-only "
+                "and reconstructs full K/V (kv_b_proj over kv_lora + k_pe broadcast) "
+                "every prefill step. Per-layer cost: one extra kv_b_proj GEMM over "
+                "(current chunk + history) tokens. Cache layout stays latent-only "
+                "and has no PD impact. Decode-only instances should use "
+                "absorb-without-precomp instead."
+            )
+
         model_kwargs = dict(
             max_position_embeddings=args.infer.max_seq_len
             + (args.infer.mtp_size if args.infer.mtp_size > 1 else 0),

@@ -84,6 +84,20 @@ class ServeConfigRules(Callback):
                 f"op_impl must be one of [torch, muxi_custom_kernel, cpu], got {op_impl}"
             )
 
+        mla_absorb = config.infer.get("mla_absorb", "auto")
+        if mla_absorb not in {
+            "auto",
+            "none",
+            "absorb-without-precomp",
+            "absorb-kv-only",
+            "absorb",
+        }:
+            self._exit_with_error(
+                "mla_absorb must be one of "
+                "[auto, none, absorb-without-precomp, absorb-kv-only, absorb], "
+                f"got {mla_absorb}"
+            )
+
         bind_process_to_cpu = config.infer.bind_process_to_cpu
         if bind_process_to_cpu not in {
             "auto",

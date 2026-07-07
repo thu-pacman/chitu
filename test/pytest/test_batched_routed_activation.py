@@ -26,6 +26,13 @@ muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
 )
 
+if has_triton:
+    from chitu.ops.triton_ops.moe_sum import (
+        moe_sum_per_token_triton,
+    )
+else:
+    moe_sum_per_token_triton = None
+
 _I32_MAX = 2**31 - 1
 
 
@@ -353,6 +360,57 @@ def test_batched_routed_activation_blockfp8_large_token_count(
         block_size,
         sample_ids,
     )
+
+
+# ---------------------------------------------------------------------------
+# 分别对INT32 / INT64 路径测试
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "M, topk, N, expect_i64",
+    [
+        (1024, 8, 7168, False),
+        (49152, 8, 7168, True),
+    ],
+    ids=["int32_path", "int64_path"],
+)
+@pytest.mark.skipif(not has_triton, reason="triton is missing")
+def test_moe_sum_per_token_offset_type(M, topk, N, expect_i64):
+    """分别测试 moe_sum_per_token 的 INT32 和 INT64 index path
+
+    M=1024  时 M*topk*N = 58,720,256  < 2^31，走 INT32。
+    M=49152 时 M*topk*N = 2,818,572,288 > 2^31，走 INT64。
+    两种情况都应与 torch 实现一致
+    """
+    product = M * topk * N
+    assert (
+        product > _I32_MAX
+    ) == expect_i64, (
+        f"input size not expected: M*topk*N={product}, expect_i64={expect_i64}"
+    )
+
+    x = torch.randn(M, topk, N, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(M, topk, device="cuda", dtype=torch.float32).softmax(dim=-1)
+
+    out = moe_sum_per_token_triton(x, weights)
+    torch.cuda.synchronize()
+
+    assert out.shape == (M, N)
+    max_diff = 0.0
+    chunk_size = 1024
+    for start in range(0, M, chunk_size):
+        end = min(start + chunk_size, M)
+        ref = (
+            (x[start:end].float() * weights[start:end].unsqueeze(-1))
+            .sum(dim=1)
+            .to(x.dtype)
+        )
+        diff = (out[start:end].float() - ref.float()).abs().max().item()
+        max_diff = max(max_diff, diff)
+        assert torch.allclose(
+            out[start:end].float(), ref.float(), rtol=1e-2, atol=1e-2
+        ), f"max diff = {max_diff}"
 
 
 @pytest.mark.parametrize("num_experts", [256])

@@ -489,6 +489,7 @@ class TransformerKimiK25VL(TransformerDeepSeekV3):
         attn_backend: AttnBackend,
         op_impl: str,
         mla_absorb: str,
+        **kwargs,
     ):
         self.vision_config = getattr(params, "vision_config", None)
 
@@ -499,6 +500,7 @@ class TransformerKimiK25VL(TransformerDeepSeekV3):
             attn_backend=attn_backend,
             op_impl=op_impl,
             mla_absorb=mla_absorb,
+            **kwargs,
         )
 
         # Vision tower lives only on PP stage 0 (same stage as embed_tokens).
