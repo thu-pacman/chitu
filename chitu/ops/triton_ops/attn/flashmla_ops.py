@@ -729,4 +729,200 @@ def convert_req_index_to_global_ragged_index_triton(
     return out
 
 
+@triton.jit
+def _fused_append_and_convert_paged_kv_cache_kernel(
+    # Append inputs: scatter KV to paged cache
+    kv_cache_ptr,  # (num_pages, page_size, D)
+    page_table_ptr,  # (batch_size, num_pages_per_sample) -- also serves as block_table
+    this_kv_ptr,  # (num_tokens, D)
+    delta_position_ids_ptr,  # (num_tokens,) int32
+    delta_seq_ids_ptr,  # (num_tokens,) int32
+    # Convert inputs: local indices -> global paged indices
+    token_indices_ptr,  # (num_tokens, NUM_TOPK_TOKENS) int32
+    out_ptr,  # (num_tokens, NUM_TOPK_TOKENS) int32
+    # Shape constants
+    PAGE_SIZE: tl.constexpr,
+    NUM_PAGES_PER_SAMPLE: tl.constexpr,
+    TOT_LEN_OF_OTHER_DIMS: tl.constexpr,
+    NUM_TOPK_TOKENS: tl.constexpr,
+    # GPU tile sizes
+    BLOCK_DIM: tl.constexpr,  # 512: append dim tile width
+    BLOCK_N: tl.constexpr,  # 128: convert index tile width
+    NUM_APPEND_TILES: tl.constexpr,  # ceil(TOT_LEN_OF_OTHER_DIMS / BLOCK_DIM)
+    # Strides (in elements)
+    KV_CACHE_STRIDE0,
+    KV_CACHE_STRIDE1,
+    THIS_KV_STRIDE0,
+    ti_stride0,
+    ti_stride1,
+    out_stride0,
+    out_stride1,
+    bt_stride0,
+    bt_stride1,
+    # Bounds for req_id guarding
+    num_requests,
+    max_num_blocks_per_req,
+    HAS_DELTA_SEQ_IDS: tl.constexpr,
+    INDEX_DTYPE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+
+    # === Shared metadata loads (single load, used by both operations) ===
+    seqlen = tl.load(delta_position_ids_ptr + token_id).to(INDEX_DTYPE)
+    if HAS_DELTA_SEQ_IDS:
+        batch_id = tl.load(delta_seq_ids_ptr + token_id).to(INDEX_DTYPE)
+    else:
+        batch_id = token_id
+
+    # page_table_offset is common preamble for both operations
+    page_table_offset = batch_id * NUM_PAGES_PER_SAMPLE + seqlen // PAGE_SIZE
+
+    if tile_id < NUM_APPEND_TILES:
+        # === APPEND operation: scatter KV data to paged cache ===
+        page_id = tl.load(page_table_ptr + page_table_offset).to(INDEX_DTYPE)
+
+        off_d = tile_id * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+        dim_mask = off_d < TOT_LEN_OF_OTHER_DIMS
+
+        kv_cache_off = (
+            page_id * KV_CACHE_STRIDE0 + (seqlen % PAGE_SIZE) * KV_CACHE_STRIDE1 + off_d
+        )
+        kv_off = token_id * THIS_KV_STRIDE0 + off_d
+
+        data = tl.load(this_kv_ptr + kv_off, mask=dim_mask)
+        tl.store(kv_cache_ptr + kv_cache_off, data, mask=dim_mask)
+
+    else:
+        # === CONVERT operation: local indices -> global paged indices ===
+        conv_tile = tile_id - NUM_APPEND_TILES
+        indice_id = conv_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+
+        # req_id = batch_id (shared from append path)
+        # upper_bound for causal decode = delta_position_ids + 1 = seqlen + 1
+        is_invalid_req = (batch_id < 0) | (batch_id >= num_requests)
+        upper = seqlen + 1  # causal: upper bound = position_id + 1
+
+        # Load token indices for this tile
+        ti_off = token_id * ti_stride0 + indice_id * ti_stride1
+        tok = tl.load(ti_off + token_indices_ptr)
+
+        is_invalid_tok = (tok < 0) | (tok >= upper)
+
+        # PAGE_SIZE here is the same as BLOCK_SIZE in the original convert kernel
+        block_id = tok // PAGE_SIZE
+        inblock_off = tok % PAGE_SIZE
+
+        valid_block = (
+            (~is_invalid_tok)
+            & (~is_invalid_req)
+            & (block_id < max_num_blocks_per_req)
+            & (block_id >= 0)
+        )
+
+        # page_table_ptr serves as block_table_ptr (same tensor)
+        safe_req = tl.where(is_invalid_req, 0, batch_id)
+        bt_off = page_table_ptr + safe_req * bt_stride0 + block_id * bt_stride1
+        base = tl.load(bt_off, mask=valid_block, other=0)
+
+        out_val = tl.where(
+            is_invalid_tok | is_invalid_req | (~valid_block),
+            -1,
+            base * PAGE_SIZE + inblock_off,
+        )
+
+        out_off = out_ptr + token_id * out_stride0 + indice_id * out_stride1
+        tl.store(out_off, out_val)
+
+
+def fused_append_and_convert_paged_kv_cache(
+    kv_cache: torch.Tensor,  # (num_pages, page_size, D)
+    page_table: torch.Tensor,  # (batch_size, num_pages_per_sample)
+    this_kv: torch.Tensor,  # (num_tokens, D)
+    delta_position_ids: torch.Tensor,  # (num_tokens,) int32
+    delta_seq_ids: torch.Tensor,  # (num_tokens,) int32
+    token_indices: torch.Tensor,  # (num_tokens, NUM_TOPK_TOKENS) int32
+    NUM_TOPK_TOKENS: int,
+    PAGE_SIZE: int,
+    use_i64_offsets: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused append_to_paged_kv_cache + convert_req_index_to_global_paged_index.
+
+    Combines two operations into a single kernel:
+    1. Append: scatter this_kv into kv_cache at positions given by
+       delta_position_ids / delta_seq_ids via page_table.
+    2. Index convert: translate local token_indices into global paged
+       indices using page_table (= block_table).
+
+    Returns (kv_cache, global_indices). kv_cache is updated in-place;
+    global_indices is a new tensor suitable for flash_mla sparse attention.
+
+    NOTE: This kernel is designed for the causal decode path where
+    upper_idx_bound_per_token = delta_position_ids + 1.
+    """
+    if this_kv.numel() == 0:
+        return kv_cache, torch.empty_like(token_indices)
+
+    # Flatten to contiguous dims for pointer arithmetic
+    orig_kv_cache_shape = kv_cache.shape
+    kv_cache = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], -1)
+    this_kv = this_kv.view(this_kv.shape[0], -1)
+
+    assert page_table.is_contiguous()
+    assert delta_position_ids.is_contiguous()
+    assert delta_seq_ids.is_contiguous()
+    assert token_indices.is_contiguous()
+
+    num_tokens = this_kv.shape[0]
+    tot_len_of_other_dims = this_kv.numel() // num_tokens
+    num_pages_per_sample = page_table.shape[1]
+    num_requests = page_table.shape[0]
+    max_num_blocks_per_req = page_table.shape[1]
+
+    BLOCK_DIM = 512
+    BLOCK_N = 128
+    num_append_tiles = triton.cdiv(tot_len_of_other_dims, BLOCK_DIM)
+    num_convert_tiles = NUM_TOPK_TOKENS // BLOCK_N
+    assert (
+        NUM_TOPK_TOKENS % BLOCK_N == 0
+    ), f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible by BLOCK_N ({BLOCK_N})"
+
+    INDEX_DTYPE = tl.int64 if use_i64_offsets else tl.int32
+
+    out = torch.empty_like(token_indices)
+    grid = (num_tokens, num_append_tiles + num_convert_tiles)
+
+    _fused_append_and_convert_paged_kv_cache_kernel[grid](
+        kv_cache_ptr=kv_cache,
+        page_table_ptr=page_table,
+        this_kv_ptr=this_kv,
+        delta_position_ids_ptr=delta_position_ids,
+        delta_seq_ids_ptr=delta_seq_ids,
+        token_indices_ptr=token_indices,
+        out_ptr=out,
+        PAGE_SIZE=PAGE_SIZE,
+        NUM_PAGES_PER_SAMPLE=num_pages_per_sample,
+        TOT_LEN_OF_OTHER_DIMS=tot_len_of_other_dims,
+        NUM_TOPK_TOKENS=NUM_TOPK_TOKENS,
+        BLOCK_DIM=BLOCK_DIM,
+        BLOCK_N=BLOCK_N,
+        NUM_APPEND_TILES=num_append_tiles,
+        KV_CACHE_STRIDE0=kv_cache.stride(0),
+        KV_CACHE_STRIDE1=kv_cache.stride(1),
+        THIS_KV_STRIDE0=this_kv.stride(0),
+        ti_stride0=token_indices.stride(0),
+        ti_stride1=token_indices.stride(1),
+        out_stride0=out.stride(0),
+        out_stride1=out.stride(1),
+        bt_stride0=page_table.stride(0),
+        bt_stride1=page_table.stride(1),
+        num_requests=num_requests,
+        max_num_blocks_per_req=max_num_blocks_per_req,
+        HAS_DELTA_SEQ_IDS=True,
+        INDEX_DTYPE=INDEX_DTYPE,
+    )
+
+    return kv_cache.view(orig_kv_cache_shape), out
+
+
 # SPDX-SnippetEnd
