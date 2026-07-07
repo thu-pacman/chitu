@@ -52,6 +52,8 @@ from chitu.ops import (
     to_fp4_e2m1_in_uint8,
     mla_prologue,
     blockfp8_act_quant,
+    append_to_paged_kv_cache,
+    read_from_paged_kv_cache,
     hadamard_transform,
     topk_indices,
     topk_page_table_decode_cuda,
@@ -391,7 +393,7 @@ class AttentionDeepSeekV3(Attention):
         *,
         checkpoint_prefix: str,
         indexer_cache: Optional[KVCacheBase] = None,
-        indexer_impl: Optional[DSAIndexer],
+        indexer_impl: Optional[DSAIndexer] = None,
         has_local_indexer: bool = True,
     ):
         super().__init__(layer_id, cache, attn_backend)
@@ -630,7 +632,7 @@ class AttentionDeepSeekV3(Attention):
                 ),
                 checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
             )
-        elif self.mla_absorb == "absorb-without-precomp":
+        elif self.mla_absorb in ("absorb-without-precomp", "absorb-kv-only"):
             kv_b_proj_features_per_head = self.qk_nope_head_dim + self.v_head_dim
             absorb_block_size = block_size
             if (
@@ -662,6 +664,18 @@ class AttentionDeepSeekV3(Attention):
                 quant_kwargs=absorb_quant_kwargs,
                 checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
             )
+            if self.mla_absorb == "absorb-kv-only":
+                self.kv_b_proj = ColumnParallelLinear(
+                    self.kv_lora_rank,
+                    self.n_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                    has_bias=False,
+                    gather_output=False,
+                    base_linear_class=get_linear_layout_contig_y(
+                        op_impl,
+                        checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
+                    ),
+                    checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
+                )
 
         self.o_proj = RowParallelLinear(
             (
@@ -691,6 +705,257 @@ class AttentionDeepSeekV3(Attention):
                 indexer_impl=indexer_impl,
             )
 
+    @staticmethod
+    def _as_plain_tensor(x):
+        return x.convert_to_plain() if isinstance(x, NativeLayoutTensor) else x
+
+    def _project_mla_q_latent_kv(
+        self,
+        x: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        n_tokens: int,
+        *,
+        cp_active: bool = False,
+        seq_len_delta: Optional[BatchedSeqLenDelta] = None,
+    ):
+        """Project Q and latent MLA KV once for absorb/none/reconstruct paths."""
+        assert self.q_lora_rank > 0
+        indexer_k = None
+        has_indexer_weights = self.index_topk is not None and self.has_local_indexer
+        if self.merge_qkv:
+            if not has_indexer_weights:
+                q_a_kv = self.wqkv_a(x)
+                q_a, kv = torch.split(
+                    q_a_kv,
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    dim=-1,
+                )
+            else:
+                assert self.index_head_dim is not None
+                q_a_kv_indexer_k = self.wqkv_a_indexer_k(x)
+                indexer_k, q_a, kv = torch.split(
+                    q_a_kv_indexer_k,
+                    [
+                        self.index_head_dim,
+                        self.q_lora_rank,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
+                    ],
+                    dim=-1,
+                )
+        else:
+            q_a = self.q_a_proj(x)
+            kv = self.kv_a_proj_with_mqa(x)
+            if has_indexer_weights:
+                indexer_k = self.indexer_wk(x)
+
+        qr = self.q_a_layernorm(q_a, compute_dtype=q_a.dtype)
+        indexer_q = None
+        if self.merge_qkv and has_indexer_weights:
+            assert self.index_n_heads is not None
+            assert self.index_head_dim is not None
+            indexer_dim = self.index_n_heads * self.index_head_dim
+            q_indexer_q = self.wq_b_indexer_q_b(qr)
+            indexer_q, q = torch.split(
+                q_indexer_q,
+                [
+                    indexer_dim,
+                    q_indexer_q.shape[-1] - indexer_dim,
+                ],
+                dim=-1,
+            )
+        else:
+            q = self.q_b_proj(qr)
+            if has_indexer_weights:
+                indexer_q = self.indexer_wq_b(qr)
+
+        q = q.view(n_tokens, self.n_local_heads, -1)
+        kv = kv.view(n_tokens, 1, -1)
+
+        q, kv, q_nope, q_pe, _, kv_lora, k_pe, _ = apply_rotary_pos_emb_partial(
+            q,
+            kv,
+            freqs_cis,
+            q_rotary_begin=q.shape[-1] - self.qk_rope_head_dim,
+            k_rotary_begin=self.kv_lora_rank,
+            rotary_type="interleaved",
+        )
+
+        indexer_k_global: torch.Tensor | None = None
+        if cp_active:
+            assert seq_len_delta is not None
+            cp_ctx = get_cp_context()
+            kv_global, indexer_k_global = cp_ctx.allgather_kv(
+                n_tokens,
+                kv,
+                indexer_k,
+                self.index_head_dim,
+                seq_len_delta,
+            )
+            kv = kv_global.unsqueeze(1)
+            kv_lora = kv[..., : self.kv_lora_rank]
+            k_pe = kv[..., self.kv_lora_rank :]
+
+        return (
+            q,
+            kv,
+            q_nope,
+            q_pe,
+            kv_lora,
+            k_pe,
+            indexer_q,
+            indexer_k,
+            indexer_k_global,
+        )
+
+    def _expand_latent_kv_to_full_kv(
+        self,
+        kv_lora: torch.Tensor,
+        k_pe: torch.Tensor,
+        n_tokens: int,
+        *,
+        normalize: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        k_pe = self._as_plain_tensor(k_pe)
+        if normalize:
+            # In-place normalize kv_lora; since kv_lora is a view into the latent
+            # KV tensor, this also updates the compressed tensor stored by
+            # absorb-kv-only.
+            self.kv_a_layernorm(kv_lora, compute_dtype=kv_lora.dtype, out=kv_lora)
+
+        kv_full = self.kv_b_proj(kv_lora.contiguous())
+        kv_full = kv_full.view(
+            n_tokens, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
+        k_nope, v = torch.split(
+            kv_full, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        )
+        k = torch.cat(
+            [
+                k_nope,
+                k_pe.view(n_tokens, 1, self.qk_rope_head_dim).expand(
+                    -1, self.n_local_heads, -1
+                ),
+            ],
+            dim=-1,
+        )
+        return k, v.contiguous()
+
+    def _forward_reconstruct_prefill(
+        self,
+        x: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        is_mtp: bool = False,
+    ):
+        """Prefill with latent-only KV cache and on-the-fly full K/V rebuild.
+
+        The cache stores the normal absorb MLA latent layout. For continuation
+        prefill chunks, this path reads the full 0..new_len latent cache,
+        re-applies kv_b_proj, rebuilds per-head K/V, then uses ragged flash
+        attention with current Q and reconstructed historical K/V.
+        """
+        bs_seq, _ = x.size()
+        seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
+
+        # Build full Q/K/V and normalized latent KV for absorb-kv-only prefill.
+        n_tokens = x.size(0)
+        q, kv, _, _, kv_lora, k_pe, _, _, _ = self._project_mla_q_latent_kv(
+            x, freqs_cis, n_tokens
+        )
+        q = self._as_plain_tensor(q)
+        kv_compressed = self._as_plain_tensor(kv)
+        k_chunk, v_chunk = self._expand_latent_kv_to_full_kv(
+            kv_lora, k_pe, n_tokens, normalize=True
+        )
+
+        k_chunk = k_chunk.contiguous()
+        v_chunk = v_chunk.contiguous()
+
+        kv_cache_accessor = self.cache.get_accessor(self.layer_id, is_mtp)
+        if "kv_lora_k_pe" in kv_cache_accessor.kv:
+            append_to_paged_kv_cache(
+                kv_cache_accessor.kv["kv_lora_k_pe"],
+                kv_cache_accessor.block_table,
+                kv_compressed,
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+                get_page_ids=kv_cache_accessor.get_page_ids,
+                get_offs_in_page=kv_cache_accessor.get_offs_in_page,
+            )
+        elif "kv_lora" in kv_cache_accessor.kv and "k_pe" in kv_cache_accessor.kv:
+            append_to_paged_kv_cache(
+                kv_cache_accessor.kv["kv_lora"],
+                kv_cache_accessor.block_table,
+                kv_compressed[..., : self.kv_lora_rank],
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+                get_page_ids=kv_cache_accessor.get_page_ids,
+                get_offs_in_page=kv_cache_accessor.get_offs_in_page,
+            )
+            append_to_paged_kv_cache(
+                kv_cache_accessor.kv["k_pe"],
+                kv_cache_accessor.block_table,
+                kv_compressed[..., self.kv_lora_rank :],
+                seq_len_delta.delta_position_ids_tensor_device,
+                seq_len_delta.delta_seq_ids_tensor_device,
+                get_page_ids=kv_cache_accessor.get_page_ids,
+                get_offs_in_page=kv_cache_accessor.get_offs_in_page,
+            )
+        else:
+            raise ValueError(
+                "Reconstruct prefill requires MLA-format KV cache "
+                f'("kv_lora_k_pe" or "kv_lora"+"k_pe"), got '
+                f"{list(kv_cache_accessor.kv.keys())}"
+            )
+
+        if seq_len_delta.is_first_prefill_chunk:
+            k_attn = k_chunk
+            v_attn = v_chunk
+        else:
+            new_pos = seq_len_delta.new.position_ids_tensor_device
+            new_seq = seq_len_delta.new.seq_ids_tensor_device
+            if "kv_lora_k_pe" in kv_cache_accessor.kv:
+                latent_full = read_from_paged_kv_cache(
+                    kv_cache_accessor.kv["kv_lora_k_pe"],
+                    kv_cache_accessor.block_table,
+                    new_pos,
+                    new_seq,
+                )
+                kv_lora_full = latent_full[..., : self.kv_lora_rank]
+                k_pe_full = latent_full[..., self.kv_lora_rank :]
+            else:
+                kv_lora_full = read_from_paged_kv_cache(
+                    kv_cache_accessor.kv["kv_lora"],
+                    kv_cache_accessor.block_table,
+                    new_pos,
+                    new_seq,
+                )
+                k_pe_full = read_from_paged_kv_cache(
+                    kv_cache_accessor.kv["k_pe"],
+                    kv_cache_accessor.block_table,
+                    new_pos,
+                    new_seq,
+                )
+
+            total_len = kv_lora_full.shape[0]
+            kv_lora_full = kv_lora_full.view(total_len, self.kv_lora_rank).contiguous()
+            k_attn, v_attn = self._expand_latent_kv_to_full_kv(
+                kv_lora_full,
+                k_pe_full,
+                total_len,
+                normalize=False,
+            )
+
+        x = self.attn_backend.prefill_ragged_qkvo(
+            q,
+            k_attn,
+            v_attn,
+            seq_len_delta=seq_len_delta,
+            causal=True,
+            softmax_scale=self.softmax_scale,
+        )
+
+        return self.o_proj(x.flatten(-2)).view(bs_seq, -1)
+
     def make_indexer(
         self,
         args,
@@ -715,16 +980,25 @@ class AttentionDeepSeekV3(Attention):
         When CP step is active, allgathers KV and uses local_lengths for causal bounds.
         """
         seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
+        bs_seq, _ = x.size()
+        n_tokens = bs_seq
 
-        n_tokens, _ = x.size()
         cp_ctx = get_cp_context()
         cp_active = cp_ctx.step_active and not seq_len_delta.is_decode_stage
+        has_indexer_weights = self.index_topk is not None and self.has_local_indexer
 
         # Clear stale CP cache from previous steps (e.g., prefill's local_lengths
         # should not leak into decode). When CP is active, prepare_local_lengths
         # will set fresh values before downstream methods read them.
         if not cp_active:
             cp_ctx.clear_step_cache()
+
+        if (
+            self.mla_absorb == "absorb-kv-only"
+            and not cp_active
+            and not seq_len_delta.is_classic_decoding
+        ):
+            return self._forward_reconstruct_prefill(x, freqs_cis, is_mtp=is_mtp)
 
         # ---- torch_npu MLA prologue fast path (only non-CP) ----
         if not cp_active and self.can_use_mla_prologue_torch_npu:
@@ -783,118 +1057,36 @@ class AttentionDeepSeekV3(Attention):
                 softmax_scale=self.softmax_scale,
             )
 
-            x = self.kv_b_proj_absorb_2(x)
+            if self.mla_absorb in ("absorb-without-precomp", "absorb-kv-only"):
+                x = self.kv_b_proj_absorb_2(x)
 
         else:  # standard path (non-CP w/o torch_npu, or CP mode)
-            assert self.q_lora_rank > 0
-            indexer_k = None
-            # Whether the wqkv_a / q_b_proj weights include the indexer slice.
-            # Shared-indexer layers do not own indexer weights and read top-k
-            # from the shared buffer instead.
-            has_indexer_weights = self.index_topk is not None and self.has_local_indexer
-            if self.merge_qkv:
-                if not has_indexer_weights:
-                    q_a_kv = self.wqkv_a(x)
-                    q_a, kv = torch.split(
-                        q_a_kv,
-                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                        dim=-1,
-                    )
-                else:
-                    q_a_kv_indexer_k = self.wqkv_a_indexer_k(x)
-                    indexer_k, q_a, kv = torch.split(
-                        q_a_kv_indexer_k,
-                        [
-                            self.index_head_dim,
-                            self.q_lora_rank,
-                            self.kv_lora_rank + self.qk_rope_head_dim,
-                        ],
-                        dim=-1,
-                    )
-            else:
-                q_a = self.q_a_proj(x)
-                kv = self.kv_a_proj_with_mqa(x)
-                if has_indexer_weights:
-                    indexer_k = self.indexer_wk(x)
-                else:
-                    indexer_k = None
-
-            qr = self.q_a_layernorm(q_a, compute_dtype=q_a.dtype)
-
-            indexer_q = None
-            if self.merge_qkv and has_indexer_weights:
-                q_indexer_q = self.wq_b_indexer_q_b(qr)
-                indexer_q, q = torch.split(
-                    q_indexer_q,
-                    [
-                        self.index_n_heads * self.index_head_dim,
-                        q_indexer_q.shape[-1]
-                        - self.index_n_heads * self.index_head_dim,
-                    ],
-                    dim=-1,
-                )
-            else:
-                q = self.q_b_proj(qr)
-                if has_indexer_weights:
-                    indexer_q = self.indexer_wq_b(qr)
-                else:
-                    indexer_q = None
-
-            q = q.view(n_tokens, self.n_local_heads, -1)
-            kv = kv.view(n_tokens, 1, -1)
-
-            # ---- RoPE ----
-            q, kv, q_nope, q_pe, _, kv_lora, k_pe, _ = apply_rotary_pos_emb_partial(
+            (
                 q,
                 kv,
+                q_nope,
+                q_pe,
+                kv_lora,
+                k_pe,
+                indexer_q,
+                indexer_k,
+                indexer_k_global,
+            ) = self._project_mla_q_latent_kv(
+                x,
                 freqs_cis,
-                q_rotary_begin=q.shape[-1] - self.qk_rope_head_dim,
-                k_rotary_begin=self.kv_lora_rank,
-                rotary_type="interleaved",
+                n_tokens,
+                cp_active=cp_active,
+                seq_len_delta=seq_len_delta,
             )
-
-            # ---- CP allgather KV ----
-            indexer_k_global: torch.Tensor | None = None
-            if cp_active:
-                kv_global, indexer_k_global = cp_ctx.allgather_kv(
-                    n_tokens,
-                    kv,
-                    indexer_k,
-                    self.index_head_dim,
-                    seq_len_delta,
-                )
-                kv = kv_global.unsqueeze(1)  # [total, 1, kv_lora_rank + rope]
-                kv_lora = kv[..., : self.kv_lora_rank]
-                k_pe = kv[..., self.kv_lora_rank :]
 
             # ---- MLA absorb ----
             if self.mla_absorb == "none":
                 # absorb="none" is incompatible with CP mode (no allgather KV support).
                 assert not cp_active
 
-                if isinstance(k_pe, NativeLayoutTensor):
-                    k_pe = k_pe.convert_to_plain()
-
-                kv = self.kv_b_proj(self.kv_a_layernorm(kv_lora))
-
-                kv = kv.view(
-                    n_tokens,
-                    self.n_local_heads,
-                    self.qk_nope_head_dim + self.v_head_dim,
-                )
-                k_nope, v = torch.split(
-                    kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-                )
-                k = torch.cat(
-                    [
-                        k_nope.view(
-                            n_tokens, self.n_local_heads, self.qk_nope_head_dim
-                        ),
-                        k_pe.view(n_tokens, 1, self.qk_rope_head_dim).expand(
-                            -1, self.n_local_heads, -1
-                        ),
-                    ],
-                    dim=-1,
+                q = self._as_plain_tensor(q)
+                k, v = self._expand_latent_kv_to_full_kv(
+                    kv_lora, k_pe, n_tokens, normalize=True
                 )
 
                 if has_indexer_weights:
@@ -922,8 +1114,12 @@ class AttentionDeepSeekV3(Attention):
                     softmax_scale=self.softmax_scale,
                 )
 
-            elif self.mla_absorb in ["absorb-without-precomp", "absorb"]:
-                if self.mla_absorb == "absorb-without-precomp":
+            elif self.mla_absorb in [
+                "absorb-without-precomp",
+                "absorb-kv-only",
+                "absorb",
+            ]:
+                if self.mla_absorb in ("absorb-without-precomp", "absorb-kv-only"):
                     q_nope = self.kv_b_proj_absorb_1(q_nope)
 
                 # KV layernorm
@@ -1058,7 +1254,7 @@ class AttentionDeepSeekV3(Attention):
                     topk_page_table=topk_page_table,
                 )
 
-                if self.mla_absorb == "absorb-without-precomp":
+                if self.mla_absorb in ("absorb-without-precomp", "absorb-kv-only"):
                     x = self.kv_b_proj_absorb_2(x)
 
             else:
@@ -1367,7 +1563,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         mla_absorb,
         *,
         checkpoint_prefix,
-        indexer_impl,
+        indexer_impl=None,
     ):
         super().__init__(
             layer_id, args, cache_dict, attn_backend=attn_backend, op_impl=op_impl
@@ -1462,7 +1658,7 @@ class TransformerBlockDeepSeekV3MTP(TransformerBlockDeepSeekV3):
         mla_absorb,
         *,
         checkpoint_prefix,
-        indexer_impl,
+        indexer_impl=None,
     ):
         super().__init__(
             layer_id,
@@ -1662,7 +1858,7 @@ class TransformerDeepSeekV3(Transformer):
         return checkpoint
 
     def _normalize_w8a8_kv_b_proj_checkpoint(self, state_dict: dict[str, Any]) -> None:
-        if self.mla_absorb != "absorb-without-precomp":
+        if self.mla_absorb not in ("absorb-without-precomp", "absorb-kv-only"):
             return
 
         for k in list(state_dict.keys()):
@@ -1719,11 +1915,16 @@ class TransformerDeepSeekV3(Transformer):
                 if k.endswith(f".kv_b_proj.input_scale") or k.endswith(
                     f".kv_b_proj.weight_scale_2"
                 ):
+                    scale_val = checkpoint.pop(k)
+                    if self.mla_absorb == "absorb-kv-only":
+                        checkpoint[f"{prefix}.kv_b_proj.{tensor_name}"] = (
+                            scale_val.clone().view(1, 1)
+                        )
                     checkpoint[f"{prefix}.kv_b_proj_absorb_1.{tensor_name}"] = (
-                        checkpoint.pop(k).view(1, 1)
+                        scale_val.view(1, 1)
                     )
                     checkpoint[f"{prefix}.kv_b_proj_absorb_2.{tensor_name}"] = (
-                        checkpoint.pop(k).view(1, 1)
+                        scale_val.clone().view(1, 1)
                     )
                 elif tensor_name == "scale" and use_blockfp8_absorb64:
                     continue
@@ -1734,6 +1935,13 @@ class TransformerDeepSeekV3(Transformer):
                     assert self.params.kv_lora_rank % absorb_block_size == 0
                     kv_b_proj_weight = checkpoint.pop(src_key)
                     kv_b_proj_scale = checkpoint.pop(f"{prefix}.kv_b_proj.scale")
+                    if self.mla_absorb == "absorb-kv-only":
+                        checkpoint[f"{prefix}.kv_b_proj.weight"] = (
+                            kv_b_proj_weight.clone()
+                        )
+                        checkpoint[f"{prefix}.kv_b_proj.scale"] = (
+                            kv_b_proj_scale.clone()
+                        )
                     kv_b_proj_in_features = kv_b_proj_weight.shape[-1]
                     kv_b_proj_weight = kv_b_proj_weight.view(
                         n_local_heads,
@@ -1807,6 +2015,10 @@ class TransformerDeepSeekV3(Transformer):
                     )
                 else:
                     kv_b_proj_weight = checkpoint.pop(src_key)
+                    if self.mla_absorb == "absorb-kv-only":
+                        checkpoint[f"{prefix}.kv_b_proj.{tensor_name}"] = (
+                            kv_b_proj_weight.clone()
+                        )
                     kv_b_proj_weight = kv_b_proj_weight.view(
                         n_local_heads, -1, kv_b_proj_weight.shape[-1]
                     )
@@ -1876,10 +2088,10 @@ class TransformerDeepSeekV3(Transformer):
                 o_proj_quant = get_quant_from_checkpoint_prefix(
                     prefix + "o_proj.weight", self.params.quant_config.rules
                 )
-                if "w8a8_dynamic" in (q_b_proj_quant, o_proj_quant):
+                if "w8a8_per_token_per_channel_dyn" in (q_b_proj_quant, o_proj_quant):
                     raise NotImplementedError(
                         "infer.mla_absorb=absorb is not implemented for "
-                        "w8a8_dynamic q_b_proj/o_proj weights. Use "
+                        "w8a8_per_token_per_channel_dyn q_b_proj/o_proj weights. Use "
                         "infer.mla_absorb=absorb-without-precomp."
                     )
                 assert prefix + "kv_b_proj.weight" in checkpoint
@@ -2233,7 +2445,7 @@ class TransformerDeepSeekV3(Transformer):
         if not skip_preprocess:
             if self.mla_absorb == "absorb":
                 state_dict = self._process_state_dict_for_absorption(state_dict)
-            elif self.mla_absorb == "absorb-without-precomp":
+            elif self.mla_absorb in ("absorb-without-precomp", "absorb-kv-only"):
                 state_dict = (
                     self._process_state_dict_for_absorption_without_precomputation(
                         state_dict

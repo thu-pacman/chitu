@@ -54,6 +54,7 @@ def moe_sum_per_token_triton(
     assert topk_weights.is_contiguous()
     assert out.is_contiguous()
 
+    # M * topk * N 可能overflow，按需让 kernel 内部用 int64
     use_i64 = M * topk * N > 2**31 - 1
     moe_sum_per_token_triton_kernel[M,](
         x,
@@ -84,9 +85,8 @@ def moe_sum_per_token_triton_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     USE_I64_OFFSET: tl.constexpr,
 ):
-    # Program ID
     row_index = tl.program_id(axis=0)
-    # Create offsets for m and n dimensions
+    # row_index * topk * N 可能overflow，按需让 kernel 内部用 int64
     if USE_I64_OFFSET:
         row_index = row_index.to(tl.int64)
     offs_n = tl.arange(0, BLOCK_SIZE_N)
@@ -160,6 +160,7 @@ def _fwd_kernel_ep_gather(
                 acc_weight = tl.load(
                     recv_topk_weight + cur_token * recv_topk_weight_stride0 + topk_index
                 )
+                # source_token_index 是 int32，乘以 stride 后乘积可能overflow，按需让 kernel 内部用 int64
                 if USE_I64_OFFSET:
                     source_offset = source_token_index.to(tl.int64)
                 else:
@@ -205,6 +206,7 @@ def moe_sum_expert_block_permuted_triton(
     BLOCK_D = 1024  # No longer needed (FIXME)
     num_warps = 2
     assert hidden_size % BLOCK_D == 0
+    # x 的行数 × stride 可能overflow，按需让 kernel 内部用 int64
     use_i64 = x.shape[0] * x.stride(0) > 2**31 - 1
     grid = (triton.cdiv(hidden_size, BLOCK_D), min(num_tokens, 1024))
     _fwd_kernel_ep_gather[grid](

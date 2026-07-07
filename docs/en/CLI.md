@@ -449,6 +449,10 @@ Acceptable values:
 - "absorb-without-precomp": exchange some matrices in the order of multiplication. This is
   an optimization for smaller memory footprint and lower memory occupancy for KV cache,
   which matches the typical need for decoding.
+- "absorb-kv-only": keep the same latent-only KV cache and absorbed weight layout as
+  "absorb-without-precomp", but reconstruct full K/V from kv_lora + k_pe during prefill
+  before calling normal attention. This is intended for Prefill instances that want
+  flash-attn over full K/V while preserving latent-only cache storage and PD transfer.
 - "absorb": exchange some matrices in the order of multiplication, and precompute all the
   multiplications that can be computed before inference. This is an optimization for fewer
   operator counts, which may be useful for low-latency + low-concurrency cases.

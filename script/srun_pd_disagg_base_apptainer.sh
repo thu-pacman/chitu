@@ -30,6 +30,7 @@ usage() {
      --partition P          (默认 long; 空串=不传)
      --slurm-job-id ID      (复用已有 allocation 的 job id)
      --exclude NODES        (srun --exclude, 如 node005 或 node[005-007])
+     --nodelist NODES       (srun --nodelist, 指定固定节点, 如 node[033,035,037,039])
      --log-dir DIR          (默认 $(pwd)/log)
 
   2. 模型参数 (Router/Prefill/Decode 通用):
@@ -87,6 +88,7 @@ PD_CPUS_PER_GPU="${PD_CPUS_PER_GPU:-24}"
 PD_PARTITION="${PD_PARTITION:-debug}"
 PD_SLURM_JOB_ID="${PD_SLURM_JOB_ID:-}"
 PD_EXCLUDE="${PD_EXCLUDE:-}"
+PD_NODELIST="${PD_NODELIST:-}"
 LOG_DIR="${LOG_DIR:-"$(pwd)/log"}"
 
 # 模型通用
@@ -691,6 +693,7 @@ while [ $# -gt 0 ]; do
     --partition)     PD_PARTITION="$2"; shift 2;;
     --slurm-job-id)  PD_SLURM_JOB_ID="$2"; shift 2;;
     --exclude)       PD_EXCLUDE="$2"; shift 2;;
+    --nodelist)      PD_NODELIST="$2"; shift 2;;
     --log-dir)       LOG_DIR="$2"; shift 2;;
     # 模型 / PD
     --model-spec)    parse_model_spec "$2"; shift 2;;
@@ -768,7 +771,8 @@ done
 for i in "${!DECODE_NNODES[@]}"; do
   echo "  D${i}: nn=${DECODE_NNODES[i]} tp=${DECODE_TP[i]} pcp=${DECODE_PCP[i]} pp=${DECODE_PP[i]} dp=${DECODE_DP[i]} ep=${DECODE_EP[i]} max_seq_len=${DECODE_MAX_SEQ_LEN[i]} max_reqs=${DECODE_MAX_REQS[i]} max_batch_size=${DECODE_MAX_BATCH_SIZE[i]}"
 done
-[ -n "${PD_EXCLUDE}" ] && echo "exclude=${PD_EXCLUDE}"
+[ -n "${PD_EXCLUDE}" ]  && echo "exclude=${PD_EXCLUDE}"
+[ -n "${PD_NODELIST}" ] && echo "nodelist=${PD_NODELIST}"
 echo "bind_code=${PD_APPTAINER_BIND_CODE}  log=${LOG_DIR}"
 if [ -n "${PD_SLURM_JOB_ID}" ]; then
   echo "launch_mode=reuse_allocation"
@@ -794,6 +798,7 @@ else
   SRUN_CMD+=(--gres="gpu:${PD_GPUS_PER_NODE}")
   [ -n "${PD_PARTITION}" ] && SRUN_CMD+=(--partition="${PD_PARTITION}")
   [ -n "${PD_EXCLUDE}" ] && SRUN_CMD+=(--exclude="${PD_EXCLUDE}")
+  [ -n "${PD_NODELIST}" ] && SRUN_CMD+=(--nodelist="${PD_NODELIST}")
   SRUN_CMD+=(--job-name="${JOB_NAME:-pd_disagg_multi_apptainer}" --time=1:00:00)
 fi
 

@@ -24,9 +24,10 @@ class FlashInferBackend(TritonAttnBackend):
 
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
+        mla_cache_modes = {"absorb-without-precomp", "absorb-kv-only", "absorb"}
         self.is_mla = (
             self.args.models.type == ModelType.DEEPSEEK_V3
-            and self.args.infer.mla_absorb in {"absorb-without-precomp", "absorb"}
+            and self.args.infer.mla_absorb in mla_cache_modes
         )
         self.is_paged = self.args.infer.cache_type == "paged"
 

@@ -254,7 +254,7 @@ infer:
   #: IMPORTANT: Typically, you need to set this field.
   max_seq_len: 10240
 
-  #: Data structure for KV cache. Set it to "page" for paged KV cache 
+  #: Data structure for KV cache. Set it to "page" for paged KV cache
   #:
   #: Acceptable values:
   #: - "skew": For better performance when the memory is sufficient. This is a legacy name for
@@ -332,7 +332,7 @@ infer:
   op_impl: torch
 
   #: Absorption mode for MLA. This field is ignored when the model does not contain MLA.
-  #: 
+  #:
   #: Acceptable values:
   #: - "auto": Decide automatically.
   #: - "none": No absorption. This is an optimization for lower FLOP counts, which matches the
@@ -340,6 +340,10 @@ infer:
   #: - "absorb-without-precomp": exchange some matrices in the order of multiplication. This is
   #:   an optimization for smaller memory footprint and lower memory occupancy for KV cache,
   #:   which matches the typical need for decoding.
+  #: - "absorb-kv-only": keep the same latent-only KV cache and absorbed weight layout as
+  #:   "absorb-without-precomp", but reconstruct full K/V from kv_lora + k_pe during prefill
+  #:   before calling normal attention. This is intended for Prefill instances that want
+  #:   flash-attn over full K/V while preserving latent-only cache storage and PD transfer.
   #: - "absorb": exchange some matrices in the order of multiplication, and precompute all the
   #:   multiplications that can be computed before inference. This is an optimization for fewer
   #:   operator counts, which may be useful for low-latency + low-concurrency cases.
@@ -418,7 +422,7 @@ infer:
   #: Acceptable values: A positive integer.
   mtp_size: 1
 
-  #: This parameter is only used for Qwen3.5 model family. If this parameter is true, 
+  #: This parameter is only used for Qwen3.5 model family. If this parameter is true,
   #: you can skip loading the vision encoder and only start the language model.
   language_model_only: False
 
@@ -669,7 +673,7 @@ multi_inst:
     # Size of the router cache block eviction buffer (unit: blocks).
     # The buffer temporarily holds cache blocks evicted from the router's local cache.
     # It addresses the asynchrony in eviction timing between the router and its downstream instances.
-    router_evict_buffer_size: 64 
+    router_evict_buffer_size: 64
 
 #: Configs how chitu is monitored and logged.
 metrics:

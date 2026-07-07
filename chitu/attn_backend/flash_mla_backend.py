@@ -37,6 +37,7 @@ if has_flash_mla and has_accelerator():
     from chitu.ops.triton_ops import (
         build_dsv4_mtp_sliding_window_global_indices_triton,
         convert_req_index_to_global_paged_index_triton,
+        fused_append_and_convert_paged_kv_cache,
         quant_pertoken_kvcache_dsa,
     )
 
@@ -1683,12 +1684,6 @@ class FlashMLABackend(TritonAttnBackend):
         kv_lora_rank = q_nope.shape[-1]
         if self.use_fp8_cache:
             kv = quant_pertoken_kvcache_dsa(kv)
-        kv_lora_k_pe = self.update_paged_mla_kv(
-            kv_lora_rank,
-            kv,
-            kv_cache,
-            seq_len_delta,
-        )
 
         q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
 
@@ -1697,6 +1692,12 @@ class FlashMLABackend(TritonAttnBackend):
 
         if topk_indices is None:  # dense+bf16
             assert not self.use_fp8_cache
+            kv_lora_k_pe = self.update_paged_mla_kv(
+                kv_lora_rank,
+                kv,
+                kv_cache,
+                seq_len_delta,
+            )
             return self.flashmla_dense_fwd_bf16(
                 q_nope_pe,
                 kv_lora_k_pe,
@@ -1706,13 +1707,54 @@ class FlashMLABackend(TritonAttnBackend):
             )
 
         ### indices is not None: convert indices
-        topk_indices = self.convert_indices_paged_triton(
-            topk_indices.to(torch.int32),
-            seq_len_delta,
-            block_table=kv_cache.block_table,
-            block_size=kv_lora_k_pe.size(1),
-            causal=True,
-        )
+        topk_indices = topk_indices.to(torch.int32)
+        if topk_indices.size(-1) < self.index_topk:
+            topk_indices = self.pad_indices(topk_indices)
+
+        if self.use_fp8_cache:
+            kv_lora_k_pe = self.update_paged_mla_kv(
+                kv_lora_rank,
+                kv,
+                kv_cache,
+                seq_len_delta,
+            )
+            topk_indices = self.convert_indices_paged_triton(
+                topk_indices,
+                seq_len_delta,
+                block_table=kv_cache.block_table,
+                block_size=kv_cache.kv["kv_lora_k_pe"].size(1),
+                causal=True,
+            )
+        else:
+            # Fused append + convert for BF16 sparse path
+            if "kv_lora_k_pe" in kv_cache.kv:
+                kv_cache_tensor = kv_cache.kv["kv_lora_k_pe"]
+                page_size = kv_cache_tensor.size(1)
+                kv_lora_k_pe, topk_indices = fused_append_and_convert_paged_kv_cache(
+                    kv_cache_tensor,
+                    kv_cache.block_table,
+                    kv,
+                    seq_len_delta.delta_position_ids_tensor_device,
+                    seq_len_delta.delta_seq_ids_tensor_device,
+                    topk_indices,
+                    NUM_TOPK_TOKENS=topk_indices.size(-1),
+                    PAGE_SIZE=page_size,
+                )
+            else:
+                # Legacy split cache fallback
+                kv_lora_k_pe = self.update_paged_mla_kv(
+                    kv_lora_rank,
+                    kv,
+                    kv_cache,
+                    seq_len_delta,
+                )
+                topk_indices = self.convert_indices_paged_triton(
+                    topk_indices,
+                    seq_len_delta,
+                    block_table=kv_cache.block_table,
+                    block_size=kv_lora_k_pe.size(1),
+                    causal=True,
+                )
 
         if self.use_fp8_cache:
             return self.flashmla_sparse_fwd_fp8(

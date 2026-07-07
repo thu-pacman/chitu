@@ -287,6 +287,9 @@ class Scheduler:
 
         num_cached_tokens = task.prefix_tokens_len
         for manager in list(self.cache_manager_dict.values()):
+            # Skip Cache that does not support prefix caching e.g. singleton
+            if not manager.enable_prefix_caching:
+                continue
             num_cached_tokens = min(
                 num_cached_tokens, manager.num_cached_blocks(task) * manager.block_size
             )
@@ -445,7 +448,14 @@ class Scheduler:
     def schedule(
         self,
         strict_allowed_task_type: set[TaskType] = {TaskType.Prefill, TaskType.Decode},
+        ready_task_ids: Optional[list[str]] = None,
     ) -> list[str]:
+        strict_allowed_task_type = strict_allowed_task_type.intersection(
+            self.strict_allowed_task_type
+        )
+        if len(strict_allowed_task_type) == 0:
+            return []
+
         sgroup_id = self.sgroup_list.get_current_sgroup()
         if TaskPool.is_empty():
             logger.debug("TaskPool is empty, returning empty task list.")
@@ -463,8 +473,13 @@ class Scheduler:
         )
 
         task_ids: list[str] = []
-        for task_id in TaskPool.id_list:
-            task = TaskPool.pool[task_id]
+        source_task_ids = (
+            ready_task_ids if ready_task_ids is not None else TaskPool.id_list
+        )
+        for task_id in source_task_ids:
+            task = TaskPool.pool.get(task_id)
+            if task is None or task.task_type not in strict_allowed_task_type:
+                continue
             if (
                 task.dp_rank is None
                 and task.preferred_dp_rank is not None
@@ -480,19 +495,6 @@ class Scheduler:
                     n_running += 1
                 task_ids.append(task_id)
 
-        # enforce strict-only gating if enabled
-        strict_allowed_task_type = strict_allowed_task_type.intersection(
-            self.strict_allowed_task_type
-        )
-        if len(strict_allowed_task_type) == 0:
-            # chitu_main 里面先用 strict_allowed_task_type=Prefill调一次 schedule()，如果拿不到任务，再用 Decode 再调一次
-            # 在PD分离只有decode_only，就会走到这里
-            return []
-        task_ids = [
-            tid
-            for tid in task_ids
-            if TaskPool.pool[tid].task_type in strict_allowed_task_type
-        ]
         if len(task_ids) == 0:
             # No avaliable tasks, returning empty task list.
             # This is in a busy loop waiting for tasks, so don't print logs here.
@@ -933,6 +935,7 @@ class SkewScheduler(Scheduler):
     def schedule(
         self,
         strict_allowed_task_type: set[TaskType] = {TaskType.Prefill, TaskType.Decode},
+        ready_task_ids: Optional[list[str]] = None,
     ) -> list[str]:
         sgroup_id = self.sgroup_list.get_current_sgroup()
         if TaskPool.is_empty():
@@ -945,11 +948,15 @@ class SkewScheduler(Scheduler):
         )
 
         # collect ready task ids
+        source_task_ids = (
+            ready_task_ids if ready_task_ids is not None else TaskPool.id_list
+        )
         has_correct_dp_rank = lambda t: t.dp_rank is None or self.dp_rank == t.dp_rank
         task_ids = [
             tid
-            for tid in TaskPool.id_list
-            if has_correct_dp_rank(TaskPool.pool[tid])
+            for tid in source_task_ids
+            if tid in TaskPool.pool
+            and has_correct_dp_rank(TaskPool.pool[tid])
             and TaskPool.pool[tid].can_schedule()
             and TaskPool.pool[tid].task_type in strict_allowed_task_type
         ]

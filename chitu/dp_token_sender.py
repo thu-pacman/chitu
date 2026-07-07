@@ -86,7 +86,7 @@ class DPTokenSender:
         self.socket.connect(router_addr)
         logger.info(f"[DPTokenSender] group={self.instance_id} connect={router_addr}")
         if self._send_queue is None:
-            self._send_queue = queue.Queue(maxsize=10000)
+            self._send_queue = queue.Queue()
 
     def _start_sender_thread(self):
         # 避免重复启动多个发送线程（ZeroMQ socket 非线程安全）

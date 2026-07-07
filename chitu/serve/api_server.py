@@ -866,15 +866,27 @@ def init_dp_router(args):
     tokenizer_path = getattr(args.models, "tokenizer_path", None) or getattr(
         args.models, "ckpt_dir", None
     )
+    processor_path = None
+    if hasattr(args.models, "processor_path"):
+        # fallback to ckpt_dir when having processor_path=null
+        processor_path = args.models.processor_path or args.models.ckpt_dir
+
     if tokenizer_path:
         args.models.tokenizer_path = tokenizer_path
         Backend.tokenizer = Backend._init_tokenizer(args)
-        Backend.formatter = Backend._init_formatter(args)
         logger.info("[ROUTER] Tokenizer initialized successfully")
     else:
         logger.info(
             "[ROUTER] No tokenizer path available, /tokenize endpoint will be unavailable"
         )
+
+    if processor_path:
+        args.models.processor_path = processor_path
+        Backend.processor = Backend._init_processor(args)
+        logger.info("[ROUTER] Processor initialized successfully")
+
+    if Backend.tokenizer is not None:
+        Backend.formatter = Backend._init_formatter(args)
 
     if is_classic_pd_disagg():
         logger.info("[ROUTER] Using classic PD disaggregation mode")

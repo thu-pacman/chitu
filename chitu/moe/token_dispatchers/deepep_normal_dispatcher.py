@@ -137,8 +137,10 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                 layer_id=layer_id,
             )
 
-        if may_fuse_quant == "w8a8_dynamic" and is_hygon():
-            return self._enter_moe_hygon_w8a8(x, topk_weights)
+        if may_fuse_quant == "w8a8_per_token_per_channel_dyn" and is_hygon():
+            return self._enter_moe_hygon_backend_w8a8_per_token_per_channel_dyn(
+                x, topk_weights
+            )
 
         dp_local_bs = topk_weights.shape[0]
         (
@@ -180,7 +182,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             recv_topk_weights,
         )
 
-    def _enter_moe_hygon_w8a8(
+    def _enter_moe_hygon_backend_w8a8_per_token_per_channel_dyn(
         self,
         x: IndexedBatchedRoutedActivation,
         topk_weights: torch.Tensor,
@@ -193,7 +195,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             activation=q_x.contiguous(),
             activation_scale=scale.reshape(q_x.shape[0], 1),
             token_to_expert_indices=x.token_to_expert_indices,
-            quant_method="w8a8_dynamic",
+            quant_method="w8a8_per_token_per_channel_dyn",
             expected_n_tokens_per_expert=x.expected_n_tokens_per_expert,
             expert_ids_are_local=True,
         )

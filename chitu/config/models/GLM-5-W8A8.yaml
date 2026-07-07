@@ -2,9 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+# GLM-5-W8A8 is a quantization of GLM-5
 defaults:
   - GLM-5
-  - quant_config: hygon-w8a8
-  - _self_
+  - quant_config: metax-w8a8
+  - _self_ # Config in this file overrides configs in defaults
 
 name: GLM-5-W8A8
+source: "https://modelscope.cn/models/metax-tech/GLM-5-W8A8/" # Just for displaying. No automatic download.

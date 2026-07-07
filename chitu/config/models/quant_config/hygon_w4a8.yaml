@@ -8,6 +8,8 @@ quant:
     - regex: 'kv_b_proj'
       type: null
     - regex: '(\.self_attn|\.mlp\.(shared_experts\.)?(gate_proj|gate_up_proj|up_proj|down_proj))'
-      type: w8a8_dynamic
+      type: w8a8_per_token_per_channel_dyn
+      kwargs:
+        weight_scale_has_singleton_last_dim: True
     - regex: '\.mlp\.(moe|experts)'
       type : hygon_w4a8
