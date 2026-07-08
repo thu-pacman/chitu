@@ -3,7 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import os
+from logging import getLogger
+
 import uvloop
+
+logger = getLogger(__name__)
 
 _server_event_loop = None
 
@@ -20,4 +25,8 @@ def start_server_in_new_event_loop(server_awaitable):
         _server_event_loop = asyncio.get_event_loop()
         await server_awaitable
 
-    asyncio.run(async_main())
+    try:
+        asyncio.run(async_main())
+    except:
+        logger.exception("server event loop fatal error, exiting process")
+        os._exit(1)
