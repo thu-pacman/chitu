@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -21,7 +21,11 @@ from chitu.ops.utils import compatible_with_inplace, make_op_dispatcher
 triton, has_triton = try_import_platform_dep("triton")
 has_triton_impl = has_triton and has_accelerator()
 if has_triton_impl:
-    from chitu.ops.triton_ops import rms_norm_triton, layer_norm_triton
+    from chitu.ops.triton_ops import (
+        rms_norm_triton,
+        rms_norm_residual_triton,
+        layer_norm_triton,
+    )
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
@@ -242,3 +246,66 @@ def rms_norm_ref(
     x = x.to(compute_dtype)
     y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     return (y.to(weight.dtype) * weight).to(dtype)
+
+
+@make_op_dispatcher
+def rms_norm_residual(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps,
+    compute_dtype: torch.dtype,
+    impl: str = "auto",
+) -> Tuple[torch.Tensor, torch.Tensor]: ...
+
+
+@rms_norm_residual.register_auto
+def _auto_rms_norm_residual(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps,
+    compute_dtype: torch.dtype,
+) -> str:
+    if has_triton_impl:
+        return "triton"
+    return "separated"
+
+
+rms_norm_residual.register_candidate("triton")
+if has_triton_impl:
+    rms_norm_residual.register("triton")(rms_norm_residual_triton)
+
+
+@rms_norm_residual.register("separated")
+def rms_norm_residual_separated(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps,
+    compute_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    combined = x + residual
+    normed = rms_norm(
+        combined, weight, eps=eps, compute_dtype=compute_dtype, impl="auto"
+    )
+    return combined, normed
+
+
+@rms_norm_residual.register("ref")
+def rms_norm_residual_ref(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps,
+    compute_dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    combined = x + residual
+    normed = rms_norm(
+        combined, weight, eps=eps, compute_dtype=compute_dtype, impl="ref"
+    )
+    return combined, normed

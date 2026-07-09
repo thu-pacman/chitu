@@ -27,7 +27,7 @@ from chitu.task_type import TaskType
 from chitu.models.registry import ModelType, register_model
 from chitu.quantization import QuantizationRegistry
 from chitu.quantization.utils import get_layer_id_from_checkpoint_prefix
-from chitu.models.model import TransformerBlock, RMSNorm
+from chitu.models.model import TransformerBlock, RMSNorm, RMSNormResidual
 from chitu.models.model_deepseek_v3 import (
     Indexer,
     AttentionDeepSeekV3,
@@ -287,6 +287,7 @@ class TransformerBlockGLM52(TransformerBlock):
         checkpoint_prefix,
         indexer_impl,
         indexer_role: str,
+        is_first_local_layer: bool,
         indexer_buffer: Optional[_IndexerBuffer] = None,
     ):
         super().__init__(
@@ -337,12 +338,20 @@ class TransformerBlockGLM52(TransformerBlock):
                 )
             )
         )
-        self.input_layernorm = RMSNorm(
-            args.dim,
-            dtype=parse_dtype(args.rms_norm_dtype),
-            eps=args.rms_norm_eps,
+        self.input_layernorm = (
+            RMSNorm(
+                args.dim,
+                dtype=parse_dtype(args.rms_norm_dtype),
+                eps=args.rms_norm_eps,
+            )
+            if is_first_local_layer
+            else RMSNormResidual(
+                args.dim,
+                dtype=parse_dtype(args.rms_norm_dtype),
+                eps=args.rms_norm_eps,
+            )
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = RMSNormResidual(
             args.dim,
             dtype=parse_dtype(args.rms_norm_dtype),
             eps=args.rms_norm_eps,
@@ -354,14 +363,22 @@ class TransformerBlockGLM52(TransformerBlock):
         x: torch.Tensor,
         freqs_cis: BatchedFreqsCis,
         is_mtp: bool = False,
-    ):
-        x = x + self.self_attn(
-            self.input_layernorm(x, compute_dtype=x.dtype),
-            freqs_cis,
-            is_mtp,
+        residual: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            assert not isinstance(self.input_layernorm, RMSNormResidual)
+            normed_x = self.input_layernorm(x, compute_dtype=x.dtype)
+        else:
+            assert isinstance(self.input_layernorm, RMSNormResidual)
+            x, normed_x = self.input_layernorm(x, residual, compute_dtype=x.dtype)
+        x, normed_x = self.post_attention_layernorm(
+            self.self_attn(normed_x, freqs_cis, is_mtp),
+            x,
+            compute_dtype=x.dtype,
         )
-        x = x + self.mlp(self.post_attention_layernorm(x, compute_dtype=x.dtype))
-        return x
+        residual_x = x
+        x = self.mlp(normed_x)
+        return x, residual_x
 
     def set_indexer_buffer(
         self, mode: Optional[str], buffer: Optional[_IndexerBuffer]
@@ -400,6 +417,7 @@ class TransformerBlockGLM52MTP(TransformerBlockGLM52):
             checkpoint_prefix=checkpoint_prefix,
             indexer_impl=indexer_impl,
             indexer_role="full",
+            is_first_local_layer=True,
         )
         self.enorm = RMSNorm(
             args.dim,
@@ -434,13 +452,8 @@ class TransformerBlockGLM52MTP(TransformerBlockGLM52):
         inputs_embeds = self.enorm(x)
         previous_hidden_states = self.hnorm(previous_hidden_states)
         x = self.eh_proj(torch.cat([inputs_embeds, previous_hidden_states], dim=-1))
-        x = x + self.self_attn(
-            self.input_layernorm(x, compute_dtype=x.dtype),
-            freqs_cis,
-            is_mtp,
-        )
-        x = x + self.mlp(self.post_attention_layernorm(x, compute_dtype=x.dtype))
-        return x
+        x, residual = super().forward(x, freqs_cis, is_mtp)
+        return x + residual
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +501,7 @@ class TransformerGLM52(TransformerDeepSeekV3):
                     checkpoint_prefix=f"layers.{layer_id}",
                     indexer_impl=self.indexer_backend,
                     indexer_role=indexer_types[layer_id],
+                    is_first_local_layer=layer_id == self.local_begin_layer_id,
                     indexer_buffer=self._backbone_buf,
                 )
             else:
@@ -603,8 +617,14 @@ class TransformerGLM52(TransformerDeepSeekV3):
             self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
         h = self._pre_layers(tokens, **args)
 
-        for layer in self.non_mtp_layers:
-            h = layer(h, freqs_cis)
+        residual = None
+        for it, layer in enumerate(self.non_mtp_layers):
+            if it == 0:
+                h, residual = layer(h, freqs_cis)
+            else:
+                h, residual = layer(h, freqs_cis, residual=residual)
+        if residual is not None:
+            h = h + residual
 
         if self.mtp_size > 1:
             self.mtp_prefill(
@@ -623,8 +643,14 @@ class TransformerGLM52(TransformerDeepSeekV3):
     def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
         self._clear_backbone_indexer_buffer()
         h = self._pre_layers(tokens)
-        for layer in self.non_mtp_layers:
-            h = layer(h, freqs_cis)
+        residual = None
+        for it, layer in enumerate(self.non_mtp_layers):
+            if it == 0:
+                h, residual = layer(h, freqs_cis)
+            else:
+                h, residual = layer(h, freqs_cis, residual=residual)
+        if residual is not None:
+            h = h + residual
         if self.mtp_size > 1:
             self.update_mtp_hidden_states(
                 self.norm(h, compute_dtype=h.dtype), is_mtp=True
@@ -700,8 +726,14 @@ class TransformerGLM52(TransformerDeepSeekV3):
         if self.moe_impl is not None:
             self.moe_impl.prepare(TaskType.Prefill, batch_size)
 
-        for layer in self.non_mtp_layers:
-            h = layer(h, freqs_cis)
+        residual = None
+        for it, layer in enumerate(self.non_mtp_layers):
+            if it == 0:
+                h, residual = layer(h, freqs_cis)
+            else:
+                h, residual = layer(h, freqs_cis, residual=residual)
+        if residual is not None:
+            h = h + residual
 
         if self.pp_stage == self.pp_end_stage:
             if self.mtp_size > 1:
@@ -743,8 +775,14 @@ class TransformerGLM52(TransformerDeepSeekV3):
                 middle_state, topk = self._unpack_topk(middle_state)
                 self._backbone_buf.topk = topk
             h = middle_state
-        for layer in self.non_mtp_layers:
-            h = layer(h, freqs_cis)
+        residual = None
+        for it, layer in enumerate(self.non_mtp_layers):
+            if it == 0:
+                h, residual = layer(h, freqs_cis)
+            else:
+                h, residual = layer(h, freqs_cis, residual=residual)
+        if residual is not None:
+            h = h + residual
         if self.pp_stage == self.pp_end_stage:
             if self.mtp_size > 1:
                 self.update_mtp_hidden_states(

@@ -7,7 +7,7 @@ import functools
 import operator
 from logging import getLogger
 from collections import OrderedDict
-from typing import Any, Mapping, Optional, Callable
+from typing import Any, Mapping, Optional, Callable, Tuple
 from contextlib import nullcontext
 
 import torch
@@ -33,6 +33,7 @@ from chitu.muxi_utils import (
 from chitu.ops import (
     apply_rotary_pos_emb,
     rms_norm,
+    rms_norm_residual,
     layer_norm,
     moe_gate,
     add_shared_experts,
@@ -165,6 +166,43 @@ class RMSNorm(nn.Module):
             self.weight,
             eps=self.eps,
             out=out,
+            compute_dtype=compute_dtype,
+            impl=impl,
+        )
+
+
+class RMSNormResidual(RMSNorm):
+    """
+    RMSNorm fused with residual connection.
+    """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        compute_dtype=None,
+        impl: str = "auto",
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass for RMSNormResidual.
+
+        Args:
+            x (torch.Tensor): Input tensor to add to the residual.
+            residual (torch.Tensor): Residual tensor.
+            compute_dtype (torch.dtype, optional): The dtype to use for computation.
+
+        Returns:
+            tuple[torch.Tensor, torch.Tensor]: The residual sum and RMS-normalized residual sum.
+        """
+
+        if compute_dtype is None:
+            compute_dtype = torch.float32
+
+        return rms_norm_residual(
+            x,
+            residual,
+            self.weight,
+            eps=self.eps,
             compute_dtype=compute_dtype,
             impl=impl,
         )
@@ -1126,6 +1164,9 @@ class Transformer(nn.Module):
     def _init_layers(self, cache_dict: dict[str, KVCacheBase], attn_backend, op_impl):
         raise NotImplementedError
 
+    def _layer_expects_residual_input(self) -> bool:
+        return False
+
     def _init_post_layers(self):
         raise NotImplementedError
 
@@ -1360,8 +1401,17 @@ class Transformer(nn.Module):
 
         h = self._pre_layers(tokens, **args)
 
+        residual = None
         for it, layer in enumerate(self.non_mtp_layers):
-            h = layer(h, freqs_cis)
+            if self._layer_expects_residual_input():
+                if it == 0:
+                    h, residual = layer(h, freqs_cis)
+                else:
+                    h, residual = layer(h, freqs_cis, residual=residual)
+            else:
+                h = layer(h, freqs_cis)
+        if residual is not None:
+            h = h + residual
         if self.mtp_size > 1:
             self.mtp_prefill(
                 x=self._pre_layers_mtp(tokens, **args),
@@ -1379,8 +1429,17 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
         h = self._pre_layers(tokens)
+        residual = None
         for it, layer in enumerate(self.non_mtp_layers):
-            h = layer(h, freqs_cis)
+            if self._layer_expects_residual_input():
+                if it == 0:
+                    h, residual = layer(h, freqs_cis)
+                else:
+                    h, residual = layer(h, freqs_cis, residual=residual)
+            else:
+                h = layer(h, freqs_cis)
+        if residual is not None:
+            h = h + residual
         if self.mtp_size > 1:
             self.update_mtp_hidden_states(
                 self.norm(h, compute_dtype=h.dtype), is_mtp=True
@@ -1476,8 +1535,17 @@ class Transformer(nn.Module):
                 batch_size,
             )
 
+        residual = None
         for it, layer in enumerate(self.non_mtp_layers):
-            h = layer(h, freqs_cis)
+            if self._layer_expects_residual_input():
+                if it == 0:
+                    h, residual = layer(h, freqs_cis)
+                else:
+                    h, residual = layer(h, freqs_cis, residual=residual)
+            else:
+                h = layer(h, freqs_cis)
+        if residual is not None:
+            h = h + residual
 
         if self.pp_stage == self.pp_end_stage:
             if self.mtp_size > 1:
@@ -1506,8 +1574,17 @@ class Transformer(nn.Module):
             h = self._pre_layers(tokens)
         else:
             h = tokens
+        residual = None
         for it, layer in enumerate(self.non_mtp_layers):
-            h = layer(h, freqs_cis)
+            if self._layer_expects_residual_input():
+                if it == 0:
+                    h, residual = layer(h, freqs_cis)
+                else:
+                    h, residual = layer(h, freqs_cis, residual=residual)
+            else:
+                h = layer(h, freqs_cis)
+        if residual is not None:
+            h = h + residual
         if self.pp_stage == self.pp_end_stage:
             if self.mtp_size > 1:
                 self.update_mtp_hidden_states(

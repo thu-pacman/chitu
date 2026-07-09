@@ -30,6 +30,7 @@ from chitu.models.model import (
     MoeGate,
     ParallelMoeBlock,
     RMSNorm,
+    RMSNormResidual,
     LayerNorm,
     Transformer,
     TransformerBlock,
@@ -1564,6 +1565,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         *,
         checkpoint_prefix,
         indexer_impl=None,
+        is_first_local_layer: bool,
     ):
         super().__init__(
             layer_id, args, cache_dict, attn_backend=attn_backend, op_impl=op_impl
@@ -1612,16 +1614,28 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 )
             )
         )
-        self.input_layernorm = RMSNorm(
-            args.dim,
-            dtype=(
-                parse_dtype(args.rms_norm_dtype)
-                if hasattr(args, "rms_norm_dtype")
-                else None
-            ),
-            eps=getattr(args, "rms_norm_eps", 1e-6),
+        self.input_layernorm = (
+            RMSNorm(
+                args.dim,
+                dtype=(
+                    parse_dtype(args.rms_norm_dtype)
+                    if hasattr(args, "rms_norm_dtype")
+                    else None
+                ),
+                eps=getattr(args, "rms_norm_eps", 1e-6),
+            )
+            if is_first_local_layer
+            else RMSNormResidual(
+                args.dim,
+                dtype=(
+                    parse_dtype(args.rms_norm_dtype)
+                    if hasattr(args, "rms_norm_dtype")
+                    else None
+                ),
+                eps=getattr(args, "rms_norm_eps", 1e-6),
+            )
         )
-        self.post_attention_layernorm = RMSNorm(
+        self.post_attention_layernorm = RMSNormResidual(
             args.dim,
             dtype=(
                 parse_dtype(args.rms_norm_dtype)
@@ -1637,14 +1651,22 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         x: torch.Tensor,
         freqs_cis: BatchedFreqsCis,
         is_mtp: bool = False,
-    ):
-        x = x + self.self_attn(
-            self.input_layernorm(x, compute_dtype=x.dtype),
-            freqs_cis,
-            is_mtp,
+        residual: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            assert not isinstance(self.input_layernorm, RMSNormResidual)
+            normed_x = self.input_layernorm(x, compute_dtype=x.dtype)
+        else:
+            assert isinstance(self.input_layernorm, RMSNormResidual)
+            x, normed_x = self.input_layernorm(x, residual, compute_dtype=x.dtype)
+        x, normed_x = self.post_attention_layernorm(
+            self.self_attn(normed_x, freqs_cis, is_mtp),
+            x,
+            compute_dtype=x.dtype,
         )
-        x = x + self.mlp(self.post_attention_layernorm(x, compute_dtype=x.dtype))
-        return x
+        residual_x = x
+        x = self.mlp(normed_x)
+        return x, residual_x
 
 
 class TransformerBlockDeepSeekV3MTP(TransformerBlockDeepSeekV3):
@@ -1669,6 +1691,7 @@ class TransformerBlockDeepSeekV3MTP(TransformerBlockDeepSeekV3):
             mla_absorb=mla_absorb,
             checkpoint_prefix=checkpoint_prefix,
             indexer_impl=indexer_impl,
+            is_first_local_layer=True,
         )
 
         self.enorm = RMSNorm(
@@ -1713,8 +1736,8 @@ class TransformerBlockDeepSeekV3MTP(TransformerBlockDeepSeekV3):
         inputs_embeds = self.enorm(x)
         previous_hidden_states = self.hnorm(previous_hidden_states)
         x = self.eh_proj(torch.cat([inputs_embeds, previous_hidden_states], dim=-1))
-        x = super().forward(x, freqs_cis, is_mtp)
-        return x
+        x, residual = super().forward(x, freqs_cis, is_mtp)
+        return x + residual
 
 
 @register_model(ModelType.DEEPSEEK_V3)
@@ -2486,6 +2509,7 @@ class TransformerDeepSeekV3(Transformer):
                     mla_absorb=self.mla_absorb,
                     checkpoint_prefix=f"layers.{layer_id}",
                     indexer_impl=self.indexer_backend,
+                    is_first_local_layer=layer_id == self.local_begin_layer_id,
                 )
             else:
                 block = TransformerBlockDeepSeekV3MTP(
@@ -2500,6 +2524,9 @@ class TransformerDeepSeekV3(Transformer):
                 )
 
             self.layers.append(block)
+
+    def _layer_expects_residual_input(self) -> bool:
+        return True
 
     @override
     def _init_post_layers(self):
