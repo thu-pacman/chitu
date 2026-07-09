@@ -8,6 +8,7 @@ import functools
 
 import torch
 
+from chitu.lazy import eval_lazy
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.distributed.comm_group import CommGroup
 from chitu.moe.batched_routed_activation import (
@@ -122,10 +123,13 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
     @override
     def exit_moe_after_local_sum(self, local_sum_result: torch.Tensor) -> torch.Tensor:
-        # NOTE: This function do in-place operation on input.
+        # NOTE: This function does in-place operations on input.
         # TODO: For safety, add an `inplace: bool` parameter.
-        self.ep_etp_group.all_reduce(local_sum_result)
+        if self.ep_etp_group.group_size > 1:
+            local_sum_result = eval_lazy(local_sum_result)
+            self.ep_etp_group.all_reduce(local_sum_result)
         if self.dp_group.group_size > 1:
+            local_sum_result = eval_lazy(local_sum_result)
             local_sum_result = local_sum_result[
                 self.cum_num_tokens[self.dp_group.rank_in_group] : self.cum_num_tokens[
                     self.dp_group.rank_in_group + 1

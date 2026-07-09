@@ -5,6 +5,7 @@
 from typing import Optional
 import torch
 
+from chitu.lazy import eval_lazy, make_lazy_op
 from chitu.device_type import has_accelerator
 from chitu.ops.utils import compatible_with_inplace, make_op_dispatcher
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
@@ -16,11 +17,13 @@ has_triton_impl = has_triton and has_accelerator()
 if has_triton_impl:
     from chitu.ops.triton_ops import (
         moe_sum_per_token_triton,
+        moe_sum_per_token_with_shared_triton,
         moe_sum_expert_block_permuted_triton,
         moe_sum_per_expert_dense_triton,
     )
 
 
+@make_lazy_op
 @make_op_dispatcher
 def moe_sum_per_token(
     x: torch.Tensor,
@@ -33,9 +36,9 @@ def moe_sum_per_token(
     Operator of PerTokenBatchedExpertResult.weighted_sum.
 
     Args:
-        x: [batch_size, topk, hidden_size]. Input activatoin.
+        x: [batch_size, topk, hidden_size]. Input activation.
         topk_weights: [batch_size, topk]. Weight for each expert.
-        out: Optional inplace output.
+        out: Optional in-place output.
 
     Returns:
         [batch_size, hidden_size]. Summed activation.
@@ -53,6 +56,56 @@ def _auto_moe_sum_per_token():
 moe_sum_per_token.register_candidate("triton")
 if has_triton_impl:
     moe_sum_per_token.register("triton")(moe_sum_per_token_triton)
+
+
+@make_op_dispatcher
+def moe_sum_per_token_with_shared(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    shared_y: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    impl: str = "auto",
+):
+    """
+    Operator of PerTokenBatchedExpertResult.weighted_sum fused with shared expert output.
+
+    Args:
+        x: [batch_size, topk, hidden_size]. Input activation.
+        topk_weights: [batch_size, topk]. Weight for each expert.
+        shared_y: [batch_size, hidden_size]. Output from shared experts.
+        out: Optional in-place output.
+
+    Returns:
+        [batch_size, hidden_size]. Summed activation plus shared expert output.
+    """
+    raise NotImplementedError
+
+
+@moe_sum_per_token_with_shared.register_auto
+def _auto_moe_sum_per_token_with_shared():
+    if has_triton_impl:
+        return "triton"
+    return "separated"
+
+
+moe_sum_per_token_with_shared.register_candidate("triton")
+if has_triton_impl:
+    moe_sum_per_token_with_shared.register("triton")(
+        moe_sum_per_token_with_shared_triton
+    )
+
+
+@moe_sum_per_token_with_shared.register("separated")
+def moe_sum_per_token_with_shared_separated(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    shared_y: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+):
+    y = eval_lazy(moe_sum_per_token(x, topk_weights, out=out))
+    return torch.add(y, shared_y, out=out)
 
 
 @moe_sum_per_token.register("torch")

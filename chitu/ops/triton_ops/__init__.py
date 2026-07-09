@@ -55,6 +55,7 @@ from chitu.ops.triton_ops.quant import (
 )
 from chitu.ops.triton_ops.moe_sum import (
     moe_sum_per_token_triton,
+    moe_sum_per_token_with_shared_triton,
     moe_sum_expert_block_permuted_triton,
     moe_sum_per_expert_dense_triton,
 )

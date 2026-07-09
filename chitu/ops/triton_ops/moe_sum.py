@@ -11,10 +11,30 @@ import triton.language as tl
 def moe_sum_per_token_triton(
     x: torch.Tensor, topk_weights: torch.Tensor, *, out: Optional[torch.Tensor] = None
 ):
-    # NOTE: Although this function accept inplace `out` parameter, but `out` cannot
-    # have the same address as `x` or `topk_weights`, due to Triton limitations.
+    return moe_sum_per_token_with_shared_triton(x, topk_weights, shared_y=None, out=out)
+
+
+def moe_sum_per_token_with_shared_triton(
+    x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    shared_y: Optional[torch.Tensor] = None,
+    *,
+    out: Optional[torch.Tensor] = None,
+):
+    # NOTE: Although this function accepts inplace `out` parameter, `out` cannot
+    # have the same address as any input tensor, due to Triton limitations.
 
     M, topk, N = x.shape
+
+    if x.is_meta:
+        if out is None:
+            out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+        assert out.shape == (M, N)
+        assert out.dtype == x.dtype
+        if shared_y is not None:
+            assert shared_y.shape == (M, N)
+            assert shared_y.dtype == x.dtype
+        return out
 
     # SPDX-SnippetBegin
     # SPDX-License-Identifier: Apache-2.0
@@ -53,17 +73,24 @@ def moe_sum_per_token_triton(
     assert x.is_contiguous()
     assert topk_weights.is_contiguous()
     assert out.is_contiguous()
+    has_shared_y = shared_y is not None
+    if has_shared_y:
+        assert shared_y.shape == (M, N)
+        assert shared_y.dtype == x.dtype
+        assert shared_y.is_contiguous()
 
-    # M * topk * N 可能overflow，按需让 kernel 内部用 int64
+    # M * topk * N may overflow int32, so the kernel uses int64 offsets when needed.
     use_i64 = M * topk * N > 2**31 - 1
     moe_sum_per_token_triton_kernel[M,](
         x,
         topk_weights,
+        shared_y,
         out,
         M,
         topk,
         N,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
+        HAS_SHARED_Y=has_shared_y,
         USE_I64_OFFSET=use_i64,
         num_warps=num_warps,
     )
@@ -76,6 +103,7 @@ def moe_sum_per_token_triton_kernel(
     # Pointers to matrices
     x_ptr,  # (M, topk, N)
     topk_weights_ptr,  # (M, topk)
+    shared_y_ptr,  # (M, N), used only when HAS_SHARED_Y is true
     output_ptr,  # (M, N)
     # Matrix dimensions
     M,
@@ -83,10 +111,11 @@ def moe_sum_per_token_triton_kernel(
     N,
     # Meta-parameters
     BLOCK_SIZE_N: tl.constexpr,
+    HAS_SHARED_Y: tl.constexpr,
     USE_I64_OFFSET: tl.constexpr,
 ):
     row_index = tl.program_id(axis=0)
-    # row_index * topk * N 可能overflow，按需让 kernel 内部用 int64
+    # row_index * topk * N may overflow int32, so use int64 offsets when needed.
     if USE_I64_OFFSET:
         row_index = row_index.to(tl.int64)
     offs_n = tl.arange(0, BLOCK_SIZE_N)
@@ -110,8 +139,12 @@ def moe_sum_per_token_triton_kernel(
         # Add to the running sum
         output_sum += x * topk_weight
 
-    # Store the final sum to the output tensor
     output_offset = row_index * N + offs_n
+    if HAS_SHARED_Y:
+        shared_y = tl.load(shared_y_ptr + output_offset, n_mask, other=0.0)
+        output_sum += shared_y
+
+    # Store the final sum to the output tensor
     tl.store(output_ptr + output_offset, output_sum, mask=n_mask)
 
 

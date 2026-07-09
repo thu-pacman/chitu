@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from chitu.lazy import eval_lazy
 from chitu.task_type import TaskType
 from chitu.device_type import is_muxi
 from chitu.attn_backend import AttnBackend, NpuAttnBackend
@@ -2250,7 +2251,7 @@ class ParallelMoeBlock(nn.Module):
             if len(y_list) == 1:
                 y = y_list[0]
             else:
-                y = torch.cat(y_list, dim=0)
+                y = torch.cat([eval_lazy(y_item) for y_item in y_list], dim=0)
 
             if shared_y is not None and self.moe_impl.tp_size > 1:
                 # Note that shared experts are partitioned among TP groups instead of ETP groups,
@@ -2275,7 +2276,7 @@ class ParallelMoeBlock(nn.Module):
             if self.moe_impl.tp_size > 1:
                 self.moe_impl.tp_group.all_reduce(shared_y)
             y += shared_y
-        return y.view(shape)
+        return eval_lazy(y).view(shape)
 
 
 def get_linear_layout_native_y(
