@@ -30,6 +30,7 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
         (128, 1, 1, None, 8, "sigmoid", True, False),
         (256, 1, 1, None, 6, "sqrtsoftplus", True, True),
         (128, 1, 1, None, 8, "softmax", False, None),
+        (384, 1, 1, None, 8, "sigmoid", True, True),  # Kimi-K2.5
     ],
 )
 @pytest.mark.parametrize("norm_prob", [True, False])
@@ -79,6 +80,10 @@ def test_moe_fused_gate(
             pytest.skip("npu_moe_gating_top_k only supports 256 and 384 experts")
         if not norm_prob:
             pytest.skip("npu_moe_gating_top_k only supports norm_prob=True")
+        if not (num_expert_group == topk_group == topk):
+            pytest.skip(
+                "npu_moe_gating_top_k only supports num_expert_group == topk_group == topk"
+            )
     if impl == "npu_moe_gating_top_k_softmax":
         if not has_torch_npu:
             pytest.skip("torch_npu is missing")

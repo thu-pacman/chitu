@@ -411,7 +411,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
     }
 }
 
-template <typename T, typename BIAS_T, int EXPERTS, bool NORMALIZE_TOPK>
+template <typename T, typename BIAS_T, int EXPERTS, bool NORMALIZE_TOPK,
+          int BYTES_PER_LDG = 16>
 void fused_gate_dispatcher(const T *input, const int score_fun,
                            const int batchSize, const int n_groups,
                            const int topK_groups, int topInGroup,
@@ -419,7 +420,6 @@ void fused_gate_dispatcher(const T *input, const int score_fun,
                            const int topK, const BIAS_T *bias,
                            cudaStream_t stream) {
     static constexpr int BLOCK_SIZE = 256;
-    static constexpr int BYTES_PER_LDG = 16;
 
     using Constants = TopkConstants<T, EXPERTS, BYTES_PER_LDG>;
 
@@ -459,6 +459,12 @@ void fused_gate_dispatcher(const T *input, const int score_fun,
         input, score_fun, batchSize, n_groups, topK_groups, topInGroup,        \
         expertsIds, selectedExpertsWeights, topK, bias, stream)
 
+#define LAUNCH_GATE_LDG(NUM_EXPERTS, BYTES_PER_LDG)                            \
+    fused_gate_dispatcher<T, BIAS_T, NUM_EXPERTS, NORMALIZE_TOPK,              \
+                          BYTES_PER_LDG>(                                      \
+        input, score_fun, batchSize, n_groups, topK_groups, topInGroup,        \
+        expertsIds, selectedExpertsWeights, topK, bias, stream)
+
 template <typename T, typename BIAS_T, bool NORMALIZE_TOPK>
 void fused_gate_launcher(const T *input, int score_fun, const int batchSize,
                          const int n_groups, const int topK_groups,
@@ -467,6 +473,12 @@ void fused_gate_launcher(const T *input, int score_fun, const int batchSize,
                          const int numExperts, const BIAS_T *bias,
                          cudaStream_t stream) {
     switch (numExperts) {
+    case 384:
+        // 384 is not a power of two. With 8-byte vector loads, each row uses
+        // 32 threads, so warp-shuffle reductions still have a power-of-two
+        // width.
+        LAUNCH_GATE_LDG(384, 8);
+        break;
     case 256:
         LAUNCH_GATE(256);
         break;

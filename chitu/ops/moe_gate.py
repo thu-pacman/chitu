@@ -80,12 +80,13 @@ def _auto_moe_gate(
     score_func: str,
     norm_prob: bool = False,
 ):
+    num_experts = scores.shape[-1]
     if (
         has_muxi_layout_kernels
         and num_expert_group == 8
         and topk_group == 4
         and topk == 8
-        and scores.shape[-1] == 256
+        and num_experts == 256
         and score_func in ["sigmoid", "softmax"]
         and (
             e_score_correction_bias is None
@@ -97,24 +98,31 @@ def _auto_moe_gate(
         return "cpu"
     if (
         has_hard_fp4_kernels
-        and scores.shape[-1] <= 256
-        and is_power_of_two(scores.shape[-1])
+        and num_experts <= 256
+        and is_power_of_two(num_experts)
         and score_func in ["softmax"]
     ):
         return "blackwell"
-    if (
-        has_chitu_backend
-        and scores.shape[-1] <= 256
-        and is_power_of_two(scores.shape[-1])
-        and (
-            (score_func == "softmax" and topk == 8)
-            or (score_func in ["sigmoid", "sqrtsoftplus"] and topk in [6, 8])
+    if has_chitu_backend and (
+        (
+            score_func == "softmax"
+            and topk == 8
+            and num_experts <= 256
+            and is_power_of_two(num_experts)
+        )
+        or (
+            score_func in ["sigmoid", "sqrtsoftplus"]
+            and topk in [6, 8]
+            and (
+                (num_experts <= 256 and is_power_of_two(num_experts))
+                or num_experts == 384
+            )
         )
     ):
         return "cuda"
     if (
         has_torch_npu
-        and scores.shape[-1] in [256, 384]
+        and num_experts in [256, 384]
         and norm_prob
         and score_func in ["softmax", "sigmoid"]
         # aclnnMoeGatingTopK requires group_count == k_count == k.
