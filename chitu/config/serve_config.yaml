@@ -357,6 +357,10 @@ infer:
   #: Whether to fuse shared experts and routed experts into the same operators. This field is
   #: ignored for non-MoE models, or for MoE models with no shared experts.
   #:
+  #: When enabled, shared experts are treated as part of MoE blocks and partitioned by
+  #: `infer.etp_size`. When disabled, shared experts are treated as ordinary dense modules
+  #: and partitioned by `infer.tp_size`.
+  #:
   #: Acceptable values: True, False
   fuse_shared_experts: False
 

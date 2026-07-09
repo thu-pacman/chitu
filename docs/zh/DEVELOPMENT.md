@@ -483,6 +483,8 @@ torchrun --nproc_per_node 8 test/single_req_test.py request.max_new_tokens=64 mo
 
 TP、DP、ETP、EP 和/或 PP 可通过传入 `tp_size`、`dp_size`、`etp_size`、`ep_size` 和/或 `pp_size` 参数开启。ETP 的并行度如不设置，默认等于 `tp_size * dp_size // ep_size`。
 
+对于带有共享专家的 MoE 模型，`infer.fuse_shared_experts` 还决定共享专家的切分方式。当 `infer.fuse_shared_experts=True` 时，共享专家被视为 MoE 块的一部分，并按照 `infer.etp_size` 切分，与路由专家保持一致。当 `infer.fuse_shared_experts=False` 时，共享专家被视为普通稠密模块，并按照 `infer.tp_size` 切分。
+
 TP 样例参数：
 
 ```bash

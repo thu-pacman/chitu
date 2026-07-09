@@ -599,7 +599,11 @@ class Transformer(nn.Module):
             quant = get_quant_from_checkpoint_prefix(name)
             quant_kwargs = get_quant_kwargs_from_checkpoint_prefix(name)
             backend = get_backend_from_checkpoint_prefix(name)
-            if ".experts." in name:
+            is_moe_expert_tensor = ".experts." in name or (
+                get_global_args().infer.fuse_shared_experts
+                and ".shared_experts." in name
+            )
+            if is_moe_expert_tensor:
                 tp_or_etp_size = etp_size
                 tp_or_etp_rank = etp_rank
             else:

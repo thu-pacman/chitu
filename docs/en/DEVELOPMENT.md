@@ -477,6 +477,8 @@ Chitu makes parallelism with higher communication demands use nearer devices:
 
 TP, DP, ETP, EP, PCP and/or PP can be used by passing `tp_size`, `dp_size`, `etp_size`, `ep_size`, `pcp_size` and/or `pp_size` arguments. ETP size is `tp_size * dp_size // ep_size` by default if omitted.
 
+For MoE models with shared experts, `infer.fuse_shared_experts` also determines how shared experts are partitioned. When `infer.fuse_shared_experts=True`, shared experts are treated as part of MoE blocks and partitioned by `infer.etp_size`, the same as routed experts. When `infer.fuse_shared_experts=False`, shared experts are treated as ordinary dense modules and partitioned by `infer.tp_size`.
+
 Example arguments for TP:
 
 ```bash
