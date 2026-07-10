@@ -78,6 +78,7 @@ def srun(cfg, raw_argv, local_run_callback):
             str(num_cpus),
             "--mem",
             str(num_mems),
+            "--kill-on-bad-exit=1",
         ]
 
         gres_info = run_capture(["sinfo", "--noheader", "-o", "%G"])

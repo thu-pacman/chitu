@@ -25,7 +25,11 @@ from chitu.ops.triton_ops.deepseek_compressor import (
     compress_csa,
     writeback_pending,
 )
-from chitu.ops.triton_ops.norm import rms_norm_triton, layer_norm_triton
+from chitu.ops.triton_ops.norm import (
+    rms_norm_triton,
+    rms_norm_residual_triton,
+    layer_norm_triton,
+)
 from chitu.ops.triton_ops.quant import (
     blockfp8_einsum_shc_hdc_shd_triton,
     w8a8_gemm_per_token_per_channel_triton,
@@ -51,6 +55,7 @@ from chitu.ops.triton_ops.quant import (
 )
 from chitu.ops.triton_ops.moe_sum import (
     moe_sum_per_token_triton,
+    moe_sum_per_token_with_shared_triton,
     moe_sum_expert_block_permuted_triton,
     moe_sum_per_expert_dense_triton,
 )

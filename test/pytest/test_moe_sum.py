@@ -1,7 +1,9 @@
 import torch
 import pytest
 
+from chitu.lazy import eval_lazy
 from chitu.ops import (
+    add,
     moe_sum_per_token,
     moe_sum_expert_block_permuted,
     moe_sum_per_expert_dense,
@@ -9,7 +11,7 @@ from chitu.ops import (
     batched_routed_activation_indexed_to_per_expert_dense,
 )
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
-from chitu.testing import assert_close, gen_token_to_expert_indices
+from chitu.testing import assert_close, gen_token_to_expert_indices, AssertOpCalled
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -38,13 +40,15 @@ def test_moe_sum_per_token(
     topk_weights = torch.rand(M, topk, device="cuda", dtype=compute_dtype)
 
     test_output = torch.zeros(M, N, device="cuda", dtype=compute_dtype)
-    run_triton = lambda: moe_sum_per_token(
-        input_tensor, topk_weights, out=test_output, impl="triton"
+    run_triton = lambda: eval_lazy(
+        moe_sum_per_token(input_tensor, topk_weights, out=test_output, impl="triton")
     )
 
     if expect_i64_offset is None:
         ref_output = torch.zeros(M, N, device="cuda", dtype=compute_dtype)
-        moe_sum_per_token(input_tensor, topk_weights, out=ref_output, impl="torch")
+        eval_lazy(
+            moe_sum_per_token(input_tensor, topk_weights, out=ref_output, impl="torch")
+        )
         record_benchmark.run(run_triton, N=N, impl="triton")
     else:
         product = M * topk * N
@@ -69,6 +73,41 @@ def test_moe_sum_per_token(
                 .sum(dim=1)
                 .to(compute_dtype)
             )
+
+    assert_close(test_output, ref_output, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("op", ["add", "radd", "iadd", "explicit_add", "explicit_radd"])
+@pytest.mark.parametrize("M", [0, 32])
+@pytest.mark.parametrize("topk", [8])
+@pytest.mark.parametrize("N", [256])
+@pytest.mark.parametrize("compute_dtype", [torch.float16])
+@pytest.mark.skipif(not has_triton, reason="triton is not available")
+def test_moe_sum_per_token_add_shared_fusion(op, M, topk, N, compute_dtype):
+    input_tensor = torch.rand(M, topk, N, device="cuda", dtype=compute_dtype)
+    topk_weights = torch.rand(M, topk, device="cuda", dtype=compute_dtype)
+    shared_y = torch.rand(M, N, device="cuda", dtype=compute_dtype)
+
+    ref_output = torch.add(
+        eval_lazy(moe_sum_per_token(input_tensor, topk_weights, impl="torch")),
+        shared_y,
+    )
+
+    with AssertOpCalled("moe_sum_per_token_with_shared", expected_call_cnt=1):
+        lazy_sum = moe_sum_per_token(input_tensor, topk_weights, impl="triton")
+        if op == "add":
+            test_output = eval_lazy(lazy_sum + shared_y)
+        elif op == "radd":
+            test_output = eval_lazy(shared_y + lazy_sum)
+        elif op == "iadd":
+            lazy_sum += shared_y
+            test_output = eval_lazy(lazy_sum)
+        elif op == "explicit_add":
+            test_output = eval_lazy(add(lazy_sum, shared_y))
+        elif op == "explicit_radd":
+            test_output = eval_lazy(add(shared_y, lazy_sum))
+        else:
+            raise AssertionError(f"unknown op: {op}")
 
     assert_close(test_output, ref_output, rtol=1e-2, atol=1e-2)
 
@@ -151,24 +190,28 @@ def test_moe_sum_per_expert_dense(
     topk_weights = torch.rand(M, topk, device="cuda", dtype=compute_dtype)
 
     ref_output = torch.zeros(M, N, device="cuda", dtype=compute_dtype)
-    moe_sum_per_expert_dense(
-        activation_per_expert,
-        token_to_expert_indices,
-        token_pos_in_expert,
-        topk_weights,
-        out=ref_output,
-        impl="ref",
-    )
-
-    test_output = torch.zeros(M, N, device="cuda", dtype=compute_dtype)
-    record_benchmark.run(
-        lambda: moe_sum_per_expert_dense(
+    eval_lazy(
+        moe_sum_per_expert_dense(
             activation_per_expert,
             token_to_expert_indices,
             token_pos_in_expert,
             topk_weights,
-            out=test_output,
-            impl="triton",
+            out=ref_output,
+            impl="ref",
+        )
+    )
+
+    test_output = torch.zeros(M, N, device="cuda", dtype=compute_dtype)
+    record_benchmark.run(
+        lambda: eval_lazy(
+            moe_sum_per_expert_dense(
+                activation_per_expert,
+                token_to_expert_indices,
+                token_pos_in_expert,
+                topk_weights,
+                out=test_output,
+                impl="triton",
+            )
         ),
         N=N,
         impl="triton",

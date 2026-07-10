@@ -7,6 +7,7 @@ from typing_extensions import override
 
 import torch
 
+from chitu.lazy import eval_lazy
 from chitu.task_type import TaskType
 from chitu.utils import try_import_opt_dep, try_import_and_setup_torch_npu, ceil_div
 from chitu.moe.token_dispatchers import (
@@ -669,6 +670,7 @@ class MoEImplNoEP(MoEImplBase):
         if self.need_token_dispatch():
             return self.cp_etp_dispatcher.exit_moe_after_local_sum(local_sum_result)
         if self.etp_size > 1:
+            local_sum_result = eval_lazy(local_sum_result)
             self.etp_group.all_reduce(local_sum_result)
         return local_sum_result
 

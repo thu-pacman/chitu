@@ -9,6 +9,7 @@ import functools
 
 import torch
 
+from chitu.lazy import eval_lazy
 from chitu.device_type import is_blackwell, is_hygon
 from chitu.global_vars import get_global_args
 from chitu.utils import parse_dtype, ceil_div
@@ -281,6 +282,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
     def exit_moe_after_local_sum(
         self, local_sum_result, previous_event: Optional["deep_ep.EventOverlap"] = None
     ):
+        local_sum_result = eval_lazy(local_sum_result)
         handle, topk_ids, topk_weights, dp_local_bs = self.dispatch_ctx
         combined_x, event = self.combine_forward(
             local_sum_result, topk_weights, handle, dp_local_bs

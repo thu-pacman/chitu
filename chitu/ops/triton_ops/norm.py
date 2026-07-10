@@ -94,6 +94,62 @@ def layer_norm_triton(
     return out.view(x_shape)
 
 
+@auto_retry_triton_compilation
+def rms_norm_residual_triton(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps,
+    compute_dtype: torch.dtype,
+):
+    combined = torch.empty_like(x)
+    normed = torch.empty_like(x)
+    if x.numel() == 0:
+        return combined, normed
+
+    x_shape = x.shape
+    num_cols = x.shape[-1]
+    if x.ndim >= 3:
+        num_heads = x.shape[-2]
+        num_seqs = x.numel() // (num_cols * num_heads)
+    else:
+        num_heads = 1
+        num_seqs = x.numel() // num_cols
+
+    # Batch dimensions are contiguous; the last two dimensions may use arbitrary strides.
+    x = x.view(num_seqs, num_heads, num_cols)
+    residual = residual.view(num_seqs, num_heads, num_cols)
+    combined = combined.view(num_seqs, num_heads, num_cols)
+    normed = normed.view(num_seqs, num_heads, num_cols)
+
+    assert residual.shape == x.shape
+    assert weight.is_contiguous()
+
+    BLOCK_SIZE, _ = calculate_settings(num_cols)
+    rms_norm_kernel[num_seqs, num_heads](
+        normed,
+        normed.stride(-3),
+        normed.stride(-2),
+        x,
+        x.stride(-3),
+        x.stride(-2),
+        weight,
+        num_cols,
+        eps,
+        residual,
+        residual.stride(-3),
+        residual.stride(-2),
+        combined,
+        combined.stride(-3),
+        combined.stride(-2),
+        compute_dtype=to_triton_dtype(compute_dtype),
+        BLOCK_SIZE=BLOCK_SIZE,
+        HAS_RESIDUAL=True,
+    )
+    return combined.view(x_shape), normed.view(x_shape)
+
+
 @compatible_with_inplace
 @auto_retry_triton_compilation
 def rms_norm_triton(
@@ -119,7 +175,7 @@ def rms_norm_triton(
 
     assert weight.is_contiguous()
 
-    BLOCK_SIZE, num_warps = calculate_settings(num_cols)
+    BLOCK_SIZE, _ = calculate_settings(num_cols)
     rms_norm_kernel[num_seqs, num_heads](
         out,
         out.stride(-3),
@@ -130,8 +186,15 @@ def rms_norm_triton(
         weight,
         num_cols,
         eps,
+        None,
+        0,
+        0,
+        None,
+        0,
+        0,
         compute_dtype=to_triton_dtype(compute_dtype),
         BLOCK_SIZE=BLOCK_SIZE,
+        HAS_RESIDUAL=False,
     )
     return out.view(x_shape)
 
@@ -198,7 +261,12 @@ def layer_norm_kernel(
         "Y_head_stride",
         "X_seq_stride",
         "X_head_stride",
+        "Residual_seq_stride",
+        "Residual_head_stride",
+        "Combined_seq_stride",
+        "Combined_head_stride",
         "compute_dtype",
+        "HAS_RESIDUAL",
     ],
 )
 @triton.jit
@@ -212,11 +280,20 @@ def rms_norm_kernel(
     W,
     n_cols: tl.constexpr,
     eps: tl.constexpr,
+    Residual,
+    Residual_seq_stride: tl.constexpr,
+    Residual_head_stride: tl.constexpr,
+    Combined,
+    Combined_seq_stride: tl.constexpr,
+    Combined_head_stride: tl.constexpr,
     compute_dtype: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
 ):
     """
-    Fast RMS Layernorm kernel
+    Fast RMSNorm kernel.
+
+    When HAS_RESIDUAL is true, the kernel also computes and stores X + Residual.
     Inspiration from a Triton tutorial:
     https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html
     """
@@ -229,7 +306,15 @@ def rms_norm_kernel(
     Y += seq_idx * Y_seq_stride + head_idx * Y_head_stride
     X += seq_idx * X_seq_stride + head_idx * X_head_stride
 
-    X_row = tl.load(X + col_offsets, mask=mask, other=0).to(compute_dtype)
+    X_row = tl.load(X + col_offsets, mask=mask, other=0)
+    if HAS_RESIDUAL:
+        Residual += seq_idx * Residual_seq_stride + head_idx * Residual_head_stride
+        Combined += seq_idx * Combined_seq_stride + head_idx * Combined_head_stride
+        Residual_row = tl.load(Residual + col_offsets, mask=mask, other=0)
+        X_row += Residual_row
+        tl.store(Combined + col_offsets, X_row, mask=mask)
+
+    X_row = X_row.to(compute_dtype)
     W_row = tl.load(W + col_offsets, mask=mask, other=0)
 
     row_var = tl.sum(X_row * X_row, axis=0) / n_cols

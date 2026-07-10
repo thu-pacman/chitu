@@ -149,7 +149,7 @@ class MooncakeKVTransferHook:
 
         first_tokens = None
         if isinstance(tasks, PackedTasks) and tasks.generated_result is not None:
-            first_tokens = tasks.generated_result.tokens.flatten().tolist()
+            first_tokens = tasks.generated_result.tokens.flatten()
 
         # Send KV cache and first-token metadata to decode side.
         if tasks.num_tasks > 0:
@@ -178,7 +178,6 @@ class MooncakeKVTransferHook:
             if pd_trace_enabled():
                 logger.debug(
                     f"[PD_TRACE][prefill.kv_send] req_ids={req_ids_output} batch={len(req_ids_output)} "
-                    f"first_tokens={first_tokens} "
                     f"cache_type={get_global_args().infer.cache_type}"
                 )
 

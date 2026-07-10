@@ -6,6 +6,8 @@ import os
 import concurrent.futures
 from logging import getLogger
 
+import torch
+
 from chitu.backend import Backend
 from chitu.kv_cache.kv_cache import PagedKVCache
 from .base import KVManagerBase, DisaggregationMode
@@ -103,7 +105,7 @@ class KVManagerPrefill(KVManagerBase):
 
     def send_kv_cache(
         self,
-        first_tokens: list[int] | None,
+        first_tokens: torch.Tensor | None,
         request_ids: list[str],
         num_hit_tokens: list[int],
     ):
@@ -113,11 +115,15 @@ class KVManagerPrefill(KVManagerBase):
         """
         logger.debug(f"send_kv_cache {request_ids}")
 
+        if first_tokens is not None:
+            first_tokens = first_tokens.clone().to("cpu", non_blocking=True)
+
+        kv_ready_event = torch.cuda.Event()
+        kv_ready_event.record()
+
         for i, req_id in enumerate(request_ids):
             info = self._info(req_id)
             info.num_hit_tokens = num_hit_tokens[i]
-            if first_tokens:
-                info.first_token = first_tokens[i]
 
             # Gather send buffers from all caches.
             inst_id = self._decode_inst_ids[info.decode_sid]
@@ -136,9 +142,25 @@ class KVManagerPrefill(KVManagerBase):
 
             plan = create_transfer_plan(send_buffers, info.recv_buffers)
             logger.debug(f"transfer_worker.submit {req_id=}")
-            self.executor.submit(self.transfer_worker, req_id, info.first_token, plan)
+            first_token = first_tokens[i] if first_tokens is not None else None
+            self.executor.submit(
+                self.transfer_worker,
+                kv_ready_event,
+                req_id,
+                first_token,
+                plan,
+            )
 
-    def transfer_worker(self, req_id: str, first_token: int, plan: TransferPlan):
+    def transfer_worker(
+        self,
+        event: torch.cuda.Event,
+        req_id: str,
+        first_token: torch.Tensor | None,
+        plan: TransferPlan,
+    ):
+        """Wait for GPU kernels to finish, then execute RDMA transfer."""
+        event.synchronize()
+        first_token = int(first_token.item()) if first_token is not None else 0
         logger.debug(f"transfer_worker.start {req_id=}")
         try:
             plan.execute_send(self.transfer_engine.engine)

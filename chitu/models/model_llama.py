@@ -11,7 +11,13 @@ from torch import nn
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.kv_cache import KVCacheBase
-from chitu.models.model import Attention, RMSNorm, Transformer, TransformerBlock
+from chitu.models.model import (
+    Attention,
+    RMSNorm,
+    RMSNormResidual,
+    Transformer,
+    TransformerBlock,
+)
 from chitu.models.registry import ModelType, register_model
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
@@ -123,8 +129,12 @@ class TransformerLlama(Transformer):
                     attn_backend,
                     self.op_impl,
                     checkpoint_prefix=f"layers.{layer_id}",
+                    is_first_local_layer=layer_id == self.local_begin_layer_id,
                 )
             )
+
+    def _layer_expects_residual_input(self) -> bool:
+        return True
 
     def _init_post_layers(self):
         self.norm = RMSNorm(self.params.dim, eps=self.params.norm_eps)
@@ -196,6 +206,8 @@ class TransformerBlockLlama(TransformerBlock):
         attn_backend,
         op_impl,
         checkpoint_prefix,
+        *,
+        is_first_local_layer: bool,
     ):
         super().__init__(layer_id, args, cache_dict, attn_backend, op_impl)
         self.attention = AttentionLlama(
@@ -212,11 +224,26 @@ class TransformerBlockLlama(TransformerBlock):
             ffn_dim_multiplier=args.ffn_dim_multiplier,
             checkpoint_prefix=f"{checkpoint_prefix}.feed_forward",
         )
-        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
-        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.attention_norm = (
+            RMSNorm(args.dim, eps=args.norm_eps)
+            if is_first_local_layer
+            else RMSNormResidual(args.dim, eps=args.norm_eps)
+        )
+        self.ffn_norm = RMSNormResidual(args.dim, eps=args.norm_eps)
 
-    def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
-        h = self.attention(self.attention_norm(x), freqs_cis)
-        h += x
-        out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        residual: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            assert not isinstance(self.attention_norm, RMSNormResidual)
+            normed_x = self.attention_norm(x)
+        else:
+            assert isinstance(self.attention_norm, RMSNormResidual)
+            x, normed_x = self.attention_norm(x, residual)
+        h = self.attention(normed_x, freqs_cis)
+        h, normed_h = self.ffn_norm(h, x)
+        out = self.feed_forward(normed_h)
+        return out, h

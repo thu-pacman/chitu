@@ -8,6 +8,7 @@ import functools
 
 import torch
 
+from chitu.lazy import eval_lazy
 from chitu.distributed.comm_group import CommGroup
 from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
@@ -120,6 +121,9 @@ class MoECPETPTokenDispatcher(MoETokenDispatcher):
 
     @override
     def exit_moe_after_local_sum(self, local_sum_result: torch.Tensor) -> torch.Tensor:
+        if self.etp_group.group_size == 1:
+            return local_sum_result
+        local_sum_result = eval_lazy(local_sum_result)
         out = torch.empty(
             self.local_num_tokens,
             local_sum_result.shape[-1],

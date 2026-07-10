@@ -26,11 +26,12 @@ from chitu.ops.kv_cache import (
     dsa_fp8_kvcache_dequant,
     dsa_fp8_paged_kvcache_read_dequant,
 )
-from chitu.ops.norm import rms_norm, layer_norm
+from chitu.ops.norm import rms_norm, rms_norm_residual, layer_norm
 from chitu.ops.moe_gate import moe_gate
 from chitu.ops.moe_hash_gate import moe_hash_gate
 from chitu.ops.moe_sum import (
     moe_sum_per_token,
+    moe_sum_per_token_with_shared,
     moe_sum_expert_block_permuted,
     moe_sum_per_expert_dense,
     moe_sum_expert_concat_permuted,
@@ -86,5 +87,6 @@ from chitu.ops.causal_conv import causal_conv1d_update, causal_conv1d_prefill
 from chitu.ops.norm_gate import rms_norm_gate
 from chitu.ops.mhc import mhc_pre, mhc_post
 from chitu.ops.fused_g import fused_g
+from chitu.ops.add import add
 from chitu.ops.add_shared_experts import add_shared_experts
 from chitu.ops.topk import topk_indices, topk_page_table_decode_cuda

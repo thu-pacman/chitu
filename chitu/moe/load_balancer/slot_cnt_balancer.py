@@ -115,6 +115,11 @@ class MoESlotCntLoadBalancer(MoELoadBalancer):
     | 2                   | 3 | 6 | 7 | 2 | 5 | 8 |
     """
 
+    # FIXME: The current algorithm only choose one distribution per DP rank. If there is only
+    # 1 DP rank (e.g., when running TP+EP), only 1 distribution will be chosen, and it may
+    # leave vacant slots. In order to fix this, we may need to do round-robin inside a DP rank
+    # at run time.
+
     def generate_expert_mapping(
         self,
         n_routed_experts: Optional[int] = None,
