@@ -123,11 +123,11 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
     @override
     def exit_moe_after_local_sum(self, local_sum_result: torch.Tensor) -> torch.Tensor:
-        # NOTE: This function does in-place operations on input.
-        # TODO: For safety, add an `inplace: bool` parameter.
+        # NOTE: This function may modify its input.
+        # TODO: Add a `maybe_inplace` parameter to `exit_moe_after_local_sum`.
         if self.ep_etp_group.group_size > 1:
             local_sum_result = eval_lazy(local_sum_result)
-            self.ep_etp_group.all_reduce(local_sum_result)
+            local_sum_result = self.ep_etp_group.all_reduce(local_sum_result)
         if self.dp_group.group_size > 1:
             local_sum_result = eval_lazy(local_sum_result)
             local_sum_result = local_sum_result[

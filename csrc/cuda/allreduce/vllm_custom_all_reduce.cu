@@ -89,6 +89,9 @@ void all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
         AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size,
                                       cudaMemcpyDeviceToDevice, stream));
     } else {
+        TORCH_CHECK(inp.data_ptr() != out.data_ptr(),
+                    "custom allreduce graph-registered mode requires distinct "
+                    "input and output tensors");
         reg_buffer = inp.data_ptr();
     }
     switch (out.scalar_type()) {

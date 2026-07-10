@@ -334,7 +334,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                     group=self.tp_group.gpu_group,
                 )
             elif self.etp_group.group_size == self.tp_group.group_size:
-                self.etp_group.all_reduce(outputs)
+                outputs = self.etp_group.all_reduce(outputs)
             else:
                 raise NotImplementedError(
                     "Only TP=1, TP=ETP, (TP>1 and ETP=1) are supported in MoELowLatencyTokenDispatcher"

@@ -1355,7 +1355,7 @@ class Transformer(nn.Module):
 
         if bool(owned_mask.any()):
             mtp_hidden_states[owned_mask] = h[last_token_offsets_local[owned_mask]]
-        cp_ctx.cp_group.all_reduce(mtp_hidden_states)
+        mtp_hidden_states = cp_ctx.cp_group.all_reduce(mtp_hidden_states)
         # gather last tokens' hidden states from all CP ranks
         self.update_mtp_hidden_states(mtp_hidden_states)
 
@@ -2278,7 +2278,7 @@ class ParallelMoeBlock(nn.Module):
             if self.shared_experts_stream:
                 torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
             if self.moe_impl.tp_size > 1:
-                self.moe_impl.tp_group.all_reduce(shared_y)
+                shared_y = self.moe_impl.tp_group.all_reduce(shared_y)
             y += shared_y
         return eval_lazy(y).view(shape)
 

@@ -432,7 +432,7 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
                     group=self.tp_group.gpu_group,
                 )
             elif self.etp_group.group_size == self.tp_group.group_size:
-                self.etp_group.all_reduce(combined_x)
+                combined_x = self.etp_group.all_reduce(combined_x)
             else:
                 raise NotImplementedError(
                     "Only TP=1, TP=ETP, (TP>1 and ETP=1) are supported in MoENormalTokenDispatcher"
