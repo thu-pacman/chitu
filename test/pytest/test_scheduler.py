@@ -1529,36 +1529,59 @@ def test_pp_chunked_prefill():
         task = Task(f"{req.request_id}", req)
         TaskPool.add(task)
 
+    pp_size = 3
     scheduler = Scheduler(
         100,
         12,
         12,
-        "prefill_first",
+        "prefill_first,fifo",
         cache_manager_dict=Backend.cache_managers[0],
-        num_scheduler_groups=3,
+        num_scheduler_groups=pp_size,
         prefill_chunk_size=200,
     )
 
-    # group 1: [0, 1], [1, 6]
-    # group 2: [2, 3], [3, 7]
-    # group 3: [4, 5], [5, 8, 9]
     expected_batch_ids_list = [
-        ["req_0", "req_1"],
-        ["req_2", "req_3"],
-        ["req_4", "req_5"],
-        ["req_1", "req_6"],
-        ["req_3", "req_7"],
-        ["req_5", "req_8", "req_9"],
+        # req_0: 0->192 (done). req_1: 0->8.
+        ["req_0", "req_1"],  # Group A
+        # We don't have to wait before req_1 finishes all stages before scheduling
+        # req_1 again, because the only dependency among prefill chunks of a single
+        # request is the KV cache, which lives on local stages.
+        #
+        # req_1: 8->192 (done). req_2: 0->16.
+        ["req_1", "req_2"],  # Group B
+        # req_2: 16->192 (done). req_3: 0->24.
+        ["req_2", "req_3"],  # Group C
+        # req_3: 24->192 (done). req_4: 0->32.
+        ["req_3", "req_4"],  # Group A
+        # req_4: 32->192 (done). req_5: 0->40.
+        ["req_4", "req_5"],  # Group B
+        # req_5: 40->96 (done). req_6: 0->96 (done). req_7: 0->48.
+        ["req_5", "req_6", "req_7"],  # Group C
+        # req_7: 48->96 (done). req_8: 0->96 (done). req_9: 0->56.
+        ["req_7", "req_8", "req_9"],  # Group A
+        # req_9: 56->96 (done)
+        ["req_9"],  # Group B
     ]
 
+    batch_ids_list = []
     for i in range(len(expected_batch_ids_list)):
         scheduler.prepare_for_schedule()
         batch_ids = scheduler.schedule()
         assert batch_ids == expected_batch_ids_list[i]
+        batch_ids_list.append(batch_ids)
+
+        # `consume_req_tokens` is called after the local PP stage's computation
+        # completes
         for task_id in batch_ids:
             TaskPool.pool[task_id].consume_req_tokens()
 
-        scheduler.update(batch_ids)
+        # `scheduler.update` is called after all PP stages' computation completes
+        if i - pp_size + 1 >= 0:
+            scheduler.update(batch_ids_list[i - pp_size + 1])
+    for i in range(
+        len(expected_batch_ids_list) - pp_size + 1, len(expected_batch_ids_list)
+    ):
+        scheduler.update(batch_ids_list[i])
 
 
 def test_prepare_prefill_metadata_multi_cache_managers():

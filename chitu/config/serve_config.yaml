@@ -518,7 +518,7 @@ scheduler:
   #:   max_output_tokens * beta`. Select the tasks with nearest DDL. Alpha and beta are arbitary value,
   #:   defaults to 1ms.
   #: - "prefix_align": Batch tasks with similar input lengths togather.
-  type: "request_preset,prefill_first"
+  type: "request_preset,prefill_first,fcfs"
 
   #: Configs how to schedule for micro batches use for Pipeline Parallelism. Ignore when `pp_size == 1`.
   pp_config:

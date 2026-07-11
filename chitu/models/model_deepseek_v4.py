@@ -128,12 +128,6 @@ def _tp_rank() -> int:
     return get_tp_group().rank_in_group
 
 
-def _all_reduce_tp(x: torch.Tensor) -> torch.Tensor:
-    if get_tp_size() > 1:
-        get_tp_group().all_reduce(x)
-    return x
-
-
 def _check_deepseek_v4_parallel_divisible(
     value: int,
     divisor: int,
@@ -203,7 +197,7 @@ class ParallelEmbeddingDeepSeekV4(nn.Module):
         y = F.embedding(x, self.weight)
         if get_tp_size() > 1:
             y = y.masked_fill(mask.unsqueeze(-1), 0)
-            _all_reduce_tp(y)
+            y = get_tp_group().all_reduce(y)
         return y
 
 
@@ -1416,7 +1410,7 @@ class IndexerDeepSeekV4(nn.Module):
         index_score = torch.einsum("bshd,btd->bsht", q, index_kv)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         if get_tp_size() > 1:
-            _all_reduce_tp(index_score)
+            index_score = get_tp_group().all_reduce(index_score)
 
         cols = torch.arange(index_kv.size(1), device=device, dtype=torch.long)
         index_score = index_score.masked_fill(
@@ -1514,7 +1508,7 @@ class IndexerDeepSeekV4(nn.Module):
         index_score = torch.einsum("bshd,btd->bsht", q_padded, index_kv)
         index_score = (index_score.relu_() * weights_padded.unsqueeze(-1)).sum(dim=2)
         if get_tp_size() > 1:
-            _all_reduce_tp(index_score)
+            index_score = get_tp_group().all_reduce(index_score)
 
         token_cols = torch.arange(max_seqlen, device=device, dtype=torch.long)
         token_valid = token_cols.unsqueeze(0) < seqlens.unsqueeze(1)
@@ -1572,7 +1566,7 @@ class IndexerDeepSeekV4(nn.Module):
         index_score = torch.einsum("bshd,btd->bsht", q, index_kv)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         if get_tp_size() > 1:
-            _all_reduce_tp(index_score)
+            index_score = get_tp_group().all_reduce(index_score)
         visible_lengths = (
             start_pos + torch.arange(1, seqlen + 1, device=x.device)
         ) // ratio

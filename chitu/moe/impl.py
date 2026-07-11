@@ -671,7 +671,7 @@ class MoEImplNoEP(MoEImplBase):
             return self.cp_etp_dispatcher.exit_moe_after_local_sum(local_sum_result)
         if self.etp_size > 1:
             local_sum_result = eval_lazy(local_sum_result)
-            self.etp_group.all_reduce(local_sum_result)
+            local_sum_result = self.etp_group.all_reduce(local_sum_result)
         return local_sum_result
 
     @override

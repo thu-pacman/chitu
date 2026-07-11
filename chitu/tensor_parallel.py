@@ -425,7 +425,7 @@ class RowParallelLinearMixIn:
 
         if self.reduce_output and self.tp_size > 1:
             if dst == -1:
-                self.tp_group.all_reduce(y)
+                y = self.tp_group.all_reduce(y)
             else:
                 self.tp_group.reduce(y, dst=dst)
 
@@ -511,7 +511,7 @@ class VocabParallelEmbedding(torch.nn.Module):
                 y *= ~mask.unsqueeze(-1)
             else:
                 y[mask] = 0
-            torch.distributed.all_reduce(y, group=self.tp_group)
+            y = self._comm_group.all_reduce(y)
 
         if self.specialize:
             if cum_num_tokens is not None:

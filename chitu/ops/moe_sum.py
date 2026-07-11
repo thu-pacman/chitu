@@ -58,6 +58,12 @@ if has_triton_impl:
     moe_sum_per_token.register("triton")(moe_sum_per_token_triton)
 
 
+@moe_sum_per_token.register("torch")
+@compatible_with_inplace
+def moe_sum_per_token_torch(x: torch.Tensor, topk_weights: torch.Tensor):
+    return (x * topk_weights.unsqueeze(-1)).sum(dim=1)
+
+
 @make_op_dispatcher
 def moe_sum_per_token_with_shared(
     x: torch.Tensor,
@@ -106,12 +112,6 @@ def moe_sum_per_token_with_shared_separated(
 ):
     y = eval_lazy(moe_sum_per_token(x, topk_weights, out=out))
     return torch.add(y, shared_y, out=out)
-
-
-@moe_sum_per_token.register("torch")
-@compatible_with_inplace
-def moe_sum_per_token_torch(x: torch.Tensor, topk_weights: torch.Tensor):
-    return (x * topk_weights.unsqueeze(-1)).sum(dim=1)
 
 
 @make_op_dispatcher

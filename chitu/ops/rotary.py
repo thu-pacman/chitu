@@ -118,23 +118,31 @@ if has_triton_impl:
 
 
 @make_op_dispatcher(op_name="apply_rotary_pos_emb_single")
-def _dispatch_apply_rotary_pos_emb_single(
+def apply_rotary_pos_emb_single(
     x: torch.Tensor,
     freqs_cis: BatchedFreqsCis,
     out: Optional[torch.Tensor] = None,
     rotary_type: str = "separated",
     impl: str = "auto",
 ) -> torch.Tensor:
+    """
+    Rotary positional embedding for one tensor.
+
+    This is used by paths where query and key are generated at different
+    positions or cardinalities, so the paired q/k RoPE API cannot express the
+    operation without fabricating a dummy tensor.
+    """
     raise NotImplementedError
 
 
-@_dispatch_apply_rotary_pos_emb_single.register_auto
+@apply_rotary_pos_emb_single.register_auto
 def _auto_apply_rotary_pos_emb_single(
     x: torch.Tensor,
     freqs_cis: BatchedFreqsCis,
     out: Optional[torch.Tensor] = None,
     rotary_type: str = "separated",
 ):
+    assert freqs_cis.cos.dtype == freqs_cis.sin.dtype
     if (
         x.is_cuda
         and has_triton_impl
@@ -147,11 +155,9 @@ def _auto_apply_rotary_pos_emb_single(
     return "torch"
 
 
-_dispatch_apply_rotary_pos_emb_single.register_candidate("triton")
+apply_rotary_pos_emb_single.register_candidate("triton")
 if has_triton_impl:
-    _dispatch_apply_rotary_pos_emb_single.register("triton")(
-        apply_rotary_pos_emb_single_triton
-    )
+    apply_rotary_pos_emb_single.register("triton")(apply_rotary_pos_emb_single_triton)
 
 
 @_dispatch_apply_rotary_pos_emb.register("cuda", available=has_chitu_backend)
@@ -464,13 +470,14 @@ def apply_rotary_pos_emb_torch(
     return q_out, k_out
 
 
-@_dispatch_apply_rotary_pos_emb_single.register("torch")
+@apply_rotary_pos_emb_single.register("torch")
 def apply_rotary_pos_emb_single_torch(
     x: torch.Tensor,
     freqs_cis: BatchedFreqsCis,
     out: Optional[torch.Tensor] = None,
     rotary_type: str = "separated",
 ) -> torch.Tensor:
+    assert freqs_cis.cos.dtype == freqs_cis.sin.dtype
     if rotary_type == "separated":
         cos = freqs_cis.separatedly_doubled_cos
         sin = freqs_cis.separatedly_doubled_sin
@@ -495,26 +502,6 @@ def apply_rotary_pos_emb_single_torch(
     else:
         out = x_embed
     return out
-
-
-def apply_rotary_pos_emb_single(
-    x: torch.Tensor,
-    freqs_cis: BatchedFreqsCis,
-    out: Optional[torch.Tensor] = None,
-    rotary_type: str = "separated",
-    impl: str = "auto",
-) -> torch.Tensor:
-    """
-    Rotary positional embedding for one tensor.
-
-    This is used by paths where query and key are generated at different
-    positions or cardinalities, so the paired q/k RoPE API cannot express the
-    operation without fabricating a dummy tensor.
-    """
-    assert freqs_cis.cos.dtype == freqs_cis.sin.dtype
-    return _dispatch_apply_rotary_pos_emb_single(
-        x, freqs_cis, out=out, rotary_type=rotary_type, impl=impl
-    )
 
 
 def apply_rotary_pos_emb(
@@ -616,7 +603,7 @@ def apply_rotary_pos_emb_single_partial(
     assert freqs_cis.cos.dtype == freqs_cis.sin.dtype
 
     rotary_part = x[..., rotary_begin:rotary_end]
-    impl = _dispatch_apply_rotary_pos_emb_single.resolve_impl(
+    impl = apply_rotary_pos_emb_single.resolve_impl(
         rotary_part,
         freqs_cis,
         out=None,

@@ -321,7 +321,9 @@ class ChituCustomAllreduce:
             )
         return out
 
-    def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
+    def custom_all_reduce(
+        self, input: torch.Tensor, *, maybe_inplace: bool = True
+    ) -> Optional[torch.Tensor]:
 
         if torch.cuda.is_current_stream_capturing():
             self._register_for_cuda_graph_capture()
@@ -332,13 +334,11 @@ class ChituCustomAllreduce:
         if self.disabled or not self.should_custom_ar(input):
             return None
 
-        if self._IS_CAPTURING and torch.cuda.is_current_stream_capturing():
-            registered = True
-        else:
-            registered = False
+        registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        out = torch.empty_like(input)
 
-        self.all_reduce(input, out=input, registered=registered)
-        return input
+        self.all_reduce(input, out=out, registered=registered)
+        return out
 
     def close(self):
         try:

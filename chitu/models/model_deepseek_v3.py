@@ -42,6 +42,7 @@ from chitu.native_layout import NativeLayoutTensor
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.ops import (
     apply_rotary_pos_emb_partial,
+    apply_rotary_pos_emb_single_partial,
     silu_and_mul,
     blockfp8_weight_dequant,
     soft_fp8_blockfp8_weight_dequant,
@@ -182,28 +183,24 @@ class Indexer(torch.nn.Module):
             k = self.k_norm(k)
 
         if freqs_cis_k is not None:
-            # CP mode: separate RoPE for Q (local) and K (global)
-            q_rot, _, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
-                q,
+            # CP mode: Q uses local positions and K uses global positions.
+            q_rot, _, _, _ = apply_rotary_pos_emb_single_partial(
                 q,
                 freqs_cis,
-                q_rotary_end=self.rope_head_dim,
-                k_rotary_end=self.rope_head_dim,
+                rotary_end=self.rope_head_dim,
                 rotary_type=self.index_rope_layout,
                 impl="torch_npu" if has_torch_npu else "auto",
             )
-            _, k_rot, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
-                k,
+            k_rot, _, _, _ = apply_rotary_pos_emb_single_partial(
                 k,
                 freqs_cis_k,
-                q_rotary_end=self.rope_head_dim,
-                k_rotary_end=self.rope_head_dim,
+                rotary_end=self.rope_head_dim,
                 rotary_type=self.index_rope_layout,
                 impl="torch_npu" if has_torch_npu else "auto",
             )
         else:
             # Non-CP mode: unified RoPE for Q and K
-            q, k, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
+            q_rot, k_rot, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
                 q,
                 k,
                 freqs_cis,
@@ -212,8 +209,6 @@ class Indexer(torch.nn.Module):
                 rotary_type=self.index_rope_layout,
                 impl="torch_npu" if has_torch_npu else "auto",
             )
-            q_rot = q
-            k_rot = k
 
         q_rot = self._rotate_activation(q_rot)
         k_rot = self._rotate_activation(k_rot)

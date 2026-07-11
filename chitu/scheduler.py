@@ -69,10 +69,26 @@ class SchedulerGroupList:
         self.release_sgroup(self.current_sgroup_id)
         return self.current_sgroup_id
 
-    def set_task_ids(self, task_ids: list[str]):
-        self._sgroup_list[self.current_sgroup_id] = task_ids
+    def set_task_ids(self, task_ids: list[str], keep_unwait: Optional[set[str]] = None):
+        """Write task_ids into the current sgroup slot and `wait()` each.
+
+        Args:
+            keep_unwait: intermediate prefill task_ids to keep schedulable on
+                the next consecutive step. Such tasks are `unwait()`ed AND left out of the
+                sgroup list, so a later `release_sgroup` of this slot does not prematurely
+                re-unwait them — only the completing chunk (not in keep_unwait) stays listed
+                and `Waiting`, and is released `pp_size` steps later, which is the decode
+                gate (the first decode token returns `pp_size-1` steps after the completing
+                chunk). Default None preserves the original round-robin behavior.
+        """
+        keep_unwait = keep_unwait or set()
+        self._sgroup_list[self.current_sgroup_id] = [
+            tid for tid in task_ids if tid not in keep_unwait
+        ]
         for task_id in task_ids:
             TaskPool.pool[task_id].wait()
+        for task_id in keep_unwait:
+            TaskPool.pool[task_id].unwait()
 
     def get_sgroup_all_tasks(self, sgroup_id: int):
         # assert self.is_skew
@@ -527,7 +543,15 @@ class Scheduler:
             task_ids = self._schedule_decode_tasks(task_ids)[: self.decode_num_tasks]
 
         # Allocate sgroup for for task_ids
-        self.sgroup_list.set_task_ids(task_ids)
+        keep_unwait: Optional[set[str]] = None
+        if self.num_scheduler_groups > 1:
+            keep_unwait = {
+                task_id
+                for task_id in task_ids
+                if TaskPool.pool[task_id].task_type == TaskType.Prefill
+                and not TaskPool.pool[task_id].has_output()
+            }
+        self.sgroup_list.set_task_ids(task_ids, keep_unwait=keep_unwait)
 
         # postprocess
         for task_id in task_ids:

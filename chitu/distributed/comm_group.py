@@ -300,27 +300,47 @@ class CommGroup:
             group=self.gpu_group, device_ids=[torch.cuda.current_device()]
         )
 
-    def all_reduce(self, tensor: torch.Tensor):
+    def all_reduce(
+        self, tensor: torch.Tensor, *, maybe_inplace: bool = True
+    ) -> torch.Tensor:
+        """Reduce ``tensor`` across this group and return the reduced tensor.
+
+        Callers must use the returned tensor. The returned tensor may be the same
+        object as ``tensor`` or a newly allocated tensor, depending on backend and
+        capture mode.
+
+        Args:
+            tensor: Local tensor to reduce.
+            maybe_inplace: If True, the backend may modify ``tensor`` when that is
+                safe and efficient. If False, ``tensor`` is treated as read-only
+                and the reduced value is returned in a separate tensor.
+        """
+        if self.group_size == 1:
+            return tensor
+
         ca_comm = self.get_custom_ar_manager
-        use_custom = False
+        result = None
 
         if ca_comm and not ca_comm.disabled:
             try:
-                if ca_comm.should_custom_ar(tensor):
-                    ca_comm.custom_all_reduce(tensor)
-
-                    use_custom = True
+                result = ca_comm.custom_all_reduce(tensor, maybe_inplace=maybe_inplace)
             except Exception as e:
                 logger.warning(
                     f"Custom AllReduce failed, falling back to NCCL forever: {e}"
                 )
                 self._enable_custom_allreduce = False
                 self.custom_ar_manager = None
-                use_custom = False
+                result = None
 
-        # Fallback to standard NCCL
-        if not use_custom:
-            torch.distributed.all_reduce(tensor, group=self.gpu_group)
+        if result is not None:
+            return result
+
+        if maybe_inplace:
+            result = tensor
+        else:
+            result = tensor.clone()
+        torch.distributed.all_reduce(result, group=self.gpu_group)
+        return result
 
     def reduce(
         self,
