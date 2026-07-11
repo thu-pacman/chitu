@@ -18,6 +18,7 @@ def apply_rotary_pos_emb_single_triton(
     out: Optional[torch.Tensor] = None,
     rotary_type: str = "separated",
 ) -> torch.Tensor:
+    assert freqs_cis.cos.dtype == freqs_cis.sin.dtype
     if rotary_type == "interleaved" and not hasattr(tl, "interleave"):
         raise RuntimeError(
             "triton.language.interleave is not supported, please check triton version"
