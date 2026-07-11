@@ -666,7 +666,7 @@ Acceptable values: An ordered comma separated list of scheduler types among:
   defaults to 1ms.
 - "prefix_align": Batch tasks with similar input lengths togather.
 
-*Default: `"request_preset,prefill_first"`.*
+*Default: `"request_preset,prefill_first,fcfs"`.*
 
 ### `scheduler.pp_config`
 
