@@ -11,7 +11,7 @@ import torch
 from chitu.native_layout.base import NativeLayoutTensor
 from chitu.native_layout.common import (
     Packed4BitWeightAlongKContig,
-    Packed4BitWeightAlongKInt32,
+    Packed4BitWeightAlongKContigInt32,
 )
 from chitu.import_utils import try_import_platform_dep
 
@@ -133,7 +133,7 @@ class BlockInt4MarlinQWeight(NativeLayoutTensor):
     @classmethod
     @override
     def convert_from(
-        cls, packed: Packed4BitWeightAlongKInt32
+        cls, packed: Packed4BitWeightAlongKContigInt32
     ) -> "BlockInt4MarlinQWeight":
         """Convert from int32-packed checkpoint format."""
         tensor = packed.layout_tensor

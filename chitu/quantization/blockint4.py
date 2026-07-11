@@ -20,7 +20,7 @@ from chitu.moe.batched_expert_result import PerTokenBatchedExpertResult
 from chitu.utils import try_import_platform_dep
 from chitu.native_layout import (
     NativeLayoutMixin,
-    Packed4BitWeightAlongKInt32,
+    Packed4BitWeightAlongKContigInt32,
     BlockInt4MarlinQWeight,
     BlockInt4MarlinScale,
 )
@@ -82,8 +82,6 @@ class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged
             checkpoint_prefix,
         )
 
-        self.bits = 4
-        self.pack_factor = 32 // self.bits  # 8 x 4-bit values per int32
         self.quant_group_size = group_size
 
         # Checkpoint layout: (num_experts, out_features, packed_in_features)
@@ -145,27 +143,28 @@ class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged
 
     def init_native_layout(self):
         super().init_native_layout()
-        if not has_marlin:
-            return
         self.apply_native_layout(
             self.gate_proj_qweight,
-            Packed4BitWeightAlongKInt32,
+            Packed4BitWeightAlongKContigInt32,
             state_dict_convert=False,
         )
         self.apply_native_layout(
-            self.up_proj_qweight, Packed4BitWeightAlongKInt32, state_dict_convert=False
+            self.up_proj_qweight,
+            Packed4BitWeightAlongKContigInt32,
+            state_dict_convert=False,
         )
         self.apply_native_layout(
             self.down_proj_qweight,
-            Packed4BitWeightAlongKInt32,
+            Packed4BitWeightAlongKContigInt32,
             state_dict_convert=False,
         )
-        self.apply_native_layout(self.gate_proj_qweight, BlockInt4MarlinQWeight)
-        self.apply_native_layout(self.gate_proj_scales, BlockInt4MarlinScale)
-        self.apply_native_layout(self.up_proj_qweight, BlockInt4MarlinQWeight)
-        self.apply_native_layout(self.up_proj_scales, BlockInt4MarlinScale)
-        self.apply_native_layout(self.down_proj_qweight, BlockInt4MarlinQWeight)
-        self.apply_native_layout(self.down_proj_scales, BlockInt4MarlinScale)
+        if has_marlin:
+            self.apply_native_layout(self.gate_proj_qweight, BlockInt4MarlinQWeight)
+            self.apply_native_layout(self.gate_proj_scales, BlockInt4MarlinScale)
+            self.apply_native_layout(self.up_proj_qweight, BlockInt4MarlinQWeight)
+            self.apply_native_layout(self.up_proj_scales, BlockInt4MarlinScale)
+            self.apply_native_layout(self.down_proj_qweight, BlockInt4MarlinQWeight)
+            self.apply_native_layout(self.down_proj_scales, BlockInt4MarlinScale)
 
     def _ensure_marlin_workspace(self):
         """Allocate Marlin workspace and sentinel tensors lazily."""

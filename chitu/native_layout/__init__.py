@@ -17,7 +17,7 @@ from chitu.native_layout.common import (
     Packed4BitWeightAlongKContig,
     Packed4BitWeightAlongN,
     Packed4BitWeightQServe,
-    Packed4BitWeightAlongKInt32,
+    Packed4BitWeightAlongKContigInt32,
     ColumnOddEvenSeparatedTensor,
     PartialColumnOddEvenSeparatedTensor,
     Repeat1ToLength,
