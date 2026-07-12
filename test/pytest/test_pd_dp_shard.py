@@ -75,7 +75,7 @@ def test_pd_dp_shard_round_robin():
                 },
             },
             "scheduler": {
-                "type": "decode_only",
+                "type": "fcfs",
                 "pp_config": {
                     "prefill_num_tasks_divided_by_pp": True,
                     "prefill_num_tasks": None,

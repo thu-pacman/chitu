@@ -92,15 +92,10 @@ def get_last_step_task_type() -> Optional[TaskType]:
     return _last_step_task_type
 
 
-def _infer_schedule_task_type_order(scheduler_type: str) -> tuple[TaskType, ...]:
-    scheduler_type_parts = {
-        part.strip().lower() for part in str(scheduler_type).split(",") if part.strip()
-    }
-    has_prefill_only = "prefill_only" in scheduler_type_parts
-    has_decode_only = "decode_only" in scheduler_type_parts
-    if has_decode_only and not has_prefill_only:
+def _infer_schedule_task_type_order(role: str) -> tuple[TaskType, ...]:
+    if role == "decode":
         return (TaskType.Decode,)
-    if has_prefill_only and not has_decode_only:
+    if role == "prefill":
         return (TaskType.Prefill,)
     return (TaskType.Prefill, TaskType.Decode)
 
@@ -566,10 +561,9 @@ def _auto_set_num_blocks_after_warmup(args):
         return
 
     if is_classic_pd_disagg():
-        sched_type = args.scheduler.type.lower()
-        is_pd_decode_only = "decode_only" in sched_type
+        is_pd_decode_role = args.multi_inst.role == "decode"
     else:
-        is_pd_decode_only = False
+        is_pd_decode_role = False
     full_warmup = args.infer.full_warmup
 
     paged_caches = {}
@@ -587,7 +581,7 @@ def _auto_set_num_blocks_after_warmup(args):
         )
         return
 
-    if is_pd_decode_only and not full_warmup:
+    if is_pd_decode_role and not full_warmup:
         if args.models.type == ModelType.DEEPSEEK_V4:
             current_targets = {}
             for name, cache in paged_caches.items():
@@ -621,7 +615,7 @@ def _auto_set_num_blocks_after_warmup(args):
             for scheduler in Backend.schedulers:
                 scheduler.reset_kvcache_block_threshold()
         logger.warning(
-            "skip auto set num blocks after warmup for PD decode-only without "
+            "skip auto set num blocks after warmup for PD decode role without "
             "full_warmup; direct warmup only exercises batch_size=1 and seq_len=1, "
             "so keeping current KV blocks=%s",
             current_targets,
@@ -682,7 +676,7 @@ def _auto_set_num_blocks_after_warmup(args):
     main_cap = main_cm.get_allocatable_max_num_blocks()
     reserve_bytes = 512 << 20  # 512 MiB
     min_decode_blocks = 1
-    if is_pd_decode_only:
+    if is_pd_decode_role:
         min_decode_blocks = int(
             getattr(main_cm, "max_blocks_per_req", 0)
             or ceil_div(int(args.infer.max_seq_len), int(main_cm.block_size))
@@ -730,9 +724,9 @@ def _auto_set_num_blocks_after_warmup(args):
         final_main_target = clamp_int(int(final_main_target), 1, int(main_cap))
         final_indexer_target = None
 
-    if is_pd_decode_only and int(final_main_target) < int(min_decode_blocks):
+    if is_pd_decode_role and int(final_main_target) < int(min_decode_blocks):
         logger.warning(
-            "PD decode-only warmup solve requested %d main KV blocks, but at least "
+            "PD decode-role warmup solve requested %d main KV blocks, but at least "
             "%d are required to hold one max_seq_len request; clamping upward",
             int(final_main_target),
             int(min_decode_blocks),
@@ -781,9 +775,9 @@ def _auto_set_num_blocks_after_warmup(args):
         main_cm.get_allocatable_max_num_blocks(),
     )
     safe_main_target = allreduce_min_int(int(safe_main_target))
-    if is_pd_decode_only and int(safe_main_target) < int(min_decode_blocks):
+    if is_pd_decode_role and int(safe_main_target) < int(min_decode_blocks):
         logger.warning(
-            "PD decode-only safe main KV target %d is smaller than the one-request "
+            "PD decode-role safe main KV target %d is smaller than the one-request "
             "floor %d; clamping upward",
             int(safe_main_target),
             int(min_decode_blocks),
@@ -1056,11 +1050,10 @@ def _warmup_backend_direct(
         cache.prepare_cache_prefill(all_tasks)
     PrometheusMetricsCollector.update_GPU_usage()
 
-    # decode_only 下，Decode 不需要跑 prefill；但需要把 cache 的 seq_len
-    # 和 block_table 初始化到可 decode 的状态（否则后续 prepare_cache_decode 会找不到 req_id）
-    # 仅做 cache prepare，避免 prefill 算子在 Decode 进程里被执行，从而触发所谓的“illegal memory access”
-    # MoE 的 task_type 需要设置在 moe_impl 上，否则 decode_only
-    # 的 warmup 会在 MoE layer 里因为 task_type=None 触发 KeyError(None)
+    # Decode-role instances do not run model.prefill during warmup, but cache
+    # seq_len and block_table still need initialization for prepare_cache_decode.
+    # Cache prepare is enough here, and avoids executing Prefill kernels in Decode processes.
+    # MoE task_type is set on moe_impl so Decode warmup has an explicit task type.
 
     output_token_offsets = torch.arange(
         local_max_bs, dtype=torch.int32, device=tokens.device
@@ -1152,14 +1145,14 @@ def warmup_engine(args):
             "Mixing prefill_and_decode with prefill/decode roles is not supported"
         )
 
-    sched_type = str(args.scheduler.type).lower()
-    skip_model_prefill = "decode_only" in sched_type
-    skip_model_decode = "prefill_only" in sched_type
+    role = args.multi_inst.role
+    skip_model_prefill = role == "decode"
+    skip_model_decode = role == "prefill"
 
     def _log_skip_prefill():
         if skip_model_prefill:
             logger.info(
-                "[warmup][direct] decode_only detected, skipping model.prefill in warmup"
+                "[warmup][direct] decode role detected, skipping model.prefill in warmup"
             )
 
     if runner == "taskpool":
@@ -1248,9 +1241,6 @@ def chitu_init(args):
                 Scheduler.build(args.scheduler, args.infer, dp_rank=i)
                 for i in range(args.infer.dp_size)
             ]
-            Backend.schedule_task_type_order = _infer_schedule_task_type_order(
-                args.scheduler.type
-            )
         executor = Executor.build(args)
         Backend.executor = executor
         PackedTasks.configure(max_num_tasks=args.infer.max_batch_size)
@@ -1415,9 +1405,8 @@ def chitu_run_main_rank():
         assert len(Backend.schedulers) == 1
         task_ids = Backend.schedulers[0].schedule()
     else:
-        schedule_task_type_order = Backend.schedule_task_type_order or (
-            TaskType.Prefill,
-            TaskType.Decode,
+        schedule_task_type_order = _infer_schedule_task_type_order(
+            Backend.args.multi_inst.role
         )
         if TaskType.Prefill in schedule_task_type_order:
             _update_tasks_preferred_dp_rank()  # Update DP preference for prefill.

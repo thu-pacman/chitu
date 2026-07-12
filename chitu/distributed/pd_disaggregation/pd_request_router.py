@@ -349,16 +349,14 @@ class PDRequestRouter(RequestRouter):
                     data = await self.stats_socket.recv()
                     stats_dict = msgpack.unpackb(data, raw=False)
 
-                    scheduler_type = stats_dict.get("scheduler_type") or stats_dict.get(
-                        "pd_mode"
-                    )
+                    pd_mode = stats_dict.get("pd_mode")
                     local_instance_id = int(stats_dict.get("local_instance_id", -1))
-                    if scheduler_type == PDSchedulerMode.PREFILL_ONLY.value:
+                    if pd_mode == PDSchedulerMode.PREFILL_ONLY.value:
                         if local_instance_id not in self.prefill_schedulers:
                             continue
                         policy = self.prefill_policy
                         role = "prefill"
-                    elif scheduler_type == PDSchedulerMode.DECODE_ONLY.value:
+                    elif pd_mode == PDSchedulerMode.DECODE_ONLY.value:
                         if local_instance_id not in self.decode_schedulers:
                             continue
                         policy = self.decode_policy
@@ -610,7 +608,7 @@ class PDRequestRouter(RequestRouter):
 
         # Add Prefill-specific information
         prefill_data = request_data.copy()
-        prefill_data["scheduler_type"] = "prefill"
+        prefill_data["target_role"] = "prefill"
         prefill_data["local_instance_id"] = local_instance_id
 
         packed_data = msgpack.packb(prefill_data)
@@ -636,7 +634,7 @@ class PDRequestRouter(RequestRouter):
 
         # Add Decode-specific information
         decode_data = request_data.copy()
-        decode_data["scheduler_type"] = "decode"
+        decode_data["target_role"] = "decode"
         decode_data["local_instance_id"] = local_instance_id
         decode_data["prefill_scheduler_id"] = prefill_scheduler_id
 

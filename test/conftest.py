@@ -620,7 +620,7 @@ def global_args():
                 "enable_prefix_caching": False,
             },
             "scheduler": {
-                "type": "prefill_only",
+                "type": "fcfs",
                 "pp_config": {
                     "prefill_num_tasks_divided_by_pp": True,
                     "prefill_num_tasks": None,

@@ -202,7 +202,7 @@ def test_chunked_prefill_skew():
     scheduler = SkewScheduler(
         max_batch_size=infer_args.max_batch_size,
         cache_manager_dict=None,
-        original_scheduler_type="prefill_first",
+        scheduler_type="prefill_first",
         prefill_chunk_size=4096,
     )
 
@@ -417,7 +417,7 @@ def test_priority_prefill_first_skew():
     scheduler = SkewScheduler(
         infer_args.max_batch_size,
         cache_manager_dict=None,
-        original_scheduler_type="prefill_first",
+        scheduler_type="prefill_first",
         prefill_chunk_size=None,
     )
 
@@ -612,7 +612,7 @@ def test_priority_fcfs_skew():
     scheduler = SkewScheduler(
         infer_args.max_batch_size,
         cache_manager_dict=None,
-        original_scheduler_type="fcfs",
+        scheduler_type="fcfs",
         prefill_chunk_size=None,
     )
 
@@ -819,7 +819,7 @@ def test_priority_request_preset_over_prefill_first_skew():
     scheduler = SkewScheduler(
         infer_args.max_batch_size,
         cache_manager_dict=None,
-        original_scheduler_type="request_preset,prefill_first",
+        scheduler_type="request_preset,prefill_first",
         prefill_chunk_size=None,
     )
 
@@ -1400,7 +1400,7 @@ def test_slot_group_skew():
     scheduler = SkewScheduler(
         infer_args.max_batch_size,
         cache_manager_dict=None,
-        original_scheduler_type="request_preset,prefill_first",
+        scheduler_type="request_preset,prefill_first",
         prefill_chunk_size=None,
     )
 

@@ -200,7 +200,7 @@ class PDInstanceRequestManager:
 
         self.pd_mode = pd_mode
         self.local_instance_id = local_instance_id
-        self.original_scheduler_type = scheduler_type
+        self.scheduler_type = scheduler_type
         self.dp_size: int = args.infer.dp_size
 
         # PD disaggregation related state
@@ -287,29 +287,28 @@ class PDInstanceRequestManager:
         """Process incoming request"""
         request_id = request_data.get("request_id")
         request_type = request_data.get("type", "regular")
-        scheduler_type = request_data.get("scheduler_type")
+        target_role = request_data.get("target_role")
 
         if pd_trace_enabled():
             logger.debug(
                 f"[PD_TRACE][sched.recv] mode={self.pd_mode.value} "
                 f"local_instance_id={self.local_instance_id} req_id={request_id} type={request_type} "
-                f"scheduler_type={scheduler_type} keys={sorted(list(request_data.keys()))}"
+                f"target_role={target_role} keys={sorted(list(request_data.keys()))}"
             )
 
         if request_type == "pd_request":
             if (
-                scheduler_type == "prefill"
+                target_role == "prefill"
                 and self.pd_mode == PDSchedulerMode.PREFILL_ONLY
             ):
                 await self._process_prefill_request(request_data)
             elif (
-                scheduler_type == "decode"
-                and self.pd_mode == PDSchedulerMode.DECODE_ONLY
+                target_role == "decode" and self.pd_mode == PDSchedulerMode.DECODE_ONLY
             ):
                 await self._process_decode_request(request_data)
             else:
                 logger.warning(
-                    f"scheduler type mismatch: got {scheduler_type}, mode is {self.pd_mode}"
+                    f"target role mismatch: got {target_role}, mode is {self.pd_mode}"
                 )
         else:
             raise ValueError(f"unexpected request type: {request_type}")

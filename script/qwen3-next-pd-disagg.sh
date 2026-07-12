@@ -125,7 +125,6 @@ srun $SRUN_PARTITION_ARG \
           +multi_inst.inst_overrides.0.multi_inst.pd_disaggregation.prefill_scheduler.max_batch_size=32 \
           +multi_inst.inst_overrides.0.multi_inst.pd_disaggregation.prefill_scheduler.max_total_tokens=8192 \
           +multi_inst.inst_overrides.0.multi_inst.pd_disaggregation.prefill_scheduler.batching_strategy=varlen \
-          +multi_inst.inst_overrides.0.scheduler.type=prefill_only \
           +multi_inst.inst_overrides.0.infer.max_seq_len=6144 \
           +multi_inst.inst_overrides.0.infer.max_batch_size=288 \
           +multi_inst.inst_overrides.0.request.max_new_tokens=4096 \
@@ -136,7 +135,6 @@ srun $SRUN_PARTITION_ARG \
           +multi_inst.inst_overrides.0.infer.device_ids=[0,1,2,3,4,5,6,7] \
           +multi_inst.inst_overrides.1.multi_inst.role=decode \
           +multi_inst.inst_overrides.1.multi_inst.pd_disaggregation.decode_scheduler.scheduling_strategy=immediate \
-          +multi_inst.inst_overrides.1.scheduler.type=decode_only \
           +multi_inst.inst_overrides.1.infer.max_seq_len=6144 \
           +multi_inst.inst_overrides.1.infer.max_batch_size=288 \
           +multi_inst.inst_overrides.1.request.max_new_tokens=4096 \
