@@ -116,6 +116,16 @@ def init_cache_static():
 
 
 def _deepseek_v4_compressed_ratio_from_manager_name(manager_name: str) -> Optional[int]:
+    """Extract the compression ratio from a DeepSeek-V4 KV cache manager name.
+
+    DeepSeek-V4 uses compressed key-value caches (CSA and HCA) to reduce memory
+    footprint.  The manager name encodes the compression ratio:
+        - "compressed_csa" → 4x  (compressed sliding-window attention)
+        - "compressed_hca" → 128x (highly compressed attention)
+        - "compressed_N"   → Nx  (generic compressed cache)
+
+    Returns None if the manager does not represent a compressed cache.
+    """
     if manager_name == "compressed_csa":
         return 4
     if manager_name == "compressed_hca":
@@ -133,6 +143,21 @@ def _deepseek_v4_compressed_blocks_for_seq_len(
     block_size: int,
     num_reqs: int,
 ) -> int:
+    """Compute the number of compressed KV cache blocks needed for a given sequence length.
+
+    DeepSeek-V4's compressed attention stores tokens at reduced resolution.
+    For example, with a 128x compression ratio, every 128 tokens map to a single
+    compressed token.  The compressed tokens are then stored in paged blocks.
+
+    Args:
+        seq_len: Logical sequence length (uncompressed).
+        ratio: Compression ratio (e.g. 4 for CSA, 128 for HCA).
+        block_size: Number of compressed tokens per physical block.
+        num_reqs: Number of concurrent requests.
+
+    Returns:
+        Total number of compressed blocks required across all requests.
+    """
     compressed_len = max(0, int(seq_len)) // int(ratio)
     if compressed_len == 0:
         return 0
@@ -145,6 +170,15 @@ def _direct_warmup_target_lens(
     bs_descend: int,
     skip_model_decode: bool,
 ) -> list[int]:
+    """Build a list of target token lengths for direct warmup requests.
+
+    Direct warmup bypasses the scheduler and drives the model directly with mock
+    requests.  Each request starts with 1 prefill token.  If decode is enabled,
+    the warmup simulates multiple decode steps where each step advances the
+    sequence by ``mtp_size`` tokens (for multi-token prediction models).
+    Later decode steps use progressively smaller batch sizes when ``bs_descend``
+    is non-zero.
+    """
     local_max_bs = int(local_max_bs)
     if local_max_bs <= 0:
         return []
@@ -420,6 +454,18 @@ def _auto_set_deepseek_v4_num_blocks_after_warmup(
     args,
     paged_caches,
 ):
+    """Resize DeepSeek-V4 KV cache blocks after warmup based on memory budget.
+
+    DeepSeek-V4 has multiple KV cache groups (main, compressed CSA, compressed
+    HCA) that must be jointly sized.  This solver uses a binary search over the
+    effective logical sequence length to find the largest per-group block
+    allocation that fits within the GPU memory budget.
+
+    The solver treats sliding-window groups as fixed at one page per hot
+    request, and sizes compressed groups proportionally to the effective
+    sequence length.  Results are reduced across all ranks to ensure
+    consistency.
+    """
     reserve_bytes = 512 << 20
     cache_groups = {}
     for name, cache in paged_caches.items():
@@ -863,7 +909,18 @@ def _emit_observed_op_impl_summary_after_warmup():
 
 
 def _warmup_via_taskpool(args):
-    rank = torch.distributed.get_rank()
+    """Warm up the inference engine by running mock requests through the full scheduler → executor pipeline.
+
+    This is the standard warmup path for standalone (non-PD-disaggregated)
+    deployments.  It exercises both prefill and decode phases using the real
+    scheduler and executor, capturing CUDA graphs at representative batch sizes
+    and sequence lengths.  After warmup completes, the MoE load planner is
+    switched from warmup to production mode.
+
+    The warmup runs ``max_batch_size`` requests, each with a sequence length
+    derived from ``prefill_chunk_size``.  Rank 0 drives the loop; other ranks
+    follow via the executor until termination is signaled.
+    """
 
     # Turn ON MoE planner warmup mode on all ranks
     planner = get_moe_load_planner()
@@ -1015,6 +1072,19 @@ def _warmup_backend_direct(
     skip_model_prefill: bool = False,
     skip_model_decode: bool = False,
 ):
+    """Warm up the model backend directly, bypassing the scheduler.
+
+    This is used in two scenarios:
+    1. **PD disaggregation** — decode-only workers skip prefill and prefill-only
+       workers skip decode, so each role only warms the operators it actually runs.
+    2. **Full warmup** — after the KV cache is resized, the engine runs decode
+       steps at every possible batch size (descending from ``local_max_bs`` to 1)
+       to capture CUDA graphs and JIT-compile all operator variants.
+
+    The warmup creates mock requests with random token IDs, runs a single
+    prefill step, then runs ``decode_steps`` decode steps (optionally descending
+    batch size by ``bs_descend`` each step).
+    """
     logger.info(
         f"Starting local backend warmup (direct) with local max batch size {local_max_bs}..."
     )
@@ -1115,6 +1185,24 @@ def _warmup_backend_direct(
 
 
 def warmup_engine(args):
+    """Three-phase engine warmup: light run → KV resize → full CUDA graph capture.
+
+    Phase 1 (light run):
+        Run one forward pass at a representative batch size to trigger JIT
+        compilation and estimate peak GPU memory.  Routes through either
+        ``_warmup_via_taskpool`` (standalone) or ``_warmup_backend_direct``
+        (PD disaggregation).
+
+    Phase 2 (KV reallocation):
+        Resize KV cache blocks based on measured memory usage, reclaiming
+        any excess for the CUDA allocator or growing if room permits.
+        Captured CUDA graphs are invalidated and re-captured after resizing.
+
+    Phase 3 (full warmup, optional):
+        If ``full_warmup`` is enabled, run decode steps at every batch size
+        from ``local_max_bs`` down to 1.  This ensures all CUDA graphs are
+        captured and all operator variants are tuned before serving traffic.
+    """
     # Router 进程不做 warmup
     if args.multi_inst.router.is_router:
         return
@@ -1298,10 +1386,23 @@ def chitu_init(args):
 
 
 def _update_tasks_preferred_dp_rank():
-    """Update the preferred DP rank for each schedulable but unscheduled prefill task.
-    The preferred DP rank selection considers:
-        - Prefix cache hit rate
-        - Load of each DP rank
+    """Assign a preferred DP rank to each unscheduled prefill task.
+
+    In a multi-DP deployment, each request can be routed to any DP rank.
+    This function picks the best rank by balancing two factors:
+
+    1. **Prefix cache hit rate** — how many of the request's prompt tokens
+       are already cached on each DP rank.  Higher cache hits mean fewer
+       tokens to recompute during prefill, reducing latency.
+    2. **Current load** — the number of in-flight decode tasks on each DP
+       rank.  Load is penalized to avoid overloading a single rank.
+
+    The final score per rank is:
+        score = cache_hit_rate * hit_rate_weight
+              - running_tasks * running_penalty_weight
+
+    The weights are configurable via ``dp_prefix_caching_hit_rate_weight``
+    and ``dp_prefix_caching_running_penalty_weight``.
     """
     args = get_global_args()
     dp_size = int(args.infer.dp_size)
@@ -1407,8 +1508,21 @@ def _collect_ready_task_ids_by_dp(task_type: TaskType) -> list[list[str]]:
 
 @torch.inference_mode()
 def chitu_run_main_rank():
-    # 1. Schedule
-    global _last_step_task_type
+    """Execute one inference step on the main (rank-0) process.
+
+    The step is split into three phases:
+
+    1. **Schedule** — each DP-rank scheduler selects ready prefill and decode
+       tasks.  Prefill tasks are first assigned preferred DP ranks via
+       ``_update_tasks_preferred_dp_rank`` (balancing cache-hit rate and per-rank
+       load).  Decode tasks follow, filling remaining budget.
+
+    2. **Run** — the Executor dispatches task metadata across TP/PP/DP ranks,
+       runs the model (prefill or decode), samples tokens, and collects results.
+
+    3. **Update TaskPool** — completed tasks are removed, running tasks are
+       updated with new tokens and status changes.
+    """
     for scheduler in Backend.schedulers:
         scheduler.prepare_for_schedule()
     if Backend.args.infer.dp_size == 1:
@@ -1546,6 +1660,13 @@ _last_alloc_retries = 0
 
 
 def check_alloc_retries():
+    """Log a warning if PyTorch's CUDA allocator had to retry allocations.
+
+    Retried allocations indicate memory fragmentation — the allocator had to
+    free cached memory and re-request it from CUDA.  Frequent retries degrade
+    performance significantly and usually mean ``memory_utilization`` is set too
+    high for the current workload.
+    """
     global _last_alloc_retries
     cur_alloc_retries = torch.cuda.memory_stats(torch.cuda.current_device())[
         "num_alloc_retries"

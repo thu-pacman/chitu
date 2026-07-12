@@ -47,7 +47,13 @@ MOE_IMPL_INSTANCE: Optional["MoEImplBase"] = None
 
 
 def init_moe_impl(args) -> None:
-    """Initialize MoEImpl instance."""
+    """Create the global MoE implementation singleton.
+
+    Picks between ``MoEImplEP`` (expert-parallel, requires ``ep_size > 1``) and
+    ``MoEImplNoEP`` (all experts replicated on every rank).  The choice is
+    driven by ``args.infer.ep_size``.  The instance is stored in the module-level
+    ``MOE_IMPL_INSTANCE`` singleton and retrieved by ``get_moe_impl()``.
+    """
     global MOE_IMPL_INSTANCE
     assert MOE_IMPL_INSTANCE is None, "moe impl already initialized"
 
@@ -131,6 +137,23 @@ def get_moe_impl() -> Optional["MoEImplBase"]:
 
 
 class MoEImplBase:
+    """Base class for Mixture-of-Experts dispatch implementations.
+
+    The MoE implementation coordinates expert dispatch and combine across
+    parallelism dimensions.  It is called by every transformer layer's
+    ``ParallelMoeBlock.forward()``:
+
+    1. **Gate** — compute routing weights and expert indices (in the model).
+    2. **Dispatch** — send each token's hidden state to the assigned expert.
+    3. **Expert compute** — run the expert FFN on received tokens.
+    4. **Combine** — return output tokens to their original positions.
+
+    Subclasses implement two strategies:
+    - ``MoEImplNoEP``: all experts are on every rank; dispatch is local.
+    - ``MoEImplEP``: experts are partitioned across EP ranks; dispatch uses
+      all-to-all collectives (via DeepEP, NCCL, or NPU all-to-all).
+    """
+
     def __init__(
         self,
         n_routed_experts: int,

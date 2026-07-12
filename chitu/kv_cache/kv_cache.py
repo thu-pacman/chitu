@@ -129,11 +129,17 @@ class GlobalLocalMap:
 
 
 class KVCacheAccessor:
-    """
-    Base class for KV cache accessors
+    """Lightweight descriptor passed to attention kernels to locate cached KV states.
 
-    A KV cache accessor locates specific tokens of a specific layer in a KV cache. Data
-    can be read from the accessor, and updates to the accessor apply to the KV cache.
+    An accessor is a view into a specific layer's KV cache.  It carries the
+    tensors and metadata that the attention backend needs to read (and
+    optionally update) cached key/value data without coupling to the underlying
+    cache storage layout (paged vs. dense).
+
+    Subclasses add layout-specific fields: ``PagedKVCacheAccessor`` carries
+    block tables for page-to-physical-address translation, while
+    ``DenseKVCacheAccessor`` carries contiguous tensors indexed directly by
+    request and position.
     """
 
     pass
@@ -477,6 +483,23 @@ class KVCacheBase:
 
 
 class PagedKVCache(KVCacheBase):
+    """Paged KV cache with virtual-to-physical block mapping.
+
+    Inspired by OS virtual memory, PagedKVCache divides the KV cache into
+    fixed-size blocks (pages) and maps each request's logical positions to
+    physical blocks via a block table.  This eliminates fragmentation: blocks
+    can be allocated on demand and reclaimed independently per request.
+
+    Key design points:
+    - ``block_table``: (num_hot_req, max_blocks_per_req) — maps each request's
+      logical block offsets to physical block indices.
+    - ``block_size``: Must be a multiple of 256 for FlashAttention compatibility.
+    - Prefix caching: when enabled, blocks with identical content are shared
+      across requests (managed by the cache manager, not the cache itself).
+    - ``allocatable_max_num_blocks``: With prefix caching, this is virtually
+      unbounded; without it, it equals ``page_table_max_num_blocks``.
+    """
+
     def __init__(
         self,
         layer_id_map: GlobalLocalMap,
@@ -1250,6 +1273,15 @@ class MMPagedKVCache(PagedKVCache):
 
 
 class DenseKVCache(KVCacheBase):
+    """Contiguous (non-paged) KV cache — one fixed-size buffer per request.
+
+    In contrast to ``PagedKVCache``, DenseKVCache pre-allocates a contiguous
+    region of ``[max_seq_len, shape_per_token...]`` for each hot request.
+    This is simpler and avoids block-table indirection, but is memory-inefficient
+    for long sequences with variable lengths.  It is primarily used for the
+    "skew" cache type (legacy) and for specialized DeepSeek-V4 caches.
+    """
+
     def __init__(
         self,
         layer_id_map: GlobalLocalMap,

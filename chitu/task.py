@@ -93,8 +93,20 @@ class RequestParams:
 
 @dataclass
 class UserRequest:
-    """
-    Request object holding context for processing input request
+    """Incoming inference request with full lifecycle state.
+
+    A UserRequest encapsulates everything the server needs to process one
+    conversation turn: the prompt tokens, sampling parameters, tool-call
+    configuration, and streaming output buffer (``AsyncDataStream``).
+
+    Lifecycle:
+    1. Created from a client request via ``from_request_params`` (parse, tokenize,
+       apply chat template, build grammar for tool calls).
+    2. Wrapped in a ``Task`` for scheduling.
+    3. Receives generated tokens via ``add_data()``, which pushes into the
+       async stream for delivery to the client.
+    4. ``stop_stream()`` marks the request complete and optionally writes
+       a trace file.
     """
 
     # ============ Serialization fields ==============
@@ -345,6 +357,20 @@ class UserRequest:
 
 
 class Task:
+    """A schedulable unit of inference work — one request going through prefill → decode.
+
+    Tasks are the bridge between the scheduler and the executor.  They carry all
+    the metadata the scheduler needs for admission decisions (prefix cache
+    locality, DP rank assignment, KV cache block allocation) and all the state
+    the executor needs to run the forward pass (token buffers, chunk boundaries,
+    MTP acceptance indices).
+
+    Lifecycle:
+    - Created in ``TaskType.Prefill`` state.
+    - After prefill completes (``consume_req_tokens()``), transitions to ``TaskType.Decode``.
+    - Stopped when EOS is emitted, max_new_tokens is reached, or KV cache overflows.
+    """
+
     def __init__(
         self,
         task_id: str,
@@ -748,6 +774,18 @@ class BatchResult:
 
 
 class TaskPool:
+    """Global registry of all active (running + waiting) tasks on this rank.
+
+    Only rank 0 populates the pool; other ranks receive task metadata via
+    ZMQ dispatchers.  Tasks are stored in a dict keyed by ``task_id`` for O(1)
+    lookup, with an ordered ``id_list`` that preserves arrival order for
+    deterministic FCFS scheduling.
+
+    The ``pending_queue`` holds tasks that have been submitted by the router
+    but not yet promoted into the main pool (e.g. during a concurrent decode
+    step).
+    """
+
     pool: dict[str, Task] = {}
     id_list: list[str] = []
     pending_queue: deque[Task] = Deque()
@@ -908,6 +946,21 @@ class PackedTasksBase:
 
 
 class PackedTasks(PackedTasksBase):
+    """A batch of tasks ready for model execution, constructed from task IDs.
+
+    PackedTasks is created by rank 0 from the scheduler output and serialized
+    (via ``MetadataSerializer``) for ZMQ dispatch to all TP/PP/DP ranks.
+    It pre-computes everything the executor needs:
+
+    - Token lists (for prefill) or next-token indices (for decode).
+    - KV cache block assignments (``new_cache_ids_list``).
+    - Prefix cache hit metadata (``inc_hit_tokens_list``).
+    - Multimodal payloads (pixel values and grid dimensions for VL models).
+
+    When ``metadata_only`` is True, the object carries only metadata fields
+    (no tensor data), used for DP worker ranks that just need task descriptors.
+    """
+
     def __init__(
         self,
         task_ids: list[str],

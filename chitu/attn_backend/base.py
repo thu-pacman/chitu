@@ -33,8 +33,25 @@ logger = getLogger(__name__)
 
 
 class AttnBackend(abc.ABC):
-    """
-    Interface class for all attention implementations
+    """Abstract interface for attention operator backends.
+
+    Chitu supports multiple attention implementations that are selected at
+    runtime based on GPU architecture and model type:
+
+    - ``FlashAttnBackend`` — FlashAttention 2/3 for standard attention.
+    - ``FlashMLABackend`` — Multi-head Latent Attention (MLA) for DeepSeek-V3/V4.
+    - ``FlashInferBackend`` — FlashInfer's optimized paged-attention kernels.
+    - ``HopperMixedBackend`` — Mixed-precision attention for Hopper (SM90) GPUs.
+    - ``HybridAttnBackend`` — Selects the best backend per operation (prefill vs decode).
+    - ``TritonAttnBackend`` — Triton-based attention (portable across accelerators).
+    - ``NpuAttnBackend`` — Ascend NPU attention implementation.
+    - ``RefAttnBackend`` — Pure PyTorch reference implementation (CPU/Muxi).
+
+    Each backend implements two paths:
+    - ``__call__`` — the actual attention computation (read KV from cache,
+      compute QK scores, apply softmax, compute weighted V sum, write KV to cache).
+    - ``prepare_metadata_for_*`` — set up metadata (e.g. page tables) before
+      prefill or decode steps.
     """
 
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):

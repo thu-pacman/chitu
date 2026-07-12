@@ -283,6 +283,25 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
+    """Base class for all language models in Chitu.
+
+    The Transformer owns the full model lifecycle:
+    - Embedding table and final lm_head projection.
+    - A stack of ``layers`` (``TransformerBlock`` instances), each with
+      attention + MLP (optionally MoE).
+    - KV caches (paged or dense) shared across layers.
+    - Parallelism setup: partitions layers across PP stages, experts across
+      EP ranks, and heads across TP ranks.
+    - CUDA graph capture for decode (the latency-critical path).
+
+    Subclasses (``model_deepseek_v3.py``, ``model_hf_llama.py``, etc.)
+    implement the specific architecture by overriding:
+    - Layer construction (attention type, MLP type, norm positions).
+    - ``prefill`` and ``decode`` forward passes.
+    - ``load_state_dict_parallel`` and ``_get_layer_i_prefix_mapping`` for
+      checkpoint loading.
+    """
+
     def __init__(
         self,
         params,
@@ -1691,6 +1710,27 @@ class Transformer(nn.Module):
         output_token_offsets: torch.Tensor,
         **args,
     ) -> torch.Tensor:
+        """Run the prefill forward pass.
+
+        Prefill processes all prompt tokens in parallel, caching the KV states
+        for every position and returning the hidden states of the last token
+        per request (specified by ``output_token_offsets``).
+
+        In PP mode, ``tokens`` is None on non-first stages (hidden states are
+        received from the preceding stage).  The first stage embeds tokens and
+        sends hidden states downstream; intermediate stages process hidden
+        states only; the last stage projects to logits.
+
+        Args:
+            tokens: Flat tensor of token IDs for the first PP stage; None
+                   for later stages (which receive hidden states).
+            hiddens: Hidden states from the previous PP stage (None for stage 0).
+            output_token_offsets: Per-request positions of the last prompt token
+                                  (used to extract the logits for sampling).
+        Returns:
+            Logits for the last prompt token of each request (on the last PP
+            stage), or hidden states to forward to the next PP stage.
+        """
         if hiddens is not None and len(hiddens) == 0:
             return self.empty_prefill()
         if tokens is not None and len(tokens) == 0:

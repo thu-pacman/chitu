@@ -28,12 +28,34 @@ logger = getLogger(__name__)
 
 
 class KVCacheCapacityStatus(Enum):
+    """Result of a KV cache capacity check for a candidate task.
+
+    OK:
+        The task can be scheduled — enough free blocks are available.
+    CONGESTED:
+        The task needs more blocks than currently free, but the total number
+        of blocks it would need (after running to completion) is within the
+        cache's physical capacity.  The scheduler should skip this task for
+        now and retry later when in-flight prefill tasks have released blocks.
+    EXCEEDS_CAPACITY:
+        The task's sequence length requires more blocks than the cache can
+        physically hold, even if all blocks were free.  The task must be
+        terminated (evicted).
+    """
     OK = auto()
     CONGESTED = auto()
     EXCEEDS_CAPACITY = auto()
 
 
 class SchedulerGroupList:
+    """Ring-buffer of schedule groups for pipeline parallelism.
+
+    In PP mode, ``pp_size`` schedule groups rotate each step so that tasks
+    entering the pipeline in step N complete their prefill and enter decode
+    synchronously.  Each group tracks the task IDs that were scheduled in its
+    slot; when the slot wraps around, its tasks are released (``unwait()``).
+    """
+
     def __init__(self, num_sgroup: int, type: str = "paged"):
         self.num_sgroup = num_sgroup
         self.type = type
@@ -317,12 +339,18 @@ class Scheduler:
     def _inflight_prefill_reserved_blocks(
         self, cache_manager, exclude_task_id: str
     ) -> int:
-        """已开始prefill但未完成（仍持有块、task_type仍为Prefill）的任务，跑到完整
-        prompt长度还需要的块数之和。准入新prefill时必须为它们预留这些块，否则会出现
-        多个在途prefill互相占用、谁都无法跑完、谁都到不了decode释放块的死锁。
+        """Count blocks that in-flight prefill tasks still need to reach their full prompt length.
+
+        When admitting a new prefill task, the scheduler must reserve enough
+        blocks for every already-running prefill to finish.  Without this
+        reservation, multiple partial prefill tasks could each hold blocks while
+        waiting for more, creating a deadlock where none can reach decode (the
+        only phase that releases blocks).
+
         Args:
-            cache_manager: 当前正在统计预留块的cache_manager
-            exclude_task_id: 排除的task_id（通常是当前正在检查容量的任务自身）
+            cache_manager: The cache manager to count against.
+            exclude_task_id: Exclude this task from the count (typically the
+                candidate task being evaluated for admission).
         """
         reserved = 0
         for tid, cache_ids in cache_manager.task_to_cache_ids.items():

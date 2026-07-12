@@ -73,33 +73,30 @@ RESULT_TAG = 3
 
 
 class TasksDispatcher(ABC):
-    """
-    Communication interface for a parallelism
+    """Abstract communication interface for distributing tasks across parallel ranks.
+
+    Each parallelism strategy (TP, PP, DP, PCP) implements a dispatcher that
+    handles metadata dispatch (task IDs, sequence lengths, cache block assignments)
+    and tensor payload transfer (token IDs for the first PP stage, hidden states
+    for later stages).
 
     General workflow:
-    1. `Executor` calls `dispatch_metadata` of this interface to let all corresponding
-        ranks know the task meta data.
-    2. for each model input:
-        1. on source rank, `Executor` generates model input, then calls `send_payload` of
-            this interface to send model input to other ranks.
-        2. on other ranks, `Executor` calls `recv_payload` of this interface to receive
-        model input from source rank.
-    3. `Executor` computes the model on every corresponding rank.
+    1. ``Executor.step()`` calls ``dispatch_metadata`` on each dispatcher in
+       depth-first order (pipe → PCP → TP → DP).  Each dispatcher sends the
+       task metadata to its sibling ranks.
+    2. For each model input tensor:
+       a. On the source rank (TP0/PCP0/PP stage 0), the Executor generates the
+          payload (token IDs for first PP stage, hidden states otherwise).
+       b. ``send_payload`` pushes the tensor to other ranks in the group.
+       c. On target ranks, ``recv_payload`` receives the tensor.
+    3. Every rank runs the model forward pass independently.
+    4. Results flow backward (PP last → PP first, DP workers → DP main rank).
 
-    When combining multiple parallelism, generally we want a fused dispatcher dedicatedly
-    designed for this combined parallelism in order for higher performance. But if we don't
-    have such a fused dispatcher, we should chain multiple dispatchers. When chaining
-    dispatchers, we should take care of the order of dispatchers, and the dispatcher will
-    have an additional filter.
-
-    Example of calling `dispatch_metadata` on combined PP dispatcher with TP dispatcher:
-    1. `Executor` calls PP dispatcher, only on TP main ranks.
-    2. `Executor` calls TP disptchers, on all ranks.
-
-    In this example, during initialization, `Executor` should initialize the TP dispatcher
-    first, and initialize the PP dispatcher next only on filtered ranks. During execution,
-    `Executor` should call `dispatch_metadata` on the PP dispatcher first, and then call
-    `dispatch_metadata` on the TP dispatcher.
+    When combining multiple parallelism strategies, dispatchers are chained:
+    the executor prepends them in order so that outer dispatchers (PP) wrap
+    inner ones (TP, DP).  Only ranks that are "main" for a given parallelism
+    level participate in its dispatcher communication.  See ``Executor.step()``
+    for the dispatch ordering.
     """
 
     def __init__(
@@ -268,10 +265,16 @@ class TasksDispatcher(ABC):
 
 
 class PipeDispatcher(TasksDispatcher):
-    """PP (Pipeline Parallelism) Dispatcher
+    """Pipeline Parallelism (PP) dispatcher using ZMQ PUSH/PULL point-to-point links.
 
-    使用 ZMQ PUSH/PULL 模式（点对点，单向流水线传输）
-    协议选择：自动根据相邻 stages 是否同节点选择 ipc:// 或 tcp://
+    Each PP stage sends hidden states to the next stage via ZMQ.  The protocol
+    automatically selects IPC (shared memory) when adjacent stages reside on the
+    same node, or TCP when they are on different nodes.  Metadata (task IDs,
+    sequence lengths, slot indices) is serialized via msgpack and forwarded
+    through the pipeline alongside the tensor payloads.
+
+    Only the first TP rank and first PCP rank within each PP stage participates
+    in metadata dispatch; tensor payloads use NCCL send/recv for efficiency.
     """
 
     def __init__(
@@ -465,7 +468,14 @@ class PipeDispatcher(TasksDispatcher):
 
 
 class TensorDispatcher(TasksDispatcher):
-    """TP (Tensor Parallelism) Dispatcher — also used for CP task dispatch."""
+    """TP and PCP task dispatcher using ZMQ ROUTER/DEALER + NCCL broadcast.
+
+    Tensor parallelism splits the model's weight matrices across ranks, so
+    every rank must receive the same task metadata and the same input tensors.
+    This dispatcher uses a ROUTER/DEALER pattern: the main rank (TP0/PCP0)
+    serializes task metadata to all sibling ranks via ZMQ, then broadcasts
+    the input tensor payload using NCCL broadcast.
+    """
 
     def __init__(
         self,
@@ -556,7 +566,13 @@ class TensorDispatcher(TasksDispatcher):
 
 
 class ExpertDataDispatcher(TasksDispatcher):
-    """DP (Data Parallelism) Dispatcher"""
+    """DP (Data Parallelism) dispatcher for distributing requests across DP ranks.
+
+    In data-parallel serving, each DP rank runs the full model independently
+    on a subset of the batch.  This dispatcher sends per-rank task metadata
+    from DP rank 0 to workers, and collects per-rank results (sampled tokens,
+    logprobs, PD first-token hints) back on rank 0 for merging.
+    """
 
     def __init__(
         self,
@@ -967,7 +983,14 @@ class Executor:
         return self._kv_hook
 
     def _lb_trigger(self) -> None:
-        # 如果sysnc没有成功，不要开启下一步的trigger
+        """Trigger MoE expert load-balancing at the configured interval.
+
+        Every ``moe_lb_trigger`` decode steps, the planner aggregates per-expert
+        load statistics from the current batch and generates an ordered list of
+        expert-migration actions.  The actual migration (P2P weight transfers)
+        is deferred to ``_lb_sync``, which commits only the layers whose
+        transfers have completed.
+        """
         if not self._lb_enabled:
             return
         try:
@@ -982,6 +1005,12 @@ class Executor:
             pass
 
     def _lb_sync(self) -> None:
+        """Commit ready MoE expert-migration layers after load-balancing trigger.
+
+        Expert migration uses async P2P transfers; this method commits only the
+        layers whose transfers have finished.  Layers still in-flight are left
+        for the next sync.
+        """
         if not self._lb_enabled:
             return
         try:
@@ -1095,7 +1124,27 @@ class Executor:
     def step(
         self, tasks: Optional[PackedTasksBase]
     ) -> SerializedPackedTasksPayloadType:
-        # 1. propagate tasks and handle special payload type
+        """Execute one inference step — dispatch tasks, run the model, and collect results.
+
+        This is the heart of the executor.  A step proceeds through these phases:
+
+        1. **Metadata dispatch** — each dispatcher (PP → PCP → TP → DP) serializes
+           task metadata and sends it to its sibling ranks via ZMQ.  After
+           dispatch, every rank that participates in the step has a local copy
+           of the task descriptors.
+
+        2. **Special payload handling** — ``TerminateBackend`` sets the backend
+           state to Terminated; ``EndTask`` cleans up finished tasks (KV cache
+           eviction, sampler state removal, TaskPool cleanup).
+
+        3. **Process queue** — runs a sequence of callbacks configured at init:
+           - Normal mode: model_run → process_last_batch_results → postprocess_sync
+           - Schedule-overlap mode: postprocess_sync → model_run → process_last_batch_results
+           The overlap mode pipelines CPU postprocessing of step N with GPU work
+           for step N+1.
+
+        Returns the serialized payload type (Empty, Normal, TerminateBackend, EndTask).
+        """
         payload_type = tasks.payload_type if tasks is not None else None
 
         for dispatcher in self.task_dispatchers:
@@ -1176,7 +1225,21 @@ class Executor:
             return torch.arange(tasks.num_tasks, dtype=torch.int32, device=self.device)
 
     def model_run(self, tasks: PackedTasksBase):
-        if tasks.payload_type == SerializedPackedTasksPayloadType.Empty:
+        """Run the model forward pass for one step — prefill or decode.
+
+        This method:
+        1. Prepares the MoE implementation for the step (sets task type and
+           number of tokens so MoE layers can configure their dispatchers).
+        2. Prepares KV caches for the step via ``prepare_cache_prefill`` or
+           ``prepare_cache_decode``.
+        3. Builds the input payload (token IDs for first PP stage, hidden
+           states for later stages).
+        4. Calls ``Backend.model.prefill()`` or ``Backend.model.decode()``.
+        5. Sends the output to the next PP stage via ``_send_pp_payload``.
+        6. On the sample rank (TP0 + PCP0 + last PP stage), runs the sampler
+           to produce next-token predictions.
+        7. Notifies the KV transfer hook after prefill for PD disaggregation.
+        """
             if not self.is_pp_first_stage:
                 self._collect_task_and_pp_results(tasks)
             return
@@ -1299,7 +1362,21 @@ class Executor:
         return hiddens
 
     def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
-        is_empty_step = tasks.num_tasks == 0
+        """Run a single prefill forward pass.
+
+        Prefill processes the prompt tokens of newly scheduled requests in
+        parallel.  Each request's full prompt is fed through the model at once,
+        producing the KV cache entries for all prompt tokens and the hidden
+        state of the last token (used for first-token sampling).
+
+        Steps:
+        1. Prepare KV caches (allocate blocks, set sequence lengths).
+        2. Gather token IDs from task descriptors into a flat tensor.
+        3. Receive hidden states from the previous PP stage (if not stage 0).
+        4. Call ``Backend.model.prefill()``.
+        5. Send output hidden states to the next PP stage.
+        6. Collect prompt token metrics for Prometheus.
+        """
         if not is_empty_step:
             for cache in Backend.cache_dict.values():
                 cache.prepare_cache_prefill(tasks)
@@ -1354,7 +1431,21 @@ class Executor:
             return self.dummy_output
 
     def decode_step(self, tasks: PackedTasksBase, is_empty_step: bool = False):
-        if tasks.num_tasks == 0:
+        """Run a single decode forward pass.
+
+        Decode processes one token per in-flight request, generating the next
+        token prediction.  For multi-token prediction (MTP) models, this
+        processes ``mtp_size`` tokens per request per step.
+
+        Steps:
+        1. Ensure KV cache is ready (for PD, this may wait for KV transfer from
+           the prefill side to complete).
+        2. Prepare KV caches — update block tables and sequence lengths.
+        3. Build the payload: token IDs (first PP stage) or hidden states
+           (later PP stages) received from the previous PP stage.
+        4. Call ``Backend.model.decode()``.
+        5. Send the output to the next PP stage.
+        """
             is_empty_step = True
         if not is_empty_step:
             # Ensure KV cache is present for PD decode-only before updating CacheManager state.
@@ -1394,10 +1485,12 @@ class Executor:
             return self.dummy_mtp_output if self.mtp_size > 1 else self.dummy_output
 
     def _send_pp_payload(self, tensor, tasks):
-        """Send payload to next PP stage if this rank should send.
+        """Send the model output to the next PP stage.
 
-        CP mode: every rank has its own PP pair and sends independently.
-        TP mode: only the main rank sends (hiddens already synced via TP broadcast).
+        - CP mode: every rank has its own independent PP pair and sends directly.
+        - TP mode: only the main (TP0) rank sends, since hidden states are
+          already synchronized across TP ranks via NCCL broadcast.
+        - The last PP stage does not send (there is no next stage).
         """
         if not get_pp_group().is_last_rank:
             if self.cp_context.should_send_directly() or self.is_main_rank:
@@ -1489,7 +1582,22 @@ class Executor:
         return logits
 
     def decode_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
-        """DLLM decode: payload is the full block per task, forward + batch_decode + update state."""
+        """Run a DLLM (Diffusion LLM) decode step.
+
+        Unlike standard autoregressive decode, DLLM operates on token *blocks*
+        of fixed length.  Each decode step iteratively refines a full block of
+        tokens via a masked-prediction loop until the block is fully decoded
+        (no mask tokens remain) or the maximum number of iterations is reached.
+
+        Steps:
+        1. Prepare the block-length payload (mask tokens filled in for undecoded positions).
+        2. Prepare DLLM-aware KV caches (``prepare_cache_decode_dllm``).
+        3. Loop: forward → batch_decode → check block-finished condition.
+        4. Finalize caches and update task state with decoded block tokens.
+        5. Queue finished blocks in ``_pending_dllm_block`` for later delivery
+           via ``_process_dllm_block_results`` (which streams all tokens at once
+           rather than one by one).
+        """
         if tasks.num_tasks == 0:
             return self.dummy_output
         if self.tp_size <= 1 and not isinstance(tasks, PackedTasks):
@@ -1740,12 +1848,22 @@ class Executor:
         TaskCollector.add_update_task_ids(tasks.output_task_ids)
 
     def postprocess_sync_part(self, current_tasks: PackedTasksBase):
-        """
-        schedule -> model -> sample -> ***sync*** -> send
+        """Synchronize sampled results to CPU and collect across DP workers.
 
-        Synchronize generated result to cpu.
+        This is the "sync" phase of the step pipeline:
 
-        After synchronizing, collect result across dp workers to dp main rank and update tasks.
+        ```
+        schedule → model → sample → ***sync*** → send (async, overlaps next step)
+        ```
+
+        Steps:
+        1. Collect results from PP (pipe results flow backward through the pipeline).
+        2. Move generated tokens to CPU (triggers CUDA synchronization).
+        3. Update token statistics (generated count, MTP accept rate).
+        4. Collect per-DP-rank results to DP rank 0 and merge.
+        5. Update response streams with new tokens.
+        6. When schedule-overlap is enabled, predict which tasks will stop after
+           this step so the scheduler can pre-warm their replacements.
         """
         tasks = self._collect_task_and_pp_results(current_tasks)
         if self.model_type == ModelType.LLADA2:
