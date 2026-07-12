@@ -776,10 +776,8 @@ class BatchResult:
 class TaskPool:
     """Global registry of all active (running + waiting) tasks on this rank.
 
-    Only rank 0 populates the pool; other ranks receive task metadata via
-    ZMQ dispatchers.  Tasks are stored in a dict keyed by ``task_id`` for O(1)
-    lookup, with an ordered ``id_list`` that preserves arrival order for
-    deterministic FCFS scheduling.
+    Tasks are stored in a dict keyed by ``task_id`` for O(1) lookup, with an
+    ordered ``id_list`` for deterministic iteration.
 
     The ``pending_queue`` holds tasks that have been submitted by the router
     but not yet promoted into the main pool (e.g. during a concurrent decode

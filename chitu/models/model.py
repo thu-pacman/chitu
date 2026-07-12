@@ -289,7 +289,6 @@ class Transformer(nn.Module):
     - Embedding table and final lm_head projection.
     - A stack of ``layers`` (``TransformerBlock`` instances), each with
       attention + MLP (optionally MoE).
-    - KV caches (paged or dense) shared across layers.
     - Parallelism setup: partitions layers across PP stages, experts across
       EP ranks, and heads across TP ranks.
     - CUDA graph capture for decode (the latency-critical path).
@@ -1712,9 +1711,8 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         """Run the prefill forward pass.
 
-        Prefill processes all prompt tokens in parallel, caching the KV states
-        for every position and returning the hidden states of the last token
-        per request (specified by ``output_token_offsets``).
+        Prefill caches KV states for prompt tokens and returns the hidden states
+        of the last token per request (specified by ``output_token_offsets``).
 
         In PP mode, ``tokens`` is None on non-first stages (hidden states are
         received from the preceding stage).  The first stage embeds tokens and

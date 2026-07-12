@@ -103,6 +103,7 @@ class BackendState(Enum):
     Terminated:
         All ranks have stopped.  The main loop exits.
     """
+
     Running = 1
     Terminating = 2  # All tasks done, but rank 0 should tell others to terminate
     Terminated = 3
@@ -119,6 +120,9 @@ class Backend:
     - KV caches and per-DP-rank cache managers.
     - Schedulers (one per DP rank) and the Executor.
     - MoE weight accessor for dynamic expert load-balancing.
+
+    Some components are attached by later initialization steps outside
+    ``Backend.build()``.
 
     The build order in ``Backend.build()`` is:
     1. Init distributed environment (NCCL/GLOO, parallel groups).

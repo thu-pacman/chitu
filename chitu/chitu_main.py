@@ -1394,8 +1394,8 @@ def _update_tasks_preferred_dp_rank():
     1. **Prefix cache hit rate** — how many of the request's prompt tokens
        are already cached on each DP rank.  Higher cache hits mean fewer
        tokens to recompute during prefill, reducing latency.
-    2. **Current load** — the number of in-flight decode tasks on each DP
-       rank.  Load is penalized to avoid overloading a single rank.
+    2. **Current load** — the number of in-flight tasks on each DP rank.
+       Load is penalized to avoid overloading a single rank.
 
     The final score per rank is:
         score = cache_hit_rate * hit_rate_weight

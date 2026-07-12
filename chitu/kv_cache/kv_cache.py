@@ -1275,11 +1275,8 @@ class MMPagedKVCache(PagedKVCache):
 class DenseKVCache(KVCacheBase):
     """Contiguous (non-paged) KV cache — one fixed-size buffer per request.
 
-    In contrast to ``PagedKVCache``, DenseKVCache pre-allocates a contiguous
-    region of ``[max_seq_len, shape_per_token...]`` for each hot request.
-    This is simpler and avoids block-table indirection, but is memory-inefficient
-    for long sequences with variable lengths.  It is primarily used for the
-    "skew" cache type (legacy) and for specialized DeepSeek-V4 caches.
+    DenseKVCache is designed for dense (a.k.a. skew) KV cache. Additionally,
+    it is used for some auxiliary fixed-length KV caches in some models.
     """
 
     def __init__(

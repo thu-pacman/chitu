@@ -81,9 +81,8 @@ class TasksDispatcher(ABC):
     for later stages).
 
     General workflow:
-    1. ``Executor.step()`` calls ``dispatch_metadata`` on each dispatcher in
-       depth-first order (pipe → PCP → TP → DP).  Each dispatcher sends the
-       task metadata to its sibling ranks.
+    1. ``Executor.step()`` calls ``dispatch_metadata`` on each dispatcher.
+       Each dispatcher sends the task metadata to its sibling ranks.
     2. For each model input tensor:
        a. On the source rank (TP0/PCP0/PP stage 0), the Executor generates the
           payload (token IDs for first PP stage, hidden states otherwise).
@@ -91,12 +90,6 @@ class TasksDispatcher(ABC):
        c. On target ranks, ``recv_payload`` receives the tensor.
     3. Every rank runs the model forward pass independently.
     4. Results flow backward (PP last → PP first, DP workers → DP main rank).
-
-    When combining multiple parallelism strategies, dispatchers are chained:
-    the executor prepends them in order so that outer dispatchers (PP) wrap
-    inner ones (TP, DP).  Only ranks that are "main" for a given parallelism
-    level participate in its dispatcher communication.  See ``Executor.step()``
-    for the dispatch ordering.
     """
 
     def __init__(
@@ -265,13 +258,14 @@ class TasksDispatcher(ABC):
 
 
 class PipeDispatcher(TasksDispatcher):
-    """Pipeline Parallelism (PP) dispatcher using ZMQ PUSH/PULL point-to-point links.
+    """Pipeline Parallelism (PP) dispatcher using point-to-point links.
 
-    Each PP stage sends hidden states to the next stage via ZMQ.  The protocol
-    automatically selects IPC (shared memory) when adjacent stages reside on the
-    same node, or TCP when they are on different nodes.  Metadata (task IDs,
-    sequence lengths, slot indices) is serialized via msgpack and forwarded
-    through the pipeline alongside the tensor payloads.
+    Each PP stage sends hidden states to the next stage.  Metadata and tensor
+    payloads use different communication channels: metadata is serialized via
+    msgpack and forwarded through ZMQ PUSH/PULL sockets, while tensor payloads
+    are transferred with ``torch.distributed`` point-to-point operations.  The
+    ZMQ protocol automatically selects IPC (shared memory) when adjacent stages
+    reside on the same node, or TCP when they are on different nodes.
 
     Only the first TP rank and first PCP rank within each PP stage participates
     in metadata dispatch; tensor payloads use NCCL send/recv for efficiency.
@@ -1128,10 +1122,9 @@ class Executor:
 
         This is the heart of the executor.  A step proceeds through these phases:
 
-        1. **Metadata dispatch** — each dispatcher (PP → PCP → TP → DP) serializes
-           task metadata and sends it to its sibling ranks via ZMQ.  After
-           dispatch, every rank that participates in the step has a local copy
-           of the task descriptors.
+        1. **Metadata dispatch** — each dispatcher serializes task metadata and
+           sends it to its sibling ranks via ZMQ.  After dispatch, every rank
+           that participates in the step has a local copy of the task descriptors.
 
         2. **Special payload handling** — ``TerminateBackend`` sets the backend
            state to Terminated; ``EndTask`` cleans up finished tasks (KV cache
@@ -1240,6 +1233,7 @@ class Executor:
            to produce next-token predictions.
         7. Notifies the KV transfer hook after prefill for PD disaggregation.
         """
+        if tasks.payload_type == SerializedPackedTasksPayloadType.Empty:
             if not self.is_pp_first_stage:
                 self._collect_task_and_pp_results(tasks)
             return
@@ -1364,10 +1358,9 @@ class Executor:
     def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         """Run a single prefill forward pass.
 
-        Prefill processes the prompt tokens of newly scheduled requests in
-        parallel.  Each request's full prompt is fed through the model at once,
-        producing the KV cache entries for all prompt tokens and the hidden
-        state of the last token (used for first-token sampling).
+        Prefill processes prompt tokens of newly scheduled requests in parallel,
+        producing KV cache entries and the hidden state of the last token used
+        for first-token sampling.
 
         Steps:
         1. Prepare KV caches (allocate blocks, set sequence lengths).
@@ -1377,6 +1370,7 @@ class Executor:
         5. Send output hidden states to the next PP stage.
         6. Collect prompt token metrics for Prometheus.
         """
+        is_empty_step = tasks.num_tasks == 0
         if not is_empty_step:
             for cache in Backend.cache_dict.values():
                 cache.prepare_cache_prefill(tasks)
@@ -1446,6 +1440,7 @@ class Executor:
         4. Call ``Backend.model.decode()``.
         5. Send the output to the next PP stage.
         """
+        if tasks.num_tasks == 0:
             is_empty_step = True
         if not is_empty_step:
             # Ensure KV cache is present for PD decode-only before updating CacheManager state.

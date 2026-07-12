@@ -34,14 +34,14 @@ class KVCacheCapacityStatus(Enum):
         The task can be scheduled — enough free blocks are available.
     CONGESTED:
         The task needs more blocks than currently free, but the total number
-        of blocks it would need (after running to completion) is within the
-        cache's physical capacity.  The scheduler should skip this task for
-        now and retry later when in-flight prefill tasks have released blocks.
+        of blocks it would need is within the cache's physical capacity.  The
+        scheduler should skip this task for now and retry later.
     EXCEEDS_CAPACITY:
         The task's sequence length requires more blocks than the cache can
         physically hold, even if all blocks were free.  The task must be
         terminated (evicted).
     """
+
     OK = auto()
     CONGESTED = auto()
     EXCEEDS_CAPACITY = auto()
