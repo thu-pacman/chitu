@@ -121,7 +121,7 @@ class PDSchedulerService:
         # Initialize scheduler
         self._init_scheduler()
 
-        if self.pd_mode == PDSchedulerMode.DECODE_ONLY or PDSchedulerMode.UNIFIED:
+        if self.pd_mode in (PDSchedulerMode.DECODE_ONLY, PDSchedulerMode.UNIFIED):
             for dp_rank in range(len(Backend.schedulers)):
                 Backend.schedulers[dp_rank].set_task_evict_hook(PDTaskEvictHook())
 
@@ -427,7 +427,7 @@ class PDSchedulerService:
 
         stats = {
             "local_instance_id": self.scheduler.local_instance_id,
-            "scheduler_type": self.pd_mode.value,
+            "pd_mode": self.pd_mode.value,
             "max_seq_len": getattr(get_global_args().infer, "max_seq_len", None),
             # FIXME: stats from all cache?
             "num_blocks": main_cache.num_blocks,
@@ -493,13 +493,9 @@ async def start_pd_worker_service(args, rank: int = 0):
 
     logger.info(f"initializing pd worker for rank {rank}")
 
-    scheduler_type = args.scheduler.type
-    if scheduler_type == "decode_only":
-        mode = "decode"
-    elif scheduler_type == "prefill_only":
-        mode = "prefill"
-    else:
-        raise ValueError(f"unsupported scheduler type: {scheduler_type}")
+    mode = args.multi_inst.role
+    if mode not in ("prefill", "decode"):
+        raise ValueError(f"unsupported multi_inst.role for PD worker: {mode}")
 
     logger.info(f"pd worker rank {rank} detected mode: {mode}")
 

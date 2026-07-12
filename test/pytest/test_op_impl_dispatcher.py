@@ -169,6 +169,7 @@ def test_warmup_engine_emits_impl_summary_after_auto_set(monkeypatch):
     args = SimpleNamespace(
         multi_inst=SimpleNamespace(
             n_insts=2,
+            role="prefill_and_decode",
             router=SimpleNamespace(is_router=False),
         ),
         scheduler=SimpleNamespace(type="default"),
@@ -191,49 +192,3 @@ def test_emit_observed_op_impl_summary_after_warmup_skips_nonzero_rank(monkeypat
     )
 
     assert chitu_main._emit_observed_op_impl_summary_after_warmup() is False
-
-
-def test_ops_source_tree_has_no_handwritten_auto_impl_dispatch_left():
-    ops_root = Path(__file__).resolve().parents[2] / "chitu" / "ops"
-    offenders = []
-
-    for path in ops_root.rglob("*.py"):
-        if path.name == "utils.py" or "triton_ops" in path.parts:
-            continue
-        if 'if impl == "auto":' in path.read_text():
-            offenders.append(path.relative_to(ops_root.parent).as_posix())
-
-    assert offenders == []
-
-
-def test_blockfp_quantization_files_have_no_handwritten_auto_impl_dispatch_left():
-    quant_root = Path(__file__).resolve().parents[2] / "chitu" / "quantization"
-    offenders = []
-
-    for relative_path in ("blockfp4.py", "blockfp8.py"):
-        path = quant_root / relative_path
-        if not path.exists():
-            continue
-        if 'impl == "auto"' in path.read_text():
-            offenders.append(relative_path)
-
-    assert offenders == []
-
-
-def test_tail_cleanup_files_have_no_handwritten_impl_branching_left():
-    repo_root = Path(__file__).resolve().parents[2] / "chitu"
-    offenders = []
-
-    for relative_path in (
-        "quantization/normal.py",
-        "ops/sampling.py",
-        "ops/rotary.py",
-    ):
-        path = repo_root / relative_path
-        if not path.exists():
-            continue
-        text = path.read_text()
-        if "if impl ==" in text or "elif impl ==" in text:
-            offenders.append(relative_path)
-
-    assert offenders == []

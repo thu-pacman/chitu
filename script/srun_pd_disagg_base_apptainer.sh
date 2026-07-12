@@ -507,7 +507,6 @@ pd_node_main() {
       "+multi_inst.inst_overrides.${_inst_id}.multi_inst.pd_disaggregation.prefill_scheduler.max_batch_size=${ROUTER_PREFILL_MAX_BATCH_SIZE}"
       "+multi_inst.inst_overrides.${_inst_id}.multi_inst.pd_disaggregation.prefill_scheduler.max_total_tokens=${ROUTER_PREFILL_MAX_TOTAL_TOKENS}"
       "+multi_inst.inst_overrides.${_inst_id}.multi_inst.pd_disaggregation.prefill_scheduler.batching_strategy=${ROUTER_PREFILL_BATCHING_STRATEGY}"
-      "+multi_inst.inst_overrides.${_inst_id}.scheduler.type=prefill_only"
       "+multi_inst.inst_overrides.${_inst_id}.infer.max_seq_len=${PREFILL_MAX_SEQ_LEN[i]}"
       "+multi_inst.inst_overrides.${_inst_id}.infer.max_batch_size=${PREFILL_MAX_BATCH_SIZE[i]}"
       "+multi_inst.inst_overrides.${_inst_id}.request.max_new_tokens=${PREFILL_MAX_NEW_TOKENS[i]}"
@@ -525,7 +524,6 @@ pd_node_main() {
     PD_INST_OVERRIDES_ARGS+=(
       "+multi_inst.inst_overrides.${_inst_id}.multi_inst.role=decode"
       "+multi_inst.inst_overrides.${_inst_id}.multi_inst.pd_disaggregation.decode_scheduler.scheduling_strategy=${ROUTER_DECODE_SCHEDULING_STRATEGY}"
-      "+multi_inst.inst_overrides.${_inst_id}.scheduler.type=decode_only"
       "+multi_inst.inst_overrides.${_inst_id}.infer.max_seq_len=${DECODE_MAX_SEQ_LEN[i]}"
       "+multi_inst.inst_overrides.${_inst_id}.infer.max_batch_size=${DECODE_MAX_BATCH_SIZE[i]}"
       "+multi_inst.inst_overrides.${_inst_id}.request.max_new_tokens=${DECODE_MAX_NEW_TOKENS[i]}"

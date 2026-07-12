@@ -115,7 +115,6 @@ class Backend:
 
     # components
     schedulers: Optional[list["Scheduler"]] = None  # One per each DP rank
-    schedule_task_type_order = None
     cache_managers: Optional[list[dict[str, "KVCacheManagerBase"]]] = (
         None  # One per each DP rank
     )
@@ -769,11 +768,11 @@ class Backend:
 
         if (
             args.infer.mla_absorb == "absorb-kv-only"
-            and args.scheduler.type == "decode_only"
+            and args.multi_inst.role == "decode"
         ):
             raise ValueError(
                 "infer.mla_absorb=absorb-kv-only is only valid for Prefill instances, "
-                f"but scheduler.type={args.scheduler.type}."
+                f"but multi_inst.role={args.multi_inst.role}."
             )
 
         if args.infer.mla_absorb == "absorb-kv-only":

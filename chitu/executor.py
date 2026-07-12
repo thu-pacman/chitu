@@ -897,9 +897,8 @@ class Executor:
         # Decode is responsible for sampling and subsequent token generation.
         # If keep PP sampling enabled, last PP stage would sample and send results
         # back to rank0, adding latency and overhead.
-        sched_type = str(getattr(getattr(args, "scheduler", None), "type", "")).lower()
         self._pd_prefill_only = bool(
-            is_classic_pd_disagg() and ("prefill_only" in sched_type)
+            is_classic_pd_disagg() and args.multi_inst.role == "prefill"
         )
 
         # ---- Load balancer concurrent scheduling ----
