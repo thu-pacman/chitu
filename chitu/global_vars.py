@@ -496,6 +496,17 @@ def resolve_default_args(args):
         else:
             validate_indexer_config(args, args.infer.indexer_type)
 
+    if args.infer.process_group_timeout_seconds == "auto":
+        if args.infer.full_warmup:
+            # DeepGEMM JIT warmup compiles many kernels during the first forward pass
+            # (each (n,k) shape sweeps m=[1, DG_WARMUP_MAX_M] building 15-29 distinct
+            # kernels), which can take well over the NCCL default 600s watchdog timeout.
+            # Use a generous timeout that covers the warmup compilation window when
+            # enable full_warmup
+            args.infer.process_group_timeout_seconds = 3600
+        else:
+            args.infer.process_group_timeout_seconds = None
+
     logger.debug(f"Auto setting configs done. Full configs are: {args}")
     return args
 

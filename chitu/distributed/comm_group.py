@@ -21,16 +21,12 @@ _torch_group_dedup_dict_host: dict[tuple[tuple[int, ...], ...], list[Any]] = {}
 
 
 def _get_pg_timeout() -> Optional[timedelta]:
-    """Process-group collective timeout.
-    DeepGEMM JIT warmup compiles many kernels during the first
-    forward pass (each (n,k) shape sweeps m=[1, DG_WARMUP_MAX_M] building
-    15-29 distinct kernels), which can take well over the NCCL default
-    600 s watchdog timeout.
-    Use a generous timeout that covers the warmup compilation window when enable full_warmup
-    """
-    if getattr(get_global_args().infer, "full_warmup", False):
-        return timedelta(seconds=3600)
-    return None
+    if (
+        timeout := get_global_args().infer.get("process_group_timeout_seconds", None)
+    ) is not None:
+        return timedelta(seconds=timeout)
+    else:
+        return None
 
 
 class SingletonGroupPlaceholder:

@@ -451,6 +451,14 @@ infer:
   #: - False: Skip full warmup.
   full_warmup: auto
 
+  #: Override torch distributed process group timeout, in seconds.
+  #:
+  #: Acceptable values:
+  #: - "auto": Decide automatically.
+  #: - null: Use the default from `torch.distributed`.
+  #: - An integer: the timeout in seconds.
+  process_group_timeout_seconds: auto
+
   #: Whether and how to bind the currenct process to a CPU. If binding, it requires installing
   #: chitu with `chitu[numa]` for extra dependency.
   #:

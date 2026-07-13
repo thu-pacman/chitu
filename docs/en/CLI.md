@@ -597,6 +597,17 @@ Acceptable values:
 
 *Default: `auto`.*
 
+### Argument `infer.process_group_timeout_seconds`
+
+Override torch distributed process group timeout, in seconds.
+
+Acceptable values:
+- "auto": Decide automatically.
+- null: Use the default from `torch.distributed`.
+- An integer: the timeout in seconds.
+
+*Default: `auto`.*
+
 ### Argument `infer.bind_process_to_cpu`
 
 Whether and how to bind the currenct process to a CPU. If binding, it requires installing
