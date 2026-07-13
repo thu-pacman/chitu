@@ -357,7 +357,7 @@ class UserRequest:
 
 
 class Task:
-    """A schedulable unit of inference work — one request going through prefill → decode.
+    """A schedulable unit of inference work — one request going through prefill -> decode.
 
     Tasks are the bridge between the scheduler and the executor.  They carry all
     the metadata the scheduler needs for admission decisions (prefix cache
@@ -368,7 +368,7 @@ class Task:
     Lifecycle:
     - Created in ``TaskType.Prefill`` state.
     - After prefill completes (``consume_req_tokens()``), transitions to ``TaskType.Decode``.
-    - Stopped when EOS is emitted, max_new_tokens is reached, or KV cache overflows.
+    - Stopped when request stop conditions are met or the scheduler evicts it.
     """
 
     def __init__(

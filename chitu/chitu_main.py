@@ -118,11 +118,10 @@ def init_cache_static():
 def _deepseek_v4_compressed_ratio_from_manager_name(manager_name: str) -> Optional[int]:
     """Extract the compression ratio from a DeepSeek-V4 KV cache manager name.
 
-    DeepSeek-V4 uses compressed key-value caches (CSA and HCA) to reduce memory
-    footprint.  The manager name encodes the compression ratio:
-        - "compressed_csa" → 4x  (compressed sliding-window attention)
-        - "compressed_hca" → 128x (highly compressed attention)
-        - "compressed_N"   → Nx  (generic compressed cache)
+    DeepSeek-V4 compressed cache manager names encode the compression ratio:
+        - "compressed_csa" -> 4x
+        - "compressed_hca" -> 128x
+        - "compressed_<ratio>" -> that ratio
 
     Returns None if the manager does not represent a compressed cache.
     """
@@ -456,15 +455,14 @@ def _auto_set_deepseek_v4_num_blocks_after_warmup(
 ):
     """Resize DeepSeek-V4 KV cache blocks after warmup based on memory budget.
 
-    DeepSeek-V4 has multiple KV cache groups (main, compressed CSA, compressed
-    HCA) that must be jointly sized.  This solver uses a binary search over the
-    effective logical sequence length to find the largest per-group block
-    allocation that fits within the GPU memory budget.
+    DeepSeek-V4 has multiple KV cache groups (main and compressed groups) that
+    must be jointly sized.  This solver uses a binary search over the effective
+    logical sequence length to find the largest per-group block allocation that
+    fits within the GPU memory budget.
 
-    The solver treats sliding-window groups as fixed at one page per hot
-    request, and sizes compressed groups proportionally to the effective
-    sequence length.  Results are reduced across all ranks to ensure
-    consistency.
+    Fixed-size groups are kept at their capacity, compressed groups are sized
+    proportionally to the effective sequence length, and results are reduced
+    across all ranks to ensure consistency.
     """
     reserve_bytes = 512 << 20
     cache_groups = {}
@@ -909,7 +907,7 @@ def _emit_observed_op_impl_summary_after_warmup():
 
 
 def _warmup_via_taskpool(args):
-    """Warm up the inference engine by running mock requests through the full scheduler → executor pipeline.
+    """Warm up the inference engine by running mock requests through the full scheduler -> executor pipeline.
 
     This is the standard warmup path for standalone (non-PD-disaggregated)
     deployments.  It exercises both prefill and decode phases using the real
@@ -917,9 +915,9 @@ def _warmup_via_taskpool(args):
     and sequence lengths.  After warmup completes, the MoE load planner is
     switched from warmup to production mode.
 
-    The warmup runs ``max_batch_size`` requests, each with a sequence length
-    derived from ``prefill_chunk_size``.  Rank 0 drives the loop; other ranks
-    follow via the executor until termination is signaled.
+    The warmup starts ``max_batch_size`` mock requests with prompt length derived
+    from ``prefill_chunk_size``.  Rank 0 drives the loop; other ranks follow via
+    the executor until termination is signaled.
     """
 
     rank = torch.distributed.get_rank()
@@ -1077,15 +1075,16 @@ def _warmup_backend_direct(
     """Warm up the model backend directly, bypassing the scheduler.
 
     This is used in two scenarios:
-    1. **PD disaggregation** — decode-only workers skip prefill and prefill-only
-       workers skip decode, so each role only warms the operators it actually runs.
+    1. **PD disaggregation** — decode-only workers skip model prefill and
+       prefill-only workers skip decode, so each role only warms the operators
+       it actually runs.
     2. **Full warmup** — after the KV cache is resized, the engine runs decode
        steps at every possible batch size (descending from ``local_max_bs`` to 1)
        to capture CUDA graphs and JIT-compile all operator variants.
 
-    The warmup creates mock requests with random token IDs, runs a single
-    prefill step, then runs ``decode_steps`` decode steps (optionally descending
-    batch size by ``bs_descend`` each step).
+    The warmup prepares cache state for mock requests, optionally runs one
+    prefill model call, then optionally runs ``decode_steps`` decode model calls
+    with descending batch size controlled by ``bs_descend``.
     """
     logger.info(
         f"Starting local backend warmup (direct) with local max batch size {local_max_bs}..."
@@ -1514,10 +1513,10 @@ def chitu_run_main_rank():
 
     The step is split into three phases:
 
-    1. **Schedule** — each DP-rank scheduler selects ready prefill and decode
-       tasks.  Prefill tasks are first assigned preferred DP ranks via
-       ``_update_tasks_preferred_dp_rank`` (balancing cache-hit rate and per-rank
-       load).  Decode tasks follow, filling remaining budget.
+    1. **Schedule** — schedulers select ready prefill or decode tasks. In DP,
+       tasks are assigned to preferred DP ranks for a better load and prefix
+       cache hit. In DP, also ensure either all the ranks are running prefill or
+       all the ranks are running decode.
 
     2. **Run** — the Executor dispatches task metadata across TP/PP/DP ranks,
        runs the model (prefill or decode), samples tokens, and collects results.
@@ -1525,6 +1524,7 @@ def chitu_run_main_rank():
     3. **Update TaskPool** — completed tasks are removed, running tasks are
        updated with new tokens and status changes.
     """
+    global _last_step_task_type
     for scheduler in Backend.schedulers:
         scheduler.prepare_for_schedule()
     if Backend.args.infer.dp_size == 1:

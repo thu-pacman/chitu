@@ -1123,9 +1123,9 @@ class Executor:
 
         This is the heart of the executor.  A step proceeds through these phases:
 
-        1. **Metadata dispatch** — each dispatcher serializes task metadata and
-           sends it to its sibling ranks via ZMQ.  After dispatch, every rank
-           that participates in the step has a local copy of the task descriptors.
+        1. **Metadata dispatch** — each dispatcher propagates task metadata to
+           its sibling ranks.  After dispatch, every rank that participates in
+           the step has a local copy of the task descriptors.
 
         2. **Special payload handling** — ``TerminateBackend`` sets the backend
            state to Terminated; ``EndTask`` cleans up finished tasks (KV cache
@@ -1229,7 +1229,7 @@ class Executor:
         3. Builds the input payload (token IDs for first PP stage, hidden
            states for later stages).
         4. Calls ``Backend.model.prefill()`` or ``Backend.model.decode()``.
-        5. Sends the output to the next PP stage via ``_send_pp_payload``.
+        5. Sends the output to the next PP stage when applicable.
         6. On the sample rank (TP0 + PCP0 + last PP stage), runs the sampler
            to produce next-token predictions.
         7. Notifies the KV transfer hook after prefill for PD disaggregation.
@@ -1360,15 +1360,15 @@ class Executor:
         """Run a single prefill forward pass.
 
         Prefill processes prompt tokens of newly scheduled requests in parallel,
-        producing KV cache entries and the hidden state of the last token used
-        for first-token sampling.
+        producing KV cache entries and the hidden state or logits selected from
+        each request's last prompt token.
 
         Steps:
         1. Prepare KV caches (allocate blocks, set sequence lengths).
         2. Gather token IDs from task descriptors into a flat tensor.
         3. Receive hidden states from the previous PP stage (if not stage 0).
         4. Call ``Backend.model.prefill()``.
-        5. Send output hidden states to the next PP stage.
+        5. Send output hidden states to the next PP stage when applicable.
         6. Collect prompt token metrics for Prometheus.
         """
         is_empty_step = tasks.num_tasks == 0

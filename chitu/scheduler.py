@@ -50,10 +50,9 @@ class KVCacheCapacityStatus(Enum):
 class SchedulerGroupList:
     """Ring-buffer of schedule groups for pipeline parallelism.
 
-    In PP mode, ``pp_size`` schedule groups rotate each step so that tasks
-    entering the pipeline in step N complete their prefill and enter decode
-    synchronously.  Each group tracks the task IDs that were scheduled in its
-    slot; when the slot wraps around, its tasks are released (``unwait()``).
+    In PP mode, schedule groups rotate each step.  Each group records the task
+    IDs scheduled in its slot so they can be marked waiting and later released
+    with ``unwait()`` after the corresponding pipeline delay.
     """
 
     def __init__(self, num_sgroup: int, type: str = "paged"):
@@ -344,8 +343,7 @@ class Scheduler:
         When admitting a new prefill task, the scheduler must reserve enough
         blocks for every already-running prefill to finish.  Without this
         reservation, multiple partial prefill tasks could each hold blocks while
-        waiting for more, creating a deadlock where none can reach decode (the
-        only phase that releases blocks).
+        waiting for more, creating a deadlock where none can reach decode.
 
         Args:
             cache_manager: The cache manager to count against.

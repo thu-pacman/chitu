@@ -1697,8 +1697,9 @@ class Transformer(nn.Module):
     ) -> torch.Tensor:
         """Run the prefill forward pass.
 
-        Prefill caches KV states for prompt tokens and returns the hidden states
-        of the last token per request (specified by ``output_token_offsets``).
+        Prefill caches KV states for prompt tokens and returns the selected
+        hidden states or logits for the last prompt token of each request
+        (specified by ``output_token_offsets``).
 
         In PP mode, ``tokens`` is None on non-first stages (hidden states are
         received from the preceding stage).  The first stage embeds tokens and
@@ -1710,7 +1711,7 @@ class Transformer(nn.Module):
                    for later stages (which receive hidden states).
             hiddens: Hidden states from the previous PP stage (None for stage 0).
             output_token_offsets: Per-request positions of the last prompt token
-                                  (used to extract the logits for sampling).
+                                  (used to select outputs for sampling).
         Returns:
             Logits for the last prompt token of each request (on the last PP
             stage), or hidden states to forward to the next PP stage.

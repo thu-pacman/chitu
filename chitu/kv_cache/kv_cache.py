@@ -485,18 +485,16 @@ class KVCacheBase:
 class PagedKVCache(KVCacheBase):
     """Paged KV cache with virtual-to-physical block mapping.
 
-    Inspired by OS virtual memory, PagedKVCache divides the KV cache into
-    fixed-size blocks (pages) and maps each request's logical positions to
-    physical blocks via a block table.  This eliminates fragmentation: blocks
-    can be allocated on demand and reclaimed independently per request.
+    PagedKVCache divides the KV cache into fixed-size blocks (pages) and maps
+    each request's logical positions to physical blocks via a block table.
 
     Key design points:
-    - ``block_table``: (num_hot_req, max_blocks_per_req) — maps each request's
-      logical block offsets to physical block indices.
-    - Prefix caching: when enabled, blocks with identical content are shared
-      across requests (managed by the cache manager, not the cache itself).
-    - ``allocatable_max_num_blocks``: With prefix caching, this is virtually
-      unbounded; without it, it equals ``page_table_max_num_blocks``.
+    - ``block_table``: maps each request's logical block offsets to physical
+      block indices.
+    - Prefix-cache sharing, when enabled for a cache type, is managed by the
+      cache manager rather than the cache itself.
+    - ``allocatable_max_num_blocks`` records the effective upper bound used by
+      warmup-time reallocation.
     """
 
     def __init__(

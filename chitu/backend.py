@@ -97,9 +97,8 @@ class BackendState(Enum):
     Running:
         Normal operation — accepting and processing requests.
     Terminating:
-        A termination signal has been received.  The backend drains in-flight
-        requests but does not accept new ones.  Once all tasks are finished,
-        rank 0 broadcasts the Terminated state to all workers.
+        A termination signal has been received.  The serving loop drains
+        in-flight requests before moving the backend to Terminated.
     Terminated:
         All ranks have stopped.  The main loop exits.
     """
@@ -1293,8 +1292,8 @@ def load_state_dict(
 
     Supports:
     - Loading a subset of keys via ``prefix`` (single prefix match).
-    - Loading from additional prefix lists via ``prefix_list``.
-    - Filtering keys with a caller-supplied ``key_filter`` callback.
+    - Loading extra keys via ``prefix_list``.
+    - Filtering normally loaded keys with a caller-supplied ``key_filter`` callback.
     - ``skip_preprocess`` mode: each rank loads only its own shard
       (``model.rank{rank}.safetensors``).
 
