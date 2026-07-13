@@ -283,22 +283,8 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    """Base class for all language models in Chitu.
-
-    The Transformer owns the full model lifecycle:
-    - Embedding table and final lm_head projection.
-    - A stack of ``layers`` (``TransformerBlock`` instances), each with
-      attention + MLP (optionally MoE).
-    - Parallelism setup: partitions layers across PP stages, experts across
-      EP ranks, and heads across TP ranks.
-    - CUDA graph capture for decode (the latency-critical path).
-
-    Subclasses (``model_deepseek_v3.py``, ``model_hf_llama.py``, etc.)
-    implement the specific architecture by overriding:
-    - Layer construction (attention type, MLP type, norm positions).
-    - ``prefill`` and ``decode`` forward passes.
-    - ``load_state_dict_parallel`` and ``_get_layer_i_prefix_mapping`` for
-      checkpoint loading.
+    """
+    Base class for model architectures in Chitu.
     """
 
     def __init__(

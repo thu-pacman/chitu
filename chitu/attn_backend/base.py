@@ -38,18 +38,18 @@ class AttnBackend(abc.ABC):
     Chitu supports multiple attention implementations that are selected at
     runtime based on GPU architecture and model type:
 
-    - ``FlashAttnBackend`` — FlashAttention 2/3 for standard attention.
-    - ``FlashMLABackend`` — Multi-head Latent Attention (MLA) for DeepSeek-V3/V4.
-    - ``FlashInferBackend`` — FlashInfer's optimized paged-attention kernels.
-    - ``HopperMixedBackend`` — Mixed-precision attention for Hopper (SM90) GPUs.
-    - ``HybridAttnBackend`` — Selects the best backend per operation (prefill vs decode).
-    - ``TritonAttnBackend`` — Triton-based attention (portable across accelerators).
-    - ``NpuAttnBackend`` — Ascend NPU attention implementation.
-    - ``RefAttnBackend`` — Pure PyTorch reference implementation (CPU/Muxi).
+    - ``FlashAttnBackend`` — FlashAttention 2/3.
+    - ``FlashMLABackend`` — FlashMLA for MLA in DeepSeek-V3/V4 and similar models.
+    - ``FlashInferBackend`` — FlashInfer.
+    - ``HybridAttnBackend`` — Selects a better backend per operation.
+    - ``TritonAttnBackend`` — Triton-based implementation.
+    - ``NpuAttnBackend`` — Ascend NPU implementation.
+    - ``RefAttnBackend`` — Pure PyTorch reference implementation.
 
     Each backend implements two paths:
     - ``__call__`` — the actual attention computation (read KV from cache,
-      compute QK scores, apply softmax, compute weighted V sum, write KV to cache).
+      compute QK scores, apply softmax, compute weighted V sum, optionally write
+      KV to cache).
     - ``prepare_metadata_for_*`` — set up metadata (e.g. page tables) before
       prefill or decode steps.
     """

@@ -493,7 +493,6 @@ class PagedKVCache(KVCacheBase):
     Key design points:
     - ``block_table``: (num_hot_req, max_blocks_per_req) — maps each request's
       logical block offsets to physical block indices.
-    - ``block_size``: Must be a multiple of 256 for FlashAttention compatibility.
     - Prefix caching: when enabled, blocks with identical content are shared
       across requests (managed by the cache manager, not the cache itself).
     - ``allocatable_max_num_blocks``: With prefix caching, this is virtually

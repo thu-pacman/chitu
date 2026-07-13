@@ -268,7 +268,8 @@ class PipeDispatcher(TasksDispatcher):
     reside on the same node, or TCP when they are on different nodes.
 
     Only the first TP rank and first PCP rank within each PP stage participates
-    in metadata dispatch; tensor payloads use NCCL send/recv for efficiency.
+    in metadata dispatch; tensor payloads use torch.distributed send/recv for
+    efficiency.
     """
 
     def __init__(
@@ -462,13 +463,13 @@ class PipeDispatcher(TasksDispatcher):
 
 
 class TensorDispatcher(TasksDispatcher):
-    """TP and PCP task dispatcher using ZMQ ROUTER/DEALER + NCCL broadcast.
+    """TP and PCP task dispatcher using ZMQ ROUTER/DEALER + torch.distributed broadcast.
 
     Tensor parallelism splits the model's weight matrices across ranks, so
     every rank must receive the same task metadata and the same input tensors.
     This dispatcher uses a ROUTER/DEALER pattern: the main rank (TP0/PCP0)
     serializes task metadata to all sibling ranks via ZMQ, then broadcasts
-    the input tensor payload using NCCL broadcast.
+    the input tensor payload using torch.distributed broadcast.
     """
 
     def __init__(
@@ -1484,7 +1485,7 @@ class Executor:
 
         - CP mode: every rank has its own independent PP pair and sends directly.
         - TP mode: only the main (TP0) rank sends, since hidden states are
-          already synchronized across TP ranks via NCCL broadcast.
+          already synchronized across TP ranks via torch.distributed broadcast.
         - The last PP stage does not send (there is no next stage).
         """
         if not get_pp_group().is_last_rank:

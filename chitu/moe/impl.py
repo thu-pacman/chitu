@@ -137,21 +137,8 @@ def get_moe_impl() -> Optional["MoEImplBase"]:
 
 
 class MoEImplBase:
-    """Base class for Mixture-of-Experts dispatch implementations.
-
-    The MoE implementation coordinates expert dispatch and combine across
-    parallelism dimensions.  It is called by every transformer layer's
-    ``ParallelMoeBlock.forward()``:
-
-    1. **Gate** — compute routing weights and expert indices (in the model).
-    2. **Dispatch** — send each token's hidden state to the assigned expert.
-    3. **Expert compute** — run the expert FFN on received tokens.
-    4. **Combine** — return output tokens to their original positions.
-
-    Subclasses implement two strategies:
-    - ``MoEImplNoEP``: all experts are on every rank; dispatch is local.
-    - ``MoEImplEP``: experts are partitioned across EP ranks; dispatch uses
-      all-to-all collectives (via DeepEP, NCCL, or NPU all-to-all).
+    """
+    Base class for Mixture-of-Experts dispatching implementations.
     """
 
     def __init__(

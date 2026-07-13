@@ -922,6 +922,8 @@ def _warmup_via_taskpool(args):
     follow via the executor until termination is signaled.
     """
 
+    rank = torch.distributed.get_rank()
+
     # Turn ON MoE planner warmup mode on all ranks
     planner = get_moe_load_planner()
     if planner is not None:

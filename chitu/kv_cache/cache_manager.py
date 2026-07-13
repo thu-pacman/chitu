@@ -44,10 +44,6 @@ class PagedKVCacheManager(KVCacheManagerBase):
     - Free block pool (reclaimed when tasks finish or blocks are evicted).
     - Optional prefix-cache metadata: tracks block hashes and reference counts
       to enable block sharing across requests with shared prefixes.
-
-    The manager is per-DP-rank: rank 0's manager makes scheduling decisions,
-    and worker ranks replicate the metadata via ``prepare_metadata_before_*``
-    calls after ZMQ dispatch.
     """
 
     def __init__(
