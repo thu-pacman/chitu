@@ -92,12 +92,45 @@ logger = getLogger(__name__)
 
 
 class BackendState(Enum):
+    """Global state machine for the inference backend.
+
+    Running:
+        Normal operation — accepting and processing requests.
+    Terminating:
+        A termination signal has been received.  The serving loop drains
+        in-flight requests before moving the backend to Terminated.
+    Terminated:
+        All ranks have stopped.  The main loop exits.
+    """
+
     Running = 1
     Terminating = 2  # All tasks done, but rank 0 should tell others to terminate
     Terminated = 3
 
 
 class Backend:
+    """Static registry and lifecycle manager for the inference backend.
+
+    Backend is a **namespace class** (all attributes are class-level, never
+    instantiated).  It holds singleton references to every long-lived component
+    in the system:
+
+    - Model, tokenizer, and formatter (built once at startup).
+    - KV caches and per-DP-rank cache managers.
+    - Schedulers (one per DP rank) and the Executor.
+    - MoE weight accessor for dynamic expert load-balancing.
+
+    Some components are attached by later initialization steps outside
+    ``Backend.build()``.
+
+    The build order in ``Backend.build()`` is:
+    1. Init distributed environment (NCCL/GLOO, parallel groups).
+    2. Init tokenizer, processor, formatter.
+    3. Build KV caches and per-DP-rank cache managers.
+    4. Create and load the model.
+    5. Register MoE weight accessor (if the model supports it).
+    """
+
     # init once
     model = None
     tokenizer = None
@@ -156,7 +189,17 @@ class Backend:
     def register_moe_layer_experts(
         layer_id: int, experts_module: QuantizedMoeExpertsBase
     ) -> None:
-        """Register the experts module for a specific layer and auto-wire accessor."""
+        """Register a layer's MoE experts module for dynamic load-balancing.
+
+        Called by each transformer layer during model construction.  The first
+        call auto-creates an ``ExpertParamAccessor`` that can read and write
+        individual expert parameters by slot index, enabling the MoE load
+        planner to migrate experts between EP ranks via P2P transfer.
+
+        Args:
+            layer_id: The transformer layer index (0-based).
+            experts_module: The quantized experts module for that layer.
+        """
         Backend._moe_experts_by_layer[int(layer_id)] = experts_module
         # Build and register accessor lazily on first registration
         if Backend.moe_weight_accessor is None:
@@ -994,6 +1037,19 @@ class Backend:
 
     @staticmethod
     def _load_hf_checkpoint_layerwise(model, args):
+        """Load HuggingFace-format checkpoints one layer at a time.
+
+        Instead of loading the entire checkpoint into CPU RAM (which can exceed
+        hundreds of GB for MoE models), this method loads each transformer
+        layer's weights independently, moves them to GPU, and frees the CPU
+        buffer before loading the next layer.  Non-layer weights (embeddings,
+        final norm, lm_head) are loaded first; then layers are iterated in
+        global layer order, with PP-sliced ranks each loading only their
+        assigned layer range.
+
+        For models with multi-token prediction (MTP), a separate pass handles
+        the MTP-specific layers at the end.
+        """
 
         key_filter = Backend._build_hf_key_filter(args)
 
@@ -1231,6 +1287,17 @@ def load_state_dict(
     prefix: str = "",
     prefix_list: list[str] = None,
 ):
+    """Load model weights from safetensors files in a HuggingFace checkpoint directory.
+
+    Supports:
+    - Loading a subset of keys via ``prefix`` (single prefix match).
+    - Loading extra keys via ``prefix_list``.
+    - Filtering normally loaded keys with a caller-supplied ``key_filter`` callback.
+    - ``skip_preprocess`` mode: each rank loads only its own shard
+      (``model.rank{rank}.safetensors``).
+
+    Returns a dict mapping parameter names to CPU tensors.
+    """
     if not skip_preprocess:
         path = os.path.join(hf_ckpt_path, "*.safetensors")
     else:

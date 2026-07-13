@@ -129,11 +129,17 @@ class GlobalLocalMap:
 
 
 class KVCacheAccessor:
-    """
-    Base class for KV cache accessors
+    """Lightweight descriptor passed to attention kernels to locate cached KV states.
 
-    A KV cache accessor locates specific tokens of a specific layer in a KV cache. Data
-    can be read from the accessor, and updates to the accessor apply to the KV cache.
+    An accessor is a view into a specific layer's KV cache.  It carries the
+    tensors and metadata that the attention backend needs to read (and
+    optionally update) cached key/value data without coupling to the underlying
+    cache storage layout (paged vs. dense).
+
+    Subclasses add layout-specific fields: ``PagedKVCacheAccessor`` carries
+    block tables for page-to-physical-address translation, while
+    ``DenseKVCacheAccessor`` carries contiguous tensors indexed directly by
+    request and position.
     """
 
     pass
@@ -477,6 +483,20 @@ class KVCacheBase:
 
 
 class PagedKVCache(KVCacheBase):
+    """Paged KV cache with virtual-to-physical block mapping.
+
+    PagedKVCache divides the KV cache into fixed-size blocks (pages) and maps
+    each request's logical positions to physical blocks via a block table.
+
+    Key design points:
+    - ``block_table``: maps each request's logical block offsets to physical
+      block indices.
+    - Prefix-cache sharing, when enabled for a cache type, is managed by the
+      cache manager rather than the cache itself.
+    - ``allocatable_max_num_blocks`` records the effective upper bound used by
+      warmup-time reallocation.
+    """
+
     def __init__(
         self,
         layer_id_map: GlobalLocalMap,
@@ -1250,6 +1270,12 @@ class MMPagedKVCache(PagedKVCache):
 
 
 class DenseKVCache(KVCacheBase):
+    """Contiguous (non-paged) KV cache — one fixed-size buffer per request.
+
+    DenseKVCache is designed for dense (a.k.a. skew) KV cache. Additionally,
+    it is used for some auxiliary fixed-length KV caches in some models.
+    """
+
     def __init__(
         self,
         layer_id_map: GlobalLocalMap,

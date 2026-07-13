@@ -24,10 +24,27 @@ logger = getLogger(__name__)
 
 
 class KVCacheManagerBase:
+    """Base class for KV cache managers — the scheduler-side counterpart of KVCacheBase.
+
+    While ``KVCacheBase`` owns the GPU tensor storage, ``KVCacheManagerBase``
+    owns the allocation metadata: which blocks are assigned to which task,
+    which blocks are free, and (with prefix caching) which blocks are shared.
+    The scheduler uses the manager for admission control and to populate the
+    block metadata that the executor later consumes in ``prepare_cache_*``.
+    """
+
     pass
 
 
 class PagedKVCacheManager(KVCacheManagerBase):
+    """Block allocator for paged KV caches with optional prefix caching.
+
+    Maintains:
+    - ``task_to_cache_ids``: maps each task to its allocated physical block IDs.
+    - Free block pool (reclaimed when tasks finish or blocks are evicted).
+    - Optional prefix-cache metadata: tracks block hashes and reference counts
+      to enable block sharing across requests with shared prefixes.
+    """
 
     def __init__(
         self,

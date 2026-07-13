@@ -283,6 +283,10 @@ class TransformerBlock(nn.Module):
 
 
 class Transformer(nn.Module):
+    """
+    Base class for model architectures in Chitu.
+    """
+
     def __init__(
         self,
         params,
@@ -1691,6 +1695,27 @@ class Transformer(nn.Module):
         output_token_offsets: torch.Tensor,
         **args,
     ) -> torch.Tensor:
+        """Run the prefill forward pass.
+
+        Prefill caches KV states for prompt tokens and returns the selected
+        hidden states or logits for the last prompt token of each request
+        (specified by ``output_token_offsets``).
+
+        In PP mode, ``tokens`` is None on non-first stages (hidden states are
+        received from the preceding stage).  The first stage embeds tokens and
+        sends hidden states downstream; intermediate stages process hidden
+        states only; the last stage projects to logits.
+
+        Args:
+            tokens: Flat tensor of token IDs for the first PP stage; None
+                   for later stages (which receive hidden states).
+            hiddens: Hidden states from the previous PP stage (None for stage 0).
+            output_token_offsets: Per-request positions of the last prompt token
+                                  (used to select outputs for sampling).
+        Returns:
+            Logits for the last prompt token of each request (on the last PP
+            stage), or hidden states to forward to the next PP stage.
+        """
         if hiddens is not None and len(hiddens) == 0:
             return self.empty_prefill()
         if tokens is not None and len(tokens) == 0:

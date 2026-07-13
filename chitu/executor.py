@@ -1094,7 +1094,26 @@ class Executor:
     def step(
         self, tasks: Optional[PackedTasksBase]
     ) -> SerializedPackedTasksPayloadType:
-        # 1. propagate tasks and handle special payload type
+        """Execute one inference step — dispatch tasks, run the model, and collect results.
+
+        This is the heart of the executor.  A step proceeds through these phases:
+
+        1. **Metadata dispatch** — each dispatcher propagates task metadata to
+           its sibling ranks.  After dispatch, every rank that participates in
+           the step has a local copy of the task descriptors.
+
+        2. **Special payload handling** — ``TerminateBackend`` sets the backend
+           state to Terminated; ``EndTask`` cleans up finished tasks (KV cache
+           eviction, sampler state removal, TaskPool cleanup).
+
+        3. **Process queue** — runs a sequence of callbacks configured at init:
+           - Normal mode: model_run → process_last_batch_results → postprocess_sync
+           - Schedule-overlap mode: postprocess_sync → model_run → process_last_batch_results
+           The overlap mode pipelines CPU postprocessing of step N with GPU work
+           for step N+1.
+
+        Returns the serialized payload type (Empty, Normal, TerminateBackend, EndTask).
+        """
         payload_type = tasks.payload_type if tasks is not None else None
 
         for dispatcher in self.task_dispatchers:
@@ -1175,6 +1194,21 @@ class Executor:
             return torch.arange(tasks.num_tasks, dtype=torch.int32, device=self.device)
 
     def model_run(self, tasks: PackedTasksBase):
+        """Run the model forward pass for one step — prefill or decode.
+
+        This method:
+        1. Prepares the MoE implementation for the step (sets task type and
+           number of tokens so MoE layers can configure their dispatchers).
+        2. Prepares KV caches for the step via ``prepare_cache_prefill`` or
+           ``prepare_cache_decode``.
+        3. Builds the input payload (token IDs for first PP stage, hidden
+           states for later stages).
+        4. Calls ``Backend.model.prefill()`` or ``Backend.model.decode()``.
+        5. Sends the output to the next PP stage when applicable.
+        6. On the sample rank (TP0 + PCP0 + last PP stage), runs the sampler
+           to produce next-token predictions.
+        7. Notifies the KV transfer hook after prefill for PD disaggregation.
+        """
         if tasks.payload_type == SerializedPackedTasksPayloadType.Empty:
             if not self.is_pp_first_stage:
                 self._collect_task_and_pp_results(tasks)
@@ -1298,6 +1332,20 @@ class Executor:
         return hiddens
 
     def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
+        """Run a single prefill forward pass.
+
+        Prefill processes prompt tokens for scheduled requests, producing KV
+        cache entries and the selected hidden states or logits for output token
+        offsets requested by the scheduler.
+
+        Steps:
+        1. Prepare KV caches (allocate blocks, set sequence lengths).
+        2. Gather token IDs from task descriptors into a flat tensor.
+        3. Receive hidden states from the previous PP stage (if not stage 0).
+        4. Call ``Backend.model.prefill()``.
+        5. Send output hidden states to the next PP stage when applicable.
+        6. Collect prompt token metrics for Prometheus.
+        """
         is_empty_step = tasks.num_tasks == 0
         if not is_empty_step:
             for cache in Backend.cache_dict.values():
@@ -1353,6 +1401,21 @@ class Executor:
             return self.dummy_output
 
     def decode_step(self, tasks: PackedTasksBase, is_empty_step: bool = False):
+        """Run a single decode forward pass.
+
+        Decode consumes the current token for each in-flight request and produces
+        next-token predictions.  For multi-token prediction (MTP) models, the
+        model may draft multiple tokens per request in one decode step.
+
+        Steps:
+        1. Ensure KV cache is ready (for PD, this may wait for KV transfer from
+           the prefill side to complete).
+        2. Prepare KV caches — update block tables and sequence lengths.
+        3. Build the payload: token IDs (first PP stage) or hidden states
+           (later PP stages) received from the previous PP stage.
+        4. Call ``Backend.model.decode()``.
+        5. Send the output to the next PP stage.
+        """
         if tasks.num_tasks == 0:
             is_empty_step = True
         if not is_empty_step:
@@ -1488,7 +1551,23 @@ class Executor:
         return logits
 
     def decode_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
-        """DLLM decode: payload is the full block per task, forward + batch_decode + update state."""
+        """Run a DLLM (Diffusion LLM) decode step.
+
+        Unlike standard autoregressive decode, DLLM operates on token *blocks*
+        of fixed length.  Each decode step iteratively refines block payloads via
+        a masked-prediction loop until at least one block in the batch is fully
+        decoded (no mask tokens remain) or the maximum number of iterations is
+        reached.
+
+        Steps:
+        1. Prepare the block-length payload (mask tokens filled in for undecoded positions).
+        2. Prepare DLLM-aware KV caches (``prepare_cache_decode_dllm``).
+        3. Loop: forward → batch_decode → check block-finished condition.
+        4. Finalize caches and update task state for finished blocks.
+        5. Queue finished blocks in ``_pending_dllm_block`` for later delivery
+           via ``_process_dllm_block_results`` (which streams all tokens at once
+           rather than one by one).
+        """
         if tasks.num_tasks == 0:
             return self.dummy_output
         if self.tp_size <= 1 and not isinstance(tasks, PackedTasks):
