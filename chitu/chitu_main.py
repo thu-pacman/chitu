@@ -1524,6 +1524,8 @@ def chitu_run_main_rank():
     3. **Update TaskPool** — completed tasks are removed, running tasks are
        updated with new tokens and status changes.
     """
+
+    # 1. Schedule
     global _last_step_task_type
     for scheduler in Backend.schedulers:
         scheduler.prepare_for_schedule()
