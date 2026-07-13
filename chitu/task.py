@@ -95,13 +95,13 @@ class RequestParams:
 class UserRequest:
     """Incoming inference request with full lifecycle state.
 
-    A UserRequest encapsulates everything the server needs to process one
-    conversation turn: the prompt tokens, sampling parameters, tool-call
+    A UserRequest encapsulates the server-side state needed to process one
+    conversation turn: prompt tokens, sampling parameters, tool-call
     configuration, and streaming output buffer (``AsyncDataStream``).
 
     Lifecycle:
     1. Created from a client request via ``from_request_params`` (parse, tokenize,
-       apply chat template, build grammar for tool calls).
+       apply chat template, and store tool-call configuration when enabled).
     2. Wrapped in a ``Task`` for scheduling.
     3. Receives generated tokens via ``add_data()``, which pushes into the
        async stream for delivery to the client.
@@ -367,7 +367,8 @@ class Task:
 
     Lifecycle:
     - Created in ``TaskType.Prefill`` state.
-    - After prefill completes (``consume_req_tokens()``), transitions to ``TaskType.Decode``.
+    - After all prompt tokens have been consumed by ``consume_req_tokens()``,
+      transitions to ``TaskType.Decode``.
     - Stopped when request stop conditions are met or the scheduler evicts it.
     """
 

@@ -73,23 +73,33 @@ RESULT_TAG = 3
 
 
 class TasksDispatcher(ABC):
-    """Abstract communication interface for distributing tasks across parallel ranks.
-
-    Each parallelism strategy (TP, PP, DP, PCP) implements a dispatcher that
-    handles metadata dispatch (task IDs, sequence lengths, cache block assignments)
-    and tensor payload transfer (token IDs for the first PP stage, hidden states
-    for later stages).
+    """
+    Communication interface for a parallelism
 
     General workflow:
-    1. ``Executor.step()`` calls ``dispatch_metadata`` on each dispatcher.
-       Each dispatcher sends the task metadata to its sibling ranks.
-    2. For each model input tensor:
-       a. On the source rank (TP0/PCP0/PP stage 0), the Executor generates the
-          payload (token IDs for first PP stage, hidden states otherwise).
-       b. ``send_payload`` pushes the tensor to other ranks in the group.
-       c. On target ranks, ``recv_payload`` receives the tensor.
-    3. Every rank runs the model forward pass independently.
-    4. Results flow backward (PP last → PP first, DP workers → DP main rank).
+    1. `Executor` calls `dispatch_metadata` of this interface to let all corresponding
+        ranks know the task meta data.
+    2. for each model input:
+        1. on source rank, `Executor` generates model input, then calls `send_payload` of
+            this interface to send model input to other ranks.
+        2. on other ranks, `Executor` calls `recv_payload` of this interface to receive
+        model input from source rank.
+    3. `Executor` computes the model on every corresponding rank.
+
+    When combining multiple parallelism, generally we want a fused dispatcher dedicatedly
+    designed for this combined parallelism in order for higher performance. But if we don't
+    have such a fused dispatcher, we should chain multiple dispatchers. When chaining
+    dispatchers, we should take care of the order of dispatchers, and the dispatcher will
+    have an additional filter.
+
+    Example of calling `dispatch_metadata` on combined PP dispatcher with TP dispatcher:
+    1. `Executor` calls PP dispatcher, only on TP main ranks.
+    2. `Executor` calls TP disptchers, on all ranks.
+
+    In this example, during initialization, `Executor` should initialize the TP dispatcher
+    first, and initialize the PP dispatcher next only on filtered ranks. During execution,
+    `Executor` should call `dispatch_metadata` on the PP dispatcher first, and then call
+    `dispatch_metadata` on the TP dispatcher.
     """
 
     def __init__(
@@ -258,18 +268,10 @@ class TasksDispatcher(ABC):
 
 
 class PipeDispatcher(TasksDispatcher):
-    """Pipeline Parallelism (PP) dispatcher using point-to-point links.
+    """PP (Pipeline Parallelism) Dispatcher
 
-    Each PP stage sends hidden states to the next stage.  Metadata and tensor
-    payloads use different communication channels: metadata is serialized via
-    msgpack and forwarded through ZMQ PUSH/PULL sockets, while tensor payloads
-    are transferred with ``torch.distributed`` point-to-point operations.  The
-    ZMQ protocol automatically selects IPC (shared memory) when adjacent stages
-    reside on the same node, or TCP when they are on different nodes.
-
-    Only the first TP rank and first PCP rank within each PP stage participates
-    in metadata dispatch; tensor payloads use torch.distributed send/recv for
-    efficiency.
+    使用 ZMQ PUSH/PULL 模式（点对点，单向流水线传输）
+    协议选择：自动根据相邻 stages 是否同节点选择 ipc:// 或 tcp://
     """
 
     def __init__(
@@ -463,14 +465,7 @@ class PipeDispatcher(TasksDispatcher):
 
 
 class TensorDispatcher(TasksDispatcher):
-    """TP and PCP task dispatcher using ZMQ ROUTER/DEALER + torch.distributed broadcast.
-
-    Tensor parallelism splits the model's weight matrices across ranks, so
-    every rank must receive the same task metadata and the same input tensors.
-    This dispatcher uses a ROUTER/DEALER pattern: the main rank (TP0/PCP0)
-    serializes task metadata to all sibling ranks via ZMQ, then broadcasts
-    the input tensor payload using torch.distributed broadcast.
-    """
+    """TP (Tensor Parallelism) Dispatcher — also used for CP task dispatch."""
 
     def __init__(
         self,
@@ -561,13 +556,7 @@ class TensorDispatcher(TasksDispatcher):
 
 
 class ExpertDataDispatcher(TasksDispatcher):
-    """DP (Data Parallelism) dispatcher for distributing requests across DP ranks.
-
-    In data-parallel serving, each DP rank runs the full model independently
-    on a subset of the batch.  This dispatcher sends per-rank task metadata
-    from DP rank 0 to workers, and collects per-rank results (sampled tokens,
-    logprobs, PD first-token hints) back on rank 0 for merging.
-    """
+    """DP (Data Parallelism) Dispatcher"""
 
     def __init__(
         self,
@@ -978,14 +967,7 @@ class Executor:
         return self._kv_hook
 
     def _lb_trigger(self) -> None:
-        """Trigger MoE expert load-balancing at the configured interval.
-
-        Every ``moe_lb_trigger`` decode steps, the planner aggregates per-expert
-        load statistics from the current batch and generates an ordered list of
-        expert-migration actions.  The actual migration (P2P weight transfers)
-        is deferred to ``_lb_sync``, which commits only the layers whose
-        transfers have completed.
-        """
+        # 如果sysnc没有成功，不要开启下一步的trigger
         if not self._lb_enabled:
             return
         try:
@@ -1000,12 +982,6 @@ class Executor:
             pass
 
     def _lb_sync(self) -> None:
-        """Commit ready MoE expert-migration layers after load-balancing trigger.
-
-        Expert migration uses async P2P transfers; this method commits only the
-        layers whose transfers have finished.  Layers still in-flight are left
-        for the next sync.
-        """
         if not self._lb_enabled:
             return
         try:
@@ -1359,9 +1335,9 @@ class Executor:
     def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         """Run a single prefill forward pass.
 
-        Prefill processes prompt tokens of newly scheduled requests in parallel,
-        producing KV cache entries and the hidden state or logits selected from
-        each request's last prompt token.
+        Prefill processes prompt tokens for scheduled requests, producing KV
+        cache entries and the selected hidden states or logits for output token
+        offsets requested by the scheduler.
 
         Steps:
         1. Prepare KV caches (allocate blocks, set sequence lengths).
@@ -1428,9 +1404,9 @@ class Executor:
     def decode_step(self, tasks: PackedTasksBase, is_empty_step: bool = False):
         """Run a single decode forward pass.
 
-        Decode processes one token per in-flight request, generating the next
-        token prediction.  For multi-token prediction (MTP) models, this
-        processes ``mtp_size`` tokens per request per step.
+        Decode consumes the current token for each in-flight request and produces
+        next-token predictions.  For multi-token prediction (MTP) models, the
+        model may draft multiple tokens per request in one decode step.
 
         Steps:
         1. Ensure KV cache is ready (for PD, this may wait for KV transfer from
@@ -1481,12 +1457,10 @@ class Executor:
             return self.dummy_mtp_output if self.mtp_size > 1 else self.dummy_output
 
     def _send_pp_payload(self, tensor, tasks):
-        """Send the model output to the next PP stage.
+        """Send payload to next PP stage if this rank should send.
 
-        - CP mode: every rank has its own independent PP pair and sends directly.
-        - TP mode: only the main (TP0) rank sends, since hidden states are
-          already synchronized across TP ranks via torch.distributed broadcast.
-        - The last PP stage does not send (there is no next stage).
+        CP mode: every rank has its own PP pair and sends independently.
+        TP mode: only the main rank sends (hiddens already synced via TP broadcast).
         """
         if not get_pp_group().is_last_rank:
             if self.cp_context.should_send_directly() or self.is_main_rank:
@@ -1581,15 +1555,16 @@ class Executor:
         """Run a DLLM (Diffusion LLM) decode step.
 
         Unlike standard autoregressive decode, DLLM operates on token *blocks*
-        of fixed length.  Each decode step iteratively refines a full block of
-        tokens via a masked-prediction loop until the block is fully decoded
-        (no mask tokens remain) or the maximum number of iterations is reached.
+        of fixed length.  Each decode step iteratively refines block payloads via
+        a masked-prediction loop until at least one block in the batch is fully
+        decoded (no mask tokens remain) or the maximum number of iterations is
+        reached.
 
         Steps:
         1. Prepare the block-length payload (mask tokens filled in for undecoded positions).
         2. Prepare DLLM-aware KV caches (``prepare_cache_decode_dllm``).
         3. Loop: forward → batch_decode → check block-finished condition.
-        4. Finalize caches and update task state with decoded block tokens.
+        4. Finalize caches and update task state for finished blocks.
         5. Queue finished blocks in ``_pending_dllm_block`` for later delivery
            via ``_process_dllm_block_results`` (which streams all tokens at once
            rather than one by one).
@@ -1844,22 +1819,12 @@ class Executor:
         TaskCollector.add_update_task_ids(tasks.output_task_ids)
 
     def postprocess_sync_part(self, current_tasks: PackedTasksBase):
-        """Synchronize sampled results to CPU and collect across DP workers.
+        """
+        schedule -> model -> sample -> ***sync*** -> send
 
-        This is the "sync" phase of the step pipeline:
+        Synchronize generated result to cpu.
 
-        ```
-        schedule → model → sample → ***sync*** → send (async, overlaps next step)
-        ```
-
-        Steps:
-        1. Collect results from PP (pipe results flow backward through the pipeline).
-        2. Move generated tokens to CPU (triggers CUDA synchronization).
-        3. Update token statistics (generated count, MTP accept rate).
-        4. Collect per-DP-rank results to DP rank 0 and merge.
-        5. Update response streams with new tokens.
-        6. When schedule-overlap is enabled, predict which tasks will stop after
-           this step so the scheduler can pre-warm their replacements.
+        After synchronizing, collect result across dp workers to dp main rank and update tasks.
         """
         tasks = self._collect_task_and_pp_results(current_tasks)
         if self.model_type == ModelType.LLADA2:

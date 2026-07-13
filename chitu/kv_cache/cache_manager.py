@@ -29,8 +29,8 @@ class KVCacheManagerBase:
     While ``KVCacheBase`` owns the GPU tensor storage, ``KVCacheManagerBase``
     owns the allocation metadata: which blocks are assigned to which task,
     which blocks are free, and (with prefix caching) which blocks are shared.
-    The manager is consulted by the scheduler for admission control and by the
-    executor's ``prepare_cache_*`` methods to allocate/reclaim blocks.
+    The scheduler uses the manager for admission control and to populate the
+    block metadata that the executor later consumes in ``prepare_cache_*``.
     """
 
     pass
