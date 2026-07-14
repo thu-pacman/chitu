@@ -5,6 +5,7 @@
 import os
 import concurrent.futures
 from logging import getLogger
+import gc
 
 import torch
 
@@ -15,6 +16,10 @@ from .endpoint import PrefillEndpoints, DecodeEndpoints
 from .protocol import DecodeAllocated, RankTransferDone, PrefillDone, ProtocolSerializer
 from .transfer_buffers import TransferBuffers
 from .transfer_plan import create_transfer_plan, TransferPlan
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .cache_info import CacheDistributions
 
 logger = getLogger(__name__)
 
@@ -124,31 +129,21 @@ class KVManagerPrefill(KVManagerBase):
         for i, req_id in enumerate(request_ids):
             info = self._info(req_id)
             info.num_hit_tokens = num_hit_tokens[i]
-
-            # Gather send buffers from all caches.
             inst_id = self._decode_inst_ids[info.decode_sid]
             remote_dists = self.remote_cache_dists[inst_id]
-            local_dists = self._local_cache_dists
-            send_buffers = TransferBuffers()
-            for cache_name, cache in Backend.cache_dict.items():
-                assert isinstance(cache, PagedKVCache)
-                cache.get_kv_transfer_buffers(
-                    send_buffers,
-                    req_id,
-                    cache.block_table.get(req_id, []),
-                    local_dists=local_dists,
-                    remote_dists=remote_dists,
-                )
-
-            plan = create_transfer_plan(send_buffers, info.recv_buffers)
-            logger.debug(f"transfer_worker.submit {req_id=}")
             first_token = first_tokens[i] if first_tokens is not None else None
+            cache_blocks = [
+                (cache, cache.block_table.get(req_id, []))
+                for cache in Backend.cache_dict.values()
+            ]
             self.executor.submit(
                 self.transfer_worker,
                 kv_ready_event,
                 req_id,
                 first_token,
-                plan,
+                cache_blocks,
+                info.recv_buffers,
+                remote_dists,
             )
 
     def transfer_worker(
@@ -156,14 +151,39 @@ class KVManagerPrefill(KVManagerBase):
         event: torch.cuda.Event,
         req_id: str,
         first_token: torch.Tensor | None,
-        plan: TransferPlan,
+        cache_blocks: list,
+        recv_buffers: dict[str, TransferBuffers],
+        remote_dists: "CacheDistributions",
     ):
-        """Wait for GPU kernels to finish, then execute RDMA transfer."""
-        event.synchronize()
-        first_token = int(first_token.item()) if first_token is not None else 0
+        """Build send buffers + transfer plan and fire the RDMA writes."""
         logger.debug(f"transfer_worker.start {req_id=}")
         try:
+            local_dists = self._local_cache_dists
+            send_buffers = TransferBuffers()
+
+            # get_kv_transfer_buffers以及create_transfer_plan中创建了
+            # 大量的临时对象，会触发gc.collect()造成性能波动，但这些临时对象
+            # 不会循环引用，可通过引用计数机制自动释放，无需gc.collect().
+            gc_was_enabled = gc.isenabled()
+            gc.disable()
+            for cache, block_indices in cache_blocks:
+                assert isinstance(cache, PagedKVCache)
+                cache.get_kv_transfer_buffers(
+                    send_buffers,
+                    req_id,
+                    block_indices,
+                    local_dists=local_dists,
+                    remote_dists=remote_dists,
+                )
+
+            plan = create_transfer_plan(send_buffers, recv_buffers)
+
+            event.synchronize()
+
             plan.execute_send(self.transfer_engine.engine)
+            first_token = int(first_token.item()) if first_token is not None else 0
+            if gc_was_enabled:
+                gc.enable()
 
             msg = RankTransferDone(
                 req_id=req_id,

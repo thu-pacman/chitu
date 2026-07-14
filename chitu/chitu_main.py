@@ -1291,6 +1291,20 @@ def warmup_engine(args):
 
     _emit_observed_op_impl_summary_after_warmup()
 
+    # warmup后的存活的变量为常驻变量，使用gc.freeze()冻结这些变量
+    # 防止后续gc.collect()时遍历这些常驻变量，降低gc.collect()耗
+    # 时，减少性能抖动
+    import gc
+
+    gc.collect()
+    gc.freeze()
+    frozen = gc.get_freeze_count() if hasattr(gc, "get_freeze_count") else -1
+    logger.info(
+        f"[rank {torch.distributed.get_rank()}] gc.freeze() after warmup: "
+        f"{frozen if frozen >= 0 else '(count unavailable)'} objects moved to the "
+        "permanent generation; subsequent collections skip them",
+    )
+
 
 def chitu_init(args):
     """

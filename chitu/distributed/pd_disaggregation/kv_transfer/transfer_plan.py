@@ -4,9 +4,7 @@
 
 import dataclasses
 import logging
-from typing import NamedTuple
-
-from .transfer_buffers import TransferBuffer, TransferBuffers
+from .transfer_buffers import TransferBuffer, TransferBufferKey, TransferBuffers
 
 logger = logging.getLogger(__name__)
 
@@ -67,108 +65,58 @@ class TransferPlan:
 
 
 # ---------------------------------------------------------------------------
-# TransferPair / TransferMatcher
+# Key matching
 # ---------------------------------------------------------------------------
-
-
-class TransferPair(NamedTuple):
-    """A matched send→recv buffer pair for one RDMA operation."""
-
-    send: TransferBuffer
-    recv: TransferBuffer
-
-
-@dataclasses.dataclass
-class TransferMatcher:
-    """Per-prefix matching state."""
-
-    send_replica_id: int
-    send_replica_size: int
-    send_buffer: TransferBuffer
-    recv_pairs: list[tuple[int, int, list[TransferBuffer], str]] = dataclasses.field(
-        default_factory=list
-    )
-
-    def merge_recv(
-        self, rep_id: int, rep_sz: int, entries: list[TransferBuffer], session_id: str
-    ) -> None:
-        self.recv_pairs.append((rep_id, rep_sz, entries, session_id))
-
-    def apply(self, session_matches: dict[str, list[TransferPair]]) -> None:
-        """Filter by replica ratio and populate *session_matches*.
-
-        Maps recv replicas onto send replicas via::
-
-            send_id == (recv_id * send_replica_size) // recv_replica_size
-
-        This single formula handles all cases — divisible or not — and
-        distributes recv replicas as evenly as possible across send replicas
-        with no gaps or duplicates.
-        """
-        for r_rep_id, r_rep_sz, r_entries, session_id in self.recv_pairs:
-            if self.send_replica_id != (r_rep_id * self.send_replica_size) // r_rep_sz:
-                continue
-
-            for r in r_entries:
-                assert (
-                    r.length == self.send_buffer.length
-                ), f"chunk length mismatch: send={self.send_buffer.length} recv={r.length}"
-                session_matches.setdefault(session_id, []).append(
-                    TransferPair(self.send_buffer, r)
-                )
+#
+# Keys are :class:`TransferBufferKey` NamedTuples.  A send and recv buffer
+# match on their ``match_prefix`` (all fields except replica_id/replica_size);
+# the replica ids are then reconciled by the formula:
+#    ``send_id == (recv_id * send_replica_size) // recv_replica_size``.
 
 
 # ---------------------------------------------------------------------------
-# Key parsing
-# ---------------------------------------------------------------------------
-
-# Key format:
-#   {req_id}[{cache_name}]_L{layer_id}_B{block_id}_S{split_id}+{split_num}_R{replica_id}/{replica_size}
-_REPLICA_SEP = "_R"
-
-
-def _parse_replica(key_str: str) -> tuple[str, int, int]:
-    """Split key into *match_prefix* (everything before ``_R``) and replica info."""
-    idx = key_str.rfind(_REPLICA_SEP)
-    assert idx != -1, f"missing replica suffix in key: {key_str!r}"
-    prefix = key_str[:idx]
-    rep_id, rep_sz = key_str[idx + len(_REPLICA_SEP) :].split("/")
-    return prefix, int(rep_id), int(rep_sz)
-
-
-# ---------------------------------------------------------------------------
-# Address merge
+# Sort + contiguous address merge
 # ---------------------------------------------------------------------------
 
 
-def _contiguous_address_merge(
-    pairs: list[TransferPair],
-) -> list[TransferPair]:
-    """Merge adjacent entries where both src and dst are contiguous.
+def _sort_and_merge(
+    send_ptrs: list[int],
+    recv_ptrs: list[int],
+    lengths: list[int],
+) -> tuple[list[int], list[int], list[int]]:
+    """Sort matched pairs by recv ptr and merge contiguous addresses.
 
-    Pairs must be sorted by ``recv.ptr``.  Merges when::
-
-        pairs[i].send.ptr + pairs[i].send.length == pairs[i+1].send.ptr  AND
-        pairs[i].recv.ptr + pairs[i].recv.length == pairs[i+1].recv.ptr
+    Given parallel lists describing matched (send, recv, length) triples,
+    returns ``(ptrs, lengths, remote_ptrs)`` for one session after:
+      1. sorting by ``recv_ptr``, and
+      2. merging addresses where both source and destination are contiguous::
+             send[i] + len[i] == send[i+1]  AND  recv[i] + len[i] == recv[i+1]
     """
-    if not pairs:
-        return pairs
+    n = len(send_ptrs)
+    if n <= 1:
+        return send_ptrs, recv_ptrs, lengths
 
-    merged: list[TransferPair] = [pairs[0]]
-    for p in pairs[1:]:
-        prev = merged[-1]
+    order = sorted(range(n), key=recv_ptrs.__getitem__)
+
+    out_send: list[int] = []
+    out_len: list[int] = []
+    out_recv: list[int] = []
+    for i in order:
+        s = send_ptrs[i]
+        r = recv_ptrs[i]
+        length = lengths[i]
         if (
-            prev.send.ptr + prev.send.length == p.send.ptr
-            and prev.recv.ptr + prev.recv.length == p.recv.ptr
+            out_send
+            and out_send[-1] + out_len[-1] == s
+            and out_recv[-1] + out_len[-1] == r
         ):
-            merged[-1] = TransferPair(
-                TransferBuffer(prev.send.ptr, prev.send.length + p.send.length),
-                TransferBuffer(prev.recv.ptr, prev.recv.length + p.recv.length),
-            )
+            out_len[-1] += length
         else:
-            merged.append(p)
+            out_send.append(s)
+            out_recv.append(r)
+            out_len.append(length)
 
-    return merged
+    return out_send, out_recv, out_len
 
 
 # ---------------------------------------------------------------------------
@@ -184,67 +132,74 @@ def create_transfer_plan(
 
     Send belongs to the prefill Mooncake session, recv entries are grouped
     by decode session_id.
-
-    Matching:
-      1. Strip ``_R{replica_id}/{replica_size}`` from keys to form a
-         *match prefix* (req[cache]_L{layer}_B{block}_S{split_id}+{split_num}).
-      2. Build a ``TransferMatcher`` per prefix, holding one send entry and
-         recv entries grouped by session.
-      3. For each matcher, apply replica filtering
-         (``send_replica_id == recv_replica_id * replica_ratio``) and
-         populate ``TransferPair`` entries.
-      4. Sort by remote_ptr, apply contiguous address merge, and build a
-         ``TransferPlan``.
     """
-    logger.debug(
-        "[PD_PLAN] send_keys=%d recv_sessions=%s",
-        len(send_buffers.buffers),
-        {sid: len(rb.buffers) for sid, rb in recv_by_session.items()},
-    )
-
-    # ---- build matchers from send / recv keys ----
-    matchers: dict[str, TransferMatcher] = {}
-    for key_str, entries in send_buffers.buffers.items():
-        prefix, rep_id, rep_sz = _parse_replica(key_str)
-        assert (
-            len(entries) == 1
-        ), f"prefix {prefix}: expected 1 send entry, got {len(entries)}"
-        assert prefix not in matchers, f"duplicate send prefix: {prefix}"
-        matchers[prefix] = TransferMatcher(
-            send_replica_id=rep_id,
-            send_replica_size=rep_sz,
-            send_buffer=entries[0],
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "[PD_PLAN] send_keys=%d recv_sessions=%s",
+            len(send_buffers.buffers),
+            {sid: len(rb.buffers) for sid, rb in recv_by_session.items()},
         )
 
+    # ---- build matchers from send / recv keys ----
+    # match_prefix -> (send_ptr, send_len, send_replica_id, send_replica_size)
+    send_index: dict[tuple, tuple[int, int, int, int]] = {}
+    for send_key, send_entries in send_buffers.buffers.items():
+        prefix = send_key.match_prefix
+        assert (
+            len(send_entries) == 1
+        ), f"prefix {prefix}: expected 1 send entry, got {len(send_entries)}"
+        assert prefix not in send_index, f"duplicate send prefix: {prefix}"
+        send_buffer = send_entries[0]
+        send_index[prefix] = (
+            send_buffer.ptr,
+            send_buffer.length,
+            send_key.replica_id,
+            send_key.replica_size,
+        )
+
+    # ---- join recv entries against send, per session ----
+    # session_id -> (send_ptrs, recv_ptrs, lengths)
+    matched: dict[str, tuple[list[int], list[int], list[int]]] = {}
     for session_id, recv_bufs in recv_by_session.items():
         if not recv_bufs:
             continue
-        for key_str, entries in recv_bufs.buffers.items():
-            prefix, rep_id, rep_sz = _parse_replica(key_str)
-            m = matchers.get(prefix)
-            if m is None:
+        for recv_key, entries in recv_bufs.buffers.items():
+            send_entry = send_index.get(recv_key.match_prefix)
+            if send_entry is None:
                 continue
-            m.merge_recv(rep_id, rep_sz, entries, session_id)
+            send_ptr, send_len, send_rep_id, send_rep_sz = send_entry
 
-    # ---- apply matchers → session_matches ----
-    session_matches: dict[str, list[TransferPair]] = {}
-    for prefix, m in matchers.items():
-        if not m.recv_pairs:
-            continue
-        m.apply(session_matches)
+            # Reconcile replica placement: this send replica owns the recv
+            # replica if it is the one the ratio formula maps it to.
+            if (
+                send_rep_id
+                != (recv_key.replica_id * send_rep_sz) // recv_key.replica_size
+            ):
+                continue
 
-    # ---- build plan ----
+            triple = matched.get(session_id)
+            if triple is None:
+                triple = ([], [], [])
+                matched[session_id] = triple
+            send_ptrs, recv_ptrs, lengths = triple
+            for recv_buffer in entries:
+                assert (
+                    recv_buffer.length == send_len
+                ), f"chunk length mismatch: send={send_len} recv={recv_buffer.length}"
+                send_ptrs.append(send_ptr)
+                recv_ptrs.append(recv_buffer.ptr)
+                lengths.append(recv_buffer.length)
+
+    # ---- sort + contiguous merge → plan ----
     plan_dict: dict[str, TransferPlanPerRank] = {}
-    for session_id, pairs in session_matches.items():
-        if not pairs:
+    for session_id, (send_ptrs, recv_ptrs, lengths) in matched.items():
+        if not send_ptrs:
             continue
-        pairs.sort(key=lambda p: p.recv.ptr)
-        pairs = _contiguous_address_merge(pairs)
-
+        ptrs, remote_ptrs, lens = _sort_and_merge(send_ptrs, recv_ptrs, lengths)
         plan_dict[session_id] = TransferPlanPerRank(
-            ptrs=[p.send.ptr for p in pairs],
-            lengths=[p.send.length for p in pairs],
-            remote_ptrs=[p.recv.ptr for p in pairs],
+            ptrs=ptrs,
+            lengths=lens,
+            remote_ptrs=remote_ptrs,
         )
 
     return TransferPlan(plans=plan_dict)

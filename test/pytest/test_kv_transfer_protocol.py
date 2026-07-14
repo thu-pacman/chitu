@@ -17,6 +17,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.protocol import (
     ProtocolSerializer,
 )
 from chitu.distributed.pd_disaggregation.kv_transfer.transfer_buffers import (
+    TransferBufferKey,
     TransferBuffers,
 )
 
@@ -41,7 +42,16 @@ def _add(bufs, data, **kw):
     kd = dict(_KW)
     kd.update(kw)
     bufs.add(data.data_ptr(), data.numel() * data.element_size(), **kd)
-    return f"{kd['req_id']}[{kd['cache_name']}]_L{kd['layer_id']}_B{kd['block_id']}_S{kd['split_id']}+{kd['split_len']}_R{kd['replica_id']}/{kd['replica_size']}"
+    return TransferBufferKey(
+        req_id=kd["req_id"],
+        cache_name=kd["cache_name"],
+        layer_id=kd["layer_id"],
+        block_id=kd["block_id"],
+        split_id=kd["split_id"],
+        split_len=kd["split_len"],
+        replica_id=kd["replica_id"],
+        replica_size=kd["replica_size"],
+    )
 
 
 class TestDecodeAllocated:

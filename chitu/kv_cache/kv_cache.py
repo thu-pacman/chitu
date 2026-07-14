@@ -22,6 +22,9 @@ if TYPE_CHECKING:
     from chitu.distributed.pd_disaggregation.kv_transfer.cache_info import (
         CacheDistributions,
     )
+    from chitu.distributed.pd_disaggregation.kv_transfer.transfer_buffers import (
+        TransferBuffers,
+    )
 
 
 logger = getLogger(__name__)
@@ -840,7 +843,7 @@ class PagedKVCache(KVCacheBase):
 
     def get_kv_transfer_buffers(
         self,
-        buffers,
+        buffers: "TransferBuffers",
         req_id: str,
         block_indices: list[int],
         *,
@@ -851,22 +854,39 @@ class PagedKVCache(KVCacheBase):
         if not block_indices:
             return
 
+        global_layers = [
+            self.layer_id_map.to_global(local_layer)
+            for local_layer in range(self.num_layers)
+        ]
+
         for key, cache in self.paged_kv_cache.items():
+            assert (
+                cache.is_contiguous()
+            ), f"kv cache {key} must be contiguous for transfer"
             ld = local_dists.dists[key]
             rd = remote_dists.dists[key]
             n_chunks, split_len = ld.calc_chunking(rd)
 
+            elem_size = cache.element_size()
+            layer_stride_bytes = cache.stride(0) * elem_size
+            block_stride_bytes = cache.stride(1) * elem_size
+            assert (
+                block_stride_bytes % n_chunks == 0
+            ), f"block bytes {block_stride_bytes} not divisible by n_chunks {n_chunks}"
+            chunk_bytes = block_stride_bytes // n_chunks
+            base_ptr = cache.data_ptr()
+
             for i, block_id in enumerate(block_indices):
-                for local_layer in range(self.num_layers):
-                    global_layer = self.layer_id_map.to_global(local_layer)
-                    block = cache[local_layer, block_id]
-                    if not block.is_contiguous():
-                        block = block.contiguous()
-                    chunks = block.view(-1).chunk(n_chunks)
-                    for j, chunk in enumerate(chunks):
+                for local_layer, global_layer in enumerate(global_layers):
+                    layer_block_base_ptr = (
+                        base_ptr
+                        + local_layer * layer_stride_bytes
+                        + block_id * block_stride_bytes
+                    )
+                    for j in range(n_chunks):
                         buffers.add(
-                            chunk.data_ptr(),
-                            chunk.numel() * chunk.element_size(),
+                            layer_block_base_ptr + chunk_bytes * j,
+                            chunk_bytes,
                             cache_name=key,
                             req_id=req_id,
                             layer_id=global_layer,
