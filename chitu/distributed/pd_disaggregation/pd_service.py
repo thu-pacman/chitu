@@ -48,7 +48,6 @@ from chitu.global_vars import (
 )
 from chitu.distributed.coordinator import get_endpoint, set_endpoint
 from chitu.hooks import (
-    DPTokenSink,
     MooncakeKVTransferHook,
     PDTaskEvictHook,
 )
@@ -218,8 +217,6 @@ class PDSchedulerService:
             # Inject hooks into executor
             kv_hook = MooncakeKVTransferHook(self.scheduler.kv_manager, "decode")
             Backend.executor.set_kv_hook(kv_hook)
-            # Decode side streams via DP Token Manager wrapper, avoid duplication
-            Backend.executor.set_token_sink(DPTokenSink())
         else:
             logger.info("prefill-only mode: skip initializing token manager")
             # Inject prefill-side KV hook on all ranks
@@ -519,7 +516,6 @@ async def start_pd_worker_service(args, rank: int = 0):
     kv_hook = MooncakeKVTransferHook(kv_manager, mode)
     Backend.executor.set_kv_hook(kv_hook)
     if mode == "decode":
-        Backend.executor.set_token_sink(DPTokenSink())
         # ------------------------------------------------------------
         # Decode-side prepare listener (worker ranks)
         # ------------------------------------------------------------

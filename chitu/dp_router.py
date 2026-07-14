@@ -2,12 +2,15 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from chitu.dp_request_router import RequestRouter
     from chitu.dp_token_router import TokenRouter
 
+
+logger = logging.getLogger(__name__)
 
 # Global Request Router and Token Router instance
 _request_router: Optional["RequestRouter"] = None
@@ -40,3 +43,20 @@ def set_global_token_router(router: "TokenRouter"):
     """Set global Request Router instance"""
     global _token_router
     _token_router = router
+
+
+def remove_request_everywhere(request_id: str):
+    if _request_router is not None:
+        if not hasattr(_request_router, "remove_request"):
+            logger.warning_once(
+                f"Request Router class {type(_request_router).__name__} requires remove_request method"
+            )
+        else:
+            _request_router.remove_request(request_id)
+    if _token_router is not None:
+        if not hasattr(_token_router, "remove_request"):
+            logger.warning_once(
+                f"Token Router class {type(_token_router).__name__} requires remove_request method"
+            )
+        else:
+            _token_router.remove_request(request_id)

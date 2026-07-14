@@ -9,8 +9,15 @@ from chitu.kv_cache.kv_cache import PagedKVCache
 
 from .base import KVManagerBase, DisaggregationMode
 from .endpoint import PrefillEndpoints, DecodeEndpoints
-from .protocol import DecodeAllocated, PrefillDone, DecodePrepare, ProtocolSerializer
+from .protocol import (
+    DecodeAllocated,
+    PrefillDone,
+    DecodePrepare,
+    ProtocolSerializer,
+    RemoveRequest,
+)
 from .transfer_buffers import TransferBuffers
+from chitu.distributed.pd_disaggregation.kv_transfer.task_info import TransferStatus
 
 logger = getLogger(__name__)
 
@@ -22,6 +29,9 @@ class KVManagerDecode(KVManagerBase):
 
         self.is_ctrl_rank = self.rank == 0
         self._decode_scheduler_id = self._decode_inst_ids.index(self.instance_id)
+
+        # Main rank should hold the transfer done state for all requests
+        self._transfer_done_states: dict[str, TransferStatus] = {}
 
         self.endpoints = DecodeEndpoints(self._decode_scheduler_id)
         self._prefill_endpoints = {
@@ -48,15 +58,24 @@ class KVManagerDecode(KVManagerBase):
     ) -> None:
         """Handle DecodePrepare — reserve blocks and send DecodeAllocated for the owning dp_rank."""
         msg = ProtocolSerializer.unpack(raw)
+        if isinstance(msg, RemoveRequest):
+            self.remove_request(msg.req_id)
+            return
         assert isinstance(msg, DecodePrepare)
 
         # Non-rank0, non-owning ranks skip entirely.
-        if self.rank != 0 and msg.dp_rank != self.dp_rank:
+        if self.is_ctrl_rank:
+            assert (
+                self._transfer_done_states.get(msg.req_id) is None
+            ), f"Can not prepare decode for an existing request {msg.req_id}"
+            self._transfer_done_states[msg.req_id] = TransferStatus()
+
+        if msg.dp_rank != self.dp_rank:
             return
 
         logger.debug(f"handle_decode_prepare {msg.req_id} dp_rank={msg.dp_rank}")
 
-        info = self._info(msg.req_id)
+        info = self._info(msg.req_id, create=True)
         info.prefill_sid = msg.prefill_sid
         info.prefix_len = msg.prefix_len
         info.cache_manager_new_block_ids = msg.new_cache_ids
@@ -64,8 +83,7 @@ class KVManagerDecode(KVManagerBase):
 
         if not info.is_decode_prepare_received:
             info.is_decode_prepare_received = True
-            if msg.dp_rank == self.dp_rank:
-                self.prepare_kv_transfer(msg.req_id)
+            self.prepare_kv_transfer(msg.req_id)
 
         self._trace("handle_decode_prepare", req_id=msg.req_id)
 
@@ -133,12 +151,18 @@ class KVManagerDecode(KVManagerBase):
         msg = ProtocolSerializer.unpack(raw)
         assert isinstance(msg, PrefillDone)
 
-        info = self._info(msg.req_id, create=False)
-        if info is None:
-            return
+        if self.is_ctrl_rank:
+            if self._transfer_done_states.get(msg.req_id) is None:
+                return
+            self._transfer_done_states[msg.req_id] = TransferStatus(
+                done=True,
+                first_token=msg.first_token,
+                num_hit_tokens=msg.num_hit_tokens,
+            )
 
         # Non-rank0, non-owning ranks skip.
-        if self.rank != 0 and info.dp_rank != self.dp_rank:
+        info = self._info(msg.req_id)
+        if info is None:
             return
 
         logger.debug(f"handle_prefill_done {msg.req_id} dp_rank={info.dp_rank}")
@@ -211,7 +235,13 @@ class KVManagerDecode(KVManagerBase):
         self.endpoints.decode_prepare.send(ProtocolSerializer.pack(msg))
 
     def is_prefill_done(self, req_id: str):
-        info = self._info(req_id, create=False)
-        if info is None:
-            return False
-        return info.is_prefill_done
+        return self._transfer_done_states.get(req_id, TransferStatus())
+
+    def remove_request(self, request_id: str):
+        super().remove_request(request_id)
+        self._transfer_done_states.pop(request_id, None)
+
+    def remove_request_all_rank(self, request_id: str):
+        self.endpoints.decode_prepare.send(
+            ProtocolSerializer.pack(RemoveRequest(req_id=request_id))
+        )

@@ -696,12 +696,7 @@ class ExpertDataDispatcher(TasksDispatcher):
             result.logits = create((bs, vocab_size), torch.float32)
         return result
 
-    def collect_results(
-        self,
-        results: PackedTasksResult,
-        pd_first_tokens: dict[str, int],
-        pd_cached_hit_tokens: dict[str, int],
-    ):
+    def collect_results(self, results: PackedTasksResult):
         """
         collect results through zmq.
         """
@@ -710,8 +705,6 @@ class ExpertDataDispatcher(TasksDispatcher):
             dp_tasks = DPTaskCollector.get_last_packedtasks()
             merged_results = self._create_empty_recv_results(dp_tasks)
             merged = dataclass_to_dict(merged_results)
-            merged["pd_first_tokens"] = pd_first_tokens
-            merged["pd_cached_hit_tokens"] = pd_cached_hit_tokens
 
             all_data = [None for _ in range(self.group_size)]
             all_data[0] = dataclass_to_dict(results)
@@ -738,20 +731,14 @@ class ExpertDataDispatcher(TasksDispatcher):
                     elif isinstance(v, torch.Tensor):
                         v[slicing] = data[k].reshape(v[slicing].shape)
                 offset += bs
-            return (
-                merged_results,
-                merged["pd_first_tokens"],
-                merged["pd_cached_hit_tokens"],
-            )
+            return merged_results
         else:
             data = dataclass_to_dict(results)
             for k in list(data.keys()):
                 if isinstance(data[k], torch.Tensor):
                     data[k] = data[k].numpy().tobytes()
-            data["pd_first_tokens"] = pd_first_tokens
-            data["pd_cached_hit_tokens"] = pd_cached_hit_tokens
             self.socket.send(msgpack.dumps(data))
-            return results, pd_first_tokens, pd_cached_hit_tokens
+            return results
 
     def send_payload(self, payload: torch.Tensor, tasks=None):
         pass
@@ -920,20 +907,16 @@ class Executor:
             self.process_queue = [
                 self.model_run,
             ]
-        elif not self.has_schedule_overlap:
-            # normal step
-            self.process_queue = [
-                self.model_run,
-                TaskCollector.process_last_batch_results,
-                self.postprocess_sync_part,
-            ]
         else:
-            # step with overlap
-            self.process_queue = [
-                self.postprocess_sync_part,
-                self.model_run,
-                TaskCollector.process_last_batch_results,
-            ]
+            model_part = [self.model_run]
+            sync_part = [self.postprocess_sync_part]
+            token_send_part = [TaskCollector.process_last_batch_results]
+            if not self.has_schedule_overlap:
+                # normal step
+                self.process_queue = model_part + token_send_part + sync_part
+            else:
+                # step with overlap
+                self.process_queue = sync_part + model_part + token_send_part
 
     def _prepend_dispatcher(self, dispatcher: TasksDispatcher):
         self.task_dispatchers.insert(0, dispatcher)
@@ -1746,7 +1729,7 @@ class Executor:
                 task.req.stop_stream()
             else:
                 task.req.notify_server_data_added_threadsafe()
-        TaskCollector.set_update_task_ids(block_tasks.task_ids)
+        TaskCollector.add_update_task_ids(block_tasks.task_ids)
 
     def _collect_task_and_pp_results(self, tasks: PackedTasksBase):
         """collect tasks to run `postprocess_sync_part` at this step, send/recv pp results if needed"""
@@ -1773,32 +1756,15 @@ class Executor:
         else:
             PrometheusMetricsCollector.inc_generated_tokens(bs)
 
-    def _collect_pd_extra_data(self, tasks: PackedTasks):
-        pd_first_tokens: dict[str, int] = {}
-        pd_num_hit_tokens: dict[str, int] = {}
-        for task in tasks.output_tasks:
-            if task._pd_first_token_for_dp_emit is not None:
-                pd_first_tokens[task.task_id] = task._pd_first_token_for_dp_emit
-                task._pd_first_token_for_dp_emit = None
-            if task._pd_cached_hit_tokens_for_dp_emit is not None:
-                pd_num_hit_tokens[task.task_id] = task._pd_cached_hit_tokens_for_dp_emit
-                task._pd_cached_hit_tokens_for_dp_emit = None
-        return pd_first_tokens, pd_num_hit_tokens
-
     def _dp_collect_result(self, tasks: PackedTasks):
-        pd_first_tokens, pd_num_hit_tokens = self._collect_pd_extra_data(tasks)
         if not self.dp_dispatcher:
-            return tasks, pd_first_tokens, pd_num_hit_tokens
+            return tasks
 
-        dp_results, pd_first_tokens, pd_num_hit_tokens = (
-            self.dp_dispatcher.collect_results(
-                tasks.generated_result, pd_first_tokens, pd_num_hit_tokens
-            )
-        )
+        dp_results = self.dp_dispatcher.collect_results(tasks.generated_result)
         if self.rank == 0:
             tasks = DPTaskCollector.get_last_packedtasks()
             tasks.generated_result = dp_results
-        return tasks, pd_first_tokens, pd_num_hit_tokens
+        return tasks
 
     def _update_pd_num_hit_tokens(self, pd_num_hit_tokens: dict[str, int]):
         for task_id, num_hit_tokens in pd_num_hit_tokens.items():
@@ -1835,7 +1801,7 @@ class Executor:
         if self._pd_prefill_only:
             if self.rank == 0 and DPTaskCollector.available():
                 tasks = DPTaskCollector.get_last_packedtasks()
-            TaskCollector.set_update_task_ids(
+            TaskCollector.add_update_task_ids(
                 tasks.output_task_ids if tasks is not None else []
             )
             return
@@ -1853,22 +1819,17 @@ class Executor:
             )
             self._update_token_statistics(tasks, accept_indices_list)
             tasks.batch_update_mtp_accept_index(accept_indices_list)
-            tasks, pd_first_tokens, pd_cached_hit_tokens = self._dp_collect_result(
-                tasks
-            )
-            tasks.batch_update_response_sync(extra_first_token=pd_first_tokens)
+            tasks = self._dp_collect_result(tasks)
+            tasks.batch_update_response_sync()
 
         if self.rank != 0:
             return
 
         if tasks is not None:
-            self._update_pd_num_hit_tokens(pd_cached_hit_tokens)
             tasks.batch_update_test_result()
             TaskCollector.append_to_last_batch_results(tasks.create_batch_result())
             tasks.batch_update_decode_status()
-            TaskCollector.set_update_task_ids(tasks.output_task_ids)
-        else:
-            TaskCollector.set_update_task_ids([])
+            TaskCollector.add_update_task_ids(tasks.output_task_ids)
 
         if self.has_schedule_overlap and current_tasks.task_type != TaskType.Special:
             if self.dp_dispatcher:

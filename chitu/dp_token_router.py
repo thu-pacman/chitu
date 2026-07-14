@@ -11,7 +11,7 @@ import asyncio
 import os
 import time
 from collections import defaultdict
-from typing import Any
+from typing import Any, Optional
 import zmq
 import zmq.asyncio
 import msgpack
@@ -24,6 +24,7 @@ from chitu.dp_router import (
     get_request_router,
     get_token_router,
     set_global_token_router,
+    remove_request_everywhere,
 )
 
 logger = logging.getLogger(__name__)
@@ -113,6 +114,25 @@ class TokenRouter:
             f"Token Router: Request {req.request_id} registered, active requests: {len(self.active_requests)}"
         )
 
+    def remove_request(self, request_id: str):
+        """[called by remove_request_everywhere] Remove request data in Token Router"""
+        self.active_requests.pop(request_id, None)
+
+    def finish_request(
+        self,
+        request: UserRequest,
+        finish_reason: Optional[str] = None,
+        error: Optional[str] = None,
+        num_hit_tokens: Optional[int] = None,
+    ):
+        """Finalize request, stop output stream and remove request data in all DP components"""
+        if finish_reason is not None:
+            request.finish_reason = finish_reason
+        if num_hit_tokens is not None:
+            request.num_hit_tokens = num_hit_tokens
+        request.stop_stream(error=error)
+        remove_request_everywhere(request.request_id)
+
     async def _recv_loop(self, instance_id: int, sock):
         # 批量排空
         try:
@@ -182,8 +202,7 @@ class TokenRouter:
             top_logprobs = token_data.get("top_logprobs")
             top_token_idx = token_data.get("top_token_idx")
             is_first_token = req.num_output_tokens == 0
-            for token in tokens:
-                req.add_data(token, top_logprobs, top_token_idx)
+            req.add_data(tokens, top_logprobs, top_token_idx)
 
             self.total_tokens_received += 1
             # per-instance 统计
@@ -234,16 +253,7 @@ class TokenRouter:
                 self._last_stats_log_ts = now
 
         elif token_data.get("type") == "finish":
-            # Request completed
             finish_reason = token_data.get("finish_reason", "stop")
-            req.finish_reason = finish_reason
-            req.num_hit_tokens = int(
-                token_data.get("num_hit_tokens", req.num_hit_tokens)
-            )
-            req.stop_stream()
-
-            # Remove from active requests
-            del self.active_requests[request_id]
             # Update active requests gauge
             from chitu.metrics.prometheus_collector import chitu_active_requests
 
@@ -255,11 +265,22 @@ class TokenRouter:
             logger.debug(
                 f"Token Router: Request {request_id} finished, reason={finish_reason}"
             )
+
+            # Request completed
+            self.finish_request(
+                req,
+                finish_reason=finish_reason,
+                num_hit_tokens=token_data.get("num_hit_tokens"),
+            )
+
+        elif token_data.get("type") == "evict":
+            # For multi instance, evicting is handled by each instance and would not raise to Router
+            # For PD disaggrigation, request router (not the token router) should handle evicting requests
+            logger.warning(
+                f"Evicting requetst {request_id} due to insufficient KV cache"
+            )
             if request_router := get_request_router():
-                if hasattr(request_router, "policy") and hasattr(
-                    request_router.policy, "forget_request"
-                ):
-                    request_router.policy.forget_request(request_id)
+                await request_router.add_request(self.active_requests[request_id])
 
         elif token_data.get("type") == "error":
             # Handle error
@@ -269,13 +290,11 @@ class TokenRouter:
             )
 
             # Send stop signal and cleanup
-            req.stop_stream()
-            del self.active_requests[request_id]
-            if request_router := get_request_router():
-                if hasattr(request_router, "policy") and hasattr(
-                    request_router.policy, "forget_request"
-                ):
-                    request_router.policy.forget_request(request_id)
+            self.finish_request(
+                req,
+                error=error_message,
+                num_hit_tokens=token_data.get("num_hit_tokens"),
+            )
 
         else:
             logger.warning(
@@ -294,14 +313,13 @@ class TokenRouter:
                         self._cleanup_timeout_s > 0
                         and current_time - req.start_time > self._cleanup_timeout_s
                     ):
-                        timeout_requests.append(request_id)
+                        timeout_requests.append(req)
 
-                for request_id in timeout_requests:
+                for request in timeout_requests:
                     logger.warning(
-                        f"Token Router: Request {request_id} timed out, cleaning up"
+                        f"Token Router: Request {request.request_id} timed out, cleaning up"
                     )
-                    req.async_stream.send_stop_signal()
-                    del self.active_requests[request_id]
+                    self.finish_request(request, error="Timeout error")
 
                 await asyncio.sleep(60)  # Clean up every minute
 

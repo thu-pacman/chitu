@@ -296,6 +296,7 @@ parse_instance_spec() {
       max_reqs=*)                 max_reqs="${_kv#*=}"; max_reqs_explicit=1;;
       max_batch_size=*)           max_batch_size="${_kv#*=}"; max_batch_size_explicit=1;;
       max_new_tokens=*)           max_new_tokens="${_kv#*=}";;
+      num_blocks=*)               num_blocks="${_kv#*=}";;
       master_port=*)              master_port="${_kv#*=}";;
       nproc=*|nproc_per_node=*)   nproc="${_kv#*=}";;
       chunk=*|prefill_chunk_size=*) chunk="${_kv#*=}";;

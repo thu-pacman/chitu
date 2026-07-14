@@ -28,6 +28,7 @@ from chitu.task import (
     TaskPool,
     TaskType,
     UserRequest,
+    TaskCollector,
 )
 from chitu.global_vars import get_global_args
 from chitu.distributed.pd_disaggregation.kv_transfer import (
@@ -171,8 +172,8 @@ class PDQueue:
 
     def peek(self, max_items: int) -> list[tuple[str, dict[str, Any]]]:
         with self._lock:
-            if max_items <= 0:
-                return []
+            if max_items < 0:
+                return list(self._items.items())
             return list(self._items.items())[: int(max_items)]
 
 
@@ -197,6 +198,7 @@ class PDInstanceRequestManager:
             raise RuntimeError("Backend.cache_managers is not initialized")
         self.prefill_num_tasks = prefill_num_tasks
         self.decode_num_tasks = decode_num_tasks
+        self._schedule_lock = threading.Lock()
 
         self.pd_mode = pd_mode
         self.local_instance_id = local_instance_id
@@ -279,14 +281,25 @@ class PDInstanceRequestManager:
 
         if self.token_manager is not None:
             self.token_manager.token_sender.send_error(rid, error_message)
-            self.token_manager.unwrap_task(rid)
 
         logger.error(f"[PD_DECODE][reject] req_id={rid} error={error_message}")
 
+    def stop_request(
+        self, request_id: str, force_stop: bool = False, timeout: float = 30.0
+    ):
+        """Stop/Cancel the given Running/Pending request.
+
+        If force_stop=False, requests that do not require other instances will not be stopped.
+        """
+        # [Prefill/Decode Common Part] Remove request from KV Manager
+        self.kv_manager.remove_request_all_rank(request_id=request_id)
+        return True
+
     async def process_request(self, request_data: dict[str, Any]):
         """Process incoming request"""
-        request_id = request_data.get("request_id")
-        request_type = request_data.get("type", "regular")
+        request_id: str = request_data.get("request_id")
+        request_type: str = request_data.get("type", "regular")
+        scheduler_type: str = request_data.get("scheduler_type")
         target_role = request_data.get("target_role")
 
         if pd_trace_enabled():
@@ -310,6 +323,25 @@ class PDInstanceRequestManager:
                 logger.warning(
                     f"target role mismatch: got {target_role}, mode is {self.pd_mode}"
                 )
+        elif request_type == "pd_prefill_fail":
+            if isinstance(self, DecodeOnlyManager):
+                if self.stop_request(request_id, timeout=0.0):
+                    await self.token_manager.send_error_for_request(
+                        request_id, "prefill worker is down"
+                    )
+            else:
+                raise ValueError(
+                    f"unexpected request type: {request_type} in {type(self).__name__}"
+                )
+        elif request_type == "pd_decode_fail":
+            if isinstance(self, PrefillOnlyManager):
+                self.stop_request(request_id, timeout=0.0)
+            else:
+                raise ValueError(
+                    f"unexpected request type: {request_type} in {type(self).__name__}"
+                )
+        elif request_type == "interrupt":
+            await self.stop_request(request_id, force_stop=True, timeout=0.0)
         else:
             raise ValueError(f"unexpected request type: {request_type}")
 
@@ -573,6 +605,26 @@ class PrefillOnlyManager(PDInstanceRequestManager):
 
         threading.Thread(target=_bootstrap_poller_loop, daemon=True).start()
 
+    def stop_request(
+        self, request_id: str, force_stop: bool = False, timeout: float = 30.0
+    ):
+        with self._schedule_lock:
+            if request_id in TaskPool.pool:
+                task = TaskPool.pool[request_id]
+                task.set_stopped()
+                TaskCollector.add_update_task_ids([request_id])
+                return True
+
+            self.pending_decode_requests.pop(request_id, None)
+            if self._prefill_incoming_q.contains(request_id):
+                self._prefill_incoming_q.pop(request_id)
+            elif self._prefill_bootstrap_q.contains(request_id):
+                self._prefill_bootstrap_q.pop(request_id)
+            elif self._prefill_ready_q.contains(request_id):
+                self._prefill_ready_q.pop(request_id)
+
+            return super().stop_request(request_id, force_stop)
+
     async def _process_prefill_request(self, request_data: dict[str, Any]):
         """Process Prefill-only request.
 
@@ -623,65 +675,76 @@ class PrefillOnlyManager(PDInstanceRequestManager):
         for rid, info in self._prefill_incoming_q.peek(max_check):
             if self._prefill_bootstrap_q.is_full():
                 break
-            if self._prefill_bootstrap_q.enqueue(rid, info):
-                self._prefill_incoming_q.pop(rid)
-                info["_transfer_info_start_ts"] = time.monotonic()
-                logger.debug(f"[PD_STAGE][prefill.transfer_info.start] req_id={rid}")
-                logger.debug(
-                    f"[PD_QUEUE][prefill.move] incoming->bootstrap_wait req_id={rid}"
-                )
+            with self._schedule_lock:
+                if not self._prefill_incoming_q.contains(rid):
+                    continue
+                if self._prefill_bootstrap_q.enqueue(rid, info):
+                    self._prefill_incoming_q.pop(rid)
+                    info["_transfer_info_start_ts"] = time.monotonic()
+                    logger.debug(
+                        f"[PD_STAGE][prefill.transfer_info.start] req_id={rid}"
+                    )
+                    logger.debug(
+                        f"[PD_QUEUE][prefill.move] incoming->bootstrap_wait req_id={rid}"
+                    )
 
         # 2) bootstrap_wait -> ready (DecodeAllocated ready)
         items = self._prefill_bootstrap_q.peek(max_check)
-        if not items:
-            return
-        req_ids = [rid for rid, _ in items]
+        if items:
+            req_ids = [rid for rid, _ in items]
 
-        for rid, (_, info) in zip(req_ids, items):
-            if not self.kv_manager.is_decode_allocated(rid):
-                last_log_ts = float(info.get("last_log_ts", 0.0))
-                created_ts = float(info.get("created_ts", now))
-                waited = now - created_ts
-                if (now - last_log_ts) >= 1.0 and waited >= 1.0:
-                    info["last_log_ts"] = now
-                    logger.debug(
-                        f"[PD_BOOTSTRAP][prefill.wait] still waiting DecodeAllocated: req_id={rid} "
-                        f"waited={waited:.1f}s"
-                    )
-                if (
-                    self._bootstrap_timeout_s > 0
-                    and waited >= self._bootstrap_timeout_s
-                ):
-                    # FIXME: log every 10 seconds
-                    logger.warning(
-                        f"[PD_BOOTSTRAP][prefill.backpressure] req_id={rid} waited={waited:.1f}s "
-                        f"threshold={self._bootstrap_timeout_s:.1f}s"
-                    )
-                continue
+            for rid, (_, info) in zip(req_ids, items):
+                if not self.kv_manager.is_decode_allocated(rid):
+                    last_log_ts = float(info.get("last_log_ts", 0.0))
+                    created_ts = float(info.get("created_ts", now))
+                    waited = now - created_ts
+                    if (now - last_log_ts) >= 1.0 and waited >= 1.0:
+                        info["last_log_ts"] = now
+                        logger.debug(
+                            f"[PD_BOOTSTRAP][prefill.wait] still waiting DecodeAllocated: req_id={rid} "
+                            f"waited={waited:.1f}s"
+                        )
+                    if (
+                        self._bootstrap_timeout_s > 0
+                        and waited >= self._bootstrap_timeout_s
+                    ):
+                        # FIXME: log every 10 seconds
+                        logger.warning(
+                            f"[PD_BOOTSTRAP][prefill.backpressure] req_id={rid} waited={waited:.1f}s "
+                            f"threshold={self._bootstrap_timeout_s:.1f}s"
+                        )
+                    continue
 
-            if self._prefill_ready_q.is_full():
-                logger.warning(
-                    f"[PD_QUEUE][backpressure] queue=prefill.ready req_id={rid}"
-                )
-                continue
-            if self._prefill_ready_q.enqueue(rid, info):
-                self._prefill_bootstrap_q.pop(rid)
-                created_ts = float(info.get("created_ts", now))
-                waited = now - created_ts
-                # Record transfer_info_wait stage duration
-                _ti_start = float(info.get("_transfer_info_start_ts", 0))
-                if _ti_start > 0:
-                    observe_stage_duration(
-                        "prefill", "transfer_info_wait", time.monotonic() - _ti_start
-                    )
-                if waited > 5.0:
+                if self._prefill_ready_q.is_full():
                     logger.warning(
-                        f"[PD_SLOW] prefill.transfer_info_wait req_id={rid} waited={waited:.1f}s"
+                        f"[PD_QUEUE][backpressure] queue=prefill.ready req_id={rid}"
                     )
-                logger.debug(
-                    f"[PD_QUEUE][prefill.ready] req_id={rid} DecodeAllocated ready waited={waited:.1f}s"
-                )
-                logger.debug(f"[PD_STAGE][prefill.transfer_info.end] req_id={rid}")
+                    continue
+                with self._schedule_lock:
+                    if not self._prefill_bootstrap_q.contains(rid):
+                        continue
+                    if self._prefill_ready_q.enqueue(rid, info):
+                        self._prefill_bootstrap_q.pop(rid)
+                        created_ts = float(info.get("created_ts", now))
+                        waited = now - created_ts
+                        # Record transfer_info_wait stage duration
+                        _ti_start = float(info.get("_transfer_info_start_ts", 0))
+                        if _ti_start > 0:
+                            observe_stage_duration(
+                                "prefill",
+                                "transfer_info_wait",
+                                time.monotonic() - _ti_start,
+                            )
+                        if waited > 5.0:
+                            logger.warning(
+                                f"[PD_SLOW] prefill.transfer_info_wait req_id={rid} waited={waited:.1f}s"
+                            )
+                        logger.debug(
+                            f"[PD_QUEUE][prefill.ready] req_id={rid} DecodeAllocated ready waited={waited:.1f}s"
+                        )
+                        logger.debug(
+                            f"[PD_STAGE][prefill.transfer_info.end] req_id={rid}"
+                        )
 
         # 3) ready -> TaskPool
         promoted = 0
@@ -692,18 +755,23 @@ class PrefillOnlyManager(PDInstanceRequestManager):
             if original_request is None:
                 self._prefill_ready_q.pop(rid)
                 continue
-            self._prefill_ready_q.pop(rid)
-            self._create_task_from_request(original_request)
-            promoted += 1
-            created_ts = float(info.get("created_ts", time.time()))
-            waited = time.time() - created_ts
-            # Record prefill queue duration
-            observe_stage_duration("prefill", "queue", waited)
-            logger.debug(
-                f"[PD_BOOTSTRAP][prefill.promote] promoted req_id={rid} to Prefill task waited={waited:.1f}s"
-            )
-            logger.debug(f"[PD_STAGE][prefill.queue.end] req_id={rid}")
-            logger.debug(f"[PD_STAGE][prefill.exec.start] req_id={rid}")
+            if TaskPool.pool.get(rid) is not None:
+                continue
+            with self._schedule_lock:
+                if not self._prefill_ready_q.contains(rid):
+                    continue
+                self._prefill_ready_q.pop(rid)
+                self._create_task_from_request(original_request)
+                promoted += 1
+                created_ts = float(info.get("created_ts", time.time()))
+                waited = time.time() - created_ts
+                # Record prefill queue duration
+                observe_stage_duration("prefill", "queue", waited)
+                logger.debug(
+                    f"[PD_BOOTSTRAP][prefill.promote] promoted req_id={rid} to Prefill task waited={waited:.1f}s"
+                )
+                logger.debug(f"[PD_STAGE][prefill.queue.end] req_id={rid}")
+                logger.debug(f"[PD_STAGE][prefill.exec.start] req_id={rid}")
 
         # Update prefill queue size gauges
         set_queue_size("prefill", "incoming", self._prefill_incoming_q.size())
@@ -794,6 +862,42 @@ class DecodeOnlyManager(PDInstanceRequestManager):
 
         threading.Thread(target=_decode_wait_poller, daemon=True).start()
 
+    def stop_request(
+        self, request_id: str, force_stop: bool = False, timeout: float = 30.0
+    ):
+        if not force_stop:
+            if request_id in TaskPool.pool or self._decode_ready_q.contains(request_id):
+                return False
+        if request_id in TaskPool.pool:
+            task = TaskPool.pool[request_id]
+            task.set_stopped()
+            TaskCollector.add_update_task_ids([request_id])
+            return True
+
+        self.pending_decode_requests.pop(request_id, None)
+        if self._decode_incoming_q.contains(request_id):
+            self._decode_incoming_q.pop(request_id)
+            return True
+        info = None
+        if self._decode_prealloc_q.contains(request_id):
+            info = self._decode_prealloc_q.pop(request_id)
+            # waiting for prefill reply
+            start_time = time.time()
+            while not self.kv_manager.is_prefill_done(request_id):
+                if time.time() - start_time > timeout:
+                    break
+                time.sleep(0.1)
+        elif self._decode_ready_q.contains(request_id):
+            info = self._decode_ready_q.pop(request_id)
+        # clean kv cache
+        if info is not None:
+            task = info.get("task")
+            for cache_dict in Backend.cache_managers:
+                for cache_manager in cache_dict.values():
+                    cache_manager.finalize_metadata_all_decode(task)
+
+        return super().stop_request(request_id, force_stop, timeout)
+
     def _decode_check_and_promote(
         self, max_check: Optional[int] = None, max_promote: Optional[int] = None
     ):
@@ -827,6 +931,8 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             if task is None:
                 self._decode_incoming_q.pop(rid)
                 continue
+            if TaskPool.pool.get(rid) is not None:
+                continue
             target_dp_rank = int(task.dp_rank)
             prefill_sid = task.pd_prefill_engine_rank
             prefix_len = int(getattr(task, "prefix_tokens_len", 0))
@@ -840,125 +946,133 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             ):
                 break
 
-            # decode侧预分配kv cache block
-            if not task.new_cache_ids:
-                prefix_len = int(getattr(task, "prefix_tokens_len", 0))
+            with self._schedule_lock:
+                if not self._decode_incoming_q.contains(rid):
+                    continue
+                # decode侧预分配kv cache block
+                if not task.new_cache_ids:
+                    prefix_len = int(getattr(task, "prefix_tokens_len", 0))
 
-                cache_manager_dict: dict[str, PagedKVCacheManager] = (
-                    Backend.cache_managers[target_dp_rank]
-                )
-
-                num_cached_tokens = min(
-                    (
-                        cache_manager.num_cached_blocks(task) * cache_manager.block_size
-                        for cache_manager in cache_manager_dict.values()
-                        if not isinstance(
-                            cache_manager, SingletonPagedKVCacheManager
-                        )  # singleton managers don't participate in prefix caching
-                    ),
-                    default=0,
-                )
-                remain_prefix_len = prefix_len - num_cached_tokens
-
-                has_capacity = True
-                failed_cache_manager = None
-                for cache_manager in cache_manager_dict.values():
-                    cur_blocks = cache_manager.num_blocks_for_seq_len(num_cached_tokens)
-                    target_blocks = cache_manager.num_blocks_for_seq_len(prefix_len)
-                    idle_hit_blocks = cache_manager.num_cached_idle_blocks(
-                        task, max_cached_token_len=num_cached_tokens
+                    cache_manager_dict: dict[str, PagedKVCacheManager] = (
+                        Backend.cache_managers[target_dp_rank]
                     )
-                    available_blocks = (
-                        cache_manager.num_blocks
-                        - cache_manager.num_active_blocks
-                        - idle_hit_blocks
-                    )
-                    if target_blocks - cur_blocks > available_blocks:
-                        has_capacity = False
-                        failed_cache_manager = cache_manager
-                        break
 
-                if not has_capacity:
-                    assert failed_cache_manager is not None
-                    if prefix_len > (
-                        failed_cache_manager.block_size
-                        * failed_cache_manager.num_blocks
-                    ):
-                        total_capacity_tokens = (
+                    num_cached_tokens = min(
+                        (
+                            cache_manager.num_cached_blocks(task)
+                            * cache_manager.block_size
+                            for cache_manager in cache_manager_dict.values()
+                            if not isinstance(
+                                cache_manager, SingletonPagedKVCacheManager
+                            )  # singleton managers don't participate in prefix caching
+                        ),
+                        default=0,
+                    )
+                    remain_prefix_len = prefix_len - num_cached_tokens
+
+                    has_capacity = True
+                    failed_cache_manager = None
+                    for cache_manager in cache_manager_dict.values():
+                        cur_blocks = cache_manager.num_blocks_for_seq_len(
+                            num_cached_tokens
+                        )
+                        target_blocks = cache_manager.num_blocks_for_seq_len(prefix_len)
+                        idle_hit_blocks = cache_manager.num_cached_idle_blocks(
+                            task, max_cached_token_len=num_cached_tokens
+                        )
+                        available_blocks = (
+                            cache_manager.num_blocks
+                            - cache_manager.num_active_blocks
+                            - idle_hit_blocks
+                        )
+                        if target_blocks - cur_blocks > available_blocks:
+                            has_capacity = False
+                            failed_cache_manager = cache_manager
+                            break
+
+                    if not has_capacity:
+                        assert failed_cache_manager is not None
+                        if prefix_len > (
                             failed_cache_manager.block_size
                             * failed_cache_manager.num_blocks
-                        )
-                        error_message = (
-                            "KV cache capacity is insufficient to support prefilling. "
-                            f"total_blocks={failed_cache_manager.num_blocks} "
-                            f"block_size={failed_cache_manager.block_size} "
-                            f"total_capacity_tokens={total_capacity_tokens} "
-                            f"prompt_len={task.prompt_len}. "
-                            "Increase decode KV blocks or enable full_warmup."
-                        )
-                        self._fail_decode_request_before_taskpool(
-                            rid,
-                            info,
-                            error_message,
-                        )
-                    continue
+                        ):
+                            total_capacity_tokens = (
+                                failed_cache_manager.block_size
+                                * failed_cache_manager.num_blocks
+                            )
+                            error_message = (
+                                "KV cache capacity is insufficient to support prefilling. "
+                                f"total_blocks={failed_cache_manager.num_blocks} "
+                                f"block_size={failed_cache_manager.block_size} "
+                                f"total_capacity_tokens={total_capacity_tokens} "
+                                f"prompt_len={task.prompt_len}. "
+                                "Increase decode KV blocks or enable full_warmup."
+                            )
+                            self._fail_decode_request_before_taskpool(
+                                rid,
+                                info,
+                                error_message,
+                            )
+                        continue
 
-                if remain_prefix_len == 0:
-                    remain_prefix_len = 1
+                    if remain_prefix_len == 0:
+                        remain_prefix_len = 1
 
-                task.set_prefill_chunk_size_for_one_step(remain_prefix_len)
+                    task.set_prefill_chunk_size_for_one_step(remain_prefix_len)
 
-                if num_cached_tokens == task.prefix_tokens_len:
-                    num_cached_tokens = task.prefix_tokens_len - 1
+                    if num_cached_tokens == task.prefix_tokens_len:
+                        num_cached_tokens = task.prefix_tokens_len - 1
 
-                task.set_inc_hit_tokens(num_cached_tokens - task.consumed_req_tokens)
-                task.consumed_req_tokens = num_cached_tokens
-
-                for name, cache_manager in cache_manager_dict.items():
-                    task.new_cache_ids[name] = (
-                        cache_manager.prepare_metadata_before_prefill(task)
+                    task.set_inc_hit_tokens(
+                        num_cached_tokens - task.consumed_req_tokens
                     )
+                    task.consumed_req_tokens = num_cached_tokens
 
-                task.consume_req_tokens()
+                    for name, cache_manager in cache_manager_dict.items():
+                        task.new_cache_ids[name] = (
+                            cache_manager.prepare_metadata_before_prefill(task)
+                        )
 
-                assert (
-                    task.task_type == TaskType.Decode
-                ), f"{task.task_type} vs {TaskType.Decode}"
+                    task.consume_req_tokens()
 
-            self.kv_manager.send_decode_prepare(
-                req_id=rid,
-                prefill_sid=task.pd_prefill_engine_rank,
-                prefix_len=task.prefix_tokens_len,
-                new_cache_ids=task.new_cache_ids,
-                dp_rank=task.dp_rank,
-            )
-            info["last_prepare_ts"] = now
-            if float(info.get("first_prepare_ts", 0.0)) <= 0.0:
-                info["first_prepare_ts"] = now
-            info["prealloc_tokens"] = required_tokens
-            info["target_dp_rank"] = target_dp_rank
-            if self._decode_prealloc_q.enqueue(rid, info):
-                self._decode_incoming_q.pop(rid)
-                self._decode_prealloc_tokens_inflight += required_tokens
-                if (
-                    0
-                    <= target_dp_rank
-                    < len(self._decode_prealloc_tokens_inflight_by_dp)
-                ):
-                    self._decode_prealloc_tokens_inflight_by_dp[
-                        target_dp_rank
-                    ] += required_tokens
-                self._decode_prealloc_promoted_total += 1
-                created_ts = float(info.get("created_ts", now))
-                waited = now - created_ts
-                info["_prealloc_start_ts"] = time.monotonic()
-                # Record enqueue stage duration
-                observe_stage_duration("decode", "enqueue", waited)
-                logger.debug(f"[PD_STAGE][decode.enqueue.end] req_id={rid}")
-                logger.debug(f"[PD_STAGE][decode.prealloc.start] req_id={rid}")
-                logger.debug(
-                    f"[PD_QUEUE][decode.prealloc] req_id={rid} cache_owner={target_dp_rank} waited={waited:.1f}s"
+                    assert (
+                        task.task_type == TaskType.Decode
+                    ), f"{task.task_type} vs {TaskType.Decode}"
+
+                self.kv_manager.send_decode_prepare(
+                    req_id=rid,
+                    prefill_sid=task.pd_prefill_engine_rank,
+                    prefix_len=task.prefix_tokens_len,
+                    new_cache_ids=task.new_cache_ids,
+                    dp_rank=task.dp_rank,
                 )
+                info["last_prepare_ts"] = now
+                if float(info.get("first_prepare_ts", 0.0)) <= 0.0:
+                    info["first_prepare_ts"] = now
+                info["prealloc_tokens"] = required_tokens
+                info["target_dp_rank"] = target_dp_rank
+                if self._decode_prealloc_q.enqueue(rid, info):
+                    self._decode_incoming_q.pop(rid)
+                    self._decode_prealloc_tokens_inflight += required_tokens
+                    if (
+                        0
+                        <= target_dp_rank
+                        < len(self._decode_prealloc_tokens_inflight_by_dp)
+                    ):
+                        self._decode_prealloc_tokens_inflight_by_dp[
+                            target_dp_rank
+                        ] += required_tokens
+                    self._decode_prealloc_promoted_total += 1
+                    created_ts = float(info.get("created_ts", now))
+                    waited = now - created_ts
+                    info["_prealloc_start_ts"] = time.monotonic()
+                    # Record enqueue stage duration
+                    observe_stage_duration("decode", "enqueue", waited)
+                    logger.debug(f"[PD_STAGE][decode.enqueue.end] req_id={rid}")
+                    logger.debug(f"[PD_STAGE][decode.prealloc.start] req_id={rid}")
+                    logger.debug(
+                        f"[PD_QUEUE][decode.prealloc] req_id={rid} cache_owner={target_dp_rank} waited={waited:.1f}s"
+                    )
 
         # 2) prealloc -> ready (wait KVPoll.Success)
         for rid, info in self._decode_prealloc_q.peek(max_check):
@@ -1002,30 +1116,40 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                     f"[PD_QUEUE][backpressure] queue=decode.ready req_id={rid}"
                 )
                 continue
-            if self._decode_ready_q.enqueue(rid, info):
-                self._decode_prealloc_q.pop(rid)
-                created_ts = float(info.get("created_ts", now))
-                waited = now - created_ts
-                self._decode_ready_promoted_total += 1
-                self._decode_ready_wait_total_s += waited
-                if waited > self._decode_ready_wait_max_s:
-                    self._decode_ready_wait_max_s = waited
-                # Record prealloc stage duration
-                _pa_start = float(info.get("_prealloc_start_ts", 0))
-                if _pa_start > 0:
-                    observe_stage_duration(
-                        "decode", "prealloc", time.monotonic() - _pa_start
+            self.kv_manager._transfer_done_states.pop(rid, None)
+            with self._schedule_lock:
+                if not self._decode_prealloc_q.contains(rid):
+                    continue
+                if self._decode_ready_q.enqueue(rid, info):
+                    self._decode_prealloc_q.pop(rid)
+                    # send first token without update task
+                    task: "Task" = info.get("task")
+                    task.req.num_hit_tokens = max(
+                        task.req.num_hit_tokens, prefill_done.num_hit_tokens
                     )
-                info["_ready_start_ts"] = time.monotonic()
-                if waited > 10.0:
-                    logger.warning(
-                        f"[PD_SLOW] decode.prealloc req_id={rid} waited={waited:.1f}s"
+                    task.req.add_data(prefill_done.first_token)
+                    created_ts = float(info.get("created_ts", now))
+                    waited = now - created_ts
+                    self._decode_ready_promoted_total += 1
+                    self._decode_ready_wait_total_s += waited
+                    if waited > self._decode_ready_wait_max_s:
+                        self._decode_ready_wait_max_s = waited
+                    # Record prealloc stage duration
+                    _pa_start = float(info.get("_prealloc_start_ts", 0))
+                    if _pa_start > 0:
+                        observe_stage_duration(
+                            "decode", "prealloc", time.monotonic() - _pa_start
+                        )
+                    info["_ready_start_ts"] = time.monotonic()
+                    if waited > 10.0:
+                        logger.warning(
+                            f"[PD_SLOW] decode.prealloc req_id={rid} waited={waited:.1f}s"
+                        )
+                    logger.debug(f"[PD_STAGE][decode.prealloc.end] req_id={rid}")
+                    logger.debug(f"[PD_STAGE][decode.ready.start] req_id={rid}")
+                    logger.debug(
+                        f"[PD_QUEUE][decode.ready] req_id={rid} KV ready waited={waited:.1f}s"
                     )
-                logger.debug(f"[PD_STAGE][decode.prealloc.end] req_id={rid}")
-                logger.debug(f"[PD_STAGE][decode.ready.start] req_id={rid}")
-                logger.debug(
-                    f"[PD_QUEUE][decode.ready] req_id={rid} KV ready waited={waited:.1f}s"
-                )
 
         # 3) ready -> TaskPool
         promoted = 0
@@ -1082,49 +1206,56 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                     >= self._decode_max_running_tasks_per_dp
                 ):
                     continue
-            self._decode_ready_q.pop(rid)
-            if not hasattr(task, "pd_ready_ts"):
-                task.pd_ready_ts = time.perf_counter()
-            TaskPool.enqueue(task)
-            if running_per_dp is not None:
-                running_per_dp[target_dp_rank] += 1
-            # Record ready_wait stage duration
-            _rdy_start = float(info.get("_ready_start_ts", 0))
-            if _rdy_start > 0:
-                observe_stage_duration(
-                    "decode", "ready_wait", time.monotonic() - _rdy_start
-                )
-            logger.debug(f"[PD_STAGE][decode.ready.end] req_id={rid}")
-            if not getattr(task, "pd_exec_start_logged", False):
-                task.pd_exec_start_logged = True
-                logger.debug(f"[PD_STAGE][decode.exec.start] req_id={rid}")
-            prealloc_tokens = int(info.get("prealloc_tokens", 0))
-            if prealloc_tokens > 0:
-                self._decode_prealloc_tokens_inflight = max(
-                    0, self._decode_prealloc_tokens_inflight - prealloc_tokens
-                )
-                if (
-                    0
-                    <= target_dp_rank
-                    < len(self._decode_prealloc_tokens_inflight_by_dp)
-                ):
-                    self._decode_prealloc_tokens_inflight_by_dp[target_dp_rank] = max(
-                        0,
-                        self._decode_prealloc_tokens_inflight_by_dp[target_dp_rank]
-                        - prealloc_tokens,
+            with self._schedule_lock:
+                if not self._decode_ready_q.contains(rid):
+                    continue
+                self._decode_ready_q.pop(rid)
+                if not hasattr(task, "pd_ready_ts"):
+                    task.pd_ready_ts = time.perf_counter()
+                TaskPool.enqueue(task)
+                if running_per_dp is not None:
+                    running_per_dp[target_dp_rank] += 1
+                # Record ready_wait stage duration
+                _rdy_start = float(info.get("_ready_start_ts", 0))
+                if _rdy_start > 0:
+                    observe_stage_duration(
+                        "decode", "ready_wait", time.monotonic() - _rdy_start
                     )
-            promoted += 1
-            decode_info = self.pending_decode_requests.get(rid)
-            if decode_info is not None:
-                decode_info["status"] = PDRequestStatus.DECODE_RUNNING
-                decode_info["decode_start_time"] = time.time()
-            created_ts = float(info.get("created_ts", time.time()))
-            waited = time.time() - created_ts
-            logger.debug(
-                f"[PD_BOOTSTRAP][decode.promote] promoted req_id={rid} to Decode task "
-                f"waited={waited:.1f}s"
-            )
-            logger.debug(f"[PD_STAGE][decode.sched_wait.start] req_id={rid}")
+                logger.debug(f"[PD_STAGE][decode.ready.end] req_id={rid}")
+                if not getattr(task, "pd_exec_start_logged", False):
+                    task.pd_exec_start_logged = True
+                    logger.debug(f"[PD_STAGE][decode.exec.start] req_id={rid}")
+                prealloc_tokens = int(info.get("prealloc_tokens", 0))
+                if prealloc_tokens > 0:
+                    self._decode_prealloc_tokens_inflight = max(
+                        0, self._decode_prealloc_tokens_inflight - prealloc_tokens
+                    )
+                    if (
+                        0
+                        <= target_dp_rank
+                        < len(self._decode_prealloc_tokens_inflight_by_dp)
+                    ):
+                        self._decode_prealloc_tokens_inflight_by_dp[target_dp_rank] = (
+                            max(
+                                0,
+                                self._decode_prealloc_tokens_inflight_by_dp[
+                                    target_dp_rank
+                                ]
+                                - prealloc_tokens,
+                            )
+                        )
+                promoted += 1
+                decode_info = self.pending_decode_requests.pop(rid, None)
+                if decode_info is not None:
+                    decode_info["status"] = PDRequestStatus.DECODE_RUNNING
+                    decode_info["decode_start_time"] = time.time()
+                created_ts = float(info.get("created_ts", time.time()))
+                waited = time.time() - created_ts
+                logger.debug(
+                    f"[PD_BOOTSTRAP][decode.promote] promoted req_id={rid} to Decode task "
+                    f"waited={waited:.1f}s"
+                )
+                logger.debug(f"[PD_STAGE][decode.sched_wait.start] req_id={rid}")
 
         # Update decode queue size gauges
         set_queue_size("decode", "incoming", self._decode_incoming_q.size())

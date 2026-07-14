@@ -84,6 +84,7 @@ class InferConfig(InferConfigLegacy):
     prefill_chunk_size: Union[int, str, None] = MISSING
     schedule_overlap: bool | str = MISSING
     full_warmup: bool | str = MISSING
+    process_group_timeout_seconds: Optional[int | str] = MISSING
     embed_tokens_lm_head_tp_size: str = MISSING
     experts_stats_path: Optional[str] = MISSING
     num_experts_slots: Optional[int] = MISSING
