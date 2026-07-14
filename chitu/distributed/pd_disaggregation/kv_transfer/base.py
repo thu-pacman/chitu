@@ -143,7 +143,7 @@ class KVManagerBase:
                 nbytes = _tensor.numel() * _tensor.element_size()
                 self.transfer_engine.register(ptr, nbytes)
 
-    def _info(self, req_id: str, create=True) -> TaskInfo:
+    def _info(self, req_id: str, create=False) -> TaskInfo:
         """Get or create the TaskInfo for *request*."""
         info = self._task_infos.get(req_id)
         if info is None and create:
@@ -198,3 +198,6 @@ class KVManagerBase:
 
         parts = ["[PD_TRACE]"] + [f"{k}={v}" for k, v in items.items()]
         logger.debug(" ".join(parts))
+
+    def remove_request(self, request_id: str):
+        self._remove_info(request_id)

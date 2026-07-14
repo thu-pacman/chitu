@@ -31,6 +31,7 @@ class AsyncDataStream:
         self.reasoning_states: list[bool] = []
         self.cached_reasoning_state: bool = False
         self.callbacks_on_stop = []
+        self.error_message: Optional[str] = None
 
     def add_data(
         self,
@@ -80,9 +81,11 @@ class AsyncDataStream:
         if notify_server:
             self.notify_server_threadsafe()
 
-    def send_stop_signal(self):
+    def send_stop_signal(self, error: Optional[str] = None):
         self.add_data(None)
         with self.lock:
+            if error is not None:
+                self.error_message = error
             self.stop_signal = True
         self.notify_server_threadsafe()
         for callback in self.callbacks_on_stop:
@@ -103,6 +106,8 @@ class AsyncDataStream:
     async def __anext__(self):
         while True:
             with self.lock:
+                if self.error_message is not None:
+                    raise RuntimeError(self.error_message)
                 if self.stop_signal and self.index >= len(self.seqs):
                     raise StopAsyncIteration
                 if self.index < len(self.seqs):

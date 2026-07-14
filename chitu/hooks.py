@@ -10,10 +10,12 @@ import time
 from chitu.global_vars import get_global_args
 from chitu.task import (
     Task,
+    TaskType,
     TaskPool,
     PackedTasks,
     PackedTasksBase,
     DPTaskCollector,
+    TaskCollector,
 )
 from chitu.serve.event_loop import get_server_event_loop
 from typing import TYPE_CHECKING
@@ -78,23 +80,6 @@ class LocalTokenSink:
         if (loop := get_server_event_loop()) is not None:
             # No need to notify if there is no server (e.g. offline inference)
             loop.call_soon_threadsafe(notify_all_response_in_batch)
-
-
-class DPTokenSink:
-    """No-op sink for PD decode flow.
-
-    Tokens are already streamed by DP Token Manager via task wrapper during
-    postprocess_sync_part. Emitting again here would duplicate outputs.
-    """
-
-    def emit_batch(
-        self,
-        task_list: list[Task],
-        token_list: list[list[int]],
-        logprobs_list: Optional[list[list[float]]] = None,
-        token_idxs_list: Optional[list[list[int]]] = None,
-    ) -> None:
-        return
 
 
 class KVTransferHook(Protocol):
@@ -236,21 +221,7 @@ class MooncakeKVTransferHook:
             task = TaskPool.pool.get(req_id)
             if task is None:
                 continue
-            # Worker rank 的 task 没有 req；先把值挂在 task 上，后续由主 rank 汇聚回传。
-            task._pd_cached_hit_tokens_for_dp_emit = num_hit_tokens
-            if not task.has_next_token():
-                task.update_response_sync([first_token])
-                # DP worker rank 的 task 没有被 DPTaskWrapper 替换 update_response_sync，
-                # 上面的 update_response_sync 只更新了本地状态，不会把 token 发给 Router。
-                # 在 task 上标记这个 token，后续 collect_token 会把它带回 rank 0 补发。
-                if Backend.executor.rank != 0:
-                    task._pd_first_token_for_dp_emit = first_token
-            if task.req is not None and not task._pd_first_token_applied:
-                task.req.num_hit_tokens = max(task.req.num_hit_tokens, num_hit_tokens)
-                task._pd_first_token_applied = True
-                max_seq_len = get_global_args().infer.max_seq_len
-                remaining = max(0, int(max_seq_len) - int(task.prefix_tokens_len))
-                task.req.max_new_tokens = min(int(task.req.max_new_tokens), remaining)
+            task.update_response_sync([first_token])
 
         if get_dp_group().group_id == 0:
             from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
@@ -264,32 +235,58 @@ class TaskEvictHook(Protocol):
     Default hook does nothing
     """
 
-    def before_evict(self, task: Task):
-        pass
+    def get_prefill_task_ids(self) -> list[str]:
+        return []
+
+    def check_evict(self, task_id: str) -> bool:
+        return True
 
     def on_evict_done(self, task: Task):
         pass
 
 
 class NoopTaskEvictHook:
-    def before_evict(self, task: Task):
-        pass
+    def get_prefill_task_ids(self) -> list[str]:
+        return []
+
+    def check_evict(self, task_id: str) -> bool:
+        return TaskPool.pool.get(task_id) is not None
 
     def on_evict_done(self, task: Task):
-        pass
+        # Restore the task's status to before prefill
+        task.task_type = TaskType.Prefill
+        task.prefill_chunk_size = None
+        task.consumed_req_tokens = 0
+        task.sched_group_id = None
+        task.dp_rank = None
 
 
 class PDTaskEvictHook:
-    def before_evict(self, task: Task):
-        pass
+    def get_prefill_task_ids(self) -> list[str]:
+        # TODO: return pd decode preparing tasks
+        return []
+
+    def check_evict(self, task_id: str) -> bool:
+        if TaskPool.pool.get(task_id) is not None:
+            return True
+        # evict prefilling tasks on decode rank
+        pd_scheduler = get_pd_scheduler_instance()
+        pd_scheduler.stop_request(task_id, force_stop=True)
+        logger.warning(f"Evicted task {task_id} due to insufficient KV cache")
+        return False
 
     def on_evict_done(self, task: Task):
         # Mark stopped so need_remove() returns True and update() drops it
         task.set_stopped()
+        TaskCollector.add_update_task_ids([task.task_id])
         if getattr(task, "req", None) is not None and not task.req.finished:
             task.req.finish_reason = "evicted"
-            token_manager = get_pd_scheduler_instance().token_manager
+            pd_scheduler = get_pd_scheduler_instance()
+            if pd_scheduler is None:
+                return
+            pd_scheduler.kv_manager.remove_request_all_rank(task.req.request_id)
+            token_manager = pd_scheduler.token_manager
             if token_manager is not None:
-                token_manager.token_sender.send_finish(
-                    task.req.request_id, finish_reason="evicted"
+                token_manager.token_sender.send_evict(
+                    task.req.request_id, task.req.num_hit_tokens
                 )

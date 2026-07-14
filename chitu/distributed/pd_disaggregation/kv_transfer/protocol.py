@@ -97,6 +97,13 @@ class RankTransferDone:
 
 @dataclasses.dataclass
 @_register
+class RemoveRequest:
+    type: ClassVar[str] = "RemoveRequest"
+    req_id: str
+
+
+@dataclasses.dataclass
+@_register
 class PrefillDone:
     """Control rank notifies Decode that all transfers for a request are done.
 

@@ -127,11 +127,13 @@ class UserRequest:
     prompt_len: int
     max_new_tokens: int
     trace_data: dict
+    generated_tokens: list[int] = field(default_factory=list)
 
     # ============ Serialization fields end ==========
 
     def __post_init__(self):
         # response related
+        self.generated_tokens = []
         self.output = ""
         self.async_stream = AsyncDataStream(self.enable_thinking)
         self.finish_reason = None
@@ -310,11 +312,11 @@ class UserRequest:
     def finished(self):
         return self.async_stream.stop_signal
 
-    def stop_stream(self):
+    def stop_stream(self, error: Optional[str] = None):
         if self.finished:
             return
         self.output = repr("".join(self.async_stream.seqs))
-        self.async_stream.send_stop_signal()
+        self.async_stream.send_stop_signal(error=error)
         self.completion_time = time.monotonic()
         if self.save_trace_dir and self.trace_data:
             self.save_trace_data()
@@ -335,7 +337,8 @@ class UserRequest:
             self.async_stream.add_data(
                 token, top_logprobs, top_token_idx, notify_server=notify_server
             )
-            logger.debug(f"add data: {token}")
+            self.generated_tokens.append(token)
+            logger.debug(f"Request {self.request_id} adds a new token: {token}")
             self.num_output_tokens += 1
             if token in Backend.tokenizer.stop_tokens:
                 break
@@ -400,7 +403,7 @@ class Task:
         self.prefix_tokens = (
             prefix_tokens
             if prefix_tokens is not None
-            else (req.prompt_tokens if req is not None else [])
+            else (req.prompt_tokens + req.generated_tokens if req is not None else [])
         )
         self.prompt_len = (
             prompt_len if prompt_len is not None else len(self.prefix_tokens)
@@ -501,11 +504,6 @@ class Task:
 
         # PD related
         self.pd_prefill_engine_rank: Optional[int] = None
-        self._pd_first_token_applied = False
-        self._pd_first_token_for_dp_emit: int | None = None
-        """ prefill output token on decode instance dp rank that need to send to router """
-        self._pd_cached_hit_tokens_for_dp_emit: int | None = None
-        """ cached hit tokens on decode instance dp rank that need to send to router """
 
     def set_inc_hit_tokens(self, num: int) -> None:
         # Per-step incremental hit tokens; clamp negatives to avoid metric drift.
@@ -1071,12 +1069,10 @@ class PackedTasks(PackedTasksBase):
         for i, task in enumerate(self.output_tasks):
             task.mtp_accept_index = accept_indices[i]
 
-    def batch_update_response_sync(self, extra_first_token: dict[str, int]):
+    def batch_update_response_sync(self):
         accepted_tokens = self.generated_result.accepted_tokens
         for i, task in enumerate(self.output_tasks):
             tokens = accepted_tokens[i]
-            if task.task_id in extra_first_token:
-                tokens = [extra_first_token[task.task_id]] + tokens
             task.update_response_sync(tokens)
 
     def create_batch_result(self):
@@ -1197,8 +1193,11 @@ class TaskCollector:
 
     @staticmethod
     def add_update_task_ids(task_ids: list[str]):
-        task_ids_set = set(task_ids) | set(TaskCollector._update_task_ids)
-        TaskCollector._update_task_ids = list(task_ids_set)
+        if len(TaskCollector._update_task_ids) == 0:
+            TaskCollector._update_task_ids = task_ids
+        else:
+            task_ids_set = set(task_ids) | set(TaskCollector._update_task_ids)
+            TaskCollector._update_task_ids = list(task_ids_set)
 
 
 class DPTaskCollector:

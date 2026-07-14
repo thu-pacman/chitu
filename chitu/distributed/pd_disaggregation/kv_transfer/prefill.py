@@ -85,7 +85,7 @@ class KVManagerPrefill(KVManagerBase):
         assert isinstance(msg, DecodeAllocated)
         logger.debug(f"handle_decode_allocated {msg.req_id}")
 
-        info = self._info(msg.req_id)
+        info = self._info(msg.req_id, create=True)
 
         info.decode_sid = msg.decode_sid
         info.decode_dp_rank = msg.dp_rank
@@ -183,7 +183,7 @@ class KVManagerPrefill(KVManagerBase):
             os._exit(1)
 
     def is_decode_allocated(self, req_id: str):
-        info = self._info(req_id, create=False)
+        info = self._info(req_id)
         if info is None:
             return False
         return info.is_decode_allocated

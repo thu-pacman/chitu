@@ -497,7 +497,7 @@ class Scheduler:
             if (
                 task.dp_rank is None or self.dp_rank == task.dp_rank
             ) and task.can_schedule():
-                if n_running == self.max_running_tasks and task.dp_rank is None:
+                if n_running >= self.max_running_tasks and task.dp_rank is None:
                     continue
                 if task.dp_rank is None:
                     n_running += 1
@@ -751,7 +751,9 @@ class Scheduler:
         """
 
         decode_task_ids = deque()
-        cached_prefill_task_ids = []  # 已开始prefill但未完成的任务
+        cached_prefill_task_ids = (
+            self._task_evict_hook.get_prefill_task_ids()
+        )  # 已开始prefill但未完成的任务
 
         for tid in task_ids:
             if tid not in TaskPool.pool:
@@ -817,8 +819,10 @@ class Scheduler:
         - For PP=1, raise error when current tasks list is empty
         - For PP>1, raise error when current DP rank has no tasks
         """
+        if not self._task_evict_hook.check_evict(task_id):
+            # evict task not in TaskPool, skip evicting
+            return
         task = TaskPool.pool[task_id]
-        self._task_evict_hook.before_evict(task)
 
         # Remove kvcache of this task
         if task.has_unsync_new_token:
@@ -845,13 +849,6 @@ class Scheduler:
 
         # Update metrics: record task eviction
         PrometheusMetricsCollector.inc_task_eviction()
-
-        # Restore the task's status to before prefill
-        task.task_type = TaskType.Prefill
-        task.prefill_chunk_size = None
-        task.consumed_req_tokens = 0
-        task.sched_group_id = None
-        task.dp_rank = None
 
         # For congestion control
         if congestion_control:

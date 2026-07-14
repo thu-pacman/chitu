@@ -11,12 +11,12 @@ import asyncio
 import logging
 import os
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
-from chitu.dp_token_router import get_token_router
 from chitu.global_vars import get_global_args
 from chitu.metrics import stop_metrics_monitor
 from chitu.task import UserRequest
+from chitu.dp_router import get_request_router, get_token_router
 
 if TYPE_CHECKING:
     from chitu.distributed.pd_disaggregation.pd_request_router import PDRequestRouter
@@ -42,9 +42,7 @@ class PDTestRunner:
     results, and finally shuts the router down.
     """
 
-    def __init__(self, router: PDRequestRouter) -> None:
-        self._router = router
-
+    def __init__(self, router: "PDRequestRouter") -> None:
         test_cfg = get_global_args().pd_test
 
         self.req_timeout = test_cfg.req_timeout
@@ -55,6 +53,7 @@ class PDTestRunner:
         self.num_failed = 0
         self.start_time = 0.0
 
+        self.req_pool: dict[str, UserRequest] = {}
         # enable == 2 → inject a shared system prompt so that later
         # requests can hit the prefix cache.
         self._inject_system_prompt = test_cfg.enable == 2
@@ -70,13 +69,19 @@ class PDTestRunner:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        request_ids = await self._create_requests()
-        if not request_ids:
-            logger.warning("[PD_TEST] no test requests were created, skipping")
-            return
+        try:
+            request_ids = await self._create_requests()
+            if not request_ids:
+                logger.warning("[PD_TEST] no test requests were created, skipping")
+                return
 
-        await self._monitor(request_ids)
-        await self._shutdown()
+            await self._monitor(request_ids)
+            await self._shutdown()
+        except Exception as e:
+            logger.exception(
+                f"[PD_TEST] An error occured in PDTestRunner, PD test failed! {type(e).__name__}: {str(e)}"
+            )
+            os._exit(1)
 
     # ------------------------------------------------------------------
     # Create requests
@@ -105,6 +110,7 @@ class PDTestRunner:
     async def _create_requests(self) -> list[str]:
         logger.info(f"[PD_TEST] creating {self.num_requests} test requests")
         request_ids: list[str] = []
+        request_router: "PDRequestRouter" = get_request_router()
         token_router = get_token_router()
 
         for i in range(self.num_requests):
@@ -120,8 +126,9 @@ class PDTestRunner:
             logger.debug(
                 f"[PD_TEST] request {req.request_id} prompt={msg[0]['content'][:40]}..."
             )
-            await self._router.add_request(req)
+            await request_router.add_request(req)
             await token_router.register_request(req)
+            self.req_pool[req.request_id] = req
 
         self.start_time = time.time()
         logger.info(
@@ -135,48 +142,58 @@ class PDTestRunner:
     # ------------------------------------------------------------------
 
     async def _monitor(
-        self, request_ids: list[str], poll_interval_s: float = 0.5
+        self,
+        request_ids: list[str],
+        poll_interval_s: float = 0.5,
+        allow_request_error: bool = True,
     ) -> None:
         logger.info(
             f"[PD_TEST] monitoring {len(request_ids)} requests, "
             f"timeout={self.req_timeout:.1f}s"
         )
 
+        request_router: "PDRequestRouter" = get_request_router()
         token_router = get_token_router()
         request_set = frozenset(request_ids)
+        running: list[str] = request_ids
         completed: set[str] = set()
         failed: set[str] = set()
 
-        while len(completed) + len(failed) < len(request_set):
+        while running:
             now = time.time()
+            still_running: list[str] = []
+            for request_id in running:
+                if self.req_pool[request_id].finished:
+                    if (
+                        not allow_request_error
+                        and self.req_pool[request_id].async_stream.error_message
+                        is not None
+                    ):
+                        failed.add(request_id)
+                        self.num_failed = len(failed)
+                        self.num_completed = len(completed)
+                        return
+                    completed.add(request_id)
+                else:
+                    pd_req = request_router.pending_pd_requests.get(request_id, None)
+                    if (
+                        pd_req is not None
+                        and now - pd_req.created_time > self.req_timeout
+                    ):
+                        logger.error(
+                            f"[PD_TEST] request {request_id} exceeded timeout "
+                            f"({now - pd_req.created_time:.1f}s > "
+                            f"{self.req_timeout:.1f}s), "
+                            f"status={pd_req.status.value} "
+                            f"error={pd_req.error_message or 'none'}"
+                        )
+                        failed.add(request_id)
+                        self.num_failed = len(failed)
+                        self.num_completed = len(completed)
+                        return
+                    still_running.append(request_id)
 
-            for pd_req in list(self._router.pending_pd_requests.values()):
-                rid = pd_req.request_id
-                if rid not in request_set or rid in completed or rid in failed:
-                    continue
-                if now - pd_req.created_time > self.req_timeout:
-                    logger.error(
-                        f"[PD_TEST] request {rid} exceeded timeout "
-                        f"({now - pd_req.created_time:.1f}s > "
-                        f"{self.req_timeout:.1f}s), "
-                        f"status={pd_req.status.value} "
-                        f"error={pd_req.error_message or 'none'}"
-                    )
-                    failed.add(rid)
-                    self.num_failed = len(failed)
-                    self.num_completed = len(completed)
-                    return
-
-            # Completed when token router removed it from active_requests.
-            for rid in request_ids:
-                if rid in completed or rid in failed:
-                    continue
-                if (
-                    rid not in token_router.active_requests
-                    and rid in self._router.pending_pd_requests
-                ):
-                    completed.add(rid)
-
+            running = still_running
             await asyncio.sleep(poll_interval_s)
 
         total_elapsed = time.time() - self.start_time
@@ -208,15 +225,14 @@ class PDTestRunner:
                 f"completed successfully"
             )
 
+        request_router: "PDRequestRouter" = get_request_router()
         token_router = get_token_router()
-        for rid, pd_req in self._router.pending_pd_requests.items():
+        for rid, req in self.req_pool.items():
             if not rid.startswith("pd_test_"):
                 continue
-            req = pd_req.original_request
             completed_flag = rid not in token_router.active_requests
-            status_text = "COMPLETED" if completed_flag else pd_req.status.value.upper()
             logger.warning(
-                f"[PD_TEST][result] rid={rid} status={status_text} "
+                f"[PD_TEST][result] rid={rid} "
                 f"input_len={req.prompt_len} max_new_tokens={req.max_new_tokens} "
                 f"output_tokens={req.num_output_tokens} "
                 f"cached_tokens={req.num_hit_tokens} "
@@ -228,9 +244,8 @@ class PDTestRunner:
         if get_global_args().infer.enable_prefix_caching and self._inject_system_prompt:
             num_cache_hit = sum(
                 1
-                for rid, pd_req in self._router.pending_pd_requests.items()
-                if rid.startswith("pd_test_")
-                and pd_req.original_request.num_hit_tokens > 0
+                for rid, req in self.req_pool.items()
+                if rid.startswith("pd_test_") and req.num_hit_tokens > 0
             )
             if num_cache_hit == 0:
                 logger.error(
@@ -251,8 +266,8 @@ class PDTestRunner:
         if token_router is not None:
             await token_router.begin_termination()
 
-        await self._router.terminate_instances()
-        drained = await self._router.wait_for_instances_terminated()
+        await request_router.terminate_instances()
+        drained = await request_router.wait_for_instances_terminated()
         if not drained:
             logger.error(
                 "[PD_TEST] graceful shutdown timed out — instances did not "
@@ -262,7 +277,7 @@ class PDTestRunner:
 
         if token_router is not None:
             await token_router.shutdown()
-        await self._router.shutdown()
+        await request_router.shutdown()
         stop_metrics_monitor()
 
         logger.info("[PD_TEST] exiting process")

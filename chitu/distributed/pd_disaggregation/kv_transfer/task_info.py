@@ -18,11 +18,16 @@ if TYPE_CHECKING:
     )
 
 
-class TransferStatus(IntEnum):
-    """Per-request transfer status."""
+@dataclass
+class TransferStatus:
+    """Record the transfer status in the Decode Main Rank"""
 
-    Waiting = 0
-    Success = 1
+    done: bool = False
+    first_token: int = 0
+    num_hit_tokens: int = 0
+
+    def __bool__(self):
+        return self.done
 
 
 @dataclass

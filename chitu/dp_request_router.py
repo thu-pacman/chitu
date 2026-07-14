@@ -37,6 +37,7 @@ from chitu.dp_router import (
     get_request_router,
     get_token_router,
     set_global_request_router,
+    remove_request_everywhere,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,9 @@ class RoutePolicy:
         pass
 
     def forget_request(self, request_id: str) -> None:
+        pass
+
+    def remove_request(self, request_id: str):
         pass
 
 
@@ -406,6 +410,10 @@ class PrefixCacheAwarePolicy(LoadBalancer):
                 "If this warning is frequent, router/instance cache states may drift."
             )
 
+    def remove_request(self, request_id: str):
+        self.req_to_request.pop(request_id, None)
+        self.req_to_scheduler.pop(request_id, None)
+
 
 class RequestRouter:
     """Main Request Router for two-level data parallel scheduling."""
@@ -444,6 +452,9 @@ class RequestRouter:
         self._shutdown = False
         self._drain_complete: dict[int, bool] = {i: False for i in range(self._n_insts)}
         self._tasks: list[asyncio.Task] = []
+
+        self.heartbeat_timeout: float = 60.0
+        self.stop_on_heartbeat_timeout: bool = os.environ.get("CI_TESTS") == "true"
 
         logger.info(f"RequestRouter initialized for {self._n_insts} instance(s)")
 
@@ -569,15 +580,24 @@ class RequestRouter:
                 logger.error(f"Error in stats collector: {e}")
                 await asyncio.sleep(0.1)
 
-    def finish_request_before_send(
-        self, req: UserRequest, finish_reason: str = "stopped"
+    def remove_request(self, request_id: str):
+        """[called by remove_request_everywhere] Finish request data in Request Router"""
+        self.policy.remove_request(request_id)
+
+    def finish_request_before_recv_stop(
+        self,
+        request: UserRequest,
+        finish_reason: Optional[str] = None,
+        error: Optional[str] = None,
     ):
-        """Finish request before sending to an instance."""
-        req.finish_reason = finish_reason
-        req.stop_stream()
+        """Finish request before receiving stop signal."""
+        if finish_reason is not None:
+            request.finish_reason = finish_reason
+        request.stop_stream(error=error)
         token_router = get_token_router()
         if token_router is not None:
-            token_router.active_requests.pop(req.request_id)
+            token_router.active_requests.pop(request.request_id, None)
+        remove_request_everywhere(request.request_id)
 
     async def _request_processor_task(self):
         """Process pending requests and route them to schedulers."""
@@ -594,7 +614,9 @@ class RequestRouter:
                         > self.policy.max_support_prompt_length
                     ):
                         # Prompt length exceeds the prefill kv cache capacity, stop request with finish_reason=length
-                        self.finish_request_before_send(request, finish_reason="length")
+                        self.finish_request_before_recv_stop(
+                            request, finish_reason="length"
+                        )
                         self.total_requests += 1
                         await asyncio.sleep(0.001)
                         continue
@@ -650,13 +672,15 @@ class RequestRouter:
                 logger.error(f"[REQUEST_ROUTER] Stack trace: {traceback.format_exc()}")
                 await asyncio.sleep(0.1)
 
-    async def _heartbeat_monitor_task(self, timeout: float = 20.0):
+    async def _heartbeat_monitor_task(self, timeout: Optional[float] = None):
         """Monitor scheduler heartbeat status"""
-        HEARTBEAT_TIMEOUT = timeout  # 20s timeout threshold
+        HEARTBEAT_TIMEOUT = timeout or self.heartbeat_timeout  # 20s timeout threshold
         while True:
             current_time = time.time()
+            dead = []
 
             # Check heartbeat status for all schedulers
+            num_instances = len(self.policy.scheduler_stats)
             for local_instance_id, stats in self.policy.scheduler_stats.items():
                 if current_time - stats.last_heartbeat_time > HEARTBEAT_TIMEOUT:
                     logger.warning(
@@ -664,7 +688,19 @@ class RequestRouter:
                         f"Last heartbeat: {current_time - stats.last_heartbeat_time:.2f}s ago"
                     )
                     # Mark as dead
-                    stats.is_alive = False
+                    if stats.is_alive:
+                        dead.append(local_instance_id)
+                        stats.is_alive = False
+                        if self.stop_on_heartbeat_timeout:
+                            raise RuntimeError(
+                                f"Instance {local_instance_id} heartbeat timeout, stopping Chitu Serve"
+                            )
+                        if len(dead) == num_instances:
+                            raise RuntimeError(
+                                f"All instances heartbeat timeout, stopping Chitu Serve"
+                            )
+            for instance_id in dead:
+                await self.handle_dead_instance(instance_id)
             await asyncio.sleep(5.0)  # Check every 5 seconds
 
     async def _health_monitor_task(self):
@@ -703,6 +739,15 @@ class RequestRouter:
 
             except Exception as e:
                 logger.error(f"Error in health monitor: {e}")
+
+    async def handle_dead_instance(self, dead_instance_id: int):
+        remove_requests = [
+            self.policy.req_to_request[rid]
+            for rid, iid in self.policy.req_to_scheduler.items()
+            if iid == dead_instance_id
+        ]
+        for request in remove_requests:
+            self.finish_request_before_recv_stop(request, error="chitu serve is down")
 
     async def submit_request(self, request: UserRequest):
         """Add request to processing queue."""

@@ -11,6 +11,7 @@ import logging
 import msgpack
 import time
 from typing import Any, Optional
+from typing_extensions import override
 import threading
 import queue
 import zmq
@@ -19,7 +20,8 @@ import os
 from chitu.distributed.coordinator import get_endpoint
 from chitu.global_vars import get_global_args
 from chitu.metrics.prometheus_collector import inc_completed_requests, observe_ttft
-from chitu.task import Task
+from chitu.task import Task, UserRequest
+from chitu.async_stream import AsyncDataStream
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +89,11 @@ class DPTokenSender:
         logger.info(f"[DPTokenSender] group={self.instance_id} connect={router_addr}")
         if self._send_queue is None:
             self._send_queue = queue.Queue()
+
+    def _remove_request(self, request_id: str):
+        self.request_token_cache.pop(request_id, None)
+        self._chars_len.pop(request_id, None)
+        self._first_token_sent.discard(request_id)
 
     def _start_sender_thread(self):
         # 避免重复启动多个发送线程（ZeroMQ socket 非线程安全）
@@ -158,9 +165,7 @@ class DPTokenSender:
         """Send request finish signal"""
         # Clean up caches for this request
         self.send_token(request_id, [])
-        self.request_token_cache.pop(request_id, None)
-        self._chars_len.pop(request_id, None)
-        self._first_token_sent.discard(request_id)
+        self._remove_request(request_id)
         data = dict(
             type="finish",
             request_id=request_id,
@@ -172,12 +177,24 @@ class DPTokenSender:
 
         self._send_data(data)
 
+    def send_evict(self, request_id: str, num_hit_tokens: int = 0):
+        """Send request evict signal"""
+        # Clean up caches for this request
+        self._remove_request(request_id)
+        data = dict(
+            type="evict",
+            request_id=request_id,
+            num_hit_tokens=num_hit_tokens,
+            instance_id=self.instance_id,
+            timestamp=time.time(),
+        )
+
+        self._send_data(data)
+
     def send_error(self, request_id: str, error_message: str):
         """Send error signal"""
         # Clean up caches for this request
-        self.request_token_cache.pop(request_id, None)
-        self._chars_len.pop(request_id, None)
-        self._first_token_sent.discard(request_id)
+        self._remove_request(request_id)
         data = dict(
             type="error",
             request_id=request_id,
@@ -218,71 +235,48 @@ class DPTokenSender:
         logger.info(f"DPTokenSender closed for group {self.instance_id}")
 
 
-class DPTaskWrapper:
-    """DP Task wrapper with integrated Token Sender capability"""
+class DPAsyncDataStream(AsyncDataStream):
+    """DP Async Data Stream with integrated Token Sender capability"""
 
-    def __init__(self, original_task: Task, token_sender: DPTokenSender):
-        self.original_task = original_task
-        self.token_sender = token_sender
-        self._finish_sent = False
+    @classmethod
+    def build(cls, enable_thinking: bool, task: Task, token_sender: DPTokenSender):
+        async_stream = cls(enable_thinking=enable_thinking)
+        async_stream.task = task
+        async_stream.token_sender = token_sender
+        return async_stream
 
-        # Hook update_response_sync for token sending
-        self._original_update_response_sync = original_task.update_response_sync
-        original_task.update_response_sync = self._dp_update_response_sync
-
-        # Hook update_decode_status for finish detection
-        self._original_update_decode_status = original_task.update_decode_status
-        original_task.update_decode_status = self._dp_update_decode_status
-
-    def _dp_update_response_sync(self, tokens: list[int]):
-        """Override update_response_sync to also send token to Router"""
-        self._original_update_response_sync(tokens)
-        # Enqueue in order to keep relative order with finish
-        self._send_token_to_router(tokens)
-
-    def _dp_update_decode_status(self, tokens: list[int]):
-        """Override update_decode_status to detect finish and send signal"""
-        result = self._original_update_decode_status(tokens)
-
-        # Check if task just finished and we haven't sent finish yet
-        if not self._finish_sent and self.original_task.need_remove():
-            request_id = self.original_task.req.request_id
-            finish_reason = self.original_task.req.finish_reason or "stop"
-            self.token_sender.send_finish(
-                request_id,
-                finish_reason,
-                self.original_task.req.num_hit_tokens,
+    @override
+    def add_data(
+        self,
+        value: Optional[int],
+        top_logprobs=None,
+        top_token_idx=None,
+        *,
+        notify_server: bool = True,
+    ):
+        if value is not None and not self.stop_signal:
+            request_id = self.task.req.request_id
+            self.token_sender.send_token(
+                request_id=request_id,
+                tokens=[value],
+                top_logprobs=top_logprobs,
+                top_token_idx=top_token_idx,
             )
-            self._finish_sent = True
-            self.original_task.pd_exec_end_logged = True
-            # Record completed request metric
-            inc_completed_requests("decode")
             logger.debug(
-                f"[PD_STAGE][decode.exec.end] req_id={request_id} finish_reason={finish_reason}"
+                f"[DPAsyncDataStream] Token sent successfully: {request_id} -> {value}"
             )
-            logger.debug(f"[DPTaskWrapper] Finish signal sent: {request_id}")
 
-        return result
-
-    def _send_token_to_router(self, tokens: list[int]):
-        """Synchronously enqueue current token to Router sending queue (lightweight, keep order)"""
-        request_id = self.original_task.req.request_id
-
-        self.token_sender.send_token(
-            request_id=request_id,
-            tokens=tokens,
-            top_logprobs=None,
-            top_token_idx=None,
-            task=self.original_task,
-        )
-
-        logger.debug(
-            f"[DPTaskWrapper] Token sent successfully: {request_id} -> {tokens}"
-        )
-
-    def __getattr__(self, name):
-        """Delegate other attributes to the original task"""
-        return getattr(self.original_task, name)
+    @override
+    def send_stop_signal(self, error: Optional[str] = None):
+        if not self.stop_signal:
+            self.stop_signal = True
+            if self.task.req.finish_reason != "evicted":
+                self.token_sender.send_finish(
+                    self.task.req.request_id,
+                    self.task.req.finish_reason,
+                    self.task.req.num_hit_tokens,
+                )
+            del self.task
 
 
 class DPTokenManager:
@@ -292,7 +286,6 @@ class DPTokenManager:
         self.instance_id = instance_id
         self.router_address = router_address
         self.token_sender = DPTokenSender(router_address, instance_id)
-        self.wrapped_tasks: dict[str, DPTaskWrapper] = {}
 
         logger.info(
             f"DPTokenManager created: group={instance_id}, router={router_address}"
@@ -303,25 +296,18 @@ class DPTokenManager:
         await self.token_sender.start()
         logger.debug(f"DP Token Manager started for group {self.instance_id}")
 
-    def wrap_task(self, task: Task) -> DPTaskWrapper:
+    def wrap_task(self, task: Task) -> Task:
         """Wrap Task to enable token sending"""
-        if task.req.request_id in self.wrapped_tasks:
-            return self.wrapped_tasks[task.req.request_id]
-
-        wrapped = DPTaskWrapper(task, self.token_sender)
-        self.wrapped_tasks[task.req.request_id] = wrapped
+        task.req.async_stream = DPAsyncDataStream.build(
+            task.req.enable_thinking, task=task, token_sender=self.token_sender
+        )
 
         logger.debug(f"Wrapped task {task.req.request_id} for DP token sending")
-        return wrapped
-
-    def unwrap_task(self, request_id: str):
-        """Unwrap Task"""
-        if request_id in self.wrapped_tasks:
-            del self.wrapped_tasks[request_id]
+        return task
 
     async def send_error_for_request(self, request_id: str, error_message: str):
         """Send error for a specific request"""
-        await self.token_sender.send_error(request_id, error_message)
+        self.token_sender.send_error(request_id, error_message)
 
     def close(self):
         """Close manager"""
