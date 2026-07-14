@@ -3375,9 +3375,13 @@ class TransformerDeepSeekV4(Transformer):
                 self.tp_size,
                 self.etp_size,
             )
+        state_dict = self.prefetch_state_dict(state_dict)
+        # FIXME: move mergine into preprocess_state_dict
         state_dict = self.process_state_dict_for_merging_gate_up(state_dict)
         state_dict = self.process_state_dict_for_merging_experts(state_dict)
-        return self.preprocess_state_dict(state_dict, skip_preprocess=True)
+        return self.preprocess_state_dict(
+            state_dict, skip_preprocess=True, prefetch=False
+        )
 
     def _normalize_hf_state_dict_keys(
         self, state_dict: dict[str, Any]

@@ -678,22 +678,50 @@ class Backend:
                         m._buffers[key] = m._buffers[key].contiguous()
 
     @staticmethod
-    def _create_empty_model(model: torch.nn.Module, skip_preprocess: bool):
+    def _create_empty_module(module: torch.nn.Module, skip_preprocess: bool):
         if skip_preprocess:
-            model.to_empty(device=torch.cuda.current_device())
-            for p in model.parameters():
-                # NPU format (FRACTAL_NZ / FRACTAL_ZN) cannot exist on
-                # meta or CPU tensors — convert_from on meta only
-                # produces a stub (ND format).  After to_empty we have
-                # real NPU memory, so re-run convert_from to apply the
-                # hardware format cast.
-                if NpuFractalNzTensor.check_tensor(p):
-                    p.data = NpuFractalNzTensor.convert_from(p.data).layout_tensor
-                elif NpuFractalZnTensor.check_tensor(p):
-                    p.data = NpuFractalZnTensor.convert_from(p.data).layout_tensor
+            # Build new Parameter objects on the current device (meta .data
+            # is not reassignable).  Zn/Nz need convert_from on real memory
+            # because their npu_format only exists on NPU tensors, not on
+            # meta/CPU; others reuse the layout shape/stride already set by
+            # init_native_layout.
+            device = torch.cuda.current_device()
+            for mod in module.modules():
+                for name, param in list(mod._parameters.items()):
+                    if param is None:
+                        continue
+
+                    if NpuFractalZnTensor.check_tensor(param):
+                        new_data = torch.empty(
+                            param.transpose(-1, -2).shape,
+                            dtype=param.dtype,
+                            device=device,
+                        )
+                        new_data = NpuFractalZnTensor.convert_from(
+                            new_data
+                        ).layout_tensor
+                    elif NpuFractalNzTensor.check_tensor(param):
+                        new_data = torch.empty(
+                            param.shape, dtype=param.dtype, device=device
+                        )
+                        new_data = NpuFractalNzTensor.convert_from(
+                            new_data
+                        ).layout_tensor
+                    else:
+                        new_data = torch.empty_strided(
+                            param.shape,
+                            param.stride(),
+                            dtype=param.dtype,
+                            device=device,
+                        )
+
+                    new_param = torch.nn.Parameter(new_data, requires_grad=False)
+                    if hasattr(param, "native_layout"):
+                        new_param.native_layout = param.native_layout
+                    mod._parameters[name] = new_param
         else:
             state_dict = {}
-            for name, param in model.named_parameters():
+            for name, param in module.named_parameters():
                 if isinstance(param, TensorWithNativeLayout):
                     t = param.native_layout
                     state_dict[name] = torch.empty(
@@ -701,7 +729,7 @@ class Backend:
                     )
                 else:
                     state_dict[name] = torch.empty(param.shape, dtype=param.dtype)
-            model.load_state_dict(state_dict, assign=True)
+            module.load_state_dict(state_dict, assign=True)
 
     @staticmethod
     def _build_and_setup_model(args, attn_backend):
@@ -717,12 +745,13 @@ class Backend:
         """
         Backend.args = args
 
+        start_time = time.monotonic()
         with torch.device("meta"):
             model = Backend._build_model_architecture(args, attn_backend)
             init_native_layout(model)
 
         if args.debug.skip_model_load:
-            Backend._create_empty_model(model, args.skip_preprocess)
+            Backend._create_empty_module(model, args.skip_preprocess)
         else:
             Backend._load_checkpoint(model, args)
 
@@ -742,6 +771,7 @@ class Backend:
 
         gc.collect()
         torch.cuda.empty_cache()
+        logger.info(f"Checkpoint loaded in {time.monotonic() - start_time:.2f}s")
 
     @staticmethod
     def _auto_register_moe_weight_accessor_if_available() -> None:
@@ -876,13 +906,6 @@ class Backend:
         return checkpoint
 
     @staticmethod
-    def _support_layerwise_loading():
-        if is_ascend():
-            return False
-        else:
-            return True
-
-    @staticmethod
     def _load_checkpoint(model, args):
         """
         Load model parameters from checkpoint files.
@@ -891,8 +914,6 @@ class Backend:
             model: The model to load parameters into
             args: Configuration with checkpoint settings
         """
-        start_time = time.time()
-
         if (
             args.models.type == ModelType.DEEPSEEK_V3
             and args.models.quant_config.type
@@ -947,11 +968,11 @@ class Backend:
                 ModelType.LLADA2,
                 ModelType.DEEPSEEK_V4,
             }:
-                if Backend._support_layerwise_loading():
+                if not args.disable_layerwise_load:
+                    if args.gpu_preprocess is True:
+                        Backend._create_empty_module(model, True)
+                        model.gpu_preprocess = True
                     checkpoint = Backend._load_hf_checkpoint_layerwise(model, args)
-                    logger.info(
-                        f"Checkpoint loaded in {time.time() - start_time:.2f} seconds"
-                    )
                     return
                 else:
                     checkpoint = Backend._load_hf_checkpoint(model, args)
@@ -976,8 +997,6 @@ class Backend:
                     and callable(experts.warm_up)
                 ):
                     experts.warm_up()
-
-        logger.info(f"Checkpoint loaded in {time.time() - start_time:.2f} seconds")
 
     @staticmethod
     def _remove_prefix(state_dict, prefix):
@@ -1262,8 +1281,10 @@ class Backend:
         except Exception as _e:
             logger.debug(f"Skip/failed running warmup for MoE schema: {_e}")
 
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        fragment = torch.cuda.memory_reserved() / 1024**3 - allocated
         logger.info(
-            f"Backend initialized with CUDA mem at {torch.cuda.memory_allocated()/1024**3:.2f} GB"
+            f"Backend initialized with cuda memory {allocated:.2f}GB allocated and {fragment:.2f}GB fragment"
         )
         logger.info(
             f"Using {len(c10d._pg_map)} communication groups. If this number is too high, there may be too much memory reserved for underlying communication libraries."

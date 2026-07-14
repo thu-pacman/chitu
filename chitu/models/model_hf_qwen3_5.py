@@ -1045,6 +1045,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
                     state_dict, self.rank % self.tp_size, self.tp_size
                 )
             else:
+                # FIXME: mergine makes prefetch invalid
                 state_dict = self._process_state_dict_for_merging_qkv_z_for_tp1(
                     state_dict
                 )
@@ -1059,7 +1060,7 @@ class TransformerHFQwen3_5(TransformerHFQwen3_5Base):
                     )
                     state_dict[new_k] = v
 
-            if self.mtp_size > 1 and not Backend._support_layerwise_loading():
+            if self.mtp_size > 1:
                 old_prefix_layer, new_prefix_layer, extra_prefix_dict = (
                     self._get_layer_mtp_prefix_mapping(self.global_n_layers - 1)
                 )

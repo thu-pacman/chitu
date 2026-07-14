@@ -69,6 +69,7 @@ from chitu.utils import (
     ceil_div,
     proportion_split,
     prefetch_state_dict,
+    fetch_state_dict_to_device,
 )
 from chitu.quantization import (
     QuantizationRegistry,
@@ -364,6 +365,7 @@ class Transformer(nn.Module):
 
         self.do_decode_callable = None
         self.args = get_global_args()
+        self.gpu_preprocess = False
         self.model_type = self.args.models.type
         self.use_cuda_graph = self.args.infer.use_cuda_graph
         self.specialize_embed_tokens_lm_head_parallel = (
@@ -508,6 +510,7 @@ class Transformer(nn.Module):
         skip_preprocess: bool = False,
         replace: bool = True,
     ) -> nn.Module:
+        module = self._get_module_by_prefix(prefix)
         state_dict = self.preprocess_state_dict_parallel(
             state_dict, skip_preprocess=skip_preprocess, replace=replace
         )
@@ -516,12 +519,11 @@ class Transformer(nn.Module):
             if key.startswith(prefix):
                 module_state_dict[key[len(prefix) :]] = value
         state_dict = module_state_dict
-        module = self._get_module_by_prefix(prefix)
         assert module is not None, f"Module {prefix} not found"
         module.load_state_dict(
             state_dict,
             strict=True,
-            assign=True,  # Replacing "meta" tensors in the model with tensors from the checkpoint
+            assign=not self.gpu_preprocess,
         )
         return module
 
@@ -1079,7 +1081,7 @@ class Transformer(nn.Module):
                 state_dict = self.process_state_dict_for_splitting_gate_up(state_dict)
 
                 # Repeat kv_head weights in case tp_size > n_kv_heads
-                # TODO: 与后面的chunk tp合并，消除可能的内存复制，否则prefetch会失效
+                # FIXME: 与后面的chunk tp合并，消除可能的内存复制，否则prefetch会失效
                 state_dict = self.process_state_dict_for_repeat_kv_head(state_dict)
 
             if self.tp_size > 1 or self.etp_size > 1:
@@ -1099,17 +1101,24 @@ class Transformer(nn.Module):
                     )
                 )
 
-        prefetch_state_dict(state_dict)
         return self.preprocess_state_dict(state_dict, skip_preprocess=skip_preprocess)
 
+    def prefetch_state_dict(self, state_dict: dict):
+        if self.gpu_preprocess:
+            fetch_state_dict_to_device(state_dict)
+        else:
+            prefetch_state_dict(state_dict)
+        return state_dict
+
     def preprocess_state_dict(
-        self, state_dict: dict[str, Any], *, skip_preprocess: bool = False
+        self,
+        state_dict: dict[str, Any],
+        *,
+        skip_preprocess: bool = False,
+        prefetch: bool = True,
     ) -> dict[str, Any]:
-        # TODO: Move `state_dict` to GPU and preprocess on GPU if there is no `CPUParameter`s
-        # Problems:
-        # - Processing on GPU laeds to sever memory fragmentation (13.44 GiB fragements in 94.93
-        #   GiB allocated memory). Disabling torch allocator with `PYTORCH_NO_CUDA_MEMORY_CACHING=1`
-        #   works but may lead to too much performance degradation.
+        if prefetch:
+            self.prefetch_state_dict(state_dict)
 
         if not skip_preprocess:
             state_dict = self.process_state_dict_for_merging_qkv(state_dict)
