@@ -255,9 +255,14 @@ class KVCacheBase:
         self.curr_tids: Optional[list[str]] = None  # current task ids in model run.
 
         prefill_chunk_size_global = get_global_args().infer.prefill_chunk_size
+        # prefill_chunk_size is the GLOBAL budget across all DP and CP ranks. The
+        # seq_len_delta buffers hold the per-step delta a single rank admits in
+        # prefill (global-across-CP for that DP rank), so the worst-case per-DP
+        # delta is global // dp_size (no pcp_size factor: pcp ranks each handle
+        # only their own local slice, sized by CP at split time).
         prefill_chunk_size_per_dp = (
             ceil_div(
-                prefill_chunk_size_global * get_global_args().infer.pcp_size,
+                prefill_chunk_size_global,
                 get_global_args().infer.dp_size,
             )
             if prefill_chunk_size_global is not None

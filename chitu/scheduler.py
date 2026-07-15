@@ -125,16 +125,16 @@ class Scheduler:
         max_reqs_per_dp = compute_local_batch_size_dist_in_dp(
             infer_args.max_batch_size, infer_args.dp_size
         )[dp_rank]
-        pcp_size = getattr(infer_args, "pcp_size", 1) or 1
         if infer_args.prefill_chunk_size is not None:
-            # In CP mode, each CP rank only processes 1/pcp_size of the global
-            # prefill tokens in a step, so the scheduler can afford pcp_size
-            # times more global tokens per step without increasing per-rank
-            # compute cost.
-            effective_chunk_size = infer_args.prefill_chunk_size * pcp_size
+            # infer.prefill_chunk_size is the GLOBAL (total) prefill chunk size across
+            # all DP and CP ranks. The scheduler for a given DP rank packs its share
+            # of the global budget: config // dp_size tokens per step. These tokens
+            # are then split across the pcp_size CP ranks, so each CP rank only
+            # processes 1/pcp_size of them (i.e. config // pcp_size per rank).
+            global_chunk_size = infer_args.prefill_chunk_size
             prefill_chunk_size_per_dp: Optional[int] = (
-                effective_chunk_size // infer_args.dp_size
-                + int(dp_rank < effective_chunk_size % infer_args.dp_size)
+                global_chunk_size // infer_args.dp_size
+                + int(dp_rank < global_chunk_size % infer_args.dp_size)
             )
         else:
             prefill_chunk_size_per_dp: Optional[int] = None

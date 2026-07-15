@@ -2253,8 +2253,14 @@ class ParallelMoeBlock(nn.Module):
                 and self.prefill_memory_tolerance < self.moe_impl.ep_size
                 and get_global_args().infer.prefill_chunk_size is not None
             ):
+                # prefill_chunk_size is the GLOBAL budget; routed_x is already the
+                # local (post-CP-split) token set, so bound the per-chunk memory by
+                # the per-rank chunk = global // pcp_size to keep the tolerance guard
+                # effective.
+                _pcs = get_global_args().infer.prefill_chunk_size
+                _per_rank_chunk = _pcs // max(get_global_args().infer.pcp_size, 1)
                 max_n_tokens_x_topk_per_chunk = int(
-                    get_global_args().infer.prefill_chunk_size
+                    _per_rank_chunk
                     * self.gate.topk
                     / self.moe_impl.ep_size
                     * self.prefill_memory_tolerance
