@@ -326,7 +326,10 @@ def resolve_default_args(args):
         )
 
     if args.infer.prefill_chunk_size == "auto":
-        args.infer.prefill_chunk_size = 4096 * args.infer.dp_size
+        # prefill_chunk_size is the GLOBAL budget across all DP and CP ranks.
+        # Aim for ~4096 tokens processed per rank, so scale by both dp_size
+        # and pcp_size.
+        args.infer.prefill_chunk_size = 4096 * args.infer.dp_size * args.infer.pcp_size
 
     if (
         args.infer.prefill_chunk_size is not None

@@ -14,6 +14,8 @@ from dataclasses import is_dataclass, fields
 from types import UnionType
 import importlib
 import importlib.resources
+import threading
+from collections import deque
 from types import UnionType
 from concurrent.futures import ThreadPoolExecutor
 
@@ -559,3 +561,44 @@ def prefetch_state_dict(state_dict: dict[str, torch.Tensor], max_workers: int = 
         max_workers=max_workers, thread_name_prefix="prefetch"
     )
     executor.map(_prefetch, state_dict)
+
+
+def fetch_state_dict_to_device(
+    state_dict: dict[str, torch.Tensor], max_workers: int = 16
+):
+    """
+    多线程将 state_dict non-blocking 搬运到 GPU，inplace 替换 CPU tensor 为
+    GPU tensor。不做 clone，缺页触发 + pageable→pinned→DMA 一步完成。
+    """
+    device = torch.cuda.current_device()
+    main_stream = torch.cuda.current_stream()
+    work = deque(state_dict.keys())
+    if not work:
+        return
+
+    events: list[torch.cuda.Event] = []
+    lock = threading.Lock()
+
+    def _worker():
+        while True:
+            try:
+                key = work.popleft()
+            except IndexError:
+                break
+            state_dict[key] = state_dict[key].to(device=device, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        with lock:
+            events.append(event)
+
+    n_workers = min(max_workers, len(work))
+    threads = [
+        threading.Thread(target=_worker, name="fetch_to_gpu") for _ in range(n_workers)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for event in events:
+        main_stream.wait_event(event)

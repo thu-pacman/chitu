@@ -83,6 +83,10 @@ def build_terminate_engine_message() -> dict:
     return {"type": TERMINATE_ENGINE_MESSAGE_TYPE}
 
 
+def is_profile_message(request_data: dict) -> bool:
+    return request_data.get("__chitu_msg_type") == "profile"
+
+
 class RoutePolicy:
     def __init__(self, config):
         self.config = config
@@ -825,6 +829,19 @@ class RequestRouter:
         logger.debug(
             f"Added request {request.request_id} to queue (queue size: {len(self.pending_requests)})"
         )
+
+    async def broadcast_profile(self, payload: dict) -> dict:
+        """Broadcast a profile command to all Workers (PD混部)."""
+        control_msg = {"__chitu_msg_type": "profile", "payload": payload}
+        data = msgpack.packb(control_msg)
+        sent, errors = [], []
+        for sid, socket in self.scheduler_sockets.items():
+            try:
+                await socket.send(data)
+                sent.append(sid)
+            except Exception as e:
+                errors.append(f"{sid}: {e}")
+        return {"sent_to": sent, "errors": errors}
 
     def record_generated_token(self, request_id: str, count: int = 1):
         """Record generated tokens and update total token count."""

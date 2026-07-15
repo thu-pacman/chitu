@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from chitu.distributed.pd_disaggregation.kv_transfer.transfer_buffers import (
+    TransferBufferKey,
     TransferBuffers,
 )
 from chitu.distributed.pd_disaggregation.kv_transfer.transfer_plan import (
@@ -32,7 +33,7 @@ def make_contiguous_tensor(shape, device="cpu", dtype=torch.float32):
 
 
 def _k(**kw):
-    """Shortcut for building the composite key string with defaults."""
+    """Shortcut for building the composite TransferBufferKey with defaults."""
     d = dict(
         cache_name="main",
         req_id="test",
@@ -44,11 +45,15 @@ def _k(**kw):
         replica_size=1,
     )
     d.update(kw)
-    # Key format used by TransferBuffers.add():
-    # {req_id}[{cache_name}]_L{layer_id}_B{block_id}_S{split_id}+{split_len}_R{replica_id}/{replica_size}
-    return (
-        f"{d['req_id']}[{d['cache_name']}]_L{d['layer_id']}_B{d['block_id']}"
-        f"_S{d['split_id']}+{d['split_len']}_R{d['replica_id']}/{d['replica_size']}"
+    return TransferBufferKey(
+        req_id=d["req_id"],
+        cache_name=d["cache_name"],
+        layer_id=d["layer_id"],
+        block_id=d["block_id"],
+        split_id=d["split_id"],
+        split_len=d["split_len"],
+        replica_id=d["replica_id"],
+        replica_size=d["replica_size"],
     )
 
 
@@ -72,13 +77,13 @@ def _add(bufs, data, **kw):
 
 
 # ---------------------------------------------------------------------------
-# key string format
+# TransferBufferKey
 # ---------------------------------------------------------------------------
 
 
 class TestKeyStr:
     def test_create(self):
-        s = _k(
+        k = _k(
             cache_name="main",
             req_id="req1",
             layer_id=3,
@@ -88,7 +93,18 @@ class TestKeyStr:
             replica_id=0,
             replica_size=2,
         )
-        assert s == "req1[main]_L3_B7_S0+2_R0/2"
+        assert k == TransferBufferKey(
+            req_id="req1",
+            cache_name="main",
+            layer_id=3,
+            block_id=7,
+            split_id=0,
+            split_len=2,
+            replica_id=0,
+            replica_size=2,
+        )
+        # match_prefix drops the replica placement fields.
+        assert k.match_prefix == ("req1", "main", 3, 7, 0, 2)
 
     def test_equality(self):
         a = _k(cache_name="k", req_id="r1")
@@ -272,9 +288,12 @@ class TestTransferPlan:
         """Split cache: different split_ids match separately."""
         recv = TransferBuffers()
         send = TransferBuffers()
-        # Use non-adjacent tensors so contiguous merge doesn't combine them.
-        d0 = make_contiguous_tensor((128,))
-        d1 = make_contiguous_tensor((128,))
+        # Slice one backing tensor with a gap so d0/d1 are guaranteed
+        # non-adjacent — otherwise the allocator may place two fresh tensors
+        # contiguously and _contiguous_address_merge legitimately combines them.
+        backing = make_contiguous_tensor((384,))
+        d0 = backing[0:128]
+        d1 = backing[256:384]
         # Two Prefill ranks send with different split_id
         _add(send, d0, split_id=0)
         _add(send, d1, split_id=1)

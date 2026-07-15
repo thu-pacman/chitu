@@ -37,6 +37,44 @@ class TransferBuffer(NamedTuple):
 
 
 # ---------------------------------------------------------------------------
+# TransferBufferKey
+# ---------------------------------------------------------------------------
+
+
+class TransferBufferKey(NamedTuple):
+    """The identifier for distinguishing different TransferBuffers.
+    The same TransferBufferKey corresponds to the same underlying KV cache tensor block.
+    Args:
+        req_id:        request identifier.
+        cache_name:    key in ``paged_kv_cache`` (e.g. ``"main.k"``).
+        layer_id:      **global** layer id.
+        block_id:      **logical** position in the block table.
+        split_id:      starting index in split-space.
+        split_len:     number of split units this region covers.
+        replica_id:    which replica group this belongs to.
+        replica_size:  total number of replica groups.
+    """
+
+    req_id: str
+    cache_name: str
+    layer_id: int
+    block_id: int
+    split_id: int
+    split_len: int
+    replica_id: int
+    replica_size: int
+
+    @property
+    def match_prefix(self) -> tuple:
+        """Identity for matching send/recv, ignoring replica placement.
+
+        Two buffers match iff they describe the same (req, cache, layer,
+        block, split) region — i.e. everything except the replica id/size.
+        """
+        return self[:6]
+
+
+# ---------------------------------------------------------------------------
 # TransferBuffers
 # ---------------------------------------------------------------------------
 
@@ -47,17 +85,20 @@ class TransferBuffers:
 
     Structure::
 
-        buffers: dict[key_str: str, list[TransferBuffer]]
+        buffers: dict[TransferBufferKey, list[TransferBuffer]]
 
-    Keys are composite strings
-    ``cache_name,req_id,layer_id,block_id,split_id,split_len,replica_id,replica_size``
-    so the whole structure is natively msgpack-serializable.
+    Keys are :class:`TransferBufferKey` NamedTuples.  Because msgpack has no
+    map-key type richer than str/int, the whole structure serializes as a
+    *list of ``[key, entries]`` pairs* (see :meth:`to_msgpackable`) rather
+    than a dict.
 
     Session ownership is tracked externally (e.g. ``TaskInfo.recv_buffers``
     is a ``dict[session_id, TransferBuffers]``).
     """
 
-    buffers: dict[str, list[TransferBuffer]] = field(default_factory=dict)
+    buffers: dict["TransferBufferKey", list[TransferBuffer]] = field(
+        default_factory=dict
+    )
 
     # ---- mutation ----------------------------------------------------------
 
@@ -89,9 +130,19 @@ class TransferBuffers:
             replica_id:    which replica group this belongs to.
             replica_size:  total number of replica groups.
         """
-        key_str = f"{req_id}[{cache_name}]_L{layer_id}_B{block_id}_S{split_id}+{split_len}_R{replica_id}/{replica_size}"
-        logger.debug(f"[PD_KV_TRANSFER] {key_str} ptr={ptr} len={length}")
-        self.buffers.setdefault(key_str, []).append(TransferBuffer(ptr, length))
+        key = TransferBufferKey(
+            req_id=req_id,
+            cache_name=cache_name,
+            layer_id=layer_id,
+            block_id=block_id,
+            split_id=split_id,
+            split_len=split_len,
+            replica_id=replica_id,
+            replica_size=replica_size,
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[PD_KV_TRANSFER] %s ptr=%s len=%s", key, ptr, length)
+        self.buffers.setdefault(key, []).append(TransferBuffer(ptr, length))
 
     # ---- query -------------------------------------------------------------
 
@@ -104,20 +155,25 @@ class TransferBuffers:
 
     # ---- serialization -----------------------------------------------------
 
-    def to_msgpackable(self) -> dict[str, list[list[int]]]:
-        """Return the internal buffers dict as-is for msgpack.
+    def to_msgpackable(self) -> list[list]:
+        """Serialize as a list of ``[key, entries]`` pairs.
 
-        ``TransferBuffer`` is a NamedTuple → tuple → msgpack array.
+        msgpack cannot use a tuple as a map key, so the dict is flattened to
+        a list of pairs.  ``TransferBufferKey`` and ``TransferBuffer`` are both
+        NamedTuples → serialized as msgpack arrays.
         """
-        return self.buffers
+        return [[list(key), entries] for key, entries in self.buffers.items()]
 
     @classmethod
-    def from_msgpackable(cls, data: dict[str, list[list[int]]]) -> "TransferBuffers":
+    def from_msgpackable(cls, data: list[list]) -> "TransferBuffers":
         """Reconstruct from msgpack round-tripped data.
 
-        Each leaf list ``[ptr, length]`` is converted back to ``TransferBuffer``.
+        Each pair is ``[key_fields, entries]``: ``key_fields`` becomes a
+        :class:`TransferBufferKey` and each ``[ptr, length]`` a
+        :class:`TransferBuffer`.
         """
         obj = cls()
-        for key_str, entries_raw in data.items():
-            obj.buffers[key_str] = [TransferBuffer(*e) for e in entries_raw]
+        for key_raw, entries_raw in data:
+            key = TransferBufferKey(*key_raw)
+            obj.buffers[key] = [TransferBuffer(*e) for e in entries_raw]
         return obj

@@ -2239,6 +2239,7 @@ class TransformerQwen3VLMoe(TransformerQwen3VLMoeBase):
     ) -> dict[str, Any]:
         if not skip_preprocess:
             state_dict = self._process_state_dict_for_adding_dot_weight(state_dict)
+            # FIXME: transpose may makes prefetch invalid
             state_dict = self._process_state_dict_for_transposing_moe_expert_weights(
                 state_dict
             )

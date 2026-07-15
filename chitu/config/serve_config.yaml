@@ -778,6 +778,15 @@ keep_dtype_in_checkpoint: False
 #: file system size. See `docs/en/DEVELOPMENT.md` for details.
 skip_preprocess: False
 
+#: Preprocess state dict using GPU to accelerate model load time, but use a bit more GPU memory
+#: during loading. Only takes effect when using layerwise loading.
+gpu_preprocess: True
+
+#: Disable layerwise checkpoint loading. When True, falls back to loading the
+#: full checkpoint at once instead of streaming layer-by-layer. Useful on
+#: platforms where layerwise loading causes memory fragmentation issues (e.g. Ascend NPU).
+disable_layerwise_load: False
+
 quant: null
 
 # The followings are legacy parameters. They are to be removed in the future.

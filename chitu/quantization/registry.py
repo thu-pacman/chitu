@@ -53,6 +53,7 @@ class QuantizationRegistry:
         "mixq",
         "w8a8_per_token_per_channel_dyn",
         "w4_g128_symm_a8_symm",
+        "blockint4",
         "hygon_w4a8",
         None,
     ]

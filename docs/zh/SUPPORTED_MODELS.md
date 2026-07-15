@@ -23,6 +23,7 @@
 | DeepSeek-V3.2-kv-fp8 | ✓ | `models=DeepSeek-V3.2-kv-fp8` | https://huggingface.co/deepseek-ai/DeepSeek-V3.2 |
 | DeepSeek-V4-Flash-Base | ✓ | `models=DeepSeek-V4-Flash-Base` | https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base |
 | DeepSeek-V4-Flash-FP8 | ✓ | `models=DeepSeek-V4-Flash-FP8` | https://huggingface.co/sgl-project/DeepSeek-V4-Flash-FP8 |
+| DeepSeek-V4-Pro | ✓ | `models=DeepSeek-V4-Pro` | https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro |
 | glm-4-32b |  | `models=GLM-4-32B-0414` | https://modelscope.cn/models/ZhipuAI/GLM-4-32B-0414 |
 | glm-4-9b |  | `models=GLM-4-9B-0414` | https://www.modelscope.cn/models/ZhipuAI/GLM-4-9B-0414 |
 | GLM-4.5 | ✓ | `models=GLM-4.5` | https://huggingface.co/zai-org/GLM-4.5 |

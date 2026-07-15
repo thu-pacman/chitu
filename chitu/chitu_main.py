@@ -65,7 +65,7 @@ from chitu.distributed.comm_group import SingletonGroupPlaceholder
 from chitu.distributed.coordinator import get_endpoint, set_endpoint
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
-from chitu.dp_request_router import is_terminate_engine_message
+from chitu.dp_request_router import is_terminate_engine_message, is_profile_message
 from chitu.kv_cache.utils import (
     plan_kv_cache_blocks_after_warmup,
     reduce_num_block_plan_across_ranks,
@@ -961,16 +961,15 @@ def _warmup_via_taskpool(args):
 
     # Prefill phase
     # In DP chunk prefill, each schedule processes approximately `prefill_chunk_size` tokens across the whole DP group.
-    # In PCP mode, the effective per-step budget is `prefill_chunk_size * pcp_size` because each CP
-    # rank only processes 1/pcp_size of the global tokens.
+    # infer.prefill_chunk_size is the GLOBAL (total) prefill chunk size across all DP and CP ranks,
+    # so the effective per-step budget for the whole system is just `prefill_chunk_size` itself.
     # Due to per-rank budget constraints and uneven task distribution, some tokens may be left unprocessed.
     # Example: DP2, chunk=16, max_batch_size=5 (创建 5 个 warmup 任务), 每任务 3 tokens
     #   - Budget: Rank0=8, Rank1=8 (chunk_size 均分给各 rank)
     #   - Tasks: Rank0 分到 3 个任务 (round robin), Rank1 分到 2 个任务
     #   - Actual: Rank0 处理 8 tokens (3+3+2, task4 剩 1 token), Rank1 处理 6 tokens (3+3)
     #   - Result: 需要 2 轮迭代来处理完所有 15 tokens
-    _cp_context = get_cp_context()
-    effective_prefill_chunk_size = prefill_chunk_size * _cp_context.pcp_size
+    effective_prefill_chunk_size = prefill_chunk_size
     total_tokens = warmup_seq_len * num_warmup_reqs
 
     # Calculate required iterations considering DP task distribution
@@ -1215,12 +1214,16 @@ def warmup_engine(args):
                 args.infer, "max_batch_size", 0
             )
         if _pcs and isinstance(_pcs, int) and _pcs > 0:
+            # DG_WARMUP_MAX_M bounds the per-rank token count (m) DeepGEMM must
+            # warm kernels for. prefill_chunk_size is the GLOBAL budget, so a
+            # single rank processes at most _pcs // pcp_size // dp_size tokens.
             _dp_size = max(getattr(args.infer, "dp_size", 1), 1)
-            _warmup_max_m = _pcs // _dp_size
+            _pcp_size = max(getattr(args.infer, "pcp_size", 1), 1)
+            _warmup_max_m = _pcs // _pcp_size // _dp_size
             os.environ["DG_WARMUP_MAX_M"] = str(_warmup_max_m)
             logger.info(
                 f"[warmup] Set DG_WARMUP_MAX_M={_warmup_max_m} "
-                f"(prefill_chunk_size={_pcs} / dp_size={_dp_size})"
+                f"(prefill_chunk_size={_pcs} / pcp_size={_pcp_size} / dp_size={_dp_size})"
             )
 
     #######################################################################################
@@ -1290,6 +1293,20 @@ def warmup_engine(args):
         )
 
     _emit_observed_op_impl_summary_after_warmup()
+
+    # warmup后的存活的变量为常驻变量，使用gc.freeze()冻结这些变量
+    # 防止后续gc.collect()时遍历这些常驻变量，降低gc.collect()耗
+    # 时，减少性能抖动
+    import gc
+
+    gc.collect()
+    gc.freeze()
+    frozen = gc.get_freeze_count() if hasattr(gc, "get_freeze_count") else -1
+    logger.info(
+        f"[rank {torch.distributed.get_rank()}] gc.freeze() after warmup: "
+        f"{frozen if frozen >= 0 else '(count unavailable)'} objects moved to the "
+        "permanent generation; subsequent collections skip them",
+    )
 
 
 def chitu_init(args):
@@ -1875,6 +1892,12 @@ async def process_scheduler_request(rank: int, request_data: dict):
         if is_terminate_engine_message(request_data):
             Backend.state = BackendState.Terminating
             logger.info("Terminate_engine received. Draining in-flight requests")
+            return
+
+        if is_profile_message(request_data):
+            from chitu.serve.common import enqueue_profile_payload
+
+            enqueue_profile_payload(request_data["payload"])
             return
 
         # Create UserRequest

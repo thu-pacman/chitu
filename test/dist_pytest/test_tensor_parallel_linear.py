@@ -1,9 +1,11 @@
+from omegaconf import OmegaConf
 import os
 import pytest
 import torch
 
 from chitu.distributed.comm_group import CommGroup
 from chitu.distributed.infiniband import auto_set_ib_envs
+from chitu.global_vars import set_global_args
 from chitu.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from chitu.quantization.normal import NormalLinear
 from chitu.testing import assert_close
@@ -17,6 +19,12 @@ from chitu.testing import assert_close
 def test_column_parallel_linear(
     tp_group_size, batch_size, in_features, out_features, has_bias, record_benchmark
 ):
+    set_global_args(
+        OmegaConf.create({"infer": {"process_group_timeout_seconds": None}}),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+
     if not torch.distributed.is_initialized():
         auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
@@ -90,6 +98,12 @@ def test_column_parallel_linear(
 def test_row_parallel_linear(
     tp_group_size, batch_size, in_features, out_features, has_bias, record_benchmark
 ):
+    set_global_args(
+        OmegaConf.create({"infer": {"process_group_timeout_seconds": None}}),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+
     if not torch.distributed.is_initialized():
         auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")

@@ -26,7 +26,13 @@ from chitu.quantization.normal import (
 from chitu.quantization.llmint8 import LLMInt8Linear
 from chitu.quantization.autoawq import AutoAWQLinear
 from chitu.quantization.gptqmodel import GPTQLinear
-from chitu.quantization.blockint4 import BlockInt4MoeExpertsUnmerged
+from chitu.quantization.blockint4 import (
+    TritonBlockInt4MoeExpertsUnmerged,
+    TritonBlockInt4MoeExpertsMerged,
+    MarlinBlockInt4MoeExpertsUnmerged,
+    MarlinBlockInt4MoeExpertsMerged,
+    AiterBlockInt4MoeExpertsMerged,
+)
 from chitu.quantization.w8a8_per_token_per_channel_dyn import (
     W8A8PerTokenPerChannelDynLinear,
     AscendW8A8PerTokenPerChannelDynLinear,

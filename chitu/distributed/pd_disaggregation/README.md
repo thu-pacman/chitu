@@ -195,7 +195,7 @@ kv_transfer/
 ├── endpoint.py              # KVManagerEndpoint: ZMQ master/slave/remote 三模式
 ├── protocol.py              # 4 种协议消息 dataclass + ProtocolSerializer (msgpack)
 ├── transfer_buffers.py      # TransferBuffer + TransferBuffers
-├── transfer_plan.py         # TransferPair + TransferMatcher + TransferPlan + create_transfer_plan
+├── transfer_plan.py         # TransferPlan + create_transfer_plan
 ├── cache_info.py            # CacheDistribution / CacheDistributions: per-cache distribution 与 chunk 计算
 ├── task_info.py             # TaskInfo: per-request 状态聚合
 └── mooncake/
@@ -250,10 +250,12 @@ class DisaggregationMode(Enum):
 
 ### 传输匹配与规划（`transfer_plan.py`）
 
-**Key 格式**：`{req_id}[{cache_name}]_L{layer_id}_B{block_id}_S{split_id}+{split_len}_R{replica_id}/{replica_size}`
+**Key 类型**：`TransferBufferKey` NamedTuple —
+`(req_id, cache_name, layer_id, block_id, split_id, split_len, replica_id, replica_size)`。
+序列化时以 `[key_fields, entries]` 二元组列表进入 msgpack（tuple 不能作 map key），反序列化恢复为 NamedTuple。
 
 **`create_transfer_plan` 流程**：
-1. 从 send key 中剥离 `_R...` 后缀得到 match_prefix
+1. 取 send key 去掉 `replica_id` / `replica_size` 的前 6 个字段
 2. 构建 `TransferMatcher` per prefix
 3. 按 `replica_ratio = send_replica_size // recv_replica_size` 过滤：仅 `send_replica_id == recv_replica_id * replica_ratio` 时匹配
 4. 双向长度一致性断言

@@ -86,7 +86,11 @@ from chitu.distributed.parallel_state import (
     get_dp_size,
 )
 from chitu.distributed.partition import compute_expert_dist_in_ep
-from chitu.utils import ceil_div, parse_dtype, try_import_and_setup_torch_npu
+from chitu.utils import (
+    ceil_div,
+    parse_dtype,
+    try_import_and_setup_torch_npu,
+)
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -2458,8 +2462,14 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def preprocess_state_dict(
-        self, state_dict: dict[str, Any], *, skip_preprocess: bool = False
+        self,
+        state_dict: dict[str, Any],
+        *,
+        skip_preprocess: bool = False,
+        prefetch: bool = True,
     ) -> dict[str, Any] | None:
+        if prefetch:
+            self.prefetch_state_dict(state_dict)
         if not skip_preprocess:
             if self.mla_absorb == "absorb":
                 state_dict = self._process_state_dict_for_absorption(state_dict)
@@ -2470,7 +2480,7 @@ class TransformerDeepSeekV3(Transformer):
                     )
                 )
         return super().preprocess_state_dict(
-            state_dict, skip_preprocess=skip_preprocess
+            state_dict, skip_preprocess=skip_preprocess, prefetch=False
         )
 
     @override

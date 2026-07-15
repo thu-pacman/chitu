@@ -970,3 +970,18 @@ file can be loaded via setting this field to True. This is useful if the running
 file system size. See `docs/en/DEVELOPMENT.md` for details.
 
 *Default: `False`.*
+
+## Argument `gpu_preprocess`
+
+Preprocess state dict using GPU to accelerate model load time, but use a bit more GPU memory
+during loading. Only takes effect when using layerwise loading.
+
+*Default: `True`.*
+
+## Argument `disable_layerwise_load`
+
+Disable layerwise checkpoint loading. When True, falls back to loading the
+full checkpoint at once instead of streaming layer-by-layer. Useful on
+platforms where layerwise loading causes memory fragmentation issues (e.g. Ascend NPU).
+
+*Default: `False`.*
