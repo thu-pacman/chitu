@@ -4,19 +4,26 @@
 
 from typing import Optional
 from typing_extensions import override
-import logging
-import plum
+import functools
 
 import torch
 import torch.nn as nn
 
+from chitu.lazy import eval_lazy
 from chitu.quantization.registry import QuantizationRegistry
-from chitu.quantization.base import QuantizedMoeExpertsUnmerged
+from chitu.quantization.base import (
+    QuantizedMoeExpertsMerged,
+    QuantizedMoeExpertsUnmerged,
+)
 from chitu.moe.batched_routed_activation import (
+    BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
     ExpertBlockIndexedBatchedRoutedActivation,
 )
-from chitu.moe.batched_expert_result import PerTokenBatchedExpertResult
+from chitu.moe.batched_expert_result import (
+    BatchedExpertResult,
+    PerTokenBatchedExpertResult,
+)
 from chitu.utils import try_import_platform_dep
 from chitu.native_layout import (
     NativeLayoutMixin,
@@ -25,16 +32,13 @@ from chitu.native_layout import (
     BlockInt4MarlinScale,
 )
 from chitu.quantization.gptqmodel import marlin_make_empty_g_idx
-from chitu.device_type import is_hygon
-
-logger = logging.getLogger(__name__)
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
 has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
-
-# aiter (AMD ROCm backend)
+has_marlin_moe = has_chitu_backend and hasattr(chitu_backend, "moe_wna16_marlin_gemm")
 aiter, has_aiter = try_import_platform_dep("aiter")
+
 if has_aiter:
     from aiter.moe import aiter_moe, get_aiter_moe_config, MoeQuantType, MoeSolutionType
     from aiter.ops.shuffle import w4a16_marlin_weight_1, w4a16_marlin_weight_2
@@ -42,20 +46,15 @@ if has_triton:
     from chitu.moe.experts.triton_batched_experts import (
         invoke_fused_moe_wna16_triton_kernel,
     )
-# ScalarTypeId for ScalarType::uint4b8
+
+# ScalarTypeId for ScalarType::uint4b8.
 # Computed from scalar_type.hpp: ScalarType(exponent=0, mantissa=4, signed_=false, bias=8)
 # with NAN_IEEE_754=1, packed as: exponent(8b)|mantissa(8b)|signed_(1b)|bias(32b)|finite(1b)|nan_repr(8b)
 UINT4B8_TYPE_ID = 1125899907892224
 
 
-@QuantizationRegistry.register_moe_experts(
-    "blockint4", merge_gate_up=False, when=lambda _: has_chitu_backend or has_aiter
-)
-class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged):
-    """
-    Marlin INT4 quantized MoE experts with unmerged gate and up projection.
-    Supports compressed-tensors pack-quantized format (4-bit symmetric, group quantization).
-    """
+class BlockInt4MoeExpertsUnmergedBase(NativeLayoutMixin, QuantizedMoeExpertsUnmerged):
+    """blockint4 MoE experts with separated gate and up projections."""
 
     def __init__(
         self,
@@ -81,18 +80,10 @@ class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged
             n_activated_experts,
             checkpoint_prefix,
         )
-
         self.quant_group_size = group_size
 
-        # Checkpoint layout: (num_experts, out_features, packed_in_features)
-        # gate/up: out=moe_inter_dim, in=dim
         self.gate_proj_qweight = nn.Parameter(
-            torch.empty(
-                self.group_size,
-                moe_inter_dim,
-                dim,
-            ),
-            requires_grad=False,
+            torch.empty(self.group_size, moe_inter_dim, dim), requires_grad=False
         )
         self.gate_proj_scales = nn.Parameter(
             torch.empty(
@@ -104,12 +95,7 @@ class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged
             requires_grad=False,
         )
         self.up_proj_qweight = nn.Parameter(
-            torch.empty(
-                self.group_size,
-                moe_inter_dim,
-                dim,
-            ),
-            requires_grad=False,
+            torch.empty(self.group_size, moe_inter_dim, dim), requires_grad=False
         )
         self.up_proj_scales = nn.Parameter(
             torch.empty(
@@ -120,14 +106,8 @@ class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged
             ),
             requires_grad=False,
         )
-        # down: out=dim, in=moe_inter_dim
         self.down_proj_qweight = nn.Parameter(
-            torch.empty(
-                self.group_size,
-                dim,
-                moe_inter_dim,
-            ),
-            requires_grad=False,
+            torch.empty(self.group_size, dim, moe_inter_dim), requires_grad=False
         )
         self.down_proj_scales = nn.Parameter(
             torch.empty(
@@ -139,8 +119,7 @@ class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged
             requires_grad=False,
         )
 
-        self._aiter_repacked = False
-
+    @override
     def init_native_layout(self):
         super().init_native_layout()
         self.apply_native_layout(
@@ -158,19 +137,303 @@ class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged
             Packed4BitWeightAlongKContigInt32,
             state_dict_convert=False,
         )
-        if has_marlin:
-            self.apply_native_layout(self.gate_proj_qweight, BlockInt4MarlinQWeight)
-            self.apply_native_layout(self.gate_proj_scales, BlockInt4MarlinScale)
-            self.apply_native_layout(self.up_proj_qweight, BlockInt4MarlinQWeight)
-            self.apply_native_layout(self.up_proj_scales, BlockInt4MarlinScale)
-            self.apply_native_layout(self.down_proj_qweight, BlockInt4MarlinQWeight)
-            self.apply_native_layout(self.down_proj_scales, BlockInt4MarlinScale)
+
+
+class BlockInt4MoeExpertsMergedBase(NativeLayoutMixin, QuantizedMoeExpertsMerged):
+    """blockint4 MoE experts with merged gate and up projection."""
+
+    def __init__(
+        self,
+        ############################################
+        # Common parameters for all quantizations
+        dim: int,
+        moe_inter_dim: int,
+        global_n_experts: int,
+        experts_start_idx: int,
+        experts_end_idx: int,
+        n_activated_experts: int,
+        checkpoint_prefix: str,
+        ############################################
+        # Parameters specific to this quantization
+        group_size: int = 128,
+    ):
+        super().__init__(
+            dim,
+            moe_inter_dim,
+            global_n_experts,
+            experts_start_idx,
+            experts_end_idx,
+            n_activated_experts,
+            checkpoint_prefix,
+        )
+        self.quant_group_size = group_size
+
+        self.gate_up_proj_qweight = nn.Parameter(
+            torch.empty(self.group_size, 2 * moe_inter_dim, dim), requires_grad=False
+        )
+        self.gate_up_proj_scales = nn.Parameter(
+            torch.empty(
+                self.group_size,
+                2 * moe_inter_dim,
+                dim // group_size,
+                dtype=torch.bfloat16,
+            ),
+            requires_grad=False,
+        )
+        self.down_proj_qweight = nn.Parameter(
+            torch.empty(self.group_size, dim, moe_inter_dim), requires_grad=False
+        )
+        self.down_proj_scales = nn.Parameter(
+            torch.empty(
+                self.group_size,
+                dim,
+                moe_inter_dim // group_size,
+                dtype=torch.bfloat16,
+            ),
+            requires_grad=False,
+        )
+
+    @override
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(
+            self.gate_up_proj_qweight,
+            Packed4BitWeightAlongKContigInt32,
+            state_dict_convert=False,
+        )
+        self.apply_native_layout(
+            self.down_proj_qweight,
+            Packed4BitWeightAlongKContigInt32,
+            state_dict_convert=False,
+        )
+
+
+class BlockInt4ExpertBlockDispatchMixin:
+    """Shared conversion from indexed routing to expert-block indexed routing."""
+
+    moe_block_size = 64
+
+    @override
+    @functools.singledispatchmethod
+    def forward_no_sum(
+        self, routed_x: BatchedRoutedActivation, impl="auto"
+    ) -> BatchedExpertResult:
+        return super().forward_no_sum(routed_x, impl=impl)
+
+    @forward_no_sum.register
+    def _(
+        self, routed_x: IndexedBatchedRoutedActivation, impl="auto"
+    ) -> PerTokenBatchedExpertResult:
+        routed_x = routed_x.as_local_expert_ids(
+            self.experts_start_idx, self.experts_end_idx
+        )
+        block_routed = ExpertBlockIndexedBatchedRoutedActivation.convert_from(
+            routed_x,
+            n_experts=self.group_size,
+            block_size=self.moe_block_size,
+        )
+        return self.forward_no_sum(block_routed, impl=impl)
+
+    @forward_no_sum.register
+    def _(
+        self, routed_x: ExpertBlockIndexedBatchedRoutedActivation, impl="auto"
+    ) -> PerTokenBatchedExpertResult:
+        routed_x = routed_x.as_local_expert_ids(
+            self.experts_start_idx, self.experts_end_idx
+        )
+        return self._forward_expert_block_indexed(routed_x)
+
+    def _forward_expert_block_indexed(
+        self, routed_x: ExpertBlockIndexedBatchedRoutedActivation
+    ) -> PerTokenBatchedExpertResult:
+        raise NotImplementedError
+
+
+class BlockInt4TritonMixin(BlockInt4ExpertBlockDispatchMixin):
+    """Triton blockint4 MoE consumes the int32-packed checkpoint layout directly."""
+
+    def _invoke_triton(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        B_scale: torch.Tensor,
+        routed_x: ExpertBlockIndexedBatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+        top_k: int,
+        config: dict,
+    ):
+        A = eval_lazy(A)
+        invoke_fused_moe_wna16_triton_kernel(
+            A=A,
+            B=B,
+            C=C,
+            B_scale=B_scale,
+            B_zp=None,
+            topk_weights=topk_weights,
+            sorted_token_ids=routed_x.block_to_token_x_topk_indices.flatten()
+            .contiguous()
+            .to(torch.int64),
+            expert_ids=routed_x.block_to_expert_indices.contiguous().to(torch.int64),
+            num_tokens_post_padded=routed_x.n_blocks_scalar_tensor
+            * self.moe_block_size,
+            mul_routed_weight=False,
+            top_k=top_k,
+            config=config,
+            use_int4_w4a16=True,
+            use_int8_w8a16=False,
+            group_size=self.quant_group_size,
+        )
+
+
+@QuantizationRegistry.register_moe_experts(
+    "blockint4", merge_gate_up=False, when=lambda _: has_triton, priority=0
+)
+class TritonBlockInt4MoeExpertsUnmerged(
+    BlockInt4TritonMixin, BlockInt4MoeExpertsUnmergedBase
+):
+    @override
+    def _forward_expert_block_indexed(
+        self, routed_x: ExpertBlockIndexedBatchedRoutedActivation
+    ) -> PerTokenBatchedExpertResult:
+        M = routed_x.activation.shape[0]
+        topk = routed_x.topk
+        device = routed_x.activation.device
+        if M == 0:
+            return PerTokenBatchedExpertResult(
+                torch.zeros(
+                    M,
+                    topk,
+                    self.dim,
+                    device=device,
+                    dtype=routed_x.activation.dtype,
+                )
+            )
+
+        activation = routed_x.activation
+        topk_weights = torch.empty(M, topk, dtype=torch.float32, device=device)
+        config = {
+            "BLOCK_SIZE_M": self.moe_block_size,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+        }
+
+        gate_out = torch.zeros(
+            M, topk, self.moe_inter_dim, dtype=activation.dtype, device=device
+        )
+        self._invoke_triton(
+            activation,
+            self.gate_proj_qweight,
+            gate_out,
+            self.gate_proj_scales,
+            routed_x,
+            topk_weights,
+            topk,
+            config,
+        )
+        up_out = torch.zeros(
+            M, topk, self.moe_inter_dim, dtype=activation.dtype, device=device
+        )
+        self._invoke_triton(
+            activation,
+            self.up_proj_qweight,
+            up_out,
+            self.up_proj_scales,
+            routed_x,
+            topk_weights,
+            topk,
+            config,
+        )
+        intermediate = torch.nn.functional.silu(gate_out) * up_out
+        del gate_out, up_out
+
+        down_out = torch.zeros(M, topk, self.dim, dtype=activation.dtype, device=device)
+        self._invoke_triton(
+            intermediate.view(M * topk, self.moe_inter_dim),
+            self.down_proj_qweight,
+            down_out,
+            self.down_proj_scales,
+            routed_x,
+            topk_weights,
+            1,
+            config,
+        )
+        del intermediate
+        return PerTokenBatchedExpertResult(down_out)
+
+
+@QuantizationRegistry.register_moe_experts(
+    "blockint4", merge_gate_up=True, when=lambda _: has_triton, priority=0
+)
+class TritonBlockInt4MoeExpertsMerged(
+    BlockInt4TritonMixin, BlockInt4MoeExpertsMergedBase
+):
+    @override
+    def _forward_expert_block_indexed(
+        self, routed_x: ExpertBlockIndexedBatchedRoutedActivation
+    ) -> PerTokenBatchedExpertResult:
+        M = routed_x.activation.shape[0]
+        topk = routed_x.topk
+        device = routed_x.activation.device
+        if M == 0:
+            return PerTokenBatchedExpertResult(
+                torch.zeros(
+                    M,
+                    topk,
+                    self.dim,
+                    device=device,
+                    dtype=routed_x.activation.dtype,
+                )
+            )
+
+        activation = routed_x.activation
+        topk_weights = torch.empty(M, topk, dtype=torch.float32, device=device)
+        config = {
+            "BLOCK_SIZE_M": self.moe_block_size,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+        }
+
+        gate_up_out = torch.zeros(
+            M, topk, 2 * self.moe_inter_dim, dtype=activation.dtype, device=device
+        )
+        self._invoke_triton(
+            activation,
+            self.gate_up_proj_qweight,
+            gate_up_out,
+            self.gate_up_proj_scales,
+            routed_x,
+            topk_weights,
+            topk,
+            config,
+        )
+        intermediate = self.forward_act_fn_merged(gate_up_out)
+        del gate_up_out
+
+        down_out = torch.zeros(M, topk, self.dim, dtype=activation.dtype, device=device)
+        self._invoke_triton(
+            intermediate.view(M * topk, self.moe_inter_dim),
+            self.down_proj_qweight,
+            down_out,
+            self.down_proj_scales,
+            routed_x,
+            topk_weights,
+            1,
+            config,
+        )
+        del intermediate
+        return PerTokenBatchedExpertResult(down_out)
+
+
+class BlockInt4MarlinMixin(BlockInt4ExpertBlockDispatchMixin):
+    """Marlin blockint4 MoE stores qweights and scales in Marlin runtime layout."""
 
     def _ensure_marlin_workspace(self):
-        """Allocate Marlin workspace and sentinel tensors lazily."""
         if not hasattr(self, "workspace"):
-            device = self.gate_proj_qweight.device
-            non_moe_ws_size = max(self.dim, self.moe_inter_dim) // 64 * 16
+            device = self.down_proj_qweight.device
+            non_moe_ws_size = max(self.dim, self.moe_inter_dim * 2) // 64 * 16
             sms = torch.cuda.get_device_properties(device).multi_processor_count
             moe_ws_size = sms * 4
             ws_size = max(non_moe_ws_size, moe_ws_size)
@@ -181,175 +444,6 @@ class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged
             self._g_idx_sort_indices = marlin_make_empty_g_idx(device)
             self._zp = marlin_make_empty_g_idx(device)
 
-    def _repack_to_aiter(self):
-        """Convert weights from chitu int32 pack8 to aiter uint8 pack2.
-
-        Stores a cached unshuffled copy; Marlin shuffle is applied lazily
-        in ``_forward_aiter`` once the actual backend is known.
-
-        Cached tensors:
-          _w1:       ``[E, 2*inter, K//2]`` uint8 (gate+up concatenated)
-          _w1_scale: ``[E, 2*inter, K/G]`` bf16
-          _w2:       ``[E, dim, inter//2]`` uint8
-          _w2_scale: ``[E, dim, inter/G]`` bf16
-        """
-        gate_q = self.gate_proj_qweight.data.view(torch.uint8)
-        up_q = self.up_proj_qweight.data.view(torch.uint8)
-        self._w1 = torch.cat([gate_q, up_q], dim=1).contiguous()
-        self._w1_scale = torch.cat(
-            [self.gate_proj_scales.data, self.up_proj_scales.data], dim=1
-        ).contiguous()
-        self._w2 = self.down_proj_qweight.data.view(torch.uint8).contiguous()
-        self._w2_scale = self.down_proj_scales.data.contiguous()
-
-        # Dummy zero-points for symmetric quant — the Marlin kernel
-        # requires ``b_zeros`` to be a non-None tensor even when all
-        # values are the midpoint (8).  Shape: ``[E, N//2, K/G]`` uint8.
-        E = self.gate_proj_qweight.shape[0]
-        n_groups_k = self.dim // self.quant_group_size
-        n_groups_inter = self.moe_inter_dim // self.quant_group_size
-        self._w1_zp_dummy = torch.full(
-            (E, self.moe_inter_dim, n_groups_k),
-            0x88,
-            dtype=torch.uint8,
-            device=self.gate_proj_qweight.device,
-        ).contiguous()
-        self._w2_zp_dummy = torch.full(
-            (E, self.dim // 2, n_groups_inter),
-            0x88,
-            dtype=torch.uint8,
-            device=self.gate_proj_qweight.device,
-        ).contiguous()
-
-        self._aiter_config_valid = False
-        self._aiter_repacked = True
-
-    def _forward_aiter(
-        self, routed_x: IndexedBatchedRoutedActivation
-    ) -> PerTokenBatchedExpertResult:
-        """MoE forward using ``aiter.moe.aiter_moe`` (AMD ROCm).
-
-        Delegates to ``get_aiter_moe_config`` + ``aiter_moe``, which
-        select the best available backend (mo_c / asm / triton).  The
-        output shape is adjusted back to ``[M, topk, dim]`` because the
-        downstream caller always applies ``weighted_sum``.
-        """
-        if not self._aiter_repacked:
-            self._repack_to_aiter()
-
-        routed_x = routed_x.as_local_expert_ids(
-            self.experts_start_idx, self.experts_end_idx
-        )
-
-        M = routed_x.activation.shape[0]
-        topk = routed_x.token_to_expert_indices.shape[1]
-        n_local_experts = self.experts_end_idx - self.experts_start_idx
-        device = routed_x.activation.device
-
-        if M == 0:
-            y = torch.zeros(
-                M,
-                topk,
-                self.dim,
-                device=device,
-                dtype=routed_x.activation.dtype,
-            )
-            return PerTokenBatchedExpertResult(y)
-
-        # Fetch (or validate) aiter config
-        if not self._aiter_config_valid:
-            status, moe_cfg = get_aiter_moe_config(
-                M=M,
-                E=n_local_experts,
-                N1=2 * self.moe_inter_dim,
-                N2=self.dim,
-                K=self.dim,
-                top_k=topk,
-                block_size=self.quant_group_size,
-                dtype=routed_x.activation.dtype,
-                quant_type=MoeQuantType.W4A16,
-            )
-            if not status:
-                logger.warning(
-                    "aiter config not found for M=%d E=%d N1=%d N2=%d K=%d, "
-                    "falling back to triton",
-                    M,
-                    n_local_experts,
-                    2 * self.moe_inter_dim,
-                    self.dim,
-                    self.dim,
-                )
-                return self._forward_triton(routed_x)
-            self._moe_config = moe_cfg
-            self._aiter_config_valid = True
-
-        # Apply Marlin shuffle when the backend requires it (moe_c);
-        # asm / triton use the unshuffled uint8 pack2 format.
-        if self._moe_config.solution_type == MoeSolutionType.MOE_C:
-            w1 = w4a16_marlin_weight_1(self._w1)
-            w1 = w1.view(-1).view(torch.uint8).view(*self._w1.shape)
-            w2 = w4a16_marlin_weight_2(self._w2)
-            w2 = w2.view(-1).view(torch.uint8).view(*self._w2.shape)
-            zp1 = self._w1_zp_dummy
-            zp2 = self._w2_zp_dummy
-        elif self._moe_config.solution_type == MoeSolutionType.ASM:
-            # ASM kernel also requires non-None ZP tensors (packed along K
-            # dim).  Symmetric quant → all nibbles = 8 (midpoint).
-            w1, w2 = self._w1, self._w2
-            zp1 = self._w1_zp_dummy
-            zp2 = self._w2_zp_dummy
-        else:
-            w1 = self._w1
-            w2 = self._w2
-            zp1 = None
-            zp2 = None
-
-        # Prepare inputs for aiter_moe
-        topk_weights = torch.ones(
-            M,
-            topk,
-            device=device,
-            dtype=torch.float32,
-        )
-        topk_ids = routed_x.token_to_expert_indices.contiguous()
-
-        a = routed_x.activation
-        if a.dtype != self.gate_proj_scales.dtype:
-            a = a.to(self.gate_proj_scales.dtype)
-
-        out = aiter_moe(
-            a,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            self._moe_config,
-            inplace=False,
-            activation="silu",
-            w1_scale=self._w1_scale,
-            w2_scale=self._w2_scale,
-            w1_zp=zp1,
-            w2_zp=zp2,
-            a1_scale=None,
-            a2_scale=None,
-            block_shape=[0, self.quant_group_size],
-            global_num_experts=n_local_experts,
-            expert_map=None,
-            routed_scaling_factor=1.0,
-            output_dtype=a.dtype,
-        )
-
-        # aiter_moe output shape depends on backend:
-        #   MOE_C → [M, topk, dim]  (per-expert, before weighted_sum)
-        #   ASM   → [M, dim]        (weighted_sum already applied)
-        if out.dim() == 2:
-            # Already weighted — unsqueeze to [M, 1, dim] so that
-            # ``PerTokenBatchedExpertResult.weighted_sum`` with
-            # 1.0 weights is a no-op.
-            out = out.unsqueeze(1)  # [M, 1, dim]
-
-        return PerTokenBatchedExpertResult(out)
-
     def _marlin_gemm(
         self,
         x: torch.Tensor,
@@ -358,52 +452,9 @@ class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged
         in_features: int,
         out_features: int,
     ) -> torch.Tensor:
-        reshaped_x = x.reshape(-1, x.shape[-1])
+        activation = eval_lazy(x).reshape(-1, x.shape[-1])
         output = chitu_backend.gptq_marlin_gemm(
-            reshaped_x,
-            None,  # c_or_none
-            qweight,  # b_q_weight
-            None,  # b_bias_or_none
-            scales,  # b_scales
-            None,  # global_scale_or_none
-            None,  # b_zeros_or_none (symmetric)
-            None,  # g_idx_or_none (no act reorder)
-            None,  # perm_or_none
-            self.workspace,  # workspace
-            UINT4B8_TYPE_ID,
-            reshaped_x.shape[0],
-            out_features,
-            in_features,
-            True,  # is_k_full
-            False,  # use_atomic_add
-            True,  # use_fp32_reduce
-            False,  # is_zp_float
-            False,  # is_block_fp8
-        )
-        return output.reshape(x.shape[:-1] + (out_features,))
-
-    # ------------------------------------------------------------------ #
-    #  Batch group GEMM using moe_wna16_marlin_gemm kernel                #
-    # ------------------------------------------------------------------ #
-
-    MOE_BLOCK_SIZE = 64
-
-    def _moe_marlin_gemm(
-        self,
-        a: torch.Tensor,
-        qweight: torch.Tensor,
-        scales: torch.Tensor,
-        sorted_token_ids: torch.Tensor,
-        expert_ids: torch.Tensor,
-        num_tokens_past_padded: torch.Tensor,
-        topk_weights: torch.Tensor,
-        size_m: int,
-        size_n: int,
-        size_k: int,
-        top_k: int,
-    ) -> torch.Tensor:
-        return chitu_backend.moe_wna16_marlin_gemm(
-            a,  # a
+            activation,  # a
             None,  # c_or_none
             qweight,  # b_q_weight
             None,  # b_bias_or_none
@@ -413,11 +464,54 @@ class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged
             None,  # g_idx_or_none
             None,  # perm_or_none
             self.workspace,  # workspace
-            sorted_token_ids,  # sorted_token_ids
-            expert_ids,  # expert_ids
-            num_tokens_past_padded,  # num_tokens_past_padded
+            UINT4B8_TYPE_ID,  # b_q_type_id
+            activation.shape[0],  # size_m
+            out_features,  # size_n
+            in_features,  # size_k
+            True,  # is_k_full
+            False,  # use_atomic_add
+            True,  # use_fp32_reduce
+            False,  # is_zp_float
+            False,  # is_block_fp8
+        )
+        return output.reshape(x.shape[:-1] + (out_features,))
+
+    def _invoke_marlin_moe(
+        self,
+        activation: torch.Tensor,
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+        routed_x: ExpertBlockIndexedBatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+        size_m: int,
+        size_n: int,
+        size_k: int,
+        top_k: int,
+    ) -> torch.Tensor:
+        activation = eval_lazy(activation)
+        output = torch.zeros(
+            size_m * top_k,
+            size_n,
+            dtype=activation.dtype,
+            device=activation.device,
+        )
+        return chitu_backend.moe_wna16_marlin_gemm(
+            activation,  # a
+            output,  # c_or_none
+            qweight,  # b_q_weight
+            None,  # b_bias_or_none
+            scales,  # b_scales
+            None,  # global_scale_or_none
+            None,  # b_zeros_or_none
+            None,  # g_idx_or_none
+            None,  # perm_or_none
+            self.workspace,  # workspace
+            routed_x.block_to_token_x_topk_indices.flatten().contiguous(),  # sorted_token_ids
+            routed_x.block_to_expert_indices.contiguous(),  # expert_ids
+            routed_x.n_blocks_scalar_tensor
+            * self.moe_block_size,  # num_tokens_past_padded
             topk_weights,  # topk_weights
-            self.MOE_BLOCK_SIZE,  # moe_block_size
+            self.moe_block_size,  # moe_block_size
             top_k,  # top_k
             False,  # mul_topk_weights
             False,  # is_ep
@@ -432,130 +526,90 @@ class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged
         )
 
     @override
-    @plum.dispatch
-    def forward_no_sum(
-        self, routed_x: IndexedBatchedRoutedActivation, impl="auto"
-    ) -> PerTokenBatchedExpertResult:
-        """
-        Batch group GEMM forward.
-
-        Args:
-            routed_x: Input routed activations.
-            impl: Backend selection — ``"auto"`` (default, automatic),
-                  ``"aiter"``, ``"triton"``, or ``"marlin"``.
-        """
-        if impl == "auto":
-            if has_aiter:
-                impl = "aiter"
-            elif (
-                has_triton
-                and not has_chitu_backend
-                or not hasattr(chitu_backend, "moe_wna16_marlin_gemm")
-            ):
-                impl = "triton"
-            else:
-                impl = "marlin"
-
-        if impl == "aiter":
-            return self._forward_aiter(routed_x)
-        if impl == "triton":
-            return self._forward_triton(routed_x)
-        if impl == "marlin":
-            return self._forward_marlin(routed_x)
-
-    def _forward_marlin(
-        self, routed_x: IndexedBatchedRoutedActivation
-    ) -> PerTokenBatchedExpertResult:
-        """
-        MoE forward using Marlin CUDA kernel (for NVIDIA platform).
-        """
+    def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
         self._ensure_marlin_workspace()
-
-        routed_x = routed_x.as_local_expert_ids(
-            self.experts_start_idx, self.experts_end_idx
+        return self._marlin_gemm(
+            x,
+            self.down_proj_qweight[i],
+            self.down_proj_scales[i],
+            self.moe_inter_dim,
+            self.dim,
         )
 
+
+@QuantizationRegistry.register_moe_experts(
+    "blockint4",
+    merge_gate_up=False,
+    when=lambda _: has_marlin and has_marlin_moe,
+    priority=1,
+)
+class MarlinBlockInt4MoeExpertsUnmerged(
+    BlockInt4MarlinMixin, BlockInt4MoeExpertsUnmergedBase
+):
+    @override
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.gate_proj_qweight, BlockInt4MarlinQWeight)
+        self.apply_native_layout(self.gate_proj_scales, BlockInt4MarlinScale)
+        self.apply_native_layout(self.up_proj_qweight, BlockInt4MarlinQWeight)
+        self.apply_native_layout(self.up_proj_scales, BlockInt4MarlinScale)
+        self.apply_native_layout(self.down_proj_qweight, BlockInt4MarlinQWeight)
+        self.apply_native_layout(self.down_proj_scales, BlockInt4MarlinScale)
+
+    @override
+    def _forward_expert_block_indexed(
+        self, routed_x: ExpertBlockIndexedBatchedRoutedActivation
+    ) -> PerTokenBatchedExpertResult:
+        self._ensure_marlin_workspace()
         M = routed_x.activation.shape[0]
-        topk = routed_x.token_to_expert_indices.shape[1]
-        n_local_experts = self.experts_end_idx - self.experts_start_idx
+        topk = routed_x.topk
         device = routed_x.activation.device
-
         if M == 0:
-            y = torch.zeros(
-                M,
-                topk,
-                self.dim,
-                device=device,
-                dtype=routed_x.activation.dtype,
+            return PerTokenBatchedExpertResult(
+                torch.zeros(
+                    M,
+                    topk,
+                    self.dim,
+                    device=device,
+                    dtype=routed_x.activation.dtype,
+                )
             )
-            return PerTokenBatchedExpertResult(y)
 
-        # Convert to ExpertBlockIndexed format (sorted_token_ids, expert_ids)
-        block_routed = ExpertBlockIndexedBatchedRoutedActivation.convert_from(
-            routed_x,
-            n_experts=n_local_experts,
-            block_size=self.MOE_BLOCK_SIZE,
-        )
-
-        sorted_token_ids = (
-            block_routed.block_to_token_x_topk_indices.flatten().contiguous()
-        )
-        expert_ids = block_routed.block_to_expert_indices.contiguous()
-        num_tokens_past_padded = (
-            block_routed.n_blocks_scalar_tensor * self.MOE_BLOCK_SIZE
-        )
-
-        # Ensure activation dtype matches scales
         a = routed_x.activation
-        if a.dtype != self.gate_proj_scales.dtype:
-            a = a.to(self.gate_proj_scales.dtype)
-
-        # Dummy topk_weights (mul_topk_weights=False, not used)
+        if a.dtype != self.down_proj_scales.dtype:
+            a = a.to(self.down_proj_scales.dtype)
         topk_weights = torch.empty(M, topk, dtype=torch.float32, device=device)
 
-        # Gate projection: (M, dim) -> (M*topk, moe_inter_dim)
-        gate_out = self._moe_marlin_gemm(
+        gate_out = self._invoke_marlin_moe(
             a,
             self.gate_proj_qweight,
             self.gate_proj_scales,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_past_padded,
+            routed_x,
             topk_weights,
             M,
             self.moe_inter_dim,
             self.dim,
             topk,
         )
-
-        # Up projection: (M, dim) -> (M*topk, moe_inter_dim)
-        up_out = self._moe_marlin_gemm(
+        up_out = self._invoke_marlin_moe(
             a,
             self.up_proj_qweight,
             self.up_proj_scales,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_past_padded,
+            routed_x,
             topk_weights,
             M,
             self.moe_inter_dim,
             self.dim,
             topk,
         )
-
-        # Activation: silu(gate) * up
         intermediate = torch.nn.functional.silu(gate_out) * up_out
         del gate_out, up_out
 
-        # Down projection: (M*topk, moe_inter_dim) -> (M*topk, dim)
-        # top_k=1 because input is already topk-expanded
-        down_out = self._moe_marlin_gemm(
-            intermediate,
+        down_out = self._invoke_marlin_moe(
+            intermediate.view(M * topk, self.moe_inter_dim),
             self.down_proj_qweight,
             self.down_proj_scales,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_past_padded,
+            routed_x,
             topk_weights,
             M * topk,
             self.dim,
@@ -563,155 +617,7 @@ class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged
             1,
         )
         del intermediate
-
         return PerTokenBatchedExpertResult(down_out.view(M, topk, self.dim))
-
-    def _forward_triton(
-        self, routed_x: IndexedBatchedRoutedActivation
-    ) -> PerTokenBatchedExpertResult:
-        """
-        MoE forward using Triton kernel (for Hygon platform).
-
-        Uses fused_moe_kernel_gptq_awq from vllm, which works with
-        AWQ format weights: [E, N, K//8] for int4 packed weights.
-        """
-
-        routed_x = routed_x.as_local_expert_ids(
-            self.experts_start_idx, self.experts_end_idx
-        )
-
-        activation_shape = routed_x.activation.shape
-        M = activation_shape[0]
-        topk = routed_x.token_to_expert_indices.shape[1]
-
-        n_local_experts = self.experts_end_idx - self.experts_start_idx
-        device = routed_x.activation.device
-
-        if M == 0:
-            y = torch.zeros(
-                M,
-                topk,
-                self.dim,
-                device=device,
-                dtype=routed_x.activation.dtype,
-            )
-            return PerTokenBatchedExpertResult(y)
-
-        # Convert to ExpertBlockIndexed format (sorted_token_ids, expert_ids)
-        block_routed = ExpertBlockIndexedBatchedRoutedActivation.convert_from(
-            routed_x,
-            n_experts=n_local_experts,
-            block_size=self.MOE_BLOCK_SIZE,
-        )
-
-        sorted_token_ids = (
-            block_routed.block_to_token_x_topk_indices.flatten().contiguous()
-        ).to(
-            torch.int64
-        )  # Convert to int64 for kernel compatibility
-        expert_ids = block_routed.block_to_expert_indices.contiguous().to(torch.int64)
-
-        num_tokens_past_padded = (
-            block_routed.n_blocks_scalar_tensor * self.MOE_BLOCK_SIZE
-        )
-
-        # Ensure activation dtype matches scales
-        a = routed_x.activation
-        if a.dtype != self.gate_proj_scales.dtype:
-            a = a.to(self.gate_proj_scales.dtype)
-
-        # Default config for Triton kernel
-        config = {
-            "BLOCK_SIZE_M": self.MOE_BLOCK_SIZE,
-            "BLOCK_SIZE_N": 32,
-            "BLOCK_SIZE_K": 64,
-            "GROUP_SIZE_M": 1,
-        }
-
-        # Dummy topk_weights (mul_routed_weight=False, not used)
-        topk_weights = torch.empty(M, topk, dtype=torch.float32, device=device)
-
-        # Gate projection: (M, dim) -> (M, topk, moe_inter_dim)
-        # Weight shape: [E, N, K//8] = [E, moe_inter_dim, dim//8]
-        # Scale shape: [E, N, num_groups] = [E, moe_inter_dim, dim//group_size]
-        # Output C: 3D tensor [M, topk, N]
-        gate_out = torch.empty(
-            M, topk, self.moe_inter_dim, dtype=a.dtype, device=device
-        )
-
-        invoke_fused_moe_wna16_triton_kernel(
-            A=a,
-            B=self.gate_proj_qweight,  # [E, N, K//8]
-            C=gate_out,
-            B_scale=self.gate_proj_scales,  # [E, N, num_groups]
-            B_zp=None,  # Symmetric quantization, no zero point
-            topk_weights=topk_weights,
-            sorted_token_ids=sorted_token_ids,
-            expert_ids=expert_ids,
-            num_tokens_post_padded=num_tokens_past_padded,
-            mul_routed_weight=False,
-            top_k=topk,
-            config=config,
-            use_int4_w4a16=True,
-            use_int8_w8a16=False,
-            group_size=self.quant_group_size,
-        )
-
-        # Up projection: (M, dim) -> (M, topk, moe_inter_dim)
-        up_out = torch.empty(M, topk, self.moe_inter_dim, dtype=a.dtype, device=device)
-        invoke_fused_moe_wna16_triton_kernel(
-            A=a,
-            B=self.up_proj_qweight,
-            C=up_out,
-            B_scale=self.up_proj_scales,
-            B_zp=None,
-            topk_weights=topk_weights,
-            sorted_token_ids=sorted_token_ids,
-            expert_ids=expert_ids,
-            num_tokens_post_padded=num_tokens_past_padded,
-            mul_routed_weight=False,
-            top_k=topk,
-            config=config,
-            use_int4_w4a16=True,
-            use_int8_w8a16=False,
-            group_size=self.quant_group_size,
-        )
-
-        # Activation: silu(gate) * up
-        intermediate = torch.nn.functional.silu(gate_out) * up_out
-        del gate_out, up_out
-
-        # Down projection: (M, topk, moe_inter_dim) -> (M, topk, dim)
-        # Weight shape: [E, dim, moe_inter_dim//8]
-        # Scale shape: [E, dim, moe_inter_dim//group_size]
-        # For down projection, top_k=1 because we process M*topk tokens as M tokens each with top_k=1
-        down_out = torch.empty(M, topk, self.dim, dtype=a.dtype, device=device)
-        invoke_fused_moe_wna16_triton_kernel(
-            A=intermediate.view(
-                M * topk, self.moe_inter_dim
-            ),  # 2D input [M*topk, moe_inter_dim]
-            B=self.down_proj_qweight,
-            C=down_out,
-            B_scale=self.down_proj_scales,
-            B_zp=None,
-            topk_weights=topk_weights,
-            sorted_token_ids=sorted_token_ids,
-            expert_ids=expert_ids,
-            num_tokens_post_padded=num_tokens_past_padded,
-            mul_routed_weight=False,
-            top_k=1,  # Input is already topk-expanded
-            config=config,
-            use_int4_w4a16=True,
-            use_int8_w8a16=False,
-            group_size=self.quant_group_size,
-        )
-        del intermediate
-
-        return PerTokenBatchedExpertResult(down_out)
-
-    # ------------------------------------------------------------------ #
-    #  Per-expert iterative forward (fallback)                            #
-    # ------------------------------------------------------------------ #
 
     @override
     def forward_ith_expert_gate(
@@ -741,13 +647,256 @@ class BlockInt4MoeExpertsUnmerged(NativeLayoutMixin, QuantizedMoeExpertsUnmerged
             self.moe_inter_dim,
         )
 
+
+@QuantizationRegistry.register_moe_experts(
+    "blockint4",
+    merge_gate_up=True,
+    when=lambda _: has_marlin and has_marlin_moe,
+    priority=1,
+)
+class MarlinBlockInt4MoeExpertsMerged(
+    BlockInt4MarlinMixin, BlockInt4MoeExpertsMergedBase
+):
     @override
-    def forward_ith_expert_down(self, i: int, x: torch.Tensor) -> torch.Tensor:
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(self.gate_up_proj_qweight, BlockInt4MarlinQWeight)
+        self.apply_native_layout(self.gate_up_proj_scales, BlockInt4MarlinScale)
+        self.apply_native_layout(self.down_proj_qweight, BlockInt4MarlinQWeight)
+        self.apply_native_layout(self.down_proj_scales, BlockInt4MarlinScale)
+
+    @override
+    def _forward_expert_block_indexed(
+        self, routed_x: ExpertBlockIndexedBatchedRoutedActivation
+    ) -> PerTokenBatchedExpertResult:
+        self._ensure_marlin_workspace()
+        M = routed_x.activation.shape[0]
+        topk = routed_x.topk
+        device = routed_x.activation.device
+        if M == 0:
+            return PerTokenBatchedExpertResult(
+                torch.zeros(
+                    M,
+                    topk,
+                    self.dim,
+                    device=device,
+                    dtype=routed_x.activation.dtype,
+                )
+            )
+
+        a = routed_x.activation
+        if a.dtype != self.down_proj_scales.dtype:
+            a = a.to(self.down_proj_scales.dtype)
+        topk_weights = torch.empty(M, topk, dtype=torch.float32, device=device)
+
+        gate_up_out = self._invoke_marlin_moe(
+            a,
+            self.gate_up_proj_qweight,
+            self.gate_up_proj_scales,
+            routed_x,
+            topk_weights,
+            M,
+            2 * self.moe_inter_dim,
+            self.dim,
+            topk,
+        )
+        intermediate = self.forward_act_fn_merged(gate_up_out.view(M, topk, -1))
+        del gate_up_out
+
+        down_out = self._invoke_marlin_moe(
+            intermediate.view(M * topk, self.moe_inter_dim),
+            self.down_proj_qweight,
+            self.down_proj_scales,
+            routed_x,
+            topk_weights,
+            M * topk,
+            self.dim,
+            self.moe_inter_dim,
+            1,
+        )
+        del intermediate
+        return PerTokenBatchedExpertResult(down_out.view(M, topk, self.dim))
+
+    @override
+    def forward_ith_expert_gate_up(
+        self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        assert x_scale is None
         self._ensure_marlin_workspace()
         return self._marlin_gemm(
             x,
-            self.down_proj_qweight[i],
-            self.down_proj_scales[i],
-            self.moe_inter_dim,
+            self.gate_up_proj_qweight[i],
+            self.gate_up_proj_scales[i],
             self.dim,
+            2 * self.moe_inter_dim,
         )
+
+
+@QuantizationRegistry.register_moe_experts(
+    "blockint4", merge_gate_up=True, when=lambda _: has_aiter, priority=1
+)
+class AiterBlockInt4MoeExpertsMerged(BlockInt4MoeExpertsMergedBase):
+    """aiter blockint4 MoE consumes merged gate/up weights repacked to uint8 pack2."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._aiter_repacked = False
+
+    def _repack_to_aiter(self):
+        self._w1 = self.gate_up_proj_qweight.data.view(torch.uint8).contiguous()
+        self._w1_scale = self.gate_up_proj_scales.data.contiguous()
+        self._w2 = self.down_proj_qweight.data.view(torch.uint8).contiguous()
+        self._w2_scale = self.down_proj_scales.data.contiguous()
+
+        E = self.gate_up_proj_qweight.shape[0]
+        n_groups_k = self.dim // self.quant_group_size
+        n_groups_inter = self.moe_inter_dim // self.quant_group_size
+        device = self.gate_up_proj_qweight.device
+        self._w1_zp_dummy = torch.full(
+            (E, self.moe_inter_dim, n_groups_k),
+            0x88,
+            dtype=torch.uint8,
+            device=device,
+        ).contiguous()
+        self._w2_zp_dummy = torch.full(
+            (E, self.dim // 2, n_groups_inter),
+            0x88,
+            dtype=torch.uint8,
+            device=device,
+        ).contiguous()
+
+        self._aiter_config_valid = False
+        self._aiter_repacked = True
+
+    @override
+    def forward(
+        self,
+        routed_x: BatchedRoutedActivation,
+        weights: torch.Tensor,
+        inplace: bool = False,
+        impl: str = "auto",
+    ) -> torch.Tensor:
+        if not isinstance(routed_x, IndexedBatchedRoutedActivation):
+            return QuantizedMoeExpertsMerged.forward(
+                self, routed_x, weights, inplace=inplace, impl=impl
+            )
+        if not self._aiter_repacked:
+            self._repack_to_aiter()
+
+        activation = routed_x.activation
+        if activation.dtype != self.gate_up_proj_scales.dtype:
+            activation = activation.to(self.gate_up_proj_scales.dtype)
+
+        M = activation.shape[0]
+        topk = routed_x.token_to_expert_indices.shape[1]
+        device = activation.device
+        if M == 0:
+            return torch.zeros(
+                M,
+                self.dim,
+                device=device,
+                dtype=activation.dtype,
+            )
+
+        n_local_experts = self.experts_end_idx - self.experts_start_idx
+        topk_ids = routed_x.token_to_expert_indices.contiguous()
+
+        if not self._aiter_config_valid:
+            status, moe_cfg = get_aiter_moe_config(
+                M=M,
+                E=n_local_experts,
+                N1=2 * self.moe_inter_dim,
+                N2=self.dim,
+                K=self.dim,
+                top_k=topk,
+                block_size=self.quant_group_size,
+                dtype=activation.dtype,
+                quant_type=MoeQuantType.W4A16,
+            )
+            if not status:
+                raise NotImplementedError(
+                    "aiter config not found for blockint4 MoE: "
+                    f"M={M} E={n_local_experts} N1={2 * self.moe_inter_dim} "
+                    f"N2={self.dim} K={self.dim}"
+                )
+            self._moe_config = moe_cfg
+            self._aiter_config_valid = True
+
+        aiter_global_num_experts = self.global_n_experts
+        expert_map = None
+        if self.group_size != self.global_n_experts:
+            if routed_x.expert_ids_are_local:
+                raise RuntimeError(
+                    "aiter blockint4 EP expects global expert IDs. "
+                    "ChiTu local expert IDs with sentinel are not supported."
+                )
+            if self._moe_config.solution_type == MoeSolutionType.ASM:
+                # aiter names this argument ``expert_map``, but ASM EP treats
+                # it as a binary expert mask: 1 for local global experts, 0
+                # otherwise.
+                expert_map = torch.zeros(
+                    self.global_n_experts,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                expert_map[self.experts_start_idx : self.experts_end_idx] = 1
+            else:
+                # aiter non-ASM EP backends use the documented global-to-local
+                # mapping: local global experts map to [0, n_local_experts),
+                # and non-local experts map to -1.
+                expert_map = torch.full(
+                    (self.global_n_experts,),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                expert_map[self.experts_start_idx : self.experts_end_idx] = (
+                    torch.arange(n_local_experts, dtype=torch.int32, device=device)
+                )
+
+        if self._moe_config.solution_type == MoeSolutionType.MOE_C:
+            w1 = w4a16_marlin_weight_1(self._w1)
+            w1 = w1.view(-1).view(torch.uint8).view(*self._w1.shape)
+            w2 = w4a16_marlin_weight_2(self._w2)
+            w2 = w2.view(-1).view(torch.uint8).view(*self._w2.shape)
+            zp1 = self._w1_zp_dummy
+            zp2 = self._w2_zp_dummy
+        elif self._moe_config.solution_type == MoeSolutionType.ASM:
+            w1, w2 = self._w1, self._w2
+            zp1 = self._w1_zp_dummy
+            zp2 = self._w2_zp_dummy
+        else:
+            w1 = self._w1
+            w2 = self._w2
+            zp1 = None
+            zp2 = None
+
+        topk_weights = weights.to(torch.float32)
+
+        out = aiter_moe(
+            activation,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            self._moe_config,
+            inplace=False,
+            activation="silu",
+            w1_scale=self._w1_scale,
+            w2_scale=self._w2_scale,
+            w1_zp=zp1,
+            w2_zp=zp2,
+            a1_scale=None,
+            a2_scale=None,
+            block_shape=[0, self.quant_group_size],
+            global_num_experts=aiter_global_num_experts,
+            expert_map=expert_map,
+            routed_scaling_factor=1.0,
+            output_dtype=activation.dtype,
+        )
+
+        if out.dim() != 2:
+            raise RuntimeError(
+                f"aiter blockint4 MoE expected weighted 2D output, got {out.shape}"
+            )
+        return out

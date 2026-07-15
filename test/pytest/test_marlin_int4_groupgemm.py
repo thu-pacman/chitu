@@ -10,16 +10,20 @@ produces the same output as the per-expert iterative path.
 import pytest
 import torch
 
-from chitu.quantization import QuantizedMoeExpertsUnmerged, BlockInt4MoeExpertsUnmerged
+from chitu.quantization import (
+    QuantizedMoeExpertsUnmerged,
+    MarlinBlockInt4MoeExpertsUnmerged,
+)
 from chitu.utils import try_import_platform_dep
 from chitu.native_layout import init_native_layout
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-has_marlin_moe = has_chitu_backend and hasattr(chitu_backend, "moe_wna16_marlin_gemm")
+has_marlin = has_chitu_backend and hasattr(chitu_backend, "gptq_marlin_gemm")
+has_marlin_moe = has_marlin and hasattr(chitu_backend, "moe_wna16_marlin_gemm")
 
 pytestmark = [
     pytest.mark.skipif(
-        not has_marlin_moe, reason="chitu_backend with marlin MoE not available"
+        not has_marlin_moe, reason="chitu_backend with Marlin int4 MoE not available"
     ),
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available"),
 ]
@@ -31,9 +35,9 @@ def _make_experts_module(
     n_experts: int,
     group_size: int = 128,
 ):
-    """Create a BlockInt4MoeExpertsUnmerged with random quantized weights."""
+    """Create a MarlinBlockInt4MoeExpertsUnmerged with random quantized weights."""
 
-    module = BlockInt4MoeExpertsUnmerged(
+    module = MarlinBlockInt4MoeExpertsUnmerged(
         dim=dim,
         moe_inter_dim=moe_inter_dim,
         global_n_experts=n_experts,
