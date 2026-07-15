@@ -1,0 +1,116 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - quant_config: ds-blockfp8_ue8m0_scale_mxfp4
+  - _self_ # Config in this file overrides configs in defaults
+
+name: DeepSeek-V4-Pro
+type: deepseek-v4
+source: "https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro"
+tokenizer_type: "hf"
+chatformat_type: dsv4
+tool_parser: DeepSeekV4ToolParser
+reasoning_type: switchable
+
+vocab_size: 129280
+bos_token_id: 0
+eos_token_id: 1
+dim: 7168
+moe_inter_dim: 3072
+n_layers: 61
+n_heads: 128
+n_routed_experts: 384
+n_shared_experts: 1
+n_activated_experts: 6
+n_hash_layers: 3
+score_func: "sqrtsoftplus"
+route_scale: 2.5
+swiglu_limit: 10.0
+
+q_lora_rank: 1536
+head_dim: 512
+rope_head_dim: 64
+o_groups: 16
+o_lora_rank: 1024
+
+index_n_heads: 64
+index_head_dim: 128
+index_topk: 1024
+
+hc_mult: 4
+hc_sinkhorn_iters: 20
+hc_eps: 1.0e-6
+norm_eps: 1.0e-6
+
+rope_theta: 10000.0
+window_size: 128
+original_seq_len: 65536
+rope_factor: 16
+beta_fast: 32
+beta_slow: 1
+compress_rope_theta: 160000
+compress_ratios:
+  - 128
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 128
+  - 4
+  - 0
