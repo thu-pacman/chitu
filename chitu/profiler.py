@@ -12,6 +12,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from logging import getLogger
 from typing import Callable
+from chitu.global_vars import get_global_args
 
 
 import torch
@@ -570,7 +571,7 @@ class ProfileManager:
 
         try:
             if self._current_profiler is None:
-                self._do_start(stage=stage if cfg.profile_by_stage else None)
+                self._do_start()
             return True
         except Exception:
             logger.exception("ProfileManager: error starting step, disabling profiler")
@@ -605,7 +606,8 @@ class ProfileManager:
 
     def _do_start(self, stage: str | None = None):
         cfg = self._config
-        suffix = f"-{stage}" if stage else ""
+        role = getattr(getattr(get_global_args(), "multi_inst", None), "role", None)
+        suffix = f"-{role}" if role and role != "prefill_and_decode" else ""
         self._current_profiler = create_profiler(
             activities=cfg.activities,
             output_dir=cfg.output_dir,

@@ -65,7 +65,7 @@ from chitu.distributed.comm_group import SingletonGroupPlaceholder
 from chitu.distributed.coordinator import get_endpoint, set_endpoint
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
-from chitu.dp_request_router import is_terminate_engine_message
+from chitu.dp_request_router import is_terminate_engine_message, is_profile_message
 from chitu.kv_cache.utils import (
     plan_kv_cache_blocks_after_warmup,
     reduce_num_block_plan_across_ranks,
@@ -1889,6 +1889,12 @@ async def process_scheduler_request(rank: int, request_data: dict):
         if is_terminate_engine_message(request_data):
             Backend.state = BackendState.Terminating
             logger.info("Terminate_engine received. Draining in-flight requests")
+            return
+
+        if is_profile_message(request_data):
+            from chitu.serve.common import enqueue_profile_payload
+
+            enqueue_profile_payload(request_data["payload"])
             return
 
         # Create UserRequest

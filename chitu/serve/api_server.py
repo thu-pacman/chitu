@@ -307,17 +307,6 @@ def _is_router_process() -> bool:
     return bool(getattr(router_cfg, "is_router", False))
 
 
-def _is_pd_router_process() -> bool:
-    """Detect whether this process is a PD-mode Router."""
-    if is_classic_pd_disagg():
-        return _is_router_process()
-    if is_independent_multi_inst():
-        return False
-    raise NotImplementedError(
-        "Mixing prefill_and_decode with prefill/decode roles is not supported"
-    )
-
-
 def _validate_pd_profile_request(request: "ProfileRequest") -> None:
     if request.pd_stage not in (None, "prefill", "decode", "all"):
         raise HTTPException(
@@ -351,7 +340,11 @@ def _build_profile_start_payload(request: "ProfileRequest") -> tuple[dict, str]:
 @app.post("/profile/start")
 async def start_profile(request: ProfileRequest):
     try:
-        if _is_pd_router_process():
+        if _is_router_process():
+            if not is_classic_pd_disagg() and not is_independent_multi_inst():
+                raise NotImplementedError(
+                    "Mixing prefill_and_decode with prefill/decode roles is not supported"
+                )
             _validate_pd_profile_request(request)
             payload, output_dir = _build_profile_start_payload(request)
             payload["profile_by_stage"] = True
@@ -400,7 +393,7 @@ async def start_profile(request: ProfileRequest):
 @app.post("/profile/stop")
 async def stop_profile():
     try:
-        if _is_pd_router_process():
+        if _is_router_process():
             payload = {"action": "stop"}
             router = get_request_router()
             broadcast_result = await router.broadcast_profile(payload)
@@ -423,7 +416,7 @@ async def stop_profile():
 @app.post("/profile/dump_memory")
 async def dump_memory():
     """Queue a dump_memory command for all ranks."""
-    if _is_pd_router_process():
+    if _is_router_process():
         # Router process does not run a model, so its local MemoryRecorder is
         # never enabled. Skip the local check and broadcast unconditionally;
         # each peer enforces its own recording precondition.
