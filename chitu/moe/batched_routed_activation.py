@@ -493,6 +493,37 @@ class ExpertBlockIndexedBatchedRoutedActivation(BatchedRoutedActivation):
 
 
 @dataclass
+class ExpertBlockIndexedBatchedRoutedActivationWithScale(
+    ExpertBlockIndexedBatchedRoutedActivation
+):
+    activation_scale: torch.Tensor
+    quant_method: RoutedActivationQuantMethod
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(
+        cls,
+        old: IndexedBatchedRoutedActivationWithScale,
+        *,
+        n_experts: int,
+        block_size: int,
+    ) -> "ExpertBlockIndexedBatchedRoutedActivationWithScale":
+        return cls(
+            old.activation,
+            *batched_routed_activation_indexed_to_expert_block_indexed(
+                old.token_to_expert_indices,
+                block_size,
+                n_experts,
+            ),
+            topk=old.token_to_expert_indices.shape[-1],
+            activation_scale=old.activation_scale,
+            quant_method=old.quant_method,
+            expert_ids_are_local=old.expert_ids_are_local,
+        )
+
+
+@dataclass
 class ExpertBlockPermutedBatchedRoutedActivation(BatchedRoutedActivation):
     """
     Activation are permuted in blocks, with indices expressing the relation between the
