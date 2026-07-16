@@ -8,8 +8,10 @@ Exercises ``PrefixCacheAwarePolicy`` / ``LoadBalancer`` via ``policy.update_stat
 selection helpers — no ZMQ or ``_pd_stats_collector_task`` integration.
 """
 
+import asyncio
 from omegaconf import OmegaConf
 from dataclasses import dataclass, field
+from typing import Any, Optional
 
 from chitu.distributed.pd_disaggregation.pd_request_router import PDRequestRouter
 from chitu.dp_request_router import LoadBalancer, PrefixCacheAwarePolicy, SchedulerStats
@@ -17,6 +19,11 @@ from chitu.global_vars import set_global_args
 from chitu.schemas.serve_config import (
     PDDisaggregationConfig,
     RouterConfig,
+)
+from chitu.distributed.pd_disaggregation.pd_types import (
+    PDRequestStatus,
+    PendingPDRequest,
+    SchedulerType,
 )
 
 
@@ -26,6 +33,83 @@ class MockReq:
 
     request_id: str
     prompt_tokens: list[int] = field(default_factory=list)
+
+
+class TestPDRequestRouter(PDRequestRouter):
+    """A testing PD request router without communication"""
+
+    def __init__(self, config: RouterConfig, pd_config: PDDisaggregationConfig):
+        super().__init__(config, pd_config)
+        self._test_prefill_msg_queue: dict[int, list[dict[str, Any]]] = {}
+        self._test_decode_msg_queue: dict[int, list[dict[str, Any]]] = {}
+        self._test_finished_reqs: set[str] = set()
+
+    # override communications
+
+    async def _send_to_prefill_scheduler(
+        self, local_instance_id: int, request_data: dict
+    ):
+        prefill_data = request_data.copy()
+        prefill_data["target_role"] = "prefill"
+        prefill_data["local_instance_id"] = local_instance_id
+        if self._test_prefill_msg_queue.get(local_instance_id) is None:
+            self._test_prefill_msg_queue[local_instance_id] = []
+        self._test_prefill_msg_queue[local_instance_id].append(prefill_data)
+
+    async def _send_to_decode_scheduler(
+        self, local_instance_id: int, request_data: dict, prefill_scheduler_id: int
+    ):
+        decode_data = request_data.copy()
+        decode_data["target_role"] = "decode"
+        decode_data["local_instance_id"] = local_instance_id
+        decode_data["prefill_scheduler_id"] = prefill_scheduler_id
+        if self._test_decode_msg_queue.get(local_instance_id) is None:
+            self._test_decode_msg_queue[local_instance_id] = []
+        self._test_decode_msg_queue[local_instance_id].append(decode_data)
+
+    def finish_request_before_recv_stop(
+        self, request, finish_reason: Optional[str] = None, error: Optional[str] = None
+    ):
+        self._test_finished_reqs.add(request.request_id)
+
+    # tests
+
+    def _test_create_mock_pd_request(
+        self, request_id: str, prefill_scheduler_id: int, decode_scheduler_id: int
+    ):
+        request = MockReq(request_id=request_id)
+        pd_request = PendingPDRequest(
+            request_id=request_id,
+            original_request=request,
+            prefill_scheduler_id=prefill_scheduler_id,
+            decode_scheduler_id=decode_scheduler_id,
+            status=PDRequestStatus.DISPATCHED,
+        )
+        self.pending_pd_requests[request_id] = pd_request
+
+    def _test_check_prefill_msg(self, local_instance_id, target_type, request_ids):
+        real_request_ids = []
+        if self._test_prefill_msg_queue.get(local_instance_id) is not None:
+            real_request_ids = [
+                msg["request_id"]
+                for msg in self._test_prefill_msg_queue[local_instance_id]
+                if msg["type"] == target_type
+            ]
+        assert set(request_ids) == set(
+            real_request_ids
+        ), f"Prefill instance {local_instance_id} message type {target_type}, except {request_ids}, find {real_request_ids}"
+
+    def _test_check_decode_msg(self, local_instance_id, target_type, request_ids):
+        real_request_ids = []
+        if self._test_decode_msg_queue.get(local_instance_id) is not None:
+            real_request_ids = [
+                msg["request_id"]
+                for msg in self._test_decode_msg_queue[local_instance_id]
+                if msg["type"] == target_type
+            ]
+        assert set(request_ids) == set(
+            real_request_ids
+        ), f"Decode instance {local_instance_id} message type {target_type}, except {request_ids}, find {real_request_ids}"
 
 
 def set_default_global_args():
@@ -289,3 +373,26 @@ def test_pd_router_prefix_prefill_decode_uses_decode_policy():
 
     assert isinstance(router.prefill_policy, PrefixCacheAwarePolicy)
     assert router.decode_policy.algorithm == "round_robin"
+
+
+def test_pd_router_handle_instance_fail():
+    cfg = _pd_router_config(routing_algorithm="round_robin")
+    router = TestPDRequestRouter(cfg, PDDisaggregationConfig())
+
+    req_list = [
+        ("test0", 0, 0),
+        ("test1", 1, 0),
+        ("test2", 0, 1),
+    ]
+    for request_id, prefill_id, decode_id in req_list:
+        router._test_create_mock_pd_request(request_id, prefill_id, decode_id)
+
+    asyncio.run(router.handle_dead_instance_prefill(1))
+    router._test_check_decode_msg(0, "pd_prefill_fail", ["test1"])
+    # prefill fail should not finish request
+    assert len(router._test_finished_reqs) == 0
+
+    asyncio.run(router.handle_dead_instance_decode(0))
+    router._test_check_prefill_msg(0, "pd_decode_fail", ["test0"])
+    router._test_check_prefill_msg(1, "pd_decode_fail", ["test1"])
+    assert len(router._test_finished_reqs) == 2
