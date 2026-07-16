@@ -140,6 +140,11 @@ def fused_experts_npu_for_ep(
     )
 
     group_list = hidden_states.n_tokens_per_expert.to(torch.int64)
+    concat_activation_scale = (
+        hidden_states.concat_activation_scale.to(torch.float32).contiguous()
+        if use_int8_w8a8
+        else None
+    )
 
     hidden_states = torch_npu.npu_grouped_matmul(
         [hidden_states.concat_activation],
@@ -161,9 +166,7 @@ def fused_experts_npu_for_ep(
         hidden_states, gate_up_out_scale = torch_npu.npu_dequant_swiglu_quant(
             x=hidden_states,
             weight_scale=w1_scale_fp32,
-            activation_scale=hidden_states.concat_activation_scale.to(
-                torch.float32
-            ).contiguous(),
+            activation_scale=concat_activation_scale,
             bias=None,
             quant_scale=None,
             quant_offset=None,
