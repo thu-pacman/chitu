@@ -249,7 +249,7 @@ def fused_moe_kernel_block_fp8(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     top_k: tl.constexpr,
-    compute_type: tl.constexpr,
+    output_type: tl.constexpr,
     soft_fp8: tl.constexpr,
     per_channel_quant: tl.constexpr,
     bs_if_in_graph: tl.constexpr,
@@ -284,7 +284,7 @@ def fused_moe_kernel_block_fp8(
             token_mask,
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
-            compute_type,
+            output_type,
         )
         return
 
@@ -340,7 +340,7 @@ def fused_moe_kernel_block_fp8(
                 b_unscaled_fp32 = t.to(tl.float32, bitcast=True)
                 b_new_scale = b_scale * fp8_to_fp32_scale
                 b_scaled_fp32 = b_unscaled_fp32 * b_new_scale
-                b_scaled_fp32 = b_scaled_fp32.to(dtype=compute_type)
+                b_scaled_fp32 = b_scaled_fp32.to(dtype=output_type)
                 accumulator += tl.dot(a, b_scaled_fp32)
             else:
                 a_scale = tl.load(
@@ -353,13 +353,13 @@ def fused_moe_kernel_block_fp8(
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
     if group_k > 0 and group_n > 0:
-        accumulator = accumulator.to(compute_type)
+        accumulator = accumulator.to(output_type)
     elif per_channel_quant:
         accumulator = (accumulator * a_scale[:, None] * b_scale[None, :]).to(
-            compute_type
+            output_type
         )
     else:
-        accumulator = (accumulator * a_scale * b_scale).to(compute_type)
+        accumulator = (accumulator * a_scale * b_scale).to(output_type)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)

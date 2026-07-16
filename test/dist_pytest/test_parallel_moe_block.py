@@ -822,7 +822,9 @@ def test_parallel_moe_block_blockfp8(
                     "raise_lower_bit_float_to": "float8_e4m3fn",
                 },
                 "models": {
-                    "quant_config": {"rules": [{"regex": "", "type": "blockfp8"}]}
+                    "quant_config": {
+                        "rules": [{"regex": r"ffn\.experts", "type": "blockfp8"}]
+                    }
                 },
             }
         ),
@@ -1306,6 +1308,10 @@ def test_parallel_moe_block_blockint4(
     experts_impl,
     record_benchmark,
 ):
+    ############################################################################
+    # Filter test settings
+
+    # Filter token_dispatcher_impl
     if ep_size > 1:
         if token_dispatcher_impl is None:
             pytest.skip("token_dispatcher_impl is required for EP")
@@ -1325,6 +1331,7 @@ def test_parallel_moe_block_blockint4(
     if task_type == TaskType.Decode and token_dispatcher_impl == "allgather":
         pytest.skip("allgather dispatcher is only used for prefill")
 
+    # Filter distributed settings
     if not torch.distributed.is_initialized():
         auto_set_ib_envs()
         torch.distributed.init_process_group("nccl")
@@ -1339,6 +1346,9 @@ def test_parallel_moe_block_blockint4(
         pytest.skip(
             f"moe_inter_dim({moe_inter_dim}) should be divisible by etp_size({etp_size})"
         )
+
+    ############################################################################
+    # Setup distributed environment
 
     set_global_args(
         OmegaConf.create(
@@ -1424,6 +1434,9 @@ def test_parallel_moe_block_blockint4(
         global_experts_down_qweight=global_experts_down_qweight,
         global_experts_down_scales=global_experts_down_scales,
     )
+
+    ############################################################################
+    # Test on participating ranks
 
     if rank < test_world_size:
         local_batch_size = compute_local_batch_size_dist_in_dp(batch_size, dp_size)[

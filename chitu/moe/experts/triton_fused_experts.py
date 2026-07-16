@@ -15,6 +15,7 @@ from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
     ExpertBlockIndexedBatchedRoutedActivation,
+    ExpertBlockIndexedBatchedRoutedActivationWithScale,
     IndexedBatchedRoutedActivationWithScale,
 )
 from chitu.moe.batched_expert_result import (
@@ -416,7 +417,7 @@ def fused_moe_kernel_wrapper_fp8(
     num_valid_tokens_x_topk: int,
     top_k: int,
     config: dict[str, Any],
-    compute_type: tl.dtype,
+    output_type: tl.dtype,
     block_shape: Optional[list[int]] = None,
     soft_fp8: bool = False,
     per_channel_quant: bool = False,
@@ -461,7 +462,7 @@ def fused_moe_kernel_wrapper_fp8(
         0 if block_shape is None else block_shape[0],
         0 if block_shape is None else block_shape[1],
         top_k=top_k,
-        compute_type=compute_type,
+        output_type=output_type,
         soft_fp8=soft_fp8,
         per_channel_quant=per_channel_quant,
         bs_if_in_graph=bs_if_in_graph,
@@ -890,13 +891,21 @@ def fused_experts_fp8(
     n_local_experts = w1.shape[0]
     M, _ = hidden_states.activation.shape
     E, N, _ = w1.shape
+    has_pre_quantized_activation_scale = isinstance(
+        hidden_states, IndexedBatchedRoutedActivationWithScale
+    )
     hidden_states = hidden_states.as_local_expert_ids(
         experts_start_idx,
         experts_start_idx + n_local_experts,
     )
-    hidden_states = ExpertBlockIndexedBatchedRoutedActivation.convert_from(
-        hidden_states, n_experts=E, block_size=config["BLOCK_SIZE_M"]
-    )
+    if has_pre_quantized_activation_scale:
+        hidden_states = ExpertBlockIndexedBatchedRoutedActivationWithScale.convert_from(
+            hidden_states, n_experts=E, block_size=config["BLOCK_SIZE_M"]
+        )
+    else:
+        hidden_states = ExpertBlockIndexedBatchedRoutedActivation.convert_from(
+            hidden_states, n_experts=E, block_size=config["BLOCK_SIZE_M"]
+        )
     assert hidden_states.activation.shape[1] == w1.shape[2], "Hidden size mismatch"
 
     assert hidden_states.activation.is_contiguous(), "Hidden_states must be contiguous"
@@ -924,18 +933,18 @@ def fused_experts_fp8(
     intermediate_cache1 = torch.zeros(
         (M, hidden_states.topk, N),
         device=hidden_states.activation.device,
-        dtype=hidden_states.activation.dtype,
+        dtype=torch.get_default_dtype(),
     )
     intermediate_cache3 = torch.zeros(
         (M, hidden_states.topk, w2.shape[1]),
         device=hidden_states.activation.device,
-        dtype=hidden_states.activation.dtype,
+        dtype=torch.get_default_dtype(),
     )
 
-    compute_type = to_triton_dtype(hidden_states.activation.dtype)
+    output_type = to_triton_dtype(torch.get_default_dtype())
     # Add bs as a tuning key if in graph, because bs is also a key for graph
     # capturing and thus fixed per graph.
-    if isinstance(hidden_states, IndexedBatchedRoutedActivationWithScale):
+    if isinstance(hidden_states, ExpertBlockIndexedBatchedRoutedActivationWithScale):
         hidden_states_activation = hidden_states.activation
         a1_scale = hidden_states.activation_scale
     elif not soft_fp8:
@@ -960,7 +969,7 @@ def fused_experts_fp8(
         hidden_states.activation.shape[0] * hidden_states.topk,
         hidden_states.topk,
         config,
-        compute_type=compute_type,
+        output_type=output_type,
         block_shape=block_shape,
         soft_fp8=soft_fp8,
     )
@@ -992,7 +1001,7 @@ def fused_experts_fp8(
         hidden_states.activation.shape[0] * hidden_states.topk,
         1,
         config,
-        compute_type=compute_type,
+        output_type=output_type,
         block_shape=block_shape,
         soft_fp8=soft_fp8,
     )
@@ -1044,7 +1053,7 @@ def fused_experts_fp8_per_channel(
         dtype=hidden_states.activation.dtype,
     )
 
-    compute_type = to_triton_dtype(hidden_states.activation.dtype)
+    output_type = to_triton_dtype(hidden_states.activation.dtype)
 
     # Per-token FP8 quantization for activations
     hidden_states_activation, a1_scale = per_token_quant_fp8(hidden_states.activation)
@@ -1061,7 +1070,7 @@ def fused_experts_fp8_per_channel(
         hidden_states.activation.shape[0] * hidden_states.topk,
         hidden_states.topk,
         config,
-        compute_type=compute_type,
+        output_type=output_type,
         per_channel_quant=True,
     )
 
@@ -1093,7 +1102,7 @@ def fused_experts_fp8_per_channel(
         hidden_states.activation.shape[0] * hidden_states.topk,
         1,
         config,
-        compute_type=compute_type,
+        output_type=output_type,
         per_channel_quant=True,
     )
 
