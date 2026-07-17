@@ -476,8 +476,10 @@ class BenchmarkServing:
                 )
                 await asyncio.sleep(interval)
             outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
+            batch_complete = time.perf_counter()
 
-        return outputs
+        request_start = min(output.start_timestamp for output in outputs)
+        return outputs, batch_complete - request_start
 
     def benchmark(self):
         # Warmup
@@ -490,12 +492,12 @@ class BenchmarkServing:
         # Measure
         outputs: list[RequestFuncOutput] = []
 
-        start_time = time.perf_counter()
+        total_time = 0.0
 
         for _ in range(self.config.num_iterations):
-            outputs.extend(asyncio.run(self.run_async()))
-
-        total_time = time.perf_counter() - start_time
+            iteration_outputs, request_duration = asyncio.run(self.run_async())
+            outputs.extend(iteration_outputs)
+            total_time += request_duration
 
         return outputs, total_time
 
