@@ -57,9 +57,7 @@ def get_extensions():
         for arch in torch_cuda_arch_list.split():
             if arch.startswith("8.") or arch.startswith("9."):
                 enable_marlin = True
-    enable_custom_all_reduce = (
-        (hygon_build == "0") and (muxi_build == "0") and (ascend_build == "0")
-    )
+    enable_custom_all_reduce = (muxi_build == "0") and (ascend_build == "0")
     enable_dsa_fp8_kv_dequant = (
         (hygon_build == "0") and (muxi_build == "0") and (ascend_build == "0")
     )
@@ -94,6 +92,8 @@ def get_extensions():
         ]
 
     if enable_custom_all_reduce:
+        cxx_extra_args += ["-DCHITU_ENABLE_CUSTOM_ALL_REDUCE=1"]
+        nvcc_extra_args += ["-DCHITU_ENABLE_CUSTOM_ALL_REDUCE=1"]
         extra_sources += [
             os.path.join(this_dir, "cuda/allreduce/vllm_custom_all_reduce.cu"),
         ]

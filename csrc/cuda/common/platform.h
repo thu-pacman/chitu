@@ -39,12 +39,18 @@ using cudaError_t = hipError_t;
 using cudaStream_t = hipStream_t;
 using cudaIpcMemHandle_t = hipIpcMemHandle_t;
 using cudaStreamCaptureStatus = hipStreamCaptureStatus;
+using cudaStreamCaptureMode = hipStreamCaptureMode;
 using CUdeviceptr = void *;
 
 // CUDA enum value compatibility - use #define to avoid hipify transforming
 // variable names
-#define cudaIpcMemLazyEnablePeerAccess hipIpcMemLazyEnablePeerAccess
 #define cudaStreamCaptureStatusActive hipStreamCaptureStatusActive
+#define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
+
+// Use a project-local name because PyTorch's hipify rewrites identifiers in
+// macro definitions and would create a self-referential HIP macro.
+constexpr unsigned int chituIpcMemLazyEnablePeerAccess =
+    hipIpcMemLazyEnablePeerAccess;
 
 // CUDA driver API compatibility
 #define CU_POINTER_ATTRIBUTE_RANGE_START_ADDR                                  \
@@ -59,11 +65,18 @@ using CUdeviceptr = void *;
 #define cudaGetErrorString hipGetErrorString
 #define cudaDeviceReset hipDeviceReset
 #define cudaMemcpy hipMemcpy
+#define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaIpcOpenMemHandle hipIpcOpenMemHandle
 #define cudaIpcGetMemHandle hipIpcGetMemHandle
 #define cudaIpcCloseMemHandle hipIpcCloseMemHandle
 #define cudaStreamIsCapturing hipStreamIsCapturing
+#define cudaThreadExchangeStreamCaptureMode hipThreadExchangeStreamCaptureMode
+#define cudaStreamSynchronize hipStreamSynchronize
+#define cudaMalloc hipMalloc
+#define cudaMemsetAsync hipMemsetAsync
+#define cudaFree hipFree
 #define cudaSetDevice hipSetDevice
 
 #else
@@ -72,5 +85,8 @@ using CUdeviceptr = void *;
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+constexpr unsigned int chituIpcMemLazyEnablePeerAccess =
+    cudaIpcMemLazyEnablePeerAccess;
 
 #endif

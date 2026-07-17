@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from chitu.device_type import is_hygon
 from chitu.import_utils import try_import_platform_dep, try_import_opt_dep
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
@@ -19,6 +20,10 @@ logger = getLogger(__name__)
 
 custom_ar = False
 _backend_checked = False
+
+
+def _hygon_custom_ar_enabled() -> bool:
+    return os.environ.get("CHITU_HYGON_CUSTOM_AR", "1").strip() == "1"
 
 
 def _init_backend():
@@ -50,6 +55,14 @@ CUSTOM_ALL_REDUCE_MAX_SIZES = {
         6: 1 * MiB,
         8: 1 * MiB,
     },
+    # Full-HSW TP2/4/6/8 CUDA-graph measurements validated custom AR through
+    # a BF16 [256, 7168] payload (3.5 MiB).
+    "hygon": {
+        2: 7 * MiB // 2,
+        4: 7 * MiB // 2,
+        6: 7 * MiB // 2,
+        8: 7 * MiB // 2,
+    },
 }
 
 
@@ -60,16 +73,58 @@ def is_weak_contiguous(inp: torch.Tensor):
     )
 
 
-def _check_p2p_access(rank: int, world_size: int) -> bool:
-    for i in range(world_size):
-        if i == rank:
+def _check_p2p_access(local_device_id: int, local_device_ids: List[int]) -> bool:
+    for peer_device_id in local_device_ids:
+        if peer_device_id == local_device_id:
             continue
         try:
-            if not torch.cuda.can_device_access_peer(rank, i):
+            if not torch.cuda.can_device_access_peer(local_device_id, peer_device_id):
                 return False
         except Exception:
             return False
     return True
+
+
+def _check_full_hsw(physical_device_ids: List[int]) -> bool:
+    """Return whether every Hygon device pair has a direct HSW link."""
+    initialized = False
+    try:
+        amdsmi, has_amdsmi = try_import_platform_dep("amdsmi")
+        if not has_amdsmi:
+            logger.warning(
+                "amdsmi is not available; cannot verify HSW topology. "
+                "Disabling custom AR."
+            )
+            return False
+
+        amdsmi.amdsmi_init()
+        initialized = True
+        handles = amdsmi.amdsmi_get_processor_handles()
+        if len(set(physical_device_ids)) != len(physical_device_ids) or any(
+            device_id < 0 or device_id >= len(handles)
+            for device_id in physical_device_ids
+        ):
+            return False
+
+        hsw_type = amdsmi.AmdSmiIoLinkType.XGMI.value
+        for i, src_id in enumerate(physical_device_ids):
+            for dst_id in physical_device_ids[i + 1 :]:
+                link = amdsmi.amdsmi_topo_get_link_type(
+                    handles[src_id], handles[dst_id]
+                )
+                link_type = getattr(link["type"], "value", link["type"])
+                if int(link["hops"]) != 1 or int(link_type) != hsw_type:
+                    return False
+        return True
+    except Exception as e:
+        logger.warning("Failed to verify HSW topology: %s", e)
+        return False
+    finally:
+        if initialized:
+            try:
+                amdsmi.amdsmi_shut_down()
+            except Exception as e:
+                logger.debug("Failed to shut down amdsmi cleanly: %s", e)
 
 
 def _check_full_nvlink(physical_device_ids) -> bool:
@@ -134,6 +189,11 @@ class ChituCustomAllreduce:
             self.disabled = True
             return
 
+        if is_hygon() and not _hygon_custom_ar_enabled():
+            logger.info("Hygon custom allreduce disabled by CHITU_HYGON_CUSTOM_AR=0.")
+            self.disabled = True
+            return
+
         assert (
             dist.get_backend(group) != dist.Backend.NCCL
         ), "ChituCustomAllreduce should be attached to a non-NCCL group."
@@ -155,31 +215,63 @@ class ChituCustomAllreduce:
         elif isinstance(device, str):
             device = torch.device(device)
         self.device = device
+        # HIP graph-pool allocations are not reliably visible through peer IPC
+        # mappings on Hygon. Stage into the pre-registered uncached buffer.
+        self._use_staging_buffer_in_graph = is_hygon()
 
         try:
-            cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
             local_index = device.index
             if local_index is None:
                 local_index = torch.cuda.current_device()
-            if cuda_visible_devices:
-                device_ids = list(map(int, cuda_visible_devices.split(",")))
+            visible_devices = next(
+                (
+                    value
+                    for name in (
+                        "CUDA_VISIBLE_DEVICES",
+                        "HIP_VISIBLE_DEVICES",
+                        "ROCR_VISIBLE_DEVICES",
+                    )
+                    if (value := os.environ.get(name))
+                ),
+                None,
+            )
+            if visible_devices:
+                device_ids = list(map(int, visible_devices.split(",")))
                 physical_device_id = device_ids[local_index]
             else:
                 physical_device_id = local_index
 
-            tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-            gather_list = [torch.zeros_like(tensor) for _ in range(self.world_size)]
-            dist.all_gather(gather_list, tensor, group=self.group)
+            topology = torch.tensor(
+                [local_index, physical_device_id], dtype=torch.int, device="cpu"
+            )
+            gather_list = [torch.zeros_like(topology) for _ in range(self.world_size)]
+            dist.all_gather(gather_list, topology, group=self.group)
 
-            physical_device_ids = [int(t.item()) for t in gather_list]
-            self.fully_connected = _check_full_nvlink(physical_device_ids)
+            local_device_ids = [int(t[0].item()) for t in gather_list]
+            physical_device_ids = [int(t[1].item()) for t in gather_list]
 
-            if not _check_p2p_access(self.rank, self.world_size):
+            if len(set(local_device_ids)) != self.world_size:
+                logger.warning(
+                    "Custom allreduce disabled: group is not contained on one "
+                    "host with unique local device IDs: %s",
+                    local_device_ids,
+                )
+                self.disabled = True
+                return
+
+            if not _check_p2p_access(local_index, local_device_ids):
                 logger.warning(
                     f"Rank {self.rank}: P2P access check failed. Custom AR disabled."
                 )
                 self.disabled = True
                 return
+
+            if is_hygon():
+                self.fully_connected = _check_full_hsw(physical_device_ids)
+                topology_name = "HSW"
+            else:
+                self.fully_connected = _check_full_nvlink(physical_device_ids)
+                topology_name = "NVLink"
 
             if not self.fully_connected:
                 # vLLM's upstream check is `world_size > 2 and not fully_connected`
@@ -187,12 +279,13 @@ class ChituCustomAllreduce:
                 # practice the cross-device release/acquire.sys barrier is still
                 # unreliable on PCIe-only hosts (see vllm_custom_all_reduce.cuh's
                 # multi_gpu_barrier), so we keep the stricter rule: any group
-                # without full NVLink disables custom AR.
+                # without a fully connected device fabric disables custom AR.
                 logger.warning(
-                    "Custom allreduce disabled: not full NVLink between all GPUs "
-                    "in this group (world_size=%d). PCIe P2P cannot guarantee the "
+                    "Custom allreduce disabled: not full %s between all GPUs "
+                    "in this group (world_size=%d). P2P alone cannot guarantee the "
                     "cross-device atomic / release-acquire visibility the barrier "
                     "kernel depends on.",
+                    topology_name,
                     self.world_size,
                 )
                 self.disabled = True
@@ -205,6 +298,11 @@ class ChituCustomAllreduce:
             self.disabled = True
             return
 
+        if is_hygon():
+            max_size = min(
+                max_size,
+                CUSTOM_ALL_REDUCE_MAX_SIZES["hygon"][self.world_size],
+            )
         self.max_size = max_size
 
         try:
@@ -253,13 +351,16 @@ class ChituCustomAllreduce:
             yield
         finally:
             self._IS_CAPTURING = False
-            if not self.disabled:
+            if not self.disabled and not self._use_staging_buffer_in_graph:
                 self.register_graph_buffers()
 
     def _register_for_cuda_graph_capture(self):
         from chitu.cuda_graph import add_post_hook_for_currently_capturing_graph_object
 
         if torch.cuda.is_current_stream_capturing():
+            self._IS_CAPTURING = True
+            if self._use_staging_buffer_in_graph:
+                return
             has_run = [False]
 
             def post_hook():
@@ -269,7 +370,6 @@ class ChituCustomAllreduce:
                     has_run[0] = True
 
             add_post_hook_for_currently_capturing_graph_object(post_hook)
-            self._IS_CAPTURING = True
 
     def register_graph_buffers(self):
         if self.disabled or self._ptr == 0:
@@ -303,6 +403,8 @@ class ChituCustomAllreduce:
             return False
 
         if self.world_size == 2 or self.fully_connected:
+            if is_hygon():
+                return inp_size <= self.max_size
             return inp_size < self.max_size
 
         return False
@@ -334,7 +436,11 @@ class ChituCustomAllreduce:
         if self.disabled or not self.should_custom_ar(input):
             return None
 
-        registered = self._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        registered = (
+            self._IS_CAPTURING
+            and torch.cuda.is_current_stream_capturing()
+            and not self._use_staging_buffer_in_graph
+        )
         out = torch.empty_like(input)
 
         self.all_reduce(input, out=out, registered=registered)

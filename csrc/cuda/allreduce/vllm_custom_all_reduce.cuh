@@ -47,7 +47,11 @@ struct Signal {
 };
 
 struct __align__(16) RankData {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    const void *ptrs[8];
+#else
     const void *__restrict__ ptrs[8];
+#endif
 };
 
 struct __align__(16) RankSignals {
@@ -87,7 +91,7 @@ DINLINE half &assign_add(half &a, half b) {
 }
 DINLINE float &assign_add(float &a, float b) { return a += b; }
 
-#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+#if defined(__HIP_PLATFORM_AMD__) || (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
 DINLINE float upcast_s(nv_bfloat16 val) { return __bfloat162float(val); }
 template <> DINLINE nv_bfloat16 downcast_s(float val) {
     return __float2bfloat16(val);
@@ -135,7 +139,10 @@ template <typename O> DINLINE O downcast(array_t<float, O::size> val) {
 }
 
 static DINLINE void st_flag_release(FlagType *flag_addr, FlagType flag) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    __hip_atomic_store(flag_addr, flag, __ATOMIC_RELEASE,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     asm volatile("st.release.sys.global.u32 [%1], %0;" ::"r"(flag),
                  "l"(flag_addr));
 #else
@@ -145,6 +152,10 @@ static DINLINE void st_flag_release(FlagType *flag_addr, FlagType flag) {
 }
 
 static DINLINE FlagType ld_flag_acquire(FlagType *flag_addr) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    return __hip_atomic_load(flag_addr, __ATOMIC_ACQUIRE,
+                             __HIP_MEMORY_SCOPE_SYSTEM);
+#else
     FlagType flag;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
@@ -156,19 +167,30 @@ static DINLINE FlagType ld_flag_acquire(FlagType *flag_addr) {
                  : "l"(flag_addr));
 #endif
     return flag;
+#endif
 }
 
 static DINLINE void st_flag_volatile(FlagType *flag_addr, FlagType flag) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    __hip_atomic_store(flag_addr, flag, __ATOMIC_RELAXED,
+                       __HIP_MEMORY_SCOPE_SYSTEM);
+#else
     asm volatile("st.volatile.global.u32 [%1], %0;" ::"r"(flag),
                  "l"(flag_addr));
+#endif
 }
 
 static DINLINE FlagType ld_flag_volatile(FlagType *flag_addr) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    return __hip_atomic_load(flag_addr, __ATOMIC_RELAXED,
+                             __HIP_MEMORY_SCOPE_SYSTEM);
+#else
     FlagType flag;
     asm volatile("ld.volatile.global.u32 %0, [%1];"
                  : "=r"(flag)
                  : "l"(flag_addr));
     return flag;
+#endif
 }
 
 // is_start: whether this is the very first synchronization barrier.
@@ -351,7 +373,7 @@ class CustomAllreduce {
             char *ipc_ptr;
             CUDACHECK(cudaIpcOpenMemHandle(
                 (void **)&ipc_ptr, *((const cudaIpcMemHandle_t *)ipc_handle),
-                cudaIpcMemLazyEnablePeerAccess));
+                chituIpcMemLazyEnablePeerAccess));
             it->second = ipc_ptr;
         }
         return it->second;
@@ -460,17 +482,19 @@ class CustomAllreduce {
         RankData *ptrs;
         cudaStreamCaptureStatus status;
         CUDACHECK(cudaStreamIsCapturing(stream, &status));
-        if (status == cudaStreamCaptureStatusActive) {
+        auto registered_it = buffers_.find(input);
+        if (registered_it != buffers_.end()) {
+            // Hygon graph capture stages input into an uncached IPC buffer.
+            // Prefer its pre-registered peer pointers even while capturing.
+            ptrs = registered_it->second;
+        } else if (status == cudaStreamCaptureStatusActive) {
             ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
             graph_unreg_buffers_.push_back(input);
         } else {
-            auto it = buffers_.find(input);
-            if (it == buffers_.end())
-                throw std::runtime_error(
-                    "buffer address " +
-                    std::to_string(reinterpret_cast<uint64_t>(input)) +
-                    " is not registered!");
-            ptrs = it->second;
+            throw std::runtime_error(
+                "buffer address " +
+                std::to_string(reinterpret_cast<uint64_t>(input)) +
+                " is not registered!");
         }
 
         size /= d;
@@ -481,6 +505,20 @@ class CustomAllreduce {
                                                    output, rank_, size);
         // TODO(hanzhi713): Threshold is different for A100 and H100.
         // Add per device threshold.
+#if defined(CHITU_HYGON_BUILD) && CHITU_HYGON_BUILD == 1
+        // Hygon HSW uses the lower-traffic reduce-scatter/all-gather path for
+        // every supported world size and payload. Keep the upstream threshold
+        // selection below for other platforms.
+        if (!full_nvlink_)
+            throw std::runtime_error(
+                "Hygon two-stage custom allreduce requires a fully connected "
+                "peer topology");
+#define REDUCE_CASE(ngpus)                                                     \
+    case ngpus: {                                                              \
+        KL(ngpus, cross_device_reduce_2stage);                                 \
+        break;                                                                 \
+    }
+#else
 #define REDUCE_CASE(ngpus)                                                     \
     case ngpus: {                                                              \
         if (world_size_ == 2) {                                                \
@@ -495,6 +533,7 @@ class CustomAllreduce {
         }                                                                      \
         break;                                                                 \
     }
+#endif
 
         switch (world_size_) {
             REDUCE_CASE(2)
