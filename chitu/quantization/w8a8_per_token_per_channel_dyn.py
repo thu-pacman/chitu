@@ -48,6 +48,7 @@ from chitu.lazy import LazyTensor, eval_lazy
 from chitu.global_vars import get_global_args
 from chitu.utils import parse_dtype
 
+_, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 lmslim_quant_ops, has_lmslim_quant_ops = try_import_platform_dep(
     "lmslim.quantize.quant_ops"
@@ -56,6 +57,8 @@ aiter, has_aiter = try_import_platform_dep("aiter.moe")
 deepgemm, has_deepgemm = try_import_platform_dep("deepgemm")
 lightop, has_lightop = try_import_platform_dep("lightop")
 
+if has_triton:
+    from chitu.moe.experts.triton_fused_experts import fused_experts_int8
 if has_torch_npu:
     from chitu.moe.experts import fused_experts_no_sum_npu, fused_experts_npu_for_ep
 
@@ -379,47 +382,6 @@ class AscendW8A8PerTokenPerChannelDynLinear(
         return y.view(*x.shape[:-1], y.shape[-1])
 
 
-@QuantizationRegistry.register_linear(
-    W8A8_PER_TOKEN_PER_CHANNEL_DYN,
-    when=lambda kwargs: is_hygon(),
-    priority=12,
-)
-class HygonW8A8PerTokenPerChannelDynLinear(W8A8PerTokenPerChannelDynLinear):
-    """
-    W8A8 per-token/per-channel dynamic linear layer on Hygon.
-
-    Hygon checkpoints store weight scales with a singleton trailing dimension.
-    """
-
-    def __init__(
-        self,
-        ############################################
-        # Common parameters for all quantizations
-        in_features: int,
-        out_features: int,
-        has_bias: bool = True,
-        ############################################
-        # Parameters specific to this quantization
-        weight_scale_dtype: Optional[torch.dtype | str] = None,
-        weight_scale_has_singleton_last_dim: bool = False,
-    ):
-        super().__init__(
-            in_features,
-            out_features,
-            has_bias,
-            weight_scale_dtype=weight_scale_dtype,
-            weight_scale_has_singleton_last_dim=weight_scale_has_singleton_last_dim,
-        )
-
-    @torch.no_grad()
-    @override
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[0] == 0:
-            output_shape = (*x.shape[:-1], self.out_features)
-            return torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        return super().forward(x)
-
-
 def _finalize_fused_experts_sum_output(
     output, hidden_states, topk_weights: torch.Tensor, inplace: bool
 ):
@@ -605,15 +567,8 @@ def _run_sum_concat_torch_npu(
     )
 
 
-@QuantizationRegistry.register_moe_experts(
-    "w8a8_per_token_per_channel_dyn", merge_gate_up=True
-)
-class AscendW8A8PerTokenPerChannelDynMoeExperts(
-    NativeLayoutMixin, QuantizedMoeExpertsMerged
-):
-    """
-    AscendW8A8Dynamic quantized MoeExperts
-    """
+class W8A8PerTokenPerChannelDynMoeExpertsMergedBase(QuantizedMoeExpertsMerged):
+    """Merged W8A8 MoE experts with shared parameter layout."""
 
     def __init__(
         self,
@@ -640,16 +595,13 @@ class AscendW8A8PerTokenPerChannelDynMoeExperts(
             n_activated_experts,
             checkpoint_prefix,
         )
-
         if weight_scale_dtype is None:
             weight_scale_dtype = torch.get_default_dtype()
         elif isinstance(weight_scale_dtype, str):
             weight_scale_dtype = parse_dtype(weight_scale_dtype)
-
         self.gate_up_proj_weight = torch.nn.Parameter(
             torch.empty(
-                (self.group_size, moe_inter_dim * 2, self.dim),
-                dtype=torch.int8,
+                (self.group_size, moe_inter_dim * 2, self.dim), dtype=torch.int8
             ),
             requires_grad=False,
         )
@@ -665,10 +617,7 @@ class AscendW8A8PerTokenPerChannelDynMoeExperts(
             requires_grad=False,
         )
         self.down_proj_weight = torch.nn.Parameter(
-            torch.empty(
-                (self.group_size, self.dim, moe_inter_dim),
-                dtype=torch.int8,
-            ),
+            torch.empty((self.group_size, self.dim, moe_inter_dim), dtype=torch.int8),
             requires_grad=False,
         )
         self.down_proj_weight_scale = torch.nn.Parameter(
@@ -683,6 +632,13 @@ class AscendW8A8PerTokenPerChannelDynMoeExperts(
             requires_grad=False,
         )
 
+
+@QuantizationRegistry.register_moe_experts(
+    "w8a8_per_token_per_channel_dyn", merge_gate_up=True
+)
+class AscendW8A8PerTokenPerChannelDynMoeExperts(
+    NativeLayoutMixin, W8A8PerTokenPerChannelDynMoeExpertsMergedBase
+):
     def init_native_layout(self):
         super().init_native_layout()
         self.apply_native_layout(self.gate_up_proj_weight, NpuFractalZnTensor)
@@ -800,73 +756,11 @@ class AscendW8A8PerTokenPerChannelDynMoeExperts(
     priority=10,
 )
 class HygonAiterW8A8PerTokenPerChannelDynMoeExpertsMerged(
-    NativeLayoutMixin, QuantizedMoeExpertsMerged
+    NativeLayoutMixin, W8A8PerTokenPerChannelDynMoeExpertsMergedBase
 ):
     """
     W8A8 per-token/per-channel dynamic MoE on Hygon using Aiter MOE_C.
     """
-
-    def __init__(
-        self,
-        ############################################
-        # Common parameters for all quantizations
-        dim: int,
-        moe_inter_dim: int,
-        global_n_experts: int,
-        experts_start_idx: int,
-        experts_end_idx: int,
-        n_activated_experts: int,
-        checkpoint_prefix: str,
-        ############################################
-        # Parameters specific to this quantization
-        weight_scale_dtype: Optional[torch.dtype | str] = None,
-        weight_scale_has_singleton_last_dim: bool = False,
-    ):
-        super().__init__(
-            dim,
-            moe_inter_dim,
-            global_n_experts,
-            experts_start_idx,
-            experts_end_idx,
-            n_activated_experts,
-            checkpoint_prefix,
-        )
-        if weight_scale_dtype is None:
-            weight_scale_dtype = torch.get_default_dtype()
-        elif isinstance(weight_scale_dtype, str):
-            weight_scale_dtype = parse_dtype(weight_scale_dtype)
-        self.gate_up_proj_weight = torch.nn.Parameter(
-            torch.empty(
-                (self.group_size, moe_inter_dim * 2, self.dim), dtype=torch.int8
-            ),
-            requires_grad=False,
-        )
-        self.gate_up_proj_weight_scale = torch.nn.Parameter(
-            torch.empty(
-                (
-                    (self.group_size, moe_inter_dim * 2, 1)
-                    if weight_scale_has_singleton_last_dim
-                    else (self.group_size, moe_inter_dim * 2)
-                ),
-                dtype=weight_scale_dtype,
-            ),
-            requires_grad=False,
-        )
-        self.down_proj_weight = torch.nn.Parameter(
-            torch.empty((self.group_size, self.dim, moe_inter_dim), dtype=torch.int8),
-            requires_grad=False,
-        )
-        self.down_proj_weight_scale = torch.nn.Parameter(
-            torch.empty(
-                (
-                    (self.group_size, self.dim, 1)
-                    if weight_scale_has_singleton_last_dim
-                    else (self.group_size, self.dim)
-                ),
-                dtype=weight_scale_dtype,
-            ),
-            requires_grad=False,
-        )
 
     def init_native_layout(self):
         super().init_native_layout()
@@ -939,6 +833,12 @@ class HygonAiterW8A8PerTokenPerChannelDynMoeExpertsMerged(
             raise RuntimeError("Aiter MoE requires all experts to be local.")
 
         M = routed_x.activation.shape[0]
+        if M == 0:
+            return torch.empty(
+                (0, self.dim),
+                dtype=routed_x.activation.dtype,
+                device=routed_x.activation.device,
+            )
         E, N1, K, N2, _ = _validate_indexed_moe_shapes(
             label="Aiter MoE",
             activation=routed_x.activation,
@@ -977,8 +877,14 @@ class HygonAiterW8A8PerTokenPerChannelDynMoeExpertsMerged(
             moe_config=moe_config,
             inplace=False,
             activation="silu",
-            w1_scale=self.gate_up_proj_weight_scale,
-            w2_scale=self.down_proj_weight_scale,
+            w1_scale=self.gate_up_proj_weight_scale.view(
+                self.group_size, self.moe_inter_dim * 2, 1
+            )
+            .to(torch.float32)
+            .contiguous(),
+            w2_scale=self.down_proj_weight_scale.view(self.group_size, self.dim, 1)
+            .to(torch.float32)
+            .contiguous(),
             w1_zp=None,
             w2_zp=None,
             a1_scale=None,
@@ -995,90 +901,59 @@ class HygonAiterW8A8PerTokenPerChannelDynMoeExpertsMerged(
 @QuantizationRegistry.register_moe_experts(
     W8A8_PER_TOKEN_PER_CHANNEL_DYN,
     merge_gate_up=True,
+    when=lambda _: has_triton,
+)
+class TritonW8A8PerTokenPerChannelDynMoeExpertsMerged(
+    W8A8PerTokenPerChannelDynMoeExpertsMergedBase
+):
+    """W8A8 per-token/per-channel dynamic MoE using Triton kernels."""
+
+    @override
+    @functools.singledispatchmethod
+    def forward_no_sum(
+        self, routed_x: BatchedRoutedActivation, impl: str = "triton"
+    ) -> BatchedExpertResult:
+        return super().forward_no_sum(routed_x, impl=impl)
+
+    @forward_no_sum.register
+    def _(
+        self,
+        routed_x: IndexedBatchedRoutedActivation,
+        impl: str = "triton",
+    ) -> PerTokenBatchedExpertResult:
+        return fused_experts_int8(
+            hidden_states=routed_x,
+            w1=self.gate_up_proj_weight,
+            w2=self.down_proj_weight,
+            activation="silu",
+            use_int8_w8a16=False,
+            w1_scale=self.gate_up_proj_weight_scale,
+            w2_scale=self.down_proj_weight_scale,
+            a1_scale=None,
+            a2_scale=None,
+            use_int8_w8a8=True,
+            swiglu_limit=self.swiglu_limit,
+            experts_start_idx=self.experts_start_idx,
+        )
+
+
+@QuantizationRegistry.register_moe_experts(
+    W8A8_PER_TOKEN_PER_CHANNEL_DYN,
+    merge_gate_up=True,
     when=lambda _: is_hygon()
     and _lightop_gemm_w8a8_smooth_available()
     and _lightop_moe_gemm_w8a8_available(),
     priority=1,
 )
-class HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged(QuantizedMoeExpertsMerged):
+class HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged(
+    W8A8PerTokenPerChannelDynMoeExpertsMergedBase
+):
     """W8A8 per-token/per-channel dynamic MoE on Hygon using LightOP."""
 
     @override
     @functools.singledispatchmethod
     def forward_no_sum(self, routed_x: Any, impl: str = "auto") -> BatchedExpertResult:
         return super().forward_no_sum(routed_x, impl=impl)
-
-    def __init__(
-        self,
-        ############################################
-        # Common parameters for all quantizations
-        dim: int,
-        moe_inter_dim: int,
-        global_n_experts: int,
-        experts_start_idx: int,
-        experts_end_idx: int,
-        n_activated_experts: int,
-        checkpoint_prefix: str,
-        ############################################
-        # Parameters specific to this quantization
-        weight_scale_dtype: Optional[torch.dtype | str] = None,
-        weight_scale_has_singleton_last_dim: bool = False,
-    ):
-        super().__init__(
-            dim,
-            moe_inter_dim,
-            global_n_experts,
-            experts_start_idx,
-            experts_end_idx,
-            n_activated_experts,
-            checkpoint_prefix,
-        )
-        if weight_scale_dtype is None:
-            weight_scale_dtype = torch.get_default_dtype()
-        elif isinstance(weight_scale_dtype, str):
-            weight_scale_dtype = parse_dtype(weight_scale_dtype)
-        self.gate_up_proj_weight = torch.nn.Parameter(
-            torch.empty(
-                (self.group_size, moe_inter_dim * 2, self.dim), dtype=torch.int8
-            ),
-            requires_grad=False,
-        )
-        self.gate_up_proj_weight_scale = torch.nn.Parameter(
-            torch.empty(
-                (
-                    (self.group_size, moe_inter_dim * 2, 1)
-                    if weight_scale_has_singleton_last_dim
-                    else (self.group_size, moe_inter_dim * 2)
-                ),
-                dtype=weight_scale_dtype,
-            ),
-            requires_grad=False,
-        )
-        self.down_proj_weight = torch.nn.Parameter(
-            torch.empty((self.group_size, self.dim, moe_inter_dim), dtype=torch.int8),
-            requires_grad=False,
-        )
-        self.down_proj_weight_scale = torch.nn.Parameter(
-            torch.empty(
-                (
-                    (self.group_size, self.dim, 1)
-                    if weight_scale_has_singleton_last_dim
-                    else (self.group_size, self.dim)
-                ),
-                dtype=weight_scale_dtype,
-            ),
-            requires_grad=False,
-        )
-
-    def _ensure_lightop_scales(
-        self,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return (
-            self.gate_up_proj_weight,
-            self.gate_up_proj_weight_scale.to(torch.float32).contiguous(),
-            self.down_proj_weight,
-            self.down_proj_weight_scale.to(torch.float32).contiguous(),
-        )
 
     @torch.no_grad()
     def _w8a8_expert_gemm(
@@ -1297,7 +1172,24 @@ class HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged(QuantizedMoeExpertsM
             )
         M = routed_x.activation.shape[0]
         topk = topk_weights.shape[1]
-        w1, w1_scale_3d, w2, w2_scale_3d = self._ensure_lightop_scales()
+        if M == 0:
+            return routed_x, torch.empty(
+                (0, topk, self.dim),
+                dtype=routed_x.activation.dtype,
+                device=routed_x.activation.device,
+            )
+        w1 = self.gate_up_proj_weight
+        w1_scale_3d = (
+            self.gate_up_proj_weight_scale.to(torch.float32)
+            .view(self.group_size, self.moe_inter_dim * 2, 1)
+            .contiguous()
+        )
+        w2 = self.down_proj_weight
+        w2_scale_3d = (
+            self.down_proj_weight_scale.to(torch.float32)
+            .view(self.group_size, self.dim, 1)
+            .contiguous()
+        )
         cfg1, cfg2, has_tuned_cfg = _lightop_get_moe_cuda_config(
             E=w1.shape[0],
             M=M,
@@ -1335,8 +1227,13 @@ class HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged(QuantizedMoeExpertsM
             topk,
             cfg1,
         )
-        intermediate_cache2 = silu_and_mul(intermediate_cache1)
-        q_intermediate_cache2, a2_scale_1d = a8_per_token_act_quant(intermediate_cache2)
+        intermediate_cache2 = eval_lazy(silu_and_mul(intermediate_cache1))
+        intermediate_cache2_2d = intermediate_cache2.reshape(
+            -1, intermediate_cache2.shape[-1]
+        )
+        q_intermediate_cache2, a2_scale_1d = a8_per_token_act_quant(
+            intermediate_cache2_2d
+        )
         q_intermediate_cache2 = q_intermediate_cache2.contiguous()
         a2_scale = a2_scale_1d.to(torch.float32).reshape(-1, 1).contiguous()
         intermediate_cache3 = torch.zeros(
@@ -1359,31 +1256,6 @@ class HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged(QuantizedMoeExpertsM
         )
         return routed_x, intermediate_cache3
 
-    def _triton_fallback_no_sum(
-        self,
-        routed_x: IndexedBatchedRoutedActivation,
-    ) -> PerTokenBatchedExpertResult:
-        from chitu.moe.experts.triton_fused_experts import fused_experts_int8
-
-        w1, w1_scale_3d, w2, w2_scale_3d = self._ensure_lightop_scales()
-        if not routed_x.expert_ids_are_local:
-            routed_x = routed_x.as_local_expert_ids(
-                self.experts_start_idx, self.experts_start_idx + w1.shape[0]
-            )
-        return fused_experts_int8(
-            hidden_states=routed_x,
-            w1=w1,
-            w2=w2,
-            activation="silu",
-            use_int8_w8a16=False,
-            w1_scale=w1_scale_3d,
-            w2_scale=w2_scale_3d,
-            a1_scale=None,
-            a2_scale=None,
-            use_int8_w8a8=True,
-            experts_start_idx=0,
-        )
-
     def _forward_indexed(
         self,
         routed_x: IndexedBatchedRoutedActivation,
@@ -1394,9 +1266,7 @@ class HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged(QuantizedMoeExpertsM
             topk_weights=weights,
         )
         if per_token_topk is None:
-            per_token_topk = self._triton_fallback_no_sum(routed_x).activation
-            weighted = per_token_topk * weights.to(per_token_topk.dtype).unsqueeze(-1)
-            return weighted.sum(dim=1).to(routed_x.activation.dtype)
+            raise RuntimeError("LightOP W8A8 MoE tuned config is not available.")
         return per_token_topk.sum(dim=1).to(routed_x.activation.dtype)
 
     def _forward_no_sum_indexed(
@@ -1413,7 +1283,7 @@ class HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged(QuantizedMoeExpertsM
             ),
         )
         if per_token_topk is None:
-            return self._triton_fallback_no_sum(routed_x)
+            raise RuntimeError("LightOP W8A8 MoE tuned config is not available.")
         return PerTokenBatchedExpertResult(per_token_topk)
 
 
@@ -1424,71 +1294,9 @@ class HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged(QuantizedMoeExpertsM
     priority=13,
 )
 class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
-    NativeLayoutMixin, QuantizedMoeExpertsMerged
+    NativeLayoutMixin, W8A8PerTokenPerChannelDynMoeExpertsMergedBase
 ):
     """W8A8 per-token/per-channel dynamic MoE on Hygon using DeepGEMM."""
-
-    def __init__(
-        self,
-        ############################################
-        # Common parameters for all quantizations
-        dim: int,
-        moe_inter_dim: int,
-        global_n_experts: int,
-        experts_start_idx: int,
-        experts_end_idx: int,
-        n_activated_experts: int,
-        checkpoint_prefix: str,
-        ############################################
-        # Parameters specific to this quantization
-        weight_scale_dtype: Optional[torch.dtype | str] = None,
-        weight_scale_has_singleton_last_dim: bool = False,
-    ):
-        super().__init__(
-            dim,
-            moe_inter_dim,
-            global_n_experts,
-            experts_start_idx,
-            experts_end_idx,
-            n_activated_experts,
-            checkpoint_prefix,
-        )
-        if weight_scale_dtype is None:
-            weight_scale_dtype = torch.get_default_dtype()
-        elif isinstance(weight_scale_dtype, str):
-            weight_scale_dtype = parse_dtype(weight_scale_dtype)
-        self.gate_up_proj_weight = torch.nn.Parameter(
-            torch.empty(
-                (self.group_size, moe_inter_dim * 2, self.dim), dtype=torch.int8
-            ),
-            requires_grad=False,
-        )
-        self.gate_up_proj_weight_scale = torch.nn.Parameter(
-            torch.empty(
-                (
-                    (self.group_size, moe_inter_dim * 2, 1)
-                    if weight_scale_has_singleton_last_dim
-                    else (self.group_size, moe_inter_dim * 2)
-                ),
-                dtype=weight_scale_dtype,
-            ),
-            requires_grad=False,
-        )
-        self.down_proj_weight = torch.nn.Parameter(
-            torch.empty((self.group_size, self.dim, moe_inter_dim), dtype=torch.int8),
-            requires_grad=False,
-        )
-        self.down_proj_weight_scale = torch.nn.Parameter(
-            torch.empty(
-                (
-                    (self.group_size, self.dim, 1)
-                    if weight_scale_has_singleton_last_dim
-                    else (self.group_size, self.dim)
-                ),
-                dtype=weight_scale_dtype,
-            ),
-            requires_grad=False,
-        )
 
     def init_native_layout(self):
         super().init_native_layout()

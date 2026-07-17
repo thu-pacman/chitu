@@ -107,7 +107,8 @@ void all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
                             out.numel());
         break;
     }
-#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+#if defined(__HIP_PLATFORM_AMD__) ||                                           \
+    (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
     case at::ScalarType::BFloat16: {
         fa->allreduce<nv_bfloat16>(
             stream, reinterpret_cast<nv_bfloat16 *>(reg_buffer),
@@ -171,7 +172,7 @@ allocate_shared_buffer_and_handle(int64_t size) {
     AT_CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
 
 // Allocate buffer
-#if defined(USE_ROCM)
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     // data buffers need to be "uncached" for signal on MI200
     AT_CUDA_CHECK(
         hipExtMallocWithFlags((void **)&buffer, size, hipDeviceMallocUncached));
@@ -198,7 +199,7 @@ fptr_t open_mem_handle(torch::Tensor &mem_handle) {
     void *ipc_ptr;
     AT_CUDA_CHECK(cudaIpcOpenMemHandle(
         (void **)&ipc_ptr, *((const cudaIpcMemHandle_t *)mem_handle.data_ptr()),
-        cudaIpcMemLazyEnablePeerAccess));
+        chituIpcMemLazyEnablePeerAccess));
     return reinterpret_cast<fptr_t>(ipc_ptr);
 }
 

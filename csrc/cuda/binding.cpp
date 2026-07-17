@@ -10,7 +10,7 @@
 
 #include "common/platform.h"
 
-#if !defined(CHITU_HYGON_BUILD) || CHITU_HYGON_BUILD != 1
+#if defined(CHITU_ENABLE_CUSTOM_ALL_REDUCE) && CHITU_ENABLE_CUSTOM_ALL_REDUCE
 #include "allreduce/custom_all_reduce.h"
 #endif
 #include "dequant/ops.h"
@@ -62,7 +62,7 @@ void init_compute(py::module &m) {
     m.def("cuda_topk_softmax", &topk_softmax, "");
     m.def("cuda_frequency_penalty", &applyFrequencyPenalty, "");
     m.def("cuda_response_append", &response_append, "");
-#if !defined(CHITU_HYGON_BUILD) || CHITU_HYGON_BUILD != 1
+#if defined(CHITU_ENABLE_CUSTOM_ALL_REDUCE) && CHITU_ENABLE_CUSTOM_ALL_REDUCE
     m.def("init_custom_ar", &init_custom_ar, "Initialize custom all-reduce",
           "ipc_pointers"_a, "rank_data"_a, "rank"_a, "full_nvlink"_a);
     m.def("all_reduce", &all_reduce, "Perform all-reduce operation", "handle"_a,

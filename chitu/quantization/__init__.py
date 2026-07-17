@@ -37,7 +37,7 @@ from chitu.quantization.w8a8_per_token_per_channel_dyn import (
     W8A8PerTokenPerChannelDynLinear,
     AscendW8A8PerTokenPerChannelDynLinear,
     AscendW8A8PerTokenPerChannelDynMoeExperts,
-    HygonW8A8PerTokenPerChannelDynLinear,
+    TritonW8A8PerTokenPerChannelDynMoeExpertsMerged,
     HygonAiterW8A8PerTokenPerChannelDynMoeExpertsMerged,
     HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged,
     HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged,
