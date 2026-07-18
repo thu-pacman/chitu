@@ -119,6 +119,10 @@ extras_require = {
         "deep_gemm @ file://localhost"
         + os.path.join(setup_dir, "third_party/DeepGEMM"),
     ],
+    "deepgemm_hygon": [
+        "deepgemm @ file://localhost"
+        + os.path.join(setup_dir, "third_party/deepgemm_hygon"),
+    ],
     "deep_ep": [
         "deep_ep @ file://localhost" + os.path.join(setup_dir, "third_party/DeepEP"),
     ],  # Please make sure `requirements-build-deep_ep-cu12.txt` is installed at BUILD TIME

@@ -17,12 +17,14 @@ import torch
 from omegaconf import OmegaConf
 import re
 
-from chitu.import_utils import try_import_opt_dep
+from chitu.device_type import has_native_fp8
+from chitu.import_utils import try_import_platform_dep, try_import_opt_dep
 from chitu.schemas.serve_config import ServeConfig, StaticConfig
 from chitu.schemas.utils import ModelConfigResolver
 
 logger = getLogger(__name__)
 
+triton, has_triton = try_import_platform_dep("triton")
 numa, has_numa = try_import_opt_dep("numa", "cpu")
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 
@@ -459,45 +461,35 @@ def resolve_default_args(args):
         args.models.type == ModelType.DEEPSEEK_V3
         or args.models.type == ModelType.GLM_5_2
     ) and args.models.get("index_topk", None) is not None:
-        assert args.infer.indexer_type in (
-            "auto",
-            "deepgemm",
-            "hygon",
-            "torch_bf16",
-            "triton",
-        )
         from chitu.dsa_indexer import (
+            HYGON_INDEXER_MAX_MTP_SIZE,
             support_indexer_deepgemm,
             support_indexer_hygon,
-            support_indexer_torch_bf16,
             validate_indexer_config,
         )
 
         if args.infer.indexer_type == "auto":
             if (
-                support_indexer_hygon
-                and args.infer.cache_type == "paged"
-                and args.infer.mtp_size < 3
-                and int(args.models.index_head_dim) == 128
-                and int(args.models.index_n_heads) in (32, 64)
-            ):
-                args.infer.indexer_type = "hygon"
-            elif (
-                support_indexer_torch_bf16
-                and args.infer.cache_type == "paged"
-                and args.infer.mtp_size < 3
-            ):
-                args.infer.indexer_type = "torch_bf16"
-            elif (
                 support_indexer_deepgemm
                 and args.infer.cache_type == "paged"
                 and args.infer.mtp_size < 3
             ):
                 args.infer.indexer_type = "deepgemm"
-            else:
+            elif has_native_fp8() and has_triton:
                 args.infer.indexer_type = "triton"
-        else:
-            validate_indexer_config(args, args.infer.indexer_type)
+            elif (
+                support_indexer_hygon
+                and args.infer.cache_type == "paged"
+                and args.infer.mtp_size <= HYGON_INDEXER_MAX_MTP_SIZE
+                and int(args.models.index_head_dim) == 128
+                and int(args.models.index_n_heads) in (32, 64)
+            ):
+                args.infer.indexer_type = "hygon"
+            elif args.infer.cache_type == "paged":
+                args.infer.indexer_type = "torch_bf16"
+            else:
+                raise NotImplementedError("No available infer.indexer_type found")
+        validate_indexer_config(args, args.infer.indexer_type)
 
     if args.infer.process_group_timeout_seconds == "auto":
         if args.infer.full_warmup:

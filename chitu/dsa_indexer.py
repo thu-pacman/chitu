@@ -33,7 +33,9 @@ logger = getLogger(__name__)
 
 triton, has_triton = try_import_platform_dep("triton")
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
+deepgemm, has_hygon_deepgemm = try_import_opt_dep("deepgemm", "deepgemm_hygon")
 lightop, has_hygon_lightop = try_import_platform_dep("lightop")
+chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
 support_indexer_deepgemm = (
     is_nvidia()
@@ -43,15 +45,15 @@ support_indexer_deepgemm = (
 )
 support_indexer_hygon = (
     is_hygon()
+    and has_chitu_backend
     and has_hygon_lightop
     and hasattr(lightop, "op")
     and hasattr(lightop.op, "mqa_logits")
-    and hasattr(lightop, "gemmopt")
-    and hasattr(lightop.gemmopt, "paged_mqa_logits")
-    and hasattr(lightop.gemmopt, "get_paged_mqa_logits_metadata")
+    and has_hygon_deepgemm
+    and hasattr(deepgemm, "paged_mqa_logits")
+    and hasattr(deepgemm, "get_paged_mqa_logits_metadata")
 )
-# torch_bf16 uses a pure-torch bf16 mqa_logits.
-support_indexer_torch_bf16 = is_ascend()
+HYGON_INDEXER_MAX_MTP_SIZE = 5
 
 
 def validate_indexer_config(args, indexer_type):
@@ -63,6 +65,10 @@ def validate_indexer_config(args, indexer_type):
         _validate_hygon_indexer_config(args)
     elif indexer_type == "torch_bf16":
         _validate_torch_bf16_indexer_config(args)
+    elif indexer_type == "triton":
+        pass
+    else:
+        raise ValueError(f"Unrecognized indexer_type {indexer_type}")
 
 
 def _validate_deepgemm_indexer_config(args):
@@ -79,14 +85,19 @@ def _validate_deepgemm_indexer_config(args):
 def _validate_hygon_indexer_config(args):
     if not support_indexer_hygon:
         raise ValueError(
-            "indexer_type=hygon requires Hygon lightop mqa logits, paged mqa logits, and paged metadata"
+            "indexer_type=hygon requires the Chitu Hygon indexer TopK kernel, "
+            "Hygon lightop prefill mqa logits, and DeepGEMM paged mqa logits "
+            "and metadata"
         )
     if args.infer.cache_type != "paged":
         raise ValueError(
             f"indexer_type=hygon only supports cache_type=paged, but got {args.infer.cache_type}"
         )
-    if args.infer.mtp_size > 2:
-        raise ValueError("indexer_type=hygon does not support mtp_size > 2")
+    if args.infer.mtp_size > HYGON_INDEXER_MAX_MTP_SIZE:
+        raise ValueError(
+            "indexer_type=hygon only supports mtp_size <= "
+            f"{HYGON_INDEXER_MAX_MTP_SIZE}"
+        )
     if int(args.models.index_head_dim) != 128:
         raise ValueError(
             f"indexer_type=hygon requires index_head_dim=128, but got {args.models.index_head_dim}"
@@ -98,8 +109,6 @@ def _validate_hygon_indexer_config(args):
 
 
 def _validate_torch_bf16_indexer_config(args):
-    if not support_indexer_torch_bf16:
-        raise ValueError("indexer_type=torch_bf16 requires running on an Ascend NPU")
     if args.infer.cache_type != "paged":
         raise ValueError(
             f"indexer_type=torch_bf16 only supports cache_type=paged, but got {args.infer.cache_type}"
@@ -240,7 +249,30 @@ class DSAIndexer:
             True,
         )
 
-        return index_score
+        # This kernel stores the output in a (ragged_q * ragged_k) layout, we need to
+        # convert it back to (ragged_q * local_k), so the following `topk` can be correct.
+        # The (ragged_q * ragged_k) layout is a pure waste of memory, because most of the
+        # items in a row does not store any value at all. TODO: Implement our own version
+        # of this kernel on hygon, and replace it.
+        out = torch.full(
+            (index_score.shape[0], seq_len_delta.new.max_len),
+            float("-inf"),
+            dtype=index_score.dtype,
+            device=index_score.device,
+        )
+        for seq_id, (row_start, seq_len) in enumerate(
+            zip(seq_len_delta.new.prefix_lens_list, seq_len_delta.new.lens_list)
+        ):
+            rows = torch.nonzero(
+                seq_len_delta.delta_seq_ids_tensor_device == seq_id, as_tuple=True
+            )[0]
+            local_width = min(seq_len, seq_len_delta.new.max_len)
+            if rows.numel() and local_width:
+                out[rows, :local_width] = index_score[
+                    rows, row_start : row_start + local_width
+                ]
+
+        return out
 
     @staticmethod
     def _bf16_mqa_logits_torch(
@@ -312,26 +344,45 @@ class DSAIndexer:
         k_page_table: torch.Tensor,  # [b, n_pages_per_seq]
     ):
         """
-        Indexer score by Hygon lightop.gemmopt.paged_mqa_logits() for decode stage.
+        Indexer score by Hygon DeepGEMM paged_mqa_logits() for decode stage.
+
+        The main decode pass supplies all configured MTP queries together,
+        while each draft-layer pass supplies one query per request. Infer the
+        actual query group size from the tensor instead of assuming that every
+        call contains ``self.mtp_size`` queries.
         """
         s_q, h, d = q.shape
         batch_size = seq_len_delta.batch_size
-        assert s_q == batch_size * self.mtp_size
+        if batch_size == 0:
+            return torch.empty(
+                (0, self.static_max_n), dtype=torch.float32, device=q.device
+            )
+        if s_q % batch_size != 0:
+            raise ValueError(
+                f"Hygon paged MQA requires query rows divisible by batch size, "
+                f"got rows={s_q}, batch_size={batch_size}"
+            )
+        next_n = s_q // batch_size
+        if not 1 <= next_n <= self.mtp_size:
+            raise ValueError(
+                "Hygon paged MQA query group must be between 1 and the "
+                f"configured mtp_size={self.mtp_size}, got {next_n}"
+            )
 
         # reshape as batch view
-        q = q.view(batch_size, self.mtp_size, h, d)
+        q = q.view(batch_size, next_n, h, d)
 
         weights = weights.reshape(s_q, h)
         assert k.dim() == 3
         k = k.unsqueeze(2)
 
         context_lens = seq_len_delta.new.lens_tensor_device
-        schedule_meta = lightop.gemmopt.get_paged_mqa_logits_metadata(
+        schedule_meta = deepgemm.get_paged_mqa_logits_metadata(
             context_lens,
-            64,  # lightop paged MQA metadata uses page_size=64
+            64,  # DeepGEMM paged MQA metadata uses page_size=64
             torch.cuda.get_device_properties(q.device).multi_processor_count,
         )
-        return lightop.gemmopt.paged_mqa_logits(
+        return deepgemm.paged_mqa_logits(
             q,
             k,
             weights,

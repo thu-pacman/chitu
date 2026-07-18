@@ -72,6 +72,7 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> tuple[Any, bool]:
         "fla",
         "flash_mla",
         "deep_gemm",
+        "deepgemm_hygon",
         "deep_ep",
         "tilelang",
         "cpu",

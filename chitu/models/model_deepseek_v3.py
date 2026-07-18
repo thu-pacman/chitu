@@ -165,6 +165,9 @@ class Indexer(torch.nn.Module):
             checkpoint_prefix=f"{checkpoint_prefix}.weights_proj",
         )
 
+    def must_materialize_topk_indices(self) -> bool:
+        return False
+
     def _build_index_qk(
         self,
         x: torch.Tensor,
@@ -1140,13 +1143,7 @@ class AttentionDeepSeekV3(Attention):
                     indexer_cache_accessor = self.indexer_cache.get_accessor(
                         self.layer_id
                     )
-                    force_topk_indices = bool(
-                        getattr(
-                            self.indexer,
-                            "must_materialize_topk_indices",
-                            lambda: False,
-                        )()
-                    )
+                    force_topk_indices = self.indexer.must_materialize_topk_indices()
 
                     if cp_active:
                         # CP indexer: separate Q/K RoPE, local Q × global K

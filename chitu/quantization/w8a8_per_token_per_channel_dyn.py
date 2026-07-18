@@ -12,7 +12,11 @@ import os
 import torch
 
 from chitu.device_type import get_device_name, is_hygon
-from chitu.import_utils import try_import_platform_dep
+from chitu.import_utils import (
+    try_import_platform_dep,
+    try_import_opt_dep,
+    try_import_and_setup_torch_npu,
+)
 from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
     ExpertBlockPermutedBatchedExpertResult,
@@ -43,7 +47,6 @@ from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedLinearBase, QuantizedMoeExpertsMerged
 from chitu.ops.quant import w8a8_gemm_per_token_per_channel, a8_per_token_act_quant
 from chitu.ops.utils import make_op_dispatcher
-from chitu.import_utils import try_import_and_setup_torch_npu
 from chitu.lazy import LazyTensor, eval_lazy
 from chitu.global_vars import get_global_args
 from chitu.utils import parse_dtype
@@ -54,7 +57,7 @@ lmslim_quant_ops, has_lmslim_quant_ops = try_import_platform_dep(
     "lmslim.quantize.quant_ops"
 )
 aiter, has_aiter = try_import_platform_dep("aiter.moe")
-deepgemm, has_deepgemm = try_import_platform_dep("deepgemm")
+deepgemm, has_deepgemm = try_import_opt_dep("deepgemm", "deepgemm_hygon")
 lightop, has_lightop = try_import_platform_dep("lightop")
 
 if has_triton:

@@ -12,13 +12,11 @@ initialization; MTP decode temporarily switches the same indexer hook at call
 time because its skip state is runtime-controlled.
 """
 
-from __future__ import annotations
-
-import re
 from typing import Any, Optional
+from typing_extensions import override
+import re
 
 import torch
-from typing_extensions import override
 
 from chitu.kv_cache import KVCacheBase
 from chitu.batched_freqs_cis import BatchedFreqsCis
@@ -101,6 +99,7 @@ class IndexerGLM52(Indexer):
         self._indexer_buffer_mode = mode
         self._indexer_buffer = buffer
 
+    @override
     def must_materialize_topk_indices(self) -> bool:
         return self._indexer_buffer_mode is not None
 

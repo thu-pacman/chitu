@@ -32,5 +32,5 @@
     path = third_party/fast-hadamard-transform
     url = https://github.com/Dao-AILab/fast-hadamard-transform.git
 [submodule "third_party/hpc-ops"]
-	path = third_party/hpc-ops
-	url = https://github.com/Tencent/hpc-ops.git
+    path = third_party/hpc-ops
+    url = https://github.com/Tencent/hpc-ops.git
