@@ -1655,6 +1655,7 @@ def test_prepare_prefill_metadata_multi_cache_managers():
     assert len(task1.new_cache_ids["main"]) == 1
     assert len(task1.new_cache_ids["indexer"]) == 2
     assert task1.inc_hit_tokens == 127
+    assert task1.req.num_hit_tokens == 127
     assert task1.consumed_req_tokens == 127
     assert task1.prefill_chunk_size == 1
 

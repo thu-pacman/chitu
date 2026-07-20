@@ -1130,6 +1130,10 @@ class TaskCollector:
 
     @staticmethod
     def all_finished():
+        executor = getattr(Backend, "executor", None)
+        has_pending_pp_results = getattr(executor, "has_pending_pp_results", None)
+        if has_pending_pp_results is not None and has_pending_pp_results():
+            return False
         return len(TaskCollector._last_batch_results) == 0 and all(
             (tasks is None or tasks.num_tasks == 0)
             for tasks in TaskCollector._waiting_queue

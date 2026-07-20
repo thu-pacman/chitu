@@ -59,7 +59,12 @@ from chitu.serve.common import (
 from .kv_transfer import KVManagerPrefill, KVManagerDecode
 from chitu.serve.event_loop import get_server_event_loop
 from chitu.chitu_main import chitu_terminate
-from chitu.task import SerializedPackedTasksPayloadType, TaskPool
+from chitu.task import (
+    SerializedPackedTasksPayloadType,
+    TaskPool,
+    TaskCollector,
+    DPTaskCollector,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -329,6 +334,91 @@ class PDSchedulerService:
             f"connected to stats port {stats_port}"
         )
 
+    def _log_termination_drain_state(self, reason: str) -> None:
+        """Debug-only dump of local state that can block PD termination ack."""
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+
+        try:
+            task_snapshot = []
+            for task_id in list(TaskPool.id_list):
+                task = TaskPool.pool.get(task_id)
+                if task is None:
+                    continue
+                req = getattr(task, "req", None)
+                task_snapshot.append(
+                    {
+                        "task_id": task_id,
+                        "task_type": getattr(
+                            getattr(task, "task_type", None), "name", None
+                        ),
+                        "status": getattr(getattr(task, "status", None), "name", None),
+                        "num_new_tokens": getattr(task, "num_new_tokens", None),
+                        "has_unsync_new_token": getattr(
+                            task, "has_unsync_new_token", None
+                        ),
+                        "finish_reason": getattr(req, "finish_reason", None),
+                        "request_id": getattr(req, "request_id", None),
+                    }
+                )
+
+            scheduler = self.scheduler
+            queue_snapshot = {}
+            for name in (
+                "_prefill_incoming_q",
+                "_prefill_bootstrap_q",
+                "_prefill_ready_q",
+                "_decode_incoming_q",
+                "_decode_prealloc_q",
+                "_decode_ready_q",
+            ):
+                queue = getattr(scheduler, name, None)
+                if queue is None:
+                    continue
+                queue_snapshot[name] = {
+                    "size": queue.size(),
+                    "head": [rid for rid, _ in queue.peek(10)],
+                }
+
+            task_collector_waiting = getattr(TaskCollector, "_waiting_queue", None)
+            dp_collector_waiting = getattr(
+                DPTaskCollector, "_total_packedtasks_queue", None
+            )
+
+            logger.debug(
+                "[PD_TERMINATE_DRAIN] reason=%s mode=%s rank=%s "
+                "backend_state=%s all_finished=%s "
+                "task_pool_size=%s pending_queue_size=%s task_ids=%s tasks=%s "
+                "task_collector_available=%s task_collector_last_results=%s "
+                "task_collector_waiting=%s "
+                "dp_task_collector_available=%s dp_task_collector_waiting=%s "
+                "scheduler_queues=%s scheduler_stats=%s",
+                reason,
+                self.pd_mode.value,
+                self.rank,
+                getattr(Backend.state, "name", Backend.state),
+                TaskPool.all_finished(),
+                len(TaskPool.pool),
+                len(TaskPool.pending_queue),
+                list(TaskPool.id_list),
+                task_snapshot,
+                TaskCollector.available(),
+                len(getattr(TaskCollector, "_last_batch_results", [])),
+                [
+                    None if tasks is None else getattr(tasks, "num_tasks", None)
+                    for tasks in list(task_collector_waiting or [])
+                ],
+                DPTaskCollector.available(),
+                [
+                    None if tasks is None else getattr(tasks, "num_tasks", None)
+                    for tasks in list(dp_collector_waiting or [])
+                ],
+                queue_snapshot,
+                scheduler.get_pd_stats() if scheduler is not None else None,
+            )
+        except Exception:
+            logger.exception("[PD_TERMINATE_DRAIN] failed to collect debug state")
+
     async def _send_termination_ack(self):
         """Notify the router that this PD public rank has drained and is exiting."""
         if self.stats_socket is None:
@@ -372,6 +462,9 @@ class PDSchedulerService:
                             await self._send_termination_ack()
                             self.running = False
                             break
+                        self._log_termination_drain_state(
+                            "terminate_received_not_drained"
+                        )
                     elif (
                         isinstance(request_data, dict)
                         and request_data.get("__chitu_msg_type") == "profile"
@@ -413,6 +506,9 @@ class PDSchedulerService:
                 logger.info("PD termination ack sent via stats reporter")
                 self.running = False
                 break
+
+            if Backend.state == BackendState.Terminating:
+                self._log_termination_drain_state("stats_reporter_terminating")
 
             await asyncio.sleep(1.0)  # Report every second
 

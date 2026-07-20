@@ -438,7 +438,7 @@ class Scheduler:
         if cached_len == task.prefix_tokens_len:
             cached_len = task.prefix_tokens_len - 1
 
-        task.inc_hit_tokens = cached_len - task.consumed_req_tokens
+        task.set_inc_hit_tokens(cached_len - task.consumed_req_tokens)
         task.consumed_req_tokens = cached_len
 
         for name, cache_manager in self.cache_manager_dict.items():

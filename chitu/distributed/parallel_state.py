@@ -7,7 +7,7 @@ from logging import getLogger
 
 import torch
 
-from chitu.distributed.comm_group import CommGroup
+from chitu.distributed.comm_group import CommGroup, _get_pg_timeout
 from chitu.device_type import is_ascend
 from chitu.cp_utils import CPContext, NoOpCPContext, _set_cp_context, _reset_cp_context
 
@@ -25,6 +25,7 @@ _PP_GROUP: Optional[CommGroup] = None
 _EMBED_TOKENS_LM_HEAD_TP_GROUP: Optional[CommGroup] = None
 
 _PP_PAIR_GROUP_DICT: dict[tuple[int, int], Any] = {}  # Compatible with NPU platforms
+_PP_RESULT_PAIR_GROUP_DICT: dict[tuple[int, int], Any] = {}
 
 
 def get_global_var(name):
@@ -243,6 +244,12 @@ def get_pp_pair_group(
     return _PP_PAIR_GROUP_DICT.get((rank0, rank1), None)
 
 
+def get_pp_result_pair_group(
+    rank0: int, rank1: int
+) -> Optional[torch.distributed.ProcessGroup]:
+    return _PP_RESULT_PAIR_GROUP_DICT.get((rank0, rank1), None)
+
+
 def initialize_world_group(rank: int, world_size: int):
     global _WORLD_GROUP
     assert _WORLD_GROUP is None
@@ -294,25 +301,85 @@ def initialize_pp_group(
     pp_rank_lists = get_pp_rank_lists(pp_size=pp_size, world_size=world_size)
     _PP_GROUP = CommGroup(pp_rank_lists, rank)
 
-    # _PP_PAIR_GROUP_DICT reuse the ProcessGroup objects already created
-    # and initialized by CommGroup above (stored in CommGroup().all_gpu_groups).
     assert len(_PP_PAIR_GROUP_DICT) == 0
+    assert len(_PP_RESULT_PAIR_GROUP_DICT) == 0
     if pp_size < 2:
         return
 
-    for pp_rank_list, pg in zip(pp_rank_lists, _PP_GROUP.all_gpu_groups):
-        for i in range(pp_size):
-            next_i = (i + 1) % pp_size
-            r_i, r_next = pp_rank_list[i], pp_rank_list[next_i]
-            if (r_i, r_next) not in _PP_PAIR_GROUP_DICT:
-                _PP_PAIR_GROUP_DICT[(r_i, r_next)] = pg
-                _PP_PAIR_GROUP_DICT[(r_next, r_i)] = pg
+    # Reuse the PP CommGroup communicator for hidden payloads. Results use a
+    # separate communicator so reverse result P2P cannot be matched against the
+    # next forward hidden payload when both are in flight.
+    _register_pp_ring_groups(
+        rank, pp_rank_lists, _PP_GROUP.all_gpu_groups, _PP_PAIR_GROUP_DICT
+    )
+    _register_pp_result_groups(
+        rank,
+        pp_rank_lists,
+        _new_pp_result_process_groups(pp_rank_lists),
+        _PP_RESULT_PAIR_GROUP_DICT,
+    )
 
     if not is_ascend():
-        _warmup_pp_pair_p2p(rank, pp_rank_lists)
+        _warmup_pp_pair_p2p(rank, pp_rank_lists, _PP_PAIR_GROUP_DICT)
+        _warmup_pp_result_p2p(rank, pp_rank_lists, _PP_RESULT_PAIR_GROUP_DICT)
 
 
-def _warmup_pp_pair_p2p(rank: int, pp_rank_lists):
+def _new_pp_result_process_groups(pp_rank_lists):
+    return [
+        torch.distributed.new_group(
+            [pp_rank_list[-1], pp_rank_list[0]], timeout=_get_pg_timeout()
+        )
+        for pp_rank_list in pp_rank_lists
+    ]
+
+
+def _register_pp_result_groups(rank: int, pp_rank_lists, groups, group_dict):
+    for pp_rank_list, pg in zip(pp_rank_lists, groups):
+        sender = pp_rank_list[-1]
+        receiver = pp_rank_list[0]
+        if rank not in (sender, receiver):
+            continue
+        group_dict[(sender, receiver)] = pg
+        group_dict[(receiver, sender)] = pg
+
+
+def _warmup_pp_result_p2p(rank: int, pp_rank_lists, group_dict):
+    for pp_rank_list in pp_rank_lists:
+        sender = pp_rank_list[-1]
+        receiver = pp_rank_list[0]
+        if rank == sender:
+            pg = group_dict[(sender, receiver)]
+            send_buf = torch.zeros(
+                1,
+                dtype=torch.float32,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+            torch.distributed.send(send_buf, dst=receiver, group=pg)
+        elif rank == receiver:
+            pg = group_dict[(receiver, sender)]
+            recv_buf = torch.empty(
+                1,
+                dtype=torch.float32,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+            torch.distributed.recv(recv_buf, src=sender, group=pg)
+    torch.cuda.synchronize()
+    logger.info("PP result P2P communicators warmed up")
+
+
+def _register_pp_ring_groups(rank: int, pp_rank_lists, groups, group_dict):
+    pp_size = len(pp_rank_lists[0]) if pp_rank_lists else 0
+    for pp_rank_list, pg in zip(pp_rank_lists, groups):
+        if rank not in pp_rank_list:
+            continue
+        for i in range(pp_size):
+            r_i = pp_rank_list[i]
+            r_next = pp_rank_list[(i + 1) % pp_size]
+            group_dict[(r_i, r_next)] = pg
+            group_dict[(r_next, r_i)] = pg
+
+
+def _warmup_pp_pair_p2p(rank: int, pp_rank_lists, group_dict):
     """Force NCCL point-to-point communicators for every adjacent PP pair to be
     created, while all ranks are synchronized at init time.
 
@@ -340,15 +407,25 @@ def _warmup_pp_pair_p2p(rank: int, pp_rank_lists):
     device = torch.device("cuda", torch.cuda.current_device())
     for low, high in edges:
         if rank == low:
-            pg = _PP_PAIR_GROUP_DICT[(low, high)]
+            pg = group_dict[(low, high)]
             send_buf = torch.zeros(1, dtype=torch.float32, device=device)
             torch.distributed.send(send_buf, dst=high, group=pg)
         elif rank == high:
-            pg = _PP_PAIR_GROUP_DICT[(high, low)]
+            pg = group_dict[(high, low)]
             recv_buf = torch.empty(1, dtype=torch.float32, device=device)
             torch.distributed.recv(recv_buf, src=low, group=pg)
     torch.cuda.synchronize()
     logger.info("PP pair P2P communicators warmed up")
+
+
+def _destroy_process_groups_once(group_dict):
+    destroyed_group_ids = set()
+    for group in group_dict.values():
+        group_id = id(group)
+        if group_id in destroyed_group_ids:
+            continue
+        destroyed_group_ids.add(group_id)
+        torch.distributed.destroy_process_group(group)
 
 
 def initialize_dp_group(
@@ -464,6 +541,7 @@ def parallel_groups_initialized():
 
 def destroy_parallel_groups():
     _reset_cp_context()
+    _destroy_process_groups_once(_PP_RESULT_PAIR_GROUP_DICT)
     get_tp_group().destroy()
     get_pcp_group().destroy()
     get_pp_group().destroy()

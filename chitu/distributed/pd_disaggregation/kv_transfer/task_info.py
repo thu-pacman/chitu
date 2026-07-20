@@ -57,6 +57,9 @@ class TaskInfo:
     done_count: int = 0
     """RankTransferDone counter."""
 
+    is_prefill_transfer_completed: bool = False
+    """True if all P ranks have completed RDMA for this request."""
+
     rank_bytes: dict[str, int] = field(default_factory=dict)
     """Per-session sent bytes, accumulated from RankTransferDone (P side)."""
 
