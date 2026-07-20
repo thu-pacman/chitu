@@ -36,6 +36,7 @@ install_requires = [
     "hydra-core",
     "fastapi",
     "pydantic>=2,<3",
+    "pydantic-extra-types[all]",
     "uvicorn[standard]",
     "tqdm",
     "einops",

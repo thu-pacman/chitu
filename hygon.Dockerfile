@@ -1,4 +1,4 @@
-FROM image.sourcefind.cn:5000/dcu/admin/base/pytorch:2.4.1-ubuntu22.04-dtk25.04-py3.10-fixpy AS base
+FROM harbor.sourcefind.cn:5443/dcu/admin/base/pytorch:2.9.0-ubuntu22.04-dtk26.04-py3.10 AS base
 
 SHELL ["/bin/bash", "-c"]
 
@@ -54,6 +54,17 @@ RUN if [ "${enable_test}" = "true" ]; then \
     pip install pytest matplotlib; \
 fi
 RUN apt update -y && apt install -y infiniband-diags curl
+
+RUN curl -L --retry 3 --retry-delay 5 -o /tmp/dtk_llvm.run https://download.sourcefind.cn:65024/file/4/dtk_llvm/dtk_llvm.run && \
+    chmod +x /tmp/dtk_llvm.run && \
+    /tmp/dtk_llvm.run && \
+    rm -f /tmp/dtk_llvm.run
+RUN --mount=source=./third_party/hygon_wheels,destination=./third_party/hygon_wheels pip install \
+  ./third_party/hygon_wheels/aiter-0.1.2+das.opt1.dtk2604.torch290.2605071840.g1f8f50-cp310-cp310-linux_x86_64.whl \
+  ./third_party/hygon_wheels/flash_mla-1.2.0+das.optphase1.d512.h64.dtk2604-cp310-cp310-linux_x86_64.whl \
+  ./third_party/hygon_wheels/lmslim-0.3.1+das.opt4.dtk2604.torch290.2604281437.g61fdfe-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl \
+  ./third_party/hygon_wheels/triton-3.5.1+das.opt1.dtk2604.torch290-cp310-cp310-manylinux_2_28_x86_64.whl \
+  -c <(pip list --format freeze | grep -v -e "aiter" -e "flash_mla" -e "flash-mla" -e "lmslim" -e "triton")
 
 # Download prometheus
 RUN --mount=type=secret,id=tos_id \
@@ -146,5 +157,16 @@ COPY ./benchmarks ./benchmarks
 COPY ./chitu/metrics/grafana ./grafana
 
 ENV CHITU_HYGON_BUILD=1
+ENV HIP_GRAPH_ACCUMULATE_DISPATCH=1
+ENV GPU_MAX_HW_QUEUES=3
+
+# Update entrypoint, which calls the original entrypoint of the base image.
+#
+# If you want to change the base image, use
+# `docker inspect --format='Entrypoint: {{.Config.Entrypoint}}' <image>`
+# to check its entrypoint.
+COPY ./script/entrypoint.sh /chitu-entrypoint.sh
+ENTRYPOINT ["/chitu-entrypoint.sh", "/usr/local/bin/docker-entrypoint.sh"]
+
 # The actual installing procedure requries a NPU device, which is not available in the `docker build` stage.
 # We delay it to an additional `docker run` stage which runs `script/install.sh`.

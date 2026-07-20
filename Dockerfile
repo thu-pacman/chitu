@@ -273,6 +273,8 @@ print(next((d.version for d in m.distributions() if (d.metadata.get('Name') or '
     else \
         echo "flashinfer-python not installed; skip installing flashinfer_jit_cache"; \
     fi
+
+
 #####################################
 # Wheel build Stage
 #
@@ -287,11 +289,10 @@ COPY . .
 # build wheel of chitu
 RUN ./script/build_for_dist.sh "${enable_cython}"
 
-# verify the wheel was created
-RUN cp dist/*.whl /tmp/
-RUN ls -al /tmp/
+RUN mkdir -p /tmp/wheels/ && cp dist/*.whl /tmp/wheels/
 
 RUN rm -rf /workspace/chitu/*
+
 
 #####################################
 # Build Stage
@@ -300,11 +301,11 @@ FROM basic_deps AS build
 
 WORKDIR /workspace/chitu
 COPY --from=dependency_installer /opt/conda /opt/conda
-COPY --from=wheel_builder /tmp/ /tmp/
 
 # Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
 # compile at install time, and the compile results are environment dependent.
-RUN pip install /tmp/*.whl \
+RUN --mount=from=wheel_builder,source=/tmp/wheels,target=/tmp/wheels \
+  pip install /tmp/wheels/*.whl \
     -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "numpy" -e "transformers" -e "pytest" -e 'typing-extensions' -e 'typing_extensions' -e "build")
 
 RUN rm -rf /tmp/*

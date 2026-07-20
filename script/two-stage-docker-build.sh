@@ -48,7 +48,7 @@ container_base_name=$(basename ${image_name})
 docker image rm ${image_name}:${image_version} || true
 docker image rm ${image_name}:${image_version}-stage0 || true
 docker rm ${container_base_name}-${image_version}-stage1 || true
-docker build \
+DOCKER_BUILDKIT=1 docker build \
     -f "${dockerfile}" \
     --build-arg optional_deps="${optional_deps}" \
     --build-arg enable_cython="${enable_cython}" \

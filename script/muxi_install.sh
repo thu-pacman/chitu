@@ -50,12 +50,12 @@ if [ "${enable_editable_install}" == "true" ]; then
     pip install \
         --no-build-isolation \
         -e .${OPTIONAL_DEPS_SPECIFIER} \
-        -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "pyzmq" -e "transformers" -e "huggingface-hub" -e "huggingface_hub" -e "huggingface_hub" -e "tokenizers" -e "hf-xet" -e "deepgemm")
+        -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "pyzmq" -e "transformers" -e "huggingface-hub" -e "huggingface_hub" -e "huggingface_hub" -e "tokenizers" -e "hf-xet" -e "deepgemm" -e "xgrammar")
 else
     pip install \
         --no-build-isolation \
         .${OPTIONAL_DEPS_SPECIFIER} \
-        -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "pyzmq" -e "transformers" -e "huggingface-hub" -e "huggingface_hub" -e "huggingface_hub" -e "tokenizers" -e "hf-xet" -e "deepgemm")
+        -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "pyzmq" -e "transformers" -e "huggingface-hub" -e "huggingface_hub" -e "huggingface_hub" -e "tokenizers" -e "hf-xet" -e "deepgemm" -e "xgrammar")
         rm -rf build chitu.egg-info
 
     # Remove the source code. We only need to run the installed package. Keep testings and scripts.
