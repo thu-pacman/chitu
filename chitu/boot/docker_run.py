@@ -16,7 +16,7 @@ import requests
 from logging import getLogger
 
 from chitu.boot.appimage_utils import appdir
-from chitu.boot.arg_utils import args_as_list
+from chitu.boot.arg_utils import args_as_list, suffixed_name
 from chitu.boot.poll import wait_for_server_initialized
 from chitu.boot.tcp_ip import get_local_ip
 
@@ -42,6 +42,7 @@ def docker_run(
     is_master_node,
     torchrun_n_nodes,
     torchrun_nproc_per_node,
+    container_name_suffix=None,
     _proc_registry=None,
 ):
     n_nodes = int(torchrun_n_nodes)
@@ -222,9 +223,16 @@ def docker_run(
             "-e",
             "PYTHONPATH=/workspace/chitu",
         ]
-    docker_cmd += [image_name]
 
-    service_docker_cmd = copy.copy(docker_cmd)
+    def docker_cmd_with_image(suffix):
+        cmd = copy.copy(docker_cmd)
+        container_name = suffixed_name(cfg.boot.job_name, suffix)
+        if container_name is not None:
+            cmd += ["--name", container_name]
+        cmd += [image_name]
+        return cmd
+
+    service_docker_cmd = docker_cmd_with_image(container_name_suffix)
     service_docker_cmd += torchrun_wrapper
     service_docker_cmd += [
         "torchrun",
@@ -257,7 +265,12 @@ def docker_run(
             try:
                 wait_for_server_initialized(status_url)
 
-                on_ready_cmd = list(docker_cmd) + on_ready_args
+                on_ready_suffix = (
+                    f"{container_name_suffix}-on-ready"
+                    if container_name_suffix is not None
+                    else "on-ready"
+                )
+                on_ready_cmd = docker_cmd_with_image(on_ready_suffix) + on_ready_args
                 if cfg.boot.on_ready_relay_args:
                     on_ready_cmd += raw_argv[1:]
                 logger.info(f"Running on_ready: {on_ready_cmd}")

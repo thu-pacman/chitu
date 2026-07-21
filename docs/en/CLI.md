@@ -48,6 +48,16 @@ Number of GPUs per node to use
 
 *Default: `1`.*
 
+### Argument `boot.job_name`
+
+Slurm job name and Docker container name prefix.
+
+Acceptable values:
+- null: Use `${USER}-chitu` as the Slurm job name, and do not set Docker container names.
+- A string: Use this value as the Slurm job name and Docker container name prefix.
+
+*Default: `null`.*
+
 ### Argument `boot.container_image`
 
 Path to container image (override bundled image).

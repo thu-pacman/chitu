@@ -16,6 +16,7 @@ from chitu.boot.srun import srun
 from chitu.boot.ssh import ssh
 from chitu.boot.apptainer_run import apptainer_run
 from chitu.boot.docker_run import docker_run
+from chitu.boot.local_run_base import LocalRunCallback
 from chitu.boot.appimage_utils import appdir, appimage
 
 logger = getLogger(__name__)
@@ -49,6 +50,7 @@ def main(cfg: DictConfig):
     if cfg.boot.interactive_node_0 == "auto":
         cfg.boot.interactive_node_0 = sys.stdout.isatty() and cfg.boot.n_nodes == 1
 
+    local_run_callback: LocalRunCallback
     if cfg.boot.container_image is not None:
         if os.path.isfile(cfg.boot.container_image):
             logger.info("Using apptainer runtime")

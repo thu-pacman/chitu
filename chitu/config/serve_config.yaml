@@ -55,6 +55,13 @@ boot:
   #: Number of GPUs per node to use
   n_gpus_per_node: 1
 
+  #: Slurm job name and Docker container name prefix.
+  #:
+  #: Acceptable values:
+  #: - null: Use `${USER}-chitu` as the Slurm job name, and do not set Docker container names.
+  #: - A string: Use this value as the Slurm job name and Docker container name prefix.
+  job_name: null
+
   #: Path to container image (override bundled image).
   #:
   #: For apptainer: absolute path to a .sif file.

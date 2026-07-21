@@ -37,6 +37,7 @@ def apptainer_run(
     is_master_node,
     torchrun_n_nodes,
     torchrun_nproc_per_node,
+    container_name_suffix=None,
     _proc_registry=None,
 ):
     n_nodes = int(torchrun_n_nodes)

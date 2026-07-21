@@ -11,6 +11,7 @@ from logging import getLogger
 
 from chitu.boot.appimage_utils import appimage
 from chitu.boot.arg_utils import args_as_list
+from chitu.boot.local_run_base import LocalRunCallback
 from chitu.boot.multi_instance import (
     build_instance_launch_plans,
     launch_multi_instance_on_node,
@@ -27,8 +28,12 @@ def run_capture(cmd):
     ).stdout
 
 
-def srun(cfg, raw_argv, local_run_callback):
-    job_name = f"{os.environ.get('USER', '')}-chitu"
+def srun(cfg, raw_argv, local_run_callback: LocalRunCallback):
+    job_name = (
+        cfg.boot.job_name
+        if cfg.boot.job_name is not None
+        else f"{os.environ.get('USER', '')}-chitu"
+    )
 
     n_nodes = int(cfg.boot.n_nodes)
     n_gpus_per_node = int(cfg.boot.n_gpus_per_node)
@@ -189,4 +194,5 @@ def srun(cfg, raw_argv, local_run_callback):
         is_master_node=is_master_node,
         torchrun_n_nodes=n_nodes,
         torchrun_nproc_per_node=n_gpus_per_node,
+        container_name_suffix="service",
     )
