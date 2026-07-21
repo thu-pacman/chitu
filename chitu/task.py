@@ -41,6 +41,9 @@ class TaskStatus(Enum):
     Stopped = -1
     AvailableForSchedule = 0
     Waiting = 1
+    PDPrefillIncoming = 2
+    PDDecodeIncoming = 3
+    PDDecodePrealloc = 4
 
 
 @dataclass
@@ -505,6 +508,8 @@ class Task:
         # PD related
         self.pd_prefill_engine_rank: Optional[int] = None
 
+        self.pd_scheduler_info = {}
+
     def set_inc_hit_tokens(self, num: int) -> None:
         # Per-step incremental hit tokens; clamp negatives to avoid metric drift.
         self.inc_hit_tokens = max(0, int(num))
@@ -518,6 +523,13 @@ class Task:
     def can_schedule(self):
         # reserved as interface
         return self.status == TaskStatus.AvailableForSchedule
+
+    def is_pd_status(self):
+        return self.status in [
+            TaskStatus.PDPrefillIncoming,
+            TaskStatus.PDDecodeIncoming,
+            TaskStatus.PDDecodePrealloc,
+        ]
 
     def user_request_finished(self):
         if not self.status == TaskStatus.Stopped:
@@ -1130,6 +1142,10 @@ class TaskCollector:
 
     @staticmethod
     def all_finished():
+        executor = getattr(Backend, "executor", None)
+        has_pending_pp_results = getattr(executor, "has_pending_pp_results", None)
+        if has_pending_pp_results is not None and has_pending_pp_results():
+            return False
         return len(TaskCollector._last_batch_results) == 0 and all(
             (tasks is None or tasks.num_tasks == 0)
             for tasks in TaskCollector._waiting_queue

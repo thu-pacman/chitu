@@ -5,10 +5,11 @@
 from logging import getLogger
 import subprocess
 import os
+import re
 
 import torch
 
-from chitu.device_type import is_nvidia
+from chitu.device_type import is_hygon, is_nvidia
 from chitu.utils import try_import_opt_dep
 
 numa, has_numa = try_import_opt_dep("numa", "cpu")
@@ -18,35 +19,82 @@ logger = getLogger(__name__)
 
 
 def _get_numa_of_gpu(gpu_id: int):
-    if not is_nvidia():
+    if is_nvidia():
+        try:
+            # Get PCI bus ID from nvidia-smi
+            result = subprocess.run(
+                f"nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i {gpu_id}",
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            pci_bus_id = result.stdout.strip()
+
+            # Convert format (e.g., 00000000:3B:00.0 -> 0000:3b:00.0)
+            pci_parts = pci_bus_id.split(":")
+            if len(pci_parts) != 3:
+                raise RuntimeError(f"Invalid PCI bus ID: {pci_bus_id}")
+            pci_bus_id = f"{pci_parts[0][-4:]}:{pci_parts[1]}:{pci_parts[2]}"
+            pci_bus_id = pci_bus_id.lower()
+
+            # Read from /sys/bus/pci/devices/0000:3b:00.0/numa_node
+            with open(f"/sys/bus/pci/devices/{pci_bus_id}/numa_node") as f:
+                return int(f.read().strip())
+
+        except Exception as e:
+            raise RuntimeError("NUMA node not found") from e
+
+    elif is_hygon():
+        try:
+            result = subprocess.run(
+                "hy-smi --showtoponuma",
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            # Example output:
+            #
+            # ```
+            # ================================= System Management Interface ==================================
+            # ================================================================================================
+            # HCU[0]          : (Topology) Numa Node 0
+            # HCU[0]          : (Topology) Numa Affinity 0
+            # HCU[1]          : (Topology) Numa Node 3
+            # HCU[1]          : (Topology) Numa Affinity 3
+            # HCU[2]          : (Topology) Numa Node 2
+            # HCU[2]          : (Topology) Numa Affinity 2
+            # HCU[3]          : (Topology) Numa Node 1
+            # HCU[3]          : (Topology) Numa Affinity 1
+            # HCU[4]          : (Topology) Numa Node 4
+            # HCU[4]          : (Topology) Numa Affinity 4
+            # HCU[5]          : (Topology) Numa Node 7
+            # HCU[5]          : (Topology) Numa Affinity 7
+            # HCU[6]          : (Topology) Numa Node 6
+            # HCU[6]          : (Topology) Numa Affinity 6
+            # HCU[7]          : (Topology) Numa Node 5
+            # HCU[7]          : (Topology) Numa Affinity 5
+            # ================================================================================================
+            # ======================================== End of SMI Log ========================================
+            # ```
+            for line in result.stdout.splitlines():
+                match = re.search(
+                    rf"^HCU\[{gpu_id}\]\s*:\s*\(Topology\)\s*Numa Node\s+(-?\d+)\s*$",
+                    line,
+                )
+                if match:
+                    return int(match.group(1))
+            raise RuntimeError(f"NUMA node not found for HCU[{gpu_id}]")
+
+        except Exception as e:
+            raise RuntimeError("NUMA node not found") from e
+
+    else:
         raise NotImplementedError(
-            "Detecting NUMA node near GPU is only supported on NVIDIA GPUs"
+            "Detecting NUMA node near GPU is only supported on NVIDIA and Hygon GPUs"
         )
-
-    try:
-        # Get PCI bus ID from nvidia-smi
-        result = subprocess.run(
-            f"nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader -i {gpu_id}",
-            shell=True,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        pci_bus_id = result.stdout.strip()
-
-        # Convert format (e.g., 00000000:3B:00.0 -> 0000:3b:00.0)
-        pci_parts = pci_bus_id.split(":")
-        if len(pci_parts) != 3:
-            raise RuntimeError(f"Invalid PCI bus ID: {pci_bus_id}")
-        pci_bus_id = f"{pci_parts[0][-4:]}:{pci_parts[1]}:{pci_parts[2]}"
-        pci_bus_id = pci_bus_id.lower()
-
-        # Read from /sys/bus/pci/devices/0000:3b:00.0/numa_node
-        with open(f"/sys/bus/pci/devices/{pci_bus_id}/numa_node") as f:
-            return int(f.read().strip())
-
-    except Exception as e:
-        raise RuntimeError("NUMA node not found") from e
 
 
 def _bind_process_to_numa_id(numa_id: int):

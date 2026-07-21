@@ -65,7 +65,12 @@ class BatchedSeqLen:
         self.lens_list = lens_list
         self.device = device
         self.lens_static_tensor_device = StaticTensor(
-            torch.tensor(self.lens_list, device=self.device, dtype=torch.int32),
+            create_tensor(
+                self.lens_list,
+                device=self.device,
+                dtype=torch.int32,
+                sync_free=True,
+            ),
             max_nelem=max_batch_size,
         )
 

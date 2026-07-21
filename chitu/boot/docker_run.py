@@ -111,7 +111,7 @@ def docker_run(
             logger.info(f"Image {image_name} already exists in docker")
 
     hosts_tmp_file = None
-    docker_cmd = ["docker", "run", "--network", "host"]
+    docker_cmd = ["docker", "run", "--network", "host", "--pid=host"]
 
     # Detect the type of device and add the corresponding docker arguments.
     if shutil.which("nvidia-smi"):

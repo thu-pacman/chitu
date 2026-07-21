@@ -35,6 +35,7 @@ rope_theta: 50000.0
 rope_factor: 64.0
 rs_token_id: 163584
 re_token_id: 163585
+reasoning_type: switchable
 # Vision encoder configuration (MoonViT3d)
 vision_config:
   hidden_size: 1152

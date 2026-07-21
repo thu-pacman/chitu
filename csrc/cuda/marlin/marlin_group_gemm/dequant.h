@@ -116,9 +116,11 @@ __device__ inline void dequant<half2, vllm::kU4B8.id(), true>(int q,
     const int MASK = 0x000f000f;
     const int EX = 0x64006400;
     // Guarantee that the `(a & b) | c` operations are LOP3s.
-    int lo = lop3 < (0xf0 & 0xcc) | 0xaa > (q, MASK, EX);
+    // clang-format off
+    int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
     q >>= 4;
-    int hi = lop3 < (0xf0 & 0xcc) | 0xaa > (q, MASK, EX);
+    int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, MASK, EX);
+    // clang-format on
 
     frag_b[0] = *reinterpret_cast<half2 *>(&lo);
     frag_b[1] = *reinterpret_cast<half2 *>(&hi);

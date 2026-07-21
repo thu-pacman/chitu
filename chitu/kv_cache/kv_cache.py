@@ -14,7 +14,7 @@ from chitu.cuda_graph import cuda_graph_safe_cached_property
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
-from chitu.utils import ceil_div
+from chitu.utils import ceil_div, create_tensor
 from chitu.ops import fp8_pertensor_kvcache_quant, fp8_pertoken_kvcache_quant_dsa
 
 if TYPE_CHECKING:
@@ -687,7 +687,12 @@ class PagedKVCache(KVCacheBase):
             blocks + [0] * (max_block_num - len(blocks))
             for blocks in block_lists
         ]
-        cpu_block_table_tensor = torch.tensor(all_block_ids, dtype=torch.int32)
+        cpu_block_table_tensor = create_tensor(
+            all_block_ids,
+            device=self.device,
+            dtype=torch.int32,
+            sync_free=True,
+        )
         self.gpu_block_table.set_shape(cpu_block_table_tensor.shape)
         self.gpu_block_table.get().copy_(cpu_block_table_tensor, non_blocking=True)
 

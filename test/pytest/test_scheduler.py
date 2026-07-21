@@ -1655,6 +1655,7 @@ def test_prepare_prefill_metadata_multi_cache_managers():
     assert len(task1.new_cache_ids["main"]) == 1
     assert len(task1.new_cache_ids["indexer"]) == 2
     assert task1.inc_hit_tokens == 127
+    assert task1.req.num_hit_tokens == 127
     assert task1.consumed_req_tokens == 127
     assert task1.prefill_chunk_size == 1
 
@@ -2004,20 +2005,24 @@ def test_prefill_capacity_reserves_for_inflight_prefill():
 
     from chitu.scheduler import KVCacheCapacityStatus
 
-    # is_new_task为True时，表示新prefill任务，需要考虑为正在prefill的任务预留容量，防止进入自锁状态
+    # need_reserve_capacity为True时，表示新prefill任务，需要考虑为正在prefill的任务预留容量，防止进入自锁状态
     assert (
-        scheduler._check_prefill_capacity(new_task, cached_len=0, is_new_task=True)
+        scheduler._check_prefill_capacity(
+            new_task, cached_len=0, need_reserve_capacity=True
+        )
         is KVCacheCapacityStatus.CONGESTED
     )
 
-    # is_new_task为False时，表示非新prefill任务，容量足够（不扣除为正在prefill任务预留的容量）
+    # need_reserve_capacity为False时，表示非新prefill任务，容量足够（不扣除为正在prefill任务预留的容量）
     assert (
-        scheduler._check_prefill_capacity(new_task, cached_len=0, is_new_task=False)
+        scheduler._check_prefill_capacity(
+            new_task, cached_len=0, need_reserve_capacity=False
+        )
         is KVCacheCapacityStatus.OK
     )
     assert (
         scheduler._check_prefill_capacity(
-            inflight, cached_len=BLOCK_SIZE, is_new_task=False
+            inflight, cached_len=BLOCK_SIZE, need_reserve_capacity=False
         )
         is KVCacheCapacityStatus.OK
     )

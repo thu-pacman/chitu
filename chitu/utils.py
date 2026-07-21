@@ -22,12 +22,14 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 import torch.distributed as dist
+
 from chitu.global_vars import get_global_args
 from chitu.import_utils import (
     try_import_and_setup_torch_npu,
     try_import_platform_dep,
     try_import_opt_dep,
 )
+from chitu.device_type import is_ascend
 
 logger = getLogger(__name__)
 
@@ -488,7 +490,7 @@ def gather_str_to_dst_rank(strings: str, dst: int, group=None) -> Optional[list]
 
 
 def create_tensor(data, device, dtype=None, sync_free=True):
-    if sync_free:
+    if sync_free and not is_ascend():
         pin_memory = not isinstance(data, np.ndarray)
         return torch.tensor(data, dtype=dtype, pin_memory=pin_memory).to(
             device=device, non_blocking=True

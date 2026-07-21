@@ -182,15 +182,27 @@ class MooncakeKVTransferHook:
 
         if DPTaskCollector.available():
             tasks = DPTaskCollector.get_total_packedtasks()
-        if Backend.executor._pd_prefill_only and isinstance(tasks, PackedTasks):
-            for t in tasks.output_tasks:
-                if t is None:
+        if Backend.executor._pd_prefill_only:
+            output_tasks = getattr(tasks, "output_tasks", None)
+            if output_tasks is None:
+                output_tasks = [
+                    TaskPool.pool.get(task_id) for task_id in tasks.output_task_ids
+                ]
+            stopped_task_ids = []
+            for task in output_tasks:
+                if task is None:
                     continue
-                if t.req is not None and not t.req.finish_reason:
-                    t.req.finish_reason = "prefill_only"
-                # Also clear `waiting` to ensure need_remove() becomes True immediately.
-                t.unwait()
-                t.set_stopped()
+                if task.req is not None and not task.req.finish_reason:
+                    task.req.finish_reason = "prefill_only"
+                # Stop task so it won't start decode, and enqueue it for the
+                # normal Scheduler.update() cleanup path. Async PP can detach
+                # result readiness from the current collector slot, so relying
+                # only on executor-side ready_tasks can leave stopped prefill
+                # tasks in TaskPool and block graceful termination.
+                task.set_stopped()
+                stopped_task_ids.append(task.task_id)
+            if stopped_task_ids:
+                TaskCollector.add_update_task_ids(stopped_task_ids)
 
     def before_decode_step(
         self,
@@ -267,7 +279,10 @@ class PDTaskEvictHook:
         return []
 
     def check_evict(self, task_id: str) -> bool:
-        if TaskPool.pool.get(task_id) is not None:
+        if (
+            TaskPool.pool.get(task_id) is not None
+            and not TaskPool.pool.get(task_id).is_pd_status()
+        ):
             return True
         # evict prefilling tasks on decode rank
         pd_scheduler = get_pd_scheduler_instance()

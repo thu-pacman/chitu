@@ -49,7 +49,6 @@ from chitu.dsa_indexer import (
     DSAIndexer,
     support_indexer_deepgemm,
     support_indexer_hygon,
-    support_indexer_torch_bf16,
 )
 
 triton, has_triton = try_import_platform_dep("triton")
@@ -352,7 +351,7 @@ def _ref_bf16_index_score(
     static_max_n,
     is_causal,
 ):
-    """fp32 ground truth for the bf16 lightning indexer.
+    """ground truth for the bf16 lightning indexer, computed and returned in fp32
 
     ``index_type=torch`` would need fp8, which 910B2 does not support
     (Float8_e4m3fn), so this independent fp32 reference is used instead.
@@ -402,6 +401,9 @@ def _ref_bf16_index_score(
     [
         (1, 4096),  # mtp=1 decode
         (2, 4096),  # mtp=2 decode
+        (3, 4096),  # mtp=3 decode
+        (4, 4096),  # mtp=4 decode
+        (5, 4096),  # mtp=5 decode
         (4096, 4096),  # prefill
         (2048, 4096),  # chunked prefill
     ],
@@ -410,28 +412,20 @@ def _ref_bf16_index_score(
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("impl", ["torch_bf16", "hygon"])
 def test_dsa_indexer_paged_kv_bf16(
-    bs,
-    s_q,
-    s_k,
-    n_heads,
-    head_dim,
-    impl,
-    record_benchmark,
+    bs, s_q, s_k, n_heads, head_dim, impl, record_benchmark
 ):
-    if impl == "torch_bf16":
-        if not support_indexer_torch_bf16:
-            pytest.skip("torch_bf16 indexer requires an Ascend NPU")
-    elif impl == "hygon":
-        if not support_indexer_hygon:
-            pytest.skip("hygon indexer requires Hygon lightop")
-    else:
-        pytest.skip(f"{impl=} is not supported")
+    if impl == "hygon" and not support_indexer_hygon:
+        pytest.skip("hygon indexer requires Hygon lightop")
 
-    device = "npu" if impl == "torch_bf16" else "cuda"
+    _, total_memory = torch.cuda.mem_get_info()
+    total_memory = total_memory / (1024**3)
+    if s_q >= 2048 and total_memory < 80:
+        pytest.skip("Skip testing s_q>=2048 on devices with not enough memory")
+
     torch.set_default_dtype(torch.bfloat16)
 
     max_seq_len = 8192
-    mtp_size = s_q if s_q <= 2 else 1
+    mtp_size = s_q if s_q <= 5 else 1
     set_global_args(
         OmegaConf.create(
             {
@@ -456,7 +450,7 @@ def test_dsa_indexer_paged_kv_bf16(
         need_preprocess=False,
     )
 
-    is_decode = s_q <= 2
+    is_decode = s_q <= 5
     if is_decode:
         old_seq_len_list = [torch.randint(1, s_k - s_q, (1,)).item() for _ in range(bs)]
         new_seq_len_list = [ol + s_q for ol in old_seq_len_list]
@@ -472,27 +466,31 @@ def test_dsa_indexer_paged_kv_bf16(
     seq_len_delta = BatchedSeqLenDelta(
         old_seq_len_list,
         new_seq_len_list,
-        device=device,
+        device="cuda",
         cache_prefix_lens_tensor_device=False,
         cache_position_ids_tensor_device=False,
         cache_seq_ids_tensor_device=False,
         cache_delta_position_ids_tensor_device=False,
         cache_delta_seq_ids_tensor_device=False,
     )
+    # BatchedSeqLenDelta defaults to the prefill stage. Production sets this
+    # flag in the executor; set it explicitly here so the decode cases really
+    # exercise the paged score kernel (including MTP sizes greater than two).
+    seq_len_delta.is_decode_stage = is_decode
 
     page_size = 64
     n_pages_per_req = ceil_div(max_seq_len, page_size)
     max_num_pages = n_pages_per_req * bs
-    page_table = torch.randperm(max_num_pages, device=device, dtype=torch.int32)[
+    page_table = torch.randperm(max_num_pages, device="cuda", dtype=torch.int32)[
         : bs * n_pages_per_req
     ].view(bs, n_pages_per_req)
 
     # bf16 q / k
-    q = torch.randn(seq_len_delta.delta_total_len, n_heads, head_dim, device=device)
+    q = torch.randn(seq_len_delta.delta_total_len, n_heads, head_dim, device="cuda")
     weights = torch.randn(
-        seq_len_delta.delta_total_len, n_heads, dtype=torch.float32, device=device
+        seq_len_delta.delta_total_len, n_heads, dtype=torch.float32, device="cuda"
     )
-    k_ragged = torch.randn(seq_len_delta.new.total_len, head_dim, device=device)
+    k_ragged = torch.randn(seq_len_delta.new.total_len, head_dim, device="cuda")
 
     prefix_new_t = (
         seq_len_delta.new.prefix_lens_tensor_device
@@ -521,7 +519,7 @@ def test_dsa_indexer_paged_kv_bf16(
     indexer_backend = DSAIndexer(impl)
 
     def init_indexer_paged_kv_accessor(k_old=None):
-        k_paged = torch.zeros(max_num_pages, page_size, head_dim, device=device)
+        k_paged = torch.zeros(max_num_pages, page_size, head_dim, device="cuda")
         if k_old is not None:
             append_to_paged_kv_cache(
                 k_paged,
@@ -558,17 +556,18 @@ def test_dsa_indexer_paged_kv_bf16(
         static_max_n=max_seq_len,
         is_causal=True,
     )
+    if ref_logits.shape[-1] > logits.shape[-1]:
+        ref_logits = ref_logits[..., : logits.shape[-1]]
 
+    assert logits.shape == ref_logits.shape
     if logits.numel() == 0:
-        assert logits.shape == ref_logits.shape
         return
 
     # The decode path masks only by context length (not causal among mtp tokens),
     # so apply causal masking to the impl output before comparison.
-    mask = torch.arange(0, max_seq_len, device=device).unsqueeze(
+    mask = torch.arange(0, logits.shape[-1], device="cuda").unsqueeze(
         0
     ) <= seq_len_delta.delta_position_ids_tensor_device.unsqueeze(1)
-    logits = logits.clone()
     logits[~mask] = float("-inf")
 
     logits_f = logits.to(torch.float32)

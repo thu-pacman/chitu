@@ -4,6 +4,7 @@
 
 import os
 import concurrent.futures
+import threading
 from logging import getLogger
 import gc
 
@@ -36,6 +37,13 @@ class KVManagerPrefill(KVManagerBase):
         cpu_count = os.cpu_count()
         transfer_thread_pool_size = min(max(4, int(0.75 * cpu_count) // 8), 12)
         self.executor = concurrent.futures.ThreadPoolExecutor(transfer_thread_pool_size)
+        # Protect TaskInfo while the RankTransferDone receive thread and the
+        # main executor thread hand off completion ownership.
+        self._prefill_transfer_state_lock = threading.Lock()
+        # Completion bookkeeping is separate from TaskInfo so TaskInfo can keep
+        # origin/main's per-active-transfer lifetime and still support async PP
+        # drain checks after RankTransferDone removes it.
+        self._completed_prefill_request_counts: dict[str, int] = {}
 
         self.endpoints = PrefillEndpoints(self.prefill_scheduler_id)
         if self.is_ctrl_rank:
@@ -64,26 +72,58 @@ class KVManagerPrefill(KVManagerBase):
         assert isinstance(msg, RankTransferDone)
         logger.debug(f"handle_rank_transfer_done {msg.req_id}")
 
-        info = self._info(msg.req_id)
-        info.done_count += 1
-        if msg.first_token:
-            info.first_token = msg.first_token
-        # Accumulate per-session byte counts.
-        for sid, nbytes in msg.rank_bytes.items():
-            info.rank_bytes[sid] = info.rank_bytes.get(sid, 0) + nbytes
-        if info.done_count >= self.dp_way_size:
-            nty = PrefillDone(
-                req_id=info.req_id,
-                first_token=info.first_token,
-                num_hit_tokens=info.num_hit_tokens,
-                rank_bytes=info.rank_bytes,
-            )
-            endpoint = self._decode_endpoints[info.decode_sid].prefill_done
-            endpoint.send(ProtocolSerializer.pack(nty))
+        with self._prefill_transfer_state_lock:
+            info = self._info(msg.req_id)
+            info.done_count += 1
+            if msg.first_token:
+                info.first_token = msg.first_token
+            # Accumulate per-session byte counts.
+            for sid, nbytes in msg.rank_bytes.items():
+                info.rank_bytes[sid] = info.rank_bytes.get(sid, 0) + nbytes
+            if (
+                info.done_count >= self.dp_way_size
+                and not info.is_prefill_transfer_completed
+            ):
+                nty = PrefillDone(
+                    req_id=info.req_id,
+                    first_token=info.first_token,
+                    num_hit_tokens=info.num_hit_tokens,
+                    rank_bytes=info.rank_bytes,
+                )
+                endpoint = self._decode_endpoints[info.decode_sid].prefill_done
+                endpoint.send(ProtocolSerializer.pack(nty))
 
-            self._remove_info(info.req_id)
+                info.is_prefill_transfer_completed = True
+                self._completed_prefill_request_counts[info.req_id] = (
+                    self._completed_prefill_request_counts.get(info.req_id, 0) + 1
+                )
+                self._remove_info(info.req_id)
 
         self._trace("handle_rank_transfer_done", req_id=msg.req_id)
+
+    def are_prefill_requests_completed(self, request_ids: list[str]) -> bool:
+        """Check whether all RDMA transfers for a batch have completed."""
+        with self._prefill_transfer_state_lock:
+            return all(
+                self._completed_prefill_request_counts.get(request_id, 0) > 0
+                for request_id in request_ids
+            )
+
+    def consume_completed_prefill_requests(self, request_ids: list[str]) -> bool:
+        """Consume async-PP completion markers after RDMA transfers finish."""
+        with self._prefill_transfer_state_lock:
+            if not all(
+                self._completed_prefill_request_counts.get(request_id, 0) > 0
+                for request_id in request_ids
+            ):
+                return False
+            for request_id in request_ids:
+                remaining = self._completed_prefill_request_counts[request_id] - 1
+                if remaining > 0:
+                    self._completed_prefill_request_counts[request_id] = remaining
+                else:
+                    self._completed_prefill_request_counts.pop(request_id, None)
+            return True
 
     def handle_decode_allocated(self, raw: bytes):
         msg = ProtocolSerializer.unpack(raw)

@@ -23,9 +23,7 @@ from chitu.boot.tcp_ip import get_local_ip, get_free_port
 from chitu.global_vars import get_global_args
 from chitu.metrics.cache_stats import kvcache_stats, get_prealloc_blocks
 from chitu.metrics.task_stats import count_tasks_for_dp_rank, count_tasks_non_dp
-from chitu.import_utils import try_import_opt_dep
-
-pynvml, has_pynvml = try_import_opt_dep("pynvml", "nvidia-ml-py")
+from chitu.accelerator_monitor import get_accelerator_memory_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -206,63 +204,6 @@ def inc_request_timeouts(stage: str, count: int = 1):
     chitu_request_timeouts_total.labels(stage=stage).inc(count)
 
 
-def _nvml_handle_for_device(device_index: int):
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if cuda_visible_devices:
-        device_tokens = [
-            token.strip() for token in cuda_visible_devices.split(",") if token.strip()
-        ]
-        if device_index < len(device_tokens):
-            token = device_tokens[device_index]
-            if token.startswith(("GPU-", "MIG-")):
-                return pynvml.nvmlDeviceGetHandleByUUID(token)
-            try:
-                return pynvml.nvmlDeviceGetHandleByIndex(int(token))
-            except ValueError:
-                pass
-    return pynvml.nvmlDeviceGetHandleByIndex(device_index)
-
-
-def _get_nvml_memory_bytes(device_index: int, pid: int):
-    if not has_pynvml:
-        return None
-    initialized = False
-    try:
-        pynvml.nvmlInit()
-        initialized = True
-        handle = _nvml_handle_for_device(device_index)
-        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        total = int(mem_info.total)
-        used = int(mem_info.used)
-        try:
-            processes = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
-        except Exception:
-            try:
-                processes = pynvml.nvmlDeviceGetComputeRunningProcesses_v2(handle)
-            except Exception:
-                logger.warning_once(
-                    "Failed to get compute running processes, use empty list as default"
-                )
-                processes = []
-        for proc in processes:
-            if proc.pid != pid:
-                continue
-            proc_used = getattr(proc, "usedGpuMemory", None)
-            if proc_used is not None and proc_used > 0:
-                used = int(proc_used)
-            break
-        return used, total
-    except Exception as e:
-        logger.warning_once(f"Failed to get NVML memory bytes: {e}")
-        return None
-    finally:
-        if initialized:
-            try:
-                pynvml.nvmlShutdown()
-            except Exception:
-                pass
-
-
 class PrometheusMetricsCollector:
     """Singleton metrics collector for Prometheus"""
 
@@ -329,7 +270,7 @@ class PrometheusMetricsCollector:
         self.addr = None
 
         try:
-            # --- Per-rank metrics (kv cache, GPU memory)
+            # --- Per-rank metrics (KV cache, accelerator memory)
             self.kv_cache_usage = Gauge(
                 "chitu_kv_cache_usage_ratio",
                 "KV cache usage ratio (used_blocks / total_blocks)",
@@ -347,13 +288,13 @@ class PrometheusMetricsCollector:
             )
             self.cuda_total_bytes = Gauge(
                 "chitu_cuda_total_bytes",
-                "CUDA total memory (bytes)",
+                "Accelerator total memory (bytes)",
                 ["rank", "dp_id", "instance_id"],
             )
             self.cuda_used_bytes = Gauge(
                 "chitu_cuda_used_bytes",
-                "CUDA used memory (bytes), including torch allocated memory, torch "
-                "reserved but unused memory, and other CUDA memory",
+                "Accelerator used memory (bytes), including torch allocated memory, "
+                "torch reserved but unused memory, and other accelerator memory",
                 ["rank", "dp_id", "instance_id"],
             )
             self.torch_allocated_bytes = Gauge(
@@ -630,7 +571,7 @@ class PrometheusMetricsCollector:
             device_index = device.index
             if device_index is None:
                 device_index = torch.cuda.current_device()
-            mem_info = _get_nvml_memory_bytes(device_index, os.getpid())
+            mem_info = get_accelerator_memory_bytes(device_index, os.getpid())
             if mem_info is not None:
                 cuda_used_bytes, cuda_total_bytes = mem_info
             else:

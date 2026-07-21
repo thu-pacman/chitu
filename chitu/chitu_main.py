@@ -1514,6 +1514,21 @@ def _collect_ready_task_ids_by_dp(task_type: TaskType) -> list[list[str]]:
     return task_ids_by_dp
 
 
+def _do_pd_scheduler():
+    from chitu.distributed.pd_disaggregation.pd_scheduler import (
+        get_pd_scheduler_instance,
+    )
+
+    pd_scheduler = get_pd_scheduler_instance()
+
+    if Backend.args.multi_inst.role == "prefill":
+        pd_scheduler._bootstrap_check_and_promote()
+    elif Backend.args.multi_inst.role == "decode":
+        pd_scheduler._decode_check_and_promote()
+    else:
+        return
+
+
 @torch.inference_mode()
 def chitu_run_main_rank():
     """Execute one inference step on the main (rank-0) process.
@@ -1534,6 +1549,11 @@ def chitu_run_main_rank():
 
     # 1. Schedule
     global _last_step_task_type
+    if (
+        Backend.args.multi_inst.role == "prefill"
+        or Backend.args.multi_inst.role == "decode"
+    ):
+        _do_pd_scheduler()
     for scheduler in Backend.schedulers:
         scheduler.prepare_for_schedule()
     if Backend.args.infer.dp_size == 1:
@@ -1623,6 +1643,7 @@ def chitu_run_main_rank():
 
     # 3. Update TaskPool
     task_ids = TaskCollector.get_update_task_ids()
+    task_ids = TaskPool.id_list
     task_ids = [task_id for task_id in task_ids if TaskPool.pool.get(task_id)]
     # tasks w/o dp_size are evicted and already removed
     task_ids = [

@@ -7,6 +7,7 @@ import zmq
 import msgpack
 from logging import getLogger
 import weakref
+from collections import deque
 from typing import Optional
 from abc import ABC, abstractmethod
 
@@ -43,6 +44,7 @@ from chitu.distributed.parallel_state import (
     get_pcp_group,
     get_pp_group,
     get_pp_pair_group,
+    get_pp_result_pair_group,
     get_dp_group,
     get_dp_size,
     get_world_group,
@@ -70,6 +72,66 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 TASK_TENSOR_TAG = 1
 HIDDEN_TENSOR_TAG = 2
 RESULT_TAG = 3
+
+
+class _StreamRecvHandle:
+    def __init__(
+        self,
+        work,
+        stream,
+        payload: torch.Tensor,
+        stream_blocked: bool = False,
+    ):
+        self.work = work
+        self.stream = stream
+        self.payload = payload
+        self.stream_blocked = stream_blocked
+
+    def __getattr__(self, name):
+        return getattr(self.work, name)
+
+    def wait(self):
+        if self.stream is None or self.payload.device.type != "cuda":
+            return self.work.wait()
+
+        current_stream = torch.cuda.current_stream(self.payload.device)
+        if not self.stream_blocked:
+            with torch.cuda.stream(self.stream):
+                result = self.work.wait()
+            current_stream.wait_stream(self.stream)
+            return result
+
+        current_stream.wait_stream(self.stream)
+        return None
+
+
+class _AsyncResultHandle:
+    def __init__(self, works, tensors):
+        self.works = [work for work in works if work is not None]
+        self.tensors = [
+            tensor
+            for tensor in tensors
+            if tensor is not None and getattr(tensor, "device", None) is not None
+        ]
+        self._done = len(self.works) == 0
+
+    def is_completed(self) -> bool:
+        if self._done:
+            return True
+        for work in self.works:
+            is_completed = getattr(work, "is_completed", None)
+            if is_completed is None or not is_completed():
+                return False
+        return True
+
+    def wait(self):
+        if not self._done:
+            for work in self.works:
+                work.wait()
+            self._done = True
+        for tensor in self.tensors:
+            if tensor.device.type == "cuda":
+                tensor.record_stream(torch.cuda.current_stream(tensor.device))
 
 
 class TasksDispatcher(ABC):
@@ -293,6 +355,21 @@ class PipeDispatcher(TasksDispatcher):
         # to avoild nccl timeout during deepgemm warmup.
         self.next_pair_group = get_pp_pair_group(self.rank, self.next_rank)
         self.prev_pair_group = get_pp_pair_group(self.rank, self.prev_rank)
+        self.next_result_pair_group = (
+            get_pp_result_pair_group(self.rank, self.next_rank) or self.next_pair_group
+        )
+        self.prev_result_pair_group = (
+            get_pp_result_pair_group(self.rank, self.prev_rank) or self.prev_pair_group
+        )
+        device_obj = torch.device(device)
+        self.recv_stream = (
+            torch.cuda.Stream(device=device_obj)
+            if device_obj.type == "cuda"
+            and not self.is_first_stage
+            and torch.cuda.is_available()
+            else None
+        )
+        self._pending_result_sends: list[_AsyncResultHandle] = []
 
         self.dp_size = get_dp_size()
         self.num_nodes_per_dp = (
@@ -376,8 +453,41 @@ class PipeDispatcher(TasksDispatcher):
 
         return payload_type, tasks
 
-    def recv_payload(self, payload: torch.Tensor) -> torch.Tensor:
+    def recv_payload(self, payload: torch.Tensor, return_handle: bool = False):
         if not self.is_first_stage:
+            if return_handle:
+                if self.recv_stream is not None and payload.device.type == "cuda":
+                    # Allocate and bind the async PP recv buffer on recv_stream
+                    # so it does not inherit unrelated compute/TP stream waits.
+                    with torch.cuda.stream(self.recv_stream):
+                        recv_handle = torch.distributed.irecv(
+                            tensor=payload,
+                            src=self.prev_rank,
+                            tag=HIDDEN_TENSOR_TAG,
+                            group=self.prev_pair_group,
+                        )
+                        stream_blocked = False
+                        block_current_stream = getattr(
+                            recv_handle, "block_current_stream", None
+                        )
+                        if block_current_stream is not None:
+                            block_current_stream()
+                            stream_blocked = True
+                        payload.record_stream(self.recv_stream)
+                    return payload, _StreamRecvHandle(
+                        recv_handle,
+                        self.recv_stream,
+                        payload,
+                        stream_blocked=stream_blocked,
+                    )
+                recv_handle = torch.distributed.irecv(
+                    tensor=payload,
+                    src=self.prev_rank,
+                    tag=HIDDEN_TENSOR_TAG,
+                    group=self.prev_pair_group,
+                )
+                return payload, recv_handle
+
             torch.distributed.recv(
                 tensor=payload,
                 src=self.prev_rank,
@@ -396,55 +506,104 @@ class PipeDispatcher(TasksDispatcher):
             )
 
     def recv_results(self, tasks: Optional[PackedTasks] = None):
+        handle = self.recv_results_async(tasks)
+        if handle is not None:
+            handle.wait()
+
+    def recv_results_async(self, tasks: Optional[PackedTasks] = None):
+        if tasks is None:
+            return None
         bs = len(tasks.output_tasks)
         mtp_size = Backend.executor.mtp_size
         vocab_size = Backend.model.vocab_size
+        recv_works = []
+        recv_tensors = []
 
-        def recv(shape, dtype=torch.int64):
+        def irecv(shape, dtype=torch.int64):
             tensor = torch.empty(shape, dtype=dtype, device=self.device)
             if tensor.numel() == 0:
                 return tensor
-            torch.distributed.recv(
-                tensor,
-                src=self.prev_rank,
-                tag=RESULT_TAG,
-                group=self.prev_pair_group,
+            recv_works.append(
+                torch.distributed.irecv(
+                    tensor,
+                    src=self.prev_rank,
+                    tag=RESULT_TAG,
+                    group=self.prev_result_pair_group,
+                )
             )
+            recv_tensors.append(tensor)
             return tensor
 
-        result = PackedTasksResult(tokens=recv((bs, mtp_size)))
+        result = PackedTasksResult(tokens=irecv((bs, mtp_size)))
         if mtp_size > 1 and tasks.task_type == TaskType.Decode:
-            result.accept_indices = recv((bs,))
+            result.accept_indices = irecv((bs,))
         if tasks.return_logprobs:
-            result.logprobs = recv((bs, vocab_size), torch.float32)
-            result.token_idxs = recv((bs, vocab_size))
+            result.logprobs = irecv((bs, vocab_size), torch.float32)
+            result.token_idxs = irecv((bs, vocab_size))
         if tasks._test_flag:
-            result.logits = recv((bs, vocab_size), torch.float32)
+            result.logits = irecv((bs, vocab_size), torch.float32)
 
         tasks.generated_result = result
+        handle = _AsyncResultHandle(recv_works, recv_tensors)
+        tasks._pp_result_recv_handle = handle
+        return handle
 
     def send_results(self, tasks: Optional[PackedTasks] = None):
-        def send(tensor: torch.Tensor):
-            if tensor.numel() == 0:
+        handle = self.send_results_async(tasks)
+        if handle is not None:
+            handle.wait()
+
+    def send_results_async(self, tasks: Optional[PackedTasks] = None):
+        if tasks is None:
+            return None
+        self._retire_pending_result_sends()
+        send_works = []
+        send_tensors = []
+
+        def isend(tensor: torch.Tensor):
+            if tensor is None or tensor.numel() == 0:
                 return
-            torch.distributed.send(
-                tensor=tensor,
-                dst=self.next_rank,
-                tag=RESULT_TAG,
-                group=self.next_pair_group,
+            tensor = tensor.contiguous()
+            send_works.append(
+                torch.distributed.isend(
+                    tensor=tensor,
+                    dst=self.next_rank,
+                    tag=RESULT_TAG,
+                    group=self.next_result_pair_group,
+                )
             )
+            send_tensors.append(tensor)
 
         result = tasks.generated_result
-        send(result.tokens)
+        isend(result.tokens)
         if Backend.executor.mtp_size > 1 and tasks.task_type == TaskType.Decode:
-            send(result.accept_indices)
+            isend(result.accept_indices)
         if tasks.return_logprobs:
-            send(result.logprobs)
-            send(result.token_idxs)
+            isend(result.logprobs)
+            isend(result.token_idxs)
         if tasks._test_flag:
-            send(result.logits)
+            isend(result.logits)
+        handle = _AsyncResultHandle(send_works, send_tensors)
+        self._pending_result_sends.append(handle)
+        self._retire_pending_result_sends()
+        return handle
 
-    def collect_results(self, tasks: Optional[PackedTasks] = None):
+    def _retire_pending_result_sends(self, force: bool = False):
+        pending = []
+        for handle in self._pending_result_sends:
+            if force or handle.is_completed():
+                handle.wait()
+            else:
+                pending.append(handle)
+        self._pending_result_sends = pending
+
+    def has_pending_result_sends(self):
+        self._retire_pending_result_sends()
+        return len(self._pending_result_sends) > 0
+
+    def collect_results(
+        self, tasks: Optional[PackedTasks] = None, async_result: bool = False
+    ):
         # PD Prefill-only:
         # - Prefill side does not sample tokens in PP send_payload (no sampling round-trip).
         # - Prefill runs model prefill and KV transfer; first token is sampled in KV hook
@@ -457,11 +616,21 @@ class PipeDispatcher(TasksDispatcher):
             return
         if tasks is None:
             return
-        if get_tp_group().is_first_rank and get_pcp_group().is_first_rank:
+        # In TP-only mode, only the TP first rank has sampled results to
+        # exchange. In PCP/CP mode, every CP rank owns a PP pair and must
+        # exchange its result tensors directly.
+        cp_context = self.get_executor().cp_context
+        if cp_context.is_active or get_tp_group().is_first_rank:
             if self.is_first_stage:
-                self.recv_results(tasks)
+                if async_result:
+                    self.recv_results_async(tasks)
+                else:
+                    self.recv_results(tasks)
             elif self.is_last_stage:
-                self.send_results(tasks)
+                if async_result:
+                    self.send_results_async(tasks)
+                else:
+                    self.send_results(tasks)
 
 
 class TensorDispatcher(TasksDispatcher):
@@ -575,6 +744,7 @@ class ExpertDataDispatcher(TasksDispatcher):
 
         # 使用统一的 ZMQ 初始化（自动选择 ipc:// 或 tcp://）
         assert self.rank_in_group is not None and self.group_size is not None
+        self._pending_result_msgs = [deque() for _ in range(self.group_size)]
         self._init_zmq_router_dealer(
             group=self.dp_group,
             main_rank=self.dp_main_rank,
@@ -696,29 +866,60 @@ class ExpertDataDispatcher(TasksDispatcher):
             result.logits = create((bs, vocab_size), torch.float32)
         return result
 
-    def collect_results(self, results: PackedTasksResult):
+    def collect_results(
+        self,
+        results: PackedTasksResult,
+        dp_tasks: Optional[DPPackedTasks] = None,
+    ):
         """
         collect results through zmq.
         """
 
         if self.is_main_rank:
-            dp_tasks = DPTaskCollector.get_last_packedtasks()
+            if dp_tasks is None:
+                dp_tasks = DPTaskCollector.get_last_packedtasks()
+            if dp_tasks is None:
+                raise RuntimeError("Missing DP task metadata while collecting results")
             merged_results = self._create_empty_recv_results(dp_tasks)
             merged = dataclass_to_dict(merged_results)
 
-            all_data = [None for _ in range(self.group_size)]
-            all_data[0] = dataclass_to_dict(results)
-            for _ in range(1, self.group_size):
-                msgs = self.socket.recv_multipart()
-                rank_in_group = int(msgs[0].decode())
-                data = msgpack.loads(msgs[1])
+            def decode_result_data(msg: bytes):
+                data = msgpack.loads(msg)
                 for k, v in data.items():
                     if isinstance(v, bytes):
                         if len(v) == 0:
                             data[k] = torch.empty(0, dtype=merged[k].dtype)
                         else:
                             data[k] = torch.frombuffer(v, dtype=merged[k].dtype)
-                all_data[rank_in_group] = data
+                return data
+
+            all_data = [None for _ in range(self.group_size)]
+            all_data[0] = dataclass_to_dict(results)
+
+            num_missing = self.group_size - 1
+            for rank_in_group in range(1, self.group_size):
+                if self._pending_result_msgs[rank_in_group]:
+                    msg = self._pending_result_msgs[rank_in_group].popleft()
+                    all_data[rank_in_group] = decode_result_data(msg)
+                    num_missing -= 1
+
+            while num_missing > 0:
+                msgs = self.socket.recv_multipart()
+                rank_in_group = int(msgs[0].decode())
+                if not 0 < rank_in_group < self.group_size:
+                    raise RuntimeError(
+                        f"Invalid DP result rank {rank_in_group}; "
+                        f"expected a rank in [1, {self.group_size})"
+                    )
+                if all_data[rank_in_group] is None:
+                    all_data[rank_in_group] = decode_result_data(msgs[1])
+                    num_missing -= 1
+                else:
+                    # DEALER preserves FIFO per rank, but faster ranks may send
+                    # the next batch before every rank has sent this batch.
+                    # Keep the raw message because the next batch may use a
+                    # different schema (for example Prefill followed by MTP Decode).
+                    self._pending_result_msgs[rank_in_group].append(msgs[1])
 
             offset = 0
             for data, bs in zip(all_data, dp_tasks.dp_num_output_tasks):
@@ -895,6 +1096,8 @@ class Executor:
         self._lb_every = args.infer.moe_lb_trigger
         self._lb_step = 0
         self._pending_dllm_block = None
+        self._pending_pp_result_tasks = deque()
+        self._next_pp_result_seq = 0
 
         if self.is_sample_rank:
             self.sampler = Sampler()
@@ -1275,15 +1478,22 @@ class Executor:
             tokens = self._broadcast_tensor_payload(tokens)
         return tokens
 
-    def _prepare_hiddens(self, tasks: PackedTasksBase):
+    def _prepare_hiddens(
+        self, tasks: PackedTasksBase, return_recv_handle: bool = False
+    ):
         if get_pp_group().is_first_rank:
+            if return_recv_handle:
+                return None, None, False, False
             return None
         if tasks.num_tokens == 0:
-            return torch.empty(
+            hiddens = torch.empty(
                 self.get_payload_shape(0),
                 device=self.device,
                 dtype=self.get_payload_dtype(),
             )
+            if return_recv_handle:
+                return hiddens, None, False, False
+            return hiddens
 
         # receive hiddens from previous PP stage
         # In PCP+PP prefill, each CP rank only processes ceil(num_tokens/pcp_size)
@@ -1294,23 +1504,76 @@ class Executor:
             pp_num_tokens = tasks.num_tokens
         else:
             pp_num_tokens = self.cp_context.compute_pp_num_tokens(tasks.num_tokens)
-        hiddens = torch.empty(
-            self.get_payload_shape(pp_num_tokens),
-            device=self.device,
-            dtype=self.get_payload_dtype(),
+        hiddens_shape = self.get_payload_shape(pp_num_tokens)
+        hiddens_dtype = self.get_payload_dtype()
+        recv_stream = getattr(self.pipe_dispatcher, "recv_stream", None)
+        receives_from_pipe = self.cp_context.should_recv_directly(self.tp_size) or (
+            self.is_main_rank
         )
+        allocate_on_recv_stream = (
+            return_recv_handle
+            and receives_from_pipe
+            and recv_stream is not None
+            and torch.device(self.device).type == "cuda"
+        )
+        if allocate_on_recv_stream:
+            with torch.cuda.stream(recv_stream):
+                hiddens = torch.empty(
+                    hiddens_shape,
+                    device=self.device,
+                    dtype=hiddens_dtype,
+                )
+        else:
+            hiddens = torch.empty(
+                hiddens_shape,
+                device=self.device,
+                dtype=hiddens_dtype,
+            )
+
+        recv_handle = None
+        should_send_tp_payload = False
+        should_recv_tp_payload = False
         # In CP+PP mode, each CP rank has its own PP pair and receives
         # hiddens directly from pipe — no TP/CP broadcast needed.
         # In TP mode, only the TP main rank receives from pipe, then
         # broadcasts to other TP ranks.
         if self.cp_context.should_recv_directly(self.tp_size):
             # CP mode (or no TP): every rank receives from its PP pair directly
-            hiddens = self.pipe_dispatcher.recv_payload(hiddens)
+            if return_recv_handle:
+                hiddens, recv_handle = self.pipe_dispatcher.recv_payload(
+                    hiddens, return_handle=True
+                )
+            else:
+                hiddens = self.pipe_dispatcher.recv_payload(hiddens)
         elif self.is_main_rank:
-            hiddens = self.pipe_dispatcher.recv_payload(hiddens)
-            if self.tensor_broadcast_dispatchers:
-                hiddens = self._broadcast_tensor_payload(hiddens)
+            if return_recv_handle:
+                hiddens, recv_handle = self.pipe_dispatcher.recv_payload(
+                    hiddens, return_handle=True
+                )
+                should_send_tp_payload = bool(self.tensor_broadcast_dispatchers)
+            else:
+                hiddens = self.pipe_dispatcher.recv_payload(hiddens)
+                if self.tensor_broadcast_dispatchers:
+                    hiddens = self._broadcast_tensor_payload(hiddens)
         else:
+            if return_recv_handle:
+                should_recv_tp_payload = bool(self.tensor_broadcast_dispatchers)
+            else:
+                hiddens = self._broadcast_tensor_payload(hiddens)
+        if return_recv_handle:
+            return hiddens, recv_handle, should_send_tp_payload, should_recv_tp_payload
+        return hiddens
+
+    def _wait_hiddens_recv(
+        self,
+        hiddens: Optional[torch.Tensor],
+        recv_handle,
+        should_send_tp_payload: bool,
+        should_recv_tp_payload: bool,
+    ):
+        if recv_handle is not None:
+            recv_handle.wait()
+        if should_send_tp_payload or should_recv_tp_payload:
             hiddens = self._broadcast_tensor_payload(hiddens)
         return hiddens
 
@@ -1338,8 +1601,25 @@ class Executor:
             PrometheusMetricsCollector.update_task_counts()
 
         tokens = self._prepare_tokens_prefill(tasks)
-        hiddens = self._prepare_hiddens(tasks)
+        (
+            hiddens,
+            hiddens_recv_handle,
+            should_send_tp_hiddens,
+            should_recv_tp_hiddens,
+        ) = self._prepare_hiddens(tasks, return_recv_handle=True)
         output_token_offsets = self._get_output_token_offsets(tasks)
+
+        if (
+            hiddens_recv_handle is not None
+            or should_send_tp_hiddens
+            or should_recv_tp_hiddens
+        ):
+            hiddens = self._wait_hiddens_recv(
+                hiddens,
+                hiddens_recv_handle,
+                should_send_tp_hiddens,
+                should_recv_tp_hiddens,
+            )
 
         if not self.is_pp_first_stage:
             self._collect_task_and_pp_results(tasks)
@@ -1731,11 +2011,181 @@ class Executor:
                 task.req.notify_server_data_added_threadsafe()
         TaskCollector.add_update_task_ids(block_tasks.task_ids)
 
-    def _collect_task_and_pp_results(self, tasks: PackedTasksBase):
+    def _can_async_pp_results(self):
+        return (
+            self.has_schedule_overlap
+            and self.pipe_dispatcher is not None
+            and self.pipe_dispatcher.is_first_stage
+            and self.is_dp_rank
+        )
+
+    def has_pending_pp_results(self):
+        if len(self._pending_pp_result_tasks) > 0:
+            return True
+        if self.pipe_dispatcher is not None:
+            has_pending_sends = getattr(
+                self.pipe_dispatcher, "has_pending_result_sends", None
+            )
+            if has_pending_sends is not None and has_pending_sends():
+                return True
+        return False
+
+    def _is_pending_pp_result_task_ready(self, tasks: PackedTasks) -> bool:
+        handle = getattr(tasks, "_pp_result_recv_handle", None)
+        if self._pd_prefill_only:
+            if self.rank == 0:
+                kv_manager = self._kv_hook.kv_manager
+                return kv_manager.are_prefill_requests_completed(tasks.output_task_ids)
+            return True
+        return handle is not None and handle.is_completed()
+
+    def _pending_pp_result_head_ready(self) -> tuple[int, bool]:
+        if len(self._pending_pp_result_tasks) == 0:
+            return -1, False
+        tasks = self._pending_pp_result_tasks[0]
+        return int(
+            getattr(tasks, "_pp_result_seq", -1)
+        ), self._is_pending_pp_result_task_ready(tasks)
+
+    def _current_step_requires_pp_result(self, current_tasks: PackedTasksBase) -> bool:
+        if current_tasks is None:
+            return False
+        if current_tasks.task_type == TaskType.Decode:
+            return True
+        return not is_normal_payload(current_tasks.payload_type)
+
+    def _all_dp_lanes_ready_for_pp_result(
+        self, force_if_any_lane_needs: bool = False
+    ) -> bool:
+        local_seq, local_ready = self._pending_pp_result_head_ready()
+        local_need = bool(force_if_any_lane_needs and local_seq >= 0)
+
+        if self.dp_dispatcher is None or self.dp_dispatcher.group_size <= 1:
+            return local_seq >= 0 and (local_ready or local_need)
+
+        local_state = torch.tensor(
+            [local_seq, 1 if local_ready else 0, 1 if local_need else 0],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        gathered = [
+            torch.empty_like(local_state) for _ in range(self.dp_dispatcher.group_size)
+        ]
+        torch.distributed.all_gather(
+            gathered,
+            local_state,
+            group=self.dp_dispatcher.dp_group.cpu_group,
+        )
+
+        seqs = [int(state[0].item()) for state in gathered]
+        ready_flags = [bool(state[1].item()) for state in gathered]
+        need_flags = [bool(state[2].item()) for state in gathered]
+        if local_seq < 0 or not all(seq == local_seq for seq in seqs):
+            return False
+
+        # Normal async path: retire only when all lanes are already complete.
+        # Decode/control path: all lanes force-drain the same head result before
+        # entering the next model/EP collective.
+        return all(ready_flags) or any(need_flags)
+
+    def _pop_pending_pp_result_task(self, force: bool = False):
+        if len(self._pending_pp_result_tasks) == 0:
+            return None
+        tasks = self._pending_pp_result_tasks[0]
+        handle = getattr(tasks, "_pp_result_recv_handle", None)
+        if self._pd_prefill_only:
+            if self.rank == 0:
+                kv_manager = self._kv_hook.kv_manager
+                # main dp rank pop task after all RDMA transfer is done
+                if not kv_manager.consume_completed_prefill_requests(
+                    tasks.output_task_ids
+                ):
+                    return None
+            # non dp main rank can safely pop task since only main rank will
+            # call special_step(..., type="EndTask") later to release kvCache
+            return self._pending_pp_result_tasks.popleft()
+        if handle is not None and (force or handle.is_completed()):
+            handle.wait()
+            tasks._pp_result_recv_handle = None
+            return self._pending_pp_result_tasks.popleft()
+        return None
+
+    def _collect_async_pp_result_tasks(
+        self,
+        tasks: Optional[PackedTasks],
+        current_tasks: PackedTasksBase,
+    ) -> list[PackedTasks]:
+        ready_tasks: list[PackedTasks] = []
+
+        force_head_result = self._current_step_requires_pp_result(current_tasks)
+
+        # Retire only already-completed older PP results during normal overlapped
+        # execution. Before decode/control steps, force-drain the head PP result
+        # in the same order on all DP lanes so newly sampled tokens are visible
+        # before the next model run.
+        while self._all_dp_lanes_ready_for_pp_result(
+            force_if_any_lane_needs=force_head_result
+        ):
+            pending_tasks = self._pop_pending_pp_result_task(force=True)
+            if pending_tasks is None:
+                break
+            ready_tasks.append(pending_tasks)
+
+        if tasks is None:
+            return ready_tasks
+
+        if (
+            self.rank == 0
+            and self.dp_dispatcher is not None
+            and not self._pd_prefill_only
+        ):
+            # The TaskCollector and DPTaskCollector tail slots correspond here.
+            # Bind them before an async PP result can outlive the global DP slot.
+            dp_tasks = DPTaskCollector.get_last_packedtasks()
+            if dp_tasks is None:
+                raise RuntimeError(
+                    "Missing DP task metadata when starting async PP result collection"
+                )
+            tasks._dp_result_metadata = dp_tasks
+
+        if tasks.task_type == TaskType.Prefill:
+            # Always post the PP result recv for this microbatch, even when an
+            # older async result is still pending. This keeps the PP result
+            # protocol aligned per PP stage while allowing result processing to
+            # lag behind model execution.
+            self.pipe_dispatcher.collect_results(tasks, async_result=True)
+            tasks._pp_result_seq = self._next_pp_result_seq
+            self._next_pp_result_seq += 1
+            self._pending_pp_result_tasks.append(tasks)
+
+            if self._all_dp_lanes_ready_for_pp_result(
+                force_if_any_lane_needs=force_head_result
+            ):
+                pending_tasks = self._pop_pending_pp_result_task(force=True)
+                if pending_tasks is not None:
+                    ready_tasks.append(pending_tasks)
+            return ready_tasks
+
+        self.pipe_dispatcher.collect_results(tasks)
+        ready_tasks.append(tasks)
+        return ready_tasks
+
+    def _collect_task_and_pp_results(
+        self, tasks: PackedTasksBase
+    ) -> PackedTasks | list[PackedTasks] | None:
         """collect tasks to run `postprocess_sync_part` at this step, send/recv pp results if needed"""
+        current_tasks = tasks
         tasks = TaskCollector.collect(tasks)
         if self.pipe_dispatcher:
-            self.pipe_dispatcher.collect_results(tasks)
+            if self._can_async_pp_results():
+                return self._collect_async_pp_result_tasks(tasks, current_tasks)
+            async_result = (
+                self.has_schedule_overlap
+                and self.pipe_dispatcher.is_last_stage
+                and tasks is not None
+                and tasks.task_type == TaskType.Prefill
+            )
+            self.pipe_dispatcher.collect_results(tasks, async_result=async_result)
         return tasks
 
     def _update_token_statistics(
@@ -1760,9 +2210,24 @@ class Executor:
         if not self.dp_dispatcher:
             return tasks
 
-        dp_results = self.dp_dispatcher.collect_results(tasks.generated_result)
+        dp_tasks = getattr(tasks, "_dp_result_metadata", None)
+        if (
+            self.rank == 0
+            and self._can_async_pp_results()
+            and not self._pd_prefill_only
+            and dp_tasks is None
+        ):
+            raise RuntimeError("Async PP result is missing its bound DP task metadata")
+
+        dp_results = self.dp_dispatcher.collect_results(
+            tasks.generated_result, dp_tasks=dp_tasks
+        )
         if self.rank == 0:
-            tasks = DPTaskCollector.get_last_packedtasks()
+            if dp_tasks is None:
+                dp_tasks = DPTaskCollector.get_last_packedtasks()
+            if dp_tasks is None:
+                raise RuntimeError("Missing DP task metadata while updating results")
+            tasks = dp_tasks
             tasks.generated_result = dp_results
         return tasks
 
@@ -1791,7 +2256,13 @@ class Executor:
 
         After synchronizing, collect result across dp workers to dp main rank and update tasks.
         """
-        tasks = self._collect_task_and_pp_results(current_tasks)
+        collected_tasks = self._collect_task_and_pp_results(current_tasks)
+        if isinstance(collected_tasks, list):
+            ready_tasks = collected_tasks
+        elif collected_tasks is None:
+            ready_tasks = []
+        else:
+            ready_tasks = [collected_tasks]
         if self.model_type == ModelType.LLADA2:
             # dllm use `_process_dllm_block_results`
             return
@@ -1800,13 +2271,16 @@ class Executor:
 
         if self._pd_prefill_only:
             if self.rank == 0 and DPTaskCollector.available():
-                tasks = DPTaskCollector.get_last_packedtasks()
+                dp_tasks = DPTaskCollector.get_last_packedtasks()
+                ready_tasks = [] if dp_tasks is None else [dp_tasks]
             TaskCollector.add_update_task_ids(
-                tasks.output_task_ids if tasks is not None else []
+                [task_id for tasks in ready_tasks for task_id in tasks.output_task_ids]
             )
             return
 
-        if tasks is not None:
+        update_task_ids: list[str] = []
+        pd_cached_hit_tokens: dict[str, int] = {}
+        for tasks in ready_tasks:
             assert isinstance(tasks, PackedTasks)
             assert tasks.generated_result is not None
 
@@ -1822,14 +2296,17 @@ class Executor:
             tasks = self._dp_collect_result(tasks)
             tasks.batch_update_response_sync()
 
+            if self.rank == 0:
+                self._update_pd_num_hit_tokens(pd_cached_hit_tokens)
+                tasks.batch_update_test_result()
+                TaskCollector.append_to_last_batch_results(tasks.create_batch_result())
+                tasks.batch_update_decode_status()
+                update_task_ids.extend(tasks.output_task_ids)
+
         if self.rank != 0:
             return
 
-        if tasks is not None:
-            tasks.batch_update_test_result()
-            TaskCollector.append_to_last_batch_results(tasks.create_batch_result())
-            tasks.batch_update_decode_status()
-            TaskCollector.add_update_task_ids(tasks.output_task_ids)
+        TaskCollector.add_update_task_ids(update_task_ids)
 
         if self.has_schedule_overlap and current_tasks.task_type != TaskType.Special:
             if self.dp_dispatcher:

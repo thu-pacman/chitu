@@ -22,7 +22,7 @@ This executable will run Chitu with a Docker container internally.
 #### NVIDIA GPU
 
 ```bash
-docker run --rm --gpus=all --privileged --shm-size=1g \
+docker run --pid=host --rm --gpus=all --privileged --shm-size=1g \
   -v <your_model_path>:<container_model_path> \
   <your_image_name> \
   <your_command>
@@ -32,6 +32,7 @@ docker run --rm --gpus=all --privileged --shm-size=1g \
 
 ```
 docker run \
+  --pid=host \
   --rm \
   --device /dev/davinci0 \
   --device /dev/davinci1 \
@@ -58,6 +59,7 @@ docker run \
 
 ```
 docker run \
+  --pid=host \
   --rm \
   --device=/dev/dri \
   --device=/dev/mxcd \
@@ -76,6 +78,7 @@ docker run \
 
 ```
 docker run -dit \
+  --pid=host \
   -u root \
   --network=host \
   --privileged \
@@ -286,15 +289,16 @@ Some dependencies must be installed with device visible, so they must be install
 ```bash
 bash ./script/two-stage-docker-build.sh \
   'muxi.Dockerfile' \
-  '<comma_separated_optional_deps>' \
-  '<extra_build_args>' \
-  '<enable_cython_true_or_false>' \
-  '<enable_test_true_or_false>' \
-  '<another_flag_true_or_false>' \
-  '<your_pypi_mirror>' \
   '<your_image_name>' \
   '<your_image_tag>' \
+  --optional_deps='<comma_separated_optional_deps>' \
+  --chitu_setup_jobs='<chitu_setup_jobs>' \
+  --enable_cython='<true_or_false>' \
+  --enable_test='<true_or_false>' \
+  --pypi_mirror='<your_pypi_mirror>' \
+  -- \
   docker run \
+    --pid=host \
     --device=/dev/dri \
     --device=/dev/mxcd \
     --group-add video \
@@ -313,15 +317,16 @@ Some dependencies must be installed with device visible, so they must be install
 ```bash
 bash ./script/two-stage-docker-build.sh \
   'ascend.Dockerfile' \
-  '<comma_separated_optional_deps>' \
-  '<extra_build_args>' \
-  '<enable_cython_true_or_false>' \
-  '<enable_test_true_or_false>' \
-  '<another_flag_true_or_false>' \
-  '<your_pypi_mirror>' \
   '<your_image_name>' \
   '<your_image_tag>' \
+  --optional_deps='<comma_separated_optional_deps>' \
+  --chitu_setup_jobs='<chitu_setup_jobs>' \
+  --enable_cython='<true_or_false>' \
+  --enable_test='<true_or_false>' \
+  --pypi_mirror='<your_pypi_mirror>' \
+  -- \
   docker run \
+    --pid=host \
     --privileged \
     --device /dev/devmm_svm \
     --device /dev/hisi_hdc \
@@ -341,17 +346,19 @@ Some dependencies must be installed with device visible, so they must be install
 ```bash
 bash ./script/two-stage-docker-build.sh \
   'hygon.Dockerfile' \
-  '<comma_separated_optional_deps>' \
-  '<extra_build_args>' \
-  '<enable_cython_true_or_false>' \
-  '<enable_test_true_or_false>' \
-  '<another_flag_true_or_false>' \
-  '<your_pypi_mirror>' \
   '<your_image_name>' \
   '<your_image_tag>' \
+  --optional_deps='<comma_separated_optional_deps>' \
+  --chitu_setup_jobs='<chitu_setup_jobs>' \
+  --enable_editable_install='<true_or_false>' \
+  --enable_cython='<true_or_false>' \
+  --enable_test='<true_or_false>' \
+  --pypi_mirror='<your_pypi_mirror>' \
+  -- \
   docker run \
     -u root \
     --network=host \
+    --pid=host \
     --privileged \
     --device=/dev/kfd \
     --device=/dev/dri \
@@ -606,7 +613,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
     boot.remote_launcher=srun \
     "boot.target=[test/single_req_test.py]" \
     "boot.interactive_node_0=True" \
-    "boot.extra_apptainer_args=[-v,/path/to/models:/path/to/models]" \
+    "boot.extra_docker_args=[-v,/path/to/models:/path/to/models]" \
     models=Qwen3-235B-A22B \
     models.ckpt_dir=/path/to/Qwen3-235B-A22B \
     infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
@@ -617,8 +624,9 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 ```bash
 ./chitu.run boot.n_nodes=2 boot.n_gpus_per_node=8 \
     boot.remote_launcher=srun \
+    boot.source_path=. \
     "boot.target=[test/single_req_test.py]" \
-    "boot.extra_apptainer_args=[-B,.:/workspace/chitu,-B,/path/to/models:/path/to/models,--env,PYTHONPATH=/workspace/chitu]" \
+    "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
     models=Qwen3-235B-A22B \
     models.ckpt_dir=/path/to/Qwen3-235B-A22B \
     infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
@@ -1018,6 +1026,7 @@ Install time:
 | `CHITU_WITH_CYTHON`        | `0`, `1`                     | Compile Python sources with Cython.                    |
 | `CHITU_ASCEND_BUILD`       | `0`, `1`                     | Build for Ascend.                                      |
 | `CHITU_HYGON_BUILD`        | `0`, `1`                     | Build for Hygon.                                       |
+| `CHITU_HYGON_BUILD_FOR_SHCA` | `0`, `1`                   | When `CHITU_HYGON_BUILD=1`, build is for SHCA NIC      |
 | `CHITU_MUXI_BUILD`         | `0`, `1`                     | Build for Muxi (MetaX).                                |
 | `CHITU_MOORE_BUILD`        | `0`, `1`                     | Build for MooreThreads.                                |
 | `CHITU_SETUP_JOBS`         | Integer                      | Number of processes for compiling.                     |

@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
 import os
 import packaging.version
 import torch
@@ -10,12 +11,47 @@ import csrc.setup_build as operators
 
 setup_dir = os.path.dirname(os.path.abspath(__file__))
 
-cuda_major = int((torch.version.cuda or "0").split(".")[0])
 
-if cuda_major == 13:
-    mooncake = "mooncake-transfer-engine-cuda13"
+def get_bool_env(name: str, default: Optional[bool] = None):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"Environment variable {name} must be a boolean value, got {value!r}"
+    )
+
+
+if get_bool_env("CHITU_HYGON_BUILD", False):
+    deep_gemm = "deepgemm @ file://localhost" + os.path.join(
+        setup_dir, "third_party/deepgemm_hygon"
+    )
+
+    if get_bool_env("CHITU_HYGON_BUILD_FOR_SHCA", False):
+        mooncake = "mooncake-transfer-engine @ file://localhost" + os.path.join(
+            setup_dir,
+            "third_party/hygon_wheels/mooncake_transfer_engine_shca-0.3.10.post1+das.opt1.dtk2604.2605131044.gd34f6f-cp310-cp310-manylinux_2_35_x86_64.whl",
+        )
+    else:
+        mooncake = "mooncake-transfer-engine @ file://localhost" + os.path.join(
+            setup_dir,
+            "third_party/hygon_wheels/mooncake_transfer_engine-0.3.7.post2+das.opt1.dtk2604.torch290-cp310-cp310-manylinux_2_28_x86_64.whl",
+        )
 else:
-    mooncake = "mooncake-transfer-engine"
+    cuda_major = int((torch.version.cuda or "0").split(".")[0])
+
+    deep_gemm = "deep_gemm @ file://localhost" + os.path.join(
+        setup_dir, "third_party/DeepGEMM"
+    )
+
+    if cuda_major == 13:
+        mooncake = "mooncake-transfer-engine-cuda13"
+    else:
+        mooncake = "mooncake-transfer-engine"
 
 install_requires = [
     # Special notes on torch:
@@ -36,6 +72,7 @@ install_requires = [
     "hydra-core",
     "fastapi",
     "pydantic>=2,<3",
+    "pydantic-extra-types[all]",
     "uvicorn[standard]",
     "tqdm",
     "einops",
@@ -115,10 +152,7 @@ extras_require = {
         "flash_mla @ file://localhost"
         + os.path.join(setup_dir, "third_party/FlashMLA"),
     ],
-    "deep_gemm": [
-        "deep_gemm @ file://localhost"
-        + os.path.join(setup_dir, "third_party/DeepGEMM"),
-    ],
+    "deep_gemm": [deep_gemm],
     "deep_ep": [
         "deep_ep @ file://localhost" + os.path.join(setup_dir, "third_party/DeepEP"),
     ],  # Please make sure `requirements-build-deep_ep-cu12.txt` is installed at BUILD TIME

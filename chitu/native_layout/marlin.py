@@ -133,14 +133,25 @@ class BlockInt4MarlinQWeight(NativeLayoutTensor):
     @classmethod
     @override
     def convert_from(
-        cls, packed: Packed4BitWeightAlongKContigInt32
+        cls, packed: Packed4BitWeightAlongKContigInt32 | torch.Tensor
     ) -> "BlockInt4MarlinQWeight":
         """Convert from int32-packed checkpoint format."""
-        tensor = packed.layout_tensor
-        e, n, k = packed.plain_shape
+        if isinstance(packed, Packed4BitWeightAlongKContigInt32):
+            tensor = packed.layout_tensor
+            plain_shape = packed.plain_shape
+        elif isinstance(packed, torch.Tensor):
+            *prefix_dims, packed_k = packed.shape
+            tensor = packed
+            plain_shape = (*prefix_dims, packed_k * 8)
+        else:
+            raise TypeError(
+                f"Cannot convert from {type(packed)} to BlockInt4MarlinQWeight"
+            )
+
+        e, n, k = plain_shape
         if tensor.device.type == "meta":
             return cls(
-                packed.plain_shape,
+                plain_shape,
                 torch.empty(e, k // 8 // 2, n * 2, dtype=torch.int32, device="meta"),
             )
 
@@ -153,7 +164,7 @@ class BlockInt4MarlinQWeight(NativeLayoutTensor):
             repacked = gptq_marlin_repack(qw, empty_g_idx, k, n, 4)
             repacked_list.append(repacked)
 
-        return cls(packed.plain_shape, torch.stack(repacked_list, dim=0))
+        return cls(plain_shape, torch.stack(repacked_list, dim=0))
 
 
 @dataclass
