@@ -11,10 +11,10 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from chitu.device_type import is_hygon
-from chitu.import_utils import try_import_platform_dep, try_import_opt_dep
+from chitu.import_utils import try_import_platform_dep
+from chitu.accelerator_monitor import check_accelerator_fully_connected
 
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-pynvml, has_pynvml = try_import_opt_dep("pynvml", "nvidia-ml-py")
 
 logger = getLogger(__name__)
 
@@ -83,87 +83,6 @@ def _check_p2p_access(local_device_id: int, local_device_ids: List[int]) -> bool
         except Exception:
             return False
     return True
-
-
-def _check_full_hsw(physical_device_ids: List[int]) -> bool:
-    """Return whether every Hygon device pair has a direct HSW link."""
-    initialized = False
-    try:
-        amdsmi, has_amdsmi = try_import_platform_dep("amdsmi")
-        if not has_amdsmi:
-            logger.warning(
-                "amdsmi is not available; cannot verify HSW topology. "
-                "Disabling custom AR."
-            )
-            return False
-
-        amdsmi.amdsmi_init()
-        initialized = True
-        handles = amdsmi.amdsmi_get_processor_handles()
-        if len(set(physical_device_ids)) != len(physical_device_ids) or any(
-            device_id < 0 or device_id >= len(handles)
-            for device_id in physical_device_ids
-        ):
-            return False
-
-        hsw_type = amdsmi.AmdSmiIoLinkType.XGMI.value
-        for i, src_id in enumerate(physical_device_ids):
-            for dst_id in physical_device_ids[i + 1 :]:
-                link = amdsmi.amdsmi_topo_get_link_type(
-                    handles[src_id], handles[dst_id]
-                )
-                link_type = getattr(link["type"], "value", link["type"])
-                if int(link["hops"]) != 1 or int(link_type) != hsw_type:
-                    return False
-        return True
-    except Exception as e:
-        logger.warning("Failed to verify HSW topology: %s", e)
-        return False
-    finally:
-        if initialized:
-            try:
-                amdsmi.amdsmi_shut_down()
-            except Exception as e:
-                logger.debug("Failed to shut down amdsmi cleanly: %s", e)
-
-
-def _check_full_nvlink(physical_device_ids) -> bool:
-    """Every pair of GPUs is connected by NVLink (1 hop).
-
-    Matches vLLM's `is_fully_connected` (vllm/platforms/cuda.py): query NVML
-    via nvidia-ml-py for each pair with `NVML_P2P_CAPS_INDEX_NVLINK`. Only returns
-    True if every pair reports `NVML_P2P_STATUS_OK`. PCIe-only hosts will see
-    `NOT_SUPPORTED` and correctly yield False — which is the condition the
-    custom AR spin-barrier kernel relies on.
-    """
-    if not has_pynvml:
-        logger.warning(
-            "nvidia-ml-py not available; cannot verify NVLink. Disabling custom AR."
-        )
-        return False
-    try:
-        pynvml.nvmlInit()
-        try:
-            handles = [
-                pynvml.nvmlDeviceGetHandleByIndex(int(i)) for i in physical_device_ids
-            ]
-            for i, h_i in enumerate(handles):
-                for j, h_j in enumerate(handles):
-                    if i >= j:
-                        continue
-                    try:
-                        st = pynvml.nvmlDeviceGetP2PStatus(
-                            h_i, h_j, pynvml.NVML_P2P_CAPS_INDEX_NVLINK
-                        )
-                        if st != pynvml.NVML_P2P_STATUS_OK:
-                            return False
-                    except pynvml.NVMLError:
-                        return False
-            return True
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception:
-        return False
 
 
 class ChituCustomAllreduce:
@@ -266,12 +185,9 @@ class ChituCustomAllreduce:
                 self.disabled = True
                 return
 
-            if is_hygon():
-                self.fully_connected = _check_full_hsw(physical_device_ids)
-                topology_name = "HSW"
-            else:
-                self.fully_connected = _check_full_nvlink(physical_device_ids)
-                topology_name = "NVLink"
+            self.fully_connected, topology_name = check_accelerator_fully_connected(
+                physical_device_ids
+            )
 
             if not self.fully_connected:
                 # vLLM's upstream check is `world_size > 2 and not fully_connected`

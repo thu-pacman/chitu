@@ -129,7 +129,7 @@ if [ -f "/sbin/ibdev2netdev" ]; then
     echo "Adding /sbin/ibdev2netdev to mounts" >&2
 fi
 
-DOCKER_RUN_CMD="docker run --network host"
+DOCKER_RUN_CMD="docker run --network host --pid=host"
 if which nvidia-smi >/dev/null 2>&1; then
     DOCKER_RUN_CMD="${DOCKER_RUN_CMD} \
         --gpus=all \

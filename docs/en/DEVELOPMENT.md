@@ -22,7 +22,7 @@ This executable will run Chitu with a Docker container internally.
 #### NVIDIA GPU
 
 ```bash
-docker run --rm --gpus=all --privileged --shm-size=1g \
+docker run --pid=host --rm --gpus=all --privileged --shm-size=1g \
   -v <your_model_path>:<container_model_path> \
   <your_image_name> \
   <your_command>
@@ -32,6 +32,7 @@ docker run --rm --gpus=all --privileged --shm-size=1g \
 
 ```
 docker run \
+  --pid=host \
   --rm \
   --device /dev/davinci0 \
   --device /dev/davinci1 \
@@ -58,6 +59,7 @@ docker run \
 
 ```
 docker run \
+  --pid=host \
   --rm \
   --device=/dev/dri \
   --device=/dev/mxcd \
@@ -76,6 +78,7 @@ docker run \
 
 ```
 docker run -dit \
+  --pid=host \
   -u root \
   --network=host \
   --privileged \
@@ -295,6 +298,7 @@ bash ./script/two-stage-docker-build.sh \
   '<your_image_name>' \
   '<your_image_tag>' \
   docker run \
+    --pid=host \
     --device=/dev/dri \
     --device=/dev/mxcd \
     --group-add video \
@@ -322,6 +326,7 @@ bash ./script/two-stage-docker-build.sh \
   '<your_image_name>' \
   '<your_image_tag>' \
   docker run \
+    --pid=host \
     --privileged \
     --device /dev/devmm_svm \
     --device /dev/hisi_hdc \
@@ -352,6 +357,7 @@ bash ./script/two-stage-docker-build.sh \
   docker run \
     -u root \
     --network=host \
+    --pid=host \
     --privileged \
     --device=/dev/kfd \
     --device=/dev/dri \
@@ -606,7 +612,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
     boot.remote_launcher=srun \
     "boot.target=[test/single_req_test.py]" \
     "boot.interactive_node_0=True" \
-    "boot.extra_apptainer_args=[-v,/path/to/models:/path/to/models]" \
+    "boot.extra_docker_args=[-v,/path/to/models:/path/to/models]" \
     models=Qwen3-235B-A22B \
     models.ckpt_dir=/path/to/Qwen3-235B-A22B \
     infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
@@ -617,8 +623,9 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 ```bash
 ./chitu.run boot.n_nodes=2 boot.n_gpus_per_node=8 \
     boot.remote_launcher=srun \
+    boot.source_path=. \
     "boot.target=[test/single_req_test.py]" \
-    "boot.extra_apptainer_args=[-B,.:/workspace/chitu,-B,/path/to/models:/path/to/models,--env,PYTHONPATH=/workspace/chitu]" \
+    "boot.extra_apptainer_args=[-B,/path/to/models:/path/to/models]" \
     models=Qwen3-235B-A22B \
     models.ckpt_dir=/path/to/Qwen3-235B-A22B \
     infer.dp_size=4 infer.tp_size=4 infer.ep_size=16
