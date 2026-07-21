@@ -289,14 +289,14 @@ Some dependencies must be installed with device visible, so they must be install
 ```bash
 bash ./script/two-stage-docker-build.sh \
   'muxi.Dockerfile' \
-  '<comma_separated_optional_deps>' \
-  '<extra_build_args>' \
-  '<enable_cython_true_or_false>' \
-  '<enable_test_true_or_false>' \
-  '<another_flag_true_or_false>' \
-  '<your_pypi_mirror>' \
   '<your_image_name>' \
   '<your_image_tag>' \
+  --optional_deps='<comma_separated_optional_deps>' \
+  --chitu_setup_jobs='<chitu_setup_jobs>' \
+  --enable_cython='<true_or_false>' \
+  --enable_test='<true_or_false>' \
+  --pypi_mirror='<your_pypi_mirror>' \
+  -- \
   docker run \
     --pid=host \
     --device=/dev/dri \
@@ -317,14 +317,14 @@ Some dependencies must be installed with device visible, so they must be install
 ```bash
 bash ./script/two-stage-docker-build.sh \
   'ascend.Dockerfile' \
-  '<comma_separated_optional_deps>' \
-  '<extra_build_args>' \
-  '<enable_cython_true_or_false>' \
-  '<enable_test_true_or_false>' \
-  '<another_flag_true_or_false>' \
-  '<your_pypi_mirror>' \
   '<your_image_name>' \
   '<your_image_tag>' \
+  --optional_deps='<comma_separated_optional_deps>' \
+  --chitu_setup_jobs='<chitu_setup_jobs>' \
+  --enable_cython='<true_or_false>' \
+  --enable_test='<true_or_false>' \
+  --pypi_mirror='<your_pypi_mirror>' \
+  -- \
   docker run \
     --pid=host \
     --privileged \
@@ -346,14 +346,15 @@ Some dependencies must be installed with device visible, so they must be install
 ```bash
 bash ./script/two-stage-docker-build.sh \
   'hygon.Dockerfile' \
-  '<comma_separated_optional_deps>' \
-  '<extra_build_args>' \
-  '<enable_cython_true_or_false>' \
-  '<enable_test_true_or_false>' \
-  '<another_flag_true_or_false>' \
-  '<your_pypi_mirror>' \
   '<your_image_name>' \
   '<your_image_tag>' \
+  --optional_deps='<comma_separated_optional_deps>' \
+  --chitu_setup_jobs='<chitu_setup_jobs>' \
+  --enable_editable_install='<true_or_false>' \
+  --enable_cython='<true_or_false>' \
+  --enable_test='<true_or_false>' \
+  --pypi_mirror='<your_pypi_mirror>' \
+  -- \
   docker run \
     -u root \
     --network=host \
@@ -1025,6 +1026,7 @@ Install time:
 | `CHITU_WITH_CYTHON`        | `0`, `1`                     | Compile Python sources with Cython.                    |
 | `CHITU_ASCEND_BUILD`       | `0`, `1`                     | Build for Ascend.                                      |
 | `CHITU_HYGON_BUILD`        | `0`, `1`                     | Build for Hygon.                                       |
+| `CHITU_HYGON_BUILD_FOR_SHCA` | `0`, `1`                   | When `CHITU_HYGON_BUILD=1`, build is for SHCA NIC      |
 | `CHITU_MUXI_BUILD`         | `0`, `1`                     | Build for Muxi (MetaX).                                |
 | `CHITU_MOORE_BUILD`        | `0`, `1`                     | Build for MooreThreads.                                |
 | `CHITU_SETUP_JOBS`         | Integer                      | Number of processes for compiling.                     |

@@ -33,7 +33,7 @@ logger = getLogger(__name__)
 
 triton, has_triton = try_import_platform_dep("triton")
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
-deepgemm, has_hygon_deepgemm = try_import_opt_dep("deepgemm", "deepgemm_hygon")
+hygon_deepgemm, has_hygon_deepgemm = try_import_opt_dep("deepgemm", "deep_gemm")
 lightop, has_hygon_lightop = try_import_platform_dep("lightop")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
@@ -50,8 +50,8 @@ support_indexer_hygon = (
     and hasattr(lightop, "op")
     and hasattr(lightop.op, "mqa_logits")
     and has_hygon_deepgemm
-    and hasattr(deepgemm, "paged_mqa_logits")
-    and hasattr(deepgemm, "get_paged_mqa_logits_metadata")
+    and hasattr(hygon_deepgemm, "paged_mqa_logits")
+    and hasattr(hygon_deepgemm, "get_paged_mqa_logits_metadata")
 )
 HYGON_INDEXER_MAX_MTP_SIZE = 5
 
@@ -377,12 +377,12 @@ class DSAIndexer:
         k = k.unsqueeze(2)
 
         context_lens = seq_len_delta.new.lens_tensor_device
-        schedule_meta = deepgemm.get_paged_mqa_logits_metadata(
+        schedule_meta = hygon_deepgemm.get_paged_mqa_logits_metadata(
             context_lens,
             64,  # DeepGEMM paged MQA metadata uses page_size=64
             torch.cuda.get_device_properties(q.device).multi_processor_count,
         )
-        return deepgemm.paged_mqa_logits(
+        return hygon_deepgemm.paged_mqa_logits(
             q,
             k,
             weights,

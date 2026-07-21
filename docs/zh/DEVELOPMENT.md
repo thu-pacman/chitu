@@ -293,14 +293,14 @@ docker build \
 ```bash
 bash ./script/two-stage-docker-build.sh \
   'muxi.Dockerfile' \
-  '<comma_separated_optional_deps>' \
-  '<extra_build_args>' \
-  '<enable_cython_true_or_false>' \
-  '<enable_test_true_or_false>' \
-  '<another_flag_true_or_false>' \
-  '<your_pypi_mirror>' \
   '<your_image_name>' \
   '<your_image_tag>' \
+  --optional_deps='<comma_separated_optional_deps>' \
+  --chitu_setup_jobs='<chitu_setup_jobs>' \
+  --enable_cython='<true_or_false>' \
+  --enable_test='<true_or_false>' \
+  --pypi_mirror='<your_pypi_mirror>' \
+  -- \
   docker run \
     --pid=host \
     --device=/dev/dri \
@@ -321,14 +321,14 @@ bash ./script/two-stage-docker-build.sh \
 ```bash
 bash ./script/two-stage-docker-build.sh \
   'ascend.Dockerfile' \
-  '<comma_separated_optional_deps>' \
-  '<extra_build_args>' \
-  '<enable_cython_true_or_false>' \
-  '<enable_test_true_or_false>' \
-  '<another_flag_true_or_false>' \
-  '<your_pypi_mirror>' \
   '<your_image_name>' \
   '<your_image_tag>' \
+  --optional_deps='<comma_separated_optional_deps>' \
+  --chitu_setup_jobs='<chitu_setup_jobs>' \
+  --enable_cython='<true_or_false>' \
+  --enable_test='<true_or_false>' \
+  --pypi_mirror='<your_pypi_mirror>' \
+  -- \
   docker run \
     --pid=host \
     --privileged \
@@ -350,14 +350,15 @@ bash ./script/two-stage-docker-build.sh \
 ```bash
 bash ./script/two-stage-docker-build.sh \
   'hygon.Dockerfile' \
-  '<comma_separated_optional_deps>' \
-  '<extra_build_args>' \
-  '<enable_cython_true_or_false>' \
-  '<enable_test_true_or_false>' \
-  '<another_flag_true_or_false>' \
-  '<your_pypi_mirror>' \
   '<your_image_name>' \
   '<your_image_tag>' \
+  --optional_deps='<comma_separated_optional_deps>' \
+  --chitu_setup_jobs='<chitu_setup_jobs>' \
+  --enable_editable_install='<true_or_false>' \
+  --enable_cython='<true_or_false>' \
+  --enable_test='<true_or_false>' \
+  --pypi_mirror='<your_pypi_mirror>' \
+  -- \
   docker run \
     -u root \
     --network=host \
@@ -1026,6 +1027,7 @@ torchrun --nproc_per_node 8 --no-python ./test/dist_pytest/run_pytest_with_prett
 | `CHITU_WITH_CYTHON`        | `0`, `1`                     | 利用 Cython 编译 Python 源码。                         |
 | `CHITU_ASCEND_BUILD`       | `0`, `1`                     | 面向昇腾构建。                                         |
 | `CHITU_HYGON_BUILD`        | `0`, `1`                     | 面向海光构建。                                         |
+| `CHITU_HYGON_BUILD_FOR_SHCA` | `0`, `1`                   | `CHITU_HYGON_BUILD=1` 时，面向 SHCA 网卡构建           |
 | `CHITU_MUXI_BUILD`         | `0`, `1`                     | 面向沐曦构建。                                         |
 | `CHITU_MOORE_BUILD`        | `0`, `1`                     | 面向摩尔线程构建。                                     |
 | `CHITU_SETUP_JOBS`         | 整数                         | 并行编译的进程数。                                     |

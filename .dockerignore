@@ -107,3 +107,10 @@
 
 # Vim
 **/.*.swp
+
+
+# Keep Hygon topology libraries in Docker build context
+!third_party/hygon_wheels/topo_lib/
+!third_party/hygon_wheels/topo_lib/**
+!third_party/hygon_wheels/topo_lib/lib/
+!third_party/hygon_wheels/topo_lib/lib/**

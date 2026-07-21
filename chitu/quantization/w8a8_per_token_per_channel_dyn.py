@@ -57,7 +57,7 @@ lmslim_quant_ops, has_lmslim_quant_ops = try_import_platform_dep(
     "lmslim.quantize.quant_ops"
 )
 aiter, has_aiter = try_import_platform_dep("aiter.moe")
-deepgemm, has_deepgemm = try_import_opt_dep("deepgemm", "deepgemm_hygon")
+hygon_deepgemm, has_deepgemm = try_import_opt_dep("deepgemm", "deep_gemm")
 lightop, has_lightop = try_import_platform_dep("lightop")
 
 if has_triton:
@@ -169,7 +169,7 @@ def _call_deepgemm_w8a8_grouped_gemm(
     m_indices: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    deepgemm.m_grouped_i8_gemm_nt_contiguous(
+    hygon_deepgemm.m_grouped_i8_gemm_nt_contiguous(
         (a, a_scale), (weight, weight_scale), out, m_indices, {"MODE": 1000}
     )
 
@@ -1519,7 +1519,7 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
             dtype=torch.bfloat16,
             device=device,
         )
-        deepgemm.m_grouped_w8a8_gemm_nt_masked(
+        hygon_deepgemm.m_grouped_w8a8_gemm_nt_masked(
             (q_x, act_scale),
             (gate_up_weight, gate_up_scale),
             gate_up_out,
@@ -1555,7 +1555,7 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
         # Hygon DeepGEMM W8A8 requires fp32 scale tensors.
         down_scale = self.down_proj_weight_scale.to(torch.float32).contiguous()
         down_out = torch.empty((E, M, self.dim), dtype=torch.bfloat16, device=device)
-        deepgemm.m_grouped_w8a8_gemm_nt_masked(
+        hygon_deepgemm.m_grouped_w8a8_gemm_nt_masked(
             (q_intermediate, intermediate_scale),
             (down_weight, down_scale),
             down_out,

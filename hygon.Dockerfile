@@ -8,6 +8,7 @@ ARG enable_editable_install='false'
 ARG enable_cython='true'
 ARG enable_test='false'
 ARG pypi_mirror=''
+ARG build_for_shca='false'
 
 ENV CHITU_SETUP_JOBS=$chitu_setup_jobs
 ENV MAX_JOBS=$CHITU_SETUP_JOBS
@@ -26,6 +27,10 @@ RUN if [ "{enable_cython}" = "true" ] && [ "${enable_editable_install}" = "true"
 fi
 RUN if [ "${enable_test}" != "true" ] && [ "${enable_test}" != "false" ]; then \
     echo "ARG enable_test must either be 'true' or 'false'"; \
+    exit 1; \
+fi
+RUN if [ "${build_for_shca}" != "true" ] && [ "${build_for_shca}" != "false" ]; then \
+    echo "ARG build_for_shca must either be 'true' or 'false'"; \
     exit 1; \
 fi
 
@@ -54,6 +59,15 @@ RUN if [ "${enable_test}" = "true" ]; then \
     pip install pytest matplotlib; \
 fi
 RUN apt update -y && apt install -y infiniband-diags curl
+RUN --mount=source=./third_party/hygon_wheels,destination=./third_party/hygon_wheels if [ "${build_for_shca}" = "true" ]; then \
+    apt-get update -y; \
+    apt remove -y rdmacm-utils ibacm perftest ibverbs-utils ucx libibverbs-dev libibmad-dev libibumad-dev librdmacm1 infiniband-diags opensm rdma-core libibmad5 libibumad3 ibverbs-providers libibverbs1 || true; \
+    apt install -y libmosquitto1 && \
+    dpkg -i ./third_party/hygon_wheels/shca-tools_2.500.4.B074-Ubuntu22.04_amd64.deb && \
+    cp -r ./third_party/hygon_wheels/topo_lib /opt/topo_lib && \
+    ln -s /opt/topo_lib/lib/librccl-net-shca.so.0.0.0 /opt/topo_lib/lib/librccl-net-shca.so && \
+    ln -s /opt/topo_lib/lib/librccl-net-shca.so.0.0.0 /opt/topo_lib/lib/librccl-net-shca.so.0; \
+fi
 
 RUN curl -L --retry 3 --retry-delay 5 -o /tmp/dtk_llvm.run https://download.sourcefind.cn:65024/file/4/dtk_llvm/dtk_llvm.run && \
     chmod +x /tmp/dtk_llvm.run && \
@@ -157,6 +171,7 @@ COPY ./benchmarks ./benchmarks
 COPY ./chitu/metrics/grafana ./grafana
 
 ENV CHITU_HYGON_BUILD=1
+ENV CHITU_HYGON_BUILD_FOR_SHCA=$build_for_shca
 ENV HIP_GRAPH_ACCUMULATE_DISPATCH=1
 ENV GPU_MAX_HW_QUEUES=3
 
@@ -165,7 +180,7 @@ ENV GPU_MAX_HW_QUEUES=3
 # If you want to change the base image, use
 # `docker inspect --format='Entrypoint: {{.Config.Entrypoint}}' <image>`
 # to check its entrypoint.
-COPY ./script/entrypoint.sh /chitu-entrypoint.sh
+COPY ./script/entrypoint-hygon.sh /chitu-entrypoint.sh
 ENTRYPOINT ["/chitu-entrypoint.sh", "/usr/local/bin/docker-entrypoint.sh"]
 
 # The actual installing procedure requries a NPU device, which is not available in the `docker build` stage.
