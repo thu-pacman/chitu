@@ -6,11 +6,11 @@ import time
 import math
 from enum import Enum, auto
 from logging import getLogger
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, Callable
 from typing_extensions import override
 from collections import deque
 
-from chitu.task import TaskPool, TaskType, Task
+from chitu.task import TaskPool, TaskType, Task, TaskStatus
 from chitu.global_vars import get_global_args, SlotHandle
 from chitu.hooks import TaskEvictHook, NoopTaskEvictHook
 from chitu.utils import ceil_div
@@ -227,30 +227,9 @@ class Scheduler:
         self.sgroup_list = SchedulerGroupList(num_sgroup=self.num_scheduler_groups)
         self.dp_rank = dp_rank
 
-        # determine scoring method
-        self.scorers = []
-        scheduler_types = [st for st in scheduler_type.split(",") if st]
-        if not scheduler_types:
-            raise ValueError("scheduler.type must contain at least one scheduler type")
-        for st in scheduler_types:
-            if st == "request_preset":
-                self.scorers.append(lambda task: task.priority)
-            elif st == "prefill_first":
-                self.scorers.append(
-                    lambda task: 1 if task.task_type == TaskType.Prefill else 0
-                )
-            elif st == "fcfs" or st == "fifo":
-                self.scorers.append(lambda task: -task.arrv_ts)
-            elif st == "stride":
-                self.scorers.append(
-                    lambda task: task.priority * (self.scheduling_ts - task.arrv_ts)
-                )
-            elif st == "deadline":
-                self.scorers.append(lambda task: -task.sched_ddl)
-            elif st == "prefix_align":
-                self.scorers.append(lambda task: -task.prefix_tokens_len)
-            else:
-                raise NotImplementedError(f"Scheduler type {st} not implemented")
+        self.scorers = self.get_scheduler_method_scorers(
+            scheduler_type, lambda: self.scheduling_ts
+        )
 
         self.reset_kvcache_block_threshold()
         self.is_warmup_stage = False
@@ -274,6 +253,38 @@ class Scheduler:
     def set_task_evict_hook(self, hook: TaskEvictHook):
         self._task_evict_hook = hook
 
+    @staticmethod
+    def get_scheduler_method_scorers(
+        scheduler_type: str, get_ts: Callable[[], int]
+    ) -> list[Callable[[Task], int | float]]:
+        # determine scoring method
+        scorers = []
+        scheduler_types = [st for st in scheduler_type.split(",") if st]
+        if not scheduler_types:
+            raise ValueError("scheduler.type must contain at least one scheduler type")
+        for st in scheduler_types:
+            if st == "request_preset":
+                scorers.append(lambda task: task.priority)
+            elif st == "prefill_first":
+                scorers.append(
+                    lambda task: 1 if task.task_type == TaskType.Prefill else 0
+                )
+            elif st == "fcfs" or st == "fifo":
+                scorers.append(lambda task: -task.arrv_ts)
+            elif st == "stride":
+                scorers.append(
+                    lambda task, get_ts=get_ts: task.priority
+                    * (get_ts() - task.arrv_ts)
+                )
+            elif st == "deadline":
+                scorers.append(lambda task: -task.sched_ddl)
+            elif st == "prefix_align":
+                scorers.append(lambda task: -task.prefix_tokens_len)
+            else:
+                raise NotImplementedError(f"Scheduler type {st} not implemented")
+
+        return scorers
+
     def scorer(self, task: Task):
         if self.is_warmup_stage:
             fn = lambda task: (
@@ -290,7 +301,11 @@ class Scheduler:
             不开启prefix caching时，返回当前任务已计算长度
             开启prefix caching时，返回当前任务在各manager中的最小击中长度
         """
-        completed_tokens = task.kv_cache_len_used_in_completed_steps
+        completed_tokens = (
+            0
+            if task.status == TaskStatus.PDDecodeIncoming
+            else task.kv_cache_len_used_in_completed_steps
+        )
         if not self.cache_manager_dict["main"].enable_prefix_caching:
             return completed_tokens
 
@@ -336,26 +351,37 @@ class Scheduler:
         return reserved
 
     def _check_prefill_capacity(
-        self, task, cached_len: int, *, is_new_task: bool = False
+        self,
+        task,
+        cached_len: int,
+        *,
+        need_reserve_capacity: bool = False,
+        pd_prealloc_tokens: int = -1,
     ) -> KVCacheCapacityStatus:
         """检查是否所有cache_manager容量都足以容纳当前Prefill任务(task已缓存token长度为cached_len)
         Args:
             task: 当前正在检查kv cache容量的Prefill任务
             cached_len: 当前任务已缓存的长度
-            is_new_task: 是否为尚未开始prefill的新任务。新任务准入时需为所有在途
+            need_reserve_capacity: 是否需要为任务预留容量。新任务准入时需为所有在途
                 prefill任务预留其完成所需容量，以避免互相占用导致的调度死锁。
+            pd_prealloc_tokens: pd decode阶段的预留prefill容量token数，只在pd decode调用时生效。
         """
+        is_pd_decode_check = pd_prealloc_tokens != -1
+        target_len = (
+            pd_prealloc_tokens
+            if is_pd_decode_check
+            else cached_len + task.next_req_tokens_len
+        )
+
         for name, cache_manager in self.cache_manager_dict.items():
-            target_blocks = cache_manager.num_blocks_for_seq_len(
-                cached_len + task.next_req_tokens_len
-            )
+            target_blocks = cache_manager.num_blocks_for_seq_len(target_len)
             if target_blocks > cache_manager.num_blocks:
                 return KVCacheCapacityStatus.EXCEEDS_CAPACITY
 
             cur_blocks = cache_manager.num_blocks_for_seq_len(cached_len)
             block_threshold = (
                 self.kvcache_block_threshold
-                if name == "main"
+                if (name == "main" and not is_pd_decode_check)
                 else cache_manager.num_blocks
             )
             available_blocks = (
@@ -367,7 +393,7 @@ class Scheduler:
             )
             # 准入「新」prefill任务时，必须为所有在途prefill任务的完成预留容量，
             # 否则会出现两个部分完成的prefill互相占块、谁都无法完成的死锁。
-            if is_new_task:
+            if need_reserve_capacity:
                 available_blocks -= self._inflight_prefill_reserved_blocks(
                     cache_manager, exclude_task_id=task.task_id
                 )
@@ -610,6 +636,27 @@ class Scheduler:
             f"p95_ms={_pct(95):.2f} p99_ms={_pct(99):.2f}"
         )
 
+    def _prepare_pd_decode_kvcache(
+        self, task_id: str, pd_prealloc_tokens: int
+    ) -> KVCacheCapacityStatus:
+        task = TaskPool.pool[task_id]
+        num_cached_tokens = self._num_prefill_cached_tokens(task)
+        num_uncomputed_tokens = task.prefix_tokens_len - num_cached_tokens
+        capacity_status = self._check_prefill_capacity(
+            task,
+            num_cached_tokens,
+            need_reserve_capacity=False,
+            pd_prealloc_tokens=pd_prealloc_tokens,
+        )
+        if capacity_status is not KVCacheCapacityStatus.OK:
+            return capacity_status
+        task.set_prefill_chunk_size_for_one_step(
+            1 if num_uncomputed_tokens == 0 else num_uncomputed_tokens
+        )
+        self._prepare_prefill_metadata(task, num_cached_tokens)
+        task.consume_req_tokens()
+        return capacity_status
+
     def _schedule_prefill_tasks(self, task_ids: list[str]) -> list[str]:
         """Prefill tasks scheduling with congestion control
         Args:
@@ -668,9 +715,9 @@ class Scheduler:
             task_origin_prefill_chunk_size = task.prefill_chunk_size
             task.set_prefill_chunk_size_for_one_step(task_prefill_chunk_size)
 
-            is_new_task = task.consumed_req_tokens == 0
+            need_reserve_capacity = task.consumed_req_tokens == 0
             capacity_status = self._check_prefill_capacity(
-                task, num_cached_tokens, is_new_task=is_new_task
+                task, num_cached_tokens, need_reserve_capacity=need_reserve_capacity
             )
             if capacity_status is KVCacheCapacityStatus.EXCEEDS_CAPACITY:
                 task.prefill_chunk_size = task_origin_prefill_chunk_size
@@ -678,7 +725,7 @@ class Scheduler:
                 continue
             if capacity_status is KVCacheCapacityStatus.CONGESTED:
                 task.prefill_chunk_size = task_origin_prefill_chunk_size
-                if is_new_task:
+                if need_reserve_capacity:
                     # 全新任务被拥塞（含为在途prefill预留容量导致）：跳过它继续检查
                     # 排序靠后的、已在途的部分完成任务，让后者有机会推进而不被挡住。
                     continue

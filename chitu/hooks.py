@@ -279,7 +279,10 @@ class PDTaskEvictHook:
         return []
 
     def check_evict(self, task_id: str) -> bool:
-        if TaskPool.pool.get(task_id) is not None:
+        if (
+            TaskPool.pool.get(task_id) is not None
+            and not TaskPool.pool.get(task_id).is_pd_status()
+        ):
             return True
         # evict prefilling tasks on decode rank
         pd_scheduler = get_pd_scheduler_instance()
