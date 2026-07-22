@@ -995,3 +995,12 @@ full checkpoint at once instead of streaming layer-by-layer. Useful on
 platforms where layerwise loading causes memory fragmentation issues (e.g. Ascend NPU).
 
 *Default: `False`.*
+
+## Argument `model_load_per_layer_timeout_s`
+
+Timeout for each process to finish one model layer during layerwise loading, in seconds.
+
+This is an explicit timeout effective for layerwise loading. For non-layerwise loading, implicit
+timeout may or may not happen in the communication immedately after model loading.
+
+*Default: `60`.*

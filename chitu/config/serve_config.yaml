@@ -794,6 +794,12 @@ gpu_preprocess: True
 #: platforms where layerwise loading causes memory fragmentation issues (e.g. Ascend NPU).
 disable_layerwise_load: False
 
+#: Timeout for each process to finish one model layer during layerwise loading, in seconds.
+#:
+#: This is an explicit timeout effective for layerwise loading. For non-layerwise loading, implicit
+#: timeout may or may not happen in the communication immedately after model loading.
+model_load_per_layer_timeout_s: 60
+
 quant: null
 
 # The followings are legacy parameters. They are to be removed in the future.
