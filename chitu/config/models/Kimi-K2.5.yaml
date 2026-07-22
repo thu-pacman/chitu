@@ -33,8 +33,10 @@ qk_rope_head_dim: 64
 v_head_dim: 128
 rope_theta: 50000.0
 rope_factor: 64.0
-rs_token_id: 163584
-re_token_id: 163585
+bos_token_id: 163584
+eos_token_id: [163585, 163586, 163593]
+rs_token_id: 163606
+re_token_id: 163607
 reasoning_type: switchable
 # Vision encoder configuration (MoonViT3d)
 vision_config:

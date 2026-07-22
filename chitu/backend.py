@@ -7,6 +7,7 @@ import functools
 import os
 import time
 import re
+import threading
 from collections import deque
 from datetime import timedelta
 from enum import Enum
@@ -35,7 +36,6 @@ from chitu.attn_backend import (
     DLLMAttnBackend,
     HunyuanAttnBackend,
 )
-
 from chitu.kv_cache.registry import (
     should_use_hopper_mixed_backend,
     can_use_hunyuan_attn,
@@ -48,7 +48,7 @@ from chitu.distributed.parallel_state import (
     get_dp_group,
     initialize_parallel_groups,
 )
-from chitu.distributed.coordinator import init_coordinator
+from chitu.distributed.coordinator import init_coordinator, get_value, set_value
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 from chitu.distributed.infiniband import auto_set_ib_envs
 from chitu.hybrid_device import CPUParameter
@@ -76,7 +76,12 @@ from chitu.tool_call import patch_chat_template
 from chitu.utils import parse_dtype
 from chitu.import_utils import try_import_opt_dep
 from chitu.moe import init_moe_impl
-from chitu.global_vars import set_slot_handle, set_cuda_device
+from chitu.global_vars import (
+    get_multi_inst_world_size,
+    get_world_size_from_config,
+    set_slot_handle,
+    set_cuda_device,
+)
 from chitu.numa_utils import bind_process_to_numa
 from chitu.kv_cache.providers import register_all_providers
 from chitu.kv_cache.builders import build_cache_managers
@@ -330,6 +335,7 @@ class Backend:
         prefill_context_parallel_size = args.infer.pcp_size
         global_rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
+        expected_world_size = get_world_size_from_config(args)
 
         if prefill_context_parallel_size > 1 and non_expert_data_parallel_size > 1:
             raise ValueError(
@@ -339,13 +345,6 @@ class Backend:
             )
 
         if expert_tensor_parallel_size is None:
-            assert (
-                tensor_parallel_size
-                * non_expert_data_parallel_size
-                * prefill_context_parallel_size
-                % expert_parallel_size
-                == 0
-            )
             expert_tensor_parallel_size = (
                 tensor_parallel_size
                 * prefill_context_parallel_size
@@ -366,31 +365,14 @@ class Backend:
                 embed_tokens_lm_head_tp_size == 1
             ), "embed_tokens_lm_head_tp_size must be 1 when tensor_parallel_size == 1 and non_expert_data_parallel_size == 1"
 
-        if (
-            world_size
-            != tensor_parallel_size
-            * prefill_context_parallel_size
-            * non_expert_data_parallel_size
-            * pipeline_parallel_size
-        ):
+        if world_size != expected_world_size:
             raise ValueError(
-                f"Inconsistent parallelism: world_size({world_size}) should be equal to "
-                f"tensor_parallel_size({tensor_parallel_size}) "
-                f"* prefill_context_parallel_size({prefill_context_parallel_size}) "
-                f"* non_expert_data_parallel_size({non_expert_data_parallel_size}) "
-                f"* pipeline_parallel_size({pipeline_parallel_size}) "
-            )
-        if (
-            world_size
-            != expert_tensor_parallel_size
-            * expert_parallel_size
-            * pipeline_parallel_size
-        ):
-            raise ValueError(
-                f"Inconsistent parallelism: world_size({world_size}) should be equal to "
-                f"expert_tensor_parallel_size({expert_tensor_parallel_size}) "
-                f"* expert_parallel_size({expert_parallel_size}) "
-                f"* pipeline_parallel_size({pipeline_parallel_size}) "
+                f"Inconsistent parallelism: torch distributed world_size({world_size}) "
+                f"does not match the world size implied by infer parallelism "
+                f"({expected_world_size}). Please check infer.tp_size({args.infer.tp_size}), "
+                f"infer.pcp_size({args.infer.pcp_size}), infer.dp_size({args.infer.dp_size}), "
+                f"infer.pp_size({args.infer.pp_size}), infer.ep_size({args.infer.ep_size}), "
+                f"and infer.etp_size({args.infer.etp_size})."
             )
 
         initialize_parallel_groups(
@@ -1055,6 +1037,129 @@ class Backend:
         return key_filter
 
     @staticmethod
+    def _get_model_load_processes(args):
+        return [
+            (inst_id, rank)
+            for inst_id in range(args.multi_inst.n_insts)
+            for rank in range(get_multi_inst_world_size(inst_id))
+        ]
+
+    @staticmethod
+    def _get_model_load_progress_key(args, inst_id, rank):
+        return f"model_load_progress:{inst_id}:{rank}:progress"
+
+    @staticmethod
+    def _get_model_load_total_key(args, inst_id, rank):
+        return f"model_load_progress:{inst_id}:{rank}:total"
+
+    @staticmethod
+    def _set_model_load_total(args, total_layers):
+        inst_id = args.multi_inst.inst_id
+        rank = torch.distributed.get_rank()
+        set_value(
+            Backend._get_model_load_total_key(args, inst_id, rank),
+            str(total_layers).encode(),
+            override=True,
+        )
+
+    @staticmethod
+    def _set_model_load_progress(args, current_layer):
+        inst_id = args.multi_inst.inst_id
+        rank = torch.distributed.get_rank()
+        set_value(
+            Backend._get_model_load_progress_key(args, inst_id, rank),
+            str(current_layer).encode(),
+            override=True,
+        )
+
+    @staticmethod
+    def _read_model_load_progress(args):
+        progress = {}
+        for inst_id, rank in Backend._get_model_load_processes(args):
+            total = int(
+                get_value(
+                    Backend._get_model_load_total_key(args, inst_id, rank)
+                ).decode()
+            )
+            current = int(
+                get_value(
+                    Backend._get_model_load_progress_key(args, inst_id, rank)
+                ).decode()
+            )
+            progress[(inst_id, rank)] = (current, total)
+        return progress
+
+    @staticmethod
+    def _wait_for_global_layerwise_model_load(args):
+        timeout_s = args.model_load_per_layer_timeout_s
+        poll_interval_s = 1
+        processes = Backend._get_model_load_processes(args)
+        last_progress = {}
+        last_update_time = {}
+
+        while True:
+            now = time.monotonic()
+            all_done = True
+            progress = Backend._read_model_load_progress(args)
+
+            for process in processes:
+                current, total = progress[process]
+                previous = last_progress.get(process)
+                if previous is None or current > previous:
+                    last_progress[process] = current
+                    last_update_time[process] = now
+
+                if current < total:
+                    all_done = False
+                    if now - last_update_time[process] > timeout_s:
+                        inst_id, rank = process
+                        raise TimeoutError(
+                            f"Rank {rank} in instance {inst_id} did not finish a model layer "
+                            f"within {timeout_s}s while loading layerwise checkpoint "
+                            f"({current}/{total} layers complete)."
+                        )
+
+            if all_done:
+                return
+            time.sleep(poll_interval_s)
+
+    @staticmethod
+    def _display_global_layerwise_model_load_progress(args):
+        poll_interval_s = 1
+        bars = {}
+
+        try:
+            processes = Backend._get_model_load_processes(args)
+            while True:
+                all_done = True
+                progress = Backend._read_model_load_progress(args)
+
+                for position, process in enumerate(processes):
+                    current, total = progress[process]
+                    if current < total:
+                        all_done = False
+
+                    if process not in bars:
+                        inst_id, rank = process
+                        bars[process] = tqdm(
+                            total=total,
+                            desc=f"Model loading inst {inst_id} rank {rank}",
+                            unit="layer",
+                            position=position,
+                            leave=False,
+                            nrows=len(processes) + 1,
+                        )
+                    bars[process].n = current
+                    bars[process].refresh()
+
+                if all_done:
+                    return
+                time.sleep(poll_interval_s)
+        finally:
+            for bar in bars.values():
+                bar.close()
+
+    @staticmethod
     def _load_hf_checkpoint_layerwise(model, args):
         """Load HuggingFace-format checkpoints one layer at a time.
 
@@ -1146,12 +1251,6 @@ class Backend:
                     f"Error loading tensors into model part by prefix {target_prefix}"
                 ) from e
 
-        # Load non-layer weights
-        for checkpoint_prefix, model_prefix in model._get_non_layer_prefix_mappings():
-            _load_and_apply(checkpoint_prefix, model_prefix)
-
-        # Load transformer layers
-        is_print_rank = int(os.environ.get("LOCAL_RANK", 0)) == 0
         has_separate_mtp_layer = (
             args.infer.mtp_size > 1
             and args.models.type in {ModelType.HF_QWEN3_5, ModelType.DEEPSEEK_V4}
@@ -1164,12 +1263,35 @@ class Backend:
             if has_separate_mtp_layer
             else model.local_end_layer_id
         )
-        for global_layer_id in tqdm(
-            range(model.local_begin_layer_id, local_main_end_layer_id),
-            disable=not is_print_rank,
-            desc="Model loading",
-            unit="layer",
-            leave=False,
+        total_layers = local_main_end_layer_id - model.local_begin_layer_id
+        if has_separate_mtp_layer:
+            total_layers += model.local_end_layer_id - local_main_end_layer_id
+        loaded_layers = 0
+        Backend._set_model_load_total(args, total_layers)
+        Backend._set_model_load_progress(args, loaded_layers)
+        display_thread = None
+        display_thread_errors = []
+        if args.multi_inst.inst_id == 0 and torch.distributed.get_rank() == 0:
+
+            def _display_progress_and_save_error():
+                try:
+                    Backend._display_global_layerwise_model_load_progress(args)
+                except Exception as e:
+                    display_thread_errors.append(e)
+
+            display_thread = threading.Thread(
+                target=_display_progress_and_save_error,
+                daemon=True,
+            )
+            display_thread.start()
+
+        # Load non-layer weights
+        for checkpoint_prefix, model_prefix in model._get_non_layer_prefix_mappings():
+            _load_and_apply(checkpoint_prefix, model_prefix)
+
+        # Load transformer layers
+        for global_layer_id in range(
+            model.local_begin_layer_id, local_main_end_layer_id
         ):
             checkpoint_prefix, model_prefix = model._get_layer_i_prefix_mapping(
                 global_layer_id
@@ -1182,14 +1304,12 @@ class Backend:
                 model_prefix,
                 local_layer_prefix=local_layer_prefix,
             )
+            loaded_layers += 1
+            Backend._set_model_load_progress(args, loaded_layers)
 
         if has_separate_mtp_layer:
-            for global_layer_id in tqdm(
-                range(local_main_end_layer_id, model.local_end_layer_id),
-                disable=not is_print_rank,
-                desc="Model loading",
-                unit="layer",
-                leave=False,
+            for global_layer_id in range(
+                local_main_end_layer_id, model.local_end_layer_id
             ):
                 checkpoint_prefix, model_prefix, extra_prefix_dict = (
                     model._get_layer_mtp_prefix_mapping(global_layer_id)
@@ -1203,6 +1323,15 @@ class Backend:
                     local_layer_prefix=local_layer_prefix,
                     extra_prefix_dict=extra_prefix_dict,
                 )
+                loaded_layers += 1
+                Backend._set_model_load_progress(args, loaded_layers)
+        Backend._wait_for_global_layerwise_model_load(args)
+        if display_thread is not None:
+            display_thread.join()
+        if display_thread_errors:
+            raise RuntimeError(
+                "Model loading progress display thread failed"
+            ) from display_thread_errors[0]
         torch.cuda.empty_cache()
 
     @staticmethod

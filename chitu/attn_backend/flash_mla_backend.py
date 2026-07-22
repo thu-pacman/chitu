@@ -1613,6 +1613,10 @@ class FlashMLABackend(TritonAttnBackend):
             return
 
         if is_hygon() or is_muxi():
+            # 新版 FlashMLA 接口：直接创建 FlashMLASchedMeta
+            if has_flash_mla_sched_meta:
+                self.hygon_metadata_decode, _ = flash_mla.get_mla_metadata()
+                return
             # 参考旧版FlashMLA的实现，将metadata和num_splits存储为static tensor
             s_q = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
             num_q_tokens_per_head_k = s_q * self.local_n_heads // self.kv_heads
@@ -1637,24 +1641,17 @@ class FlashMLABackend(TritonAttnBackend):
                     self.kv_heads,
                 )
 
-            if has_flash_mla_sched_meta:
-                # 新版 FlashMLA 接口：直接创建 FlashMLASchedMeta
-                if self.hygon_metadata_decode is None:
-                    # Create empty FlashMLASchedMeta using get_mla_metadata()
-                    # The actual tensor data will be generated during kernel execution
-                    self.hygon_metadata_decode, _ = flash_mla.get_mla_metadata()
+            # 旧版 FlashMLA 接口：使用 StaticTensor 存储
+            if self.hygon_metadata_decode is None:
+                self.hygon_metadata_decode = StaticTensor(metadata)
             else:
-                # 旧版 FlashMLA 接口：使用 StaticTensor 存储
-                if self.hygon_metadata_decode is None:
-                    self.hygon_metadata_decode = StaticTensor(metadata)
-                else:
-                    self.hygon_metadata_decode.set(metadata)
-                if self.hygon_num_splits_decode is None:
-                    self.hygon_num_splits_decode = StaticTensor(
-                        num_splits, max_nelem=max_batch_size_per_dp + 1
-                    )
-                else:
-                    self.hygon_num_splits_decode.set(num_splits)
+                self.hygon_metadata_decode.set(metadata)
+            if self.hygon_num_splits_decode is None:
+                self.hygon_num_splits_decode = StaticTensor(
+                    num_splits, max_nelem=max_batch_size_per_dp + 1
+                )
+            else:
+                self.hygon_num_splits_decode.set(num_splits)
         else:
             # NOTE: the actual metadata intialization in the updated version of
             # FlashMLA occurs during the first execution of flash_mla_with_kvcache in

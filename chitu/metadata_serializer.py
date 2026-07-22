@@ -190,6 +190,30 @@ class MetadataConfig:
         return cls.for_decode_with_status()
 
     @classmethod
+    def for_pp_bootstrap_decode(cls) -> "MetadataConfig":
+        """PP 全前缀命中任务转 Decode 的注册配置
+
+        全前缀命中（num_uncomputed==0）的 Prefill 被 scheduler 直接转为 Decode、
+        未经过 prefill_step，故非首 PP stage 的 TaskPool 没有它：
+        - for_decode_with_status 不含 tasks_data，接收侧无法注册 → KeyError；
+          本配置在 decode_with_status 基础上补注册字段（prompt_len /
+          sample_params / return_params / consumed / next_token），使非首 stage
+          经 _create_task_from_data 重建该 Decode 任务。
+        """
+        return cls(
+            include_task_ids=True,
+            include_payload_type=True,
+            include_task_type=True,
+            include_has_outputs=True,
+            include_slot_idx=True,
+            include_prompt_len=True,
+            include_sample_params=True,
+            include_return_params=True,
+            include_consumed_tokens=True,
+            include_next_token=True,
+        )
+
+    @classmethod
     def for_dp_prefill(cls) -> "MetadataConfig":
         return cls.for_prefill()
 
@@ -537,7 +561,16 @@ class MetadataSerializer:
         elif tasks.task_type == TaskType.Decode:
             if pd_enabled:
                 return MetadataConfig.for_pd_decode_rank()
-            else:
-                return MetadataConfig.for_decode_with_status()
+            # bootstrap decode: a never-prefilled task (never registered to a
+            # downstream stage via for_prefill) appears as a new_task on its first
+            # hop -> needs for_pp_bootstrap_decode to register it; after that it
+            # enters transmitted_task_ids -> for_decode_with_status.
+            new_task_set = set(new_task_ids)
+            is_bootstrap = isinstance(tasks, PackedTasks) and any(
+                tid in new_task_set for tid in tasks.task_ids
+            )
+            if is_bootstrap:
+                return MetadataConfig.for_pp_bootstrap_decode()
+            return MetadataConfig.for_decode_with_status()
         else:
             return MetadataConfig.for_special()

@@ -699,14 +699,22 @@ class Scheduler:
             num_cached_tokens = self._num_prefill_cached_tokens(task)
             num_uncomputed_tokens = task.prefix_tokens_len - num_cached_tokens
             if num_uncomputed_tokens == 0:
-                # prompt_len == num_cached_tokens
-                # All prompt tokens are hit, but an additional step is required to compute the logits.
-                # This task in the step consumes 1 of the chunk_prefill_size budget, but doesn't need additional KV cache capacity.
-                # Only the last token of the prompt requires an extra prefill step.
-                prefill_tokens += 1
-                task.set_prefill_chunk_size_for_one_step(1)
-                sched_out_task_ids.append(task_id)
-                self._prepare_prefill_metadata(task, num_cached_tokens)
+                if self.is_warmup_stage or get_global_args().infer.mtp_size > 1:
+                    # Fall back to legacy 1-token prefill:
+                    # - warmup: decode graph not captured yet, full prefill needed to
+                    #   estimate memory;
+                    # - mtp>1: bootstrap decode only supports mtp==1; the MTP draft
+                    #   state machine (mtp cache, accept_index, is_classic_decoding)
+                    #   depends on prefill_step initialization, so skipping prefill
+                    #   would break it
+                    prefill_tokens += 1
+                    task.set_prefill_chunk_size_for_one_step(1)
+                    sched_out_task_ids.append(task_id)
+                    self._prepare_prefill_metadata(task, num_cached_tokens)
+                    continue
+                # Fully cached (mtp==1): skip prefill here and let _schedule_decode_tasks
+                # convert this task to a bootstrap Decode (graphed decode for the
+                # first token, see _schedule_decode_tasks).
                 continue
 
             task_prefill_chunk_size = min(
@@ -807,12 +815,18 @@ class Scheduler:
                 continue
             task = TaskPool.pool[tid]
             if task.task_type == TaskType.Decode:
-                decode_task_ids.append(tid)
-            elif (
-                task.task_type == TaskType.Prefill
-                and task.task_id in self.cache_manager_dict["main"].task_to_cache_ids
-            ):
-                cached_prefill_task_ids.append(tid)
+                decode_task_ids.append((tid, None))
+            elif task.task_type == TaskType.Prefill:
+                num_cached_tokens = self._num_prefill_cached_tokens(task)
+                if (
+                    get_global_args().infer.mtp_size == 1
+                    and task.prefix_tokens_len >= 2
+                    and self.cache_manager_dict["main"].enable_prefix_caching
+                    and task.prefix_tokens_len - num_cached_tokens == 0
+                ):
+                    decode_task_ids.append((tid, num_cached_tokens))
+                elif task.task_id in self.cache_manager_dict["main"].task_to_cache_ids:
+                    cached_prefill_task_ids.append(tid)
 
         if not decode_task_ids:
             return []
@@ -821,13 +835,32 @@ class Scheduler:
         evict_tasks = []
 
         while decode_task_ids and len(sched_out_task_ids) < self.decode_num_tasks:
-            candidate_task_id = decode_task_ids.popleft()
+            candidate_task_id, num_cached_tokens = decode_task_ids.popleft()
             candidate_task = TaskPool.pool[candidate_task_id]
+            is_bootstrap_candidate = num_cached_tokens is not None
+            if is_bootstrap_candidate:
+                # Confirmed scheduling this candidate this step: convert to a
+                # Decode task and reactivate the KV prefix blocks. Via
+                # _prepare_prefill_metadata -> prepare_metadata_before_prefill, the
+                # prefix blocks are reactivated; without this they could be evicted
+                # or block_table left empty, and decode would read no KV.
+                self._prepare_prefill_metadata(candidate_task, num_cached_tokens)
+                candidate_task.task_type = TaskType.Decode
+                candidate_task.prefill_chunk_size = None
+                candidate_task.consumed_req_tokens = candidate_task.prefix_tokens_len
+                candidate_task.next_token = candidate_task.prefix_tokens[-1]
+                candidate_task.has_unsync_new_token = False
 
             capacity_status = self._check_decode_capacity(candidate_task)
             if capacity_status is KVCacheCapacityStatus.OK:
                 sched_out_task_ids.append(candidate_task_id)
-                self._prepare_decode_metadata(candidate_task)
+                if not is_bootstrap_candidate:
+                    # A bootstrap candidate already had _prepare_prefill_metadata
+                    # reactivate the prefix blocks and write the reactivated
+                    # cache_idx into task.new_cache_ids (serialized to each stage
+                    # to fill block_table). It must NOT call _prepare_decode_metadata:
+                    # that would clear new_cache_ids.
+                    self._prepare_decode_metadata(candidate_task)
                 continue
             if capacity_status is KVCacheCapacityStatus.EXCEEDS_CAPACITY:
                 self._terminate_task_exceeds_capacity(candidate_task_id)
@@ -838,11 +871,12 @@ class Scheduler:
                 break
 
             # 容量不足，可逐出低优先级任务（优先逐出已开始prefill但未完成的任务）
-            decode_task_ids.appendleft(candidate_task_id)
+            decode_task_ids.appendleft((candidate_task_id, None))
             if cached_prefill_task_ids:
                 evict_task_id = cached_prefill_task_ids.pop()
             else:
-                evict_task_id = decode_task_ids.pop()
+                evict_tid, _ = decode_task_ids.pop()
+                evict_task_id = evict_tid
             evict_tasks.append(evict_task_id)
             self.evict_task(evict_task_id)
 

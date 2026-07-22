@@ -4,6 +4,7 @@
 
 from logging import getLogger
 
+from chitu.boot.local_run_base import LocalRunCallback
 from chitu.boot.multi_instance import (
     build_instance_launch_plans,
     launch_multi_instance_on_node,
@@ -13,7 +14,7 @@ from chitu.boot.multi_instance import (
 logger = getLogger(__name__)
 
 
-def local(cfg, raw_argv, local_run_callback):
+def local(cfg, raw_argv, local_run_callback: LocalRunCallback):
     n_nodes = int(cfg.boot.n_nodes)
     if n_nodes > 1:
         raise ValueError(f"boot.n_nodes must be 1 (got {n_nodes}) for local launcher")
@@ -64,4 +65,5 @@ def local(cfg, raw_argv, local_run_callback):
         is_master_node=True,
         torchrun_n_nodes=n_nodes,
         torchrun_nproc_per_node=n_gpus_per_node,
+        container_name_suffix="service",
     )

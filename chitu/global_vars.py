@@ -570,6 +570,56 @@ def _apply_multi_inst_override(cfg: Any, override_inst_id: Optional[int] = None)
     return OmegaConf.merge(cfg, normalized_overrides[inst_id])
 
 
+def get_multi_inst_config(inst_id: int) -> Any:
+    """Return the effective config for one multi-instance."""
+    _ensure_var_is_initialized(_RAW_GLOBAL_ARGS, "global args")
+    return _apply_multi_inst_override(_RAW_GLOBAL_ARGS, override_inst_id=inst_id)
+
+
+def get_world_size_from_config(cfg: Any) -> int:
+    """Return the world size from a config and validate parallelism consistency."""
+    if cfg.infer.etp_size is None:
+        if (
+            cfg.infer.tp_size
+            * cfg.infer.dp_size
+            * cfg.infer.pcp_size
+            % cfg.infer.ep_size
+            != 0
+        ):
+            raise ValueError(
+                f"Inconsistent parallelism: "
+                f"tensor_parallel_size({cfg.infer.tp_size}) "
+                f"* prefill_context_parallel_size({cfg.infer.pcp_size}) "
+                f"* non_expert_data_parallel_size({cfg.infer.dp_size}) "
+                f"should be divisible by expert_parallel_size({cfg.infer.ep_size}) "
+                f"when expert_tensor_parallel_size is not set"
+            )
+        etp_size = (
+            cfg.infer.tp_size * cfg.infer.pcp_size * cfg.infer.dp_size
+        ) // cfg.infer.ep_size
+    else:
+        etp_size = cfg.infer.etp_size
+
+    world_size = (
+        cfg.infer.tp_size * cfg.infer.pcp_size * cfg.infer.dp_size * cfg.infer.pp_size
+    )
+
+    if world_size != etp_size * cfg.infer.ep_size * cfg.infer.pp_size:
+        raise ValueError(
+            f"Inconsistent parallelism: world_size({world_size}) should be equal to "
+            f"expert_tensor_parallel_size({etp_size}) "
+            f"* expert_parallel_size({cfg.infer.ep_size}) "
+            f"* pipeline_parallel_size({cfg.infer.pp_size}) "
+        )
+
+    return world_size
+
+
+def get_multi_inst_world_size(inst_id: int) -> int:
+    """Return the effective torch world size for one multi-instance."""
+    return get_world_size_from_config(get_multi_inst_config(inst_id))
+
+
 @functools.cache
 def get_multi_inst_ids_by_role(role: str) -> list[int]:
     """Return global instance IDs whose effective config has the given role."""

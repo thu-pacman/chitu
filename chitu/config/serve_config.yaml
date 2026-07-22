@@ -55,6 +55,13 @@ boot:
   #: Number of GPUs per node to use
   n_gpus_per_node: 1
 
+  #: Slurm job name and Docker container name prefix.
+  #:
+  #: Acceptable values:
+  #: - null: Use `${USER}-chitu` as the Slurm job name, and do not set Docker container names.
+  #: - A string: Use this value as the Slurm job name and Docker container name prefix.
+  job_name: null
+
   #: Path to container image (override bundled image).
   #:
   #: For apptainer: absolute path to a .sif file.
@@ -786,6 +793,12 @@ gpu_preprocess: True
 #: full checkpoint at once instead of streaming layer-by-layer. Useful on
 #: platforms where layerwise loading causes memory fragmentation issues (e.g. Ascend NPU).
 disable_layerwise_load: False
+
+#: Timeout for each process to finish one model layer during layerwise loading, in seconds.
+#:
+#: This is an explicit timeout effective for layerwise loading. For non-layerwise loading, implicit
+#: timeout may or may not happen in the communication immedately after model loading.
+model_load_per_layer_timeout_s: 60
 
 quant: null
 

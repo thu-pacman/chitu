@@ -9,6 +9,8 @@ from typing import Callable, Iterable, Sequence
 
 from omegaconf import DictConfig, OmegaConf
 
+from chitu.boot.local_run_base import LocalRunCallback
+
 
 @dataclass(frozen=True)
 class InstanceLaunchPlan:
@@ -173,7 +175,7 @@ def catch_into_errors(errors: list[Exception], f: Callable) -> Callable:
 def launch_multi_instance_on_node(
     cfg: DictConfig,
     raw_argv: Sequence[str],
-    local_run_callback: Callable,
+    local_run_callback: LocalRunCallback,
     *,
     instance_plans: Sequence[InstanceLaunchPlan],
     node_rank: int,
@@ -210,6 +212,7 @@ def launch_multi_instance_on_node(
                 "is_master_node": True,
                 "torchrun_n_nodes": 1,
                 "torchrun_nproc_per_node": 1,
+                "container_name_suffix": "router",
                 "_proc_registry": procs,
             },
             daemon=True,
@@ -246,6 +249,7 @@ def launch_multi_instance_on_node(
                 "is_master_node": inst_node_rank == 0,
                 "torchrun_n_nodes": instance_plan.nnodes,
                 "torchrun_nproc_per_node": instance_plan.nproc_per_node,
+                "container_name_suffix": f"inst-{instance_plan.inst_id}",
                 "_proc_registry": procs,
             },
         )
