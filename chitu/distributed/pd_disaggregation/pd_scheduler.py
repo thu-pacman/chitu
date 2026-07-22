@@ -370,12 +370,14 @@ class PDInstanceRequestManager:
         # In PD disagg mode, prefill produces the first token.
         # Decode should only generate up to max_seq_len - prompt_len tokens.
         max_seq_len = get_global_args().infer.max_seq_len
-        allowed_new = max(0, int(max_seq_len) - int(task.prompt_len))
-        if int(task.req.max_new_tokens) > allowed_new:
+        generated = len(task.req.generated_tokens)
+        allowed_new = max(0, max_seq_len - task.prefix_tokens_len)
+        allowed_new = min(allowed_new, task.req.max_new_tokens - generated)
+        if task.req.max_new_tokens > allowed_new:
             logger.warning(
                 f"[PD_DECODE] clamp max_new_tokens: req_id={task.task_id} "
-                f"prompt_len={int(task.prompt_len)} max_seq_len={int(max_seq_len)} "
-                f"max_new_tokens={int(task.req.max_new_tokens)} -> {int(allowed_new)}"
+                f"prompt_len={task.prompt_len} {generated=} {max_seq_len=}"
+                f"max_new_tokens={task.req.max_new_tokens} -> {allowed_new}"
             )
             task.req.max_new_tokens = int(allowed_new)
         # For PD services, keep request handling non-blocking and thread-safe:
@@ -819,7 +821,7 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                     logger.warning(
                         "[PD_BOOTSTRAP][decode.timeout] "
                         f"req_id={rid} waited={waited:.1f}s timeout_s={wait_timeout_s:.1f} "
-                        f"prefill_done={prefill_done} cache_owner={target_dp_rank} prefill_sid={prefill_sid} "
+                        f"prefill_done={bool(prefill_done)} cache_owner={target_dp_rank} prefill_sid={prefill_sid} "
                         f"last_prepare_age_s={now - last_prepare_ts:.1f} "
                         f"prefix_len={int(getattr(task, 'prefix_tokens_len', 0)) if task is not None else 0}"
                     )
@@ -832,6 +834,12 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                     )
                 continue
 
+            task.req.num_hit_tokens = max(
+                task.req.num_hit_tokens, prefill_done.num_hit_tokens
+            )
+            task.req.add_data(prefill_done.first_token)
+            if task.dp_rank != 0:
+                task.update_response_sync([prefill_done.first_token])
             created_ts = float(info.get("created_ts", now))
             waited = now - created_ts
             self._decode_ready_promoted_total += 1
