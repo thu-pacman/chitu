@@ -17,6 +17,7 @@ import torch
 from omegaconf import OmegaConf
 import re
 
+from chitu.boot.arg_utils import resolve_default_args
 from chitu.device_type import has_native_fp8
 from chitu.import_utils import try_import_platform_dep, try_import_opt_dep
 from chitu.schemas.serve_config import ServeConfig, StaticConfig
@@ -219,143 +220,18 @@ def set_backend_variables(global_args=None):
     models.backend_config = backend_config
 
 
-def _check_checkpoint_path(args):
-    if args.models.ckpt_dir is None:
-        if not getattr(args.models, "is_pro", False):
-            raise ValueError(
-                f"No checkpoint path provided. You can set it in command line by adding "
-                f"`models.ckpt_dir=<path>`. The model {args.models.name} can be downloaded "
-                f"from {args.models.source}"
-            )
-        else:
-            raise ValueError(
-                f"No checkpoint path provided. You can set it in command line by adding "
-                f"`models.ckpt_dir=<path>`. The model {args.models.name} is part of "
-                f"chitu-pro, which may be obtained by concatting solution@chitu.ai"
-            )
-    if args.models.tokenizer_path is None:
-        logger.info(
-            f"Using {args.models.ckpt_dir} as the path to tokenizer. If the tokenizer has a different path, please set in command line by adding `models.tokenizer_path=<path>`"
-        )
-        args.models.tokenizer_path = args.models.ckpt_dir
-    if hasattr(args.models, "processor_path") and args.models.processor_path is None:
-        logger.info(
-            f"Using {args.models.ckpt_dir} as the path to processor. If the processor has a different path, please set in command line by adding `models.processor_path=<path>`"
-        )
-        args.models.processor_path = args.models.ckpt_dir
+def resolve_full_default_args(args):
+    """
+    This function provides default args resolving in addition to `esolve_default_args`. The
+    additional part can't be done in boot phase.
+    """
 
-
-def _has_cpu_layer(args) -> bool:
-    if (backend_config := args.models.get("backend_config")) is not None:
-        for config in backend_config.get("backend", []):
-            if (pattern := config.get("model")) is not None:
-                if re.match(pattern, args.models.name.lower()):
-                    for rule in config.rules:
-                        if rule.get("backend") == "cpuinfer":
-                            return True
-    return False
-
-
-def resolve_default_args(args):
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
 
-    ###################################################################
-    # Deal with legacy arguments
-    if hasattr(args.infer, "soft_fp8") and args.infer.soft_fp8:
-        logger.warning(
-            "Argument `infer.soft_fp8=True` is deprecated. Use `infer.raise_lower_bit_float_to=bfloat16` instead."
-        )
-        args.infer.raise_lower_bit_float_to = "bfloat16"
-    if hasattr(args, "dtype") and args.dtype is not None:
-        logger.warning(
-            "Argument `dtype` is deprecated. Use `float_16bit_variant` instead."
-        )
-        args.float_16bit_variant = args.dtype
-    if hasattr(args.infer, "do_load") and not args.infer.do_load:
-        logger.warning(
-            "Argument `infer.do_load=False` is deprecated. Use `debug.skip_model_load=True` instead."
-        )
-        args.debug.skip_model_load = True
-    if hasattr(args.infer, "max_reqs") and args.infer.max_reqs is not None:
-        args.infer.max_batch_size = args.infer.max_reqs
-        logger.warning(
-            f"Argument `infer.max_reqs={args.infer.max_reqs}` is deprecated. Use `infer.max_batch_size={args.infer.max_batch_size}` instead."
-        )
-    if getattr(args.infer, "max_concurrent_requests", None) is None:
-        args.infer.max_concurrent_requests = args.infer.max_batch_size * 2
-        logger.info(
-            f"infer.max_concurrent_requests not set, defaulting to max_batch_size * 2 ({args.infer.max_concurrent_requests})"
-        )
+    args = resolve_default_args(args)
 
-    if (
-        hasattr(args.scheduler.pp_config, "prefill_num_tasks_divided_by_pp")
-        and not args.scheduler.pp_config.prefill_num_tasks_divided_by_pp
-    ):
-        logger.warning(
-            "Argument `scheduler.pp_config.prefill_num_tasks_divided_by_pp=False` is deprecated. Use `scheduler.pp_config.pp_micro_batch_size_prefill=<num>` instead."
-        )
-        assert (
-            hasattr(args.scheduler.pp_config, "prefill_num_tasks")
-            and args.scheduler.pp_config.prefill_num_tasks
-        )
-        args.scheduler.pp_config.pp_micro_batch_size_prefill = (
-            args.scheduler.pp_config.prefill_num_tasks
-        )
-    if (
-        hasattr(args.scheduler.pp_config, "enforce_decode_num_tasks_max")
-        and not args.scheduler.pp_config.enforce_decode_num_tasks_max
-    ):
-        logger.warning(
-            "Argument `scheduler.pp_config.enforce_decode_num_tasks_max=False` is deprecated. Use `scheduler.pp_config.pp_micro_batch_size_decode=<num>` instead."
-        )
-        assert (
-            hasattr(args.scheduler.pp_config, "decode_num_tasks")
-            and args.scheduler.pp_config.decode_num_tasks
-        )
-        args.scheduler.pp_config.pp_micro_batch_size_decode = (
-            args.scheduler.pp_config.decode_num_tasks
-        )
-
-    ###################################################################
-    # Deal with automatic arguments
-
-    if args.infer.device_ids is None:
-        args.infer.device_ids = [i % local_world_size for i in range(world_size)]
-    if len(args.infer.device_ids) != world_size:
-        raise ValueError(
-            f"len(infer.device_ids) ({len(args.infer.device_ids)}) must be equalt to world_size ({world_size})"
-        )
-
-    if args.infer.prefill_chunk_size == "auto":
-        # prefill_chunk_size is the GLOBAL budget across all DP and CP ranks.
-        # Aim for ~4096 tokens processed per rank, so scale by both dp_size
-        # and pcp_size.
-        args.infer.prefill_chunk_size = 4096 * args.infer.dp_size * args.infer.pcp_size
-
-    if (
-        args.infer.prefill_chunk_size is not None
-        and args.infer.prefill_chunk_size
-        > args.infer.max_batch_size * args.infer.max_seq_len
-    ):
-        logger.warning(
-            f"infer.prefill_chunk_size ({args.infer.prefill_chunk_size}) is larger than "
-            f"infer.max_batch_size ({args.infer.max_batch_size}) * infer.max_seq_len "
-            f"({args.infer.max_seq_len}), which has no effect. Reducing it to "
-            f"infer.max_batch_size * infer.max_seq_len."
-        )
-        args.infer.prefill_chunk_size = (
-            args.infer.max_batch_size * args.infer.max_seq_len
-        )
-
-    if args.infer.prefill_chunk_size is not None:
-        if args.infer.pp_size > 1 and args.infer.cache_type == "skew":
-            logger.warning(
-                "Disabling infer.prefill_chunk_size because it is not compatible with PP+skew yet"
-            )
-            args.infer.prefill_chunk_size = None
-
-    if args.infer.bind_process_to_cpu == "auto":
+    if args.infer.bind_process_to_cpu != "none":
         if not has_numa:
             logger.warning(
                 "Optional dependency '[numa]' is mising. Disabling NUMA binding."
@@ -366,16 +242,14 @@ def resolve_default_args(args):
                 "NUMA is not support on this OS or hardware platform. Disabling NUMA binding."
             )
             args.infer.bind_process_to_cpu = "none"
-        elif _has_cpu_layer(args):
-            if numa.get_max_node() + 1 < local_world_size:
-                logger.warning(
-                    "Disable NUMA binding due to insufficient NUMA nodes. Is is an inefficient setting of CPU inference."
-                )
-                args.infer.bind_process_to_cpu = "none"
-            else:
-                args.infer.bind_process_to_cpu = "one_numa_per_rank"
-        else:
-            args.infer.bind_process_to_cpu = "numa_near_device"
+    if (
+        args.infer.bind_process_to_cpu == "one_numa_per_rank"
+        and numa.get_max_node() + 1 < local_world_size
+    ):
+        logger.warning(
+            "Disable NUMA binding due to insufficient NUMA nodes. Is is an inefficient setting of CPU inference."
+        )
+        args.infer.bind_process_to_cpu = "none"
 
     if args.infer.use_cuda_graph == "auto":
         if args.models.name in {
@@ -401,64 +275,9 @@ def resolve_default_args(args):
         else:
             args.infer.use_cuda_graph = True
 
-    if args.infer.mtp_size <= 0:
-        args.infer.mtp_size = 1
-
-    if args.infer.full_warmup == "auto":
-        # Suppose you are benchmarking Chitu with a fixed context length, if will end up
-        # always running the decode stage with full batch size, then we set
-        # `infer.full_warmup=False`. Otherwise, we set `infer.full_warmup=True`.
-        if args.infer.pp_size > 1:
-            # The actual batch size is affected by micro-batching
-            args.infer.full_warmup = True
-        elif args.infer.mtp_size > 1:
-            # Some requests will end sooner depending on the success rate of MTP, so some
-            # final batches will be unfull.
-            args.infer.full_warmup = True
-        else:
-            args.infer.full_warmup = False
-
-    if args.scheduler.pp_config.pp_micro_batch_size_prefill == "auto":
-        args.scheduler.pp_config.pp_micro_batch_size_prefill = "max"
-
-    if args.scheduler.pp_config.pp_micro_batch_size_decode == "auto":
-        args.scheduler.pp_config.pp_micro_batch_size_decode = "max"
-
-    if args.infer.embed_tokens_lm_head_tp_size == "auto":
-        args.infer.embed_tokens_lm_head_tp_size = args.infer.tp_size
-    else:
-        assert (
-            args.infer.embed_tokens_lm_head_tp_size.isdigit()
-        ), "embed_tokens_lm_head_tp_size must be auto or an integer"
-
-    from chitu.models.registry import ModelType
-
-    if args.infer.mla_absorb == "auto":
-        if args.models.type in {
-            ModelType.DEEPSEEK_V3,
-            ModelType.KIMI_K2_5,
-            ModelType.GLM_5_2,
-        }:
-            args.infer.mla_absorb = "absorb-without-precomp"
-        else:
-            args.infer.mla_absorb = "none"
-
-    if args.infer.dp_size > args.infer.max_batch_size:
-        raise ValueError(
-            f"infer.dp_size ({args.infer.dp_size}) cannot be greater than infer.max_batch_size ({args.infer.max_batch_size})"
-        )
-
-    _check_checkpoint_path(args)
-
-    model_resolver = ModelConfigResolver()
-    args.models = StaticConfig(
-        model_resolver.process_config_dict(args.models, args.models.ckpt_dir)
-    )
-
-    if (
-        args.models.type == ModelType.DEEPSEEK_V3
-        or args.models.type == ModelType.GLM_5_2
-    ) and args.models.get("index_topk", None) is not None:
+    if (args.models.type in {"deepseek-v3", "glm-5-2"}) and args.models.get(
+        "index_topk", None
+    ) is not None:
         from chitu.dsa_indexer import (
             HYGON_INDEXER_MAX_MTP_SIZE,
             support_indexer_deepgemm,
@@ -489,16 +308,10 @@ def resolve_default_args(args):
                 raise NotImplementedError("No available infer.indexer_type found")
         validate_indexer_config(args, args.infer.indexer_type)
 
-    if args.infer.process_group_timeout_seconds == "auto":
-        if args.infer.full_warmup:
-            # DeepGEMM JIT warmup compiles many kernels during the first forward pass
-            # (each (n,k) shape sweeps m=[1, DG_WARMUP_MAX_M] building 15-29 distinct
-            # kernels), which can take well over the NCCL default 600s watchdog timeout.
-            # Use a generous timeout that covers the warmup compilation window when
-            # enable full_warmup
-            args.infer.process_group_timeout_seconds = 3600
-        else:
-            args.infer.process_group_timeout_seconds = None
+    model_resolver = ModelConfigResolver()
+    args.models = StaticConfig(
+        model_resolver.process_config_dict(args.models, args.models.ckpt_dir)
+    )
 
     logger.debug(f"Auto setting configs done. Full configs are: {args}")
     return args
@@ -696,7 +509,7 @@ def set_global_args(raw_args, need_ensure=True, need_preprocess=True):
             multi_inst, "inst_id", None
         ) is not None:
             args = _apply_multi_inst_override(args)
-        args = resolve_default_args(StaticConfig(args))
+        args = resolve_full_default_args(StaticConfig(args))
     _GLOBAL_ARGS = args
 
 

@@ -28,7 +28,14 @@ run_server(){
     CPUS_PER_GPU=24
     MEM_PER_GPU=142144
 
-    NUM_CPUS=$(($NUM_GPUS * $CPUS_PER_GPU))
+    MAX_CPUS=$(sinfo --noheader -o "%c" | grep -oE "[0-9]+" | sort -nr | head -n 1)
+    if [ "$NUM_GPUS" -eq 8 ]; then
+        NUM_CPUS=${MAX_CPUS}
+        GRES_FLAGS_ARG=""
+    else
+        NUM_CPUS=$(($NUM_GPUS * $CPUS_PER_GPU))
+        GRES_FLAGS_ARG="--gres-flags=enforce-binding"
+    fi
     NUM_MEMS=$(($NUM_GPUS * $MEM_PER_GPU))
 
     srun --partition=${SLURM_PARTITION} \
@@ -36,6 +43,7 @@ run_server(){
         --cpus-per-task=${NUM_CPUS} \
         --mem=${NUM_MEMS} \
         --gres=gpu:${NUM_GPUS} \
+        ${GRES_FLAGS_ARG} \
         --job-name=${SERVE_JOB_NAME} \
         --nodes=1 \
         --ntasks=1 \

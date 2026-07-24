@@ -25,6 +25,14 @@ GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 CPUS_PER_GPU=${CPUS_PER_GPU:-24}
 SLURM_PARTITION=${SLURM_PARTITION:-}
 
+slurm_max_cpus_per_node() {
+  if [ -n "$SLURM_PARTITION" ]; then
+    sinfo --noheader -p "$SLURM_PARTITION" -o "%c" | grep -oE "[0-9]+" | sort -nr | head -n 1
+  else
+    sinfo --noheader -o "%c" | grep -oE "[0-9]+" | sort -nr | head -n 1
+  fi
+}
+
 if [ "$NUM_NODES" -lt 3 ]; then
   echo "ERROR: NUM_NODES must be >= 3 (need Node0=P+Router, Node1-2=Decode)" >&2
   exit 2
@@ -39,6 +47,15 @@ echo "节点每卡: $GPUS_PER_NODE"
 SRUN_PARTITION_ARG=""
 if [ -n "$SLURM_PARTITION" ]; then SRUN_PARTITION_ARG="--partition=${SLURM_PARTITION}"; fi
 
+if [ "$GPUS_PER_NODE" -eq 8 ]; then
+  CPUS_PER_TASK="$(slurm_max_cpus_per_node)"
+  GRES_FLAGS_ARG=""
+else
+  CPUS_PER_TASK=$((GPUS_PER_NODE * CPUS_PER_GPU))
+  GRES_FLAGS_ARG="--gres-flags=enforce-binding"
+fi
+[ -n "$CPUS_PER_TASK" ] || { echo "ERROR: cannot determine Slurm CPUs per node" >&2; exit 2; }
+
 LOG_DIR=${LOG_DIR:-"$(pwd)/log"}
 echo "日志目录: $LOG_DIR"
 mkdir -p "$LOG_DIR"
@@ -48,7 +65,8 @@ srun $SRUN_PARTITION_ARG \
      --ntasks=${NUM_NODES} \
      --ntasks-per-node=1 \
      --gres=gpu:${GPUS_PER_NODE} \
-     --cpus-per-task=$((GPUS_PER_NODE * CPUS_PER_GPU)) \
+     ${GRES_FLAGS_ARG} \
+     --cpus-per-task=${CPUS_PER_TASK} \
      --job-name=pd_disagg_qwen3_next_1p1d_tp2pp4_dp16ep16_3n \
      --time=01:00:00 \
      -l \

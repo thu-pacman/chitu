@@ -46,9 +46,11 @@ if [[ "$3" != "--node" ]]; then
     fi
 
     # 计算总的CPU和内存
-    MAX_CPUS=$(sinfo --noheader -o "%c" | grep -oE "[0-9]+")
-    MAX_MEM=$(sinfo --noheader -o "%m" | grep -oE "[0-9]+")
-    if [ -z "${NUM_CPUS}" ]; then
+    MAX_CPUS=$(sinfo --noheader -o "%c" | grep -oE "[0-9]+" | sort -nr | head -n 1)
+    MAX_MEM=$(sinfo --noheader -o "%m" | grep -oE "[0-9]+" | sort -nr | head -n 1)
+    if [ "${NUM_GPUS}" -eq 8 ]; then
+        NUM_CPUS=${MAX_CPUS}
+    elif [ -z "${NUM_CPUS}" ]; then
         NUM_CPUS=$((NUM_GPUS * ${CPUS_PER_GPU}))
         NUM_CPUS=$((NUM_CPUS < MAX_CPUS ? NUM_CPUS : MAX_CPUS))
     fi
@@ -61,6 +63,9 @@ if [[ "$3" != "--node" ]]; then
     if sinfo --noheader -o "%G" | grep -q "gpu:"; then
         echo "Detected GRES gpu in Slurm, allocating resources with --gres=gpu:$NUM_GPUS"
         PARAMS="$PARAMS --gres=gpu:$NUM_GPUS"
+        if [ "${NUM_GPUS}" -ne 8 ]; then
+            PARAMS="$PARAMS --gres-flags=enforce-binding"
+        fi
     else
         echo "No supported GRES detected in Slurm, allocating nodes exclusively"
         PARAMS="$PARAMS --exclusive"

@@ -16,6 +16,26 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 die() { echo "ERROR: $*" >&2; exit 2; }
 
+slurm_max_cpus_per_node() {
+  local partition="${1:-}" cpus
+  if [ -n "${partition}" ]; then
+    cpus="$(sinfo --noheader -p "${partition}" -o "%c" | grep -oE "[0-9]+" | sort -nr | head -n 1 || true)"
+  else
+    cpus="$(sinfo --noheader -o "%c" | grep -oE "[0-9]+" | sort -nr | head -n 1 || true)"
+  fi
+  [ -n "${cpus}" ] || die "cannot determine Slurm CPUs per node"
+  echo "${cpus}"
+}
+
+slurm_cpus_per_task() {
+  local gpus="$1" cpus_per_gpu="$2" partition="${3:-}"
+  if [ "${gpus}" -eq 8 ]; then
+    slurm_max_cpus_per_node "${partition}"
+  else
+    echo $((gpus * cpus_per_gpu))
+  fi
+}
+
 usage() {
   cat <<'EOF'
 用法:
@@ -758,6 +778,8 @@ for _x in "${DECODE_SPECS[@]}"; do PD_DECODE_SPECS_STR+="${_x}"$'\n'; done
 export PD_COMMON_OVERRIDES_STR PD_PREFILL_SPECS_STR PD_DECODE_SPECS_STR
 export PD_PREFILL_DEFAULT_SPEC="${PREFILL_DEFAULT_SPEC}" PD_DECODE_DEFAULT_SPEC="${DECODE_DEFAULT_SPEC}"
 
+PD_CPUS_PER_TASK="$(slurm_cpus_per_task "${PD_GPUS_PER_NODE}" "${PD_CPUS_PER_GPU}" "${PD_PARTITION}")"
+
 # ── 打印摘要 ──
 echo "=== PD Disagg (nodes=${PD_NODES} gpus=${PD_GPUS_PER_NODE}) ==="
 echo "router_port=${PD_ROUTER_PORT:-auto} job_port_offset=${PD_JOB_PORT_OFFSET}"
@@ -788,13 +810,14 @@ SRUN_CMD=(
   --nodes="${PD_NODES}"
   --ntasks="${PD_NODES}"
   --ntasks-per-node=1
-  --cpus-per-task=$((PD_GPUS_PER_NODE * PD_CPUS_PER_GPU))
+  --cpus-per-task="${PD_CPUS_PER_TASK}"
 )
 
 if [ -n "${PD_SLURM_JOB_ID}" ]; then
   SRUN_CMD+=(--jobid="${PD_SLURM_JOB_ID}")
 else
   SRUN_CMD+=(--gres="gpu:${PD_GPUS_PER_NODE}")
+  [ "${PD_GPUS_PER_NODE}" -ne 8 ] && SRUN_CMD+=(--gres-flags=enforce-binding)
   [ -n "${PD_PARTITION}" ] && SRUN_CMD+=(--partition="${PD_PARTITION}")
   [ -n "${PD_EXCLUDE}" ] && SRUN_CMD+=(--exclude="${PD_EXCLUDE}")
   [ -n "${PD_NODELIST}" ] && SRUN_CMD+=(--nodelist="${PD_NODELIST}")

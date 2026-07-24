@@ -21,6 +21,9 @@ def _collect_models() -> list[tuple[str, Any]]:
             base = os.path.basename(model_file)
             if base.endswith(".yaml"):
                 filename = base[:-5]
+                if filename == "none":
+                    # This is a placeholder only for testing
+                    continue
                 cfg = hydra.compose(config_name=filename)
                 ret.append((filename, cfg))
     return ret

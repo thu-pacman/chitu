@@ -17,6 +17,26 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 die() { echo "ERROR: $*" >&2; exit 2; }
 
+slurm_max_cpus_per_node() {
+  local partition="${1:-}" cpus
+  if [ -n "${partition}" ]; then
+    cpus="$(sinfo --noheader -p "${partition}" -o "%c" | grep -oE "[0-9]+" | sort -nr | head -n 1 || true)"
+  else
+    cpus="$(sinfo --noheader -o "%c" | grep -oE "[0-9]+" | sort -nr | head -n 1 || true)"
+  fi
+  [ -n "${cpus}" ] || die "cannot determine Slurm CPUs per node"
+  echo "${cpus}"
+}
+
+slurm_cpus_per_task() {
+  local gpus="$1" cpus_per_gpu="$2" partition="${3:-}"
+  if [ "${gpus}" -eq 8 ]; then
+    slurm_max_cpus_per_node "${partition}"
+  else
+    echo $((gpus * cpus_per_gpu))
+  fi
+}
+
 usage() {
   cat <<'EOF'
 用法:
@@ -512,6 +532,8 @@ for _x in "${INSTANCE_SPECS[@]}"; do MI_INSTANCE_SPECS_STR+="${_x:-__DEFAULT__}"
 export MI_COMMON_OVERRIDES_STR MI_INSTANCE_SPECS_STR
 export MI_INST_DEFAULT_SPEC="${INST_DEFAULT_SPEC}"
 
+MI_CPUS_PER_TASK="$(slurm_cpus_per_task "${MI_GPUS_PER_NODE}" "${MI_CPUS_PER_GPU}" "${MI_PARTITION}")"
+
 # NCCL / IB defaults
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 export NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_0,mlx5_3,mlx5_4,mlx5_7}"
@@ -540,6 +562,7 @@ echo "bind_code=${MI_APPTAINER_BIND_CODE}  log=${LOG_DIR}"
 SRUN_EXTRA=""
 [ -n "${MI_PARTITION}" ] && SRUN_EXTRA+=" --partition=${MI_PARTITION}"
 [ -n "${MI_EXCLUDE}" ]   && SRUN_EXTRA+=" --exclude=${MI_EXCLUDE}"
+[ "${MI_GPUS_PER_NODE}" -ne 8 ] && SRUN_EXTRA+=" --gres-flags=enforce-binding"
 
 srun ${SRUN_EXTRA} \
   --export=ALL \
@@ -547,7 +570,7 @@ srun ${SRUN_EXTRA} \
   --ntasks="${MI_NODES}" \
   --ntasks-per-node=1 \
   --gres="gpu:${MI_GPUS_PER_NODE}" \
-  --cpus-per-task=$((MI_GPUS_PER_NODE * MI_CPUS_PER_GPU)) \
+  --cpus-per-task="${MI_CPUS_PER_TASK}" \
   --job-name="multi_instance_apptainer" \
   --time="${MI_TIME}" \
   -l \

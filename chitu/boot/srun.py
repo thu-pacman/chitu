@@ -58,8 +58,17 @@ def srun(cfg, raw_argv, local_run_callback: LocalRunCallback):
         max_cpus = int(max_cpus_match.group()) if max_cpus_match else 0
         max_mem = int(max_mem_match.group()) if max_mem_match else 0
 
+        gres_info = run_capture(["sinfo", "--noheader", "-o", "%G"])
+        if "gpu:" in gres_info:
+            max_gpus_match = re.search(r"[0-9]+", gres_info)
+            max_gpus = int(max_gpus_match.group()) if max_gpus_match else 0
+        else:
+            max_gpus = None
+
         num_cpus = os.environ.get("NUM_CPUS")
-        if not num_cpus:
+        if max_gpus is not None and n_gpus_per_node == max_gpus:
+            num_cpus = max_cpus
+        elif not num_cpus:
             num_cpus = n_gpus_per_node * cpus_per_gpu
             num_cpus = min(num_cpus, max_cpus)
         else:
@@ -86,13 +95,32 @@ def srun(cfg, raw_argv, local_run_callback: LocalRunCallback):
             "--kill-on-bad-exit=1",
         ]
 
-        gres_info = run_capture(["sinfo", "--noheader", "-o", "%G"])
-        if "gpu:" in gres_info:
+        if max_gpus is not None:
             logger.info(
                 f"Detected GRES gpu in Slurm, allocating resources with "
                 f"--gres=gpu:{n_gpus_per_node}"
             )
             full_srun_args += [f"--gres=gpu:{n_gpus_per_node}"]
+            if n_gpus_per_node < max_gpus:
+                if cfg.infer.bind_process_to_cpu == "numa_near_device":
+                    if num_cpus <= n_gpus_per_node * cpus_per_gpu:
+                        full_srun_args += ["--gres-flags=enforce-binding"]
+                    else:
+                        logger.warning(
+                            "Skipping Slurm-level NUMA binding, because the required number "
+                            "of CPUs is higher than total number of CPUs near the specific GPUs"
+                        )
+                elif cfg.infer.bind_process_to_cpu == "one_numa_per_rank":
+                    logger.warning(
+                        "`infer.bind_process_to_cpu=one_numa_per_rank` is not implemented "
+                        "yet at slurm level. Skipping Slurm-level NUMA binding"
+                    )
+                elif cfg.infer.bind_process_to_cpu == "none":
+                    pass
+                else:
+                    raise ValueError(
+                        f'Unexpected value "{cfg.infer.bind_process_to_cpu}" for infer.bind_process_to_cpu'
+                    )
         else:
             logger.warning(
                 "No supported GRES detected in Slurm, allocating nodes exclusively"
