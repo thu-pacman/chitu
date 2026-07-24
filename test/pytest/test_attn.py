@@ -89,6 +89,176 @@ def _skip_unsupported_csa_hca_impl(impl: str):
             pytest.skip("flash_mla is too old to have `flash_mla_sparse_fwd`")
 
 
+def _make_decode_seq_len_delta_from_start_positions(
+    start_positions: torch.Tensor,
+) -> BatchedSeqLenDelta:
+    old_lens = start_positions.to(device="cpu", dtype=torch.int64).tolist()
+    new_lens = (start_positions + 1).to(device="cpu", dtype=torch.int64).tolist()
+    return BatchedSeqLenDelta(
+        old_lens,
+        new_lens,
+        device=start_positions.device,
+        cache_prefix_lens_tensor_device=False,
+        cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
+        cache_delta_position_ids_tensor_device=False,
+        cache_delta_seq_ids_tensor_device=False,
+    )
+
+
+def _decode_compressor_ref(
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    ape: torch.Tensor,
+    start_positions: torch.Tensor,
+    cache_slots: torch.Tensor,
+    *,
+    ratio: int,
+    q_len: int,
+    head_dim: int,
+    is_csa: bool,
+    use_cuda_graph: bool,
+):
+    kv_state_ref = kv_state.clone()
+    score_state_ref = score_state.clone()
+    state_rows = kv_state_ref.shape[1]
+    bsz = start_positions.numel()
+    full_d = kv_state_ref.shape[-1]
+    kv_flat = kv.reshape(bsz * q_len, full_d)
+    score_flat = score.reshape(bsz * q_len, full_d)
+    compressed_mask = start_positions.remainder(ratio) + q_len >= ratio
+    full_rows = use_cuda_graph or is_csa
+    compressed_idx = (
+        torch.arange(bsz, device=start_positions.device, dtype=torch.long)
+        if full_rows
+        else torch.nonzero(compressed_mask, as_tuple=False).flatten()
+    )
+    out = torch.zeros(
+        bsz if full_rows else compressed_idx.numel(),
+        head_dim,
+        device=kv.device,
+        dtype=torch.float32,
+    )
+
+    out_row = 0
+    for req in range(bsz):
+        sp = int(start_positions[req].item())
+        slot = int(cache_slots[req].item())
+        pending = sp % ratio
+        should_compress = bool(compressed_mask[req].item())
+        group_start = sp - pending
+
+        if should_compress:
+            if is_csa:
+                cur_kv = []
+                cur_score = []
+                prev_kv = []
+                prev_score = []
+                for r in range(ratio):
+                    pos = group_start + r
+                    if pos < sp:
+                        row = pos % state_rows
+                        cur_kv.append(kv_state_ref[slot, row, head_dim:])
+                        cur_score.append(score_state_ref[slot, row, head_dim:])
+                    else:
+                        src = req * q_len + (pos - sp)
+                        cur_kv.append(kv_flat[src, head_dim:])
+                        cur_score.append(score_flat[src, head_dim:] + ape[r, head_dim:])
+
+                    prev_pos = group_start - ratio + r
+                    if prev_pos >= 0:
+                        row = prev_pos % state_rows
+                        prev_kv.append(kv_state_ref[slot, row, :head_dim])
+                        prev_score.append(score_state_ref[slot, row, :head_dim])
+                    else:
+                        prev_kv.append(torch.zeros_like(kv_flat[0, :head_dim]))
+                        prev_score.append(
+                            torch.full_like(kv_flat[0, :head_dim], float("-inf"))
+                        )
+                src_kv = torch.stack(prev_kv + cur_kv, dim=0)
+                src_score = torch.stack(prev_score + cur_score, dim=0)
+            else:
+                src_kv = []
+                src_score = []
+                for r in range(ratio):
+                    pos = group_start + r
+                    if pos < sp:
+                        row = pos % state_rows
+                        src_kv.append(kv_state_ref[slot, row])
+                        src_score.append(score_state_ref[slot, row])
+                    else:
+                        src = req * q_len + (pos - sp)
+                        src_kv.append(kv_flat[src])
+                        src_score.append(score_flat[src] + ape[r])
+                src_kv = torch.stack(src_kv, dim=0)
+                src_score = torch.stack(src_score, dim=0)
+
+            value = (src_kv * src_score.softmax(dim=0)).sum(dim=0)
+            if full_rows:
+                out[req] = value
+            else:
+                out[out_row] = value
+                out_row += 1
+
+        for t in range(q_len):
+            pos = sp + t
+            row = pos % state_rows
+            src = req * q_len + t
+            ape_row = pos % ratio
+            kv_state_ref[slot, row] = kv_flat[src]
+            score_state_ref[slot, row] = score_flat[src] + ape[ape_row]
+
+    return (
+        out,
+        compressed_mask,
+        compressed_idx,
+        full_rows,
+        kv_state_ref,
+        score_state_ref,
+    )
+
+
+def _hadamard_128_ref(x: torch.Tensor) -> torch.Tensor:
+    out = x.clone()
+    width = 1
+    while width < 128:
+        view = out.view(-1, width * 2)
+        left = view[:, :width].clone()
+        right = view[:, width : width * 2].clone()
+        view[:, :width] = left + right
+        view[:, width : width * 2] = left - right
+        width *= 2
+    return out * (128.0**-0.5)
+
+
+def _postprocess_write_kv_cache_ref(
+    kv_compress: torch.Tensor,
+    norm_weight: torch.Tensor,
+    start_positions: torch.Tensor,
+    cache_slots: torch.Tensor,
+    *,
+    ratio: int,
+    q_len: int,
+    norm_eps: float,
+    use_hadamard: bool,
+) -> dict[tuple[int, int], torch.Tensor]:
+    values = {}
+    d = kv_compress.shape[-1]
+    for req in range(start_positions.numel()):
+        sp = int(start_positions[req].item())
+        if sp % ratio + q_len < ratio:
+            continue
+        kv = kv_compress[req].to(torch.bfloat16).to(torch.float32)
+        rms = torch.sqrt(torch.sum(kv * kv) / d + norm_eps)
+        value = (kv / rms * norm_weight).to(torch.bfloat16).to(torch.float32)
+        if use_hadamard:
+            value = _hadamard_128_ref(value).to(torch.bfloat16).to(torch.float32)
+        values[(int(cache_slots[req].item()), sp // ratio)] = value
+    return values
+
+
 def _dequant_dsa_fp8_kv_cache(kv_fp8: torch.Tensor) -> torch.Tensor:
     """Dequantize DeepSeek/GLM DSA FP8 MLA KV layout to bf16.
 
@@ -1504,6 +1674,312 @@ def test_mla_decode_paged_kv(
     assert_close(y, y_ref, atol=1e-2, rtol=1e-2, cos_sim_tol=cos_sim_tol)
 
 
+@pytest.mark.parametrize(
+    "name,is_csa,ratio,q_len,use_cuda_graph,start_positions",
+    [
+        ("hca_decode", False, 128, 1, False, [0, 127, 128, 255]),
+        ("hca_mtp", False, 128, 4, False, [0, 124, 125, 255]),
+        ("hca_mtp_graph", False, 128, 4, True, [0, 124, 125, 255]),
+        ("csa_decode", True, 4, 1, False, [0, 2, 3, 5]),
+        ("csa_mtp", True, 4, 3, False, [0, 2, 3, 5]),
+    ],
+)
+def test_deepseek_v4_decode_compressor_dispatch(
+    name,
+    is_csa,
+    ratio,
+    q_len,
+    use_cuda_graph,
+    start_positions,
+):
+    del name
+    if not torch.cuda.is_available() or not has_triton:
+        pytest.skip("DeepSeek-V4 decode compressor dispatch test requires CUDA Triton")
+
+    from chitu.ops.deepseek_compressor import decode_compressor
+    from chitu.ops.deepseek_v4_decode_plan import build_decode_compress_plan
+
+    torch.manual_seed(20260716 + q_len + ratio)
+    device = torch.device("cuda")
+    start_positions = torch.tensor(start_positions, device=device, dtype=torch.long)
+    bsz = start_positions.numel()
+    cache_slots = torch.tensor([2, 0, 3, 1], device=device, dtype=torch.long)[:bsz]
+    cache_seq_ids = torch.arange(bsz, device=device, dtype=torch.long)
+    head_dim = 8
+    full_d = head_dim * 2 if is_csa else head_dim
+    state_rows = ratio * 2 if is_csa else ratio
+
+    kv_state = torch.randn(bsz, state_rows, full_d, device=device, dtype=torch.float32)
+    score_state = torch.randn_like(kv_state)
+    ape = torch.randn(ratio, full_d, device=device, dtype=torch.float32) * 0.1
+    kv_shape = (bsz, q_len, full_d)
+    if not is_csa and q_len > 1:
+        kv_shape = (bsz * q_len, full_d)
+    kv = torch.randn(*kv_shape, device=device, dtype=torch.float32)
+    score = torch.randn(*kv_shape, device=device, dtype=torch.float32) * 0.1
+
+    expected = _decode_compressor_ref(
+        kv,
+        score,
+        kv_state,
+        score_state,
+        ape,
+        start_positions,
+        cache_slots,
+        ratio=ratio,
+        q_len=q_len,
+        head_dim=head_dim,
+        is_csa=is_csa,
+        use_cuda_graph=use_cuda_graph,
+    )
+    (
+        expected_out,
+        expected_mask,
+        expected_idx,
+        expected_full_rows,
+        expected_kv_state,
+        expected_score_state,
+    ) = expected
+
+    plan = build_decode_compress_plan(
+        start_positions,
+        cache_slots,
+        cache_seq_ids,
+        ratio=ratio,
+        q_len=q_len,
+        head_dim=head_dim,
+        is_csa=is_csa,
+        use_cuda_graph=use_cuda_graph,
+    )
+    request_rows, row_is_valid = (
+        (plan.full_request_rows, plan.full_row_is_valid)
+        if expected_full_rows
+        else (plan.compact_request_rows, None)
+    )
+
+    assert_close(plan.should_compress, expected_mask, atol=0.0, rtol=0.0)
+    assert_close(
+        plan.full_request_rows,
+        torch.arange(bsz, device=device, dtype=torch.long),
+        atol=0.0,
+        rtol=0.0,
+    )
+    assert_close(plan.full_row_is_valid, expected_mask, atol=0.0, rtol=0.0)
+    assert_close(
+        plan.compact_request_rows,
+        torch.nonzero(expected_mask, as_tuple=False).flatten(),
+        atol=0.0,
+        rtol=0.0,
+    )
+    assert_close(request_rows, expected_idx, atol=0.0, rtol=0.0)
+    if expected_full_rows:
+        assert row_is_valid is not None
+        assert_close(row_is_valid, expected_mask, atol=0.0, rtol=0.0)
+    else:
+        assert row_is_valid is None
+
+    assert (
+        decode_compressor.resolve_impl(
+            kv,
+            score,
+            kv_state,
+            score_state,
+            ape,
+            start_positions,
+            cache_slots,
+            ratio=ratio,
+            q_len=q_len,
+            head_dim=head_dim,
+            is_csa=is_csa,
+            use_cuda_graph=use_cuda_graph,
+        )
+        == "triton"
+    )
+
+    kv_state_actual = kv_state.clone()
+    score_state_actual = score_state.clone()
+    out, compressed_mask, compressed_idx, mask_required = decode_compressor(
+        kv,
+        score,
+        kv_state_actual,
+        score_state_actual,
+        ape,
+        start_positions,
+        cache_slots,
+        ratio=ratio,
+        q_len=q_len,
+        head_dim=head_dim,
+        is_csa=is_csa,
+        use_cuda_graph=use_cuda_graph,
+        plan=plan,
+        request_rows=request_rows,
+        row_is_valid=row_is_valid,
+    )
+
+    assert mask_required == expected_full_rows
+    assert_close(compressed_mask, expected_mask, atol=0.0, rtol=0.0)
+    assert_close(compressed_idx, expected_idx, atol=0.0, rtol=0.0)
+    assert_close(out, expected_out, atol=2e-4, rtol=2e-4)
+    assert_close(kv_state_actual, expected_kv_state, atol=0.0, rtol=0.0)
+    assert_close(score_state_actual, expected_score_state, atol=0.0, rtol=0.0)
+
+    if q_len == 1:
+        kv_state_torch = kv_state.clone()
+        score_state_torch = score_state.clone()
+        torch_out, torch_mask, torch_idx, torch_mask_required = decode_compressor(
+            kv,
+            score,
+            kv_state_torch,
+            score_state_torch,
+            ape,
+            start_positions,
+            cache_slots,
+            ratio=ratio,
+            q_len=q_len,
+            head_dim=head_dim,
+            is_csa=is_csa,
+            use_cuda_graph=use_cuda_graph,
+            plan=plan,
+            request_rows=request_rows,
+            row_is_valid=row_is_valid,
+            impl="torch",
+        )
+        assert torch_mask_required == expected_full_rows
+        assert_close(torch_mask, expected_mask, atol=0.0, rtol=0.0)
+        assert_close(torch_idx, expected_idx, atol=0.0, rtol=0.0)
+        assert_close(torch_out, expected_out, atol=2e-4, rtol=2e-4)
+        assert_close(kv_state_torch, expected_kv_state, atol=0.0, rtol=0.0)
+        assert_close(score_state_torch, expected_score_state, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("use_hadamard", [False, True])
+def test_deepseek_v4_decode_postprocess_dispatch_dense_kv_cache(use_hadamard):
+    if not torch.cuda.is_available() or not has_triton:
+        pytest.skip("DeepSeek-V4 postprocess dispatch test requires CUDA Triton")
+
+    from chitu.ops.deepseek_compressor import try_fused_decode_postprocess_write_cache
+
+    torch.manual_seed(20260717 + int(use_hadamard))
+    device = torch.device("cuda")
+    bsz = 4
+    dim = 128
+    ratio = 128
+    q_len = 1
+    norm_eps = 1e-6
+    start_positions = torch.tensor([0, 127, 128, 255], device=device, dtype=torch.long)
+    cache_slots = torch.tensor([3, 1, 2, 0], device=device, dtype=torch.long)
+    cache_seq_ids = torch.arange(bsz, device=device, dtype=torch.long)
+    kv_compress = torch.randn(bsz, dim, device=device, dtype=torch.float32)
+    norm_weight = torch.randn(dim, device=device, dtype=torch.float32)
+    freqs_cis = torch.ones(300, 32, device=device, dtype=torch.complex64)
+    kv_cache = torch.full((bsz, 4, dim), -9.0, device=device, dtype=torch.bfloat16)
+
+    expected_impl = "kv_cache_hadamard" if use_hadamard else "kv_cache"
+    assert (
+        try_fused_decode_postprocess_write_cache.resolve_impl(
+            kv_compress,
+            norm_weight,
+            freqs_cis,
+            kv_cache,
+            None,
+            start_positions,
+            cache_slots,
+            cache_seq_ids,
+            ratio=ratio,
+            norm_eps=norm_eps,
+            q_len=q_len,
+            rope_dim=64,
+            use_cuda_graph=True,
+            use_hadamard=use_hadamard,
+            kv_cache_is_paged=False,
+        )
+        == expected_impl
+    )
+
+    assert try_fused_decode_postprocess_write_cache(
+        kv_compress,
+        norm_weight,
+        freqs_cis,
+        kv_cache,
+        None,
+        start_positions,
+        cache_slots,
+        cache_seq_ids,
+        ratio=ratio,
+        norm_eps=norm_eps,
+        q_len=q_len,
+        rope_dim=64,
+        use_cuda_graph=True,
+        use_hadamard=use_hadamard,
+        kv_cache_is_paged=False,
+    )
+
+    expected_values = _postprocess_write_kv_cache_ref(
+        kv_compress,
+        norm_weight,
+        start_positions,
+        cache_slots,
+        ratio=ratio,
+        q_len=q_len,
+        norm_eps=norm_eps,
+        use_hadamard=use_hadamard,
+    )
+    for slot in range(kv_cache.shape[0]):
+        for pos in range(kv_cache.shape[1]):
+            key = (slot, pos)
+            if key in expected_values:
+                assert_close(
+                    kv_cache[slot, pos].float(),
+                    expected_values[key],
+                    atol=6e-2 if use_hadamard else 2e-2,
+                    rtol=6e-2 if use_hadamard else 2e-2,
+                )
+            else:
+                assert_close(
+                    kv_cache[slot, pos].float(),
+                    torch.full((dim,), -9.0, device=device, dtype=torch.float32),
+                    atol=0.0,
+                    rtol=0.0,
+                )
+
+
+def test_deepseek_v4_decode_postprocess_dispatch_resolves_flashmla_packed_cache():
+    if not torch.cuda.is_available() or not has_triton:
+        pytest.skip("DeepSeek-V4 postprocess dispatch test requires CUDA Triton")
+
+    from chitu.ops.deepseek_compressor import try_fused_decode_postprocess_write_cache
+
+    device = torch.device("cuda")
+    kv_compress = torch.empty(1, 512, device=device, dtype=torch.float32)
+    norm_weight = torch.empty(512, device=device, dtype=torch.float32)
+    freqs_cis = torch.empty(1, 32, device=device, dtype=torch.complex64)
+    kv_cache = torch.empty(1, 1, 584, device=device, dtype=torch.uint8)
+    block_table = torch.zeros(1, 1, device=device, dtype=torch.int32)
+    start_positions = torch.zeros(1, device=device, dtype=torch.long)
+    cache_slots = torch.zeros(1, device=device, dtype=torch.long)
+    cache_seq_ids = torch.zeros(1, device=device, dtype=torch.long)
+
+    assert (
+        try_fused_decode_postprocess_write_cache.resolve_impl(
+            kv_compress,
+            norm_weight,
+            freqs_cis,
+            kv_cache,
+            block_table,
+            start_positions,
+            cache_slots,
+            cache_seq_ids,
+            ratio=128,
+            norm_eps=1e-6,
+            q_len=1,
+            use_cuda_graph=True,
+            use_hadamard=False,
+            kv_cache_is_paged=True,
+        )
+        == "flashmla"
+    )
+
+
 @pytest.mark.parametrize("q_len", [1, 7])
 @pytest.mark.parametrize("has_compressed", [False, True])
 @pytest.mark.parametrize("local_n_heads,head_dim", [(16, 512)])
@@ -1840,7 +2316,7 @@ def test_csa_hca_prefill_paged_kv_dispatch(
     _skip_unsupported_csa_hca_impl(impl)
 
     torch.set_default_dtype(torch.bfloat16)
-    bs = 1
+    bs = 2
     history_len = min(start_pos, window_size)
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
@@ -1873,14 +2349,15 @@ def test_csa_hca_prefill_paged_kv_dispatch(
 
     from chitu.models.model_deepseek_v4 import get_chunked_prefill_topk_idxs_v4
 
-    seqlens = torch.tensor([q_len], device="cuda", dtype=torch.long)
-    start_positions = torch.tensor([start_pos], device="cuda", dtype=torch.long)
-    cache_slots = torch.tensor([0], device="cuda", dtype=torch.long)
-    cache_seq_ids = torch.tensor([0], device="cuda", dtype=torch.long)
+    seqlens = torch.full((bs,), q_len, device="cuda", dtype=torch.long)
+    start_positions = torch.full((bs,), start_pos, device="cuda", dtype=torch.long)
+    cache_slots = torch.tensor([1, 0], device="cuda", dtype=torch.long)
+    cache_seq_ids = torch.tensor([1, 0], device="cuda", dtype=torch.long)
 
-    q = torch.randn(q_len, local_n_heads, head_dim, device="cuda")
-    history_kv = torch.randn(history_len, head_dim, device="cuda")
-    current_kv = torch.randn(q_len, head_dim, device="cuda")
+    total_q = bs * q_len
+    q = torch.randn(total_q, local_n_heads, head_dim, device="cuda")
+    history_kv = torch.randn(bs, history_len, head_dim, device="cuda")
+    current_kv = torch.randn(total_q, head_dim, device="cuda")
     attn_sink = torch.randn(local_n_heads, device="cuda", dtype=torch.float32)
 
     if has_compressed:
@@ -1891,21 +2368,15 @@ def test_csa_hca_prefill_paged_kv_dispatch(
                 rounding_mode="floor",
             )[0].item()
         )
-        compressed_kv = torch.randn(
-            compressed_len,
-            head_dim,
-            device="cuda",
-        )
-        compressed_lens = torch.tensor(
-            [compressed_len],
-            device="cuda",
-            dtype=torch.long,
+        compressed_kv = torch.randn(bs, compressed_len, head_dim, device="cuda")
+        compressed_lens = torch.full(
+            (bs,), compressed_len, device="cuda", dtype=torch.long
         )
     else:
         compressed_kv = None
-        compressed_lens = torch.zeros(1, device="cuda", dtype=torch.long)
+        compressed_lens = torch.zeros(bs, device="cuda", dtype=torch.long)
 
-    local_topk, _ = get_chunked_prefill_topk_idxs_v4(
+    local_topk_one_req, _ = get_chunked_prefill_topk_idxs_v4(
         window_size,
         q_len,
         start_pos,
@@ -1913,11 +2384,28 @@ def test_csa_hca_prefill_paged_kv_dispatch(
         ratio=compress_ratio if has_compressed else 0,
         compress_offset=history_len + q_len,
     )
+    local_topk = local_topk_one_req.repeat(bs, 1)
 
-    expected_parts = [history_kv, current_kv]
-    if compressed_kv is not None:
-        expected_parts.append(compressed_kv)
+    expected_parts = []
+    for req in range(bs):
+        req_parts = [
+            history_kv[req],
+            current_kv[req * q_len : (req + 1) * q_len],
+        ]
+        if compressed_kv is not None:
+            req_parts.append(compressed_kv[req])
+        expected_parts.append(torch.cat(req_parts, dim=0))
     expected_kv = torch.cat(expected_parts, dim=0)
+    kv_lens = history_len + seqlens + compressed_lens
+    kv_offsets = torch.empty(bs + 1, device="cuda", dtype=torch.long)
+    kv_offsets[0] = 0
+    kv_offsets[1:] = torch.cumsum(kv_lens, dim=0)
+    current_req_ids = torch.repeat_interleave(torch.arange(bs, device="cuda"), seqlens)
+    global_topk = torch.where(
+        local_topk >= 0,
+        local_topk + kv_offsets[current_req_ids].unsqueeze(1),
+        local_topk,
+    )
 
     attn_backend = _make_csa_hca_attn_backend(impl, head_dim=head_dim)
     ref_backend = RefAttnBackend(qk_nope_head_dim=head_dim)
@@ -1925,15 +2413,23 @@ def test_csa_hca_prefill_paged_kv_dispatch(
         q,
         expected_kv.unsqueeze(1),
         attn_sink,
-        local_topk,
+        global_topk,
         softmax_scale,
         compress_ratio=compress_ratio if has_compressed else None,
     )
 
-    block_table = torch.tensor([[0]], device="cuda", dtype=torch.long)
+    block_table = torch.tensor([[1], [0]], device="cuda", dtype=torch.long)
+    history_positions = (
+        start_pos - history_len + torch.arange(history_len, device="cuda")
+    ) % window_size
 
     def run_prefill():
-        sliding_cache_for_backend = history_kv.unsqueeze(0).clone()
+        sliding_cache_for_backend = torch.empty(
+            bs, window_size, head_dim, device="cuda", dtype=history_kv.dtype
+        )
+        for req in range(bs):
+            block_id = int(block_table[cache_seq_ids[req], 0].item())
+            sliding_cache_for_backend[block_id, history_positions] = history_kv[req]
         sliding_accessor = PagedKVCacheAccessor(
             block_table,
             {"sliding_window": sliding_cache_for_backend},
@@ -1941,9 +2437,13 @@ def test_csa_hca_prefill_paged_kv_dispatch(
         if compressed_kv is None:
             compressed_accessor_for_backend = None
         else:
+            compressed_cache_for_backend = torch.empty_like(compressed_kv)
+            for req in range(bs):
+                block_id = int(block_table[cache_seq_ids[req], 0].item())
+                compressed_cache_for_backend[block_id] = compressed_kv[req]
             compressed_accessor_for_backend = PagedKVCacheAccessor(
                 block_table,
-                {"compressed": compressed_kv.unsqueeze(0).clone()},
+                {"compressed": compressed_cache_for_backend},
             )
         out = attn_backend.csa_hca(
             q,
@@ -1973,12 +2473,14 @@ def test_csa_hca_prefill_paged_kv_dispatch(
     rtol = 2e-2 if impl == "flash_mla" else 1e-5
     assert_close(out, ref_out, atol=atol, rtol=rtol)
     current_positions = (start_pos + torch.arange(q_len, device="cuda")) % window_size
-    assert_close(
-        sliding_cache_for_backend[0, current_positions],
-        current_kv,
-        atol=0.0,
-        rtol=0.0,
-    )
+    for req in range(bs):
+        block_id = int(block_table[cache_seq_ids[req], 0].item())
+        assert_close(
+            sliding_cache_for_backend[block_id, current_positions],
+            current_kv[req * q_len : (req + 1) * q_len],
+            atol=0.0,
+            rtol=0.0,
+        )
 
 
 @pytest.mark.parametrize("bs", [1, 4])
@@ -2060,8 +2562,11 @@ def test_csa_hca_decode_dense_kv(
     ).int()
 
     if has_compressed:
+        seq_len_delta = _make_decode_seq_len_delta_from_start_positions(start_positions)
         compressed_topk_idxs = get_decode_compress_topk_idxs_v4(
-            compress_ratio, start_positions
+            compress_ratio,
+            seq_len_delta,
+            seq_len_delta.new.max_len // compress_ratio,
         ).int()
         compressed_kv = torch.randn(
             bs, compressed_topk_idxs.size(-1), head_dim, device="cuda"
@@ -2210,8 +2715,11 @@ def test_csa_hca_decode_paged_kv(
         slidingwindow_paged_kv[page_id] = slidingwindow_kv[i]
 
     if has_compressed:
+        seq_len_delta = _make_decode_seq_len_delta_from_start_positions(start_positions)
         compressed_topk_idxs = get_decode_compress_topk_idxs_v4(
-            compress_ratio, start_positions
+            compress_ratio,
+            seq_len_delta,
+            seq_len_delta.new.max_len // compress_ratio,
         ).int()
         compressed_len = compressed_topk_idxs.size(-1)
         compressed_kv = torch.randn(bs, compressed_len, head_dim, device="cuda")
@@ -2419,8 +2927,13 @@ def test_csa_hca_decode_mtp_paged_kv(
     ).int()
 
     if has_compressed:
+        compressed_max_len = (
+            int(((start_positions.max() + q_len) // compress_ratio).item())
+            if start_positions.numel()
+            else 0
+        )
         compressed_topk_idxs = get_decode_mtp_compress_topk_idxs_v4(
-            compress_ratio, start_positions, q_len
+            compress_ratio, start_positions, q_len, max_len=compressed_max_len
         ).int()
         compressed_len = compressed_topk_idxs.size(-1)
         compressed_kv = torch.randn(bs, compressed_len, head_dim, device="cuda")

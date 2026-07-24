@@ -39,7 +39,7 @@ class ArgumentsGrammar(AbstractArgumentsGrammar):
         self.sep = separator
 
     def build(self, schema: dict) -> Format:
-        properties = schema["properties"]
+        properties = schema.get("properties", {})
         required_set = set(schema.get("required", []))
 
         tag_by_key: dict[str, TagFormat] = {}

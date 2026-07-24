@@ -115,6 +115,7 @@ def _append_paged_kvcache_dsv4_flashmla_kernel(
     block_table_ptr,
     positions_ptr,
     seq_ids_ptr,
+    valid_mask_ptr,
     D: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_TABLE_STRIDE: tl.constexpr,
@@ -125,12 +126,18 @@ def _append_paged_kvcache_dsv4_flashmla_kernel(
     QUANT_BLOCK: tl.constexpr,
     SCALE_DIM: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    HAS_VALID_MASK: tl.constexpr,
 ):
     token_id = tl.program_id(axis=0)
     position = tl.load(positions_ptr + token_id).to(tl.int64)
     seq_id = tl.load(seq_ids_ptr + token_id).to(tl.int64)
+    valid = True
+    if HAS_VALID_MASK:
+        valid = tl.load(valid_mask_ptr + token_id)
     block_idx = tl.load(
-        block_table_ptr + seq_id * BLOCK_TABLE_STRIDE + position // PAGE_SIZE
+        block_table_ptr + seq_id * BLOCK_TABLE_STRIDE + position // PAGE_SIZE,
+        mask=valid,
+        other=0,
     ).to(tl.int64)
     pos_in_block = position % PAGE_SIZE
 
@@ -160,14 +167,14 @@ def _append_paged_kvcache_dsv4_flashmla_kernel(
     x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
     x_uint8_flat = tl.reshape(x_uint8, (D,))
 
-    tl.store(token_data_base + offs_d, x_uint8_flat, mask=offs_d < NOPE_DIM)
+    tl.store(token_data_base + offs_d, x_uint8_flat, mask=valid & (offs_d < NOPE_DIM))
 
     bf16_ptr = (token_data_base + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
     rope_local = offs_d - NOPE_DIM
     tl.store(
         bf16_ptr + tl.maximum(rope_local, 0),
         kv.to(tl.bfloat16),
-        mask=(offs_d >= NOPE_DIM) & (offs_d < NOPE_DIM + ROPE_DIM),
+        mask=valid & (offs_d >= NOPE_DIM) & (offs_d < NOPE_DIM + ROPE_DIM),
     )
 
     scale_idx = tl.arange(0, SCALE_DIM)
@@ -176,9 +183,9 @@ def _append_paged_kvcache_dsv4_flashmla_kernel(
     tl.store(
         scale_base + scale_idx,
         encoded.to(tl.uint8),
-        mask=scale_idx < n_nope_blocks,
+        mask=valid & (scale_idx < n_nope_blocks),
     )
-    tl.store(scale_base + n_nope_blocks, tl.zeros((), dtype=tl.uint8))
+    tl.store(scale_base + n_nope_blocks, tl.zeros((), dtype=tl.uint8), mask=valid)
 
 
 def _prepare_dsv4_flashmla_append_inputs(
@@ -228,6 +235,7 @@ def append_to_paged_kv_cache_flashmla_dsv4(
     seq_ids: torch.Tensor,
     *,
     window_size: int | None = None,
+    valid_mask: torch.Tensor | None = None,
 ) -> None:
     """Append bf16 DSV4 KV into FlashMLA's paged 584B physical layout."""
     if kv_cache.dtype != torch.uint8 or kv_cache.shape[-1] != 584:
@@ -247,16 +255,21 @@ def append_to_paged_kv_cache_flashmla_dsv4(
     values, positions, seq_ids = _prepare_dsv4_flashmla_append_inputs(
         values, positions, seq_ids
     )
+    if valid_mask is not None:
+        valid_mask = valid_mask.to(device=values.device, dtype=torch.bool).reshape(-1)
+        assert valid_mask.numel() == values.reshape(-1, values.shape[-1]).shape[0]
     if values.numel() == 0:
         return
 
     page_size = kv_cache.shape[1]
+    valid_mask_arg = valid_mask if valid_mask is not None else positions
     _append_paged_kvcache_dsv4_flashmla_kernel[(values.shape[0],)](
         values,
         kv_cache,
         block_table,
         positions,
         seq_ids,
+        valid_mask_arg,
         D=values.shape[-1],
         PAGE_SIZE=page_size,
         BLOCK_TABLE_STRIDE=block_table.stride(0),
@@ -267,6 +280,7 @@ def append_to_paged_kv_cache_flashmla_dsv4(
         QUANT_BLOCK=64,
         SCALE_DIM=8,
         FP8_MAX=448.0,
+        HAS_VALID_MASK=valid_mask is not None,
     )
 
 

@@ -64,6 +64,7 @@ def _append_deepseek_v4_flashmla_paged_cache(
     seq_ids: torch.Tensor,
     *,
     window_size: Optional[int] = None,
+    valid_mask: Optional[torch.Tensor] = None,
 ) -> bool:
     if not _is_deepseek_v4_flashmla_packed_cache(kv_cache):
         return False
@@ -79,6 +80,7 @@ def _append_deepseek_v4_flashmla_paged_cache(
         positions,
         seq_ids,
         window_size=window_size,
+        valid_mask=valid_mask,
     )
     return True
 

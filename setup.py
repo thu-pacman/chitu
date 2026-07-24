@@ -103,11 +103,11 @@ class SkipBuildPy(build_py):
 
 my_build_py = build_py
 if os.environ.get("CHITU_WITH_CYTHON", "0") != "0":
-    nthreads = os.environ.get("CHITU_SETUP_JOBS", 0)
-    if nthreads:
-        nthreads = int(nthreads)
+    nthreads_env = os.environ.get("CHITU_SETUP_JOBS", "")
+    if nthreads_env != "":
+        nthreads = int(nthreads_env)
     else:
-        nthreads = 0
+        nthreads = os.cpu_count() or 1
     ext_modules += cythonize(create_cython_extensions("chitu"), nthreads=nthreads)
     my_build_py = SkipBuildPy
 

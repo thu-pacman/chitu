@@ -51,6 +51,7 @@ def load_data_jsonl(file_path):
 def prepare_plot_data(start_ts, response_ts):
     start_x, start_y = [], []
     token_x, token_y = [], []
+    first_x, first_y = [], []
     t0 = 0
 
     for req_id, (s_time, token_times) in enumerate(zip(start_ts, response_ts)):
@@ -60,11 +61,14 @@ def prepare_plot_data(start_ts, response_ts):
         start_y.append(req_id)
 
         if isinstance(token_times, list) and len(token_times) > 0:
-            for t_time in token_times:
+            # 第一个响应时间单独收集，用不同颜色表示
+            first_x.append(token_times[0] - t0)
+            first_y.append(req_id)
+            for t_time in token_times[1:]:
                 token_x.append(t_time - t0)
                 token_y.append(req_id)
 
-    return start_x, start_y, token_x, token_y
+    return start_x, start_y, token_x, token_y, first_x, first_y
 
 
 def plot_timestamps(
@@ -72,6 +76,8 @@ def plot_timestamps(
     start_y,
     token_x,
     token_y,
+    first_x,
+    first_y,
     model_name,
     batch_size,
     total_input_tokens,
@@ -82,6 +88,10 @@ def plot_timestamps(
 
     ax.scatter(
         token_x, token_y, c="#1f77b4", s=2, alpha=0.6, label="Token response time"
+    )
+
+    ax.scatter(
+        first_x, first_y, c="#1fb426", s=2, alpha=0.6, label="First token response time"
     )
 
     ax.scatter(
@@ -166,7 +176,7 @@ if __name__ == "__main__":
 
         save_path = os.path.join(output_dir, f"{model_name}_{batch_size}.jpg")
 
-        start_x, start_y, token_x, token_y = prepare_plot_data(
+        start_x, start_y, token_x, token_y, first_x, first_y = prepare_plot_data(
             start_timestamps, response_timestamps
         )
 
@@ -175,6 +185,8 @@ if __name__ == "__main__":
             start_y,
             token_x,
             token_y,
+            first_x,
+            first_y,
             model_name=model_name,
             batch_size=batch_size,
             total_input_tokens=total_input_tokens,

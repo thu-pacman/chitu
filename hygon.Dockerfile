@@ -58,7 +58,7 @@ RUN if [ "${enable_test}" = "true" ]; then \
     apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping && \
     pip install pytest matplotlib; \
 fi
-RUN apt update -y && apt install -y infiniband-diags curl
+RUN apt update -y && apt install -y curl
 RUN --mount=source=./third_party/hygon_wheels,destination=./third_party/hygon_wheels if [ "${build_for_shca}" = "true" ]; then \
     apt-get update -y; \
     apt remove -y rdmacm-utils ibacm perftest ibverbs-utils ucx libibverbs-dev libibmad-dev libibumad-dev librdmacm1 infiniband-diags opensm rdma-core libibmad5 libibumad3 ibverbs-providers libibverbs1 || true; \
@@ -67,6 +67,8 @@ RUN --mount=source=./third_party/hygon_wheels,destination=./third_party/hygon_wh
     cp -r ./third_party/hygon_wheels/topo_lib /opt/topo_lib && \
     ln -s /opt/topo_lib/lib/librccl-net-shca.so.0.0.0 /opt/topo_lib/lib/librccl-net-shca.so && \
     ln -s /opt/topo_lib/lib/librccl-net-shca.so.0.0.0 /opt/topo_lib/lib/librccl-net-shca.so.0; \
+else \
+    apt update -y && apt install -y infiniband-diags; \
 fi
 
 RUN curl -L --retry 3 --retry-delay 5 -o /tmp/dtk_llvm.run https://download.sourcefind.cn:65024/file/4/dtk_llvm/dtk_llvm.run && \

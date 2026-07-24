@@ -96,8 +96,10 @@ class NormalLinear(QuantizedLinearBase):
         else:
             self.bias = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return linear(x, self.weight, self.bias)
+    def forward(
+        self, x: torch.Tensor, out_dtype: Optional[torch.dtype] = None
+    ) -> torch.Tensor:
+        return linear(x, self.weight, self.bias, out_dtype=out_dtype)
 
 
 class NormalLinearNpuFractalNz(NativeLayoutMixin, NormalLinear):
@@ -106,9 +108,11 @@ class NormalLinearNpuFractalNz(NativeLayoutMixin, NormalLinear):
         self.apply_native_layout(self.weight, NpuFractalNzTensor)
 
     @override
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, out_dtype: Optional[torch.dtype] = None
+    ) -> torch.Tensor:
         assert torch_npu.get_npu_format(self.weight) == ACL_FORMAT_FRACTAL_NZ
-        return super().forward(x)
+        return super().forward(x, out_dtype=out_dtype)
 
 
 class NormalLinearNpuFractalZn(NativeLayoutMixin, NormalLinear):

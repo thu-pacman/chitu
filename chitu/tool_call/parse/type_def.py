@@ -10,7 +10,7 @@ class ToolsInfo:
         self.arg_types: dict[str, dict[str, Any]] = {}
         for tool in tools:
             name = tool["function"]["name"]
-            params: dict = tool["function"]["parameters"]["properties"]
+            params: dict = tool["function"]["parameters"].get("properties", {})
             self.arg_types[name] = {
                 key: value.get("type", None) for key, value in params.items()
             }

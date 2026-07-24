@@ -1,4 +1,4 @@
-setuptools>=77.0.3
+setuptools>=77.0.3,<81  # <81 is for `from pkg_resources import packaging` compatibility, including in submodules
 wheel
 cmake
 ninja
