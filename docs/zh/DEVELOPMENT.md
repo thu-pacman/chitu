@@ -966,13 +966,18 @@ torchrun --nnodes 1 \
 ```bash
 python benchmarks/benchmark_serving.py \
     --model "deepseek-r1" \
-    --batch-size 1 \
-    --iterations 10 \
+    --max-concurrency 1 \
+    --num-requests 10 \
     --input-len 128 \
     --output-len 1024 \
-    --warmup 3 \
+    --warmup-requests 3 \
+    --request-rate inf \
     --base-url http://localhost:21002
 ```
+
+`--request-rate` 控制请求到达速率，`--max-concurrency` 限制同时在途的请求数。要压测固定并发的满载吞吐，请设置 `--request-rate inf` 并指定有限的 `--max-concurrency`；请求完成后会立即由下一个请求补位，直到处理完该轮的 `--num-requests`。
+
+`--iterations` 会重复完整的“warmup -> benchmark -> result”流程，每轮独立输出一份结果。例如，复现三轮、每轮同时发起 8 个请求且等待该轮完成的场景：`--max-concurrency 8 --num-requests 8 --iterations 3 --request-rate inf`。
 
 此性能测试假设了如下场景。在不同推理引擎或不同平台间进行性能对比时，应保证这些假设一致：
 
@@ -980,7 +985,7 @@ python benchmarks/benchmark_serving.py \
 - 会使用默认的采样参数进行推理。默认的采样参数可在 `chitu/task.py` 中的 `class UserRequest` 中查看。
 - 不在请求间进行缓存。
 
-注意当 `--batch-size` 较大时，性能测试工具会占用大量文件描述符，可能超过 `ulimit` 限制。**建议在运行性能测试前提升限制，如 `ulimit -n 65536`。**
+注意当 `--max-concurrency` 较大时，性能测试工具会占用大量文件描述符，可能超过 `ulimit` 限制。**建议在运行性能测试前提升限制，如 `ulimit -n 65536`。**
 
 ## 单元测试
 

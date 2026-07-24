@@ -19,6 +19,7 @@
 # Part 1. 你需要仔细检查和修改的变量和函数
 SERVER_LOG_FILE="chitu_run.log"
 MODEL_NAME="Qwen3-32B"
+METRIC_PERCENTILES="${METRIC_PERCENTILES:-90,95,99}"
 
 run_server(){
     SERVE_JOB_NAME="run_serve" # rename "run_serve" (with a unique name) to prevent conflicts
@@ -65,15 +66,18 @@ run_server(){
 run_benchmark(){
     local host_name=$1
     local temp_file=$(mktemp)
-    for bsz in 1 2 4 8 16 32 64 128 256
+    for concurrency in 1 2 4 8 16 32 64 128 256
     do
         python benchmarks/benchmark_serving.py \
-            --batch-size $bsz \
+            --max-concurrency "$concurrency" \
+            --num-requests "$concurrency" \
+            --warmup-requests "$concurrency" \
             --model $MODEL_NAME \
             --iterations 1 \
+            --metric-percentiles "$METRIC_PERCENTILES" \
+            --request-rate inf \
             --input-len 128 \
             --output-len 1024 \
-            --warmup 1 \
             --base-url http://${host_name}:21002 \
             2>&1 | stdbuf -o0 tee "$temp_file"  # Do not delete
 
@@ -207,4 +211,3 @@ info "serve_host: $serve_host"
 
 # run benchmark script
 run_benchmark $serve_host
-
