@@ -504,6 +504,7 @@ class DSAIndexer:
         ke: Optional[torch.Tensor] = None,
         k_append: Optional[torch.Tensor] = None,
         ks: Optional[torch.Tensor] = None,
+        skip_prefill_score: bool = False,
     ):
         # save to paged kv cache
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
@@ -529,6 +530,9 @@ class DSAIndexer:
                 cache_accessor.block_table,
             )
 
+        elif skip_prefill_score:
+            # The cache append above is still required by later decode steps.
+            index_score = None
         else:  # prefill
             k, k_s = read_from_paged_indexer_kv_cache_deepgemm(
                 cache_accessor.kv["indexer_k_ks"],
@@ -561,6 +565,7 @@ class DSAIndexer:
         seq_len_delta,
         cache_accessor: KVCacheAccessor,
         is_causal: bool = True,
+        skip_prefill_score: bool = False,
     ):
         delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
         delta_pos_ids = seq_len_delta.delta_position_ids_tensor_device
@@ -588,6 +593,8 @@ class DSAIndexer:
                 get_page_ids=cache_accessor.get_page_ids,
                 get_offs_in_page=cache_accessor.get_offs_in_page,
             )
+            if skip_prefill_score:
+                return None
             index_score = blockfp8_index_score_ragged_q_paged_k_dsv32(
                 q_fp8,
                 weights,
@@ -607,6 +614,8 @@ class DSAIndexer:
             append_to_dense_kv_cache(
                 cache_accessor.kv["indexer_ks"], k_scale, delta_pos_ids, delta_seq_ids
             )
+            if skip_prefill_score:
+                return None
             index_score = blockfp8_index_score_ragged_q_dense_k_dsv32(
                 q_fp8,
                 weights,
@@ -632,6 +641,7 @@ class DSAIndexer:
         is_causal=True,
         ke: Optional[torch.Tensor] = None,
         k_append: Optional[torch.Tensor] = None,
+        skip_prefill_score: bool = False,
     ):
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
         # CP: k is allgathered global K (n_local*pcp_size tokens), k_append is local K (n_local tokens).
@@ -659,6 +669,11 @@ class DSAIndexer:
                 seq_len_delta,
                 cache_accessor.block_table,
             )
+        elif skip_prefill_score:
+            # When every key is selected, preserve the cache append above but
+            # avoid reading the cache back and computing scores that TopK will
+            # discard. The caller returns request-local indices directly.
+            index_score = None
         else:
             k = read_from_paged_kv_cache(
                 cache_accessor.kv["indexer_k"],
@@ -686,6 +701,7 @@ class DSAIndexer:
         seq_len_delta: BatchedSeqLenDelta,
         cache_accessor: KVCacheAccessor,
         is_causal=True,
+        skip_prefill_score: bool = False,
     ):
         """Pure-torch bf16 equivalent of bf16_index_score_dsa: bf16 KV cache, pure-torch mqa."""
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
@@ -708,6 +724,10 @@ class DSAIndexer:
                 seq_len_delta,
                 cache_accessor.block_table,
             )
+
+        if skip_prefill_score:
+            # The cache append above is still required by later decode steps.
+            return None
 
         k_full = read_from_paged_kv_cache(
             cache_accessor.kv["indexer_k"],
@@ -737,6 +757,11 @@ class DSAIndexer:
     ):
         if q_fp8.numel() == 0:
             return torch.randn(0, self.static_max_n)
+        select_all_prefill_keys = (
+            return_indices
+            and not seq_len_delta.is_decode_stage
+            and seq_len_delta.new.max_len <= index_topk
+        )
         ### get index_score
         if self.impl == "deepgemm":  # deepgemm uses a distinct kv layout
             logits = self.blockfp8_index_score_dsa_deepgemm(
@@ -750,6 +775,7 @@ class DSAIndexer:
                 ke=ke,
                 k_append=k_append,
                 ks=ks,
+                skip_prefill_score=select_all_prefill_keys,
             )
         elif self.impl == "hygon":
             logits = self.bf16_index_score_dsa_hygon(
@@ -761,6 +787,7 @@ class DSAIndexer:
                 is_causal,
                 ke=ke,
                 k_append=k_append,
+                skip_prefill_score=select_all_prefill_keys,
             )
         elif self.impl == "torch_bf16":
             logits = self.bf16_index_score_dsa_torch_bf16(
@@ -770,6 +797,7 @@ class DSAIndexer:
                 seq_len_delta,
                 cache_accessor,
                 is_causal,
+                skip_prefill_score=select_all_prefill_keys,
             )
         else:  # triton and torch impl share a same kv layout
             logits = self.blockfp8_index_score_dsa_triton(
@@ -780,7 +808,18 @@ class DSAIndexer:
                 seq_len_delta,
                 cache_accessor,
                 is_causal,
+                skip_prefill_score=select_all_prefill_keys,
             )
+
+        if select_all_prefill_keys:
+            # Keep the configured TopK width for attention backends whose sparse
+            # metadata is built for a fixed number of indices. Entries beyond a
+            # request's valid length are removed by the existing downstream mask.
+            return torch.arange(
+                index_topk,
+                dtype=torch.int32,
+                device=q_fp8.device,
+            ).repeat(q_fp8.shape[0], 1)
 
         if not return_indices:  # for unit test
             return logits
