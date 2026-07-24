@@ -6,7 +6,7 @@
 
 Three kernels shared by both modes:
   1. gather_pending_and_new   - concat pending_state + new tokens into flat buffer
-  2. compress_hca / compress_csa - softmax weighted sum (HCA: ratio tokens; CSA: 2*ratio with overlap inlined)
+  2. compress_hca / compress_csa - softmax weighted sum (HCA: ratio tokens; CSA: previous group + current group)
   3. writeback_pending        - write the live logical suffix back to the pending-state ring
 
 The prefill attention path also uses pack_prefill_kv to materialize each request's
@@ -17,7 +17,6 @@ import torch
 import triton
 import triton.language as tl
 
-from chitu.ops.deepseek_compressor import build_compress_metadata
 from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
 
 # FIXME: The ragged metadata tensors and most pointer-offset arithmetic in this
@@ -25,6 +24,93 @@ from chitu.ops.triton_ops.utils import auto_retry_triton_compilation
 # int64 offsets for large tensors; do the same here before relying on these
 # kernels when the flat buffers or KV state/cache can exceed the int32-safe
 # address range, e.g. multi-GB KV-cache tensors.
+
+
+@triton.jit
+def _masked_write_kv_cache_kernel(
+    values_ptr,
+    kv_cache_ptr,
+    block_table_ptr,
+    cache_slots_ptr,
+    positions_ptr,
+    cache_seq_ids_ptr,
+    valid_mask_ptr,
+    kv_stride0: tl.constexpr,
+    kv_stride1: tl.constexpr,
+    kv_stride2: tl.constexpr,
+    block_table_stride0: tl.constexpr,
+    page_size: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    PAGED: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < D
+    valid = tl.load(valid_mask_ptr + token_id)
+
+    position = tl.load(positions_ptr + token_id).to(tl.int64)
+    if PAGED:
+        seq_id = tl.load(cache_seq_ids_ptr + token_id).to(tl.int64)
+        page_id = tl.load(
+            block_table_ptr + seq_id * block_table_stride0 + position // page_size,
+            mask=valid,
+            other=0,
+        ).to(tl.int64)
+        row0 = page_id
+        row1 = position % page_size
+    else:
+        row0 = tl.load(cache_slots_ptr + token_id).to(tl.int64)
+        row1 = position
+
+    vals = tl.load(values_ptr + token_id * D + d_offs, mask=d_mask, other=0.0)
+    tl.store(
+        kv_cache_ptr + row0 * kv_stride0 + row1 * kv_stride1 + d_offs * kv_stride2,
+        vals,
+        mask=valid & d_mask,
+    )
+
+
+@auto_retry_triton_compilation
+def masked_write_kv_cache(
+    values: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor | None,
+    cache_slots: torch.Tensor,
+    positions: torch.Tensor,
+    cache_seq_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+):
+    values = values.contiguous()
+    cache_slots = cache_slots.contiguous()
+    positions = positions.contiguous()
+    cache_seq_ids = cache_seq_ids.contiguous()
+    valid_mask = valid_mask.to(device=values.device, dtype=torch.bool).contiguous()
+    n = values.shape[0]
+    if n == 0:
+        return
+    D = values.shape[-1]
+    BLOCK_D = triton.next_power_of_2(D)
+    paged = block_table is not None
+    dummy_block_table = block_table if paged else kv_cache
+    _masked_write_kv_cache_kernel[(n,)](
+        values,
+        kv_cache,
+        dummy_block_table,
+        cache_slots,
+        positions,
+        cache_seq_ids,
+        valid_mask,
+        kv_stride0=kv_cache.stride(0),
+        kv_stride1=kv_cache.stride(1),
+        kv_stride2=kv_cache.stride(2),
+        block_table_stride0=block_table.stride(0) if paged else 0,
+        page_size=kv_cache.shape[1] if paged else 1,
+        D=D,
+        BLOCK_D=BLOCK_D,
+        PAGED=paged,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Kernel 1: gather pending state + new kv/score into a flat contiguous buffer
@@ -54,7 +140,7 @@ def _gather_kernel(
     # dims
     D: tl.constexpr,
     RATIO: tl.constexpr,
-    PENDING_OFFSET: tl.constexpr,  # = ratio if overlap (CSA) else 0 (HCA)
+    PENDING_OFFSET: tl.constexpr,  # = ratio for CSA, 0 for HCA
     STATE_ROWS: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -152,7 +238,7 @@ def gather_pending_and_new(
     start_positions: torch.Tensor,  # [n] int64 on GPU
     cache_slots: torch.Tensor,  # [n]   int32 on GPU
     ratio: int,
-    pending_offset: int = 0,  # = ratio for CSA (overlap), 0 for HCA
+    pending_offset: int = 0,  # = ratio for CSA, 0 for HCA
     max_eff: int | None = None,
 ):
     n = pending_lens.shape[0]
@@ -291,7 +377,7 @@ def compress_hca(
 #   second head: flat_kv[t, head_dim:]
 #
 # For group g, the effective input is [2*ratio, head_dim]:
-#   rows  0..ratio-1  : group (g-1)'s tokens' first head   (overlap prev)
+#   rows  0..ratio-1  : group (g-1)'s tokens' first head   (CSA prev group)
 #   rows ratio..2*ratio-1 : group g's tokens' second head   (current)
 #
 # Group 0's prev comes from kv_state[slot, :ratio, :head_dim] when pending_len > 0,
@@ -487,7 +573,7 @@ def _writeback_pending_kernel(
     pending_lens_ptr,  # [n] int32
     start_positions_ptr,  # [n] int64
     cache_slots_ptr,  # [n]   int32
-    pending_offset,  # int: = ratio if overlap else 0
+    pending_offset,  # int: = ratio for CSA, 0 for HCA
     state_s0: tl.constexpr,
     state_s1: tl.constexpr,
     D: tl.constexpr,
@@ -601,6 +687,11 @@ def writeback_pending(
 
 
 @triton.jit
+def _decode_should_compress(sp, RATIO: tl.constexpr, Q_LEN: tl.constexpr):
+    return sp % RATIO + Q_LEN >= RATIO
+
+
+@triton.jit
 def _decode_mtp_hca_compress_kernel(
     kv_cat_ptr,  # [bsz * Q_LEN, D] raw wkv output
     score_cat_ptr,  # [bsz * Q_LEN, D] raw gate output
@@ -624,10 +715,17 @@ def _decode_mtp_hca_compress_kernel(
     sp = tl.load(start_positions_ptr + req)
     slot = tl.load(cache_slots_ptr + req)
     pending = sp % RATIO
-    group_start = sp - pending
-
+    has_group = _decode_should_compress(sp, RATIO, Q_LEN)
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
+    if not has_group:
+        tl.store(
+            out_kv_ptr + out_req * D + d_offs,
+            tl.zeros((BLOCK_D,), tl.float32),
+            mask=d_mask,
+        )
+        return
+    group_start = sp - pending
 
     r_offs = tl.arange(0, RATIO)
     is_pending = r_offs < pending
@@ -652,7 +750,7 @@ def _decode_mtp_hca_compress_kernel(
     )
 
     new_rows = req * Q_LEN + new_idx
-    new_mask = (~is_pending)[:, None] & d_mask[None, :]
+    new_mask = (~is_pending)[:, None] & (new_idx[:, None] < Q_LEN) & d_mask[None, :]
     new_kv = tl.load(
         kv_cat_ptr + new_rows[:, None] * D + d_offs[None, :],
         mask=new_mask,
@@ -765,7 +863,7 @@ def _decode_mtp_csa_kernel(
     sp = tl.load(start_positions_ptr + req)
     slot = tl.load(cache_slots_ptr + req)
     pending = sp % RATIO
-    has_group = pending + Q_LEN >= RATIO
+    has_group = _decode_should_compress(sp, RATIO, Q_LEN)
     group_start = sp - pending
     hd_offs = tl.arange(0, BLOCK_HD)
     hd_mask = hd_offs < HEAD_DIM
@@ -774,6 +872,54 @@ def _decode_mtp_csa_kernel(
     new_idx = r_offs - pending
     cur_pos = group_start + r_offs
     cur_rows = cur_pos % STATE_ROWS
+
+    # Save every draft token to the logical ring. If a suffix is rejected, the
+    # scheduler rolls back the logical length; these physical rows are then
+    # ignored until the same positions are produced again and overwritten.
+    t_offs = tl.arange(0, BLOCK_Q)
+    d_offs = tl.arange(0, BLOCK_FULL_D)
+    t_mask = t_offs < Q_LEN
+    d_mask = d_offs < FULL_D
+    positions = sp + t_offs
+    dst_rows = positions % STATE_ROWS
+    ape_rows = positions % RATIO
+    src_rows = req * Q_LEN + t_offs
+    new_kv = tl.load(
+        kv_cat_ptr + src_rows[:, None] * FULL_D + d_offs[None, :],
+        mask=t_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    new_score = tl.load(
+        score_cat_ptr + src_rows[:, None] * FULL_D + d_offs[None, :],
+        mask=t_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    new_ape = tl.load(
+        ape_ptr + ape_rows[:, None] * FULL_D + d_offs[None, :],
+        mask=t_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+    tl.store(
+        kv_state_ptr + slot * state_s0 + dst_rows[:, None] * state_s1 + d_offs[None, :],
+        new_kv,
+        mask=t_mask[:, None] & d_mask[None, :],
+    )
+    tl.store(
+        score_state_ptr
+        + slot * state_s0
+        + dst_rows[:, None] * state_s1
+        + d_offs[None, :],
+        new_score + new_ape,
+        mask=t_mask[:, None] & d_mask[None, :],
+    )
+
+    if not has_group:
+        tl.store(
+            out_kv_ptr + req * HEAD_DIM + hd_offs,
+            tl.zeros((BLOCK_HD,), tl.float32),
+            mask=hd_mask,
+        )
+        return
 
     # Current group's second head. Pending rows are read by logical position;
     # draft rows that later get rejected are ignored after cached length rolls back.
@@ -849,47 +995,7 @@ def _decode_mtp_csa_kernel(
     tl.store(
         out_kv_ptr + req * HEAD_DIM + hd_offs,
         compressed,
-        mask=hd_mask & has_group,
-    )
-
-    # Save every draft token to the logical ring. If a suffix is rejected, the
-    # scheduler rolls back the logical length; these physical rows are then
-    # ignored until the same positions are produced again and overwritten.
-    t_offs = tl.arange(0, BLOCK_Q)
-    d_offs = tl.arange(0, BLOCK_FULL_D)
-    t_mask = t_offs < Q_LEN
-    d_mask = d_offs < FULL_D
-    positions = sp + t_offs
-    dst_rows = positions % STATE_ROWS
-    ape_rows = positions % RATIO
-    src_rows = req * Q_LEN + t_offs
-    new_kv = tl.load(
-        kv_cat_ptr + src_rows[:, None] * FULL_D + d_offs[None, :],
-        mask=t_mask[:, None] & d_mask[None, :],
-        other=0.0,
-    )
-    new_score = tl.load(
-        score_cat_ptr + src_rows[:, None] * FULL_D + d_offs[None, :],
-        mask=t_mask[:, None] & d_mask[None, :],
-        other=0.0,
-    )
-    new_ape = tl.load(
-        ape_ptr + ape_rows[:, None] * FULL_D + d_offs[None, :],
-        mask=t_mask[:, None] & d_mask[None, :],
-        other=0.0,
-    )
-    tl.store(
-        kv_state_ptr + slot * state_s0 + dst_rows[:, None] * state_s1 + d_offs[None, :],
-        new_kv,
-        mask=t_mask[:, None] & d_mask[None, :],
-    )
-    tl.store(
-        score_state_ptr
-        + slot * state_s0
-        + dst_rows[:, None] * state_s1
-        + d_offs[None, :],
-        new_score + new_ape,
-        mask=t_mask[:, None] & d_mask[None, :],
+        mask=hd_mask,
     )
 
 
@@ -995,6 +1101,529 @@ def decode_mtp_csa(
         BLOCK_Q=BLOCK_Q,
         BLOCK_HD=BLOCK_HD,
         BLOCK_FULL_D=BLOCK_FULL_D,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Classic single-token HCA decode fast path
+#
+# This is the hot DeepSeek-V4 HCA decode path when mtp_size == 1. It keeps the
+# batch shape fixed for CUDA graph capture, but follows the SGLang-style split:
+# every request writes pending state; only compression-boundary requests continue
+# into the expensive 128-row reduction.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _decode_hca_kernel(
+    kv_ptr,  # [bsz, 1, D]
+    score_ptr,  # [bsz, 1, D]
+    kv_state_ptr,  # [max_batch, RATIO, D]
+    score_state_ptr,
+    ape_ptr,  # [RATIO, D]
+    out_kv_ptr,  # [bsz, D]
+    start_positions_ptr,  # [bsz]
+    cache_slots_ptr,  # [bsz]
+    state_s0: tl.constexpr,
+    state_s1: tl.constexpr,
+    RATIO: tl.constexpr,
+    STATE_ROWS: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    req = tl.program_id(0)
+    d_blk = tl.program_id(1)
+    sp = tl.load(start_positions_ptr + req)
+    slot = tl.load(cache_slots_ptr + req)
+
+    d_offs = d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = d_offs < D
+    ape_row = sp % RATIO
+    dst_row = sp % STATE_ROWS
+
+    kv = tl.load(kv_ptr + req * D + d_offs, mask=d_mask, other=0.0)
+    score = tl.load(score_ptr + req * D + d_offs, mask=d_mask, other=0.0)
+    ape = tl.load(ape_ptr + ape_row * D + d_offs, mask=d_mask, other=0.0)
+    score_with_ape = score + ape
+
+    tl.store(
+        kv_state_ptr + slot * state_s0 + dst_row * state_s1 + d_offs,
+        kv,
+        mask=d_mask,
+    )
+    tl.store(
+        score_state_ptr + slot * state_s0 + dst_row * state_s1 + d_offs,
+        score_with_ape,
+        mask=d_mask,
+    )
+
+    if not _decode_should_compress(sp, RATIO, 1):
+        tl.store(
+            out_kv_ptr + req * D + d_offs,
+            tl.zeros((BLOCK_D,), tl.float32),
+            mask=d_mask,
+        )
+        return
+
+    group_start = sp - (RATIO - 1)
+    r_offs = tl.arange(0, RATIO)
+    rows = (group_start + r_offs) % STATE_ROWS
+
+    state_kv = tl.load(
+        kv_state_ptr + slot * state_s0 + rows[:, None] * state_s1 + d_offs[None, :],
+        mask=d_mask[None, :],
+        other=0.0,
+    )
+    state_score = tl.load(
+        score_state_ptr + slot * state_s0 + rows[:, None] * state_s1 + d_offs[None, :],
+        mask=d_mask[None, :],
+        other=0.0,
+    )
+
+    score_max = tl.max(state_score, axis=0)
+    score_exp = tl.exp(state_score - score_max[None, :])
+    score_sum = tl.sum(score_exp, axis=0)
+    compressed = tl.sum(state_kv * score_exp, axis=0) / score_sum
+
+    tl.store(out_kv_ptr + req * D + d_offs, compressed, mask=d_mask)
+
+
+@auto_retry_triton_compilation
+def decode_hca(
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    ape: torch.Tensor,
+    out_kv: torch.Tensor,
+    start_positions: torch.Tensor,
+    cache_slots: torch.Tensor,
+    ratio: int,
+):
+    bsz = start_positions.shape[0]
+    if bsz == 0:
+        return
+    D = out_kv.shape[1]
+    BLOCK_D = min(64, triton.next_power_of_2(D))
+    grid = (bsz, triton.cdiv(D, BLOCK_D))
+    _decode_hca_kernel[grid](
+        kv,
+        score,
+        kv_state,
+        score_state,
+        ape,
+        out_kv,
+        start_positions,
+        cache_slots,
+        state_s0=kv_state.stride(0),
+        state_s1=kv_state.stride(1),
+        RATIO=ratio,
+        STATE_ROWS=kv_state.shape[1],
+        D=D,
+        BLOCK_D=BLOCK_D,
+    )
+
+
+@triton.jit
+def _postprocess_write_kv_cache_kernel(
+    kv_ptr,  # [bsz, D] fp32 compressed KV
+    norm_weight_ptr,  # [D]
+    freqs_real_ptr,
+    freqs_imag_ptr,
+    kv_cache_ptr,  # dense [slots, len, D] or paged [blocks, page, D]
+    block_table_ptr,
+    start_positions_ptr,
+    cache_slots_ptr,
+    cache_seq_ids_ptr,
+    norm_eps: tl.constexpr,
+    freqs_stride0: tl.constexpr,
+    freqs_stride1: tl.constexpr,
+    kv_stride0: tl.constexpr,
+    kv_stride1: tl.constexpr,
+    kv_stride2: tl.constexpr,
+    block_table_stride0: tl.constexpr,
+    page_size: tl.constexpr,
+    RATIO: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    D: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    PAGED: tl.constexpr,
+    USE_HADAMARD: tl.constexpr,
+):
+    req = tl.program_id(0)
+    sp = tl.load(start_positions_ptr + req)
+    if not _decode_should_compress(sp, RATIO, Q_LEN):
+        return
+
+    offs_d = tl.arange(0, BLOCK_D)
+    d_mask = offs_d < D
+    kv = (
+        tl.load(kv_ptr + req * D + offs_d, mask=d_mask, other=0.0)
+        .to(tl.bfloat16)
+        .to(tl.float32)
+    )
+    rms = tl.sqrt(tl.sum(kv * kv, axis=0) / D + norm_eps)
+    inv_rms = 1.0 / rms
+    weight = tl.load(norm_weight_ptr + offs_d, mask=d_mask, other=0.0).to(tl.float32)
+    kv_norm = (kv * inv_rms * weight).to(tl.bfloat16).to(tl.float32)
+
+    rotary_begin: tl.constexpr = D - ROPE_DIM
+    rope_local = offs_d - rotary_begin
+    pair_idx = rope_local // 2
+    even_idx = rotary_begin + pair_idx * 2
+    odd_idx = even_idx + 1
+
+    rope_pos = sp - sp % RATIO
+    freqs_off = rope_pos * freqs_stride0 + pair_idx * freqs_stride1
+    cos = tl.load(freqs_real_ptr + freqs_off, mask=offs_d >= rotary_begin, other=1.0)
+    sin = tl.load(freqs_imag_ptr + freqs_off, mask=offs_d >= rotary_begin, other=0.0)
+
+    kv_even = tl.load(
+        kv_ptr + req * D + even_idx, mask=offs_d >= rotary_begin, other=0.0
+    )
+    kv_odd = tl.load(kv_ptr + req * D + odd_idx, mask=offs_d >= rotary_begin, other=0.0)
+    weight_even = tl.load(
+        norm_weight_ptr + even_idx, mask=offs_d >= rotary_begin, other=0.0
+    ).to(tl.float32)
+    weight_odd = tl.load(
+        norm_weight_ptr + odd_idx, mask=offs_d >= rotary_begin, other=0.0
+    ).to(tl.float32)
+    q0 = kv_even.to(tl.bfloat16).to(tl.float32) * inv_rms * weight_even
+    q1 = kv_odd.to(tl.bfloat16).to(tl.float32) * inv_rms * weight_odd
+    q0 = q0.to(tl.bfloat16).to(tl.float32)
+    q1 = q1.to(tl.bfloat16).to(tl.float32)
+    rope_even = q0 * cos - q1 * sin
+    rope_odd = q1 * cos + q0 * sin
+    rope_val = tl.where(rope_local % 2 == 0, rope_even, rope_odd)
+    values = tl.where(
+        offs_d >= rotary_begin,
+        rope_val.to(tl.bfloat16).to(tl.float32),
+        kv_norm,
+    )
+
+    if USE_HADAMARD:
+        values = _hadamard_128(values).to(tl.bfloat16)
+
+    position = sp // RATIO
+    if PAGED:
+        seq_id = tl.load(cache_seq_ids_ptr + req).to(tl.int64)
+        row0 = tl.load(
+            block_table_ptr + seq_id * block_table_stride0 + position // page_size
+        ).to(tl.int64)
+        row1 = position % page_size
+    else:
+        row0 = tl.load(cache_slots_ptr + req).to(tl.int64)
+        row1 = position
+
+    tl.store(
+        kv_cache_ptr + row0 * kv_stride0 + row1 * kv_stride1 + offs_d * kv_stride2,
+        values,
+        mask=d_mask,
+    )
+
+
+@triton.jit
+def _hadamard_128_stage(x, GROUPS: tl.constexpr, STRIDE: tl.constexpr):
+    half = tl.arange(0, 2)
+    select_a = tl.reshape(tl.where(half == 0, 1.0, 0.0), (1, 2, 1))
+    select_b = tl.reshape(tl.where(half == 1, 1.0, 0.0), (1, 2, 1))
+    half = tl.reshape(half, (1, 2, 1))
+    x = tl.reshape(x, (GROUPS, 2, STRIDE))
+    a = tl.sum(x * select_a, axis=1)
+    b = tl.sum(x * select_b, axis=1)
+    x = tl.where(
+        half == 0,
+        a[:, None, :] + b[:, None, :],
+        a[:, None, :] - b[:, None, :],
+    )
+    return tl.reshape(x, (128,))
+
+
+@triton.jit
+def _hadamard_128(x):
+    x = _hadamard_128_stage(x, 64, 1)
+    x = _hadamard_128_stage(x, 32, 2)
+    x = _hadamard_128_stage(x, 16, 4)
+    x = _hadamard_128_stage(x, 8, 8)
+    x = _hadamard_128_stage(x, 4, 16)
+    x = _hadamard_128_stage(x, 2, 32)
+    x = _hadamard_128_stage(x, 1, 64)
+    return x * (128.0**-0.5)
+
+
+@auto_retry_triton_compilation
+def postprocess_write_kv_cache_hadamard(
+    kv_compress: torch.Tensor,
+    norm_weight: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor | None,
+    start_positions: torch.Tensor,
+    cache_slots: torch.Tensor,
+    cache_seq_ids: torch.Tensor,
+    ratio: int,
+    norm_eps: float,
+    q_len: int = 1,
+    rope_dim: int = 64,
+):
+    assert kv_cache.shape[-1] == kv_compress.shape[-1]
+    assert kv_compress.shape[-1] == 128
+    bsz = start_positions.shape[0]
+    if bsz == 0:
+        return
+    paged = block_table is not None
+    freqs_real = freqs_cis.real
+    freqs_imag = freqs_cis.imag
+    D = kv_compress.shape[-1]
+    BLOCK_D = triton.next_power_of_2(D)
+    _postprocess_write_kv_cache_kernel[(bsz,)](
+        kv_compress,
+        norm_weight,
+        freqs_real,
+        freqs_imag,
+        kv_cache,
+        block_table,
+        start_positions,
+        cache_slots,
+        cache_seq_ids,
+        norm_eps=norm_eps,
+        freqs_stride0=freqs_real.stride(0),
+        freqs_stride1=freqs_real.stride(1),
+        kv_stride0=kv_cache.stride(0),
+        kv_stride1=kv_cache.stride(1),
+        kv_stride2=kv_cache.stride(2),
+        block_table_stride0=block_table.stride(0) if paged else 0,
+        page_size=kv_cache.shape[1],
+        RATIO=ratio,
+        Q_LEN=q_len,
+        D=D,
+        ROPE_DIM=rope_dim,
+        BLOCK_D=BLOCK_D,
+        PAGED=paged,
+        USE_HADAMARD=True,
+        num_warps=4,
+    )
+
+
+@auto_retry_triton_compilation
+def postprocess_write_kv_cache(
+    kv_compress: torch.Tensor,
+    norm_weight: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor | None,
+    start_positions: torch.Tensor,
+    cache_slots: torch.Tensor,
+    cache_seq_ids: torch.Tensor,
+    ratio: int,
+    norm_eps: float,
+    q_len: int = 1,
+    rope_dim: int = 64,
+):
+    assert kv_cache.shape[-1] == kv_compress.shape[-1]
+    bsz = start_positions.shape[0]
+    if bsz == 0:
+        return
+    paged = block_table is not None
+    freqs_real = freqs_cis.real
+    freqs_imag = freqs_cis.imag
+    D = kv_compress.shape[-1]
+    BLOCK_D = triton.next_power_of_2(D)
+    _postprocess_write_kv_cache_kernel[(bsz,)](
+        kv_compress,
+        norm_weight,
+        freqs_real,
+        freqs_imag,
+        kv_cache,
+        block_table,
+        start_positions,
+        cache_slots,
+        cache_seq_ids,
+        norm_eps=norm_eps,
+        freqs_stride0=freqs_real.stride(0),
+        freqs_stride1=freqs_real.stride(1),
+        kv_stride0=kv_cache.stride(0),
+        kv_stride1=kv_cache.stride(1),
+        kv_stride2=kv_cache.stride(2),
+        block_table_stride0=block_table.stride(0) if paged else 0,
+        page_size=kv_cache.shape[1],
+        RATIO=ratio,
+        Q_LEN=q_len,
+        D=D,
+        ROPE_DIM=rope_dim,
+        BLOCK_D=BLOCK_D,
+        PAGED=paged,
+        USE_HADAMARD=False,
+        num_warps=8,
+    )
+
+
+@triton.jit
+def _postprocess_write_flashmla_kernel(
+    kv_ptr,  # [bsz, D] fp32 compressed KV
+    norm_weight_ptr,  # [D]
+    freqs_real_ptr,  # [max_seq, ROPE_DIM // 2], view of complex freqs
+    freqs_imag_ptr,
+    kv_cache_ptr,  # [num_blocks, page_size, 584] uint8
+    block_table_ptr,
+    start_positions_ptr,  # [bsz]
+    cache_seq_ids_ptr,  # [bsz]
+    norm_eps: tl.constexpr,
+    freqs_stride0: tl.constexpr,
+    freqs_stride1: tl.constexpr,
+    page_size: tl.constexpr,
+    block_table_stride0: tl.constexpr,
+    kv_block_stride: tl.constexpr,
+    RATIO: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    D: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    TOKEN_DATA_BYTES: tl.constexpr,
+    QUANT_BLOCK: tl.constexpr,
+    SCALE_DIM: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    req = tl.program_id(0)
+    sp = tl.load(start_positions_ptr + req)
+    if not _decode_should_compress(sp, RATIO, Q_LEN):
+        return
+
+    offs_d = tl.arange(0, D)
+    kv = tl.load(kv_ptr + req * D + offs_d).to(tl.bfloat16).to(tl.float32)
+    rms = tl.sqrt(tl.sum(kv * kv, axis=0) / D + norm_eps)
+    inv_rms = 1.0 / rms
+    weight = tl.load(norm_weight_ptr + offs_d).to(tl.float32)
+    kv_norm = (kv * inv_rms * weight).to(tl.bfloat16).to(tl.float32)
+
+    rotary_begin: tl.constexpr = D - ROPE_DIM
+    rope_local = offs_d - rotary_begin
+    pair_idx = rope_local // 2
+    even_idx = rotary_begin + pair_idx * 2
+    odd_idx = even_idx + 1
+
+    rope_pos = sp - sp % RATIO
+    freqs_off = rope_pos * freqs_stride0 + pair_idx * freqs_stride1
+    cos = tl.load(freqs_real_ptr + freqs_off, mask=offs_d >= rotary_begin, other=1.0)
+    sin = tl.load(freqs_imag_ptr + freqs_off, mask=offs_d >= rotary_begin, other=0.0)
+
+    kv_even = tl.load(
+        kv_ptr + req * D + even_idx, mask=offs_d >= rotary_begin, other=0.0
+    )
+    kv_odd = tl.load(kv_ptr + req * D + odd_idx, mask=offs_d >= rotary_begin, other=0.0)
+    weight_even = tl.load(
+        norm_weight_ptr + even_idx, mask=offs_d >= rotary_begin, other=0.0
+    ).to(tl.float32)
+    weight_odd = tl.load(
+        norm_weight_ptr + odd_idx, mask=offs_d >= rotary_begin, other=0.0
+    ).to(tl.float32)
+    q0 = kv_even.to(tl.bfloat16).to(tl.float32) * inv_rms * weight_even
+    q1 = kv_odd.to(tl.bfloat16).to(tl.float32) * inv_rms * weight_odd
+    q0 = q0.to(tl.bfloat16).to(tl.float32)
+    q1 = q1.to(tl.bfloat16).to(tl.float32)
+    rope_even = q0 * cos - q1 * sin
+    rope_odd = q1 * cos + q0 * sin
+    rope_val = tl.where(rope_local % 2 == 0, rope_even, rope_odd)
+    kv_pack = tl.where(
+        offs_d >= rotary_begin,
+        rope_val.to(tl.bfloat16).to(tl.float32),
+        kv_norm,
+    )
+
+    position = sp // RATIO
+    seq_id = tl.load(cache_seq_ids_ptr + req).to(tl.int64)
+    block_idx = tl.load(
+        block_table_ptr + seq_id * block_table_stride0 + position // page_size
+    ).to(tl.int64)
+    pos_in_block = position % page_size
+    block_base = kv_cache_ptr + block_idx * kv_block_stride
+    token_data_base = block_base + pos_in_block * TOKEN_DATA_BYTES
+    scale_base = block_base + page_size * TOKEN_DATA_BYTES + pos_in_block * SCALE_DIM
+
+    n_quant_blocks: tl.constexpr = D // QUANT_BLOCK
+    n_nope_blocks: tl.constexpr = NOPE_DIM // QUANT_BLOCK
+    quant_2d = tl.reshape(
+        kv_pack.to(tl.bfloat16).to(tl.float32), (n_quant_blocks, QUANT_BLOCK)
+    )
+    block_absmax = tl.max(tl.abs(quant_2d), axis=1)
+    block_absmax = tl.maximum(block_absmax, 1e-4)
+    raw_scales = block_absmax / FP8_MAX
+    exponents = tl.ceil(tl.log2(raw_scales))
+    inv_scales = tl.exp2(-exponents)
+    x_scaled = quant_2d * tl.reshape(inv_scales, (n_quant_blocks, 1))
+    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
+    x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+    x_uint8_flat = tl.reshape(x_uint8, (D,))
+
+    tl.store(token_data_base + offs_d, x_uint8_flat, mask=offs_d < NOPE_DIM)
+
+    bf16_ptr = (token_data_base + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+    tl.store(
+        bf16_ptr + tl.maximum(rope_local, 0),
+        kv_pack.to(tl.bfloat16),
+        mask=(offs_d >= NOPE_DIM) & (offs_d < NOPE_DIM + ROPE_DIM),
+    )
+
+    scale_idx = tl.arange(0, SCALE_DIM)
+    encoded = exponents + 127.0
+    encoded = tl.maximum(tl.minimum(encoded, 255.0), 0.0)
+    tl.store(
+        scale_base + scale_idx,
+        encoded.to(tl.uint8),
+        mask=scale_idx < n_nope_blocks,
+    )
+    tl.store(scale_base + n_nope_blocks, tl.zeros((), dtype=tl.uint8))
+
+
+@auto_retry_triton_compilation
+def postprocess_write_flashmla(
+    kv_compress: torch.Tensor,
+    norm_weight: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    start_positions: torch.Tensor,
+    cache_seq_ids: torch.Tensor,
+    ratio: int,
+    norm_eps: float,
+    q_len: int = 1,
+):
+    if kv_cache.dim() == 4:
+        assert kv_cache.shape[-2] == 1
+        kv_cache = kv_cache.squeeze(-2)
+    assert kv_cache.dtype == torch.uint8 and kv_cache.shape[-1] == 584
+    assert kv_compress.shape[-1] == 512
+    bsz = start_positions.shape[0]
+    if bsz == 0:
+        return
+    freqs_real = freqs_cis.real
+    freqs_imag = freqs_cis.imag
+    _postprocess_write_flashmla_kernel[(bsz,)](
+        kv_compress,
+        norm_weight,
+        freqs_real,
+        freqs_imag,
+        kv_cache,
+        block_table,
+        start_positions,
+        cache_seq_ids,
+        norm_eps=norm_eps,
+        freqs_stride0=freqs_real.stride(0),
+        freqs_stride1=freqs_real.stride(1),
+        page_size=kv_cache.shape[1],
+        block_table_stride0=block_table.stride(0),
+        kv_block_stride=kv_cache.stride(0),
+        RATIO=ratio,
+        Q_LEN=q_len,
+        D=kv_compress.shape[-1],
+        NOPE_DIM=448,
+        ROPE_DIM=64,
+        TOKEN_DATA_BYTES=576,
+        QUANT_BLOCK=64,
+        SCALE_DIM=8,
+        FP8_MAX=448.0,
+        num_warps=8,
     )
 
 

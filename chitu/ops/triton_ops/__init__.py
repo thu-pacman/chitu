@@ -19,7 +19,6 @@ from chitu.ops.triton_ops.kv_cache import (
     read_from_paged_indexer_kv_cache_deepgemm_triton,
 )
 from chitu.ops.triton_ops.deepseek_compressor import (
-    build_compress_metadata,
     gather_pending_and_new,
     compress_hca,
     compress_csa,
