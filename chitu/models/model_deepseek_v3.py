@@ -236,8 +236,12 @@ class Indexer(torch.nn.Module):
         cache_accessor: KVCacheAccessor,
         freqs_cis_k: Optional[BatchedFreqsCis] = None,
         k_pre_normed: bool = False,
+        return_indices: bool = False,
     ) -> torch.Tensor:
-        """Build index score. In CP mode, uses get_cp_context() for CP-specific params."""
+        """Build index scores or direct select-all prefill indices.
+
+        In CP mode, use get_cp_context() for CP-specific parameters.
+        """
         cp_ctx = get_cp_context()
         # Only apply CP logic when freqs_cis_k is provided (CP indexer path).
         # In non-CP path, override to pcp_size=1 so k_append etc. stay None.
@@ -304,7 +308,7 @@ class Indexer(torch.nn.Module):
             cache_accessor,
             is_causal,
             self.index_topk,
-            return_indices=False,
+            return_indices=return_indices,
             ke=local_lengths,
             k_append=k_append,
             ks=local_ks,
@@ -353,6 +357,11 @@ class Indexer(torch.nn.Module):
         freqs_cis_k: Optional[BatchedFreqsCis] = None,
         k_pre_normed: bool = False,
     ):
+        # TopK selects every valid key when the longest request already fits.
+        select_all_prefill_keys = (
+            not seq_len_delta.is_decode_stage
+            and seq_len_delta.new.max_len <= self.index_topk
+        )
         index_score = self._build_index_score(
             x,
             q,
@@ -363,7 +372,10 @@ class Indexer(torch.nn.Module):
             cache_accessor,
             freqs_cis_k=freqs_cis_k,
             k_pre_normed=k_pre_normed,
+            return_indices=select_all_prefill_keys,
         )  # [s_q, out_max_n]
+        if select_all_prefill_keys:
+            return index_score
         topk = min(self.index_topk, index_score.size(-1))
         # Use cached local_lengths only in CP path (freqs_cis_k is not None).
         # In non-CP path, always use seq_len_delta.

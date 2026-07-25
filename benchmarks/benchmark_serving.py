@@ -24,7 +24,7 @@ import traceback
 import numpy as np
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, Optional
 from typing_extensions import override
 
 import aiohttp
@@ -45,14 +45,20 @@ TIMEOUT = 300 if CI_PIPELINE_SOURCE == "schedule" else 10000
 @dataclass
 class BenchmarkConfig:
     model_name: str
-    batch_size: int
+    max_concurrency: Optional[int]
+    num_requests: int
+    num_iterations: int
+    warmup_requests: int
+    warmup_iterations: int
     input_length: Optional[int]
     output_length: int
-    num_iterations: int
-    warmup_iterations: int
+    temperature: float
+    top_p: float
+    top_k: int
     dataset: str
+    request_rate: float
     request_interval: float
-    force_max_min_bs: bool
+    min_batch_size: Optional[int]
     stop_with_eos: bool
     print_generated: bool
     tokenizer_path: Optional[str] = None
@@ -101,6 +107,7 @@ class BenchmarkMetrics:
     mean_itl_ms: float
     median_itl_ms: float
     std_itl_ms: float
+    max_itl_ms: float
     percentiles_itl_ms: list[tuple[float, float]]
     # E2EL stands for end-to-end latency per request.
     # It is the time taken on the client side from sending
@@ -109,6 +116,9 @@ class BenchmarkMetrics:
     median_e2el_ms: float
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
+    # Average number of successful requests in flight during the benchmark.
+    concurrency: float
+    max_concurrent_requests: int
 
 
 class Dataset:
@@ -263,19 +273,45 @@ class BenchmarkServing:
                 ) from e
 
         # Validate configuration
-        if config.batch_size < 1:
-            raise ValueError("Batch size must be at least 1")
+        if config.max_concurrency is not None and config.max_concurrency < 1:
+            raise ValueError("Max concurrency must be at least 1")
+        if config.num_requests < 1:
+            raise ValueError("Number of requests must be at least 1")
+        if config.warmup_requests < 0:
+            raise ValueError("Number of warmup requests cannot be negative")
+        if config.warmup_iterations < 0:
+            raise ValueError("Number of warmup iterations cannot be negative")
+        if config.request_rate <= 0 and config.request_rate != float("inf"):
+            raise ValueError("Request rate must be positive or inf")
+        if config.request_interval < 0:
+            raise ValueError("Request interval cannot be negative")
+        if config.min_batch_size is not None and config.min_batch_size < 1:
+            raise ValueError("Forced min_batch_size must be at least 1")
+        if config.min_batch_size is not None and config.max_concurrency is not None:
+            assert (
+                config.min_batch_size <= config.max_concurrency
+            ), "--force-min-bs must not exceed --max-concurrency"
         if config.num_iterations < 1:
             raise ValueError("Number of iterations must be at least 1")
-
         # Print configuration
         print(f"Benchmark Configuration:")
         print(f"  Model: {config.model_name}")
-        print(f"  Batch Size: {config.batch_size}")
+        print(f"  Max Concurrency: {config.max_concurrency}")
+        print(
+            "  Forced min_batch_size: "
+            f"{config.min_batch_size if config.min_batch_size is not None else 'disabled'}"
+        )
+        print(f"  Requests per Iteration: {config.num_requests}")
+        print(f"  Iterations: {config.num_iterations}")
+        print(f"  Warmup Requests: {config.warmup_requests}")
+        print(f"  Warmup Iterations: {config.warmup_iterations}")
         print(f"  Input Length: {config.input_length}")
         print(f"  Output Length: {config.output_length}")
-        print(f"  Iterations: {config.num_iterations}")
-        print(f"  Warmup Iterations: {config.warmup_iterations}")
+        print(f"  Temperature: {config.temperature}")
+        print(f"  Top P: {config.top_p}")
+        print(f"  Top K: {config.top_k}")
+        print(f"  Request Rate: {config.request_rate} req/s")
+        print(f"  Request Interval: {config.request_interval} s")
         print(f"  Base URL: {base_url}")
 
     def remote_tokenize(self, prompt: str):
@@ -335,6 +371,7 @@ class BenchmarkServing:
         # Send request and measure time
         st = time.perf_counter()
         output.start_timestamp = st
+        most_recent_timestamp = st
 
         try:
             async with session.post(
@@ -395,6 +432,13 @@ class BenchmarkServing:
                         )
                     output.generated_text = generated_text
                     output.latency = most_recent_timestamp - st
+                else:
+                    output.success = False
+                    response_text = await response.text()
+                    output.error = (
+                        f"HTTP {response.status} from "
+                        f"{self.base_url}/v1/chat/completions: {response_text}"
+                    )
         except Exception:
             output.success = False
             exc_info = sys.exc_info()
@@ -438,66 +482,124 @@ class BenchmarkServing:
         else:
             raise Exception("args.dataset only supports random or sharegpt")
 
-    async def run_async(self):
-        tasks: list[asyncio.Task] = []
-        interval = self.config.request_interval
-        messages_list = []
+    def _build_payload(self, messages: list[dict]) -> Dict[str, Any]:
+        """Build one OpenAI-compatible streaming request payload."""
+        return {
+            "model": self.config.model_name,
+            "messages": messages,
+            "max_completion_tokens": self.config.output_length,
+            "max_tokens": self.config.output_length,
+            "stream": True,
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+            "top_k": self.config.top_k,
+            "min_batch_size": self.config.min_batch_size or 1,
+            "stop_with_eos": self.config.stop_with_eos,
+            "ignore_eos": not self.config.stop_with_eos,
+            "stream_options": {"include_usage": True},
+        }
 
-        for _ in range(self.config.batch_size):
-            messages_list.append(self._get_test_messages())
+    async def _get_requests(
+        self,
+        payloads: list[Dict[str, Any]],
+        request_rate: float,
+    ) -> AsyncGenerator[tuple[int, Dict[str, Any]], None]:
+        """Yield requests at the specified rate.
+
+        ``inf`` submits all requests as quickly as possible. A finite rate uses
+        a Poisson process to sample arrival intervals.
+        """
+        for request_id, payload in enumerate(payloads):
+            yield request_id, payload
+            if request_rate == float("inf"):
+                continue
+            await asyncio.sleep(np.random.exponential(1.0 / request_rate))
+
+    async def run_async(
+        self,
+        payloads: list[Dict[str, Any]],
+        request_rate: Optional[float] = None,
+    ) -> list[RequestFuncOutput]:
+        """Run requests with specified rate and concurrency control.
+
+        ``request_rate`` controls request arrival. ``max_concurrency`` limits
+        in-flight requests.
+        """
+        if not payloads:
+            return []
+
+        rate = self.config.request_rate if request_rate is None else request_rate
+        semaphore = (
+            asyncio.Semaphore(self.config.max_concurrency)
+            if self.config.max_concurrency is not None
+            else None
+        )
 
         connector = aiohttp.TCPConnector(limit=0)
         async with aiohttp.ClientSession(
-            connector=connector, trust_env=True, timeout=AIOHTTP_TIMEOUT
+            connector=connector,
+            trust_env=True,
+            timeout=AIOHTTP_TIMEOUT,
         ) as session:
 
-            for i in range(self.config.batch_size):
+            async def limited_request(payload: Dict[str, Any]) -> RequestFuncOutput:
+                if semaphore is None:
+                    return await self._async_run_inference(session, payload)
+                async with semaphore:
+                    return await self._async_run_inference(session, payload)
 
-                # Prepare request payload
-                payload = {
-                    "model": self.config.model_name,
-                    "messages": messages_list[i],
-                    "max_completion_tokens": self.config.output_length,
-                    "max_tokens": self.config.output_length,
-                    "stream": True,
-                    "temperature": 1.0,
-                    "top_p": 0.9,
-                    "top_k": 50,
-                    "min_batch_size": (
-                        self.config.batch_size if self.config.force_max_min_bs else 1
-                    ),
-                    "stop_with_eos": self.config.stop_with_eos,
-                    "ignore_eos": not self.config.stop_with_eos,
-                    "stream_options": {"include_usage": True},
-                }
+            tasks: list[asyncio.Task[RequestFuncOutput]] = []
+            async for _, payload in self._get_requests(payloads, rate):
+                tasks.append(asyncio.create_task(limited_request(payload)))
 
-                tasks.append(
-                    asyncio.create_task(self._async_run_inference(session, payload))
+            return await asyncio.gather(*tasks)
+
+    def warmup_requests(self) -> None:
+        """Run request-level warmup without including it in benchmark results."""
+        if self.config.warmup_requests > 0:
+            print(f"Warming up with {self.config.warmup_requests} requests...")
+            warmup_payloads = [
+                self._build_payload(self._get_test_messages())
+                for _ in range(self.config.warmup_requests)
+            ]
+            warmup_outputs = asyncio.run(
+                self.run_async(warmup_payloads, request_rate=float("inf"))
+            )
+            if not any(output.success for output in warmup_outputs):
+                raise RuntimeError(
+                    "Warmup failed. Check the benchmark arguments and server. "
+                    f"First error: {warmup_outputs[0].error}"
                 )
-                await asyncio.sleep(interval)
-            outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
-            batch_complete = time.perf_counter()
+        else:
+            print("Skipping warmup.")
 
-        request_start = min(output.start_timestamp for output in outputs)
-        return outputs, batch_complete - request_start
+    def warmup_iteration(self, iteration: int) -> None:
+        """Run one full, unreported benchmark iteration as warmup."""
+        print(
+            f"Starting warmup iteration "
+            f"{iteration}/{self.config.warmup_iterations}..."
+        )
+        outputs, _ = self.benchmark()
+        if not any(output.success for output in outputs):
+            raise RuntimeError(
+                "Warmup iteration failed. Check the benchmark arguments and "
+                f"server. First error: {outputs[0].error}"
+            )
 
     def benchmark(self):
-        # Warmup
-        print(f"Warming up with {self.config.warmup_iterations} iterations...")
-        for _ in range(self.config.warmup_iterations):
-            asyncio.run(self.run_async())
+        print(
+            f"Running {self.config.num_requests} requests at "
+            f"request_rate={self.config.request_rate}, "
+            f"max_concurrency={self.config.max_concurrency}..."
+        )
+        benchmark_payloads = [
+            self._build_payload(self._get_test_messages())
+            for _ in range(self.config.num_requests)
+        ]
 
-        print(f"Running {self.config.num_iterations} benchmark iterations...")
-
-        # Measure
-        outputs: list[RequestFuncOutput] = []
-
-        total_time = 0.0
-
-        for _ in range(self.config.num_iterations):
-            iteration_outputs, request_duration = asyncio.run(self.run_async())
-            outputs.extend(iteration_outputs)
-            total_time += request_duration
+        start_time = time.perf_counter()
+        outputs = asyncio.run(self.run_async(benchmark_payloads))
+        total_time = time.perf_counter() - start_time
 
         return outputs, total_time
 
@@ -596,6 +698,21 @@ def calculate_metrics(
     #         "All requests failed. This is likely due to a misconfiguration "
     #         "on the benchmark arguments.",
     #         stacklevel=2)
+    successful_outputs = [out for out in outputs if out.success]
+    events: list[tuple[float, int]] = []
+    for out in successful_outputs:
+        events.append((out.start_timestamp, 1))
+        events.append((out.start_timestamp + out.latency, -1))
+    # stamp  delta  active    max
+    # 0.0     +1      1        1
+    # 0.5     +1      2        2
+    # 1.0     -1      1        2
+    active_requests = 0
+    max_concurrent_requests = 0
+    for _, delta in sorted(events, key=lambda event: (event[0], event[1])):
+        active_requests += delta
+        max_concurrent_requests = max(max_concurrent_requests, active_requests)
+
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -619,6 +736,7 @@ def calculate_metrics(
         mean_itl_ms=np.mean(itls or 0) * 1000,
         std_itl_ms=np.std(itls or 0) * 1000,
         median_itl_ms=np.median(itls or 0) * 1000,
+        max_itl_ms=np.max(itls or 0) * 1000,
         percentiles_itl_ms=[
             (p, np.percentile(itls or 0, p) * 1000) for p in selected_percentiles
         ],
@@ -628,6 +746,8 @@ def calculate_metrics(
         percentiles_e2el_ms=[
             (p, np.percentile(e2els or 0, p) * 1000) for p in selected_percentiles
         ],
+        concurrency=sum(e2els) / dur_s,
+        max_concurrent_requests=max_concurrent_requests,
     )
 
     return metrics, actual_output_lens
@@ -643,6 +763,7 @@ def process_one_metric(
     result,
     metrics,
     selected_percentile_metrics,
+    include_max: bool = False,
 ):
     # This function prints and adds statistics of the specified
     # metric.
@@ -674,6 +795,10 @@ def process_one_metric(
         p_word = str(int(p)) if int(p) == p else str(p)
         print("{:<40} {:<10.2f}".format(f"P{p_word} {metric_name} (ms):", value))
         result[f"p{p_word}_{metric_attribute_name}_ms"] = value
+    if include_max:
+        max_value = getattr(metrics, f"max_{metric_attribute_name}_ms")
+        print("{:<40} {:<10.2f}".format(f"Max {metric_name} (ms):", max_value))
+        result[f"max_{metric_attribute_name}_ms"] = max_value
 
 
 def save_dict_result(result: dict, output_dir: str, append: bool = False):
@@ -692,14 +817,56 @@ def save_dict_result(result: dict, output_dir: str, append: bool = False):
 def main():
     parser = argparse.ArgumentParser(description="Run Chitu performance benchmarks")
     parser.add_argument("--model", required=True, help="Model name")
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of concurrent requests. Together with "
+            "--request-rate, this controls fixed-concurrency serving tests."
+        ),
+    )
+    parser.add_argument(
+        "--num-requests",
+        dest="num_requests",
+        type=int,
+        default=None,
+        help=(
+            "Number of requests to process in each iteration. Defaults to "
+            "max_concurrency."
+        ),
+    )
+    parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=None,
+        help=(
+            "Total warmup requests before all iterations. Defaults to "
+            "max_concurrency, or 1 when max concurrency is not set."
+        ),
+    )
+    parser.add_argument(
+        "--warmup-iteration",
+        type=int,
+        default=0,
+        help=(
+            "Number of complete benchmark iterations to run before collecting "
+            "results."
+        ),
+    )
     parser.add_argument("--input-len", type=int)
     parser.add_argument("--output-len", type=int, default=128)
-    parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=1,
+    )
     parser.add_argument("--output-dir", help="Output dir of benchmark json file")
     parser.add_argument("--base-url", help="URL of the Chitu server endpoint")
-    parser.add_argument("--metric-percentiles", type=str, default="99")
+    parser.add_argument("--metric-percentiles", type=str, default="90,95,99")
     parser.add_argument("--percentile-metrics", type=str, default="ttft,tpot,itl")
     parser.add_argument("--append-result", action="store_true")
     parser.add_argument(
@@ -707,44 +874,128 @@ def main():
     )
     parser.add_argument("--dataset-path")
     parser.add_argument("--tokenizer-path")
-    parser.add_argument("--request-interval", type=float, default=0.0)
-    parser.add_argument("--force-max-min-bs", action="store_true")
+    request_rate_group = parser.add_mutually_exclusive_group()
+    request_rate_group.add_argument(
+        "--request-rate",
+        type=float,
+        default=None,
+        help=(
+            "Number of requests per second. If inf, requests are submitted as "
+            "quickly as possible; otherwise, inter-arrival times follow a "
+            "Poisson process."
+        ),
+    )
+    request_rate_group.add_argument(
+        "--request-interval",
+        type=float,
+        default=None,
+        help=(
+            "Mean interval in seconds between requests. This is the reciprocal "
+            "of --request-rate; 0 submits requests as quickly as possible."
+        ),
+    )
+    parser.add_argument(
+        "--force-min-bs",
+        type=int,
+        metavar="BATCH_SIZE",
+        default=None,
+        help="Force the server request field min_batch_size to this value.",
+    )
     parser.add_argument("--stop-with-eos", action="store_true", default=False)
     parser.add_argument("--print-generated", action="store_true")
 
     args = parser.parse_args()
 
+    max_concurrency = args.max_concurrency
+    num_requests = (
+        args.num_requests if args.num_requests is not None else (max_concurrency or 1)
+    )
+    warmup_requests = (
+        args.warmup_requests
+        if args.warmup_requests is not None
+        else (max_concurrency or 1)
+    )
+    if args.request_rate is not None:
+        if args.request_rate <= 0 and args.request_rate != float("inf"):
+            parser.error("--request-rate must be positive or inf")
+        request_rate = args.request_rate
+    elif args.request_interval is not None:
+        if args.request_interval < 0:
+            parser.error("--request-interval cannot be negative")
+        request_rate = (
+            float("inf") if args.request_interval == 0 else 1 / args.request_interval
+        )
+    else:
+        request_rate = float("inf")
+    request_interval = 0.0 if request_rate == float("inf") else 1 / request_rate
+
     config = BenchmarkConfig(
         model_name=args.model,
-        batch_size=args.batch_size,
+        max_concurrency=max_concurrency,
+        num_requests=num_requests,
+        num_iterations=args.iterations,
+        warmup_requests=warmup_requests,
+        warmup_iterations=args.warmup_iteration,
         input_length=args.input_len,
         output_length=args.output_len,
-        num_iterations=args.iterations,
-        warmup_iterations=args.warmup,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
         dataset=args.dataset,
         tokenizer_path=args.tokenizer_path,
         dataset_path=args.dataset_path,
-        request_interval=args.request_interval,
-        force_max_min_bs=args.force_max_min_bs,
+        request_rate=request_rate,
+        request_interval=request_interval,
+        min_batch_size=args.force_min_bs,
         stop_with_eos=args.stop_with_eos,
         print_generated=args.print_generated,
     )
 
     runner = BenchmarkServing(config, base_url=args.base_url)
 
-    # Run benchmark
-    print("\nStarting benchmark...")
+    runner.warmup_requests()
 
-    outputs, total_time = runner.benchmark()
+    for iteration in range(1, config.warmup_iterations + 1):
+        runner.warmup_iteration(iteration)
 
-    metrics, actual_output_lens = calculate_metrics(
-        outputs=outputs,
-        dur_s=total_time,
-        selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
-        config=config,
+    for iteration in range(1, config.num_iterations + 1):
+        print(
+            f"\nStarting benchmark iteration " f"{iteration}/{config.num_iterations}..."
+        )
+        outputs, total_time = runner.benchmark()
+        metrics, actual_output_lens = calculate_metrics(
+            outputs=outputs,
+            dur_s=total_time,
+            selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
+            config=config,
+        )
+        report_benchmark_result(
+            outputs=outputs,
+            total_time=total_time,
+            metrics=metrics,
+            actual_output_lens=actual_output_lens,
+            config=config,
+            args=args,
+            iteration=iteration,
+        )
+
+
+def report_benchmark_result(
+    outputs: list[RequestFuncOutput],
+    total_time: float,
+    metrics: BenchmarkMetrics,
+    actual_output_lens: list[int],
+    config: BenchmarkConfig,
+    args: argparse.Namespace,
+    iteration: int,
+) -> None:
+    print(
+        "{s:{c}^{n}}".format(
+            s=f" Serving Benchmark Result ({iteration}/{config.num_iterations}) ",
+            n=50,
+            c="=",
+        )
     )
-
-    print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", total_time))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
@@ -764,12 +1015,29 @@ def main():
             "Total Token throughput (tok/s):", metrics.total_token_throughput
         )
     )
+    print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
+    print(
+        "{:<40} {:<10}".format(
+            "Max concurrent requests:", metrics.max_concurrent_requests
+        )
+    )
 
     model = {"name": config.model_name}
 
     result = {
         "model": model,
-        "batch_size": config.batch_size,
+        "max_concurrency": config.max_concurrency,
+        "min_batch_size": config.min_batch_size,
+        "num_requests": config.num_requests,
+        "iteration": iteration,
+        "num_iterations": config.num_iterations,
+        "warmup_requests": config.warmup_requests,
+        "warmup_iterations": config.warmup_iterations,
+        "request_rate": config.request_rate,
+        "request_interval": config.request_interval,
+        "temperature": config.temperature,
+        "top_p": config.top_p,
+        "top_k": config.top_k,
         "duration": total_time,
         "completed": metrics.completed,
         "total_input_tokens": metrics.total_input,
@@ -777,6 +1045,8 @@ def main():
         "request_throughput": metrics.request_throughput,
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
+        "concurrency": metrics.concurrency,
+        "max_concurrent_requests": metrics.max_concurrent_requests,
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
@@ -819,6 +1089,7 @@ def main():
         result,
         metrics,
         selected_percentile_metrics,
+        include_max=True,
     )
     process_one_metric(
         "e2el",

@@ -11,6 +11,7 @@ from hydra.core.config_store import ConfigStore
 from omegaconf import DictConfig
 from logging import getLogger
 
+from chitu.boot.arg_utils import resolve_default_args
 from chitu.boot.local import local
 from chitu.boot.srun import srun
 from chitu.boot.ssh import ssh
@@ -47,8 +48,7 @@ cs.store(name="serve_config_schema", node={})
     config_name="serve_config",
 )
 def main(cfg: DictConfig):
-    if cfg.boot.interactive_node_0 == "auto":
-        cfg.boot.interactive_node_0 = sys.stdout.isatty() and cfg.boot.n_nodes == 1
+    cfg = resolve_default_args(cfg)
 
     local_run_callback: LocalRunCallback
     if cfg.boot.container_image is not None:

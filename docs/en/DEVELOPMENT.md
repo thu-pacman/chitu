@@ -965,13 +965,18 @@ First start the service like above, then you can use the following command to be
 ```bash
 python benchmarks/benchmark_serving.py \
     --model "deepseek-r1" \
-    --batch-size 1 \
-    --iterations 10 \
+    --max-concurrency 1 \
+    --num-requests 10 \
     --input-len 128 \
     --output-len 1024 \
-    --warmup 3 \
+    --warmup-requests 3 \
+    --request-rate inf \
     --base-url http://localhost:21002
 ```
+
+`--request-rate` controls request arrival and `--max-concurrency` limits the number of in-flight requests. For a saturated fixed-concurrency serving benchmark, set `--request-rate inf` with a finite `--max-concurrency`; each completed request is immediately replaced until that iteration's `--num-requests` is exhausted.
+
+`--iterations` repeats the complete warmup → benchmark → result flow and emits one result per iteration. To reproduce three rounds that each submit eight concurrent requests and wait for the round to finish, use `--max-concurrency 8 --num-requests 8 --iterations 3 --request-rate inf`.
 
 The benchmark follows the following assumption, and you should keep them consistent when comparing between frameworks or platforms:
 
@@ -979,7 +984,7 @@ The benchmark follows the following assumption, and you should keep them consist
 - Default sampling parameters are used. See `class UserRequest` in `chitu/task.py` for default values.
 - There is no caching between requests.
 
-Note that the benchmarking script uses a lot of file handles when `--batch-size` is large, which may be over the limit by `ulimit`. **It is recommended to raise to limit before benchmarking, for example by `ulimit -n 65536`.**
+Note that the benchmarking script uses a lot of file handles when `--max-concurrency` is large, which may be over the limit by `ulimit`. **It is recommended to raise to limit before benchmarking, for example by `ulimit -n 65536`.**
 
 ## Unit Tests
 
