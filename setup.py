@@ -11,6 +11,7 @@ import glob
 import setuptools
 from setuptools import Extension, setup, find_packages
 from setuptools.command.build_py import build_py
+from setuptools.command.build_ext import build_ext as setuptools_build_ext
 import packaging.version
 from Cython.Build import cythonize
 
@@ -92,6 +93,14 @@ def create_cython_extensions(directory):
     return extensions
 
 
+def get_setup_jobs():
+    for key in ("CHITU_SETUP_JOBS", "MAX_JOBS"):
+        jobs_env = os.environ.get(key, "")
+        if jobs_env != "":
+            return int(jobs_env)
+    return os.cpu_count() or 1
+
+
 class SkipBuildPy(build_py):
     def find_package_modules(self, package, package_dir):
         modules = super().find_package_modules(package, package_dir)
@@ -101,18 +110,55 @@ class SkipBuildPy(build_py):
         return filtered_modules
 
 
+class HybridBuildExtension(BuildExtension):
+    def build_extension(self, ext):
+        if getattr(self, "_chitu_building_cython_extensions", False):
+            return setuptools_build_ext.build_extension(self, ext)
+        return super().build_extension(ext)
+
+    def build_extensions(self):
+        cython_extensions = [
+            ext for ext in self.extensions if getattr(ext, "_chitu_cython", False)
+        ]
+        native_extensions = [
+            ext for ext in self.extensions if not getattr(ext, "_chitu_cython", False)
+        ]
+
+        original_extensions = self.extensions
+        original_parallel = getattr(self, "parallel", None)
+        try:
+            if cython_extensions:
+                self.extensions = cython_extensions
+                self.parallel = get_setup_jobs()
+                self._chitu_building_cython_extensions = True
+                setuptools_build_ext.build_extensions(self)
+                self._chitu_building_cython_extensions = False
+
+            if native_extensions:
+                self.extensions = native_extensions
+                self.parallel = None
+                BuildExtension.build_extensions(self)
+        finally:
+            self.extensions = original_extensions
+            self.parallel = original_parallel
+            self._chitu_building_cython_extensions = False
+
+
 my_build_py = build_py
 if os.environ.get("CHITU_WITH_CYTHON", "0") != "0":
-    nthreads_env = os.environ.get("CHITU_SETUP_JOBS", "")
-    if nthreads_env != "":
-        nthreads = int(nthreads_env)
-    else:
-        nthreads = os.cpu_count() or 1
-    ext_modules += cythonize(create_cython_extensions("chitu"), nthreads=nthreads)
+    nthreads = get_setup_jobs()
+    cython_extensions = cythonize(create_cython_extensions("chitu"), nthreads=nthreads)
+    for extension in cython_extensions:
+        extension._chitu_cython = True
+    ext_modules += cython_extensions
     my_build_py = SkipBuildPy
 
-if os.environ.get("CHITU_SETUP_JOBS") is not None:
-    os.environ["MAX_JOBS"] = os.environ.get("CHITU_SETUP_JOBS")  # type: ignore
+# Cython extensions are compiled in parallel across modules with setuptools' normal
+# compiler path. Native PyTorch/CUDA extensions are built afterwards with
+# BuildExtension's Ninja backend, which uses MAX_JOBS for within-extension
+# parallelism. Keeping these phases separate avoids concurrent writes to PyTorch's
+# build.ninja files.
+os.environ["MAX_JOBS"] = str(get_setup_jobs())
 
 # The information here can also be placed in setup.cfg - better separation of
 # logic and declaration, and simpler if you include description/version in a file.
@@ -124,6 +170,6 @@ setup(
     extras_require=extras_require,
     packages=find_packages(),
     ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension, "build_py": my_build_py},
+    cmdclass={"build_ext": HybridBuildExtension, "build_py": my_build_py},
     package_data={"chitu": ["config/**/*.yaml"]},
 )
