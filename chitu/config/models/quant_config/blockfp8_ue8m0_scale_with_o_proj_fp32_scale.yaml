@@ -23,3 +23,8 @@ quant:
       type : blockfp8
       kwargs:
         round_scale_to_pow2: true
+
+- kv_cache: '.'
+  rules:
+    - regex: '^indexer_k$'
+      type: fp8_pertoken_indexer

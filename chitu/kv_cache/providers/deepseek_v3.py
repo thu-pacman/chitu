@@ -15,8 +15,23 @@ from chitu.kv_cache.registry import (
     KVCacheSpec,
     register_kv_cache_spec,
     _normalize_model_type,
+    kv_cache_quant_type_for_key,
 )
 from chitu.models.registry import ModelType
+
+
+def _uses_fp8_pertoken_dsa(models) -> bool:
+    return (
+        kv_cache_quant_type_for_key(getattr(models, "quant_config", None), "kv_lora")
+        == "fp8_pertoken_dsa"
+    )
+
+
+def _uses_fp8_pertoken_indexer(models) -> bool:
+    return (
+        kv_cache_quant_type_for_key(getattr(models, "quant_config", None), "indexer_k")
+        == "fp8_pertoken_indexer"
+    )
 
 
 def _deepseek_v3_paged_block_size(args, attn_backend_type, *, cache_name: str):
@@ -43,25 +58,11 @@ def _deepseek_v3_paged_block_size(args, attn_backend_type, *, cache_name: str):
 )
 def deepseek_v3_indexer_cache_spec(args, attn_backend_type) -> KVCacheSpec:
     index_head_dim = int(args.models.index_head_dim)
+    fp8_indexer_kv = _uses_fp8_pertoken_indexer(args.models)
 
-    # deepgemm indexer-kv layout
-    if args.infer.indexer_type == "deepgemm":
-        return KVCacheSpec(
-            block_size=64,
-            kvargs={
-                "shape_per_token_dict": {
-                    "indexer_k_ks": (index_head_dim + (index_head_dim // 128) * 4,),
-                },
-                "dtype_dict": {
-                    "indexer_k_ks": (torch.float8_e4m3fn),
-                },
-            },
-        )
-
-    # BF16 indexer-kv layout keeps only K. Used by:
-    #   - Hygon (lightop.op.mqa_logits / paged_mqa_logits)
-    #   - Ascend NPU (pure-torch bf16 mqa_logits)
-    if args.infer.indexer_type in ("hygon", "torch_bf16"):
+    # BF16 indexer-kv layout keeps only K. Used by indexer_type=hygon and
+    # indexer_type=torch_bf16.
+    if not fp8_indexer_kv:
         return KVCacheSpec(
             block_size=64,
             kvargs={
@@ -71,23 +72,47 @@ def deepseek_v3_indexer_cache_spec(args, attn_backend_type) -> KVCacheSpec:
                 "dtype_dict": {
                     "indexer_k": torch.bfloat16,
                 },
+                "quant_type": None,
             },
         )
 
-    return KVCacheSpec(
-        kvargs={
-            "shape_per_token_dict": {
-                "indexer_k": (index_head_dim,),
-                "indexer_ks": (index_head_dim // 128,),
+    # indexer_type=deepgemm packs FP8 K and per-block scales into one tensor.
+    if args.infer.indexer_type == "deepgemm":
+        return KVCacheSpec(
+            block_size=64,
+            kvargs={
+                "shape_per_token_dict": {
+                    "indexer_k_ks": (index_head_dim + (index_head_dim // 128) * 4,),
+                },
+                "dtype_dict": {
+                    "indexer_k_ks": torch.float8_e4m3fn,
+                },
+                "quant_type": "fp8_pertoken_indexer",
             },
-            "dtype_dict": {
-                "indexer_k": torch.float8_e4m3fn,
-                "indexer_ks": torch.float32,
+        )
+
+    # indexer_type=triton and indexer_type=torch share the same FP8 indexer-kv
+    # layout with separate K and per-block scale tensors.
+    if args.infer.indexer_type in ("triton", "torch"):
+        return KVCacheSpec(
+            kvargs={
+                "shape_per_token_dict": {
+                    "indexer_k": (index_head_dim,),
+                    "indexer_ks": (index_head_dim // 128,),
+                },
+                "dtype_dict": {
+                    "indexer_k": torch.float8_e4m3fn,
+                    "indexer_ks": torch.float32,
+                },
+                "quant_type": "fp8_pertoken_indexer",
             },
-        },
-        block_size=_deepseek_v3_paged_block_size(
-            args, attn_backend_type, cache_name="indexer"
-        ),
+            block_size=_deepseek_v3_paged_block_size(
+                args, attn_backend_type, cache_name="indexer"
+            ),
+        )
+
+    raise ValueError(
+        f"Unrecognized indexer_type {args.infer.indexer_type} for FP8 indexer KV quantization."
     )
 
 
@@ -97,12 +122,7 @@ def deepseek_v3_indexer_cache_spec(args, attn_backend_type) -> KVCacheSpec:
 )
 def deepseek_v3_kv_cache_spec(args, attn_backend_type) -> KVCacheSpec:
     tp = int(args.infer.tp_size)
-    quant_cfg = getattr(args.models, "quant_config", None)
-
-    ds_fp8_quant = (
-        hasattr(quant_cfg, "kv_cache")
-        and getattr(quant_cfg.kv_cache, "type", None) == "fp8_pertoken_dsa"
-    )
+    ds_fp8_quant = _uses_fp8_pertoken_dsa(args.models)
 
     mla_absorb = getattr(args.infer, "mla_absorb", "none")
 
@@ -116,22 +136,30 @@ def deepseek_v3_kv_cache_spec(args, attn_backend_type) -> KVCacheSpec:
             args, attn_backend_type, cache_name="main"
         )
 
-        if use_separated:
-            kvargs["shape_per_token_dict"] = {
-                "kv_lora": (args.models.kv_lora_rank,),
-                "k_pe": (args.models.qk_rope_head_dim,),
-            }
-            kv_keys = ["kv_lora", "k_pe"]
-        else:
-            if ds_fp8_quant:
+        if ds_fp8_quant:
+            if use_separated:
+                raise ValueError(
+                    "fp8_pertoken_dsa KV cache requires the packed kv_lora_k_pe layout"
+                )
+            else:
                 kvargs["shape_per_token_dict"] = {"kv_lora_k_pe": (656,)}
+                kvargs["dtype_dict"] = {"kv_lora_k_pe": torch.float8_e4m3fn}
+                kvargs["quant_type"] = "fp8_pertoken_dsa"
+                kv_keys = ["kv_lora", "k_pe"]
+        else:
+            if use_separated:
+                kvargs["shape_per_token_dict"] = {
+                    "kv_lora": (args.models.kv_lora_rank,),
+                    "k_pe": (args.models.qk_rope_head_dim,),
+                }
+                kv_keys = ["kv_lora", "k_pe"]
             else:
                 kvargs["shape_per_token_dict"] = {
                     "kv_lora_k_pe": (
                         args.models.kv_lora_rank + args.models.qk_rope_head_dim,
                     )
                 }
-            kv_keys = ["kv_lora_k_pe"]
+                kv_keys = ["kv_lora_k_pe"]
 
         return KVCacheSpec(kvargs=kvargs, kv_keys=kv_keys, block_size=block_size)
 

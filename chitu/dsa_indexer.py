@@ -56,19 +56,42 @@ support_indexer_hygon = (
 HYGON_INDEXER_MAX_MTP_SIZE = 5
 
 
+def use_fp8_dsa_indexer_kv(args) -> bool:
+    # Import lazily to avoid an import cycle during module initialization:
+    # kv_cache.registry -> chitu.models -> model_deepseek_v3 -> dsa_indexer.
+    from chitu.kv_cache.registry import kv_cache_quant_type_for_key
+
+    quant_cfg = getattr(args.models, "quant_config", None)
+    indexer_kv_quant_type = kv_cache_quant_type_for_key(quant_cfg, "indexer_k")
+    if indexer_kv_quant_type not in (None, "fp8_pertoken_indexer"):
+        raise ValueError(
+            f"DSA indexer KV cache only supports no quantization or fp8_pertoken_indexer, got {indexer_kv_quant_type}"
+        )
+    return indexer_kv_quant_type == "fp8_pertoken_indexer"
+
+
 def validate_indexer_config(args, indexer_type):
     if args.models.get("index_topk", None) is None:
         return
-    if indexer_type == "deepgemm":
-        _validate_deepgemm_indexer_config(args)
-    elif indexer_type == "hygon":
-        _validate_hygon_indexer_config(args)
-    elif indexer_type == "torch_bf16":
-        _validate_torch_bf16_indexer_config(args)
-    elif indexer_type == "triton":
-        pass
+
+    if use_fp8_dsa_indexer_kv(args):
+        if indexer_type == "deepgemm":
+            _validate_deepgemm_indexer_config(args)
+        elif indexer_type in ("triton", "torch"):
+            pass
+        else:
+            raise ValueError(
+                f"Unrecognized indexer_type {indexer_type} for FP8 indexer KV quantization."
+            )
     else:
-        raise ValueError(f"Unrecognized indexer_type {indexer_type}")
+        if indexer_type == "hygon":
+            _validate_hygon_indexer_config(args)
+        elif indexer_type == "torch_bf16":
+            _validate_torch_bf16_indexer_config(args)
+        else:
+            raise ValueError(
+                f"Unrecognized indexer_type {indexer_type} for BF16 indexer KV quantization."
+            )
 
 
 def _validate_deepgemm_indexer_config(args):
@@ -370,7 +393,7 @@ class DSAIndexer:
             )
 
         # reshape as batch view
-        q = q.view(batch_size, next_n, h, d)
+        q = q.contiguous().view(batch_size, next_n, h, d)
 
         weights = weights.reshape(s_q, h)
         assert k.dim() == 3
@@ -556,7 +579,7 @@ class DSAIndexer:
 
         return index_score
 
-    def blockfp8_index_score_dsa_triton(
+    def blockfp8_index_score_dsa_torch_or_triton(
         self,
         q_fp8,
         k_fp8,
@@ -799,8 +822,8 @@ class DSAIndexer:
                 is_causal,
                 skip_prefill_score=select_all_prefill_keys,
             )
-        else:  # triton and torch impl share a same kv layout
-            logits = self.blockfp8_index_score_dsa_triton(
+        else:  # triton and torch impl share the same kv layout
+            logits = self.blockfp8_index_score_dsa_torch_or_triton(
                 q_fp8,
                 k_fp8,
                 k_scale,

@@ -78,40 +78,34 @@ def set_quant_variables(global_args=None):
     model_name = model_name.lower()
 
     def _ensure_quant_config_struct():
-        """Ensure models.quant_config exists and has kv_cache sub-struct."""
+        """Ensure models.quant_config exists and has a kv_cache rules list."""
         if models.get("quant_config", None) is None:
             OmegaConf.set_struct(models, False)
             models["quant_config"] = {
                 "rules": [],
                 "type": None,
-                "kv_cache": {"rules": [], "type": None},
+                "kv_cache": {"rules": []},
             }
             OmegaConf.set_struct(models, True)
             return True
 
         if models.quant_config.get("kv_cache", None) is None:
             OmegaConf.set_struct(models.quant_config, False)
-            models.quant_config["kv_cache"] = {"rules": [], "type": None}
+            models.quant_config["kv_cache"] = {"rules": []}
             OmegaConf.set_struct(models.quant_config, True)
 
         return False
 
-    def _get_kv_cache_existing():
-        """Read existing kv_cache config (for fallback)."""
+    def _get_kv_cache_existing_rules():
+        """Read existing kv_cache rules (for fallback)."""
         old_kv = models.quant_config.get("kv_cache", None)
         if old_kv is None:
-            return None, []
-        kv_type = (
-            old_kv.get("type", None)
-            if isinstance(old_kv, dict)
-            else getattr(old_kv, "type", None)
-        )
-        kv_rules = (
+            return []
+        return (
             old_kv.get("rules", [])
             if isinstance(old_kv, dict)
             else getattr(old_kv, "rules", [])
         )
-        return kv_type, kv_rules
 
     def _normalize_rules(rules, default_type):
         """
@@ -133,6 +127,21 @@ def set_quant_variables(global_args=None):
 
         return out, default_type
 
+    def _normalize_kv_cache_rules(rules):
+        """Normalize KV cache rules. Each regex rule must explicitly declare its type."""
+        out = []
+        for rule in rules:
+            if rule.get("type", None) is None:
+                raise ValueError(
+                    f"kv_cache quant rule {rule} must explicitly set its type"
+                )
+            OmegaConf.set_struct(rule, False)
+            if "layers" in rule:
+                rule.layers = expand_layers(rule.get("layers", []))
+            OmegaConf.set_struct(rule, True)
+            out.append(rule)
+        return out
+
     def _match_entry(quant_list, key):
         """
         Find first config entry matching model_name for given key.
@@ -149,12 +158,12 @@ def set_quant_variables(global_args=None):
     if created_default:
         return
 
-    # Prepare output quant_config skeleton (keep old kv_cache as fallback)
-    old_kv_type, old_kv_rules = _get_kv_cache_existing()
+    # Prepare output quant_config skeleton (keep old kv_cache rules as fallback)
+    old_kv_rules = _get_kv_cache_existing_rules()
     quant_config = {
         "rules": [],
         "type": models.quant_config.get("type", None),
-        "kv_cache": {"rules": [], "type": old_kv_type},
+        "kv_cache": {"rules": []},
     }
 
     quant_list = models.quant_config.get("quant", [])
@@ -171,9 +180,7 @@ def set_quant_variables(global_args=None):
     kv_cfg = _match_entry(quant_list, "kv_cache")
     if kv_cfg is not None:
         rules = kv_cfg.get("rules", [])
-        quant_config["kv_cache"]["rules"], quant_config["kv_cache"]["type"] = (
-            _normalize_rules(rules, quant_config["kv_cache"]["type"])
-        )
+        quant_config["kv_cache"]["rules"] = _normalize_kv_cache_rules(rules)
     else:
         # fallback: keep existing kv_cache rules if present
         if old_kv_rules:
@@ -231,6 +238,11 @@ def resolve_full_default_args(args):
 
     args = resolve_default_args(args)
 
+    model_resolver = ModelConfigResolver()
+    args.models = StaticConfig(
+        model_resolver.process_config_dict(args.models, args.models.ckpt_dir)
+    )
+
     if args.infer.bind_process_to_cpu != "none":
         if not has_numa:
             logger.warning(
@@ -282,18 +294,24 @@ def resolve_full_default_args(args):
             HYGON_INDEXER_MAX_MTP_SIZE,
             support_indexer_deepgemm,
             support_indexer_hygon,
+            use_fp8_dsa_indexer_kv,
             validate_indexer_config,
         )
 
         if args.infer.indexer_type == "auto":
-            if (
-                support_indexer_deepgemm
-                and args.infer.cache_type == "paged"
-                and args.infer.mtp_size < 3
-            ):
-                args.infer.indexer_type = "deepgemm"
-            elif has_native_fp8() and has_triton:
-                args.infer.indexer_type = "triton"
+            if use_fp8_dsa_indexer_kv(args):
+                if (
+                    support_indexer_deepgemm
+                    and args.infer.cache_type == "paged"
+                    and args.infer.mtp_size < 3
+                ):
+                    args.infer.indexer_type = "deepgemm"
+                elif has_native_fp8() and has_triton:
+                    args.infer.indexer_type = "triton"
+                else:
+                    raise NotImplementedError(
+                        "No available FP8 infer.indexer_type found"
+                    )
             elif (
                 support_indexer_hygon
                 and args.infer.cache_type == "paged"
@@ -305,13 +323,8 @@ def resolve_full_default_args(args):
             elif args.infer.cache_type == "paged":
                 args.infer.indexer_type = "torch_bf16"
             else:
-                raise NotImplementedError("No available infer.indexer_type found")
+                raise NotImplementedError("No available BF16 infer.indexer_type found")
         validate_indexer_config(args, args.infer.indexer_type)
-
-    model_resolver = ModelConfigResolver()
-    args.models = StaticConfig(
-        model_resolver.process_config_dict(args.models, args.models.ckpt_dir)
-    )
 
     logger.debug(f"Auto setting configs done. Full configs are: {args}")
     return args

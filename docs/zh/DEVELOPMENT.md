@@ -230,8 +230,8 @@ TORCH_CUDA_ARCH_LIST=9.0 pip install --no-build-isolation ".[flash_mla]"
 - `deep_ep`: 用于支持使用 DeepEP 进行 MoE 通信（需要在**安装赤兔前**先在系统中安装 NVSHMEM，NVSHMEM 已经包含在 `requirements-build-deep_ep-cu12.txt` 中）
 - `cpu`: 用于支持 CPU+GPU 混合推理。
 - `muxi_layout_kernels`: 用于支持在沐曦 GPU 上使用 `infer.op_impl=muxi_custom_kernel` 模式，在小 batch 场景性能更优。
-- `scipy`: 用于支持 DeepSeek-V3.2-Exp 中的 indexer 的可选依赖。
-- `fast_hadamard_transform`: 用于支持 DeepSeek-V3.2-Exp 中的 indexer 的可选依赖。
+- `scipy`: 用于支持 DeepSeek-V3.2-Exp 中 FP8 indexer KV cache 的可选依赖。
+- `fast_hadamard_transform`: 用于支持 DeepSeek-V3.2-Exp 中 FP8 indexer KV cache 的可选依赖。
 - `numa`: 用于支持 NUMA 绑定。
 
 如果需要用于开发，建议加上 `-e` 选项启用 editable install，如

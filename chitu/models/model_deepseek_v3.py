@@ -25,6 +25,7 @@ from chitu.kv_cache import (
 )
 from chitu.cp_utils import get_cp_context
 from chitu.global_vars import get_global_args
+from chitu.dsa_indexer import use_fp8_dsa_indexer_kv
 from chitu.models.model import (
     Attention,
     MoeGate,
@@ -150,6 +151,7 @@ class Indexer(torch.nn.Module):
         self.q_lora_rank: int = args.q_lora_rank
         self.softmax_scale = self.head_dim**-0.5
         self.block_size = 128
+        self.use_hadamard_transform = use_fp8_dsa_indexer_kv(get_global_args())
         self.indexer_impl = indexer_impl
 
         self.k_norm = LayerNorm(
@@ -217,8 +219,9 @@ class Indexer(torch.nn.Module):
                 impl="torch_npu" if has_torch_npu else "auto",
             )
 
-        q_rot = self._rotate_activation(q_rot)
-        k_rot = self._rotate_activation(k_rot)
+        if self.use_hadamard_transform:
+            q_rot = self._rotate_activation(q_rot)
+            k_rot = self._rotate_activation(k_rot)
         if self.indexer_impl.impl in ("hygon", "torch_bf16"):
             return (q_rot, None), (k_rot, None)
         return blockfp8_act_quant(

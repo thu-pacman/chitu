@@ -427,12 +427,19 @@ Acceptable values:
 
 Indexer impl type, only valid for models with DSA (DeepSeek Sparse Attention).
 
-Accetable values:
+Acceptable values:
 - "auto": Automatically choose.
-- "deepgemm": use deep_gemm mqa logits and fused paged indexer-kv layout (requires deep_gemm).
-- "triton": use triton impl when computing index_score and separate (paged/skew) indexer-kv layout.
-- "hygon": use bf16 indexer dtype in hygon platform
-- "torch_bf16": pure-torch bf16 mqa logits (auto-selected on Ascend NPU)
+- "deepgemm": FP8 indexer KV cache path using deep_gemm mqa logits and a fused
+  paged indexer-kv layout (requires deep_gemm).
+- "triton": FP8 indexer KV cache path using Triton kernels and a separate
+  (paged/skew) indexer-kv layout.
+- "torch": FP8 indexer KV cache reference/fallback path sharing the same
+  separate (paged/skew) indexer-kv layout as "triton".
+- "hygon": BF16 indexer KV cache path for the Hygon platform.
+- "torch_bf16": BF16 indexer KV cache pure-torch mqa logits path.
+
+FP8 indexer paths require a kv_cache rule matching indexer_k with
+type=fp8_pertoken_indexer. BF16 indexer paths require unquantized indexer KV cache.
 
 *Default: `auto`.*
 
