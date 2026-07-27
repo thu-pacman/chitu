@@ -31,18 +31,25 @@ if get_bool_env("CHITU_HYGON_BUILD", False):
         setup_dir, "third_party/deepgemm_hygon"
     )
 
+    flash_mla = "flash_mla @ file://localhost" + os.path.join(
+        setup_dir,
+        "third_party/hygon_wheels/flash_mla-1.2.0+das.optphase1.d512.h64.dtk2604-cp310-cp310-linux_x86_64.whl",
+    )
+
     if get_bool_env("CHITU_HYGON_BUILD_FOR_SHCA", False):
-        mooncake = "mooncake-transfer-engine @ file://localhost" + os.path.join(
+        mooncake = "mooncake-transfer-engine-shca @ file://localhost" + os.path.join(
             setup_dir,
             "third_party/hygon_wheels/mooncake_transfer_engine_shca-0.3.10.post1+das.opt1.dtk2604.2605131044.gd34f6f-cp310-cp310-manylinux_2_35_x86_64.whl",
         )
     else:
-        mooncake = "mooncake-transfer-engine @ file://localhost" + os.path.join(
-            setup_dir,
-            "third_party/hygon_wheels/mooncake_transfer_engine-0.3.7.post2+das.opt1.dtk2604.torch290-cp310-cp310-manylinux_2_28_x86_64.whl",
-        )
+        mooncake = "mooncake-transfer-engine==0.3.7.post2+das.opt1.dtk2604.torch290"
+
 else:
     cuda_major = int((torch.version.cuda or "0").split(".")[0])
+
+    flash_mla = "flash_mla @ file://localhost" + os.path.join(
+        setup_dir, "third_party/FlashMLA"
+    )
 
     deep_gemm = "deep_gemm @ file://localhost" + os.path.join(
         setup_dir, "third_party/DeepGEMM"
@@ -148,10 +155,7 @@ extras_require = {
     "flash_linear_attention": [
         "flash-linear-attention",
     ],
-    "flash_mla": [
-        "flash_mla @ file://localhost"
-        + os.path.join(setup_dir, "third_party/FlashMLA"),
-    ],
+    "flash_mla": [flash_mla],
     "deep_gemm": [deep_gemm],
     "deep_ep": [
         "deep_ep @ file://localhost" + os.path.join(setup_dir, "third_party/DeepEP"),

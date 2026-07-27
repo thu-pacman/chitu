@@ -242,18 +242,22 @@ COPY --from=dependency_resolver /tmp/requirements.txt /tmp/requirements.txt
 
 COPY ./third_party ./third_party
 COPY ./csrc/cpuinfer ./csrc/cpuinfer
-COPY ./pypi-links ./pypi-links
+COPY ./script/pip-multi-indices.sh ./script/pip-multi-indices.sh
 
-# Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
-# compile at install time, and the compile results are environment dependent.
-#依赖 pytorch 的库应该一律都需要 --no-build-isolation。因为：
-# 1. pytorch 是个构建时依赖。
-# 2. pytorch 一般都要使用和具体卡以及其他基础软件（如 cuda）版本相关的版本。
-# 3. 如果没有 --no-build-isolation ，pip 会在构建时用单独的环境重新下载所有构建时依赖，此时无法指定上述版本。
-RUN pip install --no-build-isolation -r /tmp/requirements.txt \
-        -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "pytest" -e "build") \
-        --find-links ./pypi-links \
-        --timeout 60 --retries 10
+# NOTE: Don't use `--mount=type=cache,target=/root/.cache/pip` here, because some dependencies
+#       compile at install time, and the compile results are environment dependent.
+# NOTE: Always set `--no-build-isolation` for packages dependent on `torch`, because: 1) `torch`
+#       is a build-time dependency. 2) We must use the specific `torch` version already installed
+#       in the image, which matches the hardware. If not, `pip` will download arbitrary `torch`
+#       at build time.
+# NOTE: We use `./script/pip-multi-indices.sh` to set `https://pypi.org/simple` as a fallback,
+#       because some optional dependencies (e.g. `mooncake-transfer-engine-cuda13`) is not avaiable
+#       in some PyPI mirrors.
+RUN ./script/pip-multi-indices.sh install --no-build-isolation -r /tmp/requirements.txt \
+    -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "numpy" -e "transformers" -e "pytest" -e "build" -e "click") \
+    -i "${pypi_mirror}" \
+    -i https://pypi.org/simple \
+    --timeout 60 --retries 10
 
 RUN set -eux; \
     VER="$(python -c "import importlib.metadata as m; \
@@ -306,7 +310,7 @@ COPY --from=dependency_installer /opt/conda /opt/conda
 # compile at install time, and the compile results are environment dependent.
 RUN --mount=from=wheel_builder,source=/tmp/wheels,target=/tmp/wheels \
   pip install /tmp/wheels/*.whl \
-    -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "numpy" -e "transformers" -e "pytest" -e 'typing-extensions' -e 'typing_extensions' -e "build")
+    -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "numpy" -e "transformers" -e "pytest" -e 'typing-extensions' -e 'typing_extensions' -e "build" -e "click")
 
 RUN rm -rf /tmp/*
 COPY ./test ./test
