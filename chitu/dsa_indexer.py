@@ -227,6 +227,7 @@ class DSAIndexer:
         seq_len_delta: BatchedSeqLenDelta,
         causal: bool,
         ke: Optional[torch.Tensor] = None,  # [s_q], int32, pre-computed ke for CP
+        q_seq_ids: Optional[torch.Tensor] = None,  # [s_q], CP-local seq ids
     ):
         """
         Indexer score by Hygon lightop.op.mqa_logits() for ragged qk in prefill stage.
@@ -258,19 +259,35 @@ class DSAIndexer:
                     + ks
                 )
 
+        # LightOp's 128-row ASM path launches full query tiles, but its Q,
+        # weight, and range-metadata loads do not mask a partial last tile.
+        # Pad every row-indexed input to the launch shape, then discard the
+        # dummy output rows below.
+        kernel_s_q = s_q
+        if s_q >= 128 and s_q % 128 != 0:
+            kernel_s_q = (s_q + 127) // 128 * 128
+            pad_rows = kernel_s_q - s_q
+            q = torch.cat((q, q.new_zeros((pad_rows, h, q.shape[2]))), dim=0)
+            weights = torch.cat((weights, weights.new_zeros((pad_rows, h))), dim=0)
+            ks = torch.cat((ks, ks.new_zeros((pad_rows,))), dim=0)
+            ke = torch.cat((ke, ke.new_zeros((pad_rows,))), dim=0)
+
         index_score = lightop.op.mqa_logits(
             q,
             k,
             weights,
             ks,
             ke,
-            s_q,
+            kernel_s_q,
             k.shape[0],
             h,
             q.shape[2],
             None,
             True,
         )
+
+        if kernel_s_q != s_q:
+            index_score = index_score.narrow(0, 0, s_q)
 
         # This kernel stores the output in a (ragged_q * ragged_k) layout, we need to
         # convert it back to (ragged_q * local_k), so the following `topk` can be correct.
@@ -283,12 +300,15 @@ class DSAIndexer:
             dtype=index_score.dtype,
             device=index_score.device,
         )
+        row_seq_ids = (
+            q_seq_ids
+            if q_seq_ids is not None
+            else seq_len_delta.delta_seq_ids_tensor_device
+        )
         for seq_id, (row_start, seq_len) in enumerate(
             zip(seq_len_delta.new.prefix_lens_list, seq_len_delta.new.lens_list)
         ):
-            rows = torch.nonzero(
-                seq_len_delta.delta_seq_ids_tensor_device == seq_id, as_tuple=True
-            )[0]
+            rows = torch.nonzero(row_seq_ids == seq_id, as_tuple=True)[0]
             local_width = min(seq_len, seq_len_delta.new.max_len)
             if rows.numel() and local_width:
                 out[rows, :local_width] = index_score[
@@ -664,6 +684,7 @@ class DSAIndexer:
         is_causal=True,
         ke: Optional[torch.Tensor] = None,
         k_append: Optional[torch.Tensor] = None,
+        q_seq_ids: Optional[torch.Tensor] = None,
         skip_prefill_score: bool = False,
     ):
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
@@ -712,6 +733,7 @@ class DSAIndexer:
                 seq_len_delta,
                 is_causal,
                 ke=ke,
+                q_seq_ids=q_seq_ids,
             )
 
         return index_score
@@ -777,6 +799,7 @@ class DSAIndexer:
         ke: Optional[torch.Tensor] = None,
         k_append: Optional[torch.Tensor] = None,
         ks: Optional[torch.Tensor] = None,
+        q_seq_ids: Optional[torch.Tensor] = None,
     ):
         if q_fp8.numel() == 0:
             return torch.randn(0, self.static_max_n)
@@ -810,6 +833,7 @@ class DSAIndexer:
                 is_causal,
                 ke=ke,
                 k_append=k_append,
+                q_seq_ids=q_seq_ids,
                 skip_prefill_score=select_all_prefill_keys,
             )
         elif self.impl == "torch_bf16":

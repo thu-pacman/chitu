@@ -252,10 +252,12 @@ class Indexer(torch.nn.Module):
             pcp_size = cp_ctx.pcp_size
             cp_rank = cp_ctx.cp_rank
             local_lengths = cp_ctx.local_lengths
+            local_seq_ids = cp_ctx.local_seq_ids
         else:
             pcp_size = 1
             cp_rank = 0
             local_lengths = None
+            local_seq_ids = None
 
         q_pack, k_pack = self._build_index_qk(
             x,
@@ -315,6 +317,13 @@ class Indexer(torch.nn.Module):
             ke=local_lengths,
             k_append=k_append,
             ks=local_ks,
+            q_seq_ids=(
+                local_seq_ids
+                if pcp_size > 1
+                and local_lengths is not None
+                and not seq_len_delta.is_decode_stage
+                else None
+            ),
         )
 
     def build_decode_topk_page_table(

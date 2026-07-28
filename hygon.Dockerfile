@@ -77,6 +77,8 @@ RUN curl -L --retry 3 --retry-delay 5 -o /tmp/dtk_llvm.run https://download.sour
     rm -f /tmp/dtk_llvm.run
 
 COPY ./script/pip-multi-indices.sh ./script/pip-multi-indices.sh
+# NOTE: ./third_party/hygon_wheels/triton-3.5.1+das.opt1.dtk2604.torch290-cp310-cp310-manylinux_2_28_x86_64.whl is different from
+#       `triton==3.5.1+das.opt1.dtk2604.torch290` from https://pypi.sourcefind.cn/release/dtk/, although they have the same name.
 RUN --mount=source=./third_party/hygon_wheels,destination=./third_party/hygon_wheels \
   ./script/pip-multi-indices.sh install \
     -i "${pypi_mirror}" \
@@ -84,9 +86,9 @@ RUN --mount=source=./third_party/hygon_wheels,destination=./third_party/hygon_wh
     -i https://pypi.sourcefind.cn/nightly/dtk/ \
     ./third_party/hygon_wheels/aiter-0.1.2+das.opt1.dtk2604.torch290.2605071840.g1f8f50-cp310-cp310-linux_x86_64.whl \
     ./third_party/hygon_wheels/flash_mla-1.2.0+das.optphase1.d512.h64.dtk2604-cp310-cp310-linux_x86_64.whl \
+    ./third_party/hygon_wheels/triton-3.5.1+das.opt1.dtk2604.torch290-cp310-cp310-manylinux_2_28_x86_64.whl \
     "lightop==0.6.0+das.dtk2604.torch290.20260327.gaa4938" \
     "lmslim==0.3.1+das.opt4.dtk2604.torch290.2604281437.g61fdfe" \
-    "triton==3.5.1+das.opt1.dtk2604.torch290" \
     -c <(pip list --format freeze | grep -v -e "setuptools" -e "numpy")
 
 # Download prometheus
