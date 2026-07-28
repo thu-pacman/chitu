@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import time
 from datetime import datetime
 from logging import getLogger
@@ -220,7 +221,7 @@ class AsyncResponse:
                 )
             except Exception as e:
                 logger.exception("Error in chat completion stream generator.")
-                data = {"detail": str(e)}
+                data = json.dumps({"detail": str(e)})
                 yield f"data: {data}\n\n"
             yield "data: [DONE]\n\n"
 

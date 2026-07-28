@@ -16,4 +16,4 @@ class ToolsInfo:
             }
 
     def get_arg_type(self, name: str, arg_name: str):
-        return self.arg_types[name][arg_name]
+        return self.arg_types.get(name, {}).get(arg_name)
