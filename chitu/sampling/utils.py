@@ -54,8 +54,26 @@ def compile_grammar(grammar: Grammar | None) -> tuple[CompiledGrammar | None, st
     if compiler is None or grammar is None:
         return None, ""
 
-    compiled = compiler.compile_grammar(grammar)
-    grammar_str = compiled.serialize_json()
+    try:
+        compiled = compiler.compile_grammar(grammar)
+    except Exception:
+        logger.warning(
+            "Failed to compile grammar via xgrammar, "
+            "falling back to unconstrained generation",
+            exc_info=True,
+        )
+        return None, ""
+
+    try:
+        grammar_str = compiled.serialize_json()
+    except Exception:
+        logger.warning(
+            "Failed to serialize compiled grammar, "
+            "falling back to unconstrained generation",
+            exc_info=True,
+        )
+        return None, ""
+
     return compiled, grammar_str
 
 
