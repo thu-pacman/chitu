@@ -246,9 +246,30 @@ def build_mtp_cache(args):
     )
 
 
+def _build_indexer_layer_id_map(args, *, layer_filter_fn=lambda x: x) -> GlobalLocalMap:
+    """Map only layers that own indexer state for GLM-5.2."""
+    if _normalize_model_type(getattr(args.models, "type", None)) != ModelType.GLM_5_2:
+        return build_layer_id_map(args, layer_filter_fn=layer_filter_fn)
+
+    n_layers = int(args.models.n_layers)
+    indexer_types = args.models.indexer_types
+
+    def local_indexer_layers(layers: Iterable[int]) -> Iterable[int]:
+        # GLM-5.2 shared layers consume their preceding full layer's top-k and
+        # never touch indexer KV. Keep the synthetic MTP layer (n_layers): it
+        # owns a full indexer and its global id is required for PP-local lookup.
+        return [
+            layer_id
+            for layer_id in layer_filter_fn(layers)
+            if layer_id == n_layers or indexer_types[layer_id] == "full"
+        ]
+
+    return build_layer_id_map(args, layer_filter_fn=local_indexer_layers)
+
+
 def _build_indexer_cache(args, *, layer_filter_fn=lambda x: x):
     device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
-    layer_id_map = build_layer_id_map(args, layer_filter_fn=layer_filter_fn)
+    layer_id_map = _build_indexer_layer_id_map(args, layer_filter_fn=layer_filter_fn)
     if layer_id_map.size() == 0:
         return None
 
