@@ -208,11 +208,18 @@ class FlashMLABackend(TritonAttnBackend):
         )
 
         # get quant config
+        # Import lazily to avoid an import cycle during module initialization:
+        # attn_backend -> flash_mla_backend -> kv_cache.registry -> chitu.models
+        # -> model_deepseek_v3 -> model -> attn_backend.
+        from chitu.kv_cache.registry import kv_cache_quant_type_for_key
+
         quant_config = getattr(self.args.models, "quant_config", None)
-        if hasattr(quant_config, "kv_cache") and hasattr(quant_config.kv_cache, "type"):
-            self.use_fp8_cache = quant_config.kv_cache.type == "fp8_pertoken_dsa"
-        else:
-            self.use_fp8_cache = use_fp8
+        kv_lora_quant_type = kv_cache_quant_type_for_key(quant_config, "kv_lora")
+        self.use_fp8_cache = (
+            kv_lora_quant_type == "fp8_pertoken_dsa"
+            if kv_lora_quant_type is not None
+            else use_fp8
+        )
 
         if self.use_fp8_cache and (is_hygon() or is_muxi()):
             raise NotImplementedError(

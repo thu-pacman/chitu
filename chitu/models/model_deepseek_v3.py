@@ -25,6 +25,7 @@ from chitu.kv_cache import (
 )
 from chitu.cp_utils import get_cp_context
 from chitu.global_vars import get_global_args
+from chitu.dsa_indexer import use_fp8_dsa_indexer_kv
 from chitu.models.model import (
     Attention,
     MoeGate,
@@ -150,6 +151,7 @@ class Indexer(torch.nn.Module):
         self.q_lora_rank: int = args.q_lora_rank
         self.softmax_scale = self.head_dim**-0.5
         self.block_size = 128
+        self.use_hadamard_transform = use_fp8_dsa_indexer_kv(get_global_args())
         self.indexer_impl = indexer_impl
 
         self.k_norm = LayerNorm(
@@ -217,8 +219,9 @@ class Indexer(torch.nn.Module):
                 impl="torch_npu" if has_torch_npu else "auto",
             )
 
-        q_rot = self._rotate_activation(q_rot)
-        k_rot = self._rotate_activation(k_rot)
+        if self.use_hadamard_transform:
+            q_rot = self._rotate_activation(q_rot)
+            k_rot = self._rotate_activation(k_rot)
         if self.indexer_impl.impl in ("hygon", "torch_bf16"):
             return (q_rot, None), (k_rot, None)
         return blockfp8_act_quant(
@@ -249,10 +252,12 @@ class Indexer(torch.nn.Module):
             pcp_size = cp_ctx.pcp_size
             cp_rank = cp_ctx.cp_rank
             local_lengths = cp_ctx.local_lengths
+            local_seq_ids = cp_ctx.local_seq_ids
         else:
             pcp_size = 1
             cp_rank = 0
             local_lengths = None
+            local_seq_ids = None
 
         q_pack, k_pack = self._build_index_qk(
             x,
@@ -312,6 +317,13 @@ class Indexer(torch.nn.Module):
             ke=local_lengths,
             k_append=k_append,
             ks=local_ks,
+            q_seq_ids=(
+                local_seq_ids
+                if pcp_size > 1
+                and local_lengths is not None
+                and not seq_len_delta.is_decode_stage
+                else None
+            ),
         )
 
     def build_decode_topk_page_table(

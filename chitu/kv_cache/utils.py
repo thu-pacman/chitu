@@ -59,6 +59,27 @@ def build_layer_id_map(
     return GlobalLocalMap.from_list(local_layers)
 
 
+def is_reallocable_kv_cache(cache) -> bool:
+    """Whether a KV cache participates in the token-capacity block sizing.
+
+    A cache is reallocable only if its block count scales with sequence length
+    (tokens). Fixed-capacity caches — SingletonPagedKVCache (one block per hot
+    request, e.g. MTP / linear-attention state) and any cache flagged
+    ``fixed_num_blocks`` (e.g. DeepSeek-V4 sliding-window ring buffers) — own a
+    per-request number of blocks unrelated to token capacity and MUST be
+    excluded.
+    """
+    if not hasattr(cache, "realloc") or not hasattr(cache, "num_blocks"):
+        return False
+    if not hasattr(cache, "manager_name") or not hasattr(cache, "max_num_blocks"):
+        return False
+    if type(cache).__name__ == "SingletonPagedKVCache":
+        return False
+    if bool(getattr(cache, "fixed_num_blocks", False)):
+        return False
+    return True
+
+
 def build_layer_id_map_lastlayer(args):
     layer_ids = []
     if get_pp_group().is_last_rank:
@@ -66,65 +87,6 @@ def build_layer_id_map_lastlayer(args):
         total_n_layers = int(args.models.n_layers) + (1 if mtp_size > 1 else 0)
         layer_ids = [total_n_layers - 1]
     return GlobalLocalMap.from_list(layer_ids)
-
-
-def plan_kv_cache_blocks_after_warmup(args, cache_managers):
-    """
-    Structure-driven pre-plan:
-
-    - main is kept at current size in pre-plan
-    - indexer is shrunk to the minimum size needed to cover CURRENT main blocks
-    - final main/indexer growth will be solved after shrink using current live memory
-    """
-    assert "main" in cache_managers, "main cache manager is required"
-
-    infos = {}
-    for name, cm in cache_managers.items():
-        infos[name] = {
-            "cm": cm,
-            "block_mem": cm.estimate_bytes_per_block(),
-            "current_blocks": cm.num_blocks,
-            "max_num_blocks": cm.get_allocatable_max_num_blocks(),
-        }
-
-    main_cm = cache_managers["main"]
-    main_cur = int(main_cm.num_blocks)
-
-    plan = {"main": main_cur}
-
-    if "indexer" in cache_managers:
-        indexer_cm = cache_managers["indexer"]
-        indexer_cur = int(indexer_cm.num_blocks)
-        indexer_cap = indexer_cm.get_allocatable_max_num_blocks()
-
-        desired_indexer_blocks = estimate_indexer_blocks_from_main(
-            main_cm, indexer_cm, main_cur
-        )
-        desired_indexer_blocks = min(
-            max(0, int(desired_indexer_blocks)), int(indexer_cap)
-        )
-
-        # shrink-only in pre-plan
-        indexer_target = min(indexer_cur, desired_indexer_blocks)
-        plan["indexer"] = indexer_target
-
-        logger.info(
-            "KV cache pre-plan: main_cur=%d, indexer_cur=%d, desired_indexer_blocks=%d, indexer_target=%d",
-            main_cur,
-            indexer_cur,
-            desired_indexer_blocks,
-            indexer_target,
-        )
-
-    for name, info in infos.items():
-        if name in plan:
-            continue
-        plan[name] = min(int(info["current_blocks"]), int(info["max_num_blocks"]))
-
-    # mtp cache only exists in pp last stage, causing stuck in `reduce_num_block_plan_across_ranks`
-    # mtp cache size only depends on request num, shrinking is not required
-    plan.pop("mtp", None)
-    return plan
 
 
 def get_peak_live_and_target_bytes(
@@ -211,126 +173,6 @@ def get_peak_live_and_target_bytes(
     return live_bytes, target_budget_bytes, allocator_debug_bytes
 
 
-def solve_main_target_from_current(
-    args,
-    main_cm,
-    reserve_bytes: int,
-) -> int:
-    """
-    Solve the FINAL feasible main target from current live memory.
-    This may shrink or grow main.
-    """
-    main_cur = int(main_cm.num_blocks)
-    main_cap = main_cm.get_allocatable_max_num_blocks()
-    main_bpb = int(main_cm.estimate_bytes_per_block())
-
-    if main_bpb <= 0:
-        return 0
-
-    live_bytes, target_budget_bytes, allocator_debug_bytes = (
-        get_peak_live_and_target_bytes(
-            memory_utilization=args.infer.memory_utilization,
-            reserve_bytes=reserve_bytes,
-        )
-    )
-
-    # baseline = everything except current main cache
-    baseline_bytes = max(0, int(live_bytes) - int(main_cur) * int(main_bpb))
-
-    allowed_main_bytes = max(0, int(target_budget_bytes) - int(baseline_bytes))
-    target_main_blocks = allowed_main_bytes // int(main_bpb)
-
-    logger.info(
-        "KV main-only solve: live=%.2fGB target_budget=%.2fGB "
-        "baseline=%.2fGB main_cur=%d target_main_blocks=%d main_cap=%d "
-        "reserved_peak_gap=%.2fGB",
-        _bytes_to_gb(live_bytes),
-        _bytes_to_gb(target_budget_bytes),
-        _bytes_to_gb(baseline_bytes),
-        int(main_cur),
-        int(target_main_blocks),
-        int(main_cap),
-        _bytes_to_gb(allocator_debug_bytes["reserved_peak_gap_bytes"]),
-    )
-
-    return max(0, min(int(target_main_blocks), int(main_cap)))
-
-
-def solve_main_target_after_shrink(
-    args,
-    main_cm,
-    indexer_cm,
-    reserve_bytes: int,
-) -> int:
-    """
-    Return the largest feasible FINAL main target after shrink,
-    accounting for coupled indexer size.
-    This may shrink or grow main.
-    """
-    main_cur = int(main_cm.num_blocks)
-    main_cap = main_cm.get_allocatable_max_num_blocks()
-    main_bpb = int(main_cm.estimate_bytes_per_block())
-
-    indexer_cur = int(indexer_cm.num_blocks)
-    indexer_cap = indexer_cm.get_allocatable_max_num_blocks()
-    indexer_bpb = int(indexer_cm.estimate_bytes_per_block())
-
-    live_bytes, target_budget_bytes, allocator_debug_bytes = (
-        get_peak_live_and_target_bytes(
-            memory_utilization=args.infer.memory_utilization,
-            reserve_bytes=reserve_bytes,
-        )
-    )
-
-    # baseline = everything except current main + current indexer
-    baseline_bytes = max(
-        0,
-        int(live_bytes)
-        - int(main_cur) * int(main_bpb)
-        - int(indexer_cur) * int(indexer_bpb),
-    )
-
-    lo, hi = 0, int(main_cap)
-    best_main = 0
-    best_indexer = 0
-
-    while lo <= hi:
-        mid = (lo + hi) // 2
-
-        derived_indexer = estimate_indexer_blocks_from_main(main_cm, indexer_cm, mid)
-        derived_indexer = clamp_int(derived_indexer, 1, indexer_cap)
-
-        total_live_if_mid = (
-            int(baseline_bytes)
-            + int(mid) * int(main_bpb)
-            + int(derived_indexer) * int(indexer_bpb)
-        )
-
-        if int(total_live_if_mid) <= int(target_budget_bytes):
-            best_main = int(mid)
-            best_indexer = int(derived_indexer)
-            lo = mid + 1
-        else:
-            hi = mid - 1
-
-    logger.info(
-        "KV joint solve after shrink: live=%.2fGB target_budget=%.2fGB "
-        "baseline=%.2fGB main_cur=%d indexer_cur=%d best_main=%d best_indexer=%d "
-        "main_cap=%d indexer_cap=%d reserved_peak_gap=%.2fGB",
-        _bytes_to_gb(live_bytes),
-        _bytes_to_gb(target_budget_bytes),
-        _bytes_to_gb(baseline_bytes),
-        int(main_cur),
-        int(indexer_cur),
-        int(best_main),
-        int(best_indexer),
-        int(main_cap),
-        int(indexer_cap),
-        _bytes_to_gb(allocator_debug_bytes["reserved_peak_gap_bytes"]),
-    )
-    return int(best_main)
-
-
 def reduce_num_block_plan_across_ranks(plan: dict[str, int]) -> dict[str, int]:
     plan = {k: int(v) for k, v in plan.items()}
 
@@ -352,19 +194,6 @@ def reduce_num_block_plan_across_ranks(plan: dict[str, int]) -> dict[str, int]:
     torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
 
     return {k: int(v) for k, v in zip(keys, t.tolist())}
-
-
-def estimate_indexer_blocks_from_main(main_cm, indexer_cm, main_blocks: int) -> int:
-    """
-    Derive how many indexer blocks are needed to cover the same token range as main_blocks.
-
-    If both caches use the same block_size (most likely here), this becomes 1:1.
-    Otherwise use token-coverage ratio.
-    """
-    # TODO: mm cache
-    if indexer_cm.block_size <= 0:
-        return 0
-    return int(math.ceil(main_blocks * main_cm.block_size / indexer_cm.block_size))
 
 
 def allreduce_min_int(value: int) -> int:

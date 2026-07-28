@@ -25,5 +25,7 @@ quant:
         round_scale_to_pow2: true
 - kv_cache: '.'
   rules:
-    - regex: '^kv_lora_k_pe$'
+    - regex: '^(kv_lora|k_pe)$'
       type: fp8_pertoken_dsa
+    - regex: '^indexer_k$'
+      type: fp8_pertoken_indexer

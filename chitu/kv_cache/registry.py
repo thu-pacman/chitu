@@ -77,6 +77,18 @@ def register_kv_cache_spec(
     return deco
 
 
+def kv_cache_quant_type_for_key(quant_config: Any, key: str):
+    kv_cache_cfg = getattr(quant_config, "kv_cache", None) if quant_config else None
+    if kv_cache_cfg is None:
+        return None
+
+    for rule in getattr(kv_cache_cfg, "rules", None) or []:
+        pattern = getattr(rule, "regex", None)
+        if pattern and re.search(pattern, key):
+            return getattr(rule, "type", None)
+    return None
+
+
 def get_kv_cache_spec(
     args,
     attn_backend_type,
@@ -105,11 +117,7 @@ def should_use_hopper_mixed_backend(args) -> bool:
     ):
         return False
     quant_config = getattr(args.models, "quant_config", None)
-    kv_cache_cfg = getattr(quant_config, "kv_cache", None) if quant_config else None
-    if (
-        kv_cache_cfg is not None
-        and getattr(kv_cache_cfg, "type", None) == "fp8_pertoken_dsa"
-    ):
+    if kv_cache_quant_type_for_key(quant_config, "kv_lora") == "fp8_pertoken_dsa":
         return False
     return has_flash_attn3
 
@@ -122,17 +130,21 @@ def can_use_hunyuan_attn(args) -> bool:
     infer = getattr(args, "infer", args)
     fp16_variant = getattr(args, "float_16bit_variant", None)
     quant_config = getattr(models, "quant_config", None)
-    kv_cache_cfg = getattr(quant_config, "kv_cache", None) if quant_config else None
-    kv_quant_type = getattr(kv_cache_cfg, "type", None)
+    k_quant_type = kv_cache_quant_type_for_key(quant_config, "k")
+    v_quant_type = kv_cache_quant_type_for_key(quant_config, "v")
 
     head_dim = getattr(models, "head_dim", None)
     if head_dim is None:
         head_dim = int(models.dim) // int(models.n_heads)
     if int(head_dim) != 128:
         return False
-    if kv_quant_type not in {None, "fp8_pertensor"}:
+    if k_quant_type not in {None, "fp8_pertensor"}:
         return False
-    if kv_quant_type is None and fp16_variant != "bfloat16":
+    if v_quant_type not in {None, "fp8_pertensor"}:
+        return False
+    if k_quant_type != v_quant_type:
+        return False
+    if k_quant_type is None and fp16_variant != "bfloat16":
         return False
     cache_type = getattr(infer, "cache_type", None)
     if cache_type != "paged":
@@ -182,10 +194,7 @@ def apply_kv_cache_quantization_rules(
         return kvargs
 
     kv_cache_cfg = getattr(quant_config, "kv_cache", None)
-    quant_type = (
-        getattr(kv_cache_cfg, "type", None) if kv_cache_cfg is not None else None
-    )
-    if kv_cache_cfg is None or quant_type is None:
+    if kv_cache_cfg is None:
         return kvargs
 
     if kv_keys is None:
@@ -196,38 +205,46 @@ def apply_kv_cache_quantization_rules(
 
     kv_cache_rules = getattr(kv_cache_cfg, "rules", None) or []
 
+    if not kv_cache_rules:
+        return kvargs
+
     quant_type_to_dtype = {
         "fp8_pertensor": torch.float8_e4m3fn,
-        "fp8_pertoken_dsa": torch.float8_e4m3fn,  # special for DSV32/DeepSeek-V3
+        "fp8_pertoken_dsa": None,
+        "fp8_pertoken_indexer": None,
     }
 
-    dtype_dict: Dict[str, torch.dtype] = {}
+    dtype_dict: Dict[str, torch.dtype] = dict(kvargs.get("dtype_dict", {}))
 
-    if kv_cache_rules:
-        for key in kv_keys:
-            matched = False
-            for rule in kv_cache_rules:
-                pattern = getattr(rule, "regex", None)
-                rtype = getattr(rule, "type", None) or quant_type
-                if pattern and re.search(pattern, key):
-                    if rtype not in quant_type_to_dtype:
-                        raise NotImplementedError(
-                            f"Unsupported kv_cache quant type: {rtype}"
-                        )
-                    dtype_dict[key] = quant_type_to_dtype[rtype]
-                    matched = True
-                    break
-            if not matched:
-                raise ValueError(
-                    f"kv_cache quant rules did not match key '{key}'. "
-                    f"Available keys: {kv_keys}. Please add a rule for it."
-                )
-    else:
-        if quant_type not in quant_type_to_dtype:
-            raise NotImplementedError(f"Unsupported kv_cache quant type: {quant_type}")
-        dtype = quant_type_to_dtype[quant_type]
-        dtype_dict = {k: dtype for k in kv_keys}
+    matched_types = []
+    for key in kv_keys:
+        for rule in kv_cache_rules:
+            pattern = getattr(rule, "regex", None)
+            rtype = getattr(rule, "type", None)
+            if pattern and re.search(pattern, key):
+                if rtype is None:
+                    raise ValueError(
+                        f"kv_cache quant rule matched key '{key}' but has no type"
+                    )
+                if rtype not in quant_type_to_dtype:
+                    raise NotImplementedError(
+                        f"Unsupported kv_cache quant type: {rtype}"
+                    )
+                dtype = quant_type_to_dtype[rtype]
+                if dtype is not None:
+                    dtype_dict[key] = dtype
+                matched_types.append(rtype)
+                break
+    matched_types = list(dict.fromkeys(matched_types))
+    if len(matched_types) > 1:
+        raise ValueError(
+            f"kv_cache quant rules matched multiple quant types {matched_types} "
+            f"for keys {kv_keys}. Please split them into separate cache specs."
+        )
+    quant_type = matched_types[0] if matched_types else None
     out = dict(kvargs)
-    out["dtype_dict"] = dtype_dict
-    out["quant_type"] = quant_type
+    if dtype_dict:
+        out["dtype_dict"] = dtype_dict
+    if quant_type is not None:
+        out["quant_type"] = quant_type
     return out

@@ -184,6 +184,7 @@ class KVCacheQuantType(Enum):
     NONE = "None"
     FP8_PERTENSOR = "fp8_pertensor"
     FP8_PERTOKEN_DSA = "fp8_pertoken_dsa"
+    FP8_PERTOKEN_INDEXER = "fp8_pertoken_indexer"
 
     @property
     def needs_kv_scales(self) -> bool:

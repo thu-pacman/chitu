@@ -73,16 +73,31 @@ class HunyuanAttnBackend(AttnBackend):
             "Hunyuan attn only supports head group size in "
             f"{sorted(self.SUPPORTED_HEAD_GROUP_SIZES)}, got {self.head_group_size}"
         )
+        # Import lazily to avoid an import cycle during module initialization:
+        # attn_backend -> hunyuan_attn_backend -> kv_cache.registry -> chitu.models
+        # -> model modules -> attn_backend.
+        from chitu.kv_cache.registry import kv_cache_quant_type_for_key
+
         quant_config = getattr(self.args.models, "quant_config", None)
-        kv_cache_cfg = getattr(quant_config, "kv_cache", None) if quant_config else None
-        kv_quant_type = getattr(kv_cache_cfg, "type", None)
-        if kv_quant_type not in {None, "fp8_pertensor"}:
+        k_quant_type = kv_cache_quant_type_for_key(quant_config, "k")
+        v_quant_type = kv_cache_quant_type_for_key(quant_config, "v")
+        if k_quant_type not in {None, "fp8_pertensor"}:
             raise NotImplementedError(
-                "Hunyuan backend only supports kv_cache quant type None/fp8_pertensor, "
-                f"but got {kv_quant_type!r}."
+                "Hunyuan backend only supports kv_cache quant type None/fp8_pertensor for k, "
+                f"but got {k_quant_type!r}."
+            )
+        if v_quant_type not in {None, "fp8_pertensor"}:
+            raise NotImplementedError(
+                "Hunyuan backend only supports kv_cache quant type None/fp8_pertensor for v, "
+                f"but got {v_quant_type!r}."
+            )
+        if k_quant_type != v_quant_type:
+            raise NotImplementedError(
+                "Hunyuan backend requires k and v to use the same kv_cache quant type, "
+                f"but got k={k_quant_type!r}, v={v_quant_type!r}."
             )
         fp16_variant = getattr(self.args, "float_16bit_variant", None)
-        if kv_quant_type is None and fp16_variant != "bfloat16":
+        if k_quant_type is None and fp16_variant != "bfloat16":
             raise NotImplementedError(
                 "Hunyuan bf16 path requires `float_16bit_variant=bfloat16` when kv cache is not fp8."
             )

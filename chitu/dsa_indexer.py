@@ -56,19 +56,42 @@ support_indexer_hygon = (
 HYGON_INDEXER_MAX_MTP_SIZE = 5
 
 
+def use_fp8_dsa_indexer_kv(args) -> bool:
+    # Import lazily to avoid an import cycle during module initialization:
+    # kv_cache.registry -> chitu.models -> model_deepseek_v3 -> dsa_indexer.
+    from chitu.kv_cache.registry import kv_cache_quant_type_for_key
+
+    quant_cfg = getattr(args.models, "quant_config", None)
+    indexer_kv_quant_type = kv_cache_quant_type_for_key(quant_cfg, "indexer_k")
+    if indexer_kv_quant_type not in (None, "fp8_pertoken_indexer"):
+        raise ValueError(
+            f"DSA indexer KV cache only supports no quantization or fp8_pertoken_indexer, got {indexer_kv_quant_type}"
+        )
+    return indexer_kv_quant_type == "fp8_pertoken_indexer"
+
+
 def validate_indexer_config(args, indexer_type):
     if args.models.get("index_topk", None) is None:
         return
-    if indexer_type == "deepgemm":
-        _validate_deepgemm_indexer_config(args)
-    elif indexer_type == "hygon":
-        _validate_hygon_indexer_config(args)
-    elif indexer_type == "torch_bf16":
-        _validate_torch_bf16_indexer_config(args)
-    elif indexer_type == "triton":
-        pass
+
+    if use_fp8_dsa_indexer_kv(args):
+        if indexer_type == "deepgemm":
+            _validate_deepgemm_indexer_config(args)
+        elif indexer_type in ("triton", "torch"):
+            pass
+        else:
+            raise ValueError(
+                f"Unrecognized indexer_type {indexer_type} for FP8 indexer KV quantization."
+            )
     else:
-        raise ValueError(f"Unrecognized indexer_type {indexer_type}")
+        if indexer_type == "hygon":
+            _validate_hygon_indexer_config(args)
+        elif indexer_type == "torch_bf16":
+            _validate_torch_bf16_indexer_config(args)
+        else:
+            raise ValueError(
+                f"Unrecognized indexer_type {indexer_type} for BF16 indexer KV quantization."
+            )
 
 
 def _validate_deepgemm_indexer_config(args):
@@ -204,6 +227,7 @@ class DSAIndexer:
         seq_len_delta: BatchedSeqLenDelta,
         causal: bool,
         ke: Optional[torch.Tensor] = None,  # [s_q], int32, pre-computed ke for CP
+        q_seq_ids: Optional[torch.Tensor] = None,  # [s_q], CP-local seq ids
     ):
         """
         Indexer score by Hygon lightop.op.mqa_logits() for ragged qk in prefill stage.
@@ -235,19 +259,35 @@ class DSAIndexer:
                     + ks
                 )
 
+        # LightOp's 128-row ASM path launches full query tiles, but its Q,
+        # weight, and range-metadata loads do not mask a partial last tile.
+        # Pad every row-indexed input to the launch shape, then discard the
+        # dummy output rows below.
+        kernel_s_q = s_q
+        if s_q >= 128 and s_q % 128 != 0:
+            kernel_s_q = (s_q + 127) // 128 * 128
+            pad_rows = kernel_s_q - s_q
+            q = torch.cat((q, q.new_zeros((pad_rows, h, q.shape[2]))), dim=0)
+            weights = torch.cat((weights, weights.new_zeros((pad_rows, h))), dim=0)
+            ks = torch.cat((ks, ks.new_zeros((pad_rows,))), dim=0)
+            ke = torch.cat((ke, ke.new_zeros((pad_rows,))), dim=0)
+
         index_score = lightop.op.mqa_logits(
             q,
             k,
             weights,
             ks,
             ke,
-            s_q,
+            kernel_s_q,
             k.shape[0],
             h,
             q.shape[2],
             None,
             True,
         )
+
+        if kernel_s_q != s_q:
+            index_score = index_score.narrow(0, 0, s_q)
 
         # This kernel stores the output in a (ragged_q * ragged_k) layout, we need to
         # convert it back to (ragged_q * local_k), so the following `topk` can be correct.
@@ -260,12 +300,15 @@ class DSAIndexer:
             dtype=index_score.dtype,
             device=index_score.device,
         )
+        row_seq_ids = (
+            q_seq_ids
+            if q_seq_ids is not None
+            else seq_len_delta.delta_seq_ids_tensor_device
+        )
         for seq_id, (row_start, seq_len) in enumerate(
             zip(seq_len_delta.new.prefix_lens_list, seq_len_delta.new.lens_list)
         ):
-            rows = torch.nonzero(
-                seq_len_delta.delta_seq_ids_tensor_device == seq_id, as_tuple=True
-            )[0]
+            rows = torch.nonzero(row_seq_ids == seq_id, as_tuple=True)[0]
             local_width = min(seq_len, seq_len_delta.new.max_len)
             if rows.numel() and local_width:
                 out[rows, :local_width] = index_score[
@@ -370,7 +413,7 @@ class DSAIndexer:
             )
 
         # reshape as batch view
-        q = q.view(batch_size, next_n, h, d)
+        q = q.contiguous().view(batch_size, next_n, h, d)
 
         weights = weights.reshape(s_q, h)
         assert k.dim() == 3
@@ -556,7 +599,7 @@ class DSAIndexer:
 
         return index_score
 
-    def blockfp8_index_score_dsa_triton(
+    def blockfp8_index_score_dsa_torch_or_triton(
         self,
         q_fp8,
         k_fp8,
@@ -641,6 +684,7 @@ class DSAIndexer:
         is_causal=True,
         ke: Optional[torch.Tensor] = None,
         k_append: Optional[torch.Tensor] = None,
+        q_seq_ids: Optional[torch.Tensor] = None,
         skip_prefill_score: bool = False,
     ):
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
@@ -689,6 +733,7 @@ class DSAIndexer:
                 seq_len_delta,
                 is_causal,
                 ke=ke,
+                q_seq_ids=q_seq_ids,
             )
 
         return index_score
@@ -754,6 +799,7 @@ class DSAIndexer:
         ke: Optional[torch.Tensor] = None,
         k_append: Optional[torch.Tensor] = None,
         ks: Optional[torch.Tensor] = None,
+        q_seq_ids: Optional[torch.Tensor] = None,
     ):
         if q_fp8.numel() == 0:
             return torch.randn(0, self.static_max_n)
@@ -787,6 +833,7 @@ class DSAIndexer:
                 is_causal,
                 ke=ke,
                 k_append=k_append,
+                q_seq_ids=q_seq_ids,
                 skip_prefill_score=select_all_prefill_keys,
             )
         elif self.impl == "torch_bf16":
@@ -799,8 +846,8 @@ class DSAIndexer:
                 is_causal,
                 skip_prefill_score=select_all_prefill_keys,
             )
-        else:  # triton and torch impl share a same kv layout
-            logits = self.blockfp8_index_score_dsa_triton(
+        else:  # triton and torch impl share the same kv layout
+            logits = self.blockfp8_index_score_dsa_torch_or_triton(
                 q_fp8,
                 k_fp8,
                 k_scale,

@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -10,15 +11,24 @@ import torch
 import chitu.dsa_indexer as dsa_indexer_module
 from chitu.dsa_indexer import DSAIndexer
 from chitu.kv_cache import DenseKVCacheAccessor, PagedKVCacheAccessor
+from chitu.kv_cache.providers.deepseek_v3 import (
+    deepseek_v3_indexer_cache_spec,
+    deepseek_v3_kv_cache_spec,
+)
 
 
 BACKEND_METHODS = [
     ("deepgemm", "blockfp8_index_score_dsa_deepgemm"),
     ("hygon", "bf16_index_score_dsa_hygon"),
     ("torch_bf16", "bf16_index_score_dsa_torch_bf16"),
-    ("triton", "blockfp8_index_score_dsa_triton"),
-    ("torch", "blockfp8_index_score_dsa_triton"),
+    ("triton", "blockfp8_index_score_dsa_torch_or_triton"),
+    ("torch", "blockfp8_index_score_dsa_torch_or_triton"),
 ]
+
+
+class AttrNamespace(SimpleNamespace):
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 
 def _indexer_without_runtime_init(impl: str) -> DSAIndexer:
@@ -117,7 +127,7 @@ def test_decode_or_long_prefill_keeps_topk_path(monkeypatch, is_decode_stage, ma
         calls.append(skip_prefill_score)
         return logits
 
-    monkeypatch.setattr(indexer, "blockfp8_index_score_dsa_triton", fake_score)
+    monkeypatch.setattr(indexer, "blockfp8_index_score_dsa_torch_or_triton", fake_score)
     monkeypatch.setattr(
         dsa_indexer_module,
         "topk_indices",
@@ -138,6 +148,116 @@ def test_decode_or_long_prefill_keeps_topk_path(monkeypatch, is_decode_stage, ma
 
     assert calls == [False]
     assert actual is expected
+
+
+def _dsa_args(
+    *,
+    kv_quant_type=None,
+    main_kv_quant_type=None,
+    indexer_type="torch_bf16",
+):
+    kv_cache_rules = []
+    if kv_quant_type is not None:
+        kv_cache_rules.append(SimpleNamespace(regex="^indexer_k$", type=kv_quant_type))
+    if main_kv_quant_type is not None:
+        kv_cache_rules.append(
+            SimpleNamespace(regex="^(kv_lora|k_pe)$", type=main_kv_quant_type)
+        )
+    return SimpleNamespace(
+        models=AttrNamespace(
+            index_topk=2048,
+            index_head_dim=128,
+            index_n_heads=32,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            quant_config=SimpleNamespace(
+                kv_cache=SimpleNamespace(rules=kv_cache_rules)
+            ),
+        ),
+        infer=SimpleNamespace(
+            indexer_type=indexer_type,
+            cache_type="paged",
+            mtp_size=1,
+            mla_absorb="absorb",
+            tp_size=1,
+        ),
+    )
+
+
+@pytest.mark.parametrize("indexer_type", ["hygon", "torch_bf16"])
+def test_bf16_indexer_types_require_unquantized_dsa_indexer_kv(indexer_type):
+    args = _dsa_args(kv_quant_type="fp8_pertoken_indexer")
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            f"Unrecognized indexer_type {indexer_type} for FP8 indexer KV quantization."
+        ),
+    ):
+        dsa_indexer_module.validate_indexer_config(args, indexer_type)
+
+
+@pytest.mark.parametrize("indexer_type", ["deepgemm", "triton", "torch"])
+def test_fp8_indexer_types_require_fp8_dsa_indexer_kv(indexer_type):
+    args = _dsa_args()
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            f"Unrecognized indexer_type {indexer_type} for BF16 indexer KV quantization."
+        ),
+    ):
+        dsa_indexer_module.validate_indexer_config(args, indexer_type)
+
+
+@pytest.mark.parametrize(
+    ("indexer_type", "expected_keys", "expected_dtypes"),
+    [
+        (
+            "deepgemm",
+            {"indexer_k_ks"},
+            {"indexer_k_ks": torch.float8_e4m3fn},
+        ),
+        (
+            "triton",
+            {"indexer_k", "indexer_ks"},
+            {"indexer_k": torch.float8_e4m3fn, "indexer_ks": torch.float32},
+        ),
+        (
+            "torch",
+            {"indexer_k", "indexer_ks"},
+            {"indexer_k": torch.float8_e4m3fn, "indexer_ks": torch.float32},
+        ),
+    ],
+)
+def test_fp8_dsa_indexer_cache_layouts_follow_indexer_type(
+    indexer_type, expected_keys, expected_dtypes
+):
+    spec = deepseek_v3_indexer_cache_spec(
+        _dsa_args(kv_quant_type="fp8_pertoken_indexer", indexer_type=indexer_type),
+        None,
+    )
+
+    assert set(spec.kvargs["shape_per_token_dict"]) == expected_keys
+    assert spec.kvargs["dtype_dict"] == expected_dtypes
+    assert spec.kvargs["quant_type"] == "fp8_pertoken_indexer"
+
+
+def test_unquantized_dsa_indexer_cache_uses_bf16_base_tensor():
+    spec = deepseek_v3_indexer_cache_spec(_dsa_args(indexer_type="torch_bf16"), None)
+
+    assert spec.kvargs["shape_per_token_dict"] == {"indexer_k": (128,)}
+    assert spec.kvargs["dtype_dict"] == {"indexer_k": torch.bfloat16}
+
+
+def test_fp8_dsa_main_cache_validates_base_tensor_rules_for_packed_layout():
+    spec = deepseek_v3_kv_cache_spec(
+        _dsa_args(main_kv_quant_type="fp8_pertoken_dsa"), None
+    )
+
+    assert spec.kvargs["shape_per_token_dict"] == {"kv_lora_k_pe": (656,)}
+    assert spec.kvargs["dtype_dict"] == {"kv_lora_k_pe": torch.float8_e4m3fn}
+    assert spec.kv_keys == ["kv_lora", "k_pe"]
 
 
 def _paged_accessor(*keys: str) -> PagedKVCacheAccessor:
@@ -209,11 +329,12 @@ def test_bf16_fast_path_appends_cache_without_reading(monkeypatch, impl, method_
     assert appended == [True]
 
 
+@pytest.mark.parametrize("impl", ["triton", "torch"])
 @pytest.mark.parametrize("cache_layout", ["paged", "dense"])
-def test_triton_fast_path_appends_k_and_scale_without_scoring(
-    monkeypatch, cache_layout
+def test_torch_or_triton_fast_path_appends_k_and_scale_without_scoring(
+    monkeypatch, impl, cache_layout
 ):
-    indexer = _indexer_without_runtime_init("triton")
+    indexer = _indexer_without_runtime_init(impl)
     appended = []
     monkeypatch.setattr(
         dsa_indexer_module,
@@ -253,7 +374,7 @@ def test_triton_fast_path_appends_k_and_scale_without_scoring(
             {"indexer_k": torch.empty(1), "indexer_ks": torch.empty(1)}
         )
 
-    result = indexer.blockfp8_index_score_dsa_triton(
+    result = indexer.blockfp8_index_score_dsa_torch_or_triton(
         torch.empty(3, 1),
         torch.empty(3, 1),
         torch.empty(3, 1),

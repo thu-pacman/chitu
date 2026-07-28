@@ -32,7 +32,16 @@ class MonkIndexerImpl:
         self.impl = impl
 
 
-def _make_indexer(n_heads, head_dim, rope_head_dim, impl, rope_layout, device):
+def _make_indexer(
+    n_heads,
+    head_dim,
+    rope_head_dim,
+    impl,
+    rope_layout,
+    device,
+    *,
+    fp8_indexer_kv=False,
+):
     set_global_args(
         OmegaConf.create(
             {
@@ -46,6 +55,20 @@ def _make_indexer(n_heads, head_dim, rope_head_dim, impl, rope_layout, device):
                     "index_topk": 2048,
                     "index_rope_layout": rope_layout,
                     "index_norm_dtype": "float32",
+                    "quant_config": {
+                        "kv_cache": {
+                            "rules": (
+                                [
+                                    {
+                                        "regex": "^indexer_k$",
+                                        "type": "fp8_pertoken_indexer",
+                                    }
+                                ]
+                                if fp8_indexer_kv
+                                else []
+                            )
+                        }
+                    },
                 },
             }
         ),
@@ -83,7 +106,17 @@ def _dequant_blockfp8(x_fp8, scale, block_size=128):
     return dequant.view(x_fp8.shape)
 
 
-def _ref_qk_transform(indexer, q, k, freqs_cis, head_dim, rope_head_dim, rope_layout):
+def _ref_qk_transform(
+    indexer,
+    q,
+    k,
+    freqs_cis,
+    head_dim,
+    rope_head_dim,
+    rope_layout,
+    *,
+    use_hadamard_transform,
+):
     """Reference"""
     q3 = einops.rearrange(q.clone(), "s (h d) -> s h d", d=head_dim)
     k_normed = indexer.k_norm(k.clone())
@@ -96,15 +129,12 @@ def _ref_qk_transform(indexer, q, k, freqs_cis, head_dim, rope_head_dim, rope_la
         rotary_type=rope_layout,
         impl="torch_npu" if has_torch_npu else "auto",
     )
-    q_ref = hadamard_transform(q_rot, scale=head_dim**-0.5)
-    k_ref = hadamard_transform(k_rot, scale=head_dim**-0.5)
-    return q_ref, k_ref
+    if use_hadamard_transform:
+        q_rot = hadamard_transform(q_rot, scale=head_dim**-0.5)
+        k_rot = hadamard_transform(k_rot, scale=head_dim**-0.5)
+    return q_rot, k_rot
 
 
-@pytest.mark.skipif(
-    not has_scipy and not has_fast_hadamard_transform,
-    reason="A Hadamard transform implementation (scipy or fast_hadamard_transform) is required",
-)
 @pytest.mark.parametrize("impl", ["torch_bf16", "hygon"])
 @pytest.mark.parametrize("rope_layout", ["separated", "interleaved"])
 @pytest.mark.parametrize("s", [1, 8])
@@ -130,7 +160,14 @@ def test_build_index_qk_bf16_path(impl, rope_layout, s):
     assert k_out.shape == (s, head_dim)
 
     q_ref, k_ref = _ref_qk_transform(
-        indexer, q, k, freqs_cis, head_dim, rope_head_dim, rope_layout
+        indexer,
+        q,
+        k,
+        freqs_cis,
+        head_dim,
+        rope_head_dim,
+        rope_layout,
+        use_hadamard_transform=False,
     )
 
     assert_close(q_out, q_ref, rtol=1e-2, atol=1e-2)
@@ -151,7 +188,15 @@ def test_build_index_qk_fp8_path(impl, rope_layout, s):
     device = "cuda"
 
     n_heads, head_dim, rope_head_dim = 4, 128, 64
-    indexer = _make_indexer(n_heads, head_dim, rope_head_dim, impl, rope_layout, device)
+    indexer = _make_indexer(
+        n_heads,
+        head_dim,
+        rope_head_dim,
+        impl,
+        rope_layout,
+        device,
+        fp8_indexer_kv=True,
+    )
 
     x = torch.randn(s, n_heads * head_dim, device=device)
     q = torch.randn(s, n_heads * head_dim, device=device)
@@ -172,7 +217,14 @@ def test_build_index_qk_fp8_path(impl, rope_layout, s):
     k_out = _dequant_blockfp8(k_fp8, k_scale, block_size=indexer.block_size)
 
     q_ref, k_ref = _ref_qk_transform(
-        indexer, q, k, freqs_cis, head_dim, rope_head_dim, rope_layout
+        indexer,
+        q,
+        k,
+        freqs_cis,
+        head_dim,
+        rope_head_dim,
+        rope_layout,
+        use_hadamard_transform=True,
     )
 
     assert_close(q_out, q_ref.float(), rtol=5e-2, atol=1e-1, cos_sim_tol=1e-2)

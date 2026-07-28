@@ -9,6 +9,7 @@ from logging import getLogger
 from typing import Optional
 import re
 from tqdm import tqdm
+import math
 
 import torch
 import torch.distributed
@@ -67,11 +68,8 @@ from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
 from chitu.dp_request_router import is_terminate_engine_message, is_profile_message
 from chitu.kv_cache.utils import (
-    plan_kv_cache_blocks_after_warmup,
+    is_reallocable_kv_cache,
     reduce_num_block_plan_across_ranks,
-    estimate_indexer_blocks_from_main,
-    solve_main_target_after_shrink,
-    solve_main_target_from_current,
     get_peak_live_and_target_bytes,
     cleanup_cuda_if_needed,
     allreduce_min_int,
@@ -610,14 +608,23 @@ def _auto_set_num_blocks_after_warmup(args):
         is_pd_decode_role = False
     full_warmup = args.infer.full_warmup
 
-    paged_caches = {}
-    for name, cache in Backend.cache_dict.items():
-        if (
-            hasattr(cache, "realloc")
-            and hasattr(cache, "num_blocks")
-            and hasattr(cache, "max_num_blocks")
-        ):
-            paged_caches[name] = cache
+    # All paged KV caches (including fixed-capacity ones such as
+    # SingletonPagedKVCache / DeepSeek-V4 sliding-window).
+    paged_caches = {
+        name: cache
+        for name, cache in Backend.cache_dict.items()
+        if hasattr(cache, "realloc")
+        and hasattr(cache, "num_blocks")
+        and hasattr(cache, "max_num_blocks")
+    }
+    # Token-scaled caches only: these are sized jointly from one token capacity.
+    # Fixed-capacity caches are excluded (their block count is per-request, not
+    # token-scaled).
+    reallocable_caches = {
+        name: cache
+        for name, cache in paged_caches.items()
+        if is_reallocable_kv_cache(cache)
+    }
 
     if "main" not in paged_caches:
         logger.warning(
@@ -674,7 +681,7 @@ def _auto_set_num_blocks_after_warmup(args):
         )
         effective_cap = cache.get_allocatable_max_num_blocks()
         logger.info(
-            "%s warmup stats before planning: bytes_per_block=%s current_blocks=%s "
+            "%s warmup stats before realloc: bytes_per_block=%s current_blocks=%s "
             "max_num_blocks=%s effective_cap=%s",
             name,
             bytes_per_block,
@@ -690,199 +697,106 @@ def _auto_set_num_blocks_after_warmup(args):
         )
         return
 
-    plan = plan_kv_cache_blocks_after_warmup(args, paged_caches)
-    plan = reduce_num_block_plan_across_ranks(plan)
-    logger.info("KV cache reduced pre-plan after warmup: %s", plan)
-
-    # shrink non-main managers first
-    for name, cm in paged_caches.items():
-        if name == "main":
-            continue
-
-        current_blocks = int(cm.num_blocks)
-        target_blocks = int(plan.get(name, current_blocks))
-        target_blocks = clamp_int(target_blocks, 1, cm.get_allocatable_max_num_blocks())
-
-        if target_blocks < current_blocks:
-            cm.realloc(int(target_blocks))
-            logger.info(
-                "%s cache manager shrunk to %d blocks before joint solve",
-                name,
-                int(target_blocks),
-            )
-
-    cleanup_cuda_if_needed()
-
-    main_cm = paged_caches["main"]
-    indexer_cm = paged_caches.get("indexer")
-
-    main_current = int(main_cm.num_blocks)
-    main_cap = main_cm.get_allocatable_max_num_blocks()
     reserve_bytes = 512 << 20  # 512 MiB
-    min_decode_blocks = 1
-    if is_pd_decode_role:
-        min_decode_blocks = int(
-            getattr(main_cm, "max_blocks_per_req", 0)
-            or ceil_div(int(args.infer.max_seq_len), int(main_cm.block_size))
-        )
-        min_decode_blocks = clamp_int(min_decode_blocks, 1, int(main_cap))
 
-    if indexer_cm is not None:
-        solved_main = solve_main_target_after_shrink(
-            args=args,
-            main_cm=main_cm,
-            indexer_cm=indexer_cm,
+    # ---- live-memory budget observed during warmup ----
+    live_bytes, target_budget_bytes, allocator_debug_bytes = (
+        get_peak_live_and_target_bytes(
+            memory_utilization=args.infer.memory_utilization,
             reserve_bytes=reserve_bytes,
         )
+    )
 
-        solved_main = allreduce_min_int(int(solved_main))
-        solved_main = clamp_int(int(solved_main), 1, int(main_cap))
+    current_reallocable_kv_bytes = sum(
+        int(cache.num_blocks) * int(cache.estimate_bytes_per_block())
+        for cache in reallocable_caches.values()
+    )  # current footprint of token-scaled (reallocable) KV caches
+    # baseline = everything except the reallocable KV caches (weights + activation
+    # peak + fixed-capacity caches + others).
+    baseline_bytes = max(0, int(live_bytes) - int(current_reallocable_kv_bytes))
+    allowed_bytes = max(0, int(target_budget_bytes) - int(baseline_bytes))
 
-        final_indexer_target = estimate_indexer_blocks_from_main(
-            main_cm, indexer_cm, int(solved_main)
-        )
-        final_indexer_target = clamp_int(
-            final_indexer_target,
-            1,
-            indexer_cm.get_allocatable_max_num_blocks(),
-        )
-        final_indexer_target = allreduce_min_int(int(final_indexer_target))
+    total_paged_bpt = 0  # sum of per-token bytes over all reallocable caches
+    block_sizes = set()  # block_size values of reallocable caches
+    cap_tokens = math.inf
+    for cache_name, cache in reallocable_caches.items():
+        block_sz = cache.block_size
+        block_sizes.add(block_sz)
+        bytes_per_block = int(cache.estimate_bytes_per_block())
+        bytes_per_token = bytes_per_block / block_sz
+        total_paged_bpt += bytes_per_token
+        cap_tokens = min(cap_tokens, cache.get_allocatable_max_num_blocks() * block_sz)
 
-        final_main_target = int(solved_main)
+    # 可重分配的KVCache应该被realloc相同的token容量
+    max_tokens = int(allowed_bytes / total_paged_bpt)  # floor, never ceil
 
-        logger.info(
-            "KV final joint targets: main_current=%d final_main_target=%d "
-            "final_indexer_target=%d reserve_bytes=%d",
-            int(main_current),
-            int(final_main_target),
-            int(final_indexer_target),
-            int(reserve_bytes),
-        )
-    else:
-        final_main_target = solve_main_target_from_current(
-            args=args,
-            main_cm=main_cm,
-            reserve_bytes=reserve_bytes,
-        )
-        final_main_target = allreduce_min_int(int(final_main_target))
-        final_main_target = clamp_int(int(final_main_target), 1, int(main_cap))
-        final_indexer_target = None
+    # align down to lcm(block_sizes)
+    block_lcm = math.lcm(*block_sizes)
+    max_tokens = (max_tokens // block_lcm) * block_lcm
 
-    if is_pd_decode_role and int(final_main_target) < int(min_decode_blocks):
+    # never exceed any group's allocatable capacity
+    max_tokens = min(max_tokens, (cap_tokens // block_lcm) * block_lcm)
+
+    # all ranks must agree; each rank already aligned to block_lcm so min stays aligned
+    max_tokens = allreduce_min_int(int(max_tokens))
+
+    # hard floor: a single max_seq_len request must fit; otherwise fail
+    floor_tokens = int(args.infer.max_seq_len)
+    if int(max_tokens) < floor_tokens:
         logger.warning(
-            "PD decode-role warmup solve requested %d main KV blocks, but at least "
-            "%d are required to hold one max_seq_len request; clamping upward",
-            int(final_main_target),
-            int(min_decode_blocks),
+            f"KV cache token capacity {int(max_tokens)} < max_seq_len {floor_tokens}: "
+            f"insufficient GPU memory to hold a single max-length request "
+            f"(role={getattr(args.multi_inst, 'role', None)}, "
+            f"target_budget={int(target_budget_bytes)}, baseline={int(baseline_bytes)}). "
+            f"Reduce max_seq_len, raise memory_utilization, or add GPUs."
         )
-        final_main_target = int(min_decode_blocks)
 
-    # If main needs shrink, do it early to release memory before any later growth.
-    main_current = int(main_cm.num_blocks)
-    if int(final_main_target) < int(main_current):
-        main_cm.realloc(int(final_main_target))
-        logger.info(
-            "main cache manager pre-shrunk from %d to %d blocks before final placement",
-            int(main_current),
-            int(final_main_target),
-        )
-        cleanup_cuda_if_needed()
-
-    # Place indexer to the final target if present. Allow both shrink and grow.
-    if indexer_cm is not None:
-        indexer_current = int(indexer_cm.num_blocks)
-        final_indexer_target = clamp_int(
-            final_indexer_target,
-            1,
-            indexer_cm.get_allocatable_max_num_blocks(),
-        )
-        if int(final_indexer_target) != int(indexer_current):
-            indexer_cm.realloc(int(final_indexer_target))
+    # Shrink first, then grow, to release memory before any later growth and
+    # avoid a transient peak that could OOM.
+    for name, cache in reallocable_caches.items():
+        target_blocks = max_tokens // cache.block_size
+        if target_blocks < cache.num_blocks:
+            cache.realloc(target_blocks)
             logger.info(
-                "indexer cache manager resized from %d to %d blocks before main safe solve",
-                int(indexer_current),
-                int(final_indexer_target),
+                "%s cache resized down to %d blocks after warmup", name, target_blocks
             )
             cleanup_cuda_if_needed()
 
-    # Recheck main safe target from current memory after indexer is in place
-    main_current = int(main_cm.num_blocks)
-    safe_main_target = solve_main_target_from_current(
-        args=args,
-        main_cm=main_cm,
-        reserve_bytes=reserve_bytes,
-    )
-    safe_main_target = min(int(safe_main_target), int(final_main_target))
-    safe_main_target = clamp_int(
-        safe_main_target,
-        1,
-        main_cm.get_allocatable_max_num_blocks(),
-    )
-    safe_main_target = allreduce_min_int(int(safe_main_target))
-    if is_pd_decode_role and int(safe_main_target) < int(min_decode_blocks):
-        logger.warning(
-            "PD decode-role safe main KV target %d is smaller than the one-request "
-            "floor %d; clamping upward",
-            int(safe_main_target),
-            int(min_decode_blocks),
-        )
-        safe_main_target = int(min_decode_blocks)
+    for name, cache in reallocable_caches.items():
+        target_blocks = max_tokens // cache.block_size
+        if target_blocks > cache.num_blocks:
+            cache.realloc(target_blocks)
+            logger.info(
+                "%s cache resized up to %d blocks after warmup", name, target_blocks
+            )
+            cleanup_cuda_if_needed()
 
-    logger.info(
-        "KV safe main target before final resize: current=%d final_main_target=%d safe_main_target=%d",
-        int(main_current),
-        int(final_main_target),
-        int(safe_main_target),
+    get_global_args().infer.num_blocks = (
+        max_tokens // Backend.cache_dict["main"].block_size
     )
 
-    # Final resize main
-    main_current = int(main_cm.num_blocks)
-    if int(safe_main_target) != int(main_current):
-        main_cm.realloc(int(safe_main_target))
-        logger.info(
-            "main cache manager resized from %d to %d blocks after warmup",
-            int(main_current),
-            int(safe_main_target),
-        )
-    else:
-        logger.info(
-            "main cache manager keeps %d blocks after warmup",
-            int(main_current),
-        )
-
-    cleanup_cuda_if_needed()
-
-    final_main_blocks = int(main_cm.num_blocks)
-    final_main_blocks = allreduce_min_int(int(final_main_blocks))
-    get_global_args().infer.num_blocks = int(final_main_blocks)
-
+    # reallocate blocks for cache managers (skip fixed-capacity managers, whose
+    # block count is per-request rather than token-scaled).
     if Backend.cache_managers:
-        for dp_rank, dp_rank_managers in enumerate(Backend.cache_managers):
-            for name, cache in paged_caches.items():
-                manager = dp_rank_managers.get(name)
-                if manager is None:
+        for dp_rank, manager_dict in enumerate(Backend.cache_managers):
+            for name, manager in manager_dict.items():
+                if type(manager).__name__ == "SingletonPagedKVCacheManager" or bool(
+                    getattr(manager, "fixed_num_blocks", False)
+                ):
                     continue
-
-                final_blocks = int(cache.num_blocks)
-                mgr_current = int(manager.num_blocks)
-                if int(final_blocks) != int(mgr_current):
-                    manager.realloc(int(final_blocks))
+                target_blocks = max_tokens // manager.block_size
+                if target_blocks != manager.num_blocks:
+                    manager.realloc(target_blocks)
                     logger.info(
                         "scheduler dp_rank=%d %s cache manager synced to %d blocks after warmup",
                         dp_rank,
                         name,
-                        int(final_blocks),
+                        target_blocks,
                     )
 
-    # finalize other non-main managers
-    for name, cm in paged_caches.items():
-        if name == "main":
-            continue
-
+    for name, cache in reallocable_caches.items():
         logger.info(
-            "%s cache keeps %d blocks after warmup",
-            name,
-            int(cm.num_blocks),
+            "%s cache keeps %d blocks after warmup", name, int(cache.num_blocks)
         )
 
     if torch.distributed.get_rank() == 0:
