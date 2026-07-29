@@ -1194,7 +1194,7 @@ def warmup_engine(args):
             ):
                 local_max_bs = ceil_div(max_reqs_per_dp, args.infer.pp_size)
             else:
-                local_max_bs = args.scheduler.pp_config.pp_micro_batch_size_decode
+                local_max_bs = int(args.scheduler.pp_config.pp_micro_batch_size_decode)
         else:
             local_max_bs = max_reqs_per_dp
         _warmup_backend_direct(

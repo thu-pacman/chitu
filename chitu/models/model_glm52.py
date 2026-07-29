@@ -301,7 +301,7 @@ class TransformerBlockGLM52(TransformerBlock):
             op_impl=op_impl,
             mla_absorb=mla_absorb,
             checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
-            indexer_cache=cache_dict["indexer"],
+            indexer_cache=cache_dict.get("indexer"),
             indexer_impl=indexer_impl,
             indexer_role=indexer_role,
             indexer_buffer=indexer_buffer,

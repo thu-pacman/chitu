@@ -16,6 +16,7 @@ from chitu.device_type import get_device_name
 from chitu.global_vars import get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.ops import append_to_dense_kv_cache, append_to_paged_kv_cache
+from chitu.ops.page_table import topk_ids_to_page_ids
 from chitu.utils import try_import_and_setup_torch_npu, try_import_opt_dep
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -918,20 +919,11 @@ class NpuAttnBackend(RefAttnBackend):
             )
 
         idx = topk_indices.to(torch.long)  # [bsz, topk]
-        # Token-level index -> (block_id, offset_in_block).
-        block_id_local = idx.clamp(min=0) // block_size  # [bsz, topk]
-        offs_in_block = idx.clamp(min=0) % block_size  # [bsz, topk]
-
-        # maskout invilia index: -1 or beyond seq_len
-        seq_lens = seq_len_delta.new.lens_tensor_device.to(torch.long)  # [bsz]
-        invalid_mask = (idx < 0) | (idx >= seq_lens.unsqueeze(1))  # [bsz,topk]
-        max_blocks = kv_cache.block_table.shape[1]
-        block_id_local = block_id_local.clamp(min=0, max=max(max_blocks - 1, 0))
-
-        # Translate per-seq local block id to physical page id.
-        page_id = kv_cache.block_table.to(torch.long).gather(
-            1, block_id_local
-        )  # [bsz,tok_k]
+        page_id, offs_in_block = topk_ids_to_page_ids(
+            idx,
+            kv_cache.block_table.to(torch.long),
+            ids_per_page=block_size,
+        )
 
         # [n_pages, block_size, kv_lora_rank] -> [n_pages*block_size, kv_lora_rank]
         # [n_pages, block_size, qk_rope_head_dim] -> [n_pages*block_size, qk_rope_head_dim]

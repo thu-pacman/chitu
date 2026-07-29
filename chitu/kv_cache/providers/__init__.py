@@ -7,4 +7,5 @@ def register_all_providers():
     from . import default  # noqa: F401
     from . import deepseek_v3  # noqa: F401
     from . import deepseek_v4  # noqa: F401
+    from . import minimax_m3  # noqa: F401
     from . import qwen  # noqa: F401

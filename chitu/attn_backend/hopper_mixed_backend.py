@@ -11,6 +11,7 @@ from chitu.attn_backend.flash_attn_backend import FlashAttnBackend
 from chitu.attn_backend.flash_mla_backend import FlashMLABackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import PagedKVCacheAccessor
+from chitu.ops.page_table import topk_ids_to_page_ids
 from chitu.utils import try_import_opt_dep
 
 flash_attn3, has_flash_attn3 = try_import_opt_dep(
@@ -64,8 +65,6 @@ class HopperMixedBackend(FlashMLABackend):
         upper_bounds = position_ids_per_seq + 1  # [bsz]
 
         max_blocks_per_seq = block_table.size(1)
-        if max_blocks_per_seq <= 0:
-            raise ValueError("block_table has zero width")
 
         # Need both semantic validity and physical table-bound validity.
         valid_mask = (
@@ -74,12 +73,11 @@ class HopperMixedBackend(FlashMLABackend):
             & (topk_indices_per_seq < max_blocks_per_seq)
         )
 
-        # Clamp to the valid gather range so gather itself never OOBs.
-        safe_indices = topk_indices_per_seq.clamp(min=0, max=max_blocks_per_seq - 1).to(
-            torch.long
+        sparse_page_ids, _ = topk_ids_to_page_ids(
+            topk_indices_per_seq,
+            block_table,
+            ids_per_page=1,
         )
-
-        sparse_page_ids = block_table.gather(1, safe_indices)
 
         # FA3 reads the first cache_seqlens[i] entries per row, so valid
         # pages must be packed to the front via argsort.

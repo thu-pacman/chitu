@@ -60,8 +60,8 @@ def deepseek_v3_indexer_cache_spec(args, attn_backend_type) -> KVCacheSpec:
     index_head_dim = int(args.models.index_head_dim)
     fp8_indexer_kv = _uses_fp8_pertoken_indexer(args.models)
 
-    # BF16 indexer-kv layout keeps only K. Used by indexer_type=hygon and
-    # indexer_type=torch_bf16.
+    # BF16 indexer-kv layout keeps only K. Selected whenever the indexer KV is
+    # not fp8-quantized (indexer_type=hygon, torch_bf16, or triton_bf16).
     if not fp8_indexer_kv:
         return KVCacheSpec(
             block_size=64,

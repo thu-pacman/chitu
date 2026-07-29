@@ -246,9 +246,32 @@ def build_mtp_cache(args):
     )
 
 
-def _build_indexer_cache(args):
+def _build_indexer_layer_id_map(args, *, layer_filter_fn=lambda x: x) -> GlobalLocalMap:
+    """Map only layers that own indexer state for GLM-5.2."""
+    if _normalize_model_type(getattr(args.models, "type", None)) != ModelType.GLM_5_2:
+        return build_layer_id_map(args, layer_filter_fn=layer_filter_fn)
+
+    n_layers = int(args.models.n_layers)
+    indexer_types = args.models.indexer_types
+
+    def local_indexer_layers(layers: Iterable[int]) -> Iterable[int]:
+        # GLM-5.2 shared layers consume their preceding full layer's top-k and
+        # never touch indexer KV. Keep the synthetic MTP layer (n_layers): it
+        # owns a full indexer and its global id is required for PP-local lookup.
+        return [
+            layer_id
+            for layer_id in layer_filter_fn(layers)
+            if layer_id == n_layers or indexer_types[layer_id] == "full"
+        ]
+
+    return build_layer_id_map(args, layer_filter_fn=local_indexer_layers)
+
+
+def _build_indexer_cache(args, *, layer_filter_fn=lambda x: x):
     device = torch.device("cpu" if args.infer.op_impl == "cpu" else "cuda")
-    layer_id_map = build_layer_id_map(args)
+    layer_id_map = _build_indexer_layer_id_map(args, layer_filter_fn=layer_filter_fn)
+    if layer_id_map.size() == 0:
+        return None
 
     spec = get_kv_cache_spec(args, None, cache_name="indexer")
     if spec is None:
@@ -287,6 +310,48 @@ def _build_indexer_cache(args):
         )
 
     raise ValueError(f"Unknown cache type {args.infer.cache_type} for Indexer")
+
+
+def _attach_indexer_cache_managers(
+    args,
+    main_cache,
+    main_managers,
+    cache_dict: dict,
+    indexer,
+) -> None:
+    if indexer is None:
+        return
+
+    cache_dict["indexer"] = indexer
+
+    if (
+        args.infer.cache_type == "paged"
+        and isinstance(main_cache, PagedKVCache)
+        and isinstance(indexer, PagedKVCache)
+    ):
+        use_indexer_manager = indexer.block_size != main_cache.block_size
+        indexer.manager_name = "indexer" if use_indexer_manager else "main"
+        if use_indexer_manager and main_managers is not None:
+            for dp_rank, cache_manager_dict in enumerate(main_managers):
+                cache_manager_dict["indexer"] = PagedKVCacheManager(
+                    indexer.num_blocks,
+                    num_hot_req=ceil_div(args.infer.max_batch_size, args.infer.dp_size),
+                    max_seq_len=args.infer.max_seq_len,
+                    dp_rank=dp_rank,
+                    mtp_size=args.infer.mtp_size,
+                    enable_prefix_caching=args.infer.enable_prefix_caching,
+                    block_size=indexer.block_size,
+                    manager_name="indexer",
+                )
+
+    if (
+        isinstance(main_cache, PagedKVCache)
+        and isinstance(indexer, PagedKVCache)
+        and indexer.block_size == main_cache.block_size
+    ):
+        assert (
+            indexer.num_blocks == main_cache.num_blocks
+        ), f"{indexer.num_blocks} vs {main_cache.num_blocks}"
 
 
 def _build_multimodal_cache(
@@ -482,34 +547,35 @@ def _build_deepseek_v3_with_indexer_cache_managers(
     cache_dict = {"main": main_cache}
 
     indexer = _build_indexer_cache(args)
-    if indexer is not None:
-        if (
-            args.infer.cache_type == "paged"
-            and isinstance(main_cache, PagedKVCache)
-            and isinstance(indexer, PagedKVCache)
-        ):
-            use_indexer_manager = indexer.block_size != main_cache.block_size
-            indexer.manager_name = "indexer" if use_indexer_manager else "main"
-            if use_indexer_manager and main_managers is not None:
-                for dp_rank, cache_manager_dict in enumerate(main_managers):
-                    cache_manager_dict["indexer"] = PagedKVCacheManager(
-                        indexer.num_blocks,
-                        num_hot_req=ceil_div(
-                            args.infer.max_batch_size, args.infer.dp_size
-                        ),
-                        max_seq_len=args.infer.max_seq_len,
-                        dp_rank=dp_rank,
-                        mtp_size=args.infer.mtp_size,
-                        enable_prefix_caching=args.infer.enable_prefix_caching,
-                        block_size=indexer.block_size,
-                        manager_name="indexer",
-                    )
-        cache_dict["indexer"] = indexer
+    _attach_indexer_cache_managers(args, main_cache, main_managers, cache_dict, indexer)
 
-    if indexer.block_size == main_cache.block_size:
-        assert (
-            indexer.num_blocks == main_cache.num_blocks
-        ), f"{indexer.num_blocks} vs {main_cache.num_blocks}"
+    return CacheBuildBundle(
+        cache_type=args.infer.cache_type,
+        cache_dict=cache_dict,
+        cache_managers=main_managers,
+    )
+
+
+@register_cache_manager_builder(
+    predicate=lambda args: (
+        _normalize_model_type(getattr(args.models, "type", None))
+        == ModelType.MINIMAX_M3_VL
+        and getattr(args.models, "index_head_dim", None)
+    ),
+    priority=1,
+)
+def _build_minimax_m3_with_indexer_cache_managers(
+    args, attn_backend_type
+) -> CacheBuildBundle:
+    from chitu.kv_cache.providers.minimax_m3 import minimax_m3_indexer_layer_filter
+
+    main_cache, main_managers = _build_main_cache_bundle(args, attn_backend_type)
+    cache_dict = {"main": main_cache}
+
+    indexer = _build_indexer_cache(
+        args, layer_filter_fn=minimax_m3_indexer_layer_filter(args)
+    )
+    _attach_indexer_cache_managers(args, main_cache, main_managers, cache_dict, indexer)
 
     return CacheBuildBundle(
         cache_type=args.infer.cache_type,

@@ -74,7 +74,7 @@ def _(
         assert block_shape[0] == block_shape[1]
         activation_fp8, activation_scale = blockfp8_act_quant(
             hidden_states.activation,
-            block_size=block_shape[0],
+            scale_block_shape=block_shape,
             round_scale_to_pow2=round_scale_to_pow2,
         )
         return deepgemm_masked_fused_expert(
@@ -250,7 +250,7 @@ def _(
         else:
             hidden_states_fp8, a1_scale = blockfp8_act_quant(
                 hidden_states.activation_per_expert,
-                block_size=block_shape[0],
+                scale_block_shape=block_shape,
                 round_scale_to_pow2=round_scale_to_pow2,
             )
 
@@ -271,7 +271,7 @@ def _(
             intermediate_cache1,
             expert_n_tokens=hidden_states.n_tokens_per_expert,
             swiglu_limit=swiglu_limit,
-            block_size=block_shape[0],
+            scale_block_shape=block_shape,
             round_scale_to_pow2=round_scale_to_pow2,
         )
         del intermediate_cache1

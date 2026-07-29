@@ -516,6 +516,7 @@ class PDRequestRouter(RequestRouter):
     async def _add_pd_request(self, request: UserRequest):
         """Add PD disaggregation request"""
         request_id = request.request_id
+        self._ensure_ttft_deadline(request)
         logger.debug(f"[PD_STAGE][router.recv.start] req_id={request_id}")
 
         with observe_pd_stage("router", "recv"):
@@ -588,6 +589,15 @@ class PDRequestRouter(RequestRouter):
                     pd_request = self.pending_requests.popleft()
 
                     if isinstance(pd_request, PendingPDRequest):
+                        if self._reject_ttft_timeout(
+                            pd_request.original_request, "ttft_pd_router"
+                        ):
+                            pd_request.status = PDRequestStatus.FAILED
+                            self.total_requests += 1
+                            chitu_router_pending_requests.set(
+                                len(self.pending_pd_requests)
+                            )
+                            continue
                         await self._process_pd_request(pd_request)
                     else:
                         raise ValueError(f"unexpected request type: {type(pd_request)}")

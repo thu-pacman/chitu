@@ -45,4 +45,4 @@ quant:
   - type : blockfp8
     regex : down_proj 
     kwargs:
-      block_size : 128
+      scale_block_shape: [128, 128]

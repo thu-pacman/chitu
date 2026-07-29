@@ -437,6 +437,8 @@ Acceptable values:
   separate (paged/skew) indexer-kv layout as "triton".
 - "hygon": BF16 indexer KV cache path for the Hygon platform.
 - "torch_bf16": BF16 indexer KV cache pure-torch mqa logits path.
+- "triton_bf16": BF16 indexer KV cache path using Triton mqa logits kernels,
+  sharing the BF16 (K-only) indexer-kv layout with "torch_bf16"/"hygon".
 
 FP8 indexer paths require a kv_cache rule matching indexer_k with
 type=fp8_pertoken_indexer. BF16 indexer paths require unquantized indexer KV cache.
@@ -528,6 +530,23 @@ Acceptable values:
 - "auto": Decide automatically.
 - True: Use CUDA graph.
 - False: Do not use CUDA graph.
+
+*Default: `auto`.*
+
+### Argument `infer.minimax_sparse_decode_backend`
+
+MiniMax M3 only: sparse-layer decode backend.
+- "remap": gather selected sparse blocks and use the configured dense attention backend (default)
+- "triton": per-KV-head block sparse attention
+
+*Default: `remap`.*
+
+### Argument `infer.minimax_sparse_prefill_backend`
+
+MiniMax M3 only: sparse-layer prefill backend.
+- "auto": Triton block sparse when max prefill query len >= 9216 (H20-tuned), else dense Flash
+- "dense_flash": always use dense Flash attention (legacy fallback)
+- "triton": always use Triton block sparse prefill
 
 *Default: `auto`.*
 

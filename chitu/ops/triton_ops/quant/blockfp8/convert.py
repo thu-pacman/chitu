@@ -17,6 +17,8 @@ from chitu.ops.triton_ops.utils import (
     auto_retry_triton_compilation,
     SIGNED_INT32_0x87F00000,
 )
+from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
+from chitu.utils import ceil_div
 
 
 @triton.jit
@@ -63,7 +65,7 @@ def fp8_e4m3fn_quant_per_tensor_triton(
 def blockfp8_act_quant_triton(
     x: torch.Tensor,
     *,
-    block_size: int = 128,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     round_scale_to_pow2: bool = False,
     eps: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -71,18 +73,21 @@ def blockfp8_act_quant_triton(
     Quantizes the input tensor `x` using block-wise quantization.
 
     Args:
-        x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
-        block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
+        x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last
+            dimension size must be divisible by the K-axis scale block size.
+        scale_block_shape (list, optional): Scale block shape ``[out_blk, in_blk]``.
+            Activation quantization uses ``in_blk``. Defaults to ``[128, 128]``.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]: A tuple containing:
             - The quantized tensor with dtype `torch.float8_e4m3fn`.
             - A tensor of scaling factors with dtype `torch.float32`.
     """
+    block_size = scale_block_shape[1]
 
     assert (
         x.shape[-1] % block_size == 0
-    ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
+    ), f"Last dimension size must be divisible by scale block size (scale_block_shape={scale_block_shape}, in_blk={block_size})"
     y = torch.empty(*x.shape, dtype=torch.float8_e4m3fn, device=x.device)
     s = torch.empty(
         *x.shape[:-1], x.shape[-1] // block_size, dtype=torch.float32, device=x.device
@@ -116,7 +121,7 @@ def blockfp8_act_quant_triton(
 def _(
     x: silu_and_mul.lazy_tensor_type(),
     *,
-    block_size: int = 128,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     round_scale_to_pow2: bool = False,
     eps: float = 1e-4,
 ):
@@ -124,9 +129,11 @@ def _(
 
     return silu_and_mul_and_blockfp8_act_quant(
         x.kwargs["x"],
-        expert_n_tokens=x.kwargs["expert_n_tokens"],
-        swiglu_limit=x.kwargs["swiglu_limit"],
-        block_size=block_size,
+        expert_n_tokens=x.kwargs.get("expert_n_tokens"),
+        swiglu_limit=x.kwargs.get("swiglu_limit"),
+        swiglu_alpha=x.kwargs.get("swiglu_alpha"),
+        swiglu_beta=x.kwargs.get("swiglu_beta"),
+        scale_block_shape=scale_block_shape,
         round_scale_to_pow2=round_scale_to_pow2,
         eps=eps,
         impl="triton",
@@ -221,10 +228,17 @@ def silu_and_mul_and_blockfp8_act_quant_triton(
     *,
     expert_n_tokens: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[float] = None,
-    block_size: int = 128,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     round_scale_to_pow2: bool = False,
     eps: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if (swiglu_alpha is None) != (swiglu_beta is None):
+        raise ValueError("swiglu_alpha and swiglu_beta must be specified together")
+    is_swiglu_oai = swiglu_alpha is not None
+    block_size = scale_block_shape[1]
+
     if expert_n_tokens is not None:
         assert x.shape[-1] % (2 * block_size) == 0
         output = torch.empty(
@@ -243,6 +257,8 @@ def silu_and_mul_and_blockfp8_act_quant_triton(
             block_size,
             expert_n_tokens,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             scale_ue8m0=round_scale_to_pow2,
             eps=eps,
         )
@@ -251,7 +267,7 @@ def silu_and_mul_and_blockfp8_act_quant_triton(
     assert x.is_contiguous(), "Input tensor must be contiguous"
     assert (
         x.size(-1) % (2 * block_size) == 0
-    ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
+    ), f"Last dimension size must be divisible by scale block size (scale_block_shape={scale_block_shape}, in_blk={block_size})"
     y = torch.empty(
         *x.shape[:-1], x.shape[-1] // 2, dtype=torch.float8_e4m3fn, device=x.device
     )
@@ -279,6 +295,9 @@ def silu_and_mul_and_blockfp8_act_quant_triton(
         INDEX_DTYPE=INDEX_DTYPE,
         HAS_SWIGLU_LIMIT=swiglu_limit is not None,
         SWIGLU_LIMIT=float(swiglu_limit) if swiglu_limit is not None else 0.0,
+        HAS_SWIGLU_OAI=is_swiglu_oai,
+        SWIGLU_ALPHA=float(swiglu_alpha) if is_swiglu_oai else 0.0,
+        SWIGLU_BETA=float(swiglu_beta) if is_swiglu_oai else 0.0,
     )
     return y, s
 
@@ -295,6 +314,9 @@ def silu_and_mul_and_blockfp8_act_quant_kernel(
     INDEX_DTYPE: tl.constexpr,
     HAS_SWIGLU_LIMIT: tl.constexpr,
     SWIGLU_LIMIT: tl.constexpr,
+    HAS_SWIGLU_OAI: tl.constexpr,
+    SWIGLU_ALPHA: tl.constexpr,
+    SWIGLU_BETA: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     dim_id = pid // (HIDDEN_DIM // BLOCK_SIZE)
@@ -318,9 +340,13 @@ def silu_and_mul_and_blockfp8_act_quant_kernel(
     if HAS_SWIGLU_LIMIT:
         x1_fp32 = tl.minimum(x1_fp32, SWIGLU_LIMIT)
         x2_fp32 = tl.minimum(tl.maximum(x2_fp32, -SWIGLU_LIMIT), SWIGLU_LIMIT)
-    silu_x1_fp32 = x1_fp32 / (1 + tl.exp(-1 * x1_fp32))
-    silu_x1 = silu_x1_fp32.to(x1.dtype)
-    x = silu_x1 * x2_fp32.to(x2.dtype)
+    if HAS_SWIGLU_OAI:
+        sig = 1.0 / (1.0 + tl.exp(-SWIGLU_ALPHA * x1_fp32))
+        x = (x1_fp32 * sig * (x2_fp32 + SWIGLU_BETA)).to(x1.dtype)
+    else:
+        silu_x1_fp32 = x1_fp32 / (1 + tl.exp(-1 * x1_fp32))
+        silu_x1 = silu_x1_fp32.to(x1.dtype)
+        x = silu_x1 * x2_fp32.to(x2.dtype)
 
     s = tl.maximum(tl.max(tl.abs(x)), EPS)
     if SCALE_IS_UE8M0:
@@ -365,6 +391,9 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask_kernel(
     EPS: tl.constexpr,
     HAS_SWIGLU_LIMIT: tl.constexpr,
     SWIGLU_LIMIT: tl.constexpr,
+    HAS_SWIGLU_OAI: tl.constexpr,
+    SWIGLU_ALPHA: tl.constexpr,
+    SWIGLU_BETA: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -404,9 +433,13 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask_kernel(
         if HAS_SWIGLU_LIMIT:
             gate = tl.minimum(gate, SWIGLU_LIMIT)
             up = tl.minimum(tl.maximum(up, -SWIGLU_LIMIT), SWIGLU_LIMIT)
-        gate = gate / (1 + tl.exp(-gate))
-        gate = gate.to(input_ptr.dtype.element_ty)
-        gate_up = up.to(input_ptr.dtype.element_ty) * gate
+        if HAS_SWIGLU_OAI:
+            sig = 1.0 / (1.0 + tl.exp(-SWIGLU_ALPHA * gate))
+            gate_up = (gate * sig * (up + SWIGLU_BETA)).to(input_ptr.dtype.element_ty)
+        else:
+            gate = gate / (1 + tl.exp(-gate))
+            gate = gate.to(input_ptr.dtype.element_ty)
+            gate_up = up.to(input_ptr.dtype.element_ty) * gate
         _absmax = tl.maximum(tl.max(tl.abs(gate_up)), EPS)
         output_s = _absmax / fp8_max
         if SCALE_UE8M0:
@@ -445,6 +478,8 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
     quant_group_size: int,
     masked_m: torch.Tensor,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
     scale_ue8m0: bool = False,
     eps: float = 1e-4,
 ):
@@ -455,6 +490,9 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
     quant_group_size  int,
     masked_m shape [expert_num],
     """
+    if (swiglu_alpha is None) != (swiglu_beta is None):
+        raise ValueError("swiglu_alpha and swiglu_beta must be specified together")
+    is_swiglu_oai = swiglu_alpha is not None
 
     assert input.is_contiguous()
     assert output.dtype == torch.float8_e4m3fn
@@ -507,6 +545,9 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
         EPS=eps,
         HAS_SWIGLU_LIMIT=swiglu_limit is not None,
         SWIGLU_LIMIT=float(swiglu_limit) if swiglu_limit is not None else 0.0,
+        HAS_SWIGLU_OAI=is_swiglu_oai,
+        SWIGLU_ALPHA=float(swiglu_alpha) if is_swiglu_oai else 0.0,
+        SWIGLU_BETA=float(swiglu_beta) if is_swiglu_oai else 0.0,
     )
 
 
@@ -515,15 +556,18 @@ def silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
 
 @auto_retry_triton_compilation
 def blockfp8_weight_dequant_triton(
-    x: torch.Tensor, s: torch.Tensor, block_size: int = 128
+    x: torch.Tensor,
+    s: torch.Tensor,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
 ) -> torch.Tensor:
     """
     Dequantizes the given weight tensor using the provided scale tensor.
 
     Args:
         x (torch.Tensor): The quantized weight tensor of shape (M, N).
-        s (torch.Tensor): The scale tensor of shape (M / block_size, N / block_size).
-        block_size (int, optional): The block size to use for dequantization. Defaults to 128.
+        s (torch.Tensor): The scale tensor.
+        scale_block_shape (list, optional): Scale block shape ``[out_blk, in_blk]``.
+            Defaults to ``[128, 128]``.
 
     Returns:
         torch.Tensor: The dequantized weight tensor of the same shape as `x`.
@@ -531,6 +575,9 @@ def blockfp8_weight_dequant_triton(
     Raises:
         AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
     """
+    out_blk, in_blk = scale_block_shape
+    assert out_blk == in_blk, "blockfp8_weight_dequant requires square scale blocks"
+    block_size = out_blk
     assert x.is_contiguous() and s.is_contiguous(), "Input tensors must be contiguous"
     assert (
         s.dim() == x.dim()
@@ -554,15 +601,20 @@ def blockfp8_weight_dequant_triton(
 
 @auto_retry_triton_compilation
 def soft_fp8_blockfp8_weight_dequant_triton(
-    x: torch.Tensor, s: torch.Tensor, block_size: int = 128
+    x: torch.Tensor,
+    s: torch.Tensor,
+    *,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
 ) -> torch.Tensor:
     """
     Dequantizes the given weight tensor using the provided scale tensor.
 
     Args:
         x (torch.Tensor): The quantized weight tensor of shape (M, N).
-        s (torch.Tensor): The scale tensor of shape (M / block_size, N / block_size).
-        block_size (int, optional): The block size to use for dequantization. Defaults to 128.
+        s (torch.Tensor): The scale tensor. For square blocks ``[M/B, N/B]``; for
+            MXFP8 ``[1, 32]`` blocks ``[M, N // 32]``.
+        scale_block_shape (list, optional): Scale block shape ``[out_blk, in_blk]``.
+            Defaults to ``[128, 128]``.
 
     Returns:
         torch.Tensor: The dequantized weight tensor of the same shape as `x`.
@@ -570,6 +622,8 @@ def soft_fp8_blockfp8_weight_dequant_triton(
     Raises:
         AssertionError: If `x` or `s` are not contiguous or if their dimensions are not 2.
     """
+    _, in_blk = scale_block_shape
+    block_size = in_blk
     assert x.is_contiguous() and s.is_contiguous(), "Input tensors must be contiguous"
     assert (
         s.dim() == x.dim()
@@ -602,6 +656,9 @@ def soft_fp8_blockfp8_weight_dequant_triton(
     # which is used for initializing a constant with a given type. Therefore, we need to
     # pass `fp8_to_fp32_scale` as a constant from outside.
     fp8_to_fp32_scale = struct.unpack(">f", bytes.fromhex("7b800000"))[0]
+    group_n, group_k = scale_block_shape
+    n_scale_k = ceil_div(N, group_k)
+    scale_is_ue8m0 = s.dtype == torch.uint8
     y = torch.empty_like(x, dtype=torch.get_default_dtype())
     grid = lambda meta: (
         B,
@@ -614,6 +671,10 @@ def soft_fp8_blockfp8_weight_dequant_triton(
         y,
         M,
         N,
+        n_scale_k=n_scale_k,
+        group_n=group_n,
+        group_k=group_k,
+        SCALE_IS_UE8M0=scale_is_ue8m0,
         BLOCK_SIZE=block_size,
         fp8_to_fp32_scale=fp8_to_fp32_scale,
     )
@@ -671,23 +732,39 @@ def soft_fp8_blockfp8_weight_dequant_kernel_step_1(
 @triton.jit
 def soft_fp8_blockfp8_weight_dequant_kernel_step_2(
     x_ptr,  # fp32
-    s_ptr,  # fp32
+    s_ptr,  # fp32 or uint8
     y_ptr,  # bf16
     M,
     N,
+    n_scale_k: tl.constexpr,
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
+    SCALE_IS_UE8M0: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     fp8_to_fp32_scale: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=0)
     pid_m = tl.program_id(axis=1)
     pid_n = tl.program_id(axis=2)
-    n = tl.cdiv(N, BLOCK_SIZE)
-    m = tl.cdiv(M, BLOCK_SIZE)
     offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     offs = pid_b * M * N + offs_m[:, None] * N + offs_n[None, :]
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     x = tl.load(x_ptr + offs, mask=mask)
-    s = tl.load(s_ptr + pid_b * m * n + pid_m * n + pid_n)
+    if group_n == 1:
+        s_offs = (
+            pid_b * M * n_scale_k
+            + offs_m[:, None] * n_scale_k
+            + (offs_n[None, :] // group_k)
+        )
+        s_raw = tl.load(s_ptr + s_offs, mask=mask)
+    else:
+        n = tl.cdiv(N, BLOCK_SIZE)
+        m = tl.cdiv(M, BLOCK_SIZE)
+        s_raw = tl.load(s_ptr + pid_b * m * n + pid_m * n + pid_n)
+    if SCALE_IS_UE8M0:
+        s = (s_raw.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+    else:
+        s = s_raw.to(tl.float32)
     y = x * (s * fp8_to_fp32_scale)
     tl.store(y_ptr + offs, y, mask=mask)

@@ -76,6 +76,7 @@ class AnthropicMessagesRequest(BaseModel):
     thinking: Optional[AnthropicThinking] = None
     tools: Optional[list[dict]] = None
     tool_choice: Optional[AnthropicToolChoice] = None
+    ttft_timeout_s: Optional[float] = None
 
 
 class AnthropicCompletionRequest(BaseModel):
@@ -94,6 +95,7 @@ class AnthropicCompletionRequest(BaseModel):
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     stop_sequences: Optional[list[str]] = None
+    ttft_timeout_s: Optional[float] = None
 
 
 def anthropic_error(status_code: int, error_type: str, message: str):
@@ -656,6 +658,7 @@ async def handle_messages_request(*, request: AnthropicMessagesRequest, priority
         enable_thinking=enable_thinking,
         save_trace_dir=args.debug.save_trace_dir,
         priority=priority,
+        ttft_timeout_s=request.ttft_timeout_s,
     )
     user_req = UserRequest.from_request_params(req_params)
 
@@ -759,6 +762,7 @@ async def handle_completion_request(
         max_new_tokens=max_new_tokens,
         trace_data={},
     )
+    user_req.ttft_timeout_s = request.ttft_timeout_s
 
     await submit_request(user_req)
 

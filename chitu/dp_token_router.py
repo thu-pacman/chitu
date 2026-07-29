@@ -284,7 +284,9 @@ class TokenRouter:
 
         elif token_data.get("type") == "error":
             # Handle error
-            error_message = token_data.get("error", "Unknown error")
+            error_message = token_data.get("error") or token_data.get(
+                "error_message", "Unknown error"
+            )
             logger.error(
                 f"Token Router: DP group reported error, request_id={request_id}, error={error_message}"
             )

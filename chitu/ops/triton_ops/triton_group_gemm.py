@@ -251,6 +251,7 @@ def fused_moe_kernel_block_fp8(
     top_k: tl.constexpr,
     output_type: tl.constexpr,
     soft_fp8: tl.constexpr,
+    SCALE_IS_UE8M0: tl.constexpr,
     per_channel_quant: tl.constexpr,
     bs_if_in_graph: tl.constexpr,
 ):
@@ -303,8 +304,15 @@ def fused_moe_kernel_block_fp8(
     if group_k > 0 and group_n > 0:
         if not soft_fp8:
             a_scale_ptrs = a_scale_ptr + (offs_token // top_k) * stride_asm
-        offs_bsn = offs_bn // group_n
-        b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
+        if group_n == 1:
+            b_scale_n_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bn * stride_bsn
+            )
+        else:
+            offs_bsn = offs_bn // group_n
+            b_scale_ptrs = (
+                b_scale_ptr + off_experts * stride_bse + offs_bsn * stride_bsn
+            )
     elif per_channel_quant:
         # per-channel: b_scale shape [E, N], load per output channel
         b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bn * stride_bsn
@@ -330,7 +338,10 @@ def fused_moe_kernel_block_fp8(
         if group_k > 0 and group_n > 0:
             k_start = k * BLOCK_SIZE_K
             offs_ks = k_start // group_k
-            b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+            if group_n == 1:
+                b_scale = tl.load(b_scale_n_ptrs + offs_ks * stride_bsk)
+            else:
+                b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
 
             if soft_fp8:
                 t = b.to(tl.int8, bitcast=True).to(
@@ -338,15 +349,23 @@ def fused_moe_kernel_block_fp8(
                 )  # Do signed cast to copy the sign bit
                 t = (t << 20) & SIGNED_INT32_0x87F00000
                 b_unscaled_fp32 = t.to(tl.float32, bitcast=True)
-                b_new_scale = b_scale * fp8_to_fp32_scale
-                b_scaled_fp32 = b_unscaled_fp32 * b_new_scale
+                if SCALE_IS_UE8M0:
+                    b_s = (b_scale.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+                else:
+                    b_s = b_scale.to(tl.float32)
+                b_new_scale = b_s * fp8_to_fp32_scale
+                b_scaled_fp32 = b_unscaled_fp32 * b_new_scale[None, :]
                 b_scaled_fp32 = b_scaled_fp32.to(dtype=output_type)
                 accumulator += tl.dot(a, b_scaled_fp32)
             else:
                 a_scale = tl.load(
                     a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                 )
-                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                if SCALE_IS_UE8M0:
+                    b_s = (b_scale.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+                else:
+                    b_s = b_scale.to(tl.float32)
+                accumulator += tl.dot(a, b) * a_scale[:, None] * b_s[None, :]
         else:
             accumulator = tl.dot(a, b, acc=accumulator)
         a_ptrs += BLOCK_SIZE_K * stride_ak

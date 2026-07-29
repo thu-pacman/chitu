@@ -222,11 +222,13 @@ class Indexer(torch.nn.Module):
         if self.use_hadamard_transform:
             q_rot = self._rotate_activation(q_rot)
             k_rot = self._rotate_activation(k_rot)
-        if self.indexer_impl.impl in ("hygon", "torch_bf16"):
+        if self.indexer_impl.impl in ("hygon", "torch_bf16", "triton_bf16"):
             return (q_rot, None), (k_rot, None)
         return blockfp8_act_quant(
-            q_rot, block_size=self.block_size
-        ), blockfp8_act_quant(k_rot, block_size=self.block_size)
+            q_rot, scale_block_shape=[self.block_size, self.block_size]
+        ), blockfp8_act_quant(
+            k_rot, scale_block_shape=[self.block_size, self.block_size]
+        )
 
     def _build_index_score(
         self,
@@ -270,7 +272,7 @@ class Indexer(torch.nn.Module):
         q_indexer, q_scale = q_pack
         k_indexer, k_scale = k_pack
         weights = self.weights_proj(x) * self.n_heads**-0.5
-        if self.indexer_impl.impl in ("hygon", "torch_bf16"):
+        if self.indexer_impl.impl in ("hygon", "torch_bf16", "triton_bf16"):
             weights = (weights * self.softmax_scale).to(torch.float32).contiguous()
         else:
             weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
@@ -671,7 +673,11 @@ class AttentionDeepSeekV3(Attention):
                 )
             ):
                 absorb_block_size = 64
-            absorb_quant_kwargs = {"blockfp8": {"block_size": absorb_block_size}}
+            absorb_quant_kwargs = {
+                "blockfp8": {
+                    "scale_block_shape": [absorb_block_size, absorb_block_size]
+                }
+            }
             self.kv_b_proj_absorb_1 = ParallelAbsorbGemm(
                 self.n_heads,
                 self.qk_nope_head_dim,
@@ -2146,7 +2152,9 @@ class TransformerDeepSeekV3(Transformer):
                     kv_b_proj_scale = checkpoint.pop(prefix + "kv_b_proj.scale")
                     old_device = kv_b_proj_ckpt_weight.device
                     kv_b_proj_weight = weight_dequant_fn(
-                        kv_b_proj_ckpt_weight.cuda(), kv_b_proj_scale.cuda(), block_size
+                        kv_b_proj_ckpt_weight.cuda(),
+                        kv_b_proj_scale.cuda(),
+                        scale_block_shape=[block_size, block_size],
                     ).to(old_device)
                 elif quant in ["blockfp4"]:
                     assert prefix + "kv_b_proj.weight_scale" in checkpoint
@@ -2198,7 +2206,9 @@ class TransformerDeepSeekV3(Transformer):
                     q_b_proj_scale = checkpoint.pop(prefix + "q_b_proj.scale")
                     old_device = q_b_proj_ckpt_weight.device
                     q_b_proj_weight = weight_dequant_fn(
-                        q_b_proj_ckpt_weight.cuda(), q_b_proj_scale.cuda(), block_size
+                        q_b_proj_ckpt_weight.cuda(),
+                        q_b_proj_scale.cuda(),
+                        scale_block_shape=[block_size, block_size],
                     ).to(old_device)
                 elif quant in ["blockfp4"]:
                     assert prefix + "q_b_proj.weight_scale" in checkpoint
@@ -2286,7 +2296,7 @@ class TransformerDeepSeekV3(Transformer):
                 elif quant in ["blockfp8", "q4km"]:
                     # FIXME: Support soft fp8 in blockfp8_weight_quant
                     new_q_b_proj, new_q_b_proj_scale = blockfp8_weight_quant(
-                        new_q_b_proj, block_size
+                        new_q_b_proj, scale_block_shape=[block_size, block_size]
                     )
                     if (
                         parse_dtype(
@@ -2311,7 +2321,9 @@ class TransformerDeepSeekV3(Transformer):
                     o_proj_scale = checkpoint.pop(prefix + "o_proj.scale")
                     old_device = o_proj_ckpt_weight.device
                     o_proj_weight = weight_dequant_fn(
-                        o_proj_ckpt_weight.cuda(), o_proj_scale.cuda(), block_size
+                        o_proj_ckpt_weight.cuda(),
+                        o_proj_scale.cuda(),
+                        scale_block_shape=[block_size, block_size],
                     ).to(old_device)
                 elif quant in ["blockfp4"]:
                     assert prefix + "o_proj.weight_scale" in checkpoint
@@ -2359,7 +2371,7 @@ class TransformerDeepSeekV3(Transformer):
                 elif quant in ["blockfp8", "q4km"]:
                     # FIXME: Support soft fp8 in blockfp8_weight_quant
                     new_o_proj, new_o_proj_scale = blockfp8_weight_quant(
-                        new_o_proj, block_size
+                        new_o_proj, scale_block_shape=[block_size, block_size]
                     )
                     if (
                         parse_dtype(

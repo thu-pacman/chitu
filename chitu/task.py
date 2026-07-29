@@ -77,6 +77,7 @@ class RequestParams:
     save_trace_dir: str | None = None
     priority: int = 1
     stop_with_eos: bool = True
+    ttft_timeout_s: Optional[float] = None
 
     def create_trace_data(self):
         return {
@@ -131,6 +132,7 @@ class UserRequest:
     max_new_tokens: int
     trace_data: dict
     generated_tokens: list[int] = field(default_factory=list)
+    ttft_deadline_ts: Optional[float] = None
 
     # ============ Serialization fields end ==========
 
@@ -156,6 +158,7 @@ class UserRequest:
         self.start_time: float = time.monotonic()
         self.prefill_end_time: float = 0
         self.completion_time: float = 0
+        self.ttft_timeout_s: Optional[float] = None
 
     @staticmethod
     def from_request_params(params: RequestParams, max_prompt_len: int | None = None):
@@ -201,7 +204,7 @@ class UserRequest:
         else:
             trace_data = {}
 
-        return UserRequest(
+        req = UserRequest(
             request_id=params.request_id,
             enable_thinking=params.enable_thinking,
             logprobs=params.logprobs,
@@ -218,6 +221,8 @@ class UserRequest:
             max_new_tokens=max_new_tokens,
             trace_data=trace_data,
         )
+        req.ttft_timeout_s = params.ttft_timeout_s
+        return req
 
     @staticmethod
     def cap_max_new_tokens(max_new_tokens: int, prompt_len: int) -> int:
@@ -287,6 +292,12 @@ class UserRequest:
 
     def to_dict(self) -> dict:
         return dataclass_to_dict(self)
+
+    def ttft_expired(self, now: Optional[float] = None) -> bool:
+        return (
+            self.ttft_deadline_ts is not None
+            and (time.time() if now is None else now) >= self.ttft_deadline_ts
+        )
 
     def save_trace_data(self):
         prefill_duration = self.prefill_end_time - self.start_time

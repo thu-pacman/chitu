@@ -12,11 +12,27 @@ from chitu.device_type import is_muxi
 
 
 @auto_retry_triton_compilation
-def silu_and_mul_triton(x, swiglu_limit=None):
+def silu_and_mul_triton(
+    x,
+    swiglu_limit=None,
+    swiglu_alpha=None,
+    swiglu_beta=None,
+):
+    if (swiglu_alpha is None) != (swiglu_beta is None):
+        raise ValueError("swiglu_alpha and swiglu_beta must be specified together")
+    is_swiglu_oai = swiglu_alpha is not None
+    if is_swiglu_oai and swiglu_limit is None:
+        raise ValueError("swiglu_limit is required for OAI SwiGLU")
+
     if isinstance(x, Vector):
         return Vector(
             list(x.plain_shape[:-1]) + [x.plain_shape[-1] // 2],
-            silu_and_mul_triton(x.layout_tensor, swiglu_limit=swiglu_limit),
+            silu_and_mul_triton(
+                x.layout_tensor,
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+            ),
         )
 
     assert isinstance(x, torch.Tensor)
@@ -77,6 +93,9 @@ def silu_and_mul_triton(x, swiglu_limit=None):
         INDEX_DTYPE=INDEX_DTYPE,
         HAS_SWIGLU_LIMIT=swiglu_limit is not None,
         SWIGLU_LIMIT=float(swiglu_limit) if swiglu_limit is not None else 0.0,
+        HAS_SWIGLU_OAI=is_swiglu_oai,
+        SWIGLU_ALPHA=float(swiglu_alpha) if is_swiglu_oai else 0.0,
+        SWIGLU_BETA=float(swiglu_beta) if is_swiglu_oai else 0.0,
     )
     return output
 
@@ -102,6 +121,9 @@ def silu_and_mul_kernel(
     INDEX_DTYPE: tl.constexpr,
     HAS_SWIGLU_LIMIT: tl.constexpr,
     SWIGLU_LIMIT: tl.constexpr,
+    HAS_SWIGLU_OAI: tl.constexpr,
+    SWIGLU_ALPHA: tl.constexpr,
+    SWIGLU_BETA: tl.constexpr,
 ):
     row_idx = tl.program_id(0)
     row_start_ptr = x_ptr + tl.cast(row_idx, INDEX_DTYPE) * output_n_cols * 2
@@ -115,9 +137,13 @@ def silu_and_mul_kernel(
     if HAS_SWIGLU_LIMIT:
         part1_fp32 = tl.minimum(part1_fp32, SWIGLU_LIMIT)
         part2_fp32 = tl.minimum(tl.maximum(part2_fp32, -SWIGLU_LIMIT), SWIGLU_LIMIT)
-    silu_part1_fp32 = part1_fp32 / (1 + tl.exp(-1 * part1_fp32))
-    silu_part1 = silu_part1_fp32.to(part1.dtype)
-    result = silu_part1 * part2_fp32.to(part2.dtype)
+    if HAS_SWIGLU_OAI:
+        sig = 1.0 / (1.0 + tl.exp(-SWIGLU_ALPHA * part1_fp32))
+        result = (part1_fp32 * sig * (part2_fp32 + SWIGLU_BETA)).to(part1.dtype)
+    else:
+        silu_part1_fp32 = part1_fp32 / (1 + tl.exp(-part1_fp32))
+        silu_part1 = silu_part1_fp32.to(part1.dtype)
+        result = silu_part1 * part2_fp32.to(part2.dtype)
     output = output_ptr + tl.cast(row_idx, INDEX_DTYPE) * output_n_cols + offsets
     tl.store(output, result, mask=(offsets < output_n_cols))
 

@@ -42,7 +42,11 @@ from chitu.distributed.pd_disaggregation.kv_transfer.mooncake.metadata import (
     MetadataBuffers,
 )
 from chitu.distributed.pd_disaggregation.pd_types import PDRequestStatus
-from chitu.metrics.prometheus_collector import observe_stage_duration, set_queue_size
+from chitu.metrics.prometheus_collector import (
+    inc_request_timeouts,
+    observe_stage_duration,
+    set_queue_size,
+)
 
 if TYPE_CHECKING:
     from chitu.kv_cache import PagedKVCacheManager
@@ -202,6 +206,29 @@ class PDInstanceRequestManager:
             self.token_manager.token_sender.send_error(request_id, error_message)
 
         logger.warning(error_message)
+
+    def _reject_pd_ttft_timeout(
+        self, task: Task, stage: str, now: Optional[float] = None
+    ) -> bool:
+        if now is None:
+            now = time.time()
+        req = task.req
+        if req is None or not req.ttft_expired(now):
+            return False
+
+        request_id = task.task_id
+        req.finish_reason = "error"
+        self.stop_request(request_id, force_stop=True, timeout=0.0)
+        if self.token_manager is not None:
+            self.token_manager.token_sender.send_error(request_id, "TTFT timeout")
+        inc_request_timeouts(stage)
+        logger.warning(
+            "[TTFT_TIMEOUT][pd_scheduler] req_id=%s stage=%s overdue_s=%.3f",
+            request_id,
+            stage,
+            max(0.0, now - req.ttft_deadline_ts),
+        )
+        return True
 
     def stop_request(
         self, request_id: str, force_stop: bool = False, timeout: float = 30.0
@@ -551,6 +578,9 @@ class PrefillOnlyManager(PDInstanceRequestManager):
         for rid in incoming_task_ids:
             task = TaskPool.pool[rid]
 
+            if self._reject_pd_ttft_timeout(task, "ttft_pd_prefill", now):
+                continue
+
             info = task.pd_scheduler_info
 
             info["_transfer_info_start_ts"] = time.monotonic()
@@ -657,6 +687,24 @@ class DecodeOnlyManager(PDInstanceRequestManager):
         self._decode_ready_exec_delays_ms: list[float] = []
         self._decode_ready_exec_last_log_ts = 0.0
 
+    def _release_decode_prealloc_budget(self, task: Task) -> None:
+        if task.status != TaskStatus.PDDecodePrealloc:
+            return
+        info = task.pd_scheduler_info
+        prealloc_tokens = int(info.pop("prealloc_tokens", 0))
+        if prealloc_tokens <= 0:
+            return
+        self._decode_prealloc_tokens_inflight = max(
+            0, self._decode_prealloc_tokens_inflight - prealloc_tokens
+        )
+        target_dp_rank = int(task.dp_rank)
+        if 0 <= target_dp_rank < len(self._decode_prealloc_tokens_inflight_by_dp):
+            self._decode_prealloc_tokens_inflight_by_dp[target_dp_rank] = max(
+                0,
+                self._decode_prealloc_tokens_inflight_by_dp[target_dp_rank]
+                - prealloc_tokens,
+            )
+
     def stop_request(
         self, request_id: str, force_stop: bool = False, timeout: float = 30.0
     ):
@@ -676,6 +724,7 @@ class DecodeOnlyManager(PDInstanceRequestManager):
 
         if task.status == TaskStatus.PDDecodePrealloc:
             # waiting for prefill reply
+            self._release_decode_prealloc_budget(task)
             start_time = time.time()
             while not self.kv_manager.is_prefill_done(request_id):
                 if time.time() - start_time > timeout:
@@ -711,6 +760,10 @@ class DecodeOnlyManager(PDInstanceRequestManager):
         )
 
         for rid in incoming_task_ids:
+            task = TaskPool.pool[rid]
+            if self._reject_pd_ttft_timeout(task, "ttft_pd_decode_incoming", now):
+                continue
+
             if (
                 self._decode_prealloc_max_pending > 0
                 and len(incoming_task_ids) >= self._decode_prealloc_max_pending
@@ -722,7 +775,6 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 # prealloc 的block 已经达到上限，incoming 队列的请求不能进来
                 break
 
-            task = TaskPool.pool[rid]
             info = task.pd_scheduler_info
             target_dp_rank = int(task.dp_rank)
             prefix_len = int(getattr(task, "prefix_tokens_len", 0))
@@ -798,6 +850,9 @@ class DecodeOnlyManager(PDInstanceRequestManager):
 
         for rid in prealloc_task_ids:
             task = TaskPool.pool[rid]
+            if self._reject_pd_ttft_timeout(task, "ttft_pd_decode_prealloc", now):
+                continue
+
             info = task.pd_scheduler_info
             target_dp_rank = int(task.dp_rank)
 
@@ -863,23 +918,8 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 f"[PD_QUEUE][decode.ready] req_id={rid} KV ready waited={waited:.1f}s"
             )
 
+            self._release_decode_prealloc_budget(task)
             task.status = TaskStatus.AvailableForSchedule
-
-            prealloc_tokens = int(info.get("prealloc_tokens", 0))
-            if prealloc_tokens > 0:
-                self._decode_prealloc_tokens_inflight = max(
-                    0, self._decode_prealloc_tokens_inflight - prealloc_tokens
-                )
-                if (
-                    0
-                    <= target_dp_rank
-                    < len(self._decode_prealloc_tokens_inflight_by_dp)
-                ):
-                    self._decode_prealloc_tokens_inflight_by_dp[target_dp_rank] = max(
-                        0,
-                        self._decode_prealloc_tokens_inflight_by_dp[target_dp_rank]
-                        - prealloc_tokens,
-                    )
 
             decode_info = self.pending_decode_requests.pop(rid, None)
             if decode_info is not None:

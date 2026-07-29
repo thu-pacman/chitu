@@ -183,6 +183,8 @@ class FlashAttnBackend(AttnBackend):
         softmax_scale=None,
         sinks=None,
         topk_indices: Optional[torch.Tensor] = None,
+        sparse_page_table: Optional[torch.Tensor] = None,
+        sparse_cache_seqlens: Optional[torch.Tensor] = None,
     ):
         if topk_indices is not None:
             raise NotImplementedError()
@@ -200,31 +202,67 @@ class FlashAttnBackend(AttnBackend):
 
         bsz = seq_len_delta.batch_size
         s_q = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
-        kwargs = dict(
-            q=q.view(bsz, s_q, q.shape[-2], q.shape[-1]),
-            k_cache=kv_cache.k,
-            v_cache=kv_cache.v,
-            k=k.view(bsz, s_q, k.shape[-2], k.shape[-1]) if k is not None else None,
-            v=v.view(bsz, s_q, v.shape[-2], v.shape[-1]) if v is not None else None,
-            cache_seqlens=seq_len_delta.old.lens_tensor_device,
-            causal=s_q > 1,
-            window_size=window_size,
-            softmax_scale=softmax_scale,
-            **extra_kvargs,
+        dense_sparse_kv = (
+            sparse_cache_seqlens is not None
+            and sparse_page_table is None
+            and k is not None
+            and v is not None
+            and k.shape[0] == bsz
+            and k.shape[1] != s_q
         )
-        if self._use_fa3:
-            kwargs["page_table"] = kv_cache.block_table
-            kwargs["q_descale"] = _expand_fa3_descale(
-                q_descale, seq_len_delta.batch_size, kv_cache.k.shape[-2]
+        if dense_sparse_kv:
+            num_kv_heads = k.shape[-2]
+            kwargs = dict(
+                q=q.view(bsz, s_q, q.shape[-2], q.shape[-1]),
+                k_cache=k,
+                v_cache=v,
+                cache_seqlens=sparse_cache_seqlens,
+                causal=False,
+                window_size=window_size,
+                softmax_scale=softmax_scale,
+                **extra_kvargs,
             )
-            kwargs["k_descale"] = _expand_fa3_descale(
-                k_descale, seq_len_delta.batch_size, kv_cache.k.shape[-2]
-            )
-            kwargs["v_descale"] = _expand_fa3_descale(
-                v_descale, seq_len_delta.batch_size, kv_cache.v.shape[-2]
-            )
+            if self._use_fa3:
+                kwargs["q_descale"] = _expand_fa3_descale(q_descale, bsz, num_kv_heads)
+                kwargs["k_descale"] = _expand_fa3_descale(k_descale, bsz, num_kv_heads)
+                kwargs["v_descale"] = _expand_fa3_descale(v_descale, bsz, num_kv_heads)
         else:
-            kwargs["block_table"] = kv_cache.block_table
+            if sparse_page_table is not None:
+                assert self._use_fa3, (
+                    "MiniMax Sparse Flash decode page-table remap requires FA3; FA2 "
+                    "paged KV requires page block size to be a multiple of 256."
+                )
+                assert sparse_cache_seqlens is not None
+                page_table = sparse_page_table
+                cache_seqlens = sparse_cache_seqlens
+            else:
+                page_table = kv_cache.block_table
+                cache_seqlens = seq_len_delta.old.lens_tensor_device
+            kwargs = dict(
+                q=q.view(bsz, s_q, q.shape[-2], q.shape[-1]),
+                k_cache=kv_cache.k,
+                v_cache=kv_cache.v,
+                k=k.view(bsz, s_q, k.shape[-2], k.shape[-1]) if k is not None else None,
+                v=v.view(bsz, s_q, v.shape[-2], v.shape[-1]) if v is not None else None,
+                cache_seqlens=cache_seqlens,
+                causal=s_q > 1,
+                window_size=window_size,
+                softmax_scale=softmax_scale,
+                **extra_kvargs,
+            )
+            if self._use_fa3:
+                kwargs["page_table"] = page_table
+                kwargs["q_descale"] = _expand_fa3_descale(
+                    q_descale, bsz, kv_cache.k.shape[-2]
+                )
+                kwargs["k_descale"] = _expand_fa3_descale(
+                    k_descale, bsz, kv_cache.k.shape[-2]
+                )
+                kwargs["v_descale"] = _expand_fa3_descale(
+                    v_descale, bsz, kv_cache.v.shape[-2]
+                )
+            else:
+                kwargs["block_table"] = page_table
 
         output = self._fa.flash_attn_with_kvcache(**kwargs)
         output = output.view(bsz * s_q, output.shape[-2], output.shape[-1])

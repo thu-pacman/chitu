@@ -27,7 +27,12 @@ from chitu.ops.quant import (
 )
 from chitu.ops.utils import make_op_dispatcher
 from chitu.device_type import get_device_name, is_muxi, is_nvidia
-from chitu.utils import parse_dtype, ceil_div
+from chitu.utils import parse_dtype
+from chitu.blockfp8_shape import (
+    DEFAULT_SCALE_BLOCK_SHAPE,
+    blockfp8_scale_dtype,
+    blockfp8_scale_shape,
+)
 from chitu.import_utils import try_import_platform_dep, try_import_opt_dep
 from chitu.global_vars import get_global_args
 from chitu.cuda_graph import is_warming_up_or_cuda_graph_capture
@@ -62,6 +67,25 @@ if has_deep_gemm:
 logger = getLogger(__name__)
 
 
+def _blockfp8_hard_fp8_compute_available() -> bool:
+    """Return True unless low-bit weights are explicitly raised to BF16."""
+    return get_global_args().infer.raise_lower_bit_float_to != "bfloat16"
+
+
+def _blockfp8_linear_activation_round_scale_to_pow2(
+    *,
+    round_scale_to_pow2: bool,
+    weight_scale: torch.Tensor,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
+) -> bool:
+    if weight_scale.dtype == torch.uint8:
+        # MXFP8 checkpoint weight scales are E8M0, but runtime activation scales
+        # can stay FP32. This keeps W8A8 tensor-core GEMM while reducing
+        # quantization error for sensitive projection layers.
+        return False
+    return round_scale_to_pow2
+
+
 def linear_blockfp8(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -69,8 +93,8 @@ def linear_blockfp8(
     bias: Optional[torch.Tensor] = None,
     *,
     x_scale: Optional[torch.Tensor] = None,
-    block_size: int,
     round_scale_to_pow2: bool,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
 ) -> torch.Tensor:
     """
     Quantized linear with blockfp8 quantization.
@@ -97,7 +121,12 @@ def linear_blockfp8(
         if x_scale is not None:
             raise ValueError(f"No x_scale is supported for {x.dtype=}")
         try:
-            y = soft_fp8_blockfp8_gemm(x, weight, weight_scale)
+            y = soft_fp8_blockfp8_gemm(
+                x,
+                weight,
+                weight_scale,
+                scale_block_shape=scale_block_shape,
+            )
             if bias is not None:
                 y += bias
             return y
@@ -106,7 +135,9 @@ def linear_blockfp8(
                 f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
             )
             weight_dequanted = soft_fp8_blockfp8_weight_dequant(
-                weight, weight_scale, block_size
+                weight,
+                weight_scale,
+                scale_block_shape=scale_block_shape,
             )
             return linear(x, weight_dequanted, bias)
     else:
@@ -114,7 +145,13 @@ def linear_blockfp8(
         if x.dtype in {torch.float16, torch.bfloat16}:
             x = x.view(-1, x_shape[-1])
             x, x_scale = blockfp8_act_quant(
-                x, block_size=block_size, round_scale_to_pow2=round_scale_to_pow2
+                x,
+                scale_block_shape=scale_block_shape,
+                round_scale_to_pow2=_blockfp8_linear_activation_round_scale_to_pow2(
+                    round_scale_to_pow2=round_scale_to_pow2,
+                    weight_scale=weight_scale,
+                    scale_block_shape=scale_block_shape,
+                ),
             )
         elif x.dtype == torch.float8_e4m3fn:
             assert x_scale is not None
@@ -128,8 +165,8 @@ def linear_blockfp8(
             x_scale,
             weight,
             weight_scale,
-            block_size=block_size,
             round_scale_to_pow2=round_scale_to_pow2,
+            scale_block_shape=scale_block_shape,
         )
         if bias is not None:
             y = (y + bias).to(y.dtype)
@@ -153,16 +190,16 @@ class Blockfp8Linear(QuantizedLinearBase):
         ############################################
         # Parameters specific to this quantization
         bias_dtype=None,
-        block_size: int = 128,
         round_scale_to_pow2: bool = False,
+        scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     ):
         """
         Linear layer with blockfp8 quantization
 
         Additional args of this inheritance:
             bias_dtype: Data type for bias. Only applied when `has_bias` is True.
-            block_size: Size of the quantization group along both of the weight
-                dimensions, which means each group is a square.
+            scale_block_shape: Scale block shape ``[out_blk, in_blk]``. Defaults to
+                ``[128, 128]``.
             round_scale_to_pow2: Round scale to powers of 2. But it does not necessarily
                 mean the scale must be stored as a 8-bit integer. Implementations are
                 free to pick a storage data type for it.
@@ -179,8 +216,8 @@ class Blockfp8Linear(QuantizedLinearBase):
             dtype = torch.float8_e4m3fn
         assert dtype.itemsize == 1
 
-        self.block_size = block_size
         self.round_scale_to_pow2 = round_scale_to_pow2
+        self.scale_block_shape = scale_block_shape
 
         self.register_parameter(
             "weight",
@@ -190,15 +227,18 @@ class Blockfp8Linear(QuantizedLinearBase):
             ),
         )
 
-        scale_out_features = ceil_div(out_features, block_size)
-        scale_in_features = ceil_div(in_features, block_size)
+        scale_rows, scale_cols = blockfp8_scale_shape(
+            out_features,
+            in_features,
+            scale_block_shape=scale_block_shape,
+        )
         self.register_parameter(
             "scale",
             torch.nn.Parameter(
                 torch.empty(
-                    scale_out_features,
-                    scale_in_features,
-                    dtype=torch.float32,
+                    scale_rows,
+                    scale_cols,
+                    dtype=blockfp8_scale_dtype(round_scale_to_pow2, scale_block_shape),
                 ),
                 requires_grad=False,
             ),
@@ -221,15 +261,22 @@ class Blockfp8Linear(QuantizedLinearBase):
             self.weight,
             self.scale,
             self.bias,
-            block_size=self.block_size,
             round_scale_to_pow2=self.round_scale_to_pow2,
+            scale_block_shape=self.scale_block_shape,
         )
 
 
 @QuantizationRegistry.register_linear(
     "blockfp8",
-    when=lambda _: has_marlin
-    and parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize > 1,
+    when=lambda quant_kwargs: (
+        has_marlin
+        and parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize > 1
+        and blockfp8_scale_dtype(
+            quant_kwargs.get("round_scale_to_pow2", False),
+            quant_kwargs.get("scale_block_shape", DEFAULT_SCALE_BLOCK_SHAPE),
+        )
+        != torch.uint8
+    ),
     priority=1,
 )
 class Blockfp8LinearMarlinLayout(NativeLayoutMixin, Blockfp8Linear):
@@ -248,7 +295,10 @@ class Blockfp8LinearMarlinLayout(NativeLayoutMixin, Blockfp8Linear):
 
 @QuantizationRegistry.register_linear(
     "blockfp8",
-    when=lambda quant_kwargs: quant_kwargs.get("block_size", 128) == 128
+    when=lambda quant_kwargs: quant_kwargs.get(
+        "scale_block_shape", DEFAULT_SCALE_BLOCK_SHAPE
+    )
+    == DEFAULT_SCALE_BLOCK_SHAPE
     and has_deep_gemm
     and torch.get_default_dtype() == torch.bfloat16
     and (
@@ -278,8 +328,8 @@ class Blockfp8LinearDeepGemm(NativeLayoutMixin, Blockfp8Linear):
             self.weight,
             self.get_native_layout_scale(),
             self.bias,
-            block_size=self.block_size,
             round_scale_to_pow2=self.round_scale_to_pow2,
+            scale_block_shape=self.scale_block_shape,
             # TODO: Call deep_gemm implementation only. No dispatching
         )
 
@@ -314,6 +364,8 @@ def fused_experts_no_sum_blockfp8_indexed(
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ): ...
@@ -347,17 +399,43 @@ def fused_experts_sum_blockfp8_indexed(
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ): ...
 
 
+def _blockfp8_moe_requires_triton(
+    *,
+    soft_fp8: bool = False,
+    block_shape: Optional[list] = None,
+) -> bool:
+    # Soft FP8
+    if soft_fp8:
+        return True
+    if parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize > 1:
+        return True
+    if block_shape is not None:
+        block_n, block_k = int(block_shape[0]), int(block_shape[1])
+        if block_n != block_k or block_n != 128:
+            return True
+    return False
+
+
 @fused_experts_sum_blockfp8_indexed.register_auto
 @fused_experts_no_sum_blockfp8_indexed.register_auto
-def _auto_fused_experts_sum_blockfp8_indexed() -> str:
-    # Soft FP8
-    if parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize > 1:
-        return "triton"
+def _auto_fused_experts_sum_blockfp8_indexed(
+    *,
+    soft_fp8: bool = False,
+    block_shape: Optional[list] = None,
+) -> str:
+    if _blockfp8_moe_requires_triton(soft_fp8=soft_fp8, block_shape=block_shape):
+        if has_triton:
+            return "triton"
+        raise NotImplementedError(
+            "No triton implementation for soft-fp8 / MXFP8 blockfp8 MoE"
+        )
 
     if not is_warming_up_or_cuda_graph_capture():
         # Prefill (no CUDA graph warmup/capture phase) prefers deepgemm contiguous
@@ -391,6 +469,8 @@ def _fused_experts_sum_blockfp8_indexed_any(
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
     impl: str,
@@ -407,6 +487,8 @@ def _fused_experts_sum_blockfp8_indexed_any(
         soft_fp8=soft_fp8,
         round_scale_to_pow2=round_scale_to_pow2,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         global_num_experts=global_num_experts,
         experts_start_idx=experts_start_idx,
     )
@@ -433,7 +515,14 @@ def fused_experts_no_sum_blockfp8_per_expert_dense(
 
 
 @fused_experts_no_sum_blockfp8_per_expert_dense.register_auto
-def _auto_fused_experts_no_sum_blockfp8_per_expert_dense():
+def _auto_fused_experts_no_sum_blockfp8_per_expert_dense(
+    *,
+    block_shape: Optional[list] = None,
+):
+    if _blockfp8_moe_requires_triton(block_shape=block_shape):
+        raise NotImplementedError(
+            "No triton implementation for per-expert-dense blockfp8 MoE"
+        )
     if has_deep_gemm:
         return "deepgemm"
     raise NotImplementedError
@@ -466,10 +555,11 @@ def fused_experts_sum_blockfp8_per_expert_dense(
 
 
 @fused_experts_sum_blockfp8_per_expert_dense.register_auto
-def _auto_fused_experts_sum_blockfp8_per_expert_dense():
-    if has_deep_gemm:
-        return "deepgemm"
-    raise NotImplementedError
+def _auto_fused_experts_sum_blockfp8_per_expert_dense(
+    *,
+    block_shape: Optional[list] = None,
+):
+    return _auto_fused_experts_no_sum_blockfp8_per_expert_dense(block_shape=block_shape)
 
 
 @fused_experts_sum_blockfp8_per_expert_dense.register(
@@ -528,8 +618,8 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
         checkpoint_prefix: str,
         ############################################
         # Parameters specific to this quantization
-        block_size: int = 128,
         round_scale_to_pow2: bool = False,
+        scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     ):
         super().__init__(
             dim,
@@ -541,8 +631,19 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
             checkpoint_prefix,
         )
 
-        self.block_size = block_size
         self.round_scale_to_pow2 = round_scale_to_pow2
+        self.scale_block_shape = scale_block_shape
+        scale_dtype = blockfp8_scale_dtype(round_scale_to_pow2, scale_block_shape)
+        gate_scale_rows, gate_scale_cols = blockfp8_scale_shape(
+            moe_inter_dim,
+            dim,
+            scale_block_shape=scale_block_shape,
+        )
+        down_scale_rows, down_scale_cols = blockfp8_scale_shape(
+            dim,
+            moe_inter_dim,
+            scale_block_shape=scale_block_shape,
+        )
 
         # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
         # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
@@ -567,23 +668,21 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
             ),
             requires_grad=False,
         )
-        scale_out_features = ceil_div(moe_inter_dim, block_size)
-        scale_in_features = ceil_div(dim, block_size)
         self.gate_proj_scale = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
-                scale_out_features,
-                scale_in_features,
-                dtype=torch.float32,
+                gate_scale_rows,
+                gate_scale_cols,
+                dtype=scale_dtype,
             ),
             requires_grad=False,
         )
         self.up_proj_scale = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
-                scale_out_features,
-                scale_in_features,
-                dtype=torch.float32,
+                gate_scale_rows,
+                gate_scale_cols,
+                dtype=scale_dtype,
             ),
             requires_grad=False,
         )
@@ -594,14 +693,12 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
             ),
             requires_grad=False,
         )
-        down_proj_scale_out_features = ceil_div(dim, block_size)
-        down_proj_scale_in_features = ceil_div(moe_inter_dim, block_size)
         self.down_proj_scale = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
-                down_proj_scale_out_features,
-                down_proj_scale_in_features,
-                dtype=torch.float32,
+                down_scale_rows,
+                down_scale_cols,
+                dtype=scale_dtype,
             ),
             requires_grad=False,
         )
@@ -616,8 +713,8 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
             self.gate_proj_scale[i],
             None,
             x_scale=x_scale,
-            block_size=self.block_size,
             round_scale_to_pow2=self.round_scale_to_pow2,
+            scale_block_shape=self.scale_block_shape,
         )
 
     @override
@@ -630,8 +727,8 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
             self.up_proj_scale[i],
             None,
             x_scale=x_scale,
-            block_size=self.block_size,
             round_scale_to_pow2=self.round_scale_to_pow2,
+            scale_block_shape=self.scale_block_shape,
         )
 
     @override
@@ -641,8 +738,8 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
             self.down_proj_weight[i],
             self.down_proj_scale[i],
             None,
-            block_size=self.block_size,
             round_scale_to_pow2=self.round_scale_to_pow2,
+            scale_block_shape=self.scale_block_shape,
         )
 
 
@@ -665,8 +762,8 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
         checkpoint_prefix: str,
         ############################################
         # Parameters specific to this quantization
-        block_size: int = 128,
         round_scale_to_pow2: bool = False,
+        scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     ):
         super().__init__(
             dim,
@@ -678,8 +775,19 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             checkpoint_prefix,
         )
 
-        self.block_size = block_size
         self.round_scale_to_pow2 = round_scale_to_pow2
+        self.scale_block_shape = scale_block_shape
+        scale_dtype = blockfp8_scale_dtype(round_scale_to_pow2, scale_block_shape)
+        gate_up_scale_rows, gate_up_scale_cols = blockfp8_scale_shape(
+            moe_inter_dim * 2,
+            dim,
+            scale_block_shape=scale_block_shape,
+        )
+        down_scale_rows, down_scale_cols = blockfp8_scale_shape(
+            dim,
+            moe_inter_dim,
+            scale_block_shape=scale_block_shape,
+        )
 
         # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
         # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
@@ -697,14 +805,12 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             ),
             requires_grad=False,
         )
-        scale_out_features = ceil_div(moe_inter_dim * 2, block_size)
-        scale_in_features = ceil_div(dim, block_size)
         self.gate_up_proj_scale = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
-                scale_out_features,
-                scale_in_features,
-                dtype=torch.float32,
+                gate_up_scale_rows,
+                gate_up_scale_cols,
+                dtype=scale_dtype,
             ),
             requires_grad=False,
         )
@@ -715,17 +821,30 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             ),
             requires_grad=False,
         )
-        down_proj_scale_out_features = ceil_div(dim, block_size)
-        down_proj_scale_in_features = ceil_div(moe_inter_dim, block_size)
         self.down_proj_scale = torch.nn.Parameter(
             torch.empty(
                 self.group_size,
-                down_proj_scale_out_features,
-                down_proj_scale_in_features,
-                dtype=torch.float32,
+                down_scale_rows,
+                down_scale_cols,
+                dtype=scale_dtype,
             ),
             requires_grad=False,
         )
+
+    def _blockfp8_moe_activation_kwargs(self) -> dict:
+        alpha = getattr(self, "swiglu_alpha", 1.0)
+        beta = getattr(self, "swiglu_beta", 0.0)
+        if alpha != 1.0 or beta != 0.0:
+            return {
+                "activation": "swigluoai_uninterleave",
+                "swiglu_limit": self.swiglu_limit,
+                "swiglu_alpha": alpha,
+                "swiglu_beta": beta,
+            }
+        return {
+            "activation": "silu",
+            "swiglu_limit": self.swiglu_limit,
+        }
 
     @override
     @functools.singledispatchmethod
@@ -738,38 +857,33 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
         if has_triton:
             fused_soft_fp8 = False
             use_fp8_w8a8 = False
-            if (
-                parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
-                == 1
-                or is_nvidia()
-                or is_muxi()
-            ):
-                fused_soft_fp8 = (
-                    parse_dtype(
-                        get_global_args().infer.raise_lower_bit_float_to
-                    ).itemsize
-                    != 1
-                )
+            if _blockfp8_hard_fp8_compute_available():
+                fused_soft_fp8 = False
                 gate_up_proj_weight = self.gate_up_proj_weight
                 gate_up_proj_scale = self.gate_up_proj_scale
                 down_proj_weight = self.down_proj_weight
                 down_proj_scale = self.down_proj_scale
                 use_fp8_w8a8 = True
+            elif is_nvidia() or is_muxi():
+                fused_soft_fp8 = True
+                gate_up_proj_weight = self.gate_up_proj_weight
+                gate_up_proj_scale = self.gate_up_proj_scale
+                down_proj_weight = self.down_proj_weight
+                down_proj_scale = self.down_proj_scale
             else:
                 logger.warning(
                     f"Soft-fp8 fused gemm not implemented for {get_device_name()}, falling back to soft-fp8 conversion"
                 )
-                block_size = 128
                 gate_up_proj_weight = soft_fp8_blockfp8_weight_dequant(
                     self.gate_up_proj_weight,
                     self.gate_up_proj_scale,
-                    block_size,
+                    scale_block_shape=self.scale_block_shape,
                 )
                 gate_up_proj_scale = None
                 down_proj_weight = soft_fp8_blockfp8_weight_dequant(
                     self.down_proj_weight,
                     self.down_proj_scale,
-                    block_size,
+                    scale_block_shape=self.scale_block_shape,
                 )
                 down_proj_scale = None
 
@@ -802,16 +916,15 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             routed_x,
             w1=gate_up_proj_weight,
             w2=down_proj_weight,
-            activation="silu",
             w1_scale=gate_up_proj_scale,
             w2_scale=down_proj_scale,
-            block_shape=[self.block_size, self.block_size],
+            block_shape=self.scale_block_shape,
             round_scale_to_pow2=self.round_scale_to_pow2,
             soft_fp8=fused_soft_fp8,
-            swiglu_limit=self.swiglu_limit,
             global_num_experts=self.global_n_experts,
             experts_start_idx=self.experts_start_idx,
             impl=impl,
+            **self._blockfp8_moe_activation_kwargs(),
         )
 
     @forward_no_sum.register
@@ -847,7 +960,7 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             activation="silu",
             w1_scale=gate_up_proj_scale,
             w2_scale=down_proj_scale,
-            block_shape=[self.block_size, self.block_size],
+            block_shape=self.scale_block_shape,
             round_scale_to_pow2=self.round_scale_to_pow2,
             swiglu_limit=self.swiglu_limit,
             experts_start_idx=self.experts_start_idx,
@@ -889,17 +1002,16 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             w1=gate_up_proj_weight,
             w2=down_proj_weight,
             topk_weights=weights,
-            activation="silu",
             inplace=inplace,
             w1_scale=gate_up_proj_scale,
             w2_scale=down_proj_scale,
-            block_shape=[self.block_size, self.block_size],
+            block_shape=self.scale_block_shape,
             round_scale_to_pow2=self.round_scale_to_pow2,
             soft_fp8=fused_soft_fp8,
-            swiglu_limit=self.swiglu_limit,
             global_num_experts=self.global_n_experts,
             experts_start_idx=self.experts_start_idx,
             impl=impl,
+            **self._blockfp8_moe_activation_kwargs(),
         )
 
     @forward.register
@@ -937,7 +1049,7 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             inplace=inplace,
             w1_scale=gate_up_proj_scale,
             w2_scale=down_proj_scale,
-            block_shape=[self.block_size, self.block_size],
+            block_shape=self.scale_block_shape,
             round_scale_to_pow2=self.round_scale_to_pow2,
             swiglu_limit=self.swiglu_limit,
             experts_start_idx=self.experts_start_idx,
@@ -954,8 +1066,8 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             self.gate_up_proj_scale[i],
             None,
             x_scale=x_scale,
-            block_size=self.block_size,
             round_scale_to_pow2=self.round_scale_to_pow2,
+            scale_block_shape=self.scale_block_shape,
         )
 
     @override
@@ -965,8 +1077,8 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
             self.down_proj_weight[i],
             self.down_proj_scale[i],
             None,
-            block_size=self.block_size,
             round_scale_to_pow2=self.round_scale_to_pow2,
+            scale_block_shape=self.scale_block_shape,
         )
 
 
@@ -982,7 +1094,7 @@ class Blockfp8AbsorbGemm(QuantizedAbsorbGemmBase):
         *,
         ############################################
         # Parameters specific to this quantization
-        block_size: int = 128,
+        scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
         round_scale_to_pow2: bool = False,
     ):
         super().__init__(n_heads, in_features_per_head, out_features_per_head)
@@ -995,6 +1107,10 @@ class Blockfp8AbsorbGemm(QuantizedAbsorbGemmBase):
         else:
             dtype = torch.float8_e4m3fn
 
+        out_blk, in_blk = scale_block_shape
+        self.scale_block_shape = scale_block_shape
+        group_n, group_k = scale_block_shape
+
         self.weight = torch.nn.Parameter(
             torch.empty(
                 n_heads, out_features_per_head, in_features_per_head, dtype=dtype
@@ -1002,31 +1118,36 @@ class Blockfp8AbsorbGemm(QuantizedAbsorbGemmBase):
             requires_grad=False,
         )
 
-        if out_features_per_head % block_size != 0:
+        if out_features_per_head % out_blk != 0:
             raise NotImplementedError(
                 f"This model does not support infer.mla_absorb=absorb-without-precomp because otherwise "
                 f"out_features_per_head({out_features_per_head}) of the absorbing group gemm will not be "
-                f"a multiple of block_size({block_size}). Please use infer.mla_absorb=none or "
+                f"a multiple of scale block out_blk({out_blk}). Please use infer.mla_absorb=none or "
                 f"infer.mla_absorb=absorb instead."
             )
-        if in_features_per_head % block_size != 0:
+        if in_features_per_head % in_blk != 0:
             raise NotImplementedError(
                 f"This model does not support infer.mla_absorb=absorb-without-precomp because otherwise "
                 f"in_features_per_head({in_features_per_head}) of the absorbing group gemm will not be "
-                f"a multiple of block_size({block_size}). Please use infer.mla_absorb=none or "
+                f"a multiple of scale block in_blk({in_blk}). Please use infer.mla_absorb=none or "
                 f"infer.mla_absorb=absorb instead."
             )
+        scale_rows, scale_cols = blockfp8_scale_shape(
+            out_features_per_head,
+            in_features_per_head,
+            scale_block_shape=scale_block_shape,
+        )
         self.scale = torch.nn.Parameter(
             torch.empty(
                 n_heads,
-                out_features_per_head // block_size,
-                in_features_per_head // block_size,
+                scale_rows,
+                scale_cols,
                 dtype=torch.float32,
             ),
             requires_grad=False,
         )
-
-        self.block_size = block_size
+        self.group_n = group_n
+        self.group_k = group_k
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 3:
@@ -1040,9 +1161,9 @@ class Blockfp8AbsorbGemm(QuantizedAbsorbGemmBase):
             x,
             self.weight,
             self.scale,
-            block_size=self.block_size,
-            group_n=self.block_size,
-            group_k=self.block_size,
+            scale_block_shape=self.scale_block_shape,
+            group_n=self.group_n,
+            group_k=self.group_k,
             soft_fp8=(get_global_args().infer.raise_lower_bit_float_to == "bfloat16"),
         )
 

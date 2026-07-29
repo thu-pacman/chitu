@@ -31,6 +31,43 @@ def test_silu_and_mul_swiglu_limit_torch(M, N):
     assert_close(result, baseline_result, rtol=1e-6, atol=1e-6)
 
 
+def test_silu_and_mul_oai_torch():
+    swiglu_limit = 7.0
+    swiglu_alpha = 1.702
+    swiglu_beta = 1.0
+    input_tensor = torch.linspace(-10, 10, steps=16, dtype=torch.float32).view(2, 8)
+    gate, up = input_tensor.chunk(2, dim=-1)
+    gate = gate.clamp(max=swiglu_limit)
+    up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    baseline_result = gate * torch.sigmoid(gate * swiglu_alpha) * (up + swiglu_beta)
+
+    result = eval_lazy(
+        silu_and_mul(
+            input_tensor,
+            swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            impl="torch",
+        )
+    )
+    assert_close(result, baseline_result, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.skipif(not has_triton, reason="triton is missing")
+@pytest.mark.parametrize("N", [512, 6144])
+def test_silu_and_mul_oai_triton(N):
+    torch.manual_seed(42)
+    input_tensor = torch.randn(32, N, device="cuda", dtype=torch.bfloat16) * 16
+    kwargs = {
+        "swiglu_limit": 7.0,
+        "swiglu_alpha": 1.702,
+        "swiglu_beta": 1.0,
+    }
+    baseline_result = eval_lazy(silu_and_mul(input_tensor, impl="torch", **kwargs))
+    result = eval_lazy(silu_and_mul(input_tensor, impl="triton", **kwargs))
+    assert_close(result, baseline_result, rtol=2e-2, atol=0.15)
+
+
 @pytest.mark.parametrize("M", [0, 32, 64, 128])
 @pytest.mark.parametrize("N", [256, 512, 1024, 18944])
 @pytest.mark.parametrize("impl", ["triton", "torch_npu"])

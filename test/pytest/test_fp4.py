@@ -120,7 +120,9 @@ def test_fp4_raise_to_fp8_gemm_is_close_to_dequanted_gemm(dim, record_benchmark)
     a = torch.randn(dim, dim, dtype=default_dtype, device="cuda")
     b, b_s, b_s_2 = init_weight_and_scales(dim, block_size)
 
-    a_fp8, a_s = blockfp8_act_quant(a, block_size=act_block_size)
+    a_fp8, a_s = blockfp8_act_quant(
+        a, scale_block_shape=[act_block_size, act_block_size]
+    )
 
     # Dequant from `a_fp8` and `a_s` instead of directly using `a` in dequanted implementation,
     # so the numerical difference is controlled inside the kernels

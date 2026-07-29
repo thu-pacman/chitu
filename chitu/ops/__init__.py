@@ -90,3 +90,7 @@ from chitu.ops.fused_g import fused_g
 from chitu.ops.add import add
 from chitu.ops.add_shared_experts import add_shared_experts
 from chitu.ops.topk import topk_indices, topk_page_table_decode_cuda
+from chitu.ops.indexer_score_bf16 import (
+    bf16_index_score_ragged_q_paged_k_dsv32,
+    bf16_index_score_ragged_qk_dsv32,
+)

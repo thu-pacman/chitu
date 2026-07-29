@@ -60,7 +60,10 @@ def test_blockfp8_act_quant(
 
     a_fp8, a_s = record_benchmark.run(
         lambda: blockfp8_act_quant(
-            a, block_size=block_size, round_scale_to_pow2=round_scale_to_pow2, impl=impl
+            a,
+            scale_block_shape=[block_size, block_size],
+            round_scale_to_pow2=round_scale_to_pow2,
+            impl=impl,
         ),
         bs=bs,
         dim=dim,
@@ -69,7 +72,7 @@ def test_blockfp8_act_quant(
     a_fp8_ref, a_s_ref = record_benchmark.run(
         lambda: blockfp8_act_quant(
             a,
-            block_size=block_size,
+            scale_block_shape=[block_size, block_size],
             round_scale_to_pow2=round_scale_to_pow2,
             impl="torch",
         ),
@@ -124,7 +127,7 @@ def test_silu_and_mul_and_blockfp8_act_quant(
         ):
             return blockfp8_act_quant(
                 silu_and_mul(a, swiglu_limit=swiglu_limit, impl=impl),
-                block_size=block_size,
+                scale_block_shape=[block_size, block_size],
                 impl=impl,
             )
 
@@ -133,7 +136,75 @@ def test_silu_and_mul_and_blockfp8_act_quant(
     # Reference: explicitly non-fused op
     a_fp8_ref, a_s_ref = blockfp8_act_quant(
         eval_lazy(silu_and_mul(a, swiglu_limit=swiglu_limit, impl="torch")),
-        block_size=block_size,
+        scale_block_shape=[block_size, block_size],
+        impl="torch",
+    )
+
+    assert_close(a_fp8.float(), a_fp8_ref.float(), atol=0.15, rtol=0.15)
+    assert_close(a_s.float(), a_s_ref.float(), atol=0.15, rtol=0.15)
+
+
+@pytest.mark.parametrize("bs,dim", [[256, 6144], [409472, 6144]])
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.skipif(
+    not has_native_fp8(),
+    reason="This test requires the GPU to have native FP8 support",
+)
+def test_silu_and_mul_oai_and_blockfp8_act_quant_lazy_fusion(
+    bs, dim, block_size, dtype: torch.dtype, record_benchmark
+):
+    if (
+        torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+        < bs * dim * dtype.itemsize * 20
+    ):
+        pytest.skip("No enough device memory on this platform")
+    if not has_triton:
+        pytest.skip("Triton is not available")
+
+    swiglu_alpha = 1.702
+    swiglu_beta = 1.0
+    swiglu_limit = 7.0
+
+    set_global_args(
+        OmegaConf.create({"infer": {"op_impl": "torch"}}),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    torch.set_default_dtype(dtype)
+    assert dim % block_size == 0, "dim must be divisible by block_size"
+    a = torch.randn(bs, dim * 2, dtype=dtype, device="cuda")
+
+    def testee():
+        with AssertOpCalled(
+            "silu_and_mul_and_blockfp8_act_quant",
+            expected_call_cnt=1,
+        ):
+            return blockfp8_act_quant(
+                silu_and_mul(
+                    a,
+                    swiglu_limit=swiglu_limit,
+                    swiglu_alpha=swiglu_alpha,
+                    swiglu_beta=swiglu_beta,
+                    impl="triton",
+                ),
+                scale_block_shape=[block_size, block_size],
+                impl="triton",
+            )
+
+    a_fp8, a_s = record_benchmark.run(testee, bs=bs, dim=dim, impl="triton")
+
+    a_fp8_ref, a_s_ref = blockfp8_act_quant(
+        eval_lazy(
+            silu_and_mul(
+                a,
+                swiglu_limit=swiglu_limit,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
+                impl="torch",
+            )
+        ),
+        scale_block_shape=[block_size, block_size],
         impl="torch",
     )
 
@@ -170,7 +241,7 @@ def test_silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
         lambda: silu_and_mul_and_blockfp8_act_quant(
             a,
             expert_n_tokens=expert_n_tokens,
-            block_size=block_size,
+            scale_block_shape=[block_size, block_size],
             swiglu_limit=swiglu_limit,
         ),
         N=N,
@@ -180,7 +251,7 @@ def test_silu_and_mul_and_blockfp8_act_quant_with_expert_mask(
         eval_lazy(
             silu_and_mul(a, expert_n_tokens=expert_n_tokens, swiglu_limit=swiglu_limit)
         ),
-        block_size=block_size,
+        scale_block_shape=[block_size, block_size],
     )
 
     # fp8 does not support masked_fill, so cast them to bf16 to check
@@ -211,12 +282,13 @@ def test_dequanted_gemm_is_close_to_fp8_gemm(
     bs, dim, dtype: torch.dtype, record_benchmark
 ):
     torch.set_default_dtype(dtype)
+    torch.manual_seed(42)
     block_size = 128
     assert dim % block_size == 0, "dim must be divisible by block_size"
     a = torch.randn(bs, dim, dtype=dtype, device="cuda")
     b, b_s = init_b_and_b_s(dim, block_size)
 
-    a_fp8, a_s = blockfp8_act_quant(a, block_size=block_size)
+    a_fp8, a_s = blockfp8_act_quant(a, scale_block_shape=[block_size, block_size])
 
     std_y = record_benchmark.run(
         lambda: blockfp8_gemm(a_fp8, a_s, b, b_s),
@@ -307,10 +379,10 @@ def test_blockfp8_index_score_dense_dsv32(
     b, m, n, h, d, block_size, causal, impl, record_benchmark
 ):
     q_bf16 = torch.randn(b, m, h, d, dtype=torch.bfloat16, device="cuda")
-    q_fp8, q_s = blockfp8_act_quant(q_bf16, block_size=block_size)
+    q_fp8, q_s = blockfp8_act_quant(q_bf16, scale_block_shape=[block_size, block_size])
 
     k_bf16 = torch.randn(b, n, d, dtype=torch.bfloat16, device="cuda")
-    k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size=block_size)
+    k_fp8, k_s = blockfp8_act_quant(k_bf16, scale_block_shape=[block_size, block_size])
 
     output = record_benchmark.run(
         lambda: blockfp8_index_score_dense_dsv32(
@@ -356,12 +428,12 @@ def test_blockfp8_index_score_ragged_q_dense_k_dsv32(
     q_bf16 = torch.randn(
         seq_len_delta.delta_total_len, h, d, dtype=torch.bfloat16, device="cuda"
     )
-    q_fp8, q_s = blockfp8_act_quant(q_bf16, block_size=block_size)
+    q_fp8, q_s = blockfp8_act_quant(q_bf16, scale_block_shape=[block_size, block_size])
 
     k_bf16 = torch.randn(
         b, seq_len_delta.new.max_len, d, dtype=torch.bfloat16, device="cuda"
     )
-    k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size=block_size)
+    k_fp8, k_s = blockfp8_act_quant(k_bf16, scale_block_shape=[block_size, block_size])
 
     output = record_benchmark.run(
         lambda: blockfp8_index_score_ragged_q_dense_k_dsv32(
@@ -418,10 +490,10 @@ def test_blockfp8_index_score_ragged_q_paged_k_dsv32(
     q_bf16 = torch.randn(
         seq_len_delta.delta_total_len, h, d, dtype=torch.bfloat16, device="cuda"
     )
-    q_fp8, q_s = blockfp8_act_quant(q_bf16, block_size=block_size)
+    q_fp8, q_s = blockfp8_act_quant(q_bf16, scale_block_shape=[block_size, block_size])
 
     k_bf16 = torch.randn(n_pages, page_size, d, dtype=torch.bfloat16, device="cuda")
-    k_fp8, k_s = blockfp8_act_quant(k_bf16, block_size=block_size)
+    k_fp8, k_s = blockfp8_act_quant(k_bf16, scale_block_shape=[block_size, block_size])
 
     page_table = torch.randperm(n_pages, device="cuda", dtype=torch.int32).view(
         b, page_cnt_per_sample

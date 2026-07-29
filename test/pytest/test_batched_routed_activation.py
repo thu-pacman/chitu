@@ -54,10 +54,11 @@ def _run_blockfp8_expert_block_permuted(
     block_size: int,
     num_tokens: int,
     hidden_size: int,
-    quant_block_size: int,
+    scale_block_shape: list[int],
     topk: int,
     distribution: str,
 ) -> tuple[torch.Tensor, ...]:
+    quant_block_size = scale_block_shape[1]
     assert hidden_size % quant_block_size == 0
     activation = torch.rand(
         (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
@@ -233,7 +234,7 @@ def test_batched_routed_activation_indexed_to_expert_block_indexed(
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("num_tokens", [0, 64, 4096])
 @pytest.mark.parametrize("hidden_size", [7168])
-@pytest.mark.parametrize("quant_block_size", [128])
+@pytest.mark.parametrize("scale_block_shape", [[128, 128]])
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
 @pytest.mark.parametrize("impl", ["triton"])
@@ -246,7 +247,7 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted_with_scale(
     block_size,
     num_tokens,
     hidden_size,
-    quant_block_size,
+    scale_block_shape,
     topk,
     distribution,
     impl,
@@ -267,7 +268,7 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted_with_scale(
         block_size,
         num_tokens,
         hidden_size,
-        quant_block_size,
+        scale_block_shape,
         topk,
         distribution,
     )
@@ -289,7 +290,7 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted_with_scale(
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("num_tokens", [49152])
 @pytest.mark.parametrize("hidden_size", [7168])
-@pytest.mark.parametrize("quant_block_size", [128])
+@pytest.mark.parametrize("scale_block_shape", [[128, 128]])
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("distribution", ["uniform"])
 @pytest.mark.parametrize("impl", ["triton"])
@@ -302,7 +303,7 @@ def test_batched_routed_activation_blockfp8_large_token_count(
     block_size,
     num_tokens,
     hidden_size,
-    quant_block_size,
+    scale_block_shape,
     topk,
     distribution,
     impl,
@@ -317,6 +318,7 @@ def test_batched_routed_activation_blockfp8_large_token_count(
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
 
+    quant_block_size = scale_block_shape[1]
     assert num_tokens * topk * hidden_size > _I32_MAX
     (
         activation,
@@ -331,7 +333,7 @@ def test_batched_routed_activation_blockfp8_large_token_count(
         block_size,
         num_tokens,
         hidden_size,
-        quant_block_size,
+        scale_block_shape,
         topk,
         distribution,
     )
@@ -417,7 +419,7 @@ def test_moe_sum_per_token_offset_type(M, topk, N, expect_i64):
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("num_tokens", [0, 64, 4096])
 @pytest.mark.parametrize("hidden_size", [7168])
-@pytest.mark.parametrize("quant_block_size", [128])
+@pytest.mark.parametrize("scale_block_shape", [[128, 128]])
 @pytest.mark.parametrize("topk", [8])
 @pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
 @pytest.mark.parametrize("invalid_rate", [0, 0.3])
@@ -427,7 +429,7 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted(
     block_size,
     num_tokens,
     hidden_size,
-    quant_block_size,
+    scale_block_shape,
     topk,
     distribution,
     invalid_rate,
@@ -438,6 +440,7 @@ def test_batched_routed_activation_indexed_to_expert_block_permuted(
 
     torch.set_default_dtype(torch.bfloat16)
 
+    quant_block_size = scale_block_shape[1]
     assert hidden_size % quant_block_size == 0
     activation = torch.rand(
         (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
@@ -562,15 +565,16 @@ def test_batched_routed_activation_indexed_to_per_expert_dense(
 @pytest.mark.parametrize("num_tokens", [0, 1, 64])
 @pytest.mark.parametrize("hidden_size", [7168])
 @pytest.mark.parametrize("topk", [8, 10])  # 10 is for Qwen3-Next
-@pytest.mark.parametrize("quant_block_size", [128])
+@pytest.mark.parametrize("scale_block_shape", [[128, 128]])
 @pytest.mark.parametrize("distribution", ["imbalance", "uniform"])
 @pytest.mark.parametrize("impl", ["ref", "triton"])
 def test_batched_routed_activation_indexed_to_per_expert_dense_with_scale(
-    num_experts, num_tokens, hidden_size, topk, quant_block_size, distribution, impl
+    num_experts, num_tokens, hidden_size, topk, scale_block_shape, distribution, impl
 ):
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
 
+    quant_block_size = scale_block_shape[1]
     activation = torch.rand(
         (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
     )

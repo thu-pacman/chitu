@@ -674,7 +674,7 @@ def ref_parallel_moe_block_blockfp8(
             experts_end_idx=n_routed_experts,
             n_activated_experts=topk,
             checkpoint_prefix="ffn.experts",
-            block_size=quant_block_size,
+            scale_block_shape=[quant_block_size, quant_block_size],
         ),
         non_fused_shared_experts=None,
         layer_id=0,
@@ -701,14 +701,14 @@ def ref_parallel_moe_block_blockfp8(
             ref_x,
             global_experts_gate_weight[i],
             global_experts_gate_scale[i],
-            block_size=quant_block_size,
+            scale_block_shape=[quant_block_size, quant_block_size],
             round_scale_to_pow2=False,
         )
         shared_up = linear_blockfp8(
             ref_x,
             global_experts_up_weight[i],
             global_experts_up_scale[i],
-            block_size=quant_block_size,
+            scale_block_shape=[quant_block_size, quant_block_size],
             round_scale_to_pow2=False,
         )
         shared_act = torch.nn.functional.silu(shared_gate) * shared_up
@@ -716,7 +716,7 @@ def ref_parallel_moe_block_blockfp8(
             shared_act,
             global_experts_down_weight[i],
             global_experts_down_scale[i],
-            block_size=quant_block_size,
+            scale_block_shape=[quant_block_size, quant_block_size],
             round_scale_to_pow2=False,
         )
     return ref_y
@@ -1017,7 +1017,7 @@ def test_parallel_moe_block_blockfp8(
                 experts_end_idx=experts_end_idx,
                 n_activated_experts=topk,
                 checkpoint_prefix="ffn.experts",
-                block_size=quant_block_size,
+                scale_block_shape=[quant_block_size, quant_block_size],
             ),
             non_fused_shared_experts=None,
             layer_id=0,

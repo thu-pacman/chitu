@@ -33,6 +33,7 @@ from chitu.kv_cache.prefix_caching import (
     BlockIdentityChainBuilder,
 )
 from chitu.metrics import start_prometheus_server_and_metrics_monitor
+from chitu.metrics.prometheus_collector import inc_request_timeouts
 from chitu.dp_router import (
     get_request_router,
     get_token_router,
@@ -462,6 +463,43 @@ class RequestRouter:
 
         logger.info(f"RequestRouter initialized for {self._n_insts} instance(s)")
 
+    def _ensure_ttft_deadline(self, request: UserRequest) -> None:
+        if request.ttft_deadline_ts is not None:
+            return
+        timeout_s = getattr(request, "ttft_timeout_s", None)
+        if timeout_s is None:
+            return
+        try:
+            timeout_s = float(timeout_s)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[TTFT_TIMEOUT][router] invalid ttft_timeout_s=%r req_id=%s",
+                timeout_s,
+                request.request_id,
+            )
+            return
+        if timeout_s > 0:
+            request.ttft_deadline_ts = time.time() + timeout_s
+
+    def _reject_ttft_timeout(
+        self, request: UserRequest, stage: str = "ttft_router"
+    ) -> bool:
+        now = time.time()
+        if not request.ttft_expired(now):
+            return False
+
+        inc_request_timeouts(stage)
+        logger.warning(
+            "[TTFT_TIMEOUT][router] req_id=%s stage=%s overdue_s=%.3f",
+            request.request_id,
+            stage,
+            max(0.0, now - request.ttft_deadline_ts),
+        )
+        self.finish_request_before_recv_stop(
+            request, finish_reason="error", error="TTFT timeout"
+        )
+        return True
+
     @property
     def scheduler_addresses(self) -> list[str]:
         return self._scheduler_addresses
@@ -613,6 +651,10 @@ class RequestRouter:
                 if self.pending_requests:
                     request_counter += 1
                     request = self.pending_requests.popleft()
+                    if self._reject_ttft_timeout(request):
+                        self.total_requests += 1
+                        continue
+
                     if (
                         len(request.prompt_tokens)
                         > self.policy.max_support_prompt_length
@@ -755,6 +797,7 @@ class RequestRouter:
 
     async def submit_request(self, request: UserRequest):
         """Add request to processing queue."""
+        self._ensure_ttft_deadline(request)
         queue_size_before = len(self.pending_requests)
         self.pending_requests.append(request)
         queue_size_after = len(self.pending_requests)
@@ -823,6 +866,7 @@ class RequestRouter:
 
     async def add_request(self, request: UserRequest):
         """Add new request to processing queue."""
+        self._ensure_ttft_deadline(request)
         self.pending_requests.append(request)
 
         # Update request stats for monitoring
