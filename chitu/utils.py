@@ -582,6 +582,7 @@ def fetch_state_dict_to_device(
     lock = threading.Lock()
 
     def _worker():
+        torch.cuda.set_device(device)  # Required, or we will init allocator on GPU 0
         while True:
             try:
                 key = work.popleft()
