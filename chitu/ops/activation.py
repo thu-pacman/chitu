@@ -34,7 +34,18 @@ if has_triton_impl:
 logger = getLogger(__name__)
 
 
-def silu_and_mul_torch(x: torch.Tensor, swiglu_limit: Optional[float] = None):
+def silu_and_mul_torch(
+    x: torch.Tensor,
+    swiglu_limit: Optional[float] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+):
+    if (swiglu_alpha is None) != (swiglu_beta is None):
+        raise ValueError("swiglu_alpha and swiglu_beta must be specified together")
+    is_swiglu_oai = swiglu_alpha is not None
+    if is_swiglu_oai and swiglu_limit is None:
+        raise ValueError("swiglu_limit is required for OAI SwiGLU")
+
     if isinstance(x, torch.Tensor):
         d = x.shape[-1] // 2
         gate = x[..., :d]
@@ -42,6 +53,8 @@ def silu_and_mul_torch(x: torch.Tensor, swiglu_limit: Optional[float] = None):
         if swiglu_limit is not None:
             gate = torch.clamp(gate, max=swiglu_limit)
             up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+        if is_swiglu_oai:
+            return gate * torch.sigmoid(gate * swiglu_alpha) * (up + swiglu_beta)
         return torch.nn.functional.silu(gate) * up
 
     elif isinstance(x, Vector):
@@ -51,9 +64,13 @@ def silu_and_mul_torch(x: torch.Tensor, swiglu_limit: Optional[float] = None):
         if swiglu_limit is not None:
             gate = torch.clamp(gate, max=swiglu_limit)
             up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+        if is_swiglu_oai:
+            output = gate * torch.sigmoid(gate * swiglu_alpha) * (up + swiglu_beta)
+        else:
+            output = torch.nn.functional.silu(gate) * up
         return Vector(
             list(x.plain_shape[:-1]) + [d],
-            torch.nn.functional.silu(gate) * up,
+            output,
         )
 
     elif isinstance(x, MuxiNativeLayoutActivation):
@@ -65,9 +82,13 @@ def silu_and_mul_torch(x: torch.Tensor, swiglu_limit: Optional[float] = None):
         if swiglu_limit is not None:
             gate = torch.clamp(gate, max=swiglu_limit)
             up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+        if is_swiglu_oai:
+            output = gate * torch.sigmoid(gate * swiglu_alpha) * (up + swiglu_beta)
+        else:
+            output = torch.nn.functional.silu(gate) * up
         return MuxiNativeLayoutActivation(
             list(x.plain_shape[:-1]) + [x.plain_shape[-1] // 2],
-            torch.nn.functional.silu(gate) * up,
+            output,
         )
 
     else:
@@ -112,6 +133,8 @@ def silu_and_mul(
     x: torch.Tensor,
     expert_n_tokens: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
     impl="auto",
 ):
     raise NotImplementedError
@@ -122,7 +145,17 @@ def _auto_silu_and_mul(
     x: torch.Tensor,
     expert_n_tokens: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
 ):
+    if (swiglu_alpha is None) != (swiglu_beta is None):
+        raise ValueError("swiglu_alpha and swiglu_beta must be specified together")
+    if swiglu_alpha is not None:
+        if swiglu_limit is None:
+            raise ValueError("swiglu_limit is required for OAI SwiGLU")
+        if expert_n_tokens is not None:
+            raise ValueError("OAI SwiGLU does not support expert_n_tokens")
+        return "triton" if has_triton_impl else "torch"
     if isinstance(x, MuxiNativeLayoutActivation):
         return "torch"
     if has_torch_npu:
@@ -141,16 +174,41 @@ def _auto_silu_and_mul(
 
 
 @silu_and_mul.register("triton", available=has_triton_impl)
-def _silu_and_mul_triton(x, expert_n_tokens=None, swiglu_limit=None):
+def _silu_and_mul_triton(
+    x,
+    expert_n_tokens=None,
+    swiglu_limit=None,
+    swiglu_alpha=None,
+    swiglu_beta=None,
+):
+    if (swiglu_alpha is None) != (swiglu_beta is None):
+        raise ValueError("swiglu_alpha and swiglu_beta must be specified together")
+    if swiglu_alpha is not None and swiglu_limit is None:
+        raise ValueError("swiglu_limit is required for OAI SwiGLU")
     if expert_n_tokens is not None:
+        if swiglu_alpha is not None:
+            raise ValueError("OAI SwiGLU does not support expert_n_tokens")
         return silu_and_mul_triton_with_expert_mask(
             x, expert_n_tokens, swiglu_limit=swiglu_limit
         )
-    return silu_and_mul_triton(x, swiglu_limit=swiglu_limit)
+    return silu_and_mul_triton(
+        x,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+    )
 
 
 @silu_and_mul.register("torch_npu", available=has_torch_npu)
-def _silu_and_mul_npu(x, expert_n_tokens=None, swiglu_limit=None):
+def _silu_and_mul_npu(
+    x,
+    expert_n_tokens=None,
+    swiglu_limit=None,
+    swiglu_alpha=None,
+    swiglu_beta=None,
+):
+    if swiglu_alpha is not None or swiglu_beta is not None:
+        raise ValueError("silu_and_mul(impl=torch_npu) does not support OAI SwiGLU")
     if expert_n_tokens is not None:
         logger.warning_once(
             "silu_and_mul(impl=torch_npu) does not support expert_n_tokens, "
@@ -169,7 +227,15 @@ def _silu_and_mul_npu(x, expert_n_tokens=None, swiglu_limit=None):
 
 
 @silu_and_mul.register("cpu", available=has_cpuinfer)
-def _silu_and_mul_cpu_handler(x, expert_n_tokens=None, swiglu_limit=None):
+def _silu_and_mul_cpu_handler(
+    x,
+    expert_n_tokens=None,
+    swiglu_limit=None,
+    swiglu_alpha=None,
+    swiglu_beta=None,
+):
+    if swiglu_alpha is not None or swiglu_beta is not None:
+        raise ValueError("silu_and_mul(impl=cpu) does not support OAI SwiGLU")
     if expert_n_tokens is not None:
         logger.warning_once(
             "silu_and_mul(impl=cpu) does not support expert_n_tokens, "
@@ -179,10 +245,21 @@ def _silu_and_mul_cpu_handler(x, expert_n_tokens=None, swiglu_limit=None):
 
 
 @silu_and_mul.register("torch")
-def _silu_and_mul_torch_handler(x, expert_n_tokens=None, swiglu_limit=None):
+def _silu_and_mul_torch_handler(
+    x,
+    expert_n_tokens=None,
+    swiglu_limit=None,
+    swiglu_alpha=None,
+    swiglu_beta=None,
+):
     if expert_n_tokens is not None:
         logger.warning_once(
             "silu_and_mul(impl=torch) does not support expert_n_tokens, "
             "falling back to computing the whole tensor"
         )
-    return silu_and_mul_torch(x, swiglu_limit=swiglu_limit)
+    return silu_and_mul_torch(
+        x,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+    )

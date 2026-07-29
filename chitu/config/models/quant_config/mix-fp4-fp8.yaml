@@ -10,6 +10,6 @@ quant:
     - regex : '\.gate\.'
       type : blockfp8
       kwargs:
-        block_size : 128
+        scale_block_shape: [128, 128]
     - regex : '\.layers\.'
       type : blockfp4

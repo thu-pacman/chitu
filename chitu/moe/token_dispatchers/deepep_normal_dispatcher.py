@@ -13,6 +13,7 @@ from chitu.lazy import eval_lazy
 from chitu.device_type import is_blackwell, is_hygon
 from chitu.global_vars import get_global_args
 from chitu.utils import parse_dtype, ceil_div
+from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
 from chitu.import_utils import try_import_opt_dep
 from chitu.distributed.comm_group import CommGroup
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
@@ -107,7 +108,10 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
         round_scale_to_pow2 = False
         if (
             may_fuse_quant == "blockfp8"
-            and may_fuse_quant_kwargs.get("block_size", 128) == 128
+            and may_fuse_quant_kwargs.get(
+                "scale_block_shape", DEFAULT_SCALE_BLOCK_SHAPE
+            )
+            == DEFAULT_SCALE_BLOCK_SHAPE
             and parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
             <= 1
         ):
@@ -121,7 +125,9 @@ class MoENormalTokenDispatcher(MoETokenDispatcher):
             from chitu.ops.quant.blockfp8 import blockfp8_act_quant
 
             hidden_states_fp8, scale = blockfp8_act_quant(
-                x.activation, block_size=128, round_scale_to_pow2=round_scale_to_pow2
+                x.activation,
+                scale_block_shape=DEFAULT_SCALE_BLOCK_SHAPE,
+                round_scale_to_pow2=round_scale_to_pow2,
             )
             return self.enter_moe(
                 IndexedBatchedRoutedActivationWithScale(

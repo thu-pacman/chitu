@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# MiniMax-M3-MXFP8 is a quantization of MiniMax-M3
+defaults:
+  - MiniMax-M3
+  - quant_config: blockfp8_m3
+  - _self_ # Config in this file overrides configs in defaults
+
+# Access info
+name: MiniMax-M3-MXFP8
+source: "https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8" # Just for displaying. No automatic download.

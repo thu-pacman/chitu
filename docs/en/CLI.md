@@ -531,6 +531,23 @@ Acceptable values:
 
 *Default: `auto`.*
 
+### Argument `infer.minimax_sparse_decode_backend`
+
+MiniMax M3 only: sparse-layer decode backend.
+- "remap": gather selected sparse blocks and use the configured dense attention backend (default)
+- "triton": per-KV-head block sparse attention
+
+*Default: `remap`.*
+
+### Argument `infer.minimax_sparse_prefill_backend`
+
+MiniMax M3 only: sparse-layer prefill backend.
+- "auto": Triton block sparse when max prefill query len >= 9216 (H20-tuned), else dense Flash
+- "dense_flash": always use dense Flash attention (legacy fallback)
+- "triton": always use Triton block sparse prefill
+
+*Default: `auto`.*
+
 ### Argument `infer.memory_utilization`
 
 Device memory utilization rate for automatic page allocation for paged KV cache.

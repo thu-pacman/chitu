@@ -4,6 +4,7 @@
 
 import struct
 import functools
+from typing import Optional
 
 import torch
 import triton
@@ -11,6 +12,7 @@ import triton.language as tl
 from triton import Config
 
 from chitu.lazy import single_dispatch_lazy_tensor
+from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
 from chitu.ops.triton_ops.utils import (
     auto_retry_triton_compilation,
     to_triton_dtype,
@@ -27,8 +29,8 @@ def blockfp8_gemm_triton(
     b: torch.Tensor,
     b_s: torch.Tensor,
     *,
-    block_size: int = 128,
     round_scale_to_pow2: bool = False,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
 ):
     """
     Perform a matrix multiplication using FP8 precision.
@@ -50,13 +52,40 @@ def blockfp8_gemm_triton(
     M = a.numel() // K
     N = b.size(0)
     c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+    group_n, group_k = scale_block_shape
+    scale_is_ue8m0 = b_s.dtype == torch.uint8
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    blockfp8_gemm_kernel[grid](
-        a, b, c, a_s, b_s, M, N, K, group_n=block_size, group_k=block_size
-    )
+    if group_k < 128:
+        blockfp8_gemm_kernel_grouped[grid](
+            a,
+            b,
+            c,
+            a_s,
+            b_s,
+            M,
+            N,
+            K,
+            group_n=group_n,
+            group_k=group_k,
+            SCALE_IS_UE8M0=scale_is_ue8m0,
+        )
+    else:
+        blockfp8_gemm_kernel[grid](
+            a,
+            b,
+            c,
+            a_s,
+            b_s,
+            M,
+            N,
+            K,
+            group_n=group_n,
+            group_k=group_k,
+            SCALE_IS_UE8M0=scale_is_ue8m0,
+        )
     return c
 
 
@@ -66,6 +95,8 @@ def soft_fp8_blockfp8_gemm_triton(
     x: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
+    *,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
 ):
     """
     Perform a matrix multiplication with FP8 dynamically casted to BF16.
@@ -91,10 +122,17 @@ def soft_fp8_blockfp8_gemm_triton(
     # which is used for initializing a constant with a given type. Therefore, we need to
     # pass `fp8_to_fp32_scale` as a constant from outside.
     fp8_to_fp32_scale = struct.unpack(">f", bytes.fromhex("7b800000"))[0]
+    group_n, group_k = scale_block_shape
+    scale_is_ue8m0 = scale.dtype == torch.uint8
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    soft_fp8_blockfp8_gemm_kernel[grid](
+    kernel = (
+        soft_fp8_blockfp8_gemm_kernel_grouped
+        if group_k < 128
+        else soft_fp8_blockfp8_gemm_kernel
+    )
+    kernel[grid](
         x,
         weight.view(dtype=torch.uint8),
         c,
@@ -102,8 +140,9 @@ def soft_fp8_blockfp8_gemm_triton(
         M,
         N,
         K,
-        group_n=128,
-        group_k=128,
+        group_n=group_n,
+        group_k=group_k,
+        SCALE_IS_UE8M0=scale_is_ue8m0,
         fp8_to_fp32_scale=fp8_to_fp32_scale,
         compute_dtype=to_triton_dtype(torch.get_default_dtype()),
     )
@@ -142,6 +181,7 @@ def blockfp8_gemm_kernel(
     K: tl.constexpr,
     group_n: tl.constexpr,
     group_k: tl.constexpr,
+    SCALE_IS_UE8M0: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -184,6 +224,82 @@ def blockfp8_gemm_kernel(
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0.0)
         a_s = tl.load(a_s_ptrs + i * BLOCK_SIZE_K // group_k)
         b_s = tl.load(b_s_ptrs + i * BLOCK_SIZE_K // group_k)
+        if SCALE_IS_UE8M0:
+            b_s = (b_s.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+        else:
+            b_s = b_s.to(tl.float32)
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K
+        b_ptrs += BLOCK_SIZE_K
+    c = accumulator.to(c_ptr.dtype.element_ty)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=mask)
+
+
+blockfp8_gemm_grouped_configs = [
+    Config(
+        {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": 32},
+        num_stages=num_stages,
+        num_warps=8,
+        pre_hook=functools.partial(
+            auto_tuning_logger,
+            name="blockfp8_gemm_grouped",
+            block_m=block_m,
+            block_n=block_n,
+            num_stages=num_stages,
+        ),
+    )
+    for block_m in [16, 32, 64]
+    for block_n in [32, 64, 128]
+    for num_stages in [3, 4, 5, 6]
+]
+
+
+@autotune_compat(
+    configs=blockfp8_gemm_grouped_configs, key=["N", "K"], cache_results=True
+)
+@triton.jit(do_not_specialize=["M"])
+def blockfp8_gemm_kernel_grouped(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_s_ptr,
+    b_s_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
+    SCALE_IS_UE8M0: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    k = tl.cdiv(K, BLOCK_SIZE_K)
+    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+    b_ptrs = b_ptr + offs_n[None, :] * K + offs_k[:, None]
+    a_s_ptrs = a_s_ptr + offs_m * tl.cdiv(K, group_k)
+    b_s_ptrs = b_s_ptr + (offs_n // group_n) * tl.cdiv(K, group_k)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for i in range(k):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - i * BLOCK_SIZE_K, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - i * BLOCK_SIZE_K, other=0.0)
+        scale_idx = i * BLOCK_SIZE_K // group_k
+        a_s = tl.load(a_s_ptrs + scale_idx)
+        b_s = tl.load(b_s_ptrs + scale_idx)
+        if SCALE_IS_UE8M0:
+            b_s = (b_s.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+        else:
+            b_s = b_s.to(tl.float32)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K
         b_ptrs += BLOCK_SIZE_K
@@ -215,6 +331,25 @@ soft_fp8_blockfp8_gemm_configs = [
 ]
 
 
+soft_fp8_blockfp8_gemm_grouped_configs = [
+    Config(
+        {
+            "BLOCK_SIZE_M": block_m,
+            "BLOCK_SIZE_N": block_n,
+            "BLOCK_SIZE_K": 32,
+            "GROUP_SIZE_M": group_m,
+        },
+        num_stages=num_stages,
+        num_warps=num_warps,
+    )
+    for block_m in [16, 32, 64]
+    for block_n in [32, 64, 128]
+    for group_m in [1, 32]
+    for num_stages in [3, 4, 5, 6]
+    for num_warps in [4, 8]
+]
+
+
 @autotune_compat(
     configs=soft_fp8_blockfp8_gemm_configs, key=["N", "K"], cache_results=True
 )
@@ -229,6 +364,7 @@ def soft_fp8_blockfp8_gemm_kernel(
     K: tl.constexpr,
     group_n: tl.constexpr,
     group_k: tl.constexpr,
+    SCALE_IS_UE8M0: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -273,7 +409,8 @@ def soft_fp8_blockfp8_gemm_kernel(
     b_ptrs = B + (offs_k[:, None] + offs_bn[None, :] * K)
 
     offs_bsn = offs_bn // group_n
-    Bs_ptrs = Bs + offs_bsn * tl.cdiv(K, BLOCK_SIZE_K)
+    n_scale_k = tl.cdiv(K, group_k)
+    Bs_ptrs = Bs + offs_bsn * n_scale_k
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -282,15 +419,96 @@ def soft_fp8_blockfp8_gemm_kernel(
 
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
-        b_s = tl.load(Bs_ptrs + offs_ks)
+        b_s_raw = tl.load(Bs_ptrs + offs_ks)
 
         t = b.to(tl.int8, bitcast=True).to(
             tl.int32
         )  # Do signed cast to copy the sign bit
         t = (t << 20) & SIGNED_INT32_0x87F00000
         b_unscaled_fp32 = t.to(tl.float32, bitcast=True)
+        if SCALE_IS_UE8M0:
+            b_s = (b_s_raw.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+        else:
+            b_s = b_s_raw.to(tl.float32)
         b_new_scale = b_s * fp8_to_fp32_scale
-        b_scaled_fp32 = b_unscaled_fp32 * b_new_scale
+        b_scaled_fp32 = b_unscaled_fp32 * b_new_scale[None, :]
+        b_scaled_fp32 = b_scaled_fp32.to(dtype=compute_dtype)
+        accumulator += tl.dot(a, b_scaled_fp32)
+
+        a_ptrs += BLOCK_SIZE_K
+        b_ptrs += BLOCK_SIZE_K
+
+    c = accumulator.to(compute_dtype)
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = C + N * offs_cm[:, None] + offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+@autotune_compat(
+    configs=soft_fp8_blockfp8_gemm_grouped_configs, key=["N", "K"], cache_results=True
+)
+@triton.jit(do_not_specialize=["M"])
+def soft_fp8_blockfp8_gemm_kernel_grouped(
+    A,
+    B,
+    C,
+    Bs,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    group_n: tl.constexpr,
+    group_k: tl.constexpr,
+    SCALE_IS_UE8M0: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    fp8_to_fp32_scale: tl.constexpr,
+    compute_dtype: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = A + (offs_am[:, None] * K + offs_k[None, :])
+    b_ptrs = B + (offs_k[:, None] + offs_bn[None, :] * K)
+
+    offs_bsn = offs_bn // group_n
+    n_scale_k = tl.cdiv(K, group_k)
+    Bs_ptrs = Bs + offs_bsn * n_scale_k
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+
+        k_start = k * BLOCK_SIZE_K
+        offs_ks = k_start // group_k
+        b_s_raw = tl.load(Bs_ptrs + offs_ks)
+
+        t = b.to(tl.int8, bitcast=True).to(
+            tl.int32
+        )  # Do signed cast to copy the sign bit
+        t = (t << 20) & SIGNED_INT32_0x87F00000
+        b_unscaled_fp32 = t.to(tl.float32, bitcast=True)
+        if SCALE_IS_UE8M0:
+            b_s = (b_s_raw.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+        else:
+            b_s = b_s_raw.to(tl.float32)
+        b_new_scale = b_s * fp8_to_fp32_scale
+        b_scaled_fp32 = b_unscaled_fp32 * b_new_scale[None, :]
         b_scaled_fp32 = b_scaled_fp32.to(dtype=compute_dtype)
         accumulator += tl.dot(a, b_scaled_fp32)
 

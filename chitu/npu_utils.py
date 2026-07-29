@@ -216,10 +216,12 @@ def fused_experts_no_sum_npu(
     w2_scale=None,
     *,
     activation: str = "silu",
+    swiglu_limit=None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int,
     experts_start_idx: int = 0,
     use_int8_w8a8=False,
-    swiglu_limit=None,
 ) -> BatchedExpertResult:
     raise ValueError(f"Unsupported hidden_states type: {type(hidden_states)}")
 
@@ -233,10 +235,12 @@ def _(
     w2_scale=None,
     *,
     activation: str = "silu",
+    swiglu_limit=None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int,
     experts_start_idx: int = 0,
     use_int8_w8a8=False,
-    swiglu_limit=None,
 ) -> BatchedExpertResult:
     assert activation == "silu"
     n_local_experts = w1.shape[0] if isinstance(w1, torch.Tensor) else w1.plain_shape[0]
@@ -255,6 +259,8 @@ def _(
         experts_start_idx=experts_start_idx,
         use_int8_w8a8=use_int8_w8a8,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
     )
     if hidden_states.expert_ids_are_local:
         expert_result.indices_maybe_invalid = False
@@ -270,10 +276,12 @@ def _(
     w2_scale=None,
     *,
     activation: str = "silu",
+    swiglu_limit=None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int,
     experts_start_idx: int = 0,
     use_int8_w8a8=False,
-    swiglu_limit=None,
 ) -> ConcatPermutedBatchedExpertResult:
     # Check constraints.
     if not get_global_args().infer.npu_fusion_fp4 and not use_int8_w8a8:
@@ -291,6 +299,10 @@ def _(
         torch.bfloat16,
     ]
     assert activation == "silu"
+    if swiglu_alpha != 1.0 or swiglu_beta != 0.0:
+        raise NotImplementedError(
+            "Custom swiglu_alpha/swiglu_beta are not supported on NPU fused MoE yet"
+        )
 
     concat_activation = hidden_states.concat_activation
 

@@ -2,12 +2,15 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
+
 import torch
 
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.native_layout import DeepGemmScale
 from chitu.global_vars import get_global_args
 from chitu.ops.utils import make_op_dispatcher
+from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
 from chitu.utils import (
     try_import_platform_dep,
     try_import_opt_dep,
@@ -37,17 +40,22 @@ def blockfp8_gemm(
     b: torch.Tensor,
     b_s: torch.Tensor,
     *,
-    block_size: int = 128,
     round_scale_to_pow2: bool = False,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     impl: str = "auto",
 ):
     raise NotImplementedError
 
 
 @blockfp8_gemm.register_auto
-def _auto_blockfp8_gemm(*, round_scale_to_pow2: bool = False):
+def _auto_blockfp8_gemm(
+    *,
+    round_scale_to_pow2: bool = False,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
+):
     if (
-        has_deep_gemm
+        scale_block_shape == DEFAULT_SCALE_BLOCK_SHAPE
+        and has_deep_gemm
         and torch.get_default_dtype() == torch.bfloat16
         and (
             torch.cuda.get_device_capability()[0] == 9
@@ -67,13 +75,11 @@ def blockfp8_gemm_deep_gemm(
     b: torch.Tensor,
     b_s: torch.Tensor,
     *,
-    block_size: int = 128,
     round_scale_to_pow2: bool = False,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
 ):
-    if block_size != 128:
-        raise NotImplementedError(
-            f"deep_gemm only supports quantization block_size=128, but got {block_size}"
-        )
+    if scale_block_shape != DEFAULT_SCALE_BLOCK_SHAPE:
+        raise NotImplementedError("deep_gemm only supports 128x128 blockfp8 scales")
     if torch.cuda.get_device_capability()[0] == 10 and not round_scale_to_pow2:
         raise NotImplementedError(
             "deep_gemm does not support round_scale_to_pow2==False on sm_10x"
@@ -101,6 +107,8 @@ def soft_fp8_blockfp8_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
+    *,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     impl: str = "auto",
 ):
     """
@@ -137,6 +145,8 @@ def soft_fp8_blockfp8_gemm_npu(
     x: torch.Tensor,
     weight: torch.Tensor,
     scale: torch.Tensor,
+    *,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
 ) -> torch.Tensor:
     expert_tokens = None
     if get_global_args().models.name in ["Qwen3-32B-FP8"]:

@@ -40,6 +40,8 @@ def deepgemm_contiguous_fused_expert(
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
@@ -58,6 +60,8 @@ def _(
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
@@ -65,10 +69,9 @@ def _(
     if w1.dtype == torch.float8_e4m3fn:
         assert len(block_shape) == 2
         assert block_shape[0] == block_shape[1]
-        quant_block_size = block_shape[0]
         hidden_states_fp8, scale = blockfp8_act_quant(
             hidden_states.activation,
-            block_size=quant_block_size,
+            scale_block_shape=block_shape,
             round_scale_to_pow2=round_scale_to_pow2,
         )
         return deepgemm_contiguous_fused_expert(
@@ -91,6 +94,8 @@ def _(
             block_shape=block_shape,
             round_scale_to_pow2=round_scale_to_pow2,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             experts_start_idx=experts_start_idx,
         )
 
@@ -107,6 +112,8 @@ def _(
         w2=w2,
         activation=activation,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         experts_start_idx=experts_start_idx,
     )
 
@@ -123,6 +130,8 @@ def _(
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> ExpertBlockPermutedBatchedExpertResult:
@@ -160,9 +169,12 @@ def _(
     )
     del blocked_activation
 
+    assert activation in ["silu", "swigluoai_uninterleave"]
     intermediate_cache2 = silu_and_mul(
-        x=intermediate_cache1.view(-1, N),
+        intermediate_cache1.view(-1, N),
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha if activation == "swigluoai_uninterleave" else None,
+        swiglu_beta=swiglu_beta if activation == "swigluoai_uninterleave" else None,
         impl="triton",
     )
     del intermediate_cache1
@@ -195,6 +207,8 @@ def _(
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
@@ -218,6 +232,8 @@ def _(
         block_shape=block_shape,
         round_scale_to_pow2=round_scale_to_pow2,
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         experts_start_idx=experts_start_idx,
     )
 
@@ -234,6 +250,8 @@ def _(
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> ExpertBlockPermutedBatchedExpertResult:
@@ -256,7 +274,7 @@ def _(
 
     assert not soft_fp8
     assert block_shape is not None
-    assert activation == "silu"
+    assert activation in ["silu", "swigluoai_uninterleave"]
 
     blocked_activation = hidden_states.blocked_activation
     blocked_activation_scale = hidden_states.blocked_activation_scale
@@ -293,13 +311,15 @@ def _(
     intermediate_cache2 = silu_and_mul(
         intermediate_cache1.view(-1, N),
         swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha if activation == "swigluoai_uninterleave" else None,
+        swiglu_beta=swiglu_beta if activation == "swigluoai_uninterleave" else None,
         impl="triton",
     )
     del intermediate_cache1
 
     qintermediate_cache2, a2q_scale = blockfp8_act_quant(
         intermediate_cache2,
-        block_size=block_shape[0],
+        scale_block_shape=block_shape,
         round_scale_to_pow2=round_scale_to_pow2,
     )
     del intermediate_cache2
@@ -333,13 +353,14 @@ def _(
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ) -> BatchedExpertResult:
     assert not soft_fp8
     assert len(block_shape) == 2
     assert block_shape[0] == block_shape[1]
-    quant_block_size = block_shape[0]
     pad_block_size = 128
     n_experts = w1.shape[0]
     hidden_states = hidden_states.as_local_expert_ids(
@@ -353,7 +374,7 @@ def _(
         else:
             hidden_states_fp8, scale = blockfp8_act_quant(
                 hidden_states.activation,
-                block_size=quant_block_size,
+                scale_block_shape=block_shape,
                 round_scale_to_pow2=round_scale_to_pow2,
             )
         hidden_states = IndexedBatchedRoutedActivationWithScale(
@@ -378,6 +399,8 @@ def _(
             w2_scale=w2_scale,
             block_shape=block_shape,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             experts_start_idx=experts_start_idx,
         )
     else:
@@ -392,5 +415,7 @@ def _(
             w2=w2,
             activation=activation,
             swiglu_limit=swiglu_limit,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
             experts_start_idx=experts_start_idx,
         )

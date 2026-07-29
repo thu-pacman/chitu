@@ -949,6 +949,7 @@ class Backend:
                 ModelType.HF_QWEN3_5,
                 ModelType.LLADA2,
                 ModelType.DEEPSEEK_V4,
+                ModelType.MINIMAX_M3_VL,
             }:
                 if not args.disable_layerwise_load:
                     if args.gpu_preprocess is True:

@@ -75,6 +75,8 @@ class InferConfig(InferConfigLegacy):
     device_ids: Optional[list[int]] = MISSING
     pp_layer_partition: Optional[list[int]] = MISSING
     use_cuda_graph: bool | str = MISSING
+    minimax_sparse_decode_backend: str = MISSING
+    minimax_sparse_prefill_backend: str = MISSING
     npu_fusion_fp4: bool = MISSING
     num_blocks: int = MISSING
     max_multimodal_blocks: int = MISSING

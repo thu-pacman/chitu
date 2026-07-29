@@ -134,7 +134,34 @@ def _moe_fp8_candidate_configs(
         return []
     if block_shape is None:
         return _moe_default_candidate_configs(M=M, E=E)
+    block_n, block_k = block_shape
+    # MXFP8 uses [1, K] scale groups. Keep normal N tile sizes, but the K tile
+    # must not span multiple scale groups.
+    if block_n == 1:
+        return _build_moe_config_list(
+            block_m_values=[16, 32, 64],
+            block_n_values=[32, 64, 128],
+            block_k_values=[block_k],
+            group_m_values=[8, 16, 32],
+        )
     return [dict(cfg) for cfg in _build_block_shape_kernel_configs(block_shape)]
+
+
+def _moe_fp8_activation_round_scale_to_pow2(
+    *,
+    round_scale_to_pow2: bool,
+    weight_scale: Optional[torch.Tensor],
+    block_shape: Optional[list[int]],
+) -> bool:
+    if (
+        weight_scale is not None
+        and weight_scale.dtype == torch.uint8
+        and block_shape is not None
+    ):
+        # MXFP8 weights use E8M0 scales, but activation scales can stay FP32
+        # while still using W8A8 tensor-core GEMM.
+        return False
+    return round_scale_to_pow2
 
 
 def _prepend_default_config_candidate(
@@ -433,6 +460,7 @@ def fused_moe_kernel_wrapper_fp8(
     # Add bs as a tuning key if in graph, because bs is also a key for graph capturing and
     # thus fixed per graph.
     bs_if_in_graph = M if is_warming_up_or_cuda_graph_capture() else -1
+    scale_is_ue8m0 = B_scale is not None and B_scale.dtype == torch.uint8
     fused_moe_kernel_block_fp8[grid](
         A,
         B,
@@ -464,6 +492,7 @@ def fused_moe_kernel_wrapper_fp8(
         top_k=top_k,
         output_type=output_type,
         soft_fp8=soft_fp8,
+        SCALE_IS_UE8M0=scale_is_ue8m0,
         per_channel_quant=per_channel_quant,
         bs_if_in_graph=bs_if_in_graph,
         **config,
@@ -549,12 +578,14 @@ def fused_experts_key(
     *,
     activation: str = "silu",
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ):
     M = int(hidden_states.activation.shape[0])
     m_bucket = _bucket_m_for_autotune_key(M)
-    key_extra = (activation,)
+    key_extra = (activation, swiglu_alpha, swiglu_beta)
     return _build_moe_autotune_key(hidden_states, w1, w2, m_bucket, key_extra)
 
 
@@ -565,6 +596,8 @@ def fused_experts_config_candidates(
     *,
     activation: str = "silu",
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ):
@@ -585,6 +618,8 @@ def fused_experts(
     *,
     activation: str = "silu",
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
     config: Optional[dict[str, Any]] = None,
@@ -641,12 +676,13 @@ def fused_experts(
         config,
         compute_type,
     )
-    if activation == "silu":
-        intermediate_cache2 = silu_and_mul(
-            intermediate_cache1.view(-1, N), swiglu_limit=swiglu_limit
-        )
-    else:
-        raise ValueError(f"Unsupported FusedMoe activation: {activation}")
+    assert activation in ["silu", "swigluoai_uninterleave"]
+    intermediate_cache2 = silu_and_mul(
+        intermediate_cache1.view(-1, N),
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha if activation == "swigluoai_uninterleave" else None,
+        swiglu_beta=swiglu_beta if activation == "swigluoai_uninterleave" else None,
+    )
     fused_moe_kernel_wrapper(
         intermediate_cache2,
         w2,
@@ -831,6 +867,8 @@ def fused_experts_fp8_key(
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ):
@@ -858,6 +896,8 @@ def fused_experts_fp8_config_candidates(
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
 ):
@@ -884,6 +924,8 @@ def fused_experts_fp8(
     soft_fp8: bool = False,
     round_scale_to_pow2: bool = False,
     swiglu_limit: Optional[float] = None,
+    swiglu_alpha: float = 1.0,
+    swiglu_beta: float = 0.0,
     global_num_experts: int = -1,
     experts_start_idx: int = 0,
     config: Optional[dict[str, Any]] = None,
@@ -951,11 +993,16 @@ def fused_experts_fp8(
         block_n, block_k = block_shape
         hidden_states_activation, a1_scale = blockfp8_act_quant(
             hidden_states.activation,
-            block_size=block_k,
-            round_scale_to_pow2=round_scale_to_pow2,
+            scale_block_shape=block_shape,
+            round_scale_to_pow2=_moe_fp8_activation_round_scale_to_pow2(
+                round_scale_to_pow2=round_scale_to_pow2,
+                weight_scale=w1_scale,
+                block_shape=block_shape,
+            ),
         )
     else:
         hidden_states_activation = hidden_states.activation
+        a1_scale = None
 
     fused_moe_kernel_wrapper_fp8(
         hidden_states_activation,
@@ -974,20 +1021,27 @@ def fused_experts_fp8(
         soft_fp8=soft_fp8,
     )
 
-    if activation == "silu":
-        intermediate_cache2 = silu_and_mul(
-            intermediate_cache1.view(-1, N), swiglu_limit=swiglu_limit
-        )
-    else:
-        raise ValueError(f"Unsupported FusedMoe activation: {activation}")
+    assert activation in ["silu", "swigluoai_uninterleave"]
+    intermediate_cache2 = silu_and_mul(
+        intermediate_cache1.view(-1, N),
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha if activation == "swigluoai_uninterleave" else None,
+        swiglu_beta=swiglu_beta if activation == "swigluoai_uninterleave" else None,
+    )
 
     if not soft_fp8:
         block_n, block_k = block_shape
         intermediate_cache2, a2_scale = blockfp8_act_quant(
             intermediate_cache2,
-            block_size=block_k,
-            round_scale_to_pow2=round_scale_to_pow2,
+            scale_block_shape=block_shape,
+            round_scale_to_pow2=_moe_fp8_activation_round_scale_to_pow2(
+                round_scale_to_pow2=round_scale_to_pow2,
+                weight_scale=w2_scale,
+                block_shape=block_shape,
+            ),
         )
+    else:
+        a2_scale = None
 
     fused_moe_kernel_wrapper_fp8(
         intermediate_cache2,
@@ -1257,8 +1311,12 @@ def fused_experts_soft_fp4(
         block_n, block_k = block_shape
         hidden_states_activation, a1_scale = blockfp8_act_quant(
             hidden_states.activation,
-            block_size=block_k,
-            round_scale_to_pow2=round_scale_to_pow2,
+            scale_block_shape=block_shape,
+            round_scale_to_pow2=_moe_fp8_activation_round_scale_to_pow2(
+                round_scale_to_pow2=round_scale_to_pow2,
+                weight_scale=w1_scale,
+                block_shape=block_shape,
+            ),
         )
     else:
         hidden_states_activation = hidden_states.activation
@@ -1293,8 +1351,12 @@ def fused_experts_soft_fp4(
         block_n, block_k = block_shape
         intermediate_cache2, a2_scale = blockfp8_act_quant(
             intermediate_cache2,
-            block_size=block_k,
-            round_scale_to_pow2=round_scale_to_pow2,
+            scale_block_shape=block_shape,
+            round_scale_to_pow2=_moe_fp8_activation_round_scale_to_pow2(
+                round_scale_to_pow2=round_scale_to_pow2,
+                weight_scale=w2_scale,
+                block_shape=block_shape,
+            ),
         )
     fused_moe_kernel_wrapper_soft_fp4(
         intermediate_cache2,

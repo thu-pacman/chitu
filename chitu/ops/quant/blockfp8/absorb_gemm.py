@@ -2,7 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from typing import Optional
+
 import torch
+
+from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
 
 from chitu.ops.quant.blockfp8.convert import (
     blockfp8_weight_dequant,
@@ -23,7 +27,7 @@ def blockfp8_einsum_shc_hdc_shd(
     group_B: torch.Tensor,
     group_b_s: torch.Tensor,
     *,
-    block_size: int = 128,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     group_n: int = 128,
     group_k: int = 128,
     soft_fp8: bool = False,
@@ -45,7 +49,7 @@ def _einsum_shc_hdc_shd_torch(
     group_B,
     group_b_s,
     *,
-    block_size=128,
+    scale_block_shape=DEFAULT_SCALE_BLOCK_SHAPE,
     group_n=128,
     group_k=128,
     soft_fp8=False,
@@ -57,7 +61,7 @@ def _einsum_shc_hdc_shd_torch(
     weight_dequant_fn = (
         soft_fp8_blockfp8_weight_dequant if soft_fp8 else blockfp8_weight_dequant
     )
-    group_B = weight_dequant_fn(group_B, group_b_s, block_size=block_size)
+    group_B = weight_dequant_fn(group_B, group_b_s, scale_block_shape=scale_block_shape)
     return torch.einsum("shc,hdc->shd", group_A, group_B)
 
 
@@ -67,7 +71,7 @@ def _einsum_shc_hdc_shd_triton(
     group_B,
     group_b_s,
     *,
-    block_size=128,
+    scale_block_shape=DEFAULT_SCALE_BLOCK_SHAPE,
     group_n=128,
     group_k=128,
     soft_fp8=False,
@@ -76,7 +80,7 @@ def _einsum_shc_hdc_shd_triton(
     assert group_B.dim() == 3
     assert group_A.shape[1] == group_B.shape[0]
     assert group_A.shape[2] == group_B.shape[2]
-    assert block_size in [64, 128]
+    assert group_n in [64, 128] and group_k in [64, 128]
     return blockfp8_einsum_shc_hdc_shd_triton(
         group_A,
         group_B,

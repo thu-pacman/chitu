@@ -175,7 +175,9 @@ def _linear_block_fp4_fp8(
     x_shape = x.shape
     if x.dtype in {torch.float16, torch.bfloat16}:
         x = x.view(-1, x_shape[-1])
-        x, x_scale = blockfp8_act_quant(x, block_size=act_block_size)
+        x, x_scale = blockfp8_act_quant(
+            x, scale_block_shape=[act_block_size, act_block_size]
+        )
     elif x.dtype == torch.float8_e4m3fn:
         assert x_scale is not None
         x = x.view(-1, x_shape[-1])

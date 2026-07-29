@@ -1832,7 +1832,7 @@ class AttentionDeepSeekV4(Attention):
             return weight_dequant_fn(
                 self.wo_a.weight,
                 self.wo_a.scale,
-                block_size=self.wo_a.block_size,
+                scale_block_shape=self.wo_a.scale_block_shape,
             )
         else:
             assert False

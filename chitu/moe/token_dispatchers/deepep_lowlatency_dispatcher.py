@@ -12,6 +12,7 @@ import torch
 
 from chitu.distributed.comm_group import CommGroup
 from chitu.utils import parse_dtype
+from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
 from chitu.import_utils import try_import_opt_dep
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.moe.batched_expert_result import (
@@ -180,7 +181,10 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         round_scale_to_pow2 = False
         if (
             may_fuse_quant == "blockfp8"
-            and may_fuse_quant_kwargs.get("block_size", 128) == 128
+            and may_fuse_quant_kwargs.get(
+                "scale_block_shape", DEFAULT_SCALE_BLOCK_SHAPE
+            )
+            == DEFAULT_SCALE_BLOCK_SHAPE
             and parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
             <= 1
         ):

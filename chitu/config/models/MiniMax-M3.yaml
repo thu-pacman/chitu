@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: MiniMax-M3
+type: minimax-m3-vl
+source: "https://huggingface.co/MiniMaxAI/MiniMax-M3" # Just for displaying. No automatic download.
+tokenizer_type: "hf" # one of: hf, tiktoken
+
+dim: 6144
+head_dim: 128
+vocab_size: 200064
+n_layers: 60
+n_heads: 64
+n_kv_heads: 4
+norm_eps: 1e-6
+tie_word_embeddings: false
+qkv_has_bias: false
+n_attn_dense_layers: 3
+n_dense_layers: 3
+dense_intermediate_size: 12288
+moe_inter_dim: 3072
+shared_intermediate_size: 3072
+n_routed_experts: 128
+n_shared_experts: 1
+n_activated_experts: 4
+n_expert_groups: 1
+n_limited_groups: 1
+score_func: "sigmoid"
+norm_topk_prob: true
+route_scale: 2.0
+swiglu_alpha: 1.702
+swiglu_limit: 7.0
+index_n_heads: 4
+index_head_dim: 128
+index_block_size: 128
+index_topk_blocks: 16
+index_local_blocks: 1
+rope_theta: 5000000.0
+bos_token_id: 200034
+eos_token_id: 200020

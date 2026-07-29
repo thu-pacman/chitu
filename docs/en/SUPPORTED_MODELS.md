@@ -58,6 +58,8 @@
 | Llama-3.3-70B-Instruct |  | `models=Llama-3.3-70B-Instruct` | https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct |
 | Meta-Llama-3-8B-Instruct |  | `models=Meta-Llama-3-8B-Instruct` | https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct (The default checkpoint. Not the "original" one) |
 | Meta-Llama-3-8B-Instruct-original |  | `models=Meta-Llama-3-8B-Instruct-original` | https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct (Please use its "original" checkpoint) |
+| MiniMax-M3 |  | `models=MiniMax-M3` | https://huggingface.co/MiniMaxAI/MiniMax-M3 |
+| MiniMax-M3-MXFP8 |  | `models=MiniMax-M3-MXFP8` | https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8 |
 | Mixtral-8x7B-Instruct-v0.1 |  | `models=Mixtral-8x7B-Instruct-v0.1` | https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1 |
 | QwQ-32B |  | `models=QwQ-32B` | https://huggingface.co/Qwen/QwQ-32B |
 | QwQ-32B-AWQ |  | `models=QwQ-32B-AWQ` | https://huggingface.co/Qwen/QwQ-32B-AWQ |

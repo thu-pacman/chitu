@@ -25,6 +25,7 @@ class ModelType(str, Enum):
     HF_QWEN3_5 = "hf-qwen3-5"
     KIMI_K2_5 = "kimi-k2-5"
     GLM_5_2 = "glm-5-2"
+    MINIMAX_M3_VL = "minimax-m3-vl"
 
 
 def register_model(name: str | ModelType):

@@ -8,6 +8,7 @@ import torch
 
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.ops.utils import make_op_dispatcher
+from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
 from chitu.utils import try_import_platform_dep
 
 triton, has_triton = try_import_platform_dep("triton")
@@ -23,8 +24,11 @@ if has_triton:
 
 
 def blockfp8_weight_quant(
-    w: torch.Tensor, block_size: int = 128
+    w: torch.Tensor, scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    out_blk, in_blk = scale_block_shape
+    assert out_blk == in_blk, "blockfp8_weight_quant requires square scale blocks"
+    block_size = out_blk
     row, col = w.shape
     assert row % block_size == 0
     assert col % block_size == 0
@@ -50,15 +54,19 @@ def blockfp8_weight_quant(
 
 @make_op_dispatcher
 def blockfp8_weight_dequant(
-    x: torch.Tensor, s: torch.Tensor, block_size: int = 128, impl: str = "auto"
+    x: torch.Tensor,
+    s: torch.Tensor,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
+    impl: str = "auto",
 ) -> torch.Tensor:
     """
     Dequantizes the given weight tensor using the provided scale tensor.
 
     Args:
         x (torch.Tensor): The quantized weight tensor of shape (M, N).
-        s (torch.Tensor): The scale tensor of shape (M / block_size, N / block_size).
-        block_size (int, optional): The block size to use for dequantization. Defaults to 128.
+        s (torch.Tensor): The scale tensor.
+        scale_block_shape (list, optional): Scale block shape ``[out_blk, in_blk]``.
+            Defaults to ``[128, 128]``.
 
     Returns:
         torch.Tensor: The dequantized weight tensor of the same shape as `x`.
@@ -81,15 +89,20 @@ if has_triton:
 
 @make_op_dispatcher
 def soft_fp8_blockfp8_weight_dequant(
-    x: torch.Tensor, s: torch.Tensor, block_size: int = 128, impl: str = "auto"
+    x: torch.Tensor,
+    s: torch.Tensor,
+    *,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
+    impl: str = "auto",
 ) -> torch.Tensor:
     """
     Dequantizes the given weight tensor using the provided scale tensor.
 
     Args:
         x (torch.Tensor): The quantized weight tensor of shape (M, N).
-        s (torch.Tensor): The scale tensor of shape (M / block_size, N / block_size).
-        block_size (int, optional): The block size to use for dequantization. Defaults to 128.
+        s (torch.Tensor): The scale tensor.
+        scale_block_shape (list, optional): Scale block shape ``[out_blk, in_blk]``.
+            Defaults to ``[128, 128]``.
 
     Returns:
         torch.Tensor: The dequantized weight tensor of the same shape as `x`.
@@ -116,7 +129,7 @@ if has_triton:
 def blockfp8_act_quant(
     x: torch.Tensor,
     *,
-    block_size: int = 128,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     round_scale_to_pow2: bool = False,
     eps: float = 1e-4,
     impl: str = "auto",
@@ -126,9 +139,9 @@ def blockfp8_act_quant(
 
     Args:
         x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last
-            dimension size must be divisible by `block_size`.
-        block_size (int, optional): The size of the blocks to be used for quantization.
-            Default is 128.
+            dimension size must be divisible by the K-axis scale block size.
+        scale_block_shape (list, optional): Scale block shape ``[out_blk, in_blk]``.
+            Activation quantization uses ``in_blk``. Defaults to ``[128, 128]``.
         round_scale_to_pow2: Round scale to powers of 2, which is equivalent to ue8m0
             mathematically, but it does not necessarily mean the result tensor is stored in
             an int8 tensor.
@@ -155,10 +168,11 @@ def _auto_blockfp8_act_quant():
 def blockfp8_act_quant_torch(
     x: torch.Tensor,
     *,
-    block_size: int = 128,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     round_scale_to_pow2: bool = False,
     eps: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    block_size = scale_block_shape[1]
     assert x.shape[-1] % block_size == 0
     x_blocked = x.view(*x.shape[:-1], x.shape[-1] // block_size, block_size)
     s = torch.maximum(
@@ -201,7 +215,9 @@ def silu_and_mul_and_blockfp8_act_quant(
     *,
     expert_n_tokens: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[float] = None,
-    block_size: int = 128,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
     round_scale_to_pow2: bool = False,
     eps: float = 1e-4,
     impl: str = "auto",
