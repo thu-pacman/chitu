@@ -90,3 +90,7 @@ from chitu.ops.triton_ops.fused_recurrent import (
     fused_recurrent_gated_delta_rule_fwd_all_state_triton,
 )
 from chitu.ops.triton_ops.mhc import mhc_pre_triton, mhc_post_triton
+from chitu.ops.triton_ops.indexer_score_bf16 import (
+    bf16_index_score_ragged_qk_dsv32_triton,
+    bf16_index_score_ragged_q_paged_k_dsv32_triton,
+)

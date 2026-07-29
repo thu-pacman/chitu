@@ -1,10 +1,15 @@
 import os
+import re
+import math
+import einops
 import torch
 import pytest
 import packaging.version
+from types import SimpleNamespace
 from omegaconf import OmegaConf
 
 from chitu import global_vars
+import chitu.dsa_indexer as dsa_indexer_module
 from chitu.attn_backend import (
     RefAttnBackend,
     TritonAttnBackend,
@@ -27,8 +32,8 @@ from chitu.distributed.parallel_state import (
     initialize_parallel_groups,
     parallel_groups_initialized,
 )
-from chitu.global_vars import set_global_args
-from chitu.models.model_deepseek_v3 import AttentionDeepSeekV3
+from chitu.global_vars import set_global_args, get_global_args
+from chitu.models.model_deepseek_v3 import AttentionDeepSeekV3, Indexer
 from chitu.utils import (
     ceil_div,
     try_import_opt_dep,
@@ -44,11 +49,19 @@ from chitu.ops import (
     convert_req_index_to_global_ragged_index,
     dsa_fp8_paged_kvcache_read_dequant,
     read_from_paged_kv_cache,
+    bf16_index_score_ragged_q_paged_k_dsv32,
+    bf16_index_score_ragged_qk_dsv32,
+    apply_rotary_pos_emb_partial,
+    hadamard_transform,
 )
 from chitu.dsa_indexer import (
     DSAIndexer,
     support_indexer_deepgemm,
     support_indexer_hygon,
+)
+from chitu.kv_cache.providers.deepseek_v3 import (
+    deepseek_v3_indexer_cache_spec,
+    deepseek_v3_kv_cache_spec,
 )
 
 triton, has_triton = try_import_platform_dep("triton")
@@ -61,6 +74,10 @@ flash_attn3, has_flash_attn3 = try_import_opt_dep(
 )
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 hunyuan_ops, has_hunyuan_ops = try_import_opt_dep("hpc", "hpc_ops")
+scipy, has_scipy = try_import_opt_dep("scipy", "scipy")
+fast_hadamard_transform, has_fast_hadamard_transform = try_import_opt_dep(
+    "fast_hadamard_transform", "fast_hadamard_transform"
+)
 
 
 def _make_csa_hca_attn_backend(
@@ -580,12 +597,14 @@ def _ref_bf16_index_score(
 )
 @pytest.mark.parametrize("n_heads", [64])
 @pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("impl", ["torch_bf16", "hygon"])
+@pytest.mark.parametrize("impl", ["torch_bf16", "hygon", "triton_bf16"])
 def test_dsa_indexer_paged_kv_bf16(
     bs, s_q, s_k, n_heads, head_dim, impl, record_benchmark
 ):
     if impl == "hygon" and not support_indexer_hygon:
         pytest.skip("hygon indexer requires Hygon lightop")
+    if impl == "triton_bf16" and not (torch.cuda.is_available() and has_triton):
+        pytest.skip("triton_bf16 indexer requires CUDA + triton")
 
     _, total_memory = torch.cuda.mem_get_info()
     total_memory = total_memory / (1024**3)
@@ -747,6 +766,269 @@ def test_dsa_indexer_paged_kv_bf16(
     assert torch.equal(finite, torch.isfinite(logits_f)), "valid-region mask mismatch"
     assert_close(
         logits_f[finite],
+        ref_logits[finite],
+        rtol=1e-2,
+        atol=1e-2,
+        cos_sim_tol=1e-3,
+    )
+
+
+# ---------------------------------------------------------------------------
+# triton_bf16 indexer kernels — standalone precision tests.
+#
+# These exercise the two bf16 triton kernels used by ``indexer_type=triton_bf16``
+# directly against the fp32 reference ``_ref_bf16_index_score``, decoupled from
+# the ``torch_bf16`` / ``hygon`` suite above:
+#   - prefill:  bf16_index_score_ragged_qk_dsv32  (non-CP and CP)
+#   - decode:   bf16_index_score_ragged_q_paged_k_dsv32  (no CP)
+# ---------------------------------------------------------------------------
+
+
+def _triton_bf16_indexer_common_args(max_seq_len, mtp_size, n_heads, head_dim):
+    """Minimal global args shared by the triton_bf16 kernel tests."""
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_batch_size": 8,
+                    "op_impl": "torch",
+                    "use_cuda_graph": False,
+                    "tp_size": 1,
+                    "cache_type": "paged",
+                    "dp_size": 1,
+                    "mla_absorb": "absorb",
+                    "max_seq_len": max_seq_len,
+                    "mtp_size": mtp_size,
+                },
+                "models": {
+                    "index_n_heads": n_heads,
+                    "index_head_dim": head_dim,
+                },
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "old_seq_len_list, new_seq_len_list",
+    [
+        ([0], [4096]),  # single seq, pure prefill
+        (
+            [0, 0, 0],
+            [4096, 2048, 6144],
+        ),  # multi-seq prefill (must not bleed across seqs)
+        (
+            [2048, 1024, 512],
+            [4096, 2048, 3072],
+        ),  # multi-seq chunked prefill (has history)
+        ([6000], [8000]),  # long single-seq chunked prefill
+        ([0, 0, 0], [8000, 2048, 4096]),  # long/short mixed multi-seq
+    ],
+)
+@pytest.mark.parametrize("is_causal", [False])
+@pytest.mark.parametrize("n_heads", [64])
+@pytest.mark.parametrize("head_dim", [128])
+def test_triton_bf16_index_score_ragged_qk_nocp(
+    old_seq_len_list, new_seq_len_list, is_causal, n_heads, head_dim, record_benchmark
+):
+    """Non-causal prefill/chunked kernel ``bf16_index_score_ragged_qk_dsv32`` (non-CP).
+
+    The causal path is already covered end-to-end by
+    ``test_dsa_indexer_paged_kv_bf16`` (impl=triton_bf16); this keeps the
+    non-causal window (ke = seq_len + ks) which that suite does not exercise.
+    Each query attends only to its own sequence's keys in the ragged concat K.
+    """
+    if not (torch.cuda.is_available() and has_triton):
+        pytest.skip("triton_bf16 indexer requires CUDA + triton")
+
+    # The fp32 reference materializes a per-seq [m, h, s_k] tensor; large s_k
+    # OOMs on small CI GPUs. Skip big shapes there (same policy as
+    # test_dsa_indexer_paged_kv_bf16).
+    _, total_memory = torch.cuda.mem_get_info()
+    total_memory = total_memory / (1024**3)
+    if max(new_seq_len_list) > 4096 and total_memory < 80:
+        pytest.skip("Skip large s_k ref on devices with not enough memory")
+
+    device = "cuda"
+    torch.set_default_dtype(torch.bfloat16)
+    max_seq_len = 8192
+    _triton_bf16_indexer_common_args(max_seq_len, 1, n_heads, head_dim)
+
+    seq_len_delta = BatchedSeqLenDelta(
+        old_seq_len_list,
+        new_seq_len_list,
+        device=device,
+        cache_prefix_lens_tensor_device=False,
+        cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
+        cache_delta_position_ids_tensor_device=False,
+        cache_delta_seq_ids_tensor_device=False,
+    )
+
+    s_q = seq_len_delta.delta_total_len
+    q = torch.randn(s_q, n_heads, head_dim, device=device)
+    weights = torch.randn(s_q, n_heads, dtype=torch.float32, device=device)
+    k_ragged = torch.randn(seq_len_delta.new.total_len, head_dim, device=device)
+
+    # Non-CP ks/ke: ks = prefix start row, ke = abs_pos + ks + 1 (causal).
+    prefix = seq_len_delta.new.prefix_lens_tensor_device
+    seq_ids = seq_len_delta.delta_seq_ids_tensor_device
+    pos = seq_len_delta.delta_position_ids_tensor_device
+    ks = prefix[seq_ids.long()].to(torch.int32).contiguous()
+    if is_causal:
+        ke = (pos + ks + 1).to(torch.int32).contiguous()
+    else:
+        lens = seq_len_delta.new.lens_tensor_device[seq_ids.long()]
+        ke = (lens + ks).to(torch.int32).contiguous()
+
+    out = record_benchmark.run(
+        lambda: bf16_index_score_ragged_qk_dsv32(
+            q,
+            weights,
+            k_ragged,
+            seq_len_delta,
+            is_causal,
+            ke,
+            ks,
+            impl="triton",
+        ),
+        x_val=f"bs={len(new_seq_len_list)} s_q={s_q} s_k={seq_len_delta.new.total_len}",
+        impl="triton_bf16",
+    )
+    out_f = out.to(torch.float32)
+
+    ref_logits = _ref_bf16_index_score(
+        q,
+        weights,
+        k_ragged,
+        seq_len_delta,
+        static_max_n=max_seq_len,
+        is_causal=is_causal,
+    )
+    # The kernel compresses columns to actual_max_n; ref padding beyond that must
+    # be all -inf (i.e. no finite value was truncated away).
+    n_cols = out_f.shape[-1]
+    assert torch.isinf(
+        ref_logits[:, n_cols:]
+    ).all(), "kernel truncated finite columns (actual_max_n too small)"
+    ref_logits = ref_logits[:, :n_cols]
+
+    finite = torch.isfinite(ref_logits)
+    assert torch.equal(
+        finite, torch.isfinite(out_f)
+    ), "valid-region mask mismatch (possible cross-seq bleed)"
+    assert_close(
+        out_f[finite],
+        ref_logits[finite],
+        rtol=1e-2,
+        atol=1e-2,
+        cos_sim_tol=1e-3,
+    )
+
+
+@pytest.mark.parametrize("pcp_size", [2, 3, 4])
+@pytest.mark.parametrize("stage", ["prefill", "chunked"])
+@pytest.mark.parametrize("n_heads", [64])
+@pytest.mark.parametrize("head_dim", [128])
+def test_triton_bf16_index_score_ragged_qk_cp(pcp_size, stage, n_heads, head_dim):
+    """CP path of the prefill kernel ``bf16_index_score_ragged_qk_dsv32``.
+
+    Simulates ``pcp_size`` ranks: global K is shared, q/weights are sliced
+    ``[r::pcp_size]`` per rank. Each rank passes ks (global prefix start row)
+    and the full global ke = (local abs_pos + 1) + ks. Per-rank outputs are
+    scattered back and must match the un-split fp32 global reference.
+
+    Focus: multi-seq must not bleed across sequences — the exact scenario where
+    the hygon CP branch (which zeroes ks) is wrong.
+    """
+    if not (torch.cuda.is_available() and has_triton):
+        pytest.skip("triton_bf16 indexer requires CUDA + triton")
+
+    # Fixed shapes go up to s_k=8192; the fp32 reference materializes a per-seq
+    # [m, h, s_k] tensor that OOMs on small CI GPUs. Skip there (same policy as
+    # test_dsa_indexer_paged_kv_bf16).
+    _, total_memory = torch.cuda.mem_get_info()
+    total_memory = total_memory / (1024**3)
+    if total_memory < 80:
+        pytest.skip("Skip large s_k ref on devices with not enough memory")
+
+    device = "cuda"
+    torch.set_default_dtype(torch.bfloat16)
+    max_seq_len = 8192
+    _triton_bf16_indexer_common_args(max_seq_len, 1, n_heads, head_dim)
+
+    # Fixed long/short mixed multi-seq to fully expose cross-seq bleed.
+    if stage == "prefill":
+        old_seq_len_list = [0, 0, 0]
+        new_seq_len_list = [8192, 4096, 6144]
+    else:  # chunked: has history
+        old_seq_len_list = [2048, 1024, 512]
+        new_seq_len_list = [8192, 4096, 6144]
+
+    seq_len_delta = BatchedSeqLenDelta(
+        old_seq_len_list,
+        new_seq_len_list,
+        device=device,
+        cache_prefix_lens_tensor_device=False,
+        cache_position_ids_tensor_device=False,
+        cache_seq_ids_tensor_device=False,
+        cache_delta_position_ids_tensor_device=False,
+        cache_delta_seq_ids_tensor_device=False,
+    )
+
+    s_q = seq_len_delta.delta_total_len
+    q = torch.randn(s_q, n_heads, head_dim, device=device)
+    weights = torch.randn(s_q, n_heads, dtype=torch.float32, device=device)
+    k_ragged = torch.randn(seq_len_delta.new.total_len, head_dim, device=device)
+
+    # Global fp32 reference (not split): per-rank results scattered back must agree.
+    ref_logits = _ref_bf16_index_score(
+        q, weights, k_ragged, seq_len_delta, static_max_n=max_seq_len, is_causal=True
+    )
+
+    prefix = seq_len_delta.new.prefix_lens_tensor_device
+    seq_ids = seq_len_delta.delta_seq_ids_tensor_device
+    pos = seq_len_delta.delta_position_ids_tensor_device
+
+    out_global = torch.full_like(ref_logits, float("-inf"))
+    for rank in range(pcp_size):
+        local_row_idx = torch.arange(rank, s_q, pcp_size, device=device)
+        if local_row_idx.numel() == 0:
+            continue
+        local_seq_ids = seq_ids[local_row_idx].long()
+        local_pos = pos[local_row_idx]
+        ks = prefix[local_seq_ids].to(torch.int32).contiguous()  # global start row
+        # Full global ke = local window length (abs_pos + 1) + global prefix.
+        ke = (local_pos + 1 + ks).to(torch.int32).contiguous()
+
+        q_local = q[local_row_idx].contiguous()
+        w_local = weights[local_row_idx].contiguous()
+
+        out_local = bf16_index_score_ragged_qk_dsv32(
+            q_local,
+            w_local,
+            k_ragged,  # global K, not split
+            seq_len_delta,
+            True,  # is_causal
+            ke,
+            ks,
+            impl="triton",
+        )
+        out_local_f = out_local.to(torch.float32)
+        n_cols = out_local_f.shape[-1]
+        out_global[
+            local_row_idx.unsqueeze(1),
+            torch.arange(n_cols, device=device).unsqueeze(0),
+        ] = out_local_f
+
+    finite = torch.isfinite(ref_logits)
+    assert torch.equal(
+        finite, torch.isfinite(out_global)
+    ), "valid-region mask mismatch (possible cross-seq bleed)"
+    assert_close(
+        out_global[finite],
         ref_logits[finite],
         rtol=1e-2,
         atol=1e-2,
@@ -3966,3 +4248,617 @@ def test_reconstruct_prefill_matches_full_kv_attention(chunk_lens):
         assert_close(out, ref, atol=1e-4, rtol=1e-4)
         prev_len = new_len
     torch.set_default_dtype(prev_default_dtype)
+
+
+# ===========================================================================
+# DSA indexer scheduling / config / KV-layout tests
+# (merged from test/pytest/test_indexer.py — mock-based control-flow checks,
+#  CPU-only, no GPU required)
+# ===========================================================================
+
+BACKEND_METHODS = [
+    ("deepgemm", "blockfp8_index_score_dsa_deepgemm"),
+    ("hygon", "bf16_index_score_dsa_hygon"),
+    ("torch_bf16", "bf16_index_score_dsa_torch_bf16"),
+    ("triton_bf16", "bf16_index_score_dsa_triton_bf16"),
+    ("triton", "blockfp8_index_score_dsa_torch_or_triton"),
+    ("torch", "blockfp8_index_score_dsa_torch_or_triton"),
+]
+
+
+class AttrNamespace(SimpleNamespace):
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+
+def _indexer_without_runtime_init(impl: str) -> DSAIndexer:
+    indexer = object.__new__(DSAIndexer)
+    indexer.impl = impl
+    indexer.static_max_n = 8192
+    indexer.mtp_size = 1
+    return indexer
+
+
+def _indexer_seq_len_delta(*, max_len: int = 3, is_decode_stage: bool = False):
+    return SimpleNamespace(
+        is_decode_stage=is_decode_stage,
+        delta_position_ids_tensor_device=torch.arange(3, dtype=torch.int32),
+        delta_seq_ids_tensor_device=torch.zeros(3, dtype=torch.int32),
+        new=SimpleNamespace(
+            max_len=max_len,
+            position_ids_tensor_device=torch.arange(3, dtype=torch.int32),
+            seq_ids_tensor_device=torch.zeros(3, dtype=torch.int32),
+        ),
+    )
+
+
+@pytest.mark.parametrize(("impl", "method_name"), BACKEND_METHODS)
+@pytest.mark.parametrize(
+    "mode", ["select_all", "logits", "decode_topk", "long_prefill_topk"]
+)
+def test_dsa_indexer_routing_for_every_backend(monkeypatch, impl, method_name, mode):
+    """All four routing exits of ``DSAIndexer.dsa_indexer`` for every backend.
+
+    ``mode`` selects the exit; the score method is mocked per backend and the
+    branch that fires is asserted via the recorded ``skip_prefill_score`` and
+    the returned value:
+      - "select_all"        : return_indices=True + short prefill (max_len <=
+        index_topk) -> scoring skipped (skip=True), TopK-width arange returned.
+      - "logits"            : return_indices=False -> scoring runs (skip=False),
+        its result returned as-is.
+      - "decode_topk"       : return_indices=True + decode stage -> scoring runs,
+        TopK indices returned.
+      - "long_prefill_topk" : return_indices=True + prefill with max_len >
+        index_topk -> scoring runs, TopK indices returned.
+    """
+    # select_all / logits are asserted for every backend (routing may branch on
+    # the backend's score method, which is mocked here). The TopK exits (decode /
+    # long prefill) are backend-agnostic post-processing: once scoring returns,
+    # dsa_indexer calls topk_indices the same way regardless of impl. So any one
+    # backend suffices as the representative — we reuse "triton" as the original
+    # test did — and the others are skipped to avoid redundant coverage.
+    if mode in ("decode_topk", "long_prefill_topk") and impl != "triton":
+        pytest.skip(
+            "TopK routing is backend-agnostic; covered by the triton representative"
+        )
+
+    indexer = _indexer_without_runtime_init(impl)
+    calls = []
+
+    # Per-mode config: seq_len_delta, return_indices, and the score stub result.
+    if mode == "select_all":
+        seq_len_delta = _indexer_seq_len_delta()  # prefill, max_len=3 <= topk=4
+        return_indices = True
+        score_result = None
+    elif mode == "logits":
+        seq_len_delta = _indexer_seq_len_delta()
+        return_indices = False
+        score_result = torch.randn(3, 4)
+    elif mode == "decode_topk":
+        seq_len_delta = _indexer_seq_len_delta(max_len=4, is_decode_stage=True)
+        return_indices = True
+        score_result = torch.randn(3, 4)
+    else:  # long_prefill_topk
+        seq_len_delta = _indexer_seq_len_delta(max_len=5, is_decode_stage=False)
+        return_indices = True
+        score_result = torch.randn(3, 5)
+
+    def fake_score(*args, skip_prefill_score=False, **kwargs):
+        calls.append(skip_prefill_score)
+        return score_result
+
+    monkeypatch.setattr(indexer, method_name, fake_score)
+
+    expected_topk = torch.full((3, 4), 7, dtype=torch.int64)
+    if mode in ("decode_topk", "long_prefill_topk"):
+        monkeypatch.setattr(
+            dsa_indexer_module, "topk_indices", lambda *args, **kwargs: expected_topk
+        )
+
+    actual = indexer.dsa_indexer(
+        torch.empty(3, 1),
+        torch.empty(3, 1),
+        None,
+        torch.empty(3, 1),
+        seq_len_delta,
+        object(),
+        is_causal=True,
+        index_topk=4,
+        return_indices=return_indices,
+    )
+
+    if mode == "select_all":
+        assert calls == [True]  # select-all skips scoring
+        # Keep the configured TopK width even when the actual sequence is shorter.
+        assert torch.equal(actual, torch.arange(4, dtype=torch.int32).repeat(3, 1))
+    elif mode == "logits":
+        assert calls == [False]  # logits request keeps the score path
+        assert actual is score_result
+    else:  # decode_topk / long_prefill_topk keep the score path then TopK
+        assert calls == [False]
+        assert actual is expected_topk
+
+
+def _dsa_args(
+    *,
+    kv_quant_type=None,
+    main_kv_quant_type=None,
+    indexer_type="torch_bf16",
+):
+    kv_cache_rules = []
+    if kv_quant_type is not None:
+        kv_cache_rules.append(SimpleNamespace(regex="^indexer_k$", type=kv_quant_type))
+    if main_kv_quant_type is not None:
+        kv_cache_rules.append(
+            SimpleNamespace(regex="^(kv_lora|k_pe)$", type=main_kv_quant_type)
+        )
+    return SimpleNamespace(
+        models=AttrNamespace(
+            index_topk=2048,
+            index_head_dim=128,
+            index_n_heads=32,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            quant_config=SimpleNamespace(
+                kv_cache=SimpleNamespace(rules=kv_cache_rules)
+            ),
+        ),
+        infer=SimpleNamespace(
+            indexer_type=indexer_type,
+            cache_type="paged",
+            mtp_size=1,
+            mla_absorb="absorb",
+            tp_size=1,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("indexer_type", "kv_quant_type", "wrong_quant_label"),
+    [
+        # bf16 indexer types reject fp8-quantized indexer KV
+        ("hygon", "fp8_pertoken_indexer", "FP8"),
+        ("torch_bf16", "fp8_pertoken_indexer", "FP8"),
+        ("triton_bf16", "fp8_pertoken_indexer", "FP8"),
+        # fp8 indexer types reject unquantized (bf16) indexer KV
+        ("deepgemm", None, "BF16"),
+        ("triton", None, "BF16"),
+        ("torch", None, "BF16"),
+    ],
+)
+def test_indexer_types_require_matching_dsa_indexer_kv_quant(
+    indexer_type, kv_quant_type, wrong_quant_label
+):
+    """Each indexer_type must reject the mismatched indexer-KV quantization.
+
+    - bf16 types (hygon/torch_bf16/triton_bf16) require unquantized KV, so an
+      fp8_pertoken_indexer rule is rejected with an "FP8 ..." message.
+    - fp8 types (deepgemm/triton/torch) require fp8 KV, so an unquantized
+      (no rule) config is rejected with a "BF16 ..." message.
+    """
+    args = _dsa_args(kv_quant_type=kv_quant_type)
+
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            f"Unrecognized indexer_type {indexer_type} for "
+            f"{wrong_quant_label} indexer KV quantization."
+        ),
+    ):
+        dsa_indexer_module.validate_indexer_config(args, indexer_type)
+
+
+@pytest.mark.parametrize(
+    ("indexer_type", "kv_quant_type", "expected_keys", "expected_dtypes"),
+    [
+        (
+            "deepgemm",
+            "fp8_pertoken_indexer",
+            {"indexer_k_ks"},
+            {"indexer_k_ks": torch.float8_e4m3fn},
+        ),
+        (
+            "triton",
+            "fp8_pertoken_indexer",
+            {"indexer_k", "indexer_ks"},
+            {"indexer_k": torch.float8_e4m3fn, "indexer_ks": torch.float32},
+        ),
+        (
+            "torch",
+            "fp8_pertoken_indexer",
+            {"indexer_k", "indexer_ks"},
+            {"indexer_k": torch.float8_e4m3fn, "indexer_ks": torch.float32},
+        ),
+        # Unquantized (bf16) indexer KV: single bf16 base tensor.
+        (
+            "torch_bf16",
+            None,
+            {"indexer_k"},
+            {"indexer_k": torch.bfloat16},
+        ),
+    ],
+)
+def test_dsa_indexer_cache_layout_follows_indexer_type(
+    indexer_type, kv_quant_type, expected_keys, expected_dtypes
+):
+    """indexer KV cache spec (keys/dtypes/quant_type) per indexer_type.
+
+    fp8 types use their fp8_pertoken_indexer layout (deepgemm packs K+scale
+    into one tensor; triton/torch keep separate indexer_k + indexer_ks); the
+    unquantized bf16 type keeps a single bf16 indexer_k base tensor.
+
+    Assertions check tensor keys, dtypes and quant_type; per-token shapes are
+    intentionally not hard-coded here (they follow index_head_dim in the
+    provider) except for the bf16 base tensor, which the original test pinned.
+    """
+    spec = deepseek_v3_indexer_cache_spec(
+        _dsa_args(kv_quant_type=kv_quant_type, indexer_type=indexer_type),
+        None,
+    )
+
+    assert set(spec.kvargs["shape_per_token_dict"]) == expected_keys
+    assert spec.kvargs["dtype_dict"] == expected_dtypes
+    assert spec.kvargs["quant_type"] == kv_quant_type
+
+    if kv_quant_type is None:
+        # bf16 base tensor: single indexer_k of size index_head_dim (128 here).
+        assert spec.kvargs["shape_per_token_dict"] == {"indexer_k": (128,)}
+
+
+def test_fp8_dsa_main_cache_validates_base_tensor_rules_for_packed_layout():
+    spec = deepseek_v3_kv_cache_spec(
+        _dsa_args(main_kv_quant_type="fp8_pertoken_dsa"), None
+    )
+
+    assert spec.kvargs["shape_per_token_dict"] == {"kv_lora_k_pe": (656,)}
+    assert spec.kvargs["dtype_dict"] == {"kv_lora_k_pe": torch.float8_e4m3fn}
+    assert spec.kv_keys == ["kv_lora", "k_pe"]
+
+
+def _paged_accessor(*keys: str) -> PagedKVCacheAccessor:
+    return PagedKVCacheAccessor(
+        torch.zeros(1, 1, dtype=torch.int32),
+        {key: torch.empty(1) for key in keys},
+    )
+
+
+@pytest.mark.parametrize(
+    ("impl", "method_name", "append_fn", "read_fn", "accessor_key", "n_tensor_args"),
+    [
+        # deepgemm: its own packed append + indexer read; score takes
+        # (q, k, k_scale, weights) -> 4 leading tensor args.
+        (
+            "deepgemm",
+            "blockfp8_index_score_dsa_deepgemm",
+            "append_to_paged_kv_cache_blockfp8_deepgemm",
+            "read_from_paged_indexer_kv_cache_deepgemm",
+            "indexer_k_ks",
+            4,
+        ),
+        # bf16 backends: shared paged append + read; score takes (q, k, weights)
+        # -> 3 leading tensor args (no separate k_scale).
+        (
+            "hygon",
+            "bf16_index_score_dsa_hygon",
+            "append_to_paged_kv_cache",
+            "read_from_paged_kv_cache",
+            "indexer_k",
+            3,
+        ),
+        (
+            "torch_bf16",
+            "bf16_index_score_dsa_torch_bf16",
+            "append_to_paged_kv_cache",
+            "read_from_paged_kv_cache",
+            "indexer_k",
+            3,
+        ),
+        (
+            "triton_bf16",
+            "bf16_index_score_dsa_triton_bf16",
+            "append_to_paged_kv_cache",
+            "read_from_paged_kv_cache",
+            "indexer_k",
+            3,
+        ),
+    ],
+)
+def test_dsa_fast_path_appends_cache_without_reading(
+    monkeypatch, impl, method_name, append_fn, read_fn, accessor_key, n_tensor_args
+):
+    """Prefill fast path (skip_prefill_score=True): append the cache but never
+    read it back or compute scores.
+
+    Covers deepgemm (packed indexer_k_ks + deepgemm-specific append/read, score
+    signature has a separate k_scale so 4 tensor args) and the bf16 backends
+    (hygon/torch_bf16/triton_bf16, shared paged append/read, 3 tensor args).
+    The score method returns None and only the append helper must fire.
+    """
+    indexer = _indexer_without_runtime_init(impl)
+    appended = []
+    monkeypatch.setattr(
+        dsa_indexer_module,
+        append_fn,
+        lambda *args, **kwargs: appended.append(True),
+    )
+    monkeypatch.setattr(
+        dsa_indexer_module,
+        read_fn,
+        lambda *args, **kwargs: pytest.fail("fast path must not read the cache"),
+    )
+
+    tensor_args = [torch.empty(3, 1) for _ in range(n_tensor_args)]
+    result = getattr(indexer, method_name)(
+        *tensor_args,
+        _indexer_seq_len_delta(),
+        _paged_accessor(accessor_key),
+        skip_prefill_score=True,
+    )
+
+    assert result is None
+    assert appended == [True]
+
+
+@pytest.mark.parametrize("impl", ["triton", "torch"])
+@pytest.mark.parametrize("cache_layout", ["paged", "dense"])
+def test_torch_or_triton_fast_path_appends_k_and_scale_without_scoring(
+    monkeypatch, impl, cache_layout
+):
+    indexer = _indexer_without_runtime_init(impl)
+    appended = []
+    monkeypatch.setattr(
+        dsa_indexer_module,
+        "get_global_args",
+        lambda: SimpleNamespace(
+            infer=SimpleNamespace(
+                raise_lower_bit_float_to=None,
+                max_seq_len=8192,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        dsa_indexer_module,
+        "blockfp8_index_score_ragged_q_paged_k_dsv32",
+        lambda *args, **kwargs: pytest.fail("fast path must not compute scores"),
+    )
+    monkeypatch.setattr(
+        dsa_indexer_module,
+        "blockfp8_index_score_ragged_q_dense_k_dsv32",
+        lambda *args, **kwargs: pytest.fail("fast path must not compute scores"),
+    )
+
+    if cache_layout == "paged":
+        monkeypatch.setattr(
+            dsa_indexer_module,
+            "append_to_paged_kv_cache",
+            lambda *args, **kwargs: appended.append(True),
+        )
+        accessor = _paged_accessor("indexer_k", "indexer_ks")
+    else:
+        monkeypatch.setattr(
+            dsa_indexer_module,
+            "append_to_dense_kv_cache",
+            lambda *args, **kwargs: appended.append(True),
+        )
+        accessor = DenseKVCacheAccessor(
+            {"indexer_k": torch.empty(1), "indexer_ks": torch.empty(1)}
+        )
+
+    result = indexer.blockfp8_index_score_dsa_torch_or_triton(
+        torch.empty(3, 1),
+        torch.empty(3, 1),
+        torch.empty(3, 1),
+        torch.empty(3, 1),
+        _indexer_seq_len_delta(),
+        accessor,
+        skip_prefill_score=True,
+    )
+
+    assert result is None
+    assert appended == [True, True]
+
+
+# ===========================================================================
+# DSA indexer Q/K builder tests
+# (merged from test/pytest/test_indexer_qk.py — RoPE / norm / (fp8) quant
+#  preprocessing in Indexer._build_index_qk, numerical vs reference)
+# ===========================================================================
+
+
+class MonkIndexerImpl:
+    """Monkey DSAIndexer impl."""
+
+    def __init__(self, impl: str):
+        self.impl = impl
+
+
+def _make_qk_indexer(
+    n_heads,
+    head_dim,
+    rope_head_dim,
+    impl,
+    rope_layout,
+    device,
+    *,
+    fp8_indexer_kv=False,
+):
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {"max_seq_len": 4096, "op_impl": "torch"},
+                "models": {
+                    "index_n_heads": n_heads,
+                    "index_head_dim": head_dim,
+                    "dim": n_heads * head_dim,
+                    "qk_rope_head_dim": rope_head_dim,
+                    "q_lora_rank": 0,
+                    "index_topk": 2048,
+                    "index_rope_layout": rope_layout,
+                    "index_norm_dtype": "float32",
+                    "quant_config": {
+                        "kv_cache": {
+                            "rules": (
+                                [
+                                    {
+                                        "regex": "^indexer_k$",
+                                        "type": "fp8_pertoken_indexer",
+                                    }
+                                ]
+                                if fp8_indexer_kv
+                                else []
+                            )
+                        }
+                    },
+                },
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+
+    model_cfg = get_global_args().models
+    indexer = Indexer(
+        model_cfg,
+        checkpoint_prefix="indexer",
+        indexer_impl=MonkIndexerImpl(impl),
+    )
+    return indexer.to(device)
+
+
+def _make_qk_freqs_cis(s, rope_head_dim, device):
+    complex_freqs = torch.polar(
+        torch.ones(s, rope_head_dim // 2, device=device, dtype=torch.float32),
+        torch.rand(s, rope_head_dim // 2, device=device, dtype=torch.float32)
+        * 2
+        * math.pi,
+    )
+    return BatchedFreqsCis(
+        complex_freqs.real.contiguous().to(torch.bfloat16),
+        complex_freqs.imag.contiguous().to(torch.bfloat16),
+    )
+
+
+def _dequant_blockfp8(x_fp8, scale, block_size=128):
+    x = x_fp8.to(torch.float32)
+    x_blocked = x.view(*x.shape[:-1], x.shape[-1] // block_size, block_size)
+    dequant = x_blocked * scale.unsqueeze(-1)
+    return dequant.view(x_fp8.shape)
+
+
+def _ref_qk_transform(
+    indexer,
+    q,
+    k,
+    freqs_cis,
+    head_dim,
+    rope_head_dim,
+    rope_layout,
+    *,
+    use_hadamard_transform,
+):
+    """Reference"""
+    q3 = einops.rearrange(q.clone(), "s (h d) -> s h d", d=head_dim)
+    k_normed = indexer.k_norm(k.clone())
+    q_rot, k_rot, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
+        q3,
+        k_normed,
+        freqs_cis,
+        q_rotary_end=rope_head_dim,
+        k_rotary_end=rope_head_dim,
+        rotary_type=rope_layout,
+        impl="torch_npu" if has_torch_npu else "auto",
+    )
+    if use_hadamard_transform:
+        q_rot = hadamard_transform(q_rot, scale=head_dim**-0.5)
+        k_rot = hadamard_transform(k_rot, scale=head_dim**-0.5)
+    return q_rot, k_rot
+
+
+@pytest.mark.parametrize(
+    ("path", "impl"),
+    [
+        ("bf16", "torch_bf16"),
+        ("bf16", "hygon"),
+        ("bf16", "triton_bf16"),
+        ("fp8", "deepgemm"),
+        ("fp8", "triton"),
+    ],
+)
+@pytest.mark.parametrize("rope_layout", ["separated", "interleaved"])
+@pytest.mark.parametrize("s", [1, 8])
+def test_build_index_qk(path, impl, rope_layout, s):
+    """Indexer._build_index_qk Q/K preprocessing vs fp32 reference.
+
+    Two paths share the same build-and-compare skeleton:
+      - "bf16" (torch_bf16 / hygon / triton_bf16): RoPE + norm only, returns
+        plain tensors with a None scale.
+      - "fp8" (deepgemm / triton): RoPE + norm + Hadamard + block-fp8 quant,
+        returns quantized tensors with a per-block scale (dequantized before
+        comparison, looser tolerances).
+    """
+    if path == "fp8":
+        if not (has_scipy or has_fast_hadamard_transform):
+            pytest.skip(
+                "A Hadamard transform implementation (scipy or "
+                "fast_hadamard_transform) is required;"
+            )
+        if not has_native_fp8():
+            pytest.skip("Float8_e4m3fn support is required;")
+
+    torch.manual_seed(0)
+    torch.set_default_dtype(torch.bfloat16)
+    device = "cuda"
+
+    n_heads, head_dim, rope_head_dim = 4, 128, 64
+    indexer = _make_qk_indexer(
+        n_heads,
+        head_dim,
+        rope_head_dim,
+        impl,
+        rope_layout,
+        device,
+        fp8_indexer_kv=(path == "fp8"),
+    )
+
+    x = torch.randn(s, n_heads * head_dim, device=device)
+    q = torch.randn(s, n_heads * head_dim, device=device)
+    k = torch.randn(s, head_dim, device=device)
+    freqs_cis = _make_qk_freqs_cis(s, rope_head_dim, device)
+
+    (q_built, q_scale), (k_built, k_scale) = indexer._build_index_qk(
+        x, q.clone(), k.clone(), freqs_cis
+    )
+
+    if path == "bf16":
+        # The bf16/hygon branch returns plain tensors with a None scale.
+        assert q_scale is None and k_scale is None
+        assert q_built.shape == (s, n_heads, head_dim)
+        assert k_built.shape == (s, head_dim)
+        q_out, k_out = q_built, k_built
+    else:
+        # The fp8 path returns quantized tensors with a per-block scale.
+        assert q_built.dtype == torch.float8_e4m3fn
+        assert k_built.dtype == torch.float8_e4m3fn
+        assert q_scale is not None and k_scale is not None
+        assert q_built.shape == (s, n_heads, head_dim)
+        assert k_built.shape == (s, head_dim)
+        q_out = _dequant_blockfp8(q_built, q_scale, block_size=indexer.block_size)
+        k_out = _dequant_blockfp8(k_built, k_scale, block_size=indexer.block_size)
+
+    q_ref, k_ref = _ref_qk_transform(
+        indexer,
+        q,
+        k,
+        freqs_cis,
+        head_dim,
+        rope_head_dim,
+        rope_layout,
+        use_hadamard_transform=(path == "fp8"),
+    )
+
+    if path == "bf16":
+        assert_close(q_out, q_ref, rtol=1e-2, atol=1e-2)
+        assert_close(k_out, k_ref, rtol=1e-2, atol=1e-2)
+    else:
+        assert_close(q_out, q_ref.float(), rtol=5e-2, atol=1e-1, cos_sim_tol=1e-2)
+        assert_close(k_out, k_ref.float(), rtol=5e-2, atol=1e-1, cos_sim_tol=1e-2)

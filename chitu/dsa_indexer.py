@@ -8,6 +8,8 @@ from typing import Optional
 from chitu.ops import (
     blockfp8_index_score_ragged_q_dense_k_dsv32,
     blockfp8_index_score_ragged_q_paged_k_dsv32,
+    bf16_index_score_ragged_q_paged_k_dsv32,
+    bf16_index_score_ragged_qk_dsv32,
     append_to_paged_kv_cache,
     append_to_dense_kv_cache,
     append_to_paged_kv_cache_blockfp8_deepgemm,
@@ -88,6 +90,8 @@ def validate_indexer_config(args, indexer_type):
             _validate_hygon_indexer_config(args)
         elif indexer_type == "torch_bf16":
             _validate_torch_bf16_indexer_config(args)
+        elif indexer_type == "triton_bf16":
+            _validate_triton_bf16_indexer_config(args)
         else:
             raise ValueError(
                 f"Unrecognized indexer_type {indexer_type} for BF16 indexer KV quantization."
@@ -140,6 +144,15 @@ def _validate_torch_bf16_indexer_config(args):
         raise ValueError("indexer_type=torch_bf16 does not support mtp_size > 2")
 
 
+def _validate_triton_bf16_indexer_config(args):
+    if not has_triton:
+        raise ValueError("indexer_type=triton_bf16 requires triton")
+    if args.infer.cache_type != "paged":
+        raise ValueError(
+            f"indexer_type=triton_bf16 only supports cache_type=paged, but got {args.infer.cache_type}"
+        )
+
+
 class DSAIndexer:
     def __init__(self, impl="auto"):
         args = get_global_args()
@@ -151,6 +164,7 @@ class DSAIndexer:
                 "deepgemm",
                 "hygon",
                 "torch_bf16",
+                "triton_bf16",
                 "triton",
                 "torch",
             ], f"Unsupported {impl=}"
@@ -785,6 +799,95 @@ class DSAIndexer:
             q, weights, k_full, seq_len_delta, is_causal
         )
 
+    def bf16_index_score_dsa_triton_bf16(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        seq_len_delta: BatchedSeqLenDelta,
+        cache_accessor: KVCacheAccessor,
+        is_causal=True,
+        ke: Optional[torch.Tensor] = None,
+        ks: Optional[torch.Tensor] = None,
+        skip_prefill_score: bool = False,
+    ):
+        """Triton bf16 equivalent of bf16_index_score_dsa_torch_bf16.
+
+        Shares the BF16 (K-only) indexer KV layout with torch_bf16/hygon, but
+        computes the mqa logits with the triton kernels registered under
+        chitu.ops.indexer_score_bf16.
+
+        In CP mode, ``ks`` and ``ke`` are provided with LOCAL sizes matching q
+        (``ke`` is the local delta_position_ids + 1). Mirroring the deepgemm
+        branch, the full global ke for the kernel is ``ke + ks``.
+        """
+        assert isinstance(cache_accessor, PagedKVCacheAccessor)
+        append_to_paged_kv_cache(
+            cache_accessor.kv["indexer_k"],
+            cache_accessor.block_table,
+            k,
+            seq_len_delta.delta_position_ids_tensor_device,
+            seq_len_delta.delta_seq_ids_tensor_device,
+            get_page_ids=cache_accessor.get_page_ids,
+            get_offs_in_page=cache_accessor.get_offs_in_page,
+            use_i64_offsets=cache_accessor.use_i64_offsets,
+        )
+
+        if seq_len_delta.is_decode_stage:
+            return bf16_index_score_ragged_q_paged_k_dsv32(
+                q,
+                weights,
+                cache_accessor.kv["indexer_k"],
+                seq_len_delta,
+                cache_accessor.block_table,
+                self.static_max_n,
+                impl="triton",
+            )
+
+        if skip_prefill_score:
+            # The cache append above is still required by later decode steps.
+            return None
+
+        k_full = read_from_paged_kv_cache(
+            cache_accessor.kv["indexer_k"],
+            cache_accessor.block_table,
+            seq_len_delta.new.position_ids_tensor_device,
+            seq_len_delta.new.seq_ids_tensor_device,
+            use_i64_offsets=cache_accessor.use_i64_offsets,
+        )
+
+        s_q, h, _ = q.shape
+        weights = weights.reshape(s_q, h)
+
+        # CP mode: use caller-provided local ks and ke (local_lengths) so the
+        # kernel's ks/ke stay aligned with the local query count, then rebuild
+        # the full ke (delta_pos + 1 + prefix_len). Same as the deepgemm branch.
+        if ks is not None and ke is not None:
+            ke = ke + ks
+        else:
+            ks = seq_len_delta.new.prefix_lens_tensor_device[
+                seq_len_delta.delta_seq_ids_tensor_device
+            ]
+            if is_causal:
+                ke = seq_len_delta.delta_position_ids_tensor_device + ks + 1
+            else:
+                ke = (
+                    seq_len_delta.new.lens_tensor_device[
+                        seq_len_delta.delta_seq_ids_tensor_device
+                    ]
+                    + ks
+                )
+        return bf16_index_score_ragged_qk_dsv32(
+            q,
+            weights,
+            k_full,
+            seq_len_delta,
+            is_causal,
+            ke,
+            ks,
+            impl="triton",
+        )
+
     def dsa_indexer(
         self,
         q_fp8,
@@ -844,6 +947,18 @@ class DSAIndexer:
                 seq_len_delta,
                 cache_accessor,
                 is_causal,
+                skip_prefill_score=select_all_prefill_keys,
+            )
+        elif self.impl == "triton_bf16":
+            logits = self.bf16_index_score_dsa_triton_bf16(
+                q_fp8,
+                k_fp8,
+                weights,
+                seq_len_delta,
+                cache_accessor,
+                is_causal,
+                ke=ke,
+                ks=ks,
                 skip_prefill_score=select_all_prefill_keys,
             )
         else:  # triton and torch impl share the same kv layout

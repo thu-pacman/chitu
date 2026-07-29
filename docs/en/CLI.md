@@ -437,6 +437,8 @@ Acceptable values:
   separate (paged/skew) indexer-kv layout as "triton".
 - "hygon": BF16 indexer KV cache path for the Hygon platform.
 - "torch_bf16": BF16 indexer KV cache pure-torch mqa logits path.
+- "triton_bf16": BF16 indexer KV cache path using Triton mqa logits kernels,
+  sharing the BF16 (K-only) indexer-kv layout with "torch_bf16"/"hygon".
 
 FP8 indexer paths require a kv_cache rule matching indexer_k with
 type=fp8_pertoken_indexer. BF16 indexer paths require unquantized indexer KV cache.
