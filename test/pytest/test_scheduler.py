@@ -1,3 +1,4 @@
+import time
 from omegaconf import OmegaConf
 
 from chitu.task import Task, TaskPool, UserRequest
@@ -2028,3 +2029,66 @@ def test_prefill_capacity_reserves_for_inflight_prefill():
     )
 
     TaskPool.reset()
+
+
+def test_scheduler_rejects_ttft_expired_prefill_candidates(monkeypatch):
+    now = [2000.0]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 2048,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                    "schedule_overlap": True,
+                    "mtp_size": 1,
+                }
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    TaskPool.reset()
+    Backend.cache_managers = [
+        {
+            "main": PagedKVCacheManager(
+                num_blocks=100,
+                num_hot_req=10,
+                max_seq_len=2048,
+                dp_rank=0,
+                block_size=512,
+            )
+        }
+    ]
+    Backend.executor = MockExecutor()
+
+    queued_reqs = []
+    for i in range(8):
+        req = UserRequest.create_mock(
+            input_len=32, request_id=f"req_expired_{i}", enable_thinking=False
+        )
+        req.ttft_deadline_ts = now[0] + 0.01
+        queued_reqs.append(req)
+        TaskPool.add(Task(req.request_id, req))
+
+    scheduler = Scheduler(
+        max_running_tasks=100,
+        prefill_num_tasks=8,
+        decode_num_tasks=8,
+        scheduler_type="prefill_first",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=1,
+    )
+
+    now[0] += 1.0
+
+    try:
+        scheduler.prepare_for_schedule()
+        assert scheduler.schedule() == []
+        assert TaskPool.is_empty()
+        for req in queued_reqs:
+            assert req.finish_reason == "error"
+            assert req.async_stream.error_message == "TTFT timeout"
+    finally:
+        TaskPool.reset()

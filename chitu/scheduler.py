@@ -19,6 +19,7 @@ from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 from chitu.metrics.prometheus_collector import (
     PrometheusMetricsCollector,
     inc_completed_requests,
+    inc_request_timeouts,
 )
 
 if TYPE_CHECKING:
@@ -421,6 +422,43 @@ class Scheduler:
                 return KVCacheCapacityStatus.CONGESTED
         return KVCacheCapacityStatus.OK
 
+    def _drop_ttft_expired_candidates(self, task_ids: list[str]) -> list[str]:
+        now = time.time()
+        kept: list[str] = []
+        for task_id in task_ids:
+            task = TaskPool.pool.get(task_id)
+            req = task.req if task is not None else None
+            should_reject = (
+                req is not None
+                and req.ttft_expired(now)
+                and task.task_type == TaskType.Prefill
+                and req.num_output_tokens == 0
+                and task.consumed_req_tokens == 0
+                and not task.new_cache_ids
+            )
+            if not should_reject:
+                if task is not None:
+                    kept.append(task_id)
+                continue
+
+            task.set_stopped()
+            req.finish_reason = "error"
+            sender = getattr(req.async_stream, "token_sender", None)
+            if sender is not None:
+                sender.send_error(req.request_id, "TTFT timeout")
+                req.async_stream.stop_signal = True
+                req.completion_time = time.monotonic()
+            else:
+                req.stop_stream(error="TTFT timeout")
+            TaskPool.remove(task_id)
+            inc_request_timeouts("ttft_scheduler")
+            logger.warning(
+                "[TTFT_TIMEOUT][scheduler] req_id=%s overdue_s=%.3f",
+                task_id,
+                max(0.0, now - req.ttft_deadline_ts),
+            )
+        return kept
+
     def _terminate_task_exceeds_capacity(self, task_id: str) -> None:
         """Stop a task whose sequence exceeds KV cache physical capacity."""
         task = TaskPool.pool.get(task_id)
@@ -532,6 +570,10 @@ class Scheduler:
         if len(task_ids) == 0:
             # No avaliable tasks, returning empty task list.
             # This is in a busy loop waiting for tasks, so don't print logs here.
+            return []
+
+        task_ids = self._drop_ttft_expired_candidates(task_ids)
+        if len(task_ids) == 0:
             return []
 
         task_ids.sort(
@@ -1030,6 +1072,7 @@ class SkewScheduler(Scheduler):
         ]
         if not task_ids:
             return []
+
         task_ids.sort(key=lambda x: self.scorer(TaskPool.pool[x]), reverse=True)
 
         # Prepare to schedule the earlist released free slot group

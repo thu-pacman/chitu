@@ -100,6 +100,7 @@ class ResponsesCreateRequest(BaseModel):
     store: bool = False
     conversation: Optional[str | dict[str, Any]] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    ttft_timeout_s: Optional[float] = None
 
     @model_validator(mode="after")
     def validate_minimal_supported_shape(self):
@@ -910,6 +911,7 @@ async def handle_responses_request(
         save_trace_dir=args.debug.save_trace_dir,
         priority=priority,
         stop_with_eos=True,
+        ttft_timeout_s=request.ttft_timeout_s,
     )
     user_req = UserRequest.from_request_params(req_params)
     await submit_request(user_req)

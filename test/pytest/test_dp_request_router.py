@@ -1,3 +1,5 @@
+import asyncio
+import time
 import types
 from collections import OrderedDict
 from unittest.mock import patch
@@ -5,6 +7,7 @@ from dataclasses import dataclass, field
 from omegaconf import OmegaConf
 
 from chitu.dp_request_router import RequestRouter, SchedulerStats
+from chitu.task import UserRequest
 from chitu.global_vars import set_global_args
 from chitu.schemas.serve_config import RouterConfig
 from chitu.kv_cache import BlockIdentity, NONE_BLK_HASH, BlockIdentityChainBuilder
@@ -178,3 +181,56 @@ def test_evict_buffer_keeps_fixed_capacity():
     assert "h1" not in router.policy.evict_buffer[0]
     assert "h2" in router.policy.evict_buffer[0]
     assert "h3" in router.policy.evict_buffer[0]
+
+
+def test_request_router_rejects_requests_expired_while_pending(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    router = _build_router(algorithm="least_loaded")
+    router.finished_requests = []
+    router.sent_requests = []
+
+    def finish_request_before_recv_stop(request, finish_reason=None, error=None):
+        router.finished_requests.append((request.request_id, finish_reason, error))
+        request.finish_reason = finish_reason
+        request.stop_stream(error=error)
+
+    async def send_request(local_instance_id: int, request: UserRequest):
+        router.sent_requests.append((local_instance_id, request.request_id))
+
+    router.finish_request_before_recv_stop = finish_request_before_recv_stop
+    router._send_request = send_request
+
+    reqs = []
+    for i in range(16):
+        req = UserRequest.create_mock(
+            input_len=4, request_id=f"req-ttft-{i}", enable_thinking=False
+        )
+        req.ttft_timeout_s = 0.01
+        asyncio.run(router.submit_request(req))
+        assert req.ttft_deadline_ts == now[0] + req.ttft_timeout_s
+        reqs.append(req)
+
+    now[0] += 1.0
+
+    async def run_processor():
+        task = asyncio.create_task(router._request_processor_task())
+        try:
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                if all(req.finished for req in reqs):
+                    return
+                await asyncio.sleep(0.001)
+            assert all(req.finished for req in reqs)
+        finally:
+            router._shutdown = True
+            await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(run_processor())
+
+    assert router.finished_requests == [
+        (req.request_id, "error", "TTFT timeout") for req in reqs
+    ]
+    assert router.sent_requests == []
+    assert all(req.async_stream.error_message == "TTFT timeout" for req in reqs)
+    assert router.total_requests == len(reqs)

@@ -74,6 +74,7 @@ class ChatRequest(BaseModel):
     enable_thinking: bool = True
     reasoning_effort: Optional[str] = None
     extra_body: Mapping[str, Any] = {}
+    ttft_timeout_s: Optional[float] = None
 
     @model_validator(mode="after")
     def validate_eos_setting(self):
@@ -309,6 +310,7 @@ def build_user_request(req: ChatRequest, priority: int = 1) -> UserRequest:
         )
     else:
         tool_config = ToolConfig(req.tool_choice, not req.parallel_tool_calls)
+    ttft_timeout_s = req.extra_body.get("ttft_timeout_s", req.ttft_timeout_s)
     req_params = RequestParams(
         messages=[msg.model_dump() for msg in req.messages],
         request_id=gen_req_id(),
@@ -326,6 +328,7 @@ def build_user_request(req: ChatRequest, priority: int = 1) -> UserRequest:
         save_trace_dir=args.debug.save_trace_dir,
         priority=priority,
         stop_with_eos=req.stop_with_eos,
+        ttft_timeout_s=ttft_timeout_s,
     )
     return UserRequest.from_request_params(req_params)
 
