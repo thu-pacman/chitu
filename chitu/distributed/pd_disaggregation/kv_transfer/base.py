@@ -5,10 +5,10 @@
 """
 KV cache manager for PD disaggregation.
 
-Decode allocates destination KV buffers, sends recv_buffers (DecodeAllocated)
-to Prefill.  Prefill computes send_buffers, matches against recv_buffers via
-the unified virtual address space, generates a TransferPlan, and executes
-RDMA transfers.  Completion is tracked with RankTransferDone messages.
+Decode allocates destination blocks, sends block ID lists (DecodeAllocated)
+to Prefill.  Prefill builds a StaticTransferPlan at init time, then per
+request generates addresses via cartesian product + sorts/merges, executes
+RDMA transfers, and signals RankTransferDone.
 """
 
 from enum import Enum
@@ -34,7 +34,11 @@ from chitu.distributed.infiniband import detect_ib_devices
 from chitu.distributed.pd_disaggregation.pd_log_utils import pd_trace_enabled
 from chitu.distributed.coordinator import set_value, get_value
 from chitu.kv_cache.kv_cache import PagedKVCache
-from .cache_info import CacheDistributions
+from .cache_info import CacheInfo, RankCacheInfos, InstanceCacheInfos
+from .cache_info import (
+    collect_rank_cache_infos,
+    exchange_instance_cache_infos,
+)
 from .mooncake.transfer_engine import MooncakeTransferEngine
 from .task_info import TaskInfo
 from .protocol import ProtocolSerializer
@@ -92,46 +96,30 @@ class KVManagerBase:
         self.world_size = get_world_group().group_size
         self.dp_way_size = get_world_group().group_size // get_dp_group().group_size
 
-    def register_buffer_to_engine(self):
+    def register_cache(self):
         """Register all KV cache tensors with Mooncake for RDMA.
 
-        Exchanges ``CacheDistributions`` via coordinator first, then registers
-        each whole tensor once instead of block-by-block, since PyTorch tensors
-        are contiguous in memory.  This covers all block-level addresses used
-        later for RDMA transfers.
-
-        Call after all caches have been created (both Prefill and Decode).
+        Collects per-rank cache info, exchanges it with remote instances
+        via the coordinator, then RDMA-registers all tensors once.
+        Subclasses may override or extend (e.g. Prefill builds a
+        ``StaticTransferPlan`` after exchange).
         """
-
-        # --- compute local CacheDistributions ---
-        self._local_cache_dists = CacheDistributions()
-        for cache in Backend.cache_dict.values():
-            if not isinstance(cache, PagedKVCache) or cache.paged_kv_cache is None:
-                continue
-            for tensor_name, tensor in cache.paged_kv_cache.items():
-                self._local_cache_dists.register(
-                    tensor_name, int(tensor.shape[3]), cache.split_size
-                )
-
-        # --- exchange CacheDistributions (only instance control rank writes) ---
-        if self.rank == 0:
-            if get_global_args().infer.mtp_size > 1 and "mtp" not in Backend.cache_dict:
-                self._local_cache_dists.register_mtp_by_spec()
-            set_value(
-                f"inst{self.instance_id}:cache_dists",
-                ProtocolSerializer.pack(self._local_cache_dists),
-            )
-
-        self.remote_cache_dists: dict[int, CacheDistributions] = {}
+        session_id = self.transfer_engine.get_session_id()
+        per_rank = collect_rank_cache_infos(session_id)
         remote_inst_ids = (
             self._prefill_inst_ids if self.is_decode else self._decode_inst_ids
         )
-        for inst_id in remote_inst_ids:
-            self.remote_cache_dists[inst_id] = ProtocolSerializer.unpack(
-                get_value(f"inst{inst_id}:cache_dists"), CacheDistributions
-            )
+        local_all, self.remote_cache_dists = exchange_instance_cache_infos(
+            per_rank,
+            rank=self.rank,
+            instance_id=self.instance_id,
+            remote_inst_ids=remote_inst_ids,
+        )
+        self._local_cache_dists = per_rank
+        self._register_rdma_buffers()
 
-        # --- RDMA registration ---
+    def _register_rdma_buffers(self) -> None:
+        """RDMA-register every KV cache tensor once."""
         if torch.cuda.is_available():
             set_cuda_device()
 

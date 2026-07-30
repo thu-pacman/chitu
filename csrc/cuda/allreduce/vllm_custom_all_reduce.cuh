@@ -506,16 +506,21 @@ class CustomAllreduce {
         // TODO(hanzhi713): Threshold is different for A100 and H100.
         // Add per device threshold.
 #if defined(CHITU_HYGON_BUILD) && CHITU_HYGON_BUILD == 1
-        // Hygon HSW uses the lower-traffic reduce-scatter/all-gather path for
-        // every supported world size and payload. Keep the upstream threshold
-        // selection below for other platforms.
+        // TP8 measurements on Hygon HSW put the crossover between 126 KiB and
+        // 140 KiB. Use 128 KiB as the dispatch boundary, and keep the existing
+        // two-stage behavior for other, unmeasured world sizes.
         if (!full_nvlink_)
             throw std::runtime_error(
-                "Hygon two-stage custom allreduce requires a fully connected "
+                "Hygon custom allreduce requires a fully connected "
                 "peer topology");
+        constexpr size_t kHygonTp8OneStageMaxBytes = 128 * 1024;
 #define REDUCE_CASE(ngpus)                                                     \
     case ngpus: {                                                              \
-        KL(ngpus, cross_device_reduce_2stage);                                 \
+        if (world_size_ == 8 && bytes <= kHygonTp8OneStageMaxBytes) {          \
+            KL(ngpus, cross_device_reduce_1stage);                             \
+        } else {                                                               \
+            KL(ngpus, cross_device_reduce_2stage);                             \
+        }                                                                      \
         break;                                                                 \
     }
 #else

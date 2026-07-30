@@ -46,6 +46,7 @@ class KVManagerEndpoint:
         )
 
         self._pub_socket = self.zmq_ctx.socket(zmq.PUB)
+        self._pub_socket.setsockopt(zmq.SNDHWM, 10000)
         pub_port = self._pub_socket.bind_to_random_port(bind_addr)
         set_endpoint(self.role, self.name + "_pub", self.ip, pub_port)
         self._pub_socket.setsockopt(zmq.LINGER, 0)
@@ -54,6 +55,7 @@ class KVManagerEndpoint:
         self.socket = self.zmq_ctx.socket(zmq.SUB)
         self.socket.setsockopt(zmq.SUBSCRIBE, b"")
         self.socket.connect(TCP_ENDPOINT.format(self.ip, pub_port))
+        self.socket.setsockopt(zmq.RCVHWM, 10000)
 
     def init_slave(self):
         """init receiver on slave rank"""
@@ -61,6 +63,7 @@ class KVManagerEndpoint:
         self.socket = self.zmq_ctx.socket(zmq.SUB)
         self.socket.setsockopt(zmq.SUBSCRIBE, b"")
         self.socket.connect(endpoint)
+        self.socket.setsockopt(zmq.RCVHWM, 10000)
 
     def init_remote(self):
         """init sender on any rank"""

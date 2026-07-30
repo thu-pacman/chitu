@@ -12,6 +12,7 @@ on real PagedKVCache instances.
 import os
 import ctypes
 
+import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -25,6 +26,15 @@ from chitu.distributed.pd_disaggregation.kv_transfer.transfer_plan import (
     TransferPlan,
     TransferPlanPerRank,
     create_transfer_plan,
+)
+from chitu.distributed.pd_disaggregation.kv_transfer.cache_info import (
+    CacheInfo,
+    RankCacheInfos,
+    InstanceCacheInfos,
+)
+from chitu.distributed.pd_disaggregation.kv_transfer.static_transfer_plan import (
+    StaticTransferPlan,
+    StaticTransferPlanPerCache,
 )
 
 _PD_UNIT_JOB_NAME = "pd_unit_test_h20"
@@ -102,35 +112,35 @@ def _build_cache(
 
 
 def _make_remote_dists(name, local_heads, remote_heads, split_size, rank=0, gsize=1):
-    """Build a remote CacheDistributions matching the given parameters."""
-    from chitu.distributed.pd_disaggregation.kv_transfer.cache_info import (
-        CacheDistribution,
-        CacheDistributions,
-    )
+    """Build a remote InstanceCacheInfos matching the given parameters."""
 
     if split_size == 0:
-        return CacheDistributions(
-            dists={
-                name: CacheDistribution(
-                    split_len=remote_heads,
-                    split_id=0,
-                    split_size=0,
-                    replica_id=rank,
-                    replica_size=gsize,
-                )
+        return InstanceCacheInfos(
+            ranks={
+                "sid": {
+                    name: CacheInfo(
+                        split_len=remote_heads,
+                        split_id=0,
+                        split_size=0,
+                        replica_id=rank,
+                        replica_size=gsize,
+                    )
+                }
             }
         )
     replica_size = gsize // split_size if gsize > 0 else 1
     split_id_base = (rank // replica_size) * remote_heads
-    return CacheDistributions(
-        dists={
-            name: CacheDistribution(
-                split_len=remote_heads,
-                split_id=split_id_base,
-                split_size=split_size,
-                replica_id=rank % replica_size,
-                replica_size=replica_size,
-            )
+    return InstanceCacheInfos(
+        ranks={
+            "sid": {
+                name: CacheInfo(
+                    split_len=remote_heads,
+                    split_id=split_id_base,
+                    split_size=split_size,
+                    replica_id=rank % replica_size,
+                    replica_size=replica_size,
+                )
+            }
         }
     )
 
@@ -256,7 +266,17 @@ def test_kv_recv_reorder_tp2_permute(monkeypatch):
 
     # Remote (Prefill) has split_len = nh // prefill_tp = 2; local = 4
     # gcd(4, 2) = 2 → n_chunks = 4/2 = 2
-    ld = _make_remote_dists("kv_cache", nh, nh, split_size=1)
+    ld = RankCacheInfos(
+        caches={
+            "kv_cache": CacheInfo(
+                split_len=nh,
+                split_id=0,
+                split_size=1,
+                replica_id=0,
+                replica_size=1,
+            )
+        }
+    )
     rd = _make_remote_dists("kv_cache", nh, nh // prefill_tp, split_size=1)
     c.kv_recv_reorder(list(bi), local_dists=ld, remote_dists=rd)
 
@@ -307,9 +327,9 @@ def test_transfer_plan_execute_cpu():
     plan = TransferPlan(
         plans={
             "s1": TransferPlanPerRank(
-                ptrs=[src.data_ptr()],
-                lengths=[src.numel() * 4],
-                remote_ptrs=[dst.data_ptr()],
+                ptrs=np.array([src.data_ptr()], dtype=np.int64),
+                lengths=np.array([src.numel() * 4], dtype=np.int64),
+                remote_ptrs=np.array([dst.data_ptr()], dtype=np.int64),
             ),
         }
     )
@@ -318,42 +338,32 @@ def test_transfer_plan_execute_cpu():
 
 
 def test_create_transfer_plan_cpu():
+    import numpy as np
+
     src = torch.zeros(8, dtype=torch.int32)
     dst = torch.zeros(8, dtype=torch.int32)
     src[:] = torch.arange(8, dtype=torch.int32)
 
     sb = TransferBuffers()
+    sb.cache_block_ids["main"] = np.array([0], dtype=np.int32)
     rb = TransferBuffers()
-    sb.add(
-        src.data_ptr(),
-        src.numel() * 4,
-        cache_name="main",
-        req_id="e2e",
-        layer_id=0,
-        block_id=0,
-        split_id=0,
-        split_len=1,
-        replica_id=0,
-        replica_size=1,
-    )
-    rb.add(
-        dst.data_ptr(),
-        dst.numel() * 4,
-        cache_name="main",
-        req_id="e2e",
-        layer_id=0,
-        block_id=0,
-        split_id=0,
-        split_len=1,
-        replica_id=0,
-        replica_size=1,
+    rb.cache_block_ids["main"] = np.array([0], dtype=np.int32)
+
+    plan = StaticTransferPlan(
+        per_session={
+            "default": {
+                "main": StaticTransferPlanPerCache(
+                    src_base_ptrs=np.array([src.data_ptr()], dtype=np.int64),
+                    dst_base_ptrs=np.array([dst.data_ptr()], dtype=np.int64),
+                    src_block_stride=0,
+                    dst_block_stride=0,
+                    buffer_size=src.numel() * 4,
+                ),
+            }
+        }
     )
 
     class M:
-        def transfer_sync(self, s, a, b, n):
-            ctypes.memmove(b, a, n)
-            return 0
-
         def batch_transfer_async_write(self, session_id, src_ptrs, dst_ptrs, lengths):
             for a, b, n in zip(src_ptrs, dst_ptrs, lengths):
                 ctypes.memmove(b, a, n)
@@ -362,5 +372,5 @@ def test_create_transfer_plan_cpu():
         def get_batch_transfer_status(self, batch_ids):
             return 0
 
-    create_transfer_plan(sb, {"default": rb}).execute_send(M())
+    create_transfer_plan(plan, sb, {"default": rb}).execute_send(M())
     assert torch.all(dst == src)

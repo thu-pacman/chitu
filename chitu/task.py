@@ -848,8 +848,17 @@ class TaskPool:
 
     @classmethod
     def add_all_queued(cls):
+        pending_tasks: dict[str, Task] = {}
         while cls.pending_queue:
-            cls.add(cls.pending_queue.popleft())
+            cur_task = cls.pending_queue.popleft()
+            if cur_task.task_id in pending_tasks:
+                continue
+            if cur_task.task_id in cls.pool:
+                pending_tasks[cur_task.task_id] = cur_task
+            else:
+                cls.add(cur_task)
+        for re_task in pending_tasks.values():
+            cls.enqueue(re_task)
 
     @classmethod
     def remove(cls, task_id: str):
