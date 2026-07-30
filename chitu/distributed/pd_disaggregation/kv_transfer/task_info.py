@@ -41,6 +41,9 @@ class TaskInfo:
     req_id: str = ""
     first_token: int = 0
     num_hit_tokens: int = 0
+    decode_cached_tokens: int = 0
+    """Number of tokens already cached on the decode side.
+    Set from DecodePrepare (decode) / DecodeAllocated (prefill)."""
 
     # ===============================
     #            Prefill

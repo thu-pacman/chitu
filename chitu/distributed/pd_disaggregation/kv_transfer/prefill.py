@@ -71,8 +71,8 @@ class KVManagerPrefill(KVManagerBase):
     def get_send_buffers(self, req_id: str) -> TransferBuffers:
         """Collect block IDs for all caches on the send (prefill) side.
 
-        Prefill blocks start from position 0 (no prefix skip).
-        ``create_transfer_plan`` uses decode's ``cache_skip_length`` for alignment.
+        Truncates cached prefix from the front.  ``skip`` is 0 for now;
+        future work: derive from ``decode_cached_tokens``.
         """
         send_buffers = TransferBuffers()
         for cache in Backend.cache_dict.values():
@@ -82,9 +82,9 @@ class KVManagerPrefill(KVManagerBase):
             if not block_indices:
                 continue
             ids = np.array(block_indices, dtype=np.int32)
+            skip = 0  # decode_cached_tokens // cache.block_size
             for key in cache.paged_kv_cache:
-                send_buffers.cache_block_ids[key] = ids
-                send_buffers.cache_skip_length[key] = 0
+                send_buffers.cache_block_ids[key] = ids[skip:]
         return send_buffers
 
     def _build_static_transfer_plans(self) -> None:
@@ -167,6 +167,7 @@ class KVManagerPrefill(KVManagerBase):
 
         info.recv_buffers[msg.session_id] = msg.buffers
         info.decode_allocated_cnt += 1
+        info.decode_cached_tokens = msg.decode_cached_tokens
 
         if info.decode_allocated_cnt >= msg.rank_num:
             info.is_decode_allocated = True

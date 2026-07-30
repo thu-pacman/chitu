@@ -792,7 +792,7 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             assert (
                 not task.new_cache_ids
             ), f"task.new_cache_ids should be empty before prealloc"
-            capacity_status = Backend.schedulers[
+            capacity_status, num_cached_tokens = Backend.schedulers[
                 target_dp_rank
             ]._prepare_pd_decode_kvcache(rid, required_tokens)
 
@@ -812,6 +812,7 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 prefix_len=task.prefix_tokens_len,
                 new_cache_ids=task.new_cache_ids,
                 dp_rank=task.dp_rank,
+                decode_cached_tokens=num_cached_tokens,
             )
             info["last_prepare_ts"] = now
             if float(info.get("first_prepare_ts", 0.0)) <= 0.0:
