@@ -63,7 +63,10 @@ class DecodeAllocated:
             TransferBuffers,
         )
 
-        data = {**data, "buffers": TransferBuffers.from_msgpackable(data["buffers"])}
+        data = {
+            **data,
+            "buffers": TransferBuffers.from_msgpackable(data["buffers"]),
+        }
         return ProtocolSerializer.dict_to_dataclass(data, cls)
 
 

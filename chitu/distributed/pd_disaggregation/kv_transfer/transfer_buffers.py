@@ -3,177 +3,55 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Transfer buffer abstractions and transfer plan generation for PD disaggregation.
+Transfer buffer abstraction for PD disaggregation.
 
-Key types:
-  - TransferBuffer:   a single (ptr, length) pair describing one contiguous GPU
-    memory region.
-  - TransferBuffers:  collection of TransferBuffer entries keyed by a composite
-    string key — represents one rank's buffers.
+``TransferBuffers`` carries only per-cache physical block ID lists.
+All GPU address computation is handled by ``StaticTransferPlan`` +
+``create_transfer_plan``.
 """
 
-import logging
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import NamedTuple
+from typing import Any
 
-logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# TransferBuffer
-# ---------------------------------------------------------------------------
-
-
-class TransferBuffer(NamedTuple):
-    """A single contiguous GPU memory region for transfer.
-
-    Attributes:
-        ptr:     GPU data pointer.
-        length:  byte length of the region.
-    """
-
-    ptr: int
-    length: int
-
-
-# ---------------------------------------------------------------------------
-# TransferBufferKey
-# ---------------------------------------------------------------------------
-
-
-class TransferBufferKey(NamedTuple):
-    """The identifier for distinguishing different TransferBuffers.
-    The same TransferBufferKey corresponds to the same underlying KV cache tensor block.
-    Args:
-        req_id:        request identifier.
-        cache_name:    key in ``paged_kv_cache`` (e.g. ``"main.k"``).
-        layer_id:      **global** layer id.
-        block_id:      **logical** position in the block table.
-        split_id:      starting index in split-space.
-        split_len:     number of split units this region covers.
-        replica_id:    which replica group this belongs to.
-        replica_size:  total number of replica groups.
-    """
-
-    req_id: str
-    cache_name: str
-    layer_id: int
-    block_id: int
-    split_id: int
-    split_len: int
-    replica_id: int
-    replica_size: int
-
-    @property
-    def match_prefix(self) -> tuple:
-        """Identity for matching send/recv, ignoring replica placement.
-
-        Two buffers match iff they describe the same (req, cache, layer,
-        block, split) region — i.e. everything except the replica id/size.
-        """
-        return self[:6]
-
-
-# ---------------------------------------------------------------------------
-# TransferBuffers
-# ---------------------------------------------------------------------------
+import numpy as np
 
 
 @dataclass
 class TransferBuffers:
-    """Collection of transfer buffers for a single rank.
+    """Per-request block ID lists for KV cache transfer.
 
-    Structure::
-
-        buffers: dict[TransferBufferKey, list[TransferBuffer]]
-
-    Keys are :class:`TransferBufferKey` NamedTuples.  Because msgpack has no
-    map-key type richer than str/int, the whole structure serializes as a
-    *list of ``[key, entries]`` pairs* (see :meth:`to_msgpackable`) rather
-    than a dict.
-
-    Session ownership is tracked externally (e.g. ``TaskInfo.recv_buffers``
-    is a ``dict[session_id, TransferBuffers]``).
+    ``cache_block_ids`` maps cache_name to a 1-D int32 array of
+    **physical** block IDs.
+    ``cache_skip_length`` maps cache_name to the number of tokens
+    skipped before the first block (i.e. tokens already cached on
+    the decode side).  Used by ``create_transfer_plan`` to align
+    both sides.
     """
 
-    buffers: dict["TransferBufferKey", list[TransferBuffer]] = field(
-        default_factory=dict
-    )
-
-    # ---- mutation ----------------------------------------------------------
-
-    def add(
-        self,
-        ptr: int,
-        length: int,
-        *,
-        cache_name: str,
-        req_id: str,
-        layer_id: int,
-        block_id: int,
-        split_id: int,
-        split_len: int,
-        replica_id: int,
-        replica_size: int,
-    ):
-        """Register a physical memory region for transfer.
-
-        Args:
-            ptr:           GPU data pointer of the contiguous region.
-            length:        byte length of the region.
-            cache_name:    key in ``paged_kv_cache`` (e.g. ``"main.k"``).
-            req_id:        request identifier.
-            layer_id:      **global** layer id.
-            block_id:      **logical** position in the block table.
-            split_id:      starting index in split-space.
-            split_len:     number of split units this region covers.
-            replica_id:    which replica group this belongs to.
-            replica_size:  total number of replica groups.
-        """
-        key = TransferBufferKey(
-            req_id=req_id,
-            cache_name=cache_name,
-            layer_id=layer_id,
-            block_id=block_id,
-            split_id=split_id,
-            split_len=split_len,
-            replica_id=replica_id,
-            replica_size=replica_size,
-        )
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[PD_KV_TRANSFER] %s ptr=%s len=%s", key, ptr, length)
-        self.buffers.setdefault(key, []).append(TransferBuffer(ptr, length))
-
-    # ---- query -------------------------------------------------------------
-
-    def total_bytes(self) -> int:
-        """Sum of all lengths across all entries."""
-        return sum(e.length for entries in self.buffers.values() for e in entries)
+    cache_block_ids: dict[str, np.ndarray] = field(default_factory=dict)
+    cache_skip_length: dict[str, int] = field(default_factory=dict)
 
     def __bool__(self) -> bool:
-        return bool(self.buffers)
+        return any(len(v) > 0 for v in self.cache_block_ids.values())
 
     # ---- serialization -----------------------------------------------------
 
-    def to_msgpackable(self) -> list[list]:
-        """Serialize as a list of ``[key, entries]`` pairs.
-
-        msgpack cannot use a tuple as a map key, so the dict is flattened to
-        a list of pairs.  ``TransferBufferKey`` and ``TransferBuffer`` are both
-        NamedTuples → serialized as msgpack arrays.
-        """
-        return [[list(key), entries] for key, entries in self.buffers.items()]
+    def to_msgpackable(self) -> dict[str, Any]:
+        """Serialize as ``{blocks: {cache_name: int32_bytes}, skip: {cache_name: int}}``."""
+        return {
+            "blocks": {k: v.tobytes() for k, v in self.cache_block_ids.items()},
+            "skip": dict(self.cache_skip_length),
+        }
 
     @classmethod
-    def from_msgpackable(cls, data: list[list]) -> "TransferBuffers":
-        """Reconstruct from msgpack round-tripped data.
-
-        Each pair is ``[key_fields, entries]``: ``key_fields`` becomes a
-        :class:`TransferBufferKey` and each ``[ptr, length]`` a
-        :class:`TransferBuffer`.
-        """
-        obj = cls()
-        for key_raw, entries_raw in data:
-            key = TransferBufferKey(*key_raw)
-            obj.buffers[key] = [TransferBuffer(*e) for e in entries_raw]
-        return obj
+    def from_msgpackable(cls, data: dict[str, Any]) -> "TransferBuffers":
+        """Reconstruct from msgpack data."""
+        return cls(
+            cache_block_ids={
+                k: np.frombuffer(v, dtype=np.int32)
+                for k, v in data.get("blocks", {}).items()
+            },
+            cache_skip_length=dict(data.get("skip", {})),
+        )

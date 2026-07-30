@@ -20,7 +20,8 @@ from chitu.ops import fp8_pertensor_kvcache_quant, fp8_pertoken_kvcache_quant_ds
 if TYPE_CHECKING:
     from chitu.task import PackedTasksBase
     from chitu.distributed.pd_disaggregation.kv_transfer.cache_info import (
-        CacheDistributions,
+        RankCacheInfos,
+        InstanceCacheInfos,
     )
     from chitu.distributed.pd_disaggregation.kv_transfer.transfer_buffers import (
         TransferBuffers,
@@ -862,75 +863,21 @@ class PagedKVCache(KVCacheBase):
         self.block_table[tid] = list(int(x) for x in page_indices)
         self.tid_to_cached_len[tid] = int(prefix_length)
 
-    def get_kv_transfer_buffers(
-        self,
-        buffers: "TransferBuffers",
-        req_id: str,
-        block_indices: list[int],
-        *,
-        local_dists: "CacheDistributions",
-        remote_dists: "CacheDistributions",
-    ):
-        """Register block entries for send or recv into TransferBuffers."""
-        if not block_indices:
-            return
-
-        global_layers = [
-            self.layer_id_map.to_global(local_layer)
-            for local_layer in range(self.num_layers)
-        ]
-
-        for key, cache in self.paged_kv_cache.items():
-            assert (
-                cache.is_contiguous()
-            ), f"kv cache {key} must be contiguous for transfer"
-            ld = local_dists.dists[key]
-            rd = remote_dists.dists[key]
-            n_chunks, split_len = ld.calc_chunking(rd)
-
-            elem_size = cache.element_size()
-            layer_stride_bytes = cache.stride(0) * elem_size
-            block_stride_bytes = cache.stride(1) * elem_size
-            assert (
-                block_stride_bytes % n_chunks == 0
-            ), f"block bytes {block_stride_bytes} not divisible by n_chunks {n_chunks}"
-            chunk_bytes = block_stride_bytes // n_chunks
-            base_ptr = cache.data_ptr()
-
-            for i, block_id in enumerate(block_indices):
-                for local_layer, global_layer in enumerate(global_layers):
-                    layer_block_base_ptr = (
-                        base_ptr
-                        + local_layer * layer_stride_bytes
-                        + block_id * block_stride_bytes
-                    )
-                    for j in range(n_chunks):
-                        buffers.add(
-                            layer_block_base_ptr + chunk_bytes * j,
-                            chunk_bytes,
-                            cache_name=key,
-                            req_id=req_id,
-                            layer_id=global_layer,
-                            block_id=i,
-                            split_id=ld.split_id + j * split_len,
-                            split_len=split_len,
-                            replica_id=ld.replica_id,
-                            replica_size=ld.replica_size,
-                        )
-
     def kv_recv_reorder(
         self,
         new_block_ids: list[int],
         *,
-        local_dists: "CacheDistributions",
-        remote_dists: "CacheDistributions",
+        local_dists: "RankCacheInfos",
+        remote_dists: "InstanceCacheInfos",
     ):
         """Permute chunk-interleaved layout back to T-major."""
         for key, cache in self.paged_kv_cache.items():
             if self.split_size == 0:
                 continue
-            ld = local_dists.dists[key]
-            rd = remote_dists.dists[key]
+            ld = local_dists.get(key)
+            rd = remote_dists.get_any(key)
+            if ld is None or rd is None:
+                continue
             n_chunks, _ = ld.calc_chunking(rd)
             if n_chunks <= 1:
                 continue

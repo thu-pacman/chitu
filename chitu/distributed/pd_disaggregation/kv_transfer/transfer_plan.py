@@ -4,7 +4,15 @@
 
 import dataclasses
 import logging
-from .transfer_buffers import TransferBuffer, TransferBufferKey, TransferBuffers
+
+import numpy as np
+
+from .transfer_buffers import TransferBuffers
+from .static_transfer_plan import (
+    StaticTransferPlan,
+    generate_transfer_addrs,
+    sort_and_merge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -19,39 +27,34 @@ class TransferPlanPerRank:
     """Resolved address mapping for a single remote session.
 
     ``ptrs[i]`` → ``remote_ptrs[i]`` transfers ``lengths[i]`` bytes.
+
+    All fields are numpy int64 arrays.  Convert to ``list[int]`` at the
+    ``batch_transfer_async_write`` call site via ``.tolist()``.
     """
 
-    ptrs: list[int]
-    lengths: list[int]
-    remote_ptrs: list[int]
+    ptrs: np.ndarray
+    lengths: np.ndarray
+    remote_ptrs: np.ndarray
 
 
 class TransferPlan:
     """Execution plan for one request's KV transfer.
 
     ``plans`` maps ``session_id`` → ``TransferPlanPerRank``.
-
-    Both source and destination memory must already be registered
-    via ``register_buffer_to_engine`` at init time — no per-transfer
-    registration is needed.
     """
 
     def __init__(self, plans: dict[str, TransferPlanPerRank]):
         self.plans = plans
 
     def execute_send(self, engine) -> None:
-        """Submit all RDMA transfers synchronously.
-
-        Memory is pre-registered at init time; this just fires async
-        writes and waits for completion.
-        """
+        """Submit all RDMA transfers synchronously."""
         batch_ids = []
         for session_id, per_rank in self.plans.items():
             batch_id = engine.batch_transfer_async_write(
                 session_id,
-                per_rank.ptrs,
-                per_rank.remote_ptrs,
-                per_rank.lengths,
+                per_rank.ptrs.tolist(),
+                per_rank.remote_ptrs.tolist(),
+                per_rank.lengths.tolist(),
             )
             assert batch_id != 0, "batch_transfer_async_write failed"
             batch_ids.append(batch_id)
@@ -61,62 +64,7 @@ class TransferPlan:
 
     def total_bytes_per_session(self) -> dict[str, int]:
         """Sum of lengths per session_id."""
-        return {sid: sum(pr.lengths) for sid, pr in self.plans.items()}
-
-
-# ---------------------------------------------------------------------------
-# Key matching
-# ---------------------------------------------------------------------------
-#
-# Keys are :class:`TransferBufferKey` NamedTuples.  A send and recv buffer
-# match on their ``match_prefix`` (all fields except replica_id/replica_size);
-# the replica ids are then reconciled by the formula:
-#    ``send_id == (recv_id * send_replica_size) // recv_replica_size``.
-
-
-# ---------------------------------------------------------------------------
-# Sort + contiguous address merge
-# ---------------------------------------------------------------------------
-
-
-def _sort_and_merge(
-    send_ptrs: list[int],
-    recv_ptrs: list[int],
-    lengths: list[int],
-) -> tuple[list[int], list[int], list[int]]:
-    """Sort matched pairs by recv ptr and merge contiguous addresses.
-
-    Given parallel lists describing matched (send, recv, length) triples,
-    returns ``(ptrs, lengths, remote_ptrs)`` for one session after:
-      1. sorting by ``recv_ptr``, and
-      2. merging addresses where both source and destination are contiguous::
-             send[i] + len[i] == send[i+1]  AND  recv[i] + len[i] == recv[i+1]
-    """
-    n = len(send_ptrs)
-    if n <= 1:
-        return send_ptrs, recv_ptrs, lengths
-
-    order = sorted(range(n), key=recv_ptrs.__getitem__)
-
-    out_send: list[int] = []
-    out_len: list[int] = []
-    out_recv: list[int] = []
-    for i in order:
-        s = send_ptrs[i]
-        r = recv_ptrs[i]
-        length = lengths[i]
-        if (
-            out_send
-            and out_send[-1] + out_len[-1] == s
-            and out_recv[-1] + out_len[-1] == r
-        ):
-            out_len[-1] += length
-        else:
-            out_send.append(s)
-            out_recv.append(r)
-            out_len.append(length)
-
-    return out_send, out_recv, out_len
+        return {sid: int(pr.lengths.sum()) for sid, pr in self.plans.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -125,81 +73,65 @@ def _sort_and_merge(
 
 
 def create_transfer_plan(
+    static_plan: StaticTransferPlan,
     send_buffers: TransferBuffers,
     recv_by_session: dict[str, TransferBuffers],
 ) -> TransferPlan:
-    """Create a TransferPlan by matching send and recv buffers on split-id.
+    """Create a :class:`TransferPlan` from the precomputed :class:`StaticTransferPlan`.
 
-    Send belongs to the prefill Mooncake session, recv entries are grouped
-    by decode session_id.
+    For each session, per cache:
+    1. Align prefix using decode's ``cache_skip_length``.
+    2. ``generate_transfer_addrs`` → ``sort_and_merge``.
+    3. Accumulate into :class:`TransferPlanPerRank`.
     """
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "[PD_PLAN] send_keys=%d recv_sessions=%s",
-            len(send_buffers.buffers),
-            {sid: len(rb.buffers) for sid, rb in recv_by_session.items()},
-        )
+    plans: dict[str, TransferPlanPerRank] = {}
 
-    # ---- build matchers from send / recv keys ----
-    # match_prefix -> (send_ptr, send_len, send_replica_id, send_replica_size)
-    send_index: dict[tuple, tuple[int, int, int, int]] = {}
-    for send_key, send_entries in send_buffers.buffers.items():
-        prefix = send_key.match_prefix
-        assert (
-            len(send_entries) == 1
-        ), f"prefix {prefix}: expected 1 send entry, got {len(send_entries)}"
-        assert prefix not in send_index, f"duplicate send prefix: {prefix}"
-        send_buffer = send_entries[0]
-        send_index[prefix] = (
-            send_buffer.ptr,
-            send_buffer.length,
-            send_key.replica_id,
-            send_key.replica_size,
-        )
-
-    # ---- join recv entries against send, per session ----
-    # session_id -> (send_ptrs, recv_ptrs, lengths)
-    matched: dict[str, tuple[list[int], list[int], list[int]]] = {}
-    for session_id, recv_bufs in recv_by_session.items():
-        if not recv_bufs:
+    for session_id, session_caches in static_plan.per_session.items():
+        recv_bufs = recv_by_session.get(session_id)
+        if recv_bufs is None:
             continue
-        for recv_key, entries in recv_bufs.buffers.items():
-            send_entry = send_index.get(recv_key.match_prefix)
-            if send_entry is None:
-                continue
-            send_ptr, send_len, send_rep_id, send_rep_sz = send_entry
 
-            # Reconcile replica placement: this send replica owns the recv
-            # replica if it is the one the ratio formula maps it to.
-            if (
-                send_rep_id
-                != (recv_key.replica_id * send_rep_sz) // recv_key.replica_size
-            ):
+        all_ptrs: list[np.ndarray] = []
+        all_rptrs: list[np.ndarray] = []
+        all_lens: list[np.ndarray] = []
+
+        for cache_name, plan in session_caches.items():
+            src_ids = send_buffers.cache_block_ids.get(cache_name)
+            dst_ids = recv_bufs.cache_block_ids.get(cache_name)
+            if src_ids is None or dst_ids is None:
                 continue
 
-            triple = matched.get(session_id)
-            if triple is None:
-                triple = ([], [], [])
-                matched[session_id] = triple
-            send_ptrs, recv_ptrs, lengths = triple
-            for recv_buffer in entries:
-                assert (
-                    recv_buffer.length == send_len
-                ), f"chunk length mismatch: send={send_len} recv={recv_buffer.length}"
-                send_ptrs.append(send_ptr)
-                recv_ptrs.append(recv_buffer.ptr)
-                lengths.append(recv_buffer.length)
+            # Align prefix: prefill blocks start at position 0; decode
+            # may have cached tokens on the front.  Truncate prefill's
+            # list from the front by that many blocks.
+            assert (
+                send_buffers.cache_skip_length.get(cache_name, 0) == 0
+            ), f"prefill cache_skip_length must be 0 for {cache_name}"
+            skip_tokens = recv_bufs.cache_skip_length.get(cache_name, 0)
+            if skip_tokens > 0 and plan.block_tokens > 0:
+                skip_blocks = skip_tokens // plan.block_tokens
+                src_ids = src_ids[skip_blocks:]
 
-    # ---- sort + contiguous merge → plan ----
-    plan_dict: dict[str, TransferPlanPerRank] = {}
-    for session_id, (send_ptrs, recv_ptrs, lengths) in matched.items():
-        if not send_ptrs:
-            continue
-        ptrs, remote_ptrs, lens = _sort_and_merge(send_ptrs, recv_ptrs, lengths)
-        plan_dict[session_id] = TransferPlanPerRank(
-            ptrs=ptrs,
-            lengths=lens,
-            remote_ptrs=remote_ptrs,
-        )
+            assert len(src_ids) == len(dst_ids), (
+                f"block count mismatch after alignment: {cache_name} "
+                f"src={len(src_ids)} dst={len(dst_ids)}"
+            )
 
-    return TransferPlan(plans=plan_dict)
+            s, d = generate_transfer_addrs(plan, src_ids, dst_ids)
+            p, rp, sz = sort_and_merge(
+                s, d, np.full(len(s), plan.buffer_size, dtype=np.int64)
+            )
+            if len(p) == 0:
+                continue
+            all_ptrs.append(p)
+            all_rptrs.append(rp)
+            all_lens.append(sz)
+
+        if all_ptrs:
+            plans[session_id] = TransferPlanPerRank(
+                ptrs=np.concatenate(all_ptrs),
+                lengths=np.concatenate(all_lens),
+                remote_ptrs=np.concatenate(all_rptrs),
+            )
+
+    return TransferPlan(plans=plans)

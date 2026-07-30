@@ -63,8 +63,8 @@ ZMQ 端点通过 `KVManagerEndpoint` 统一抽象，支持三种模式：
 
 Prefill 通过 Mooncake Transfer Engine 执行 Device-to-Device 的 RDMA 写入：
 
-- **内存注册**：整个 KV cache tensor 一次性注册，由 `KVManagerBase.register_buffer_to_engine()` 在初始化时完成
-- **传输规划**：`create_transfer_plan()` 基于 key 等值匹配生成 `TransferPlan`，自动处理 split/replica 过滤和连续地址合并
+- **内存注册**：整个 KV cache tensor 一次性注册，由 `KVManagerBase.register_cache()` 在初始化时完成
+- **传输规划**：Prefill 初始化时通过 per-rank `CacheInfo` 交换预计算 `StaticTransferPlan`；per-request 利用 `base_ptrs + block_id × block_stride` 笛卡尔积生成地址，numpy sort/merge 后输出 `TransferPlan`
 - **首 token**：通过 `PrefillDone` 消息直接携带
 
 ### KV Cache 的 split/replica 模型
@@ -89,7 +89,7 @@ Prefill 通过 Mooncake Transfer Engine 执行 Device-to-Device 的 RDMA 写入�
    │                 │                   │                   │── PUB relay ────▶│
    │                 │                   │                   │                   │
    │                 │                   │                   │          分配 block
-   │                 │                   │                   │    get_kv_transfer_buffers
+   │                 │                   │                   │    构造 TransferBuffers (block_ids)
    │                 │                   │                   │                   │
    │                 │    DecodeAllocated│                   │                   │
    │                 │◀──────────────────────────────────────────────────────────│ (dp_rank 匹配的)
@@ -148,7 +148,7 @@ Decode Scheduler 收到请求后入队到 `_decode_incoming_q`。后台推进线
 
 Decode ctrl rank 通过 PUB/SUB relay 广播 `DecodePrepare` 到所有 Decode rank。dp_rank 匹配的 rank 调用 `prepare_kv_transfer()`：
 - 为每个 cache 分配 block（`PagedKVCache` 或 `SingletonPagedKVCache`）
-- 调用 `cache.get_kv_transfer_buffers()` 收集 recv_buffers（物理地址 + key）
+- 调用 `cache.构造 TransferBuffers (block_ids)()` 收集 recv_buffers（物理地址 + key）
 - 记录 `recv_bytes` 用于后续字节校验
 - 发送 `DecodeAllocated` 到 Prefill ctrl rank
 
@@ -157,8 +157,8 @@ Decode ctrl rank 通过 PUB/SUB relay 广播 `DecodePrepare` 到所有 Decode ra
 Prefill ctrl rank 收到 `DecodeAllocated` 后通过 PUB/SUB relay 广播到所有 Prefill rank。Scheduler 侧的队列推进（`_prefill_incoming_q → _prefill_bootstrap_q → _prefill_ready_q`）等待 `is_decode_allocated` 就绪后创建 Task 执行 prefill。
 
 Prefill 完成后触发 `MooncakeKVTransferHook.on_prefill_done()`，每个 Prefill rank 调用 `KVManagerPrefill.send_kv_cache()`：
-- 遍历 `Backend.cache_dict` 中所有 cache，调用 `cache.get_kv_transfer_buffers()` 收集 send_buffers
-- `create_transfer_plan(send_buffers, recv_buffers)` 生成 `TransferPlan`
+- 遍历 `Backend.cache_dict` 中所有 cache，调用 `cache.构造 TransferBuffers (block_ids)()` 收集 send_buffers
+- `create_transfer_plan(static_plan, send_buffers, recv_buffers)` 生成 `TransferPlan`
 - 提交到 `ThreadPoolExecutor` 异步执行 RDMA
 
 `transfer_worker` 线程：
@@ -194,9 +194,10 @@ kv_transfer/
 ├── decode.py                # KVManagerDecode: recv 侧完整逻辑
 ├── endpoint.py              # KVManagerEndpoint: ZMQ master/slave/remote 三模式
 ├── protocol.py              # 4 种协议消息 dataclass + ProtocolSerializer (msgpack)
-├── transfer_buffers.py      # TransferBuffer + TransferBuffers
+├── transfer_buffers.py      # TransferBuffers (per-cache block ID lists)
 ├── transfer_plan.py         # TransferPlan + create_transfer_plan
-├── cache_info.py            # CacheDistribution / CacheDistributions: per-cache distribution 与 chunk 计算
+├── static_transfer_plan.py  # StaticTransferPlan + build + sort/merge
+├── cache_info.py            # CacheInfo / InstanceCacheInfos: per-cache distribution 与 chunk 计算
 ├── task_info.py             # TaskInfo: per-request 状态聚合
 └── mooncake/
     ├── transfer_engine.py   # MooncakeTransferEngine: RDMA 封装 + MooncakeBootstrapServer
@@ -248,52 +249,55 @@ class DisaggregationMode(Enum):
 | `RankTransferDone` | Prefill rank → ctrl | `req_id`, `first_token`, `rank_bytes: dict[str,int]` |
 | `PrefillDone` | Prefill ctrl → Decode | `req_id`, `first_token`, `num_hit_tokens`, `rank_bytes: dict[str,int]` |
 
-### 传输匹配与规划（`transfer_plan.py`）
+### 传输匹配与规划（`transfer_plan.py` + `static_transfer_plan.py`）
 
-**Key 类型**：`TransferBufferKey` NamedTuple —
-`(req_id, cache_name, layer_id, block_id, split_id, split_len, replica_id, replica_size)`。
-序列化时以 `[key_fields, entries]` 二元组列表进入 msgpack（tuple 不能作 map key），反序列化恢复为 NamedTuple。
+**初始化阶段**：每个 Prefill rank 在 `register_cache()` 后调用 `_build_static_transfer_plans()`。
 
-**`create_transfer_plan` 流程**：
-1. 取 send key 去掉 `replica_id` / `replica_size` 的前 6 个字段
-2. 构建 `TransferMatcher` per prefix
-3. 按 `replica_ratio = send_replica_size // recv_replica_size` 过滤：仅 `send_replica_id == recv_replica_id * replica_ratio` 时匹配
-4. 双向长度一致性断言
-5. 按 recv.ptr 排序 + `_contiguous_address_merge` 合并相邻连续地址
-6. 构建 `TransferPlan`（per-session `TransferPlanPerRank`）
+1. 收集本 rank 各 cache 的 `CacheInfo`（GPU 指针、strides、layer_ids、split/replica）
+2. `all_gather_object` 汇聚所有本地 rank 信息，coordinator 交换远端信息 → `InstanceCacheInfos`
+3. 对每个 decode instance 调用 `build_static_transfer_plan(local_infos: RankCacheInfos, remote_infos: InstanceCacheInfos)`：
+   - 遍历 `(decode_session, cache_name)` pair，chunk 映射 + replica 匹配 + layer 交集
+   - chunk offset 预计算入 `src_base_ptrs / dst_base_ptrs`
+4. 产出 `StaticTransferPlan`（per decode inst_id），存为 `self.static_transfer_plan: dict[int, StaticTransferPlan]`
 
-**字节校验**：`PrefillDone.rank_bytes` 汇总所有 Prefill rank 的 per-session 传输字节数，Decode 侧对比 `recv_bytes`，不一致记录 error。
+**Per-request**：`create_transfer_plan(static_plan, send_buffers, recv_by_session)` —
 
-### CacheDistribution / CacheDistributions（`cache_info.py`）
+1. per cache：`generate_and_merge()` — `n_layers * n_blocks` 笛卡尔积 `addr = base_ptrs[layer] + phys_block_id * block_stride`，ravel 后 numpy sort/merge
+2. 跨 cache `sort_and_merge()` 统一按 dst 地址排序合并连续区间
+3. 产出 `TransferPlan`（`ptrs/lengths/remote_ptrs` 全为 numpy int64 数组，`execute_send()` 时 `.tolist()` 转换为 `list[int]`）
 
-`CacheDistribution`（frozen dataclass）描述单个 cache tensor 在 TP/PCP ranks 间的分布信息，在 `register_buffer_to_engine()` 初始化时根据 tensor shape 自动计算，无需外部配置：
+**优势**：无 per-request 临时对象；地址计算向量化（numpy）；`DecodeAllocated` 消息体积 ~10MB → ~1KB。
+
+**字节校验**：`PrefillDone.rank_bytes` 汇总所有 Prefill rank 的 per-session 传输字节数，Decode 侧对比 `recv_bytes`。
+### CacheInfo / RankCacheInfos / InstanceCacheInfos（`cache_info.py`）
+
+**`CacheInfo`**（frozen dataclass）描述单一 rank 的单一 cache tensor 的全部静态信息：
 
 ```python
 @dataclass(frozen=True)
-class CacheDistribution:
-    split_len: int       # 本地 head 数（cache tensor dim3）
+class CacheInfo:
+    split_len: int       # 本地 head 数
     split_id: int        # 全局 head 起始偏移
-    split_size: int      # 0 = replica; >0 = 在 TP/PCP ranks 间 split
-    replica_id: int      # 本 rank 在 replica 组内的序号
-    replica_size: int    # replica 组总大小
+    split_size: int      # 0 = replica; >0 = split
+    replica_id: int      # replica 组内序号
+    replica_size: int    # replica 组大小
+    base_ptr: int        # tensor GPU data_ptr（新增）
+    layer_ids: list[int] # 持有的 global layer 列表（新增）
+    layer_stride: int    # stride(0) * elem_size（新增）
+    block_stride: int    # stride(1) * elem_size（新增）
 
-    def calc_chunking(self, remote: CacheDistribution) -> tuple[int, int]:
-        """基于 gcd(local.split_len, remote.split_len) 计算 chunk 数与每 chunk 的 split 长度"""
+    def calc_chunking(self, remote: CacheInfo) -> tuple[int, int]:
         align = math.gcd(self.split_len, remote.split_len)
         return self.split_len // align, align
 ```
 
-统一计算逻辑（`CacheDistributions.register`）：
-```python
-replica_size = group_size // split_size
-split_id = (rank // replica_size) * split_len
-replica_id = rank % replica_size
-```
+**`RankCacheInfos`** — 单个 rank 的 cache 集合：`{session_id, caches: dict[cache_name, CacheInfo]}`。
 
-`CacheDistributions` 收集每个实例所有 cache 的 `CacheDistribution`（以 tensor name 为 key），在 `register_buffer_to_engine()` 中通过 coordinator 进行 P/D 两端交换，使 `get_kv_transfer_buffers()` 和 `kv_recv_reorder()` 能在运行时根据本地和对端的分布信息动态计算 chunking 策略（`calc_chunking`）。msgpack 序列化由 `ProtocolSerializer` 统一处理。
+**`InstanceCacheInfos`** — 一个实例所有 rank 的集合：`{ranks: dict[session_id, dict[cache_name, CacheInfo]]}`。msgpack 序列化通过 coordinator 在 P/D 间交换（key: `inst{id}:all_rank_cache_dists`，type: `"InstanceCacheInfos"`）。
+
+**per-rank 交换**：每个 rank 收集自身 `RankCacheInfos` → `all_gather_object` 汇聚 → coordinator 交换 → Prefill 侧用 `build_static_transfer_plan()` 构建 per-rank `StaticTransferPlan`。`kv_recv_reorder()` 通过 `local_dists.get(key)` 和 `remote_dists.get_any(key)` 动态计算 `n_chunks`。
 
 通过 `gcd(local.split_len, remote.split_len)` 动态对齐——无论 P/D 两端的 TP 大小如何，chunking 总能自动匹配。
-
 ### PDCoordinationService（`pd_coordination.py`）
 
 运行在 Router 进程中，负责调度器注册与 P/D 配对的状态管理（`register_scheduler` / `register_pd_pair` / `get_pd_stats`）。
@@ -679,7 +683,7 @@ Router 进程可选启动内置的 Prometheus Server（`PrometheusServerManager`
 - 非 rank 0 通过 PUB/SUB 接收 ctrl rank 广播的 `DecodeAllocated` / `DecodePrepare` / `PrefillDone` 等消息
 - 每个 TP rank 独立执行自己负责的 KV 层的 RDMA 传输
 - 所有 rank 完成后由 Prefill ctrl rank 汇总 `dp_way_size` 个 `RankTransferDone`，发送 `PrefillDone`
-- head-repeat 场景（n_head < tp_size）下，同 head 的连续 rank 产生相同 match_prefix，`TransferMatcher` 自动过滤重复匹配
+- head-repeat 场景（n_head < tp_size）下，同 head 的连续 rank 产生相同 match_prefix，`StaticTransferPlan builder` 自动过滤重复匹配
 
 ## CP（Context Parallelism）支持
 
@@ -701,9 +705,9 @@ Router 进程可选启动内置的 Prometheus Server（`PrometheusServerManager`
 | KV Manager Decode  | `kv_transfer/decode.py`                | Recv 侧：DecodePrepare → block 分配 → DecodeAllocated → 等待 PrefillDone |
 | Endpoint        | `kv_transfer/endpoint.py`                 | ZMQ master/slave/remote 三模式抽象              |
 | Protocol        | `kv_transfer/protocol.py`                 | 4 种协议消息 dataclass + msgpack 序列化           |
-| Transfer Buffers | `kv_transfer/transfer_buffers.py`        | TransferBuffer + TransferBuffers            |
-| Transfer Plan   | `kv_transfer/transfer_plan.py`            | TransferMatcher + TransferPlan + create_transfer_plan |
-| Cache Info      | `kv_transfer/cache_info.py`               | CacheDistribution / CacheDistributions: per-cache distribution 与 chunk 计算 |
+| Transfer Buffers | `kv_transfer/transfer_buffers.py`        | TransferBuffers (per-cache block ID lists)  |
+| Transfer Plan   | `kv_transfer/transfer_plan.py`            | StaticTransferPlan builder + TransferPlan + create_transfer_plan |
+| Cache Info      | `kv_transfer/cache_info.py`               | CacheInfo / InstanceCacheInfos: per-cache distribution 与 chunk 计算 |
 | Task Info       | `kv_transfer/task_info.py`                | TaskInfo: per-request 状态聚合                |
 | Transfer Engine | `kv_transfer/mooncake/transfer_engine.py` | Mooncake RDMA 引擎封装 + Bootstrap Server    |
 | Metadata        | `kv_transfer/mooncake/metadata.py`        | MetadataBuffers（辅助 buffer 管理）             |
@@ -721,8 +725,8 @@ Router 进程可选启动内置的 Prometheus Server（`PrometheusServerManager`
 | --------------------- | --------------------------------------------------------------------------- |
 | P/D 启动卡在 Bootstrap 连接 | 确认 Router 已启动 Bootstrap，且 coordinator.host/port 对 P/D 节点可达 |
 | Decode 长时间 WAITING    | 检查 Prefill 是否收到 `DecodeAllocated`；查看 Prefill 传输线程日志；确认 RDMA 设备已正确检测（见 `chitu/distributed/infiniband.py`） |
-| RDMA "Bad address"    | 确认 `register_buffer_to_engine()` 在 cache 创建后调用；检查各层 ptr/len 无重叠 |
+| RDMA "Bad address"    | 确认 `register_cache()` 在 cache 创建后调用；检查各层 ptr/len 无重叠 |
 | transfer bytes mismatch | Decode 日志出现 `rank_bytes` vs `recv_bytes` 不一致；检查 Prefill/Decode 的 `split_size` 配置是否匹配 |
 | GLM-5 + auto attn_type + MTP>1 乱码 | `HopperMixedBackend` 与 MTP 不兼容，设置 `attn_type=flash_mla` |
 | 同节点多进程端口冲突            | 调度器请求端口为随机分配并通过 coordinator 发现；仅需为每个 torchrun 进程指定不同的 `--master_port`；Router port 使用 22001 + job_offset 基础 |
-| head-repeat 模型乱码          | 检查 `CacheDistribution` 中的 `replica_size` / `split_id` 计算是否正确（head 按连续分组分布，同 head 的 rank 相邻）；确认 `TransferMatcher` replica_ratio 过滤逻辑 |
+| head-repeat 模型乱码          | 检查 `CacheInfo` 中的 `replica_size` / `split_id` 计算是否正确（head 按连续分组分布，同 head 的 rank 相邻）；确认 `StaticTransferPlan builder` replica_ratio 过滤逻辑 |

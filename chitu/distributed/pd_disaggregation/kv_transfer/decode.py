@@ -4,6 +4,8 @@
 
 from logging import getLogger
 
+import numpy as np
+
 from chitu.backend import Backend
 from chitu.kv_cache.kv_cache import PagedKVCache
 
@@ -47,7 +49,7 @@ class KVManagerDecode(KVManagerBase):
         for prefill_endpoint in self._prefill_endpoints.values():
             prefill_endpoint.decode_allocated.init_remote()
 
-        self.register_buffer_to_engine()
+        self.register_cache()
 
         self.endpoints.decode_prepare.launch_recv_thread(self.handle_decode_prepare)
         self.endpoints.prefill_done.launch_recv_thread(self.handle_prefill_done)
@@ -87,6 +89,32 @@ class KVManagerDecode(KVManagerBase):
 
         self._trace("handle_decode_prepare", req_id=msg.req_id)
 
+    def get_recv_buffers(self, req_id: str) -> TransferBuffers:
+        """Collect block IDs for all caches on the recv (decode) side.
+
+        Truncates to the non-cached portion using ``tid_to_cached_len``,
+        and records ``cache_skip_length`` so prefill can align.
+        """
+        info = self._info(req_id)
+        recv_buffers = TransferBuffers()
+
+        for cache_name, cache in Backend.cache_dict.items():
+            assert isinstance(cache, PagedKVCache)
+            new_block_ids = info.cache_manager_new_block_ids[cache.manager_name]
+
+            hit = cache.tid_to_cached_len.get(req_id, 0)
+            recv_buffers.cache_skip_length[cache_name] = hit
+
+            needed = -(-max(0, info.prefix_len - hit) // cache.block_size)  # ceil
+            new_block_ids = new_block_ids[:needed]
+            info.cache_new_block_ids[cache_name] = new_block_ids
+
+            for key in cache.paged_kv_cache:
+                recv_buffers.cache_block_ids[key] = np.array(
+                    new_block_ids, dtype=np.int32
+                )
+        return recv_buffers
+
     def prepare_kv_transfer(self, req_id: str) -> None:
         """Pre-allocate destination blocks and send DecodeAllocated to Prefill.
 
@@ -106,25 +134,17 @@ class KVManagerDecode(KVManagerBase):
             return
         info.is_decode_allocated_sent = True
 
-        remote_dists = self.remote_cache_dists[self._prefill_inst_ids[info.prefill_sid]]
+        recv_buffers = self.get_recv_buffers(req_id)
 
-        # Gather recv buffers
-        recv_buffers = TransferBuffers()
+        # Record expected recv bytes for later verification (approximate)
+        info.recv_bytes = 0
         for cache_name, cache in Backend.cache_dict.items():
-            assert isinstance(cache, PagedKVCache)
-            new_block_ids = info.cache_manager_new_block_ids[cache.manager_name]
-            info.cache_new_block_ids[cache_name] = new_block_ids
-
-            cache.get_kv_transfer_buffers(
-                recv_buffers,
-                req_id,
-                new_block_ids,
-                local_dists=self._local_cache_dists,
-                remote_dists=remote_dists,
-            )
-
-        # Record expected recv bytes for later verification.
-        info.recv_bytes = recv_buffers.total_bytes()
+            if not isinstance(cache, PagedKVCache) or cache.paged_kv_cache is None:
+                continue
+            ids = info.cache_new_block_ids.get(cache_name, [])
+            for tensor in cache.paged_kv_cache.values():
+                block_bytes = int(tensor.stride(1)) * tensor.element_size()
+                info.recv_bytes += len(ids) * tensor.shape[0] * block_bytes
 
         # Send DecodeAllocated to Prefill
         msg = DecodeAllocated(
