@@ -107,6 +107,31 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # Incremental evicted block hashes, consumed by scheduler stats reporter.
         self.evicted_blk_hashes: deque[str] = deque()
 
+    def has_active_blocks(self):
+        if len(self.active_blocks) > 0:
+            return True
+        assert (
+            not self.task_to_cache_ids
+        ), f"something wrong here, task_to_cache_ids should be empty, found: {self.task_to_cache_ids}"
+        return False
+
+    def clear_prefix_cache(self):
+        """Drop idle prefix-cache metadata"""
+        assert (
+            not self.has_active_blocks()
+        ), f"cache_manager is busy, can't clear prefix cache metadata."
+        self.free_cache_ids = deque(range(self.num_blocks))
+
+        self.active_blocks.clear()
+        self.cached_idle_blocks.clear()
+        self.evicted_blk_hashes.clear()
+        self.task_to_cache_ids.clear()
+        self.task_to_token_blocks.clear()
+        self.identity_runtime_pool.clear()
+        self.cache_idx_to_hash.clear()
+        self.identity_builder.hashed_block_pool.clear()
+        self.identity_builder.tid_to_identities.clear()
+
     def get_allocatable_max_num_blocks(self) -> int:
         return int(getattr(self, "allocatable_max_num_blocks", self.max_num_blocks))
 

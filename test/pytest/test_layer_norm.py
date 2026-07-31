@@ -25,8 +25,9 @@ def test_layer_norm_operator(
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
 
+    torch.manual_seed(1234)
     torch.set_default_dtype(default_dtype)
-    x = torch.rand(bs, dim).cuda()
+    x = torch.randn(bs, dim).cuda()
     weight = torch.randn(dim, dtype=weight_dtype, device=x.device)
     bias = torch.randn(dim, dtype=weight_dtype, device=x.device)
 
@@ -73,8 +74,9 @@ def test_layer_norm_in_place(
     if impl == "triton" and not has_triton:
         pytest.skip("triton is missing")
 
+    torch.manual_seed(1234)
     torch.set_default_dtype(default_dtype)
-    x = torch.rand(bs, dim).cuda()
+    x = torch.randn(bs, dim).cuda()
     weight = torch.randn(dim, dtype=weight_dtype, device=x.device)
     bias = torch.randn(dim, dtype=weight_dtype, device=x.device)
 

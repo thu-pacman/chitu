@@ -67,7 +67,11 @@ from chitu.distributed.coordinator import get_endpoint, set_endpoint
 from chitu.distributed.pd_disaggregation.pd_scheduler import get_pd_scheduler_instance
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
-from chitu.dp_request_router import is_terminate_engine_message, is_profile_message
+from chitu.dp_request_router import (
+    is_terminate_engine_message,
+    is_profile_message,
+    is_flush_cache_message,
+)
 from chitu.kv_cache.utils import (
     is_reallocable_kv_cache,
     reduce_num_block_plan_across_ranks,
@@ -1828,12 +1832,62 @@ async def start_enhanced_scheduler_service(rank: int, multi_inst, args):
         logger.warning(f"[Enhanced Scheduler {instance_id}] Service stopped")
 
 
+def flush_local_prefix_cache() -> dict:
+    """Drop idle prefix-cache metadata on this instance.
+    The function only flushes when no request is active locally. Active KV blocks
+    are left untouched to avoid invalidating an in-flight task.
+    """
+    if len(TaskPool.pool) + len(TaskPool.pending_queue) > 0:
+        raise RuntimeError("cannot flush cache while requests are active")
+    cache_managers = Backend.cache_managers or []
+
+    # 先探测是否有busy状态
+    busy = []
+    for dp_rank, cache_manager_dict in enumerate(cache_managers):
+        for name, manager in cache_manager_dict.items():
+            if not hasattr(manager, "has_active_blocks"):
+                continue
+            if manager.has_active_blocks():
+                busy.append(
+                    {
+                        "dp_rank": dp_rank,
+                        "manager": name,
+                        "active_blocks": len(getattr(manager, "active_blocks", [])),
+                    }
+                )
+    if busy:
+        raise RuntimeError(f"cannot flush cache while KV blocks are active: {busy}")
+
+    # 实施flush
+    flushed_blocks = 0
+    touched = []
+    for dp_rank, cache_manager_dict in enumerate(cache_managers):
+        for name, manager in cache_manager_dict.items():
+            if not hasattr(manager, "clear_prefix_cache"):
+                continue
+            n_idle_blocks = len(getattr(manager, "cached_idle_blocks", {}))
+            manager.clear_prefix_cache()
+            flushed_blocks += n_idle_blocks
+            touched.append(
+                {"dp_rank": dp_rank, "manager": name, "flushed_blocks": n_idle_blocks}
+            )
+    return {"status": "success", "flushed_blocks": flushed_blocks, "managers": touched}
+
+
 async def process_scheduler_request(rank: int, request_data: dict):
     """Handle scheduling requests from Router"""
     try:
         if is_terminate_engine_message(request_data):
             Backend.state = BackendState.Terminating
             logger.info("Terminate_engine received. Draining in-flight requests")
+            return
+
+        if is_flush_cache_message(request_data):
+            try:
+                result = flush_local_prefix_cache()
+                logger.info("flush_cache applied: %s", result)
+            except Exception as e:
+                logger.exception(f"flush_cache failed: {e}")
             return
 
         if is_profile_message(request_data):

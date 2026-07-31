@@ -147,6 +147,11 @@ class MooncakeKVTransferHook:
             num_hit_tokens = [
                 request_cached_tokens.get(rid, 0) for rid in req_ids_output
             ]
+            if logger.isEnabledFor(logging.DEBUG):
+                for rid, hit_tokens in zip(req_ids_output, num_hit_tokens):
+                    logger.debug(
+                        f"[Trace data] ({rid}): prefill_send_num_hit_tokens={hit_tokens}"
+                    )
             if first_tokens is None:
                 # 看到该日志表示：该 rank 只传输 KV Cache（不包含首 token）
                 logger.debug(f"[KVHook] sending KV-only for requests: {req_ids_output}")

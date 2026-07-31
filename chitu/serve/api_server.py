@@ -210,6 +210,43 @@ async def v1_responses(
     )
 
 
+@app.post("/flush_cache")
+async def flush_cache(priority=Depends(api_guard)):
+    if _is_router_process():
+        router = get_request_router()
+        if not hasattr(router, "broadcast_flush_cache"):
+            raise HTTPException(
+                status_code=501, detail="router does not support flush_cache"
+            )
+        result = await router.broadcast_flush_cache()
+        sent_to = result.get("sent_to", [])
+        n_flushed_workers = len(sent_to)
+        n_total_workers = n_flushed_workers + len(result.get("errors", []))
+
+        status = "success" if not result.get("errors") else "partial"
+        return {
+            "status": status,
+            "num_flushed_workers": n_flushed_workers,
+            "num_total_workers": n_total_workers,
+            "workers_flushed": n_flushed_workers,
+            "total_http_workers": n_total_workers,
+            "detail": result,
+        }
+
+    try:
+        from chitu.chitu_main import flush_local_prefix_cache
+
+        result = flush_local_prefix_cache()
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {
+        "status": "success",
+        "workers_flushed": 1,
+        "total_http_workers": 1,
+        "detail": result,
+    }
+
+
 @app.post("/init")
 async def init_chitu_service():
     if get_server_status():
