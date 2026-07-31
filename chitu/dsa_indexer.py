@@ -140,8 +140,6 @@ def _validate_torch_bf16_indexer_config(args):
         raise ValueError(
             f"indexer_type=torch_bf16 only supports cache_type=paged, but got {args.infer.cache_type}"
         )
-    if args.infer.mtp_size > 2:
-        raise ValueError("indexer_type=torch_bf16 does not support mtp_size > 2")
 
 
 def _validate_triton_bf16_indexer_config(args):
@@ -330,67 +328,6 @@ class DSAIndexer:
                 ]
 
         return out
-
-    @staticmethod
-    def _bf16_mqa_logits_torch(
-        q: torch.Tensor,  # [s_q, h, d], bf16
-        k: torch.Tensor,  # [s_k, d], bf16
-        weights: torch.Tensor,  # [s_q, h], fp32
-        ks: torch.Tensor,  # [s_q], int32 — start of valid k range in concat K per query
-        ke: torch.Tensor,  # [s_q], int32 — end (exclusive) of valid k range in concat K
-        out_max_n: int,
-    ) -> torch.Tensor:
-        """
-        Pure-torch MQA logits for ragged QK on NPU.
-        """
-        s_q, h, _ = q.shape
-
-        # bmm: q [s_q, h, d] · k.T [d, s_k] -> [s_q, h, s_k]
-        qk = torch.matmul(q, k.transpose(0, 1))
-        qk = torch.relu(qk)
-        # weighted sum over heads: [s_q, s_k]
-        score_global = (qk * weights.to(qk.dtype).unsqueeze(-1)).sum(dim=1)
-
-        # Remap each query's [ks, ke) slice to local offsets [0, ke-ks).
-        s_k = k.shape[0]
-
-        # Build per-query column indices: clamp to [0, s_k-1], invalid positions get
-        # -inf score below.
-        j_local = torch.arange(out_max_n, device=score_global.device, dtype=ks.dtype)
-        j_global = ks.unsqueeze(1) + j_local.unsqueeze(0)  # [s_q, out_max_n]
-        in_range = j_global < ke.unsqueeze(1)  # [s_q, out_max_n]
-        j_clamped = j_global.clamp(min=0, max=max(s_k - 1, 0)).to(torch.long)
-        gathered = score_global.gather(1, j_clamped)  # [s_q, out_max_n]
-        score = torch.where(
-            in_range, gathered, torch.full_like(gathered, float("-inf"))
-        )
-        return score
-
-    def bf16_index_score_ragged_qk_dsv32_torch_bf16(
-        self,
-        q: torch.Tensor,  # [s_q, h, d=128], bf16
-        weights: torch.Tensor,  # [s_q, h], fp32
-        k: torch.Tensor,  # [s_k, d=128], bf16
-        seq_len_delta: BatchedSeqLenDelta,
-        causal: bool,
-    ):
-        """Pure-torch bf16 mqa_logits for ragged qk (prefill)."""
-        s_q, h, _ = q.shape
-        assert k.dim() == 2
-        weights = weights.reshape(s_q, h)
-        ks = seq_len_delta.new.prefix_lens_tensor_device[
-            seq_len_delta.delta_seq_ids_tensor_device
-        ]
-        if causal:
-            ke = seq_len_delta.delta_position_ids_tensor_device + ks + 1
-        else:
-            ke = (
-                seq_len_delta.new.lens_tensor_device[
-                    seq_len_delta.delta_seq_ids_tensor_device
-                ]
-                + ks
-            )
-        return self._bf16_mqa_logits_torch(q, k, weights, ks, ke, self.static_max_n)
 
     def bf16_index_score_ragged_q_paged_k_dsv32_hygon(
         self,
@@ -752,54 +689,7 @@ class DSAIndexer:
 
         return index_score
 
-    def bf16_index_score_dsa_torch_bf16(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        weights: torch.Tensor,
-        seq_len_delta: BatchedSeqLenDelta,
-        cache_accessor: KVCacheAccessor,
-        is_causal=True,
-        skip_prefill_score: bool = False,
-    ):
-        """Pure-torch bf16 equivalent of bf16_index_score_dsa: bf16 KV cache, pure-torch mqa."""
-        assert isinstance(cache_accessor, PagedKVCacheAccessor)
-        append_to_paged_kv_cache(
-            cache_accessor.kv["indexer_k"],
-            cache_accessor.block_table,
-            k,
-            seq_len_delta.delta_position_ids_tensor_device,
-            seq_len_delta.delta_seq_ids_tensor_device,
-            get_page_ids=cache_accessor.get_page_ids,
-            get_offs_in_page=cache_accessor.get_offs_in_page,
-            use_i64_offsets=cache_accessor.use_i64_offsets,
-        )
-
-        if seq_len_delta.is_decode_stage:
-            return self.bf16_index_score_ragged_q_paged_k_dsv32_torch_bf16(
-                q,
-                weights,
-                cache_accessor.kv["indexer_k"],
-                seq_len_delta,
-                cache_accessor.block_table,
-            )
-
-        if skip_prefill_score:
-            # The cache append above is still required by later decode steps.
-            return None
-
-        k_full = read_from_paged_kv_cache(
-            cache_accessor.kv["indexer_k"],
-            cache_accessor.block_table,
-            seq_len_delta.new.position_ids_tensor_device,
-            seq_len_delta.new.seq_ids_tensor_device,
-            use_i64_offsets=cache_accessor.use_i64_offsets,
-        )
-        return self.bf16_index_score_ragged_qk_dsv32_torch_bf16(
-            q, weights, k_full, seq_len_delta, is_causal
-        )
-
-    def bf16_index_score_dsa_triton_bf16(
+    def bf16_index_score_dsa_bf16(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
@@ -811,17 +701,9 @@ class DSAIndexer:
         ks: Optional[torch.Tensor] = None,
         skip_prefill_score: bool = False,
     ):
-        """Triton bf16 equivalent of bf16_index_score_dsa_torch_bf16.
-
-        Shares the BF16 (K-only) indexer KV layout with torch_bf16/hygon, but
-        computes the mqa logits with the triton kernels registered under
-        chitu.ops.indexer_score_bf16.
-
-        In CP mode, ``ks`` and ``ke`` are provided with LOCAL sizes matching q
-        (``ke`` is the local delta_position_ids + 1). Mirroring the deepgemm
-        branch, the full global ke for the kernel is ``ke + ks``.
-        """
+        """BF16 indexer score using the BF16 K-only paged cache layout."""
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
+        score_impl = {"torch_bf16": "torch", "triton_bf16": "triton"}[self.impl]
         append_to_paged_kv_cache(
             cache_accessor.kv["indexer_k"],
             cache_accessor.block_table,
@@ -834,6 +716,14 @@ class DSAIndexer:
         )
 
         if seq_len_delta.is_decode_stage:
+            if score_impl == "torch":
+                return self.bf16_index_score_ragged_q_paged_k_dsv32_torch_bf16(
+                    q,
+                    weights,
+                    cache_accessor.kv["indexer_k"],
+                    seq_len_delta,
+                    cache_accessor.block_table,
+                )
             return bf16_index_score_ragged_q_paged_k_dsv32(
                 q,
                 weights,
@@ -841,7 +731,7 @@ class DSAIndexer:
                 seq_len_delta,
                 cache_accessor.block_table,
                 self.static_max_n,
-                impl="triton",
+                impl=score_impl,
             )
 
         if skip_prefill_score:
@@ -859,9 +749,6 @@ class DSAIndexer:
         s_q, h, _ = q.shape
         weights = weights.reshape(s_q, h)
 
-        # CP mode: use caller-provided local ks and ke (local_lengths) so the
-        # kernel's ks/ke stay aligned with the local query count, then rebuild
-        # the full ke (delta_pos + 1 + prefix_len). Same as the deepgemm branch.
         if ks is not None and ke is not None:
             ke = ke + ks
         else:
@@ -885,7 +772,7 @@ class DSAIndexer:
             is_causal,
             ke,
             ks,
-            impl="triton",
+            impl=score_impl,
         )
 
     def dsa_indexer(
@@ -939,18 +826,8 @@ class DSAIndexer:
                 q_seq_ids=q_seq_ids,
                 skip_prefill_score=select_all_prefill_keys,
             )
-        elif self.impl == "torch_bf16":
-            logits = self.bf16_index_score_dsa_torch_bf16(
-                q_fp8,
-                k_fp8,
-                weights,
-                seq_len_delta,
-                cache_accessor,
-                is_causal,
-                skip_prefill_score=select_all_prefill_keys,
-            )
-        elif self.impl == "triton_bf16":
-            logits = self.bf16_index_score_dsa_triton_bf16(
+        elif self.impl in ("torch_bf16", "triton_bf16"):
+            logits = self.bf16_index_score_dsa_bf16(
                 q_fp8,
                 k_fp8,
                 weights,

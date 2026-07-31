@@ -71,8 +71,8 @@ class KVManagerPrefill(KVManagerBase):
     def get_send_buffers(self, req_id: str) -> TransferBuffers:
         """Collect block IDs for all caches on the send (prefill) side.
 
-        Prefill blocks start from position 0 (no prefix skip).
-        ``create_transfer_plan`` uses decode's ``cache_skip_length`` for alignment.
+        Truncates cached prefix from the front.  ``skip`` is 0 for now;
+        future work: derive from ``decode_cached_tokens``.
         """
         send_buffers = TransferBuffers()
         for cache in Backend.cache_dict.values():
@@ -82,9 +82,9 @@ class KVManagerPrefill(KVManagerBase):
             if not block_indices:
                 continue
             ids = np.array(block_indices, dtype=np.int32)
+            skip = 0  # decode_cached_tokens // cache.block_size
             for key in cache.paged_kv_cache:
-                send_buffers.cache_block_ids[key] = ids
-                send_buffers.cache_skip_length[key] = 0
+                send_buffers.cache_block_ids[key] = ids[skip:]
         return send_buffers
 
     def _build_static_transfer_plans(self) -> None:
@@ -110,10 +110,7 @@ class KVManagerPrefill(KVManagerBase):
             # Accumulate per-session byte counts.
             for sid, nbytes in msg.rank_bytes.items():
                 info.rank_bytes[sid] = info.rank_bytes.get(sid, 0) + nbytes
-            if (
-                info.done_count >= self.dp_way_size
-                and not info.is_prefill_transfer_completed
-            ):
+            if info.done_count == self.dp_way_size:
                 nty = PrefillDone(
                     req_id=info.req_id,
                     first_token=info.first_token,
@@ -127,7 +124,6 @@ class KVManagerPrefill(KVManagerBase):
                 self._completed_prefill_request_counts[info.req_id] = (
                     self._completed_prefill_request_counts.get(info.req_id, 0) + 1
                 )
-                self._remove_info(info.req_id)
 
         self._trace("handle_rank_transfer_done", req_id=msg.req_id)
 
@@ -167,6 +163,7 @@ class KVManagerPrefill(KVManagerBase):
 
         info.recv_buffers[msg.session_id] = msg.buffers
         info.decode_allocated_cnt += 1
+        info.decode_cached_tokens = msg.decode_cached_tokens
 
         if info.decode_allocated_cnt >= msg.rank_num:
             info.is_decode_allocated = True
@@ -255,3 +252,14 @@ class KVManagerPrefill(KVManagerBase):
         if info is None:
             return False
         return info.is_decode_allocated
+
+    def get_all_transfer_done(self) -> list[str]:
+        with self._prefill_transfer_state_lock:
+            request_ids = [
+                rid
+                for rid, info in self._task_infos.items()
+                if info.is_prefill_transfer_completed
+            ]
+            for request_id in request_ids:
+                self._remove_info(request_id)
+            return request_ids

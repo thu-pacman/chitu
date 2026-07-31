@@ -80,9 +80,8 @@ def create_transfer_plan(
     """Create a :class:`TransferPlan` from the precomputed :class:`StaticTransferPlan`.
 
     For each session, per cache:
-    1. Align prefix using decode's ``cache_skip_length``.
-    2. ``generate_transfer_addrs`` → ``sort_and_merge``.
-    3. Accumulate into :class:`TransferPlanPerRank`.
+    1. ``generate_transfer_addrs`` → ``sort_and_merge``.
+    2. Accumulate into :class:`TransferPlanPerRank`.
     """
     plans: dict[str, TransferPlanPerRank] = {}
 
@@ -101,19 +100,8 @@ def create_transfer_plan(
             if src_ids is None or dst_ids is None:
                 continue
 
-            # Align prefix: prefill blocks start at position 0; decode
-            # may have cached tokens on the front.  Truncate prefill's
-            # list from the front by that many blocks.
-            assert (
-                send_buffers.cache_skip_length.get(cache_name, 0) == 0
-            ), f"prefill cache_skip_length must be 0 for {cache_name}"
-            skip_tokens = recv_bufs.cache_skip_length.get(cache_name, 0)
-            if skip_tokens > 0 and plan.block_tokens > 0:
-                skip_blocks = skip_tokens // plan.block_tokens
-                src_ids = src_ids[skip_blocks:]
-
             assert len(src_ids) == len(dst_ids), (
-                f"block count mismatch after alignment: {cache_name} "
+                f"block count mismatch: {cache_name} "
                 f"src={len(src_ids)} dst={len(dst_ids)}"
             )
 

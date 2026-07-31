@@ -691,13 +691,13 @@ class Scheduler:
             pd_prealloc_tokens=pd_prealloc_tokens,
         )
         if capacity_status is not KVCacheCapacityStatus.OK:
-            return capacity_status
+            return capacity_status, num_cached_tokens
         task.set_prefill_chunk_size_for_one_step(
             1 if num_uncomputed_tokens == 0 else num_uncomputed_tokens
         )
         self._prepare_prefill_metadata(task, num_cached_tokens)
         task.consume_req_tokens()
-        return capacity_status
+        return capacity_status, num_cached_tokens
 
     def _schedule_prefill_tasks(self, task_ids: list[str]) -> list[str]:
         """Prefill tasks scheduling with congestion control

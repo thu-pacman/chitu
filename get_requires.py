@@ -41,8 +41,15 @@ if get_bool_env("CHITU_HYGON_BUILD", False):
             setup_dir,
             "third_party/hygon_wheels/mooncake_transfer_engine_shca-0.3.10.post1+das.opt1.dtk2604.2605131044.gd34f6f-cp310-cp310-manylinux_2_35_x86_64.whl",
         )
+
+        deep_ep = "deep_ep @ file://localhost" + os.path.join(
+            setup_dir,
+            "third_party/hygon_wheels/deep_ep-1.1.0+das.opt1.dtk2604.shca-cp310-cp310-linux_x86_64.whl",
+        )
     else:
         mooncake = "mooncake-transfer-engine==0.3.7.post2+das.opt1.dtk2604.torch290"
+
+        deep_ep = "deep-ep==1.1.0+das.opt1.dtk2604.torch290"
 
 else:
     cuda_major = int((torch.version.cuda or "0").split(".")[0])
@@ -53,6 +60,11 @@ else:
 
     deep_gemm = "deep_gemm @ file://localhost" + os.path.join(
         setup_dir, "third_party/DeepGEMM"
+    )
+
+    # NOTE: Please make sure `requirements-build-deep_ep-cu12.txt` is installed at BUILD TIME
+    deep_ep = "deep_ep @ file://localhost" + os.path.join(
+        setup_dir, "third_party/DeepEP"
     )
 
     if cuda_major == 13:
@@ -157,9 +169,7 @@ extras_require = {
     ],
     "flash_mla": [flash_mla],
     "deep_gemm": [deep_gemm],
-    "deep_ep": [
-        "deep_ep @ file://localhost" + os.path.join(setup_dir, "third_party/DeepEP"),
-    ],  # Please make sure `requirements-build-deep_ep-cu12.txt` is installed at BUILD TIME
+    "deep_ep": [deep_ep],
     "hard_fp4_kernels": [
         "hard_fp4_kernels @ file://localhost"
         + os.path.join(setup_dir, "third_party/hard_fp4_kernels"),

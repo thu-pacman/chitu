@@ -71,6 +71,12 @@ else \
     apt update -y && apt install -y infiniband-diags; \
 fi
 
+# /opt/mpi in the `harbor.sourcefind.cn:5443/dcu/admin/base/pytorch:2.9.0-ubuntu22.04-dtk26.04-py3.10` base image is broken, but
+# the base image has another `/usr/mpi/gcc/openmpi-4.1.7a1` installed by `apt`. Use this instead.
+RUN rm -rf /opt/mpi
+ENV LD_LIBRARY_PATH="/usr/mpi/gcc/openmpi-4.1.7a1/lib:$LD_LIBRARY_PATH"
+ENV PATH="/usr/mpi/gcc/openmpi-4.1.7a1/bin:$PATH"
+
 RUN curl -L --retry 3 --retry-delay 5 -o /tmp/dtk_llvm.run https://download.sourcefind.cn:65024/file/4/dtk_llvm/dtk_llvm.run && \
     chmod +x /tmp/dtk_llvm.run && \
     /tmp/dtk_llvm.run && \

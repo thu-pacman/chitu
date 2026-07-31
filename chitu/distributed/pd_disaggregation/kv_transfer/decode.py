@@ -9,6 +9,10 @@ import numpy as np
 from chitu.backend import Backend
 from chitu.kv_cache.kv_cache import PagedKVCache
 
+from chitu.kv_cache.kv_cache import PagedKVCache
+
+from chitu.utils import ceil_div
+
 from .base import KVManagerBase, DisaggregationMode
 from .endpoint import PrefillEndpoints, DecodeEndpoints
 from .protocol import (
@@ -82,6 +86,7 @@ class KVManagerDecode(KVManagerBase):
         info.prefix_len = msg.prefix_len
         info.cache_manager_new_block_ids = msg.new_cache_ids
         info.dp_rank = msg.dp_rank
+        info.decode_cached_tokens = msg.decode_cached_tokens
 
         if not info.is_decode_prepare_received:
             info.is_decode_prepare_received = True
@@ -92,8 +97,8 @@ class KVManagerDecode(KVManagerBase):
     def get_recv_buffers(self, req_id: str) -> TransferBuffers:
         """Collect block IDs for all caches on the recv (decode) side.
 
-        Truncates to the non-cached portion using ``tid_to_cached_len``,
-        and records ``cache_skip_length`` so prefill can align.
+        Truncates cached prefix from the front.  ``skip`` is 0 for now;
+        future work: derive from ``decode_cached_tokens``.
         """
         info = self._info(req_id)
         recv_buffers = TransferBuffers()
@@ -102,17 +107,14 @@ class KVManagerDecode(KVManagerBase):
             assert isinstance(cache, PagedKVCache)
             new_block_ids = info.cache_manager_new_block_ids[cache.manager_name]
 
-            hit = cache.tid_to_cached_len.get(req_id, 0)
-            recv_buffers.cache_skip_length[cache_name] = hit
-
-            needed = -(-max(0, info.prefix_len - hit) // cache.block_size)  # ceil
-            new_block_ids = new_block_ids[:needed]
-            info.cache_new_block_ids[cache_name] = new_block_ids
+            skip = 0  # decode_cached_tokens // cache.block_size
+            need = ceil_div(info.prefix_len, cache.block_size)
+            sliced = new_block_ids[skip:need]
+            ids = np.array(sliced, dtype=np.int32)
+            info.cache_new_block_ids[cache_name] = sliced
 
             for key in cache.paged_kv_cache:
-                recv_buffers.cache_block_ids[key] = np.array(
-                    new_block_ids, dtype=np.int32
-                )
+                recv_buffers.cache_block_ids[key] = ids
         return recv_buffers
 
     def prepare_kv_transfer(self, req_id: str) -> None:
@@ -154,6 +156,7 @@ class KVManagerDecode(KVManagerBase):
             rank_num=self.dp_way_size,
             session_id=self.session_id,
             buffers=recv_buffers,
+            decode_cached_tokens=info.decode_cached_tokens,
         )
         payload = ProtocolSerializer.pack(msg)
 
@@ -244,6 +247,7 @@ class KVManagerDecode(KVManagerBase):
         prefix_len: int,
         new_cache_ids: dict[str, list[int]],
         dp_rank: int,
+        decode_cached_tokens: int = 0,
     ):
         msg = DecodePrepare(
             req_id=req_id,
@@ -251,6 +255,7 @@ class KVManagerDecode(KVManagerBase):
             prefix_len=prefix_len,
             new_cache_ids=new_cache_ids,
             dp_rank=dp_rank,
+            decode_cached_tokens=decode_cached_tokens,
         )
         self.endpoints.decode_prepare.send(ProtocolSerializer.pack(msg))
 
