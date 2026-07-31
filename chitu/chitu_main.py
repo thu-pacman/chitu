@@ -64,6 +64,7 @@ from chitu.ops.utils import (
 )
 from chitu.distributed.comm_group import SingletonGroupPlaceholder
 from chitu.distributed.coordinator import get_endpoint, set_endpoint
+from chitu.distributed.pd_disaggregation.pd_scheduler import get_pd_scheduler_instance
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
 from chitu.dp_request_router import is_terminate_engine_message, is_profile_message
@@ -1429,10 +1430,6 @@ def _collect_ready_task_ids_by_dp(task_type: TaskType) -> list[list[str]]:
 
 
 def _do_pd_scheduler():
-    from chitu.distributed.pd_disaggregation.pd_scheduler import (
-        get_pd_scheduler_instance,
-    )
-
     pd_scheduler = get_pd_scheduler_instance()
 
     if Backend.args.multi_inst.role == "prefill":
@@ -1470,13 +1467,15 @@ def chitu_run_main_rank():
         _do_pd_scheduler()
     for scheduler in Backend.schedulers:
         scheduler.prepare_for_schedule()
+    schedule_task_type_order = _infer_schedule_task_type_order(
+        Backend.args.multi_inst.role
+    )
     if Backend.args.infer.dp_size == 1:
         assert len(Backend.schedulers) == 1
-        task_ids = Backend.schedulers[0].schedule()
-    else:
-        schedule_task_type_order = _infer_schedule_task_type_order(
-            Backend.args.multi_inst.role
+        task_ids = Backend.schedulers[0].schedule(
+            strict_allowed_task_type=set(schedule_task_type_order)
         )
+    else:
         if TaskType.Prefill in schedule_task_type_order:
             _update_tasks_preferred_dp_rank()  # Update DP preference for prefill.
 
@@ -1557,6 +1556,14 @@ def chitu_run_main_rank():
 
     # 3. Update TaskPool
     task_ids = TaskCollector.get_update_task_ids()
+    if Backend.args.multi_inst.role == "prefill":
+        pd_scheduler = get_pd_scheduler_instance()
+        transfer_done_ids = pd_scheduler.kv_manager.get_all_transfer_done()
+        for task_id in transfer_done_ids:
+            task = TaskPool.pool[task_id]
+            task.req.finish_reason = "prefill_only"
+            task.set_stopped()
+        task_ids += transfer_done_ids
     task_ids = TaskPool.id_list
     task_ids = [task_id for task_id in task_ids if TaskPool.pool.get(task_id)]
     # tasks w/o dp_size are evicted and already removed
