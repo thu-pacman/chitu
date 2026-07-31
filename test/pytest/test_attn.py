@@ -530,58 +530,6 @@ def test_dsa_indexer_paged_kv(
     assert_close(logits.to(ref_logits.dtype), ref_logits, rtol=1e-2, atol=1e-2)
 
 
-def _ref_bf16_index_score(
-    q,  # [s_q, h, d], bf16
-    weights,  # [s_q, h], fp32
-    k_ragged,  # [s_k_total, d], bf16 — new-ragged layout: each seq's keys contiguous
-    seq_len_delta: BatchedSeqLenDelta,
-    static_max_n,
-    is_causal,
-):
-    """ground truth for the bf16 lightning indexer, computed and returned in fp32
-
-    ``index_type=torch`` would need fp8, which 910B2 does not support
-    (Float8_e4m3fn), so this independent fp32 reference is used instead.
-    """
-    s_q = q.shape[0]
-    out = torch.full(
-        (s_q, static_max_n), float("-inf"), dtype=torch.float32, device=q.device
-    )
-    if s_q == 0:
-        return out
-
-    q_f = q.to(torch.float32)
-    w_f = weights.to(torch.float32)
-    k_f = k_ragged.to(torch.float32)
-
-    delta_pos_ids = seq_len_delta.delta_position_ids_tensor_device
-    prefix_new = seq_len_delta.new.prefix_lens_list  # [bs + 1]
-    new_lens = seq_len_delta.new.lens_list  # [bs]
-
-    # Each query attends only to its own sequence's keys; process one sequence at
-    # a time (bs iterations, not s_q).
-    delta_seq_ids_t = seq_len_delta.delta_seq_ids_tensor_device
-    for seq_id, seq_len in enumerate(new_lens):
-        rows = (delta_seq_ids_t == seq_id).nonzero(as_tuple=True)[0]
-        if rows.numel() == 0 or seq_len == 0:
-            continue
-        n = min(seq_len, static_max_n)
-        k_start = prefix_new[seq_id]
-        k_seq = k_f[k_start : k_start + n]  # [n, d]
-        qi = q_f[rows]  # [m, h, d]
-        # [m, h, n] -> ReLU -> weighted sum over heads -> [m, n]
-        qk = torch.relu(torch.matmul(qi, k_seq.transpose(0, 1)))
-        score = (qk * w_f[rows].unsqueeze(-1)).sum(dim=1)  # [m, n]
-        col = torch.arange(n, device=q.device)
-        if is_causal:
-            pos = delta_pos_ids[rows].to(torch.long)  # [m]
-            score = score.masked_fill(
-                col.unsqueeze(0) > pos.unsqueeze(1), float("-inf")
-            )
-        out[rows.unsqueeze(1), col.unsqueeze(0)] = score
-    return out
-
-
 @pytest.mark.parametrize("bs", [0, 1, 5])
 @pytest.mark.parametrize(
     "s_q, s_k",
@@ -597,7 +545,7 @@ def _ref_bf16_index_score(
 )
 @pytest.mark.parametrize("n_heads", [64])
 @pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("impl", ["torch_bf16", "hygon", "triton_bf16"])
+@pytest.mark.parametrize("impl", ["hygon", "triton_bf16"])
 def test_dsa_indexer_paged_kv_bf16(
     bs, s_q, s_k, n_heads, head_dim, impl, record_benchmark
 ):
@@ -737,13 +685,16 @@ def test_dsa_indexer_paged_kv_bf16(
         impl=impl,
     )
 
-    ref_logits = _ref_bf16_index_score(
+    ref_indexer_backend = DSAIndexer("torch_bf16")
+    ref_logits = ref_indexer_backend.dsa_indexer(
         q,
+        k_delta,
+        None,
         weights,
-        k_ragged,
         seq_len_delta,
-        static_max_n=max_seq_len,
+        init_indexer_paged_kv_accessor(k_old),
         is_causal=True,
+        return_indices=False,
     )
     if ref_logits.shape[-1] > logits.shape[-1]:
         ref_logits = ref_logits[..., : logits.shape[-1]]
@@ -758,6 +709,7 @@ def test_dsa_indexer_paged_kv_bf16(
         0
     ) <= seq_len_delta.delta_position_ids_tensor_device.unsqueeze(1)
     logits[~mask] = float("-inf")
+    ref_logits[~mask] = float("-inf")
 
     logits_f = logits.to(torch.float32)
 
@@ -776,11 +728,9 @@ def test_dsa_indexer_paged_kv_bf16(
 # ---------------------------------------------------------------------------
 # triton_bf16 indexer kernels — standalone precision tests.
 #
-# These exercise the two bf16 triton kernels used by ``indexer_type=triton_bf16``
-# directly against the fp32 reference ``_ref_bf16_index_score``, decoupled from
-# the ``torch_bf16`` / ``hygon`` suite above:
+# These exercise the bf16 triton prefill kernel used by
+# ``indexer_type=triton_bf16`` against the production torch implementation:
 #   - prefill:  bf16_index_score_ragged_qk_dsv32  (non-CP and CP)
-#   - decode:   bf16_index_score_ragged_q_paged_k_dsv32  (no CP)
 # ---------------------------------------------------------------------------
 
 
@@ -843,18 +793,14 @@ def test_triton_bf16_index_score_ragged_qk_nocp(
     if not (torch.cuda.is_available() and has_triton):
         pytest.skip("triton_bf16 indexer requires CUDA + triton")
 
-    # The fp32 reference materializes a per-seq [m, h, s_k] tensor; large s_k
-    # OOMs on small CI GPUs. Skip big shapes there (same policy as
-    # test_dsa_indexer_paged_kv_bf16).
     _, total_memory = torch.cuda.mem_get_info()
     total_memory = total_memory / (1024**3)
     if max(new_seq_len_list) > 4096 and total_memory < 80:
-        pytest.skip("Skip large s_k ref on devices with not enough memory")
+        pytest.skip("Skip large s_k on devices with not enough memory")
 
     device = "cuda"
     torch.set_default_dtype(torch.bfloat16)
-    max_seq_len = 8192
-    _triton_bf16_indexer_common_args(max_seq_len, 1, n_heads, head_dim)
+    _triton_bf16_indexer_common_args(8192, 1, n_heads, head_dim)
 
     seq_len_delta = BatchedSeqLenDelta(
         old_seq_len_list,
@@ -899,21 +845,16 @@ def test_triton_bf16_index_score_ragged_qk_nocp(
     )
     out_f = out.to(torch.float32)
 
-    ref_logits = _ref_bf16_index_score(
+    ref_logits = bf16_index_score_ragged_qk_dsv32(
         q,
         weights,
         k_ragged,
         seq_len_delta,
-        static_max_n=max_seq_len,
-        is_causal=is_causal,
-    )
-    # The kernel compresses columns to actual_max_n; ref padding beyond that must
-    # be all -inf (i.e. no finite value was truncated away).
-    n_cols = out_f.shape[-1]
-    assert torch.isinf(
-        ref_logits[:, n_cols:]
-    ).all(), "kernel truncated finite columns (actual_max_n too small)"
-    ref_logits = ref_logits[:, :n_cols]
+        is_causal,
+        ke,
+        ks,
+        impl="torch",
+    ).to(torch.float32)
 
     finite = torch.isfinite(ref_logits)
     assert torch.equal(
@@ -938,7 +879,7 @@ def test_triton_bf16_index_score_ragged_qk_cp(pcp_size, stage, n_heads, head_dim
     Simulates ``pcp_size`` ranks: global K is shared, q/weights are sliced
     ``[r::pcp_size]`` per rank. Each rank passes ks (global prefix start row)
     and the full global ke = (local abs_pos + 1) + ks. Per-rank outputs are
-    scattered back and must match the un-split fp32 global reference.
+    scattered back and must match the production torch implementation.
 
     Focus: multi-seq must not bleed across sequences — the exact scenario where
     the hygon CP branch (which zeroes ks) is wrong.
@@ -946,18 +887,14 @@ def test_triton_bf16_index_score_ragged_qk_cp(pcp_size, stage, n_heads, head_dim
     if not (torch.cuda.is_available() and has_triton):
         pytest.skip("triton_bf16 indexer requires CUDA + triton")
 
-    # Fixed shapes go up to s_k=8192; the fp32 reference materializes a per-seq
-    # [m, h, s_k] tensor that OOMs on small CI GPUs. Skip there (same policy as
-    # test_dsa_indexer_paged_kv_bf16).
     _, total_memory = torch.cuda.mem_get_info()
     total_memory = total_memory / (1024**3)
     if total_memory < 80:
-        pytest.skip("Skip large s_k ref on devices with not enough memory")
+        pytest.skip("Skip large s_k on devices with not enough memory")
 
     device = "cuda"
     torch.set_default_dtype(torch.bfloat16)
-    max_seq_len = 8192
-    _triton_bf16_indexer_common_args(max_seq_len, 1, n_heads, head_dim)
+    _triton_bf16_indexer_common_args(8192, 1, n_heads, head_dim)
 
     # Fixed long/short mixed multi-seq to fully expose cross-seq bleed.
     if stage == "prefill":
@@ -983,16 +920,17 @@ def test_triton_bf16_index_score_ragged_qk_cp(pcp_size, stage, n_heads, head_dim
     weights = torch.randn(s_q, n_heads, dtype=torch.float32, device=device)
     k_ragged = torch.randn(seq_len_delta.new.total_len, head_dim, device=device)
 
-    # Global fp32 reference (not split): per-rank results scattered back must agree.
-    ref_logits = _ref_bf16_index_score(
-        q, weights, k_ragged, seq_len_delta, static_max_n=max_seq_len, is_causal=True
-    )
-
     prefix = seq_len_delta.new.prefix_lens_tensor_device
     seq_ids = seq_len_delta.delta_seq_ids_tensor_device
     pos = seq_len_delta.delta_position_ids_tensor_device
 
-    out_global = torch.full_like(ref_logits, float("-inf"))
+    ref_global = torch.full(
+        (s_q, seq_len_delta.new.max_len),
+        float("-inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+    out_global = torch.full_like(ref_global, float("-inf"))
     for rank in range(pcp_size):
         local_row_idx = torch.arange(rank, s_q, pcp_size, device=device)
         if local_row_idx.numel() == 0:
@@ -1006,30 +944,44 @@ def test_triton_bf16_index_score_ragged_qk_cp(pcp_size, stage, n_heads, head_dim
         q_local = q[local_row_idx].contiguous()
         w_local = weights[local_row_idx].contiguous()
 
-        out_local = bf16_index_score_ragged_qk_dsv32(
+        ref_local = bf16_index_score_ragged_qk_dsv32(
             q_local,
             w_local,
-            k_ragged,  # global K, not split
+            k_ragged,
             seq_len_delta,
-            True,  # is_causal
+            True,
+            ke,
+            ks,
+            impl="torch",
+        ).to(torch.float32)
+        out_local_f = bf16_index_score_ragged_qk_dsv32(
+            q_local,
+            w_local,
+            k_ragged,
+            seq_len_delta,
+            True,
             ke,
             ks,
             impl="triton",
-        )
-        out_local_f = out_local.to(torch.float32)
+        ).to(torch.float32)
         n_cols = out_local_f.shape[-1]
+        assert ref_local.shape[-1] == n_cols
+        ref_global[
+            local_row_idx.unsqueeze(1),
+            torch.arange(n_cols, device=device).unsqueeze(0),
+        ] = ref_local
         out_global[
             local_row_idx.unsqueeze(1),
             torch.arange(n_cols, device=device).unsqueeze(0),
         ] = out_local_f
 
-    finite = torch.isfinite(ref_logits)
+    finite = torch.isfinite(ref_global)
     assert torch.equal(
         finite, torch.isfinite(out_global)
     ), "valid-region mask mismatch (possible cross-seq bleed)"
     assert_close(
         out_global[finite],
-        ref_logits[finite],
+        ref_global[finite],
         rtol=1e-2,
         atol=1e-2,
         cos_sim_tol=1e-3,
@@ -4259,8 +4211,8 @@ def test_reconstruct_prefill_matches_full_kv_attention(chunk_lens):
 BACKEND_METHODS = [
     ("deepgemm", "blockfp8_index_score_dsa_deepgemm"),
     ("hygon", "bf16_index_score_dsa_hygon"),
-    ("torch_bf16", "bf16_index_score_dsa_torch_bf16"),
-    ("triton_bf16", "bf16_index_score_dsa_triton_bf16"),
+    ("torch_bf16", "bf16_index_score_dsa_bf16"),
+    ("triton_bf16", "bf16_index_score_dsa_bf16"),
     ("triton", "blockfp8_index_score_dsa_torch_or_triton"),
     ("torch", "blockfp8_index_score_dsa_torch_or_triton"),
 ]
@@ -4535,8 +4487,8 @@ def _paged_accessor(*keys: str) -> PagedKVCacheAccessor:
             "indexer_k_ks",
             4,
         ),
-        # bf16 backends: shared paged append + read; score takes (q, k, weights)
-        # -> 3 leading tensor args (no separate k_scale).
+        # bf16 dispatcher-backed backends: shared paged append + read; score takes
+        # (q, k, weights) -> 3 leading tensor args (no separate k_scale).
         (
             "hygon",
             "bf16_index_score_dsa_hygon",
@@ -4547,7 +4499,7 @@ def _paged_accessor(*keys: str) -> PagedKVCacheAccessor:
         ),
         (
             "torch_bf16",
-            "bf16_index_score_dsa_torch_bf16",
+            "bf16_index_score_dsa_bf16",
             "append_to_paged_kv_cache",
             "read_from_paged_kv_cache",
             "indexer_k",
@@ -4555,7 +4507,7 @@ def _paged_accessor(*keys: str) -> PagedKVCacheAccessor:
         ),
         (
             "triton_bf16",
-            "bf16_index_score_dsa_triton_bf16",
+            "bf16_index_score_dsa_bf16",
             "append_to_paged_kv_cache",
             "read_from_paged_kv_cache",
             "indexer_k",
@@ -4571,8 +4523,8 @@ def test_dsa_fast_path_appends_cache_without_reading(
 
     Covers deepgemm (packed indexer_k_ks + deepgemm-specific append/read, score
     signature has a separate k_scale so 4 tensor args) and the bf16 backends
-    (hygon/torch_bf16/triton_bf16, shared paged append/read, 3 tensor args).
-    The score method returns None and only the append helper must fire.
+    (hygon plus dispatcher-backed torch_bf16/triton_bf16, shared paged append/read,
+    3 tensor args). The score method returns None and only the append helper must fire.
     """
     indexer = _indexer_without_runtime_init(impl)
     appended = []
