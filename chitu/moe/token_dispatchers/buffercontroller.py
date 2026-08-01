@@ -6,6 +6,7 @@ import torch.distributed as dist
 from typing import Optional
 
 from chitu.utils import try_import_opt_dep, ceil_div
+from chitu.device_type import is_hygon
 
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 
@@ -46,9 +47,14 @@ class DeepEPBuffer:
         if cls._buffer is not None:
             return cls._buffer
 
+        if is_hygon():
+            align_size = 16
+        else:
+            align_size = 256
+
         cls._hidden_size = hidden_size
         cls._lowlatency_num_max_dispatch_tokens_per_rank = (
-            ceil_div(max_bs_per_dp_rank, 256) * 256
+            ceil_div(max_bs_per_dp_rank, align_size) * align_size
         )
         cls._num_experts = num_experts
 

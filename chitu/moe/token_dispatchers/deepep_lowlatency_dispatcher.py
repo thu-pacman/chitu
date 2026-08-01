@@ -12,7 +12,6 @@ import torch
 
 from chitu.distributed.comm_group import CommGroup
 from chitu.utils import parse_dtype
-from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
 from chitu.import_utils import try_import_opt_dep
 from chitu.moe.token_dispatchers.base import MoETokenDispatcher
 from chitu.moe.batched_expert_result import (
@@ -29,7 +28,6 @@ from chitu.moe.load_balancer import get_moe_load_planner
 from chitu.global_vars import get_global_args
 from chitu.device_type import is_blackwell, is_muxi, is_hygon
 from contextlib import nullcontext
-from chitu.device_type import is_hygon
 
 # replace the buffer setting with DeepEP to concurrently enbale ll mode and normal mode, need more test to verify.
 from chitu.moe.token_dispatchers.buffercontroller import DeepEPBuffer
@@ -181,10 +179,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         round_scale_to_pow2 = False
         if (
             may_fuse_quant == "blockfp8"
-            and may_fuse_quant_kwargs.get(
-                "scale_block_shape", DEFAULT_SCALE_BLOCK_SHAPE
-            )
-            == DEFAULT_SCALE_BLOCK_SHAPE
+            and may_fuse_quant_kwargs.get("block_size", 128) == 128
             and parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize
             <= 1
         ):
@@ -204,6 +199,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             # Here we may modify `topk_ids`. Please note that `dispatcher_ctx` must save
             # the MODIFIED `topk_ids`.
             topk_ids = x.token_to_expert_indices.to(torch.int64)
+            topk_weights = topk_weights.to(torch.float32)
             if self.tp_group.group_size > 1:
                 if self.etp_group.group_size == 1:
                     if not self.tp_group.is_first_rank:
@@ -229,6 +225,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
                 self.deepep_token_dispatch(
                     x.activation,
                     topk_ids,
+                    topk_weights=topk_weights,
                     return_recv_hook=True,
                     dispatch_use_fp8=dispatch_use_fp8,
                     dispatch_use_int8=dispatch_use_int8,
@@ -362,6 +359,7 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
         cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        topk_weights: Optional[torch.Tensor] = None,
     ):
         if dispatch_use_fp8 and dispatch_use_int8:
             raise ValueError(
@@ -381,10 +379,16 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             quant_group_size = (
                 0 if dispatch_use_int8 else (128 if dispatch_use_fp8 else 0)
             )
+            if topk_weights is None:
+                raise RuntimeError(
+                    "Hygon DeepEP low-latency dispatch requires topk_weights for "
+                    "the integrated Hygon DeepEP package API."
+                )
             recv_hidden_states, recv_expert_count, handle, event, hook = (
                 self._buffer.low_latency_dispatch(
                     hidden_states,
                     topk_idx,
+                    topk_weights,
                     DeepEPBuffer._lowlatency_num_max_dispatch_tokens_per_rank,
                     self.num_global_experts * self.etp_group.group_size,
                     quant_type=quant_type,
@@ -446,11 +450,13 @@ class MoELowLatencyTokenDispatcher(MoETokenDispatcher):
             self._buffer.get_next_low_latency_combine_buffer(handle)[
                 :, :, :
             ] = hidden_states
+        if is_hygon():
+            topk_idx = topk_idx.to(torch.int64)
         # Do MoE combine, compatible with CUDA graph (but you may restore some buffer status once you replay)
         combined_hidden_states, event, hook = self._buffer.low_latency_combine(
             hidden_states,
             topk_idx,
-            topk_weights.to(torch.float32),
+            topk_weights,
             handle,
             zero_copy=zero_copy,
             async_finish=async_finish,
