@@ -39,6 +39,15 @@ hygon_deepgemm, has_hygon_deepgemm = try_import_opt_dep("deepgemm", "deep_gemm")
 lightop, has_hygon_lightop = try_import_platform_dep("lightop")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 
+if has_triton:
+    # Schedule helpers used to build the triton_bf16 prefill qblock schedule once
+    # per step (lazily, in the first indexer layer) and reuse it across layers.
+    from chitu.ops.triton_ops.indexer_score_bf16 import (
+        build_qblock_schedule,
+        _bucket_max_n,
+        DEFAULT_BLOCK_M,
+    )
+
 support_indexer_deepgemm = (
     is_nvidia()
     and torch.cuda.get_device_capability()[0] in (9, 10)
@@ -177,6 +186,10 @@ class DSAIndexer:
         if self.impl == "deepgemm":
             self.metadata = None
             self.num_sms = deep_gemm.get_num_sms()
+
+        # triton_bf16 only: per-step prefill qblock schedule, built lazily by the
+        # first indexer layer and reused across layers (None = not cached).
+        self.prefill_schedule = None
 
         logger.info(f"Indexer Backend is initialized with impl={self.impl}")
 
@@ -452,6 +465,31 @@ class DSAIndexer:
                 self.metadata = StaticTensor(metadata)  # `metadata` has a fixed shape
             else:
                 self.metadata.set(metadata)
+
+    def prepare_metadata_for_prefill(
+        self,
+        seq_len_delta: BatchedSeqLenDelta,
+    ):
+        """Invalidate the cached triton_bf16 prefill qblock schedule (per step).
+
+        Called once at the start of every prefill step (model.prefill). It only
+        RESETS the cache so a schedule from the previous step is never reused;
+        the schedule itself is built lazily by the first triton_bf16 indexer
+        layer in bf16_index_score_dsa_triton_bf16 and reused by the remaining
+        layers of the same step.
+
+        Why lazy (not computed here): the schedule depends on each layer's ks,
+        which in CP mode is the layer-local ``local_ks`` (derived from cp_ctx +
+        local_lengths). local_lengths is only populated inside the first layer's
+        forward, AFTER this hook runs, so this hook cannot compute the correct
+        CP ks. Building lazily in-layer sidesteps that ordering and makes reuse
+        work for BOTH the CP and non-CP paths.
+
+        No-op for every backend other than triton_bf16.
+        """
+        if self.impl != "triton_bf16":
+            return
+        self.prefill_schedule = None  # reset each step → next layer rebuilds
 
     def blockfp8_index_score_ragged_q_paged_k_dsv32_deepgemm(
         self,
@@ -764,6 +802,45 @@ class DSAIndexer:
                     ]
                     + ks
                 )
+
+        # triton_bf16: per-step, cross-layer qblock schedule reuse (lazy build in
+        # the first indexer layer). Every layer of one prefill step computes the
+        # same ks/ke (CP: local_ks; non-CP: global ks) and thus the same schedule;
+        # only q/w/k differ. The first layer builds it from ITS OWN ks/ke and
+        # caches it on the shared DSAIndexer; later layers reuse it, skipping
+        # build_qblock_schedule + the (ke-ks).max().item() sync (~0.82ms each).
+        # prepare_metadata_for_prefill reset the cache to None this step. Guards
+        # (query count, BLOCK_M, is_causal) fall back to a fresh build on any
+        # mismatch. The torch_bf16 path does not use a schedule.
+        schedule = None
+        if score_impl == "triton":
+            block_m = DEFAULT_BLOCK_M
+            cached = self.prefill_schedule
+            if (
+                cached is not None
+                and cached["ks"].shape[0] == ks.shape[0]
+                and cached["block_m"] == block_m
+                and cached["is_causal"] == is_causal
+            ):
+                schedule = cached
+                ks, ke = cached["ks"], cached["ke"]  # keep ks/ke same-source
+            else:
+                actual_max_n = int((ke - ks).max().item())
+                max_n = _bucket_max_n(actual_max_n)
+                bqs, bnr, num_blocks = build_qblock_schedule(ks, block_m, ks.device)
+                schedule = {
+                    "ks": ks,
+                    "ke": ke,
+                    "max_n": max_n,
+                    "actual_max_n": actual_max_n,
+                    "block_q_start": bqs,
+                    "block_n_rows": bnr,
+                    "num_blocks": num_blocks,
+                    "block_m": block_m,
+                    "is_causal": is_causal,
+                }
+                self.prefill_schedule = schedule  # first layer stores; rest reuse
+
         return bf16_index_score_ragged_qk_dsv32(
             q,
             weights,
@@ -773,6 +850,7 @@ class DSAIndexer:
             ke,
             ks,
             impl=score_impl,
+            schedule=schedule,
         )
 
     def dsa_indexer(
