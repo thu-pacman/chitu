@@ -91,7 +91,6 @@ RUN --mount=source=./third_party/hygon_wheels,destination=./third_party/hygon_wh
     -i https://pypi.sourcefind.cn/release/dtk/ \
     -i https://pypi.sourcefind.cn/nightly/dtk/ \
     ./third_party/hygon_wheels/aiter-0.1.2+das.opt1.dtk2604.torch290.2605071840.g1f8f50-cp310-cp310-linux_x86_64.whl \
-    ./third_party/hygon_wheels/flash_mla-1.2.0+das.optphase1.d512.h64.dtk2604-cp310-cp310-linux_x86_64.whl \
     ./third_party/hygon_wheels/triton-3.5.1+das.opt1.dtk2604.torch290-cp310-cp310-manylinux_2_28_x86_64.whl \
     "lightop==0.6.0+das.dtk2604.torch290.20260327.gaa4938" \
     "lmslim==0.3.1+das.opt4.dtk2604.torch290.2604281437.g61fdfe" \
