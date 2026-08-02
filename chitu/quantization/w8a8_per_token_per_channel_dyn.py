@@ -346,7 +346,7 @@ class W8A8PerTokenPerChannelDynLinear(QuantizedLinearBase):
             act_scale,
             self.weight,
             self.weight_scale.view(self.out_features),
-        ).view(*x.shape[:-1], -1)
+        ).view(*x.shape[:-1], self.out_features)
         if self.bias is not None:
             out += self.bias
         return out

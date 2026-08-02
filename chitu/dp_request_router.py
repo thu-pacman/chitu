@@ -74,6 +74,7 @@ PENDING_TOKENS_WEIGHT = 1 / NUM_ESTIMATED_TOKENS_PER_REQ  # 0.01
 # Router-side prefix scoring shares BlockIdentityChainBuilder with this logical name.
 ROUTER_BLOCK_IDENTITY_MANAGER_NAME = "router"
 TERMINATE_ENGINE_MESSAGE_TYPE = "terminate_engine"
+FLUSH_CACHE_MESSAGE_TYPE = "flush_cache"
 
 
 def is_terminate_engine_message(request_data: dict) -> bool:
@@ -82,6 +83,14 @@ def is_terminate_engine_message(request_data: dict) -> bool:
 
 def build_terminate_engine_message() -> dict:
     return {"type": TERMINATE_ENGINE_MESSAGE_TYPE}
+
+
+def is_flush_cache_message(request_data: dict) -> bool:
+    return request_data.get("type") == FLUSH_CACHE_MESSAGE_TYPE
+
+
+def build_flush_cache_message() -> dict:
+    return {"type": FLUSH_CACHE_MESSAGE_TYPE}
 
 
 def is_profile_message(request_data: dict) -> bool:
@@ -262,6 +271,12 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         )
         if self.cache_miss_fallback_algorithm == "prefix_cache_aware":
             self.cache_miss_fallback_algorithm = "power_of_two_choices"
+
+    def clear_prefix_cache(self):
+        self.cached_blocks.clear()
+        self.evict_buffer.clear()
+        self.req_to_request.clear()
+        self.req_to_scheduler.clear()
 
     def update_stats(self, stats: SchedulerStats):
         super().update_stats(stats)
@@ -838,23 +853,11 @@ class RequestRouter:
     async def _send_control_message(
         self, socket, payload: bytes, label: str, timeout_s: float = 5.0
     ) -> None:
-        start_time = time.time()
-        retry_s = 0.01
-        while True:
-            try:
-                await socket.send(payload, flags=zmq.DONTWAIT)
-                logger.info(f"[REQUEST_ROUTER] control message sent to {label}")
-                return
-            except zmq.Again:
-                if time.time() - start_time > timeout_s:
-                    logger.exception(
-                        f"[REQUEST_ROUTER] control message timed out for {label}"
-                    )
-                    return
-                await asyncio.sleep(retry_s)
-            except Exception:
-                logger.exception(f"[REQUEST_ROUTER] control message failed for {label}")
-                return
+        try:
+            await self._send_with_retry(socket, payload, label, timeout_s=timeout_s)
+            logger.info(f"[REQUEST_ROUTER] control message sent to {label}")
+        except Exception:
+            logger.exception(f"[REQUEST_ROUTER] control message failed for {label}")
 
     async def terminate_instances(self) -> None:
         payload = msgpack.packb(build_terminate_engine_message())
@@ -874,6 +877,54 @@ class RequestRouter:
             f"Added request {request.request_id} to queue (queue size: {len(self.pending_requests)})"
         )
 
+    async def _send_with_retry(
+        self,
+        socket,
+        payload: bytes,
+        label: str,
+        *,
+        timeout_s: float | None = None,
+        retry_s: float | None = None,
+    ):
+        if timeout_s is None:
+            timeout_s = float(
+                os.getenv(
+                    "ROUTER_SEND_TIMEOUT_S", os.getenv("PD_ROUTER_SEND_TIMEOUT_S", "5")
+                )
+            )
+        if retry_s is None:
+            retry_s = float(
+                os.getenv(
+                    "ROUTER_SEND_RETRY_S", os.getenv("PD_ROUTER_SEND_RETRY_S", "0.05")
+                )
+            )
+        start_time = time.time()
+        while True:
+            try:
+                await socket.send(payload, flags=zmq.DONTWAIT)
+                return
+            except zmq.Again as e:
+                if time.time() - start_time > timeout_s:
+                    raise RuntimeError(
+                        f"send to {label} timed out after {timeout_s:.1f}s: {e}"
+                    ) from e
+                await asyncio.sleep(retry_s)
+
+    async def broadcast_flush_cache(self) -> dict:
+        """Router broadcast flush_cache command to all instances"""
+        if hasattr(self.policy, "clear_prefix_cache"):
+            self.policy.clear_prefix_cache()
+
+        data = msgpack.packb(build_flush_cache_message())
+        sent, errors = [], []
+        for sid, socket in self.scheduler_sockets.items():
+            try:
+                await self._send_with_retry(socket, data, sid)
+                sent.append(sid)
+            except Exception as e:
+                errors.append(f"{sid}: {e}")
+        return {"sent_to": sent, "errors": errors}
+
     async def broadcast_profile(self, payload: dict) -> dict:
         """Broadcast a profile command to all Workers (PD混部)."""
         control_msg = {"__chitu_msg_type": "profile", "payload": payload}
@@ -881,7 +932,7 @@ class RequestRouter:
         sent, errors = [], []
         for sid, socket in self.scheduler_sockets.items():
             try:
-                await socket.send(data)
+                await self._send_with_retry(socket, data, f"instance:{sid}")
                 sent.append(sid)
             except Exception as e:
                 errors.append(f"{sid}: {e}")

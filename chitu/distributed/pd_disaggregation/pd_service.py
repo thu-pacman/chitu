@@ -39,7 +39,7 @@ from chitu.distributed.pd_disaggregation.pd_scheduler import (
 )
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_token_sender import start_dp_token_manager
-from chitu.dp_request_router import is_terminate_engine_message
+from chitu.dp_request_router import is_terminate_engine_message, is_flush_cache_message
 from chitu.global_vars import (
     get_global_args,
     get_multi_inst_ids_by_role,
@@ -465,6 +465,16 @@ class PDSchedulerService:
                         self._log_termination_drain_state(
                             "terminate_received_not_drained"
                         )
+                    elif isinstance(request_data, dict) and is_flush_cache_message(
+                        request_data
+                    ):
+                        from chitu.chitu_main import flush_local_prefix_cache
+
+                        try:
+                            result = flush_local_prefix_cache()
+                            logger.info("flush_cache applied: %s", result)
+                        except Exception as e:
+                            logger.exception("flush_cache failed")
                     elif (
                         isinstance(request_data, dict)
                         and request_data.get("__chitu_msg_type") == "profile"

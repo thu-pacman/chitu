@@ -25,6 +25,7 @@ from chitu.dp_request_router import (
     RequestRouter,
     SchedulerStats,
     build_terminate_engine_message,
+    build_flush_cache_message,
 )
 from chitu.schemas.serve_config import (
     PDDisaggregationConfig,
@@ -724,21 +725,6 @@ class PDRequestRouter(RequestRouter):
             f"decode:{local_instance_id}",
         )
 
-    async def _send_with_retry(self, socket, payload: bytes, label: str):
-        timeout_s = float(os.getenv("PD_ROUTER_SEND_TIMEOUT_S", "5"))
-        retry_s = float(os.getenv("PD_ROUTER_SEND_RETRY_S", "0.05"))
-        start_time = time.time()
-        while True:
-            try:
-                await socket.send(payload, flags=zmq.DONTWAIT)
-                return
-            except zmq.Again as e:
-                if time.time() - start_time > timeout_s:
-                    raise RuntimeError(
-                        f"send to {label} timed out after {timeout_s:.1f}s: {e}"
-                    ) from e
-                await asyncio.sleep(retry_s)
-
     async def terminate_instances(self) -> None:
         payload = msgpack.packb(build_terminate_engine_message())
 
@@ -754,6 +740,39 @@ class PDRequestRouter(RequestRouter):
             await _send_one(socket, "prefill", local_instance_id)
         for local_instance_id, socket in list(self.decode_sockets.items()):
             await _send_one(socket, "decode", local_instance_id)
+
+    async def broadcast_flush_cache(self, pd_stage: str = "all") -> dict:
+        if hasattr(self.prefill_policy, "clear_prefix_cache"):
+            self.prefill_policy.clear_prefix_cache()
+        if hasattr(self.decode_policy, "clear_prefix_cache"):
+            self.decode_policy.clear_prefix_cache()
+
+        data = msgpack.packb(build_flush_cache_message())
+        sent, errors = [], []
+        prefill_targets = (
+            list(self.prefill_sockets.items()) if pd_stage in ("prefill", "all") else []
+        )
+        decode_targets = (
+            list(self.decode_sockets.items()) if pd_stage in ("decode", "all") else []
+        )
+
+        for sid, socket in prefill_targets:
+            label = f"prefill:{sid}"
+            try:
+                await self._send_with_retry(socket, data, label)
+                sent.append(label)
+            except Exception as e:
+                errors.append(f"{label}: {e}")
+
+        for sid, socket in decode_targets:
+            label = f"decode:{sid}"
+            try:
+                await self._send_with_retry(socket, data, label)
+                sent.append(label)
+            except Exception as e:
+                errors.append(f"{label}: {e}")
+
+        return {"pd_stage": pd_stage, "sent_to": sent, "errors": errors}
 
     async def broadcast_profile(self, payload: dict) -> dict:
         """Broadcast a profile command to schedulers."""

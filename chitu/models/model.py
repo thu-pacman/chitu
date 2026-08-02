@@ -1735,6 +1735,9 @@ class Transformer(nn.Module):
         self.attn_backend.prepare_metadata_for_prefill(
             self.cache_dict["main"].seq_len_delta
         )
+        indexer = getattr(self, "indexer_backend", None)
+        if indexer is not None:
+            indexer.prepare_metadata_for_prefill(self.cache_dict["main"].seq_len_delta)
         if self.pp_size > 1:
             return self.prefill_pipeline(tokens, hiddens, output_token_offsets, **args)
         else:

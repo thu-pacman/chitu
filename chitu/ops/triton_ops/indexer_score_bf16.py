@@ -180,6 +180,20 @@ DEFAULT_BLOCK_M = (
     8  # 每个 program 处理的 query 数（可调：8/16/32；越大 k 复用越多但 program 越少）
 )
 
+# actual_max_n 量化粒度。prefill 每个 chunk 的最长窗口宽 actual_max_n 都在变,
+# 若直接用它做输出列宽/grid, Triton 会因 shape 每次不同而反复重编译(autotune
+# 查找)。把列宽向上对齐到该粒度的整数倍, 使不同 chunk 收敛到 {2048, 4096, ...}
+# 少数几个档位, 大幅提高编译缓存命中。放大列宽只多出若干列 -inf: kernel 按真实
+# 窗口 win_m 写值、其余保持预填的 -inf, 下游 topk 忽略 -inf, 故数值结果不变。
+MAX_N_BUCKET = 2048
+
+
+def _bucket_max_n(actual_max_n: int) -> int:
+    """把动态 actual_max_n 向上对齐到 MAX_N_BUCKET 的整数倍(至少一档)。"""
+    if actual_max_n <= 0:
+        return MAX_N_BUCKET
+    return ((actual_max_n + MAX_N_BUCKET - 1) // MAX_N_BUCKET) * MAX_N_BUCKET
+
 
 def build_qblock_schedule(ks, BLOCK_M, device):
     """按 q 的实际行切 query-block（不跨序列）。
@@ -232,7 +246,9 @@ def build_qblock_schedule(ks, BLOCK_M, device):
     block_n_rows = torch.minimum(
         torch.full_like(q_off, BLOCK_M), seg_qlen - q_off
     )  # 尾块 < BLOCK_M
-    return block_q_start.contiguous(), block_n_rows.contiguous(), num_blocks
+    block_q_start = block_q_start.contiguous()
+    block_n_rows = block_n_rows.contiguous()
+    return block_q_start, block_n_rows, num_blocks
 
 
 @triton.jit
@@ -325,6 +341,8 @@ def bf16_index_score_ragged_qk_dsv32_triton(
     ks,  # [s_q] int32
     BLOCK_M: int = DEFAULT_BLOCK_M,
     BLOCK_N: int = 128,  # k-tile 宽; 增大可减少 q 的重复加载(grid.y ∝ 1/BLOCK_N)
+    *,
+    schedule=None,  # 预计算的 qblock 调度(每步一次跨层复用); None 则本函数内计算
 ) -> torch.Tensor:  # fp32
     """bf16 ragged-qk indexer score (triton), 由 qblock kernel 计算:
 
@@ -333,26 +351,39 @@ def bf16_index_score_ragged_qk_dsv32_triton(
           循环复用 K 的 HBM 读量降 ~BLOCK_M 倍（相比bs=1，减少kernel 整体访存）
 
     ks/ke 语义(window = [ks, ke))，是全局的ke和ks，ks作为每个token所载的seq在kcache的起始位置，ke作为这个token的在kcache 上的mask可见的最后一个位置的下一位。
+
+    schedule: 若非 None, 是 prepare_metadata_for_prefill 每步预算一次的字典
+      {max_n, block_q_start, block_n_rows, num_blocks}, 各层复用, 省掉本函数内的
+      (ke-ks).max().item() 同步与 build_qblock_schedule (~0.82ms/层)。输出 buffer o
+      不在其中, 仍每层单独分配。
     """
     s_q, h, d = q.shape
     weights = weights.reshape(s_q, h)
     if s_q == 0:
         return torch.empty((0, 0), dtype=torch.float32, device=q.device)
 
-    actual_max_n = int(
-        (ke - ks).max().item()
-    )  # 获取本次处理的所有seq的kcache长度的最大值，这个作为结果的列数，目的是减少indexer score的显存占用
-    o = torch.full(
-        (s_q, actual_max_n), float("-inf"), dtype=torch.float32, device=q.device
-    )
+    if schedule is not None:
+        # 复用每步预算的调度(跨层不变), 跳过 .item() 同步与 build_qblock_schedule。
+        max_n = schedule["max_n"]
+        actual_max_n = schedule["actual_max_n"]
+        block_q_start = schedule["block_q_start"]
+        block_n_rows = schedule["block_n_rows"]
+        num_blocks = schedule["num_blocks"]
+    else:
+        # 本次所有 seq 的最长有效窗口宽; 量化到固定档位以减少 Triton 重编译。
+        actual_max_n = int((ke - ks).max().item())
+        max_n = _bucket_max_n(actual_max_n)  # kernel/grid 用量化后的档位
+        # 按 query 构造 query-block schedule（基于 ks，不跨序列也就是一个block中的query都是属于一个seq）
+        block_q_start, block_n_rows, num_blocks = build_qblock_schedule(
+            ks, BLOCK_M, q.device
+        )
 
-    # 按 query 构造 query-block schedule（基于 ks，不跨序列也就是一个block中的query都是属于一个seq）
-    block_q_start, block_n_rows, num_blocks = build_qblock_schedule(
-        ks, BLOCK_M, q.device
-    )
+    # 输出 buffer 按量化后的 max_n 分配(与 kernel/grid 一致), 每层单独分配。
+    o = torch.full((s_q, max_n), float("-inf"), dtype=torch.float32, device=q.device)
     if num_blocks == 0:
-        return o
-    grid = (num_blocks, triton.cdiv(actual_max_n, BLOCK_N))
+        # 裁到真实窗口宽, 保持与 torch 参考一致的输出契约。
+        return o[:, :actual_max_n]
+    grid = (num_blocks, triton.cdiv(max_n, BLOCK_N))
     bf16_index_score_ragged_qk_dsv32_qblock_triton_kernel[grid](
         q,
         weights,
@@ -362,7 +393,7 @@ def bf16_index_score_ragged_qk_dsv32_triton(
         block_q_start,
         block_n_rows,
         o,
-        actual_max_n,
+        max_n,
         h,
         d,
         BLOCK_M,
@@ -379,4 +410,6 @@ def bf16_index_score_ragged_qk_dsv32_triton(
         o.stride(0),
         o.stride(1),
     )
-    return o
+    # kernel 用量化 max_n 写值(多出的列为预填 -inf), 返回前裁回真实窗口宽 actual_max_n,
+    # 使输出宽度与 torch 参考一致; bucket 只服务 kernel 编译缓存, 不泄漏到输出契约。
+    return o[:, :actual_max_n]

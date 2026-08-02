@@ -78,6 +78,7 @@ def bf16_index_score_ragged_qk_dsv32_torch(
     is_casual: bool,
     ke: Optional[torch.Tensor] = None,  # [s_q] int32, global end offsets
     ks: Optional[torch.Tensor] = None,  # [s_q] int32, global start offsets
+    schedule=None,  # unused; kept so the triton/torch dispatch share one call
 ) -> torch.Tensor:  # [s_q, max(ke - ks)]
     """Pure-torch bf16 ragged-qk indexer score.
 

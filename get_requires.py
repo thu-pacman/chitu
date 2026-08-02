@@ -32,8 +32,7 @@ if get_bool_env("CHITU_HYGON_BUILD", False):
     )
 
     flash_mla = "flash_mla @ file://localhost" + os.path.join(
-        setup_dir,
-        "third_party/hygon_wheels/flash_mla-1.2.0+das.optphase1.d512.h64.dtk2604-cp310-cp310-linux_x86_64.whl",
+        setup_dir, "third_party/flashmla_hygon"
     )
 
     if get_bool_env("CHITU_HYGON_BUILD_FOR_SHCA", False):
