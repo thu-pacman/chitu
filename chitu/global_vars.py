@@ -36,6 +36,8 @@ _GLOBAL_TIMERS = None
 _GLOBAL_MEMORY_BUFFER = None
 _GLOBAL_SLOT_HANDLE = None
 _GLOBAL_DEBUG: bool = False
+_GLOBAL_INSTANCE_ID: int = -1
+_GLOBAL_RANK_ID: int = 0
 
 
 def get_global_memory_buffer():
@@ -52,6 +54,9 @@ def set_global_variables(global_args=None, debug=False):
     _set_debug(debug)
     set_global_args(global_args)
     _set_timers()
+    multi_inst_args = getattr(get_global_args(), "multi_inst")
+    if multi_inst_args is not None and multi_inst_args.inst_id is not None:
+        _set_instance_id(multi_inst_args.inst_id)
 
 
 def expand_layers(spec):
@@ -328,6 +333,24 @@ def resolve_full_default_args(args):
 
     logger.debug(f"Auto setting configs done. Full configs are: {args}")
     return args
+
+
+def _set_instance_id(instance_id: int):
+    global _GLOBAL_INSTANCE_ID
+    _GLOBAL_INSTANCE_ID = instance_id
+
+
+def get_instance_id():
+    return _GLOBAL_INSTANCE_ID
+
+
+def set_rank(rank: int):
+    global _GLOBAL_RANK_ID
+    _GLOBAL_RANK_ID = rank
+
+
+def get_rank():
+    return _GLOBAL_RANK_ID
 
 
 def _set_debug(debug: bool):

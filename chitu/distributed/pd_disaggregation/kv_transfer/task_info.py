@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Optional, TYPE_CHECKING
 
+from chitu.trace import Trace
+
 if TYPE_CHECKING:
     from chitu.distributed.pd_disaggregation.kv_transfer.transfer_buffers import (
         TransferBuffers,
@@ -20,11 +22,12 @@ if TYPE_CHECKING:
 
 @dataclass
 class TransferStatus:
-    """Record the transfer status in the Decode Main Rank"""
+    """Record the transfer status and other info associated with first token in the Decode Main Rank"""
 
     done: bool = False
     first_token: int = 0
     num_hit_tokens: int = 0
+    trace: Optional[Trace] = None
 
     def __bool__(self):
         return self.done
@@ -91,3 +94,5 @@ class TaskInfo:
 
     recv_bytes: int = 0
     """Expected total recv bytes, set during prepare_kv_transfer (D side)."""
+
+    trace: Optional[Trace] = None

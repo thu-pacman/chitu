@@ -544,6 +544,8 @@ class PrefillOnlyManager(PDInstanceRequestManager):
         }
 
         task = self._create_task_from_request(original_request, enqueue=False)
+        if task.req.save_trace_dir:
+            self.kv_manager.update_trace_info(request_id, task.req.trace_data)
         task.status = TaskStatus.PDPrefillIncoming
         task.pd_scheduler_info = info
         TaskPool.enqueue(task)
@@ -897,6 +899,8 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             if task.dp_rank != 0:
                 task.update_response_sync([prefill_done.first_token])
             created_ts = float(info.get("created_ts", now))
+            if prefill_done.trace:
+                task.req.trace_data.merge(prefill_done.trace)
             waited = now - created_ts
             self._decode_ready_promoted_total += 1
             self._decode_ready_wait_total_s += waited

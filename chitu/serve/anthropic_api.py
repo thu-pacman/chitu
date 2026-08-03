@@ -760,7 +760,6 @@ async def handle_completion_request(
         grid_thw=None,
         prompt_len=prompt_len,
         max_new_tokens=max_new_tokens,
-        trace_data={},
     )
     user_req.ttft_timeout_s = request.ttft_timeout_s
 

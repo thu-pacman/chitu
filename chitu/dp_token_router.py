@@ -20,6 +20,7 @@ import logging
 from chitu.task import UserRequest
 from chitu.distributed.coordinator import set_endpoint
 from chitu.boot.tcp_ip import get_local_ip
+from chitu.trace import Trace
 from chitu.dp_router import (
     get_request_router,
     get_token_router,
@@ -203,6 +204,12 @@ class TokenRouter:
             top_token_idx = token_data.get("top_token_idx")
             is_first_token = req.num_output_tokens == 0
             req.add_data(tokens, top_logprobs, top_token_idx)
+            req.trace_data.debug(
+                {
+                    "name": "Router Receive Token",
+                    "length": req.prompt_len + req.num_output_tokens,
+                }
+            )
 
             self.total_tokens_received += 1
             # per-instance 统计
@@ -297,6 +304,10 @@ class TokenRouter:
                 error=error_message,
                 num_hit_tokens=token_data.get("num_hit_tokens"),
             )
+
+        elif token_data.get("type") == "trace":
+            trace = Trace.load(token_data)
+            req.trace_data.merge(trace)
 
         else:
             logger.warning(

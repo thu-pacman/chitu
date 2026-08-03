@@ -28,6 +28,7 @@ from chitu.global_vars import (
     set_global_variables,
     set_quant_variables,
     set_backend_variables,
+    set_rank,
 )
 from chitu.models.registry import ModelType
 from chitu.moe.load_balancer import get_moe_load_planner
@@ -1261,6 +1262,7 @@ def chitu_init(args):
     try:
         Backend.build(args)
         rank = torch.distributed.get_rank()
+        set_rank(rank)
         if rank == 0:
             Backend.schedulers = [
                 Scheduler.build(args.scheduler, args.infer, dp_rank=i)
@@ -1526,6 +1528,17 @@ def chitu_run_main_rank():
         if len(all_rank_task_ids) == 0
         else TaskPool.pool[all_rank_task_ids[0]].task_type
     )
+
+    for task_id in all_rank_task_ids:
+        task = TaskPool.pool[task_id]
+        task.req.trace_data.debug(
+            {
+                "name": "Task Scheduled",
+                "task_type": task.task_type.name,
+                "rank": task.dp_rank or 0,
+                "length": task.prefix_tokens_len,
+            }
+        )
 
     # 2. Run
     if task_ids or DPTaskCollector.has_available_tasks():
