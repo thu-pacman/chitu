@@ -6,9 +6,11 @@ from typing import Literal, Optional
 from typing_extensions import override
 import dataclasses
 from dataclasses import dataclass
+import functools
 import plum
 import torch
 
+from chitu.lazy import eval_lazy
 from chitu.ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_expert_block_indexed,
     batched_routed_activation_indexed_to_expert_block_permuted_with_scale,
@@ -56,6 +58,39 @@ def _compute_padded_per_expert_counts(
 def _require_local_expert_ids(old: "BatchedRoutedActivation") -> None:
     if not old.expert_ids_are_local:
         raise NotImplementedError("`expert_ids_are_local` is required")
+
+
+# Serving workers keep one fixed expert-buffer layout while CUDA graphs are alive.
+@functools.lru_cache(1)
+def _get_per_expert_dense_block_route(
+    n_experts: int,
+    capacity: int,
+    block_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the fixed route shared by dense expert buffers with the same layout."""
+    n_blocks_per_expert = capacity // block_size
+    n_blocks = n_experts * n_blocks_per_expert
+    block_to_token_x_topk_indices = torch.arange(
+        n_experts * capacity,
+        dtype=torch.int32,
+        device=device,
+    ).view(n_blocks, block_size)
+    block_to_expert_indices = torch.arange(
+        n_experts,
+        dtype=torch.int32,
+        device=device,
+    ).repeat_interleave(n_blocks_per_expert)
+    n_blocks_scalar_tensor = torch.tensor(
+        n_blocks,
+        dtype=torch.int32,
+        device=device,
+    )
+    return (
+        block_to_token_x_topk_indices,
+        block_to_expert_indices,
+        n_blocks_scalar_tensor,
+    )
 
 
 def _rewrap_chunks_with_padded_metadata(
@@ -439,6 +474,38 @@ class IndexedBatchedRoutedActivationWithScaleAndPaddedPerExpertCnt(
 
 
 @dataclass
+class PerExpertDenseBatchedRoutedActivationMinimal(BatchedRoutedActivation):
+    """
+    Activation is copied top-k times and stored densely for each expert (minimal
+    variant).
+
+    Please note that this "minimal" variant does NOT contain necessary indices
+    for local summation. It is dedicated for summing inside DeepEP. In order
+    for full functionality, please use `PerExpertDenseBatchedRoutedActivation`.
+    """
+
+    activation_per_expert: (
+        torch.Tensor
+    )  # [n_experts, max_n_tokens_per_expert, hidden_size]
+    n_tokens_per_expert: torch.Tensor  # [n_experts]
+    expected_n_tokens_per_expert: int  # = bs * topk / num_global_experts
+
+
+@dataclass
+class PerExpertDenseBatchedRoutedActivationWithScaleMinimal(
+    PerExpertDenseBatchedRoutedActivationMinimal
+):
+    activation_scale_per_expert: (
+        torch.Tensor
+    )  # e.g. blockfp8 [..., hidden_size // quant_block_size], w8a8_per_token_per_channel_dyn [..., 1]
+
+    _: dataclasses.KW_ONLY
+
+    quant_method: RoutedActivationQuantMethod
+    output_dtype: Optional[torch.dtype]
+
+
+@dataclass
 class ExpertBlockIndexedBatchedRoutedActivation(BatchedRoutedActivation):
     """
     Activation stored in a dense batch, with blocked indices expressing the relation
@@ -473,6 +540,55 @@ class ExpertBlockIndexedBatchedRoutedActivation(BatchedRoutedActivation):
             ),
             topk=old.token_to_expert_indices.shape[-1],
             expert_ids_are_local=old.expert_ids_are_local,
+        )
+
+    @classmethod
+    @override
+    @plum.dispatch
+    def convert_from(
+        cls,
+        old: PerExpertDenseBatchedRoutedActivationMinimal,
+        *,
+        block_size: int,
+    ) -> "ExpertBlockIndexedBatchedRoutedActivation":
+        """Treat every row in a fixed-capacity expert buffer as a routed row.
+
+        The token counts are intentionally ignored. DeepEP removes unused rows when it
+        combines the expert output.
+        """
+        _require_local_expert_ids(old)
+        if isinstance(old, PerExpertDenseBatchedRoutedActivationWithScaleMinimal):
+            raise TypeError(
+                "Scaled per-expert activations cannot be converted without "
+                "preserving their scales"
+            )
+
+        activation_per_expert = eval_lazy(old.activation_per_expert)
+        if activation_per_expert.ndim != 3:
+            raise ValueError("Per-expert activation must be a 3-D tensor")
+        n_experts, capacity, hidden_size = activation_per_expert.shape
+        if block_size <= 0:
+            raise ValueError("Block size must be positive")
+        if capacity % block_size != 0:
+            raise ValueError(
+                "Per-expert activation capacity must be divisible by block size"
+            )
+        if not activation_per_expert.is_contiguous():
+            raise ValueError("Per-expert activation must be contiguous")
+
+        route = _get_per_expert_dense_block_route(
+            n_experts,
+            capacity,
+            block_size,
+            activation_per_expert.device,
+        )
+        return cls(
+            activation=activation_per_expert.view(n_experts * capacity, hidden_size),
+            block_to_token_x_topk_indices=route[0],
+            block_to_expert_indices=route[1],
+            n_blocks_scalar_tensor=route[2],
+            topk=1,
+            expert_ids_are_local=True,
         )
 
     @override
@@ -653,24 +769,6 @@ class ExpertBlockPermutedBatchedRoutedActivationWithScale(
 
 
 @dataclass
-class PerExpertDenseBatchedRoutedActivationMinimal(BatchedRoutedActivation):
-    """
-    Activation is copied top-k times and stored densely for each expert (minimal
-    variant).
-
-    Please note that this "minimal" variant does NOT contain necessary indices
-    for local summation. It is dedicated for summing inside DeepEP. In order
-    for full functionality, please use `PerExpertDenseBatchedRoutedActivation`.
-    """
-
-    activation_per_expert: (
-        torch.Tensor
-    )  # [n_experts, max_n_tokens_per_expert, hidden_size]
-    n_tokens_per_expert: torch.Tensor  # [n_experts]
-    expected_n_tokens_per_expert: int  # = bs * topk / num_global_experts
-
-
-@dataclass
 class PerExpertDenseBatchedRoutedActivation(
     PerExpertDenseBatchedRoutedActivationMinimal
 ):
@@ -704,20 +802,6 @@ class PerExpertDenseBatchedRoutedActivation(
             token_pos_in_expert=token_pos_in_expert,
             expert_ids_are_local=old.expert_ids_are_local,
         )
-
-
-@dataclass
-class PerExpertDenseBatchedRoutedActivationWithScaleMinimal(
-    PerExpertDenseBatchedRoutedActivationMinimal
-):
-    activation_scale_per_expert: (
-        torch.Tensor
-    )  # e.g. blockfp8 [..., hidden_size // quant_block_size], w8a8_per_token_per_channel_dyn [..., 1]
-
-    _: dataclasses.KW_ONLY
-
-    quant_method: RoutedActivationQuantMethod
-    output_dtype: Optional[torch.dtype]
 
 
 @dataclass

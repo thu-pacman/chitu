@@ -2,11 +2,13 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import torch.distributed as dist
+import os
 from typing import Optional
 
-from chitu.utils import try_import_opt_dep, ceil_div
+import torch.distributed as dist
+
 from chitu.device_type import is_hygon
+from chitu.utils import ceil_div, try_import_opt_dep
 
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 
@@ -47,14 +49,17 @@ class DeepEPBuffer:
         if cls._buffer is not None:
             return cls._buffer
 
-        if is_hygon():
-            align_size = 16
-        else:
-            align_size = 256
-
         cls._hidden_size = hidden_size
+        # A smaller granularity avoids oversized DeepEP receive buffers at low batch sizes.
+        dispatch_granularity = (
+            16
+            if is_hygon()
+            else int(os.environ.get("CHITU_LL_DISPATCH_GRANULARITY", "256"))
+        )
+        if dispatch_granularity <= 0:
+            raise ValueError("CHITU_LL_DISPATCH_GRANULARITY must be positive")
         cls._lowlatency_num_max_dispatch_tokens_per_rank = (
-            ceil_div(max_bs_per_dp_rank, align_size) * align_size
+            ceil_div(max_bs_per_dp_rank, dispatch_granularity) * dispatch_granularity
         )
         cls._num_experts = num_experts
 

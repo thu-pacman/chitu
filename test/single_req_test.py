@@ -159,6 +159,8 @@ def check_phonebook_test_results(reqs):
 
 
 USE_TOOLS = False
+# Exercise text generation for multimodal models without changing model loading.
+USE_TEXT_PROMPTS = os.environ.get("CHITU_TEST_TEXT_PROMPTS", "false") == "true"
 msg_tools = [
     {
         "messages": [
@@ -314,7 +316,8 @@ def run_pipe_or_tensor_parallelism(args, timers):
                 max_new_tokens=args.request.max_new_tokens,
                 frequency_penalty=args.request.frequency_penalty,
                 is_vl=hasattr(args.models, "vision_config")
-                and not args.infer.language_model_only,
+                and not args.infer.language_model_only
+                and not USE_TEXT_PROMPTS,
             )
             for req in reqs:
                 TaskPool.add(Task(req.request_id, req, stop_with_eos=True))
@@ -369,7 +372,8 @@ def run_normal(args, timers):
             max_new_tokens=args.request.max_new_tokens,
             frequency_penalty=args.request.frequency_penalty,
             is_vl=hasattr(args.models, "vision_config")
-            and not args.infer.language_model_only,
+            and not args.infer.language_model_only
+            and not USE_TEXT_PROMPTS,
         )
         for req in reqs:
             TaskPool.add(Task(req.request_id, req, stop_with_eos=True))
