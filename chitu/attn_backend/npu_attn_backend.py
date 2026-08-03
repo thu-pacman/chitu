@@ -118,7 +118,7 @@ class NpuAttnBackend(RefAttnBackend):
             dtype=torch.int32,
             device=context_lengths.device,
         ).reshape(n_total_tokens, n_blocks_per_token)
-        if not self.mla_routes_to_decode(seq_len_delta):
+        if not self.route_to_decode(seq_len_delta):
             return
         self.sparse_mla_block_table_static.set(self.sparse_mla_block_table)
 

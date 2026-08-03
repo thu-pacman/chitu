@@ -515,6 +515,12 @@ def is_classic_pd_disagg() -> bool:
     return all(role in ("prefill", "decode") for role in roles)
 
 
+def is_pd_prefill_only() -> bool:
+    return bool(
+        is_classic_pd_disagg() and get_global_args().multi_inst.role == "prefill"
+    )
+
+
 def get_global_args(need_ensure=True):
     if need_ensure:
         _ensure_var_is_initialized(_GLOBAL_ARGS, "global args")
