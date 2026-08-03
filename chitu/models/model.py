@@ -1732,12 +1732,22 @@ class Transformer(nn.Module):
 
         for cache in self.cache_dict.values():
             cache.seq_len_delta.is_decode_stage = False
-        self.attn_backend.prepare_metadata_for_prefill(
-            self.cache_dict["main"].seq_len_delta
-        )
-        indexer = getattr(self, "indexer_backend", None)
-        if indexer is not None:
-            indexer.prepare_metadata_for_prefill(self.cache_dict["main"].seq_len_delta)
+
+        # 元数据准备必须与 attn_backend 的路由判定保持一致，不能由 prefill/decode
+        # 函数身份决定：开启 prefix caching 后，若 prefill 请求的前缀全部命中(PD分离)，
+        # 该 step会路由到 decode kernel，此时应准备 decode 元数据，
+        # 否则 metadata 中的 batchsize 会与实际 q 不一致。
+        if self.attn_backend.route_to_decode(self.cache_dict["main"].seq_len_delta):
+            self.prepare_decoding_attn()
+        else:
+            self.attn_backend.prepare_metadata_for_prefill(
+                self.cache_dict["main"].seq_len_delta
+            )
+            indexer = getattr(self, "indexer_backend", None)
+            if indexer is not None:
+                indexer.prepare_metadata_for_prefill(
+                    self.cache_dict["main"].seq_len_delta
+                )
         if self.pp_size > 1:
             return self.prefill_pipeline(tokens, hiddens, output_token_offsets, **args)
         else:

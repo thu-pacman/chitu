@@ -21,6 +21,7 @@ from chitu.distributed.coordinator import get_endpoint
 from chitu.global_vars import get_global_args
 from chitu.metrics.prometheus_collector import inc_completed_requests, observe_ttft
 from chitu.task import Task, UserRequest
+from chitu.trace import Trace
 from chitu.async_stream import AsyncDataStream
 
 logger = logging.getLogger(__name__)
@@ -205,6 +206,12 @@ class DPTokenSender:
 
         self._send_data(data)
 
+    def send_trace(self, trace: Trace):
+        data = trace.dump()
+        data["type"] = "trace"
+        logger.warning(f"{data}")
+        self._send_data(data)
+
     def _send_data(self, data: dict[str, Any]):
         """Send data to Router (enqueue; background thread will send)"""
         packed_data = msgpack.packb(data)
@@ -270,6 +277,8 @@ class DPAsyncDataStream(AsyncDataStream):
     def send_stop_signal(self, error: Optional[str] = None):
         if not self.stop_signal:
             self.stop_signal = True
+            if self.task.req.save_trace_dir:
+                self.token_sender.send_trace(self.task.req.trace_data)
             if self.task.req.finish_reason != "evicted":
                 self.token_sender.send_finish(
                     self.task.req.request_id,

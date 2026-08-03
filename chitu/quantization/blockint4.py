@@ -5,6 +5,7 @@
 from typing import Optional
 from typing_extensions import override
 import functools
+from logging import getLogger
 
 import torch
 import torch.nn as nn
@@ -19,10 +20,12 @@ from chitu.moe.batched_routed_activation import (
     BatchedRoutedActivation,
     IndexedBatchedRoutedActivation,
     ExpertBlockIndexedBatchedRoutedActivation,
+    PerExpertDenseBatchedRoutedActivationMinimal,
 )
 from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
     PerTokenBatchedExpertResult,
+    PerExpertDenseBatchedExpertResultMinimal,
 )
 from chitu.utils import try_import_platform_dep
 from chitu.native_layout import (
@@ -51,6 +54,8 @@ if has_triton:
 # Computed from scalar_type.hpp: ScalarType(exponent=0, mantissa=4, signed_=false, bias=8)
 # with NAN_IEEE_754=1, packed as: exponent(8b)|mantissa(8b)|signed_(1b)|bias(32b)|finite(1b)|nan_repr(8b)
 UINT4B8_TYPE_ID = 1125899907892224
+
+logger = getLogger(__name__)
 
 
 class BlockInt4MoeExpertsUnmergedBase(NativeLayoutMixin, QuantizedMoeExpertsUnmerged):
@@ -430,6 +435,37 @@ class TritonBlockInt4MoeExpertsMerged(
 class BlockInt4MarlinMixin(BlockInt4ExpertBlockDispatchMixin):
     """Marlin blockint4 MoE stores qweights and scales in Marlin runtime layout."""
 
+    # Process DeepEP's expert buffers in one Marlin call instead of one at a time.
+    @override
+    @functools.singledispatchmethod
+    def forward_no_sum(
+        self, routed_x: BatchedRoutedActivation, impl="auto"
+    ) -> BatchedExpertResult:
+        return super().forward_no_sum(routed_x, impl=impl)
+
+    @forward_no_sum.register
+    def _(
+        self,
+        routed_x: PerExpertDenseBatchedRoutedActivationMinimal,
+        impl="auto",
+    ) -> PerExpertDenseBatchedExpertResultMinimal:
+        routed_x = routed_x.as_local_expert_ids(
+            self.experts_start_idx, self.experts_end_idx
+        )
+        n_experts, capacity, hidden_size = routed_x.activation_per_expert.shape
+        if n_experts != self.group_size or hidden_size != self.dim:
+            raise ValueError(
+                "Marlin per-expert-dense input does not match the expert layout"
+            )
+        block_routed = ExpertBlockIndexedBatchedRoutedActivation.convert_from(
+            routed_x,
+            block_size=self.moe_block_size,
+        )
+        result = self._forward_expert_block_indexed(block_routed)
+        return PerExpertDenseBatchedExpertResultMinimal(
+            activation_per_expert=result.activation.view(n_experts, capacity, self.dim)
+        )
+
     def _ensure_marlin_workspace(self):
         if not hasattr(self, "workspace"):
             device = self.down_proj_qweight.device
@@ -487,13 +523,27 @@ class BlockInt4MarlinMixin(BlockInt4ExpertBlockDispatchMixin):
         size_n: int,
         size_k: int,
         top_k: int,
+        *,
+        zero_unrouted: bool = False,
     ) -> torch.Tensor:
         activation = eval_lazy(activation)
-        output = torch.zeros(
-            size_m * top_k,
-            size_n,
-            dtype=activation.dtype,
-            device=activation.device,
+        logger.info_once(
+            "KIMI_BLOCKINT4_RUNTIME impl=marlin class=%s "
+            "kernel=chitu_backend.moe_wna16_marlin_gemm group_size=%d",
+            type(self).__name__,
+            self.quant_group_size,
+        )
+        # EP reductions require non-local token/expert rows to be zero. Only
+        # the final projection is reduced; unrouted gate/up rows are never read.
+        output = (
+            torch.zeros(
+                size_m * top_k,
+                size_n,
+                dtype=activation.dtype,
+                device=activation.device,
+            )
+            if zero_unrouted
+            else None
         )
         return chitu_backend.moe_wna16_marlin_gemm(
             activation,  # a
@@ -615,6 +665,7 @@ class MarlinBlockInt4MoeExpertsUnmerged(
             self.dim,
             self.moe_inter_dim,
             1,
+            zero_unrouted=True,
         )
         del intermediate
         return PerTokenBatchedExpertResult(down_out.view(M, topk, self.dim))
@@ -713,6 +764,7 @@ class MarlinBlockInt4MoeExpertsMerged(
             self.dim,
             self.moe_inter_dim,
             1,
+            zero_unrouted=True,
         )
         del intermediate
         return PerTokenBatchedExpertResult(down_out.view(M, topk, self.dim))

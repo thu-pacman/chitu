@@ -12,6 +12,7 @@ import torch
 
 from chitu.backend import Backend
 from chitu.kv_cache.kv_cache import PagedKVCache
+from chitu.trace import Trace
 from .base import KVManagerBase, DisaggregationMode
 from .endpoint import PrefillEndpoints, DecodeEndpoints
 from .protocol import DecodeAllocated, RankTransferDone, PrefillDone, ProtocolSerializer
@@ -111,11 +112,14 @@ class KVManagerPrefill(KVManagerBase):
             for sid, nbytes in msg.rank_bytes.items():
                 info.rank_bytes[sid] = info.rank_bytes.get(sid, 0) + nbytes
             if info.done_count == self.dp_way_size:
+                if info.trace is not None:
+                    info.trace.info({"name": "Prefill Complete"})
                 nty = PrefillDone(
                     req_id=info.req_id,
                     first_token=info.first_token,
                     num_hit_tokens=info.num_hit_tokens,
                     rank_bytes=info.rank_bytes,
+                    trace_dict={} if info.trace is None else info.trace.dump(),
                 )
                 endpoint = self._decode_endpoints[info.decode_sid].prefill_done
                 endpoint.send(ProtocolSerializer.pack(nty))
@@ -252,6 +256,9 @@ class KVManagerPrefill(KVManagerBase):
         if info is None:
             return False
         return info.is_decode_allocated
+
+    def update_trace_info(self, req_id: str, trace: Trace):
+        self._info(req_id, create=True).trace = trace
 
     def get_all_transfer_done(self) -> list[str]:
         with self._prefill_transfer_state_lock:

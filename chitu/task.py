@@ -20,7 +20,12 @@ import torch
 from chitu.models.registry import ModelType
 from chitu.async_stream import AsyncDataStream
 from chitu.backend import Backend
-from chitu.global_vars import get_slot_handle, get_global_args, is_classic_pd_disagg
+from chitu.global_vars import (
+    get_slot_handle,
+    get_global_args,
+    is_classic_pd_disagg,
+    get_instance_id,
+)
 from chitu.task_type import TaskType
 from chitu.tool_call import (
     ToolCallParams,
@@ -28,6 +33,7 @@ from chitu.tool_call import (
     adjust_message_for_tool_calls,
     build_grammar,
 )
+from chitu.trace import Trace, TraceLevel
 from chitu.utils import dataclass_to_dict, dataclass_from_dict
 from chitu.reasoning import (
     update_chat_template_kwargs_reasoning,
@@ -130,7 +136,6 @@ class UserRequest:
     grid_thw: Any | None
     prompt_len: int
     max_new_tokens: int
-    trace_data: dict
     generated_tokens: list[int] = field(default_factory=list)
     ttft_deadline_ts: Optional[float] = None
 
@@ -152,6 +157,25 @@ class UserRequest:
         self._test_tokens = []
         self._test_standard_tokens = None
         self._test_standard_it = 0
+
+        self.trace_data: Trace = Trace(
+            self.request_id,
+            trace_level=TraceLevel.DEBUG if self.save_trace_dir else TraceLevel.NOTRACE,
+        )
+        self.trace_data.info(
+            {
+                "id": self.request_id,
+                "sample_params": {
+                    "temperature": self.sample_params.temperature,
+                    "top_p": self.sample_params.top_p,
+                    "top_k": self.sample_params.top_k,
+                    "frequency_penalty": self.sample_params.frequency_penalty,
+                },
+                "tools": self.tool_call_params and self.tool_call_params.tools,
+                "max_new_tokens": self.max_new_tokens,
+            },
+            "Request Initialize",
+        )
 
         # performance metrics
         self.timestamp: str = datetime.now().strftime("%H:%M:%S:%f")
@@ -199,11 +223,6 @@ class UserRequest:
             params.max_new_tokens, prompt_len
         )
 
-        if params.save_trace_dir:
-            trace_data = params.create_trace_data()
-        else:
-            trace_data = {}
-
         req = UserRequest(
             request_id=params.request_id,
             enable_thinking=params.enable_thinking,
@@ -219,7 +238,6 @@ class UserRequest:
             grid_thw=grid_thw,
             prompt_len=prompt_len,
             max_new_tokens=max_new_tokens,
-            trace_data=trace_data,
         )
         req.ttft_timeout_s = params.ttft_timeout_s
         return req
@@ -283,7 +301,6 @@ class UserRequest:
             grid_thw=None,
             prompt_len=input_len,
             max_new_tokens=max_new_tokens,
-            trace_data={},
         )
 
     @staticmethod
@@ -303,24 +320,28 @@ class UserRequest:
         prefill_duration = self.prefill_end_time - self.start_time
         all_duration = self.completion_time - self.start_time
         tps = self.async_stream.tokens_len / all_duration
-        trace_data = {
-            **self.trace_data,
-            "input_length": self.prompt_len,
-            "timestamp": self.timestamp,
-            "output_length": self.async_stream.tokens_len,
-            "prefill_duration": round(prefill_duration, 6),
-            "all_duration": round(all_duration, 6),
-            "tps": round(tps, 6),
-        }
 
-        trace_str = json.dumps(trace_data)
-
-        os.makedirs(self.save_trace_dir, exist_ok=True)
-        path = (
-            f"{self.save_trace_dir}/trace_{datetime.now().strftime('%Y_%m_%d')}.jsonl"
+        self.trace_data.info(
+            {
+                "input_length": self.prompt_len,
+                "timestamp": self.timestamp,
+                "output_length": self.async_stream.tokens_len,
+                "prefill_duration": round(prefill_duration, 6),
+                "all_duration": round(all_duration, 6),
+                "tps": round(tps, 6),
+            },
+            "Request Stopped",
         )
-        with open(path, "a") as file:
-            file.write(trace_str + "\n")
+        if get_instance_id() < 0:
+            # Router save trace result
+            self.trace_data.sort(key="time")
+            trace_data = self.trace_data.dump()
+            trace_str = json.dumps(trace_data)
+
+            os.makedirs(self.save_trace_dir, exist_ok=True)
+            path = f"{self.save_trace_dir}/trace_{datetime.now().strftime('%Y_%m_%d')}.jsonl"
+            with open(path, "a") as file:
+                file.write(trace_str + "\n")
 
     @property
     def finished(self):
@@ -330,10 +351,10 @@ class UserRequest:
         if self.finished:
             return
         self.output = repr("".join(self.async_stream.seqs))
-        self.async_stream.send_stop_signal(error=error)
         self.completion_time = time.monotonic()
-        if self.save_trace_dir and self.trace_data:
+        if self.save_trace_dir:
             self.save_trace_data()
+        self.async_stream.send_stop_signal(error=error)
 
     def add_data(
         self,
@@ -354,7 +375,7 @@ class UserRequest:
             self.generated_tokens.append(token)
             logger.debug(f"Request {self.request_id} adds a new token: {token}")
             self.num_output_tokens += 1
-            if token in Backend.tokenizer.stop_tokens:
+            if self.stop_with_eos and token in Backend.tokenizer.stop_tokens:
                 break
 
     def notify_server_data_added_from_server_thread(self):

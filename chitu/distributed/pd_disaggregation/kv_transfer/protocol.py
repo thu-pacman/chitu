@@ -120,6 +120,7 @@ class PrefillDone:
     first_token: int
     num_hit_tokens: int
     rank_bytes: dict[str, int] = dataclasses.field(default_factory=dict)
+    trace_dict: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 class ProtocolSerializer:

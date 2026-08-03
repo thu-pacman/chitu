@@ -1,6 +1,11 @@
 import torch
 import pytest
 
+from chitu.moe.batched_routed_activation import (
+    ExpertBlockIndexedBatchedRoutedActivation,
+    PerExpertDenseBatchedRoutedActivationMinimal,
+    PerExpertDenseBatchedRoutedActivationWithScaleMinimal,
+)
 from chitu.ops import (
     batched_routed_activation_indexed_to_expert_block_indexed,
     batched_routed_activation_indexed_to_expert_block_permuted,
@@ -34,6 +39,112 @@ else:
     moe_sum_per_token_triton = None
 
 _I32_MAX = 2**31 - 1
+
+
+def test_per_expert_dense_to_expert_block_indexed_reuses_route():
+    n_experts, capacity, hidden_size, block_size = 3, 8, 5, 4
+    activation = torch.arange(
+        n_experts * capacity * hidden_size,
+        dtype=torch.float32,
+    ).view(n_experts, capacity, hidden_size)
+    routed = PerExpertDenseBatchedRoutedActivationMinimal(
+        activation_per_expert=activation,
+        n_tokens_per_expert=torch.tensor([0, 3, capacity], dtype=torch.int32),
+        expected_n_tokens_per_expert=1,
+        expert_ids_are_local=True,
+    )
+
+    converted = ExpertBlockIndexedBatchedRoutedActivation.convert_from(
+        routed,
+        block_size=block_size,
+    )
+    expected_n_blocks = n_experts * capacity // block_size
+    torch.testing.assert_close(
+        converted.activation,
+        activation.view(n_experts * capacity, hidden_size),
+    )
+    torch.testing.assert_close(
+        converted.block_to_token_x_topk_indices,
+        torch.arange(n_experts * capacity, dtype=torch.int32).view(
+            expected_n_blocks, block_size
+        ),
+    )
+    torch.testing.assert_close(
+        converted.block_to_expert_indices,
+        torch.arange(n_experts, dtype=torch.int32).repeat_interleave(
+            capacity // block_size
+        ),
+    )
+    assert converted.n_blocks_scalar_tensor.item() == expected_n_blocks
+    assert converted.topk == 1
+    assert converted.expert_ids_are_local
+
+    routed_again = PerExpertDenseBatchedRoutedActivationMinimal(
+        activation_per_expert=torch.zeros_like(activation),
+        n_tokens_per_expert=routed.n_tokens_per_expert,
+        expected_n_tokens_per_expert=1,
+        expert_ids_are_local=True,
+    )
+    converted_again = ExpertBlockIndexedBatchedRoutedActivation.convert_from(
+        routed_again,
+        block_size=block_size,
+    )
+    assert (
+        converted_again.block_to_token_x_topk_indices.data_ptr()
+        == converted.block_to_token_x_topk_indices.data_ptr()
+    )
+    assert (
+        converted_again.block_to_expert_indices.data_ptr()
+        == converted.block_to_expert_indices.data_ptr()
+    )
+    assert (
+        converted_again.n_blocks_scalar_tensor.data_ptr()
+        == converted.n_blocks_scalar_tensor.data_ptr()
+    )
+
+    converted_with_larger_blocks = (
+        ExpertBlockIndexedBatchedRoutedActivation.convert_from(
+            routed_again,
+            block_size=capacity,
+        )
+    )
+    assert converted_with_larger_blocks.block_to_token_x_topk_indices.shape == (
+        n_experts,
+        capacity,
+    )
+    torch.testing.assert_close(
+        converted_with_larger_blocks.block_to_expert_indices,
+        torch.arange(n_experts, dtype=torch.int32),
+    )
+
+
+def test_per_expert_dense_to_expert_block_indexed_rejects_invalid_layout():
+    routed = PerExpertDenseBatchedRoutedActivationMinimal(
+        activation_per_expert=torch.zeros(2, 6, 4),
+        n_tokens_per_expert=torch.tensor([1, 2], dtype=torch.int32),
+        expected_n_tokens_per_expert=1,
+        expert_ids_are_local=True,
+    )
+    with pytest.raises(ValueError, match="divisible by block size"):
+        ExpertBlockIndexedBatchedRoutedActivation.convert_from(
+            routed,
+            block_size=4,
+        )
+
+    scaled = PerExpertDenseBatchedRoutedActivationWithScaleMinimal(
+        activation_per_expert=torch.zeros(2, 8, 4),
+        n_tokens_per_expert=torch.tensor([1, 2], dtype=torch.int32),
+        expected_n_tokens_per_expert=1,
+        expert_ids_are_local=True,
+        activation_scale_per_expert=torch.ones(2, 8, 1),
+        quant_method="blockfp8",
+        output_dtype=torch.bfloat16,
+    )
+    with pytest.raises(TypeError, match="preserving their scales"):
+        ExpertBlockIndexedBatchedRoutedActivation.convert_from(
+            scaled,
+            block_size=4,
+        )
 
 
 def _get_padded_token_count_per_expert(

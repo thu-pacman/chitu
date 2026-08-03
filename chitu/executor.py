@@ -22,6 +22,7 @@ from chitu.global_vars import (
     get_slot_handle,
     get_timers,
     is_classic_pd_disagg,
+    is_pd_prefill_only,
     is_independent_multi_inst,
 )
 from chitu.models.registry import ModelType
@@ -1085,9 +1086,7 @@ class Executor:
         # Decode is responsible for sampling and subsequent token generation.
         # If keep PP sampling enabled, last PP stage would sample and send results
         # back to rank0, adding latency and overhead.
-        self._pd_prefill_only = bool(
-            is_classic_pd_disagg() and args.multi_inst.role == "prefill"
-        )
+        self._pd_prefill_only = is_pd_prefill_only()
 
         # ---- Load balancer concurrent scheduling ----
         # Planner runs on a background thread; we only trigger and (optionally) sync here.

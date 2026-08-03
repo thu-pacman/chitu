@@ -661,6 +661,18 @@ class NormalAbsorbGemm(QuantizedAbsorbGemmBase):
             y = y.view(bs, seq, y.shape[-2], y.shape[-1])
         return y
 
+    def forward_token_major(self, x: torch.Tensor) -> torch.Tensor:
+        # FlashMLA split-Q consumes q_nope directly, so write it as a contiguous
+        # token-major [seq, head, dim] tensor without materializing torch.cat.
+        seq, n_head, _ = x.shape
+        y = x.new_empty((seq, n_head, self.out_features_per_head))
+        torch.bmm(
+            x.transpose(0, 1),
+            self.weight.transpose(1, 2),
+            out=y.transpose(0, 1),
+        )
+        return y
+
 
 class NormalAbsorbGemmPermuted021(NativeLayoutMixin, NormalAbsorbGemm):
     def init_native_layout(self):

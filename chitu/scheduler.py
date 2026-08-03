@@ -11,7 +11,7 @@ from typing_extensions import override
 from collections import deque
 
 from chitu.task import TaskPool, TaskType, Task, TaskStatus
-from chitu.global_vars import get_global_args, SlotHandle
+from chitu.global_vars import get_global_args, SlotHandle, is_pd_prefill_only
 from chitu.hooks import TaskEvictHook, NoopTaskEvictHook
 from chitu.utils import ceil_div
 from chitu.backend import Backend
@@ -741,7 +741,12 @@ class Scheduler:
             num_cached_tokens = self._num_prefill_cached_tokens(task)
             num_uncomputed_tokens = task.prefix_tokens_len - num_cached_tokens
             if num_uncomputed_tokens == 0:
-                if self.is_warmup_stage or get_global_args().infer.mtp_size > 1:
+                pd_prefill_only = is_pd_prefill_only()
+                if (
+                    self.is_warmup_stage
+                    or get_global_args().infer.mtp_size > 1
+                    or pd_prefill_only
+                ):
                     # Fall back to legacy 1-token prefill:
                     # - warmup: decode graph not captured yet, full prefill needed to
                     #   estimate memory;
@@ -749,6 +754,9 @@ class Scheduler:
                     #   state machine (mtp cache, accept_index, is_classic_decoding)
                     #   depends on prefill_step initialization, so skipping prefill
                     #   would break it
+                    # - PD prefill-only: decode waits for PrefillDone/first_token from
+                    #   the prefill hook, so a full-hit request must still execute one
+                    #   prefill step.
                     prefill_tokens += 1
                     task.set_prefill_chunk_size_for_one_step(1)
                     sched_out_task_ids.append(task_id)

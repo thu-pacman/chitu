@@ -8,6 +8,7 @@ import numpy as np
 
 from chitu.backend import Backend
 from chitu.kv_cache.kv_cache import PagedKVCache
+from chitu.trace import Trace
 
 from chitu.kv_cache.kv_cache import PagedKVCache
 
@@ -181,6 +182,7 @@ class KVManagerDecode(KVManagerBase):
                 done=True,
                 first_token=msg.first_token,
                 num_hit_tokens=msg.num_hit_tokens,
+                trace=Trace.load(msg.trace_dict),
             )
 
         # Non-rank0, non-owning ranks skip.

@@ -133,9 +133,7 @@ class AttnBackend(abc.ABC):
             out: (total, nheads, headdim).
         """
 
-        if seq_len_delta.is_classic_decoding or (
-            seq_len_delta.is_decode_stage and self.decode_op_supports_mtp()
-        ):
+        if self.route_to_decode(seq_len_delta):
             return self.decode(
                 q,
                 kv_cache,
@@ -171,7 +169,7 @@ class AttnBackend(abc.ABC):
 
     # SPDX-SnippetEnd
 
-    def mla_routes_to_decode(self, seq_len_delta: BatchedSeqLenDelta) -> bool:
+    def route_to_decode(self, seq_len_delta: BatchedSeqLenDelta) -> bool:
         """Whether `mla()` will dispatch this step to the decode kernel."""
         return seq_len_delta.is_classic_decoding or (
             seq_len_delta.is_decode_stage and self.decode_op_supports_mtp()
@@ -207,7 +205,7 @@ class AttnBackend(abc.ABC):
         if not isinstance(kv, torch.Tensor):
             raise NotImplementedError(f"Unsupported type {type(kv)} for kv")
 
-        if self.mla_routes_to_decode(seq_len_delta):
+        if self.route_to_decode(seq_len_delta):
             return self.mla_decode(
                 q_nope,
                 q_pe,
