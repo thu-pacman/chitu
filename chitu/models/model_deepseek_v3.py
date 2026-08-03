@@ -70,6 +70,7 @@ from chitu.quantization import (
     get_layer_id_from_checkpoint_prefix,
 )
 from chitu.quantization.normal import (
+    NormalAbsorbGemm,
     NormalLinear,
     NormalAbsorbGemmPermuted021,
     NormalLinearNpuFractalZn,
@@ -429,6 +430,7 @@ class AttentionDeepSeekV3(Attention):
         self.op_impl = op_impl
         self.mla_absorb = mla_absorb
         self.indexer_cache = indexer_cache
+        self._use_hygon_split_q_absorb_output = False
         # When False, this layer reuses topk from another layer's indexer via a
         # shared buffer (GLM-5.2 "shared" indexer role). It must NOT allocate
         # any of its own indexer projection weights, and the forward path skips
@@ -690,6 +692,9 @@ class AttentionDeepSeekV3(Attention):
                 quant_kwargs=absorb_quant_kwargs,
                 checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
             )
+            self._use_hygon_split_q_absorb_output = getattr(
+                self.attn_backend, "sparse_split_q_supported", False
+            ) and isinstance(self.kv_b_proj_absorb_1, NormalAbsorbGemm)
             self.kv_b_proj_absorb_2 = ParallelAbsorbGemm(
                 self.n_heads,
                 self.kv_lora_rank,
@@ -1153,7 +1158,10 @@ class AttentionDeepSeekV3(Attention):
                 "absorb",
             ]:
                 if self.mla_absorb in ("absorb-without-precomp", "absorb-kv-only"):
-                    q_nope = self.kv_b_proj_absorb_1(q_nope)
+                    if self._use_hygon_split_q_absorb_output:
+                        q_nope = self.kv_b_proj_absorb_1.forward_token_major(q_nope)
+                    else:
+                        q_nope = self.kv_b_proj_absorb_1(q_nope)
 
                 # KV layernorm
                 self.kv_a_layernorm(kv_lora, compute_dtype=kv.dtype, out=kv_lora)

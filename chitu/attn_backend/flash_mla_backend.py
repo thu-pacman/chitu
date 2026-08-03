@@ -206,6 +206,13 @@ class FlashMLABackend(TritonAttnBackend):
             if index_topk is None
             else index_topk
         )
+        self.sparse_split_q_supported = (
+            hasattr(flash_mla, "flash_mla_sparse_fwd_split_q")
+            and self.local_n_heads == 64
+            and self.args.models.kv_lora_rank == 512
+            and self.args.models.qk_rope_head_dim == 64
+            and self.index_topk == 2048
+        )
 
         # get quant config
         # Import lazily to avoid an import cycle during module initialization:
@@ -227,7 +234,9 @@ class FlashMLABackend(TritonAttnBackend):
             )
 
         logger.info(
-            f"FlashMLA backend initialized with topk={self.index_topk} and use_fp8_cache={self.use_fp8_cache}"
+            f"FlashMLA backend initialized with topk={self.index_topk}, "
+            f"use_fp8_cache={self.use_fp8_cache}, "
+            f"sparse_split_q={self.sparse_split_q_supported}"
         )
 
     # TODO: padding indices could be done in triton kernel
@@ -539,6 +548,28 @@ class FlashMLABackend(TritonAttnBackend):
         )
 
         return output[:, :local_h_q, :]
+
+    def flashmla_sparse_fwd_split_q_bf16(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv: torch.Tensor,
+        softmax_scale,
+        topk_indices: torch.Tensor,
+        attn_sink: Optional[torch.Tensor] = None,
+        topk_length: Optional[torch.Tensor] = None,
+    ):
+        output, _, _ = flash_mla.flash_mla_sparse_fwd_split_q(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            kv=kv.view(-1, 1, kv.shape[-1]),
+            indices=topk_indices.to(q_nope.device).unsqueeze(1),
+            sm_scale=softmax_scale,
+            d_v=512,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+        )
+        return output
 
     def flashmla_sparse_fwd_fp8(  # fp8 attn forward
         self,
@@ -1350,6 +1381,15 @@ class FlashMLABackend(TritonAttnBackend):
             causal,
         )
 
+        if self.sparse_split_q_supported and q_nope.is_contiguous():
+            return self.flashmla_sparse_fwd_split_q_bf16(
+                q_nope,
+                q_pe,
+                kv,
+                softmax_scale,
+                topk_indices,
+            )
+
         q = torch.cat([q_nope, q_pe], dim=-1)
 
         return self.flashmla_sparse_fwd_bf16(
@@ -1547,9 +1587,6 @@ class FlashMLABackend(TritonAttnBackend):
             )
         # NOTE: currently use bf16 kv with fp8 kv chunked prefill make inaccurate output
 
-        # quant then fwd with kvcache
-        q = torch.cat([q_nope, q_pe], dim=-1)
-
         if self.use_fp8_cache:
             kv = quant_pertoken_kvcache_dsa(kv)
 
@@ -1598,12 +1635,22 @@ class FlashMLABackend(TritonAttnBackend):
             )
             topk_indices.squeeze_(1)
 
-        output = self.flashmla_sparse_fwd_bf16(
-            q,
-            attn_kv,
-            softmax_scale,
-            topk_indices,
-        )
+        if self.sparse_split_q_supported and q_nope.is_contiguous():
+            output = self.flashmla_sparse_fwd_split_q_bf16(
+                q_nope,
+                q_pe,
+                attn_kv,
+                softmax_scale,
+                topk_indices,
+            )
+        else:
+            q = torch.cat([q_nope, q_pe], dim=-1)
+            output = self.flashmla_sparse_fwd_bf16(
+                q,
+                attn_kv,
+                softmax_scale,
+                topk_indices,
+            )
 
         return output
 
@@ -1691,8 +1738,6 @@ class FlashMLABackend(TritonAttnBackend):
         if self.use_fp8_cache:
             kv = quant_pertoken_kvcache_dsa(kv)
 
-        q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
-
         if softmax_scale is None:  # TODO: move to prepare_metadata
             softmax_scale = 1.0 / ((q_pe.shape[-1] + self.qk_nope_head_dim) ** 0.5)
 
@@ -1704,6 +1749,7 @@ class FlashMLABackend(TritonAttnBackend):
                 kv_cache,
                 seq_len_delta,
             )
+            q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
             return self.flashmla_dense_fwd_bf16(
                 q_nope_pe,
                 kv_lora_k_pe,
@@ -1763,6 +1809,7 @@ class FlashMLABackend(TritonAttnBackend):
                 )
 
         if self.use_fp8_cache:
+            q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
             return self.flashmla_sparse_fwd_fp8(
                 q_nope_pe,
                 kv_lora_k_pe,
@@ -1772,10 +1819,20 @@ class FlashMLABackend(TritonAttnBackend):
                 softmax_scale,
                 is_decode=True,
             )
-        else:
-            return self.flashmla_sparse_fwd_bf16(
-                q_nope_pe,
+
+        if self.sparse_split_q_supported and q_nope.is_contiguous():
+            return self.flashmla_sparse_fwd_split_q_bf16(
+                q_nope,
+                q_pe,
                 kv_lora_k_pe,
                 softmax_scale,
                 topk_indices,
             )
+
+        q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
+        return self.flashmla_sparse_fwd_bf16(
+            q_nope_pe,
+            kv_lora_k_pe,
+            softmax_scale,
+            topk_indices,
+        )
