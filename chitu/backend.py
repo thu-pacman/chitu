@@ -96,6 +96,50 @@ cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 logger = getLogger(__name__)
 
 
+def _patch_kimi_encode(tokenizer_model):
+    """Strip ``add_special_tokens=False`` on Kimi's TikTokenTokenizer.
+
+    Kimi's remote ``TikTokenTokenizer.encode`` treats any leftover kwarg as a
+    signal to fall back to ``super().encode`` (the HF pure-Python base class),
+    which does per-token dict lookups and added-token regex scanning and is
+    slower than the native tiktoken (Rust) path.
+
+    The chitu chat path (HF ``apply_chat_template`` calls
+    ``encode(rendered, add_special_tokens=False)``) and the /v1/completions path
+    (``TokenizerHF.encode(s, bos=False, eos=False)`` →
+    ``model.encode(s, add_special_tokens=False)``) never want special tokens,
+    so the ``False`` value is stripped to keep them on the fast path. An
+    explicit ``add_special_tokens=True`` is left in place so ``encode`` routes
+    through the HF base class that honors it, rather than being silently
+    discarded.
+
+    Only patches Kimi's TikTokenTokenizer; other tokenizer classes are
+    untouched.
+    """
+    cls = type(tokenizer_model)
+    if cls.__name__ != "TikTokenTokenizer" or "tokenization_kimi" not in (
+        cls.__module__ or ""
+    ):
+        return
+
+    if getattr(cls, "_chitu_kimi_encode_patched", False):
+        return
+
+    original_encode = cls.encode
+
+    def patched_encode(self, text, *args, **kwargs):
+        if kwargs.get("add_special_tokens") is False:
+            kwargs.pop("add_special_tokens", None)
+        return original_encode(self, text, *args, **kwargs)
+
+    cls.encode = patched_encode
+    cls._chitu_kimi_encode_patched = True
+    logger.info(
+        "Patched Kimi TikTokenTokenizer.encode to strip add_special_tokens=False "
+        "(keeps fast tiktoken path)."
+    )
+
+
 class BackendState(Enum):
     """Global state machine for the inference backend.
 
@@ -473,6 +517,7 @@ class Backend:
             ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
 
         patch_chat_template(tokenizer.model)
+        _patch_kimi_encode(tokenizer.model)
         return tokenizer
 
     @staticmethod

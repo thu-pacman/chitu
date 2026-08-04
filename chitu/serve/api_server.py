@@ -175,6 +175,16 @@ async def create_chat_completion(
     return await openai_api.handle_chat_completion(request=request, priority=priority)
 
 
+@app.post("/v1/completions")
+async def create_completion(
+    request: openai_api.CompletionsRequest,
+    priority=Depends(api_guard),
+):
+    """openai text completions endpoint (raw prompt, no chat template)"""
+
+    return await openai_api.handle_completion(request=request, priority=priority)
+
+
 @app.post("/v1/messages")
 async def v1_messages(
     request: anthropic_api.AnthropicMessagesRequest,
