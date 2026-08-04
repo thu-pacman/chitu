@@ -1843,6 +1843,9 @@ class Transformer(nn.Module):
             extra_inputs_mtp, extra_inputs_mtp_max_nelem = (), ()
 
         if self.do_decode_callable is None:
+            decode_graph_pool_handle = (
+                torch.cuda.graph_pool_handle() if self.use_cuda_graph else None
+            )
 
             before_replay_callback = None
 
@@ -1894,6 +1897,7 @@ class Transformer(nn.Module):
                 before_capture_callback=lambda: self.prepare_decoding_attn(),
                 before_replay_callback=before_replay_callback,
                 enable=self.use_cuda_graph,
+                graph_pool=decode_graph_pool_handle,
             )
             def do_decode(tokens, *extra_inputs):
                 freqs_cis = self._prepare_freqs_cis_for_decode(*extra_inputs)
@@ -1915,6 +1919,7 @@ class Transformer(nn.Module):
                     ),
                     before_replay_callback=before_replay_callback,
                     enable=self.use_cuda_graph,
+                    graph_pool=decode_graph_pool_handle,
                 )
                 def do_decode_mtp(tokens, *extra_inputs_mtp):
                     freqs_cis = self._prepare_freqs_cis_for_decode_mtp(
