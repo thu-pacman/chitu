@@ -143,7 +143,6 @@ class UserRequest:
 
     def __post_init__(self):
         # response related
-        self.generated_tokens = []
         self.output = ""
         self.async_stream = AsyncDataStream(self.enable_thinking)
         self.finish_reason = None

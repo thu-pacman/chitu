@@ -1009,6 +1009,7 @@ class Scheduler:
                         f"Task({task_id}) finished decoding, increasing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {self.cache_manager_dict['main'].num_blocks}"
                     )
                 TaskPool.remove(task_id)
+                self._task_evict_hook.on_task_remove(task)
 
         if removed_task_ids:
             inc_completed_requests("worker", len(removed_task_ids))

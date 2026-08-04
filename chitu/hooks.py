@@ -251,6 +251,9 @@ class NoopTaskEvictHook:
         task.sched_group_id = None
         task.dp_rank = None
 
+    def on_task_remove(self, task: Task):
+        pass
+
 
 class PDTaskEvictHook:
     def get_prefill_task_ids(self) -> list[str]:
@@ -279,6 +282,15 @@ class PDTaskEvictHook:
             if pd_scheduler is None:
                 return
             pd_scheduler.kv_manager.remove_request_all_rank(task.req.request_id)
+
+    def on_task_remove(self, task: Task):
+        if (
+            getattr(task, "req", None) is not None
+            and task.req.finish_reason == "evicted"
+        ):
+            pd_scheduler = get_pd_scheduler_instance()
+            if pd_scheduler is None:
+                return
             token_manager = pd_scheduler.token_manager
             if token_manager is not None:
                 token_manager.token_sender.send_evict(

@@ -15,7 +15,13 @@ from chitu.kv_cache.kv_cache import PagedKVCache
 from chitu.trace import Trace
 from .base import KVManagerBase, DisaggregationMode
 from .endpoint import PrefillEndpoints, DecodeEndpoints
-from .protocol import DecodeAllocated, RankTransferDone, PrefillDone, ProtocolSerializer
+from .protocol import (
+    DecodeAllocated,
+    RankTransferDone,
+    PrefillDone,
+    ProtocolSerializer,
+    RemoveRequest,
+)
 from .transfer_buffers import TransferBuffers
 from .transfer_plan import create_transfer_plan
 from .static_transfer_plan import (
@@ -46,6 +52,9 @@ class KVManagerPrefill(KVManagerBase):
         # drain checks after RankTransferDone removes it.
         self._completed_prefill_request_counts: dict[str, int] = {}
 
+        # Main rank should hold the transfer done state for all requests
+        self._transfer_done_reqs: list[str] = []
+
         self.endpoints = PrefillEndpoints(self.prefill_scheduler_id)
         if self.is_ctrl_rank:
             self._decode_endpoints = {
@@ -55,6 +64,7 @@ class KVManagerPrefill(KVManagerBase):
             self.endpoints.rank_transfer_done.init_master(has_slave=False)
             for endpoints in self._decode_endpoints.values():
                 endpoints.prefill_done.init_remote()
+            self.endpoints.decode_allocated.init_remote()
         else:
             self.endpoints.decode_allocated.init_slave()
         self.endpoints.rank_transfer_done.init_remote()
@@ -105,6 +115,8 @@ class KVManagerPrefill(KVManagerBase):
 
         with self._prefill_transfer_state_lock:
             info = self._info(msg.req_id)
+            if info is None:
+                return
             info.done_count += 1
             if msg.first_token:
                 info.first_token = msg.first_token
@@ -114,6 +126,9 @@ class KVManagerPrefill(KVManagerBase):
             if info.done_count == self.dp_way_size:
                 if info.trace is not None:
                     info.trace.info({"name": "Prefill Complete"})
+                # Remove info before send to decode to avoid conflict
+                self.remove_request_all_rank(info.req_id)
+                self._transfer_done_reqs.append(info.req_id)
                 nty = PrefillDone(
                     req_id=info.req_id,
                     first_token=info.first_token,
@@ -157,6 +172,10 @@ class KVManagerPrefill(KVManagerBase):
 
     def handle_decode_allocated(self, raw: bytes):
         msg = ProtocolSerializer.unpack(raw)
+        if isinstance(msg, RemoveRequest):
+            self.remove_request(msg.req_id)
+            return
+
         assert isinstance(msg, DecodeAllocated)
         logger.debug(f"handle_decode_allocated {msg.req_id}")
 
@@ -169,7 +188,7 @@ class KVManagerPrefill(KVManagerBase):
         info.decode_allocated_cnt += 1
         info.decode_cached_tokens = msg.decode_cached_tokens
 
-        if info.decode_allocated_cnt >= msg.rank_num:
+        if info.decode_allocated_cnt == msg.rank_num:
             info.is_decode_allocated = True
 
         self._trace(
@@ -199,6 +218,8 @@ class KVManagerPrefill(KVManagerBase):
 
         for i, req_id in enumerate(request_ids):
             info = self._info(req_id)
+            if info is None:
+                continue
             info.num_hit_tokens = num_hit_tokens[i]
             inst_id = self._decode_inst_ids[info.decode_sid]
             first_token = first_tokens[i] if first_tokens is not None else None
@@ -242,8 +263,6 @@ class KVManagerPrefill(KVManagerBase):
             payload = ProtocolSerializer.pack(msg)
             self.endpoints.rank_transfer_done.send(payload)
 
-            if not self.is_ctrl_rank:
-                self._remove_info(req_id)
             logger.debug(f"transfer_worker.done {req_id=}")
         except Exception:
             logger.exception(
@@ -258,15 +277,17 @@ class KVManagerPrefill(KVManagerBase):
         return info.is_decode_allocated
 
     def update_trace_info(self, req_id: str, trace: Trace):
-        self._info(req_id, create=True).trace = trace
+        info = self._info(req_id, create=True)
+        if info is not None:
+            info.trace = trace
 
     def get_all_transfer_done(self) -> list[str]:
         with self._prefill_transfer_state_lock:
-            request_ids = [
-                rid
-                for rid, info in self._task_infos.items()
-                if info.is_prefill_transfer_completed
-            ]
-            for request_id in request_ids:
-                self._remove_info(request_id)
-            return request_ids
+            transfer_done_reqs = self._transfer_done_reqs
+            self._transfer_done_reqs = []
+            return transfer_done_reqs
+
+    def remove_request_all_rank(self, request_id: str):
+        self.endpoints.decode_allocated.send(
+            ProtocolSerializer.pack(RemoveRequest(req_id=request_id))
+        )
