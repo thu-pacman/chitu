@@ -287,7 +287,8 @@ def blockfp4_gemm_chitu_backend(
         x = x.view(-1, x.shape[-1])
     # fp4_scaled_mm kernel requires the first dimension of the input matrix to be a multiple of 128
     x = pad_tensor_to_size(x, rounded_m)
-    x_global_scale = ((448 * 6) / torch.amax(x.flatten(), dim=-1)).to(torch.float32)
+    x_amax = torch.amax(x.abs()).clamp(min=1e-12)
+    x_global_scale = ((448 * 6) / x_amax).to(torch.float32)
 
     x, x_scale = blockfp4_act_quant(x, x_global_scale)
     if alpha is None:

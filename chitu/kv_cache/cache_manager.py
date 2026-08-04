@@ -193,18 +193,28 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.identity_runtime_pool.clear()
         self.cache_idx_to_hash.clear()
 
+    def _num_computed_blocks(self, task: "Task") -> int:
+        """Prefill only: fully-written block count (excludes a partial last block).
+
+        Decode callers should use ``len(task_to_cache_ids[...])`` directly; that
+        count may include a non-full trailing block and must not go through here.
+        """
+        n = len(self.task_to_cache_ids.get(task.task_id, set()))
+        return min(n, task.kv_cache_len_used_in_completed_steps // self.block_size)
+
     def num_cached_blocks(self, task: "Task") -> int:
         """Number of contiguous cached blocks hit from prompt start."""
-        num_computed_blocks = len(self.task_to_cache_ids.get(task.task_id, set()))
         if not self.enable_prefix_caching or task.task_type == TaskType.Decode:
-            return num_computed_blocks
+            return len(self.task_to_cache_ids.get(task.task_id, set()))
+
+        # Prefill: start binary search from fully-computed blocks only.
+        left = self._num_computed_blocks(task)
 
         # 二分查找第一个cache_idx为None的block序号（LRU逐出策略确保cached blocks连续）
         num_needed_blocks = self.num_blocks_for_seq_len(task.prefix_tokens_len)
         task_identities = self._make_task_identities(
             task, required_identity_blocks=num_needed_blocks
         )
-        left = num_computed_blocks
         right = min(num_needed_blocks, len(task_identities))
         while left < right:
             mid = (left + right) // 2
@@ -225,7 +235,10 @@ class PagedKVCacheManager(KVCacheManagerBase):
         if max_cached_token_len <= 0:
             return 0
 
-        num_computed_blocks = len(self.task_to_cache_ids.get(task.task_id, set()))
+        if task.task_type == TaskType.Decode:
+            num_computed_blocks = len(self.task_to_cache_ids.get(task.task_id, set()))
+        else:
+            num_computed_blocks = self._num_computed_blocks(task)
         num_cached_blocks = min(
             self.num_blocks_for_seq_len(max_cached_token_len),
             self.num_cached_blocks(task),
@@ -369,9 +382,12 @@ class PagedKVCacheManager(KVCacheManagerBase):
             new_cache_ids.append(cache_idx)
             block = TokenBlock(identity, runtime=BlockRuntime(cache_idx, active_cnt=1))
             self.active_blocks[block.cache_idx] = block.runtime
-            self.upload_to_identity_runtime_pool(block)
             self.task_to_cache_ids[task.task_id].add(cache_idx)
             self.task_to_token_blocks[task.task_id].append(block)
+
+        for idx, block in enumerate(self.task_to_token_blocks[task.task_id]):
+            if (idx + 1) * self.block_size <= target_seq_len:
+                self.upload_to_identity_runtime_pool(block)
         return new_cache_ids
 
     def prepare_metadata_before_decode(self, task: "Task") -> list[int]:
