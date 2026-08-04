@@ -17,6 +17,9 @@ from chitu.moe.token_dispatchers import (
     MoENpuAllToAllTokenDispatcher,
     MoENpuDistributeTokenDispatcher,
 )
+from chitu.moe.token_dispatchers.dp_etp_varlen_dispatcher import (
+    MoEDPETPVarlenTokenDispatcher,
+)
 from chitu.moe.load_balancer import (
     MoESlotCntLoadBalancer,
     init_moe_load_balancer,
@@ -25,7 +28,7 @@ from chitu.moe.load_balancer import (
 from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import BatchedRoutedActivation
 from chitu.cp_utils import get_cp_context
-from chitu.device_type import is_ascend_910b
+from chitu.device_type import is_ascend_910b, is_hygon
 from chitu.distributed.parallel_state import (
     get_tp_group,
     get_dp_group,
@@ -44,6 +47,77 @@ if has_deep_ep:
 
 
 MOE_IMPL_INSTANCE: Optional["MoEImplBase"] = None
+
+
+def _is_hygon_dp_etp_varlen_layout(
+    tp_group: CommGroup,
+    dp_group: CommGroup,
+    etp_group: CommGroup,
+    ep_group: CommGroup,
+) -> bool:
+    return (
+        tp_group.group_size == 1
+        and ep_group.group_size == 1
+        and dp_group.group_size == 8
+        and etp_group.group_size == 8
+        and dp_group.rank_list == etp_group.rank_list
+        and dp_group.rank_in_group == etp_group.rank_in_group
+    )
+
+
+def _is_dp_etp_dispatch_required(
+    tp_group: CommGroup,
+    dp_group: CommGroup,
+    etp_group: CommGroup,
+    ep_group: CommGroup,
+) -> bool:
+    """Whether MoE needs an explicit DP <-> ETP token redistribution path."""
+
+    return (
+        ep_group.group_size == 1
+        and dp_group.group_size > 1
+        and etp_group.group_size > 1
+    )
+
+
+def _compute_dp_etp_global_capacity(
+    max_batch_size: int,
+    dp_size: int,
+    pp_size: int,
+    pp_micro_batch_size_decode,
+    cache_type: Optional[str] = None,
+) -> int:
+    """Bound the tokens in one PP microstep across the whole DP group."""
+
+    max_batch_size = int(max_batch_size)
+    dp_size = int(dp_size)
+    pp_size = int(pp_size)
+    if max_batch_size <= 0 or dp_size <= 0 or pp_size <= 0:
+        raise ValueError(
+            "max_batch_size, dp_size and pp_size must all be positive, got "
+            f"{max_batch_size}, {dp_size}, {pp_size}"
+        )
+    if pp_size == 1:
+        return max_batch_size
+
+    decode_limit = str(pp_micro_batch_size_decode).strip().lower()
+    if str(cache_type).strip().lower() == "skew":
+        # SkewScheduler ignores pp_micro_batch_size_decode and always splits
+        # each DP rank's full request capacity across the PP slots.
+        decode_limit = "max"
+    if decode_limit in ("auto", "max"):
+        quotient, remainder = divmod(max_batch_size, dp_size)
+        local_batch_capacities = [
+            quotient + int(rank < remainder) for rank in range(dp_size)
+        ]
+        return sum(ceil_div(capacity, pp_size) for capacity in local_batch_capacities)
+
+    if not decode_limit.isdigit() or int(decode_limit) <= 0:
+        raise ValueError(
+            "scheduler.pp_config.pp_micro_batch_size_decode must be max or a "
+            f"positive integer, got {pp_micro_batch_size_decode!r}"
+        )
+    return min(max_batch_size, dp_size * int(decode_limit))
 
 
 def init_moe_impl(args) -> None:
@@ -124,11 +198,74 @@ def init_moe_impl(args) -> None:
             moe_lb_threshold=args.infer.moe_lb_threshold,
         )
     else:
-        MOE_IMPL_INSTANCE = MoEImplNoEP(
-            n_routed_experts=n_routed_experts,
-            n_activated_experts=n_activated_experts,
-            n_fused_shared_experts=n_fused_shared_experts,
+        dp_etp_global_capacity = None
+        dp_etp_required_staging_bytes = None
+        tp_group = get_tp_group()
+        dp_group = get_dp_group()
+        etp_group = get_etp_group()
+        ep_group = get_ep_group()
+        dp_etp_dispatch_required = _is_dp_etp_dispatch_required(
+            tp_group, dp_group, etp_group, ep_group
         )
+        dp_etp_layout_candidate = _is_hygon_dp_etp_varlen_layout(
+            tp_group, dp_group, etp_group, ep_group
+        )
+        if (
+            dp_etp_layout_candidate
+            and is_hygon()
+            and getattr(args, "float_16bit_variant", None) == "bfloat16"
+            and int(getattr(args.infer, "mtp_size", 1)) == 1
+        ):
+            scheduler = getattr(args, "scheduler", None)
+            pp_config = getattr(scheduler, "pp_config", None)
+            decode_limit = getattr(pp_config, "pp_micro_batch_size_decode", "max")
+            dp_etp_global_capacity = _compute_dp_etp_global_capacity(
+                args.infer.max_batch_size,
+                args.infer.dp_size,
+                args.infer.pp_size,
+                decode_limit,
+                getattr(args.infer, "cache_type", None),
+            )
+            hidden_dim = getattr(args.models, "dim", None) or getattr(
+                args.models, "hidden_size", None
+            )
+            packed_width = (
+                None
+                if hidden_dim is None
+                else int(hidden_dim) + 3 * int(n_activated_experts)
+            )
+            if packed_width is None or packed_width % 8 != 0:
+                raise ValueError(
+                    "Hygon DP8+ETP8 variable-length dispatch requires a known "
+                    "hidden dimension and a 16-byte-aligned packed row, got "
+                    f"hidden_dim={hidden_dim}, topk={n_activated_experts}"
+                )
+            dp_etp_required_staging_bytes = dp_etp_global_capacity * packed_width * 2
+        n_dense_layers = int(getattr(args.models, "n_dense_layers", 0))
+        if dp_etp_dispatch_required:
+            MOE_IMPL_INSTANCE = MoEImplDPETP(
+                n_routed_experts=n_routed_experts,
+                n_activated_experts=n_activated_experts,
+                n_fused_shared_experts=n_fused_shared_experts,
+                n_dense_layers=n_dense_layers,
+                dp_etp_global_capacity=dp_etp_global_capacity,
+                dp_etp_required_staging_bytes=dp_etp_required_staging_bytes,
+                tp_group=tp_group,
+                dp_group=dp_group,
+                etp_group=etp_group,
+                ep_group=ep_group,
+            )
+        else:
+            MOE_IMPL_INSTANCE = MoEImplNoEP(
+                n_routed_experts=n_routed_experts,
+                n_activated_experts=n_activated_experts,
+                n_fused_shared_experts=n_fused_shared_experts,
+                n_dense_layers=n_dense_layers,
+                tp_group=tp_group,
+                dp_group=dp_group,
+                etp_group=etp_group,
+                ep_group=ep_group,
+            )
 
 
 def get_moe_impl() -> Optional["MoEImplBase"]:
@@ -550,6 +687,7 @@ class MoEImplNoEP(MoEImplBase):
         n_routed_experts: int,
         n_activated_experts: int,
         n_fused_shared_experts: int,
+        n_dense_layers: int = 0,
         *,
         tp_group: Optional[CommGroup] = None,
         dp_group: Optional[CommGroup] = None,
@@ -567,12 +705,14 @@ class MoEImplNoEP(MoEImplBase):
         )
 
         assert self.ep_size == 1
+        self.n_dense_layers = int(n_dense_layers)
         self.cp_etp_dispatcher = None
         self.cp_etp_unsupported_reason = None
         self._init_cp_etp_dispatcher()
 
     def _init_cp_etp_dispatcher(self) -> None:
         cp_context = get_cp_context()
+        cp_group = cp_context.cp_group
         unsupported_reason = None
         if not cp_context.is_active:
             unsupported_reason = "CP context is not active"
@@ -584,18 +724,21 @@ class MoEImplNoEP(MoEImplBase):
             unsupported_reason = (
                 f"etp_size({self.etp_size}) must equal pcp_size({cp_context.pcp_size})"
             )
-        elif cp_context.cp_group.rank_list != self.etp_group.rank_list:
+        elif cp_group is None:
+            unsupported_reason = "CP group is unavailable"
+        elif cp_group.rank_list != self.etp_group.rank_list:
             unsupported_reason = "CP group and ETP group rank lists differ"
-        elif cp_context.cp_group.rank_in_group != self.etp_group.rank_in_group:
+        elif cp_group.rank_in_group != self.etp_group.rank_in_group:
             unsupported_reason = "CP group and ETP group rank positions differ"
 
         if unsupported_reason is not None:
             self.cp_etp_unsupported_reason = unsupported_reason
             return
 
+        assert cp_group is not None
         self.cp_etp_dispatcher = MoECPETPTokenDispatcher(
             self.n_experts,
-            cp_group=cp_context.cp_group,
+            cp_group=cp_group,
             tp_group=self.tp_group,
             dp_group=self.dp_group,
             etp_group=self.etp_group,
@@ -622,12 +765,17 @@ class MoEImplNoEP(MoEImplBase):
         if self.cp_etp_dispatcher is not None:
             self.cp_etp_dispatcher.prepare(num_tokens, enabled=enabled)
 
-    @override
-    def need_token_dispatch(self) -> bool:
-        return (
+    def _get_active_no_ep_dispatcher(self):
+        if (
             self.cp_etp_dispatcher is not None
             and self.cp_etp_dispatcher.enabled_for_step
-        )
+        ):
+            return self.cp_etp_dispatcher
+        return None
+
+    @override
+    def need_token_dispatch(self) -> bool:
+        return self._get_active_no_ep_dispatcher() is not None
 
     @override
     def enter_moe(
@@ -639,8 +787,9 @@ class MoEImplNoEP(MoEImplBase):
         may_fuse_quant_kwargs: dict = {},
         layer_id: Optional[int] = None,
     ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
-        if self.need_token_dispatch():
-            return self.cp_etp_dispatcher.enter_moe(
+        dispatcher = self._get_active_no_ep_dispatcher()
+        if dispatcher is not None:
+            return dispatcher.enter_moe(
                 x,
                 topk_weights,
                 may_fuse_quant=may_fuse_quant,
@@ -661,8 +810,9 @@ class MoEImplNoEP(MoEImplBase):
     ) -> tuple[
         BatchedRoutedActivation, Optional[torch.Tensor], Optional[torch.cuda.Stream]
     ]:
-        if self.need_token_dispatch():
-            return self.cp_etp_dispatcher.enter_moe_dispatch_streaming(
+        dispatcher = self._get_active_no_ep_dispatcher()
+        if dispatcher is not None:
+            return dispatcher.enter_moe_dispatch_streaming(
                 x,
                 topk_weights,
                 may_fuse_quant=may_fuse_quant,
@@ -677,8 +827,9 @@ class MoEImplNoEP(MoEImplBase):
 
     @override
     def exit_moe_after_local_sum(self, local_sum_result: torch.Tensor) -> torch.Tensor:
-        if self.need_token_dispatch():
-            return self.cp_etp_dispatcher.exit_moe_after_local_sum(local_sum_result)
+        dispatcher = self._get_active_no_ep_dispatcher()
+        if dispatcher is not None:
+            return dispatcher.exit_moe_after_local_sum(local_sum_result)
         if self.etp_size > 1:
             local_sum_result = eval_lazy(local_sum_result)
             local_sum_result = self.etp_group.all_reduce(local_sum_result)
@@ -687,3 +838,209 @@ class MoEImplNoEP(MoEImplBase):
     @override
     def exit_moe_reduce_rank_lists(self) -> Optional[Sequence[Sequence[int]]]:
         return self.etp_group.rank_lists
+
+
+class MoEImplDPETP(MoEImplBase):
+    """MoE implementation for the Hygon DP <-> ETP decode dispatcher."""
+
+    def __init__(
+        self,
+        n_routed_experts: int,
+        n_activated_experts: int,
+        n_fused_shared_experts: int,
+        n_dense_layers: int = 0,
+        dp_etp_global_capacity: Optional[int] = None,
+        dp_etp_required_staging_bytes: Optional[int] = None,
+        *,
+        tp_group: Optional[CommGroup] = None,
+        dp_group: Optional[CommGroup] = None,
+        etp_group: Optional[CommGroup] = None,
+        ep_group: Optional[CommGroup] = None,
+    ):
+        super().__init__(
+            n_routed_experts=n_routed_experts,
+            n_activated_experts=n_activated_experts,
+            n_fused_shared_experts=n_fused_shared_experts,
+            tp_group=tp_group,
+            dp_group=dp_group,
+            etp_group=etp_group,
+            ep_group=ep_group,
+        )
+
+        assert self.ep_size == 1
+        self.n_dense_layers = int(n_dense_layers)
+        self.dp_etp_dispatcher = None
+        self.dp_etp_unsupported_reason = None
+        if not _is_dp_etp_dispatch_required(
+            self.tp_group, self.dp_group, self.etp_group, self.ep_group
+        ):
+            raise ValueError(
+                "MoEImplDPETP requires DP+ETP dispatch, got "
+                f"DP={self.dp_size}, ETP={self.etp_size}, EP={self.ep_size}"
+            )
+        self._init_dp_etp_dispatcher(
+            dp_etp_global_capacity, dp_etp_required_staging_bytes
+        )
+        if self.dp_etp_dispatcher is None:
+            raise NotImplementedError(
+                "DP+ETP MoE dispatch requires Hygon variable-length custom "
+                "AG/RS, but it is unavailable: "
+                f"{self.dp_etp_unsupported_reason}"
+            )
+
+    def _init_dp_etp_dispatcher(
+        self,
+        global_capacity: Optional[int],
+        required_staging_bytes: Optional[int],
+    ) -> None:
+        if not is_hygon():
+            self.dp_etp_unsupported_reason = "accelerator is not Hygon"
+            return
+
+        unsupported_reason = None
+        if self.tp_size != 1:
+            unsupported_reason = f"tp_size must be 1, got {self.tp_size}"
+        elif self.dp_size != 8:
+            unsupported_reason = f"dp_size must be 8, got {self.dp_size}"
+        elif self.etp_size != 8:
+            unsupported_reason = f"etp_size must be 8, got {self.etp_size}"
+        elif self.dp_group.rank_list != self.etp_group.rank_list:
+            unsupported_reason = "DP and ETP group rank lists differ"
+        elif self.dp_group.rank_in_group != self.etp_group.rank_in_group:
+            unsupported_reason = "DP and ETP group rank positions differ"
+        elif global_capacity is None or int(global_capacity) <= 0:
+            unsupported_reason = (
+                "BF16, MTP=1, a 16-byte-aligned packed row and a positive "
+                "global token capacity are required"
+            )
+
+        if unsupported_reason is not None:
+            self.dp_etp_unsupported_reason = unsupported_reason
+            return
+
+        assert global_capacity is not None
+        global_capacity_int = int(global_capacity)
+        manager = self.etp_group.get_custom_ar_manager
+        if (
+            manager is None
+            or manager.disabled
+            or not getattr(manager, "supports_varlen_collectives", False)
+        ):
+            self.dp_etp_unsupported_reason = (
+                "Hygon custom manager is unavailable, lacks full HSW/P2P, or "
+                "does not expose varlen AG/RS"
+            )
+            return
+        if (
+            required_staging_bytes is not None
+            and int(required_staging_bytes) > manager.max_size
+        ):
+            self.dp_etp_unsupported_reason = (
+                "global token capacity requires "
+                f"{required_staging_bytes} staging bytes, but the custom "
+                f"manager has {manager.max_size}"
+            )
+            return
+
+        self.dp_etp_dispatcher = MoEDPETPVarlenTokenDispatcher(
+            self.n_experts,
+            global_capacity_int,
+            tp_group=self.tp_group,
+            dp_group=self.dp_group,
+            etp_group=self.etp_group,
+            ep_group=self.ep_group,
+        )
+
+    @override
+    def prepare(
+        self,
+        task_type: TaskType,
+        num_tokens: int,
+    ) -> None:
+        MoEImplBase.prepare(self, task_type, num_tokens)
+        if task_type == TaskType.Prefill:
+            raise NotImplementedError(
+                "DP+ETP prefill is not implemented for the Hygon "
+                "variable-length custom AG/RS path. Use CP+ETP prefill "
+                "or disable this DP+ETP decode-only layout for prefill."
+            )
+        assert self.dp_etp_dispatcher is not None
+        self.dp_etp_dispatcher.prepare(num_tokens, enabled=task_type == TaskType.Decode)
+
+    @override
+    def need_token_dispatch(self) -> bool:
+        return self._get_active_dp_etp_dispatcher() is not None
+
+    def _get_active_dp_etp_dispatcher(self):
+        if (
+            self.dp_etp_dispatcher is not None
+            and self.dp_etp_dispatcher.enabled_for_step
+        ):
+            return self.dp_etp_dispatcher
+        return None
+
+    @override
+    def enter_moe(
+        self,
+        x: BatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
+        layer_id: Optional[int] = None,
+    ) -> tuple[BatchedRoutedActivation, Optional[torch.Tensor]]:
+        dispatcher = self._get_active_dp_etp_dispatcher()
+        if dispatcher is not None:
+            return dispatcher.enter_moe(
+                x,
+                topk_weights,
+                may_fuse_quant=may_fuse_quant,
+                may_fuse_quant_kwargs=may_fuse_quant_kwargs,
+                layer_id=layer_id,
+            )
+        return x, topk_weights
+
+    @override
+    def enter_moe_dispatch_streaming(
+        self,
+        x: BatchedRoutedActivation,
+        topk_weights: torch.Tensor,
+        *,
+        may_fuse_quant: Optional[str] = None,
+        may_fuse_quant_kwargs: dict = {},
+        layer_id: Optional[int] = None,
+    ) -> tuple[
+        BatchedRoutedActivation, Optional[torch.Tensor], Optional[torch.cuda.Stream]
+    ]:
+        dispatcher = self._get_active_dp_etp_dispatcher()
+        if dispatcher is not None:
+            return dispatcher.enter_moe_dispatch_streaming(
+                x,
+                topk_weights,
+                may_fuse_quant=may_fuse_quant,
+                may_fuse_quant_kwargs=may_fuse_quant_kwargs,
+                layer_id=layer_id,
+            )
+        return x, topk_weights, None
+
+    @override
+    def exit_moe_prefer_before_local_sum(self) -> bool:
+        return False
+
+    @override
+    def exit_moe_after_local_sum(self, local_sum_result: torch.Tensor) -> torch.Tensor:
+        dispatcher = self._get_active_dp_etp_dispatcher()
+        if dispatcher is not None:
+            return dispatcher.exit_moe_after_local_sum(local_sum_result)
+        if self.etp_size > 1:
+            local_sum_result = eval_lazy(local_sum_result)
+            local_sum_result = self.etp_group.all_reduce(local_sum_result)
+        return local_sum_result
+
+    @override
+    def exit_moe_reduce_rank_lists(self) -> Optional[Sequence[Sequence[int]]]:
+        return self.etp_group.rank_lists
+
+    @property
+    def requires_empty_token_collective(self) -> bool:
+        return True

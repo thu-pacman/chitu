@@ -20,10 +20,25 @@ logger = getLogger(__name__)
 
 custom_ar = False
 _backend_checked = False
+HYGON_VARLEN_COLLECTIVE_ABI_VERSION = 2
 
 
 def _hygon_custom_ar_enabled() -> bool:
     return os.environ.get("CHITU_HYGON_CUSTOM_AR", "1").strip() == "1"
+
+
+def _has_hygon_varlen_collective_api() -> bool:
+    version = getattr(chitu_backend, "hygon_varlen_collective_abi_version", None)
+    try:
+        abi_version = version() if callable(version) else None
+        return (
+            callable(getattr(chitu_backend, "varlen_all_gather", None))
+            and callable(getattr(chitu_backend, "varlen_reduce_scatter", None))
+            and isinstance(abi_version, int)
+            and abi_version == HYGON_VARLEN_COLLECTIVE_ABI_VERSION
+        )
+    except Exception:
+        return False
 
 
 def _init_backend():
@@ -85,6 +100,14 @@ def _check_p2p_access(local_device_id: int, local_device_ids: List[int]) -> bool
     return True
 
 
+def _all_ranks_true(group: ProcessGroup, local_value: bool) -> bool:
+    """Return True only when every rank in the CPU process group agrees."""
+
+    flag = torch.tensor([int(local_value)], dtype=torch.int32, device="cpu")
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+    return bool(flag.item())
+
+
 class ChituCustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
 
@@ -98,47 +121,65 @@ class ChituCustomAllreduce:
         _init_backend()
         self._IS_CAPTURING = False
         self.disabled = False
+        self._supports_varlen_collectives = False
         self._ptr = 0
         self.group = group
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
-
-        if not custom_ar:
-            logger.info("Custom allreduce is disabled: missing library.")
-            self.disabled = True
-            return
-
-        if is_hygon() and not _hygon_custom_ar_enabled():
-            logger.info("Hygon custom allreduce disabled by CHITU_HYGON_CUSTOM_AR=0.")
-            self.disabled = True
-            return
-
         assert (
             dist.get_backend(group) != dist.Backend.NCCL
         ), "ChituCustomAllreduce should be attached to a non-NCCL group."
+        self.meta_ptrs = []
+        self.buffer_ptrs = []
 
-        if self.world_size == 1:
-            self.disabled = True
-            return
-
-        if self.world_size not in ChituCustomAllreduce._SUPPORTED_WORLD_SIZES:
-            logger.warning(
-                f"Custom allreduce disabled: unsupported world size {self.world_size}. "
-                f"Supported: {ChituCustomAllreduce._SUPPORTED_WORLD_SIZES}"
+        local_is_hygon = is_hygon()
+        all_hygon = _all_ranks_true(self.group, local_is_hygon)
+        all_non_hygon = _all_ranks_true(self.group, not local_is_hygon)
+        local_reason = None
+        if not all_hygon and not all_non_hygon:
+            local_reason = "ranks disagree on the accelerator platform"
+        elif not custom_ar:
+            local_reason = "missing custom allreduce library"
+        elif all_hygon and not _hygon_custom_ar_enabled():
+            local_reason = "CHITU_HYGON_CUSTOM_AR=0"
+        elif self.world_size == 1:
+            local_reason = "world size is 1"
+        elif self.world_size not in ChituCustomAllreduce._SUPPORTED_WORLD_SIZES:
+            local_reason = (
+                f"unsupported world size {self.world_size}; supported sizes are "
+                f"{ChituCustomAllreduce._SUPPORTED_WORLD_SIZES}"
             )
+
+        if not _all_ranks_true(self.group, local_reason is None):
+            if local_reason is not None:
+                logger.warning("Custom allreduce disabled: %s.", local_reason)
+            else:
+                logger.warning(
+                    "Custom allreduce disabled because another rank failed "
+                    "the prerequisite checks."
+                )
             self.disabled = True
             return
 
-        if isinstance(device, int):
-            device = torch.device(f"cuda:{device}")
-        elif isinstance(device, str):
-            device = torch.device(device)
-        self.device = device
-        # HIP graph-pool allocations are not reliably visible through peer IPC
-        # mappings on Hygon. Stage into the pre-registered uncached buffer.
-        self._use_staging_buffer_in_graph = is_hygon()
+        self._is_hygon = all_hygon
+        if self._is_hygon:
+            self._supports_varlen_collectives = _all_ranks_true(
+                self.group, _has_hygon_varlen_collective_api()
+            )
+            if not self._supports_varlen_collectives:
+                logger.warning(
+                    "Hygon custom allreduce remains available for ordinary AR, "
+                    "but varlen AG/RS is unavailable on at least one rank."
+                )
 
+        device_error = None
+        local_index = None
+        physical_device_id = None
         try:
+            if isinstance(device, int):
+                device = torch.device(f"cuda:{device}")
+            elif isinstance(device, str):
+                device = torch.device(device)
             local_index = device.index
             if local_index is None:
                 local_index = torch.cuda.current_device()
@@ -159,106 +200,172 @@ class ChituCustomAllreduce:
                 physical_device_id = device_ids[local_index]
             else:
                 physical_device_id = local_index
-
-            topology = torch.tensor(
-                [local_index, physical_device_id], dtype=torch.int, device="cpu"
-            )
-            gather_list = [torch.zeros_like(topology) for _ in range(self.world_size)]
-            dist.all_gather(gather_list, topology, group=self.group)
-
-            local_device_ids = [int(t[0].item()) for t in gather_list]
-            physical_device_ids = [int(t[1].item()) for t in gather_list]
-
-            if len(set(local_device_ids)) != self.world_size:
-                logger.warning(
-                    "Custom allreduce disabled: group is not contained on one "
-                    "host with unique local device IDs: %s",
-                    local_device_ids,
-                )
-                self.disabled = True
-                return
-
-            if not _check_p2p_access(local_index, local_device_ids):
-                logger.warning(
-                    f"Rank {self.rank}: P2P access check failed. Custom AR disabled."
-                )
-                self.disabled = True
-                return
-
-            self.fully_connected, topology_name = check_accelerator_fully_connected(
-                physical_device_ids
-            )
-
-            if not self.fully_connected:
-                # vLLM's upstream check is `world_size > 2 and not fully_connected`
-                # because its 2-GPU 1stage kernel is meant to work on PCIe. In
-                # practice the cross-device release/acquire.sys barrier is still
-                # unreliable on PCIe-only hosts (see vllm_custom_all_reduce.cuh's
-                # multi_gpu_barrier), so we keep the stricter rule: any group
-                # without a fully connected device fabric disables custom AR.
-                logger.warning(
-                    "Custom allreduce disabled: not full %s between all GPUs "
-                    "in this group (world_size=%d). P2P alone cannot guarantee the "
-                    "cross-device atomic / release-acquire visibility the barrier "
-                    "kernel depends on.",
-                    topology_name,
-                    self.world_size,
-                )
-                self.disabled = True
-                return
-
         except Exception as e:
+            device_error = e
+
+        if not _all_ranks_true(self.group, device_error is None):
+            if device_error is not None:
+                logger.warning(
+                    "Custom allreduce device mapping failed on rank %d: %s",
+                    self.rank,
+                    device_error,
+                )
+            else:
+                logger.warning(
+                    "Custom allreduce disabled because another rank could not "
+                    "resolve its physical device."
+                )
+            self.disabled = True
+            return
+
+        assert isinstance(device, torch.device)
+        assert local_index is not None
+        assert physical_device_id is not None
+        self.device = device
+        # HIP graph-pool allocations are not reliably visible through peer IPC
+        # mappings on Hygon. Stage into the pre-registered uncached buffer.
+        self._use_staging_buffer_in_graph = self._is_hygon
+
+        topology = torch.tensor(
+            [local_index, physical_device_id], dtype=torch.int, device="cpu"
+        )
+        gather_list = [torch.zeros_like(topology) for _ in range(self.world_size)]
+        dist.all_gather(gather_list, topology, group=self.group)
+
+        local_device_ids = [int(t[0].item()) for t in gather_list]
+        physical_device_ids = [int(t[1].item()) for t in gather_list]
+        if len(set(local_device_ids)) != self.world_size:
             logger.warning(
-                f"Topology detection failed: {e}. Disabling custom AR for safety."
+                "Custom allreduce disabled: group is not contained on one "
+                "host with unique local device IDs: %s",
+                local_device_ids,
             )
             self.disabled = True
             return
 
+        local_p2p_ok = _check_p2p_access(local_index, local_device_ids)
+        if not local_p2p_ok:
+            logger.warning(
+                "Rank %d: P2P access check failed. Custom AR will be disabled.",
+                self.rank,
+            )
+
+        topology_name = "HSW" if self._is_hygon else "NVLink"
+        # The fabric query is host-global. Run it once and fold its result into
+        # the same all-rank decision as each rank's local P2P check.
+        local_fabric_ok = True
+        if self.rank == 0:
+            local_fabric_ok, topology_name = check_accelerator_fully_connected(
+                physical_device_ids
+            )
+
+        self.fully_connected = _all_ranks_true(
+            self.group, local_p2p_ok and local_fabric_ok
+        )
+        if not self.fully_connected:
+            # vLLM's upstream check is `world_size > 2 and not fully_connected`
+            # because its 2-GPU 1stage kernel is meant to work on PCIe. The
+            # cross-device release/acquire barrier still requires a fully
+            # connected device fabric here.
+            logger.warning(
+                "Custom allreduce disabled: not full %s/P2P between all GPUs "
+                "in this group (world_size=%d).",
+                topology_name,
+                self.world_size,
+            )
+            self.disabled = True
+            return
+
+        self.custom_ar_max_size = max_size
         if is_hygon():
-            max_size = min(
+            self.custom_ar_max_size = min(
                 max_size,
                 CUSTOM_ALL_REDUCE_MAX_SIZES["hygon"][self.world_size],
             )
         self.max_size = max_size
 
+        rank_data_error = None
         try:
-            # Metadata buffer
-            self.meta_ptrs = self.create_shared_buffer(
-                chitu_backend.meta_size() + max_size, group=group, uncached=True
-            )
-
-            # Data buffer (IPC)
-            self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
-
-            # Rank data buffer
             self.rank_data = torch.empty(
                 8 * 1024 * 1024, dtype=torch.uint8, device=self.device
             )
+        except Exception as e:
+            rank_data_error = e
 
-            # <--- 再次检查防止空指针传入
-            if any(p == 0 for p in self.meta_ptrs) or any(
-                p == 0 for p in self.buffer_ptrs
-            ):
-                raise RuntimeError(
-                    "Found invalid (0) pointers in shared buffer initialization"
+        if not _all_ranks_true(self.group, rank_data_error is None):
+            if rank_data_error is not None:
+                logger.warning(
+                    "Rank %d failed to allocate custom AR rank data: %s",
+                    self.rank,
+                    rank_data_error,
                 )
+            else:
+                logger.warning(
+                    "Custom allreduce disabled because another rank could not "
+                    "allocate rank data."
+                )
+            self.disabled = True
+            return
 
+        self.meta_ptrs = self.create_shared_buffer(
+            chitu_backend.meta_size() + max_size, group=group, uncached=True
+        )
+        self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
+        local_buffers_ok = not any(p == 0 for p in self.meta_ptrs) and not any(
+            p == 0 for p in self.buffer_ptrs
+        )
+        if not _all_ranks_true(self.group, local_buffers_ok):
+            logger.warning(
+                "Custom allreduce disabled because shared-buffer setup failed "
+                "on at least one rank."
+            )
+            self.close()
+            return
+
+        init_error = None
+        try:
             self._ptr = chitu_backend.init_custom_ar(
                 self.meta_ptrs, self.rank_data, self.rank, self.fully_connected
             )
-
-            if self._ptr == 0:
-                logger.warning("chitu_backend.init_custom_ar returned 0 handle.")
-                self.disabled = True
-            else:
-                chitu_backend.register_buffer(self._ptr, self.buffer_ptrs)
-                logger.info("ChituCustomAllreduce initialized successfully.")
-
         except Exception as e:
-            logger.warning(f"Failed to initialize custom allreduce buffers: {e}")
-            self.disabled = True
+            init_error = e
+
+        if not _all_ranks_true(self.group, init_error is None and self._ptr != 0):
+            if init_error is not None:
+                logger.warning(
+                    "Rank %d failed to initialize custom AR: %s",
+                    self.rank,
+                    init_error,
+                )
+            else:
+                logger.warning(
+                    "Custom allreduce initialization failed on at least one rank."
+                )
             self.close()
-            self._ptr = 0
+            return
+
+        register_error = None
+        try:
+            chitu_backend.register_buffer(self._ptr, self.buffer_ptrs)
+        except Exception as e:
+            register_error = e
+
+        if not _all_ranks_true(self.group, register_error is None):
+            if register_error is not None:
+                logger.warning(
+                    "Rank %d failed to register the custom AR staging buffer: %s",
+                    self.rank,
+                    register_error,
+                )
+            else:
+                logger.warning(
+                    "Custom allreduce staging-buffer registration failed on "
+                    "at least one rank."
+                )
+            self.close()
+            return
+
+        logger.info("ChituCustomAllreduce initialized successfully.")
 
     @contextmanager
     def capture(self):
@@ -296,9 +403,15 @@ class ChituCustomAllreduce:
         local_data = [handle, offset]
         all_data = [None for _ in range(self.world_size)]
         dist.all_gather_object(all_data, local_data, group=self.group)
+        gathered_data = []
+        for data in all_data:
+            if data is None:
+                logger.error("Failed to gather graph buffers metadata")
+                return
+            gathered_data.append(data)
 
-        handles = [d[0] for d in all_data]
-        offsets = [d[1] for d in all_data]
+        handles = [d[0] for d in gathered_data]
+        offsets = [d[1] for d in gathered_data]
 
         if any(h is None for h in handles):
             logger.error("Failed to gather graph buffers metadata")
@@ -320,10 +433,20 @@ class ChituCustomAllreduce:
 
         if self.world_size == 2 or self.fully_connected:
             if is_hygon():
-                return inp_size <= self.max_size
+                return inp_size <= self.custom_ar_max_size
             return inp_size < self.max_size
 
         return False
+
+    @property
+    def supports_varlen_collectives(self) -> bool:
+        """Whether this manager can run the Hygon variable-length AG/RS API."""
+
+        return (
+            not self.disabled
+            and getattr(self, "_is_hygon", False)
+            and getattr(self, "_supports_varlen_collectives", False)
+        )
 
     def all_reduce(
         self, inp: torch.Tensor, *, out: torch.Tensor = None, registered: bool = False
@@ -337,6 +460,56 @@ class ChituCustomAllreduce:
             chitu_backend.all_reduce(
                 self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
             )
+        return out
+
+    def varlen_all_gather(
+        self,
+        inp: torch.Tensor,
+        local_count: torch.Tensor,
+        *,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compact DP-to-ETP all-gather driven by a device int32 count.
+
+        ``inp`` and ``out`` share one fixed global row capacity. Every rank
+        calls the collective, including ranks whose logical row count is zero.
+        Input is first copied to the manager's persistent uncached staging
+        allocation.
+        """
+        if not self.supports_varlen_collectives or self._ptr == 0:
+            raise RuntimeError(
+                "custom all-reduce manager does not support Hygon varlen AG/RS"
+            )
+        chitu_backend.varlen_all_gather(
+            self._ptr,
+            inp,
+            out,
+            local_count,
+            self.buffer_ptrs[self.rank],
+            self.max_size,
+        )
+        return out
+
+    def varlen_reduce_scatter(
+        self,
+        inp: torch.Tensor,
+        local_count: torch.Tensor,
+        *,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compact ETP-to-DP reduce-scatter with one global row capacity."""
+        if not self.supports_varlen_collectives or self._ptr == 0:
+            raise RuntimeError(
+                "custom all-reduce manager does not support Hygon varlen AG/RS"
+            )
+        chitu_backend.varlen_reduce_scatter(
+            self._ptr,
+            inp,
+            out,
+            local_count,
+            self.buffer_ptrs[self.rank],
+            self.max_size,
+        )
         return out
 
     def custom_all_reduce(
@@ -392,51 +565,89 @@ class ChituCustomAllreduce:
         group: ProcessGroup = None,
         uncached: bool = False,
     ) -> List[int]:
+        world_size = dist.get_world_size(group=group)
+        rank = dist.get_rank(group=group)
+        zeros = [0] * world_size
+        pointer = 0
+        handle = None
+        allocation_error = None
+
         try:
-            if hasattr(chitu_backend, "allocate_shared_buffer_and_handle"):
-                pointer, handle = chitu_backend.allocate_shared_buffer_and_handle(
-                    size_in_bytes
-                )
-
-                world_size = dist.get_world_size(group=group)
-                rank = dist.get_rank(group=group)
-
-                handles = [None] * world_size
-                dist.all_gather_object(handles, handle, group=group)
-
-                pointers = []
-                for i, h in enumerate(handles):
-                    if i == rank:
-                        pointers.append(pointer)
-                    else:
-                        if hasattr(chitu_backend, "open_mem_handle") and h is not None:
-                            ptr = chitu_backend.open_mem_handle(h)
-                            if ptr == 0:
-                                raise RuntimeError(
-                                    f"Rank {rank}: Failed to open IPC handle from Rank {i}"
-                                )
-                            pointers.append(ptr)
-                        else:
-                            logger.warning(
-                                f"Missing open_mem_handle or invalid handle from Rank {i}"
-                            )
-                            pointers.append(0)
-                return pointers
-            else:
-                logger.warning(
+            if not hasattr(chitu_backend, "allocate_shared_buffer_and_handle"):
+                raise RuntimeError(
                     "chitu_backend missing allocate_shared_buffer_and_handle"
                 )
-                return [0] * dist.get_world_size(group=group)
-
+            pointer, handle = chitu_backend.allocate_shared_buffer_and_handle(
+                size_in_bytes
+            )
         except Exception as e:
-            logger.warning(f"Failed to create shared buffer: {e}")
-            return [0] * dist.get_world_size(group=group)
+            allocation_error = e
+
+        if not _all_ranks_true(
+            group, allocation_error is None and pointer != 0 and handle is not None
+        ):
+            if allocation_error is not None:
+                logger.warning(
+                    "Rank %d failed to allocate a custom AR shared buffer: %s",
+                    rank,
+                    allocation_error,
+                )
+            free_fn = getattr(chitu_backend, "free_shared_buffer", None)
+            if pointer != 0 and callable(free_fn):
+                try:
+                    free_fn(pointer)
+                except Exception:
+                    pass
+            return zeros
+
+        handles = [None] * world_size
+        # A process-group failure is not a safe local fallback: let it raise so
+        # the caller does not split ranks between custom AR and RCCL.
+        dist.all_gather_object(handles, handle, group=group)
+
+        pointers = [0] * world_size
+        pointers[rank] = pointer
+        open_error = None
+        for i, peer_handle in enumerate(handles):
+            if i == rank:
+                continue
+            try:
+                if not hasattr(chitu_backend, "open_mem_handle"):
+                    raise RuntimeError("chitu_backend missing open_mem_handle")
+                if peer_handle is None:
+                    raise RuntimeError(f"Rank {i} returned an invalid IPC handle")
+                peer_pointer = chitu_backend.open_mem_handle(peer_handle)
+                if peer_pointer == 0:
+                    raise RuntimeError(f"failed to open IPC handle from rank {i}")
+                pointers[i] = peer_pointer
+            except Exception as e:
+                open_error = e
+                break
+
+        if not _all_ranks_true(
+            group, open_error is None and all(pointer != 0 for pointer in pointers)
+        ):
+            if open_error is not None:
+                logger.warning(
+                    "Rank %d failed to open a custom AR peer buffer: %s",
+                    rank,
+                    open_error,
+                )
+            free_fn = getattr(chitu_backend, "free_shared_buffer", None)
+            if pointer != 0 and callable(free_fn):
+                try:
+                    free_fn(pointer)
+                except Exception:
+                    pass
+            return zeros
+
+        return pointers
 
     @staticmethod
     def free_shared_buffer(
         pointers: List[int],
-        group: ProcessGroup = None,
-        rank: int = None,
+        group: Optional[ProcessGroup] = None,
+        rank: Optional[int] = None,
     ) -> None:
         if rank is None:
             rank = dist.get_rank(group=group)

@@ -122,6 +122,105 @@ void all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
     }
 }
 
+#if defined(CHITU_HYGON_BUILD) && CHITU_HYGON_BUILD == 1
+int64_t hygon_varlen_collective_abi_version() { return 2; }
+
+namespace {
+
+void check_varlen_common(chitu::CustomAllreduce *fa, torch::Tensor &inp,
+                         torch::Tensor &out, torch::Tensor &local_count) {
+    TORCH_CHECK(fa != nullptr, "custom collective handle is null");
+    TORCH_CHECK(fa->world_size_ == 8,
+                "variable-length collectives currently require 8 ranks");
+    TORCH_CHECK(inp.dim() == 2, "input must be a 2-D tensor");
+    TORCH_CHECK(out.dim() == 2, "output must be a 2-D tensor");
+    TORCH_CHECK(inp.scalar_type() == at::ScalarType::BFloat16,
+                "variable-length collectives support BF16 only");
+    TORCH_CHECK_EQ(out.scalar_type(), inp.scalar_type());
+    TORCH_CHECK(
+        inp.data_ptr() != out.data_ptr(),
+        "variable-length collectives require distinct input and output");
+    TORCH_CHECK(inp.is_cuda() && out.is_cuda() && local_count.is_cuda(),
+                "input, output and local_count must all be GPU tensors");
+    TORCH_CHECK_EQ(inp.device(), out.device());
+    TORCH_CHECK_EQ(inp.device(), local_count.device());
+    TORCH_CHECK(inp.is_contiguous());
+    TORCH_CHECK(out.is_contiguous());
+    TORCH_CHECK(local_count.is_contiguous());
+    TORCH_CHECK(local_count.scalar_type() == at::ScalarType::Int,
+                "local_count must be a device int32 scalar");
+    TORCH_CHECK(local_count.numel() == 1,
+                "local_count must contain exactly one int32 value");
+    TORCH_CHECK_EQ(inp.size(0), out.size(0));
+    TORCH_CHECK_GT(inp.size(0), 0);
+    TORCH_CHECK_EQ(inp.size(1), out.size(1));
+    TORCH_CHECK_GT(inp.size(1), 0);
+    TORCH_CHECK_LE(inp.size(0), std::numeric_limits<int>::max());
+    TORCH_CHECK_LE(inp.size(1), std::numeric_limits<int>::max());
+    TORCH_CHECK_LE(inp.numel(), std::numeric_limits<int>::max());
+    TORCH_CHECK_LE(out.numel(), std::numeric_limits<int>::max());
+    TORCH_CHECK((inp.size(1) * inp.element_size()) % 16 == 0,
+                "each row must be an integer number of 16-byte packs");
+}
+
+void *prepare_varlen_input(torch::Tensor &inp, fptr_t fake_reg_buffer,
+                           int64_t reg_buffer_sz_bytes, cudaStream_t stream) {
+    void *reg_buffer = reinterpret_cast<void *>(fake_reg_buffer);
+    TORCH_CHECK(reg_buffer != nullptr,
+                "variable-length collectives require the registered staging "
+                "buffer");
+
+    const int64_t input_size = inp.numel() * inp.element_size();
+    TORCH_CHECK(reg_buffer_sz_bytes >= input_size,
+                "registered staging buffer is too small");
+    AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size,
+                                  cudaMemcpyDeviceToDevice, stream));
+    return reg_buffer;
+}
+
+} // namespace
+
+void varlen_all_gather(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
+                       torch::Tensor &local_count, fptr_t _reg_buffer,
+                       int64_t reg_buffer_sz_bytes) {
+    auto fa = reinterpret_cast<chitu::CustomAllreduce *>(_fa);
+    TORCH_CHECK(out.dim() == 2 && inp.dim() == 2,
+                "all-gather input and output must be 2-D tensors");
+    TORCH_CHECK_EQ(out.size(0), inp.size(0));
+    check_varlen_common(fa, inp, out, local_count);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    void *input =
+        prepare_varlen_input(inp, _reg_buffer, reg_buffer_sz_bytes, stream);
+    fa->varlen_all_gather<nv_bfloat16>(
+        stream, reinterpret_cast<nv_bfloat16 *>(input),
+        reinterpret_cast<const int *>(local_count.data_ptr()),
+        reinterpret_cast<nv_bfloat16 *>(out.data_ptr()),
+        static_cast<int>(inp.size(0)), static_cast<int>(inp.size(1)));
+    AT_CUDA_CHECK(cudaGetLastError());
+}
+
+void varlen_reduce_scatter(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
+                           torch::Tensor &local_count, fptr_t _reg_buffer,
+                           int64_t reg_buffer_sz_bytes) {
+    auto fa = reinterpret_cast<chitu::CustomAllreduce *>(_fa);
+    TORCH_CHECK(out.dim() == 2 && inp.dim() == 2,
+                "reduce-scatter input and output must be 2-D tensors");
+    TORCH_CHECK_EQ(inp.size(0), out.size(0));
+    check_varlen_common(fa, inp, out, local_count);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    void *input =
+        prepare_varlen_input(inp, _reg_buffer, reg_buffer_sz_bytes, stream);
+    fa->varlen_reduce_scatter<nv_bfloat16>(
+        stream, reinterpret_cast<nv_bfloat16 *>(input),
+        reinterpret_cast<const int *>(local_count.data_ptr()),
+        reinterpret_cast<nv_bfloat16 *>(out.data_ptr()),
+        static_cast<int>(out.size(0)), static_cast<int>(out.size(1)));
+    AT_CUDA_CHECK(cudaGetLastError());
+}
+#endif
+
 void dispose(fptr_t _fa) {
     delete reinterpret_cast<chitu::CustomAllreduce *>(_fa);
 }

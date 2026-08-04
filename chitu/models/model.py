@@ -1623,7 +1623,7 @@ class Transformer(nn.Module):
                 self.global_embed_num_tokens,
                 self.embed_tokens_cum_num_tokens,
             )
-        if self.ep_size > 1:
+        if self._requires_empty_token_collective():
             for it, layer in enumerate(self.layers):
                 if self.local_begin_layer_id + it < self.moe_impl.n_dense_layers:
                     continue
@@ -1642,6 +1642,12 @@ class Transformer(nn.Module):
                     self.lm_head_cum_num_tokens,
                 )
         return None
+
+    def _requires_empty_token_collective(self) -> bool:
+        return self.ep_size > 1 or bool(
+            self.moe_impl is not None
+            and getattr(self.moe_impl, "requires_empty_token_collective", False)
+        )
 
     @torch.inference_mode()
     def empty_decode(self):
@@ -1929,7 +1935,7 @@ class Transformer(nn.Module):
 
                 self.do_decode_callable_mtp = do_decode_mtp
 
-            if self.ep_size > 1:
+            if self._requires_empty_token_collective():
 
                 @make_dispatched_graphed_callables(
                     args_max_nelem=(),
@@ -1972,7 +1978,7 @@ class Transformer(nn.Module):
             else:
                 return self.do_decode_callable(key, tokens, *extra_inputs)
         else:
-            if not self.ep_size > 1:
+            if not self._requires_empty_token_collective():
                 return None
             if self.mtp_size > 1:
                 return self.empty_mtp_decode_total(
