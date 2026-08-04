@@ -533,9 +533,6 @@ class PrefillOnlyManager(PDInstanceRequestManager):
         """
         request_id = str(request_data["request_id"])
         original_request = request_data["request"]
-        # Idempotent: Router may resend the same request.
-        if request_id in TaskPool.pool:
-            return
 
         info = {
             "request": original_request,

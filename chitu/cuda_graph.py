@@ -45,6 +45,7 @@ def make_dispatched_graphed_callables(
     before_capture_callback: Optional[Callable[[], None]] = None,
     before_replay_callback: Optional[Callable[[Any], None]] = None,
     enable: bool = True,
+    graph_pool: Any = None,
 ) -> Callable:
     """
     Make a callable to run with CUDA graph but capature different graphs when `key` changes.
@@ -62,6 +63,8 @@ def make_dispatched_graphed_callables(
             graph replay. Note that this callback is not invoked before warming-up runs, or before graph
             capturing.
         enable: If False, do nothing but only add the `key` argument.
+        graph_pool: An optional CUDA Graph pool handle. Graphs sharing a pool
+            must be replayed in a capture-compatible order and never concurrently.
 
     Returns:
         The wrapped function, which has an additional first argument `key` to dispatch different graphs.
@@ -76,12 +79,13 @@ def make_dispatched_graphed_callables(
             before_capture_callback=before_capture_callback,
             before_replay_callback=before_replay_callback,
             enable=enable,
+            graph_pool=graph_pool,
         )
 
     if enable:
 
         graph_dict: dict[Any, torch.cuda.CUDAGraph] = {}
-        cuda_graph_pool = None
+        cuda_graph_pool = graph_pool
 
         args_static_tensors: Optional[Sequence[StaticTensor]] = None
         kwargs_static_tensors: Optional[dict[str, StaticTensor]] = None

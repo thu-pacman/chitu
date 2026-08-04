@@ -870,6 +870,20 @@ curl localhost:21002/v1/chat/completions \
   }'
 ```
 
+测试 OpenAI 文本补全接口（`/v1/completions`，原始 prompt、不套 chat template）：
+
+```bash
+curl -s localhost:21002/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Kimi-K2.5",
+    "prompt": "What is machine learning?",
+    "max_tokens": 32,
+    "temperature": 0
+  }'
+```
+
+
 测试 OpenAI Responses 接口：
 
 ```bash

@@ -133,7 +133,7 @@ class KVManagerDecode(KVManagerBase):
 
         info = self._info(req_id)
 
-        if info.is_decode_allocated_sent:
+        if info is None or info.is_decode_allocated_sent:
             return
         info.is_decode_allocated_sent = True
 
@@ -219,6 +219,8 @@ class KVManagerDecode(KVManagerBase):
 
         # Wait for the recv thread to process PrefillDone.
         info = self._info(req_id)
+        if info is None:
+            return (0, 0)
         if not info.prefill_done_event.wait(timeout=10.0):
             raise RuntimeError(
                 f"Timed out waiting for PrefillDone after 10s: req_id={req_id}"
@@ -265,7 +267,7 @@ class KVManagerDecode(KVManagerBase):
         return self._transfer_done_states.get(req_id, TransferStatus())
 
     def remove_request(self, request_id: str):
-        super().remove_request(request_id)
+        self._remove_info(request_id)
         self._transfer_done_states.pop(request_id, None)
 
     def remove_request_all_rank(self, request_id: str):

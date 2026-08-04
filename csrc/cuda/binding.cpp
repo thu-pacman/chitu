@@ -67,6 +67,19 @@ void init_compute(py::module &m) {
           "ipc_pointers"_a, "rank_data"_a, "rank"_a, "full_nvlink"_a);
     m.def("all_reduce", &all_reduce, "Perform all-reduce operation", "handle"_a,
           "input"_a, "output"_a, "reg_buffer"_a, "reg_buffer_size"_a);
+#if defined(CHITU_HYGON_BUILD) && CHITU_HYGON_BUILD == 1
+    m.def("hygon_varlen_collective_abi_version",
+          &hygon_varlen_collective_abi_version,
+          "Get the Hygon variable-length collective ABI version");
+    m.def("varlen_all_gather", &varlen_all_gather,
+          "Compact GPU-count all-gatherv for DP-to-ETP dispatch", "handle"_a,
+          "input"_a, "output"_a, "local_count"_a, "reg_buffer"_a,
+          "reg_buffer_size"_a);
+    m.def("varlen_reduce_scatter", &varlen_reduce_scatter,
+          "Compact GPU-count reduce-scatterv for ETP-to-DP combine",
+          "handle"_a, "input"_a, "output"_a, "local_count"_a,
+          "reg_buffer"_a, "reg_buffer_size"_a);
+#endif
     m.def("dispose", &dispose, "Dispose custom all-reduce instance",
           "handle"_a);
     m.def("meta_size", &meta_size, "Get metadata size");

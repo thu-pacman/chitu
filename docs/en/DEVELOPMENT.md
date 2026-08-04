@@ -869,6 +869,19 @@ curl localhost:21002/v1/chat/completions \
   }'
 ```
 
+Test the service via OpenAI text-completions API (`/v1/completions`, raw prompt, no chat template):
+
+```bash
+curl -s localhost:21002/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Kimi-K2.5",
+    "prompt": "What is machine learning?",
+    "max_tokens": 32,
+    "temperature": 0
+  }'
+```
+
 Test the service via OpenAI Responses API:
 
 ```bash

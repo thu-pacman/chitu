@@ -189,6 +189,9 @@ Acceptable values:
 
 Additional arguments passed to `docker run`
 
+By default, Chitu passes `--rm` to `docker run`, so containers are automatically
+removed when they exit. To keep stopped containers, pass `--rm=false` in this field.
+
 Acceptable values:
 - A list of arguments.
 - A space-separated string for arguments.

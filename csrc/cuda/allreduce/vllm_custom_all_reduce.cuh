@@ -44,6 +44,17 @@ struct Signal {
     // may write counter+1 while current GPU is busy waiting for counter. We use
     // alternating counter array to avoid this possibility.
     alignas(128) FlagType peer_counter[2][kMaxBlocks][8];
+#if defined(CHITU_HYGON_BUILD) && CHITU_HYGON_BUILD == 1
+    // Device-side row counts exchanged by the variable-length collectives.
+    // Two epoch slots prevent a faster rank from overwriting a count that a
+    // slower rank is still consuming. Counts are per block because the peer
+    // barrier deliberately has no cross-block synchronization.
+    alignas(128) FlagType token_count[2][kMaxBlocks][8];
+    // Used only on a fatal global-capacity overflow. The final local block
+    // traps after every block has completed the peer tail barrier, so no rank
+    // is left spinning in the collective when the device error is raised.
+    alignas(128) FlagType varlen_overflow_blocks;
+#endif
 };
 
 struct __align__(16) RankData {
@@ -229,6 +240,45 @@ DINLINE void multi_gpu_barrier(const RankSignals &sg, Signal *self_sg,
         __syncthreads();
 }
 
+#if defined(CHITU_HYGON_BUILD) && CHITU_HYGON_BUILD == 1
+// Publish each rank's logical row count together with the input payload. All
+// ranks launch the same fixed grid, including ranks whose count is zero.
+template <int ngpus>
+DINLINE void multi_gpu_barrier_exchange_count(const RankSignals &sg,
+                                               Signal *self_sg, int rank,
+                                               int local_count,
+                                               int *shared_counts) {
+    if (threadIdx.x < ngpus) {
+        const auto val =
+            self_sg->self_counter[blockIdx.x][threadIdx.x] += 1;
+        const int peer = threadIdx.x;
+        const int slot = val % 2;
+        auto peer_count_ptr =
+            &sg.signals[peer]->token_count[slot][blockIdx.x][rank];
+        auto peer_counter_ptr =
+            &sg.signals[peer]->peer_counter[slot][blockIdx.x][rank];
+        auto self_counter_ptr =
+            &self_sg->peer_counter[slot][blockIdx.x][peer];
+
+        st_flag_volatile(peer_count_ptr, static_cast<FlagType>(local_count));
+        st_flag_release(peer_counter_ptr, val);
+        while (ld_flag_acquire(self_counter_ptr) != val)
+            ;
+        shared_counts[peer] = static_cast<int>(ld_flag_volatile(
+            &self_sg->token_count[slot][blockIdx.x][peer]));
+    }
+    __syncthreads();
+}
+
+DINLINE void trap_varlen_overflow_after_all_blocks(Signal *self_sg) {
+    if (threadIdx.x != 0)
+        return;
+    const auto arrived = atomicAdd(&self_sg->varlen_overflow_blocks, 1u);
+    if (arrived + 1 == gridDim.x)
+        __builtin_trap();
+}
+#endif
+
 template <typename P, int ngpus, typename A>
 DINLINE P packed_reduce(const P *ptrs[], int idx) {
     A tmp = upcast(ptrs[0][idx]);
@@ -306,6 +356,135 @@ __global__ void __launch_bounds__(512, 1)
         }
     }
 }
+
+#if defined(CHITU_HYGON_BUILD) && CHITU_HYGON_BUILD == 1
+// Direct-pull compact variable-length all-gather. Each rank exposes a static
+// [global_capacity, row_elems] staging allocation, but peers only copy the
+// rows named by the exchanged device counts. The unused output tail is zeroed
+// locally. A rank may contribute the entire global capacity; only the sum of
+// all rank counts is globally bounded.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_varlen_all_gather(RankData *_dp, RankSignals sg,
+                                   Signal *self_sg,
+                                   const int *__restrict__ local_count_ptr,
+                                   T *__restrict__ output, int rank,
+                                   int global_capacity, int row_elems) {
+    using P = typename packed_t<T>::P;
+    constexpr int pack_elems = P::size;
+    __shared__ int counts[ngpus];
+    __shared__ int offsets[ngpus + 1];
+    __shared__ int invalid_count;
+
+    multi_gpu_barrier_exchange_count<ngpus>(sg, self_sg, rank,
+                                            *local_count_ptr, counts);
+
+    if (threadIdx.x == 0) {
+        offsets[0] = 0;
+        invalid_count = 0;
+#pragma unroll
+        for (int peer = 0; peer < ngpus; ++peer) {
+            int n = counts[peer];
+            invalid_count |= n < 0 || n > global_capacity;
+            n = n < 0 ? 0 : n;
+            n = n > global_capacity ? global_capacity : n;
+            counts[peer] = n;
+            offsets[peer + 1] = offsets[peer] + n;
+        }
+    }
+    __syncthreads();
+
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    const int row_packs = row_elems / pack_elems;
+    const int capacity_packs = global_capacity * row_packs;
+    const bool overflow = invalid_count || offsets[ngpus] > global_capacity;
+    if (!overflow) {
+        const auto dp = *_dp;
+#pragma unroll
+        for (int peer = 0; peer < ngpus; ++peer) {
+            const P *src = reinterpret_cast<const P *>(dp.ptrs[peer]);
+            P *dst = reinterpret_cast<P *>(output) + offsets[peer] * row_packs;
+            const int valid_packs = counts[peer] * row_packs;
+            for (int idx = tid; idx < valid_packs; idx += stride)
+                dst[idx] = src[idx];
+        }
+        P zero{};
+        const int valid_packs = offsets[ngpus] * row_packs;
+        for (int idx = valid_packs + tid; idx < capacity_packs; idx += stride)
+            reinterpret_cast<P *>(output)[idx] = zero;
+    }
+
+    // Do not let a fast rank reuse its staging input while a peer is reading.
+    multi_gpu_barrier<ngpus, false, true>(sg, self_sg, rank);
+    if (overflow)
+        trap_varlen_overflow_after_all_blocks(self_sg);
+}
+
+// Owner-pull compact variable-length reduce-scatter. Rank r reduces its real
+// compact segment from every ETP rank and zeros the unused output capacity.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_varlen_reduce_scatter(RankData *_dp, RankSignals sg,
+                                       Signal *self_sg,
+                                       const int *__restrict__ local_count_ptr,
+                                       T *__restrict__ output, int rank,
+                                       int global_capacity, int row_elems) {
+    using P = typename packed_t<T>::P;
+    using A = typename packed_t<T>::A;
+    constexpr int pack_elems = P::size;
+    __shared__ int counts[ngpus];
+    __shared__ int offsets[ngpus + 1];
+    __shared__ int invalid_count;
+
+    multi_gpu_barrier_exchange_count<ngpus>(sg, self_sg, rank,
+                                            *local_count_ptr, counts);
+
+    if (threadIdx.x == 0) {
+        offsets[0] = 0;
+        invalid_count = 0;
+#pragma unroll
+        for (int peer = 0; peer < ngpus; ++peer) {
+            int n = counts[peer];
+            invalid_count |= n < 0 || n > global_capacity;
+            n = n < 0 ? 0 : n;
+            n = n > global_capacity ? global_capacity : n;
+            counts[peer] = n;
+            offsets[peer + 1] = offsets[peer] + n;
+        }
+    }
+    __syncthreads();
+
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    const int row_packs = row_elems / pack_elems;
+    const int output_capacity_packs = global_capacity * row_packs;
+    const bool overflow = invalid_count || offsets[ngpus] > global_capacity;
+    if (!overflow) {
+        const auto dp = *_dp;
+        const int segment_start = offsets[rank] * row_packs;
+        const int valid_packs = counts[rank] * row_packs;
+        const P *ptrs[ngpus];
+#pragma unroll
+        for (int peer = 0; peer < ngpus; ++peer)
+            ptrs[peer] =
+                reinterpret_cast<const P *>(dp.ptrs[peer]) + segment_start;
+
+        for (int idx = tid; idx < valid_packs; idx += stride) {
+            reinterpret_cast<P *>(output)[idx] =
+                packed_reduce<P, ngpus, A>(ptrs, idx);
+        }
+        P zero{};
+        for (int idx = valid_packs + tid; idx < output_capacity_packs;
+             idx += stride)
+            reinterpret_cast<P *>(output)[idx] = zero;
+    }
+
+    multi_gpu_barrier<ngpus, false, true>(sg, self_sg, rank);
+    if (overflow)
+        trap_varlen_overflow_after_all_blocks(self_sg);
+}
+#endif
 
 using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
 static_assert(sizeof(IPC_KEY) == sizeof(cudaIpcMemHandle_t));
@@ -456,6 +635,65 @@ class CustomAllreduce {
         graph_unreg_buffers_.clear();
     }
 
+#if defined(CHITU_HYGON_BUILD) && CHITU_HYGON_BUILD == 1
+    RankData *registered_rank_data(void *input) {
+        auto it = buffers_.find(input);
+        if (it == buffers_.end())
+            throw std::runtime_error(
+                "variable-length collective input address " +
+                std::to_string(reinterpret_cast<uint64_t>(input)) +
+                " is not IPC-registered");
+        return it->second;
+    }
+
+    template <typename T>
+    void varlen_all_gather(cudaStream_t stream, T *input,
+                           const int *local_count, T *output,
+                           int global_capacity, int row_elems) {
+        const int pack_elems = packed_t<T>::P::size;
+        if (world_size_ != 8)
+            throw std::runtime_error(
+                "variable-length collectives currently require world_size=8");
+        if (global_capacity <= 0 || row_elems <= 0)
+            throw std::runtime_error(
+                "global_capacity and row_elems must both be positive");
+        if (row_elems % pack_elems != 0)
+            throw std::runtime_error(
+                "row length must be a multiple of the 16-byte pack width");
+
+        constexpr int threads = 256;
+        constexpr int blocks = 8;
+        auto ptrs = registered_rank_data(input);
+        cross_device_varlen_all_gather<T, 8><<<blocks, threads, 0, stream>>>(
+            ptrs, sg_, self_sg_, local_count, output, rank_, global_capacity,
+            row_elems);
+    }
+
+    template <typename T>
+    void varlen_reduce_scatter(cudaStream_t stream, T *input,
+                               const int *local_count, T *output,
+                               int global_capacity, int row_elems) {
+        const int pack_elems = packed_t<T>::P::size;
+        if (world_size_ != 8)
+            throw std::runtime_error(
+                "variable-length collectives currently require world_size=8");
+        if (global_capacity <= 0 || row_elems <= 0)
+            throw std::runtime_error(
+                "global_capacity and row_elems must both be positive");
+        if (row_elems % pack_elems != 0)
+            throw std::runtime_error(
+                "row length must be a multiple of the 16-byte pack width");
+
+        constexpr int threads = 256;
+        constexpr int blocks = 8;
+        auto ptrs = registered_rank_data(input);
+        cross_device_varlen_reduce_scatter<T, 8>
+            <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, local_count,
+                                             output, rank_, global_capacity,
+                                             row_elems);
+    }
+#endif
+
     /**
      * Performs allreduce, assuming input has already been registered.
      *
@@ -483,18 +721,29 @@ class CustomAllreduce {
         cudaStreamCaptureStatus status;
         CUDACHECK(cudaStreamIsCapturing(stream, &status));
         auto registered_it = buffers_.find(input);
-        if (registered_it != buffers_.end()) {
-            // Hygon graph capture stages input into an uncached IPC buffer.
-            // Prefer its pre-registered peer pointers even while capturing.
-            ptrs = registered_it->second;
-        } else if (status == cudaStreamCaptureStatusActive) {
+#if defined(CHITU_HYGON_BUILD) && CHITU_HYGON_BUILD == 1
+        // Hygon graph capture stages input into a fixed uncached IPC buffer.
+        // Prefer that pre-registered buffer; an unregistered address still
+        // follows the generic graph-registration path.
+        const bool use_graph_rank_data =
+            status == cudaStreamCaptureStatusActive &&
+            registered_it == buffers_.end();
+#else
+        // Preserve the upstream CUDA capture-first semantics. In particular,
+        // never deduplicate graph inputs by virtual address across captures.
+        const bool use_graph_rank_data =
+            status == cudaStreamCaptureStatusActive;
+#endif
+        if (use_graph_rank_data) {
             ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
             graph_unreg_buffers_.push_back(input);
         } else {
-            throw std::runtime_error(
-                "buffer address " +
-                std::to_string(reinterpret_cast<uint64_t>(input)) +
-                " is not registered!");
+            if (registered_it == buffers_.end())
+                throw std::runtime_error(
+                    "buffer address " +
+                    std::to_string(reinterpret_cast<uint64_t>(input)) +
+                    " is not registered!");
+            ptrs = registered_it->second;
         }
 
         size /= d;

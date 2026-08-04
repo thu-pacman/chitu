@@ -189,3 +189,6 @@ class KVManagerBase:
 
     def remove_request(self, request_id: str):
         self._remove_info(request_id)
+
+    def remove_request_all_rank(self, request_id: str):
+        self.remove_request(request_id)

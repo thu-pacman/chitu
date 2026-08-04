@@ -21,6 +21,18 @@ fptr_t init_custom_ar(const std::vector<int64_t> &fake_ipc_ptrs,
 void all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
                 fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
 
+#if defined(CHITU_HYGON_BUILD) && CHITU_HYGON_BUILD == 1
+int64_t hygon_varlen_collective_abi_version();
+
+void varlen_all_gather(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
+                       torch::Tensor &local_count, fptr_t reg_buffer,
+                       int64_t reg_buffer_sz_bytes);
+
+void varlen_reduce_scatter(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
+                           torch::Tensor &local_count, fptr_t reg_buffer,
+                           int64_t reg_buffer_sz_bytes);
+#endif
+
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t> &fake_ipc_ptrs);

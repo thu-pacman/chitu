@@ -143,7 +143,6 @@ class UserRequest:
 
     def __post_init__(self):
         # response related
-        self.generated_tokens = []
         self.output = ""
         self.async_stream = AsyncDataStream(self.enable_thinking)
         self.finish_reason = None
@@ -251,6 +250,72 @@ class UserRequest:
             )
         max_new_tokens = min(max_new_tokens, max_seq_len - prompt_len + 1)
         return max_new_tokens
+
+    @staticmethod
+    def from_prompt_text(
+        prompt: Union[str, list[int]],
+        request_id: str,
+        *,
+        max_new_tokens: int = 128,
+        top_p: float = 0.9,
+        top_k: int = 50,
+        temperature: float = 0.8,
+        frequency_penalty: float = 0.0,
+        logprobs: bool = False,
+        top_logprobs: Optional[int] = None,
+        stop_with_eos: bool = True,
+        priority: int = 1,
+        save_trace_dir: Optional[str] = None,
+        ttft_timeout_s: Optional[float] = None,
+    ):
+        """Build a UserRequest from a raw prompt, bypassing the chat template.
+
+        Unlike ``from_request_params``, this does NOT call ``encode_dialog_prompt``
+        / ``apply_chat_template``. The prompt is tokenized directly (no special
+        tokens, no role markers, no assistant suffix), so the model receives
+        exactly the content tokens the client sent. This is the /v1/completions
+        (text completion) semantics, suitable for raw throughput benchmarking
+        where you want prompt length to be exactly what you sent.
+
+        ``prompt`` may be a string (re-tokenized server-side) or a list of token
+        ids (used verbatim, giving exact length control with no decode/encode
+        round-trip drift).
+        """
+        if isinstance(prompt, list):
+            prompt_tokens = list(prompt)
+        else:
+            # bos=False, eos=False: no special tokens injected. This differs
+            # from sglang's /v1/completions default (which adds special tokens)
+            # by design, for clean prompt-length control during benchmarking.
+            prompt_tokens = Backend.tokenizer.encode(prompt, bos=False, eos=False)
+        prompt_len = len(prompt_tokens)
+
+        max_new_tokens = UserRequest.cap_max_new_tokens(max_new_tokens, prompt_len)
+        sample_params = SampleParams(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            frequency_penalty=frequency_penalty,
+        )
+
+        req = UserRequest(
+            request_id=request_id,
+            enable_thinking=False,
+            logprobs=logprobs,
+            top_logprobs=top_logprobs,
+            save_trace_dir=save_trace_dir,
+            priority=priority,
+            stop_with_eos=stop_with_eos,
+            sample_params=sample_params,
+            tool_call_params=None,
+            prompt_tokens=prompt_tokens,
+            pixel_values=None,
+            grid_thw=None,
+            prompt_len=prompt_len,
+            max_new_tokens=max_new_tokens,
+        )
+        req.ttft_timeout_s = ttft_timeout_s
+        return req
 
     @staticmethod
     def create(messages: list, request_id: str, max_prompt_len=None, **kwargs):
