@@ -246,7 +246,7 @@ class Indexer(torch.nn.Module):
         k_pre_normed: bool = False,
         return_indices: bool = False,
     ) -> torch.Tensor:
-        """Build index scores or direct select-all prefill indices.
+        """Build index scores or direct prefill indices.
 
         In CP mode, use get_cp_context() for CP-specific parameters.
         """
@@ -374,11 +374,17 @@ class Indexer(torch.nn.Module):
         freqs_cis_k: Optional[BatchedFreqsCis] = None,
         k_pre_normed: bool = False,
     ):
+        direct_hygon_topk = self.indexer_impl.should_use_packed_hygon_prefill(
+            seq_len_delta,
+            self.index_topk,
+            return_indices=True,
+        )
         # TopK selects every valid key when the longest request already fits.
         select_all_prefill_keys = (
             not seq_len_delta.is_decode_stage
             and seq_len_delta.new.max_len <= self.index_topk
         )
+        return_direct_indices = direct_hygon_topk or select_all_prefill_keys
         index_score = self._build_index_score(
             x,
             q,
@@ -389,9 +395,11 @@ class Indexer(torch.nn.Module):
             cache_accessor,
             freqs_cis_k=freqs_cis_k,
             k_pre_normed=k_pre_normed,
-            return_indices=select_all_prefill_keys,
+            # Packed logits require row starts that are available inside
+            # DSAIndexer, so that path must finalize TopK before returning.
+            return_indices=return_direct_indices,
         )  # [s_q, out_max_n]
-        if select_all_prefill_keys:
+        if return_direct_indices:
             return index_score
         topk = min(self.index_topk, index_score.size(-1))
         # Use cached local_lengths only in CP path (freqs_cis_k is not None).

@@ -24,7 +24,10 @@ from chitu.kv_cache import (
 from chitu.device_type import is_ascend, is_hygon, is_nvidia
 from chitu.utils import try_import_opt_dep, try_import_platform_dep, get_global_args
 from chitu.batched_seq_len import BatchedSeqLenDelta
-from chitu.ops.topk import topk_indices
+from chitu.ops.topk import (
+    topk_indices,
+    has_hygon_indexer_topk,
+)
 from chitu.static_tensor import StaticTensor
 
 import torch
@@ -64,7 +67,10 @@ support_indexer_hygon = (
     and hasattr(hygon_deepgemm, "paged_mqa_logits")
     and hasattr(hygon_deepgemm, "get_paged_mqa_logits_metadata")
 )
+support_hygon_packed_topk = support_indexer_hygon and has_hygon_indexer_topk
 HYGON_INDEXER_MAX_MTP_SIZE = 5
+
+_hygon_mqa_logits_keyword_support: dict[object, bool] = {}
 
 
 def use_fp8_dsa_indexer_kv(args) -> bool:
@@ -79,6 +85,42 @@ def use_fp8_dsa_indexer_kv(args) -> bool:
             f"DSA indexer KV cache only supports no quantization or fp8_pertoken_indexer, got {indexer_kv_quant_type}"
         )
     return indexer_kv_quant_type == "fp8_pertoken_indexer"
+
+
+def _call_hygon_mqa_logits(
+    q,
+    k,
+    weights,
+    ks,
+    ke,
+    s_q,
+    s_k,
+    h,
+    head_dim,
+    clean_logits,
+):
+    """Call LightOp mqa_logits across its old and new Python ABIs."""
+    op = lightop.op.mqa_logits
+    common_args = (q, k, weights, ks, ke, s_q, s_k, h, head_dim)
+
+    if op in _hygon_mqa_logits_keyword_support:
+        if _hygon_mqa_logits_keyword_support[op]:
+            return op(*common_args, clean_logits=clean_logits)
+        return op(*common_args, clean_logits)
+
+    # Older bindings name clean_logits and let the preceding KV_scale default
+    # to None. The current binding exposes only positional arguments. Probe the
+    # keyword form once per binding and cache the compatible call form.
+    try:
+        result = op(*common_args, clean_logits=clean_logits)
+    except TypeError as exc:
+        if "incompatible function arguments" not in str(exc):
+            raise
+        result = op(*common_args, clean_logits)
+        _hygon_mqa_logits_keyword_support[op] = False
+    else:
+        _hygon_mqa_logits_keyword_support[op] = True
+    return result
 
 
 def validate_indexer_config(args, indexer_type):
@@ -121,9 +163,8 @@ def _validate_deepgemm_indexer_config(args):
 def _validate_hygon_indexer_config(args):
     if not support_indexer_hygon:
         raise ValueError(
-            "indexer_type=hygon requires the Chitu Hygon indexer TopK kernel, "
-            "Hygon lightop prefill mqa logits, and DeepGEMM paged mqa logits "
-            "and metadata"
+            "indexer_type=hygon requires the Chitu backend, Hygon lightop "
+            "prefill mqa logits, and DeepGEMM paged mqa logits and metadata"
         )
     if args.infer.cache_type != "paged":
         raise ValueError(
@@ -193,6 +234,22 @@ class DSAIndexer:
 
         logger.info(f"Indexer Backend is initialized with impl={self.impl}")
 
+    def should_use_packed_hygon_prefill(
+        self,
+        seq_len_delta: BatchedSeqLenDelta,
+        index_topk: int,
+        *,
+        return_indices: bool,
+    ) -> bool:
+        return (
+            self.impl == "hygon"
+            and support_hygon_packed_topk
+            and return_indices
+            and not seq_len_delta.is_decode_stage
+            and index_topk == 2048
+            and seq_len_delta.new.max_len > index_topk
+        )
+
     # TODO: 不同方法按照实际impl注册？
     def blockfp8_index_score_ragged_qk_dsv32_deepgemm(
         self,
@@ -251,15 +308,20 @@ class DSAIndexer:
         k: torch.Tensor,  # [s_k, d=128] or [s_k, 1, d=128], bf16
         seq_len_delta: BatchedSeqLenDelta,
         causal: bool,
-        ke: Optional[torch.Tensor] = None,  # [s_q], int32, pre-computed ke for CP
+        ke: Optional[torch.Tensor] = None,  # [s_q], int32, CP relative lengths
+        ks: Optional[torch.Tensor] = None,  # [s_q], int32, CP row starts
         q_seq_ids: Optional[torch.Tensor] = None,  # [s_q], CP-local seq ids
+        compact_output: bool = True,
     ):
         """
         Indexer score by Hygon lightop.op.mqa_logits() for ragged qk in prefill stage.
 
-        In CP mode, `ke` should be pre-computed from local_lengths (correct global
-        positions of local Q tokens). When provided, `ks` is set to all zeros
-        (single-batch prefix), and the seq_len_delta computation is bypassed.
+        In CP mode, `ke` contains request-relative valid lengths and `ks`
+        contains request offsets in the concatenated K tensor. When
+        `compact_output` is false, LightOp's packed-global logits are returned
+        for direct consumption by TopK with matching row starts. LightOp is
+        called with `clean_logits=False` because every consumer restricts the
+        operation to the per-row valid range.
         """
         s_q, h, _ = q.shape
         assert k.dim() == 2
@@ -267,8 +329,9 @@ class DSAIndexer:
         weights = weights.reshape(s_q, h)
 
         if ke is not None:
-            # CP path: use pre-computed ke with zero prefix
-            ks = torch.zeros(s_q, dtype=torch.int32, device=q.device)
+            if ks is None:
+                ks = torch.zeros(s_q, dtype=torch.int32, device=q.device)
+            ke = ke + ks
         else:
             # Standard path: compute from seq_len_delta
             ks = seq_len_delta.new.prefix_lens_tensor_device[
@@ -297,7 +360,7 @@ class DSAIndexer:
             ks = torch.cat((ks, ks.new_zeros((pad_rows,))), dim=0)
             ke = torch.cat((ke, ke.new_zeros((pad_rows,))), dim=0)
 
-        index_score = lightop.op.mqa_logits(
+        index_score = _call_hygon_mqa_logits(
             q,
             k,
             weights,
@@ -307,12 +370,14 @@ class DSAIndexer:
             k.shape[0],
             h,
             q.shape[2],
-            None,
-            True,
+            clean_logits=False,
         )
 
         if kernel_s_q != s_q:
             index_score = index_score.narrow(0, 0, s_q)
+
+        if not compact_output:
+            return index_score
 
         # This kernel stores the output in a (ragged_q * ragged_k) layout, we need to
         # convert it back to (ragged_q * local_k), so the following `topk` can be correct.
@@ -673,7 +738,9 @@ class DSAIndexer:
         is_causal=True,
         ke: Optional[torch.Tensor] = None,
         k_append: Optional[torch.Tensor] = None,
+        ks: Optional[torch.Tensor] = None,
         q_seq_ids: Optional[torch.Tensor] = None,
+        compact_prefill_logits: bool = True,
         skip_prefill_score: bool = False,
     ):
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
@@ -722,7 +789,9 @@ class DSAIndexer:
                 seq_len_delta,
                 is_causal,
                 ke=ke,
+                ks=ks,
                 q_seq_ids=q_seq_ids,
+                compact_output=compact_prefill_logits,
             )
 
         return index_score
@@ -876,6 +945,11 @@ class DSAIndexer:
             and not seq_len_delta.is_decode_stage
             and seq_len_delta.new.max_len <= index_topk
         )
+        use_packed_hygon_prefill = self.should_use_packed_hygon_prefill(
+            seq_len_delta,
+            index_topk,
+            return_indices=return_indices,
+        )
         ### get index_score
         if self.impl == "deepgemm":  # deepgemm uses a distinct kv layout
             logits = self.blockfp8_index_score_dsa_deepgemm(
@@ -901,7 +975,9 @@ class DSAIndexer:
                 is_causal,
                 ke=ke,
                 k_append=k_append,
+                ks=ks,
                 q_seq_ids=q_seq_ids,
+                compact_prefill_logits=not use_packed_hygon_prefill,
                 skip_prefill_score=select_all_prefill_keys,
             )
         elif self.impl in ("torch_bf16", "triton_bf16"):
@@ -938,10 +1014,37 @@ class DSAIndexer:
                 device=q_fp8.device,
             ).repeat(q_fp8.shape[0], 1)
 
-        if not return_indices:  # for unit test
+        # Some callers need scores for a later length-aware TopK or page-table
+        # transform; direct-index paths finalize TopK inside this method.
+        if not return_indices:
             return logits
 
+        assert logits is not None
+
         ### get topk_indices
+        if self.impl == "hygon" and use_packed_hygon_prefill:
+            if ks is not None:
+                if ke is None:
+                    raise ValueError("CP packed Hygon TopK requires valid lengths")
+                row_starts = ks
+                lengths = ke
+            else:
+                row_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
+                row_starts = seq_len_delta.new.prefix_lens_tensor_device[
+                    row_seq_ids
+                ].contiguous()
+                lengths = (
+                    seq_len_delta.delta_position_ids_tensor_device + 1
+                    if is_causal
+                    else seq_len_delta.new.lens_tensor_device[row_seq_ids]
+                )
+            return topk_indices(
+                logits,
+                index_topk,
+                lengths=lengths.contiguous(),
+                row_starts=row_starts.contiguous(),
+            )
+
         # Ensure k does not exceed the actual size of index_score
         k = min(index_topk, logits.size(-1))
         lengths = (
