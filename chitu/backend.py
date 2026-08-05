@@ -76,9 +76,9 @@ from chitu.tool_call import patch_chat_template
 from chitu.utils import parse_dtype
 from chitu.import_utils import try_import_opt_dep
 from chitu.moe import init_moe_impl
+from chitu.boot.arg_utils import calculate_parallelism_sizes
 from chitu.global_vars import (
-    get_multi_inst_world_size,
-    get_world_size_from_config,
+    get_multi_inst_config,
     set_slot_handle,
     set_cuda_device,
 )
@@ -371,62 +371,28 @@ class Backend:
 
         bind_process_to_numa(args.infer.bind_process_to_cpu)
 
-        tensor_parallel_size = args.infer.tp_size
-        pipeline_parallel_size = args.infer.pp_size
-        non_expert_data_parallel_size = args.infer.dp_size
-        expert_parallel_size = args.infer.ep_size
-        expert_tensor_parallel_size = args.infer.etp_size
-        prefill_context_parallel_size = args.infer.pcp_size
+        parallelism_sizes = calculate_parallelism_sizes(args)
         global_rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
-        expected_world_size = get_world_size_from_config(args)
 
-        if prefill_context_parallel_size > 1 and non_expert_data_parallel_size > 1:
-            raise ValueError(
-                "infer.pcp_size > 1 cannot be used with infer.dp_size > 1 yet. "
-                "Prefill CP currently uses the MoE allgather dispatcher group slot, "
-                "so it cannot also express attention DP allgather."
-            )
-
-        if expert_tensor_parallel_size is None:
-            expert_tensor_parallel_size = (
-                tensor_parallel_size
-                * prefill_context_parallel_size
-                * non_expert_data_parallel_size
-                // expert_parallel_size
-            )
-        embed_tokens_lm_head_tp_size = int(args.infer.embed_tokens_lm_head_tp_size)
-        if tensor_parallel_size > 1:
-            assert (
-                embed_tokens_lm_head_tp_size == tensor_parallel_size
-            ), "embed_tokens_lm_head_tp_size must be equal to tensor_parallel_size when tensor_parallel_size > 1"
-        elif non_expert_data_parallel_size > 1:
-            assert (
-                non_expert_data_parallel_size % embed_tokens_lm_head_tp_size == 0
-            ), "non_expert_data_parallel_size must be divisible by embed_tokens_lm_head_tp_size when non_expert_data_parallel_size > 1"
-        else:
-            assert (
-                embed_tokens_lm_head_tp_size == 1
-            ), "embed_tokens_lm_head_tp_size must be 1 when tensor_parallel_size == 1 and non_expert_data_parallel_size == 1"
-
-        if world_size != expected_world_size:
+        if world_size != parallelism_sizes.world_size:
             raise ValueError(
                 f"Inconsistent parallelism: torch distributed world_size({world_size}) "
                 f"does not match the world size implied by infer parallelism "
-                f"({expected_world_size}). Please check infer.tp_size({args.infer.tp_size}), "
+                f"({parallelism_sizes.world_size}). Please check infer.tp_size({args.infer.tp_size}), "
                 f"infer.pcp_size({args.infer.pcp_size}), infer.dp_size({args.infer.dp_size}), "
                 f"infer.pp_size({args.infer.pp_size}), infer.ep_size({args.infer.ep_size}), "
                 f"and infer.etp_size({args.infer.etp_size})."
             )
 
         initialize_parallel_groups(
-            tp_size=tensor_parallel_size,
-            dp_size=non_expert_data_parallel_size,
-            etp_size=expert_tensor_parallel_size,
-            ep_size=expert_parallel_size,
-            pp_size=pipeline_parallel_size,
-            pcp_size=prefill_context_parallel_size,
-            embed_tokens_lm_head_tp_size=embed_tokens_lm_head_tp_size,
+            tp_size=parallelism_sizes.tp_size,
+            dp_size=parallelism_sizes.dp_size,
+            etp_size=parallelism_sizes.etp_size,
+            ep_size=parallelism_sizes.ep_size,
+            pp_size=parallelism_sizes.pp_size,
+            pcp_size=parallelism_sizes.pcp_size,
+            embed_tokens_lm_head_tp_size=parallelism_sizes.embed_tokens_lm_head_tp_size,
         )
         if args.multi_inst.n_insts > 1:
             if args.coordinator.host is None:
@@ -1087,7 +1053,9 @@ class Backend:
         return [
             (inst_id, rank)
             for inst_id in range(args.multi_inst.n_insts)
-            for rank in range(get_multi_inst_world_size(inst_id))
+            for rank in range(
+                calculate_parallelism_sizes(get_multi_inst_config(inst_id)).world_size
+            )
         ]
 
     @staticmethod

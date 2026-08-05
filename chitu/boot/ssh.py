@@ -41,7 +41,7 @@ _FORWARDED_ENV_VARS = [
 ]
 
 
-def ssh(cfg, raw_argv, local_run_callback: LocalRunCallback):
+def ssh(cfg, instance_cfgs, raw_argv, local_run_callback: LocalRunCallback):
     n_nodes = int(cfg.boot.n_nodes)
     node_list = list(cfg.boot.ssh_node_list or [])
     if len(node_list) != n_nodes:
@@ -184,6 +184,7 @@ def ssh(cfg, raw_argv, local_run_callback: LocalRunCallback):
     if multi_instance_enabled(cfg):
         instance_plans = build_instance_launch_plans(
             cfg,
+            instance_cfgs,
             node_list,
             master_port_base=52000,
             rdvz_port_base=53000,
