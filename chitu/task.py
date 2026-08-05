@@ -487,6 +487,8 @@ class Task:
         stop_with_eos: bool = True,
         block_length: int = 32,
     ):
+        from chitu.distributed.pd_disaggregation.pd_scheduler import PDSchedulerInfo
+
         logger.debug(f"Create Task {task_id} with priority {priority}")
 
         # Task meta
@@ -605,7 +607,8 @@ class Task:
         # PD related
         self.pd_prefill_engine_rank: Optional[int] = None
 
-        self.pd_scheduler_info = {}
+        # PD scheduler runtime information
+        self.pd_scheduler_info: PDSchedulerInfo = PDSchedulerInfo()
 
     def set_inc_hit_tokens(self, num: int) -> None:
         # Per-step incremental hit tokens; clamp negatives to avoid metric drift.
