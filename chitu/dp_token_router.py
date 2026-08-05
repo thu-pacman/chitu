@@ -156,7 +156,7 @@ class TokenRouter:
                 else:
                     await asyncio.sleep(0.001)
             except Exception as e:
-                logger.error(f"Error in token receiver[{instance_id}]: {e}")
+                logger.exception(f"Error in token receiver[{instance_id}]")
                 await asyncio.sleep(0.01)
 
     async def _process_token_data(self, token_data: dict[str, Any]):

@@ -12,6 +12,7 @@ import torch
 
 from chitu.backend import Backend
 from chitu.kv_cache.kv_cache import PagedKVCache
+from chitu.task import PackedTasksResult
 from chitu.trace import Trace
 from .base import KVManagerBase, DisaggregationMode
 from .endpoint import PrefillEndpoints, DecodeEndpoints
@@ -200,21 +201,29 @@ class KVManagerPrefill(KVManagerBase):
 
     def send_kv_cache(
         self,
-        first_tokens: torch.Tensor | None,
+        generated_result: PackedTasksResult | None,
         request_ids: list[str],
         num_hit_tokens: list[int],
     ):
         """Send KV cache for multiple requests (Prefill mode).
 
-        Non-last PP stages send KV only with first_tokens=None.
+        Non-last PP stages send KV only with generated_result=None.
+
+        When generated_result is provided, its synced CUDA event is reused as
+        the kv_ready_event — no additional event is recorded.
         """
         logger.debug(f"send_kv_cache {request_ids}")
 
-        if first_tokens is not None:
-            first_tokens = first_tokens.clone().to("cpu", non_blocking=True)
-
-        kv_ready_event = torch.cuda.Event()
-        kv_ready_event.record()
+        if generated_result is not None:
+            event = generated_result.synced
+            if not isinstance(event, torch.cuda.Event):
+                event = torch.cuda.Event()
+                event.record()
+            first_tokens = generated_result.tokens.flatten()
+        else:
+            event = torch.cuda.Event()
+            event.record()
+            first_tokens = None
 
         for i, req_id in enumerate(request_ids):
             info = self._info(req_id)
@@ -225,7 +234,7 @@ class KVManagerPrefill(KVManagerBase):
             first_token = first_tokens[i] if first_tokens is not None else None
             self.executor.submit(
                 self.transfer_worker,
-                kv_ready_event,
+                event,
                 req_id,
                 inst_id,
                 first_token,
