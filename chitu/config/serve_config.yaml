@@ -717,6 +717,11 @@ multi_inst:
     # It addresses the asynchrony in eviction timing between the router and its downstream instances.
     router_evict_buffer_size: 64
 
+    # Used for Prefix cache aware Routing
+    # Release a router-local load reservation if its completion signal does not arrive.
+    # Set to 0 to disable expiration.
+    router_local_reservation_timeout_s: 600
+
 #: Configs how chitu is monitored and logged.
 metrics:
   #: Access prometheus server at this address

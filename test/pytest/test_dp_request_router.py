@@ -33,6 +33,7 @@ def _build_router(algorithm: str = "prefix_cache_aware") -> RequestRouter:
         router_hit_weight=1.0,
         router_load_penalty_weight=0.02,
         router_evict_buffer_size=64,
+        router_local_reservation_timeout_s=600.0,
     )
     router = RequestRouter(cfg)
     return router
@@ -110,6 +111,9 @@ def test_select_scheduler_falls_back_to_lb_when_all_hit_zero():
         )
     )
 
+    router.policy.remember_request(
+        MonkReq("busy", list(range(200))), local_instance_id=0
+    )
     req = MonkReq("req-no-hit", [11, 12, 13, 14])
     # no cached blocks on both instances => fallback to least_loaded (scheduler 1)
     selected = router.policy.select_scheduler(req)
@@ -132,6 +136,20 @@ def test_remember_req_and_insert_req_blocks_and_forget_req():
     router.policy.forget_request(req.request_id)
     assert req.request_id not in router.policy.req_to_request
     assert req.request_id not in router.policy.req_to_scheduler
+
+
+def test_unified_dp_keeps_running_load_until_request_finishes():
+    router = _build_router(algorithm="prefix_cache_aware")
+    req = MonkReq("req-unified", list(range(20)))
+
+    router.policy.remember_request(req, local_instance_id=0)
+    router.policy.forget_request(req.request_id)
+
+    assert router.policy.get_router_load(0) == (1, 0)
+
+    router.policy.remove_request(req.request_id)
+
+    assert router.policy.get_router_load(0) == (0, 0)
 
 
 def test_local_evict_moves_hash_to_buffer():

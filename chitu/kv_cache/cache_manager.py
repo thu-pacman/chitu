@@ -294,11 +294,14 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.identity_runtime_pool.pop(blk_hash, None)
         self.identity_builder.forget_hash(blk_hash)
         multi_inst = getattr(get_global_args(), "multi_inst", None)
+        role = getattr(multi_inst, "role", None)
+        # update evicted_blk_hashes for routers to sync shadow cache in cache-aware routing policy
+        # currently only support multi DP and Prefill-only instance
         if (
             blk_hash is not None
             and multi_inst
             and getattr(multi_inst, "n_insts", 1) > 1
-            and is_independent_multi_inst()
+            and (is_independent_multi_inst() or role == "prefill")
         ):
             self.evicted_blk_hashes.append(blk_hash)
         if (

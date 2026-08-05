@@ -13,7 +13,7 @@ import logging
 import random
 import time
 import traceback
-from collections import deque, OrderedDict
+from collections import defaultdict, deque, OrderedDict
 from dataclasses import dataclass, field
 from chitu.global_vars import (
     get_global_args,
@@ -64,6 +64,13 @@ class SchedulerStats:
     evicted_blk_hashes: list[str] = field(
         default_factory=list
     )  # evicted block hash values returned from the instance
+
+
+@dataclass
+class RouterLoadReservation:
+    local_instance_id: int
+    pending_tokens: int
+    reserved_at: float
 
 
 from chitu.schemas.serve_config import RouterConfig as ServeRouterConfig
@@ -140,6 +147,11 @@ class RoutePolicy:
             f"Updated stats for scheduler {stats.local_instance_id}, stats: {stats}"
         )
 
+    def _running_requests_for_routing(self, local_instance_id: int) -> int:
+        # FIXME: worker currently hard-code running_requests to 0, so this will
+        # always return 0. This fuction should be overrided/prohibited
+        return self.scheduler_stats[local_instance_id].running_requests
+
     def eligible_schedulers(self) -> list[int]:
         """Soft-admission: prefer under-cap alive schedulers; fallback to all alive.
 
@@ -150,11 +162,19 @@ class RoutePolicy:
         for s_id, stats in self.scheduler_stats.items():
             if stats.is_alive:
                 alive.append(s_id)
-                if stats.running_requests < self.max_inflight_per_scheduler:
+                if (
+                    self._running_requests_for_routing(s_id)
+                    < self.max_inflight_per_scheduler
+                ):
                     under_cap.append(s_id)
         return under_cap if under_cap else alive
 
-    def remember_request(self, request: UserRequest, local_instance_id: int) -> None:
+    def remember_request(
+        self,
+        request: UserRequest,
+        local_instance_id: int,
+        pending_tokens: Optional[int] = None,
+    ) -> None:
         pass
 
     def forget_request(self, request_id: str) -> None:
@@ -170,10 +190,105 @@ class LoadBalancer(RoutePolicy):
     def __init__(self, config: ServeRouterConfig):
         super().__init__(config)
         self.round_robin_counter = 0
+        self.last_selected_scheduler_id: Optional[int] = None
         self.w_pending_tokens = float(PENDING_TOKENS_WEIGHT)
+
+        # router maintains its own state to comupte load score
+        self.router_reservations: dict[str, RouterLoadReservation] = {}
+        self.router_running_requests: dict[int, int] = defaultdict(int)
+        self.router_pending_tokens: dict[int, int] = defaultdict(int)
+        self.router_reservation_timeout_s = max(
+            0.0, float(config.router_local_reservation_timeout_s)
+        )
         logger.info(
             f"[LOAD_BALANCER] max_inflight_per_scheduler: {self.max_inflight_per_scheduler}"
         )
+
+    def _running_requests_for_routing(self, local_instance_id: int) -> int:
+        return self.router_running_requests[local_instance_id]
+
+    def _pending_tokens_for_routing(self, local_instance_id: int) -> int:
+        return self.router_pending_tokens[local_instance_id]
+
+    def _reserve_router_load(
+        self, request_id: str, local_instance_id: int, pending_tokens: int
+    ) -> None:
+        self._release_router_reservation(request_id)
+        self.router_reservations[request_id] = RouterLoadReservation(
+            local_instance_id=local_instance_id,
+            pending_tokens=pending_tokens,
+            reserved_at=time.monotonic(),
+        )
+        self.router_running_requests[local_instance_id] += 1
+        self.router_pending_tokens[local_instance_id] += pending_tokens
+
+    def _release_router_reservation(self, request_id: str) -> None:
+        reservation = self.router_reservations.pop(request_id, None)
+        if reservation is None:
+            return
+        local_instance_id = reservation.local_instance_id
+        self.router_running_requests[local_instance_id] -= 1
+        self.router_pending_tokens[local_instance_id] -= reservation.pending_tokens
+
+    def _release_router_pending_tokens(self, request_id: str) -> None:
+        reservation = self.router_reservations.get(request_id)
+        if reservation is None:
+            return
+        local_instance_id = reservation.local_instance_id
+        self.router_pending_tokens[local_instance_id] -= reservation.pending_tokens
+        reservation.pending_tokens = 0
+
+    def _reap_stale_router_reservations(self) -> None:
+        """Clean haning requests that never finish"""
+        if self.router_reservation_timeout_s == 0:
+            return
+        deadline = time.monotonic() - self.router_reservation_timeout_s
+        for request_id, reservation in list(self.router_reservations.items()):
+            if reservation.reserved_at > deadline:
+                continue
+            logger.warning(
+                "[REQUEST_ROUTER] expiring stale router load reservation, "
+                f"request_id={request_id}, local_instance_id={reservation.local_instance_id}, "
+                f"age_s={time.monotonic() - reservation.reserved_at:.1f}"
+            )
+            self._release_router_reservation(request_id)
+
+    def get_router_load(self, local_instance_id: int) -> tuple[int, int]:
+        self._reap_stale_router_reservations()
+        return (
+            self.router_running_requests[local_instance_id],
+            self.router_pending_tokens[local_instance_id],
+        )
+
+    def _estimate_pending_tokens(
+        self, request: UserRequest, local_instance_id: int
+    ) -> int:
+        return len(request.prompt_tokens)
+
+    def remember_request(
+        self,
+        request: UserRequest,
+        local_instance_id: int,
+        pending_tokens: Optional[int] = None,
+    ) -> None:
+        if pending_tokens is None:
+            pending_tokens = self._estimate_pending_tokens(request, local_instance_id)
+        self._reserve_router_load(
+            request.request_id,
+            local_instance_id,
+            pending_tokens,
+        )
+
+    def forget_request(self, request_id: str) -> None:
+        if is_independent_multi_inst():
+            # prefill is done but dp instance still need to do decode task
+            self._release_router_pending_tokens(request_id)
+        else:
+            # prefill is done and prefill instance dont need to do decode task
+            self._release_router_reservation(request_id)
+
+    def remove_request(self, request_id: str):
+        self._release_router_reservation(request_id)
 
     def _round_robin(self, eligible_ids: list[int]) -> int:
         idx = self.round_robin_counter % len(eligible_ids)
@@ -184,10 +299,7 @@ class LoadBalancer(RoutePolicy):
         min_load = float("inf")
         best_scheduler = eligible_ids[0]
         for s_id in eligible_ids:
-            stats = self.scheduler_stats[s_id]
-            load_score = (
-                stats.pending_tokens * self.w_pending_tokens + stats.running_requests
-            )
+            load_score = self._load_score(s_id)
             if load_score < min_load:
                 min_load = load_score
                 best_scheduler = s_id
@@ -197,10 +309,21 @@ class LoadBalancer(RoutePolicy):
         if len(eligible_ids) < 2:
             return eligible_ids[0]
         c1, c2 = random.sample(eligible_ids, 2)
-        s1, s2 = self.scheduler_stats[c1], self.scheduler_stats[c2]
-        load1 = s1.pending_tokens * self.w_pending_tokens + s1.running_requests
-        load2 = s2.pending_tokens * self.w_pending_tokens + s2.running_requests
+        load1 = self._load_score(c1)
+        load2 = self._load_score(c2)
+        logger.info(
+            f"[LOAD_BALANCER] power_of_two_choices: c1={c1}, load1={load1:.3f}; c2={c2}, load2={load2:.3f}"
+        )
+        if load1 == load2 and self.last_selected_scheduler_id in (c1, c2):
+            return c2 if c1 == self.last_selected_scheduler_id else c1
         return c1 if load1 <= load2 else c2
+
+    def _load_score(self, local_instance_id: int) -> float:
+        return self._pending_tokens_for_routing(
+            local_instance_id
+        ) * self.w_pending_tokens + self._running_requests_for_routing(
+            local_instance_id
+        )
 
     def select_scheduler(
         self,
@@ -210,6 +333,7 @@ class LoadBalancer(RoutePolicy):
         algorithm: Optional[str] = None,
     ) -> int:
         """Select scheduler by the configured load-balancing strategy."""
+        self._reap_stale_router_reservations()
         if eligible_ids is None:
             eligible_ids = self.eligible_schedulers()
         if not eligible_ids:
@@ -223,13 +347,16 @@ class LoadBalancer(RoutePolicy):
             algorithm = self.algorithm
 
         if algorithm == "round_robin":
-            return self._round_robin(eligible_ids)
-        if algorithm == "least_loaded":
-            return self._least_loaded(eligible_ids)
-        if algorithm == "power_of_two_choices":
-            return self._power_of_two_choices(eligible_ids)
+            selected_scheduler_id = self._round_robin(eligible_ids)
+        elif algorithm == "least_loaded":
+            selected_scheduler_id = self._least_loaded(eligible_ids)
+        elif algorithm == "power_of_two_choices":
+            selected_scheduler_id = self._power_of_two_choices(eligible_ids)
+        else:
+            raise ValueError(f"Unknown load balance algorithm: {algorithm}")
 
-        raise ValueError(f"Unknown load balance algorithm: {algorithm}")
+        self.last_selected_scheduler_id = selected_scheduler_id
+        return selected_scheduler_id
 
 
 class PrefixCacheAwarePolicy(LoadBalancer):
@@ -319,14 +446,23 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             num_hits += 1
         return num_hits
 
-    def _load_score(self, local_instance_id: int) -> float:
-        stats = self.scheduler_stats.get(local_instance_id)
-        if stats is None:
-            return float("inf")
-        return stats.pending_tokens * PENDING_TOKENS_WEIGHT + stats.running_requests
+    def _estimate_pending_tokens(
+        self, request: UserRequest, local_instance_id: int
+    ) -> int:
+        prompt_tokens = list(request.prompt_tokens)
+        block_size = self.instances_block_size.get(local_instance_id)
+        if not block_size:
+            return len(prompt_tokens)
+        req_blocks = self.build_req_token_blocks(request, local_instance_id)
+        return max(
+            0,
+            len(prompt_tokens)
+            - self.num_hit_blocks(local_instance_id, req_blocks) * block_size,
+        )
 
     def select_scheduler(self, request: UserRequest) -> int:
         """Use prefix-cache score first, fallback to load-balance on zero-hit."""
+        self._reap_stale_router_reservations()
         eligible_ids = self.eligible_schedulers()
         if not eligible_ids:
             raise RuntimeError("No eligible schedulers available for request routing.")
@@ -361,9 +497,16 @@ class PrefixCacheAwarePolicy(LoadBalancer):
                 algorithm=self.cache_miss_fallback_algorithm,
             )
 
+        self.last_selected_scheduler_id = best_scheduler
         return best_scheduler
 
-    def remember_request(self, request: UserRequest, local_instance_id: int) -> None:
+    def remember_request(
+        self,
+        request: UserRequest,
+        local_instance_id: int,
+        pending_tokens: Optional[int] = None,
+    ) -> None:
+        super().remember_request(request, local_instance_id, pending_tokens)
         self.req_to_scheduler[request.request_id] = local_instance_id
         self.req_to_request[request.request_id] = request
 
@@ -396,6 +539,7 @@ class PrefixCacheAwarePolicy(LoadBalancer):
                 self._push_evict_buffer(local_instance_id, evicted_hash)
 
     def forget_request(self, request_id: str) -> None:
+        super().forget_request(request_id)
         self.req_to_request.pop(request_id, None)
         self.req_to_scheduler.pop(request_id, None)
 
@@ -431,6 +575,7 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             )
 
     def remove_request(self, request_id: str):
+        super().remove_request(request_id)
         self.req_to_request.pop(request_id, None)
         self.req_to_scheduler.pop(request_id, None)
 
@@ -706,7 +851,7 @@ class RequestRouter:
                         await self._send_request(local_instance_id, request)
                     except Exception:
                         self.pending_requests.appendleft(request)
-                        self.policy.forget_request(request.request_id)
+                        self.policy.remove_request(request.request_id)
                         await asyncio.sleep(0.001)
                         continue
                     send_time = time.time() - send_start_time
