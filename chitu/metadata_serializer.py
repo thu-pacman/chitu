@@ -395,6 +395,14 @@ class MetadataSerializer:
     ]:
         extra_info = dict()
         msg_dict = msgpack.unpackb(data, raw=False)
+        if not isinstance(msg_dict, dict):
+            raise TypeError(
+                "deserialize_metadata: expected a msgpack dict, got "
+                f"{type(msg_dict).__name__} (data={data!r}). This means a "
+                "non-metadata ZMQ frame was received — e.g. a ROUTER identity or a "
+                "broadcast_data payload interleaved by concurrent socket sends during "
+                "shutdown."
+            )
         msg_format = msg_dict.get("format", "error no format")
         assert msg_format in (
             "PackedTasks",
