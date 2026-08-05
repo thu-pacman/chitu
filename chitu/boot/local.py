@@ -14,7 +14,7 @@ from chitu.boot.multi_instance import (
 logger = getLogger(__name__)
 
 
-def local(cfg, raw_argv, local_run_callback: LocalRunCallback):
+def local(cfg, instance_cfgs, raw_argv, local_run_callback: LocalRunCallback):
     n_nodes = int(cfg.boot.n_nodes)
     if n_nodes > 1:
         raise ValueError(f"boot.n_nodes must be 1 (got {n_nodes}) for local launcher")
@@ -36,6 +36,7 @@ def local(cfg, raw_argv, local_run_callback: LocalRunCallback):
     if multi_instance_enabled(cfg):
         instance_plans = build_instance_launch_plans(
             cfg,
+            instance_cfgs,
             ["127.0.0.1"],
             master_port_base=52000,
             rdvz_port_base=53000,

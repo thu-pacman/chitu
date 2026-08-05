@@ -498,25 +498,6 @@ def create_tensor(data, device, dtype=None, sync_free=True):
     return torch.tensor(data, dtype=dtype, device=device)
 
 
-class AsyncCPUTensor:
-    def __init__(self, tensor: torch.Tensor, clone=False):
-        if clone:
-            # need to clone the tensor if it will be modified before transfer finish
-            tensor = tensor.clone()
-        if tensor.device.type == "cpu":
-            self._tensor = tensor
-            self._event = None
-        else:
-            self._tensor = tensor.to("cpu", non_blocking=True)
-            self._event = torch.cuda.current_stream().record_event()
-
-    def synchronize(self):
-        if self._event:
-            self._event.synchronize()
-            self._event = None
-        return self._tensor
-
-
 def dataclass_to_dict(obj: Any) -> dict[str, Any] | Any:
     """
     将dataclass转为字典，支持field为 dataclass或Union[dataclass, ...] 的嵌套转换

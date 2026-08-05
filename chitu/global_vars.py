@@ -10,6 +10,7 @@ import operator
 import os
 import time
 import functools
+import copy
 from logging import getLogger
 from typing import Any, Optional
 
@@ -17,7 +18,7 @@ import torch
 from omegaconf import OmegaConf
 import re
 
-from chitu.boot.arg_utils import resolve_default_args
+from chitu.boot.arg_utils import apply_multi_inst_override, resolve_default_args
 from chitu.device_type import has_native_fp8
 from chitu.import_utils import try_import_platform_dep, try_import_opt_dep
 from chitu.schemas.serve_config import ServeConfig, StaticConfig
@@ -243,6 +244,13 @@ def resolve_full_default_args(args):
 
     args = resolve_default_args(args)
 
+    if args.infer.device_ids is None:
+        args.infer.device_ids = [i % local_world_size for i in range(world_size)]
+    if len(args.infer.device_ids) != world_size:
+        raise ValueError(
+            f"len(infer.device_ids) ({len(args.infer.device_ids)}) must be equalt to world_size ({world_size})"
+        )
+
     model_resolver = ModelConfigResolver()
     args.models = StaticConfig(
         model_resolver.process_config_dict(args.models, args.models.ckpt_dir)
@@ -394,77 +402,14 @@ def _set_tensorboard_writer(args):
             )
 
 
-def _apply_multi_inst_override(cfg: Any, override_inst_id: Optional[int] = None) -> Any:
-    """Apply a multi-instance override to a config object."""
-    multi_inst = getattr(cfg, "multi_inst", None)
-    if multi_inst is None:
-        return cfg
-
-    normalized_overrides = {
-        int(key): value
-        for key, value in (getattr(multi_inst, "inst_overrides", None) or {}).items()
-    }
-
-    inst_id_value = getattr(multi_inst, "inst_id", None)
-    assert (
-        override_inst_id is not None or inst_id_value is not None
-    ), "multi_inst.inst_id must be set when applying an instance config"
-
-    inst_id = int(inst_id_value if override_inst_id is None else override_inst_id)
-    if inst_id not in normalized_overrides:
-        return cfg
-
-    return OmegaConf.merge(cfg, normalized_overrides[inst_id])
-
-
+@functools.cache
 def get_multi_inst_config(inst_id: int) -> Any:
-    """Return the effective config for one multi-instance."""
+    """Return the resolved effective config for one multi-instance."""
     _ensure_var_is_initialized(_RAW_GLOBAL_ARGS, "global args")
-    return _apply_multi_inst_override(_RAW_GLOBAL_ARGS, override_inst_id=inst_id)
-
-
-def get_world_size_from_config(cfg: Any) -> int:
-    """Return the world size from a config and validate parallelism consistency."""
-    if cfg.infer.etp_size is None:
-        if (
-            cfg.infer.tp_size
-            * cfg.infer.dp_size
-            * cfg.infer.pcp_size
-            % cfg.infer.ep_size
-            != 0
-        ):
-            raise ValueError(
-                f"Inconsistent parallelism: "
-                f"tensor_parallel_size({cfg.infer.tp_size}) "
-                f"* prefill_context_parallel_size({cfg.infer.pcp_size}) "
-                f"* non_expert_data_parallel_size({cfg.infer.dp_size}) "
-                f"should be divisible by expert_parallel_size({cfg.infer.ep_size}) "
-                f"when expert_tensor_parallel_size is not set"
-            )
-        etp_size = (
-            cfg.infer.tp_size * cfg.infer.pcp_size * cfg.infer.dp_size
-        ) // cfg.infer.ep_size
-    else:
-        etp_size = cfg.infer.etp_size
-
-    world_size = (
-        cfg.infer.tp_size * cfg.infer.pcp_size * cfg.infer.dp_size * cfg.infer.pp_size
+    cfg = apply_multi_inst_override(
+        copy.deepcopy(_RAW_GLOBAL_ARGS), override_inst_id=inst_id
     )
-
-    if world_size != etp_size * cfg.infer.ep_size * cfg.infer.pp_size:
-        raise ValueError(
-            f"Inconsistent parallelism: world_size({world_size}) should be equal to "
-            f"expert_tensor_parallel_size({etp_size}) "
-            f"* expert_parallel_size({cfg.infer.ep_size}) "
-            f"* pipeline_parallel_size({cfg.infer.pp_size}) "
-        )
-
-    return world_size
-
-
-def get_multi_inst_world_size(inst_id: int) -> int:
-    """Return the effective torch world size for one multi-instance."""
-    return get_world_size_from_config(get_multi_inst_config(inst_id))
+    return resolve_default_args(StaticConfig(cfg))
 
 
 @functools.cache
@@ -475,7 +420,7 @@ def get_multi_inst_ids_by_role(role: str) -> list[int]:
     base_multi_inst = getattr(base_cfg, "multi_inst", None)
     role_ids = []
     for inst_id in range(int(getattr(base_multi_inst, "n_insts", 1))):
-        cfg = _apply_multi_inst_override(base_cfg, override_inst_id=inst_id)
+        cfg = apply_multi_inst_override(base_cfg, override_inst_id=inst_id)
         multi_inst = getattr(cfg, "multi_inst", None)
         if getattr(multi_inst, "role", "prefill_and_decode") == role:
             role_ids.append(inst_id)
@@ -491,7 +436,7 @@ def _get_effective_multi_inst_roles() -> tuple[str, ...]:
     return tuple(
         getattr(
             getattr(
-                _apply_multi_inst_override(base_cfg, override_inst_id=inst_id),
+                apply_multi_inst_override(base_cfg, override_inst_id=inst_id),
                 "multi_inst",
                 None,
             ),
@@ -542,6 +487,7 @@ def set_global_args(raw_args, need_ensure=True, need_preprocess=True):
         _ensure_var_is_not_initialized(_RAW_GLOBAL_ARGS, "raw global args")
         _ensure_var_is_not_initialized(_GLOBAL_ARGS, "global args")
     _RAW_GLOBAL_ARGS = raw_args
+    get_multi_inst_config.cache_clear()
     get_multi_inst_ids_by_role.cache_clear()
     _get_effective_multi_inst_roles.cache_clear()
 
@@ -550,7 +496,7 @@ def set_global_args(raw_args, need_ensure=True, need_preprocess=True):
         if (multi_inst := getattr(args, "multi_inst", None)) and getattr(
             multi_inst, "inst_id", None
         ) is not None:
-            args = _apply_multi_inst_override(args)
+            args = apply_multi_inst_override(args)
         args = resolve_full_default_args(StaticConfig(args))
     _GLOBAL_ARGS = args
 

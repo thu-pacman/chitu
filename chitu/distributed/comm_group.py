@@ -120,17 +120,17 @@ class CommGroup:
         self.gpu_group = gpu_groups[self.group_id]
         self.all_gpu_groups = gpu_groups  # Expose to get_pp_pair_group call
 
-        if type(self.gpu_group) != SingletonGroupPlaceholder:
-            # fix random graph capture stuck on cm384, in tp2
-            # we need to do a world barrier before dp group barrier in init_zmq
-            self.barrier()
-
         # NOTE: `self.rank_list` is local, which includes only the ranks communicating with
         # the current rank. This is different from `self.rank_lists`.
         self.rank_list: Sequence[int] = rank_lists[self.group_id]
 
         self.rank_in_group = self.rank_list.index(global_rank)
         self.group_size = len(self.rank_list)
+
+        if type(self.gpu_group) != SingletonGroupPlaceholder:
+            # fix random graph capture stuck on cm384, in tp2
+            # we need to do a world barrier before dp group barrier in init_zmq
+            self.barrier()
 
         self.custom_ar_manager = None
         self._enable_custom_allreduce = enable_custom_allreduce
@@ -292,6 +292,8 @@ class CommGroup:
         )
 
     def barrier(self):
+        if self.group_size == 1:
+            return
         torch.distributed.barrier(
             group=self.gpu_group, device_ids=[torch.cuda.current_device()]
         )
@@ -343,9 +345,13 @@ class CommGroup:
         tensor: torch.Tensor,
         dst: int,
     ):
+        if self.group_size == 1:
+            return
         torch.distributed.reduce(tensor, dst=dst, group=self.gpu_group)
 
     def broadcast(self, tensor: torch.Tensor, src: int = 0):
+        if self.group_size == 1:
+            return
         torch.distributed.broadcast(tensor, src=src, group=self.gpu_group)
 
     def scatter(
@@ -355,6 +361,8 @@ class CommGroup:
         src: int = 0,
         group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        if self.group_size == 1:
+            return
         torch.distributed.scatter(tensor, scatter_list, src=src, group=group)
 
     def gather(
@@ -363,12 +371,18 @@ class CommGroup:
         gather_list: Optional[list[torch.Tensor]] = None,
         dst: int = 0,
     ):
+        if self.group_size == 1:
+            return
         torch.distributed.gather(tensor, gather_list, dst=dst, group=self.gpu_group)
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if self.group_size == 1:
+            return
         torch.distributed.all_gather_into_tensor(output, input, group=self.gpu_group)
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if self.group_size == 1:
+            return
         torch.distributed.reduce_scatter_tensor(output, input, group=self.gpu_group)
 
     # use for token dispatcher

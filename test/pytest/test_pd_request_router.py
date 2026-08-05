@@ -188,6 +188,7 @@ def _pd_router_config(
         router_hit_weight=1.0,
         router_load_penalty_weight=0.02,
         router_evict_buffer_size=64,
+        router_local_reservation_timeout_s=600.0,
     )
 
 
@@ -282,7 +283,7 @@ def test_pd_prefill_prefix_among_prefers_higher_hit_prefill_with_real_block_size
     assert policy.select_scheduler(req) == 1
 
 
-def test_pd_prefill_prefix_among_fallback_least_loaded_when_no_hits():
+def test_pd_prefill_prefix_fallback_uses_router_local_load_when_no_hits():
     cfg = _pd_router_config(routing_algorithm="prefix_cache_aware")
     policy = PrefixCacheAwarePolicy(cfg)
 
@@ -313,8 +314,41 @@ def test_pd_prefill_prefix_among_fallback_least_loaded_when_no_hits():
         )
     )
 
-    req = MockReq("r2", [11, 12, 13, 14])
+    req = MockReq("r-worker-load", [11, 12, 13, 14])
+    assert policy.select_scheduler(req) == 0
+
+    policy.remember_request(MockReq("busy", list(range(200))), local_instance_id=0)
+    req = MockReq("r-router-load", [21, 22, 23, 24])
     assert policy.select_scheduler(req) == 1
+
+
+def test_pd_prefill_prefix_releases_router_load_on_first_token():
+    cfg = _pd_router_config(routing_algorithm="prefix_cache_aware")
+    policy = PrefixCacheAwarePolicy(cfg)
+    for local_instance_id in (0, 1):
+        policy.update_stats(
+            SchedulerStats(
+                local_instance_id=local_instance_id,
+                running_requests=0,
+                waiting_requests=0,
+                pending_tokens=0,
+                throughput_tokens_per_sec=0.0,
+                last_update_time=0.0,
+                is_alive=True,
+                num_blocks=8,
+                block_size=4,
+            )
+        )
+
+    req = MockReq("r-local", list(range(20)))
+    policy.remember_request(req, local_instance_id=0)
+
+    assert policy.get_router_load(0) == (1, 20)
+    assert policy.select_scheduler(MockReq("r-next", [100, 101, 102, 103])) == 1
+
+    policy.forget_request(req.request_id)
+
+    assert policy.get_router_load(0) == (0, 0)
 
 
 def test_pd_load_balancer_least_loaded_with_eligible_subset():
@@ -343,6 +377,8 @@ def test_pd_load_balancer_least_loaded_with_eligible_subset():
             is_alive=True,
         )
     )
+
+    policy.remember_request(MockReq("busy", list(range(20))), local_instance_id=0)
 
     req = MockReq("lb", [])
     assert policy.select_scheduler(req, eligible_ids=[0, 1]) == 1

@@ -334,6 +334,25 @@ class PDSchedulerService:
             f"connected to stats port {stats_port}"
         )
 
+    async def _wait_for_terminate(self, timeout: float = 300.0) -> None:
+        """Wait until the main loop has broadcast TerminateBackend.
+
+        The terminate_engine handler only sets the ``Terminating`` flag; the actual
+        ``chitu_terminate()`` → ``step(TerminateBackend)`` runs on the main
+        ``process_queue`` loop at a step boundary (where the loop is not holding any
+        ZMQ socket), so it never races this thread. Once the main loop sets
+        ``Backend.state = Terminated``, drain is complete and we can send the ack.
+        """
+        deadline = asyncio.get_running_loop().time() + timeout
+        while Backend.state != BackendState.Terminated:
+            if asyncio.get_running_loop().time() > deadline:
+                logger.warning(
+                    "timed out waiting for main loop to terminate backend; "
+                    "sending termination ack anyway"
+                )
+                break
+            await asyncio.sleep(0.1)
+
     def _log_termination_drain_state(self, reason: str) -> None:
         """Debug-only dump of local state that can block PD termination ack."""
         if not logger.isEnabledFor(logging.DEBUG):
@@ -458,7 +477,12 @@ class PDSchedulerService:
                             "Terminate_engine received. Draining in-flight requests"
                         )
                         if TaskPool.all_finished():
-                            chitu_terminate()
+                            # Do NOT call chitu_terminate() from this thread: the
+                            # scheduler service thread and the main process_queue loop
+                            # would then race on the non-thread-safe ZMQ sockets.
+                            # Only write the Terminating flag here; the main loop
+                            # executes chitu_terminate() at a step boundary.
+                            await self._wait_for_terminate()
                             await self._send_termination_ack()
                             self.running = False
                             break

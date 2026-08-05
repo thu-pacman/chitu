@@ -208,6 +208,7 @@ class RouterConfig:
     router_hit_weight: float = MISSING
     router_load_penalty_weight: float = MISSING
     router_evict_buffer_size: int = MISSING
+    router_local_reservation_timeout_s: float = MISSING
     launch_timeout: float = MISSING
 
 

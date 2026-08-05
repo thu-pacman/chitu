@@ -25,59 +25,6 @@ if has_triton_impl:
 
 
 @make_op_dispatcher
-def multinomial(
-    probs: torch.Tensor,
-    num_samples: int,
-    seq_groups: Optional[list] = None,
-    impl: str = "auto",
-) -> torch.Tensor:
-    raise NotImplementedError
-
-
-@multinomial.register_auto
-def _auto_multinomial():
-    return "torch"
-
-
-@multinomial.register("torch")
-def _multinomial_torch(
-    probs: torch.Tensor, num_samples: int, seq_groups: Optional[list] = None
-) -> torch.Tensor:
-    return torch.multinomial(probs, num_samples)
-
-
-@multinomial.register("sync-free")
-def _multinomial_sync_free(
-    probs: torch.Tensor,
-    num_samples: int,
-    seq_groups: Optional[list] = None,
-) -> torch.Tensor:
-    # Adapted from
-    # https://github.com/vllm-project/vllm/blob/4577fc9abb064d74b2082ffc5005cbb82ca91766/vllm/model_executor/layers/sampler.py#L527
-    # SPDX-SnippetBegin
-    # SPDX-License-Identifier: Apache-2.0
-    # SPDX-SnippetCopyrightText: 2025 vLLM Team
-    # SDPX—SnippetName: _multinomial from vllm
-    if num_samples > 1:
-        probs = probs.repeat_interleave(num_samples, dim=0)
-    q = torch.empty_like(probs)
-    if seq_groups is None:
-        q.exponential_()
-    else:
-        sample_idx = 0
-        for seq_group in seq_groups:
-            seq_ids = seq_group.seq_ids
-            stride = len(seq_ids) * num_samples
-            assert seq_group.generator is not None
-            q[sample_idx : sample_idx + stride].exponential_(
-                generator=seq_group.generator
-            )
-            sample_idx += stride
-    # SPDX-SnippetEnd
-    return probs.div_(q).argmax(dim=1).view(-1, num_samples)
-
-
-@make_op_dispatcher
 def apply_frequency_penalty(
     logits: torch.Tensor,
     indices: list[int],
@@ -262,53 +209,225 @@ def apply_bitmask(logits: torch.Tensor, bitmask: torch.Tensor, indices: list[int
     return xgrammar.apply_token_bitmask_inplace(logits, bitmask, indices=indices)
 
 
+def filter_logits_top_k_top_p(
+    logits: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    max_top_k: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply top-k truncation + top-p filtering, return renormalized reduced-space probs.
+
+    Steps:
+      1. torch.topk(logits, k=max_top_k) — restrict to top-k candidates
+      2. Mask positions >= top_k[b] with -inf
+      3. softmax over reduced space
+      4. Mask cumulative mass > top_p[b] to 0
+      5. Mask cumulative mass > top_p[b] to 0
+
+    Note: probs are NOT renormalized after filtering. Gumbel-max is scale-invariant
+    and compute_mtp_acceptance / resample_mtp_rejected require q and p on comparable scales.
+
+    Returns:
+        filtered_probs: (N, max_top_k)  unnormalized filtered probabilities
+        token_ids:      (N, max_top_k)  original vocab indices from topk
+    """
+    if max_top_k is None:
+        max_top_k = logits.shape[-1]
+
+    logits, token_ids = torch.topk(logits, k=max_top_k, dim=-1)  # reduce calculation
+    topk_mask = (
+        torch.arange(max_top_k, device=logits.device)[None, :] >= top_ks[:, None]
+    )
+    logits[topk_mask] = float("-inf")
+    # topp is applied on filtered probs by topk
+
+    probs = torch.softmax(logits, dim=-1)
+    topp_mask = (torch.cumsum(probs, dim=-1) - probs) > top_ps[:, None]
+    probs[topp_mask] = 0
+
+    return probs, token_ids
+
+
+def gumbel_max_sample(
+    probs: torch.Tensor,
+    token_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Sample one token per row via Gumbel-max trick.
+
+    probs need not be normalized; argmax(probs / exponential_noise) is
+    equivalent to multinomial sampling from the normalized distribution.
+    """
+    noise = torch.empty_like(probs).exponential_()
+    sample_idx = (probs / noise).argmax(dim=-1)
+    return torch.gather(token_ids, index=sample_idx[:, None], dim=1).squeeze(1)
+
+
+def scatter_probs_to_vocab(
+    probs: torch.Tensor,
+    token_ids: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Scatter reduced-space (N, K) probabilities into full (N, vocab_size) tensor."""
+    result = torch.zeros(
+        probs.shape[0], vocab_size, dtype=probs.dtype, device=probs.device
+    )
+    result.scatter_(-1, token_ids, probs)
+    return result
+
+
 def top_k_top_p_min_p_sampling_from_logits(
     logits: torch.Tensor,
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
-    # TODO: Support min_ps
+    max_top_k: int | None = None,
 ):
-    """A top-k, top-p and min-p sampling implementation."""
+    filtered_probs, token_ids = filter_logits_top_k_top_p(
+        logits, top_ks, top_ps, max_top_k=max_top_k
+    )
+    return gumbel_max_sample(filtered_probs, token_ids)
 
-    if is_ascend() and has_torch_npu:
-        assert logits.dim() == 2
-        assert (
-            top_ps.shape[0] == logits.shape[0]
-        ), f"top_ps.shape[0]={top_ps.shape[0]} didn't match logits.shape[0]={logits.shape[0]}"
-        assert (
-            top_ks.shape[0] == logits.shape[0]
-        ), f"top_ks.shape[0]={top_ks.shape[0]} didn't match logits.shape[0]={logits.shape[0]}"
-        top_ps = top_ps.to(torch.float)
-        top_ks = top_ks.to(torch.int32)
-        probs = torch.softmax(logits, dim=-1)
-        probs = torch_npu.npu_top_k_top_p(probs, top_ps, top_ks)
-        sampled_index = multinomial(probs, num_samples=1, impl="sync-free").view(-1)
-        return sampled_index
 
-    # SPDX-SnippetBegin
-    # SPDX-License-Identifier: Apache-2.0
-    # SPDX-SnippetCopyrightText: 2025 SGLang Team
-    # SPDX—SnippetName: top_k_top_p_min_p_sampling_from_logits_torch
-    #
-    # This sampling implementation is originally from SGLang
-    # (https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/sampler.py),
-    # licensed under Apache 2.0.
-    probs = torch.softmax(logits, dim=-1)
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    # TODO: Support min_ps like: min_p_thresholds = probs_sort[:, 0] * min_ps
+def compute_mtp_acceptance(
+    q: torch.Tensor,
+    p: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    exact_match: torch.Tensor,
+    greedy_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-depth acceptance for MTP rejection sampling.
 
-    top_p_mask = (probs_sum - probs_sort) > top_ps.view(-1, 1)
-    top_k_mask = torch.arange(0, probs.shape[-1], device=probs.device).view(
-        1, -1
-    ) >= top_ks.view(-1, 1)
-    if is_ascend():
-        probs_sort *= ~(top_p_mask | top_k_mask)
-    else:
-        probs_sort[top_p_mask | top_k_mask] = 0.0
-    # TODO: Support min_ps like:  probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
-    probs_sort.div_(probs_sort.max(dim=-1, keepdim=True)[0])
-    sampled_index = multinomial(probs_sort, num_samples=1, impl="sync-free")
-    batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
-    return batch_next_token_ids
-    # SPDX-SnippetEnd
+    For greedy requests (greedy_mask[b] == True):
+        accepted = exact_match  (sampled_token == draft)
+    For non-greedy requests:
+        accepted = (rand < min(1, q(d)/p(d)))
+
+    Args:
+        q:           (bs, n_drafts, vocab)  target softmax distribution (with temperature)
+        p:           (bs, n_drafts, vocab)  draft softmax distribution (no temperature)
+        draft_tokens:(bs, n_drafts)         draft token ids (from MTP layers)
+        exact_match: (bs, n_drafts) bool    sampled_token == draft token
+        greedy_mask: (bs,) bool             which requests are greedy
+
+    Returns:
+        accepted:       (bs, n_drafts) bool  per-depth acceptance
+        accept_indices: (bs,) long            first rejected depth, or n_drafts if all accepted
+    """
+    bs, n_drafts, _ = q.shape
+    mtp_size = n_drafts + 1
+
+    # Probabilistic acceptance for non-greedy:
+    #   q(d): target probability of the draft token
+    #   p(d): draft probability of the draft token
+    q_d = q.gather(-1, draft_tokens.unsqueeze(-1)).squeeze(-1)  # (bs, n_drafts)
+    p_d = p.gather(-1, draft_tokens.unsqueeze(-1)).squeeze(-1)  # (bs, n_drafts)
+    accept_prob = torch.clamp(q_d / p_d, max=1.0)  # min(1, q(d)/p(d))
+    rand = torch.rand(bs, n_drafts, device=q.device)
+    prob_accepted = rand < accept_prob  # (bs, n_drafts)
+
+    # Per-request dispatch: exact_match for greedy, prob_accepted for non-greedy
+    greedy_exp = greedy_mask.unsqueeze(-1).expand(bs, n_drafts)
+    accepted = torch.where(greedy_exp, exact_match, prob_accepted)
+
+    # First rejected depth → accept_indices
+    accept_indices = torch.argmin(accepted.int(), dim=1)
+    accept_indices[accepted.all(dim=1)] = mtp_size - 1
+
+    return accepted, accept_indices
+
+
+def resample_mtp_rejected(
+    tokens: torch.Tensor,
+    q_all_probs: torch.Tensor,
+    q_all_token_ids: torch.Tensor,
+    p: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    accept_indices: torch.Tensor,
+    greedy_mask: torch.Tensor,
+    mtp_size: int,
+) -> torch.Tensor:
+    """Resample rejected positions and finalize accepted positions for MTP.
+
+    tokens[:, 0] is always the target model output — never verified, never touched.
+    Verification happens on tokens[:, 1:] (positions N+1..N+mtp_size-1) against
+    draft_tokens.
+
+    Accepted draft positions (depth d < accept_indices[b]) MUST emit the DRAFT
+    token (not the target-sampled token): the KV cache and MTP layers advance
+    based on the draft tokens that were accepted.  Rejected positions are
+    resampled from norm(max(0, q - p)).
+
+    Args:
+        tokens:         (bs, mtp_size)          in/out — sampled token ids
+        q_all_probs:    (bs*mtp_size, K)        filtered target probs (all positions)
+        q_all_token_ids:(bs*mtp_size, K)        token indices from top-k
+        p:              (bs, n_drafts, V)       draft softmax (positions 1..n_drafts)
+        draft_tokens:   (bs, n_drafts)          draft token ids (what was accepted)
+        accept_indices: (bs,) long              first rejected draft depth, or n_drafts if all accepted
+        greedy_mask:    (bs,) bool
+        mtp_size:       int
+
+    Returns:
+        tokens: (bs, mtp_size)  updated token ids
+    """
+    bs = tokens.shape[0]
+    n_drafts = mtp_size - 1
+    K = q_all_probs.shape[-1]
+    device = q_all_probs.device
+
+    q_probs_3d = q_all_probs.view(bs, mtp_size, K)
+    q_token_ids_3d = q_all_token_ids.view(bs, mtp_size, K)
+
+    # ---- q for rejection positions 1..mtp_size-1 (= n_drafts positions) ----
+    q_probs = q_probs_3d[:, 1:].reshape(bs * n_drafts, K)
+    q_token_ids = q_token_ids_3d[:, 1:].reshape(bs * n_drafts, K)
+
+    # ---- gather p at q_token_ids positions ----
+    p_flat = p.reshape(bs * n_drafts, -1)  # (bs*n_drafts, V)
+    p_reduced = p_flat.gather(-1, q_token_ids).view(bs, n_drafts, K)
+
+    # ---- residual = max(0, q - p) ----
+    residual = torch.clamp(q_probs.view(bs, n_drafts, K) - p_reduced, min=0)
+    residual_sum = residual.sum(dim=-1)  # (bs, n_drafts)
+
+    # ---- Gumbel-max samples ----
+    res_sample = gumbel_max_sample(
+        residual.reshape(bs * n_drafts, K),
+        q_token_ids,
+    ).view(bs, n_drafts)
+
+    q_fallback = gumbel_max_sample(
+        q_probs.view(bs, n_drafts, K).reshape(bs * n_drafts, K),
+        q_token_ids,
+    ).view(bs, n_drafts)
+
+    bonus_sample = gumbel_max_sample(
+        q_probs_3d[:, n_drafts],
+        q_token_ids_3d[:, n_drafts],
+    )  # (bs,)
+
+    # ---- select residual or q-fallback ----
+    rejection_sample = torch.where(
+        residual_sum > 0,
+        res_sample,
+        q_fallback,
+    )  # (bs, n_drafts)
+
+    # ---- masks ----
+    depths = torch.arange(n_drafts, device=device)[None, :]  # (1, n_drafts)
+    # Accepted depth d: d < accept_indices[b] (all depths before the first rejection)
+    accept_mask = depths < accept_indices[:, None]  # (bs, n_drafts)
+    reject_mask = ~greedy_mask[:, None] & (
+        accept_indices[:, None] == depths
+    )  # (bs, n_drafts)
+    bonus_mask = ~greedy_mask & (accept_indices == n_drafts)  # (bs,)
+
+    # ---- apply updates ----
+    # 1. Accepted draft positions → emit the DRAFT token (KV/MTP advance on drafts)
+    # 2. Rejected position → resampled token
+    # 3. All accepted → bonus token from q_last
+    tokens_out = tokens.clone()
+    tokens_out[:, 1:] = torch.where(accept_mask, draft_tokens, tokens[:, 1:])
+    tokens_out[:, 1:] = torch.where(reject_mask, rejection_sample, tokens_out[:, 1:])
+    tokens_out[:, n_drafts] = torch.where(bonus_mask, bonus_sample, tokens[:, n_drafts])
+
+    return tokens_out

@@ -132,18 +132,20 @@ class MooncakeKVTransferHook:
         if tasks.num_tasks == 0 and not DPTaskCollector.available():
             return
 
-        first_tokens = None
+        generated_result = None
         if isinstance(tasks, PackedTasks) and tasks.generated_result is not None:
-            first_tokens = tasks.generated_result.tokens.flatten()
+            generated_result = tasks.generated_result
 
         # Send KV cache and first-token metadata to decode side.
         if tasks.num_tasks > 0:
             req_ids_output = tasks.output_task_ids
             request_cached_tokens = {}
-            for t in getattr(tasks, "output_tasks", []):
-                if t is None or getattr(t, "req", None) is None:
+            for task in getattr(tasks, "output_tasks", []):
+                if task is None or getattr(task, "req", None) is None:
                     continue
-                request_cached_tokens[str(t.req.request_id)] = int(t.req.num_hit_tokens)
+                request_cached_tokens[str(task.req.request_id)] = int(
+                    task.req.num_hit_tokens
+                )
             num_hit_tokens = [
                 request_cached_tokens.get(rid, 0) for rid in req_ids_output
             ]
@@ -152,7 +154,7 @@ class MooncakeKVTransferHook:
                     logger.debug(
                         f"[Trace data] ({rid}): prefill_send_num_hit_tokens={hit_tokens}"
                     )
-            if first_tokens is None:
+            if generated_result is None:
                 # 看到该日志表示：该 rank 只传输 KV Cache（不包含首 token）
                 logger.debug(f"[KVHook] sending KV-only for requests: {req_ids_output}")
             else:
@@ -172,7 +174,7 @@ class MooncakeKVTransferHook:
                 )
 
             self.kv_manager.send_kv_cache(
-                first_tokens=first_tokens,
+                generated_result=generated_result,
                 request_ids=req_ids_output,
                 num_hit_tokens=num_hit_tokens,
             )

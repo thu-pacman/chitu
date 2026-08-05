@@ -487,6 +487,8 @@ class Task:
         stop_with_eos: bool = True,
         block_length: int = 32,
     ):
+        from chitu.distributed.pd_disaggregation.pd_scheduler import PDSchedulerInfo
+
         logger.debug(f"Create Task {task_id} with priority {priority}")
 
         # Task meta
@@ -605,7 +607,8 @@ class Task:
         # PD related
         self.pd_prefill_engine_rank: Optional[int] = None
 
-        self.pd_scheduler_info = {}
+        # PD scheduler runtime information
+        self.pd_scheduler_info: PDSchedulerInfo = PDSchedulerInfo()
 
     def set_inc_hit_tokens(self, num: int) -> None:
         # Per-step incremental hit tokens; clamp negatives to avoid metric drift.
@@ -989,16 +992,44 @@ class PackedTasksResult:
     """ token_idxs, (bs, vocab_size) of int32 """
     logits: torch.Tensor | None = None
     """ logits, (bs, vocab_size) of int32 """
+    synced: bool | torch.cuda.Event = False
+    """ False: data on gpu; True: data on cpu; Event: data is transferring to cpu and need synchronize """
 
-    def cpu(self):
-        to_cpu = lambda t: t.cpu() if t is not None else None
-        return PackedTasksResult(
+    def _sync(self, non_blocking: bool):
+        to_cpu = lambda t: (
+            t.to("cpu", non_blocking=non_blocking) if t is not None else None
+        )
+        result = PackedTasksResult(
             tokens=to_cpu(self.tokens),
             accept_indices=to_cpu(self.accept_indices),
             logprobs=to_cpu(self.logprobs),
             token_idxs=to_cpu(self.token_idxs),
             logits=to_cpu(self.logits),
         )
+        result.synced = (
+            torch.cuda.current_stream().record_event() if non_blocking else True
+        )
+        return result
+
+    def start_sync(self):
+        if self.synced is not False:
+            return self
+        return self._sync(True)
+
+    def finish_sync(self):
+        assert self.synced is not False
+        if self.synced is True:
+            return self
+        self.synced.synchronize()
+        self.synced = True
+        return self
+
+    def sync(self):
+        if self.synced is True:
+            return self
+        elif self.synced is False:
+            return self._sync(False)
+        return self.finish_sync()
 
     @cached_property
     def accepted_tokens(self) -> list[list[int]]:
@@ -1100,6 +1131,7 @@ class PackedTasks(PackedTasksBase):
 
         # user request related
         self.generated_result: PackedTasksResult | None = None
+        self.generated_result_device: PackedTasksResult | None = None
 
         if not task_ids:  # empty PackedTasks, only dp/dp+pp use this method
             self.task_type = (
@@ -1233,7 +1265,8 @@ class TaskCollector:
     _total_waiting_steps: int = -1
     _waiting_queue: Deque[Optional[PackedTasks]] = deque()
     _last_batch_results: list[BatchResult] = []
-    _update_task_ids: list[str] = []
+    _update_task_ids: set[str] = set()
+    _postprocess_tasks: PackedTasks | None = None
 
     @staticmethod
     def init(length: int):
@@ -1259,18 +1292,19 @@ class TaskCollector:
 
     # Running tasks
     @staticmethod
-    def collect(new_tasks: Optional[PackedTasks] = None) -> PackedTasks | None:
+    def step(new_tasks: Optional[PackedTasks] = None):
         if not TaskCollector.available():
             return None
 
         if not isinstance(new_tasks, PackedTasks):
             new_tasks = None
         if len(TaskCollector._waiting_queue) == 0:
-            return new_tasks
+            TaskCollector._postprocess_tasks = new_tasks
+            return
         collect_tasks = TaskCollector._waiting_queue[-1]
         TaskCollector._waiting_queue.rotate()
         TaskCollector._waiting_queue[0] = new_tasks
-        return collect_tasks
+        TaskCollector._postprocess_tasks = collect_tasks
 
     @staticmethod
     def pop():
@@ -1297,29 +1331,25 @@ class TaskCollector:
         TaskCollector._last_batch_results.append(result)
 
     @staticmethod
-    def process_last_batch_results(current_tasks: PackedTasks):
+    def process_last_batch_results(_):
         for tasks in TaskCollector._last_batch_results:
             Backend.executor.postprocess_async_part(tasks)
         TaskCollector._last_batch_results.clear()
 
     # Update (remove taskpool & remove kvcache)
     @staticmethod
-    def set_update_task_ids(task_ids: list[str]):
-        TaskCollector._update_task_ids = task_ids
-
-    @staticmethod
     def get_update_task_ids():
         task_ids = TaskCollector._update_task_ids
-        TaskCollector._update_task_ids = []
-        return task_ids
+        TaskCollector._update_task_ids = set()
+        return list(task_ids)
 
     @staticmethod
     def add_update_task_ids(task_ids: list[str]):
-        if len(TaskCollector._update_task_ids) == 0:
-            TaskCollector._update_task_ids = task_ids
-        else:
-            task_ids_set = set(task_ids) | set(TaskCollector._update_task_ids)
-            TaskCollector._update_task_ids = list(task_ids_set)
+        TaskCollector._update_task_ids.update(task_ids)
+
+    @staticmethod
+    def get_postprocess_tasks():
+        return TaskCollector._postprocess_tasks
 
 
 class DPTaskCollector:

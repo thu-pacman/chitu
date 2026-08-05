@@ -28,7 +28,7 @@ def run_capture(cmd):
     ).stdout
 
 
-def srun(cfg, raw_argv, local_run_callback: LocalRunCallback):
+def srun(cfg, instance_cfgs, raw_argv, local_run_callback: LocalRunCallback):
     job_name = (
         cfg.boot.job_name
         if cfg.boot.job_name is not None
@@ -177,6 +177,7 @@ def srun(cfg, raw_argv, local_run_callback: LocalRunCallback):
 
         instance_plans = build_instance_launch_plans(
             cfg,
+            instance_cfgs,
             hostnames,
             master_port_base=(slurm_job_id % 10000) + 52000,
             rdvz_port_base=(slurm_job_id % 10000) + 53000,

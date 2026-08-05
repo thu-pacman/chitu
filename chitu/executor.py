@@ -544,7 +544,7 @@ class PipeDispatcher(TasksDispatcher):
         if tasks._test_flag:
             result.logits = irecv((bs, vocab_size), torch.float32)
 
-        tasks.generated_result = result
+        tasks.generated_result_device = result
         handle = _AsyncResultHandle(recv_works, recv_tensors)
         tasks._pp_result_recv_handle = handle
         return handle
@@ -575,7 +575,7 @@ class PipeDispatcher(TasksDispatcher):
             )
             send_tensors.append(tensor)
 
-        result = tasks.generated_result
+        result = tasks.generated_result_device
         isend(result.tokens)
         if Backend.executor.mtp_size > 1 and tasks.task_type == TaskType.Decode:
             isend(result.accept_indices)
@@ -877,10 +877,7 @@ class ExpertDataDispatcher(TasksDispatcher):
         """
 
         if self.is_main_rank:
-            if dp_tasks is None:
-                dp_tasks = DPTaskCollector.get_last_packedtasks()
-            if dp_tasks is None:
-                raise RuntimeError("Missing DP task metadata while collecting results")
+            dp_tasks = DPTaskCollector.get_last_packedtasks()
             merged_results = self._create_empty_recv_results(dp_tasks)
             merged = dataclass_to_dict(merged_results)
 
@@ -1106,19 +1103,32 @@ class Executor:
             # For pp last stage:
             # sync postprocess before PP receive will cause ACL stream synchronize failed with error code:107020
             # TODO: fix this bug and move postprocess_sync_part in front of model run
+            if self.has_schedule_overlap:
+                self.process_queue = [
+                    self.model_run,
+                ]
+            else:
+                self.process_queue = [
+                    self.model_run,
+                    self.postprocess_send_pp_result,
+                    self.postprocess_update_sampler,
+                ]
+        elif not self.has_schedule_overlap:
+            # normal step
             self.process_queue = [
                 self.model_run,
+                self.postprocess_send_pp_result,
+                TaskCollector.process_last_batch_results,
+                self.postprocess_sync_part,
+                self.postprocess_update_sampler,
             ]
         else:
-            model_part = [self.model_run]
-            sync_part = [self.postprocess_sync_part]
-            token_send_part = [TaskCollector.process_last_batch_results]
-            if not self.has_schedule_overlap:
-                # normal step
-                self.process_queue = model_part + token_send_part + sync_part
-            else:
-                # step with overlap
-                self.process_queue = sync_part + model_part + token_send_part
+            # step with overlap
+            self.process_queue = [
+                self.postprocess_sync_part,
+                self.model_run,
+                TaskCollector.process_last_batch_results,
+            ]
 
     def _prepend_dispatcher(self, dispatcher: TasksDispatcher):
         self.task_dispatchers.insert(0, dispatcher)
@@ -1334,6 +1344,9 @@ class Executor:
                         TaskPool.remove(task_id)
             return payload_type
 
+        if self.is_main_rank:
+            TaskCollector.step(tasks)
+
         process_queue = self.process_queue
         from chitu.serve.common import begin_profiler_step, end_profiler_step
 
@@ -1395,8 +1408,9 @@ class Executor:
         7. Notifies the KV transfer hook after prefill for PD disaggregation.
         """
         if tasks.payload_type == SerializedPackedTasksPayloadType.Empty:
-            if not self.is_pp_first_stage:
-                self._collect_task_and_pp_results(tasks)
+            if self.has_schedule_overlap:
+                self.postprocess_send_pp_result(None)
+                self.postprocess_update_sampler(None)
             return
 
         if self.moe_impl is not None:
@@ -1442,9 +1456,14 @@ class Executor:
             if self.rank == 0:
                 for task in update_tasks.output_tasks:
                     task.has_unsync_new_token = True
+                    if self.has_schedule_overlap:
+                        task.update_decode_status([])
 
         if self.is_sample_rank and self.model_type != ModelType.LLADA2:
-            tasks.generated_result = self.sampler.sample(out, tasks)
+            if self.has_schedule_overlap:
+                self.postprocess_update_sampler(None)
+            tasks.generated_result_device = self.sampler.sample(out, tasks)
+            tasks.generated_result = tasks.generated_result_device.start_sync()
 
         # For DLLM: convert finished block results into BatchResults
         if self.model_type == ModelType.LLADA2:
@@ -1620,8 +1639,8 @@ class Executor:
                 should_recv_tp_hiddens,
             )
 
-        if not self.is_pp_first_stage:
-            self._collect_task_and_pp_results(tasks)
+        if self.has_schedule_overlap:
+            self.postprocess_send_pp_result(None)
 
         self.timers("prefill").start()
         out = Backend.model.prefill(
@@ -1697,10 +1716,13 @@ class Executor:
         else:
             payload = self._prepare_hiddens(tasks)
 
-        if not self.is_pp_first_stage:
-            self._collect_task_and_pp_results(tasks)
+        if self.has_schedule_overlap:
+            self.postprocess_send_pp_result(None)
 
         self.timers("decode").start()
+        if self.mtp_size > 1 and tasks.num_tasks > 0 and self.is_sample_rank:
+            # Sample rank prepares draft proposal params; model broadcasts them on tp_group.
+            self.sampler.prepare_model_input(tasks)
         out = Backend.model.decode(payload)
         self.timers("decode").stop()
 
@@ -1973,13 +1995,10 @@ class Executor:
             return
         block_tasks = self._pending_dllm_block
         self._pending_dllm_block = None
-        if block_tasks is None:
+        if block_tasks is None or block_tasks.generated_result is None:
             return
-        result = block_tasks.generated_result
-        if result is None:
-            return
-        result = result.cpu().tokens
-        block_length = result.shape[1]
+        all_tokens = block_tasks.generated_result.sync().tokens
+        block_length = all_tokens.shape[1]
         tasks_list = block_tasks.tasks
         skip_prompt_tokens = getattr(
             block_tasks, "skip_prompt_tokens", [0] * len(tasks_list)
@@ -1992,7 +2011,7 @@ class Executor:
             skip = skip_prompt_tokens[i]
             if skip >= block_length:
                 continue
-            tokens = result[i, skip:].tolist()
+            tokens = all_tokens[i, skip:].tolist()
             task.update_response_sync(tokens)
             task.update_decode_status(tokens)
             if task.req is not None:
@@ -2009,6 +2028,24 @@ class Executor:
             else:
                 task.req.notify_server_data_added_threadsafe()
         TaskCollector.add_update_task_ids(block_tasks.task_ids)
+
+    def postprocess_send_pp_result(self, _):
+        if self.is_sample_rank and self.pipe_dispatcher:
+            if self._pd_prefill_only:
+                # Prefill node send tokens at pp last stage in `on_prefill_done`
+                return
+            # send pp result
+            tasks = TaskCollector.get_postprocess_tasks()
+            if tasks is not None:
+                self.pipe_dispatcher.send_results(tasks)
+
+    def postprocess_update_sampler(self, _):
+        if self.is_sample_rank and self.model_type != ModelType.LLADA2:
+            # update sampler by syned tokens
+            tasks = TaskCollector.get_postprocess_tasks()
+            if tasks is not None:
+                tasks.generated_result.finish_sync()
+                self.sampler.update_results(tasks)
 
     def _can_async_pp_results(self):
         return (
@@ -2169,23 +2206,28 @@ class Executor:
         ready_tasks.append(tasks)
         return ready_tasks
 
-    def _collect_task_and_pp_results(
-        self, tasks: PackedTasksBase
-    ) -> PackedTasks | list[PackedTasks] | None:
-        """collect tasks to run `postprocess_sync_part` at this step, send/recv pp results if needed"""
-        current_tasks = tasks
-        tasks = TaskCollector.collect(tasks)
-        if self.pipe_dispatcher:
-            if self._can_async_pp_results():
-                return self._collect_async_pp_result_tasks(tasks, current_tasks)
-            async_result = (
-                self.has_schedule_overlap
-                and self.pipe_dispatcher.is_last_stage
-                and tasks is not None
-                and tasks.task_type == TaskType.Prefill
-            )
-            self.pipe_dispatcher.collect_results(tasks, async_result=async_result)
-        return tasks
+    # FIXME: enable async pp result — _collect_task_and_pp_results was
+    # superseded by the inline TaskCollector.step / postprocess_send_pp_result /
+    # postprocess_sync_part decomposition.  Keep the body as reference when
+    # async PP result collection is re-enabled.
+    # @staticmethod
+    # def _collect_task_and_pp_results(
+    #     self, tasks: PackedTasksBase
+    # ) -> PackedTasks | list[PackedTasks] | None:
+    #     """collect tasks to run `postprocess_sync_part` at this step, send/recv pp results if needed"""
+    #     current_tasks = tasks
+    #     tasks = TaskCollector.collect(tasks)
+    #     if self.pipe_dispatcher:
+    #         if self._can_async_pp_results():
+    #             return self._collect_async_pp_result_tasks(tasks, current_tasks)
+    #         async_result = (
+    #             self.has_schedule_overlap
+    #             and self.pipe_dispatcher.is_last_stage
+    #             and tasks is not None
+    #             and tasks.task_type == TaskType.Prefill
+    #         )
+    #         self.pipe_dispatcher.collect_results(tasks, async_result=async_result)
+    #     return tasks
 
     def _update_token_statistics(
         self,
@@ -2210,44 +2252,24 @@ class Executor:
             return tasks
 
         dp_tasks = getattr(tasks, "_dp_result_metadata", None)
-        if (
-            self.rank == 0
-            and self._can_async_pp_results()
-            and not self._pd_prefill_only
-            and dp_tasks is None
-        ):
-            raise RuntimeError("Async PP result is missing its bound DP task metadata")
+        # FIXME: enable async pp result
+        # if (
+        #     self.rank == 0
+        #     and self._can_async_pp_results()
+        #     and not self._pd_prefill_only
+        #     and dp_tasks is None
+        # ):
+        #     raise RuntimeError("Async PP result is missing its bound DP task metadata")
 
         dp_results = self.dp_dispatcher.collect_results(
             tasks.generated_result, dp_tasks=dp_tasks
         )
         if self.rank == 0:
-            if dp_tasks is None:
-                dp_tasks = DPTaskCollector.get_last_packedtasks()
-            if dp_tasks is None:
-                raise RuntimeError("Missing DP task metadata while updating results")
-            tasks = dp_tasks
+            tasks = DPTaskCollector.get_last_packedtasks()
             tasks.generated_result = dp_results
         return tasks
 
-    def _update_pd_num_hit_tokens(self, pd_num_hit_tokens: dict[str, int]):
-        for task_id, num_hit_tokens in pd_num_hit_tokens.items():
-            task = TaskPool.pool.get(task_id)
-            if task is not None:
-                task.req.num_hit_tokens = max(task.req.num_hit_tokens, num_hit_tokens)
-
-    def _predict_tasks_stop_after_this_step(self, tasks: PackedTasks):
-        """predict tasks may stop after this step when schedule overlap"""
-        if len(tasks.output_tasks) == 0:
-            return
-
-        # when schedule overlap, tokens generated later in this step may cause stop by length
-        for task in tasks.output_tasks:
-            task.has_unsync_new_token = True
-            task.update_decode_status([])
-        TaskCollector.add_update_task_ids(tasks.output_task_ids)
-
-    def postprocess_sync_part(self, current_tasks: PackedTasksBase):
+    def postprocess_sync_part(self, _):
         """
         schedule -> model -> sample -> ***sync*** -> send
 
@@ -2255,62 +2277,41 @@ class Executor:
 
         After synchronizing, collect result across dp workers to dp main rank and update tasks.
         """
-        collected_tasks = self._collect_task_and_pp_results(current_tasks)
-        if isinstance(collected_tasks, list):
-            ready_tasks = collected_tasks
-        elif collected_tasks is None:
-            ready_tasks = []
-        else:
-            ready_tasks = [collected_tasks]
         if self.model_type == ModelType.LLADA2:
             # dllm use `_process_dllm_block_results`
             return
         if not self.is_dp_rank:
             return
-
         if self._pd_prefill_only:
-            if self.rank == 0 and DPTaskCollector.available():
-                dp_tasks = DPTaskCollector.get_last_packedtasks()
-                ready_tasks = [] if dp_tasks is None else [dp_tasks]
-            TaskCollector.add_update_task_ids(
-                [task_id for tasks in ready_tasks for task_id in tasks.output_task_ids]
-            )
+            # Prefill node send tokens at pp last stage in `on_prefill_done`
             return
 
-        update_task_ids: list[str] = []
-        pd_cached_hit_tokens: dict[str, int] = {}
-        for tasks in ready_tasks:
-            assert isinstance(tasks, PackedTasks)
-            assert tasks.generated_result is not None
+        tasks = TaskCollector.get_postprocess_tasks()
+        if tasks is None:
+            return
 
-            tasks.generated_result = tasks.generated_result.cpu()
+        if self.pipe_dispatcher:
+            self.pipe_dispatcher.recv_results(tasks)
+            tasks.generated_result = tasks.generated_result_device.sync()
+        else:
+            tasks.generated_result = tasks.generated_result.finish_sync()
 
-            accept_indices_list = (
-                [int(v) for v in tasks.generated_result.accept_indices.tolist()]
-                if tasks.generated_result.accept_indices is not None
-                else None
-            )
-            self._update_token_statistics(tasks, accept_indices_list)
-            tasks.batch_update_mtp_accept_index(accept_indices_list)
-            tasks = self._dp_collect_result(tasks)
-            tasks.batch_update_response_sync()
-
-            if self.rank == 0:
-                self._update_pd_num_hit_tokens(pd_cached_hit_tokens)
-                tasks.batch_update_test_result()
-                TaskCollector.append_to_last_batch_results(tasks.create_batch_result())
-                tasks.batch_update_decode_status()
-                update_task_ids.extend(tasks.output_task_ids)
+        accept_indices_list = (
+            [int(v) for v in tasks.generated_result.accept_indices.tolist()]
+            if tasks.generated_result.accept_indices is not None
+            else None
+        )
+        self._update_token_statistics(tasks, accept_indices_list)
+        tasks.batch_update_mtp_accept_index(accept_indices_list)
+        tasks = self._dp_collect_result(tasks)
+        tasks.batch_update_response_sync()
 
         if self.rank != 0:
             return
 
-        TaskCollector.add_update_task_ids(update_task_ids)
-
-        if self.has_schedule_overlap and current_tasks.task_type != TaskType.Special:
-            if self.dp_dispatcher:
-                current_tasks = DPTaskCollector.get_total_packedtasks()
-            self._predict_tasks_stop_after_this_step(current_tasks)
+        tasks.batch_update_test_result()
+        TaskCollector.append_to_last_batch_results(tasks.create_batch_result())
+        tasks.batch_update_decode_status()
 
     def postprocess_async_part(self, batch_result: BatchResult) -> None:
         """

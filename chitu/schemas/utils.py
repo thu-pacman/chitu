@@ -40,24 +40,20 @@ class ModelConfigResolver:
     def __init__(self):
         self._config_cache: dict[str, dict[str, Any]] = {}
 
-    def resolve_config_value(self, value: Any, ckpt_dir: Optional[str] = None) -> Any:
+    def resolve_config_value(self, value: Any, ckpt_dir: str) -> Any:
         match = re.match(r"^\$\(config\.json:([^)]+)\)$", str(value))
         if not match:
             return value
 
         field_name = match.group(1)
 
-        if not ckpt_dir:
-            logger.warning(
-                f"Cannot resolve config value '{value}': ckpt_dir not provided"
-            )
-            return value
+        if not Path(ckpt_dir).is_dir():
+            raise ValueError(f"Invalid ckpt_dir '{ckpt_dir}': not a directory")
 
         try:
             config_data = self._load_config_json(ckpt_dir)
             if config_data is None:
-                logger.warning(f"Cannot load config file: {ckpt_dir}/config.json")
-                return value
+                raise RuntimeError(f"Cannot load config file: {ckpt_dir}/config.json")
 
             # Support nested fields, such as "model.num_layers"
             field_parts = field_name.split(".")
@@ -67,17 +63,15 @@ class ModelConfigResolver:
                 if isinstance(result, dict) and part in result:
                     result = result[part]
                 else:
-                    logger.warning(
+                    raise RuntimeError(
                         f"Config field '{field_name}' does not exist in config.json"
                     )
-                    return value
 
             logger.info(f"Read config from config.json: {field_name} = {result}")
             return result
 
         except Exception as e:
-            logger.warning(f"Error parsing config value '{value}': {e}")
-            return value
+            raise RuntimeError(f"Error parsing config value '{value}'") from e
 
     def _load_config_json(self, ckpt_dir: str) -> Optional[dict[str, Any]]:
 

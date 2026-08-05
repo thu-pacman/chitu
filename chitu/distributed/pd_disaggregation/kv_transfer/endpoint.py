@@ -14,6 +14,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 TCP_ENDPOINT = "tcp://{}:{}"
+ZMQ_HIGH_WATER_MARK = 10000
 
 
 class KVManagerEndpoint:
@@ -46,7 +47,7 @@ class KVManagerEndpoint:
         )
 
         self._pub_socket = self.zmq_ctx.socket(zmq.PUB)
-        self._pub_socket.setsockopt(zmq.SNDHWM, 10000)
+        self._pub_socket.setsockopt(zmq.SNDHWM, ZMQ_HIGH_WATER_MARK)
         pub_port = self._pub_socket.bind_to_random_port(bind_addr)
         set_endpoint(self.role, self.name + "_pub", self.ip, pub_port)
         self._pub_socket.setsockopt(zmq.LINGER, 0)
@@ -55,7 +56,7 @@ class KVManagerEndpoint:
         self.socket = self.zmq_ctx.socket(zmq.SUB)
         self.socket.setsockopt(zmq.SUBSCRIBE, b"")
         self.socket.connect(TCP_ENDPOINT.format(self.ip, pub_port))
-        self.socket.setsockopt(zmq.RCVHWM, 10000)
+        self.socket.setsockopt(zmq.RCVHWM, ZMQ_HIGH_WATER_MARK)
 
     def init_slave(self):
         """init receiver on slave rank"""
@@ -63,7 +64,7 @@ class KVManagerEndpoint:
         self.socket = self.zmq_ctx.socket(zmq.SUB)
         self.socket.setsockopt(zmq.SUBSCRIBE, b"")
         self.socket.connect(endpoint)
-        self.socket.setsockopt(zmq.RCVHWM, 10000)
+        self.socket.setsockopt(zmq.RCVHWM, ZMQ_HIGH_WATER_MARK)
 
     def init_remote(self):
         """init sender on any rank"""

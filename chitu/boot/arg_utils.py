@@ -2,13 +2,118 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional, Sequence, List
+from dataclasses import dataclass
+from typing import Any, Optional, Sequence, List
 from logging import getLogger
+
+from omegaconf import OmegaConf
+
 import sys
 import os
 import re
 
 logger = getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ParallelismSizes:
+    tp_size: int
+    pp_size: int
+    dp_size: int
+    ep_size: int
+    etp_size: int
+    pcp_size: int
+    embed_tokens_lm_head_tp_size: int
+    world_size: int
+
+
+def apply_multi_inst_override(cfg: Any, override_inst_id: Optional[int] = None) -> Any:
+    """Apply the selected multi-instance override to a config object."""
+    multi_inst = getattr(cfg, "multi_inst", None)
+    if multi_inst is None:
+        return cfg
+
+    normalized_overrides = {
+        int(key): value
+        for key, value in (getattr(multi_inst, "inst_overrides", None) or {}).items()
+    }
+
+    inst_id_value = getattr(multi_inst, "inst_id", None)
+    assert (
+        override_inst_id is not None or inst_id_value is not None
+    ), "multi_inst.inst_id must be set when applying an instance config"
+
+    inst_id = int(inst_id_value if override_inst_id is None else override_inst_id)
+    if inst_id not in normalized_overrides:
+        return cfg
+
+    return OmegaConf.merge(cfg, normalized_overrides[inst_id])
+
+
+def calculate_parallelism_sizes(cfg: Any) -> ParallelismSizes:
+    """Return the derived parallelism sizes and validate their consistency."""
+    tp_size = int(cfg.infer.tp_size)
+    pp_size = int(cfg.infer.pp_size)
+    dp_size = int(cfg.infer.dp_size)
+    ep_size = int(cfg.infer.ep_size)
+    pcp_size = int(cfg.infer.pcp_size)
+
+    if pcp_size > 1 and dp_size > 1:
+        raise ValueError(
+            "infer.pcp_size > 1 cannot be used with infer.dp_size > 1 yet. "
+            "Prefill CP currently uses the MoE allgather dispatcher group slot, "
+            "so it cannot also express attention DP allgather."
+        )
+
+    raw_etp_size = cfg.infer.etp_size
+    if raw_etp_size is None:
+        if tp_size * pcp_size * dp_size % ep_size != 0:
+            raise ValueError(
+                f"Inconsistent parallelism: "
+                f"tensor_parallel_size({tp_size}) "
+                f"* prefill_context_parallel_size({pcp_size}) "
+                f"* non_expert_data_parallel_size({dp_size}) "
+                f"should be divisible by expert_parallel_size({ep_size}) "
+                f"when expert_tensor_parallel_size is not set"
+            )
+        etp_size = tp_size * pcp_size * dp_size // ep_size
+    else:
+        etp_size = int(raw_etp_size)
+
+    embed_tokens_lm_head_tp_size = int(cfg.infer.embed_tokens_lm_head_tp_size)
+    if tp_size > 1:
+        assert (
+            embed_tokens_lm_head_tp_size == tp_size
+        ), "embed_tokens_lm_head_tp_size must be equal to tensor_parallel_size when tensor_parallel_size > 1"
+    elif dp_size > 1:
+        assert (
+            dp_size % embed_tokens_lm_head_tp_size == 0
+        ), "non_expert_data_parallel_size must be divisible by embed_tokens_lm_head_tp_size when non_expert_data_parallel_size > 1"
+    else:
+        assert (
+            embed_tokens_lm_head_tp_size == 1
+        ), "embed_tokens_lm_head_tp_size must be 1 when tensor_parallel_size == 1 and non_expert_data_parallel_size == 1"
+
+    world_size = tp_size * pcp_size * dp_size * pp_size
+
+    if world_size != etp_size * ep_size * pp_size:
+        raise ValueError(
+            f"Inconsistent parallelism: world_size({world_size}) should be equal to "
+            f"expert_tensor_parallel_size({etp_size}) "
+            f"* expert_parallel_size({ep_size}) "
+            f"* pipeline_parallel_size({pp_size}) "
+        )
+
+    return ParallelismSizes(
+        tp_size=tp_size,
+        pp_size=pp_size,
+        dp_size=dp_size,
+        ep_size=ep_size,
+        etp_size=etp_size,
+        pcp_size=pcp_size,
+        embed_tokens_lm_head_tp_size=embed_tokens_lm_head_tp_size,
+        world_size=world_size,
+    )
 
 
 def args_as_list(args) -> List[str]:
@@ -66,15 +171,6 @@ def _check_checkpoint_path(args):
 
 
 def resolve_default_args(args):
-    if "WORLD_SIZE" in os.environ and "LOCAL_WORLD_SIZE" in os.environ:
-        # Inside torchrun. May or may not launched by chitu.boot
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
-    else:
-        # Launching with chitu.boot
-        world_size = args.boot.n_nodes * args.boot.n_gpus_per_node
-        local_world_size = args.boot.n_gpus_per_node
-
     ###################################################################
     # Deal with legacy arguments
     if hasattr(args.infer, "soft_fp8") and args.infer.soft_fp8:
@@ -137,13 +233,6 @@ def resolve_default_args(args):
 
     if args.boot.interactive_node_0 == "auto":
         args.boot.interactive_node_0 = sys.stdout.isatty() and args.boot.n_nodes == 1
-
-    if args.infer.device_ids is None:
-        args.infer.device_ids = [i % local_world_size for i in range(world_size)]
-    if len(args.infer.device_ids) != world_size:
-        raise ValueError(
-            f"len(infer.device_ids) ({len(args.infer.device_ids)}) must be equalt to world_size ({world_size})"
-        )
 
     if args.infer.prefill_chunk_size == "auto":
         # prefill_chunk_size is the GLOBAL budget across all DP and CP ranks.

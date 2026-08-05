@@ -5,10 +5,11 @@
 import functools
 import threading
 from dataclasses import dataclass
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from omegaconf import DictConfig, OmegaConf
 
+from chitu.boot.arg_utils import calculate_parallelism_sizes
 from chitu.boot.local_run_base import LocalRunCallback
 
 
@@ -56,24 +57,9 @@ def _override_device_ids(inst_override):
     return infer_override.get("device_ids")
 
 
-def _effective_inst_cfg(cfg: DictConfig, inst_id: int) -> DictConfig:
-    if cfg.multi_inst.inst_overrides is None:
-        return cfg
-    overrides = OmegaConf.to_container(cfg.multi_inst.inst_overrides, resolve=True)
-    override = {int(k): v for k, v in overrides.items()}.get(inst_id)
-    if override is None:
-        return cfg
-    return OmegaConf.merge(cfg, override)
-
-
-def _world_size_for_instance(cfg: DictConfig, inst_id: int) -> int:
-    inst_cfg = _effective_inst_cfg(cfg, inst_id)
-    infer = inst_cfg.infer
-    return int(infer.tp_size) * int(infer.pp_size) * int(infer.dp_size)
-
-
 def build_instance_launch_plans(
     cfg: DictConfig,
+    instance_cfgs: Sequence[Any],
     node_addrs: Sequence[str],
     master_port_base: int,
     rdvz_port_base: int,
@@ -85,7 +71,7 @@ def build_instance_launch_plans(
     plans: list[InstanceLaunchPlan] = []
     slot = 0
     for inst_id in range(n_insts):
-        world_size = _world_size_for_instance(cfg, inst_id)
+        world_size = calculate_parallelism_sizes(instance_cfgs[inst_id]).world_size
         assert world_size >= 1
 
         remaining_on_node = n_gpus_per_node - (slot % n_gpus_per_node)

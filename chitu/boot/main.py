@@ -6,12 +6,25 @@
 
 import os
 import sys
-import hydra
-from hydra.core.config_store import ConfigStore
-from omegaconf import DictConfig
+import copy
+
+try:
+    import hydra
+    from hydra.core.config_store import ConfigStore
+    from omegaconf import DictConfig
+    import requests
+    import netifaces
+except ImportError:
+    print(
+        "chitu.boot is missing required dependencies. Install them with:\n"
+        "    pip3 install -r ./boot/requirements.txt",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
 from logging import getLogger
 
-from chitu.boot.arg_utils import resolve_default_args
+from chitu.boot.arg_utils import apply_multi_inst_override, resolve_default_args
 from chitu.boot.local import local
 from chitu.boot.srun import srun
 from chitu.boot.ssh import ssh
@@ -38,6 +51,23 @@ cs = ConfigStore.instance()
 cs.store(name="serve_config_schema", node={})
 
 
+def _resolve_instance_cfgs(cfg: DictConfig) -> list[DictConfig]:
+    if int(cfg.multi_inst.n_insts) > 1 and cfg.infer.device_ids is not None:
+        raise ValueError(
+            "Setting global infer.device_ids is not supported when using multiple "
+            "instances (multi_inst.n_insts > 1); it is overridden per-instance by the "
+            "launcher. Set device IDs per-instance via "
+            "multi_inst.inst_overrides.<id>.infer.device_ids instead."
+        )
+    instance_cfgs = []
+    for inst_id in range(int(cfg.multi_inst.n_insts)):
+        inst_cfg = apply_multi_inst_override(
+            copy.deepcopy(cfg), override_inst_id=inst_id
+        )
+        instance_cfgs.append(resolve_default_args(inst_cfg))
+    return instance_cfgs
+
+
 @hydra.main(
     version_base=None,
     config_path=(
@@ -48,6 +78,7 @@ cs.store(name="serve_config_schema", node={})
     config_name="serve_config",
 )
 def main(cfg: DictConfig):
+    instance_cfgs = _resolve_instance_cfgs(cfg)
     cfg = resolve_default_args(cfg)
 
     local_run_callback: LocalRunCallback
@@ -68,11 +99,11 @@ def main(cfg: DictConfig):
             local_run_callback = apptainer_run
 
     if cfg.boot.remote_launcher == "local":
-        local(cfg, raw_argv, local_run_callback)
+        local(cfg, instance_cfgs, raw_argv, local_run_callback)
     elif cfg.boot.remote_launcher == "srun":
-        srun(cfg, raw_argv, local_run_callback)
+        srun(cfg, instance_cfgs, raw_argv, local_run_callback)
     elif cfg.boot.remote_launcher == "ssh":
-        ssh(cfg, raw_argv, local_run_callback)
+        ssh(cfg, instance_cfgs, raw_argv, local_run_callback)
     else:
         raise NotImplementedError(
             f"Unrecognized remote launcher: {cfg.boot.remote_launcher}"

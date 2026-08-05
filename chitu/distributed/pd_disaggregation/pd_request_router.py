@@ -69,6 +69,17 @@ def _policy_stats(policy, local_instance_id: int) -> str:
     stats = getattr(policy, "scheduler_stats", {}).get(local_instance_id)
     if stats is None:
         return "stats=missing"
+    if isinstance(policy, LoadBalancer):
+        router_running, router_pending_tokens = policy.get_router_load(
+            local_instance_id
+        )
+        return (
+            f"alive={stats.is_alive} running={stats.running_requests} "
+            f"waiting={stats.waiting_requests} "
+            f"pending_tokens={stats.pending_tokens} "
+            f"router_running={router_running} "
+            f"router_pending_tokens={router_pending_tokens}"
+        )
     return (
         f"alive={stats.is_alive} running={stats.running_requests} "
         f"waiting={stats.waiting_requests} pending_tokens={stats.pending_tokens}"
@@ -419,6 +430,14 @@ class PDRequestRouter(RequestRouter):
                         continue
 
                     instance_id = get_multi_inst_ids_by_role(role)[local_instance_id]
+                    evicted_blk_hashes = stats_dict.get("evicted_blk_hashes", [])
+                    if evicted_blk_hashes:
+                        logger.debug(
+                            "[PD_ROUTER][evict_stats] role=%s sid=%s count=%s",
+                            role,
+                            local_instance_id,
+                            len(evicted_blk_hashes),
+                        )
                     if stats_dict.get("terminated", False):
                         self._drain_complete[instance_id] = True
 
@@ -438,7 +457,7 @@ class PDRequestRouter(RequestRouter):
                         max_seq_len=stats_dict.get("max_seq_len", None),
                         num_blocks=stats_dict.get("num_blocks", None),
                         block_size=stats_dict.get("block_size", None),
-                        evicted_blk_hashes=stats_dict.get("evicted_blk_hashes", []),
+                        evicted_blk_hashes=evicted_blk_hashes,
                     )
                     policy.update_stats(stats)
                     stats_log_key = (role, local_instance_id)
@@ -572,6 +591,11 @@ class PDRequestRouter(RequestRouter):
             )
 
             self.prefill_policy.remember_request(request, prefill_scheduler_id)
+            self.decode_policy.remember_request(
+                request,
+                decode_scheduler_id,
+                pending_tokens=0,
+            )
 
             # Put request into processing queue
             self.pending_requests.append(pd_request)

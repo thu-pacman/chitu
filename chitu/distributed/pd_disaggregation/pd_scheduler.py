@@ -17,6 +17,7 @@ from enum import Enum
 from collections import OrderedDict
 from logging import getLogger
 from typing import Any, Optional, TYPE_CHECKING
+from dataclasses import dataclass, field
 
 import torch
 import msgpack
@@ -111,6 +112,67 @@ class PDSchedulerMode(Enum):
     PREFILL_ONLY = "prefill_only"
     DECODE_ONLY = "decode_only"
     UNIFIED = "unified"  # traditional mode
+
+
+@dataclass
+class PDSchedulerInfo:
+    """PD Scheduler per-task state information."""
+
+    # Common fields
+    created_ts: float = field(default_factory=time.time)  # Request creation timestamp
+    last_log_ts: float = 0.0  # Last log timestamp
+
+    # Prefill-only fields
+    _transfer_info_start_ts: float = 0.0  # Transfer info wait start timestamp
+
+    # Decode-only fields
+    last_prepare_ts: float = 0.0  # Last KV prepare timestamp
+    prealloc_tokens: int = 0  # Number of tokens preallocated
+    timeout_logged: bool = False  # Whether timeout warning has been logged
+    _prealloc_start_ts: float = 0.0  # Prealloc stage start timestamp
+
+    # Calculate the time elapsed since task creation.
+    def time_since_task_created(self, now: float) -> float:
+        return now - self.created_ts
+
+    # When the time since the last log entry is ≥interval second and the waiting time has reached ≥interval second, update the timestamp and return True
+    def should_refresh_log(self, now: float, interval: float = 1.0) -> bool:
+        if (now - self.last_log_ts) >= interval and self.time_since_task_created(
+            now
+        ) >= interval:
+            self.last_log_ts = now
+            return True
+        return False
+
+    # Record the start timestamp for observing a stage.
+    def begin_observe_stage(self, stage: str):
+        setattr(self, f"_{stage}_start_ts", time.monotonic())
+
+    # Record the elapsed time for the observed stage.
+    # For prefill, this measures the time spent waiting for transfer_info from decode.
+    # For decode, this measures the time spent waiting for kv_cache from prefill.
+    def finish_observe_stage(self, role, stage):
+        start = getattr(self, f"_{stage}_start_ts")
+        if start > 0:
+            observe_stage_duration(
+                role,
+                stage,
+                time.monotonic() - start,
+            )
+
+    # Check whether the task has exceeded the timeout.
+    def check_if_timeout(
+        self, now: float, timeout: float, if_log_once: bool = False
+    ) -> bool:
+        if timeout <= 0:
+            return False
+        if self.time_since_task_created(now) < timeout:
+            return False
+        if if_log_once:
+            if self.timeout_logged:
+                return False
+            self.timeout_logged = True
+        return True
 
 
 class PDInstanceRequestManager:
@@ -369,13 +431,6 @@ class PDInstanceRequestManager:
         task.status = TaskStatus.PDDecodeIncoming
         TaskPool.enqueue(task)
 
-        info = {
-            "created_ts": time.time(),
-            "last_log_ts": 0.0,
-            "last_prepare_ts": 0.0,
-        }
-        task.pd_scheduler_info = info
-
         decode_info["status"] = PDRequestStatus.KV_TRANSFERRING
         logger.debug(
             f"[PD_QUEUE][decode.enqueue] req_id={request_id} cache_owner={target_dp_rank}"
@@ -534,17 +589,11 @@ class PrefillOnlyManager(PDInstanceRequestManager):
         request_id = str(request_data["request_id"])
         original_request = request_data["request"]
 
-        info = {
-            "request": original_request,
-            "created_ts": time.time(),
-            "last_log_ts": 0.0,
-        }
-
         task = self._create_task_from_request(original_request, enqueue=False)
         if task.req.save_trace_dir:
             self.kv_manager.update_trace_info(request_id, task.req.trace_data)
         task.status = TaskStatus.PDPrefillIncoming
-        task.pd_scheduler_info = info
+
         TaskPool.enqueue(task)
 
         # 该日志表示 Prefill scheduler 已接收该请求，但尚未进入 prefill executor.step 流程
@@ -581,50 +630,37 @@ class PrefillOnlyManager(PDInstanceRequestManager):
                 continue
 
             info = task.pd_scheduler_info
+            time_since_task_created = info.time_since_task_created(now)
 
-            info["_transfer_info_start_ts"] = time.monotonic()
+            info.begin_observe_stage("transfer_info")
             logger.debug(f"[PD_STAGE][prefill.transfer_info.start] req_id={rid}")
             logger.debug(
                 f"[PD_QUEUE][prefill.move] incoming->bootstrap_wait req_id={rid}"
             )
 
             if not self.kv_manager.is_decode_allocated(rid):
-                last_log_ts = float(info.get("last_log_ts", 0.0))
-                created_ts = float(info.get("created_ts", now))
-                waited = now - created_ts
-                if (now - last_log_ts) >= 1.0 and waited >= 1.0:
-                    info["last_log_ts"] = now
+                if info.should_refresh_log(now, 10.0):
                     logger.debug(
                         f"[PD_BOOTSTRAP][prefill.wait] still waiting DecodeAllocated: req_id={rid} "
-                        f"waited={waited:.1f}s"
+                        f"waited={time_since_task_created:.1f}s"
                     )
-                if (
-                    self._bootstrap_timeout_s > 0
-                    and waited >= self._bootstrap_timeout_s
-                ):
+                if info.check_if_timeout(now, self._bootstrap_timeout_s):
                     # FIXME: log every 10 seconds
                     logger.warning(
-                        f"[PD_BOOTSTRAP][prefill.backpressure] req_id={rid} waited={waited:.1f}s "
+                        f"[PD_BOOTSTRAP][prefill.backpressure] req_id={rid} waited={time_since_task_created:.1f}s "
                         f"threshold={self._bootstrap_timeout_s:.1f}s"
                     )
                 continue
 
             task.status = TaskStatus.AvailableForSchedule
 
-            created_ts = float(info.get("created_ts", now))
-            waited = now - created_ts
-            # Record transfer_info_wait stage duration
-            _ti_start = float(info.get("_transfer_info_start_ts", 0))
-            if _ti_start > 0:
-                observe_stage_duration(
-                    "prefill", "transfer_info_wait", time.monotonic() - _ti_start
-                )
-            if waited > 5.0:
+            info.finish_observe_stage("prefill", "transfer_info")
+            if info.check_if_timeout(now, 5.0):
                 logger.warning(
-                    f"[PD_SLOW] prefill.transfer_info_wait req_id={rid} waited={waited:.1f}s"
+                    f"[PD_SLOW] prefill.transfer_info_wait req_id={rid} waited={time_since_task_created:.1f}s"
                 )
             logger.debug(
-                f"[PD_QUEUE][prefill.ready] req_id={rid} DecodeAllocated ready waited={waited:.1f}s"
+                f"[PD_QUEUE][prefill.ready] req_id={rid} DecodeAllocated ready waited={time_since_task_created:.1f}s"
             )
             logger.debug(f"[PD_STAGE][prefill.transfer_info.end] req_id={rid}")
 
@@ -690,7 +726,7 @@ class DecodeOnlyManager(PDInstanceRequestManager):
         if task.status != TaskStatus.PDDecodePrealloc:
             return
         info = task.pd_scheduler_info
-        prealloc_tokens = int(info.pop("prealloc_tokens", 0))
+        prealloc_tokens = info.prealloc_tokens
         if prealloc_tokens <= 0:
             return
         self._decode_prealloc_tokens_inflight = max(
@@ -738,6 +774,16 @@ class DecodeOnlyManager(PDInstanceRequestManager):
 
         return super().stop_request(request_id, force_stop, timeout)
 
+    def _increace_prealloc_tokens_inflight_by_dp(
+        self, required_tokens: int, target_dp_rank: int
+    ):
+        self._decode_prealloc_tokens_inflight += required_tokens
+        if 0 <= target_dp_rank < len(self._decode_prealloc_tokens_inflight_by_dp):
+            self._decode_prealloc_tokens_inflight_by_dp[
+                target_dp_rank
+            ] += required_tokens
+        self._decode_prealloc_promoted_total += 1
+
     def _decode_check_and_promote(self):
         from chitu.scheduler import KVCacheCapacityStatus
 
@@ -775,6 +821,7 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 break
 
             info = task.pd_scheduler_info
+            time_since_task_created = info.time_since_task_created(now)
             target_dp_rank = int(task.dp_rank)
             prefix_len = int(getattr(task, "prefix_tokens_len", 0))
             required_tokens = max(
@@ -813,29 +860,22 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 dp_rank=task.dp_rank,
                 decode_cached_tokens=num_cached_tokens,
             )
-            info["last_prepare_ts"] = now
-            if float(info.get("first_prepare_ts", 0.0)) <= 0.0:
-                info["first_prepare_ts"] = now
-            info["prealloc_tokens"] = required_tokens
-            info["target_dp_rank"] = target_dp_rank
+            info.last_prepare_ts = now
+            info.prealloc_tokens = required_tokens
 
             task.status = TaskStatus.PDDecodePrealloc
 
-            self._decode_prealloc_tokens_inflight += required_tokens
-            if 0 <= target_dp_rank < len(self._decode_prealloc_tokens_inflight_by_dp):
-                self._decode_prealloc_tokens_inflight_by_dp[
-                    target_dp_rank
-                ] += required_tokens
-            self._decode_prealloc_promoted_total += 1
-            created_ts = float(info.get("created_ts", now))
-            waited = now - created_ts
-            info["_prealloc_start_ts"] = time.monotonic()
+            self._increace_prealloc_tokens_inflight_by_dp(
+                required_tokens, target_dp_rank
+            )
+
+            info.begin_observe_stage("prealloc")
             # Record enqueue stage duration
-            observe_stage_duration("decode", "enqueue", waited)
+            observe_stage_duration("decode", "enqueue", time_since_task_created)
             logger.debug(f"[PD_STAGE][decode.enqueue.end] req_id={rid}")
             logger.debug(f"[PD_STAGE][decode.prealloc.start] req_id={rid}")
             logger.debug(
-                f"[PD_QUEUE][decode.prealloc] req_id={rid} cache_owner={target_dp_rank} waited={waited:.1f}s"
+                f"[PD_QUEUE][decode.prealloc] req_id={rid} cache_owner={target_dp_rank} waited={time_since_task_created:.1f}s"
             )
 
         prealloc_task_ids = [
@@ -854,38 +894,26 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 continue
 
             info = task.pd_scheduler_info
+            time_since_task_created = info.time_since_task_created(now)
             target_dp_rank = int(task.dp_rank)
 
             prefill_done = self.kv_manager.is_prefill_done(rid)
             if not prefill_done:
-                last_prepare_ts = float(info.get("last_prepare_ts", 0.0))
-                created_ts = float(info.get("created_ts", now))
-                waited = now - created_ts
                 wait_timeout_s = float(
                     getattr(self._kv_cfg, "decode_wait_timeout_s", 0.0) or 0.0
                 )
-                if (
-                    wait_timeout_s > 0
-                    and waited >= wait_timeout_s
-                    and not bool(info.get("timeout_logged", False))
-                ):
-                    info["timeout_logged"] = True
-                    task: "Task" = task
-                    target_dp_rank = int(task.dp_rank)
-                    prefill_sid = task.pd_prefill_engine_rank
+                if info.check_if_timeout(now, wait_timeout_s, True):
                     logger.warning(
                         "[PD_BOOTSTRAP][decode.timeout] "
-                        f"req_id={rid} waited={waited:.1f}s timeout_s={wait_timeout_s:.1f} "
-                        f"prefill_done={bool(prefill_done)} cache_owner={target_dp_rank} prefill_sid={prefill_sid} "
-                        f"last_prepare_age_s={now - last_prepare_ts:.1f} "
+                        f"req_id={rid} waited={time_since_task_created:.1f}s timeout_s={wait_timeout_s:.1f} "
+                        f"prefill_done={bool(prefill_done)} cache_owner={target_dp_rank} prefill_sid={task.pd_prefill_engine_rank} "
+                        f"last_prepare_age_s={now - info.last_prepare_ts:.1f} "
                         f"prefix_len={int(getattr(task, 'prefix_tokens_len', 0)) if task is not None else 0}"
                     )
-                last_log_ts = float(info.get("last_log_ts", 0.0))
-                if (now - last_log_ts) >= 1.0 and (now - created_ts) >= 1.0:
-                    info["last_log_ts"] = now
+                if info.should_refresh_log(now, 10.0):
                     logger.debug(
                         f"[PD_BOOTSTRAP][decode.wait] still waiting KV ready: req_id={rid} "
-                        f"waited={now - created_ts:.1f}s"
+                        f"waited={time_since_task_created:.1f}s"
                     )
                 continue
 
@@ -895,29 +923,24 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             task.req.add_data(prefill_done.first_token)
             if task.dp_rank != 0:
                 task.update_response_sync([prefill_done.first_token])
-            created_ts = float(info.get("created_ts", now))
             if prefill_done.trace:
                 task.req.trace_data.merge(prefill_done.trace)
-            waited = now - created_ts
+
             self._decode_ready_promoted_total += 1
-            self._decode_ready_wait_total_s += waited
-            if waited > self._decode_ready_wait_max_s:
-                self._decode_ready_wait_max_s = waited
+            self._decode_ready_wait_total_s += time_since_task_created
+            if info.check_if_timeout(now, self._decode_ready_wait_max_s):
+                self._decode_ready_wait_max_s = time_since_task_created
             # Record prealloc stage duration
-            _pa_start = float(info.get("_prealloc_start_ts", 0))
-            if _pa_start > 0:
-                observe_stage_duration(
-                    "decode", "prealloc", time.monotonic() - _pa_start
-                )
-            info["_ready_start_ts"] = time.monotonic()
-            if waited > 10.0:
+            info.finish_observe_stage("decode", "prealloc")
+
+            if info.check_if_timeout(now, 10.0):
                 logger.warning(
-                    f"[PD_SLOW] decode.prealloc req_id={rid} waited={waited:.1f}s"
+                    f"[PD_SLOW] decode.prealloc req_id={rid} waited={time_since_task_created:.1f}s"
                 )
             logger.debug(f"[PD_STAGE][decode.prealloc.end] req_id={rid}")
             logger.debug(f"[PD_STAGE][decode.ready.start] req_id={rid}")
             logger.debug(
-                f"[PD_QUEUE][decode.ready] req_id={rid} KV ready waited={waited:.1f}s"
+                f"[PD_QUEUE][decode.ready] req_id={rid} KV ready waited={time_since_task_created:.1f}s"
             )
 
             self._release_decode_prealloc_budget(task)
