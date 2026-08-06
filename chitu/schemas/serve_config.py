@@ -207,6 +207,7 @@ class RouterConfig:
     router_cache_miss_fallback_algorithm: str = MISSING
     router_hit_weight: float = MISSING
     router_load_penalty_weight: float = MISSING
+    router_decode_token_equiv: float = MISSING
     router_evict_buffer_size: int = MISSING
     router_local_reservation_timeout_s: float = MISSING
     launch_timeout: float = MISSING

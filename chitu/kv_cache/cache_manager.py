@@ -303,6 +303,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
             and getattr(multi_inst, "n_insts", 1) > 1
             and (is_independent_multi_inst() or role == "prefill")
         ):
+            # Only record where a consumer pops: enhanced-scheduler stats loop
+            # (independent multi-inst) or PD prefill-only get_pd_stats. PD
+            # decode-only instances never pop, so they must not record.
             self.evicted_blk_hashes.append(blk_hash)
         if (
             blk_hash is not None
