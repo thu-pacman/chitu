@@ -9,12 +9,16 @@ import zmq
 
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.distributed.coordinator import get_endpoint, set_endpoint
+from chitu.distributed.parallel_state import get_world_group
 import logging
 
 logger = logging.getLogger(__name__)
 
 TCP_ENDPOINT = "tcp://{}:{}"
-ZMQ_HIGH_WATER_MARK = 10000
+ZMQ_RCVHWM = 200000
+ZMQ_RCVBUF = 4 * 1024 * 1024  # 4MB
+ZMQ_SNDHWM = 200000
+ZMQ_SNDBUF = 4 * 1024 * 1024  # 4MB
 
 
 class KVManagerEndpoint:
@@ -30,6 +34,8 @@ class KVManagerEndpoint:
         bind_addr = f"tcp://{self.ip}"
         if not has_slave:
             self.socket = self.zmq_ctx.socket(zmq.PULL)
+            self.socket.setsockopt(zmq.RCVHWM, ZMQ_RCVHWM)
+            self.socket.setsockopt(zmq.RCVBUF, ZMQ_RCVBUF)
             set_endpoint(
                 self.role,
                 self.name,
@@ -39,6 +45,8 @@ class KVManagerEndpoint:
             return
 
         self._relay_socket = self.zmq_ctx.socket(zmq.PULL)
+        self._relay_socket.setsockopt(zmq.RCVHWM, ZMQ_RCVHWM)
+        self._relay_socket.setsockopt(zmq.RCVBUF, ZMQ_RCVBUF)
         set_endpoint(
             self.role,
             self.name,
@@ -46,30 +54,54 @@ class KVManagerEndpoint:
             self._relay_socket.bind_to_random_port(bind_addr),
         )
 
-        self._pub_socket = self.zmq_ctx.socket(zmq.PUB)
-        self._pub_socket.setsockopt(zmq.SNDHWM, ZMQ_HIGH_WATER_MARK)
-        pub_port = self._pub_socket.bind_to_random_port(bind_addr)
-        set_endpoint(self.role, self.name + "_pub", self.ip, pub_port)
-        self._pub_socket.setsockopt(zmq.LINGER, 0)
+        self._push_sockets = []
+        for rank in range(get_world_group().group_size - 1, -1, -1):
+            _pub_socket = self.zmq_ctx.socket(zmq.PUSH)
+            _pub_socket.setsockopt(zmq.SNDHWM, ZMQ_SNDHWM)
+            _pub_socket.setsockopt(zmq.SNDBUF, ZMQ_SNDBUF)
+            _pub_socket.setsockopt(zmq.SNDTIMEO, 60 * 1000)
+            _pub_socket.setsockopt(zmq.LINGER, 0)
+            pub_port = _pub_socket.bind_to_random_port(bind_addr)
+            set_endpoint(
+                self.role,
+                f"{self.name}_pub_{rank}",
+                self.ip,
+                pub_port,
+            )
+            self._push_sockets.append(_pub_socket)
+
         threading.Thread(target=self.relay_thread, daemon=True).start()
 
-        self.socket = self.zmq_ctx.socket(zmq.SUB)
-        self.socket.setsockopt(zmq.SUBSCRIBE, b"")
-        self.socket.connect(TCP_ENDPOINT.format(self.ip, pub_port))
-        self.socket.setsockopt(zmq.RCVHWM, ZMQ_HIGH_WATER_MARK)
+        self.socket = self.zmq_ctx.socket(zmq.PULL)
+        self.socket.setsockopt(zmq.RCVHWM, ZMQ_RCVHWM)
+        self.socket.setsockopt(zmq.RCVBUF, ZMQ_RCVBUF)
+        endpoint = TCP_ENDPOINT.format(
+            *get_endpoint(
+                self.role,
+                f"{self.name}_pub_{get_world_group().global_rank}",
+            )
+        )
+        self.socket.connect(endpoint)
 
     def init_slave(self):
         """init receiver on slave rank"""
-        endpoint = TCP_ENDPOINT.format(*get_endpoint(self.role, self.name + "_pub"))
-        self.socket = self.zmq_ctx.socket(zmq.SUB)
-        self.socket.setsockopt(zmq.SUBSCRIBE, b"")
+        self.socket = self.zmq_ctx.socket(zmq.PULL)
+        self.socket.setsockopt(zmq.RCVHWM, ZMQ_RCVHWM)
+        self.socket.setsockopt(zmq.RCVBUF, ZMQ_RCVBUF)
+        endpoint = TCP_ENDPOINT.format(
+            *get_endpoint(
+                self.role,
+                f"{self.name}_pub_{get_world_group().global_rank}",
+            )
+        )
         self.socket.connect(endpoint)
-        self.socket.setsockopt(zmq.RCVHWM, ZMQ_HIGH_WATER_MARK)
 
     def init_remote(self):
         """init sender on any rank"""
         endpoint = TCP_ENDPOINT.format(*get_endpoint(self.role, self.name))
         self.send_socket = self.zmq_ctx.socket(zmq.PUSH)
+        self.send_socket.setsockopt(zmq.SNDHWM, ZMQ_SNDHWM)
+        self.send_socket.setsockopt(zmq.SNDBUF, ZMQ_SNDBUF)
         self.send_socket.setsockopt(zmq.SNDTIMEO, 60 * 1000)
         self.send_socket.setsockopt(zmq.LINGER, 0)
         self.send_socket.connect(endpoint)
@@ -79,10 +111,13 @@ class KVManagerEndpoint:
 
     def relay_thread(self):
         try:
-            zmq.proxy(self._relay_socket, self._pub_socket)
+            while True:
+                msg = self._relay_socket.recv()
+                for sock in self._push_sockets:
+                    sock.send(msg)
         except Exception:
             logger.exception(
-                f"{self.role}:{self.name} relay_thread fatal error, exiting process"
+                f"{self.role}:{self.name} relay_thread socket error, exiting process"
             )
             os._exit(1)
 
