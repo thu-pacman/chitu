@@ -1513,7 +1513,7 @@ class Transformer(nn.Module):
                 if sampler is not None
                 else torch.argmax(logits, dim=-1)
             )
-            self.tp_group.broadcast(tokens, src=0)
+            self.tp_group.broadcast(tokens, src=self.tp_group.rank_list[0])
             token_list.append(tokens)
         for cache in self.cache_dict.values():
             if isinstance(cache, PagedKVCache):
