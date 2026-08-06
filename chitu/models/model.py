@@ -380,14 +380,6 @@ class Transformer(nn.Module):
                 dtype=torch.int64,
                 device=self.device,
             )
-            self.draft_tokens: torch.Tensor | None = None
-            """ draft tokens, with shape (bs, mtp_size - 1) """
-            self.draft_tokens_cpu: torch.Tensor | None = None
-            """ draft tokens on CPU (async transfer target) """
-            self.draft_tokens_cpu_ready: torch.cuda.Event | None = None
-            """ event signaling draft_tokens_cpu transfer is complete """
-            self.draft_logits: torch.Tensor | None = None
-            """ draft token logits, with shape (bs, mtp_size - 1, vocab_size) """
 
         dummy_input_shape = [0, self.params.dim]
         self.dummy_input = torch.empty(
@@ -1492,13 +1484,12 @@ class Transformer(nn.Module):
     ):
         self.update_mtp_hidden_states(self.read_mtp_hidden_states(is_mtp=True))
         bs = tokens.shape[0]
-        draft_logits = []
-        token_list = [tokens]
         from chitu.backend import Backend  # local import to avoid cycles
 
         is_tp_rank0 = self.tp_group.rank_in_group == 0
         sampler = Backend.executor.sampler if is_tp_rank0 else None
 
+        token_list = [tokens]
         for i in range(1, self.mtp_size):
             for cache in self.cache_dict.values():
                 cache.prepare_mtp_cache_decode(i)
@@ -1506,19 +1497,18 @@ class Transformer(nn.Module):
                     cache.update_page_offs()
             self.prepare_decoding_attn(is_mtp=True)
             logits = func_mtp(key_mtp, tokens, *extra_inputs_mtp)
-            draft_logits.append(logits)
-
-            tokens = (
-                sampler.sample_draft_tokens(logits)
-                if sampler is not None
-                else torch.argmax(logits, dim=-1)
-            )
+            if sampler is not None:
+                tokens = sampler.sample_draft_tokens(logits)
+            else:
+                tokens = torch.argmax(logits, dim=-1)
             self.tp_group.broadcast(tokens, src=self.tp_group.rank_list[0])
             token_list.append(tokens)
+        if sampler is not None:
+            sampler.draft_sample_done()
+
         for cache in self.cache_dict.values():
             if isinstance(cache, PagedKVCache):
                 cache.update_page_offs()
-        tokens = torch.stack(token_list, dim=1)
         if self.use_cuda_graph:
             self.prepare_decoding_attn()
         else:
@@ -1527,12 +1517,12 @@ class Transformer(nn.Module):
             )
         if self.moe_impl is not None:
             self.moe_impl.prepare(TaskType.Decode, bs * self.mtp_size)
-        h = func(key, tokens.view(-1), *extra_inputs)
-        self.draft_tokens = tokens[:, 1:]
-        self.draft_tokens_cpu = self.draft_tokens.to("cpu", non_blocking=True)
-        self.draft_tokens_cpu_ready = torch.cuda.current_stream().record_event()
-        self.draft_logits = torch.stack(draft_logits, dim=1)
 
+        # verify_input_tokens: [target_output, d1, d2, ...]
+        # Each rank builds it locally — all ranks have the same tokens after
+        # per-iteration tp_group.broadcast.
+        verify_input_tokens = torch.stack(token_list, dim=1)
+        h = func(key, verify_input_tokens.view(-1), *extra_inputs)
         h = h.view(bs, self.mtp_size, h.shape[-1])
         return h
 

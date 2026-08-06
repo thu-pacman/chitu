@@ -454,6 +454,26 @@ class PrometheusMetricsCollector:
             logger.error(f"inc_mtp_tokens failed: {e}")
 
     @classmethod
+    def get_mtp_stats(cls) -> tuple[int, int]:
+        """Return (total_proposed, total_accepted) across all DP ranks on this process."""
+        collector = cls.get_instance()
+        if not collector:
+            return 0, 0
+        total_proposed = 0
+        total_accepted = 0
+        if collector.mtp_proposed_tokens:
+            for metric in collector.mtp_proposed_tokens.collect():
+                for sample in metric.samples:
+                    if sample.name.endswith("_total"):
+                        total_proposed += int(sample.value)
+        if collector.mtp_accepted_tokens:
+            for metric in collector.mtp_accepted_tokens.collect():
+                for sample in metric.samples:
+                    if sample.name.endswith("_total"):
+                        total_accepted += int(sample.value)
+        return total_proposed, total_accepted
+
+    @classmethod
     def inc_prompt_tokens(cls, count: int = 1):
         if count < 0:
             return
