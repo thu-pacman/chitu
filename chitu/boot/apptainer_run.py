@@ -12,7 +12,8 @@ import requests
 from logging import getLogger
 
 from chitu.boot.appimage_utils import appdir
-from chitu.boot.arg_utils import args_as_list
+from chitu.boot.arg_utils import args_as_list, container_setup_cmd_wrapper_args
+from chitu.boot.platform import resolve_platform
 from chitu.boot.poll import wait_for_server_initialized
 
 logger = getLogger(__name__)
@@ -45,6 +46,9 @@ def apptainer_run(
     apptainer_args = args_as_list(cfg.boot.extra_apptainer_args)
     torchrun_args = args_as_list(cfg.boot.extra_torchrun_args)
     target_args = args_as_list(cfg.boot.target)
+    container_setup_cmd_args = container_setup_cmd_wrapper_args(
+        cfg.boot.container_setup_cmd
+    )
     torchrun_wrapper = args_as_list(cfg.boot.torchrun_wrapper)
     if cfg.boot.on_ready is not None and (
         is_router or (not is_multi_inst and is_master_node)
@@ -93,17 +97,26 @@ def apptainer_run(
         "apptainer",
         "run",
         "--no-eval",  # Stop apptainer from eval quotes in user args
-        "--nv",
         "--contain",
         "--writable-tmpfs",
         "--cwd",
         "/workspace/chitu",
         "--cleanenv",
-        "--env",
-        "NCCL_GRAPH_MIXING_SUPPORT=0",
-        "--env",
-        "NCCL_GRAPH_REGISTER=0",
     ]
+
+    # Select the platform and add the corresponding Apptainer arguments.
+    platform = resolve_platform(cfg.boot.platform, ("nvidia", "hygon"), "Apptainer")
+    if platform == "nvidia":
+        apptainer_cmd += [
+            "--nv",
+            "--env",
+            "NCCL_GRAPH_MIXING_SUPPORT=0",
+            "--env",
+            "NCCL_GRAPH_REGISTER=0",
+        ]
+    elif platform == "hygon":
+        apptainer_cmd += ["--rocm", "-B", "/opt/hyhal:/opt/hyhal:ro"]
+
     apptainer_cmd += ib_mount_args
     apptainer_cmd += ib_env_args
     apptainer_cmd += apptainer_args
@@ -117,6 +130,7 @@ def apptainer_run(
     apptainer_cmd += [image_file]
 
     service_apptainer_cmd = copy.copy(apptainer_cmd)
+    service_apptainer_cmd += container_setup_cmd_args
     service_apptainer_cmd += torchrun_wrapper
     service_apptainer_cmd += [
         "torchrun",

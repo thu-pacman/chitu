@@ -125,6 +125,19 @@ def args_as_list(args) -> List[str]:
         raise ValueError(f"Unsupported argument type: {type(args)}")
 
 
+def container_setup_cmd_wrapper_args(container_setup_cmd: Optional[str]) -> List[str]:
+    if container_setup_cmd is None or container_setup_cmd == "":
+        return []
+    if not isinstance(container_setup_cmd, str):
+        raise ValueError(
+            f"boot.container_setup_cmd must be a string or null, "
+            f"got {type(container_setup_cmd)}"
+        )
+
+    script = "\n".join([container_setup_cmd, 'exec "$@"'])
+    return ["/bin/bash", "-c", script, "chitu-container-setup-cmd"]
+
+
 def suffixed_name(name: Optional[str], suffix: Optional[str]) -> Optional[str]:
     if name is None:
         return None

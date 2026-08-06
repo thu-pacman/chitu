@@ -16,7 +16,12 @@ import requests
 from logging import getLogger
 
 from chitu.boot.appimage_utils import appdir
-from chitu.boot.arg_utils import args_as_list, suffixed_name
+from chitu.boot.arg_utils import (
+    args_as_list,
+    container_setup_cmd_wrapper_args,
+    suffixed_name,
+)
+from chitu.boot.platform import resolve_platform
 from chitu.boot.poll import wait_for_server_initialized
 from chitu.boot.tcp_ip import get_local_ip
 
@@ -50,6 +55,9 @@ def docker_run(
     docker_args = args_as_list(cfg.boot.extra_docker_args)
     torchrun_args = args_as_list(cfg.boot.extra_torchrun_args)
     target_args = args_as_list(cfg.boot.target)
+    container_setup_cmd_args = container_setup_cmd_wrapper_args(
+        cfg.boot.container_setup_cmd
+    )
     torchrun_wrapper = args_as_list(cfg.boot.torchrun_wrapper)
     if cfg.boot.on_ready is not None and (
         is_router or (not is_multi_inst and is_master_node)
@@ -114,8 +122,11 @@ def docker_run(
     hosts_tmp_file = None
     docker_cmd = ["docker", "run", "--rm", "--network", "host", "--pid=host"]
 
-    # Detect the type of device and add the corresponding docker arguments.
-    if shutil.which("nvidia-smi"):
+    # Select the platform and add the corresponding Docker arguments.
+    platform = resolve_platform(
+        cfg.boot.platform, ("nvidia", "ascend", "hygon", "metax"), "Docker"
+    )
+    if platform == "nvidia":
         docker_cmd += [
             "--gpus=all",
             "--privileged",
@@ -125,7 +136,7 @@ def docker_run(
             "-e",
             "NCCL_GRAPH_REGISTER=0",
         ]
-    elif shutil.which("npu-smi"):
+    elif platform == "ascend":
         docker_cmd += [
             "--device",
             "/dev/davinci_manager",
@@ -160,7 +171,7 @@ def docker_run(
             docker_cmd += ["--privileged"]
             for dev in glob.glob("/dev/davinci*"):
                 docker_cmd += ["--device", dev]
-    elif shutil.which("hy-smi"):
+    elif platform == "hygon":
         docker_cmd += [
             "--privileged",
             "--device=/dev/kfd",
@@ -181,7 +192,7 @@ def docker_run(
             "-v",
             "/opt/hyhal:/opt/hyhal:ro",
         ]
-    elif shutil.which("mx-smi"):
+    elif platform == "metax":
         docker_cmd += [
             "--device=/dev/dri",
             "--device=/dev/mxcd",
@@ -196,8 +207,6 @@ def docker_run(
             "--ulimit",
             "memlock=-1",
         ]
-    else:
-        raise RuntimeError("No supported type of devices detected")
 
     docker_cmd += ib_env_args
     docker_cmd += ib_mount_args
@@ -233,6 +242,7 @@ def docker_run(
         return cmd
 
     service_docker_cmd = docker_cmd_with_image(container_name_suffix)
+    service_docker_cmd += container_setup_cmd_args
     service_docker_cmd += torchrun_wrapper
     service_docker_cmd += [
         "torchrun",

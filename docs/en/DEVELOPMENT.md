@@ -576,6 +576,7 @@ All arguments are defined in [Chitu CLI Arguments](CLI.md). The most relevant op
 | :--- | :------ | :--- |
 | `boot.n_nodes` | `1` | Number of nodes (servers) to use. |
 | `boot.n_gpus_per_node` | `1` | Number of GPUs per node to use. |
+| `boot.platform` | `"auto"` | Container hardware platform. Explicit values bypass automatic SMI detection. |
 | `boot.target` | `["-m", "chitu"]` | Target chitu program or script to run inside the container. |
 | `boot.remote_launcher` | `"local"` | How to run on multiple nodes. Set to `srun` to use Slurm. |
 | `boot.interactive_node_0` | `"auto"` | Make the first node interactive. `"auto"` decides automatically. |

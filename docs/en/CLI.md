@@ -68,6 +68,25 @@ When null, uses the image bundled in the AppImage.
 
 *Default: `null`.*
 
+### Argument `boot.platform`
+
+Hardware platform used to configure device access for the container
+
+Acceptable values:
+- "auto": Detect the platform on each node from the available system management
+  command.
+- "nvidia": Use NVIDIA container arguments without checking for `nvidia-smi`.
+- "ascend": Use Ascend container arguments without checking for `npu-smi`
+  (Docker only).
+- "hygon": Use Hygon container arguments without checking for `hy-smi`.
+- "metax": Use MetaX container arguments without checking for `mx-smi`
+  (Docker only).
+
+Auto detection checks NVIDIA, Ascend, Hygon, and MetaX in that order for Docker.
+Apptainer supports and checks only NVIDIA and Hygon.
+
+*Default: `"auto"`.*
+
 ### Argument `boot.source_path`
 
 Path to source tree to mount into the container at /workspace/chitu.
@@ -207,6 +226,29 @@ Acceptable values:
 - A space-separated string for arguments.
 
 *Default: `[]`.*
+
+### Argument `boot.container_setup_cmd`
+
+Bash commands to set up each Docker or Apptainer workload container before launching its main
+command
+
+The commands run after the container starts and before `boot.torchrun_wrapper` and `torchrun`.
+They run sequentially in the same non-interactive Bash shell. No shell options are changed and
+no variables are exported automatically. Environment variables explicitly exported by the
+commands are visible to `torchrun`. In multi-instance deployments, the commands run once in
+each workload container, including the router. They do not run in the container for
+`boot.on_ready`.
+Commands may run concurrently across containers and nodes, so they must be safe to repeat and
+must not modify the same shared files without coordination. Referenced files must be mounted
+into the container separately. The command string may be visible in process listings and
+startup logs, so do not put secrets directly in this setting.
+
+Acceptable values:
+- null: Run no extra commands.
+- A string containing trusted Bash commands. Use a YAML block scalar (`|`) for multiple
+  commands.
+
+*Default: `null`.*
 
 ### Argument `boot.torchrun_wrapper`
 
