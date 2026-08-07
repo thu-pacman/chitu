@@ -30,7 +30,7 @@ def DocField(default: Any = _UNSET, *, en: str, zh: str, **kwargs: Any):
 LANG = {
     "en": {
         "title": "API Parameters Reference",
-        "intro": "Chitu provides OpenAI-compatible and Anthropic-compatible HTTP APIs. This document is generated from the server request models and structured API metadata.",
+        "intro": "Chitu provides OpenAI-compatible, Anthropic-compatible, tokenization, lifecycle, and profiling HTTP APIs. This document is generated from the server request models and structured API metadata.",
         "endpoint": "Endpoint",
         "parameters": "Parameters",
         "field": "Parameter",
@@ -44,7 +44,7 @@ LANG = {
     },
     "zh": {
         "title": "API 参数参考",
-        "intro": "赤兔提供 OpenAI 兼容和 Anthropic 兼容的 HTTP API。本文档根据服务端请求模型和结构化 API 元数据生成。",
+        "intro": "赤兔提供 OpenAI 兼容、Anthropic 兼容、词元化、生命周期和性能分析 HTTP API。本文档根据服务端请求模型和结构化 API 元数据生成。",
         "endpoint": "接口",
         "parameters": "参数",
         "field": "参数",
@@ -63,6 +63,7 @@ SECTION_ORDER = [
     "OpenAI-Compatible API",
     "Anthropic-Compatible API",
     "Tokenization APIs",
+    "Profiling APIs",
     "Lifecycle, Status, and Cache APIs",
 ]
 
@@ -74,6 +75,7 @@ SECTION_TITLES = {
         "zh": "Anthropic 兼容 API",
     },
     "Tokenization APIs": {"en": "Tokenization APIs", "zh": "词元化接口"},
+    "Profiling APIs": {"en": "Profiling APIs", "zh": "性能分析接口"},
     "Lifecycle, Status, and Cache APIs": {
         "en": "Lifecycle, Status, and Cache APIs",
         "zh": "生命周期、状态和缓存接口",
@@ -81,7 +83,7 @@ SECTION_TITLES = {
 }
 
 
-EXCLUDED_PATH_PREFIXES = ["/dp", "/profile"]
+EXCLUDED_PATH_PREFIXES = ["/dp"]
 
 
 ENDPOINT_EXTRA_SECTIONS = {
@@ -152,6 +154,18 @@ ENDPOINT_NOTES = {
         {
             "en": "Anthropic tool definitions are converted into Chitu's internal function tool format. For new model adaptation, see the [Tool Calling Adaptation Guide](./TOOL_CALL_ADAPTATION.md).",
             "zh": "Anthropic 工具定义会转换成赤兔内部 function tool 格式。新模型适配方式请参见 [工具调用适配指南](./TOOL_CALL_ADAPTATION.md)。",
+        }
+    ],
+    "/profile/start": [
+        {
+            "en": "For end-to-end profiling workflows and environment variables, see [Profiling](./PROFILING.md).",
+            "zh": "端到端 profile 流程和环境变量请参见 [性能分析](./PROFILING.md)。",
+        }
+    ],
+    "/profile/dump_memory": [
+        {
+            "en": "For memory tracking setup and snapshot analysis, see [Profiling](./PROFILING.md).",
+            "zh": "显存跟踪设置和 snapshot 分析方式请参见 [性能分析](./PROFILING.md)。",
         }
     ],
 }

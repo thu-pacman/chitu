@@ -2,7 +2,7 @@
 
 > 本文档由 `script/generate_http_api_docs.py` 生成。请勿手动编辑；如需修改，请更新源代码中的元数据并重新运行该脚本。
 
-赤兔提供 OpenAI 兼容和 Anthropic 兼容的 HTTP API。本文档根据服务端请求模型和结构化 API 元数据生成。
+赤兔提供 OpenAI 兼容、Anthropic 兼容、词元化、生命周期和性能分析 HTTP API。本文档根据服务端请求模型和结构化 API 元数据生成。
 
 ## OpenAI 兼容 API
 
@@ -474,6 +474,60 @@ POST /detokenize
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `tokens` | `list[integer]` | **必填** | 要转换回文本的 token ID 列表。 |
+
+## 性能分析接口
+
+### 启动性能分析
+
+**接口**
+
+````text
+POST /profile/start
+````
+
+为运行中的服务提交 Torch Profiler 启动请求。
+
+#### 参数（`ProfileRequest` 对象）
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `output_dir` | `string` | `"trace/chitu"` | 输出目录。相对路径会写入 CHITU_TORCH_PROFILER_OUTPUT_ROOT 下。 |
+| `activities` | `list[string]` \| `null` | `null` | 采集类型，可包含 "CPU"、"GPU" 和 "MEM"。 |
+| `start_step` | `integer` | `0` | 开始采集前跳过的推理步数。 |
+| `num_steps` | `integer` | `10` | 自动停止前采集的推理步数。 |
+| `with_stack` | `boolean` | `false` | 是否记录 Python 调用栈。 |
+| `profile_by_stage` | `boolean` | `false` | 是否按 Prefill 和 Decode 阶段分别采集。 |
+| `profile_memory` | `boolean` | `false` | 是否在本次 profile 中向 activities 加入 "MEM" 以采集 CUDA 显存信息。 |
+| `memory_max_entries` | `integer` | `100000` | "MEM" 采集模式下的环形缓冲区大小。 |
+| `pd_stage` | `string` \| `null` | `null` | PD 分离部署中的目标阶段，可为 "prefill"、"decode" 或 "all"。 |
+
+端到端 profile 流程和环境变量请参见 [性能分析](./PROFILING.md)。
+
+### 停止性能分析
+
+**接口**
+
+````text
+POST /profile/stop
+````
+
+为运行中的服务提交 Torch Profiler 停止请求。
+
+无请求体参数。
+
+### 导出显存快照
+
+**接口**
+
+````text
+POST /profile/dump_memory
+````
+
+提交 CUDA 显存 snapshot 导出请求。需要通过 CHITU_MEM_TRACK=1 启用显存跟踪，或在运行中的 profile 中包含 MEM。
+
+无请求体参数。
+
+显存跟踪设置和 snapshot 分析方式请参见 [性能分析](./PROFILING.md)。
 
 ## 生命周期、状态和缓存接口
 

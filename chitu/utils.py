@@ -48,7 +48,7 @@ def get_chitu_env(
     for legacy_name in legacy_names:
         if legacy_name in os.environ:
             logger.warning(
-                f"Environment variable {legacy_name} is recognized byt deprecated. Please Use {name} instead."
+                f"Environment variable {legacy_name} is recognized but deprecated. Please Use {name} instead."
             )
             return os.environ[legacy_name]
 

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from logging import getLogger
 from typing import Callable
 from chitu.global_vars import get_global_args
+from chitu.utils import get_chitu_bool_env, get_chitu_env
 
 
 import torch
@@ -154,15 +155,15 @@ class MemoryRecorder:
         """Call before any CUDA allocation
         Activated by CHITU_MEM_TRACK=1.
         """
-        if os.getenv("CHITU_MEM_TRACK") != "1":
+        if get_chitu_bool_env("CHITU_MEM_TRACK", False) is not True:
             return
         if not torch.cuda.is_available():
             return
 
         rec = cls.get()
-        max_entries_env = os.getenv("CHITU_MEM_TRACK_MAX_ENTRIES", "").strip()
+        max_entries_env = get_chitu_env("CHITU_MEM_TRACK_MAX_ENTRIES", "").strip()
         max_entries = int(max_entries_env) if max_entries_env else 1_000_000
-        rec._snapshot_dir = os.getenv(
+        rec._snapshot_dir = get_chitu_env(
             "CHITU_MEM_TRACK_SNAPSHOT_DIR",
             os.path.join(os.getcwd(), "trace", "chitu", "mem_track"),
         )

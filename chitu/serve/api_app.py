@@ -14,7 +14,7 @@ from typing import Annotated, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from chitu.serve import anthropic_api, openai_api, responses_api
 from chitu.serve.api_docs import DocField
@@ -119,15 +119,54 @@ class DetokenizeRequest(BaseModel):
 
 
 class ProfileRequest(BaseModel):
-    output_dir: str = "trace/chitu"
-    activities: Optional[list[str]] = None
-    start_step: int = Field(default=0, ge=0)
-    num_steps: int = Field(default=10, ge=1)
-    with_stack: bool = False
-    profile_by_stage: bool = False
-    profile_memory: bool = False
-    memory_max_entries: int = Field(default=100000, ge=1)
-    pd_stage: Optional[str] = None
+    output_dir: str = DocField(
+        "trace/chitu",
+        en="Output directory. Relative paths are written under CHITU_TORCH_PROFILER_OUTPUT_ROOT.",
+        zh="输出目录。相对路径会写入 CHITU_TORCH_PROFILER_OUTPUT_ROOT 下。",
+    )
+    activities: Optional[list[str]] = DocField(
+        None,
+        en='Activity types to collect. Values can include "CPU", "GPU", and "MEM".',
+        zh='采集类型，可包含 "CPU"、"GPU" 和 "MEM"。',
+    )
+    start_step: int = DocField(
+        0,
+        ge=0,
+        en="Number of inference steps to skip before collecting data.",
+        zh="开始采集前跳过的推理步数。",
+    )
+    num_steps: int = DocField(
+        10,
+        ge=1,
+        en="Number of inference steps to collect before automatic stop.",
+        zh="自动停止前采集的推理步数。",
+    )
+    with_stack: bool = DocField(
+        False,
+        en="Whether to record Python stack traces.",
+        zh="是否记录 Python 调用栈。",
+    )
+    profile_by_stage: bool = DocField(
+        False,
+        en="Whether to collect Prefill and Decode stages separately.",
+        zh="是否按 Prefill 和 Decode 阶段分别采集。",
+    )
+    profile_memory: bool = DocField(
+        False,
+        en='Whether to add "MEM" to activities for CUDA memory profiling during this profile run.',
+        zh='是否在本次 profile 中向 activities 加入 "MEM" 以采集 CUDA 显存信息。',
+    )
+    memory_max_entries: int = DocField(
+        100000,
+        ge=1,
+        en='Ring-buffer size for "MEM" activity collection.',
+        zh='"MEM" 采集模式下的环形缓冲区大小。',
+    )
+    pd_stage: Optional[str] = DocField(
+        None,
+        en='Target stage in PD disaggregated serving. Values can be "prefill", "decode", or "all".',
+        zh='PD 分离部署中的目标阶段，可为 "prefill"、"decode" 或 "all"。',
+    )
 
 
 _DEFAULT_PD_DECODE_PROFILE_START_STEP = 5
@@ -556,7 +595,18 @@ def _build_profile_start_payload(request: "ProfileRequest") -> tuple[dict, str]:
     return payload, output_dir
 
 
-@app.post("/profile/start")
+@app.post(
+    "/profile/start",
+    tags=["Profiling APIs"],
+    summary="Start Profiler",
+    description="Queues a Torch Profiler start request for the running service.",
+    openapi_extra={
+        "x-doc": {
+            "zh-summary": "启动性能分析",
+            "zh-description": "为运行中的服务提交 Torch Profiler 启动请求。",
+        }
+    },
+)
 async def start_profile(request: ProfileRequest):
     try:
         if _is_router_process():
@@ -609,7 +659,18 @@ async def start_profile(request: ProfileRequest):
     return response
 
 
-@app.post("/profile/stop")
+@app.post(
+    "/profile/stop",
+    tags=["Profiling APIs"],
+    summary="Stop Profiler",
+    description="Queues a Torch Profiler stop request for the running service.",
+    openapi_extra={
+        "x-doc": {
+            "zh-summary": "停止性能分析",
+            "zh-description": "为运行中的服务提交 Torch Profiler 停止请求。",
+        }
+    },
+)
 async def stop_profile():
     try:
         if _is_router_process():
@@ -632,7 +693,24 @@ async def stop_profile():
     return response
 
 
-@app.post("/profile/dump_memory")
+@app.post(
+    "/profile/dump_memory",
+    tags=["Profiling APIs"],
+    summary="Dump Memory Snapshot",
+    description=(
+        "Queues a CUDA memory snapshot dump request. Memory tracking must be "
+        "enabled with CHITU_MEM_TRACK=1 or by including MEM in an active profile."
+    ),
+    openapi_extra={
+        "x-doc": {
+            "zh-summary": "导出显存快照",
+            "zh-description": (
+                "提交 CUDA 显存 snapshot 导出请求。需要通过 CHITU_MEM_TRACK=1 "
+                "启用显存跟踪，或在运行中的 profile 中包含 MEM。"
+            ),
+        }
+    },
+)
 async def dump_memory():
     """Queue a dump_memory command for all ranks."""
     if _is_router_process():

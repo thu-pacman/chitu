@@ -26,6 +26,7 @@ from chitu.task import (
     TaskCollector,
 )
 from chitu.task_type import TaskType
+from chitu.utils import get_chitu_env
 from chitu.dp_router import get_request_router, get_token_router
 
 logger = getLogger(__name__)
@@ -48,7 +49,7 @@ def set_min_batch_size(value: int):
 
 
 def get_profile_output_root() -> str:
-    output_root = os.getenv("CHITU_TORCH_PROFILER_OUTPUT_ROOT", "trace/chitu")
+    output_root = get_chitu_env("CHITU_TORCH_PROFILER_OUTPUT_ROOT", "trace/chitu")
     return os.path.abspath(os.path.normpath(output_root))
 
 
