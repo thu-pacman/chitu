@@ -186,7 +186,8 @@ def _pd_router_config(
         routing_algorithm_for_decode=routing_algorithm_for_decode,
         router_cache_miss_fallback_algorithm=router_cache_miss_fallback_algorithm,
         router_hit_weight=1.0,
-        router_load_penalty_weight=0.02,
+        router_load_penalty_weight=0.5,
+        router_decode_token_equiv=16.0,
         router_evict_buffer_size=64,
         router_local_reservation_timeout_s=600.0,
     )
@@ -196,36 +197,28 @@ def test_pd_prefill_prefix_among_prefers_more_prefix_hits():
     cfg = _pd_router_config(routing_algorithm="prefix_cache_aware")
     policy = PrefixCacheAwarePolicy(cfg)
 
-    policy.update_stats(
-        SchedulerStats(
-            local_instance_id=0,
-            running_requests=20,
-            waiting_requests=0,
-            pending_tokens=0,
-            throughput_tokens_per_sec=0.0,
-            last_update_time=0.0,
-            is_alive=True,
-            num_blocks=8,
-            block_size=4,
+    for local_instance_id in (0, 1):
+        policy.update_stats(
+            SchedulerStats(
+                local_instance_id=local_instance_id,
+                running_requests=0,
+                waiting_requests=0,
+                pending_tokens=0,
+                throughput_tokens_per_sec=0.0,
+                last_update_time=0.0,
+                is_alive=True,
+                num_blocks=64,
+                block_size=4,
+            )
         )
-    )
-    policy.update_stats(
-        SchedulerStats(
-            local_instance_id=1,
-            running_requests=0,
-            waiting_requests=0,
-            pending_tokens=0,
-            throughput_tokens_per_sec=0.0,
-            last_update_time=0.0,
-            is_alive=True,
-            num_blocks=8,
-            block_size=4,
-        )
-    )
 
-    req = MockReq("r1", [1, 2, 3, 4, 5, 6, 7, 8])
+    # 16 full blocks of 4 tokens. Both score terms are prompt tokens, so the
+    # prompt has to be long enough for the cache hit to be worth more than the
+    # load the routed request itself puts on instance 0.
+    req = MockReq("r1", list(range(64)))
     policy.remember_request(req, local_instance_id=0)
     policy.insert_req_blocks(req.request_id)
+    assert policy.get_router_load(0) == (1, 64)
 
     chosen = policy.select_scheduler(req)
     assert chosen == 0

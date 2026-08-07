@@ -192,6 +192,11 @@ class LoadBalancer(RoutePolicy):
         self.round_robin_counter = 0
         self.last_selected_scheduler_id: Optional[int] = None
         self.w_pending_tokens = float(PENDING_TOKENS_WEIGHT)
+        # Prefill-token equivalents charged for one request that is past its first
+        # token, used by the token-denominated queue estimate below.
+        self.decode_token_equiv = float(
+            getattr(config, "router_decode_token_equiv", 16.0)
+        )
 
         # router maintains its own state to comupte load score
         self.router_reservations: dict[str, RouterLoadReservation] = {}
@@ -325,6 +330,29 @@ class LoadBalancer(RoutePolicy):
             local_instance_id
         )
 
+    def prefill_queue_tokens(self, local_instance_id: int) -> float:
+        """Prefill work queued ahead of a new request, in prompt tokens.
+
+        ``_load_score`` answers the same question in request units, which is all
+        the pure load-balancing algorithms need. Weighing queueing against cached
+        tokens needs it denominated in tokens instead, because the same queue
+        depth is cheap when it holds short prompts and ruinous when it holds long
+        ones.
+
+        Router-local pending tokens already cover every request that still owes a
+        prefill. Under unified DP a request that has produced its first token
+        keeps its slot in ``router_running_requests`` while its pending tokens
+        drop to zero, so it only steals decode step time from a new prefill, which
+        ``decode_token_equiv`` prices in. Requests still owing a prefill are
+        counted by both terms; at a few tokens each that overlap is noise next to
+        a prompt, and it usefully breaks ties on equal pending tokens.
+        """
+        return (
+            self._pending_tokens_for_routing(local_instance_id)
+            + self._running_requests_for_routing(local_instance_id)
+            * self.decode_token_equiv
+        )
+
     def select_scheduler(
         self,
         request: Optional[UserRequest] = None,
@@ -365,10 +393,25 @@ class PrefixCacheAwarePolicy(LoadBalancer):
     def __init__(self, config: ServeRouterConfig):
         super().__init__(config)
 
-        # The weight of the prefix cache hit block count during router routing tasks.
+        # Routing score is ``w_hit * hit_tokens - w_load * prefill_queue_tokens``,
+        # both terms in prompt tokens, which is what makes them comparable at all.
+        # Mixing units instead needs an implicit "one queued request is worth N
+        # cached blocks" constant, and no such constant exists: the same queue
+        # depth is cheap when it holds short prompts and ruinous when it holds
+        # long ones.
+        #
+        # Maximizing this is equivalent to minimizing
+        # ``w_load * queue_tokens + miss_tokens``, because ``miss_tokens`` and
+        # ``hit_tokens`` differ by the prompt length, a per-request constant.
+        # Which gives ``w_load`` its default: queued tokens cost this request
+        # latency, while missed tokens cost it the same latency *and* burn
+        # cluster prefill compute that a cache hit would have saved. Counting the
+        # miss twice and the wait once weighs time-to-first-token and cluster
+        # throughput equally, and normalizing drops it out as 0.5.
         self.w_hit = float(getattr(config, "router_hit_weight", 1.0))
-        # The penalty weight of instance load during router routing tasks.
-        self.w_load = float(getattr(config, "router_load_penalty_weight", 0.02))
+        # Raise toward 1.0 to route purely for this request's first-token latency,
+        # lower toward 0 to hoard cache hits regardless of queueing.
+        self.w_load = float(getattr(config, "router_load_penalty_weight", 0.5))
 
         # Router-side per-instance shadow cache (LRU by block hash).
         # The element lifecycle of the LRU :
@@ -385,6 +428,17 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         # even when routing happened before the first prefill stats heartbeat.
         self.req_to_request: dict[str, UserRequest] = {}
         self.req_to_scheduler: dict[str, int] = {}
+
+        # Pending-prefix overlay: full-block hashes of in-flight requests counted
+        # into hit scoring from route time (``remember_request``) until
+        # first-token confirmation (``forget_request``) or request teardown
+        # (``remove_request``). Keeps bursty same-prefix requests herded on the
+        # same instance before ``insert_req_blocks`` confirms the prefix, without
+        # polluting the shadow LRU with blocks of requests that never prefill.
+        # ``req_pending_hashes`` carries the instance id alongside the hashes so
+        # releasing refcounts never depends on ``req_to_scheduler`` still being set.
+        self.pending_blocks: dict[int, dict[str, int]] = {}
+        self.req_pending_hashes: dict[str, tuple[int, list[str]]] = {}
 
         # Router evicted block buffer temporarily holds cache blocks evicted from the router's cached_blocks.
         self.evict_buffer: dict[int, OrderedDict[str, float]] = {}
@@ -404,6 +458,8 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         self.evict_buffer.clear()
         self.req_to_request.clear()
         self.req_to_scheduler.clear()
+        self.pending_blocks.clear()
+        self.req_pending_hashes.clear()
 
     def update_stats(self, stats: SchedulerStats):
         super().update_stats(stats)
@@ -431,17 +487,19 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         self, local_instance_id: int, req_blocks: list[BlockIdentity]
     ) -> int:
         # Count contiguous prefix hits from the beginning of block chain.
+        # A block counts when it is either confirmed in the shadow LRU or
+        # pending confirmation from an in-flight request routed to this
+        # instance (pending-prefix overlay).
         if not req_blocks:
             return 0
-        lru = self.cached_blocks.get(local_instance_id)
+        lru = self.cached_blocks.get(local_instance_id) or {}
+        pend = self.pending_blocks.get(local_instance_id) or {}
         num_hits = 0
-        if not lru:
-            return num_hits
         for block in req_blocks:
             blk_hash = block.blk_hash
             if not blk_hash:
                 break
-            if blk_hash not in lru:
+            if blk_hash not in lru and blk_hash not in pend:
                 break
             num_hits += 1
         return num_hits
@@ -475,13 +533,15 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             req_blocks = self.build_req_token_blocks(request, local_instance_id)
             num_hits = self.num_hit_blocks(local_instance_id, req_blocks)
             max_num_hits = max(max_num_hits, num_hits)
-            score = self.w_hit * num_hits - self.w_load * self._load_score(
-                local_instance_id
-            )
+            block_size = self.instances_block_size.get(local_instance_id, 0)
+            hit_tokens = num_hits * block_size
+            queue_tokens = self.prefill_queue_tokens(local_instance_id)
+            score = self.w_hit * hit_tokens - self.w_load * queue_tokens
             logger.debug(
                 f"  - local_instance_id={local_instance_id}: "
-                f"score = w_hit({self.w_hit})*num_hits({num_hits}) - "
-                f"w_load({self.w_load})*_load_score({self._load_score(local_instance_id)})"
+                f"score = w_hit({self.w_hit})*hit_tokens({hit_tokens}) - "
+                f"w_load({self.w_load})*queue_tokens({queue_tokens}), "
+                f"num_hits={num_hits}/{len(req_blocks)}"
             )
             if score > best_score:
                 best_score = score
@@ -509,6 +569,61 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         super().remember_request(request, local_instance_id, pending_tokens)
         self.req_to_scheduler[request.request_id] = local_instance_id
         self.req_to_request[request.request_id] = request
+        self._insert_pending_hashes(request, local_instance_id)
+
+    def _insert_pending_hashes(
+        self, request: UserRequest, local_instance_id: int
+    ) -> None:
+        """Count a routed request's prefix into hit scoring from route time.
+
+        Same-prefix requests arriving before this one's first token then still see
+        the hit and herd onto this instance. ``build_req_token_blocks`` returns []
+        when the instance's block_size is not known yet (before the first stats
+        heartbeat); scoring then degenerates to shadow-LRU-only hits until
+        first-token insert, matching the pre-overlay behavior.
+
+        Unlike the shadow LRU this is not capped by the instance's block count, so
+        a burst too large to fit scores optimistically. Entries only live until
+        first token and the burst is bounded by ``max_inflight_per_instance``.
+        """
+        req_blocks = self.build_req_token_blocks(request, local_instance_id)
+        if not req_blocks:
+            return
+        pend = self.pending_blocks.setdefault(local_instance_id, {})
+        hashes: list[str] = []
+        for block in req_blocks:
+            blk_hash = block.blk_hash
+            if not blk_hash:
+                # Pending chain follows the same contiguous-prefix rule as the
+                # shadow LRU: stop at the first non-hashable (partial) block.
+                break
+            pend[blk_hash] = pend.get(blk_hash, 0) + 1
+            hashes.append(blk_hash)
+        if hashes:
+            self.req_pending_hashes[request.request_id] = (local_instance_id, hashes)
+
+    def _release_router_reservation(self, request_id: str) -> None:
+        # Also reached from the stale-reservation reaper, which must not leave the
+        # overlay holding blocks of a request nobody will ever finish: those would
+        # keep scoring as hits forever and pin the burst to a dead prefix.
+        super()._release_router_reservation(request_id)
+        self._release_pending_hashes(request_id)
+
+    def _release_pending_hashes(self, request_id: str) -> None:
+        """Drop this request's pending-overlay refcounts (idempotent)."""
+        entry = self.req_pending_hashes.pop(request_id, None)
+        if entry is None:
+            return
+        local_instance_id, hashes = entry
+        pend = self.pending_blocks.get(local_instance_id)
+        if not pend:
+            return
+        for blk_hash in hashes:
+            cnt = pend.get(blk_hash, 0)
+            if cnt <= 1:
+                pend.pop(blk_hash, None)
+            else:
+                pend[blk_hash] = cnt - 1
 
     def insert_req_blocks(self, request_id: str) -> None:
         # Insert request blocks into cached_blocks when the first token arrived.
@@ -539,6 +654,11 @@ class PrefixCacheAwarePolicy(LoadBalancer):
                 self._push_evict_buffer(local_instance_id, evicted_hash)
 
     def forget_request(self, request_id: str) -> None:
+        # The prefix has just been handed over to the confirmed shadow LRU by
+        # ``insert_req_blocks``, so the overlay entry is no longer needed. Needed
+        # explicitly here because unified DP keeps the reservation alive through
+        # decode and so never reaches ``_release_router_reservation``.
+        self._release_pending_hashes(request_id)
         super().forget_request(request_id)
         self.req_to_request.pop(request_id, None)
         self.req_to_scheduler.pop(request_id, None)
@@ -575,6 +695,7 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             )
 
     def remove_request(self, request_id: str):
+        # Overlay release rides along in ``_release_router_reservation``.
         super().remove_request(request_id)
         self.req_to_request.pop(request_id, None)
         self.req_to_scheduler.pop(request_id, None)

@@ -9,6 +9,7 @@ from logging import getLogger
 from pathlib import Path
 
 from chitu.task import UserRequest, TaskPool, Task
+from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 from chitu.chitu_main import (
     chitu_init,
     chitu_run,
@@ -219,6 +220,7 @@ def gen_reqs_fake(num_reqs, prompt_len, max_new_tokens, frequency_penalty):
 
 def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
     reqs: list[UserRequest] = []
+    temperature = float(os.environ.get("CHITU_TEST_TEMPERATURE", "1"))
     for i in range(num_reqs):
         if USE_TOOLS:
             req_data = msg_tools[i % len(msg_tools)]
@@ -228,7 +230,7 @@ def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
                 f"{gen_req_id()}",
                 max_new_tokens=max_new_tokens,
                 frequency_penalty=frequency_penalty,
-                temperature=1,
+                temperature=temperature,
                 tools=req_data["tools"],
             )
         elif is_vl:
@@ -238,7 +240,7 @@ def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
                 f"{gen_req_id()}",
                 max_new_tokens=max_new_tokens,
                 frequency_penalty=frequency_penalty,
-                temperature=1,
+                temperature=temperature,
             )
         else:
             msg = msgs[i % len(msgs)]
@@ -247,7 +249,7 @@ def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
                 f"{gen_req_id()}",
                 max_new_tokens=max_new_tokens,
                 frequency_penalty=frequency_penalty,
-                temperature=1,
+                temperature=temperature,
             )
         req.messages = msg
         reqs.append(req)
@@ -325,9 +327,9 @@ def run_pipe_or_tensor_parallelism(args, timers):
             t_start = time.perf_counter()
             timers("overall").start()
 
-        tokens = 0
+        steps = 0
         while not chitu_is_terminated():
-            tokens += 1
+            steps += 1
             chitu_run()
             if rank == 0 and TaskPool.all_finished():
                 break  # Rank 0 can temporarily leave to do other things
@@ -335,11 +337,20 @@ def run_pipe_or_tensor_parallelism(args, timers):
         if rank == 0:
             timers("overall").stop()
             t_end = time.perf_counter()
-            logger.info(f"Tokens generate : {tokens}")
+            logger.info(f"Total steps : {steps}")
             logger.info(f"Time cost {t_end - t_start}")
             logger.info(
                 f"max GPU memory used: {torch.cuda.max_memory_allocated() / 1024**3} GB"
             )
+            # MTP acceptance: from Prometheus counters (same source as metrics_monitor)
+            n_drafts = args.infer.mtp_size - 1 if args.infer.mtp_size > 1 else 0
+            if n_drafts > 0 and steps > 0:
+                proposed, accepted = PrometheusMetricsCollector.get_mtp_stats()
+                if proposed > 0:
+                    logger.info(
+                        f"MTP acceptance: accepted={accepted}/{proposed} "
+                        f"({accepted/proposed:.1%} | {accepted/len(reqs):.2f}/req)"
+                    )
 
             for i, req in enumerate(reqs):
                 if sys.stdout.isatty():
@@ -380,9 +391,9 @@ def run_normal(args, timers):
         logger.info(f"------ batch {i} ------")
         t_start = time.time()
         timers("overall").start()
-        tokens = 0
+        steps = 0
         while len(TaskPool.pool) > 0:
-            tokens += 1
+            steps += 1
             chitu_run()
         while not TaskPool.all_finished():
             # no new token generated, but chitu is not terminated
@@ -391,8 +402,16 @@ def run_normal(args, timers):
         print("GPU memory used : ", torch.cuda.memory_allocated())
         timers("overall").stop()
         t_end = time.time()
-        logger.info(f"Tokens generate : {tokens}")
+        logger.info(f"Total steps : {steps}")
         logger.info(f"Time cost {t_end - t_start}")
+        n_drafts = args.infer.mtp_size - 1 if args.infer.mtp_size > 1 else 0
+        if n_drafts > 0 and steps > 0:
+            proposed, accepted = PrometheusMetricsCollector.get_mtp_stats()
+            if proposed > 0:
+                logger.info(
+                    f"MTP acceptance: accepted={accepted}/{proposed} "
+                    f"({accepted/proposed:.1%} | {accepted/len(reqs):.2f}/req)"
+                )
 
         for i, req in enumerate(reqs):
             logger.info(f"Response in rank {rank}: reqs[{i}].output={req.output}")

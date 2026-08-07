@@ -582,6 +582,7 @@ torchrun --nnodes 1 \
 | :--- | :------ | :--- |
 | `boot.n_nodes` | `1` | 要使用的节点（服务器）数量。 |
 | `boot.n_gpus_per_node` | `1` | 每个节点要使用的 GPU 数量。 |
+| `boot.platform` | `"auto"` | 容器硬件平台；显式指定时跳过 SMI 自动探测。 |
 | `boot.target` | `["-m", "chitu"]` | 在容器内运行的目标 chitu 程序或脚本。 |
 | `boot.remote_launcher` | `"local"` | 如何在多个节点上运行。设置为 `srun` 以使用 Slurm。 |
 | `boot.interactive_node_0` | `"auto"` | 使第一个节点进入交互模式。`"auto"` 表示自动决定。 |

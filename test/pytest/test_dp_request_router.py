@@ -31,7 +31,8 @@ def _build_router(algorithm: str = "prefix_cache_aware") -> RequestRouter:
         routing_algorithm=algorithm,
         router_cache_miss_fallback_algorithm="least_loaded",
         router_hit_weight=1.0,
-        router_load_penalty_weight=0.02,
+        router_load_penalty_weight=0.5,
+        router_decode_token_equiv=16.0,
         router_evict_buffer_size=64,
         router_local_reservation_timeout_s=600.0,
     )
@@ -43,40 +44,33 @@ def test_hit_aware_select_scheduler_prefers_instance_with_more_prefix_hits():
     router = _build_router(algorithm="prefix_cache_aware")
 
     # mark two schedulers alive
-    router.policy.update_stats(
-        SchedulerStats(
-            local_instance_id=0,
-            running_requests=20,  # higher load on purpose
-            waiting_requests=0,
-            pending_tokens=0,
-            throughput_tokens_per_sec=0.0,
-            last_update_time=0.0,
-            is_alive=True,
-            num_blocks=8,
-            block_size=4,
+    for local_instance_id in (0, 1):
+        router.policy.update_stats(
+            SchedulerStats(
+                local_instance_id=local_instance_id,
+                running_requests=0,
+                waiting_requests=0,
+                pending_tokens=0,
+                throughput_tokens_per_sec=0.0,
+                last_update_time=0.0,
+                is_alive=True,
+                num_blocks=64,
+                block_size=4,
+            )
         )
-    )
-    router.policy.update_stats(
-        SchedulerStats(
-            local_instance_id=1,
-            running_requests=0,
-            waiting_requests=0,
-            pending_tokens=0,
-            throughput_tokens_per_sec=0.0,
-            last_update_time=0.0,
-            is_alive=True,
-            num_blocks=8,
-            block_size=4,
-        )
-    )
 
-    # request has two full blocks: [1,2,3,4], [5,6,7,8]
-    req = MonkReq("req-hit", [1, 2, 3, 4, 5, 6, 7, 8])
+    # 16 full blocks of 4 tokens. Both score terms are prompt tokens, so the
+    # prompt has to be long enough for the cache hit to be worth more than the
+    # load the routed request itself puts on instance 0.
+    req = MonkReq("req-hit", list(range(64)))
     req_blocks = router.policy.build_req_token_blocks(req, local_instance_id=0)
-    assert len(req_blocks) == 2
-    # instance 0 hits two blocks; instance 1 hits zero.
+    assert len(req_blocks) == 16
+    # instance 0 hits every block; instance 1 hits zero.
     router.policy.remember_request(req, local_instance_id=0)
     router.policy.insert_req_blocks(req.request_id)
+    # Load is the router's own reservation, not the instance-reported figure,
+    # which workers hard-code to 0.
+    assert router.policy.get_router_load(0) == (1, 64)
 
     selected = router.policy.select_scheduler(req)
     assert selected == 0

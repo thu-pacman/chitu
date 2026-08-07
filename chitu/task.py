@@ -434,14 +434,14 @@ class UserRequest:
         if not isinstance(tokens, list):
             tokens = [tokens]
         for token in tokens:
-            self.async_stream.add_data(
-                token, top_logprobs, top_token_idx, notify_server=notify_server
-            )
             self.generated_tokens.append(token)
             logger.debug(f"Request {self.request_id} adds a new token: {token}")
             self.num_output_tokens += 1
             if self.stop_with_eos and token in Backend.tokenizer.stop_tokens:
                 break
+            self.async_stream.add_data(
+                token, top_logprobs, top_token_idx, notify_server=notify_server
+            )
 
     def notify_server_data_added_from_server_thread(self):
         self.async_stream.notify_server_from_server_thread()

@@ -69,6 +69,22 @@ boot:
   #: When null, uses the image bundled in the AppImage.
   container_image: null
 
+  #: Hardware platform used to configure device access for the container
+  #:
+  #: Acceptable values:
+  #: - "auto": Detect the platform on each node from the available system management
+  #:   command.
+  #: - "nvidia": Use NVIDIA container arguments without checking for `nvidia-smi`.
+  #: - "ascend": Use Ascend container arguments without checking for `npu-smi`
+  #:   (Docker only).
+  #: - "hygon": Use Hygon container arguments without checking for `hy-smi`.
+  #: - "metax": Use MetaX container arguments without checking for `mx-smi`
+  #:   (Docker only).
+  #:
+  #: Auto detection checks NVIDIA, Ascend, Hygon, and MetaX in that order for Docker.
+  #: Apptainer supports and checks only NVIDIA and Hygon.
+  platform: "auto"
+
   #: Path to source tree to mount into the container at /workspace/chitu.
   #:
   #: When set, the directory is bind-mounted into the container, so code changes
@@ -169,6 +185,26 @@ boot:
   #: - A list of arguments.
   #: - A space-separated string for arguments.
   extra_torchrun_args: []
+
+  #: Bash commands to set up each Docker or Apptainer workload container before launching its main
+  #: command
+  #:
+  #: The commands run after the container starts and before `boot.torchrun_wrapper` and `torchrun`.
+  #: They run sequentially in the same non-interactive Bash shell. No shell options are changed and
+  #: no variables are exported automatically. Environment variables explicitly exported by the
+  #: commands are visible to `torchrun`. In multi-instance deployments, the commands run once in
+  #: each workload container, including the router. They do not run in the container for
+  #: `boot.on_ready`.
+  #: Commands may run concurrently across containers and nodes, so they must be safe to repeat and
+  #: must not modify the same shared files without coordination. Referenced files must be mounted
+  #: into the container separately. The command string may be visible in process listings and
+  #: startup logs, so do not put secrets directly in this setting.
+  #:
+  #: Acceptable values:
+  #: - null: Run no extra commands.
+  #: - A string containing trusted Bash commands. Use a YAML block scalar (`|`) for multiple
+  #:   commands.
+  container_setup_cmd: null
 
   #: Optional arguments to appear before `torchrun`
   #:
@@ -709,8 +745,21 @@ multi_inst:
     # Only effective when routing_algorithm == prefix_cache_aware
     # when router cache miss, fallback the this algorithm, option: power_of_two_choices, round_robin, least_loaded
     router_cache_miss_fallback_algorithm: "power_of_two_choices"
-    router_hit_weight: 1.0 # The weight of the prefix cache hit block count during router routing tasks.
-    router_load_penalty_weight: 0.02 # The penalty weight of instance load during router routing tasks.
+    # Routing score is w_hit * cached_prompt_tokens - w_load * queued_prefill_tokens.
+    # Both terms are prompt tokens, so they are directly comparable.
+    router_hit_weight: 1.0
+    # A queued token costs the request being routed some latency; a missed token
+    # costs it the same latency and burns prefill compute a cache hit would have
+    # saved. 0.5 weighs time-to-first-token and cluster throughput equally. Raise
+    # toward 1.0 to route purely for latency, lower toward 0 to hoard cache hits.
+    router_load_penalty_weight: 0.5
+    # Prefill-token equivalents charged per request holding a router-local load
+    # reservation. Under unified DP a request keeps its reservation through decode
+    # after its pending tokens drop to zero, and decoding only steals step time
+    # from a new prefill, so this sits far below an average prompt length. Measure
+    # before tuning; 0 drops the term and leaves that pressure entirely to
+    # max_inflight_per_instance.
+    router_decode_token_equiv: 16.0
 
     # Size of the router cache block eviction buffer (unit: blocks).
     # The buffer temporarily holds cache blocks evicted from the router's local cache.

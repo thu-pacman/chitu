@@ -347,21 +347,21 @@ def resample_mtp_rejected(
 ) -> torch.Tensor:
     """Resample rejected positions and finalize accepted positions for MTP.
 
-    tokens[:, 0] is always the target model output — never verified, never touched.
-    Verification happens on tokens[:, 1:] (positions N+1..N+mtp_size-1) against
-    draft_tokens.
+    tokens[:, 0] is the target prediction at the same position as draft[0];
+    tokens[:, n_drafts-1] is the target at draft[n_drafts-1];
+    tokens[:, n_drafts] (the last position, the bonus token) has no draft — it
+    is kept as-is from _sample_mtp.
 
-    Accepted draft positions (depth d < accept_indices[b]) MUST emit the DRAFT
-    token (not the target-sampled token): the KV cache and MTP layers advance
-    based on the draft tokens that were accepted.  Rejected positions are
-    resampled from norm(max(0, q - p)).
+    Accepted draft positions (depth d < accept_indices[b]) emit the DRAFT token
+    (target's KV cache and MTP hidden states advance on drafts).  Rejected
+    positions are resampled from norm(max(0, q - p)).
 
     Args:
         tokens:         (bs, mtp_size)          in/out — sampled token ids
         q_all_probs:    (bs*mtp_size, K)        filtered target probs (all positions)
         q_all_token_ids:(bs*mtp_size, K)        token indices from top-k
-        p:              (bs, n_drafts, V)       draft softmax (positions 1..n_drafts)
-        draft_tokens:   (bs, n_drafts)          draft token ids (what was accepted)
+        p:              (bs, n_drafts, V)       draft proposal distribution (same as sample_draft_tokens)
+        draft_tokens:   (bs, n_drafts)          draft token ids (what was proposed)
         accept_indices: (bs,) long              first rejected draft depth, or n_drafts if all accepted
         greedy_mask:    (bs,) bool
         mtp_size:       int
@@ -377,9 +377,9 @@ def resample_mtp_rejected(
     q_probs_3d = q_all_probs.view(bs, mtp_size, K)
     q_token_ids_3d = q_all_token_ids.view(bs, mtp_size, K)
 
-    # ---- q for rejection positions 1..mtp_size-1 (= n_drafts positions) ----
-    q_probs = q_probs_3d[:, 1:].reshape(bs * n_drafts, K)
-    q_token_ids = q_token_ids_3d[:, 1:].reshape(bs * n_drafts, K)
+    # ---- q for positions 0..n_drafts-1 (= positions with drafts) ----
+    q_probs = q_probs_3d[:, :n_drafts].reshape(bs * n_drafts, K)
+    q_token_ids = q_token_ids_3d[:, :n_drafts].reshape(bs * n_drafts, K)
 
     # ---- gather p at q_token_ids positions ----
     p_flat = p.reshape(bs * n_drafts, -1)  # (bs*n_drafts, V)
@@ -400,11 +400,6 @@ def resample_mtp_rejected(
         q_token_ids,
     ).view(bs, n_drafts)
 
-    bonus_sample = gumbel_max_sample(
-        q_probs_3d[:, n_drafts],
-        q_token_ids_3d[:, n_drafts],
-    )  # (bs,)
-
     # ---- select residual or q-fallback ----
     rejection_sample = torch.where(
         residual_sum > 0,
@@ -419,15 +414,18 @@ def resample_mtp_rejected(
     reject_mask = ~greedy_mask[:, None] & (
         accept_indices[:, None] == depths
     )  # (bs, n_drafts)
-    bonus_mask = ~greedy_mask & (accept_indices == n_drafts)  # (bs,)
 
     # ---- apply updates ----
-    # 1. Accepted draft positions → emit the DRAFT token (KV/MTP advance on drafts)
+    # 1. Accepted draft positions → emit the DRAFT token
     # 2. Rejected position → resampled token
-    # 3. All accepted → bonus token from q_last
+    # 3. tokens[:, n_drafts] is the bonus token already sampled from q by _sample_mtp
+    #    — kept as-is.
     tokens_out = tokens.clone()
-    tokens_out[:, 1:] = torch.where(accept_mask, draft_tokens, tokens[:, 1:])
-    tokens_out[:, 1:] = torch.where(reject_mask, rejection_sample, tokens_out[:, 1:])
-    tokens_out[:, n_drafts] = torch.where(bonus_mask, bonus_sample, tokens[:, n_drafts])
+    tokens_out[:, :n_drafts] = torch.where(
+        accept_mask, draft_tokens, tokens[:, :n_drafts]
+    )
+    tokens_out[:, :n_drafts] = torch.where(
+        reject_mask, rejection_sample, tokens_out[:, :n_drafts]
+    )
 
     return tokens_out
