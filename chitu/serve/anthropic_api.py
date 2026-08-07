@@ -6,26 +6,28 @@
 from __future__ import annotations
 
 import json
-from typing import Optional, Literal
+import os
+from typing import Any, Annotated, Optional, Literal
 from logging import getLogger
 
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from chitu.backend import Backend
-from chitu.global_vars import get_global_args
-from chitu.task import SampleParams, UserRequest, RequestParams
-from chitu.tool_call import (
-    ChoiceToolCall,
-    ToolConfig,
-    get_tool_parser_cls,
-    parse_stream_by_parser,
-)
-from chitu.serve.common import (
-    build_chat_template_kwargs,
-    submit_request,
-)
-from chitu.utils import gen_req_id
+from chitu.serve.api_docs import DocField
+from chitu.tool_call.type_def import ChoiceToolCall, ToolConfig
+from chitu.serve.request_id import gen_req_id
+
+DOC_GENERATION = os.environ.get("CHITU_HTTP_API_DOCS") == "1"
+
+if not DOC_GENERATION:
+    from chitu.backend import Backend
+    from chitu.global_vars import get_global_args
+    from chitu.task import SampleParams, UserRequest, RequestParams
+    from chitu.tool_call import get_tool_parser_cls, parse_stream_by_parser
+    from chitu.serve.common import (
+        build_chat_template_kwargs,
+        submit_request,
+    )
 
 logger = getLogger(__name__)
 
@@ -34,20 +36,121 @@ class AnthropicThinking(BaseModel):
     """Subset of Anthropic 'thinking' parameter."""
 
     model_config = ConfigDict(extra="allow")
-    type: Literal["enabled", "disabled", "adaptive"]
-    budget_tokens: Optional[int] = None
+    type: Literal["enabled", "disabled", "adaptive"] = DocField(
+        en='Thinking mode: "enabled", "disabled", or "adaptive". "adaptive" is currently treated as "enabled".',
+        zh='思考模式："enabled"、"disabled" 或 "adaptive"。当前 "adaptive" 会按 "enabled" 处理。',
+    )
+    budget_tokens: Optional[int] = DocField(
+        None,
+        en="Optional token budget hint for extended thinking. Accepted only for Anthropic compatibility and current ignored. Please use thinking.type to enable or disable thinking.",
+        zh="扩展思考的可选 token 预算提示。仅为兼容 Anthropic 接口而接受，当前被忽略。请通过 thinking.type 启用或关闭 thinking。",
+    )
+
+
+class AnthropicTextBlock(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["text"] = DocField(
+        "text", en="Text content block.", zh="文本内容块。"
+    )
+    text: str = DocField(en="Text content.", zh="文本内容。")
+
+
+class AnthropicThinkingBlock(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["thinking"] = DocField(
+        "thinking",
+        en="Thinking content block.",
+        zh="思考内容块。",
+    )
+    thinking: str = DocField(en="Thinking content.", zh="思考内容。")
+
+
+class AnthropicToolUseBlock(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["tool_use"] = DocField(
+        "tool_use",
+        en="Tool-use content block emitted by an assistant message.",
+        zh="assistant 消息发出的工具调用内容块。",
+    )
+    id: str | None = DocField(None, en="Tool-use identifier.", zh="工具调用 ID。")
+    name: str = DocField(en="Tool name.", zh="工具名称。")
+    input: dict[str, Any] = DocField(
+        default_factory=dict,
+        en="Tool input arguments.",
+        zh="工具输入参数。",
+    )
+
+
+class AnthropicToolResultBlock(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["tool_result"] = DocField(
+        "tool_result",
+        en="Tool-result content block returned to the model.",
+        zh="返回给模型的工具结果内容块。",
+    )
+    tool_use_id: str | None = DocField(
+        None,
+        en="Identifier of the tool_use block this result responds to.",
+        zh="该结果所回复的 tool_use 内容块 ID。",
+    )
+    tool_call_id: str | None = DocField(
+        None,
+        en="OpenAI-compatible alias of tool_use_id.",
+        zh="tool_use_id 的 OpenAI 兼容别名。",
+    )
+    content: str | list[str | AnthropicTextBlock] = DocField(
+        "",
+        en="Tool result content as text or text blocks.",
+        zh="工具结果内容，可以是文本或文本块。",
+    )
+
+
+AnthropicContentBlock = Annotated[
+    AnthropicTextBlock
+    | AnthropicThinkingBlock
+    | AnthropicToolUseBlock
+    | AnthropicToolResultBlock,
+    Field(discriminator="type"),
+]
+
+
+def _content_block_to_dict(item):
+    if isinstance(item, BaseModel):
+        return item.model_dump(exclude_none=True)
+    return item
 
 
 class AnthropicMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
-    role: Literal["user", "assistant"] | str
-    content: str | list[str | dict]
+    role: Literal["user", "assistant"] | str = DocField(
+        en='Message role, normally "user" or "assistant".',
+        zh='消息角色，通常为 "user" 或 "assistant"。',
+    )
+    content: str | list[str | AnthropicContentBlock] = DocField(
+        en="Message content as a string or a list of content blocks.",
+        zh="消息内容，可以是字符串或内容块列表。",
+    )
 
 
 class AnthropicToolChoice(BaseModel):
-    type: Literal["auto", "any", "tool", "none"]
-    disable_parallel_tool_use: bool | None = False
-    name: str | None = None
+    type: Literal["auto", "any", "tool", "none"] = DocField(
+        en='Tool choice mode: "auto", "any", "tool", or "none". "any" maps to a required tool call.',
+        zh='工具选择模式："auto"、"any"、"tool" 或 "none"。"any" 会映射为强制工具调用。',
+    )
+    disable_parallel_tool_use: bool | None = DocField(
+        False,
+        en="Whether to disable parallel tool use.",
+        zh="是否禁用并行工具调用。",
+    )
+    name: str | None = DocField(
+        None,
+        en='Tool name required when type is "tool".',
+        zh='当 type 为 "tool" 时必填的工具名称。',
+    )
 
     @model_validator(mode="after")
     def validate_tool_choice_params(self):
@@ -64,19 +167,69 @@ class AnthropicMessagesRequest(BaseModel):
     """
 
     model_config = ConfigDict(extra="allow")
-    model: Optional[str] = None
-    messages: list[AnthropicMessage]
-    system: Optional[str | list[str | dict]] = None
-    max_tokens: int
-    stream: bool = False
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    top_k: Optional[int] = None
-    stop_sequences: Optional[list[str]] = None
-    thinking: Optional[AnthropicThinking] = None
-    tools: Optional[list[dict]] = None
-    tool_choice: Optional[AnthropicToolChoice] = None
-    ttft_timeout_s: Optional[float] = None
+    model: Optional[str] = DocField(
+        None,
+        en="Model identifier. Defaults to the loaded model when omitted and supports configured model aliases.",
+        zh="模型标识符。省略时默认使用已加载模型，并支持配置的模型别名。",
+    )
+    messages: list[AnthropicMessage] = DocField(
+        en='List of messages with role and content. Roles are normally "user" or "assistant".',
+        zh='消息列表，每条消息包含 role 和 content。role 通常为 "user" 或 "assistant"。',
+    )
+    system: Optional[str | list[str | AnthropicContentBlock]] = DocField(
+        None,
+        en="System prompt as a string or content blocks.",
+        zh="系统提示词，可以是字符串或内容块列表。",
+    )
+    max_tokens: int = DocField(
+        en="Maximum number of tokens to generate.",
+        zh="最大生成 token 数。",
+    )
+    stream: bool = DocField(
+        False,
+        en="Whether to stream the response using SSE.",
+        zh="是否使用 SSE 流式返回响应。",
+    )
+    temperature: Optional[float] = DocField(
+        None,
+        en="Sampling temperature. Uses the server default when omitted.",
+        zh="采样温度。省略时使用服务端默认值。",
+    )
+    top_p: Optional[float] = DocField(
+        None,
+        en="Nucleus sampling threshold. Uses the server default when omitted.",
+        zh="核采样阈值。省略时使用服务端默认值。",
+    )
+    top_k: Optional[int] = DocField(
+        None,
+        en="Top-k sampling value. Uses the server default when omitted.",
+        zh="Top-k 采样值。省略时使用服务端默认值。",
+    )
+    stop_sequences: Optional[list[str]] = DocField(
+        None,
+        en="Sequences that stop generation. Applied by post-generation string truncation.",
+        zh="停止生成的序列列表。通过生成后字符串截断实现。",
+    )
+    thinking: Optional[AnthropicThinking] = DocField(
+        None,
+        en="Extended thinking configuration.",
+        zh="扩展思考配置。",
+    )
+    tools: Optional[list[dict]] = DocField(
+        None,
+        en="Tool definitions in Anthropic format, or already normalized OpenAI function tool format.",
+        zh="Anthropic 格式的工具定义，或已归一化的 OpenAI function tool 格式。",
+    )
+    tool_choice: Optional[AnthropicToolChoice] = DocField(
+        None,
+        en="Tool calling behavior.",
+        zh="工具调用行为。",
+    )
+    ttft_timeout_s: Optional[float] = DocField(
+        None,
+        en="Time-to-first-token timeout in seconds. Requests that wait too long to satisfy their TTFT requirement can be terminated to leave capacity for other requests that may still return in time.",
+        zh="首 token 延迟超时时间，单位为秒。若请求等待过久且已无法满足 TTFT 要求，可终止该请求以便为仍可能及时返回的其他请求留出处理能力。",
+    )
 
 
 class AnthropicCompletionRequest(BaseModel):
@@ -86,16 +239,48 @@ class AnthropicCompletionRequest(BaseModel):
     """
 
     model_config = ConfigDict(extra="allow")
-    model: Optional[str] = None
-    prompt: str
-    suffix: Optional[str] = None
-    max_tokens_to_sample: int
-    stream: bool = False
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    top_k: Optional[int] = None
-    stop_sequences: Optional[list[str]] = None
-    ttft_timeout_s: Optional[float] = None
+    model: Optional[str] = DocField(
+        None,
+        en="Model identifier. Defaults to the loaded model when omitted and supports configured model aliases.",
+        zh="模型标识符。省略时默认使用已加载模型，并支持配置的模型别名。",
+    )
+    prompt: str = DocField(
+        en="Text prompt for completion.",
+        zh="文本补全的输入提示。",
+    )
+    suffix: Optional[str] = DocField(
+        None,
+        en="Optional suffix for fill-in-the-middle completion when the tokenizer supports FIM tokens.",
+        zh="用于 fill-in-the-middle 补全的可选后缀，需要分词器支持 FIM token。",
+    )
+    max_tokens_to_sample: int = DocField(
+        en="Maximum number of tokens to generate.",
+        zh="最大生成 token 数。",
+    )
+    stream: bool = DocField(
+        False,
+        en="Whether to stream the response using SSE.",
+        zh="是否使用 SSE 流式返回响应。",
+    )
+    temperature: Optional[float] = DocField(
+        None, en="Sampling temperature.", zh="采样温度。"
+    )
+    top_p: Optional[float] = DocField(
+        None, en="Nucleus sampling threshold.", zh="核采样阈值。"
+    )
+    top_k: Optional[int] = DocField(
+        None, en="Top-k sampling value.", zh="Top-k 采样值。"
+    )
+    stop_sequences: Optional[list[str]] = DocField(
+        None,
+        en="Sequences that stop generation. Applied by post-generation string truncation.",
+        zh="停止生成的序列列表。通过生成后字符串截断实现。",
+    )
+    ttft_timeout_s: Optional[float] = DocField(
+        None,
+        en="Time-to-first-token timeout in seconds. Requests that wait too long to satisfy their TTFT requirement can be terminated to leave capacity for other requests that may still return in time.",
+        zh="首 token 延迟超时时间，单位为秒。若请求等待过久且已无法满足 TTFT 要求，可终止该请求以便为仍可能及时返回的其他请求留出处理能力。",
+    )
 
 
 def anthropic_error(status_code: int, error_type: str, message: str):
@@ -141,7 +326,7 @@ def resolve_requested_model_or_error(requested_model: Optional[str]) -> str:
     return req_model
 
 
-def anthropic_content_to_text(content: str | list[str | dict]) -> str:
+def anthropic_content_to_text(content: str | list[str | AnthropicContentBlock]) -> str:
     """
     Convert Anthropic-style content blocks into plain text to be compatible with
     tokenizers/chat templates that only accept string content.
@@ -150,6 +335,7 @@ def anthropic_content_to_text(content: str | list[str | dict]) -> str:
         return content
     parts: list[str] = []
     for item in content:
+        item = _content_block_to_dict(item)
         if isinstance(item, str):
             parts.append(item)
             continue
@@ -270,6 +456,7 @@ def anthropic_message_to_internal(message: AnthropicMessage) -> list[dict]:
         tool_calls.clear()
 
     for item in message.content:
+        item = _content_block_to_dict(item)
         if isinstance(item, str):
             text_parts.append(item)
             continue

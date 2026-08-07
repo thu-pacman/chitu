@@ -38,7 +38,7 @@ class TestMessage:
     def test_list_content(self):
         msg = Message(content=[{"type": "text", "text": "hello"}])
         assert isinstance(msg.content, list)
-        assert msg.content[0]["type"] == "text"
+        assert msg.content[0].type == "text"
 
     def test_none_content(self):
         """OpenClaw may set content to None."""

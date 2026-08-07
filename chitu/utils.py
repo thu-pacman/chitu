@@ -30,6 +30,7 @@ from chitu.import_utils import (
     try_import_opt_dep,
 )
 from chitu.device_type import is_ascend
+from chitu.serve.request_id import gen_req_id
 
 logger = getLogger(__name__)
 
@@ -351,12 +352,6 @@ class DataSaver:
             return result
 
         return wrapper
-
-
-def gen_req_id(len=8):
-    random_number = random.getrandbits(len * 4)
-    hex_string = f"{random_number:0{len}x}"
-    return hex_string
 
 
 def log_with_rank(msg, rank=0, prefix="", level=WARNING, logger=logger):
