@@ -328,6 +328,19 @@ class DSAIndexer:
 
         weights = weights.reshape(s_q, h)
 
+        # CP pads every rank to n_local rows, so q may contain trailing rows that
+        # are not real queries. q_seq_ids is built from the unpadded local index
+        # selection and therefore records the real query count. Do not expose
+        # those CP padding rows as logical M to the LightOp CO: the CO derives a
+        # whole 128-row tile's KE from KE[min(tile_end, logical_s_q - 1)], and a
+        # trailing CP dummy can otherwise truncate real rows in the same tile.
+        logical_s_q = q_seq_ids.shape[0] if q_seq_ids is not None else s_q
+        if logical_s_q <= 0 or logical_s_q > s_q:
+            raise ValueError(
+                f"Invalid Hygon MQA logical query count {logical_s_q} "
+                f"for storage query count {s_q}"
+            )
+
         if ke is not None:
             if ks is None:
                 ks = torch.zeros(s_q, dtype=torch.int32, device=q.device)
@@ -347,18 +360,29 @@ class DSAIndexer:
                     + ks
                 )
 
-        # LightOp's 128-row ASM path launches full query tiles, but its Q,
-        # weight, and range-metadata loads do not mask a partial last tile.
-        # Pad every row-indexed input to the launch shape, then discard the
-        # dummy output rows below.
-        kernel_s_q = s_q
-        if s_q >= 128 and s_q % 128 != 0:
-            kernel_s_q = (s_q + 127) // 128 * 128
-            pad_rows = kernel_s_q - s_q
+        # LightOp mqa_logits call contract for its 128-row path:
+        # 1. Every query-row input (`q`, `weights`, `ks`, and `ke`) must provide
+        #    physical storage for round_up(logical_s_q, 128) rows.
+        # 2. Set `ks = ke = 0` for every padded query row.
+        # 3. Pass the real query count, excluding CP padding, as logical_s_q;
+        #    never pass the padded physical row count.
+        required_storage_rows = logical_s_q
+        # Preserve the proven ASM threshold: the tail-OOB evidence covers this
+        # path, not LightOp's small-M behavior.
+        if logical_s_q >= 128:
+            required_storage_rows = (logical_s_q + 127) // 128 * 128
+        if s_q < required_storage_rows:
+            pad_rows = required_storage_rows - s_q
             q = torch.cat((q, q.new_zeros((pad_rows, h, q.shape[2]))), dim=0)
             weights = torch.cat((weights, weights.new_zeros((pad_rows, h))), dim=0)
             ks = torch.cat((ks, ks.new_zeros((pad_rows,))), dim=0)
             ke = torch.cat((ke, ke.new_zeros((pad_rows,))), dim=0)
+
+        # LightOp's MQA ABI assumes packed [M, H, D] input and has no stride
+        # arguments. A fused indexer/attention projection returns indexer Q as
+        # a strided view, so materialize it at the Hygon kernel boundary. Keep
+        # this after tail padding to avoid copying the same Q twice.
+        q = q.contiguous()
 
         index_score = _call_hygon_mqa_logits(
             q,
@@ -366,15 +390,20 @@ class DSAIndexer:
             weights,
             ks,
             ke,
-            kernel_s_q,
+            logical_s_q,
             k.shape[0],
             h,
             q.shape[2],
             clean_logits=False,
         )
 
-        if kernel_s_q != s_q:
-            index_score = index_score.narrow(0, 0, s_q)
+        if index_score.shape[0] < logical_s_q:
+            raise RuntimeError(
+                f"Hygon MQA returned {index_score.shape[0]} rows for "
+                f"logical query count {logical_s_q}"
+            )
+        if index_score.shape[0] > logical_s_q:
+            index_score = index_score.narrow(0, 0, logical_s_q)
 
         if not compact_output:
             return index_score
@@ -385,7 +414,7 @@ class DSAIndexer:
         # items in a row does not store any value at all. TODO: Implement our own version
         # of this kernel on hygon, and replace it.
         out = torch.full(
-            (index_score.shape[0], seq_len_delta.new.max_len),
+            (s_q, seq_len_delta.new.max_len),
             float("-inf"),
             dtype=index_score.dtype,
             device=index_score.device,
@@ -1026,8 +1055,17 @@ class DSAIndexer:
             if ks is not None:
                 if ke is None:
                     raise ValueError("CP packed Hygon TopK requires valid lengths")
-                row_starts = ks
-                lengths = ke
+                # MR1978 passes only real query rows to LightOp, while CP's
+                # metadata still includes physical dummy rows. Keep TopK
+                # metadata aligned with the logical logits rows.
+                rows = logits.shape[0]
+                if ks.numel() < rows or ke.numel() < rows:
+                    raise ValueError(
+                        "CP packed Hygon TopK metadata is shorter than logits: "
+                        f"rows={rows}, ks={ks.numel()}, ke={ke.numel()}"
+                    )
+                row_starts = ks.narrow(0, 0, rows)
+                lengths = ke.narrow(0, 0, rows)
             else:
                 row_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
                 row_starts = seq_len_delta.new.prefix_lens_tensor_device[
@@ -1038,12 +1076,36 @@ class DSAIndexer:
                     if is_causal
                     else seq_len_delta.new.lens_tensor_device[row_seq_ids]
                 )
-            return topk_indices(
+            logical_indices = topk_indices(
                 logits,
                 index_topk,
                 lengths=lengths.contiguous(),
                 row_starts=row_starts.contiguous(),
             )
+            if logical_indices.dtype != torch.int32:
+                raise RuntimeError(
+                    "Packed Hygon TopK must return int32 indices, got "
+                    f"{logical_indices.dtype}"
+                )
+
+            # FlashMLA still consumes the CP-padded physical Q rows. Restore
+            # that row count without inventing valid keys for dummy queries.
+            physical_rows = q_fp8.shape[0]
+            logical_rows = logical_indices.shape[0]
+            if logical_rows > physical_rows:
+                raise RuntimeError(
+                    "Packed Hygon TopK returned more rows than physical Q: "
+                    f"logical_rows={logical_rows}, physical_rows={physical_rows}"
+                )
+            if logical_rows == physical_rows:
+                return logical_indices
+            dummy_indices = torch.full(
+                (physical_rows - logical_rows, *logical_indices.shape[1:]),
+                -1,
+                dtype=torch.int32,
+                device=logical_indices.device,
+            )
+            return torch.cat((logical_indices, dummy_indices), dim=0)
 
         # Ensure k does not exceed the actual size of index_score
         k = min(index_topk, logits.size(-1))
