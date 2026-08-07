@@ -445,8 +445,9 @@ def build_chat_template_kwargs(
     reasoning_effort: Optional[str] = None,
 ) -> dict[str, Any]:
     chat_template_kwargs = {}
-    if "DeepSeek-V3.1" in get_global_args().models.name:
-        # DeepSeek-V3.1 tokenizer uses `thinking` instead of `enable_thinking`
+    model_name = get_global_args().models.name
+    if "DeepSeek-V3.1" in model_name or "Kimi-K2" in model_name:
+        # These models' chat templates use `thinking` instead of `enable_thinking`.
         chat_template_kwargs["thinking"] = enable_thinking
     else:
         chat_template_kwargs["enable_thinking"] = enable_thinking
