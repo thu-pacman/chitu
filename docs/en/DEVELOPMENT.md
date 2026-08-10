@@ -1000,6 +1000,10 @@ The benchmark follows the following assumption, and you should keep them consist
 
 Note that the benchmarking script uses a lot of file handles when `--max-concurrency` is large, which may be over the limit by `ulimit`. **It is recommended to raise to limit before benchmarking, for example by `ulimit -n 65536`.**
 
+## Performance Profiling
+
+See [Profiling](PROFILING.md).
+
 ## Unit Tests
 
 Some unit tests may be used for diagnosing potential issues:
@@ -1060,3 +1064,7 @@ Runtime:
 | `CHITU_CONFIG_PATH`             | Path to a directory          | Override the config directory.                         |
 | `CHITU_CONFIG_NAME`             | Config file name w/o .yml    | Override the entry config file name.                   |
 | `CHITU_PREPROCESS_AND_SAVE_DIR` | Path to a directory          | Output directory for `script/preprocess_and_save.py`   |
+| `CHITU_TORCH_PROFILER_OUTPUT_ROOT` | Path to a directory        | Root directory for Torch Profiler trace files. See [Profiling](./PROFILING.md). |
+| `CHITU_MEM_TRACK`              | `0`, `1`                     | Enable startup-time CUDA memory tracking. See [Profiling](./PROFILING.md). |
+| `CHITU_MEM_TRACK_MAX_ENTRIES`  | Integer                      | Ring-buffer size for CUDA memory tracking. See [Profiling](./PROFILING.md). |
+| `CHITU_MEM_TRACK_SNAPSHOT_DIR` | Path to a directory          | Output directory for CUDA memory snapshots. See [Profiling](./PROFILING.md). |

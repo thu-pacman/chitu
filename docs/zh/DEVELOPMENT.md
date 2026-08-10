@@ -1002,6 +1002,10 @@ python benchmarks/benchmark_serving.py \
 
 注意当 `--max-concurrency` 较大时，性能测试工具会占用大量文件描述符，可能超过 `ulimit` 限制。**建议在运行性能测试前提升限制，如 `ulimit -n 65536`。**
 
+## 性能分析
+
+请参阅[性能分析](PROFILING.md)。
+
 ## 单元测试
 
 一些单元测试可用于定位潜在问题：
@@ -1062,3 +1066,7 @@ torchrun --nproc_per_node 8 --no-python ./test/dist_pytest/run_pytest_with_prett
 | `CHITU_CONFIG_PATH`             | 指向配置文件目录的路径       | 覆盖默认的配置文件目录。                               |
 | `CHITU_CONFIG_NAME`             | 不含 .yml 后缀的配置文件名   | 覆盖默认的配置文件名。                                 |
 | `CHITU_PREPROCESS_AND_SAVE_DIR` | 指向目录的路径               | `script/preprocess_and_save.py` 的输出目录。           |
+| `CHITU_TORCH_PROFILER_OUTPUT_ROOT` | 指向目录的路径            | Torch Profiler trace 输出根目录。参见 [性能分析](./PROFILING.md)。 |
+| `CHITU_MEM_TRACK`              | `0`, `1`                     | 启用启动时 CUDA 显存跟踪。参见 [性能分析](./PROFILING.md)。 |
+| `CHITU_MEM_TRACK_MAX_ENTRIES`  | 整数                         | CUDA 显存跟踪的环形缓冲区大小。参见 [性能分析](./PROFILING.md)。 |
+| `CHITU_MEM_TRACK_SNAPSHOT_DIR` | 指向目录的路径               | CUDA 显存 snapshot 输出目录。参见 [性能分析](./PROFILING.md)。 |

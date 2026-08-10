@@ -5,12 +5,15 @@
 import os
 import sys
 
-# Skip heavy dependencies when running as chitu.boot (boot-time only, no torch).
-# - PyInstaller (frozen) already skips.
-# - APPIMAGE=SOURCE is the source-mode marker set by the boot test scripts.
-_is_boot = getattr(sys, "frozen", False) or (os.environ.get("APPIMAGE") == "SOURCE")
+# Package-level logging setup is for normal runtime imports. Boot-time and docs
+# generation imports avoid runtime dependencies such as torch.
+should_setup_logging = not (
+    getattr(sys, "frozen", False)
+    or (os.environ.get("APPIMAGE") == "SOURCE")
+    or (os.environ.get("CHITU_HTTP_API_DOCS") == "1")
+)
 
-if not _is_boot:
+if should_setup_logging:
     # Some special logging functions like `logger.warning_once` are used
     # across chitu functions. In order to make those functions functional,
     # we configure the logging functions here.

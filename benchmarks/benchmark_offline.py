@@ -130,6 +130,7 @@ def random_requests(args, num_reqs):
             input_len=prompt_len,
             request_id=gen_sequential_id(),
             max_new_tokens=max_new_tokens,
+            random_tokens=True,
         )
         reqs.append(req)
     return reqs

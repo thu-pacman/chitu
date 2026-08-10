@@ -2,44 +2,101 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
 import json
+import os
 import time
 from datetime import datetime
 from logging import getLogger
-from typing import Any, Optional, Literal, Mapping
+from typing import Annotated, Any, Optional, Literal, Mapping
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, model_validator
-from chitu.global_vars import get_global_args
-from chitu.task import UserRequest, RequestParams
-from chitu.utils import gen_req_id
-from chitu.serve.common import (
-    set_min_batch_size,
-    submit_request,
-    build_chat_template_kwargs,
-)
-from chitu.tool_call import (
-    ChoiceDelta,
-    parse_stream_by_parser,
-    get_tool_parser_cls,
-    ToolConfig,
-    ChoiceToolCall,
-)
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from chitu.serve.request_id import gen_req_id
+from chitu.serve.api_docs import DocField
+from chitu.tool_call.type_def import ChoiceDelta, ChoiceToolCall, ToolConfig
+
+DOC_GENERATION = os.environ.get("CHITU_HTTP_API_DOCS") == "1"
+
+if not DOC_GENERATION:
+    from chitu.global_vars import get_global_args
+    from chitu.task import UserRequest, RequestParams
+    from chitu.serve.common import (
+        set_min_batch_size,
+        submit_request,
+        build_chat_template_kwargs,
+    )
+    from chitu.tool_call import parse_stream_by_parser, get_tool_parser_cls
 
 logger = getLogger(__name__)
 
 
+class MessageTextContentBlock(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["text"] = DocField(
+        "text", en="Text content block.", zh="文本内容块。"
+    )
+    text: str = DocField(en="Text content.", zh="文本内容。")
+
+
+class MessageImageURLContentBlock(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    type: Literal["image_url"] = DocField(
+        "image_url",
+        en="Image URL content block.",
+        zh="图片 URL 内容块。",
+    )
+    image_url: str | dict[str, Any] = DocField(
+        en="Image URL or image URL object.",
+        zh="图片 URL 或图片 URL 对象。",
+    )
+
+
+MessageContentBlock = Annotated[
+    MessageTextContentBlock | MessageImageURLContentBlock,
+    Field(discriminator="type"),
+]
+
+
 class Message(BaseModel):
-    role: str = "user"
+    role: str = DocField(
+        "user",
+        en='The role of the message author, such as "system", "user", "assistant", or "tool".',
+        zh='消息作者的角色，例如 "system"、"user"、"assistant" 或 "tool"。',
+    )
     # Note on `None` on `content`: OpenClaw may set `content` to be `None`, although this
     # does not comply with OpenAI spec.
-    content: str | list[str | dict] | None = "hello, who are you"
-    reasoning_content: str | None = None
-    tool_calls: list[ChoiceToolCall] = []
-    tool_call_id: str | None = None
+    content: str | list[str | MessageContentBlock] | None = DocField(
+        "hello, who are you",
+        en="The message content. It can be a string, content blocks, or null for compatibility.",
+        zh="消息内容。可以是字符串、内容块，或为兼容性设置为 null。",
+    )
+    reasoning_content: str | None = DocField(
+        None,
+        en="Reasoning or thinking content carried by the message.",
+        zh="消息中携带的推理或思考内容。",
+    )
+    tool_calls: list[ChoiceToolCall] = DocField(
+        [],
+        en="Tool calls made by the assistant message.",
+        zh="assistant 消息发起的工具调用。",
+    )
+    tool_call_id: str | None = DocField(
+        None,
+        en="Identifier of the tool call that this tool message responds to.",
+        zh="该 tool 消息所回复的工具调用 ID。",
+    )
 
 
 class StreamOptions(BaseModel):
-    include_usage: bool = True
+    include_usage: bool = DocField(
+        True,
+        en="Whether to include token usage information in the stream.",
+        zh="是否在流式返回中包含 token 用量信息。",
+    )
 
 
 class ToolChoiceFunction(BaseModel):
@@ -52,29 +109,121 @@ class ToolChoiceNamedTool(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    conversation_id: str = Field(default_factory=gen_req_id)
-    messages: list[Message]
-    tools: list[dict] = []
-    tool_choice: Literal["none", "auto", "required"] | ToolChoiceNamedTool = "auto"
-    parallel_tool_calls: bool = True
-    logprobs: bool = False
-    top_logprobs: Optional[int] = None
-    max_completion_tokens: Optional[int] = None
-    max_tokens: Optional[int] = Field(default=None, deprecated=True)
-    stream: bool = False
-    stream_options: StreamOptions = Field(default_factory=StreamOptions)
-    temperature: float = 0.8  # [0, 2]
-    top_p: float = 0.9  # [0,1]
-    top_k: int = 50  # -1 or positive integer
-    frequency_penalty: float = 0.0  # [-2, 2]
-    min_batch_size: int = 1
-    stop_with_eos: Optional[bool] = None
-    ignore_eos: Optional[bool] = None  # Compatible with vLLM. Not a OpenAI standard
-    chat_template_kwargs: Mapping[str, Any] = {}
-    enable_thinking: bool = True
-    reasoning_effort: Optional[str] = None
-    extra_body: Mapping[str, Any] = {}
-    ttft_timeout_s: Optional[float] = None
+    conversation_id: str = DocField(
+        default_factory=gen_req_id,
+        en="Unique identifier for the conversation. Generated automatically when omitted.",
+        zh="对话的唯一标识符。省略时会自动生成。",
+    )
+    messages: list[Message] = DocField(
+        en="List of message objects composing the conversation.",
+        zh="组成对话的消息对象列表。",
+    )
+    tools: list[dict] = DocField(
+        [],
+        en="Tool or function definitions available for the model to call.",
+        zh="模型可调用的工具或函数定义列表。",
+    )
+    tool_choice: Literal["none", "auto", "required"] | ToolChoiceNamedTool = DocField(
+        "auto",
+        en='Controls tool calling behavior: "auto", "none", "required", or a named function tool.',
+        zh='控制工具调用行为："auto"、"none"、"required"，或指定一个命名 function tool。',
+    )
+    parallel_tool_calls: bool = DocField(
+        True,
+        en="Whether the model can make multiple tool calls in parallel.",
+        zh="模型是否可以并行发起多个工具调用。",
+    )
+    logprobs: bool = DocField(
+        False,
+        en="Whether to return log probabilities for generated tokens.",
+        zh="是否返回生成 token 的 log 概率。",
+    )
+    top_logprobs: Optional[int] = DocField(
+        None,
+        en="Number of most likely tokens to include log probabilities for when logprobs is enabled.",
+        zh="启用 logprobs 时返回最可能 token 的 log 概率数量。",
+    )
+    max_completion_tokens: Optional[int] = DocField(
+        None,
+        en="Maximum number of tokens to generate.",
+        zh="最大生成 token 数。",
+    )
+    max_tokens: Optional[int] = DocField(
+        None,
+        en="Deprecated alias of max_completion_tokens. If both are set, they must have the same value.",
+        zh="max_completion_tokens 的已弃用别名。若两者同时设置，值必须一致。",
+        deprecated=True,
+    )
+    stream: bool = DocField(
+        False,
+        en="Whether to stream the response using SSE.",
+        zh="是否使用 SSE 流式返回响应。",
+    )
+    stream_options: StreamOptions = DocField(
+        default_factory=StreamOptions,
+        en="Options for streaming responses.",
+        zh="流式响应选项。",
+    )
+    temperature: float = DocField(
+        0.8,
+        en="Sampling temperature. Higher values make output more random.",
+        zh="采样温度。值越高，输出越随机。",
+    )
+    top_p: float = DocField(
+        0.9,
+        en="Nucleus sampling threshold.",
+        zh="核采样阈值。",
+    )
+    top_k: int = DocField(
+        50,
+        en="Top-k sampling value. Use -1 to disable top-k filtering.",
+        zh="Top-k 采样值。设为 -1 可禁用 top-k 过滤。",
+    )
+    frequency_penalty: float = DocField(
+        0.0,
+        en="Frequency penalty applied to repeated tokens.",
+        zh="对重复 token 应用的频率惩罚。",
+    )
+    min_batch_size: int = DocField(
+        1,
+        en="Minimum batch size for processing this request.",
+        zh="处理该请求时使用的最小 batch size。",
+    )
+    stop_with_eos: Optional[bool] = DocField(
+        None,
+        en="Whether generation should stop at the EOS token. Cannot conflict with ignore_eos.",
+        zh="是否在 EOS token 处停止生成。不能与 ignore_eos 冲突。",
+    )
+    ignore_eos: Optional[bool] = DocField(
+        None,
+        en="vLLM-compatible inverse of stop_with_eos. Cannot conflict with stop_with_eos.",
+        zh="兼容 vLLM 的 stop_with_eos 反向参数。不能与 stop_with_eos 冲突。",
+    )
+    chat_template_kwargs: Mapping[str, Any] = DocField(
+        {},
+        en="Additional keyword arguments for chat template construction. Only supported keys are forwarded.",
+        zh="构造对话模板时使用的额外关键字参数。仅支持的键会被转发。",
+    )
+    enable_thinking: bool = DocField(
+        True,
+        en="Whether to enable extended thinking or reasoning mode.",
+        zh="是否启用扩展思考或推理模式。",
+    )
+    reasoning_effort: Optional[str] = DocField(
+        None,
+        en="Reasoning effort hint passed to supported chat templates.",
+        zh="传递给受支持对话模板的 reasoning effort 提示。",
+    )
+    extra_body: Mapping[str, Any] = DocField(
+        {},
+        en="Extra compatibility parameters. Supported keys can override matching top-level fields.",
+        zh="额外兼容参数。受支持的键可以覆盖对应的顶层字段。",
+    )
+    ttft_timeout_s: Optional[float] = DocField(
+        None,
+        en="Time-to-first-token timeout in seconds. Requests that wait too long to satisfy their TTFT requirement can be terminated to leave capacity for other requests that may still return in time.",
+        zh="首 token 延迟超时时间，单位为秒。若请求等待过久且已无法满足 TTFT 要求，可终止该请求以便为仍可能及时返回的其他请求留出处理能力。",
+    )
 
     @model_validator(mode="after")
     def validate_eos_setting(self):
@@ -368,23 +517,70 @@ class CompletionsRequest(BaseModel):
     multi-turn messages and thinking are not supported on this endpoint.
     """
 
-    conversation_id: str = Field(default_factory=gen_req_id)
-    prompt: str | list[int]
-    max_tokens: Optional[int] = None
-    stream: bool = False
-    stream_options: StreamOptions = Field(default_factory=StreamOptions)
-    temperature: float = 0.8  # [0, 2]
-    top_p: float = 0.9  # [0,1]
-    top_k: int = 50
-    frequency_penalty: float = 0.0  # [-2, 2]
-    min_batch_size: int = 1
+    conversation_id: str = DocField(
+        default_factory=gen_req_id,
+        en="Unique identifier for the completion request. Generated automatically when omitted.",
+        zh="补全请求的唯一标识符。省略时会自动生成。",
+    )
+    prompt: str | list[int] = DocField(
+        en="Raw text prompt or token ID sequence to complete without applying a chat template.",
+        zh="要补全的原始文本 prompt 或 token ID 序列，不会应用对话模板。",
+    )
+    max_tokens: Optional[int] = DocField(
+        None,
+        en="Maximum number of tokens to generate. Uses the server default when omitted.",
+        zh="最大生成 token 数。省略时使用服务端默认值。",
+    )
+    stream: bool = DocField(
+        False,
+        en="Whether to stream the response using SSE.",
+        zh="是否使用 SSE 流式返回响应。",
+    )
+    stream_options: StreamOptions = DocField(
+        default_factory=StreamOptions,
+        en="Options for streaming responses.",
+        zh="流式响应选项。",
+    )
+    temperature: float = DocField(0.8, en="Sampling temperature.", zh="采样温度。")
+    top_p: float = DocField(0.9, en="Nucleus sampling threshold.", zh="核采样阈值。")
+    top_k: int = DocField(50, en="Top-k sampling value.", zh="Top-k 采样值。")
+    frequency_penalty: float = DocField(
+        0.0,
+        en="Frequency penalty applied to repeated tokens.",
+        zh="对重复 token 应用的频率惩罚。",
+    )
+    min_batch_size: int = DocField(
+        1,
+        en="Minimum batch size for processing this request.",
+        zh="处理该请求时使用的最小 batch size。",
+    )
     # vLLM/SGLang compatibility. ignore_eos=True forces generation to max_tokens.
-    ignore_eos: Optional[bool] = None
-    stop_with_eos: Optional[bool] = None
+    ignore_eos: Optional[bool] = DocField(
+        None,
+        en="vLLM/SGLang-compatible inverse of stop_with_eos. ignore_eos=True forces generation to max_tokens.",
+        zh="兼容 vLLM/SGLang 的 stop_with_eos 反向参数。ignore_eos=True 会强制生成到 max_tokens。",
+    )
+    stop_with_eos: Optional[bool] = DocField(
+        None,
+        en="Whether generation should stop at the EOS token. Cannot conflict with ignore_eos.",
+        zh="是否在 EOS token 处停止生成。不能与 ignore_eos 冲突。",
+    )
     # Accepted for OpenAI compatibility; not used by chitu.
-    model: Optional[str] = None
-    extra_body: Mapping[str, Any] = {}
-    ttft_timeout_s: Optional[float] = None
+    model: Optional[str] = DocField(
+        None,
+        en="Model identifier accepted for OpenAI compatibility.",
+        zh="为兼容 OpenAI 接口而接受的模型标识符。",
+    )
+    extra_body: Mapping[str, Any] = DocField(
+        {},
+        en="Extra compatibility parameters. Supported keys can override matching top-level fields.",
+        zh="额外兼容参数。受支持的键可以覆盖对应的顶层字段。",
+    )
+    ttft_timeout_s: Optional[float] = DocField(
+        None,
+        en="Time-to-first-token timeout in seconds. Requests that wait too long to satisfy their TTFT requirement can be terminated to leave capacity for other requests that may still return in time.",
+        zh="首 token 延迟超时时间，单位为秒。若请求等待过久且已无法满足 TTFT 要求，可终止该请求以便为仍可能及时返回的其他请求留出处理能力。",
+    )
 
     @model_validator(mode="after")
     def resolve_eos_setting(self):
