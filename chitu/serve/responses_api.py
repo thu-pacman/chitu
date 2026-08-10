@@ -1139,7 +1139,11 @@ async def handle_responses_request(
         tool_config=tool_config,
         logprobs=False,
         top_logprobs=None,
-        max_new_tokens=request.max_output_tokens or args.request.max_new_tokens,
+        max_new_tokens=(
+            request.max_output_tokens
+            if request.max_output_tokens is not None
+            else args.infer.max_seq_len
+        ),
         temperature=request.resolved_temperature,
         top_p=request.resolved_top_p,
         top_k=50,

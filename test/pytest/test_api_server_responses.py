@@ -75,7 +75,7 @@ def create_client(monkeypatch):
         "get_global_args",
         lambda: SimpleNamespace(
             multi_inst=SimpleNamespace(n_insts=1),
-            request=SimpleNamespace(max_new_tokens=64),
+            infer=SimpleNamespace(max_seq_len=4096),
             debug=SimpleNamespace(save_trace_dir=None),
         ),
     )

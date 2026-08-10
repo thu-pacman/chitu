@@ -442,7 +442,11 @@ class AsyncResponse:
 def build_user_request(req: ChatRequest, priority: int = 1) -> UserRequest:
     # enable_thinking / max_new_tokens / chat_template_kwargs
     args = get_global_args()
-    max_new_tokens = req.max_tokens or args.request.max_new_tokens
+    max_new_tokens = (
+        req.max_completion_tokens
+        if req.max_completion_tokens is not None
+        else args.infer.max_seq_len
+    )
     enable_thinking = req.extra_body.get(
         "enable_thinking",
         req.chat_template_kwargs.get("enable_thinking", req.enable_thinking),
@@ -716,7 +720,9 @@ def build_completion_user_request(
     req: CompletionsRequest, priority: int = 1
 ) -> UserRequest:
     args = get_global_args()
-    max_new_tokens = req.max_tokens or args.request.max_new_tokens
+    max_new_tokens = (
+        req.max_tokens if req.max_tokens is not None else args.infer.max_seq_len
+    )
     ttft_timeout_s = req.extra_body.get("ttft_timeout_s", req.ttft_timeout_s)
     return UserRequest.from_prompt_text(
         req.prompt,

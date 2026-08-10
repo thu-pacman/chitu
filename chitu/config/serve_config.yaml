@@ -24,9 +24,7 @@ defaults:
   # Sub-configs for `benchmarks/benchmark_offline.sh`. Ignored for serving.
   - benchmark: default
 
-  # Sub-configs for `test/single_req_test.py` and `test/single_req_compare.py`. Ignored for serving.
-  - request: default
-
+  # Sub-configs only for testing. Ignored for serving.
   - test
 
   # Config loggers. Only for chitu developers.
