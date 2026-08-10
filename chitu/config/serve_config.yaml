@@ -557,12 +557,14 @@ infer:
   #: -default: False
   enable_prefix_caching: False
 
-  #: The weight of the prefix cache hit rate during router routing tasks.
-  dp_prefix_caching_hit_rate_weight: 0.01
+  #: Minimum prefix-cache hit rate required to keep a task on the best prefix-cache DP rank.
+  dp_prefix_caching_cache_threshold: 0.5
 
-  #: Penalty weight for running task count of each DP rank when selecting preferred DP rank.
-  #: Higher value means stronger load balancing pressure.
-  dp_prefix_caching_running_penalty_weight: 0.1
+  #: Absolute running-task spread required before DP preferred-rank selection ignores prefix locality.
+  dp_prefix_caching_balance_abs_threshold: 4
+
+  #: Relative running-task spread required before DP preferred-rank selection ignores prefix locality.
+  dp_prefix_caching_balance_rel_threshold: 1.5
 
   max_multimodal_blocks: -1
   experts_stats_path: null
@@ -740,26 +742,15 @@ multi_inst:
     # Used by unified DP routing, and by PD prefill routing when PD disaggregation is enabled.
     routing_algorithm: "prefix_cache_aware" # option: prefix_cache_aware, power_of_two_choices, round_robin, least_loaded
     # Used only by PD decode routing when PD disaggregation is enabled.
-    routing_algorithm_for_decode: "power_of_two_choices" # option: power_of_two_choices, round_robin
+    routing_algorithm_for_decode: "prefix_cache_aware" # option: prefix_cache_aware, power_of_two_choices, round_robin
 
-    # Only effective when routing_algorithm == prefix_cache_aware
-    # when router cache miss, fallback the this algorithm, option: power_of_two_choices, round_robin, least_loaded
-    router_cache_miss_fallback_algorithm: "power_of_two_choices"
-    # Routing score is w_hit * cached_prompt_tokens - w_load * queued_prefill_tokens.
-    # Both terms are prompt tokens, so they are directly comparable.
-    router_hit_weight: 1.0
-    # A queued token costs the request being routed some latency; a missed token
-    # costs it the same latency and burns prefill compute a cache hit would have
-    # saved. 0.5 weighs time-to-first-token and cluster throughput equally. Raise
-    # toward 1.0 to route purely for latency, lower toward 0 to hoard cache hits.
-    router_load_penalty_weight: 0.5
-    # Prefill-token equivalents charged per request holding a router-local load
-    # reservation. Under unified DP a request keeps its reservation through decode
-    # after its pending tokens drop to zero, and decoding only steals step time
-    # from a new prefill, so this sits far below an average prompt length. Measure
-    # before tuning; 0 drops the term and leaves that pressure entirely to
-    # max_inflight_per_instance.
-    router_decode_token_equiv: 16.0
+    # Only effective when routing_algorithm == prefix_cache_aware or routing_algorithm_for_decode == prefix_cache_aware.
+    # Minimum prefix-cache block hit rate required to route to the best prefix-cache instance.
+    router_cache_threshold: 0.5
+    # Absolute load-score spread required before routing ignores prefix locality and chooses the least-loaded instance.
+    router_balance_abs_threshold: 32
+    # Relative load-score spread required before routing ignores prefix locality and chooses the least-loaded instance.
+    router_balance_rel_threshold: 1.1
 
     # Size of the router cache block eviction buffer (unit: blocks).
     # The buffer temporarily holds cache blocks evicted from the router's local cache.

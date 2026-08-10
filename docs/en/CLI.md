@@ -724,18 +724,23 @@ Whether to enable prefix caching
 
 *Default: `False`.*
 
-### Argument `infer.dp_prefix_caching_hit_rate_weight`
+### Argument `infer.dp_prefix_caching_cache_threshold`
 
-The weight of the prefix cache hit rate during router routing tasks.
+Minimum prefix-cache hit rate required to keep a task on the best prefix-cache DP rank.
 
-*Default: `0.01`.*
+*Default: `0.5`.*
 
-### Argument `infer.dp_prefix_caching_running_penalty_weight`
+### Argument `infer.dp_prefix_caching_balance_abs_threshold`
 
-Penalty weight for running task count of each DP rank when selecting preferred DP rank.
-Higher value means stronger load balancing pressure.
+Absolute running-task spread required before DP preferred-rank selection ignores prefix locality.
 
-*Default: `0.1`.*
+*Default: `4`.*
+
+### Argument `infer.dp_prefix_caching_balance_rel_threshold`
+
+Relative running-task spread required before DP preferred-rank selection ignores prefix locality.
+
+*Default: `1.5`.*
 
 ## `scheduler`
 

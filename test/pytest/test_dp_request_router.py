@@ -29,12 +29,13 @@ def _build_router(algorithm: str = "prefix_cache_aware") -> RequestRouter:
         is_router=True,
         max_inflight_per_instance=24,
         routing_algorithm=algorithm,
-        router_cache_miss_fallback_algorithm="least_loaded",
-        router_hit_weight=1.0,
-        router_load_penalty_weight=0.5,
-        router_decode_token_equiv=16.0,
+        routing_algorithm_for_decode="prefix_cache_aware",
+        router_cache_threshold=0.5,
+        router_balance_abs_threshold=32,
+        router_balance_rel_threshold=1.1,
         router_evict_buffer_size=64,
         router_local_reservation_timeout_s=600.0,
+        launch_timeout=3600.0,
     )
     router = RequestRouter(cfg)
     return router
@@ -109,7 +110,7 @@ def test_select_scheduler_falls_back_to_lb_when_all_hit_zero():
         MonkReq("busy", list(range(200))), local_instance_id=0
     )
     req = MonkReq("req-no-hit", [11, 12, 13, 14])
-    # no cached blocks on both instances => fallback to least_loaded (scheduler 1)
+    # no useful prefix affinity => two-gate seeds on the least-loaded scheduler.
     selected = router.policy.select_scheduler(req)
     assert selected == 1
 

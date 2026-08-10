@@ -121,16 +121,19 @@ class PDRequestRouter(RequestRouter):
             )
 
         decode_algorithm = getattr(
-            self.config, "routing_algorithm_for_decode", "power_of_two_choices"
+            self.config, "routing_algorithm_for_decode", "prefix_cache_aware"
         )
-        if decode_algorithm not in ("round_robin", "power_of_two_choices"):
+        if decode_algorithm == "prefix_cache_aware":
+            self.decode_policy = PrefixCacheAwarePolicy(self.config)
+        elif decode_algorithm in ("round_robin", "power_of_two_choices"):
+            self.decode_policy = LoadBalancer(self.config)
+            self.decode_policy.algorithm = decode_algorithm
+        else:
             raise ValueError(
                 "pd_disaggregation decode routing only supports "
-                "round_robin or power_of_two_choices "
+                "round_robin, power_of_two_choices, or prefix_cache_aware "
                 f"(got {decode_algorithm!r})"
             )
-        self.decode_policy = LoadBalancer(self.config)
-        self.decode_policy.algorithm = decode_algorithm
         self.policy = self.prefill_policy
         self._pd_stats_logged: set[tuple[str, int]] = set()
         logger.info(
@@ -281,13 +284,19 @@ class PDRequestRouter(RequestRouter):
             logger.info(f"listening for stats: tcp://{stats_ip}:{stats_port}")
 
     def _init_prefill_policy_shadow_caches(self) -> None:
-        """Mirror RequestRouter._init_sockets prefix-cache bookkeeping for each prefill slot."""
+        """Mirror RequestRouter._init_sockets prefix-cache bookkeeping for each P/D slot."""
         if hasattr(self.prefill_policy, "cached_blocks"):
             for sid in self.prefill_schedulers:
                 self.prefill_policy.cached_blocks.setdefault(sid, OrderedDict())
         if hasattr(self.prefill_policy, "evict_buffer"):
             for sid in self.prefill_schedulers:
                 self.prefill_policy.evict_buffer.setdefault(sid, OrderedDict())
+        if hasattr(self.decode_policy, "cached_blocks"):
+            for sid in self.decode_schedulers:
+                self.decode_policy.cached_blocks.setdefault(sid, OrderedDict())
+        if hasattr(self.decode_policy, "evict_buffer"):
+            for sid in self.decode_schedulers:
+                self.decode_policy.evict_buffer.setdefault(sid, OrderedDict())
 
     @override
     async def _heartbeat_monitor_task(self, timeout: Optional[float] = None):

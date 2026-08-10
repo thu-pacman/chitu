@@ -295,13 +295,14 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.identity_builder.forget_hash(blk_hash)
         multi_inst = getattr(get_global_args(), "multi_inst", None)
         role = getattr(multi_inst, "role", None)
-        # update evicted_blk_hashes for routers to sync shadow cache in cache-aware routing policy
-        # currently only support multi DP and Prefill-only instance
+        # Update evicted_blk_hashes for routers to sync shadow cache in cache-aware routing policy.
+        # Independent multi-inst uses a shared policy namespace; classic PD has separate
+        # prefill/decode policy instances, so both roles must report their own evictions.
         if (
             blk_hash is not None
             and multi_inst
             and getattr(multi_inst, "n_insts", 1) > 1
-            and (is_independent_multi_inst() or role == "prefill")
+            and (is_independent_multi_inst() or role in ("prefill", "decode"))
         ):
             # Only record where a consumer pops: enhanced-scheduler stats loop
             # (independent multi-inst) or PD prefill-only get_pd_stats. PD
