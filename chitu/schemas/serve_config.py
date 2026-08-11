@@ -94,8 +94,9 @@ class InferConfig(InferConfigLegacy):
     moe_lb_threshold: float = MISSING
     dllm_block_length: int = MISSING  # block length for dLLM decode
     enable_prefix_caching: bool = MISSING
-    dp_prefix_caching_hit_rate_weight: float = MISSING
-    dp_prefix_caching_running_penalty_weight: float = MISSING
+    dp_prefix_caching_cache_threshold: float = MISSING
+    dp_prefix_caching_balance_abs_threshold: float = MISSING
+    dp_prefix_caching_balance_rel_threshold: float = MISSING
 
     @dataclass
     class MoEConfig:
@@ -204,10 +205,9 @@ class RouterConfig:
     max_inflight_per_instance: int = MISSING
     routing_algorithm: str = MISSING
     routing_algorithm_for_decode: str = MISSING
-    router_cache_miss_fallback_algorithm: str = MISSING
-    router_hit_weight: float = MISSING
-    router_load_penalty_weight: float = MISSING
-    router_decode_token_equiv: float = MISSING
+    router_cache_threshold: float = MISSING
+    router_balance_abs_threshold: float = MISSING
+    router_balance_rel_threshold: float = MISSING
     router_evict_buffer_size: int = MISSING
     router_local_reservation_timeout_s: float = MISSING
     launch_timeout: float = MISSING

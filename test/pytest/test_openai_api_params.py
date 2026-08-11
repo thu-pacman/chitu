@@ -477,12 +477,12 @@ class TestBuildUserRequestReasoningEffort:
         import chitu.serve.openai_api as openai_api
         import chitu.serve.common as serve_common
 
-        # build_user_request reads args.request.max_new_tokens / debug.save_trace_dir
+        # build_user_request reads args.infer.max_seq_len / debug.save_trace_dir
         monkeypatch.setattr(
             openai_api,
             "get_global_args",
             lambda: SimpleNamespace(
-                request=SimpleNamespace(max_new_tokens=64),
+                infer=SimpleNamespace(max_seq_len=4096),
                 debug=SimpleNamespace(save_trace_dir=None),
             ),
         )

@@ -7,7 +7,6 @@ from typing_extensions import override
 import functools
 import logging
 import math
-import os
 
 import torch
 
@@ -38,7 +37,8 @@ from chitu.moe.batched_routed_activation import (
 from chitu.native_layout import (
     AiterMoeCInt8Gemm1Weight,
     AiterMoeCInt8Gemm2Weight,
-    HygonDeepGemmW8A8MarlinWeight,
+    HygonDeepGemmW8A8LegacyMarlinWeight,
+    HygonDeepGemmW8A8Marlin2Weight,
     NativeLayoutMixin,
     NpuFractalZnTensor,
 )
@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 
 
 def _hygon_backend_w8a8_per_token_per_channel_dyn_use_deepgemm_moe(
-    _: dict[str, Any]
+    _: dict[str, Any],
 ) -> bool:
     if not (is_hygon() and has_deepgemm):
         return False
@@ -1304,9 +1304,9 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
     def init_native_layout(self):
         super().init_native_layout()
         self.apply_native_layout(
-            self.gate_up_proj_weight, HygonDeepGemmW8A8MarlinWeight
+            self.gate_up_proj_weight, HygonDeepGemmW8A8Marlin2Weight
         )
-        self.apply_native_layout(self.down_proj_weight, HygonDeepGemmW8A8MarlinWeight)
+        self.apply_native_layout(self.down_proj_weight, HygonDeepGemmW8A8Marlin2Weight)
 
     @override
     @functools.singledispatchmethod
@@ -1407,9 +1407,9 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
                 dtype=output_dtype,
                 device=routed_x.activation.device,
             )
-        gate_up_weight = (
-            self.get_native_layout_gate_up_proj_weight().layout_tensor.contiguous()
-        )
+        gate_up_weight = HygonDeepGemmW8A8LegacyMarlinWeight.convert_from(
+            self.get_native_layout_gate_up_proj_weight()
+        ).layout_tensor
         # Hygon DeepGEMM W8A8 requires fp32 scale tensors.
         gate_up_scale = (
             self.gate_up_proj_weight_scale.squeeze(-1).to(torch.float32).contiguous()
@@ -1427,11 +1427,12 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
             m_indices,
             gate_up_out,
         )
+        del gate_up_weight
         intermediate = silu_and_mul(gate_up_out, swiglu_limit=self.swiglu_limit)
         q_intermediate, intermediate_scale = a8_per_token_act_quant(intermediate)
-        down_weight = (
-            self.get_native_layout_down_proj_weight().layout_tensor.contiguous()
-        )
+        down_weight = HygonDeepGemmW8A8LegacyMarlinWeight.convert_from(
+            self.get_native_layout_down_proj_weight()
+        ).layout_tensor
         # Hygon DeepGEMM W8A8 requires fp32 scale tensors.
         down_scale = (
             self.down_proj_weight_scale.squeeze(-1).to(torch.float32).contiguous()
@@ -1511,7 +1512,12 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
             q_x = _pad_deepgemm_masked_m(q_x, layout_m)
             act_scale = _pad_deepgemm_masked_m(act_scale, layout_m)
         M = layout_m
-        expected_m = M
+        infer_args = get_global_args().infer
+        expected_m_per_group = min(
+            M,
+            int(infer_args.max_batch_size)
+            * max(1, int(getattr(infer_args, "mtp_size", 1) or 1)),
+        )
         # Hygon DeepGEMM W8A8 requires fp32 scale tensors.
         gate_up_scale = self.gate_up_proj_weight_scale.to(torch.float32).contiguous()
         gate_up_out = torch.empty(
@@ -1524,7 +1530,7 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
             (gate_up_weight, gate_up_scale),
             gate_up_out,
             masked_m,
-            expected_m,
+            expected_m_per_group,
         )
         if self.swiglu_limit is None and _lightop_fuse_silu_mul_quant_ep_available():
             q_intermediate, intermediate_scale = lightop.fuse_silu_mul_quant_ep(
@@ -1560,7 +1566,7 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
             (down_weight, down_scale),
             down_out,
             masked_m,
-            expected_m,
+            expected_m_per_group,
         )
         if output_m != M:
             down_out = down_out[:, :output_m, :].contiguous()

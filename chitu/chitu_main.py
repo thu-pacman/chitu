@@ -6,7 +6,7 @@ import os
 import time
 import traceback
 from logging import getLogger
-from typing import Optional
+from typing import Optional, Callable
 import re
 from tqdm import tqdm
 import math
@@ -43,6 +43,7 @@ from chitu.task import (
     UserRequest,
     TaskCollector,
     DPTaskCollector,
+    TaskStatus,
 )
 from chitu.utils import (
     gen_req_id,
@@ -1314,24 +1315,43 @@ def chitu_init(args):
     return args
 
 
-def _update_tasks_preferred_dp_rank():
-    """Assign a preferred DP rank to each unscheduled prefill task.
-
+def _update_tasks_preferred_dp_rank(
+    task_selector: Optional[Callable[[Task], bool]] = None,
+):
+    """
     In a multi-DP deployment, each request can be routed to any DP rank.
     This function picks the best rank by balancing two factors:
 
-    1. **Prefix cache hit rate** — how many of the request's prompt tokens
-       are already cached on each DP rank.  Higher cache hits mean fewer
-       tokens to recompute during prefill, reducing latency.
-    2. **Current load** — the number of in-flight tasks on each DP rank.
-       Load is penalized to avoid overloading a single rank.
+    1. **Load-balance gate.** If the projected running-task
+       spread across ranks is BOTH absolutely and relatively large
+       (``(max - min) > abs_threshold`` AND ``max > min * rel_threshold``),
+       the fleet is imbalanced -> route to the least-loaded rank, ignoring
+       prefix.
+    2. **Prefix-cache gate.** Otherwise pick the rank with the best cache hit
+       rate. If it clears ``cache_threshold`` -> stick to that rank. Else the
+       task has no useful prefix affinity -> seed it onto the least-loaded
+       rank so future same-prefix tasks follow the load distribution.
 
-    The final score per rank is:
-        score = cache_hit_rate * hit_rate_weight
-              - running_tasks * running_penalty_weight
+    config via: ``dp_prefix_caching_cache_threshold``,
+    ``dp_prefix_caching_balance_abs_threshold``,
+    ``dp_prefix_caching_balance_rel_threshold``.
 
-    The weights are configurable via ``dp_prefix_caching_hit_rate_weight``
-    and ``dp_prefix_caching_running_penalty_weight``.
+    Args:
+        task_selector: An optional predicate that determines whether a task
+                       should be assigned the preferred_dp_rank.This function
+                       only considers tasks whose ``dp_rank`` is currently ``None``.
+                       For such tasks:
+                        - Returns True : The task is selected and will receive
+                                          the preferred_dp_rank.
+                        - Returns False: The task is skipped and no action is taken.
+                       If not provided (None), all tasks are considered eligible.
+    Returns:
+        task_ids_by_dp: List[List[str]]
+            A list of length ``dp_size``, where each inner list contains the
+            task IDs that are currently assigned to the corresponding DP rank
+            (including both task.dp_rank and task.preferred_dp_rank). This list
+            reflects the final task distribution after the update and is used
+            for subsequent load‑balancing decisions.
     """
     args = get_global_args()
     dp_size = int(args.infer.dp_size)
@@ -1340,47 +1360,63 @@ def _update_tasks_preferred_dp_rank():
     if dp_size <= 1:
         return
 
-    # weight of preifx cache hit rate
-    hit_rate_weight = float(
-        getattr(args.infer, "dp_prefix_caching_hit_rate_weight", 0.01)
+    # two-layer gate knobs.
+    cache_threshold = float(
+        getattr(args.infer, "dp_prefix_caching_cache_threshold", 0.5)
+    )
+    balance_abs_threshold = float(
+        getattr(args.infer, "dp_prefix_caching_balance_abs_threshold", 4)
+    )
+    balance_rel_threshold = float(
+        getattr(args.infer, "dp_prefix_caching_balance_rel_threshold", 1.5)
     )
 
-    # penalty weight of the number of running tasks in the DP rank
-    running_tasks_penalty_weight = float(
-        getattr(args.infer, "dp_prefix_caching_running_penalty_weight", 0.01)
-    )
+    max_load = -math.inf
+    task_ids_by_dp = [[] for _ in range(dp_size)]
 
-    hit_rate_weight = max(min(hit_rate_weight, 1), 0)
-    running_tasks_penalty_weight = max(min(running_tasks_penalty_weight, 1), 0)
+    def _min_load_and_rank() -> tuple[int, int]:
+        return min(
+            [(len(tids), dp_rank) for dp_rank, tids in enumerate(task_ids_by_dp)],
+            key=lambda load_and_rank: load_and_rank[0],
+        )
 
     if Backend.cache_managers is not None:
         # paged kv cache
-        projected_running_tasks_per_dp = [
-            len(
-                Backend.schedulers[dp_rank].cache_manager_dict["main"].task_to_cache_ids
+        for dp_rank in range(dp_size):
+            task_ids_by_dp[dp_rank] = list(
+                Backend.schedulers[dp_rank]
+                .cache_manager_dict["main"]
+                .task_to_cache_ids.keys()
             )
-            for dp_rank in range(dp_size)
-        ]
+            max_load = max(max_load, len(task_ids_by_dp[dp_rank]))
     else:
         # dense kv cache
-        projected_running_tasks_per_dp = [0 for dp_rank in range(dp_size)]
         for task in TaskPool.pool.values():
-            if task.dp_rank is not None and 0 <= task.dp_rank <= dp_size:
-                projected_running_tasks_per_dp[task.dp_rank] += 1
+            if task.dp_rank is not None and 0 <= task.dp_rank < dp_size:
+                task_ids_by_dp[task.dp_rank].append(task.task_id)
+        max_load = max(len(tids) for tids in task_ids_by_dp)
 
     for task in TaskPool.pool.values():
-        if (
-            task.dp_rank is not None
-            or task.task_type != TaskType.Prefill
-            or not task.can_schedule()
-        ):
+        if task.dp_rank is not None:
+            continue
+        if task_selector and not task_selector(task):
+            # 跳过task_selector(task)为false的任务
             continue
 
-        best_preference_score = float("-inf")
-        best_dp_rank = None
+        min_load, min_load_rank = _min_load_and_rank()
 
-        for dp_rank in range(dp_size):
-            if enable_prefix_caching:
+        best_dp_rank = None
+        # --- Layer 1: load-balance gate ---
+        is_imbalanced = (
+            max_load - min_load
+        ) > balance_abs_threshold and max_load > min_load * balance_rel_threshold
+        if is_imbalanced or not enable_prefix_caching or Backend.cache_managers is None:
+            best_dp_rank = min_load_rank
+        else:
+            # --- Layer 2: prefix-cache gate ---
+            best_cached_rate = -1.0
+            best_dp_rank = min_load_rank
+            for dp_rank in range(dp_size):
                 cache_managers = list(Backend.cache_managers[dp_rank].values())
                 cached_tokens = task.prefix_tokens_len
                 for cache_manager in cache_managers:
@@ -1392,45 +1428,18 @@ def _update_tasks_preferred_dp_rank():
                     cached_rate = cached_tokens / task.prefix_tokens_len
                 else:
                     cached_rate = 0.0
-            else:
-                cached_rate = 0.0
-
-            preference_score = (
-                cached_rate * hit_rate_weight
-                - running_tasks_penalty_weight * projected_running_tasks_per_dp[dp_rank]
-            )
-
-            if preference_score > best_preference_score:
-                best_preference_score = preference_score
-                best_dp_rank = dp_rank
+                if cached_rate > best_cached_rate:
+                    best_cached_rate = cached_rate
+                    best_dp_rank = dp_rank
+            if best_cached_rate <= cache_threshold:
+                # Weak prefix affinity: seed onto the least-loaded rank so
+                # future same-prefix tasks follow the load distribution.
+                best_dp_rank = min_load_rank
 
         task.preferred_dp_rank = best_dp_rank
         if best_dp_rank is not None:
-            projected_running_tasks_per_dp[best_dp_rank] += 1
-
-
-def _collect_ready_task_ids_by_dp(task_type: TaskType) -> list[list[str]]:
-    dp_size = int(Backend.args.infer.dp_size)
-    task_ids_by_dp: list[list[str]] = [[] for _ in range(dp_size)]
-
-    for task_id in TaskPool.id_list:
-        task = TaskPool.pool.get(task_id)
-        if task is None or task.task_type != task_type or not task.can_schedule():
-            continue
-
-        dp_rank = task.dp_rank
-        if dp_rank is None:
-            dp_rank = task.preferred_dp_rank
-
-        # A schedulable task should have a DP owner by this point: prefill tasks
-        # get preferred_dp_rank from _update_tasks_preferred_dp_rank() before
-        # collection, and decode tasks keep the dp_rank assigned by the scheduler
-        # or by the PD decode queue before entering TaskPool.
-        assert dp_rank is not None, f"Task {task_id} has no DP assignment"
-
-        dp_rank = int(dp_rank)
-        if 0 <= dp_rank < dp_size:
-            task_ids_by_dp[dp_rank].append(task_id)
+            task_ids_by_dp[best_dp_rank].append(task.task_id)
+            max_load = max(max_load, len(task_ids_by_dp[best_dp_rank]))
 
     return task_ids_by_dp
 
@@ -1470,6 +1479,11 @@ def chitu_run_main_rank():
         Backend.args.multi_inst.role == "prefill"
         or Backend.args.multi_inst.role == "decode"
     ):
+        if Backend.args.multi_inst.role == "decode":
+            _update_tasks_preferred_dp_rank(
+                task_selector=lambda task: task.dp_rank is None
+                and task.status == TaskStatus.PDDecodeIncoming
+            )
         _do_pd_scheduler()
     for scheduler in Backend.schedulers:
         scheduler.prepare_for_schedule()
@@ -1482,14 +1496,16 @@ def chitu_run_main_rank():
             strict_allowed_task_type=set(schedule_task_type_order)
         )
     else:
-        if TaskType.Prefill in schedule_task_type_order:
-            _update_tasks_preferred_dp_rank()  # Update DP preference for prefill.
-
         # New prefill tasks are routed by DP preference assignment above.
         id_and_scheduler_list = list(enumerate(Backend.schedulers))
         task_ids_list = [[]] * len(id_and_scheduler_list)
         for task_type in schedule_task_type_order:
-            ready_task_ids_by_dp = _collect_ready_task_ids_by_dp(task_type)
+            ready_task_ids_by_dp = _update_tasks_preferred_dp_rank(
+                task_selector=lambda task: task.dp_rank is None
+                and task.task_type == task_type
+                and task.can_schedule()
+            )
+
             for i, scheduler in id_and_scheduler_list:
                 task_ids = scheduler.schedule(
                     strict_allowed_task_type={task_type},

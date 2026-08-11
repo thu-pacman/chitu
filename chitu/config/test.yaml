@@ -7,3 +7,9 @@ pd_test:
   req_num: 8
   req_timeout: 300
   output_len: 128
+
+# Sub-configs for `test/single_req_test.py` and `test/single_req_compare.py`.
+request:
+  prompt_tokens_len: -1  # use for performance testing, -1 means use real requests.
+  max_new_tokens: 128
+  frequency_penalty: 0.0

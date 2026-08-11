@@ -11,8 +11,16 @@ from xgrammar import (
     CompiledGrammar,
     Grammar,
 )
+import threading
+import json
+
+from collections import OrderedDict
+from concurrent.futures import Future
+from concurrent.futures import ThreadPoolExecutor
 
 from chitu.global_vars import get_global_args
+from chitu.tool_call.type_def import ToolCallParams
+from chitu.tool_call import build_grammar
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +57,10 @@ def get_op_device():
     return "cpu" if op_impl == "cpu" else "cuda"
 
 
-def compile_grammar(grammar: Grammar | None) -> tuple[CompiledGrammar | None, str]:
+def compile_grammar(grammar: Grammar | None) -> CompiledGrammar | None:
     compiler = get_grammar_compiler()
     if compiler is None or grammar is None:
-        return None, ""
+        return None
 
     try:
         compiled = compiler.compile_grammar(grammar)
@@ -62,22 +70,100 @@ def compile_grammar(grammar: Grammar | None) -> tuple[CompiledGrammar | None, st
             "falling back to unconstrained generation",
             exc_info=True,
         )
-        return None, ""
+        return None
 
-    try:
-        grammar_str = compiled.serialize_json()
-    except Exception:
-        logger.warning(
-            "Failed to serialize compiled grammar, "
-            "falling back to unconstrained generation",
-            exc_info=True,
+    return compiled
+
+
+# ---------------------------------------------------------------------------
+# Grammar future cache (keyed on tool-schema) + deferred-compile pool.
+#
+# Each cached value is a Future. A pending Future represents an in-flight compile;
+# a completed Future represents the cached CompiledGrammar result. The result may
+# legitimately be None, so caching the Future avoids a separate miss sentinel.
+# ---------------------------------------------------------------------------
+
+_GRAMMAR_CACHE_LOCK = threading.Lock()
+_GRAMMAR_FUTURES_MAX = 2048
+
+_GRAMMAR_FUTURES: OrderedDict[str, Future] = OrderedDict()
+_GRAMMAR_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="grammar-compile"
+)
+
+_GRAMMAR_CACHE_LOOKUPS = 0
+_GRAMMAR_CACHE_HITS = 0
+
+
+def _done_future(result) -> Future:
+    done = Future()
+    done.set_result(result)
+    return done
+
+
+def _grammar_cache_hit_rate() -> float:
+    if _GRAMMAR_CACHE_LOOKUPS == 0:
+        return 0.0
+    return _GRAMMAR_CACHE_HITS * 100.0 / _GRAMMAR_CACHE_LOOKUPS
+
+
+def _compile_grammar_worker(params):
+    """Runs on _GRAMMAR_EXECUTOR: grammar build and compile.
+
+    The returned Future is stored in _GRAMMAR_FUTURES before this worker starts.
+    Completed futures stay cached until LRU eviction.
+    """
+    grammar = build_grammar(params)
+    return compile_grammar(grammar)
+
+
+def submit_grammar_compile(params: ToolCallParams) -> Future:
+    """Return a Future resolving to the CompiledGrammar (or None) for this
+    tool-schema.
+        - completed hit -> a cached completed Future
+        - in-flight hit -> the shared Future for a concurrent compile
+        - cold miss     -> a new Future backed by the background compile pool
+    Callers never block here; they read .result() only when the grammar is
+    actually needed (sample time)
+    """
+    global _GRAMMAR_CACHE_LOOKUPS, _GRAMMAR_CACHE_HITS
+
+    assert params is not None
+    key = json.dumps(
+        ToolCallParams.to_dict(params),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+    if get_grammar_compiler() is None:
+        logger.debug(
+            "[GRAMMAR] cache=skip reason=no_compiler hit_rate=%.1f%% cache=%d",
+            _grammar_cache_hit_rate(),
+            len(_GRAMMAR_FUTURES),
         )
-        return None, ""
+        return _done_future(None)
 
-    return compiled, grammar_str
+    with _GRAMMAR_CACHE_LOCK:
+        _GRAMMAR_CACHE_LOOKUPS += 1
+        fut = _GRAMMAR_FUTURES.get(key)
+        if fut is not None:
+            _GRAMMAR_FUTURES.move_to_end(key)
+            _GRAMMAR_CACHE_HITS += 1
+            logger.debug(
+                "[GRAMMAR] cache=hit hit_rate=%.1f%% cache=%d",
+                _grammar_cache_hit_rate(),
+                len(_GRAMMAR_FUTURES),
+            )
+            return fut
 
-
-def deserialize_grammar(grammar_str: str) -> CompiledGrammar | None:
-    if grammar_str:
-        return CompiledGrammar.deserialize_json(grammar_str, get_tokenizer_info())
-    return None
+        fut = _GRAMMAR_EXECUTOR.submit(_compile_grammar_worker, params)
+        _GRAMMAR_FUTURES[key] = fut
+        while len(_GRAMMAR_FUTURES) > _GRAMMAR_FUTURES_MAX:
+            _GRAMMAR_FUTURES.popitem(last=False)
+        logger.debug(
+            "[GRAMMAR] cache=miss hit_rate=%.1f%% cache=%d",
+            _grammar_cache_hit_rate(),
+            len(_GRAMMAR_FUTURES),
+        )
+        return fut

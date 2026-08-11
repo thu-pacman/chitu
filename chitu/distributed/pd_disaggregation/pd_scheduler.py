@@ -10,18 +10,12 @@ PD disaggregation Scheduler
 - Decode-only：只做 decode 计算；KV pull 与首 token 处理由 KV hook 触发。
 """
 
-import os
 import time
 import math
 from enum import Enum
-from collections import OrderedDict
 from logging import getLogger
 from typing import Any, Optional, TYPE_CHECKING
 from dataclasses import dataclass, field
-
-import torch
-import msgpack
-import zmq
 
 from chitu.task import (
     Task,
@@ -399,20 +393,11 @@ class PDInstanceRequestManager:
         }
         self.pending_decode_requests[request_id] = decode_info
 
-        # DP Scheduling: Determine target DP rank
-        target_dp_rank = 0
-        if self.dp_size > 1:
-            args = get_global_args()
-            if not hasattr(self, "_dp_cursor"):
-                self._dp_cursor = 0
-            target_dp_rank = self._dp_cursor % self.dp_size
-            self._dp_cursor += 1
-            logger.debug(f"Scheduled request {request_id} to DP rank {target_dp_rank}")
         args = get_global_args()
         if pd_trace_enabled():
             logger.debug(
                 f"[PD_TRACE][decode.dispatch] req_id={request_id} prefill_sid={prefill_scheduler_id} "
-                f"target_dp_rank={int(target_dp_rank)} infer_dp_size={int(self.dp_size)} "
+                f"infer_dp_size={int(self.dp_size)} "
                 f"infer_ep_size={int(args.infer.ep_size)}"
             )
 
@@ -422,8 +407,6 @@ class PDInstanceRequestManager:
         task = self._create_task_from_request(
             decode_info["original_request"], enqueue=False
         )
-        # Bind request to the target DP rank for compute placement.
-        task.dp_rank = target_dp_rank
         # Carry PD binding so KV hook can route to the correct prefill engine_rank.
         if prefill_scheduler_id is not None:
             task.pd_prefill_engine_rank = prefill_scheduler_id
@@ -433,7 +416,7 @@ class PDInstanceRequestManager:
 
         decode_info["status"] = PDRequestStatus.KV_TRANSFERRING
         logger.debug(
-            f"[PD_QUEUE][decode.enqueue] req_id={request_id} cache_owner={target_dp_rank}"
+            f"[PD_QUEUE][decode.enqueue] req_id={request_id} cache_owner=pending"
         )
         logger.debug(f"[PD_STAGE][decode.enqueue.start] req_id={request_id}")
 
@@ -449,6 +432,7 @@ class PDInstanceRequestManager:
             priority=req.priority,
             stop_with_eos=req.stop_with_eos,
         )
+        task.submit_grammar()
         # In PD disagg mode, prefill produces the first token.
         # Decode should only generate up to max_seq_len - prompt_len tokens.
         max_seq_len = get_global_args().infer.max_seq_len
@@ -529,7 +513,10 @@ class PDInstanceRequestManager:
                 "ready_wait_max_s": ready_wait_max,
             }
 
-        if self.pd_mode == PDSchedulerMode.PREFILL_ONLY:
+        if self.pd_mode in (
+            PDSchedulerMode.PREFILL_ONLY,
+            PDSchedulerMode.DECODE_ONLY,
+        ):
             stats.update(_collect_router_kv_cache_stats())
 
         return stats
@@ -774,16 +761,6 @@ class DecodeOnlyManager(PDInstanceRequestManager):
 
         return super().stop_request(request_id, force_stop, timeout)
 
-    def _increace_prealloc_tokens_inflight_by_dp(
-        self, required_tokens: int, target_dp_rank: int
-    ):
-        self._decode_prealloc_tokens_inflight += required_tokens
-        if 0 <= target_dp_rank < len(self._decode_prealloc_tokens_inflight_by_dp):
-            self._decode_prealloc_tokens_inflight_by_dp[
-                target_dp_rank
-            ] += required_tokens
-        self._decode_prealloc_promoted_total += 1
-
     def _decode_check_and_promote(self):
         from chitu.scheduler import KVCacheCapacityStatus
 
@@ -821,15 +798,29 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 break
 
             info = task.pd_scheduler_info
+            preferred_dp_rank = task.preferred_dp_rank
+            if preferred_dp_rank is None:
+                if self.dp_size > 1:
+                    logger.error(
+                        f"task[{task.task_id}] should be assigned preferred_dp_rank."
+                    )
+                    continue
+                preferred_dp_rank = 0
+            target_dp_rank = int(preferred_dp_rank)
             time_since_task_created = info.time_since_task_created(now)
-            target_dp_rank = int(task.dp_rank)
             prefix_len = int(getattr(task, "prefix_tokens_len", 0))
+
+            hit_tokens = Backend.schedulers[target_dp_rank]._num_prefill_cached_tokens(
+                task
+            )
             required_tokens = max(
                 0, prefix_len + int(self._decode_prealloc_reserved_tokens)
             )
+            prealloc_charge_tokens = max(0, required_tokens - hit_tokens)
+
             if (
                 self._decode_prealloc_token_budget > 0
-                and (self._decode_prealloc_tokens_inflight + required_tokens)
+                and (self._decode_prealloc_tokens_inflight + prealloc_charge_tokens)
                 > self._decode_prealloc_token_budget
             ):
                 break
@@ -852,6 +843,7 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             if capacity_status == KVCacheCapacityStatus.CONGESTED:
                 continue
 
+            task.dp_rank = target_dp_rank
             self.kv_manager.send_decode_prepare(
                 req_id=rid,
                 prefill_sid=task.pd_prefill_engine_rank,
@@ -861,13 +853,17 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 decode_cached_tokens=num_cached_tokens,
             )
             info.last_prepare_ts = now
-            info.prealloc_tokens = required_tokens
+            prealloc_charge_tokens = max(0, required_tokens - num_cached_tokens)
+            info.prealloc_tokens = prealloc_charge_tokens
 
             task.status = TaskStatus.PDDecodePrealloc
 
-            self._increace_prealloc_tokens_inflight_by_dp(
-                required_tokens, target_dp_rank
-            )
+            self._decode_prealloc_tokens_inflight += prealloc_charge_tokens
+            if 0 <= target_dp_rank < len(self._decode_prealloc_tokens_inflight_by_dp):
+                self._decode_prealloc_tokens_inflight_by_dp[
+                    target_dp_rank
+                ] += prealloc_charge_tokens
+            self._decode_prealloc_promoted_total += 1
 
             info.begin_observe_stage("prealloc")
             # Record enqueue stage duration

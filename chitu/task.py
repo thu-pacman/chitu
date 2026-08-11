@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, asdict, fields
 from datetime import datetime
 from enum import Enum
 from logging import getLogger
-from typing import Any, ClassVar, Deque, Optional, Union, Iterable
+from typing import Any, ClassVar, Deque, Optional, Union
 from functools import cached_property
 import random
 
@@ -38,7 +38,7 @@ from chitu.utils import dataclass_to_dict, dataclass_from_dict
 from chitu.reasoning import (
     update_chat_template_kwargs_reasoning,
 )
-from chitu.sampling.utils import compile_grammar, deserialize_grammar
+from chitu.sampling.utils import submit_grammar_compile
 
 logger = getLogger(__name__)
 
@@ -482,7 +482,7 @@ class Task:
         sample_params: SampleParams = None,
         prefix_tokens=None,
         prompt_len=None,
-        grammar_str: str = "",
+        tool_call_params: ToolCallParams | None = None,
         priority: int = 1,
         stop_with_eos: bool = True,
         block_length: int = 32,
@@ -530,17 +530,13 @@ class Task:
         # Request
         self.req = req
 
-        # Grammar
-        if req:
-            if req.tool_call_params:
-                grammar = build_grammar(req.tool_call_params)
-                self.grammar, self.grammar_str = compile_grammar(grammar)
-            else:
-                self.grammar = None
-                self.grammar_str = ""
-        else:
-            self.grammar_str = grammar_str
-            self.grammar = deserialize_grammar(grammar_str)
+        # Grammar. The tool-call grammar is defined entirely by grammar_params
+        # (a ToolCallParams, or None when the request has no tools). We ship these
+        # tiny params across PP/PD boundaries and compile locally only on the rank
+        # that samples. The compile itself is a cached background Future (grammar_future),
+        # submitted by submit_grammar() ahead of sampling.
+        self.grammar_params = req.tool_call_params if req else tool_call_params
+        self.grammar_future = None
 
         self.prefill_chunk_size: Optional[int] = (
             None  # Dynamic in Task, but adds up to be no higher than a static bound in PackedTasks
@@ -623,6 +619,27 @@ class Task:
     def can_schedule(self):
         # reserved as interface
         return self.status == TaskStatus.AvailableForSchedule
+
+    def submit_grammar(self) -> None:
+        """Launch (or reuse) the background compile of this task's tool-call
+        grammar.
+        Should be call ahead of sampling. non-blocking.
+        """
+        if self.grammar_future is None and self.grammar_params is not None:
+            self.grammar_future = submit_grammar_compile(self.grammar_params)
+
+    @property
+    def grammar(self):
+        """The CompiledGrammar for this task, or None if it has no tools."""
+        if self.grammar_params is None:
+            return None
+        if self.grammar_future is None:
+            logger.warning(
+                f"task[{self.task_id}]: 'grammar' was called before 'submit_grammar'. "
+                f"This violates the expected call order and may cause undefined behavior."
+            )
+            self.submit_grammar()
+        return self.grammar_future.result()
 
     def is_pd_status(self):
         return self.status in [

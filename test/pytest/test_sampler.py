@@ -1,5 +1,7 @@
 """Unit tests for sampler.py covering mtp_size=1/3 with topk/topp/temperature, frequency penalty, and grammar."""
 
+from concurrent.futures import Future
+
 import pytest
 import torch
 import numpy as np
@@ -19,11 +21,18 @@ from chitu.global_vars import get_global_args
 # ---- helpers ----
 
 
+def _make_done_future(result):
+    fut = Future()
+    fut.set_result(result)
+    return fut
+
+
 def _make_task(sample_params, grammar=None, num_new_tokens=0, prompt_len=0):
     """Create a minimal Task with controlled sample_params and grammar."""
     task = Task.__new__(Task)
     task.sample_params = sample_params
-    task.grammar = grammar
+    task.grammar_params = object() if grammar is not None else None
+    task.grammar_future = _make_done_future(grammar) if grammar is not None else None
     task._test_standard_tokens = None
     task._test_flag = False
     task.has_output = lambda: True

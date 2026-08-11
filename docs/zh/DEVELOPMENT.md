@@ -546,7 +546,6 @@ torchrun --nnodes 1 \
     scheduler.pp_config.pp_micro_batch_size_prefill=8 \
     scheduler.pp_config.pp_micro_batch_size_decode=auto \
     infer.max_seq_len=4096 \
-    request.max_new_tokens=100 \
     infer.use_cuda_graph=True
 ```
 
@@ -846,7 +845,6 @@ torchrun --nnodes 1 \
     infer.raise_lower_bit_float_to=bfloat16 \
     infer.max_batch_size=1 \
     infer.max_seq_len=4096 \
-    request.max_new_tokens=100 \
     infer.use_cuda_graph=True
 ```
 

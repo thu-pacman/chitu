@@ -176,7 +176,6 @@ def _pd_router_config(
     *,
     routing_algorithm: str,
     routing_algorithm_for_decode: str = "power_of_two_choices",
-    router_cache_miss_fallback_algorithm: str = "least_loaded",
 ) -> RouterConfig:
     set_default_global_args()
     return RouterConfig(
@@ -184,12 +183,12 @@ def _pd_router_config(
         max_inflight_per_instance=24,
         routing_algorithm=routing_algorithm,
         routing_algorithm_for_decode=routing_algorithm_for_decode,
-        router_cache_miss_fallback_algorithm=router_cache_miss_fallback_algorithm,
-        router_hit_weight=1.0,
-        router_load_penalty_weight=0.5,
-        router_decode_token_equiv=16.0,
+        router_cache_threshold=0.5,
+        router_balance_abs_threshold=32,
+        router_balance_rel_threshold=1.1,
         router_evict_buffer_size=64,
         router_local_reservation_timeout_s=600.0,
+        launch_timeout=3600.0,
     )
 
 
@@ -308,7 +307,9 @@ def test_pd_prefill_prefix_fallback_uses_router_local_load_when_no_hits():
     )
 
     req = MockReq("r-worker-load", [11, 12, 13, 14])
-    assert policy.select_scheduler(req) == 0
+    # Worker-reported running_requests are ignored; with equal router-local load,
+    # the two-gate min-load tie-breaker picks the last eligible scheduler.
+    assert policy.select_scheduler(req) == 1
 
     policy.remember_request(MockReq("busy", list(range(200))), local_instance_id=0)
     req = MockReq("r-router-load", [21, 22, 23, 24])
@@ -379,9 +380,7 @@ def test_pd_load_balancer_least_loaded_with_eligible_subset():
 
 def test_pd_router_round_robin_policies():
     cfg = _pd_router_config(
-        routing_algorithm="round_robin",
-        routing_algorithm_for_decode="round_robin",
-        router_cache_miss_fallback_algorithm="power_of_two_choices",
+        routing_algorithm="round_robin", routing_algorithm_for_decode="round_robin"
     )
     router = PDRequestRouter(cfg, PDDisaggregationConfig())
 

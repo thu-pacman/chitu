@@ -335,6 +335,17 @@ def _wait_http_ready(host: str, port: int, timeout: float) -> None:
     raise RuntimeError(f"HTTP server not ready: {last_err}")
 
 
+def _request_server_shutdown(base_url: str, timeout: float = 10.0) -> None:
+    req = urllib.request.Request(
+        f"{base_url}/terminate_engine",
+        method="POST",
+        data=json.dumps({"confirm": True}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout):
+        pass
+
+
 @hydra.main(
     version_base=None,
     config_path=get_chitu_env(
@@ -366,12 +377,22 @@ def hydra_main(args: ServeConfig):
         api_key = os.getenv("ANTHROPIC_API_KEY", "test-api-key")
         model = os.getenv("ANTHROPIC_MODEL", args.models.name)
         max_tokens = int(os.getenv("MAX_TOKENS", "1024"))
-        exit_code = _run_sdk_tests(
-            base_url=base_url,
-            model=model,
-            api_key=api_key,
-            max_tokens=max_tokens,
-        )
+        exit_code = 1
+        try:
+            exit_code = _run_sdk_tests(
+                base_url=base_url,
+                model=model,
+                api_key=api_key,
+                max_tokens=max_tokens,
+            )
+        finally:
+            _request_server_shutdown(base_url)
+            uvicorn_thread.join(timeout=30)
+            if uvicorn_thread.is_alive():
+                raise RuntimeError(
+                    "uvicorn thread did not stop after /terminate_engine"
+                )
+
         if exit_code != 0:
             raise SystemExit(exit_code)
 

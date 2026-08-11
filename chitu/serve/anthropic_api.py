@@ -817,7 +817,9 @@ async def handle_messages_request(*, request: AnthropicMessagesRequest, priority
     except ValueError as e:
         return anthropic_error(400, "invalid_request_error", str(e))
 
-    max_new_tokens = request.max_tokens or args.request.max_new_tokens
+    max_new_tokens = (
+        request.max_tokens if request.max_tokens is not None else args.infer.max_seq_len
+    )
     temperature = request.temperature if request.temperature is not None else 0.8
     top_p = request.top_p if request.top_p is not None else 0.9
     top_k = request.top_k if request.top_k is not None else 50
@@ -924,7 +926,11 @@ async def handle_completion_request(
     except Exception as e:
         return anthropic_error(400, "invalid_request_error", f"Tokenize error: {e}")
     prompt_len = len(prompt_tokens)
-    max_new_tokens = request.max_tokens_to_sample or args.request.max_new_tokens
+    max_new_tokens = (
+        request.max_tokens_to_sample
+        if request.max_tokens_to_sample is not None
+        else args.infer.max_seq_len
+    )
     max_new_tokens = UserRequest.cap_max_new_tokens(max_new_tokens, prompt_len)
     sample_params = SampleParams(
         request.temperature if request.temperature is not None else 0.8,
