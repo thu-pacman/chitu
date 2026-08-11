@@ -36,7 +36,8 @@ from chitu.native_layout.metax import (
 from chitu.native_layout.hygon import (
     AiterMoeCInt8Gemm1Weight,
     AiterMoeCInt8Gemm2Weight,
-    HygonDeepGemmW8A8MarlinWeight,
+    HygonDeepGemmW8A8LegacyMarlinWeight,
+    HygonDeepGemmW8A8Marlin2Weight,
     HygonW4A8Int4TileTensor,
     HygonW4A8Int8TileTensor,
     HygonMixQIntTileTensor,

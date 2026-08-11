@@ -305,12 +305,12 @@ def test_hygon_deepgemm_moe_forward_no_sum_pads_small_masked_layout(monkeypatch)
         checkpoint_prefix="",
     )
     gate_up_native = (
-        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8MarlinWeight.convert_from(
+        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8Marlin2Weight.convert_from(
             module.gate_up_proj_weight.data.clone()
         )
     )
     down_native = (
-        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8MarlinWeight.convert_from(
+        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8Marlin2Weight.convert_from(
             module.down_proj_weight.data.clone()
         )
     )
@@ -942,12 +942,12 @@ def test_hygon_aiter_moe_forward_matches_reference(monkeypatch):
 
 def test_hygon_deepgemm_moe_shape_validation_accepts_packed_weights_with_empty_activation():
     gate_up_native = (
-        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8MarlinWeight.convert_from(
+        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8Marlin2Weight.convert_from(
             torch.zeros((2, 32, 16), dtype=torch.int8)
         )
     )
     down_native = (
-        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8MarlinWeight.convert_from(
+        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8Marlin2Weight.convert_from(
             torch.zeros((2, 16, 16), dtype=torch.int8)
         )
     )

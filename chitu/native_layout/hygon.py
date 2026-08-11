@@ -155,10 +155,11 @@ def _check_deepgemm_w8a8_plain_shape(shape: torch.Size):
             f"DeepGEMM W8A8 weight should be 2D or 3D, got shape {tuple(shape)}"
         )
 
-    if n % _DEEPGEMM_W8A8_TILE != 0 or k % _DEEPGEMM_W8A8_TILE != 0:
+    if n % _DEEPGEMM_W8A8_TILE != 0 or k % 64 != 0:
         raise ValueError(
-            "DeepGEMM W8A8 weight requires N and K to be multiples of "
-            f"{_DEEPGEMM_W8A8_TILE}, got N={n}, K={k}"
+            "DeepGEMM masked W8A8 Marlin2 weight requires N to be a multiple "
+            f"of {_DEEPGEMM_W8A8_TILE} and K to be a multiple of 64, "
+            f"got N={n}, K={k}"
         )
 
 
@@ -169,10 +170,11 @@ def _pack_deepgemm_w8a8_2d(weight: torch.Tensor):
         .view(
             n // _DEEPGEMM_W8A8_TILE,
             _DEEPGEMM_W8A8_TILE,
-            k // _DEEPGEMM_W8A8_TILE,
+            k // 64,
+            4,
             _DEEPGEMM_W8A8_TILE,
         )
-        .permute(0, 2, 1, 3)
+        .permute(2, 0, 3, 1, 4)
         .contiguous()
         .view(n // _DEEPGEMM_W8A8_TILE, k * _DEEPGEMM_W8A8_TILE)
     )
@@ -186,10 +188,11 @@ def _pack_deepgemm_w8a8_3d(weight: torch.Tensor):
             e,
             n // _DEEPGEMM_W8A8_TILE,
             _DEEPGEMM_W8A8_TILE,
-            k // _DEEPGEMM_W8A8_TILE,
+            k // 64,
+            4,
             _DEEPGEMM_W8A8_TILE,
         )
-        .permute(0, 1, 3, 2, 4)
+        .permute(0, 3, 1, 4, 2, 5)
         .contiguous()
         .view(e, n // _DEEPGEMM_W8A8_TILE, k * _DEEPGEMM_W8A8_TILE)
     )
@@ -200,12 +203,13 @@ def _unpack_deepgemm_w8a8_2d(weight: torch.Tensor, plain_shape: torch.Size):
     return (
         weight.contiguous()
         .view(
+            k // 64,
             n // _DEEPGEMM_W8A8_TILE,
-            k // _DEEPGEMM_W8A8_TILE,
+            4,
             _DEEPGEMM_W8A8_TILE,
             _DEEPGEMM_W8A8_TILE,
         )
-        .permute(0, 2, 1, 3)
+        .permute(1, 3, 0, 2, 4)
         .contiguous()
         .view(n, k)
     )
@@ -217,23 +221,24 @@ def _unpack_deepgemm_w8a8_3d(weight: torch.Tensor, plain_shape: torch.Size):
         weight.contiguous()
         .view(
             e,
+            k // 64,
             n // _DEEPGEMM_W8A8_TILE,
-            k // _DEEPGEMM_W8A8_TILE,
+            4,
             _DEEPGEMM_W8A8_TILE,
             _DEEPGEMM_W8A8_TILE,
         )
-        .permute(0, 1, 3, 2, 4)
+        .permute(0, 2, 4, 1, 3, 5)
         .contiguous()
         .view(e, n, k)
     )
 
 
 @dataclass
-class HygonDeepGemmW8A8MarlinWeight(NativeLayoutTensor):
+class HygonDeepGemmW8A8Marlin2Weight(NativeLayoutTensor):
     """
-    DeepGEMM W8A8 grouped GEMM weight layout.
+    DeepGEMM GFX936 masked W8A8 grouped GEMM Marlin2 weight layout.
 
-    Plain weight is NT-style [N, K]. DeepGEMM expects 16-wide Marlin tiles:
+    Plain weight is NT-style [N, K]. The b1 masked hsaco expects Marlin2 tiles:
     [N, K] -> [N // 16, K * 16]. Grouped weights keep the expert dimension:
     [E, N, K] -> [E, N // 16, K * 16].
     """
@@ -243,6 +248,25 @@ class HygonDeepGemmW8A8MarlinWeight(NativeLayoutTensor):
     def convert_from(cls, tensor: torch.Tensor | NativeLayoutTensor):
         if isinstance(tensor, cls):
             return tensor
+        if isinstance(tensor, HygonDeepGemmW8A8LegacyMarlinWeight):
+            plain_shape = torch.Size(tensor.plain_shape)
+            if len(plain_shape) != 3:
+                raise ValueError(
+                    "DeepGEMM masked W8A8 Marlin2 weight must be 3D when "
+                    "converted from legacy Marlin, "
+                    f"got shape {tuple(plain_shape)}"
+                )
+            _check_deepgemm_w8a8_plain_shape(plain_shape)
+            e, n, k = plain_shape
+            # [E, N16, K64, K4, Ni16, Ki16] -> [E, K64, N16, K4, Ni16, Ki16]
+            layout_tensor = (
+                tensor.layout_tensor.contiguous()
+                .view(e, n // 16, k // 64, 4, 16, 16)
+                .permute(0, 2, 1, 3, 4, 5)
+                .contiguous()
+                .view(e, n // 16, k * 16)
+            )
+            return cls(plain_shape=plain_shape, layout_tensor=layout_tensor)
         if isinstance(tensor, NativeLayoutTensor):
             tensor = tensor.convert_to_plain()
         if tensor.dtype != torch.int8:
@@ -269,6 +293,39 @@ class HygonDeepGemmW8A8MarlinWeight(NativeLayoutTensor):
             self.layout_tensor,
             torch.Size(self.plain_shape),
         )
+
+
+@dataclass
+class HygonDeepGemmW8A8LegacyMarlinWeight(NativeLayoutTensor):
+    """Transient legacy Marlin layout consumed by contiguous W8A8 prefill."""
+
+    @classmethod
+    @override
+    def convert_from(cls, tensor: NativeLayoutTensor):
+        if isinstance(tensor, cls):
+            return tensor
+        if not isinstance(tensor, HygonDeepGemmW8A8Marlin2Weight):
+            raise TypeError(
+                "DeepGEMM legacy Marlin weight conversion expects "
+                f"HygonDeepGemmW8A8Marlin2Weight, got {type(tensor)}"
+            )
+
+        plain_shape = torch.Size(tensor.plain_shape)
+        if len(plain_shape) != 3:
+            raise ValueError(
+                "DeepGEMM contiguous W8A8 legacy Marlin weight must be 3D, "
+                f"got shape {tuple(plain_shape)}"
+            )
+        e, n, k = plain_shape
+        # [E, K64, N16, K4, Ni16, Ki16] -> [E, N16, K64, K4, Ni16, Ki16]
+        layout_tensor = (
+            tensor.layout_tensor.contiguous()
+            .view(e, k // 64, n // 16, 4, 16, 16)
+            .permute(0, 2, 1, 3, 4, 5)
+            .contiguous()
+            .view(e, n // 16, k * 16)
+        )
+        return cls(plain_shape=plain_shape, layout_tensor=layout_tensor)
 
 
 @dataclass
