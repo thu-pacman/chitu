@@ -432,6 +432,7 @@ class PDInstanceRequestManager:
             priority=req.priority,
             stop_with_eos=req.stop_with_eos,
         )
+        task.submit_grammar()
         # In PD disagg mode, prefill produces the first token.
         # Decode should only generate up to max_seq_len - prompt_len tokens.
         max_seq_len = get_global_args().infer.max_seq_len

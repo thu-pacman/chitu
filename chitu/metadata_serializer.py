@@ -22,6 +22,7 @@ from chitu.task import (
     SampleParams,
     is_normal_payload,
 )
+from chitu.tool_call.type_def import ToolCallParams
 
 logger = getLogger(__name__)
 
@@ -333,7 +334,9 @@ class MetadataSerializer:
                     if config.include_tokens:
                         task_data["tokens"] = list(task.prefix_tokens)
                         task_data["standard_tokens"] = task._test_standard_tokens
-                        task_data["grammar_str"] = task.grammar_str
+                        task_data["tool_call_params"] = ToolCallParams.to_dict(
+                            task.grammar_params
+                        )
                     # 只对新任务传输 sample_params
                     if config.include_sample_params:
                         task_data["sample_params"] = {
@@ -508,14 +511,14 @@ class MetadataSerializer:
             frequency_penalty=sample_params_dict.get("frequency_penalty"),
         )
         tokens = task_data.get("tokens")
-        grammar_str = task_data.get("grammar_str", "")
+        tool_call_params = ToolCallParams.from_dict(task_data.get("tool_call_params"))
         prompt_len = task_data.get("prompt_len")
         task = Task(
             task_id=task_id,
             req=None,
             sample_params=sample_params,
             prefix_tokens=tokens,
-            grammar_str=grammar_str,
+            tool_call_params=tool_call_params,
             prompt_len=prompt_len,
         )
         task.return_logprobs = task_data.get("return_logprobs")

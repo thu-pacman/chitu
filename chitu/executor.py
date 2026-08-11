@@ -1314,6 +1314,10 @@ class Executor:
         for dispatcher in self.task_dispatchers:
             payload_type, tasks = dispatcher.dispatch_metadata(tasks)
 
+        if self.is_sample_rank and isinstance(tasks, PackedTasks):
+            for task in tasks.output_tasks:
+                task.submit_grammar()
+
         if self.task_dispatchers:
             from chitu.serve.common import (
                 apply_pending_profile_command,
