@@ -494,38 +494,38 @@ def test_dsa_indexer_paged_kv(
     if is_decode:
         indexer_backend.prepare_metadata_for_decode(seq_len_delta)
 
-    logits = record_benchmark.run(
-        lambda: indexer_backend.dsa_indexer(
+    def _build_index_score(backend, accessor):
+        # Append this step's delta-K once, then score (matches the Indexer
+        # orchestration: append_indexer_kv + index_score).
+        backend.append_indexer_kv(k_delta, ks_delta, seq_len_delta, accessor)
+        return backend.index_score(
             q,
-            k_delta,
-            ks_delta,
             weights,
             seq_len_delta,
-            init_indexer_paged_kv_accessor(impl, k_ks_old),
+            accessor,
             is_causal=True,
-            return_indices=False,
+        )
+
+    logits = record_benchmark.run(
+        lambda: _build_index_score(
+            indexer_backend, init_indexer_paged_kv_accessor(impl, k_ks_old)
         ),
         x_val=f"bs={bs} sq={s_q} sk={s_k}",
         impl=impl,
     )
 
-    mask = torch.arange(0, max_seq_len, device="cuda").unsqueeze(
+    row_width = logits.shape[-1]
+    mask = torch.arange(0, row_width, device="cuda").unsqueeze(
         0
     ) <= seq_len_delta.delta_position_ids_tensor_device.unsqueeze(1)
     logits[~mask] = float("-inf")  # causal masking before comparison
 
     # ref torch impl
     ref_indexer_backend = DSAIndexer("torch")
-    ref_logits = ref_indexer_backend.dsa_indexer(
-        q,
-        k_delta,
-        ks_delta,
-        weights,
-        seq_len_delta,
-        init_indexer_paged_kv_accessor("torch", k_ks_old),
-        is_causal=True,
-        return_indices=False,
+    ref_logits = _build_index_score(
+        ref_indexer_backend, init_indexer_paged_kv_accessor("torch", k_ks_old)
     )
+    ref_logits = ref_logits[:, :row_width]
 
     assert_close(logits.to(ref_logits.dtype), ref_logits, rtol=1e-2, atol=1e-2)
 
@@ -670,31 +670,33 @@ def test_dsa_indexer_paged_kv_bf16(
     if is_decode:
         indexer_backend.prepare_metadata_for_decode(seq_len_delta)
 
-    logits = record_benchmark.run(
-        lambda: indexer_backend.dsa_indexer(
+    def _build_index_score():
+        accessor = init_indexer_paged_kv_accessor(k_old)
+        # k_scale unused for bf16 paths.
+        indexer_backend.append_indexer_kv(k_delta, None, seq_len_delta, accessor)
+        return indexer_backend.index_score(
             q,
-            k_delta,
-            None,  # k_scale unused for bf16 paths
             weights,
             seq_len_delta,
-            init_indexer_paged_kv_accessor(k_old),
+            accessor,
             is_causal=True,
-            return_indices=False,
-        ),
+        )
+
+    logits = record_benchmark.run(
+        _build_index_score,
         x_val=f"bs={bs} sq={s_q} sk={s_k}",
         impl=impl,
     )
 
     ref_indexer_backend = DSAIndexer("torch_bf16")
-    ref_logits = ref_indexer_backend.dsa_indexer(
+    ref_accessor = init_indexer_paged_kv_accessor(k_old)
+    ref_indexer_backend.append_indexer_kv(k_delta, None, seq_len_delta, ref_accessor)
+    ref_logits = ref_indexer_backend.index_score(
         q,
-        k_delta,
-        None,
         weights,
         seq_len_delta,
-        init_indexer_paged_kv_accessor(k_old),
+        ref_accessor,
         is_causal=True,
-        return_indices=False,
     )
     if ref_logits.shape[-1] > logits.shape[-1]:
         ref_logits = ref_logits[..., : logits.shape[-1]]
@@ -4208,127 +4210,10 @@ def test_reconstruct_prefill_matches_full_kv_attention(chunk_lens):
 #  CPU-only, no GPU required)
 # ===========================================================================
 
-BACKEND_METHODS = [
-    ("deepgemm", "blockfp8_index_score_dsa_deepgemm"),
-    ("hygon", "bf16_index_score_dsa_hygon"),
-    ("torch_bf16", "bf16_index_score_dsa_bf16"),
-    ("triton_bf16", "bf16_index_score_dsa_bf16"),
-    ("triton", "blockfp8_index_score_dsa_torch_or_triton"),
-    ("torch", "blockfp8_index_score_dsa_torch_or_triton"),
-]
-
 
 class AttrNamespace(SimpleNamespace):
     def get(self, key, default=None):
         return getattr(self, key, default)
-
-
-def _indexer_without_runtime_init(impl: str) -> DSAIndexer:
-    indexer = object.__new__(DSAIndexer)
-    indexer.impl = impl
-    indexer.static_max_n = 8192
-    indexer.mtp_size = 1
-    return indexer
-
-
-def _indexer_seq_len_delta(*, max_len: int = 3, is_decode_stage: bool = False):
-    return SimpleNamespace(
-        is_decode_stage=is_decode_stage,
-        delta_position_ids_tensor_device=torch.arange(3, dtype=torch.int32),
-        delta_seq_ids_tensor_device=torch.zeros(3, dtype=torch.int32),
-        new=SimpleNamespace(
-            max_len=max_len,
-            position_ids_tensor_device=torch.arange(3, dtype=torch.int32),
-            seq_ids_tensor_device=torch.zeros(3, dtype=torch.int32),
-        ),
-    )
-
-
-@pytest.mark.parametrize(("impl", "method_name"), BACKEND_METHODS)
-@pytest.mark.parametrize(
-    "mode", ["select_all", "logits", "decode_topk", "long_prefill_topk"]
-)
-def test_dsa_indexer_routing_for_every_backend(monkeypatch, impl, method_name, mode):
-    """All four routing exits of ``DSAIndexer.dsa_indexer`` for every backend.
-
-    ``mode`` selects the exit; the score method is mocked per backend and the
-    branch that fires is asserted via the recorded ``skip_prefill_score`` and
-    the returned value:
-      - "select_all"        : return_indices=True + short prefill (max_len <=
-        index_topk) -> scoring skipped (skip=True), TopK-width arange returned.
-      - "logits"            : return_indices=False -> scoring runs (skip=False),
-        its result returned as-is.
-      - "decode_topk"       : return_indices=True + decode stage -> scoring runs,
-        TopK indices returned.
-      - "long_prefill_topk" : return_indices=True + prefill with max_len >
-        index_topk -> scoring runs, TopK indices returned.
-    """
-    # select_all / logits are asserted for every backend (routing may branch on
-    # the backend's score method, which is mocked here). The TopK exits (decode /
-    # long prefill) are backend-agnostic post-processing: once scoring returns,
-    # dsa_indexer calls topk_indices the same way regardless of impl. So any one
-    # backend suffices as the representative — we reuse "triton" as the original
-    # test did — and the others are skipped to avoid redundant coverage.
-    if mode in ("decode_topk", "long_prefill_topk") and impl != "triton":
-        pytest.skip(
-            "TopK routing is backend-agnostic; covered by the triton representative"
-        )
-
-    indexer = _indexer_without_runtime_init(impl)
-    calls = []
-
-    # Per-mode config: seq_len_delta, return_indices, and the score stub result.
-    if mode == "select_all":
-        seq_len_delta = _indexer_seq_len_delta()  # prefill, max_len=3 <= topk=4
-        return_indices = True
-        score_result = None
-    elif mode == "logits":
-        seq_len_delta = _indexer_seq_len_delta()
-        return_indices = False
-        score_result = torch.randn(3, 4)
-    elif mode == "decode_topk":
-        seq_len_delta = _indexer_seq_len_delta(max_len=4, is_decode_stage=True)
-        return_indices = True
-        score_result = torch.randn(3, 4)
-    else:  # long_prefill_topk
-        seq_len_delta = _indexer_seq_len_delta(max_len=5, is_decode_stage=False)
-        return_indices = True
-        score_result = torch.randn(3, 5)
-
-    def fake_score(*args, skip_prefill_score=False, **kwargs):
-        calls.append(skip_prefill_score)
-        return score_result
-
-    monkeypatch.setattr(indexer, method_name, fake_score)
-
-    expected_topk = torch.full((3, 4), 7, dtype=torch.int64)
-    if mode in ("decode_topk", "long_prefill_topk"):
-        monkeypatch.setattr(
-            dsa_indexer_module, "topk_indices", lambda *args, **kwargs: expected_topk
-        )
-
-    actual = indexer.dsa_indexer(
-        torch.empty(3, 1),
-        torch.empty(3, 1),
-        None,
-        torch.empty(3, 1),
-        seq_len_delta,
-        object(),
-        is_causal=True,
-        index_topk=4,
-        return_indices=return_indices,
-    )
-
-    if mode == "select_all":
-        assert calls == [True]  # select-all skips scoring
-        # Keep the configured TopK width even when the actual sequence is shorter.
-        assert torch.equal(actual, torch.arange(4, dtype=torch.int32).repeat(3, 1))
-    elif mode == "logits":
-        assert calls == [False]  # logits request keeps the score path
-        assert actual is score_result
-    else:  # decode_topk / long_prefill_topk keep the score path then TopK
-        assert calls == [False]
-        assert actual is expected_topk
 
 
 def _dsa_args(
@@ -4472,142 +4357,6 @@ def _paged_accessor(*keys: str) -> PagedKVCacheAccessor:
         torch.zeros(1, 1, dtype=torch.int32),
         {key: torch.empty(1) for key in keys},
     )
-
-
-@pytest.mark.parametrize(
-    ("impl", "method_name", "append_fn", "read_fn", "accessor_key", "n_tensor_args"),
-    [
-        # deepgemm: its own packed append + indexer read; score takes
-        # (q, k, k_scale, weights) -> 4 leading tensor args.
-        (
-            "deepgemm",
-            "blockfp8_index_score_dsa_deepgemm",
-            "append_to_paged_kv_cache_blockfp8_deepgemm",
-            "read_from_paged_indexer_kv_cache_deepgemm",
-            "indexer_k_ks",
-            4,
-        ),
-        # bf16 dispatcher-backed backends: shared paged append + read; score takes
-        # (q, k, weights) -> 3 leading tensor args (no separate k_scale).
-        (
-            "hygon",
-            "bf16_index_score_dsa_hygon",
-            "append_to_paged_kv_cache",
-            "read_from_paged_kv_cache",
-            "indexer_k",
-            3,
-        ),
-        (
-            "torch_bf16",
-            "bf16_index_score_dsa_bf16",
-            "append_to_paged_kv_cache",
-            "read_from_paged_kv_cache",
-            "indexer_k",
-            3,
-        ),
-        (
-            "triton_bf16",
-            "bf16_index_score_dsa_bf16",
-            "append_to_paged_kv_cache",
-            "read_from_paged_kv_cache",
-            "indexer_k",
-            3,
-        ),
-    ],
-)
-def test_dsa_fast_path_appends_cache_without_reading(
-    monkeypatch, impl, method_name, append_fn, read_fn, accessor_key, n_tensor_args
-):
-    """Prefill fast path (skip_prefill_score=True): append the cache but never
-    read it back or compute scores.
-
-    Covers deepgemm (packed indexer_k_ks + deepgemm-specific append/read, score
-    signature has a separate k_scale so 4 tensor args) and the bf16 backends
-    (hygon plus dispatcher-backed torch_bf16/triton_bf16, shared paged append/read,
-    3 tensor args). The score method returns None and only the append helper must fire.
-    """
-    indexer = _indexer_without_runtime_init(impl)
-    appended = []
-    monkeypatch.setattr(
-        dsa_indexer_module,
-        append_fn,
-        lambda *args, **kwargs: appended.append(True),
-    )
-    monkeypatch.setattr(
-        dsa_indexer_module,
-        read_fn,
-        lambda *args, **kwargs: pytest.fail("fast path must not read the cache"),
-    )
-
-    tensor_args = [torch.empty(3, 1) for _ in range(n_tensor_args)]
-    result = getattr(indexer, method_name)(
-        *tensor_args,
-        _indexer_seq_len_delta(),
-        _paged_accessor(accessor_key),
-        skip_prefill_score=True,
-    )
-
-    assert result is None
-    assert appended == [True]
-
-
-@pytest.mark.parametrize("impl", ["triton", "torch"])
-@pytest.mark.parametrize("cache_layout", ["paged", "dense"])
-def test_torch_or_triton_fast_path_appends_k_and_scale_without_scoring(
-    monkeypatch, impl, cache_layout
-):
-    indexer = _indexer_without_runtime_init(impl)
-    appended = []
-    monkeypatch.setattr(
-        dsa_indexer_module,
-        "get_global_args",
-        lambda: SimpleNamespace(
-            infer=SimpleNamespace(
-                raise_lower_bit_float_to=None,
-                max_seq_len=8192,
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        dsa_indexer_module,
-        "blockfp8_index_score_ragged_q_paged_k_dsv32",
-        lambda *args, **kwargs: pytest.fail("fast path must not compute scores"),
-    )
-    monkeypatch.setattr(
-        dsa_indexer_module,
-        "blockfp8_index_score_ragged_q_dense_k_dsv32",
-        lambda *args, **kwargs: pytest.fail("fast path must not compute scores"),
-    )
-
-    if cache_layout == "paged":
-        monkeypatch.setattr(
-            dsa_indexer_module,
-            "append_to_paged_kv_cache",
-            lambda *args, **kwargs: appended.append(True),
-        )
-        accessor = _paged_accessor("indexer_k", "indexer_ks")
-    else:
-        monkeypatch.setattr(
-            dsa_indexer_module,
-            "append_to_dense_kv_cache",
-            lambda *args, **kwargs: appended.append(True),
-        )
-        accessor = DenseKVCacheAccessor(
-            {"indexer_k": torch.empty(1), "indexer_ks": torch.empty(1)}
-        )
-
-    result = indexer.blockfp8_index_score_dsa_torch_or_triton(
-        torch.empty(3, 1),
-        torch.empty(3, 1),
-        torch.empty(3, 1),
-        torch.empty(3, 1),
-        _indexer_seq_len_delta(),
-        accessor,
-        skip_prefill_score=True,
-    )
-
-    assert result is None
-    assert appended == [True, True]
 
 
 # ===========================================================================

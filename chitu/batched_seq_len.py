@@ -553,3 +553,60 @@ class BatchedSeqLenDelta:
             return torch.arange(self.batch_size, device=self.device, dtype=torch.int32)
         else:
             return self._delta.seq_ids_tensor_device
+
+
+class SlicedDelta:
+    """
+    A lightweight q-axis view over a `BatchedSeqLenDelta`.
+
+    The q-axis (delta tokens) is the axis that scorers iterate along a query
+    slice `[i:j]`. This view slices exactly the two per-q-token vectors
+    (`delta_position_ids_tensor_device`, `delta_seq_ids_tensor_device`) to
+    `[i:j]`, and passes everything else (`.new`, `.old`, batch-level flags)
+    through unchanged, because the k-axis is addressed via `.new` and is never
+    sliced.
+
+    This is only ever used for prefill chunking. Decode is single-pass and its
+    delta tensors are captured in a CUDA graph, so decode must not be sliced.
+    """
+
+    def __init__(self, base: "BatchedSeqLenDelta", start: int, stop: int):
+        self._base = base
+        self._start = start
+        self._stop = stop
+
+    @property
+    def old(self):
+        return self._base.old
+
+    @property
+    def new(self):
+        return self._base.new
+
+    @property
+    def device(self):
+        return self._base.device
+
+    @property
+    def is_classic_decoding(self):
+        return self._base.is_classic_decoding
+
+    @property
+    def is_decode_stage(self):
+        return self._base.is_decode_stage
+
+    @property
+    def is_first_prefill_chunk(self):
+        return self._base.is_first_prefill_chunk
+
+    @property
+    def batch_size(self):
+        return self._base.batch_size
+
+    @property
+    def delta_position_ids_tensor_device(self):
+        return self._base.delta_position_ids_tensor_device[self._start : self._stop]
+
+    @property
+    def delta_seq_ids_tensor_device(self):
+        return self._base.delta_seq_ids_tensor_device[self._start : self._stop]

@@ -96,31 +96,39 @@ def blockfp8_index_score_ragged_q_dense_k_dsv32_torch(
     k_seq_ids = seq_len_delta.new.seq_ids_tensor_device
     k_pos_ids = seq_len_delta.new.position_ids_tensor_device
 
-    b, n, _ = k.shape
-    # Graph-safety: use static m equal to K length (typically static_max_n)
-    m = n
+    b, n, d = k.shape
+    bm, h, _ = q.shape
+    assert tuple(q_s.shape) == (bm, h, 1)
+    assert tuple(k_s.shape) == (b, n, 1)
 
-    q_dense = torch.zeros(b, m, *q.shape[1:], dtype=q.dtype, device=q.device)
-    q_s_dense = torch.zeros(b, m, *q_s.shape[1:], dtype=q_s.dtype, device=q_s.device)
-    q_dense[q_seq_ids, q_pos_ids] = q
-    q_s_dense[q_seq_ids, q_pos_ids] = q_s
+    # Cast to bf16 as a reference fallback
+    q_bf16 = q.to(torch.bfloat16)  # [bm, h, d]
+    k_bf16 = k.to(torch.bfloat16)  # [b, n, d]
 
-    # Keep only valid K positions; others remain zero and will be masked to -inf later
-    k_filtered = torch.zeros_like(k)
-    k_s_filtered = torch.zeros_like(k_s)
-    k_filtered[k_seq_ids, k_pos_ids] = k[k_seq_ids, k_pos_ids]
-    k_s_filtered[k_seq_ids, k_pos_ids] = k_s[k_seq_ids, k_pos_ids]
+    # Gather the K rows for each query token's own sequence, so the whole
+    # computation is sized by the number of query rows (bm) rather than a dense
+    # [b, static_max_n, ...] grid. Under query chunking bm == chunk_s_q, so this
+    # op's peak memory scales with the chunk.
+    k_row = k_bf16[q_seq_ids]  # [bm, n, d]
+    k_s_row = k_s[q_seq_ids]  # [bm, n, 1]
 
-    score_dense = blockfp8_index_score_dense_dsv32(
-        q_dense, q_s_dense, k_filtered, k_s_filtered, causal=causal
-    )
+    logits = torch.einsum("mhd,mnd->mnh", q_bf16, k_row)  # [bm, n, h]
+    logits = logits.relu_()
+    logits *= q_s.view(bm, 1, h)
+    logits_sum = logits.sum(dim=-1)  # [bm, n]
+    output = logits_sum * k_s_row.view(bm, n)  # [bm, n]
 
-    # Prevent selecting invalid (not-yet-written) K positions under topk
+    # Only valid (already-written) K positions of the row's own sequence are
+    # selectable; mask everything else (and the causal future) to -inf.
     valid_mask = torch.zeros(b, n, dtype=torch.bool, device=k.device)
     valid_mask[k_seq_ids, k_pos_ids] = True
-    score_dense = score_dense.masked_fill(~valid_mask.unsqueeze(1), float("-inf"))
+    row_valid = valid_mask[q_seq_ids]  # [bm, n]
+    if causal:
+        n_idx = torch.arange(n, device=k.device)
+        row_valid &= n_idx.unsqueeze(0) <= q_pos_ids.unsqueeze(1)
+    output = output.masked_fill(~row_valid, float("-inf"))
 
-    return score_dense[q_seq_ids, q_pos_ids]
+    return output.to(torch.get_default_dtype())
 
 
 @make_op_dispatcher

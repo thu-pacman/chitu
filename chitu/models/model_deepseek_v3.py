@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend
-from chitu.batched_seq_len import BatchedSeqLenDelta
+from chitu.batched_seq_len import BatchedSeqLenDelta, SlicedDelta
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.kv_cache import (
     KVCacheBase,
@@ -242,13 +242,22 @@ class Indexer(torch.nn.Module):
         freqs_cis: BatchedFreqsCis,
         is_causal: bool,
         cache_accessor: KVCacheAccessor,
+        reduce,
+        *,
+        allow_select_all: bool,
+        empty_output: torch.Tensor,
         freqs_cis_k: Optional[BatchedFreqsCis] = None,
         k_pre_normed: bool = False,
-        return_indices: bool = False,
     ) -> torch.Tensor:
-        """Build index scores or direct prefill indices.
+        """Build the indexer Q/K/weights, append K to cache once, then compute
+        the per-query index score and reduce it to the caller's output.
 
-        In CP mode, use get_cp_context() for CP-specific parameters.
+        This owns the whole query-axis pipeline so ``forward`` (top-k indices)
+        and ``build_decode_topk_page_table`` (top-k page table) can share it,
+        differing only in the ``reduce`` callable.
+
+        ``reduce(logits, delta_view, ke_slice, ks_slice, physical_rows) -> [rows, W]``
+        turns one score slice into that slice's output rows.
         """
         cp_ctx = get_cp_context()
         # Only apply CP logic when freqs_cis_k is provided (CP indexer path).
@@ -309,27 +318,125 @@ class Indexer(torch.nn.Module):
                 )
                 local_ks = torch.cat([local_ks, pad_ks])
 
-        return self.indexer_impl.dsa_indexer(
-            q_indexer,
+        s_q = q_indexer.shape[0]
+        if s_q == 0:
+            # Empty batch: nothing to append or score; return caller's empty output.
+            return empty_output
+
+        # Append this step's K to the indexer KV cache
+        self.indexer_impl.append_indexer_kv(
             k_indexer,
             k_scale,
-            weights,
             seq_len_delta,
             cache_accessor,
-            is_causal,
-            self.index_topk,
-            return_indices=return_indices,
-            ke=local_lengths,
             k_append=k_append,
-            ks=local_ks,
-            q_seq_ids=(
-                local_seq_ids
-                if pcp_size > 1
-                and local_lengths is not None
-                and not seq_len_delta.is_decode_stage
-                else None
-            ),
         )
+
+        # CP-local per-row sequence ids: in CP mode q holds only this rank's
+        # query rows, so the global delta_seq_ids would mislabel them. Passed to
+        # index_score (used by the hygon scorer's row->sequence remap).
+        q_seq_ids = (
+            local_seq_ids
+            if pcp_size > 1
+            and local_lengths is not None
+            and not seq_len_delta.is_decode_stage
+            else None
+        )
+
+        # Prefill fast path: when the whole sequence fits within index_topk,
+        # every valid key is selected, so skip scoring and emit arange indices.
+        if (
+            allow_select_all
+            and not seq_len_delta.is_decode_stage
+            and seq_len_delta.new.max_len <= self.index_topk
+        ):
+            return torch.arange(
+                self.index_topk, dtype=torch.int32, device=q_indexer.device
+            ).repeat(s_q, 1)
+
+        # Decide chunking. The indexer owns the whole decision (decode never
+        # chunks; non-sliceable backends can't be capped; budget vs row_width),
+        # so we just ask it for a chunk size and iterate.
+        chunk_size = self.indexer_impl.chunk_size(seq_len_delta)
+        if chunk_size is None:
+            chunk_size = s_q
+
+        if chunk_size >= s_q:
+            # Single pass over the full (unsliced) delta.
+            logits = self.indexer_impl.index_score(
+                q_indexer,
+                weights,
+                seq_len_delta,
+                cache_accessor,
+                is_causal,
+                ke=local_lengths,
+                ks=local_ks,
+                q_seq_ids=q_seq_ids,
+                compact_prefill_logits=not self.indexer_impl.should_use_packed_hygon_prefill(
+                    seq_len_delta,
+                    self.index_topk,
+                    return_indices=True,
+                ),
+            )
+            return reduce(logits, seq_len_delta, local_lengths, local_ks, s_q)
+
+        out = None
+        for i in range(0, s_q, chunk_size):
+            j = min(i + chunk_size, s_q)
+            delta_view = SlicedDelta(seq_len_delta, i, j)
+            ke_slice = local_lengths[i:j] if local_lengths is not None else None
+            ks_slice = local_ks[i:j] if local_ks is not None else None
+            q_seq_ids_slice = q_seq_ids[i:j] if q_seq_ids is not None else None
+            physical_rows = j - i
+            logical_end = j
+            if q_seq_ids is not None:
+                logical_end = min(j, q_seq_ids.shape[0])
+                if i >= logical_end:
+                    rows = reduce(
+                        q_indexer.new_empty((0, self.indexer_impl.static_max_n)),
+                        delta_view,
+                        ke_slice,
+                        ks_slice,
+                        physical_rows,
+                    )
+                    if out is None:
+                        out = torch.empty(
+                            (s_q, rows.shape[-1]), dtype=rows.dtype, device=rows.device
+                        )
+                    out[i:j] = rows
+                    continue
+                q_slice = q_indexer[i:logical_end]
+                w_slice = weights[i:logical_end]
+                ke_slice = (
+                    local_lengths[i:logical_end] if local_lengths is not None else None
+                )
+                ks_slice = local_ks[i:logical_end] if local_ks is not None else None
+                q_seq_ids_slice = q_seq_ids[i:logical_end]
+            else:
+                q_slice = q_indexer[i:j]
+                w_slice = weights[i:j]
+            logits = self.indexer_impl.index_score(
+                q_slice,
+                w_slice,
+                delta_view,
+                cache_accessor,
+                is_causal,
+                ke=ke_slice,
+                ks=ks_slice,
+                q_seq_ids=q_seq_ids_slice,
+                compact_prefill_logits=not self.indexer_impl.should_use_packed_hygon_prefill(
+                    delta_view,
+                    self.index_topk,
+                    return_indices=True,
+                ),
+            )
+            rows = reduce(logits, delta_view, ke_slice, ks_slice, physical_rows)
+            if out is None:
+                out = torch.empty(
+                    (s_q, rows.shape[-1]), dtype=rows.dtype, device=rows.device
+                )
+            out[i:j] = rows
+        return out
 
     def build_decode_topk_page_table(
         self,
@@ -346,9 +453,21 @@ class Indexer(torch.nn.Module):
     ) -> torch.Tensor:
         """Build decode topk page table with optional CP support.
 
-        When freqs_cis_k is not None, uses separate Q/K RoPE (CP mode).
+        When freqs_cis_k is not None, uses separate Q/K RoPE (CP mode). Decode is
+        single-pass (never chunked), so the reduce below always sees the full
+        seq_len_delta.
         """
-        index_score = self._build_index_score(
+
+        def reduce(logits, delta_view, ke_slice, ks_slice, physical_rows):
+            lengths = delta_view.delta_position_ids_tensor_device + 1
+            return topk_page_table_decode_cuda(logits, lengths, source_page_table)
+
+        empty_output = topk_page_table_decode_cuda(
+            torch.empty(0, self.indexer_impl.static_max_n, device=x.device),
+            torch.empty(0, dtype=torch.int32, device=x.device),
+            source_page_table,
+        )
+        return self._build_index_score(
             x,
             q,
             k,
@@ -356,11 +475,12 @@ class Indexer(torch.nn.Module):
             freqs_cis,
             is_causal,
             cache_accessor,
+            reduce,
+            allow_select_all=False,
+            empty_output=empty_output,
             freqs_cis_k=freqs_cis_k,
             k_pre_normed=k_pre_normed,
         )
-        lengths = seq_len_delta.delta_position_ids_tensor_device + 1
-        return topk_page_table_decode_cuda(index_score, lengths, source_page_table)
 
     def forward(
         self,
@@ -373,19 +493,95 @@ class Indexer(torch.nn.Module):
         cache_accessor: KVCacheAccessor,
         freqs_cis_k: Optional[BatchedFreqsCis] = None,
         k_pre_normed: bool = False,
-    ):
-        direct_hygon_topk = self.indexer_impl.should_use_packed_hygon_prefill(
-            seq_len_delta,
-            self.index_topk,
-            return_indices=True,
+    ) -> torch.Tensor:
+        """Build per-query top-k indices.
+
+        In CP mode, use get_cp_context() for CP-specific parameters.
+        """
+
+        def reduce(logits, delta_view, ke_slice, ks_slice, physical_rows):
+            use_packed_hygon_prefill = (
+                self.indexer_impl.should_use_packed_hygon_prefill(
+                    delta_view,
+                    self.index_topk,
+                    return_indices=True,
+                )
+            )
+            if use_packed_hygon_prefill:
+                if ks_slice is not None:
+                    if ke_slice is None:
+                        raise ValueError("CP packed Hygon TopK requires valid lengths")
+                    logical_rows = logits.shape[0]
+                    if (
+                        ks_slice.numel() < logical_rows
+                        or ke_slice.numel() < logical_rows
+                    ):
+                        raise ValueError(
+                            "CP packed Hygon TopK metadata is shorter than logits: "
+                            f"rows={logical_rows}, ks={ks_slice.numel()}, "
+                            f"ke={ke_slice.numel()}"
+                        )
+                    row_starts = ks_slice.narrow(0, 0, logical_rows)
+                    lengths = ke_slice.narrow(0, 0, logical_rows)
+                else:
+                    row_seq_ids = delta_view.delta_seq_ids_tensor_device
+                    row_starts = delta_view.new.prefix_lens_tensor_device[
+                        row_seq_ids
+                    ].contiguous()
+                    lengths = (
+                        delta_view.delta_position_ids_tensor_device + 1
+                        if is_causal
+                        else delta_view.new.lens_tensor_device[row_seq_ids]
+                    )
+                    logical_rows = logits.shape[0]
+
+                logical_indices = topk_indices(
+                    logits,
+                    self.index_topk,
+                    lengths=lengths.contiguous(),
+                    row_starts=row_starts.contiguous(),
+                )
+                if logical_indices.dtype != torch.int32:
+                    raise RuntimeError(
+                        "Packed Hygon TopK must return int32 indices, got "
+                        f"{logical_indices.dtype}"
+                    )
+                if logical_indices.shape[0] > physical_rows:
+                    raise RuntimeError(
+                        "Packed Hygon TopK returned more rows than physical Q: "
+                        f"logical_rows={logical_indices.shape[0]}, "
+                        f"physical_rows={physical_rows}"
+                    )
+                if logical_indices.shape[0] == physical_rows:
+                    return logical_indices
+                dummy_indices = torch.full(
+                    (
+                        physical_rows - logical_indices.shape[0],
+                        *logical_indices.shape[1:],
+                    ),
+                    -1,
+                    dtype=torch.int32,
+                    device=logical_indices.device,
+                )
+                return torch.cat((logical_indices, dummy_indices), dim=0)
+
+            # Ensure k does not exceed the actual score width.
+            k_topk = min(self.index_topk, logits.size(-1))
+            lengths = (
+                ke_slice
+                if ke_slice is not None
+                else (delta_view.delta_position_ids_tensor_device + 1)
+            )
+            # May select some out-of-range items as -inf, which is fine.
+            return topk_indices(logits, k_topk, lengths=lengths)
+
+        empty_output = torch.empty(
+            0,
+            min(self.index_topk, self.indexer_impl.static_max_n),
+            dtype=torch.int32,
+            device=x.device,
         )
-        # TopK selects every valid key when the longest request already fits.
-        select_all_prefill_keys = (
-            not seq_len_delta.is_decode_stage
-            and seq_len_delta.new.max_len <= self.index_topk
-        )
-        return_direct_indices = direct_hygon_topk or select_all_prefill_keys
-        index_score = self._build_index_score(
+        return self._build_index_score(
             x,
             q,
             k,
@@ -393,27 +589,12 @@ class Indexer(torch.nn.Module):
             freqs_cis,
             is_causal,
             cache_accessor,
+            reduce,
+            allow_select_all=True,
+            empty_output=empty_output,
             freqs_cis_k=freqs_cis_k,
             k_pre_normed=k_pre_normed,
-            # Packed logits require row starts that are available inside
-            # DSAIndexer, so that path must finalize TopK before returning.
-            return_indices=return_direct_indices,
-        )  # [s_q, out_max_n]
-        if return_direct_indices:
-            return index_score
-        topk = min(self.index_topk, index_score.size(-1))
-        # Use cached local_lengths only in CP path (freqs_cis_k is not None).
-        # In non-CP path, always use seq_len_delta.
-        if freqs_cis_k is not None:
-            cp_ctx = get_cp_context()
-            lengths = (
-                cp_ctx.local_lengths
-                if cp_ctx.local_lengths is not None
-                else (seq_len_delta.delta_position_ids_tensor_device + 1)
-            )
-        else:
-            lengths = seq_len_delta.delta_position_ids_tensor_device + 1
-        return topk_indices(index_score, topk, lengths=lengths)
+        )
 
     def _rotate_activation(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dtype == torch.bfloat16

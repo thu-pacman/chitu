@@ -202,6 +202,8 @@ def _validate_triton_bf16_indexer_config(args):
 
 
 class DSAIndexer:
+    # Backends whose prefill index-score is query-sliceable and therefore honor
+
     def __init__(self, impl="auto"):
         args = get_global_args()
         if impl == "auto":
@@ -221,6 +223,19 @@ class DSAIndexer:
         validate_indexer_config(args, self.impl)
 
         self.static_max_n = args.infer.max_seq_len
+        self.index_topk = args.models.get("index_topk", 2048) or 2048
+        # Per-chunk memory budget (bytes) for the prefill indexer's intermediate
+        # index-score buffer. When set, the prefill index-score + top-k is
+        # computed in query chunks sized to this budget so the full
+        # [num_query_tokens, max_seq_len] buffer is never materialized (bounds
+        # peak memory under long prompts / context parallelism). None disables
+        # chunking (infinite budget: compute the whole buffer at once). See
+        # serve_config.yaml `indexer_logits_chunk_bytes`. Only the query-sliceable
+        # backends (deepgemm / hygon / torch_bf16) honor this; triton/torch
+        # compute the full buffer regardless.
+        self._indexer_logits_chunk_bytes = getattr(
+            args.infer, "indexer_logits_chunk_bytes", None
+        )
         self.mtp_size = getattr(args.infer, "mtp_size", 1)
 
         # deepgemm only
@@ -233,6 +248,130 @@ class DSAIndexer:
         self.prefill_schedule = None
 
         logger.info(f"Indexer Backend is initialized with impl={self.impl}")
+
+    def row_width(self, seq_len_delta: BatchedSeqLenDelta) -> int:
+        """Per-chunk index-score row width (columns) for this backend.
+
+        This is the number of fp32 score columns produced per query row, used to
+        size query chunks against ``indexer_logits_chunk_bytes``. Layout/width
+        conventions differ per backend, so each one reports its own width.
+        """
+        if self.impl == "deepgemm":
+            # deep_gemm compresses columns to align(max_seqlen_k, 256).
+            max_seqlen_k = min(
+                self.static_max_n,
+                max(seq_len_delta.new.max_len, self.index_topk),
+            )
+            return ((max_seqlen_k + 255) // 256) * 256
+        if self.impl == "hygon":
+            return seq_len_delta.new.max_len
+        # torch_bf16 / torch / triton materialize the full static width.
+        return self.static_max_n
+
+    def chunk_size(self, seq_len_delta: BatchedSeqLenDelta) -> Optional[int]:
+        """Number of query rows to score per prefill chunk, or None for single-pass.
+
+        Encapsulates the whole chunking decision so the caller only iterates:
+        - decode is never chunked (slicing the delta breaks the captured CUDA
+          graph), so return None;
+        - backends whose score op is not query-sliceable (triton / torch build a
+          dense ``[b, static_max_n, ...]`` buffer internally regardless of the
+          q-slice) can't be capped by chunking, so return None;
+        - otherwise size the chunk to ``indexer_logits_chunk_bytes`` using this
+          backend's ``row_width`` (fp32 columns). None budget disables chunking.
+        """
+        if seq_len_delta.is_decode_stage:
+            return None
+        if self._indexer_logits_chunk_bytes is None:
+            return None
+        row_bytes = max(1, int(self.row_width(seq_len_delta))) * 4
+        return max(1, int(self._indexer_logits_chunk_bytes) // row_bytes)
+
+    def append_indexer_kv(
+        self,
+        k_fp8,
+        k_scale,
+        seq_len_delta: BatchedSeqLenDelta,
+        cache_accessor: KVCacheAccessor,
+        k_append: Optional[torch.Tensor] = None,
+    ):
+        """Append this step's indexer K (and scale) to the KV cache once."""
+        delta_pos = seq_len_delta.delta_position_ids_tensor_device
+        delta_seq = seq_len_delta.delta_seq_ids_tensor_device
+
+        if self.impl == "deepgemm":
+            assert isinstance(cache_accessor, PagedKVCacheAccessor)
+            append_to_paged_kv_cache_blockfp8_deepgemm(
+                cache_accessor.kv["indexer_k_ks"],
+                cache_accessor.block_table,
+                k_fp8,
+                k_scale,
+                delta_pos,
+                delta_seq,
+                use_i64_offsets=cache_accessor.use_i64_offsets,
+            )
+        elif self.impl == "hygon":
+            assert isinstance(cache_accessor, PagedKVCacheAccessor)
+            # CP: k_fp8 is the allgathered global K (n_local*pcp_size tokens),
+            # k_append is local K (n_local tokens). When k_fp8's size doesn't
+            # match delta_position_ids (warmup/decode with few tokens), fall back
+            # to k_append which has the matching size.
+            k_size = k_fp8.shape[0]
+            pos_size = delta_pos.shape[0]
+            append_k = (
+                k_append if (k_append is not None and k_size != pos_size) else k_fp8
+            )
+            append_to_paged_kv_cache(
+                cache_accessor.kv["indexer_k"],
+                cache_accessor.block_table,
+                append_k,
+                delta_pos,
+                delta_seq,
+                get_page_ids=cache_accessor.get_page_ids,
+                get_offs_in_page=cache_accessor.get_offs_in_page,
+                use_i64_offsets=cache_accessor.use_i64_offsets,
+            )
+        elif self.impl in ("torch_bf16", "triton_bf16"):
+            assert isinstance(cache_accessor, PagedKVCacheAccessor)
+            append_to_paged_kv_cache(
+                cache_accessor.kv["indexer_k"],
+                cache_accessor.block_table,
+                k_fp8,
+                delta_pos,
+                delta_seq,
+                get_page_ids=cache_accessor.get_page_ids,
+                get_offs_in_page=cache_accessor.get_offs_in_page,
+                use_i64_offsets=cache_accessor.use_i64_offsets,
+            )
+        else:  # torch / triton share the same (indexer_k + indexer_ks) layout
+            if isinstance(cache_accessor, PagedKVCacheAccessor):
+                append_to_paged_kv_cache(
+                    cache_accessor.kv["indexer_k"],
+                    cache_accessor.block_table,
+                    k_fp8,
+                    delta_pos,
+                    delta_seq,
+                    get_page_ids=cache_accessor.get_page_ids,
+                    get_offs_in_page=cache_accessor.get_offs_in_page,
+                )
+                append_to_paged_kv_cache(
+                    cache_accessor.kv["indexer_ks"],
+                    cache_accessor.block_table,
+                    k_scale,
+                    delta_pos,
+                    delta_seq,
+                    get_page_ids=cache_accessor.get_page_ids,
+                    get_offs_in_page=cache_accessor.get_offs_in_page,
+                )
+            elif isinstance(cache_accessor, DenseKVCacheAccessor):
+                append_to_dense_kv_cache(
+                    cache_accessor.kv["indexer_k"], k_fp8, delta_pos, delta_seq
+                )
+                append_to_dense_kv_cache(
+                    cache_accessor.kv["indexer_ks"], k_scale, delta_pos, delta_seq
+                )
+            else:
+                raise NotImplementedError()
 
     def should_use_packed_hygon_prefill(
         self,
@@ -288,14 +427,20 @@ class DSAIndexer:
             else:
                 ke = seq_len_delta.new.lens_tensor_device + ks
 
-        # TODO: chunk to avoid OOM
+        # Use seq_len_delta.new.max_len instead of static_max_n to avoid over-
+        # allocating the compressed-logits row width.
+        max_seqlen_k = min(
+            self.static_max_n,
+            max(seq_len_delta.new.max_len, self.index_topk),
+        )
+
         index_score = deep_gemm.fp8_mqa_logits(
             q,
             (k, k_s),
             weights,
             ks,
             ke,
-            max_seqlen_k=self.static_max_n,  # compress logits
+            max_seqlen_k=max_seqlen_k,  # compress logits
             clean_logits=False,
         )
 
@@ -620,34 +765,19 @@ class DSAIndexer:
 
     def blockfp8_index_score_dsa_deepgemm(
         self,
-        q_fp8,
-        k_fp8,
-        k_scale,
-        weights,
-        seq_len_delta: BatchedSeqLenDelta,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        seq_len_delta,
         cache_accessor: KVCacheAccessor,
-        is_causal=True,
+        is_causal: bool = True,
         ke: Optional[torch.Tensor] = None,
-        k_append: Optional[torch.Tensor] = None,
         ks: Optional[torch.Tensor] = None,
-        skip_prefill_score: bool = False,
     ):
-        # save to paged kv cache
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
-        append_to_paged_kv_cache_blockfp8_deepgemm(
-            cache_accessor.kv["indexer_k_ks"],
-            cache_accessor.block_table,
-            k_fp8,
-            k_scale,
-            seq_len_delta.delta_position_ids_tensor_device,
-            seq_len_delta.delta_seq_ids_tensor_device,
-            use_i64_offsets=cache_accessor.use_i64_offsets,
-        )
 
         if seq_len_delta.is_decode_stage:  # decode
             if self.mtp_size > 2:
                 raise NotImplementedError()
-
             index_score = self.blockfp8_index_score_ragged_q_paged_k_dsv32_deepgemm(
                 q_fp8,
                 weights,
@@ -655,10 +785,6 @@ class DSAIndexer:
                 seq_len_delta,
                 cache_accessor.block_table,
             )
-
-        elif skip_prefill_score:
-            # The cache append above is still required by later decode steps.
-            index_score = None
         else:  # prefill
             k, k_s = read_from_paged_indexer_kv_cache_deepgemm(
                 cache_accessor.kv["indexer_k_ks"],
@@ -668,7 +794,6 @@ class DSAIndexer:
                 use_i64_offsets=cache_accessor.use_i64_offsets,
             )
 
-            # TODO: chunk to avoid OOM
             index_score = self.blockfp8_index_score_ragged_qk_dsv32_deepgemm(
                 q_fp8,
                 weights,
@@ -679,49 +804,23 @@ class DSAIndexer:
                 ks=ks,
                 ke_override=ke,
             )
-
         return index_score
 
     def blockfp8_index_score_dsa_torch_or_triton(
         self,
         q_fp8,
-        k_fp8,
-        k_scale,
         weights,
         seq_len_delta,
         cache_accessor: KVCacheAccessor,
         is_causal: bool = True,
-        skip_prefill_score: bool = False,
     ):
-        delta_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
-        delta_pos_ids = seq_len_delta.delta_position_ids_tensor_device
         softfp8 = (
             getattr(get_global_args().infer, "raise_lower_bit_float_to", None)
             == "bfloat16"
         )
 
         if isinstance(cache_accessor, PagedKVCacheAccessor):
-            append_to_paged_kv_cache(
-                cache_accessor.kv["indexer_k"],
-                cache_accessor.block_table,
-                k_fp8,
-                delta_pos_ids,
-                delta_seq_ids,
-                get_page_ids=cache_accessor.get_page_ids,
-                get_offs_in_page=cache_accessor.get_offs_in_page,
-            )
-            append_to_paged_kv_cache(
-                cache_accessor.kv["indexer_ks"],
-                cache_accessor.block_table,
-                k_scale,
-                delta_pos_ids,
-                delta_seq_ids,
-                get_page_ids=cache_accessor.get_page_ids,
-                get_offs_in_page=cache_accessor.get_offs_in_page,
-            )
-            if skip_prefill_score:
-                return None
-            index_score = blockfp8_index_score_ragged_q_paged_k_dsv32(
+            return blockfp8_index_score_ragged_q_paged_k_dsv32(
                 q_fp8,
                 weights,
                 cache_accessor.kv["indexer_k"],
@@ -734,15 +833,7 @@ class DSAIndexer:
                 impl=self.impl,
             )
         elif isinstance(cache_accessor, DenseKVCacheAccessor):
-            append_to_dense_kv_cache(
-                cache_accessor.kv["indexer_k"], k_fp8, delta_pos_ids, delta_seq_ids
-            )
-            append_to_dense_kv_cache(
-                cache_accessor.kv["indexer_ks"], k_scale, delta_pos_ids, delta_seq_ids
-            )
-            if skip_prefill_score:
-                return None
-            index_score = blockfp8_index_score_ragged_q_dense_k_dsv32(
+            return blockfp8_index_score_ragged_q_dense_k_dsv32(
                 q_fp8,
                 weights,
                 cache_accessor.kv["indexer_k"],
@@ -755,40 +846,22 @@ class DSAIndexer:
         else:
             raise NotImplementedError()
 
-        return index_score
-
     def bf16_index_score_dsa_hygon(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
         weights: torch.Tensor,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta,
         cache_accessor: KVCacheAccessor,
-        is_causal=True,
+        is_causal: bool = True,
         ke: Optional[torch.Tensor] = None,
-        k_append: Optional[torch.Tensor] = None,
         ks: Optional[torch.Tensor] = None,
         q_seq_ids: Optional[torch.Tensor] = None,
         compact_prefill_logits: bool = True,
-        skip_prefill_score: bool = False,
     ):
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
         # CP: k is allgathered global K (n_local*pcp_size tokens), k_append is local K (n_local tokens).
         # When k's size doesn't match delta_position_ids (warmup/decode with few tokens),
         # fall back to k_append which has the matching size.
-        k_size = k.shape[0]
-        pos_size = seq_len_delta.delta_position_ids_tensor_device.shape[0]
-        append_k = k_append if (k_append is not None and k_size != pos_size) else k
-        append_to_paged_kv_cache(
-            cache_accessor.kv["indexer_k"],
-            cache_accessor.block_table,
-            append_k,
-            seq_len_delta.delta_position_ids_tensor_device,
-            seq_len_delta.delta_seq_ids_tensor_device,
-            get_page_ids=cache_accessor.get_page_ids,
-            get_offs_in_page=cache_accessor.get_offs_in_page,
-            use_i64_offsets=cache_accessor.use_i64_offsets,
-        )
 
         if seq_len_delta.is_decode_stage:
             index_score = self.bf16_index_score_ragged_q_paged_k_dsv32_hygon(
@@ -798,11 +871,6 @@ class DSAIndexer:
                 seq_len_delta,
                 cache_accessor.block_table,
             )
-        elif skip_prefill_score:
-            # When every key is selected, preserve the cache append above but
-            # avoid reading the cache back and computing scores that TopK will
-            # discard. The caller returns request-local indices directly.
-            index_score = None
         else:
             k = read_from_paged_kv_cache(
                 cache_accessor.kv["indexer_k"],
@@ -828,28 +896,15 @@ class DSAIndexer:
     def bf16_index_score_dsa_bf16(
         self,
         q: torch.Tensor,
-        k: torch.Tensor,
         weights: torch.Tensor,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta,
         cache_accessor: KVCacheAccessor,
         is_causal=True,
         ke: Optional[torch.Tensor] = None,
         ks: Optional[torch.Tensor] = None,
-        skip_prefill_score: bool = False,
     ):
-        """BF16 indexer score using the BF16 K-only paged cache layout."""
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
         score_impl = {"torch_bf16": "torch", "triton_bf16": "triton"}[self.impl]
-        append_to_paged_kv_cache(
-            cache_accessor.kv["indexer_k"],
-            cache_accessor.block_table,
-            k,
-            seq_len_delta.delta_position_ids_tensor_device,
-            seq_len_delta.delta_seq_ids_tensor_device,
-            get_page_ids=cache_accessor.get_page_ids,
-            get_offs_in_page=cache_accessor.get_offs_in_page,
-            use_i64_offsets=cache_accessor.use_i64_offsets,
-        )
 
         if seq_len_delta.is_decode_stage:
             if score_impl == "torch":
@@ -870,10 +925,6 @@ class DSAIndexer:
                 impl=score_impl,
             )
 
-        if skip_prefill_score:
-            # The cache append above is still required by later decode steps.
-            return None
-
         k_full = read_from_paged_kv_cache(
             cache_accessor.kv["indexer_k"],
             cache_accessor.block_table,
@@ -884,7 +935,6 @@ class DSAIndexer:
 
         s_q, h, _ = q.shape
         weights = weights.reshape(s_q, h)
-
         if ks is not None and ke is not None:
             ke = ke + ks
         else:
@@ -951,169 +1001,51 @@ class DSAIndexer:
             schedule=schedule,
         )
 
-    def dsa_indexer(
+    def index_score(
         self,
-        q_fp8,
-        k_fp8,
-        k_scale,
+        q,
         weights,
         seq_len_delta,
         cache_accessor: KVCacheAccessor,
-        is_causal,
-        index_topk=2048,
-        return_indices=True,
+        is_causal: bool = True,
         ke: Optional[torch.Tensor] = None,
-        k_append: Optional[torch.Tensor] = None,
         ks: Optional[torch.Tensor] = None,
         q_seq_ids: Optional[torch.Tensor] = None,
+        compact_prefill_logits: bool = True,
     ):
-        if q_fp8.numel() == 0:
-            return torch.randn(0, self.static_max_n)
-        select_all_prefill_keys = (
-            return_indices
-            and not seq_len_delta.is_decode_stage
-            and seq_len_delta.new.max_len <= index_topk
-        )
-        use_packed_hygon_prefill = self.should_use_packed_hygon_prefill(
-            seq_len_delta,
-            index_topk,
-            return_indices=return_indices,
-        )
-        ### get index_score
+        """Pure index-score (raw logits) for one (possibly query-sliced) ``q``.
+
+        In CP mode ``ke`` / ``ks`` are the query-aligned local bounds
+        (already sliced to match ``q`` by the caller), and ``q_seq_ids`` are the
+        CP-local per-row sequence ids (the global ``delta_seq_ids`` would
+        mislabel the rank-local query rows).
+        """
+        if q.numel() == 0:
+            return torch.empty(
+                0, self.static_max_n, dtype=torch.float32, device=q.device
+            )
+
         if self.impl == "deepgemm":  # deepgemm uses a distinct kv layout
-            logits = self.blockfp8_index_score_dsa_deepgemm(
-                q_fp8,
-                k_fp8,
-                k_scale,
-                weights,
-                seq_len_delta,
-                cache_accessor,
-                is_causal,
-                ke=ke,
-                k_append=k_append,
-                ks=ks,
-                skip_prefill_score=select_all_prefill_keys,
+            return self.blockfp8_index_score_dsa_deepgemm(
+                q, weights, seq_len_delta, cache_accessor, is_causal, ke, ks
             )
         elif self.impl == "hygon":
-            logits = self.bf16_index_score_dsa_hygon(
-                q_fp8,
-                k_fp8,
+            return self.bf16_index_score_dsa_hygon(
+                q,
                 weights,
                 seq_len_delta,
                 cache_accessor,
                 is_causal,
                 ke=ke,
-                k_append=k_append,
                 ks=ks,
                 q_seq_ids=q_seq_ids,
-                compact_prefill_logits=not use_packed_hygon_prefill,
-                skip_prefill_score=select_all_prefill_keys,
+                compact_prefill_logits=compact_prefill_logits,
             )
         elif self.impl in ("torch_bf16", "triton_bf16"):
-            logits = self.bf16_index_score_dsa_bf16(
-                q_fp8,
-                k_fp8,
-                weights,
-                seq_len_delta,
-                cache_accessor,
-                is_causal,
-                ke=ke,
-                ks=ks,
-                skip_prefill_score=select_all_prefill_keys,
+            return self.bf16_index_score_dsa_bf16(
+                q, weights, seq_len_delta, cache_accessor, is_causal, ke, ks
             )
         else:  # triton and torch impl share the same kv layout
-            logits = self.blockfp8_index_score_dsa_torch_or_triton(
-                q_fp8,
-                k_fp8,
-                k_scale,
-                weights,
-                seq_len_delta,
-                cache_accessor,
-                is_causal,
-                skip_prefill_score=select_all_prefill_keys,
+            return self.blockfp8_index_score_dsa_torch_or_triton(
+                q, weights, seq_len_delta, cache_accessor, is_causal
             )
-
-        if select_all_prefill_keys:
-            # Keep the configured TopK width for attention backends whose sparse
-            # metadata is built for a fixed number of indices. Entries beyond a
-            # request's valid length are removed by the existing downstream mask.
-            return torch.arange(
-                index_topk,
-                dtype=torch.int32,
-                device=q_fp8.device,
-            ).repeat(q_fp8.shape[0], 1)
-
-        # Some callers need scores for a later length-aware TopK or page-table
-        # transform; direct-index paths finalize TopK inside this method.
-        if not return_indices:
-            return logits
-
-        assert logits is not None
-
-        ### get topk_indices
-        if self.impl == "hygon" and use_packed_hygon_prefill:
-            if ks is not None:
-                if ke is None:
-                    raise ValueError("CP packed Hygon TopK requires valid lengths")
-                # MR1978 passes only real query rows to LightOp, while CP's
-                # metadata still includes physical dummy rows. Keep TopK
-                # metadata aligned with the logical logits rows.
-                rows = logits.shape[0]
-                if ks.numel() < rows or ke.numel() < rows:
-                    raise ValueError(
-                        "CP packed Hygon TopK metadata is shorter than logits: "
-                        f"rows={rows}, ks={ks.numel()}, ke={ke.numel()}"
-                    )
-                row_starts = ks.narrow(0, 0, rows)
-                lengths = ke.narrow(0, 0, rows)
-            else:
-                row_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
-                row_starts = seq_len_delta.new.prefix_lens_tensor_device[
-                    row_seq_ids
-                ].contiguous()
-                lengths = (
-                    seq_len_delta.delta_position_ids_tensor_device + 1
-                    if is_causal
-                    else seq_len_delta.new.lens_tensor_device[row_seq_ids]
-                )
-            logical_indices = topk_indices(
-                logits,
-                index_topk,
-                lengths=lengths.contiguous(),
-                row_starts=row_starts.contiguous(),
-            )
-            if logical_indices.dtype != torch.int32:
-                raise RuntimeError(
-                    "Packed Hygon TopK must return int32 indices, got "
-                    f"{logical_indices.dtype}"
-                )
-
-            # FlashMLA still consumes the CP-padded physical Q rows. Restore
-            # that row count without inventing valid keys for dummy queries.
-            physical_rows = q_fp8.shape[0]
-            logical_rows = logical_indices.shape[0]
-            if logical_rows > physical_rows:
-                raise RuntimeError(
-                    "Packed Hygon TopK returned more rows than physical Q: "
-                    f"logical_rows={logical_rows}, physical_rows={physical_rows}"
-                )
-            if logical_rows == physical_rows:
-                return logical_indices
-            dummy_indices = torch.full(
-                (physical_rows - logical_rows, *logical_indices.shape[1:]),
-                -1,
-                dtype=torch.int32,
-                device=logical_indices.device,
-            )
-            return torch.cat((logical_indices, dummy_indices), dim=0)
-
-        # Ensure k does not exceed the actual size of index_score
-        k = min(index_topk, logits.size(-1))
-        lengths = (
-            ke
-            if ke is not None
-            else (seq_len_delta.delta_position_ids_tensor_device + 1)
-        )
-        indices = topk_indices(logits, k, lengths=lengths)
-        # shape: [bs_seq_q, k]. May select some out-of-range items as -inf, which is fine
-        return indices
