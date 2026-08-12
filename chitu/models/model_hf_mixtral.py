@@ -8,6 +8,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
 from chitu.attn_backend import AttnBackend
 from chitu.kv_cache import KVCacheBase
 from chitu.models.model_hf_llama import (
@@ -26,10 +27,11 @@ class SparseMoeBlockHFMixtral(nn.Module):
         num_experts: int,
         top_k: int,
         op_impl: str,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         layer_id: int,
     ):
         super().__init__()
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         self.num_experts = num_experts
         self.top_k = top_k
 
@@ -39,7 +41,7 @@ class SparseMoeBlockHFMixtral(nn.Module):
             num_experts,
             has_bias=False,
             input_is_parallel=False,
-            checkpoint_prefix=f"{checkpoint_prefix}.gate",
+            checkpoint_prefix=checkpoint_prefix / "gate",
         )
 
         self.experts = nn.ModuleList(

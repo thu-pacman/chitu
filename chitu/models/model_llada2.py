@@ -53,6 +53,7 @@ from chitu.distributed.parallel_state import (
 )
 
 from chitu.distributed.partition import compute_expert_dist_in_ep
+from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
 from chitu.utils import parse_dtype
 
 logger = getLogger(__name__)
@@ -77,6 +78,7 @@ class AttentionLLaDA2(AttentionHFLlama):
         op_impl: str = "torch",
         checkpoint_prefix="",
     ):
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         # Don't call super().__init__ since we have different structure
         nn.Module.__init__(self)
 
@@ -109,7 +111,7 @@ class AttentionLLaDA2(AttentionHFLlama):
             * self.head_dim,
             has_bias=False,
             gather_output=False,
-            checkpoint_prefix=f"{checkpoint_prefix}.query_key_value",
+            checkpoint_prefix=checkpoint_prefix / "query_key_value",
         )
 
         # QK LayerNorm
@@ -130,7 +132,7 @@ class AttentionLLaDA2(AttentionHFLlama):
             args.dim,
             has_bias=False,
             input_is_parallel=True,
-            checkpoint_prefix=f"{checkpoint_prefix}.dense",
+            checkpoint_prefix=checkpoint_prefix / "dense",
         )
 
     def _run_linear(self, x):
@@ -245,17 +247,21 @@ class MLPLLaDA2(nn.Module):
         role: str = "standalone",  # "standalone" or "shared_experts"
         *,
         op_impl: str,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         merge_gate_up=None,  # only work when role is "shared_experts"
         layer_id: int = 0,
     ):
         super().__init__()
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+        gate_up_checkpoint_prefix = checkpoint_prefix / CheckpointPrefix.merged(
+            "gate_proj", "up_proj"
+        )
         if role == "shared_experts":
             assert merge_gate_up is not None
             self.merge_gate_up = merge_gate_up
         else:
             self.merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
-                checkpoint_prefix
+                gate_up_checkpoint_prefix
             )
 
         self.op_impl = op_impl
@@ -282,11 +288,9 @@ class MLPLLaDA2(nn.Module):
                             "block_shape_2": (args.dim, inter_dim // get_tp_size())
                         }
                     },
-                    checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
+                    checkpoint_prefix=gate_up_checkpoint_prefix,
                 ),
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
-                # FIXME: f"{checkpoint_prefix}.gate_up_proj" is not a real checkpoint prefix,
-                # implement a joint checkpoint prefix for gate_proj and up_proj.
+                checkpoint_prefix=gate_up_checkpoint_prefix,
             )
         else:
             self.gate_proj = ColumnParallelLinear(
@@ -296,9 +300,9 @@ class MLPLLaDA2(nn.Module):
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_y(
                     op_impl,
-                    checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
+                    checkpoint_prefix=checkpoint_prefix / "gate_proj",
                 ),
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
+                checkpoint_prefix=checkpoint_prefix / "gate_proj",
             )
             self.up_proj = ColumnParallelLinear(
                 args.dim,
@@ -307,9 +311,9 @@ class MLPLLaDA2(nn.Module):
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_y(
                     op_impl,
-                    checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
+                    checkpoint_prefix=checkpoint_prefix / "up_proj",
                 ),
-                checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
+                checkpoint_prefix=checkpoint_prefix / "up_proj",
             )
         self.down_proj = RowParallelLinear(
             inter_dim,
@@ -319,9 +323,9 @@ class MLPLLaDA2(nn.Module):
             reduce_output=(role == "standalone"),
             base_linear_class=get_linear_layout_contig_y(
                 op_impl,
-                checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
+                checkpoint_prefix=checkpoint_prefix / "down_proj",
             ),
-            checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
+            checkpoint_prefix=checkpoint_prefix / "down_proj",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -343,6 +347,22 @@ class MLPLLaDA2(nn.Module):
             return self.down_proj(F.silu(gate_proj_out) * up_proj_out)
 
 
+def _llada2_moe_quant_prefixes(
+    checkpoint_prefix: str | CheckpointPrefix,
+    experts_start_idx: int,
+    experts_end_idx: int,
+    projection_names: tuple[str, ...],
+) -> CheckpointPrefix:
+    checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+    return CheckpointPrefix.merged(
+        *(
+            checkpoint_prefix / f"{expert_id}.{projection_name}"
+            for expert_id in range(experts_start_idx, experts_end_idx)
+            for projection_name in projection_names
+        )
+    )
+
+
 def LLaDA2MoeExperts(
     args,
     global_n_experts: int,
@@ -351,10 +371,19 @@ def LLaDA2MoeExperts(
     base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
     *,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
 ):
     """Create MoE experts for LLaDA2."""
-    quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
+    checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+    gate_up_quant_prefix = _llada2_moe_quant_prefixes(
+        checkpoint_prefix,
+        experts_start_idx,
+        experts_end_idx,
+        ("gate_proj", "up_proj"),
+    )
+    quant = get_quant_from_checkpoint_prefix(
+        gate_up_quant_prefix, args.quant_config.rules
+    )
     merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
 
     if base_moe_experts_class is None:
@@ -362,7 +391,7 @@ def LLaDA2MoeExperts(
             QuantizationRegistry.get_quantized_moe_experts_class_from_global_args(
                 merge_gate_up=merge_gate_up,
                 quant_kwargs=quant_kwargs,
-                checkpoint_prefix=checkpoint_prefix,
+                checkpoint_prefix=gate_up_quant_prefix,
             )
         )
 
@@ -390,8 +419,9 @@ class ParallelMoeBlockLLaDA2(ParallelMoeBlock):
         layer_id: int = 0,
         moe_impl: Optional[MoEImplBase] = None,
         *,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
     ):
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         if moe_impl is None:
             moe_impl = get_moe_impl()
 
@@ -403,13 +433,20 @@ class ParallelMoeBlockLLaDA2(ParallelMoeBlock):
             experts_start_idx = 0
             experts_end_idx = args.num_experts
 
-        merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(checkpoint_prefix)
+        shared_experts_gate_up_quant_prefix = (
+            checkpoint_prefix
+            / "shared_experts"
+            / CheckpointPrefix.merged("gate_proj", "up_proj")
+        )
+        merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
+            shared_experts_gate_up_quant_prefix
+        )
 
         non_fused_shared_experts = MLPLLaDA2(
             args,
             role="shared_experts",
             op_impl=op_impl,
-            checkpoint_prefix=f"{checkpoint_prefix}.shared_experts",
+            checkpoint_prefix=checkpoint_prefix / "shared_experts",
             merge_gate_up=merge_gate_up,
         )
 
@@ -422,7 +459,7 @@ class ParallelMoeBlockLLaDA2(ParallelMoeBlock):
                 experts_end_idx,
                 base_moe_experts_class,
                 quant_kwargs,
-                checkpoint_prefix=f"{checkpoint_prefix}.experts",
+                checkpoint_prefix=checkpoint_prefix / "experts",
             ),
             non_fused_shared_experts=non_fused_shared_experts,
             layer_id=layer_id,

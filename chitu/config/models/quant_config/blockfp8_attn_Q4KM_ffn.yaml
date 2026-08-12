@@ -5,12 +5,12 @@
 quant: 
 - model: 'deepseek'
   rules:
-    - regex : 'layers\.(\d+)\.mlp\.moe'
+    - regex : 'layers\.(\d+)\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)'
       type : q4km
       layers: ["3-6", 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, "53-60"]
       kwargs:
         ggml_type: q6k
-    - regex : 'layers\.(\d+)\.mlp\.moe'
+    - regex : 'layers\.(\d+)\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)'
       type : q4km
       backend: cpuinfer
       layers: [7, 8, 10, 11, 13, 14, 16, 17, 19, 20, 22, 23, 25, 26, 28, 29, 31, 32, 34, 35, 37, 38, 40, 41, 43, 44, 46, 47, 49, 50, 52]

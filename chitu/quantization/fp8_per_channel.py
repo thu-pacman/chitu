@@ -8,6 +8,7 @@ import functools
 
 import torch
 
+from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.ops.quant import per_token_quant_fp8
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import (
@@ -115,7 +116,7 @@ class Fp8PerChannelMoeExpertsMerged(QuantizedMoeExpertsMerged):
         experts_start_idx: int,
         experts_end_idx: int,
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
     ):
         super().__init__(
             dim,

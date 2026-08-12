@@ -7,6 +7,7 @@ import torch
 import ctypes
 import functools
 
+from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedMoeExpertsUnmerged
 from chitu.global_vars import get_global_args
@@ -39,7 +40,7 @@ class MoeExpertsDeepSeekV3CPUInfer(QuantizedMoeExpertsUnmerged):
         experts_start_idx: int,
         experts_end_idx: int,
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         *,
         ############################################
         # Parameters specific to this quantization

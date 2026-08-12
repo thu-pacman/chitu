@@ -9,6 +9,7 @@ from logging import getLogger
 
 import torch
 
+from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.quantization.base import (
     QuantizedLinearBase,
     QuantizedMoeExpertsUnmerged,
@@ -615,7 +616,7 @@ class Blockfp8MoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
         experts_start_idx: int,
         experts_end_idx: int,
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         ############################################
         # Parameters specific to this quantization
         round_scale_to_pow2: bool = False,
@@ -759,7 +760,7 @@ class Blockfp8MoeExpertsMerged(QuantizedMoeExpertsMerged):
         experts_start_idx: int,
         experts_end_idx: int,
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         ############################################
         # Parameters specific to this quantization
         round_scale_to_pow2: bool = False,

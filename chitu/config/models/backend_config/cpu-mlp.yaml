@@ -5,6 +5,6 @@
 backend: 
 - model: 'deepseek'
   rules:
-    - regex : 'layers\.(\d+)\.mlp\.moe'
+    - regex : 'layers\.(\d+)\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)'
       backend: cpuinfer
       layers: ["3-60"]

@@ -11,6 +11,7 @@ from typing_extensions import override
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
 from chitu.distributed.parallel_state import get_etp_size, get_etp_group
 from chitu.distributed.partition import compute_expert_dist_in_ep
 from chitu.models.model import ParallelMoeBlock
@@ -118,7 +119,7 @@ class GptOssMoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
         experts_start_idx: int,
         experts_end_idx: int,
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         *,
         ############################################
         # Parameters specific to this quantization
@@ -226,7 +227,7 @@ class GptOssMoeExpertsMerged(QuantizedMoeExpertsMerged):
         experts_start_idx: int,
         experts_end_idx: int,
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         *,
         ############################################
         # Parameters specific to this quantization
@@ -308,8 +309,9 @@ class ParallelMoeBlockGptOss(ParallelMoeBlock):
         layer_id: int = 0,
         moe_impl: Optional[MoEImplBase] = None,
         *,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
     ):
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         if moe_impl is None:
             moe_impl = get_moe_impl()
 
@@ -330,7 +332,7 @@ class ParallelMoeBlockGptOss(ParallelMoeBlock):
                 experts_start_idx=experts_start_idx,
                 experts_end_idx=experts_end_idx,
                 n_activated_experts=0,
-                checkpoint_prefix=f"{checkpoint_prefix}.experts",
+                checkpoint_prefix=checkpoint_prefix / "experts",
             ),
             non_fused_shared_experts=None,
             layer_id=layer_id,
@@ -352,9 +354,9 @@ class TransformerBlockHFGptOss(TransformerBlockHFLlama):
         checkpoint_prefix="",
         attn_type=AttentionHFGptOss,
     ):
-        base_moe_experts_class = None
+        base_moe_experts_class: Optional[type] = None
         quant = get_quant_from_checkpoint_prefix(
-            f"{checkpoint_prefix}.mlp", args.quant_config.rules
+            as_checkpoint_prefix(checkpoint_prefix) / "mlp", args.quant_config.rules
         )
         if op_impl == "muxi_custom_kernel":
             if quant is None:

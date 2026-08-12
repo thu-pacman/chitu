@@ -20,6 +20,7 @@ from chitu.quantization.utils import (
     get_quant_kwargs_from_checkpoint_prefix,
     get_backend_from_checkpoint_prefix,
 )
+from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.distributed.parallel_state import get_tp_size
 from chitu.utils import try_import_and_setup_torch_npu
 
@@ -71,7 +72,7 @@ class QuantizationRegistry:
     ]
 
     @classmethod
-    def allowed_merge_gate_up(cls, checkpoint):
+    def allowed_merge_gate_up(cls, checkpoint: str | CheckpointPrefix):
         quant = get_quant_from_checkpoint_prefix(checkpoint)
         backend = get_backend_from_checkpoint_prefix(checkpoint)
         if backend == "cpuinfer":
@@ -79,7 +80,11 @@ class QuantizationRegistry:
         return quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
 
     @classmethod
-    def allowed_merge_qkv(cls, checkpoint, can_use_mla_prologue_int8: bool = False):
+    def allowed_merge_qkv(
+        cls,
+        checkpoint: str | CheckpointPrefix,
+        can_use_mla_prologue_int8: bool = False,
+    ):
         quant = get_quant_from_checkpoint_prefix(checkpoint)
 
         backend = get_backend_from_checkpoint_prefix(checkpoint)
@@ -243,7 +248,7 @@ class QuantizationRegistry:
         class_type: str,
         *,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-        checkpoint_prefix="",
+        checkpoint_prefix: str | CheckpointPrefix = "",
     ) -> Type:
         method = get_quant_from_checkpoint_prefix(checkpoint_prefix)
         kwargs_of_method_from_user = quant_kwargs.get(method, {})
@@ -266,7 +271,7 @@ class QuantizationRegistry:
         cls,
         *,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-        checkpoint_prefix="",
+        checkpoint_prefix: str | CheckpointPrefix = "",
     ) -> Type[QuantizedLinearBase]:
         return cls._get_quantized_class_from_global_args(
             "linear",
@@ -280,7 +285,7 @@ class QuantizationRegistry:
         *,
         merge_gate_up: bool,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-        checkpoint_prefix="",
+        checkpoint_prefix: str | CheckpointPrefix = "",
     ) -> Type[QuantizedMoeExpertsBase]:
         return cls._get_quantized_class_from_global_args(
             "moe_experts_merged" if merge_gate_up else "moe_experts_unmerged",
@@ -293,7 +298,7 @@ class QuantizationRegistry:
         cls,
         *,
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
-        checkpoint_prefix="",
+        checkpoint_prefix: str | CheckpointPrefix = "",
     ) -> Type[QuantizedAbsorbGemmBase]:
         return cls._get_quantized_class_from_global_args(
             "absorb_gemm",

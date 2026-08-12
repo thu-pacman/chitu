@@ -20,6 +20,7 @@ from chitu.quantization import (
 )
 from chitu.distributed.parallel_state import get_etp_size
 from chitu.distributed.partition import compute_expert_dist_in_ep
+from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
 from chitu.models.registry import ModelType, register_model
 from chitu.moe import get_moe_impl, MoEImplBase, MoEImplEP
 
@@ -47,6 +48,22 @@ class Qwen3MoeGate(MoeGate):
         )
 
 
+def _qwen3_moe_quant_prefixes(
+    checkpoint_prefix: str | CheckpointPrefix,
+    experts_start_idx: int,
+    experts_end_idx: int,
+    projection_names: tuple[str, ...],
+) -> CheckpointPrefix:
+    checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+    return CheckpointPrefix.merged(
+        *(
+            checkpoint_prefix / f"{expert_id}.{projection_name}"
+            for expert_id in range(experts_start_idx, experts_end_idx)
+            for projection_name in projection_names
+        )
+    )
+
+
 def Qwen3MoeExperts(
     args,
     global_n_experts: int,
@@ -55,16 +72,26 @@ def Qwen3MoeExperts(
     base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
     *,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
 ):
-    quant = get_quant_from_checkpoint_prefix(checkpoint_prefix, args.quant_config.rules)
+    checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+    moe_checkpoint_prefix = checkpoint_prefix / "moe"
+    gate_up_quant_prefix = _qwen3_moe_quant_prefixes(
+        checkpoint_prefix,
+        experts_start_idx,
+        experts_end_idx,
+        ("gate_proj", "up_proj"),
+    )
+    quant = get_quant_from_checkpoint_prefix(
+        gate_up_quant_prefix, args.quant_config.rules
+    )
     merge_gate_up = quant in QuantizationRegistry._allowed_quant_for_merge_gate_up
     if base_moe_experts_class is None:
         base_moe_experts_class = (
             QuantizationRegistry.get_quantized_moe_experts_class_from_global_args(
                 merge_gate_up=merge_gate_up,
                 quant_kwargs=quant_kwargs,
-                checkpoint_prefix=f"{checkpoint_prefix}.moe",
+                checkpoint_prefix=gate_up_quant_prefix,
             )
         )
 
@@ -76,7 +103,7 @@ def Qwen3MoeExperts(
         experts_start_idx=experts_start_idx,
         experts_end_idx=experts_end_idx,
         n_activated_experts=0,
-        checkpoint_prefix=f"{checkpoint_prefix}.moe",
+        checkpoint_prefix=moe_checkpoint_prefix,
     )
 
 
@@ -90,8 +117,9 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
         layer_id: int = 0,
         moe_impl: Optional[MoEImplBase] = None,
         *,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
     ):
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         if moe_impl is None:
             moe_impl = get_moe_impl()
 
@@ -121,7 +149,7 @@ class ParallelMoeBlockQwen3(ParallelMoeBlock):
                 experts_end_idx,
                 base_moe_experts_class,
                 quant_kwargs,
-                checkpoint_prefix=f"{checkpoint_prefix}.experts",
+                checkpoint_prefix=checkpoint_prefix / "experts",
             ),
             non_fused_shared_experts=None,
             layer_id=layer_id,
@@ -143,9 +171,10 @@ class TransformerBlockHFQwen3Moe(TransformerBlockHFLlama):
         mlp_type=ParallelMoeBlockQwen3,
         checkpoint_prefix,
     ):
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         base_moe_experts_class = None
         quant = get_quant_from_checkpoint_prefix(
-            f"{checkpoint_prefix}.mlp", args.quant_config.rules
+            checkpoint_prefix / "mlp", args.quant_config.rules
         )
         if op_impl == "muxi_custom_kernel":
             if quant is None:

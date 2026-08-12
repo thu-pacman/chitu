@@ -69,6 +69,7 @@ from chitu.quantization import (
     get_quant_kwargs_from_checkpoint_prefix,
     get_layer_id_from_checkpoint_prefix,
 )
+from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
 from chitu.quantization.normal import (
     NormalAbsorbGemm,
     NormalLinear,
@@ -105,7 +106,7 @@ def ParallelAbsorbGemm(
     in_features_per_head: int,
     out_features_per_head: int,
     *,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
     base_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
@@ -136,10 +137,11 @@ class Indexer(torch.nn.Module):
         self,
         args,
         *,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         indexer_impl: DSAIndexer,
     ):
         super().__init__()
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         self.dim: int = args.dim
         self.n_heads: int = args.index_n_heads
         self.head_dim: int = args.index_head_dim
@@ -165,7 +167,7 @@ class Indexer(torch.nn.Module):
             self.n_heads,
             base_linear_class=NormalLinear,
             has_bias=False,
-            checkpoint_prefix=f"{checkpoint_prefix}.weights_proj",
+            checkpoint_prefix=checkpoint_prefix / "weights_proj",
         )
 
     def must_materialize_topk_indices(self) -> bool:
@@ -421,7 +423,7 @@ class AttentionDeepSeekV3(Attention):
         op_impl: str,
         mla_absorb,
         *,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         indexer_cache: Optional[KVCacheBase] = None,
         indexer_impl: Optional[DSAIndexer] = None,
         has_local_indexer: bool = True,
@@ -439,50 +441,46 @@ class AttentionDeepSeekV3(Attention):
         # Set dynamically by ModelDeepSeekV3 after construction for CP mode
         self._freqs_cis_real: torch.Tensor | None = None
         self._freqs_cis_imag: torch.Tensor | None = None
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         quant = get_quant_from_checkpoint_prefix(
             checkpoint_prefix, args.quant_config.rules
         )
         self.mla_prologue_int8_partial = (
             get_quant_from_checkpoint_prefix(
-                checkpoint_prefix + ".kv_b_proj", args.quant_config.rules
+                checkpoint_prefix / "kv_b_proj", args.quant_config.rules
             )
             is None
             and get_quant_from_checkpoint_prefix(
-                checkpoint_prefix + ".q_a_proj", args.quant_config.rules
+                checkpoint_prefix / "q_a_proj", args.quant_config.rules
             )
             is None
             and get_quant_from_checkpoint_prefix(
-                checkpoint_prefix + ".kv_a_proj_with_mqa", args.quant_config.rules
+                checkpoint_prefix / "kv_a_proj_with_mqa", args.quant_config.rules
             )
             is None
             and get_quant_from_checkpoint_prefix(
-                checkpoint_prefix + ".q_b_proj", args.quant_config.rules
+                checkpoint_prefix / "q_b_proj", args.quant_config.rules
             )
             == "w8a8_per_token_per_channel_dyn"
         )
         self.mla_prologue_int8_full = (
             get_quant_from_checkpoint_prefix(
-                checkpoint_prefix + ".kv_b_proj", args.quant_config.rules
+                checkpoint_prefix / "kv_b_proj", args.quant_config.rules
             )
             is None
             and get_quant_from_checkpoint_prefix(
-                checkpoint_prefix + ".q_a_proj", args.quant_config.rules
+                checkpoint_prefix / "q_a_proj", args.quant_config.rules
             )
             == "w8a8_per_token_per_channel_dyn"
             and get_quant_from_checkpoint_prefix(
-                checkpoint_prefix + ".kv_a_proj_with_mqa", args.quant_config.rules
+                checkpoint_prefix / "kv_a_proj_with_mqa", args.quant_config.rules
             )
             == "w8a8_per_token_per_channel_dyn"
             and get_quant_from_checkpoint_prefix(
-                checkpoint_prefix + ".q_b_proj", args.quant_config.rules
+                checkpoint_prefix / "q_b_proj", args.quant_config.rules
             )
             == "w8a8_per_token_per_channel_dyn"
         )
-        self.merge_qkv = QuantizationRegistry.allowed_merge_qkv(
-            checkpoint_prefix,
-            self.mla_prologue_int8_partial or self.mla_prologue_int8_full,
-        )
-
         self.dim = args.dim
         self.n_heads = args.n_heads
         self.n_local_heads = args.n_heads // get_tp_size()
@@ -496,6 +494,28 @@ class AttentionDeepSeekV3(Attention):
         self.index_head_dim = getattr(args, "index_head_dim", None)
         self.index_n_heads = getattr(args, "index_n_heads", None)
         self.index_topk = getattr(args, "index_topk", None)
+        has_indexer_weights = self.index_topk is not None and self.has_local_indexer
+        qkv_a_checkpoint_prefix = (
+            checkpoint_prefix
+            / CheckpointPrefix.merged("indexer.wk", "q_a_proj", "kv_a_proj_with_mqa")
+            if has_indexer_weights
+            else checkpoint_prefix
+            / CheckpointPrefix.merged("q_a_proj", "kv_a_proj_with_mqa")
+        )
+        q_b_indexer_q_b_checkpoint_prefix = checkpoint_prefix / CheckpointPrefix.merged(
+            "indexer.wq_b", "q_b_proj"
+        )
+        merge_qkv_checkpoint_prefix = (
+            CheckpointPrefix.merged(
+                qkv_a_checkpoint_prefix, q_b_indexer_q_b_checkpoint_prefix
+            )
+            if has_indexer_weights
+            else qkv_a_checkpoint_prefix
+        )
+        self.merge_qkv = QuantizationRegistry.allowed_merge_qkv(
+            merge_qkv_checkpoint_prefix,
+            self.mla_prologue_int8_partial or self.mla_prologue_int8_full,
+        )
 
         block_size = 16 if quant == "blockfp4" else 128
 
@@ -528,13 +548,12 @@ class AttentionDeepSeekV3(Attention):
             # fp8 gemm can handle weights not divisible by block_size, but it does not hold
             # after merging for the output dimension, except for the last weight.
             assert self.q_lora_rank % block_size == 0
-            has_indexer_weights = self.index_topk is not None and self.has_local_indexer
             if not has_indexer_weights:
                 self.wqkv_a = LocalLinear(
                     self.dim,
                     self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
                     has_bias=False,
-                    checkpoint_prefix=f"{checkpoint_prefix}.wqkv_a",  # FIXME: Really use name from checkpoint
+                    checkpoint_prefix=qkv_a_checkpoint_prefix,
                 )  # FIXME: Run this layer with muxi_layout_kernels
             else:
                 assert self.index_head_dim % block_size == 0
@@ -545,14 +564,14 @@ class AttentionDeepSeekV3(Attention):
                     + self.kv_lora_rank
                     + self.qk_rope_head_dim,
                     has_bias=False,
-                    checkpoint_prefix=f"{checkpoint_prefix}.wqkv_a",  # FIXME: Really use name from checkpoint
+                    checkpoint_prefix=qkv_a_checkpoint_prefix,
                 )  # FIXME: Run this layer with muxi_layout_kernels
         else:
             self.q_a_proj = LocalLinear(
                 self.dim,
                 self.q_lora_rank,
                 has_bias=False,
-                checkpoint_prefix=f"{checkpoint_prefix}.q_a_proj",
+                checkpoint_prefix=checkpoint_prefix / "q_a_proj",
                 base_linear_class=(
                     NormalLinearNpuFractalZn
                     if self.can_use_mla_prologue_torch_npu
@@ -564,7 +583,7 @@ class AttentionDeepSeekV3(Attention):
                 self.dim,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 has_bias=False,
-                checkpoint_prefix=f"{checkpoint_prefix}.kv_a_proj_with_mqa",
+                checkpoint_prefix=checkpoint_prefix / "kv_a_proj_with_mqa",
                 base_linear_class=(
                     NormalLinearNpuFractalZn
                     if self.can_use_mla_prologue_torch_npu
@@ -577,7 +596,7 @@ class AttentionDeepSeekV3(Attention):
                     self.dim,
                     self.index_head_dim,
                     has_bias=False,
-                    checkpoint_prefix=f"{checkpoint_prefix}.indexer.wk",
+                    checkpoint_prefix=checkpoint_prefix / "indexer.wk",
                 )
 
         self.q_a_layernorm = RMSNorm(
@@ -605,7 +624,7 @@ class AttentionDeepSeekV3(Attention):
                 )
                 // get_tp_size(),
                 has_bias=False,
-                checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",  # FIXME: Really use name from checkpoint
+                checkpoint_prefix=q_b_indexer_q_b_checkpoint_prefix,
             )
         else:
             self.q_b_proj = ColumnParallelLinear(
@@ -628,17 +647,17 @@ class AttentionDeepSeekV3(Attention):
                     )
                     else get_linear_layout_contig_y(
                         op_impl,
-                        checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
+                        checkpoint_prefix=checkpoint_prefix / "q_b_proj",
                     )
                 ),
-                checkpoint_prefix=f"{checkpoint_prefix}.q_b_proj",
+                checkpoint_prefix=checkpoint_prefix / "q_b_proj",
             )
             if self.index_topk is not None and self.has_local_indexer:
                 self.indexer_wq_b = LocalLinear(
                     self.q_lora_rank,
                     self.index_n_heads * self.index_head_dim,
                     has_bias=False,
-                    checkpoint_prefix=f"{checkpoint_prefix}.indexer.wq_b",
+                    checkpoint_prefix=checkpoint_prefix / "indexer.wq_b",
                 )
 
         self.kv_a_layernorm = RMSNorm(
@@ -659,9 +678,9 @@ class AttentionDeepSeekV3(Attention):
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_y(
                     op_impl,
-                    checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
+                    checkpoint_prefix=checkpoint_prefix / "kv_b_proj",
                 ),
-                checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
+                checkpoint_prefix=checkpoint_prefix / "kv_b_proj",
             )
         elif self.mla_absorb in ("absorb-without-precomp", "absorb-kv-only"):
             kv_b_proj_features_per_head = self.qk_nope_head_dim + self.v_head_dim
@@ -690,7 +709,7 @@ class AttentionDeepSeekV3(Attention):
                     else None
                 ),
                 quant_kwargs=absorb_quant_kwargs,
-                checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
+                checkpoint_prefix=checkpoint_prefix / "kv_b_proj",
             )
             self._use_hygon_split_q_absorb_output = getattr(
                 self.attn_backend, "sparse_split_q_supported", False
@@ -700,7 +719,7 @@ class AttentionDeepSeekV3(Attention):
                 self.kv_lora_rank,
                 self.v_head_dim,
                 quant_kwargs=absorb_quant_kwargs,
-                checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
+                checkpoint_prefix=checkpoint_prefix / "kv_b_proj",
             )
             if self.mla_absorb == "absorb-kv-only":
                 self.kv_b_proj = ColumnParallelLinear(
@@ -710,9 +729,9 @@ class AttentionDeepSeekV3(Attention):
                     gather_output=False,
                     base_linear_class=get_linear_layout_contig_y(
                         op_impl,
-                        checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
+                        checkpoint_prefix=checkpoint_prefix / "kv_b_proj",
                     ),
-                    checkpoint_prefix=f"{checkpoint_prefix}.kv_b_proj",
+                    checkpoint_prefix=checkpoint_prefix / "kv_b_proj",
                 )
 
         self.o_proj = RowParallelLinear(
@@ -726,9 +745,9 @@ class AttentionDeepSeekV3(Attention):
             input_is_parallel=True,
             base_linear_class=get_linear_layout_contig_y(
                 op_impl,
-                checkpoint_prefix=f"{checkpoint_prefix}.o_proj",
+                checkpoint_prefix=checkpoint_prefix / "o_proj",
             ),
-            checkpoint_prefix=f"{checkpoint_prefix}.o_proj",
+            checkpoint_prefix=checkpoint_prefix / "o_proj",
         )
 
         self.softmax_scale = compute_softmax_scale_deepseek_v3(args)
@@ -739,7 +758,7 @@ class AttentionDeepSeekV3(Attention):
             ), f"DSA is enabled, but got impl={type(indexer_impl)}"
             self.indexer = self.make_indexer(
                 args,
-                checkpoint_prefix=f"{checkpoint_prefix}.indexer",
+                checkpoint_prefix=checkpoint_prefix / "indexer",
                 indexer_impl=indexer_impl,
             )
 
@@ -998,7 +1017,7 @@ class AttentionDeepSeekV3(Attention):
         self,
         args,
         *,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         indexer_impl: DSAIndexer,
     ) -> Indexer:
         return Indexer(
@@ -1355,17 +1374,21 @@ class MLPDeepSeekV3(nn.Module):
         args,
         role: str,  # "standalone" or "shared_experts"
         op_impl: str,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         merge_gate_up=None,  # only work when role is "shared_experts"
         layer_id: int = 0,
     ):
         super().__init__()
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+        gate_up_checkpoint_prefix = checkpoint_prefix / CheckpointPrefix.merged(
+            "gate_proj", "up_proj"
+        )
         if role == "shared_experts":
             assert merge_gate_up is not None
             self.merge_gate_up = merge_gate_up
         else:
             self.merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
-                checkpoint_prefix
+                gate_up_checkpoint_prefix
             )
 
         self.op_impl = op_impl
@@ -1392,11 +1415,9 @@ class MLPDeepSeekV3(nn.Module):
                             "block_shape_2": (args.dim, inter_dim // get_tp_size())
                         }
                     },
-                    checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
+                    checkpoint_prefix=gate_up_checkpoint_prefix,
                 ),
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
-                # FIXME: f"{checkpoint_prefix}.gate_up_proj" is not a real checkpoint prefix,
-                # implement a joint checkpoint prefix for gate_proj and up_proj.
+                checkpoint_prefix=gate_up_checkpoint_prefix,
             )
         else:
             self.gate_proj = ColumnParallelLinear(
@@ -1406,9 +1427,9 @@ class MLPDeepSeekV3(nn.Module):
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_y(
                     op_impl,
-                    checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
+                    checkpoint_prefix=checkpoint_prefix / "gate_proj",
                 ),
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
+                checkpoint_prefix=checkpoint_prefix / "gate_proj",
             )
             self.up_proj = ColumnParallelLinear(
                 args.dim,
@@ -1417,9 +1438,9 @@ class MLPDeepSeekV3(nn.Module):
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_y(
                     op_impl,
-                    checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
+                    checkpoint_prefix=checkpoint_prefix / "up_proj",
                 ),
-                checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
+                checkpoint_prefix=checkpoint_prefix / "up_proj",
             )
         self.down_proj = RowParallelLinear(
             inter_dim,
@@ -1429,9 +1450,9 @@ class MLPDeepSeekV3(nn.Module):
             reduce_output=(role == "standalone"),
             base_linear_class=get_linear_layout_contig_y(
                 op_impl,
-                checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
+                checkpoint_prefix=checkpoint_prefix / "down_proj",
             ),
-            checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
+            checkpoint_prefix=checkpoint_prefix / "down_proj",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1498,23 +1519,53 @@ class GateDeepSeekV3(MoeGate):
         )
 
 
+def _deepseek_v3_moe_quant_prefixes(
+    checkpoint_prefix: str | CheckpointPrefix,
+    global_n_experts: int,
+    experts_start_idx: int,
+    experts_end_idx: int,
+    projection_names: tuple[str, ...],
+) -> CheckpointPrefix:
+    checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+    routed_end_idx = min(experts_end_idx, global_n_experts)
+    prefixes = [
+        checkpoint_prefix / f"experts.{expert_id}.{projection_name}"
+        for expert_id in range(experts_start_idx, routed_end_idx)
+        for projection_name in projection_names
+    ]
+    if experts_end_idx > global_n_experts:
+        prefixes.extend(
+            checkpoint_prefix / "shared_experts" / projection_name
+            for projection_name in projection_names
+        )
+    return CheckpointPrefix.merged(*prefixes)
+
+
 def MoeExpertsDeepSeekV3(
     args,
     global_n_experts: int,
     experts_start_idx: int,
     experts_end_idx: int,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
     base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
-    checkpoint_prefix = checkpoint_prefix + ".moe"
-    merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(checkpoint_prefix)
+    checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+    moe_checkpoint_prefix = checkpoint_prefix / "moe"
+    gate_up_quant_prefix = _deepseek_v3_moe_quant_prefixes(
+        checkpoint_prefix,
+        global_n_experts,
+        experts_start_idx,
+        experts_end_idx,
+        ("gate_proj", "up_proj"),
+    )
+    merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(gate_up_quant_prefix)
     if base_moe_experts_class is None:
         base_moe_experts_class = (
             QuantizationRegistry.get_quantized_moe_experts_class_from_global_args(
                 merge_gate_up=merge_gate_up,
                 quant_kwargs=quant_kwargs,
-                checkpoint_prefix=checkpoint_prefix,
+                checkpoint_prefix=gate_up_quant_prefix,
             )
         )
 
@@ -1526,7 +1577,7 @@ def MoeExpertsDeepSeekV3(
         experts_start_idx=experts_start_idx,
         experts_end_idx=experts_end_idx,
         n_activated_experts=args.n_activated_experts,
-        checkpoint_prefix=checkpoint_prefix,
+        checkpoint_prefix=moe_checkpoint_prefix,
     )
 
 
@@ -1540,14 +1591,20 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
         layer_id: int = 0,
         moe_impl: Optional[MoEImplBase] = None,
         *,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
     ):
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         if moe_impl is None:
             moe_impl = get_moe_impl()
 
         if not get_global_args().infer.fuse_shared_experts:
-            merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
+            shared_experts_gate_up_quant_prefix = (
                 checkpoint_prefix
+                / "shared_experts"
+                / CheckpointPrefix.merged("gate_proj", "up_proj")
+            )
+            merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
+                shared_experts_gate_up_quant_prefix
             )
 
             non_fused_shared_experts = MLPDeepSeekV3(
@@ -1555,7 +1612,7 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
                 role="shared_experts",
                 merge_gate_up=merge_gate_up,
                 op_impl=op_impl,
-                checkpoint_prefix=f"{checkpoint_prefix}.shared_experts",
+                checkpoint_prefix=checkpoint_prefix / "shared_experts",
             )
             n_fused_shared_experts = 0
         else:
@@ -1604,6 +1661,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         super().__init__(
             layer_id, args, cache_dict, attn_backend=attn_backend, op_impl=op_impl
         )
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         self.layer_id = layer_id
         self.self_attn = AttentionDeepSeekV3(
             args,
@@ -1612,7 +1670,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
             attn_backend,
             op_impl=op_impl,
             mla_absorb=mla_absorb,
-            checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
+            checkpoint_prefix=checkpoint_prefix / "self_attn",
             indexer_cache=cache_dict.get("indexer", None),
             indexer_impl=indexer_impl,
             has_local_indexer=True,
@@ -1620,7 +1678,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
         base_moe_experts_class = None
         if op_impl == "muxi_custom_kernel":
             quant = get_quant_from_checkpoint_prefix(
-                f"{checkpoint_prefix}.mlp", args.quant_config.rules
+                checkpoint_prefix / "mlp", args.quant_config.rules
             )
             if quant is None:
                 base_moe_experts_class = NormalMoeExpertsMuxiLayout
@@ -1635,7 +1693,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                 args,
                 role="standalone",
                 op_impl=op_impl,
-                checkpoint_prefix=f"{checkpoint_prefix}.mlp",
+                checkpoint_prefix=checkpoint_prefix / "mlp",
             )
             if layer_id < args.n_dense_layers
             else (
@@ -1643,7 +1701,7 @@ class TransformerBlockDeepSeekV3(TransformerBlock):
                     args,
                     op_impl=op_impl,
                     base_moe_experts_class=base_moe_experts_class,
-                    checkpoint_prefix=f"{checkpoint_prefix}.mlp",
+                    checkpoint_prefix=checkpoint_prefix / "mlp",
                     layer_id=layer_id,
                 )
             )
@@ -2428,12 +2486,14 @@ class TransformerDeepSeekV3(Transformer):
 
     @override
     def process_state_dict_for_merging_qkv(self, checkpoint: dict[str, Any]):
-        def enable_callback(k: str):
+        def enable_callback(checkpoint_prefix: str | CheckpointPrefix):
+            checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+            representative_path = next(iter(checkpoint_prefix.paths))
             layer_id = get_layer_id_from_checkpoint_prefix(
-                k, self.params.quant_config.rules
+                representative_path, self.params.quant_config.rules
             )
             return QuantizationRegistry.allowed_merge_qkv(
-                k,
+                checkpoint_prefix,
                 (
                     (
                         self.layers[layer_id].self_attn.mla_prologue_int8_partial

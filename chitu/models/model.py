@@ -78,6 +78,7 @@ from chitu.quantization import (
     get_quant_kwargs_from_checkpoint_prefix,
     get_backend_from_checkpoint_prefix,
 )
+from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.hybrid_device import CPUParameter
 from chitu.native_layout.base import TensorWithNativeLayout
 from chitu.static_tensor import StaticTensor
@@ -961,7 +962,7 @@ class Transformer(nn.Module):
         tgt_layer: str,
         src_layers: list[str],
         *,
-        enable_callback: Callable[[str], bool] = lambda _: True,
+        enable_callback: Callable[[str | CheckpointPrefix], bool] = lambda _: True,
         dim_type: str | int = "out",
     ):
         """
@@ -994,14 +995,18 @@ class Transformer(nn.Module):
                 + _1d_in_tensor_names
             )
 
-            if not enable_callback(k):
-                continue
-            elif any(
+            if any(
                 k.endswith(f".{src_layers[0]}.{tensor_name}")
                 for tensor_name in all_tensor_names
             ):
                 tensor_name = k.split(".")[-1]
                 prefix = k[: -len(f".{src_layers[0]}.{tensor_name}")]
+                callback_checkpoint_prefix = CheckpointPrefix.merged(
+                    *(f"{prefix}.{src_layer}" for src_layer in src_layers)
+                )
+                if not enable_callback(callback_checkpoint_prefix):
+                    continue
+
                 src_weights = [
                     checkpoint.pop(f"{prefix}.{src_layer}.{tensor_name}")
                     for src_layer in src_layers
@@ -2140,7 +2145,7 @@ class ParallelMoeBlock(nn.Module):
         *,
         enable_dynamic_load_balance: Optional[bool] = None,
         prefill_memory_tolerance: Optional[float] = None,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
     ):
         super().__init__()
 
@@ -2164,7 +2169,7 @@ class ParallelMoeBlock(nn.Module):
                 # Only do permutation on run time if the mapping is not identical
                 self.expert_mapping = m
 
-        self.checkpoint_prefix = checkpoint_prefix
+        self.checkpoint_prefix = CheckpointPrefix(checkpoint_prefix)
         self.layer_id = layer_id
 
         from chitu.backend import Backend
@@ -2237,10 +2242,10 @@ class ParallelMoeBlock(nn.Module):
                     routed_x,
                     weights,
                     may_fuse_quant=get_quant_from_checkpoint_prefix(
-                        f"{self.checkpoint_prefix}.experts"
+                        self.checkpoint_prefix / "experts"
                     ),
                     may_fuse_quant_kwargs=get_quant_kwargs_from_checkpoint_prefix(
-                        f"{self.checkpoint_prefix}.experts"
+                        self.checkpoint_prefix / "experts"
                     ),
                     layer_id=self.layer_id,
                 )
@@ -2356,7 +2361,7 @@ class ParallelMoeBlock(nn.Module):
 
 def get_linear_layout_native_y(
     op_impl: str,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     if op_impl == "muxi_custom_kernel":
@@ -2390,7 +2395,7 @@ def get_linear_layout_native_y(
 
 def get_linear_layout_contig_y(
     op_impl: str,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     if op_impl == "muxi_custom_kernel":

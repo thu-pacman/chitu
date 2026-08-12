@@ -33,6 +33,7 @@ from chitu.quantization import (
     get_quant_from_checkpoint_prefix,
     get_quant_kwargs_from_checkpoint_prefix,
 )
+from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
 from chitu.utils import is_layer, parse_dtype
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
@@ -85,7 +86,11 @@ class AttentionHFLlama(Attention):
         super().__init__(layer_id, cache, attn_backend)
         self.rotary_type = rotary_type
         self.op_impl = op_impl
-        self.merge_qkv = QuantizationRegistry.allowed_merge_qkv(checkpoint_prefix)
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+        qkv_checkpoint_prefix = checkpoint_prefix / CheckpointPrefix.merged(
+            "q_proj", "k_proj", "v_proj"
+        )
+        self.merge_qkv = QuantizationRegistry.allowed_merge_qkv(qkv_checkpoint_prefix)
 
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         tp_size = get_tp_size()
@@ -125,16 +130,6 @@ class AttentionHFLlama(Attention):
         else:
             quant_kwargs = {}
 
-        qkv_proj_linear = get_linear_layout_contig_y(
-            op_impl,
-            checkpoint_prefix=f"{checkpoint_prefix}.qkv_proj",
-            quant_kwargs=quant_kwargs,
-        )
-        o_proj_linear = get_linear_layout_contig_y(
-            op_impl,
-            checkpoint_prefix=f"{checkpoint_prefix}.o_proj",
-            quant_kwargs=quant_kwargs,
-        )
         if self.merge_qkv:
             self.qkv_proj = ColumnParallelLinear(
                 args.dim,
@@ -142,10 +137,12 @@ class AttentionHFLlama(Attention):
                 * self.head_dim,
                 has_bias=qkv_has_bias,
                 gather_output=False,
-                base_linear_class=qkv_proj_linear,
-                checkpoint_prefix=f"{checkpoint_prefix}.qkv_proj",
-                # FIXME: f"{checkpoint_prefix}.qkv_proj" is not a real checkpoint prefix,
-                # implement a joint checkpoint prefix for q_proj, k_proj, v_proj.
+                base_linear_class=get_linear_layout_contig_y(
+                    op_impl,
+                    checkpoint_prefix=qkv_checkpoint_prefix,
+                    quant_kwargs=quant_kwargs,
+                ),
+                checkpoint_prefix=qkv_checkpoint_prefix,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -153,32 +150,48 @@ class AttentionHFLlama(Attention):
                 args.n_heads * self.head_dim,
                 has_bias=qkv_has_bias,
                 gather_output=False,
-                base_linear_class=qkv_proj_linear,
-                checkpoint_prefix=f"{checkpoint_prefix}.q_proj",
+                base_linear_class=get_linear_layout_contig_y(
+                    op_impl,
+                    checkpoint_prefix=checkpoint_prefix / "q_proj",
+                    quant_kwargs=quant_kwargs,
+                ),
+                checkpoint_prefix=checkpoint_prefix / "q_proj",
             )
             self.k_proj = ColumnParallelLinear(
                 args.dim,
                 self.n_kv_heads * self.head_dim * self.n_kv_head_multiplier,
                 has_bias=qkv_has_bias,
                 gather_output=False,
-                base_linear_class=qkv_proj_linear,
-                checkpoint_prefix=f"{checkpoint_prefix}.k_proj",
+                base_linear_class=get_linear_layout_contig_y(
+                    op_impl,
+                    checkpoint_prefix=checkpoint_prefix / "k_proj",
+                    quant_kwargs=quant_kwargs,
+                ),
+                checkpoint_prefix=checkpoint_prefix / "k_proj",
             )
             self.v_proj = ColumnParallelLinear(
                 args.dim,
                 self.n_kv_heads * self.head_dim * self.n_kv_head_multiplier,
                 has_bias=qkv_has_bias,
                 gather_output=False,
-                base_linear_class=qkv_proj_linear,
-                checkpoint_prefix=f"{checkpoint_prefix}.v_proj",
+                base_linear_class=get_linear_layout_contig_y(
+                    op_impl,
+                    checkpoint_prefix=checkpoint_prefix / "v_proj",
+                    quant_kwargs=quant_kwargs,
+                ),
+                checkpoint_prefix=checkpoint_prefix / "v_proj",
             )
         self.o_proj = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
             has_bias=o_has_bias,
             input_is_parallel=True,
-            base_linear_class=o_proj_linear,
-            checkpoint_prefix=f"{checkpoint_prefix}.o_proj",
+            base_linear_class=get_linear_layout_contig_y(
+                op_impl,
+                checkpoint_prefix=checkpoint_prefix / "o_proj",
+                quant_kwargs=quant_kwargs,
+            ),
+            checkpoint_prefix=checkpoint_prefix / "o_proj",
         )
 
         if getattr(args, "use_qk_norm", False):
@@ -293,31 +306,28 @@ class FeedForwardHFLlama(nn.Module):
     ):
         super().__init__()
         self.op_impl = op_impl
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+        gate_up_checkpoint_prefix = checkpoint_prefix / CheckpointPrefix.merged(
+            "gate_proj", "up_proj"
+        )
         self.merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
-            checkpoint_prefix
+            gate_up_checkpoint_prefix
         )
 
         # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
         # Therefore, the projected shape is [tp_size, 2 * params.intermediate_dim]
 
-        gate_up_proj_linear = get_linear_layout_native_y(
-            op_impl,
-            checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
-        )
-        down_proj_linear = get_linear_layout_contig_y(
-            op_impl,
-            checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
-        )
         if self.merge_gate_up:
             self.gate_up_proj = ColumnParallelLinear(
                 params.dim,
                 params.intermediate_dim * 2,
                 has_bias=has_bias,
                 gather_output=False,
-                base_linear_class=gate_up_proj_linear,
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
-                # FIXME: f"{checkpoint_prefix}.gate_up_proj" is not a real checkpoint prefix,
-                # implement a joint checkpoint prefix for gate_proj and up_proj.
+                base_linear_class=get_linear_layout_native_y(
+                    op_impl,
+                    checkpoint_prefix=gate_up_checkpoint_prefix,
+                ),
+                checkpoint_prefix=gate_up_checkpoint_prefix,
             )
         else:
             self.gate_proj = ColumnParallelLinear(
@@ -325,8 +335,11 @@ class FeedForwardHFLlama(nn.Module):
                 params.intermediate_dim,
                 has_bias=has_bias,
                 gather_output=False,
-                base_linear_class=gate_up_proj_linear,
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
+                base_linear_class=get_linear_layout_native_y(
+                    op_impl,
+                    checkpoint_prefix=checkpoint_prefix / "gate_proj",
+                ),
+                checkpoint_prefix=checkpoint_prefix / "gate_proj",
             )
 
             self.up_proj = ColumnParallelLinear(
@@ -334,8 +347,11 @@ class FeedForwardHFLlama(nn.Module):
                 params.intermediate_dim,
                 has_bias=has_bias,
                 gather_output=False,
-                base_linear_class=gate_up_proj_linear,
-                checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
+                base_linear_class=get_linear_layout_native_y(
+                    op_impl,
+                    checkpoint_prefix=checkpoint_prefix / "up_proj",
+                ),
+                checkpoint_prefix=checkpoint_prefix / "up_proj",
             )
 
         self.down_proj = RowParallelLinear(
@@ -343,8 +359,11 @@ class FeedForwardHFLlama(nn.Module):
             params.dim,
             has_bias=has_bias,
             input_is_parallel=True,
-            base_linear_class=down_proj_linear,
-            checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
+            base_linear_class=get_linear_layout_contig_y(
+                op_impl,
+                checkpoint_prefix=checkpoint_prefix / "down_proj",
+            ),
+            checkpoint_prefix=checkpoint_prefix / "down_proj",
         )
 
     def forward(self, x):
@@ -389,6 +408,7 @@ class TransformerBlockHFLlama(TransformerBlock):
         attn_type=AttentionHFLlama,
     ):
         super().__init__(layer_id, args, cache_dict, attn_backend, op_impl)
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         self.self_attn = attn_type(
             args,
             layer_id,
@@ -396,20 +416,20 @@ class TransformerBlockHFLlama(TransformerBlock):
             attn_backend,
             rotary_type=rotary_type,
             op_impl=op_impl,
-            checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
+            checkpoint_prefix=checkpoint_prefix / "self_attn",
         )
 
         self.mlp = mlp_type(
             args,
             op_impl=op_impl,
-            checkpoint_prefix=f"{checkpoint_prefix}.mlp",
+            checkpoint_prefix=checkpoint_prefix / "mlp",
             layer_id=layer_id,
         )
 
         input_layernorm_module_type = (
             RMSNormBias
             if get_quant_kwargs_from_checkpoint_prefix(
-                checkpoint_prefix + ".input_layernorm", args.quant_config.rules
+                checkpoint_prefix / "input_layernorm", args.quant_config.rules
             ).get("bias")
             else RMSNorm
         )
@@ -425,7 +445,7 @@ class TransformerBlockHFLlama(TransformerBlock):
         post_attention_layernorm_module_type = (
             RMSNormBias
             if get_quant_kwargs_from_checkpoint_prefix(
-                checkpoint_prefix + ".post_attention_layernorm", args.quant_config.rules
+                checkpoint_prefix / "post_attention_layernorm", args.quant_config.rules
             ).get("bias")
             else RMSNorm
         )
