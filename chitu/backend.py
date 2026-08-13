@@ -752,6 +752,9 @@ class Backend:
         model.apply(Backend._move_one_module_to_device)
 
         if torch.distributed.get_rank() == 0:
+            QuantizationRegistry.emit_observed_quantized_module_impl_summary(
+                target_logger=logger
+            )
             logger.debug(f"Model structure: \n{model}")
 
         Backend.model = model

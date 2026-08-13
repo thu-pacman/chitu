@@ -3,9 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import Any, Mapping, Optional, Type, Callable
+import copy
+from dataclasses import dataclass
 import functools
 import re
+from logging import getLogger
 import torch
+from tabulate import tabulate
 
 from chitu.global_vars import get_global_args
 from chitu.quantization.base import (
@@ -25,6 +29,36 @@ from chitu.distributed.parallel_state import get_tp_size
 from chitu.utils import try_import_and_setup_torch_npu
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+logger = getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _ObservedModuleImplRequest:
+    class_type: str
+    backend_type: str
+    method: str | None
+    effective_kwargs: Mapping[str, Any]
+
+
+_LinearImplEntry = tuple[
+    Type[QuantizedLinearBase], Callable[[Mapping[str, Any]], bool], int
+]
+_MoeExpertsUnmergedImplEntry = tuple[
+    Type[QuantizedMoeExpertsUnmerged], Callable[[Mapping[str, Any]], bool], int
+]
+_MoeExpertsMergedImplEntry = tuple[
+    Type[QuantizedMoeExpertsMerged], Callable[[Mapping[str, Any]], bool], int
+]
+_AbsorbGemmImplEntry = tuple[
+    Type[QuantizedAbsorbGemmBase], Callable[[Mapping[str, Any]], bool], int
+]
+
+
+def _copy_observed_kwargs(kwargs: Mapping[str, Any]) -> Mapping[str, Any]:
+    try:
+        return copy.deepcopy(kwargs)
+    except Exception:
+        return dict(kwargs)
 
 
 class QuantizationRegistry:
@@ -34,16 +68,17 @@ class QuantizationRegistry:
 
     # NOTE: The inner dict's key can either be a `str` typed quantization method
     # nane, or `None` for no quantization (a.k.a. "normal" quantization)
-    _linear_registry: dict[str, dict[str | None, list[Type[QuantizedLinearBase]]]] = {}
+    _linear_registry: dict[str, dict[str | None, list[_LinearImplEntry]]] = {}
     _moe_experts_unmerged_registry: dict[
-        str, dict[str | None, list[Type[QuantizedMoeExpertsUnmerged]]]
+        str, dict[str | None, list[_MoeExpertsUnmergedImplEntry]]
     ] = {}
     _moe_experts_merged_registry: dict[
-        str, dict[str | None, list[Type[QuantizedMoeExpertsMerged]]]
+        str, dict[str | None, list[_MoeExpertsMergedImplEntry]]
     ] = {}
-    _absorb_gemm_registry: dict[
-        str, dict[str | None, list[Type[QuantizedAbsorbGemmBase]]]
-    ] = {}
+    _absorb_gemm_registry: dict[str, dict[str | None, list[_AbsorbGemmImplEntry]]] = {}
+
+    _observed_module_impl_requests: list[_ObservedModuleImplRequest] = []
+    _observed_module_impl_summary_emitted = False
 
     _allowed_quant_for_merge_gate_up: list = [
         "blockfp4_merged",
@@ -70,6 +105,101 @@ class QuantizationRegistry:
         "hygon_w4a8",
         None,
     ]
+
+    @classmethod
+    def _get_module_registry(cls, class_type: str):
+        if class_type == "linear":
+            return cls._linear_registry
+        if class_type == "moe_experts_unmerged":
+            return cls._moe_experts_unmerged_registry
+        if class_type == "moe_experts_merged":
+            return cls._moe_experts_merged_registry
+        if class_type == "absorb_gemm":
+            return cls._absorb_gemm_registry
+        raise ValueError(f"Unknown class type: {class_type}")
+
+    @staticmethod
+    def _select_module_impl(backend_impl, effective_kwargs: Mapping[str, Any]):
+        priority = -1
+        impl: Type | None = None
+        availability: dict[Type, bool] = {}
+        for impl_, when_, priority_ in backend_impl:
+            available = when_(effective_kwargs)
+            availability[impl_] = available
+            if available and priority_ > priority:
+                impl, priority = impl_, priority_
+        return impl, availability
+
+    @staticmethod
+    def _format_module_selection_key(
+        class_type: str, backend_type: str, method: str | None
+    ) -> str:
+        quant = "none" if method is None else method
+        return f"{class_type}[backend={backend_type}, quant={quant}]"
+
+    @classmethod
+    def format_observed_quantized_module_impl_summary_lines(cls) -> list[str]:
+        table = []
+        seen_selection_keys = set()
+        for request in cls._observed_module_impl_requests:
+            selection_key = cls._format_module_selection_key(
+                request.class_type, request.backend_type, request.method
+            )
+            if selection_key in seen_selection_keys:
+                continue
+            seen_selection_keys.add(selection_key)
+
+            registry = cls._get_module_registry(request.class_type)
+            backend_impl = registry.get(request.backend_type, {}).get(request.method)
+            if not backend_impl:
+                continue
+
+            selected_impl, availability = cls._select_module_impl(
+                backend_impl, request.effective_kwargs
+            )
+            if selected_impl is None:
+                continue
+
+            row = [selection_key]
+            for impl_, _, _ in backend_impl:
+                if impl_ is selected_impl:
+                    marker = "✓"
+                elif availability.get(impl_, False):
+                    marker = "·"
+                else:
+                    marker = "×"
+                row.append(f"{impl_.__qualname__} {marker}")
+            table.append(row)
+
+        if not table:
+            return []
+
+        max_columns = max(len(row) for row in table)
+        for row in table:
+            row += [""] * (max_columns - len(row))
+        return tabulate(table, tablefmt="github").splitlines()
+
+    @classmethod
+    def emit_observed_quantized_module_impl_summary(cls, target_logger=None) -> bool:
+        lines = cls.format_observed_quantized_module_impl_summary_lines()
+        if not lines:
+            return False
+
+        if cls._observed_module_impl_summary_emitted:
+            return False
+        cls._observed_module_impl_summary_emitted = True
+
+        if target_logger is None:
+            target_logger = logger
+        target_logger.info(
+            "Quantized module implementations selected during model build (✓ = selected; · = not selected due to priority; × = unavailable):"
+        )
+        for line in lines:
+            target_logger.info(line)
+        target_logger.info(
+            "Set CHITU_LOGGING_LEVEL=chitu.backend:DEBUG to see the full model structure, including where each selected module is used."
+        )
+        return True
 
     @classmethod
     def allowed_merge_gate_up(cls, checkpoint: str | CheckpointPrefix):
@@ -127,17 +257,7 @@ class QuantizationRegistry:
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
         backend_type: str = "default",
     ) -> Type:
-        registry: dict[str, dict[str | None, Type]]
-        if class_type == "linear":
-            registry = cls._linear_registry
-        elif class_type == "moe_experts_unmerged":
-            registry = cls._moe_experts_unmerged_registry
-        elif class_type == "moe_experts_merged":
-            registry = cls._moe_experts_merged_registry
-        elif class_type == "absorb_gemm":
-            registry = cls._absorb_gemm_registry
-        else:
-            raise ValueError(f"Unknown class type: {class_type}")
+        registry = cls._get_module_registry(class_type)
 
         if backend_type not in registry:
             raise ValueError(f"Unknown backend impls: {backend_type}")
@@ -147,18 +267,26 @@ class QuantizationRegistry:
                 f"Unknown quantization: `method` {method}, `backend` {backend_type}"
             )
         backend_impl = backend_impls[method]
+        if method is not None:
+            effective_kwargs = quant_kwargs.get(method, {})
+        else:
+            effective_kwargs = {}
+        cls._observed_module_impl_requests.append(
+            _ObservedModuleImplRequest(
+                class_type=class_type,
+                backend_type=backend_type,
+                method=method,
+                effective_kwargs=_copy_observed_kwargs(effective_kwargs),
+            )
+        )
 
-        priority = -1
-        impl: Type = None
-        for impl_, when_, priority_ in backend_impl:
-            if when_(quant_kwargs.get(method, {})) and priority_ > priority:
-                impl, priority = impl_, priority_
+        impl, _ = cls._select_module_impl(backend_impl, effective_kwargs)
         if impl is None:
             raise ValueError(
                 f"No available implementation for quantization method: {method}, backend: {backend_type}"
             )
 
-        if method in quant_kwargs:
+        if method is not None and method in quant_kwargs:
 
             class QuantLayerImpl(impl):
                 def __init__(self, *args, **kwargs):
@@ -251,7 +379,10 @@ class QuantizationRegistry:
         checkpoint_prefix: str | CheckpointPrefix = "",
     ) -> Type:
         method = get_quant_from_checkpoint_prefix(checkpoint_prefix)
-        kwargs_of_method_from_user = quant_kwargs.get(method, {})
+        if method is not None:
+            kwargs_of_method_from_user = quant_kwargs.get(method, {})
+        else:
+            kwargs_of_method_from_user = {}
         kwargs_of_method_from_rules = get_quant_kwargs_from_checkpoint_prefix(
             checkpoint_prefix
         )
@@ -259,10 +390,14 @@ class QuantizationRegistry:
             **kwargs_of_method_from_rules,
             **kwargs_of_method_from_user,
         }
+        if method is not None:
+            joined_quant_kwargs = {method: joined_kwargs_of_method}
+        else:
+            joined_quant_kwargs = {}
         return cls._get_quantized_class(
             class_type,
             method,
-            quant_kwargs={method: joined_kwargs_of_method},
+            quant_kwargs=joined_quant_kwargs,
             backend_type=get_backend_from_checkpoint_prefix(checkpoint_prefix),
         )
 

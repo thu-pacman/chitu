@@ -310,7 +310,7 @@ COPY --from=dependency_installer /opt/conda /opt/conda
 # compile at install time, and the compile results are environment dependent.
 RUN --mount=from=wheel_builder,source=/tmp/wheels,target=/tmp/wheels \
   pip install /tmp/wheels/*.whl \
-    -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "numpy" -e "transformers" -e "pytest" -e 'typing-extensions' -e 'typing_extensions' -e "build" -e "click")
+    -c <(pip list --format freeze | grep -v -e "pillow" -e "fsspec" -e "flash-mla" -e "flash_mla" -e "numpy" -e "transformers" -e "pytest" -e 'typing-extensions' -e 'typing_extensions' -e "build" -e "click" -e "idna")
 
 RUN rm -rf /tmp/*
 COPY ./test ./test

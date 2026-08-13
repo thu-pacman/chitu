@@ -106,6 +106,7 @@ install_requires = [
     "anthropic",
     "build==1.4.0",
     "aiohttp",
+    "tabulate",
 ]
 
 
