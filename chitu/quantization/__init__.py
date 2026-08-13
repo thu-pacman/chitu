@@ -16,6 +16,7 @@ from chitu.quantization.utils import (
     get_quant_kwargs_from_checkpoint_prefix,
     get_layer_id_from_checkpoint_prefix,
 )
+from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.quantization.normal import (
     NormalLinear,
     NormalMoeExpertsUnmerged,

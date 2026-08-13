@@ -12,6 +12,7 @@ import torch.nn as nn
 
 from chitu.lazy import eval_lazy
 from chitu.quantization.registry import QuantizationRegistry
+from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.quantization.base import (
     QuantizedMoeExpertsMerged,
     QuantizedMoeExpertsUnmerged,
@@ -71,7 +72,7 @@ class BlockInt4MoeExpertsUnmergedBase(NativeLayoutMixin, QuantizedMoeExpertsUnme
         experts_start_idx: int,
         experts_end_idx: int,
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         ############################################
         # Parameters specific to this quantization
         group_size: int = 128,
@@ -157,7 +158,7 @@ class BlockInt4MoeExpertsMergedBase(NativeLayoutMixin, QuantizedMoeExpertsMerged
         experts_start_idx: int,
         experts_end_idx: int,
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         ############################################
         # Parameters specific to this quantization
         group_size: int = 128,

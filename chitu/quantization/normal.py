@@ -8,6 +8,7 @@ import functools
 import torch
 import ctypes
 
+from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.quantization.base import (
     QuantizedLinearBase,
     QuantizedMoeExpertsUnmerged,
@@ -385,7 +386,7 @@ class NormalMoeExpertsUnmerged(QuantizedMoeExpertsUnmerged):
         experts_start_idx: int,
         experts_end_idx: int,
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         *,
         ############################################
         # Parameters specific to this quantization
@@ -454,7 +455,7 @@ class NormalMoeExpertsMerged(QuantizedMoeExpertsMerged):
         experts_start_idx: int,
         experts_end_idx: int,
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         *,
         ############################################
         # Parameters specific to this quantization
@@ -796,7 +797,7 @@ class NormalMoeExpertsCPUInfer(torch.nn.Module):
         experts_start_idx: int,
         experts_end_idx: int,
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
     ):
         super().__init__()
 

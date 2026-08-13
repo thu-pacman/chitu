@@ -7,6 +7,7 @@ from typing_extensions import override
 import torch
 import functools
 
+from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.utils import try_import_opt_dep
 from chitu.quantization import (
     NormalLinear,
@@ -467,7 +468,7 @@ class NormalMoeExpertsMuxiLayout(NativeLayoutMixin, NormalMoeExpertsMerged):
         n_shared_experts: int,
         n_activated_experts: int,
         fuse_shared_experts: bool,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         *,
         ############################################
         # Parameters specific to this quantization
@@ -524,7 +525,7 @@ class Blockfp8MoeExpertsMuxiLayout(NativeLayoutMixin, Blockfp8MoeExpertsMerged):
         experts_start_idx: int,
         experts_end_idx: int,
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         ############################################
         # No parameters specific to this quantization
     ):

@@ -11,6 +11,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import (
@@ -1211,7 +1212,7 @@ class IndexerDeepSeekV4(nn.Module):
         self,
         args,
         *,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         compress_ratio: int = 4,
     ):
         super().__init__()
@@ -2424,11 +2425,15 @@ class MLPDeepSeekV4(nn.Module):
         args,
         role: str,
         op_impl: str,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         merge_gate_up=None,
         layer_id: int = 0,
     ):
         super().__init__()
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+        gate_up_checkpoint_prefix = checkpoint_prefix / CheckpointPrefix.merged(
+            "gate_proj", "up_proj"
+        )
         if role == "standalone":
             inter_dim = args.inter_dim
             reduce_output = True
@@ -2441,7 +2446,7 @@ class MLPDeepSeekV4(nn.Module):
             )
         if merge_gate_up is None:
             merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
-                checkpoint_prefix
+                gate_up_checkpoint_prefix
             )
         self.merge_gate_up = merge_gate_up
         self.swiglu_limit = getattr(args, "swiglu_limit", 0.0)
@@ -2453,9 +2458,9 @@ class MLPDeepSeekV4(nn.Module):
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_y(
                     op_impl,
-                    checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
+                    checkpoint_prefix=gate_up_checkpoint_prefix,
                 ),
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
+                checkpoint_prefix=gate_up_checkpoint_prefix,
             )
         else:
             self.gate_proj = ColumnParallelLinear(
@@ -2465,9 +2470,9 @@ class MLPDeepSeekV4(nn.Module):
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_y(
                     op_impl,
-                    checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
+                    checkpoint_prefix=checkpoint_prefix / "gate_proj",
                 ),
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
+                checkpoint_prefix=checkpoint_prefix / "gate_proj",
             )
             self.up_proj = ColumnParallelLinear(
                 args.dim,
@@ -2476,9 +2481,9 @@ class MLPDeepSeekV4(nn.Module):
                 gather_output=False,
                 base_linear_class=get_linear_layout_contig_y(
                     op_impl,
-                    checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
+                    checkpoint_prefix=checkpoint_prefix / "up_proj",
                 ),
-                checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
+                checkpoint_prefix=checkpoint_prefix / "up_proj",
             )
         self.down_proj = RowParallelLinear(
             inter_dim,
@@ -2488,9 +2493,9 @@ class MLPDeepSeekV4(nn.Module):
             reduce_output=reduce_output,
             base_linear_class=get_linear_layout_contig_y(
                 op_impl,
-                checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
+                checkpoint_prefix=checkpoint_prefix / "down_proj",
             ),
-            checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
+            checkpoint_prefix=checkpoint_prefix / "down_proj",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -2613,23 +2618,59 @@ class GateDeepSeekV4(MoeGate):
         return self._finalize_routing(x, weights, indices)
 
 
+def _deepseek_v4_moe_quant_prefixes(
+    checkpoint_prefix: str | CheckpointPrefix,
+    global_n_experts: int,
+    experts_start_idx: int,
+    experts_end_idx: int,
+    projection_names: tuple[str, ...],
+) -> CheckpointPrefix:
+    checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+    routed_end_idx = min(experts_end_idx, global_n_experts)
+    prefixes = [
+        checkpoint_prefix / f"{expert_id}.{projection_name}"
+        for expert_id in range(experts_start_idx, routed_end_idx)
+        for projection_name in projection_names
+    ]
+    if experts_end_idx > global_n_experts:
+        shared_experts_prefix = CheckpointPrefix.merged(
+            *(
+                str(path).replace(".experts", ".shared_experts", 1)
+                for path in checkpoint_prefix.paths
+            )
+        )
+        prefixes.extend(
+            shared_experts_prefix / projection_name
+            for projection_name in projection_names
+        )
+    return CheckpointPrefix.merged(*prefixes)
+
+
 def MoeExpertsDeepSeekV4(
     args,
     global_n_experts: int,
     experts_start_idx: int,
     experts_end_idx: int,
     *,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
     base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ) -> QuantizedMoeExpertsBase:
-    merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(checkpoint_prefix)
+    checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+    gate_up_quant_prefix = _deepseek_v4_moe_quant_prefixes(
+        checkpoint_prefix,
+        global_n_experts,
+        experts_start_idx,
+        experts_end_idx,
+        ("gate_proj", "up_proj"),
+    )
+    merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(gate_up_quant_prefix)
     if base_moe_experts_class is None:
         base_moe_experts_class = (
             QuantizationRegistry.get_quantized_moe_experts_class_from_global_args(
                 merge_gate_up=merge_gate_up,
                 quant_kwargs=quant_kwargs,
-                checkpoint_prefix=checkpoint_prefix,
+                checkpoint_prefix=gate_up_quant_prefix,
             )
         )
 
@@ -2660,22 +2701,28 @@ class ParallelMoeBlockDeepSeekV4(ParallelMoeBlock):
         quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
         moe_impl: Optional[MoEImplBase] = None,
         *,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         runtime_context,
     ):
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         if moe_impl is None:
             moe_impl = get_moe_impl()
 
         assert args.n_shared_experts == 1
         if not get_global_args().infer.fuse_shared_experts:
-            merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
+            shared_experts_gate_up_quant_prefix = (
                 checkpoint_prefix
+                / "shared_experts"
+                / CheckpointPrefix.merged("gate_proj", "up_proj")
+            )
+            merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
+                shared_experts_gate_up_quant_prefix
             )
             non_fused_shared_experts = MLPDeepSeekV4(
                 args,
                 role="shared_experts",
                 op_impl=op_impl,
-                checkpoint_prefix=f"{checkpoint_prefix}.shared_experts",
+                checkpoint_prefix=checkpoint_prefix / "shared_experts",
                 merge_gate_up=merge_gate_up,
             )
             n_fused_shared_experts = 0
@@ -2704,7 +2751,7 @@ class ParallelMoeBlockDeepSeekV4(ParallelMoeBlock):
                 args.n_routed_experts,
                 experts_start_idx,
                 experts_end_idx,
-                checkpoint_prefix=f"{checkpoint_prefix}.experts",
+                checkpoint_prefix=checkpoint_prefix / "experts",
                 base_moe_experts_class=base_moe_experts_class,
                 quant_kwargs=quant_kwargs,
             ),

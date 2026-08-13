@@ -10,6 +10,7 @@ from torch import nn
 
 from chitu.attn_backend import AttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
 from chitu.kv_cache import KVCacheBase
 from chitu.models.model import (
     Attention,
@@ -28,8 +29,16 @@ from chitu.tensor_parallel import (
 
 
 class AttentionLlama(Attention):
-    def __init__(self, args, layer_id, cache, attn_backend, checkpoint_prefix):
+    def __init__(
+        self,
+        args,
+        layer_id,
+        cache,
+        attn_backend,
+        checkpoint_prefix: str | CheckpointPrefix,
+    ):
         super().__init__(layer_id, cache, attn_backend)
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         tp_size = get_tp_size()
         self.n_local_heads = args.n_heads // tp_size
@@ -42,28 +51,28 @@ class AttentionLlama(Attention):
             args.n_heads * self.head_dim,
             has_bias=False,
             gather_output=False,
-            checkpoint_prefix=f"{checkpoint_prefix}.wq",
+            checkpoint_prefix=checkpoint_prefix / "wq",
         )
         self.wk = ColumnParallelLinear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             has_bias=False,
             gather_output=False,
-            checkpoint_prefix=f"{checkpoint_prefix}.wk",
+            checkpoint_prefix=checkpoint_prefix / "wk",
         )
         self.wv = ColumnParallelLinear(
             args.dim,
             self.n_kv_heads * self.head_dim,
             has_bias=False,
             gather_output=False,
-            checkpoint_prefix=f"{checkpoint_prefix}.wv",
+            checkpoint_prefix=checkpoint_prefix / "wv",
         )
         self.wo = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
             has_bias=False,
             input_is_parallel=True,
-            checkpoint_prefix=f"{checkpoint_prefix}.wo",
+            checkpoint_prefix=checkpoint_prefix / "wo",
         )
 
     def _run_linear(self, x):
@@ -162,9 +171,10 @@ class FeedForwardLlama(nn.Module):
         hidden_dim: int,
         multiple_of: int,
         ffn_dim_multiplier: Optional[float],
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
     ):
         super().__init__()
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         hidden_dim = int(2 * hidden_dim / 3)
         # custom dim factor multiplier
         if ffn_dim_multiplier is not None:
@@ -176,21 +186,21 @@ class FeedForwardLlama(nn.Module):
             hidden_dim,
             has_bias=False,
             gather_output=False,
-            checkpoint_prefix=f"{checkpoint_prefix}.w1",
+            checkpoint_prefix=checkpoint_prefix / "w1",
         )
         self.w2 = RowParallelLinear(
             hidden_dim,
             dim,
             has_bias=False,
             input_is_parallel=True,
-            checkpoint_prefix=f"{checkpoint_prefix}.w2",
+            checkpoint_prefix=checkpoint_prefix / "w2",
         )
         self.w3 = ColumnParallelLinear(
             dim,
             hidden_dim,
             has_bias=False,
             gather_output=False,
-            checkpoint_prefix=f"{checkpoint_prefix}.w3",
+            checkpoint_prefix=checkpoint_prefix / "w3",
         )
 
     def forward(self, x):
@@ -205,24 +215,25 @@ class TransformerBlockLlama(TransformerBlock):
         cache_dict: dict[str, KVCacheBase],
         attn_backend,
         op_impl,
-        checkpoint_prefix,
+        checkpoint_prefix: str | CheckpointPrefix,
         *,
         is_first_local_layer: bool,
     ):
         super().__init__(layer_id, args, cache_dict, attn_backend, op_impl)
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         self.attention = AttentionLlama(
             args,
             layer_id,
             cache_dict["main"],
             attn_backend,
-            f"{checkpoint_prefix}.attention",
+            checkpoint_prefix / "attention",
         )
         self.feed_forward = FeedForwardLlama(
             dim=args.dim,
             hidden_dim=4 * args.dim,
             multiple_of=args.multiple_of,
             ffn_dim_multiplier=args.ffn_dim_multiplier,
-            checkpoint_prefix=f"{checkpoint_prefix}.feed_forward",
+            checkpoint_prefix=checkpoint_prefix / "feed_forward",
         )
         self.attention_norm = (
             RMSNorm(args.dim, eps=args.norm_eps)

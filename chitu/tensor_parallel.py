@@ -14,6 +14,7 @@ from typing import Optional, Mapping, Any
 from logging import getLogger
 
 from chitu.quantization import QuantizationRegistry
+from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.device_type import is_ascend
 from chitu.distributed.parallel_state import (
     get_tp_group,
@@ -31,7 +32,7 @@ logger = getLogger(__name__)
 def get_local_linear_class(
     base_linear_class: Optional[type] = None,
     *,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     if base_linear_class is None:
@@ -48,7 +49,7 @@ def LocalLinear(
     out_features: int,
     has_bias: bool = True,
     *,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
     base_linear_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
@@ -79,7 +80,7 @@ def LocalLinear(
 def get_column_parallel_linear_class(
     base_linear_class: Optional[type] = None,
     *,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     if base_linear_class is None:
@@ -108,7 +109,7 @@ def ColumnParallelLinear(
     gather_output: bool = True,
     tp_group: Optional[CommGroup] = None,
     *,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
     base_linear_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
@@ -142,7 +143,7 @@ def ColumnParallelLinear(
 def get_row_parallel_linear_class(
     base_linear_class: Optional[type] = None,
     *,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     if base_linear_class is None:
@@ -172,7 +173,7 @@ def RowParallelLinear(
     reduce_output: bool = True,
     tp_group: Optional[CommGroup] = None,
     *,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
     base_linear_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
@@ -322,7 +323,7 @@ class LmHeadColumnParallelLinearMixIn(ColumnParallelLinearMixIn):
 def get_lm_head_column_parallel_linear_class(
     base_linear_class: Optional[type] = None,
     *,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):
     if base_linear_class is None:
@@ -348,7 +349,7 @@ def LmHeadColumnParallelLinear(
     has_bias: bool = True,
     gather_output: bool = True,
     *,
-    checkpoint_prefix: str,
+    checkpoint_prefix: str | CheckpointPrefix,
     base_linear_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
 ):

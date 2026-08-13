@@ -18,6 +18,7 @@ import re
 
 import torch
 
+from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
 from chitu.kv_cache import KVCacheBase
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.dsa_indexer import DSAIndexer
@@ -77,7 +78,7 @@ class IndexerGLM52(Indexer):
         self,
         args,
         *,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         indexer_impl: DSAIndexer,
         buffer_mode: Optional[str] = None,
         indexer_buffer: Optional[_IndexerBuffer] = None,
@@ -202,7 +203,7 @@ class AttentionGLM52(AttentionDeepSeekV3):
         op_impl: str,
         mla_absorb,
         *,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         indexer_cache,
         indexer_impl,
         indexer_role: str,
@@ -236,7 +237,7 @@ class AttentionGLM52(AttentionDeepSeekV3):
         self,
         args,
         *,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         indexer_impl: DSAIndexer,
     ) -> IndexerGLM52:
         indexer_role = self._indexer_role_for_make
@@ -810,12 +811,14 @@ class TransformerGLM52(TransformerDeepSeekV3):
 
     @override
     def process_state_dict_for_merging_qkv(self, checkpoint: dict[str, Any]):
-        def enable_callback(k: str):
+        def enable_callback(checkpoint_prefix: str | CheckpointPrefix):
+            checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+            representative_path = next(iter(checkpoint_prefix.paths))
             layer_id = get_layer_id_from_checkpoint_prefix(
-                k, self.params.quant_config.rules
+                representative_path, self.params.quant_config.rules
             )
             return QuantizationRegistry.allowed_merge_qkv(
-                k,
+                checkpoint_prefix,
                 (
                     (
                         self.layers[layer_id].self_attn.mla_prologue_int8_partial
@@ -826,22 +829,28 @@ class TransformerGLM52(TransformerDeepSeekV3):
                 ),
             )
 
-        def _layer_id_from_key(k: str) -> int:
-            match = re.search(r"layers\.(\d+)\.", k)
+        def _layer_id_from_key(checkpoint_prefix: str | CheckpointPrefix) -> int:
+            checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+            representative_path = next(iter(checkpoint_prefix.paths))
+            match = re.search(r"layers\.(\d+)\.", representative_path)
             return int(match.group(1)) if match else -1
 
-        def enable_for_local_indexer_layer(k: str) -> bool:
-            if not enable_callback(k):
+        def enable_for_local_indexer_layer(
+            checkpoint_prefix: str | CheckpointPrefix,
+        ) -> bool:
+            if not enable_callback(checkpoint_prefix):
                 return False
-            layer_id = _layer_id_from_key(k)
+            layer_id = _layer_id_from_key(checkpoint_prefix)
             if layer_id < 0 or layer_id >= len(self.layers):
                 return True
             return self.layers[layer_id].self_attn.has_local_indexer
 
-        def enable_for_shared_indexer_layer(k: str) -> bool:
-            if not enable_callback(k):
+        def enable_for_shared_indexer_layer(
+            checkpoint_prefix: str | CheckpointPrefix,
+        ) -> bool:
+            if not enable_callback(checkpoint_prefix):
                 return False
-            layer_id = _layer_id_from_key(k)
+            layer_id = _layer_id_from_key(checkpoint_prefix)
             if layer_id < 0 or layer_id >= len(self.layers):
                 return False
             return not self.layers[layer_id].self_attn.has_local_indexer

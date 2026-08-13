@@ -10,6 +10,7 @@ import math
 
 import torch
 
+from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.device_type import get_device_name, is_hygon
 from chitu.import_utils import (
     try_import_platform_dep,
@@ -583,7 +584,7 @@ class W8A8PerTokenPerChannelDynMoeExpertsMergedBase(QuantizedMoeExpertsMerged):
         experts_start_idx: int,
         experts_end_idx: int,
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         ############################################
         # Parameters specific to this quantization
         weight_scale_dtype: Optional[torch.dtype | str] = None,

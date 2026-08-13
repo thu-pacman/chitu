@@ -8,6 +8,7 @@ import itertools
 import plum
 import torch
 
+from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.ops import silu_and_mul
 from chitu.moe.batched_expert_result import (
     BatchedExpertResult,
@@ -59,7 +60,7 @@ class QuantizedMoeExpertsBase(torch.nn.Module):
         experts_start_idx: int,  # fused shared experts included
         experts_end_idx: int,  # fused shared experts included
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
         swiglu_limit: Optional[float] = None,
     ):
         super().__init__()

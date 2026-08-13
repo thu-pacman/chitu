@@ -6,6 +6,7 @@ import functools
 import inspect
 from dataclasses import dataclass, field
 from logging import getLogger
+from tabulate import tabulate
 from threading import Lock
 from typing import Callable, Dict, Optional
 from collections import OrderedDict
@@ -119,19 +120,16 @@ def format_observed_op_impl_summary_lines(pretty: bool = True) -> list[str]:
             row.append(f"{name} {marker}")
         table.append(row)
 
-    if pretty:
-        max_columns = max(len(row) for row in table)
-        for row in table:
-            row += [""] * (max_columns - len(row))
-        for i in range(max_columns):
-            max_width = max(len(row[i]) for row in table)
-            for row in table:
-                row[i] = row[i].ljust(max_width)
+    if not table:
+        return []
 
-    lines = []
+    if not pretty:
+        return [" | ".join(row) for row in table]
+
+    max_columns = max(len(row) for row in table)
     for row in table:
-        lines.append(" | ".join(row))
-    return lines
+        row += [""] * (max_columns - len(row))
+    return tabulate(table, tablefmt="github").splitlines()
 
 
 def emit_observed_op_impl_summary(target_logger=None) -> bool:

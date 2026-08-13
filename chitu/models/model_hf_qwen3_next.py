@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend
+from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.kv_cache import KVCacheBase
 from chitu.distributed.parallel_state import get_tp_size
@@ -100,7 +101,9 @@ def get_mtp_accept_indices():
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
-    def __init__(self, args, layer_id, cache, *, checkpoint_prefix: str):
+    def __init__(
+        self, args, layer_id, cache, *, checkpoint_prefix: str | CheckpointPrefix
+    ):
         super().__init__()
         self.dim = args.dim
         self.n_v_heads = args.linear_n_v_heads
@@ -442,36 +445,33 @@ class MLPQwen3Next(nn.Module):
         params,
         intermediate_dim: int,
         op_impl: str,
-        checkpoint_prefix="",
+        checkpoint_prefix: str | CheckpointPrefix = "",
         has_bias: bool = False,
     ):
         super().__init__()
         self.op_impl = op_impl
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
+        gate_up_checkpoint_prefix = checkpoint_prefix / CheckpointPrefix.merged(
+            "gate_proj", "up_proj"
+        )
         self.merge_gate_up = QuantizationRegistry.allowed_merge_gate_up(
-            checkpoint_prefix
+            gate_up_checkpoint_prefix
         )
 
         # Do a parallel + fused linear projection, while ensuring outputs from gate_proj and up_proj are contiguous in memory.
         # Therefore, the projected shape is [tp_size, 2 * params.intermediate_dim]
 
-        gate_up_proj_linear = get_linear_layout_native_y(
-            op_impl,
-            checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
-        )
-        down_proj_linear = get_linear_layout_contig_y(
-            op_impl,
-            checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
-        )
         if self.merge_gate_up:
             self.gate_up_proj = ColumnParallelLinear(
                 params.dim,
                 intermediate_dim * 2,
                 has_bias=has_bias,
                 gather_output=False,
-                base_linear_class=gate_up_proj_linear,
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_up_proj",
-                # FIXME: f"{checkpoint_prefix}.gate_up_proj" is not a real checkpoint prefix,
-                # implement a joint checkpoint prefix for gate_proj and up_proj.
+                base_linear_class=get_linear_layout_native_y(
+                    op_impl,
+                    checkpoint_prefix=gate_up_checkpoint_prefix,
+                ),
+                checkpoint_prefix=gate_up_checkpoint_prefix,
             )
         else:
             self.gate_proj = ColumnParallelLinear(
@@ -479,8 +479,11 @@ class MLPQwen3Next(nn.Module):
                 intermediate_dim,
                 has_bias=has_bias,
                 gather_output=False,
-                base_linear_class=gate_up_proj_linear,
-                checkpoint_prefix=f"{checkpoint_prefix}.gate_proj",
+                base_linear_class=get_linear_layout_native_y(
+                    op_impl,
+                    checkpoint_prefix=checkpoint_prefix / "gate_proj",
+                ),
+                checkpoint_prefix=checkpoint_prefix / "gate_proj",
             )
 
             self.up_proj = ColumnParallelLinear(
@@ -488,8 +491,11 @@ class MLPQwen3Next(nn.Module):
                 intermediate_dim,
                 has_bias=has_bias,
                 gather_output=False,
-                base_linear_class=gate_up_proj_linear,
-                checkpoint_prefix=f"{checkpoint_prefix}.up_proj",
+                base_linear_class=get_linear_layout_native_y(
+                    op_impl,
+                    checkpoint_prefix=checkpoint_prefix / "up_proj",
+                ),
+                checkpoint_prefix=checkpoint_prefix / "up_proj",
             )
 
         self.down_proj = RowParallelLinear(
@@ -498,8 +504,11 @@ class MLPQwen3Next(nn.Module):
             has_bias=has_bias,
             input_is_parallel=True,
             reduce_output=False,
-            base_linear_class=down_proj_linear,
-            checkpoint_prefix=f"{checkpoint_prefix}.down_proj",
+            base_linear_class=get_linear_layout_contig_y(
+                op_impl,
+                checkpoint_prefix=checkpoint_prefix / "down_proj",
+            ),
+            checkpoint_prefix=checkpoint_prefix / "down_proj",
         )
 
     def forward(self, x):
@@ -517,19 +526,20 @@ class MLPQwen3Next(nn.Module):
 
 
 class SharedExpertGateAndBodyQwen3Next(torch.nn.Module):
-    def __init__(self, args, op_impl: str, checkpoint_prefix: str):
+    def __init__(self, args, op_impl: str, checkpoint_prefix: str | CheckpointPrefix):
         super().__init__()
+        checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         self.gate = LocalLinear(
             args.dim,
             1,
             has_bias=False,
-            checkpoint_prefix=f"{checkpoint_prefix}.shared_expert_gate",
+            checkpoint_prefix=checkpoint_prefix / "shared_expert_gate",
         )
         self.body = MLPQwen3Next(
             args,
             intermediate_dim=args.moe_intermediate_dim,
             op_impl=op_impl,
-            checkpoint_prefix=f"{checkpoint_prefix}.shared_expert",
+            checkpoint_prefix=checkpoint_prefix / "shared_expert",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -547,7 +557,7 @@ class ParallelMoeBlockQwen3Next(ParallelMoeBlock):
         layer_id: int = 0,
         moe_impl: Optional[MoEImplBase] = None,
         *,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
     ):
         if moe_impl is None:
             moe_impl = get_moe_impl()

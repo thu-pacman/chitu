@@ -6,6 +6,7 @@ from typing_extensions import override
 import functools
 import torch
 
+from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.utils import try_import_platform_dep
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.quantization.base import QuantizedMoeExpertsMerged
@@ -33,7 +34,7 @@ class HygonW4A8MoeExpertsMerged(QuantizedMoeExpertsMerged):
         experts_start_idx: int,
         experts_end_idx: int,
         n_activated_experts: int,
-        checkpoint_prefix: str,
+        checkpoint_prefix: str | CheckpointPrefix,
     ):
         super().__init__(
             dim,
