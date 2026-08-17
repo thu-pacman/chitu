@@ -16,8 +16,9 @@ import torch
 from typing import Optional, Tuple
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.batched_seq_len import BatchedSeqLenDelta
+from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
 from chitu.distributed.comm_group import CommGroup
+from chitu.utils import ceil_div
 
 # ---- Global singleton ----
 
@@ -96,14 +97,16 @@ class CPContext:
         self.is_active = True
         self.is_first_rank = cp_group.is_first_rank
 
-        # Internal state for tracking split/gather across stages
+        # Internal state for tracking split/allgather across stages.
         self._orig_num_tokens: int = 0
         self._n_local: int = 0
+        # Equal-shape collectives still need this padded per-rank length at
+        # communication boundaries; model/attention paths use _n_local rows.
+        self._expected_n_local: int = 0
         self._step_active: bool = False
 
-        # Per-step cached values (set by prepare_local_lengths, read by layers)
-        self._local_lengths: Optional[torch.Tensor] = None
-        self._local_seq_ids: Optional[torch.Tensor] = None
+        # Per-step cached query view (set by prepare_local_lengths, read by layers)
+        self._seq_len_delta_view: Optional[BatchedSeqLenDeltaView] = None
 
     def set_step_active(self, active: bool) -> None:
         self._step_active = bool(active)
@@ -113,186 +116,114 @@ class CPContext:
     def step_active(self) -> bool:
         return self._step_active
 
-    def split_stage0(
-        self, tokens: torch.Tensor, freqs_cis: BatchedFreqsCis
-    ) -> Tuple[torch.Tensor, BatchedFreqsCis]:
-        """CP split on PP stage 0 or no-PP: interleave token IDs across CP ranks.
+    def split_prefill(
+        self,
+        tokens: Optional[torch.Tensor],
+        hiddens: Optional[torch.Tensor],
+        freqs_cis: BatchedFreqsCis,
+        total_tokens: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], BatchedFreqsCis]:
+        """Split CP prefill inputs to this rank's real interleaved local rows.
 
-        Pads to ceil(num_tokens/pcp_size) so all ranks have equal local length,
-        which is required by CP allgather collectives.
+        Stage 0 provides token IDs and splits them here. Later PP stages receive
+        CP-local hidden states from the previous PP stage; when MTP is enabled,
+        the last PP stage may also have local token IDs. In that case this method
+        slices tokens and validates hiddens against the same real local rows.
+        Collectives pad at their own boundary when equal per-rank shapes are
+        required.
         """
+        if not self._should_split_prefill(total_tokens):
+            self.set_step_active(False)
+            return tokens, hiddens, freqs_cis
+
+        if tokens is None and hiddens is None:
+            raise ValueError(f"CP{self.cp_rank}: missing prefill payload")
         self.set_step_active(True)
-        local_indices = torch.arange(
-            self.cp_rank, tokens.shape[0], self.pcp_size, device=tokens.device
+        self._orig_num_tokens = total_tokens
+        self._expected_n_local = ceil_div(self._orig_num_tokens, self.pcp_size)
+        device = tokens.device if tokens is not None else hiddens.device
+        local_indices = build_cp_local_indices(
+            self.cp_rank, self.pcp_size, self._orig_num_tokens, device=device
         )
-        self._orig_num_tokens = tokens.shape[0]
-        self._n_local = (self._orig_num_tokens + self.pcp_size - 1) // self.pcp_size
-        n_local = local_indices.shape[0]
-        if n_local < self._n_local:
-            local_indices = torch.cat(
-                [
-                    local_indices,
-                    local_indices[-1].repeat(self._n_local - n_local),
-                ]
+        self._n_local = local_indices.shape[0]
+        if hiddens is not None and hiddens.shape[0] != self._n_local:
+            raise RuntimeError(
+                f"CP{self.cp_rank}: hidden rows {hiddens.shape[0]} != {self._n_local}"
             )
-        tokens = tokens[local_indices]
+        if tokens is not None:
+            tokens = tokens[local_indices]
         freqs_cis = BatchedFreqsCis(
             freqs_cis.cos[local_indices],
             freqs_cis.sin[local_indices],
         )
-        return tokens, freqs_cis
+        return tokens, hiddens, freqs_cis
 
-    def split_stage1(
-        self, h: torch.Tensor, freqs_cis: BatchedFreqsCis
-    ) -> BatchedFreqsCis:
-        """CP split on PP stage 1+: hidden states already local from PP transfer.
-
-        Only splits freqs_cis; pads freqs_cis if stage 0 padded tokens.
-        """
-        self.set_step_active(True)
-        n_local = h.shape[0]
-        bs_seq_full = n_local * self.pcp_size
-        orig_len = freqs_cis.cos.shape[0]
-        if bs_seq_full > orig_len:
-            pad_len = bs_seq_full - orig_len
-            pad_cos = freqs_cis.cos[-1:].repeat(pad_len, 1)
-            pad_sin = freqs_cis.sin[-1:].repeat(pad_len, 1)
-            freqs_cis = BatchedFreqsCis(
-                torch.cat([freqs_cis.cos, pad_cos]),
-                torch.cat([freqs_cis.sin, pad_sin]),
-            )
-        local_indices = torch.arange(
-            self.cp_rank, bs_seq_full, self.pcp_size, device=h.device
-        )
-        self._orig_num_tokens = orig_len
-        self._n_local = n_local
-        return BatchedFreqsCis(
-            freqs_cis.cos[local_indices],
-            freqs_cis.sin[local_indices],
-        )
-
-    def split_prefill(
-        self,
-        tokens: Optional[torch.Tensor],
-        freqs_cis: BatchedFreqsCis,
-        hiddens: Optional[torch.Tensor],
-        pp_stage: int,
-        delta_total: int,
-    ) -> Tuple[Optional[torch.Tensor], BatchedFreqsCis]:
-        """Split stage-0 token IDs or later-stage freqs_cis for CP prefill."""
-        if not self.should_split_prefill(delta_total):
-            self.set_step_active(False)
-            return tokens, freqs_cis
-        if pp_stage == 0:
-            tokens, freqs_cis = self.split_stage0(tokens, freqs_cis)
-        else:
-            assert hiddens is not None, "hiddens must be provided at PP stage > 0"
-            freqs_cis = self.split_stage1(hiddens, freqs_cis)
-        return tokens, freqs_cis
-
-    def gather(
+    def allgather_hidden_states(
         self,
         h: torch.Tensor,
-        output_token_offsets: torch.Tensor,
+        output_token_offsets: Optional[torch.Tensor],
         post_layers_fn,
-        cp_active: Optional[bool] = None,
-        pp_size: int = 1,
-        pp_stage: int = 0,
-        seq_len_delta: Optional[BatchedSeqLenDelta] = None,
     ) -> torch.Tensor:
         """CP allgather hidden states, reorder, trim, select output, post_layers.
 
         Args:
             h: local hidden states [n_local, dim]
-            output_token_offsets: indices of output token positions in global order
-            post_layers_fn: callable for post_layers (lm_head etc.)
-            cp_active: whether CP split was active on this stage
-            pp_size: pipeline parallel size
-            pp_stage: current pipeline stage
-            seq_len_delta: for delta_total_len at PP stage 1+
+            output_token_offsets: indices of output token positions in global
+                order, or None to return all gathered rows
+            post_layers_fn: callable for post_layers (lm_head etc.), or None to
+                return hidden states without projection
 
         Returns:
-            Logits tensor [num_outputs, dim]
+            Logits tensor [num_outputs, dim], or gathered hidden states when
+            post_layers_fn is None.
         """
-        need_gather = self.step_active if cp_active is None else cp_active
-        # Later PP stages decide by global delta, not local hidden length.
-        if not need_gather and pp_size > 1 and pp_stage != 0:
-            if seq_len_delta is not None:
-                delta_total = seq_len_delta.delta_total_len
-                need_gather = delta_total >= self.pcp_size
-        if not need_gather:
-            h = h[output_token_offsets]
+        if not self.step_active:
+            if output_token_offsets is not None:
+                h = h[output_token_offsets]
+            if post_layers_fn is None:
+                return h
             h = post_layers_fn(h)
             return h.float()
 
-        orig = self._orig_num_tokens
-        if orig <= 0 and pp_size > 1:
-            if seq_len_delta is not None:
-                orig = seq_len_delta.delta_total_len
+        if h.shape[0] != self._n_local:
+            raise AssertionError(
+                f"CP{self.cp_rank}: gather rows {h.shape[0]} != {self._n_local}"
+            )
 
-        h = self.allgather_interleaved(
-            h, orig if orig > 0 else h.shape[0] * self.pcp_size
-        )
-        h = h[output_token_offsets]
+        h = self._allgather_interleaved_payload(h)
+        if output_token_offsets is not None:
+            h = h[output_token_offsets]
+        if post_layers_fn is None:
+            return h
         h = post_layers_fn(h)
         return h.float()
 
     def allgather_kv(
         self,
-        n_local: int,
         kv: torch.Tensor,
         indexer_k_local: Optional[torch.Tensor],
-        index_head_dim: Optional[int],
-        seq_len_delta: BatchedSeqLenDelta,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """CP allgather KV + optional indexer K, reorder to global token order.
 
         Args:
-            n_local: local token count (padded to ceil(total/pcp_size))
             kv: local KV tensor [n_local, 1, kv_dim]
             indexer_k_local: local indexer K [n_local, index_head_dim] or None
-            index_head_dim: indexer head dimension
-            seq_len_delta: BatchedSeqLenDelta with delta_total_len
 
         Returns:
             (kv_global, indexer_k_global):
               kv_global: [total_len] flat KV tensor (unsqueezed later by caller)
               indexer_k_global: [total_len, index_head_dim] or None
         """
-        expected_n_local = n_local
-        bs_seq_global = expected_n_local * self.pcp_size
         kv_flat = kv.squeeze(1)  # [n_local, kv_dim]
 
         if indexer_k_local is not None:
             allgather_payload = torch.cat([indexer_k_local, kv_flat], dim=-1)
-            payload_dim = allgather_payload.shape[-1]
+            index_head_dim = indexer_k_local.shape[-1]
         else:
             allgather_payload = kv_flat
-            payload_dim = kv_flat.shape[-1]
+            index_head_dim = None
 
-        if n_local < expected_n_local:
-            pad = torch.zeros(
-                expected_n_local - n_local,
-                payload_dim,
-                device=kv.device,
-                dtype=kv.dtype,
-            )
-            allgather_payload = torch.cat([allgather_payload, pad], dim=0)
-
-        global_payload = torch.empty(
-            bs_seq_global, payload_dim, device=kv.device, dtype=kv.dtype
-        )
-        self.cp_group.all_gather_into_tensor(
-            global_payload, allgather_payload.contiguous()
-        )
-
-        reorder_idx = build_cp_reorder_idx(
-            self.pcp_size, expected_n_local, device=global_payload.device
-        )
-        global_payload = global_payload[reorder_idx]
-        delta_len = seq_len_delta.delta_total_len
-        if global_payload.shape[0] > delta_len:
-            global_payload = global_payload[:delta_len]
+        global_payload = self._allgather_interleaved_payload(allgather_payload)
 
         if indexer_k_local is not None:
             indexer_k_global = global_payload[:, :index_head_dim]
@@ -303,85 +234,52 @@ class CPContext:
 
         return kv_global, indexer_k_global
 
-    def build_local_lengths(
-        self,
-        seq_len_delta: BatchedSeqLenDelta,
-        n_local: int,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Compute per-query local_lengths and local_seq_ids for CP sparse attn.
-
-        Returns (local_lengths, local_seq_ids):
-          local_lengths: per-query causal upper bounds (padded to n_local)
-          local_seq_ids: per-query sequence IDs for page table isolation, or None
-        """
-        total_tokens = seq_len_delta.delta_position_ids_tensor_device.shape[0]
-        position_ids = seq_len_delta.delta_position_ids_tensor_device
-        local_len_idx = build_cp_local_indices(
-            self.cp_rank, self.pcp_size, total_tokens, position_ids.device
-        )
-        local_lengths = (
-            torch.index_select(position_ids, 0, local_len_idx) + 1
-        ).contiguous()
-        local_seq_ids = None
-        if seq_len_delta.batch_size > 1:
-            local_seq_ids = torch.index_select(
-                seq_len_delta.delta_seq_ids_tensor_device, 0, local_len_idx
-            )
-        if local_lengths.shape[0] < n_local:
-            pad_len = n_local - local_lengths.shape[0]
-            pad = torch.full(
-                (pad_len,),
-                seq_len_delta.delta_total_len,
-                dtype=local_lengths.dtype,
-                device=local_lengths.device,
-            )
-            local_lengths = torch.cat([local_lengths, pad])
-            # Also pad local_seq_ids so its length matches n_local.
-            # Use seq_id=0 for padding tokens; they will be assigned to
-            # batch 0 in the batch-grouped sort, which is harmless since
-            # padding tokens produce zero-contribution attention output.
-            if local_seq_ids is not None:
-                seq_pad = torch.zeros(
-                    pad_len, dtype=local_seq_ids.dtype, device=local_seq_ids.device
-                )
-                local_seq_ids = torch.cat([local_seq_ids, seq_pad])
-        return local_lengths, local_seq_ids
-
     def prepare_local_lengths(
         self,
         seq_len_delta: BatchedSeqLenDelta,
         n_tokens: int,
         is_decode_stage: bool,
     ):
-        """Compute and cache local_lengths/local_seq_ids for this step.
+        """Compute and cache the CP-local query delta view for this step.
 
-        Called once per attention forward, reused by subsequent layers and
-        attn_backend/indexer via the local_lengths/local_seq_ids properties.
+        Called once per CP prefill step. The returned view represents the
+        q-axis rows owned by this CP rank while preserving the global k-axis via
+        ``seq_len_delta.new``.
         """
         if is_decode_stage:
-            self._local_lengths = (
-                seq_len_delta.delta_position_ids_tensor_device + 1
-            ).contiguous()
-            self._local_seq_ids = None
+            self._seq_len_delta_view = None
+            return seq_len_delta
         else:
-            self._local_lengths, self._local_seq_ids = self.build_local_lengths(
+            self._seq_len_delta_view = self._build_local_delta_view(
                 seq_len_delta, n_tokens
             )
+            return self._seq_len_delta_view
 
-    @property
-    def local_lengths(self) -> Optional[torch.Tensor]:
-        """Cached local_lengths for the current step (None if pcp_size==1 or not prepared)."""
-        return self._local_lengths
+    def get_seq_len_delta_view(self):
+        if self.step_active:
+            return self._seq_len_delta_view
+        return None
 
-    @property
-    def local_seq_ids(self) -> Optional[torch.Tensor]:
-        """Cached local_seq_ids for the current step (None if pcp_size==1 or not prepared)."""
-        return self._local_seq_ids
+    def _build_local_delta_view(
+        self,
+        seq_len_delta: BatchedSeqLenDelta,
+        n_local: int,
+    ) -> BatchedSeqLenDeltaView:
+        total_tokens = seq_len_delta.delta_position_ids_tensor_device.shape[0]
+        position_ids = seq_len_delta.delta_position_ids_tensor_device
+        local_len_idx = build_cp_local_indices(
+            self.cp_rank, self.pcp_size, total_tokens, position_ids.device
+        )
+        if local_len_idx.shape[0] != n_local:
+            raise RuntimeError(
+                "CP local delta length does not match real local tokens: "
+                f"got {local_len_idx.shape[0]}, expected {n_local}"
+            )
+        return BatchedSeqLenDeltaView(seq_len_delta, indices=local_len_idx)
 
     def clear_step_cache(self):
         """Clear per-step cached values."""
-        self._local_lengths = None
-        self._local_seq_ids = None
+        self._seq_len_delta_view = None
 
     def barrier(self):
         """Barrier on CP group."""
@@ -392,7 +290,7 @@ class CPContext:
         if pp_size > 1:
             self.cp_group.barrier()
 
-    def should_split_prefill(
+    def _should_split_prefill(
         self,
         delta_total: int = 0,
     ) -> bool:
@@ -406,11 +304,13 @@ class CPContext:
     def compute_pp_num_tokens(self, num_tokens: int) -> int:
         """Compute the number of tokens for PP hidden state transfer.
 
-        In PCP mode, each CP rank only processes ceil(num_tokens/pcp_size) local tokens.
+        In PCP mode, each CP rank only processes its real interleaved local tokens.
         """
-        if num_tokens >= self.pcp_size:
-            return (num_tokens + self.pcp_size - 1) // self.pcp_size
-        return num_tokens
+        if num_tokens < self.pcp_size:
+            return num_tokens
+        return (
+            num_tokens - 1 - self.cp_rank
+        ) // self.pcp_size + 1  # 即: pcp_size*k+cp_rank <= num_tokens-1
 
     def should_recv_directly(self, tp_size: int) -> bool:
         """In CP mode (or no TP), every rank receives from its PP pair directly."""
@@ -444,26 +344,44 @@ class CPContext:
         flat_indices, _ = self.local_flat_indices(n_local, total_tokens, tensor.device)
         return tensor[flat_indices]
 
-    def allgather_interleaved(
-        self, local_tensor: torch.Tensor, total_tokens: int
+    def _allgather_interleaved_payload(
+        self, local_tensor: torch.Tensor
     ) -> torch.Tensor:
-        """Allgather CP-local tensor, reorder to global token order, trim padding.
+        """Allgather a CP-local payload using the current split_prefill state."""
+        n_local = self._n_local
+        expected_n_local = self._expected_n_local
+        if local_tensor.shape[0] != n_local:
+            raise AssertionError(
+                f"CP{self.cp_rank}: local rows {local_tensor.shape[0]} != {n_local}"
+            )
+        if n_local > expected_n_local:
+            raise AssertionError(
+                f"CP{self.cp_rank}: local rows {n_local} > {expected_n_local}"
+            )
+        if self._orig_num_tokens <= 0 or expected_n_local != ceil_div(
+            self._orig_num_tokens, self.pcp_size
+        ):
+            raise AssertionError(f"CP{self.cp_rank}: invalid allgather state")
 
-        Unlike ``gather``, this does *not* apply output_token_offsets or
-        post_layers_fn — it returns the reordered hidden states directly.
-        """
-        n_local = local_tensor.shape[0]
+        if n_local < expected_n_local:
+            pad = torch.zeros(
+                expected_n_local - n_local,
+                *local_tensor.shape[1:],
+                device=local_tensor.device,
+                dtype=local_tensor.dtype,
+            )
+            local_tensor = torch.cat([local_tensor, pad], dim=0)
         gathered = torch.empty(
-            n_local * self.pcp_size,
+            expected_n_local * self.pcp_size,
             *local_tensor.shape[1:],
             device=local_tensor.device,
             dtype=local_tensor.dtype,
         )
         self.cp_group.all_gather_into_tensor(gathered, local_tensor.contiguous())
         reorder_idx = build_cp_reorder_idx(
-            self.pcp_size, n_local, device=local_tensor.device
+            self.pcp_size, expected_n_local, device=local_tensor.device
         )
-        return gathered[reorder_idx][:total_tokens]
+        return gathered[reorder_idx][: self._orig_num_tokens]
 
     @property
     def n_local(self) -> int:
@@ -487,44 +405,35 @@ class NoOpCPContext:
     is_active: bool = False
     is_first_rank: bool = True
     cp_group: None = None
-    local_lengths = None
-    local_seq_ids = None
     step_active: bool = False
 
     def set_step_active(self, active: bool):
         self.step_active = False
 
-    def split_stage0(self, tokens, freqs_cis):
-        return tokens, freqs_cis
+    def split_prefill(self, tokens, hiddens, freqs_cis, total_tokens):
+        return tokens, hiddens, freqs_cis
 
-    def split_stage1(self, h, freqs_cis):
-        return freqs_cis
-
-    def split_prefill(self, tokens, freqs_cis, hiddens, pp_stage, delta_total):
-        return tokens, freqs_cis
-
-    def gather(
+    def allgather_hidden_states(
         self,
         h,
         output_token_offsets,
         post_layers_fn,
-        cp_active=None,
-        pp_size=1,
-        pp_stage=0,
-        seq_len_delta=None,
     ):
-        h = h[output_token_offsets]
+        if output_token_offsets is not None:
+            h = h[output_token_offsets]
+        if post_layers_fn is None:
+            return h
         h = post_layers_fn(h)
         return h.float()
 
-    def allgather_kv(self, n_local, kv, indexer_k_local, index_head_dim, seq_len_delta):
+    def allgather_kv(self, kv, indexer_k_local):
         return kv.squeeze(1), indexer_k_local
 
-    def build_local_lengths(self, seq_len_delta, n_local):
-        return None, None
-
     def prepare_local_lengths(self, seq_len_delta, n_tokens, is_decode_stage):
-        pass
+        return seq_len_delta
+
+    def get_seq_len_delta_view(self):
+        return None
 
     def clear_step_cache(self):
         pass
@@ -535,7 +444,7 @@ class NoOpCPContext:
     def barrier_if_pp(self, pp_size):
         pass
 
-    def should_split_prefill(self, delta_total: int = 0) -> bool:
+    def _should_split_prefill(self, delta_total: int = 0) -> bool:
         return False
 
     def compute_pp_num_tokens(self, num_tokens):
@@ -554,9 +463,6 @@ class NoOpCPContext:
 
     def slice_for_local(self, tensor, n_local, total_tokens):
         return tensor
-
-    def allgather_interleaved(self, local_tensor, total_tokens):
-        return local_tensor
 
     @property
     def n_local(self) -> int:

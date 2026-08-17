@@ -23,7 +23,7 @@ from chitu.kv_cache import (
 )
 from chitu.device_type import is_ascend, is_hygon, is_nvidia
 from chitu.utils import try_import_opt_dep, try_import_platform_dep, get_global_args
-from chitu.batched_seq_len import BatchedSeqLenDelta
+from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
 from chitu.ops.topk import (
     topk_indices,
     has_hygon_indexer_topk,
@@ -249,7 +249,9 @@ class DSAIndexer:
 
         logger.info(f"Indexer Backend is initialized with impl={self.impl}")
 
-    def row_width(self, seq_len_delta: BatchedSeqLenDelta) -> int:
+    def row_width(
+        self, seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView
+    ) -> int:
         """Per-chunk index-score row width (columns) for this backend.
 
         This is the number of fp32 score columns produced per query row, used to
@@ -268,7 +270,9 @@ class DSAIndexer:
         # torch_bf16 / torch / triton materialize the full static width.
         return self.static_max_n
 
-    def chunk_size(self, seq_len_delta: BatchedSeqLenDelta) -> Optional[int]:
+    def chunk_size(
+        self, seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView
+    ) -> Optional[int]:
         """Number of query rows to score per prefill chunk, or None for single-pass.
 
         Encapsulates the whole chunking decision so the caller only iterates:
@@ -375,7 +379,7 @@ class DSAIndexer:
 
     def should_use_packed_hygon_prefill(
         self,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         index_topk: int,
         *,
         return_indices: bool,
@@ -396,7 +400,7 @@ class DSAIndexer:
         weights: torch.Tensor,  # [s_q, h=64, d/block_size=1], fp32
         k: torch.Tensor,  # [s_k, n=1, d=128], fp8
         k_s: torch.Tensor,  # [s_k, n=1, d/block_size=1], fp32
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         causal: bool,
         ks: Optional[torch.Tensor] = None,
         ke_override: Optional[torch.Tensor] = None,
@@ -412,8 +416,8 @@ class DSAIndexer:
         k = k.view(k.shape[0], -1)  # [s_k, h=1, d=128]
         k_s = k_s.reshape(k.shape[0])  # [s_k,]
 
-        # CP mode: use caller-provided local ks and ke (local_lengths)
-        # to keep deep_gemm.fp8_mqa_logits ks/ke aligned with local q.
+        # CP mode: use caller-provided local ks and ke to keep
+        # deep_gemm.fp8_mqa_logits ks/ke aligned with local q.
         if ks is not None and ke_override is not None:
             # ke_override = delta_position_ids[local] + 1
             # Full ke for deep_gemm = ke_override + ks (delta_pos + 1 + prefix_len)
@@ -451,7 +455,7 @@ class DSAIndexer:
         q: torch.Tensor,  # [s_q, h, d=128], bf16
         weights: torch.Tensor,  # [s_q, h], fp32
         k: torch.Tensor,  # [s_k, d=128] or [s_k, 1, d=128], bf16
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         causal: bool,
         ke: Optional[torch.Tensor] = None,  # [s_q], int32, CP relative lengths
         ks: Optional[torch.Tensor] = None,  # [s_q], int32, CP row starts
@@ -718,11 +722,9 @@ class DSAIndexer:
         layers of the same step.
 
         Why lazy (not computed here): the schedule depends on each layer's ks,
-        which in CP mode is the layer-local ``local_ks`` (derived from cp_ctx +
-        local_lengths). local_lengths is only populated inside the first layer's
-        forward, AFTER this hook runs, so this hook cannot compute the correct
-        CP ks. Building lazily in-layer sidesteps that ordering and makes reuse
-        work for BOTH the CP and non-CP paths.
+        which in CP mode is derived from the CP-local query delta view passed to
+        the indexer. Building lazily in-layer keeps the schedule aligned with the
+        actual query rows for BOTH the CP and non-CP paths.
 
         No-op for every backend other than triton_bf16.
         """
@@ -1005,7 +1007,7 @@ class DSAIndexer:
         self,
         q,
         weights,
-        seq_len_delta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         cache_accessor: KVCacheAccessor,
         is_causal: bool = True,
         ke: Optional[torch.Tensor] = None,

@@ -605,13 +605,18 @@ class TransformerGLM52(TransformerDeepSeekV3):
         self._clear_backbone_indexer_buffer()
         freqs_cis = self.prepare_freqs_cis()
         delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
-        tokens, freqs_cis = self.cp_context.split_prefill(
-            tokens,
-            freqs_cis,
+        tokens, _, freqs_cis = self.cp_context.split_prefill(
+            tokens=tokens,
             hiddens=None,
-            pp_stage=0,
-            delta_total=delta_total,
+            freqs_cis=freqs_cis,
+            total_tokens=delta_total,
         )
+        if self.cp_context.step_active:
+            self.cp_context.prepare_local_lengths(
+                self.cache_dict["main"].seq_len_delta,
+                int(tokens.shape[0]),
+                is_decode_stage=False,
+            )
 
         if self.moe_impl is not None:
             self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
@@ -632,7 +637,7 @@ class TransformerGLM52(TransformerDeepSeekV3):
                 h=h,
                 freqs_cis=freqs_cis,
             )
-        return self.cp_context.gather(
+        return self.cp_context.allgather_hidden_states(
             h,
             output_token_offsets,
             self._post_layers,
@@ -697,12 +702,11 @@ class TransformerGLM52(TransformerDeepSeekV3):
         if self.pp_stage == 0:
             assert tokens is not None
             assert hiddens is None
-            tokens, freqs_cis = self.cp_context.split_prefill(
-                tokens,
-                freqs_cis,
-                hiddens,
-                self.pp_stage,
-                delta_total=delta_total,
+            tokens, _, freqs_cis = self.cp_context.split_prefill(
+                tokens=tokens,
+                hiddens=None,
+                freqs_cis=freqs_cis,
+                total_tokens=delta_total,
             )
             batch_size = tokens.shape[0]
             h = self._pre_layers(tokens, **args)
@@ -712,16 +716,30 @@ class TransformerGLM52(TransformerDeepSeekV3):
             if self._cross_stage_recv_topk:
                 hiddens, topk = self._unpack_topk(hiddens)
                 self._backbone_buf.topk = topk
-            tokens, freqs_cis = self.cp_context.split_prefill(
-                tokens,
-                freqs_cis,
-                hiddens,
-                self.pp_stage,
-                delta_total=delta_total,
-            )
+            if self.pp_stage == self.pp_end_stage and self.mtp_size > 1:
+                tokens, hiddens, freqs_cis = self.cp_context.split_prefill(
+                    tokens=tokens,
+                    hiddens=hiddens,
+                    freqs_cis=freqs_cis,
+                    total_tokens=delta_total,
+                )
+            else:
+                _, hiddens, freqs_cis = self.cp_context.split_prefill(
+                    tokens=None,
+                    hiddens=hiddens,
+                    freqs_cis=freqs_cis,
+                    total_tokens=delta_total,
+                )
             batch_size = hiddens.shape[0]
             h = hiddens
             del hiddens
+
+        if self.cp_context.step_active:
+            self.cp_context.prepare_local_lengths(
+                self.cache_dict["main"].seq_len_delta,
+                int(batch_size),
+                is_decode_stage=False,
+            )
 
         if self.moe_impl is not None:
             self.moe_impl.prepare(TaskType.Prefill, batch_size)
@@ -743,16 +761,10 @@ class TransformerGLM52(TransformerDeepSeekV3):
                     h=h,
                     freqs_cis=freqs_cis,
                 )
-            seq_len_delta = (
-                self.cache_dict["main"].seq_len_delta if self.pp_size > 1 else None
-            )
-            h = self.cp_context.gather(
+            h = self.cp_context.allgather_hidden_states(
                 h,
                 output_token_offsets,
                 self._post_layers,
-                pp_size=self.pp_size,
-                pp_stage=self.pp_stage,
-                seq_len_delta=seq_len_delta,
             )
         else:
             # Pack topk for the next PP stage.

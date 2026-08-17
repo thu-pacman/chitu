@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from chitu.attn_backend import AttnBackend
-from chitu.batched_seq_len import BatchedSeqLenDelta, SlicedDelta
+from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.kv_cache import (
     KVCacheBase,
@@ -238,7 +238,7 @@ class Indexer(torch.nn.Module):
         x: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         freqs_cis: BatchedFreqsCis,
         is_causal: bool,
         cache_accessor: KVCacheAccessor,
@@ -265,13 +265,9 @@ class Indexer(torch.nn.Module):
         if freqs_cis_k is not None:
             pcp_size = cp_ctx.pcp_size
             cp_rank = cp_ctx.cp_rank
-            local_lengths = cp_ctx.local_lengths
-            local_seq_ids = cp_ctx.local_seq_ids
         else:
             pcp_size = 1
             cp_rank = 0
-            local_lengths = None
-            local_seq_ids = None
 
         q_pack, k_pack = self._build_index_qk(
             x,
@@ -292,31 +288,10 @@ class Indexer(torch.nn.Module):
         # CP-specific: extract k_append and local_ks
         k_append = k_indexer[cp_rank::pcp_size] if pcp_size > 1 else None
         local_ks = None
-        if (
-            pcp_size > 1
-            and local_lengths is not None
-            and not seq_len_delta.is_decode_stage
-        ):
-            seq_ids = seq_len_delta.delta_seq_ids_tensor_device
-            total_tokens = seq_len_delta.delta_position_ids_tensor_device.shape[0]
-            local_len_idx = torch.arange(
-                cp_rank,
-                total_tokens,
-                pcp_size,
-                device=seq_ids.device,
-                dtype=torch.long,
-            )
-            local_seq_ids = torch.index_select(seq_ids, 0, local_len_idx)
+        if pcp_size > 1 and not seq_len_delta.is_decode_stage:
             local_ks = seq_len_delta.new.prefix_lens_tensor_device[
-                local_seq_ids
+                seq_len_delta.delta_seq_ids_tensor_device
             ].contiguous()
-            if local_ks.shape[0] < local_lengths.shape[0]:
-                pad_ks = torch.zeros(
-                    local_lengths.shape[0] - local_ks.shape[0],
-                    dtype=local_ks.dtype,
-                    device=local_ks.device,
-                )
-                local_ks = torch.cat([local_ks, pad_ks])
 
         s_q = q_indexer.shape[0]
         if s_q == 0:
@@ -327,19 +302,14 @@ class Indexer(torch.nn.Module):
         self.indexer_impl.append_indexer_kv(
             k_indexer,
             k_scale,
-            seq_len_delta,
+            getattr(seq_len_delta, "base_delta", seq_len_delta),
             cache_accessor,
             k_append=k_append,
         )
 
-        # CP-local per-row sequence ids: in CP mode q holds only this rank's
-        # query rows, so the global delta_seq_ids would mislabel them. Passed to
-        # index_score (used by the hygon scorer's row->sequence remap).
         q_seq_ids = (
-            local_seq_ids
-            if pcp_size > 1
-            and local_lengths is not None
-            and not seq_len_delta.is_decode_stage
+            seq_len_delta.delta_seq_ids_tensor_device
+            if pcp_size > 1 and not seq_len_delta.is_decode_stage
             else None
         )
 
@@ -369,7 +339,11 @@ class Indexer(torch.nn.Module):
                 seq_len_delta,
                 cache_accessor,
                 is_causal,
-                ke=local_lengths,
+                ke=(
+                    (seq_len_delta.delta_position_ids_tensor_device + 1)
+                    if pcp_size > 1 and not seq_len_delta.is_decode_stage
+                    else None
+                ),
                 ks=local_ks,
                 q_seq_ids=q_seq_ids,
                 compact_prefill_logits=not self.indexer_impl.should_use_packed_hygon_prefill(
@@ -378,43 +352,32 @@ class Indexer(torch.nn.Module):
                     return_indices=True,
                 ),
             )
-            return reduce(logits, seq_len_delta, local_lengths, local_ks, s_q)
+            return reduce(
+                logits,
+                seq_len_delta,
+                (
+                    (seq_len_delta.delta_position_ids_tensor_device + 1)
+                    if pcp_size > 1 and not seq_len_delta.is_decode_stage
+                    else None
+                ),
+                local_ks,
+                s_q,
+            )
 
         out = None
         for i in range(0, s_q, chunk_size):
             j = min(i + chunk_size, s_q)
-            delta_view = SlicedDelta(seq_len_delta, i, j)
-            ke_slice = local_lengths[i:j] if local_lengths is not None else None
+            delta_view = BatchedSeqLenDeltaView(seq_len_delta, i, j)
+            ke_slice = (
+                delta_view.delta_position_ids_tensor_device + 1
+                if pcp_size > 1 and not seq_len_delta.is_decode_stage
+                else None
+            )
             ks_slice = local_ks[i:j] if local_ks is not None else None
             q_seq_ids_slice = q_seq_ids[i:j] if q_seq_ids is not None else None
             physical_rows = j - i
-            logical_end = j
-            if q_seq_ids is not None:
-                logical_end = min(j, q_seq_ids.shape[0])
-                if i >= logical_end:
-                    rows = reduce(
-                        q_indexer.new_empty((0, self.indexer_impl.static_max_n)),
-                        delta_view,
-                        ke_slice,
-                        ks_slice,
-                        physical_rows,
-                    )
-                    if out is None:
-                        out = torch.empty(
-                            (s_q, rows.shape[-1]), dtype=rows.dtype, device=rows.device
-                        )
-                    out[i:j] = rows
-                    continue
-                q_slice = q_indexer[i:logical_end]
-                w_slice = weights[i:logical_end]
-                ke_slice = (
-                    local_lengths[i:logical_end] if local_lengths is not None else None
-                )
-                ks_slice = local_ks[i:logical_end] if local_ks is not None else None
-                q_seq_ids_slice = q_seq_ids[i:logical_end]
-            else:
-                q_slice = q_indexer[i:j]
-                w_slice = weights[i:j]
+            q_slice = q_indexer[i:j]
+            w_slice = weights[i:j]
             logits = self.indexer_impl.index_score(
                 q_slice,
                 w_slice,
@@ -443,7 +406,7 @@ class Indexer(torch.nn.Module):
         x: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         freqs_cis: BatchedFreqsCis,
         is_causal: bool,
         cache_accessor: KVCacheAccessor,
@@ -487,7 +450,7 @@ class Indexer(torch.nn.Module):
         x: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         freqs_cis: BatchedFreqsCis,
         is_causal: bool,
         cache_accessor: KVCacheAccessor,
@@ -496,7 +459,8 @@ class Indexer(torch.nn.Module):
     ) -> torch.Tensor:
         """Build per-query top-k indices.
 
-        In CP mode, use get_cp_context() for CP-specific parameters.
+        In CP mode, seq_len_delta is a BatchedSeqLenDeltaView over this rank's
+        local query rows while preserving the global K axis through .new.
         """
 
         def reduce(logits, delta_view, ke_slice, ks_slice, physical_rows):
@@ -1028,14 +992,10 @@ class AttentionDeepSeekV3(Attention):
 
         indexer_k_global: torch.Tensor | None = None
         if cp_active:
-            assert seq_len_delta is not None
             cp_ctx = get_cp_context()
             kv_global, indexer_k_global = cp_ctx.allgather_kv(
-                n_tokens,
                 kv,
                 indexer_k,
-                self.index_head_dim,
-                seq_len_delta,
             )
             kv = kv_global.unsqueeze(1)
             kv_lora = kv[..., : self.kv_lora_rank]
@@ -1223,7 +1183,8 @@ class AttentionDeepSeekV3(Attention):
     ):
         """Unified forward for DeepSeek V3 MLA attention.
 
-        When CP step is active, allgathers KV and uses local_lengths for causal bounds.
+        When CP step is active, allgathers KV and uses a query-local
+        BatchedSeqLenDeltaView for causal bounds.
         """
         seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
         bs_seq, _ = x.size()
@@ -1232,12 +1193,6 @@ class AttentionDeepSeekV3(Attention):
         cp_ctx = get_cp_context()
         cp_active = cp_ctx.step_active and not seq_len_delta.is_decode_stage
         has_indexer_weights = self.index_topk is not None and self.has_local_indexer
-
-        # Clear stale CP cache from previous steps (e.g., prefill's local_lengths
-        # should not leak into decode). When CP is active, prepare_local_lengths
-        # will set fresh values before downstream methods read them.
-        if not cp_active:
-            cp_ctx.clear_step_cache()
 
         if (
             self.mla_absorb == "absorb-kv-only"
@@ -1378,11 +1333,14 @@ class AttentionDeepSeekV3(Attention):
                 topk_indices = None
                 topk_page_table = None
 
-                # ---- CP: build local_lengths for attention causal bounds ----
                 if cp_active:
-                    cp_ctx.prepare_local_lengths(
-                        seq_len_delta, n_tokens, seq_len_delta.is_decode_stage
-                    )
+                    query_seq_len_delta = cp_ctx.get_seq_len_delta_view()
+                    if query_seq_len_delta is None:
+                        raise RuntimeError(
+                            "CP query delta view has not been prepared for this step"
+                        )
+                else:
+                    query_seq_len_delta = seq_len_delta
 
                 if has_indexer_weights:
                     assert self.indexer_cache is not None
@@ -1418,7 +1376,7 @@ class AttentionDeepSeekV3(Attention):
                                 x,
                                 indexer_q,
                                 indexer_k_normed,
-                                seq_len_delta,
+                                query_seq_len_delta,
                                 freqs_cis,
                                 is_causal=True,
                                 cache_accessor=indexer_cache_accessor,
@@ -1431,7 +1389,7 @@ class AttentionDeepSeekV3(Attention):
                                 x,
                                 indexer_q,
                                 indexer_k_normed,
-                                seq_len_delta,
+                                query_seq_len_delta,
                                 freqs_cis,
                                 is_causal=True,
                                 cache_accessor=indexer_cache_accessor,
@@ -1451,7 +1409,7 @@ class AttentionDeepSeekV3(Attention):
                                 x,
                                 indexer_q,
                                 indexer_k,
-                                seq_len_delta,
+                                query_seq_len_delta,
                                 freqs_cis,
                                 is_causal=True,
                                 cache_accessor=indexer_cache_accessor,
@@ -1462,7 +1420,7 @@ class AttentionDeepSeekV3(Attention):
                                 x,
                                 indexer_q,
                                 indexer_k,
-                                seq_len_delta,
+                                query_seq_len_delta,
                                 freqs_cis,
                                 is_causal=True,
                                 cache_accessor=indexer_cache_accessor,
@@ -1490,7 +1448,7 @@ class AttentionDeepSeekV3(Attention):
                     q_pe,
                     main_cache_accessor,
                     kv,
-                    seq_len_delta=seq_len_delta,
+                    seq_len_delta=query_seq_len_delta,
                     causal=True,
                     softmax_scale=self.softmax_scale,
                     topk_indices=topk_indices,

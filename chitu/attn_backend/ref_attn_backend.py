@@ -10,7 +10,7 @@ import einops
 import torch
 
 from chitu.attn_backend.base import AttnBackend
-from chitu.batched_seq_len import BatchedSeqLenDelta
+from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
 from chitu.kv_cache import KVCacheAccessor, PagedKVCacheAccessor, DenseKVCacheAccessor
 
 
@@ -577,7 +577,7 @@ class RefAttnBackend(AttnBackend):
         q,
         k,
         v,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         causal=False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated

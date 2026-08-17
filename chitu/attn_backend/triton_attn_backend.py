@@ -10,7 +10,7 @@ import einops
 import torch
 
 from chitu.attn_backend.ref_attn_backend import RefAttnBackend
-from chitu.batched_seq_len import BatchedSeqLenDelta
+from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
 from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.device_type import is_muxi, has_accelerator
 from chitu.ops import append_to_dense_kv_cache, append_to_paged_kv_cache
@@ -39,7 +39,7 @@ class TritonAttnBackend(RefAttnBackend):
         q,
         k,
         v,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         causal=False,
         window_size=(-1, -1),
         softcap=0,
@@ -88,7 +88,7 @@ class TritonAttnBackend(RefAttnBackend):
         q_nope,
         q_pe,
         kv,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         causal: bool = False,
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,

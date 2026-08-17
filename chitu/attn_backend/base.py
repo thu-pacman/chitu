@@ -10,7 +10,7 @@ from logging import getLogger
 
 import torch
 
-from chitu.batched_seq_len import BatchedSeqLenDelta
+from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
 from chitu.kv_cache import KVCacheAccessor, DenseKVCacheAccessor, PagedKVCacheAccessor
 from chitu.native_layout import (
     ColumnOddEvenSeparatedTensor,
@@ -169,7 +169,9 @@ class AttnBackend(abc.ABC):
 
     # SPDX-SnippetEnd
 
-    def route_to_decode(self, seq_len_delta: BatchedSeqLenDelta) -> bool:
+    def route_to_decode(
+        self, seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView
+    ) -> bool:
         """Whether `mla()` will dispatch this step to the decode kernel."""
         return seq_len_delta.is_classic_decoding or (
             seq_len_delta.is_decode_stage and self.decode_op_supports_mtp()
@@ -181,7 +183,7 @@ class AttnBackend(abc.ABC):
         q_pe: torch.Tensor | ColumnOddEvenSeparatedTensor,
         kv_cache: KVCacheAccessor,
         kv: PartialColumnOddEvenSeparatedTensor,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         causal: bool = False,
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
@@ -1127,7 +1129,7 @@ class AttnBackend(abc.ABC):
         q,
         k,
         v,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         causal: bool = False,
         window_size=(-1, -1),  # -1 means infinite context window
         softcap=0.0,  # 0.0 means deactivated
@@ -1340,7 +1342,7 @@ class AttnBackend(abc.ABC):
         q_pe,
         kv_cache: KVCacheAccessor,
         kv,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         causal: bool = False,
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
@@ -1423,7 +1425,7 @@ class AttnBackend(abc.ABC):
         q_pe,
         kv_cache: Optional[KVCacheAccessor],
         kv,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         softmax_scale,
         topk_indices: Optional[torch.Tensor],
         mqa_func,
@@ -1520,7 +1522,7 @@ class AttnBackend(abc.ABC):
         q_nope,
         q_pe,
         kv,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         causal: bool = False,
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
@@ -1543,7 +1545,7 @@ class AttnBackend(abc.ABC):
         q_pe,
         kv_cache: DenseKVCacheAccessor,
         kv,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         causal: bool = False,
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
@@ -1560,13 +1562,14 @@ class AttnBackend(abc.ABC):
         # because it incurs redundant KV cache copying.
 
         kv_lora_rank = q_nope.shape[-1]
+        append_delta = getattr(seq_len_delta, "base_delta", seq_len_delta)
 
         if "kv_lora_k_pe" in kv_cache.kv:
             append_to_dense_kv_cache(
                 kv_cache.kv["kv_lora_k_pe"],
                 kv,
-                seq_len_delta.delta_position_ids_tensor_device,
-                seq_len_delta.delta_seq_ids_tensor_device,
+                append_delta.delta_position_ids_tensor_device,
+                append_delta.delta_seq_ids_tensor_device,
             )
             if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefill
                 kv = read_from_dense_kv_cache(
@@ -1578,14 +1581,14 @@ class AttnBackend(abc.ABC):
             append_to_dense_kv_cache(
                 kv_cache.kv["kv_lora"],
                 kv[..., :kv_lora_rank],
-                seq_len_delta.delta_position_ids_tensor_device,
-                seq_len_delta.delta_seq_ids_tensor_device,
+                append_delta.delta_position_ids_tensor_device,
+                append_delta.delta_seq_ids_tensor_device,
             )
             append_to_dense_kv_cache(
                 kv_cache.kv["k_pe"],
                 kv[..., kv_lora_rank:],
-                seq_len_delta.delta_position_ids_tensor_device,
-                seq_len_delta.delta_seq_ids_tensor_device,
+                append_delta.delta_position_ids_tensor_device,
+                append_delta.delta_seq_ids_tensor_device,
             )
             if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefill
                 kv = torch.cat(
@@ -1625,7 +1628,7 @@ class AttnBackend(abc.ABC):
         q_pe,
         kv_cache: PagedKVCacheAccessor,
         kv,
-        seq_len_delta: BatchedSeqLenDelta,
+        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
         causal: bool = False,
         softmax_scale=None,
         topk_indices: Optional[torch.Tensor] = None,
@@ -1642,14 +1645,15 @@ class AttnBackend(abc.ABC):
         # because it incurs redundant KV cache copying.
 
         kv_lora_rank = q_nope.shape[-1]
+        append_delta = getattr(seq_len_delta, "base_delta", seq_len_delta)
 
         if "kv_lora_k_pe" in kv_cache.kv:
             append_to_paged_kv_cache(
                 kv_cache.kv["kv_lora_k_pe"],
                 kv_cache.block_table,
                 kv,
-                seq_len_delta.delta_position_ids_tensor_device,
-                seq_len_delta.delta_seq_ids_tensor_device,
+                append_delta.delta_position_ids_tensor_device,
+                append_delta.delta_seq_ids_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
             )
@@ -1665,8 +1669,8 @@ class AttnBackend(abc.ABC):
                 kv_cache.kv["kv_lora"],
                 kv_cache.block_table,
                 kv[..., :kv_lora_rank],
-                seq_len_delta.delta_position_ids_tensor_device,
-                seq_len_delta.delta_seq_ids_tensor_device,
+                append_delta.delta_position_ids_tensor_device,
+                append_delta.delta_seq_ids_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
             )
@@ -1674,8 +1678,8 @@ class AttnBackend(abc.ABC):
                 kv_cache.kv["k_pe"],
                 kv_cache.block_table,
                 kv[..., kv_lora_rank:],
-                seq_len_delta.delta_position_ids_tensor_device,
-                seq_len_delta.delta_seq_ids_tensor_device,
+                append_delta.delta_position_ids_tensor_device,
+                append_delta.delta_seq_ids_tensor_device,
                 get_page_ids=kv_cache.get_page_ids,
                 get_offs_in_page=kv_cache.get_offs_in_page,
             )

@@ -52,7 +52,6 @@ from chitu.utils import (
     gather_str_to_dst_rank,
     get_chitu_bool_env,
 )
-from chitu.cp_utils import get_cp_context
 from chitu.distributed.parallel_state import get_pp_group, get_world_group
 from chitu.logging_utils import setup_chitu_logging
 from chitu.metrics import (
@@ -1003,13 +1002,6 @@ def _warmup_backend_direct(
     logger.info(
         f"Starting local backend warmup (direct) with local max batch size {local_max_bs}..."
     )
-    _cp_context = get_cp_context()
-    if _cp_context.is_active:
-        local_max_bs = max(local_max_bs, _cp_context.pcp_size)
-        # Round up to multiple of pcp_size for clean interleaved split
-        local_max_bs = (
-            (local_max_bs + _cp_context.pcp_size - 1) // _cp_context.pcp_size
-        ) * _cp_context.pcp_size
     init_cache_static()
 
     req_ids = [f"__warmup_{i}__" for i in range(local_max_bs)]
