@@ -1373,7 +1373,7 @@ class Transformer(nn.Module):
         # gather last tokens' hidden states from all CP ranks
         self.update_mtp_hidden_states(mtp_hidden_states)
 
-        # get local embeddings and freqs(padded to n_local) for MTP prefill
+        # get local embeddings and freqs for this rank's real local tokens
         if x.shape[0] != n_local:
             x = self.cp_context.slice_for_local(x, n_local, total_tokens)
         if freqs_cis.cos.shape[0] != n_local:
@@ -1389,10 +1389,10 @@ class Transformer(nn.Module):
         local_position_ids = main_mtp_delta.delta_position_ids_tensor_device[
             local_flat_indices
         ]
-        # zero the padding embedding and first token embedding of each request
+        # zero the first token embedding of each request
         x[valid_mask & (local_position_ids == 0)] = 0
 
-        h_full = self.cp_context.allgather_interleaved(h, total_tokens)
+        h_full = self.cp_context.allgather_hidden_states(h, None, None)
         prev_h_full = torch.roll(h_full, shifts=1, dims=0)
         prev_h = prev_h_full[local_flat_indices]
         _ = self.layers[-1](x, freqs_cis, prev_h, is_mtp=False)
@@ -1404,13 +1404,18 @@ class Transformer(nn.Module):
         freqs_cis = self.prepare_freqs_cis()
 
         delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
-        tokens, freqs_cis = self.cp_context.split_prefill(
-            tokens,
-            freqs_cis,
+        tokens, _, freqs_cis = self.cp_context.split_prefill(
+            tokens=tokens,
             hiddens=None,
-            pp_stage=0,
-            delta_total=delta_total,
+            freqs_cis=freqs_cis,
+            total_tokens=delta_total,
         )
+        if self.cp_context.step_active:
+            self.cp_context.prepare_local_lengths(
+                self.cache_dict["main"].seq_len_delta,
+                int(tokens.shape[0]),
+                is_decode_stage=False,
+            )
 
         if self.moe_impl is not None:
             self.moe_impl.prepare(
@@ -1439,7 +1444,7 @@ class Transformer(nn.Module):
             )
 
         # CP: allgather back to full token order before output selection
-        return self.cp_context.gather(
+        return self.cp_context.allgather_hidden_states(
             h,
             output_token_offsets,
             self._post_layers,
@@ -1542,22 +1547,43 @@ class Transformer(nn.Module):
         freqs_cis = self.prepare_freqs_cis()
 
         delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
-        tokens, freqs_cis = self.cp_context.split_prefill(
-            tokens,
-            freqs_cis,
-            hiddens,
-            self.pp_stage,
-            delta_total=delta_total,
-        )
 
         if self.pp_stage == 0:
+            tokens, _, freqs_cis = self.cp_context.split_prefill(
+                tokens=tokens,
+                hiddens=None,
+                freqs_cis=freqs_cis,
+                total_tokens=delta_total,
+            )
             batch_size = tokens.shape[0]
             assert hiddens is None
             h = self._pre_layers(tokens, **args)
         else:
+            if self.pp_stage == self.pp_end_stage and self.mtp_size > 1:
+                tokens, hiddens, freqs_cis = self.cp_context.split_prefill(
+                    tokens=tokens,
+                    hiddens=hiddens,
+                    freqs_cis=freqs_cis,
+                    total_tokens=delta_total,
+                )
+            else:
+                _, hiddens, freqs_cis = self.cp_context.split_prefill(
+                    tokens=None,
+                    hiddens=hiddens,
+                    freqs_cis=freqs_cis,
+                    total_tokens=delta_total,
+                )
+
             batch_size = hiddens.shape[0]
             h = hiddens
             del hiddens
+
+        if self.cp_context.step_active:
+            self.cp_context.prepare_local_lengths(
+                self.cache_dict["main"].seq_len_delta,
+                int(batch_size),
+                is_decode_stage=False,
+            )
 
         if self.moe_impl is not None:
             self.moe_impl.prepare(
@@ -1585,16 +1611,10 @@ class Transformer(nn.Module):
                     h=h,
                     freqs_cis=freqs_cis,
                 )
-            seq_len_delta = (
-                self.cache_dict["main"].seq_len_delta if self.pp_size > 1 else None
-            )
-            return self.cp_context.gather(
+            return self.cp_context.allgather_hidden_states(
                 h,
                 output_token_offsets,
                 self._post_layers,
-                pp_size=self.pp_size,
-                pp_stage=self.pp_stage,
-                seq_len_delta=seq_len_delta,
             )
         return h
 
@@ -1750,6 +1770,7 @@ class Transformer(nn.Module):
 
         for cache in self.cache_dict.values():
             cache.seq_len_delta.is_decode_stage = False
+        self.cp_context.clear_step_cache()
 
         # 元数据准备必须与 attn_backend 的路由判定保持一致，不能由 prefill/decode
         # 函数身份决定：开启 prefix caching 后，若 prefill 请求的前缀全部命中(PD分离)，

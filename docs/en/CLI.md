@@ -490,6 +490,18 @@ type=fp8_pertoken_indexer. BF16 indexer paths require unquantized indexer KV cac
 
 *Default: `auto`.*
 
+### Argument `infer.indexer_logits_chunk_bytes`
+
+Memory budget (in bytes) for one chunk of the indexer's intermediate
+index-score (logits) buffer during prefill.
+Acceptable values:
+- null: Default. Disable chunking. The full score buffer is materialized in one shot.
+- A positive integer: Per-chunk score-buffer budget in bytes, e.g.
+  268435456 for 256 MiB. Smaller values use less peak memory but launch
+  more chunks.
+
+*Default: `null`.*
+
 ### Argument `infer.op_impl`
 
 Currently this option is only for enabling/disabling muxi_custom_kernel.

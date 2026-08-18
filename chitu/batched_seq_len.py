@@ -553,3 +553,137 @@ class BatchedSeqLenDelta:
             return torch.arange(self.batch_size, device=self.device, dtype=torch.int32)
         else:
             return self._delta.seq_ids_tensor_device
+
+
+class BatchedSeqLenDeltaView:
+    """
+    A lightweight q-axis view over a `BatchedSeqLenDelta`.
+
+    The q-axis (delta tokens) is the axis that scorers iterate along. This view
+    selects exactly the two per-q-token vectors
+    (`delta_position_ids_tensor_device`, `delta_seq_ids_tensor_device`) to
+    either a contiguous `[start:stop]` range or an explicit index tensor, and
+    passes everything else (`.new`, `.old`, batch-level flags) through unchanged,
+    because the k-axis is addressed via `.new` and is not sliced.
+
+    Decode is single-pass and its delta tensors are captured in a CUDA graph, so
+    decode must not be sliced/indexed.
+    """
+
+    def __init__(
+        self,
+        base: "BatchedSeqLenDelta | BatchedSeqLenDeltaView",
+        start: Optional[int] = None,
+        stop: Optional[int] = None,
+        *,
+        indices: Optional[torch.Tensor] = None,
+    ):
+        if indices is not None and (start is not None or stop is not None):
+            raise ValueError("Use either indices or start/stop, not both")
+        if indices is None and (start is None or stop is None):
+            raise ValueError("BatchedSeqLenDeltaView requires indices or start/stop")
+
+        if isinstance(base, BatchedSeqLenDeltaView):
+            if base._indices is not None:
+                if indices is not None:
+                    indices = torch.index_select(
+                        base._indices, 0, indices.to(torch.long)
+                    )
+                else:
+                    indices = base._indices[start:stop]
+                start = None
+                stop = None
+            else:
+                parent_start = base._start
+                assert parent_start is not None
+                if indices is not None:
+                    indices = indices + parent_start
+                else:
+                    start = parent_start + start
+                    stop = parent_start + stop
+            base = base._base
+
+        self._base = base
+        self._start = start
+        self._stop = stop
+        self._indices = indices
+
+    @property
+    def base_delta(self):
+        return self._base
+
+    @property
+    def old(self):
+        return self._base.old
+
+    @property
+    def new(self):
+        return self._base.new
+
+    @property
+    def device(self):
+        return self._base.device
+
+    @property
+    def is_classic_decoding(self):
+        return self._base.is_classic_decoding
+
+    @property
+    def is_decode_stage(self):
+        return self._base.is_decode_stage
+
+    @property
+    def is_first_prefill_chunk(self):
+        return self._base.is_first_prefill_chunk
+
+    @property
+    def batch_size(self):
+        return self._base.batch_size
+
+    def _select(self, x: torch.Tensor) -> torch.Tensor:
+        if self._indices is not None:
+            return torch.index_select(x, 0, self._indices.to(torch.long))
+        return x[self._start : self._stop]
+
+    @property
+    def delta_position_ids_tensor_device(self):
+        return self._select(self._base.delta_position_ids_tensor_device)
+
+    @property
+    def delta_seq_ids_tensor_device(self):
+        return self._select(self._base.delta_seq_ids_tensor_device)
+
+    @property
+    def delta_total_len(self):
+        return int(self.delta_position_ids_tensor_device.shape[0])
+
+    @property
+    def delta_lens_tensor_device(self):
+        return torch.bincount(
+            self.delta_seq_ids_tensor_device.to(torch.long),
+            minlength=self.batch_size,
+        ).to(torch.int32)
+
+    @property
+    def delta_lens_list(self):
+        return self.delta_lens_tensor_device.tolist()
+
+    @property
+    def delta_prefix_lens_tensor_device(self):
+        return torch.cat(
+            [
+                torch.zeros((1,), device=self.device, dtype=torch.int32),
+                torch.cumsum(self.delta_lens_tensor_device, dim=0, dtype=torch.int32),
+            ],
+            dim=0,
+        )
+
+    @property
+    def delta_prefix_lens_list(self):
+        return self.delta_prefix_lens_tensor_device.tolist()
+
+    @property
+    def delta_max_len(self):
+        if self.batch_size == 0:
+            return 0
+        return int(self.delta_lens_tensor_device.max().item())

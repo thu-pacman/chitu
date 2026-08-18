@@ -1518,9 +1518,9 @@ class Executor:
             return hiddens
 
         # receive hiddens from previous PP stage
-        # In PCP+PP prefill, each CP rank only processes ceil(num_tokens/pcp_size)
+        # In PCP+PP prefill, each CP rank only processes its real interleaved
         # local tokens. The recv buffer must match the size that the sender
-        # (PP stage 0) actually sends, which is the CP-split local size.
+        # actually sends for this CP rank.
         # In PCP+PP decode, each CP rank has the full batch — no CP-split is applied.
         if tasks.task_type == TaskType.Decode:
             pp_num_tokens = tasks.num_tokens
