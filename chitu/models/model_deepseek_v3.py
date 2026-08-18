@@ -256,7 +256,7 @@ class Indexer(torch.nn.Module):
         and ``build_decode_topk_page_table`` (top-k page table) can share it,
         differing only in the ``reduce`` callable.
 
-        ``reduce(logits, delta_view, ke_slice, ks_slice, physical_rows) -> [rows, W]``
+        ``reduce(logits, delta_view) -> [rows, W]``
         turns one score slice into that slice's output rows.
         """
         cp_ctx = get_cp_context()
@@ -325,7 +325,7 @@ class Indexer(torch.nn.Module):
             ).repeat(s_q, 1)
 
         # Decide chunking. The indexer owns the whole decision (decode never
-        # chunks; non-sliceable backends can't be capped; budget vs row_width),
+        # chunks; budget vs row_width),
         # so we just ask it for a chunk size and iterate.
         chunk_size = self.indexer_impl.chunk_size(seq_len_delta)
         if chunk_size is None:
@@ -352,17 +352,7 @@ class Indexer(torch.nn.Module):
                     return_indices=True,
                 ),
             )
-            return reduce(
-                logits,
-                seq_len_delta,
-                (
-                    (seq_len_delta.delta_position_ids_tensor_device + 1)
-                    if pcp_size > 1 and not seq_len_delta.is_decode_stage
-                    else None
-                ),
-                local_ks,
-                s_q,
-            )
+            return reduce(logits, seq_len_delta)
 
         out = None
         for i in range(0, s_q, chunk_size):
@@ -375,7 +365,6 @@ class Indexer(torch.nn.Module):
             )
             ks_slice = local_ks[i:j] if local_ks is not None else None
             q_seq_ids_slice = q_seq_ids[i:j] if q_seq_ids is not None else None
-            physical_rows = j - i
             q_slice = q_indexer[i:j]
             w_slice = weights[i:j]
             logits = self.indexer_impl.index_score(
@@ -393,7 +382,7 @@ class Indexer(torch.nn.Module):
                     return_indices=True,
                 ),
             )
-            rows = reduce(logits, delta_view, ke_slice, ks_slice, physical_rows)
+            rows = reduce(logits, delta_view)
             if out is None:
                 out = torch.empty(
                     (s_q, rows.shape[-1]), dtype=rows.dtype, device=rows.device
@@ -421,7 +410,7 @@ class Indexer(torch.nn.Module):
         seq_len_delta.
         """
 
-        def reduce(logits, delta_view, ke_slice, ks_slice, physical_rows):
+        def reduce(logits, delta_view):
             lengths = delta_view.delta_position_ids_tensor_device + 1
             return topk_page_table_decode_cuda(logits, lengths, source_page_table)
 
@@ -463,7 +452,7 @@ class Indexer(torch.nn.Module):
         local query rows while preserving the global K axis through .new.
         """
 
-        def reduce(logits, delta_view, ke_slice, ks_slice, physical_rows):
+        def reduce(logits, delta_view):
             use_packed_hygon_prefill = (
                 self.indexer_impl.should_use_packed_hygon_prefill(
                     delta_view,
@@ -472,70 +461,37 @@ class Indexer(torch.nn.Module):
                 )
             )
             if use_packed_hygon_prefill:
-                if ks_slice is not None:
-                    if ke_slice is None:
-                        raise ValueError("CP packed Hygon TopK requires valid lengths")
-                    logical_rows = logits.shape[0]
-                    if (
-                        ks_slice.numel() < logical_rows
-                        or ke_slice.numel() < logical_rows
-                    ):
-                        raise ValueError(
-                            "CP packed Hygon TopK metadata is shorter than logits: "
-                            f"rows={logical_rows}, ks={ks_slice.numel()}, "
-                            f"ke={ke_slice.numel()}"
-                        )
-                    row_starts = ks_slice.narrow(0, 0, logical_rows)
-                    lengths = ke_slice.narrow(0, 0, logical_rows)
-                else:
-                    row_seq_ids = delta_view.delta_seq_ids_tensor_device
-                    row_starts = delta_view.new.prefix_lens_tensor_device[
-                        row_seq_ids
-                    ].contiguous()
-                    lengths = (
-                        delta_view.delta_position_ids_tensor_device + 1
-                        if is_causal
-                        else delta_view.new.lens_tensor_device[row_seq_ids]
-                    )
-                    logical_rows = logits.shape[0]
+                row_seq_ids = delta_view.delta_seq_ids_tensor_device
+                row_starts = delta_view.new.prefix_lens_tensor_device[
+                    row_seq_ids
+                ].contiguous()
+                lengths = (
+                    delta_view.delta_position_ids_tensor_device + 1
+                    if is_causal
+                    else delta_view.new.lens_tensor_device[row_seq_ids]
+                )
 
-                logical_indices = topk_indices(
+                indices = topk_indices(
                     logits,
                     self.index_topk,
                     lengths=lengths.contiguous(),
                     row_starts=row_starts.contiguous(),
                 )
-                if logical_indices.dtype != torch.int32:
+                if indices.dtype != torch.int32:
                     raise RuntimeError(
                         "Packed Hygon TopK must return int32 indices, got "
-                        f"{logical_indices.dtype}"
+                        f"{indices.dtype}"
                     )
-                if logical_indices.shape[0] > physical_rows:
+                if indices.shape[0] != logits.shape[0]:
                     raise RuntimeError(
-                        "Packed Hygon TopK returned more rows than physical Q: "
-                        f"logical_rows={logical_indices.shape[0]}, "
-                        f"physical_rows={physical_rows}"
+                        "Packed Hygon TopK rows mismatch: "
+                        f"{indices.shape[0]} != {logits.shape[0]}"
                     )
-                if logical_indices.shape[0] == physical_rows:
-                    return logical_indices
-                dummy_indices = torch.full(
-                    (
-                        physical_rows - logical_indices.shape[0],
-                        *logical_indices.shape[1:],
-                    ),
-                    -1,
-                    dtype=torch.int32,
-                    device=logical_indices.device,
-                )
-                return torch.cat((logical_indices, dummy_indices), dim=0)
+                return indices
 
             # Ensure k does not exceed the actual score width.
             k_topk = min(self.index_topk, logits.size(-1))
-            lengths = (
-                ke_slice
-                if ke_slice is not None
-                else (delta_view.delta_position_ids_tensor_device + 1)
-            )
+            lengths = delta_view.delta_position_ids_tensor_device + 1
             # May select some out-of-range items as -inf, which is fine.
             return topk_indices(logits, k_topk, lengths=lengths)
 

@@ -1012,13 +1012,28 @@ def _warmup_backend_direct(
         device="cuda",
         dtype=torch.int64,
     )
-    hiddens = None
+    prefill_hiddens = None
+    decode_hiddens = None
     if not get_pp_group().is_first_rank:
-        hiddens = torch.randn(
-            Backend.executor.get_payload_shape(local_max_bs),
-            device="cuda",
-            dtype=Backend.executor.get_payload_dtype(),
-        )
+        payload_dtype = Backend.executor.get_payload_dtype()
+        if not skip_model_prefill:
+            # Match executor._prepare_hiddens(): PP prefill receives CP-local
+            # hidden rows, while direct warmup bypasses the real pipe receiver.
+            prefill_tokens = Backend.model.cp_context.compute_pp_num_tokens(
+                local_max_bs
+            )
+            prefill_hiddens = torch.randn(
+                Backend.executor.get_payload_shape(prefill_tokens),
+                device="cuda",
+                dtype=payload_dtype,
+            )
+        if not skip_model_decode:
+            # Decode is not CP-split; each PP stage receives the full local batch.
+            decode_hiddens = torch.randn(
+                Backend.executor.get_payload_shape(local_max_bs),
+                device="cuda",
+                dtype=payload_dtype,
+            )
     all_tasks = PackedTasksBase(local_max_bs, task_ids=req_ids)
     all_tasks.new_cache_ids_list = _build_direct_warmup_new_cache_ids_list(
         local_max_bs,
@@ -1048,7 +1063,7 @@ def _warmup_backend_direct(
         Backend.model.mtp_accept_indices.set(mtp_accept_indices)
 
     if not skip_model_prefill:
-        Backend.model.prefill(tokens, hiddens, output_token_offsets)
+        Backend.model.prefill(tokens, prefill_hiddens, output_token_offsets)
 
     # Decode steps
     if not skip_model_decode:
@@ -1079,7 +1094,7 @@ def _warmup_backend_direct(
             if get_pp_group().is_first_rank:
                 payload = tokens[:curr_bs]
             else:
-                payload = hiddens[:curr_bs]
+                payload = decode_hiddens[:curr_bs]
 
             _ = Backend.model.decode(payload)
 
