@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import atexit
+import json
 import logging
 import os
 import shutil
@@ -17,6 +18,14 @@ from typing import Optional
 
 from chitu.boot.tcp_ip import get_free_port, is_port_available
 from chitu.global_vars import get_global_args
+from chitu.metrics.definitions import (
+    MetricType,
+    get_metric_definition,
+    grafana_derived_metrics,
+    grafana_raw_metrics,
+    histogram_series_names,
+    prometheus_query_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +112,33 @@ class GrafanaManager:
         (prov_dst / "dashboards" / "dashboard.yml").write_text(rendered)
 
         src_json = provisioning_dir / "dashboards" / "chitu_overview.json"
+        self._validate_dashboard_metrics(src_json)
         shutil.copy2(src_json, dash_dst / "chitu_overview.json")
+
+    def _validate_dashboard_metrics(self, dashboard_path: Path) -> None:
+        dashboard = json.loads(dashboard_path.read_text())
+        allowed_series = set()
+        for metric in grafana_raw_metrics():
+            allowed_series.add(prometheus_query_name(metric))
+            allowed_series.update(histogram_series_names(metric))
+        for derived_metric in grafana_derived_metrics():
+            for source_metric_name in derived_metric.source_metrics:
+                source_metric = get_metric_definition(source_metric_name)
+                allowed_series.add(prometheus_query_name(source_metric))
+                allowed_series.update(histogram_series_names(source_metric))
+
+        referenced_series = set()
+        for panel in dashboard.get("panels", []):
+            for target in panel.get("targets", []):
+                expr = target.get("expr", "")
+                referenced_series.update(re.findall(r"\bchitu_[a-zA-Z0-9_]+\b", expr))
+        referenced_series.discard("chitu_service")
+        unknown_series = sorted(referenced_series - allowed_series)
+        if unknown_series:
+            raise ValueError(
+                "Grafana dashboard references metrics that are not enabled in "
+                f"the registry: {', '.join(unknown_series)}"
+            )
 
     # ------------------------------------------------------------------
     # Start / stop

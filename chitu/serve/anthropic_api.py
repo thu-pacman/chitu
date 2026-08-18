@@ -17,7 +17,7 @@ from chitu.serve.api_docs import DocField
 from chitu.tool_call.type_def import ChoiceToolCall, ToolConfig
 from chitu.serve.request_id import gen_req_id
 
-DOC_GENERATION = os.environ.get("CHITU_HTTP_API_DOCS") == "1"
+DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
 
 if not DOC_GENERATION:
     from chitu.backend import Backend

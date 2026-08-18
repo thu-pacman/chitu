@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-os.environ["CHITU_HTTP_API_DOCS"] = "1"
+os.environ["CHITU_GENERATING_DOCS"] = "1"
 
 from chitu.serve.api_docs import (
     ENDPOINT_EXTRA_SECTIONS,

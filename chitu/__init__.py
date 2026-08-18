@@ -10,7 +10,7 @@ import sys
 should_setup_logging = not (
     getattr(sys, "frozen", False)
     or (os.environ.get("APPIMAGE") == "SOURCE")
-    or (os.environ.get("CHITU_HTTP_API_DOCS") == "1")
+    or (os.environ.get("CHITU_GENERATING_DOCS") == "1")
 )
 
 if should_setup_logging:

@@ -8,7 +8,7 @@ import time
 import threading
 from contextlib import contextmanager
 from typing import Optional
-from prometheus_client import Counter, Gauge, Histogram, start_http_server, REGISTRY
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
 import atexit
 import torch
 
@@ -17,6 +17,7 @@ from chitu.distributed.parallel_state import (
     get_dp_group,
     get_tp_group,
     get_pp_group,
+    get_pcp_group,
     get_dp_size,
 )
 from chitu.boot.tcp_ip import get_local_ip, get_free_port
@@ -24,111 +25,98 @@ from chitu.global_vars import get_global_args
 from chitu.metrics.cache_stats import kvcache_stats, get_prealloc_blocks
 from chitu.metrics.task_stats import count_tasks_for_dp_rank, count_tasks_non_dp
 from chitu.accelerator_monitor import get_accelerator_memory_bytes
+from chitu.metrics.registry import (
+    close_active_metrics_runtime,
+    get_active_metrics_runtime,
+)
+from chitu.metrics.definitions import MetricContext, MetricType, raw_metrics_for_context
 
 logger = logging.getLogger(__name__)
+
+_COLLECTOR_ATTR_BY_METRIC_NAME = {
+    "chitu_total_generated_tokens": "total_generated_tokens",
+    "chitu_total_prompt_tokens": "total_prompt_tokens",
+    "chitu_total_hit_tokens": "total_hit_tokens",
+    "chitu_total_task_evictions": "total_task_evictions",
+    "chitu_mtp_proposed_tokens": "mtp_proposed_tokens",
+    "chitu_mtp_accepted_tokens": "mtp_accepted_tokens",
+    "chitu_kv_cache_usage_ratio": "kv_cache_usage",
+    "chitu_used_blocks": "used_blocks",
+    "chitu_total_blocks": "total_blocks",
+    "chitu_cuda_total_bytes": "cuda_total_bytes",
+    "chitu_cuda_used_bytes": "cuda_used_bytes",
+    "chitu_torch_allocated_bytes": "torch_allocated_bytes",
+    "chitu_torch_reserved_bytes": "torch_reserved_bytes",
+    "chitu_running_requests": "running_requests",
+    "chitu_waiting_requests": "waiting_requests",
+    "chitu_prealloc_blocks": "prealloc_blocks",
+}
+
+_COLLECTOR_ZERO_INIT_METRICS = {
+    "chitu_total_generated_tokens",
+    "chitu_total_prompt_tokens",
+    "chitu_total_hit_tokens",
+    "chitu_total_task_evictions",
+    "chitu_mtp_proposed_tokens",
+    "chitu_mtp_accepted_tokens",
+    "chitu_cuda_total_bytes",
+    "chitu_cuda_used_bytes",
+    "chitu_torch_allocated_bytes",
+    "chitu_torch_reserved_bytes",
+    "chitu_running_requests",
+    "chitu_waiting_requests",
+}
 
 
 # 部分参考自 sglang 的 metrics.py和 vllm
 # ---------------------------------------------------------------------------
-# PD Disaggregation Metrics (module-level singletons, created on first import)
-# These are safe to define at module scope; Prometheus client handles
-# duplicate registration gracefully when the same metric name is reused.
+# PD Disaggregation Metrics
 # ---------------------------------------------------------------------------
 
-# -- Histograms: per-stage latency ------------------------------------------
-_PD_STAGE_BUCKETS = (
-    0.001,
-    0.005,
-    0.01,
-    0.025,
-    0.05,
-    0.1,
-    0.25,
-    0.5,
-    1.0,
-    2.5,
-    5.0,
-    10.0,
-    30.0,
-    60.0,
-    120.0,
-    300.0,
-)
+_ROLE_CONTEXT = lambda role: MetricContext(inst_role=role)
+_SERVICE_CONTEXT = MetricContext(is_router=True)
 
-chitu_pd_stage_duration_seconds = Histogram(
-    "chitu_pd_stage_duration_seconds",
-    "PD disaggregation per-stage request latency in seconds",
-    ["role", "stage"],
-    buckets=_PD_STAGE_BUCKETS,
-)
 
-chitu_e2e_request_duration_seconds = Histogram(
-    "chitu_e2e_request_duration_seconds",
-    "End-to-end request latency from router recv to decode complete",
-    buckets=(1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0),
-)
+def _current_instance_rank_labels() -> dict[str, str]:
+    collector = PrometheusMetricsCollector.get_instance()
+    if collector is None:
+        raise RuntimeError("Prometheus metrics collector is not initialized")
+    return {"instance_id": str(collector.instance_id), "rank": str(collector.rank)}
 
-chitu_time_to_first_token_seconds = Histogram(
-    "chitu_time_to_first_token_seconds",
-    "Time from request arrival to first token generated",
-    buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0),
-)
 
-chitu_kv_transfer_duration_seconds = Histogram(
-    "chitu_kv_transfer_duration_seconds",
-    "KV cache transfer duration in seconds",
-    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
-)
+def _role_metric(name: str, role: str):
+    runtime = get_active_metrics_runtime()
+    if runtime is None:
+        return None
+    metric = runtime.registry.get_for_context(name, _ROLE_CONTEXT(role))
+    if metric is None:
+        raise RuntimeError(f"Metric {name} is not collected for role {role}")
+    return metric
 
-chitu_kv_transfer_size_bytes = Histogram(
-    "chitu_kv_transfer_size_bytes",
-    "KV cache transfer size in bytes per request",
-    buckets=(1e6, 1e7, 5e7, 1e8, 5e8, 1e9),
-)
 
-# -- Gauges: queue depths ---------------------------------------------------
+def _service_metric(name: str):
+    runtime = get_active_metrics_runtime()
+    if runtime is None:
+        return None
+    metric = runtime.registry.get_for_context(name, _SERVICE_CONTEXT)
+    if metric is None:
+        raise RuntimeError(f"Metric {name} is not collected by the service context")
+    return metric
 
-chitu_pd_queue_size = Gauge(
-    "chitu_pd_queue_size",
-    "Current queue size for PD disaggregation stages",
-    ["role", "queue_name"],
-)
 
-chitu_router_pending_requests = Gauge(
-    "chitu_router_pending_requests",
-    "Number of pending requests in router",
-)
-
-chitu_active_requests = Gauge(
-    "chitu_active_requests",
-    "Number of active streaming requests",
-    ["role"],
-)
-
-chitu_kv_transfer_speed_gbps = Gauge(
-    "chitu_kv_transfer_speed_gbps",
-    "Latest KV transfer speed in GB/s",
-)
-
-# -- Counters: errors / completions -----------------------------------------
-
-chitu_kv_transfer_failures_total = Counter(
-    "chitu_kv_transfer_failures_total",
-    "Total KV transfer failures",
-    ["role"],
-)
-
-chitu_request_timeouts_total = Counter(
-    "chitu_request_timeouts_total",
-    "Total request timeouts",
-    ["stage"],
-)
-
-chitu_completed_requests_total = Counter(
-    "chitu_completed_requests_total",
-    "Total completed requests",
-    ["role"],
-)
+def _rank_metric(name: str):
+    runtime = get_active_metrics_runtime()
+    if runtime is None:
+        return None
+    collector = PrometheusMetricsCollector.get_instance()
+    if collector is None:
+        raise RuntimeError("Prometheus metrics collector is not initialized")
+    metric = runtime.registry.get_for_context(name, collector.metric_context)
+    if metric is None:
+        raise RuntimeError(
+            f"Metric {name} is not collected for rank={collector.rank} instance={collector.instance_id}"
+        )
+    return metric
 
 
 # ---------------------------------------------------------------------------
@@ -149,59 +137,94 @@ def observe_pd_stage(role: str, stage: str):
         yield
     finally:
         duration = time.monotonic() - start
-        chitu_pd_stage_duration_seconds.labels(role=role, stage=stage).observe(duration)
+        metric = _role_metric("chitu_pd_stage_duration_seconds", role)
+        if metric is not None:
+            metric.labels(role=role, stage=stage).observe(duration)
 
 
 def observe_stage_duration(role: str, stage: str, duration_s: float):
     """Record a pre-computed stage duration (seconds) into the Histogram."""
     if duration_s >= 0:
-        chitu_pd_stage_duration_seconds.labels(role=role, stage=stage).observe(
-            duration_s
-        )
+        metric = _role_metric("chitu_pd_stage_duration_seconds", role)
+        if metric is not None:
+            metric.labels(role=role, stage=stage).observe(duration_s)
 
 
 def observe_e2e_duration(duration_s: float):
     """Record end-to-end request duration."""
     if duration_s >= 0:
-        chitu_e2e_request_duration_seconds.observe(duration_s)
+        metric = _service_metric("chitu_e2e_request_duration_seconds")
+        if metric is not None:
+            metric.observe(duration_s)
 
 
 def observe_ttft(duration_s: float):
     """Record time-to-first-token."""
     if duration_s >= 0:
-        chitu_time_to_first_token_seconds.observe(duration_s)
+        metric = _service_metric("chitu_time_to_first_token_seconds")
+        if metric is not None:
+            metric.observe(duration_s)
 
 
-def observe_kv_transfer(
-    duration_s: float, size_bytes: float = 0, speed_gbps: float = 0
-):
-    """Record KV transfer duration, size, and speed."""
-    if duration_s >= 0:
-        chitu_kv_transfer_duration_seconds.observe(duration_s)
+def observe_kv_transfer(size_bytes: float = 0, duration_s: float | None = None):
+    """Record KV transfer size and duration."""
+    if get_active_metrics_runtime() is None:
+        return
+    labels = _current_instance_rank_labels()
     if size_bytes > 0:
-        chitu_kv_transfer_size_bytes.observe(size_bytes)
-    if speed_gbps > 0:
-        chitu_kv_transfer_speed_gbps.set(speed_gbps)
+        metric = _rank_metric("chitu_kv_transfer_size_bytes")
+        assert metric is not None
+        metric.labels(**labels).observe(size_bytes)
+    if duration_s is not None and duration_s >= 0:
+        metric = _rank_metric("chitu_kv_transfer_duration_seconds")
+        assert metric is not None
+        metric.labels(**labels).observe(duration_s)
 
 
 def set_queue_size(role: str, queue_name: str, size: int):
     """Set a queue depth gauge."""
-    chitu_pd_queue_size.labels(role=role, queue_name=queue_name).set(size)
+    metric = _role_metric("chitu_pd_queue_size", role)
+    if metric is not None:
+        metric.labels(role=role, queue_name=queue_name).set(size)
 
 
 def inc_completed_requests(role: str, count: int = 1):
     """Increment completed requests counter."""
-    chitu_completed_requests_total.labels(role=role).inc(count)
+    if get_active_metrics_runtime() is None:
+        return
+    metric = _rank_metric("chitu_completed_requests_total")
+    assert metric is not None
+    metric.labels(role=role, **_current_instance_rank_labels()).inc(count)
 
 
 def inc_kv_transfer_failures(role: str, count: int = 1):
     """Increment KV transfer failure counter."""
-    chitu_kv_transfer_failures_total.labels(role=role).inc(count)
+    if get_active_metrics_runtime() is None:
+        return
+    metric = _rank_metric("chitu_kv_transfer_failures_total")
+    assert metric is not None
+    metric.labels(role=role, **_current_instance_rank_labels()).inc(count)
 
 
 def inc_request_timeouts(stage: str, count: int = 1):
     """Increment request timeout counter."""
-    chitu_request_timeouts_total.labels(stage=stage).inc(count)
+    metric = _service_metric("chitu_request_timeouts_total")
+    if metric is not None:
+        metric.labels(stage=stage).inc(count)
+
+
+def set_router_pending_requests(size: int):
+    """Set the service-level router pending-request gauge."""
+    metric = _service_metric("chitu_router_pending_requests")
+    if metric is not None:
+        metric.set(size)
+
+
+def set_active_requests(role: str, size: int):
+    """Set the active-request gauge for a role."""
+    metric = _role_metric("chitu_active_requests", role)
+    if metric is not None:
+        metric.labels(role=role).set(size)
 
 
 class PrometheusMetricsCollector:
@@ -209,8 +232,27 @@ class PrometheusMetricsCollector:
 
     _instance: Optional["PrometheusMetricsCollector"] = None
     _lock = threading.RLock()
-    _shutting_down = False  # 正在关闭为True，未关闭和关闭完成为False
+    _shutting_down = False
     addrs: Optional[list[str]] = None
+
+    @classmethod
+    def metric_context_from_distributed(cls) -> MetricContext:
+        dp_group = get_dp_group()
+        tp_pcp_pp_group = (
+            get_tp_group()
+            .cartesian_product(get_pcp_group())
+            .cartesian_product(get_pp_group())
+        )
+        multi_inst = getattr(get_global_args(), "multi_inst", None)
+        inst_id = 0 if multi_inst is None else multi_inst.inst_id
+        inst_role = None if multi_inst is None else getattr(multi_inst, "role", None)
+        return MetricContext(
+            rank=dp_group.global_rank,
+            rank_in_dp=tp_pcp_pp_group.rank_in_group,
+            dp_rank=dp_group.rank_in_group,
+            inst_id=inst_id,
+            inst_role=inst_role,
+        )
 
     @classmethod
     def get_instance(
@@ -227,26 +269,85 @@ class PrometheusMetricsCollector:
 
         with cls._lock:
             if cls._instance is None:
-                dp_id = get_dp_group().rank_in_group
-                multi_inst = getattr(get_global_args(), "multi_inst", None)
-                instance_id = 0 if multi_inst is None else multi_inst.inst_id
-                rank = get_dp_group().global_rank
-                cls._instance = cls(rank, dp_id, instance_id)
-                cls.addrs = [cls._instance.addr]
+                runtime = get_active_metrics_runtime()
+                if runtime is None:
+                    raise RuntimeError(
+                        "Prometheus metrics collector requires an active metrics runtime context"
+                    )
+                metric_context = runtime.metric_context
+                cls._instance = cls(
+                    rank=0 if metric_context.rank is None else metric_context.rank,
+                    rank_in_dp=(
+                        0
+                        if metric_context.rank_in_dp is None
+                        else metric_context.rank_in_dp
+                    ),
+                    dp_rank=(
+                        0 if metric_context.dp_rank is None else metric_context.dp_rank
+                    ),
+                    inst_id=(
+                        0 if metric_context.inst_id is None else metric_context.inst_id
+                    ),
+                    is_router=metric_context.is_router,
+                    metric_context=metric_context,
+                )
+                if cls._instance.addr is not None:
+                    cls.addrs = [cls._instance.addr]
+                else:
+                    cls.addrs = []
         return cls._instance
 
-    def __init__(self, rank: int = 0, dp_id: int = 0, instance_id: int = 0):
-        self.rank: int = rank
-        self.dp_id: int = dp_id
-        self.instance_id: int = instance_id
+    @classmethod
+    def get_router_instance(
+        cls, is_create: bool = False
+    ) -> Optional["PrometheusMetricsCollector"]:
+        if cls._shutting_down:
+            return None
 
-        tp_group = get_tp_group()
-        dp_group = get_dp_group()
-        pp_group = get_pp_group()
-        self.is_dp_metrics_rank = (
-            tp_group.rank_in_group == 0 and pp_group.rank_in_group == 0
-        )
-        self.is_main_rank = dp_group.is_first_rank
+        if cls._instance is not None:
+            return cls._instance
+
+        if not is_create:
+            return None
+
+        with cls._lock:
+            if cls._instance is None:
+                runtime = get_active_metrics_runtime()
+                if runtime is None:
+                    raise RuntimeError(
+                        "Prometheus router metrics collector requires an active metrics runtime context"
+                    )
+                if not runtime.metric_context.is_router:
+                    raise RuntimeError(
+                        "Router metrics collector requires a router context"
+                    )
+                cls._instance = cls(
+                    is_router=True,
+                    metric_context=runtime.metric_context,
+                )
+                if cls._instance.addr is not None:
+                    cls.addrs = [cls._instance.addr]
+                else:
+                    cls.addrs = []
+        return cls._instance
+
+    def __init__(
+        self,
+        rank: int = 0,
+        rank_in_dp: int = 0,
+        dp_rank: int = 0,
+        inst_id: int = 0,
+        is_router: bool = False,
+        metric_context: MetricContext | None = None,
+    ):
+        self.rank: int = rank
+        self.rank_in_dp: int = rank_in_dp
+        self.dp_id: int = dp_rank
+        self.instance_id: int = inst_id
+        self.is_dp_metrics_rank = rank_in_dp == 0
+        self.is_main_rank = rank == 0
+        self.is_router = is_router
+        self.metric_context: MetricContext
         self.dp_size = get_dp_size()
 
         self.total_generated_tokens: Optional[Counter] = None
@@ -267,163 +368,135 @@ class PrometheusMetricsCollector:
         self.prealloc_blocks: Optional[Gauge] = None
         self.collector_server = None
         self.collector_thread = None
-        self.addr = None
+        self.ip: Optional[str] = None
+        self.port: Optional[int] = None
 
         try:
-            # --- Per-rank metrics (KV cache, accelerator memory)
-            self.kv_cache_usage = Gauge(
-                "chitu_kv_cache_usage_ratio",
-                "KV cache usage ratio (used_blocks / total_blocks)",
-                ["rank", "dp_id", "instance_id"],
-            )
-            self.used_blocks = Gauge(
-                "chitu_used_blocks",
-                "KV cache used blocks",
-                ["rank", "dp_id", "instance_id"],
-            )
-            self.total_blocks = Gauge(
-                "chitu_total_blocks",
-                "KV cache total blocks",
-                ["rank", "dp_id", "instance_id"],
-            )
-            self.cuda_total_bytes = Gauge(
-                "chitu_cuda_total_bytes",
-                "Accelerator total memory (bytes)",
-                ["rank", "dp_id", "instance_id"],
-            )
-            self.cuda_used_bytes = Gauge(
-                "chitu_cuda_used_bytes",
-                "Accelerator used memory (bytes), including torch allocated memory, "
-                "torch reserved but unused memory, and other accelerator memory",
-                ["rank", "dp_id", "instance_id"],
-            )
-            self.torch_allocated_bytes = Gauge(
-                "chitu_torch_allocated_bytes",
-                "torch allocated GPU memory (bytes)",
-                ["rank", "dp_id", "instance_id"],
-            )
-            self.torch_reserved_bytes = Gauge(
-                "chitu_torch_reserved_bytes",
-                "torch reserved GPU memory (bytes), including torch allocated memory, "
-                "and torch reserved but unused memory",
-                ["rank", "dp_id", "instance_id"],
-            )
+            if metric_context is None:
+                metric_context = MetricContext(
+                    rank=rank,
+                    rank_in_dp=rank_in_dp,
+                    dp_rank=dp_rank,
+                    inst_id=inst_id,
+                    is_router=is_router,
+                )
+            self.metric_context = metric_context
+            runtime = get_active_metrics_runtime()
+            if runtime is None:
+                raise RuntimeError(
+                    "Prometheus metrics collector requires an active metrics runtime context"
+                )
+            metric_definitions = raw_metrics_for_context(metric_context)
+            metrics = runtime.registry.get_all_for_context(metric_context)
 
-            self.cuda_total_bytes.labels(
-                rank=rank, dp_id=dp_id, instance_id=instance_id
-            ).set(0)
-            self.cuda_used_bytes.labels(
-                rank=rank, dp_id=dp_id, instance_id=instance_id
-            ).set(0)
-            self.torch_allocated_bytes.labels(
-                rank=rank, dp_id=dp_id, instance_id=instance_id
-            ).set(0)
-            self.torch_reserved_bytes.labels(
-                rank=rank, dp_id=dp_id, instance_id=instance_id
-            ).set(0)
-
-            # --- Per-dp metrics (throughput, task counts)
-            if self.is_dp_metrics_rank:
-                self.total_generated_tokens = Counter(
-                    "chitu_total_generated_tokens",
-                    "Total tokens generated by executor",
-                    ["rank", "dp_id", "instance_id"],
+            for metric in metric_definitions:
+                prometheus_metric = metrics[metric.name]
+                attr_name = _COLLECTOR_ATTR_BY_METRIC_NAME.get(metric.name)
+                if attr_name is not None:
+                    setattr(self, attr_name, prometheus_metric)
+                if metric.name not in _COLLECTOR_ZERO_INIT_METRICS:
+                    continue
+                labeled_metric = prometheus_metric.labels(
+                    rank=rank, dp_id=dp_rank, instance_id=inst_id
                 )
-                self.total_prompt_tokens = Counter(
-                    "chitu_total_prompt_tokens",
-                    "Total prompt tokens processed by executor",
-                    ["rank", "dp_id", "instance_id"],
-                )
-                self.total_hit_tokens = Counter(
-                    "chitu_total_hit_tokens",
-                    "total prompt tokens hit by prefix caching",
-                    ["rank", "dp_id", "instance_id"],
-                )
-                self.total_task_evictions = Counter(
-                    "chitu_total_task_evictions",
-                    "Total number of tasks evicted due to insufficient KV cache",
-                    ["rank", "dp_id", "instance_id"],
-                )
-                self.mtp_proposed_tokens = Counter(
-                    "chitu_mtp_proposed_tokens",
-                    "Total MTP proposed tokens (mtp_size-1 per task per decode step)",
-                    ["rank", "dp_id", "instance_id"],
-                )
-                self.mtp_accepted_tokens = Counter(
-                    "chitu_mtp_accepted_tokens",
-                    "Total MTP accepted tokens after verification",
-                    ["rank", "dp_id", "instance_id"],
-                )
-                self.running_requests = Gauge(
-                    "chitu_running_requests",
-                    "Number of currently running requests",
-                    ["rank", "dp_id", "instance_id"],
-                )
-                self.waiting_requests = Gauge(
-                    "chitu_waiting_requests",
-                    "Number of currently waiting requests",
-                    ["rank", "dp_id", "instance_id"],
-                )
-                self.total_generated_tokens.labels(
-                    rank=rank, dp_id=dp_id, instance_id=instance_id
-                ).inc(0)
-                self.total_prompt_tokens.labels(
-                    rank=rank, dp_id=dp_id, instance_id=instance_id
-                ).inc(0)
-                self.total_hit_tokens.labels(
-                    rank=rank, dp_id=dp_id, instance_id=instance_id
-                ).inc(0)
-                self.total_task_evictions.labels(
-                    rank=rank, dp_id=dp_id, instance_id=instance_id
-                ).inc(0)
-                self.mtp_proposed_tokens.labels(
-                    rank=rank, dp_id=dp_id, instance_id=instance_id
-                ).inc(0)
-                self.mtp_accepted_tokens.labels(
-                    rank=rank, dp_id=dp_id, instance_id=instance_id
-                ).inc(0)
-                self.running_requests.labels(
-                    rank=rank, dp_id=dp_id, instance_id=instance_id
-                ).set(0)
-                self.waiting_requests.labels(
-                    rank=rank, dp_id=dp_id, instance_id=instance_id
-                ).set(0)
-            if self.is_main_rank:
-                self.prealloc_blocks = Gauge(
-                    "chitu_prealloc_blocks",
-                    "Number of pre-allocated blocks for PD disaggrigation",
-                    ["rank", "dp_id", "instance_id"],
-                )
+                if metric.type == MetricType.COUNTER:
+                    labeled_metric.inc(0)
+                elif metric.type == MetricType.GAUGE:
+                    labeled_metric.set(0)
+            self._initialize_common_labeled_metrics(metric_context)
             # init kv cache and prealloc blocks via update_kvcache_usage
-            self.update_kvcache_usage()
+            self._update_kvcache_usage()
 
-            try:
-                ip = get_local_ip()
-            except Exception as e:
-                logger.warning(f"Failed to get local IP: {e}, use 127.0.0.1 as default")
-                ip = "127.0.0.1"
-            port = get_free_port()
-            self.collector_server, self.collector_thread = start_http_server(
-                port
-            )  # Prometheus serve pull data from this server
-            self.addr = f"{ip}:{port}"
-            logger.info(f"Prometheus metrics server started on addr {self.addr}")
+            if runtime.start_http_server:
+                try:
+                    ip = get_local_ip()
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to get local IP: {e}, use 127.0.0.1 as default"
+                    )
+                    ip = "127.0.0.1"
+                port = get_free_port()
+                self.collector_server, self.collector_thread = start_http_server(
+                    port
+                )  # Prometheus serve pull data from this server
+                self.ip = ip
+                self.port = port
+                logger.info(f"Prometheus metrics server started on addr {self.addr}")
+            else:
+                self.ip = "127.0.0.1"
+                self.port = 0
             atexit.register(PrometheusMetricsCollector.stop_instance)
 
         except Exception as e:
             logger.error(f"Failed to start Prometheus metrics collector: {e}")
             raise
 
+    @property
+    def addr(self) -> Optional[str]:
+        if self.ip is None or self.port is None:
+            return None
+        return f"{self.ip}:{self.port}"
+
+    def _initialize_common_labeled_metrics(self, metric_context: MetricContext) -> None:
+        runtime = get_active_metrics_runtime()
+        if runtime is None:
+            raise RuntimeError("Prometheus metrics collector is not initialized")
+        if metric_context.inst_role in {"prefill", "decode"}:
+            role = metric_context.inst_role
+            runtime.registry.get("chitu_kv_transfer_failures_total").labels(
+                role=role,
+                instance_id=str(metric_context.inst_id),
+                rank=str(metric_context.rank),
+            ).inc(0)
+            runtime.registry.get("chitu_completed_requests_total").labels(
+                role=role,
+                instance_id=str(metric_context.inst_id),
+                rank=str(metric_context.rank),
+            ).inc(0)
+        if metric_context.is_router:
+            for stage in (
+                "ttft_router",
+                "ttft_pd_router",
+                "ttft_scheduler",
+                "ttft_pd_prefill",
+                "ttft_pd_decode_incoming",
+                "ttft_pd_decode_prealloc",
+            ):
+                _service_metric("chitu_request_timeouts_total").labels(stage=stage).inc(
+                    0
+                )
+            _service_metric("chitu_router_pending_requests").set(0)
+
+    @classmethod
+    def _metric_attr_or_none(cls, metric_name: str, attr_name: str):
+        if get_active_metrics_runtime() is None:
+            return None, None
+        collector = cls.get_instance()
+        if not collector:
+            raise RuntimeError("Prometheus metrics collector is not initialized")
+        if metric_name not in {
+            metric.name for metric in raw_metrics_for_context(collector.metric_context)
+        }:
+            return collector, None
+        metric = getattr(collector, attr_name)
+        if metric is None:
+            raise RuntimeError(
+                f"Metric {metric_name} is selected but not initialized for rank={collector.rank} instance={collector.instance_id}"
+            )
+        return collector, metric
+
     @classmethod
     def inc_generated_tokens(cls, count: int = 1):
         if count < 0:
             return
 
-        collector = cls.get_instance()
-        if not collector or not collector.total_generated_tokens:
+        collector, metric = cls._metric_attr_or_none(
+            "chitu_total_generated_tokens", "total_generated_tokens"
+        )
+        if collector is None or metric is None:
             return
         try:
-            collector.total_generated_tokens.labels(
+            metric.labels(
                 rank=collector.rank,
                 dp_id=collector.dp_id,
                 instance_id=collector.instance_id,
@@ -436,16 +509,21 @@ class PrometheusMetricsCollector:
         if proposed <= 0:
             return
 
-        collector = cls.get_instance()
-        if not collector or not collector.mtp_proposed_tokens:
+        collector, proposed_metric = cls._metric_attr_or_none(
+            "chitu_mtp_proposed_tokens", "mtp_proposed_tokens"
+        )
+        _, accepted_metric = cls._metric_attr_or_none(
+            "chitu_mtp_accepted_tokens", "mtp_accepted_tokens"
+        )
+        if collector is None or proposed_metric is None or accepted_metric is None:
             return
         try:
-            collector.mtp_proposed_tokens.labels(
+            proposed_metric.labels(
                 rank=collector.rank,
                 dp_id=collector.dp_id,
                 instance_id=collector.instance_id,
             ).inc(proposed)
-            collector.mtp_accepted_tokens.labels(
+            accepted_metric.labels(
                 rank=collector.rank,
                 dp_id=collector.dp_id,
                 instance_id=collector.instance_id,
@@ -478,11 +556,13 @@ class PrometheusMetricsCollector:
         if count < 0:
             return
 
-        collector = cls.get_instance()
-        if not collector or not collector.total_prompt_tokens:
+        collector, metric = cls._metric_attr_or_none(
+            "chitu_total_prompt_tokens", "total_prompt_tokens"
+        )
+        if collector is None or metric is None:
             return
         try:
-            collector.total_prompt_tokens.labels(
+            metric.labels(
                 rank=collector.rank,
                 dp_id=collector.dp_id,
                 instance_id=collector.instance_id,
@@ -495,12 +575,14 @@ class PrometheusMetricsCollector:
         if count < 0:
             return
 
-        collector = cls.get_instance()
-        if not collector or not collector.total_hit_tokens:
+        collector, metric = cls._metric_attr_or_none(
+            "chitu_total_hit_tokens", "total_hit_tokens"
+        )
+        if collector is None or metric is None:
             return
 
         try:
-            collector.total_hit_tokens.labels(
+            metric.labels(
                 rank=collector.rank,
                 dp_id=collector.dp_id,
                 instance_id=collector.instance_id,
@@ -511,20 +593,25 @@ class PrometheusMetricsCollector:
     @classmethod
     def update_task_counts(cls):
         """Update running/waiting request count metrics."""
-        collector = cls.get_instance()
-        if not collector or not collector.running_requests:
+        collector, running_metric = cls._metric_attr_or_none(
+            "chitu_running_requests", "running_requests"
+        )
+        _, waiting_metric = cls._metric_attr_or_none(
+            "chitu_waiting_requests", "waiting_requests"
+        )
+        if collector is None or running_metric is None or waiting_metric is None:
             return
         try:
             if collector.is_main_rank:
                 running, waiting = count_tasks_for_dp_rank(collector.dp_id)
             else:
                 running, waiting = count_tasks_non_dp()
-            collector.running_requests.labels(
+            running_metric.labels(
                 rank=collector.rank,
                 dp_id=collector.dp_id,
                 instance_id=collector.instance_id,
             ).set(running)
-            collector.waiting_requests.labels(
+            waiting_metric.labels(
                 rank=collector.rank,
                 dp_id=collector.dp_id,
                 instance_id=collector.instance_id,
@@ -532,46 +619,60 @@ class PrometheusMetricsCollector:
         except Exception as e:
             logger.error(f"update_task_counts failed: {e}")
 
+    def _update_kvcache_usage(self):
+        if Backend.cache_dict is None or "main" not in Backend.cache_dict:
+            return
+        if not self.total_blocks or not self.used_blocks or not self.kv_cache_usage:
+            raise RuntimeError(
+                f"KV cache metrics are not collected for rank={self.rank} instance={self.instance_id}"
+            )
+
+        kvcache_stats_dict = kvcache_stats(self.is_main_rank, self.dp_id)
+        for dp_id in kvcache_stats_dict:
+            rank = get_dp_group().rank_list[dp_id]
+            total_blocks, used_blocks, kvcache_usage = kvcache_stats_dict[dp_id]
+            self.total_blocks.labels(
+                rank=rank, dp_id=dp_id, instance_id=self.instance_id
+            ).set(total_blocks)
+            self.used_blocks.labels(
+                rank=rank, dp_id=dp_id, instance_id=self.instance_id
+            ).set(used_blocks)
+            if kvcache_usage >= 0:
+                self.kv_cache_usage.labels(
+                    rank=rank, dp_id=dp_id, instance_id=self.instance_id
+                ).set(kvcache_usage)
+            else:
+                logger.error(
+                    f"Unexpected {type(Backend.cache_dict['main']).__name__}.num_blocks({total_blocks}), update_kvcache_usage failed. "
+                )
+        if self.prealloc_blocks is not None:
+            prealloc_blocks_dict = get_prealloc_blocks(self.dp_size)
+            if prealloc_blocks_dict:
+                for dp_id in prealloc_blocks_dict:
+                    rank = get_dp_group().rank_list[dp_id]
+                    prealloc_blocks = prealloc_blocks_dict[dp_id]
+                    self.prealloc_blocks.labels(
+                        rank=rank, dp_id=dp_id, instance_id=self.instance_id
+                    ).set(prealloc_blocks)
+
     @classmethod
     def update_kvcache_usage(cls):
         """Update KV cache usage metrics."""
-        collector = cls.get_instance()
-        if not collector or Backend.cache_dict is None:
+        collector, metric = cls._metric_attr_or_none(
+            "chitu_kv_cache_usage_ratio", "kv_cache_usage"
+        )
+        if collector is None or metric is None:
             return
 
         try:
-            kvcache_stats_dict = kvcache_stats(collector.is_main_rank, collector.dp_id)
-            for dp_id in kvcache_stats_dict:
-                rank = get_dp_group().rank_list[dp_id]
-                total_blocks, used_blocks, kvcache_usage = kvcache_stats_dict[dp_id]
-                collector.total_blocks.labels(
-                    rank=rank, dp_id=dp_id, instance_id=collector.instance_id
-                ).set(total_blocks)
-                collector.used_blocks.labels(
-                    rank=rank, dp_id=dp_id, instance_id=collector.instance_id
-                ).set(used_blocks)
-                if kvcache_usage >= 0:
-                    collector.kv_cache_usage.labels(
-                        rank=rank, dp_id=dp_id, instance_id=collector.instance_id
-                    ).set(kvcache_usage)
-                else:
-                    logger.error(
-                        f"Unexpected {type(Backend.cache_dict['main']).__name__}.num_blocks({total_blocks}), update_kvcache_usage failed. "
-                    )
-            if collector.prealloc_blocks is not None:
-                prealloc_blocks_dict = get_prealloc_blocks(collector.dp_size)
-                if prealloc_blocks_dict:
-                    for dp_id in prealloc_blocks_dict:
-                        rank = get_dp_group().rank_list[dp_id]
-                        prealloc_blocks = prealloc_blocks_dict[dp_id]
-                        collector.prealloc_blocks.labels(
-                            rank=rank, dp_id=dp_id, instance_id=collector.instance_id
-                        ).set(prealloc_blocks)
+            collector._update_kvcache_usage()
         except Exception as e:
             logger.error(f"update_kvcache_usage failed: {e}")
 
     @classmethod
     def update_GPU_usage(cls):
+        if get_active_metrics_runtime() is None:
+            return
         if Backend.cache_dict is None:
             return
 
@@ -579,7 +680,16 @@ class PrometheusMetricsCollector:
 
         collector = cls.get_instance()
         if not collector:
-            return
+            raise RuntimeError("Prometheus metrics collector is not initialized")
+        if (
+            not collector.cuda_total_bytes
+            or not collector.cuda_used_bytes
+            or not collector.torch_allocated_bytes
+            or not collector.torch_reserved_bytes
+        ):
+            raise RuntimeError(
+                f"GPU memory metrics are not collected for rank={collector.rank} instance={collector.instance_id}"
+            )
 
         try:
             device = Backend.cache_dict["main"].device
@@ -628,12 +738,13 @@ class PrometheusMetricsCollector:
     @classmethod
     def inc_task_eviction(cls):
         """Increment task eviction counter"""
-        collector = cls.get_instance()
-        if not collector or not collector.total_task_evictions:
+        collector, metric = cls._metric_attr_or_none(
+            "chitu_total_task_evictions", "total_task_evictions"
+        )
+        if collector is None or metric is None:
             return
-
         try:
-            collector.total_task_evictions.labels(
+            metric.labels(
                 rank=collector.rank,
                 dp_id=collector.dp_id,
                 instance_id=collector.instance_id,
@@ -643,39 +754,33 @@ class PrometheusMetricsCollector:
             pass
 
     @classmethod
-    def stop_instance(cls):
+    def _stop_instance_resources(cls):
         cls._shutting_down = True
         with cls._lock:
-            if cls._instance is None:
-                return
-
             instance = cls._instance
+            if instance is None:
+                cls._shutting_down = False
+                return
             try:
-                # Stop HTTP server
                 if instance.collector_server:
                     instance.collector_server.shutdown()
                     instance.collector_server.server_close()
-
-                # Wait for thread to finish
                 if instance.collector_thread:
                     instance.collector_thread.join(timeout=5.0)
-
-                # Unregister metrics
-                for attr_name in dir(instance):
-                    attr = getattr(instance, attr_name, None)
-                    if isinstance(attr, (Counter, Gauge, Histogram)):
-                        try:
-                            REGISTRY.unregister(attr)
-                        except Exception as e:
-                            logger.debug(
-                                f"Metric {attr_name} already unregistered or failed: {e}"
-                            )
-
                 logger.info(
-                    f"[rank {instance.rank}]: Prometheus metrics collector stopped and cleaned up"
+                    f"[rank {instance.rank}]: Prometheus metrics collector stopped"
                 )
             except Exception as e:
-                logger.error(f"Error during cleanup: {e}")
+                logger.error(f"Error during collector cleanup: {e}")
             finally:
                 cls._instance = None
+                cls.addrs = None
                 cls._shutting_down = False
+
+    @classmethod
+    def stop_instance(cls):
+        runtime = get_active_metrics_runtime()
+        if runtime is not None:
+            close_active_metrics_runtime()
+            return
+        cls._stop_instance_resources()

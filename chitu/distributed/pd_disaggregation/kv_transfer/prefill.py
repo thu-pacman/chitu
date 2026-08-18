@@ -5,6 +5,7 @@
 import os
 import concurrent.futures
 import threading
+import time
 from logging import getLogger
 
 import numpy as np
@@ -14,6 +15,10 @@ from chitu.backend import Backend
 from chitu.kv_cache.kv_cache import PagedKVCache
 from chitu.task import PackedTasksResult
 from chitu.trace import Trace
+from chitu.metrics.prometheus_collector import (
+    inc_kv_transfer_failures,
+    observe_kv_transfer,
+)
 from .base import KVManagerBase, DisaggregationMode
 from .endpoint import PrefillEndpoints, DecodeEndpoints
 from .protocol import (
@@ -261,19 +266,26 @@ class KVManagerPrefill(KVManagerBase):
 
             event.synchronize()
 
+            transfer_start = time.monotonic()
             plan.execute_send(self.transfer_engine.engine)
+            transfer_duration = time.monotonic() - transfer_start
+            rank_bytes = plan.total_bytes_per_session()
+            observe_kv_transfer(
+                size_bytes=sum(rank_bytes.values()), duration_s=transfer_duration
+            )
             first_token = int(first_token.item()) if first_token is not None else 0
 
             msg = RankTransferDone(
                 req_id=req_id,
                 first_token=first_token,
-                rank_bytes=plan.total_bytes_per_session(),
+                rank_bytes=rank_bytes,
             )
             payload = ProtocolSerializer.pack(msg)
             self.endpoints.rank_transfer_done.send(payload)
 
             logger.debug(f"transfer_worker.done {req_id=}")
         except Exception:
+            inc_kv_transfer_failures("prefill")
             logger.exception(
                 f"transfer_worker fatal error req_id={req_id}, exiting process"
             )

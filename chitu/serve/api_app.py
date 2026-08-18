@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 from chitu.serve import anthropic_api, openai_api, responses_api
 from chitu.serve.api_docs import DocField
 
-DOC_GENERATION = os.environ.get("CHITU_HTTP_API_DOCS") == "1"
+DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
 
 if not DOC_GENERATION:
     from chitu.backend import Backend
