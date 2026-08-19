@@ -22,6 +22,7 @@ from chitu.device_type import is_nvidia, has_accelerator
 from chitu.executor import Executor
 from chitu.global_vars import (
     get_global_args,
+    get_multi_inst_config,
     get_slot_handle,
     is_classic_pd_disagg,
     is_independent_multi_inst,
@@ -49,13 +50,13 @@ from chitu.utils import (
     gen_req_id,
     try_import_and_setup_torch_npu,
     ceil_div,
-    gather_str_to_dst_rank,
     get_chitu_bool_env,
 )
-from chitu.distributed.parallel_state import get_pp_group, get_world_group
+from chitu.distributed.parallel_state import get_pp_group
 from chitu.logging_utils import setup_chitu_logging
 from chitu.metrics import (
     PrometheusMetricsCollector,
+    metrics_runtime_context,
     start_prometheus_server_and_metrics_monitor,
     stop_metrics_monitor,
 )
@@ -63,9 +64,9 @@ from chitu.ops.utils import (
     clear_observed_op_impl_selections,
     emit_observed_op_impl_summary,
 )
-from chitu.distributed.comm_group import SingletonGroupPlaceholder
 from chitu.distributed.coordinator import get_endpoint, set_endpoint
 from chitu.distributed.pd_disaggregation.pd_scheduler import get_pd_scheduler_instance
+from chitu.boot.arg_utils import calculate_parallelism_sizes
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
 from chitu.dp_request_router import (
@@ -1012,13 +1013,28 @@ def _warmup_backend_direct(
         device="cuda",
         dtype=torch.int64,
     )
-    hiddens = None
+    prefill_hiddens = None
+    decode_hiddens = None
     if not get_pp_group().is_first_rank:
-        hiddens = torch.randn(
-            Backend.executor.get_payload_shape(local_max_bs),
-            device="cuda",
-            dtype=Backend.executor.get_payload_dtype(),
-        )
+        payload_dtype = Backend.executor.get_payload_dtype()
+        if not skip_model_prefill:
+            # Match executor._prepare_hiddens(): PP prefill receives CP-local
+            # hidden rows, while direct warmup bypasses the real pipe receiver.
+            prefill_tokens = Backend.model.cp_context.compute_pp_num_tokens(
+                local_max_bs
+            )
+            prefill_hiddens = torch.randn(
+                Backend.executor.get_payload_shape(prefill_tokens),
+                device="cuda",
+                dtype=payload_dtype,
+            )
+        if not skip_model_decode:
+            # Decode is not CP-split; each PP stage receives the full local batch.
+            decode_hiddens = torch.randn(
+                Backend.executor.get_payload_shape(local_max_bs),
+                device="cuda",
+                dtype=payload_dtype,
+            )
     all_tasks = PackedTasksBase(local_max_bs, task_ids=req_ids)
     all_tasks.new_cache_ids_list = _build_direct_warmup_new_cache_ids_list(
         local_max_bs,
@@ -1048,7 +1064,7 @@ def _warmup_backend_direct(
         Backend.model.mtp_accept_indices.set(mtp_accept_indices)
 
     if not skip_model_prefill:
-        Backend.model.prefill(tokens, hiddens, output_token_offsets)
+        Backend.model.prefill(tokens, prefill_hiddens, output_token_offsets)
 
     # Decode steps
     if not skip_model_decode:
@@ -1079,7 +1095,7 @@ def _warmup_backend_direct(
             if get_pp_group().is_first_rank:
                 payload = tokens[:curr_bs]
             else:
-                payload = hiddens[:curr_bs]
+                payload = decode_hiddens[:curr_bs]
 
             _ = Backend.model.decode(payload)
 
@@ -1266,25 +1282,38 @@ def chitu_init(args):
         PackedTasks.configure(max_num_tasks=args.infer.max_batch_size)
         logger.info("Chitu has been initialized")
 
+        metrics_runtime_context(
+            PrometheusMetricsCollector.metric_context_from_distributed()
+        ).__enter__()
         collector = PrometheusMetricsCollector.get_instance(is_create=True)
+        assert collector.ip is not None
+        assert collector.port is not None
+        assert collector.addr is not None
+        set_endpoint(
+            f"instance_{collector.instance_id}_rank_{collector.rank}",
+            "prometheus_collector_port",
+            collector.ip,
+            collector.port,
+        )
+        PrometheusMetricsCollector.addrs = [collector.addr]
 
-        collector_addrs = PrometheusMetricsCollector.addrs
-        if type(get_world_group().gpu_group) != SingletonGroupPlaceholder:
-            try:
-                collector_addrs = gather_str_to_dst_rank(
-                    collector_addrs[0], dst=0, group=get_world_group().gpu_group
-                )
-            except Exception as e:
-                logger.error(
-                    f"An error occurred while gathering collector addresses to rank 0. Prometheus will monitor metrics only on rank 0: {e}"
-                )
-        PrometheusMetricsCollector.addrs = collector_addrs
-
-        logger.info(f"Prometheus collector addresses:{collector_addrs}")
+        logger.info(f"Prometheus collector address:{collector.addr}")
 
         # Only rank 0 monitors (it has all TaskPool data)
         should_start_monitor = rank == 0 and args.multi_inst.n_insts == 1
         if should_start_monitor:
+            launch_timeout = float(args.multi_inst.router.launch_timeout)
+            collector_addrs = []
+            world_size = calculate_parallelism_sizes(
+                get_multi_inst_config(collector.instance_id)
+            ).world_size
+            for endpoint_rank in range(world_size):
+                ip, port = get_endpoint(
+                    f"instance_{collector.instance_id}_rank_{endpoint_rank}",
+                    "prometheus_collector_port",
+                    timeout=launch_timeout,
+                )
+                collector_addrs.append(f"{ip}:{port}")
             start_prometheus_server_and_metrics_monitor(collector_addrs)
     except Exception as e:
         if not torch.distributed.is_initialized():

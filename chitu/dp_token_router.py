@@ -27,6 +27,7 @@ from chitu.dp_router import (
     set_global_token_router,
     remove_request_everywhere,
 )
+from chitu.metrics.prometheus_collector import observe_e2e_duration
 
 logger = logging.getLogger(__name__)
 
@@ -108,9 +109,9 @@ class TokenRouter:
         self.active_requests[req.request_id] = req
 
         # Update active requests gauge
-        from chitu.metrics.prometheus_collector import chitu_active_requests
+        from chitu.metrics.prometheus_collector import set_active_requests
 
-        chitu_active_requests.labels(role="decode").set(len(self.active_requests))
+        set_active_requests("decode", len(self.active_requests))
         logger.debug(
             f"Token Router: Request {req.request_id} registered, active requests: {len(self.active_requests)}"
         )
@@ -131,7 +132,10 @@ class TokenRouter:
             request.finish_reason = finish_reason
         if num_hit_tokens is not None:
             request.num_hit_tokens = num_hit_tokens
+        was_finished = request.finished
         request.stop_stream(error=error)
+        if not was_finished and request.completion_time > 0:
+            observe_e2e_duration(request.completion_time - request.start_time)
         remove_request_everywhere(request.request_id)
 
     async def _recv_loop(self, instance_id: int, sock):
@@ -262,9 +266,9 @@ class TokenRouter:
         elif token_data.get("type") == "finish":
             finish_reason = token_data.get("finish_reason", "stop")
             # Update active requests gauge
-            from chitu.metrics.prometheus_collector import chitu_active_requests
+            from chitu.metrics.prometheus_collector import set_active_requests
 
-            chitu_active_requests.labels(role="decode").set(len(self.active_requests))
+            set_active_requests("decode", len(self.active_requests))
             logger.debug(
                 f"Token Router: Request {request_id} removed from active_requests on finish"
             )

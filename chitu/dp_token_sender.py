@@ -152,6 +152,8 @@ class DPTokenSender:
             _created_ts = getattr(task, "_pd_created_ts", None)
             if _created_ts is not None:
                 observe_ttft(time.time() - _created_ts)
+            else:
+                observe_ttft(time.monotonic() - task.req.start_time)
             logger.debug(
                 f"DP Token Sender: [request {request_id}] first token, prompt_len={task.req.prompt_len}, tokens={tokens}"
             )

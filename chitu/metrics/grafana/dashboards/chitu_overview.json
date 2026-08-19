@@ -57,7 +57,7 @@
       "title": "MTP Hit Rate (per dp rank)",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 9 },
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
@@ -75,10 +75,31 @@
       ]
     },
     {
+      "title": "Prefix Cache Hit Rate (per dp rank)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0, "max": 1,
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "chitu_total_hit_tokens_total{job=\"chitu_service\"} / clamp_min(chitu_total_prompt_tokens_total{job=\"chitu_service\"}, 1)",
+          "legendFormat": "instance{{instance_id}} dp{{dp_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
       "title": "Task Eviction Rate (per dp rank)",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 9 },
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
@@ -168,23 +189,28 @@
       "targets": [
         {
           "expr": "chitu_cuda_used_bytes{job=\"chitu_service\"}",
-          "legendFormat": "used instance{{instance_id}} dp{{dp_id}} rank{{rank}}",
+          "legendFormat": "cuda used instance{{instance_id}} dp{{dp_id}} rank{{rank}}",
           "refId": "A"
         },
         {
           "expr": "chitu_cuda_total_bytes{job=\"chitu_service\"}",
-          "legendFormat": "total instance{{instance_id}} dp{{dp_id}} rank{{rank}}",
+          "legendFormat": "cuda total instance{{instance_id}} dp{{dp_id}} rank{{rank}}",
           "refId": "B"
         },
         {
           "expr": "chitu_torch_allocated_bytes{job=\"chitu_service\"}",
-          "legendFormat": "torch instance{{instance_id}} dp{{dp_id}} rank{{rank}}",
+          "legendFormat": "torch allocated instance{{instance_id}} dp{{dp_id}} rank{{rank}}",
           "refId": "C"
+        },
+        {
+          "expr": "chitu_torch_reserved_bytes{job=\"chitu_service\"}",
+          "legendFormat": "torch reserved instance{{instance_id}} dp{{dp_id}} rank{{rank}}",
+          "refId": "D"
         }
       ]
     },
     {
-      "title": "Requests",
+      "title": "Requests & Latency",
       "type": "row",
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 },
       "collapsed": false,
@@ -235,15 +261,65 @@
       "targets": [
         {
           "expr": "rate(chitu_completed_requests_total{job=\"chitu_service\"}[$__rate_interval])",
-          "legendFormat": "{{role}}",
+          "legendFormat": "instance{{instance_id}} rank{{rank}} {{role}}",
           "refId": "A"
+        }
+      ]
+    },
+    {
+      "title": "Time To First Token (P50 / P95)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 35 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(chitu_time_to_first_token_seconds_bucket{job=\"chitu_service\"}[$__rate_interval])) by (le))",
+          "legendFormat": "TTFT P50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(chitu_time_to_first_token_seconds_bucket{job=\"chitu_service\"}[$__rate_interval])) by (le))",
+          "legendFormat": "TTFT P95",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "title": "E2E Request Duration (P50 / P95)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 35 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(chitu_e2e_request_duration_seconds_bucket{job=\"chitu_service\"}[$__rate_interval])) by (le))",
+          "legendFormat": "E2E P50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(chitu_e2e_request_duration_seconds_bucket{job=\"chitu_service\"}[$__rate_interval])) by (le))",
+          "legendFormat": "E2E P95",
+          "refId": "B"
         }
       ]
     },
     {
       "title": "PD Disaggregation",
       "type": "row",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 },
       "collapsed": false,
       "panels": []
     },
@@ -251,7 +327,7 @@
       "title": "PD Stage Duration (P50 / P95)",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
@@ -276,7 +352,7 @@
       "title": "KV Transfer",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
@@ -286,18 +362,18 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, rate(chitu_kv_transfer_duration_seconds_bucket{job=\"chitu_service\"}[$__rate_interval]))",
-          "legendFormat": "duration P50",
+          "expr": "histogram_quantile(0.50, sum(rate(chitu_kv_transfer_duration_seconds_bucket{job=\"chitu_service\"}[$__rate_interval])) by (le, instance_id, rank))",
+          "legendFormat": "instance{{instance_id}} rank{{rank}} duration P50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, rate(chitu_kv_transfer_duration_seconds_bucket{job=\"chitu_service\"}[$__rate_interval]))",
-          "legendFormat": "duration P95",
+          "expr": "histogram_quantile(0.95, sum(rate(chitu_kv_transfer_duration_seconds_bucket{job=\"chitu_service\"}[$__rate_interval])) by (le, instance_id, rank))",
+          "legendFormat": "instance{{instance_id}} rank{{rank}} duration P95",
           "refId": "B"
         },
         {
-          "expr": "chitu_kv_transfer_speed_gbps{job=\"chitu_service\"}",
-          "legendFormat": "speed (GB/s)",
+          "expr": "sum(rate(chitu_kv_transfer_size_bytes_sum{job=\"chitu_service\"}[$__rate_interval])) by (instance_id, rank) / clamp_min(sum(rate(chitu_kv_transfer_duration_seconds_sum{job=\"chitu_service\"}[$__rate_interval])) by (instance_id, rank), 1e-9)",
+          "legendFormat": "instance{{instance_id}} rank{{rank}} speed bytes/s",
           "refId": "C"
         }
       ]
@@ -306,7 +382,7 @@
       "title": "PD Queue Size",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 52 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -331,7 +407,7 @@
       "title": "Errors & Timeouts",
       "type": "timeseries",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 52 },
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
@@ -342,7 +418,7 @@
       "targets": [
         {
           "expr": "rate(chitu_kv_transfer_failures_total{job=\"chitu_service\"}[$__rate_interval])",
-          "legendFormat": "kv_failure {{role}}",
+          "legendFormat": "instance{{instance_id}} rank{{rank}} {{role}} kv_failure",
           "refId": "A"
         },
         {

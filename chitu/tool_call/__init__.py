@@ -11,7 +11,7 @@ from .type_def import (
     ToolConfig,
 )
 
-DOC_GENERATION = os.environ.get("CHITU_HTTP_API_DOCS") == "1"
+DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
 
 if not DOC_GENERATION:
     from .utils import (

@@ -41,11 +41,16 @@ from chitu.distributed.pd_disaggregation.pd_types import (
     SchedulerType,
 )
 from chitu.metrics.prometheus_collector import (
-    chitu_router_pending_requests,
     observe_pd_stage,
+    set_router_pending_requests,
 )
-from chitu.global_vars import get_global_args, get_multi_inst_ids_by_role
+from chitu.global_vars import (
+    get_global_args,
+    get_multi_inst_config,
+    get_multi_inst_ids_by_role,
+)
 from chitu.distributed.coordinator import set_endpoint, get_endpoint
+from chitu.boot.arg_utils import calculate_parallelism_sizes
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.task import UserRequest
 from chitu.testing.pd_utils import PDTestRunner
@@ -214,6 +219,7 @@ class PDRequestRouter(RequestRouter):
             self._heartbeat_monitor_task(),
             self._pd_coordination_task(),
             self._wait_for_pd_instances(),
+            self._prometheus_manager_task(),
         )
 
     async def _init_pd_sockets(self):
@@ -224,7 +230,7 @@ class PDRequestRouter(RequestRouter):
         need to initialize their model first, so wait up to `launch_timeout`
         seconds for each endpoint to be registered.
         """
-        launch_timeout = getattr(self.config, "launch_timeout", None)
+        launch_timeout = float(get_global_args().multi_inst.router.launch_timeout)
 
         # Create sockets to Prefill Schedulers
         for local_instance_id, info in self.prefill_schedulers.items():
@@ -487,26 +493,6 @@ class PDRequestRouter(RequestRouter):
                             stats.block_size,
                             stats.num_blocks,
                         )
-                    prometheus_collector_addrs = stats_dict.get(
-                        "prometheus_collector_addrs", []
-                    )
-                    if (
-                        self.collector_addrs.get(instance_id, None) is None
-                        and len(prometheus_collector_addrs) > 0
-                    ):
-                        logger.debug(
-                            f"[PD_ROUTER] received Prometheus collector addresses from {role} {local_instance_id} (instance {instance_id})"
-                        )
-                        self.collector_addrs[instance_id] = prometheus_collector_addrs
-                        prefill_instance_ids = get_multi_inst_ids_by_role("prefill")
-                        decode_instance_ids = get_multi_inst_ids_by_role("decode")
-                        all_scheduler_ids = prefill_instance_ids + decode_instance_ids
-                        if all(
-                            self.collector_addrs.get(instance_id, None) is not None
-                            for instance_id in all_scheduler_ids
-                        ):
-                            logger.info(f"[PD_ROUTER] starting Prometheus manager")
-                            self._start_prometheus_manager()
 
             except KeyError as e:
                 logger.error(f"[PD_ROUTER] missing field in stats data: {e}")
@@ -610,8 +596,39 @@ class PDRequestRouter(RequestRouter):
             self.pending_requests.append(pd_request)
 
         # Update router pending requests gauge
-        chitu_router_pending_requests.set(len(self.pending_pd_requests))
+        set_router_pending_requests(len(self.pending_pd_requests))
         logger.debug(f"[PD_STAGE][router.recv.end] req_id={request_id}")
+
+    def _discover_prometheus_collectors(self) -> None:
+        launch_timeout = float(get_global_args().multi_inst.router.launch_timeout)
+        all_scheduler_ids = get_multi_inst_ids_by_role(
+            "prefill"
+        ) + get_multi_inst_ids_by_role("decode")
+        for instance_id in all_scheduler_ids:
+            world_size = calculate_parallelism_sizes(
+                get_multi_inst_config(instance_id)
+            ).world_size
+            addrs = []
+            for rank in range(world_size):
+                ip, port = get_endpoint(
+                    f"instance_{instance_id}_rank_{rank}",
+                    "prometheus_collector_port",
+                    timeout=launch_timeout,
+                )
+                addrs.append(f"{ip}:{port}")
+            self.collector_addrs[instance_id] = addrs
+
+    def _collector_targets_ready(self) -> bool:
+        router_addrs = self.collector_addrs.get("router")
+        if not router_addrs:
+            return False
+        all_scheduler_ids = get_multi_inst_ids_by_role(
+            "prefill"
+        ) + get_multi_inst_ids_by_role("decode")
+        return all(
+            self.collector_addrs.get(instance_id) is not None
+            for instance_id in all_scheduler_ids
+        )
 
     async def _pd_request_processor_task(self):
         """PD request processing task"""
@@ -628,9 +645,7 @@ class PDRequestRouter(RequestRouter):
                         ):
                             pd_request.status = PDRequestStatus.FAILED
                             self.total_requests += 1
-                            chitu_router_pending_requests.set(
-                                len(self.pending_pd_requests)
-                            )
+                            set_router_pending_requests(len(self.pending_pd_requests))
                             continue
                         await self._process_pd_request(pd_request)
                     else:

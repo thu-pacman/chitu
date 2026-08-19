@@ -9,6 +9,7 @@ import numpy as np
 from chitu.backend import Backend
 from chitu.kv_cache.kv_cache import PagedKVCache
 from chitu.trace import Trace
+from chitu.metrics.prometheus_collector import inc_kv_transfer_failures
 
 from chitu.kv_cache.kv_cache import PagedKVCache
 
@@ -201,6 +202,7 @@ class KVManagerDecode(KVManagerBase):
                     f"req_id={msg.req_id}: transfer bytes mismatch "
                     f"for session {self.session_id}: sent={actual} recv_expected={expected}"
                 )
+                inc_kv_transfer_failures("decode")
 
         info.first_token = msg.first_token
         info.num_hit_tokens = msg.num_hit_tokens

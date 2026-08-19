@@ -18,10 +18,12 @@ from collections import defaultdict, deque, OrderedDict
 from dataclasses import dataclass, field
 from chitu.global_vars import (
     get_global_args,
+    get_multi_inst_config,
     is_classic_pd_disagg,
     is_independent_multi_inst,
 )
 from chitu.distributed.coordinator import set_endpoint, get_endpoint
+from chitu.boot.arg_utils import calculate_parallelism_sizes
 from chitu.boot.tcp_ip import get_local_ip
 import zmq
 import zmq.asyncio
@@ -34,7 +36,12 @@ from chitu.kv_cache.prefix_caching import (
     BlockIdentityChainBuilder,
 )
 from chitu.metrics import start_prometheus_server_and_metrics_monitor
-from chitu.metrics.prometheus_collector import inc_request_timeouts
+from chitu.metrics.prometheus_collector import (
+    PrometheusMetricsCollector,
+    inc_request_timeouts,
+    observe_e2e_duration,
+)
+from chitu.metrics.registry import get_active_metrics_runtime
 from chitu.dp_router import (
     get_request_router,
     get_token_router,
@@ -671,7 +678,8 @@ class RequestRouter:
         self.total_requests = 0
         self.total_tokens = 0
         self.start_time = time.time()
-        self.collector_addrs: dict[int, list[str]] = {}
+        self.collector_addrs: dict[int | str, list[str]] = {}
+        self.router_collector = None
         self._shutdown = False
         self._drain_complete: dict[int, bool] = {i: False for i in range(self._n_insts)}
         self._tasks: list[asyncio.Task] = []
@@ -731,6 +739,7 @@ class RequestRouter:
         self._tasks = [
             asyncio.create_task(self._stats_collector_task()),
             asyncio.create_task(self._request_processor_task()),
+            asyncio.create_task(self._prometheus_manager_task()),
             # asyncio.create_task(self._health_monitor_task()),
             # asyncio.create_task(self._heartbeat_monitor_task()),
         ]
@@ -743,7 +752,7 @@ class RequestRouter:
         # `instance_0`, `instance_1`, ... before the router connects. Instances
         # need to initialize their model first, so wait up to `launch_timeout`
         # seconds for each endpoint to be registered.
-        launch_timeout = getattr(self.config, "launch_timeout", None)
+        launch_timeout = float(get_global_args().multi_inst.router.launch_timeout)
         self._scheduler_addresses = []
         for instance_id in range(self._n_insts):
             ip, port = get_endpoint(
@@ -777,6 +786,38 @@ class RequestRouter:
         logger.info(
             f"[REQUEST_ROUTER] Listening for statistics: tcp://{stats_ip}:{stats_port}"
         )
+
+    async def _prometheus_manager_task(self):
+        if get_active_metrics_runtime() is None:
+            logger.info(
+                "Router metrics runtime is not active; Prometheus/Grafana startup is skipped"
+            )
+            return
+
+        try:
+            router_collector = PrometheusMetricsCollector.get_router_instance(
+                is_create=True
+            )
+            assert router_collector is not None
+            assert router_collector.ip is not None
+            assert router_collector.port is not None
+            assert router_collector.addr is not None
+            self.router_collector = router_collector
+            self.collector_addrs["router"] = [router_collector.addr]
+            set_endpoint(
+                "router",
+                "prometheus_collector_port",
+                router_collector.ip,
+                router_collector.port,
+            )
+            logger.info("Discovering Prometheus collector endpoints from coordinator")
+            await asyncio.to_thread(self._discover_prometheus_collectors)
+            logger.info(
+                f"Discovered Prometheus collector endpoints: {self.collector_addrs}"
+            )
+            await asyncio.to_thread(self._start_prometheus_manager)
+        except Exception:
+            logger.exception("Failed to start Prometheus/Grafana manager")
 
     async def _stats_collector_task(self):
         """Collect statistics from Enhanced Schedulers."""
@@ -817,21 +858,6 @@ class RequestRouter:
                         self._drain_complete[local_instance_id] = True
 
                     self.policy.update_stats(stats)
-                    prometheus_collector_addrs = stats_dict.get(
-                        "prometheus_collector_addrs", []
-                    )
-                    if (
-                        self.collector_addrs.get(local_instance_id, None) is None
-                        and len(prometheus_collector_addrs) > 0
-                    ):
-                        self.collector_addrs[local_instance_id] = (
-                            prometheus_collector_addrs
-                        )
-                        if all(
-                            self.collector_addrs.get(i, None) is not None
-                            for i in range(len(self._scheduler_addresses))
-                        ):
-                            self._start_prometheus_manager()
 
             except KeyError as e:
                 logger.error(f"Missing required field in stats data: {e}")
@@ -853,7 +879,10 @@ class RequestRouter:
         """Finish request before receiving stop signal."""
         if finish_reason is not None:
             request.finish_reason = finish_reason
+        was_finished = request.finished
         request.stop_stream(error=error)
+        if not was_finished and request.completion_time > 0:
+            observe_e2e_duration(request.completion_time - request.start_time)
         token_router = get_token_router()
         if token_router is not None:
             token_router.active_requests.pop(request.request_id, None)
@@ -1164,7 +1193,34 @@ class RequestRouter:
             "scheduler_stats": dict(self.policy.scheduler_stats),
         }
 
+    def _discover_prometheus_collectors(self) -> None:
+        launch_timeout = float(get_global_args().multi_inst.router.launch_timeout)
+        for instance_id in range(self._n_insts):
+            world_size = calculate_parallelism_sizes(
+                get_multi_inst_config(instance_id)
+            ).world_size
+            addrs = []
+            for rank in range(world_size):
+                ip, port = get_endpoint(
+                    f"instance_{instance_id}_rank_{rank}",
+                    "prometheus_collector_port",
+                    timeout=launch_timeout,
+                )
+                addrs.append(f"{ip}:{port}")
+            self.collector_addrs[instance_id] = addrs
+
+    def _collector_targets_ready(self) -> bool:
+        router_addrs = self.collector_addrs.get("router")
+        if not router_addrs:
+            return False
+        return all(
+            self.collector_addrs.get(instance_id) is not None
+            for instance_id in range(self._n_insts)
+        )
+
     def _start_prometheus_manager(self):
+        if not self._collector_targets_ready():
+            return
         start_prometheus_server_and_metrics_monitor(
             [addr for addr_list in self.collector_addrs.values() for addr in addr_list]
         )

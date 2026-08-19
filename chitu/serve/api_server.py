@@ -21,6 +21,8 @@ from chitu.global_vars import (
     is_independent_multi_inst,
     set_global_args,
 )
+from chitu.metrics.definitions import MetricContext
+from chitu.metrics.registry import metrics_runtime_context
 from chitu.serve.api_app import (
     DetokenizeRequest,
     ProfileRequest,
@@ -94,48 +96,50 @@ async def start_router_components_and_serve():
 
     logger.info("[ROUTER] Starting DP components...")
     try:
-        # Start DP components
-        await start_dp_components()
-        set_server_status(initialized=True)
-        logger.info(
-            "[ROUTER] DP components startup completed. Service status set to available, can accept inference requests"
-        )
-
-        # 大 Batch Size(>1024) 会 too many open files，这里是为了避免这个问题
-        try:
-            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-            target = int(os.getenv("NOFILE_SOFT_LIMIT", str(131072)))
-            new_soft = min(
-                max(soft, target), hard if hard != resource.RLIM_INFINITY else target
+        with metrics_runtime_context(MetricContext(is_router=True)):
+            # Start DP components
+            await start_dp_components()
+            set_server_status(initialized=True)
+            logger.info(
+                "[ROUTER] DP components startup completed. Service status set to available, can accept inference requests"
             )
-            if new_soft > soft:
-                resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
-                logger.info(
-                    f"[ROUTER] Raised RLIMIT_NOFILE soft from {soft} to {new_soft}"
+
+            # 大 Batch Size(>1024) 会 too many open files，这里是为了避免这个问题
+            try:
+                soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+                target = int(os.getenv("NOFILE_SOFT_LIMIT", str(131072)))
+                new_soft = min(
+                    max(soft, target),
+                    hard if hard != resource.RLIM_INFINITY else target,
                 )
-        except Exception as e:
-            logger.warning(f"[ROUTER] Failed to raise RLIMIT_NOFILE: {e}")
+                if new_soft > soft:
+                    resource.setrlimit(resource.RLIMIT_NOFILE, (new_soft, hard))
+                    logger.info(
+                        f"[ROUTER] Raised RLIMIT_NOFILE soft from {soft} to {new_soft}"
+                    )
+            except Exception as e:
+                logger.warning(f"[ROUTER] Failed to raise RLIMIT_NOFILE: {e}")
 
-        # Configure uvicorn with sane defaults for high-concurrency
-        backlog = int(os.getenv("UVICORN_BACKLOG", "10240"))
-        limit_conc = int(os.getenv("UVICORN_LIMIT_CONCURRENCY", "10240"))
-        keepalive = float(os.getenv("UVICORN_TIMEOUT_KEEP_ALIVE", "2"))
+            # Configure uvicorn with sane defaults for high-concurrency
+            backlog = int(os.getenv("UVICORN_BACKLOG", "10240"))
+            limit_conc = int(os.getenv("UVICORN_LIMIT_CONCURRENCY", "10240"))
+            keepalive = float(os.getenv("UVICORN_TIMEOUT_KEEP_ALIVE", "2"))
 
-        # Use uvicorn.Server instead of uvicorn.run to avoid event loop conflicts
-        config = uvicorn.Config(
-            app,
-            host=args.serve.host,
-            port=args.serve.port,
-            log_level="info",
-            access_log=True,
-            backlog=backlog,
-            limit_concurrency=limit_conc,
-            timeout_keep_alive=keepalive,
-        )
-        server = uvicorn.Server(config)
-        set_uvicorn_server(server)
-        # Run server in current event loop - use await instead of asyncio.run!
-        await server.serve()
+            # Use uvicorn.Server instead of uvicorn.run to avoid event loop conflicts
+            config = uvicorn.Config(
+                app,
+                host=args.serve.host,
+                port=args.serve.port,
+                log_level="info",
+                access_log=True,
+                backlog=backlog,
+                limit_concurrency=limit_conc,
+                timeout_keep_alive=keepalive,
+            )
+            server = uvicorn.Server(config)
+            set_uvicorn_server(server)
+            # Run server in current event loop - use await instead of asyncio.run!
+            await server.serve()
 
     except Exception as e:
         logger.error(f"[ROUTER] DP components and HTTP service startup failed: {e}")

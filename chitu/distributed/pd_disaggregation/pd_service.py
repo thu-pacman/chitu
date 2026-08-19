@@ -111,8 +111,6 @@ class PDSchedulerService:
         self.ready_event: Optional[threading.Event] = None
         self.external_compute_loop = False
 
-        self.send_collector_addrs = False
-
         # Bind the request socket and register its endpoint in the coordinator
         # before initializing the scheduler. The scheduler initialization
         # creates the KVManager, which contacts the router's coordination
@@ -568,13 +566,6 @@ class PDSchedulerService:
             "heartbeat": Backend.state != BackendState.Terminated,
             "terminated": Backend.state == BackendState.Terminated,
         }
-        if (
-            not self.send_collector_addrs
-            and PrometheusMetricsCollector.addrs is not None
-        ):
-            stats["prometheus_collector_addrs"] = PrometheusMetricsCollector.addrs
-            self.send_collector_addrs = True
-
         if self.scheduler:
             pd_stats = self.scheduler.get_pd_stats()
             stats.update(pd_stats)

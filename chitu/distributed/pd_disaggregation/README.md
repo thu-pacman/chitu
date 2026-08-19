@@ -601,44 +601,7 @@ CHITU_CMDLINE: |
 
 ### Prometheus 指标（`chitu/metrics/prometheus_collector.py`）
 
-每个 P/D 进程启动独立的 Prometheus HTTP exporter。
-
-**延迟分布（Histogram）**
-
-
-| 指标名                                  | 标签              | 说明                                        |
-| ------------------------------------ | --------------- | ----------------------------------------- |
-| `chitu_pd_stage_duration_seconds`    | `role`, `stage` | 各阶段延迟（如 `router.recv`, `prefill.kv_send`） |
-| `chitu_e2e_request_duration_seconds` | —               | 端到端请求延迟                                   |
-| `chitu_time_to_first_token_seconds`  | —               | 首 token 延迟（TTFT）                          |
-| `chitu_kv_transfer_duration_seconds` | —               | KV RDMA 传输延迟                              |
-| `chitu_kv_transfer_size_bytes`       | —               | 单次 KV 传输大小                                |
-
-
-**实时状态（Gauge）**
-
-
-| 指标名                                        | 标签                   | 说明             |
-| ------------------------------------------ | -------------------- | -------------- |
-| `chitu_pd_queue_size`                      | `role`, `queue_name` | 各队列深度          |
-| `chitu_router_pending_requests`            | —                    | Router 待处理请求   |
-| `chitu_active_requests`                    | `role`               | 活跃请求数          |
-| `chitu_kv_transfer_speed_gbps`             | —                    | 最近一次 KV 传输速度   |
-| `chitu_kv_cache_usage_ratio`               | `rank`, `dp_id`      | KV Cache 使用率   |
-| `chitu_used_blocks` / `chitu_total_blocks` | `rank`, `dp_id`      | KV Cache 块使用情况 |
-| `chitu_cuda_used_bytes` / `chitu_cuda_total_bytes` | `rank`, `dp_id` | GPU 显存使用       |
-
-
-**计数器（Counter）**
-
-
-| 指标名                                | 标签              | 说明                 |
-| ---------------------------------- | --------------- | ------------------ |
-| `chitu_completed_requests_total`   | `role`          | 完成请求数              |
-| `chitu_kv_transfer_failures_total` | `role`          | KV 传输失败数           |
-| `chitu_request_timeouts_total`     | `stage`         | 请求超时数              |
-| `chitu_total_generated_tokens`     | `rank`, `dp_id` | 生成 token 总数        |
-| `chitu_total_prompt_tokens`        | `rank`, `dp_id` | 处理 prompt token 总数 |
+每个 P/D 进程启动独立的 Prometheus HTTP exporter。指标名称、标签、类型、派生表达式和展示位置以生成文档为准：[`docs/zh/METRICS.md`](../../../docs/zh/METRICS.md)。
 
 
 ### 代码中的打点方式

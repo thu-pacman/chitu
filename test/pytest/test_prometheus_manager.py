@@ -9,7 +9,8 @@ import multiprocessing as mp
 from chitu.backend import Backend
 from chitu.global_vars import set_global_args, get_global_args
 import chitu.metrics
-from chitu.metrics import PrometheusMetricsCollector
+from chitu.metrics import PrometheusMetricsCollector, metrics_runtime_context
+from chitu.metrics.definitions import MetricContext
 from chitu.metrics import PrometheusServerManager
 
 
@@ -41,32 +42,37 @@ class Monkcachemanager:
 
 def run_PrometheusServerManager(instance_id, dp_id, rank, result_queue, stop_event):
     chitu.metrics.prometheus_collector.Backend = Backend
-    chitu.metrics.prometheus_collector.get_dp_group = lambda: MockGroup(rank, dp_id)
-    chitu.metrics.prometheus_collector.get_tp_group = lambda: MockGroup(rank, 0)
-    chitu.metrics.prometheus_collector.get_pp_group = lambda: MockGroup(rank, 0)
+    setattr(
+        chitu.metrics.prometheus_collector,
+        "get_dp_group",
+        lambda: MockGroup(rank, dp_id),
+    )
 
-    collector = PrometheusMetricsCollector.get_instance(is_create=True)
-    result_queue.put(collector.addr)
+    with metrics_runtime_context(
+        MetricContext(rank=rank, rank_in_dp=0, dp_rank=dp_id, inst_id=instance_id),
+    ):
+        collector = PrometheusMetricsCollector.get_instance(is_create=True)
+        result_queue.put(collector.addr)
 
-    if dp_id == 0:
-        mock_cache_manager = Monkcachemanager(num_blocks=100, num_free_blocks=50)
-    else:
-        mock_cache_manager = Monkcachemanager(num_blocks=100, num_free_blocks=20)
-    Backend.cache_dict = {"main": mock_cache_manager}
-
-    while not stop_event.is_set():
         if dp_id == 0:
-            PrometheusMetricsCollector.inc_prompt_tokens(10)
-            PrometheusMetricsCollector.inc_generated_tokens(100)
-            PrometheusMetricsCollector.inc_task_eviction()
-            PrometheusMetricsCollector.update_kvcache_usage()
-        if dp_id == 1:
-            PrometheusMetricsCollector.inc_prompt_tokens(20)
-            PrometheusMetricsCollector.inc_generated_tokens(200)
-            PrometheusMetricsCollector.inc_task_eviction()
-            PrometheusMetricsCollector.inc_task_eviction()
-            PrometheusMetricsCollector.update_kvcache_usage()
-        time.sleep(1)
+            mock_cache_manager = Monkcachemanager(num_blocks=100, num_free_blocks=50)
+        else:
+            mock_cache_manager = Monkcachemanager(num_blocks=100, num_free_blocks=20)
+        Backend.cache_dict = {"main": mock_cache_manager}
+
+        while not stop_event.is_set():
+            if dp_id == 0:
+                PrometheusMetricsCollector.inc_prompt_tokens(10)
+                PrometheusMetricsCollector.inc_generated_tokens(100)
+                PrometheusMetricsCollector.inc_task_eviction()
+                PrometheusMetricsCollector.update_kvcache_usage()
+            if dp_id == 1:
+                PrometheusMetricsCollector.inc_prompt_tokens(20)
+                PrometheusMetricsCollector.inc_generated_tokens(200)
+                PrometheusMetricsCollector.inc_task_eviction()
+                PrometheusMetricsCollector.inc_task_eviction()
+                PrometheusMetricsCollector.update_kvcache_usage()
+            time.sleep(1)
 
 
 def test_PrometheusServerManager():

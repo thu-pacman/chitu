@@ -15,6 +15,12 @@ from chitu.global_vars import (
     is_classic_pd_disagg,
     is_independent_multi_inst,
 )
+from chitu.metrics.definitions import (
+    MetricType,
+    prometheus_query_name,
+    stdout_derived_metrics,
+    stdout_raw_metrics,
+)
 
 logger = getLogger(__name__)
 
@@ -64,12 +70,15 @@ class MetricsFormatter:
         return "{instance_id}" if self.use_instance_info else None
 
     def _get_prefix_format_str(self) -> str:
-        prefix_formats = [
-            self._instance_format_str(),
-            self._dp_format_str(),
-            self._rank_format_str(),
+        prefix_formats: list[str] = [
+            s
+            for s in (
+                self._instance_format_str(),
+                self._dp_format_str(),
+                self._rank_format_str(),
+            )
+            if s is not None
         ]
-        prefix_formats = [s for s in prefix_formats if s is not None]
         return "[" + ", ".join(prefix_formats) + "]: "
 
     def _format_instance(self, instance_id) -> str:
@@ -116,6 +125,44 @@ class MetricsMonitor:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._started = False
+        self.stdout_raw_metrics = stdout_raw_metrics()
+        self.stdout_derived_metrics = stdout_derived_metrics()
+        self.stdout_raw_query_names = {
+            metric.name: prometheus_query_name(metric)
+            for metric in self.stdout_raw_metrics
+        }
+        self.stdout_derived_names = {
+            metric.name for metric in self.stdout_derived_metrics
+        }
+
+    def _stdout_query_name(self, metric_name: str) -> str:
+        query_name = self.stdout_raw_query_names.get(metric_name)
+        if query_name is None:
+            raise KeyError(f"Metric {metric_name} is not enabled for stdout monitoring")
+        return query_name
+
+    def _require_stdout_derived(self, metric_name: str) -> None:
+        if metric_name not in self.stdout_derived_names:
+            raise KeyError(
+                f"Derived metric {metric_name} is not enabled for stdout monitoring"
+            )
+
+    def _query_stdout_raw_metrics(self, time_window: str) -> tuple[
+        dict[str, dict[tuple[str, str, str], str]],
+        dict[str, dict[tuple[str, str, str], str]],
+    ]:
+        latest_values: dict[str, dict[tuple[str, str, str], str]] = {}
+        rates: dict[str, dict[tuple[str, str, str], str]] = {}
+        for metric in self.stdout_raw_metrics:
+            query_name = self._stdout_query_name(metric.name)
+            latest_values[metric.name] = (
+                self.manager.query_metric_latest_value_each_rank(query_name)
+            )
+            if metric.type == MetricType.COUNTER:
+                rates[metric.name] = self.manager.query_metric_rate_each_rank(
+                    query_name, time_window=time_window
+                )
+        return latest_values, rates
 
     def start(self):
         """Start the monitoring thread."""
@@ -163,59 +210,30 @@ class MetricsMonitor:
                     continue
                 log_interval = f"{int(self.log_interval)}s"
                 # self.manager.list_all_metrics()
-                prompt_tps = self.manager.query_metric_rate_each_rank(
-                    "chitu_total_prompt_tokens_total", time_window=log_interval
+                for metric in self.stdout_derived_metrics:
+                    self._require_stdout_derived(metric.name)
+                latest_values, rates = self._query_stdout_raw_metrics(log_interval)
+                prompt_tps = rates.get("chitu_total_prompt_tokens", {})
+                gen_tps = rates.get("chitu_total_generated_tokens", {})
+                eviction_rate = rates.get("chitu_total_task_evictions", {})
+                kvcache_usage = latest_values.get("chitu_kv_cache_usage_ratio", {})
+                used_blocks = latest_values.get("chitu_used_blocks", {})
+                total_blocks = latest_values.get("chitu_total_blocks", {})
+                cuda_total_bytes = latest_values.get("chitu_cuda_total_bytes", {})
+                cuda_used_bytes = latest_values.get("chitu_cuda_used_bytes", {})
+                torch_allocated_bytes = latest_values.get(
+                    "chitu_torch_allocated_bytes", {}
                 )
-                gen_tps = self.manager.query_metric_rate_each_rank(
-                    "chitu_total_generated_tokens_total", time_window=log_interval
+                torch_reserved_bytes = latest_values.get(
+                    "chitu_torch_reserved_bytes", {}
                 )
-                eviction_rate = self.manager.query_metric_rate_each_rank(
-                    "chitu_total_task_evictions_total", time_window=log_interval
-                )
-                kvcache_usage = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_kv_cache_usage_ratio"
-                )
-                used_blocks = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_used_blocks"
-                )
-                total_blocks = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_total_blocks"
-                )
-                cuda_total_bytes = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_cuda_total_bytes"
-                )
-                cuda_used_bytes = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_cuda_used_bytes"
-                )
-                torch_allocated_bytes = (
-                    self.manager.query_metric_latest_value_each_rank(
-                        "chitu_torch_allocated_bytes"
-                    )
-                )
-                torch_reserved_bytes = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_torch_reserved_bytes"
-                )
-                mtp_proposed_rate = self.manager.query_metric_rate_each_rank(
-                    "chitu_mtp_proposed_tokens_total", time_window=log_interval
-                )
-                mtp_accepted_rate = self.manager.query_metric_rate_each_rank(
-                    "chitu_mtp_accepted_tokens_total", time_window=log_interval
-                )
-                total_hit_tokens = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_total_hit_tokens_total"
-                )
-                total_prompt_tokens = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_total_prompt_tokens_total"
-                )
-                running_requests = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_running_requests"
-                )
-                waiting_requests = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_waiting_requests"
-                )
-                prealloc_blocks = self.manager.query_metric_latest_value_each_rank(
-                    "chitu_prealloc_blocks"
-                )
+                mtp_proposed_rate = rates.get("chitu_mtp_proposed_tokens", {})
+                mtp_accepted_rate = rates.get("chitu_mtp_accepted_tokens", {})
+                total_hit_tokens = latest_values.get("chitu_total_hit_tokens", {})
+                total_prompt_tokens = latest_values.get("chitu_total_prompt_tokens", {})
+                running_requests = latest_values.get("chitu_running_requests", {})
+                waiting_requests = latest_values.get("chitu_waiting_requests", {})
+                prealloc_blocks = latest_values.get("chitu_prealloc_blocks", {})
                 self._print_stats(
                     prompt_tps,
                     gen_tps,
@@ -252,12 +270,18 @@ class MetricsMonitor:
         torch_reserved_bytes: dict[tuple[str, str, str], str],
         total_hit_tokens: dict[tuple[str, str, str], str],
         total_prompt_tokens: dict[tuple[str, str, str], str],
-        mtp_proposed_rate: dict[tuple[str, str, str], str] = None,
-        mtp_accepted_rate: dict[tuple[str, str, str], str] = None,
-        running_requests: dict[tuple[str, str, str], str] = None,
-        waiting_requests: dict[tuple[str, str, str], str] = None,
-        prealloc_blocks: dict[tuple[str, str, str], str] = None,
+        mtp_proposed_rate: Optional[dict[tuple[str, str, str], str]] = None,
+        mtp_accepted_rate: Optional[dict[tuple[str, str, str], str]] = None,
+        running_requests: Optional[dict[tuple[str, str, str], str]] = None,
+        waiting_requests: Optional[dict[tuple[str, str, str], str]] = None,
+        prealloc_blocks: Optional[dict[tuple[str, str, str], str]] = None,
     ):
+        mtp_proposed_rate = mtp_proposed_rate or {}
+        mtp_accepted_rate = mtp_accepted_rate or {}
+        running_requests = running_requests or {}
+        waiting_requests = waiting_requests or {}
+        prealloc_blocks = prealloc_blocks or {}
+
         stats_parts: dict[tuple[str, str, str], list[str]] = {}
 
         def append_part(rank_dp: tuple[str, str, str], part: str):
@@ -394,6 +418,10 @@ def start_prometheus_server_and_metrics_monitor(
             GrafanaManager.get_instance(prometheus_url)
         except Exception as e:
             logger.warning(f"Failed to start Grafana: {e}")
+    else:
+        logger.info(
+            "Grafana auto-start is disabled. Set metrics.grafana_enabled=true to start Grafana."
+        )
 
     _global_monitor = MetricsMonitor(manager, log_interval)
     _global_monitor.start()
