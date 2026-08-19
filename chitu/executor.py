@@ -2339,10 +2339,12 @@ class Executor:
                     batch_result.logprobs[it],
                     batch_result.token_idxs[it],
                 )
-                logprobs_list.append(logprobs[: max(1, task.req.top_logprobs)].tolist())
-                token_idxs_list.append(
-                    token_idxs[: max(1, task.req.top_logprobs)].tolist()
-                )
+                num_logprobs = task.req.top_logprobs
+                if num_logprobs is None:
+                    num_logprobs = 1
+                num_logprobs = max(1, num_logprobs)
+                logprobs_list.append(logprobs[:num_logprobs].tolist())
+                token_idxs_list.append(token_idxs[:num_logprobs].tolist())
         self.get_token_sink().emit_batch(
             batch_result.tasks, next_token_list, logprobs_list, token_idxs_list
         )

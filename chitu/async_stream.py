@@ -50,7 +50,7 @@ class AsyncDataStream:
                 return
             s = self.tokenizer.decode(self.cache_tokens)
             top_tokens = (
-                [self.tokenizer.decode(token_idx) for token_idx in top_token_idx]
+                [self.tokenizer.decode([token_idx]) for token_idx in top_token_idx]
                 if top_token_idx
                 else None
             )
