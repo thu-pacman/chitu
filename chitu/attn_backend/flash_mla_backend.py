@@ -227,10 +227,20 @@ class FlashMLABackend(TritonAttnBackend):
             else use_fp8
         )
 
-        if self.use_fp8_cache and (is_hygon() or is_muxi()):
+        if self.use_fp8_cache and is_muxi():
             raise NotImplementedError(
                 "The version of flashmla on this platform does not support FP8"
             )
+        self.sparse_fp8_split_q_supported = (
+            self.use_fp8_cache
+            and is_hygon()
+            and has_flash_mla_sched_meta
+            and hasattr(flash_mla, "flash_mla_with_kvcache_fp8_split_q")
+            and self.local_n_heads == 64
+            and self.args.models.kv_lora_rank == 512
+            and self.args.models.qk_rope_head_dim == 64
+            and self.index_topk == 2048
+        )
 
         logger.info(
             f"FlashMLA backend initialized with topk={self.index_topk}, "
@@ -608,6 +618,37 @@ class FlashMLABackend(TritonAttnBackend):
 
         output = output.view(-1, output.shape[-2], output.shape[-1])
         return output[:, :local_h_q, :]
+
+    def flashmla_sparse_fwd_split_q_fp8(
+        self,
+        q_nope: torch.Tensor,  # [num_tokens, 64, 512]
+        q_pe: torch.Tensor,  # [num_tokens, 64, 64]
+        paged_kv_fp8: torch.Tensor,
+        topk_indices: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_len_delta: BatchedSeqLenDelta,
+        softmax_scale,
+    ) -> torch.Tensor:
+        bsz = seq_len_delta.batch_size
+        s_q = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
+        q_nope = q_nope.unflatten(0, (bsz, s_q))
+        q_pe = q_pe.unflatten(0, (bsz, s_q))
+        topk_indices = topk_indices.unflatten(0, (bsz, s_q))
+
+        output, _ = flash_mla.flash_mla_with_kvcache_fp8_split_q(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            k_cache=paged_kv_fp8.unsqueeze(2),
+            block_table=block_table,
+            head_dim_v=512,
+            cache_seqlens=seq_len_delta.new.lens_tensor_device,
+            tile_scheduler_metadata=self.hygon_metadata_decode,
+            num_splits=None,
+            is_fp8_kvcache=True,
+            indices=topk_indices,
+            softmax_scale=softmax_scale,
+        )
+        return output.flatten(0, 1)
 
     @override
     def csa_hca_prefill_ragged_qkvo(
@@ -1743,6 +1784,20 @@ class FlashMLABackend(TritonAttnBackend):
                 )
 
         if self.use_fp8_cache:
+            if (
+                self.sparse_fp8_split_q_supported
+                and q_nope.stride(-1) == 1
+                and q_pe.stride(-1) == 1
+            ):
+                return self.flashmla_sparse_fwd_split_q_fp8(
+                    q_nope,
+                    q_pe,
+                    kv_lora_k_pe,
+                    topk_indices,
+                    kv_cache.block_table,
+                    seq_len_delta,
+                    softmax_scale,
+                )
             q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
             return self.flashmla_sparse_fwd_fp8(
                 q_nope_pe,
