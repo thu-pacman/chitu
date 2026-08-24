@@ -21,7 +21,8 @@ __global__ void rotary_pos_emb_llama_kernel(
     const U *__restrict__ freqs_cis_sin, T *q_out, T *k_out, size_t batch_size,
     size_t q_n_heads, size_t k_n_heads, size_t n_hidden, size_t q_batch_stride,
     size_t k_batch_stride, size_t q_head_stride, size_t k_head_stride,
-    size_t cos_sin_stride) {
+    size_t q_out_batch_stride, size_t k_out_batch_stride,
+    size_t q_out_head_stride, size_t k_out_head_stride, size_t cos_sin_stride) {
     // NOTE: No restrict pointers because `q` may be alias to `q_out` and `k`
     // may be alias to `k_out`
 
@@ -37,23 +38,31 @@ __global__ void rotary_pos_emb_llama_kernel(
         float s = to_scalar<float>(freqs_cis_sin[cos_sin_idx]);
 
         if (j < q_n_heads) {
-            size_t q_offset = i * q_batch_stride + j * q_head_stride;
-            size_t q1_idx = q_offset + t * 2;
+            size_t q_in_offset = i * q_batch_stride + j * q_head_stride;
+            size_t q_out_offset =
+                i * q_out_batch_stride + j * q_out_head_stride;
+            size_t q1_idx = q_in_offset + t * 2;
             size_t q2_idx = q1_idx + 1;
+            size_t q1_out_idx = q_out_offset + t * 2;
+            size_t q2_out_idx = q1_out_idx + 1;
             float q1 = to_scalar<float>(q[q1_idx]);
             float q2 = to_scalar<float>(q[q2_idx]);
-            q_out[q1_idx] = to_scalar<T>(q1 * c - q2 * s);
-            q_out[q2_idx] = to_scalar<T>(q2 * c + q1 * s);
+            q_out[q1_out_idx] = to_scalar<T>(q1 * c - q2 * s);
+            q_out[q2_out_idx] = to_scalar<T>(q2 * c + q1 * s);
         }
 
         if (j < k_n_heads) {
-            size_t k_offset = i * k_batch_stride + j * k_head_stride;
-            size_t k1_idx = k_offset + t * 2;
+            size_t k_in_offset = i * k_batch_stride + j * k_head_stride;
+            size_t k_out_offset =
+                i * k_out_batch_stride + j * k_out_head_stride;
+            size_t k1_idx = k_in_offset + t * 2;
             size_t k2_idx = k1_idx + 1;
+            size_t k1_out_idx = k_out_offset + t * 2;
+            size_t k2_out_idx = k1_out_idx + 1;
             float k1 = to_scalar<float>(k[k1_idx]);
             float k2 = to_scalar<float>(k[k2_idx]);
-            k_out[k1_idx] = to_scalar<T>(k1 * c - k2 * s);
-            k_out[k2_idx] = to_scalar<T>(k2 * c + k1 * s);
+            k_out[k1_out_idx] = to_scalar<T>(k1 * c - k2 * s);
+            k_out[k2_out_idx] = to_scalar<T>(k2 * c + k1 * s);
         }
     }
 }
@@ -64,7 +73,8 @@ __global__ void rotary_pos_emb_separated_kernel(
     const U *__restrict__ freqs_cis_sin, T *q_out, T *k_out, size_t batch_size,
     size_t q_n_heads, size_t k_n_heads, size_t n_hidden, size_t q_batch_stride,
     size_t k_batch_stride, size_t q_head_stride, size_t k_head_stride,
-    size_t cos_sin_stride) {
+    size_t q_out_batch_stride, size_t k_out_batch_stride,
+    size_t q_out_head_stride, size_t k_out_head_stride, size_t cos_sin_stride) {
     // NOTE: No restrict pointers because `q` may be alias to `q_out` and `k`
     // may be alias to `k_out`
 
@@ -82,23 +92,31 @@ __global__ void rotary_pos_emb_separated_kernel(
         float s = to_scalar<float>(freqs_cis_sin[cos_sin_idx]);
 
         if (j < q_n_heads) {
-            size_t q_offset = i * q_batch_stride + j * q_head_stride;
-            size_t q1_idx = q_offset + t;
+            size_t q_in_offset = i * q_batch_stride + j * q_head_stride;
+            size_t q_out_offset =
+                i * q_out_batch_stride + j * q_out_head_stride;
+            size_t q1_idx = q_in_offset + t;
             size_t q2_idx = q1_idx + half_dim;
+            size_t q1_out_idx = q_out_offset + t;
+            size_t q2_out_idx = q1_out_idx + half_dim;
             float q1 = to_scalar<float>(q[q1_idx]);
             float q2 = to_scalar<float>(q[q2_idx]);
-            q_out[q1_idx] = to_scalar<T>(q1 * c - q2 * s);
-            q_out[q2_idx] = to_scalar<T>(q2 * c + q1 * s);
+            q_out[q1_out_idx] = to_scalar<T>(q1 * c - q2 * s);
+            q_out[q2_out_idx] = to_scalar<T>(q2 * c + q1 * s);
         }
 
         if (j < k_n_heads) {
-            size_t k_offset = i * k_batch_stride + j * k_head_stride;
-            size_t k1_idx = k_offset + t;
+            size_t k_in_offset = i * k_batch_stride + j * k_head_stride;
+            size_t k_out_offset =
+                i * k_out_batch_stride + j * k_out_head_stride;
+            size_t k1_idx = k_in_offset + t;
             size_t k2_idx = k1_idx + half_dim;
+            size_t k1_out_idx = k_out_offset + t;
+            size_t k2_out_idx = k1_out_idx + half_dim;
             float k1 = to_scalar<float>(k[k1_idx]);
             float k2 = to_scalar<float>(k[k2_idx]);
-            k_out[k1_idx] = to_scalar<T>(k1 * c - k2 * s);
-            k_out[k2_idx] = to_scalar<T>(k2 * c + k1 * s);
+            k_out[k1_out_idx] = to_scalar<T>(k1 * c - k2 * s);
+            k_out[k2_out_idx] = to_scalar<T>(k2 * c + k1 * s);
         }
     }
 }
@@ -142,10 +160,10 @@ void rotary_pos_emb_llama_impl(torch::Tensor q, torch::Tensor k,
                "Tensor q_out should have the same size as q");
     ASSERTWITH(k_out.sizes() == k.sizes(),
                "Tensor k_out should have the same size as k");
-    ASSERTWITH(q_out.strides() == q.strides(),
-               "Tensor q_out should have the same stride as q");
-    ASSERTWITH(k_out.strides() == k.strides(),
-               "Tensor k_out should have the same stride as k");
+    ASSERTWITH(q_out.stride(2) == 1,
+               "Tensor q_out should be contiguous in the last dimension");
+    ASSERTWITH(k_out.stride(2) == 1,
+               "Tensor k_out should be contiguous in the last dimension");
 
     dim3 grid_dim(q_shape[0], max(q_shape[1], k_shape[1]));
     int thread_per_block = std::min<int>(
@@ -170,7 +188,9 @@ void rotary_pos_emb_llama_impl(torch::Tensor q, torch::Tensor k,
             reinterpret_cast<typename map_to_cuda_type<T>::type *>(
                 k_out.data_ptr<T>()),
             q_shape[0], q_shape[1], k_shape[1], q_shape[2], q.stride(0),
-            k.stride(0), q.stride(1), k.stride(1), freqs_cis_cos.stride(0));
+            k.stride(0), q.stride(1), k.stride(1), q_out.stride(0),
+            k_out.stride(0), q_out.stride(1), k_out.stride(1),
+            freqs_cis_cos.stride(0));
     } else if (rotary_type == "interleaved") {
         rotary_pos_emb_llama_kernel<<<grid_dim, block_dim, shared_mem_size,
                                       stream>>>(
@@ -187,7 +207,9 @@ void rotary_pos_emb_llama_impl(torch::Tensor q, torch::Tensor k,
             reinterpret_cast<typename map_to_cuda_type<T>::type *>(
                 k_out.data_ptr<T>()),
             q_shape[0], q_shape[1], k_shape[1], q_shape[2], q.stride(0),
-            k.stride(0), q.stride(1), k.stride(1), freqs_cis_cos.stride(0));
+            k.stride(0), q.stride(1), k.stride(1), q_out.stride(0),
+            k_out.stride(0), q_out.stride(1), k_out.stride(1),
+            freqs_cis_cos.stride(0));
     } else {
         ASSERTWITH(false,
                    "Unsupported rotary_type: " + rotary_type +

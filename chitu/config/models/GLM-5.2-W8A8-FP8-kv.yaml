@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# GLM-5.2 compressed-tensors W8A8 weights with packed FP8 MLA KV cache.
+defaults:
+  - GLM-5.2-W8A8
+  - override quant_config: metax-w8a8-dsa-kv-fp8
+  - _self_ # Config in this file overrides configs in defaults
+
+name: GLM-5.2-W8A8-FP8-kv
+source: "https://modelscope.cn/models/metax-tech/GLM-5.2-W8A8" # Display only.

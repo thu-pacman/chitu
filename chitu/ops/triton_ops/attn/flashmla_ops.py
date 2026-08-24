@@ -6,14 +6,18 @@ import torch
 import triton
 import triton.language as tl
 
+from chitu.cuda_graph import is_warming_up_or_cuda_graph_capture
+from chitu.ops.triton_ops.utils import autotune_compat
+
 
 # quantization kernel for bf16 mla kvcache format to fp8 format
 @triton.jit
 def _quant_pertoken_kvcache_dsa_kernel(
     k_ptr,  # (N, D), D=d_v+d_pe=512+64=576*bf16
-    k_quant_ptr,  # (N, 656), 656=512 (fp8) + 16 (4*fp32 scales) + 128 (6*bf16 pe)
+    k_quant_ptr,  # (N, 656), 656=512 (fp8) + 16 (4*fp32 scales) + 128 (64*bf16 pe)
     N,
     D,
+    input_token_stride,
     dv,  # N: n_tokens, D,
     tile_size: tl.constexpr = 128,
     BLOCK_N: tl.constexpr = 128,
@@ -27,7 +31,7 @@ def _quant_pertoken_kvcache_dsa_kernel(
     # mask for valid N
     mask_n = offs_n < N
 
-    src_ptrs = k_ptr + offs_n[:, None] * D + offs_d[None, :]
+    src_ptrs = k_ptr + offs_n[:, None] * input_token_stride + offs_d[None, :]
     src_tile = tl.load(src_ptrs, mask=mask_n[:, None], other=0.0)
 
     abs_tile = tl.abs(src_tile)
@@ -53,6 +57,34 @@ def _quant_pertoken_kvcache_dsa_kernel(
     tar_ptrs = k_quant_ptr + nope_offsets
     tl.store(tar_ptrs, k_fp8_tile, mask=mask_n[:, None])
 
+    # Fold the 64-BF16 RoPE copy into the pid_d=0 quant CTA, avoiding a
+    # separate copy kernel for both Decode and Prefill.
+    rope_offsets = tl.arange(0, 64)
+    rope_mask = mask_n[:, None] & (pid_d == 0)
+    rope = tl.load(
+        k_ptr + offs_n[:, None] * input_token_stride + dv + rope_offsets[None, :],
+        mask=rope_mask,
+        other=0.0,
+    )
+    rope_dst = k_quant_ptr + offs_n[:, None] * 656 + dv + 16 + rope_offsets[None, :] * 2
+    tl.store(
+        rope_dst.to(tl.pointer_type(tl.bfloat16)),
+        rope,
+        mask=rope_mask,
+    )
+
+
+_quant_pertoken_kvcache_dsa_decode_kernel = autotune_compat(
+    configs=[
+        triton.Config({"BLOCK_N": 1}, num_warps=1),
+        triton.Config({"BLOCK_N": 2}, num_warps=2),
+        triton.Config({"BLOCK_N": 4}, num_warps=4),
+        triton.Config({"BLOCK_N": 8}, num_warps=8),
+    ],
+    key=["N"],
+    cache_results=True,
+)(_quant_pertoken_kvcache_dsa_kernel)
+
 
 def quant_pertoken_kvcache_dsa(
     input_k_cache: torch.Tensor,  # [num_blocks, block_size, 1, d] or [num_blocks, block_size, d] or [N, d]
@@ -69,40 +101,47 @@ def quant_pertoken_kvcache_dsa(
     assert dv % tile_size == 0
     assert input_k_cache.dtype == torch.bfloat16
 
-    # Flatten to [N, d]
+    # Flatten to [N, d]. Decode supplies [N, 1, d] with a unit inner stride,
+    # so view preserves its non-contiguous token stride without a copy.
     orig_shape = input_k_cache.shape
-    input_k_cache = input_k_cache.contiguous()
-    if input_k_cache.ndim > 2:
-        input_k_cache = input_k_cache.view(-1, input_k_cache.shape[-1])  # [N, d]
-    else:
-        assert input_k_cache.ndim == 2
+    input_k_cache_2d = input_k_cache.view(-1, input_k_cache.shape[-1])  # [N, d]
 
-    N, d = input_k_cache.shape
+    N, d = input_k_cache_2d.shape
     assert d == dv + 64
+
+    # Decode is tuned during the warmup preceding CUDA Graph capture; capture
+    # and replay reuse that cached choice. Prefill keeps deterministic tiling.
+    use_decode_graph_path = is_warming_up_or_cuda_graph_capture()
+    if use_decode_graph_path:
+        kernel = _quant_pertoken_kvcache_dsa_decode_kernel
+        launch_options = {}
+    else:
+        kernel = _quant_pertoken_kvcache_dsa_kernel
+        if N <= 2048:
+            block_n, num_warps = 16, 4
+        else:
+            block_n, num_warps = 32, 4
+        launch_options = {"BLOCK_N": block_n, "num_warps": num_warps}
 
     # Allocate outputs
     quant_output = torch.empty(
         N, 656, dtype=torch.float8_e4m3fn, device=input_k_cache.device
     )
-    # directly copy the rope part
-    quant_output[..., dv + 16 :].view(torch.bfloat16).copy_(
-        input_k_cache[..., dv:], non_blocking=True
-    )
-
     # Launch kernel
     grid = lambda META: (
         triton.cdiv(N, META["BLOCK_N"]),
         dv // tile_size,
     )
 
-    _quant_pertoken_kvcache_dsa_kernel[grid](
-        input_k_cache,
+    kernel[grid](
+        input_k_cache_2d,
         quant_output,
         N=N,
         D=d,
+        input_token_stride=input_k_cache_2d.stride(0),
         dv=dv,
         tile_size=tile_size,
-        BLOCK_N=128,
+        **launch_options,
     )
     # the last dim: 576 -> 656
     return quant_output.view(*orig_shape[:-1], -1)

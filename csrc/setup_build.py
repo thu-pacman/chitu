@@ -58,9 +58,7 @@ def get_extensions():
             if arch.startswith("8.") or arch.startswith("9."):
                 enable_marlin = True
     enable_custom_all_reduce = (muxi_build == "0") and (ascend_build == "0")
-    enable_dsa_fp8_kv_dequant = (
-        (hygon_build == "0") and (muxi_build == "0") and (ascend_build == "0")
-    )
+    enable_dsa_fp8_kv_dequant = (muxi_build == "0") and (ascend_build == "0")
 
     if enable_nvfp4:
         cutlass_path = os.path.join(this_dir, "../third_party/cutlass")
@@ -103,6 +101,14 @@ def get_extensions():
         nvcc_extra_args += ["-DCHITU_ENABLE_DSA_FP8_KV_DEQUANT=1"]
         extra_sources += [
             os.path.join(this_dir, "cuda/dequant/dequant_kv.cu"),
+            os.path.join(
+                this_dir,
+                (
+                    "cuda/dequant/dequant_kv_hygon.cu"
+                    if hygon_build == "1"
+                    else "cuda/dequant/dequant_kv_cuda.cu"
+                ),
+            ),
         ]
 
     base_sources = [

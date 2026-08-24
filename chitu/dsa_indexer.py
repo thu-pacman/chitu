@@ -744,11 +744,12 @@ class DSAIndexer:
         Indexer score by deep_gemm.fp8_paged_mqa_logits() for ragged_q_paged_k in decode stage
         """
         s_q, h, d = q.shape
-        batch_size = seq_len_delta.batch_size
-        assert s_q == batch_size * self.mtp_size
+        seq_len = 1 if seq_len_delta.is_classic_decoding else self.mtp_size
+        batch_size = s_q // seq_len
+        assert batch_size == seq_len_delta.batch_size
 
         # reshape as batch view
-        q = q.view(batch_size, self.mtp_size, h, d)
+        q = q.view(batch_size, seq_len, h, d)
         weights = weights.view(s_q, h)
         k_ks = k_ks.unsqueeze(2).view(torch.uint8)
         context_lens = seq_len_delta.new.lens_tensor_device.to(torch.int32)
