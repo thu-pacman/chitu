@@ -104,7 +104,7 @@ def test_executor_accepts_omitted_top_logprobs():
         tasks=[task],
         tokens=[[2]],
         return_logprobs=True,
-        logprobs=torch.tensor([[-0.1, -0.2]]),
+        logprobs=torch.tensor([[-0.1, -0.2]], dtype=torch.bfloat16),
         token_idxs=torch.tensor([[2, 3]]),
     )
     sink = RecordingTokenSink()
@@ -115,7 +115,7 @@ def test_executor_accepts_omitted_top_logprobs():
 
     assert sink.task_list == [task]
     assert sink.token_list == [[2]]
-    assert sink.logprobs_list[0] == pytest.approx([-0.1])
+    assert sink.logprobs_list == [[batch_result.logprobs[0, 0].item()]]
     assert sink.token_idxs_list == [[2]]
 
 
