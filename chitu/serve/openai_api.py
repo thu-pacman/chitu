@@ -305,7 +305,10 @@ class AsyncResponse:
                                     "top_logprobs": [],
                                 }
                             )
-                            if self.req.top_logprobs > 0:
+                            if (
+                                self.req.top_logprobs is not None
+                                and self.req.top_logprobs > 0
+                            ):
                                 for logprob, token in zip(top_logprobs, top_tokens):
                                     logprobs["content"][-1]["top_logprobs"].append(
                                         {
@@ -412,7 +415,7 @@ class AsyncResponse:
                         "top_logprobs": [],
                     }
                 )
-                if self.req.top_logprobs > 0:
+                if self.req.top_logprobs is not None and self.req.top_logprobs > 0:
                     for logprob, token in zip(top_logprobs, top_tokens):
                         logprobs["content"][-1]["top_logprobs"].append(
                             {
