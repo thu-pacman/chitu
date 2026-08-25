@@ -43,6 +43,10 @@ from chitu.sampling.utils import submit_grammar_compile
 logger = getLogger(__name__)
 
 
+class PromptTooLongError(ValueError):
+    """Raised when a prompt is too long for an inference request."""
+
+
 class TaskStatus(Enum):
     Stopped = -1
     AvailableForSchedule = 0
@@ -245,7 +249,7 @@ class UserRequest:
     def cap_max_new_tokens(max_new_tokens: int, prompt_len: int) -> int:
         max_seq_len = get_global_args().infer.max_seq_len
         if prompt_len >= max_seq_len:
-            raise ValueError(
+            raise PromptTooLongError(
                 f"prompt length({prompt_len}) cannot be greater than max_seq_len({max_seq_len})"
             )
         max_new_tokens = min(max_new_tokens, max_seq_len - prompt_len + 1)
