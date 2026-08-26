@@ -865,7 +865,7 @@ class PagedKVCache(KVCacheBase):
 
     def kv_recv_reorder(
         self,
-        new_block_ids: list[int],
+        block_ids: list[int],
         *,
         local_dists: "RankCacheInfos",
         remote_dists: "InstanceCacheInfos",
@@ -882,7 +882,7 @@ class PagedKVCache(KVCacheBase):
             if n_chunks <= 1:
                 continue
 
-            for block_id in new_block_ids:
+            for block_id in block_ids:
                 for layer in range(cache.shape[0]):
                     block = cache[layer, block_id].contiguous()
                     cache[layer, block_id] = (

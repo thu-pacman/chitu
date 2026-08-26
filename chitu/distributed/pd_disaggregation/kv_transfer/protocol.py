@@ -51,7 +51,9 @@ class DecodeAllocated:
     rank_num: int
     session_id: str
     buffers: "TransferBuffers"
-    decode_cached_tokens: int = 0
+    cache_manager_hit_block_counts: dict[str, int] = dataclasses.field(
+        default_factory=dict
+    )
 
     def to_msgpackable(self) -> dict[str, Any]:
         d = ProtocolSerializer.dataclass_to_dict(self)
@@ -82,7 +84,9 @@ class DecodePrepare:
     prefix_len: int
     new_cache_ids: dict[str, list[int]]
     dp_rank: int = 0
-    decode_cached_tokens: int = 0
+    cache_manager_hit_block_counts: dict[str, int] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass

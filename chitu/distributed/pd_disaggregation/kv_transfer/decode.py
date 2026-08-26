@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from logging import getLogger
-
+from typing import Optional
 import numpy as np
 
 from chitu.backend import Backend
@@ -87,8 +87,8 @@ class KVManagerDecode(KVManagerBase):
         info.prefill_sid = msg.prefill_sid
         info.prefix_len = msg.prefix_len
         info.cache_manager_new_block_ids = msg.new_cache_ids
+        info.cache_manager_hit_block_counts = msg.cache_manager_hit_block_counts
         info.dp_rank = msg.dp_rank
-        info.decode_cached_tokens = msg.decode_cached_tokens
 
         if not info.is_decode_prepare_received:
             info.is_decode_prepare_received = True
@@ -99,8 +99,9 @@ class KVManagerDecode(KVManagerBase):
     def get_recv_buffers(self, req_id: str) -> TransferBuffers:
         """Collect block IDs for all caches on the recv (decode) side.
 
-        Truncates cached prefix from the front.  ``skip`` is 0 for now;
-        future work: derive from ``decode_cached_tokens``.
+        Truncates decode-side hit blocks from the front. The full block list is
+        still kept so the request block table can point at both hit and
+        transferred blocks.
         """
         info = self._info(req_id)
         recv_buffers = TransferBuffers()
@@ -109,11 +110,19 @@ class KVManagerDecode(KVManagerBase):
             assert isinstance(cache, PagedKVCache)
             new_block_ids = info.cache_manager_new_block_ids[cache.manager_name]
 
-            skip = 0  # decode_cached_tokens // cache.block_size
             need = ceil_div(info.prefix_len, cache.block_size)
-            sliced = new_block_ids[skip:need]
-            ids = np.array(sliced, dtype=np.int32)
-            info.cache_new_block_ids[cache_name] = sliced
+            full_block_ids = new_block_ids[:need]
+            skip = min(
+                max(
+                    0,
+                    info.cache_manager_hit_block_counts.get(cache.manager_name, 0),
+                ),
+                len(full_block_ids),
+            )
+            transfer_block_ids = full_block_ids[skip:]
+            ids = np.array(transfer_block_ids, dtype=np.int32)
+            info.cache_new_block_ids[cache_name] = full_block_ids
+            info.cache_transfer_block_ids[cache_name] = transfer_block_ids
 
             for key in cache.paged_kv_cache:
                 recv_buffers.cache_block_ids[key] = ids
@@ -145,7 +154,7 @@ class KVManagerDecode(KVManagerBase):
         for cache_name, cache in Backend.cache_dict.items():
             if not isinstance(cache, PagedKVCache) or cache.paged_kv_cache is None:
                 continue
-            ids = info.cache_new_block_ids.get(cache_name, [])
+            ids = info.cache_transfer_block_ids.get(cache_name, [])
             for tensor in cache.paged_kv_cache.values():
                 block_bytes = int(tensor.stride(1)) * tensor.element_size()
                 info.recv_bytes += len(ids) * tensor.shape[0] * block_bytes
@@ -158,7 +167,7 @@ class KVManagerDecode(KVManagerBase):
             rank_num=self.dp_way_size,
             session_id=self.session_id,
             buffers=recv_buffers,
-            decode_cached_tokens=info.decode_cached_tokens,
+            cache_manager_hit_block_counts=info.cache_manager_hit_block_counts,
         )
         payload = ProtocolSerializer.pack(msg)
 
@@ -232,10 +241,11 @@ class KVManagerDecode(KVManagerBase):
 
         for cache_name, cache in Backend.cache_dict.items():
             assert isinstance(cache, PagedKVCache)
-            new_block_ids = info.cache_new_block_ids[cache_name]
-            cache.insert_kv_cache_from_transfer(req_id, new_block_ids, info.prefix_len)
+            full_block_ids = info.cache_new_block_ids[cache_name]
+            transfer_block_ids = info.cache_transfer_block_ids.get(cache_name, [])
+            cache.insert_kv_cache_from_transfer(req_id, full_block_ids, info.prefix_len)
             cache.kv_recv_reorder(
-                new_block_ids,
+                transfer_block_ids,
                 local_dists=self._local_cache_dists,
                 remote_dists=remote_dists,
             )
@@ -253,7 +263,7 @@ class KVManagerDecode(KVManagerBase):
         prefix_len: int,
         new_cache_ids: dict[str, list[int]],
         dp_rank: int,
-        decode_cached_tokens: int = 0,
+        cache_manager_hit_block_counts: Optional[dict[str, int]] = None,
     ):
         msg = DecodePrepare(
             req_id=req_id,
@@ -261,7 +271,7 @@ class KVManagerDecode(KVManagerBase):
             prefix_len=prefix_len,
             new_cache_ids=new_cache_ids,
             dp_rank=dp_rank,
-            decode_cached_tokens=decode_cached_tokens,
+            cache_manager_hit_block_counts=cache_manager_hit_block_counts or {},
         )
         self.endpoints.decode_prepare.send(ProtocolSerializer.pack(msg))
 

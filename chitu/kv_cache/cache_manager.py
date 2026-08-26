@@ -33,7 +33,8 @@ class KVCacheManagerBase:
     block metadata that the executor later consumes in ``prepare_cache_*``.
     """
 
-    pass
+    def publish_prefix_cache_blocks(self, *args, **kwargs) -> None:
+        pass
 
 
 class PagedKVCacheManager(KVCacheManagerBase):
@@ -107,6 +108,12 @@ class PagedKVCacheManager(KVCacheManagerBase):
         # Incremental evicted block hashes, consumed by scheduler stats reporter.
         self.evicted_blk_hashes: deque[str] = deque()
 
+        # PD分离Decode-Only: 记录KV传输+reorder尚未就绪的prefix block，
+        # 数据含义: {task_id: target_seq_len}。在该任务首个decode step
+        # (prepare_metadata_before_decode)发布，届时recv_kv_cache_and_insert
+        # (KV插入 + kv_recv_reorder)必然已完成。
+        self._deferred_prefix_publish: dict[str, int] = {}
+
     def has_active_blocks(self):
         if len(self.active_blocks) > 0:
             return True
@@ -129,6 +136,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         self.task_to_token_blocks.clear()
         self.identity_runtime_pool.clear()
         self.cache_idx_to_hash.clear()
+        self._deferred_prefix_publish.clear()
         self.identity_builder.hashed_block_pool.clear()
         self.identity_builder.tid_to_identities.clear()
 
@@ -305,8 +313,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             and (is_independent_multi_inst() or role in ("prefill", "decode"))
         ):
             # Only record where a consumer pops: enhanced-scheduler stats loop
-            # (independent multi-inst) or PD prefill-only get_pd_stats. PD
-            # decode-only instances never pop, so they must not record.
+            # (independent multi-inst) or PD get_pd_stats.
             self.evicted_blk_hashes.append(blk_hash)
         if (
             blk_hash is not None
@@ -324,7 +331,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
             out.append(self.evicted_blk_hashes.popleft())
         return out
 
-    def prepare_metadata_before_prefill(self, task: "Task") -> list[int]:
+    def prepare_metadata_before_prefill(
+        self, task: "Task", *, eager_prefix_cache_insert: bool = True
+    ) -> list[int]:
         """Prepare cache-manager metadata for one prefill step.
 
         Preconditions (set by the scheduler before calling):
@@ -392,13 +401,31 @@ class PagedKVCacheManager(KVCacheManagerBase):
             self.task_to_cache_ids[task.task_id].add(cache_idx)
             self.task_to_token_blocks[task.task_id].append(block)
 
+        if eager_prefix_cache_insert:
+            # 非PD-Decode-Only节点调用prepare_metadata_before_prefill后立刻进入model_run，可视为cache就绪可复用
+            self.publish_prefix_cache_blocks(task, target_seq_len)
+        else:
+            # PD分离Decode-Only节点：此时KV cache还未从prefill传输并reorder就绪，
+            # 不能视为可复用的cache blocks。推迟到该任务首个decode step
+            # (prepare_metadata_before_decode)再发布。
+            self._deferred_prefix_publish[task.task_id] = target_seq_len
+        return new_cache_ids
+
+    def publish_prefix_cache_blocks(self, task: "Task", target_seq_len: int) -> None:
         for idx, block in enumerate(self.task_to_token_blocks[task.task_id]):
             if (idx + 1) * self.block_size <= target_seq_len:
                 self.upload_to_identity_runtime_pool(block)
-        return new_cache_ids
 
     def prepare_metadata_before_decode(self, task: "Task") -> list[int]:
         """prepare and update metadata before the task begin a decode step"""
+        # PD分离Decode-Only：任务被调度进入首个decode step时，其KV传输与reorder
+        # (在同一step稍后的before_decode_step->recv_kv_cache_and_insert中执行)
+        # 即将在本step完成，且其它请求最早只能在下一个step的调度阶段
+        # (_do_pd_scheduler)观察到这些block，故在此发布prefix block可复用是安全的。
+        deferred_seq_len = self._deferred_prefix_publish.pop(task.task_id, None)
+        if deferred_seq_len is not None:
+            self.publish_prefix_cache_blocks(task, deferred_seq_len)
+
         new_cache_ids: list[int] = []
 
         target_seq_len = task.kv_cache_len_used_in_completed_steps_and_next_step
@@ -477,6 +504,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
                     else:
                         assert blk_visible_runtime.cache_idx in self.active_blocks
 
+        self._deferred_prefix_publish.pop(task.task_id, None)
         self.task_to_cache_ids.pop(task.task_id)
         self.task_to_token_blocks.pop(task.task_id)
         self.identity_builder.forget_task(task)
@@ -660,7 +688,7 @@ class SingletonPagedKVCacheManager(KVCacheManagerBase):
     #   Allocation / release
     # ========================
 
-    def prepare_metadata_before_prefill(self, task) -> list[int]:
+    def prepare_metadata_before_prefill(self, task, *args, **kwargs) -> list[int]:
         """Allocate the single block for the full request lifetime."""
         tid = task.task_id
         if tid not in self.task_to_cache_ids:
