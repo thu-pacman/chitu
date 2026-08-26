@@ -44,9 +44,6 @@ class TaskInfo:
     req_id: str = ""
     first_token: int = 0
     num_hit_tokens: int = 0
-    decode_cached_tokens: int = 0
-    """Number of tokens already cached on the decode side.
-    Set from DecodePrepare (decode) / DecodeAllocated (prefill)."""
 
     # ===============================
     #            Prefill
@@ -76,10 +73,16 @@ class TaskInfo:
     prefill_sid: Optional[int] = None
 
     cache_new_block_ids: dict[str, list[int]] = field(default_factory=dict)
-    """cache name -> list of new block ids."""
+    """cache name -> full prefix block ids to install in the decode block table."""
+
+    cache_transfer_block_ids: dict[str, list[int]] = field(default_factory=dict)
+    """cache name -> block ids that are written by this RDMA transfer."""
 
     cache_manager_new_block_ids: dict[str, list[int]] = field(default_factory=dict)
     """cache manager name -> list of new block ids."""
+
+    cache_manager_hit_block_counts: dict[str, int] = field(default_factory=dict)
+    """cache manager name -> number of decode-side prefix blocks already ready."""
 
     is_prefill_done: bool = False
     prefill_done_event: threading.Event = field(default_factory=threading.Event)

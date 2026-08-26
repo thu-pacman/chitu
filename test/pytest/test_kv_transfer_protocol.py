@@ -12,6 +12,7 @@ import numpy as np
 
 from chitu.distributed.pd_disaggregation.kv_transfer.protocol import (
     DecodeAllocated,
+    DecodePrepare,
     RankTransferDone,
     PrefillDone,
     ProtocolSerializer,
@@ -83,6 +84,25 @@ class TestDecodeAllocated:
         ids = list(restored.cache_block_ids["main"])
         assert ids == [7, 8, 9, 10]
         assert restored.cache_block_ids["main"].dtype == np.int32
+
+
+class TestDecodePrepare:
+    def test_roundtrip_preserves_hit_block_counts(self):
+        msg = DecodePrepare(
+            req_id="prepare-1",
+            prefill_sid=0,
+            prefix_len=1024,
+            new_cache_ids={"main": [1, 2, 3, 4], "linear": [8]},
+            dp_rank=1,
+            cache_manager_hit_block_counts={"main": 2, "linear": 0},
+        )
+        packed = ProtocolSerializer.pack(msg)
+        unpacked = ProtocolSerializer.unpack(packed)
+
+        assert isinstance(unpacked, DecodePrepare)
+        assert unpacked.req_id == "prepare-1"
+        assert unpacked.new_cache_ids["main"] == [1, 2, 3, 4]
+        assert unpacked.cache_manager_hit_block_counts == {"main": 2, "linear": 0}
 
 
 class TestRankTransferDone:

@@ -48,6 +48,9 @@ class TransferPlan:
 
     def execute_send(self, engine) -> None:
         """Submit all RDMA transfers synchronously."""
+        if not self.plans:
+            # 全命中时可能会生成空plan
+            return
         batch_ids = []
         for session_id, per_rank in self.plans.items():
             batch_id = engine.batch_transfer_async_write(

@@ -491,7 +491,9 @@ class Scheduler:
             },
         )
 
-    def _prepare_prefill_metadata(self, task, cached_len: int) -> None:
+    def _prepare_prefill_metadata(
+        self, task, cached_len: int, *, eager_prefix_cache_insert: bool = True
+    ) -> None:
         """task进行prefill前的元数据准备: 维护本次新增击中长度、本次结束后已消费的token，
         调用prepare_metadata_before_prefill维护所有cache_manager中的元信息，
         维护本次cache_manager为任务新新分配的kv block ids
@@ -507,7 +509,7 @@ class Scheduler:
 
         for name, cache_manager in self.cache_manager_dict.items():
             task.new_cache_ids[name] = cache_manager.prepare_metadata_before_prefill(
-                task
+                task, eager_prefix_cache_insert=eager_prefix_cache_insert
             )
 
     def _prepare_decode_metadata(self, task) -> None:
@@ -680,9 +682,17 @@ class Scheduler:
 
     def _prepare_pd_decode_kvcache(
         self, task_id: str, pd_prealloc_tokens: int
-    ) -> KVCacheCapacityStatus:
+    ) -> tuple[KVCacheCapacityStatus, int, dict[str, int]]:
         task = TaskPool.pool[task_id]
         num_cached_tokens = self._num_prefill_cached_tokens(task)
+        cache_manager_hit_block_counts = {
+            name: (
+                manager.num_blocks_for_seq_len(num_cached_tokens)
+                if getattr(manager, "enable_prefix_caching", False)
+                else 0
+            )
+            for name, manager in self.cache_manager_dict.items()
+        }
         num_uncomputed_tokens = task.prefix_tokens_len - num_cached_tokens
         capacity_status = self._check_prefill_capacity(
             task,
@@ -691,13 +701,15 @@ class Scheduler:
             pd_prealloc_tokens=pd_prealloc_tokens,
         )
         if capacity_status is not KVCacheCapacityStatus.OK:
-            return capacity_status, num_cached_tokens
+            return capacity_status, num_cached_tokens, cache_manager_hit_block_counts
         task.set_prefill_chunk_size_for_one_step(
             1 if num_uncomputed_tokens == 0 else num_uncomputed_tokens
         )
-        self._prepare_prefill_metadata(task, num_cached_tokens)
+        self._prepare_prefill_metadata(
+            task, num_cached_tokens, eager_prefix_cache_insert=False
+        )
         task.consume_req_tokens()
-        return capacity_status, num_cached_tokens
+        return capacity_status, num_cached_tokens, cache_manager_hit_block_counts
 
     def _schedule_prefill_tasks(self, task_ids: list[str]) -> list[str]:
         """Prefill tasks scheduling with congestion control

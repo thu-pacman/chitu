@@ -829,9 +829,13 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             assert (
                 not task.new_cache_ids
             ), f"task.new_cache_ids should be empty before prealloc"
-            capacity_status, num_cached_tokens = Backend.schedulers[
-                target_dp_rank
-            ]._prepare_pd_decode_kvcache(rid, required_tokens)
+            (
+                capacity_status,
+                num_cached_tokens,
+                hit_block_counts,
+            ) = Backend.schedulers[target_dp_rank]._prepare_pd_decode_kvcache(
+                rid, required_tokens
+            )
 
             if capacity_status == KVCacheCapacityStatus.EXCEEDS_CAPACITY:
                 self._terminate_task_exceeds_capacity(
@@ -850,7 +854,7 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 prefix_len=task.prefix_tokens_len,
                 new_cache_ids=task.new_cache_ids,
                 dp_rank=task.dp_rank,
-                decode_cached_tokens=num_cached_tokens,
+                cache_manager_hit_block_counts=hit_block_counts,
             )
             info.last_prepare_ts = now
             prealloc_charge_tokens = max(0, required_tokens - num_cached_tokens)
@@ -913,6 +917,9 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                     )
                 continue
 
+            # 注意: prefix block的发布(publish_prefix_cache_blocks)已推迟到该任务
+            # 首个decode step的prepare_metadata_before_decode，确保KV传输+kv_recv_reorder
+            # 完成后其它请求才可能命中并复用，避免读到未reorder的block。
             task.req.num_hit_tokens = max(
                 task.req.num_hit_tokens, prefill_done.num_hit_tokens
             )

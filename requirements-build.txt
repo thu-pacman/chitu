@@ -2,7 +2,7 @@ setuptools>=77.0.3,<81  # <81 is for `from pkg_resources import packaging` compa
 wheel
 cmake
 ninja
-cython
+cython<3.3.0  # Cython 3.30 rejects multiple declarations of the same variable
 packaging
 pybind11
 py-cpuinfo

@@ -361,6 +361,11 @@ async def _round_anthropic(
     )
     kwargs.pop("parallel_tool_calls")
     kwargs["thinking"] = {"type": "enabled" if ENABLE_THINKING else "disabled"}
+    kwargs["extra_body"] = {
+        name: kwargs.pop(name)
+        for name in ("temperature", "top_p", "top_k")
+        if name in kwargs
+    }
     msg = await anthropic_client.messages.create(messages=messages, **kwargs)
     content_blocks = getattr(msg, "content", None)
     content_parts: list[str] = []
