@@ -13,6 +13,16 @@ from chitu.task_type import TaskType
 import torch
 
 
+def _assert_block_table_prefixes(
+    block_table: torch.Tensor, expected: list[list[int]]
+) -> None:
+    """Compare valid block-table prefixes; padding values are unspecified."""
+    assert block_table.ndim == 2
+    assert block_table.shape[0] == len(expected)
+    for batch_index, block_ids in enumerate(expected):
+        assert block_table[batch_index, : len(block_ids)].tolist() == block_ids
+
+
 @pytest.fixture(autouse=True)
 def setup_global_args():
     """Set up global arguments for tests."""
@@ -257,9 +267,7 @@ class TestPagedKVCache:
 
         # test get_accessor after prepare_cache_prefill
         accessor = kvcache.get_accessor(0, is_mtp=False)
-        assert torch.all(
-            accessor.block_table == torch.tensor([[0, 0, 0, 0], [1, 0, 0, 0]])
-        )
+        _assert_block_table_prefixes(accessor.block_table, [[0], [1]])
         for _, tensor in accessor.kv.items():
             assert tensor.shape == (100, 512, 8, 64)
 
@@ -283,9 +291,7 @@ class TestPagedKVCache:
 
         # test accessor after prepare_cache_decode
         accessor = kvcache.get_accessor(0, is_mtp=False)
-        assert torch.all(
-            accessor.block_table == torch.tensor([[0, 2, 0, 0], [1, 0, 0, 0]])
-        )
+        _assert_block_table_prefixes(accessor.block_table, [[0, 2], [1]])
 
         # test finalize_cache_all_decode
         tasks = PackedTasksBase(
@@ -322,9 +328,7 @@ class TestPagedKVCache:
         assert kvcache.seq_len_delta.new.lens_list == [514, 9]
 
         accessor = kvcache.get_accessor(0, is_mtp=False)
-        assert torch.all(
-            accessor.block_table == torch.tensor([[0, 1, 0, 0], [2, 0, 0, 0]])
-        )
+        _assert_block_table_prefixes(accessor.block_table, [[0, 1], [2]])
 
         # 结束'req_3','req_4'
         tasks = PackedTasksBase(
