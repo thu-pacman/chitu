@@ -10,6 +10,7 @@ import time
 from datetime import datetime
 from logging import getLogger
 from typing import Annotated, Any, Optional, Literal, Mapping
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -21,7 +22,7 @@ DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
 
 if not DOC_GENERATION:
     from chitu.global_vars import get_global_args
-    from chitu.task import UserRequest, RequestParams
+    from chitu.task import PromptTooLongError, UserRequest, RequestParams
     from chitu.serve.common import (
         set_min_batch_size,
         submit_request,
@@ -495,8 +496,11 @@ async def handle_chat_completion(
 ):
 
     args = get_global_args()
+    try:
+        user_req = build_user_request(request, priority)
+    except PromptTooLongError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     set_min_batch_size(request.min_batch_size)
-    user_req = build_user_request(request, priority)
     await submit_request(user_req)
     rsp = AsyncResponse(user_req)
 
