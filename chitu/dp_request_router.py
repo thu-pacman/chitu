@@ -21,6 +21,7 @@ from chitu.global_vars import (
     get_multi_inst_config,
     is_classic_pd_disagg,
     is_independent_multi_inst,
+    get_multi_inst_ids_by_role,
 )
 from chitu.distributed.coordinator import set_endpoint, get_endpoint
 from chitu.boot.arg_utils import calculate_parallelism_sizes
@@ -436,6 +437,9 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             1, int(getattr(config, "router_evict_buffer_size", 64))
         )
 
+        # If requests are routed by request length
+        self.routing_by_req_len = False
+
     def clear_prefix_cache(self):
         self.cached_blocks.clear()
         self.evict_buffer.clear()
@@ -497,7 +501,12 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             - self.num_hit_blocks(local_instance_id, req_blocks) * block_size,
         )
 
-    def select_scheduler(self, request: UserRequest) -> int:
+    def select_scheduler(
+        self,
+        request: UserRequest,
+        *,
+        eligible_ids: Optional[list[int]] = None,
+    ) -> int:
         """Two-layer gate: load-balance is a brake, cache is default.
         1. Compute load spread over eligible ranks. If BOTH the absolute and the
            relative spread exceed the thresholds -> route to the least-loaded
@@ -508,7 +517,8 @@ class PrefixCacheAwarePolicy(LoadBalancer):
            rank so future same-prefix requests follow the load distribution.
         """
         self._reap_stale_router_reservations()
-        eligible_ids = self.eligible_schedulers()
+        if eligible_ids is None:
+            eligible_ids = self.eligible_schedulers()
         if not eligible_ids:
             raise RuntimeError("No eligible schedulers available for request routing.")
         if len(eligible_ids) == 1:
@@ -555,6 +565,13 @@ class PrefixCacheAwarePolicy(LoadBalancer):
                 f"match_rate={match_rate:.2f} hits={best_num_hits}/{best_total}"
             )
             return best_scheduler
+
+        if self.routing_by_req_len:
+            logger.debug(
+                f"[PREFIX_ROUTER] req[{request.request_id}] weak match_rate={match_rate:.2f} "
+                f"-> seed on min-max_seq_len sid={eligible_ids[0]}"
+            )
+            return eligible_ids[0]
 
         logger.debug(
             f"[PREFIX_ROUTER] req[{request.request_id}] weak match_rate={match_rate:.2f} "
@@ -650,9 +667,18 @@ class RequestRouter:
 
     def __init__(self, config: ServeRouterConfig):
         self.config = config
+        self.prefill_and_decode_schedulers: dict[int, dict] = {}
+        self.routing_by_req_len = bool(
+            getattr(self.config, "routing_by_req_len", False)
+        )
+        if self.routing_by_req_len:
+            self._parse_scheduler_configs()
         if config.routing_algorithm == "prefix_cache_aware":
             self.policy = PrefixCacheAwarePolicy(config)
+            self.policy.routing_by_req_len = self.routing_by_req_len
         else:
+            if self.routing_by_req_len:
+                raise ValueError("LoadBalancer do not supports routing_by_req_len")
             self.policy = LoadBalancer(config)
         self.context = zmq.asyncio.Context()
         # 轮询游标
@@ -688,6 +714,19 @@ class RequestRouter:
         self.stop_on_heartbeat_timeout: bool = os.environ.get("CI_TESTS") == "true"
 
         logger.info(f"RequestRouter initialized for {self._n_insts} instance(s)")
+
+    def _scheduler_max_seq_len(self, inst_id: int) -> int:
+        inst_override = get_multi_inst_config(inst_id)
+        infer_cfg = getattr(inst_override, "infer", None)
+        max_seq_len = getattr(infer_cfg, "max_seq_len", 10240)
+        return max_seq_len
+
+    def _parse_scheduler_configs(self):
+        for i, inst_id in enumerate(get_multi_inst_ids_by_role("prefill_and_decode")):
+            self.prefill_and_decode_schedulers[i] = {
+                "global_instance_id": inst_id,
+                "max_seq_len": self._scheduler_max_seq_len(inst_id),
+            }
 
     def _ensure_ttft_deadline(self, request: UserRequest) -> None:
         if request.ttft_deadline_ts is not None:
@@ -888,6 +927,24 @@ class RequestRouter:
             token_router.active_requests.pop(request.request_id, None)
         remove_request_everywhere(request.request_id)
 
+    def _length_routing_candidates(
+        self,
+        *,
+        policy: PrefixCacheAwarePolicy,
+        schedulers: dict[int, dict],
+        req_seq_len: int,
+    ) -> list[int]:
+        eligible_alive = set(policy.eligible_schedulers())
+        return sorted(
+            (
+                sid
+                for sid, info in schedulers.items()
+                if sid in eligible_alive
+                and info.get("max_seq_len", 10240) > req_seq_len
+            ),
+            key=lambda sid: schedulers[sid].get("max_seq_len", 10240),
+        )
+
     async def _request_processor_task(self):
         """Process pending requests and route them to schedulers."""
         logger.info(f"[REQUEST_ROUTER] Request processor task started")
@@ -917,7 +974,18 @@ class RequestRouter:
                     # Admission + selection delegated to LoadBalancer (soft admission inside)
                     start_time = time.time()
                     try:
-                        local_instance_id = self.policy.select_scheduler(request)
+                        eligible_ids = (
+                            self._length_routing_candidates(
+                                policy=self.policy,
+                                schedulers=self.prefill_and_decode_schedulers,
+                                req_seq_len=request.prompt_len + request.max_new_tokens,
+                            )
+                            if self.routing_by_req_len
+                            else None
+                        )
+                        local_instance_id = self.policy.select_scheduler(
+                            request, eligible_ids
+                        )
                     except Exception:
                         # No eligible/alive schedulers currently; push back briefly
                         self.pending_requests.appendleft(request)

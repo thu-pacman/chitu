@@ -36,6 +36,8 @@ def _build_router(algorithm: str = "prefix_cache_aware") -> RequestRouter:
         router_evict_buffer_size=64,
         router_local_reservation_timeout_s=600.0,
         launch_timeout=3600.0,
+        routing_by_req_len=False,
+        decode_routing_by_req_len=False,
     )
     router = RequestRouter(cfg)
     return router
