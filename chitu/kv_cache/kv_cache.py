@@ -192,6 +192,31 @@ class KVCacheQuantType(Enum):
         return self in {KVCacheQuantType.FP8_PERTENSOR}
 
 
+BlockTableUpdate = tuple[int, int, Sequence[int]]  # batch_index, start, block_ids
+
+
+@dataclass
+class GPUBlockTableSyncState:
+    """Previous GPU synchronization state indexed by batch index."""
+
+    batch_states: list[Optional[tuple[str, int]]]
+    batch_size: int = 0
+
+    @classmethod
+    def create(cls, capacity: int) -> "GPUBlockTableSyncState":
+        return cls(batch_states=[None] * capacity)
+
+    def get(self, batch_index: int) -> Optional[tuple[str, int]]:
+        return self.batch_states[batch_index]
+
+    def commit(self, task_ids: list[str], lengths: list[int]) -> None:
+        for batch_index, (task_id, length) in enumerate(zip(task_ids, lengths)):
+            self.batch_states[batch_index] = (task_id, length)
+        for batch_index in range(len(task_ids), self.batch_size):
+            self.batch_states[batch_index] = None
+        self.batch_size = len(task_ids)
+
+
 class KVCacheBase:
     def __init__(
         self,
@@ -578,6 +603,7 @@ class PagedKVCache(KVCacheBase):
         self.gpu_block_table = StaticTensor(
             max_nelem=self.max_num_blocks, dtype=torch.int32, device=self.device
         )
+        self._gpu_block_table_sync_state = GPUBlockTableSyncState.create(num_hot_req)
         self.paged_kv_cache: dict[str, torch.Tensor] = {}
         logger.info(
             f"Allocating KV cache of {','.join(self.shape_per_token_dict.keys())} with "
@@ -679,38 +705,131 @@ class PagedKVCache(KVCacheBase):
     def offs_in_page_mtp(self):
         return self.mtp_seq_len_delta.delta_position_ids_tensor_device % self.block_size
 
-    def _upd_gpu_block_table(self, task_ids: list[str]):
-        block_lists = [list(self.block_table[tid]) for tid in task_ids]
-        max_len = max(len(blocks) for blocks in block_lists)
-        if get_global_args().infer.use_cuda_graph:
-            if max_len > self.max_blocks_per_req:
-                logger.warning(
-                    "block_table length exceeds per-request page-table limit; "
-                    "decode max_seq_len may be too small. "
-                    f"max_len={max_len} max_blocks_per_req={self.max_blocks_per_req} "
-                    f"max_seq_len={get_global_args().infer.max_seq_len} block_size={self.block_size}"
-                )
-            max_block_num = max(self.max_blocks_per_req, max_len)
-        else:
-            max_block_num = max_len
+    def _copy_gpu_block_table_updates(
+        self,
+        gpu_block_table: torch.Tensor,
+        updates: list[BlockTableUpdate],
+    ) -> None:
+        """Copy planned valid ranges through one flat CPU staging tensor.
 
-        all_block_ids = [
-            # pad the block ids to max_block_num
-            blocks + [0] * (max_block_num - len(blocks))
-            for blocks in block_lists
+        This avoids materializing a padded Python ``batch x table_width`` list.
+        Values outside each request's valid block-table prefix remain unspecified.
+        """
+        flat_block_ids = [
+            block_id for _, _, block_ids in updates for block_id in block_ids
         ]
-        cpu_block_table_tensor = create_tensor(
-            all_block_ids,
-            device=self.device,
+        staging = create_tensor(
+            flat_block_ids,
+            device="cpu",
             dtype=torch.int32,
-            sync_free=True,
+            sync_free=self.device.type != "cpu",
         )
-        self.gpu_block_table.set_shape(cpu_block_table_tensor.shape)
-        self.gpu_block_table.get().copy_(cpu_block_table_tensor, non_blocking=True)
 
+        staging_offset = 0
+        for batch_index, start, block_ids in updates:
+            num_blocks = len(block_ids)
+            gpu_block_table[batch_index, start : start + num_blocks].copy_(
+                staging[staging_offset : staging_offset + num_blocks],
+                non_blocking=self.device.type != "cpu",
+            )
+            staging_offset += num_blocks
+
+    def _validate_gpu_block_table_batch(self, task_ids: list[str]) -> None:
+        if len(task_ids) > self.num_hot_req:
+            raise ValueError(
+                "block-table batch exceeds configured hot-request capacity: "
+                f"batch_size={len(task_ids)} num_hot_req={self.num_hot_req}"
+            )
+
+    def _upd_gpu_block_table(
+        self,
+        task_ids: list[str],
+        incremental: bool = False,
+    ):
+        """Synchronize CPU block-table rows into the GPU table.
+
+        ``self.block_table`` is authoritative. ``incremental=True`` is reserved
+        for the append-only scheduler path: an unchanged batch-index binding copies
+        only ``blocks[previous_len:]``. Rebinds and other callers refresh the
+        complete valid prefix. Consumers must use sequence lengths to bound every
+        row; padding beyond ``len(self.block_table[task_id])`` is unspecified.
+        """
+        self._validate_gpu_block_table_batch(task_ids)
+        block_rows = [self.block_table[tid] for tid in task_ids]
+        max_len = max((len(blocks) for blocks in block_rows), default=0)
+
+        if max_len > self.max_blocks_per_req:
+            raise ValueError(
+                "block-table row exceeds configured per-request capacity: "
+                f"max_len={max_len} max_blocks_per_req={self.max_blocks_per_req} "
+                f"max_seq_len={get_global_args().infer.max_seq_len} block_size={self.block_size}"
+            )
+
+        # Keep the row stride stable so synchronization history remains valid
+        # regardless of whether CUDA Graph is enabled.
+        self.gpu_block_table.set_shape((len(task_ids), self.max_blocks_per_req))
+        gpu_block_table = self.gpu_block_table.get()
+        state = self._gpu_block_table_sync_state
+        updates: list[BlockTableUpdate] = []
+
+        for batch_index, (task_id, blocks) in enumerate(zip(task_ids, block_rows)):
+            binding = state.get(batch_index)
+            previous_task_id, previous_len = binding or (None, 0)
+            # Only an unchanged batch-index binding with monotonic growth has a dirty suffix.
+            is_valid_append = (
+                incremental
+                and previous_task_id == task_id
+                and previous_len <= len(blocks)
+            )
+
+            if is_valid_append:
+                if previous_len < len(blocks):
+                    updates.append((batch_index, previous_len, blocks[previous_len:]))
+            else:
+                if blocks:
+                    updates.append((batch_index, 0, blocks))
+
+        if updates:
+            self._copy_gpu_block_table_updates(gpu_block_table, updates)
+
+        state.commit(task_ids, [len(blocks) for blocks in block_rows])
         self.update_page_offs()
-        # self._page_ids_up_to_date = False
-        # self._offs_in_page_up_to_date = False
+
+    def _update_block_table_from_scheduler(
+        self,
+        tasks: "PackedTasksBase",
+        incremental: bool = False,
+    ) -> None:
+        """Apply scheduler allocations, then synchronize the active GPU rows.
+
+        Owning both operations here makes ``incremental=True`` an append-only
+        contract instead of trusting a caller-provided list of dirty block IDs.
+        """
+        task_ids = tasks.task_ids
+        self._validate_gpu_block_table_batch(task_ids)
+
+        new_cache_ids_list = tasks.new_cache_ids_list
+        if new_cache_ids_list and len(new_cache_ids_list) != len(task_ids):
+            raise ValueError(
+                "new_cache_ids_list must be empty or match task_ids: "
+                f"new_cache_ids={len(new_cache_ids_list)} task_ids={len(task_ids)}"
+            )
+
+        if new_cache_ids_list:
+            for task_id, item in zip(task_ids, new_cache_ids_list):
+                new_block_ids = item.get(self.manager_name, [])
+                new_length = len(self.block_table.get(task_id, ())) + len(new_block_ids)
+                if new_length > self.max_blocks_per_req:
+                    raise ValueError(
+                        "block-table row exceeds configured per-request capacity: "
+                        f"task_id={task_id} new_len={new_length} "
+                        f"max_blocks_per_req={self.max_blocks_per_req}"
+                    )
+
+            for task_id, item in zip(task_ids, new_cache_ids_list):
+                self.block_table[task_id].extend(item.get(self.manager_name, []))
+
+        self._upd_gpu_block_table(task_ids, incremental=incremental)
 
     def update_page_offs(self):
         self._page_ids_up_to_date = False
@@ -719,11 +838,7 @@ class PagedKVCache(KVCacheBase):
     @override
     def prepare_cache_prefill(self, tasks: "PackedTasksBase"):
         super().prepare_cache_prefill(tasks)
-        if tasks.new_cache_ids_list:
-            for tid, item in zip(tasks.task_ids, tasks.new_cache_ids_list):
-                new_cache_ids = item.get(self.manager_name, [])
-                self.block_table[tid].extend(new_cache_ids)
-        self._upd_gpu_block_table(tasks.task_ids)
+        self._update_block_table_from_scheduler(tasks)
 
     def prepare_cache_prefill_dllm(
         self,
@@ -742,23 +857,14 @@ class PagedKVCache(KVCacheBase):
         # Call base class to set up seq_len_delta and tid_to_cached_len
         super().prepare_cache_prefill_dllm(tasks, prefilling_lengths)
 
-        # Receive pre-allocated block indices from scheduler
-        if tasks.new_cache_ids_list:
-            for tid, item in zip(tasks.task_ids, tasks.new_cache_ids_list):
-                new_cache_ids = item.get(self.manager_name, [])
-                self.block_table[tid].extend(new_cache_ids)
-        self._upd_gpu_block_table(tasks.task_ids)
+        self._update_block_table_from_scheduler(tasks)
 
     @override
     def prepare_cache_decode(self, tasks: "PackedTasksBase"):
         # Prepare enough block table for next decoding. When decoding, AttnBackend will fill new kv into
         # paged kv cache in place.
         super().prepare_cache_decode(tasks)
-        if tasks.new_cache_ids_list:
-            for tid, item in zip(tasks.task_ids, tasks.new_cache_ids_list):
-                new_cache_ids = item.get(self.manager_name, [])
-                self.block_table[tid].extend(new_cache_ids)
-        self._upd_gpu_block_table(tasks.task_ids)
+        self._update_block_table_from_scheduler(tasks, incremental=True)
 
     def prepare_cache_decode_dllm(
         self,
@@ -774,12 +880,7 @@ class PagedKVCache(KVCacheBase):
         # Call base class to set curr_req_ids and seq_len_delta
         super().prepare_cache_decode_dllm(tasks, decoding_start, block_length)
 
-        # Receive pre-allocated block indices from scheduler (via new_cache_ids_list)
-        if tasks.new_cache_ids_list:
-            for tid, item in zip(tasks.task_ids, tasks.new_cache_ids_list):
-                new_cache_ids = item.get(self.manager_name, [])
-                self.block_table[tid].extend(new_cache_ids)
-        self._upd_gpu_block_table(tasks.task_ids)
+        self._update_block_table_from_scheduler(tasks, incremental=True)
 
     def estimate_bytes_per_block(self) -> int:
         """Estimate additional bytes required to allocate 1 more KV page/block.

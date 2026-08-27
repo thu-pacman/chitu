@@ -104,6 +104,10 @@ class PDRequestRouter(RequestRouter):
         self.prefill_schedulers: dict[int, dict] = {}  # local_instance_id -> info
         self.decode_schedulers: dict[int, dict] = {}  # local_instance_id -> info
 
+        self.decode_routing_by_req_len = bool(
+            getattr(self.config, "decode_routing_by_req_len", False)
+        )
+
         self.pd_coordination_service = PDCoordinationService()
         self._parse_pd_scheduler_configs()
 
@@ -115,7 +119,10 @@ class PDRequestRouter(RequestRouter):
         routing_algorithm = getattr(self.config, "routing_algorithm", "")
         if routing_algorithm == "prefix_cache_aware":
             self.prefill_policy = PrefixCacheAwarePolicy(self.config)
+            self.prefill_policy.routing_by_req_len = self.routing_by_req_len
         elif routing_algorithm in ("round_robin", "power_of_two_choices"):
+            if self.routing_by_req_len:
+                raise ValueError("LoadBalancer do not supports routing_by_req_len")
             self.prefill_policy = LoadBalancer(self.config)
             self.prefill_policy.algorithm = routing_algorithm
         else:
@@ -130,7 +137,10 @@ class PDRequestRouter(RequestRouter):
         )
         if decode_algorithm == "prefix_cache_aware":
             self.decode_policy = PrefixCacheAwarePolicy(self.config)
+            self.decode_policy.routing_by_req_len = self.decode_routing_by_req_len
         elif decode_algorithm in ("round_robin", "power_of_two_choices"):
+            if self.decode_routing_by_req_len:
+                raise ValueError("LoadBalancer do not supports routing_by_req_len")
             self.decode_policy = LoadBalancer(self.config)
             self.decode_policy.algorithm = decode_algorithm
         else:
@@ -191,6 +201,10 @@ class PDRequestRouter(RequestRouter):
                 "global_instance_id": inst_id,
                 "status": "online",
             }
+            if self.routing_by_req_len:
+                self.prefill_schedulers[i]["max_seq_len"] = self._scheduler_max_seq_len(
+                    inst_id
+                )
             logger.info(f"configuring prefill scheduler {i} for instance {inst_id}")
 
         for i, inst_id in enumerate(get_multi_inst_ids_by_role("decode")):
@@ -198,6 +212,10 @@ class PDRequestRouter(RequestRouter):
                 "global_instance_id": inst_id,
                 "status": "online",
             }
+            if self.decode_routing_by_req_len:
+                self.decode_schedulers[i]["max_seq_len"] = self._scheduler_max_seq_len(
+                    inst_id
+                )
             logger.info(f"configuring decode scheduler {i} for instance {inst_id}")
 
     async def start(self):
@@ -536,8 +554,33 @@ class PDRequestRouter(RequestRouter):
 
         with observe_pd_stage("router", "recv"):
             try:
-                prefill_scheduler_id = self.prefill_policy.select_scheduler(request)
-                decode_scheduler_id = self.decode_policy.select_scheduler(request)
+                prefill_eligible_ids = (
+                    self._length_routing_candidates(
+                        policy=self.prefill_policy,
+                        schedulers=self.prefill_schedulers,
+                        req_seq_len=request.prompt_len,
+                    )
+                    if self.routing_by_req_len
+                    else None
+                )
+                decode_eligible_ids = (
+                    self._length_routing_candidates(
+                        policy=self.decode_policy,
+                        schedulers=self.decode_schedulers,
+                        req_seq_len=request.prompt_len + request.max_new_tokens,
+                    )
+                    if self.decode_routing_by_req_len
+                    else None
+                )
+                prefill_scheduler_id = self.prefill_policy.select_scheduler(
+                    request,
+                    eligible_ids=prefill_eligible_ids,
+                )
+                decode_scheduler_id = self.decode_policy.select_scheduler(
+                    request,
+                    eligible_ids=decode_eligible_ids,
+                )
+
             except Exception as e:
                 logger.warning(f"no available prefill or decode scheduler: {e}")
                 return

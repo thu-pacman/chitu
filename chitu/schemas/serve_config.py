@@ -206,6 +206,8 @@ class RouterConfig:
     max_inflight_per_instance: int = MISSING
     routing_algorithm: str = MISSING
     routing_algorithm_for_decode: str = MISSING
+    routing_by_req_len: bool = MISSING
+    decode_routing_by_req_len: bool = MISSING
     router_cache_threshold: float = MISSING
     router_balance_abs_threshold: float = MISSING
     router_balance_rel_threshold: float = MISSING

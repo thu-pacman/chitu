@@ -751,6 +751,11 @@ multi_inst:
     # Used only by PD decode routing when PD disaggregation is enabled.
     routing_algorithm_for_decode: "prefix_cache_aware" # option: prefix_cache_aware, power_of_two_choices, round_robin
 
+    # Instacne can dynamically select requests of different lengths, with long requests prioritizing long instances
+    # and short requests prioritizing short instances
+    routing_by_req_len: False
+    decode_routing_by_req_len: False
+
     # Only effective when routing_algorithm == prefix_cache_aware or routing_algorithm_for_decode == prefix_cache_aware.
     # Minimum prefix-cache block hit rate required to route to the best prefix-cache instance.
     router_cache_threshold: 0.5
