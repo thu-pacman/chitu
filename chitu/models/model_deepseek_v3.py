@@ -285,13 +285,22 @@ class Indexer(torch.nn.Module):
         else:
             weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
-        # CP-specific: extract k_append and local_ks
+        # CP-specific: extract k_append and query-aligned local bounds. KE is
+        # relative here; the Hygon scorer converts it to an absolute end with
+        # KS after reading the packed global K tensor.
         k_append = k_indexer[cp_rank::pcp_size] if pcp_size > 1 else None
         local_ks = None
+        local_ke = None
         if pcp_size > 1 and not seq_len_delta.is_decode_stage:
+            row_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
             local_ks = seq_len_delta.new.prefix_lens_tensor_device[
-                seq_len_delta.delta_seq_ids_tensor_device
+                row_seq_ids
             ].contiguous()
+            local_ke = (
+                seq_len_delta.delta_position_ids_tensor_device + 1
+                if is_causal
+                else seq_len_delta.new.lens_tensor_device[row_seq_ids]
+            ).contiguous()
 
         s_q = q_indexer.shape[0]
         if s_q == 0:
@@ -305,12 +314,6 @@ class Indexer(torch.nn.Module):
             getattr(seq_len_delta, "base_delta", seq_len_delta),
             cache_accessor,
             k_append=k_append,
-        )
-
-        q_seq_ids = (
-            seq_len_delta.delta_seq_ids_tensor_device
-            if pcp_size > 1 and not seq_len_delta.is_decode_stage
-            else None
         )
 
         # Prefill fast path: when the whole sequence fits within index_topk,
@@ -339,18 +342,8 @@ class Indexer(torch.nn.Module):
                 seq_len_delta,
                 cache_accessor,
                 is_causal,
-                ke=(
-                    (seq_len_delta.delta_position_ids_tensor_device + 1)
-                    if pcp_size > 1 and not seq_len_delta.is_decode_stage
-                    else None
-                ),
+                ke=local_ke,
                 ks=local_ks,
-                q_seq_ids=q_seq_ids,
-                compact_prefill_logits=not self.indexer_impl.should_use_packed_hygon_prefill(
-                    seq_len_delta,
-                    self.index_topk,
-                    return_indices=True,
-                ),
             )
             return reduce(logits, seq_len_delta)
 
@@ -358,13 +351,8 @@ class Indexer(torch.nn.Module):
         for i in range(0, s_q, chunk_size):
             j = min(i + chunk_size, s_q)
             delta_view = BatchedSeqLenDeltaView(seq_len_delta, i, j)
-            ke_slice = (
-                delta_view.delta_position_ids_tensor_device + 1
-                if pcp_size > 1 and not seq_len_delta.is_decode_stage
-                else None
-            )
+            ke_slice = local_ke[i:j] if local_ke is not None else None
             ks_slice = local_ks[i:j] if local_ks is not None else None
-            q_seq_ids_slice = q_seq_ids[i:j] if q_seq_ids is not None else None
             q_slice = q_indexer[i:j]
             w_slice = weights[i:j]
             logits = self.indexer_impl.index_score(
@@ -375,12 +363,6 @@ class Indexer(torch.nn.Module):
                 is_causal,
                 ke=ke_slice,
                 ks=ks_slice,
-                q_seq_ids=q_seq_ids_slice,
-                compact_prefill_logits=not self.indexer_impl.should_use_packed_hygon_prefill(
-                    delta_view,
-                    self.index_topk,
-                    return_indices=True,
-                ),
             )
             rows = reduce(logits, delta_view)
             if out is None:
@@ -453,45 +435,14 @@ class Indexer(torch.nn.Module):
         """
 
         def reduce(logits, delta_view):
-            use_packed_hygon_prefill = (
-                self.indexer_impl.should_use_packed_hygon_prefill(
-                    delta_view,
-                    self.index_topk,
-                    return_indices=True,
-                )
-            )
-            if use_packed_hygon_prefill:
-                row_seq_ids = delta_view.delta_seq_ids_tensor_device
-                row_starts = delta_view.new.prefix_lens_tensor_device[
-                    row_seq_ids
-                ].contiguous()
-                lengths = (
-                    delta_view.delta_position_ids_tensor_device + 1
-                    if is_causal
-                    else delta_view.new.lens_tensor_device[row_seq_ids]
-                )
-
-                indices = topk_indices(
-                    logits,
-                    self.index_topk,
-                    lengths=lengths.contiguous(),
-                    row_starts=row_starts.contiguous(),
-                )
-                if indices.dtype != torch.int32:
-                    raise RuntimeError(
-                        "Packed Hygon TopK must return int32 indices, got "
-                        f"{indices.dtype}"
-                    )
-                if indices.shape[0] != logits.shape[0]:
-                    raise RuntimeError(
-                        "Packed Hygon TopK rows mismatch: "
-                        f"{indices.shape[0]} != {logits.shape[0]}"
-                    )
-                return indices
-
             # Ensure k does not exceed the actual score width.
             k_topk = min(self.index_topk, logits.size(-1))
-            lengths = delta_view.delta_position_ids_tensor_device + 1
+            row_seq_ids = delta_view.delta_seq_ids_tensor_device
+            lengths = (
+                delta_view.delta_position_ids_tensor_device + 1
+                if is_causal
+                else delta_view.new.lens_tensor_device[row_seq_ids]
+            )
             # May select some out-of-range items as -inf, which is fine.
             return topk_indices(logits, k_topk, lengths=lengths)
 

@@ -311,17 +311,23 @@ class Scheduler:
             return completed_tokens
 
         num_cached_tokens = task.prefix_tokens_len
+        cache_manager_block_sizes: list[int] = []
         for manager in list(self.cache_manager_dict.values()):
             # Skip Cache that does not support prefix caching e.g. singleton
             if not manager.enable_prefix_caching:
                 continue
+            cache_manager_block_sizes.append(manager.block_size)
             num_cached_tokens = min(
                 num_cached_tokens, manager.num_cached_blocks(task) * manager.block_size
             )
             if num_cached_tokens <= completed_tokens:
                 return completed_tokens
 
-        return num_cached_tokens
+        if cache_manager_block_sizes:
+            block_lcm = math.lcm(*cache_manager_block_sizes)
+            num_cached_tokens = (num_cached_tokens // block_lcm) * block_lcm
+
+        return max(completed_tokens, num_cached_tokens)
 
     def _inflight_prefill_reserved_blocks(
         self, cache_manager, exclude_task_id: str

@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import inspect
+import os
 from typing import Optional
 
 from chitu.ops import (
@@ -24,10 +26,7 @@ from chitu.kv_cache import (
 from chitu.device_type import is_ascend, is_hygon, is_nvidia
 from chitu.utils import try_import_opt_dep, try_import_platform_dep, get_global_args
 from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
-from chitu.ops.topk import (
-    topk_indices,
-    has_hygon_indexer_topk,
-)
+from chitu.ops.topk import topk_indices
 from chitu.static_tensor import StaticTensor
 
 import torch
@@ -39,8 +38,44 @@ logger = getLogger(__name__)
 triton, has_triton = try_import_platform_dep("triton")
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 hygon_deepgemm, has_hygon_deepgemm = try_import_opt_dep("deepgemm", "deep_gemm")
-lightop, has_hygon_lightop = try_import_platform_dep("lightop")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
+
+
+def _has_hygon_compact_mqa_logits(module, available: bool) -> bool:
+    """Check for the canonical gfx936 compact-MQA package contract."""
+    if not available:
+        return False
+
+    op = getattr(module, "mqa_logits", None)
+    if not callable(op) or not str(getattr(module, "gfx", "")).startswith("gfx936"):
+        return False
+
+    asm_dir = str(getattr(module, "DEEPGEMM_ASM_DIR", ""))
+    if not asm_dir or not os.path.isfile(
+        os.path.join(asm_dir, "deepgemm_mqa_logits.co")
+    ):
+        return False
+
+    try:
+        parameters = inspect.signature(op).parameters
+    except (TypeError, ValueError):
+        return False
+
+    required = {
+        "clean_logit",
+        "D_out",
+        "max_seqlen_k",
+        "compact_output",
+        "assume_ks_nondecreasing",
+    }
+    return (
+        required.issubset(parameters) and parameters["compact_output"].default is True
+    )
+
+
+has_hygon_compact_mqa_logits = _has_hygon_compact_mqa_logits(
+    hygon_deepgemm, has_hygon_deepgemm
+)
 
 if has_triton:
     # Schedule helpers used to build the triton_bf16 prefill qblock schedule once
@@ -60,17 +95,12 @@ support_indexer_deepgemm = (
 support_indexer_hygon = (
     is_hygon()
     and has_chitu_backend
-    and has_hygon_lightop
-    and hasattr(lightop, "op")
-    and hasattr(lightop.op, "mqa_logits")
     and has_hygon_deepgemm
+    and has_hygon_compact_mqa_logits
     and hasattr(hygon_deepgemm, "paged_mqa_logits")
     and hasattr(hygon_deepgemm, "get_paged_mqa_logits_metadata")
 )
-support_hygon_packed_topk = support_indexer_hygon and has_hygon_indexer_topk
 HYGON_INDEXER_MAX_MTP_SIZE = 5
-
-_hygon_mqa_logits_keyword_support: dict[object, bool] = {}
 
 
 def use_fp8_dsa_indexer_kv(args) -> bool:
@@ -85,42 +115,6 @@ def use_fp8_dsa_indexer_kv(args) -> bool:
             f"DSA indexer KV cache only supports no quantization or fp8_pertoken_indexer, got {indexer_kv_quant_type}"
         )
     return indexer_kv_quant_type == "fp8_pertoken_indexer"
-
-
-def _call_hygon_mqa_logits(
-    q,
-    k,
-    weights,
-    ks,
-    ke,
-    s_q,
-    s_k,
-    h,
-    head_dim,
-    clean_logits,
-):
-    """Call LightOp mqa_logits across its old and new Python ABIs."""
-    op = lightop.op.mqa_logits
-    common_args = (q, k, weights, ks, ke, s_q, s_k, h, head_dim)
-
-    if op in _hygon_mqa_logits_keyword_support:
-        if _hygon_mqa_logits_keyword_support[op]:
-            return op(*common_args, clean_logits=clean_logits)
-        return op(*common_args, clean_logits)
-
-    # Older bindings name clean_logits and let the preceding KV_scale default
-    # to None. The current binding exposes only positional arguments. Probe the
-    # keyword form once per binding and cache the compatible call form.
-    try:
-        result = op(*common_args, clean_logits=clean_logits)
-    except TypeError as exc:
-        if "incompatible function arguments" not in str(exc):
-            raise
-        result = op(*common_args, clean_logits)
-        _hygon_mqa_logits_keyword_support[op] = False
-    else:
-        _hygon_mqa_logits_keyword_support[op] = True
-    return result
 
 
 def validate_indexer_config(args, indexer_type):
@@ -163,8 +157,10 @@ def _validate_deepgemm_indexer_config(args):
 def _validate_hygon_indexer_config(args):
     if not support_indexer_hygon:
         raise ValueError(
-            "indexer_type=hygon requires the Chitu backend, Hygon lightop "
-            "prefill mqa logits, and DeepGEMM paged mqa logits and metadata"
+            "indexer_type=hygon requires the Chitu backend and Hygon DeepGEMM "
+            "dense/paged mqa logits and paged metadata; dense prefill requires "
+            "the compact-capable mqa_logits API and the canonical gfx936 code "
+            "object deepgemm_mqa_logits.co"
         )
     if args.infer.cache_type != "paged":
         raise ValueError(
@@ -377,22 +373,6 @@ class DSAIndexer:
             else:
                 raise NotImplementedError()
 
-    def should_use_packed_hygon_prefill(
-        self,
-        seq_len_delta: BatchedSeqLenDelta | BatchedSeqLenDeltaView,
-        index_topk: int,
-        *,
-        return_indices: bool,
-    ) -> bool:
-        return (
-            self.impl == "hygon"
-            and support_hygon_packed_topk
-            and return_indices
-            and not seq_len_delta.is_decode_stage
-            and index_topk == 2048
-            and seq_len_delta.new.max_len > index_topk
-        )
-
     # TODO: 不同方法按照实际impl注册？
     def blockfp8_index_score_ragged_qk_dsv32_deepgemm(
         self,
@@ -459,131 +439,62 @@ class DSAIndexer:
         causal: bool,
         ke: Optional[torch.Tensor] = None,  # [s_q], int32, CP relative lengths
         ks: Optional[torch.Tensor] = None,  # [s_q], int32, CP row starts
-        q_seq_ids: Optional[torch.Tensor] = None,  # [s_q], CP-local seq ids
-        compact_output: bool = True,
     ):
         """
-        Indexer score by Hygon lightop.op.mqa_logits() for ragged qk in prefill stage.
+        Indexer score by Hygon DeepGEMM mqa_logits() for ragged qk in prefill.
 
         In CP mode, `ke` contains request-relative valid lengths and `ks`
-        contains request offsets in the concatenated K tensor. When
-        `compact_output` is false, LightOp's packed-global logits are returned
-        for direct consumption by TopK with matching row starts. LightOp is
-        called with `clean_logits=False` because every consumer restricts the
-        operation to the per-row valid range.
+        contains request offsets in the concatenated K tensor. DeepGEMM writes
+        each row's valid `[ks, ke)` range directly to local columns in a
+        contiguous `[M, W]` output, where `W` is the maximum request length.
         """
         s_q, h, _ = q.shape
         assert k.dim() == 2
 
         weights = weights.reshape(s_q, h)
 
-        # CP pads every rank to n_local rows, so q may contain trailing rows that
-        # are not real queries. q_seq_ids is built from the unpadded local index
-        # selection and therefore records the real query count. Do not expose
-        # those CP padding rows as logical M to the LightOp CO: the CO derives a
-        # whole 128-row tile's KE from KE[min(tile_end, logical_s_q - 1)], and a
-        # trailing CP dummy can otherwise truncate real rows in the same tile.
-        logical_s_q = q_seq_ids.shape[0] if q_seq_ids is not None else s_q
-        if logical_s_q <= 0 or logical_s_q > s_q:
-            raise ValueError(
-                f"Invalid Hygon MQA logical query count {logical_s_q} "
-                f"for storage query count {s_q}"
-            )
-
         if ke is not None:
             if ks is None:
                 ks = torch.zeros(s_q, dtype=torch.int32, device=q.device)
             ke = ke + ks
         else:
-            # Standard path: compute from seq_len_delta
-            ks = seq_len_delta.new.prefix_lens_tensor_device[
-                seq_len_delta.delta_seq_ids_tensor_device
-            ]
+            row_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
+            ks = seq_len_delta.new.prefix_lens_tensor_device[row_seq_ids]
             if causal:
                 ke = seq_len_delta.delta_position_ids_tensor_device + ks + 1
             else:
-                ke = (
-                    seq_len_delta.new.lens_tensor_device[
-                        seq_len_delta.delta_seq_ids_tensor_device
-                    ]
-                    + ks
-                )
+                ke = seq_len_delta.new.lens_tensor_device[row_seq_ids] + ks
 
-        # LightOp mqa_logits call contract for its 128-row path:
-        # 1. Every query-row input (`q`, `weights`, `ks`, and `ke`) must provide
-        #    physical storage for round_up(logical_s_q, 128) rows.
-        # 2. Set `ks = ke = 0` for every padded query row.
-        # 3. Pass the real query count, excluding CP padding, as logical_s_q;
-        #    never pass the padded physical row count.
-        required_storage_rows = logical_s_q
-        # Preserve the proven ASM threshold: the tail-OOB evidence covers this
-        # path, not LightOp's small-M behavior.
-        if logical_s_q >= 128:
-            required_storage_rows = (logical_s_q + 127) // 128 * 128
-        if s_q < required_storage_rows:
-            pad_rows = required_storage_rows - s_q
-            q = torch.cat((q, q.new_zeros((pad_rows, h, q.shape[2]))), dim=0)
-            weights = torch.cat((weights, weights.new_zeros((pad_rows, h))), dim=0)
-            ks = torch.cat((ks, ks.new_zeros((pad_rows,))), dim=0)
-            ke = torch.cat((ke, ke.new_zeros((pad_rows,))), dim=0)
+        if tuple(ks.shape) != (s_q,) or tuple(ke.shape) != (s_q,):
+            raise ValueError(
+                "Hygon MQA metadata must match the query rows exactly: "
+                f"q={s_q}, ks={tuple(ks.shape)}, ke={tuple(ke.shape)}"
+            )
 
-        # LightOp's MQA ABI assumes packed [M, H, D] input and has no stride
-        # arguments. A fused indexer/attention projection returns indexer Q as
-        # a strided view, so materialize it at the Hygon kernel boundary. Keep
-        # this after tail padding to avoid copying the same Q twice.
-        q = q.contiguous()
-
-        index_score = _call_hygon_mqa_logits(
-            q,
-            k,
+        # The dense MQA ABI has no Q/K stride arguments. Fused QKV projection
+        # can return a strided Q view even though CP now carries only real rows.
+        # Weights and metadata are already contiguous on the production path.
+        index_score = hygon_deepgemm.mqa_logits(
+            q.contiguous(),
+            k.contiguous(),
             weights,
             ks,
             ke,
-            logical_s_q,
-            k.shape[0],
-            h,
-            q.shape[2],
-            clean_logits=False,
+            clean_logit=False,
+            max_seqlen_k=int(seq_len_delta.new.max_len),
+            compact_output=True,
+            # Packed scheduler order and CP's ascending local subsequence keep
+            # absolute KS nondecreasing. Chunking only takes contiguous slices.
+            assume_ks_nondecreasing=True,
         )
 
-        if index_score.shape[0] < logical_s_q:
+        expected_shape = (s_q, int(seq_len_delta.new.max_len))
+        if tuple(index_score.shape) != expected_shape:
             raise RuntimeError(
-                f"Hygon MQA returned {index_score.shape[0]} rows for "
-                f"logical query count {logical_s_q}"
+                f"Hygon MQA returned shape {tuple(index_score.shape)}, "
+                f"expected {expected_shape}"
             )
-        if index_score.shape[0] > logical_s_q:
-            index_score = index_score.narrow(0, 0, logical_s_q)
-
-        if not compact_output:
-            return index_score
-
-        # This kernel stores the output in a (ragged_q * ragged_k) layout, we need to
-        # convert it back to (ragged_q * local_k), so the following `topk` can be correct.
-        # The (ragged_q * ragged_k) layout is a pure waste of memory, because most of the
-        # items in a row does not store any value at all. TODO: Implement our own version
-        # of this kernel on hygon, and replace it.
-        out = torch.full(
-            (s_q, seq_len_delta.new.max_len),
-            float("-inf"),
-            dtype=index_score.dtype,
-            device=index_score.device,
-        )
-        row_seq_ids = (
-            q_seq_ids
-            if q_seq_ids is not None
-            else seq_len_delta.delta_seq_ids_tensor_device
-        )
-        for seq_id, (row_start, seq_len) in enumerate(
-            zip(seq_len_delta.new.prefix_lens_list, seq_len_delta.new.lens_list)
-        ):
-            rows = torch.nonzero(row_seq_ids == seq_id, as_tuple=True)[0]
-            local_width = min(seq_len, seq_len_delta.new.max_len)
-            if rows.numel() and local_width:
-                out[rows, :local_width] = index_score[
-                    rows, row_start : row_start + local_width
-                ]
-
-        return out
+        return index_score
 
     def bf16_index_score_ragged_q_paged_k_dsv32_hygon(
         self,
@@ -620,7 +531,7 @@ class DSAIndexer:
             )
 
         # reshape as batch view
-        q = q.contiguous().view(batch_size, next_n, h, d)
+        q = q.view(batch_size, next_n, h, d)
 
         weights = weights.reshape(s_q, h)
         assert k.dim() == 3
@@ -858,8 +769,6 @@ class DSAIndexer:
         is_causal: bool = True,
         ke: Optional[torch.Tensor] = None,
         ks: Optional[torch.Tensor] = None,
-        q_seq_ids: Optional[torch.Tensor] = None,
-        compact_prefill_logits: bool = True,
     ):
         assert isinstance(cache_accessor, PagedKVCacheAccessor)
         # CP: k is allgathered global K (n_local*pcp_size tokens), k_append is local K (n_local tokens).
@@ -890,8 +799,6 @@ class DSAIndexer:
                 is_causal,
                 ke=ke,
                 ks=ks,
-                q_seq_ids=q_seq_ids,
-                compact_output=compact_prefill_logits,
             )
 
         return index_score
@@ -1013,15 +920,11 @@ class DSAIndexer:
         is_causal: bool = True,
         ke: Optional[torch.Tensor] = None,
         ks: Optional[torch.Tensor] = None,
-        q_seq_ids: Optional[torch.Tensor] = None,
-        compact_prefill_logits: bool = True,
     ):
-        """Pure index-score (raw logits) for one (possibly query-sliced) ``q``.
+        """Compute index-score logits for one (possibly query-sliced) ``q``.
 
         In CP mode ``ke`` / ``ks`` are the query-aligned local bounds
-        (already sliced to match ``q`` by the caller), and ``q_seq_ids`` are the
-        CP-local per-row sequence ids (the global ``delta_seq_ids`` would
-        mislabel the rank-local query rows).
+        already sliced to match ``q`` by the caller.
         """
         if q.numel() == 0:
             return torch.empty(
@@ -1041,8 +944,6 @@ class DSAIndexer:
                 is_causal,
                 ke=ke,
                 ks=ks,
-                q_seq_ids=q_seq_ids,
-                compact_prefill_logits=compact_prefill_logits,
             )
         elif self.impl in ("torch_bf16", "triton_bf16"):
             return self.bf16_index_score_dsa_bf16(

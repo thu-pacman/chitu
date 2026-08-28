@@ -120,7 +120,6 @@ def test_index_score_prefill_reads_cache_then_method_scores(
     scorer_kwargs = []
     ke = torch.tensor([1, 2, 3], dtype=torch.int32)
     ks = torch.tensor([0, 4, 8], dtype=torch.int32)
-    q_seq_ids = torch.tensor([0, 0, 0], dtype=torch.int32)
 
     monkeypatch.setattr(
         dsa_indexer_module,
@@ -147,7 +146,6 @@ def test_index_score_prefill_reads_cache_then_method_scores(
         _paged_accessor("indexer_k", "indexer_k_ks"),
         ke=ke,
         ks=ks,
-        q_seq_ids=q_seq_ids,
     )
 
     assert out is expected
@@ -159,8 +157,6 @@ def test_index_score_prefill_reads_cache_then_method_scores(
     else:
         assert scorer_kwargs[0]["ke"] is ke
         assert scorer_kwargs[0]["ks"] is ks
-        assert scorer_kwargs[0]["q_seq_ids"] is q_seq_ids
-        assert scorer_kwargs[0]["compact_output"] is True
 
 
 @pytest.mark.parametrize("impl", ["torch_bf16", "triton_bf16"])
