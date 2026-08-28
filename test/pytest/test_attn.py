@@ -550,7 +550,7 @@ def test_dsa_indexer_paged_kv_bf16(
     bs, s_q, s_k, n_heads, head_dim, impl, record_benchmark
 ):
     if impl == "hygon" and not support_indexer_hygon:
-        pytest.skip("hygon indexer requires Hygon lightop")
+        pytest.skip("hygon indexer requires compact-capable Hygon DeepGEMM")
     if impl == "triton_bf16" and not (torch.cuda.is_available() and has_triton):
         pytest.skip("triton_bf16 indexer requires CUDA + triton")
 
