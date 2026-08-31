@@ -801,7 +801,8 @@ is `paged`.
 Acceptable values:
 - "max": The maximum value of `decode micro batch size` is limited to `max_reqs_per_dp / pp_size`.
 - An integer: The maximum value of `decode micro batch size` is limited to the number.
-- "auto": Currently this means "max".
+- "auto": Dynamically distributes current decode requests across PP scheduler groups, while using
+  "max" as the static upper bound and allowing the current group to schedule at least one candidate.
 
 *Default: `auto`.*
 

@@ -149,17 +149,20 @@ class Scheduler:
                 prefill_chunk_size=prefill_chunk_size_per_dp,
             )
 
+        auto_decode_num_tasks = False
         if infer_args.pp_size > 1:
             if args.pp_config.pp_micro_batch_size_prefill == "max":
                 prefill_num_tasks = ceil_div(max_reqs_per_dp, infer_args.pp_size)
             else:
                 assert args.pp_config.pp_micro_batch_size_prefill.isdigit()
                 prefill_num_tasks = int(args.pp_config.pp_micro_batch_size_prefill)
-            if args.pp_config.pp_micro_batch_size_decode == "max":
+            decode_mode = args.pp_config.pp_micro_batch_size_decode
+            if decode_mode in {"auto", "max"}:
                 decode_num_tasks = ceil_div(max_reqs_per_dp, infer_args.pp_size)
+                auto_decode_num_tasks = decode_mode == "auto"
             else:
-                assert args.pp_config.pp_micro_batch_size_decode.isdigit()
-                decode_num_tasks = int(args.pp_config.pp_micro_batch_size_decode)
+                assert decode_mode.isdigit()
+                decode_num_tasks = int(decode_mode)
         else:
             prefill_num_tasks = max_reqs_per_dp
             decode_num_tasks = max_reqs_per_dp
@@ -175,6 +178,7 @@ class Scheduler:
             num_scheduler_groups=infer_args.pp_size,
             dp_rank=dp_rank,
             prefill_chunk_size=prefill_chunk_size_per_dp,
+            auto_decode_num_tasks=auto_decode_num_tasks,
         )
 
     def __init__(
@@ -188,6 +192,7 @@ class Scheduler:
         num_scheduler_groups: int,
         dp_rank: int = 0,
         prefill_chunk_size: Optional[int] = None,
+        auto_decode_num_tasks: bool = False,
     ):
         """
         Initialize the scheduler.
@@ -222,6 +227,7 @@ class Scheduler:
         self.max_running_tasks = max_running_tasks
         self.prefill_num_tasks = prefill_num_tasks
         self.decode_num_tasks = decode_num_tasks
+        self.auto_decode_num_tasks = auto_decode_num_tasks
         self.prefill_chunk_size = prefill_chunk_size
         self.cache_manager_dict = cache_manager_dict
         self.num_scheduler_groups = num_scheduler_groups
@@ -608,7 +614,7 @@ class Scheduler:
 
         # scheduling decode tasks
         if filter_task_type == TaskType.Decode:
-            task_ids = self._schedule_decode_tasks(task_ids)[: self.decode_num_tasks]
+            task_ids = self._schedule_decode_tasks(task_ids)
 
         # Allocate sgroup for for task_ids
         keep_unwait: Optional[set[str]] = None
@@ -899,10 +905,16 @@ class Scheduler:
         if not decode_task_ids:
             return []
 
+        current_group_decode_limit = self._get_current_group_decode_limit(
+            len(decode_task_ids)
+        )
+        if current_group_decode_limit == 0:
+            return []
+
         sched_out_task_ids = []
         evict_tasks = []
 
-        while decode_task_ids and len(sched_out_task_ids) < self.decode_num_tasks:
+        while decode_task_ids and len(sched_out_task_ids) < current_group_decode_limit:
             candidate_task_id, num_cached_tokens = decode_task_ids.popleft()
             candidate_task = TaskPool.pool[candidate_task_id]
             is_bootstrap_candidate = num_cached_tokens is not None
@@ -961,6 +973,44 @@ class Scheduler:
             )
 
         return sched_out_task_ids
+
+    def _get_current_group_decode_limit(self, num_candidate_tasks: int) -> int:
+        """Return the decode task limit for the current PP scheduler group.
+
+        In auto mode, schedulable and in-flight decode tasks for this DP rank
+        are distributed as evenly as possible across PP scheduler groups.
+        Lower-numbered groups receive one additional task when the total is
+        not divisible by the group count. For example, five tasks across four
+        groups produce limits of ``[2, 1, 1, 1]``. When candidates are
+        available, every group receives a minimum limit of one to avoid an
+        empty pipeline step. Static modes return the configured decode limit
+        unchanged.
+
+        Args:
+            num_candidate_tasks: Number of schedulable logical decode
+                candidates for this DP rank.
+
+        Returns:
+            Maximum number of decode tasks that the current scheduler group
+            may select in this step.
+        """
+        if not self.auto_decode_num_tasks:
+            return self.decode_num_tasks
+
+        num_waiting_tasks = sum(
+            1
+            for task in TaskPool.pool.values()
+            if task.task_type == TaskType.Decode
+            and task.status == TaskStatus.Waiting
+            and task.dp_rank == self.dp_rank
+        )
+        total_num_tasks = num_candidate_tasks + num_waiting_tasks
+        base_num_tasks, remainder = divmod(total_num_tasks, self.num_scheduler_groups)
+        sgroup_id = self.sgroup_list.get_current_sgroup()
+        return min(
+            self.decode_num_tasks,
+            max(1, base_num_tasks + int(sgroup_id < remainder)),
+        )
 
     def evict_task(self, task_id: str, congestion_control: bool = True):
         """Evicting kv cache in kv_cache manager of the given task_id, restore task state to its pre-prefilling state

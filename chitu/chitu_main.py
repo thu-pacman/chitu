@@ -1223,7 +1223,7 @@ def warmup_engine(args):
         max_reqs_per_dp = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
         if args.infer.pp_size > 1:
             if (
-                args.scheduler.pp_config.pp_micro_batch_size_decode == "max"
+                args.scheduler.pp_config.pp_micro_batch_size_decode in {"auto", "max"}
                 or get_slot_handle()
             ):
                 local_max_bs = ceil_div(max_reqs_per_dp, args.infer.pp_size)

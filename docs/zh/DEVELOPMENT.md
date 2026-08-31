@@ -523,7 +523,7 @@ torchrun --nnodes 2 --nproc_per_node 8 test/single_req_test.py request.max_new_t
 | 参数                              | 默认值 | 说明                                                         |
 | :-------------------------------- | :----- | :----------------------------------------------------------- |
 | `pp_micro_batch_size_prefill`     | `auto` | 当 `pp_size > 1` 且 `cache_type` 为 `paged` 时生效。设置为 `max` 时，限制最大 `prefill micro batch size` 为 `max_reqs_per_dp / pp_size`；设置为具体数字时，限制为该数字；设置为 `auto` 时，自动采用 `max` 策略。 |
-| `pp_micro_batch_size_decode`      | `auto` | 当 `pp_size > 1` 且 `cache_type` 为 `paged` 时生效。设置为 `max` 时，限制最大 `decode micro batch size` 为 `max_reqs_per_dp / pp_size`；设置为具体数字时，限制为该数字；设置为 `auto` 时，自动采用 `max` 策略。 |
+| `pp_micro_batch_size_decode`      | `auto` | 当 `pp_size > 1` 且 `cache_type` 为 `paged` 时生效。设置为 `max` 时，限制最大 `decode micro batch size` 为 `max_reqs_per_dp / pp_size`；设置为具体数字时，限制为该数字；设置为 `auto` 时，按照当前 Decode 请求数在 PP group 间动态分配，并以 `max` 作为静态上限。 |
 
 具体使用：
 

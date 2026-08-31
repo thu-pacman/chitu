@@ -1,7 +1,7 @@
 import time
 from omegaconf import OmegaConf
 
-from chitu.task import Task, TaskPool, UserRequest
+from chitu.task import Task, TaskPool, TaskStatus, UserRequest
 from chitu.kv_cache import PagedKVCacheManager
 from chitu.scheduler import Scheduler, SkewScheduler
 from chitu.global_vars import set_global_args, set_slot_handle, get_global_args
@@ -1585,6 +1585,77 @@ def test_pp_chunked_prefill():
         len(expected_batch_ids_list) - pp_size + 1, len(expected_batch_ids_list)
     ):
         scheduler.update(batch_ids_list[i])
+
+
+def test_auto_current_group_decode_limit_distributes_requests_across_pp_groups():
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 1024,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                    "pp_size": 4,
+                    "schedule_overlap": True,
+                    "mtp_size": 1,
+                }
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    TaskPool.reset()
+    Backend.cache_managers = [
+        {
+            "main": PagedKVCacheManager(
+                num_blocks=100,
+                num_hot_req=100,
+                max_seq_len=1024,
+                dp_rank=0,
+                block_size=512,
+            )
+        }
+    ]
+    scheduler = Scheduler(
+        max_running_tasks=100,
+        prefill_num_tasks=3,
+        decode_num_tasks=3,
+        scheduler_type="prefill_first",
+        cache_manager_dict=Backend.cache_managers[0],
+        num_scheduler_groups=4,
+        auto_decode_num_tasks=True,
+    )
+
+    candidate_task_ids = set()
+    for i in range(10):
+        req = UserRequest.create_mock(
+            input_len=10, request_id=f"req_{i}", enable_thinking=False
+        )
+        task = Task(req.request_id, req)
+        task.task_type = TaskType.Decode
+        task.dp_rank = 0
+        TaskPool.add(task)
+        candidate_task_ids.add(task.task_id)
+
+    for sgroup_id, expected in enumerate([3, 3, 2, 2]):
+        scheduler.sgroup_list.current_sgroup_id = sgroup_id
+        assert (
+            scheduler._get_current_group_decode_limit(len(candidate_task_ids))
+            == expected
+        )
+
+    other_dp_req = UserRequest.create_mock(
+        input_len=10, request_id="other_dp", enable_thinking=False
+    )
+    other_dp_task = Task(other_dp_req.request_id, other_dp_req)
+    other_dp_task.task_type = TaskType.Decode
+    other_dp_task.status = TaskStatus.Waiting
+    other_dp_task.dp_rank = 1
+    TaskPool.add(other_dp_task)
+    scheduler.sgroup_list.current_sgroup_id = 0
+    assert scheduler._get_current_group_decode_limit(len(candidate_task_ids)) == 3
+    scheduler.sgroup_list.current_sgroup_id = 3
+    assert scheduler._get_current_group_decode_limit(1) == 1
 
 
 def test_prepare_prefill_metadata_multi_cache_managers():

@@ -517,7 +517,7 @@ For PP, there are additional arguments for micro batching:
 | Parameter                         | Default | Description                                                  |
 | :-------------------------------- | :------ | :----------------------------------------------------------- |
 | `pp_micro_batch_size_prefill`     | `auto`  | Takes effect only when `pp_size > 1` and `cache_type` is `paged`. Setting this to `max` means the maximum value of `prefill micro batch size` is limited to `max_reqs_per_dp / pp_size`, setting this to a number means it is limited to the number, setting this to `auto` to use `max` strategy. |
-| `pp_micro_batch_size_decode`      | `auto`  | Takes effect only when `pp_size > 1` and `cache_type` is `paged`. Setting this to `max` means the maximum value of `decode micro batch size` is limited to `max_reqs_per_dp / pp_size`, setting this to a number means it is limited to the number, setting this to `auto` to use `max` strategy.  |
+| `pp_micro_batch_size_decode`      | `auto`  | Takes effect only when `pp_size > 1` and `cache_type` is `paged`. Setting this to `max` means the maximum value of `decode micro batch size` is limited to `max_reqs_per_dp / pp_size`; setting this to a number limits it to that number; setting this to `auto` dynamically distributes current decode requests across PP groups, using `max` as the static upper bound. |
 
 Usage Example
 
