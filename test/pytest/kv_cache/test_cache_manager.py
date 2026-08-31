@@ -348,8 +348,8 @@ class TestPagedKVCacheManager:
 
         # 在executor中完成的步骤
         task.consume_req_tokens()
-        task.next_token = 1
-        task.prefix_tokens.append(task.next_token)
+        task.next_tokens = [1]
+        task.prefix_tokens.append(task.next_tokens[0])
         assert task.consumed_req_tokens == 600
         assert task.prefix_tokens_len == 601
         assert task.task_type == TaskType.Decode
@@ -396,7 +396,7 @@ class TestPagedKVCacheManager:
         assert task_token_blocks[1].active_cnt == 1
 
         # 在executor中执行decode step
-        task.next_token = 1
+        task.next_tokens = [1]
         task.prefix_tokens.extend([1] * 400)  # 假设主模型只接受了400个token
         assert task.prefix_tokens_len == 1001
 
@@ -567,7 +567,7 @@ class TestPagedKVCacheManagerWithPrefixCaching:
         # 在executor中完成的步骤
         task_0.consume_req_tokens()
         task_0.prefix_tokens.append(1)
-        task_0.next_token = 1
+        task_0.next_tokens = [1]
         assert task_0.consumed_req_tokens == 1024
         assert task_0.task_type == TaskType.Decode
 

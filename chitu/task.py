@@ -554,8 +554,8 @@ class Task:
 
         # Response
         self.num_new_tokens: int = 0
-        self.next_token: int = -1  # Only effective when num_new_tokens > 0
-        self.num_new_tokens_single_step: int = 1
+        self.next_tokens: list[int] = []  # (K,) next verify input tokens for MTP
+        self.num_new_tokens_single_step: int = get_global_args().infer.mtp_size
 
         # task states
         # has_unsync_new_token is used to estimate the prefix_tokens_len
@@ -693,10 +693,13 @@ class Task:
 
     def update_response_sync(self, tokens: list[int]):
         assert tokens, "tokens cannot be empty"
-        self.next_token = tokens[-1]
+        self.next_tokens = list(tokens)
         self.num_new_tokens += len(tokens)
         self.prefix_tokens.extend(tokens)
         self.has_unsync_new_token = False
+        mtp_size = Backend.executor.mtp_size
+        if mtp_size > 1 and len(self.next_tokens) < mtp_size:
+            self.next_tokens = (self.next_tokens + [0] * mtp_size)[:mtp_size]
 
     def wait(self):
         if self.status == TaskStatus.AvailableForSchedule:
@@ -842,9 +845,6 @@ class Task:
                 >= self.prefix_tokens_len
             )
         ) or self.task_type == TaskType.Decode
-
-    def has_next_token(self):
-        return self.next_token >= 0
 
     @property
     def kv_cache_len_used_in_completed_steps(self):
@@ -1007,6 +1007,8 @@ class PackedTasksResult:
     """ sampled tokens, (bs, mtp_size) of int32 """
     accept_indices: torch.Tensor | None = None
     """ accept indices for mtp tokens, (bs,) of int32 if mtp decode, otherwise None. Equals to number of accepted tokens - 1 """
+    next_tokens: torch.Tensor | None = None
+    """ next verify input tokens, (bs, K) int64. """
     logprobs: torch.Tensor | None = None
     """ logprobs, (bs, vocab_size) of float32 """
     token_idxs: torch.Tensor | None = None
@@ -1023,13 +1025,14 @@ class PackedTasksResult:
         result = PackedTasksResult(
             tokens=to_cpu(self.tokens),
             accept_indices=to_cpu(self.accept_indices),
+            next_tokens=to_cpu(self.next_tokens),
             logprobs=to_cpu(self.logprobs),
             token_idxs=to_cpu(self.token_idxs),
             logits=to_cpu(self.logits),
+            synced=True,
         )
-        result.synced = (
-            torch.cuda.current_stream().record_event() if non_blocking else True
-        )
+        if non_blocking:
+            result.record_sync_event()
         return result
 
     def start_sync(self):
@@ -1051,6 +1054,10 @@ class PackedTasksResult:
         elif self.synced is False:
             return self._sync(False)
         return self.finish_sync()
+
+    def record_sync_event(self):
+        self.synced = torch.cuda.current_stream().record_event()
+        return self
 
     @cached_property
     def accepted_tokens(self) -> list[list[int]]:
@@ -1111,6 +1118,9 @@ class PackedTasksBase:
         PackedTasksBase.configured = True
         PackedTasksBase.max_num_tasks = max_num_tasks
 
+    def is_empty_tasks(self):
+        return self.payload_type == SerializedPackedTasksPayloadType.Empty
+
 
 class PackedTasks(PackedTasksBase):
     """A batch of tasks ready for model execution, constructed from task IDs.
@@ -1135,6 +1145,7 @@ class PackedTasks(PackedTasksBase):
         task_type: Optional[TaskType] = None,
         tasks: Optional[list[Task]] = None,
         metadata_only: bool = False,
+        payload_type: Optional[SerializedPackedTasksPayloadType] = None,
     ):
         super().__init__()
 
@@ -1160,7 +1171,11 @@ class PackedTasks(PackedTasksBase):
                 if task_type is not None
                 else DPTaskCollector.get_current_task_type()
             )
-            self.payload_type = SerializedPackedTasksPayloadType(self.task_type.value)
+            self.payload_type = (
+                payload_type
+                if payload_type is not None
+                else SerializedPackedTasksPayloadType(self.task_type.value)
+            )
             return
 
         # metadata
@@ -1189,7 +1204,11 @@ class PackedTasks(PackedTasksBase):
             self.inc_hit_tokens_list = [task.inc_hit_tokens for task in self.tasks]
         self.prefix_lens = [int(task.prefix_tokens_len) for task in self.tasks]
 
-        self.payload_type = SerializedPackedTasksPayloadType(self.task_type.value)
+        self.payload_type = (
+            payload_type
+            if payload_type is not None
+            else SerializedPackedTasksPayloadType(self.task_type.value)
+        )
 
         # additional modifications are required when adapting to MTP or Hybrid.
         # also need to be handle in deserialize
@@ -1238,7 +1257,13 @@ class PackedTasks(PackedTasksBase):
             else accept_indices_list
         )
         for i, task in enumerate(self.output_tasks):
-            task.mtp_accept_index = accept_indices[i]
+            # A Prefill step's accept is the prefill->decode boundary value: it
+            # is not backed by a K-wide decode window, so mark it -1 and let
+            # update_mtp_cache_accept skip the rewind for the first decode
+            # window (see KVCacheBase comment).
+            task.mtp_accept_index = (
+                -1 if self.task_type == TaskType.Prefill else accept_indices[i]
+            )
 
     def batch_update_response_sync(self):
         accepted_tokens = self.generated_result.accepted_tokens
@@ -1317,7 +1342,7 @@ class TaskCollector:
         if not TaskCollector.available():
             return None
 
-        if not isinstance(new_tasks, PackedTasks):
+        if not isinstance(new_tasks, PackedTasksBase):
             new_tasks = None
         if len(TaskCollector._waiting_queue) == 0:
             TaskCollector._postprocess_tasks = new_tasks

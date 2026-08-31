@@ -54,7 +54,7 @@ class MetadataConfig:
 
     # PD
     include_prompt_len: bool = False
-    include_next_token: bool = False
+    include_next_tokens: bool = False
     include_pd_prefill_engine_rank: bool = False
 
     # 辅助信息
@@ -71,7 +71,7 @@ class MetadataConfig:
             or self.include_consumed_tokens
             or self.include_chunk_size
             or self.include_prompt_len
-            or self.include_next_token
+            or self.include_next_tokens
             or self.include_pd_prefill_engine_rank
         )
 
@@ -177,7 +177,7 @@ class MetadataConfig:
             include_return_params=True,
             include_prompt_len=True,
             include_pd_prefill_engine_rank=True,
-            include_next_token=True,
+            include_next_tokens=True,
         )
 
     # 目前未使用，保留
@@ -198,7 +198,7 @@ class MetadataConfig:
         未经过 prefill_step，故非首 PP stage 的 TaskPool 没有它：
         - for_decode_with_status 不含 tasks_data，接收侧无法注册 → KeyError；
           本配置在 decode_with_status 基础上补注册字段（prompt_len /
-          sample_params / return_params / consumed / next_token），使非首 stage
+          sample_params / return_params / consumed / next_tokens），使非首 stage
           经 _create_task_from_data 重建该 Decode 任务。
         """
         return cls(
@@ -211,7 +211,7 @@ class MetadataConfig:
             include_sample_params=True,
             include_return_params=True,
             include_consumed_tokens=True,
-            include_next_token=True,
+            include_next_tokens=True,
         )
 
     @classmethod
@@ -366,8 +366,8 @@ class MetadataSerializer:
                     task_data["prefill_chunk_size"] = task.prefill_chunk_size
 
                 # Decode 相关字段
-                if config.include_next_token:
-                    task_data["next_token"] = task.next_token
+                if config.include_next_tokens:
+                    task_data["next_tokens"] = list(task.next_tokens)
 
                 tasks_data.append(task_data)
 
@@ -476,8 +476,8 @@ class MetadataSerializer:
                     int(task_data["prefill_chunk_size"])
                 )
             # Decode
-            if "next_token" in task_data:
-                task.next_token = task_data["next_token"]
+            if "next_tokens" in task_data:
+                task.next_tokens = list(task_data["next_tokens"])
 
             task_list.append(task)
 

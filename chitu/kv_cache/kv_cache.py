@@ -435,19 +435,13 @@ class KVCacheBase:
     ):
         for tid, accept_index in zip(tasks.task_ids, mtp_accept_indices):
             if accept_index >= 0:
+                assert tid in self.tid_to_cached_len
                 self.tid_to_cached_len[tid] += -self.mtp_size + accept_index + 1
 
-    def prepare_mtp_cache_decode(self, draft_offset: int):
-        task_ids = self.curr_tids
+    def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", draft_offset: int):
         self.mtp_seq_len_delta.copy_from_list(
-            [
-                self.tid_to_cached_len[tid] - self.mtp_size + draft_offset
-                for tid in task_ids
-            ],
-            [
-                self.tid_to_cached_len[tid] - self.mtp_size + draft_offset + 1
-                for tid in task_ids
-            ],
+            [self.tid_to_cached_len[tid] + draft_offset - 1 for tid in tasks.task_ids],
+            [self.tid_to_cached_len[tid] + draft_offset for tid in tasks.task_ids],
         )
         self.mtp_seq_len_delta.is_decode_stage = True
 
@@ -865,6 +859,22 @@ class PagedKVCache(KVCacheBase):
         # paged kv cache in place.
         super().prepare_cache_decode(tasks)
         self._update_block_table_from_scheduler(tasks, incremental=True)
+
+    @override
+    def update_mtp_cache_accept(
+        self, tasks: "PackedTasksBase", mtp_accept_indices: list[int]
+    ):
+        super().update_mtp_cache_accept(tasks, mtp_accept_indices)
+        # TODO: incremental update
+        self._upd_gpu_block_table(tasks.task_ids)
+
+    @override
+    def prepare_mtp_cache_decode(self, tasks, draft_offset):
+        super().prepare_mtp_cache_decode(tasks, draft_offset)
+        # FIXME: prepare mtp blocks
+        # self._update_block_table_from_scheduler(tasks, incremental=True)
+        # TODO: incremental update
+        self._upd_gpu_block_table(tasks.task_ids)
 
     def prepare_cache_decode_dllm(
         self,
@@ -1326,7 +1336,7 @@ class MMPagedKVCache(PagedKVCache):
         pass
 
     @override
-    def prepare_mtp_cache_decode(self, draft_offset: int):
+    def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", offset: int):
         pass
 
     @override

@@ -343,6 +343,10 @@ class PDSchedulerService:
         """
         deadline = asyncio.get_running_loop().time() + timeout
         while Backend.state != BackendState.Terminated:
+            if TaskPool.all_finished():
+                # Engine drained: ack immediately (the main loop may still be
+                # mid-step and set Terminated on the next boundary).
+                break
             if asyncio.get_running_loop().time() > deadline:
                 logger.warning(
                     "timed out waiting for main loop to terminate backend; "
@@ -474,19 +478,15 @@ class PDSchedulerService:
                         logger.info(
                             "Terminate_engine received. Draining in-flight requests"
                         )
-                        if TaskPool.all_finished():
-                            # Do NOT call chitu_terminate() from this thread: the
-                            # scheduler service thread and the main process_queue loop
-                            # would then race on the non-thread-safe ZMQ sockets.
-                            # Only write the Terminating flag here; the main loop
-                            # executes chitu_terminate() at a step boundary.
-                            await self._wait_for_terminate()
-                            await self._send_termination_ack()
-                            self.running = False
-                            break
-                        self._log_termination_drain_state(
-                            "terminate_received_not_drained"
-                        )
+                        # all_finished() is racy here (task mid-removal /
+                        # not-yet-cleared _last_batch_results): gating on it could skip
+                        # the ack and hang the router's 30s drain. The main loop
+                        # re-checks it and calls chitu_terminate() at a step boundary;
+                        # this thread only sets the Terminating flag.
+                        await self._wait_for_terminate()
+                        await self._send_termination_ack()
+                        self.running = False
+                        break
                     elif isinstance(request_data, dict) and is_flush_cache_message(
                         request_data
                     ):
