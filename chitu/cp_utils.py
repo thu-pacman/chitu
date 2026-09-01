@@ -13,7 +13,7 @@ Access via get_cp_context() singleton. When pcp_size == 1, returns NoOpCPContext
 from __future__ import annotations
 
 import torch
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
@@ -81,6 +81,45 @@ def build_cp_local_indices(
         device=device,
         dtype=torch.long,
     )
+
+
+def pad_rows_to_count(
+    tensors: Sequence[torch.Tensor], target_rows: int
+) -> list[torch.Tensor]:
+    """Zero-pad tensors along dim 0 to exactly ``target_rows`` rows.
+
+    Used to equalize per-rank row counts before equal-shape collectives (e.g.
+    the CP allgather and the ETP reduce-scatter in the MoE CP-ETP dispatcher).
+    Real rows always come first; trailing pad rows are all zeros. No-op for
+    tensors that already have ``target_rows`` rows.
+
+    Raises if a tensor has more rows than the target: silently feeding an
+    oversized tensor to an equal-shape collective would desynchronize (hang)
+    the whole group, so fail fast instead.
+    """
+    padded = []
+    for tensor in tensors:
+        rows = tensor.shape[0]
+        if rows == target_rows:
+            padded.append(tensor)
+        elif rows < target_rows:
+            pad = torch.zeros(
+                target_rows - rows,
+                *tensor.shape[1:],
+                device=tensor.device,
+                dtype=tensor.dtype,
+            )
+            padded.append(torch.cat([tensor, pad], dim=0))
+        else:
+            raise ValueError(
+                f"Cannot pad tensor with {rows} rows down to target_rows={target_rows}"
+            )
+    return padded
+
+
+def trim_rows(tensor: torch.Tensor, rows: int) -> torch.Tensor:
+    """Keep the first ``rows`` rows of dim 0 (no-op if already shorter)."""
+    return tensor[:rows] if tensor.shape[0] > rows else tensor
 
 
 class CPContext:
@@ -389,6 +428,16 @@ class CPContext:
         return self._n_local
 
     @property
+    def expected_n_local(self) -> int:
+        """Equal per-rank row count required by equal-shape collectives.
+
+        Real per-rank row counts may differ after PCP removes token padding;
+        collective boundaries pad every rank up to this count. Only meaningful
+        while the CP context is active (``is_active``).
+        """
+        return self._expected_n_local
+
+    @property
     def orig_num_tokens(self) -> int:
         """Get the original (global) token count from the most recent split."""
         return self._orig_num_tokens
@@ -466,6 +515,11 @@ class NoOpCPContext:
 
     @property
     def n_local(self) -> int:
+        return 0
+
+    @property
+    def expected_n_local(self) -> int:
+        """Undefined when CP is inactive; callers must check ``is_active`` first."""
         return 0
 
     @property
