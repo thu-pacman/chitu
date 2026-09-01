@@ -7,6 +7,7 @@ import logging
 from logging import WARNING, INFO, getLogger
 import os
 import re
+import sys
 from pathlib import Path
 import random
 from typing import Optional, Sequence, Any, TypeVar, get_type_hints
@@ -69,6 +70,25 @@ def get_chitu_bool_env(
         return False
     else:
         return None
+
+
+def should_pretty_log(args=None) -> bool:
+    """Whether pretty (interactive) terminal output should be printed.
+
+    Follows the `pretty_log` serve config:
+      - "auto": only when stdout and stderr are attached to a terminal.
+      - "true": always, even when redirected (e.g. `2>&1 | tee`).
+      - "false": never.
+    When `args` is omitted or does not define `pretty_log` (e.g. global args
+    are not initialized yet during logging setup), fall back to terminal
+    detection.
+    """
+    pretty_log = str(getattr(args, "pretty_log", "auto")).lower() if args else "auto"
+    if pretty_log in ("true", "1"):
+        return True
+    if pretty_log in ("false", "0"):
+        return False
+    return sys.stdout.isatty() and sys.stderr.isatty()
 
 
 _regex_special_chars = set(".^$*+?{}[]|()")

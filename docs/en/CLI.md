@@ -1093,3 +1093,16 @@ This is an explicit timeout effective for layerwise loading. For non-layerwise l
 timeout may or may not happen in the communication immedately after model loading.
 
 *Default: `60`.*
+
+## Argument `pretty_log`
+
+Controls whether pretty (interactive) output is printed to the terminal,
+such as the per-rank model-load progress bars.
+
+- "auto": print only when stdout and stderr are attached to a terminal.
+  When output is redirected to a file or piped (e.g. `2>&1 | tee`), pretty
+  output is suppressed to keep logs small.
+- "true": always print pretty output, even when output is redirected.
+- "false": never print pretty output.
+
+*Default: `auto`.*

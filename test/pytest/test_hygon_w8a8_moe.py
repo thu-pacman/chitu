@@ -59,7 +59,14 @@ def test_hygon_deepgemm_moe_contiguous_forward_matches_reference(monkeypatch):
 
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_deepgemm", True)
-    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "deepgemm", _FakeDeepGemm())
+    monkeypatch.setattr(
+        w8a8_per_token_per_channel_dyn, "hygon_deepgemm", _FakeDeepGemm()
+    )
+    monkeypatch.setattr(
+        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8LegacyMarlinWeight,
+        "convert_from",
+        classmethod(lambda cls, tensor: tensor),
+    )
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_lightop", False)
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "lightop", SimpleNamespace())
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "_DEEPGEMM_MOE_BLOCK_SIZE", 2)
@@ -255,6 +262,28 @@ def test_hygon_deepgemm_moe_forward_no_sum_pads_small_masked_layout(monkeypatch)
     calls = []
 
     class _FakeDeepGemm:
+        def m_grouped_w8a8_gemm_nt_masked(
+            self,
+            a_pair,
+            w_pair,
+            out,
+            masked_m,
+            expected_m,
+            config=None,
+        ):
+            del config
+            a, a_scale = a_pair
+            del w_pair
+            calls.append(
+                {
+                    "a_shape": tuple(a.shape),
+                    "a_scale_shape": tuple(a_scale.shape),
+                    "masked_m": masked_m.clone(),
+                    "expected_m": expected_m,
+                }
+            )
+            out.zero_()
+
         def m_grouped_w8a8_gemm_nt_masked_impl(
             self,
             a_pair,
@@ -264,22 +293,16 @@ def test_hygon_deepgemm_moe_forward_no_sum_pads_small_masked_layout(monkeypatch)
             expected_m,
             mode,
         ):
-            a, a_scale = a_pair
-            del w_pair
-            calls.append(
-                {
-                    "a_shape": tuple(a.shape),
-                    "a_scale_shape": tuple(a_scale.shape),
-                    "masked_m": masked_m.clone(),
-                    "expected_m": expected_m,
-                    "mode": mode,
-                }
+            del mode
+            self.m_grouped_w8a8_gemm_nt_masked(
+                a_pair, w_pair, out, masked_m, expected_m
             )
-            out.zero_()
 
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_deepgemm", True)
-    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "deepgemm", _FakeDeepGemm())
+    monkeypatch.setattr(
+        w8a8_per_token_per_channel_dyn, "hygon_deepgemm", _FakeDeepGemm()
+    )
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_lightop", False)
     monkeypatch.setattr(
         w8a8_per_token_per_channel_dyn,
@@ -292,7 +315,14 @@ def test_hygon_deepgemm_moe_forward_no_sum_pads_small_masked_layout(monkeypatch)
     monkeypatch.setattr(
         w8a8_per_token_per_channel_dyn,
         "silu_and_mul",
-        lambda x, *, swiglu_limit=None: x[..., : x.shape[-1] // 2].contiguous(),
+        lambda x, *, swiglu_limit=None, expert_n_tokens=None: x[
+            ..., : x.shape[-1] // 2
+        ].contiguous(),
+    )
+    monkeypatch.setattr(
+        w8a8_per_token_per_channel_dyn,
+        "get_global_args",
+        lambda: SimpleNamespace(infer=SimpleNamespace(max_batch_size=64, mtp_size=1)),
     )
 
     module = w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
@@ -304,18 +334,14 @@ def test_hygon_deepgemm_moe_forward_no_sum_pads_small_masked_layout(monkeypatch)
         n_activated_experts=2,
         checkpoint_prefix="",
     )
-    gate_up_native = (
-        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8Marlin2Weight.convert_from(
-            module.gate_up_proj_weight.data.clone()
-        )
+    gate_up_native = SimpleNamespace(
+        layout_tensor=module.gate_up_proj_weight.data.clone(),
+        plain_shape=tuple(module.gate_up_proj_weight.data.shape),
     )
-    down_native = (
-        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8Marlin2Weight.convert_from(
-            module.down_proj_weight.data.clone()
-        )
+    down_native = SimpleNamespace(
+        layout_tensor=module.down_proj_weight.data.clone(),
+        plain_shape=tuple(module.down_proj_weight.data.shape),
     )
-    module.gate_up_proj_weight.data = gate_up_native.layout_tensor
-    module.down_proj_weight.data = down_native.layout_tensor
     module.get_native_layout_gate_up_proj_weight = lambda: gate_up_native
     module.get_native_layout_down_proj_weight = lambda: down_native
     module.gate_up_proj_weight_scale.data.fill_(1.0)
@@ -332,9 +358,8 @@ def test_hygon_deepgemm_moe_forward_no_sum_pads_small_masked_layout(monkeypatch)
 
     out = module.forward_no_sum(routed_x)
 
-    assert out.activation_per_expert.shape == (2, 64, 16)
+    assert out.activation_per_expert.shape == (2, 8, 16)
     assert len(calls) == 2
-    assert all(call["mode"] == 0 for call in calls)
     assert all(call["expected_m"] == 64 for call in calls)
     assert all(call["a_shape"] == (2, 64, 16) for call in calls)
     assert all(call["a_scale_shape"] == (2, 64, 1) for call in calls)
@@ -344,15 +369,16 @@ def test_hygon_deepgemm_moe_masked_forward_no_sum_matches_reference(monkeypatch)
     calls = []
 
     class _FakeDeepGemm:
-        def m_grouped_w8a8_gemm_nt_masked_impl(
+        def m_grouped_w8a8_gemm_nt_masked(
             self,
             a_pair,
             w_pair,
             out,
             masked_m,
             expected_m,
-            mode,
+            config=None,
         ):
+            del config
             a, a_scale = a_pair
             w, w_scale = w_pair
             calls.append(
@@ -363,7 +389,6 @@ def test_hygon_deepgemm_moe_masked_forward_no_sum_matches_reference(monkeypatch)
                     "w_scale_shape": tuple(w_scale.shape),
                     "masked_m": masked_m.clone(),
                     "expected_m": expected_m,
-                    "mode": mode,
                 }
             )
 
@@ -373,9 +398,25 @@ def test_hygon_deepgemm_moe_masked_forward_no_sum_matches_reference(monkeypatch)
                 scale = w_scale[expert_id].to(torch.float32).view(-1, 1)
                 out[expert_id].copy_(a_fp[expert_id] @ (weight * scale).t())
 
+        def m_grouped_w8a8_gemm_nt_masked_impl(
+            self,
+            a_pair,
+            w_pair,
+            out,
+            masked_m,
+            expected_m,
+            mode,
+        ):
+            del mode
+            self.m_grouped_w8a8_gemm_nt_masked(
+                a_pair, w_pair, out, masked_m, expected_m
+            )
+
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_deepgemm", True)
-    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "deepgemm", _FakeDeepGemm())
+    monkeypatch.setattr(
+        w8a8_per_token_per_channel_dyn, "hygon_deepgemm", _FakeDeepGemm()
+    )
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_lightop", False)
     monkeypatch.setattr(
         w8a8_per_token_per_channel_dyn,
@@ -388,10 +429,15 @@ def test_hygon_deepgemm_moe_masked_forward_no_sum_matches_reference(monkeypatch)
     monkeypatch.setattr(
         w8a8_per_token_per_channel_dyn,
         "silu_and_mul",
-        lambda x, *, swiglu_limit=None: (
+        lambda x, *, swiglu_limit=None, expert_n_tokens=None: (
             torch.nn.functional.silu(x[..., : x.shape[-1] // 2])
             * x[..., x.shape[-1] // 2 :]
         ),
+    )
+    monkeypatch.setattr(
+        w8a8_per_token_per_channel_dyn,
+        "get_global_args",
+        lambda: SimpleNamespace(infer=SimpleNamespace(max_batch_size=64, mtp_size=1)),
     )
 
     module = w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
@@ -468,27 +514,22 @@ def test_hygon_deepgemm_moe_masked_forward_no_sum_matches_reference(monkeypatch)
 
     out = module.forward_no_sum(routed_x)
 
-    expected = torch.zeros((2, 64, 4), dtype=torch.float32)
-    expected[:, :3] = routed_x.activation_per_expert
-    gate_up = torch.empty((2, 64, 4), dtype=torch.float32)
+    expected = routed_x.activation_per_expert.to(torch.int8)
+    gate_up = torch.empty((2, 3, 4))
     for expert_id in range(2):
-        gate_up[expert_id] = (
-            expected[expert_id] @ gate_up_weight[expert_id].to(torch.float32).t()
-        )
-    intermediate = (
-        (torch.nn.functional.silu(gate_up[..., :2]) * gate_up[..., 2:])
-        .to(torch.int8)
-        .to(torch.float32)
+        gate_up[expert_id] = expected[expert_id] @ gate_up_weight[expert_id].t()
+    intermediate = (torch.nn.functional.silu(gate_up[..., :2]) * gate_up[..., 2:]).to(
+        torch.int8
     )
-    ref = torch.empty((2, 64, 4), dtype=torch.float32)
+    ref = torch.empty((2, 3, 4), dtype=torch.int8)
     for expert_id in range(2):
-        ref[expert_id] = (
-            intermediate[expert_id] @ down_weight[expert_id].to(torch.float32).t()
-        )
+        ref[expert_id] = intermediate[expert_id] @ down_weight[expert_id].t()
 
-    torch.testing.assert_close(out.activation_per_expert, ref)
+    torch.testing.assert_close(
+        out.activation_per_expert,
+        ref.to(out.activation_per_expert.dtype),
+    )
     assert len(calls) == 2
-    assert all(call["mode"] == 0 for call in calls)
     assert all(call["expected_m"] == 64 for call in calls)
     assert torch.equal(calls[0]["masked_m"], torch.tensor([2, 1], dtype=torch.int32))
     assert calls[0]["a_shape"] == (2, 64, 4)
@@ -662,7 +703,14 @@ def test_hygon_deepgemm_contiguous_quantizes_intermediate_after_silu_mul(
 
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "is_hygon", lambda: True)
     monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "has_deepgemm", True)
-    monkeypatch.setattr(w8a8_per_token_per_channel_dyn, "deepgemm", _FakeDeepGemm())
+    monkeypatch.setattr(
+        w8a8_per_token_per_channel_dyn, "hygon_deepgemm", _FakeDeepGemm()
+    )
+    monkeypatch.setattr(
+        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8LegacyMarlinWeight,
+        "convert_from",
+        classmethod(lambda cls, tensor: tensor),
+    )
     monkeypatch.setattr(
         w8a8_per_token_per_channel_dyn,
         "a8_per_token_act_quant",
@@ -941,26 +989,20 @@ def test_hygon_aiter_moe_forward_matches_reference(monkeypatch):
 
 
 def test_hygon_deepgemm_moe_shape_validation_accepts_packed_weights_with_empty_activation():
-    gate_up_native = (
-        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8Marlin2Weight.convert_from(
-            torch.zeros((2, 32, 16), dtype=torch.int8)
-        )
-    )
-    down_native = (
-        w8a8_per_token_per_channel_dyn.HygonDeepGemmW8A8Marlin2Weight.convert_from(
-            torch.zeros((2, 16, 16), dtype=torch.int8)
-        )
-    )
-
+    # _validate_indexed_moe_shapes only reads the plain shapes (w1_plain_shape/
+    # w2_plain_shape) and leaves packed-layout construction to convert_from.
+    # K=16 is intentionally used here to verify the shape-validation logic itself
+    # without requiring DeepGEMM packing (which would require K to be a multiple
+    # of 64).
     e, n1, k1, n2, k2 = w8a8_per_token_per_channel_dyn._validate_indexed_moe_shapes(
         label="DeepGEMM masked MoE",
         activation=torch.empty((0, 16), dtype=torch.bfloat16),
-        w1=gate_up_native.layout_tensor,
-        w2=down_native.layout_tensor,
+        w1=torch.empty((2, 2, 256), dtype=torch.int8),
+        w2=torch.empty((2, 1, 256), dtype=torch.int8),
         dim=16,
         moe_inter_dim=16,
-        w1_plain_shape=gate_up_native.plain_shape,
-        w2_plain_shape=down_native.plain_shape,
+        w1_plain_shape=torch.Size((2, 32, 16)),
+        w2_plain_shape=torch.Size((2, 16, 16)),
     )
 
     assert (e, n1, k1, n2, k2) == (2, 32, 16, 16, 16)

@@ -115,7 +115,28 @@ def apptainer_run(
             "NCCL_GRAPH_REGISTER=0",
         ]
     elif platform == "hygon":
-        apptainer_cmd += ["--rocm", "-B", "/opt/hyhal:/opt/hyhal:ro"]
+        apptainer_cmd += [
+            "--rocm",
+            "-B",
+            "/opt/hyhal:/opt/hyhal:ro",
+            "-B",
+            "/dev/mkfd:/dev/mkfd",  # `/dev/mkfd` is a Hygon-specific device that `--rocm` does not bind.
+        ]
+        # `--rocm` binds the devices, but combined with `--cleanenv` it does not
+        # forward Slurm's per-job GPU restriction. Forward ROCR_VISIBLE_DEVICES
+        # (physical device ids) so each job only sees its allocated GPUs.
+        #
+        # NOTE: only forward ROCR_VISIBLE_DEVICES, NOT HIP_VISIBLE_DEVICES.
+        # HIP_VISIBLE_DEVICES indexes into the already-ROCR-filtered device list,
+        # so setting both to the same physical id double-maps and makes HIP see
+        # zero devices (e.g. ROCR=3 leaves one device at HIP index 0, but
+        # HIP_VISIBLE_DEVICES=3 then asks for the non-existent index 3).
+        rocr_visible = os.environ.get("ROCR_VISIBLE_DEVICES")
+        if rocr_visible:
+            apptainer_cmd += [
+                "--env",
+                f"ROCR_VISIBLE_DEVICES={rocr_visible}",
+            ]
 
     apptainer_cmd += ib_mount_args
     apptainer_cmd += ib_env_args

@@ -12,6 +12,24 @@
 
 set -ex
 
+# Fix up permissions on root-created artifacts on every exit (success or
+# failure). The build may fail midway, and without this the root-owned files it
+# already produced would be undeletable by the host gitlab-runner user, causing
+# "Permission denied" on the next retry's `git clean`.
+cleanup_permissions() {
+    find . -name ".git" -prune -o \
+        -user root \( \
+            -path "*/__pycache__" -o -path "*/__pycache__/*" -o \
+            -path "*/cinfer.tmp" -o -path "*/cinfer.tmp/*" -o \
+            -path "*/build" -o -path "*/build/*" -o \
+            -name "*.egg-info" -o -path "*.egg-info/*" -o \
+            -path "*/dist" -o -path "*/dist/*" -o \
+            -name "*.hip" -o \
+            -name "hip" -o -path "*/hip/*" \
+        \) -exec chmod 777 {} + 2>/dev/null || true
+}
+trap cleanup_permissions EXIT
+
 if [ $# -ne 4 ]; then
     echo "Usage: $0 <optional_deps> <chitu_setup_jobs> <enable_editable_install> <enable_cython>"
     exit 1
@@ -71,11 +89,3 @@ else
     # NOTE: A better practice is to use a multi-stage build. But currently `muxi.Dockerfile`
     # requires an additional `docker run` stage to build. We will consider this in the future.
 fi
-
-# 给权限让gitlab-runner删除，如果手动都删了，可能会不太方便debug；只改出问题的几个临时目录
-find . -name ".git" -prune -o \
-    -user root \( \
-        -path "*/__pycache__" -o -path "*/__pycache__/*" -o \
-        -path "*/cinfer.tmp" -o -path "*/cinfer.tmp/*" -o \
-        -path "*/build" -o -path "*/build/*" \
-    \) -exec chmod 777 {} +

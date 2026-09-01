@@ -2,7 +2,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-import sys
 import inspect
 import logging
 import traceback
@@ -12,7 +11,7 @@ from contextlib import contextmanager
 from logging import getLogger
 
 from chitu.global_vars import get_global_args
-from chitu.utils import get_chitu_env, get_chitu_bool_env
+from chitu.utils import get_chitu_env, get_chitu_bool_env, should_pretty_log
 
 try:
     import torch.distributed as dist
@@ -80,7 +79,9 @@ _RESET = "\033[0m"
 
 
 def maybe_colored_by_idx(s: str, idx: int, underline: bool = False):
-    if sys.stdout.isatty() and idx < len(_COLORS):
+    # Global args may not be initialized yet when this runs during logging
+    # setup; should_pretty_log falls back to terminal detection in that case.
+    if should_pretty_log(get_global_args(need_ensure=False)) and idx < len(_COLORS):
         # Apply underline after color because color escape codes include `0`,
         # which resets previously applied text attributes.
         s = _COLORS[idx] + (_UNDERLINE if underline else "") + s

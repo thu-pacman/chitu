@@ -881,6 +881,16 @@ disable_layerwise_load: False
 #: timeout may or may not happen in the communication immedately after model loading.
 model_load_per_layer_timeout_s: 60
 
+#: Controls whether pretty (interactive) output is printed to the terminal,
+#: such as the per-rank model-load progress bars.
+#:
+#: - "auto": print only when stdout and stderr are attached to a terminal.
+#:   When output is redirected to a file or piped (e.g. `2>&1 | tee`), pretty
+#:   output is suppressed to keep logs small.
+#: - "true": always print pretty output, even when output is redirected.
+#: - "false": never print pretty output.
+pretty_log: auto
+
 quant: null
 
 # The followings are legacy parameters. They are to be removed in the future.
