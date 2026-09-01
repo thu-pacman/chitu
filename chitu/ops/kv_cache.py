@@ -631,9 +631,14 @@ def read_from_singleton_paged_kv_cache_torch(
     mtp_accept_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if mtp_accept_indices is None:
-        return kv_cache[page_table.squeeze(1), 0]
+        return kv_cache[
+            page_table.squeeze(1) if page_table.dim() > 1 else page_table, 0
+        ]
     else:
-        return kv_cache[page_table.squeeze(1), mtp_accept_indices]
+        return kv_cache[
+            page_table.squeeze(1) if page_table.dim() > 1 else page_table,
+            mtp_accept_indices,
+        ]
 
 
 @make_op_dispatcher

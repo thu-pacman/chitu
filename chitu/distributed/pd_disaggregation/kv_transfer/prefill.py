@@ -13,7 +13,7 @@ import torch
 
 from chitu.backend import Backend
 from chitu.kv_cache.kv_cache import PagedKVCache
-from chitu.task import PackedTasksResult
+from chitu.task import PackedTasksResult, TaskPool
 from chitu.trace import Trace
 from chitu.metrics.prometheus_collector import (
     inc_kv_transfer_failures,
@@ -138,6 +138,13 @@ class KVManagerPrefill(KVManagerBase):
             # Accumulate per-session byte counts.
             for sid, nbytes in msg.rank_bytes.items():
                 info.rank_bytes[sid] = info.rank_bytes.get(sid, 0) + nbytes
+            task = TaskPool.pool.get(info.req_id)
+            if task is None or getattr(task, "req", None) is None:
+                raise RuntimeError(
+                    "Prefill ctrl rank received RankTransferDone for a request "
+                    f"without local TaskPool request state: req_id={info.req_id}"
+                )
+            info.num_hit_tokens = max(info.num_hit_tokens, int(task.req.num_hit_tokens))
             if info.done_count == self.dp_way_size:
                 if info.trace is not None:
                     info.trace.info({"name": "Prefill Complete"})

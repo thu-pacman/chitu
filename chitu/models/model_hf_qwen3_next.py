@@ -202,7 +202,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         x: torch.Tensor,
     ):
         seq_len_delta = self.cache.seq_len_delta
-        use_precomputed_states = seq_len_delta.is_classic_decoding
+        use_precomputed_states = (
+            seq_len_delta.is_classic_decoding and self.mtp_size == 1
+        )
 
         cache_accessor = self.cache.get_accessor(self.layer_id)
         is_mtp_decode_stage = (
@@ -226,7 +228,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         qkv, z, b, a = self.fix_qkvz_ba_ordering(qkvz, ba)
 
-        # classic decode
+        # classic decode: only reached when mtp_size == 1. With mtp_size > 1,
+        # is_classic_decoding is True only for 1-length prefill chunks, which are
+        # routed to the prefill branch below (mtp_size == 1 keeps this branch for
+        # real decode; the prefill branch would be equivalent but uses the
+        # slower chunk kernels).
         if use_precomputed_states:
             qkv, conv_state = causal_conv1d_update(qkv, conv_state, self.conv1d.weight)
             # qkv: (bsz, hidden_size), conv_state: (bsz, hidden_size, state_len)

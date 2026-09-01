@@ -62,6 +62,7 @@ from chitu.distributed.partition import (
 from chitu.moe import get_moe_impl, MoEImplBase
 from chitu.moe.batched_routed_activation import IndexedBatchedRoutedActivation
 from chitu.moe.load_balancer import get_moe_load_planner
+
 from chitu.utils import (
     is_layer,
     try_import_platform_dep,
@@ -365,6 +366,9 @@ class Transformer(nn.Module):
             self.precompute_freqs_cis(max_position_embeddings, self.device)
 
         self.do_decode_callable = None
+        self.do_decode_callable_mtp = None
+        self.do_empty_decode_callable = None
+        self.do_empty_decode_callable_mtp = None
         self.args = get_global_args()
         self.gpu_preprocess = False
         self.model_type = self.args.models.type
@@ -1341,7 +1345,9 @@ class Transformer(nn.Module):
 
     @property
     def non_mtp_layers(self):
-        return self.layers[:-1] if self.mtp_size > 1 else self.layers
+        if self.mtp_size > 1 and self.pp_stage == self.pp_end_stage:
+            return self.layers[:-1]
+        return self.layers
 
     def _mtp_prefill_cp(self, x, h, freqs_cis):
         """CP-aware MTP prefill for interleaved context parallel shards."""
@@ -1482,59 +1488,156 @@ class Transformer(nn.Module):
         return h
 
     @torch.inference_mode()
-    def mtp_decode_no_pipeline_total(
-        self,
-        tokens,
-        func,
-        key,
-        func_mtp,
-        key_mtp,
-        extra_inputs: tuple[torch.Tensor, ...] = (),
-        extra_inputs_mtp: tuple[torch.Tensor, ...] = (),
-    ):
-        self.update_mtp_hidden_states(self.read_mtp_hidden_states(is_mtp=True))
-        bs = tokens.shape[0]
-        from chitu.backend import Backend  # local import to avoid cycles
+    def draft(
+        self, tasks, last_tokens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        from chitu.backend import Backend
 
-        is_tp_rank0 = self.tp_group.rank_in_group == 0
-        sampler = Backend.executor.sampler if is_tp_rank0 else None
+        sampler = Backend.executor.sampler
 
-        token_list = [tokens]
-        for i in range(1, self.mtp_size):
+        if self.pp_size > 1 and self.pp_stage != self.pp_end_stage:
+            return None
+
+        bs = last_tokens.shape[0]
+        if bs == 0:
+            if self.do_empty_decode_callable_mtp is None:
+                self._init_empty_mtp_draft_callable()
+            if self.moe_impl is not None:
+                self.moe_impl.prepare(TaskType.Decode, int(self.dummy_input.shape[0]))
+            for i in range(1, self.mtp_size):
+                self.do_empty_decode_callable_mtp((1,) + ("empty_mtp",))
+            return None
+
+        is_main_rank = Backend.executor.is_main_rank
+        tokens = last_tokens
+        token_list = []
+        prob_list = []
+
+        if self.do_decode_callable_mtp is None:
+            self._init_mtp_draft_callable(bs, tokens)
+        if isinstance(self.cache_dict["main"], DenseKVCache):
+            key_mtp = (
+                bs,
+                self.cache_dict["main"].get_start_and_end_idx()[0],
+            ) + ("mtp",)
+        elif isinstance(self.cache_dict["main"], PagedKVCache):
+            key_mtp = (bs, get_global_args().infer.num_blocks) + ("mtp",)
+        else:
+            assert False
+        extra_inputs_mtp, _ = self._decode_graph_extra_inputs_mtp(tokens, bs)
+
+        for offset in range(1, self.mtp_size):
             for cache in self.cache_dict.values():
-                cache.prepare_mtp_cache_decode(i)
+                cache.prepare_mtp_cache_decode(tasks, offset)
                 if isinstance(cache, PagedKVCache):
                     cache.update_page_offs()
             self.prepare_decoding_attn(is_mtp=True)
-            logits = func_mtp(key_mtp, tokens, *extra_inputs_mtp)
-            if sampler is not None:
-                tokens = sampler.sample_draft_tokens(logits)
+
+            logits = self.do_decode_callable_mtp(key_mtp, tokens, *extra_inputs_mtp)
+
+            if is_main_rank:
+                if sampler is not None:
+                    token, draft_prob = sampler.sample_draft_tokens(logits)
+                    token_list.append(token)
+                    prob_list.append(draft_prob)
+                else:
+                    token = torch.argmax(logits, dim=-1)
             else:
-                tokens = torch.argmax(logits, dim=-1)
-            self.tp_group.broadcast(tokens, src=self.tp_group.rank_list[0])
-            token_list.append(tokens)
-        if sampler is not None:
-            sampler.draft_sample_done()
+                token = torch.argmax(logits, dim=-1)
+            self.tp_group.broadcast(token, src=self.tp_group.rank_list[0])
+            tokens = token
 
-        for cache in self.cache_dict.values():
-            if isinstance(cache, PagedKVCache):
-                cache.update_page_offs()
-        if self.use_cuda_graph:
-            self.prepare_decoding_attn()
-        else:
-            self.attn_backend.prepare_metadata_for_prefill(
-                self.cache_dict["main"].seq_len_delta
+        if is_main_rank and sampler is not None:
+            # All-greedy batches return p' = None (never stacked).
+            draft_probs = (
+                torch.stack(prob_list, dim=1) if prob_list[0] is not None else None
             )
-        if self.moe_impl is not None:
-            self.moe_impl.prepare(TaskType.Decode, bs * self.mtp_size)
+            return (
+                torch.stack(token_list, dim=1),  # (bs, K-1)
+                draft_probs,  # (bs, K-1, vocab) proposal p', or None (all-greedy)
+            )
+        return None
 
-        # verify_input_tokens: [target_output, d1, d2, ...]
-        # Each rank builds it locally — all ranks have the same tokens after
-        # per-iteration tp_group.broadcast.
-        verify_input_tokens = torch.stack(token_list, dim=1)
-        h = func(key, verify_input_tokens.view(-1), *extra_inputs)
-        h = h.view(bs, self.mtp_size, h.shape[-1])
-        return h
+    def _init_mtp_draft_callable(self, bs: int, tokens: torch.Tensor):
+        """Lazily build the CUDA-graph callable for the MTP draft decode."""
+        infer_args = get_global_args().infer
+        decode_graph_pool_handle = (
+            torch.cuda.graph_pool_handle() if self.use_cuda_graph else None
+        )
+        before_replay_callback = None
+        if is_ascend() and not (
+            infer_args.cache_type == "skew"
+            and NpuAttnBackend.should_use_attn_from_cinfer_ascendc(
+                self.args.models.type, infer_args.max_batch_size
+            )
+        ):
+            if hasattr(self.args.models, "index_topk"):
+                # DSA sparse MLA reads only min(seq_len, topk) KV positions, NOT the
+                # full context length. `prepare_decoding_attn` ->
+                # `prepare_sparse_mla_metadata` recomputes this host list on every
+                # decode step (before each replay).
+                actual_seq_lengths_kv_fn = (
+                    lambda: self.attn_backend.actual_seq_lengths_kv
+                )
+            else:
+                actual_seq_lengths_kv_fn = lambda: self.cache_dict[
+                    "main"
+                ].seq_len_delta.new.lens_list
+            before_replay_callback = lambda graph: graph.update(
+                cpu_update_input=[{"actual_seq_lengths_kv": actual_seq_lengths_kv_fn()}]
+            )
+
+        def numel_per_seq(batch_size, x):
+            if batch_size > 0:
+                return x.numel() // batch_size
+            else:
+                assert x.shape[0] == 0
+                return functools.reduce(operator.mul, x.shape[1:], 1)
+
+        tokens_max_nelem = self.max_batch_size_per_dp * numel_per_seq(bs, tokens)
+        output_max_nelem_callback = (
+            lambda key, out: numel_per_seq(key[0], out)
+            * self.max_batch_size_per_dp
+            * self.mtp_size
+        )
+        _, extra_inputs_mtp_max_nelem = self._decode_graph_extra_inputs_mtp(tokens, bs)
+
+        @make_dispatched_graphed_callables(
+            args_max_nelem=(tokens_max_nelem, *extra_inputs_mtp_max_nelem),
+            kwargs_max_nelem={},
+            output_max_nelem_callback=output_max_nelem_callback,
+            before_capture_callback=lambda: self.prepare_decoding_attn(is_mtp=True),
+            before_replay_callback=before_replay_callback,
+            enable=self.use_cuda_graph,
+            graph_pool=decode_graph_pool_handle,
+        )
+        def do_decode_mtp(tokens, *extra_inputs_mtp):
+            freqs_cis = self._prepare_freqs_cis_for_decode_mtp(*extra_inputs_mtp)
+            return self.mtp_decode_no_pipeline(tokens, freqs_cis)
+
+        self.do_decode_callable_mtp = do_decode_mtp
+
+    def _init_empty_mtp_draft_callable(self):
+        """Lazily build the CUDA-graph callable for the EMPTY MTP draft.
+
+        The empty-batch MTP draft (K-1 layer-(n-1) MoE dispatches, no tokens)
+        runs from postprocess_generate_draft -> draft(bs==0) BEFORE any empty
+        main decode. Its graph callable is therefore created here, in the
+        draft/postprocess side, NOT in decode() — draft and MTP concerns must
+        not live in decode().
+        """
+
+        @make_dispatched_graphed_callables(
+            args_max_nelem=(),
+            kwargs_max_nelem={},
+            output_max_nelem_callback=lambda key, n: 1,
+            before_replay_callback=None,
+            enable=self.use_cuda_graph,
+        )
+        def do_empty_decode_mtp():
+            return self.empty_mtp_decode()
+
+        self.do_empty_decode_callable_mtp = do_empty_decode_mtp
 
     @torch.inference_mode()
     def prefill_pipeline(
@@ -1691,8 +1794,7 @@ class Transformer(nn.Module):
                 self.global_embed_num_tokens,
                 self.embed_tokens_cum_num_tokens,
             )
-        has_mtp_layer = self.mtp_size > 1 and self.pp_stage == self.pp_end_stage
-        layer_main = self.layers[0:-1] if has_mtp_layer else self.layers
+        layer_main = self.non_mtp_layers
         for it, layer in enumerate(layer_main):
             if self.local_begin_layer_id + it < self.moe_impl.n_dense_layers:
                 continue
@@ -1720,19 +1822,6 @@ class Transformer(nn.Module):
         if self.specialize_embed_tokens_lm_head_parallel:
             self._post_layers_mtp(self.dummy_input)
         return self.graph_dummy_output
-
-    @torch.inference_mode()
-    def empty_mtp_decode_total(self, func, key, func_mtp, key_mtp):
-        for i in range(1, self.mtp_size):
-            func_mtp(key_mtp)
-
-        if (
-            self.moe_impl is not None
-            and self.moe_impl.decode_token_dispatcher_impl == "allgather"
-        ):
-            self.moe_impl.prepare(TaskType.Decode, self.dummy_input.shape[0])
-
-        return func(key)
 
     @torch.inference_mode()
     def prefill(
@@ -1866,7 +1955,7 @@ class Transformer(nn.Module):
         for cache in self.cache_dict.values():
             cache.seq_len_delta.is_decode_stage = True
 
-        if batch_size != 0 and not self.mtp_size > 1:
+        if batch_size != 0:
             self.prepare_decoding_attn()
 
         infer_args = get_global_args().infer
@@ -1874,12 +1963,6 @@ class Transformer(nn.Module):
         extra_inputs, extra_inputs_max_nelem = self._decode_graph_extra_inputs(
             tokens, batch_size
         )
-        if self.mtp_size > 1:
-            extra_inputs_mtp, extra_inputs_mtp_max_nelem = (
-                self._decode_graph_extra_inputs_mtp(tokens, batch_size)
-            )
-        else:
-            extra_inputs_mtp, extra_inputs_mtp_max_nelem = (), ()
 
         if self.do_decode_callable is None:
             decode_graph_pool_handle = (
@@ -1923,7 +2006,9 @@ class Transformer(nn.Module):
                 batch_size, tokens
             )
             output_max_nelem_callback = (
-                lambda key, out: numel_per_seq(key[0], out) * self.max_batch_size_per_dp
+                lambda key, out: numel_per_seq(key[0], out)
+                * self.max_batch_size_per_dp
+                * self.mtp_size
             )
 
             @make_dispatched_graphed_callables(
@@ -1947,27 +2032,6 @@ class Transformer(nn.Module):
 
             self.do_decode_callable = do_decode
 
-            if self.mtp_size > 1:
-
-                @make_dispatched_graphed_callables(
-                    args_max_nelem=(tokens_max_nelem, *extra_inputs_mtp_max_nelem),
-                    kwargs_max_nelem={},
-                    output_max_nelem_callback=output_max_nelem_callback,
-                    before_capture_callback=lambda: self.prepare_decoding_attn(
-                        is_mtp=True
-                    ),
-                    before_replay_callback=before_replay_callback,
-                    enable=self.use_cuda_graph,
-                    graph_pool=decode_graph_pool_handle,
-                )
-                def do_decode_mtp(tokens, *extra_inputs_mtp):
-                    freqs_cis = self._prepare_freqs_cis_for_decode_mtp(
-                        *extra_inputs_mtp
-                    )
-                    return self.mtp_decode_no_pipeline(tokens, freqs_cis)
-
-                self.do_decode_callable_mtp = do_decode_mtp
-
             if self._requires_empty_token_collective():
 
                 @make_dispatched_graphed_callables(
@@ -1982,44 +2046,13 @@ class Transformer(nn.Module):
 
                 self.do_empty_decode_callable = do_empty_decode
 
-                if self.mtp_size > 1:
-
-                    @make_dispatched_graphed_callables(
-                        args_max_nelem=(),
-                        kwargs_max_nelem={},
-                        output_max_nelem_callback=lambda key, n: 1,
-                        before_replay_callback=None,
-                        enable=self.use_cuda_graph,
-                    )
-                    def do_empty_decode_mtp():
-                        return self.empty_mtp_decode()
-
-                    self.do_empty_decode_callable_mtp = do_empty_decode_mtp
-
         if batch_size != 0:
-
-            if self.mtp_size > 1:
-                return self.mtp_decode_no_pipeline_total(
-                    tokens,
-                    self.do_decode_callable,
-                    key + ("main",),
-                    self.do_decode_callable_mtp,
-                    key + ("mtp",),
-                    extra_inputs,
-                    extra_inputs_mtp,
-                )
-            else:
-                return self.do_decode_callable(key, tokens, *extra_inputs)
+            return self.do_decode_callable(key, tokens, *extra_inputs)
         else:
             if not self._requires_empty_token_collective():
                 return None
             if self.mtp_size > 1:
-                return self.empty_mtp_decode_total(
-                    self.do_empty_decode_callable,
-                    (1,) + ("empty_main",),
-                    self.do_empty_decode_callable_mtp,
-                    (1,) + ("empty_mtp",),
-                )
+                return self.do_empty_decode_callable((1,) + ("empty_main",))
             else:
                 return self.do_empty_decode_callable((1,) + ("empty",))
 

@@ -215,6 +215,10 @@ class MooncakeKVTransferHook:
             if task is None:
                 continue
             task.update_response_sync([first_token])
+            mtp_size = Backend.executor.mtp_size
+            if mtp_size > 1:
+                # pad next_tokens to (mtp_size,)
+                task.next_tokens = [first_token] + [0] * (mtp_size - 1)
 
         if get_dp_group().group_id == 0:
             from chitu.metrics.prometheus_collector import PrometheusMetricsCollector

@@ -1094,10 +1094,29 @@ def _warmup_backend_direct(
 
             if get_pp_group().is_first_rank:
                 payload = tokens[:curr_bs]
+                if args.infer.mtp_size > 1:
+                    payload = payload.repeat_interleave(args.infer.mtp_size)
             else:
                 payload = decode_hiddens[:curr_bs]
+                if args.infer.mtp_size > 1:
+                    payload = payload.repeat_interleave(args.infer.mtp_size, dim=0)
 
             _ = Backend.model.decode(payload)
+
+            if args.infer.mtp_size > 1:
+                if get_pp_group().is_last_rank:
+                    # Prepare slot 0 with the accepted hidden state before drafting.
+                    accept_hidden = Backend.model.read_mtp_hidden_states(is_mtp=True)
+                    Backend.model.update_mtp_hidden_states(accept_hidden, is_mtp=False)
+                Backend.model.draft(cur_tasks, tokens[:curr_bs])
+
+    if (
+        not skip_model_decode
+        and args.infer.use_cuda_graph
+        and Backend.model._requires_empty_token_collective()
+    ):
+        Backend.model.draft(all_tasks, torch.empty(0, dtype=torch.int64, device="cuda"))
+        _ = Backend.model.decode(torch.empty(0, dtype=torch.int64, device="cuda"))
 
     # Clean KV for this request
     for cache in Backend.cache_dict.values():
@@ -1637,7 +1656,7 @@ def chitu_run_main_rank():
     for i in range(Backend.args.infer.dp_size):
         dp_local_removed_task_ids = Backend.schedulers[i].update(task_ids_per_dp[i])
         removed_task_ids += dp_local_removed_task_ids
-    Backend.executor.special_step(removed_task_ids, type="EndTask")
+    Backend.executor.end_task_step(removed_task_ids)
     return backend_payload_type
 
 

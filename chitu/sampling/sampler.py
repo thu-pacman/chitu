@@ -10,7 +10,7 @@ from xgrammar import (
     GrammarMatcher,
     BatchGrammarMatcher,
 )
-from chitu.global_vars import get_global_args
+from chitu.global_vars import get_global_args, is_pd_prefill_only
 from chitu.task import Task, SampleParams, PackedTasks, PackedTasksResult, TaskType
 from chitu.ops.sampling import (
     apply_bitmask,
@@ -66,31 +66,6 @@ class FrequencyPenaltyOps:
 
 
 @dataclass
-class DraftInfo:
-    """MTP draft outputs produced by one decode step, consumed by verification.
-
-    Created in ``prepare_model_input`` (with ``needs_cpu_draft`` set from the
-    current batch), populated per-layer by ``sample_draft_tokens``, finalized
-    by ``draft_sample_done``, and cleared at the end of ``sample()``. The
-    draft state lives on the sampling rank only — the model never stores it
-    itself.
-
-    ``tokens_cpu`` / ``tokens_cpu_ready`` are only populated when
-    ``needs_cpu_draft`` is True (frequency penalty or grammar is active).
-    """
-
-    needs_cpu_draft: bool = False
-    tokens: torch.Tensor | None = None  # (bs, n_drafts) draft token ids, on device
-    tokens_cpu: torch.Tensor | None = None  # async CPU copy (only if needs_cpu_draft)
-    tokens_cpu_ready: torch.cuda.Event | None = None
-    logits: torch.Tensor | None = None  # (bs, n_drafts, vocab) draft logits
-
-    # Per-layer accumulators — populated by sample_draft_tokens, consumed by draft_sample_done.
-    _token_list: list[torch.Tensor] = field(default_factory=list)
-    _logit_list: list[torch.Tensor] = field(default_factory=list)
-
-
-@dataclass
 class TaskSampleState:
     task: Task
     sample_params: SampleParams
@@ -98,6 +73,8 @@ class TaskSampleState:
     token_blocks: list[torch.Tensor] | None = None
     output_len: int = 0
     matcher: GrammarMatcher | None = None
+    draft_probs: torch.Tensor | None = None
+    next_tokens_device: torch.Tensor | None = None
 
     @staticmethod
     def from_task(task: Task):
@@ -191,26 +168,27 @@ class Sampler:
         self.states: dict[str, TaskSampleState] = {}
         self.batch_matcher = BatchGrammarMatcher()
 
-        # Draft proposal params (per-request), set by `prepare_model_input` before
-        # each decode step. The model reads them via `sample_draft_tokens` to draw
-        # non-greedy drafts from a temperature/top-k/top-p scaled proposal p'.
+        # Draft proposal params (per-request), set by `prepare_draft_sample_params`
+        # before each draft loop. The model reads them via `sample_draft_tokens`
+        # to draw non-greedy drafts from a temperature/top-k/top-p scaled
+        # proposal p'.
         self.draft_temperatures: torch.Tensor | None = None
         self.draft_top_ks: torch.Tensor | None = None
         self.draft_top_ps: torch.Tensor | None = None
         self.max_top_k_for_draft: int = 1
         self.draft_greedy_mask: torch.Tensor | None = None  # True → argmax draft
-        self.all_greedy: bool = True  # pre-computed by prepare_model_input
-        self.draft_info: DraftInfo | None = None  # MTP draft outputs (this step)
+        self.all_greedy: bool = True  # pre-computed by prepare_draft_sample_params
 
-    def prepare_model_input(self, tasks: PackedTasks):
-        """Build per-request draft proposal params in `tasks.output_tasks` order.
+    def prepare_draft_sample_params(self, tasks: PackedTasks):
+        """Set per-request draft proposal params in `tasks.output_tasks` order.
 
         Uses the same states as `sample()` so draft and target sampling share
-        identical sample_params. In decode, `output_tasks == tasks`, matching the
-        token payload order. The model broadcasts greedy_mask on tp_group so all
-        TP ranks propose identical drafts.
+        identical sample_params. In decode, `output_tasks == tasks`, matching
+        the token payload order. The model broadcasts greedy_mask on tp_group
+        so all TP ranks propose identical drafts.
         """
         states = self._get_states(tasks.output_tasks)
+
         device = get_op_device()
         self.draft_greedy_mask = create_tensor(
             [s.sample_params.top_k <= 1 for s in states],
@@ -234,16 +212,11 @@ class Sampler:
         )
         self.max_top_k_for_draft = max(s.sample_params.top_k for s in states)
         self.all_greedy = all(s.sample_params.top_k <= 1 for s in states)
-        self.draft_info = DraftInfo(
-            needs_cpu_draft=any(
-                state.enable_frequency_penalty
-                or (state.matcher and not state.matcher.is_terminated())
-                for state in states
-            )
-        )
 
-    def sample_draft_tokens(self, logits: torch.Tensor) -> torch.Tensor:
-        """Select the next MTP draft token.
+    def sample_draft_tokens(
+        self, logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Select the next MTP draft token and its proposal distribution p'.
 
         Greedy: argmax (matches target argmax → exact-match acceptance, highest rate).
         Non-greedy: Gumbel-max sample from a temperature/top-k/top-p scaled proposal
@@ -253,41 +226,22 @@ class Sampler:
         """
         greedy_mask = self.draft_greedy_mask
         argmax_token = torch.argmax(logits, dim=-1)
-        if not self.all_greedy:
-            scaled = logits / self.draft_temperatures.view(-1, 1)
-            probs, token_ids = filter_logits_top_k_top_p(
-                scaled,
-                self.draft_top_ks,
-                self.draft_top_ps,
-                max_top_k=self.max_top_k_for_draft,
-            )
-            sampled = gumbel_max_sample(probs, token_ids)
-            argmax_token = torch.where(greedy_mask, argmax_token, sampled)
+        if self.all_greedy:
+            return argmax_token, None
 
-        if self.draft_info is None:
-            # warmup or direct call without prepare_model_input
-            return argmax_token
-        self.draft_info._token_list.append(argmax_token)
-        self.draft_info._logit_list.append(logits)
-        return argmax_token
-
-    def draft_sample_done(self) -> None:
-        """Finalize MTP draft outputs for this step.
-
-        Stacks the per-layer tokens/logits accumulated by ``sample_draft_tokens``
-        into ``self.draft_info``.  Only starts the async CPU copy when
-        ``needs_cpu_draft`` is True (frequency penalty or grammar active).
-        """
-        info = self.draft_info
-        if info is None:
-            return  # warmup or direct call without prepare_model_input
-        info.tokens = torch.stack(info._token_list, dim=1)  # (bs, n_drafts)
-        info.logits = torch.stack(info._logit_list, dim=1)  # (bs, n_drafts, V)
-        if info.needs_cpu_draft:
-            info.tokens_cpu = info.tokens.to("cpu", non_blocking=True)
-            info.tokens_cpu_ready = torch.cuda.current_stream().record_event()
-        info._token_list.clear()
-        info._logit_list.clear()
+        scaled = logits / self.draft_temperatures.view(-1, 1)
+        probs, token_ids = filter_logits_top_k_top_p(
+            scaled,
+            self.draft_top_ks,
+            self.draft_top_ps,
+            max_top_k=self.max_top_k_for_draft,
+        )
+        sampled = gumbel_max_sample(probs, token_ids)
+        argmax_token = torch.where(greedy_mask, argmax_token, sampled)
+        # p' = the exact distribution the draft was sampled from (greedy
+        # requests in a mixed batch degenerate to a one-hot at their argmax).
+        p_prime = scatter_probs_to_vocab(probs, token_ids, logits.shape[-1])
+        return argmax_token, p_prime
 
     def _get_states(self, tasks: list[Task]):
         """get states of tasks, create new state if needed"""
@@ -323,28 +277,72 @@ class Sampler:
     ) -> tuple[
         list[TaskSampleState],
         torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
         list[list[int]] | None,
     ]:
-        """Flatten logits, get states, sync draft tokens."""
+        """Flatten logits, get states, rebuild the MTP draft verify inputs."""
         states = self._get_states(tasks.output_tasks)
 
         logits = logits.contiguous()
         if mtp_size > 1:
             logits = logits.view(-1, logits.shape[-1])
 
+        draft_tokens = None
+        draft_probs = None
         draft_tokens_list = None
-        if mtp_size > 1 and self.draft_info.needs_cpu_draft:
-            self.draft_info.tokens_cpu_ready.synchronize()
-            draft_tokens_list = self.draft_info.tokens_cpu.tolist()
+        if mtp_size > 1:
+            K = mtp_size
+            n_drafts = K - 1
+            vocab_size = get_tokenizer_info().vocab_size
+            draft_tokens_list = []
+            draft_probs_list = []
+            for state in states:
+                nt = state.task.next_tokens
+                if len(nt) >= K:
+                    draft_tokens_list.append(nt[1:K])  # d1, ..., d_{K-1}
+                else:
+                    draft_tokens_list.append([0] * n_drafts)
 
-            append_ops = AppendTokenOps()
-            for ti, state in enumerate(states):
-                draft_row = draft_tokens_list[ti]
-                if draft_row:
-                    state.append_tokens(append_ops, draft_row)
-            append_ops.execute()
+                dp = state.draft_probs
+                if dp is not None:
+                    draft_probs_list.append(dp)
+                else:
+                    # One-hot fallback (PD first step / new task): p[draft] = 1,
+                    # rest = 0, so rejection sampling degenerates to
+                    # accept_prob = q(d), semantically equivalent to mtp_size=1.
+                    dt = draft_tokens_list[-1]
+                    p = torch.zeros(
+                        n_drafts, vocab_size, device=logits.device, dtype=torch.float32
+                    )
+                    for d in range(n_drafts):
+                        tid = dt[d] if d < len(dt) else 0
+                        if tid >= 0:
+                            p[d, tid] = 1.0
+                    draft_probs_list.append(p)
 
-        return states, logits, draft_tokens_list
+            draft_tokens = create_tensor(
+                draft_tokens_list, device=logits.device, dtype=torch.int64
+            )
+            if draft_probs_list:
+                draft_probs = torch.stack(draft_probs_list)  # (bs, K-1, V)
+
+            # Frequency penalty: the MTP target positions 1..K-1 continue from
+            # the draft tokens, so append them to the per-task token blocks
+            # (same condition as the old needs_cpu_draft path).
+            if any(
+                state.enable_frequency_penalty
+                or (state.matcher and not state.matcher.is_terminated())
+                for state in states
+            ):
+                append_ops = AppendTokenOps()
+                for ti, state in enumerate(states):
+                    draft_row = draft_tokens_list[ti]
+                    if draft_row:
+                        state.append_tokens(append_ops, draft_row)
+                append_ops.execute()
+
+        return states, logits, draft_tokens, draft_probs, draft_tokens_list
 
     def _apply_frequency_penalty(
         self,
@@ -477,27 +475,18 @@ class Sampler:
         logits = logits.view(bs, mtp_size, -1)
         logits_flat = logits.reshape(bs * mtp_size, -1)
 
-        # Reuse the per-request params cached by `prepare_model_input` (same
-        # sample_params as the draft proposal), expanded to the flat depth layout.
-        if self.draft_temperatures is not None:
-            temperatures = self.draft_temperatures.repeat_interleave(mtp_size)
-            top_ks_t = self.draft_top_ks.repeat_interleave(mtp_size)
-            top_ps_t = self.draft_top_ps.repeat_interleave(mtp_size)
-            max_top_k = self.max_top_k_for_draft
-        else:  # direct call (e.g. unit tests) without prepare_model_input
-            temperatures = [
-                s.sample_params.temperature for s in states for _ in range(mtp_size)
-            ]
-            top_ks_list = [
-                s.sample_params.top_k for s in states for _ in range(mtp_size)
-            ]
-            top_ps_list = [
-                s.sample_params.top_p for s in states for _ in range(mtp_size)
-            ]
-            temperatures = create_tensor(temperatures, device=logits.device)
-            top_ks_t = create_tensor(top_ks_list, device=logits.device)
-            top_ps_t = create_tensor(top_ps_list, device=logits.device)
-            max_top_k = max(top_ks_list)
+        # Per-request target params (same sample_params as the draft proposal),
+        # expanded to the flat depth layout. Always rebuilt from the states so
+        # the batch composition of THIS step is used (no cached batch leftovers).
+        temperatures = [
+            s.sample_params.temperature for s in states for _ in range(mtp_size)
+        ]
+        top_ks_list = [s.sample_params.top_k for s in states for _ in range(mtp_size)]
+        top_ps_list = [s.sample_params.top_p for s in states for _ in range(mtp_size)]
+        temperatures = create_tensor(temperatures, device=logits.device)
+        top_ks_t = create_tensor(top_ks_list, device=logits.device)
+        top_ps_t = create_tensor(top_ps_list, device=logits.device)
+        max_top_k = max(top_ks_list)
         logits_flat = logits_flat / temperatures.view(-1, 1)
         tokens = top_k_top_p_min_p_sampling_from_logits(
             logits_flat, top_ks_t, top_ps_t, max_top_k=max_top_k
@@ -511,6 +500,8 @@ class Sampler:
         mtp_size: int,
         return_logits: bool,
         states: list[TaskSampleState] | None = None,
+        draft_tokens: torch.Tensor | None = None,
+        draft_probs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """View to MTP shape, verify draft. Returns (tokens, logits, accept_indices)."""
         if mtp_size <= 1:
@@ -521,8 +512,6 @@ class Sampler:
         logits = logits.view(bs, mtp_size, -1)
         n_drafts = mtp_size - 1
 
-        draft_tokens = self.draft_info.tokens
-
         # Determine which requests are greedy (temperature=0 → top_k=1)
         if states is not None:
             greedy_mask = create_tensor(
@@ -530,10 +519,12 @@ class Sampler:
                 device=tokens.device,
                 dtype=torch.bool,
             )
+            all_greedy = all(s.sample_params.top_k <= 1 for s in states)
         else:
             greedy_mask = torch.ones(bs, dtype=torch.bool, device=tokens.device)
+            all_greedy = True
 
-        if self.all_greedy:
+        if all_greedy:
             # All greedy: exact-match fast path
             # tokens[:, 0] is target for position 0 (same position as draft[0]).
             # tokens[:, n_drafts-1] is target for position n_drafts-1 (same as draft[n_drafts-1]).
@@ -544,7 +535,13 @@ class Sampler:
         else:
             # Mixed: call into ops for rejection sampling
             accept_indices, tokens = self._verify_mtp_mixed(
-                tokens, logits, draft_tokens, greedy_mask, mtp_size, states
+                tokens,
+                logits,
+                draft_tokens,
+                draft_probs,
+                greedy_mask,
+                mtp_size,
+                states,
             )
 
         batch_idx = torch.arange(bs, device=tokens.device)
@@ -559,6 +556,7 @@ class Sampler:
         tokens: torch.Tensor,
         logits: torch.Tensor,
         draft_tokens: torch.Tensor,
+        draft_probs: torch.Tensor,
         greedy_mask: torch.Tensor,
         mtp_size: int,
         states: list[TaskSampleState],
@@ -572,7 +570,6 @@ class Sampler:
         bs = tokens.shape[0]
         n_drafts = mtp_size - 1
         V = logits.shape[-1]
-        draft_logits = self.draft_info.logits  # (bs, n_drafts, vocab)
 
         # ---- build per-position filter params ----
         top_ks_all, top_ps_all = [], []
@@ -605,18 +602,7 @@ class Sampler:
         # from (temperature + top-k/top-p, same params). Using the plain softmax here
         # would break rejection sampling: the accepted fraction would be min(q, p·p'/p)
         # instead of min(q, p'), biasing output toward the draft distribution.
-        draft_flat = draft_logits.float().reshape(bs * n_drafts, V)
-        draft_temps = self.draft_temperatures.repeat_interleave(n_drafts)
-        draft_tks = self.draft_top_ks.repeat_interleave(n_drafts)
-        draft_tps = self.draft_top_ps.repeat_interleave(n_drafts)
-        draft_max_top_k = self.max_top_k_for_draft
-        p_probs, p_token_ids = filter_logits_top_k_top_p(
-            draft_flat / draft_temps.view(-1, 1),
-            draft_tks,
-            draft_tps,
-            max_top_k=draft_max_top_k,
-        )
-        p = scatter_probs_to_vocab(p_probs, p_token_ids, V).view(bs, n_drafts, V)
+        p = draft_probs.float().view(bs, n_drafts, V)
 
         # ---- acceptance: compare positions 0..n_drafts-1 with same-position drafts ----
         exact_match = tokens[:, :n_drafts] == draft_tokens
@@ -638,9 +624,6 @@ class Sampler:
 
         return accept_indices, tokens
 
-    def _clear_draft_model_outputs(self):
-        self.draft_info = None
-
     def sample(self, logits: torch.Tensor, tasks: PackedTasks):
         assert not (
             self.mtp_size > 1 and tasks._test_flag
@@ -649,12 +632,13 @@ class Sampler:
         mtp_size = self.mtp_size if tasks.task_type == TaskType.Decode else 1
 
         if tasks.num_tasks == 0:
-            self._clear_draft_model_outputs()
-            return self._make_results_empty(tasks, mtp_size, logits.device)
+            return self._make_results_empty(tasks, self.mtp_size, logits.device)
 
         return_logits = tasks.return_logprobs or tasks._test_flag
 
-        states, logits, draft_tokens_list = self._prepare(logits, tasks, mtp_size)
+        states, logits, draft_tokens, draft_probs, draft_tokens_list = self._prepare(
+            logits, tasks, mtp_size
+        )
 
         self._apply_frequency_penalty(logits, states, mtp_size)
 
@@ -666,10 +650,35 @@ class Sampler:
             self._apply_test_tokens(tokens, states)
 
         tokens, logits, accept_indices = self._verify_tokens(
-            logits, tokens, mtp_size, return_logits, states=states
+            logits,
+            tokens,
+            mtp_size,
+            return_logits,
+            states=states,
+            draft_tokens=draft_tokens,
+            draft_probs=draft_probs,
         )
 
-        return self._make_results(tasks, tokens, logits, accept_indices)
+        result = self._make_results(tasks, tokens, logits, accept_indices)
+
+        if tasks.task_type == TaskType.Prefill and self.mtp_size > 1:
+            sampled = result.tokens  # (bs, 1)
+            if not is_pd_prefill_only():
+                # Non-PD prefill: pad the sampled first token into an
+                # mtp_size-wide row so the prefill->decode boundary feeds a
+                # full K-wide verify window.
+                # PD disaggregation: the decode instance rebuilds its own
+                # K-wide window and the prefill side only forwards the
+                # sampled first token (send_kv_cache flattens result.tokens
+                # and indexes per request); padding would shift the
+                # flattened indices and hand the decode side pad tokens
+                # instead of the real first token.
+                padded = sampled.new_zeros((sampled.shape[0], self.mtp_size))
+                padded[:, 0] = sampled[:, 0]
+                result.tokens = padded
+            result.accept_indices = sampled.new_zeros((sampled.shape[0],))
+
+        return result
 
     def _make_results_empty(
         self, tasks: PackedTasks, mtp_size: int, device
@@ -703,9 +712,39 @@ class Sampler:
         if tasks._test_flag:
             result.logits = logits
 
-        self._clear_draft_model_outputs()
-
         return result
+
+    def update_draft_results(
+        self,
+        tasks: PackedTasks,
+        next_tokens: torch.Tensor,
+        draft_probs: torch.Tensor | None,
+    ):
+        states = self._get_states(tasks.output_tasks)
+        if draft_probs is not None:
+            for i, state in enumerate(states):
+                state.draft_probs = draft_probs[i].detach().clone()
+        else:
+            # All-greedy batch: the verify uses exact-match acceptance and
+            # never reads p'; drop any stale per-task proposal so a later mixed
+            # verify rebuilds the correct one-hot (== greedy argmax) p'.
+            for state in states:
+                state.draft_probs = None
+
+        # Keep the drafted verify-input row on GPU so the next verify can
+        # consume it without a blocking CPU round trip. Clone the row so the
+        # per-task state does not keep the whole batch tensor alive for the
+        # task's lifetime. The CPU copy is started asynchronously;
+        # update_results() syncs it after the verify graph is launched, so the
+        # wait overlaps the model forward.
+        for i, state in enumerate(states):
+            state.next_tokens_device = next_tokens[i].clone()
+
+        tasks.generated_result_device.next_tokens = next_tokens
+        result = tasks.generated_result
+        if result is not None:
+            result.next_tokens = next_tokens.to("cpu", non_blocking=True)
+            result.record_sync_event()
 
     def update_results(self, tasks: PackedTasks):
         states = self._get_states(tasks.output_tasks)
@@ -716,6 +755,16 @@ class Sampler:
             state.append_tokens(ops, tokens)
             state.output_len += len(tokens)
         ops.execute()
+
+        # Mirror the last stage's drafted next_tokens into task.next_tokens so
+        # the next verify / model input reads the fresh draft. Only present when
+        # update_draft_results ran for this batch (the draft lives on the last
+        # PP stage, which is the sample rank).
+        result = tasks.generated_result
+        if result is not None and result.next_tokens is not None:
+            result.sync()
+            for i, task in enumerate(tasks.output_tasks):
+                task.next_tokens = result.next_tokens[i].tolist()
 
     def end_tasks(self, task_ids: list[str]):
         for task_id in task_ids:

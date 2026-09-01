@@ -454,6 +454,20 @@ class PipeDispatcher(TasksDispatcher):
 
         return payload_type, tasks
 
+    def dispatch_data(self, data):
+        if self.is_first_stage:
+            if data is not None:
+                payload = msgpack.packb(data, use_bin_type=True)
+                self.send_socket.send_multipart([payload])
+            return data
+
+        msgs = self.recv_socket.recv_multipart()
+        data = msgpack.unpackb(msgs[0], raw=False)
+        if not self.is_last_stage:
+            payload = msgpack.packb(data, use_bin_type=True)
+            self.send_socket.send_multipart([payload])
+        return data
+
     def recv_payload(self, payload: torch.Tensor, return_handle: bool = False):
         if not self.is_first_stage:
             if return_handle:
@@ -512,7 +526,7 @@ class PipeDispatcher(TasksDispatcher):
             handle.wait()
 
     def recv_results_async(self, tasks: Optional[PackedTasks] = None):
-        if tasks is None:
+        if tasks is None or not isinstance(tasks, PackedTasks):
             return None
         bs = len(tasks.output_tasks)
         mtp_size = Backend.executor.mtp_size
@@ -536,8 +550,9 @@ class PipeDispatcher(TasksDispatcher):
             return tensor
 
         result = PackedTasksResult(tokens=irecv((bs, mtp_size)))
-        if mtp_size > 1 and tasks.task_type == TaskType.Decode:
+        if mtp_size > 1:
             result.accept_indices = irecv((bs,))
+            result.next_tokens = irecv((bs, mtp_size))
         if tasks.return_logprobs:
             result.logprobs = irecv((bs, vocab_size), torch.float32)
             result.token_idxs = irecv((bs, vocab_size))
@@ -577,8 +592,10 @@ class PipeDispatcher(TasksDispatcher):
 
         result = tasks.generated_result_device
         isend(result.tokens)
-        if Backend.executor.mtp_size > 1 and tasks.task_type == TaskType.Decode:
+        mtp_size = Backend.executor.mtp_size
+        if mtp_size > 1:
             isend(result.accept_indices)
+            isend(result.next_tokens)
         if tasks.return_logprobs:
             isend(result.logprobs)
             isend(result.token_idxs)
@@ -848,10 +865,7 @@ class ExpertDataDispatcher(TasksDispatcher):
         per-rank slices directly so that no torch.cat is needed afterwards.
         """
         bs = len(tasks.output_tasks)
-        # mtp tokens only exist in Decode, see ``Sampler.sample()``
-        mtp_size = (
-            Backend.executor.mtp_size if tasks.task_type == TaskType.Decode else 1
-        )
+        mtp_size = Backend.executor.mtp_size
         vocab_size = Backend.model.vocab_size
 
         def create(shape, dtype=torch.int64):
@@ -860,6 +874,7 @@ class ExpertDataDispatcher(TasksDispatcher):
         result = PackedTasksResult(tokens=create((bs, mtp_size)))
         if mtp_size > 1:
             result.accept_indices = create((bs,))
+            result.next_tokens = create((bs, mtp_size))
         if tasks.return_logprobs:
             result.logprobs = create((bs, vocab_size), torch.float32)
             result.token_idxs = create((bs, vocab_size))
@@ -877,7 +892,8 @@ class ExpertDataDispatcher(TasksDispatcher):
         """
 
         if self.is_main_rank:
-            dp_tasks = DPTaskCollector.get_last_packedtasks()
+            if dp_tasks is None:
+                dp_tasks = DPTaskCollector.get_last_packedtasks()
             merged_results = self._create_empty_recv_results(dp_tasks)
             merged = dataclass_to_dict(merged_results)
 
@@ -928,7 +944,9 @@ class ExpertDataDispatcher(TasksDispatcher):
                     if isinstance(v, dict) and k in data:
                         v.update(data[k])
                     elif isinstance(v, torch.Tensor):
-                        v[slicing] = data[k].reshape(v[slicing].shape)
+                        dv = data.get(k)
+                        if isinstance(dv, torch.Tensor):
+                            v[slicing] = dv.reshape(v[slicing].shape)
                 offset += bs
             return merged_results
         else:
@@ -973,6 +991,7 @@ class Executor:
         self.tp_group = None
         self.pp_stage = get_pp_group().rank_in_group
         self.is_pp_first_stage = self.pp_size <= 1 or self.pp_stage == 0
+        self.is_pp_last_stage = self.pp_size <= 1 or self.pp_stage == self.pp_size - 1
         self.has_schedule_overlap = args.infer.schedule_overlap
 
         rank_filter = True
@@ -1016,6 +1035,8 @@ class Executor:
             # 需要接收 pp_size-1 步前的结果
             # 如果接收的位置在模型运行前，需要延后一步
             length = self.pp_size - 1 + (1 if self.has_schedule_overlap else 0)
+            if self.mtp_size > 1 and not is_pd_prefill_only():
+                length = max(length, 1)
             TaskCollector.init(length=length)
             if self.rank == 0:
                 DPTaskCollector.init(length=length)
@@ -1025,6 +1046,8 @@ class Executor:
             TaskCollector.init(length=1)
         elif self.pipe_dispatcher and self.pipe_dispatcher.is_first_stage:
             # PP non-main first stage: receive results from paired last stage.
+            TaskCollector.init(length=1)
+        elif self.mtp_size > 1 and not is_pd_prefill_only():
             TaskCollector.init(length=1)
 
         if self.pp_size > 1 and not get_pp_group().is_first_rank:
@@ -1095,40 +1118,35 @@ class Executor:
         self._pending_pp_result_tasks = deque()
         self._next_pp_result_seq = 0
 
+        self.sampler = None
         if self.is_sample_rank:
             self.sampler = Sampler()
 
-        self.process_queue = []
-        if not self.is_pp_first_stage:
-            # For pp last stage:
-            # sync postprocess before PP receive will cause ACL stream synchronize failed with error code:107020
-            # TODO: fix this bug and move postprocess_sync_part in front of model run
-            if self.has_schedule_overlap:
+        if self.has_schedule_overlap:
+            if self.is_pp_first_stage:
                 self.process_queue = [
+                    self.postprocess_sync_part,
+                    self.postprocess_generate_draft,
                     self.model_run,
+                    TaskCollector.process_last_batch_results,
                 ]
+            elif self.is_pp_last_stage:
+                if self.mtp_size > 1:
+                    self.process_queue = [
+                        self.postprocess_sync_part,
+                        self.postprocess_generate_draft,
+                        self.model_run,
+                    ]
+                else:
+                    # mtp=1: nothing to draft, so defer the previous step's
+                    # result sync until after decode is launched (inside
+                    # model_run -> postprocess_update_sampler), letting it
+                    # overlap the model forward like main.
+                    self.process_queue = [self.model_run]
             else:
-                self.process_queue = [
-                    self.model_run,
-                    self.postprocess_send_pp_result,
-                    self.postprocess_update_sampler,
-                ]
-        elif not self.has_schedule_overlap:
-            # normal step
-            self.process_queue = [
-                self.model_run,
-                self.postprocess_send_pp_result,
-                TaskCollector.process_last_batch_results,
-                self.postprocess_sync_part,
-                self.postprocess_update_sampler,
-            ]
+                self.process_queue = [self.model_run]
         else:
-            # step with overlap
-            self.process_queue = [
-                self.postprocess_sync_part,
-                self.model_run,
-                TaskCollector.process_last_batch_results,
-            ]
+            raise NotImplementedError
 
     def _prepend_dispatcher(self, dispatcher: TasksDispatcher):
         self.task_dispatchers.insert(0, dispatcher)
@@ -1193,16 +1211,54 @@ class Executor:
             return torch.empty((0,), device=self.device, dtype=torch.int64)
 
         if isinstance(tasks, PackedTasks):
-            tokens = create_tensor(
-                [task.next_token for task in tasks.tasks],
+            K = self.mtp_size
+            tokens = self._get_draft_tokens_device(tasks, K)
+            if tokens is None:
+                tokens = create_tensor(
+                    [
+                        tok
+                        for task in tasks.tasks
+                        for tok in (task.next_tokens or [0] * K)
+                    ],
+                    device=self.device,
+                    dtype=torch.int64,
+                )
+        else:
+            tokens = torch.empty(
+                tasks.num_tasks * self.mtp_size,
                 device=self.device,
                 dtype=torch.int64,
             )
-        else:
-            tokens = torch.empty(tasks.num_tasks, device=self.device, dtype=torch.int64)
         if self.tensor_broadcast_dispatchers:
             tokens = self._broadcast_tensor_payload(tokens)
         return tokens
+
+    def _get_draft_tokens_device(
+        self, tasks: PackedTasks, K: int
+    ) -> torch.Tensor | None:
+        """GPU draft rows for the verify input (pp=1 sample rank only).
+
+        The draft runs in decode_step right before the verify; keeping the
+        verify input on GPU avoids the blocking D2H + H2D round trip that
+        otherwise idles the GPU between the draft and verify graph replays.
+        Returns None to fall back to the CPU task.next_tokens path.
+        """
+        if self.mtp_size <= 1 or self.sampler is None:
+            return None
+        zero_row = None
+        rows = []
+        for task in tasks.tasks:
+            state = self.sampler.states.get(task.task_id)
+            row = state.next_tokens_device if state is not None else None
+            if row is None:
+                if task.has_output():
+                    # Active task missing its draft row: fall back to CPU.
+                    return None
+                if zero_row is None:
+                    zero_row = torch.zeros(K, dtype=torch.int64, device=self.device)
+                row = zero_row
+            rows.append(row)
+        return torch.stack(rows, dim=0).reshape(-1)
 
     def _prepare_blocks_for_decode_dllm(self, tasks: PackedTasks) -> torch.Tensor:
         """Prepare payload as concatenated blocks for DLLM decode. Each task's next_block is [block_length] tokens."""
@@ -1348,8 +1404,7 @@ class Executor:
                         TaskPool.remove(task_id)
             return payload_type
 
-        if self.is_main_rank:
-            TaskCollector.step(tasks)
+        TaskCollector.step(tasks)
 
         process_queue = self.process_queue
         from chitu.serve.common import begin_profiler_step, end_profiler_step
@@ -1367,17 +1422,27 @@ class Executor:
                     getattr(tasks, "task_type", None),
                     int(getattr(tasks, "num_tasks", 0) or 0),
                 )
-
         return payload_type
 
-    def special_step(self, task_ids: list[str], type: str = "EndTask"):
+    def end_task_step(self, task_ids: list[str]):
         if len(task_ids) == 0:
             return
+        if self.mtp_size > 1:
+            self.empty_step()  # flush postprocess_generate_draft
         tasks = PackedTasksBase(
             num_tasks=len(task_ids),
             task_ids=task_ids,
             task_type=TaskType.Special,
-            payload_type=SerializedPackedTasksPayloadType[type],
+            payload_type=SerializedPackedTasksPayloadType.EndTask,
+        )
+        self.step(tasks)
+
+    def empty_step(self):
+        DPTaskCollector.prepare_dp_tasks([])
+        tasks = PackedTasks(
+            task_ids=[],
+            task_type=TaskType.Special,
+            payload_type=SerializedPackedTasksPayloadType.Empty,
         )
         self.step(tasks)
 
@@ -1524,6 +1589,9 @@ class Executor:
         # In PCP+PP decode, each CP rank has the full batch — no CP-split is applied.
         if tasks.task_type == TaskType.Decode:
             pp_num_tokens = tasks.num_tokens
+            # Decode sends (bs*K,) hidden states; recv buffer must match
+            if self.mtp_size > 1:
+                pp_num_tokens *= self.mtp_size
         else:
             pp_num_tokens = self.cp_context.compute_pp_num_tokens(tasks.num_tokens)
         hiddens_shape = self.get_payload_shape(pp_num_tokens)
@@ -1708,9 +1776,7 @@ class Executor:
             self._kv_hook.before_decode_step(tasks.req_ids)
 
             if self.mtp_size > 1:
-                mtp_token_indices = self._prepare_mtp_token_indices(tasks)
-                for cache in Backend.cache_dict.values():
-                    cache.update_mtp_cache_accept(tasks, mtp_token_indices)
+                self._prepare_accept_indices(tasks)
 
             for cache in Backend.cache_dict.values():
                 cache.prepare_cache_decode(tasks)
@@ -1724,9 +1790,6 @@ class Executor:
             self.postprocess_send_pp_result(None)
 
         self.timers("decode").start()
-        if self.mtp_size > 1 and tasks.num_tasks > 0 and self.is_sample_rank:
-            # Sample rank prepares draft proposal params; model broadcasts them on tp_group.
-            self.sampler.prepare_model_input(tasks)
         out = Backend.model.decode(payload)
         self.timers("decode").stop()
 
@@ -1754,16 +1817,83 @@ class Executor:
                 assert self.pipe_dispatcher is not None
                 self.pipe_dispatcher.send_payload(tensor, tasks)
 
-    def _prepare_mtp_token_indices(self, tasks) -> list[int]:
+    def _prepare_accept_indices(self, tasks, is_draft_prepare=False) -> list[int]:
         indices = None
-        if isinstance(tasks, PackedTasks):
+        if self.is_dp_rank or self.is_sample_rank:
             indices = [task.mtp_accept_index for task in tasks.tasks]
+        if is_draft_prepare:
+            # Only the last stage runs the draft path (postprocess_generate_draft);
+            # no upstream stage sends accept indices during it, so never recv here.
+            assert self.is_pp_last_stage
+        elif self.pipe_dispatcher is not None and self.is_main_rank:
+            indices = self.pipe_dispatcher.dispatch_data(indices)
         if self.tensor_broadcast_dispatchers:
             indices = self._broadcast_data_payload(indices)
         indices_device = create_tensor(indices, device=self.device, dtype=torch.int64)
         indices_device = torch.clamp(indices_device, min=0)
         Backend.model.mtp_accept_indices.set(indices_device)
-        return indices
+        if not is_draft_prepare and self.is_pp_last_stage:
+            # skip last stage cache update if not in draft path
+            return
+        for cache in Backend.cache_dict.values():
+            cache.update_mtp_cache_accept(tasks, indices)
+
+    def postprocess_generate_draft(self, _):
+        if self.model_type == ModelType.LLADA2:
+            return
+        if self._pd_prefill_only:
+            return
+        if self.mtp_size <= 1:
+            return
+        if not self.is_pp_last_stage:
+            return
+        tasks = TaskCollector.get_postprocess_tasks()
+        if tasks is None:
+            return
+
+        if len(tasks.output_task_ids) == 0:
+            Backend.model.draft(
+                tasks, torch.empty(0, dtype=torch.int64, device=self.device)
+            )
+            return
+
+        self._prepare_accept_indices(tasks, is_draft_prepare=True)
+
+        # Anchor tokens (last accepted token per task) for the next draft.
+        # Uses the previous step's accepted tokens when available; on the first
+        # decode step (no sample yet) falls back to the prefill output token
+        # staged in ``task.next_tokens``.
+        last_tokens = None
+        if self.is_sample_rank:
+            if tasks.generated_result is not None:
+                last_tokens = tasks.generated_result.accepted_tokens
+                last_tokens = [a[-1] for a in last_tokens]
+            else:
+                last_tokens = [
+                    (task.next_tokens[0] if task.next_tokens else 0)
+                    for task in tasks.tasks
+                ]
+        for dispatcher in self.tensor_broadcast_dispatchers:
+            last_tokens = dispatcher.broadcast_data(last_tokens)
+        last_tokens = create_tensor(last_tokens, device=self.device, dtype=torch.int64)
+
+        if Backend.model.moe_impl is not None:
+            Backend.model.moe_impl.prepare(TaskType.Decode, len(tasks.output_task_ids))
+
+        Backend.model.update_mtp_hidden_states(
+            Backend.model.read_mtp_hidden_states(is_mtp=True), is_mtp=False
+        )
+        if self.is_sample_rank:
+            # Draft proposal params (temperature/top-k/top-p/greedy mask) must be
+            # refreshed per decode step from the CURRENT batch: sample_draft_tokens
+            # samples the next drafts from p' on the sample rank, and the next
+            # verify consumes the same p' via state.draft_probs.
+            self.sampler.prepare_draft_sample_params(tasks)
+            next_tokens, draft_probs = Backend.model.draft(tasks, last_tokens)
+            next_tokens = torch.cat([last_tokens.unsqueeze(1), next_tokens], dim=1)
+            self.sampler.update_draft_results(tasks, next_tokens, draft_probs)
+        else:
+            Backend.model.draft(tasks, last_tokens)
 
     def prefill_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
         is_empty_step = tasks.num_tasks == 0
@@ -2036,18 +2166,15 @@ class Executor:
     def postprocess_send_pp_result(self, _):
         if self.is_sample_rank and self.pipe_dispatcher:
             if self._pd_prefill_only:
-                # Prefill node send tokens at pp last stage in `on_prefill_done`
                 return
-            # send pp result
             tasks = TaskCollector.get_postprocess_tasks()
-            if tasks is not None:
+            if isinstance(tasks, PackedTasks):
                 self.pipe_dispatcher.send_results(tasks)
 
     def postprocess_update_sampler(self, _):
         if self.is_sample_rank and self.model_type != ModelType.LLADA2:
-            # update sampler by syned tokens
             tasks = TaskCollector.get_postprocess_tasks()
-            if tasks is not None:
+            if tasks is not None and not tasks.is_empty_tasks():
                 tasks.generated_result.finish_sync()
                 self.sampler.update_results(tasks)
 
@@ -2142,7 +2269,7 @@ class Executor:
                 ):
                     return None
             # non dp main rank can safely pop task since only main rank will
-            # call special_step(..., type="EndTask") later to release kvCache
+            # call end_task_step(...) later to release kvCache
             return self._pending_pp_result_tasks.popleft()
         if handle is not None and (force or handle.is_completed()):
             handle.wait()
@@ -2284,17 +2411,18 @@ class Executor:
         if self.model_type == ModelType.LLADA2:
             # dllm use `_process_dllm_block_results`
             return
-        if not self.is_dp_rank:
-            return
         if self._pd_prefill_only:
             # Prefill node send tokens at pp last stage in `on_prefill_done`
             return
 
-        tasks = TaskCollector.get_postprocess_tasks()
-        if tasks is None:
+        if not self.is_dp_rank and not self.is_sample_rank:
             return
 
-        if self.pipe_dispatcher:
+        tasks = TaskCollector.get_postprocess_tasks()
+        if tasks is None or tasks.is_empty_tasks():
+            return
+
+        if self.pipe_dispatcher and self.is_pp_first_stage:
             self.pipe_dispatcher.recv_results(tasks)
             tasks.generated_result = tasks.generated_result_device.sync()
         else:
@@ -2305,10 +2433,18 @@ class Executor:
             if tasks.generated_result.accept_indices is not None
             else None
         )
-        self._update_token_statistics(tasks, accept_indices_list)
         tasks.batch_update_mtp_accept_index(accept_indices_list)
-        tasks = self._dp_collect_result(tasks)
-        tasks.batch_update_response_sync()
+
+        if self.is_pp_first_stage:
+            self._update_token_statistics(tasks, accept_indices_list)
+            tasks = self._dp_collect_result(tasks)
+            tasks.batch_update_response_sync()
+            if self.pp_size > 1:
+                # update next_tokens containing draft tokens receavied from last stage
+                next_tokens = tasks.generated_result.next_tokens
+                if next_tokens is not None:
+                    for i, task in enumerate(tasks.output_tasks):
+                        task.next_tokens = next_tokens[i].tolist()
 
         if self.rank != 0:
             return

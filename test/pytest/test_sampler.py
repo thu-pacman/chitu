@@ -11,7 +11,6 @@ from chitu.sampling.sampler import (
     TaskSampleState,
     AppendTokenOps,
     FrequencyPenaltyOps,
-    DraftInfo,
     TOKEN_BLOCK_SIZE,
 )
 from chitu.task import Task, SampleParams, PackedTasks, PackedTasksResult
@@ -65,15 +64,6 @@ def _make_packed_tasks(tasks):
     pt.generated_result = None
     pt.generated_result_device = None
     return pt
-
-
-def _inject_draft_info(sampler, tokens, logits=None):
-    """Inject DraftInfo into sampler so _verify_tokens / _verify_mtp_mixed can read drafts."""
-    sampler.draft_info = DraftInfo(
-        needs_cpu_draft=False,
-        tokens=tokens,
-        logits=logits,
-    )
 
 
 def _setup_draft_sampling_params(sampler, bs, temperature=1.0, top_k=50, top_p=0.9):
@@ -713,6 +703,66 @@ class TestGumbelMaxSample:
         assert result.max() < 50
 
 
+class TestSampleDraftTokens:
+    """Sampler.sample_draft_tokens returns (token, p') with p' = the exact
+    distribution the draft was sampled from (verify consumes it directly)."""
+
+    def test_all_greedy_returns_none(self, sampler, global_args):
+        """All-greedy fast path: p' is not needed (exact-match verify) -> None."""
+        sampler.all_greedy = True
+        V = global_args.models.vocab_size
+        logits = torch.randn(2, V)
+        token, p_prime = sampler.sample_draft_tokens(logits)
+        assert p_prime is None
+        assert torch.equal(token, torch.argmax(logits, dim=-1))
+
+    def test_non_greedy_returns_sampling_distribution(self, sampler, global_args):
+        """Non-greedy: p' is the filtered proposal carrying the sampled token."""
+        sampler.all_greedy = False
+        V = global_args.models.vocab_size
+        bs = 2
+        logits = torch.full((bs, V), -1.0)
+        logits[0, 5] = 3.0
+        logits[1, 7] = 2.0
+        _setup_draft_sampling_params(sampler, bs)  # temp=1.0, top_k=50, top_p=0.9
+        sampler.draft_greedy_mask = torch.zeros(bs, dtype=torch.bool)
+
+        token, p_prime = sampler.sample_draft_tokens(logits)
+
+        assert p_prime.shape == (bs, V)
+        # filter_logits_top_k_top_p does NOT renormalize after top-p filtering,
+        # so p' sums to <= 1 (never above); the sampled token keeps its mass.
+        assert bool((p_prime.sum(dim=-1) <= 1.0 + 1e-6).all())
+        assert bool((p_prime.sum(dim=-1) > 0).all())
+        for b in range(bs):
+            # the sampled token must come from the proposal distribution
+            assert p_prime[b, token[b].item()] > 0
+
+    def test_mixed_batch_greedy_row_onehot(self, sampler, global_args):
+        """Mixed batch: greedy row keeps argmax and p' degenerates to one-hot at it."""
+        sampler.all_greedy = False
+        V = global_args.models.vocab_size
+        bs = 2
+        logits = torch.full((bs, V), -1.0)
+        logits[0, 5] = 3.0
+        logits[1, 7] = 2.0
+        # SampleParams normalizes temperature=0 -> (temperature=1, top_k=1).
+        sampler.draft_temperatures = torch.tensor([1.0, 1.0], dtype=torch.float32)
+        sampler.draft_top_ks = torch.tensor([1, 50], dtype=torch.int32)
+        sampler.draft_top_ps = torch.tensor([1.0, 0.9], dtype=torch.float32)
+        sampler.max_top_k_for_draft = 50
+        sampler.draft_greedy_mask = torch.tensor([True, False])
+
+        token, p_prime = sampler.sample_draft_tokens(logits)
+
+        assert token[0].item() == 5  # greedy row: argmax
+        onehot = torch.zeros(V, dtype=p_prime.dtype)
+        onehot[5] = 1.0
+        assert torch.allclose(p_prime[0], onehot, atol=1e-6)
+        assert 0 < p_prime[1].sum() <= 1.0 + 1e-6
+        assert p_prime[1, token[1].item()] > 0
+
+
 # ========================================================
 #  resample_mtp_rejected — pure-function unit tests
 # ========================================================
@@ -978,7 +1028,7 @@ class TestSampleMTP:
 
 
 class TestVerifyTokensMTP:
-    """Test Sampler._verify_tokens with DraftInfo injection."""
+    """Test Sampler._verify_tokens with explicit draft inputs."""
 
     @pytest.fixture(autouse=True)
     def _set_mtp3(self, monkeypatch, global_args):
@@ -994,9 +1044,7 @@ class TestVerifyTokensMTP:
         tokens_flat = torch.tensor([7, 3, 0, 9, 2, 0], dtype=torch.int64)
         logits_flat = torch.randn(bs * mtp_size, V)
 
-        _inject_draft_info(
-            sampler, tokens=torch.tensor([[7, 3], [9, 2]], dtype=torch.int64)
-        )
+        draft_tokens = torch.tensor([[7, 3], [9, 2]], dtype=torch.int64)
 
         tasks = [
             _make_task(_make_sample_params(temperature=0, top_k=1)),
@@ -1005,7 +1053,12 @@ class TestVerifyTokensMTP:
         states = [TaskSampleState.from_task(t) for t in tasks]
 
         tokens, logits, accept_indices = sampler._verify_tokens(
-            logits_flat, tokens_flat, mtp_size, return_logits=False, states=states
+            logits_flat,
+            tokens_flat,
+            mtp_size,
+            return_logits=False,
+            states=states,
+            draft_tokens=draft_tokens,
         )
 
         assert tokens.shape == (bs, mtp_size)
@@ -1023,13 +1076,18 @@ class TestVerifyTokensMTP:
         tokens_flat = torch.tensor([7, 99, 0], dtype=torch.int64)
         logits_flat = torch.randn(bs * mtp_size, V)
 
-        _inject_draft_info(sampler, tokens=torch.tensor([[7, 3]], dtype=torch.int64))
+        draft_tokens = torch.tensor([[7, 3]], dtype=torch.int64)
 
         tasks = [_make_task(_make_sample_params(temperature=0, top_k=1))]
         states = [TaskSampleState.from_task(t) for t in tasks]
 
         tokens, logits, accept_indices = sampler._verify_tokens(
-            logits_flat, tokens_flat, mtp_size, return_logits=False, states=states
+            logits_flat,
+            tokens_flat,
+            mtp_size,
+            return_logits=False,
+            states=states,
+            draft_tokens=draft_tokens,
         )
 
         assert accept_indices[0].item() == 1
@@ -1043,10 +1101,15 @@ class TestVerifyTokensMTP:
         # tokens[:n_drafts]=[7,3] vs draft=[7,3] → all True → accept=2
         tokens_flat = torch.tensor([7, 3, 0], dtype=torch.int64)
         logits_flat = torch.randn(bs * mtp_size, V)
-        _inject_draft_info(sampler, tokens=torch.tensor([[7, 3]], dtype=torch.int64))
+        draft_tokens = torch.tensor([[7, 3]], dtype=torch.int64)
 
         tokens, logits, accept_indices = sampler._verify_tokens(
-            logits_flat, tokens_flat, mtp_size, return_logits=False, states=None
+            logits_flat,
+            tokens_flat,
+            mtp_size,
+            return_logits=False,
+            states=None,
+            draft_tokens=draft_tokens,
         )
 
         assert accept_indices.shape == (bs,)
@@ -1063,13 +1126,18 @@ class TestVerifyTokensMTP:
         logits_flat[1, 0] = 2.0
         logits_flat[2, 0] = 3.0
         tokens_flat = torch.tensor([7, 3, 0], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=torch.tensor([[7, 3]], dtype=torch.int64))
+        draft_tokens = torch.tensor([[7, 3]], dtype=torch.int64)
 
         tasks = [_make_task(_make_sample_params(temperature=0, top_k=1))]
         states = [TaskSampleState.from_task(t) for t in tasks]
 
         tokens, logits, accept_indices = sampler._verify_tokens(
-            logits_flat, tokens_flat, mtp_size, return_logits=True, states=states
+            logits_flat,
+            tokens_flat,
+            mtp_size,
+            return_logits=True,
+            states=states,
+            draft_tokens=draft_tokens,
         )
 
         assert accept_indices[0].item() == mtp_size - 1
@@ -1083,7 +1151,7 @@ class TestVerifyTokensMTP:
 
 
 class TestVerifyMtpMixed:
-    """Test Sampler._verify_mtp_mixed end-to-end with DraftInfo injection."""
+    """Test Sampler._verify_mtp_mixed end-to-end with explicit draft inputs."""
 
     @pytest.fixture(autouse=True)
     def _set_mtp3(self, monkeypatch, global_args):
@@ -1100,11 +1168,10 @@ class TestVerifyMtpMixed:
         logits[:, :, 42] = 100.0
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
-        draft_logits[0, 1, 20] = 100.0
+        draft_logits[0, 0, 10] = 1.0
+        draft_logits[0, 1, 20] = 1.0
 
         draft_tokens = torch.tensor([[10, 20]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs)
 
         tokens = torch.tensor([[42, 42, 42]], dtype=torch.int64)
@@ -1119,6 +1186,7 @@ class TestVerifyMtpMixed:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1143,11 +1211,10 @@ class TestVerifyMtpMixed:
         logits[0, 2, 99] = 100.0  # bonus position
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
-        draft_logits[0, 1, 99] = 100.0
+        draft_logits[0, 0, 10] = 1.0
+        draft_logits[0, 1, 99] = 1.0
 
         draft_tokens = torch.tensor([[10, 99]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs)
 
         tokens = torch.tensor([[10, 99, 0]], dtype=torch.int64)
@@ -1162,6 +1229,7 @@ class TestVerifyMtpMixed:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1189,13 +1257,12 @@ class TestVerifyMtpMixed:
         logits[1, 1, 20] = 100.0
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
-        draft_logits[0, 1, 20] = 100.0
-        draft_logits[1, 0, 10] = 100.0
-        draft_logits[1, 1, 20] = 100.0
+        draft_logits[0, 0, 10] = 1.0
+        draft_logits[0, 1, 20] = 1.0
+        draft_logits[1, 0, 10] = 1.0
+        draft_logits[1, 1, 20] = 1.0
 
         draft_tokens = torch.tensor([[10, 20], [10, 20]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs)
 
         tokens = torch.tensor([[10, 20, 0], [42, 20, 0]], dtype=torch.int64)
@@ -1213,6 +1280,7 @@ class TestVerifyMtpMixed:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1238,11 +1306,10 @@ class TestVerifyMtpMixed:
         logits[0, 1, 20] = 100.0
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
-        draft_logits[0, 1, 20] = 100.0
+        draft_logits[0, 0, 10] = 1.0
+        draft_logits[0, 1, 20] = 1.0
 
         draft_tokens = torch.tensor([[10, 20]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs)
 
         tokens = torch.tensor([[10, 20, 0]], dtype=torch.int64)
@@ -1257,6 +1324,7 @@ class TestVerifyMtpMixed:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1293,11 +1361,10 @@ class TestMTPRejectionEdgeCases:
         logits[0, 1, 88] = 100.0  # depth 1: mass on 88 ≠ draft[1]=20
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
-        draft_logits[0, 1, 20] = 100.0
+        draft_logits[0, 0, 10] = 1.0
+        draft_logits[0, 1, 20] = 1.0
 
         draft_tokens = torch.tensor([[10, 20]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs)
 
         tokens = torch.tensor([[7, 10, 20]], dtype=torch.int64)
@@ -1312,6 +1379,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1333,11 +1401,10 @@ class TestMTPRejectionEdgeCases:
         logits[0, 2, 20] = 100.0  # bonus: NOT compared
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
-        draft_logits[0, 1, 20] = 100.0
+        draft_logits[0, 0, 10] = 1.0
+        draft_logits[0, 1, 20] = 1.0
 
         draft_tokens = torch.tensor([[10, 20]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs)
 
         tokens = torch.tensor([[10, 42, 20]], dtype=torch.int64)
@@ -1352,6 +1419,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1376,11 +1444,10 @@ class TestMTPRejectionEdgeCases:
         logits[0, 1, 88] = 100.0
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
-        draft_logits[0, 1, 20] = 100.0
+        draft_logits[0, 0, 10] = 1.0
+        draft_logits[0, 1, 20] = 1.0
 
         draft_tokens = torch.tensor([[10, 20]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs)
 
         tokens = torch.tensor([[77, 88, 0]], dtype=torch.int64)
@@ -1395,6 +1462,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1416,11 +1484,10 @@ class TestMTPRejectionEdgeCases:
         logits[0, 1, 20] = 100.0
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
-        draft_logits[0, 1, 20] = 100.0
+        draft_logits[0, 0, 10] = 1.0
+        draft_logits[0, 1, 20] = 1.0
 
         draft_tokens = torch.tensor([[10, 20]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs, top_k=1)
 
         tokens = torch.tensor([[42, 20, 0]], dtype=torch.int64)
@@ -1435,6 +1502,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1455,11 +1523,10 @@ class TestMTPRejectionEdgeCases:
         logits[0, 1, 88] = 100.0  # depth 1 = draft[1] verification
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
-        draft_logits[0, 1, 20] = 100.0
+        draft_logits[0, 0, 10] = 1.0
+        draft_logits[0, 1, 20] = 1.0
 
         draft_tokens = torch.tensor([[10, 20]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs, top_p=0.01)
 
         tokens = torch.tensor([[10, 88, 0]], dtype=torch.int64)
@@ -1474,6 +1541,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1492,11 +1560,10 @@ class TestMTPRejectionEdgeCases:
         logits = torch.ones(bs, mtp_size, V) * 0.01
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
-        draft_logits[0, 1, 20] = 100.0
+        draft_logits[0, 0, 10] = 1.0
+        draft_logits[0, 1, 20] = 1.0
 
         draft_tokens = torch.tensor([[10, 20]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs, temperature=100.0)
 
         tokens = torch.tensor([[0, 10, 20]], dtype=torch.int64)
@@ -1511,6 +1578,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1531,11 +1599,10 @@ class TestMTPRejectionEdgeCases:
         logits[0, 1, 20] = 100.0  # depth 1 (= draft[1])
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
-        draft_logits[0, 1, 20] = 100.0
+        draft_logits[0, 0, 10] = 1.0
+        draft_logits[0, 1, 20] = 1.0
 
         draft_tokens = torch.tensor([[10, 20]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs)
 
         tokens = torch.tensor([[10, 20, 0]], dtype=torch.int64)
@@ -1550,6 +1617,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1571,11 +1639,10 @@ class TestMTPRejectionEdgeCases:
         logits[0, 2, 42] = 100.0
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
-        draft_logits[0, 1, 20] = 100.0
+        draft_logits[0, 0, 10] = 1.0
+        draft_logits[0, 1, 20] = 1.0
 
         draft_tokens = torch.tensor([[10, 20]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs)
 
         tokens = torch.tensor([[0, 10, 20]], dtype=torch.int64)
@@ -1590,6 +1657,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1609,11 +1677,10 @@ class TestMTPRejectionEdgeCases:
         logits[0, 1, 88] = 100.0  # depth 1 = draft[1]
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 42] = 100.0
-        draft_logits[0, 1, 88] = 100.0
+        draft_logits[0, 0, 42] = 1.0
+        draft_logits[0, 1, 88] = 1.0
 
         draft_tokens = torch.tensor([[42, 88]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs)
 
         tokens = torch.tensor([[42, 88, 0]], dtype=torch.int64)
@@ -1628,6 +1695,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1647,11 +1715,10 @@ class TestMTPRejectionEdgeCases:
         logits[0, 1, 99] = 100.0  # depth 1 = draft[1]
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
-        draft_logits[0, 1, 99] = 100.0
+        draft_logits[0, 0, 10] = 1.0
+        draft_logits[0, 1, 99] = 1.0
 
         draft_tokens = torch.tensor([[10, 99]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs)
 
         tokens = torch.tensor([[10, 99, 11]], dtype=torch.int64)
@@ -1666,6 +1733,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1688,13 +1756,12 @@ class TestMTPRejectionEdgeCases:
         logits[1, 1, 20] = 100.0
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
-        draft_logits[0, 1, 20] = 100.0
-        draft_logits[1, 0, 10] = 100.0
-        draft_logits[1, 1, 20] = 100.0
+        draft_logits[0, 0, 10] = 1.0
+        draft_logits[0, 1, 20] = 1.0
+        draft_logits[1, 0, 10] = 1.0
+        draft_logits[1, 1, 20] = 1.0
 
         draft_tokens = torch.tensor([[10, 20], [10, 20]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs)
 
         tokens = torch.tensor([[10, 20, 0], [42, 20, 0]], dtype=torch.int64)
@@ -1712,6 +1779,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,
@@ -1734,10 +1802,9 @@ class TestMTPRejectionEdgeCases:
         logits[0, 0, 42] = 1.0
 
         draft_logits = torch.zeros(bs, n_drafts, V)
-        draft_logits[0, 0, 10] = 100.0
+        draft_logits[0, 0, 10] = 1.0
 
         draft_tokens = torch.tensor([[10, 0]], dtype=torch.int64)
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits)
         _setup_draft_sampling_params(sampler, bs)
 
         tokens = torch.tensor([[42, 0, 0]], dtype=torch.int64)
@@ -1755,6 +1822,7 @@ class TestMTPRejectionEdgeCases:
                 tokens.clone(),
                 logits,
                 draft_tokens,
+                draft_logits,
                 greedy_mask,
                 mtp_size,
                 states,
@@ -1779,7 +1847,6 @@ class TestMTPRejectionEdgeCases:
         tokens = torch.randint(0, V, (bs, mtp_size))
 
         draft_tokens = torch.randint(0, V, (bs, n_drafts))
-        _inject_draft_info(sampler, tokens=draft_tokens, logits=draft_logits.float())
         _setup_draft_sampling_params(sampler, bs)
 
         greedy_mask = torch.zeros(bs, dtype=torch.bool)
@@ -1803,6 +1870,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
+            draft_logits,
             greedy_mask,
             mtp_size,
             states,

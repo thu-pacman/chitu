@@ -484,7 +484,7 @@ class Scheduler:
         if has_kv_cache:
             for cache_manager in self.cache_manager_dict.values():
                 cache_manager.finalize_metadata_all_decode(task)
-            Backend.executor.special_step([task_id], type="EndTask")
+            Backend.executor.end_task_step([task_id])
 
         TaskPool.remove(task_id)
         inc_completed_requests("worker", 1)
@@ -916,7 +916,14 @@ class Scheduler:
                 candidate_task.task_type = TaskType.Decode
                 candidate_task.prefill_chunk_size = None
                 candidate_task.consumed_req_tokens = candidate_task.prefix_tokens_len
-                candidate_task.next_token = candidate_task.prefix_tokens[-1]
+                # MTP: first decode verify input starts from the last prefix token,
+                # pre-padded to K with zeros (no _prepare_tokens_decode fallback).
+                candidate_task.next_tokens = [candidate_task.prefix_tokens[-1]]
+                mtp_size = get_global_args().infer.mtp_size
+                if mtp_size > 1:
+                    candidate_task.next_tokens = (
+                        candidate_task.next_tokens + [0] * mtp_size
+                    )[:mtp_size]
                 candidate_task.has_unsync_new_token = False
 
             capacity_status = self._check_decode_capacity(candidate_task)
@@ -977,14 +984,14 @@ class Scheduler:
         if task.has_unsync_new_token:
             task.evicting_with_new_token = True
         else:
-            task.next_token = -1
+            # MTP: drop the K-token verify input so a re-prefilled task does
+            # not reuse stale drafts.
+            task.next_tokens = []
         for cache_manager in self.cache_manager_dict.values():
             cache_manager.finalize_metadata_all_decode(
                 task
             )  # 清除KVCacheManager中的元数据
-        Backend.executor.special_step(
-            [task.task_id], type="EndTask"
-        )  # 清除KVCache中的元数据
+        Backend.executor.end_task_step([task.task_id])  # 清除KVCache中的元数据
 
         logger.warning(
             f"Evicted task {task_id} due to insufficient KV cache",

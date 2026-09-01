@@ -17,7 +17,7 @@ class MockExecutor:
     def step(self, tasks):
         pass
 
-    def special_step(self, task_ids, type):
+    def end_task_step(self, task_ids):
         pass
 
 
@@ -429,7 +429,7 @@ def test_priority_prefill_first_skew():
     assert sorted(batch1_ids) == sorted(["req_7", "req_1", "req_3", "req_8"])
     for task_id in batch1_ids:
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch1_ids)
@@ -441,7 +441,7 @@ def test_priority_prefill_first_skew():
     assert sorted(batch2_ids) == sorted(["req_0", "req_4"])
     for task_id in batch2_ids:
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch2_ids)
@@ -455,7 +455,7 @@ def test_priority_prefill_first_skew():
     )  # skewScheduler's decode_mbs == prefill_mbs == 4
     for task_id in batch3_ids:
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch3_ids)
@@ -625,7 +625,7 @@ def test_priority_fcfs_skew():
     for task_id in batch1_ids:
         # Make task need_move
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch1_ids)
@@ -638,7 +638,7 @@ def test_priority_fcfs_skew():
     for task_id in batch2_ids:
         # Make task need_move
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch2_ids)
@@ -652,7 +652,7 @@ def test_priority_fcfs_skew():
     for task_id in batch3_ids:
         # Make task need_move
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch3_ids)
@@ -832,7 +832,7 @@ def test_priority_request_preset_over_prefill_first_skew():
     for task_id in batch1_ids:
         # Make task need_move
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch1_ids)
@@ -845,7 +845,7 @@ def test_priority_request_preset_over_prefill_first_skew():
     for task_id in batch2_ids:
         # Make task need_move
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch2_ids)
@@ -858,7 +858,7 @@ def test_priority_request_preset_over_prefill_first_skew():
     for task_id in batch3_ids:
         # Make task need_move
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch3_ids)
@@ -1039,6 +1039,8 @@ def test_single_decode_prompt_seq_bigger_than_kvcache_capacity():
         }
     ]  # kv_cache capacity = 1024
 
+    Backend.executor = MockExecutor()
+
     req = UserRequest.create_mock(
         input_len=NUM_BLOCKS * BLOCK_SIZE - DIFF,
         request_id=f"req_0",
@@ -1182,7 +1184,7 @@ def test_evict_task():
     # two tasks finishes decoding
     for i in range(2):
         task = TaskPool.pool[f"req_{i}"]
-        task.next_token = 2
+        task.next_tokens = [2]
         task.num_new_tokens = 1
         task.set_stopped()
     task_ids = [task.task_id for task in tasks]
@@ -1315,7 +1317,7 @@ def test_scheduler_group():
     # Set all tasks in scheduler_group_1 are unwait, release scheduler_group_1
     for task_id in batch2_ids:
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     # sgroup head at: 1, empty sgroup: []
@@ -1330,7 +1332,7 @@ def test_scheduler_group():
     # remove tasks in scheduler_group_0, release scheduler_group_0
     for task_id in batch3_ids:
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     # sgroup head at: 0, empty sgroup: []
@@ -1338,7 +1340,7 @@ def test_scheduler_group():
 
     for task_id in batch4_ids:
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch4_ids)
@@ -1443,7 +1445,7 @@ def test_slot_group_skew():
     # Set all tasks in scheduler_group_1 are unwait, release scheduler_group_1
     for task_id in batch2_ids:
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     # slot_group: [['req_2', 'req_5'], ['req_7', 'req_1', 'req_3', 'req_8']], sgroup head at: 1
@@ -1459,7 +1461,7 @@ def test_slot_group_skew():
     # remove tasks in scheduler_group_0, release scheduler_group_0
     for task_id in batch3_ids:
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     # slot_group: [['req_0', 'req_4'], ['req_7', 'req_1', 'req_3', 'req_8']], sgroup head at: 0
@@ -1473,7 +1475,7 @@ def test_slot_group_skew():
 
     for task_id in batch4_ids + batch5_ids:
         TaskPool.pool[task_id].num_new_tokens = 1025
-        TaskPool.pool[task_id].next_token = 2
+        TaskPool.pool[task_id].next_tokens = [2]
         TaskPool.pool[task_id].task_type = TaskType.Decode
         TaskPool.pool[task_id].set_stopped()
     scheduler.update(batch4_ids)
