@@ -574,7 +574,22 @@ class DSAIndexer:
         gathered = k_cache[page_ids].view(batch_size, max_ctx, d)  # [b, max_ctx, d]
 
         # 展开 q/weights 到 [b, mtp, h, d]
-        mtp = self.mtp_size
+        # Infer the actual query group size from the tensor instead of assuming
+        # every call carries ``self.mtp_size`` queries: the main decode pass
+        # supplies all configured MTP queries together, while each draft-layer
+        # pass supplies one query per request.
+        if s_q % batch_size != 0:
+            raise ValueError(
+                "paged MQA requires query rows divisible by batch size, "
+                f"got rows={s_q}, batch_size={batch_size}"
+            )
+        mtp = s_q // batch_size
+        if not 1 <= mtp <= self.mtp_size:
+            raise ValueError(
+                "paged MQA query group must be between 1 and the "
+                f"configured mtp_size={self.mtp_size}, got {mtp}"
+            )
+
         q_b = q.view(batch_size, mtp, h, d)  # [b, mtp, h, d]
         w_b = weights.view(batch_size, mtp, h)  # [b, mtp, h]
 
