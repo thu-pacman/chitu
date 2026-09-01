@@ -40,6 +40,12 @@ if has_flash_mla and has_accelerator():
         quant_pertoken_kvcache_dsa,
     )
 
+    has_flash_mla_e5m2 = has_flash_mla_sched_meta and hasattr(
+        flash_mla, "flash_mla_with_kvcache_fp8_e5m2_dense"
+    )
+else:
+    has_flash_mla_e5m2 = False
+
 
 logger = getLogger(__name__)
 
@@ -226,6 +232,30 @@ class FlashMLABackend(TritonAttnBackend):
             if kv_lora_quant_type is not None
             else use_fp8
         )
+        self.use_e5m2_cache = kv_lora_quant_type == "fp8_e5m2"
+
+        if self.use_e5m2_cache:
+            if not is_hygon():
+                raise NotImplementedError("fp8_e5m2 FlashMLA is Hygon-only")
+            if not has_flash_mla_e5m2:
+                raise RuntimeError(
+                    "fp8_e5m2 KV cache requires "
+                    "flash_mla_with_kvcache_fp8_e5m2_dense"
+                )
+            if getattr(self.args.infer, "cache_type", "paged") != "paged":
+                raise NotImplementedError("fp8_e5m2 KV cache requires paged cache")
+            if self.index_topk is not None:
+                raise NotImplementedError("fp8_e5m2 only supports dense MLA")
+            if self.mtp_size != 1:
+                raise NotImplementedError("fp8_e5m2 only supports classic decode")
+            if not (
+                self.local_n_heads == 8
+                and self.args.models.kv_lora_rank == 512
+                and self.args.models.qk_rope_head_dim == 64
+            ):
+                raise NotImplementedError(
+                    "fp8_e5m2 FlashMLA requires h_q=8 and a 512+64 latent KV"
+                )
 
         if self.use_fp8_cache and is_muxi():
             raise NotImplementedError(
@@ -245,6 +275,7 @@ class FlashMLABackend(TritonAttnBackend):
         logger.info(
             f"FlashMLA backend initialized with topk={self.index_topk}, "
             f"use_fp8_cache={self.use_fp8_cache}, "
+            f"use_e5m2_cache={self.use_e5m2_cache}, "
             f"sparse_split_q={self.sparse_split_q_supported}"
         )
 
@@ -263,7 +294,8 @@ class FlashMLABackend(TritonAttnBackend):
 
     @override
     def decode_op_supports_mtp(self) -> bool:
-        return True
+        # The E5M2 dense kernel only supports classic single-token decode.
+        return not self.use_e5m2_cache
 
     def convert_indices_ragged_torch(
         self,
@@ -488,6 +520,41 @@ class FlashMLABackend(TritonAttnBackend):
                 softmax_scale=softmax_scale,
             )
         return output.view(bsz * s_q, output.shape[-2], output.shape[-1])
+
+    def flashmla_dense_fwd_e5m2(
+        self,
+        q_nope,
+        q_pe,
+        kv_lora_k_pe,
+        block_table,
+        seq_len_delta,
+        softmax_scale,
+    ):
+        if not seq_len_delta.is_classic_decoding:
+            raise NotImplementedError(
+                "fp8_e5m2 FlashMLA only supports classic s_q=1 decode"
+            )
+        if self.hygon_metadata_decode is None:
+            raise RuntimeError(
+                "prepare_metadata_for_decode() must run before fp8_e5m2 decode"
+            )
+
+        bsz = seq_len_delta.batch_size
+        q = torch.cat([q_nope, q_pe], dim=-1).view(
+            bsz, 1, q_nope.shape[-2], q_nope.shape[-1] + q_pe.shape[-1]
+        )
+        output, _ = flash_mla.flash_mla_with_kvcache_fp8_e5m2_dense(
+            q=q,
+            k_cache=kv_lora_k_pe.unsqueeze(2),
+            block_table=block_table,
+            cache_seqlens=seq_len_delta.new.lens_tensor_device,
+            head_dim_v=512,
+            tile_scheduler_metadata=self.hygon_metadata_decode,
+            num_splits=None,
+            softmax_scale=softmax_scale,
+            causal=False,
+        )
+        return output.view(bsz, output.shape[-2], output.shape[-1])
 
     def flashmla_sparse_fwd_bf16(  # this kernel only supports mixed 1-batch forward
         self,
@@ -1427,12 +1494,13 @@ class FlashMLABackend(TritonAttnBackend):
                 use_i64_offsets=kv_cache.use_i64_offsets,
             )
             if return_ragged:  # fall back to prefill_ragged_qkvo when necessary
-                return read_from_paged_kv_cache(
+                ragged = read_from_paged_kv_cache(
                     kv_cache.kv["kv_lora_k_pe"],
                     kv_cache.block_table,
                     seq_len_delta.new.position_ids_tensor_device,
                     seq_len_delta.new.seq_ids_tensor_device,
                 )
+                return ragged.to(torch.bfloat16) if self.use_e5m2_cache else ragged
             return kv_cache.kv["kv_lora_k_pe"]
         elif "kv_lora" in kv_cache.kv and "k_pe" in kv_cache.kv:
             logger.warning_once(
@@ -1716,7 +1784,7 @@ class FlashMLABackend(TritonAttnBackend):
         if softmax_scale is None:  # TODO: move to prepare_metadata
             softmax_scale = 1.0 / ((q_pe.shape[-1] + self.qk_nope_head_dim) ** 0.5)
 
-        if topk_indices is None:  # dense+bf16
+        if topk_indices is None:
             assert not self.use_fp8_cache
             kv_lora_k_pe = self.update_paged_mla_kv(
                 kv_lora_rank,
@@ -1724,6 +1792,15 @@ class FlashMLABackend(TritonAttnBackend):
                 kv_cache,
                 seq_len_delta,
             )
+            if self.use_e5m2_cache:
+                return self.flashmla_dense_fwd_e5m2(
+                    q_nope,
+                    q_pe,
+                    kv_lora_k_pe,
+                    kv_cache.block_table,
+                    seq_len_delta,
+                    softmax_scale,
+                )
             q_nope_pe = torch.cat([q_nope, q_pe], dim=-1)
             return self.flashmla_dense_fwd_bf16(
                 q_nope_pe,

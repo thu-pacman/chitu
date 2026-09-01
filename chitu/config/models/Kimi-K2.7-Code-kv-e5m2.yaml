@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - Kimi-K2.7-Code
+  - override quant_config: blockint4_e5m2_kv
+  - _self_
+
+name: Kimi-K2.7-Code-kv-e5m2
+source: "https://huggingface.co/moonshotai/Kimi-K2.7-Code"

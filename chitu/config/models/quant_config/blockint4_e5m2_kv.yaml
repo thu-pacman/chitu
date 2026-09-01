@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Block INT4 routed-expert weights with an unscaled E5M2 latent KV cache.
+quant:
+- model: '.'
+  rules:
+    - regex : '\.mlp\.(moe|experts\.)'
+      type : blockint4
+      kwargs:
+        group_size: 32
+- kv_cache: '.'
+  rules:
+    - regex: '^(kv_lora_k_pe|kv_lora|k_pe)$'
+      type: fp8_e5m2

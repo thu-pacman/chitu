@@ -493,6 +493,12 @@ class AttentionDeepSeekV3(Attention):
         self.mla_absorb = mla_absorb
         self.indexer_cache = indexer_cache
         self._use_hygon_split_q_absorb_output = False
+        # Import lazily to avoid an import cycle during module initialization.
+        from chitu.kv_cache.registry import kv_cache_quant_type_for_key
+
+        self.use_e5m2_kv_cache = (
+            kv_cache_quant_type_for_key(args.quant_config, "kv_lora") == "fp8_e5m2"
+        )
         # When False, this layer reuses topk from another layer's indexer via a
         # shared buffer (GLM-5.2 "shared" indexer role). It must NOT allocate
         # any of its own indexer projection weights, and the forward path skips
@@ -826,6 +832,20 @@ class AttentionDeepSeekV3(Attention):
     def _as_plain_tensor(x):
         return x.convert_to_plain() if isinstance(x, NativeLayoutTensor) else x
 
+    def _should_reconstruct_prefill(
+        self, seq_len_delta: BatchedSeqLenDelta, cp_active: bool
+    ) -> bool:
+        e5m2_one_token_prefill = (
+            self.use_e5m2_kv_cache
+            and seq_len_delta.is_classic_decoding
+            and not seq_len_delta.is_decode_stage
+        )
+        return (
+            self.mla_absorb == "absorb-kv-only"
+            and not cp_active
+            and (not seq_len_delta.is_classic_decoding or e5m2_one_token_prefill)
+        )
+
     def _project_mla_q_latent_kv(
         self,
         x: torch.Tensor,
@@ -1050,6 +1070,10 @@ class AttentionDeepSeekV3(Attention):
                 )
 
             total_len = kv_lora_full.shape[0]
+            if kv_lora_full.dtype == torch.float8_e5m2:
+                kv_lora_full = kv_lora_full.to(torch.bfloat16)
+            if k_pe_full.dtype == torch.float8_e5m2:
+                k_pe_full = k_pe_full.to(torch.bfloat16)
             kv_lora_full = kv_lora_full.view(total_len, self.kv_lora_rank).contiguous()
             k_attn, v_attn = self._expand_latent_kv_to_full_kv(
                 kv_lora_full,
@@ -1101,11 +1125,7 @@ class AttentionDeepSeekV3(Attention):
         cp_active = cp_ctx.step_active and not seq_len_delta.is_decode_stage
         has_indexer_weights = self.index_topk is not None and self.has_local_indexer
 
-        if (
-            self.mla_absorb == "absorb-kv-only"
-            and not cp_active
-            and not seq_len_delta.is_classic_decoding
-        ):
+        if self._should_reconstruct_prefill(seq_len_delta, cp_active):
             return self._forward_reconstruct_prefill(x, freqs_cis, is_mtp=is_mtp)
 
         # ---- torch_npu MLA prologue fast path (only non-CP) ----
