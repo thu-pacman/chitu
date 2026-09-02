@@ -34,6 +34,7 @@ from chitu.distributed.parallel_state import (
 )
 from chitu.global_vars import set_global_args, get_global_args
 from chitu.models.model_deepseek_v3 import AttentionDeepSeekV3, Indexer
+from chitu.native_layout import init_native_layout
 from chitu.utils import (
     ceil_div,
     try_import_opt_dep,
@@ -1310,6 +1311,8 @@ def test_flash_mla_fp8_kvcache_dequant_bf16_prefill(
 ):
     if not has_accelerator() or not has_flash_mla:
         pytest.skip("flash_mla is missing")
+    if is_hygon() or is_muxi():
+        pytest.skip("FlashMLA FP8 is not supported on Hygon/Muxi")
     if not hasattr(flash_mla, "flash_mla_sparse_fwd"):
         pytest.skip("flash_mla is too old to have `flash_mla_sparse_fwd`")
     if not has_triton:
@@ -3578,6 +3581,8 @@ def test_decode_dense_kv(
             pytest.skip("flash_attn is missing")
     if impl == "npu" and not has_torch_npu:
         pytest.skip("torch_npu is missing")
+    if is_hygon() and head_dim == 256:
+        pytest.skip("flash_attn decode head_dim=256 is not supported on Hygon")
 
     torch.set_default_dtype(torch.float16)
     set_global_args(
@@ -3743,7 +3748,8 @@ def test_decode_paged_kv(
                 "hunyuan_attn only supports head group size in "
                 f"{sorted(HunyuanAttnBackend.SUPPORTED_HEAD_GROUP_SIZES)}"
             )
-
+    if is_hygon() and head_dim == 256:
+        pytest.skip("flash_attn decode head_dim=256 is not supported on Hygon")
     torch.set_default_dtype(torch.float16)
     global_args = {
         "infer": {
@@ -3787,6 +3793,8 @@ def test_decode_paged_kv(
         attn_backend = TritonAttnBackend()
     elif impl == "flash_attn":
         attn_backend = FlashAttnBackend()
+        if is_hygon():
+            block_size = 64
     elif impl == "flashinfer":
         attn_backend = FlashInferBackend(tot_num_blocks=num_blocks)
     elif impl == "npu":
@@ -4144,6 +4152,7 @@ def test_reconstruct_prefill_matches_full_kv_attention(chunk_lens):
         mla_absorb="absorb-kv-only",
         checkpoint_prefix="layers.0.self_attn",
     ).to(device)
+    init_native_layout(attn)
     with torch.no_grad():
         for param in attn.parameters():
             if param.ndim == 1:

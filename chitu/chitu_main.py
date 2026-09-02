@@ -51,6 +51,7 @@ from chitu.utils import (
     try_import_and_setup_torch_npu,
     ceil_div,
     get_chitu_bool_env,
+    should_pretty_log,
 )
 from chitu.distributed.parallel_state import get_pp_group
 from chitu.logging_utils import setup_chitu_logging
@@ -1069,7 +1070,9 @@ def _warmup_backend_direct(
     # Decode steps
     if not skip_model_decode:
         for i in tqdm(
-            range(max(1, decode_steps)), desc="finished warmup decode iterations"
+            range(max(1, decode_steps)),
+            desc="finished warmup decode iterations",
+            disable=not should_pretty_log(args),
         ):
             curr_bs = local_max_bs - i * bs_descend
             curr_req_ids = req_ids[:curr_bs]
@@ -1223,7 +1226,7 @@ def warmup_engine(args):
         max_reqs_per_dp = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
         if args.infer.pp_size > 1:
             if (
-                args.scheduler.pp_config.pp_micro_batch_size_decode == "max"
+                args.scheduler.pp_config.pp_micro_batch_size_decode in {"auto", "max"}
                 or get_slot_handle()
             ):
                 local_max_bs = ceil_div(max_reqs_per_dp, args.infer.pp_size)

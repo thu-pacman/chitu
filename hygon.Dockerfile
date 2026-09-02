@@ -9,9 +9,14 @@ ARG enable_cython='true'
 ARG enable_test='false'
 ARG pypi_mirror=''
 ARG build_for_shca='false'
+# Pin the GPU arch so compilation does not depend on runtime device detection
+# (the `docker build` stage has no /dev/kfd device). This also keeps the hipcc
+# arch argument stable, which ccache relies on for cache hits.
+ARG hygon_arch='gfx936'
 
 ENV CHITU_SETUP_JOBS=$chitu_setup_jobs
 ENV MAX_JOBS=$CHITU_SETUP_JOBS
+ENV TORCH_CUDA_ARCH_LIST=$hygon_arch
 
 RUN if [ "${enable_editable_install}" != "true" ] && [ "${enable_editable_install}" != "false" ]; then \
     echo "ARG enable_editable_install must either be 'true' or 'false'"; \
@@ -38,7 +43,6 @@ fi
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 ENV PIP_PROGRESS_BAR=off
-ENV PIP_NO_CACHE_DIR=1
 
 # Upgrade pip and set mirror. The mirror should be set AFTER upgrading pip
 RUN if [ "${pypi_mirror}" != "" ]; then \
@@ -58,7 +62,27 @@ RUN if [ "${enable_test}" = "true" ]; then \
     apt update -y && apt install -y expect vim tmux telnet htop lsof strace iputils-ping && \
     pip install pytest matplotlib; \
 fi
-RUN apt update -y && apt install -y curl
+RUN --mount=type=cache,target=/var/cache/apt --mount=type=cache,target=/var/lib/apt \
+    apt update -y && apt install -y curl ccache
+
+# Route hipcc / clang / gcc through ccache so the Cython/C++ kernel
+# compilation in the second stage is cached across builds. ccache is installed
+# above; the cache directory itself is mounted at `docker run` time
+# (see two-stage-docker-build.sh).
+RUN mkdir -p /usr/lib/ccache && \
+    for c in hipcc clang clang++ gcc g++ cc c++; do \
+        if command -v "$c" >/dev/null 2>&1; then \
+            ln -sf /usr/bin/ccache "/usr/lib/ccache/$c"; \
+        fi; \
+    done
+ENV PATH="/usr/lib/ccache:$PATH"
+ENV CCACHE_DIR=/root/.ccache
+ENV CCACHE_COMPILERCHECK=content
+ENV CCACHE_MAXSIZE=20G
+# Subprojects (deepgemm/flash_mla/...) are built in pip's per-build temp dirs.
+# Don't hash the current working directory so the random temp dir name does not
+# bust the cache.
+ENV CCACHE_NOHASHDIR=true
 RUN --mount=source=./third_party/hygon_wheels,destination=./third_party/hygon_wheels if [ "${build_for_shca}" = "true" ]; then \
     apt-get update -y; \
     apt remove -y rdmacm-utils ibacm perftest ibverbs-utils ucx libibverbs-dev libibmad-dev libibumad-dev librdmacm1 infiniband-diags opensm rdma-core libibmad5 libibumad3 ibverbs-providers libibverbs1 || true; \
@@ -77,24 +101,29 @@ RUN rm -rf /opt/mpi
 ENV LD_LIBRARY_PATH="/usr/mpi/gcc/openmpi-4.1.7a1/lib:$LD_LIBRARY_PATH"
 ENV PATH="/usr/mpi/gcc/openmpi-4.1.7a1/bin:$PATH"
 
-RUN curl -L --retry 3 --retry-delay 5 -o /tmp/dtk_llvm.run https://download.sourcefind.cn:65024/file/4/dtk_llvm/dtk_llvm.run && \
-    chmod +x /tmp/dtk_llvm.run && \
-    /tmp/dtk_llvm.run && \
-    rm -f /tmp/dtk_llvm.run
+# Install dtk_llvm, caching the .run installer in a BuildKit cache mount so it
+# is only downloaded once across builds.
+RUN --mount=type=cache,target=/var/cache/chitu \
+    if [ ! -f /var/cache/chitu/dtk_llvm.run ]; then \
+        curl -L --retry 3 --retry-delay 5 -o /var/cache/chitu/dtk_llvm.run https://download.sourcefind.cn:65024/file/4/dtk_llvm/dtk_llvm.run; \
+    fi && \
+    chmod +x /var/cache/chitu/dtk_llvm.run && \
+    /var/cache/chitu/dtk_llvm.run
 
 COPY ./script/pip-multi-indices.sh ./script/pip-multi-indices.sh
 # NOTE: ./third_party/hygon_wheels/triton-3.5.1+das.opt1.dtk2604.torch290-cp310-cp310-manylinux_2_28_x86_64.whl is different from
 #       `triton==3.5.1+das.opt1.dtk2604.torch290` from https://pypi.sourcefind.cn/release/dtk/, although they have the same name.
 RUN --mount=source=./third_party/hygon_wheels,destination=./third_party/hygon_wheels \
+    --mount=type=cache,target=/root/.cache/pip \
   ./script/pip-multi-indices.sh install \
     -i "${pypi_mirror}" \
     -i https://pypi.sourcefind.cn/release/dtk/ \
     -i https://pypi.sourcefind.cn/nightly/dtk/ \
     ./third_party/hygon_wheels/aiter-0.1.2+das.opt1.dtk2604.torch290.2605071840.g1f8f50-cp310-cp310-linux_x86_64.whl \
     ./third_party/hygon_wheels/triton-3.5.1+das.opt1.dtk2604.torch290-cp310-cp310-manylinux_2_28_x86_64.whl \
-    "lightop==0.6.0+das.dtk2604.torch290.20260327.gaa4938" \
+    "lightop==0.6.0+das.dtk2604.torch290.2605220936.g6bfaca" \
     "lmslim==0.3.1+das.opt4.dtk2604.torch290.2604281437.g61fdfe" \
-    -c <(pip list --format freeze | grep -v -e "setuptools" -e "numpy")
+    -c <(pip list --format freeze | grep -v -e "setuptools" -e "numpy" -e "triton" -e "aiter" -e "lightop" -e "lmslim")
 
 # Download prometheus
 RUN --mount=type=secret,id=tos_id \

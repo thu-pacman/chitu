@@ -212,6 +212,7 @@ def apply_kv_cache_quantization_rules(
         "fp8_pertensor": torch.float8_e4m3fn,
         "fp8_pertoken_dsa": None,
         "fp8_pertoken_indexer": None,
+        "fp8_e5m2": torch.float8_e5m2,
     }
 
     dtype_dict: Dict[str, torch.dtype] = dict(kvargs.get("dtype_dict", {}))

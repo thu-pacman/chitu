@@ -801,7 +801,8 @@ is `paged`.
 Acceptable values:
 - "max": The maximum value of `decode micro batch size` is limited to `max_reqs_per_dp / pp_size`.
 - An integer: The maximum value of `decode micro batch size` is limited to the number.
-- "auto": Currently this means "max".
+- "auto": Dynamically distributes current decode requests across PP scheduler groups, while using
+  "max" as the static upper bound and allowing the current group to schedule at least one candidate.
 
 *Default: `auto`.*
 
@@ -1092,3 +1093,16 @@ This is an explicit timeout effective for layerwise loading. For non-layerwise l
 timeout may or may not happen in the communication immedately after model loading.
 
 *Default: `60`.*
+
+## Argument `pretty_log`
+
+Controls whether pretty (interactive) output is printed to the terminal,
+such as the per-rank model-load progress bars.
+
+- "auto": print only when stdout and stderr are attached to a terminal.
+  When output is redirected to a file or piped (e.g. `2>&1 | tee`), pretty
+  output is suppressed to keep logs small.
+- "true": always print pretty output, even when output is redirected.
+- "false": never print pretty output.
+
+*Default: `auto`.*

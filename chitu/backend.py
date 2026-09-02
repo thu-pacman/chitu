@@ -5,6 +5,7 @@
 import gc
 import functools
 import os
+import sys
 import time
 import re
 import threading
@@ -73,7 +74,7 @@ from chitu.tokenizer import (
     Processor,
 )
 from chitu.tool_call import patch_chat_template
-from chitu.utils import parse_dtype
+from chitu.utils import parse_dtype, should_pretty_log
 from chitu.import_utils import try_import_opt_dep
 from chitu.moe import init_moe_impl
 from chitu.boot.arg_utils import calculate_parallelism_sizes
@@ -1144,6 +1145,12 @@ class Backend:
     def _display_global_layerwise_model_load_progress(args):
         poll_interval_s = 1
         bars = {}
+        # tqdm renders one progress bar per rank, which floods non-interactive
+        # (CI) logs for large PD jobs (tens of ranks).
+        use_tqdm = should_pretty_log(args)
+        # Refresh once per loaded layer (progress change) instead of every poll.
+        last_current = {}
+        last_log_time = 0.0
 
         try:
             processes = Backend._get_model_load_processes(args)
@@ -1155,6 +1162,14 @@ class Backend:
                     current, total = progress[process]
                     if current < total:
                         all_done = False
+
+                    # Skip refresh until this rank finishes another layer.
+                    if process in last_current and current == last_current[process]:
+                        continue
+                    last_current[process] = current
+
+                    if not use_tqdm:
+                        continue
 
                     if process not in bars:
                         inst_id, rank = process
@@ -1168,6 +1183,17 @@ class Backend:
                         )
                     bars[process].n = current
                     bars[process].refresh()
+
+                if not use_tqdm:
+                    now = time.monotonic()
+                    if now - last_log_time >= 30:
+                        done = sum(1 for c, t in progress.values() if c >= t)
+                        logger.info(
+                            "Model loading progress: %d/%d ranks finished",
+                            done,
+                            len(processes),
+                        )
+                        last_log_time = now
 
                 if all_done:
                     return
@@ -1473,13 +1499,14 @@ def load_state_dict(
 
     state_dict = {}
     ignored_params = []
+    param: torch.Tensor
     for file_path in glob(path):
         with safe_open(file_path, framework="pt", device="cpu") as f:
             for name in f.keys():
                 if prefix and not name.startswith(prefix):
                     continue
                 if key_filter is None or key_filter(name):
-                    param: torch.Tensor = f.get_tensor(name)
+                    param = f.get_tensor(name)
                     state_dict[name] = param
                 else:
                     ignored_params.append(name)
@@ -1487,7 +1514,7 @@ def load_state_dict(
             if prefix_list is not None:
                 for name in f.keys():
                     if name.startswith(tuple(prefix_list)):
-                        param: torch.Tensor = f.get_tensor(name)
+                        param = f.get_tensor(name)
                         state_dict[name] = param
 
     if ignored_params:

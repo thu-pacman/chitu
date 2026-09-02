@@ -14,6 +14,7 @@
 import torch
 import triton
 import triton.language as tl
+from chitu.device_type import is_hygon
 from chitu.ops.triton_ops.utils import autotune_compat
 
 
@@ -22,16 +23,32 @@ def triton_or(x, y):
     return x | y
 
 
-_mla_attn_kernel_configs = [
-    triton.Config(
-        {"BLOCK_N": block_n},
-        num_stages=num_stages,
-        num_warps=num_warps,
-    )
-    for block_n in [16, 32, 64, 128]
-    for num_stages in [1, 2, 3, 4]
-    for num_warps in [2, 4, 8, 16]
-]
+# The gfx936 triton fork miscompiles this kernel family (paged/dense/topk
+# mla decode) for num_stages >= 2: outputs are wrong for data-dependent
+# subsets of shapes, so failures move between runs and look flaky. A config
+# sweep replaying the failing CI scenarios (bs=64, topk=None, dense+paged,
+# 5 fixed seeds, all num_warps in {2,4,8,16}) measured: num_stages=1 ->
+# 55/55 correct, num_stages=2 -> 22/55, num_stages>=3 -> 0/55, independent
+# of num_warps. BLOCK_N=64/128 are miscompiled on gfx936 too, hence the
+# earlier restriction. Keep Hygon at num_stages=1 (num_warps is safe to
+# autotune among the verified-correct candidates); other platforms keep the
+# full sweep. Re-sweep after any triton upgrade before relaxing this.
+if is_hygon():
+    _mla_attn_kernel_configs = [
+        triton.Config({"BLOCK_N": 16}, num_stages=1, num_warps=num_warps)
+        for num_warps in [2, 4, 8, 16]
+    ]
+else:
+    _mla_attn_kernel_configs = [
+        triton.Config(
+            {"BLOCK_N": block_n},
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+        for block_n in [16, 32, 64, 128]
+        for num_stages in [1, 2, 3, 4]
+        for num_warps in [2, 4, 8, 16]
+    ]
 
 
 @autotune_compat(configs=_mla_attn_kernel_configs, key=[], cache_results=True)

@@ -25,6 +25,7 @@ from chitu.models.model_minimax_m3_vl import (
     MiniMaxM3VLIndexer,
 )
 from chitu.models.registry import ModelType, get_model_class
+from chitu.native_layout import init_native_layout
 from chitu.device_type import is_ascend
 from chitu.ops.minimax_sparse.indexer_decode import (
     compute_block_indices_classic_decode_batched,
@@ -131,6 +132,7 @@ def test_minimax_m3_indexer_cache_and_forward():
     )
     device = torch.device("cuda")
     idx = idx.to(device)
+    init_native_layout(idx)
     x = torch.randn(5, 128, device=device)
     freqs = BatchedFreqsCis(
         cos=torch.randn(5, 8, device=device),
@@ -192,6 +194,7 @@ def test_attention_minimax_m3_sparse_prefill():
         checkpoint_prefix="layers.3.self_attn",
         indexer_cache=indexer_cache,
     ).cuda()
+    init_native_layout(attn)
 
     _prepare_skew_prefill(main_cache, seq_len=5)
     _prepare_skew_prefill(indexer_cache, seq_len=5)
@@ -223,6 +226,7 @@ def test_attention_minimax_m3_sparse_decode():
         checkpoint_prefix="layers.3.self_attn",
         indexer_cache=indexer_cache,
     ).cuda()
+    init_native_layout(attn)
 
     device = torch.device("cuda")
     _prepare_skew_prefill(main_cache, seq_len=5)

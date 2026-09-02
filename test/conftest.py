@@ -649,6 +649,29 @@ def global_args():
     return cfg
 
 
+@pytest.fixture(autouse=True)
+def _restore_global_args(global_args):
+    """Reset global args before each test to avoid cross-test pollution."""
+    set_global_args(global_args, need_ensure=False, need_preprocess=False)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _restore_default_dtype():
+    """Restore torch's default dtype after each test.
+
+    Several tests (e.g. test_attn.py::test_mla_decode_dense_kv) call
+    `torch.set_default_dtype(torch.bfloat16)` and never reset it, so the
+    change leaks into every subsequently-collected test. Under
+    `pytest ./test/pytest -s` this pollutes the default dtype for later
+    cases; running any single test in isolation hides the problem. Snapshot
+    before, restore after.
+    """
+    saved = torch.get_default_dtype()
+    yield
+    torch.set_default_dtype(saved)
+
+
 @pytest.fixture(scope="session")
 def init_distributed(global_args):
     initialized = False
