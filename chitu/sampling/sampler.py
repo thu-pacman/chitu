@@ -75,6 +75,7 @@ class TaskSampleState:
     matcher: GrammarMatcher | None = None
     draft_probs: torch.Tensor | None = None
     next_tokens_device: torch.Tensor | None = None
+    draft_tokens: list[int] | None = None
 
     @staticmethod
     def from_task(task: Task):
@@ -298,8 +299,8 @@ class Sampler:
             draft_tokens_list = []
             draft_probs_list = []
             for state in states:
-                nt = state.task.next_tokens
-                if len(nt) >= K:
+                nt = state.draft_tokens
+                if nt is not None and len(nt) >= K:
                     draft_tokens_list.append(nt[1:K])  # d1, ..., d_{K-1}
                 else:
                     draft_tokens_list.append([0] * n_drafts)
@@ -764,7 +765,9 @@ class Sampler:
         if result is not None and result.next_tokens is not None:
             result.sync()
             for i, task in enumerate(tasks.output_tasks):
-                task.next_tokens = result.next_tokens[i].tolist()
+                nt = result.next_tokens[i].tolist()
+                task.next_tokens = nt
+                states[i].draft_tokens = nt
 
     def end_tasks(self, task_ids: list[str]):
         for task_id in task_ids:
