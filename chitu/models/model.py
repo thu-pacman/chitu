@@ -74,7 +74,10 @@ from chitu.utils import (
 )
 from chitu.quantization import (
     QuantizationRegistry,
+    QuantizedLinearBase,
     QuantizedMoeExpertsBase,
+    QuantizedAbsorbGemmBase,
+    is_lossless_dtype_upcast,
     get_quant_from_checkpoint_prefix,
     get_quant_kwargs_from_checkpoint_prefix,
     get_backend_from_checkpoint_prefix,
@@ -503,6 +506,30 @@ class Transformer(nn.Module):
             else:
                 module = getattr(module, part, None)
         return module
+
+    def _get_quantized_module_owning_param(
+        self, param_name: str
+    ) -> QuantizedLinearBase | QuantizedMoeExpertsBase | QuantizedAbsorbGemmBase | None:
+        """
+        Return the nearest ancestor module of the parameter `param_name` that is
+        a quantized Linear/MoeExperts/AbsorbGemm instance, or None if there is
+        no such ancestor.
+        """
+        prefix, _, _ = param_name.rpartition(".")
+        while True:
+            module = self._get_module_by_prefix(prefix)
+            if isinstance(
+                module,
+                (
+                    QuantizedLinearBase,
+                    QuantizedMoeExpertsBase,
+                    QuantizedAbsorbGemmBase,
+                ),
+            ):
+                return module
+            if not prefix:
+                return None
+            prefix, _, _ = prefix.rpartition(".")
 
     def load_state_dict_by_prefix(
         self,
@@ -1140,7 +1167,24 @@ class Transformer(nn.Module):
             else:
                 model_dtype = param.dtype
             if name in state_dict and model_dtype != state_dict[name].dtype:
-                if keep_dtype_in_checkpoint:
+                quantized_module = self._get_quantized_module_owning_param(name)
+                if quantized_module is not None and is_lossless_dtype_upcast(
+                    state_dict[name].dtype, model_dtype
+                ):
+                    # Quantized Linear/MoeExperts/AbsorbGemm modules are allowed
+                    # to use a dtype different from the one defined by their
+                    # quantization method in the checkpoint, as long as loading
+                    # the checkpoint weights into the model is a lossless upcast
+                    # (small dtype -> large dtype). Convert silently, overriding
+                    # `keep_dtype_in_checkpoint`.
+                    logger.debug(
+                        f"Parameter {name} has inconsistent dtype in the checkpoint "
+                        f"({state_dict[name].dtype}) and the model ({model_dtype}), "
+                        f"losslessly upcasting to the model dtype for "
+                        f"{type(quantized_module).__name__}."
+                    )
+                    state_dict[name] = state_dict[name].to(model_dtype)
+                elif keep_dtype_in_checkpoint:
                     logger.info(
                         f"Parameter {name} has inconsistent dtype in the checkpoint "
                         f"({state_dict[name].dtype}) and the model ({model_dtype}), "

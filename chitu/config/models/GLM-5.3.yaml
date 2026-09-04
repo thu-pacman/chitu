@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# GLM-5.3 shares the same model architecture as GLM-5.2
+defaults:
+  - GLM-5.2
+  - _self_ # Config in this file overrides configs in defaults
+
+name: GLM-5.3
+source: "https://huggingface.co/zai-org/GLM-5.3" # Just for displaying. No automatic download.

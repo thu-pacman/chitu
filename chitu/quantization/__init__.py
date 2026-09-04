@@ -2,7 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from chitu.quantization.registry import QuantizationRegistry
+from chitu.quantization.registry import (
+    QuantizationRegistry,
+    is_lossless_dtype_upcast,
+)
 from chitu.quantization.base import (
     QuantizedLinearBase,
     QuantizedMoeExpertsBase,

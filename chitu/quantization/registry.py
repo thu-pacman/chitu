@@ -32,6 +32,30 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 logger = getLogger(__name__)
 
 
+def is_lossless_dtype_upcast(src: torch.dtype, dst: torch.dtype) -> bool:
+    """
+    Check whether converting `src` to `dst` is a lossless upcast, i.e. every
+    value representable in `src` is also representable in `dst` ("small type
+    -> large type", e.g. fp8 -> bf16, bf16 -> fp32, int8 -> int32).
+
+    The two dtypes must belong to the same numeric family (floating point or
+    integer), and `dst` must be strictly wider than `src`.
+
+    Used by `Transformer.preprocess_state_dict`: quantized Linear/MoeExperts/
+    AbsorbGemm modules are allowed to use a dtype different from the one defined
+    by their quantization method in the checkpoint, but only when loading the
+    checkpoint weights into the model is a lossless upcast; such conversions
+    are applied silently, regardless of `keep_dtype_in_checkpoint`.
+    """
+    if src == dst:
+        return False
+    src_is_float = torch.empty((), dtype=src).is_floating_point()
+    dst_is_float = torch.empty((), dtype=dst).is_floating_point()
+    if src_is_float != dst_is_float:
+        return False
+    return dst.itemsize > src.itemsize
+
+
 @dataclass(frozen=True)
 class _ObservedModuleImplRequest:
     class_type: str
