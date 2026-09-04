@@ -4,7 +4,7 @@
 
 # GLM-5.3-W8A8 is a quantization of GLM-5.3
 defaults:
-  - GLM-5.2
+  - GLM-5.3
   - quant_config: metax-w8a8
   - _self_ # Config in this file overrides configs in defaults
 
