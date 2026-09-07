@@ -52,6 +52,13 @@ from chitu.global_vars import (
 from chitu.distributed.coordinator import set_endpoint, get_endpoint
 from chitu.boot.arg_utils import calculate_parallelism_sizes
 from chitu.boot.tcp_ip import get_local_ip
+from chitu.serve.crash import (
+    MSG_TYPE_CRASH,
+    report_and_exit,
+    is_dying,
+    get_crash_reason,
+)
+from chitu.dp_router import get_token_router
 from chitu.task import UserRequest
 from chitu.testing.pd_utils import PDTestRunner
 
@@ -221,7 +228,20 @@ class PDRequestRouter(RequestRouter):
     async def start(self):
         """Start router service"""
         logger.info("starting pd disaggregation router...")
+        try:
+            await self._start_inner()
+        except (Exception, SystemExit):
+            # A fatal fault in any background task (heartbeat timeout, coordination
+            # raise, stats collector) would leave the Router half-alive serving
+            # 503s. SystemExit is included because uvicorn/framework calls
+            # sys.exit() on bind failures — without it the Router exits silently
+            # and peer instances hang waiting for notification.
+            # CancelledError (normal asyncio shutdown) is NOT caught — it
+            # propagates normally.
+            logger.exception("[CRASH_PROTOCOL] PD router background task fatal error")
+            report_and_exit("pd router background task crashed")
 
+    async def _start_inner(self):
         await self.pd_coordination_service.start()
         await self._start_bootstrap_server_if_needed()
 
@@ -230,15 +250,16 @@ class PDRequestRouter(RequestRouter):
         # coordination service.
         await self._init_pd_sockets()
 
-        await asyncio.gather(
-            self._stats_collector_task(),
-            self._pd_request_processor_task(),
-            self._health_monitor_task(),
-            self._heartbeat_monitor_task(),
-            self._pd_coordination_task(),
-            self._wait_for_pd_instances(),
-            self._prometheus_manager_task(),
-        )
+        self._tasks = [
+            asyncio.create_task(self._stats_collector_task()),
+            asyncio.create_task(self._pd_request_processor_task()),
+            asyncio.create_task(self._health_monitor_task()),
+            asyncio.create_task(self._heartbeat_monitor_task()),
+            asyncio.create_task(self._pd_coordination_task()),
+            asyncio.create_task(self._wait_for_pd_instances()),
+            asyncio.create_task(self._prometheus_manager_task()),
+        ]
+        await asyncio.gather(*self._tasks)
 
     async def _init_pd_sockets(self):
         """Initialize PD specific ZMQ socket.
@@ -267,6 +288,7 @@ class PDRequestRouter(RequestRouter):
             socket = self.context.socket(zmq.PUSH)
             # Fail immdediately if peer not connected to avoid silent drops.
             socket.setsockopt(zmq.IMMEDIATE, 1)
+            socket.setsockopt(zmq.LINGER, 0)
             socket.connect(info["address"])
             self.prefill_sockets[local_instance_id] = socket
             logger.info(
@@ -325,7 +347,7 @@ class PDRequestRouter(RequestRouter):
     @override
     async def _heartbeat_monitor_task(self, timeout: Optional[float] = None):
         HEARTBEAT_TIMEOUT = timeout or self.heartbeat_timeout  # 20s timeout threshold
-        while True:
+        while not self._shutdown:
             current_time = time.time()
 
             # Check heartbeat status for all schedulers
@@ -335,7 +357,6 @@ class PDRequestRouter(RequestRouter):
                 policy = getattr(self, role + "_policy", None)
                 if policy is None:
                     raise ValueError(f"{role} policy not found")
-                num_instances = len(policy.scheduler_stats)
                 for local_instance_id, stats in policy.scheduler_stats.items():
                     if current_time - stats.last_heartbeat_time > HEARTBEAT_TIMEOUT:
                         logger.warning(
@@ -350,10 +371,10 @@ class PDRequestRouter(RequestRouter):
                                 raise RuntimeError(
                                     f"{role} instance {local_instance_id} heartbeat timeout, stopping Chitu Serve"
                                 )
-                            if len(dead[role]) == num_instances:
-                                raise RuntimeError(
-                                    f"All {role} instances heartbeat timeout, stopping Chitu Serve"
-                                )
+                            # TEMPORARY: crash on any single instance heartbeat timeout
+                            raise RuntimeError(
+                                f"{role} instance {local_instance_id} heartbeat timeout, stopping Chitu Serve"
+                            )
             for role in ["prefill", "decode"]:
                 handle_dead_instance = getattr(
                     self, "handle_dead_instance_" + role, self.handle_dead_instance
@@ -398,7 +419,7 @@ class PDRequestRouter(RequestRouter):
 
     @override
     async def _health_monitor_task(self):
-        while True:
+        while not self._shutdown:
             try:
                 await asyncio.sleep(30)  # Log every 30 seconds
 
@@ -441,11 +462,40 @@ class PDRequestRouter(RequestRouter):
         await self._pd_stats_collector_task()
 
     async def _pd_stats_collector_task(self):
-        while True:
+        while not self._shutdown:
+            # Local crash watch: if this process is dying (report_and_exit from
+            # any thread, e.g. Mooncake bootstrap), terminate in-flight requests
+            # before the hard exit (R-side crash).
+            if is_dying() and not self._crash_handled:
+                crash_reason = get_crash_reason() or "local crash detected"
+                await self.handle_crash(crash_reason)
             try:
                 if self.stats_socket and await self.stats_socket.poll(timeout=100):
                     data = await self.stats_socket.recv()
-                    stats_dict = msgpack.unpackb(data, raw=False)
+                    # Isolate malformed stats frames: skip, don't crash the Router.
+                    try:
+                        stats_dict = msgpack.unpackb(data, raw=False)
+                    except Exception as e:
+                        logger.error(f"[PD_ROUTER] malformed stats frame: {e}")
+                        continue
+
+                    # Crash notification from a P/D instance (msg_type="crash").
+                    # The Router is the termination authority: it enters the dying
+                    # state, terminates all in-flight requests, and exits after the
+                    # graceful window.
+                    if stats_dict.get("msg_type") == MSG_TYPE_CRASH:
+                        reason = stats_dict.get("reason", "peer instance crashed")
+                        crashed_instance = stats_dict.get("instance")
+                        crashed_role = stats_dict.get("role")
+                        logger.error(
+                            "[CRASH_PROTOCOL] received crash notification: "
+                            "role=%s instance=%s reason=%s",
+                            crashed_role,
+                            crashed_instance,
+                            reason,
+                        )
+                        await self.handle_crash(reason=reason)
+                        continue
 
                     pd_mode = stats_dict.get("pd_mode")
                     local_instance_id = int(stats_dict.get("local_instance_id", -1))
@@ -516,8 +566,121 @@ class PDRequestRouter(RequestRouter):
                 logger.error(f"[PD_ROUTER] missing field in stats data: {e}")
                 await asyncio.sleep(0.1)
             except Exception as e:
-                logger.error(f"[PD_ROUTER] stats collector error: {e}")
-                await asyncio.sleep(0.1)
+                # Stats/heartbeat ingestion fault. Only the KeyError above is a
+                # reviewed isolation point; anything else masks stale/missing
+                # routing state -> crash per the unified protocol.
+                logger.exception(f"[PD_ROUTER] stats collector error: {e}")
+                report_and_exit("pd stats collector crashed")
+
+    @override
+    async def terminate_all_inflight(self, error_msg: str) -> None:
+        """Terminate every in-flight PD request (skip already-finished).
+
+        Covers both the streaming registry (``token_router.active_requests``)
+        and the PD routing registry (``pending_pd_requests``); every PendingPDRequest
+        is registered in the latter even while sitting in ``pending_requests``,
+        so iterating it is sufficient (covers all in-flight, any instance).
+        """
+        token_router = get_token_router(check_exist=False)
+        seen = set()
+        if token_router is not None:
+            for request_id, req in list(token_router.active_requests.items()):
+                if req.finished:
+                    continue
+                seen.add(request_id)
+                token_router.finish_request(req, error=error_msg)
+        for request_id, pd_req in list(self.pending_pd_requests.items()):
+            if request_id in seen:
+                continue
+            req = pd_req.original_request
+            if req.finished:
+                continue
+            self.finish_request_before_recv_stop(req, error=error_msg)
+
+    @override
+    async def handle_prefill_failed(self, request_id: str) -> None:
+        """Forward a Prefill-side request-level failure to the paired Decode.
+
+        Called by the TokenRouter when a Prefill instance reports an error with
+        ``prefill_failed=True`` (a request-parameter or KV-capacity failure).
+        The request's KV will never arrive at Decode; tell Decode to stop waiting
+        (pd_prefill_fail) so it does not hit its PrefillDone timeout and crash.
+
+        The ZMQ send may retry up to ~5s; run it as a background task so the
+        TokenRouter recv loop is not stalled per failure.
+        """
+        pd_request = self.pending_pd_requests.get(request_id)
+        if pd_request is None:
+            # Already cleaned up (e.g. user-side finish already ran) — nothing to
+            # forward; the paired Decode will also be cleaned up by its own path.
+            logger.debug(
+                f"[PD_ROUTER] handle_prefill_failed: unknown/finished req_id={request_id}"
+            )
+            return
+        decode_sid = pd_request.decode_scheduler_id
+        prefill_sid = pd_request.prefill_scheduler_id
+        logger.warning(
+            f"[PD_ROUTER] prefill failed for req_id={request_id}, "
+            f"notifying decode {decode_sid}"
+        )
+        if not self._shutdown:
+            asyncio.create_task(
+                self._notify_peer_prefill_failed(request_id, decode_sid, prefill_sid)
+            )
+
+    async def _notify_peer_prefill_failed(self, request_id, decode_sid, prefill_sid):
+        try:
+            await self._send_to_decode_scheduler(
+                local_instance_id=decode_sid,
+                request_data={
+                    "request_id": request_id,
+                    "type": "pd_prefill_fail",
+                },
+                prefill_scheduler_id=prefill_sid,
+            )
+        except Exception as e:
+            logger.exception(
+                f"[PD_ROUTER] failed to notify decode {decode_sid} for req_id={request_id}: {e}"
+            )
+
+    async def handle_decode_failed(self, request_id: str) -> None:
+        """Forward a Decode-side request-level failure to the paired Prefill.
+
+        Called by the TokenRouter when a Decode instance reports an error with
+        ``decode_failed=True`` (a request-parameter or KV-capacity failure).
+        The request's DecodeAllocated will never reach Prefill; tell Prefill to
+        stop waiting (pd_decode_fail, RequestAborted). Background task so the
+        recv loop is not stalled.
+        """
+        pd_request = self.pending_pd_requests.get(request_id)
+        if pd_request is None:
+            logger.debug(
+                f"[PD_ROUTER] handle_decode_failed: unknown/finished req_id={request_id}"
+            )
+            return
+        prefill_sid = pd_request.prefill_scheduler_id
+        logger.warning(
+            f"[PD_ROUTER] decode failed for req_id={request_id}, "
+            f"notifying prefill {prefill_sid}"
+        )
+        if not self._shutdown:
+            asyncio.create_task(
+                self._notify_peer_decode_failed(request_id, prefill_sid)
+            )
+
+    async def _notify_peer_decode_failed(self, request_id, prefill_sid):
+        try:
+            await self._send_to_prefill_scheduler(
+                local_instance_id=prefill_sid,
+                request_data={
+                    "request_id": request_id,
+                    "type": "pd_decode_fail",
+                },
+            )
+        except Exception as e:
+            logger.exception(
+                f"[PD_ROUTER] failed to notify prefill {prefill_sid} for req_id={request_id}: {e}"
+            )
 
     async def _start_bootstrap_server_if_needed(self):
         """Start Mooncake Bootstrap HTTP server on Router when Mooncake transfer is enabled."""
@@ -582,7 +745,16 @@ class PDRequestRouter(RequestRouter):
                 )
 
             except Exception as e:
+                # No eligible scheduler is a service-level failure, not a
+                # whitelisted request-parameter error. Fail this request with a
+                # service error instead of silently dropping it (which would hang
+                # the client). The heartbeat monitor handles the "all instances
+                # dead" crash path separately.
                 logger.warning(f"no available prefill or decode scheduler: {e}")
+                self.finish_request_before_recv_stop(
+                    request, error="service temporarily unavailable"
+                )
+                self.total_requests += 1
                 return
             logger.info(
                 "[PD_ROUTER][route_select] req_id=%s prefill_policy=%s "
@@ -677,12 +849,21 @@ class PDRequestRouter(RequestRouter):
         """PD request processing task"""
         logger.info("starting pd request processor")
 
-        while True:
+        while not self._shutdown:
+            if is_dying():
+                # During the crash window, stop dispatching new requests.
+                await asyncio.sleep(0.1)
+                continue
             try:
                 if self.pending_requests:
                     pd_request = self.pending_requests.popleft()
 
                     if isinstance(pd_request, PendingPDRequest):
+                        if pd_request.status == PDRequestStatus.FAILED:
+                            # Terminated by a dead-instance handler while still
+                            # queued in the dispatch deque; skip re-dispatch to
+                            # avoid blocking on retries to the dead peer.
+                            continue
                         if self._reject_ttft_timeout(
                             pd_request.original_request, "ttft_pd_router"
                         ):
@@ -695,9 +876,13 @@ class PDRequestRouter(RequestRouter):
                         raise ValueError(f"unexpected request type: {type(pd_request)}")
 
                 await asyncio.sleep(0.01)  # 10ms polling interval
-            except:
+            except Exception:
+                # A fault in the request-processing loop. The inner dispatch and
+                # routing paths isolate their own failures; reaching here masks a
+                # systemic bug. Crash via the unified protocol so the Router does
+                # not go half-alive (no dying flag, no in-flight termination).
                 logger.exception("Failed to process PD request")
-                raise
+                report_and_exit("pd request processor task crashed")
 
     async def _process_pd_request(self, pd_request: PendingPDRequest):
         """Process PD disaggregation request"""
@@ -754,9 +939,15 @@ class PDRequestRouter(RequestRouter):
                     f"pd request dispatch failed: req_id={pd_request.request_id} "
                     f"err_type={type(e).__name__} err={e}"
                 )
-                pd_request.status = PDRequestStatus.PENDING
-                self.pending_requests.appendleft(pd_request)
-                await asyncio.sleep(0.05)
+                # _send_with_retry already retried ~5s before raising; reaching
+                # here means a persistently unreachable peer. Fail this request
+                # with a service error instead of hot-retrying forever (which
+                # would monopolize the single processor task and starve others).
+                self.finish_request_before_recv_stop(
+                    pd_request.original_request, error="service temporarily unavailable"
+                )
+                pd_request.status = PDRequestStatus.FAILED
+                self.total_requests += 1
                 return
         logger.debug(f"[PD_STAGE][router.dispatch.end] req_id={pd_request.request_id}")
 
@@ -925,7 +1116,7 @@ class PDRequestRouter(RequestRouter):
         # - Handle timed-out requests
         # - Collect statistics
 
-        while True:
+        while not self._shutdown:
             # Check request status periodically
             await self._check_pd_request_status()
             await asyncio.sleep(1.0)  # Check every second
@@ -936,11 +1127,26 @@ class PDRequestRouter(RequestRouter):
         timeout_threshold = 30.0  # 30s timeout
 
         for request_id, pd_request in list(self.pending_pd_requests.items()):
-            if pd_request.status == PDRequestStatus.PENDING:
-                if current_time - pd_request.created_time > timeout_threshold:
-                    logger.warning(f"pd request timeout: {request_id}")
-                    pd_request.status = PDRequestStatus.FAILED
-                    pd_request.error_message = "request timeout"
+            if (
+                pd_request.status == PDRequestStatus.PENDING
+                and current_time - pd_request.created_time > timeout_threshold
+            ):
+                logger.warning(f"pd request timeout: {request_id}")
+                pd_request.status = PDRequestStatus.FAILED
+                pd_request.error_message = "request timeout"
+                # Also fail the user-facing stream so the client does not hang
+                # indefinitely waiting for a request that never dispatched.
+                self.finish_request_before_recv_stop(
+                    pd_request.original_request, error="request timeout"
+                )
+                # Drop it from the dispatch deque so it is not dispatched later
+                # onto a finished request. Iterate a snapshot so removing
+                # from the deque while iterating is safe; request_id maps to at
+                # most one entry, so break after the first match.
+                for pr in list(self.pending_requests):
+                    if isinstance(pr, PendingPDRequest) and pr.request_id == request_id:
+                        self.pending_requests.remove(pr)
+                        break
 
     # ------------------------------------------------------------------
     # PD instance readiness (always active in PD mode)
@@ -979,7 +1185,16 @@ class PDRequestRouter(RequestRouter):
                     f"[PD_LAUNCH][TIMEOUT] {len(missing)}/{len(expected)} instances "
                     f"missing after {launch_timeout:.1f}s: {sorted(missing)}"
                 )
-                os._exit(1)
+                # report_and_exit schedules the bounded hard exit (loop context) and
+                # returns; return (not break) so the polling loop does not
+                # re-trigger and stack repeated call_later exits, and to skip
+                # the test runner on a half-initialised Router.
+                report_and_exit(
+                    f"PD launch timeout: instances missing after {launch_timeout:.1f}s"
+                )
+                # After a launch timeout the process is dying; skip the test runner
+                # (if enabled) — it should not execute on a half-initialised Router.
+                return
 
             await asyncio.sleep(poll_interval_s)
 
@@ -1014,11 +1229,15 @@ class PDRequestRouter(RequestRouter):
 
         await self.pd_coordination_service.stop()
 
+        # Signal all background tasks to exit before closing sockets,
+        # so no task tries to use a socket after it has been closed.
+        self._shutdown = True
+
         # Close PD-specific sockets
         for socket in self.prefill_sockets.values():
             socket.close()
         for socket in self.decode_sockets.values():
             socket.close()
 
-        # Call parent shutdown logic
+        # Cancel background tasks and wait for them to drain
         await super().shutdown()

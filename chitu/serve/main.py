@@ -75,6 +75,10 @@ def main(args: ServeConfig):
         checkpoint("after warmup_engine")
         rank = torch.distributed.get_rank()
         if rank == 0:
+            from chitu.serve.crash import maybe_start_test_crash_injection
+
+            maybe_start_test_crash_injection("standalone")
+
             uvicorn_thread = Thread(target=start_uvicorn, args=(args,))
             uvicorn_thread.start()
 

@@ -66,7 +66,10 @@ from chitu.ops.utils import (
     emit_observed_op_impl_summary,
 )
 from chitu.distributed.coordinator import get_endpoint, set_endpoint
-from chitu.distributed.pd_disaggregation.pd_scheduler import get_pd_scheduler_instance
+from chitu.distributed.pd_disaggregation.pd_scheduler import (
+    PDSchedulerMode,
+    get_pd_scheduler_instance,
+)
 from chitu.boot.arg_utils import calculate_parallelism_sizes
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.dp_token_sender import get_dp_token_manager, start_dp_token_manager
@@ -1259,6 +1262,8 @@ def warmup_engine(args):
         "permanent generation; subsequent collections skip them",
     )
 
+    Backend.warmup_done = True
+
 
 def chitu_init(args):
     """
@@ -1337,23 +1342,29 @@ def chitu_init(args):
                 )
                 collector_addrs.append(f"{ip}:{port}")
             start_prometheus_server_and_metrics_monitor(collector_addrs)
-    except Exception as e:
-        if not torch.distributed.is_initialized():
-            raise e
-        rank = torch.distributed.get_rank()
-        # Prepend rank ID before the message
-        header = ""
-        if args.multi_inst.router.is_router:
-            header += "[Router]"
+    except Exception:
+        # Startup failure: the model is not fully loaded, no request/Router/crash
+        # reporter exists yet, and no response channel is up — there is no graceful
+        # window to serve. Enter the unified crash protocol immediately
+        # (immediate=True) so diagnostics are logged and flushed before the hard
+        # exit, instead of exiting with a bare traceback.
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            # Prepend rank ID before the message
+            header = ""
+            if args.multi_inst.router.is_router:
+                header += "[Router]"
+            else:
+                header += f"[Inst {args.multi_inst.inst_id}]"
+            header += f" [Rank {rank}]"
+            msg = "\n".join(
+                [f"{header} {line}" for line in traceback.format_exc().split("\n")]
+            )
         else:
-            header += f"[Inst {args.multi_inst.inst_id}]"
-        header += f" [Rank {rank}]"
-        msg = "\n".join(
-            [f"{header} {line}" for line in traceback.format_exc().split("\n")]
-        )
-        raise Exception(
-            msg
-        ) from None  # `msg` already contains traceback, so raise from None
+            msg = traceback.format_exc()
+        from chitu.serve.crash import report_and_exit
+
+        report_and_exit(f"chitu_init failed:\n{msg}", immediate=True)
 
     return args
 
@@ -1636,16 +1647,30 @@ def chitu_run_main_rank():
         pd_scheduler = get_pd_scheduler_instance()
         transfer_done_ids = pd_scheduler.kv_manager.get_all_transfer_done()
         for task_id in transfer_done_ids:
-            task = TaskPool.pool[task_id]
+            task = TaskPool.pool.get(task_id)
+            if task is None:
+                continue  # already cleaned up (e.g. pd_decode_fail won the race)
             task.req.finish_reason = "prefill_only"
             task.set_stopped()
         task_ids += transfer_done_ids
     task_ids = TaskPool.id_list
     task_ids = [task_id for task_id in task_ids if TaskPool.pool.get(task_id)]
-    # tasks w/o dp_size are evicted and already removed
-    task_ids = [
-        task_id for task_id in task_ids if TaskPool.pool[task_id].dp_rank is not None
-    ]
+    # Partition: tasks with dp_rank go through scheduler.update(); tasks
+    # without dp_rank (P-side, where only D sets it) that need removal are
+    # removed directly. Stopped tasks without a DP assignment must not block
+    # terminate-drain forever.
+    has_dp = []
+    no_dp_remove = []
+    for task_id in task_ids:
+        if TaskPool.pool[task_id].dp_rank is not None:
+            has_dp.append(task_id)
+        elif TaskPool.pool[task_id].need_remove():
+            no_dp_remove.append(task_id)
+    for task_id in no_dp_remove:
+        TaskPool.remove(task_id)
+    if no_dp_remove:
+        logger.info(f"[chitu_run] removed no-dp_rank stopped tasks: {no_dp_remove}")
+    task_ids = has_dp
     DPTaskCollector.clear_last_packedtasks()
 
     # Collect tasks by DP rank. All tasks that have run should have dp_rank.
@@ -1748,6 +1773,14 @@ async def start_enhanced_scheduler_service(rank: int, multi_inst, args):
         f"[Enhanced Scheduler {instance_id}] connected to stats service: {stats_address}"
     )
 
+    # Start the crash reporter (instance -> Router, msg_type="crash") so the DP
+    # Router can terminate in-flight requests when this instance crashes — same
+    # mechanism as PD. Mirrors pd_service._init_sockets.
+    from chitu.serve.crash import start_crash_reporter, maybe_start_test_crash_injection
+
+    start_crash_reporter(stats_address, instance_id, PDSchedulerMode.UNIFIED.value)
+    maybe_start_test_crash_injection(PDSchedulerMode.UNIFIED.value)
+
     # Start DP Token Manager
     try:
         logger.warning(
@@ -1762,6 +1795,18 @@ async def start_enhanced_scheduler_service(rank: int, multi_inst, args):
             f"[Enhanced Scheduler {instance_id}] DP Token Manager failed to start"
         )
         return
+
+    # Wire capacity-exceeded callback (mirrors PDInstanceRequestManager.set_token_manager).
+    # Without it, stop_stream emits no "error" keyword, making the termination invisible.
+    token_manager = get_dp_token_manager(instance_id)
+    if token_manager is not None:
+        _token_sender = token_manager.token_sender
+
+        def _capacity_error(request_id: str, message: str) -> None:
+            _token_sender.send_error(request_id, message)
+
+        for scheduler in Backend.schedulers or []:
+            scheduler._pd_exceeds_capacity_callback = _capacity_error
 
     # Performance statistics
     processed_requests = 0
@@ -1969,6 +2014,9 @@ async def process_scheduler_request(rank: int, request_data: dict):
             return
 
         # Create UserRequest
+        from chitu.testing.exception import test_inject_exception_request_build_failure
+
+        test_inject_exception_request_build_failure()
         user_request = UserRequest.from_dict(request_data)
         request_id = user_request.request_id
 
@@ -2030,7 +2078,6 @@ def chitu_terminate():
             payload_type=SerializedPackedTasksPayloadType.TerminateBackend,
         )
         Backend.executor.step(terminated_task)
-
         try:
             from chitu.dp_token_sender import close_dp_token_managers
 

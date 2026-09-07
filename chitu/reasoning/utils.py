@@ -41,7 +41,8 @@ def _get_reasoning_params(enable_thinking: bool) -> ReasoningParams:
     try:
         args = get_global_args()
         reasoning_type: ReasoningType = args.models.reasoning_type
-    except:
+    except Exception:
+        # Model not configured with a reasoning_type: fall back to "auto".
         logger.info('fallback to "auto" reasoning type')
         reasoning_type = "auto"
 

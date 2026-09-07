@@ -105,6 +105,11 @@ class MoELoadPlannerSwap(BaseMoELoadPlanner):
             logger.exception(f"MoELoadPlanner: launching migration failed: {e}")
             self.reset_stats()
             self.lock_stats = False
+            # Re-raise: an asymmetric failure (e.g. get_params raises on only one
+            # rank) leaves the peer rank blocked forever in the P2P wait. Let the
+            # exception propagate to the unified crash protocol instead of
+            # swallowing it into a silent weightless-flip / cross-rank hang.
+            raise
 
     def apply_actions(self, actions: List[AdjustmentAction]) -> None:
         """Apply actions to in-memory mapping only (does not move weights).
@@ -457,6 +462,11 @@ class MoELoadPlannerReplace(BaseMoELoadPlanner):
             logger.exception(f"MoELoadPlanner: launching migration failed: {e}")
             self.reset_stats()
             self.lock_stats = False
+            # Re-raise: an asymmetric failure (e.g. get_params raises on only one
+            # rank) leaves the peer rank blocked forever in the P2P wait. Let the
+            # exception propagate to the unified crash protocol instead of
+            # swallowing it into a silent weightless-flip / cross-rank hang.
+            raise
 
     def apply_actions(self, actions: List[AdjustmentAction]) -> None:
         """Apply actions to in-memory mapping only (does not move weights).

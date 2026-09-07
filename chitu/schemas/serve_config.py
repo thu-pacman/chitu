@@ -139,6 +139,9 @@ class KvTransferConfig:
     decode_wait_timeout_s: float = MISSING
     decode_resend_interval_s: float = MISSING
     decode_poll_interval_s: float = MISSING
+    # Message-loss fallback on the Prefill side: how long to wait for the
+    # DecodeAllocated signal before failing the request at request level.
+    prefill_wait_timeout_s: float = MISSING
     # Decode preallocation settings. These separate preallocation from runtime work.
     decode_prealloc_max_pending: Optional[int] = MISSING
     decode_prealloc_poll_interval_s: float = MISSING
@@ -151,6 +154,8 @@ class KvTransferConfig:
     decode_max_running_tasks_per_dp: Optional[int] = MISSING
     # Log throttling interval for Decode prepare backpressure, in seconds.
     prepare_backpressure_log_interval_s: float = MISSING
+    # Bootstrap poll interval for Prefill waiting for DecodeAllocated, in seconds.
+    prefill_bootstrap_poll_interval_s: float = 0.01
 
 
 @dataclass
@@ -162,6 +167,13 @@ class PDTestConfig:
     req_num: int = MISSING  # number of test requests
     req_timeout: float = MISSING  # per-request timeout (seconds)
     output_len: int = MISSING  # max_new_tokens for each test request
+
+
+@dataclass
+class TestConfig:
+    """E2E exception injection test configuration."""
+
+    inject_exception: str = ""
 
 
 @dataclass
@@ -214,6 +226,10 @@ class RouterConfig:
     router_evict_buffer_size: int = MISSING
     router_local_reservation_timeout_s: float = MISSING
     launch_timeout: float = MISSING
+    # Crash-protocol window: once a process decides it must crash, it has this
+    # many seconds to notify the Router / terminate in-flight requests before a
+    # hard exit. Default 10s.
+    graceful_crash_time: float = MISSING
 
 
 @dataclass
@@ -357,6 +373,7 @@ class ServeConfig(ServeConfigLegacy):
     coordinator: CoordinatorConfig = field(default_factory=CoordinatorConfig)
     multi_inst: MultiInstConfig = field(default_factory=MultiInstConfig)
     pd_test: PDTestConfig = field(default_factory=PDTestConfig)
+    test: TestConfig = field(default_factory=TestConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     quant: Optional[str] = MISSING

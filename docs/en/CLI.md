@@ -149,6 +149,12 @@ or not)
 
 *Default: `False`.*
 
+### Argument `boot.on_ready_allow_crash`
+
+Allow an engine non-zero exit and defer the verdict to boot.on_ready's verifier.
+
+*Default: `False`.*
+
 ### Argument `boot.remote_launcher`
 
 How to run on multiple nodes
@@ -861,9 +867,16 @@ Acceptable values: mooncake, nccl
 
 *Default: `"mooncake"`.*
 
-#### Argument `multi_inst.pd_disaggregation.kv_transfer`
+#### `multi_inst.pd_disaggregation.kv_transfer`
 
 Additional configs for KV transfer
+
+##### Argument `multi_inst.pd_disaggregation.kv_transfer.prefill_wait_timeout_s`
+
+Message-loss fallback on the Prefill side: how long to wait for the
+DecodeAllocated signal before failing the request at request level.
+
+*Default: `600.0`.*
 
 ### Argument `multi_inst.inst_overrides`
 
@@ -932,6 +945,14 @@ Set this to True if the current process is a router.
 When the router is ready, wait for this time untill the instances are ready.
 
 *Default: `3600`.*
+
+#### Argument `multi_inst.router.graceful_crash_time`
+
+Crash-protocol window (seconds): once a process decides it must crash, it
+has this many seconds to notify the Router / terminate in-flight requests
+before a hard exit. Default 10s.
+
+*Default: `10.0`.*
 
 ## `metrics`
 

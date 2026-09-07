@@ -49,6 +49,12 @@ from chitu.dp_router import (
     set_global_request_router,
     remove_request_everywhere,
 )
+from chitu.serve.crash import (
+    MSG_TYPE_CRASH,
+    is_dying,
+    report_and_exit,
+    get_crash_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -712,6 +718,8 @@ class RequestRouter:
 
         self.heartbeat_timeout: float = 60.0
         self.stop_on_heartbeat_timeout: bool = os.environ.get("CI_TESTS") == "true"
+        # Set once the Router has entered the crash-handling flow (idempotency guard).
+        self._crash_handled = False
 
         logger.info(f"RequestRouter initialized for {self._n_insts} instance(s)")
 
@@ -771,18 +779,31 @@ class RequestRouter:
 
     async def start(self):
         """Start the Request Router service."""
-        # Initialize ZMQ sockets
-        await self._init_sockets()
+        try:
+            # Initialize ZMQ sockets
+            await self._init_sockets()
 
-        # Start background tasks
-        self._tasks = [
-            asyncio.create_task(self._stats_collector_task()),
-            asyncio.create_task(self._request_processor_task()),
-            asyncio.create_task(self._prometheus_manager_task()),
-            # asyncio.create_task(self._health_monitor_task()),
-            # asyncio.create_task(self._heartbeat_monitor_task()),
-        ]
-        await asyncio.gather(*self._tasks)
+            # Start background tasks
+            self._tasks = [
+                asyncio.create_task(self._stats_collector_task()),
+                asyncio.create_task(self._request_processor_task()),
+                asyncio.create_task(self._prometheus_manager_task()),
+                # Performance logging only.
+                # asyncio.create_task(self._health_monitor_task()),
+                # Instance-death fallback when crash notification is lost.
+                asyncio.create_task(self._heartbeat_monitor_task()),
+            ]
+            await asyncio.gather(*self._tasks)
+        except (Exception, SystemExit):
+            # A fatal fault in a background task would leave the Router half-alive
+            # serving 503s. SystemExit: uvicorn/framework calls sys.exit() on bind
+            # failures — must enter crash protocol so peer instances are notified.
+            # CancelledError (normal asyncio shutdown from gather cancellation) is
+            # NOT caught — it propagates normally.
+            logger.exception(
+                "[CRASH_PROTOCOL] request router background task fatal error"
+            )
+            report_and_exit("request router background task crashed")
 
     async def _init_sockets(self):
         """Initialize ZMQ sockets for communication."""
@@ -861,13 +882,43 @@ class RequestRouter:
     async def _stats_collector_task(self):
         """Collect statistics from Enhanced Schedulers."""
         while not self._shutdown:
+            # Local crash watch: if this process is dying (report_and_exit from
+            # any thread, e.g. Mooncake bootstrap), terminate in-flight requests
+            # before the hard exit (R-side crash).
+            if is_dying() and not self._crash_handled:
+                crash_reason = get_crash_reason() or "local crash detected"
+                await self.handle_crash(crash_reason)
             try:
                 # Receive stats with timeout
                 if self.stats_socket and await self.stats_socket.poll(
                     timeout=100
                 ):  # 100ms timeout
                     data = await self.stats_socket.recv()
-                    stats_dict = msgpack.unpackb(data, raw=False)
+                    # A malformed stats frame must not kill the Router: isolate the
+                    # unpack (reviewed swallow) and skip the frame.
+                    try:
+                        stats_dict = msgpack.unpackb(data, raw=False)
+                    except Exception as e:
+                        logger.error(f"[REQUEST_ROUTER] malformed stats frame: {e}")
+                        continue
+                    # Crash notification from an instance (msg_type="crash"). The
+                    # Router is the termination authority: it enters the dying
+                    # state, terminates all in-flight requests, and exits after the
+                    # graceful window.
+                    if stats_dict.get("msg_type") == MSG_TYPE_CRASH:
+                        reason = stats_dict.get("reason", "peer instance crashed")
+                        crashed_instance = stats_dict.get("instance")
+                        crashed_role = stats_dict.get("role")
+                        logger.error(
+                            "[CRASH_PROTOCOL] received crash notification: "
+                            "role=%s instance=%s reason=%s",
+                            crashed_role,
+                            crashed_instance,
+                            reason,
+                        )
+                        await self.handle_crash(reason=reason)
+                        continue
+
                     local_instance_id = stats_dict.get("local_instance_id", 0)
 
                     # Safely get statistics data with default values
@@ -902,12 +953,72 @@ class RequestRouter:
                 logger.error(f"Missing required field in stats data: {e}")
                 await asyncio.sleep(0.1)
             except Exception as e:
-                logger.error(f"Error in stats collector: {e}")
-                await asyncio.sleep(0.1)
+                # Stats/heartbeat channel fault (unpack, construction). Only the
+                # KeyError above is a reviewed isolation point; anything else is a
+                # real fault -> crash per the unified protocol.
+                logger.exception(f"Error in stats collector: {e}")
+                report_and_exit("stats collector crashed")
 
     def remove_request(self, request_id: str):
         """[called by remove_request_everywhere] Finish request data in Request Router"""
         self.policy.remove_request(request_id)
+
+    async def handle_prefill_failed(self, request_id: str) -> None:
+        """No-op in the base class. PDRequestRouter overrides to forward
+        Prefill-side request-level failures to the paired Decode instance."""
+        pass
+
+    async def handle_decode_failed(self, request_id: str) -> None:
+        """No-op in the base class. PDRequestRouter overrides to forward
+        Decode-side request-level failures to the paired Prefill instance."""
+        pass
+
+    async def handle_crash(self, reason: str) -> None:
+        """Router-side crash handling (unified crash protocol).
+
+        Enter the dying state (reject new requests), terminate every
+        in-flight request, then exit after the graceful crash window. The Router
+        is the sole termination authority on the user side.
+        Idempotent: called from either the stats collector (external crash
+        notification) or the local dying watcher (internal report_and_exit).
+        """
+        from chitu.serve import crash
+
+        if self._crash_handled:
+            return
+        self._crash_handled = True
+        crash.set_dying()
+        logger.error("[CRASH_PROTOCOL] router entering dying state: %s", reason)
+        error_msg = "service temporarily unavailable"
+        try:
+            await self.terminate_all_inflight(error_msg)
+        except Exception:
+            # Even if in-flight termination fails, the Router must still exit within
+            # the bounded window: a stuck dying Router would serve 503 forever.
+            logger.exception(
+                "[CRASH_PROTOCOL] terminate_all_inflight failed; exiting anyway"
+            )
+        # Schedule the bounded hard exit via the crash protocol (flushes logs)
+        # rather than a raw os._exit.
+        crash.report_and_exit(f"router crash: {reason}", notify=False)
+
+    async def terminate_all_inflight(self, error_msg: str) -> None:
+        """Terminate every in-flight user request (skip already-finished)."""
+        token_router = get_token_router(check_exist=False)
+        seen = set()
+        if token_router is not None:
+            for request_id, req in list(token_router.active_requests.items()):
+                if req.finished:
+                    continue
+                seen.add(request_id)
+                token_router.finish_request(req, error=error_msg)
+        for request in list(self.pending_requests):
+            request_id = request.request_id
+            if request_id is None or request_id in seen:
+                continue
+            if request.finished:
+                continue
+            self.finish_request_before_recv_stop(request, error=error_msg)
 
     def finish_request_before_recv_stop(
         self,
@@ -951,6 +1062,10 @@ class RequestRouter:
         request_counter = 0
 
         while not self._shutdown:
+            if is_dying():
+                # During the crash window, stop dispatching new requests.
+                await asyncio.sleep(0.1)
+                continue
             try:
                 if self.pending_requests:
                     request_counter += 1
@@ -984,7 +1099,7 @@ class RequestRouter:
                             else None
                         )
                         local_instance_id = self.policy.select_scheduler(
-                            request, eligible_ids
+                            request, eligible_ids=eligible_ids
                         )
                     except Exception:
                         # No eligible/alive schedulers currently; push back briefly
@@ -1028,45 +1143,58 @@ class RequestRouter:
                     await asyncio.sleep(0.001)  # 1ms when no requests
 
             except Exception as e:
-                # print stack trace
-                logger.error(f"[REQUEST_ROUTER] Request processor exception: {e}")
-                logger.error(f"[REQUEST_ROUTER] Stack trace: {traceback.format_exc()}")
-                await asyncio.sleep(0.1)
+                # Blanket fault in the request-processing loop. The inner
+                # select-scheduler pushback / send-requeue are reviewed isolation
+                # points; reaching here masks a systemic routing bug -> crash.
+                logger.exception(f"[REQUEST_ROUTER] Request processor exception: {e}")
+                report_and_exit("request processor task crashed")
 
     async def _heartbeat_monitor_task(self, timeout: Optional[float] = None):
-        """Monitor scheduler heartbeat status"""
-        HEARTBEAT_TIMEOUT = timeout or self.heartbeat_timeout  # 20s timeout threshold
-        while True:
+        """Monitor scheduler heartbeat status.
+
+        Heartbeat is the crash-notification-loss fallback: if an
+        instance dies without sending msg_type="crash" (segfault / OOM-kill /
+        failed notification), its heartbeat stops and this task detects it. A
+        dead instance means in-flight requests routed to it are lost — terminate
+        them and, per the unified crash protocol, exit the whole deployment in
+        the bounded window.
+        """
+        HEARTBEAT_TIMEOUT = timeout or self.heartbeat_timeout  # 60s default
+        while not self._shutdown:
             current_time = time.time()
             dead = []
 
             # Check heartbeat status for all schedulers
-            num_instances = len(self.policy.scheduler_stats)
             for local_instance_id, stats in self.policy.scheduler_stats.items():
                 if current_time - stats.last_heartbeat_time > HEARTBEAT_TIMEOUT:
                     logger.warning(
                         f"--- [HEARTBEAT_MONITOR] Scheduler {local_instance_id} heartbeat timeout! ---"
                         f"Last heartbeat: {current_time - stats.last_heartbeat_time:.2f}s ago"
                     )
-                    # Mark as dead
+                    # Mark as dead; only trigger the crash protocol if it was
+                    # previously alive (first timeout) — avoids a transient stats
+                    # gap killing the whole deployment.
                     if stats.is_alive:
                         dead.append(local_instance_id)
                         stats.is_alive = False
-                        if self.stop_on_heartbeat_timeout:
-                            raise RuntimeError(
-                                f"Instance {local_instance_id} heartbeat timeout, stopping Chitu Serve"
-                            )
-                        if len(dead) == num_instances:
-                            raise RuntimeError(
-                                f"All instances heartbeat timeout, stopping Chitu Serve"
-                            )
-            for instance_id in dead:
-                await self.handle_dead_instance(instance_id)
+            if dead:
+                # A dead instance (heartbeat lost): terminate only the in-flight
+                # requests routed to it (handle_dead_instance). Only when every
+                # scheduler has gone silent — crash notification was lost on all
+                # instances (e.g. simultaneous segfault / OOM) — does the Router
+                # enter the crash protocol and exit the deployment.
+                for instance_id in dead:
+                    await self.handle_dead_instance(instance_id)
+                if len(self.policy.scheduler_stats) >= self._n_insts and all(
+                    not stats.is_alive for stats in self.policy.scheduler_stats.values()
+                ):
+                    await self.handle_crash(f"all instances heartbeat timeout: {dead}")
+                    return
             await asyncio.sleep(5.0)  # Check every 5 seconds
 
     async def _health_monitor_task(self):
         """Monitor system health and log performance metrics."""
-        while True:
+        while not self._shutdown:
             try:
                 await asyncio.sleep(30)  # Log every 30 seconds
 
@@ -1102,11 +1230,29 @@ class RequestRouter:
                 logger.error(f"Error in health monitor: {e}")
 
     async def handle_dead_instance(self, dead_instance_id: int):
-        remove_requests = [
-            self.policy.req_to_request[rid]
-            for rid, iid in self.policy.req_to_scheduler.items()
-            if iid == dead_instance_id
-        ]
+        # Terminate in-flight requests routed to the dead instance. Two tracking
+        # sources: req_to_scheduler (PrefixCacheAwarePolicy) or router_reservations
+        # (LoadBalancer, the default policy).
+        remove_requests = []
+        if hasattr(self.policy, "req_to_request") and hasattr(
+            self.policy, "req_to_scheduler"
+        ):
+            remove_requests = [
+                self.policy.req_to_request[rid]
+                for rid, iid in self.policy.req_to_scheduler.items()
+                if iid == dead_instance_id
+            ]
+        else:
+            token_router = get_token_router(check_exist=False)
+            if token_router is not None:
+                for rid, reservation in list(
+                    getattr(self.policy, "router_reservations", {}).items()
+                ):
+                    if reservation.local_instance_id != dead_instance_id:
+                        continue
+                    req = token_router.active_requests.get(rid)
+                    if req is not None and not req.finished:
+                        remove_requests.append(req)
         for request in remove_requests:
             self.finish_request_before_recv_stop(request, error="chitu serve is down")
 
@@ -1313,11 +1459,12 @@ class RequestRouter:
         """Gracefully shutdown the Request Router."""
         logger.info("Shutting down Request Router...")
         self._shutdown = True
-
-        for task in self._tasks:
+        current = asyncio.current_task()
+        to_cancel = [t for t in self._tasks if t is not current]
+        for task in to_cancel:
             task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+        if to_cancel:
+            await asyncio.gather(*to_cancel, return_exceptions=True)
         self._tasks.clear()
 
         # Close ZMQ sockets

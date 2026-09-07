@@ -3,13 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-import os
 import threading
 import zmq
 
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.distributed.coordinator import get_endpoint, set_endpoint
 from chitu.distributed.parallel_state import get_world_group
+from chitu.serve.crash import report_and_exit
 import logging
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,11 @@ class KVManagerEndpoint:
 
         self.zmq_ctx = zmq.Context.instance()
         self.ip = get_local_ip()
+        # ZMQ sockets are not thread-safe: the send_socket may be accessed
+        # concurrently from ThreadPoolExecutor workers (prefill transfer_worker)
+        # and from the asyncio event loop (stop_request -> remove_request_all_rank).
+        # Serialize all sends through a single lock.
+        self._send_lock = threading.Lock()
 
     def init_master(self, has_slave: bool):
         """init listener and receiver on master rank"""
@@ -117,9 +122,9 @@ class KVManagerEndpoint:
                     sock.send(msg)
         except Exception:
             logger.exception(
-                f"{self.role}:{self.name} relay_thread socket error, exiting process"
+                f"{self.role}:{self.name} relay_thread fatal error, entering crash protocol"
             )
-            os._exit(1)
+            report_and_exit(f"KV relay thread crashed ({self.role}:{self.name})")
 
     def recv_thread(self, handler):
         while True:
@@ -127,19 +132,24 @@ class KVManagerEndpoint:
                 raw = self.socket.recv()
             except Exception:
                 logger.exception(
-                    f"{self.role}:{self.name} recv_thread socket error, exiting process"
+                    f"{self.role}:{self.name} recv_thread socket error, entering crash protocol"
                 )
-                os._exit(1)
+                report_and_exit(
+                    f"KV recv_thread socket crashed ({self.role}:{self.name})"
+                )
             try:
                 handler(raw)
             except Exception:
                 logger.exception(
-                    f"{self.role}:{self.name} recv_thread handler error, exiting process"
+                    f"{self.role}:{self.name} recv_thread handler error, entering crash protocol"
                 )
-                os._exit(1)
+                report_and_exit(
+                    f"KV recv_thread handler crashed ({self.role}:{self.name})"
+                )
 
     def send(self, data: bytes):
-        return self.send_socket.send(data)
+        with self._send_lock:
+            return self.send_socket.send(data)
 
 
 class DecodeEndpoints:

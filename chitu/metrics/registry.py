@@ -20,7 +20,6 @@ from chitu.metrics.definitions import (
     raw_metrics_for_context,
 )
 
-
 PrometheusMetric: TypeAlias = Counter | Gauge | Histogram
 
 

@@ -206,6 +206,7 @@ class Backend:
 
     # mutable
     state = BackendState.Running
+    warmup_done = False
 
     # ---- MoE load balancer optional weight accessor ----
     # Provide a place to install a weight accessor from model/engine.
@@ -308,12 +309,11 @@ class Backend:
                                 continue
                             if param.dim() == 0:
                                 continue
-                            try:
-                                # write into the target expert slot in-place
-                                self._copy_in(param, src, slot)
-                            except Exception:
-                                # Shape mismatch or non-expert tensor; skip
-                                continue
+                            # Write into the target expert slot in-place. A failed
+                            # write-back silently loses the weight while the mapping
+                            # flips — data corruption. Re-raise to crash via the
+                            # unified protocol.
+                            self._copy_in(param, src, slot)
 
                 accessor = _ModelExpertsAccessor()
                 Backend.set_moe_weight_accessor(accessor)
@@ -760,11 +760,11 @@ class Backend:
 
         Backend.model = model
 
-        # Try to auto-register a MoE weight accessor provided by the model/experts
-        try:
-            Backend._auto_register_moe_weight_accessor_if_available()
-        except Exception:
-            pass
+        # Try to auto-register a MoE weight accessor provided by the model/experts.
+        # Failure with EP>1 means load-balancing weight migration is silently dead
+        # (and later migration would corrupt weights) -> crash via the unified
+        # protocol instead of serving with a broken LB.
+        Backend._auto_register_moe_weight_accessor_if_available()
 
         gc.collect()
         torch.cuda.empty_cache()

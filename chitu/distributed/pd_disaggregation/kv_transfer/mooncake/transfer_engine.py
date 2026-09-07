@@ -9,6 +9,7 @@ import threading
 import os
 from aiohttp import web
 from chitu.device_type import is_ascend
+from chitu.serve.crash import report_and_exit
 
 logger = logging.getLogger(__name__)
 
@@ -244,11 +245,11 @@ class MooncakeBootstrapServer:
                 self._startup_error = exc
                 self._started.set()
                 raise
-            # Runtime error after successful startup: fail-fast
+            # Runtime error after successful startup: fail-fast via crash protocol
             logger.exception(
-                "Mooncake Bootstrap HTTP server runtime error, exiting process"
+                "Mooncake Bootstrap HTTP server runtime error, entering crash protocol"
             )
-            os._exit(1)
+            report_and_exit("Mooncake bootstrap server crashed")
 
     def start_in_background(self):
         t = threading.Thread(target=self._run_server, daemon=True)

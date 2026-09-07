@@ -28,6 +28,7 @@ from chitu.task import (
 from chitu.task_type import TaskType
 from chitu.utils import get_chitu_env
 from chitu.dp_router import get_request_router, get_token_router
+from chitu.serve.crash import report_and_exit
 
 logger = getLogger(__name__)
 
@@ -367,7 +368,15 @@ async def process_queue():
             )
             if Backend.state == BackendState.Terminating and TaskPool.all_finished():
                 chitu_terminate()
-                break
+            if Backend.state == BackendState.Terminating and len(TaskPool.pool) > 0:
+                from chitu.distributed.pd_disaggregation.pd_scheduler import (
+                    get_pd_scheduler_instance,
+                )
+
+                pd_scheduler = get_pd_scheduler_instance()
+                if pd_scheduler is not None:
+                    for task_id in list(TaskPool.id_list):
+                        pd_scheduler.stop_request(task_id, force_stop=True, timeout=0.0)
 
         has_profile_command = rank == 0 and (
             not _profile_cmd_queue.empty() or has_pending_profile_payload()
@@ -397,8 +406,8 @@ def start_worker():
     try:
         loop.run_until_complete(process_queue())
     except Exception:
-        logger.exception("compute worker fatal error, exiting process")
-        os._exit(1)
+        logger.exception("compute worker fatal error, entering crash protocol")
+        report_and_exit("compute worker loop crashed")
     finally:
         loop.close()
 
@@ -465,6 +474,9 @@ async def submit_request(req: UserRequest):
         await request_router.add_request(req)
         await token_router.register_request(req)
     else:
+        from chitu.testing.exception import test_inject_exception_request_build_failure
+
+        test_inject_exception_request_build_failure()
         task = Task(
             req.request_id,
             req,

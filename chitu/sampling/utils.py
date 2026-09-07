@@ -16,7 +16,8 @@ import json
 
 from collections import OrderedDict
 from concurrent.futures import Future
-from concurrent.futures import ThreadPoolExecutor
+
+from chitu.utils import DaemonThreadPoolExecutor
 
 from chitu.global_vars import get_global_args
 from chitu.tool_call.type_def import ToolCallParams
@@ -87,7 +88,7 @@ _GRAMMAR_CACHE_LOCK = threading.Lock()
 _GRAMMAR_FUTURES_MAX = 2048
 
 _GRAMMAR_FUTURES: OrderedDict[str, Future] = OrderedDict()
-_GRAMMAR_EXECUTOR = ThreadPoolExecutor(
+_GRAMMAR_EXECUTOR = DaemonThreadPoolExecutor(
     max_workers=4, thread_name_prefix="grammar-compile"
 )
 

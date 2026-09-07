@@ -41,6 +41,7 @@ if not DOC_GENERATION:
         queue_profile_stop,
         resolve_profile_output_dir,
     )
+    from chitu.serve.crash import is_dying
     from chitu.serve.middleware import RejectOverloadMiddleware
     from chitu.task import TaskPool
     from chitu.tool_call import adjust_message_for_tool_calls
@@ -58,6 +59,9 @@ if not DOC_GENERATION:
 @dataclass
 class ServerStatus:
     initialized: bool
+
+    def __bool__(self):
+        return self.initialized
 
 
 server_status = ServerStatus(initialized=False)
@@ -196,6 +200,13 @@ async def api_guard(
 @app.exception_handler(Exception)
 async def handle_generic_exception(request, e: Exception):
     logger.error("Unhandled internal exception", exc_info=e)
+    if not DOC_GENERATION and is_dying():
+        # The process is within its graceful crash window;
+        # tell the client the service is going away rather than a request fault.
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "service temporarily unavailable"},
+        )
     return JSONResponse(
         status_code=500,
         content={"detail": str(e)},

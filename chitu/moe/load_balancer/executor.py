@@ -212,13 +212,12 @@ class WeightMigrationExecutor:
         for role_slot, _peer, _act in role_entries:
             if role_slot in param_cache:
                 continue
-            try:
-                params_send = self.accessor.get_params(*role_slot)
-            except Exception as e:
-                logger.exception(
-                    f"[MoE WeightExecutor] get_params failed on rank={self.rank}: {e}"
-                )
-                params_send = {}
+            # Read-out failure must not degrade into an empty migration: with a
+            # non-static schema an empty params dict yields zero P2P ops, set_params
+            # is skipped, and commit_ready_layers still flips the mapping — silently
+            # corrupting the expert. Re-raise so the migration aborts (crash via the
+            # unified protocol) instead of shipping a weightless flip.
+            params_send = self.accessor.get_params(*role_slot)
             param_cache[role_slot] = params_send
 
             if use_static:
@@ -309,10 +308,14 @@ class WeightMigrationExecutor:
                     try:
                         w.wait()
                     except Exception:
-                        logger.warning(
-                            f"[MoE WeightExecutor] Warning: a migration work failed to complete"
+                        # A failed P2P migration leaves the recv buffer uninitialized;
+                        # installing it would corrupt the expert weights. Re-raise so
+                        # the process crashes via the unified protocol.
+                        logger.exception(
+                            "[MoE WeightExecutor] migration work failed to complete; "
+                            "expert weights may be corrupt"
                         )
-                        pass
+                        raise
                 for act in involved_actions:
                     if self.rank in (act.from_rank, act.to_rank):
                         role_slot = (
@@ -330,9 +333,12 @@ class WeightMigrationExecutor:
                             if params:
                                 self.accessor.set_params(*role_slot, params)
                         except Exception as e:
-                            logger.warning(
+                            # Weight write-back failure leaves the mapping flipped
+                            # without the weights — data corruption. Re-raise.
+                            logger.exception(
                                 f"[MoE WeightExecutor] finalize failed for layer={act.layer_id}: {e}"
                             )
+                            raise
                 self._staged.clear()
                 works_ref.clear()
 
