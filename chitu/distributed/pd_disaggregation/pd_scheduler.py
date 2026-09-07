@@ -42,6 +42,12 @@ from chitu.metrics.prometheus_collector import (
     observe_stage_duration,
     set_queue_size,
 )
+from chitu.testing.exception import (
+    test_inject_exception_prefill_fail_before_task,
+    test_inject_exception_request_build_failure,
+    test_inject_exception_decode_side_failure,
+    test_inject_exception_prefill_done_missing,
+)
 
 if TYPE_CHECKING:
     from chitu.kv_cache import PagedKVCacheManager
@@ -89,7 +95,10 @@ def _collect_router_kv_cache_stats() -> dict[str, Any]:
                 pop = getattr(main_cm, "pop_evicted_blk_hashes")
                 evicted_blk_hashes.extend(pop(max_items=(512 // num_managers)))
     except Exception:
-        return out
+        # KV-stats failure blinds the Router's prefix-cache routing; re-raise
+        # to crash the process via the unified protocol.
+        logger.exception("[CRASH_PROTOCOL] failed to collect router KV cache stats")
+        raise
 
     if num_blocks > 0:
         out["num_blocks"] = num_blocks
@@ -250,16 +259,63 @@ class PDInstanceRequestManager:
     def set_token_manager(self, token_manager):
         """Attach DP token manager so we can stream tokens back to Router."""
         self.token_manager = token_manager
+        # Inject EXCEEDS_CAPACITY hook into the base schedulers.
+        # Prefill: the Decode side has its own capacity path; must NOT mark prefill_failed.
+        if self.pd_mode == PDSchedulerMode.PREFILL_ONLY:
+            for scheduler in Backend.schedulers or []:
+                scheduler._pd_exceeds_capacity_callback = self._send_error_for_request
+                # TTFT drop in base prefill admission also needs prefill_failed for peer notify.
+                scheduler._pd_ttft_error_callback = self._send_error_for_request
+        elif self.pd_mode == PDSchedulerMode.DECODE_ONLY:
+            # D-side runtime decode capacity in the base scheduler also reports a
+            # request-level error with decode_failed so P is notified.
+            for scheduler in Backend.schedulers or []:
+                scheduler._pd_exceeds_capacity_callback = self._send_error_for_request
         logger.info("token manager set for pd scheduler")
+
+    def _send_error_for_request(self, request_id: str, error_message: str) -> None:
+        """Send error frame to Router with prefill_failed/decode_failed flag, then clean up local KV state.
+        Idempotent: repeated calls are harmless."""
+        # Send error frame first, then clean up local state.
+        # If stop_request's ZMQ relay fails, the error frame already reached the Router.
+        if self.token_manager is not None:
+            self.token_manager.token_sender.send_error(
+                request_id,
+                error_message,
+                prefill_failed=self.pd_mode == PDSchedulerMode.PREFILL_ONLY,
+                decode_failed=self.pd_mode == PDSchedulerMode.DECODE_ONLY,
+            )
+        self.stop_request(request_id, force_stop=True, timeout=0.0)
+
+    def _handle_request_creation_error(self, request_id: str, exc: Exception) -> None:
+        """Per-request recovery: whitelist boundary for request-build failures.
+        Notifies Router + peer (prefill_failed/decode_failed). Does NOT crash."""
+        logger.warning(
+            "[PD_SCHED][request-build] request build failed req_id=%s: %s",
+            request_id,
+            exc,
+        )
+        if self.token_manager is not None:
+            self.token_manager.token_sender.send_error(
+                request_id,
+                f"request parameters invalid: {exc}",
+                prefill_failed=self.pd_mode == PDSchedulerMode.PREFILL_ONLY,
+                decode_failed=self.pd_mode == PDSchedulerMode.DECODE_ONLY,
+            )
 
     def _terminate_task_exceeds_capacity(
         self, request_id: str, error_message: str
     ) -> None:
-        is_stoped = self.stop_request(request_id, force_stop=True, timeout=0.0)
-        assert is_stoped, f"Failed to stop request {request_id}."
+        # Idempotent: task may already be gone (concurrent cleanup won the race).
+        self.stop_request(request_id, force_stop=True, timeout=0.0)
 
         if self.token_manager is not None:
-            self.token_manager.token_sender.send_error(request_id, error_message)
+            # D-side capacity failure: notify P (decode_failed) so it stops waiting.
+            self.token_manager.token_sender.send_error(
+                request_id,
+                error_message,
+                decode_failed=self.pd_mode == PDSchedulerMode.DECODE_ONLY,
+            )
 
         logger.warning(error_message)
 
@@ -276,7 +332,13 @@ class PDInstanceRequestManager:
         req.finish_reason = "error"
         self.stop_request(request_id, force_stop=True, timeout=0.0)
         if self.token_manager is not None:
-            self.token_manager.token_sender.send_error(request_id, "TTFT timeout")
+            # P TTFT timeout: notify D (prefill_failed). D TTFT timeout: notify P (decode_failed).
+            self.token_manager.token_sender.send_error(
+                request_id,
+                "TTFT timeout",
+                prefill_failed=self.pd_mode == PDSchedulerMode.PREFILL_ONLY,
+                decode_failed=self.pd_mode == PDSchedulerMode.DECODE_ONLY,
+            )
         inc_request_timeouts(stage)
         logger.warning(
             "[TTFT_TIMEOUT][pd_scheduler] req_id=%s stage=%s overdue_s=%.3f",
@@ -327,6 +389,8 @@ class PDInstanceRequestManager:
                 )
         elif request_type == "pd_prefill_fail":
             if isinstance(self, DecodeOnlyManager):
+                # Prefill reported a request-level failure: mark prefill-failed before cleanup.
+                self.kv_manager.cancel_prefill_wait(request_id)
                 if self.stop_request(request_id, timeout=0.0):
                     await self.token_manager.send_error_for_request(
                         request_id, "prefill worker is down"
@@ -355,9 +419,13 @@ class PDInstanceRequestManager:
         logger.debug(f"processing prefill request: {request_id}")
         logger.debug(f"[PD_STAGE][prefill.queue.start] req_id={request_id}")
 
-        # Create task from request and enqueue. Actual batched prefill compute is driven by
-        # the background compute loop (start_worker -> chitu_run()).
-        task = self._create_task_from_request(original_request)
+        # Create task from request (request-build boundary). Actual batched prefill
+        # compute is driven by the background compute loop (start_worker -> chitu_run()).
+        task = self._build_task_with_wrap(original_request, request_id)
+        if task is None:
+            return
+        # Enqueue OUTSIDE whitelist boundary: a failure here crashes via unified protocol.
+        TaskPool.enqueue(task)
         if pd_trace_enabled():
             logger.debug(
                 f"[PD_TRACE][prefill.task] req_id={request_id} task_id={task.task_id} "
@@ -383,6 +451,13 @@ class PDInstanceRequestManager:
         if request_id in self.pending_decode_requests:
             return
 
+        if test_inject_exception_prefill_fail_before_task(self, request_id):
+            if self.token_manager is not None:
+                await self.token_manager.send_error_for_request(
+                    request_id, "prefill worker is down"
+                )
+            return
+
         # Store decode request info
         decode_info = {
             "request_id": request_id,
@@ -404,9 +479,10 @@ class PDInstanceRequestManager:
         # Create task but not enqueue to TaskPool
         # task.task_type is still prefill untill cache_manager allocate blocks for the task
         # req will be promoted only after KV Cache is ready
-        task = self._create_task_from_request(
-            decode_info["original_request"], enqueue=False
-        )
+        task = self._build_task_with_wrap(decode_info["original_request"], request_id)
+        if task is None:
+            self.pending_decode_requests.pop(request_id, None)
+            return
         # Carry PD binding so KV hook can route to the correct prefill engine_rank.
         if prefill_scheduler_id is not None:
             task.pd_prefill_engine_rank = prefill_scheduler_id
@@ -420,10 +496,11 @@ class PDInstanceRequestManager:
         )
         logger.debug(f"[PD_STAGE][decode.enqueue.start] req_id={request_id}")
 
-    def _create_task_from_request(
-        self, request_data: dict, *, enqueue: bool = True
-    ) -> Task:
-        """Create Task object from serialized request"""
+    def _create_task_from_request(self, request_data: dict) -> Task:
+        """Create Task from serialized request. Whitelist boundary: only
+        UserRequest.from_dict + Task(...); callers wrap in try/except for
+        per-request recovery. Enqueue done OUTSIDE by caller."""
+        test_inject_exception_request_build_failure()
         assert isinstance(request_data, dict)
         req = UserRequest.from_dict(request_data)
         task = Task(
@@ -447,15 +524,23 @@ class PDInstanceRequestManager:
             )
             task.req.max_new_tokens = int(allowed_new)
         # For PD services, keep request handling non-blocking and thread-safe:
-        # enqueue tasks here; the background compute loop (start_worker -> chitu_run())
-        # will call TaskPool.add_all_queued() and drive batched scheduling/execution.
-        #
-        # NOTE: DPTokenManager.wrap_task monkey-patches the *original* task's
-        # update_response_no_sync to stream tokens; it does NOT require TaskPool.add().
+        # the caller wraps + enqueues OUTSIDE the request-build boundary (see below).
+        return task
+
+    def _build_task_with_wrap(
+        self, request_data: dict, request_id: str
+    ) -> Optional[Task]:
+        """Build Task + wrap: try _create_task_from_request, on error
+        _handle_request_creation_error + return None, else wrap_task + return Task.
+        Returns None on whitelist (request-parameter) error; raises on non-whitelist."""
+        try:
+            task = self._create_task_from_request(request_data)
+        except Exception as e:
+            self._handle_request_creation_error(request_id, e)
+            return None
+        # OUTSIDE the whitelist boundary: wrap touches token-sender state.
         if self.token_manager is not None:
-            _ = self.token_manager.wrap_task(task)
-        if enqueue:
-            TaskPool.enqueue(task)
+            self.token_manager.wrap_task(task)
         return task
 
     def get_pd_stats(self) -> dict:
@@ -540,29 +625,64 @@ class PrefillOnlyManager(PDInstanceRequestManager):
         )
 
         # 轮询参数（通过 kv_transfer 配置）
-        self._bootstrap_timeout_s = float(
-            getattr(self._kv_cfg, "prefill_wait_transfer_info_timeout_s", 2400.0)
-        )
+        # Message-loss fallback bound (aligned with D-side decode_wait_timeout_s
+        # default 300s; configurable via prefill_wait_timeout_s).
+        self._bootstrap_timeout_s = float(self._kv_cfg.prefill_wait_timeout_s)
         # 轮询间隔：实测写成 0 就 CPU 卡死了
         self._bootstrap_poll_interval_s = float(
             getattr(self._kv_cfg, "prefill_bootstrap_poll_interval_s", 0.01)
         )
         self._bootstrap_last_poll_ts = 0.0
 
+    def _fail_prefill_wait_timeout(self, request_id: str) -> None:
+        """Message-loss fallback (P side): DecodeAllocated never arrived.
+
+        Fail this request at request level: notify the user (error frame with
+        prefill_failed=True so the paired Decode stops too) and clean up the P task.
+        Mirror of DecodeOnlyManager._fail_decode_wait_timeout.
+        """
+        task = TaskPool.pool.get(request_id)
+        if task is None:
+            return
+        if self.token_manager is not None:
+            self.token_manager.token_sender.send_error(
+                request_id,
+                "decode response timeout",
+                prefill_failed=True,
+            )
+        self.stop_request(request_id, force_stop=True, timeout=0.0)
+
     def stop_request(
         self, request_id: str, force_stop: bool = False, timeout: float = 30.0
     ):
         task = TaskPool.pool.get(request_id, None)
 
+        # The task may already be gone (request-build failure, ttft stop, or a
+        # concurrent cleanup won the race) or still queued but not promoted.
+        # Clean up whatever remains and return rather than AttributeError on None.
+        if task is None:
+            self.pending_decode_requests.pop(request_id, None)
+            # Removal is deferred to the compute thread (drained at the top of
+            # each step). If the task is still in the pending queue, the mark
+            # prevents it being promoted.
+            TaskPool.mark_pending_remove(request_id)
+            self.kv_manager.remove_request_all_rank(request_id=request_id)
+            return True
+
         if not task.is_pd_status():
             task.set_stopped()
             TaskCollector.add_update_task_ids([request_id])
+            self.kv_manager.remove_request_all_rank(request_id=request_id)
             return True
 
         self.pending_decode_requests.pop(request_id, None)
 
         if task.is_pd_status():
-            TaskPool.remove(request_id)
+            # Defer the actual pool removal to the compute thread (drained at
+            # the top of each step). Stop it first so schedulers/promoters skip
+            # it in the meantime.
+            task.set_stopped()
+            TaskPool.mark_pending_remove(request_id)
 
         return super().stop_request(request_id, force_stop)
 
@@ -576,7 +696,9 @@ class PrefillOnlyManager(PDInstanceRequestManager):
         request_id = str(request_data["request_id"])
         original_request = request_data["request"]
 
-        task = self._create_task_from_request(original_request, enqueue=False)
+        task = self._build_task_with_wrap(original_request, request_id)
+        if task is None:
+            return
         if task.req.save_trace_dir:
             self.kv_manager.update_trace_info(request_id, task.req.trace_data)
         task.status = TaskStatus.PDPrefillIncoming
@@ -632,12 +754,17 @@ class PrefillOnlyManager(PDInstanceRequestManager):
                         f"waited={time_since_task_created:.1f}s"
                     )
                 if info.check_if_timeout(now, self._bootstrap_timeout_s):
-                    # FIXME: log every 10 seconds
+                    # Message-loss fallback (P side): DecodeAllocated never
+                    # arrived within the bound (lost pd_decode_fail / decode died).
+                    # Fail this request at request level and notify the paired
+                    # Decode so nothing leaks — mirror of the D-side timeout.
                     logger.warning(
                         f"[PD_BOOTSTRAP][prefill.backpressure] req_id={rid} waited={time_since_task_created:.1f}s "
                         f"threshold={self._bootstrap_timeout_s:.1f}s"
                     )
-                continue
+                    self._fail_prefill_wait_timeout(rid)
+                    continue
+                continue  # still waiting for DecodeAllocated — skip promotion
 
             task.status = TaskStatus.AvailableForSchedule
 
@@ -657,6 +784,31 @@ class PrefillOnlyManager(PDInstanceRequestManager):
 
 class DecodeOnlyManager(PDInstanceRequestManager):
     """Decode-only Scheduler"""
+
+    def _fail_decode_wait_timeout(self, request_id: str) -> None:
+        """Message-loss fallback: PrefillDone timeout. Fail request-level with
+        decode_failed peer notify. Rely on update() for KV metadata finalization."""
+        task = TaskPool.pool.get(request_id)
+        if task is not None:
+            if self.token_manager is not None:
+                self.token_manager.token_sender.send_error(
+                    request_id,
+                    "prefill response timeout",
+                    decode_failed=True,
+                )
+            # Release prealloc KV budget; mark stopped for update() to finalize metadata.
+            self.pending_decode_requests.pop(request_id, None)
+            if task.status == TaskStatus.PDDecodePrealloc:
+                self._release_decode_prealloc_budget(task)
+            task.set_stopped()
+        # Clean up KV transfer state (_task_infos, _transfer_done_states) that
+        # would normally be cleaned by recv_kv_cache_and_insert on successful
+        # PrefillDone delivery. Without this, every message-loss timeout leaks
+        # one entry in both dicts (slow leak).  Always clean up even when the
+        # task was already evicted from TaskPool — the KV transfer state is
+        # tracked independently and remove_request_all_rank is idempotent.
+        if self.kv_manager is not None:
+            self.kv_manager.remove_request_all_rank(request_id)
 
     def __init__(
         self,
@@ -732,6 +884,18 @@ class DecodeOnlyManager(PDInstanceRequestManager):
     ):
         task = TaskPool.pool.get(request_id, None)
 
+        # The task may already be gone (e.g. the Prefill side failed the request
+        # before Decode created its task, and pd_prefill_fail arrives; or a
+        # concurrent cleanup won the race). Clean up whatever remains — including
+        # a task still sitting in the pending queue (enqueued but not promoted) —
+        # and return.
+        if task is None:
+            self.pending_decode_requests.pop(request_id, None)
+            self.kv_manager.remove_request_all_rank(request_id=request_id)
+            # Removal is deferred to the compute thread (see mark_pending_remove).
+            TaskPool.mark_pending_remove(request_id)
+            return False
+
         if not force_stop and not task.is_pd_status():
             return False
         if not task.is_pd_status():
@@ -741,7 +905,8 @@ class DecodeOnlyManager(PDInstanceRequestManager):
 
         self.pending_decode_requests.pop(request_id, None)
         if task.status == TaskStatus.PDDecodeIncoming:
-            TaskPool.remove(request_id)
+            task.set_stopped()
+            TaskPool.mark_pending_remove(request_id)
             return True
 
         if task.status == TaskStatus.PDDecodePrealloc:
@@ -757,7 +922,8 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             for cache_dict in Backend.cache_managers:
                 for cache_manager in cache_dict.values():
                     cache_manager.finalize_metadata_all_decode(task)
-            TaskPool.remove(request_id)
+            task.set_stopped()
+            TaskPool.mark_pending_remove(request_id)
 
         return super().stop_request(request_id, force_stop, timeout)
 
@@ -893,12 +1059,26 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             if self._reject_pd_ttft_timeout(task, "ttft_pd_decode_prealloc", now):
                 continue
 
+            if test_inject_exception_decode_side_failure(self, rid):
+                continue
+
             info = task.pd_scheduler_info
             time_since_task_created = info.time_since_task_created(now)
             target_dp_rank = int(task.dp_rank)
 
+            # The Prefill side reported a request-level failure for this request
+            # (its KV will never arrive). Fail it at request level BEFORE it is
+            # promoted into a decode batch — otherwise the request would be
+            # scheduled into decode_step with no KV. Checked here on the
+            # scheduler side so the failure is caught before batch assembly.
+            if self.kv_manager.is_prefill_failed(rid):
+                self._fail_decode_wait_timeout(rid)
+                continue
+
             prefill_done = self.kv_manager.is_prefill_done(rid)
             if not prefill_done:
+                if test_inject_exception_prefill_done_missing(self, rid):
+                    continue
                 wait_timeout_s = float(
                     getattr(self._kv_cfg, "decode_wait_timeout_s", 0.0) or 0.0
                 )
@@ -910,6 +1090,11 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                         f"last_prepare_age_s={now - info.last_prepare_ts:.1f} "
                         f"prefix_len={int(getattr(task, 'prefix_tokens_len', 0)) if task is not None else 0}"
                     )
+                    # Message-loss fallback: the PrefillDone message was lost (or the
+                    # Prefill side died without notifying). Fail this request at request
+                    # level instead of leaking the task + prealloc KV blocks forever.
+                    self._fail_decode_wait_timeout(rid)
+                    continue
                 if info.should_refresh_log(now, 10.0):
                     logger.debug(
                         f"[PD_BOOTSTRAP][decode.wait] still waiting KV ready: req_id={rid} "

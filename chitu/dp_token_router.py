@@ -27,6 +27,7 @@ from chitu.dp_router import (
     set_global_token_router,
     remove_request_everywhere,
 )
+from chitu.serve.crash import report_and_exit, is_dying
 from chitu.metrics.prometheus_collector import observe_e2e_duration
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,15 @@ class TokenRouter:
         self._per_instance_tokens: dict[int, int] = defaultdict(
             int
         )  # instance_id -> tokens in window
-        self._cleanup_timeout_s = float(os.getenv("ROUTER_CLEANUP_TIMEOUT_S", "2400"))
+        # Watchdog: requests stuck beyond the bound (no token, no
+        # error, no finish — e.g. report channel broken) are force-failed.
+        self._cleanup_timeout_s = float(
+            os.getenv(
+                "ROUTER_REQUEST_TIMEOUT_S",
+                os.getenv("ROUTER_CLEANUP_TIMEOUT_S", "1200"),
+            )
+        )
+        self._cleanup_interval_s = float(os.getenv("ROUTER_WATCHDOG_INTERVAL_S", "30"))
         self._shutdown = False
         self._terminating = False
         self._tasks: list[asyncio.Task] = []
@@ -104,6 +113,14 @@ class TokenRouter:
 
     async def register_request(self, req: UserRequest):
         """Register new request"""
+        # The request may already have been finished during add_request (e.g. no
+        # eligible scheduler); registering it would leak into active_requests
+        # until the watchdog. Skip finished requests.
+        if req.finished:
+            logger.debug(
+                f"Token Router: skip registering already-finished request {req.request_id}"
+            )
+            return
         logger.debug(f"Token Router: Registering request {req.request_id}")
 
         self.active_requests[req.request_id] = req
@@ -145,6 +162,12 @@ class TokenRouter:
         except Exception:
             rcv_batch = 256
         while not self._shutdown:
+            if is_dying():
+                # During the crash window, stop processing new token data so the
+                # Router's dying-watch (handle_crash) can terminate in-flight
+                # requests without racing with incoming token frames.
+                await asyncio.sleep(0.1)
+                continue
             try:
                 if await sock.poll(timeout=1):
                     drained = 0
@@ -152,7 +175,20 @@ class TokenRouter:
                         if not await sock.poll(timeout=0):
                             break
                         data = await sock.recv()
-                        token_data = msgpack.unpackb(data, raw=False)
+                        # Malformed frame must not kill the Router: isolate unpack, skip bad frames.
+                        try:
+                            token_data = msgpack.unpackb(data, raw=False)
+                        except Exception as e:
+                            logger.error(
+                                f"Token Router: malformed token frame from receiver[{instance_id}]: {e}"
+                            )
+                            continue
+                        if not isinstance(token_data, dict):
+                            logger.error(
+                                f"Token Router: non-dict frame from receiver[{instance_id}]: "
+                                f"type={type(token_data).__name__}"
+                            )
+                            continue
                         if instance_id is not None:
                             token_data.setdefault("instance_id", instance_id)
                         await self._process_token_data(token_data)
@@ -160,8 +196,9 @@ class TokenRouter:
                 else:
                     await asyncio.sleep(0.001)
             except Exception as e:
-                logger.exception(f"Error in token receiver[{instance_id}]")
-                await asyncio.sleep(0.01)
+                # Token-path processing fault (not unpack) = real bug -> crash.
+                logger.exception(f"Error in token receiver[{instance_id}]: {e}")
+                report_and_exit(f"token receiver[{instance_id}] crashed")
 
     async def _process_token_data(self, token_data: dict[str, Any]):
         """Process received token data"""
@@ -207,6 +244,10 @@ class TokenRouter:
             top_logprobs = token_data.get("top_logprobs")
             top_token_idx = token_data.get("top_token_idx")
             is_first_token = req.num_output_tokens == 0
+            # tokenizer.decode is assumed never to fail (tool-call parsing is the
+            # request-isolated failure, not decode). A decode failure is a real
+            # engine fault: let it propagate to _recv_loop's except ->
+            # report_and_exit (crash protocol), not isolate per-request.
             req.add_data(tokens, top_logprobs, top_token_idx)
             req.trace_data.debug(
                 {
@@ -302,6 +343,24 @@ class TokenRouter:
                 f"Token Router: DP group reported error, request_id={request_id}, error={error_message}"
             )
 
+            # Peer-fail: forward to request router BEFORE finishing user stream,
+            # so the paired peer is notified and does not wait/leak.
+            request_router = get_request_router(check_exist=False)
+            if request_router is not None:
+                if token_data.get("prefill_failed"):
+                    handler = request_router.handle_prefill_failed
+                elif token_data.get("decode_failed"):
+                    handler = request_router.handle_decode_failed
+                else:
+                    handler = None
+                if handler is not None:
+                    try:
+                        await handler(request_id)
+                    except Exception:
+                        logger.exception(
+                            f"Token Router: peer-fail notify failed for {request_id}"
+                        )
+
             # Send stop signal and cleanup
             self.finish_request(
                 req,
@@ -319,7 +378,12 @@ class TokenRouter:
             )
 
     async def _cleanup_task(self):
-        """Clean up timed out requests"""
+        """Clean up timed out requests (watchdog).
+
+        This is a slow-fallback: a single stuck/corrupt request must not take down
+        the whole Router. Per-request faults are isolated below; the outer loop only
+        logs and continues so other timed-out requests still get cleaned up.
+        """
         while not self._shutdown:
             try:
                 current_time = time.monotonic()
@@ -333,16 +397,24 @@ class TokenRouter:
                         timeout_requests.append(req)
 
                 for request in timeout_requests:
-                    logger.warning(
-                        f"Token Router: Request {request.request_id} timed out, cleaning up"
-                    )
-                    self.finish_request(request, error="Timeout error")
+                    try:
+                        logger.warning(
+                            f"Token Router: Request {request.request_id} timed out, cleaning up"
+                        )
+                        self.finish_request(request, error="Timeout error")
+                    except Exception:
+                        # Isolate single-request cleanup fault; keep watchdog alive.
+                        logger.exception(
+                            f"Token Router: failed to clean up request {request.request_id}"
+                        )
 
-                await asyncio.sleep(60)  # Clean up every minute
+                await asyncio.sleep(self._cleanup_interval_s)  # Watchdog scan period
 
             except Exception as e:
-                logger.error(f"Token Router: Error in cleanup task: {e}")
-                await asyncio.sleep(60)
+                # A systemic scan fault (e.g. iteration over a mutated registry) — log
+                # and continue; the next scan retries. Do NOT crash the Router here.
+                logger.exception(f"Token Router: Error in cleanup task: {e}")
+                await asyncio.sleep(self._cleanup_interval_s)
 
     async def begin_termination(self):
         """Stop active streams but keep token receivers alive during instance drain."""

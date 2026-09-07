@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 from typing import Optional, Sequence
 from typing_extensions import override
 
@@ -40,6 +41,8 @@ from chitu.distributed.comm_group import CommGroup
 deep_ep, has_deep_ep = try_import_opt_dep("deep_ep", "deep_ep")
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+
+logger = logging.getLogger(__name__)
 
 if has_deep_ep:
     from .token_dispatchers import MoELowLatencyTokenDispatcher
@@ -444,7 +447,13 @@ class MoEImplEP(MoEImplBase):
                 if accessor is not None:
                     register_moe_weight_accessor(accessor, self.ep_group)
             except Exception:
-                pass
+                # LB is enabled but its weight accessor cannot be registered —
+                # weight migration would silently fail (corrupting experts).
+                # Re-raise so model construction crashes via the unified protocol.
+                logger.exception(
+                    "[MoE] failed to register weight accessor with load balancer"
+                )
+                raise
 
     def _init_token_dispatcher(self):
         # impl selection

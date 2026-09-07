@@ -182,7 +182,10 @@ def apptainer_run(
 
         def wait_and_run_on_ready():
             try:
-                wait_for_server_initialized(status_url)
+                wait_for_server_initialized(
+                    status_url,
+                    timeout=float(cfg.multi_inst.router.launch_timeout),
+                )
 
                 on_ready_cmd = list(apptainer_cmd) + on_ready_args
                 if cfg.boot.on_ready_relay_args:
@@ -207,11 +210,15 @@ def apptainer_run(
     proc = subprocess.Popen(service_apptainer_cmd)
     if _proc_registry is not None:
         _proc_registry.append(proc)
+    allow_crash = cfg.boot.on_ready is not None and getattr(
+        cfg.boot, "on_ready_allow_crash", False
+    )
     ret = proc.wait()
-    if ret != 0:
+    if ret != 0 and not allow_crash:
         raise subprocess.CalledProcessError(ret, service_apptainer_cmd)
-
-    if on_ready_thread is not None and ret == 0:
+    if on_ready_thread is not None:
         on_ready_thread.join()
     if on_ready_error:
         raise on_ready_error[0]
+    if ret != 0:
+        raise subprocess.CalledProcessError(ret, service_apptainer_cmd)

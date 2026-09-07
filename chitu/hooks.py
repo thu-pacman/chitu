@@ -207,9 +207,13 @@ class MooncakeKVTransferHook:
             return
 
         for req_id in pending:
-            first_token, num_hit_tokens = self.kv_manager.recv_kv_cache_and_insert(
-                req_id
-            )
+            # The request in this batch already passed the decode scheduler's
+            # prealloc->available promotion, which requires is_prefill_done (the
+            # Prefill succeeded). A failure here (KV-transfer fault, 10s wait
+            # timeout, bytes mismatch) is therefore NOT a request-level
+            # prefill-failure — it is an engine fault and must propagate to the
+            # compute loop -> crash via the unified protocol.
+            first_token, _ = self.kv_manager.recv_kv_cache_and_insert(req_id)
 
             task = TaskPool.pool.get(req_id)
             if task is None:

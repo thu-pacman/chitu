@@ -273,7 +273,10 @@ def docker_run(
 
         def wait_and_run_on_ready():
             try:
-                wait_for_server_initialized(status_url)
+                wait_for_server_initialized(
+                    status_url,
+                    timeout=float(cfg.multi_inst.router.launch_timeout),
+                )
 
                 on_ready_suffix = (
                     f"{container_name_suffix}-on-ready"
@@ -303,10 +306,12 @@ def docker_run(
     proc = subprocess.Popen(service_docker_cmd)
     if _proc_registry is not None:
         _proc_registry.append(proc)
+    allow_crash = cfg.boot.on_ready is not None and getattr(
+        cfg.boot, "on_ready_allow_crash", False
+    )
     ret = proc.wait()
-
     try:
-        if ret != 0:
+        if ret != 0 and not allow_crash:
             raise subprocess.CalledProcessError(ret, service_docker_cmd)
     finally:
         if hosts_tmp_file is not None:
@@ -317,7 +322,10 @@ def docker_run(
                     f"Failed to remove temporary hosts file {hosts_tmp_file}: {e}"
                 )
 
-    if on_ready_thread is not None and ret == 0:
+    if on_ready_thread is not None:
         on_ready_thread.join()
     if on_ready_error:
         raise on_ready_error[0]
+    if ret != 0:
+        # Crash allowed: raise to fail-fast siblings; the on_ready marker is the verdict.
+        raise subprocess.CalledProcessError(ret, service_docker_cmd)

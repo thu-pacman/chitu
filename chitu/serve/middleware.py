@@ -9,6 +9,7 @@ from logging import getLogger
 from fastapi.responses import JSONResponse
 
 from chitu.global_vars import get_global_args
+from chitu.serve.crash import is_dying
 from chitu.task import TaskPool
 
 logger = getLogger(__name__)
@@ -18,6 +19,7 @@ _INFERENCE_PATH_PREFIXES = (
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/messages",
+    "/v1/complete",
     "/v1/responses",
 )
 
@@ -34,6 +36,20 @@ class RejectOverloadMiddleware:
         if scope["type"] == "http" and scope["path"].startswith(
             _INFERENCE_PATH_PREFIXES
         ):
+            if is_dying():
+                # During a crash window, reject new inference requests.
+                response = JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": {
+                            "message": "Service is shutting down",
+                            "type": "shutting_down",
+                        }
+                    },
+                )
+                await response(scope, receive, send)
+                return
+
             args = get_global_args()
             max_total = getattr(args.infer, "max_concurrent_requests", None)
             if max_total is not None:

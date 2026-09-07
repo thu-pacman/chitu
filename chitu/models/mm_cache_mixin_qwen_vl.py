@@ -4,6 +4,8 @@
 
 from typing import TYPE_CHECKING, Any, Optional
 
+import logging
+
 import torch
 
 from chitu.kv_cache import MMPagedKVCache
@@ -11,6 +13,8 @@ from chitu.ops import append_to_paged_kv_cache
 
 if TYPE_CHECKING:
     from chitu.task import PackedTasksBase
+
+logger = logging.getLogger(__name__)
 
 
 class QwenVLMmCacheCoreMixin:
@@ -33,6 +37,9 @@ class QwenVLMmCacheCoreMixin:
                 getattr(self.cache_dict["main"], "tid_to_cached_len", {}).keys()
             )
         except Exception:
+            # Best-effort cleanup: a broken main cache should not take
+            # down the loop, but must be diagnosable.
+            logger.exception("_mm_cache_cleanup: failed to read main cache")
             return
 
         mm_cache = self._require_mm_cache()

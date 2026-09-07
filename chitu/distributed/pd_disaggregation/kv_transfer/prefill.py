@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-import concurrent.futures
 import threading
 import time
 from logging import getLogger
@@ -11,8 +10,10 @@ from logging import getLogger
 import numpy as np
 import torch
 
+from chitu.utils import DaemonThreadPoolExecutor
 from chitu.backend import Backend
 from chitu.kv_cache.kv_cache import PagedKVCache
+from chitu.serve.crash import report_and_exit
 from chitu.task import PackedTasksResult, TaskPool
 from chitu.trace import Trace
 from chitu.metrics.prometheus_collector import (
@@ -49,14 +50,14 @@ class KVManagerPrefill(KVManagerBase):
         # Transfer executor
         cpu_count = os.cpu_count()
         transfer_thread_pool_size = min(max(4, int(0.75 * cpu_count) // 8), 12)
-        self.executor = concurrent.futures.ThreadPoolExecutor(transfer_thread_pool_size)
+        self.executor = DaemonThreadPoolExecutor(transfer_thread_pool_size)
         # Protect TaskInfo while the RankTransferDone receive thread and the
         # main executor thread hand off completion ownership.
         self._prefill_transfer_state_lock = threading.Lock()
         # Completion bookkeeping is separate from TaskInfo so TaskInfo can keep
         # origin/main's per-active-transfer lifetime and still support async PP
         # drain checks after RankTransferDone removes it.
-        self._completed_prefill_request_counts: dict[str, int] = {}
+        self._completed_prefill_requests: set[str] = set()
 
         # Main rank should hold the transfer done state for all requests
         self._transfer_done_reqs: list[str] = []
@@ -161,10 +162,7 @@ class KVManagerPrefill(KVManagerBase):
                 endpoint = self._decode_endpoints[info.decode_sid].prefill_done
                 endpoint.send(ProtocolSerializer.pack(nty))
 
-                info.is_prefill_transfer_completed = True
-                self._completed_prefill_request_counts[info.req_id] = (
-                    self._completed_prefill_request_counts.get(info.req_id, 0) + 1
-                )
+                self._completed_prefill_requests.add(info.req_id)
 
         self._trace("handle_rank_transfer_done", req_id=msg.req_id)
 
@@ -172,7 +170,7 @@ class KVManagerPrefill(KVManagerBase):
         """Check whether all RDMA transfers for a batch have completed."""
         with self._prefill_transfer_state_lock:
             return all(
-                self._completed_prefill_request_counts.get(request_id, 0) > 0
+                request_id in self._completed_prefill_requests
                 for request_id in request_ids
             )
 
@@ -180,22 +178,24 @@ class KVManagerPrefill(KVManagerBase):
         """Consume async-PP completion markers after RDMA transfers finish."""
         with self._prefill_transfer_state_lock:
             if not all(
-                self._completed_prefill_request_counts.get(request_id, 0) > 0
+                request_id in self._completed_prefill_requests
                 for request_id in request_ids
             ):
                 return False
             for request_id in request_ids:
-                remaining = self._completed_prefill_request_counts[request_id] - 1
-                if remaining > 0:
-                    self._completed_prefill_request_counts[request_id] = remaining
-                else:
-                    self._completed_prefill_request_counts.pop(request_id, None)
+                self._completed_prefill_requests.discard(request_id)
             return True
 
     def handle_decode_allocated(self, raw: bytes):
         msg = ProtocolSerializer.unpack(raw)
         if isinstance(msg, RemoveRequest):
             self.remove_request(msg.req_id)
+            # Mark the cancelled request as "completed" for async-PP drain so
+            # it doesn't block the batch — the request will never produce a
+            # RankTransferDone. Without this entry, are_prefill_requests_completed
+            # returns False forever and _pop_pending_pp_result_task stalls.
+            with self._prefill_transfer_state_lock:
+                self._completed_prefill_requests.add(msg.req_id)
             return
 
         assert isinstance(msg, DecodeAllocated)
@@ -249,6 +249,21 @@ class KVManagerPrefill(KVManagerBase):
         for i, req_id in enumerate(request_ids):
             info = self._info(req_id)
             if info is None:
+                # The request was already cleaned up (e.g. the paired Decode
+                # failed it and sent RemoveRequest, clearing this side's info)
+                # while this side's prefill was still finishing. The request is a
+                # request-level failure, not a crash — skip sending its KV and
+                # mark the task stopped so the scheduler removes it instead of
+                # re-scheduling it forever (which would block terminate-drain).
+                logger.warning(
+                    "[KV_HOOK] skip send_kv_cache for already-cleaned request %s",
+                    req_id,
+                )
+                from chitu.task import TaskPool
+
+                task = TaskPool.pool.get(req_id)
+                if task is not None:
+                    task.set_stopped()
                 continue
             info.num_hit_tokens = num_hit_tokens[i]
             inst_id = self._decode_inst_ids[info.decode_sid]
@@ -303,9 +318,23 @@ class KVManagerPrefill(KVManagerBase):
         except Exception:
             inc_kv_transfer_failures("prefill")
             logger.exception(
-                f"transfer_worker fatal error req_id={req_id}, exiting process"
+                f"transfer_worker fatal error req_id={req_id}, entering crash protocol"
             )
-            os._exit(1)
+            report_and_exit(f"KV transfer_worker crashed req_id={req_id}")
+
+    def remove_request_all_rank(self, request_id: str):
+        """Broadcast RemoveRequest to all Prefill ranks (including self).
+
+        Mirrors KVManagerDecode.remove_request_all_rank: the ctrl rank sends a
+        RemoveRequest through the decode_allocated relay, and every rank's
+        handle_decode_allocated calls local remove_request.  World_size == 1
+        has no relay; only local cleanup is needed.
+        """
+        if self.is_ctrl_rank and self.world_size > 1:
+            self.endpoints.decode_allocated.send(
+                ProtocolSerializer.pack(RemoveRequest(req_id=request_id))
+            )
+        self.remove_request(request_id)
 
     def is_decode_allocated(self, req_id: str):
         info = self._info(req_id)
@@ -323,8 +352,3 @@ class KVManagerPrefill(KVManagerBase):
             transfer_done_reqs = self._transfer_done_reqs
             self._transfer_done_reqs = []
             return transfer_done_reqs
-
-    def remove_request_all_rank(self, request_id: str):
-        self.endpoints.decode_allocated.send(
-            ProtocolSerializer.pack(RemoveRequest(req_id=request_id))
-        )

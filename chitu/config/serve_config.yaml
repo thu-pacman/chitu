@@ -127,6 +127,9 @@ boot:
   #: or not)
   on_ready_shutdown: False
 
+  #: Allow an engine non-zero exit and defer the verdict to boot.on_ready's verifier.
+  on_ready_allow_crash: False
+
   #: How to run on multiple nodes
   #:
   #: Acceptable values:
@@ -682,6 +685,9 @@ multi_inst:
       decode_wait_timeout_s: 300.0
       decode_resend_interval_s: 0.5
       decode_poll_interval_s: 0.05
+      #: Message-loss fallback on the Prefill side: how long to wait for the
+      #: DecodeAllocated signal before failing the request at request level.
+      prefill_wait_timeout_s: 600.0
       decode_prealloc_max_pending: null
       decode_prealloc_poll_interval_s: 0.01
       decode_prealloc_token_budget: null
@@ -745,6 +751,11 @@ multi_inst:
 
     #: When the router is ready, wait for this time untill the instances are ready.
     launch_timeout: 3600
+
+    #: Crash-protocol window (seconds): once a process decides it must crash, it
+    #: has this many seconds to notify the Router / terminate in-flight requests
+    #: before a hard exit. Default 10s.
+    graceful_crash_time: 10.0
 
     max_inflight_per_instance: 24 # max number of inflight requests per dp instance
     # Used by unified DP routing, and by PD prefill routing when PD disaggregation is enabled.

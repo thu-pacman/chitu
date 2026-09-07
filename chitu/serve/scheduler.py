@@ -18,6 +18,7 @@ import torch.distributed
 
 from chitu.chitu_main import chitu_init, warmup_engine, start_enhanced_scheduler_service
 from chitu.serve.common import start_worker
+from chitu.serve.crash import report_and_exit
 from chitu.task import TaskPool
 from chitu.distributed.infiniband import auto_set_ib_envs
 from chitu.global_vars import (
@@ -94,8 +95,16 @@ def init_dp_scheduler(args):
     )
 
     def set_device_id_again_and_start_worker():
-        set_cuda_device()
-        start_worker()
+        try:
+            set_cuda_device()
+            start_worker()
+        except Exception:
+            # A raise in set_cuda_device would otherwise die silently in this
+            # thread, leaving the instance half-alive (no compute loop).
+            logger.exception(
+                "[SCHEDULER] compute worker thread fatal error, entering crash protocol"
+            )
+            report_and_exit("DP compute worker thread crashed")
 
     t = threading.Thread(target=set_device_id_again_and_start_worker)
     t.start()

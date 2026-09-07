@@ -16,9 +16,11 @@ from types import UnionType
 import importlib
 import importlib.resources
 import threading
+import weakref
 from collections import deque
 from types import UnionType
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import thread as _cf_thread
 
 import numpy as np
 import torch
@@ -34,6 +36,42 @@ from chitu.device_type import is_ascend
 from chitu.serve.request_id import gen_req_id
 
 logger = getLogger(__name__)
+
+
+class DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    """ThreadPoolExecutor whose worker threads are daemon.
+
+    A worker stuck in a C++ call (e.g. a mooncake RDMA transfer waiting on a
+    peer that is shutting down) would otherwise keep the Python interpreter from
+    exiting on terminate — hanging the job after the service has drained.
+    Daemon threads are not joined at interpreter exit, so a stuck background
+    task cannot block process exit.
+    """
+
+    def _adjust_thread_count(self):
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
+            t = threading.Thread(
+                name=thread_name,
+                target=_cf_thread._worker,
+                args=(
+                    weakref.ref(self, weakref_cb),
+                    self._work_queue,
+                    self._initializer,
+                    self._initargs,
+                ),
+                daemon=True,
+            )
+            t.start()
+            self._threads.add(t)
+            _cf_thread._threads_queues[t] = self._work_queue
 
 
 def get_chitu_env(
@@ -555,7 +593,7 @@ def prefetch_state_dict(state_dict: dict[str, torch.Tensor], max_workers: int = 
         # 假设绝大部分tensor都是磁盘mmap到内存再view，此时只需做一次clone即可完成预取
         state_dict[key].clone()
 
-    executor = ThreadPoolExecutor(
+    executor = DaemonThreadPoolExecutor(
         max_workers=max_workers, thread_name_prefix="prefetch"
     )
     executor.map(_prefetch, state_dict)
@@ -575,7 +613,6 @@ def fetch_state_dict_to_device(
         return
 
     events: list[torch.cuda.Event] = []
-    lock = threading.Lock()
 
     def _worker():
         torch.cuda.set_device(device)  # Required, or we will init allocator on GPU 0
@@ -584,11 +621,25 @@ def fetch_state_dict_to_device(
                 key = work.popleft()
             except IndexError:
                 break
-            state_dict[key] = state_dict[key].to(device=device, non_blocking=True)
+            try:
+                state_dict[key] = state_dict[key].to(device=device, non_blocking=True)
+            except Exception as e:
+                # A failed .to() leaves partial weights on GPU — do not let other
+                # workers keep moving weights for a doomed process. This is startup
+                # (no reporter yet): crash immediately from this thread. Local
+                # import avoids a module cycle.
+                logger.exception("fetch_to_gpu: .to() failed for %s", key)
+                from chitu.serve.crash import report_and_exit
+
+                report_and_exit(
+                    f"fetch_state_dict_to_device failed: {e!r}", immediate=True
+                )
+                return  # unreachable in practice; defensive
         event = torch.cuda.Event()
         event.record()
-        with lock:
-            events.append(event)
+        # list.append is atomic under the GIL; the main thread reads events only
+        # after joining all workers (happens-before), so no lock is needed here.
+        events.append(event)
 
     n_workers = min(max_workers, len(work))
     threads = [

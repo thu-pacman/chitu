@@ -14,6 +14,7 @@ from logging import getLogger
 from typing import Any, ClassVar, Deque, Optional, Union
 from functools import cached_property
 import random
+import threading
 
 import torch
 
@@ -919,6 +920,12 @@ class TaskPool:
     pool: dict[str, Task] = {}
     id_list: list[str] = []
     pending_queue: deque[Task] = Deque()
+    pending_remove: set[str] = set()  # task_ids to delete, drained by add_all_queued
+    # Guards pending_queue/pending_remove. add_all_queued runs on the compute
+    # thread while enqueue()/mark_pending_remove() run on the scheduler-service
+    # thread; deque/set *iteration* is not safe against concurrent mutation, so
+    # all reads and writes of these two containers must hold this lock.
+    _lock = threading.Lock()
 
     def __bool__(self):
         return len(self.pool) > 0
@@ -930,6 +937,7 @@ class TaskPool:
     def reset(cls):
         cls.pool = {}
         cls.id_list = []
+        cls.pending_remove.clear()
 
     @classmethod
     def is_empty(cls):
@@ -954,28 +962,93 @@ class TaskPool:
 
     @classmethod
     def enqueue(cls, task: Task):
-        cls.pending_queue.append(task)
+        with cls._lock:
+            cls.pending_queue.append(task)
+
+    @classmethod
+    def _drain_pending_pool_removals(cls):
+        """Compute thread: apply marks for tasks already resident in ``pool``.
+
+        ``pending_remove`` marks a task for removal; the actual removal is only
+        performed on the compute thread so a scheduler never sees a task vanish
+        underneath it. Tasks still in ``pending_queue`` are dropped by
+        add_all_queued() itself before promotion; this pass only handles ids
+        already in the pool (skipping any that also still sit in the pending
+        queue, so a re-sent duplicate is not resurrected).
+        """
+        with cls._lock:
+            queued_ids = {t.task_id for t in cls.pending_queue}
+            to_remove = [
+                tid
+                for tid in cls.pending_remove
+                if tid in cls.pool and tid not in queued_ids
+            ]
+        for tid in to_remove:
+            # remove() re-acquires _lock to clear the pending_remove mark.
+            cls.remove(tid)
 
     @classmethod
     def add_all_queued(cls):
-        pending_tasks: dict[str, Task] = {}
-        while cls.pending_queue:
-            cur_task = cls.pending_queue.popleft()
-            if cur_task.task_id in pending_tasks:
-                continue
-            if cur_task.task_id in cls.pool:
-                pending_tasks[cur_task.task_id] = cur_task
-            else:
+        cls._drain_pending_pool_removals()
+        with cls._lock:
+            # Collect pending_queue task IDs into a set before the stale scan.
+            # pending_queue is deque[Task]; direct string-in-deque comparison falls
+            # through to object identity (Task has no __eq__) and always returns
+            # False—so we collect IDs into a plain set first.
+            pending_queue_ids = {t.task_id for t in cls.pending_queue}
+            # Clean up stale pending_remove entries that no longer exist in either
+            # pool or pending_queue (the task was removed by another path while the
+            # mark was still pending). Must run BEFORE the while loop — otherwise
+            # a retried request carrying the same task_id would be silently dropped
+            # by the pending_remove check below.
+            stale = [
+                tid
+                for tid in cls.pending_remove
+                if tid not in cls.pool and tid not in pending_queue_ids
+            ]
+            for tid in stale:
+                cls.pending_remove.discard(tid)
+
+            while cls.pending_queue:
+                cur_task = cls.pending_queue.popleft()
+                if cur_task.task_id in cls.pool:
+                    # A task that is already in the pool must not also sit in the
+                    # pending_queue — this is a router-resend duplicate. Drop the
+                    # duplicate silently; the original is already being processed.
+                    logger.warning(
+                        "Task %s found in both pool and pending_queue — dropping duplicate",
+                        cur_task.task_id,
+                    )
+                    continue
+                if cur_task.task_id in cls.pending_remove:
+                    cls.pending_remove.discard(cur_task.task_id)
+                    continue  # marked for removal — drop silently
                 cls.add(cur_task)
-        for re_task in pending_tasks.values():
-            cls.enqueue(re_task)
+
+    @classmethod
+    def mark_pending_remove(cls, task_id: str):
+        """Mark a task for removal; applied on the compute thread.
+
+        ``add_all_queued()`` drains pool-resident ids and drops pending-queue ids
+        before promotion, so this is safe to call from any thread (incl. the
+        scheduler-service thread). Idempotent — repeated calls for the same
+        task_id are harmless.
+        """
+        with cls._lock:
+            cls.pending_remove.add(task_id)
 
     @classmethod
     def remove(cls, task_id: str):
-        assert task_id in cls.pool, "Task not found in pool"
-        if cls.pool.pop(task_id) is None:
-            raise ValueError(f"Task {task_id} not found in pool")
-        cls.id_list.remove(task_id)
+        """Remove a task from the pool. Idempotent: removing an unknown/already
+        removed task is a no-op (design principle 5 — repeated cleanup from
+        multiple trigger paths must be harmless)."""
+        cls.pool.pop(task_id, None)
+        try:
+            cls.id_list.remove(task_id)
+        except ValueError:
+            pass
+        with cls._lock:
+            cls.pending_remove.discard(task_id)
 
 
 class SerializedPackedTasksPayloadType(Enum):

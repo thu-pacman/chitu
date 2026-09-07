@@ -7,11 +7,16 @@ from functools import lru_cache
 from typing import Any, Callable, Mapping, Optional
 from typing_extensions import override
 
+import logging
+
 import torch
 from torch import nn
 import torch.nn.functional as F
 
 from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
+
+logger = logging.getLogger(__name__)
+
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import (
@@ -3207,6 +3212,11 @@ class TransformerDeepSeekV4(Transformer):
             try:
                 expert_id = int(parts[4])
             except ValueError:
+                # Malformed/non-numeric expert id in a checkpoint key; skip this
+                # key but surface it so silent weight loss is diagnosable.
+                logger.warning(
+                    "Skipping checkpoint expert key with non-numeric expert id: %s", k
+                )
                 continue
 
             weight_name, tensor_name = parts[-2], parts[-1]

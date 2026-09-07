@@ -274,10 +274,11 @@ def launch_multi_instance_on_node(
     for t in instance_threads:
         t.join(timeout=10)
 
+    if router_thread is not None:
+        router_thread.join()
+
     if errors:
         raise errors[0]
-    if router_thread is not None and not errors:
-        router_thread.join()
 
 
 def instance_plan_extra_args(

@@ -12,7 +12,6 @@ PD disaggregation Service
 
 import asyncio
 import logging
-import os
 from typing import Optional, Tuple
 import threading
 
@@ -58,6 +57,13 @@ from chitu.serve.common import (
 )
 from .kv_transfer import KVManagerPrefill, KVManagerDecode
 from chitu.serve.event_loop import get_server_event_loop
+from chitu.serve.crash import (
+    MSG_TYPE_HEARTBEAT,
+    maybe_start_test_crash_injection,
+    report_and_exit,
+    start_crash_reporter,
+    is_dying,
+)
 from chitu.chitu_main import chitu_terminate
 from chitu.task import (
     SerializedPackedTasksPayloadType,
@@ -212,8 +218,10 @@ class PDSchedulerService:
                         f"cache {keys} is not supported for PD-disaggregation"
                     )
 
-        # Initialize DP token manager for streaming tokens back to Router
-        # Only needed for Decode-only or Unified mode. Prefill-only does NOT send tokens.
+        # Initialize DP token manager for streaming tokens back to Router.
+        # Decode-only / Unified stream generated tokens; Prefill-only uses the
+        # sender exclusively for request-level errors (capacity / request-build)
+        # via send_error, so it does not register a conflict-free token port.
         if self.pd_mode in (PDSchedulerMode.DECODE_ONLY, PDSchedulerMode.UNIFIED):
             token_manager = await start_dp_token_manager(self.local_instance_id)
             self.scheduler.set_token_manager(token_manager)
@@ -221,7 +229,14 @@ class PDSchedulerService:
             kv_hook = MooncakeKVTransferHook(self.scheduler.kv_manager, "decode")
             Backend.executor.set_kv_hook(kv_hook)
         else:
-            logger.info("prefill-only mode: skip initializing token manager")
+            # Prefill-only: start a token sender for request-level errors. Decode
+            # instances occupy token_port_0..D-1 (role-local), so prefill uses
+            # token_port_{D + role_local} to avoid endpoint collision.
+            prefill_token_offset = len(get_multi_inst_ids_by_role("decode"))
+            token_manager = await start_dp_token_manager(
+                prefill_token_offset + self.local_instance_id
+            )
+            self.scheduler.set_token_manager(token_manager)
             # Inject prefill-side KV hook on all ranks
             kv_hook = MooncakeKVTransferHook(self.scheduler.kv_manager, "prefill")
             Backend.executor.set_kv_hook(kv_hook)
@@ -238,6 +253,10 @@ class PDSchedulerService:
             logger.info("pd compute worker loop started in background thread")
 
         self.running = True
+
+        # Test-injection (off by default): schedule a delayed crash on this role
+        # to E2E-verify the crash protocol.
+        maybe_start_test_crash_injection(self.pd_mode.value)
 
         # Start async tasks
         self.request_task = asyncio.create_task(self._request_handler())
@@ -257,6 +276,9 @@ class PDSchedulerService:
         while True:
             # Step with None to receive tasks via dispatchers' collectives
             status = Backend.executor.step(None)
+            if status == SerializedPackedTasksPayloadType.TerminateBackend:
+                logger.info("tp worker loop received TerminateBackend, exiting")
+                break
             await asyncio.sleep(0)  # avoid busy-waiting
 
     async def stop(self):
@@ -326,6 +348,16 @@ class PDSchedulerService:
         )
         self.stats_socket.connect(f"tcp://{stats_ip}:{stats_port}")
 
+        # Start the P/D -> Router crash reporter (dedicated sync-socket thread).
+        # It delivers the crash notification even if the async service loop dies.
+        # role mirrors PDSchedulerMode.value so the crash notification is
+        # attributable to prefill_only / decode_only / unified.
+        start_crash_reporter(
+            f"tcp://{stats_ip}:{stats_port}",
+            self.local_instance_id,
+            self.pd_mode.value,
+        )
+
         logger.info(
             f"request endpoint {self._request_host_role} at "
             f"{self._request_ip}:{self._request_port}, "
@@ -336,10 +368,12 @@ class PDSchedulerService:
         """Wait until the main loop has broadcast TerminateBackend.
 
         The terminate_engine handler only sets the ``Terminating`` flag; the actual
-        ``chitu_terminate()`` → ``step(TerminateBackend)`` runs on the main
-        ``process_queue`` loop at a step boundary (where the loop is not holding any
-        ZMQ socket), so it never races this thread. Once the main loop sets
-        ``Backend.state = Terminated``, drain is complete and we can send the ack.
+        ``chitu_terminate()`` fills the executor's flag tensor, then the next
+        ``step(None)`` on EVERY rank propagates it via all_reduce and sets
+        ``Backend.state = Terminated``. This runs on the main ``process_queue`` loop
+        at a step boundary (where the loop is not holding any ZMQ socket), so it
+        never races this thread. Once the main loop sets ``Backend.state = Terminated``,
+        drain is complete and we can send the ack.
         """
         deadline = asyncio.get_running_loop().time() + timeout
         while Backend.state != BackendState.Terminated:
@@ -349,8 +383,9 @@ class PDSchedulerService:
                 break
             if asyncio.get_running_loop().time() > deadline:
                 logger.warning(
-                    "timed out waiting for main loop to terminate backend; "
-                    "sending termination ack anyway"
+                    "timed out waiting for main loop to terminate backend "
+                    "(state=%s); sending termination ack anyway",
+                    Backend.state.name,
                 )
                 break
             await asyncio.sleep(0.1)
@@ -466,6 +501,11 @@ class PDSchedulerService:
         logger.info("starting request handler")
 
         while self.running:
+            if is_dying():
+                # During the crash window, reject new requests (do not enter
+                # the pool). The Router fails user-facing in-flight requests.
+                await asyncio.sleep(0.1)
+                continue
             try:
                 if await self.request_socket.poll(timeout=100):  # 100ms timeout
                     request_bytes = await self.request_socket.recv()
@@ -505,8 +545,16 @@ class PDSchedulerService:
                         # Keep torch.profiler start/stop on the inference thread.
                         enqueue_profile_payload(request_data["payload"])
                     else:
+                        # During drain (Terminating), reject new requests — the
+                        # compute thread force-stops all in-flight tasks and any
+                        # newly added request would just be wastefully stopped on
+                        # the next iteration.  Accepting it also risks an orphan
+                        # race with _wait_for_terminate.
+                        if Backend.state == BackendState.Terminating:
+                            logger.debug("Rejected request during drain (Terminating)")
+                            continue
                         await self.scheduler.process_request(request_data)
-            except:
+            except Exception:
                 logger.exception("PDSchedulerService process request failed")
                 raise
 
@@ -551,6 +599,7 @@ class PDSchedulerService:
         main_cache = Backend.cache_dict["main"]
 
         stats = {
+            "msg_type": MSG_TYPE_HEARTBEAT,  # distinguish heartbeat vs crash
             "local_instance_id": self.scheduler.local_instance_id,
             "pd_mode": self.pd_mode.value,
             "max_seq_len": getattr(get_global_args().infer, "max_seq_len", None),
@@ -579,7 +628,13 @@ def init_pd_scheduler(args, rank: int = 0):
 
     service = PDSchedulerService(args, rank)
     if not service.is_pd_public_rank:
-        asyncio.run(_run_existing_service_async(service))
+        try:
+            asyncio.run(_run_existing_service_async(service))
+        except Exception:
+            logger.exception(
+                "PD worker loop (non-public rank) fatal error, entering crash protocol"
+            )
+            report_and_exit("PD worker loop crashed")
         return
 
     ready_event = threading.Event()
@@ -590,8 +645,10 @@ def init_pd_scheduler(args, rank: int = 0):
         try:
             asyncio.run(_run_existing_service_async(service))
         except Exception:
-            logger.exception("PD scheduler service fatal error, exiting process")
-            os._exit(1)
+            logger.exception(
+                "PD scheduler service fatal error, entering crash protocol"
+            )
+            report_and_exit("PD scheduler service crashed")
 
     threading.Thread(target=_run_service, daemon=True).start()
     ready_event.wait()
@@ -658,14 +715,21 @@ async def start_pd_worker_service(args, rank: int = 0):
                 if status == SerializedPackedTasksPayloadType.TerminateBackend:
                     break
                 if Backend.state == BackendState.Terminating:
+                    # NOTE: Backend.state is a per-process class attribute. Under
+                    # torchrun multi-process deployment the scheduler rank sets
+                    # Terminating in _request_handler, but worker ranks never
+                    # see it — they exit purely via the NCCL all_reduce in
+                    # step().  This branch is dead code in every current
+                    # deployment mode (it was left for a potential future
+                    # single-process path, but init_pd_worker always spawns
+                    # a dedicated per-rank process).
                     chitu_terminate()
-                    if Backend.state == BackendState.Terminating:
-                        Backend.state = BackendState.Terminated
-                    break
-                if Backend.state == BackendState.Terminated:
-                    break
+                    # chitu_terminate() dispatches TerminateBackend via ZMQ to
+                    # all ranks. Do NOT break here — the next step(None) serves
+                    # as the sync point; executor.step() then returns
+                    # TerminateBackend.
             await asyncio.sleep(0)
-        except:
+        except Exception:
             logger.exception("start_pd_worker_service exception")
             raise
 
@@ -673,4 +737,8 @@ async def start_pd_worker_service(args, rank: int = 0):
 def init_pd_worker(args, rank: int = 0):
     """Initialize PD worker (entry point)"""
     logger.info(f"initializing pd worker for rank {rank}")
-    asyncio.run(start_pd_worker_service(args, rank))
+    try:
+        asyncio.run(start_pd_worker_service(args, rank))
+    except Exception:
+        logger.exception("PD worker service fatal error, entering crash protocol")
+        report_and_exit("PD worker service crashed")

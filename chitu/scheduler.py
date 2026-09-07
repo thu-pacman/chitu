@@ -15,6 +15,7 @@ from chitu.global_vars import get_global_args, SlotHandle, is_pd_prefill_only
 from chitu.hooks import TaskEvictHook, NoopTaskEvictHook
 from chitu.utils import ceil_div
 from chitu.backend import Backend
+from chitu.testing.exception import test_inject_exception_kv_capacity_exceeded
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
 from chitu.metrics.prometheus_collector import (
     PrometheusMetricsCollector,
@@ -245,6 +246,19 @@ class Scheduler:
         self._pd_ready_exec_delays_ms: list[float] = []
         self._pd_ready_exec_last_log_ts = 0.0
         self._pd_ready_exec_log_interval_s = 5.0
+        # PD request-level error hooks, overridden by PD/DP with their
+        # token-manager-based versions. The default sends the error directly
+        # via stop_stream (single-instance); PD/DP override for router routing.
+        self._pd_ttft_error_callback: Optional[Callable[[str, str], None]] = None
+
+        def _default_capacity_error(request_id: str, message: str) -> None:
+            task = TaskPool.pool.get(request_id)
+            if task is not None and task.req is not None and not task.req.finished:
+                task.req.stop_stream(error=message)
+
+        self._pd_exceeds_capacity_callback: Callable[[str, str], None] = (
+            _default_capacity_error
+        )
 
     def reset_kvcache_block_threshold(self):
         if type(self) == SkewScheduler:
@@ -379,6 +393,10 @@ class Scheduler:
                 prefill任务预留其完成所需容量，以避免互相占用导致的调度死锁。
             pd_prealloc_tokens: pd decode阶段的预留prefill容量token数，只在pd decode调用时生效。
         """
+        capacity_status = test_inject_exception_kv_capacity_exceeded()
+        if capacity_status is not None:
+            return capacity_status
+
         is_pd_decode_check = pd_prealloc_tokens != -1
         target_len = (
             pd_prealloc_tokens
@@ -455,13 +473,30 @@ class Scheduler:
 
             task.set_stopped()
             req.finish_reason = "error"
-            sender = getattr(req.async_stream, "token_sender", None)
-            if sender is not None:
-                sender.send_error(req.request_id, "TTFT timeout")
+            # PD hook (injected in PREFILL_ONLY): report the TTFT failure with the
+            # prefill_failed flag so the paired Decode is notified — without it
+            # D waits until the wait-for-KV timeout. When the hook is present it
+            # REPLACES the plain sender path (which lacks the flag).
+            cb = self._pd_ttft_error_callback
+            if cb is not None:
+                try:
+                    cb(req.request_id, "TTFT timeout")
+                except Exception:
+                    logger.exception(
+                        "PD TTFT-error callback failed for task %s", task_id
+                    )
+                # Fail-safe: signal stop regardless of cb() outcome, so the user
+                # stream always receives an error even if the callback threw.
                 req.async_stream.stop_signal = True
                 req.completion_time = time.monotonic()
             else:
-                req.stop_stream(error="TTFT timeout")
+                sender = getattr(req.async_stream, "token_sender", None)
+                if sender is not None:
+                    sender.send_error(req.request_id, "TTFT timeout")
+                    req.async_stream.stop_signal = True
+                    req.completion_time = time.monotonic()
+                else:
+                    req.stop_stream(error="TTFT timeout")
             TaskPool.remove(task_id)
             inc_request_timeouts("ttft_scheduler")
             logger.warning(
@@ -478,10 +513,31 @@ class Scheduler:
             return
 
         task.set_stopped()
-        if task.req is not None:
-            task.req.finish_reason = "length"
-            if not task.req.finished:
-                task.req.stop_stream()
+
+        # ============================================================
+        # PD disaggregation hook (injected by PDInstanceRequestManager.
+        # set_token_manager, prefill-only).
+        # Single-frame send: the error callback delivers an error frame to
+        # the Router (with prefill_failed=True) — that is the ONE frame
+        # Router needs. When cb is present it REPLACES the stop_stream()
+        # finish-frame path, matching the TTFT pattern.
+        # No-op outside PD prefill.
+        # ============================================================
+        cb = self._pd_exceeds_capacity_callback
+        if cb is not None:
+            try:
+                cb(
+                    task_id,
+                    f"Task {task_id} exceeds KV cache capacity and was terminated",
+                )
+            except Exception:
+                logger.exception(
+                    "PD capacity-error callback failed for task %s", task_id
+                )
+            if task.req is not None:
+                task.req.finish_reason = "length"
+                task.req.async_stream.stop_signal = True
+                task.req.completion_time = time.monotonic()
 
         has_kv_cache = any(
             task_id in cache_manager.task_to_cache_ids

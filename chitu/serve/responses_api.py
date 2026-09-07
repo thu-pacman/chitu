@@ -487,7 +487,7 @@ def normalize_text_config(
 
 
 def responses_input_to_internal(
-    input_value: str | list[ResponsesInputItem | dict[str, Any]]
+    input_value: str | list[ResponsesInputItem | dict[str, Any]],
 ) -> list[dict[str, Any]]:
     if isinstance(input_value, str):
         return [{"role": "user", "content": input_value}]

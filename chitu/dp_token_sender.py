@@ -20,6 +20,7 @@ import os
 from chitu.distributed.coordinator import get_endpoint
 from chitu.global_vars import get_global_args
 from chitu.metrics.prometheus_collector import inc_completed_requests, observe_ttft
+from chitu.serve.crash import report_and_exit
 from chitu.task import Task, UserRequest
 from chitu.trace import Trace
 from chitu.async_stream import AsyncDataStream
@@ -115,9 +116,9 @@ class DPTokenSender:
                         self.socket.send(data, flags=0)
                 except Exception:
                     logger.exception(
-                        "DPTokenSender sender thread fatal error, exiting process"
+                        "DPTokenSender sender thread fatal error, entering crash protocol"
                     )
-                    os._exit(1)
+                    report_and_exit("DPTokenSender sender thread crashed")
 
         self._sender_thread = threading.Thread(target=_loop, daemon=True)
         self._sender_thread.start()
@@ -194,8 +195,22 @@ class DPTokenSender:
 
         self._send_data(data)
 
-    def send_error(self, request_id: str, error_message: str):
-        """Send error signal"""
+    def send_error(
+        self,
+        request_id: str,
+        error_message: str,
+        prefill_failed: bool = False,
+        decode_failed: bool = False,
+    ):
+        """Send error signal
+
+        ``prefill_failed`` marks a Prefill-side request-level failure (whitelist):
+        the Router forwards ``pd_prefill_fail`` to the paired Decode instance so it
+        stops waiting for KV that will never arrive.
+        ``decode_failed`` marks a Decode-side request-level failure: the Router
+        forwards ``pd_decode_fail`` to the paired Prefill so it stops waiting for a
+        DecodeAllocated that will never come.
+        """
         # Clean up caches for this request
         self._remove_request(request_id)
         data = dict(
@@ -205,6 +220,10 @@ class DPTokenSender:
             instance_id=self.instance_id,
             timestamp=time.time(),
         )
+        if prefill_failed:
+            data["prefill_failed"] = True
+        if decode_failed:
+            data["decode_failed"] = True
 
         self._send_data(data)
 

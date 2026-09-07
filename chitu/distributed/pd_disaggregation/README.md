@@ -393,7 +393,7 @@ multi_inst:
       decode_prealloc_reserved_tokens: 0
       decode_max_running_tasks_per_dp: null
       prefill_bootstrap_poll_interval_s: 0.01
-      prefill_wait_transfer_info_timeout_s: 2400.0
+      prefill_wait_timeout_s: 2400.0
 
   router:
     is_router: True                # Router 进程设为 True，P/D 设为 False

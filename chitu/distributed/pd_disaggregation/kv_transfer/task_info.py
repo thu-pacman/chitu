@@ -60,9 +60,6 @@ class TaskInfo:
     done_count: int = 0
     """RankTransferDone counter."""
 
-    is_prefill_transfer_completed: bool = False
-    """True if all P ranks have completed RDMA for this request."""
-
     rank_bytes: dict[str, int] = field(default_factory=dict)
     """Per-session sent bytes, accumulated from RankTransferDone (P side)."""
 
@@ -88,6 +85,10 @@ class TaskInfo:
     prefill_done_event: threading.Event = field(default_factory=threading.Event)
     """Set when PrefillDone is received; used for thread-safe synchronization
     between the ZMQ recv thread and the compute thread."""
+    prefill_failed: bool = False
+    """Set when the Prefill side reports a request-level failure: the
+    compute thread's recv_kv_cache_and_insert must wake and fail this request
+    as request-level instead of timing out and crashing."""
     is_decode_prepare_received: bool = False
     is_decode_allocated_sent: bool = False
 

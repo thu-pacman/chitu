@@ -8,6 +8,11 @@ pd_test:
   req_timeout: 300
   output_len: 128
 
+# E2E exception injection (feat-req-error). Set to an injection name
+# (e.g. request_build_failure, delayed_crash) to activate. Empty = off.
+test:
+  inject_exception: ""
+
 # Sub-configs for `test/single_req_test.py` and `test/single_req_compare.py`.
 request:
   prompt_tokens_len: -1  # use for performance testing, -1 means use real requests.

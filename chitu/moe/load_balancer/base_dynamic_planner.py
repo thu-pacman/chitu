@@ -296,11 +296,10 @@ class BaseMoELoadPlanner(ABC):
             return
         final = self._pending_migration.get("finalize")
         if final is not None:
-            try:
-                if callable(final):
-                    final()
-            except Exception as e:
-                logger.warning(f"finalize failed for rank {self._ep_rank}: {e}")
+            # A failed finalize (P2P work or weight write-back) means a half-applied
+            # expert migration -> re-raise so the process crashes via the unified
+            # protocol rather than committing a corrupt mapping.
+            final()
         all_actions = self._pending_migration.get("actions", [])
         self.apply_actions(all_actions)
         self._pending_migration = {}

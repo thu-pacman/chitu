@@ -8,10 +8,13 @@ import numpy as np
 
 from chitu.backend import Backend
 from chitu.kv_cache.kv_cache import PagedKVCache
+from chitu.serve.crash import report_and_exit
+from chitu.testing.exception import (
+    test_inject_exception_mark_prefill_failed,
+    test_inject_exception_kv_wait_timeout,
+)
 from chitu.trace import Trace
 from chitu.metrics.prometheus_collector import inc_kv_transfer_failures
-
-from chitu.kv_cache.kv_cache import PagedKVCache
 
 from chitu.utils import ceil_div
 
@@ -40,6 +43,11 @@ class KVManagerDecode(KVManagerBase):
 
         # Main rank should hold the transfer done state for all requests
         self._transfer_done_states: dict[str, TransferStatus] = {}
+
+        # Tracks prefill failures that arrived BEFORE the TaskInfo was created
+        # (pd_prefill_fail raced ahead of pd_request over ZMQ). Entries are
+        # checked and consumed in handle_decode_prepare when TaskInfo is created.
+        self._early_prefill_failures: set[str] = set()
 
         self.endpoints = DecodeEndpoints(self._decode_scheduler_id)
         self._prefill_endpoints = {
@@ -89,6 +97,15 @@ class KVManagerDecode(KVManagerBase):
         info.cache_manager_new_block_ids = msg.new_cache_ids
         info.cache_manager_hit_block_counts = msg.cache_manager_hit_block_counts
         info.dp_rank = msg.dp_rank
+
+        # If pd_prefill_fail arrived before this DecodePrepare (raced ahead of
+        # pd_request over ZMQ), apply the deferred prefill failure now.
+        if msg.req_id in self._early_prefill_failures:
+            self._early_prefill_failures.discard(msg.req_id)
+            info.prefill_failed = True
+            info.prefill_done_event.set()
+
+        test_inject_exception_mark_prefill_failed(info)
 
         if not info.is_decode_prepare_received:
             info.is_decode_prepare_received = True
@@ -207,11 +224,18 @@ class KVManagerDecode(KVManagerBase):
             actual = msg.rank_bytes[self.session_id]
             expected = info.recv_bytes
             if actual != expected:
+                # Bytes mismatch means the decode side would insert corrupted KV
+                # pages. This is data corruption, not a recoverable request-level
+                # fault -> crash per the unified protocol.
                 logger.error(
                     f"req_id={msg.req_id}: transfer bytes mismatch "
                     f"for session {self.session_id}: sent={actual} recv_expected={expected}"
                 )
                 inc_kv_transfer_failures("decode")
+                report_and_exit(
+                    f"KV transfer bytes mismatch req_id={msg.req_id} "
+                    f"session={self.session_id} sent={actual} expected={expected}"
+                )
 
         info.first_token = msg.first_token
         info.num_hit_tokens = msg.num_hit_tokens
@@ -227,6 +251,8 @@ class KVManagerDecode(KVManagerBase):
         Returns (first_tokens, cached_hit_tokens).
         """
         logger.debug(f"recv_kv_cache_and_insert {req_id=}")
+
+        test_inject_exception_kv_wait_timeout(req_id)
 
         # Wait for the recv thread to process PrefillDone.
         info = self._info(req_id)
@@ -278,11 +304,42 @@ class KVManagerDecode(KVManagerBase):
     def is_prefill_done(self, req_id: str):
         return self._transfer_done_states.get(req_id, TransferStatus())
 
+    def is_prefill_failed(self, req_id: str) -> bool:
+        """Whether the Prefill side reported a request-level failure for this
+        request (its KV will never arrive). Consumed by the decode scheduler to
+        stop such a request before it is promoted into a decode batch."""
+        info = self._info(req_id, create=False)
+        return info is not None and info.prefill_failed
+
+    def cancel_prefill_wait(self, req_id: str) -> None:
+        """Mark this request as prefill-failed.
+
+        Called when the Prefill side reports a request-level failure. The decode
+        scheduler's is_prefill_failed() then fails the request before it is
+        promoted into a decode batch.
+        """
+        info = self._info(req_id, create=False)
+        if info is None:
+            # TaskInfo not yet created — pd_prefill_fail arrived before
+            # the pd_request message. Record the failure and apply it when
+            # handle_decode_prepare creates the TaskInfo.
+            self._early_prefill_failures.add(req_id)
+            return
+        info.prefill_failed = True
+        info.prefill_done_event.set()
+
     def remove_request(self, request_id: str):
+        # Do NOT discard _early_prefill_failures: cancel_prefill_wait() adds
+        # the marker, then stop_request() -> remove_request() runs in the same
+        # tick. The marker is consumed in handle_decode_prepare() (recv thread).
         self._remove_info(request_id)
         self._transfer_done_states.pop(request_id, None)
 
     def remove_request_all_rank(self, request_id: str):
-        self.endpoints.decode_prepare.send(
-            ProtocolSerializer.pack(RemoveRequest(req_id=request_id))
-        )
+        # Local cleanup first, then broadcast. Relay loopback double-delivers to
+        # ctrl rank (remove_request is idempotent). Slave ranks do local cleanup only.
+        self.remove_request(request_id)
+        if self.is_ctrl_rank:
+            self.endpoints.decode_prepare.send(
+                ProtocolSerializer.pack(RemoveRequest(req_id=request_id))
+            )

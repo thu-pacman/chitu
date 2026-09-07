@@ -855,8 +855,14 @@ class ExpertDataDispatcher(TasksDispatcher):
             return True
         try:
             return bool(self.socket.poll(timeout=0, flags=zmq.POLLIN))
-        except Exception:
-            return True
+        except Exception as e:
+            # Socket fault on a worker rank: returning True would make the loop
+            # proceed to recv and block/hang. Re-raise so the worker loop crashes
+            # via the unified protocol instead of silently deadlocking.
+            logger.exception(
+                f"[EXECUTOR] has_pending_metadata socket poll failed on rank {self.rank}: {e}"
+            )
+            raise
 
     def _create_empty_recv_results(self, tasks: DPPackedTasks) -> PackedTasksResult:
         """Return a PackedTasksResult pre-allocated to total bs across all DP ranks.
@@ -1182,16 +1188,22 @@ class Executor:
         # 如果sysnc没有成功，不要开启下一步的trigger
         if not self._lb_enabled:
             return
+        if not (self._lb_every > 0 and (self._lb_step % self._lb_every == 0)):
+            return
         try:
-            if self._lb_every > 0 and (self._lb_step % self._lb_every == 0):
-                self._lb_planner.aggregate_expert_stats_for_current_batch()
-                self._lb_planner.generate_actions_and_order()
-
+            self._lb_planner.aggregate_expert_stats_for_current_batch()
         except Exception as e:
+            # Stats-collection fault is transient (before migration): skip window.
             logger.warning(
                 f"Executor LB trigger failed at step {self._lb_step} on rank {self.rank}: {e}"
             )
-            pass
+            # Reset lock_stats set by aggregate_expert_stats_for_current_batch.
+            self._lb_planner.lock_stats = False
+            return
+        # generate_actions_and_order() launches the migration (get_params +
+        # batch_isend_irecv); a failure here leaves the peer blocked in P2P wait,
+        # so it must propagate to the crash protocol.
+        self._lb_planner.generate_actions_and_order()
 
     def _lb_sync(self) -> None:
         if not self._lb_enabled:
@@ -1199,10 +1211,13 @@ class Executor:
         try:
             self._lb_planner.commit_ready_layers()
         except Exception as e:
-            logger.warning(
+            # LB sync fault (commit/flip). A silent skip can half-apply an expert
+            # migration (weights moved but mapping not flipped, or vice versa) ->
+            # re-raise to crash per the unified protocol.
+            logger.exception(
                 f"Executor LB sync failed at step {self._lb_step} on rank {self.rank}: {e}"
             )
-            pass
+            raise
 
     def _prepare_tokens_decode(self, tasks: PackedTasks):
         if not get_pp_group().is_first_rank:

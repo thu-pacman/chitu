@@ -294,7 +294,7 @@ def _render_model_table(
 
 
 def _route_groups(
-    openapi: dict[str, Any]
+    openapi: dict[str, Any],
 ) -> dict[str, list[tuple[str, str, dict[str, Any]]]]:
     groups = {section: [] for section in SECTION_ORDER}
     for path, path_item in openapi.get("paths", {}).items():

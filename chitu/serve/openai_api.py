@@ -374,9 +374,15 @@ class AsyncResponse:
                     f"Completed_{self.id}: {self.req.output}, token_len: {self.async_stream.tokens_len}\n"
                 )
             except Exception as e:
+                # Request-level failure (tool-call parse, or a request
+                # error delivered via async_stream.error_message). Return an SSE
+                # error chunk and do NOT emit [DONE] — the client must not treat
+                # the error as a normal completion.
                 logger.exception("Error in chat completion stream generator.")
                 data = json.dumps({"detail": str(e)})
                 yield f"data: {data}\n\n"
+                return
+
             yield "data: [DONE]\n\n"
 
         return stream_response()
@@ -683,9 +689,13 @@ class CompletionAsyncResponse:
                     f"Completed_{self.id}: token_len: {self.async_stream.tokens_len}\n"
                 )
             except Exception as e:
+                # Request-level failure. Return an SSE error chunk and do NOT
+                # emit [DONE] — the client must not treat the error as a normal
+                # completion.
                 logger.exception("Error in completion stream generator.")
                 data = {"detail": str(e)}
                 yield f"data: {json.dumps(data)}\n\n"
+                return
             yield "data: [DONE]\n\n"
 
         return stream_response()
