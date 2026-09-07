@@ -465,6 +465,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
         cached_blocks = self.task_to_token_blocks[task.task_id]
         num_cached_blocks = len(cached_blocks)
         identities = self._make_task_identities(task)
+        valid_kv_len = task.kv_cache_len_used_in_completed_steps
+        prefix_ready = task.task_id not in self._deferred_prefix_publish
 
         # 更新blockruntime、self.active_blocks、self.cached_idle_blocks以及self.identity_runtime_pool
         for i in range(num_cached_blocks - 1, -1, -1):
@@ -483,7 +485,11 @@ class PagedKVCacheManager(KVCacheManagerBase):
                 self.cached_idle_blocks[runtime.cache_idx] = runtime
                 self.cached_idle_blocks.move_to_end(runtime.cache_idx, last=True)
 
-            if blk_hash is not None:
+            if (
+                blk_hash is not None
+                and prefix_ready
+                and (i + 1) * self.block_size <= valid_kv_len
+            ):
                 if (
                     blk_hash not in self.identity_runtime_pool
                     and self.enable_prefix_caching
