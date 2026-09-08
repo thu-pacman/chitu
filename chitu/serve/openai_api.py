@@ -706,6 +706,17 @@ class CompletionAsyncResponse:
         self.id = req.request_id
         self.async_stream = req.async_stream
 
+    def _usage(self):
+        usage = {
+            "prompt_tokens": self.req.prompt_len,
+            "completion_tokens": self.async_stream.tokens_len,
+            "total_tokens": self.req.prompt_len + self.async_stream.tokens_len,
+        }
+        cached = self.async_stream.input_cached_tokens
+        if cached is not None:
+            usage["prompt_tokens_details"] = {"cached_tokens": cached}
+        return usage
+
     def stream_generator(self, *, include_usage: bool):
         stream = self.async_stream
 
@@ -729,14 +740,7 @@ class CompletionAsyncResponse:
                         yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
                 finish_reason = self.req.finish_reason or "stop"
-                usage = None
-                if include_usage:
-                    usage = {
-                        "prompt_tokens": self.req.prompt_len,
-                        "completion_tokens": self.async_stream.tokens_len,
-                        "total_tokens": self.async_stream.tokens_len
-                        + self.req.prompt_len,
-                    }
+                usage = self._usage() if include_usage else None
                 chunk = CompletionResponse(
                     id=self.id,
                     model=self.model,
@@ -788,11 +792,7 @@ class CompletionAsyncResponse:
                     "finish_reason": self.req.finish_reason or "stop",
                 }
             ],
-            usage={
-                "prompt_tokens": self.req.prompt_len,
-                "completion_tokens": self.async_stream.tokens_len,
-                "total_tokens": self.async_stream.tokens_len + self.req.prompt_len,
-            },
+            usage=self._usage(),
         )
         logger.debug(
             f"Completed_{self.id}: token_len: {self.async_stream.tokens_len}\n"
