@@ -298,6 +298,12 @@ Acceptable values: null, /path/to/your/tokenizer
 
 Configs for how chitu responses to HTTP requests.
 
+### Argument `serve.model_alias`
+
+Optional additional API model name. Does not change loaded weights.
+
+*Default: `null`.*
+
 ### Argument `serve.host`
 
 HTTP service IP. Set this according to your network.

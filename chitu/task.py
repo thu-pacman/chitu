@@ -152,7 +152,9 @@ class UserRequest:
         self.async_stream = AsyncDataStream(self.enable_thinking)
         self.finish_reason = None
         self.num_output_tokens = 0
-        self.num_hit_tokens = 0  # 该请求被击中的token总数（全量）
+        # Cache hits in the current prefill attempt; reset on eviction before
+        # first output and freeze once output begins.
+        self.num_hit_tokens: Optional[int] = 0
 
         # test information related
         self._test_flag = False
@@ -424,7 +426,18 @@ class UserRequest:
         self.completion_time = time.monotonic()
         if self.save_trace_dir:
             self.save_trace_data()
+        if self.num_hit_tokens is not None:
+            self.async_stream.set_input_cached_tokens(self.num_hit_tokens)
         self.async_stream.send_stop_signal(error=error)
+
+    def record_prompt_cache_hit(self, start: int, end: int):
+        if self.async_stream.input_cached_tokens is not None:
+            return
+        end = min(end, self.prompt_len)
+        if start >= end:
+            return
+        if self.num_hit_tokens is not None:
+            self.num_hit_tokens += end - start
 
     def add_data(
         self,
@@ -438,6 +451,8 @@ class UserRequest:
             return
         if not isinstance(tokens, list):
             tokens = [tokens]
+        if tokens and self.num_hit_tokens is not None:
+            self.async_stream.set_input_cached_tokens(self.num_hit_tokens)
         for token in tokens:
             self.generated_tokens.append(token)
             logger.debug(f"Request {self.request_id} adds a new token: {token}")
@@ -615,7 +630,10 @@ class Task:
         # Per-step incremental hit tokens; clamp negatives to avoid metric drift.
         self.inc_hit_tokens = max(0, int(num))
         if self.inc_hit_tokens > 0 and self.req is not None:
-            self.req.num_hit_tokens += self.inc_hit_tokens
+            self.req.record_prompt_cache_hit(
+                self.consumed_req_tokens,
+                self.consumed_req_tokens + self.inc_hit_tokens,
+            )
 
     def need_remove(self):
         # reserved as interface

@@ -142,13 +142,10 @@ class TokenRouter:
         request: UserRequest,
         finish_reason: Optional[str] = None,
         error: Optional[str] = None,
-        num_hit_tokens: Optional[int] = None,
     ):
         """Finalize request, stop output stream and remove request data in all DP components"""
         if finish_reason is not None:
             request.finish_reason = finish_reason
-        if num_hit_tokens is not None:
-            request.num_hit_tokens = num_hit_tokens
         was_finished = request.finished
         request.stop_stream(error=error)
         if not was_finished and request.completion_time > 0:
@@ -238,6 +235,13 @@ class TokenRouter:
             return
 
         # Process based on token type
+        if token_data.get("type") in {"token", "finish"}:
+            # Input statistics must precede add_data's consumer wakeup. An old
+            # sender without this field has unknown input usage, not zero hits.
+            if req.async_stream.input_cached_tokens is None:
+                req.num_hit_tokens = token_data.get("input_cached_tokens")
+                if req.num_hit_tokens is not None:
+                    req.async_stream.set_input_cached_tokens(req.num_hit_tokens)
         if token_data.get("type") == "token":
             # token contains decoded text
             tokens = token_data.get("tokens")
@@ -322,7 +326,6 @@ class TokenRouter:
             self.finish_request(
                 req,
                 finish_reason=finish_reason,
-                num_hit_tokens=token_data.get("num_hit_tokens"),
             )
 
         elif token_data.get("type") == "evict":
@@ -365,7 +368,6 @@ class TokenRouter:
             self.finish_request(
                 req,
                 error=error_message,
-                num_hit_tokens=token_data.get("num_hit_tokens"),
             )
 
         elif token_data.get("type") == "trace":

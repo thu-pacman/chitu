@@ -156,6 +156,7 @@ class KVManagerPrefill(KVManagerBase):
                     req_id=info.req_id,
                     first_token=info.first_token,
                     num_hit_tokens=info.num_hit_tokens,
+                    input_cached_tokens=task.req.num_hit_tokens,
                     rank_bytes=info.rank_bytes,
                     trace_dict={} if info.trace is None else info.trace.dump(),
                 )

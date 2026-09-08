@@ -10,7 +10,6 @@ from typing import Any
 
 from pydantic import Field
 
-
 _UNSET = object()
 
 
@@ -137,24 +136,33 @@ ENDPOINT_EXTRA_SECTIONS = {
 }
 
 
+MODEL_NAME_NOTE = {
+    "en": "Use `serve.model_alias` to configure one additional model name, for example `serve.model_alias=GLM-5.3`. `/v1/models` lists the loaded name and the optional alias without duplicates. Generation endpoints accept either name and echo it unchanged; omission uses `models.name`. The alias does not change loaded weights.",
+    "zh": "通过单字符串 `serve.model_alias` 配置一个额外模型名，例如 `serve.model_alias=GLM-5.3`。`/v1/models` 列出实际模型名和可选别名，不重复列出同名项。生成接口接受这两个名称并原样回显；省略时使用 `models.name`。别名不改变权重加载。",
+}
+
+
 ENDPOINT_NOTES = {
     "/v1/chat/completions": [
+        MODEL_NAME_NOTE,
         {
             "en": "For adapting `tools`, `tool_choice`, and constrained decoding to a new model, see the [Tool Calling Adaptation Guide](./TOOL_CALL_ADAPTATION.md).",
             "zh": "为新模型适配 `tools`、`tool_choice` 和约束解码时，请参见 [工具调用适配指南](./TOOL_CALL_ADAPTATION.md)。",
-        }
+        },
     ],
     "/v1/responses": [
+        MODEL_NAME_NOTE,
         {
             "en": "Responses tool definitions are normalized into Chitu's internal function tool format. For new model adaptation, see the [Tool Calling Adaptation Guide](./TOOL_CALL_ADAPTATION.md).",
             "zh": "Responses 工具定义会归一成赤兔内部 function tool 格式。新模型适配方式请参见 [工具调用适配指南](./TOOL_CALL_ADAPTATION.md)。",
-        }
+        },
     ],
     "/v1/messages": [
+        MODEL_NAME_NOTE,
         {
             "en": "Anthropic tool definitions are converted into Chitu's internal function tool format. For new model adaptation, see the [Tool Calling Adaptation Guide](./TOOL_CALL_ADAPTATION.md).",
             "zh": "Anthropic 工具定义会转换成赤兔内部 function tool 格式。新模型适配方式请参见 [工具调用适配指南](./TOOL_CALL_ADAPTATION.md)。",
-        }
+        },
     ],
     "/profile/start": [
         {

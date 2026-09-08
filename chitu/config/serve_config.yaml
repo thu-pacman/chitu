@@ -236,6 +236,8 @@ models:
 
 #: Configs for how chitu responses to HTTP requests.
 serve:
+  #: Optional additional API model name. Does not change loaded weights.
+  model_alias: null
   #: HTTP service IP. Set this according to your network.
   host: 0.0.0.0
 

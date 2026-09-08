@@ -14,7 +14,7 @@ Chitu provides OpenAI-compatible, Anthropic-compatible, tokenization, lifecycle,
 GET /v1/models
 ````
 
-Returns the list of models currently loaded by this server.
+Returns the loaded model name and its configured aliases.
 
 No request body parameters.
 
@@ -32,6 +32,7 @@ Creates a model response for the given chat conversation.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
+| `model` | `string` \| `null` | `null` | Loaded model name or configured alias. Defaults to the loaded name. |
 | `conversation_id` | `string` | — | Unique identifier for the conversation. Generated automatically when omitted. |
 | `messages` | `list[Message]` | **required** | List of message objects composing the conversation. |
 | `tools` | `list[object]` | `[]` | Tool or function definitions available for the model to call. |
@@ -42,7 +43,7 @@ Creates a model response for the given chat conversation.
 | `max_completion_tokens` | `integer` \| `null` | `null` | Maximum number of tokens to generate. |
 | `max_tokens` | `integer` \| `null` | `null` | Deprecated alias of max_completion_tokens. If both are set, they must have the same value. |
 | `stream` | `boolean` | `false` | Whether to stream the response using SSE. |
-| `stream_options` | `object` | `{"include_usage": true}` |  |
+| `stream_options` | `object` | `{"include_usage": false}` |  |
 | `temperature` | `number` | `0.8` | Sampling temperature. Higher values make output more random. |
 | `top_p` | `number` | `0.9` | Nucleus sampling threshold. |
 | `top_k` | `integer` | `50` | Top-k sampling value. Use -1 to disable top-k filtering. |
@@ -108,11 +109,13 @@ Creates a model response for the given chat conversation.
 |---|---|---|---|
 | `name` | `string` | **required** |  |
 
-#### `StreamOptions` Object
+#### `ChatStreamOptions` Object
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `include_usage` | `boolean` | `true` | Whether to include token usage information in the stream. |
+| `include_usage` | `boolean` | `false` | Whether to include token usage information in the stream. Defaults to false. |
+
+Use `serve.model_alias` to configure one additional model name, for example `serve.model_alias=GLM-5.3`. `/v1/models` lists the loaded name and the optional alias without duplicates. Generation endpoints accept either name and echo it unchanged; omission uses `models.name`. The alias does not change loaded weights.
 
 For adapting `tools`, `tool_choice`, and constrained decoding to a new model, see the [Tool Calling Adaptation Guide](./TOOL_CALL_ADAPTATION.md).
 
@@ -142,7 +145,7 @@ Completes the user's raw sequence without treating it as chat, so no chat templa
 | `min_batch_size` | `integer` | `1` | Minimum batch size for processing this request. |
 | `ignore_eos` | `boolean` \| `null` | `null` | vLLM/SGLang-compatible inverse of stop_with_eos. ignore_eos=True forces generation to max_tokens. |
 | `stop_with_eos` | `boolean` \| `null` | `null` | Whether generation should stop at the EOS token. Cannot conflict with ignore_eos. |
-| `model` | `string` \| `null` | `null` | Model identifier accepted for OpenAI compatibility. |
+| `model` | `string` \| `null` | `null` | Loaded model name or configured alias. Defaults to the loaded name. |
 | `extra_body` | `object` | `{}` | Extra compatibility parameters. Supported keys can override matching top-level fields. |
 | `ttft_timeout_s` | `number` \| `null` | `null` | Time-to-first-token timeout in seconds. Requests that wait too long to satisfy their TTFT requirement can be terminated to leave capacity for other requests that may still return in time. |
 
@@ -287,6 +290,8 @@ Minimal subset of the OpenAI Responses API for text generation, streaming, funct
 | Built-in OpenAI tools (`web_search`, `file_search`, etc.) | Not supported. |
 | True multimodal understanding | Not supported. |
 
+Use `serve.model_alias` to configure one additional model name, for example `serve.model_alias=GLM-5.3`. `/v1/models` lists the loaded name and the optional alias without duplicates. Generation endpoints accept either name and echo it unchanged; omission uses `models.name`. The alias does not change loaded weights.
+
 Responses tool definitions are normalized into Chitu's internal function tool format. For new model adaptation, see the [Tool Calling Adaptation Guide](./TOOL_CALL_ADAPTATION.md).
 
 ## Anthropic-Compatible API
@@ -339,6 +344,7 @@ Creates a model response using the Anthropic Messages-compatible API.
 |---|---|---|---|
 | `type` | `thinking` | `"thinking"` | Thinking content block. |
 | `thinking` | `string` | **required** | Thinking content. |
+| `signature` | `string` | `""` | Compatibility placeholder; Chitu does not validate thinking signatures. |
 
 #### `AnthropicToolUseBlock` Object
 
@@ -372,6 +378,8 @@ Creates a model response using the Anthropic Messages-compatible API.
 | `type` | `auto` \| `any` \| `tool` \| `none` | **required** | Tool choice mode: "auto", "any", "tool", or "none". "any" maps to a required tool call. |
 | `disable_parallel_tool_use` | `boolean` \| `null` | `false` | Whether to disable parallel tool use. |
 | `name` | `string` \| `null` | `null` | Tool name required when type is "tool". |
+
+Use `serve.model_alias` to configure one additional model name, for example `serve.model_alias=GLM-5.3`. `/v1/models` lists the loaded name and the optional alias without duplicates. Generation endpoints accept either name and echo it unchanged; omission uses `models.name`. The alias does not change loaded weights.
 
 Anthropic tool definitions are converted into Chitu's internal function tool format. For new model adaptation, see the [Tool Calling Adaptation Guide](./TOOL_CALL_ADAPTATION.md).
 

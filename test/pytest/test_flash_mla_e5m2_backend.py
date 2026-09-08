@@ -22,7 +22,6 @@ from chitu.kv_cache.registry import (
 from chitu.models.model_deepseek_v3 import AttentionDeepSeekV3
 from chitu.utils import try_import_opt_dep
 
-
 flash_mla, has_flash_mla = try_import_opt_dep("flash_mla", "flash_mla")
 
 

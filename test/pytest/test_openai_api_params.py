@@ -227,7 +227,7 @@ class TestChatRequest:
 
     def test_stream_options_default(self):
         req = ChatRequest(**self.MINIMAL_PAYLOAD)
-        assert req.stream_options.include_usage is True
+        assert req.stream_options.include_usage is False
 
     def test_stream_options_custom(self):
         req = ChatRequest(

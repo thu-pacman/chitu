@@ -14,7 +14,7 @@
 GET /v1/models
 ````
 
-返回当前服务已加载的模型列表。
+返回当前加载的模型名称及其已配置的有效别名。
 
 无请求体参数。
 
@@ -32,6 +32,7 @@ POST /v1/chat/completions
 
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
+| `model` | `string` \| `null` | `null` | 已加载模型名或已配置的别名。省略时使用已加载模型名。 |
 | `conversation_id` | `string` | — | 对话的唯一标识符。省略时会自动生成。 |
 | `messages` | `list[Message]` | **必填** | 组成对话的消息对象列表。 |
 | `tools` | `list[object]` | `[]` | 模型可调用的工具或函数定义列表。 |
@@ -42,7 +43,7 @@ POST /v1/chat/completions
 | `max_completion_tokens` | `integer` \| `null` | `null` | 最大生成 token 数。 |
 | `max_tokens` | `integer` \| `null` | `null` | max_completion_tokens 的已弃用别名。若两者同时设置，值必须一致。 |
 | `stream` | `boolean` | `false` | 是否使用 SSE 流式返回响应。 |
-| `stream_options` | `object` | `{"include_usage": true}` |  |
+| `stream_options` | `object` | `{"include_usage": false}` |  |
 | `temperature` | `number` | `0.8` | 采样温度。值越高，输出越随机。 |
 | `top_p` | `number` | `0.9` | 核采样阈值。 |
 | `top_k` | `integer` | `50` | Top-k 采样值。设为 -1 可禁用 top-k 过滤。 |
@@ -108,11 +109,13 @@ POST /v1/chat/completions
 |---|---|---|---|
 | `name` | `string` | **必填** |  |
 
-#### `StreamOptions` 对象
+#### `ChatStreamOptions` 对象
 
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `include_usage` | `boolean` | `true` | 是否在流式返回中包含 token 用量信息。 |
+| `include_usage` | `boolean` | `false` | 是否在流式返回中包含 token 用量信息，默认关闭。 |
+
+通过单字符串 `serve.model_alias` 配置一个额外模型名，例如 `serve.model_alias=GLM-5.3`。`/v1/models` 列出实际模型名和可选别名，不重复列出同名项。生成接口接受这两个名称并原样回显；省略时使用 `models.name`。别名不改变权重加载。
 
 为新模型适配 `tools`、`tool_choice` 和约束解码时，请参见 [工具调用适配指南](./TOOL_CALL_ADAPTATION.md)。
 
@@ -142,7 +145,7 @@ POST /v1/completions
 | `min_batch_size` | `integer` | `1` | 处理该请求时使用的最小 batch size。 |
 | `ignore_eos` | `boolean` \| `null` | `null` | 兼容 vLLM/SGLang 的 stop_with_eos 反向参数。ignore_eos=True 会强制生成到 max_tokens。 |
 | `stop_with_eos` | `boolean` \| `null` | `null` | 是否在 EOS token 处停止生成。不能与 ignore_eos 冲突。 |
-| `model` | `string` \| `null` | `null` | 为兼容 OpenAI 接口而接受的模型标识符。 |
+| `model` | `string` \| `null` | `null` | 已加载模型名或已配置的别名。省略时使用已加载模型名。 |
 | `extra_body` | `object` | `{}` | 额外兼容参数。受支持的键可以覆盖对应的顶层字段。 |
 | `ttft_timeout_s` | `number` \| `null` | `null` | 首 token 延迟超时时间，单位为秒。若请求等待过久且已无法满足 TTFT 要求，可终止该请求以便为仍可能及时返回的其他请求留出处理能力。 |
 
@@ -287,6 +290,8 @@ OpenAI Responses API 的最小可用子集，用于文本生成、流式返回�
 | OpenAI 内建工具（`web_search`、`file_search` 等） | 暂不支持。 |
 | 真正的多模态理解 | 暂不支持。 |
 
+通过单字符串 `serve.model_alias` 配置一个额外模型名，例如 `serve.model_alias=GLM-5.3`。`/v1/models` 列出实际模型名和可选别名，不重复列出同名项。生成接口接受这两个名称并原样回显；省略时使用 `models.name`。别名不改变权重加载。
+
 Responses 工具定义会归一成赤兔内部 function tool 格式。新模型适配方式请参见 [工具调用适配指南](./TOOL_CALL_ADAPTATION.md)。
 
 ## Anthropic 兼容 API
@@ -339,6 +344,7 @@ POST /v1/messages
 |---|---|---|---|
 | `type` | `thinking` | `"thinking"` | 思考内容块。 |
 | `thinking` | `string` | **必填** | 思考内容。 |
+| `signature` | `string` | `""` | 兼容占位字段；Chitu 不验证 thinking 签名。 |
 
 #### `AnthropicToolUseBlock` 对象
 
@@ -372,6 +378,8 @@ POST /v1/messages
 | `type` | `auto` \| `any` \| `tool` \| `none` | **必填** | 工具选择模式："auto"、"any"、"tool" 或 "none"。"any" 会映射为强制工具调用。 |
 | `disable_parallel_tool_use` | `boolean` \| `null` | `false` | 是否禁用并行工具调用。 |
 | `name` | `string` \| `null` | `null` | 当 type 为 "tool" 时必填的工具名称。 |
+
+通过单字符串 `serve.model_alias` 配置一个额外模型名，例如 `serve.model_alias=GLM-5.3`。`/v1/models` 列出实际模型名和可选别名，不重复列出同名项。生成接口接受这两个名称并原样回显；省略时使用 `models.name`。别名不改变权重加载。
 
 Anthropic 工具定义会转换成赤兔内部 function tool 格式。新模型适配方式请参见 [工具调用适配指南](./TOOL_CALL_ADAPTATION.md)。
 
