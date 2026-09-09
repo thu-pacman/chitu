@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from chitu.serve.request_id import gen_req_id
 from chitu.serve.api_docs import DocField
+from chitu.serve.model_names import resolve_model_name
 from chitu.tool_call.type_def import ChoiceDelta, ChoiceToolCall, ToolConfig
 
 DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
@@ -100,6 +101,14 @@ class StreamOptions(BaseModel):
     )
 
 
+class ChatStreamOptions(StreamOptions):
+    include_usage: bool = DocField(
+        False,
+        en="Whether to include token usage information in the stream. Defaults to false.",
+        zh="是否在流式返回中包含 token 用量信息，默认关闭。",
+    )
+
+
 class ToolChoiceFunction(BaseModel):
     name: str
 
@@ -110,6 +119,11 @@ class ToolChoiceNamedTool(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    model: Optional[str] = DocField(
+        None,
+        en="Loaded model name or configured alias. Defaults to the loaded name.",
+        zh="已加载模型名或已配置的别名。省略时使用已加载模型名。",
+    )
     conversation_id: str = DocField(
         default_factory=gen_req_id,
         en="Unique identifier for the conversation. Generated automatically when omitted.",
@@ -160,8 +174,8 @@ class ChatRequest(BaseModel):
         en="Whether to stream the response using SSE.",
         zh="是否使用 SSE 流式返回响应。",
     )
-    stream_options: StreamOptions = DocField(
-        default_factory=StreamOptions,
+    stream_options: ChatStreamOptions = DocField(
+        default_factory=ChatStreamOptions,
         en="Options for streaming responses.",
         zh="流式响应选项。",
     )
@@ -263,20 +277,58 @@ class ChatRequest(BaseModel):
 class ChatCompletionResponse(BaseModel):
     id: str
     object: Literal["chat.completion"] = "chat.completion"
-    created: int = Field(default_factory=lambda: int(time.time()))
+    created: int
+    model: str
     choices: list
     usage: Optional[dict] = None
 
 
+class ChatCompletionChunk(ChatCompletionResponse):
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+
+
 class AsyncResponse:
-    def __init__(self, req: UserRequest):
+    def __init__(self, req: UserRequest, *, response_model: str, created: int):
         self.req = req
         self.id = req.request_id
+        self.model = response_model
+        self.created = created
         self.async_stream = req.async_stream
         if req.tool_call_params:
             self.tool_parser = get_tool_parser_cls()(req.tool_call_params.tools)
         else:
             self.tool_parser = None
+
+    def _finish_reason(self, has_tool_calls: bool):
+        reason = self.req.finish_reason
+        if reason is None:
+            raise ValueError("Completed chat request has no finish reason")
+        return "tool_calls" if has_tool_calls and reason != "length" else reason
+
+    def _usage(self):
+        cached = self.async_stream.input_cached_tokens
+        usage = {
+            "prompt_tokens": self.req.prompt_len,
+            "completion_tokens": self.async_stream.tokens_len,
+            "completion_tokens_details": {
+                "reasoning_tokens": self.async_stream.reasoning_tokens
+            },
+            "total_tokens": self.req.prompt_len + self.async_stream.tokens_len,
+        }
+        if cached is not None:
+            usage["prompt_tokens_details"] = {"cached_tokens": cached}
+        return usage
+
+    def _chunk(self, choices, *, include_usage: bool, usage=None):
+        chunk = ChatCompletionChunk(
+            id=self.id,
+            created=self.created,
+            model=self.model,
+            choices=choices,
+            usage=usage,
+        )
+        # Keep usage:null on ordinary chunks only when statistics were requested.
+        return chunk.model_dump_json(exclude=set() if include_usage else {"usage"})
 
     def stream_generator(self, *, include_usage: bool):
         if self.tool_parser:
@@ -287,16 +339,20 @@ class AsyncResponse:
         async def stream_response():
             try:
                 has_tool_calls = False
+                first_delta = True
                 async for data, is_reasoning, (top_logprobs, top_tokens) in stream:
                     if data:
                         if isinstance(data, ChoiceDelta) and data.tool_calls:
                             has_tool_calls = True
                         if isinstance(data, ChoiceDelta):
-                            delta = data
+                            delta = data.model_dump(exclude_none=True)
                         elif is_reasoning:
                             delta = dict(reasoning_content=data)
                         else:
                             delta = dict(content=data)
+                        if first_delta:
+                            delta["role"] = "assistant"
+                            first_delta = False
                         if self.req.logprobs:
                             logprobs = {"content": []}
                             logprobs["content"].append(
@@ -319,8 +375,8 @@ class AsyncResponse:
                                     )
                         else:
                             logprobs = None
-                        chunk = ChatCompletionResponse(
-                            id=self.id,
+                        data = self._chunk(
+                            include_usage=include_usage,
                             choices=[
                                 {
                                     "index": 0,
@@ -333,41 +389,30 @@ class AsyncResponse:
                                 }
                             ],
                         )
-                        data = chunk.model_dump_json(exclude_none=True)
                         yield f"data: {data}\n\n"
 
-                finish_reason = self.req.finish_reason
-                if has_tool_calls and finish_reason != "length":
-                    finish_reason = "tool_calls"
-                chunk = ChatCompletionResponse(
-                    id=self.id,
+                finish_reason = self._finish_reason(has_tool_calls)
+                data = self._chunk(
+                    include_usage=include_usage,
                     choices=[
                         {
                             "index": 0,
-                            "delta": {"content": ""},
+                            "delta": {"role": "assistant"} if first_delta else {},
                             "finish_reason": finish_reason,
                         }
                     ],
                 )
-                data = chunk.model_dump_json(exclude_none=True)
                 yield f"data: {data}\n\n"
 
                 # OpenAI standard requires "usage" in a separated chunk.
                 # See "include_usage" in
                 # https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create
                 if include_usage:
-                    chunk = ChatCompletionResponse(
-                        id=self.id,
+                    data = self._chunk(
+                        include_usage=True,
                         choices=[],
-                        usage={
-                            "prompt_tokens": self.req.prompt_len,
-                            "completion_tokens": self.async_stream.tokens_len,
-                            "total_tokens": self.async_stream.tokens_len
-                            + self.req.prompt_len,
-                            "cached_token": self.req.num_hit_tokens,
-                        },
+                        usage=self._usage(),
                     )
-                    data = chunk.model_dump_json(exclude_none=True)
                     yield f"data: {data}\n\n"
 
                 logger.debug(
@@ -435,13 +480,19 @@ class AsyncResponse:
 
         full_response = ChatCompletionResponse(
             id=self.id,
-            choices=[{"index": 0, "message": message, "logprobs": logprobs}],
-            usage={
-                "prompt_tokens": self.req.prompt_len,
-                "completion_tokens": self.async_stream.tokens_len,
-                "total_tokens": self.async_stream.tokens_len + self.req.prompt_len,
-                "cached_token": self.req.num_hit_tokens,
-            },
+            created=self.created,
+            model=self.model,
+            choices=[
+                {
+                    "index": 0,
+                    "message": message,
+                    "logprobs": logprobs,
+                    "finish_reason": self._finish_reason(
+                        bool(message.get("tool_calls"))
+                    ),
+                }
+            ],
+            usage=self._usage(),
         )
         logger.debug(
             f"Completed_{self.id}: {self.req.output}, token_len: {self.async_stream.tokens_len}\n"
@@ -496,19 +547,38 @@ def build_user_request(req: ChatRequest, priority: int = 1) -> UserRequest:
     return UserRequest.from_request_params(req_params)
 
 
+def _model_not_found_error(error: ValueError) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": {
+                "message": str(error),
+                "type": "invalid_request_error",
+                "param": "model",
+                "code": "model_not_found",
+            }
+        },
+    )
+
+
 async def handle_chat_completion(
     request: ChatRequest,
     priority: int,
 ):
 
     args = get_global_args()
+    created = int(time.time())
+    try:
+        response_model = resolve_model_name(request.model, args)
+    except ValueError as e:
+        return _model_not_found_error(e)
     try:
         user_req = build_user_request(request, priority)
     except PromptTooLongError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     set_min_batch_size(request.min_batch_size)
     await submit_request(user_req)
-    rsp = AsyncResponse(user_req)
+    rsp = AsyncResponse(user_req, response_model=response_model, created=created)
 
     if request.stream:
         return StreamingResponse(
@@ -518,11 +588,6 @@ async def handle_chat_completion(
     else:
         full_response = await rsp.full_generator()
         response_dict = full_response.model_dump()
-        response_dict.update(
-            {
-                "model": args.models.name,
-            }
-        )
         return JSONResponse(response_dict)
 
 
@@ -582,11 +647,10 @@ class CompletionsRequest(BaseModel):
         en="Whether generation should stop at the EOS token. Cannot conflict with ignore_eos.",
         zh="是否在 EOS token 处停止生成。不能与 ignore_eos 冲突。",
     )
-    # Accepted for OpenAI compatibility; not used by chitu.
     model: Optional[str] = DocField(
         None,
-        en="Model identifier accepted for OpenAI compatibility.",
-        zh="为兼容 OpenAI 接口而接受的模型标识符。",
+        en="Loaded model name or configured alias. Defaults to the loaded name.",
+        zh="已加载模型名或已配置的别名。省略时使用已加载模型名。",
     )
     extra_body: Mapping[str, Any] = DocField(
         {},
@@ -618,6 +682,7 @@ class CompletionsRequest(BaseModel):
 
 class CompletionResponse(BaseModel):
     id: str
+    model: str
     object: Literal["text_completion"] = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     choices: list
@@ -635,7 +700,8 @@ class CompletionAsyncResponse:
     empty-choices chunk.
     """
 
-    def __init__(self, req: UserRequest):
+    def __init__(self, req: UserRequest, *, response_model: str):
+        self.model = response_model
         self.req = req
         self.id = req.request_id
         self.async_stream = req.async_stream
@@ -650,6 +716,7 @@ class CompletionAsyncResponse:
                     if text:
                         chunk = CompletionResponse(
                             id=self.id,
+                            model=self.model,
                             choices=[
                                 {
                                     "index": 0,
@@ -669,10 +736,10 @@ class CompletionAsyncResponse:
                         "completion_tokens": self.async_stream.tokens_len,
                         "total_tokens": self.async_stream.tokens_len
                         + self.req.prompt_len,
-                        "cached_token": self.req.num_hit_tokens,
                     }
                 chunk = CompletionResponse(
                     id=self.id,
+                    model=self.model,
                     choices=[
                         {
                             "index": 0,
@@ -712,6 +779,7 @@ class CompletionAsyncResponse:
         text = "".join(chunks)
         full_response = CompletionResponse(
             id=self.id,
+            model=self.model,
             choices=[
                 {
                     "index": 0,
@@ -724,7 +792,6 @@ class CompletionAsyncResponse:
                 "prompt_tokens": self.req.prompt_len,
                 "completion_tokens": self.async_stream.tokens_len,
                 "total_tokens": self.async_stream.tokens_len + self.req.prompt_len,
-                "cached_token": self.req.num_hit_tokens,
             },
         )
         logger.debug(
@@ -760,10 +827,14 @@ async def handle_completion(request: CompletionsRequest, priority: int):
     """openai text-completions endpoint (raw prompt, no chat template)."""
 
     args = get_global_args()
+    try:
+        response_model = resolve_model_name(request.model, args)
+    except ValueError as e:
+        return _model_not_found_error(e)
     set_min_batch_size(request.min_batch_size)
     user_req = build_completion_user_request(request, priority)
     await submit_request(user_req)
-    rsp = CompletionAsyncResponse(user_req)
+    rsp = CompletionAsyncResponse(user_req, response_model=response_model)
 
     if request.stream:
         return StreamingResponse(
@@ -772,10 +843,4 @@ async def handle_completion(request: CompletionsRequest, priority: int):
         )
     else:
         full_response = await rsp.full_generator()
-        response_dict = full_response.model_dump()
-        response_dict.update(
-            {
-                "model": args.models.name,
-            }
-        )
-        return JSONResponse(response_dict)
+        return JSONResponse(full_response.model_dump())

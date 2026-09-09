@@ -125,6 +125,7 @@ class PrefillDone:
     num_hit_tokens: int
     rank_bytes: dict[str, int] = dataclasses.field(default_factory=dict)
     trace_dict: dict[str, Any] = dataclasses.field(default_factory=dict)
+    input_cached_tokens: int | None = None
 
 
 class ProtocolSerializer:

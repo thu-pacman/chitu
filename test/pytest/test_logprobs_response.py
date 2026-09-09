@@ -27,6 +27,8 @@ class StaticAsyncStream:
     def __init__(self, items):
         self.items = list(items)
         self.tokens_len = len(self.items)
+        self.reasoning_tokens = 0
+        self.input_cached_tokens = 0
         self.index = 0
         self.reasoning_parser = SimpleNamespace(
             params=SimpleNamespace(enable_reasoning=False)
@@ -59,6 +61,7 @@ def make_data_stream():
     stream.tokenizer = SequenceTokenizer()
     stream.seqs = []
     stream.tokens_len = 0
+    stream.reasoning_tokens = 0
     stream.chars_len = 0
     stream.cache_tokens = []
     stream.stop_signal = False
@@ -71,6 +74,7 @@ def make_data_stream():
     stream.cached_reasoning_state = False
     stream.callbacks_on_stop = []
     stream.error_message = None
+    stream.input_cached_tokens = None
     return stream
 
 
@@ -87,7 +91,7 @@ def make_response(top_logprobs=None):
         prompt_len=1,
         num_hit_tokens=0,
     )
-    return AsyncResponse(req)
+    return AsyncResponse(req, response_model="test-model", created=1700000000)
 
 
 def test_top_logprob_tokens_are_decoded_as_sequences():

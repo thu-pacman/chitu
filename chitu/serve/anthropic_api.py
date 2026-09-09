@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from chitu.serve.api_docs import DocField
+from chitu.serve.model_names import resolve_model_name
 from chitu.tool_call.type_def import ChoiceToolCall, ToolConfig
 from chitu.serve.request_id import gen_req_id
 
@@ -65,6 +66,11 @@ class AnthropicThinkingBlock(BaseModel):
         zh="思考内容块。",
     )
     thinking: str = DocField(en="Thinking content.", zh="思考内容。")
+    signature: str = DocField(
+        "",
+        en="Compatibility placeholder; Chitu does not validate thinking signatures.",
+        zh="兼容占位字段；Chitu 不验证 thinking 签名。",
+    )
 
 
 class AnthropicToolUseBlock(BaseModel):
@@ -305,25 +311,7 @@ def _sse_data(data: dict) -> str:
 
 
 def resolve_requested_model_or_error(requested_model: Optional[str]) -> str:
-    """
-    Enforce Anthropic `model` is effective under Chitu's typical single-model serving:
-    - If model is omitted: default to loaded model name.
-    - If model is provided: must equal loaded name or be an allowed alias to it.
-
-    Returns the *requested* model string (for echoing back), after validation.
-    """
-    args = get_global_args()
-    loaded = args.models.name
-    req_model = requested_model or loaded
-
-    aliases = args.serve.model_aliases
-    resolved = aliases.get(req_model, req_model)
-
-    if resolved != loaded:
-        raise ValueError(
-            f"Model '{req_model}' is not available on this server (loaded='{loaded}')."
-        )
-    return req_model
+    return resolve_model_name(requested_model, get_global_args())
 
 
 def anthropic_content_to_text(content: str | list[str | AnthropicContentBlock]) -> str:
@@ -572,6 +560,20 @@ def build_fim_prompt(prefix: str, suffix: str) -> str:
     raise ValueError("Tokenizer does not support FIM tokens for suffix completion.")
 
 
+def _messages_usage(user_req: UserRequest, output_tokens: int) -> dict:
+    cached = user_req.async_stream.input_cached_tokens
+    usage = {
+        "input_tokens": user_req.prompt_len,
+        "output_tokens": output_tokens,
+    }
+    if cached is not None:
+        usage["input_tokens"] -= cached
+        usage["cache_read_input_tokens"] = cached
+    # Prefix-cache writes do not implement Anthropic cache_control/TTL billing.
+    # Omit the optional cache_creation_input_tokens rather than inventing it.
+    return usage
+
+
 async def anthropic_stream_from_async_stream(
     *, user_req: UserRequest, response_model: str
 ):
@@ -581,6 +583,7 @@ async def anthropic_stream_from_async_stream(
     """
     async_stream = user_req.async_stream
     msg_id = f"msg_{user_req.request_id}"
+    await async_stream.wait_input_cached_tokens()
 
     yield _sse_event(
         "message_start",
@@ -594,10 +597,7 @@ async def anthropic_stream_from_async_stream(
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {
-                    "input_tokens": user_req.prompt_len,
-                    "output_tokens": 0,
-                },
+                "usage": _messages_usage(user_req, 0),
             },
         },
     )
@@ -616,6 +616,21 @@ async def anthropic_stream_from_async_stream(
     tool_call_buffers: dict[int, dict[str, str | None]] = {}
     saw_text = False
 
+    def _close_content_block():
+        if current_block_type == "thinking":
+            yield _sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "signature_delta", "signature": ""},
+                },
+            )
+        yield _sse_event(
+            "content_block_stop",
+            {"type": "content_block_stop", "index": block_index},
+        )
+
     async def _emit_text_delta(text: str, is_thinking: bool):
         nonlocal block_index, current_block_type
         new_type = "thinking" if is_thinking else "text"
@@ -623,7 +638,7 @@ async def anthropic_stream_from_async_stream(
             block_index = 0
             current_block_type = new_type
             content_block = (
-                {"type": "thinking", "thinking": ""}
+                {"type": "thinking", "thinking": "", "signature": ""}
                 if current_block_type == "thinking"
                 else {"type": "text", "text": ""}
             )
@@ -636,14 +651,12 @@ async def anthropic_stream_from_async_stream(
                 },
             )
         elif new_type != current_block_type:
-            yield _sse_event(
-                "content_block_stop",
-                {"type": "content_block_stop", "index": block_index},
-            )
+            for event in _close_content_block():
+                yield event
             block_index += 1
             current_block_type = new_type
             content_block = (
-                {"type": "thinking", "thinking": ""}
+                {"type": "thinking", "thinking": "", "signature": ""}
                 if current_block_type == "thinking"
                 else {"type": "text", "text": ""}
             )
@@ -701,10 +714,8 @@ async def anthropic_stream_from_async_stream(
                 yield event
 
     if current_block_type is not None:
-        yield _sse_event(
-            "content_block_stop",
-            {"type": "content_block_stop", "index": block_index},
-        )
+        for event in _close_content_block():
+            yield event
 
     if tool_call_buffers:
         next_index = block_index + 1
@@ -749,10 +760,7 @@ async def anthropic_stream_from_async_stream(
                 "stop_reason": stop_reason,
                 "stop_sequence": None,
             },
-            "usage": {
-                "output_tokens": async_stream.tokens_len,
-                "cached_token": user_req.num_hit_tokens,
-            },
+            "usage": _messages_usage(user_req, async_stream.tokens_len),
         },
     )
     yield _sse_event("message_stop", {"type": "message_stop"})
@@ -776,7 +784,6 @@ async def anthropic_completion_stream_from_async_stream(
         )
 
     stop_reason = map_finish_reason_to_completion_stop_reason(req.finish_reason)
-    num_hit_tokens = req.num_hit_tokens
     yield _sse_data(
         {
             "type": "completion",
@@ -784,7 +791,6 @@ async def anthropic_completion_stream_from_async_stream(
             "stop_reason": stop_reason,
             "stop_sequence": None,
             "model": response_model,
-            "cached_token": num_hit_tokens,
         }
     )
 
@@ -878,7 +884,9 @@ async def handle_messages_request(*, request: AnthropicMessagesRequest, priority
 
     content_blocks: list[dict] = []
     if reasoning_text:
-        content_blocks.append({"type": "thinking", "thinking": reasoning_text})
+        content_blocks.append(
+            {"type": "thinking", "thinking": reasoning_text, "signature": ""}
+        )
     if output_text:
         content_blocks.append({"type": "text", "text": output_text})
     if tool_calls:
@@ -892,11 +900,7 @@ async def handle_messages_request(*, request: AnthropicMessagesRequest, priority
             "content": content_blocks,
             "stop_reason": stop_reason,
             "stop_sequence": stop_sequence,
-            "usage": {
-                "input_tokens": user_req.prompt_len,
-                "output_tokens": user_req.async_stream.tokens_len,
-                "cached_token": user_req.num_hit_tokens,
-            },
+            "usage": _messages_usage(user_req, user_req.async_stream.tokens_len),
         }
     )
 
@@ -982,6 +986,5 @@ async def handle_completion_request(
             "stop_reason": stop_reason,
             "stop_sequence": stop_sequence,
             "model": response_model,
-            "cached_token": user_req.num_hit_tokens,
         }
     )

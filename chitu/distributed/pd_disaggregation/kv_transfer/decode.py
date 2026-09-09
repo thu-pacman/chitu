@@ -209,6 +209,7 @@ class KVManagerDecode(KVManagerBase):
                 done=True,
                 first_token=msg.first_token,
                 num_hit_tokens=msg.num_hit_tokens,
+                input_cached_tokens=msg.input_cached_tokens,
                 trace=Trace.load(msg.trace_dict),
             )
 

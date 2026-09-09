@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from chitu.serve import anthropic_api, openai_api, responses_api
 from chitu.serve.api_docs import DocField
+from chitu.serve.model_names import available_model_names
 
 DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
 
@@ -217,11 +218,11 @@ async def handle_generic_exception(request, e: Exception):
     "/v1/models",
     tags=["OpenAI-Compatible API"],
     summary="Models",
-    description="Returns the list of models currently loaded by this server.",
+    description="Returns the loaded model name and its configured aliases.",
     openapi_extra={
         "x-doc": {
             "zh-summary": "模型列表",
-            "zh-description": "返回当前服务已加载的模型列表。",
+            "zh-description": "返回当前加载的模型名称及其已配置的有效别名。",
         }
     },
 )
@@ -230,11 +231,12 @@ async def list_models():
         "object": "list",
         "data": [
             {
-                "id": get_global_args().models.name,
+                "id": name,
                 "object": "model",
                 "created": 0,
                 "owned_by": "unknown",
             }
+            for name in available_model_names(get_global_args())
         ],
     }
 

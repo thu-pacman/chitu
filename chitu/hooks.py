@@ -258,6 +258,8 @@ class NoopTaskEvictHook:
         task.task_type = TaskType.Prefill
         task.prefill_chunk_size = None
         task.consumed_req_tokens = 0
+        if task.req is not None and task.req.async_stream.input_cached_tokens is None:
+            task.req.num_hit_tokens = 0
         task.sched_group_id = None
         task.dp_rank = None
 

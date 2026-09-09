@@ -13,6 +13,8 @@ class StaticAsyncStream:
     def __init__(self, items, tokens_len):
         self.items = list(items)
         self.tokens_len = tokens_len
+        self.reasoning_tokens = 0
+        self.input_cached_tokens = 0
         self._index = 0
 
     def __aiter__(self):

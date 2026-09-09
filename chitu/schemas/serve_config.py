@@ -46,11 +46,8 @@ class ServeAddrConfig:
     port: int = MISSING
     api_keys: list[ApiKey] = field(default_factory=list)
     validate_api_key: bool = MISSING
-    # Optional: map external model names (e.g. Anthropic) to the currently loaded internal model name.
-    # Example:
-    #   model_aliases:
-    #     claude-3-5-sonnet-latest: DeepSeek-V3.1
-    model_aliases: dict[str, str] = field(default_factory=dict)
+    # Optional extra API model name; does not change the loaded model.
+    model_alias: Optional[str] = None
 
 
 @dataclass

@@ -130,6 +130,7 @@ class DPTokenSender:
         top_logprobs: Optional[list[float]] = None,
         top_token_idx: Optional[list[int]] = None,
         task: Task | None = None,  # Add task parameter to record ttft
+        input_cached_tokens: Optional[int] = None,
     ):
         """Send a single token to the Router"""
         # Check if this is the first token and get prompt_len
@@ -146,6 +147,8 @@ class DPTokenSender:
             instance_id=self.instance_id,
             timestamp=time.time(),
         )
+        if input_cached_tokens is not None:
+            data["input_cached_tokens"] = input_cached_tokens
 
         # If first token and task provided, include prompt_len info
         if is_first_token and task is not None and task.req is not None:
@@ -165,6 +168,7 @@ class DPTokenSender:
         request_id: str,
         finish_reason: str = "stop",
         num_hit_tokens: int = 0,
+        input_cached_tokens: Optional[int] = None,
     ):
         """Send request finish signal"""
         # Clean up caches for this request
@@ -178,6 +182,8 @@ class DPTokenSender:
             instance_id=self.instance_id,
             timestamp=time.time(),
         )
+        if input_cached_tokens is not None:
+            data["input_cached_tokens"] = input_cached_tokens
 
         self._send_data(data)
 
@@ -289,6 +295,7 @@ class DPAsyncDataStream(AsyncDataStream):
                 tokens=[value],
                 top_logprobs=top_logprobs,
                 top_token_idx=top_token_idx,
+                input_cached_tokens=self.input_cached_tokens,
             )
             logger.debug(
                 f"[DPAsyncDataStream] Token sent successfully: {request_id} -> {value}"
@@ -300,11 +307,14 @@ class DPAsyncDataStream(AsyncDataStream):
             self.stop_signal = True
             if self.task.req.save_trace_dir:
                 self.token_sender.send_trace(self.task.req.trace_data)
-            if self.task.req.finish_reason != "evicted":
+            if error is not None:
+                self.token_sender.send_error(self.task.req.request_id, error)
+            elif self.task.req.finish_reason != "evicted":
                 self.token_sender.send_finish(
                     self.task.req.request_id,
                     self.task.req.finish_reason,
                     self.task.req.num_hit_tokens,
+                    input_cached_tokens=self.input_cached_tokens,
                 )
             del self.task
 

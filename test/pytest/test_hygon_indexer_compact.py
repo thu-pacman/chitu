@@ -15,7 +15,6 @@ from chitu.device_type import is_hygon
 from chitu.dsa_indexer import DSAIndexer
 from chitu.models.model_deepseek_v3 import Indexer
 
-
 requires_hygon_deepgemm = pytest.mark.skipif(
     not (is_hygon() and dsa_indexer_module.has_hygon_compact_mqa_logits),
     reason="Hygon DeepGEMM compact-capable mqa_logits is not available",

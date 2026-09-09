@@ -20,6 +20,7 @@ class AsyncDataStream:
         self.tokenizer = Backend.tokenizer
         self.seqs: list[str] = []
         self.tokens_len: int = 0
+        self.reasoning_tokens: int = 0
         self.chars_len: int = 0
         self.cache_tokens: list[int] = []
         self.stop_signal = False
@@ -32,6 +33,26 @@ class AsyncDataStream:
         self.cached_reasoning_state: bool = False
         self.callbacks_on_stop = []
         self.error_message: Optional[str] = None
+        self.input_cached_tokens: Optional[int] = None
+
+    def set_input_cached_tokens(self, value: int):
+        """Freeze input usage before output begins, including an EOS-only output."""
+        with self.lock:
+            if self.input_cached_tokens is not None:
+                return
+            self.input_cached_tokens = value
+        self.notify_server_threadsafe()
+
+    async def wait_input_cached_tokens(self) -> Optional[int]:
+        # This precedes iteration; do not pre-read/reset the token iterator.
+        while True:
+            with self.lock:
+                if self.error_message is not None:
+                    raise RuntimeError(self.error_message)
+                if self.input_cached_tokens is not None or self.stop_signal:
+                    return self.input_cached_tokens
+                self.data_event.clear()
+            await self.data_event.wait()
 
     def add_data(
         self,
@@ -45,6 +66,9 @@ class AsyncDataStream:
             if value is not None:
                 self.cached_reasoning_state = self.reasoning_parser.update(value)
                 self.tokens_len += 1
+                # Count generated token IDs before decoding/buffering. The parser
+                # includes generated thinking delimiters in the reasoning span.
+                self.reasoning_tokens += int(self.cached_reasoning_state)
                 self.cache_tokens.append(value)
             elif len(self.cache_tokens) == 0:
                 return

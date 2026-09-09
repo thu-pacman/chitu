@@ -28,6 +28,7 @@ class TransferStatus:
     first_token: int = 0
     num_hit_tokens: int = 0
     trace: Optional[Trace] = None
+    input_cached_tokens: Optional[int] = None
 
     def __bool__(self):
         return self.done

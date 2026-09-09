@@ -11,6 +11,7 @@ from logging import getLogger
 from typing import (
     Annotated,
     Any,
+    Callable,
     Literal,
     Optional,
 )
@@ -620,6 +621,7 @@ def _make_message_item(item_id: str, text: str) -> dict[str, Any]:
                 "type": "output_text",
                 "text": text,
                 "annotations": [],
+                "logprobs": [],
             }
         ],
     }
@@ -681,17 +683,21 @@ def _response_status_and_incomplete_details(
     return "completed", None
 
 
-def _response_usage(req: UserRequest) -> dict[str, Any]:
+def _response_usage(req: UserRequest) -> dict[str, Any] | None:
     completion_tokens = req.async_stream.tokens_len
     prompt_tokens = req.prompt_len
-    cached_tokens = req.num_hit_tokens
+    cached_tokens = req.async_stream.input_cached_tokens
+    if cached_tokens is None:
+        # A peer predating input-usage metadata cannot supply exact breakdowns.
+        return None
     return {
         "input_tokens": prompt_tokens,
         "input_tokens_details": {"cached_tokens": cached_tokens},
         "output_tokens": completion_tokens,
-        "output_tokens_details": {"reasoning_tokens": 0},
+        "output_tokens_details": {
+            "reasoning_tokens": req.async_stream.reasoning_tokens
+        },
         "total_tokens": prompt_tokens + completion_tokens,
-        "cached_token": cached_tokens,
     }
 
 
@@ -748,10 +754,11 @@ def _build_response_skeleton(
 
 def _build_message_item_started_event(
     *,
+    emit: Callable[[str, dict[str, Any]], str],
     text_item_id: str,
 ) -> list[str]:
     return [
-        _sse_event(
+        emit(
             "response.output_item.added",
             {
                 "type": "response.output_item.added",
@@ -765,7 +772,7 @@ def _build_message_item_started_event(
                 },
             },
         ),
-        _sse_event(
+        emit(
             "response.content_part.added",
             {
                 "type": "response.content_part.added",
@@ -776,6 +783,7 @@ def _build_message_item_started_event(
                     "type": "output_text",
                     "text": "",
                     "annotations": [],
+                    "logprobs": [],
                 },
             },
         ),
@@ -784,12 +792,15 @@ def _build_message_item_started_event(
 
 def _build_message_item_done_events(
     *,
+    emit: Callable[[str, dict[str, Any]], str],
     text_item_id: str,
     output_text: str,
+    status: str,
 ) -> tuple[dict[str, Any], list[str]]:
     message_item = _make_message_item(text_item_id, output_text)
+    message_item["status"] = status
     return message_item, [
-        _sse_event(
+        emit(
             "response.output_text.done",
             {
                 "type": "response.output_text.done",
@@ -797,9 +808,10 @@ def _build_message_item_done_events(
                 "output_index": 0,
                 "content_index": 0,
                 "text": output_text,
+                "logprobs": [],
             },
         ),
-        _sse_event(
+        emit(
             "response.content_part.done",
             {
                 "type": "response.content_part.done",
@@ -809,7 +821,7 @@ def _build_message_item_done_events(
                 "part": message_item["content"][0],
             },
         ),
-        _sse_event(
+        emit(
             "response.output_item.done",
             {
                 "type": "response.output_item.done",
@@ -822,12 +834,13 @@ def _build_message_item_done_events(
 
 def _build_function_call_started_event(
     *,
+    emit: Callable[[str, dict[str, Any]], str],
     item_id: str,
     call_id: str,
     name: str,
     output_index: int,
 ) -> str:
-    return _sse_event(
+    return emit(
         "response.output_item.added",
         {
             "type": "response.output_item.added",
@@ -846,11 +859,12 @@ def _build_function_call_started_event(
 
 def _build_function_call_done_events(
     *,
+    emit: Callable[[str, dict[str, Any]], str],
     function_item: dict[str, Any],
     output_index: int,
 ) -> list[str]:
     return [
-        _sse_event(
+        emit(
             "response.function_call_arguments.done",
             {
                 "type": "response.function_call_arguments.done",
@@ -860,7 +874,7 @@ def _build_function_call_done_events(
                 "name": function_item["name"],
             },
         ),
-        _sse_event(
+        emit(
             "response.output_item.done",
             {
                 "type": "response.output_item.done",
@@ -913,6 +927,7 @@ async def collect_response_output(
 
 def build_responses_response(
     *,
+    created_at: int,
     request: ResponsesCreateRequest,
     response_model: str,
     user_req: UserRequest,
@@ -921,8 +936,9 @@ def build_responses_response(
     public_tools: list[dict[str, Any]],
     public_tool_choice: str | dict[str, Any],
 ) -> dict[str, Any]:
-    created_at = int(time.time())
     status, incomplete_details = _response_status_and_incomplete_details(user_req)
+    for item in output_items:
+        item["status"] = status
     return _build_response_skeleton(
         request=request,
         response_model=response_model,
@@ -931,7 +947,7 @@ def build_responses_response(
         public_tool_choice=public_tool_choice,
         status=status,
         created_at=created_at,
-        completed_at=created_at,
+        completed_at=int(time.time()) if status == "completed" else None,
         output=output_items,
         output_text=output_text,
         usage=_response_usage(user_req),
@@ -941,18 +957,27 @@ def build_responses_response(
 
 async def responses_stream_from_async_stream(
     *,
+    created_at: int,
     user_req: UserRequest,
     request: ResponsesCreateRequest,
     response_model: str,
     public_tools: list[dict[str, Any]],
     public_tool_choice: str | dict[str, Any],
 ):
+    sequence_number = 0
+
+    def emit(event: str, data: dict[str, Any]) -> str:
+        nonlocal sequence_number
+        data["sequence_number"] = sequence_number
+        sequence_number += 1
+        return _sse_event(event, data)
+
     response_id = f"resp_{user_req.request_id}"
     output_text_parts: list[str] = []
     tool_buffers: dict[int, dict[str, str]] = {}
 
     for event_name in ("response.created", "response.in_progress"):
-        yield _sse_event(
+        yield emit(
             event_name,
             {
                 "type": event_name,
@@ -963,7 +988,7 @@ async def responses_stream_from_async_stream(
                     public_tools=public_tools,
                     public_tool_choice=public_tool_choice,
                     status="in_progress",
-                    created_at=int(time.time()),
+                    created_at=created_at,
                     output=[],
                     usage=None,
                     incomplete_details=None,
@@ -983,11 +1008,11 @@ async def responses_stream_from_async_stream(
                 if not text_started:
                     text_started = True
                     for event in _build_message_item_started_event(
-                        text_item_id=text_item_id
+                        text_item_id=text_item_id, emit=emit
                     ):
                         yield event
                 output_text_parts.append(data.content)
-                yield _sse_event(
+                yield emit(
                     "response.output_text.delta",
                     {
                         "type": "response.output_text.delta",
@@ -995,6 +1020,7 @@ async def responses_stream_from_async_stream(
                         "output_index": 0,
                         "content_index": 0,
                         "delta": data.content,
+                        "logprobs": [],
                     },
                 )
             for tool_call in data.tool_calls or []:
@@ -1005,13 +1031,14 @@ async def responses_stream_from_async_stream(
                 if not buf["started"]:
                     buf["started"] = "1"
                     yield _build_function_call_started_event(
+                        emit=emit,
                         item_id=item_id,
                         call_id=call_id,
                         name=buf["name"],
                         output_index=output_index,
                     )
                 if tool_call.function.arguments:
-                    yield _sse_event(
+                    yield emit(
                         "response.function_call_arguments.delta",
                         {
                             "type": "response.function_call_arguments.delta",
@@ -1026,10 +1053,12 @@ async def responses_stream_from_async_stream(
             continue
         if not text_started:
             text_started = True
-            for event in _build_message_item_started_event(text_item_id=text_item_id):
+            for event in _build_message_item_started_event(
+                text_item_id=text_item_id, emit=emit
+            ):
                 yield event
         output_text_parts.append(data)
-        yield _sse_event(
+        yield emit(
             "response.output_text.delta",
             {
                 "type": "response.output_text.delta",
@@ -1037,14 +1066,16 @@ async def responses_stream_from_async_stream(
                 "output_index": 0,
                 "content_index": 0,
                 "delta": data,
+                "logprobs": [],
             },
         )
 
+    status, _ = _response_status_and_incomplete_details(user_req)
     output_items: list[dict[str, Any]] = []
     output_text = "".join(output_text_parts)
     if text_started:
         message_item, done_events = _build_message_item_done_events(
-            text_item_id=text_item_id, output_text=output_text
+            text_item_id=text_item_id, output_text=output_text, status=status, emit=emit
         )
         for event in done_events:
             yield event
@@ -1060,27 +1091,25 @@ async def responses_stream_from_async_stream(
             name=buf["name"],
             arguments=buf["arguments"],
         )
+        function_item["status"] = status
         for event in _build_function_call_done_events(
-            function_item=function_item, output_index=output_index
+            emit=emit, function_item=function_item, output_index=output_index
         ):
             yield event
         output_items.append(function_item)
 
-    yield _sse_event(
-        "response.completed",
-        {
-            "type": "response.completed",
-            "response": build_responses_response(
-                request=request,
-                response_model=response_model,
-                user_req=user_req,
-                output_text=output_text,
-                output_items=output_items,
-                public_tools=public_tools,
-                public_tool_choice=public_tool_choice,
-            ),
-        },
+    response = build_responses_response(
+        created_at=created_at,
+        request=request,
+        response_model=response_model,
+        user_req=user_req,
+        output_text=output_text,
+        output_items=output_items,
+        public_tools=public_tools,
+        public_tool_choice=public_tool_choice,
     )
+    event_name = f"response.{response['status']}"
+    yield emit(event_name, {"type": event_name, "response": response})
 
 
 async def handle_responses_request(
@@ -1088,6 +1117,7 @@ async def handle_responses_request(
     request: ResponsesCreateRequest,
     priority: int,
 ):
+    created_at = int(time.time())
     try:
         response_model = resolve_requested_model_or_error(request.model)
         internal_tools, public_tools = normalize_response_tools(request.tools)
@@ -1161,6 +1191,7 @@ async def handle_responses_request(
     if request.stream:
         return StreamingResponse(
             responses_stream_from_async_stream(
+                created_at=created_at,
                 user_req=user_req,
                 request=request,
                 response_model=response_model,
@@ -1173,6 +1204,7 @@ async def handle_responses_request(
     output_text, output_items = await collect_response_output(req=user_req)
     return JSONResponse(
         build_responses_response(
+            created_at=created_at,
             request=request,
             response_model=response_model,
             user_req=user_req,

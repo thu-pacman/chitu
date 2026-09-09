@@ -1105,9 +1105,7 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             # 注意: prefix block的发布(publish_prefix_cache_blocks)已推迟到该任务
             # 首个decode step的prepare_metadata_before_decode，确保KV传输+kv_recv_reorder
             # 完成后其它请求才可能命中并复用，避免读到未reorder的block。
-            task.req.num_hit_tokens = max(
-                task.req.num_hit_tokens, prefill_done.num_hit_tokens
-            )
+            task.req.num_hit_tokens = prefill_done.input_cached_tokens
             task.req.add_data(prefill_done.first_token)
             if task.dp_rank != 0:
                 task.update_response_sync([prefill_done.first_token])

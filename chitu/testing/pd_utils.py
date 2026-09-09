@@ -245,7 +245,9 @@ class PDTestRunner:
             num_cache_hit = sum(
                 1
                 for rid, req in self.req_pool.items()
-                if rid.startswith("pd_test_") and req.num_hit_tokens > 0
+                if rid.startswith("pd_test_")
+                and req.num_hit_tokens is not None
+                and req.num_hit_tokens > 0
             )
             if num_cache_hit == 0:
                 logger.error(
