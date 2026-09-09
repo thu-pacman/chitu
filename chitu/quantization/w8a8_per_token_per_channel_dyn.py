@@ -313,7 +313,15 @@ class W8A8PerTokenPerChannelDynLinear(QuantizedLinearBase):
         )
 
         if weight_scale_dtype is None:
-            weight_scale_dtype = torch.get_default_dtype()
+            # Hygon* impl classes run W8A8 kernels that consume fp32 scales;
+            # store fp32 to avoid per-forward casts. Gate on the concrete
+            # class, not the platform: only the Hygon linear subclass hits
+            # the isinstance check below.
+            weight_scale_dtype = (
+                torch.float32
+                if isinstance(self, _HYGON_FP32_SCALE_CONSUMER_CLASSES)
+                else torch.get_default_dtype()
+            )
         elif isinstance(weight_scale_dtype, str):
             weight_scale_dtype = parse_dtype(weight_scale_dtype)
         self.weight_scale = torch.nn.Parameter(
@@ -384,6 +392,22 @@ class AscendW8A8PerTokenPerChannelDynLinear(
         if self.bias is not None:
             y += self.bias
         return y.view(*x.shape[:-1], y.shape[-1])
+
+
+@QuantizationRegistry.register_linear(
+    "w8a8_per_token_per_channel_dyn", when=lambda _: is_hygon(), priority=1
+)
+class HygonW8A8PerTokenPerChannelDynLinear(W8A8PerTokenPerChannelDynLinear):
+    """
+    Hygon implementation of W8A8PerTokenPerChannelDynLinear.
+
+    Registered separately from the platform-neutral base so that the fp32
+    weight-scale storage (see _HYGON_FP32_SCALE_CONSUMER_CLASSES) applies
+    here: the hipblaslt/lightop kernels behind this class cast bf16 scales
+    to fp32 on every call.
+    """
+
+    pass
 
 
 def _finalize_fused_experts_sum_output(
@@ -600,7 +624,14 @@ class W8A8PerTokenPerChannelDynMoeExpertsMergedBase(QuantizedMoeExpertsMerged):
             checkpoint_prefix,
         )
         if weight_scale_dtype is None:
-            weight_scale_dtype = torch.get_default_dtype()
+            # The Hygon* MoE impl classes run W8A8 kernels that consume
+            # fp32 scales; store fp32 to avoid per-forward casts. Gate on
+            # the concrete class, not the platform.
+            weight_scale_dtype = (
+                torch.float32
+                if isinstance(self, _HYGON_FP32_SCALE_CONSUMER_CLASSES)
+                else torch.get_default_dtype()
+            )
         elif isinstance(weight_scale_dtype, str):
             weight_scale_dtype = parse_dtype(weight_scale_dtype)
         self.gate_up_proj_weight = torch.nn.Parameter(
@@ -883,12 +914,8 @@ class HygonAiterW8A8PerTokenPerChannelDynMoeExpertsMerged(
             activation="silu",
             w1_scale=self.gate_up_proj_weight_scale.view(
                 self.group_size, self.moe_inter_dim * 2, 1
-            )
-            .to(torch.float32)
-            .contiguous(),
-            w2_scale=self.down_proj_weight_scale.view(self.group_size, self.dim, 1)
-            .to(torch.float32)
-            .contiguous(),
+            ),
+            w2_scale=self.down_proj_weight_scale.view(self.group_size, self.dim, 1),
             w1_zp=None,
             w2_zp=None,
             a1_scale=None,
@@ -971,7 +998,7 @@ class HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged(
         if x_scale is not None:
             x_scale = eval_lazy(x_scale)
         out_dtype = out_dtype or (
-            weight_scale.dtype if x_fp.dtype == torch.int8 else x_fp.dtype
+            torch.get_default_dtype() if x_fp.dtype == torch.int8 else x_fp.dtype
         )
         if math.prod(x_fp.shape) == 0 or x_fp.shape[0] == 0:
             return torch.empty(
@@ -1183,17 +1210,11 @@ class HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged(
                 device=routed_x.activation.device,
             )
         w1 = self.gate_up_proj_weight
-        w1_scale_3d = (
-            self.gate_up_proj_weight_scale.to(torch.float32)
-            .view(self.group_size, self.moe_inter_dim * 2, 1)
-            .contiguous()
+        w1_scale_3d = self.gate_up_proj_weight_scale.view(
+            self.group_size, self.moe_inter_dim * 2, 1
         )
         w2 = self.down_proj_weight
-        w2_scale_3d = (
-            self.down_proj_weight_scale.to(torch.float32)
-            .view(self.group_size, self.dim, 1)
-            .contiguous()
-        )
+        w2_scale_3d = self.down_proj_weight_scale.view(self.group_size, self.dim, 1)
         cfg1, cfg2, has_tuned_cfg = _lightop_get_moe_cuda_config(
             E=w1.shape[0],
             M=M,
@@ -1412,9 +1433,7 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
             self.get_native_layout_gate_up_proj_weight()
         ).layout_tensor
         # Hygon DeepGEMM W8A8 requires fp32 scale tensors.
-        gate_up_scale = (
-            self.gate_up_proj_weight_scale.squeeze(-1).to(torch.float32).contiguous()
-        )
+        gate_up_scale = self.gate_up_proj_weight_scale.squeeze(-1)
         gate_up_out = torch.empty(
             (q_x.shape[0], self.moe_inter_dim * 2),
             dtype=output_dtype,
@@ -1435,9 +1454,7 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
             self.get_native_layout_down_proj_weight()
         ).layout_tensor
         # Hygon DeepGEMM W8A8 requires fp32 scale tensors.
-        down_scale = (
-            self.down_proj_weight_scale.squeeze(-1).to(torch.float32).contiguous()
-        )
+        down_scale = self.down_proj_weight_scale.squeeze(-1)
         down_out = torch.empty(
             (q_intermediate.shape[0], self.dim),
             dtype=output_dtype,
@@ -1520,7 +1537,7 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
             * max(1, int(getattr(infer_args, "mtp_size", 1) or 1)),
         )
         # Hygon DeepGEMM W8A8 requires fp32 scale tensors.
-        gate_up_scale = self.gate_up_proj_weight_scale.to(torch.float32).contiguous()
+        gate_up_scale = self.gate_up_proj_weight_scale
         gate_up_out = torch.empty(
             (E, M, self.moe_inter_dim * 2),
             dtype=torch.bfloat16,
@@ -1560,7 +1577,7 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
                 )
             )
         # Hygon DeepGEMM W8A8 requires fp32 scale tensors.
-        down_scale = self.down_proj_weight_scale.to(torch.float32).contiguous()
+        down_scale = self.down_proj_weight_scale
         down_out = torch.empty((E, M, self.dim), dtype=torch.bfloat16, device=device)
         hygon_deepgemm.m_grouped_w8a8_gemm_nt_masked(
             (q_intermediate, intermediate_scale),
@@ -1572,3 +1589,15 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
         if output_m != M:
             down_out = down_out[:, :output_m, :].contiguous()
         return PerExpertDenseBatchedExpertResultMinimal(down_out)
+
+
+# Implementations whose W8A8 kernels consume fp32 scales: the Hygon linear
+# (hipblaslt/lightop kernels cast bf16 scales to fp32 on every call) and the
+# Hygon* MoE classes (HygonW8A8AsmMoeExpertsMerged subclasses HygonAiter...
+# and is covered by isinstance on the base class).
+_HYGON_FP32_SCALE_CONSUMER_CLASSES = (
+    HygonW8A8PerTokenPerChannelDynLinear,
+    HygonAiterW8A8PerTokenPerChannelDynMoeExpertsMerged,
+    HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged,
+    HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged,
+)
