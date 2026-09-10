@@ -159,6 +159,10 @@ class BlockIdentityChainBuilder:
             for _ in range((max_seq_len + self.block_size - 1) // self.block_size)
         ]
 
+    def placeholder_identity(self) -> BlockIdentity:
+        """Shared placeholder identity for blocks without a canonical hash."""
+        return self._placeholder_identity
+
     @classmethod
     def acquire(cls, manager_name: str, block_size: int) -> "BlockIdentityChainBuilder":
         """同一进程内按 (manager_name, block_size) 共享实例；hashed_block_pool 维护满块

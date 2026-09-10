@@ -77,6 +77,20 @@ def _setup_draft_sampling_params(sampler, bs, temperature=1.0, top_k=50, top_p=0
     sampler.max_top_k_for_draft = top_k
 
 
+def _sparse_from_full(full, K=50):
+    """Convert a full-vocab (bs, n_drafts, V) proposal tensor to a sparse
+    (probs, token_ids) pair by keeping the top-K values per row."""
+    bs, n_drafts, V = full.shape
+    probs = torch.zeros(bs, n_drafts, K)
+    token_ids = torch.zeros(bs, n_drafts, K, dtype=torch.int64)
+    for b in range(bs):
+        for d in range(n_drafts):
+            vals, idxs = torch.topk(full[b, d], k=K)
+            probs[b, d] = vals
+            token_ids[b, d] = idxs
+    return probs, token_ids
+
+
 # ---- fixtures ----
 
 
@@ -428,75 +442,96 @@ class TestComputeMtpAcceptance:
     """Test chitu.ops.sampling.compute_mtp_acceptance."""
 
     @staticmethod
-    def _make_dists(bs, n_drafts, vocab_size, token_probs_at):
-        """Create q, p dists of shape (bs, n_drafts, vocab) with mass at positions."""
-        q = torch.zeros(bs, n_drafts, vocab_size)
-        p = torch.zeros(bs, n_drafts, vocab_size)
+    def _make_dists(bs, n_drafts, token_probs_at):
+        """Create sparse q, p pairs with one-hot mass at the given positions."""
+        q_probs = torch.zeros(bs, n_drafts, 4)
+        q_token_ids = torch.zeros(bs, n_drafts, 4, dtype=torch.int64)
+        p_probs = torch.zeros(bs, n_drafts, 4)
+        p_token_ids = torch.zeros(bs, n_drafts, 4, dtype=torch.int64)
         for idx, (q_pos, p_pos) in enumerate(token_probs_at):
             b, d = divmod(idx, n_drafts)
-            q[b, d, q_pos] = 1.0
-            p[b, d, p_pos] = 1.0
-        return q, p
+            q_probs[b, d, 0] = 1.0
+            q_token_ids[b, d, 0] = q_pos
+            p_probs[b, d, 0] = 1.0
+            p_token_ids[b, d, 0] = p_pos
+        return (
+            q_probs.reshape(bs * n_drafts, -1),
+            q_token_ids.reshape(bs * n_drafts, -1),
+            p_probs,
+            p_token_ids,
+        )
 
-    def test_all_non_greedy_deterministic_accept(self, global_args):
+    def test_all_non_greedy_deterministic_accept(self):
         """q_d >= p_d → accept_prob clamped to 1.0 → always accepted."""
         from chitu.ops.sampling import compute_mtp_acceptance
 
-        V = global_args.models.vocab_size
         bs, n_drafts = 2, 2
-        q = torch.zeros(bs, n_drafts, V)
-        p = torch.zeros(bs, n_drafts, V)
-        q[:, :, 5] = 1.0
-        p[:, :, 5] = 1.0
+        q_probs, q_token_ids, p_probs, p_token_ids = self._make_dists(
+            bs, n_drafts, [(5, 5)] * (bs * n_drafts)
+        )
         draft_tokens = torch.full((bs, n_drafts), 5, dtype=torch.int64)
         exact_match = torch.ones(bs, n_drafts, dtype=torch.bool)
         greedy_mask = torch.tensor([False, False])
 
         accepted, accept_indices = compute_mtp_acceptance(
-            q, p, draft_tokens, exact_match, greedy_mask
+            q_probs,
+            q_token_ids,
+            p_probs,
+            p_token_ids,
+            draft_tokens,
+            exact_match,
+            greedy_mask,
         )
 
         assert accepted.all()
         assert (accept_indices == n_drafts).all()
 
-    def test_all_non_greedy_deterministic_reject(self, global_args):
+    def test_all_non_greedy_deterministic_reject(self):
         """q_d = 0 → accept_prob = 0.0 → always rejected."""
         from chitu.ops.sampling import compute_mtp_acceptance
 
-        V = global_args.models.vocab_size
         bs, n_drafts = 1, 3
-        q = torch.zeros(bs, n_drafts, V)
-        p = torch.zeros(bs, n_drafts, V)
-        q[:, :, 3] = 1.0
-        p[:, :, 7] = 1.0
+        q_probs, q_token_ids, p_probs, p_token_ids = self._make_dists(
+            bs, n_drafts, [(3, 7)] * (bs * n_drafts)
+        )
         draft_tokens = torch.full((bs, n_drafts), 7, dtype=torch.int64)
         exact_match = torch.ones(bs, n_drafts, dtype=torch.bool)
         greedy_mask = torch.tensor([False])
 
         accepted, accept_indices = compute_mtp_acceptance(
-            q, p, draft_tokens, exact_match, greedy_mask
+            q_probs,
+            q_token_ids,
+            p_probs,
+            p_token_ids,
+            draft_tokens,
+            exact_match,
+            greedy_mask,
         )
 
         assert not accepted.any()
         assert (accept_indices == 0).all()
 
-    def test_all_greedy_uses_exact_match(self, global_args):
+    def test_all_greedy_uses_exact_match(self):
         """Greedy should use exact_match regardless of q/p distributions."""
         from chitu.ops.sampling import compute_mtp_acceptance
 
-        V = global_args.models.vocab_size
         bs, n_drafts = 2, 2
         mtp_size = n_drafts + 1
-        q = torch.zeros(bs, n_drafts, V)
-        p = torch.zeros(bs, n_drafts, V)
-        q[:, :, 5] = 1.0
-        p[:, :, 5] = 1.0
+        q_probs, q_token_ids, p_probs, p_token_ids = self._make_dists(
+            bs, n_drafts, [(5, 5)] * (bs * n_drafts)
+        )
         draft_tokens = torch.full((bs, n_drafts), 5, dtype=torch.int64)
         exact_match = torch.tensor([[True, True], [True, False]])
         greedy_mask = torch.tensor([True, True])
 
         accepted, accept_indices = compute_mtp_acceptance(
-            q, p, draft_tokens, exact_match, greedy_mask
+            q_probs,
+            q_token_ids,
+            p_probs,
+            p_token_ids,
+            draft_tokens,
+            exact_match,
+            greedy_mask,
         )
 
         assert accepted[0].all()
@@ -505,25 +540,27 @@ class TestComputeMtpAcceptance:
         assert accept_indices[0].item() == mtp_size - 1
         assert accept_indices[1].item() == 1
 
-    def test_mixed_batch(self, global_args):
+    def test_mixed_batch(self):
         """Greedy follows exact_match; non-greedy follows probabilistic."""
         from chitu.ops.sampling import compute_mtp_acceptance
 
-        V = global_args.models.vocab_size
         bs, n_drafts = 2, 2
         mtp_size = n_drafts + 1
-        q = torch.zeros(bs, n_drafts, V)
-        p = torch.zeros(bs, n_drafts, V)
-        q[0, :, 3] = 1.0
-        p[0, :, 7] = 1.0
-        q[1, :, 5] = 1.0
-        p[1, :, 5] = 1.0
+        q_probs, q_token_ids, p_probs, p_token_ids = self._make_dists(
+            bs, n_drafts, [(3, 7), (3, 7), (5, 5), (5, 5)]
+        )
         draft_tokens = torch.tensor([[7, 7], [5, 5]], dtype=torch.int64)
         exact_match = torch.ones(bs, n_drafts, dtype=torch.bool)
         greedy_mask = torch.tensor([True, False])
 
         accepted, accept_indices = compute_mtp_acceptance(
-            q, p, draft_tokens, exact_match, greedy_mask
+            q_probs,
+            q_token_ids,
+            p_probs,
+            p_token_ids,
+            draft_tokens,
+            exact_match,
+            greedy_mask,
         )
 
         assert accepted[0].all()
@@ -531,22 +568,26 @@ class TestComputeMtpAcceptance:
         assert accepted[1].all()
         assert accept_indices[1].item() == mtp_size - 1
 
-    def test_accept_indices_boundary(self, global_args):
+    def test_accept_indices_boundary(self):
         """accept_indices: all accepted → n_drafts; first rejection at d → d."""
         from chitu.ops.sampling import compute_mtp_acceptance
 
-        V = global_args.models.vocab_size
         bs, n_drafts = 3, 3
-        q = torch.zeros(bs, n_drafts, V)
-        p = torch.zeros(bs, n_drafts, V)
-
-        q[0, :, 5] = 1.0
-        p[0, :, 5] = 1.0
-        q[1, :, 3] = 1.0
-        p[1, :, 7] = 1.0
-        q[2, :, 3] = 1.0
-        p[2, :, 7] = 1.0
-
+        q_probs, q_token_ids, p_probs, p_token_ids = self._make_dists(
+            bs,
+            n_drafts,
+            [
+                (5, 5),
+                (5, 5),
+                (5, 5),
+                (3, 7),
+                (3, 7),
+                (3, 7),
+                (3, 7),
+                (3, 7),
+                (3, 7),
+            ],
+        )
         draft_tokens = torch.tensor(
             [[5, 5, 5], [7, 7, 7], [7, 7, 7]], dtype=torch.int64
         )
@@ -554,7 +595,13 @@ class TestComputeMtpAcceptance:
         greedy_mask = torch.tensor([False, False, False])
 
         _, accept_indices = compute_mtp_acceptance(
-            q, p, draft_tokens, exact_match, greedy_mask
+            q_probs,
+            q_token_ids,
+            p_probs,
+            p_token_ids,
+            draft_tokens,
+            exact_match,
+            greedy_mask,
         )
 
         assert accept_indices[0].item() == n_drafts
@@ -622,7 +669,8 @@ class TestFilterLogitsTopKTopP:
         assert probs[1, 0].item() > 0.59
         assert probs[1, 1].item() > 0
 
-    def test_topk_filter_unnormalized(self, global_args):
+    def test_topk_filter_top_p_zero(self, global_args):
+        """top_p=0 keeps only the top token; its mass renormalizes to 1.0."""
         from chitu.ops.sampling import filter_logits_top_k_top_p
 
         V = global_args.models.vocab_size
@@ -633,46 +681,25 @@ class TestFilterLogitsTopKTopP:
             logits, top_ks, top_ps, max_top_k=4
         )
         assert probs.shape == (1, 4)
-        assert probs[0, 0].item() > 0
+        assert probs[0, 0].item() == pytest.approx(1.0, abs=1e-6)
         assert probs[0, 1].item() == 0.0
 
-    def test_unnormalized_sum_less_than_one(self):
+    def test_topp_renormalizes_surviving_mass(self):
+        """Surviving rows are renormalized into a conditional distribution."""
         from chitu.ops.sampling import filter_logits_top_k_top_p
 
-        logits = torch.zeros(1, 16)
+        logits = torch.full((1, 16), -100.0)
         logits[0, 5] = 1.0
         logits[0, 10] = 1.0
-        logits[0, 3] = 1.0
-        logits[0, 7] = 1.0
         top_ks = torch.tensor([10])
         top_ps = torch.tensor([0.5])
         probs, _ = filter_logits_top_k_top_p(logits, top_ks, top_ps, max_top_k=8)
-        assert probs.sum().item() < 1.0
-        assert probs[0, 0].item() > 0
-        assert probs[0, 3].item() == 0.0
-
-
-# ========================================================
-#  scatter_probs_to_vocab — pure-function unit test
-# ========================================================
-
-
-class TestScatterProbsToVocab:
-    """Test chitu.ops.sampling.scatter_probs_to_vocab."""
-
-    def test_scatter_maps_correctly(self):
-        from chitu.ops.sampling import scatter_probs_to_vocab
-
-        probs = torch.tensor([[1.0, 0.5], [0.3, 0.7]])
-        token_ids = torch.tensor([[5, 10], [3, 7]], dtype=torch.int64)
-        V = 16
-        result = scatter_probs_to_vocab(probs, token_ids, V)
-        assert result.shape == (2, 16)
-        assert result[0, 5].item() == 1.0
-        assert result[0, 10].item() == 0.5
-        assert result[1, 3].item() == pytest.approx(0.3, abs=1e-3)
-        assert result[1, 7].item() == pytest.approx(0.7, abs=1e-3)
-        assert result[0, 0].item() == 0.0
+        # Two equal-logit tokens dominate; top-p=0.5 keeps exactly both, so
+        # after renormalization each holds half of the surviving mass.
+        assert probs.sum().item() == pytest.approx(1.0, abs=1e-5)
+        assert probs[0, 0].item() == pytest.approx(0.5, abs=1e-3)
+        assert probs[0, 1].item() == pytest.approx(0.5, abs=1e-3)
+        assert probs[0, 2].item() == 0.0
 
 
 # ========================================================
@@ -704,8 +731,9 @@ class TestGumbelMaxSample:
 
 
 class TestSampleDraftTokens:
-    """Sampler.sample_draft_tokens returns (token, p') with p' = the exact
-    distribution the draft was sampled from (verify consumes it directly)."""
+    """Sampler.sample_draft_tokens returns (token, p') where p' is a sparse
+    (probs, token_ids) top-k pair = the exact distribution the draft was sampled
+    from (verify consumes it directly, without a full-vocab scatter)."""
 
     def test_all_greedy_returns_none(self, sampler, global_args):
         """All-greedy fast path: p' is not needed (exact-match verify) -> None."""
@@ -729,14 +757,21 @@ class TestSampleDraftTokens:
 
         token, p_prime = sampler.sample_draft_tokens(logits)
 
-        assert p_prime.shape == (bs, V)
-        # filter_logits_top_k_top_p does NOT renormalize after top-p filtering,
-        # so p' sums to <= 1 (never above); the sampled token keeps its mass.
-        assert bool((p_prime.sum(dim=-1) <= 1.0 + 1e-6).all())
-        assert bool((p_prime.sum(dim=-1) > 0).all())
+        assert p_prime is not None
+        probs, token_ids = p_prime
+        assert probs.shape == (bs, 50)
+        assert token_ids.shape == (bs, 50)
+        # p' is renormalized over the surviving support: each row is a proper
+        # conditional distribution (sums to 1); the sampled token keeps its mass.
+        assert torch.allclose(
+            probs.sum(dim=-1),
+            torch.ones(bs, dtype=probs.dtype, device=probs.device),
+            atol=1e-5,
+        )
+        assert bool((probs.sum(dim=-1) > 0).all())
         for b in range(bs):
             # the sampled token must come from the proposal distribution
-            assert p_prime[b, token[b].item()] > 0
+            assert bool((probs[b][token_ids[b] == token[b]] > 0).any())
 
     def test_mixed_batch_greedy_row_onehot(self, sampler, global_args):
         """Mixed batch: greedy row keeps argmax and p' degenerates to one-hot at it."""
@@ -756,11 +791,16 @@ class TestSampleDraftTokens:
         token, p_prime = sampler.sample_draft_tokens(logits)
 
         assert token[0].item() == 5  # greedy row: argmax
-        onehot = torch.zeros(V, dtype=p_prime.dtype)
-        onehot[5] = 1.0
-        assert torch.allclose(p_prime[0], onehot, atol=1e-6)
-        assert 0 < p_prime[1].sum() <= 1.0 + 1e-6
-        assert p_prime[1, token[1].item()] > 0
+        assert p_prime is not None
+        probs, token_ids = p_prime
+        assert probs.shape == (bs, 50)
+        # greedy row: p' degenerates to a one-hot at its argmax
+        active0 = probs[0] > 0
+        assert active0.sum().item() == 1
+        assert token_ids[0][active0].item() == 5
+        assert probs[0][active0].item() == pytest.approx(1.0, abs=1e-6)
+        assert probs[1].sum().item() == pytest.approx(1.0, abs=1e-5)
+        assert bool((probs[1][token_ids[1] == token[1]] > 0).any())
 
 
 # ========================================================
@@ -786,18 +826,30 @@ class TestResampleMtpRejected:
                     q_token_ids[row, 0] = tid
         return q_probs, q_token_ids
 
-    def test_greedy_skipped(self, global_args):
+    @staticmethod
+    def _make_p_sparse(bs, n_drafts, positions, K=8):
+        """Create a sparse p (probs, token_ids) with one-hot mass at (b, d) positions."""
+        p_probs = torch.zeros(bs, n_drafts, K)
+        p_token_ids = torch.zeros(bs, n_drafts, K, dtype=torch.int64)
+        for b in range(bs):
+            for d in range(n_drafts):
+                tid = positions[b][d]
+                if tid >= 0:
+                    p_probs[b, d, 0] = 1.0
+                    p_token_ids[b, d, 0] = tid
+        return p_probs, p_token_ids
+
+    def test_greedy_skipped(self):
         """Greedy requests: accepted draft positions emit the draft token."""
         from chitu.ops.sampling import resample_mtp_rejected
 
-        V = global_args.models.vocab_size
         bs, mtp_size = 2, 3
         n_drafts = mtp_size - 1
         K = 8
         tokens = torch.tensor([[10, 20, 30], [40, 50, 60]], dtype=torch.int64)
         q_probs = torch.zeros(bs * mtp_size, K)
         q_token_ids = torch.zeros(bs * mtp_size, K, dtype=torch.int64)
-        p = torch.zeros(bs, n_drafts, V)
+        p_probs, p_token_ids = self._make_p_sparse(bs, n_drafts, [[-1, -1], [-1, -1]])
         draft_tokens = torch.tensor([[10, 20], [40, 50]], dtype=torch.int64)
         accept_indices = torch.tensor([0, 1], dtype=torch.int64)
         greedy_mask = torch.tensor([True, True])
@@ -806,7 +858,8 @@ class TestResampleMtpRejected:
             tokens,
             q_probs,
             q_token_ids,
-            p,
+            p_probs,
+            p_token_ids,
             draft_tokens,
             accept_indices,
             greedy_mask,
@@ -821,11 +874,10 @@ class TestResampleMtpRejected:
         assert result[1, 1].item() == 50
         assert result[1, 2].item() == 60
 
-    def test_rejection_resample_to_deterministic_token(self, global_args):
+    def test_rejection_resample_to_deterministic_token(self):
         """Rejection writes to positions 0..n_drafts-1 (same positions as drafts)."""
         from chitu.ops.sampling import resample_mtp_rejected
 
-        V = global_args.models.vocab_size
         bs, mtp_size = 2, 3
         n_drafts = mtp_size - 1
         K = 8
@@ -837,8 +889,7 @@ class TestResampleMtpRejected:
         q_probs[0, 0] = 1.0  # row = 0*3 + 0 = position 0 (verified against draft[0])
         q_token_ids[0, 0] = 42
 
-        p = torch.zeros(bs, n_drafts, V)
-        p[0, 0, 10] = 1.0
+        p_probs, p_token_ids = self._make_p_sparse(bs, n_drafts, [[10, -1], [-1, -1]])
         draft_tokens = torch.tensor([[10, 20], [40, 50]], dtype=torch.int64)
         accept_indices = torch.tensor([0, 1], dtype=torch.int64)
         greedy_mask = torch.tensor([False, True])
@@ -847,7 +898,8 @@ class TestResampleMtpRejected:
             tokens.clone(),
             q_probs,
             q_token_ids,
-            p,
+            p_probs,
+            p_token_ids,
             draft_tokens,
             accept_indices,
             greedy_mask,
@@ -863,11 +915,10 @@ class TestResampleMtpRejected:
         assert result[1, 1].item() == 99
         assert result[1, 2].item() == 60
 
-    def test_bonus_token_selection(self, global_args):
+    def test_bonus_token_selection(self):
         """All accepted → bonus token (tokens[:, n_drafts]) kept as-is from _sample_mtp."""
         from chitu.ops.sampling import resample_mtp_rejected
 
-        V = global_args.models.vocab_size
         bs, mtp_size = 1, 3
         n_drafts = mtp_size - 1
         K = 8
@@ -876,7 +927,7 @@ class TestResampleMtpRejected:
         q_probs = torch.zeros(bs * mtp_size, K)
         q_token_ids = torch.zeros(bs * mtp_size, K, dtype=torch.int64)
 
-        p = torch.zeros(bs, n_drafts, V)
+        p_probs, p_token_ids = self._make_p_sparse(bs, n_drafts, [[-1, -1]])
         draft_tokens = torch.tensor([[20, 99]], dtype=torch.int64)
         accept_indices = torch.tensor([n_drafts], dtype=torch.int64)
         greedy_mask = torch.tensor([False])
@@ -885,7 +936,8 @@ class TestResampleMtpRejected:
             tokens.clone(),
             q_probs,
             q_token_ids,
-            p,
+            p_probs,
+            p_token_ids,
             draft_tokens,
             accept_indices,
             greedy_mask,
@@ -899,11 +951,10 @@ class TestResampleMtpRejected:
         # position 2 (n_drafts, bonus): kept as-is from _sample_mtp
         assert result[0, n_drafts].item() == 99
 
-    def test_mixed_greedy_non_greedy(self, global_args):
+    def test_mixed_greedy_non_greedy(self):
         """Mixed batch: non-greedy resampled, greedy accepted drafts emitted."""
         from chitu.ops.sampling import resample_mtp_rejected
 
-        V = global_args.models.vocab_size
         bs, mtp_size = 2, 3
         n_drafts = mtp_size - 1
         K = 8
@@ -915,8 +966,7 @@ class TestResampleMtpRejected:
         q_probs[0, 0] = 1.0  # row = 0*3 + 0 = position 0
         q_token_ids[0, 0] = 5
 
-        p = torch.zeros(bs, n_drafts, V)
-        p[0, 0, 10] = 1.0
+        p_probs, p_token_ids = self._make_p_sparse(bs, n_drafts, [[10, -1], [-1, -1]])
         draft_tokens = torch.tensor([[10, 20], [40, 50]], dtype=torch.int64)
         accept_indices = torch.tensor([0, 1], dtype=torch.int64)
         greedy_mask = torch.tensor([False, True])
@@ -925,7 +975,8 @@ class TestResampleMtpRejected:
             tokens.clone(),
             q_probs,
             q_token_ids,
-            p,
+            p_probs,
+            p_token_ids,
             draft_tokens,
             accept_indices,
             greedy_mask,
@@ -1186,7 +1237,7 @@ class TestVerifyMtpMixed:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1229,7 +1280,7 @@ class TestVerifyMtpMixed:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1280,7 +1331,7 @@ class TestVerifyMtpMixed:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1324,7 +1375,7 @@ class TestVerifyMtpMixed:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1333,6 +1384,98 @@ class TestVerifyMtpMixed:
         assert accept_indices[0].item() == 0
         assert out_tokens[0, 0].item() == 42  # draft[0] rejected, pos 0 resampled to 42
         assert out_tokens[0, 1].item() == 20  # draft[1] accepted (q_d=1.0, p_d=1.0)
+
+
+class TestRejectionSamplingRenormalization:
+    """Regression: top-p filtered probs are renormalized, so MTP rejection
+    sampling reproduces the renormalized target q.
+
+    Guarded bug: filter_logits_top_k_top_p used to return UNnormalized probs.
+    Gumbel-max sampling (scale-invariant) effectively drew from probs/sum, but
+    compute_mtp_acceptance / resample_mtp_rejected compared raw probs -> the
+    output drifted from the target by sum(p)/sum(q). The logits below leave
+    sum(q)=0.65 vs sum(p)=0.91 after top-p, so the broken version lands ~0.15
+    off on each surviving token -- far outside the 0.02 tolerance.
+    """
+
+    def test_output_matches_renormalized_target(self):
+        from chitu.ops.sampling import (
+            compute_mtp_acceptance,
+            filter_logits_top_k_top_p,
+            gumbel_max_sample,
+            resample_mtp_rejected,
+        )
+
+        V = 6
+        mtp_size = 2
+        n_drafts = mtp_size - 1
+        top_p = 0.6
+
+        q_logits = torch.tensor([[-1.597, 0.246, 0.747, 2.417, 2.096, 2.32]])
+        p_logits = torch.tensor([[-0.608, 0.076, -0.206, 2.421, 2.789, -1.245]])
+
+        top_ks = torch.tensor([V], dtype=torch.int32)
+        top_ps = torch.tensor([top_p], dtype=torch.float32)
+        q_probs, q_token_ids = filter_logits_top_k_top_p(
+            q_logits, top_ks, top_ps, max_top_k=V
+        )
+        p_probs, p_token_ids = filter_logits_top_k_top_p(
+            p_logits, top_ks, top_ps, max_top_k=V
+        )
+
+        # The fix: each surviving row is a proper distribution.
+        assert q_probs.sum(-1).item() == pytest.approx(1.0, abs=1e-5)
+        assert p_probs.sum(-1).item() == pytest.approx(1.0, abs=1e-5)
+
+        torch.manual_seed(0)
+        n_trials = 200_000
+
+        # Independent trials: the draft is sampled from the proposal p and
+        # verified against the target q through the production ops.
+        p_probs_t = p_probs.repeat(n_trials, 1)
+        p_token_ids_t = p_token_ids.repeat(n_trials, 1)
+        draft = gumbel_max_sample(p_probs_t, p_token_ids_t).unsqueeze(-1)
+
+        q_all_probs = q_probs.repeat(mtp_size * n_trials, 1)
+        q_all_token_ids = q_token_ids.repeat(mtp_size * n_trials, 1)
+        q_draft_probs = q_probs.repeat(n_drafts * n_trials, 1)
+        q_draft_token_ids = q_token_ids.repeat(n_drafts * n_trials, 1)
+        p_probs_3d = p_probs.repeat(n_trials, n_drafts, 1)
+        p_token_ids_3d = p_token_ids.repeat(n_trials, n_drafts, 1)
+
+        tokens = torch.zeros(n_trials, mtp_size, dtype=torch.int64)
+        exact_match = torch.zeros(n_trials, n_drafts, dtype=torch.bool)
+        greedy_mask = torch.zeros(n_trials, dtype=torch.bool)
+
+        _, accept_indices = compute_mtp_acceptance(
+            q_draft_probs,
+            q_draft_token_ids,
+            p_probs_3d,
+            p_token_ids_3d,
+            draft,
+            exact_match,
+            greedy_mask,
+        )
+        out = resample_mtp_rejected(
+            tokens,
+            q_all_probs,
+            q_all_token_ids,
+            p_probs_3d,
+            p_token_ids_3d,
+            draft,
+            accept_indices,
+            greedy_mask,
+            mtp_size,
+        )
+
+        empirical = torch.bincount(out[:, 0], minlength=V).float() / n_trials
+        # q_probs is indexed by top-k rank, not token id: scatter to token-id
+        # space before comparing with the empirical id-indexed histogram.
+        target = torch.zeros(V, dtype=torch.float32)
+        target.scatter_add_(0, q_token_ids[0], q_probs[0])
+        assert torch.allclose(
+            empirical, target, atol=0.02
+        ), "emitted {} != target {}".format(empirical.tolist(), target.tolist())
 
 
 # ========================================================
@@ -1379,7 +1522,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1419,7 +1562,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1462,7 +1605,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1502,7 +1645,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1541,7 +1684,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1578,7 +1721,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1617,7 +1760,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1657,7 +1800,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1695,7 +1838,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1733,7 +1876,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1779,7 +1922,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,
@@ -1822,7 +1965,7 @@ class TestMTPRejectionEdgeCases:
                 tokens.clone(),
                 logits,
                 draft_tokens,
-                draft_logits,
+                _sparse_from_full(draft_logits),
                 greedy_mask,
                 mtp_size,
                 states,
@@ -1870,7 +2013,7 @@ class TestMTPRejectionEdgeCases:
             tokens,
             logits,
             draft_tokens,
-            draft_logits,
+            _sparse_from_full(draft_logits),
             greedy_mask,
             mtp_size,
             states,

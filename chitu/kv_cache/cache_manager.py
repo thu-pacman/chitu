@@ -160,9 +160,20 @@ class PagedKVCacheManager(KVCacheManagerBase):
         number of metadata blocks being prepared; those managers honor
         ``required_identity_blocks`` in their override.
         """
-        return self.identity_builder.make_identity_chain(
+        identities = self.identity_builder.make_identity_chain(
             task, canonical_prefix_hashes=self.enable_prefix_caching
         )
+        if (
+            required_identity_blocks is not None
+            and len(identities) < required_identity_blocks
+        ):
+            # Prefill reserves an MTP-draft lookahead page beyond the prompt;
+            # pad the tail with placeholder identities (no canonical hash yet).
+            placeholder = self.identity_builder.placeholder_identity()
+            identities = identities + [
+                placeholder for _ in range(required_identity_blocks - len(identities))
+            ]
+        return identities
 
     @property
     def num_active_blocks(self):
@@ -385,7 +396,13 @@ class PagedKVCacheManager(KVCacheManagerBase):
         assert (
             len(self.task_to_cache_ids.get(task.task_id, set()))
             == task_num_cached_blocks
-        ), f"task_id={task.task_id}: {len(self.task_to_cache_ids.get(task.task_id,set()))} vs {task_num_cached_blocks}"
+        ), (
+            f"task_id={task.task_id} manager={getattr(self,'manager_name',type(self).__name__)} "
+            f"block_size={self.block_size} type={task.task_type} consumed={task.consumed_req_tokens} "
+            f"prefix_len={task.prefix_tokens_len} target_seq_len={target_seq_len} "
+            f"n_owned={len(self.task_to_cache_ids.get(task.task_id,set()))} "
+            f"n_cached={task_num_cached_blocks} n_target={num_target_blocks}"
+        )
 
         for idx in range(
             len(self.task_to_cache_ids[task.task_id]), num_target_blocks, 1

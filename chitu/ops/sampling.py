@@ -222,13 +222,19 @@ def filter_logits_top_k_top_p(
       2. Mask positions >= top_k[b] with -inf
       3. softmax over reduced space
       4. Mask cumulative mass > top_p[b] to 0
-      5. Mask cumulative mass > top_p[b] to 0
+      5. Renormalize over the surviving support
 
-    Note: probs are NOT renormalized after filtering. Gumbel-max is scale-invariant
-    and compute_mtp_acceptance / resample_mtp_rejected require q and p on comparable scales.
+    Renormalization is required for correctness: Gumbel-max sampling is
+    scale-invariant, so drawing from the filtered (unnormalized) probs is
+    equivalent to drawing from ``probs / sum`` — the effective proposal/target
+    distribution is the conditional distribution over the surviving support.
+    compute_mtp_acceptance / resample_mtp_rejected compare q and p by value, so
+    they MUST receive normalized distributions; otherwise the acceptance ratio
+    and the residual are off by ``sum(p) / sum(q)`` and the output drifts from
+    the target.
 
     Returns:
-        filtered_probs: (N, max_top_k)  unnormalized filtered probabilities
+        filtered_probs: (N, max_top_k)  renormalized filtered probabilities
         token_ids:      (N, max_top_k)  original vocab indices from topk
     """
     if max_top_k is None:
@@ -244,6 +250,12 @@ def filter_logits_top_k_top_p(
     probs = torch.softmax(logits, dim=-1)
     topp_mask = (torch.cumsum(probs, dim=-1) - probs) > top_ps[:, None]
     probs[topp_mask] = 0
+
+    # Renormalize over the surviving support (per row). Row sums are positive
+    # (top-k >= 1 always keeps the top token), the clamp is purely defensive.
+    probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(probs.dtype).tiny
+    )
 
     return probs, token_ids
 
@@ -262,19 +274,6 @@ def gumbel_max_sample(
     return torch.gather(token_ids, index=sample_idx[:, None], dim=1).squeeze(1)
 
 
-def scatter_probs_to_vocab(
-    probs: torch.Tensor,
-    token_ids: torch.Tensor,
-    vocab_size: int,
-) -> torch.Tensor:
-    """Scatter reduced-space (N, K) probabilities into full (N, vocab_size) tensor."""
-    result = torch.zeros(
-        probs.shape[0], vocab_size, dtype=probs.dtype, device=probs.device
-    )
-    result.scatter_(-1, token_ids, probs)
-    return result
-
-
 def top_k_top_p_min_p_sampling_from_logits(
     logits: torch.Tensor,
     top_ks: torch.Tensor,
@@ -287,9 +286,33 @@ def top_k_top_p_min_p_sampling_from_logits(
     return gumbel_max_sample(filtered_probs, token_ids)
 
 
+def _sparse_lookup(
+    probs: torch.Tensor,
+    token_ids: torch.Tensor,
+    query_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Look up probability mass of a sparse (probs, token_ids) row at query ids.
+
+    ``token_ids`` rows may contain padding ids whose probability is 0, so the
+    mask-sum is exact: a query id matches at most one active position per row.
+
+    Args:
+        probs:      (N, K)  sparse probabilities (0 where masked/padded)
+        token_ids:  (N, K)  matching vocab ids from top-k
+        query_ids:  (N, Q)  vocab ids to look up
+
+    Returns:
+        (N, Q) probability at each query id (0 where the id is absent).
+    """
+    matches = token_ids.unsqueeze(1) == query_ids.unsqueeze(2)  # (N, Q, K)
+    return (probs.unsqueeze(1) * matches).sum(-1)
+
+
 def compute_mtp_acceptance(
-    q: torch.Tensor,
-    p: torch.Tensor,
+    q_probs: torch.Tensor,
+    q_token_ids: torch.Tensor,
+    p_probs: torch.Tensor,
+    p_token_ids: torch.Tensor,
     draft_tokens: torch.Tensor,
     exact_match: torch.Tensor,
     greedy_mask: torch.Tensor,
@@ -301,27 +324,40 @@ def compute_mtp_acceptance(
     For non-greedy requests:
         accepted = (rand < min(1, q(d)/p(d)))
 
+    q and p are passed as sparse top-k ``(probs, token_ids)`` pairs -- the only
+    values consumed are those at the draft token positions, so materializing
+    full-vocab tensors is unnecessary. Both must be normalized over their
+    surviving support (filter_logits_top_k_top_p returns such rows); comparing
+    raw masses would bias acceptance by ``sum(p) / sum(q)``.
+
     Args:
-        q:           (bs, n_drafts, vocab)  target softmax distribution (with temperature)
-        p:           (bs, n_drafts, vocab)  draft softmax distribution (no temperature)
-        draft_tokens:(bs, n_drafts)         draft token ids (from MTP layers)
-        exact_match: (bs, n_drafts) bool    sampled_token == draft token
-        greedy_mask: (bs,) bool             which requests are greedy
+        q_probs:      (bs*n_drafts, K)  target top-k probs at draft positions
+        q_token_ids:  (bs*n_drafts, K)  target top-k vocab ids
+        p_probs:      (bs, n_drafts, K) draft proposal top-k probs
+        p_token_ids:  (bs, n_drafts, K) draft proposal top-k vocab ids
+        draft_tokens: (bs, n_drafts)    draft token ids (from MTP layers)
+        exact_match:  (bs, n_drafts) bool  sampled_token == draft token
+        greedy_mask:  (bs,) bool        which requests are greedy
 
     Returns:
         accepted:       (bs, n_drafts) bool  per-depth acceptance
         accept_indices: (bs,) long            first rejected depth, or n_drafts if all accepted
     """
-    bs, n_drafts, _ = q.shape
+    bs, n_drafts = draft_tokens.shape
     mtp_size = n_drafts + 1
 
     # Probabilistic acceptance for non-greedy:
     #   q(d): target probability of the draft token
     #   p(d): draft probability of the draft token
-    q_d = q.gather(-1, draft_tokens.unsqueeze(-1)).squeeze(-1)  # (bs, n_drafts)
-    p_d = p.gather(-1, draft_tokens.unsqueeze(-1)).squeeze(-1)  # (bs, n_drafts)
+    draft_flat = draft_tokens.reshape(bs * n_drafts, 1)
+    q_d = _sparse_lookup(q_probs, q_token_ids, draft_flat).view(bs, n_drafts)
+    p_d = _sparse_lookup(
+        p_probs.reshape(bs * n_drafts, -1),
+        p_token_ids.reshape(bs * n_drafts, -1),
+        draft_flat,
+    ).view(bs, n_drafts)
     accept_prob = torch.clamp(q_d / p_d, max=1.0)  # min(1, q(d)/p(d))
-    rand = torch.rand(bs, n_drafts, device=q.device)
+    rand = torch.rand(bs, n_drafts, device=q_probs.device)
     prob_accepted = rand < accept_prob  # (bs, n_drafts)
 
     # Per-request dispatch: exact_match for greedy, prob_accepted for non-greedy
@@ -339,7 +375,8 @@ def resample_mtp_rejected(
     tokens: torch.Tensor,
     q_all_probs: torch.Tensor,
     q_all_token_ids: torch.Tensor,
-    p: torch.Tensor,
+    p_probs: torch.Tensor,
+    p_token_ids: torch.Tensor,
     draft_tokens: torch.Tensor,
     accept_indices: torch.Tensor,
     greedy_mask: torch.Tensor,
@@ -356,11 +393,20 @@ def resample_mtp_rejected(
     (target's KV cache and MTP hidden states advance on drafts).  Rejected
     positions are resampled from norm(max(0, q - p)).
 
+    q and p must be normalized over their surviving support (as returned by
+    filter_logits_top_k_top_p); otherwise the residual is off by the scale
+    mismatch and the output drifts from the target.
+
+    p is passed as a sparse top-k ``(probs, token_ids)`` pair -- only the values
+    at the target's top-k positions are consumed, so no full-vocab tensor is
+    materialized.
+
     Args:
         tokens:         (bs, mtp_size)          in/out — sampled token ids
         q_all_probs:    (bs*mtp_size, K)        filtered target probs (all positions)
         q_all_token_ids:(bs*mtp_size, K)        token indices from top-k
-        p:              (bs, n_drafts, V)       draft proposal distribution (same as sample_draft_tokens)
+        p_probs:        (bs, n_drafts, K)       draft proposal top-k probs
+        p_token_ids:    (bs, n_drafts, K)       draft proposal top-k vocab ids
         draft_tokens:   (bs, n_drafts)          draft token ids (what was proposed)
         accept_indices: (bs,) long              first rejected draft depth, or n_drafts if all accepted
         greedy_mask:    (bs,) bool
@@ -381,9 +427,12 @@ def resample_mtp_rejected(
     q_probs = q_probs_3d[:, :n_drafts].reshape(bs * n_drafts, K)
     q_token_ids = q_token_ids_3d[:, :n_drafts].reshape(bs * n_drafts, K)
 
-    # ---- gather p at q_token_ids positions ----
-    p_flat = p.reshape(bs * n_drafts, -1)  # (bs*n_drafts, V)
-    p_reduced = p_flat.gather(-1, q_token_ids).view(bs, n_drafts, K)
+    # ---- lookup p at q_token_ids positions (sparse, no full-vocab tensor) ----
+    p_reduced = _sparse_lookup(
+        p_probs.reshape(bs * n_drafts, -1),
+        p_token_ids.reshape(bs * n_drafts, -1),
+        q_token_ids,
+    ).view(bs, n_drafts, K)
 
     # ---- residual = max(0, q - p) ----
     residual = torch.clamp(q_probs.view(bs, n_drafts, K) - p_reduced, min=0)
