@@ -567,7 +567,9 @@ class PagedKVCache(KVCacheBase):
             quant_type=quant_type,
             device=device,
         )
-        mtp_extra = self.mtp_size if (self.mtp_size > 1 and not is_singleton) else 0
+        # The MTP draft window reads up to 2*mtp_size positions ahead of the main token,
+        # so reserve the same lookahead in the page-table stride (see Task.kv_cache_len_used_in_completed_steps_and_next_step).
+        mtp_extra = 2 * self.mtp_size if (self.mtp_size > 1 and not is_singleton) else 0
         if page_table_max_seq_len is None:
             page_table_max_seq_len = max_seq_len + mtp_extra
         else:
@@ -860,22 +862,6 @@ class PagedKVCache(KVCacheBase):
         # paged kv cache in place.
         super().prepare_cache_decode(tasks)
         self._update_block_table_from_scheduler(tasks, incremental=True)
-
-    @override
-    def update_mtp_cache_accept(
-        self, tasks: "PackedTasksBase", mtp_accept_indices: list[int]
-    ):
-        super().update_mtp_cache_accept(tasks, mtp_accept_indices)
-        # TODO: incremental update
-        self._upd_gpu_block_table(tasks.task_ids)
-
-    @override
-    def prepare_mtp_cache_decode(self, tasks, draft_offset):
-        super().prepare_mtp_cache_decode(tasks, draft_offset)
-        # FIXME: prepare mtp blocks
-        # self._update_block_table_from_scheduler(tasks, incremental=True)
-        # TODO: incremental update
-        self._upd_gpu_block_table(tasks.task_ids)
 
     def prepare_cache_decode_dllm(
         self,

@@ -885,7 +885,21 @@ class Task:
     def kv_cache_len_used_in_completed_steps_and_next_step(self):
         """在下一个step完成后缓存到kv cache中的token长度"""
         if self.task_type == TaskType.Prefill:
-            return self.consumed_req_tokens + self.next_req_tokens_len
+            # The first MTP draft runs before the first decode scheduler allocation is
+            # applied to the block table, so the final prefill chunk reserves the draft
+            # lookahead pages itself (mtp_size beyond the prompt).
+            # Only the FINAL prefill chunk (the one that completes the prompt and
+            # transitions to decode) reserves MTP draft lookahead pages. Reserving on
+            # every intermediate chunk would allocate more blocks than
+            # num_blocks_for_seq_len(consumed_req_tokens) accounts for, so the next
+            # chunk's prepare_metadata_before_prefill invariant would break.
+            mtp_lookahead = 0
+            if get_global_args().infer.mtp_size > 1 and (
+                self.consumed_req_tokens + self.next_req_tokens_len
+                >= self.prefix_tokens_len
+            ):
+                mtp_lookahead = get_global_args().infer.mtp_size
+            return self.consumed_req_tokens + self.next_req_tokens_len + mtp_lookahead
         elif self.task_type == TaskType.Decode:
             # For DLLM decode, need decoding_start + block_length
             if (
@@ -897,7 +911,7 @@ class Task:
                     get_global_args().infer.max_seq_len,
                 )
             return min(
-                self.prefix_tokens_len - 1 + get_global_args().infer.mtp_size,
+                self.prefix_tokens_len - 1 + get_global_args().infer.mtp_size * 2,
                 get_global_args().infer.max_seq_len,
             )
         else:

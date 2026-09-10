@@ -1025,7 +1025,7 @@ def test_single_decode_prompt_seq_bigger_than_kvcache_capacity():
 
     NUM_BLOCKS = 2
     BLOCK_SIZE = 512
-    DIFF = 5
+    DIFF = 5  # decode steps that fit after reserving the MTP lookahead
 
     Backend.cache_managers = [
         {
@@ -1042,7 +1042,9 @@ def test_single_decode_prompt_seq_bigger_than_kvcache_capacity():
     Backend.executor = MockExecutor()
 
     req = UserRequest.create_mock(
-        input_len=NUM_BLOCKS * BLOCK_SIZE - DIFF,
+        input_len=NUM_BLOCKS * BLOCK_SIZE
+        - DIFF
+        - 1,  # decode prop = prefix+1 (mtp_size=1)
         request_id=f"req_0",
         enable_thinking=False,
     )

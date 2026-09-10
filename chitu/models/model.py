@@ -1534,7 +1534,7 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def draft(
         self, tasks, last_tokens: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None] | None:
         from chitu.backend import Backend
 
         sampler = Backend.executor.sampler
@@ -1555,7 +1555,8 @@ class Transformer(nn.Module):
         is_main_rank = Backend.executor.is_main_rank
         tokens = last_tokens
         token_list = []
-        prob_list = []
+        probs_list = []
+        token_ids_list = []
 
         if self.do_decode_callable_mtp is None:
             self._init_mtp_draft_callable(bs, tokens)
@@ -1581,9 +1582,12 @@ class Transformer(nn.Module):
 
             if is_main_rank:
                 if sampler is not None:
-                    token, draft_prob = sampler.sample_draft_tokens(logits)
+                    token, draft_proposal = sampler.sample_draft_tokens(logits)
                     token_list.append(token)
-                    prob_list.append(draft_prob)
+                    if draft_proposal is not None:
+                        probs, token_ids = draft_proposal
+                        probs_list.append(probs)
+                        token_ids_list.append(token_ids)
                 else:
                     token = torch.argmax(logits, dim=-1)
             else:
@@ -1592,13 +1596,17 @@ class Transformer(nn.Module):
             tokens = token
 
         if is_main_rank and sampler is not None:
-            # All-greedy batches return p' = None (never stacked).
-            draft_probs = (
-                torch.stack(prob_list, dim=1) if prob_list[0] is not None else None
-            )
+            # All-greedy batches never produce p' (sample_draft_tokens returns
+            # None), so probs_list stays empty and draft_probs = None.
+            draft_probs = None
+            if probs_list:
+                draft_probs = (
+                    torch.stack(probs_list, dim=1),  # (bs, K-1, K_max)
+                    torch.stack(token_ids_list, dim=1),
+                )
             return (
                 torch.stack(token_list, dim=1),  # (bs, K-1)
-                draft_probs,  # (bs, K-1, vocab) proposal p', or None (all-greedy)
+                draft_probs,  # sparse (probs, token_ids) proposal p', or None
             )
         return None
 
