@@ -314,6 +314,8 @@ RUN --mount=from=wheel_builder,source=/tmp/wheels,target=/tmp/wheels \
 
 RUN rm -rf /tmp/*
 COPY ./test ./test
+# The host-only planner regression test compiles against this production header.
+COPY ./csrc/cuda/topk/nvidia_indexer_topk_plan.h ./csrc/cuda/topk/nvidia_indexer_topk_plan.h
 COPY ./script ./script
 COPY ./benchmarks ./benchmarks
 COPY ./chitu/metrics/grafana ./grafana

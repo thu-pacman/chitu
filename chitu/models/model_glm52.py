@@ -21,7 +21,7 @@ import torch
 from chitu.checkpoint_prefix import CheckpointPrefix, as_checkpoint_prefix
 from chitu.kv_cache import KVCacheBase
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.dsa_indexer import DSAIndexer
+from chitu.dsa_indexer_backend import DSAIndexer
 from chitu.task_type import TaskType
 from chitu.models.registry import ModelType, register_model
 from chitu.quantization import QuantizationRegistry

@@ -25,7 +25,7 @@ from chitu.kv_cache import (
 )
 from chitu.cp_utils import get_cp_context
 from chitu.global_vars import get_global_args
-from chitu.dsa_indexer import use_fp8_dsa_indexer_kv
+from chitu.dsa_indexer_backend import use_fp8_dsa_indexer_kv
 from chitu.models.model import (
     Attention,
     MoeGate,
@@ -58,11 +58,10 @@ from chitu.ops import (
     append_to_paged_kv_cache,
     read_from_paged_kv_cache,
     hadamard_transform,
-    topk_indices,
     topk_page_table_decode_cuda,
     a8_per_token_act_quant,
 )
-from chitu.dsa_indexer import DSAIndexer
+from chitu.dsa_indexer_backend import DSAIndexer
 from chitu.quantization import (
     QuantizationRegistry,
     get_quant_from_checkpoint_prefix,
@@ -394,7 +393,9 @@ class Indexer(torch.nn.Module):
 
         def reduce(logits, delta_view):
             lengths = delta_view.delta_position_ids_tensor_device + 1
-            return topk_page_table_decode_cuda(logits, lengths, source_page_table)
+            return self.indexer_impl.topk_page_table(
+                logits, delta_view, lengths, source_page_table
+            )
 
         empty_output = topk_page_table_decode_cuda(
             torch.empty(0, self.indexer_impl.static_max_n, device=x.device),
@@ -444,7 +445,9 @@ class Indexer(torch.nn.Module):
                 else delta_view.new.lens_tensor_device[row_seq_ids]
             )
             # May select some out-of-range items as -inf, which is fine.
-            return topk_indices(logits, k_topk, lengths=lengths)
+            return self.indexer_impl.topk_indices(
+                logits, k_topk, delta_view, lengths=lengths
+            )
 
         empty_output = torch.empty(
             0,

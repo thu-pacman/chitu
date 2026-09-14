@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from omegaconf import OmegaConf
 
 from chitu import global_vars
-import chitu.dsa_indexer as dsa_indexer_module
+import chitu.dsa_indexer_backend as dsa_indexer_module
 from chitu.attn_backend import (
     RefAttnBackend,
     TritonAttnBackend,
@@ -55,7 +55,7 @@ from chitu.ops import (
     apply_rotary_pos_emb_partial,
     hadamard_transform,
 )
-from chitu.dsa_indexer import (
+from chitu.dsa_indexer_backend import (
     DSAIndexer,
     support_indexer_deepgemm,
     support_indexer_hygon,
@@ -369,7 +369,7 @@ def test_dsa_indexer_paged_kv(
         OmegaConf.create(
             {
                 "infer": {
-                    "max_batch_size": 4,
+                    "max_batch_size": max(4, bs),
                     "op_impl": "torch",
                     "use_cuda_graph": False,
                     "tp_size": 1,

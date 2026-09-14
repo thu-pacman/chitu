@@ -30,6 +30,13 @@
 #include "response_append/response_append.h"
 #include "rotary/rotary_pos_emb_llama.h"
 #include "topk/topk.h"
+#if defined(CHITU_NVIDIA_INDEXER_TOPK) && CHITU_NVIDIA_INDEXER_TOPK
+#include "topk/nvidia_indexer_topk.h"
+#endif
+#if defined(CHITU_HYGON_BUILD) && CHITU_HYGON_BUILD == 1
+#include "mhc/hygon_mhc.h"
+#include "topk/hygon_indexer_topk.h"
+#endif
 #include "weight_layout/weight_layout_change.h"
 
 namespace py = pybind11;
@@ -53,6 +60,46 @@ void init_compute(py::module &m) {
     m.def("fast_topk", &fast_topk_interface, "score"_a, "indices"_a,
           "lengths_opt"_a = std::nullopt, "row_starts_opt"_a = std::nullopt,
           "");
+#if defined(CHITU_NVIDIA_INDEXER_TOPK) && CHITU_NVIDIA_INDEXER_TOPK
+    m.def("nvidia_indexer_topk", &nvidia_indexer_topk, "scores"_a, "output"_a,
+          "lengths"_a = std::nullopt, "row_starts"_a = std::nullopt);
+    m.def("nvidia_indexer_topk_with_workspace",
+          &nvidia_indexer_topk_with_workspace, "scores"_a, "output"_a,
+          "candidates"_a, "completion"_a, "plan_parts"_a,
+          "lengths"_a = std::nullopt, "row_starts"_a = std::nullopt,
+          "prefill"_a = false);
+    m.def("nvidia_indexer_topk_plan_parts", &nvidia_indexer_topk_plan_parts,
+          "old_lengths"_a, "new_lengths"_a, "static_width"_a,
+          "prefill"_a = false);
+    m.def("nvidia_indexer_topk_workspace_candidate_elements",
+          &nvidia_indexer_topk_workspace_candidate_elements);
+    m.def("nvidia_indexer_topk_workspace_candidate_elements_for_shape",
+          &nvidia_indexer_topk_workspace_candidate_elements_for_shape);
+    m.def("nvidia_indexer_topk_gather_pages",
+          &nvidia_indexer_topk_gather_pages);
+#endif
+#if defined(CHITU_HYGON_BUILD) && CHITU_HYGON_BUILD == 1
+    m.def("hygon_indexer_topk", &hygon_indexer_topk, "scores"_a, "output"_a,
+          "lengths"_a = std::nullopt, "row_starts"_a = std::nullopt,
+          "Hygon indexer TopK for bfloat16 and float32 scores.");
+    m.def("hygon_indexer_topk_with_workspace",
+          &hygon_indexer_topk_with_workspace, "scores"_a, "output"_a,
+          "candidates"_a, "completion"_a, "plan_parts"_a,
+          "lengths"_a = std::nullopt, "row_starts"_a = std::nullopt,
+          "Hygon FP32 K=2048 multi-CTA TopK with stream-exclusive workspace "
+          "and a required device plan scalar.");
+    m.def("hygon_indexer_topk_plan_parts", &hygon_indexer_topk_plan_parts,
+          "old_lengths"_a, "new_lengths"_a, "static_width"_a,
+          "Choose an active-part upper bound for all causal decode rows.");
+    m.def("hygon_indexer_topk_workspace_candidate_elements",
+          &hygon_indexer_topk_workspace_candidate_elements, "max_rows"_a,
+          "static_width"_a,
+          "Return the persistent int64 candidate capacity for all row shapes.");
+    m.def("hygon_indexer_topk_workspace_candidate_elements_for_shape",
+          &hygon_indexer_topk_workspace_candidate_elements_for_shape, "rows"_a,
+          "score_width"_a,
+          "Return the exact eager int64 candidate capacity for one shape.");
+#endif
     m.def("fast_topk_transform", &fast_topk_transform_interface, "score"_a,
           "lengths"_a, "dst_page_table"_a, "src_page_table"_a, "cu_seqlens_q"_a,
           "row_starts_opt"_a = std::nullopt, "");
@@ -76,9 +123,9 @@ void init_compute(py::module &m) {
           "input"_a, "output"_a, "local_count"_a, "reg_buffer"_a,
           "reg_buffer_size"_a);
     m.def("varlen_reduce_scatter", &varlen_reduce_scatter,
-          "Compact GPU-count reduce-scatterv for ETP-to-DP combine",
-          "handle"_a, "input"_a, "output"_a, "local_count"_a,
-          "reg_buffer"_a, "reg_buffer_size"_a);
+          "Compact GPU-count reduce-scatterv for ETP-to-DP combine", "handle"_a,
+          "input"_a, "output"_a, "local_count"_a, "reg_buffer"_a,
+          "reg_buffer_size"_a);
 #endif
     m.def("dispose", &dispose, "Dispose custom all-reduce instance",
           "handle"_a);
@@ -106,10 +153,11 @@ void init_compute(py::module &m) {
     m.def("cuda_dsa_fp8_kvcache_dequant", &dsa_fp8_kvcache_dequant, "kv_fp8"_a,
           "out"_a = std::nullopt,
           "Dequantize FlashMLA DSA FP8 KV cache layout to bf16.");
-    m.def("cuda_dsa_fp8_paged_kvcache_read_dequant",
-          &dsa_fp8_paged_kvcache_read_dequant, "kv_fp8"_a, "page_table"_a,
-          "position_ids"_a, "seq_ids"_a, "out"_a = std::nullopt,
-          "Read FlashMLA DSA FP8 paged KV cache and dequantize to ragged bf16.");
+    m.def(
+        "cuda_dsa_fp8_paged_kvcache_read_dequant",
+        &dsa_fp8_paged_kvcache_read_dequant, "kv_fp8"_a, "page_table"_a,
+        "position_ids"_a, "seq_ids"_a, "out"_a = std::nullopt,
+        "Read FlashMLA DSA FP8 paged KV cache and dequantize to ragged bf16.");
 #endif
 #if defined ENABLE_MARLIN && ENABLE_MARLIN
     m.def("gptq_marlin_gemm", &gptq_marlin_gemm, "VLLM Marlin GEMM");

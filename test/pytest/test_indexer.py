@@ -3,13 +3,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import re
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-import chitu.dsa_indexer as dsa_indexer_module
-from chitu.dsa_indexer import DSAIndexer
+import chitu.dsa_indexer_backend as dsa_indexer_module
+from chitu.dsa_indexer_backend import DSAIndexer, get_indexer_class
+import chitu.dsa_indexer_backend.base as base_backend
+import chitu.dsa_indexer_backend.bf16_backend as bf16_backend
+import chitu.dsa_indexer_backend.deepgemm_backend as deepgemm_backend
+import chitu.dsa_indexer_backend.hygon_backend as hygon_backend
+import chitu.dsa_indexer_backend.nvidia_topk as nvidia_topk_backend
+import chitu.dsa_indexer_backend.torch_backend as torch_backend
+import chitu.dsa_indexer_backend.triton_backend as triton_backend
+import chitu.ops.topk as topk_module
 from chitu.kv_cache import DenseKVCacheAccessor, PagedKVCacheAccessor
 from chitu.kv_cache.providers.deepseek_v3 import (
     deepseek_v3_indexer_cache_spec,
@@ -26,7 +36,7 @@ class AttrNamespace(SimpleNamespace):
 
 
 def _indexer_without_runtime_init(impl: str) -> DSAIndexer:
-    indexer = object.__new__(DSAIndexer)
+    indexer = object.__new__(get_indexer_class(impl))
     indexer.impl = impl
     indexer.static_max_n = 8192
     indexer.mtp_size = 1
@@ -34,6 +44,17 @@ def _indexer_without_runtime_init(impl: str) -> DSAIndexer:
     indexer._indexer_logits_chunk_bytes = None
     indexer.prefill_schedule = None
     return indexer
+
+
+def _implementation_module(indexer):
+    return {
+        "deepgemm": deepgemm_backend,
+        "hygon": hygon_backend,
+        "torch": torch_backend,
+        "triton": torch_backend,
+        "torch_bf16": bf16_backend,
+        "triton_bf16": bf16_backend,
+    }[indexer.impl]
 
 
 def _seq_len_delta(*, max_len: int = 3, is_decode_stage: bool = False):
@@ -122,12 +143,16 @@ def test_index_score_prefill_reads_cache_then_method_scores(
     ks = torch.tensor([0, 4, 8], dtype=torch.int32)
 
     monkeypatch.setattr(
-        dsa_indexer_module,
+        (
+            bf16_backend
+            if indexer.impl == "deepgemm"
+            else _implementation_module(indexer)
+        ),
         "read_from_paged_kv_cache",
         lambda *a, **k: read_calls.append("bf16") or torch.empty(3, 128),
     )
     monkeypatch.setattr(
-        dsa_indexer_module,
+        deepgemm_backend,
         "read_from_paged_indexer_kv_cache_deepgemm",
         lambda *a, **k: read_calls.append("deepgemm")
         or (torch.empty(3, 1, 128), torch.empty(3, 1, 1)),
@@ -168,7 +193,11 @@ def test_index_score_prefill_reads_cache_then_dispatcher_scores(monkeypatch, imp
     dispatch_calls = []
 
     monkeypatch.setattr(
-        dsa_indexer_module,
+        (
+            bf16_backend
+            if indexer.impl == "deepgemm"
+            else _implementation_module(indexer)
+        ),
         "read_from_paged_kv_cache",
         lambda *a, **k: read_calls.append("bf16") or torch.empty(3, 128),
     )
@@ -178,18 +207,20 @@ def test_index_score_prefill_reads_cache_then_dispatcher_scores(monkeypatch, imp
         return expected
 
     monkeypatch.setattr(
-        dsa_indexer_module, "bf16_index_score_ragged_qk_dsv32", fake_bf16_score
+        _implementation_module(indexer),
+        "bf16_index_score_ragged_qk_dsv32",
+        fake_bf16_score,
     )
     if impl == "triton_bf16":
-        monkeypatch.setattr(dsa_indexer_module, "DEFAULT_BLOCK_M", 8, raising=False)
+        monkeypatch.setattr(triton_backend, "DEFAULT_BLOCK_M", 8, raising=False)
         monkeypatch.setattr(
-            dsa_indexer_module,
+            triton_backend,
             "_bucket_max_n",
             lambda actual_max_n: actual_max_n,
             raising=False,
         )
         monkeypatch.setattr(
-            dsa_indexer_module,
+            triton_backend,
             "build_qblock_schedule",
             lambda ks, block_m, device: (
                 torch.zeros(1, dtype=torch.int32, device=device),
@@ -227,12 +258,16 @@ def test_index_score_decode_uses_paged_scorer_without_read(
     expected = torch.randn(1, 4)
 
     monkeypatch.setattr(
-        dsa_indexer_module,
+        (
+            bf16_backend
+            if indexer.impl == "deepgemm"
+            else _implementation_module(indexer)
+        ),
         "read_from_paged_kv_cache",
         lambda *a, **k: pytest.fail("decode must not read the cache"),
     )
     monkeypatch.setattr(
-        dsa_indexer_module,
+        deepgemm_backend,
         "read_from_paged_indexer_kv_cache_deepgemm",
         lambda *a, **k: pytest.fail("decode must not read the cache"),
     )
@@ -253,7 +288,11 @@ def test_triton_bf16_decode_uses_paged_dispatcher_without_read(monkeypatch):
     expected = torch.randn(1, 4)
 
     monkeypatch.setattr(
-        dsa_indexer_module,
+        (
+            bf16_backend
+            if indexer.impl == "deepgemm"
+            else _implementation_module(indexer)
+        ),
         "read_from_paged_kv_cache",
         lambda *a, **k: pytest.fail("decode must not read the cache"),
     )
@@ -265,7 +304,7 @@ def test_triton_bf16_decode_uses_paged_dispatcher_without_read(monkeypatch):
         return expected
 
     monkeypatch.setattr(
-        dsa_indexer_module,
+        triton_backend,
         "bf16_index_score_ragged_q_paged_k_dsv32",
         fake_bf16_paged_score,
     )
@@ -403,7 +442,7 @@ def test_deepgemm_append_indexer_kv_uses_packed_layout(monkeypatch):
     indexer = _indexer_without_runtime_init("deepgemm")
     appended = []
     monkeypatch.setattr(
-        dsa_indexer_module,
+        deepgemm_backend,
         "append_to_paged_kv_cache_blockfp8_deepgemm",
         lambda *args, **kwargs: appended.append(True),
     )
@@ -423,7 +462,7 @@ def test_bf16_append_indexer_kv_appends_single_tensor(monkeypatch, impl):
     indexer = _indexer_without_runtime_init(impl)
     appended = []
     monkeypatch.setattr(
-        dsa_indexer_module,
+        _implementation_module(indexer),
         "append_to_paged_kv_cache",
         lambda *args, **kwargs: appended.append(True),
     )
@@ -448,14 +487,14 @@ def test_torch_or_triton_append_indexer_kv_appends_k_and_scale(
 
     if cache_layout == "paged":
         monkeypatch.setattr(
-            dsa_indexer_module,
+            _implementation_module(indexer),
             "append_to_paged_kv_cache",
             lambda *args, **kwargs: appended.append(True),
         )
         accessor = _paged_accessor("indexer_k", "indexer_ks")
     else:
         monkeypatch.setattr(
-            dsa_indexer_module,
+            _implementation_module(indexer),
             "append_to_dense_kv_cache",
             lambda *args, **kwargs: appended.append(True),
         )
@@ -552,3 +591,180 @@ def test_torch_ragged_index_score_is_query_sliceable():
     stitched = torch.cat(rows, dim=0)
 
     torch.testing.assert_close(stitched, full)
+
+
+@pytest.mark.parametrize(
+    ("impl", "expected_class"),
+    [
+        ("deepgemm", deepgemm_backend.DeepGEMMIndexer),
+        ("hygon", hygon_backend.HygonIndexer),
+        ("torch", torch_backend.TorchIndexer),
+        ("triton", triton_backend.TritonIndexer),
+        ("torch_bf16", torch_backend.TorchBF16Indexer),
+        ("triton_bf16", triton_backend.TritonBF16Indexer),
+    ],
+)
+@pytest.mark.parametrize("construction", ["explicit", "auto", "concrete"])
+def test_backend_factory_preserves_constructor_and_base_type(
+    monkeypatch, impl, expected_class, construction
+):
+    args = AttrNamespace(
+        infer=AttrNamespace(
+            indexer_type=impl, max_seq_len=1 << 20, max_batch_size=8, mtp_size=1
+        ),
+        models=AttrNamespace(index_topk=2048),
+    )
+    monkeypatch.setattr(base_backend, "get_global_args", lambda: args)
+    validated = []
+    monkeypatch.setattr(
+        dsa_indexer_module,
+        "validate_indexer_config",
+        lambda actual_args, actual_impl: validated.append((actual_args, actual_impl)),
+    )
+    monkeypatch.setattr(
+        deepgemm_backend, "deep_gemm", SimpleNamespace(get_num_sms=lambda: 80)
+    )
+    monkeypatch.setattr(hygon_backend, "get_dp_size", lambda: 1)
+    if construction == "auto":
+        backend = DSAIndexer()
+    elif construction == "concrete":
+        backend = expected_class()
+    else:
+        backend = DSAIndexer(impl)
+    assert type(backend) is expected_class is get_indexer_class(impl)
+    assert isinstance(backend, DSAIndexer)
+    assert backend.impl == impl
+    assert backend.static_max_n == 1 << 20
+    assert validated == [(args, impl)]
+    assert not hasattr(backend, "hygon_indexer_topk")
+    if impl != "hygon":
+        assert not hasattr(backend, "workspace")
+
+
+def test_backend_factory_rejects_unknown_implementation():
+    with pytest.raises(AssertionError, match="Unsupported indexer implementation"):
+        DSAIndexer("unknown")
+
+
+@pytest.mark.parametrize(
+    "first_module", ["chitu.dsa_indexer_backend", "chitu.kv_cache.registry"]
+)
+def test_backend_package_imports_in_a_fresh_process(first_module):
+    # conftest imports models before collection; use a fresh interpreter to
+    # catch package/registry import cycles hidden by already-loaded modules.
+    code = f"""
+import importlib
+importlib.import_module({first_module!r})
+from chitu.dsa_indexer_backend import DSAIndexer
+from chitu.dsa_indexer_backend.base import DSAIndexer as BaseIndexer
+from chitu.models.model_deepseek_v3 import DSAIndexer as DeepSeekIndexer
+from chitu.models.model_glm52 import DSAIndexer as GLMIndexer
+assert DSAIndexer is BaseIndexer is DeepSeekIndexer is GLMIndexer
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "impl", ["deepgemm", "torch", "triton", "torch_bf16", "triton_bf16"]
+)
+def test_backend_topk_fallback_dispatch(monkeypatch, impl):
+    indexer = _indexer_without_runtime_init(impl)
+    logits = torch.empty(2, 32)
+    lengths = torch.tensor([16, 24], dtype=torch.int32)
+    starts = torch.tensor([0, 4], dtype=torch.int32)
+    expected = torch.empty(2, 8, dtype=torch.int64)
+    calls = []
+
+    def generic(actual_logits, k, **kwargs):
+        assert actual_logits is logits and k == 8
+        assert kwargs["lengths"] is lengths
+        assert kwargs["row_starts"] is starts
+        assert kwargs["out_dtype"] == torch.int64
+        if impl in ("deepgemm", "triton"):
+            assert kwargs["impl"] == "torch"
+        else:
+            assert "impl" not in kwargs
+        calls.append(True)
+        return expected
+
+    # NVIDIA TopK backends explicitly request exact Torch for unsupported shapes;
+    # the remaining backends keep the base implementation's generic dispatch.
+    target = nvidia_topk_backend if impl in ("deepgemm", "triton") else base_backend
+    monkeypatch.setattr(target, "topk_indices", generic)
+    assert (
+        indexer.topk_indices(
+            logits,
+            8,
+            object(),
+            lengths=lengths,
+            row_starts=starts,
+            out_dtype=torch.int64,
+        )
+        is expected
+    )
+    assert calls == [True]
+
+
+def test_deepgemm_decode_metadata_reuses_its_static_buffer(monkeypatch):
+    indexer = object.__new__(deepgemm_backend.DeepGEMMIndexer)
+    indexer.mtp_size = 1
+    # This test isolates DeepGEMM's logits metadata; TopK state has its own tests.
+    monkeypatch.setattr(nvidia_topk_backend, "has_nvidia_indexer_topk", False)
+    calls = []
+
+    def metadata(lengths, page_size, num_sms):
+        assert lengths.dtype == torch.int32
+        assert page_size == 64 and num_sms == 80
+        calls.append(lengths.clone())
+        return lengths.clone()
+
+    monkeypatch.setattr(
+        deepgemm_backend,
+        "deep_gemm",
+        SimpleNamespace(get_num_sms=lambda: 80, get_paged_mqa_logits_metadata=metadata),
+    )
+    indexer._init_backend(SimpleNamespace(infer=SimpleNamespace(max_batch_size=2)))
+    indexer.prepare_metadata_for_decode(SimpleNamespace(batch_size=0))
+    assert indexer.metadata is None and calls == []
+    addresses = []
+    for values in ([100, 200], [101, 201]):
+        lengths = torch.tensor(values, dtype=torch.int32)
+        indexer.prepare_metadata_for_decode(
+            SimpleNamespace(
+                batch_size=2, new=SimpleNamespace(lens_tensor_device=lengths)
+            )
+        )
+        actual = indexer.metadata.get()
+        assert torch.equal(actual, lengths)
+        addresses.append(actual.data_ptr())
+    assert addresses[0] == addresses[1] and len(calls) == 2
+
+
+def test_triton_prefill_schedule_is_shared_per_step_and_reset(monkeypatch):
+    indexer = object.__new__(triton_backend.TritonBF16Indexer)
+    indexer._init_backend(None)
+    calls = []
+
+    def build(ks, block_m, device):
+        calls.append(ks)
+        return torch.zeros(1, dtype=torch.int32), torch.tensor([ks.numel()]), 1
+
+    monkeypatch.setattr(triton_backend, "DEFAULT_BLOCK_M", 8, raising=False)
+    monkeypatch.setattr(triton_backend, "_bucket_max_n", lambda n: n, raising=False)
+    monkeypatch.setattr(triton_backend, "build_qblock_schedule", build, raising=False)
+    ks, ke = torch.tensor([0, 0]), torch.tensor([10, 20])
+    first, _, _ = indexer._prefill_schedule(ks, ke, True)
+    second, actual_ks, actual_ke = indexer._prefill_schedule(
+        ks.clone(), ke.clone(), True
+    )
+    assert first is second
+    assert actual_ks is ks and actual_ke is ke
+    assert len(calls) == 1
+    indexer.prepare_metadata_for_prefill(object())
+    assert indexer.prefill_schedule is None
+    third, _, _ = indexer._prefill_schedule(ks, ke + 1, True)
+    assert third is not first and third["actual_max_n"] == 21
+    assert len(calls) == 2
