@@ -32,8 +32,8 @@ class TestBatchedSeqLenDelta:
             [0, 0],
             [128, 128],
             device=device,
-            cache_position_ids_tensor_device=False,
-            cache_delta_position_ids_tensor_device=False,
+            use_position_ids_static_tensor=False,
+            use_delta_position_ids_static_tensor=False,
         )
         assert sld.is_first_prefill_chunk is True
         assert sld.old.total_len == 0
@@ -44,8 +44,8 @@ class TestBatchedSeqLenDelta:
             [100, 0],
             [200, 100],
             device=device,
-            cache_position_ids_tensor_device=False,
-            cache_delta_position_ids_tensor_device=False,
+            use_position_ids_static_tensor=False,
+            use_delta_position_ids_static_tensor=False,
         )
         assert sld.is_first_prefill_chunk is False
         assert sld.old.total_len == 100
@@ -62,8 +62,8 @@ class TestBatchedSeqLenDelta:
             [0, 0],
             [1, 1],
             device=device,
-            cache_position_ids_tensor_device=False,
-            cache_delta_position_ids_tensor_device=False,
+            use_position_ids_static_tensor=False,
+            use_delta_position_ids_static_tensor=False,
             max_batch_size=2,
         )
         assert sld.is_first_prefill_chunk is True
@@ -81,8 +81,8 @@ class TestBatchedSeqLenDelta:
             [100, 200],
             [200, 300],
             device=device,
-            cache_position_ids_tensor_device=False,
-            cache_delta_position_ids_tensor_device=False,
+            use_position_ids_static_tensor=False,
+            use_delta_position_ids_static_tensor=False,
             max_batch_size=2,
         )
         assert sld.is_first_prefill_chunk is False
@@ -96,8 +96,8 @@ class TestBatchedSeqLenDelta:
             [0, 0],
             [1, 1],
             device=device,
-            cache_position_ids_tensor_device=False,
-            cache_delta_position_ids_tensor_device=False,
+            use_position_ids_static_tensor=False,
+            use_delta_position_ids_static_tensor=False,
             max_batch_size=2,
         )
         assert sld.is_classic_decoding is False

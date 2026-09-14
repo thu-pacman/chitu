@@ -26,20 +26,25 @@ class BatchedSeqLen:
             If not set, use `len(lens_list)` by default.
         max_total_len: Reserved max total length, used for supporting CUDA graph.
             If not set, use `sum(lens_list)` by default. `max_total_len` is only
-            effective when `cache_position_ids_tensor_device` is True.
-        cache_prefix_lens_tensor_device: If true, `prefix_lens_tensor_device` will
+            effective when `use_position_ids_static_tensor` is True.
+        use_prefix_lens_static_tensor: If true, `prefix_lens_tensor_device` will
             be cached in a CUDA-graph friendly manner, but will occupy extra space
             even if the value is not used. If False, it will be computed on the
-            fly. Defaults to True because `prefix_lens_tensor_device` is used for
+            fly during capture,
+            or cached in a regular tensor when CUDA graph is disabled.
+            Defaults to True because `prefix_lens_tensor_device` is used for
             multiple times during one step.
-        cache_position_ids_tensor_device: If true, `position_ids_tensor_device`
+        use_position_ids_static_tensor: If true, `position_ids_tensor_device`
             will be cached in a CUDA-graph friendly manner, but will occupy extra
             space even if the value is not used. If False, it will be computed
-            on the fly. Defaults to True because `position_ids_tensor_device` is
+            on the fly during capture,
+            or cached in a regular tensor when CUDA graph is disabled.
+            Defaults to True because `position_ids_tensor_device` is
             used for multiple times during one step for chunked prefilling.
-        cache_seq_ids_tensor_device: If true, `seq_ids_tensor_device` will be cached
+        use_seq_ids_static_tensor: If true, `seq_ids_tensor_device` will be cached
             in a CUDA-graph friendly manner, but will occupy extra space even if
-            the value is not used. If False, it will be computed on the fly.
+            the value is not used. If False, it will be computed on the fly during capture,
+            or cached in a regular tensor when CUDA graph is disabled.
             Defaults to True because `seq_ids_tensor_device` is used for multiple
             times during one step for chunked prefilling.
     """
@@ -51,9 +56,9 @@ class BatchedSeqLen:
         *,
         max_batch_size: Optional[int] = None,
         max_total_len: Optional[int] = None,
-        cache_prefix_lens_tensor_device: bool = True,
-        cache_position_ids_tensor_device: bool = True,
-        cache_seq_ids_tensor_device: bool = True,
+        use_prefix_lens_static_tensor: bool = True,
+        use_position_ids_static_tensor: bool = True,
+        use_seq_ids_static_tensor: bool = True,
     ) -> None:
         assert all(l >= 0 for l in lens_list)
 
@@ -74,23 +79,23 @@ class BatchedSeqLen:
             max_nelem=max_batch_size,
         )
 
-        self.cache_prefix_lens_tensor_device = cache_prefix_lens_tensor_device
+        self.use_prefix_lens_static_tensor = use_prefix_lens_static_tensor
         self._prefix_lens_tensor_device_up_to_date = False
-        if self.cache_prefix_lens_tensor_device:
+        if self.use_prefix_lens_static_tensor:
             self._prefix_lens_static_tensor_device = StaticTensor(
                 max_nelem=max_batch_size + 1, dtype=torch.int32, device=device
             )
 
-        self.cache_position_ids_tensor_device = cache_position_ids_tensor_device
+        self.use_position_ids_static_tensor = use_position_ids_static_tensor
         self._position_ids_tensor_device_up_to_date = False
-        if self.cache_position_ids_tensor_device:
+        if self.use_position_ids_static_tensor:
             self._position_ids_static_tensor_device = StaticTensor(
                 max_nelem=max_total_len, dtype=torch.int32, device=device
             )
 
-        self.cache_seq_ids_tensor_device = cache_seq_ids_tensor_device
+        self.use_seq_ids_static_tensor = use_seq_ids_static_tensor
         self._seq_ids_tensor_device_up_to_date = False
-        if self.cache_seq_ids_tensor_device:
+        if self.use_seq_ids_static_tensor:
             self._seq_ids_static_tensor_device = StaticTensor(
                 max_nelem=max_total_len, dtype=torch.int32, device=device
             )
@@ -103,18 +108,18 @@ class BatchedSeqLen:
         *,
         max_batch_size: Optional[int] = None,
         max_total_len: Optional[int] = None,
-        cache_prefix_lens_tensor_device: bool = True,
-        cache_position_ids_tensor_device: bool = True,
-        cache_seq_ids_tensor_device: bool = True,
+        use_prefix_lens_static_tensor: bool = True,
+        use_position_ids_static_tensor: bool = True,
+        use_seq_ids_static_tensor: bool = True,
     ):
         return cls(
             [len(t) for t in tokens],
             device,
             max_batch_size=max_batch_size,
             max_total_len=max_total_len,
-            cache_prefix_lens_tensor_device=cache_prefix_lens_tensor_device,
-            cache_position_ids_tensor_device=cache_position_ids_tensor_device,
-            cache_seq_ids_tensor_device=cache_seq_ids_tensor_device,
+            use_prefix_lens_static_tensor=use_prefix_lens_static_tensor,
+            use_position_ids_static_tensor=use_position_ids_static_tensor,
+            use_seq_ids_static_tensor=use_seq_ids_static_tensor,
         )
 
     def copy_from_list(self, lens_list: list[int]):
@@ -123,12 +128,9 @@ class BatchedSeqLen:
             create_tensor(self.lens_list, device=self.device, dtype=torch.int32)
         )
 
-        if self.cache_prefix_lens_tensor_device:
-            self._prefix_lens_tensor_device_up_to_date = False
-        if self.cache_position_ids_tensor_device:
-            self._position_ids_tensor_device_up_to_date = False
-        if self.cache_seq_ids_tensor_device:
-            self._seq_ids_tensor_device_up_to_date = False
+        self._prefix_lens_tensor_device_up_to_date = False
+        self._position_ids_tensor_device_up_to_date = False
+        self._seq_ids_tensor_device_up_to_date = False
 
         invalidate_cached_property(self, "lens_tensor_cpu")
         invalidate_cached_property(self, "prefix_lens_list")
@@ -148,12 +150,9 @@ class BatchedSeqLen:
         self.lens_list = lens_tensor.tolist()
         self.lens_static_tensor_device.set(lens_tensor.to(torch.int32))
 
-        if self.cache_prefix_lens_tensor_device:
-            self._prefix_lens_tensor_device_up_to_date = False
-        if self.cache_position_ids_tensor_device:
-            self._position_ids_tensor_device_up_to_date = False
-        if self.cache_seq_ids_tensor_device:
-            self._seq_ids_tensor_device_up_to_date = False
+        self._prefix_lens_tensor_device_up_to_date = False
+        self._position_ids_tensor_device_up_to_date = False
+        self._seq_ids_tensor_device_up_to_date = False
 
         invalidate_cached_property(self, "lens_tensor_cpu")
         invalidate_cached_property(self, "prefix_lens_list")
@@ -168,7 +167,8 @@ class BatchedSeqLen:
         self.lens_list = other.lens_list
         self.lens_static_tensor_device.set(other.lens_tensor_device)
 
-        if self.cache_prefix_lens_tensor_device:
+        self._prefix_lens_tensor_device_up_to_date = False
+        if self.use_prefix_lens_static_tensor:
             self._prefix_lens_tensor_device_up_to_date = (
                 other._prefix_lens_tensor_device_up_to_date
             )
@@ -177,7 +177,8 @@ class BatchedSeqLen:
                     other.prefix_lens_tensor_device
                 )
 
-        if self.cache_position_ids_tensor_device:
+        self._position_ids_tensor_device_up_to_date = False
+        if self.use_position_ids_static_tensor:
             self._position_ids_tensor_device_up_to_date = (
                 other._position_ids_tensor_device_up_to_date
             )
@@ -186,7 +187,8 @@ class BatchedSeqLen:
                     other.position_ids_tensor_device
                 )
 
-        if self.cache_seq_ids_tensor_device:
+        self._seq_ids_tensor_device_up_to_date = False
+        if self.use_seq_ids_static_tensor:
             self._seq_ids_tensor_device_up_to_date = (
                 other._seq_ids_tensor_device_up_to_date
             )
@@ -214,7 +216,7 @@ class BatchedSeqLen:
     @cuda_graph_safe_cached_property(
         static_tensor_name="_prefix_lens_static_tensor_device",
         up_to_date_flag_name="_prefix_lens_tensor_device_up_to_date",
-        enable_flag_name="cache_prefix_lens_tensor_device",
+        enable_flag_name="use_prefix_lens_static_tensor",
     )
     def prefix_lens_tensor_device(self) -> torch.Tensor:
         return torch.cat(
@@ -228,7 +230,7 @@ class BatchedSeqLen:
     @cuda_graph_safe_cached_property(
         static_tensor_name="_position_ids_static_tensor_device",
         up_to_date_flag_name="_position_ids_tensor_device_up_to_date",
-        enable_flag_name="cache_position_ids_tensor_device",
+        enable_flag_name="use_position_ids_static_tensor",
     )
     def position_ids_tensor_device(self) -> torch.Tensor:
         # Example: lens = [3, 5, 2], total_len = 10
@@ -257,7 +259,7 @@ class BatchedSeqLen:
     @cuda_graph_safe_cached_property(
         static_tensor_name="_seq_ids_static_tensor_device",
         up_to_date_flag_name="_seq_ids_tensor_device_up_to_date",
-        enable_flag_name="cache_seq_ids_tensor_device",
+        enable_flag_name="use_seq_ids_static_tensor",
     )
     def seq_ids_tensor_device(self) -> torch.Tensor:
         # Example: lens = [3, 5, 2], prefix_lens = [0, 3, 8, 10]
@@ -301,34 +303,41 @@ class BatchedSeqLenDelta:
             If not set, use `len(lens_list)` by default.
         max_total_len: Reserved max total length, used for supporting CUDA graph.
             If not set, use `sum(lens_list)` by default. `max_total_len` is only
-            effective when `cache_position_ids_tensor_device` is True.
+            effective when `use_position_ids_static_tensor` is True.
         max_total_delta_len: Reserved max total length of the extra tokens added
             from the old sequence length to the new sequence length, used for
             supporting CUDA graph. `max_total_delta_len` is only effective only
-            when `cache_delta_position_ids_tensor_device` is True, and must be set
-            if `cache_delta_position_ids_tensor_device` is True.
-        cache_prefix_lens_tensor_device: If true, `prefix_lens_tensor_device` will
+            when `use_delta_position_ids_static_tensor` is True, and must be set
+            if `use_delta_position_ids_static_tensor` is True.
+        use_prefix_lens_static_tensor: If true, `prefix_lens_tensor_device` will
             be cached in a CUDA-graph friendly manner, but will occupy extra space
             even if the value is not used. If False, it will be computed on the
-            fly. Defaults to True because `prefix_lens_tensor_device` is used for
+            fly during capture,
+            or cached in a regular tensor when CUDA graph is disabled.
+            Defaults to True because `prefix_lens_tensor_device` is used for
             multiple times during one step.
-        cache_position_ids_tensor_device: If true, `position_ids_tensor_device`
+        use_position_ids_static_tensor: If true, `position_ids_tensor_device`
             will be cached in a CUDA-graph friendly manner, but will occupy extra
             space even if the value is not used. If False, it will be computed
-            on the fly. Defaults to True because `position_ids_tensor_device` is
+            on the fly during capture,
+            or cached in a regular tensor when CUDA graph is disabled.
+            Defaults to True because `position_ids_tensor_device` is
             used for multiple times during one step for chunked prefilling.
-        cache_delta_prefix_lens_tensor_device: If true, `delta_prefix_lens_tensor_device`
+        use_delta_prefix_lens_static_tensor: If true, `delta_prefix_lens_tensor_device`
             will be cached in a CUDA-graph friendly manner, but will occupy extra
             space even if the value is not used. If False, it will be computed on
-            the fly. Defaults to True.
-        cache_delta_position_ids_tensor_device: If true, `delta_position_ids_tensor_device`
+            the fly during capture,
+            or cached in a regular tensor when CUDA graph is disabled. Defaults to True.
+        use_delta_position_ids_static_tensor: If true, `delta_position_ids_tensor_device`
             will be cached in a CUDA-graph friendly manner, but will occupy extra
             space even if the value is not used. If False, it will be computed on
-            the fly. Defaults to True.
-        cache_delta_seq_ids_tensor_device: If true, `delta_seq_ids_tensor_device`
+            the fly during capture,
+            or cached in a regular tensor when CUDA graph is disabled. Defaults to True.
+        use_delta_seq_ids_static_tensor: If true, `delta_seq_ids_tensor_device`
             will be cached in a CUDA-graph friendly manner, but will occupy extra
             space even if the value is not used. If False, it will be computed on
-            the fly. Defaults to True.
+            the fly during capture,
+            or cached in a regular tensor when CUDA graph is disabled. Defaults to True.
     """
 
     def __init__(
@@ -340,12 +349,12 @@ class BatchedSeqLenDelta:
         max_batch_size: Optional[int] = None,
         max_total_len: Optional[int] = None,
         max_total_delta_len: Optional[int] = None,
-        cache_prefix_lens_tensor_device: bool = True,
-        cache_position_ids_tensor_device: bool = True,
-        cache_seq_ids_tensor_device: bool = True,
-        cache_delta_prefix_lens_tensor_device: bool = True,
-        cache_delta_position_ids_tensor_device: bool = True,
-        cache_delta_seq_ids_tensor_device: bool = True,
+        use_prefix_lens_static_tensor: bool = True,
+        use_position_ids_static_tensor: bool = True,
+        use_seq_ids_static_tensor: bool = True,
+        use_delta_prefix_lens_static_tensor: bool = True,
+        use_delta_position_ids_static_tensor: bool = True,
+        use_delta_seq_ids_static_tensor: bool = True,
     ):
         self.device = device
 
@@ -354,27 +363,27 @@ class BatchedSeqLenDelta:
             device=device,
             max_batch_size=max_batch_size,
             max_total_len=max_total_len,
-            cache_prefix_lens_tensor_device=cache_prefix_lens_tensor_device,
-            cache_position_ids_tensor_device=cache_position_ids_tensor_device,
-            cache_seq_ids_tensor_device=cache_seq_ids_tensor_device,
+            use_prefix_lens_static_tensor=use_prefix_lens_static_tensor,
+            use_position_ids_static_tensor=use_position_ids_static_tensor,
+            use_seq_ids_static_tensor=use_seq_ids_static_tensor,
         )
         self.new = BatchedSeqLen(
             new_len_list,
             device=device,
             max_batch_size=max_batch_size,
             max_total_len=max_total_len,
-            cache_prefix_lens_tensor_device=cache_prefix_lens_tensor_device,
-            cache_position_ids_tensor_device=cache_position_ids_tensor_device,
-            cache_seq_ids_tensor_device=cache_seq_ids_tensor_device,
+            use_prefix_lens_static_tensor=use_prefix_lens_static_tensor,
+            use_position_ids_static_tensor=use_position_ids_static_tensor,
+            use_seq_ids_static_tensor=use_seq_ids_static_tensor,
         )
         self._delta = BatchedSeqLen(
             [x - y for x, y in zip(self.new.lens_list, self.old.lens_list)],
             device=device,
             max_batch_size=max_batch_size,
             max_total_len=max_total_delta_len,
-            cache_prefix_lens_tensor_device=cache_delta_prefix_lens_tensor_device,
-            cache_position_ids_tensor_device=False,  # NOTE: delta_position_ids is NOT _delta.position_ids
-            cache_seq_ids_tensor_device=cache_delta_seq_ids_tensor_device,
+            use_prefix_lens_static_tensor=use_delta_prefix_lens_static_tensor,
+            use_position_ids_static_tensor=False,  # NOTE: delta_position_ids is NOT _delta.position_ids
+            use_seq_ids_static_tensor=use_delta_seq_ids_static_tensor,
         )
 
         self.is_classic_decoding = all(
@@ -382,11 +391,9 @@ class BatchedSeqLenDelta:
         )
         self.is_first_prefill_chunk = self.old.total_len == 0
 
-        self.cache_delta_position_ids_tensor_device = (
-            cache_delta_position_ids_tensor_device
-        )
+        self.use_delta_position_ids_static_tensor = use_delta_position_ids_static_tensor
         self._delta_position_ids_tensor_device_up_to_date = False
-        if self.cache_delta_position_ids_tensor_device:
+        if self.use_delta_position_ids_static_tensor:
             assert max_total_delta_len is not None
             self._delta_position_ids_static_tensor_device = StaticTensor(
                 max_nelem=max_total_delta_len, dtype=torch.int32, device=device
@@ -432,9 +439,9 @@ class BatchedSeqLenDelta:
             BatchedSeqLen(
                 [x - y for x, y in zip(self.new.lens_list, self.old.lens_list)],
                 device=self.device,
-                cache_prefix_lens_tensor_device=False,
-                cache_position_ids_tensor_device=False,
-                cache_seq_ids_tensor_device=False,
+                use_prefix_lens_static_tensor=False,
+                use_position_ids_static_tensor=False,
+                use_seq_ids_static_tensor=False,
             )
         )
         self.is_classic_decoding = all(x > 0 for x in self.old.lens_list) and all(
@@ -497,7 +504,7 @@ class BatchedSeqLenDelta:
     @cuda_graph_safe_cached_property(
         static_tensor_name="_delta_position_ids_static_tensor_device",
         up_to_date_flag_name="_delta_position_ids_tensor_device_up_to_date",
-        enable_flag_name="cache_delta_position_ids_tensor_device",
+        enable_flag_name="use_delta_position_ids_static_tensor",
     )
     def _delta_position_ids_tensor_device_impl(self):
         # Example: old = [10, 20, 30], new = [13, 25, 32]

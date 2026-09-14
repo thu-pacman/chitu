@@ -313,11 +313,11 @@ class KVCacheBase:
             max_batch_size=num_hot_req,
             max_total_len=self.max_total_len,
             max_total_delta_len=self.max_total_delta_len,
-            cache_prefix_lens_tensor_device=True,
-            cache_position_ids_tensor_device=True,
-            cache_seq_ids_tensor_device=True,
-            cache_delta_position_ids_tensor_device=True,
-            cache_delta_seq_ids_tensor_device=True,
+            use_prefix_lens_static_tensor=True,
+            use_position_ids_static_tensor=False,
+            use_seq_ids_static_tensor=False,
+            use_delta_position_ids_static_tensor=True,
+            use_delta_seq_ids_static_tensor=True,
         )
 
         self.mtp_size = get_global_args().infer.mtp_size
@@ -327,11 +327,11 @@ class KVCacheBase:
                 max_batch_size=num_hot_req,
                 max_total_len=self.max_total_len,
                 max_total_delta_len=self.max_total_delta_len,
-                cache_prefix_lens_tensor_device=True,
-                cache_position_ids_tensor_device=True,
-                cache_seq_ids_tensor_device=True,
-                cache_delta_position_ids_tensor_device=True,
-                cache_delta_seq_ids_tensor_device=True,
+                use_prefix_lens_static_tensor=True,
+                use_position_ids_static_tensor=False,
+                use_seq_ids_static_tensor=False,
+                use_delta_position_ids_static_tensor=True,
+                use_delta_seq_ids_static_tensor=True,
             )
 
     @property
@@ -389,16 +389,16 @@ class KVCacheBase:
         prev_seq_len = BatchedSeqLen(
             cached_token_lens,
             device=self.device,
-            cache_prefix_lens_tensor_device=False,
-            cache_position_ids_tensor_device=False,
-            cache_seq_ids_tensor_device=False,
+            use_prefix_lens_static_tensor=False,
+            use_position_ids_static_tensor=False,
+            use_seq_ids_static_tensor=False,
         )
         next_seq_len = BatchedSeqLen(
             [cached + delta for cached, delta in zip(cached_token_lens, delta_seq_len)],
             device=self.device,
-            cache_prefix_lens_tensor_device=False,
-            cache_position_ids_tensor_device=False,
-            cache_seq_ids_tensor_device=False,
+            use_prefix_lens_static_tensor=False,
+            use_position_ids_static_tensor=False,
+            use_seq_ids_static_tensor=False,
         )
         self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
         if self.mtp_size > 1:
@@ -466,16 +466,16 @@ class KVCacheBase:
         prev_seq_len = BatchedSeqLen(
             [0] * len(tasks.task_ids),
             device=self.device,
-            cache_prefix_lens_tensor_device=False,
-            cache_position_ids_tensor_device=False,
-            cache_seq_ids_tensor_device=False,
+            use_prefix_lens_static_tensor=False,
+            use_position_ids_static_tensor=False,
+            use_seq_ids_static_tensor=False,
         )
         next_seq_len = BatchedSeqLen(
             prefilling_lengths,
             device=self.device,
-            cache_prefix_lens_tensor_device=False,
-            cache_position_ids_tensor_device=False,
-            cache_seq_ids_tensor_device=False,
+            use_prefix_lens_static_tensor=False,
+            use_position_ids_static_tensor=False,
+            use_seq_ids_static_tensor=False,
         )
         self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
 
@@ -1143,11 +1143,11 @@ class MMPagedKVCache(PagedKVCache):
             max_batch_size=self.num_hot_req,
             max_total_len=self.max_total_len,
             max_total_delta_len=self.max_total_delta_len,
-            cache_prefix_lens_tensor_device=True,
-            cache_position_ids_tensor_device=True,
-            cache_seq_ids_tensor_device=True,
-            cache_delta_position_ids_tensor_device=True,
-            cache_delta_seq_ids_tensor_device=True,
+            use_prefix_lens_static_tensor=True,
+            use_position_ids_static_tensor=True,
+            use_seq_ids_static_tensor=True,
+            use_delta_position_ids_static_tensor=True,
+            use_delta_seq_ids_static_tensor=True,
         )
 
     def realloc(self, num_blocks):
@@ -1175,9 +1175,9 @@ class MMPagedKVCache(PagedKVCache):
         prev_seq_len = BatchedSeqLen(
             [self.tid_to_multimodal_len.get(tid, 0) for tid in task_ids],
             device=self.device,
-            cache_prefix_lens_tensor_device=False,
-            cache_position_ids_tensor_device=False,
-            cache_seq_ids_tensor_device=False,
+            use_prefix_lens_static_tensor=False,
+            use_position_ids_static_tensor=False,
+            use_seq_ids_static_tensor=False,
         )
         next_seq_len = BatchedSeqLen(
             [
@@ -1188,9 +1188,9 @@ class MMPagedKVCache(PagedKVCache):
                 for tid, d in zip(task_ids, delta_seq_len)
             ],
             device=self.device,
-            cache_prefix_lens_tensor_device=False,
-            cache_position_ids_tensor_device=False,
-            cache_seq_ids_tensor_device=False,
+            use_prefix_lens_static_tensor=False,
+            use_position_ids_static_tensor=False,
+            use_seq_ids_static_tensor=False,
         )
         self.seq_multimodal_len_delta.copy_from(prev_seq_len, next_seq_len)
 
