@@ -25,7 +25,7 @@ from chitu.kv_cache.registry import (
 )
 from chitu.kv_cache.utils import build_layer_id_map
 from chitu.models.registry import ModelType
-from chitu.utils import ceil_div
+from chitu.utils import ceil_div, max_alloc_seq_len
 
 _DEEPSEEK_V4_FLASHMLA_TOKEN_BYTES = 584
 
@@ -181,7 +181,9 @@ def _deepseek_v4_blocks_cap(num_hot_req: int, blocks_per_req: int) -> int:
 
 
 def _deepseek_v4_compressed_storage_len(max_seq_len: int, ratio: int) -> int:
-    return max(0, int(max_seq_len) // int(ratio))
+    # 压缩流按 position // ratio 寻址：最大索引 = (可寻址上界 - 1) // ratio，
+    # 故槽位数取 ceil_div(可寻址上界, ratio)（chitu/utils.max_alloc_seq_len）
+    return max(0, ceil_div(max_alloc_seq_len(int(max_seq_len)), int(ratio)))
 
 
 def _deepseek_v4_initial_num_blocks(args, block_size: int, cap: int) -> int:
@@ -304,7 +306,10 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
             compressed_cache = DeepSeekV4DenseKVCache(
                 compress_layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
-                storage_max_seq_len=ceil_div(args.infer.max_seq_len, ratio),
+                storage_max_seq_len=max(
+                    1,
+                    _deepseek_v4_compressed_storage_len(args.infer.max_seq_len, ratio),
+                ),
                 num_hot_req=num_hot_req,
                 device=device,
                 **_compressed_kvargs_for_ratio(compressed_kvargs, ratio),

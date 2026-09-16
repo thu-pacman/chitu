@@ -1025,7 +1025,7 @@ def test_single_decode_prompt_seq_bigger_than_kvcache_capacity():
 
     NUM_BLOCKS = 2
     BLOCK_SIZE = 512
-    DIFF = 5  # decode steps that fit after reserving the MTP lookahead
+    DIFF = 5  # decode steps that fit before exceeding the 2-block capacity
 
     Backend.cache_managers = [
         {
@@ -1043,8 +1043,7 @@ def test_single_decode_prompt_seq_bigger_than_kvcache_capacity():
 
     req = UserRequest.create_mock(
         input_len=NUM_BLOCKS * BLOCK_SIZE
-        - DIFF
-        - 1,  # decode prop = prefix+1 (mtp_size=1)
+        - DIFF,  # decode prop = cached_seq_len + mtp_size (= synced, mtp_size=1)
         request_id=f"req_0",
         enable_thinking=False,
     )
@@ -1489,6 +1488,93 @@ def test_slot_group_skew():
     assert len(empty_ids) == 0
 
 
+def test_skew_full_slot_group_of_decode_keeps_scheduling():
+    """A slot group that is full of Decode tasks must keep scheduling.
+
+    Regression for the CI `test_tool_call` hang: `schedule()` used to pick the
+    batch by slicing the slot group at the first Prefill, which assumes the
+    group always keeps a "Decodes first, Prefills last" order.  A group full of
+    Decode tasks therefore produced an empty slice when the highest-priority
+    request was a Prefill, `schedule()` returned [] on every step, the group
+    never drained and every request stalled forever (0 tokens/s, KV cache fully
+    occupied, no evictions, no error).
+    """
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 4096,
+                    "max_batch_size": 4,
+                    "op_impl": "torch",
+                    "cache_type": "skew",
+                    "pp_size": 1,
+                    "dp_size": 1,
+                    "schedule_overlap": True,
+                    "mtp_size": 1,
+                }
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    infer_args = get_global_args().infer
+    set_slot_handle(
+        infer_args.max_batch_size,
+        infer_args.pp_size,
+    )
+
+    TaskPool.reset()
+    Backend.cache_managers = None
+    Backend.tokenizer = MockTokenizer()
+
+    decode_task_ids = []
+    for i in range(infer_args.max_batch_size):
+        req = UserRequest.create_mock(
+            input_len=1000, request_id=f"dec_{i}", enable_thinking=False
+        )
+        task = Task(f"{req.request_id}", req)
+        task.consume_req_tokens()  # prefill done -> Decode
+        assert task.task_type == TaskType.Decode
+        TaskPool.add(task)
+        decode_task_ids.append(task.task_id)
+
+    scheduler = SkewScheduler(
+        infer_args.max_batch_size,
+        cache_manager_dict=None,
+        scheduler_type="request_preset,prefill_first,fcfs",
+        prefill_chunk_size=4096,
+    )
+
+    scheduler.prepare_for_schedule()
+    batch_ids = scheduler.schedule()
+    assert sorted(batch_ids) == sorted(decode_task_ids)
+    scheduler.update(batch_ids)
+
+    # A new request arrives while the slot group is full of Decode tasks.
+    req = UserRequest.create_mock(
+        input_len=1000, request_id="pf_new", enable_thinking=False
+    )
+    prefill_task = Task(f"{req.request_id}", req)
+    assert prefill_task.task_type == TaskType.Prefill
+    TaskPool.add(prefill_task)
+
+    # The slot group cannot admit the new Prefill yet, but it must keep serving
+    # its Decode members instead of idling forever.
+    for _ in range(5):
+        scheduler.prepare_for_schedule()
+        batch_ids = scheduler.schedule()
+        assert sorted(batch_ids) == sorted(decode_task_ids)
+
+    # Once a Decode member finishes, its slot frees up and the waiting Prefill
+    # is admitted.
+    TaskPool.pool[decode_task_ids[0]].set_stopped()
+    scheduler.update(list(TaskPool.id_list))
+
+    scheduler.prepare_for_schedule()
+    batch_ids = scheduler.schedule()
+    assert batch_ids == [prefill_task.task_id]
+
+
 def test_pp_chunked_prefill():
     set_global_args(
         OmegaConf.create(
@@ -1716,7 +1802,7 @@ def test_prepare_prefill_metadata_multi_cache_managers():
     assert len(task0.new_cache_ids["indexer"]) == 2
     assert task0.inc_hit_tokens == 0
     assert task0.consumed_req_tokens == 128
-    assert task0.kv_cache_len_used_in_completed_steps == 128
+    assert task0.cached_seq_len == 128
 
     # 测试task1的prompt被main和indexer manager全部击中
     task1 = Task("req_prefill_1", UserRequest.create_mock(128, "req_prefill_1"))
@@ -1740,7 +1826,7 @@ def test_prepare_prefill_metadata_multi_cache_managers():
     task1.prefix_tokens.append(1)
     assert task1.task_type == TaskType.Decode
     assert task1.prefix_tokens_len == 129
-    assert task1.kv_cache_len_used_in_completed_steps == 128
+    assert task1.cached_seq_len == 128
 
     assert main.task_to_cache_ids[task1.task_id] == {0}
     assert indexer.task_to_cache_ids[task1.task_id] == {0, 1}

@@ -4048,7 +4048,10 @@ def test_reconstruct_prefill_matches_full_kv_attention(chunk_lens):
     v_head_dim = 8
     q_lora_rank = 128
     dim = 32
-    max_seq_len = sum(chunk_lens)
+    # prompt 长度必须严格小于 max_seq_len（生产侧由 UserRequest.cap_max_new_tokens 保证）：
+    # kv cache 可寻址上界 max_alloc_seq_len = max_seq_len - 1（mtp_size = 1，最后一个 token
+    # 是采样得到的、不写 cache），这里 sum(chunk_lens) 是整段 prompt，故多留 1 个 token
+    max_seq_len = sum(chunk_lens) + 1
     block_size = 4
 
     set_global_args(

@@ -90,6 +90,7 @@ from chitu.distributed.parallel_state import (
 from chitu.distributed.partition import compute_expert_dist_in_ep
 from chitu.utils import (
     ceil_div,
+    max_alloc_seq_len,
     parse_dtype,
     try_import_and_setup_torch_npu,
 )
@@ -147,8 +148,8 @@ class Indexer(torch.nn.Module):
         self.rope_head_dim: int = args.qk_rope_head_dim
         self.index_rope_layout = getattr(args, "index_rope_layout", "separated")
 
-        # Adjust index_topk not exceed max_seq_len max_seq_len to avoid out-of-range errors
-        max_seq_len = get_global_args().infer.max_seq_len
+        # Adjust index_topk not exceed the max addressable length to avoid out-of-range errors
+        max_seq_len = max_alloc_seq_len(get_global_args().infer.max_seq_len)
         self.index_topk: int = min(args.index_topk, max_seq_len)
         self.q_lora_rank: int = args.q_lora_rank
         self.softmax_scale = self.head_dim**-0.5

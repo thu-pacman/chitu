@@ -21,6 +21,7 @@ import chitu.dsa_indexer_backend.torch_backend as torch_backend
 import chitu.dsa_indexer_backend.triton_backend as triton_backend
 import chitu.ops.topk as topk_module
 from chitu.kv_cache import DenseKVCacheAccessor, PagedKVCacheAccessor
+from chitu.utils import max_alloc_seq_len
 from chitu.kv_cache.providers.deepseek_v3 import (
     deepseek_v3_indexer_cache_spec,
     deepseek_v3_kv_cache_spec,
@@ -634,7 +635,9 @@ def test_backend_factory_preserves_constructor_and_base_type(
     assert type(backend) is expected_class is get_indexer_class(impl)
     assert isinstance(backend, DSAIndexer)
     assert backend.impl == impl
-    assert backend.static_max_n == 1 << 20
+    # static_max_n 是「可被寻址的最大长度」= max_alloc_seq_len(max_seq_len)：
+    # MTP 路径会寻址到 max_seq_len - 1 + 3 * draft_len（见 chitu/utils.max_alloc_seq_len）
+    assert backend.static_max_n == max_alloc_seq_len(1 << 20)
     assert validated == [(args, impl)]
     assert not hasattr(backend, "hygon_indexer_topk")
     if impl != "hygon":

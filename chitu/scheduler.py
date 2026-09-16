@@ -323,9 +323,7 @@ class Scheduler:
             开启prefix caching时，返回当前任务在各manager中的最小击中长度
         """
         completed_tokens = (
-            0
-            if task.status == TaskStatus.PDDecodeIncoming
-            else task.kv_cache_len_used_in_completed_steps
+            0 if task.status == TaskStatus.PDDecodeIncoming else task.cached_seq_len
         )
         if not self.cache_manager_dict["main"].enable_prefix_caching:
             return completed_tokens
@@ -438,9 +436,7 @@ class Scheduler:
             task: 当前正在检查kv cache容量的Decode任务
         """
         for _, cache_manager in self.cache_manager_dict.items():
-            target_blocks = cache_manager.num_blocks_for_seq_len(
-                task.kv_cache_len_used_in_completed_steps_and_next_step
-            )
+            target_blocks = cache_manager.num_blocks_for_seq_len(task.alloc_seq_len)
             if target_blocks > cache_manager.num_blocks:
                 return KVCacheCapacityStatus.EXCEEDS_CAPACITY
 
@@ -1280,25 +1276,46 @@ class SkewScheduler(Scheduler):
                 for tid in to_add:
                     TaskPool.pool[tid].sched_group_id = sgroup_id
 
-        curr_split = self.find_prefill_task_start_pos_sgroup(sgroup)
+        # Select the batch from the slot group by each member's *current* task
+        # type. Slicing the group at the first Prefill (or at its end) assumes a
+        # stable "Decodes first, Prefills last" partition, but that partition
+        # does not hold: a member flips from Prefill to Decode once its prefill
+        # finishes, and fills append new members at the tail. A group full of
+        # Decode members therefore produced an empty Prefill slice, so
+        # `schedule()` returned [] on every step and the engine stalled forever
+        # (0 tokens/s, KV cache fully occupied, no evictions).
+        def _slot_task_ids_of_type(task_type: TaskType) -> list[str]:
+            task_ids_of_type = [
+                tid for tid in sgroup if TaskPool.pool[tid].task_type == task_type
+            ]
+            if (
+                task_type == TaskType.Prefill
+                and self.prefill_chunk_size is not None
+                and task_ids_of_type
+            ):
+                limit = self._chunk_prefill_tasks_count(task_ids_of_type)
+                task_ids_of_type = task_ids_of_type[:limit]
+            return task_ids_of_type
 
-        if target_task_type == TaskType.Decode:
-            ret_task_ids = sgroup[:curr_split]
-        else:
-            ret_task_ids = sgroup[curr_split:]
-            if self.prefill_chunk_size is not None and ret_task_ids:
-                limit = self._chunk_prefill_tasks_count(ret_task_ids)
-                ret_task_ids = ret_task_ids[:limit]
-
-        #  ensure only target type tasks are returned
-        final_task_ids = [
-            tid
-            for tid in ret_task_ids
-            if TaskPool.pool[tid].task_type == target_task_type
-        ]
-
+        batch_task_type = target_task_type
+        final_task_ids = _slot_task_ids_of_type(batch_task_type)
         if not final_task_ids:
-            return []
+            # The group holds nothing runnable of the target type. That is the
+            # normal state when the group is full of the other type while
+            # requests of the target type wait outside: a group only admits new
+            # members while it has free capacity, so no member of the target
+            # type can join yet. Fall back to the other type so the group keeps
+            # making progress and its members eventually finish, free capacity
+            # and let the waiting requests in. Returning [] here instead would
+            # stall every request in the pool forever.
+            batch_task_type = (
+                TaskType.Prefill
+                if batch_task_type == TaskType.Decode
+                else TaskType.Decode
+            )
+            final_task_ids = _slot_task_ids_of_type(batch_task_type)
+            if not final_task_ids:
+                return []
 
         self.sgroup_list.set_task_ids(final_task_ids)
 
@@ -1320,18 +1337,6 @@ class SkewScheduler(Scheduler):
             if remaining_prefill_tokens <= 0:
                 break
         return i + 1
-
-    def find_prefill_task_start_pos_sgroup(self, sgroup):
-        n = len(sgroup)
-        left, right = 0, n  # [left,right)
-        while left < right:
-            mid = (left + right) // 2
-            task = TaskPool.pool[sgroup[mid]]
-            if task.task_type == TaskType.Prefill:
-                right = mid
-            else:
-                left = mid + 1
-        return right
 
     @override
     def reorder_tasks_for_batching(self, task_ids):

@@ -168,6 +168,37 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
+def max_alloc_seq_len(max_seq_len: int) -> int:
+    """给定 max_seq_len 下，单个请求在生命周期内会被寻址到的 token 数上界
+    （kv cache 容量与 RoPE 查表共用；最大索引 = 返回值 - 1）。
+
+    - 序列最后一个 token 是采样得到的、不会再喂给主模型，因此从不写入 kv cache：
+      一条 max_seq_len 长的序列，在 cache 里的长度上界是 max_seq_len - 1；
+    - kv cache 主路径写入：decode 最后一步的 alloc_seq_len 上界为 max_seq_len - 1 + 2*draft_len
+      （见 SPEC_seq-len-analy.MD §3.3）；
+    - MTP 路径（RoPE 查表 + MTP 层自身 K/V 寻址）：position id 取「上一次 verify 步 accept 后的
+      内容长度 + offset - 1」（prepare_mtp_cache_decode，offset <= draft_len；最坏全部接受时该基准
+      = 本步写完后的长度），且 draft 在停止判定之后仍会执行，即在上者之上再偏移 draft_len - 1，
+      需要 max_seq_len - 1 + 3*draft_len（§4.3，4096/mtp4 → 4104，实测上界 4103）。
+
+    mtp_size = 1（draft_len = 0）时公式退化为 max_seq_len - 1，与 MTP 路径共用同一条式子，
+    不再单独按 max_seq_len 兜底：prompt 长度受 UserRequest.cap_max_new_tokens 约束
+    （prompt_len < max_seq_len），生成侧在 synced_seq_len 达到 max_seq_len 时停止，
+    因此 max_seq_len 这个长度本身不会被寻址到。
+
+    例外：DLLM（LLaDA2）按 block 写 cache，末块会把序列最后一个 token 在同一步写入，其真实上界是
+    block 对齐后的写入末端（既有边界问题，见 SPEC_seq-len-analy.MD §5 第 9 条）；该路径同样使用本常量
+    （容量语义），不单独开分支。
+
+    返回值同时是最大的可寻址 token 数（= kv cache 里可能出现的最大长度 = RoPE 查表行数），
+    最大索引为该值 - 1。一个常量同时覆盖 kv cache 容量（page table / 每请求最大 block 数 /
+    batched seq len 缓冲 / dense cache 存储长度）与 RoPE 表长（chitu/backend.py 的
+    max_position_embeddings），不为 mtp / 主模型维护两套长度。
+    """
+    draft_len = max(0, int(getattr(get_global_args().infer, "mtp_size", 1)) - 1)
+    return max_seq_len - 1 + 3 * draft_len
+
+
 def is_power_of_two(n: int) -> bool:
     return (n != 0) and (n & (n - 1)) == 0
 

@@ -312,9 +312,7 @@ class TestPagedKVCacheManager:
         task.dp_rank = 0
         task_n_cached_blocks = cache_manager.num_cached_blocks(task)
         assert task_n_cached_blocks == 0, f"{task_n_cached_blocks} vs 0"
-        assert (
-            task.kv_cache_len_used_in_completed_steps == 0
-        ), f"{task.kv_cache_len_used_in_completed_steps} vs 0"
+        assert task.cached_seq_len == 0, f"{task.cached_seq_len} vs 0"
         task.set_prefill_chunk_size_for_one_step(300)  # 假如prefill_chunk_size为300
         task.new_cache_ids = {
             "main": cache_manager.prepare_metadata_before_prefill(task)
@@ -335,7 +333,7 @@ class TestPagedKVCacheManager:
 
         # 第二次被prefill调度
         assert cache_manager.num_cached_blocks(task) == 1
-        assert task.kv_cache_len_used_in_completed_steps == 300
+        assert task.cached_seq_len == 300
         task.set_prefill_chunk_size_for_one_step(300)  # 假如prefill_chunk_size为300
         task.new_cache_ids = {
             "main": cache_manager.prepare_metadata_before_prefill(task)
@@ -371,7 +369,7 @@ class TestPagedKVCacheManager:
             ),
             need_ensure=False,
             need_preprocess=False,
-        )  # task计算kv_cache_len_used_in_completed_steps_and_next_step时会用到全局的mtp_size信息
+        )  # task计算alloc_seq_len时会用到全局的mtp_size信息
         cache_manager.mtp_size = 500  # 设定mtp_size为500
 
         # 开始被decode调度
@@ -379,21 +377,20 @@ class TestPagedKVCacheManager:
         aviable_blocks = cache_manager.num_blocks - cache_manager.num_active_blocks
         cur_blocks = cache_manager.num_cached_blocks(task)
         target_blocks = ceil_div(
-            task.kv_cache_len_used_in_completed_steps_and_next_step,
+            task.alloc_seq_len,
             cache_manager.block_size,
         )
-        assert task.kv_cache_len_used_in_completed_steps_and_next_step == 1600
+        assert task.alloc_seq_len == 1100
         assert aviable_blocks == 98
         assert cur_blocks == 2
-        assert target_blocks == 4
+        assert target_blocks == 3
         task.new_cache_ids = {
             "main": cache_manager.prepare_metadata_before_decode(task)
         }
 
-        assert task.new_cache_ids["main"] == [2, 3]
-        assert cache_manager.task_to_cache_ids[task.task_id] == {0, 1, 2, 3}
+        assert task.new_cache_ids["main"] == [2]
+        assert cache_manager.task_to_cache_ids[task.task_id] == {0, 1, 2}
         assert cache_manager.active_blocks[2] is task_token_blocks[2].runtime
-        assert cache_manager.active_blocks[3] is task_token_blocks[3].runtime
         assert task_token_blocks[1].active_cnt == 1
 
         # 在executor中执行decode step
@@ -402,22 +399,22 @@ class TestPagedKVCacheManager:
         assert task.prefix_tokens_len == 1001
 
         # 再次被decode调度
-        assert cache_manager.num_cached_blocks(task) == 4
+        assert cache_manager.num_cached_blocks(task) == 3
         aviable_blocks = cache_manager.num_blocks - cache_manager.num_active_blocks
         cur_blocks = cache_manager.num_cached_blocks(task)
         target_blocks = ceil_div(
-            task.kv_cache_len_used_in_completed_steps_and_next_step,
+            task.alloc_seq_len,
             cache_manager.block_size,
         )
-        assert task.kv_cache_len_used_in_completed_steps_and_next_step == 2000
-        assert aviable_blocks == 96
-        assert cur_blocks == 4
-        assert target_blocks == 4
+        assert task.alloc_seq_len == 1500
+        assert aviable_blocks == 97
+        assert cur_blocks == 3
+        assert target_blocks == 3
         task.new_cache_ids = {
             "main": cache_manager.prepare_metadata_before_decode(task)
         }
         assert task.new_cache_ids["main"] == []
-        assert cache_manager.task_to_cache_ids[task.task_id] == {0, 1, 2, 3}
+        assert cache_manager.task_to_cache_ids[task.task_id] == {0, 1, 2}
 
 
 @pytest.fixture
@@ -542,7 +539,7 @@ class TestPagedKVCacheManagerWithPrefixCaching:
         task_0.dp_rank = 0
         assert main_manager.num_cached_blocks(task_0) == 0
         assert len(main_manager.identity_builder.tid_to_identities[task_0.task_id]) == 2
-        assert task_0.kv_cache_len_used_in_completed_steps == 0
+        assert task_0.cached_seq_len == 0
         task_0.set_prefill_chunk_size_for_one_step(1024)  # 假如prefill_chunk_size为1024
         scheduler._prepare_prefill_metadata(task_0, cached_len=0)
 

@@ -360,7 +360,10 @@ def run_pipe_or_tensor_parallelism(args, timers):
                     GRAY = ""
                     RESET = ""
                 logger.info(
-                    f"Response in rank {rank}: reqs[{i}].output={req.output}, {GRAY}reqs[{i}].input={req.messages}{RESET}"
+                    f"Response in rank {rank}: reqs[{i}].output={req.output}, "
+                    f"reqs[{i}].output_len={req.num_output_tokens}, "
+                    f"reqs[{i}].finish_reason={req.finish_reason}, "
+                    f"{GRAY}reqs[{i}].input={req.messages}{RESET}"
                 )
 
             if phonebook_test_enabled():
@@ -414,7 +417,11 @@ def run_normal(args, timers):
                 )
 
         for i, req in enumerate(reqs):
-            logger.info(f"Response in rank {rank}: reqs[{i}].output={req.output}")
+            logger.info(
+                f"Response in rank {rank}: reqs[{i}].output={req.output}, "
+                f"reqs[{i}].output_len={req.num_output_tokens}, "
+                f"reqs[{i}].finish_reason={req.finish_reason}"
+            )
 
         if phonebook_test_enabled():
             needle_reqs.extend(reqs)

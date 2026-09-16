@@ -8,7 +8,7 @@ from collections import deque, OrderedDict
 
 from chitu.global_vars import get_global_args, is_independent_multi_inst
 from chitu.task_type import TaskType
-from chitu.utils import ceil_div
+from chitu.utils import ceil_div, max_alloc_seq_len
 from chitu.kv_cache.prefix_caching import (
     TokenBlock,
     BlockIdentityChainBuilder,
@@ -60,7 +60,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
         manager_name: str = "main",
     ):
 
-        self.max_blocks_per_req = ceil_div(max_seq_len, block_size)
+        # 单个请求可能写入 kv cache 的最大长度：decode 最后一步可能比 max_seq_len 多出推测段
+        self.max_blocks_per_req = ceil_div(max_alloc_seq_len(max_seq_len), block_size)
         self.page_table_max_num_blocks = self.max_blocks_per_req * num_hot_req
         self.max_num_blocks = self.page_table_max_num_blocks
 
@@ -219,7 +220,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         count may include a non-full trailing block and must not go through here.
         """
         n = len(self.task_to_cache_ids.get(task.task_id, set()))
-        return min(n, task.kv_cache_len_used_in_completed_steps // self.block_size)
+        return min(n, task.cached_seq_len // self.block_size)
 
     def num_cached_blocks(self, task: "Task") -> int:
         """Number of contiguous cached blocks hit from prompt start."""
@@ -357,7 +358,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         """
         new_cache_ids: list[int] = []
         task_num_cached_blocks = self.num_blocks_for_seq_len(task.consumed_req_tokens)
-        target_seq_len = task.kv_cache_len_used_in_completed_steps_and_next_step
+        target_seq_len = task.alloc_seq_len
         num_target_blocks = self.num_blocks_for_seq_len(target_seq_len)
         num_identity_blocks = max(task_num_cached_blocks, num_target_blocks)
         task_identities = self._make_task_identities(
@@ -445,7 +446,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
         new_cache_ids: list[int] = []
 
-        target_seq_len = task.kv_cache_len_used_in_completed_steps_and_next_step
+        target_seq_len = task.alloc_seq_len
         num_target_blocks = self.num_blocks_for_seq_len(target_seq_len)
         token_blocks = self.task_to_token_blocks.get(task.task_id, [])
         assert len(token_blocks) == len(
@@ -482,7 +483,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         cached_blocks = self.task_to_token_blocks[task.task_id]
         num_cached_blocks = len(cached_blocks)
         identities = self._make_task_identities(task)
-        valid_kv_len = task.kv_cache_len_used_in_completed_steps
+        valid_kv_len = task.cached_seq_len
         prefix_ready = task.task_id not in self._deferred_prefix_publish
 
         # 更新blockruntime、self.active_blocks、self.cached_idle_blocks以及self.identity_runtime_pool
@@ -630,10 +631,15 @@ class DeepSeekV4CompressedKVCacheManager(
     ):
         self.compress_ratio = int(compress_ratio)
         super().__init__(num_blocks, **kwargs)
+        # 压缩流按 position // compress_ratio 寻址，槽位数 = ceil_div(可寻址上界, ratio)，
+        # 故按该槽位数取整块数（与 num_blocks_for_seq_len 的语义保持一致，
+        # 见 chitu/utils.max_alloc_seq_len）
         self.max_blocks_per_req = max(
             1,
             ceil_div(
-                int(kwargs["max_seq_len"]) // self.compress_ratio,
+                ceil_div(
+                    max_alloc_seq_len(int(kwargs["max_seq_len"])), self.compress_ratio
+                ),
                 self.block_size,
             ),
         )
@@ -646,6 +652,8 @@ class DeepSeekV4CompressedKVCacheManager(
 
     def num_blocks_for_seq_len(self, seq_len: int) -> int:
         seq_len = max(0, int(seq_len))
+        # 只按「已写满的压缩组」计块（尾组不占块）；存储长度按 ceil_div 多留的
+        # 那 1 个槽位与尾组同属最后一块，不会越出 max_blocks_per_req
         compressed_len = seq_len // self.compress_ratio
         if compressed_len == 0:
             return 0

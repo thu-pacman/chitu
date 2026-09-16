@@ -7,7 +7,7 @@ import torch
 
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import KVCacheAccessor, PagedKVCacheAccessor, DenseKVCacheAccessor
-from chitu.utils import get_global_args
+from chitu.utils import get_global_args, max_alloc_seq_len
 from .base import DSAIndexer
 
 from chitu.ops import (
@@ -90,7 +90,7 @@ class TorchIndexer(DSAIndexer):
                 cache_accessor.kv["indexer_ks"],
                 seq_len_delta=seq_len_delta,
                 k_page_table=cache_accessor.block_table,
-                static_max_n=get_global_args().infer.max_seq_len,
+                static_max_n=max_alloc_seq_len(get_global_args().infer.max_seq_len),
                 causal=is_causal,
                 softfp8=softfp8,
                 impl=self.impl,

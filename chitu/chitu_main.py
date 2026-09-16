@@ -48,6 +48,7 @@ from chitu.task import (
 )
 from chitu.utils import (
     gen_req_id,
+    max_alloc_seq_len,
     try_import_and_setup_torch_npu,
     ceil_div,
     get_chitu_bool_env,
@@ -751,11 +752,12 @@ def _auto_set_num_blocks_after_warmup(args):
     # all ranks must agree; each rank already aligned to block_lcm so min stays aligned
     max_tokens = allreduce_min_int(int(max_tokens))
 
-    # hard floor: a single max_seq_len request must fit; otherwise fail
-    floor_tokens = int(args.infer.max_seq_len)
+    # hard floor: a single max-length request must fit; otherwise fail
+    # (a request can be addressed up to max_alloc_seq_len tokens; see chitu/utils.py)
+    floor_tokens = int(max_alloc_seq_len(args.infer.max_seq_len))
     if int(max_tokens) < floor_tokens:
         logger.warning(
-            f"KV cache token capacity {int(max_tokens)} < max_seq_len {floor_tokens}: "
+            f"KV cache token capacity {int(max_tokens)} < max_alloc_seq_len {floor_tokens}: "
             f"insufficient GPU memory to hold a single max-length request "
             f"(role={getattr(args.multi_inst, 'role', None)}, "
             f"target_budget={int(target_budget_bytes)}, baseline={int(baseline_bytes)}). "

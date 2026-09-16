@@ -37,7 +37,7 @@ from chitu.models.model_deepseek_v3 import (
 )
 from chitu.quantization import get_quant_from_checkpoint_prefix
 from chitu.tensor_parallel import VocabParallelEmbedding
-from chitu.utils import parse_dtype, ceil_div
+from chitu.utils import parse_dtype, ceil_div, max_alloc_seq_len
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.distributed.parallel_state import get_dp_size
 from chitu.distributed.partition import compute_layer_dist_in_pp
@@ -563,7 +563,7 @@ class TransformerGLM52(TransformerDeepSeekV3):
         """Return the top-k width actually produced by the Indexer."""
         return min(
             int(self.params.index_topk),
-            int(get_global_args().infer.max_seq_len),
+            int(max_alloc_seq_len(get_global_args().infer.max_seq_len)),
         )
 
     def get_pipeline_payload_shape(self, num_tokens: int) -> list[int]:

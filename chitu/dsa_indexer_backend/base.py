@@ -10,7 +10,7 @@ import torch
 
 from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
 from chitu.ops.topk import topk_indices, topk_page_table_decode_cuda
-from chitu.utils import get_global_args
+from chitu.utils import get_global_args, max_alloc_seq_len
 
 logger = getLogger(__name__)
 
@@ -33,7 +33,8 @@ class DSAIndexer:
         assert impl in ("auto", self.impl)
         args = get_global_args()
         validate_indexer_config(args, self.impl)
-        self.static_max_n = args.infer.max_seq_len
+        # 可被寻址的最大长度（含 MTP draft / ghost token，见 chitu/utils.max_alloc_seq_len）
+        self.static_max_n = max_alloc_seq_len(args.infer.max_seq_len)
         self.index_topk = args.models.get("index_topk", 2048) or 2048
         self._indexer_logits_chunk_bytes = getattr(
             args.infer, "indexer_logits_chunk_bytes", None
