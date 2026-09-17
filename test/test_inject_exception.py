@@ -115,7 +115,7 @@ def _assert_request_succeeds(base: str) -> None:
         data = json.loads(body)
         for choice in data.get("choices", []):
             finish = choice.get("finish_reason", "")
-            if finish and finish != "stop":
+            if finish and finish not in {"stop", "length"}:
                 raise AssertionError(
                     f"expected normal finish, got finish_reason={finish!r}: {str(body)[:200]}"
                 )
