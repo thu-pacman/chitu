@@ -281,8 +281,18 @@ class FlashMLABackend(TritonAttnBackend):
 
     # TODO: padding indices could be done in triton kernel
     def pad_indices(self, topk_indices: torch.Tensor):
+        # FlashMLA sparse kernels require the topk width to be aligned to 128,
+        # and the metadata is built with topk=index_topk, so the width must also
+        # be at least index_topk. This method is a no-op when neither is needed,
+        # callers should always call it instead of duplicating the condition.
+        topk_alignment = 128
+        current_width = topk_indices.size(-1)
+        target_width = max(current_width, self.index_topk or 0)
+        padded_width = ceil_div(target_width, topk_alignment) * topk_alignment
+        if current_width == padded_width:
+            return topk_indices.contiguous()
         indices_padded = torch.full(
-            (*topk_indices.shape[:-1], self.index_topk),
+            (*topk_indices.shape[:-1], padded_width),
             -1,
             device=topk_indices.device,
             dtype=topk_indices.dtype,
@@ -339,9 +349,8 @@ class FlashMLABackend(TritonAttnBackend):
                 seq_len_delta.new.prefix_lens_tensor_device[i - 1]
             ).masked_fill_(this_seq_indices_mask, -1)
 
-        # pad indices to topk when not enough indices
-        if topk_indices.size(1) < self.index_topk:
-            topk_indices = self.pad_indices(topk_indices)
+        # pad indices to index_topk / 128-alignment when not enough indices
+        topk_indices = self.pad_indices(topk_indices)
 
         return topk_indices
 
@@ -372,9 +381,8 @@ class FlashMLABackend(TritonAttnBackend):
                 upper_idx_bound_per_token = (
                     seq_len_delta.delta_position_ids_tensor_device + 1
                 )
-            # pad indices to topk when not enough indices
-            if topk_indices.size(-1) < self.index_topk:
-                topk_indices = self.pad_indices(topk_indices)
+            # pad indices to index_topk / 128-alignment when not enough indices
+            topk_indices = self.pad_indices(topk_indices)
 
             topk_indices = convert_req_index_to_global_paged_index_triton(
                 req_id,
@@ -399,8 +407,7 @@ class FlashMLABackend(TritonAttnBackend):
     ):
         if format == "paged":
             raise NotImplementedError()
-        if topk_indices.size(-1) < self.index_topk:
-            topk_indices = self.pad_indices(topk_indices)
+        topk_indices = self.pad_indices(topk_indices)
 
         req_id = seq_len_delta.delta_seq_ids_tensor_device
         position_id = seq_len_delta.delta_position_ids_tensor_device
@@ -1812,8 +1819,7 @@ class FlashMLABackend(TritonAttnBackend):
 
         ### indices is not None: convert indices
         topk_indices = topk_indices.to(torch.int32)
-        if topk_indices.size(-1) < self.index_topk:
-            topk_indices = self.pad_indices(topk_indices)
+        topk_indices = self.pad_indices(topk_indices)
 
         if self.use_fp8_cache:
             kv_lora_k_pe = self.update_paged_mla_kv(

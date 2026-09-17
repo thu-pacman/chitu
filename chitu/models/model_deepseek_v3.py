@@ -1470,6 +1470,7 @@ class MLPDeepSeekV3(nn.Module):
             )
 
         self.op_impl = op_impl
+        self.swiglu_limit = getattr(args, "swiglu_limit", 0.0)
 
         if role == "standalone":
             inter_dim = args.inter_dim
@@ -1545,10 +1546,18 @@ class MLPDeepSeekV3(nn.Module):
         """
         if self.merge_gate_up:
             gate_up_proj_out = self.gate_up_proj(x)
-            return self.down_proj(silu_and_mul(gate_up_proj_out))
+            swiglu_limit = self.swiglu_limit if self.swiglu_limit > 0 else None
+            return self.down_proj(
+                silu_and_mul(gate_up_proj_out, swiglu_limit=swiglu_limit)
+            )
         else:
             gate_proj_out = self.gate_proj(x)
             up_proj_out = self.up_proj(x)
+            if self.swiglu_limit > 0:
+                gate_proj_out = torch.clamp(gate_proj_out, max=self.swiglu_limit)
+                up_proj_out = torch.clamp(
+                    up_proj_out, min=-self.swiglu_limit, max=self.swiglu_limit
+                )
             return self.down_proj(F.silu(gate_proj_out) * up_proj_out)
 
 
@@ -1648,7 +1657,7 @@ def MoeExpertsDeepSeekV3(
         )
 
     assert args.moe_inter_dim % get_etp_size() == 0
-    return base_moe_experts_class(
+    experts = base_moe_experts_class(
         dim=args.dim,
         moe_inter_dim=args.moe_inter_dim // get_etp_size(),
         global_n_experts=global_n_experts,
@@ -1657,6 +1666,9 @@ def MoeExpertsDeepSeekV3(
         n_activated_experts=args.n_activated_experts,
         checkpoint_prefix=moe_checkpoint_prefix,
     )
+    swiglu_limit = getattr(args, "swiglu_limit", 0.0)
+    experts.swiglu_limit = swiglu_limit if swiglu_limit > 0 else None
+    return experts
 
 
 class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):

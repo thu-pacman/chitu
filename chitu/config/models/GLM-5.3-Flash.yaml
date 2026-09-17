@@ -1,0 +1,76 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+defaults:
+  - _self_
+
+name: GLM-5.3-Flash
+type: glm-5-next
+source: "https://huggingface.co/zai-org/GLM-5.3-Flash"
+tokenizer_type: "hf"
+
+
+quant_config:
+  quant:
+    - model: "."
+      rules:
+        - regex: "\\.mlp\\.(gate_proj|up_proj|down_proj|gate_up_proj)\\."
+          type: blockfp8
+        - regex: "\\.mlp\\.experts\\."
+          type: blockfp8
+        - regex: "\\.mlp\\.shared_experts\\."
+          type: blockfp8
+
+vocab_size: "$(config.json:text_config.vocab_size)"
+dim: "$(config.json:text_config.hidden_size)"
+inter_dim: "$(config.json:text_config.intermediate_size)"
+moe_inter_dim: "$(config.json:text_config.moe_intermediate_size)"
+swiglu_limit: "$(config.json:text_config.swiglu_limit)"
+n_layers: "$(config.json:text_config.num_hidden_layers)"
+n_dense_layers: "$(config.json:text_config.first_k_dense_replace)"
+n_heads: "$(config.json:text_config.num_attention_heads)"
+n_kv_heads: "$(config.json:text_config.num_key_value_heads)"
+n_routed_experts: "$(config.json:text_config.n_routed_experts)"
+n_shared_experts: "$(config.json:text_config.n_shared_experts)"
+n_activated_experts: "$(config.json:text_config.num_experts_per_tok)"
+n_expert_groups: "$(config.json:text_config.n_group)"
+n_limited_groups: "$(config.json:text_config.topk_group)"
+route_scale: "$(config.json:text_config.routed_scaling_factor)"
+score_func: sigmoid
+moe_gate_force_fp32: true
+norm_topk_prob: "$(config.json:text_config.norm_topk_prob)"
+q_lora_rank: "$(config.json:text_config.q_lora_rank)"
+kv_lora_rank: "$(config.json:text_config.kv_lora_rank)"
+qk_nope_head_dim: "$(config.json:text_config.qk_nope_head_dim)"
+qk_rope_head_dim: "$(config.json:text_config.qk_rope_head_dim)"
+v_head_dim: "$(config.json:text_config.v_head_dim)"
+rope_theta: 10000
+rope_factor: 1
+index_head_dim: "$(config.json:text_config.index_head_dim)"
+index_n_heads: "$(config.json:text_config.index_n_heads)"
+index_topk: "$(config.json:text_config.index_topk)"
+index_kpool: "$(config.json:text_config.index_kpool)"
+index_kpool_always_select_tail: "$(config.json:text_config.index_kpool_always_select_tail)"
+indexer_types: "$(config.json:text_config.indexer_types)"
+layer_types: "$(config.json:text_config.layer_types)"
+mlp_layer_types: "$(config.json:text_config.mlp_layer_types)"
+linear_head_dim: "$(config.json:text_config.linear_attn_config.head_dim)"
+linear_num_heads: "$(config.json:text_config.linear_attn_config.num_heads)"
+linear_n_v_heads: "$(config.json:text_config.linear_attn_config.num_heads)"
+linear_n_qk_heads: "$(config.json:text_config.linear_attn_config.num_heads)"
+linear_conv_kernel_dim: "$(config.json:text_config.linear_attn_config.short_conv_kernel_size)"
+linear_lower_bound: "$(config.json:text_config.linear_attn_config.gate_lower_bound)"
+linear_conv_impl: auto
+linear_attention_impl: auto
+# mhc_impl: auto
+hc_mult: "$(config.json:text_config.hc_mult)"
+hc_eps: "$(config.json:text_config.hc_eps)"
+hc_sinkhorn_iters: "$(config.json:text_config.hc_sinkhorn_iters)"
+rms_norm_dtype: float32
+rms_norm_eps: "$(config.json:text_config.rms_norm_eps)"
+mtp_tie_word_embeddings: True
+mtp_tie_lm_head: True
+eos_token_id: "$(config.json:text_config.eos_token_id)"
+tool_parser: GLM47ToolParser
+reasoning_type: switchable

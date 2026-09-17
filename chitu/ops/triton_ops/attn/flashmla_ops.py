@@ -531,9 +531,15 @@ def convert_req_index_to_global_paged_index_triton(
     assert block_table.dtype == torch.int32
     assert token_indices.dtype == torch.int32
     assert token_indices.shape[1] == NUM_TOPK_TOKENS
-    assert (
-        NUM_TOPK_TOKENS % BLOCK_N == 0
-    ), f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) must be divisible byBLOCK_N ({BLOCK_N})"
+    assert NUM_TOPK_TOKENS > 0
+    if NUM_TOPK_TOKENS % BLOCK_N != 0:
+        padded_topk_tokens = (NUM_TOPK_TOKENS + BLOCK_N - 1) // BLOCK_N * BLOCK_N
+        token_indices = torch.constant_pad_nd(
+            token_indices,
+            (0, padded_topk_tokens - NUM_TOPK_TOKENS),
+            value=-1,
+        )
+        NUM_TOPK_TOKENS = padded_topk_tokens
 
     num_tokens = req_id.shape[0]
     tiles_per_row = NUM_TOPK_TOKENS // BLOCK_N
@@ -575,7 +581,7 @@ def convert_req_index_to_global_paged_index_triton(
         num_requests,
         max_num_blocks_per_req,
     )
-    return out
+    return out[:, : token_indices.shape[1]]
 
 
 @triton.jit
@@ -916,6 +922,22 @@ def fused_append_and_convert_paged_kv_cache(
     if this_kv.numel() == 0:
         return kv_cache, torch.empty_like(token_indices)
 
+    original_topk_width = token_indices.shape[1]
+    BLOCK_N = 128
+    if NUM_TOPK_TOKENS != original_topk_width:
+        raise ValueError(
+            f"NUM_TOPK_TOKENS ({NUM_TOPK_TOKENS}) does not match "
+            f"token_indices width ({original_topk_width})"
+        )
+    if original_topk_width % BLOCK_N != 0:
+        padded_topk_width = (original_topk_width + BLOCK_N - 1) // BLOCK_N * BLOCK_N
+        token_indices = torch.constant_pad_nd(
+            token_indices,
+            (0, padded_topk_width - original_topk_width),
+            value=-1,
+        )
+        NUM_TOPK_TOKENS = padded_topk_width
+
     # Flatten to contiguous dims for pointer arithmetic
     orig_kv_cache_shape = kv_cache.shape
     kv_cache = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], -1)
@@ -933,7 +955,6 @@ def fused_append_and_convert_paged_kv_cache(
     max_num_blocks_per_req = page_table.shape[1]
 
     BLOCK_DIM = 512
-    BLOCK_N = 128
     num_append_tiles = triton.cdiv(tot_len_of_other_dims, BLOCK_DIM)
     num_convert_tiles = NUM_TOPK_TOKENS // BLOCK_N
     assert (
@@ -975,7 +996,7 @@ def fused_append_and_convert_paged_kv_cache(
         INDEX_DTYPE=INDEX_DTYPE,
     )
 
-    return kv_cache.view(orig_kv_cache_shape), out
+    return kv_cache.view(orig_kv_cache_shape), out[:, :original_topk_width]
 
 
 # SPDX-SnippetEnd

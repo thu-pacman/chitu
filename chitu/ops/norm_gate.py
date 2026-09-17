@@ -21,6 +21,7 @@ def rms_norm_gate(
     weight: torch.Tensor,
     eps: float,
     compute_dtype: torch.dtype,
+    activation: str = "silu",
     out: Optional[torch.Tensor] = None,
     impl: str = "auto",
 ):
@@ -50,6 +51,7 @@ def rms_norm_gate_torch(
     weight: torch.Tensor,
     eps: float,
     compute_dtype: torch.dtype,
+    activation: str = "silu",
     out: Optional[torch.tensor] = None,
 ):
     input_dtype = x.dtype
@@ -60,7 +62,13 @@ def rms_norm_gate_torch(
     x = x * torch.rsqrt(variance + eps)
 
     x = weight * x.to(input_dtype)
-    x = x * F.silu(gate)
+    if activation == "silu":
+        gate = F.silu(gate)
+    elif activation == "sigmoid":
+        gate = torch.sigmoid(gate)
+    else:
+        raise ValueError(f"Unsupported activation: {activation}")
+    x = x * gate
     x = x.to(input_dtype)
     if out is not None:
         out.copy_(x)

@@ -117,7 +117,33 @@ def deepseek_v3_indexer_cache_spec(args, attn_backend_type) -> KVCacheSpec:
 
 
 @register_kv_cache_spec(
-    model_types=[ModelType.DEEPSEEK_V3, ModelType.KIMI_K2_5, ModelType.GLM_5_2],
+    model_types=[ModelType.GLM_5_NEXT],
+    cache_name="indexer",
+    priority=3,
+)
+def glm5_next_indexer_cache_spec(args, attn_backend_type) -> KVCacheSpec:
+    head_dim = int(args.models.index_head_dim)
+    return KVCacheSpec(
+        block_size=64,
+        kvargs={
+            "shape_per_token_dict": {
+                "indexer_packed": (head_dim * 2 + 1,),
+            },
+            "dtype_dict": {
+                "indexer_packed": torch.bfloat16,
+            },
+            "quant_type": None,
+        },
+    )
+
+
+@register_kv_cache_spec(
+    model_types=[
+        ModelType.DEEPSEEK_V3,
+        ModelType.KIMI_K2_5,
+        ModelType.GLM_5_2,
+        ModelType.GLM_5_NEXT,
+    ],
     priority=1,
 )
 def deepseek_v3_kv_cache_spec(args, attn_backend_type) -> KVCacheSpec:

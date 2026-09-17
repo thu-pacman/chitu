@@ -43,6 +43,51 @@ from chitu.distributed.parallel_state import get_dp_size
 from chitu.distributed.partition import compute_layer_dist_in_pp
 from chitu.global_vars import get_global_args
 
+
+def make_mlp_for_layer(
+    args,
+    layer_id: int,
+    op_impl: str,
+    *,
+    checkpoint_prefix: str | CheckpointPrefix,
+    use_layer_mlp_type: bool,
+):
+    """Construct the dense or sparse MLP used by GLM-5.x blocks."""
+    base_moe_experts_class = None
+    if op_impl == "muxi_custom_kernel":
+        quant = get_quant_from_checkpoint_prefix(
+            f"{checkpoint_prefix}.mlp", args.quant_config.rules
+        )
+        if quant is None:
+            base_moe_experts_class = NormalMoeExpertsMuxiLayout
+        elif quant == "blockfp8":
+            base_moe_experts_class = Blockfp8MoeExpertsMuxiLayout
+        else:
+            raise NotImplementedError(
+                "Unsupported quantization type for muxi_custom_kernel"
+            )
+
+    mlp_is_dense = (
+        args.mlp_layer_types[layer_id] == "dense"
+        if use_layer_mlp_type
+        else layer_id < args.n_dense_layers
+    )
+    if mlp_is_dense:
+        return MLPDeepSeekV3(
+            args,
+            role="standalone",
+            op_impl=op_impl,
+            checkpoint_prefix=f"{checkpoint_prefix}.mlp",
+        )
+    return ParallelMoeBlockDeepSeekV3(
+        args,
+        op_impl=op_impl,
+        base_moe_experts_class=base_moe_experts_class,
+        checkpoint_prefix=f"{checkpoint_prefix}.mlp",
+        layer_id=layer_id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Shared buffer
 # ---------------------------------------------------------------------------
@@ -294,49 +339,24 @@ class TransformerBlockGLM52(TransformerBlock):
             layer_id, args, cache_dict, attn_backend=attn_backend, op_impl=op_impl
         )
         self.layer_id = layer_id
-        self.self_attn = AttentionGLM52(
+        self.self_attn = self._make_attention(
+            layer_id,
+            args,
+            cache_dict,
+            attn_backend,
+            op_impl,
+            mla_absorb,
+            checkpoint_prefix,
+            indexer_impl,
+            indexer_role,
+            indexer_buffer,
+        )
+        self.mlp = make_mlp_for_layer(
             args,
             layer_id,
-            cache_dict["main"],
-            attn_backend,
-            op_impl=op_impl,
-            mla_absorb=mla_absorb,
-            checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
-            indexer_cache=cache_dict.get("indexer"),
-            indexer_impl=indexer_impl,
-            indexer_role=indexer_role,
-            indexer_buffer=indexer_buffer,
-        )
-        base_moe_experts_class = None
-        if op_impl == "muxi_custom_kernel":
-            quant = get_quant_from_checkpoint_prefix(
-                f"{checkpoint_prefix}.mlp", args.quant_config.rules
-            )
-            if quant is None:
-                base_moe_experts_class = NormalMoeExpertsMuxiLayout
-            elif quant == "blockfp8":
-                base_moe_experts_class = Blockfp8MoeExpertsMuxiLayout
-            else:
-                raise NotImplementedError(
-                    "Unsupported quantization type for muxi_custom_kernel"
-                )
-        self.mlp = (
-            MLPDeepSeekV3(
-                args,
-                role="standalone",
-                op_impl=op_impl,
-                checkpoint_prefix=f"{checkpoint_prefix}.mlp",
-            )
-            if layer_id < args.n_dense_layers
-            else (
-                ParallelMoeBlockDeepSeekV3(
-                    args,
-                    op_impl=op_impl,
-                    base_moe_experts_class=base_moe_experts_class,
-                    checkpoint_prefix=f"{checkpoint_prefix}.mlp",
-                    layer_id=layer_id,
-                )
-            )
+            op_impl,
+            checkpoint_prefix=checkpoint_prefix,
+            use_layer_mlp_type=False,
         )
         self.input_layernorm = (
             RMSNorm(
@@ -355,6 +375,33 @@ class TransformerBlockGLM52(TransformerBlock):
             args.dim,
             dtype=parse_dtype(args.rms_norm_dtype),
             eps=args.rms_norm_eps,
+        )
+
+    def _make_attention(
+        self,
+        layer_id: int,
+        args,
+        cache_dict: dict[str, KVCacheBase],
+        attn_backend,
+        op_impl: str,
+        mla_absorb: str,
+        checkpoint_prefix,
+        indexer_impl,
+        indexer_role: str,
+        indexer_buffer: Optional[_IndexerBuffer] = None,
+    ):
+        return AttentionGLM52(
+            args,
+            layer_id,
+            cache_dict["main"],
+            attn_backend,
+            op_impl=op_impl,
+            mla_absorb=mla_absorb,
+            checkpoint_prefix=f"{checkpoint_prefix}.self_attn",
+            indexer_cache=cache_dict.get("indexer"),
+            indexer_impl=indexer_impl,
+            indexer_role=indexer_role,
+            indexer_buffer=indexer_buffer,
         )
 
     @override
@@ -384,6 +431,18 @@ class TransformerBlockGLM52(TransformerBlock):
         self, mode: Optional[str], buffer: Optional[_IndexerBuffer]
     ) -> None:
         self.self_attn.set_indexer_buffer(mode, buffer)
+
+
+def _run_non_mtp_layers(layers, h, freqs_cis: BatchedFreqsCis):
+    residual = None
+    for it, layer in enumerate(layers):
+        if it == 0:
+            h, residual = layer(h, freqs_cis)
+        else:
+            h, residual = layer(h, freqs_cis, residual=residual)
+    if residual is not None:
+        h = h + residual
+    return h
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +493,7 @@ class TransformerBlockGLM52MTP(TransformerBlockGLM52):
             int(get_global_args().infer.max_batch_size), get_dp_size()
         )
         self.shared_head = SharedHeadDeepSeekV3(args, self.max_batch_size_per_dp)
-        if not args.mtp_tie_word_embeddings:
+        if not getattr(args, "mtp_tie_word_embeddings", False):
             self.embed_tokens = VocabParallelEmbedding(
                 args.vocab_size,
                 args.dim,
@@ -622,14 +681,7 @@ class TransformerGLM52(TransformerDeepSeekV3):
             self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
         h = self._pre_layers(tokens, **args)
 
-        residual = None
-        for it, layer in enumerate(self.non_mtp_layers):
-            if it == 0:
-                h, residual = layer(h, freqs_cis)
-            else:
-                h, residual = layer(h, freqs_cis, residual=residual)
-        if residual is not None:
-            h = h + residual
+        h = _run_non_mtp_layers(self.non_mtp_layers, h, freqs_cis)
 
         if self.mtp_size > 1:
             self.mtp_prefill(
@@ -648,14 +700,7 @@ class TransformerGLM52(TransformerDeepSeekV3):
     def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
         self._clear_backbone_indexer_buffer()
         h = self._pre_layers(tokens)
-        residual = None
-        for it, layer in enumerate(self.non_mtp_layers):
-            if it == 0:
-                h, residual = layer(h, freqs_cis)
-            else:
-                h, residual = layer(h, freqs_cis, residual=residual)
-        if residual is not None:
-            h = h + residual
+        h = _run_non_mtp_layers(self.non_mtp_layers, h, freqs_cis)
         if self.mtp_size > 1:
             self.update_mtp_hidden_states(
                 self.norm(h, compute_dtype=h.dtype), is_mtp=True
@@ -744,14 +789,7 @@ class TransformerGLM52(TransformerDeepSeekV3):
         if self.moe_impl is not None:
             self.moe_impl.prepare(TaskType.Prefill, batch_size)
 
-        residual = None
-        for it, layer in enumerate(self.non_mtp_layers):
-            if it == 0:
-                h, residual = layer(h, freqs_cis)
-            else:
-                h, residual = layer(h, freqs_cis, residual=residual)
-        if residual is not None:
-            h = h + residual
+        h = _run_non_mtp_layers(self.non_mtp_layers, h, freqs_cis)
 
         if self.pp_stage == self.pp_end_stage:
             if self.mtp_size > 1:
@@ -787,14 +825,7 @@ class TransformerGLM52(TransformerDeepSeekV3):
                 middle_state, topk = self._unpack_topk(middle_state)
                 self._backbone_buf.topk = topk
             h = middle_state
-        residual = None
-        for it, layer in enumerate(self.non_mtp_layers):
-            if it == 0:
-                h, residual = layer(h, freqs_cis)
-            else:
-                h, residual = layer(h, freqs_cis, residual=residual)
-        if residual is not None:
-            h = h + residual
+        h = _run_non_mtp_layers(self.non_mtp_layers, h, freqs_cis)
         if self.pp_stage == self.pp_end_stage:
             if self.mtp_size > 1:
                 self.update_mtp_hidden_states(
