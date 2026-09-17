@@ -14,7 +14,7 @@ from chitu.cuda_graph import cuda_graph_safe_cached_property
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
-from chitu.utils import ceil_div, create_tensor
+from chitu.utils import ceil_div, create_tensor, max_alloc_seq_len
 from chitu.ops import fp8_pertensor_kvcache_quant, fp8_pertoken_kvcache_quant_dsa
 
 if TYPE_CHECKING:
@@ -297,8 +297,8 @@ class KVCacheBase:
             else None
         )
         _mtp_size = get_global_args().infer.mtp_size
-        _mtp_extra = _mtp_size if _mtp_size > 1 else 0
-        self.max_total_len = num_hot_req * (max_seq_len + _mtp_extra)
+        # 每个请求可能写入 kv cache 的最大长度（decode 最后一步可能多算 mtp_size 个 token）
+        self.max_total_len = num_hot_req * max_alloc_seq_len(max_seq_len)
         self.max_total_delta_len = max(
             (
                 prefill_chunk_size_per_dp
@@ -313,11 +313,11 @@ class KVCacheBase:
             max_batch_size=num_hot_req,
             max_total_len=self.max_total_len,
             max_total_delta_len=self.max_total_delta_len,
-            cache_prefix_lens_tensor_device=True,
-            cache_position_ids_tensor_device=True,
-            cache_seq_ids_tensor_device=True,
-            cache_delta_position_ids_tensor_device=True,
-            cache_delta_seq_ids_tensor_device=True,
+            use_prefix_lens_static_tensor=True,
+            use_position_ids_static_tensor=False,
+            use_seq_ids_static_tensor=False,
+            use_delta_position_ids_static_tensor=True,
+            use_delta_seq_ids_static_tensor=True,
         )
 
         self.mtp_size = get_global_args().infer.mtp_size
@@ -327,11 +327,11 @@ class KVCacheBase:
                 max_batch_size=num_hot_req,
                 max_total_len=self.max_total_len,
                 max_total_delta_len=self.max_total_delta_len,
-                cache_prefix_lens_tensor_device=True,
-                cache_position_ids_tensor_device=True,
-                cache_seq_ids_tensor_device=True,
-                cache_delta_position_ids_tensor_device=True,
-                cache_delta_seq_ids_tensor_device=True,
+                use_prefix_lens_static_tensor=True,
+                use_position_ids_static_tensor=False,
+                use_seq_ids_static_tensor=False,
+                use_delta_position_ids_static_tensor=True,
+                use_delta_seq_ids_static_tensor=True,
             )
 
     @property
@@ -389,16 +389,16 @@ class KVCacheBase:
         prev_seq_len = BatchedSeqLen(
             cached_token_lens,
             device=self.device,
-            cache_prefix_lens_tensor_device=False,
-            cache_position_ids_tensor_device=False,
-            cache_seq_ids_tensor_device=False,
+            use_prefix_lens_static_tensor=False,
+            use_position_ids_static_tensor=False,
+            use_seq_ids_static_tensor=False,
         )
         next_seq_len = BatchedSeqLen(
             [cached + delta for cached, delta in zip(cached_token_lens, delta_seq_len)],
             device=self.device,
-            cache_prefix_lens_tensor_device=False,
-            cache_position_ids_tensor_device=False,
-            cache_seq_ids_tensor_device=False,
+            use_prefix_lens_static_tensor=False,
+            use_position_ids_static_tensor=False,
+            use_seq_ids_static_tensor=False,
         )
         self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
         if self.mtp_size > 1:
@@ -466,16 +466,16 @@ class KVCacheBase:
         prev_seq_len = BatchedSeqLen(
             [0] * len(tasks.task_ids),
             device=self.device,
-            cache_prefix_lens_tensor_device=False,
-            cache_position_ids_tensor_device=False,
-            cache_seq_ids_tensor_device=False,
+            use_prefix_lens_static_tensor=False,
+            use_position_ids_static_tensor=False,
+            use_seq_ids_static_tensor=False,
         )
         next_seq_len = BatchedSeqLen(
             prefilling_lengths,
             device=self.device,
-            cache_prefix_lens_tensor_device=False,
-            cache_position_ids_tensor_device=False,
-            cache_seq_ids_tensor_device=False,
+            use_prefix_lens_static_tensor=False,
+            use_position_ids_static_tensor=False,
+            use_seq_ids_static_tensor=False,
         )
         self.seq_len_delta.copy_from(prev_seq_len, next_seq_len)
 
@@ -567,11 +567,12 @@ class PagedKVCache(KVCacheBase):
             quant_type=quant_type,
             device=device,
         )
-        # The MTP draft window reads up to 2*mtp_size positions ahead of the main token,
-        # so reserve the same lookahead in the page-table stride (see Task.kv_cache_len_used_in_completed_steps_and_next_step).
-        mtp_extra = 2 * self.mtp_size if (self.mtp_size > 1 and not is_singleton) else 0
         if page_table_max_seq_len is None:
-            page_table_max_seq_len = max_seq_len + mtp_extra
+            # 非 singleton 的 paged cache 需要容纳 decode 最后一步可能写入的最大长度；
+            # singleton（MTP / 线性注意力状态等）每个请求只有一个块，按 max_seq_len 计
+            page_table_max_seq_len = (
+                max_seq_len if is_singleton else max_alloc_seq_len(max_seq_len)
+            )
         else:
             page_table_max_seq_len = int(page_table_max_seq_len)
             if page_table_max_seq_len < 0:
@@ -1143,11 +1144,11 @@ class MMPagedKVCache(PagedKVCache):
             max_batch_size=self.num_hot_req,
             max_total_len=self.max_total_len,
             max_total_delta_len=self.max_total_delta_len,
-            cache_prefix_lens_tensor_device=True,
-            cache_position_ids_tensor_device=True,
-            cache_seq_ids_tensor_device=True,
-            cache_delta_position_ids_tensor_device=True,
-            cache_delta_seq_ids_tensor_device=True,
+            use_prefix_lens_static_tensor=True,
+            use_position_ids_static_tensor=True,
+            use_seq_ids_static_tensor=True,
+            use_delta_position_ids_static_tensor=True,
+            use_delta_seq_ids_static_tensor=True,
         )
 
     def realloc(self, num_blocks):
@@ -1175,9 +1176,9 @@ class MMPagedKVCache(PagedKVCache):
         prev_seq_len = BatchedSeqLen(
             [self.tid_to_multimodal_len.get(tid, 0) for tid in task_ids],
             device=self.device,
-            cache_prefix_lens_tensor_device=False,
-            cache_position_ids_tensor_device=False,
-            cache_seq_ids_tensor_device=False,
+            use_prefix_lens_static_tensor=False,
+            use_position_ids_static_tensor=False,
+            use_seq_ids_static_tensor=False,
         )
         next_seq_len = BatchedSeqLen(
             [
@@ -1188,9 +1189,9 @@ class MMPagedKVCache(PagedKVCache):
                 for tid, d in zip(task_ids, delta_seq_len)
             ],
             device=self.device,
-            cache_prefix_lens_tensor_device=False,
-            cache_position_ids_tensor_device=False,
-            cache_seq_ids_tensor_device=False,
+            use_prefix_lens_static_tensor=False,
+            use_position_ids_static_tensor=False,
+            use_seq_ids_static_tensor=False,
         )
         self.seq_multimodal_len_delta.copy_from(prev_seq_len, next_seq_len)
 
@@ -1388,7 +1389,7 @@ class DenseKVCache(KVCacheBase):
             device=device,
         )
         self.storage_max_seq_len = (
-            self.max_seq_len
+            max_alloc_seq_len(self.max_seq_len)
             if storage_max_seq_len is None
             else int(storage_max_seq_len)
         )

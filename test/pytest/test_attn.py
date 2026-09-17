@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from omegaconf import OmegaConf
 
 from chitu import global_vars
-import chitu.dsa_indexer as dsa_indexer_module
+import chitu.dsa_indexer_backend as dsa_indexer_module
 from chitu.attn_backend import (
     RefAttnBackend,
     TritonAttnBackend,
@@ -55,7 +55,7 @@ from chitu.ops import (
     apply_rotary_pos_emb_partial,
     hadamard_transform,
 )
-from chitu.dsa_indexer import (
+from chitu.dsa_indexer_backend import (
     DSAIndexer,
     support_indexer_deepgemm,
     support_indexer_hygon,
@@ -116,11 +116,11 @@ def _make_decode_seq_len_delta_from_start_positions(
         old_lens,
         new_lens,
         device=start_positions.device,
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
 
 
@@ -369,7 +369,7 @@ def test_dsa_indexer_paged_kv(
         OmegaConf.create(
             {
                 "infer": {
-                    "max_batch_size": 4,
+                    "max_batch_size": max(4, bs),
                     "op_impl": "torch",
                     "use_cuda_graph": False,
                     "tp_size": 1,
@@ -406,11 +406,11 @@ def test_dsa_indexer_paged_kv(
         old_seq_len_list,
         new_seq_len_list,
         device="cuda",
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
 
     page_size = 64
@@ -605,11 +605,11 @@ def test_dsa_indexer_paged_kv_bf16(
         old_seq_len_list,
         new_seq_len_list,
         device="cuda",
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
     # BatchedSeqLenDelta defaults to the prefill stage. Production sets this
     # flag in the executor; set it explicitly here so the decode cases really
@@ -809,11 +809,11 @@ def test_triton_bf16_index_score_ragged_qk_nocp(
         old_seq_len_list,
         new_seq_len_list,
         device=device,
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
 
     s_q = seq_len_delta.delta_total_len
@@ -911,11 +911,11 @@ def test_triton_bf16_index_score_ragged_qk_cp(pcp_size, stage, n_heads, head_dim
         old_seq_len_list,
         new_seq_len_list,
         device=device,
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
 
     s_q = seq_len_delta.delta_total_len
@@ -1077,11 +1077,11 @@ def test_mla_prefill_ragged_qkvo(
         old_seq_len_list,
         new_seq_len_list,
         device="cuda",
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
 
     if topk is not None and bs > 0:
@@ -1228,11 +1228,11 @@ def test_mla_prefill_ragged_qo_paged_kv(
         old_seq_len_list,
         new_seq_len_list,
         device="cuda",
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
 
     if impl == "triton":
@@ -1362,11 +1362,11 @@ def test_flash_mla_fp8_kvcache_dequant_bf16_prefill(
         [0 for _ in range(bs)],
         [seq_len for _ in range(bs)],
         device="cuda",
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
     page_table = torch.arange(max_num_pages, device="cuda", dtype=torch.int32).view(
         bs, page_cnt_per_sample
@@ -1623,11 +1623,11 @@ def test_mla_decode_dense_kv(
         prev_seq_len_list,
         [item + 1 for item in prev_seq_len_list],
         device="cuda",
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
     q_nope = torch.randn(bs, local_n_heads, kv_lora_rank, device="cuda")
     q_pe = torch.randn(bs, local_n_heads, qk_rope_head_dim, device="cuda")
@@ -1819,11 +1819,11 @@ def test_mla_decode_paged_kv(
         prev_seq_len_list,
         [item + 1 for item in prev_seq_len_list],
         device="cuda",
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
     q_nope = torch.randn(bs, local_n_heads, kv_lora_rank, device="cuda")
     q_pe = torch.randn(bs, local_n_heads, qk_rope_head_dim, device="cuda")
@@ -3363,11 +3363,11 @@ def test_hopper_mixed_decode_paged_kv(
         prev_seq_len_list,
         [item + 1 for item in prev_seq_len_list],
         device="cuda",
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
 
     q_nope = torch.randn(bs, local_n_heads, kv_lora_rank, device="cuda")
@@ -3499,11 +3499,11 @@ def test_prefill_ragged_qkvo(
         old_seq_len_list,
         new_seq_len_list,
         device="cuda",
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
 
     if impl == "triton":
@@ -3614,11 +3614,11 @@ def test_decode_dense_kv(
         prev_seq_len_list,
         [x + 1 for x in prev_seq_len_list],
         device="cuda",
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
     batch_size = seq_len_delta.batch_size
     num_blocks = 40
@@ -3780,11 +3780,11 @@ def test_decode_paged_kv(
         prev_seq_len_list,
         [x + 1 for x in prev_seq_len_list],
         device="cuda",
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
     batch_size = seq_len_delta.batch_size
     num_blocks = 40
@@ -3950,11 +3950,11 @@ def test_prefill_ragged_qo_paged_kv(
         old_seq_len_list,
         new_seq_len_list,
         device="cuda",
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
 
     block_size = 64 if impl == "hunyuan_attn" else 256
@@ -4048,7 +4048,10 @@ def test_reconstruct_prefill_matches_full_kv_attention(chunk_lens):
     v_head_dim = 8
     q_lora_rank = 128
     dim = 32
-    max_seq_len = sum(chunk_lens)
+    # prompt 长度必须严格小于 max_seq_len（生产侧由 UserRequest.cap_max_new_tokens 保证）：
+    # kv cache 可寻址上界 max_alloc_seq_len = max_seq_len - 1（mtp_size = 1，最后一个 token
+    # 是采样得到的、不写 cache），这里 sum(chunk_lens) 是整段 prompt，故多留 1 个 token
+    max_seq_len = sum(chunk_lens) + 1
     block_size = 4
 
     set_global_args(

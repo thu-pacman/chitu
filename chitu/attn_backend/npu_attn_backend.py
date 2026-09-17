@@ -17,7 +17,11 @@ from chitu.global_vars import get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.ops import append_to_dense_kv_cache, append_to_paged_kv_cache
 from chitu.ops.page_table import topk_ids_to_page_ids
-from chitu.utils import try_import_and_setup_torch_npu, try_import_opt_dep
+from chitu.utils import (
+    try_import_and_setup_torch_npu,
+    try_import_opt_dep,
+    max_alloc_seq_len,
+)
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
@@ -69,7 +73,8 @@ class NpuAttnBackend(RefAttnBackend):
             max_nelem=self.max_aiv_num + 1, dtype=torch.int32, device="npu"
         )
         max_batch_size = self.args.infer.max_batch_size
-        max_seq_len = self.args.infer.max_seq_len
+        # 可被寻址的长度上界（含 MTP draft / ghost token，见 chitu/utils.max_alloc_seq_len）
+        max_seq_len = max_alloc_seq_len(self.args.infer.max_seq_len)
         self.decode_casual_attn_mask = StaticTensor(
             max_nelem=max_batch_size * 8 * max_seq_len, dtype=torch.bool, device="npu"
         )
@@ -224,7 +229,7 @@ class NpuAttnBackend(RefAttnBackend):
             assert q_len > 0
 
             q_max_len = q_len
-            k_max_len = self.args.infer.max_seq_len
+            k_max_len = max_alloc_seq_len(self.args.infer.max_seq_len)
 
             if q_len > 1:
                 k_lens = seq_len_delta.new.lens_tensor_device

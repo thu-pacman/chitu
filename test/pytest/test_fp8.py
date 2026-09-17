@@ -418,11 +418,11 @@ def test_blockfp8_index_score_ragged_q_dense_k_dsv32(
         old_seq_len_list,
         new_seq_len_list,
         device="cuda",
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
 
     q_bf16 = torch.randn(
@@ -477,11 +477,11 @@ def test_blockfp8_index_score_ragged_q_paged_k_dsv32(
         old_seq_len_list,
         new_seq_len_list,
         device="cuda",
-        cache_prefix_lens_tensor_device=False,
-        cache_position_ids_tensor_device=False,
-        cache_seq_ids_tensor_device=False,
-        cache_delta_position_ids_tensor_device=False,
-        cache_delta_seq_ids_tensor_device=False,
+        use_prefix_lens_static_tensor=False,
+        use_position_ids_static_tensor=False,
+        use_seq_ids_static_tensor=False,
+        use_delta_position_ids_static_tensor=False,
+        use_delta_seq_ids_static_tensor=False,
     )
 
     page_cnt_per_sample = ceil_div(seq_len_delta.new.max_len, page_size)

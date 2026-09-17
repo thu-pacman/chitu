@@ -9,6 +9,7 @@ from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Optional
 import pickle
 from chitu.global_vars import get_global_args
+from chitu.utils import max_alloc_seq_len
 import functools
 
 if TYPE_CHECKING:
@@ -151,12 +152,15 @@ class BlockIdentityChainBuilder:
         self.tid_to_identities: dict[str, list[BlockIdentity]] = dict()
 
         # 优化不开启前缀缓存/不计算块哈希时的耗时
+        # 单个请求可被寻址到的最大 token 数：prefix_tokens 含 ghost token，
+        # 长度可超过 infer.max_seq_len（见 chitu/utils.max_alloc_seq_len）
         max_seq_len = getattr(get_global_args().infer, "max_seq_len", 8192)
+        max_alloc_len = max_alloc_seq_len(max_seq_len)
 
         self._placeholder_identity = BlockIdentity(blk_size=block_size)
         self._placeholder_identity_chain = [
             self._placeholder_identity
-            for _ in range((max_seq_len + self.block_size - 1) // self.block_size)
+            for _ in range((max_alloc_len + self.block_size - 1) // self.block_size)
         ]
 
     def placeholder_identity(self) -> BlockIdentity:

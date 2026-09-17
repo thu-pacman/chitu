@@ -358,6 +358,8 @@ def live_req(monkeypatch):
     req = UserRequest.__new__(UserRequest)
     req.request_id = "req-live"
     req.prompt_len = 10
+    # add_data truncates at max_new_tokens; the fake request needs a budget
+    req.max_new_tokens = 128
     req.num_hit_tokens = 0
     req.async_stream = stream
     req.generated_tokens = []

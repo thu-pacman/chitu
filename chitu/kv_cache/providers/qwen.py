@@ -8,7 +8,7 @@ from chitu.models.registry import ModelType
 
 
 @register_kv_cache_spec(
-    model_types=[ModelType.HF_QWEN3_NEXT, ModelType.HF_QWEN3_5],
+    model_types=[ModelType.HF_QWEN3_NEXT, ModelType.HF_QWEN3_5, ModelType.GLM_5_NEXT],
     cache_name="linear",
     priority=1,
 )

@@ -17,6 +17,7 @@ def rms_norm_gate_triton(
     weight: torch.Tensor,
     eps: float,
     compute_dtype: torch.dtype,
+    activation: str = "silu",
     out: Optional[torch.Tensor] = None,
 ):
     num_cols = x.shape[-1]
@@ -69,6 +70,7 @@ def rms_norm_gate_triton(
         num_cols,
         compute_dtype=to_triton_dtype(compute_dtype),
         input_dtype=to_triton_dtype(x.dtype),
+        ACTIVATION=activation,
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return out.to(x.dtype)
@@ -114,6 +116,7 @@ def rms_norm_gate_kernel(
     n_cols: tl.constexpr,
     compute_dtype: tl.constexpr,
     input_dtype: tl.constexpr,
+    ACTIVATION: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     row_idx = tl.program_id(0)
@@ -139,11 +142,16 @@ def rms_norm_gate_kernel(
     # apply weight
     weighted_X = row_W * normd_X.to(input_dtype)
 
-    # silu and gate
+    # gate
     sig_G = tl.sigmoid(row_G)
-    silu_G = row_G * sig_G
+    if ACTIVATION == "silu":
+        gate = row_G * sig_G
+    elif ACTIVATION == "sigmoid":
+        gate = sig_G
+    else:
+        raise ValueError(f"Unsupported activation: {ACTIVATION}")
 
-    out = weighted_X * silu_G
+    out = weighted_X * gate
     out = out.to(input_dtype)
 
     tl.store(Y_ptr + row_idx * Y_row_stride + col_offsets, out, mask=mask)

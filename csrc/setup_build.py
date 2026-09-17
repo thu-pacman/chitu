@@ -60,6 +60,19 @@ def get_extensions():
     enable_custom_all_reduce = (muxi_build == "0") and (ascend_build == "0")
     enable_dsa_fp8_kv_dequant = (muxi_build == "0") and (ascend_build == "0")
 
+    if hygon_build == "0" and muxi_build == "0" and ascend_build == "0":
+        cxx_extra_args.append("-DCHITU_NVIDIA_INDEXER_TOPK=1")
+        nvcc_extra_args.append("-DCHITU_NVIDIA_INDEXER_TOPK=1")
+        extra_sources.extend(
+            os.path.join(this_dir, "cuda/topk/" + name)
+            for name in (
+                "nvidia_indexer_topk.cu",
+                "nvidia_indexer_topk_t1024_c1536.cu",
+                "nvidia_indexer_topk_t1024_c3072.cu",
+                "nvidia_indexer_topk_t512_c3072.cu",
+            )
+        )
+
     if enable_nvfp4:
         cutlass_path = os.path.join(this_dir, "../third_party/cutlass")
         cxx_extra_args += ["-DENABLE_NVFP4"]

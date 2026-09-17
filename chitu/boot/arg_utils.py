@@ -309,7 +309,7 @@ def resolve_default_args(args):
         ), "embed_tokens_lm_head_tp_size must be auto or an integer"
 
     if args.infer.mla_absorb == "auto":
-        if args.models.type in {"deepseek-v3", "kimi-k2-5", "glm-5-2"}:
+        if args.models.type in {"deepseek-v3", "kimi-k2-5", "glm-5-2", "glm-5-next"}:
             args.infer.mla_absorb = "absorb-without-precomp"
         else:
             args.infer.mla_absorb = "none"

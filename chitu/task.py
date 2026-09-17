@@ -35,7 +35,7 @@ from chitu.tool_call import (
     build_grammar,
 )
 from chitu.trace import Trace, TraceLevel
-from chitu.utils import dataclass_to_dict, dataclass_from_dict
+from chitu.utils import dataclass_to_dict, dataclass_from_dict, max_alloc_seq_len
 from chitu.reasoning import (
     update_chat_template_kwargs_reasoning,
 )
@@ -255,7 +255,7 @@ class UserRequest:
             raise PromptTooLongError(
                 f"prompt length({prompt_len}) cannot be greater than max_seq_len({max_seq_len})"
             )
-        max_new_tokens = min(max_new_tokens, max_seq_len - prompt_len + 1)
+        max_new_tokens = min(max_new_tokens, max_seq_len - prompt_len)
         return max_new_tokens
 
     @staticmethod
@@ -454,6 +454,10 @@ class UserRequest:
         if tokens and self.num_hit_tokens is not None:
             self.async_stream.set_input_cached_tokens(self.num_hit_tokens)
         for token in tokens:
+            if self.num_output_tokens >= self.max_new_tokens:
+                # 引擎可能多算 0..mtp_size-1 个 token（见 SPEC_seq-len-analy.MD §3.6），
+                # 交付层按设定的 max_new_tokens 截取
+                break
             self.generated_tokens.append(token)
             logger.debug(f"Request {self.request_id} adds a new token: {token}")
             self.num_output_tokens += 1
@@ -571,10 +575,9 @@ class Task:
         # Response
         self.num_new_tokens: int = 0
         self.next_tokens: list[int] = []  # (K,) next verify input tokens for MTP
-        self.num_new_tokens_single_step: int = get_global_args().infer.mtp_size
 
         # task states
-        # has_unsync_new_token is used to estimate the prefix_tokens_len
+        # has_unsync_new_token is used to estimate num_unsync_tokens / prefix_tokens_len
         # True if a new token is generated and not synchronized to CPU
         self.has_unsync_new_token: bool = False
         # TaskStatus.Waiting is only meaningful in pipeline parallelism. It means either of:
@@ -690,9 +693,8 @@ class Task:
             self.set_stopped()
             self.req.finish_reason = "stop"
         elif (
-            self.num_new_tokens
-            + (self.num_new_tokens_single_step if self.has_unsync_new_token else 0)
-            > self.req.max_new_tokens - get_global_args().infer.mtp_size
+            self.synced_seq_len + (1 if self.num_unsync_tokens >= 1 else 0)
+            >= self.max_seq_len
         ):
             self.set_stopped()
             self.req.finish_reason = "length"
@@ -737,10 +739,7 @@ class Task:
     @property
     def prefix_tokens_len(self):
         # if not sync, compute the prefix tokens length after sync
-        base_len = self._prefix_tokens_base_len + len(self.prefix_tokens)
-        if self.has_unsync_new_token and self.task_type == TaskType.Decode:
-            return base_len + Backend.executor.mtp_size
-        return base_len
+        return self.synced_seq_len + self.num_unsync_tokens
 
     def set_prefill_chunk_size_for_one_step(self, prefill_chunk_size: int):
         """
@@ -866,8 +865,37 @@ class Task:
         ) or self.task_type == TaskType.Decode
 
     @property
-    def kv_cache_len_used_in_completed_steps(self):
-        """在以往step中已经缓存到kv cache中的token长度"""
+    def prompt_seq_len(self) -> int:
+        """prompt 的 token 数（含 prefix cache 命中的部分）"""
+        return self.prompt_len
+
+    @property
+    def max_seq_len(self) -> int:
+        """本 task 允许达到的最大序列长度（prompt + 生成长度上限）。
+
+        计算层统一用它与 `synced_seq_len` 比较来做长度判断：`max_new_tokens`
+        只是请求层的量（`UserRequest.max_new_tokens`，交付层截取用），在这里换算一次。
+        """
+        limit = get_global_args().infer.max_seq_len
+        if self.req is None:
+            return limit
+        return min(limit, self.prompt_seq_len + self.req.max_new_tokens)
+
+    @property
+    def synced_seq_len(self) -> int:
+        """已同步&接收的 token 数（prompt + 已接收的生成 token）"""
+        return self._prefix_tokens_base_len + len(self.prefix_tokens)
+
+    @property
+    def num_unsync_tokens(self) -> int:
+        """已计算但尚未同步&接收的 token 数（估计上界）"""
+        if self.has_unsync_new_token and self.task_type == TaskType.Decode:
+            return Backend.executor.mtp_size
+        return 0
+
+    @property
+    def cached_seq_len(self) -> int:
+        """在以往step中已经缓存到kv cache中的token长度（不含会被回退的推测段）"""
         if self.task_type == TaskType.Prefill:
             return self.consumed_req_tokens
         elif self.task_type == TaskType.Decode:
@@ -877,12 +905,12 @@ class Task:
                 and Backend.args.models.type == ModelType.LLADA2
             ):
                 return self.decoding_start
-            return self.prefix_tokens_len - 1
+            return self.synced_seq_len - 1
         else:
             assert False
 
     @property
-    def kv_cache_len_used_in_completed_steps_and_next_step(self):
+    def alloc_seq_len(self) -> int:
         """在下一个step完成后缓存到kv cache中的token长度"""
         if self.task_type == TaskType.Prefill:
             # The first MTP draft runs before the first decode scheduler allocation is
@@ -906,13 +934,16 @@ class Task:
                 hasattr(Backend.args, "models")
                 and Backend.args.models.type == ModelType.LLADA2
             ):
+                # DLLM 按 block 写 cache，末块可越过序列末尾（既有问题，见 SPEC §5 第 9 条）；
+                # 这里 clamp 到与通用路径共用的容量上界，保证分配不超出 kv cache 容量
                 return min(
                     self.decoding_start + self.block_length,
-                    get_global_args().infer.max_seq_len,
+                    max_alloc_seq_len(get_global_args().infer.max_seq_len),
                 )
-            return min(
-                self.prefix_tokens_len - 1 + get_global_args().infer.mtp_size * 2,
-                get_global_args().infer.max_seq_len,
+            return (
+                self.cached_seq_len
+                + self.num_unsync_tokens
+                + get_global_args().infer.mtp_size
             )
         else:
             assert False

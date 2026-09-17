@@ -20,6 +20,16 @@ if has_fla:
         fused_recurrent_gated_delta_rule as fused_recurrent_gated_delta_rule_fla,
     )
 
+    try:
+        from fla.ops import chunk_kda as chunk_kda_fla
+        from fla.ops import fused_recurrent_kda as fused_recurrent_kda_fla
+
+        has_fla_kda = True
+    except ImportError:
+        has_fla_kda = False
+else:
+    has_fla_kda = False
+
 triton, has_triton = try_import_platform_dep("triton")
 if has_triton:
     from chitu.ops.triton_ops.fused_recurrent import (
@@ -301,6 +311,343 @@ def extract_and_merge(x, seq_len_list):
         result.append(extracted)
 
     return torch.cat(result, dim=0)
+
+
+def _kda_l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6):
+    # Match the GLM5.3 reference implementation: sqrt(sum(x^2) + eps).
+    inv_norm = torch.sqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x / inv_norm
+
+
+@make_op_dispatcher
+def chunk_kimi_delta_attention(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+    cu_seqlens=None,
+    seq_len_list=None,
+    impl="auto",
+):
+    raise NotImplementedError
+
+
+@chunk_kimi_delta_attention.register_auto
+def _auto_chunk_kimi_delta_attention():
+    if has_fla_kda:
+        return "fla"
+    return "torch"
+
+
+@chunk_kimi_delta_attention.register("fla", available=has_fla_kda)
+def _chunk_kimi_delta_attention_fla(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+    cu_seqlens=None,
+    seq_len_list=None,
+):
+    assert cu_seqlens is not None
+    if initial_state is not None:
+        initial_state = initial_state.to(torch.float32)
+    return chunk_kda_fla(
+        query,
+        key,
+        value,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        cu_seqlens=cu_seqlens,
+    )
+
+
+def chunk_kimi_delta_attention_torch_dense(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    chunk_size=64,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+):
+    initial_dtype = query.dtype
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32)
+        for x in (query, key, value, beta, g)
+    ]
+
+    if use_qk_l2norm_in_kernel:
+        query = _kda_l2norm(query, dim=-1, eps=1e-6)
+        key = _kda_l2norm(key, dim=-1, eps=1e-6)
+
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    scale = 1 / (query.shape[-1] ** 0.5)
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    total_sequence_length = sequence_length + pad_size
+
+    query = F.pad(query, (0, 0, 0, pad_size)) * scale
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    g = F.pad(g, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+
+    query, key, value, g, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+        for x in (query, key, value, g, k_beta, v_beta)
+    ]
+    beta = beta.reshape(beta.shape[0], beta.shape[1], -1, chunk_size)
+
+    g = g.cumsum(dim=-2)
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=0,
+    )
+    decay_mask = (g.unsqueeze(-2) - g.unsqueeze(-3)).exp().float()
+    attn = (
+        -(k_beta.unsqueeze(-2) * key.unsqueeze(-3) * decay_mask)
+        .sum(dim=-1)
+        .masked_fill(mask, 0)
+    )
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    value = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp())
+
+    last_recurrent_state = (
+        value.new_zeros((batch_size, num_heads, k_head_dim, v_head_dim))
+        if initial_state is None
+        else initial_state.to(value)
+    )
+    core_attn_out = torch.zeros_like(value)
+
+    mask = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=1,
+    )
+    for i in range(total_sequence_length // chunk_size):
+        q_i = query[:, :, i]
+        k_i = key[:, :, i]
+        v_i = value[:, :, i]
+        g_i = g[:, :, i]
+
+        attn_inter = (q_i * g_i.exp()) @ last_recurrent_state
+        attn_intra = (
+            (q_i.unsqueeze(-2) * k_i.unsqueeze(-3) * decay_mask[:, :, i])
+            .sum(dim=-1)
+            .masked_fill(mask, 0)
+        )
+        v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
+        v_new = v_i - v_prime
+
+        core_attn_out[:, :, i] = attn_inter + attn_intra @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g_i[:, :, -1].exp().unsqueeze(-1)
+            + (k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new
+        )
+
+    if not output_final_state:
+        last_recurrent_state = None
+
+    core_attn_out = core_attn_out.reshape(
+        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
+    )
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+
+    return core_attn_out, last_recurrent_state
+
+
+@chunk_kimi_delta_attention.register("torch")
+def chunk_kimi_delta_attention_torch(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+    cu_seqlens=None,
+    seq_len_list=None,
+):
+    assert seq_len_list is not None
+
+    max_curr_seq_len = max(seq_len_list)
+    bs = len(seq_len_list)
+    padded_q = torch.zeros(
+        (bs, max_curr_seq_len) + query.shape[-2:],
+        dtype=query.dtype,
+        device=query.device,
+    )
+    padded_k = torch.zeros(
+        (bs, max_curr_seq_len) + key.shape[-2:],
+        dtype=key.dtype,
+        device=key.device,
+    )
+    padded_v = torch.zeros(
+        (bs, max_curr_seq_len) + value.shape[-2:],
+        dtype=value.dtype,
+        device=value.device,
+    )
+    padded_g = torch.zeros(
+        (bs, max_curr_seq_len) + g.shape[-2:], dtype=g.dtype, device=g.device
+    )
+    padded_beta = torch.zeros(
+        (bs, max_curr_seq_len, beta.size(-1)), dtype=beta.dtype, device=beta.device
+    )
+
+    start_idx = 0
+    for i in range(bs):
+        padded_q[i][-seq_len_list[i] :] = query[0][
+            start_idx : start_idx + seq_len_list[i]
+        ]
+        padded_k[i][-seq_len_list[i] :] = key[0][
+            start_idx : start_idx + seq_len_list[i]
+        ]
+        padded_v[i][-seq_len_list[i] :] = value[0][
+            start_idx : start_idx + seq_len_list[i]
+        ]
+        padded_g[i][-seq_len_list[i] :] = g[0][start_idx : start_idx + seq_len_list[i]]
+        padded_beta[i][-seq_len_list[i] :] = beta[0][
+            start_idx : start_idx + seq_len_list[i]
+        ]
+        start_idx += seq_len_list[i]
+
+    core_attn_out, last_recurrent_state = chunk_kimi_delta_attention_torch_dense(
+        padded_q,
+        padded_k,
+        padded_v,
+        g=padded_g,
+        beta=padded_beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+
+    return extract_and_merge(core_attn_out, seq_len_list), last_recurrent_state
+
+
+@make_op_dispatcher
+def recurrent_kimi_delta_attention(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state,
+    output_final_state,
+    use_qk_l2norm_in_kernel=False,
+    impl="auto",
+):
+    raise NotImplementedError
+
+
+@recurrent_kimi_delta_attention.register_auto
+def _auto_recurrent_kimi_delta_attention():
+    if has_fla_kda:
+        return "fla"
+    return "torch"
+
+
+@recurrent_kimi_delta_attention.register("fla", available=has_fla_kda)
+def _recurrent_kimi_delta_attention_fla(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state,
+    output_final_state,
+    use_qk_l2norm_in_kernel=False,
+):
+    if initial_state is not None:
+        initial_state = initial_state.to(torch.float32)
+    return fused_recurrent_kda_fla(
+        query,
+        key,
+        value,
+        g=g,
+        beta=beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )
+
+
+@recurrent_kimi_delta_attention.register("torch")
+def recurrent_kimi_delta_attention_torch(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state,
+    output_final_state,
+    use_qk_l2norm_in_kernel=False,
+):
+    initial_dtype = query.dtype
+    query, key, value, g, beta = [
+        x.to(torch.float32) for x in (query, key, value, g, beta)
+    ]
+
+    if use_qk_l2norm_in_kernel:
+        query = _kda_l2norm(query, dim=-1, eps=1e-6)
+        key = _kda_l2norm(key, dim=-1, eps=1e-6)
+
+    batch_size, sequence_length, num_heads, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = query * scale
+
+    core_attn_out = value.new_zeros(
+        (batch_size, sequence_length, num_heads, v_head_dim)
+    )
+    last_recurrent_state = (
+        value.new_zeros((batch_size, num_heads, k_head_dim, v_head_dim))
+        if initial_state is None
+        else initial_state.to(value)
+    )
+
+    for i in range(sequence_length):
+        q_i = query[:, i]
+        k_i = key[:, i]
+        v_i = value[:, i]
+        g_i = g[:, i][..., None].exp()
+        b_i = beta[:, i][..., None]
+
+        last_recurrent_state = last_recurrent_state * g_i
+        kv_mem = (last_recurrent_state * k_i[..., None]).sum(dim=-2)
+        delta = (v_i - kv_mem) * b_i
+
+        last_recurrent_state = last_recurrent_state + k_i.unsqueeze(
+            -1
+        ) * delta.unsqueeze(-2)
+        core_attn_out[:, i] = (last_recurrent_state * q_i.unsqueeze(-1)).sum(dim=-2)
+
+    if not output_final_state:
+        last_recurrent_state = None
+
+    return core_attn_out.to(initial_dtype), last_recurrent_state
 
 
 @chunk_gated_delta_rule.register("torch")

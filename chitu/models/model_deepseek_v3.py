@@ -25,7 +25,7 @@ from chitu.kv_cache import (
 )
 from chitu.cp_utils import get_cp_context
 from chitu.global_vars import get_global_args
-from chitu.dsa_indexer import use_fp8_dsa_indexer_kv
+from chitu.dsa_indexer_backend import use_fp8_dsa_indexer_kv
 from chitu.models.model import (
     Attention,
     MoeGate,
@@ -58,11 +58,10 @@ from chitu.ops import (
     append_to_paged_kv_cache,
     read_from_paged_kv_cache,
     hadamard_transform,
-    topk_indices,
     topk_page_table_decode_cuda,
     a8_per_token_act_quant,
 )
-from chitu.dsa_indexer import DSAIndexer
+from chitu.dsa_indexer_backend import DSAIndexer
 from chitu.quantization import (
     QuantizationRegistry,
     get_quant_from_checkpoint_prefix,
@@ -91,6 +90,7 @@ from chitu.distributed.parallel_state import (
 from chitu.distributed.partition import compute_expert_dist_in_ep
 from chitu.utils import (
     ceil_div,
+    max_alloc_seq_len,
     parse_dtype,
     try_import_and_setup_torch_npu,
 )
@@ -148,8 +148,8 @@ class Indexer(torch.nn.Module):
         self.rope_head_dim: int = args.qk_rope_head_dim
         self.index_rope_layout = getattr(args, "index_rope_layout", "separated")
 
-        # Adjust index_topk not exceed max_seq_len max_seq_len to avoid out-of-range errors
-        max_seq_len = get_global_args().infer.max_seq_len
+        # Adjust index_topk not exceed the max addressable length to avoid out-of-range errors
+        max_seq_len = max_alloc_seq_len(get_global_args().infer.max_seq_len)
         self.index_topk: int = min(args.index_topk, max_seq_len)
         self.q_lora_rank: int = args.q_lora_rank
         self.softmax_scale = self.head_dim**-0.5
@@ -394,7 +394,9 @@ class Indexer(torch.nn.Module):
 
         def reduce(logits, delta_view):
             lengths = delta_view.delta_position_ids_tensor_device + 1
-            return topk_page_table_decode_cuda(logits, lengths, source_page_table)
+            return self.indexer_impl.topk_page_table(
+                logits, delta_view, lengths, source_page_table
+            )
 
         empty_output = topk_page_table_decode_cuda(
             torch.empty(0, self.indexer_impl.static_max_n, device=x.device),
@@ -444,7 +446,9 @@ class Indexer(torch.nn.Module):
                 else delta_view.new.lens_tensor_device[row_seq_ids]
             )
             # May select some out-of-range items as -inf, which is fine.
-            return topk_indices(logits, k_topk, lengths=lengths)
+            return self.indexer_impl.topk_indices(
+                logits, k_topk, delta_view, lengths=lengths
+            )
 
         empty_output = torch.empty(
             0,
@@ -1466,6 +1470,7 @@ class MLPDeepSeekV3(nn.Module):
             )
 
         self.op_impl = op_impl
+        self.swiglu_limit = getattr(args, "swiglu_limit", 0.0)
 
         if role == "standalone":
             inter_dim = args.inter_dim
@@ -1541,10 +1546,18 @@ class MLPDeepSeekV3(nn.Module):
         """
         if self.merge_gate_up:
             gate_up_proj_out = self.gate_up_proj(x)
-            return self.down_proj(silu_and_mul(gate_up_proj_out))
+            swiglu_limit = self.swiglu_limit if self.swiglu_limit > 0 else None
+            return self.down_proj(
+                silu_and_mul(gate_up_proj_out, swiglu_limit=swiglu_limit)
+            )
         else:
             gate_proj_out = self.gate_proj(x)
             up_proj_out = self.up_proj(x)
+            if self.swiglu_limit > 0:
+                gate_proj_out = torch.clamp(gate_proj_out, max=self.swiglu_limit)
+                up_proj_out = torch.clamp(
+                    up_proj_out, min=-self.swiglu_limit, max=self.swiglu_limit
+                )
             return self.down_proj(F.silu(gate_proj_out) * up_proj_out)
 
 
@@ -1644,7 +1657,7 @@ def MoeExpertsDeepSeekV3(
         )
 
     assert args.moe_inter_dim % get_etp_size() == 0
-    return base_moe_experts_class(
+    experts = base_moe_experts_class(
         dim=args.dim,
         moe_inter_dim=args.moe_inter_dim // get_etp_size(),
         global_n_experts=global_n_experts,
@@ -1653,6 +1666,9 @@ def MoeExpertsDeepSeekV3(
         n_activated_experts=args.n_activated_experts,
         checkpoint_prefix=moe_checkpoint_prefix,
     )
+    swiglu_limit = getattr(args, "swiglu_limit", 0.0)
+    experts.swiglu_limit = swiglu_limit if swiglu_limit > 0 else None
+    return experts
 
 
 class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):

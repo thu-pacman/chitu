@@ -74,7 +74,7 @@ from chitu.tokenizer import (
     Processor,
 )
 from chitu.tool_call import patch_chat_template
-from chitu.utils import parse_dtype, should_pretty_log
+from chitu.utils import max_alloc_seq_len, parse_dtype, should_pretty_log
 from chitu.import_utils import try_import_opt_dep
 from chitu.moe import init_moe_impl
 from chitu.boot.arg_utils import calculate_parallelism_sizes
@@ -546,6 +546,7 @@ class Backend:
                 ModelType.DEEPSEEK_V3,
                 ModelType.KIMI_K2_5,
                 ModelType.GLM_5_2,
+                ModelType.GLM_5_NEXT,
             ]:
                 return FlashMLABackend
             else:
@@ -856,8 +857,7 @@ class Backend:
             )
 
         model_kwargs = dict(
-            max_position_embeddings=args.infer.max_seq_len
-            + (args.infer.mtp_size if args.infer.mtp_size > 1 else 0),
+            max_position_embeddings=max_alloc_seq_len(args.infer.max_seq_len),
             attn_backend=attn_backend,
             op_impl=args.infer.op_impl,
             mla_absorb=args.infer.mla_absorb,
@@ -959,6 +959,7 @@ class Backend:
                 ModelType.DEEPSEEK_V3,
                 ModelType.KIMI_K2_5,
                 ModelType.GLM_5_2,
+                ModelType.GLM_5_NEXT,
                 ModelType.HF_QWEN2_VL,
                 ModelType.HF_QWEN3_NEXT,
                 ModelType.HF_QWEN3_5,
@@ -1014,14 +1015,14 @@ class Backend:
             ):
                 return False
             if args.infer.mtp_size == 1:
-                if (
-                    args.models.type
-                    in [
-                        ModelType.DEEPSEEK_V3,
-                        ModelType.HF_GLM_4_MOE,
-                        ModelType.GLM_5_2,
-                    ]
-                    and f"model.layers.{args.models.n_layers}" in k
+                if args.models.type in [
+                    ModelType.DEEPSEEK_V3,
+                    ModelType.HF_GLM_4_MOE,
+                    ModelType.GLM_5_2,
+                    ModelType.GLM_5_NEXT,
+                ] and (
+                    f"model.layers.{args.models.n_layers}" in k
+                    or f"model.language_model.layers.{args.models.n_layers}" in k
                 ):
                     return False
                 if (

@@ -247,12 +247,14 @@ def build_mtp_cache(args):
 
 
 def _build_indexer_layer_id_map(args, *, layer_filter_fn=lambda x: x) -> GlobalLocalMap:
-    """Map only layers that own indexer state for GLM-5.2."""
-    if _normalize_model_type(getattr(args.models, "type", None)) != ModelType.GLM_5_2:
+    """Map only layers that own indexer state for GLM shared-indexer models."""
+    model_type = _normalize_model_type(getattr(args.models, "type", None))
+    if model_type not in {ModelType.GLM_5_2, ModelType.GLM_5_NEXT}:
         return build_layer_id_map(args, layer_filter_fn=layer_filter_fn)
 
     n_layers = int(args.models.n_layers)
     indexer_types = args.models.indexer_types
+    layer_types = getattr(args.models, "layer_types", None)
 
     def local_indexer_layers(layers: Iterable[int]) -> Iterable[int]:
         # GLM-5.2 shared layers consume their preceding full layer's top-k and
@@ -261,7 +263,14 @@ def _build_indexer_layer_id_map(args, *, layer_filter_fn=lambda x: x) -> GlobalL
         return [
             layer_id
             for layer_id in layer_filter_fn(layers)
-            if layer_id == n_layers or indexer_types[layer_id] == "full"
+            if layer_id == n_layers
+            or (
+                indexer_types[layer_id] == "full"
+                and (
+                    layer_types is None
+                    or layer_types[layer_id] == "deepseek_sparse_attention"
+                )
+            )
         ]
 
     return build_layer_id_map(args, layer_filter_fn=local_indexer_layers)
@@ -483,6 +492,39 @@ def _build_qwen3_next_cache_managers(args, attn_backend_type) -> CacheBuildBundl
         "linear": _build_linear_cache(args, layer_filter_fn=filter_linear),
     }
 
+    return CacheBuildBundle(
+        cache_type=args.infer.cache_type,
+        cache_dict=cache_dict,
+        cache_managers=main_managers,
+    )
+
+
+@register_cache_manager_builder(model_types=[ModelType.GLM_5_NEXT], priority=4)
+def _build_glm5_next_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
+    def is_sparse_attention(layer_id: int) -> bool:
+        if args.infer.mtp_size > 1 and layer_id == args.models.n_layers:
+            return True
+        return args.models.layer_types[layer_id] == "deepseek_sparse_attention"
+
+    def filter_sparse(layers: Iterable[int]):
+        return [i for i in layers if is_sparse_attention(i)]
+
+    def filter_linear(layers: Iterable[int]):
+        return [
+            i for i in layers if i < args.models.n_layers and not is_sparse_attention(i)
+        ]
+
+    main_cache, main_managers = _build_main_cache_bundle(
+        args,
+        attn_backend_type,
+        layer_filter_fn=filter_sparse,
+    )
+    cache_dict = {
+        "main": main_cache,
+        "linear": _build_linear_cache(args, layer_filter_fn=filter_linear),
+    }
+    indexer = _build_indexer_cache(args, layer_filter_fn=filter_sparse)
+    _attach_indexer_cache_managers(args, main_cache, main_managers, cache_dict, indexer)
     return CacheBuildBundle(
         cache_type=args.infer.cache_type,
         cache_dict=cache_dict,

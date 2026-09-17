@@ -244,7 +244,10 @@ def cuda_graph_safe_cached_property(
     Similar to `functools.cached_property`, but the returned value is a tensor, and can be used
     within or without a CUDA graph.
 
-    This decorator is intended for:
+    When the attribute named by enable_flag_name is False, use a regular tensor
+    cache when CUDA graph is disabled, or compute on the fly during capture.
+
+    Otherwise, this decorator is intended for:
     1. caching a tensor and then reusing it without a CUDA graph.
     2. caching a tensor and then reusing it within a CUDA graph.
     3. caching a tensor before a CUDA graph, and then reusing it within a CUDA graph.
@@ -258,7 +261,7 @@ def cuda_graph_safe_cached_property(
     In order to support 3 and 4, the tensor is stored in an external `StaticTensor` as inputs
     or outputs of the CUDA graph, instead of storing it directly in a property like `functools.cached_property`.
 
-    In order to support 3, the cache will not be updated during the warming up phase before a graph
+    In order to support 3, the cache will not be marked up to date during the warming up phase before a graph
     capture. Otherwise, the value update will be incorrectly skipped in the graph before it is
     falsefully already "cached".
 
@@ -276,6 +279,8 @@ def cuda_graph_safe_cached_property(
     """
 
     def decorator(fn: Callable):
+        regular_tensor_name = f"{static_tensor_name}_regular_cache"
+
         @functools.wraps(fn)
         def wrapper(self, *args, **kwargs):
             if enable_flag_name is None or getattr(self, enable_flag_name):
@@ -297,7 +302,14 @@ def cuda_graph_safe_cached_property(
                         add_post_hook_for_currently_capturing_graph_object(post_hook)
                 return static_tensor.get()
             else:
-                return fn(self, *args, **kwargs)
+                if torch.cuda.is_current_stream_capturing():
+                    setattr(self, up_to_date_flag_name, False)
+                    return fn(self, *args, **kwargs)
+                if not getattr(self, up_to_date_flag_name):
+                    tensor = fn(self, *args, **kwargs)
+                    setattr(self, regular_tensor_name, tensor)
+                    setattr(self, up_to_date_flag_name, True)
+                return getattr(self, regular_tensor_name)
 
         return property(wrapper)
 

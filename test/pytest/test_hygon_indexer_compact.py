@@ -9,10 +9,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import chitu.dsa_indexer as dsa_indexer_module
+import chitu.dsa_indexer_backend.hygon_backend as dsa_indexer_module
 import chitu.models.model_deepseek_v3 as model_deepseek_v3_module
 from chitu.device_type import is_hygon
-from chitu.dsa_indexer import DSAIndexer
+from chitu.dsa_indexer_backend.hygon_backend import HygonIndexer
 from chitu.models.model_deepseek_v3 import Indexer
 
 requires_hygon_deepgemm = pytest.mark.skipif(
@@ -89,7 +89,7 @@ def test_compact_mqa_feature_gate_requires_final_gfx936_contract(tmp_path):
 
 
 def test_hygon_prefill_calls_compact_deepgemm_api(monkeypatch):
-    indexer = object.__new__(DSAIndexer)
+    indexer = object.__new__(HygonIndexer)
 
     # Fused QKV projection can leave Q/K with a padded row stride. The dense
     # MQA ABI has no Q/K stride arguments, so only these inputs need packing at
@@ -174,14 +174,15 @@ def test_model_topk_consumes_compact_local_columns(monkeypatch):
 
     indexer._build_index_score = fake_build_index_score
 
-    def fake_topk_indices(actual_logits, k, *, lengths, **kwargs):
+    def fake_topk_indices(actual_logits, k, actual_delta, *, lengths, **kwargs):
+        assert actual_delta is delta
         assert actual_logits is logits
         assert k == 2
         assert torch.equal(lengths, torch.tensor([3, 4], dtype=torch.int32))
         assert "row_starts" not in kwargs
         return expected
 
-    monkeypatch.setattr(model_deepseek_v3_module, "topk_indices", fake_topk_indices)
+    indexer.indexer_impl.topk_indices = fake_topk_indices
 
     result = Indexer.forward(
         indexer,
@@ -291,7 +292,7 @@ def test_cp_noncausal_uses_full_request_lengths_for_single_and_chunked_scores(
 @pytest.mark.parametrize("rows", [17, 129])
 def test_hygon_prefill_compact_source_and_co_match_reference(rows):
     torch.manual_seed(37)
-    indexer = object.__new__(DSAIndexer)
+    indexer = object.__new__(HygonIndexer)
     heads = 32
     head_dim = 128
     columns = 257

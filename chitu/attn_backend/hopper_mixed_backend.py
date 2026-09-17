@@ -126,8 +126,7 @@ class HopperMixedBackend(FlashMLABackend):
         if topk_page_table is None:
             assert topk_indices is not None
             topk_indices = topk_indices.to(torch.int32)
-            if topk_indices.size(-1) < self.index_topk:
-                topk_indices = self.pad_indices(topk_indices)
+            topk_indices = self.pad_indices(topk_indices)
             page_table, valid_counts = self._build_sparse_page_table_and_valid_counts(
                 topk_indices=topk_indices,
                 block_table=kv_cache.block_table,

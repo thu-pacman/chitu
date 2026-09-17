@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.global_vars import get_global_args
+from chitu.utils import max_alloc_seq_len
 from chitu.kv_cache import KVCacheAccessor, PagedKVCacheAccessor
 
 
@@ -144,7 +145,8 @@ def indexer_classic_decode_after_append(
     bsz = seq_len_delta.batch_size
     block_size = indexer.block_size
     # Static upper bound for CUDA graph (dynamic max_len is frozen at capture).
-    max_seq_len = get_global_args().infer.max_seq_len
+    # 用可被寻址的长度上界（含 MTP draft / ghost token，见 chitu/utils.max_alloc_seq_len）
+    max_seq_len = max_alloc_seq_len(get_global_args().infer.max_seq_len)
     max_num_blocks = -(-max_seq_len // block_size)
 
     idx_q = idx_q.reshape(-1, indexer.n_local_index_heads, indexer.index_head_dim)[:bsz]

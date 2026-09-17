@@ -300,10 +300,10 @@ def resolve_full_default_args(args):
         else:
             args.infer.use_cuda_graph = True
 
-    if (args.models.type in {"deepseek-v3", "glm-5-2"}) and args.models.get(
-        "index_topk", None
-    ) is not None:
-        from chitu.dsa_indexer import (
+    if (
+        args.models.type in {"deepseek-v3", "glm-5-2", "glm-5-next"}
+    ) and args.models.get("index_topk", None) is not None:
+        from chitu.dsa_indexer_backend import (
             HYGON_INDEXER_MAX_MTP_SIZE,
             support_indexer_deepgemm,
             support_indexer_hygon,
