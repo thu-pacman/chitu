@@ -22,6 +22,7 @@
 #endif
 #include "marlin/marlin_gemm/gptq_marlin.h"
 #include "marlin/marlin_group_gemm/ops.h"
+#include "common/weak_ref_tensor.h"
 #if !defined(CHITU_HYGON_BUILD) || CHITU_HYGON_BUILD != 1
 #include "gemm/w4a8_per_group_gemm_cuda.h"
 #endif
@@ -45,6 +46,7 @@ using namespace pybind11::literals;
 namespace chitu {
 
 void init_compute(py::module &m) {
+    m.def("weak_ref_tensor", &weak_ref_tensor);
     m.def("cuda_batched_routed_activation_indexed_to_expert_block_indexed",
           &batched_routed_activation_indexed_to_expert_block_indexed, "");
     m.def("cuda_add_shared_experts", &add_shared_experts, "");

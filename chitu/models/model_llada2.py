@@ -562,16 +562,10 @@ class TransformerLLaDA2(TransformerHFLlama):
     def _init_cuda_graph_decode(self, max_batch_size: int, block_length: int):
         """Initialize CUDA Graph for decode_dllm."""
         tokens_max_nelem = max_batch_size * block_length
-        vocab_size = (
-            self.params.vocab_size
-        )  # Full vocab (gather_output=True in lm_head)
 
         @make_dispatched_graphed_callables(
             args_max_nelem=(tokens_max_nelem,),
             kwargs_max_nelem={},
-            output_max_nelem_callback=lambda key, output: max_batch_size
-            * block_length
-            * vocab_size,
             before_replay_callback=self._before_decode_replay,
             enable=self.use_cuda_graph,
         )
