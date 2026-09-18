@@ -66,6 +66,11 @@ class PDCoordinationService:
             f"registered pd pair: {request_id} -> P{prefill_scheduler_id}-D{decode_scheduler_id}"
         )
 
+    def remove_pd_pair(self, request_id: str) -> None:
+        """Release router-side metadata after a request no longer needs PD coordination."""
+        self.pd_pairs.pop(request_id, None)
+        self.kv_transfer_metadata.pop(request_id, None)
+
     async def register_scheduler(
         self,
         local_instance_id: int,

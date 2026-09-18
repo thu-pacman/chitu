@@ -247,6 +247,7 @@ class DisaggregationMode(Enum):
 | `DecodePrepare` | Scheduler → Decode rank | `req_id`, `prefill_sid`, `prefix_len`, `new_cache_ids`, `dp_rank` |
 | `DecodeAllocated` | Decode → Prefill | `req_id`, `session_id`, `buffers: TransferBuffers`, `dp_rank`, `rank_num` |
 | `RankTransferDone` | Prefill rank → ctrl | `req_id`, `first_token`, `rank_bytes: dict[str,int]` |
+| `RankTransferFailed` | Prefill rank → ctrl | `req_id`, `decode_sid`, `decode_generation`, `error_message` |
 | `PrefillDone` | Prefill ctrl → Decode | `req_id`, `first_token`, `num_hit_tokens`, `rank_bytes: dict[str,int]` |
 
 ### 传输匹配与规划（`transfer_plan.py` + `static_transfer_plan.py`）
@@ -258,13 +259,14 @@ class DisaggregationMode(Enum):
 3. 对每个 decode instance 调用 `build_static_transfer_plan(local_infos: RankCacheInfos, remote_infos: InstanceCacheInfos)`：
    - 遍历 `(decode_session, cache_name)` pair，chunk 映射 + replica 匹配 + layer 交集
    - chunk offset 预计算入 `src_base_ptrs / dst_base_ptrs`
-4. 产出 `StaticTransferPlan`（per decode inst_id），存为 `self.static_transfer_plan: dict[int, StaticTransferPlan]`
+4. 产出 `StaticTransferPlan`（per decode instance / generation），存为 `self.static_transfer_plans: dict[tuple[int, int], StaticTransferPlan]`
 
 **Per-request**：`create_transfer_plan(static_plan, send_buffers, recv_by_session)` —
 
-1. per cache：`generate_and_merge()` — `n_layers * n_blocks` 笛卡尔积 `addr = base_ptrs[layer] + phys_block_id * block_stride`，ravel 后 numpy sort/merge
-2. 跨 cache `sort_and_merge()` 统一按 dst 地址排序合并连续区间
-3. 产出 `TransferPlan`（`ptrs/lengths/remote_ptrs` 全为 numpy int64 数组，`execute_send()` 时 `.tolist()` 转换为 `list[int]`）
+1. `DecodeAllocated` 固化本请求的 Decode generation 和 `recv_buffers`；传输线程在 CUDA event 就绪后按该 generation 取得静态计划
+2. per cache：`generate_and_merge()` — `n_layers * n_blocks` 笛卡尔积 `addr = base_ptrs[layer] + phys_block_id * block_stride`，ravel 后 numpy sort/merge
+3. 跨 cache `sort_and_merge()` 统一按 dst 地址排序合并连续区间
+4. 产出 `TransferPlan`（`ptrs/lengths/remote_ptrs` 全为 numpy int64 数组，`execute_send()` 时 `.tolist()` 转换为 `list[int]`）
 
 **优势**：无 per-request 临时对象；地址计算向量化（numpy）；`DecodeAllocated` 消息体积 ~10MB → ~1KB。
 
@@ -372,6 +374,7 @@ multi_inst:
   n_insts: 2                       # P + D 总实例数（启动时覆盖）
   inst_id: 0                       # 当前实例 ID；Router 启动时设为 null
   role: "prefill_and_decode"
+  fail_fast: true                  # 任一实例失败时是否停止整个服务
   inst_overrides: {}               # 启动时覆盖为每个实例的有效配置
 
   pd_disaggregation:

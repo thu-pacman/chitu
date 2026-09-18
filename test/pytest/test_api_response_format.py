@@ -450,7 +450,9 @@ def test_pd_to_dp_input_stats_transport_and_latching(monkeypatch):
     router_req = live_req(monkeypatch)
     router = router_module.TokenRouter(SimpleNamespace())
     router.active_requests[req.request_id] = router_req
-    monkeypatch.setattr(router_module, "get_request_router", lambda: None)
+    monkeypatch.setattr(
+        router_module, "get_request_router", lambda check_exist=True: None
+    )
     monkeypatch.setattr(router_module, "remove_request_everywhere", lambda *args: None)
 
     async def run():
@@ -508,7 +510,9 @@ def test_legacy_peer_unknown_input_usage_does_not_become_zero(monkeypatch):
     req = live_req(monkeypatch)
     router = router_module.TokenRouter(SimpleNamespace())
     router.active_requests[req.request_id] = req
-    monkeypatch.setattr(router_module, "get_request_router", lambda: None)
+    monkeypatch.setattr(
+        router_module, "get_request_router", lambda check_exist=True: None
+    )
     monkeypatch.setattr(router_module, "remove_request_everywhere", lambda *args: None)
 
     async def run():

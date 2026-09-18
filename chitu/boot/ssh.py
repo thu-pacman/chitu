@@ -16,8 +16,11 @@ from chitu.boot.appimage_utils import appimage
 from chitu.boot.local_run_base import LocalRunCallback
 from chitu.boot.multi_instance import (
     build_instance_launch_plans,
+    build_restart_instance_launch_plan,
     launch_multi_instance_on_node,
+    launch_restart_instance_on_node,
     multi_instance_enabled,
+    restart_instance_enabled,
 )
 
 logger = getLogger(__name__)
@@ -168,6 +171,25 @@ def ssh(cfg, instance_cfgs, raw_argv, local_run_callback: LocalRunCallback):
     master_addr = os.environ.get("CHITU_BOOT_MASTER_ADDR", node_list[0])
     node_rank = int(os.environ.get("CHITU_BOOT_NODE_RANK", "0"))
     is_master_node = node_rank == 0
+
+    if restart_instance_enabled(cfg):
+        instance_plan = build_restart_instance_launch_plan(
+            cfg,
+            instance_cfgs,
+            node_list,
+            master_port=52000,
+            rdvz_port=53000,
+        )
+        launch_restart_instance_on_node(
+            cfg,
+            raw_argv,
+            local_run_callback,
+            instance_plan=instance_plan,
+            node_rank=node_rank,
+            coordinator_host=cfg.coordinator.host,
+            coordinator_port=int(cfg.coordinator.port),
+        )
+        return
 
     if cfg.coordinator.host is not None and cfg.coordinator.port is not None:
         coordinator_host = cfg.coordinator.host

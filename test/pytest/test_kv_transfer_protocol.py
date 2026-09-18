@@ -12,8 +12,10 @@ import numpy as np
 
 from chitu.distributed.pd_disaggregation.kv_transfer.protocol import (
     DecodeAllocated,
+    DecodePeerFailed,
     DecodePrepare,
     RankTransferDone,
+    RankTransferFailed,
     PrefillDone,
     ProtocolSerializer,
 )
@@ -121,6 +123,32 @@ class TestRankTransferDone:
         assert unpacked.first_token == 0
 
 
+class TestRankTransferFailed:
+    def test_roundtrip(self):
+        msg = RankTransferFailed(
+            req_id="req-42",
+            decode_sid=1,
+            decode_generation=3,
+            error_message="transfer engine rejected session",
+        )
+        unpacked = ProtocolSerializer.unpack(ProtocolSerializer.pack(msg))
+
+        assert isinstance(unpacked, RankTransferFailed)
+        assert unpacked.req_id == "req-42"
+        assert unpacked.decode_sid == 1
+        assert unpacked.decode_generation == 3
+
+
+class TestDecodePeerFailed:
+    def test_roundtrip(self):
+        msg = DecodePeerFailed(decode_sid=1, decode_generation=3)
+        unpacked = ProtocolSerializer.unpack(ProtocolSerializer.pack(msg))
+
+        assert isinstance(unpacked, DecodePeerFailed)
+        assert unpacked.decode_sid == 1
+        assert unpacked.decode_generation == 3
+
+
 class TestPrefillDone:
     def test_roundtrip(self):
         msg = PrefillDone(
@@ -157,13 +185,20 @@ class TestProtocolDispatcher:
                 buffers=TransferBuffers(),
             ),
             RankTransferDone(req_id="r2", first_token=100),
+            RankTransferFailed(
+                req_id="r2-failed",
+                decode_sid=1,
+                decode_generation=2,
+                error_message="failed",
+            ),
+            DecodePeerFailed(decode_sid=1, decode_generation=2),
             PrefillDone(req_id="r3", first_token=5, num_hit_tokens=10),
         ]
         for msg in msgs:
             packed = ProtocolSerializer.pack(msg)
             unpacked = ProtocolSerializer.unpack(packed)
             assert type(unpacked) is type(msg), f"{type(msg).__name__} dispatch failed"
-            assert unpacked.req_id == msg.req_id
+            assert unpacked == msg
 
     def test_unknown_type(self):
         data = msgpack.packb({"type": "UnknownType", "req_id": "x"}, use_bin_type=True)

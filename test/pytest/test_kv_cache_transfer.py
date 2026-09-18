@@ -13,6 +13,7 @@ and ctypes.memmove to emulate RDMA.
 import math
 import os
 import ctypes
+import threading
 import pytest
 import torch
 import numpy as np
@@ -23,6 +24,7 @@ from chitu.distributed.pd_disaggregation.kv_transfer.transfer_buffers import (
     TransferBuffers,
 )
 from chitu.distributed.pd_disaggregation.kv_transfer.transfer_plan import (
+    KVTransferExecutionError,
     TransferPlan,
     TransferPlanPerRank,
     create_transfer_plan,
@@ -30,6 +32,9 @@ from chitu.distributed.pd_disaggregation.kv_transfer.transfer_plan import (
 from chitu.distributed.pd_disaggregation.kv_transfer.static_transfer_plan import (
     StaticTransferPlan,
     StaticTransferPlanPerCache,
+)
+from chitu.distributed.pd_disaggregation.kv_transfer.prefill import (
+    KVManagerPrefill,
 )
 from chitu.distributed.pd_disaggregation.kv_transfer.cache_info import (
     CacheInfo,
@@ -199,6 +204,26 @@ def _build_plan_for_pair(
     )
 
 
+def test_prefill_transfer_plan_is_scoped_to_decode_generation():
+    """A request can only use the plan created for its Decode generation."""
+    manager = object.__new__(KVManagerPrefill)
+    manager._prefill_transfer_state_lock = threading.Lock()
+    generation_zero_plan = StaticTransferPlan(per_session={})
+    generation_one_plan = StaticTransferPlan(per_session={})
+    manager.static_transfer_plans = {
+        (1, 0): generation_zero_plan,
+        (1, 1): generation_one_plan,
+    }
+    manager._decode_inst_ids = [1]
+
+    assert manager._get_transfer_plan(1, 0) is generation_zero_plan
+    assert manager._get_transfer_plan(1, 1) is generation_one_plan
+
+    manager._remove_transfer_plan(0, 0)
+    assert manager._get_transfer_plan(1, 0) is None
+    assert manager._get_transfer_plan(1, 1) is generation_one_plan
+
+
 # =============================================================================
 # Test #1: Prefill TP=2 → Decode TP=1 — static plan generation
 # Verifies the chunk mapping formula produces correct base_ptrs and strides.
@@ -366,6 +391,29 @@ def test_transfer_plan_execute_cpu():
     )
     plan.execute_send(M())
     assert torch.all(dst == src)
+
+
+@pytest.mark.parametrize("failure", ["submit", "status"])
+def test_transfer_plan_engine_failure_is_request_level(failure):
+    class M:
+        def batch_transfer_async_write(self, session_id, src_ptrs, dst_ptrs, lengths):
+            return 0 if failure == "submit" else 1
+
+        def get_batch_transfer_status(self, batch_ids):
+            return 1 if failure == "status" else 0
+
+    plan = TransferPlan(
+        plans={
+            "dead-session": TransferPlanPerRank(
+                ptrs=np.array([1], dtype=np.int64),
+                lengths=np.array([1], dtype=np.int64),
+                remote_ptrs=np.array([2], dtype=np.int64),
+            )
+        }
+    )
+
+    with pytest.raises(KVTransferExecutionError):
+        plan.execute_send(M())
 
 
 def test_create_transfer_plan_cpu():

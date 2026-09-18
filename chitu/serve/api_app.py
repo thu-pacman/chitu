@@ -83,6 +83,13 @@ def set_uvicorn_server(server: object | None):
     _uvicorn_server = server
 
 
+def request_server_shutdown():
+    """Stop accepting requests and let the Uvicorn event loop exit."""
+    set_server_status(initialized=False)
+    if _uvicorn_server is not None:
+        _uvicorn_server.should_exit = True
+
+
 class TokenizeRequest(BaseModel):
     # /tokenize accepts ChatRequest-compatible fields such as tools,
     # tool_choice, chat_template_kwargs, extra_body, and reasoning_effort when
@@ -491,8 +498,7 @@ async def terminate_engine(request: TerminateRequest):
 
         Backend.state = BackendState.Terminating
 
-    if _uvicorn_server is not None:
-        _uvicorn_server.should_exit = True
+    request_server_shutdown()
 
     return {"message": "Terminate signal sent. Engine and server are shutting down."}
 

@@ -9,7 +9,7 @@ from typing import Any, Callable, Iterable, Sequence
 
 from omegaconf import DictConfig, OmegaConf
 
-from chitu.boot.arg_utils import calculate_parallelism_sizes
+from chitu.boot.arg_utils import apply_multi_inst_override, calculate_parallelism_sizes
 from chitu.boot.local_run_base import LocalRunCallback
 
 
@@ -28,6 +28,23 @@ class InstanceLaunchPlan:
 
 def multi_instance_enabled(cfg: DictConfig) -> bool:
     return int(cfg.multi_inst.n_insts) > 1
+
+
+def restart_instance_enabled(cfg: DictConfig) -> bool:
+    """Whether this process restarts one existing P/D instance without a Router."""
+    return cfg.boot.restart_instance_id is not None
+
+
+def multi_instance_fail_fast_enabled(cfg: DictConfig) -> bool:
+    if not multi_instance_enabled(cfg):
+        return False
+    roles = tuple(
+        apply_multi_inst_override(cfg, override_inst_id=inst_id).multi_inst.role
+        for inst_id in range(int(cfg.multi_inst.n_insts))
+    )
+    return all(role in {"prefill", "decode"} for role in roles) and (
+        cfg.multi_inst.fail_fast
+    )
 
 
 def coordinator_extra_args(coordinator_host: str, coordinator_port: int) -> list[str]:
@@ -123,6 +140,69 @@ def build_instance_launch_plans(
     return plans
 
 
+def build_restart_instance_launch_plan(
+    cfg: DictConfig,
+    instance_cfgs: Sequence[Any],
+    node_addrs: Sequence[str],
+    master_port: int,
+    rdvz_port: int,
+) -> InstanceLaunchPlan:
+    if not multi_instance_enabled(cfg):
+        raise ValueError(
+            "boot.restart_instance_id requires multi_inst.n_insts to be greater than 1"
+        )
+    if cfg.coordinator.host is None or cfg.coordinator.port is None:
+        raise ValueError(
+            "boot.restart_instance_id requires coordinator.host and coordinator.port"
+        )
+    if cfg.multi_inst.router.is_router:
+        raise ValueError("boot.restart_instance_id cannot launch a router")
+
+    inst_id = int(cfg.boot.restart_instance_id)
+    if inst_id < 0 or inst_id >= len(instance_cfgs):
+        raise ValueError(
+            f"multi_inst.inst_id={inst_id} is outside configured instances "
+            f"[0, {len(instance_cfgs)})"
+        )
+
+    role = instance_cfgs[inst_id].multi_inst.role
+    if role not in {"prefill", "decode"}:
+        raise ValueError(
+            "boot.restart_instance_id only supports a prefill or decode instance, "
+            f"but instance {inst_id} has role={role!r}"
+        )
+
+    n_nodes = int(cfg.boot.n_nodes)
+    n_gpus_per_node = int(cfg.boot.n_gpus_per_node)
+    world_size = calculate_parallelism_sizes(instance_cfgs[inst_id]).world_size
+    if world_size % n_nodes != 0:
+        raise ValueError(
+            f"Instance {inst_id} world size {world_size} must be divisible by "
+            f"boot.n_nodes={n_nodes}"
+        )
+    nproc_per_node = world_size // n_nodes
+    if nproc_per_node > n_gpus_per_node:
+        raise ValueError(
+            f"Instance {inst_id} needs {nproc_per_node} GPUs per node, but "
+            f"boot.n_gpus_per_node={n_gpus_per_node}"
+        )
+    if len(node_addrs) != n_nodes:
+        raise ValueError(f"Expected {n_nodes} node addresses, got {len(node_addrs)}")
+
+    device_ids = tuple(range(nproc_per_node)) * n_nodes
+    return InstanceLaunchPlan(
+        inst_id=inst_id,
+        nnodes=n_nodes,
+        nproc_per_node=nproc_per_node,
+        node_start=0,
+        node_ranks=tuple(range(n_nodes)),
+        device_ids=device_ids,
+        master_addr="127.0.0.1" if n_nodes == 1 else node_addrs[0],
+        master_port=0 if n_nodes == 1 else master_port,
+        rdvz_port=0 if n_nodes == 1 else rdvz_port,
+    )
+
+
 def ensure_device_ids_in_inst_overrides(
     cfg: DictConfig, plans: Iterable[InstanceLaunchPlan]
 ) -> list[str]:
@@ -158,6 +238,12 @@ def catch_into_errors(errors: list[Exception], f: Callable) -> Callable:
     return wrapper
 
 
+def terminate_local_processes(procs: Sequence) -> None:
+    for proc in procs:
+        if proc.poll() is None:
+            proc.terminate()
+
+
 def launch_multi_instance_on_node(
     cfg: DictConfig,
     raw_argv: Sequence[str],
@@ -168,14 +254,17 @@ def launch_multi_instance_on_node(
     coordinator_host: str,
     coordinator_port: int,
 ) -> None:
-    errors: list[Exception] = []
-    procs: list = []  # shared registry of subprocess handles for fail-fast termination
-    launch = catch_into_errors(errors, local_run_callback)
+    router_errors: list[Exception] = []
+    instance_errors: list[Exception] = []
+    procs: list = []
+    launch_router = catch_into_errors(router_errors, local_run_callback)
+    launch_instance = catch_into_errors(instance_errors, local_run_callback)
+    fail_fast = multi_instance_fail_fast_enabled(cfg)
 
     router_thread = None
     if node_rank == 0:
         router_thread = threading.Thread(
-            target=launch,
+            target=launch_router,
             args=(
                 cfg,
                 list(raw_argv)
@@ -211,7 +300,7 @@ def launch_multi_instance_on_node(
     ]:
         inst_node_rank = node_rank - instance_plan.node_start
         thread = threading.Thread(
-            target=launch,
+            target=launch_instance,
             args=(
                 cfg,
                 list(raw_argv)
@@ -242,34 +331,30 @@ def launch_multi_instance_on_node(
         thread.start()
         instance_threads.append(thread)
 
-    # Poll threads so we can terminate siblings when any instance fails.
     alive = list(instance_threads)
-    while alive:
+    if router_thread is None:
+        while alive:
+            for t in list(alive):
+                t.join(timeout=1.0)
+                if not t.is_alive():
+                    alive.remove(t)
+            if fail_fast and instance_errors:
+                terminate_local_processes(procs)
+                raise instance_errors[0]
+        return
+
+    while router_thread.is_alive():
         for t in list(alive):
             t.join(timeout=1.0)
             if not t.is_alive():
                 alive.remove(t)
-        if errors:
-            for p in procs:
-                if p.poll() is None:
-                    try:
-                        p.terminate()
-                    except ProcessLookupError:
-                        pass
-            # Wait up to 30 s for graceful shutdown, then force-kill.
-            import time
+        if fail_fast and instance_errors:
+            terminate_local_processes(procs)
+            raise instance_errors[0]
+        router_thread.join(timeout=1.0)
 
-            deadline = time.monotonic() + 30
-            pending = [p for p in procs if p.poll() is None]
-            while pending and time.monotonic() < deadline:
-                time.sleep(0.5)
-                pending = [p for p in pending if p.poll() is None]
-            for p in pending:
-                try:
-                    p.kill()
-                except ProcessLookupError:
-                    pass
-            break
+    if router_errors:
+        terminate_local_processes(procs)
 
     for t in instance_threads:
         t.join(timeout=10)
@@ -277,8 +362,51 @@ def launch_multi_instance_on_node(
     if router_thread is not None:
         router_thread.join()
 
-    if errors:
-        raise errors[0]
+    if router_errors:
+        raise router_errors[0]
+    if fail_fast and instance_errors:
+        raise instance_errors[0]
+
+
+def launch_restart_instance_on_node(
+    cfg: DictConfig,
+    raw_argv: Sequence[str],
+    local_run_callback: LocalRunCallback,
+    *,
+    instance_plan: InstanceLaunchPlan,
+    node_rank: int,
+    coordinator_host: str,
+    coordinator_port: int,
+) -> None:
+    """Restart one P/D instance that reconnects to an existing Router."""
+    if node_rank not in instance_plan.node_ranks:
+        raise ValueError(
+            f"Node rank {node_rank} is not assigned to instance {instance_plan.inst_id}"
+        )
+    inst_node_rank = node_rank - instance_plan.node_start
+    local_run_callback(
+        cfg,
+        list(raw_argv)
+        + list(
+            instance_plan_extra_args(
+                cfg,
+                [instance_plan],
+                instance_plan,
+                coordinator_host,
+                coordinator_port,
+            )
+        ),
+        master_addr=instance_plan.master_addr,
+        master_port=instance_plan.master_port,
+        rdvz_port=instance_plan.rdvz_port,
+        rdvz_id=f"chitu-{instance_plan.inst_id}",
+        is_multi_inst=True,
+        is_router=False,
+        is_master_node=inst_node_rank == 0,
+        torchrun_n_nodes=instance_plan.nnodes,
+        torchrun_nproc_per_node=instance_plan.nproc_per_node,
+        container_name_suffix=f"inst-{instance_plan.inst_id}",
+    )
 
 
 def instance_plan_extra_args(

@@ -51,6 +51,7 @@ class TaskInfo:
     # ===============================
 
     decode_sid: int = -1
+    decode_generation: int = 0
     decode_dp_rank: int = -1
 
     recv_buffers: dict[str, TransferBuffers] = field(default_factory=dict)
@@ -69,6 +70,7 @@ class TaskInfo:
     # ===============================
 
     prefill_sid: Optional[int] = None
+    prefill_generation: int = 0
 
     cache_new_block_ids: dict[str, list[int]] = field(default_factory=dict)
     """cache name -> full prefix block ids to install in the decode block table."""

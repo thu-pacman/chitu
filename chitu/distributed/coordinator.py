@@ -97,7 +97,14 @@ def init_coordinator(
     _coordinator_override_existing = override_existing
 
 
-def set_endpoint(host_role: str, connection_name: str, ip: str, port: int):
+def set_endpoint(
+    host_role: str,
+    connection_name: str,
+    ip: str,
+    port: int,
+    *,
+    override: bool = False,
+):
     """Register a server endpoint under the given host role.
 
     Args:
@@ -106,6 +113,7 @@ def set_endpoint(host_role: str, connection_name: str, ip: str, port: int):
         ip (str): The host's non-wildcard ip, e.g., from `get_local_ip()`. not a wildcard
             address like "0.0.0.0".
         port (int): The TCP port ID.
+        override: Replace an existing endpoint for a restarted service role.
     """
 
     if not is_localhost(_coordinator_host) and is_localhost(ip):
@@ -115,7 +123,7 @@ def set_endpoint(host_role: str, connection_name: str, ip: str, port: int):
             f"may cause the inter-node connection to fail."
         )
     key = f"{ENDPOINT_PREFIX}{host_role}:{connection_name}"
-    if not _coordinator_override_existing and _coordinator.check([key]):
+    if not (override or _coordinator_override_existing) and _coordinator.check([key]):
         existing = _coordinator.get(key).decode()
         raise RuntimeError(
             f"Endpoint {key!r} is already registered (existing value: "

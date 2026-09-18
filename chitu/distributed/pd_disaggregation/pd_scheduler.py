@@ -262,6 +262,9 @@ class PDInstanceRequestManager:
         # Inject EXCEEDS_CAPACITY hook into the base schedulers.
         # Prefill: the Decode side has its own capacity path; must NOT mark prefill_failed.
         if self.pd_mode == PDSchedulerMode.PREFILL_ONLY:
+            self.kv_manager.set_transfer_failure_callback(
+                self._handle_kv_transfer_failure
+            )
             for scheduler in Backend.schedulers or []:
                 scheduler._pd_exceeds_capacity_callback = self._send_error_for_request
                 # TTFT drop in base prefill admission also needs prefill_failed for peer notify.
@@ -272,6 +275,27 @@ class PDInstanceRequestManager:
             for scheduler in Backend.schedulers or []:
                 scheduler._pd_exceeds_capacity_callback = self._send_error_for_request
         logger.info("token manager set for pd scheduler")
+
+    def _handle_kv_transfer_failure(
+        self,
+        request_id: str,
+        decode_sid: int,
+        decode_generation: int,
+        error_message: str,
+    ) -> None:
+        """Fail one request and withdraw an unreachable Decode generation."""
+        message = (
+            f"KV transfer to decode {decode_sid} generation "
+            f"{decode_generation} failed: {error_message}"
+        )
+        if self.token_manager is not None:
+            self.token_manager.token_sender.send_error(
+                request_id,
+                message,
+                failed_decode_scheduler_id=decode_sid,
+                failed_decode_generation=decode_generation,
+            )
+        self.stop_request(request_id, force_stop=True, timeout=0.0)
 
     def _send_error_for_request(self, request_id: str, error_message: str) -> None:
         """Send error frame to Router with prefill_failed/decode_failed flag, then clean up local KV state.
@@ -392,8 +416,21 @@ class PDInstanceRequestManager:
                 # Prefill reported a request-level failure: mark prefill-failed before cleanup.
                 self.kv_manager.cancel_prefill_wait(request_id)
                 if self.stop_request(request_id, timeout=0.0):
+                    logger.warning(
+                        "[PD_ROUTER][decode_cleaned_after_prefill_failure] "
+                        "req_id=%s decode_sid=%s",
+                        request_id,
+                        self.local_instance_id,
+                    )
                     await self.token_manager.send_error_for_request(
                         request_id, "prefill worker is down"
+                    )
+                else:
+                    logger.info(
+                        "[PD_ROUTER][decode_continues_after_prefill_failure] "
+                        "req_id=%s decode_sid=%s",
+                        request_id,
+                        self.local_instance_id,
                     )
             else:
                 raise ValueError(
@@ -442,6 +479,8 @@ class PDInstanceRequestManager:
         request_id = request_data["request_id"]
         original_request = request_data["request"]
         prefill_scheduler_id = request_data.get("prefill_scheduler_id")
+        prefill_generation = int(request_data.get("prefill_generation", 0))
+        decode_generation = int(request_data.get("decode_generation", 0))
 
         logger.debug(
             f"processing decode request: {request_id} from prefill scheduler {prefill_scheduler_id}"
@@ -486,6 +525,8 @@ class PDInstanceRequestManager:
         # Carry PD binding so KV hook can route to the correct prefill engine_rank.
         if prefill_scheduler_id is not None:
             task.pd_prefill_engine_rank = prefill_scheduler_id
+            task.pd_prefill_generation = prefill_generation
+        task.pd_decode_generation = decode_generation
 
         task.status = TaskStatus.PDDecodeIncoming
         TaskPool.enqueue(task)
@@ -1020,6 +1061,8 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 prefix_len=task.prefix_tokens_len,
                 new_cache_ids=task.new_cache_ids,
                 dp_rank=task.dp_rank,
+                prefill_generation=task.pd_prefill_generation,
+                decode_generation=task.pd_decode_generation,
                 cache_manager_hit_block_counts=hit_block_counts,
             )
             info.last_prepare_ts = now

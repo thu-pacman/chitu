@@ -48,6 +48,18 @@ Number of GPUs per node to use
 
 *Default: `1`.*
 
+### Argument `boot.restart_instance_id`
+
+Restart one predeclared prefill or decode instance without starting a Router.
+
+This reconnects an instance slot after a failure. It requires
+`coordinator.host` and `coordinator.port`; the instance ID must already
+exist in `multi_inst.inst_overrides` of the
+running Router configuration. In this mode, `n_nodes` and
+`n_gpus_per_node` describe this instance's allocation only.
+
+*Default: `null`.*
+
 ### Argument `boot.job_name`
 
 Slurm job name and Docker container name prefix.
@@ -857,6 +869,15 @@ Role of the current instance.
 Acceptable values: "prefill_and_decode", "prefill", or "decode".
 
 *Default: `"prefill_and_decode"`.*
+
+### Argument `multi_inst.fail_fast`
+
+Stop the whole multi-instance service when any instance exits.
+
+Set to false to keep the Router and remaining instances available while
+an unavailable instance is restarted.
+
+*Default: `true`.*
 
 ### `multi_inst.pd_disaggregation`
 

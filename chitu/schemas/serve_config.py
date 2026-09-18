@@ -240,6 +240,7 @@ class MultiInstConfig:
     n_insts: int = MISSING
     inst_id: Optional[int] = MISSING
     role: str = MISSING
+    fail_fast: bool = MISSING
     pd_disaggregation: PDDisaggregationConfig = field(
         default_factory=PDDisaggregationConfig
     )

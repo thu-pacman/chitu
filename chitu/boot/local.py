@@ -7,8 +7,11 @@ from logging import getLogger
 from chitu.boot.local_run_base import LocalRunCallback
 from chitu.boot.multi_instance import (
     build_instance_launch_plans,
+    build_restart_instance_launch_plan,
     launch_multi_instance_on_node,
+    launch_restart_instance_on_node,
     multi_instance_enabled,
+    restart_instance_enabled,
 )
 
 logger = getLogger(__name__)
@@ -20,6 +23,25 @@ def local(cfg, instance_cfgs, raw_argv, local_run_callback: LocalRunCallback):
         raise ValueError(f"boot.n_nodes must be 1 (got {n_nodes}) for local launcher")
 
     n_gpus_per_node = int(cfg.boot.n_gpus_per_node)
+
+    if restart_instance_enabled(cfg):
+        instance_plan = build_restart_instance_launch_plan(
+            cfg,
+            instance_cfgs,
+            ["127.0.0.1"],
+            master_port=52000,
+            rdvz_port=53000,
+        )
+        launch_restart_instance_on_node(
+            cfg,
+            raw_argv,
+            local_run_callback,
+            instance_plan=instance_plan,
+            node_rank=0,
+            coordinator_host=cfg.coordinator.host,
+            coordinator_port=int(cfg.coordinator.port),
+        )
+        return
 
     if cfg.coordinator.host is not None and cfg.coordinator.port is not None:
         coordinator_host = cfg.coordinator.host

@@ -199,6 +199,7 @@ def exchange_instance_cache_infos(
     rank: int,
     instance_id: int,
     remote_inst_ids: list[int],
+    allow_override: bool = False,
 ) -> tuple[InstanceCacheInfos, dict[int, InstanceCacheInfos]]:
     """Gather all local ranks' info and exchange with remote instances.
 
@@ -233,6 +234,7 @@ def exchange_instance_cache_infos(
         set_value(
             f"inst{instance_id}:all_rank_cache_dists",
             ProtocolSerializer.pack(local_all),
+            override=allow_override,
         )
 
     remote: dict[int, InstanceCacheInfos] = {}

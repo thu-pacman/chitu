@@ -14,8 +14,12 @@ from chitu.boot.arg_utils import args_as_list
 from chitu.boot.local_run_base import LocalRunCallback
 from chitu.boot.multi_instance import (
     build_instance_launch_plans,
+    build_restart_instance_launch_plan,
     launch_multi_instance_on_node,
+    launch_restart_instance_on_node,
+    multi_instance_fail_fast_enabled,
     multi_instance_enabled,
+    restart_instance_enabled,
 )
 
 logger = getLogger(__name__)
@@ -92,8 +96,9 @@ def srun(cfg, instance_cfgs, raw_argv, local_run_callback: LocalRunCallback):
             str(num_cpus),
             "--mem",
             str(num_mems),
-            "--kill-on-bad-exit=1",
         ]
+        if not multi_instance_enabled(cfg) or multi_instance_fail_fast_enabled(cfg):
+            full_srun_args.append("--kill-on-bad-exit=1")
 
         if max_gpus is not None:
             logger.info(
@@ -162,6 +167,25 @@ def srun(cfg, instance_cfgs, raw_argv, local_run_callback: LocalRunCallback):
         node_rank = int(os.environ.get("SLURM_NODEID", "-1"))
         if node_rank < 0:
             node_rank = hostnames.index(socket.gethostname())
+
+        if restart_instance_enabled(cfg):
+            instance_plan = build_restart_instance_launch_plan(
+                cfg,
+                instance_cfgs,
+                hostnames,
+                master_port=(slurm_job_id % 10000) + 52000,
+                rdvz_port=(slurm_job_id % 10000) + 53000,
+            )
+            launch_restart_instance_on_node(
+                cfg,
+                raw_argv,
+                local_run_callback,
+                instance_plan=instance_plan,
+                node_rank=node_rank,
+                coordinator_host=cfg.coordinator.host,
+                coordinator_port=int(cfg.coordinator.port),
+            )
+            return
 
         if cfg.coordinator.host is not None and cfg.coordinator.port is not None:
             coordinator_host = cfg.coordinator.host

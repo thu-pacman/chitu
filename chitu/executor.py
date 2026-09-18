@@ -288,6 +288,10 @@ class TasksDispatcher(ABC):
             tcp_url = self._bind_zmq_tcp_endpoint(self.socket, main_rank, group_name)
             logger.info(f"{group_name} ROUTER bind: {ipc_url} + {tcp_url}")
 
+        # non-main rank wait for main rank to bind ZMQ endpoint
+        group.barrier()
+
+        if is_main_rank:
             for _ in range(1, group.group_size):
                 msgs = self.socket.recv_multipart()
                 logger.info(f"{group_name} zmq client {msgs[0].decode()} connected")

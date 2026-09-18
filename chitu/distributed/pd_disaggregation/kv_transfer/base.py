@@ -70,9 +70,11 @@ class KVManagerBase:
         # instance_id identifies each Prefill/Decode instance (Bootstrap engine_rank).
         args = get_global_args()
         self.instance_id = int(args.multi_inst.inst_id)
+        self.is_restart_instance = args.boot.restart_instance_id is not None
 
         # Unified per-request transfer state.
         self._task_infos: dict[str, TaskInfo] = {}
+        self._peer_cache_generations: dict[int, int] = {}
 
         # transfer engine
         ib_device = detect_ib_devices()
@@ -114,9 +116,21 @@ class KVManagerBase:
             rank=self.rank,
             instance_id=self.instance_id,
             remote_inst_ids=remote_inst_ids,
+            allow_override=self.is_restart_instance,
         )
         self._local_cache_dists = per_rank
         self._register_rdma_buffers()
+
+    def refresh_remote_cache_dist(self, inst_id: int, generation: int) -> bool:
+        """Refresh one peer's cache geometry after that instance restarts."""
+        if self._peer_cache_generations.get(inst_id) == generation:
+            return False
+        raw = get_value(f"inst{inst_id}:all_rank_cache_dists")
+        remote = ProtocolSerializer.unpack(raw, InstanceCacheInfos)
+        self.remote_cache_dists[inst_id] = remote
+        self._peer_cache_generations[inst_id] = generation
+        logger.info("refreshed KV cache metadata from instance %s", inst_id)
+        return True
 
     def _register_rdma_buffers(self) -> None:
         """RDMA-register every KV cache tensor once."""

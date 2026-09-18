@@ -17,6 +17,8 @@ from chitu.trace import Trace
 from chitu.metrics.prometheus_collector import inc_kv_transfer_failures
 
 from chitu.utils import ceil_div
+from chitu.global_vars import get_global_args
+from chitu.distributed.parallel_state import get_world_group
 
 from .base import KVManagerBase, DisaggregationMode
 from .endpoint import PrefillEndpoints, DecodeEndpoints
@@ -49,17 +51,25 @@ class KVManagerDecode(KVManagerBase):
         # checked and consumed in handle_decode_prepare when TaskInfo is created.
         self._early_prefill_failures: set[str] = set()
 
-        self.endpoints = DecodeEndpoints(self._decode_scheduler_id)
+        self.endpoints = DecodeEndpoints(
+            self._decode_scheduler_id,
+            allow_override=get_global_args().boot.restart_instance_id is not None,
+        )
         self._prefill_endpoints = {
             sid: PrefillEndpoints(sid) for sid in range(len(self._prefill_inst_ids))
         }
         if self.is_ctrl_rank:
             self.endpoints.decode_prepare.init_master(has_slave=self.world_size > 1)
             self.endpoints.prefill_done.init_master(has_slave=self.world_size > 1)
-            self.endpoints.decode_prepare.init_remote()
-        else:
+        get_world_group().barrier()
+
+        if not self.is_ctrl_rank:
             self.endpoints.decode_prepare.init_slave()
             self.endpoints.prefill_done.init_slave()
+        get_world_group().barrier()
+
+        if self.is_ctrl_rank:
+            self.endpoints.decode_prepare.init_remote()
         for prefill_endpoint in self._prefill_endpoints.values():
             prefill_endpoint.decode_allocated.init_remote()
 
@@ -79,6 +89,8 @@ class KVManagerDecode(KVManagerBase):
             return
         assert isinstance(msg, DecodePrepare)
 
+        self.refresh_prefill_peer(msg.prefill_sid, msg.prefill_generation)
+
         # Non-rank0, non-owning ranks skip entirely.
         if self.is_ctrl_rank:
             assert (
@@ -93,6 +105,8 @@ class KVManagerDecode(KVManagerBase):
 
         info = self._info(msg.req_id, create=True)
         info.prefill_sid = msg.prefill_sid
+        info.prefill_generation = msg.prefill_generation
+        info.decode_generation = msg.decode_generation
         info.prefix_len = msg.prefix_len
         info.cache_manager_new_block_ids = msg.new_cache_ids
         info.cache_manager_hit_block_counts = msg.cache_manager_hit_block_counts
@@ -184,6 +198,7 @@ class KVManagerDecode(KVManagerBase):
             rank_num=self.dp_way_size,
             session_id=self.session_id,
             buffers=recv_buffers,
+            decode_generation=info.decode_generation,
             cache_manager_hit_block_counts=info.cache_manager_hit_block_counts,
         )
         payload = ProtocolSerializer.pack(msg)
@@ -264,7 +279,8 @@ class KVManagerDecode(KVManagerBase):
                 f"Timed out waiting for PrefillDone after 10s: req_id={req_id}"
             )
 
-        remote_dists = self.remote_cache_dists[self._prefill_inst_ids[info.prefill_sid]]
+        prefill_inst_id = self._prefill_inst_ids[info.prefill_sid]
+        remote_dists = self.remote_cache_dists[prefill_inst_id]
 
         for cache_name, cache in Backend.cache_dict.items():
             assert isinstance(cache, PagedKVCache)
@@ -290,6 +306,8 @@ class KVManagerDecode(KVManagerBase):
         prefix_len: int,
         new_cache_ids: dict[str, list[int]],
         dp_rank: int,
+        prefill_generation: int,
+        decode_generation: int,
         cache_manager_hit_block_counts: Optional[dict[str, int]] = None,
     ):
         msg = DecodePrepare(
@@ -298,9 +316,18 @@ class KVManagerDecode(KVManagerBase):
             prefix_len=prefix_len,
             new_cache_ids=new_cache_ids,
             dp_rank=dp_rank,
+            prefill_generation=prefill_generation,
+            decode_generation=decode_generation,
             cache_manager_hit_block_counts=cache_manager_hit_block_counts or {},
         )
         self.endpoints.decode_prepare.send(ProtocolSerializer.pack(msg))
+
+    def refresh_prefill_peer(self, prefill_sid: int, generation: int) -> None:
+        """Refresh Prefill endpoint and cache metadata after that slot restarts."""
+        inst_id = self._prefill_inst_ids[prefill_sid]
+        # If generation hit, skip TCPStore read
+        self._prefill_endpoints[prefill_sid].decode_allocated.refresh_remote(generation)
+        self.refresh_remote_cache_dist(inst_id, generation)
 
     def is_prefill_done(self, req_id: str):
         return self._transfer_done_states.get(req_id, TransferStatus())

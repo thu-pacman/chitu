@@ -156,7 +156,9 @@ def test_dp_token_replay_counts_reasoning_once(monkeypatch):
     monkeypatch.setattr(Backend, "tokenizer", SimpleNamespace(stop_tokens={0}))
     router = router_module.TokenRouter(SimpleNamespace())
     router.active_requests[receiver.request_id] = receiver
-    monkeypatch.setattr(router_module, "get_request_router", lambda: None)
+    monkeypatch.setattr(
+        router_module, "get_request_router", lambda check_exist=True: None
+    )
     monkeypatch.setattr(router_module, "remove_request_everywhere", lambda *args: None)
 
     async def replay():

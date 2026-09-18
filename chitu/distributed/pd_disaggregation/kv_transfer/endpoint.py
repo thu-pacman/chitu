@@ -22,9 +22,10 @@ ZMQ_SNDBUF = 4 * 1024 * 1024  # 4MB
 
 
 class KVManagerEndpoint:
-    def __init__(self, role: str, name: str):
+    def __init__(self, role: str, name: str, *, allow_override: bool = False):
         self.role = role
         self.name = name
+        self.allow_override = allow_override
 
         self.zmq_ctx = zmq.Context.instance()
         self.ip = get_local_ip()
@@ -33,6 +34,8 @@ class KVManagerEndpoint:
         # and from the asyncio event loop (stop_request -> remove_request_all_rank).
         # Serialize all sends through a single lock.
         self._send_lock = threading.Lock()
+        self._remote_address = None
+        self._remote_generation = None
 
     def init_master(self, has_slave: bool):
         """init listener and receiver on master rank"""
@@ -46,6 +49,7 @@ class KVManagerEndpoint:
                 self.name,
                 self.ip,
                 self.socket.bind_to_random_port(bind_addr),
+                override=self.allow_override,
             )
             return
 
@@ -57,6 +61,7 @@ class KVManagerEndpoint:
             self.name,
             self.ip,
             self._relay_socket.bind_to_random_port(bind_addr),
+            override=self.allow_override,
         )
 
         self._push_sockets = []
@@ -72,6 +77,7 @@ class KVManagerEndpoint:
                 f"{self.name}_pub_{rank}",
                 self.ip,
                 pub_port,
+                override=self.allow_override,
             )
             self._push_sockets.append(_pub_socket)
 
@@ -104,12 +110,35 @@ class KVManagerEndpoint:
     def init_remote(self):
         """init sender on any rank"""
         endpoint = TCP_ENDPOINT.format(*get_endpoint(self.role, self.name))
-        self.send_socket = self.zmq_ctx.socket(zmq.PUSH)
-        self.send_socket.setsockopt(zmq.SNDHWM, ZMQ_SNDHWM)
-        self.send_socket.setsockopt(zmq.SNDBUF, ZMQ_SNDBUF)
-        self.send_socket.setsockopt(zmq.SNDTIMEO, 60 * 1000)
-        self.send_socket.setsockopt(zmq.LINGER, 0)
-        self.send_socket.connect(endpoint)
+        self._connect_remote(endpoint)
+
+    def _connect_remote(self, endpoint: str) -> None:
+        with self._send_lock:
+            if hasattr(self, "send_socket"):
+                self.send_socket.close(linger=0)
+            self.send_socket = self.zmq_ctx.socket(zmq.PUSH)
+            self.send_socket.setsockopt(zmq.SNDHWM, ZMQ_SNDHWM)
+            self.send_socket.setsockopt(zmq.SNDBUF, ZMQ_SNDBUF)
+            self.send_socket.setsockopt(zmq.SNDTIMEO, 60 * 1000)
+            self.send_socket.setsockopt(zmq.LINGER, 0)
+            self.send_socket.connect(endpoint)
+            self._remote_address = endpoint
+
+    def refresh_remote(self, generation: int) -> None:
+        """Reconnect once when the peer publishes a new endpoint generation."""
+        if generation == self._remote_generation:
+            return
+        endpoint = TCP_ENDPOINT.format(*get_endpoint(self.role, self.name))
+        if endpoint != self._remote_address:
+            logger.info(
+                "reconnecting KV endpoint %s:%s from %s to %s",
+                self.role,
+                self.name,
+                self._remote_address,
+                endpoint,
+            )
+            self._connect_remote(endpoint)
+        self._remote_generation = generation
 
     def launch_recv_thread(self, handler):
         threading.Thread(target=self.recv_thread, args=(handler,), daemon=True).start()
@@ -153,14 +182,22 @@ class KVManagerEndpoint:
 
 
 class DecodeEndpoints:
-    def __init__(self, decode_sid: int):
+    def __init__(self, decode_sid: int, *, allow_override: bool = False):
         role = f"decode{decode_sid}"
-        self.decode_prepare = KVManagerEndpoint(role, "decode_prepare")
-        self.prefill_done = KVManagerEndpoint(role, "prefill_done")
+        self.decode_prepare = KVManagerEndpoint(
+            role, "decode_prepare", allow_override=allow_override
+        )
+        self.prefill_done = KVManagerEndpoint(
+            role, "prefill_done", allow_override=allow_override
+        )
 
 
 class PrefillEndpoints:
-    def __init__(self, prefill_sid: int):
+    def __init__(self, prefill_sid: int, *, allow_override: bool = False):
         role = f"prefill{prefill_sid}"
-        self.decode_allocated = KVManagerEndpoint(role, "decode_allocated")
-        self.rank_transfer_done = KVManagerEndpoint(role, "rank_transfer_done")
+        self.decode_allocated = KVManagerEndpoint(
+            role, "decode_allocated", allow_override=allow_override
+        )
+        self.rank_transfer_done = KVManagerEndpoint(
+            role, "rank_transfer_done", allow_override=allow_override
+        )

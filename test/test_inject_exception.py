@@ -2,18 +2,19 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""on_ready HTTP injection verifier for the unified crash protocol.
+"""on_ready HTTP injection verifier for exception-injection cases.
 
 Runs inside the service container via ``boot.on_ready``. The service is
 already initialized (on_ready fires after /server_status returns ready), so
 this script sends real HTTP requests to the Router and asserts the behavior
-of the active injection (``CHITU_TEST_INJECT_EXCEPTION``, passed to the
-service container via ``--apptainer-extra``).
+of the active ``test.inject_exception`` configuration.
 
 Each injection mode asserts:
 - request-level failures: a request returns an error, the service stays up,
   and a subsequent normal request succeeds (non-streaming, fresh connection).
 - crash injections: the service exits within a bounded time.
+- single-instance crash injections: either the service exits or a redundant
+  P/D deployment completes a new request, depending on the case expectation.
 
 Usage: python3 test_pd_inject_http.py <port> <injection_name>
 """
@@ -51,7 +52,9 @@ REQUEST_LEVEL = {
     "prefill_fail_before_task",
 }
 
-CRASH_LEVEL = {"kv_wait_timeout", "delayed_crash"}
+CRASH_LEVEL = {"kv_wait_timeout"}
+DELAYED_CRASH = "delayed_crash"
+INSTANCE_CRASH_SETTLE_S = 45.0
 
 
 def _post(
@@ -153,10 +156,18 @@ def _assert_service_down(base: str) -> None:
     raise AssertionError(f"service still up after crash injection ({CRASH_BOUND_S}s)")
 
 
+def _assert_service_survives_instance_crash(base: str) -> None:
+    """Verify a redundant P/D deployment still serves after one instance exits."""
+    _assert_request_succeeds(base)
+    time.sleep(INSTANCE_CRASH_SETTLE_S)
+    _assert_request_succeeds(base)
+
+
 def main() -> None:
     if len(sys.argv) < 3:
         print(
-            "usage: test_pd_inject_http.py <port> <injection_name> [num_failures]",
+            "usage: test_inject_exception.py <port> <injection_name> "
+            "[num_failures|crash|survive]",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -183,6 +194,16 @@ def main() -> None:
         _assert_requests_fail_then_succeed(base, num_failures)
     elif name in CRASH_LEVEL:
         _assert_service_down(base)
+    elif name == DELAYED_CRASH:
+        outcome = sys.argv[3] if len(sys.argv) > 3 else "crash"
+        if outcome == "crash":
+            _assert_service_down(base)
+        elif outcome == "survive":
+            _assert_service_survives_instance_crash(base)
+        else:
+            raise AssertionError(
+                f"expected crash or survive for {name}, got {outcome!r}"
+            )
     else:
         print(
             f"[INJECT] unknown injection {name!r}; nothing to assert", file=sys.stderr

@@ -207,6 +207,8 @@ class DPTokenSender:
         error_message: str,
         prefill_failed: bool = False,
         decode_failed: bool = False,
+        failed_decode_scheduler_id: int | None = None,
+        failed_decode_generation: int | None = None,
     ):
         """Send error signal
 
@@ -216,6 +218,8 @@ class DPTokenSender:
         ``decode_failed`` marks a Decode-side request-level failure: the Router
         forwards ``pd_decode_fail`` to the paired Prefill so it stops waiting for a
         DecodeAllocated that will never come.
+        ``failed_decode_scheduler_id`` identifies a Decode generation that rejected
+        an RDMA transfer; the Router removes that generation from routing.
         """
         # Clean up caches for this request
         self._remove_request(request_id)
@@ -230,6 +234,9 @@ class DPTokenSender:
             data["prefill_failed"] = True
         if decode_failed:
             data["decode_failed"] = True
+        if failed_decode_scheduler_id is not None:
+            data["failed_decode_scheduler_id"] = failed_decode_scheduler_id
+            data["failed_decode_generation"] = failed_decode_generation
 
         self._send_data(data)
 
