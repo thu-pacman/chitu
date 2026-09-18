@@ -116,7 +116,7 @@ def set_default_global_args():
     set_global_args(
         OmegaConf.create(
             {
-                "infer": {},
+                "infer": {"enable_prefix_caching": True},
                 "multi_inst": {
                     "n_insts": 3,
                     "inst_id": None,

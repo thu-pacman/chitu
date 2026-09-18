@@ -680,6 +680,10 @@ class RequestRouter:
         if self.routing_by_req_len:
             self._parse_scheduler_configs()
         if config.routing_algorithm == "prefix_cache_aware":
+            assert get_global_args().infer.enable_prefix_caching, (
+                "multi_inst.router.routing_algorithm=prefix_cache_aware requires "
+                "infer.enable_prefix_caching=true"
+            )
             self.policy = PrefixCacheAwarePolicy(config)
             self.policy.routing_by_req_len = self.routing_by_req_len
         else:

@@ -143,6 +143,10 @@ class PDRequestRouter(RequestRouter):
             self.config, "routing_algorithm_for_decode", "prefix_cache_aware"
         )
         if decode_algorithm == "prefix_cache_aware":
+            assert get_global_args().infer.enable_prefix_caching, (
+                "multi_inst.router.routing_algorithm_for_decode=prefix_cache_aware "
+                "requires infer.enable_prefix_caching=true"
+            )
             self.decode_policy = PrefixCacheAwarePolicy(self.config)
             self.decode_policy.routing_by_req_len = self.decode_routing_by_req_len
         elif decode_algorithm in ("round_robin", "power_of_two_choices"):

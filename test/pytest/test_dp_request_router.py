@@ -21,7 +21,9 @@ class MonkReq:
 
 def _build_router(algorithm: str = "prefix_cache_aware") -> RequestRouter:
     set_global_args(
-        OmegaConf.create({"infer": {"max_seq_len": 8192}}),
+        OmegaConf.create(
+            {"infer": {"max_seq_len": 8192, "enable_prefix_caching": True}}
+        ),
         need_ensure=False,
         need_preprocess=False,
     )
