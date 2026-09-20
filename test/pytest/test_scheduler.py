@@ -1575,6 +1575,123 @@ def test_skew_full_slot_group_of_decode_keeps_scheduling():
     assert batch_ids == [prefill_task.task_id]
 
 
+def _is_contiguous_run(group: list[str], batch: list[str]) -> bool:
+    """batch 是否为 group 中从某个位置开始的连续一段。"""
+    if not batch:
+        return True
+    try:
+        start = group.index(batch[0])
+    except ValueError:
+        return False
+    return group[start : start + len(batch)] == batch
+
+
+def test_skew_interleaved_slot_group_keeps_batch_contiguous():
+    """Slot groups can interleave types, so the batch must be a contiguous run.
+
+    Dense (skew) KV cache addresses rows by the position inside the batch
+    (`DenseKVCache._prepare_cache` takes `[start_pos, start_pos + len(batch))`,
+    with `start_pos` = the slot group's first slot for Decode and
+    `req2slot[batch[0]]` for Prefill), so a type-selected batch with a hole
+    would silently read/write the wrong rows.  A removal swaps the last member
+    into the freed position, which can put a Prefill in front of Decode
+    members -- that is the state built here.
+    """
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 4096,
+                    "max_batch_size": 4,
+                    "op_impl": "torch",
+                    "cache_type": "skew",
+                    "pp_size": 1,
+                    "dp_size": 1,
+                    "schedule_overlap": True,
+                    "mtp_size": 1,
+                }
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    infer_args = get_global_args().infer
+    set_slot_handle(
+        infer_args.max_batch_size,
+        infer_args.pp_size,
+    )
+
+    TaskPool.reset()
+    Backend.cache_managers = None
+    Backend.tokenizer = MockTokenizer()
+
+    def add_task(name: str, prefill_done: bool) -> Task:
+        req = UserRequest.create_mock(
+            input_len=1000, request_id=name, enable_thinking=False
+        )
+        task = Task(f"{req.request_id}", req)
+        if prefill_done:
+            task.consume_req_tokens()
+            assert task.task_type == TaskType.Decode
+        else:
+            assert task.task_type == TaskType.Prefill
+        TaskPool.add(task)
+        return task
+
+    scheduler = SkewScheduler(
+        infer_args.max_batch_size,
+        cache_manager_dict=None,
+        scheduler_type="request_preset,prefill_first,fcfs",
+        prefill_chunk_size=4096,
+    )
+
+    # No Prefill waiting: the slot group is filled with Decode members only.
+    dec_a = add_task("dec_a", prefill_done=True)
+    dec_b = add_task("dec_b", prefill_done=True)
+    scheduler.prepare_for_schedule()
+    batch_ids = scheduler.schedule()
+    assert sorted(batch_ids) == sorted([dec_a.task_id, dec_b.task_id])
+    scheduler.update(batch_ids)
+
+    # Two requests arrive: they join the group's free capacity at the tail.
+    pf_c = add_task("pf_c", prefill_done=False)
+    pf_d = add_task("pf_d", prefill_done=False)
+    scheduler.prepare_for_schedule()
+    batch_ids = scheduler.schedule()
+    assert sorted(batch_ids) == sorted([pf_c.task_id, pf_d.task_id])
+    scheduler.update(batch_ids)
+
+    group = scheduler.sgroup_list.get_current_sgroup_all_tasks()
+    assert sorted(group) == sorted(
+        [dec_a.task_id, dec_b.task_id, pf_c.task_id, pf_d.task_id]
+    )
+
+    # dec_a finishes: the removal swaps the group's last member (a Prefill) into
+    # its place, so the group is no longer "Decodes first, Prefills last".
+    dec_a.set_stopped()
+    scheduler.update(list(TaskPool.id_list))
+    group = scheduler.sgroup_list.get_current_sgroup_all_tasks()
+    assert sorted(group) == sorted([dec_b.task_id, pf_c.task_id, pf_d.task_id])
+    assert TaskPool.pool[group[0]].task_type == TaskType.Prefill
+
+    # Both types allowed (the `dp_size == 1` path): the Prefill run stops at the
+    # first Decode member instead of selecting a hole-riddled batch.
+    for _ in range(3):
+        scheduler.prepare_for_schedule()
+        batch_ids = scheduler.schedule()
+        assert batch_ids, "schedule() must keep making progress"
+        assert _is_contiguous_run(
+            scheduler.sgroup_list.get_current_sgroup_all_tasks(), batch_ids
+        ), (group, batch_ids)
+
+    # A single-type pass (the multi-DP schedule loop) never steals the other
+    # type: it returns [] here and the sibling pass runs the group instead.
+    scheduler.prepare_for_schedule()
+    assert scheduler.schedule(strict_allowed_task_type={TaskType.Decode}) == []
+    scheduler.prepare_for_schedule()
+    assert scheduler.schedule(strict_allowed_task_type={TaskType.Prefill}) == [group[0]]
+
+
 def test_pp_chunked_prefill():
     set_global_args(
         OmegaConf.create(

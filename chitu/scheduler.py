@@ -1276,18 +1276,48 @@ class SkewScheduler(Scheduler):
                 for tid in to_add:
                     TaskPool.pool[tid].sched_group_id = sgroup_id
 
-        # Select the batch from the slot group by each member's *current* task
-        # type. Slicing the group at the first Prefill (or at its end) assumes a
-        # stable "Decodes first, Prefills last" partition, but that partition
-        # does not hold: a member flips from Prefill to Decode once its prefill
-        # finishes, and fills append new members at the tail. A group full of
-        # Decode members therefore produced an empty Prefill slice, so
-        # `schedule()` returned [] on every step and the engine stalled forever
-        # (0 tokens/s, KV cache fully occupied, no evictions).
+        # Select a *contiguous run* of the slot group, in the group's own order
+        # (which mirrors the per-request slots: fills append members at the
+        # tail, a member flips from Prefill to Decode in place, and removals
+        # swap the last member into the freed position).
+        #
+        # The run matters because the dense (skew) KV cache addresses rows by
+        # the position inside the batch: `DenseKVCache._prepare_cache` takes the
+        # rows `[start_pos, start_pos + len(batch))` and the accessor is indexed
+        # by batch position, with `start_pos` being the slot group's first slot
+        # for Decode (`prepare_cache_decode`) and `req2slot[batch[0]]` for
+        # Prefill (`prepare_cache_prefill`). Batch member `i` must therefore own
+        # slot `start_pos + i`, i.e. the batch has to be a run of consecutive
+        # members: Decode runs start at the head of the group, Prefill runs
+        # start at the first Prefill member.
+        #
+        # Taking the batch by type alone is not enough. The group is not always
+        # partitioned into "Decodes first, Prefills last" (removals can pull a
+        # Prefill in front of Decodes), and then a type-selected batch would
+        # silently address the wrong cache rows.
         def _slot_task_ids_of_type(task_type: TaskType) -> list[str]:
-            task_ids_of_type = [
-                tid for tid in sgroup if TaskPool.pool[tid].task_type == task_type
-            ]
+            if task_type == TaskType.Decode:
+                # Decode batches are addressed from the slot group's start.
+                start = 0
+            else:
+                # Prefill batches are addressed from the first member's slot.
+                start = next(
+                    (
+                        i
+                        for i, tid in enumerate(sgroup)
+                        if TaskPool.pool[tid].task_type == TaskType.Prefill
+                    ),
+                    None,
+                )
+                if start is None:
+                    return []
+
+            task_ids_of_type: list[str] = []
+            for tid in sgroup[start:]:
+                if TaskPool.pool[tid].task_type != task_type:
+                    break
+                task_ids_of_type.append(tid)
+
             if (
                 task_type == TaskType.Prefill
                 and self.prefill_chunk_size is not None
@@ -1300,20 +1330,28 @@ class SkewScheduler(Scheduler):
         batch_task_type = target_task_type
         final_task_ids = _slot_task_ids_of_type(batch_task_type)
         if not final_task_ids:
-            # The group holds nothing runnable of the target type. That is the
-            # normal state when the group is full of the other type while
-            # requests of the target type wait outside: a group only admits new
-            # members while it has free capacity, so no member of the target
-            # type can join yet. Fall back to the other type so the group keeps
-            # making progress and its members eventually finish, free capacity
-            # and let the waiting requests in. Returning [] here instead would
-            # stall every request in the pool forever.
+            # The group holds nothing runnable of the target type at its
+            # addressable start. That is the normal state when the group is
+            # full of the other type while requests of the target type wait
+            # outside: a group only admits new members while it has free
+            # capacity, so no member of the target type can join yet. Fall back
+            # to the other type so the group keeps making progress and its
+            # members eventually finish, free capacity and let the waiting
+            # requests in. Returning [] here instead would stall every request
+            # in the pool forever (0 tokens/s, KV cache fully occupied, no
+            # evictions). The fallback respects `strict_allowed_task_type`, so
+            # callers that ask for a single type (e.g. the per-type passes of
+            # the multi-DP schedule loop) still get a homogeneous batch.
             batch_task_type = (
                 TaskType.Prefill
                 if batch_task_type == TaskType.Decode
                 else TaskType.Decode
             )
-            final_task_ids = _slot_task_ids_of_type(batch_task_type)
+            final_task_ids = (
+                _slot_task_ids_of_type(batch_task_type)
+                if batch_task_type in strict_allowed_task_type
+                else []
+            )
             if not final_task_ids:
                 return []
 
