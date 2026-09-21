@@ -17,6 +17,10 @@ from .static_transfer_plan import (
 logger = logging.getLogger(__name__)
 
 
+class KVTransferExecutionError(RuntimeError):
+    """The transfer engine rejected a request's remote KV destination."""
+
+
 # ---------------------------------------------------------------------------
 # TransferPlan / TransferPlanPerRank
 # ---------------------------------------------------------------------------
@@ -53,17 +57,32 @@ class TransferPlan:
             return
         batch_ids = []
         for session_id, per_rank in self.plans.items():
-            batch_id = engine.batch_transfer_async_write(
-                session_id,
-                per_rank.ptrs.tolist(),
-                per_rank.remote_ptrs.tolist(),
-                per_rank.lengths.tolist(),
-            )
-            assert batch_id != 0, "batch_transfer_async_write failed"
+            try:
+                batch_id = engine.batch_transfer_async_write(
+                    session_id,
+                    per_rank.ptrs.tolist(),
+                    per_rank.remote_ptrs.tolist(),
+                    per_rank.lengths.tolist(),
+                )
+            except Exception as exc:
+                raise KVTransferExecutionError(
+                    f"failed to submit KV transfer to session {session_id}"
+                ) from exc
+            if batch_id == 0:
+                raise KVTransferExecutionError(
+                    f"transfer engine rejected session {session_id}"
+                )
             batch_ids.append(batch_id)
-        assert (
-            engine.get_batch_transfer_status(batch_ids) == 0
-        ), "get_batch_transfer_status failed"
+        try:
+            status = engine.get_batch_transfer_status(batch_ids)
+        except Exception as exc:
+            raise KVTransferExecutionError(
+                "failed to query KV transfer completion"
+            ) from exc
+        if status != 0:
+            raise KVTransferExecutionError(
+                f"KV transfer completion failed with status {status}"
+            )
 
     def total_bytes_per_session(self) -> dict[str, int]:
         """Sum of lengths per session_id."""

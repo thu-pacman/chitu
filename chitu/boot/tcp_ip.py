@@ -64,6 +64,46 @@ def is_port_available(port: int):
         return False
 
 
+#: Number of ports reserved to each job inside its port block (see
+#: `job_port_base`). This is enough for the coordinator port, plus one torchrun
+#: master port and one rendezvous port per instance (see `MAX_INSTS_PER_JOB`).
+PORTS_PER_JOB = 20
+
+#: Maximum number of instances of one job that fit into its port block.
+#: `multi_inst.n_insts` must not exceed this, otherwise instances of one job
+#: would step into the port block reserved to another job.
+MAX_INSTS_PER_JOB = (PORTS_PER_JOB - 1) // 2
+
+#: Per-job port blocks are allocated from `[PORT_BLOCK_BASE, PORT_BLOCK_LIMIT)`.
+#: This range must stay outside the kernel's local port range
+#: (`net.ipv4.ip_local_port_range`, 32768-60999 by default): a port inside that
+#: range can be occupied by an outbound TCP connection of another process on the
+#: same node before we bind it, and our `bind()` then fails with EADDRINUSE.
+#: It must also stay clear of the port ranges used by other parts of chitu on
+#: the same node: the transfer engine ports of the KV cache transfer
+#: (`mooncake/transfer_engine.py`: 10000-10031, 12000-12999, and 12001 by
+#: default) and the random port range that CI cases use for `serve.port`
+#: (20000-32767).
+PORT_BLOCK_BASE = 13000
+PORT_BLOCK_LIMIT = 20000
+PORT_BLOCK_COUNT = (PORT_BLOCK_LIMIT - PORT_BLOCK_BASE) // PORTS_PER_JOB
+
+
+def job_port_base(slurm_job_id: int) -> int:
+    """
+    Get the first port of the port block reserved to the given Slurm job.
+
+    Ports that must be agreed on by all nodes and all instances of a job (e.g.
+    the coordinator port, and the torchrun master and rendezvous ports of
+    instances spanning multiple nodes) are derived from the Slurm job ID, so
+    that all the nodes of the job compute the same ports. Concurrent jobs get
+    consecutive job IDs, hence disjoint port blocks, so that they don't collide
+    on the same node.
+    """
+
+    return PORT_BLOCK_BASE + (slurm_job_id % PORT_BLOCK_COUNT) * PORTS_PER_JOB
+
+
 def is_localhost(host: str):
     return host in {"localhost", "127.0.0.1", "::1"}
 

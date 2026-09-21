@@ -405,7 +405,10 @@ class Backend:
                     "coordinator.port is required when multi_inst.n_insts > 1"
                 )
             init_coordinator(
-                args.coordinator.host, args.coordinator.port, is_coordinator_host=False
+                args.coordinator.host,
+                args.coordinator.port,
+                is_coordinator_host=False,
+                override_existing=args.boot.restart_instance_id is not None,
             )
         elif args.coordinator.host is None or args.coordinator.port is None:
             init_coordinator(

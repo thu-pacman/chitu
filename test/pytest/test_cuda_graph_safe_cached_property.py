@@ -58,7 +58,6 @@ def test_cache_in_graph_reuse_in_graph():
     @make_dispatched_graphed_callables(
         args_max_nelem=[],
         kwargs_max_nelem={},
-        output_max_nelem_callback=lambda key, sample_nelem: 1,
     )
     def f():
         y1 = a.y
@@ -89,7 +88,6 @@ def test_cache_out_of_graph_reuse_in_graph():
     @make_dispatched_graphed_callables(
         args_max_nelem=[],
         kwargs_max_nelem={},
-        output_max_nelem_callback=lambda key, sample_nelem: 1,
     )
     def f():
         y2 = a.y
@@ -119,7 +117,6 @@ def test_cache_in_graph_reuse_out_of_graph():
     @make_dispatched_graphed_callables(
         args_max_nelem=[],
         kwargs_max_nelem={},
-        output_max_nelem_callback=lambda key, sample_nelem: 1,
     )
     def f():
         y1 = a.y
@@ -169,7 +166,6 @@ def test_cache_in_graph_reuse_out_of_graph_dynamic_shape():
     @make_dispatched_graphed_callables(
         args_max_nelem=[],
         kwargs_max_nelem={},
-        output_max_nelem_callback=lambda key, sample_nelem: 100,
     )
     def f():
         y1 = b.y

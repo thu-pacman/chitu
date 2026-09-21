@@ -14,6 +14,7 @@ import asyncio
 import logging
 from typing import Optional, Tuple
 import threading
+import uuid
 
 import msgpack
 import torch
@@ -74,6 +75,8 @@ from chitu.task import (
 
 logger = logging.getLogger(__name__)
 
+_LIVENESS_HEARTBEAT_INTERVAL_S = 1.0
+
 
 def _determine_pd_scheduler_id(args, pd_mode: PDSchedulerMode, rank: int) -> int:
     """Return the role-local scheduler ID used by PDRequestRouter."""
@@ -97,6 +100,7 @@ class PDSchedulerService:
         self.scheduler: Optional[PDInstanceRequestManager] = None
         self.pd_mode = self._determine_pd_mode()
         self.local_instance_id = self._determine_scheduler_id()
+        self.instance_uuid = uuid.uuid4().hex
         # Only TP main rank should expose ZMQ service
         self.is_tp_main_rank = self._determine_tp_main_rank()
         # In CP mode TP size is forced to 1, so every CP rank looks like TP-main.
@@ -108,6 +112,9 @@ class PDSchedulerService:
         self.context = zmq.asyncio.Context()
         self.request_socket = None
         self.stats_socket = None
+        self._router_stats_address: str
+        self._liveness_stop_event = threading.Event()
+        self._liveness_thread: Optional[threading.Thread] = None
 
         # Service state
         self.running = False
@@ -253,6 +260,7 @@ class PDSchedulerService:
             logger.info("pd compute worker loop started in background thread")
 
         self.running = True
+        self._start_liveness_reporter()
 
         # Test-injection (off by default): schedule a delayed crash on this role
         # to E2E-verify the crash protocol.
@@ -267,7 +275,11 @@ class PDSchedulerService:
             self.ready_event.set()
 
         # Keep service running
-        await asyncio.gather(self.request_task, self.stats_task)
+        try:
+            await asyncio.gather(self.request_task, self.stats_task)
+        finally:
+            self.running = False
+            self._stop_liveness_reporter()
 
     async def _worker_loop(self):
         """TP non-main rank worker loop: participate in collectives and model compute without ZMQ."""
@@ -286,6 +298,7 @@ class PDSchedulerService:
         logger.info("stopping pd scheduler service...")
 
         self.running = False
+        self._stop_liveness_reporter()
 
         # Cancel tasks
         if self.request_task:
@@ -323,7 +336,14 @@ class PDSchedulerService:
             host_role = f"decode_instance_{self.local_instance_id}"
         else:
             host_role = f"instance_{self.local_instance_id}"
-        set_endpoint(host_role, "request_port", request_ip, request_port)
+        set_endpoint(
+            host_role,
+            "request_port",
+            request_ip,
+            request_port,
+            override=self.pd_mode
+            in (PDSchedulerMode.PREFILL_ONLY, PDSchedulerMode.DECODE_ONLY),
+        )
         self._request_host_role = host_role
         self._request_ip = request_ip
         self._request_port = request_port
@@ -346,7 +366,8 @@ class PDSchedulerService:
         stats_ip, stats_port = get_endpoint(
             "router", "stats_port", timeout=launch_timeout
         )
-        self.stats_socket.connect(f"tcp://{stats_ip}:{stats_port}")
+        self._router_stats_address = f"tcp://{stats_ip}:{stats_port}"
+        self.stats_socket.connect(self._router_stats_address)
 
         # Start the P/D -> Router crash reporter (dedicated sync-socket thread).
         # It delivers the crash notification even if the async service loop dies.
@@ -363,6 +384,55 @@ class PDSchedulerService:
             f"{self._request_ip}:{self._request_port}, "
             f"connected to stats port {stats_port}"
         )
+
+    def _start_liveness_reporter(self) -> None:
+        if self.pd_mode not in (
+            PDSchedulerMode.PREFILL_ONLY,
+            PDSchedulerMode.DECODE_ONLY,
+        ):
+            return
+        self._liveness_stop_event.clear()
+        self._liveness_thread = threading.Thread(
+            target=self._liveness_reporter_loop,
+            name="pd-liveness-reporter",
+            daemon=True,
+        )
+        self._liveness_thread.start()
+
+    def _stop_liveness_reporter(self) -> None:
+        self._liveness_stop_event.set()
+        if self._liveness_thread is not None:
+            self._liveness_thread.join(timeout=2.0)
+            self._liveness_thread = None
+
+    def _liveness_reporter_loop(self) -> None:
+        """Independent worker liveness reporter"""
+        context = zmq.Context()
+        socket = context.socket(zmq.PUSH)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.SNDHWM, 1)
+        socket.setsockopt(zmq.IMMEDIATE, 1)
+        socket.connect(self._router_stats_address)
+        payload = msgpack.packb(
+            {
+                "msg_type": MSG_TYPE_HEARTBEAT,
+                "liveness_only": True,
+                "local_instance_id": self.local_instance_id,
+                "instance_uuid": self.instance_uuid,
+                "pd_mode": self.pd_mode.value,
+            }
+        )
+        try:
+            while self.running and not self._liveness_stop_event.is_set():
+                try:
+                    socket.send(payload, flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    pass
+                if self._liveness_stop_event.wait(_LIVENESS_HEARTBEAT_INTERVAL_S):
+                    break
+        finally:
+            socket.close(linger=0)
+            context.term()
 
     async def _wait_for_terminate(self, timeout: float = 300.0) -> None:
         """Wait until the main loop has broadcast TerminateBackend.
@@ -579,7 +649,6 @@ class PDSchedulerService:
                     self.is_cp_main_rank,
                 )
 
-            # Send stats to router
             stats_bytes = msgpack.packb(stats)
             await self.stats_socket.send(stats_bytes)
             if stats.get("terminated", False):
@@ -601,6 +670,7 @@ class PDSchedulerService:
         stats = {
             "msg_type": MSG_TYPE_HEARTBEAT,  # distinguish heartbeat vs crash
             "local_instance_id": self.scheduler.local_instance_id,
+            "instance_uuid": self.instance_uuid,
             "pd_mode": self.pd_mode.value,
             "max_seq_len": getattr(get_global_args().infer, "max_seq_len", None),
             # FIXME: stats from all cache?

@@ -142,10 +142,20 @@ class TokenRouter:
         request: UserRequest,
         finish_reason: Optional[str] = None,
         error: Optional[str] = None,
+        num_hit_tokens: Optional[int] = None,
     ):
         """Finalize request, stop output stream and remove request data in all DP components"""
         if finish_reason is not None:
             request.finish_reason = finish_reason
+        if num_hit_tokens is not None:
+            request.num_hit_tokens = num_hit_tokens
+        request_router = get_request_router(check_exist=False)
+        if (
+            error is None
+            and request_router is not None
+            and hasattr(request_router, "finalize_request_cache")
+        ):
+            request_router.finalize_request_cache(request.request_id)
         was_finished = request.finished
         request.stop_stream(error=error)
         if not was_finished and request.completion_time > 0:
@@ -290,20 +300,26 @@ class TokenRouter:
                     if hasattr(request_router, "policy") and hasattr(
                         request_router.policy, "insert_req_blocks"
                     ):
-                        request_router.policy.insert_req_blocks(request_id)
+                        request_router.policy.insert_req_blocks(
+                            request_id, include_generated_tokens=False
+                        )
                     if hasattr(request_router, "policy") and hasattr(
                         request_router.policy, "forget_request"
                     ):
+                        # For DP instance: forget pending_tokens only
+                        # For Prefill instance: forget pending_token + running_request
                         request_router.policy.forget_request(request_id)
 
-            # Periodically print per-dp throughput, help locate if all channels are flowing
             now = time.time()
             if now - self._last_stats_log_ts >= 5.0:
                 per_instance = ", ".join(
-                    [f"dp{d}:{n}" for d, n in sorted(self._per_instance_tokens.items())]
+                    f"dp{dp_id}:{tokens}"
+                    for dp_id, tokens in sorted(self._per_instance_tokens.items())
                 )
                 logger.info(
-                    f"[PER_DP_TOKENS] {per_instance} total={self.total_tokens_received}"
+                    "[PER_DP_TOKENS] %s total=%s",
+                    per_instance,
+                    self.total_tokens_received,
                 )
                 self._per_instance_tokens.clear()
                 self._last_stats_log_ts = now
@@ -350,10 +366,28 @@ class TokenRouter:
             # so the paired peer is notified and does not wait/leak.
             request_router = get_request_router(check_exist=False)
             if request_router is not None:
-                if token_data.get("prefill_failed"):
+                failed_decode_scheduler_id = token_data.get(
+                    "failed_decode_scheduler_id"
+                )
+                if failed_decode_scheduler_id is not None:
+                    try:
+                        # Stop Decode instance
+                        await request_router.handle_decode_inst_failed(
+                            int(failed_decode_scheduler_id),
+                            int(token_data["failed_decode_generation"]),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Token Router: failed to withdraw Decode instance "
+                            "for request %s",
+                            request_id,
+                        )
+                    handler = None
+                elif token_data.get("prefill_failed"):
                     handler = request_router.handle_prefill_failed
                 elif token_data.get("decode_failed"):
-                    handler = request_router.handle_decode_failed
+                    # request level error that don't require stopping decode instance
+                    handler = request_router.handle_decode_req_failed
                 else:
                     handler = None
                 if handler is not None:

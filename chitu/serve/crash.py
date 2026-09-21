@@ -333,8 +333,7 @@ def _hard_exit() -> None:
 def maybe_start_test_crash_injection(role: str) -> None:
     """Delegate to the centralized crash injection (testing/exception.py).
 
-    When CHITU_TEST_INJECT_EXCEPTION=delayed_crash, crash this process after a
-    fixed delay to E2E-verify the crash protocol. Off (no-op) otherwise.
+    Schedule configured delayed crash injections. Off by default.
     """
     from chitu.testing.exception import test_inject_exception_delayed_crash
 

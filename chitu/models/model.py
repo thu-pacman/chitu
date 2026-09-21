@@ -1647,17 +1647,11 @@ class Transformer(nn.Module):
                 return functools.reduce(operator.mul, x.shape[1:], 1)
 
         tokens_max_nelem = self.max_batch_size_per_dp * numel_per_seq(bs, tokens)
-        output_max_nelem_callback = (
-            lambda key, out: numel_per_seq(key[0], out)
-            * self.max_batch_size_per_dp
-            * self.mtp_size
-        )
         _, extra_inputs_mtp_max_nelem = self._decode_graph_extra_inputs_mtp(tokens, bs)
 
         @make_dispatched_graphed_callables(
             args_max_nelem=(tokens_max_nelem, *extra_inputs_mtp_max_nelem),
             kwargs_max_nelem={},
-            output_max_nelem_callback=output_max_nelem_callback,
             before_capture_callback=lambda: self.prepare_decoding_attn(is_mtp=True),
             before_replay_callback=before_replay_callback,
             enable=self.use_cuda_graph,
@@ -1682,7 +1676,6 @@ class Transformer(nn.Module):
         @make_dispatched_graphed_callables(
             args_max_nelem=(),
             kwargs_max_nelem={},
-            output_max_nelem_callback=lambda key, n: 1,
             before_replay_callback=None,
             enable=self.use_cuda_graph,
         )
@@ -2057,11 +2050,6 @@ class Transformer(nn.Module):
             tokens_max_nelem = self.max_batch_size_per_dp * numel_per_seq(
                 batch_size, tokens
             )
-            output_max_nelem_callback = (
-                lambda key, out: numel_per_seq(key[0], out)
-                * self.max_batch_size_per_dp
-                * self.mtp_size
-            )
 
             @make_dispatched_graphed_callables(
                 args_max_nelem=(
@@ -2069,7 +2057,6 @@ class Transformer(nn.Module):
                     *extra_inputs_max_nelem,
                 ),
                 kwargs_max_nelem={},
-                output_max_nelem_callback=output_max_nelem_callback,
                 before_capture_callback=lambda: self.prepare_decoding_attn(),
                 before_replay_callback=before_replay_callback,
                 enable=self.use_cuda_graph,
@@ -2089,7 +2076,6 @@ class Transformer(nn.Module):
                 @make_dispatched_graphed_callables(
                     args_max_nelem=(),
                     kwargs_max_nelem={},
-                    output_max_nelem_callback=lambda key, n: 1,
                     before_replay_callback=None,
                     enable=self.use_cuda_graph,
                 )

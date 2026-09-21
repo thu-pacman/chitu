@@ -461,12 +461,18 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         self.apply_instance_evicts(stats.local_instance_id, stats.evicted_blk_hashes)
 
     def build_req_token_blocks(
-        self, request: UserRequest, local_instance_id: int
+        self,
+        request: UserRequest,
+        local_instance_id: int,
+        *,
+        include_generated_tokens: bool = False,
     ) -> list[BlockIdentity]:
         block_size = self.instances_block_size.get(local_instance_id)
         if not block_size or block_size <= 0:
             return []
         prompt_tokens = list(getattr(request, "prompt_tokens", []) or [])
+        if include_generated_tokens:
+            prompt_tokens.extend(request.generated_tokens)
         if not prompt_tokens:
             return []
 
@@ -598,8 +604,10 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         # re-inserts (recency refresh) .
         self.insert_req_blocks(request.request_id)
 
-    def insert_req_blocks(self, request_id: str) -> None:
-        # Insert request blocks into cached_blocks when the first token arrived.
+    def insert_req_blocks(
+        self, request_id: str, *, include_generated_tokens: bool = False
+    ) -> None:
+        """Refresh one request's cacheable prefix blocks in the shadow LRU."""
         local_instance_id = self.req_to_scheduler.get(request_id)
         request = self.req_to_request.get(request_id)
         if local_instance_id is None or request is None:
@@ -607,7 +615,11 @@ class PrefixCacheAwarePolicy(LoadBalancer):
                 f"[REQUEST_ROUTER] skip insert_req_blocks for unknown request_id={request_id}"
             )
             return
-        req_blocks = self.build_req_token_blocks(request, local_instance_id)
+        req_blocks = self.build_req_token_blocks(
+            request,
+            local_instance_id,
+            include_generated_tokens=include_generated_tokens,
+        )
         lru = self.cached_blocks.setdefault(local_instance_id, OrderedDict())
         cap = self.instances_num_total_blocks.get(local_instance_id, 0)
         if cap <= 0:
@@ -680,6 +692,10 @@ class RequestRouter:
         if self.routing_by_req_len:
             self._parse_scheduler_configs()
         if config.routing_algorithm == "prefix_cache_aware":
+            assert get_global_args().infer.enable_prefix_caching, (
+                "multi_inst.router.routing_algorithm=prefix_cache_aware requires "
+                "infer.enable_prefix_caching=true"
+            )
             self.policy = PrefixCacheAwarePolicy(config)
             self.policy.routing_by_req_len = self.routing_by_req_len
         else:
@@ -716,7 +732,7 @@ class RequestRouter:
         self._drain_complete: dict[int, bool] = {i: False for i in range(self._n_insts)}
         self._tasks: list[asyncio.Task] = []
 
-        self.heartbeat_timeout: float = 60.0
+        self.heartbeat_timeout: float = 20.0
         self.stop_on_heartbeat_timeout: bool = os.environ.get("CI_TESTS") == "true"
         # Set once the Router has entered the crash-handling flow (idempotency guard).
         self._crash_handled = False
@@ -968,9 +984,15 @@ class RequestRouter:
         Prefill-side request-level failures to the paired Decode instance."""
         pass
 
-    async def handle_decode_failed(self, request_id: str) -> None:
+    async def handle_decode_req_failed(self, request_id: str) -> None:
         """No-op in the base class. PDRequestRouter overrides to forward
         Decode-side request-level failures to the paired Prefill instance."""
+        pass
+
+    async def handle_decode_inst_failed(
+        self, decode_sid: int, decode_generation: int
+    ) -> None:
+        """No-op in the base class. PDRequestRouter removes failed Decode instances."""
         pass
 
     async def handle_crash(self, reason: str) -> None:
@@ -1508,7 +1530,11 @@ async def start_request_router():
         )
 
         # The PD router uses router policy settings and PD transfer settings.
-        router = PDRequestRouter(multi_inst.router, multi_inst.pd_disaggregation)
+        router = PDRequestRouter(
+            multi_inst.router,
+            multi_inst.pd_disaggregation,
+            fail_fast=multi_inst.fail_fast,
+        )
     elif is_independent_multi_inst():
         logger.info("Creating DP unified router...")
 

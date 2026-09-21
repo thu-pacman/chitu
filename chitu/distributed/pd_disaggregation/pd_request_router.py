@@ -9,9 +9,8 @@ Extends the original RequestRouter to support Prefill-Decode disaggregation
 
 import asyncio
 import logging
-import os
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Optional
 from typing_extensions import override
 
@@ -59,6 +58,7 @@ from chitu.serve.crash import (
     get_crash_reason,
 )
 from chitu.dp_router import get_token_router
+from chitu.serve.api_app import request_server_shutdown
 from chitu.task import UserRequest
 from chitu.testing.pd_utils import PDTestRunner
 
@@ -78,36 +78,50 @@ def _policy_algorithm(policy) -> str:
 
 
 def _policy_stats(policy, local_instance_id: int) -> str:
-    stats = getattr(policy, "scheduler_stats", {}).get(local_instance_id)
+    stats = policy.scheduler_stats.get(local_instance_id)
     if stats is None:
         return "stats=missing"
+    state = (
+        f"alive={stats.is_alive} running={stats.running_requests} "
+        f"waiting={stats.waiting_requests} pending_tokens={stats.pending_tokens}"
+    )
     if isinstance(policy, LoadBalancer):
         router_running, router_pending_tokens = policy.get_router_load(
             local_instance_id
         )
-        return (
-            f"alive={stats.is_alive} running={stats.running_requests} "
-            f"waiting={stats.waiting_requests} "
-            f"pending_tokens={stats.pending_tokens} "
-            f"router_running={router_running} "
+        state += (
+            f" router_running={router_running} "
             f"router_pending_tokens={router_pending_tokens}"
         )
-    return (
-        f"alive={stats.is_alive} running={stats.running_requests} "
-        f"waiting={stats.waiting_requests} pending_tokens={stats.pending_tokens}"
-    )
+    if isinstance(policy, PrefixCacheAwarePolicy):
+        state += (
+            f" cached_blocks={len(policy.cached_blocks.get(local_instance_id, ()))}"
+            f" evict_buffer={len(policy.evict_buffer.get(local_instance_id, ()))}"
+            f" cache_capacity={policy.instances_num_total_blocks.get(local_instance_id)}"
+            f" block_size={policy.instances_block_size.get(local_instance_id)}"
+        )
+    return state
 
 
 class PDRequestRouter(RequestRouter):
     """PD disaggregation request router"""
 
-    def __init__(self, config: ServeRouterConfig, pd_config: PDDisaggregationConfig):
+    def __init__(
+        self,
+        config: ServeRouterConfig,
+        pd_config: PDDisaggregationConfig,
+        *,
+        fail_fast: bool = True,
+    ):
         super().__init__(config)
         self.pd_config = pd_config
+        self.fail_fast = fail_fast
 
         logger.info("using classic pd disaggregation")
 
         self.pending_pd_requests: dict[str, PendingPDRequest] = {}
+        # Pending request when system has no avaliable P/D worker
+        self.waiting_for_pd_workers: deque[UserRequest] = deque()
         self.prefill_schedulers: dict[int, dict] = {}  # local_instance_id -> info
         self.decode_schedulers: dict[int, dict] = {}  # local_instance_id -> info
 
@@ -121,6 +135,8 @@ class PDRequestRouter(RequestRouter):
         self.prefill_sockets = {}
         self.decode_sockets = {}
         self.bootstrap_server: Optional[MooncakeBootstrapServer] = None
+        self._pd_tasks: list[asyncio.Task] = []
+        self._pd_shutdown_started = False
 
         # Keep P/D stats in separate policy instances so local_instance_id spaces can overlap.
         routing_algorithm = getattr(self.config, "routing_algorithm", "")
@@ -143,6 +159,10 @@ class PDRequestRouter(RequestRouter):
             self.config, "routing_algorithm_for_decode", "prefix_cache_aware"
         )
         if decode_algorithm == "prefix_cache_aware":
+            assert get_global_args().infer.enable_prefix_caching, (
+                "multi_inst.router.routing_algorithm_for_decode=prefix_cache_aware "
+                "requires infer.enable_prefix_caching=true"
+            )
             self.decode_policy = PrefixCacheAwarePolicy(self.config)
             self.decode_policy.routing_by_req_len = self.decode_routing_by_req_len
         elif decode_algorithm in ("round_robin", "power_of_two_choices"):
@@ -160,11 +180,12 @@ class PDRequestRouter(RequestRouter):
         self._pd_stats_logged: set[tuple[str, int]] = set()
         logger.info(
             "[PD_ROUTER][policy_config] prefill_policy=%s prefill_algorithm=%s "
-            "decode_policy=%s decode_algorithm=%s",
+            "decode_policy=%s decode_algorithm=%s fail_fast=%s",
             _policy_name(self.prefill_policy),
             _policy_algorithm(self.prefill_policy),
             _policy_name(self.decode_policy),
             _policy_algorithm(self.decode_policy),
+            self.fail_fast,
         )
 
         now = time.time()
@@ -207,6 +228,7 @@ class PDRequestRouter(RequestRouter):
             self.prefill_schedulers[i] = {
                 "global_instance_id": inst_id,
                 "status": "online",
+                "generation": 0,
             }
             if self.routing_by_req_len:
                 self.prefill_schedulers[i]["max_seq_len"] = self._scheduler_max_seq_len(
@@ -218,6 +240,7 @@ class PDRequestRouter(RequestRouter):
             self.decode_schedulers[i] = {
                 "global_instance_id": inst_id,
                 "status": "online",
+                "generation": 0,
             }
             if self.decode_routing_by_req_len:
                 self.decode_schedulers[i]["max_seq_len"] = self._scheduler_max_seq_len(
@@ -250,7 +273,7 @@ class PDRequestRouter(RequestRouter):
         # coordination service.
         await self._init_pd_sockets()
 
-        self._tasks = [
+        tasks = [
             asyncio.create_task(self._stats_collector_task()),
             asyncio.create_task(self._pd_request_processor_task()),
             asyncio.create_task(self._health_monitor_task()),
@@ -259,7 +282,18 @@ class PDRequestRouter(RequestRouter):
             asyncio.create_task(self._wait_for_pd_instances()),
             asyncio.create_task(self._prometheus_manager_task()),
         ]
-        await asyncio.gather(*self._tasks)
+        self._pd_tasks = tasks
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        self._pd_tasks = []
+        for result in results:
+            if isinstance(result, asyncio.CancelledError):
+                if self._pd_shutdown_started:
+                    # during router shutdown, router will cancel all tasks
+                    # raising CancelledError is expected behavior.
+                    continue
+                raise result
+            if isinstance(result, BaseException):
+                raise result
 
     async def _init_pd_sockets(self):
         """Initialize PD specific ZMQ socket.
@@ -287,8 +321,8 @@ class PDRequestRouter(RequestRouter):
                 )
             socket = self.context.socket(zmq.PUSH)
             # Fail immdediately if peer not connected to avoid silent drops.
-            socket.setsockopt(zmq.IMMEDIATE, 1)
             socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.IMMEDIATE, 1)
             socket.connect(info["address"])
             self.prefill_sockets[local_instance_id] = socket
             logger.info(
@@ -312,6 +346,7 @@ class PDRequestRouter(RequestRouter):
                     local_instance_id, SchedulerType.DECODE, ip, port
                 )
             socket = self.context.socket(zmq.PUSH)
+            socket.setsockopt(zmq.LINGER, 0)
             socket.setsockopt(zmq.IMMEDIATE, 1)
             socket.connect(info["address"])
             self.decode_sockets[local_instance_id] = socket
@@ -328,6 +363,46 @@ class PDRequestRouter(RequestRouter):
             stats_port = self.stats_socket.bind_to_random_port(f"tcp://{stats_ip}")
             set_endpoint("router", "stats_port", stats_ip, stats_port)
             logger.info(f"listening for stats: tcp://{stats_ip}:{stats_port}")
+
+    async def _refresh_scheduler_socket(
+        self, role: str, local_instance_id: int
+    ) -> None:
+        """Reconnect a recovered worker when it publishes a new request endpoint."""
+        if role == "prefill":
+            schedulers = self.prefill_schedulers
+            sockets = self.prefill_sockets
+            scheduler_type = SchedulerType.PREFILL
+        else:
+            schedulers = self.decode_schedulers
+            sockets = self.decode_sockets
+            scheduler_type = SchedulerType.DECODE
+
+        info = schedulers[local_instance_id]
+        ip, port = get_endpoint(f"{role}_instance_{local_instance_id}", "request_port")
+        address = f"tcp://{ip}:{port}"
+        if info.get("address") != address:
+            previous_socket = sockets.pop(local_instance_id, None)
+            if previous_socket is not None:
+                previous_socket.close(linger=0)
+            socket = self.context.socket(zmq.PUSH)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.IMMEDIATE, 1)
+            socket.connect(address)
+            sockets[local_instance_id] = socket
+            info.update(host=ip, port=port, address=address)
+
+        info["status"] = "online"
+        info["generation"] += 1
+        await self.pd_coordination_service.register_scheduler(
+            local_instance_id, scheduler_type, ip, port
+        )
+        logger.info(
+            "[PD_ROUTER][worker_recovered] role=%s sid=%s generation=%s " "address=%s",
+            role,
+            local_instance_id,
+            info["generation"],
+            address,
+        )
 
     def _init_prefill_policy_shadow_caches(self) -> None:
         """Mirror RequestRouter._init_sockets prefix-cache bookkeeping for each P/D slot."""
@@ -346,7 +421,7 @@ class PDRequestRouter(RequestRouter):
 
     @override
     async def _heartbeat_monitor_task(self, timeout: Optional[float] = None):
-        HEARTBEAT_TIMEOUT = timeout or self.heartbeat_timeout  # 20s timeout threshold
+        HEARTBEAT_TIMEOUT = timeout or self.heartbeat_timeout
         while not self._shutdown:
             current_time = time.time()
 
@@ -358,64 +433,194 @@ class PDRequestRouter(RequestRouter):
                 if policy is None:
                     raise ValueError(f"{role} policy not found")
                 for local_instance_id, stats in policy.scheduler_stats.items():
-                    if current_time - stats.last_heartbeat_time > HEARTBEAT_TIMEOUT:
+                    if (
+                        current_time - stats.last_heartbeat_time > HEARTBEAT_TIMEOUT
+                        and stats.is_alive
+                    ):
                         logger.warning(
-                            f"--- [HEARTBEAT_MONITOR] {role} instance {local_instance_id} heartbeat timeout! ---"
-                            f"Last heartbeat: {current_time - stats.last_heartbeat_time:.2f}s ago"
+                            "[PD_ROUTER][worker_down] role=%s sid=%s "
+                            "last_heartbeat_age_s=%.2f",
+                            role,
+                            local_instance_id,
+                            current_time - stats.last_heartbeat_time,
                         )
-                        # Mark as dead
-                        if stats.is_alive:
-                            dead[role].append(local_instance_id)
-                            stats.is_alive = False
-                            if self.stop_on_heartbeat_timeout:
-                                raise RuntimeError(
-                                    f"{role} instance {local_instance_id} heartbeat timeout, stopping Chitu Serve"
-                                )
-                            # TEMPORARY: crash on any single instance heartbeat timeout
-                            raise RuntimeError(
-                                f"{role} instance {local_instance_id} heartbeat timeout, stopping Chitu Serve"
-                            )
-            for role in ["prefill", "decode"]:
-                handle_dead_instance = getattr(
-                    self, "handle_dead_instance_" + role, self.handle_dead_instance
-                )
-                for local_instance_id in dead[role]:
-                    await handle_dead_instance(local_instance_id)
+                        dead[role].append(local_instance_id)
+                        stats.is_alive = False
+            if await self._handle_dead_workers(dead):
+                return
             await asyncio.sleep(5.0)  # Check every 5 seconds
 
+    async def _handle_dead_workers(self, dead: dict[str, list[int]]) -> bool:
+        for local_instance_id in dead["prefill"]:
+            await self.handle_dead_instance_prefill(local_instance_id)
+        for local_instance_id in dead["decode"]:
+            await self.handle_dead_instance_decode(local_instance_id)
+
+        if self.fail_fast and (dead["prefill"] or dead["decode"]):
+            logger.error(
+                "[PD_ROUTER][worker_down] fail_fast is enabled, stopping service"
+            )
+            await self._shutdown_service_after_worker_failure()
+            return True
+
+        policies = (self.prefill_policy, self.decode_policy)
+        if all(
+            not stats.is_alive
+            for policy in policies
+            for stats in policy.scheduler_stats.values()
+        ):
+            logger.error(
+                "[PD_ROUTER][all_workers_down] no live prefill or decode "
+                "instances remain, stopping router"
+            )
+            await self._shutdown_service_after_all_workers_down()
+            return True
+        return False
+
+    # Used in _heartbeat_monitor_task()
     async def handle_dead_instance_prefill(self, dead_instance_id: int):
+        self.prefill_schedulers[dead_instance_id]["status"] = "offline"
         affected_pd_requests = [
             pd_req
             for pd_req in self.pending_pd_requests.values()
             if pd_req.prefill_scheduler_id == dead_instance_id
         ]
+        logger.warning(
+            "[PD_ROUTER][prefill_down] sid=%s affected_requests=%s",
+            dead_instance_id,
+            len(affected_pd_requests),
+        )
+        self._clear_prefill_instance_state(dead_instance_id)
         for pd_request in affected_pd_requests:
-            await self._send_to_decode_scheduler(
-                local_instance_id=pd_request.decode_scheduler_id,
-                request_data={
-                    "request_id": pd_request.request_id,
-                    "type": "pd_prefill_fail",
-                },
-                prefill_scheduler_id=pd_request.prefill_scheduler_id,
-            )
+            if pd_request.status == PDRequestStatus.PENDING:
+                self._return_request_to_waiting_queue(pd_request)
+                continue
 
+            self.prefill_policy.remove_request(pd_request.request_id)
+            pd_request.error_message = "prefill worker is down"
+            logger.warning(
+                "[PD_ROUTER][notify_decode] notify decode%s that prefill%s is down "
+                "should fail request (id=%s status=%s)",
+                pd_request.decode_scheduler_id,
+                dead_instance_id,
+                pd_request.request_id,
+                pd_request.status.value,
+            )
+            try:
+                await self._send_to_decode_scheduler(
+                    local_instance_id=pd_request.decode_scheduler_id,
+                    request_data={
+                        "request_id": pd_request.request_id,
+                        "type": "pd_prefill_fail",
+                    },
+                    prefill_scheduler_id=pd_request.prefill_scheduler_id,
+                )
+            except Exception:
+                logger.exception(
+                    "failed to notify decode about unavailable prefill: req_id=%s",
+                    pd_request.request_id,
+                )
+            self._remove_prefill_failed_request(pd_request.request_id)
+
+    # Used in _heartbeat_monitor_task()
     async def handle_dead_instance_decode(self, dead_instance_id: int):
+        self.decode_schedulers[dead_instance_id]["status"] = "offline"
+        self._clear_decode_instance_state(dead_instance_id)
         removed_pd_requests = [
             pd_req
             for pd_req in self.pending_pd_requests.values()
             if pd_req.decode_scheduler_id == dead_instance_id
         ]
         for pd_request in removed_pd_requests:
-            await self._send_to_prefill_scheduler(
-                local_instance_id=pd_request.prefill_scheduler_id,
-                request_data={
-                    "request_id": pd_request.request_id,
-                    "type": "pd_decode_fail",
-                },
-            )
+            try:
+                await self._send_to_prefill_scheduler(
+                    local_instance_id=pd_request.prefill_scheduler_id,
+                    request_data={
+                        "request_id": pd_request.request_id,
+                        "type": "pd_decode_fail",
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "failed to notify prefill about unavailable decode: req_id=%s",
+                    pd_request.request_id,
+                )
             self.finish_request_before_recv_stop(
                 pd_request.original_request, error="decode worker is down"
             )
+
+    def _remove_prefill_failed_request(self, request_id: str) -> None:
+        """Release PD pair metadata while preserving Decode policy ownership."""
+        self.pending_pd_requests.pop(request_id, None)
+        self.pending_requests = deque(
+            item for item in self.pending_requests if item.request_id != request_id
+        )
+        if self.pd_coordination_service:
+            self.pd_coordination_service.remove_pd_pair(request_id)
+        set_router_pending_requests(
+            len(self.pending_pd_requests) + len(self.waiting_for_pd_workers)
+        )
+
+    def _clear_prefill_instance_state(self, local_instance_id: int) -> None:
+        """Discard router metadata that belongs to an unavailable prefill instance."""
+        self._clear_prefix_cache_state(
+            "prefill", self.prefill_policy, local_instance_id
+        )
+
+    def _clear_decode_instance_state(self, local_instance_id: int) -> None:
+        """Discard router metadata that belongs to an unavailable decode instance."""
+        self._clear_prefix_cache_state("decode", self.decode_policy, local_instance_id)
+
+    def _clear_prefix_cache_state(
+        self,
+        role: str,
+        policy,
+        local_instance_id: int,
+    ) -> None:
+        if not isinstance(policy, PrefixCacheAwarePolicy):
+            return
+
+        cached_blocks = policy.cached_blocks.pop(local_instance_id, OrderedDict())
+        evict_buffer = policy.evict_buffer.pop(local_instance_id, OrderedDict())
+        cache_capacity = policy.instances_num_total_blocks.pop(local_instance_id, None)
+        block_size = policy.instances_block_size.pop(local_instance_id, None)
+
+        logger.info(
+            "[PD_ROUTER][%s_cache_cleared] sid=%s removed_cached_blocks=%s "
+            "removed_evict_buffer=%s removed_cache_capacity=%s "
+            "removed_block_size=%s",
+            role,
+            local_instance_id,
+            len(cached_blocks),
+            len(evict_buffer),
+            cache_capacity,
+            block_size,
+        )
+
+    def _return_request_to_waiting_queue(self, pd_request: PendingPDRequest) -> None:
+        """Return an request back to wait until a P/D pair is available."""
+        request_id = pd_request.request_id
+
+        self.pending_pd_requests.pop(request_id, None)
+        self.pending_requests = deque(
+            item for item in self.pending_requests if item.request_id != request_id
+        )
+
+        # correct scheduling metadata
+        self.prefill_policy.remove_request(request_id)
+        self.decode_policy.remove_request(request_id)
+
+        self.waiting_for_pd_workers.appendleft(pd_request.original_request)
+        if self.pd_coordination_service:
+            self.pd_coordination_service.remove_pd_pair(request_id)
+        set_router_pending_requests(
+            len(self.pending_pd_requests) + len(self.waiting_for_pd_workers)
+        )
+
+        logger.info(
+            "[PD_ROUTER][request_requeued] req_id=%s reason=pd_pair_unavailable",
+            request_id,
+        )
 
     @override
     async def _health_monitor_task(self):
@@ -461,6 +666,31 @@ class PDRequestRouter(RequestRouter):
         """Keep prefill/decode stats in separate policies."""
         await self._pd_stats_collector_task()
 
+    def _record_liveness_heartbeat(self, stats_dict: dict) -> None:
+        """Refresh an online worker's liveness from its dedicated heartbeat."""
+        pd_mode = stats_dict["pd_mode"]
+        local_instance_id = int(stats_dict["local_instance_id"])
+        if pd_mode == PDSchedulerMode.PREFILL_ONLY.value:
+            policy = self.prefill_policy
+            schedulers = self.prefill_schedulers
+        elif pd_mode == PDSchedulerMode.DECODE_ONLY.value:
+            policy = self.decode_policy
+            schedulers = self.decode_schedulers
+        else:
+            return
+
+        stats = policy.scheduler_stats.get(local_instance_id)
+        if stats is None or schedulers[local_instance_id]["status"] != "online":
+            return
+
+        instance_uuid = stats_dict["instance_uuid"]
+        known_instance_uuid = schedulers[local_instance_id].get("instance_uuid")
+        if known_instance_uuid is not None and known_instance_uuid != instance_uuid:
+            return
+
+        schedulers[local_instance_id]["instance_uuid"] = instance_uuid
+        stats.last_heartbeat_time = time.time()
+
     async def _pd_stats_collector_task(self):
         while not self._shutdown:
             # Local crash watch: if this process is dying (report_and_exit from
@@ -479,22 +709,58 @@ class PDRequestRouter(RequestRouter):
                         logger.error(f"[PD_ROUTER] malformed stats frame: {e}")
                         continue
 
-                    # Crash notification from a P/D instance (msg_type="crash").
-                    # The Router is the termination authority: it enters the dying
-                    # state, terminates all in-flight requests, and exits after the
-                    # graceful window.
                     if stats_dict.get("msg_type") == MSG_TYPE_CRASH:
                         reason = stats_dict.get("reason", "peer instance crashed")
-                        crashed_instance = stats_dict.get("instance")
                         crashed_role = stats_dict.get("role")
                         logger.error(
                             "[CRASH_PROTOCOL] received crash notification: "
                             "role=%s instance=%s reason=%s",
                             crashed_role,
-                            crashed_instance,
+                            stats_dict.get("instance"),
                             reason,
                         )
+                        role = {
+                            PDSchedulerMode.PREFILL_ONLY.value: "prefill",
+                            PDSchedulerMode.DECODE_ONLY.value: "decode",
+                        }.get(crashed_role)
+                        if not self.fail_fast and role is not None:
+                            local_instance_id = int(stats_dict["instance"])
+                            policy = (
+                                self.prefill_policy
+                                if role == "prefill"
+                                else self.decode_policy
+                            )
+                            if local_instance_id in policy.scheduler_stats:
+                                stats = policy.scheduler_stats[local_instance_id]
+                                if stats.is_alive:
+                                    logger.warning(
+                                        "[PD_ROUTER][worker_crash] role=%s sid=%s "
+                                        "continuing with fail_fast=false",
+                                        role,
+                                        local_instance_id,
+                                    )
+                                    stats.is_alive = False
+                                    if await self._handle_dead_workers(
+                                        {
+                                            "prefill": (
+                                                [local_instance_id]
+                                                if role == "prefill"
+                                                else []
+                                            ),
+                                            "decode": (
+                                                [local_instance_id]
+                                                if role == "decode"
+                                                else []
+                                            ),
+                                        }
+                                    ):
+                                        return
+                                continue
                         await self.handle_crash(reason=reason)
+                        continue
+
+                    if stats_dict.get("liveness_only", False):
+                        self._record_liveness_heartbeat(stats_dict)
                         continue
 
                     pd_mode = stats_dict.get("pd_mode")
@@ -524,6 +790,29 @@ class PDRequestRouter(RequestRouter):
                     if stats_dict.get("terminated", False):
                         self._drain_complete[instance_id] = True
 
+                    is_alive = stats_dict.get("heartbeat", False)
+                    instance_uuid = stats_dict.get("instance_uuid")
+                    schedulers = (
+                        self.prefill_schedulers
+                        if role == "prefill"
+                        else self.decode_schedulers
+                    )
+                    scheduler = schedulers[local_instance_id]
+                    previous_instance_uuid = scheduler.get("instance_uuid")
+                    if scheduler["status"] == "online" and instance_uuid is not None:
+                        scheduler["instance_uuid"] = instance_uuid
+                    recovered = (
+                        is_alive
+                        and scheduler["status"] != "online"
+                        and instance_uuid is not None
+                        and instance_uuid != previous_instance_uuid
+                    )
+                    if recovered:
+                        await self._refresh_scheduler_socket(role, local_instance_id)
+                        scheduler["instance_uuid"] = instance_uuid
+
+                    worker_is_alive = is_alive and scheduler["status"] == "online"
+
                     stats = SchedulerStats(
                         local_instance_id=local_instance_id,
                         running_requests=stats_dict.get("running_requests", 0),
@@ -536,13 +825,22 @@ class PDRequestRouter(RequestRouter):
                             "last_update_time", time.time()
                         ),
                         last_heartbeat_time=time.time(),
-                        is_alive=stats_dict.get("heartbeat", False),
+                        is_alive=worker_is_alive,
                         max_seq_len=stats_dict.get("max_seq_len", None),
                         num_blocks=stats_dict.get("num_blocks", None),
                         block_size=stats_dict.get("block_size", None),
                         evicted_blk_hashes=evicted_blk_hashes,
                     )
                     policy.update_stats(stats)
+                    if recovered:
+                        logger.info(
+                            "[PD_ROUTER][policy_state] role=%s sid=%s generation=%s "
+                            "state=(%s)",
+                            role,
+                            local_instance_id,
+                            schedulers[local_instance_id]["generation"],
+                            _policy_stats(policy, local_instance_id),
+                        )
                     stats_log_key = (role, local_instance_id)
                     if stats_log_key not in self._pd_stats_logged:
                         self._pd_stats_logged.add(stats_log_key)
@@ -643,7 +941,7 @@ class PDRequestRouter(RequestRouter):
                 f"[PD_ROUTER] failed to notify decode {decode_sid} for req_id={request_id}: {e}"
             )
 
-    async def handle_decode_failed(self, request_id: str) -> None:
+    async def handle_decode_req_failed(self, request_id: str) -> None:
         """Forward a Decode-side request-level failure to the paired Prefill.
 
         Called by the TokenRouter when a Decode instance reports an error with
@@ -655,7 +953,7 @@ class PDRequestRouter(RequestRouter):
         pd_request = self.pending_pd_requests.get(request_id)
         if pd_request is None:
             logger.debug(
-                f"[PD_ROUTER] handle_decode_failed: unknown/finished req_id={request_id}"
+                f"[PD_ROUTER] handle_decode_req_failed: unknown/finished req_id={request_id}"
             )
             return
         prefill_sid = pd_request.prefill_scheduler_id
@@ -667,6 +965,34 @@ class PDRequestRouter(RequestRouter):
             asyncio.create_task(
                 self._notify_peer_decode_failed(request_id, prefill_sid)
             )
+
+    async def handle_decode_inst_failed(
+        self, decode_sid: int, decode_generation: int
+    ) -> None:
+        """Withdraw a Decode generation after Prefill reports a transfer failure."""
+        scheduler = self.decode_schedulers[decode_sid]
+        if scheduler["generation"] != decode_generation:
+            logger.info(
+                "[PD_ROUTER][old_decode_inst_failure] sid=%s generation=%s "
+                "current_generation=%s",
+                decode_sid,
+                decode_generation,
+                scheduler["generation"],
+            )
+            return
+
+        stats = self.decode_policy.scheduler_stats[decode_sid]
+        if not stats.is_alive:
+            return
+
+        logger.warning(
+            "[PD_ROUTER][decode_inst_failure] sid=%s generation=%s; "
+            "withdrawing Decode from routing",
+            decode_sid,
+            decode_generation,
+        )
+        stats.is_alive = False
+        await self._handle_dead_workers({"prefill": [], "decode": [decode_sid]})
 
     async def _notify_peer_decode_failed(self, request_id, prefill_sid):
         try:
@@ -702,17 +1028,42 @@ class PDRequestRouter(RequestRouter):
     @override
     def remove_request(self, request_id: str):
         self.pending_pd_requests.pop(request_id, None)
+        self.pending_requests = deque(
+            item for item in self.pending_requests if item.request_id != request_id
+        )
+        self.waiting_for_pd_workers = deque(
+            request
+            for request in self.waiting_for_pd_workers
+            if request.request_id != request_id
+        )
         self.prefill_policy.remove_request(request_id)
         self.decode_policy.remove_request(request_id)
+        if self.pd_coordination_service:
+            self.pd_coordination_service.remove_pd_pair(request_id)
+        set_router_pending_requests(
+            len(self.pending_pd_requests) + len(self.waiting_for_pd_workers)
+        )
+
+    def finalize_request_cache(self, request_id: str) -> None:
+        """Refresh cache-routing state after Decode has completed a request."""
+        if request_id not in self.pending_pd_requests:
+            return
+        if isinstance(self.decode_policy, PrefixCacheAwarePolicy):
+            self.decode_policy.insert_req_blocks(
+                request_id, include_generated_tokens=True
+            )
 
     async def add_request(self, request: UserRequest):
         """Add request to router"""
-        await self._add_pd_request(request)
-
-    async def _add_pd_request(self, request: UserRequest):
-        """Add PD disaggregation request"""
-        request_id = request.request_id
         self._ensure_ttft_deadline(request)
+        self.waiting_for_pd_workers.append(request)
+        set_router_pending_requests(
+            len(self.pending_pd_requests) + len(self.waiting_for_pd_workers)
+        )
+
+    async def _add_pd_request(self, request: UserRequest) -> bool:
+        """Bind one request to an available P/D pair."""
+        request_id = request.request_id
         logger.debug(f"[PD_STAGE][router.recv.start] req_id={request_id}")
 
         with observe_pd_stage("router", "recv"):
@@ -724,7 +1075,7 @@ class PDRequestRouter(RequestRouter):
                         req_seq_len=request.prompt_len,
                     )
                     if self.routing_by_req_len
-                    else None
+                    else self.prefill_policy.eligible_schedulers()
                 )
                 decode_eligible_ids = (
                     self._length_routing_candidates(
@@ -733,7 +1084,7 @@ class PDRequestRouter(RequestRouter):
                         req_seq_len=request.prompt_len + request.max_new_tokens,
                     )
                     if self.decode_routing_by_req_len
-                    else None
+                    else self.decode_policy.eligible_schedulers()
                 )
                 prefill_scheduler_id = self.prefill_policy.select_scheduler(
                     request,
@@ -744,33 +1095,8 @@ class PDRequestRouter(RequestRouter):
                     eligible_ids=decode_eligible_ids,
                 )
 
-            except Exception as e:
-                # No eligible scheduler is a service-level failure, not a
-                # whitelisted request-parameter error. Fail this request with a
-                # service error instead of silently dropping it (which would hang
-                # the client). The heartbeat monitor handles the "all instances
-                # dead" crash path separately.
-                logger.warning(f"no available prefill or decode scheduler: {e}")
-                self.finish_request_before_recv_stop(
-                    request, error="service temporarily unavailable"
-                )
-                self.total_requests += 1
-                return
-            logger.info(
-                "[PD_ROUTER][route_select] req_id=%s prefill_policy=%s "
-                "prefill_algorithm=%s prefill_sid=%s prefill_stats=(%s) "
-                "decode_policy=%s decode_algorithm=%s decode_sid=%s decode_stats=(%s)",
-                request_id,
-                _policy_name(self.prefill_policy),
-                _policy_algorithm(self.prefill_policy),
-                prefill_scheduler_id,
-                _policy_stats(self.prefill_policy, prefill_scheduler_id),
-                _policy_name(self.decode_policy),
-                _policy_algorithm(self.decode_policy),
-                decode_scheduler_id,
-                _policy_stats(self.decode_policy, decode_scheduler_id),
-            )
-
+            except Exception:
+                return False
             # PD trace: Router selected a P/D pair for this request.
             prompt_len = request.prompt_len
             max_new_tokens = request.max_new_tokens
@@ -806,13 +1132,15 @@ class PDRequestRouter(RequestRouter):
                 decode_scheduler_id,
                 pending_tokens=0,
             )
-
             # Put request into processing queue
             self.pending_requests.append(pd_request)
 
         # Update router pending requests gauge
-        set_router_pending_requests(len(self.pending_pd_requests))
+        set_router_pending_requests(
+            len(self.pending_pd_requests) + len(self.waiting_for_pd_workers)
+        )
         logger.debug(f"[PD_STAGE][router.recv.end] req_id={request_id}")
+        return True
 
     def _discover_prometheus_collectors(self) -> None:
         launch_timeout = float(get_global_args().multi_inst.router.launch_timeout)
@@ -869,23 +1197,39 @@ class PDRequestRouter(RequestRouter):
                         ):
                             pd_request.status = PDRequestStatus.FAILED
                             self.total_requests += 1
-                            set_router_pending_requests(len(self.pending_pd_requests))
+                            set_router_pending_requests(
+                                len(self.pending_pd_requests)
+                                + len(self.waiting_for_pd_workers)
+                            )
                             continue
                         await self._process_pd_request(pd_request)
                     else:
                         raise ValueError(f"unexpected request type: {type(pd_request)}")
 
+                elif self.waiting_for_pd_workers:
+                    request = self.waiting_for_pd_workers.popleft()
+                    if self._reject_ttft_timeout(request, "ttft_pd_router_wait_worker"):
+                        self.total_requests += 1
+                    elif not await self._add_pd_request(request):
+                        self.waiting_for_pd_workers.appendleft(request)
+                        await asyncio.sleep(0.05)
+
                 await asyncio.sleep(0.01)  # 10ms polling interval
+            except asyncio.CancelledError:
+                logger.info("[PD_ROUTER][request_processor_cancelled]")
+                raise
             except Exception:
-                # A fault in the request-processing loop. The inner dispatch and
-                # routing paths isolate their own failures; reaching here masks a
-                # systemic bug. Crash via the unified protocol so the Router does
-                # not go half-alive (no dying flag, no in-flight termination).
                 logger.exception("Failed to process PD request")
                 report_and_exit("pd request processor task crashed")
 
     async def _process_pd_request(self, pd_request: PendingPDRequest):
         """Process PD disaggregation request"""
+
+        # when either prefill or decode scheduler is down, continue wait
+        if not self._pd_pair_is_alive(pd_request):
+            self._return_request_to_waiting_queue(pd_request)
+            return
+
         # Update status
         pd_request.status = PDRequestStatus.DISPATCHED
         pd_request.prefill_start_time = time.time()
@@ -906,6 +1250,12 @@ class PDRequestRouter(RequestRouter):
             "request_id": pd_request.request_id,
             "request": req.to_dict(),
             "type": "pd_request",
+            "prefill_generation": self.prefill_schedulers[
+                pd_request.prefill_scheduler_id
+            ]["generation"],
+            "decode_generation": self.decode_schedulers[pd_request.decode_scheduler_id][
+                "generation"
+            ],
         }
         is_evict = False
         if len(pd_request.original_request.generated_tokens) > 0:
@@ -939,22 +1289,31 @@ class PDRequestRouter(RequestRouter):
                     f"pd request dispatch failed: req_id={pd_request.request_id} "
                     f"err_type={type(e).__name__} err={e}"
                 )
-                # _send_with_retry already retried ~5s before raising; reaching
-                # here means a persistently unreachable peer. Fail this request
-                # with a service error instead of hot-retrying forever (which
-                # would monopolize the single processor task and starve others).
-                self.finish_request_before_recv_stop(
-                    pd_request.original_request, error="service temporarily unavailable"
-                )
-                pd_request.status = PDRequestStatus.FAILED
-                self.total_requests += 1
+                if pd_request.request_id not in self.pending_pd_requests:
+                    return
+                pd_request.status = PDRequestStatus.PENDING
+                self.pending_requests.appendleft(pd_request)
+                await asyncio.sleep(0.05)
                 return
         logger.debug(f"[PD_STAGE][router.dispatch.end] req_id={pd_request.request_id}")
 
-        logger.debug(f"pd disaggregation request dispatched: {pd_request.request_id}")
         # Update router performance counters on successful dispatch
         if not is_evict:
             self.total_requests += 1
+
+    def _pd_pair_is_alive(self, pd_request: PendingPDRequest) -> bool:
+        prefill_stats = self.prefill_policy.scheduler_stats.get(
+            pd_request.prefill_scheduler_id
+        )
+        decode_stats = self.decode_policy.scheduler_stats.get(
+            pd_request.decode_scheduler_id
+        )
+        return bool(
+            prefill_stats
+            and prefill_stats.is_alive
+            and decode_stats
+            and decode_stats.is_alive
+        )
 
     async def _send_to_prefill_scheduler(
         self, local_instance_id: int, request_data: dict
@@ -1019,9 +1378,11 @@ class PDRequestRouter(RequestRouter):
                 logger.exception(f"[PD_ROUTER] terminate_engine failed for {label}")
 
         for local_instance_id, socket in list(self.prefill_sockets.items()):
-            await _send_one(socket, "prefill", local_instance_id)
+            if self.prefill_schedulers[local_instance_id]["status"] == "online":
+                await _send_one(socket, "prefill", local_instance_id)
         for local_instance_id, socket in list(self.decode_sockets.items()):
-            await _send_one(socket, "decode", local_instance_id)
+            if self.decode_schedulers[local_instance_id]["status"] == "online":
+                await _send_one(socket, "decode", local_instance_id)
 
     async def broadcast_flush_cache(self, pd_stage: str = "all") -> dict:
         if hasattr(self.prefill_policy, "clear_prefix_cache"):
@@ -1208,6 +1569,7 @@ class PDRequestRouter(RequestRouter):
         pd_stats = {
             "pd_enabled": True,
             "pending_pd_requests": len(self.pending_pd_requests),
+            "waiting_for_pd_workers": len(self.waiting_for_pd_workers),
             "prefill_schedulers": len(self.prefill_schedulers),
             "decode_schedulers": len(self.decode_schedulers),
         }
@@ -1225,7 +1587,22 @@ class PDRequestRouter(RequestRouter):
 
     async def shutdown(self):
         """PD Router Shutdown"""
+        if self._pd_shutdown_started:
+            return
+        self._pd_shutdown_started = True
         logger.info("closing pd router...")
+
+        current_task = asyncio.current_task()
+        tasks = [
+            task
+            for task in self._pd_tasks
+            if task is not current_task and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._pd_tasks.clear()
 
         await self.pd_coordination_service.stop()
 
@@ -1235,9 +1612,32 @@ class PDRequestRouter(RequestRouter):
 
         # Close PD-specific sockets
         for socket in self.prefill_sockets.values():
-            socket.close()
+            socket.close(0)
+        self.prefill_sockets.clear()
         for socket in self.decode_sockets.values():
-            socket.close()
+            socket.close(0)
+        self.decode_sockets.clear()
 
         # Cancel background tasks and wait for them to drain
         await super().shutdown()
+
+    async def _shutdown_service_after_all_workers_down(self) -> None:
+        """Shut down the service after every PD worker has gone offline."""
+        await self.shutdown()
+
+        token_router = get_token_router(check_exist=False)
+        if token_router is not None:
+            await token_router.shutdown()
+
+        request_server_shutdown()
+
+    async def _shutdown_service_after_worker_failure(self) -> None:
+        """Stop the remaining workers after one PD worker becomes unavailable."""
+        await self.terminate_instances()
+        await self.shutdown()
+
+        token_router = get_token_router(check_exist=False)
+        if token_router is not None:
+            await token_router.shutdown()
+
+        request_server_shutdown()

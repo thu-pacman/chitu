@@ -18,6 +18,21 @@ _currently_capturing_graph_object = None
 _post_hook_per_graph_object: dict[torch.cuda.CUDAGraph, list[Callable[[], None]]] = {}
 
 
+def weak_ref_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a non-owning alias; its storage must be kept valid by its owner."""
+    if tensor.numel() == 0:
+        return tensor
+    if is_ascend():
+        from torch_npu._C import _weak_ref_tensor
+
+        return _weak_ref_tensor(tensor)
+    if tensor.device.type == "cuda":
+        import chitu_backend
+
+        return chitu_backend.weak_ref_tensor(tensor)
+    return tensor
+
+
 def is_warming_up_before_cuda_graph_capture():
     return _is_warming_up_before_cuda_graph_capture
 
@@ -41,7 +56,6 @@ def make_dispatched_graphed_callables(
     *,
     args_max_nelem: Sequence[int],
     kwargs_max_nelem: Mapping[str, int],
-    output_max_nelem_callback: Callable[[Any, torch.Tensor], int],
     before_capture_callback: Optional[Callable[[], None]] = None,
     before_replay_callback: Optional[Callable[[Any], None]] = None,
     enable: bool = True,
@@ -57,8 +71,6 @@ def make_dispatched_graphed_callables(
             in shared static tensors.
         kwargs_max_nelem: The maximum number of elements in the keyword arguments, used to hold inputs
             in shared static tensors.
-        output_max_nelem_callback: A `(key, sample_output) -> max_nelem` callback to return the maximum
-            number of elements in the output tensor, used to hold outputs in shared static tensors.
         before_replay_callback: An optional `(graph) -> None` callback function to be called before each
             graph replay. Note that this callback is not invoked before warming-up runs, or before graph
             capturing.
@@ -75,7 +87,6 @@ def make_dispatched_graphed_callables(
             make_dispatched_graphed_callables,
             args_max_nelem=args_max_nelem,
             kwargs_max_nelem=kwargs_max_nelem,
-            output_max_nelem_callback=output_max_nelem_callback,
             before_capture_callback=before_capture_callback,
             before_replay_callback=before_replay_callback,
             enable=enable,
@@ -89,11 +100,7 @@ def make_dispatched_graphed_callables(
 
         args_static_tensors: Optional[Sequence[StaticTensor]] = None
         kwargs_static_tensors: Optional[dict[str, StaticTensor]] = None
-        output_static_tensor: Optional[StaticTensor] = None
-
-        output_shape_dict = {}
-        output_dtype_dict = {}
-        output_device_dict = {}
+        output_dict: dict[Any, torch.Tensor] = {}
 
         def new_callable(key: Any, *args, **kwargs):
             global _is_warming_up_before_cuda_graph_capture
@@ -103,21 +110,15 @@ def make_dispatched_graphed_callables(
             nonlocal cuda_graph_pool
             nonlocal args_static_tensors
             nonlocal kwargs_static_tensors
-            nonlocal output_static_tensor
-            nonlocal output_shape_dict
-            nonlocal output_dtype_dict
-            nonlocal output_device_dict
 
-            if key not in graph_dict:
+            is_new_graph = key not in graph_dict
+            if is_new_graph:
                 # Warmup
                 logger.debug(f"Warming-up before capturing new graph with key {key}")
                 assert _is_warming_up_before_cuda_graph_capture is False
                 try:
                     _is_warming_up_before_cuda_graph_capture = True
                     sample_output = f(*args, **kwargs)
-                    output_shape_dict[key] = sample_output.shape
-                    output_dtype_dict[key] = sample_output.dtype
-                    output_device_dict[key] = sample_output.device
                 finally:
                     _is_warming_up_before_cuda_graph_capture = False
 
@@ -139,13 +140,6 @@ def make_dispatched_graphed_callables(
                 else:
                     for k in kwargs:
                         kwargs_static_tensors[k].set(kwargs[k])
-                if output_static_tensor is None:
-                    output_static_tensor = StaticTensor(
-                        sample_output,
-                        max_nelem=output_max_nelem_callback(key, sample_output),
-                    )
-                else:
-                    output_static_tensor.set(sample_output)
 
                 # before capture callback
                 # NOTE: For some attn_backends like FlashMLA, the actual intiailization of
@@ -180,7 +174,6 @@ def make_dispatched_graphed_callables(
                                         for k, static_tensor in kwargs_static_tensors.items()
                                     },
                                 )
-                                output_static_tensor.set(output)
                     else:
                         with torch.cuda.graph(graph_dict[key], pool=cuda_graph_pool):
                             output = f(
@@ -193,11 +186,11 @@ def make_dispatched_graphed_callables(
                                     for k, static_tensor in kwargs_static_tensors.items()
                                 },
                             )
-                            output_static_tensor.set(output)
                 finally:
                     _currently_capturing_graph_object = None
                     gc.enable()  # Always re-enable GC
                     gc.collect()  # Clean up anything that was delayed
+                output_dict[key] = weak_ref_tensor(output)
                 if cuda_graph_pool is None:
                     cuda_graph_pool = graph_dict[key].pool()
 
@@ -205,18 +198,10 @@ def make_dispatched_graphed_callables(
                 logger.debug(f"Replaying graph with key {key}")
                 assert args_static_tensors is not None
                 assert kwargs_static_tensors is not None
-                assert output_static_tensor is not None
                 for static_tensor, arg in zip(args_static_tensors, args):
                     static_tensor.set(arg)
                 for k in kwargs:
                     kwargs_static_tensors[k].set(kwargs[k])
-                output_static_tensor.set(
-                    torch.empty(
-                        output_shape_dict[key],
-                        dtype=output_dtype_dict[key],
-                        device=output_device_dict[key],
-                    )
-                )
                 if before_replay_callback is not None:
                     before_replay_callback(graph_dict[key])
                 graph_dict[key].replay()
@@ -224,7 +209,10 @@ def make_dispatched_graphed_callables(
             for hooks in _post_hook_per_graph_object.get(graph_dict[key], []):
                 hooks()
 
-            return output_static_tensor.get()
+            # Copy outside the graph so callers own their output even when a later
+            # replay overwrites the graph output (e.g. during a PP isend).
+            # The first call uses the warmup output; later calls use the graph output.
+            return sample_output if is_new_graph else output_dict[key].clone()
 
     else:  # not enable
 

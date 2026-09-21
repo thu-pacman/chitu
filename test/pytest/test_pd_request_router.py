@@ -116,7 +116,7 @@ def set_default_global_args():
     set_global_args(
         OmegaConf.create(
             {
-                "infer": {},
+                "infer": {"enable_prefix_caching": True},
                 "multi_inst": {
                     "n_insts": 3,
                     "inst_id": None,
@@ -405,6 +405,25 @@ def test_pd_router_prefix_prefill_decode_uses_decode_policy():
     assert router.decode_policy.algorithm == "round_robin"
 
 
+def test_pd_router_liveness_heartbeat_refreshes_online_worker():
+    cfg = _pd_router_config(routing_algorithm="round_robin")
+    router = PDRequestRouter(cfg, PDDisaggregationConfig())
+    stats = router.prefill_policy.scheduler_stats[0]
+    stats.last_heartbeat_time = 0.0
+    router.prefill_schedulers[0]["instance_uuid"] = "prefill-uuid"
+
+    router._record_liveness_heartbeat(
+        {
+            "pd_mode": "prefill_only",
+            "local_instance_id": 0,
+            "instance_uuid": "prefill-uuid",
+        }
+    )
+
+    assert stats.last_heartbeat_time > 0.0
+    assert stats.is_alive
+
+
 def test_pd_router_handle_instance_fail():
     cfg = _pd_router_config(routing_algorithm="round_robin")
     router = TestPDRequestRouter(cfg, PDDisaggregationConfig())
@@ -424,5 +443,5 @@ def test_pd_router_handle_instance_fail():
 
     asyncio.run(router.handle_dead_instance_decode(0))
     router._test_check_prefill_msg(0, "pd_decode_fail", ["test0"])
-    router._test_check_prefill_msg(1, "pd_decode_fail", ["test1"])
-    assert len(router._test_finished_reqs) == 2
+    router._test_check_prefill_msg(1, "pd_decode_fail", [])
+    assert router._test_finished_reqs == {"test0"}

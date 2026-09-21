@@ -51,6 +51,7 @@ class DecodeAllocated:
     rank_num: int
     session_id: str
     buffers: "TransferBuffers"
+    decode_generation: int = 0
     cache_manager_hit_block_counts: dict[str, int] = dataclasses.field(
         default_factory=dict
     )
@@ -84,6 +85,8 @@ class DecodePrepare:
     prefix_len: int
     new_cache_ids: dict[str, list[int]]
     dp_rank: int = 0
+    prefill_generation: int = 0
+    decode_generation: int = 0
     cache_manager_hit_block_counts: dict[str, int] = dataclasses.field(
         default_factory=dict
     )
@@ -102,6 +105,28 @@ class RankTransferDone:
     req_id: str
     first_token: int = 0
     rank_bytes: dict[str, int] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+@_register
+class RankTransferFailed:
+    """A Prefill rank could not transfer KV to one Decode generation."""
+
+    type: ClassVar[str] = "RankTransferFailed"
+    req_id: str
+    decode_sid: int
+    decode_generation: int
+    error_message: str
+
+
+@dataclasses.dataclass
+@_register
+class DecodePeerFailed:
+    """Broadcast a failed Decode generation to every Prefill rank."""
+
+    type: ClassVar[str] = "DecodePeerFailed"
+    decode_sid: int
+    decode_generation: int
 
 
 @dataclasses.dataclass
