@@ -21,6 +21,7 @@ from chitu.boot.multi_instance import (
     multi_instance_enabled,
     restart_instance_enabled,
 )
+from chitu.boot.tcp_ip import job_port_base
 
 logger = getLogger(__name__)
 
@@ -168,13 +169,15 @@ def srun(cfg, instance_cfgs, raw_argv, local_run_callback: LocalRunCallback):
         if node_rank < 0:
             node_rank = hostnames.index(socket.gethostname())
 
+        port_base = job_port_base(slurm_job_id)
+
         if restart_instance_enabled(cfg):
             instance_plan = build_restart_instance_launch_plan(
                 cfg,
                 instance_cfgs,
                 hostnames,
-                master_port=(slurm_job_id % 10000) + 52000,
-                rdvz_port=(slurm_job_id % 10000) + 53000,
+                master_port=port_base + 1,
+                rdvz_port=port_base + 2,
             )
             launch_restart_instance_on_node(
                 cfg,
@@ -197,14 +200,14 @@ def srun(cfg, instance_cfgs, raw_argv, local_run_callback: LocalRunCallback):
             )
         else:
             coordinator_host = hostnames[0]
-            coordinator_port = (slurm_job_id % 10000) + 54000
+            coordinator_port = port_base
 
         instance_plans = build_instance_launch_plans(
             cfg,
             instance_cfgs,
             hostnames,
-            master_port_base=(slurm_job_id % 10000) + 52000,
-            rdvz_port_base=(slurm_job_id % 10000) + 53000,
+            master_port_base=port_base + 1,
+            rdvz_port_base=port_base + 1 + int(cfg.multi_inst.n_insts),
         )
         launch_multi_instance_on_node(
             cfg,
@@ -222,8 +225,9 @@ def srun(cfg, instance_cfgs, raw_argv, local_run_callback: LocalRunCallback):
         node_list = os.environ.get("SLURM_JOB_NODELIST", "")
         hostnames = run_capture(["scontrol", "show", "hostnames", node_list])
         master_addr = hostnames.splitlines()[0] if hostnames.splitlines() else ""
-        master_port = (slurm_job_id % 10000) + 52000
-        rdvz_port = (slurm_job_id % 10000) + 53000
+        port_base = job_port_base(slurm_job_id)
+        master_port = port_base + 1
+        rdvz_port = port_base + 2
         is_master_node = socket.gethostname() == master_addr
     else:
         # NOTE: If running on single node, let torchrun pick a random port. It's still
