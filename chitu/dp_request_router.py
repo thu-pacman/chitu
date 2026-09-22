@@ -1073,7 +1073,7 @@ class RequestRouter:
                 sid
                 for sid, info in schedulers.items()
                 if sid in eligible_alive
-                and info.get("max_seq_len", 10240) > req_seq_len
+                and info.get("max_seq_len", 10240) >= req_seq_len
             ),
             key=lambda sid: schedulers[sid].get("max_seq_len", 10240),
         )
