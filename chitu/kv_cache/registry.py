@@ -184,6 +184,21 @@ def default_paged_block_size_policy(args) -> int:
     return 256
 
 
+def _kv_cache_fp8_dtype():
+    """Ascend 950 (aclnn-only) 的 index_put 等算子不支持 FP8（float8_e4m3fn），
+    会导致 kv cache 写入失败/超时。因此在 Ascend 950 上把 FP8 kv cache 降级为 FP16。
+    其他平台保持原 FP8 行为。"""
+    try:
+        from chitu.device_type import get_device_name
+
+        name = get_device_name()
+        if name.startswith("Ascend950") or "950" in name:
+            return torch.float16
+    except Exception:
+        pass
+    return torch.float8_e4m3fn
+
+
 def apply_kv_cache_quantization_rules(
     kvargs: KVArgs,
     *,
@@ -209,10 +224,10 @@ def apply_kv_cache_quantization_rules(
         return kvargs
 
     quant_type_to_dtype = {
-        "fp8_pertensor": torch.float8_e4m3fn,
+        "fp8_pertensor": _kv_cache_fp8_dtype(),
         "fp8_pertoken_dsa": None,
         "fp8_pertoken_indexer": None,
-        "fp8_e5m2": torch.float8_e5m2,
+        "fp8_e5m2": _kv_cache_fp8_dtype(),
     }
 
     dtype_dict: Dict[str, torch.dtype] = dict(kvargs.get("dtype_dict", {}))

@@ -15,6 +15,20 @@ from logging import getLogger
 logger = getLogger(__name__)
 
 
+def _is_ascend_950():
+    """Ascend 950 (aclnn-only) 上 copy_ 不支持 Fractal internal format，
+    因此 load_state_dict 时需保持 ND 布局。"""
+    try:
+        import torch_npu
+
+        from chitu.device_type import get_device_name
+
+        name = get_device_name()
+        return "950" in name or name.startswith("Ascend950")
+    except Exception:
+        return False
+
+
 class NativeLayoutMixin:
     """Mixin that provides :meth:`apply_native_layout` and
     :meth:`init_native_layout` for deferred native-layout conversion.
@@ -123,17 +137,21 @@ class NativeLayoutMixin:
         )
 
         # ---- eager conversion ----
-        try:
-            converted = template.convert(param.data)
-        except Exception:
-            if param.data.device.type == "meta":
-                logger.error(
-                    "convert failed for %s. Tip: %s must support meta " "tensor input.",
-                    type(self).__name__,
-                    layout_cls.__name__,
-                )
-            raise
-        param.data = converted.layout_tensor
+        # Ascend 950 (aclnn-only) 上 eager 转换会生成 Fractal internal format，
+        # 导致 load_state_dict 的 copy_ 失败（坑 7 同因）。950 上保持 ND，
+        # 由 get_native_layout_<name>() 在推理时惰性转换。
+        if not _is_ascend_950():
+            try:
+                converted = template.convert(param.data)
+            except Exception:
+                if param.data.device.type == "meta":
+                    logger.error(
+                        "convert failed for %s. Tip: %s must support meta " "tensor input.",
+                        type(self).__name__,
+                        layout_cls.__name__,
+                    )
+                raise
+            param.data = converted.layout_tensor
 
         # ---- update state_dict_shape/dtype after conversion ----
         if existing is None and not state_dict_convert:
@@ -258,6 +276,13 @@ def _install_state_dict_hooks(
                 return
 
             data = state_dict[key]
+
+            # Ascend 950 (aclnn-only) 的 copy_ 不支持 Fractal internal format，
+            # 因此 load_state_dict 时保持 ND 布局，避免 copy_ 失败。
+            # 推理时 get_native_layout_weight() 会实时转换为 Fractal。
+            if _is_ascend_950():
+                state_dict[key] = data
+                return
 
             # Walk to the first template in the chain
             current = template

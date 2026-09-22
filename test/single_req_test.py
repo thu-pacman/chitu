@@ -8,6 +8,12 @@ import logging
 from logging import getLogger
 from pathlib import Path
 
+# 在一切 torch 分布式操作前激活 torch_npu transfer（nccl→hccl, cuda→npu 映射）
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+from chitu.import_utils import try_import_and_setup_torch_npu
+
+torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+
 from chitu.task import UserRequest, TaskPool, Task
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
 from chitu.chitu_main import (

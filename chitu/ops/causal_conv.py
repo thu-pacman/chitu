@@ -7,10 +7,11 @@ import torch.nn.functional as F
 
 from chitu.device_type import has_accelerator
 from chitu.ops.utils import make_op_dispatcher
+from chitu.import_utils import use_triton_impl
 from chitu.utils import try_import_platform_dep
 
 triton, has_triton = try_import_platform_dep("triton")
-has_triton_impl = has_triton and has_accelerator()
+has_triton_impl = has_triton and has_accelerator() and use_triton_impl("causal_conv")
 
 if has_triton_impl:
     from chitu.ops.triton_ops import (
