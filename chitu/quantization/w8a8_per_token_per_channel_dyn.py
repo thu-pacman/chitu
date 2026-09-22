@@ -13,6 +13,7 @@ import torch
 from chitu.checkpoint_prefix import CheckpointPrefix
 from chitu.device_type import get_device_name, is_hygon
 from chitu.import_utils import (
+    is_ascend_950,
     try_import_platform_dep,
     try_import_opt_dep,
     try_import_and_setup_torch_npu,
@@ -374,7 +375,9 @@ class AscendW8A8PerTokenPerChannelDynLinear(
 
     def init_native_layout(self):
         super().init_native_layout()
-        self.apply_native_layout(self.weight, NpuFractalZnTensor)
+        # Ascend 950 上 Fractal 布局不可用，950 上保持 ND。
+        if not is_ascend_950():
+            self.apply_native_layout(self.weight, NpuFractalZnTensor)
 
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -676,8 +679,10 @@ class AscendW8A8PerTokenPerChannelDynMoeExperts(
 ):
     def init_native_layout(self):
         super().init_native_layout()
-        self.apply_native_layout(self.gate_up_proj_weight, NpuFractalZnTensor)
-        self.apply_native_layout(self.down_proj_weight, NpuFractalZnTensor)
+        # Ascend 950 上 Fractal 布局不可用，950 上保持 ND。
+        if not is_ascend_950():
+            self.apply_native_layout(self.gate_up_proj_weight, NpuFractalZnTensor)
+            self.apply_native_layout(self.down_proj_weight, NpuFractalZnTensor)
 
     @override
     @functools.singledispatchmethod

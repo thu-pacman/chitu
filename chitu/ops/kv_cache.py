@@ -332,6 +332,8 @@ def _auto_append_to_dense_kv_cache(
     delta_seq_ids: Optional[torch.Tensor] = None,
     use_i64_offsets: bool = False,
 ):
+    if has_torch_npu:
+        return "torch_npu"
     if has_triton_impl:
         return "triton"
     return "torch"

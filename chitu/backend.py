@@ -44,6 +44,7 @@ from chitu.kv_cache.registry import (
 from chitu.kv_cache import KVCacheManagerBase, PagedKVCache, KVCacheBase
 from chitu.custom_gguf import *
 from chitu.device_type import is_ascend, is_muxi
+from chitu.import_utils import is_ascend_950
 from chitu.distributed.parallel_state import (
     get_ep_group,
     get_dp_group,
@@ -364,6 +365,9 @@ class Backend:
         if not torch.distributed.is_initialized():
             if args.infer.op_impl == "cpu":
                 torch.distributed.init_process_group("gloo")
+            elif is_ascend_950():
+                # Ascend 950 (aclnn-only) 上 nccl 检查 libcuda 失败，改用 hccl
+                torch.distributed.init_process_group("hccl")
             else:
                 torch.distributed.init_process_group("nccl")
 

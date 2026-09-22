@@ -14,6 +14,7 @@ from chitu.utils import (
     create_tensor,
 )
 from chitu.device_type import has_accelerator, is_muxi, is_ascend
+from chitu.import_utils import is_ascend_950
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -269,7 +270,14 @@ def gumbel_max_sample(
     probs need not be normalized; argmax(probs / exponential_noise) is
     equivalent to multinomial sampling from the normalized distribution.
     """
-    noise = torch.empty_like(probs).exponential_()
+    # Ascend 950 的 exponential_ 算子（aclnnSimThreadExponential）不受支持，
+    # 改用 Gumbel 分布定义生成噪声：u ~ Uniform(0,1), g = -log(-log(u))。
+    # 两者数学等价，仅在 950 上使用，其他平台保持原 exponential_ 实现。
+    if is_ascend_950():
+        u = torch.rand_like(probs)
+        noise = -torch.log(-torch.log(u.clamp_min(1e-20)))
+    else:
+        noise = torch.empty_like(probs).exponential_()
     sample_idx = (probs / noise).argmax(dim=-1)
     return torch.gather(token_ids, index=sample_idx[:, None], dim=1).squeeze(1)
 

@@ -9,7 +9,7 @@ import torch
 from chitu.device_type import has_accelerator
 from chitu.utils import ceil_div
 from chitu.ops.utils import make_op_dispatcher
-from chitu.import_utils import (
+from chitu.utils import (
     try_import_platform_dep,
     try_import_opt_dep,
     try_import_and_setup_torch_npu,

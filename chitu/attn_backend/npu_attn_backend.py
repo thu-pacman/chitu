@@ -13,6 +13,7 @@ from chitu.attn_backend.ref_attn_backend import RefAttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
 from chitu.device_type import get_device_name
+from chitu.import_utils import is_ascend_950
 from chitu.global_vars import get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.ops import append_to_dense_kv_cache, append_to_paged_kv_cache
@@ -39,6 +40,14 @@ core_num_each_platform = {
     "Ascend910B3": 40,
     "Ascend910B4-1": 40,
     "Ascend910B4": 40,
+    # Ascend 950 系列（3510 架构，1 AIC 配 2 AIV）
+    "Ascend950PR_9579": 56,  # 28 AIC x 2 AIV
+    "Ascend950PR_9581": 56,
+    "Ascend950PR_9589": 64,  # 32 AIC x 2 AIV
+    "Ascend950PR_9599": 72,  # 36 AIC x 2 AIV
+    "Ascend950DT_9571": 56,
+    "Ascend950DT_9582": 64,
+    "Ascend950": 56,
 }
 
 
@@ -283,6 +292,15 @@ class NpuAttnBackend(RefAttnBackend):
             atten_mask_npu = self.casual_attn_mask.to(q.device)
         else:
             atten_mask_npu = self.noncasual_attn_mask.to(q.device)
+
+        # Ascend 950 (aclnn-only) 的 npu_fusion_attention 要求 mask 为 bool 或 uint8，
+        # 否则 tiling 失败导致 vector core 超时。强制转换为 bool。
+        # 仅在 950 上生效，其他平台保持原行为。
+        if is_ascend_950() and atten_mask_npu.dtype not in (
+            torch.bool,
+            torch.uint8,
+        ):
+            atten_mask_npu = atten_mask_npu.to(torch.bool)
 
         head_num = q.shape[1]
 
@@ -640,6 +658,15 @@ class NpuAttnBackend(RefAttnBackend):
                 self.batch_size, q.shape[0] // self.batch_size, *q.shape[1:]
             ).contiguous()
             lse = torch.empty(1, dtype=q.dtype, device="npu")
+            # Ascend 950 的 FusedInferAttentionScore 要求 output 与 q 同维（BSND 4 维），
+            # 否则 tiling 检查报 "dim num of query (4) != dim num of attentionOut (3)"。
+            # 仅在 950 上做 BSND reshape，其他平台保持原 3 维传参。
+            if is_ascend_950():
+                output = output.view(
+                    self.batch_size,
+                    q.shape[0] // self.batch_size,
+                    *output.shape[1:],
+                ).contiguous()
             torch_npu.npu_fused_infer_attention_score.out(
                 q,
                 kv_cache.k.contiguous(),
@@ -651,6 +678,8 @@ class NpuAttnBackend(RefAttnBackend):
                 num_key_value_heads=self.local_n_kv_heads,
                 out=[output, lse],
             )
+            if is_ascend_950():
+                output = output.view(q.shape[0] * q.shape[1], *output.shape[2:])
 
         return output
 

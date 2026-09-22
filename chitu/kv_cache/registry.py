@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 from chitu.device_type import is_hygon
+from chitu.import_utils import is_ascend_950
 from chitu.models.registry import ModelType
 from chitu.utils import try_import_opt_dep
 
@@ -215,6 +216,11 @@ def apply_kv_cache_quantization_rules(
         "fp8_e5m2": torch.float8_e5m2,
     }
 
+    # Ascend 950 (aclnn-only) 的 index_put 等算子不支持 FP8 kv cache，也不做
+    # 静默降级：用户应直接选用不带 FP8 kv-cache 的量化配置（默认即 BF16 kv），
+    # 而不是选了 FP8 配置后在这里被悄悄换成 FP16。因此在配置解析阶段显式报错。
+    fp8_kv_types_not_supported_on_950 = {"fp8_pertensor", "fp8_e5m2"}
+
     dtype_dict: Dict[str, torch.dtype] = dict(kvargs.get("dtype_dict", {}))
 
     matched_types = []
@@ -230,6 +236,13 @@ def apply_kv_cache_quantization_rules(
                 if rtype not in quant_type_to_dtype:
                     raise NotImplementedError(
                         f"Unsupported kv_cache quant type: {rtype}"
+                    )
+                if is_ascend_950() and rtype in fp8_kv_types_not_supported_on_950:
+                    raise NotImplementedError(
+                        f"kv_cache quant type {rtype!r} (for key {key!r}) is not "
+                        f"supported on Ascend 950. Please select a quantization "
+                        f"config with a non-FP8 kv-cache (the default BF16 kv-cache "
+                        f"is fine); FP8 kv-cache will not be silently downgraded."
                     )
                 dtype = quant_type_to_dtype[rtype]
                 if dtype is not None:

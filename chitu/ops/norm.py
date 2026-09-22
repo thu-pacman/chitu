@@ -114,10 +114,10 @@ def _auto_rms_norm(
         return "cuda"
     if has_tbsgemm and get_global_args().dtype == "float16" and eps == 1e-6:
         return "muxi_w8a8_kernels"
-    if has_triton_impl:
-        return "triton"
     if has_torch_npu:
         return "torch_npu"
+    if has_triton_impl:
+        return "triton"
     if hasattr(F, "rms_norm"):
         return "torch"
     return "ref"

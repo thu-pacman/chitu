@@ -33,6 +33,7 @@ from chitu.native_layout import (
     NpuFractalZnTensor,
 )
 from chitu.native_layout.npu import ACL_FORMAT_FRACTAL_NZ
+from chitu.import_utils import is_ascend_950
 from chitu.custom_gguf import GGMLQuantizationType, get_ggml_quant_type
 from chitu.moe.batched_expert_result import BatchedExpertResult
 from chitu.moe.batched_routed_activation import (
@@ -106,7 +107,10 @@ class NormalLinear(QuantizedLinearBase):
 class NormalLinearNpuFractalNz(NativeLayoutMixin, NormalLinear):
     def init_native_layout(self):
         super().init_native_layout()
-        self.apply_native_layout(self.weight, NpuFractalNzTensor)
+        # Ascend 950 上 Fractal 布局不可用（copy_ 不支持 internal format），
+        # 950 上保持 ND，不使用 Fractal 布局。
+        if not is_ascend_950():
+            self.apply_native_layout(self.weight, NpuFractalNzTensor)
 
     @override
     def forward(
@@ -119,7 +123,9 @@ class NormalLinearNpuFractalNz(NativeLayoutMixin, NormalLinear):
 class NormalLinearNpuFractalZn(NativeLayoutMixin, NormalLinear):
     def init_native_layout(self):
         super().init_native_layout()
-        self.apply_native_layout(self.weight, NpuFractalZnTensor)
+        # Ascend 950 上 Fractal 布局不可用，950 上保持 ND。
+        if not is_ascend_950():
+            self.apply_native_layout(self.weight, NpuFractalZnTensor)
 
     @override
     def forward(self, x: torch.Tensor) -> torch.Tensor:
