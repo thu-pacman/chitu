@@ -16,6 +16,7 @@ from chitu.native_layout import (
     Repeat1ToLength,
 )
 from chitu.lazy import eval_lazy
+from chitu.import_utils import is_ascend_950
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
@@ -120,6 +121,12 @@ class AscendW8A8Linear(NativeLayoutMixin, QuantizedLinearBase):
             self.aclnn_input_offset.copy_(off)
         else:
             self.register_buffer("aclnn_input_offset", off, persistent=True)
+        if is_ascend_950():
+            # 950 上权重保持 ND，首次前向时转成 Fractal ZN 并缓存，
+            # 避免每次 forward 重复转换。
+            self._fractal_weight = (
+                self.weight.native_layout.convert(self.weight.data).layout_tensor
+            )
         self._ready = True
 
     @torch.no_grad()
@@ -147,9 +154,19 @@ class AscendW8A8Linear(NativeLayoutMixin, QuantizedLinearBase):
             if ((get_tp_group().rank_in_group == 0 and self.is_rpl) or not self.is_rpl)
             else None
         )
+        # Ascend 950 上权重保持 ND（加载时跳过 Fractal 转换），
+        # 首次前向时已缓存 Fractal ZN 权重（_maybe_build_quant_params）。
+        if is_ascend_950():
+            weight = getattr(self, "_fractal_weight", None)
+            if weight is None:
+                weight = (
+                    self.weight.native_layout.convert(self.weight.data).layout_tensor
+                )
+        else:
+            weight = self.weight
         output = torch_npu.npu_quant_matmul(
             x,
-            self.weight,
+            weight,
             self.deq_scale,
             bias=quant_bias,
             output_dtype=torch.get_default_dtype(),

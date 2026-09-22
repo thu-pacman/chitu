@@ -9,7 +9,8 @@ import torch
 from chitu.device_type import has_accelerator
 from chitu.utils import ceil_div
 from chitu.ops.utils import make_op_dispatcher
-from chitu.import_utils import (
+from chitu.import_utils import use_triton_impl
+from chitu.utils import (
     try_import_platform_dep,
     try_import_opt_dep,
     try_import_and_setup_torch_npu,
@@ -18,7 +19,7 @@ from chitu.import_utils import (
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-has_triton_impl = has_triton and has_accelerator()
+has_triton_impl = has_triton and has_accelerator() and use_triton_impl("batched_routed_activation")
 muxi_layout_kernels, has_muxi_layout_kernels = try_import_opt_dep(
     "muxi_layout_kernels", "muxi_layout_kernels"
 )
