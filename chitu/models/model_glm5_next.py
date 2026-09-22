@@ -14,6 +14,7 @@ from torch import nn
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.checkpoint_prefix import as_checkpoint_prefix
+from chitu.cp_utils import get_cp_context
 from chitu.global_vars import get_global_args
 from chitu.kv_cache import DenseKVCacheAccessor, KVCacheBase, PagedKVCacheAccessor
 from chitu.models.model import (
@@ -101,6 +102,10 @@ class IndexerGLM5Next(IndexerGLM52):
         return True
 
     def _append_packed_states(self, packed_states, seq_len_delta, cache_accessor):
+        assert packed_states.shape[0] == seq_len_delta.delta_total_len, (
+            f"packed states ({packed_states.shape[0]}) must cover exactly the "
+            f"delta rows ({seq_len_delta.delta_total_len})"
+        )
         if isinstance(cache_accessor, PagedKVCacheAccessor):
             append_to_paged_kv_cache(
                 cache_accessor.kv["indexer_packed"],
@@ -141,59 +146,89 @@ class IndexerGLM5Next(IndexerGLM52):
             )
         raise TypeError(f"Unsupported indexer cache accessor {type(cache_accessor)!r}")
 
-    def _score_one_sequence(self, q_row, weight_row, packed_seq, pos_seq, q_pos):
-        visible = pos_seq <= q_pos
-        visible_count = int(visible.sum().item())
-        output_width = int(self.index_topk)
-        if self.index_kpool_always_select_tail:
-            output_width += self.index_kpool - 1
-        out = torch.full((output_width,), -1, dtype=torch.int32, device=q_row.device)
-        if visible_count <= 0:
-            return out
+    # Upper bound of the float32 elements used by the per-head pool scores of
+    # one query tile, i.e. `(rows, n_heads, num_pools)`. Only limits how many
+    # queries are scored at once, so prefilling a long sequence stays in memory.
+    _SCORE_BUDGET_ELEMS = 1 << 24
 
-        visible_packed = packed_seq[visible]
-        visible_pos = pos_seq[visible]
-        full_pool_count = visible_count // self.index_kpool
-        write = 0
-        if full_pool_count > 0:
-            pooled = visible_packed[: full_pool_count * self.index_kpool].view(
-                full_pool_count, self.index_kpool, -1
+    def _pool_sequence_states(self, packed_seq):
+        """Compress the packed states of one sequence into complete k-pools.
+
+        Pool `p` holds the tokens `[p * index_kpool, (p + 1) * index_kpool)` of
+        the sequence. A pool does not depend on the query, so all the queries
+        of a sequence share the same pools.
+        """
+        num_pools = packed_seq.shape[0] // self.index_kpool
+        if num_pools == 0:
+            return packed_seq.new_zeros((0, self.head_dim))
+        pooled = packed_seq[: num_pools * self.index_kpool].view(
+            num_pools, self.index_kpool, -1
+        )
+        keys = pooled[..., : self.head_dim]
+        gates = pooled[..., self.head_dim : self.head_dim * 2]
+        logits = gates.float() + self.index_kpool_compress_ape.float().unsqueeze(0)
+        probs = logits.softmax(dim=1).to(keys.dtype)
+        return (probs * keys).sum(dim=1)
+
+    def _score_pools_topk(self, q, weights, query_pos, pool_keys, out):
+        """Select the k-pools of the queries of one sequence, filling `out`.
+
+        `q`, `weights`, `query_pos` and `out` are the rows of that sequence
+        only, so that `out` is written in place. The layout matches the
+        per-query implementation: the tokens of the selected complete pools
+        come first, then the incomplete tail, then `-1`.
+        """
+        num_pools = pool_keys.shape[0]
+        select_k = min(int(self.index_topk) // self.index_kpool, num_pools)
+        num_selected = select_k * self.index_kpool
+        # A pool is visible to a query only if the query is not before the last
+        # token of that pool.
+        pool_counts = torch.clamp((query_pos + 1) // self.index_kpool, max=num_pools)
+        if select_k > 0:
+            tile = max(
+                1, self._SCORE_BUDGET_ELEMS // (self.n_heads * max(num_pools, 1))
             )
-            keys = pooled[..., : self.head_dim]
-            gates = pooled[..., self.head_dim : self.head_dim * 2]
-            logits = gates.float() + self.index_kpool_compress_ape.float().unsqueeze(0)
-            probs = logits.softmax(dim=1).to(keys.dtype)
-            pool_keys = (probs * keys).sum(dim=1)
-            scores = torch.matmul(q_row.float(), pool_keys.float().T)
-            scores = F.relu(scores * self.softmax_scale)
-            scores = torch.matmul(weight_row.float().unsqueeze(0), scores).squeeze(0)
-            select_k = min(int(self.index_topk) // self.index_kpool, scores.numel())
-            if select_k > 0:
+            pool_ids = torch.arange(num_pools, device=q.device)
+            pool_shifts = torch.arange(self.index_kpool, device=q.device)
+            for start in range(0, q.shape[0], tile):
+                stop = min(start + tile, q.shape[0])
+                visible = pool_counts[start:stop].unsqueeze(1)
+                scores = torch.matmul(q[start:stop].float(), pool_keys.float().T)
+                scores = F.relu(scores * self.softmax_scale)
+                scores = torch.matmul(
+                    weights[start:stop].float().unsqueeze(-2), scores
+                ).squeeze(-2)
+                scores = scores.masked_fill(
+                    pool_ids.unsqueeze(0) >= visible, float("-inf")
+                )
                 selected = scores.topk(select_k, dim=-1).indices
-                pool_pos = visible_pos[: full_pool_count * self.index_kpool].view(
-                    full_pool_count, self.index_kpool
-                )
-                selected_pos = pool_pos[selected].flatten().to(torch.int32)
-                count = min(selected_pos.numel(), out.numel())
-                out[:count] = selected_pos[:count]
-                write = count
+                # Pool `p` covers the tokens `[p * kpool, (p + 1) * kpool)`,
+                # selected pools out of the causal range are dropped.
+                selected_pos = selected.unsqueeze(-1) * self.index_kpool + pool_shifts
+                selected_pos = selected_pos.masked_fill(
+                    (selected >= visible).unsqueeze(-1), -1
+                ).flatten(-2)
+                out[start:stop, :num_selected] = selected_pos.to(torch.int32)
 
-        if self.index_kpool_always_select_tail and write < out.numel():
-            tail_count = visible_count % self.index_kpool
-            if tail_count > 0:
-                tail = visible_pos[visible_count - tail_count : visible_count].to(
-                    torch.int32
-                )
-                count = min(tail.numel(), out.numel() - write)
-                out[write : write + count] = tail[:count]
+        if self.index_kpool_always_select_tail and self.index_kpool > 1:
+            tail_offsets = torch.arange(self.index_kpool - 1, device=q.device)
+            pool_widths = pool_counts * self.index_kpool
+            # The incomplete tail of a query is written right after the pools
+            # it selected, and holds the last tokens of its visible prefix.
+            selected_widths = torch.clamp(pool_counts, max=select_k) * self.index_kpool
+            tail_slots = selected_widths.unsqueeze(1) + tail_offsets.unsqueeze(0)
+            tail_pos = pool_widths.unsqueeze(1) + tail_offsets.unsqueeze(0)
+            tail = torch.where(
+                tail_offsets.unsqueeze(0) < (query_pos + 1 - pool_widths).unsqueeze(1),
+                tail_pos,
+                -1,
+            )
+            out.scatter_(1, tail_slots, tail.to(torch.int32))
         return out
 
     def _build_kpool_topk(self, x, q, packed_states, seq_len_delta):
         q = q.view(q.shape[0], self.n_heads, self.head_dim)
         weights = self.weights_proj(x) * (self.n_heads**-0.5)
-        full_seq_ids = seq_len_delta.new.seq_ids_tensor_device
-        full_pos = seq_len_delta.new.position_ids_tensor_device
-        query_seq_ids = seq_len_delta.delta_seq_ids_tensor_device
         query_pos = seq_len_delta.delta_position_ids_tensor_device
         output_width = int(self.index_topk) + (
             self.index_kpool - 1 if self.index_kpool_always_select_tail else 0
@@ -209,17 +244,32 @@ class IndexerGLM5Next(IndexerGLM52):
                 return torch.where(tail >= 0, tail, torch.full_like(tail, -1)).to(
                     torch.int32
                 )
-        out = torch.empty(
-            (q.shape[0], output_width), dtype=torch.int32, device=x.device
+        new_lens = seq_len_delta.new.lens_list
+        delta_lens = seq_len_delta.delta_lens_list
+        # The packed states are read in the order of the sequences and of the
+        # positions inside each sequence, so the states of a sequence are a
+        # contiguous slice instead of a per-query mask over the whole context.
+        assert len(new_lens) == len(delta_lens)
+        assert sum(new_lens) == packed_states.shape[0]
+        assert sum(delta_lens) == q.shape[0]
+        out = torch.full(
+            (q.shape[0], output_width), -1, dtype=torch.int32, device=x.device
         )
-        for row in range(q.shape[0]):
-            mask = full_seq_ids == query_seq_ids[row]
-            out[row] = self._score_one_sequence(
-                q[row],
-                weights[row],
-                packed_states[mask],
-                full_pos[mask],
-                query_pos[row],
+        row_start = 0
+        kv_start = 0
+        for num_tokens, num_queries in zip(new_lens, delta_lens):
+            rows = slice(row_start, row_start + num_queries)
+            packed_seq = packed_states[kv_start : kv_start + num_tokens]
+            row_start += num_queries
+            kv_start += num_tokens
+            if num_queries == 0:
+                continue
+            self._score_pools_topk(
+                q[rows],
+                weights[rows],
+                query_pos[rows],
+                self._pool_sequence_states(packed_seq),
+                out[rows],
             )
         return out
 
@@ -236,18 +286,48 @@ class IndexerGLM5Next(IndexerGLM52):
         freqs_cis_k: Optional[BatchedFreqsCis] = None,
         k_pre_normed: bool = False,
     ) -> torch.Tensor:
-        if freqs_cis_k is not None:
-            raise NotImplementedError("GLM5Next k-pool indexer does not support CP yet")
         mode = self._indexer_buffer_mode
         buffer = self._indexer_buffer
         if mode == "read":
             assert buffer is not None and buffer.topk is not None
             return buffer.topk
+
+        # CP (pcp) prefill hands us the all-gathered global indexer K and the
+        # CP-local q-axis view, while `x` — and therefore the compress gate —
+        # stays local. The gate is all-gathered as well, so that every rank
+        # appends the identical global packs on the global token axis. This is
+        # the same "every rank writes the whole context" scheme the MLA path
+        # uses for its KV cache; it keeps reads local to the rank and needs no
+        # cross-rank ordering assumption.
+        cp_active = freqs_cis_k is not None
+
+        if cp_active:
+            cp_ctx = get_cp_context()
+            assert cp_ctx.step_active and cp_ctx.pcp_size > 1, (
+                "GLM5Next indexer received global K (CP path) without an "
+                "active CP prefill step"
+            )
+            assert (
+                not seq_len_delta.is_decode_stage
+            ), "GLM5Next indexer only supports CP during prefill"
+            gate_scores = cp_ctx.allgather_hidden_states(
+                self.index_kpool_compress_gate(x), None, None
+            )
+            assert gate_scores.shape[0] == k.shape[0], (
+                f"global compress gate rows ({gate_scores.shape[0]}) must match "
+                f"global indexer K rows ({k.shape[0]})"
+            )
+            # The packs cover the global token axis, so they are appended with
+            # the unsliced delta rather than the CP-local query view.
+            append_delta = seq_len_delta.base_delta
+        else:
+            gate_scores = self.index_kpool_compress_gate(x)
+            append_delta = seq_len_delta
+
         k = k if k_pre_normed else self.k_norm(k)
-        gate_scores = self.index_kpool_compress_gate(x)
-        valid = torch.ones((x.shape[0], 1), dtype=k.dtype, device=x.device)
+        valid = torch.ones((k.shape[0], 1), dtype=k.dtype, device=k.device)
         self._append_packed_states(
-            torch.cat([k, gate_scores, valid], dim=-1), seq_len_delta, cache_accessor
+            torch.cat([k, gate_scores, valid], dim=-1), append_delta, cache_accessor
         )
         out = self._build_kpool_topk(
             x,
@@ -329,7 +409,9 @@ class Glm5NextForgetGate(nn.Module):
         if f_a is None:
             f_a = self.f_a_proj(x)
         g = self.f_b_proj(f_a).float() + self.dt_bias.float().view(1, -1)
-        g = g.view(x.shape[0], -1, self.head_dim)
+        # `x` may hold fewer rows than `f_a` under CP, where the gate is also
+        # computed from all-gathered projections.
+        g = g.view(g.shape[0], -1, self.head_dim)
         decay_rate = torch.exp(self.A_log.float()).view(1, -1, 1)
         if self.safe_gate_lower_bound is not None:
             return self.safe_gate_lower_bound * torch.sigmoid(decay_rate * g.float())
@@ -446,6 +528,8 @@ class Glm5NextLinearAttention(nn.Module):
 
     def forward(self, x: torch.Tensor):
         seq_len_delta = self.cache.seq_len_delta
+        cp_ctx = get_cp_context()
+        cp_active = cp_ctx.step_active and not seq_len_delta.is_decode_stage
         is_mtp_decode_stage = (
             self.cache.is_mtp_decode_stage if self.mtp_size > 1 else False
         )
@@ -476,8 +560,26 @@ class Glm5NextLinearAttention(nn.Module):
         else:
             qkv = torch.cat([self.q_proj(x), self.k_proj(x), self.v_proj(x)], dim=-1)
             beta_raw = self.b_proj(x)
-            f_a = None
+            f_a = self.forget_gate.f_a_proj(x)
             g_a = self.g_a_proj(x)
+        if cp_active:
+            # Both the causal conv and the gated-delta recurrence couple tokens
+            # along the sequence, but a CP rank only holds every pcp-th token.
+            # All-gather the projected states and run them over the full global
+            # sequence on every rank (the same "whole context on every rank"
+            # scheme as the MLA path), then slice the per-token result back to
+            # this rank's rows below.
+            n_local = x.shape[0]
+            total_tokens = seq_len_delta.delta_total_len
+
+            qkv, beta_raw, f_a, g_a = torch.split(
+                cp_ctx.allgather_hidden_states(
+                    torch.cat([qkv, beta_raw, f_a, g_a], dim=-1), None, None
+                ),
+                [qkv.shape[-1], beta_raw.shape[-1], f_a.shape[-1], g_a.shape[-1]],
+                dim=-1,
+            )
+
         if seq_len_delta.is_classic_decoding:
             qkv, conv_state = causal_conv1d_update(
                 qkv, conv_state, self.conv1d.weight, impl=self.conv_impl
@@ -573,6 +675,19 @@ class Glm5NextLinearAttention(nn.Module):
                 last_state = last_state.unsqueeze(1).expand(
                     -1, self.mtp_size, *([-1] * (last_state.dim() - 1))
                 )
+        if cp_active:
+            # The recurrence above ran on the all-gathered global sequence, so
+            # `out` and the gate source cover every token; keep only this
+            # rank's interleaved rows. `out` still carries the leading batch dim
+            # of `chunk_kimi_delta_attention`, while `g_a` is [rows, head_dim].
+            # The conv/recurrent states written below are global on every rank,
+            # which is what the next step (or the non-CP decode) reads.
+            assert (
+                out.dim() == 4 and out.shape[0] == 1
+            ), f"unexpected linear attention output shape {tuple(out.shape)}"
+            local_rows, _ = cp_ctx.local_flat_indices(n_local, total_tokens, out.device)
+            out = out.index_select(1, local_rows)
+            g_a = g_a.index_select(0, local_rows)
         update_singleton_paged_kv_cache(
             cache_accessor.kv["conv_state"],
             cache_accessor.block_table,
@@ -839,6 +954,13 @@ class TransformerGLM5Next(TransformerDeepSeekV3):
         tokens, _, freqs_cis = self.cp_context.split_prefill(
             tokens=tokens, hiddens=None, freqs_cis=freqs_cis, total_tokens=delta_total
         )
+
+        if self.cp_context.step_active:
+            self.cp_context.prepare_local_lengths(
+                self.cache_dict["main"].seq_len_delta,
+                int(tokens.shape[0]),
+                is_decode_stage=False,
+            )
 
         if self.moe_impl is not None:
             self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))

@@ -1949,7 +1949,8 @@ class TransformerDeepSeekV3(Transformer):
         if self.cp_context.is_active:
             for layer in self.layers:
                 attn = getattr(layer, "self_attn", None)
-                if attn is not None and attn.index_topk is not None:
+                # Linear-attention layers (GLM-5.3-Flash) have no indexer at all.
+                if attn is not None and getattr(attn, "index_topk", None) is not None:
                     attn._freqs_cis_real = self.freqs_cis_real
                     attn._freqs_cis_imag = self.freqs_cis_imag
 

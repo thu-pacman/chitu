@@ -11,7 +11,7 @@ from typing import Callable
 import numpy as np
 import torch
 
-from chitu.utils import DaemonThreadPoolExecutor
+from chitu.utils import DaemonThreadPoolExecutor, ceil_div
 from chitu.backend import Backend
 from chitu.global_vars import get_global_args
 from chitu.kv_cache.kv_cache import PagedKVCache
@@ -110,8 +110,8 @@ class KVManagerPrefill(KVManagerBase):
     def get_send_buffers(self, req_id: str) -> TransferBuffers:
         """Collect block IDs for all caches on the send (prefill) side.
 
-        Truncates decode-side hit blocks from the front. The remaining block IDs
-        line up with the recv buffers sent by decode.
+        Excludes MTP lookahead blocks beyond the cached prefix, then truncates
+        decode-side hit blocks from the front so the IDs line up with recv buffers.
         """
         info = self._info(req_id)
         send_buffers = TransferBuffers()
@@ -121,6 +121,10 @@ class KVManagerPrefill(KVManagerBase):
             block_indices = cache.block_table.get(req_id, [])
             if not block_indices:
                 continue
+            # Allocation can include MTP lookahead pages that contain no prefix
+            # KV. Match decode's prefix-length bound before skipping hit blocks.
+            need = ceil_div(cache.tid_to_cached_len[req_id], cache.block_size)
+            block_indices = block_indices[:need]
             skip = 0
             if info is not None:
                 skip = min(
