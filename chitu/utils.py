@@ -31,7 +31,6 @@ from chitu.import_utils import (
     try_import_and_setup_torch_npu,
     try_import_platform_dep,
     try_import_opt_dep,
-    use_triton_impl,
 )
 from chitu.device_type import is_ascend
 from chitu.serve.request_id import gen_req_id

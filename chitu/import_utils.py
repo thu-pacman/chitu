@@ -144,8 +144,12 @@ def try_import_and_setup_torch_npu():
 
 
 def is_ascend_950():
-    """Ascend 950 (3510 架构, aclnn-only) 上 triton kernel 的 tiling 与硬件不匹配：
-    rms_norm 数值错误、kv_cache 慢 75 倍等。这里统一判断平台，供各算子选择实现。"""
+    """Return whether we are running on Ascend 950 (3510 architecture, aclnn-only).
+
+    Several upstream mechanisms are unusable on this platform (triton kernels
+    produce wrong/slow results, Fractal internal format is unavailable, FP8
+    kv-cache is unsupported), so call sites use this predicate to choose a
+    supported path. Other Ascend/NVIDIA platforms are unaffected."""
     try:
         from chitu.device_type import get_device_name
 
@@ -155,17 +159,3 @@ def is_ascend_950():
         return False
 
 
-def use_triton_impl(op_name: str = ""):
-    """在 Ascend 950 上默认禁用 triton 实现；可通过 CHITU_TRITON_OPS 环境变量（逗号分隔的算子名）逐算子放开。
-
-    算子名约定：norm / rotary / moe_sum / kv_cache / causal_conv / sampling / activation /
-    batched_routed_activation。非 950 平台恒返回 True，保持原有行为。
-    """
-    if not is_ascend_950():
-        return True
-    enabled = {
-        name.strip()
-        for name in os.environ.get("CHITU_TRITON_OPS", "").split(",")
-        if name.strip()
-    }
-    return op_name in enabled

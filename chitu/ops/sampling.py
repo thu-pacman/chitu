@@ -10,7 +10,6 @@ import xgrammar
 from chitu.ops.utils import make_op_dispatcher
 from chitu.utils import (
     try_import_platform_dep,
-    use_triton_impl,
     try_import_and_setup_torch_npu,
     create_tensor,
 )
@@ -20,7 +19,7 @@ from chitu.import_utils import is_ascend_950
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-has_triton_impl = has_triton and has_accelerator() and use_triton_impl("sampling")
+has_triton_impl = has_triton and has_accelerator()
 
 if has_triton_impl:
     from chitu.ops.triton_ops import apply_frequency_penalty_triton

@@ -39,6 +39,7 @@ from chitu.models.model import (
 )
 from chitu.models.registry import ModelType, register_model
 from chitu.device_type import is_ascend, is_hygon
+from chitu.import_utils import is_ascend_950
 from chitu.native_layout import NativeLayoutTensor
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.ops import (
@@ -600,6 +601,7 @@ class AttentionDeepSeekV3(Attention):
         # - chitu/ops/mla_prologue.py
         self.can_use_mla_prologue_torch_npu = (
             has_torch_npu
+            and not is_ascend_950()
             and (
                 quant is None
                 or self.mla_prologue_int8_partial
