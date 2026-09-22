@@ -85,6 +85,29 @@ def _hygon_backend_w8a8_per_token_per_channel_dyn_use_deepgemm_moe(
     return ep_size > 1
 
 
+def _use_deepgemm_legacy_marlin_layout(_: dict[str, Any]) -> bool:
+    """Whether the DeepGEMM grouped weights should be stored in the legacy
+    Marlin layout: prefill-only roles without skip_preprocess checkpoints.
+
+    Platform, backend and ep_size conditions are checked by the caller (see
+    the registration of
+    HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMergedPrefillEP); decode
+    and mixed (``prefill_and_decode``) instances also run the masked path and
+    keep the default Marlin2 storage.
+    """
+    try:
+        args = get_global_args()
+        if args.skip_preprocess:
+            # skip_preprocess checkpoints are stored in the *default* final
+            # layout (Marlin2); chaining another layout would silently
+            # misinterpret them.
+            return False
+        role = getattr(args.multi_inst, "role", "prefill_and_decode")
+    except Exception:
+        return False
+    return role == "prefill"
+
+
 def _prepare_w8a8_per_token_per_channel_dyn_per_expert_activation(
     routed_x: PerExpertDenseBatchedRoutedActivationWithScaleMinimal,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1589,6 +1612,48 @@ class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged(
         if output_m != M:
             down_out = down_out[:, :output_m, :].contiguous()
         return PerExpertDenseBatchedExpertResultMinimal(down_out)
+
+
+@QuantizationRegistry.register_moe_experts(
+    W8A8_PER_TOKEN_PER_CHANNEL_DYN,
+    merge_gate_up=True,
+    when=lambda kwargs: (
+        is_hygon()
+        and _hygon_backend_w8a8_per_token_per_channel_dyn_use_deepgemm_moe(kwargs)
+        and _use_deepgemm_legacy_marlin_layout(kwargs)
+    ),
+    priority=14,
+)
+class HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMergedPrefillEP(
+    HygonDeepGemmW8A8PerTokenPerChannelDynMoeExpertsMerged
+):
+    """DeepGEMM MoE experts for prefill-only EP roles.
+
+    The contiguous prefill path consumes the legacy Marlin layout while the
+    masked path consumes Marlin2. Storing the grouped weights natively in the
+    legacy layout spares the hot path a full-weight repack (hundreds of MB per
+    weight) on every MoE layer call. Selected only for hygon platforms with
+    ep_size > 1 and the ``prefill`` role; decode and mixed instances keep the
+    Marlin2 base class.
+    """
+
+    def init_native_layout(self):
+        super().init_native_layout()
+        self.apply_native_layout(
+            self.gate_up_proj_weight, HygonDeepGemmW8A8LegacyMarlinWeight
+        )
+        self.apply_native_layout(
+            self.down_proj_weight, HygonDeepGemmW8A8LegacyMarlinWeight
+        )
+
+    @override
+    def _forward_deepgemm_masked_per_expert_dense(
+        self, routed_x: PerExpertDenseBatchedRoutedActivationMinimal
+    ) -> PerExpertDenseBatchedExpertResultMinimal:
+        raise RuntimeError(
+            "DeepGEMM masked MoE requires the Marlin2 weight layout, but this "
+            "instance stores the legacy Marlin layout (prefill-only role)."
+        )
 
 
 # Implementations whose W8A8 kernels consume fp32 scales: the Hygon linear
