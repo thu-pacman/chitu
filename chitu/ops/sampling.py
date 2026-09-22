@@ -263,13 +263,19 @@ def filter_logits_top_k_top_p(
 def gumbel_max_sample(
     probs: torch.Tensor,
     token_ids: torch.Tensor,
+    generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     """Sample one token per row via Gumbel-max trick.
 
     probs need not be normalized; argmax(probs / exponential_noise) is
     equivalent to multinomial sampling from the normalized distribution.
+
+    `generator` selects the RNG to draw the noise from. The single-graph MTP
+    draft passes the generator registered on its captured graph
+    (`torch.cuda.CUDAGraph.register_generator_state`), so the draw happens
+    inside the graph and every replay advances it normally.
     """
-    noise = torch.empty_like(probs).exponential_()
+    noise = torch.empty_like(probs).exponential_(generator=generator)
     sample_idx = (probs / noise).argmax(dim=-1)
     return torch.gather(token_ids, index=sample_idx[:, None], dim=1).squeeze(1)
 

@@ -18,6 +18,8 @@ logger = getLogger(__name__)
 class DSAIndexer:
     """Keep DSAIndexer(impl) compatible while constructing a concrete backend."""
 
+    impl: str  # set by the concrete backend classes
+
     def __new__(cls, impl="auto"):
         if cls is DSAIndexer:
             from . import get_indexer_class
@@ -75,6 +77,26 @@ class DSAIndexer:
 
     def prepare_metadata_for_prefill(self, seq_len_delta):
         pass
+
+    def supports_gpu_input(self) -> bool:
+        """Whether a decode step's indexer state can be derived on the GPU.
+
+        The single-graph MTP draft re-runs `prepare_metadata_for_decode` inside
+        a captured region, so a captured draft step may only depend on the
+        device tensors (`lens_tensor_device`, the block table). Only the BF16
+        backends qualify today: they keep the no-op
+        `prepare_metadata_for_decode` above, and both their score and their
+        top-k read device tensors.
+
+        The others keep the per-step draft, because they still carry host-side
+        state that has to be rebuilt between steps: `deepgemm` and `hygon`
+        route a paged-MQA schedule through
+        `deep_gemm.get_paged_mqa_logits_metadata`, and the FP8 top-k paths mix
+        in `NvidiaTopKMixin`, whose plan is computed from the host-side
+        `lens_list` under an explicit "must be prepared outside capture"
+        assertion. Re-enabling any of them needs its own verification.
+        """
+        return self.impl in ("torch_bf16", "triton_bf16")
 
     def append_indexer_kv(self, *args, **kwargs):
         raise NotImplementedError

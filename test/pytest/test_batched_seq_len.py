@@ -105,3 +105,57 @@ class TestBatchedSeqLenDelta:
         sld.copy_from_list([100, 200], [101, 201])
         assert sld.is_classic_decoding is True
         assert sld.is_first_prefill_chunk is False
+
+
+class TestBatchedSeqLenDeviceAdvance:
+    """advance_classic_by_one 只推进 device 侧，host 镜像 stale 时拒绝读取。"""
+
+    @staticmethod
+    def _classic_delta(device):
+        return BatchedSeqLenDelta(
+            [100, 200],
+            [101, 201],
+            device=device,
+            max_batch_size=2,
+            use_position_ids_static_tensor=False,
+            use_delta_position_ids_static_tensor=False,
+        )
+
+    def test_device_advance_poisons_the_host_mirror(self, device):
+        sld = self._classic_delta(device)
+        assert sld.is_classic_decoding is True
+
+        sld.advance_classic_by_one()
+        sld.advance_classic_by_one()
+
+        assert sld.old.lens_tensor_device.tolist() == [102, 202]
+        assert sld.new.lens_tensor_device.tolist() == [103, 203]
+        assert sld.batch_size == 2
+        assert sld.delta_lens_tensor_device.tolist() == [1, 1]
+        assert sld.delta_position_ids_tensor_device.tolist() == [102, 202]
+        assert sld.delta_seq_ids_tensor_device.tolist() == [0, 1]
+        assert sld.delta_max_len == 1
+        assert sld.delta_total_len == 2
+        assert sld.new.prefix_lens_tensor_device.tolist() == [0, 103, 306]
+
+        for read_stale in (
+            lambda: sld.old.lens_list,
+            lambda: sld.new.lens_list,
+            lambda: sld.new.lens_tensor_cpu,
+            lambda: sld.new.prefix_lens_list,
+            lambda: sld.new.total_len,
+            lambda: sld.new.max_len,
+        ):
+            with pytest.raises(RuntimeError, match="stale"):
+                read_stale()
+
+    def test_copy_from_list_restores_the_host_mirror(self, device):
+        sld = self._classic_delta(device)
+        sld.advance_classic_by_one()
+        with pytest.raises(RuntimeError, match="stale"):
+            _ = sld.new.lens_list
+
+        sld.copy_from_list([50, 60], [51, 61])
+        assert sld.old.lens_list == [50, 60]
+        assert sld.new.total_len == 112
+        assert sld.new.max_len == 61

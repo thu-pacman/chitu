@@ -307,6 +307,16 @@ class FlashMLABackend(TritonAttnBackend):
         # The E5M2 dense kernel only supports classic single-token decode.
         return not self.use_e5m2_cache
 
+    @override
+    def supports_gpu_input(self) -> bool:
+        # Non-hygon/muxi FlashMLA prepares decode metadata via a
+        # lazily-initialized singleton scheduler buffer that does NOT encode
+        # per-step sequence lengths (the scheduling is (re)computed by the
+        # kernel itself from the device-side lengths), so its
+        # prepare_metadata_for_decode() is capture-safe to call once per MTP
+        # draft step inside one graph.
+        return not (is_hygon() or is_muxi()) and not self.use_e5m2_cache
+
     def convert_indices_ragged_torch(
         self,
         topk_indices,

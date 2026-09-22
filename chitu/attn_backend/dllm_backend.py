@@ -37,6 +37,16 @@ class DLLMAttnBackend(FlashAttnBackend):
         self._max_batch_size = 0
         self._use_cuda_graph = False
 
+    @override
+    def supports_gpu_input(self) -> bool:
+        # dLLM decoding is block-wise and bidirectional rather than classic
+        # one-token-per-step decode; its per-block metadata is written from the
+        # host (see `prepare_decode`/`init_static_tensors_for_decode`), so it
+        # can never be re-derived from device tensors inside a captured step.
+        # Opt out explicitly even though the parent (`FlashAttnBackend`) opts
+        # in.
+        return False
+
     def prepare_prefill(
         self,
         cache_dict: dict[str, "PagedKVCache"],

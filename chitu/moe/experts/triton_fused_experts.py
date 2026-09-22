@@ -26,7 +26,6 @@ from chitu.ops.activation import silu_and_mul
 from chitu.ops.quant import blockfp8_act_quant, a8_per_token_act_quant
 from chitu.device_type import has_accelerator
 from chitu.lazy import single_dispatch_lazy_tensor
-from chitu.cuda_graph import is_warming_up_or_cuda_graph_capture
 from chitu.testing import AutotuneGraphTimer, Autotuner
 from chitu.global_vars import get_global_args
 
@@ -330,7 +329,6 @@ def fused_moe_kernel_wrapper(
     config: dict[str, Any],
     compute_type: tl.dtype,
 ):
-    M = A.shape[0]
     EM = sorted_token_ids.shape[0]
     if A.shape[0] < config["BLOCK_SIZE_M"]:
         # optimize for small batch_size.
@@ -342,9 +340,6 @@ def fused_moe_kernel_wrapper(
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
-    # Add bs as a tuning key if in graph, because bs is also a key for graph capturing and
-    # thus fixed per graph.
-    bs_if_in_graph = M if is_warming_up_or_cuda_graph_capture() else -1
     fused_moe_kernel[grid](
         A,
         B,
@@ -366,7 +361,6 @@ def fused_moe_kernel_wrapper(
         C.stride(2),
         top_k=top_k,
         compute_type=compute_type,
-        bs_if_in_graph=bs_if_in_graph,
         **config,
     )
 
@@ -388,7 +382,6 @@ def fused_moe_kernel_wrapper_int8(
     use_int8_w8a16: bool,
     use_int8_w8a8: bool,
 ):
-    M = A.shape[0]
     EM = sorted_token_ids.shape[0]
     if A.shape[0] < config["BLOCK_SIZE_M"]:
         EM = min(sorted_token_ids.shape[0], A.shape[0] * top_k * config["BLOCK_SIZE_M"])
@@ -396,9 +389,6 @@ def fused_moe_kernel_wrapper_int8(
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
-    # Add bs as a tuning key if in graph, because bs is also a key for graph capturing and
-    # thus fixed per graph.
-    bs_if_in_graph = M if is_warming_up_or_cuda_graph_capture() else -1
     fused_moe_kernel_int8[grid](
         A,
         B,
@@ -426,7 +416,6 @@ def fused_moe_kernel_wrapper_int8(
         compute_type=compute_type,
         use_int8_w8a16=use_int8_w8a16,
         use_int8_w8a8=use_int8_w8a8,
-        bs_if_in_graph=bs_if_in_graph,
         **config,
     )
 
@@ -449,7 +438,6 @@ def fused_moe_kernel_wrapper_fp8(
     soft_fp8: bool = False,
     per_channel_quant: bool = False,
 ):
-    M = A.shape[0]
     EM = sorted_token_ids.shape[0]
     if A.shape[0] < config["BLOCK_SIZE_M"]:
         EM = min(sorted_token_ids.shape[0], A.shape[0] * top_k * config["BLOCK_SIZE_M"])
@@ -457,9 +445,6 @@ def fused_moe_kernel_wrapper_fp8(
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
-    # Add bs as a tuning key if in graph, because bs is also a key for graph capturing and
-    # thus fixed per graph.
-    bs_if_in_graph = M if is_warming_up_or_cuda_graph_capture() else -1
     scale_is_ue8m0 = B_scale is not None and B_scale.dtype == torch.uint8
     fused_moe_kernel_block_fp8[grid](
         A,
@@ -494,7 +479,6 @@ def fused_moe_kernel_wrapper_fp8(
         soft_fp8=soft_fp8,
         SCALE_IS_UE8M0=scale_is_ue8m0,
         per_channel_quant=per_channel_quant,
-        bs_if_in_graph=bs_if_in_graph,
         **config,
     )
 
@@ -518,7 +502,6 @@ def fused_moe_kernel_wrapper_soft_fp4(
     soft_fp8: bool = False,
     is_w1w3: bool = False,
 ):
-    M = A.shape[0]
     EM = sorted_token_ids.shape[0]
     if A.shape[0] < config["BLOCK_SIZE_M"]:
         EM = min(sorted_token_ids.shape[0], A.shape[0] * top_k * config["BLOCK_SIZE_M"])
@@ -526,9 +509,6 @@ def fused_moe_kernel_wrapper_soft_fp4(
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
-    # Add bs as a tuning key if in graph, because bs is also a key for graph capturing and
-    # thus fixed per graph.
-    bs_if_in_graph = M if is_warming_up_or_cuda_graph_capture() else -1
 
     if B_scale2 is not None:
         is_w1w3 = B_scale2.flatten().shape[0] >= 2 * B.shape[0]

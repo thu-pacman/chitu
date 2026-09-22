@@ -58,6 +58,48 @@ class AttnBackend(abc.ABC):
     def decode_op_supports_mtp(self) -> bool:
         return False
 
+    def supports_gpu_input(self) -> bool:
+        """Whether every decode phase is prepared from device tensors only.
+
+        A backend that answers True fills in its decode metadata from
+        `seq_len_delta`'s device tensors and `block_table` alone -- for a plain
+        decode step, for the MTP verify step and for an MTP draft step alike --
+        so for the shapes passed to `reserve_metadata_for_decode` it never
+        reads the host-side `lens_list` and never builds a host-side plan
+        inside `prepare_metadata_for_decode`. That method is then safe to call
+        from inside a captured CUDA graph, which is what lets a whole MTP
+        iteration (a verify step plus its K-1 draft steps) share one replay.
+
+        Backends that still need the host (the FlashInfer non-MLA wrapper, the
+        hygon/muxi FlashMLA scheduler, Ascend, the reference backend, ...) keep
+        the default False and run one graph per step. Defaults to False.
+        """
+        return False
+
+    def reserve_metadata_for_decode(
+        self,
+        seq_len_delta: BatchedSeqLenDelta,
+        block_table: Optional[torch.Tensor],
+        block_size: int,
+    ) -> None:
+        """Declare that `prepare_metadata_for_decode` will run inside a capture.
+
+        Called outside any captured region, before that region is traced, for
+        every decode shape the region contains -- the MTP draft step's shape
+        today, plus the verify step's once both share a graph. It marks the
+        shape as device-driven: from then on `prepare_metadata_for_decode`
+        handles it without touching the host, and is therefore legal inside
+        the captured region.
+
+        Whatever cannot be built while capturing is built by the first
+        `prepare_metadata_for_decode` after this call, which must still run
+        outside the captured region (the warmup pass that precedes a capture,
+        or a before-capture callback). Backends that have nothing to pre-build
+        -- those whose metadata already comes from device tensors -- keep this a
+        no-op; backends that must pre-plan something outside the graph
+        (FlashInfer's MLA plan is built by a host-side scheduler) do it here.
+        """
+
     def prepare_metadata_for_decode(self, *args, **kwargs):
         pass
 

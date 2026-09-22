@@ -74,7 +74,7 @@ def _setup_draft_sampling_params(sampler, bs, temperature=1.0, top_k=50, top_p=0
     )
     sampler.draft_top_ks = torch.full((bs,), top_k, dtype=torch.int32, device=device)
     sampler.draft_top_ps = torch.full((bs,), top_p, dtype=torch.float32, device=device)
-    sampler.max_top_k_for_draft = top_k
+    sampler.max_top_k_samples = top_k
 
 
 def _sparse_from_full(full, K=50):
@@ -785,7 +785,7 @@ class TestSampleDraftTokens:
         sampler.draft_temperatures = torch.tensor([1.0, 1.0], dtype=torch.float32)
         sampler.draft_top_ks = torch.tensor([1, 50], dtype=torch.int32)
         sampler.draft_top_ps = torch.tensor([1.0, 0.9], dtype=torch.float32)
-        sampler.max_top_k_for_draft = 50
+        sampler.max_top_k_samples = 50
         sampler.draft_greedy_mask = torch.tensor([True, False])
 
         token, p_prime = sampler.sample_draft_tokens(logits)

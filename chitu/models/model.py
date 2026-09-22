@@ -7,7 +7,7 @@ import functools
 import operator
 from logging import getLogger
 from collections import OrderedDict
-from typing import Any, Mapping, Optional, Callable, Tuple
+from typing import Any, Mapping, Optional, Callable, Tuple, cast
 from contextlib import nullcontext
 
 import torch
@@ -26,6 +26,7 @@ from chitu.cuda_graph import (
 )
 from chitu.device_type import is_ascend
 from chitu.global_vars import get_global_args, get_timers
+from chitu.logging_utils import ChituLogger
 from chitu.muxi_utils import (
     Blockfp8LinearMuxiLayoutContigY,
     LinearMuxiLayoutContigY,
@@ -95,7 +96,7 @@ triton, has_triton = try_import_platform_dep("triton")
 cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
 
 
-logger = getLogger(__name__)
+logger = cast(ChituLogger, getLogger(__name__))
 _SHARED_EXPERTS_STREAM: torch.cuda.Stream | None = None
 
 
@@ -370,12 +371,35 @@ class Transformer(nn.Module):
 
         self.do_decode_callable = None
         self.do_decode_callable_mtp = None
+        # The single-graph draft callable, plus the batch it was last called for
+        # (the before-replay callback rewinds that batch's MTP cache position).
+        # Its proposal width is fixed by `self.max_top_k_samples`, so one callable per
+        # model serves every batch it is asked to draft for.
+        self._mtp_draft_single_graph_callable = None
+        self._mtp_draft_single_graph_tasks = None
         self.do_empty_decode_callable = None
         self.do_empty_decode_callable_mtp = None
         self.args = get_global_args()
         self.gpu_preprocess = False
         self.model_type = self.args.models.type
         self.use_cuda_graph = self.args.infer.use_cuda_graph
+        # `Optional` only marks "not initialized yet": a model is always built
+        # from the serve config, so the global args are set here.
+        args = self.args
+        assert args is not None
+        # Experimental: capture the whole K-1 step MTP draft loop into a single
+        # CUDA graph. Requires a supported attention backend; disabled by
+        # default.
+        self.mtp_draft_single_graph = bool(
+            getattr(args.infer, "mtp_draft_single_graph", False)
+        )
+        # Candidate width the single-graph draft samples its proposal p' from:
+        # a config constant rather than the widest top_k in the running batch,
+        # so one callable serves every batch -- a per-batch width would capture
+        # its own graph per (batch size, width) pair.
+        self.max_top_k_samples = max(
+            int(getattr(args.infer, "max_top_k_samples", 50)), 1
+        )
         self.specialize_embed_tokens_lm_head_parallel = (
             self.tp_size == 1 and self.embed_tokens_lm_head_tp_size > 1
         )
@@ -1552,11 +1576,7 @@ class Transformer(nn.Module):
                 self.do_empty_decode_callable_mtp((1,) + ("empty_mtp",))
             return None
 
-        is_main_rank = Backend.executor.is_main_rank
         tokens = last_tokens
-        token_list = []
-        probs_list = []
-        token_ids_list = []
 
         if self.do_decode_callable_mtp is None:
             self._init_mtp_draft_callable(bs, tokens)
@@ -1571,43 +1591,23 @@ class Transformer(nn.Module):
             assert False
         extra_inputs_mtp, _ = self._decode_graph_extra_inputs_mtp(tokens, bs)
 
-        for offset in range(1, self.mtp_size):
-            for cache in self.cache_dict.values():
-                cache.prepare_mtp_cache_decode(tasks, offset)
-                if isinstance(cache, PagedKVCache):
-                    cache.update_page_offs()
-            self.prepare_decoding_attn(is_mtp=True)
-
-            logits = self.do_decode_callable_mtp(key_mtp, tokens, *extra_inputs_mtp)
-
-            if is_main_rank:
-                if sampler is not None:
-                    token, draft_proposal = sampler.sample_draft_tokens(logits)
-                    token_list.append(token)
-                    if draft_proposal is not None:
-                        probs, token_ids = draft_proposal
-                        probs_list.append(probs)
-                        token_ids_list.append(token_ids)
-                else:
-                    token = torch.argmax(logits, dim=-1)
-            else:
-                token = torch.argmax(logits, dim=-1)
-            self.tp_group.broadcast(token, src=self.tp_group.rank_list[0])
-            tokens = token
-
-        if is_main_rank and sampler is not None:
-            # All-greedy batches never produce p' (sample_draft_tokens returns
-            # None), so probs_list stays empty and draft_probs = None.
-            draft_probs = None
-            if probs_list:
-                draft_probs = (
-                    torch.stack(probs_list, dim=1),  # (bs, K-1, K_max)
-                    torch.stack(token_ids_list, dim=1),
-                )
-            return (
-                torch.stack(token_list, dim=1),  # (bs, K-1)
-                draft_probs,  # sparse (probs, token_ids) proposal p', or None
+        # Both paths run the same K-1-step loop (`_mtp_draft_loop`) and return
+        # the same drafts; only the loop's steps differ. Whether it can be
+        # captured as a whole is up to the attention backend, which tells us
+        # through `supports_gpu_input` whether it can re-derive its per-step
+        # metadata from device tensors.
+        if self._use_mtp_draft_single_graph():
+            next_tokens, draft_probs = self._draft_single_graph(
+                tasks, tokens, key_mtp, extra_inputs_mtp, sampler
             )
+        else:
+            next_tokens, draft_probs = self._draft_eager(
+                tasks, tokens, key_mtp, extra_inputs_mtp, sampler
+            )
+
+        # Only the sample rank carries a sampler, and only it uses drafts.
+        if sampler is not None:
+            return next_tokens, draft_probs
         return None
 
     def _init_mtp_draft_callable(self, bs: int, tokens: torch.Tensor):
@@ -1639,14 +1639,7 @@ class Transformer(nn.Module):
                 cpu_update_input=[{"actual_seq_lengths_kv": actual_seq_lengths_kv_fn()}]
             )
 
-        def numel_per_seq(batch_size, x):
-            if batch_size > 0:
-                return x.numel() // batch_size
-            else:
-                assert x.shape[0] == 0
-                return functools.reduce(operator.mul, x.shape[1:], 1)
-
-        tokens_max_nelem = self.max_batch_size_per_dp * numel_per_seq(bs, tokens)
+        tokens_max_nelem = self.max_batch_size_per_dp * self._numel_per_seq(bs, tokens)
         _, extra_inputs_mtp_max_nelem = self._decode_graph_extra_inputs_mtp(tokens, bs)
 
         @make_dispatched_graphed_callables(
@@ -1658,10 +1651,344 @@ class Transformer(nn.Module):
             graph_pool=decode_graph_pool_handle,
         )
         def do_decode_mtp(tokens, *extra_inputs_mtp):
-            freqs_cis = self._prepare_freqs_cis_for_decode_mtp(*extra_inputs_mtp)
-            return self.mtp_decode_no_pipeline(tokens, freqs_cis)
+            return self._mtp_decode(tokens, extra_inputs_mtp)
 
         self.do_decode_callable_mtp = do_decode_mtp
+
+    # ------------------------------------------------------------------
+    # MTP draft: one K-1-step loop, optionally captured as a single graph.
+    # ------------------------------------------------------------------
+
+    def _use_mtp_draft_single_graph(self) -> bool:
+        """Whether the whole MTP draft loop can run inside one captured graph.
+
+        The captured loop advances the MTP cache position on the device and
+        re-prepares the attention metadata per step, so the attention backend
+        must be able to build that metadata from device tensors alone
+        (`AttnBackend.supports_gpu_input`). The indexer has to be able to do the
+        same (`DSAIndexer.supports_gpu_input`): today that is the BF16 indexer
+        backends, while the FP8 ones and the two deep_gemm-backed ones keep a
+        host-side top-k plan / paged-MQA schedule that has to be prepared
+        outside a capture.
+
+        The answer must be identical on every TP rank -- it decides whether the
+        loop's per-step collectives run at all, so a rank-dependent answer would
+        deadlock -- and never looks at `sampler` state, which only the sample
+        rank has. Greedy vs non-greedy is not part of it either: one callable
+        draws every step in-graph, greedy rows keeping their argmax and the rest
+        sampling p' over the configured `infer.max_top_k_samples` candidates.
+        """
+        if not self.mtp_draft_single_graph:
+            return False
+
+        blockers = []
+        if self.mtp_size <= 1:
+            blockers.append("mtp_size <= 1")
+        if not self.use_cuda_graph:
+            blockers.append("use_cuda_graph is off")
+        if not self.attn_backend.supports_gpu_input():
+            blockers.append(
+                "the attention backend prepares decode metadata on the host"
+            )
+        if not self._indexer_supports_gpu_input():
+            blockers.append("the indexer prepares decode metadata on the host")
+
+        if blockers:
+            logger.warning_once(
+                "infer.mtp_draft_single_graph is enabled but the draft loop cannot be "
+                f"captured ({'; '.join(blockers)}); running the per-step draft instead"
+            )
+            return False
+        logger.info_once(
+            "MTP draft: capturing all "
+            f"{self.mtp_size - 1} draft steps into one CUDA graph"
+        )
+        return True
+
+    def _indexer_supports_gpu_input(self) -> bool:
+        """Whether the indexer's per-step metadata can be built in-graph.
+
+        Models without an indexer (`indexer_backend is None`) trivially qualify.
+        """
+        indexer = getattr(self, "indexer_backend", None)
+        return indexer is None or indexer.supports_gpu_input()
+
+    def _prepare_mtp_caches(self, tasks, step: int) -> None:
+        """Move the MTP cache position to `step` of the draft loop, on the host."""
+        for cache in self.cache_dict.values():
+            cache.prepare_mtp_cache_decode(tasks, step)
+
+    def _advance_mtp_caches(self) -> None:
+        """Advance the MTP cache position by one step, on the device."""
+        for cache in self.cache_dict.values():
+            cache.advance_mtp_cache_decode()
+
+    def _mtp_decode(self, tokens, extra_inputs_mtp) -> torch.Tensor:
+        """One MTP forward step, on the decode graph's extra inputs."""
+        freqs_cis = self._prepare_freqs_cis_for_decode_mtp(*extra_inputs_mtp)
+        return self.mtp_decode_no_pipeline(tokens, freqs_cis)
+
+    def _mtp_draft_loop(self, tokens, prepare_step, forward, sample):
+        """Run the K-1 MTP draft steps, returning their tokens and proposals.
+
+        Both draft paths run this loop -- `_draft_eager` calls it directly, the
+        single-graph callable from inside the captured region -- so the
+        stepping, the attention preparation, the TP broadcast and the
+        collection of the drafts are written once. Its three callbacks are the
+        only parts that differ: `prepare_step(step)` moves the MTP cache
+        position to `step` (rebuilt on the host when eager, advanced on the
+        device when captured, where step 1 is prepared outside the graph, see
+        `_prepare_mtp_draft_step1`), `forward(tokens)` runs one MTP forward, and
+        `sample(logits)` turns the logits into `(token, proposal)` (the real
+        sampler when eager, a draw from the graph-registered RNG when captured).
+        Only `prepare_step` may touch the host, which is what
+        `AttnBackend.supports_gpu_input` declares.
+        """
+        token_list = []
+        proposal_list = []
+        for step in range(1, self.mtp_size):
+            prepare_step(step)
+            self.prepare_decoding_attn(is_mtp=True)
+            logits = forward(tokens)
+            token, proposal = sample(logits)
+            self.tp_group.broadcast(token, src=self.tp_group.rank_list[0])
+            tokens = token
+            token_list.append(token)
+            if proposal is not None:
+                proposal_list.append(proposal)
+        return token_list, proposal_list
+
+    @staticmethod
+    def _numel_per_seq(batch_size: int, x: torch.Tensor) -> int:
+        """Elements per sequence in a decode-graph tensor."""
+        if batch_size > 0:
+            return x.numel() // batch_size
+        assert x.shape[0] == 0
+        return functools.reduce(operator.mul, x.shape[1:], 1)
+
+    @torch.inference_mode()
+    def _draft_eager(self, tasks, tokens, key_mtp, extra_inputs_mtp, sampler):
+        """Run the draft loop eagerly, one captured decode graph per step.
+
+        The fallback whenever the loop cannot be captured as a whole: the
+        feature is off, or the attention backend still prepares host-side
+        metadata per step (`supports_gpu_input()` is False). The per-step
+        forward is still a captured graph, `do_decode_callable_mtp`, and the
+        attention metadata and the sampling stay outside it, on the host.
+        """
+
+        def sample(logits):
+            if sampler is not None and sampler.draft_params_match(logits.shape[0]):
+                return sampler.sample_draft_tokens(logits)
+            return torch.argmax(logits, dim=-1), None
+
+        forward = self.do_decode_callable_mtp
+        assert forward is not None  # initialized by `_init_mtp_draft_callable`
+
+        token_list, proposal_list = self._mtp_draft_loop(
+            tokens,
+            prepare_step=lambda step: self._prepare_mtp_caches(tasks, step),
+            forward=lambda tokens: forward(key_mtp, tokens, *extra_inputs_mtp),
+            sample=sample,
+        )
+        # All-greedy batches never produce p', so proposal_list stays empty.
+        draft_probs = None
+        if proposal_list:
+            draft_probs = (
+                torch.stack([probs for probs, _ in proposal_list], dim=1),
+                torch.stack([token_ids for _, token_ids in proposal_list], dim=1),
+            )
+        return torch.stack(token_list, dim=1), draft_probs  # (bs, K-1), p' or None
+
+    def _prepare_mtp_draft_step1(self, tasks) -> None:
+        """Reset the MTP cache position to the first draft step (offset=1).
+
+        The captured loop advances the position by one per step, so it must
+        start from step 1 on every run: on a new graph key's warmup pass, before
+        the capture itself, and before every replay.
+
+        It also declares the draft's decode shape to the attention backend: this
+        out-of-graph call says "the metadata for this shape is prepared inside a
+        captured region", so the backend builds whatever it has to build on the
+        next prepare -- which precedes the capture -- instead of while
+        capturing. See `AttnBackend.reserve_metadata_for_decode`.
+        """
+        self._prepare_mtp_caches(tasks, 1)
+        cache = self.cache_dict["main"]
+        self.attn_backend.reserve_metadata_for_decode(
+            cache.get_seq_len_delta(True),
+            cache.get_gpu_block_table(),
+            cache.block_size,
+        )
+
+    def _draft_proposal_inputs(self, sampler, bs: int, device):
+        """The per-request proposal knobs as graph inputs.
+
+        Ranks without a sampler still run the same callable -- the sample
+        rank's in-graph broadcast overwrites their draft tokens -- so their
+        knobs only have to match in shape and dtype. So does a batch the sampler
+        has not prepared: the backend warmup calls `draft()` without the
+        executor's per-step `prepare_draft_sample_params`, and the knobs must
+        still carry one row per request. The sampler clips every request's top_k
+        to this width, so none of them asks for more candidates than the graph's
+        proposal holds.
+        """
+        if sampler is not None and sampler.draft_params_match(bs):
+            return sampler.draft_sample_params()
+        return (
+            torch.ones(bs, dtype=torch.float32, device=device),
+            torch.full((bs,), self.max_top_k_samples, dtype=torch.int32, device=device),
+            torch.ones(bs, dtype=torch.float32, device=device),
+            torch.zeros(bs, dtype=torch.bool, device=device),
+        )
+
+    @torch.inference_mode()
+    def _draft_single_graph(self, tasks, tokens, key_mtp, extra_inputs_mtp, sampler):
+        """Run all K-1 MTP draft steps in one captured graph replay."""
+        # Make the current batch visible to the before-replay callback that
+        # rewinds the MTP position before each replay.
+        self._mtp_draft_single_graph_tasks = tasks
+        bs = tokens.shape[0]
+
+        # The before-replay callback does not run for the warmup pass or for
+        # the capture itself, so rewind here as well; this is also what declares
+        # the draft's attention metadata shape to the backend.
+        self._prepare_mtp_draft_step1(tasks)
+
+        if self._mtp_draft_single_graph_callable is None:
+            self._init_mtp_draft_single_graph_callable(bs, tokens)
+        assert self._mtp_draft_single_graph_callable is not None
+        out = self._mtp_draft_single_graph_callable(
+            key_mtp,
+            tokens,
+            *self._draft_proposal_inputs(sampler, bs, tokens.device),
+            *extra_inputs_mtp,
+        )
+        # Graph output: (bs, K-1, 1 + 2*max_top_k_samples) float32 -- the drafted token,
+        # then the sparse proposal p' as probs followed by token ids.
+        max_top_k_samples = self.max_top_k_samples
+        return (
+            out[..., 0].to(torch.int64),
+            (
+                out[..., 1 : 1 + max_top_k_samples],
+                out[..., 1 + max_top_k_samples :].to(torch.int64),
+            ),
+        )
+
+    def _init_mtp_draft_single_graph_callable(self, bs: int, tokens: torch.Tensor):
+        """Lazily build the single-graph callable for the whole MTP draft.
+
+        Unlike `_init_mtp_draft_callable`, the captured function runs every
+        draft step (K-1 of them): it advances the MTP cache position on device,
+        prepares the attention metadata, runs the MTP forward, draws the next
+        token -- argmax for greedy rows, Gumbel-max from p' for the rest -- and
+        broadcasts it across TP ranks.
+
+        The proposal knobs are graph inputs (the sample rank rebuilds them on
+        every decode step, see `prepare_draft_sample_params`) and the Gumbel
+        noise comes from this callable's graph-registered RNG, so neither the
+        draw nor the buffers it writes to leave the captured region. The single
+        output packs the K-1 drafted tokens (as float32) followed by the sparse
+        proposal p' (top-k probs, then top-k token ids), all `self.max_top_k_samples`
+        wide, which is what lets one callable serve any batch whose graphs are
+        already captured.
+        """
+        # The builder is rank-uniform: the same callable is created on every TP
+        # rank, so the eager warmup pass it runs issues the same collectives
+        # everywhere. The sampling itself is a static helper, so it does not
+        # need the (sample-rank-only) `sampler` object.
+        from chitu.sampling.sampler import Sampler
+
+        bs_max = self.max_batch_size_per_dp
+        max_top_k_samples = self.max_top_k_samples
+        # One generator per callable: it is registered on the graphs this
+        # callable captures, so the RNG state rides along with them and every
+        # replay draws fresh noise.
+        generator = torch.Generator(device=tokens.device)
+
+        def do_decode_mtp_all(
+            tokens,
+            draft_temperatures,
+            draft_top_ks,
+            draft_top_ps,
+            draft_greedy_mask,
+            *extra_inputs_mtp,
+        ):
+            def prepare_step(step):
+                # Step 1 is prepared outside the graph, see
+                # `_prepare_mtp_draft_step1`; the rest only move on by one.
+                if step > 1:
+                    self._advance_mtp_caches()
+
+            def sample(logits):
+                return Sampler.sample_draft_token(
+                    logits,
+                    draft_temperatures,
+                    draft_top_ks,
+                    draft_top_ps,
+                    draft_greedy_mask,
+                    max_top_k_samples,
+                    generator,
+                )
+
+            token_list, proposal_list = self._mtp_draft_loop(
+                tokens,
+                prepare_step=prepare_step,
+                forward=lambda tokens: self._mtp_decode(tokens, extra_inputs_mtp),
+                sample=sample,
+            )
+            # A graphed callable may only return a single tensor, so pack the
+            # drafted token, the sparse proposal probs and its token ids into one
+            # (bs, K-1, 1 + 2*max_top_k_samples) float32 tensor. Vocab ids below 2**24
+            # round-trip through float32 exactly, and the proposal rows are
+            # zero-padded to `max_top_k_samples`, exactly like the eager draft path.
+            return torch.cat(
+                [
+                    torch.stack(token_list, dim=1).to(torch.float32).unsqueeze(-1),
+                    torch.stack([probs for probs, _ in proposal_list], dim=1),
+                    torch.stack(
+                        [token_ids for _, token_ids in proposal_list], dim=1
+                    ).to(torch.float32),
+                ],
+                dim=-1,
+            )
+
+        def rewind():
+            """Restart the draft loop at its first step, out of the graph.
+
+            Runs on the before-capture callback -- a backend may initialize
+            metadata on a first execution, which must not land in the graph --
+            and before every replay, since the captured loop leaves the MTP
+            position at its last step.
+            """
+            self._prepare_mtp_draft_step1(self._mtp_draft_single_graph_tasks)
+
+        def before_capture():
+            rewind()
+            # The loop's own `prepare_decoding_attn` runs inside the captured
+            # region; run it once more here so nothing the backend builds on a
+            # first execution ends up in the graph.
+            self.prepare_decoding_attn(is_mtp=True)
+
+        _, extra_inputs_mtp_max_nelem = self._decode_graph_extra_inputs_mtp(tokens, bs)
+        self._mtp_draft_single_graph_callable = make_dispatched_graphed_callables(
+            args_max_nelem=(
+                bs_max * self._numel_per_seq(bs, tokens),
+                bs_max,
+                bs_max,
+                bs_max,
+                bs_max,
+                *extra_inputs_mtp_max_nelem,
+            ),
+            kwargs_max_nelem={},
+            before_capture_callback=before_capture,
+            before_replay_callback=lambda graph: rewind(),
+            enable=self.use_cuda_graph,
+            graph_pool=(
+                torch.cuda.graph_pool_handle() if self.use_cuda_graph else None
+            ),
+            generators=[generator],
+        )(do_decode_mtp_all)
 
     def _init_empty_mtp_draft_callable(self):
         """Lazily build the CUDA-graph callable for the EMPTY MTP draft.
@@ -2040,14 +2367,7 @@ class Transformer(nn.Module):
                     ]
                 )
 
-            def numel_per_seq(batch_size, x):
-                if batch_size > 0:
-                    return x.numel() // batch_size
-                else:
-                    assert x.shape[0] == 0
-                    return functools.reduce(operator.mul, x.shape[1:], 1)
-
-            tokens_max_nelem = self.max_batch_size_per_dp * numel_per_seq(
+            tokens_max_nelem = self.max_batch_size_per_dp * self._numel_per_seq(
                 batch_size, tokens
             )
 

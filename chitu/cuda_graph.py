@@ -60,6 +60,7 @@ def make_dispatched_graphed_callables(
     before_replay_callback: Optional[Callable[[Any], None]] = None,
     enable: bool = True,
     graph_pool: Any = None,
+    generators: Optional[Sequence[torch.Generator]] = None,
 ) -> Callable:
     """
     Make a callable to run with CUDA graph but capature different graphs when `key` changes.
@@ -77,6 +78,10 @@ def make_dispatched_graphed_callables(
         enable: If False, do nothing but only add the `key` argument.
         graph_pool: An optional CUDA Graph pool handle. Graphs sharing a pool
             must be replayed in a capture-compatible order and never concurrently.
+        generators: Optional CUDA generators registered on every captured graph
+            via `torch.cuda.CUDAGraph.register_generator_state`. Their RNG state
+            is part of the graph and advances on every replay, so the captured
+            function may draw random numbers without an external noise input.
 
     Returns:
         The wrapped function, which has an additional first argument `key` to dispatch different graphs.
@@ -91,6 +96,7 @@ def make_dispatched_graphed_callables(
             before_replay_callback=before_replay_callback,
             enable=enable,
             graph_pool=graph_pool,
+            generators=generators,
         )
 
     if enable:
@@ -152,6 +158,8 @@ def make_dispatched_graphed_callables(
                 # Capture the graph
                 logger.debug(f"Capturing new graph with key {key}")
                 graph_dict[key] = torch.cuda.CUDAGraph()
+                for generator in generators or ():
+                    graph_dict[key].register_generator_state(generator)
                 gc.disable()  # Disable GC to prevent mid-capture tensor destruction
                 try:
                     _currently_capturing_graph_object = graph_dict[key]

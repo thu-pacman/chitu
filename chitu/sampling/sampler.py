@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
-from dataclasses import dataclass, field
+from typing import Optional
+from dataclasses import dataclass, field, replace
 import torch
 from xgrammar import (
     allocate_token_bitmask,
@@ -73,8 +74,9 @@ class TaskSampleState:
     output_len: int = 0
     matcher: GrammarMatcher | None = None
     # Sparse proposal p' (probs, token_ids), shape (mtp_size-1, k) per task:
-    # stored at the task's OWN top-k width so state is not pinned to the batch
-    # max top-k of the step that drafted it (_prepare pads at verify time).
+    # stored at the task's OWN top-k width -- the proposal a draft step returns
+    # is `Sampler.max_top_k_samples` wide -- so a task is not pinned to the width of
+    # the step that drafted it (_prepare pads back up at verify time).
     draft_probs: tuple[torch.Tensor, torch.Tensor] | None = None
     next_tokens_device: torch.Tensor | None = None
     draft_tokens: list[int] | None = None
@@ -166,7 +168,18 @@ class TaskSampleState:
 class Sampler:
     def __init__(self):
         args = get_global_args()
+        assert args is not None  # "not initialized yet" is the only `None` case
         self.mtp_size = args.infer.mtp_size
+
+        # Width of every top-k proposal this sampler materializes: the draft's
+        # p' and the top-k filtered target distributions the verify compares it
+        # with. One server-wide value -- rather than the widest top_k in the
+        # running batch -- keeps the draft's captured graphs keyed by batch
+        # size alone, gives every filter the same shape, and lets a request's
+        # top_k be clipped against a bound that does not move.
+        self.max_top_k_samples = max(
+            int(getattr(args.infer, "max_top_k_samples", 50)), 1
+        )
 
         self.states: dict[str, TaskSampleState] = {}
         self.batch_matcher = BatchGrammarMatcher()
@@ -178,7 +191,6 @@ class Sampler:
         self.draft_temperatures: torch.Tensor | None = None
         self.draft_top_ks: torch.Tensor | None = None
         self.draft_top_ps: torch.Tensor | None = None
-        self.max_top_k_for_draft: int = 1
         self.draft_greedy_mask: torch.Tensor | None = None  # True → argmax draft
         self.all_greedy: bool = True  # pre-computed by prepare_draft_sample_params
 
@@ -213,47 +225,125 @@ class Sampler:
             device=device,
             dtype=torch.float32,
         )
-        self.max_top_k_for_draft = max(s.sample_params.top_k for s in states)
         self.all_greedy = all(s.sample_params.top_k <= 1 for s in states)
+
+    def draft_params_match(self, bs: int) -> bool:
+        """Whether the prepared draft params describe a batch of `bs` rows.
+
+        The draft loops run on the batch they are handed, and one caller
+        bypasses the executor's per-step `prepare_draft_sample_params`: the
+        direct backend warmup, which calls `draft()` with mock tasks. Its
+        drafts are discarded, so the model falls back to neutral knobs rather
+        than feeding the graph a differently shaped tensor.
+        """
+        return (
+            self.draft_temperatures is not None
+            and self.draft_temperatures.shape[0] == bs
+        )
+
+    def draft_sample_params(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The prepared draft proposal params, narrowed out of their `None` default.
+
+        `prepare_draft_sample_params` sets all four together before a draft
+        loop; `draft_params_match` is how a caller asks whether that has
+        happened for its batch.
+        """
+        temperatures, top_ks, top_ps, greedy_mask = (
+            self.draft_temperatures,
+            self.draft_top_ks,
+            self.draft_top_ps,
+            self.draft_greedy_mask,
+        )
+        assert (
+            temperatures is not None
+            and top_ks is not None
+            and top_ps is not None
+            and greedy_mask is not None
+        )
+        return temperatures, top_ks, top_ps, greedy_mask
 
     def sample_draft_tokens(
         self, logits: torch.Tensor
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """Select the next MTP draft token and its proposal distribution p'.
 
-        Greedy: argmax (matches target argmax → exact-match acceptance, highest rate).
-        Non-greedy: Gumbel-max sample from a temperature/top-k/top-p scaled proposal
-        p' — same scaling as the target q — so the draft is drawn from a distribution
-        (required for correct rejection sampling) and p's mass concentrates on high-q
-        tokens (higher acceptance, output distribution unchanged).
-
         Returns the proposal p' as a sparse top-k ``(probs, token_ids)`` pair —
         the verify only consumes values at the draft / target-top-k positions, so
-        materializing a full-vocab tensor is unnecessary. Greedy requests in a
-        mixed batch degenerate to a one-hot at their argmax. Returns ``None``
-        when the whole batch is greedy (exact-match verify never reads p').
+        materializing a full-vocab tensor is unnecessary. Returns ``None`` when
+        the whole batch is greedy (exact-match verify never reads p'), and the
+        draft token is then a plain argmax. This is the eager draft path's
+        entry point; `sample_draft_token` is the shared helper it and the
+        captured draft both call.
         """
-        greedy_mask = self.draft_greedy_mask
-        argmax_token = torch.argmax(logits, dim=-1)
         if self.all_greedy:
-            return argmax_token, None
-
-        scaled = logits / self.draft_temperatures.view(-1, 1)
-        probs, token_ids = filter_logits_top_k_top_p(
-            scaled,
-            self.draft_top_ks,
-            self.draft_top_ps,
-            max_top_k=self.max_top_k_for_draft,
+            return torch.argmax(logits, dim=-1), None
+        temperatures, top_ks, top_ps, greedy_mask = self.draft_sample_params()
+        return Sampler.sample_draft_token(
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            greedy_mask,
+            self.max_top_k_samples,
         )
-        sampled = gumbel_max_sample(probs, token_ids)
-        argmax_token = torch.where(greedy_mask, argmax_token, sampled)
-        return argmax_token, (probs, token_ids)
+
+    @staticmethod
+    def sample_draft_token(
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        greedy_mask: torch.Tensor,
+        max_top_k_samples: int,
+        generator: Optional[torch.Generator] = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Draft token and proposal p' of one MTP draft step.
+
+        Greedy rows keep their argmax (matching the target argmax gives
+        exact-match acceptance, the highest rate); the rest are Gumbel-max
+        sampled from a temperature/top-k/top-p scaled proposal p' — the same
+        scaling as the target q — so the draft comes from a real distribution
+        (required for correct rejection sampling) with its mass concentrated on
+        high-q tokens (higher acceptance, output distribution unchanged).
+
+        p' is returned as a sparse top-k ``(probs, token_ids)`` pair, since the
+        verify only reads values at the draft / target-top-k positions. Greedy
+        rows of a mixed batch keep the filtered proposal, exactly like
+        `sample_draft_tokens`; their acceptance uses exact match, never p'.
+
+        `generator` is the RNG the Gumbel noise is drawn from: the eager path
+        leaves it ``None`` (ambient RNG), while the captured single-graph draft
+        passes the generator registered on its graph, so the draw is part of the
+        graph and every replay advances it.
+        """
+        argmax_token = torch.argmax(logits, dim=-1)
+        probs, token_ids = filter_logits_top_k_top_p(
+            logits / temperatures.view(-1, 1),
+            top_ks,
+            top_ps,
+            max_top_k=max_top_k_samples,
+        )
+        sampled = gumbel_max_sample(probs, token_ids, generator)
+        return torch.where(greedy_mask, argmax_token, sampled), (probs, token_ids)
 
     def _get_states(self, tasks: list[Task]):
         """get states of tasks, create new state if needed"""
         for task in tasks:
             if task.task_id not in self.states:
-                self.states[task.task_id] = TaskSampleState.from_task(task)
+                state = TaskSampleState.from_task(task)
+                # The sampler only ever materializes `self.max_top_k_samples`
+                # candidates per row, so a request asking for more is clipped
+                # to that width: it samples from the top `self.max_top_k_samples` of
+                # its own distribution, the support every downstream shape
+                # (the draft's proposal, the verify's filters) is built for.
+                # The request keeps the top_k it asked for.
+                if state.sample_params.top_k > self.max_top_k_samples:
+                    state.sample_params = replace(
+                        state.sample_params, top_k=self.max_top_k_samples
+                    )
+                self.states[task.task_id] = state
         return [self.states[task.task_id] for task in tasks]
 
     def _apply_test_tokens(self, tokens: torch.Tensor, states: list[TaskSampleState]):
@@ -289,27 +379,26 @@ class Sampler:
 
         Returns (draft_tokens, draft_probs, draft_tokens_list):
         - draft_tokens:     (bs, mtp_size-1) drafted token ids per task.
-        - draft_probs:      (bs, mtp_size-1, max_top_k) sparse proposal p'
+        - draft_probs:      (bs, mtp_size-1, max_top_k_samples) sparse proposal p'
                             (probs, token_ids), or None for an empty batch.
         - draft_tokens_list: CPU list mirror of draft_tokens.
 
         Proposal rows are stored per-task at the task's own top-k width (see
-        update_draft_results); tasks in this batch may have been drafted under
-        different batch compositions, so allocate at THIS batch's max top-k and
-        copy each row into its leading columns; trailing slots stay zero,
-        exactly like the draft-time padding.
+        update_draft_results), while the verify's filters are `max_top_k_samples` wide:
+        allocate at that width and copy each row into its leading columns;
+        trailing slots stay zero, exactly like the draft-time padding.
         """
         K = self.mtp_size
         n_drafts = K - 1
         draft_tokens_list = []
-        max_top_k = max((max(int(s.sample_params.top_k), 1) for s in states), default=1)
+        max_top_k_samples = self.max_top_k_samples
         probs = torch.zeros(
-            (len(states), n_drafts, max_top_k),
+            (len(states), n_drafts, max_top_k_samples),
             device=device,
             dtype=torch.float32,
         )
         token_ids = torch.zeros(
-            (len(states), n_drafts, max_top_k),
+            (len(states), n_drafts, max_top_k_samples),
             device=device,
             dtype=torch.int64,
         )
@@ -340,7 +429,7 @@ class Sampler:
         draft_tokens = create_tensor(
             draft_tokens_list, device=device, dtype=torch.int64
         )
-        # (bs, K-1, max_top_k) each: proposal p' sparse probs / token ids
+        # (bs, K-1, max_top_k_samples) each: proposal p' sparse probs / token ids
         draft_probs = (probs, token_ids) if len(states) > 0 else None
 
         # Frequency penalty: the MTP target positions 1..K-1 continue from
@@ -487,12 +576,12 @@ class Sampler:
                 top_ps.append(state.sample_params.top_p)
                 top_ks.append(state.sample_params.top_k)
             temperatures = create_tensor(temperatures, device=logits.device)
-            max_top_k = max(top_ks)
             top_ps = create_tensor(top_ps, device=logits.device)
             top_ks = create_tensor(top_ks, device=logits.device)
+            max_top_k_samples = self.max_top_k_samples
             logits = logits / temperatures.view(-1, 1)
             tokens = top_k_top_p_min_p_sampling_from_logits(
-                logits, top_ks, top_ps, max_top_k=max_top_k
+                logits, top_ks, top_ps, max_top_k=max_top_k_samples
             )
         return tokens, logits
 
@@ -528,10 +617,10 @@ class Sampler:
         temperatures = create_tensor(temperatures, device=logits.device)
         top_ks_t = create_tensor(top_ks_list, device=logits.device)
         top_ps_t = create_tensor(top_ps_list, device=logits.device)
-        max_top_k = max(top_ks_list)
+        max_top_k_samples = self.max_top_k_samples
         logits_flat = logits_flat / temperatures.view(-1, 1)
         tokens = top_k_top_p_min_p_sampling_from_logits(
-            logits_flat, top_ks_t, top_ps_t, max_top_k=max_top_k
+            logits_flat, top_ks_t, top_ps_t, max_top_k=max_top_k_samples
         )
         return tokens, logits_flat
 
@@ -621,14 +710,14 @@ class Sampler:
                 top_ps_all.append(s.sample_params.top_p)
         top_ks_all_t = create_tensor(top_ks_all, device=logits.device)
         top_ps_all_t = create_tensor(top_ps_all, device=logits.device)
-        max_top_k = max(top_ks_all)
+        max_top_k_samples = self.max_top_k_samples
 
         # filtered q for ALL positions
         q_all_probs, q_all_token_ids = filter_logits_top_k_top_p(
             logits.reshape(bs * mtp_size, V),
             top_ks_all_t,
             top_ps_all_t,
-            max_top_k=max_top_k,
+            max_top_k=max_top_k_samples,
         )  # (bs*mtp_size, K), (bs*mtp_size, K)
 
         # ---- acceptance q: positions 0..n_drafts-1 = same positions as draft ----
@@ -776,9 +865,9 @@ class Sampler:
         if draft_probs is not None:
             probs, token_ids = draft_probs
             for i, state in enumerate(states):
-                # Store at the task's OWN top-k width (not the draft batch's
-                # max) so a per-task slice stays valid when the batch max top-k
-                # changes between steps; _prepare re-pads to the verify max.
+                # Store at the task's OWN top-k width -- the proposal the draft
+                # returns is `self.max_top_k_samples` wide, and the extra columns of a
+                # sparse row are padding; _prepare re-pads to match.
                 k = max(int(state.sample_params.top_k), 1)
                 state.draft_probs = (
                     probs[i, :, :k].detach().clone(),

@@ -61,6 +61,16 @@ class HybridAttnBackend(AttnBackend):
         return self.flash_attn_backend is not None
 
     @override
+    def supports_gpu_input(self) -> bool:
+        # MTP decode always runs on the FlashAttention sub-backend (see
+        # _select_backend: `mtp_size > 1` short-circuits to it, and the
+        # single-graph draft path requires `mtp_size > 1`), so the answer is
+        # the FlashAttention backend's answer.
+        if self.flash_attn_backend is None:
+            return False
+        return self.flash_attn_backend.supports_gpu_input()
+
+    @override
     def prefill_ragged_qkvo(
         self,
         q,
