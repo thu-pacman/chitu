@@ -690,7 +690,7 @@ class Backend:
                     if param is None:
                         continue
 
-                    if NpuFractalZnTensor.check_tensor(param) and not is_ascend_950():
+                    if NpuFractalZnTensor.check_tensor(param):
                         new_data = torch.empty(
                             param.transpose(-1, -2).shape,
                             dtype=param.dtype,
@@ -699,9 +699,7 @@ class Backend:
                         new_data = NpuFractalZnTensor.convert_from(
                             new_data
                         ).layout_tensor
-                    elif (
-                        NpuFractalNzTensor.check_tensor(param) and not is_ascend_950()
-                    ):
+                    elif NpuFractalNzTensor.check_tensor(param):
                         new_data = torch.empty(
                             param.shape, dtype=param.dtype, device=device
                         )

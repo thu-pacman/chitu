@@ -10,7 +10,6 @@ from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.device_type import has_accelerator
 from chitu.utils import (
     try_import_platform_dep,
-    use_triton_impl,
     try_import_and_setup_torch_npu,
     try_import_opt_dep,
 )
@@ -28,7 +27,7 @@ cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
-has_triton_impl = has_triton and has_accelerator() and use_triton_impl("rotary")
+has_triton_impl = has_triton and has_accelerator()
 
 if has_triton_impl:
     from chitu.ops.triton_ops import (
@@ -86,6 +85,16 @@ def _auto_apply_rotary_pos_emb(
 ):
     if has_cpuinfer and get_global_args().infer.op_impl == "cpu":
         return "cpu"
+    if has_torch_npu:
+        if (
+            rotary_type == "interleaved"
+            and q.shape[-1] == 64
+            and q.dtype == freqs_cis.cos.dtype
+            and (q_out is None or isinstance(q_out, ColumnOddEvenSeparatedTensor))
+            and (k_out is None or isinstance(k_out, ColumnOddEvenSeparatedTensor))
+        ):
+            return "torch_npu_with_output_layout"
+        return "torch_npu"
     if (
         q_out is None
         and k_out is None
@@ -100,16 +109,6 @@ def _auto_apply_rotary_pos_emb(
         return "triton"
     if has_chitu_backend:
         return "cuda"
-    if has_torch_npu:
-        if (
-            rotary_type == "interleaved"
-            and q.shape[-1] == 64
-            and q.dtype == freqs_cis.cos.dtype
-            and (q_out is None or isinstance(q_out, ColumnOddEvenSeparatedTensor))
-            and (k_out is None or isinstance(k_out, ColumnOddEvenSeparatedTensor))
-        ):
-            return "torch_npu_with_output_layout"
-        return "torch_npu"
     return "torch"
 
 

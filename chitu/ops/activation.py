@@ -9,7 +9,6 @@ import torch
 
 from chitu.utils import (
     try_import_platform_dep,
-    use_triton_impl,
     try_import_opt_dep,
     try_import_and_setup_torch_npu,
 )
@@ -24,7 +23,7 @@ from chitu.ops.utils import make_op_dispatcher
 triton, has_triton = try_import_platform_dep("triton")
 cpuinfer, has_cpuinfer = try_import_opt_dep("cpuinfer", "cpu")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-has_triton_impl = has_triton and has_accelerator() and use_triton_impl("activation")
+has_triton_impl = has_triton and has_accelerator()
 if has_triton_impl:
     from chitu.ops.triton_ops import (
         silu_and_mul_triton,
