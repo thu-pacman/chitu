@@ -1016,12 +1016,26 @@ class TransformerGLM5Next(TransformerDeepSeekV3):
             h = self._pre_layers(tokens, **args)
         else:
             assert hiddens is not None and hiddens.ndim == 3
-            _, hiddens, freqs_cis = self.cp_context.split_prefill(
-                tokens=None,
-                hiddens=hiddens,
-                freqs_cis=freqs_cis,
-                total_tokens=delta_total,
-            )
+            if self.pp_stage == self.pp_end_stage and self.mtp_size > 1:
+                # The MTP layer of the last stage embeds its own token ids, so the
+                # tokens must be split onto the same local rows as the hidden
+                # states (see `cp_context.split_prefill`).
+                assert (
+                    tokens is not None
+                ), "GLM-5.3-Flash MTP prefill requires token ids on the last PP stage"
+                tokens, hiddens, freqs_cis = self.cp_context.split_prefill(
+                    tokens=tokens,
+                    hiddens=hiddens,
+                    freqs_cis=freqs_cis,
+                    total_tokens=delta_total,
+                )
+            else:
+                _, hiddens, freqs_cis = self.cp_context.split_prefill(
+                    tokens=None,
+                    hiddens=hiddens,
+                    freqs_cis=freqs_cis,
+                    total_tokens=delta_total,
+                )
             batch_size = hiddens.shape[0]
             h = hiddens
             del hiddens
@@ -1039,6 +1053,13 @@ class TransformerGLM5Next(TransformerDeepSeekV3):
         h = self._run_non_mtp_layers(h, freqs_cis)
 
         if self.pp_stage == self.pp_end_stage:
+            if self.mtp_size > 1:
+                assert tokens is not None
+                self.mtp_prefill(
+                    x=self._pre_layers_mtp(tokens, **args),
+                    h=h,
+                    freqs_cis=freqs_cis,
+                )
             return self.cp_context.allgather_hidden_states(
                 h,
                 output_token_offsets,
@@ -1057,6 +1078,12 @@ class TransformerGLM5Next(TransformerDeepSeekV3):
             h = middle_state
         h = self._run_non_mtp_layers(h, freqs_cis)
         if self.pp_stage == self.pp_end_stage:
+            if self.mtp_size > 1:
+                h_for_cache = self._reduce_mhc(h)
+                self.update_mtp_hidden_states(
+                    self.norm(h_for_cache, compute_dtype=h_for_cache.dtype),
+                    is_mtp=True,
+                )
             return self._post_layers(h).float()
         return h
 
