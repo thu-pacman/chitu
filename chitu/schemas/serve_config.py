@@ -104,6 +104,8 @@ class InferConfig(InferConfigLegacy):
 
     moe: MoEConfig = MISSING
     mtp_size: int = MISSING
+    mtp_draft_single_graph: bool = MISSING
+    max_top_k_samples: int = MISSING
     language_model_only: bool = MISSING
 
 

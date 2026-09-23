@@ -88,7 +88,6 @@ def _run_direct_kernel_with_padding_token_block(padding_token_id):
         compute_type=to_triton_dtype(dtype),
         use_int8_w8a16=False,
         use_int8_w8a8=True,
-        bs_if_in_graph=-1,
     )
     torch.cuda.synchronize()
     assert torch.isfinite(c).all()

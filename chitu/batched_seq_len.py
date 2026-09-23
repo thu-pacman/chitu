@@ -67,11 +67,12 @@ class BatchedSeqLen:
         if max_total_len is None:
             max_total_len = sum(lens_list)
 
-        self.lens_list = lens_list
+        self._lens_list = lens_list
+        self._host_lens_stale = False
         self.device = device
         self.lens_static_tensor_device = StaticTensor(
             create_tensor(
-                self.lens_list,
+                self._lens_list,
                 device=self.device,
                 dtype=torch.int32,
                 sync_free=True,
@@ -123,9 +124,10 @@ class BatchedSeqLen:
         )
 
     def copy_from_list(self, lens_list: list[int]):
-        self.lens_list = lens_list
+        self._lens_list = lens_list
+        self._host_lens_stale = False
         self.lens_static_tensor_device.set(
-            create_tensor(self.lens_list, device=self.device, dtype=torch.int32)
+            create_tensor(self._lens_list, device=self.device, dtype=torch.int32)
         )
 
         self._prefix_lens_tensor_device_up_to_date = False
@@ -147,7 +149,8 @@ class BatchedSeqLen:
         assert (
             lens_tensor.device == self.device
         ), f"Device mismatch: {lens_tensor.device} vs {self.device}"
-        self.lens_list = lens_tensor.tolist()
+        self._lens_list = lens_tensor.tolist()
+        self._host_lens_stale = False
         self.lens_static_tensor_device.set(lens_tensor.to(torch.int32))
 
         self._prefix_lens_tensor_device_up_to_date = False
@@ -164,7 +167,8 @@ class BatchedSeqLen:
         assert (
             self.device == other.device
         ), f"Device mismatch: {self.device} vs {other.device}"
-        self.lens_list = other.lens_list
+        self._lens_list = other.lens_list
+        self._host_lens_stale = False
         self.lens_static_tensor_device.set(other.lens_tensor_device)
 
         self._prefix_lens_tensor_device_up_to_date = False
@@ -198,6 +202,43 @@ class BatchedSeqLen:
         invalidate_cached_property(self, "lens_tensor_cpu")
         invalidate_cached_property(self, "prefix_lens_list")
         invalidate_cached_property(self, "batch_size")
+        invalidate_cached_property(self, "total_len")
+        invalidate_cached_property(self, "max_len")
+
+    def _require_host_state_fresh(self) -> None:
+        if self._host_lens_stale:
+            raise RuntimeError(
+                "host sequence lengths are stale: the device lengths were advanced "
+                "in place (BatchedSeqLenDelta.advance_classic_by_one) without "
+                "updating the host mirror. Read the device tensors instead, or "
+                "re-prepare the lengths (e.g. KVCache.prepare_mtp_cache_decode)."
+            )
+
+    @property
+    def lens_list(self) -> list[int]:
+        """The host-side sequence lengths, valid until a device-side advance.
+
+        `BatchedSeqLenDelta.advance_classic_by_one()` moves the device lengths
+        without the host mirror, so reading this while stale raises instead of
+        silently returning lengths that lag behind by that many steps.
+        """
+        self._require_host_state_fresh()
+        return self._lens_list
+
+    def advance_by_one_device(self) -> None:
+        """Grow every sequence by one token on device, poisoning the host mirror.
+
+        See `BatchedSeqLenDelta.advance_classic_by_one()` for why the host side
+        is left behind; `copy_from_list()` / `copy_from_tensor()` / `copy_from()`
+        are the only ways back to a consistent state.
+        """
+        self.lens_tensor_device.add_(1)
+        self._host_lens_stale = True
+        self._prefix_lens_tensor_device_up_to_date = False
+        self._position_ids_tensor_device_up_to_date = False
+        self._seq_ids_tensor_device_up_to_date = False
+        invalidate_cached_property(self, "lens_tensor_cpu")
+        invalidate_cached_property(self, "prefix_lens_list")
         invalidate_cached_property(self, "total_len")
         invalidate_cached_property(self, "max_len")
 
@@ -277,7 +318,9 @@ class BatchedSeqLen:
 
     @functools.cached_property
     def batch_size(self) -> int:
-        return len(self.lens_list)
+        # Advancing the device lengths does not change the batch size, so this
+        # stays readable while the host mirror is stale.
+        return len(self._lens_list)
 
     @functools.cached_property
     def max_len(self) -> int:
@@ -560,6 +603,35 @@ class BatchedSeqLenDelta:
             return torch.arange(self.batch_size, device=self.device, dtype=torch.int32)
         else:
             return self._delta.seq_ids_tensor_device
+
+    def advance_classic_by_one(self) -> None:
+        """Advance a classic-decoding delta by one step, in place, on device.
+
+        Classic decoding means every sequence contributes exactly one new query
+        token per step, so both ``old`` and ``new`` lengths grow by 1. This is
+        the device-side counterpart of ``copy_from_list``: it keeps the update
+        inside a CUDA graph, whereas ``copy_from_list`` rebuilds CPU lists and
+        is therefore not capturable.
+
+        Only the device state moves, and the derived device quantities
+        short-circuit to values that do not read the host ``lens_list``:
+        ``delta_position_ids_tensor_device`` is ``old.lens``,
+        ``delta_seq_ids_tensor_device`` is ``arange(batch_size)`` and
+        ``delta_lens_tensor_device`` is ``ones(batch_size)``.
+
+        The host mirror is left behind on purpose, so it is poisoned rather
+        than silently stale: reading ``lens_list``, ``lens_tensor_cpu``,
+        ``prefix_lens_list``, ``total_len`` or ``max_len`` raises until the
+        next ``copy_from_list`` / ``copy_from_tensor`` / ``copy_from``.
+        ``batch_size`` stays readable, since advancing cannot change it.
+        """
+        if not self.is_classic_decoding:
+            raise RuntimeError(
+                "advance_classic_by_one() only supports classic decoding "
+                "(one new query token per sequence)"
+            )
+        self.old.advance_by_one_device()
+        self.new.advance_by_one_device()
 
 
 class BatchedSeqLenDeltaView:

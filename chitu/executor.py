@@ -1904,9 +1904,10 @@ class Executor:
         )
         if self.is_sample_rank:
             # Draft proposal params (temperature/top-k/top-p/greedy mask) must be
-            # refreshed per decode step from the CURRENT batch: sample_draft_tokens
-            # samples the next drafts from p' on the sample rank, and the next
-            # verify consumes the same p' via state.draft_probs.
+            # refreshed per decode step from the CURRENT batch: the next drafts
+            # are drawn from p' on the sample rank (in-graph when the draft is
+            # captured), and the next verify consumes the same p' via
+            # state.draft_probs.
             self.sampler.prepare_draft_sample_params(tasks)
             next_tokens, draft_probs = Backend.model.draft(tasks, last_tokens)
             next_tokens = torch.cat([last_tokens.unsqueeze(1), next_tokens], dim=1)

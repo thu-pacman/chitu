@@ -50,6 +50,20 @@ class FlashAttnBackend(AttnBackend):
         return True
 
     @override
+    def supports_gpu_input(self) -> bool:
+        # FlashAttention's decode entry points take every quantity that changes
+        # between two MTP draft steps as a device tensor: `cache_seqlens` and
+        # `block_table` are read straight from the KV cache accessor, and the
+        # scratch buffers are sized from the (fixed) batch/head shapes. The
+        # backend does not override `prepare_metadata_for_decode` (the base
+        # no-op is used), and the MLA path never touches the host either -- it
+        # either uses the device-only FA3 MLA kernel or falls back to
+        # `_mla_to_mqa` -> `decode_paged_kv`. Calling the whole per-step
+        # path once per MTP draft step inside one captured graph is therefore
+        # safe.
+        return True
+
+    @override
     def prefill_ragged_qkvo(
         self,
         q,

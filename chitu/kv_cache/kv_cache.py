@@ -219,6 +219,10 @@ class GPUBlockTableSyncState:
 
 
 class KVCacheBase:
+    # Tokens per KV-cache block: the page size of `PagedKVCache`, the whole
+    # sequence for `DenseKVCache`.
+    block_size: int
+
     def __init__(
         self,
         layer_id_map: GlobalLocalMap,
@@ -445,6 +449,33 @@ class KVCacheBase:
             [self.tid_to_cached_len[tid] + draft_offset for tid in tasks.task_ids],
         )
         self.mtp_seq_len_delta.is_decode_stage = True
+        self.update_page_offs()
+
+    def advance_mtp_cache_decode(self) -> None:
+        """Advance the MTP decode position by one step, on device.
+
+        Device-side counterpart of ``prepare_mtp_cache_decode(tasks, offset)``
+        for the sequential MTP draft loop: it advances the MTP sequence-length
+        delta by exactly one token without rebuilding CPU lists, so the whole
+        draft loop can be captured into a single CUDA graph.
+
+        The per-step GPU block table stays unchanged: blocks covering the full
+        ``max_seq_len + mtp_size`` span are reserved up front (see
+        ``page_table_max_seq_len``), so only positions move, not block rows.
+        Only the cached page ids/offsets are dropped, so that they are
+        recomputed for the new position -- inside a captured region, that
+        recomputation is what gets recorded into the graph.
+        """
+        self.mtp_seq_len_delta.advance_classic_by_one()
+        self.update_page_offs()
+
+    def update_page_offs(self) -> None:
+        """Drop cached page ids / in-page offsets.
+
+        Called whenever the decode position moves in place -- the MTP walks
+        above do it themselves -- so that the next read re-derives them from
+        the new position. Caches without pages have nothing to drop.
+        """
 
     def prepare_cache_prefill_dllm(
         self,
@@ -829,7 +860,7 @@ class PagedKVCache(KVCacheBase):
 
         self._upd_gpu_block_table(task_ids, incremental=incremental)
 
-    def update_page_offs(self):
+    def update_page_offs(self) -> None:
         self._page_ids_up_to_date = False
         self._offs_in_page_up_to_date = False
 
@@ -1325,7 +1356,7 @@ class MMPagedKVCache(PagedKVCache):
 
     @override
     def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", offset: int):
-        pass
+        self.update_page_offs()
 
     @override
     def update_mtp_cache_accept(
@@ -1430,9 +1461,6 @@ class DenseKVCache(KVCacheBase):
             if max_kv_off > (1 << 31) - 1:
                 return True
         return False
-
-    def update_page_offs(self):
-        pass
 
     def estimate_bytes_per_block(self) -> int:
         total = 0

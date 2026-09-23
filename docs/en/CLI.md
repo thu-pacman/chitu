@@ -680,6 +680,38 @@ Acceptable values: A positive integer.
 
 *Default: `1`.*
 
+### Argument `infer.mtp_draft_single_graph`
+
+Experimental: capture the whole K-1 step MTP draft loop (cache-position
+advance, attention metadata, MTP forward, sampling and TP broadcast) into a
+single CUDA graph, so one replay produces all draft tokens. Requires
+mtp_size > 1, use_cuda_graph, a supported attention backend (currently
+flash-mla / flash_attn / triton / flashinfer MLA paged on CUDA and the `auto`
+hybrid backend), and, for models with a DSA indexer, an indexer whose
+decode step is derived from device tensors alone (currently the BF16
+backends, `torch_bf16` / `triton_bf16`; the FP8 paths and `deepgemm` /
+`hygon` still keep host-side top-k plans or paged-MQA schedules). A missing
+requirement only downgrades the draft to the per-step path, with a warning.
+
+*Default: `false`.*
+
+### Argument `infer.max_top_k_samples`
+
+Width of every top-k proposal the sampler works with: the MTP draft draws
+its proposal p' from the top `max_top_k_samples` of each request's distribution,
+and the target distributions the verify compares it against are filtered
+to that same width. A request asking for a larger top_k is clipped to this
+value, so it samples from the top `max_top_k_samples` of its distribution.
+
+One width for the whole server, instead of the widest top_k in the running
+batch, is what lets the single-graph draft (mtp_draft_single_graph) capture
+one graph per batch size rather than one per (batch size, width) pair, and
+keeps every top-k filter at the same shape.
+
+Acceptable values: A positive integer.
+
+*Default: `50`.*
+
 ### Argument `infer.language_model_only`
 
 This parameter is only used for Qwen3.5 model family. If this parameter is true,

@@ -101,7 +101,6 @@ def fused_moe_kernel(
     GROUP_SIZE_M: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
-    bs_if_in_graph: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -253,7 +252,6 @@ def fused_moe_kernel_block_fp8(
     soft_fp8: tl.constexpr,
     SCALE_IS_UE8M0: tl.constexpr,
     per_channel_quant: tl.constexpr,
-    bs_if_in_graph: tl.constexpr,
 ):
     fp8_to_fp32_scale = tl.cast(0x7B800000, dtype=tl.float32, bitcast=True)
     pid = tl.program_id(axis=0)
@@ -623,7 +621,6 @@ def fused_moe_kernel_int8(
     compute_type: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     use_int8_w8a8: tl.constexpr,
-    bs_if_in_graph: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
