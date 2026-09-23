@@ -1,0 +1,5 @@
+# 统一行尾 = LF：Windows 侧编辑器 / 一次性脚本 / python 文本写入容易把整文件写成 CRLF，
+# 于是 `git diff` 里出现「整文件重写」的假噪声（本仓实例：chitu/sampling/sampler.py 等曾被整文件 CRLF）。
+# `text=auto` 仍按内容自动识别二进制文件（不去碰它们）；提交侧由本文件兜住，CI 侧由
+# ci/comm.yml 的 line_ending_check 兜底。
+* text=auto eol=lf
