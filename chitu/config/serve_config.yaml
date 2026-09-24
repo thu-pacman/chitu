@@ -539,7 +539,7 @@ infer:
   #: Acceptable values: A positive integer.
   max_top_k_samples: 50
 
-  #: This parameter is only used for Qwen3.5 model family. If this parameter is true,
+  #: This parameter is only used for Qwen3.5 and GLM5.3-Flash model family. If this parameter is true,
   #: you can skip loading the vision encoder and only start the language model.
   language_model_only: False
 

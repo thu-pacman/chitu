@@ -714,7 +714,7 @@ Acceptable values: A positive integer.
 
 ### Argument `infer.language_model_only`
 
-This parameter is only used for Qwen3.5 model family. If this parameter is true,
+This parameter is only used for Qwen3.5 and GLM5.3-Flash model family. If this parameter is true,
 you can skip loading the vision encoder and only start the language model.
 
 *Default: `False`.*

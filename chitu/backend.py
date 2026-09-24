@@ -503,7 +503,8 @@ class Backend:
         """
 
         if not hasattr(args.models, "vision_config") or (
-            args.models.type == ModelType.HF_QWEN3_5 and args.infer.language_model_only
+            args.models.type in [ModelType.HF_QWEN3_5, ModelType.GLM_5_NEXT]
+            and args.infer.language_model_only
         ):
             return None
 

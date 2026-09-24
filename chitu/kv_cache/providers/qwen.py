@@ -40,6 +40,7 @@ def qwen3_linear_cache_spec(args, attn_backend_type) -> KVCacheSpec:
         ModelType.HF_QWEN3_VL,
         ModelType.HF_QWEN3_VL_MOE,
         ModelType.HF_QWEN3_5,
+        ModelType.GLM_5_NEXT,
     ],
     cache_name="multimodal",
     priority=1,

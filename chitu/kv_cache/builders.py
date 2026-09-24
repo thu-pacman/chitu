@@ -505,10 +505,14 @@ def _build_multimodal_cache(
         ModelType.HF_QWEN3_VL,
         ModelType.HF_QWEN3_VL_MOE,
         ModelType.HF_QWEN3_5,
+        ModelType.GLM_5_NEXT,
     }:
         return None
 
-    if args.models.type == ModelType.HF_QWEN3_5 and args.infer.language_model_only:
+    if (
+        args.models.type in [ModelType.HF_QWEN3_5, ModelType.GLM_5_NEXT]
+        and args.infer.language_model_only
+    ):
         return None
 
     if args.infer.enable_prefix_caching:
@@ -529,7 +533,7 @@ def _build_multimodal_cache(
     vision_cfg = getattr(args.models, "vision_config", None)
     if vision_cfg is None:
         logger.warning(
-            "Qwen3-VL or Qwen-3.5 detected but args.models.vision_config is missing; "
+            "Multimodal model detected but args.models.vision_config is missing; "
             "skipping multimodal cache."
         )
         return None
@@ -705,6 +709,9 @@ def _build_glm5_next_cache_managers(args, attn_backend_type) -> CacheBuildBundle
         "main": main_cache,
         "linear": _build_linear_cache(args, layer_filter_fn=filter_linear),
     }
+    mm_cache = _build_multimodal_cache(args, main_cache)
+    if mm_cache is not None:
+        cache_dict["multimodal"] = mm_cache
     indexer = _build_indexer_cache(args, layer_filter_fn=filter_sparse)
     _attach_indexer_cache_managers(args, main_cache, main_managers, cache_dict, indexer)
     return CacheBuildBundle(

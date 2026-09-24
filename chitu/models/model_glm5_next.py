@@ -12,12 +12,20 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from chitu.attn_backend import FlashAttnBackend, RefAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
+from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.checkpoint_prefix import as_checkpoint_prefix
 from chitu.cp_utils import get_cp_context
 from chitu.global_vars import get_global_args
-from chitu.kv_cache import DenseKVCacheAccessor, KVCacheBase, PagedKVCacheAccessor
+from chitu.kv_cache import (
+    DenseKVCacheAccessor,
+    KVCacheBase,
+    MMPagedKVCache,
+    PagedKVCacheAccessor,
+)
 from chitu.models.model import (
+    LayerNorm,
     RMSNorm,
     RMSNormResidual,
     TransformerBlock,
@@ -34,10 +42,12 @@ from chitu.models.model_glm52 import (
     _IndexerBuffer,
     make_mlp_for_layer,
 )
+from chitu.models.mm_cache_mixin_qwen_vl import QwenVLMmCacheCoreMixin
 from chitu.models.registry import ModelType, register_model
 from chitu.ops import (
     append_to_dense_kv_cache,
     append_to_paged_kv_cache,
+    apply_rotary_pos_emb,
     blockfp8_weight_dequant,
     causal_conv1d_prefill,
     causal_conv1d_update,
@@ -55,12 +65,369 @@ from chitu.quantization import QuantizationRegistry
 from chitu.task_type import TaskType
 from chitu.tensor_parallel import ColumnParallelLinear, LocalLinear, RowParallelLinear
 from chitu.distributed.parallel_state import get_tp_size
+from chitu.utils import try_import_opt_dep
+
+
+flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 
 
 def get_mtp_accept_indices():
     from chitu.backend import Backend
 
     return Backend.model.mtp_accept_indices.get()
+
+
+def _require_vision_attrs(config, names: list[str]) -> None:
+    missing = [name for name in names if not hasattr(config, name)]
+    if missing:
+        raise ValueError(f"GLM-5.3-Flash vision_config is missing fields: {missing}")
+
+
+class Glm5NextVisionPatchEmbed(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.patch_size = int(config.patch_size)
+        self.temporal_patch_size = int(config.temporal_patch_size)
+        self.in_channels = int(config.in_channels)
+        self.embed_dim = int(config.hidden_size)
+        self.patch_dim = (
+            self.in_channels
+            * self.temporal_patch_size
+            * self.patch_size
+            * self.patch_size
+        )
+        kernel_size = (
+            self.temporal_patch_size,
+            self.patch_size,
+            self.patch_size,
+        )
+        self.proj = nn.Conv3d(
+            self.in_channels,
+            self.embed_dim,
+            kernel_size=kernel_size,
+            stride=kernel_size,
+            bias=True,
+        )
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        # `kernel_size == stride == (temporal_patch_size, patch_size, patch_size)`
+        # and the padding is zero, so every output element reads exactly one
+        # non-overlapping window of the input: the same arithmetic as a matmul over
+        # the flattened patch. cuDNN picks a pathological bf16 algorithm for the
+        # equivalent Conv3d here (~80 s for 17k patches on H20, vs <1 ms for the
+        # matmul), so compute it as a matmul instead. `self.proj` is kept as the
+        # (kernel-shaped) parameter container so checkpoint loading is unchanged.
+        weight = self.proj.weight
+        patches = pixel_values.to(dtype=weight.dtype).reshape(-1, self.patch_dim)
+        return F.linear(
+            patches,
+            weight.reshape(self.embed_dim, self.patch_dim),
+            self.proj.bias,
+        )
+
+
+class Glm5NextVisionMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.swiglu_limit = float(config.swiglu_limit)
+        hidden_size = int(config.hidden_size)
+        intermediate_size = int(config.intermediate_size)
+        self.gate_proj = nn.Linear(
+            hidden_size,
+            intermediate_size,
+            bias=True,
+        )
+        self.up_proj = nn.Linear(
+            hidden_size,
+            intermediate_size,
+            bias=True,
+        )
+        self.down_proj = nn.Linear(
+            intermediate_size,
+            hidden_size,
+            bias=True,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate = torch.clamp(self.gate_proj(hidden_states), max=self.swiglu_limit)
+        up = torch.clamp(
+            self.up_proj(hidden_states),
+            min=-self.swiglu_limit,
+            max=self.swiglu_limit,
+        )
+        return self.down_proj(F.silu(gate) * up)
+
+
+class Glm5NextVisionAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        hidden_size = int(config.hidden_size)
+        self.num_heads = int(config.num_heads)
+        self.head_dim = hidden_size // self.num_heads
+        self.scaling = self.head_dim**-0.5
+        eps = float(getattr(config, "rms_norm_eps", 1e-5))
+        self.q_norm = RMSNorm(self.head_dim, eps=eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=eps)
+        self.qkv = nn.Linear(
+            hidden_size,
+            hidden_size * 3,
+            bias=bool(getattr(config, "attention_bias", True)),
+        )
+        self.proj = nn.Linear(
+            hidden_size,
+            hidden_size,
+            bias=bool(getattr(config, "attention_bias", True)),
+        )
+        self.attn_backend = FlashAttnBackend() if has_flash_attn else RefAttnBackend()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        seq_lengths: list[int],
+        position_embeddings: BatchedFreqsCis,
+    ) -> torch.Tensor:
+        seq_length = hidden_states.shape[0]
+        query, key, value = (
+            self.qkv(hidden_states)
+            .reshape(seq_length, 3, self.num_heads, self.head_dim)
+            .permute(1, 0, 2, 3)
+            .unbind(0)
+        )
+        query = self.q_norm(query)
+        key = self.k_norm(key)
+        query, key = apply_rotary_pos_emb(
+            query,
+            key,
+            position_embeddings,
+            rotary_type="separated",
+        )
+
+        if has_flash_attn:
+            seq_len_delta = BatchedSeqLenDelta(
+                [0] * len(seq_lengths),
+                seq_lengths,
+                device=hidden_states.device,
+                use_prefix_lens_static_tensor=True,
+                use_position_ids_static_tensor=False,
+                use_delta_position_ids_static_tensor=False,
+                use_delta_seq_ids_static_tensor=False,
+            )
+            attn_output = self.attn_backend.prefill_ragged_qkvo(
+                query,
+                key,
+                value,
+                seq_len_delta,
+                causal=False,
+                softmax_scale=self.scaling,
+            )
+        else:
+            query_splits, key_splits, value_splits = (
+                torch.split(tensor, seq_lengths, dim=0)
+                for tensor in (query, key, value)
+            )
+            attn_outputs = [
+                self.attn_backend.prefill_ragged_qkvo(
+                    q,
+                    k,
+                    v,
+                    BatchedSeqLenDelta(
+                        [0],
+                        [q.size(0)],
+                        device=hidden_states.device,
+                        use_prefix_lens_static_tensor=True,
+                        use_position_ids_static_tensor=False,
+                        use_delta_position_ids_static_tensor=False,
+                        use_delta_seq_ids_static_tensor=False,
+                    ),
+                    causal=False,
+                    softmax_scale=self.scaling,
+                )
+                for q, k, v in zip(query_splits, key_splits, value_splits)
+            ]
+            attn_output = torch.cat(attn_outputs, dim=0)
+
+        return self.proj(attn_output.view(seq_length, -1).contiguous())
+
+
+class Glm5NextVisionBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        hidden_size = int(config.hidden_size)
+        eps = float(getattr(config, "rms_norm_eps", 1e-5))
+        self.norm1 = RMSNorm(hidden_size, eps=eps)
+        self.norm2 = RMSNorm(hidden_size, eps=eps)
+        self.attn = Glm5NextVisionAttention(config)
+        self.mlp = Glm5NextVisionMLP(config)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        seq_lengths: list[int],
+        position_embeddings: BatchedFreqsCis,
+    ) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn(
+            self.norm1(hidden_states), seq_lengths, position_embeddings
+        )
+        return hidden_states + self.mlp(self.norm2(hidden_states))
+
+
+class Glm5NextPatchMerger(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        hidden_size = int(config.out_hidden_size)
+        context_dim = int(config.projection_intermediate_size)
+        self.swiglu_limit = float(config.swiglu_limit)
+        self.proj = nn.Linear(
+            hidden_size,
+            hidden_size,
+            bias=False,
+        )
+        # HF uses `torch.nn.LayerNorm`, whose default eps is 1e-5 (not chitu's 1e-6).
+        self.post_projection_norm = LayerNorm(hidden_size, eps=1e-5)
+        self.extra_activation_func = nn.GELU()
+        self.gate_proj = nn.Linear(
+            hidden_size,
+            context_dim,
+            bias=False,
+        )
+        self.up_proj = nn.Linear(
+            hidden_size,
+            context_dim,
+            bias=False,
+        )
+        self.down_proj = nn.Linear(
+            context_dim,
+            hidden_size,
+            bias=False,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.proj(hidden_states)
+        hidden_states = self.extra_activation_func(
+            self.post_projection_norm(hidden_states)
+        )
+        gate = torch.clamp(self.gate_proj(hidden_states), max=self.swiglu_limit)
+        up = torch.clamp(
+            self.up_proj(hidden_states),
+            min=-self.swiglu_limit,
+            max=self.swiglu_limit,
+        )
+        return self.down_proj(F.silu(gate) * up)
+
+
+class Glm5NextVisionTransformer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        _require_vision_attrs(
+            config,
+            [
+                "patch_size",
+                "temporal_patch_size",
+                "in_channels",
+                "hidden_size",
+                "num_heads",
+                "intermediate_size",
+                "out_hidden_size",
+                "projection_intermediate_size",
+                "spatial_merge_size",
+                "swiglu_limit",
+                "depth",
+                "rms_norm_eps",
+            ],
+        )
+        self.hidden_size = int(config.hidden_size)
+        self.num_heads = int(config.num_heads)
+        self.head_dim = self.hidden_size // self.num_heads
+        self.spatial_merge_size = int(config.spatial_merge_size)
+        self.out_hidden_size = int(config.out_hidden_size)
+        self.patch_embed = Glm5NextVisionPatchEmbed(config)
+        rotary_dim = self.head_dim // 2
+        # Computed on CPU and moved together with the module: the model is built
+        # under `torch.device("meta")`, so a meta buffer would be replaced by
+        # uninitialized memory when the loader moves the module to the device.
+        inv_freq = 1.0 / (
+            10000.0
+            ** (
+                torch.arange(0, rotary_dim, 2, dtype=torch.float32, device="cpu")
+                / rotary_dim
+            )
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.blocks = nn.ModuleList(
+            Glm5NextVisionBlock(config) for layer_id in range(int(config.depth))
+        )
+        self.post_layernorm = RMSNorm(self.hidden_size, eps=float(config.rms_norm_eps))
+        self.downsample = nn.Conv2d(
+            self.hidden_size,
+            self.out_hidden_size,
+            kernel_size=self.spatial_merge_size,
+            stride=self.spatial_merge_size,
+            bias=True,
+        )
+        self.merger = Glm5NextPatchMerger(config)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.patch_embed.proj.weight.dtype
+
+    def rot_pos_emb(self, grid_thw: torch.Tensor) -> BatchedFreqsCis:
+        device = self.inv_freq.device
+        pos_ids = []
+        for frames, height, width in grid_thw.tolist():
+            height_positions = (
+                torch.arange(height, device=device).unsqueeze(1).expand(-1, width)
+            )
+            width_positions = (
+                torch.arange(width, device=device).unsqueeze(0).expand(height, -1)
+            )
+            height_positions = height_positions.reshape(
+                height // self.spatial_merge_size,
+                self.spatial_merge_size,
+                width // self.spatial_merge_size,
+                self.spatial_merge_size,
+            ).permute(0, 2, 1, 3)
+            width_positions = width_positions.reshape(
+                height // self.spatial_merge_size,
+                self.spatial_merge_size,
+                width // self.spatial_merge_size,
+                self.spatial_merge_size,
+            ).permute(0, 2, 1, 3)
+            pos_ids.append(
+                torch.stack(
+                    [height_positions.flatten(), width_positions.flatten()], dim=-1
+                ).repeat(frames, 1)
+            )
+        pos_ids = torch.cat(pos_ids, dim=0)
+        max_grid_size = int(grid_thw[:, 1:].max().item())
+        positions = torch.arange(
+            max_grid_size, device=device, dtype=self.inv_freq.dtype
+        )
+        freqs = torch.outer(positions, self.inv_freq)
+        freqs = freqs[pos_ids].flatten(1)
+        return BatchedFreqsCis(freqs.cos(), freqs.sin())
+
+    def forward(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        hidden_states = self.patch_embed(pixel_values)
+        position_embeddings = self.rot_pos_emb(grid_thw)
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0).to(hidden_states.device)
+        # Shared by all blocks: computing it here avoids one host sync per layer.
+        seq_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+
+        for block in self.blocks:
+            hidden_states = block(hidden_states, seq_lengths, position_embeddings)
+
+        hidden_states = self.post_layernorm(hidden_states)
+        hidden_states = hidden_states.view(
+            -1, self.spatial_merge_size, self.spatial_merge_size, self.hidden_size
+        )
+        hidden_states = hidden_states.permute(0, 3, 1, 2)
+        hidden_states = self.downsample(hidden_states).view(-1, self.out_hidden_size)
+        return self.merger(hidden_states)
 
 
 class IndexerGLM5Next(IndexerGLM52):
@@ -904,7 +1271,7 @@ class TransformerBlockGLM5NextMTP(TransformerBlockGLM52MTP):
 
 
 @register_model(ModelType.GLM_5_NEXT)
-class TransformerGLM5Next(TransformerDeepSeekV3):
+class TransformerGLM5Next(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
     @override
     def __init__(
         self,
@@ -916,6 +1283,8 @@ class TransformerGLM5Next(TransformerDeepSeekV3):
         op_impl: str,
         mla_absorb: str,
     ):
+        self.language_model_only = bool(get_global_args().infer.language_model_only)
+        self.vision_config = getattr(params, "vision_config", None)
         super().__init__(
             params,
             cache_dict,
@@ -924,6 +1293,16 @@ class TransformerGLM5Next(TransformerDeepSeekV3):
             op_impl=op_impl,
             mla_absorb=mla_absorb,
         )
+        if not self.language_model_only and self.pp_stage == 0:
+            if self.vision_config is None:
+                raise ValueError("GLM-5.3-Flash requires params.vision_config")
+            self.image_token_id = int(self.vision_config.image_token_id)
+            self.visual = Glm5NextVisionTransformer(self.vision_config)
+        # Both dicts are maintained by `QwenVLMmCacheCoreMixin._mm_cache_cleanup`;
+        # this model has no MRoPE, so `_rope_delta_by_req` stays empty.
+        self._mm_req_cache: dict[str, dict[str, Any]] = {}
+        self._rope_delta_by_req: dict[str, torch.Tensor] = {}
+        self.mm_cache: Optional[MMPagedKVCache] = cache_dict.get("multimodal")
 
     @override
     def _init_layers(self, cache_dict: dict[str, KVCacheBase], attn_backend, op_impl):
@@ -986,11 +1365,171 @@ class TransformerGLM5Next(TransformerDeepSeekV3):
 
     @override
     def _pre_layers(self, h, **args):
-        return (
-            super()
-            ._pre_layers(h, **args)
-            .unsqueeze(1)
-            .repeat(1, self.params.hc_mult, 1)
+        if self.pp_stage != 0:
+            assert h is not None and h.ndim == 3
+            return h
+
+        if self.language_model_only:
+            return (
+                super()
+                ._pre_layers(h, **args)
+                .unsqueeze(1)
+                .repeat(1, self.params.hc_mult, 1)
+            )
+
+        input_ids = h.reshape(-1)
+        inputs_embeds = super()._pre_layers(input_ids)
+        if not self._has_visual_payload(args):
+            self._mm_cache_cleanup()
+            return inputs_embeds.unsqueeze(1).repeat(1, self.params.hc_mult, 1)
+
+        pixel_values = args.get("pixel_values")
+        grid_thw = args.get("grid_thw")
+        image_mask = input_ids == self.image_token_id
+        if not bool(image_mask.any()):
+            # This chunk holds no placeholder token (e.g. the tail chunks of a long
+            # prompt that carries the image earlier). The vision tower is deferred to
+            # the chunk that actually consumes the features, so there is nothing to
+            # encode or consume here.
+            self._mm_cache_cleanup()
+            return inputs_embeds.unsqueeze(1).repeat(1, self.params.hc_mult, 1)
+
+        # NOTE: `image_token_id` is shared by images and videos (`video_token_id` is
+        # the same id in the checkpoint), and HF excludes the
+        # `<video_start> .. <video_end>` span from the image placeholder mask. Only
+        # images are supported here, so no span exclusion is needed yet.
+        curr_tids = getattr(self.cache_dict["main"], "curr_tids", None)
+        if curr_tids is None or len(curr_tids) <= 0:
+            raise ValueError(
+                "GLM-5.3-Flash multimodal prefill requires cache curr_tids."
+            )
+        seq_ids = self.cache_dict["main"].seq_len_delta.delta_seq_ids_tensor_device.to(
+            device=input_ids.device
+        )
+        self._mm_cache_cleanup()
+        mm_cache = self._require_mm_cache()
+
+        # Requests that either have cached vision features or hold image tokens in
+        # this chunk, computed with a single device-to-host sync.
+        tokens_per_req = torch.bincount(
+            seq_ids[image_mask].long(), minlength=len(curr_tids)
+        ).tolist()
+        req_indices = [
+            req_idx
+            for req_idx, req_id in enumerate(curr_tids)
+            if tokens_per_req[req_idx] > 0
+            or mm_cache.get_consumption_progress(req_id, "vision_embeds") > 0
+        ]
+
+        # Encode only the visual inputs of requests that still need a write, so a
+        # prompt spanning several chunks does not re-run the vision tower each time.
+        image_to_req = self._map_images_to_requests(
+            curr_tids, req_indices, int(grid_thw.shape[0])
+        )
+        images_to_encode = [
+            image_idx
+            for image_idx, req_idx in enumerate(image_to_req)
+            if not self._mm_vision_written(curr_tids[req_idx])
+        ]
+        if images_to_encode:
+            self._write_vision_to_mm_cache(
+                kind="vision",
+                per_req_feats=self._encode_images_by_request(
+                    pixel_values,
+                    grid_thw,
+                    curr_tids,
+                    image_to_req,
+                    images_to_encode,
+                ),
+                per_req_ds={},
+            )
+
+        positions, embeds, _ = self._read_vision_from_mm_cache(
+            kind="vision",
+            token_id=self.image_token_id,
+            req_ids=curr_tids,
+            seq_ids=seq_ids,
+            input_ids_flat=input_ids,
+            tensor_keys=["vision_embeds"],
+        )
+        if positions is None or embeds is None or positions.numel() == 0:
+            raise ValueError(
+                "GLM-5.3-Flash multimodal cache returned no embeddings for "
+                "placeholder tokens"
+            )
+        image_token_count = int(image_mask.sum().item())
+        if positions.numel() != embeds.shape[0] or image_token_count != embeds.shape[0]:
+            raise ValueError(
+                "GLM-5.3-Flash visual features and placeholder tokens do not match: "
+                f"tokens={image_token_count}, features={int(embeds.shape[0])}"
+            )
+        inputs_embeds = inputs_embeds.clone()
+        inputs_embeds[positions] = embeds.to(
+            device=inputs_embeds.device, dtype=inputs_embeds.dtype
+        )
+        return inputs_embeds.unsqueeze(1).repeat(1, self.params.hc_mult, 1)
+
+    def get_image_features(
+        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
+        if self.visual is None:
+            raise ValueError("GLM-5.3-Flash vision encoder is not initialized")
+        visual_embeds = self.visual(pixel_values, grid_thw)
+        split_sizes = (grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+        return torch.split(visual_embeds, split_sizes, dim=0)
+
+    @staticmethod
+    def _map_images_to_requests(
+        curr_tids: list[str],
+        req_indices: list[int],
+        num_images: int,
+    ) -> list[int]:
+        """Map every visual input, in prompt order, to the request it belongs to."""
+        if len(curr_tids) == 1:
+            return [0] * num_images
+        if num_images == len(req_indices) and req_indices:
+            # A multi-image single request, or one visual input per candidate request.
+            return list(req_indices)
+        if num_images == len(curr_tids):
+            return list(range(len(curr_tids)))
+        raise ValueError(
+            "GLM-5.3-Flash multimodal prefill needs an unambiguous mapping "
+            f"from images to requests: requests={len(curr_tids)}, "
+            f"images={num_images}, candidates={len(req_indices)}."
+        )
+
+    def _encode_images_by_request(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+        curr_tids: list[str],
+        image_to_req: list[int],
+        images_to_encode: list[int],
+    ) -> dict[str, list[torch.Tensor]]:
+        """Encode the requested visual inputs and group them by request."""
+        if not images_to_encode:
+            return {}
+        if len(images_to_encode) == len(image_to_req):
+            encoded_pixel_values, encoded_grid_thw = pixel_values, grid_thw
+        else:
+            # One `pixel_values` row per patch, i.e. `prod(t, h, w)` rows per image.
+            image_rows = grid_thw.prod(-1).tolist()
+            image_pixels = torch.split(pixel_values, image_rows, dim=0)
+            encoded_pixel_values = torch.cat(
+                [image_pixels[image_idx] for image_idx in images_to_encode], dim=0
+            )
+            encoded_grid_thw = grid_thw[images_to_encode]
+
+        splits = self.get_image_features(encoded_pixel_values, encoded_grid_thw)
+        per_req_feats: dict[str, list[torch.Tensor]] = {}
+        for split, image_idx in zip(splits, images_to_encode):
+            rid = curr_tids[image_to_req[image_idx]]
+            per_req_feats.setdefault(rid, []).append(split)
+        return per_req_feats
+
+    def _mm_vision_written(self, rid: str) -> bool:
+        return bool(
+            self._mm_state_get(rid, {}).get(self._mm_write_done_key("vision"), False)
         )
 
     def _run_non_mtp_layers(
@@ -999,6 +1538,34 @@ class TransformerGLM5Next(TransformerDeepSeekV3):
         for layer in self.non_mtp_layers:
             h = layer(h, freqs_cis)
         return h
+
+    @staticmethod
+    def _has_visual_payload(args: dict[str, Any]) -> bool:
+        return args.get("pixel_values") is not None and args.get("grid_thw") is not None
+
+    def _prepare_prefill_inputs(
+        self,
+        tokens: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        delta_total: int,
+        args: dict[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor, BatchedFreqsCis, int]:
+        has_visual_payload = self._has_visual_payload(args)
+        if has_visual_payload and self.cp_context.is_active:
+            raise ValueError("GLM-5.3-Flash multimodal prefill does not support CP")
+
+        if has_visual_payload:
+            h = self._pre_layers(tokens, **args)
+            return tokens, h, freqs_cis, int(h.shape[0])
+
+        tokens, _, freqs_cis = self.cp_context.split_prefill(
+            tokens=tokens,
+            hiddens=None,
+            freqs_cis=freqs_cis,
+            total_tokens=delta_total,
+        )
+        h = self._pre_layers(tokens, **args)
+        return tokens, h, freqs_cis, int(tokens.shape[0])
 
     @override
     def _post_layers(self, h):
@@ -1014,8 +1581,8 @@ class TransformerGLM5Next(TransformerDeepSeekV3):
         self._clear_backbone_indexer_buffer()
         freqs_cis = self.prepare_freqs_cis()
         delta_total = self.cache_dict["main"].seq_len_delta.delta_total_len
-        tokens, _, freqs_cis = self.cp_context.split_prefill(
-            tokens=tokens, hiddens=None, freqs_cis=freqs_cis, total_tokens=delta_total
+        tokens, h, freqs_cis, num_tokens = self._prepare_prefill_inputs(
+            tokens, freqs_cis, delta_total, args
         )
 
         if self.cp_context.step_active:
@@ -1026,9 +1593,8 @@ class TransformerGLM5Next(TransformerDeepSeekV3):
             )
 
         if self.moe_impl is not None:
-            self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
+            self.moe_impl.prepare(TaskType.Prefill, num_tokens)
 
-        h = self._pre_layers(tokens, **args)
         h = self._run_non_mtp_layers(h, freqs_cis)
         if self.mtp_size > 1:
             self.mtp_prefill(
@@ -1069,14 +1635,9 @@ class TransformerGLM5Next(TransformerDeepSeekV3):
 
         if self.pp_stage == 0:
             assert tokens is not None and hiddens is None
-            tokens, _, freqs_cis = self.cp_context.split_prefill(
-                tokens=tokens,
-                hiddens=None,
-                freqs_cis=freqs_cis,
-                total_tokens=delta_total,
+            tokens, h, freqs_cis, batch_size = self._prepare_prefill_inputs(
+                tokens, freqs_cis, delta_total, args
             )
-            batch_size = tokens.shape[0]
-            h = self._pre_layers(tokens, **args)
         else:
             assert hiddens is not None and hiddens.ndim == 3
             if self.pp_stage == self.pp_end_stage and self.mtp_size > 1:
@@ -1185,6 +1746,8 @@ class TransformerGLM5Next(TransformerDeepSeekV3):
             prefix_mappings.append(
                 ("model.language_model.embed_tokens.", "embed_tokens.")
             )
+            if not self.language_model_only:
+                prefix_mappings.append(("model.visual.", "visual."))
         if self.pp_stage == self.pp_end_stage:
             prefix_mappings.extend(
                 [
@@ -1197,6 +1760,13 @@ class TransformerGLM5Next(TransformerDeepSeekV3):
                     ("model.language_model.embed_tokens.", "embed_tokens.")
                 )
         return prefix_mappings
+
+    @override
+    def _get_pre_layer_prefixes(self) -> list[str]:
+        prefixes = super()._get_pre_layer_prefixes()
+        if not self.language_model_only and self.pp_stage == 0:
+            prefixes.append("visual.")
+        return prefixes
 
     @override
     def _get_layer_i_prefix_mapping(self, i: int) -> tuple[str, str]:
@@ -1217,8 +1787,35 @@ class TransformerGLM5Next(TransformerDeepSeekV3):
         return ret
 
     @override
-    def _get_tensor_row_parallel_layer_names(self) -> list[str]:
-        return super()._get_tensor_row_parallel_layer_names() + ["self_attn.o_proj"]
+    def _chunk_checkpoint_for_tensor_parallel(
+        self,
+        checkpoint: dict[str, Any],
+        tp_rank: int,
+        etp_rank: int,
+        tp_size: int,
+        etp_size: int,
+    ):
+        visual_checkpoint = {
+            key: checkpoint.pop(key)
+            for key in list(checkpoint)
+            if key.startswith("visual.")
+        }
+        checkpoint = super()._chunk_checkpoint_for_tensor_parallel(
+            checkpoint, tp_rank, etp_rank, tp_size, etp_size
+        )
+        checkpoint.update(visual_checkpoint)
+        return checkpoint
+
+    @override
+    def process_state_dict_for_merging_gate_up(self, checkpoint: dict[str, Any]):
+        visual_checkpoint = {
+            key: checkpoint.pop(key)
+            for key in list(checkpoint)
+            if key.startswith("visual.")
+        }
+        checkpoint = super().process_state_dict_for_merging_gate_up(checkpoint)
+        checkpoint.update(visual_checkpoint)
+        return checkpoint
 
     @override
     def process_state_dict_for_splitting_qkv(self, checkpoint: dict[str, Any]):
