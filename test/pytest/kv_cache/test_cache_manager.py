@@ -3,6 +3,7 @@ from chitu.kv_cache import (
     DeepSeekV4CompressedKVCacheManager,
     DeepSeekV4SlidingKVCacheManager,
     PagedKVCacheManager,
+    SingletonPagedKVCacheManager,
     TokenBlock,
     BlockIdentityChainBuilder,
     BlockRuntime,
@@ -16,7 +17,7 @@ from omegaconf import OmegaConf
 from chitu.global_vars import set_global_args
 from chitu.backend import Backend
 from chitu.utils import ceil_div
-from chitu.scheduler import Scheduler
+from chitu.scheduler import Scheduler, KVCacheCapacityStatus
 
 
 @pytest.fixture(autouse=True)
@@ -635,6 +636,272 @@ class TestPagedKVCacheManagerWithPrefixCaching:
         assert len(main_manager.active_blocks) == 3  # [0,1,2]
         main_manager.finalize_metadata_all_decode(task_1)
         main_manager.finalize_metadata_all_decode(task_2)
+
+
+def _build_singleton_manager(checkpoint_interval=None, mtp_size=1, num_blocks=256):
+    return SingletonPagedKVCacheManager(
+        num_blocks=num_blocks,
+        num_hot_req=4,
+        max_seq_len=2048,
+        mtp_size=mtp_size,
+        dp_rank=0,
+        checkpoint_interval=checkpoint_interval,
+        enable_prefix_caching=True,
+        manager_name="linear",
+    )
+
+
+def _build_mock_task(name, prompt_len, chunk_size, consumed=0):
+    req = UserRequest.create_mock(
+        input_len=prompt_len, request_id=name, enable_thinking=False
+    )
+    task = Task(name, req)
+    task.task_type = TaskType.Prefill
+    task.dp_rank = 0
+    # 前缀缓存判定看的是「已经算到哪」（consumed_req_tokens），正常由调度器维护
+    task.consumed_req_tokens = consumed
+    task.set_prefill_chunk_size_for_one_step(chunk_size)
+    return task
+
+
+class TestSingletonPagedKVCacheManager:
+    """linear attn / MTP state 的 manager：in-place block 与 ckpt block 分开管。"""
+
+    def test_without_checkpoint_interval_has_no_prefix_cache(self):
+        """没有 checkpoint_interval 时请求只有独占的 in-place block，前缀缓存恒关闭。"""
+        manager = _build_singleton_manager(checkpoint_interval=None, mtp_size=2)
+
+        assert manager.block_size == 1
+        assert manager.enable_prefix_caching is False
+        assert manager.max_blocks_per_req == 2
+        # 总占用 = 固定预留（spec block）+ 与 token 位置存在映射的块（C=None 时恒 0）
+        assert manager.num_blocks_for_seq_len(0) == 0
+        assert manager.num_blocks_for_seq_len(1) == 2
+        assert manager.num_fixed_blocks_per_req() == 2
+        assert manager.num_token_mapped_blocks_for_seq_len(1) == 0
+
+        task = _build_mock_task("req", 64, 64)
+        assert manager.num_cached_blocks(task) == 0
+        assert manager.num_owned_blocks(task) == 0
+
+        new_cache_ids = manager.prepare_metadata_before_prefill(task)
+        assert len(new_cache_ids) == 2
+        # spec block 每请求独占，从不进基类的 task_to_cache_ids（那里只放 ckpt block）
+        assert manager.task_to_spec_cache_ids[task.task_id] == new_cache_ids
+        assert manager.task_to_cache_ids.get(task.task_id, set()) == set()
+        # num_owned_blocks：2个inplace_blocks(fix_block_ids)
+        assert manager.num_owned_blocks(task) == 2
+        # 每个请求的所有 block 是一次性分配的，后续 prefill step 不再新增
+        assert manager.prepare_metadata_before_prefill(task) == []
+        # decode 也复用同一批 block
+        assert manager.prepare_metadata_before_decode(task) == []
+
+        manager.finalize_metadata_all_decode(task)
+        assert task.task_id not in manager.task_to_spec_cache_ids
+        assert task.task_id not in manager.task_to_cache_ids
+        # in-place block 全部还回空闲池
+        assert manager.num_owned_blocks(task) == 0
+        assert len(manager.free_cache_ids) == manager.num_blocks
+
+    def test_decode_without_inplace_blocks_raises(self):
+        manager = _build_singleton_manager(checkpoint_interval=None)
+        task = _build_mock_task("ghost", 64, 64)
+        with pytest.raises(RuntimeError, match="without in-place blocks"):
+            manager.prepare_metadata_before_decode(task)
+
+    def test_checkpoint_interval_sets_block_size(self):
+        manager = _build_singleton_manager(checkpoint_interval=64, mtp_size=2)
+
+        # 一个 ckpt block 覆盖 C 个 token
+        assert manager.block_size == 64
+        assert manager.checkpoint_interval == 64
+        assert manager.enable_prefix_caching is True
+        # mtp_size 个 in-place block + ceil_div(max_seq_len, C) 个 ckpt block
+        assert manager.max_blocks_per_req == 2 + ceil_div(2048, 64)
+        # 总占用 = 固定预留（mtp_size）+ 与 token 位置存在映射的块（ckpt block）
+        assert manager.num_fixed_blocks_per_req() == 2
+        assert manager.num_blocks_for_seq_len(0) == 0
+        assert manager.num_blocks_for_seq_len(64) == 2 + 1
+        assert manager.num_blocks_for_seq_len(65) == 2 + 2
+        # 位置映射本身只数 ckpt block，且与 len(task_to_cache_ids) 契约一致
+        assert manager.num_token_mapped_blocks_for_seq_len(64) == 1
+        assert manager.num_token_mapped_blocks_for_seq_len(65) == 2
+
+    def test_block_size_must_equal_checkpoint_interval(self):
+        with pytest.raises(ValueError, match="must equal"):
+            SingletonPagedKVCacheManager(
+                num_blocks=256,
+                num_hot_req=4,
+                max_seq_len=2048,
+                mtp_size=1,
+                checkpoint_interval=64,
+                enable_prefix_caching=True,
+                block_size=128,
+                manager_name="linear",
+            )
+
+    def test_prefill_returns_spec_then_ckpt_blocks(self):
+        """new_cache_ids 的布局：[spec_0 .. spec_{K-1} | ckpt_0 ... ckpt_k]。"""
+        manager = _build_singleton_manager(checkpoint_interval=64)
+        task = _build_mock_task("req", 256, 128)
+
+        new_cache_ids = manager.prepare_metadata_before_prefill(task)
+
+        # 128 token = 2 个 ckpt block，加上 1 个 in-place spec block
+        assert len(new_cache_ids) == 3
+        spec_ids = manager.task_to_spec_cache_ids[task.task_id]
+        assert new_cache_ids[: len(spec_ids)] == spec_ids
+        # task_to_cache_ids 只放可复用的 ckpt block（调度器据此做前缀缓存记账）
+        assert manager.task_to_cache_ids[task.task_id] == set(new_cache_ids[1:])
+
+        # spec block 独占，不再重复分配；续算只追加 ckpt block
+        task.consume_req_tokens()
+        task.set_prefill_chunk_size_for_one_step(128)
+        follow_up = manager.prepare_metadata_before_prefill(task)
+        assert len(follow_up) == 2
+        assert spec_ids[0] not in follow_up
+
+        manager.finalize_metadata_all_decode(task)
+        # 请求持有的块全部释放：in-place 块回到空闲池，已被 prefix cache 复用的
+        # ckpt 块留在 cached_idle_blocks 里等下一个同前缀的请求
+        assert not manager.active_blocks
+        assert len(manager.free_cache_ids) + len(manager.cached_idle_blocks) == (
+            manager.num_blocks
+        )
+
+    def test_full_hit_task_reuses_spec_and_cached_ckpt_blocks(self):
+        """同前缀的第二个任务：spec block 自己新分配，ckpt block 命中共享。"""
+        manager = _build_singleton_manager(checkpoint_interval=64)
+        first = _build_mock_task("req_a", 256, 256)
+        assert len(manager.prepare_metadata_before_prefill(first)) == 1 + 4
+        first_ckpt_ids = sorted(manager.task_to_cache_ids[first.task_id])
+
+        # 命中 4 个 ckpt block（4 * 64 = 256 token），只差最后一个 token 没算
+        second = _build_mock_task("req_b", 256, 1, consumed=255)
+        assert manager.num_cached_blocks(second) == 4
+
+        # new_cache_ids = [自己的 spec block | 命中的 4 个 ckpt block]
+        new_cache_ids = manager.prepare_metadata_before_prefill(second)
+        assert new_cache_ids[0] in manager.task_to_spec_cache_ids[second.task_id]
+        assert sorted(new_cache_ids[1:]) == first_ckpt_ids
+        # 命中没有新分配任何 ckpt block
+        assert manager.task_to_cache_ids[second.task_id] == set(first_ckpt_ids)
+
+        manager.finalize_metadata_all_decode(second)
+        # first 还持有这些 ckpt block，不会被回收
+        assert sorted(manager.task_to_cache_ids[first.task_id]) == first_ckpt_ids
+        manager.finalize_metadata_all_decode(first)
+        assert not manager.active_blocks
+        assert len(manager.free_cache_ids) + len(manager.cached_idle_blocks) == (
+            manager.num_blocks
+        )
+
+    def test_admission_budget_equals_first_allocation(self):
+        """准入的 need 必须等于首次 prefill 真正要拿的块数（固定预留 + 位置映射的块）。
+
+        旧实现里 num_blocks_for_seq_len 只数 ckpt block，need 偏小：池子接近打满时
+        调度器会放行，随后 prepare 里 get_free_cache_idx 抛 "No more free KVCache blocks"。
+        """
+        manager = _build_singleton_manager(checkpoint_interval=64, mtp_size=2)
+        task = _build_mock_task("req", 256, 64)
+        cached_len = task.consumed_req_tokens
+        target_len = cached_len + task.next_req_tokens_len
+
+        need = manager.num_blocks_to_reserve(
+            task, cached_len=cached_len, target_len=target_len
+        )
+        assert need == 2 + 1  # mtp_size 个 in-place block + 1 个 ckpt block
+        assert len(manager.prepare_metadata_before_prefill(task)) == need
+
+        # 续算时同样成立：need 恰好是这一步新追加的 ckpt block 数
+        task.consume_req_tokens()
+        task.set_prefill_chunk_size_for_one_step(64)
+        cached_len = task.consumed_req_tokens
+        target_len = cached_len + task.next_req_tokens_len
+        need = manager.num_blocks_to_reserve(
+            task, cached_len=cached_len, target_len=target_len
+        )
+        assert need == 1
+        assert len(manager.prepare_metadata_before_prefill(task)) == need
+
+    def test_admission_budget_counts_fixed_blocks_without_ownership(self):
+        """任务命中前缀但还没进 manager 时，固定预留不能被当成"已占用"。
+
+        PD decode 路径就是这样：cached_len 来自 prefill 侧的命中长度，而本实例上一个块
+        都还没分配。旧实现会把固定预留抵扣掉，need 算成 0。
+        """
+        manager = _build_singleton_manager(checkpoint_interval=None, mtp_size=2)
+        task = _build_mock_task("req", 256, 64, consumed=255)
+
+        need = manager.num_blocks_to_reserve(
+            task,
+            cached_len=task.consumed_req_tokens,
+            target_len=task.consumed_req_tokens + task.next_req_tokens_len,
+        )
+        assert need == 2
+        assert len(manager.prepare_metadata_before_prefill(task)) == need
+
+    def test_realloc_clears_spec_bookkeeping(self):
+        manager = _build_singleton_manager(checkpoint_interval=64)
+        task = _build_mock_task("req", 128, 128)
+        manager.prepare_metadata_before_prefill(task)
+
+        manager.realloc(1024)
+        assert manager.num_blocks == 1024
+        assert not manager.task_to_spec_cache_ids
+
+
+class TestSingletonAdmissionCapacity:
+    """准入容量检查必须把固定预留算进 need，否则放行后会在分配时炸掉。"""
+
+    class _Harness:
+        """只填 Scheduler 容量检查需要的属性，复用它的真实逻辑。"""
+
+        _check_prefill_capacity = Scheduler._check_prefill_capacity
+        _inflight_prefill_reserved_blocks = Scheduler._inflight_prefill_reserved_blocks
+
+        def __init__(self, manager):
+            self.cache_manager_dict = {manager.manager_name: manager}
+            self.kvcache_block_threshold = manager.num_blocks
+
+    def _manager(self, num_blocks):
+        return SingletonPagedKVCacheManager(
+            num_blocks=num_blocks,
+            num_hot_req=4,
+            max_seq_len=2048,
+            mtp_size=2,
+            dp_rank=0,
+            checkpoint_interval=64,
+            enable_prefix_caching=True,
+            manager_name="linear",
+        )
+
+    def test_pool_exactly_fit_is_admitted_and_allocatable(self):
+        """可用块刚好等于 need（含 mtp_size 个 in-place block）时必须能分配成功。"""
+        manager = self._manager(num_blocks=6)
+        harness = self._Harness(manager)
+
+        holder = _build_mock_task("holder", 256, 64)
+        assert len(manager.prepare_metadata_before_prefill(holder)) == 3
+
+        newbie = _build_mock_task("newbie", 256, 64)
+        assert harness._check_prefill_capacity(newbie, 0) is KVCacheCapacityStatus.OK
+        # 放行就必须真的能分配出来（need == 实际申请块数 == 3 == 剩余空闲块）
+        assert len(manager.prepare_metadata_before_prefill(newbie)) == 3
+
+    def test_pool_one_block_short_is_congested(self):
+        """少一块就必须判为拥塞，而不是放行后抛 No more free KVCache blocks。"""
+        manager = self._manager(num_blocks=5)
+        harness = self._Harness(manager)
+
+        holder = _build_mock_task("holder", 256, 64)
+        manager.prepare_metadata_before_prefill(holder)
+
+        newbie = _build_mock_task("newbie", 256, 64)
+        assert (
+            harness._check_prefill_capacity(newbie, 0)
+            is KVCacheCapacityStatus.CONGESTED
+        )
 
 
 class TestBlockBuilderInterfaces:

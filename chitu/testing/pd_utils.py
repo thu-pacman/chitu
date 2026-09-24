@@ -17,19 +17,34 @@ from chitu.global_vars import get_global_args
 from chitu.metrics import stop_metrics_monitor
 from chitu.task import UserRequest
 from chitu.dp_router import get_request_router, get_token_router
+from chitu.testing.phonebook import (
+    SHARED_SEED,
+    check_phonebook_test_results,
+    check_prefix_cache_hit,
+    gen_phonebook_prompt,
+)
 
 if TYPE_CHECKING:
     from chitu.distributed.pd_disaggregation.pd_request_router import PDRequestRouter
 
 logger = logging.getLogger(__name__)
 
-# Shared system prompt long enough to fill ≥1 full KV block (block_size=64 tokens).
-_SHARED_SYSTEM_PROMPT = (
+# 共享 system prompt 要够长，至少要能填满几个完整的 KV block——比一个 block 短的前缀
+# 永远不会被复用，pd_test 末尾的 "prefix caching check" 就会失败。
+# block size 随模型/后端变化（chitu/kv_cache/registry.py: default_paged_block_size_policy）：
+# MLA absorb 的模型（如 GLM-4.7-Flash / DeepSeek）是 64，而线性注意力模型
+# （Qwen3-Next / Qwen3.5 / GLM-5.3-Flash 在 H20 上）是 256，所以这里按最大的 256 来准备。
+# 8 段（约 1.4k 字）能装满 3 个 256 的 block。
+_BASE_SYSTEM_PROMPT = (
     "你是一位知识渊博、经验丰富的人工智能助手，擅长回答各种类型的问题，"
     "包括但不限于烹饪食谱、编程技术、科学知识、生活建议、历史文化、数学计算、"
     "语言翻译、创意写作等领域。你的回答应该详细、专业、条理清晰，确保内容"
     "准确、全面且易于理解。在回答之前，请先仔细分析用户的问题意图和需求，"
     "然后组织你的思考过程，最后给出结构化的高质量回答。"
+)
+
+_SHARED_SYSTEM_PROMPT = "\n\n".join(
+    f"[背景说明 {i:02d}] {_BASE_SYSTEM_PROMPT}" for i in range(1, 9)
 )
 
 
@@ -57,11 +72,21 @@ class PDTestRunner:
         # enable == 2 → inject a shared system prompt so that later
         # requests can hit the prefix cache.
         self._inject_system_prompt = test_cfg.enable == 2
+        # phonebook → long shared phone-book body per request, with the answer
+        # checked at the end. Supersedes the shared system prompt above: the
+        # phone-book body is already long enough to fill several KV blocks.
+        self._phonebook = bool(test_cfg.phonebook)
+        self._phonebook_num_entries = int(test_cfg.phonebook_num_entries)
+        self._shared_prefix = self._inject_system_prompt or self._phonebook
+        # request_id → expected phone number (phonebook mode only)
+        self._expected: dict[str, str] = {}
 
         logger.info(
             f"[PD_TEST] test mode enabled: num_requests={self.num_requests} "
             f"timeout={self.req_timeout:.1f}s output_len={self.output_len} "
-            f"inject_system_prompt={self._inject_system_prompt}"
+            f"inject_system_prompt={self._inject_system_prompt} "
+            f"phonebook={self._phonebook} "
+            f"phonebook_num_entries={self._phonebook_num_entries}"
         )
 
     # ------------------------------------------------------------------
@@ -96,16 +121,27 @@ class PDTestRunner:
         [{"role": "user", "content": "what is the recipe of mayonnaise?"}],
     ]
 
-    def _build_message(self, i: int) -> list[dict[str, str]]:
-        """Build one test message.
+    def _build_message(self, i: int) -> tuple[list[dict[str, str]], Optional[str]]:
+        """Build one test message, plus its expected answer when applicable.
 
         When ``pd_test.enable == 2``, every message is prefixed with a
         shared system prompt so that later requests hit the prefix cache.
+        When ``pd_test.phonebook`` is set, the message is instead a long
+        phone-book prompt: every request shares the same body (fixed seed) and
+        asks about a different entry, and the returned expected number is what
+        the reply must contain — that is what turns a prefix-cache hit into a
+        correctness check rather than a mere hit counter.
         """
+        if self._phonebook:
+            exp_idx = (i * 7 + 3) % self._phonebook_num_entries
+            prompt, expected = gen_phonebook_prompt(
+                self._phonebook_num_entries, exp_idx, seed=SHARED_SEED
+            )
+            return [{"role": "user", "content": prompt}], expected
         msg = self._TEST_MESSAGES[i % len(self._TEST_MESSAGES)]
         if self._inject_system_prompt:
-            return [{"role": "system", "content": _SHARED_SYSTEM_PROMPT}] + msg
-        return msg
+            return [{"role": "system", "content": _SHARED_SYSTEM_PROMPT}] + msg, None
+        return msg, None
 
     async def _create_requests(self) -> list[str]:
         logger.info(f"[PD_TEST] creating {self.num_requests} test requests")
@@ -114,7 +150,7 @@ class PDTestRunner:
         token_router = get_token_router()
 
         for i in range(self.num_requests):
-            msg = self._build_message(i)
+            msg, expected = self._build_message(i)
             req = UserRequest.create(
                 msg,
                 request_id=f"pd_test_{i:06d}",
@@ -123,6 +159,8 @@ class PDTestRunner:
                 temperature=0,
             )
             request_ids.append(req.request_id)
+            if expected is not None:
+                self._expected[req.request_id] = expected
             logger.debug(
                 f"[PD_TEST] request {req.request_id} prompt={msg[0]['content'][:40]}..."
             )
@@ -227,40 +265,48 @@ class PDTestRunner:
 
         request_router: "PDRequestRouter" = get_request_router()
         token_router = get_token_router()
+        all_reqs: list[tuple[UserRequest, Optional[str]]] = []
+        answer_pairs: list[tuple[UserRequest, str]] = []
         for rid, req in self.req_pool.items():
             if not rid.startswith("pd_test_"):
                 continue
             completed_flag = rid not in token_router.active_requests
+            expected = self._expected.get(rid)
             logger.warning(
                 f"[PD_TEST][result] rid={rid} "
                 f"input_len={req.prompt_len} max_new_tokens={req.max_new_tokens} "
                 f"output_tokens={req.num_output_tokens} "
                 f"cached_tokens={req.num_hit_tokens} "
+                f"expected={expected} "
                 f"output={req.output}"
             )
+            all_reqs.append((req, expected))
+            if expected is not None:
+                answer_pairs.append((req, expected))
 
-        # When prefix caching is enabled and test mode is 2 (shared system
-        # prompt), verify that at least one request hit the prefix cache.
-        if get_global_args().infer.enable_prefix_caching and self._inject_system_prompt:
-            num_cache_hit = sum(
-                1
-                for rid, req in self.req_pool.items()
-                if rid.startswith("pd_test_")
-                and req.num_hit_tokens is not None
-                and req.num_hit_tokens > 0
-            )
-            if num_cache_hit == 0:
-                logger.error(
-                    "[PD_TEST] prefix caching check FAILED: no request has "
-                    "num_hit_tokens > 0 despite enable_prefix_caching=True "
-                    "and pd_test.enable=2"
-                )
+        # In phone-book mode the reply must still contain the right number: a
+        # prefix-cache hit that restores the wrong KV / linear-attention state
+        # would otherwise go unnoticed.
+        if answer_pairs:
+            try:
+                check_phonebook_test_results(answer_pairs, context="PD_TEST")
+            except AssertionError as e:
+                logger.error(f"[PD_TEST] phone-book check FAILED: {e}")
                 self.num_failed += 1
-            else:
-                logger.info(
-                    f"[PD_TEST] prefix caching check PASSED: "
-                    f"{num_cache_hit} request(s) hit the prefix cache"
-                )
+
+        # When prefix caching is enabled and the requests share a long prompt
+        # (test mode 2 or phone-book mode), verify that at least one request hit
+        # the prefix cache.
+        if (
+            get_global_args().infer.enable_prefix_caching
+            and self._shared_prefix
+            and all_reqs
+        ):
+            try:
+                check_prefix_cache_hit(all_reqs, required=True, context="PD_TEST")
+            except AssertionError as e:
+                logger.error(f"[PD_TEST] prefix caching check FAILED: {e}")
+                self.num_failed += 1
 
         await asyncio.sleep(1.0)
 

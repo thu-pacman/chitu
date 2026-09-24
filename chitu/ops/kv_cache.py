@@ -261,9 +261,8 @@ if has_triton_impl:
 @make_op_dispatcher
 def update_singleton_paged_kv_cache(
     kv_cache: torch.Tensor,
-    page_table: torch.Tensor,
+    page_ids: torch.Tensor,
     this_kv: torch.Tensor,
-    mtp_size: int = 1,
     impl: str = "auto",
 ):
     """
@@ -271,8 +270,13 @@ def update_singleton_paged_kv_cache(
 
     Args:
         kv_cache: (num_pages, 1, other contiguous dims...). Data of the paged K/V cache.
-        page_table: (batch_size, 1). Page table of the paged K/V cache.
-        this_kv: (num_tokens, other contiguous dims...). New K/V value.
+        page_ids: (*batch_shape,) or (batch_size, num_states). Page of each state to
+            write. A 1-dim `page_ids` writes one state per request, e.g. the 0th
+            in-place block for prefill and for mtp_size == 1; a 2-dim one writes
+            num_states states per request, e.g. one in-place block per MTP draft
+            token, or one checkpoint block per checkpoint.
+        this_kv: (*page_ids.shape, other contiguous dims...). New K/V value of each
+            state, in the same order as `page_ids`.
     """
     raise NotImplementedError
 
@@ -285,17 +289,13 @@ def _auto_update_singleton_paged_kv_cache():
 @update_singleton_paged_kv_cache.register("torch")
 def update_singleton_paged_kv_cache_torch(
     kv_cache: torch.Tensor,
-    page_table: torch.Tensor,
+    page_ids: torch.Tensor,
     this_kv: torch.Tensor,
-    mtp_size: int = 1,
 ):
     # Page size is always 1
-    assert kv_cache.shape[1] == mtp_size
-    assert page_table.shape[1] == 1
+    assert kv_cache.shape[1] == 1, f"page size should be 1, got {kv_cache.shape[1]}"
 
-    kv_cache[page_table.squeeze(1)] = this_kv.view(
-        this_kv.shape[0], mtp_size, *kv_cache.shape[2:]
-    )
+    kv_cache[page_ids, 0] = this_kv.view(*page_ids.shape, *kv_cache.shape[2:])
 
 
 @make_op_dispatcher
@@ -605,16 +605,27 @@ if has_triton_impl:
 @make_op_dispatcher
 def read_from_singleton_paged_kv_cache(
     kv_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    mtp_accept_indices: torch.Tensor | None = None,
+    init_page_ids: torch.Tensor,  # [bsz,]
     impl: str = "auto",
-) -> torch.Tensor:
+) -> torch.Tensor:  # [bsz, *shape_per_token]
     """
     Read from singleton paged K/V cache.
 
+    A request reads exactly one recurrent state, not a range of tokens, so the caller
+    only has to say which page to read. A request owns ``mtp_size`` in-place pages, one
+    per drafted token of the previous step, and has to resume from the page holding the
+    state right after the last accepted token. Choosing that page is the cache's
+    business (see ``SingletonPagedKVCacheAccessor.get_read_page_ids``), so this op is a
+    plain per-request gather.
+
     Args:
-        kv_cache: (num_pages, page_size, other contiguous dims...). Data of the paged K/V cache.
-        page_table: (batch_size, num_pages_per_sample). Page table of the paged K/V cache.
+        kv_cache: (num_pages, 1, other contiguous dims...). Data of the paged K/V cache.
+            The page size is always 1: one in-place page holds one state.
+        init_page_ids: (batch_size,). Page to read for each request.
+
+    Returns:
+        (batch_size, other contiguous dims...). The block_size dimension (always 1) is
+        squeezed out.
     """
     raise NotImplementedError
 
@@ -627,18 +638,10 @@ def _auto_read_from_singleton_paged_kv_cache():
 @read_from_singleton_paged_kv_cache.register("torch")
 def read_from_singleton_paged_kv_cache_torch(
     kv_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    mtp_accept_indices: torch.Tensor | None = None,
+    init_page_ids: torch.Tensor,
 ) -> torch.Tensor:
-    if mtp_accept_indices is None:
-        return kv_cache[
-            page_table.squeeze(1) if page_table.dim() > 1 else page_table, 0
-        ]
-    else:
-        return kv_cache[
-            page_table.squeeze(1) if page_table.dim() > 1 else page_table,
-            mtp_accept_indices,
-        ]
+    assert kv_cache.shape[1] == 1, f"page size should be 1, got {kv_cache.shape[1]}"
+    return kv_cache[init_page_ids, 0]
 
 
 @make_op_dispatcher

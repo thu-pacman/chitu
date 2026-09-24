@@ -5,7 +5,7 @@
 import torch
 import torch.nn.functional as F
 
-from chitu.ops.utils import make_op_dispatcher
+from chitu.ops.utils import check_checkpoint_args, make_op_dispatcher
 from chitu.device_type import is_muxi
 from chitu.utils import try_import_opt_dep, try_import_platform_dep
 
@@ -130,13 +130,47 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel=False,
     cu_seqlens=None,
     seq_len_list=None,
+    state_checkpoints=None,
+    checkpoint_cu_starts=None,
+    checkpoint_every_n_tokens=0,
     impl="auto",
 ):
+    """
+    Args:
+        state_checkpoints: checkpoint 的输出 buffer（prefix caching 用的 ckpt），
+            shape (total_checkpoints, n_heads, k_head_dim, v_head_dim)。按 flashinfer 的
+            gdn_prefill 约定，checkpoint_every_n_tokens > 0 时必须传入，算子按 seq 升序、
+            seq 内位置升序把 state 写进前若干行；不存 checkpoint 时必须为 None。
+        checkpoint_cu_starts: 每个 seq 有几个 checkpoint 的累加计数（int64, [bsz + 1]，
+            同 flashinfer 的 checkpoint_cu_starts），由调用方（kv cache，见
+            SingletonPagedKVCache.ckpt_cu_starts）给出；给了就校验算子自己数出来的个数和它
+            一致，见 chitu.ops.utils.check_checkpoint_args。
+        checkpoint_every_n_tokens: 每 C 个 token 的最后一个位置存一份 state，0 表示不存
+            （默认）。和 flashinfer 一致，位置从本 chunk 的起点往前数（本 chunk 的第 C、
+            2C、... 个 token），所以只有 chunk 起点对齐到 C 时它才和 kv cache 按 seq 绝对
+            位置判定的 checkpoint 是同一批位置；cache 侧会先校验 chunk 起点对齐（见
+            SingletonPagedKVCache.ckpt_cu_starts）。目前只有 torch 实现支持。
+    Return:
+        core_attn_out: (total_len, n_heads, v_head_dim)
+        last_recurrent_state: (bsz, n_heads, k_head_dim, v_head_dim) or None
+    """
     raise NotImplementedError
 
 
 @chunk_gated_delta_rule.register_auto
-def _auto_chunk_gated_delta_rule():
+def _auto_chunk_gated_delta_rule(
+    *,
+    state_checkpoints=None,
+    checkpoint_cu_starts=None,
+    checkpoint_every_n_tokens: int = 0,
+):
+    if (
+        checkpoint_every_n_tokens > 0
+        or state_checkpoints is not None
+        or checkpoint_cu_starts is not None
+    ):
+        # 目前只有 torch 实现支持 checkpoint（fla 实现在这里会直接 assert）
+        return "torch"
     if has_fla:
         return "fla"
     return "torch"
@@ -154,7 +188,15 @@ def _chunk_gated_delta_rule_fla(
     use_qk_l2norm_in_kernel=False,
     cu_seqlens=None,
     seq_len_list=None,
+    state_checkpoints=None,
+    checkpoint_cu_starts=None,
+    checkpoint_every_n_tokens=0,
 ):
+    assert (
+        checkpoint_every_n_tokens == 0
+        and state_checkpoints is None
+        and checkpoint_cu_starts is None
+    ), "chunk_gated_delta_rule with checkpoints is not supported by the fla impl yet"
     assert cu_seqlens is not None
     return chunk_gated_delta_rule_fla(
         query,
@@ -331,13 +373,48 @@ def chunk_kimi_delta_attention(
     use_qk_l2norm_in_kernel=False,
     cu_seqlens=None,
     seq_len_list=None,
+    state_checkpoints=None,
+    checkpoint_cu_starts=None,
+    checkpoint_every_n_tokens=0,
     impl="auto",
 ):
+    """
+    Args:
+        state_checkpoints: checkpoint 的输出 buffer（prefix caching 用的 ckpt），
+            shape (total_checkpoints, n_heads, k_head_dim, v_head_dim)。约定与
+            chunk_gated_delta_rule 相同：按 seq 升序、seq 内位置升序把 state 写进
+            前若干行；不存 checkpoint 时必须为 None。
+        checkpoint_cu_starts: 每个 seq 有几个 checkpoint 的累加计数（int64, [bsz + 1]），
+            由调用方（kv cache，见 SingletonPagedKVCache.ckpt_cu_starts）给出；给了就校验
+            算子自己数出来的个数和它一致，见 chitu.ops.utils.check_checkpoint_args。
+        checkpoint_every_n_tokens: 每 C 个 token 的最后一个位置存一份 state，0 表示不存
+            （默认）。位置从本 chunk 的起点往前数，所以只有 chunk 起点对齐到 C 时它才和
+            kv cache 按 seq 绝对位置判定的 checkpoint 是同一批位置。目前只有 torch 实现支持。
+
+    Returns:
+        (out, last_state)：out 的 shape 是 [bs, total_len, n_heads, v_head_dim]，其中 bs 恒为 1
+        —— 一个 step 里各请求的 token 首尾相接成一条扁平序列（请求边界见 cu_seqlens/
+        seq_len_list），所以 total_len 是这条序列的总长度，前两维与输入 query 一致；fla 与
+        torch 两种实现的 out 布局相同。last_state 是按请求给的，shape 是
+        [num_seqs, n_heads, k_head_dim, v_head_dim]，num_seqs 即 len(seq_len_list)。
+    """
     raise NotImplementedError
 
 
 @chunk_kimi_delta_attention.register_auto
-def _auto_chunk_kimi_delta_attention():
+def _auto_chunk_kimi_delta_attention(
+    *,
+    state_checkpoints=None,
+    checkpoint_cu_starts=None,
+    checkpoint_every_n_tokens: int = 0,
+):
+    if (
+        checkpoint_every_n_tokens > 0
+        or state_checkpoints is not None
+        or checkpoint_cu_starts is not None
+    ):
+        # 目前只有 torch 实现支持 checkpoint（fla 实现在这里会直接 assert）
+        return "torch"
     if has_fla_kda:
         return "fla"
     return "torch"
@@ -355,7 +432,15 @@ def _chunk_kimi_delta_attention_fla(
     use_qk_l2norm_in_kernel=False,
     cu_seqlens=None,
     seq_len_list=None,
+    state_checkpoints=None,
+    checkpoint_cu_starts=None,
+    checkpoint_every_n_tokens=0,
 ):
+    assert (
+        checkpoint_every_n_tokens == 0
+        and state_checkpoints is None
+        and checkpoint_cu_starts is None
+    ), "chunk_kimi_delta_attention with checkpoints is not supported by the fla impl yet"
     assert cu_seqlens is not None
     if initial_state is not None:
         initial_state = initial_state.to(torch.float32)
@@ -489,8 +574,39 @@ def chunk_kimi_delta_attention_torch(
     use_qk_l2norm_in_kernel=False,
     cu_seqlens=None,
     seq_len_list=None,
+    state_checkpoints=None,
+    checkpoint_cu_starts=None,
+    checkpoint_every_n_tokens=0,
 ):
     assert seq_len_list is not None
+
+    check_checkpoint_args(
+        state_checkpoints,
+        checkpoint_cu_starts,
+        checkpoint_every_n_tokens,
+        seq_len_list,
+        (query.shape[-2], query.shape[-1], value.shape[-1]),
+        "chunk_kimi_delta_attention",
+    )
+    if checkpoint_every_n_tokens > 0:
+        out, last_state = _chunk_delta_attention_torch_with_checkpoints(
+            chunk_kimi_delta_attention_torch_dense,
+            "chunk_kimi_delta_attention",
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            seq_len_list=seq_len_list,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        )
+        # 见本函数末尾的说明：输出统一成 [bs, total_len, n_heads, v_head_dim]
+        return out.unsqueeze(0), last_state
 
     max_curr_seq_len = max(seq_len_list)
     bs = len(seq_len_list)
@@ -544,7 +660,10 @@ def chunk_kimi_delta_attention_torch(
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
 
-    return extract_and_merge(core_attn_out, seq_len_list), last_recurrent_state
+    return (
+        extract_and_merge(core_attn_out, seq_len_list).unsqueeze(0),
+        last_recurrent_state,
+    )
 
 
 @make_op_dispatcher
@@ -662,8 +781,35 @@ def chunk_gated_delta_rule_torch(
     use_qk_l2norm_in_kernel=False,
     cu_seqlens=None,
     seq_len_list=None,
+    state_checkpoints=None,
+    checkpoint_cu_starts=None,
+    checkpoint_every_n_tokens=0,
 ):
     assert seq_len_list is not None
+
+    check_checkpoint_args(
+        state_checkpoints,
+        checkpoint_cu_starts,
+        checkpoint_every_n_tokens,
+        seq_len_list,
+        (query.shape[-2], query.shape[-1], value.shape[-1]),
+        "chunk_gated_delta_rule",
+    )
+    if checkpoint_every_n_tokens > 0:
+        return chunk_gated_delta_rule_torch_with_checkpoints(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            seq_len_list=seq_len_list,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        )
 
     max_curr_seq_len = max(seq_len_list)
     bs = len(seq_len_list)
@@ -730,6 +876,169 @@ def chunk_gated_delta_rule_torch(
     )
 
     return extract_and_merge(core_attn_out, seq_len_list), last_recurrent_state
+
+
+def _chunk_delta_attention_torch_with_checkpoints(
+    dense_fn,
+    op_name,
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state,
+    output_final_state,
+    use_qk_l2norm_in_kernel,
+    seq_len_list,
+    state_checkpoints,
+    checkpoint_cu_starts,
+    checkpoint_every_n_tokens,
+):
+    """chunk 类 delta attention 算子的 torch 实现共用的 checkpoint 写回逻辑。
+
+    ``dense_fn`` 是「一次算完一个 batch 的稠密 chunk 算子」（``chunk_gated_delta_rule_torch_dense``
+    或 ``chunk_kimi_delta_attention_torch_dense``），签名里要接受
+    ``(query, key, value, g=, beta=, initial_state=, output_final_state=,
+    use_qk_l2norm_in_kernel=)``。
+
+    checkpoint 位置按 flashinfer 的 gdn_prefill 约定从本 chunk 的起点每 C 个 token 取一个：
+    本 chunk 的第 C、2C、... 个 token 之后的 state。chunk 起点对齐到 C 时（scheduler 保证，
+    cache 侧也会校验，见 SingletonPagedKVCache.ckpt_cu_starts），这和 cache 按 seq 绝对位置
+    判定的 checkpoint 是同一批位置，所以写进 buffer 的 state 和 cache 给的页
+    （``_ckpt_write_pages``）逐一对应。seq 末尾不足 C 的部分（seq 的尾巴）不是 checkpoint，
+    不算在内。入参的 shape/个数由 check_checkpoint_args 校验。
+
+    本实现按 C 分段，逐段用上一段结束时的 state 作为 initial_state，数学上和一次算完等价；
+    不需要知道 checkpoint 在 seq 里的绝对位置。
+    """
+    C = checkpoint_every_n_tokens
+    bs = len(seq_len_list)
+    cu_starts = checkpoint_cu_starts.tolist()
+    max_curr_seq_len = max(seq_len_list)
+    num_heads, k_head_dim = query.shape[-2:]
+    v_head_dim = value.shape[-1]
+    seq_start_idxs = []
+    start_idx = 0
+    for i in range(bs):
+        seq_start_idxs.append(start_idx)
+        start_idx += seq_len_list[i]
+
+    state = initial_state
+    out_per_seq = [[] for _ in range(bs)]
+    ckpt_per_seq = [[] for _ in range(bs)]
+    for seg_start in range(0, max_curr_seq_len, C):
+        seg_end = min(seg_start + C, max_curr_seq_len)
+        seg_len_list = [
+            max(0, min(seq_len_list[i], seg_end) - seg_start) for i in range(bs)
+        ]
+        seg_max_len = max(seg_len_list)
+        if seg_max_len == 0:
+            break
+        # 每段都按现有约定给每个 seq 在前部补零到本段最长；补零位置的 g 为 0（即 exp(0)=1）、
+        # k/v/beta 为 0，对 recurrence 是 no-op，所以前部补零不改变任何位置上的 state。
+        padded_q = torch.zeros(
+            (bs, seg_max_len, num_heads, k_head_dim),
+            dtype=query.dtype,
+            device=query.device,
+        )
+        padded_k = torch.zeros(
+            (bs, seg_max_len, num_heads, k_head_dim), dtype=key.dtype, device=key.device
+        )
+        padded_v = torch.zeros(
+            (bs, seg_max_len, num_heads, v_head_dim),
+            dtype=value.dtype,
+            device=value.device,
+        )
+        # g 的尾维两种算子不一样：gated rule 是逐 head 一个标量 (bsz, len, heads)，
+        # kimi 是逐 head_dim (bsz, len, heads, head_dim)，所以按 g.shape[2:] 取尾维
+        padded_g = torch.zeros(
+            (bs, seg_max_len) + tuple(g.shape[2:]), dtype=g.dtype, device=g.device
+        )
+        padded_beta = torch.zeros(
+            (bs, seg_max_len) + tuple(beta.shape[2:]),
+            dtype=beta.dtype,
+            device=beta.device,
+        )
+        for i in range(bs):
+            n = seg_len_list[i]
+            if n == 0:
+                continue
+            lo = seq_start_idxs[i] + seg_start
+            hi = lo + n
+            padded_q[i][-n:] = query[0][lo:hi]
+            padded_k[i][-n:] = key[0][lo:hi]
+            padded_v[i][-n:] = value[0][lo:hi]
+            padded_g[i][-n:] = g[0][lo:hi]
+            padded_beta[i][-n:] = beta[0][lo:hi]
+
+        seg_out, state = dense_fn(
+            padded_q,
+            padded_k,
+            padded_v,
+            g=padded_g,
+            beta=padded_beta,
+            initial_state=state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        for i in range(bs):
+            n = seg_len_list[i]
+            if n > 0:
+                out_per_seq[i].append(seg_out[i, -n:])
+            # 本段正好是一个完整的 C 时，本段的结束 state 就是这个 checkpoint 的 state
+            if n == C:
+                ckpt_per_seq[i].append(state[i])
+
+    core_attn_out = torch.cat(
+        [torch.cat(out_per_seq[i], dim=0) for i in range(bs) if seq_len_list[i] > 0],
+        dim=0,
+    )
+    # 第 i 个 seq 的 checkpoint 从 buffer 的第 cu_starts[i] 行开始（个数已经校验过一致），
+    # 行内按 seq 内位置升序
+    for i, ckpts in enumerate(ckpt_per_seq):
+        if ckpts:
+            lo = cu_starts[i]
+            state_checkpoints[lo : lo + len(ckpts)].copy_(torch.stack(ckpts, dim=0))
+
+    if not output_final_state:
+        state = None
+    return core_attn_out, state
+
+
+def chunk_gated_delta_rule_torch_with_checkpoints(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state,
+    output_final_state,
+    use_qk_l2norm_in_kernel,
+    seq_len_list,
+    state_checkpoints,
+    checkpoint_cu_starts,
+    checkpoint_every_n_tokens,
+):
+    """``chunk_gated_delta_rule`` 的 torch 实现，把 checkpoint 上的 state 写进调用方给的 buffer。
+
+    checkpoint 的位置和缓冲区约定见 ``_chunk_delta_attention_torch_with_checkpoints``。
+    """
+    return _chunk_delta_attention_torch_with_checkpoints(
+        chunk_gated_delta_rule_torch_dense,
+        "chunk_gated_delta_rule",
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        seq_len_list=seq_len_list,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+    )
 
 
 @make_op_dispatcher

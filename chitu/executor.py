@@ -1899,8 +1899,12 @@ class Executor:
         if Backend.model.moe_impl is not None:
             Backend.model.moe_impl.prepare(TaskType.Decode, len(tasks.output_task_ids))
 
+        # 把接受列的隐藏态复制到第 0 页，作为 draft 链的起点（draft 只借用第 0 页）
+        # 此处的is_draft参数并不是当前是否为draft_model的语义，而是利用该参数读写正确的位置：
+        # is_draft=False读上个step的accpet indice对应的hidden_state
+        # is_draft=True上读到的hidden_state复制到inplace_block_0上
         Backend.model.update_mtp_hidden_states(
-            Backend.model.read_mtp_hidden_states(is_mtp=True), is_mtp=False
+            Backend.model.read_mtp_hidden_states(is_draft=False), is_draft=True
         )
         if self.is_sample_rank:
             # Draft proposal params (temperature/top-k/top-p/greedy mask) must be

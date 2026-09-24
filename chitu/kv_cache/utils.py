@@ -11,9 +11,10 @@ from logging import getLogger
 from typing import Callable, Iterable
 
 from chitu.kv_cache import GlobalLocalMap
+from chitu.kv_cache.manager_names import MAIN_CACHE_NAME
 from chitu.distributed.parallel_state import get_pp_group
 from chitu.distributed.partition import compute_layer_dist_in_pp
-from chitu.utils import get_global_args
+from chitu.utils import ceil_div, get_global_args
 
 logger = getLogger(__name__)
 
@@ -59,22 +60,60 @@ def build_layer_id_map(
     return GlobalLocalMap.from_list(local_layers)
 
 
+# SingletonPagedKVCache and its scheduler-side manager. Both describe the same
+# per-request state blocks, so the sizing helpers below take either one.
+_SINGLETON_KV_CACHE_TYPES = {"SingletonPagedKVCache", "SingletonPagedKVCacheManager"}
+
+
+def is_singleton_kv_cache(cache) -> bool:
+    """``cache`` 是不是按请求独占状态的 SingletonPagedKVCache（或其 manager）。"""
+    return type(cache).__name__ in _SINGLETON_KV_CACHE_TYPES
+
+
+def kv_cache_block_layout(cache) -> tuple[int, int]:
+    """cache（或对应的 manager）的 block 数构成：``(固定块数, 一块覆盖多少 token)``。
+
+    * 普通 paged cache：``(0, block_size)``；
+    * 带 checkpoint 的 SingletonPagedKVCache：``(num_hot_req * mtp_size, C)``
+    """
+    if is_singleton_kv_cache(cache):
+        checkpoint_interval = getattr(cache, "checkpoint_interval", None)
+        if checkpoint_interval is not None:
+            return (
+                int(cache.num_hot_req) * int(cache.mtp_size),
+                int(checkpoint_interval),
+            )
+    return 0, int(cache.block_size)
+
+
+def kv_cache_num_blocks_for_tokens(cache, max_tokens: int) -> int:
+    """给定 token 容量，cache（或对应的 manager）应有的 block 数。"""
+    fixed_blocks, tokens_per_block = kv_cache_block_layout(cache)
+    return fixed_blocks + ceil_div(int(max_tokens), int(tokens_per_block))
+
+
 def is_reallocable_kv_cache(cache) -> bool:
     """Whether a KV cache participates in the token-capacity block sizing.
 
-    A cache is reallocable only if its block count scales with sequence length
-    (tokens). Fixed-capacity caches — SingletonPagedKVCache (one block per hot
-    request, e.g. MTP / linear-attention state) and any cache flagged
-    ``fixed_num_blocks`` (e.g. DeepSeek-V4 sliding-window ring buffers) — own a
-    per-request number of blocks unrelated to token capacity and MUST be
-    excluded.
+    A cache (for singletons, its manager too) is reallocable only if its block
+    count scales with sequence length (tokens):
+
+    * ``SingletonPagedKVCache`` with a ``checkpoint_interval``: one checkpoint
+      block per C tokens, so it does scale;
+    * any other paged cache: one block per ``block_size`` tokens.
+
+    Fixed-capacity caches MUST be excluded — a ``SingletonPagedKVCache`` without
+    a ``checkpoint_interval`` (MTP hidden state, decode-side linear-attention
+    state: just ``mtp_size`` in-place blocks per hot request) and any cache
+    flagged ``fixed_num_blocks`` (e.g. DeepSeek-V4 sliding-window ring buffers)
+    own a per-request number of blocks unrelated to token capacity.
     """
     if not hasattr(cache, "realloc") or not hasattr(cache, "num_blocks"):
         return False
     if not hasattr(cache, "manager_name") or not hasattr(cache, "max_num_blocks"):
         return False
-    if type(cache).__name__ == "SingletonPagedKVCache":
-        return False
+    if is_singleton_kv_cache(cache):
+        return getattr(cache, "checkpoint_interval", None) is not None
     if bool(getattr(cache, "fixed_num_blocks", False)):
         return False
     return True
@@ -183,7 +222,7 @@ def reduce_num_block_plan_across_ranks(plan: dict[str, int]) -> dict[str, int]:
     ):
         return plan
 
-    keys = ["main"] + [k for k in sorted(plan.keys()) if k != "main"]
+    keys = [MAIN_CACHE_NAME] + [k for k in sorted(plan.keys()) if k != MAIN_CACHE_NAME]
 
     if get_global_args().infer.op_impl == "cpu":
         device = torch.device("cpu")

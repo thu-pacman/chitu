@@ -10,6 +10,7 @@ from typing import Optional, TYPE_CHECKING, Callable
 from typing_extensions import override
 from collections import deque
 
+from chitu.kv_cache.manager_names import MAIN_CACHE_NAME
 from chitu.task import TaskPool, TaskType, Task, TaskStatus
 from chitu.global_vars import get_global_args, SlotHandle, is_pd_prefill_only
 from chitu.hooks import TaskEvictHook, NoopTaskEvictHook
@@ -263,7 +264,9 @@ class Scheduler:
     def reset_kvcache_block_threshold(self):
         if type(self) == SkewScheduler:
             return
-        self.kvcache_block_threshold = self.cache_manager_dict["main"].num_blocks
+        self.kvcache_block_threshold = self.cache_manager_dict[
+            MAIN_CACHE_NAME
+        ].num_blocks
 
     def start_warmup(self):
         self.is_warmup_stage = True
@@ -325,13 +328,13 @@ class Scheduler:
         completed_tokens = (
             0 if task.status == TaskStatus.PDDecodeIncoming else task.cached_seq_len
         )
-        if not self.cache_manager_dict["main"].enable_prefix_caching:
+        if not self.cache_manager_dict[MAIN_CACHE_NAME].enable_prefix_caching:
             return completed_tokens
 
         num_cached_tokens = task.prefix_tokens_len
         cache_manager_block_sizes: list[int] = []
         for manager in list(self.cache_manager_dict.values()):
-            # Skip Cache that does not support prefix caching e.g. singleton
+            # Skip Cache that does not support prefix caching e.g. singleton without checkpoint_interval
             if not manager.enable_prefix_caching:
                 continue
             cache_manager_block_sizes.append(manager.block_size)
@@ -342,10 +345,39 @@ class Scheduler:
                 return completed_tokens
 
         if cache_manager_block_sizes:
+            # 取各 manager block size 的公倍数，保证 num_cached_tokens 同时落在每个 manager 的
+            # block 边界上。
             block_lcm = math.lcm(*cache_manager_block_sizes)
             num_cached_tokens = (num_cached_tokens // block_lcm) * block_lcm
 
         return max(completed_tokens, num_cached_tokens)
+
+    @property
+    def linear_checkpoint_interval(self) -> Optional[int]:
+        """Checkpoint interval C for linear-attention prefix caching, or None.
+
+        Non-None only when a checkpointed singleton manager participates in prefix
+        caching (a singleton ``KVCacheManagerBase`` with a non-None
+        ``checkpoint_interval`` and ``enable_prefix_caching=True``). In that case
+        every prefill chunk must be aligned to C.
+        """
+        intervals = {
+            int(manager.checkpoint_interval): name
+            for name, manager in self.cache_manager_dict.items()
+            if getattr(manager, "checkpoint_interval", None) is not None
+            and getattr(manager, "enable_prefix_caching", False)
+        }
+        if not intervals:
+            return None
+        if len(intervals) > 1:
+            raise RuntimeError(
+                "checkpointed prefix-caching managers disagree on the checkpoint "
+                "interval: "
+                + ", ".join(
+                    f"{name}={interval}" for interval, name in sorted(intervals.items())
+                )
+            )
+        return next(iter(intervals))
 
     def _inflight_prefill_reserved_blocks(
         self, cache_manager, exclude_task_id: str
@@ -369,9 +401,9 @@ class Scheduler:
             task = TaskPool.pool.get(tid)
             if task is None or task.task_type != TaskType.Prefill:
                 continue
-            need = cache_manager.num_blocks_for_seq_len(task.prefix_tokens_len) - len(
-                cache_ids
-            )
+            need = cache_manager.num_blocks_for_seq_len(
+                task.prefix_tokens_len
+            ) - cache_manager.num_owned_blocks(task)
             reserved += max(0, need)
         return reserved
 
@@ -407,10 +439,13 @@ class Scheduler:
             if target_blocks > cache_manager.num_blocks:
                 return KVCacheCapacityStatus.EXCEEDS_CAPACITY
 
-            cur_blocks = cache_manager.num_blocks_for_seq_len(cached_len)
+            # 还差多少块要新拿
+            need_blocks = cache_manager.num_blocks_to_reserve(
+                task, cached_len=cached_len, target_len=target_len
+            )
             block_threshold = (
                 self.kvcache_block_threshold
-                if (name == "main" and not is_pd_decode_check)
+                if (name == MAIN_CACHE_NAME and not is_pd_decode_check)
                 else cache_manager.num_blocks
             )
             available_blocks = (
@@ -426,7 +461,7 @@ class Scheduler:
                 available_blocks -= self._inflight_prefill_reserved_blocks(
                     cache_manager, exclude_task_id=task.task_id
                 )
-            if target_blocks - cur_blocks > available_blocks:
+            if need_blocks > available_blocks:
                 return KVCacheCapacityStatus.CONGESTED
         return KVCacheCapacityStatus.OK
 
@@ -443,7 +478,8 @@ class Scheduler:
             available_blocks = (
                 cache_manager.num_blocks - cache_manager.num_active_blocks
             )
-            cur_blocks = len(cache_manager.task_to_cache_ids[task.task_id])
+            # 同基相减：目标是该长度下的总占用，已占用取任务真实持有的块
+            cur_blocks = cache_manager.num_owned_blocks(task)
             if target_blocks - cur_blocks > available_blocks:
                 return KVCacheCapacityStatus.CONGESTED
         return KVCacheCapacityStatus.OK
@@ -536,7 +572,7 @@ class Scheduler:
                 task.req.completion_time = time.monotonic()
 
         has_kv_cache = any(
-            task_id in cache_manager.task_to_cache_ids
+            cache_manager.num_owned_blocks(task) > 0
             for cache_manager in self.cache_manager_dict.values()
         )
         if has_kv_cache:
@@ -606,7 +642,9 @@ class Scheduler:
         # blocks should count against the per-DP running-request limit.
         n_running = sum(
             1
-            for cache_ids in self.cache_manager_dict["main"].task_to_cache_ids.values()
+            for cache_ids in self.cache_manager_dict[
+                MAIN_CACHE_NAME
+            ].task_to_cache_ids.values()
             if cache_ids
         )
 
@@ -751,7 +789,9 @@ class Scheduler:
         num_cached_tokens = self._num_prefill_cached_tokens(task)
         cache_manager_hit_block_counts = {
             name: (
-                manager.num_blocks_for_seq_len(num_cached_tokens)
+                # 发给 prefill 端"跳过的块数"，只能是被 prefix cache 命中的可复用块，
+                # 所以用 token 位置映射的块数（不含固定预留）
+                manager.num_token_mapped_blocks_for_seq_len(num_cached_tokens)
                 if getattr(manager, "enable_prefix_caching", False)
                 else 0
             )
@@ -804,18 +844,32 @@ class Scheduler:
                 self.prefill_chunk_size - prefill_tokens <= 0
             ):
                 break
-            task_prefill_chunk_size = (
-                self.prefill_chunk_size - prefill_tokens
-                if self.prefill_chunk_size is not None
-                else task.prefix_tokens_len
-            )
-
-            # check task's remain tokens
 
             # task.prefix_tokens_len: in prefill stage, it's prompt length
             # num_cached_tokens: number of tokens that are hit by cached_idle_blocks or active_blocks
             num_cached_tokens = self._num_prefill_cached_tokens(task)
             num_uncomputed_tokens = task.prefix_tokens_len - num_cached_tokens
+
+            if (
+                self.linear_checkpoint_interval is not None
+                and self.prefill_chunk_size is not None
+                and self.prefill_chunk_size - prefill_tokens
+                < self.linear_checkpoint_interval
+                and num_uncomputed_tokens > self.prefill_chunk_size - prefill_tokens
+            ):
+                # Remaining budget is below one linear_checkpoint_interval, and this
+                # task still needs more tokens than that, so it would only get a
+                # sub-C *partial* (non-tail) chunk — which would push its
+                # recurrent-state checkpoint off the C-grid. Skip it, but keep
+                # scanning: a shorter task whose remaining tail fits the leftover
+                # budget can still be scheduled this step.
+                continue
+
+            task_prefill_chunk_size = (
+                self.prefill_chunk_size - prefill_tokens
+                if self.prefill_chunk_size is not None
+                else task.prefix_tokens_len
+            )
             if num_uncomputed_tokens == 0:
                 pd_prefill_only = is_pd_prefill_only()
                 if (
@@ -833,19 +887,50 @@ class Scheduler:
                     # - PD prefill-only: decode waits for PrefillDone/first_token from
                     #   the prefill hook, so a full-hit request must still execute one
                     #   prefill step.
-                    prefill_tokens += 1
-                    task.set_prefill_chunk_size_for_one_step(1)
-                    sched_out_task_ids.append(task_id)
-                    self._prepare_prefill_metadata(task, num_cached_tokens)
+                    C = self.linear_checkpoint_interval
+                    if C is not None:
+                        # 全命中时 num_cached_tokens == prefix_tokens_len。既然这里必须真跑一步
+                        # prefill，就不能用 1-token 的 chunk：它从 prefix_tokens_len - 1 处
+                        # 读 state（位置 prefix_tokens_len - 2），那个位置不在 C 的网格上。
+                        # 退到上一个 checkpoint 把最后不足 C 的尾巴重算一遍，起点就落在 C 的网格上了。
+                        # main_cache也被全命中，可以回退到任何位置。
+                        num_cached_tokens = ((task.prefix_tokens_len - 1) // C) * C
+                        num_uncomputed_tokens = (
+                            task.prefix_tokens_len - num_cached_tokens
+                        )
+                        if num_uncomputed_tokens > task_prefill_chunk_size:
+                            # 上面那个守卫看的是回退前的 num_uncomputed_tokens（全命中时为 0），
+                            # 回退后尾巴可能反而比剩余 budget 还长。此时再往下走只会拿到一个
+                            # 起点仍在 C 网格上、但长度不是 C 的整数倍的 chunk（既不是 k·C 也不是
+                            # 末尾尾巴），下一次 chunk 的起点就落到网格外了。跳过本步，本轮 budget
+                            # 留给别的任务。
+                            continue
+                    else:
+                        prefill_tokens += 1
+                        task.set_prefill_chunk_size_for_one_step(1)
+                        sched_out_task_ids.append(task_id)
+                        self._prepare_prefill_metadata(task, num_cached_tokens)
+                        continue
+                else:
+                    # Fully cached (mtp==1): skip prefill here and let
+                    # _schedule_decode_tasks convert this task to a bootstrap Decode
+                    # (graphed decode for the first token, see _schedule_decode_tasks).
+                    # 它直接以 consumed == prefix_tokens_len 进 decode，读的 state 位置是
+                    # prefix_tokens_len - 1，全命中时那里就是 ckpt block
+                    # prefix_tokens_len // C - 1，所以不需要像上面那样退一个 checkpoint。
                     continue
-                # Fully cached (mtp==1): skip prefill here and let _schedule_decode_tasks
-                # convert this task to a bootstrap Decode (graphed decode for the
-                # first token, see _schedule_decode_tasks).
-                continue
 
             task_prefill_chunk_size = min(
                 task_prefill_chunk_size, num_uncomputed_tokens
             )
+            if self.linear_checkpoint_interval is not None:
+                C = self.linear_checkpoint_interval
+                if task_prefill_chunk_size >= C:
+                    # Align each linear prefill chunk down to a multiple of C so it
+                    # covers k·C tokens and writes k intermediate recurrent-state
+                    # checkpoints (k = chunk // C).
+                    task_prefill_chunk_size = (task_prefill_chunk_size // C) * C
+                # else: a < C tail chunk stays as-is (single final checkpoint).
             task_origin_prefill_chunk_size = task.prefill_chunk_size
             task.set_prefill_chunk_size_for_one_step(task_prefill_chunk_size)
 
@@ -893,7 +978,7 @@ class Scheduler:
         Return:
             是否成功逐出了一个任务。
         """
-        main = self.cache_manager_dict["main"]
+        main = self.cache_manager_dict[MAIN_CACHE_NAME]
         candidates = [
             TaskPool.pool[tid]
             for tid, cache_ids in main.task_to_cache_ids.items()
@@ -947,11 +1032,14 @@ class Scheduler:
                 if (
                     get_global_args().infer.mtp_size == 1
                     and task.prefix_tokens_len >= 2
-                    and self.cache_manager_dict["main"].enable_prefix_caching
+                    and self.cache_manager_dict[MAIN_CACHE_NAME].enable_prefix_caching
                     and task.prefix_tokens_len - num_cached_tokens == 0
                 ):
                     decode_task_ids.append((tid, num_cached_tokens))
-                elif task.task_id in self.cache_manager_dict["main"].task_to_cache_ids:
+                elif (
+                    task.task_id
+                    in self.cache_manager_dict[MAIN_CACHE_NAME].task_to_cache_ids
+                ):
                     cached_prefill_task_ids.append(tid)
 
         if not decode_task_ids:
@@ -1101,7 +1189,7 @@ class Scheduler:
                 "task_id": task_id,
                 "event": "scheduler_task_evicted",
                 "kvcache_block_threshold": self.kvcache_block_threshold,
-                "total_blocks": self.cache_manager_dict["main"].num_blocks,
+                "total_blocks": self.cache_manager_dict[MAIN_CACHE_NAME].num_blocks,
             },
         )
 
@@ -1130,10 +1218,10 @@ class Scheduler:
                     for cache_manager in self.cache_manager_dict.values():
                         cache_manager.finalize_metadata_all_decode(task)
                     self.kvcache_block_threshold = self.cache_manager_dict[
-                        "main"
+                        MAIN_CACHE_NAME
                     ].num_blocks
                     logger.debug(
-                        f"Task({task_id}) finished decoding, increasing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {self.cache_manager_dict['main'].num_blocks}"
+                        f"Task({task_id}) finished decoding, increasing kvcache_block_threshold to {self.kvcache_block_threshold}, while the number of total blocks is {self.cache_manager_dict[MAIN_CACHE_NAME].num_blocks}"
                     )
                 TaskPool.remove(task_id)
                 self._task_evict_hook.on_task_remove(task)

@@ -604,6 +604,26 @@ infer:
   #: -default: False
   enable_prefix_caching: False
 
+  #: Checkpoint interval of the linear-attention (GDN) recurrent state, in tokens. Only used by
+  #: models with linear-attention layers (e.g. hf-qwen3-next, hf-qwen3-5) and only when
+  #: enable_prefix_caching is true; must be null otherwise.
+  #:
+  #: A recurrent state can only be reused from a checkpoint every C tokens, so with prefix caching
+  #: on, the scheduler starts prefill from a multiple of C and stores the state at every C-th
+  #: position in a prefix-shareable block. The linear cache therefore holds, per request, up to
+  #: ceil(max_seq_len / C) checkpoints in addition to its in-place state (which is the dominant
+  #: term of the cache memory), so pick C with the memory budget in mind.
+  #:
+  #: On a decode-only instance in PD disaggregation the value is ignored: the linear cache there
+  #: holds the in-place state only, and gets the state of the whole prompt from the prefill
+  #: instance by KV transfer.
+  #:
+  #: If set, C must be a positive integer not exceeding both infer.max_seq_len and
+  #: infer.prefill_chunk_size (validated at startup).
+  #: -default: null, meaning C is derived automatically as the main KV cache block size, shrunk to
+  #: infer.max_seq_len / infer.prefill_chunk_size when the block size exceeds them 
+  linear_checkpoint_interval: null
+
   #: Minimum prefix-cache hit rate required to keep a task on the best prefix-cache DP rank.
   dp_prefix_caching_cache_threshold: 0.5
 

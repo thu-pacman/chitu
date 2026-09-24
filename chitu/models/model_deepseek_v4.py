@@ -41,7 +41,6 @@ from chitu.ops import (
     add_shared_experts,
     apply_rotary_pos_emb_partial,
     apply_rotary_pos_emb_single_partial,
-    read_from_singleton_paged_kv_cache,
     silu_and_mul,
     moe_gate,
     moe_hash_gate,
@@ -3361,33 +3360,29 @@ class TransformerDeepSeekV4(Transformer):
         )
         return self.layers[:-1] if has_local_mtp_layer else self.layers
 
-    def read_mtp_hidden_states(self, is_mtp=False) -> torch.Tensor:
+    def update_mtp_hidden_states(
+        self, mtp_hidden_states: torch.Tensor, *, is_draft: bool
+    ):
         cache_accessor = self.cache_dict["mtp"].get_accessor(self.global_n_layers - 1)
-        return read_from_singleton_paged_kv_cache(
-            cache_accessor.kv["hidden_states"],
-            cache_accessor.block_table,
-            self.mtp_accept_indices.get() if is_mtp else None,
-        )
-
-    def update_mtp_hidden_states(self, mtp_hidden_states: torch.Tensor, is_mtp=False):
-        cache_accessor = self.cache_dict["mtp"].get_accessor(self.global_n_layers - 1)
-        cache = cache_accessor.kv["hidden_states"]
-        if is_mtp:
+        if is_draft:
+            # prefill / draft 链 / 把接受的隐藏态挪回第 0 个 in-place block：这些情况下
+            # 一个请求只有一份 state，写第 0 个 in-place block，draft 链读写的就是这一页
+            page_ids = cache_accessor.get_write_page_ids()[:, 0]  # (bsz,)
+        else:
+            # MTP decode：第 i 个位置之后的隐藏态写第 i 个 in-place block，
+            # 下次读的时候再按接受的 draft token 个数取对应那一列（_read_page_ids），
+            # 与 model.py 的 MTP 隐藏态写入一致
             mtp_hidden_states = mtp_hidden_states.view(
                 -1,
                 self.mtp_size,
                 self.params.hc_mult,
                 self.params.dim,
             )
-            mtp_size = self.mtp_size
-        else:
-            cache = cache[:, :1]
-            mtp_size = 1
+            page_ids = cache_accessor.get_write_page_ids()  # (bsz, mtp_size)
         update_singleton_paged_kv_cache(
-            cache,
-            cache_accessor.block_table,
+            cache_accessor.kv["hidden_states"],
+            page_ids,
             mtp_hidden_states,
-            mtp_size,
         )
 
     @torch.inference_mode()
@@ -3399,7 +3394,8 @@ class TransformerDeepSeekV4(Transformer):
             self.cache_dict["mtp"].mtp_seq_len_delta.delta_prefix_lens_tensor_device[1:]
             - 1
         )
-        self.update_mtp_hidden_states(h[last_token_offsets])
+        # 一个请求只有一份 state（本 chunk 最后一个 token 的隐藏态），写第 0 页
+        self.update_mtp_hidden_states(h[last_token_offsets], is_draft=True)
         x[
             self.cache_dict["main"].mtp_seq_len_delta.delta_position_ids_tensor_device
             == 0
@@ -3413,7 +3409,8 @@ class TransformerDeepSeekV4(Transformer):
         for layer in self.non_mtp_layers:
             h = layer(h, freqs_cis)
         if self.mtp_size > 1:
-            self.update_mtp_hidden_states(h, is_mtp=True)
+            # 主模型 decode：一份 state 一个位置，写满 mtp_size 列
+            self.update_mtp_hidden_states(h, is_draft=False)
         h = self._post_layers(h)
         return h.float()
 
@@ -3427,7 +3424,7 @@ class TransformerDeepSeekV4(Transformer):
             h = layer(h, freqs_cis)
         if self.pp_stage == self.pp_end_stage:
             if self.mtp_size > 1:
-                self.update_mtp_hidden_states(h, is_mtp=True)
+                self.update_mtp_hidden_states(h, is_draft=False)
             h = self._post_layers(h)
             h = h.float()
         return h

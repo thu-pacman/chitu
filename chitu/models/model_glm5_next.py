@@ -528,23 +528,56 @@ class Glm5NextLinearAttention(nn.Module):
 
     def forward(self, x: torch.Tensor):
         seq_len_delta = self.cache.seq_len_delta
+        use_precomputed_states = (
+            seq_len_delta.is_classic_decoding and self.mtp_size == 1
+        )  # mtp=1 and is_decode_stage
+
         cp_ctx = get_cp_context()
         cp_active = cp_ctx.step_active and not seq_len_delta.is_decode_stage
-        is_mtp_decode_stage = (
-            self.cache.is_mtp_decode_stage if self.mtp_size > 1 else False
-        )
-        mtp_accept_indices = get_mtp_accept_indices() if is_mtp_decode_stage else None
+
         cache_accessor = self.cache.get_accessor(self.layer_id)
+        # is_decode_stage 是 cache 的 step 级状态（prefill 置 False、decode 置 True）
+        is_mtp_decode_stage = self.mtp_size > 1 and self.cache.is_decode_stage
+
+        write_page_ids = cache_accessor.get_write_page_ids()
+        ckpt_page_ids = cache_accessor.get_ckpt_write_pages()
+        # 本 step 要写几个 checkpoint 由 KVCache 算出来
+        # checkpoint 只在 prefill 分支由 chunk 算子算出来（见下），decode 时为 None
+        ckpt_cu_starts = cache_accessor.get_ckpt_cu_starts()
+        # 算子按 checkpoint_every_n_tokens（= cache 的 checkpoint_interval）从 chunk 起点
+        # 每 C 个 token 存一份 state；本 step 没有 checkpoint 要写时置 0，state_checkpoints
+        # 和 checkpoint_cu_starts 也都是 None
+        checkpoint_every_n_tokens = 0
+        conv_state_checkpoints = None
+        state_checkpoints = None
+
+        # 读哪个 in-place block 由 cache 在 prepare 时按上一 step 的接受长度算好
+        # （_read_page_ids）
         conv_state = read_from_singleton_paged_kv_cache(
             cache_accessor.kv["conv_state"],
-            cache_accessor.block_table,
-            mtp_accept_indices=mtp_accept_indices,
+            cache_accessor.get_read_page_ids(),
         )
         recurrent_state = read_from_singleton_paged_kv_cache(
             cache_accessor.kv["recurrent_state"],
-            cache_accessor.block_table,
-            mtp_accept_indices=mtp_accept_indices,
+            cache_accessor.get_read_page_ids(),
         )
+
+        # checkpoint 的输出 buffer 由调用方按 cache 给的个数预分配，算子把 state 写进去.
+        # 本 step 没有 checkpoint 要写时两者都是 None
+        if ckpt_cu_starts is not None:
+            checkpoint_every_n_tokens = int(self.cache.checkpoint_interval)
+            n_checkpoints = int(ckpt_cu_starts[-1])
+            conv_state_checkpoints = torch.empty(
+                (n_checkpoints,) + tuple(conv_state.shape[1:]),
+                dtype=conv_state.dtype,
+                device=conv_state.device,
+            )
+            state_checkpoints = torch.empty(
+                (n_checkpoints,) + tuple(recurrent_state.shape[1:]),
+                dtype=x.dtype,
+                device=recurrent_state.device,
+            )
+
         if self.merge_qkv:
             projected = self.in_proj_qkvbfg_a(x)
             qkv, beta_raw, f_a, g_a = torch.split(
@@ -562,6 +595,7 @@ class Glm5NextLinearAttention(nn.Module):
             beta_raw = self.b_proj(x)
             f_a = self.forget_gate.f_a_proj(x)
             g_a = self.g_a_proj(x)
+
         if cp_active:
             # Both the causal conv and the gated-delta recurrence couple tokens
             # along the sequence, but a CP rank only holds every pcp-th token.
@@ -580,7 +614,7 @@ class Glm5NextLinearAttention(nn.Module):
                 dim=-1,
             )
 
-        if seq_len_delta.is_classic_decoding:
+        if use_precomputed_states:
             qkv, conv_state = causal_conv1d_update(
                 qkv, conv_state, self.conv1d.weight, impl=self.conv_impl
             )
@@ -606,11 +640,11 @@ class Glm5NextLinearAttention(nn.Module):
                 self.conv1d.weight,
                 seq_len_delta.delta_prefix_lens_tensor_device,
                 impl=self.conv_impl,
+                state_checkpoints=conv_state_checkpoints,
+                checkpoint_cu_starts=ckpt_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             )
-            if self.mtp_size > 1:
-                conv_state = conv_state.unsqueeze(1).expand(
-                    -1, self.mtp_size, *([-1] * (conv_state.dim() - 1))
-                )
+            # prefill 只写每个 seq 的第 0 个 in-place block，所以这里不需要为 mtp_size 复制
         q, k, v = torch.split(qkv, [self.local_qkv_dim] * 3, dim=-1)
         q, k, v = map(
             lambda h: h.reshape(h.size(0), -1, self.head_dim), (q, k, v)
@@ -618,7 +652,7 @@ class Glm5NextLinearAttention(nn.Module):
 
         beta = beta_raw.sigmoid()
         g = self.forget_gate(x, f_a=f_a)
-        if seq_len_delta.is_classic_decoding:
+        if use_precomputed_states:
             out, last_state = recurrent_kimi_delta_attention(
                 q.unsqueeze(1),
                 k.unsqueeze(1),
@@ -669,37 +703,66 @@ class Glm5NextLinearAttention(nn.Module):
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=seq_len_delta.delta_prefix_lens_tensor_device,
                 seq_len_list=seq_len_delta.delta_lens_list,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=ckpt_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
                 impl=self.impl,
             )
-            if self.mtp_size > 1:
-                last_state = last_state.unsqueeze(1).expand(
-                    -1, self.mtp_size, *([-1] * (last_state.dim() - 1))
-                )
+
         if cp_active:
             # The recurrence above ran on the all-gathered global sequence, so
             # `out` and the gate source cover every token; keep only this
-            # rank's interleaved rows. `out` still carries the leading batch dim
-            # of `chunk_kimi_delta_attention`, while `g_a` is [rows, head_dim].
+            # rank's interleaved rows. `chunk_kimi_delta_attention` returns
+            # [bs, total_len, n_heads, head_dim] with bs == 1 (all requests of
+            # the step share one flattened sequence), so the token axis is dim 1
+            # and `out` lines up with the [rows, head_dim] gate source `g_a`.
             # The conv/recurrent states written below are global on every rank,
             # which is what the next step (or the non-CP decode) reads.
-            assert (
-                out.dim() == 4 and out.shape[0] == 1
-            ), f"unexpected linear attention output shape {tuple(out.shape)}"
+            assert out.shape[:2] == (1, total_tokens), (
+                f"unexpected linear attention output shape {tuple(out.shape)} "
+                f"for {total_tokens} global tokens"
+            )
             local_rows, _ = cp_ctx.local_flat_indices(n_local, total_tokens, out.device)
             out = out.index_select(1, local_rows)
             g_a = g_a.index_select(0, local_rows)
+
+        if is_mtp_decode_stage:
+            # mtp decode: 第 i 个 draft token 之后的 state 写第 i 列（和 write_page_ids 对应）
+            state_page_ids = write_page_ids  # (bsz, mtp_size)
+        else:
+            # prefill 和 mtp_size == 1 的 decode 都只有一份 state，写第 0 列
+            state_page_ids = write_page_ids[:, 0]  # (bsz,)
+
         update_singleton_paged_kv_cache(
             cache_accessor.kv["conv_state"],
-            cache_accessor.block_table,
+            state_page_ids,
             conv_state,
-            mtp_size=self.mtp_size,
         )
         update_singleton_paged_kv_cache(
             cache_accessor.kv["recurrent_state"],
-            cache_accessor.block_table,
+            state_page_ids,
             last_state.to(x.dtype),
-            mtp_size=self.mtp_size,
         )
+
+        # checkpoint_interval 为 None 或 decode stage 时 ckpt_page_ids 为 None，没有 checkpoint
+        # 要写
+        if ckpt_page_ids is not None:
+            assert (
+                conv_state_checkpoints is not None and state_checkpoints is not None
+            ), (
+                "ckpt pages are given but no checkpoint buffer was allocated; "
+                "checkpoints are only produced by the prefill branch"
+            )
+            update_singleton_paged_kv_cache(
+                cache_accessor.kv["conv_state"],
+                ckpt_page_ids,
+                conv_state_checkpoints,
+            )
+            update_singleton_paged_kv_cache(
+                cache_accessor.kv["recurrent_state"],
+                ckpt_page_ids,
+                state_checkpoints,
+            )
         gate = self.g_b_proj(g_a).view(x.shape[0], self.n_local_heads, self.head_dim)
         out = self.o_norm(
             out.reshape(-1, self.head_dim), gate.reshape(-1, self.head_dim)

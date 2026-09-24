@@ -4,6 +4,7 @@ from chitu.kv_cache import (
     DeepSeekV4PagedKVCache,
     DeepSeekV4SlidingWindowPagedKVCache,
     PagedKVCache,
+    SingletonPagedKVCache,
 )
 from chitu.global_vars import set_global_args
 from chitu.ops.kv_cache import append_to_sliding_window_paged_kv_cache
@@ -88,7 +89,7 @@ class TestPagedKVCache:
             layer_id_map,
             num_hot_req=2,
             max_seq_len=4096,
-            page_table_max_seq_len=1024,
+            max_blocks_per_req=4,
             num_blocks=8,
             shape_per_token_dict={"compressed": torch.Size([3])},
             dtype_dict={"compressed": torch.bfloat16},
@@ -98,9 +99,7 @@ class TestPagedKVCache:
 
         assert cache.max_seq_len == 4096
         assert cache.max_total_delta_len == 8192
-        assert cache.page_table_max_seq_len == 1024
         assert cache.max_blocks_per_req == 4
-        assert cache.page_table_max_num_blocks == 8
         assert cache.max_num_blocks == 8
         cache.realloc(100)
         assert cache.num_blocks == 8
@@ -193,7 +192,6 @@ class TestPagedKVCache:
 
         assert cache.block_size == 4
         assert cache.max_seq_len == 16
-        assert cache.page_table_max_seq_len == 4
         assert cache.max_blocks_per_req == 1
         assert cache.max_num_blocks == 2
         assert cache.block_table["req_0"] == [1]
@@ -341,3 +339,185 @@ class TestPagedKVCache:
         assert "req_3" not in kvcache.block_table
         assert "req_4" not in kvcache.tid_to_cached_len
         assert "req_4" not in kvcache.block_table
+
+
+def _build_singleton_cache(
+    device="cpu",
+    num_layers=1,
+    num_hot_req=4,
+    num_blocks=64,
+    checkpoint_interval=None,
+    manager_name="linear",
+):
+    return SingletonPagedKVCache(
+        GlobalLocalMap.from_range(0, num_layers),
+        num_hot_req=num_hot_req,
+        num_blocks=num_blocks,
+        shape_per_token_dict={"linear_state": torch.Size([2, 8])},
+        dtype_dict={"linear_state": torch.float16},
+        device=device,
+        manager_name=manager_name,
+        checkpoint_interval=checkpoint_interval,
+    )
+
+
+class TestSingletonPagedKVCacheLifecycle:
+    """In-place / ckpt block lifetime of the recurrent-state cache."""
+
+    def test_pd_transfer_finalize_releases_inplace_blocks(self):
+        """PD 传输路径（只写 inplace_block_ids、从不建 ckpt_block_ids）也不能漏删。"""
+        cache = _build_singleton_cache()
+        # decode 实例不做 linear 的 prefix caching：checkpoint_interval 为 None
+        assert cache.checkpoint_interval is None
+        cache.insert_kv_cache_from_transfer("r1", [3], 33)
+        assert cache.inplace_block_ids["r1"] == [3]
+        assert "r1" not in cache.ckpt_block_ids
+
+        cache.finalize_cache_all_decode(
+            PackedTasksBase(num_tasks=1, task_ids=["r1"], task_type=TaskType.Special)
+        )
+
+        assert "r1" not in cache.inplace_block_ids
+        assert "r1" not in cache.ckpt_block_ids
+        assert "r1" not in cache.tid_to_cached_len
+
+    def test_finalize_releases_local_allocated_blocks(self):
+        """首次分配（两条 dict 都有 key）时同样要一起清掉。"""
+        cache = _build_singleton_cache()
+        cache._update_block_table_from_scheduler(
+            PackedTasksBase(
+                num_tasks=1,
+                task_ids=["r1"],
+                task_type=TaskType.Prefill,
+                tokens=[[1, 2, 3]],
+                new_cache_ids_list=[{"linear": [5]}],
+                inc_hit_tokens_list=[0],
+            )
+        )
+        assert cache.inplace_block_ids["r1"] == [5]
+
+        cache.finalize_cache_all_decode(
+            PackedTasksBase(num_tasks=1, task_ids=["r1"], task_type=TaskType.Special)
+        )
+
+        assert "r1" not in cache.inplace_block_ids
+        assert "r1" not in cache.ckpt_block_ids
+        assert "r1" not in cache.tid_to_cached_len
+
+    def test_finalize_unregistered_task_is_noop(self):
+        """没登记过的请求（没有任何一类块）不能因为缺 key 报错。"""
+        cache = _build_singleton_cache()
+        cache.finalize_cache_all_decode(
+            PackedTasksBase(num_tasks=1, task_ids=["ghost"], task_type=TaskType.Special)
+        )
+        assert not cache.inplace_block_ids
+        assert not cache.ckpt_block_ids
+
+    def test_has_no_token_block_table(self):
+        """本类没有 token -> page 的页表，相关接口一律报错而不是给出别的东西。"""
+        cache = _build_singleton_cache()
+        assert cache.has_token_block_table is False
+        with pytest.raises(NotImplementedError):
+            cache.block_table
+        with pytest.raises(NotImplementedError):
+            cache.get_gpu_block_table()
+        with pytest.raises(NotImplementedError):
+            cache.page_ids
+
+    def test_insert_from_transfer_validates_pages(self):
+        cache = _build_singleton_cache()
+        # mtp_size == 1：in-place block 个数必须正好 1
+        with pytest.raises(AssertionError):
+            cache.insert_kv_cache_from_transfer("r1", [0, 1], 32)
+        # 页号必须在 num_blocks 内
+        with pytest.raises(AssertionError):
+            cache.insert_kv_cache_from_transfer("r1", [cache.num_blocks], 32)
+
+    def test_insert_from_transfer_rejects_checkpointed_cache(self):
+        """带 checkpoint 的 cache 不能只接收 in-place 块（ckpt 块会缺）。"""
+        cache = _build_singleton_cache(checkpoint_interval=64)
+        with pytest.raises(AssertionError):
+            cache.insert_kv_cache_from_transfer("r1", [0], 32)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+class TestSingletonPagedKVCacheCheckpointBlocks:
+    """checkpoint_interval 不为 None 时 ckpt block 的分配与清零。"""
+
+    C = 64
+
+    def _prepare(self, cache, task_ids, tokens, new_cache_ids, inc_hit, old_lens):
+        cache.seq_len_delta.copy_from_tensor(
+            torch.tensor(old_lens, dtype=torch.int32, device=cache.device),
+            torch.tensor(
+                [old + len(t) for old, t in zip(old_lens, tokens)],
+                dtype=torch.int32,
+                device=cache.device,
+            ),
+        )
+        cache._update_block_table_from_scheduler(
+            PackedTasksBase(
+                num_tasks=len(task_ids),
+                task_ids=task_ids,
+                task_type=TaskType.Prefill,
+                tokens=tokens,
+                new_cache_ids_list=new_cache_ids,
+                inc_hit_tokens_list=inc_hit,
+            )
+        )
+
+    def test_first_alloc_splits_spec_and_ckpt_blocks(self):
+        cache = _build_singleton_cache(
+            device=torch.device(torch.cuda.current_device()), checkpoint_interval=self.C
+        )
+        cache.paged_kv_cache["linear_state"].fill_(7)
+        # new_cache_ids = [spec_0 | fresh ckpt_0, fresh ckpt_1]
+        self._prepare(cache, ["r1"], [[1] * 128], [{"linear": [5, 6, 7]}], [0], [0])
+
+        assert cache.inplace_block_ids["r1"] == [5]
+        assert cache.ckpt_block_ids["r1"] == [6, 7]
+        # spec block 和两个新建的 ckpt block 都要清零
+        for page in (5, 6, 7):
+            assert float(cache.paged_kv_cache["linear_state"][:, page].abs().sum()) == 0
+        # 没有用到的页保持原值
+        assert float(cache.paged_kv_cache["linear_state"][:, 8].abs().sum()) != 0
+
+    def test_continuation_zeroes_only_new_ckpt_blocks(self):
+        """续算时被前缀命中覆盖的 ckpt block 不能清零：里面是已算好的 state。"""
+        cache = _build_singleton_cache(
+            device=torch.device(torch.cuda.current_device()), checkpoint_interval=self.C
+        )
+        cache.paged_kv_cache["linear_state"].fill_(7)
+        # 先算 [0, 192)：3 个 ckpt block
+        self._prepare(
+            cache,
+            ["r1"],
+            [[1] * 192],
+            [{"linear": [5, 6, 7, 8]}],
+            [0],
+            [0],
+        )
+        assert cache.ckpt_block_ids["r1"] == [6, 7, 8]
+        cache.paged_kv_cache["linear_state"].fill_(7)
+        # 命中的前 192 个 token 已算好，续算 [192, 256) 只需 1 个新 ckpt block
+        self._prepare(cache, ["r1"], [[1] * 64], [{"linear": [9]}], [0], [192])
+
+        assert cache.ckpt_block_ids["r1"] == [6, 7, 8, 9]
+        # 命中覆盖的前 3 块（192 / C）保持原值
+        for page in (6, 7, 8):
+            assert float(cache.paged_kv_cache["linear_state"][:, page].abs().sum()) != 0
+        assert float(cache.paged_kv_cache["linear_state"][:, 9].abs().sum()) == 0
+
+    def test_off_grid_chunk_start_is_rejected(self):
+        """chunk 起点不在 C 网格上、又含 checkpoint 位置时必须报错。
+
+        算子的 checkpoint 位置是从 chunk 起点每 C 个 token 数出来的，cache 是按 seq 绝对位置
+        判定的，起点不对齐就会把 state 写到错位的页上。
+        """
+        cache = _build_singleton_cache(
+            device=torch.device(torch.cuda.current_device()), checkpoint_interval=self.C
+        )
+        cache.inplace_block_ids["r1"] = [5]
+        cache.ckpt_block_ids["r1"] = [6, 7, 8, 9]
+        with pytest.raises(AssertionError, match="not a multiple of the checkpoint"):
+            self._prepare(cache, ["r1"], [[1] * 28], [{"linear": [10]}], [0], [228])

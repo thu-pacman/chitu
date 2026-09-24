@@ -5,6 +5,7 @@
 """kv cache statics for metrics collection."""
 
 from chitu.backend import Backend
+from chitu.kv_cache.manager_names import MAIN_CACHE_NAME
 from chitu.utils import ceil_div
 from typing import TYPE_CHECKING, Optional
 
@@ -24,7 +25,7 @@ def paged_kvcache_stats() -> dict[int, tuple[int, int, float]]:
         return {}
     kvcache_stats = {}
     for dp_id, cache_managers in enumerate(Backend.cache_managers):
-        kv_cache_manager: PagedKVCacheManager = cache_managers["main"]
+        kv_cache_manager: PagedKVCacheManager = cache_managers[MAIN_CACHE_NAME]
         total_blocks = kv_cache_manager.num_blocks
         used_blocks = kv_cache_manager.num_active_blocks
         if total_blocks > 0:
@@ -36,8 +37,8 @@ def paged_kvcache_stats() -> dict[int, tuple[int, int, float]]:
 
 
 def per_dp_kvcache_stats(dp_id: int) -> dict[int, tuple[int, int, float]]:
-    total_blocks = Backend.cache_dict["main"].num_blocks
-    used_blocks = Backend.cache_dict["main"].num_used_blocks
+    total_blocks = Backend.cache_dict[MAIN_CACHE_NAME].num_blocks
+    used_blocks = Backend.cache_dict[MAIN_CACHE_NAME].num_used_blocks
     if total_blocks > 0:
         kvcache_usage = used_blocks / total_blocks
     else:
@@ -50,7 +51,7 @@ def kvcache_stats(is_main_rank: bool, dp_id: int) -> dict[int, tuple[int, int, f
 
     if Backend.cache_dict is None:
         return {}
-    elif isinstance(Backend.cache_dict["main"], PagedKVCache):
+    elif isinstance(Backend.cache_dict[MAIN_CACHE_NAME], PagedKVCache):
         return paged_kvcache_stats() if is_main_rank else {}
     else:
         return per_dp_kvcache_stats(dp_id)
@@ -63,11 +64,11 @@ def get_prealloc_blocks(dp_size: int) -> Optional[dict[int, int]]:
     scheduler = get_pd_scheduler_instance()
     if scheduler is None:
         return None
-    if Backend.cache_dict["main"] is None:
+    if Backend.cache_dict[MAIN_CACHE_NAME] is None:
         return None
-    if not hasattr(Backend.cache_dict["main"], "block_size"):
+    if not hasattr(Backend.cache_dict[MAIN_CACHE_NAME], "block_size"):
         return None
-    block_size = Backend.cache_dict["main"].block_size
+    block_size = Backend.cache_dict[MAIN_CACHE_NAME].block_size
     if block_size <= 0:
         return None
     tokens_by_dp = getattr(scheduler, "_decode_prealloc_tokens_inflight_by_dp", None)

@@ -13,8 +13,8 @@ import torch
 
 from chitu.utils import DaemonThreadPoolExecutor, ceil_div
 from chitu.backend import Backend
+from chitu.kv_cache.kv_cache import PagedKVCache, SingletonPagedKVCache
 from chitu.global_vars import get_global_args
-from chitu.kv_cache.kv_cache import PagedKVCache
 from chitu.serve.crash import report_and_exit
 from chitu.distributed.parallel_state import get_world_group
 from chitu.task import PackedTasksResult, TaskPool
@@ -117,6 +117,22 @@ class KVManagerPrefill(KVManagerBase):
         send_buffers = TransferBuffers()
         for cache in Backend.cache_dict.values():
             if not isinstance(cache, PagedKVCache) or cache.paged_kv_cache is None:
+                continue
+            if isinstance(cache, SingletonPagedKVCache):
+                # linear attn / MTP state: 只传 in-place block，不按命中数跳过任何页。
+                # ckpt block 是本实例的 prefix cache，decode 实例不参与（见
+                # SingletonPagedKVCache.insert_kv_cache_from_transfer），而 decode 实例的
+                # singleton manager 也报不出命中：没有 checkpoint_interval 时它的
+                # enable_prefix_caching 恒为 False，num_cached_blocks 恒为 0
+                block_indices = list(cache.inplace_block_ids.get(req_id, []))
+                assert len(block_indices) == cache.mtp_size, (
+                    f"{req_id}: {cache.manager_name} cache has "
+                    f"{len(block_indices)} in-place block(s) to transfer, expect one per "
+                    f"MTP slot (mtp_size={cache.mtp_size}). "
+                )
+                ids = np.array(block_indices, dtype=np.int32)
+                for key in cache.paged_kv_cache:
+                    send_buffers.cache_block_ids[key] = ids
                 continue
             block_indices = cache.block_table.get(req_id, [])
             if not block_indices:

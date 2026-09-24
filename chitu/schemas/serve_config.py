@@ -92,6 +92,7 @@ class InferConfig(InferConfigLegacy):
     moe_lb_threshold: float = MISSING
     dllm_block_length: int = MISSING  # block length for dLLM decode
     enable_prefix_caching: bool = MISSING
+    linear_checkpoint_interval: Optional[int] = MISSING
     dp_prefix_caching_cache_threshold: float = MISSING
     dp_prefix_caching_balance_abs_threshold: float = MISSING
     dp_prefix_caching_balance_rel_threshold: float = MISSING
@@ -166,6 +167,15 @@ class PDTestConfig:
     req_num: int = MISSING  # number of test requests
     req_timeout: float = MISSING  # per-request timeout (seconds)
     output_len: int = MISSING  # max_new_tokens for each test request
+    # Phone-book test: every request carries a long phone book (same body, a
+    # different entry asked each time) and the reply must contain that entry's
+    # number. Supersedes the `enable == 2` shared system prompt, and needs
+    # `infer.enable_prefix_caching=True` to check anything: a request that hits
+    # the prefix cache must still answer with the right number.
+    phonebook: bool = MISSING
+    # Entries per phone book; the prompt length scales with it, so lower it when
+    # the prompt does not fit in `infer.max_seq_len`.
+    phonebook_num_entries: int = MISSING
 
 
 @dataclass

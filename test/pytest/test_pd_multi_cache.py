@@ -2,7 +2,7 @@
 Tests for PD disaggregation multi-cache manager support.
 
 Covers real PagedKVCacheManager + SingletonPagedKVCacheManager code paths:
-  - insert_kv_cache_from_transfer / insert_linear_state_from_transfer
+  - insert_kv_cache_from_transfer for both paged and singleton (in-place state) caches
   - prepare_cache_decode across multiple cache managers (the Qwen3-Next crash site)
   - finalize_cache_all_decode lifecycle
   - KeyError when any auxiliary cache is not populated (regression for the original bug)
@@ -13,6 +13,7 @@ import os
 import pytest
 import torch
 
+from chitu.global_vars import get_global_args
 from chitu.kv_cache import (
     GlobalLocalMap,
     PagedKVCache,
@@ -54,17 +55,28 @@ def _build_paged_cache(
     )
 
 
-def _build_singleton_cache(device="cuda", num_layers=2, num_hot_req=16):
+def _build_singleton_cache(
+    device="cuda", num_layers=2, num_hot_req=16, num_blocks=64, manager_name="linear"
+):
+    """decode 实例上的 linear-attn state cache：只收 in-place 页，不带 checkpoint。"""
     layer_map = GlobalLocalMap.from_range(0, num_layers)
 
     return SingletonPagedKVCache(
         layer_map,
         num_hot_req=num_hot_req,
+        num_blocks=num_blocks,
         shape_per_token_dict={"linear_state": torch.Size([2, 8])},
         n_local_kv_heads=2,
         head_dim=8,
         device=device,
+        manager_name=manager_name,
     )
+
+
+def _insert_singleton_state(cache, req_id, page_id, prefix_length):
+    """mtp_size=1（见 conftest 的 global_args）时每个请求只有一个 in-place 页。"""
+    assert get_global_args().infer.mtp_size == 1
+    cache.insert_kv_cache_from_transfer(req_id, [page_id], prefix_length)
 
 
 # Prepare cache decode across multiple cache managers
@@ -101,7 +113,7 @@ class TestMultiCachePrepareDecode:
         linear = _build_singleton_cache()
 
         main.insert_kv_cache_from_transfer("r1", [0, 1, 2], 48)
-        linear.insert_linear_state_from_transfer("r1", 0, 48)
+        _insert_singleton_state(linear, "r1", 0, 48)
 
         # 由 cache_manager分配的new_cache_ids_list
         tasks = PackedTasksBase(
@@ -122,8 +134,12 @@ class TestMultiCachePrepareDecode:
             main.tid_to_cached_len["r1"] == 49
         ), f"{main.tid_to_cached_len['r1']} vs 49"
 
+        # singleton cache 没有 token -> 页的 block_table：prefill 传过来的 in-place 页
+        # 记在 inplace_block_ids 里，decode 每步原地更新，不新增页
         linear.prepare_cache_decode(tasks)
-        assert linear.block_table["r1"] == [0], f"{linear.block_table['r1']} vs [0]"
+        assert linear.inplace_block_ids["r1"] == [0]
+        # decode 实例不做 linear 前缀缓存，不会分到 ckpt block
+        assert linear.ckpt_block_ids.get("r1", []) == []
         assert (
             linear.tid_to_cached_len["r1"] == 49
         ), f"{linear.tid_to_cached_len['r1']} vs 49"
@@ -161,12 +177,12 @@ class TestMultiCachePrepareDecode:
 
         # insert kv cache req a
         main.insert_kv_cache_from_transfer("a", [0, 1], 32)
-        linear.insert_linear_state_from_transfer("a", 0, 32)
+        _insert_singleton_state(linear, "a", 0, 32)
         indexer.insert_kv_cache_from_transfer("a", [0, 1], 32)
 
         # insert kv cache req b
         main.insert_kv_cache_from_transfer("b", [2, 3], 32)
-        linear.insert_linear_state_from_transfer("b", 1, 32)
+        _insert_singleton_state(linear, "b", 1, 32)
         indexer.insert_kv_cache_from_transfer("b", [2, 3], 32)
 
         # 由 cache_manager分配的new_cache_ids_list
@@ -200,17 +216,21 @@ class TestMultiCachePrepareDecode:
             ), f"{type(cache).__name__}: {cache.tid_to_cached_len['b']} vs 33"
 
         linear.prepare_cache_decode(tasks)
-        assert linear.block_table["a"] == [0], f"{linear.block_table['a']} vs [0]"
+        assert linear.inplace_block_ids["a"] == [0]
+        assert linear.inplace_block_ids["b"] == [1]
         assert (
             linear.tid_to_cached_len["a"] == 33
         ), f"{linear.tid_to_cached_len['a']} vs 33"
-        assert linear.block_table["b"] == [1], f"{linear.block_table['a']} vs [1]"
         assert (
             linear.tid_to_cached_len["b"] == 33
         ), f"{linear.tid_to_cached_len['b']} vs 33"
 
     def test_linear_missing_raises(self, cuda_available, global_args, init_distributed):
-        """Qwen3-Next regression: linear cache not populated."""
+        """Qwen3-Next regression: linear cache not populated.
+
+        没有 in-place 页的请求进 decode 时，singleton cache 连页 id 都拼不出来，
+        直接 KeyError（而不是悄悄拿别的块当页用）。
+        """
         main = _build_paged_cache()
         linear = _build_singleton_cache()
 
@@ -255,7 +275,7 @@ class TestMultiCachePrepareDecode:
         req_ids = [f"req_{i:03d}" for i in range(8)]
         for i, rid in enumerate(req_ids):
             main.insert_kv_cache_from_transfer(rid, [i * 2, i * 2 + 1], 32)
-            linear.insert_linear_state_from_transfer(rid, i, 32)
+            _insert_singleton_state(linear, rid, i, 32)
 
         # 由 cache_manager分配的new_cache_ids_list
         tasks = PackedTasksBase(
@@ -278,9 +298,9 @@ class TestMultiCachePrepareDecode:
 
         linear.prepare_cache_decode(tasks)
         for idx, rid in enumerate(req_ids):
-            assert linear.block_table[rid] == [
+            assert linear.inplace_block_ids[rid] == [
                 idx
-            ], f"{linear.block_table[rid]} vs {[idx]}"
+            ], f"{linear.inplace_block_ids[rid]} vs {[idx]}"
             assert (
                 linear.tid_to_cached_len[rid] == 33
             ), f"{linear.tid_to_cached_len[rid]} vs 33"
@@ -298,7 +318,7 @@ class TestMultiCacheLifecycle:
         linear = _build_singleton_cache()
 
         main.insert_kv_cache_from_transfer("r1", [0, 1], 32)
-        linear.insert_linear_state_from_transfer("r1", 0, 32)
+        _insert_singleton_state(linear, "r1", 0, 32)
 
         # 由 cache_manager分配的new_cache_ids_list
         tasks = PackedTasksBase(
@@ -315,6 +335,9 @@ class TestMultiCacheLifecycle:
 
         assert "r1" not in main.tid_to_cached_len
         assert "r1" not in linear.tid_to_cached_len
+        # PD 传输路径只登记 inplace_block_ids，finalize 必须把它一起清掉（否则泄漏）
+        assert "r1" not in linear.inplace_block_ids
+        assert "r1" not in linear.ckpt_block_ids
 
     def test_two_batches_sequential(
         self, cuda_available, global_args, init_distributed
@@ -326,7 +349,7 @@ class TestMultiCacheLifecycle:
 
         for rid in ["r1", "r2"]:
             main.insert_kv_cache_from_transfer(rid, [0], 16)
-            linear.insert_linear_state_from_transfer(rid, 0, 16)
+            _insert_singleton_state(linear, rid, 0, 16)
 
         # 由 cache_manager分配的new_cache_ids_list
         tasks = PackedTasksBase(
@@ -347,7 +370,7 @@ class TestMultiCacheLifecycle:
 
         for rid in ["r3", "r4"]:
             main.insert_kv_cache_from_transfer(rid, [1], 16)
-            linear.insert_linear_state_from_transfer(rid, 1, 16)
+            _insert_singleton_state(linear, rid, 1, 16)
 
         # 由 cache_manager分配的new_cache_ids_list
         tasks = PackedTasksBase(
@@ -368,6 +391,7 @@ class TestMultiCacheLifecycle:
 
         assert len(main.tid_to_cached_len) == 0
         assert len(linear.tid_to_cached_len) == 0
+        assert len(linear.inplace_block_ids) == 0
 
     def test_triple_cache_lifecycle(
         self, cuda_available, global_args, init_distributed
@@ -380,7 +404,7 @@ class TestMultiCacheLifecycle:
         req_ids = ["a", "b", "c"]
         for i, rid in enumerate(req_ids):
             main.insert_kv_cache_from_transfer(rid, [i], 16)
-            linear.insert_linear_state_from_transfer(rid, i, 16)
+            _insert_singleton_state(linear, rid, i, 16)
             indexer.insert_kv_cache_from_transfer(rid, [i], 16)
 
         # 由 cache_manager分配的new_cache_ids_list
@@ -401,9 +425,12 @@ class TestMultiCacheLifecycle:
         for cache in caches:
             cache.finalize_cache_all_decode(tasks)
 
-        for cache in caches:
+        for cache in [main, indexer]:
             assert len(cache.tid_to_cached_len) == 0
             assert len(cache.block_table) == 0
+        assert len(linear.tid_to_cached_len) == 0
+        assert len(linear.inplace_block_ids) == 0
+        assert len(linear.ckpt_block_ids) == 0
 
     def test_partial_finalize(self, cuda_available, global_args, init_distributed):
         """Finalize some requests while others stay active."""
@@ -413,7 +440,7 @@ class TestMultiCacheLifecycle:
 
         for i, rid in enumerate(["r1", "r2", "r3"]):
             main.insert_kv_cache_from_transfer(rid, [i], 16)
-            linear.insert_linear_state_from_transfer(rid, i, 16)
+            _insert_singleton_state(linear, rid, i, 16)
 
         # 由 cache_manager分配的new_cache_ids_list
         bach1_tasks = PackedTasksBase(

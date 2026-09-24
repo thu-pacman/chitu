@@ -1358,31 +1358,42 @@ class Transformer(nn.Module):
             self.global_embed_num_tokens = self.global_lm_head_num_tokens = None
             self.embed_tokens_cum_num_tokens = self.lm_head_cum_num_tokens = None
 
-    def read_mtp_hidden_states(self, is_mtp=False) -> torch.Tensor:
+    def read_mtp_hidden_states(self, *, is_draft: bool) -> torch.Tensor:
         cache_accessor = self.cache_dict["mtp"].get_accessor(self.global_n_layers - 1)
-        tensor = read_from_singleton_paged_kv_cache(
+        if is_draft:
+            # draft 链只借用第 0 个 in-place page：进 draft 之前 postprocess_generate_draft
+            # 已经把 accept_index 那一页的隐藏态复制到第 0 页，之后每一轮 draft 读到的都是
+            # 上一轮 draft 写回第 0 页的隐藏态（见 update_mtp_hidden_states(is_draft=True)）
+            page_ids = cache_accessor.get_write_page_ids()[:, 0]  # (bsz,)
+        else:
+            # 读哪一页由 cache 按上一 step 的接受长度算好（_read_page_ids）：通常是一个请求
+            # 的第 accept_index 个原地 page，存的正是最后被接受的那个 token 的隐藏态，也就是
+            # MTP 层要的上一 token 隐藏态（该页是 ckpt block 时同样指向这份 state）
+            page_ids = cache_accessor.get_read_page_ids()
+        return read_from_singleton_paged_kv_cache(
             cache_accessor.kv["hidden_states"],
-            cache_accessor.block_table,
-            self.mtp_accept_indices.get() if is_mtp else None,
+            page_ids,
         )
-        return tensor
 
-    def update_mtp_hidden_states(self, mtp_hidden_states: torch.Tensor, is_mtp=False):
+    def update_mtp_hidden_states(
+        self, mtp_hidden_states: torch.Tensor, *, is_draft: bool
+    ):
         cache_accessor = self.cache_dict["mtp"].get_accessor(self.global_n_layers - 1)
-        cache = cache_accessor.kv["hidden_states"]
-        if is_mtp:
+        if is_draft:
+            # prefill / draft 链 / 把接受的隐藏态挪回第 0 个 in-place block：这些情况下
+            # 一个请求只有一份 state，写第 0 个 in-place block，draft 链读写的就是这一页
+            page_ids = cache_accessor.get_write_page_ids()[:, 0]  # (bsz,)
+        else:
+            # Draft model decode：第 i 个位置之后的隐藏态写第 i 个 in-place block，
+            # 下次读的时候再按接受的 draft token 个数取对应那一列（_read_page_ids）
             mtp_hidden_states = mtp_hidden_states.view(
                 -1, self.mtp_size, self.params.dim
             )
-            mtp_size = self.mtp_size
-        else:
-            cache = cache[:, :1]
-            mtp_size = 1
+            page_ids = cache_accessor.get_write_page_ids()  # (bsz, mtp_size)
         update_singleton_paged_kv_cache(
-            cache,
-            cache_accessor.block_table,
+            cache_accessor.kv["hidden_states"],
+            page_ids,
             mtp_hidden_states,
-            mtp_size,
         )
 
     @torch.inference_mode()
@@ -1403,7 +1414,8 @@ class Transformer(nn.Module):
 
         last_token_offsets = mtp_delta.delta_prefix_lens_tensor_device[1:] - 1
         h = self.norm(h, compute_dtype=h.dtype)
-        self.update_mtp_hidden_states(h[last_token_offsets])
+        # 一个请求只有一份 state（本 chunk 最后一个 token 的隐藏态），写第 0 页
+        self.update_mtp_hidden_states(h[last_token_offsets], is_draft=True)
         # For the first token of each request, set the embedding to zero to avoid using the wrong hidden state
         x[mtp_delta.delta_position_ids_tensor_device == 0] = 0
         # match embedding of token i with hidden of token i-1, so roll h by 1
@@ -1445,7 +1457,7 @@ class Transformer(nn.Module):
             mtp_hidden_states[owned_mask] = h[last_token_offsets_local[owned_mask]]
         mtp_hidden_states = cp_ctx.cp_group.all_reduce(mtp_hidden_states)
         # gather last tokens' hidden states from all CP ranks
-        self.update_mtp_hidden_states(mtp_hidden_states)
+        self.update_mtp_hidden_states(mtp_hidden_states, is_draft=True)
 
         # get local embeddings and freqs for this rank's real local tokens
         if x.shape[0] != n_local:
@@ -1539,8 +1551,9 @@ class Transformer(nn.Module):
         if residual is not None:
             h = h + residual
         if self.mtp_size > 1:
+            # 主模型 decode：一份 state 一个位置，写满 mtp_size 列
             self.update_mtp_hidden_states(
-                self.norm(h, compute_dtype=h.dtype), is_mtp=True
+                self.norm(h, compute_dtype=h.dtype), is_draft=False
             )
         h = self._post_layers(h)
         h = h.float()
@@ -1549,8 +1562,11 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def mtp_decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
         h = self._pre_layers_mtp(tokens)
-        h = self.layers[-1](h, freqs_cis, self.read_mtp_hidden_states(), is_mtp=True)
-        self.update_mtp_hidden_states(h)
+        # draft 链的隐藏态读写都固定在第 0 个 in-place page 上（draft 只借用它一份 state）
+        h = self.layers[-1](
+            h, freqs_cis, self.read_mtp_hidden_states(is_draft=True), is_mtp=True
+        )
+        self.update_mtp_hidden_states(h, is_draft=True)
         h = self._post_layers_mtp(h)
         h = h.float()
         return h
@@ -2113,7 +2129,7 @@ class Transformer(nn.Module):
         if self.pp_stage == self.pp_end_stage:
             if self.mtp_size > 1:
                 self.update_mtp_hidden_states(
-                    self.norm(h, compute_dtype=h.dtype), is_mtp=True
+                    self.norm(h, compute_dtype=h.dtype), is_draft=False
                 )
             h = self._post_layers(h)
             h = h.float()

@@ -923,8 +923,8 @@ class Task:
             # Only the FINAL prefill chunk (the one that completes the prompt and
             # transitions to decode) reserves MTP draft lookahead pages. Reserving on
             # every intermediate chunk would allocate more blocks than
-            # num_blocks_for_seq_len(consumed_req_tokens) accounts for, so the next
-            # chunk's prepare_metadata_before_prefill invariant would break.
+            # num_token_mapped_blocks_for_seq_len(consumed_req_tokens) accounts for,
+            # so the next chunk's prepare_metadata_before_prefill invariant would break.
             mtp_lookahead = 0
             if get_global_args().infer.mtp_size > 1 and (
                 self.consumed_req_tokens + self.next_req_tokens_len
