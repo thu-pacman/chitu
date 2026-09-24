@@ -1964,8 +1964,6 @@ class AttentionDeepSeekV4(Attention):
                 return x.new_empty((0, self.dim))
             return []
         assert x.size(0) == total_q
-        if start_positions_list is None:
-            start_positions_list = seq_len_delta.old.lens_list
 
         if graph_single_decode or all(seqlen == 1 for seqlen in seqlens_list):
             out = self._forward_decode_single(
@@ -1980,6 +1978,13 @@ class AttentionDeepSeekV4(Attention):
                 return out
             assert seqlens_list is not None
             return list(out.split(seqlens_list, dim=0))
+
+        # Only the multi-token path reads the host lengths. The single-token
+        # path -- which a captured MTP draft step runs, where the device-side
+        # advance left the host mirror intentionally stale (see
+        # `BatchedSeqLenDelta.advance_classic_by_one`) -- must not touch them.
+        if start_positions_list is None:
+            start_positions_list = seq_len_delta.old.lens_list
 
         assert seqlens_list is not None
         return self._forward_decode_multi(
@@ -2232,6 +2237,7 @@ class AttentionDeepSeekV4(Attention):
             physical_window_size=physical_win,
             prewrite_current=prewrite_current,
             compress_ratio=ratio if ratio else None,
+            compressed_len_bound=compressed_max_len if ratio else None,
         )
 
         apply_rotary_emb_v4(outputs, freqs_cis, rope_dim=rope_dim, inverse=True)

@@ -72,6 +72,12 @@ HYGON_INDEXER_MAX_MTP_SIZE = 5
 _TOPK_K = 2048
 _MULTICTA_MIN_WIDTH = 98304
 _PLAN_VALUES = frozenset((1, 2, 4, 8, 16))
+# The fused decode TopK picks every row's exact split count from the device
+# lengths; the persistent scalar beside the candidate buffer only bounds which
+# parts a row may skip, and the planner clamps at 16 (`hygon_indexer_topk.cu`).
+# This tier is what a launch preceding the first reservation (warmup) runs on;
+# `reserve_metadata_for_decode` pins each capture's own bound.
+_MAX_PLAN_PARTS = 16
 has_hygon_decode_topk_workspace = has_chitu_backend and all(
     callable(getattr(chitu_backend, symbol, None))
     for symbol in (
@@ -115,12 +121,13 @@ def _validate_hygon_indexer_config(args):
 
 
 @lru_cache(maxsize=256)
-def _prefill_plan_parts_cached(
+def _plan_parts_cached(
     old_lengths: tuple[int, ...],
     new_lengths: tuple[int, ...],
     score_width: int,
 ) -> int:
-    """Share one host plan across all indexer layers in a prefill step."""
+    """Share one host plan across all indexer layers in a step."""
+
     return int(
         chitu_backend.hygon_indexer_topk_plan_parts(
             list(old_lengths),
@@ -154,10 +161,6 @@ class HygonIndexer(DSAIndexer):
         )
         assert self.max_rows > 0
         self.workspace: Optional[_TopKWorkspace] = None
-        self.plan_parts = 1
-        # Record the eager allocation stream; later prepare hooks check it
-        # outside capture, whose temporary stream is not the caller stream.
-        self.owner_stream_id: Optional[int] = None
 
     def row_width(self, seq_len_delta):
         return seq_len_delta.new.max_len
@@ -368,42 +371,6 @@ class HygonIndexer(DSAIndexer):
             and self.static_max_n >= _MULTICTA_MIN_WIDTH
         )
 
-    @staticmethod
-    def _current_stream_id(device):
-        if device.type != "cuda":
-            return None
-        return int(torch.cuda.current_stream(device=device).cuda_stream)
-
-    def prepare_metadata_for_decode(self, seq_len_delta):
-        if seq_len_delta.batch_size == 0 or not self._decode_topk_eligible():
-            return
-        if self.workspace is not None:
-            device = self.workspace.candidates.device
-            assert not (
-                device.type == "cuda" and torch.cuda.is_current_stream_capturing()
-            ), "Hygon decode TopK plan must be prepared outside graph capture"
-            assert self.owner_stream_id == self._current_stream_id(
-                device
-            ), "Hygon decode TopK workspace cannot cross caller streams"
-        rows = seq_len_delta.delta_total_len
-        assert (
-            rows > 0
-        ), "non-empty Hygon decode metadata must contain at least one query row"
-        assert (
-            rows <= self.max_rows
-        ), "Hygon decode rows exceed the persistent workspace"
-        plan = int(
-            chitu_backend.hygon_indexer_topk_plan_parts(
-                seq_len_delta.old.lens_list,
-                seq_len_delta.new.lens_list,
-                self.static_max_n,
-            )
-        )
-        assert plan in _PLAN_VALUES
-        if self.workspace is not None and plan != self.plan_parts:
-            self.workspace.plan_parts.fill_(plan)
-        self.plan_parts = plan
-
     def _ensure_topk_workspace(self, device):
         if self.workspace is not None:
             assert self.workspace.candidates.device == device
@@ -418,10 +385,49 @@ class HygonIndexer(DSAIndexer):
         )
         assert candidate_elements >= 0
         candidates = torch.empty(candidate_elements, dtype=torch.int64, device=device)
-        plan = torch.full((1,), self.plan_parts, dtype=torch.int32, device=device)
+        plan = torch.full((1,), _MAX_PLAN_PARTS, dtype=torch.int32, device=device)
         self.workspace = _TopKWorkspace(candidates, plan)
-        self.owner_stream_id = self._current_stream_id(device)
         return self.workspace
+
+    def _decode_plan_parts(self, seq_len_delta, phases_after: int) -> int:
+        """The TopK part bound one capture needs, from the step's host lengths.
+
+        The bound has to cover every phase of the capture, and the tier table is
+        not monotone in length, so it is the max over the phases.
+        """
+        old_lens = seq_len_delta.old.lens_list
+        new_lens = seq_len_delta.new.lens_list
+        return max(
+            _plan_parts_cached(
+                tuple(length + step for length in old_lens),
+                tuple(length + step for length in new_lens),
+                self.static_max_n,
+            )
+            for step in range(phases_after + 1)
+        )
+
+    def reserve_metadata_for_decode(self, seq_len_delta, phases_after: int = 0):
+        """Pin the next capture's decode TopK plan, outside the graph.
+
+        One bound serves a whole capture as long as it covers every phase in it;
+        a lower one stays correct (the rows it misses fall back to the exact P1
+        selector) but gives up their split.
+        """
+        if not self._decode_topk_eligible():
+            return
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "reserve_metadata_for_decode() pins the bound a capture runs on, so "
+            "it has to be called outside one"
+        )
+        if isinstance(seq_len_delta, BatchedSeqLenDeltaView):
+            # A CP/chunk view exposes only its own query rows, so a plan taken
+            # from it would bound a subset of this rank's rows; keep the tier
+            # the workspace was allocated with.
+            return
+        workspace = self._ensure_topk_workspace(
+            seq_len_delta.new.lens_tensor_device.device
+        )
+        workspace.plan_parts.fill_(self._decode_plan_parts(seq_len_delta, phases_after))
 
     @staticmethod
     def _prefill_may_use_multicta(rows, width):
@@ -433,7 +439,7 @@ class HygonIndexer(DSAIndexer):
         rows, width = logits.shape
         candidate_elements = _prefill_candidate_elements_cached(rows, width)
         if not isinstance(seq_len_delta, BatchedSeqLenDeltaView):
-            plan = _prefill_plan_parts_cached(
+            plan = _plan_parts_cached(
                 tuple(seq_len_delta.old.lens_list),
                 tuple(seq_len_delta.new.lens_list),
                 width,

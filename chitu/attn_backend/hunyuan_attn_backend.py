@@ -103,6 +103,14 @@ class HunyuanAttnBackend(AttnBackend):
             )
         self.splitk = True
 
+    @override
+    def decode_supports_prepare_in_graph(self) -> bool:
+        # Two things keep it out: the decode op takes no MTP verify phase at
+        # all, so `route_to_decode` sends such a step to the prefill-shaped
+        # entry point, and that entry point sizes its query extent and mask from
+        # the host `delta_max_len` mirror a captured loop never refreshes.
+        return False
+
     def _check_fp8_block_size(self, kv_cache: PagedKVCacheAccessor):
         block_size = kv_cache.k.shape[1]
         if block_size != 64:

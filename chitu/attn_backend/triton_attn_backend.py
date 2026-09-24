@@ -176,14 +176,17 @@ class TritonAttnBackend(RefAttnBackend):
         return not is_muxi()
 
     @override
-    def supports_gpu_input(self) -> bool:
-        # This backend keeps the base `prepare_metadata_for_decode` no-op and
-        # launches its decode kernels purely from device tensors
-        # (`seq_len_delta.*.lens_tensor_device`, `kv_cache.block_table`) with a
-        # `num_kv_splits` that does not depend on the per-step sequence lengths,
-        # so the whole MTP draft loop can share one captured graph. On muxi the
-        # MLA decode falls back to MQA and `num_kv_splits` is chosen from the
-        # batch size, so do not claim support there.
+    def decode_supports_prepare_in_graph(self) -> bool:
+        # This backend has no decode metadata to prepare at all -- the base
+        # `prepare_metadata_for_decode` no-op is used -- and launches its decode
+        # kernels purely from device tensors (`seq_len_delta.*.lens_tensor_device`,
+        # `kv_cache.block_table`) with a `num_kv_splits` that does not depend on
+        # the per-step sequence lengths. The dense decode reads no host length
+        # either: it masks with the per-request device lengths and builds its
+        # local mask at the cache's full width, so the whole MTP draft loop can
+        # share one captured graph. On muxi the MLA decode falls back to MQA and
+        # `num_kv_splits` is chosen from the batch size, so do not claim support
+        # there.
         return not is_muxi()
 
     @override
@@ -554,18 +557,14 @@ class TritonAttnBackend(RefAttnBackend):
         k = k.unsqueeze(1) if k is not None else None
         v = v.unsqueeze(1) if v is not None else None
 
-        if k is None and q is None:
-            max_len = seq_len_delta.old.max_len
-        elif k is not None and q is not None:
-            max_len = seq_len_delta.new.max_len
+        if k is not None:
+            assert v is not None
             append_to_dense_kv_cache(
                 kv_cache.k, k.contiguous(), seq_len_delta.old.lens_tensor_device
             )
             append_to_dense_kv_cache(
                 kv_cache.v, v.contiguous(), seq_len_delta.old.lens_tensor_device
             )
-        else:
-            assert False
 
         arange = einops.rearrange(
             torch.arange(kv_cache.k.shape[1], device=kv_cache.k.device), "s -> 1 s"
@@ -573,17 +572,20 @@ class TritonAttnBackend(RefAttnBackend):
         prev_seq_len_expanded = einops.rearrange(
             seq_len_delta.old.lens_tensor_device, "b -> b 1"
         )
-        if k is None and q is None:
-            key_padding_mask = arange < prev_seq_len_expanded
-        elif k is not None and q is not None:
-            key_padding_mask = arange < prev_seq_len_expanded + 1
-        else:
-            assert False
+        key_padding_mask = (
+            arange < prev_seq_len_expanded
+            if k is None
+            else arange < prev_seq_len_expanded + 1
+        )
+        # The local mask spans the cache's whole width rather than the current
+        # longest request: `key_padding_mask` already carries the per-request
+        # lengths on the device, so a mask that does not depend on them keeps
+        # this path free of the host `max_len` and legal inside a capture.
         local_mask = None
         if window_size[0] >= 0 or window_size[1] >= 0:
             local_mask = self._construct_local_mask(
                 1,
-                max_len,
+                kv_cache.k.shape[1],
                 window_size,
                 None,
                 key_padding_mask,

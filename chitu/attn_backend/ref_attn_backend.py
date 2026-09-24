@@ -26,6 +26,17 @@ class RefAttnBackend(AttnBackend):
     def __init__(self, *, qk_nope_head_dim: Optional[int] = None):
         super().__init__(qk_nope_head_dim=qk_nope_head_dim)
 
+    @override
+    def decode_supports_prepare_in_graph(self) -> bool:
+        # The reference backend is the readable host-side implementation: its
+        # decode walks the per-request `old.lens_list` / `new.lens_list` and
+        # reads `new.max_len` to size the dense K/V it assembles with
+        # Python-level loops and slicing (see `decode_dense_kv` and
+        # `decode_paged_kv` below). Those are the *host* mirrors, which a
+        # captured loop never refreshes, so no phase of a capture can be
+        # prepared here.
+        return False
+
     def _csa_hca_dense_topk_attention(
         self,
         q: torch.Tensor,
@@ -217,6 +228,7 @@ class RefAttnBackend(AttnBackend):
         physical_window_size: Optional[int] = None,
         prewrite_current: bool = False,
         compress_ratio: Optional[int] = None,
+        compressed_len_bound: Optional[int] = None,
     ) -> torch.Tensor:
         if cache_slots is None:
             raise ValueError("csa_hca_decode_mtp requires cache_slots")
@@ -295,12 +307,17 @@ class RefAttnBackend(AttnBackend):
                 raise ValueError(
                     "compressed csa_hca_decode_mtp requires compress_ratio"
                 )
-            valid_compressed = compressed_topk_idxs[compressed_topk_idxs >= 0]
-            max_compressed_len = (
-                int(valid_compressed.max().item()) + 1
-                if valid_compressed.numel() > 0
-                else 0
-            )
+            if compressed_len_bound is not None:
+                # See `AttnBackend.csa_hca_decode_mtp`: the bound is the
+                # caller's host constant, so no device read is needed.
+                max_compressed_len = int(compressed_len_bound)
+            else:
+                valid_compressed = compressed_topk_idxs[compressed_topk_idxs >= 0]
+                max_compressed_len = (
+                    int(valid_compressed.max().item()) + 1
+                    if valid_compressed.numel() > 0
+                    else 0
+                )
             if max_compressed_len > 0:
                 compressed_lens = torch.full_like(start_positions, max_compressed_len)
                 compressed_kv = self._materialize_v4_cache(

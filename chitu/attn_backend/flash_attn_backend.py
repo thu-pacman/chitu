@@ -50,7 +50,7 @@ class FlashAttnBackend(AttnBackend):
         return True
 
     @override
-    def supports_gpu_input(self) -> bool:
+    def decode_supports_prepare_in_graph(self) -> bool:
         # FlashAttention's decode entry points take every quantity that changes
         # between two MTP draft steps as a device tensor: `cache_seqlens` and
         # `block_table` are read straight from the KV cache accessor, and the

@@ -18,7 +18,6 @@ from chitu.ops import (
 )
 from chitu.static_tensor import StaticTensor
 
-
 triton, has_triton = try_import_platform_dep("triton")
 deep_gemm, has_deep_gemm = try_import_opt_dep("deep_gemm", "deep_gemm")
 support_indexer_deepgemm = (
@@ -57,7 +56,6 @@ class DeepGEMMIndexer(NvidiaTopKMixin, DSAIndexer):
     def prepare_metadata_for_decode(self, seq_len_delta):
         if not seq_len_delta.batch_size:
             return
-        self._prepare_topk_decode(seq_len_delta)
         metadata = deep_gemm.get_paged_mqa_logits_metadata(
             seq_len_delta.new.lens_tensor_device.to(torch.int32), 64, self.num_sms
         )

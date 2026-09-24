@@ -685,13 +685,13 @@ Acceptable values: A positive integer.
 Experimental: capture the whole K-1 step MTP draft loop (cache-position
 advance, attention metadata, MTP forward, sampling and TP broadcast) into a
 single CUDA graph, so one replay produces all draft tokens. Requires
-mtp_size > 1, use_cuda_graph, a supported attention backend (currently
-flash-mla / flash_attn / triton / flashinfer MLA paged on CUDA and the `auto`
-hybrid backend), and, for models with a DSA indexer, an indexer whose
-decode step is derived from device tensors alone (currently the BF16
-backends, `torch_bf16` / `triton_bf16`; the FP8 paths and `deepgemm` /
-`hygon` still keep host-side top-k plans or paged-MQA schedules). A missing
-requirement only downgrades the draft to the per-step path, with a warning.
+mtp_size > 1, use_cuda_graph, an attention backend that can prepare its
+decode metadata inside a capture
+(`AttnBackend.decode_supports_prepare_in_graph`) and, for a model with a
+DSA indexer, an indexer that can do the same
+(`DSAIndexer.decode_supports_prepare_in_graph`). Which ones qualify is the
+support matrix in chitu/attn_backend/README.md. A missing requirement only
+downgrades the draft to the per-step path, with a warning.
 
 *Default: `false`.*
 

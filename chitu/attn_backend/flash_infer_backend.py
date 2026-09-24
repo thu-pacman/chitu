@@ -46,6 +46,9 @@ def _mla_paged_plan_buffers(
 class _MlaGpuInputPlan:
     """One MLA decode plan that takes its per-step KV lengths from the device.
 
+    The plan serves one decode phase, which is either a classic decode, a
+    verify step (`mtp_size` query tokens per sequence) or a draft step (one).
+
     `BatchMLAPagedAttentionWrapper.plan()` is a host-side scheduler -- it copies
     its inputs to the CPU -- so it can never run inside a captured region. Its
     result is read at run time through the wrapper's int workspace, where the
@@ -76,6 +79,7 @@ class _MlaGpuInputPlan:
         self,
         float_workspace_buffer: torch.Tensor,
         batch_size: int,
+        q_tokens_per_seq: int,
         pages_per_request: int,
         block_size: int,
         num_heads: int,
@@ -97,8 +101,18 @@ class _MlaGpuInputPlan:
         self.wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
             float_workspace_buffer, use_cuda_graph=False, backend="auto"
         )
+        # A ragged query batch: `q_tokens_per_seq` is one for a classic
+        # decode and `mtp_size` for the MTP verify step, which feeds all of its
+        # drafted tokens at once. The plan bakes this stride, which is why a
+        # shape reserves its own plan per query count (`_mla_decode_shape`).
         self.wrapper.plan(
-            qo_indptr=torch.arange(0, batch_size + 1, dtype=torch.int32, device=device),
+            qo_indptr=torch.arange(
+                0,
+                batch_size * q_tokens_per_seq + 1,
+                q_tokens_per_seq,
+                dtype=torch.int32,
+                device=device,
+            ),
             kv_indptr=torch.arange(
                 0,
                 (batch_size + 1) * pages_per_request,
@@ -329,12 +343,6 @@ class FlashInferBackend(TritonAttnBackend):
         only happen outside a captured region.
         """
         batch_size, q_tokens_per_seq, pages_per_request, block_size = shape
-        assert q_tokens_per_seq == 1, (
-            "A device-driven MLA plan serves one query token per sequence, so "
-            "only a classic decode may have its shape reserved. The MTP verify "
-            "step feeds mtp_size tokens per sequence and still plans on the "
-            "host."
-        )
         args = self.args
         assert args is not None  # "not initialized yet" is the only `None` case
         assert pages_per_request * block_size >= args.infer.max_seq_len, (
@@ -361,6 +369,7 @@ class FlashInferBackend(TritonAttnBackend):
             plan = _MlaGpuInputPlan(
                 self._mla_gpu_float_workspace,
                 batch_size,
+                q_tokens_per_seq,
                 pages_per_request,
                 block_size,
                 num_heads=self.local_n_heads,
@@ -382,12 +391,13 @@ class FlashInferBackend(TritonAttnBackend):
         return self.is_mla
 
     @override
-    def supports_gpu_input(self) -> bool:
+    def decode_supports_prepare_in_graph(self) -> bool:
         # The paged MLA decode op plans its per-work-item KV lengths on the
         # device (see `_MlaGpuInputPlan`), so a reserved shape's metadata comes
-        # from device tensors alone, which is what lets a captured region hold
-        # the MTP draft steps. The non-MLA wrapper and the dense fallback keep
-        # the prefill-based path, see `decode_op_supports_mtp`.
+        # from device tensors alone, which is what lets one captured region hold
+        # the MTP verify phase and every draft step after it. The non-MLA
+        # wrapper and the dense fallback keep the prefill-based path, see
+        # `decode_op_supports_mtp`.
         return self.is_mla and self.is_paged
 
     @override

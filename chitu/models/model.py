@@ -1609,9 +1609,8 @@ class Transformer(nn.Module):
 
         # Both paths run the same K-1-step loop (`_mtp_draft_loop`) and return
         # the same drafts; only the loop's steps differ. Whether it can be
-        # captured as a whole is up to the attention backend, which tells us
-        # through `supports_gpu_input` whether it can re-derive its per-step
-        # metadata from device tensors.
+        # captured as a whole is up to the attention backend and the indexer,
+        # which say so through `decode_supports_prepare_in_graph`.
         if self._use_mtp_draft_single_graph():
             next_tokens, draft_probs = self._draft_single_graph(
                 tasks, tokens, key_mtp, extra_inputs_mtp, sampler
@@ -1680,12 +1679,11 @@ class Transformer(nn.Module):
 
         The captured loop advances the MTP cache position on the device and
         re-prepares the attention metadata per step, so the attention backend
-        must be able to build that metadata from device tensors alone
-        (`AttnBackend.supports_gpu_input`). The indexer has to be able to do the
-        same (`DSAIndexer.supports_gpu_input`): today that is the BF16 indexer
-        backends, while the FP8 ones and the two deep_gemm-backed ones keep a
-        host-side top-k plan / paged-MQA schedule that has to be prepared
-        outside a capture.
+        and the indexer (when the model has one) both have to build that
+        metadata from device tensors alone. See
+        `AttnBackend.decode_supports_prepare_in_graph`,
+        `DSAIndexer.decode_supports_prepare_in_graph`, and
+        `chitu/attn_backend/README.md` for which ones qualify.
 
         The answer must be identical on every TP rank -- it decides whether the
         loop's per-step collectives run at all, so a rank-dependent answer would
@@ -1702,12 +1700,11 @@ class Transformer(nn.Module):
             blockers.append("mtp_size <= 1")
         if not self.use_cuda_graph:
             blockers.append("use_cuda_graph is off")
-        if not self.attn_backend.supports_gpu_input():
+        if not self._decode_prepare_in_graph():
             blockers.append(
-                "the attention backend prepares decode metadata on the host"
+                "the attention backend or the indexer prepares decode metadata "
+                "on the host"
             )
-        if not self._indexer_supports_gpu_input():
-            blockers.append("the indexer prepares decode metadata on the host")
 
         if blockers:
             logger.warning_once(
@@ -1721,13 +1718,24 @@ class Transformer(nn.Module):
         )
         return True
 
-    def _indexer_supports_gpu_input(self) -> bool:
+    def _decode_prepare_in_graph(self) -> bool:
+        """Whether a decode step's prepares may run inside the captured region.
+
+        Both sides have to agree: the attention backend, and the indexer when
+        the model has one.
+        """
+        return (
+            self.attn_backend.decode_supports_prepare_in_graph()
+            and self._indexer_decode_supports_prepare_in_graph()
+        )
+
+    def _indexer_decode_supports_prepare_in_graph(self) -> bool:
         """Whether the indexer's per-step metadata can be built in-graph.
 
         Models without an indexer (`indexer_backend is None`) trivially qualify.
         """
         indexer = getattr(self, "indexer_backend", None)
-        return indexer is None or indexer.supports_gpu_input()
+        return indexer is None or indexer.decode_supports_prepare_in_graph()
 
     def _prepare_mtp_caches(self, tasks, step: int) -> None:
         """Move the MTP cache position to `step` of the draft loop, on the host."""
@@ -1758,7 +1766,7 @@ class Transformer(nn.Module):
         `sample(logits)` turns the logits into `(token, proposal)` (the real
         sampler when eager, a draw from the graph-registered RNG when captured).
         Only `prepare_step` may touch the host, which is what
-        `AttnBackend.supports_gpu_input` declares.
+        `AttnBackend.decode_supports_prepare_in_graph` declares.
         """
         token_list = []
         proposal_list = []
@@ -1788,7 +1796,7 @@ class Transformer(nn.Module):
 
         The fallback whenever the loop cannot be captured as a whole: the
         feature is off, or the attention backend still prepares host-side
-        metadata per step (`supports_gpu_input()` is False). The per-step
+        metadata per step (`decode_supports_prepare_in_graph()` is False). The per-step
         forward is still a captured graph, `do_decode_callable_mtp`, and the
         attention metadata and the sampling stay outside it, on the host.
         """
@@ -1801,9 +1809,18 @@ class Transformer(nn.Module):
         forward = self.do_decode_callable_mtp
         assert forward is not None  # initialized by `_init_mtp_draft_callable`
 
+        def prepare_step(step):
+            self._prepare_mtp_caches(tasks, step)
+            # This path prepares each phase on the host, outside the per-step
+            # graph, so each phase pins the indexer's bound for itself. The
+            # attention backend is left alone: its own reservation is about a
+            # capture that holds several phases, and this path still captures
+            # one phase per graph.
+            self._reserve_decoding_indexer(is_mtp=True)
+
         token_list, proposal_list = self._mtp_draft_loop(
             tokens,
-            prepare_step=lambda step: self._prepare_mtp_caches(tasks, step),
+            prepare_step=prepare_step,
             forward=lambda tokens: forward(key_mtp, tokens, *extra_inputs_mtp),
             sample=sample,
         )
@@ -1828,14 +1845,13 @@ class Transformer(nn.Module):
         captured region", so the backend builds whatever it has to build on the
         next prepare -- which precedes the capture -- instead of while
         capturing. See `AttnBackend.reserve_metadata_for_decode`.
+
+        The reservation covers the whole captured loop, not just this step:
+        every further step is one token longer, so that is how far
+        `phases_after` reaches (see `reserve_decoding_attn`).
         """
         self._prepare_mtp_caches(tasks, 1)
-        cache = self.cache_dict["main"]
-        self.attn_backend.reserve_metadata_for_decode(
-            cache.get_seq_len_delta(True),
-            cache.get_gpu_block_table(),
-            cache.block_size,
-        )
+        self.reserve_decoding_attn(is_mtp=True, phases_after=self.mtp_size - 2)
 
     def _draft_proposal_inputs(self, sampler, bs: int, device):
         """The per-request proposal knobs as graph inputs.
@@ -2254,8 +2270,12 @@ class Transformer(nn.Module):
         # 该 step会路由到 decode kernel，此时应准备 decode 元数据，
         # 否则 metadata 中的 batchsize 会与实际 q 不一致。
         if self.attn_backend.route_to_decode(self.cache_dict["main"].seq_len_delta):
+            # A prefill step that routes to the decode kernels prepares decode
+            # metadata, so it reserves it the same way a decode step does.
+            self.reserve_decoding_attn()
             self.prepare_decoding_attn()
         else:
+            self.reserve_prefilling_attn()
             self.attn_backend.prepare_metadata_for_prefill(
                 self.cache_dict["main"].seq_len_delta
             )
@@ -2269,6 +2289,48 @@ class Transformer(nn.Module):
         else:
             assert hiddens is None
             return self.prefill_no_pipeline(tokens, output_token_offsets, **args)
+
+    def reserve_prefilling_attn(self) -> None:
+        """Reserve one prefill step's attention metadata, from allocated sizes.
+
+        Runs immediately before this step's `prepare_metadata_for_prefill`.
+        """
+        self.attn_backend.reserve_metadata_for_prefill(
+            self.cache_dict["main"].seq_len_delta,
+            self.cache_dict["main"].get_gpu_block_table(),
+            self.cache_dict["main"].block_size,
+        )
+
+    def reserve_decoding_attn(self, is_mtp=False, phases_after: int = 0):
+        """Reserve one decode step's attention metadata, from allocated sizes.
+
+        Runs once per decode step, outside any captured region, before
+        `prepare_decoding_attn`. `is_mtp` picks the delta that describes the
+        step -- the MTP verify phase's `mtp_size`, or a draft phase's one -- and
+        `phases_after` the phases that follow it, for a capture that runs
+        several. See `AttnBackend.reserve_metadata_for_decode`. The indexer
+        reserves alongside, since it has per-capture state of its own.
+        """
+        seq_len_delta = self.cache_dict["main"].get_seq_len_delta(is_mtp)
+        self.attn_backend.reserve_metadata_for_decode(
+            seq_len_delta,
+            self.cache_dict["main"].get_gpu_block_table(),
+            self.cache_dict["main"].block_size,
+        )
+        self._reserve_decoding_indexer(is_mtp, phases_after)
+
+    def _reserve_decoding_indexer(self, is_mtp: bool, phases_after: int = 0) -> None:
+        """Pin the indexer's per-capture decode state, outside any capture.
+
+        Separate from `reserve_decoding_attn` because some callers need only
+        this one: an eager MTP draft captures one phase per graph, but the
+        indexer's state still has to be reserved for every step it runs.
+        """
+        indexer = getattr(self, "indexer_backend", None)
+        if indexer is not None:
+            indexer.reserve_metadata_for_decode(
+                self.cache_dict["main"].get_seq_len_delta(is_mtp), phases_after
+            )
 
     def prepare_decoding_attn(self, is_mtp=False):
         self.attn_backend.prepare_metadata_for_decode(
@@ -2343,8 +2405,13 @@ class Transformer(nn.Module):
         for cache in self.cache_dict.values():
             cache.seq_len_delta.is_decode_stage = True
 
+        prepare_in_graph = self._decode_prepare_in_graph()
         if batch_size != 0:
-            self.prepare_decoding_attn()
+            # One reserve per decode step, then the step's prepares: outside
+            # the capture when the backend needs the host, inside it otherwise.
+            self.reserve_decoding_attn()
+            if not prepare_in_graph:
+                self.prepare_decoding_attn()
 
         infer_args = get_global_args().infer
 
@@ -2393,12 +2460,16 @@ class Transformer(nn.Module):
                     *extra_inputs_max_nelem,
                 ),
                 kwargs_max_nelem={},
-                before_capture_callback=lambda: self.prepare_decoding_attn(),
+                before_capture_callback=(
+                    None if prepare_in_graph else self.prepare_decoding_attn
+                ),
                 before_replay_callback=before_replay_callback,
                 enable=self.use_cuda_graph,
                 graph_pool=decode_graph_pool_handle,
             )
             def do_decode(tokens, *extra_inputs):
+                if prepare_in_graph:
+                    self.prepare_decoding_attn()
                 freqs_cis = self._prepare_freqs_cis_for_decode(*extra_inputs)
                 if self.pp_size > 1:
                     return self.decode_pipeline(tokens, freqs_cis)

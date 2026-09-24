@@ -137,7 +137,10 @@ def _delta(old_lengths, new_lengths, *, decode=True):
     rows = sum(new - old for old, new in zip(old_lengths, new_lengths))
     return SimpleNamespace(
         old=SimpleNamespace(lens_list=list(old_lengths)),
-        new=SimpleNamespace(lens_list=list(new_lengths)),
+        new=SimpleNamespace(
+            lens_list=list(new_lengths),
+            lens_tensor_device=torch.tensor(new_lengths, dtype=torch.int32),
+        ),
         batch_size=len(old_lengths),
         delta_total_len=rows,
         is_decode_stage=decode,
@@ -151,8 +154,6 @@ def _indexer(max_rows, static_width=1 << 20):
     indexer.index_topk = 2048
     indexer.mtp_size = 1
     indexer.workspace = None
-    indexer.plan_parts = 1
-    indexer.owner_stream_id = None
     return indexer
 
 
@@ -160,7 +161,7 @@ def _indexer(max_rows, static_width=1 << 20):
 def fake_workspace_backend(monkeypatch):
     backend = _FakeBackend()
     backend.fallback_calls = []
-    hygon_indexer_topk._prefill_plan_parts_cached.cache_clear()
+    hygon_indexer_topk._plan_parts_cached.cache_clear()
     hygon_indexer_topk._prefill_candidate_elements_cached.cache_clear()
     monkeypatch.setattr(hygon_indexer_topk, "chitu_backend", backend)
     monkeypatch.setattr(hygon_indexer_topk, "has_hygon_decode_topk_workspace", True)
@@ -172,7 +173,7 @@ def fake_workspace_backend(monkeypatch):
 
     monkeypatch.setattr(DSAIndexer, "topk_indices", fallback)
     yield backend
-    hygon_indexer_topk._prefill_plan_parts_cached.cache_clear()
+    hygon_indexer_topk._plan_parts_cached.cache_clear()
     hygon_indexer_topk._prefill_candidate_elements_cached.cache_clear()
 
 
@@ -187,53 +188,21 @@ def test_hygon_capacity_is_initialized_on_the_backend(monkeypatch):
     assert not hasattr(indexer, "hygon_indexer_topk")
 
 
-@pytest.mark.parametrize(
-    ("length", "rows", "expected"),
-    [
-        (65535, 8, 1),
-        (65536, 8, 8),
-        (65537, 8, 8),
-        (98303, 16, 8),
-        (98304, 16, 8),
-        (98305, 16, 8),
-    ],
-)
-def test_exact_planner_threshold_boundaries(
-    fake_workspace_backend, length, rows, expected
-):
-    indexer = _indexer(rows)
-    indexer.prepare_metadata_for_decode(_delta([length - 1] * rows, [length] * rows))
-    assert indexer.plan_parts == expected
-
-
-def test_exact_planner_preserves_non_monotonic_tiers(fake_workspace_backend):
-    indexer = _indexer(64)
-    indexer.prepare_metadata_for_decode(_delta([524287] * 64, [524288] * 64))
-    assert indexer.plan_parts == 8
-    indexer.prepare_metadata_for_decode(_delta([524288] * 64, [524289] * 64))
-    assert indexer.plan_parts == 2
-
-
-def test_mtp_main_and_draft_keep_one_device_plan(fake_workspace_backend):
-    indexer = _indexer(24)
-    indexer.prepare_metadata_for_decode(_delta([65533] * 8, [65536] * 8))
-    workspace = indexer._ensure_topk_workspace(torch.device("cpu"))
-    address = workspace.plan_parts.data_ptr()
-    assert workspace.plan_parts.item() == 4
-    indexer.prepare_metadata_for_decode(_delta([65535] * 8, [65536] * 8))
-    assert indexer.plan_parts == 8
-    assert workspace.plan_parts.item() == 8
-    assert workspace.plan_parts.data_ptr() == address
-
-
-def test_device_plan_is_written_only_when_tier_changes(
+def test_decode_topk_never_rewrites_the_plan_scalar(
     fake_workspace_backend, monkeypatch
 ):
-    indexer = _indexer(64)
-    delta = _delta([524287] * 64, [524288] * 64)
-    indexer.prepare_metadata_for_decode(delta)
+    """The hint bounds which parts a row may skip; rows pick their own P.
+
+    A decode launch leaves the scalar alone -- the whole schedule stays on the
+    device (see `_MAX_PLAN_PARTS`) -- so a captured graph is never dependent on
+    a rewrite that would have to happen inside it. `reserve_metadata_for_decode`
+    is what pins the capture's own bound, from outside.
+    """
+    indexer = _indexer(1)
     workspace = indexer._ensure_topk_workspace(torch.device("cpu"))
     address = workspace.plan_parts.data_ptr()
+    assert workspace.plan_parts.item() == 16
+
     original_fill = torch.Tensor.fill_
     writes = []
 
@@ -243,19 +212,82 @@ def test_device_plan_is_written_only_when_tier_changes(
         return original_fill(tensor, value)
 
     monkeypatch.setattr(torch.Tensor, "fill_", fill)
-    indexer.prepare_metadata_for_decode(delta)
+    for length in (4095, 65535, 524287, 4095):
+        indexer.topk_indices(
+            torch.empty((1, indexer.static_max_n)),
+            2048,
+            _delta([length], [length + 1]),
+            lengths=torch.tensor([length + 1], dtype=torch.int32),
+        )
+        assert workspace.plan_parts.data_ptr() == address
+        assert workspace.plan_parts.item() == 16
     assert writes == []
-    indexer.prepare_metadata_for_decode(_delta([524288] * 64, [524289] * 64))
-    assert writes == [2] and workspace.plan_parts.item() == 2
-    indexer.prepare_metadata_for_decode(delta)
-    assert writes == [2, 8] and workspace.plan_parts.item() == 8
-    assert workspace.plan_parts.data_ptr() == address
+    assert fake_workspace_backend.planner_calls == []
+    assert fake_workspace_backend.workspace_plan_values == [16, 16, 16, 16]
+
+
+def test_reserve_pins_the_capture_bound_over_every_phase(
+    fake_workspace_backend, monkeypatch
+):
+    """One bound covers the whole capture, so it must be the phase maximum.
+
+    The tier table is not monotone in length, so the longest phase's own tier
+    is not an upper bound for the shorter ones: reserving from the last phase
+    alone would drop split rows to the exact P1 selector.
+    """
+    monkeypatch.setattr(hygon_indexer_topk, "get_dp_size", lambda: 1)
+
+    # Rows=256 phases at 65535, 65536, 65537: the middle step asks for 8 parts
+    # (`length <= 65536`) while the last one asks for 1 (`length <= 98304` is
+    # past the `rows <= 192` rung), so reserving from the last phase alone
+    # would pick the lowest of the three and give up every split row.
+    indexer = _indexer(256, 131072)
+    indexer.reserve_metadata_for_decode(
+        _delta([65534] * 256, [65535] * 256), phases_after=2
+    )
+    assert indexer.workspace.plan_parts.item() == 8
+
+    # Rows=64 phases at 98303, 98304, 98305: 4 -> 4 -> 2 across the boundary.
+    indexer = _indexer(64, 131072)
+    indexer.reserve_metadata_for_decode(
+        _delta([98302] * 64, [98303] * 64), phases_after=2
+    )
+    assert indexer.workspace.plan_parts.item() == 4
+    # The same window without the earlier phases is exactly the hazard: the
+    # captured loop would still run step 98304's rows on this bound.
+    indexer.reserve_metadata_for_decode(_delta([98304] * 64, [98305] * 64))
+    assert indexer.workspace.plan_parts.item() == 2
+
+    # Short contexts stay on P1, and the bound may move back down.
+    indexer.reserve_metadata_for_decode(_delta([4095] * 64, [4096] * 64))
+    assert indexer.workspace.plan_parts.item() == 1
+
+    assert fake_workspace_backend.workspace_plan_values == []
+
+
+def test_reserve_keeps_the_tier_for_cp_views_and_non_workspace_shapes(
+    fake_workspace_backend, monkeypatch
+):
+    """A CP view exposes a subset of this rank's rows, so it cannot bound them.
+
+    Prefill also routes here for a decode-shaped step it cannot plan for; both
+    keep whatever tier the workspace was allocated with instead of pinning one
+    derived from a partial view.
+    """
+    indexer = _indexer(8, 131072)
+    view = object.__new__(BatchedSeqLenDeltaView)
+    view._base = _delta([65534] * 8, [65535] * 8)
+    indexer.reserve_metadata_for_decode(view, phases_after=2)
+    assert indexer.workspace is None
+
+    short = _indexer(8, 65536)  # below the multi-CTA width, so no workspace
+    short.reserve_metadata_for_decode(_delta([65535] * 8, [65536] * 8))
+    assert short.workspace is None
 
 
 def test_workspace_is_lazy_and_counters_are_temporary(fake_workspace_backend):
     indexer = _indexer(4)
     delta = _delta([65535], [65536])
-    indexer.prepare_metadata_for_decode(delta)
     assert indexer.workspace is None
     logits = torch.empty((1, indexer.static_max_n), dtype=torch.float32)
     lengths = torch.tensor([65536], dtype=torch.int32)
@@ -277,40 +309,19 @@ def test_workspace_is_lazy_and_counters_are_temporary(fake_workspace_backend):
     assert fake_workspace_backend.workspace_calls == [addresses, addresses]
 
 
-def test_workspace_rejects_cross_caller_stream_prepare(
+def test_persistent_state_cannot_be_created_during_capture(
     fake_workspace_backend, monkeypatch
 ):
-    indexer = _indexer(4)
-    delta = _delta([65535], [65536])
-    indexer.prepare_metadata_for_decode(delta)
-    indexer._ensure_topk_workspace(torch.device("cpu"))
-    indexer.owner_stream_id = 17
-    monkeypatch.setattr(indexer, "_current_stream_id", lambda device: 18)
-    with pytest.raises(AssertionError, match="cannot cross caller streams"):
-        indexer.prepare_metadata_for_decode(delta)
-
-
-@pytest.mark.parametrize("operation", ["allocate", "prepare"])
-def test_persistent_state_cannot_be_created_or_prepared_during_capture(
-    fake_workspace_backend, monkeypatch, operation
-):
     indexer = _indexer(1)
-    device = torch.device("cuda")
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    if operation == "allocate":
-        with pytest.raises(AssertionError, match="eager warmup before capture"):
-            indexer._ensure_topk_workspace(device)
-    else:
-        indexer.workspace = SimpleNamespace(candidates=SimpleNamespace(device=device))
-        with pytest.raises(AssertionError, match="outside graph capture"):
-            indexer.prepare_metadata_for_decode(_delta([65535], [65536]))
+    with pytest.raises(AssertionError, match="eager warmup before capture"):
+        indexer._ensure_topk_workspace(torch.device("cuda"))
+    assert indexer.workspace is None
     assert fake_workspace_backend.planner_calls == []
 
 
 def test_workspace_oom_propagates(fake_workspace_backend, monkeypatch):
     indexer = _indexer(4)
-    delta = _delta([65535], [65536])
-    indexer.prepare_metadata_for_decode(delta)
     original_empty = torch.empty
 
     def oom_empty(*args, **kwargs):
@@ -324,30 +335,26 @@ def test_workspace_oom_propagates(fake_workspace_backend, monkeypatch):
     assert indexer._ensure_topk_workspace(torch.device("cpu")) is indexer.workspace
 
 
-@pytest.mark.parametrize("new_length", [100, 99])
-def test_nonempty_decode_requires_positive_rows(fake_workspace_backend, new_length):
-    with pytest.raises(AssertionError, match="at least one query row"):
-        _indexer(4).prepare_metadata_for_decode(_delta([100], [new_length]))
+def test_decode_shape_checks_live_in_topk_indices(fake_workspace_backend):
+    # The workspace is sized from the shape, so the row-count and capacity
+    # checks belong to the call that uses it, not to a separate prepare step.
+    with pytest.raises(AssertionError, match="query row count mismatch"):
+        _indexer(4).topk_indices(
+            torch.empty((2, 1 << 20)), 2048, _delta([65535], [65536])
+        )
+    with pytest.raises(AssertionError, match="exceed the persistent workspace"):
+        _indexer(1).topk_indices(
+            torch.empty((5, 1 << 20)), 2048, _delta([100] * 5, [101] * 5)
+        )
     assert fake_workspace_backend.planner_calls == []
 
 
-def test_decode_capacity_and_metadata_shape_checks(fake_workspace_backend):
-    indexer = _indexer(4)
-    with pytest.raises(AssertionError, match="exceed the persistent workspace"):
-        indexer.prepare_metadata_for_decode(_delta([100] * 5, [101] * 5))
-    delta = _delta([65535], [65536])
-    indexer.prepare_metadata_for_decode(delta)
-    with pytest.raises(AssertionError, match="query row count mismatch"):
-        indexer.topk_indices(torch.empty((2, 1 << 20)), 2048, delta)
-
-
-def test_empty_and_short_decode_do_not_allocate_or_plan(fake_workspace_backend):
-    for indexer, delta in [
-        (_indexer(4), _delta([], [])),
-        (_indexer(4, 8192), _delta([100] * 5, [101] * 5)),
-    ]:
-        indexer.prepare_metadata_for_decode(delta)
-        assert indexer.workspace is None
+def test_short_decode_does_not_allocate_or_plan(fake_workspace_backend):
+    # A short context is under the multi-CTA crossover, so it never reaches the
+    # persistent workspace and never allocates one.
+    indexer = _indexer(4, 8192)
+    indexer.topk_indices(torch.empty((5, 8192)), 2048, _delta([100] * 5, [101] * 5))
+    assert indexer.workspace is None
     assert fake_workspace_backend.planner_calls == []
 
 
@@ -387,8 +394,6 @@ def test_interleaved_backends_do_not_select_an_implicit_active_runtime(
 ):
     first, second = _indexer(1), _indexer(1)
     delta = _delta([65535], [65536])
-    first.prepare_metadata_for_decode(delta)
-    second.prepare_metadata_for_decode(_delta([524287], [524288]))
     first.topk_indices(
         torch.empty((1, 1 << 20)),
         2048,
@@ -396,7 +401,7 @@ def test_interleaved_backends_do_not_select_an_implicit_active_runtime(
         lengths=torch.tensor([65536], dtype=torch.int32),
     )
     assert first.workspace is not None and second.workspace is None
-    assert fake_workspace_backend.workspace_plan_values == [8]
+    assert fake_workspace_backend.workspace_plan_values == [16]
     second.topk_indices(
         torch.empty((1, 1 << 20)),
         2048,
@@ -409,15 +414,14 @@ def test_interleaved_backends_do_not_select_an_implicit_active_runtime(
     assert (
         first.workspace.plan_parts.data_ptr() != second.workspace.plan_parts.data_ptr()
     )
-    assert first.workspace.plan_parts.item() == 8
+    assert first.workspace.plan_parts.item() == 16
     assert second.workspace.plan_parts.item() == 16
-    assert fake_workspace_backend.workspace_plan_values == [8, 16]
+    assert fake_workspace_backend.workspace_plan_values == [16, 16]
 
 
 def test_prefill_does_not_change_an_existing_decode_workspace(fake_workspace_backend):
     indexer = _indexer(1)
     decode = _delta([65535], [65536])
-    indexer.prepare_metadata_for_decode(decode)
     workspace = indexer._ensure_topk_workspace(torch.device("cpu"))
     addresses = (workspace.candidates.data_ptr(), workspace.plan_parts.data_ptr())
     indexer.topk_indices(
@@ -427,14 +431,14 @@ def test_prefill_does_not_change_an_existing_decode_workspace(fake_workspace_bac
         lengths=torch.tensor([524288], dtype=torch.int32),
     )
     assert indexer.workspace is workspace
-    assert indexer.plan_parts == workspace.plan_parts.item() == 8
+    assert workspace.plan_parts.item() == 16
     indexer.topk_indices(
         torch.empty((1, 1 << 20)),
         2048,
         decode,
         lengths=torch.tensor([65536], dtype=torch.int32),
     )
-    assert fake_workspace_backend.workspace_plan_values == [16, 8]
+    assert fake_workspace_backend.workspace_plan_values == [16, 16]
     assert fake_workspace_backend.workspace_calls[-1] == addresses
 
 
@@ -670,7 +674,7 @@ def test_compiled_prefill_dispatch_matches_torch(
     or not torch.cuda.is_available(),
     reason="requires a rebuilt Hygon chitu_backend and a GPU",
 )
-def test_decode_graph_replays_clear_counters_and_read_updated_plan():
+def test_decode_graph_replays_clear_counters_and_read_the_pinned_plan():
     width = 1 << 20
     indexer = _indexer(24, width)
     graphs = {}
@@ -683,7 +687,6 @@ def test_decode_graph_replays_clear_counters_and_read_updated_plan():
         )
         lengths = torch.full((rows,), 4096, dtype=torch.int32, device="cuda")
         delta = _delta([4095] * rows, [4096] * rows)
-        indexer.prepare_metadata_for_decode(delta)
         indexer.topk_indices(logits, 2048, delta, lengths=lengths)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -698,9 +701,6 @@ def test_decode_graph_replays_clear_counters_and_read_updated_plan():
                 length if row % 2 == 0 else max(4096, length // 2)
                 for row in range(rows)
             ]
-            indexer.prepare_metadata_for_decode(
-                _delta([value - 1 for value in values], values)
-            )
             lengths.copy_(torch.tensor(values, dtype=torch.int32, device="cuda"))
             graph.replay()
             expected = torch.stack(
@@ -714,3 +714,4 @@ def test_decode_graph_replays_clear_counters_and_read_updated_plan():
                 workspace.candidates.data_ptr(),
                 workspace.plan_parts.data_ptr(),
             ) == addresses
+            assert workspace.plan_parts.item() == 16

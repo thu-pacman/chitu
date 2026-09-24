@@ -111,6 +111,10 @@ class NpuAttnBackend(RefAttnBackend):
         # min(position + 1, index_topk)
         context_lengths = seq_len_delta.delta_position_ids_tensor_device + 1
         capped = context_lengths.clamp(max=index_topk)
+        # Device-to-host by the operator's contract, not by choice: the Ascend
+        # op takes `actual_seq_lengths_kv` as a host list. A captured graph gets
+        # the refreshed list through `cpu_update_input` instead, the same
+        # requirement in another form.
         self.actual_seq_lengths_kv = capped.to(torch.int32).cpu().tolist()
 
         n_total_tokens = len(self.actual_seq_lengths_kv)
@@ -130,6 +134,17 @@ class NpuAttnBackend(RefAttnBackend):
     @override
     def decode_op_supports_mtp(self) -> bool:
         return self.args.infer.cache_type != "paged"
+
+    @override
+    def decode_supports_prepare_in_graph(self) -> bool:
+        # Both decode preparations read the host: `prepare_sparse_mla_metadata`
+        # because the Ascend operator takes its KV lengths as a host list
+        # (`actual_seq_lengths_kv`, see the device-to-host copy above), and
+        # `prepare_metadata_for_decode` because it sizes the decode mask from
+        # `new.max_len` / `delta_max_len`. A captured replay feeds the refreshed
+        # host list through `cpu_update_input` instead, so the preparation stays
+        # outside the graph.
+        return False
 
     @classmethod
     def should_use_attn_from_cinfer_ascendc(cls, model_type, batch_size):
@@ -225,6 +240,9 @@ class NpuAttnBackend(RefAttnBackend):
                 )
             )
 
+            # The query extent sizes `decode_casual_attn_mask` and a capture
+            # keeps that shape for every replay, so it has to be the step's real
+            # one -- which is why this reads the host mirror of the lengths.
             q_len = seq_len_delta.delta_max_len
             assert q_len > 0
 

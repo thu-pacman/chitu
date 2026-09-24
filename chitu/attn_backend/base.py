@@ -58,23 +58,42 @@ class AttnBackend(abc.ABC):
     def decode_op_supports_mtp(self) -> bool:
         return False
 
-    def supports_gpu_input(self) -> bool:
-        """Whether every decode phase is prepared from device tensors only.
+    def decode_supports_prepare_in_graph(self) -> bool:
+        """Whether a decode step's prepares may run inside a captured region.
 
-        A backend that answers True fills in its decode metadata from
-        `seq_len_delta`'s device tensors and `block_table` alone -- for a plain
-        decode step, for the MTP verify step and for an MTP draft step alike --
-        so for the shapes passed to `reserve_metadata_for_decode` it never
-        reads the host-side `lens_list` and never builds a host-side plan
-        inside `prepare_metadata_for_decode`. That method is then safe to call
-        from inside a captured CUDA graph, which is what lets a whole MTP
-        iteration (a verify step plus its K-1 draft steps) share one replay.
+        A decode step is one `reserve_metadata_for_decode` -- outside any
+        capture, told only about allocated sizes -- followed by one or more
+        `prepare_metadata_for_decode` + attention pairs: one pair for a plain
+        decode step, and a verify phase plus its K-1 draft phases for an MTP
+        step. A backend that answers True prepares every one of those phases
+        from device tensors alone -- `seq_len_delta`'s device tensors and the
+        block table, never the host-side `lens_list`, never a host-side plan --
+        for every shape `reserve_metadata_for_decode` was given. That is what
+        lets a whole MTP iteration share one replay.
 
-        Backends that still need the host (the FlashInfer non-MLA wrapper, the
-        hygon/muxi FlashMLA scheduler, Ascend, the reference backend, ...) keep
-        the default False and run one graph per step. Defaults to False.
+        Backends that still need the host keep the default False and run one
+        captured graph per phase, saying why where their answer is made;
+        `chitu/attn_backend/README.md` lists them. Defaults to False.
         """
         return False
+
+    def reserve_metadata_for_prefill(
+        self,
+        seq_len_delta: BatchedSeqLenDelta,
+        block_table: Optional[torch.Tensor],
+        block_size: int,
+    ) -> None:
+        """Reserve one prefill step's metadata, from allocated sizes.
+
+        Runs once per prefill step, outside any capture and before
+        `prepare_metadata_for_prefill`, and sees the same `seq_len_delta` that
+        call gets: the step's before and after lengths. A backend sizes its
+        prefill buffers, masks and plans here, from the extents the step cannot
+        exceed (the addressable KV span `max_alloc_seq_len(max_seq_len)`, the
+        paged block table's width) rather than from this step's own lengths, so
+        that `prepare_metadata_for_prefill` only has to fill them in. A backend
+        with nothing to size up front keeps this a no-op, which is the default.
+        """
 
     def reserve_metadata_for_decode(
         self,
@@ -82,29 +101,37 @@ class AttnBackend(abc.ABC):
         block_table: Optional[torch.Tensor],
         block_size: int,
     ) -> None:
-        """Declare that `prepare_metadata_for_decode` will run inside a capture.
+        """Reserve one decode step's metadata, from allocated sizes.
 
-        Called outside any captured region, before that region is traced, for
-        every decode shape the region contains -- the MTP draft step's shape
-        today, plus the verify step's once both share a graph. It marks the
-        shape as device-driven: from then on `prepare_metadata_for_decode`
-        handles it without touching the host, and is therefore legal inside
-        the captured region.
+        Runs outside any capture, before the `prepare_metadata_for_decode`
+        calls it covers. Those are the attention phases of one capture, and
+        `seq_len_delta` is that capture's delta, so the delta decides which
+        shapes are reserved: a verify step or a plain decode feeds `mtp_size` or
+        one query token per sequence, a draft step one. A decode step whose
+        verify phase and draft steps are captured separately therefore reserves
+        once per capture; one that captures them together reserves every shape
+        it will see before that single capture.
 
-        Whatever cannot be built while capturing is built by the first
-        `prepare_metadata_for_decode` after this call, which must still run
-        outside the captured region (the warmup pass that precedes a capture,
-        or a before-capture callback). Backends that have nothing to pre-build
-        -- those whose metadata already comes from device tensors -- keep this a
-        no-op; backends that must pre-plan something outside the graph
-        (FlashInfer's MLA plan is built by a host-side scheduler) do it here.
+        `prepare_metadata_for_decode` then follows once per phase, and must not
+        touch the host for a shape reserved here. Whatever cannot be built while
+        capturing is built here instead: backends whose metadata already comes
+        from device tensors keep this a no-op, backends that must pre-plan
+        something outside the graph (FlashInfer's MLA plan is built by a
+        host-side scheduler) plan it here.
         """
 
     def prepare_metadata_for_decode(self, *args, **kwargs):
-        pass
+        """Fill in one decode phase's metadata, from the step's actual lengths.
+
+        Runs once per phase, immediately before that phase's attention: for an
+        MTP step once for the verify phase and once per draft phase.
+        """
 
     def prepare_metadata_for_prefill(self, *args, **kwargs):
-        pass
+        """Fill in one prefill step's metadata, from the step's actual lengths.
+
+        Runs once per prefill step, right after `reserve_metadata_for_prefill`.
+        """
 
     def requires_sparse_decode_page_table(self) -> bool:
         return False
@@ -1046,7 +1073,18 @@ class AttnBackend(abc.ABC):
         physical_window_size: Optional[int] = None,
         prewrite_current: bool = False,
         compress_ratio: Optional[int] = None,
+        compressed_len_bound: Optional[int] = None,
     ) -> torch.Tensor:
+        """DeepSeek-V4 MTP decode: one attention call over `mtp_size` query rows.
+
+        `compressed_len_bound` is the host-side upper bound on every index in
+        `compressed_topk_idxs` -- the step's allocated compressed length -- and
+        has to be the same host constant the caller used to build those
+        indices. The packed-compressed buffer is sized from it, so a caller
+        that runs inside a captured region must pass it: reading the exact
+        maximum back to the host is illegal there. Callers that may touch the
+        host can leave it None and get the exact device maximum instead.
+        """
         raise NotImplementedError(
             f"{type(self).__name__} does not implement DeepSeek-V4 MTP decode"
         )

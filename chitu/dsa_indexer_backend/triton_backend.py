@@ -34,9 +34,6 @@ class TritonIndexer(NvidiaTopKMixin, TorchIndexer):
     def _init_backend(self, args):
         self._init_nvidia_topk(args)
 
-    def prepare_metadata_for_decode(self, seq_len_delta):
-        self._prepare_topk_decode(seq_len_delta)
-
 
 class TritonBF16Indexer(BF16Indexer):
     impl = "triton_bf16"

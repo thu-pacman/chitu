@@ -44,6 +44,7 @@ if has_flash_mla and has_accelerator():
         flash_mla, "flash_mla_with_kvcache_fp8_e5m2_dense"
     )
 else:
+    has_flash_mla_sched_meta = False
     has_flash_mla_e5m2 = False
 
 
@@ -308,14 +309,22 @@ class FlashMLABackend(TritonAttnBackend):
         return not self.use_e5m2_cache
 
     @override
-    def supports_gpu_input(self) -> bool:
-        # Non-hygon/muxi FlashMLA prepares decode metadata via a
-        # lazily-initialized singleton scheduler buffer that does NOT encode
-        # per-step sequence lengths (the scheduling is (re)computed by the
-        # kernel itself from the device-side lengths), so its
-        # prepare_metadata_for_decode() is capture-safe to call once per MTP
-        # draft step inside one graph.
-        return not (is_hygon() or is_muxi()) and not self.use_e5m2_cache
+    def decode_supports_prepare_in_graph(self) -> bool:
+        # `prepare_metadata_for_decode` is capture-safe exactly when the plan it
+        # hands the kernel is not a plan *of that phase's lengths*: the kernel
+        # has to (re)build it from the device-side lengths on every replay. That
+        # is what the `FlashMLASchedMeta` interface does -- `get_mla_metadata()`
+        # takes no arguments and returns an empty plan object that the first
+        # `flash_mla_with_kvcache` fills in from the device `cache_seqlens`.
+        # Nvidia has always shipped it, and so does Hygon's FlashMLA. The older
+        # host-planning interface that Hygon and Muxi may still get instead is a
+        # plan *of those seqlens*, rebuilt per phase, which a capture would
+        # bake. Muxi is left out because its package has not been checked.
+        if self.use_e5m2_cache:
+            return False
+        if is_hygon():
+            return has_flash_mla_sched_meta
+        return not is_muxi()
 
     def convert_indices_ragged_torch(
         self,
@@ -1070,6 +1079,23 @@ class FlashMLABackend(TritonAttnBackend):
         )
         return output[:, :, :local_h_q, :].contiguous()
 
+    @staticmethod
+    def _compressed_pack_len(compressed_topk_idxs, compressed_len_bound):
+        """Width of the packed compressed KV, as a host constant.
+
+        `compressed_topk_idxs` holds positions in the compressed cache, so the
+        buffer has to span the largest of them. Reading that maximum back to
+        the host is a device-to-host copy, which a captured region forbids;
+        `compressed_len_bound` is the caller's host-side upper bound on those
+        indices (the length it used to build them), so a capture-capable
+        caller passes it and this stays device-only. Without a bound the exact
+        device maximum is used, which is what the eager path always did.
+        """
+        if compressed_len_bound is not None:
+            return int(compressed_len_bound)
+        valid = compressed_topk_idxs[compressed_topk_idxs >= 0]
+        return int(valid.max().item()) + 1 if valid.numel() > 0 else 0
+
     @override
     def csa_hca_decode_mtp(
         self,
@@ -1089,6 +1115,7 @@ class FlashMLABackend(TritonAttnBackend):
         physical_window_size: Optional[int] = None,
         prewrite_current: bool = False,
         compress_ratio: Optional[int] = None,
+        compressed_len_bound: Optional[int] = None,
     ) -> torch.Tensor:
         if not isinstance(slidingwindow_cache, PagedKVCacheAccessor):
             raise TypeError(
@@ -1287,11 +1314,8 @@ class FlashMLABackend(TritonAttnBackend):
             compressed_topk_idxs = compressed_topk_idxs.to(
                 device=device, dtype=torch.long
             )
-            valid_compressed = compressed_topk_idxs[compressed_topk_idxs >= 0]
-            max_compressed_len = (
-                int(valid_compressed.max().item()) + 1
-                if valid_compressed.numel() > 0
-                else 0
+            max_compressed_len = self._compressed_pack_len(
+                compressed_topk_idxs, compressed_len_bound
             )
             if max_compressed_len > 0:
                 comp_cols = torch.arange(
