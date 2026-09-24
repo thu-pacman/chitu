@@ -195,7 +195,7 @@ class MetadataConfig:
         """PP 全前缀命中任务转 Decode 的注册配置
 
         全前缀命中（num_uncomputed==0）的 Prefill 被 scheduler 直接转为 Decode、
-        未经过 prefill_step，故非首 PP stage 的 TaskPool 没有它：
+        未经过 prefill 前向，故非首 PP stage 的 TaskPool 没有它：
         - for_decode_with_status 不含 tasks_data，接收侧无法注册 → KeyError；
           本配置在 decode_with_status 基础上补注册字段（prompt_len /
           sample_params / return_params / consumed / next_tokens），使非首 stage

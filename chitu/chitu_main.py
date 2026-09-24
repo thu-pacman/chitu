@@ -1076,7 +1076,7 @@ def _warmup_backend_direct(
     if not get_pp_group().is_first_rank:
         payload_dtype = Backend.executor.get_payload_dtype()
         if not skip_model_prefill:
-            # Match executor._prepare_hiddens(): PP prefill receives CP-local
+            # Match executor._recv_hiddens(): PP prefill receives CP-local
             # hidden rows, while direct warmup bypasses the real pipe receiver.
             prefill_tokens = Backend.model.cp_context.compute_pp_num_tokens(
                 local_max_bs

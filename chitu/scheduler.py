@@ -882,7 +882,7 @@ class Scheduler:
                     #   estimate memory;
                     # - mtp>1: bootstrap decode only supports mtp==1; the MTP draft
                     #   state machine (mtp cache, accept_index, is_classic_decoding)
-                    #   depends on prefill_step initialization, so skipping prefill
+                    #   depends on the prefill forward initializing it, so skipping prefill
                     #   would break it
                     # - PD prefill-only: decode waits for PrefillDone/first_token from
                     #   the prefill hook, so a full-hit request must still execute one

@@ -478,7 +478,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             self.task_to_token_blocks[task.task_id].append(block)
 
         if eager_prefix_cache_insert:
-            # 非PD-Decode-Only节点调用prepare_metadata_before_prefill后立刻进入model_run，可视为cache就绪可复用
+            # 非PD-Decode-Only节点调用prepare_metadata_before_prefill后立刻进入 prefill 前向，可视为cache就绪可复用
             self.publish_prefix_cache_blocks(task, target_seq_len)
         else:
             # PD分离Decode-Only节点：此时KV cache还未从prefill传输并reorder就绪，

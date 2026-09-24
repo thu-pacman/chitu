@@ -426,7 +426,7 @@ class KVCacheBase:
 
     def prepare_cache_decode(self, tasks: "PackedTasksBase"):
         # A fully-cached task is converted to Decode by the scheduler and skips
-        # prefill_step, so prepare_cache_prefill never ran for it and
+        # the prefill forward, so prepare_cache_prefill never ran for it and
         # tid_to_cached_len is still 0. Preset it here using the hit length from
         # inc_hit_tokens_list (N-1 when fully cached) so that decode counts the
         # N-1 already-cached prefix KV into old seq len and computes the Nth token
