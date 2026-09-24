@@ -25,6 +25,7 @@ from chitu.global_vars import (
     get_slot_handle,
     get_global_args,
     is_classic_pd_disagg,
+    is_pd_prefill_only,
     get_instance_id,
 )
 from chitu.task_type import TaskType
@@ -686,6 +687,9 @@ class Task:
 
     def update_decode_status(self, tokens: list[int]):
         if self.status == TaskStatus.Stopped:
+            return
+        # PD Prefill completion is driven by KV transfer, not decode length.
+        if is_pd_prefill_only():
             return
         if self.req is None:
             return
