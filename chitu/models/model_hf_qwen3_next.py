@@ -207,21 +207,48 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         )
 
         cache_accessor = self.cache.get_accessor(self.layer_id)
-        is_mtp_decode_stage = (
-            self.cache.is_mtp_decode_stage if self.mtp_size > 1 else False
-        )
+        # is_decode_stage 是 cache 的 step 级状态（prefill 置 False、decode 置 True），
+        is_mtp_decode_stage = self.mtp_size > 1 and self.cache.is_decode_stage
 
-        mtp_accept_indices = get_mtp_accept_indices() if is_mtp_decode_stage else None
+        write_page_ids = cache_accessor.get_write_page_ids()
+        ckpt_page_ids = cache_accessor.get_ckpt_write_pages()
+        # 本 step 要写几个 checkpoint 由 KVCache 算出来
+        # checkpoint 只在 prefill 分支由 chunk 算子算出来（见下），decode 时为 None
+        ckpt_cu_starts = cache_accessor.get_ckpt_cu_starts()
+        # 算子按 checkpoint_every_n_tokens（= cache 的 checkpoint_interval）从 chunk 起点
+        # 每 C 个 token 存一份 state；本 step 没有 checkpoint 要写时置 0，state_checkpoints
+        # 和 checkpoint_cu_starts 也都是 None
+        checkpoint_every_n_tokens = 0
+        conv_state_checkpoints = None
+        state_checkpoints = None
+
+        # 读哪个 in-place block 由 cache 在 prepare 时按上一 step 的接受长度算好
+        # （_read_page_ids）
         conv_state = read_from_singleton_paged_kv_cache(
             cache_accessor.kv["conv_state"],
-            cache_accessor.block_table,
-            mtp_accept_indices=mtp_accept_indices,
+            cache_accessor.get_read_page_ids(),
         )
         recurrent_state = read_from_singleton_paged_kv_cache(
             cache_accessor.kv["recurrent_state"],
-            cache_accessor.block_table,
-            mtp_accept_indices=mtp_accept_indices,
+            cache_accessor.get_read_page_ids(),
         )
+
+        # checkpoint 的输出 buffer 由调用方按 cache 给的个数预分配，算子把 state 写进去
+        # （flashinfer 的约定：checkpoint_every_n_tokens > 0 时 state_checkpoints 和
+        # checkpoint_cu_starts 一起传入）；本 step 没有 checkpoint 要写时两者都是 None
+        if ckpt_cu_starts is not None:
+            checkpoint_every_n_tokens = int(self.cache.checkpoint_interval)
+            n_checkpoints = int(ckpt_cu_starts[-1])
+            conv_state_checkpoints = torch.empty(
+                (n_checkpoints,) + tuple(conv_state.shape[1:]),
+                dtype=conv_state.dtype,
+                device=conv_state.device,
+            )
+            state_checkpoints = torch.empty(
+                (n_checkpoints,) + tuple(recurrent_state.shape[1:]),
+                dtype=x.dtype,
+                device=recurrent_state.device,
+            )
 
         qkvz = self.in_proj_qkvz(x)
         ba = self.in_proj_ba(x)
@@ -240,6 +267,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         elif is_mtp_decode_stage:
             qkv = qkv.view(-1, self.mtp_size, *qkv.shape[1:])
             qkv_out = torch.empty_like(qkv)
+            # conv_state_out[:, i, ...] 是第 i 个 draft token 之后的 state，写第 i 列
+            # （和 write_page_ids 的第 i 列对应）
             conv_state_out = torch.empty(
                 (qkv.shape[0], self.mtp_size, *conv_state.shape[1:]), device=qkv.device
             )
@@ -258,12 +287,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 conv_state,
                 self.conv1d.weight,
                 seq_len_delta.delta_prefix_lens_tensor_device,
+                state_checkpoints=conv_state_checkpoints,
+                checkpoint_cu_starts=ckpt_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             )
             # qkv: (total_len, hidden_size), conv_state: (total_len, hidden_size, state_len)
-            if self.mtp_size > 1:
-                conv_state = conv_state.unsqueeze(1).expand(
-                    -1, self.mtp_size, *([-1] * (conv_state.dim() - 1))
-                )
+            # Prefill只写每个 seq 的第 0 个 in-place block，所以这里不需要为 mtp_size 复制
 
         q, k, v = torch.split(
             qkv,
@@ -303,12 +332,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=seq_len_delta.delta_prefix_lens_tensor_device,
                 seq_len_list=seq_len_delta.delta_lens_list,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=ckpt_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
                 impl=self.impl,
             )
-            if self.mtp_size > 1:
-                last_recurrent_state = last_recurrent_state.unsqueeze(1).expand(
-                    -1, self.mtp_size, *([-1] * (last_recurrent_state.dim() - 1))
-                )
+            # Prefill只写每个 seq 的第 0 个 in-place block
         # mtp decode, return all step state, could be optimized with triton kernel
         elif is_mtp_decode_stage:
             q, k, v, beta, g = map(
@@ -341,18 +370,46 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 impl=self.impl,
             )
 
+        if is_mtp_decode_stage:
+            # mtp decode: 第 i 个 draft token 之后的 state 写第 i 列（data-dependent 的边界列
+            # 由 cache 换成了 ckpt block，见 SingletonPagedKVCache._update_write_page_ids），
+            # 下次读的时候再按接受的 draft token 个数取对应那一列
+            state_page_ids = write_page_ids  # (bsz, mtp_size)
+        else:
+            # prefill 和 mtp_size == 1 的 decode 都只有一份 state，写第 0 列（此时
+            # _read_page_ids 也只会取到第 0 列）
+            state_page_ids = write_page_ids[:, 0]  # (bsz,)
+
         update_singleton_paged_kv_cache(
             cache_accessor.kv["conv_state"],
-            cache_accessor.block_table,
+            state_page_ids,
             conv_state,
-            mtp_size=self.mtp_size,
         )
         update_singleton_paged_kv_cache(
             cache_accessor.kv["recurrent_state"],
-            cache_accessor.block_table,
+            state_page_ids,
             last_recurrent_state.to(x.dtype),
-            mtp_size=self.mtp_size,
         )
+
+        # checkpoint_interval 为 None 或 decode stage 时 ckpt_page_ids 为 None，没有checkpoint 要写。
+        if ckpt_page_ids is not None:
+            assert (
+                conv_state_checkpoints is not None and state_checkpoints is not None
+            ), (
+                "ckpt pages are given but no checkpoint buffer was allocated; "
+                "checkpoints are only produced by the prefill branch"
+            )
+            update_singleton_paged_kv_cache(
+                cache_accessor.kv["conv_state"],
+                ckpt_page_ids,
+                conv_state_checkpoints,
+            )
+            update_singleton_paged_kv_cache(
+                cache_accessor.kv["recurrent_state"],
+                ckpt_page_ids,
+                state_checkpoints,
+            )
+
         self.last_conv_state = conv_state.contiguous()
         self.last_recurrent_state = last_recurrent_state.to(x.dtype).contiguous()
 

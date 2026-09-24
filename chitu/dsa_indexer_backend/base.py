@@ -72,31 +72,47 @@ class DSAIndexer:
         row_bytes = max(1, int(self.row_width(seq_len_delta))) * 4
         return max(1, int(self._indexer_logits_chunk_bytes) // row_bytes)
 
+    def reserve_metadata_for_decode(self, seq_len_delta, phases_after: int = 0):
+        """Reserve one decode step's indexer state, from the step's lengths.
+
+        Like `AttnBackend.reserve_metadata_for_decode`, and it also sees the
+        phases of the capture it serves: `phases_after` of them follow this
+        delta's own, each one a token longer. Backends whose state comes from
+        device tensors keep the no-op default.
+        """
+
     def prepare_metadata_for_decode(self, seq_len_delta):
         pass
 
     def prepare_metadata_for_prefill(self, seq_len_delta):
         pass
 
-    def supports_gpu_input(self) -> bool:
+    def decode_supports_prepare_in_graph(self) -> bool:
         """Whether a decode step's indexer state can be derived on the GPU.
 
-        The single-graph MTP draft re-runs `prepare_metadata_for_decode` inside
-        a captured region, so a captured draft step may only depend on the
-        device tensors (`lens_tensor_device`, the block table). Only the BF16
-        backends qualify today: they keep the no-op
-        `prepare_metadata_for_decode` above, and both their score and their
-        top-k read device tensors.
+        The same contract as `AttnBackend.decode_supports_prepare_in_graph`, over
+        the indexer's own state: the prepare may read device tensors only --
+        `lens_tensor_device`, the block table -- and never a host mirror or a
+        device-to-host sync. See `chitu/attn_backend/README.md` for the
+        per-backend reasons.
 
-        The others keep the per-step draft, because they still carry host-side
-        state that has to be rebuilt between steps: `deepgemm` and `hygon`
-        route a paged-MQA schedule through
-        `deep_gemm.get_paged_mqa_logits_metadata`, and the FP8 top-k paths mix
-        in `NvidiaTopKMixin`, whose plan is computed from the host-side
-        `lens_list` under an explicit "must be prepared outside capture"
-        assertion. Re-enabling any of them needs its own verification.
+        The FP8 `torch` impl is the one left out, and it is a blocker, not a
+        missing measurement: its paged score
+        (`blockfp8_index_score_ragged_q_paged_k_dsv32_torch`,
+        `chitu/ops/quant/blockfp8/index_score.py`) gathers the paged cache with
+        the *K-side* ids `new.seq_ids_tensor_device` /
+        `new.position_ids_tensor_device`, which derive from the host mirror that
+        a captured draft step leaves stale, and which hold the whole context
+        length -- so a capture either reads a stale mirror or bakes a context
+        length a longer replay truncates. Admitting it is a score rewrite.
         """
-        return self.impl in ("torch_bf16", "triton_bf16")
+        return self.impl in (
+            "torch_bf16",
+            "triton_bf16",
+            "triton",
+            "deepgemm",
+            "hygon",
+        )
 
     def append_indexer_kv(self, *args, **kwargs):
         raise NotImplementedError

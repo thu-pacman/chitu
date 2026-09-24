@@ -702,8 +702,9 @@ class TransformerGLM52(TransformerDeepSeekV3):
         h = self._pre_layers(tokens)
         h = _run_non_mtp_layers(self.non_mtp_layers, h, freqs_cis)
         if self.mtp_size > 1:
+            # 主模型 decode：一份 state 一个位置，写满 mtp_size 列
             self.update_mtp_hidden_states(
-                self.norm(h, compute_dtype=h.dtype), is_mtp=True
+                self.norm(h, compute_dtype=h.dtype), is_draft=False
             )
         h = self._post_layers(h)
         h = h.float()
@@ -721,12 +722,12 @@ class TransformerGLM52(TransformerDeepSeekV3):
             h = mtp_layer(
                 h,
                 freqs_cis,
-                self.read_mtp_hidden_states(),
+                self.read_mtp_hidden_states(is_draft=True),
                 is_mtp=True,
             )
         finally:
             mtp_layer.set_indexer_buffer(None, None)
-        self.update_mtp_hidden_states(h)
+        self.update_mtp_hidden_states(h, is_draft=True)
         h = self._post_layers_mtp(h)
         h = h.float()
         return h
@@ -829,7 +830,7 @@ class TransformerGLM52(TransformerDeepSeekV3):
         if self.pp_stage == self.pp_end_stage:
             if self.mtp_size > 1:
                 self.update_mtp_hidden_states(
-                    self.norm(h, compute_dtype=h.dtype), is_mtp=True
+                    self.norm(h, compute_dtype=h.dtype), is_draft=False
                 )
             h = self._post_layers(h)
             h = h.float()

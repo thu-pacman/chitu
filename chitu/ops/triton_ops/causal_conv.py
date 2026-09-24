@@ -336,7 +336,18 @@ def causal_conv1d_prefill_triton(
     conv_state: torch.Tensor,
     weight: torch.Tensor,
     prefix_lens: torch.Tensor,
+    state_checkpoints=None,
+    checkpoint_cu_starts=None,
+    checkpoint_every_n_tokens: int = 0,
 ):
+    assert (
+        checkpoint_every_n_tokens == 0
+        and state_checkpoints is None
+        and checkpoint_cu_starts is None
+    ), (
+        "causal_conv1d_prefill with checkpoints is not supported by the triton "
+        "impl yet"
+    )
     total_len, hidden_size = inputs.shape
     conv_kernel_size = weight.shape[2]
     bsz = prefix_lens.shape[0] - 1

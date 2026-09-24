@@ -7,6 +7,7 @@ from logging import getLogger
 from collections import deque, OrderedDict
 
 from chitu.global_vars import get_global_args, is_independent_multi_inst
+from chitu.kv_cache.manager_names import MAIN_CACHE_NAME, MTP_CACHE_NAME
 from chitu.task_type import TaskType
 from chitu.utils import ceil_div, max_alloc_seq_len
 from chitu.kv_cache.prefix_caching import (
@@ -57,20 +58,22 @@ class PagedKVCacheManager(KVCacheManagerBase):
         mtp_size: int = 1,
         enable_prefix_caching=False,
         block_size: int = 512,  # must be a multiple of 256 for FlashAttention
-        manager_name: str = "main",
+        manager_name: str = MAIN_CACHE_NAME,
     ):
 
         # 单个请求可能写入 kv cache 的最大长度：decode 最后一步可能比 max_seq_len 多出推测段
         self.max_blocks_per_req = ceil_div(max_alloc_seq_len(max_seq_len), block_size)
-        self.page_table_max_num_blocks = self.max_blocks_per_req * num_hot_req
-        self.max_num_blocks = self.page_table_max_num_blocks
+
+        # Page-table capacity, not the physical block pool size (see PagedKVCache).
+        self.max_num_blocks = self.max_blocks_per_req * num_hot_req
 
         if enable_prefix_caching:
             self.allocatable_max_num_blocks = 1 << 60
         else:
-            self.allocatable_max_num_blocks = self.page_table_max_num_blocks
+            self.allocatable_max_num_blocks = self.max_num_blocks
 
         self.num_blocks = num_blocks
+        self.num_hot_req = num_hot_req
         self.dp_rank = dp_rank
         self.manager_name = manager_name
 
@@ -144,8 +147,59 @@ class PagedKVCacheManager(KVCacheManagerBase):
     def get_allocatable_max_num_blocks(self) -> int:
         return int(getattr(self, "allocatable_max_num_blocks", self.max_num_blocks))
 
-    def num_blocks_for_seq_len(self, seq_len: int) -> int:
+    def num_token_mapped_blocks_for_seq_len(self, seq_len: int) -> int:
+        """``seq_len`` 个 token 所占的、与 token 位置存在映射的块数。
+
+        如：
+        PagedKVCacheManager: block_id = p // block_size, block_offset = p % block_size
+        D-V4 sliding: block_id = 0, block_offset = p % block_size
+        singleton 的 ckpt 块: p // C, block_offset = 0
+        """
         return ceil_div(int(seq_len), self.block_size)
+
+    def num_fixed_blocks_per_req(self) -> int:
+        """每个请求固定预留的块数：与 token 长度无关。"""
+        return 0
+
+    def num_blocks_for_seq_len(self, seq_len: int) -> int:
+        """请求在 ``seq_len`` 长度下的总占用：固定预留 + token位置映射块。"""
+        if int(seq_len) <= 0:
+            return 0
+        return (
+            self.num_fixed_blocks_per_req()
+            + self.num_token_mapped_blocks_for_seq_len(seq_len)
+        )
+
+    def _num_owned_token_mapped_blocks(self, task: "Task") -> int:
+        """任务当前实际持有的、与 token 位置存在映射的块数。"""
+        return len(self.task_to_cache_ids.get(task.task_id, set()))
+
+    def _num_owned_fixed_blocks(self, task: "Task") -> int:
+        """任务当前实际持有的固定预留块数。"""
+        return 0
+
+    def num_owned_blocks(self, task: "Task") -> int:
+        """任务当前实际持有的总块数。"""
+        return self._num_owned_token_mapped_blocks(task) + self._num_owned_fixed_blocks(
+            task
+        )
+
+    def num_blocks_to_reserve(
+        self, task: "Task", *, cached_len: int, target_len: int
+    ) -> int:
+        """从 ``cached_len`` 推进到 ``target_len``，还需从可用容量里新拿的块数。
+
+        = 推进后的总占用 - (已落袋的固定预留 + 该长度的位置映射块）
+
+        * 固定预留：只有已落袋才计入（未落袋时它还没进``num_active_blocks``）；
+        * 位置映射块: 按``cached_len`` 推导而非按实际持有（命中缓存、尚未拿到块的请求
+          也要算进来，这些块同时被 ``num_cached_idle_blocks`` 从可用容量里扣掉）。
+          否则固定部分会在相减时抵消，请求还没拿到它的固定块就被判定为容量充足。
+        """
+        accounted = self._num_owned_fixed_blocks(
+            task
+        ) + self.num_token_mapped_blocks_for_seq_len(cached_len)
+        return self.num_blocks_for_seq_len(target_len) - accounted
 
     def _make_task_identities(
         self,
@@ -186,7 +240,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
 
         logger.info(
             f"Requested realloc to {requested_num_blocks} KV blocks. "
-            f"page_table_max_num_blocks={self.page_table_max_num_blocks}, "
+            f"max_num_blocks={self.max_num_blocks}, "
             f"allocatable_max_num_blocks={allocatable_cap}, "
             f"infer.max_batch_size={get_global_args().infer.max_batch_size}, "
             f"infer.max_seq_len={get_global_args().infer.max_seq_len}, "
@@ -231,7 +285,9 @@ class PagedKVCacheManager(KVCacheManagerBase):
         left = self._num_computed_blocks(task)
 
         # 二分查找第一个cache_idx为None的block序号（LRU逐出策略确保cached blocks连续）
-        num_needed_blocks = self.num_blocks_for_seq_len(task.prefix_tokens_len)
+        num_needed_blocks = self.num_token_mapped_blocks_for_seq_len(
+            task.prefix_tokens_len
+        )
         task_identities = self._make_task_identities(
             task, required_identity_blocks=num_needed_blocks
         )
@@ -260,7 +316,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
         else:
             num_computed_blocks = self._num_computed_blocks(task)
         num_cached_blocks = min(
-            self.num_blocks_for_seq_len(max_cached_token_len),
+            self.num_token_mapped_blocks_for_seq_len(max_cached_token_len),
             self.num_cached_blocks(task),
         )
 
@@ -357,9 +413,11 @@ class PagedKVCacheManager(KVCacheManagerBase):
             New cache indices allocated or reactivated for this step.
         """
         new_cache_ids: list[int] = []
-        task_num_cached_blocks = self.num_blocks_for_seq_len(task.consumed_req_tokens)
+        task_num_cached_blocks = self.num_token_mapped_blocks_for_seq_len(
+            task.consumed_req_tokens
+        )
         target_seq_len = task.alloc_seq_len
-        num_target_blocks = self.num_blocks_for_seq_len(target_seq_len)
+        num_target_blocks = self.num_token_mapped_blocks_for_seq_len(target_seq_len)
         num_identity_blocks = max(task_num_cached_blocks, num_target_blocks)
         task_identities = self._make_task_identities(
             task, required_identity_blocks=num_identity_blocks
@@ -420,7 +478,7 @@ class PagedKVCacheManager(KVCacheManagerBase):
             self.task_to_token_blocks[task.task_id].append(block)
 
         if eager_prefix_cache_insert:
-            # 非PD-Decode-Only节点调用prepare_metadata_before_prefill后立刻进入model_run，可视为cache就绪可复用
+            # 非PD-Decode-Only节点调用prepare_metadata_before_prefill后立刻进入 prefill 前向，可视为cache就绪可复用
             self.publish_prefix_cache_blocks(task, target_seq_len)
         else:
             # PD分离Decode-Only节点：此时KV cache还未从prefill传输并reorder就绪，
@@ -447,7 +505,8 @@ class PagedKVCacheManager(KVCacheManagerBase):
         new_cache_ids: list[int] = []
 
         target_seq_len = task.alloc_seq_len
-        num_target_blocks = self.num_blocks_for_seq_len(target_seq_len)
+        num_target_blocks = self.num_token_mapped_blocks_for_seq_len(target_seq_len)
+
         token_blocks = self.task_to_token_blocks.get(task.task_id, [])
         assert len(token_blocks) == len(
             self.task_to_cache_ids[task.task_id]
@@ -546,7 +605,7 @@ class _DeepSeekV4LogicalBlockMetadataMixin:
                 task, required_identity_blocks=required_identity_blocks
             )
         if required_identity_blocks is None:
-            required_identity_blocks = self.num_blocks_for_seq_len(
+            required_identity_blocks = self.num_token_mapped_blocks_for_seq_len(
                 task.prefix_tokens_len
             )
         placeholder = self.identity_builder.make_identity(
@@ -590,31 +649,33 @@ class DeepSeekV4SlidingKVCacheManager(
             )
         super().__init__(num_blocks, **kwargs)
         self.max_blocks_per_req = 1
-        self.page_table_max_num_blocks = self.max_blocks_per_req * int(
-            kwargs["num_hot_req"]
-        )
-        self.max_num_blocks = self.page_table_max_num_blocks
+        self.max_num_blocks = self.max_blocks_per_req * int(kwargs["num_hot_req"])
         self.num_blocks = fixed_num_blocks
         self.free_cache_ids = deque(range(self.num_blocks))
         self.fixed_num_blocks = True
         if not self.enable_prefix_caching:
-            self.allocatable_max_num_blocks = self.page_table_max_num_blocks
+            self.allocatable_max_num_blocks = self.max_num_blocks
 
-    def num_blocks_for_seq_len(self, seq_len: int) -> int:
+    def num_token_mapped_blocks_for_seq_len(self, seq_len: int) -> int:
+        """整条序列都写在同一个环形页里：``seq_len > 0`` 即 1 块。
+
+        位置 p 的 token 映射到第 0 页的 ``p % window_size`` 偏移处，映射非空但退化
+        （页数不随长度增长），所以它是 token 位置映射的块，而不是固定预留。
+        """
         seq_len = max(0, int(seq_len))
         if seq_len == 0:
             return 0
         return 1
 
     def realloc(self, num_blocks):
-        if int(num_blocks) != self.page_table_max_num_blocks:
+        if int(num_blocks) != self.max_num_blocks:
             logger.info(
                 "DeepSeek-V4 sliding-window manager keeps one page per hot "
                 "request; requested num_blocks=%s, using %s",
                 int(num_blocks),
-                self.page_table_max_num_blocks,
+                self.max_num_blocks,
             )
-        super().realloc(self.page_table_max_num_blocks)
+        super().realloc(self.max_num_blocks)
 
 
 class DeepSeekV4CompressedKVCacheManager(
@@ -643,14 +704,12 @@ class DeepSeekV4CompressedKVCacheManager(
                 self.block_size,
             ),
         )
-        self.page_table_max_num_blocks = self.max_blocks_per_req * int(
-            kwargs["num_hot_req"]
-        )
-        self.max_num_blocks = self.page_table_max_num_blocks
+        self.max_num_blocks = self.max_blocks_per_req * int(kwargs["num_hot_req"])
         if not self.enable_prefix_caching:
-            self.allocatable_max_num_blocks = self.page_table_max_num_blocks
+            self.allocatable_max_num_blocks = self.max_num_blocks
 
-    def num_blocks_for_seq_len(self, seq_len: int) -> int:
+    def num_token_mapped_blocks_for_seq_len(self, seq_len: int) -> int:
+        """压缩流：位置 p 的 token 落在第 ``(p // compress_ratio) // block_size`` 块。"""
         seq_len = max(0, int(seq_len))
         # 只按「已写满的压缩组」计块（尾组不占块）；存储长度按 ceil_div 多留的
         # 那 1 个槽位与尾组同属最后一块，不会越出 max_blocks_per_req
@@ -660,107 +719,160 @@ class DeepSeekV4CompressedKVCacheManager(
         return ceil_div(compressed_len, self.block_size)
 
 
-class SingletonPagedKVCacheManager(KVCacheManagerBase):
-    """Block allocator for SingletonPagedKVCache.
+class SingletonPagedKVCacheManager(PagedKVCacheManager):
+    """Block manager for ``SingletonPagedKVCache`` (linear-attention / MTP state).
 
-    Each active request owns exactly one block. Allocation happens once in
-    ``prepare_metadata_before_prefill``; decode phase reuses the same block
-    and ``prepare_metadata_before_decode`` returns an empty list (no
-    incremental allocation).
+    Every request owns ``mtp_size`` exclusive *in-place* state blocks (the
+    ``spec_*`` ids at the head of ``new_cache_ids``): they are allocated once in
+    the request's first ``prepare_metadata_before_prefill`` and released when the
+    request finishes, and each decode step reuses the same ids. When
+    ``checkpoint_interval`` is not None the request additionally owns
+    prefix-shareable *checkpoint* blocks (a recurrent-state checkpoint every C
+    tokens, i.e. one block per C tokens), allocated incrementally by the base
+    class.
 
-    The pool size is ``num_hot_req``, which exactly matches the physical
-    capacity of ``SingletonPagedKVCache`` (one block per hot request).
+    ``new_cache_ids`` per batch item follows the layout documented in
+    ``SingletonPagedKVCache``::
+
+        [spec_0 .. spec_{K-1} | ckpt_0(cached) ... ckpt_k(fresh)]   # checkpoint_interval is not None
+        [spec_0 .. spec_{K-1}]                                       # checkpoint_interval is None
+
+    Later steps carry checkpoint ids only (an empty list when
+    ``checkpoint_interval`` is None, since then nothing is ever added).
+
+    The pool holds at most ``mtp_size`` in-place blocks per in-flight request;
+    with ``checkpoint_interval`` set, ``num_blocks`` must additionally cover
+    ``ceil_div(max_seq_len, C)`` checkpoint blocks per request.
+
+    Note that a manager with ``checkpoint_interval`` set can only serve caches
+    configured with the same interval
     """
 
     def __init__(
         self,
+        num_blocks: int,
         *,
         num_hot_req: int,
-        manager_name: str,
+        max_seq_len: int,
+        mtp_size: int,
+        checkpoint_interval: Optional[int] = None,
+        enable_prefix_caching: bool = False,
+        block_size: Optional[int] = None,
+        manager_name: str = MTP_CACHE_NAME,
+        dp_rank: int = 0,
     ):
-        self.num_blocks = int(num_hot_req)
-        self.manager_name = manager_name
-        self.block_size = 1
-        self.max_blocks_per_req = 1
+        if checkpoint_interval is None:
+            # 请求不持有 ckpt block，也就没有 token 位置映射的块，block_size 仅在基类中占位
+            block_size = 1 if block_size is None else int(block_size)
+        else:
+            checkpoint_interval = int(checkpoint_interval)
+            if block_size is not None and int(block_size) != checkpoint_interval:
+                raise ValueError(
+                    "SingletonPagedKVCacheManager: block_size must equal "
+                    f"checkpoint_interval, got block_size={block_size}, "
+                    f"checkpoint_interval={checkpoint_interval}"
+                )
+            # 一个 ckpt block 对应 C 个 token 的 recurring state
+            block_size = checkpoint_interval
+        # 没有 ckpt block 就没有可复用的前缀块（spec block 是每请求独占的原地状态）
+        enable_prefix_caching = (
+            bool(enable_prefix_caching) and checkpoint_interval is not None
+        )
 
-        self.free_cache_ids: deque[int] = deque(range(self.num_blocks))
-        self.task_to_cache_ids: defaultdict[str, set[int]] = defaultdict(set)
-        """task_id -> set of allocated cache block ids.
+        super().__init__(
+            num_blocks,
+            num_hot_req=num_hot_req,
+            max_seq_len=max_seq_len,
+            dp_rank=dp_rank,
+            mtp_size=mtp_size,
+            enable_prefix_caching=enable_prefix_caching,
+            block_size=block_size,
+            manager_name=manager_name,
+        )
+        self.checkpoint_interval: Optional[int] = checkpoint_interval
 
-        Stored as ``defaultdict[str, set[int]]`` for interface compatibility
-        with ``PagedKVCacheManager.task_to_cache_ids`` which is consumed
-        directly by ``scheduler.py``.
-        """
+        # 与 SingletonPagedKVCache.__init__ 中每请求的 block 预算保持一致：
+        # mtp_size 个常驻 spec block + 最坏情况下 ceil_div(max_alloc_seq_len(max_seq_len), C)
+        # 个 ckpt block（可寻址上界与 main cache 统一取 max_alloc_seq_len）
+        self.max_blocks_per_req = self.mtp_size + (
+            self.num_token_mapped_blocks_for_seq_len(max_alloc_seq_len(max_seq_len))
+        )
+        self.max_num_blocks = self.max_blocks_per_req * int(num_hot_req)
+        if not self.enable_prefix_caching:
+            self.allocatable_max_num_blocks = self.max_num_blocks
 
-        # —— interface alignment with PagedKVCacheManager ——
-        self.max_num_blocks = self.num_blocks
-        self.page_table_max_num_blocks = self.num_blocks
-        self.allocatable_max_num_blocks = self.num_blocks
-        self.enable_prefix_caching = False
+        # 每请求独占的 in-place spec block ids。spec block 永远不进基类的
+        # task_to_cache_ids（那里只放与 token 位置存在映射、可被 prefix cache 复用的
+        # ckpt block：它的长度被当作 ckpt 序号用，成员也被当成可共享前缀块），所以它单独
+        # 存放，并作为"固定预留"通过 num_fixed_blocks_per_req 参与容量记账（已落袋的部分由
+        # _num_owned_fixed_blocks 计入；否则调度器会以为每个请求还需要重新分配这些 block）
+        self.task_to_spec_cache_ids: defaultdict[str, list[int]] = defaultdict(list)
 
-    # ========================
-    #   Capacity / queries
-    # ========================
+    def num_token_mapped_blocks_for_seq_len(self, seq_len: int) -> int:
+        """只有 ckpt block 与 token 位置存在映射：第 ``p // C`` 号，即每 C 个 token 一个
+        （C=None 时没有）。"""
+        if self.checkpoint_interval is None:
+            return 0
+        return ceil_div(max(0, int(seq_len)), self.checkpoint_interval)
 
-    @property
-    def num_active_blocks(self) -> int:
-        return len(self.task_to_cache_ids)
+    def num_fixed_blocks_per_req(self) -> int:
+        """每请求 mtp_size 个常驻 in-place 状态块，与 token 长度无关。"""
+        return self.mtp_size
 
-    def num_blocks_for_seq_len(self, seq_len: int) -> int:
-        return 1 if seq_len > 0 else 0
+    def _num_owned_fixed_blocks(self, task: "Task") -> int:
+        return self.mtp_size if self.task_to_spec_cache_ids.get(task.task_id) else 0
 
-    def num_cached_blocks(self, task) -> int:
-        return 0  # linear / mtp caches do not participate in prefix caching
-
-    def num_cached_idle_blocks(self, task, *, max_cached_token_len=None) -> int:
-        return 0
-
-    # ========================
-    #   Allocation / release
-    # ========================
-
-    def prepare_metadata_before_prefill(self, task, *args, **kwargs) -> list[int]:
-        """Allocate the single block for the full request lifetime."""
+    def _ensure_spec_blocks(self, task: "Task") -> list[int]:
+        """Allocate the ``mtp_size`` exclusive in-place blocks of a task, once."""
         tid = task.task_id
-        if tid not in self.task_to_cache_ids:
-            cache_id = self._get_free_cache_id()
-            self.task_to_cache_ids[tid] = {cache_id}
-            return [cache_id]
-        return []
+        if self.task_to_spec_cache_ids.get(tid):
+            return []
+        spec_ids = [self.get_free_cache_idx() for _ in range(self.mtp_size)]
+        for cache_idx in spec_ids:
+            # in-place block 在整个请求生命周期内保持活跃，请求结束时释放
+            self.active_blocks[cache_idx] = BlockRuntime(cache_idx, active_cnt=1)
+        self.task_to_spec_cache_ids[tid] = spec_ids
+        return spec_ids
 
-    def prepare_metadata_before_decode(self, task) -> list[int]:
-        """Decode phase reuses the block allocated during prefill.
-
-        Returns an empty list — no incremental allocation.  Raises
-        ``RuntimeError`` if the task was never seen by
-        ``prepare_metadata_before_prefill`` (programmer error).
-        """
+    def _release_spec_blocks(self, task: "Task") -> None:
         tid = task.task_id
-        if tid not in self.task_to_cache_ids:
-            raise RuntimeError(
-                f"SingletonPagedKVCacheManager '{self.manager_name}': "
-                f"task '{tid}' reached decode without prefill allocation"
-            )
-        return []
+        spec_ids = self.task_to_spec_cache_ids.pop(tid, None)
+        if spec_ids is None:
+            return
+        for cache_idx in spec_ids:
+            self.active_blocks.pop(cache_idx, None)
+            self.free_cache_ids.append(cache_idx)
 
-    def finalize_metadata_all_decode(self, task):
-        tid = task.task_id
-        cache_ids = self.task_to_cache_ids.pop(tid, None)
-        if cache_ids is not None:
-            for cache_id in cache_ids:
-                self.free_cache_ids.append(cache_id)
+    def prepare_metadata_before_prefill(
+        self, task: "Task", *, eager_prefix_cache_insert: bool = True
+    ) -> list[int]:
+        spec_ids = self._ensure_spec_blocks(task)
+        if self.checkpoint_interval is None:
+            return spec_ids
+        checkpoint_ids = super().prepare_metadata_before_prefill(
+            task, eager_prefix_cache_insert=eager_prefix_cache_insert
+        )
+        return spec_ids + checkpoint_ids
 
-    def _get_free_cache_id(self) -> int:
-        if not self.free_cache_ids:
-            raise RuntimeError(
-                f"SingletonPagedKVCacheManager '{self.manager_name}': "
-                f"no free blocks (total={self.num_blocks}, "
-                f"active={len(self.task_to_cache_ids)})"
-            )
-        return self.free_cache_ids.popleft()
+    def prepare_metadata_before_decode(self, task: "Task") -> list[int]:
+        if self.checkpoint_interval is None:
+            # decode 复用 prefill 时分配的 in-place block，不再新增
+            if not self.task_to_spec_cache_ids.get(task.task_id):
+                raise RuntimeError(
+                    f"SingletonPagedKVCacheManager '{self.manager_name}': "
+                    f"task '{task.task_id}' reached decode without in-place blocks"
+                )
+            return []
+        return super().prepare_metadata_before_decode(task)
+
+    def finalize_metadata_all_decode(self, task: "Task"):
+        super().finalize_metadata_all_decode(task)
+        self._release_spec_blocks(task)
+
+    def clear_prefix_cache(self):
+        super().clear_prefix_cache()
+        self.task_to_spec_cache_ids.clear()
 
     def realloc(self, num_blocks: int):
-        self.num_blocks = int(num_blocks)
-        self.free_cache_ids = deque(range(self.num_blocks))
-        self.task_to_cache_ids.clear()
-        self.max_num_blocks = self.num_blocks
+        super().realloc(num_blocks)
+        self.task_to_spec_cache_ids.clear()

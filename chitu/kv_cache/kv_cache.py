@@ -9,9 +9,11 @@ from logging import getLogger
 import torch
 from enum import Enum
 from collections import deque, defaultdict
+from itertools import accumulate
 
 from chitu.cuda_graph import cuda_graph_safe_cached_property
 from chitu.global_vars import get_slot_handle, get_global_args
+from chitu.kv_cache.manager_names import MAIN_CACHE_NAME, MTP_CACHE_NAME
 from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
 from chitu.utils import ceil_div, create_tensor, max_alloc_seq_len
@@ -164,6 +166,16 @@ class PagedKVCacheAccessor(KVCacheAccessor):
     @property
     def v(self):  # Legacy interface
         return self.kv["v"]
+
+
+@dataclass
+class SingletonPagedKVCacheAccessor(KVCacheAccessor):
+    kv: dict[str, torch.Tensor]
+    get_write_page_ids: Callable[[], torch.Tensor]
+    get_read_page_ids: Callable[[], torch.Tensor]
+    get_ckpt_write_pages: Callable[[], Optional[torch.Tensor]]
+    get_ckpt_cu_starts: Callable[[], Optional[torch.Tensor]]
+    use_i64_offsets: bool = False
 
 
 @dataclass
@@ -414,7 +426,7 @@ class KVCacheBase:
 
     def prepare_cache_decode(self, tasks: "PackedTasksBase"):
         # A fully-cached task is converted to Decode by the scheduler and skips
-        # prefill_step, so prepare_cache_prefill never ran for it and
+        # the prefill forward, so prepare_cache_prefill never ran for it and
         # tid_to_cached_len is still 0. Preset it here using the hit length from
         # inc_hit_tokens_list (N-1 when fully cached) so that decode counts the
         # N-1 already-cached prefix KV into old seq len and computes the Nth token
@@ -568,6 +580,9 @@ class PagedKVCache(KVCacheBase):
       warmup-time reallocation.
     """
 
+    #: Whether a request maps its tokens to physical blocks through ``block_table``.
+    has_token_block_table: bool = True
+
     def __init__(
         self,
         layer_id_map: GlobalLocalMap,
@@ -575,7 +590,7 @@ class PagedKVCache(KVCacheBase):
         num_hot_req: int,
         max_seq_len: int,
         num_blocks: int,
-        page_table_max_seq_len: Optional[int] = None,
+        max_blocks_per_req: Optional[int] = None,
         shape_per_token_dict: Optional[dict[str, torch.Size | Sequence[int]]] = None,
         dtype_dict: Optional[dict[str, torch.dtype]] = None,
         n_local_kv_heads: Optional[int] = None,
@@ -583,8 +598,7 @@ class PagedKVCache(KVCacheBase):
         quant_type: str = None,
         device="cuda",
         block_size: int = 512,  # must be a multiple of 256 for FlashAttention
-        is_singleton: bool = False,
-        manager_name: str = "main",
+        manager_name: str = MAIN_CACHE_NAME,
         split_size: int = 0,
     ):
         super().__init__(
@@ -598,41 +612,32 @@ class PagedKVCache(KVCacheBase):
             quant_type=quant_type,
             device=device,
         )
-        if page_table_max_seq_len is None:
-            # 非 singleton 的 paged cache 需要容纳 decode 最后一步可能写入的最大长度；
-            # singleton（MTP / 线性注意力状态等）每个请求只有一个块，按 max_seq_len 计
-            page_table_max_seq_len = (
-                max_seq_len if is_singleton else max_alloc_seq_len(max_seq_len)
-            )
-        else:
-            page_table_max_seq_len = int(page_table_max_seq_len)
-            if page_table_max_seq_len < 0:
-                raise ValueError(
-                    "page_table_max_seq_len must be >= 0, "
-                    f"got {page_table_max_seq_len}"
-                )
-        self.page_table_max_seq_len = page_table_max_seq_len
-        self.max_blocks_per_req = ceil_div(page_table_max_seq_len, block_size)
-        self.page_table_max_num_blocks = self.max_blocks_per_req * num_hot_req
-        self.max_num_blocks = self.page_table_max_num_blocks
+
+        if max_blocks_per_req is None:
+            max_seq_len_consider_mtp = max_alloc_seq_len(max_seq_len)
+            max_blocks_per_req = ceil_div(max_seq_len_consider_mtp, block_size)
+        assert max_blocks_per_req > 0, f"max_blocks_per_req should bigger than 0"
+        self.max_blocks_per_req = max_blocks_per_req
+        # Page-table capacity: `gpu_block_table` has num_hot_req rows of
+        # max_blocks_per_req entries. This is *not* the physical block pool size
+        # (`num_blocks`), which may exceed it when prefix caching keeps cached
+        # blocks alive beyond what active requests can index.
+        self.max_num_blocks = self.max_blocks_per_req * num_hot_req
 
         if get_global_args().infer.enable_prefix_caching:
             self.allocatable_max_num_blocks = 1 << 60
         else:
-            self.allocatable_max_num_blocks = self.page_table_max_num_blocks
+            self.allocatable_max_num_blocks = self.max_num_blocks
 
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.manager_name = manager_name
         self.split_size = split_size
 
-        self.block_table: dict[str, list[int]] = defaultdict(
-            list
-        )  # {seq_id: block_ids}
-        self.gpu_block_table = StaticTensor(
-            max_nelem=self.max_num_blocks, dtype=torch.int32, device=self.device
-        )
-        self._gpu_block_table_sync_state = GPUBlockTableSyncState.create(num_hot_req)
+        if self.has_token_block_table:
+            self.block_table: dict[str, list[int]] = defaultdict(
+                list
+            )  # {seq_id: block_ids}
         self.paged_kv_cache: dict[str, torch.Tensor] = {}
         logger.info(
             f"Allocating KV cache of {','.join(self.shape_per_token_dict.keys())} with "
@@ -646,16 +651,24 @@ class PagedKVCache(KVCacheBase):
                 dtype=self.dtype_dict[key],
                 device=device,
             )
+        self.use_i64_offsets = self.needs_i64_kv_offsets()
+        self.init_metadata_buffer()
 
+    def init_metadata_buffer(self):
+        self.gpu_block_table = StaticTensor(
+            max_nelem=self.max_num_blocks, dtype=torch.int32, device=self.device
+        )
+        self._gpu_block_table_sync_state = GPUBlockTableSyncState.create(
+            self.num_hot_req
+        )
         self._page_ids_static_tensor = StaticTensor(
-            max_nelem=self.max_total_delta_len, device=device, dtype=torch.int32
+            max_nelem=self.max_total_delta_len, device=self.device, dtype=torch.int32
         )
         self._offs_in_page_static_tensor = StaticTensor(
-            max_nelem=self.max_total_delta_len, device=device, dtype=torch.int32
+            max_nelem=self.max_total_delta_len, device=self.device, dtype=torch.int32
         )
         self._page_ids_up_to_date = False
         self._offs_in_page_up_to_date = False
-        self.use_i64_offsets = self.needs_i64_kv_offsets()
 
     def get_allocatable_max_num_blocks(self) -> int:
         return int(getattr(self, "allocatable_max_num_blocks", self.max_num_blocks))
@@ -666,7 +679,7 @@ class PagedKVCache(KVCacheBase):
 
         logger.info(
             f"Requested realloc to {requested_num_blocks} KV blocks. "
-            f"page_table_max_num_blocks={self.page_table_max_num_blocks}, "
+            f"max_num_blocks={self.max_num_blocks}, "
             f"allocatable_max_num_blocks={allocatable_cap}, "
             f"infer.max_batch_size={get_global_args().infer.max_batch_size}, "
             f"infer.max_seq_len={get_global_args().infer.max_seq_len}, "
@@ -1025,9 +1038,20 @@ class PagedKVCache(KVCacheBase):
 
 class SingletonPagedKVCache(PagedKVCache):
     """
-    1-token-per-request specialization of PagedKVCache
+    In-place-update recurrent-state cache (linear attention / RNN / MTP hidden state).
 
-    For linear attention or RNN states, instead of transformer states.
+    A request owns two kinds of blocks, which this class stores separately:
+        * ``inplace_block_ids``: the ``mtp_size`` in-place state blocks per request
+          (``spec_0, ..., spec_{mtp-1}`` in the layout below), written in place every
+          decode step;
+        * ``ckpt_block_ids``: checkpoint blocks, appended incrementally and prefix-shared.
+
+    The scheduler delivers both kinds together in ``new_cache_ids`` (per batch item,
+    under ``manager_name``), in this order:
+        1. [ spec_0, spec_1, ..., spec_{mtp-1} | ckpt_0(cached), ..., ckpt_k(fresh), ... ]
+           when ``checkpoint_interval`` is not None,
+        2. [ spec_0, spec_1, ..., spec_{mtp-1} ]
+           when ``checkpoint_interval`` is None.
     """
 
     def __init__(
@@ -1035,124 +1059,457 @@ class SingletonPagedKVCache(PagedKVCache):
         layer_id_map: GlobalLocalMap,
         *,
         num_hot_req: int,
+        num_blocks: int,
         shape_per_token_dict: Optional[dict[str, torch.Size | Sequence[int]]] = None,
         dtype_dict: Optional[dict[str, torch.dtype]] = None,
         n_local_kv_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
         device="cuda",
         split_size: int = 0,
+        manager_name: str = MTP_CACHE_NAME,
+        checkpoint_interval: Optional[int] = None,
     ):
         self.mtp_size = get_global_args().infer.mtp_size
+        max_seq_len = int(get_global_args().infer.max_seq_len)
+        self.checkpoint_interval = checkpoint_interval
+
+        assert num_blocks > 0, f"num_blocks should bigger than 0, got {num_blocks}"
+        # 每请求 block 预算：checkpoint_interval 不为 None 时为 mtp_size 个 spec block
+        # 加上 ceil_div(max_alloc_seq_len(max_seq_len), checkpoint_interval) 个 ckpt block；
+        # 为 None 时请求只持有 spec blocks。
+        # 可寻址上界与 main cache 统一取 max_alloc_seq_len（见 chitu/utils.max_alloc_seq_len）：
+        # decode 最后一步的推测段会让 alloc_seq_len 超过 max_seq_len，多出来的长度一旦跨过 C
+        # 的整数倍就要多一个 ckpt block
+        max_blocks_per_req = self.mtp_size
+        if checkpoint_interval is not None:
+            max_blocks_per_req = (
+                ceil_div(max_alloc_seq_len(max_seq_len), checkpoint_interval)
+                + self.mtp_size
+            )
+
+        self.inplace_block_ids: dict[str, list[int]] = {}
+        # 上一 step 每个请求被接受的最后一个 draft token 在 inplace_block_ids 中的下标，
+        # 由 update_mtp_cache_accept 写入（executor 的 _prepare_accept_indices），
+        # _upd_gpu_block_table 据此算出 _read_page_ids
+        self.tid_to_accept_index: dict[str, int] = {}
+        # 每请求的 ckpt block ids，下标 j ↔ 覆盖位置 [jC, (j+1)C) 的那一块（C 是
+        # checkpoint_interval）。本类没有基类那种 token → 页的 block_table（见下面的
+        # block_table property），所以这份 dict 只能走 ckpt_block_ids 这个名字
+        self.ckpt_block_ids: dict[str, list[int]] = defaultdict(list)
+
         super().__init__(
             layer_id_map,
             num_hot_req=num_hot_req,
-            max_seq_len=self.mtp_size,
+            max_seq_len=max_seq_len,
+            max_blocks_per_req=max_blocks_per_req,
             shape_per_token_dict=shape_per_token_dict,
             dtype_dict=dtype_dict,
             n_local_kv_heads=n_local_kv_heads,
             head_dim=head_dim,
             device=device,
-            block_size=self.mtp_size,
-            num_blocks=num_hot_req,
-            manager_name="singleton",
-            is_singleton=True,
+            block_size=1,
+            num_blocks=num_blocks,
+            manager_name=manager_name,
             split_size=split_size,
         )
-        self.max_blocks_per_req = 1
-        self.max_num_blocks = self.max_blocks_per_req * num_hot_req
 
-        if self.mtp_size > 1:
-            self.is_mtp_decode_stage = False
+        self.is_decode_stage = False
+
+    def init_metadata_buffer(self):
+        assert (
+            self.mtp_size >= 1
+        ), f"mtp_size shouldn't less than 1, got {self.mtp_size}"
+        self._write_page_ids = StaticTensor(
+            max_nelem=self.num_hot_req * self.mtp_size,
+            dtype=torch.int32,
+            device=self.device,
+        )  # 原地写缓存ids
+        self._read_page_ids = StaticTensor(
+            max_nelem=self.num_hot_req,
+            dtype=torch.int32,
+            device=self.device,
+        )  # 每请求本 step 要读的 page id（上一 step 的 _write_page_ids 第 accept_index 列，
+        # 该列是 checkpoint 边界时是 ckpt block）
+        self._read_page_ids_written: list[int] = (
+            []
+        )  # _read_page_ids 当前step中的内容，用于去重
+        self._ckpt_write_pages: Optional[torch.Tensor] = (
+            None  # 写checkpoint缓存, 写checkpoint在cuda graph外，无需StaticTensor
+        )
+        # 见 ckpt_cu_starts
+        self._ckpt_cu_starts: Optional[torch.Tensor] = None
+
+    def _is_ckpt_pos(self, pos: int | torch.Tensor) -> bool:
+        """位置 ``pos`` 的 state 是否落在 ckpt block 上。
+
+        位置是从 seq[0] 起算的绝对位置，checkpoint 是每 C 个 token 的最后一个位置，所以
+        判据就是 ``pos % C == C - 1``；其余位置的 state 都在 in-place block 的某一列上。
+
+        没有 checkpoint_interval 时任何位置都不是 checkpoint 位置。
+        """
+        C = self.checkpoint_interval
+        assert C is not None
+        return (pos % C) == C - 1
+
+    def _ckpt_idx(self, pos: int | torch.Tensor) -> int | torch.Tensor:
+        """位置 ``pos``的 state 落在 ``ckpt_block_ids`` 的第几块上。"""
+        C = self.checkpoint_interval
+        assert C is not None
+        return pos // C
+
+    def _ckpt_page_id(self, tid: str, pos: int) -> int:
+        """位置 ``pos`` 的 state 所在的 ckpt page id（``pos`` 必须是 checkpoint 位置）。"""
+        assert self._is_ckpt_pos(pos), f"position {pos} is not a checkpoint position"
+        idx = self._ckpt_idx(pos)
+        ckpt_blocks = self.ckpt_block_ids[tid]
+        assert idx < len(ckpt_blocks), (
+            f"tid:{tid} checkpoint block {idx} not allocated yet "
+            f"(pos={pos}, C={self.checkpoint_interval}, n_blocks={len(ckpt_blocks)}); "
+            "the checkpoint state would be lost"
+        )
+        return ckpt_blocks[idx]
+
+    def _upd_read_page_ids(
+        self, task_ids: Sequence[str], consumed_lens: Sequence[int]
+    ) -> None:
+        """每个请求本 step 该从哪个 block 读 state。
+
+        要读的 state 是「本 chunk / decode 窗口的第一个 token 之前那个位置」计算出的
+        state，也就是位置 ``consumed_lens[i] - 1`` 的 state，它有两处可能的存放地：
+
+        * 那个位置是 checkpoint 位置时（``_is_ckpt_pos(consumed - 1)``），落在
+          ``_ckpt_page_id`` 上：prefill 续算时是上一个 chunk 的算子写进去的，或是命中的
+          共享块（disaggregation 场景另见 insert_kv_cache_from_transfer）；decode 时是上一步
+          被重定向的那一列（见 _update_write_page_ids）
+        * 其余情况（chunk 尾、mtp_size=1 等）都在 in-place block 的第 accept_index
+          列上，prefill / mtp_size=1 / 没走 MTP 的请求取第 0 列
+        """
+        if not task_ids:
+            return
+        C = self.checkpoint_interval
+        page_ids = []
+        for tid, n_consumed in zip(task_ids, consumed_lens):
+            pos = n_consumed - 1
+            if C is not None and n_consumed > 0 and self._is_ckpt_pos(pos):
+                page_ids.append(self._ckpt_page_id(tid, pos))
+                continue
+            col = max(self.tid_to_accept_index.get(tid, 0), 0)
+            page_ids.append(self.inplace_block_ids[tid][col])
+        if page_ids == self._read_page_ids_written:
+            return
+        self._read_page_ids_written = page_ids
+        self._read_page_ids.set(
+            torch.tensor(page_ids, dtype=torch.int32, device=self.device)
+        )
+
+    def _update_write_page_ids(self, task_ids: Sequence[str]) -> None:
+        """每个请求本 step 的 ``mtp_size`` 列各写哪个 block（``_write_page_ids``）。
+
+        第 j 列是位置 ``start_len + j`` 的 state，默认写 in-place block 的第 j 列；decode 时
+        窗口 ``[start_len, start_len + mtp_size)`` 里落在 checkpoint 位置（``_is_ckpt_pos``）
+        的那几列直接写 ``_ckpt_page_id`` 给出的 ckpt block，省掉事后再从 in-place block 拷一次
+        的搬运。
+        """
+        start_lens = self.seq_len_delta.old.lens_list
+        C = self.checkpoint_interval
+        pages = []
+        for i, tid in enumerate(task_ids):
+            row = self.inplace_block_ids[tid]
+            if self.is_decode_stage and C is not None:
+                row = list(row)  # 要改页时才复制，其余情况直接用 in-place block ids
+                start_len = start_lens[i]
+                pos = (start_len // C + 1) * C - 1  # 窗口内第一个 checkpoint 位置
+                while pos < start_len + self.mtp_size:
+                    row[pos - start_len] = self._ckpt_page_id(tid, pos)
+                    pos += C
+            pages.append(row)
+        self._write_page_ids.set(
+            torch.tensor(pages, dtype=torch.int32, device=self.device)
+        )
+
+    def _upd_gpu_block_table(
+        self,
+        task_ids: list[str],
+        incremental: bool = False,
+    ):
+        self._update_write_page_ids(task_ids)
+
+        self._upd_read_page_ids(task_ids, self.seq_len_delta.old.lens_list)
+
+        self._upd_ckpt_write_pages(task_ids)
+
+    def _upd_ckpt_write_pages(self, task_ids: Sequence[str]) -> None:
+        """算出本 step 要写的 checkpoint：``_ckpt_write_pages`` 与 ``_ckpt_cu_starts``。
+
+        只有 prefill 的 chunk 算子会写 checkpoint（decode 的 checkpoint 由
+        ``_update_write_page_ids`` 直接把写页重定向到 ckpt block）.
+
+        - ``_ckpt_write_pages``：每个 checkpoint 要写的 ckpt block，算子算出的 state 按顺序写过去
+        - ``_ckpt_cu_starts``：每个 seq 有几个 checkpoint（累加形式），见 ``ckpt_cu_starts``
+        """
+        C = self.checkpoint_interval
+        delta_pos = self.seq_len_delta.delta_position_ids_tensor_device
+        if C is None or self.is_decode_stage or delta_pos.shape[0] == 0:
+            self._ckpt_write_pages = None
+            self._ckpt_cu_starts = None
+            return
+
+        # 每个 checkpoint 落在哪个页由 _ckpt_page_id 给出，顺便数出每个 seq 有几个
+        is_ckpt = self._is_ckpt_pos(delta_pos)
+        ckpt_seqs = self.seq_len_delta.delta_seq_ids_tensor_device[is_ckpt].tolist()
+        ckpt_pos = delta_pos[is_ckpt].tolist()
+        write_pages = []
+        counts = [0] * len(task_ids)
+        for seq_id, pos in zip(ckpt_seqs, ckpt_pos):
+            write_pages.append(self._ckpt_page_id(task_ids[seq_id], pos))
+            counts[seq_id] += 1
+        self._ckpt_write_pages = torch.tensor(
+            write_pages, dtype=torch.int32, device=self.device
+        )
+
+        # 算子按 chunk 起点每 C 个 token 取一个 checkpoint（接口对齐 flashinfer）。
+        # scheduler 把续算长度和 chunk 大小都向下取整到 C 的倍数，保证 state 不会写
+        # 到错位的页上。
+        for tid, start, count in zip(
+            task_ids, self.seq_len_delta.old.lens_list, counts
+        ):
+            assert start % C == 0 or count == 0, (
+                f"tid:{tid} chunk starts at {start}, which is not a multiple of the "
+                f"checkpoint interval {C}, but this chunk has {count} checkpoint(s); "
+                "the chunk operators count checkpoint positions from the chunk start, "
+                "so they would write those states to the wrong pages"
+            )
+        self._ckpt_cu_starts = torch.tensor(
+            [0, *accumulate(counts)], dtype=torch.int64, device=self.device
+        )
+
+    def _update_block_table_from_scheduler(
+        self,
+        tasks: "PackedTasksBase",
+        incremental: bool = False,
+    ) -> None:
+        """Apply scheduler allocations, then synchronize the active GPU rows.
+
+        Owning both operations here makes ``incremental=True`` an append-only
+        contract instead of trusting a caller-provided list of dirty block IDs.
+        """
+        task_ids = tasks.task_ids
+        self._validate_gpu_block_table_batch(task_ids)
+
+        new_cache_ids_list = tasks.new_cache_ids_list
+        if new_cache_ids_list and len(new_cache_ids_list) != len(task_ids):
+            raise ValueError(
+                "new_cache_ids_list must be empty or match task_ids: "
+                f"new_cache_ids={len(new_cache_ids_list)} task_ids={len(task_ids)}"
+            )
+
+        if new_cache_ids_list:
+            for i, item in enumerate(tasks.new_cache_ids_list):
+                new_cache_ids = item.get(self.manager_name, [])
+                task_id = task_ids[i]
+
+                # Update inplace_block_ids(store in-place state block ids)
+                is_first_alloc = not self.inplace_block_ids.get(task_id, [])
+                if is_first_alloc:
+                    # 首次为task分配block时，会将inplace_block_ids放在new_cache_ids头部
+                    assert (
+                        len(new_cache_ids) >= self.mtp_size
+                    ), f"len({new_cache_ids}) should bigger than mtp_size({self.mtp_size})."
+                    self.inplace_block_ids[task_id] = new_cache_ids[: self.mtp_size]
+
+                    # zero freshly-allocated blocks
+                    for key in self.paged_kv_cache:
+                        self.paged_kv_cache[key][:, self.inplace_block_ids[task_id]] = 0
+
+                if not new_cache_ids:
+                    continue
+
+                # Update ckpt_block_ids(only store checkpoint block ids). 首次分配时
+                # new_cache_ids = [spec | fresh ckpt]，spec 部分已计入 inplace_block_ids；
+                # 其余情况下 new_cache_ids 只含 ckpt block ids
+                new_ckpt_ids = (
+                    new_cache_ids[self.mtp_size :] if is_first_alloc else new_cache_ids
+                )
+                new_length = (
+                    len(self.ckpt_block_ids[task_id])
+                    + len(self.inplace_block_ids[task_id])
+                    + len(new_ckpt_ids)
+                )
+                assert new_length <= self.max_blocks_per_req, (
+                    "block-table row exceeds configured per-request capacity: "
+                    f"task_id={task_id} new_len={new_length} "
+                    f"max_blocks_per_req={self.max_blocks_per_req}"
+                )
+                self.ckpt_block_ids[task_id].extend(new_ckpt_ids)
+
+                # zero freshly-allocated blocks(exclude cached blocks).
+                # checkpoint_interval 为 None 时请求没有 ckpt blocks，无需清零
+                if self.checkpoint_interval is not None:
+                    n_cached_tokens = self.seq_len_delta.old.lens_list[i]
+                    # 只有被前缀完全覆盖的 ckpt block 才是「已算好的」，即 j <
+                    # n_cached_tokens / C，故向下取整；用 ceil_div 等于隐含假设
+                    # n_cached_tokens 一定落在 C 网格上，一旦不落在网格上（chunk 起点没对齐，
+                    # 见 scheduler 的守卫）就会漏清零一个其实要写的 ckpt block
+                    n_cached_blocks = n_cached_tokens // self.checkpoint_interval
+                    fresh_blocks = self.ckpt_block_ids[task_id][n_cached_blocks:]
+                    for key in self.paged_kv_cache:
+                        self.paged_kv_cache[key][:, fresh_blocks] = 0
+
+        self._upd_gpu_block_table(task_ids=task_ids)
 
     @override
     def prepare_cache_prefill(self, tasks: "PackedTasksBase"):
-        KVCacheBase.prepare_cache_prefill(self, tasks)
-
-        if self.mtp_size > 1:
-            self.is_mtp_decode_stage = False
-
-        if not tasks.new_cache_ids_list:
-            self._upd_gpu_block_table(tasks.task_ids)
-            return
-
-        for tid, item in zip(tasks.task_ids, tasks.new_cache_ids_list):
-            new_cache_ids = item.get(self.manager_name, [])
-            if new_cache_ids:
-                self.block_table[tid] = list(new_cache_ids)
-                # Zero the block tensor so linear recurrent state
-                # starts fresh.  Without this, stale state from a
-                # previous request can corrupt generation quality.
-                for cache_id in new_cache_ids:
-                    for key in self.paged_kv_cache:
-                        self.paged_kv_cache[key][:, cache_id] = 0
-        self._upd_gpu_block_table(tasks.task_ids)
+        # is_decode_stage 是 step 级状态：prefill 置 False、decode 置 True，保留到
+        # 下一个 batch 覆盖为止（model 侧据此判断 MTP decode）
+        self.is_decode_stage = False
+        super().prepare_cache_prefill(tasks)
 
     @override
     def prepare_cache_decode(self, tasks: "PackedTasksBase"):
         KVCacheBase.prepare_cache_decode(self, tasks)
-        self._upd_gpu_block_table(tasks.task_ids)
+        self.is_decode_stage = True
+        self._update_block_table_from_scheduler(tasks, incremental=True)
 
-        if self.mtp_size > 1:
-            self.is_mtp_decode_stage = True
+    @override
+    def update_mtp_cache_accept(
+        self, tasks: "PackedTasksBase", mtp_accept_indices: list[int]
+    ):
+        KVCacheBase.update_mtp_cache_accept(self, tasks, mtp_accept_indices)
+        # 记下本 step 每个请求的接受长度对应的 in-place block 下标，供 _upd_read_page_ids
+        # 用。只能在这里取：部分 rank 上 task.mtp_accept_index 是 -1，真正的值由
+        # executor dispatch/broadcast 得到
+        for tid, accept_index in zip(tasks.task_ids, mtp_accept_indices):
+            assert -1 <= accept_index < self.mtp_size, (
+                f"tid:{tid}, invalid mtp accept index {accept_index}, "
+                f"expect in [-1, {self.mtp_size - 1}]"
+            )
+            self.tid_to_accept_index[tid] = accept_index
+        # 刚应用的 accept 直到这里才记进tid_to_cached_len/tid_to_accept_index。
+        # last stage 上是在 postprocess_generate_draft 里调该函数，紧接着
+        # model.read_mtp_hidden_states(is_draft=False)拿 _read_page_ids 得到
+        # draft 链的起点，此处需重算_read_page_ids
+        if self.curr_tids:
+            self._upd_read_page_ids(
+                self.curr_tids,
+                [self.tid_to_cached_len.get(tid, 0) for tid in self.curr_tids],
+            )
 
     @override
     def finalize_cache_all_decode(self, tasks: "PackedTasksBase"):
         KVCacheBase.finalize_cache_all_decode(self, tasks)
         for tid in tasks.task_ids:
-            if tid in self.block_table:
-                del self.block_table[tid]
+            self.tid_to_accept_index.pop(tid, None)
+            self.inplace_block_ids.pop(tid, None)
+            self.ckpt_block_ids.pop(tid, None)
 
     @override
-    @cuda_graph_safe_cached_property("_page_ids_static_tensor", "_page_ids_up_to_date")
+    def get_accessor(
+        self, layer_id: int, is_mtp: bool = False
+    ) -> SingletonPagedKVCacheAccessor:
+        local_layer_id = self.layer_id_map.to_local(layer_id)
+        ret_kv = {
+            key: cache[local_layer_id] for key, cache in self.paged_kv_cache.items()
+        }
+        return SingletonPagedKVCacheAccessor(
+            kv=ret_kv,
+            get_write_page_ids=lambda: self._write_page_ids.get(),
+            get_read_page_ids=lambda: self._read_page_ids.get(),
+            get_ckpt_write_pages=lambda: self._ckpt_write_pages,
+            get_ckpt_cu_starts=lambda: self._ckpt_cu_starts,
+            use_i64_offsets=self.use_i64_offsets,
+        )
+
+    # 本类没有基类那种 token → 物理页 的页表（见 init_metadata_buffer），下面这几个接口一律
+    # 直接报错，而不是让调用方拿到一个别的东西（比如 ckpt block）当页表/页 id 用：
+    has_token_block_table = False
+
+    _PAGE_IDS_MSG = (
+        "SingletonPagedKVCache has no token -> page mapping; use "
+        "get_accessor().get_read_page_ids() / get_write_page_ids() instead"
+    )
+    _GPU_BLOCK_TABLE_MSG = (
+        "SingletonPagedKVCache has no gpu_block_table: it does not map tokens to blocks, "
+        "so there is no per-request block row table to hand to attention metadata; the "
+        "page ids it does have come from get_accessor().get_read_page_ids() / "
+        "get_write_page_ids()"
+    )
+    _BLOCK_TABLE_MSG = (
+        "SingletonPagedKVCache has no block_table: it does not map tokens to blocks. A "
+        "request here owns mtp_size in-place state blocks (inplace_block_ids) and some "
+        "checkpoint blocks (ckpt_block_ids), neither of which is a token -> page mapping"
+    )
+
+    @property
+    @override
     def page_ids(self):
-        return self.gpu_block_table.get().squeeze(1)
+        raise NotImplementedError(self._PAGE_IDS_MSG)
 
+    @property
     @override
-    @cuda_graph_safe_cached_property("_page_ids_static_tensor", "_page_ids_up_to_date")
     def page_ids_mtp(self):
-        return self.gpu_block_table.get().squeeze(1)
+        raise NotImplementedError(self._PAGE_IDS_MSG)
 
+    @property
     @override
-    @cuda_graph_safe_cached_property(
-        "_offs_in_page_static_tensor", "_offs_in_page_up_to_date"
-    )
     def offs_in_page(self):
-        return torch.zeros_like(self.seq_len_delta.delta_lens_tensor_device)
+        raise NotImplementedError(self._PAGE_IDS_MSG)
+
+    @property
+    @override
+    def offs_in_page_mtp(self):
+        raise NotImplementedError(self._PAGE_IDS_MSG)
 
     @override
-    @cuda_graph_safe_cached_property(
-        "_offs_in_page_static_tensor", "_offs_in_page_up_to_date"
-    )
-    def offs_in_page_mtp(self):
-        return torch.zeros_like(self.mtp_seq_len_delta.delta_lens_tensor_device)
+    def get_gpu_block_table(self):
+        raise NotImplementedError(self._GPU_BLOCK_TABLE_MSG)
 
-    def insert_linear_state_from_transfer(
-        self, tid: str, page_index: int, prefix_length: int
+    @property
+    def block_table(self):
+        raise NotImplementedError(self._BLOCK_TABLE_MSG)
+
+    @block_table.setter
+    def block_table(self, value):
+        raise NotImplementedError(self._BLOCK_TABLE_MSG)
+
+    @property
+    def ckpt_cu_starts(self) -> Optional[torch.Tensor]:
+        """本 step 每个 seq 有几个 checkpoint 的累加计数（int64, [bsz + 1]），用于 chunk linear_attn/conv算子。
+        本 step 没有 checkpoint 要写时为 None（不设 checkpoint_interval、decode、
+        本 step 没有新增 token）：decode 的 checkpoint 由 ``_update_write_page_ids`` 把写页
+        直接重定向到 ckpt block，不需要算子额外输出。
+        """
+        return self._ckpt_cu_starts
+
+    @override
+    def insert_kv_cache_from_transfer(
+        self, tid: str, inplace_page_ids: Sequence[int], prefix_length: int
     ):
         """
-        Register transferred linear attention state into block table.
-        For linear attention, each request uses exactly one block.
-        """
-        assert (
-            0 <= int(page_index) < self.num_blocks
-        ), f"invalid page index: {page_index}"
-        self.block_table[tid] = [int(page_index)]
-        self.tid_to_cached_len[tid] = prefix_length
+        Register the in-place state pages transferred from the prefill instance.
 
-    def insert_mtp_state_from_transfer(
-        self, tid: str, page_index: int, prefix_length: int
-    ):
+        Decode only needs the state at the end of the prompt, which lives in the in-place
+        pages, so ckpt pages are never transferred: a decode-only instance consumes no
+        prefix-cache hit and never rolls back further than the mtp window. ``ckpt_block_ids``
+        (ckpt blocks) is therefore left untouched and stays empty until this instance
+        allocates its own, which is why this cache must not be configured with a
+        ``checkpoint_interval`` (no linear prefix caching on the decode side).
+        Assumes the state has been copied into these pages via RDMA.
         """
-        Register transferred MTP hidden state into block table.
-        For MTP, each request uses exactly one block.
-        Unlike insert_kv_cache_from_transfer, this doesn't require empty block_table
-        since SingletonPagedKVCache may have allocated a block during prepare_cache_prefill.
-        """
-        assert (
-            0 <= int(page_index) < self.num_blocks
-        ), f"invalid page index: {page_index}"
-        self.block_table[tid] = [int(page_index)]
-        self.tid_to_cached_len[tid] = prefix_length
+        assert self.checkpoint_interval is None, (
+            f"tid:{tid}: this cache has checkpoint_interval="
+            f"{self.checkpoint_interval}, but the transferred state only covers the "
+            "in-place pages; a cache that keeps checkpoints must receive them too"
+        )
+        inplace_page_ids = [int(x) for x in inplace_page_ids]
+        assert len(inplace_page_ids) == self.mtp_size, (
+            f"tid:{tid}, expect {self.mtp_size} in-place pages, "
+            f"got {len(inplace_page_ids)}: {inplace_page_ids}"
+        )
+        for idx in inplace_page_ids:
+            assert 0 <= idx < self.num_blocks, f"invalid page index: {idx}"
+        # 必须在首次 _upd_gpu_block_table/清零之前登记，否则会把传过来的 state 清掉
+        self.inplace_block_ids[tid] = inplace_page_ids
+        self.tid_to_cached_len[tid] = int(prefix_length)
 
 
 class MMPagedKVCache(PagedKVCache):
@@ -1808,22 +2165,20 @@ class DeepSeekV4SlidingWindowPagedKVCache(DeepSeekV4PagedKVCache):
                 int(num_blocks),
                 fixed_num_blocks,
             )
-
+        max_blocks_per_req = ceil_div(self.window_size, self.window_size)
         super().__init__(
             *args,
             num_hot_req=num_hot_req,
             max_seq_len=max_seq_len,
             num_blocks=fixed_num_blocks,
-            page_table_max_seq_len=self.window_size,
+            max_blocks_per_req=max_blocks_per_req,
             block_size=self.window_size,
-            is_singleton=True,
             **kwargs,
         )
 
         # The logical sequence can be longer than the window, but the page table
-        # has exactly one entry per request. The parent sees page_table_max_seq_len
-        # as one window, so it already builds the correct one-entry table.
-        self.allocatable_max_num_blocks = self.page_table_max_num_blocks
+        # has exactly one entry per request.
+        self.allocatable_max_num_blocks = self.max_num_blocks
         self.fixed_num_blocks = True
 
     @override

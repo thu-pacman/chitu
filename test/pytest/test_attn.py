@@ -3092,12 +3092,14 @@ def test_csa_hca_decode_paged_kv(
 
 
 @pytest.mark.parametrize("has_compressed", [False, True])
+@pytest.mark.parametrize("bounded_pack", [False, True])
 @pytest.mark.parametrize("bs,q_len", [(2, 2), (2, 3), (2, 4), (2, 5)])
 @pytest.mark.parametrize("local_n_heads,head_dim", [(16, 512)])
 @pytest.mark.parametrize("window_size,compressed_page_size,compress_ratio", [(8, 4, 4)])
 @pytest.mark.parametrize("softmax_scale", [0.13])
 def test_csa_hca_decode_mtp_paged_kv(
     has_compressed,
+    bounded_pack,
     bs,
     q_len,
     local_n_heads,
@@ -3197,6 +3199,14 @@ def test_csa_hca_decode_mtp_paged_kv(
         compressed_topk_idxs = None
         compressed_kv = None
 
+    # Size the packed compressed KV from the caller's host-side bound instead
+    # of from the maximum of the indices, which is what a captured region has
+    # to do: reading that maximum back is a device-to-host copy. See
+    # `AttnBackend.csa_hca_decode_mtp`.
+    compressed_len_bound = (
+        compressed_max_len if (has_compressed and bounded_pack) else None
+    )
+
     ref_backend = RefAttnBackend(qk_nope_head_dim=head_dim)
     ref_out = ref_backend.csa_hca_decode_mtp(
         q,
@@ -3216,6 +3226,7 @@ def test_csa_hca_decode_mtp_paged_kv(
         cache_seq_ids=cache_seq_ids,
         window_size=window_size,
         compress_ratio=compress_ratio if has_compressed else None,
+        compressed_len_bound=compressed_len_bound,
     )
 
     slidingwindow_page_table = torch.arange(bs, device="cuda", dtype=torch.int32).view(
@@ -3290,6 +3301,7 @@ def test_csa_hca_decode_mtp_paged_kv(
         cache_seq_ids=cache_seq_ids,
         window_size=window_size,
         compress_ratio=compress_ratio if has_compressed else None,
+        compressed_len_bound=compressed_len_bound,
     )
 
     assert_close(out, ref_out, atol=3e-2, rtol=3e-2, cos_sim_tol=0.002)

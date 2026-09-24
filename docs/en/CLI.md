@@ -685,13 +685,13 @@ Acceptable values: A positive integer.
 Experimental: capture the whole K-1 step MTP draft loop (cache-position
 advance, attention metadata, MTP forward, sampling and TP broadcast) into a
 single CUDA graph, so one replay produces all draft tokens. Requires
-mtp_size > 1, use_cuda_graph, a supported attention backend (currently
-flash-mla / flash_attn / triton / flashinfer MLA paged on CUDA and the `auto`
-hybrid backend), and, for models with a DSA indexer, an indexer whose
-decode step is derived from device tensors alone (currently the BF16
-backends, `torch_bf16` / `triton_bf16`; the FP8 paths and `deepgemm` /
-`hygon` still keep host-side top-k plans or paged-MQA schedules). A missing
-requirement only downgrades the draft to the per-step path, with a warning.
+mtp_size > 1, use_cuda_graph, an attention backend that can prepare its
+decode metadata inside a capture
+(`AttnBackend.decode_supports_prepare_in_graph`) and, for a model with a
+DSA indexer, an indexer that can do the same
+(`DSAIndexer.decode_supports_prepare_in_graph`). Which ones qualify is the
+support matrix in chitu/attn_backend/README.md. A missing requirement only
+downgrades the draft to the per-step path, with a warning.
 
 *Default: `false`.*
 
@@ -714,7 +714,7 @@ Acceptable values: A positive integer.
 
 ### Argument `infer.language_model_only`
 
-This parameter is only used for Qwen3.5 model family. If this parameter is true,
+This parameter is only used for Qwen3.5 and GLM5.3-Flash model family. If this parameter is true,
 you can skip loading the vision encoder and only start the language model.
 
 *Default: `False`.*
@@ -791,6 +791,29 @@ Whether to enable prefix caching
 -default: False
 
 *Default: `False`.*
+
+### Argument `infer.linear_checkpoint_interval`
+
+Checkpoint interval of the linear-attention (GDN) recurrent state, in tokens. Only used by
+models with linear-attention layers (e.g. hf-qwen3-next, hf-qwen3-5) and only when
+enable_prefix_caching is true; must be null otherwise.
+
+A recurrent state can only be reused from a checkpoint every C tokens, so with prefix caching
+on, the scheduler starts prefill from a multiple of C and stores the state at every C-th
+position in a prefix-shareable block. The linear cache therefore holds, per request, up to
+ceil(max_seq_len / C) checkpoints in addition to its in-place state (which is the dominant
+term of the cache memory), so pick C with the memory budget in mind.
+
+On a decode-only instance in PD disaggregation the value is ignored: the linear cache there
+holds the in-place state only, and gets the state of the whole prompt from the prefill
+instance by KV transfer.
+
+If set, C must be a positive integer not exceeding both infer.max_seq_len and
+infer.prefill_chunk_size (validated at startup).
+-default: null, meaning C is derived automatically as the main KV cache block size, shrunk to
+infer.max_seq_len / infer.prefill_chunk_size when the block size exceeds them
+
+*Default: `null`.*
 
 ### Argument `infer.dp_prefix_caching_cache_threshold`
 

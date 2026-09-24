@@ -15,7 +15,6 @@ from chitu.distributed.parallel_state import get_dp_size
 from chitu.ops.topk import topk_indices
 from chitu.utils import ceil_div, try_import_platform_dep
 
-
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 has_nvidia_indexer_topk = has_chitu_backend and all(
     callable(getattr(chitu_backend, name, None))
@@ -28,6 +27,15 @@ has_nvidia_indexer_topk = has_chitu_backend and all(
         "nvidia_indexer_topk_gather_pages",
     )
 )
+
+
+# The fused decode TopK picks each row's exact split count from the device
+# lengths; the persistent scalar beside the candidate buffer only bounds which
+# parts a row may skip, and the planner's table never exceeds 16
+# (`nvidia_indexer_topk_plan.h`). Pinning it at the top tier keeps the schedule
+# on the device, and a bound that is too high costs only the empty iterations a
+# row does not use.
+_MAX_PLAN_PARTS = 16
 
 
 @dataclass
@@ -64,48 +72,6 @@ class NvidiaTopKMixin:
         ) * max(1, int(self.mtp_size))
         assert self.topk_max_rows > 0
         self.topk_workspace: Optional[_TopKWorkspace] = None
-        self.topk_plan_parts = 1
-        self.topk_owner_stream_id: Optional[int] = None
-
-    @staticmethod
-    def _topk_stream_id(device):
-        return (
-            int(torch.cuda.current_stream(device).cuda_stream)
-            if device.type == "cuda"
-            else None
-        )
-
-    def _prepare_topk_decode(self, seq_len_delta):
-        if (
-            not has_nvidia_indexer_topk
-            or self.index_topk != 2048
-            or self.static_max_n < 2048
-        ):
-            return
-        if seq_len_delta.batch_size == 0:
-            return
-        rows = seq_len_delta.delta_total_len
-        assert 0 < rows <= self.topk_max_rows
-        if self.topk_workspace is not None:
-            device = self.topk_workspace.candidates.device
-            assert not (
-                device.type == "cuda" and torch.cuda.is_current_stream_capturing()
-            ), "NVIDIA TopK plan must be prepared outside capture"
-            assert self.topk_owner_stream_id == self._topk_stream_id(
-                device
-            ), "NVIDIA TopK workspace cannot cross caller streams"
-        plan = int(
-            chitu_backend.nvidia_indexer_topk_plan_parts(
-                seq_len_delta.old.lens_list,
-                seq_len_delta.new.lens_list,
-                self.static_max_n,
-                False,
-            )
-        )
-        assert plan in (1, 2, 4, 8, 16)
-        if self.topk_workspace is not None and plan != self.topk_plan_parts:
-            self.topk_workspace.plan_parts.fill_(plan)
-        self.topk_plan_parts = plan
 
     def _ensure_topk_workspace(self, device):
         if self.topk_workspace is not None:
@@ -119,9 +85,8 @@ class NvidiaTopKMixin:
         )
         self.topk_workspace = _TopKWorkspace(
             torch.empty(capacity, dtype=torch.int64, device=device),
-            torch.full((1,), self.topk_plan_parts, dtype=torch.int32, device=device),
+            torch.full((1,), _MAX_PLAN_PARTS, dtype=torch.int32, device=device),
         )
-        self.topk_owner_stream_id = self._topk_stream_id(device)
         return self.topk_workspace
 
     def topk_indices(

@@ -38,7 +38,7 @@ class DLLMAttnBackend(FlashAttnBackend):
         self._use_cuda_graph = False
 
     @override
-    def supports_gpu_input(self) -> bool:
+    def decode_supports_prepare_in_graph(self) -> bool:
         # dLLM decoding is block-wise and bidirectional rather than classic
         # one-token-per-step decode; its per-block metadata is written from the
         # host (see `prepare_decode`/`init_static_tensors_for_decode`), so it

@@ -79,8 +79,12 @@ from chitu.dp_request_router import (
     is_profile_message,
     is_flush_cache_message,
 )
+from chitu.kv_cache.manager_names import MAIN_CACHE_NAME
 from chitu.kv_cache.utils import (
     is_reallocable_kv_cache,
+    is_singleton_kv_cache,
+    kv_cache_block_layout,
+    kv_cache_num_blocks_for_tokens,
     reduce_num_block_plan_across_ranks,
     get_peak_live_and_target_bytes,
     cleanup_cuda_if_needed,
@@ -205,9 +209,13 @@ def _direct_warmup_target_lens(
 
 
 def _cache_consumes_direct_warmup_new_cache_ids(cache) -> bool:
+    if not bool(getattr(cache, "has_token_block_table", False)):
+        # SingletonPagedKVCache 没有 token -> block 的页表（block_table 属性会直接报错），
+        # 但它同样按 new_cache_ids_list 里的 [in-place block | ckpt block] 分配页
+        return type(cache).__name__ == "SingletonPagedKVCache"
+
     if not all(
-        hasattr(cache, attr)
-        for attr in ("block_table", "block_size", "num_blocks", "manager_name")
+        hasattr(cache, attr) for attr in ("block_size", "num_blocks", "manager_name")
     ):
         return False
 
@@ -228,9 +236,14 @@ def _direct_warmup_num_blocks_for_cache(
     if target_len <= 0:
         return 0
 
-    # SingletonPagedKVCache: each request owns exactly one block.
+    # SingletonPagedKVCache: mtp_size 个 in-place block；开了 linear 的 prefix
+    # caching（checkpoint_interval 不为 None）时，target_len 这一路上每个 checkpoint
+    # 都要一个 ckpt block（cache 的 block_size 固定是 1，不能按它算）
     if type(cache).__name__ == "SingletonPagedKVCache":
-        return 1
+        checkpoint_interval = getattr(cache, "checkpoint_interval", None)
+        if checkpoint_interval is None:
+            return int(cache.mtp_size)
+        return int(cache.mtp_size) + ceil_div(target_len, int(checkpoint_interval))
 
     # DeepSeek-V4 sliding-window cache is scheduler-managed even though each
     # request owns exactly one ring-buffer page.
@@ -379,7 +392,7 @@ def _solve_deepseek_v4_kv_targets_from_seq_len(
             }
             continue
 
-        if info["fixed_num_blocks"] or manager_name == "main":
+        if info["fixed_num_blocks"] or manager_name == MAIN_CACHE_NAME:
             min_targets[manager_name] = cap
             continue
 
@@ -585,7 +598,7 @@ def _auto_set_deepseek_v4_num_blocks_after_warmup(
                 cleanup_cuda_if_needed()
 
     get_global_args().infer.num_blocks = int(
-        targets.get("main", next(iter(targets.values())))
+        targets.get(MAIN_CACHE_NAME, next(iter(targets.values())))
     )
     if Backend.cache_managers:
         for dp_rank, dp_rank_managers in enumerate(Backend.cache_managers):
@@ -605,6 +618,29 @@ def _auto_set_deepseek_v4_num_blocks_after_warmup(
     if torch.distributed.get_rank() == 0:
         for scheduler in Backend.schedulers:
             scheduler.reset_kvcache_block_threshold()
+
+
+def _kv_cache_target_blocks(cache, max_tokens: int) -> int:
+    """realloc 后 cache（或对应的 manager）应有的 block 数。
+
+    按 token 容量对齐：``kv_cache_num_blocks_for_tokens`` 把 token 容量换算成 block 数，singleton
+    的 ckpt block 同样按 ``ceil_div(max_tokens, C)`` 取，因此它 checkpoint 覆盖的 token 数与 main
+    cache 的容量一致。
+    """
+    target_blocks = kv_cache_num_blocks_for_tokens(cache, max_tokens)
+    if is_singleton_kv_cache(cache) and target_blocks < int(cache.num_blocks):
+        logger.warning(
+            "%s cache: token capacity %d allows only %d blocks, fewer than the %d blocks "
+            "warmup needs; keeping %d blocks (raise infer.memory_utilization or lower "
+            "infer.max_batch_size for checkpoint blocks to follow the token capacity)",
+            cache.manager_name,
+            int(max_tokens),
+            target_blocks,
+            int(cache.num_blocks),
+            int(cache.num_blocks),
+        )
+        target_blocks = int(cache.num_blocks)
+    return target_blocks
 
 
 def _auto_set_num_blocks_after_warmup(args):
@@ -638,7 +674,7 @@ def _auto_set_num_blocks_after_warmup(args):
         if is_reallocable_kv_cache(cache)
     }
 
-    if "main" not in paged_caches:
+    if MAIN_CACHE_NAME not in paged_caches:
         logger.warning(
             "skip auto set num blocks after warmup because main cache manager is missing"
         )
@@ -654,11 +690,15 @@ def _auto_set_num_blocks_after_warmup(args):
                     current_targets.get(manager_name, int(cache.num_blocks)),
                 )
             current_main_blocks = int(
-                current_targets.get("main", next(iter(current_targets.values())))
+                current_targets.get(
+                    MAIN_CACHE_NAME, next(iter(current_targets.values()))
+                )
             )
         else:
-            current_targets = {"main": int(paged_caches["main"].num_blocks)}
-            current_main_blocks = int(current_targets["main"])
+            current_targets = {
+                MAIN_CACHE_NAME: int(paged_caches[MAIN_CACHE_NAME].num_blocks)
+            }
+            current_main_blocks = int(current_targets[MAIN_CACHE_NAME])
         get_global_args().infer.num_blocks = int(current_main_blocks)
         if Backend.cache_managers:
             for dp_rank_managers in Backend.cache_managers:
@@ -729,15 +769,26 @@ def _auto_set_num_blocks_after_warmup(args):
     allowed_bytes = max(0, int(target_budget_bytes) - int(baseline_bytes))
 
     total_paged_bpt = 0  # sum of per-token bytes over all reallocable caches
-    block_sizes = set()  # block_size values of reallocable caches
+    block_sizes = set()  # tokens covered by one block, over all reallocable caches
+    fixed_bytes = 0  # bytes of the blocks that do not scale with the token capacity
     cap_tokens = math.inf
     for cache_name, cache in reallocable_caches.items():
-        block_sz = cache.block_size
-        block_sizes.add(block_sz)
+        # 一块覆盖多少 token：singleton 的 ckpt block 覆盖的是 C 个 token
+        fixed_blocks, tokens_per_block = kv_cache_block_layout(cache)
+        block_sizes.add(tokens_per_block)
         bytes_per_block = int(cache.estimate_bytes_per_block())
-        bytes_per_token = bytes_per_block / block_sz
+        fixed_bytes += fixed_blocks * bytes_per_block
+        bytes_per_token = bytes_per_block / tokens_per_block
         total_paged_bpt += bytes_per_token
-        cap_tokens = min(cap_tokens, cache.get_allocatable_max_num_blocks() * block_sz)
+        cap_tokens = min(
+            cap_tokens,
+            max(0, cache.get_allocatable_max_num_blocks() - fixed_blocks)
+            * tokens_per_block,
+        )
+
+    # 固定 block（singleton 每请求 mtp_size 个 in-place block）不随 token 容量变化，也不参与
+    # 上面的按 token 换算，先从预算里扣掉，剩下的才按 token 容量分给各 cache
+    allowed_bytes = max(0, int(allowed_bytes) - int(fixed_bytes))
 
     # 可重分配的KVCache应该被realloc相同的token容量
     max_tokens = int(allowed_bytes / total_paged_bpt)  # floor, never ceil
@@ -767,7 +818,7 @@ def _auto_set_num_blocks_after_warmup(args):
     # Shrink first, then grow, to release memory before any later growth and
     # avoid a transient peak that could OOM.
     for name, cache in reallocable_caches.items():
-        target_blocks = max_tokens // cache.block_size
+        target_blocks = _kv_cache_target_blocks(cache, max_tokens)
         if target_blocks < cache.num_blocks:
             cache.realloc(target_blocks)
             logger.info(
@@ -776,7 +827,7 @@ def _auto_set_num_blocks_after_warmup(args):
             cleanup_cuda_if_needed()
 
     for name, cache in reallocable_caches.items():
-        target_blocks = max_tokens // cache.block_size
+        target_blocks = _kv_cache_target_blocks(cache, max_tokens)
         if target_blocks > cache.num_blocks:
             cache.realloc(target_blocks)
             logger.info(
@@ -785,19 +836,20 @@ def _auto_set_num_blocks_after_warmup(args):
             cleanup_cuda_if_needed()
 
     get_global_args().infer.num_blocks = (
-        max_tokens // Backend.cache_dict["main"].block_size
+        max_tokens // Backend.cache_dict[MAIN_CACHE_NAME].block_size
     )
 
     # reallocate blocks for cache managers (skip fixed-capacity managers, whose
-    # block count is per-request rather than token-scaled).
+    # block count is per-request rather than token-scaled). A manager gets the same
+    # target as its cache, so both end up with the same num_blocks — including the
+    # singleton ones, whose ckpt blocks scale with the token capacity and whose
+    # in-place blocks are the same fixed count on both sides.
     if Backend.cache_managers:
         for dp_rank, manager_dict in enumerate(Backend.cache_managers):
             for name, manager in manager_dict.items():
-                if type(manager).__name__ == "SingletonPagedKVCacheManager" or bool(
-                    getattr(manager, "fixed_num_blocks", False)
-                ):
+                if not is_reallocable_kv_cache(manager):
                     continue
-                target_blocks = max_tokens // manager.block_size
+                target_blocks = _kv_cache_target_blocks(manager, max_tokens)
                 if target_blocks != manager.num_blocks:
                     manager.realloc(target_blocks)
                     logger.info(
@@ -1024,7 +1076,7 @@ def _warmup_backend_direct(
     if not get_pp_group().is_first_rank:
         payload_dtype = Backend.executor.get_payload_dtype()
         if not skip_model_prefill:
-            # Match executor._prepare_hiddens(): PP prefill receives CP-local
+            # Match executor._recv_hiddens(): PP prefill receives CP-local
             # hidden rows, while direct warmup bypasses the real pipe receiver.
             prefill_tokens = Backend.model.cp_context.compute_pp_num_tokens(
                 local_max_bs
@@ -1114,8 +1166,11 @@ def _warmup_backend_direct(
             if args.infer.mtp_size > 1:
                 if get_pp_group().is_last_rank:
                     # Prepare slot 0 with the accepted hidden state before drafting.
-                    accept_hidden = Backend.model.read_mtp_hidden_states(is_mtp=True)
-                    Backend.model.update_mtp_hidden_states(accept_hidden, is_mtp=False)
+                    # 此处的is_draft参数并不是当前是否为draft_model的语义，而是利用该参数读写正确的位置：
+                    # is_draft=False读上个step的accpet indice对应的hidden_state
+                    # is_draft=True上读到的hidden_state复制到inplace_block_0上
+                    accept_hidden = Backend.model.read_mtp_hidden_states(is_draft=False)
+                    Backend.model.update_mtp_hidden_states(accept_hidden, is_draft=True)
                 Backend.model.draft(cur_tasks, tokens[:curr_bs])
 
     if (
@@ -1441,7 +1496,7 @@ def _update_tasks_preferred_dp_rank(
         for dp_rank in range(dp_size):
             task_ids_by_dp[dp_rank] = list(
                 Backend.schedulers[dp_rank]
-                .cache_manager_dict["main"]
+                .cache_manager_dict[MAIN_CACHE_NAME]
                 .task_to_cache_ids.keys()
             )
             max_load = max(max_load, len(task_ids_by_dp[dp_rank]))
@@ -1862,19 +1917,22 @@ async def start_enhanced_scheduler_service(rank: int, multi_inst, args):
                     num_managers = len(Backend.cache_managers)
                     for cache_manager_dict in Backend.cache_managers:
                         if block_size is None:
-                            block_size = cache_manager_dict["main"].block_size
+                            block_size = cache_manager_dict[MAIN_CACHE_NAME].block_size
                         assert (
-                            block_size == cache_manager_dict["main"].block_size
+                            block_size == cache_manager_dict[MAIN_CACHE_NAME].block_size
                         ), f"The block size of all main cache managers in the same instance should be the same. "
 
-                        num_blocks += cache_manager_dict["main"].num_blocks
+                        num_blocks += cache_manager_dict[MAIN_CACHE_NAME].num_blocks
 
                         # Send only incremental evictions
                         if hasattr(
-                            cache_manager_dict["main"], "pop_evicted_blk_hashes"
+                            cache_manager_dict[MAIN_CACHE_NAME],
+                            "pop_evicted_blk_hashes",
                         ):
                             evicted_blk_hashes.extend(
-                                cache_manager_dict["main"].pop_evicted_blk_hashes(
+                                cache_manager_dict[
+                                    MAIN_CACHE_NAME
+                                ].pop_evicted_blk_hashes(
                                     max_items=(512 // num_managers)
                                 )
                             )

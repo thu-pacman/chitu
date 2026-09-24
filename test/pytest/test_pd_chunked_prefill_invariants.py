@@ -14,6 +14,7 @@ import pytest
 
 from chitu import backend as backend_module
 from chitu import hooks as hooks_module
+from chitu import task as task_module
 from chitu.hooks import MooncakeKVTransferHook
 from chitu.task import PromptTooLongError, TaskType, TaskStatus, UserRequest, Task
 from chitu.global_vars import get_global_args
@@ -222,6 +223,21 @@ class TestUpdateDecodeStatus:
         t.update_decode_status([])
         assert t.status == TaskStatus.Stopped
         assert t.req.finish_reason == "length"
+
+    def test_pd_prefill_waits_for_kv_transfer_at_length_limit(self, monkeypatch):
+        monkeypatch.setattr(task_module, "is_pd_prefill_only", lambda: True)
+        t = _make_task(
+            "req", prefix_tokens_len=100, consumed=0, chunk_size=None, max_new_tokens=1
+        )
+        t.consume_req_tokens()
+        t.has_unsync_new_token = True
+
+        t.update_decode_status([])
+
+        assert t.task_type == TaskType.Decode
+        assert t.status != TaskStatus.Stopped
+        assert not t.need_remove()
+        assert t.req.finish_reason is None
 
     def test_task_with_synced_tokens_at_limit_stopped(self):
         """synced tokens == max_new_tokens → stopped."""

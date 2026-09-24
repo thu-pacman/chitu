@@ -17,6 +17,7 @@ from chitu.kv_cache.builders import (
     _resolve_default_num_blocks,
     register_cache_manager_builder,
 )
+from chitu.kv_cache.manager_names import MAIN_CACHE_NAME
 from chitu.kv_cache.registry import KVCacheSpec, register_kv_cache_spec
 from chitu.kv_cache.registry import (
     apply_kv_cache_quantization_rules,
@@ -256,7 +257,7 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
         window_size = int(args.models.window_size)
         cache_dict = {}
         if full_layer_id_map.size() > 0:
-            cache_dict["main"] = DeepSeekV4DenseKVCache(
+            cache_dict[MAIN_CACHE_NAME] = DeepSeekV4DenseKVCache(
                 full_layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
                 storage_max_seq_len=window_size,
@@ -314,13 +315,13 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
                 device=device,
                 **_compressed_kvargs_for_ratio(compressed_kvargs, ratio),
             )
-            if "main" in cache_dict:
+            if MAIN_CACHE_NAME in cache_dict:
                 cache_dict[_deepseek_v4_main_cache_name_for_ratio(ratio)] = (
                     sliding_cache
                 )
                 cache_dict[_deepseek_v4_compressed_cache_name(ratio)] = compressed_cache
             else:
-                cache_dict["main"] = sliding_cache
+                cache_dict[MAIN_CACHE_NAME] = sliding_cache
                 cache_dict["compressed"] = compressed_cache
         return CacheBuildBundle(
             cache_type=args.infer.cache_type,
@@ -393,7 +394,7 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
             )
         cache_dict = {}
         if full_layer_id_map.size() > 0:
-            cache_dict["main"] = DeepSeekV4SlidingWindowPagedKVCache(
+            cache_dict[MAIN_CACHE_NAME] = DeepSeekV4SlidingWindowPagedKVCache(
                 full_layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
                 window_size=sliding_block_size,
@@ -401,10 +402,10 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
                 num_blocks=main_num_blocks,
                 block_size=sliding_block_size,
                 device=device,
-                manager_name="main",
+                manager_name=MAIN_CACHE_NAME,
                 **kvargs,
             )
-            cache_dict["main"].allocatable_max_num_blocks = main_num_blocks_cap
+            cache_dict[MAIN_CACHE_NAME].allocatable_max_num_blocks = main_num_blocks_cap
         index_head_dim = getattr(args.models, "index_head_dim", None)
         for ratio in unique_compress_ratios:
             compress_layer_id_map = build_layer_id_map(
@@ -443,17 +444,24 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
                 num_blocks=main_num_blocks,
                 block_size=sliding_block_size,
                 device=device,
-                manager_name="main",
+                manager_name=MAIN_CACHE_NAME,
                 request_shape_dict=request_shape_dict,
                 request_dtype_dict=request_dtype_dict,
                 **kvargs,
             )
             sliding_cache.allocatable_max_num_blocks = main_num_blocks_cap
             compressed_manager_name = _deepseek_v4_compressed_cache_name(ratio)
+
+            max_seq_len_consider_compress = max(
+                1, compressed_storage_len_by_ratio[ratio]
+            )
+
             compressed_cache = DeepSeekV4PagedKVCache(
                 compress_layer_id_map,
                 max_seq_len=args.infer.max_seq_len,
-                page_table_max_seq_len=max(1, compressed_storage_len_by_ratio[ratio]),
+                max_blocks_per_req=ceil_div(
+                    max_seq_len_consider_compress, compressed_block_size
+                ),
                 num_hot_req=num_hot_req,
                 num_blocks=compressed_num_blocks_by_ratio[ratio],
                 block_size=compressed_block_size,
@@ -464,20 +472,20 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
             compressed_cache.allocatable_max_num_blocks = (
                 compressed_num_blocks_cap_by_ratio[ratio]
             )
-            if "main" in cache_dict:
+            if MAIN_CACHE_NAME in cache_dict:
                 cache_dict[_deepseek_v4_main_cache_name_for_ratio(ratio)] = (
                     sliding_cache
                 )
                 cache_dict[_deepseek_v4_compressed_cache_name(ratio)] = compressed_cache
             else:
-                cache_dict["main"] = sliding_cache
+                cache_dict[MAIN_CACHE_NAME] = sliding_cache
                 cache_dict["compressed"] = compressed_cache
 
         cache_managers = None
         if torch.distributed.get_rank() == 0:
             cache_managers = [
                 {
-                    "main": DeepSeekV4SlidingKVCacheManager(
+                    MAIN_CACHE_NAME: DeepSeekV4SlidingKVCacheManager(
                         main_num_blocks,
                         num_hot_req=num_hot_req,
                         max_seq_len=args.infer.max_seq_len,
@@ -485,7 +493,7 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
                         mtp_size=args.infer.mtp_size,
                         enable_prefix_caching=args.infer.enable_prefix_caching,
                         block_size=sliding_block_size,
-                        manager_name="main",
+                        manager_name=MAIN_CACHE_NAME,
                         window_size=sliding_block_size,
                     ),
                     **{

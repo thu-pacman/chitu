@@ -26,6 +26,7 @@ from chitu.task import (
     TaskStatus,
 )
 from chitu.global_vars import get_global_args
+from chitu.kv_cache.manager_names import MAIN_CACHE_NAME
 from chitu.distributed.pd_disaggregation.kv_transfer import (
     KVManagerDecode,
     KVManagerPrefill,
@@ -83,7 +84,7 @@ def _collect_router_kv_cache_stats() -> dict[str, Any]:
         if num_managers <= 0:
             return out
         for cache_manager_dict in Backend.cache_managers:
-            main_cm = cache_manager_dict["main"]
+            main_cm = cache_manager_dict[MAIN_CACHE_NAME]
             if block_size is None:
                 block_size = int(main_cm.block_size)
             assert block_size == main_cm.block_size, (

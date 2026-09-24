@@ -51,8 +51,6 @@ def indexer(rows, width=WIDTH, backend_class=deepgemm_backend.DeepGEMMIndexer):
     obj.index_topk = K
     obj.mtp_size = 1
     obj.topk_workspace = None
-    obj.topk_plan_parts = 1
-    obj.topk_owner_stream_id = None
     return obj
 
 
@@ -124,15 +122,17 @@ def test_triton_mtp3_decode_uses_workspace_topk(fake, monkeypatch, dtype):
         delta_total_len=6,
         is_decode_stage=True,
     )
-    obj.prepare_metadata_for_decode(d)
     obj.topk_indices(
         torch.empty(6, WIDTH, dtype=dtype),
         K,
         d,
         lengths=torch.full((6,), WIDTH, dtype=torch.int32),
     )
-    assert fake.plans == [((WIDTH - 3, WIDTH - 3), (WIDTH, WIDTH), WIDTH, False)]
-    assert fake.calls[0][2:] == (8, False)
+    # Decode reads no host plan at all (see `NvidiaTopKMixin`): the pinned hint
+    # bounds which parts a row may skip, and each row picks its exact split
+    # count from its device length.
+    assert fake.plans == []
+    assert fake.calls[0][2:] == (16, False)
     assert fake.score_dtypes == [dtype]
     assert obj.topk_workspace.candidates.numel() == 6 * 16 * K
 
@@ -187,7 +187,6 @@ def test_triton_paged_fp8_score_keeps_dtype_for_workspace_topk(dtype):
         obj = indexer(batch * mtp, width, triton_backend.TritonIndexer)
         obj.mtp_size = mtp
         lengths = torch.full((batch * mtp,), width, device="cuda", dtype=torch.int32)
-        obj.prepare_metadata_for_decode(d)
         actual = obj.topk_indices(scores, K, d, lengths=lengths)
 
         assert obj.topk_workspace is not None
@@ -196,13 +195,12 @@ def test_triton_paged_fp8_score_keeps_dtype_for_workspace_topk(dtype):
         torch.set_default_dtype(previous_dtype)
 
 
-def test_decode_reuses_addresses_and_updates_plan(fake):
+def test_decode_reuses_addresses_with_a_pinned_plan(fake):
     obj = indexer(1)
     scores = torch.empty(1, WIDTH)
     pointers = []
     for length in (4096, WIDTH, WIDTH, 4096):
         d = delta([length - 1], [length])
-        obj._prepare_topk_decode(d)
         obj.topk_indices(scores, K, d)
         pointers.append(
             (
@@ -210,8 +208,10 @@ def test_decode_reuses_addresses_and_updates_plan(fake):
                 obj.topk_workspace.plan_parts.data_ptr(),
             )
         )
+    # The candidates buffer and the plan scalar live for the process: a
+    # captured graph holds their addresses, so no step may reallocate them.
     assert len(set(pointers)) == 1
-    assert [c[2] for c in fake.calls] == [1, 8, 8, 1]
+    assert [c[2] for c in fake.calls] == [16, 16, 16, 16]
     assert len({id(c) for c in fake.completions}) == 4
     assert all(torch.count_nonzero(c) == 0 for c in fake.completions)
     assert not hasattr(obj.topk_workspace, "completion")
@@ -219,7 +219,6 @@ def test_decode_reuses_addresses_and_updates_plan(fake):
 
 def test_prefill_keeps_decode_workspace_and_plan_unchanged(fake):
     obj = indexer(1)
-    obj._prepare_topk_decode(delta([4095], [4096]))
     workspace = obj._ensure_topk_workspace(torch.device("cpu"))
     for _ in range(2):
         obj.topk_indices(
@@ -228,8 +227,8 @@ def test_prefill_keeps_decode_workspace_and_plan_unchanged(fake):
             delta([98302], [98304], False),
             lengths=torch.tensor([98303, 98304], dtype=torch.int32),
         )
-    assert obj.topk_workspace is workspace and obj.topk_plan_parts == 1
-    assert workspace.plan_parts.item() == 1
+    assert obj.topk_workspace is workspace
+    assert workspace.plan_parts.item() == 16
     assert len([p for p in fake.plans if p[-1]]) == 1  # host plan cache
     assert all(c[-1] for c in fake.calls)
 
@@ -249,34 +248,21 @@ def test_cp_prefill_never_materializes_host_selection(fake):
     assert obj.topk_workspace is None
 
 
-def test_invalid_rows_empty_batch_and_stream_ownership(fake, monkeypatch):
+def test_workspace_allocation_is_idempotent_and_host_free(fake):
     obj = indexer(1)
-    obj._prepare_topk_decode(delta([], []))
-    assert obj.topk_workspace is None and not fake.plans
-    for d in (delta([100], [100]), delta([100], [99]), delta([100, 100], [101, 101])):
-        with pytest.raises(AssertionError):
-            obj._prepare_topk_decode(d)
-    obj._prepare_topk_decode(delta([4095], [4096]))
-    obj._ensure_topk_workspace(torch.device("cpu"))
-    obj.topk_owner_stream_id = 17
-    monkeypatch.setattr(obj, "_topk_stream_id", lambda device: 18)
-    with pytest.raises(AssertionError, match="cross caller streams"):
-        obj._prepare_topk_decode(delta([4095], [4096]))
+    first = obj._ensure_topk_workspace(torch.device("cpu"))
+    assert obj._ensure_topk_workspace(torch.device("cpu")) is first
+    assert first.candidates.numel() == 1 * 16 * K
+    assert first.plan_parts.item() == 16
+    assert fake.plans == [] and fake.calls == []
 
 
-@pytest.mark.parametrize("operation", ["allocate", "prepare"])
-def test_no_host_state_mutation_during_capture(fake, monkeypatch, operation):
+def test_workspace_allocation_is_rejected_during_capture(fake, monkeypatch):
     obj = indexer(1)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    if operation == "prepare":
-        obj.topk_workspace = SimpleNamespace(
-            candidates=SimpleNamespace(device=torch.device("cuda"))
-        )
-        fn = lambda: obj._prepare_topk_decode(delta([4095], [4096]))
-    else:
-        fn = lambda: obj._ensure_topk_workspace(torch.device("cuda"))
-    with pytest.raises(AssertionError, match="capture|warmup"):
-        fn()
+    with pytest.raises(AssertionError, match="eager warmup"):
+        obj._ensure_topk_workspace(torch.device("cuda"))
+    assert obj.topk_workspace is None
 
 
 def test_oom_propagates_instead_of_reenabling_inexact_kernel(fake, monkeypatch):
@@ -361,8 +347,6 @@ def test_native_backend_exact_and_timing(
         lengths = torch.full((rows,), length, device="cuda", dtype=torch.int32)
         d = delta([length - 1] * rows, [length] * rows)
     obj = indexer(rows, length)
-    if not prefill:
-        obj._prepare_topk_decode(d)
     actual = record_benchmark.run(
         lambda: obj.topk_indices(scores, K, d, lengths=lengths),
         rows=rows,
@@ -460,12 +444,11 @@ def test_row_starts_outer_stride_and_short_rows():
 
 @gpu
 @pytest.mark.parametrize("rows", [1, 8, 32, 64, 96, 128, 192, 256, 320])
-def test_same_graph_changes_context_and_plan_with_stable_workspace(rows):
+def test_same_graph_changes_context_with_a_stable_workspace(rows):
     obj = indexer(rows)
     scores = torch.randn(rows, WIDTH, device="cuda", dtype=torch.float32)
     lengths = torch.full((rows,), 4096, device="cuda", dtype=torch.int32)
     d = delta([4095] * rows, [4096] * rows)
-    obj._prepare_topk_decode(d)
     obj.topk_indices(scores, K, d, lengths=lengths)
     workspace = obj.topk_workspace
     pointers = workspace.candidates.data_ptr(), workspace.plan_parts.data_ptr()
@@ -475,7 +458,6 @@ def test_same_graph_changes_context_and_plan_with_stable_workspace(rows):
         actual = obj.topk_indices(scores, K, d, lengths=lengths)
     for length in [2048, 4096, 4097, 65536, WIDTH, 98304, 2048, WIDTH]:
         lengths.fill_(length)
-        obj._prepare_topk_decode(delta([length - 1] * rows, [length] * rows))
         for _ in range(3):
             graph.replay()
         assert_exact(scores, actual, lengths)
@@ -487,7 +469,7 @@ def test_same_graph_changes_context_and_plan_with_stable_workspace(rows):
 
 @gpu
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
-def test_triton_mtp3_graph_uses_stable_workspace_across_plans(dtype):
+def test_triton_mtp3_graph_keeps_the_workspace_and_plan_across_steps(dtype):
     rows = 6
     obj = indexer(rows, backend_class=triton_backend.TritonIndexer)
     obj.mtp_size = 3
@@ -497,7 +479,6 @@ def test_triton_mtp3_graph_uses_stable_workspace_across_plans(dtype):
     def mtp3_delta(length):
         return delta([length - 3] * 2, [length] * 2)
 
-    obj.prepare_metadata_for_decode(mtp3_delta(4096))
     obj.topk_indices(scores, K, mtp3_delta(4096), lengths=lengths)
     workspace = obj.topk_workspace
     pointers = workspace.candidates.data_ptr(), workspace.plan_parts.data_ptr()
@@ -505,11 +486,8 @@ def test_triton_mtp3_graph_uses_stable_workspace_across_plans(dtype):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         actual = obj.topk_indices(scores, K, mtp3_delta(4096), lengths=lengths)
-    observed_plans = []
     for length in (4096, WIDTH, 98304, 2048, WIDTH):
         lengths.fill_(length)
-        obj.prepare_metadata_for_decode(mtp3_delta(length))
-        observed_plans.append(obj.topk_plan_parts)
         for _ in range(3):
             graph.replay()
         assert_exact(scores, actual, lengths)
@@ -517,7 +495,8 @@ def test_triton_mtp3_graph_uses_stable_workspace_across_plans(dtype):
             workspace.candidates.data_ptr(),
             workspace.plan_parts.data_ptr(),
         )
-    assert max(observed_plans) > 1
+    # The hint is a shape upper bound, so a replay never rewrites it.
+    assert workspace.plan_parts.item() == 16
 
 
 @gpu
@@ -606,7 +585,6 @@ def test_page_table_path_is_exact_and_masks_invalid_entries():
     )
     d = delta([n - 1] * rows, [n] * rows)
     obj = indexer(rows, n)
-    obj._prepare_topk_decode(d)
     result = obj.topk_page_table(scores, d, lengths, pages)
     ids = result[0] - 17
     assert_exact(scores[:1], ids[None, :], lengths[:1])
@@ -621,7 +599,6 @@ def test_select_all_page_table_for_sub_k_context():
     pages = torch.arange(2048, dtype=torch.int32, device="cuda").view(2, 1024)
     obj = indexer(2, 1024)
     d = delta([1023, 99], [1024, 100])
-    obj._prepare_topk_decode(d)
     result = obj.topk_page_table(scores, d, lengths, pages)
     for row, length in enumerate([1024, 100]):
         valid = result[row][result[row] >= 0].sort().values

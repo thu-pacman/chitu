@@ -24,6 +24,7 @@ import zmq.asyncio
 import chitu.serve.event_loop as event_loop_module
 
 from chitu.backend import Backend, BackendState
+from chitu.kv_cache.manager_names import MAIN_CACHE_NAME, SUPPORTED_CACHE_NAMES
 from chitu.distributed.parallel_state import (
     get_pcp_group,
     get_dp_group,
@@ -220,7 +221,7 @@ class PDSchedulerService:
         # Set cache for KVManager so that PD path can access KV buffers
         if self.scheduler is not None:
             for keys in Backend.cache_dict:
-                if keys not in {"main", "linear", "indexer", "mtp"}:
+                if keys not in SUPPORTED_CACHE_NAMES:
                     raise NotImplementedError(
                         f"cache {keys} is not supported for PD-disaggregation"
                     )
@@ -665,7 +666,7 @@ class PDSchedulerService:
         """Collect scheduler statistics"""
         # Use event loop time if present; fallback to wall clock
         last_update_ts = get_server_event_loop().time()
-        main_cache = Backend.cache_dict["main"]
+        main_cache = Backend.cache_dict[MAIN_CACHE_NAME]
 
         stats = {
             "msg_type": MSG_TYPE_HEARTBEAT,  # distinguish heartbeat vs crash

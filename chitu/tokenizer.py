@@ -19,7 +19,7 @@ from typing import (
 
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers import AutoProcessor
 
 from chitu.global_vars import get_global_args
@@ -310,6 +310,25 @@ class ChatFormat:
         return tokens
 
 
+def _llama_tokenizer_ignores_tokenizer_json(tokenizer, path: str) -> bool:
+    """
+    Detect the directory configuration that transformers >= 5.10 resolves to a broken
+    `LlamaTokenizer`.
+
+    A directory whose `tokenizer_config.json` declares `LlamaTokenizerFast` but which only
+    ships `tokenizer.json` (no `vocab.json`/`merges.txt`) used to fall back to
+    `TokenizersBackend`. Since transformers 5.10 that fallback no longer applies to model types
+    missing from `TOKENIZER_MAPPING_NAMES` (e.g. `llama`), and `LlamaTokenizer` is returned
+    instead. `LlamaTokenizer` rebuilds the BPE from `vocab`/`merges` and ignores
+    `tokenizer.json`, which silently drops or mis-splits the prompt text.
+    """
+    if type(tokenizer).__module__ != "transformers.models.llama.tokenization_llama":
+        return False
+    return (Path(path) / "tokenizer.json").exists() and not (
+        (Path(path) / "vocab.json").exists() or (Path(path) / "merges.txt").exists()
+    )
+
+
 class TokenizerHF:
     def __init__(
         self,
@@ -326,6 +345,15 @@ class TokenizerHF:
             path,
             trust_remote_code=trust_remote_code,
         )
+        if _llama_tokenizer_ignores_tokenizer_json(self.model, path):
+            logger.warning(
+                f"AutoTokenizer resolved {path} to LlamaTokenizer, which ignores "
+                "tokenizer.json; loading PreTrainedTokenizerFast instead"
+            )
+            self.model = PreTrainedTokenizerFast.from_pretrained(
+                path,
+                trust_remote_code=trust_remote_code,
+            )
         # self.model = AutoTokenizer.from_pretrained("Qwen/Qwen2-7B-Instruct")
         # Qwen2 don't set bos but have <|im_start|>
         # all special tokens: <|endoftext|> <|im_start|> <|im_end|>

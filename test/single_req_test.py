@@ -3,7 +3,6 @@ import torch
 import time
 import os
 import sys
-import random
 import logging
 from logging import getLogger
 from pathlib import Path
@@ -20,6 +19,17 @@ from chitu.chitu_main import (
 )
 from chitu.global_vars import get_timers
 from chitu.schemas import ServeConfig
+from chitu.testing.phonebook import (
+    SHARED_SEED,
+    check_phonebook_test_results,
+    check_prefix_cache_hit,
+    expected_pairs,
+    gen_phonebook_prompt,
+    phonebook_mode_active,
+    phonebook_num_entries,
+    phonebook_shared_enabled,
+    phonebook_test_enabled,
+)
 from chitu.utils import get_config_dir_path, gen_req_id, get_chitu_env
 
 logger = getLogger(__name__)
@@ -70,94 +80,11 @@ def use_long_context_msgs(model_type: str) -> bool:
 
 
 # --- “电话本”测试 ---------------------------------
-# This builds a phone book far longer than index_topk and asks for one
-# specific entry's number. The correct answer can only be produced if the
-# indexer selects the right tokens, so a wrong answer flags an indexer
-# regression. Enabled by setting the ``CHITU_TEST_NEEDLE`` env var.
-_BASE_NAMES = [
-    "张三",
-    "李四",
-    "王五",
-    "赤兔",
-    "八卦炉",
-    "刘备",
-    "关羽",
-    "张飞",
-    "赵云",
-    "曹操",
-    "曹丕",
-    "曹植",
-    "吕布",
-    "貂蝉",
-    "孙尚香",
-    "孙权",
-]
-
-
-def gen_phonebook_prompt(num_entries: int, exp_idx: int, seed: int = 1234):
-    """Build a phone-book prompt and return ``(prompt, expected_number)``.
-
-    ``num_entries`` should be large enough that the tokenized prompt exceeds
-    ``index_topk`` (2048 for DeepSeek-V3.2), forcing the indexer's top-k to
-    actually prune. ``exp_idx`` picks which entry is asked about.
-    """
-    rng = random.Random(seed)
-    entries = []
-    numbers = []
-    used = set()
-    for i in range(num_entries):
-        name = f"{_BASE_NAMES[i % len(_BASE_NAMES)]}{i:04d}"
-        # 11-digit phone number, unique per entry.
-        while True:
-            number = "1" + "".join(str(rng.randint(0, 9)) for _ in range(10))
-            if number not in used:
-                used.add(number)
-                break
-        numbers.append(number)
-        entries.append(f"{name}\t{number}")
-
-    needle_name = f"{_BASE_NAMES[exp_idx % len(_BASE_NAMES)]}{exp_idx:04d}"
-    expected_number = numbers[exp_idx]
-
-    body = "\n".join(entries)
-    prompt = (
-        "下面是一份电话簿，每行是一个联系人的姓名和电话号码，用制表符分隔。\n"
-        "请仔细阅读，然后回答末尾的问题。\n\n"
-        f"{body}\n\n"
-        f"问题：{needle_name} 的电话号码是多少？请只输出这一串数字，不要输出其它内容。"
-    )
-    return prompt, expected_number
-
-
-def phonebook_test_enabled() -> bool:
-    """Whether to run the phone-book needle request instead of the usual msgs."""
-    return os.environ.get("CHITU_TEST_PHONEBOOK", "false") == "true"
-
-
-def check_phonebook_test_results(reqs):
-    """Assert every request's output contains its expected number.
-
-    Raises AssertionError on a miss so the failure propagates to a nonzero
-    exit code and fails CI.
-    """
-    misses = []
-    for i, req in enumerate(reqs):
-        expected = getattr(req, "_needle_expected", None)
-        if expected is None:
-            continue
-        output = req.output or ""
-        hit = expected in output
-        logger.info(
-            f"[needle] req[{i}] expected={expected} hit={hit} output={output!r}"
-        )
-        if not hit:
-            misses.append((i, expected, output))
-    if misses:
-        raise AssertionError(
-            "phone-book needle test failed; the indexer likely selected the "
-            f"wrong tokens. misses={misses}"
-        )
-
+# The prompt builders and result checkers live in chitu/testing/phonebook.py so
+# that the PD disaggregation harness (chitu/testing/pd_utils.py) can reuse them.
+# Set CHITU_TEST_PHONEBOOK=true for the needle test (one phone book per request),
+# or CHITU_TEST_PHONEBOOK_SHARED=true to give every request the same long body so
+# the prefix cache must hit (see chitu/testing/phonebook.py for the details).
 
 USE_TOOLS = False
 # Exercise text generation for multimodal models without changing model loading.
@@ -256,34 +183,67 @@ def gen_reqs_real(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
     return reqs
 
 
+def _make_phonebook_req(prompt: str, expected: str, max_new_tokens: int) -> UserRequest:
+    msg = [{"role": "user", "content": prompt}]
+    req = UserRequest.create(
+        msg,
+        f"{gen_req_id()}",
+        max_new_tokens=max_new_tokens,
+        frequency_penalty=0.0,
+        temperature=0,
+    )
+    req.messages = msg
+    req._needle_expected = expected
+    return req
+
+
 def gen_reqs_needle(num_reqs, max_new_tokens):
     """Generate phone-book test requests.
 
     Uses greedy decoding (temperature 0) and a large phone book
     so the tokenized prompt exceeds `index_topk` and the
-    indexer's top-k actually prunes.
+    indexer's top-k actually prunes. Each request gets its own phone book
+    (`seed=1234+i`), so nothing here is reusable from the prefix cache.
     """
-    num_entries = 500
+    num_entries = phonebook_num_entries()
     reqs: list[UserRequest] = []
     for i in range(num_reqs):
         exp_idx = (i * 7 + 3) % num_entries
-        prompt, expected = gen_phonebook_prompt(num_entries, exp_idx, seed=1234 + i)
-        msg = [{"role": "user", "content": prompt}]
-        req = UserRequest.create(
-            msg,
-            f"{gen_req_id()}",
-            max_new_tokens=max_new_tokens,
-            frequency_penalty=0.0,
-            temperature=0,
+        prompt, expected = gen_phonebook_prompt(
+            num_entries, exp_idx, seed=SHARED_SEED + i
         )
-        req.messages = msg
-        req._needle_expected = expected
-        reqs.append(req)
+        reqs.append(_make_phonebook_req(prompt, expected, max_new_tokens))
+    return reqs
+
+
+#: Advances across batches so the second batch asks about other entries than the
+#: first one while keeping the phone-book body byte-identical.
+_shared_exp_counter = 0
+
+
+def gen_reqs_needle_shared(num_reqs, max_new_tokens):
+    """Generate phone-book requests that all share one long prompt body.
+
+    Every request uses the same seed, hence the same phone book; only the final
+    question (which entry to look up) differs. The shared body is what the
+    prefix cache has to hit, and the per-request expected number is what proves
+    the restored KV / linear-attention state is the right one.
+    """
+    global _shared_exp_counter
+    num_entries = phonebook_num_entries()
+    reqs: list[UserRequest] = []
+    for _ in range(num_reqs):
+        exp_idx = (_shared_exp_counter * 7 + 3) % num_entries
+        _shared_exp_counter += 1
+        prompt, expected = gen_phonebook_prompt(num_entries, exp_idx, seed=SHARED_SEED)
+        reqs.append(_make_phonebook_req(prompt, expected, max_new_tokens))
     return reqs
 
 
 def gen_reqs(num_reqs, max_new_tokens, frequency_penalty, is_vl=False):
     global local_args, msgs
+    if phonebook_shared_enabled():
+        return gen_reqs_needle_shared(num_reqs, max_new_tokens)
     if phonebook_test_enabled():
         return gen_reqs_needle(num_reqs, max_new_tokens)
 
@@ -309,7 +269,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
     rank = torch.distributed.get_rank()
     warmup_engine(args)
 
-    needle_reqs = []
+    needle_reqs: list[tuple[UserRequest, str]] = []
     for i in range(2):
         chitu_start()
         if rank == 0:
@@ -366,20 +326,27 @@ def run_pipe_or_tensor_parallelism(args, timers):
                     f"{GRAY}reqs[{i}].input={req.messages}{RESET}"
                 )
 
-            if phonebook_test_enabled():
-                needle_reqs.extend(reqs)
+            if phonebook_mode_active():
+                needle_reqs.extend(expected_pairs(reqs))
             timers.log()
         chitu_terminate()
 
-    if rank == 0 and phonebook_test_enabled():
-        check_phonebook_test_results(needle_reqs)
+    if rank == 0 and phonebook_mode_active():
+        check_phonebook_test_results(needle_reqs, context="needle")
+        check_prefix_cache_hit(
+            needle_reqs,
+            required=bool(
+                phonebook_shared_enabled() and local_args.infer.enable_prefix_caching
+            ),
+            context="needle",
+        )
 
 
 def run_normal(args, timers):
     rank = torch.distributed.get_rank()
     warmup_engine(args)
 
-    needle_reqs = []
+    needle_reqs: list[tuple[UserRequest, str]] = []
     for i in range(2):
         reqs = gen_reqs(
             num_reqs=args.infer.max_batch_size,
@@ -423,12 +390,19 @@ def run_normal(args, timers):
                 f"reqs[{i}].finish_reason={req.finish_reason}"
             )
 
-        if phonebook_test_enabled():
-            needle_reqs.extend(reqs)
+        if phonebook_mode_active():
+            needle_reqs.extend(expected_pairs(reqs))
         timers.log()
 
-    if phonebook_test_enabled():
-        check_phonebook_test_results(needle_reqs)
+    if phonebook_mode_active():
+        check_phonebook_test_results(needle_reqs, context="needle")
+        check_prefix_cache_hit(
+            needle_reqs,
+            required=bool(
+                phonebook_shared_enabled() and args.infer.enable_prefix_caching
+            ),
+            context="needle",
+        )
 
 
 @hydra.main(

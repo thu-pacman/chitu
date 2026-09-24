@@ -8,7 +8,8 @@ import msgpack
 from logging import getLogger
 import weakref
 from collections import deque
-from typing import Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, cast
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -974,6 +975,42 @@ class ExpertDataDispatcher(TasksDispatcher):
         return payload
 
 
+@dataclass
+class ProcessContext:
+    """The state of one executor step, shared by the process queue running it.
+
+    A processor takes no input and returns nothing: the values that used to be
+    passed around as arguments and return values live in the fields here, so
+    each processor reads the fields it needs and writes back the fields it
+    produces. Every field is deleted by the processor that consumes it last, so
+    a context never keeps a tensor alive beyond the step that produced it.
+    """
+
+    tasks: PackedTasksBase
+    """The batch this step runs."""
+
+    payload_type: SerializedPackedTasksPayloadType
+    """The payload type metadata dispatch resolved for this step."""
+
+    # Produced by the prepare processors, consumed and deleted by the forward ones.
+    tokens: Optional[torch.Tensor] = None
+    hiddens: Optional[torch.Tensor] = None
+    hiddens_recv_handle: Optional[object] = None
+    should_send_tp_hiddens: bool = False
+    should_recv_tp_hiddens: bool = False
+    output_token_offsets: Optional[torch.Tensor] = None
+    payload: Optional[torch.Tensor] = None
+    prefilling_lengths: Optional[list[int]] = None
+    decoding_start: Optional[torch.Tensor] = None
+
+    # Produced by the forward processors, consumed and deleted by the sample ones.
+    out: Optional[torch.Tensor] = None
+
+
+ProcessStep = Callable[[], None]
+"""One stage of a process queue: an ``Executor`` method with no input or output."""
+
+
 class Executor:
 
     @classmethod
@@ -1132,31 +1169,109 @@ class Executor:
         if self.is_sample_rank:
             self.sampler = Sampler()
 
-        if self.has_schedule_overlap:
-            if self.is_pp_first_stage:
-                self.process_queue = [
-                    self.postprocess_sync_part,
-                    self.postprocess_generate_draft,
-                    self.model_run,
-                    TaskCollector.process_last_batch_results,
-                ]
-            elif self.is_pp_last_stage:
-                if self.mtp_size > 1:
-                    self.process_queue = [
-                        self.postprocess_sync_part,
-                        self.postprocess_generate_draft,
-                        self.model_run,
-                    ]
-                else:
-                    # mtp=1: nothing to draft, so defer the previous step's
-                    # result sync until after decode is launched (inside
-                    # model_run -> postprocess_update_sampler), letting it
-                    # overlap the model forward like main.
-                    self.process_queue = [self.model_run]
-            else:
-                self.process_queue = [self.model_run]
-        else:
+        # Set by `step` for the duration of one step. The annotation declares it
+        # non-optional, so the processors can read it without an `is not None`
+        # check on every field access.
+        self.ctx: ProcessContext
+        self._build_process_queues()
+
+    def _build_process_queues(self):
+        """Lay out the process queue of every kind of step.
+
+        Everything that only depends on the configuration (PP stage, MTP size,
+        dense vs. DLLM) is resolved here, so a step only has to pick the queue
+        matching its task type.
+        """
+        if not self.has_schedule_overlap:
             raise NotImplementedError
+
+        # Schedule-overlap pipelines the CPU postprocessing of step N with the
+        # GPU work of step N+1.
+        if self.is_pp_first_stage:
+            overlap_prefix: list[ProcessStep] = [
+                self.postprocess_sync_part,
+                self.postprocess_generate_draft,
+            ]
+            flush_suffix: list[ProcessStep] = [self._flush_batch_results]
+        elif self.is_pp_last_stage and self.mtp_size > 1:
+            # mtp=1: nothing to draft, so defer the previous step's result sync
+            # until after decode is launched, letting it overlap the model
+            # forward like the main rank does.
+            overlap_prefix = [
+                self.postprocess_sync_part,
+                self.postprocess_generate_draft,
+            ]
+            flush_suffix = []
+        else:
+            overlap_prefix = []
+            flush_suffix = []
+
+        if self.model_type == ModelType.LLADA2:
+            # DLLM streams finished blocks instead of sampling tokens.
+            overlap_prefix = []
+            empty_body: list[ProcessStep] = [self.postprocess_send_pp_result]
+            prefill_body: list[ProcessStep] = [
+                self._prepare_moe_prefill,
+                self._prepare_global_num_tokens,
+                self._prepare_dllm_prefill_cache,
+                self._dllm_prefill_forward,
+                self._advance_lb_step,
+                self._commit_step_tokens,
+                self._process_dllm_block_results,
+                self._on_prefill_done,
+            ]
+            decode_body: list[ProcessStep] = [
+                self._prepare_moe_decode,
+                self._prepare_global_num_tokens,
+                self._prepare_dllm_decode,
+                self._dllm_decode_forward,
+                self._lb_trigger_and_sync,
+                self._advance_lb_step,
+                self._commit_step_tokens,
+                self._process_dllm_block_results,
+            ]
+        else:
+            empty_body = [
+                self.postprocess_send_pp_result,
+                self.postprocess_update_sampler,
+            ]
+            prefill_body = [
+                self._prepare_moe_prefill,
+                self._prepare_global_num_tokens,
+                self._prepare_cache_prefill,
+                self._prepare_tokens_prefill,
+                self._prepare_prefill_hiddens,
+                self._get_output_token_offsets,
+                self._wait_hiddens_recv,
+                self.postprocess_send_pp_result,
+                self._prefill_forward,
+                self._prefill_metrics,
+                self._send_pp_payload,
+                self._advance_lb_step,
+                self._commit_step_tokens,
+                self.postprocess_update_sampler,
+                self._sample,
+                self._on_prefill_done,
+            ]
+            decode_body = [
+                self._prepare_moe_decode,
+                self._prepare_global_num_tokens,
+                self._prepare_cache_decode,
+                self._prepare_tokens_decode,
+                self._prepare_decode_hiddens,
+                self.postprocess_send_pp_result,
+                self._decode_forward,
+                self._send_pp_payload,
+                self._lb_trigger_and_sync,
+                self._advance_lb_step,
+                self._commit_step_tokens,
+                self.postprocess_update_sampler,
+                self._sample,
+            ]
+
+        self.prefill_queue = overlap_prefix + prefill_body + flush_suffix
+        self.decode_queue = overlap_prefix + decode_body + flush_suffix
+        self.empty_queue = overlap_prefix + empty_body + flush_suffix
 
     def _prepend_dispatcher(self, dispatcher: TasksDispatcher):
         self.task_dispatchers.insert(0, dispatcher)
@@ -1223,11 +1338,14 @@ class Executor:
             )
             raise
 
-    def _prepare_tokens_decode(self, tasks: PackedTasks):
+    def _prepare_tokens_decode(self) -> None:
+        """Gather the next token ids a decode step feeds to the model (first PP stage)."""
+        tasks = self.ctx.tasks
         if not get_pp_group().is_first_rank:
-            return None
+            return
         if tasks.num_tasks == 0:
-            return torch.empty((0,), device=self.device, dtype=torch.int64)
+            self.ctx.payload = torch.empty((0,), device=self.device, dtype=torch.int64)
+            return
 
         if isinstance(tasks, PackedTasks):
             K = self.mtp_size
@@ -1250,14 +1368,15 @@ class Executor:
             )
         if self.tensor_broadcast_dispatchers:
             tokens = self._broadcast_tensor_payload(tokens)
-        return tokens
+        self.ctx.payload = tokens
 
     def _get_draft_tokens_device(
         self, tasks: PackedTasks, K: int
     ) -> torch.Tensor | None:
         """GPU draft rows for the verify input (pp=1 sample rank only).
 
-        The draft runs in decode_step right before the verify; keeping the
+        The draft runs in postprocess_generate_draft right before the verify;
+        keeping the
         verify input on GPU avoids the blocking D2H + H2D round trip that
         otherwise idles the GPU between the draft and verify graph replays.
         Returns None to fall back to the CPU task.next_tokens path.
@@ -1278,19 +1397,6 @@ class Executor:
                 row = zero_row
             rows.append(row)
         return torch.stack(rows, dim=0).reshape(-1)
-
-    def _prepare_blocks_for_decode_dllm(self, tasks: PackedTasks) -> torch.Tensor:
-        """Prepare payload as concatenated blocks for DLLM decode. Each task's next_block is [block_length] tokens."""
-        block_length = get_global_args().infer.dllm_block_length
-        blocks = []
-        for task in tasks.tasks:
-            if task.next_block is not None:
-                blocks.extend(task.next_block)
-            else:
-                # Fallback: mask block if not set (e.g. from DP bootstrap)
-                mask_id = Backend.model.decoder.mask_id
-                blocks.extend([mask_id] * block_length)
-        return torch.tensor(blocks, device=self.device, dtype=torch.long)
 
     def vision_tensor_broadcast(
         self,
@@ -1376,11 +1482,12 @@ class Executor:
            state to Terminated; ``EndTask`` cleans up finished tasks (KV cache
            eviction, sampler state removal, TaskPool cleanup).
 
-        3. **Process queue** — runs a sequence of callbacks configured at init:
-           - Normal mode: model_run → process_last_batch_results → postprocess_sync
-           - Schedule-overlap mode: postprocess_sync → model_run → process_last_batch_results
-           The overlap mode pipelines CPU postprocessing of step N with GPU work
-           for step N+1.
+        3. **Process queue** — runs the process queue matching this step,
+           which reads and writes the step's ``ProcessContext``:
+           - Prefill and decode have their own queues, so the prefill/decode and
+             dense/DLLM branches are already resolved when they are built.
+           - The schedule-overlap layout pipelines the CPU postprocessing of
+             step N with the GPU work of step N+1.
 
         Returns the serialized payload type (Empty, Normal, TerminateBackend, EndTask).
         """
@@ -1425,7 +1532,11 @@ class Executor:
 
         TaskCollector.step(tasks)
 
-        process_queue = self.process_queue
+        self.ctx = ProcessContext(
+            tasks=cast(PackedTasksBase, tasks),
+            payload_type=cast(SerializedPackedTasksPayloadType, payload_type),
+        )
+        process_queue = self._select_process_queue()
         from chitu.serve.common import begin_profiler_step, end_profiler_step
 
         profiler_step_started = begin_profiler_step(
@@ -1434,14 +1545,25 @@ class Executor:
         )
         try:
             for process_step in process_queue:
-                process_step(tasks)
+                process_step()
         finally:
+            del self.ctx
             if profiler_step_started:
                 end_profiler_step(
                     getattr(tasks, "task_type", None),
                     int(getattr(tasks, "num_tasks", 0) or 0),
                 )
         return payload_type
+
+    def _select_process_queue(self) -> list[ProcessStep]:
+        """Pick the process queue matching this step's payload and task type."""
+        if self.ctx.payload_type == SerializedPackedTasksPayloadType.Empty:
+            return self.empty_queue
+        if self.ctx.tasks.task_type == TaskType.Prefill:
+            return self.prefill_queue
+        if self.ctx.tasks.task_type == TaskType.Decode:
+            return self.decode_queue
+        raise NotImplementedError
 
     def end_task_step(self, task_ids: list[str]):
         if len(task_ids) == 0:
@@ -1465,111 +1587,100 @@ class Executor:
         )
         self.step(tasks)
 
-    def _get_output_token_offsets(self, tasks: PackedTasksBase) -> torch.Tensor:
-        if tasks.task_type == TaskType.Prefill:
-            output_token_offsets = []
-            cnt = 0
-            for i in range(tasks.num_tasks):
-                cnt += len(tasks.tokens[i])
-                if tasks.has_outputs[i]:
-                    output_token_offsets.append(cnt - 1)
-            return create_tensor(
-                output_token_offsets, dtype=torch.int32, device=self.device
-            )
-        else:
-            return torch.arange(tasks.num_tasks, dtype=torch.int32, device=self.device)
+    def _get_output_token_offsets(self) -> None:
+        """Locate, per task, the position whose hidden state gets sampled."""
+        tasks = self.ctx.tasks
+        output_token_offsets = []
+        cnt = 0
+        for i in range(tasks.num_tasks):
+            cnt += len(tasks.tokens[i])
+            if tasks.has_outputs[i]:
+                output_token_offsets.append(cnt - 1)
+        self.ctx.output_token_offsets = create_tensor(
+            output_token_offsets, dtype=torch.int32, device=self.device
+        )
 
-    def model_run(self, tasks: PackedTasksBase):
-        """Run the model forward pass for one step — prefill or decode.
-
-        This method:
-        1. Prepares the MoE implementation for the step (sets task type and
-           number of tokens so MoE layers can configure their dispatchers).
-        2. Prepares KV caches for the step via ``prepare_cache_prefill`` or
-           ``prepare_cache_decode``.
-        3. Builds the input payload (token IDs for first PP stage, hidden
-           states for later stages).
-        4. Calls ``Backend.model.prefill()`` or ``Backend.model.decode()``.
-        5. Sends the output to the next PP stage when applicable.
-        6. On the sample rank (TP0 + PCP0 + last PP stage), runs the sampler
-           to produce next-token predictions.
-        7. Notifies the KV transfer hook after prefill for PD disaggregation.
-        """
-        if tasks.payload_type == SerializedPackedTasksPayloadType.Empty:
-            if self.has_schedule_overlap:
-                self.postprocess_send_pp_result(None)
-                self.postprocess_update_sampler(None)
+    def _prepare_moe_prefill(self) -> None:
+        """Let the MoE implementation configure its dispatchers for a prefill step."""
+        if self.moe_impl is None:
             return
+        self.moe_impl.prepare(TaskType.Prefill, self.ctx.tasks.num_tokens)
 
-        if self.moe_impl is not None:
-            if tasks.task_type == TaskType.Prefill:
-                self.moe_impl.prepare(TaskType.Prefill, tasks.num_tokens)
-            elif tasks.task_type == TaskType.Decode:
-                self.moe_impl.prepare(TaskType.Decode, tasks.num_tokens * self.mtp_size)
+    def _prepare_moe_decode(self) -> None:
+        """Let the MoE implementation configure its dispatchers for a decode step."""
+        if self.moe_impl is None:
+            return
+        self.moe_impl.prepare(
+            TaskType.Decode, self.ctx.tasks.num_tokens * self.mtp_size
+        )
 
-        if self.specialize_embed_tokens_lm_head_parallel:
-            Backend.model.prepare_global_num_tokens(
-                tasks, get_embed_tokens_lm_head_tp_group()
-            )
+    def _prepare_global_num_tokens(self) -> None:
+        """Tell the model how many tokens the embed-tokens/lm-head group holds."""
+        if not self.specialize_embed_tokens_lm_head_parallel:
+            return
+        Backend.model.prepare_global_num_tokens(
+            self.ctx.tasks, get_embed_tokens_lm_head_tp_group()
+        )
 
-        if tasks.task_type == TaskType.Prefill:
-            out = (
-                self.prefill_step(tasks)
-                if self.model_type != ModelType.LLADA2
-                else self.prefill_dllm_step(tasks)
-            )
-        elif tasks.task_type == TaskType.Decode:
-            out = (
-                self.decode_step(tasks)
-                if self.model_type != ModelType.LLADA2
-                else self.decode_dllm_step(tasks)
-            )
-        else:
-            raise NotImplementedError
+    def _lb_trigger_and_sync(self) -> None:
+        """Trigger and sync the MoE load-balancer window of a decode step."""
+        self._lb_trigger()
+        self._lb_sync()
 
-        if tasks.task_type == TaskType.Decode:
-            self._lb_trigger()
-            self._lb_sync()
+    def _advance_lb_step(self) -> None:
+        """Advance the MoE load-balancer step counter."""
         self._lb_step += 1
 
+    def _commit_step_tokens(self) -> None:
+        """Commit this step's token accounting onto the tasks.
+
+        Prefill tasks advance their window of consumed tokens; on rank 0 each output
+        task is marked as holding an unsynced new token and its decode status is
+        refreshed.
+        """
+        tasks = self.ctx.tasks
         # *consume prefill tokens / update prefix token length
-        if isinstance(tasks, PackedTasks):
-            if self.dp_size > 1 and self.rank == 0:
-                update_tasks = DPTaskCollector.get_total_packedtasks()
-            else:
-                update_tasks = tasks
-            if update_tasks.task_type == TaskType.Prefill:
-                for task in update_tasks.tasks:
-                    task.consume_req_tokens()
-            if self.rank == 0:
-                for task in update_tasks.output_tasks:
-                    task.has_unsync_new_token = True
-                    if self.has_schedule_overlap:
-                        task.update_decode_status([])
+        if not isinstance(tasks, PackedTasks):
+            return
+        if self.dp_size > 1 and self.rank == 0:
+            update_tasks = DPTaskCollector.get_total_packedtasks()
+        else:
+            update_tasks = tasks
+        if update_tasks.task_type == TaskType.Prefill:
+            for task in update_tasks.tasks:
+                task.consume_req_tokens()
+        if self.rank == 0:
+            for task in update_tasks.output_tasks:
+                task.has_unsync_new_token = True
+                if self.has_schedule_overlap:
+                    task.update_decode_status([])
 
-        if self.is_sample_rank and self.model_type != ModelType.LLADA2:
-            if self.has_schedule_overlap:
-                self.postprocess_update_sampler(None)
-            tasks.generated_result_device = self.sampler.sample(out, tasks)
-            tasks.generated_result = tasks.generated_result_device.start_sync()
+    def _sample(self) -> None:
+        """Sample the next tokens from this step's model output on the sample rank."""
+        out = self.ctx.out
+        del self.ctx.out
+        if not (self.is_sample_rank and self.model_type != ModelType.LLADA2):
+            return
+        tasks = self.ctx.tasks
+        tasks.generated_result_device = self.sampler.sample(out, tasks)
+        tasks.generated_result = tasks.generated_result_device.start_sync()
 
-        # For DLLM: convert finished block results into BatchResults
-        if self.model_type == ModelType.LLADA2:
-            self._process_dllm_block_results()
+    def _on_prefill_done(self) -> None:
+        """Notify the KV transfer hook that this prefill step finished."""
+        self._kv_hook.on_prefill_done(self.ctx.tasks)
 
-        # Notify KV transfer hook after prefill completes.
-        if tasks.task_type == TaskType.Prefill:
-            self._kv_hook.on_prefill_done(tasks)
-
-    def _prepare_tokens_prefill(self, tasks: PackedTasksBase):
+    def _prepare_tokens_prefill(self) -> None:
+        """Gather the prompt token ids a prefill step feeds to the model."""
+        tasks = self.ctx.tasks
         if not (
             get_pp_group().is_first_rank
             or self.mtp_size > 1
             and get_pp_group().is_last_rank
         ):
-            return None
+            return
         if tasks.num_tokens == 0:
-            return torch.empty((0,), device=self.device, dtype=torch.int64)
+            self.ctx.tokens = torch.empty((0,), device=self.device, dtype=torch.int64)
+            return
 
         if isinstance(tasks, PackedTasks):
             # only the rank that holds PackedTasks has real tokens after dispatch metadata
@@ -1582,37 +1693,55 @@ class Executor:
             )
         if self.tensor_broadcast_dispatchers:
             tokens = self._broadcast_tensor_payload(tokens)
-        return tokens
+        self.ctx.tokens = tokens
 
-    def _prepare_hiddens(
-        self, tasks: PackedTasksBase, return_recv_handle: bool = False
-    ):
+    def _prepare_prefill_hiddens(self) -> None:
+        """Post the receive of the previous PP stage's hidden states.
+
+        The receive is only posted here; ``_wait_hiddens_recv`` waits for it
+        later and finishes the TP/CP broadcast it left open.
+        """
         if get_pp_group().is_first_rank:
-            if return_recv_handle:
-                return None, None, False, False
-            return None
+            return
+        self.ctx.hiddens = self._recv_hiddens(
+            async_recv=True,
+            pp_num_tokens=self.cp_context.compute_pp_num_tokens(
+                self.ctx.tasks.num_tokens
+            ),
+        )
+
+    def _prepare_decode_hiddens(self) -> None:
+        """Receive the previous PP stage's hidden states, which are the decode payload."""
+        if get_pp_group().is_first_rank:
+            return
+        # Decode sends (bs*K,) hidden states; recv buffer must match
+        pp_num_tokens = self.ctx.tasks.num_tokens
+        if self.mtp_size > 1:
+            pp_num_tokens *= self.mtp_size
+        self.ctx.payload = self._recv_hiddens(
+            async_recv=False, pp_num_tokens=pp_num_tokens
+        )
+
+    def _recv_hiddens(self, async_recv: bool, pp_num_tokens: int) -> torch.Tensor:
+        """Receive the previous PP stage's hidden states into a fresh buffer.
+
+        With ``async_recv`` the receive is only posted here and
+        ``_wait_hiddens_recv`` later waits for it and finishes the TP/CP
+        broadcast; otherwise the receive completes in place.
+        """
+        tasks = self.ctx.tasks
         if tasks.num_tokens == 0:
-            hiddens = torch.empty(
+            return torch.empty(
                 self.get_payload_shape(0),
                 device=self.device,
                 dtype=self.get_payload_dtype(),
             )
-            if return_recv_handle:
-                return hiddens, None, False, False
-            return hiddens
 
         # receive hiddens from previous PP stage
         # In PCP+PP prefill, each CP rank only processes its real interleaved
         # local tokens. The recv buffer must match the size that the sender
         # actually sends for this CP rank.
         # In PCP+PP decode, each CP rank has the full batch — no CP-split is applied.
-        if tasks.task_type == TaskType.Decode:
-            pp_num_tokens = tasks.num_tokens
-            # Decode sends (bs*K,) hidden states; recv buffer must match
-            if self.mtp_size > 1:
-                pp_num_tokens *= self.mtp_size
-        else:
-            pp_num_tokens = self.cp_context.compute_pp_num_tokens(tasks.num_tokens)
         hiddens_shape = self.get_payload_shape(pp_num_tokens)
         hiddens_dtype = self.get_payload_dtype()
         recv_stream = getattr(self.pipe_dispatcher, "recv_stream", None)
@@ -1620,7 +1749,7 @@ class Executor:
             self.is_main_rank
         )
         allocate_on_recv_stream = (
-            return_recv_handle
+            async_recv
             and receives_from_pipe
             and recv_stream is not None
             and torch.device(self.device).type == "cuda"
@@ -1639,99 +1768,80 @@ class Executor:
                 dtype=hiddens_dtype,
             )
 
-        recv_handle = None
-        should_send_tp_payload = False
-        should_recv_tp_payload = False
         # In CP+PP mode, each CP rank has its own PP pair and receives
         # hiddens directly from pipe — no TP/CP broadcast needed.
         # In TP mode, only the TP main rank receives from pipe, then
         # broadcasts to other TP ranks.
+        pipe_dispatcher = cast(PipeDispatcher, self.pipe_dispatcher)
         if self.cp_context.should_recv_directly(self.tp_size):
             # CP mode (or no TP): every rank receives from its PP pair directly
-            if return_recv_handle:
-                hiddens, recv_handle = self.pipe_dispatcher.recv_payload(
+            if async_recv:
+                hiddens, self.ctx.hiddens_recv_handle = pipe_dispatcher.recv_payload(
                     hiddens, return_handle=True
                 )
             else:
-                hiddens = self.pipe_dispatcher.recv_payload(hiddens)
+                hiddens = pipe_dispatcher.recv_payload(hiddens)
         elif self.is_main_rank:
-            if return_recv_handle:
-                hiddens, recv_handle = self.pipe_dispatcher.recv_payload(
+            if async_recv:
+                hiddens, self.ctx.hiddens_recv_handle = pipe_dispatcher.recv_payload(
                     hiddens, return_handle=True
                 )
-                should_send_tp_payload = bool(self.tensor_broadcast_dispatchers)
+                self.ctx.should_send_tp_hiddens = bool(
+                    self.tensor_broadcast_dispatchers
+                )
             else:
-                hiddens = self.pipe_dispatcher.recv_payload(hiddens)
+                hiddens = pipe_dispatcher.recv_payload(hiddens)
                 if self.tensor_broadcast_dispatchers:
                     hiddens = self._broadcast_tensor_payload(hiddens)
         else:
-            if return_recv_handle:
-                should_recv_tp_payload = bool(self.tensor_broadcast_dispatchers)
+            if async_recv:
+                self.ctx.should_recv_tp_hiddens = bool(
+                    self.tensor_broadcast_dispatchers
+                )
             else:
                 hiddens = self._broadcast_tensor_payload(hiddens)
-        if return_recv_handle:
-            return hiddens, recv_handle, should_send_tp_payload, should_recv_tp_payload
         return hiddens
 
-    def _wait_hiddens_recv(
-        self,
-        hiddens: Optional[torch.Tensor],
-        recv_handle,
-        should_send_tp_payload: bool,
-        should_recv_tp_payload: bool,
-    ):
+    def _wait_hiddens_recv(self) -> None:
+        """Wait for the async PP receive and finish the TP/CP broadcast it left open."""
+        recv_handle = self.ctx.hiddens_recv_handle
+        should_send_tp_payload = self.ctx.should_send_tp_hiddens
+        should_recv_tp_payload = self.ctx.should_recv_tp_hiddens
+        del self.ctx.hiddens_recv_handle
+        del self.ctx.should_send_tp_hiddens
+        del self.ctx.should_recv_tp_hiddens
+
         if recv_handle is not None:
-            recv_handle.wait()
+            cast(Any, recv_handle).wait()
         if should_send_tp_payload or should_recv_tp_payload:
-            hiddens = self._broadcast_tensor_payload(hiddens)
-        return hiddens
-
-    def prefill_step(self, tasks: PackedTasksBase) -> torch.Tensor:
-        """Run a single prefill forward pass.
-
-        Prefill processes prompt tokens for scheduled requests, producing KV
-        cache entries and the selected hidden states or logits for output token
-        offsets requested by the scheduler.
-
-        Steps:
-        1. Prepare KV caches (allocate blocks, set sequence lengths).
-        2. Gather token IDs from task descriptors into a flat tensor.
-        3. Receive hidden states from the previous PP stage (if not stage 0).
-        4. Call ``Backend.model.prefill()``.
-        5. Send output hidden states to the next PP stage when applicable.
-        6. Collect prompt token metrics for Prometheus.
-        """
-        is_empty_step = tasks.num_tasks == 0
-        if not is_empty_step:
-            for cache in Backend.cache_dict.values():
-                cache.prepare_cache_prefill(tasks)
-                cache.seq_len_delta.is_decode_stage = False
-            PrometheusMetricsCollector.update_GPU_usage()
-            PrometheusMetricsCollector.update_task_counts()
-
-        tokens = self._prepare_tokens_prefill(tasks)
-        (
-            hiddens,
-            hiddens_recv_handle,
-            should_send_tp_hiddens,
-            should_recv_tp_hiddens,
-        ) = self._prepare_hiddens(tasks, return_recv_handle=True)
-        output_token_offsets = self._get_output_token_offsets(tasks)
-
-        if (
-            hiddens_recv_handle is not None
-            or should_send_tp_hiddens
-            or should_recv_tp_hiddens
-        ):
-            hiddens = self._wait_hiddens_recv(
-                hiddens,
-                hiddens_recv_handle,
-                should_send_tp_hiddens,
-                should_recv_tp_hiddens,
+            self.ctx.hiddens = self._broadcast_tensor_payload(
+                cast(torch.Tensor, self.ctx.hiddens)
             )
 
-        if self.has_schedule_overlap:
-            self.postprocess_send_pp_result(None)
+    def _prepare_cache_prefill(self) -> None:
+        """Allocate the KV cache blocks a prefill batch needs."""
+        if self.ctx.tasks.num_tasks == 0:
+            return
+        for cache in Backend.cache_dict.values():
+            cache.prepare_cache_prefill(self.ctx.tasks)
+            cache.seq_len_delta.is_decode_stage = False
+        PrometheusMetricsCollector.update_GPU_usage()
+        PrometheusMetricsCollector.update_task_counts()
+
+    def _prefill_forward(self) -> None:
+        """Run ``Backend.model.prefill`` for this step.
+
+        Prefill processes prompt tokens for scheduled requests, producing KV cache
+        entries and the selected hidden states or logits for the output token
+        offsets the scheduler requested.
+        """
+        tasks = self.ctx.tasks
+        tokens = self.ctx.tokens
+        hiddens = self.ctx.hiddens
+        output_token_offsets = self.ctx.output_token_offsets
+        del self.ctx.tokens
+        del self.ctx.hiddens
+        del self.ctx.output_token_offsets
 
         self.timers("prefill").start()
         out = Backend.model.prefill(
@@ -1747,94 +1857,86 @@ class Executor:
         )
         self.timers("prefill").stop()
 
-        if not is_empty_step:
-            # Collect prompt tokens metrics
-            inc_hit_tokens = sum(tasks.inc_hit_tokens_list)
-            PrometheusMetricsCollector.inc_prompt_tokens(
-                tasks.num_tokens + inc_hit_tokens
-            )
-            PrometheusMetricsCollector.inc_hit_tokens(inc_hit_tokens)
+        # An empty step still replays the graph so the PP/TP collectives stay in
+        # lockstep, but its output carries no meaning.
+        self.ctx.out = out if tasks.num_tasks > 0 else self.dummy_output
 
-            # payload send
-            #
-            # NOTE: send hidden states to the next PP stage BEFORE triggering KV transfer.
-            # Otherwise intermediate stages can block in KV transfer collectives, while the last
-            # stage is still waiting for payload from upstream, causing a deadlock.
-            self._send_pp_payload(out, tasks)
+    def _prefill_metrics(self) -> None:
+        """Count the prompt tokens this prefill step consumed."""
+        if self.ctx.tasks.num_tasks == 0:
+            return
+        # Collect prompt tokens metrics
+        inc_hit_tokens = sum(self.ctx.tasks.inc_hit_tokens_list)
+        PrometheusMetricsCollector.inc_prompt_tokens(
+            self.ctx.tasks.num_tokens + inc_hit_tokens
+        )
+        PrometheusMetricsCollector.inc_hit_tokens(inc_hit_tokens)
 
-            return out
-        else:
-            # Empty step: send dummy hiddens to next PP stage to avoid deadlock
-            # in CP+PP mode where the paired rank may be waiting on recv.
-            # Only needed when CP is active; without CP, the old behavior was
-            # to never send PP payloads on empty steps.
-            if self.cp_context.is_active:
-                self._send_pp_payload(self.dummy_logits, tasks=tasks)
-            return self.dummy_output
-
-    def decode_step(self, tasks: PackedTasksBase, is_empty_step: bool = False):
-        """Run a single decode forward pass.
-
-        Decode consumes the current token for each in-flight request and produces
-        next-token predictions.  For multi-token prediction (MTP) models, the
-        model may draft multiple tokens per request in one decode step.
-
-        Steps:
-        1. Ensure KV cache is ready (for PD, this may wait for KV transfer from
-           the prefill side to complete).
-        2. Prepare KV caches — update block tables and sequence lengths.
-        3. Build the payload: token IDs (first PP stage) or hidden states
-           (later PP stages) received from the previous PP stage.
-        4. Call ``Backend.model.decode()``.
-        5. Send the output to the next PP stage.
-        """
+    def _prepare_cache_decode(self) -> None:
+        """Refresh the KV cache state a decode batch needs."""
+        tasks = self.ctx.tasks
         if tasks.num_tasks == 0:
-            is_empty_step = True
-        if not is_empty_step:
-            # Ensure KV cache is present for PD decode-only before updating CacheManager state.
-            self._kv_hook.before_decode_step(tasks.req_ids)
+            return
+        # Ensure KV cache is present for PD decode-only before updating CacheManager state.
+        self._kv_hook.before_decode_step(tasks.req_ids)
 
-            if self.mtp_size > 1:
-                self._prepare_accept_indices(tasks)
+        if self.mtp_size > 1:
+            self._prepare_accept_indices(tasks)
 
-            for cache in Backend.cache_dict.values():
-                cache.prepare_cache_decode(tasks)
+        for cache in Backend.cache_dict.values():
+            cache.prepare_cache_decode(tasks)
 
-        if get_pp_group().is_first_rank:
-            payload = self._prepare_tokens_decode(tasks)
-        else:
-            payload = self._prepare_hiddens(tasks)
+    def _decode_forward(self) -> None:
+        """Run ``Backend.model.decode`` for this step.
 
-        if self.has_schedule_overlap:
-            self.postprocess_send_pp_result(None)
+        Decode consumes the current token of every in-flight request and produces
+        next-token predictions. For MTP models the model may draft several tokens
+        per request in one step.
+        """
+        payload = self.ctx.payload
+        del self.ctx.payload
 
         self.timers("decode").start()
         out = Backend.model.decode(payload)
         self.timers("decode").stop()
 
-        if not is_empty_step:
-            self._send_pp_payload(out, tasks)
-
-            return out
+        if self.ctx.tasks.num_tasks > 0:
+            self.ctx.out = out
         else:
-            # Empty step: send dummy hiddens to next PP stage to avoid deadlock
-            # in CP+PP mode where the paired rank may be waiting on recv.
-            # Only needed when CP is active; without CP, the old behavior was
-            # to never send PP payloads on empty steps.
-            if self.cp_context.is_active:
-                self._send_pp_payload(self.dummy_logits, tasks=tasks)
-            return self.dummy_mtp_output if self.mtp_size > 1 else self.dummy_output
+            # An empty step still replays the graph so the PP/TP collectives stay
+            # in lockstep, but its output carries no meaning.
+            self.ctx.out = (
+                self.dummy_mtp_output if self.mtp_size > 1 else self.dummy_output
+            )
 
-    def _send_pp_payload(self, tensor, tasks):
-        """Send payload to next PP stage if this rank should send.
+    def _send_pp_payload(self) -> None:
+        """Send this step's hidden states to the next PP stage.
 
         CP mode: every rank has its own PP pair and sends independently.
         TP mode: only the main rank sends (hiddens already synced via TP broadcast).
         """
-        if not get_pp_group().is_last_rank:
-            if self.cp_context.should_send_directly() or self.is_main_rank:
-                assert self.pipe_dispatcher is not None
-                self.pipe_dispatcher.send_payload(tensor, tasks)
+        if get_pp_group().is_last_rank:
+            return
+        if not (self.cp_context.should_send_directly() or self.is_main_rank):
+            return
+        if self.ctx.tasks.num_tasks == 0:
+            # Empty step: send dummy hiddens to next PP stage to avoid deadlock
+            # in CP+PP mode where the paired rank may be waiting on recv.
+            # Only needed when CP is active; without CP, the old behavior was
+            # to never send PP payloads on empty steps.
+            if not self.cp_context.is_active:
+                return
+            payload = self.dummy_logits
+        else:
+            # NOTE: send hidden states to the next PP stage BEFORE triggering KV
+            # transfer. Otherwise intermediate stages can block in KV transfer
+            # collectives, while the last stage is still waiting for payload from
+            # upstream, causing a deadlock.
+            payload = self.ctx.out
+        assert self.pipe_dispatcher is not None
+        self.pipe_dispatcher.send_payload(
+            cast(torch.Tensor, payload), cast(Optional[PackedTasks], self.ctx.tasks)
+        )
 
     def _prepare_accept_indices(self, tasks, is_draft_prepare=False) -> list[int]:
         indices = None
@@ -1857,7 +1959,8 @@ class Executor:
         for cache in Backend.cache_dict.values():
             cache.update_mtp_cache_accept(tasks, indices)
 
-    def postprocess_generate_draft(self, _):
+    def postprocess_generate_draft(self) -> None:
+        """Run the MTP draft model for the tasks sampled in a previous step."""
         if self.model_type == ModelType.LLADA2:
             return
         if self._pd_prefill_only:
@@ -1899,8 +2002,12 @@ class Executor:
         if Backend.model.moe_impl is not None:
             Backend.model.moe_impl.prepare(TaskType.Decode, len(tasks.output_task_ids))
 
+        # 把接受列的隐藏态复制到第 0 页，作为 draft 链的起点（draft 只借用第 0 页）
+        # 此处的is_draft参数并不是当前是否为draft_model的语义，而是利用该参数读写正确的位置：
+        # is_draft=False读上个step的accpet indice对应的hidden_state
+        # is_draft=True上读到的hidden_state复制到inplace_block_0上
         Backend.model.update_mtp_hidden_states(
-            Backend.model.read_mtp_hidden_states(is_mtp=True), is_mtp=False
+            Backend.model.read_mtp_hidden_states(is_draft=False), is_draft=True
         )
         if self.is_sample_rank:
             # Draft proposal params (temperature/top-k/top-p/greedy mask) must be
@@ -1915,13 +2022,13 @@ class Executor:
         else:
             Backend.model.draft(tasks, last_tokens)
 
-    def prefill_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
-        is_empty_step = tasks.num_tasks == 0
+    def _prepare_dllm_prefill_cache(self) -> None:
+        """Prepare the DLLM prefill: per-task decoding starts and the DLLM KV cache."""
+        tasks = self.ctx.tasks
         block_length = get_global_args().infer.dllm_block_length
-        num_tokens = tasks.num_tokens
         prefilling_lengths: list[int] = []
 
-        if not is_empty_step:
+        if tasks.num_tasks > 0:
             for it, task_id in enumerate(tasks.task_ids):
                 non_mask_number = len(tasks.tokens[it])
                 decoding_start = min(
@@ -1938,18 +2045,31 @@ class Executor:
                 dispatcher.recv_payload(self.dummy_logits)
 
         # Update task.decoding_start on main rank
-        if not is_empty_step and isinstance(tasks, PackedTasks) and self.is_main_rank:
+        if tasks.num_tasks > 0 and isinstance(tasks, PackedTasks) and self.is_main_rank:
             for it, task in enumerate(tasks.tasks):
                 task.decoding_start = prefilling_lengths[it] + task.consumed_req_tokens
 
-        max_prefilling_length = max(prefilling_lengths) if prefilling_lengths else 0
-        if is_empty_step or max_prefilling_length == 0:
-            return self.dummy_output
+        self.ctx.prefilling_lengths = prefilling_lengths
+
+    def _dllm_prefill_forward(self) -> None:
+        """Run the DLLM prefill forward pass.
+
+        The payload is a ragged token tensor: each task contributes the tokens up to
+        its decoding start.
+        """
+        tasks = self.ctx.tasks
+        prefilling_lengths = self.ctx.prefilling_lengths
+        del self.ctx.prefilling_lengths
+
+        # A batch that is empty, or whose prompts are all shorter than one
+        # block, has nothing for the diffusion forward to refine.
+        if not prefilling_lengths or max(prefilling_lengths) == 0:
+            return
 
         batch_size = tasks.num_tasks
 
         # Build ragged token tensor
-        if (self.rank == 0 and num_tokens > 0) or (
+        if (self.rank == 0 and tasks.num_tokens > 0) or (
             self.dp_size > 1 and self.pp_stage == 0
         ):
             payload = (
@@ -1979,45 +2099,27 @@ class Executor:
         )
         output_token_offsets = torch.cumsum(plen_tensor, dim=0) - 1
 
-        logits = Backend.model.prefill_dllm(
+        Backend.model.prefill_dllm(
             payload,
             output_token_offsets,
             prefilling_lengths=prefilling_lengths,
         )
 
         torch.cuda.synchronize()
-        return logits
 
-    def decode_dllm_step(self, tasks: PackedTasksBase) -> torch.Tensor:
-        """Run a DLLM (Diffusion LLM) decode step.
+    def _prepare_dllm_decode(self) -> None:
+        """Prepare the DLLM decode: decoding starts, block payload and DLLM KV cache."""
+        tasks = self.ctx.tasks
+        # Nothing to decode: `_dllm_decode_forward` emits the dummy output.
+        if tasks.num_tasks == 0 or (
+            self.tp_size <= 1 and not isinstance(tasks, PackedTasks)
+        ):
+            return
 
-        Unlike standard autoregressive decode, DLLM operates on token *blocks*
-        of fixed length.  Each decode step iteratively refines block payloads via
-        a masked-prediction loop until at least one block in the batch is fully
-        decoded (no mask tokens remain) or the maximum number of iterations is
-        reached.
-
-        Steps:
-        1. Prepare the block-length payload (mask tokens filled in for undecoded positions).
-        2. Prepare DLLM-aware KV caches (``prepare_cache_decode_dllm``).
-        3. Loop: forward → batch_decode → check block-finished condition.
-        4. Finalize caches and update task state for finished blocks.
-        5. Queue finished blocks in ``_pending_dllm_block`` for later delivery
-           via ``_process_dllm_block_results`` (which streams all tokens at once
-           rather than one by one).
-        """
-        if tasks.num_tasks == 0:
-            return self.dummy_output
-        if self.tp_size <= 1 and not isinstance(tasks, PackedTasks):
-            return self.dummy_output
-
-        decoder = Backend.model.decoder
         block_length = get_global_args().infer.dllm_block_length
-        mask_id, eos_id = decoder.mask_id, decoder.eos_id
         batch_size = tasks.num_tasks
 
         # 1) Get decoding_start tensor (broadcast for TP>1)
-
         if isinstance(tasks, PackedTasks):
             decoding_start = torch.tensor(
                 [getattr(t, "decoding_start", 0) for t in tasks.tasks],
@@ -2031,9 +2133,17 @@ class Executor:
         if self.tensor_broadcast_dispatchers:
             decoding_start = self._broadcast_tensor_payload(decoding_start)
 
-        # 2) Prepare payload
+        # 2) Prepare payload: one block of tokens per task.
         if isinstance(tasks, PackedTasks):
-            payload = self._prepare_blocks_for_decode_dllm(tasks)
+            blocks = []
+            for task in tasks.tasks:
+                if task.next_block is not None:
+                    blocks.extend(task.next_block)
+                else:
+                    # Fallback: mask block if not set (e.g. from DP bootstrap)
+                    mask_id = Backend.model.decoder.mask_id
+                    blocks.extend([mask_id] * block_length)
+            payload = torch.tensor(blocks, device=self.device, dtype=torch.long)
         else:
             payload = torch.empty(
                 [batch_size * block_length], dtype=torch.long, device=self.device
@@ -2048,7 +2158,37 @@ class Executor:
                 cache.prepare_cache_decode_dllm(tasks, decoding_start, block_length)
         PrometheusMetricsCollector.update_kvcache_usage()
 
-        # 4-6) Loop forward + batch_decode until at least one block is fully decoded.
+        self.ctx.decoding_start = decoding_start
+        self.ctx.payload = payload
+
+    def _dllm_decode_forward(self) -> None:
+        """Run the DLLM decode refinement loop and finalize the finished blocks.
+
+        Unlike standard autoregressive decode, DLLM operates on token *blocks* of
+        fixed length. Each decode step iteratively refines block payloads via a
+        masked-prediction loop until at least one block in the batch is fully
+        decoded (no mask tokens remain) or the maximum number of iterations is
+        reached. Finished blocks are queued in ``_pending_dllm_block`` for later
+        delivery via ``_process_dllm_block_results``, which streams all tokens
+        of a block at once rather than one by one.
+        """
+        tasks = self.ctx.tasks
+        decoding_start = self.ctx.decoding_start
+        payload = self.ctx.payload
+        del self.ctx.decoding_start
+        del self.ctx.payload
+
+        # An empty step (or a non-PackedTasks batch on a single TP rank) has
+        # nothing to refine.
+        if decoding_start is None:
+            return
+
+        decoder = Backend.model.decoder
+        block_length = get_global_args().infer.dllm_block_length
+        mask_id, eos_id = decoder.mask_id, decoder.eos_id
+        batch_size = tasks.num_tasks
+
+        # Loop forward + batch_decode until at least one block is fully decoded.
         total_len = decoding_start.max().item() + block_length
         col_indices = torch.arange(block_length, device=self.device).unsqueeze(
             0
@@ -2080,14 +2220,14 @@ class Executor:
 
         torch.cuda.synchronize()
 
-        # 7) Finalize cache
+        # Finalize cache
         for mgr in Backend.cache_dict.values():
             if hasattr(mgr, "finalize_cache_single_decode_dllm"):
                 mgr.finalize_cache_single_decode_dllm(
                     tasks.req_ids, block_finished, block_length
                 )
 
-        # 8) Update task state (main rank only)
+        # Update task state (main rank only)
         if self.is_main_rank and isinstance(tasks, PackedTasks):
             has_eos = (decoded_blocks == eos_id).any(dim=1)
             has_eos_list = has_eos.cpu().tolist()
@@ -2134,9 +2274,7 @@ class Executor:
         else:
             self._pending_dllm_block = None
 
-        return logits[:, -1, :]
-
-    def _process_dllm_block_results(self):
+    def _process_dllm_block_results(self) -> None:
         """Push finished DLLM block tokens directly to user requests.
 
         Bypasses the BatchResult queue so all tokens in a block are delivered
@@ -2183,7 +2321,8 @@ class Executor:
                 task.req.notify_server_data_added_threadsafe()
         TaskCollector.add_update_task_ids(block_tasks.task_ids)
 
-    def postprocess_send_pp_result(self, _):
+    def postprocess_send_pp_result(self) -> None:
+        """Send the previous step's sampled results to the PP stage that needs them."""
         if self.is_sample_rank and self.pipe_dispatcher:
             if self._pd_prefill_only:
                 return
@@ -2191,7 +2330,8 @@ class Executor:
             if isinstance(tasks, PackedTasks):
                 self.pipe_dispatcher.send_results(tasks)
 
-    def postprocess_update_sampler(self, _):
+    def postprocess_update_sampler(self) -> None:
+        """Feed the results of the previous step back into the sampler state."""
         if self.is_sample_rank and self.model_type != ModelType.LLADA2:
             tasks = TaskCollector.get_postprocess_tasks()
             if tasks is not None and not tasks.is_empty_tasks():
@@ -2420,7 +2560,7 @@ class Executor:
             tasks.generated_result = dp_results
         return tasks
 
-    def postprocess_sync_part(self, _):
+    def postprocess_sync_part(self) -> None:
         """
         schedule -> model -> sample -> ***sync*** -> send
 
@@ -2472,6 +2612,10 @@ class Executor:
         tasks.batch_update_test_result()
         TaskCollector.append_to_last_batch_results(tasks.create_batch_result())
         tasks.batch_update_decode_status()
+
+    def _flush_batch_results(self) -> None:
+        """Push the batches prepared by `postprocess_sync_part` to the user requests."""
+        TaskCollector.process_last_batch_results(None)
 
     def postprocess_async_part(self, batch_result: BatchResult) -> None:
         """

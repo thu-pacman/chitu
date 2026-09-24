@@ -375,3 +375,59 @@ def make_op_dispatcher(
     if func is None:
         return decorator
     return decorator(func)
+
+
+def check_checkpoint_args(
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+    seq_len_list: list[int],
+    tail_shape: tuple,
+    op_name: str,
+):
+    """校验 checkpoint 相关入参。
+
+    checkpoint 的接口对齐 flashinfer 的 gdn_prefill：``checkpoint_every_n_tokens > 0``
+    （每 C 个 token 的最后一个位置存一份 state）时必须传入 ``state_checkpoints``（预分配的
+    输出 buffer，shape 为 ``(total_checkpoints, *tail_shape)``）和 ``checkpoint_cu_starts``
+    （每个 seq 的 checkpoint 个数，累加形式，int64 ``[bsz + 1]``）；算子把 state 按 seq 升序、
+    seq 内位置升序写进 buffer 的前若干行。不存 checkpoint 时三者都是空的。
+
+    算子的位置只能从本 chunk 的起点每 C 个 token 取一个（接口里没有 chunk 起点的对齐信息），
+    而 ``checkpoint_cu_starts`` 是调用方（kv cache，见
+    ``SingletonPagedKVCache.ckpt_cu_starts``）按 seq 绝对位置判定出来的个数，个数对不上就
+    说明两者认为的 checkpoint 位置不一致，写回去的 state 会错位，直接报错。
+    """
+    C = checkpoint_every_n_tokens
+    n_given = (state_checkpoints is not None) + (checkpoint_cu_starts is not None)
+    assert (C > 0 and n_given == 2) or (C == 0 and n_given == 0), (
+        f"{op_name}: state_checkpoints and checkpoint_cu_starts must both be given "
+        f"exactly when checkpoint_every_n_tokens > 0, got checkpoint_every_n_tokens={C}, "
+        f"state_checkpoints given={state_checkpoints is not None}, "
+        f"checkpoint_cu_starts given={checkpoint_cu_starts is not None}"
+    )
+    if C == 0:
+        return
+
+    bsz = len(seq_len_list)
+    assert (
+        checkpoint_cu_starts.dim() == 1 and checkpoint_cu_starts.numel() == bsz + 1
+    ), (
+        f"{op_name}: checkpoint_cu_starts should be 1D with one entry per seq plus the "
+        f"leading 0, expected {bsz + 1} entries, got "
+        f"{tuple(checkpoint_cu_starts.shape)}"
+    )
+    derived = [0]
+    for n in seq_len_list:
+        derived.append(derived[-1] + n // C)
+    want = torch.tensor(derived, dtype=torch.int64, device=checkpoint_cu_starts.device)
+    got = checkpoint_cu_starts.to(torch.int64)
+    assert torch.equal(got, want), (
+        f"{op_name}: checkpoint count mismatch with checkpoint_every_n_tokens={C}: the "
+        f"caller expects {got.tolist()} checkpoints, the kernel derives {want.tolist()} "
+        f"from seq lengths {list(seq_len_list)}; checkpoint positions would be misplaced"
+    )
+    assert tuple(state_checkpoints.shape) == (int(want[-1]), *tail_shape), (
+        f"{op_name}: state_checkpoints should have one row per checkpoint, i.e. shape "
+        f"{(int(want[-1]), *tail_shape)}, got {tuple(state_checkpoints.shape)}"
+    )

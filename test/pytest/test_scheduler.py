@@ -2,7 +2,7 @@ import time
 from omegaconf import OmegaConf
 
 from chitu.task import Task, TaskPool, TaskStatus, UserRequest
-from chitu.kv_cache import PagedKVCacheManager
+from chitu.kv_cache import PagedKVCacheManager, SingletonPagedKVCacheManager
 from chitu.scheduler import Scheduler, SkewScheduler
 from chitu.global_vars import set_global_args, set_slot_handle, get_global_args
 from chitu.backend import Backend
@@ -2370,3 +2370,151 @@ def test_scheduler_rejects_ttft_expired_prefill_candidates(monkeypatch):
             assert req.async_stream.error_message == "TTFT timeout"
     finally:
         TaskPool.reset()
+
+
+# linear prefix caching（checkpoint_interval=C）对 prefill chunk 起点的约束
+_LINEAR_C = 64
+_MAIN_BLOCK_SIZE = 128
+_CHUNK = 100  # prefill_chunk_size（故意不是 C 的倍数）
+_PROMPT = 256  # 4 * C
+
+
+def _build_linear_prefix_cache_scheduler():
+    """main + 带 checkpoint 的 linear manager 的调度器（C = _LINEAR_C）。"""
+    set_global_args(
+        OmegaConf.create(
+            {
+                "infer": {
+                    "max_seq_len": 2048,
+                    "op_impl": "torch",
+                    "cache_type": "paged",
+                    "schedule_overlap": True,
+                    "mtp_size": 1,
+                    "prefill_chunk_size": _CHUNK,
+                    "dp_size": 1,
+                    "enable_prefix_caching": True,
+                }
+            }
+        ),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    TaskPool.reset()
+    main = PagedKVCacheManager(
+        num_blocks=1000,
+        num_hot_req=100,
+        max_seq_len=2048,
+        dp_rank=0,
+        block_size=_MAIN_BLOCK_SIZE,
+        enable_prefix_caching=True,
+        manager_name="main",
+    )
+    linear = SingletonPagedKVCacheManager(
+        num_blocks=1000,
+        num_hot_req=100,
+        max_seq_len=2048,
+        dp_rank=0,
+        mtp_size=1,
+        enable_prefix_caching=True,
+        block_size=_LINEAR_C,
+        manager_name="linear",
+        checkpoint_interval=_LINEAR_C,
+    )
+    managers = {"main": main, "linear": linear}
+    Backend.cache_managers = [managers]
+    Backend.executor = MockExecutor()
+
+    scheduler = Scheduler(
+        max_running_tasks=100,
+        prefill_num_tasks=8,
+        decode_num_tasks=8,
+        scheduler_type="prefill_first",
+        cache_manager_dict=managers,
+        num_scheduler_groups=1,
+        prefill_chunk_size=_CHUNK,
+    )
+    # 只有这个分支（warmup / mtp>1 / PD-prefill-only）会为「全命中」的任务真跑一步
+    # prefill，从而走回退逻辑；warmup 是最好构造的一个
+    scheduler.is_warmup_stage = True
+    return scheduler
+
+
+def _add_mock_task(name, prompt_len):
+    req = UserRequest.create_mock(
+        input_len=prompt_len, request_id=name, enable_thinking=False
+    )
+    task = Task(name, req)
+    TaskPool.add(task)
+    return task
+
+
+def _step(scheduler, consume=True):
+    """跑一轮 schedule；consume 表示把这些任务当作已执行完本 chunk。"""
+    scheduler.prepare_for_schedule()
+    task_ids = scheduler.schedule()
+    if consume:
+        for tid in task_ids:
+            TaskPool.pool[tid].consume_req_tokens()
+        scheduler.update(task_ids)
+    return task_ids
+
+
+def test_linear_full_hit_rollback_keeps_prefill_chunk_on_grid():
+    """全命中任务回退出来的 chunk 不能比本轮剩下的 budget 还长。
+
+    开了 linear prefix caching（checkpoint_interval=C）时每个 prefill chunk 要么是 k·C，
+    要么是收尾的 < C 尾巴：算子把 state 写到哪一块 ckpt page 上是按「从 chunk 起点每 C 个
+    token 数一个」算的，而 cache 是按 seq 绝对位置判定的，只有起点落在 C 网格上两者才对得
+    上（否则 SingletonPagedKVCache._upd_ckpt_write_pages 直接 assert）。
+
+    全命中的任务为了真跑一步 prefill 会退回上一个 checkpoint，把不足 C 的尾巴重算一遍。
+    这条尾巴可能比本轮剩下的 budget 还长：这里 filler 先吃掉本轮 budget，只剩 _CHUNK - C
+    = 36 < C，而回退尾巴是 C = 64。照旧往下走只会执行一个「起点在网格上、长度却不是 C 的
+    整数倍、也不是收尾尾巴」的 chunk，于是下一次 chunk 的起点就落到网格外了。
+    """
+    scheduler = _build_linear_prefix_cache_scheduler()
+
+    # 先把 prompt 算完并发布，让后面同 prompt 的任务能全命中
+    task_a = _add_mock_task("A", _PROMPT)
+    for _ in range(10):
+        _step(scheduler)
+        if task_a.task_type == TaskType.Decode:
+            break
+    assert task_a.consumed_req_tokens == _PROMPT
+
+    # filler 先占满本轮 chunk budget，再插入与 A 同 prompt、必然全命中的 B
+    filler = _add_mock_task("F", _CHUNK)
+    task_b = _add_mock_task("B", _PROMPT)
+    assert scheduler._num_prefill_cached_tokens(task_b) == _PROMPT
+
+    scheduled = _step(scheduler)
+    assert filler.task_id in scheduled
+    # 回退尾巴（64）放不进本轮剩下的 budget（36），这一步就不该调度 B
+    assert task_b.task_id not in scheduled
+    assert task_b.consumed_req_tokens == 0
+    assert filler.consumed_req_tokens % _LINEAR_C == 0
+
+    # 下一轮 budget 重新给满，B 拿到正好一个 C 的 chunk，起点仍在网格上
+    scheduled = _step(scheduler)
+    assert task_b.task_id in scheduled
+    assert task_b.consumed_req_tokens == _PROMPT
+    assert task_b.consumed_req_tokens % _LINEAR_C == 0
+
+
+def test_linear_prefill_chunks_always_land_on_checkpoint_grid():
+    """一轮一轮跑下来，每个任务的 prefill 消费量都必须落在 C 的网格上。"""
+    scheduler = _build_linear_prefix_cache_scheduler()
+
+    tasks = [_add_mock_task(f"req_{i}", _PROMPT) for i in range(3)]
+    for _step_index in range(12):
+        scheduled = _step(scheduler)
+        for task in tasks:
+            assert task.consumed_req_tokens % _LINEAR_C == 0, (
+                f"{task.task_id}: consumed={task.consumed_req_tokens} "
+                f"is not a multiple of C={_LINEAR_C}"
+            )
+        if not scheduled:
+            break
+
+    for task in tasks:
+        assert task.consumed_req_tokens == _PROMPT

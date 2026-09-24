@@ -7,7 +7,7 @@ from typing import Optional
 import numpy as np
 
 from chitu.backend import Backend
-from chitu.kv_cache.kv_cache import PagedKVCache
+from chitu.kv_cache.kv_cache import PagedKVCache, SingletonPagedKVCache
 from chitu.serve.crash import report_and_exit
 from chitu.testing.exception import (
     test_inject_exception_mark_prefill_failed,
@@ -132,7 +132,8 @@ class KVManagerDecode(KVManagerBase):
 
         Truncates decode-side hit blocks from the front. The full block list is
         still kept so the request block table can point at both hit and
-        transferred blocks.
+        transferred blocks. Singleton caches (linear attn / MTP state) have no
+        hit blocks, so all of their pre-allocated blocks (all inplace_blocks) are transferred.
         """
         info = self._info(req_id)
         recv_buffers = TransferBuffers()
@@ -141,15 +142,28 @@ class KVManagerDecode(KVManagerBase):
             assert isinstance(cache, PagedKVCache)
             new_block_ids = info.cache_manager_new_block_ids[cache.manager_name]
 
-            need = ceil_div(info.prefix_len, cache.block_size)
-            full_block_ids = new_block_ids[:need]
-            skip = min(
-                max(
-                    0,
-                    info.cache_manager_hit_block_counts.get(cache.manager_name, 0),
-                ),
-                len(full_block_ids),
-            )
+            if isinstance(cache, SingletonPagedKVCache):
+                # linear attn / MTP state: 本实例不做 linear 的 prefix caching，prealloc 时
+                # 为请求分配的正好是 mtp_size 个 in-place block，prefill 传来的也就是这
+                # 几个（没有 ckpt block 要留给自己，也没有命中的共享块要跳过，见
+                # SingletonPagedKVCache.insert_kv_cache_from_transfer）
+                assert len(new_block_ids) == cache.mtp_size, (
+                    f"{req_id}: {cache.manager_name} cache allocated "
+                    f"{len(new_block_ids)} blocks for the request, expect "
+                    f"mtp_size={cache.mtp_size}"
+                )
+                full_block_ids = list(new_block_ids)
+                skip = 0
+            else:
+                need = ceil_div(info.prefix_len, cache.block_size)
+                full_block_ids = new_block_ids[:need]
+                skip = min(
+                    max(
+                        0,
+                        info.cache_manager_hit_block_counts.get(cache.manager_name, 0),
+                    ),
+                    len(full_block_ids),
+                )
             transfer_block_ids = full_block_ids[skip:]
             ids = np.array(transfer_block_ids, dtype=np.int32)
             info.cache_new_block_ids[cache_name] = full_block_ids

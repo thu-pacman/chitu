@@ -9,6 +9,7 @@ name: GLM-5.3-Flash
 type: glm-5-next
 source: "https://huggingface.co/zai-org/GLM-5.3-Flash"
 tokenizer_type: "hf"
+processor_path: null
 
 
 quant_config:
@@ -45,6 +46,10 @@ kv_lora_rank: "$(config.json:text_config.kv_lora_rank)"
 qk_nope_head_dim: "$(config.json:text_config.qk_nope_head_dim)"
 qk_rope_head_dim: "$(config.json:text_config.qk_rope_head_dim)"
 v_head_dim: "$(config.json:text_config.v_head_dim)"
+# GLM-5.3-Flash has no text RoPE: config.json has `qk_rope_head_dim: 0` and
+# `rope_parameters: null`. These two are placeholders that `precompute_freqs_cis`
+# still reads (dropping them raises AttributeError), but their values are unused,
+# so they must NOT be bound to `rope_parameters.rope_theta` like GLM-5/5.2.
 rope_theta: 10000
 rope_factor: 1
 index_head_dim: "$(config.json:text_config.index_head_dim)"
@@ -71,6 +76,31 @@ rms_norm_dtype: float32
 rms_norm_eps: "$(config.json:text_config.rms_norm_eps)"
 mtp_tie_word_embeddings: True
 mtp_tie_lm_head: True
+
+vision_config:
+  # NOTE: `$(config.json:...)` only resolves for top-level `models` fields; nested
+  # blocks like this one are passed through untouched by ModelConfigResolver, so the
+  # values are written out literally here (they match config.json:vision_config).
+  attention_bias: True
+  depth: 24
+  hidden_size: 1024
+  in_channels: 3
+  intermediate_size: 4096
+  num_heads: 16
+  out_hidden_size: 4096
+  patch_size: 14
+  projection_intermediate_size: 10240
+  rms_norm_eps: 1.0e-5
+  spatial_merge_size: 2
+  swiglu_limit: 10.0
+  temporal_patch_size: 2
+  image_token_id: 154854
+  video_token_id: 154855
+  image_start_token_id: 154830
+  image_end_token_id: 154831
+  video_start_token_id: 154832
+  video_end_token_id: 154833
+  max_vision_tokens: 16384
 eos_token_id: "$(config.json:text_config.eos_token_id)"
 tool_parser: GLM47ToolParser
 reasoning_type: switchable

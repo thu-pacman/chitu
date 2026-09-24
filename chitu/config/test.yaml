@@ -7,6 +7,10 @@ pd_test:
   req_num: 8
   req_timeout: 300
   output_len: 128
+  # Long prompt per request (a phone book), with the answer checked at the end.
+  # See chitu/testing/phonebook.py.
+  phonebook: false
+  phonebook_num_entries: 500
 
 # E2E exception injection (feat-req-error). Set to an injection name
 # (e.g. request_build_failure, delayed_crash) to activate. Empty = off.
