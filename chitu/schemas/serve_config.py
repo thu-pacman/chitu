@@ -62,7 +62,7 @@ class InferConfig(InferConfigLegacy):
     max_seq_len: int = MISSING
     cache_type: str = MISSING
     indexer_type: str = MISSING
-    indexer_logits_chunk_bytes: Optional[int] = MISSING
+    indexer_logits_chunk_bytes: Optional[int | str] = MISSING
     attn_type: str = MISSING
     op_impl: str = MISSING
     mla_absorb: Optional[str] = MISSING

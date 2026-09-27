@@ -91,6 +91,7 @@ from chitu.kv_cache.utils import (
     allreduce_min_int,
     clamp_int,
 )
+from chitu.dsa_indexer_backend import DSAIndexer
 
 try_import_and_setup_torch_npu()
 
@@ -1239,6 +1240,8 @@ def warmup_engine(args):
 
     #######################################################################################
     # Warmup with maximal possible prefill chunk or batch, to estimate GPU memory usage
+    DSAIndexer.start_auto_deciding_chunk_size()
+
     if is_classic_pd_disagg():
         runner = "direct"
     elif is_independent_multi_inst():
@@ -1270,6 +1273,8 @@ def warmup_engine(args):
         )
     else:
         assert False
+
+    DSAIndexer.stop_auto_deciding_chunk_size()
 
     #######################################################################################
     # Reallocate KV cache with respect to the estimated GPU memory usage

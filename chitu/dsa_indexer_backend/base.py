@@ -11,6 +11,7 @@ import torch
 from chitu.batched_seq_len import BatchedSeqLenDelta, BatchedSeqLenDeltaView
 from chitu.ops.topk import topk_indices, topk_page_table_decode_cuda
 from chitu.utils import get_global_args, max_alloc_seq_len
+from chitu.kv_cache.utils import allreduce_min_int
 
 logger = getLogger(__name__)
 
@@ -19,6 +20,49 @@ class DSAIndexer:
     """Keep DSAIndexer(impl) compatible while constructing a concrete backend."""
 
     impl: str  # set by the concrete backend classes
+
+    _auto_deciding_chunk_size = False
+    _chunk_size_candidate = 0
+    _indexer_logits_chunk_bytes: Optional[int] = None
+
+    @staticmethod
+    def start_auto_deciding_chunk_size():
+        args = get_global_args()
+        if getattr(args.infer, "indexer_logits_chunk_bytes", None) == "auto":
+            logger.debug("Start auto deciding indexer_logits_chunk_bytes")
+            DSAIndexer._auto_deciding_chunk_size = True
+
+    @staticmethod
+    def stop_auto_deciding_chunk_size():
+        args = get_global_args()
+        if getattr(args.infer, "indexer_logits_chunk_bytes", None) == "auto":
+            DSAIndexer._auto_deciding_chunk_size = False
+            DSAIndexer._indexer_logits_chunk_bytes = allreduce_min_int(
+                DSAIndexer._chunk_size_candidate
+            )
+            logger.debug(
+                f"decided indexer_logits_chunk_bytes to {DSAIndexer._indexer_logits_chunk_bytes}"
+            )
+        if DSAIndexer._indexer_logits_chunk_bytes is None:
+            logger.warning(
+                "infer.indexer_logits_chunk_bytes is disabled. May take more "
+                "activation memory for long sequences."
+            )
+
+    @staticmethod
+    def update_chunk_size_candidate():
+        # auto decision durning engine warmup: use as much memory as possible
+        # as long as it does not exceed the peak in the history (usually happens
+        # for the intermediate tensor in FFN). This value will be stable after
+        # running for multiple layers, even if we only warmup for 1 step.
+        if not DSAIndexer._auto_deciding_chunk_size:
+            return
+        memory_stats = torch.cuda.memory_stats(torch.cuda.current_device())
+        avail = (
+            memory_stats["allocated_bytes.all.peak"]
+            - memory_stats["allocated_bytes.all.current"]
+        )
+        DSAIndexer._chunk_size_candidate = max(DSAIndexer._chunk_size_candidate, avail)
 
     def __new__(cls, impl="auto"):
         if cls is DSAIndexer:
@@ -38,9 +82,8 @@ class DSAIndexer:
         # 可被寻址的最大长度（含 MTP draft / ghost token，见 chitu/utils.max_alloc_seq_len）
         self.static_max_n = max_alloc_seq_len(args.infer.max_seq_len)
         self.index_topk = args.models.get("index_topk", 2048) or 2048
-        self._indexer_logits_chunk_bytes = getattr(
-            args.infer, "indexer_logits_chunk_bytes", None
-        )
+        if (val := getattr(args.infer, "indexer_logits_chunk_bytes", None)) is int:
+            DSAIndexer._indexer_logits_chunk_bytes = val
         self.mtp_size = getattr(args.infer, "mtp_size", 1)
         self._init_backend(args)
         logger.info(f"Indexer Backend is initialized with impl={self.impl}")
@@ -59,18 +102,18 @@ class DSAIndexer:
         Encapsulates the whole chunking decision so the caller only iterates:
         - decode is never chunked (slicing the delta breaks the captured CUDA
           graph), so return None;
-        - backends whose score op is not query-sliceable (triton / torch build a
-          dense ``[b, static_max_n, ...]`` buffer internally regardless of the
-          q-slice) can't be capped by chunking, so return None;
         - otherwise size the chunk to ``indexer_logits_chunk_bytes`` using this
           backend's ``row_width`` (fp32 columns). None budget disables chunking.
         """
         if seq_len_delta.is_decode_stage:
             return None
+        DSAIndexer.update_chunk_size_candidate()
         if self._indexer_logits_chunk_bytes is None:
             return None
-        row_bytes = max(1, int(self.row_width(seq_len_delta))) * 4
-        return max(1, int(self._indexer_logits_chunk_bytes) // row_bytes)
+        else:
+            assert isinstance(self._indexer_logits_chunk_bytes, int)
+            row_bytes = max(1, int(self.row_width(seq_len_delta))) * 4
+            return max(1, int(self._indexer_logits_chunk_bytes) // row_bytes)
 
     def reserve_metadata_for_decode(self, seq_len_delta, phases_after: int = 0):
         """Reserve one decode step's indexer state, from the step's lengths.

@@ -316,6 +316,10 @@ class Indexer(torch.nn.Module):
             k_append=k_append,
         )
 
+        # Get chunk_size before the fast exit below, so as to trigger auto chunk
+        # size decision during engine warmup.
+        chunk_size = self.indexer_impl.chunk_size(seq_len_delta)
+
         # Prefill fast path: when the whole sequence fits within index_topk,
         # every valid key is selected, so skip scoring and emit arange indices.
         if (
@@ -330,7 +334,6 @@ class Indexer(torch.nn.Module):
         # Decide chunking. The indexer owns the whole decision (decode never
         # chunks; budget vs row_width),
         # so we just ask it for a chunk size and iterate.
-        chunk_size = self.indexer_impl.chunk_size(seq_len_delta)
         if chunk_size is None:
             chunk_size = s_q
 
