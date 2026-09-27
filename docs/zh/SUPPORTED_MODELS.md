@@ -41,13 +41,16 @@
 | GLM-5.1 | ✓ | `models=GLM-5.1` | https://huggingface.co/zai-org/GLM-5.1 |
 | GLM-5.1-Channel-INT4-w4a8 | ✓ | `models=GLM-5.1-Channel-INT4-w4a8` | https://modelscope.cn/models/hygon/GLM-5.1-Channel-INT4-w4a8 |
 | GLM-5.1-FP8 | ✓ | `models=GLM-5.1-FP8` | https://huggingface.co/zai-org/GLM-5.1-FP8 |
+| GLM-5.1-FP8-kv | ✓ | `models=GLM-5.1-FP8-kv` | https://huggingface.co/zai-org/GLM-5.1-FP8 |
 | GLM-5.1-W8A8 | ✓ | `models=GLM-5.1-W8A8` | https://modelscope.cn/models/metax-tech/GLM-5.1-W8A8 |
 | GLM-5.2 | ✓ | `models=GLM-5.2` | https://huggingface.co/zai-org/GLM-5.2 |
 | GLM-5.2-FP8 | ✓ | `models=GLM-5.2-FP8` | https://huggingface.co/zai-org/GLM-5.2-FP8 |
+| GLM-5.2-FP8-kv | ✓ | `models=GLM-5.2-FP8-kv` | https://huggingface.co/zai-org/GLM-5.2-FP8 |
 | GLM-5.2-W8A8 | ✓ | `models=GLM-5.2-W8A8` | https://modelscope.cn/models/metax-tech/GLM-5.2-W8A8 |
 | GLM-5.2-W8A8-FP8-kv | ✓ | `models=GLM-5.2-W8A8-FP8-kv` | https://modelscope.cn/models/metax-tech/GLM-5.2-W8A8 |
 | GLM-5.3 | ✓ | `models=GLM-5.3` | https://huggingface.co/zai-org/GLM-5.3 |
 | GLM-5.3-BF16 | ✓ | `models=GLM-5.3-BF16` | https://huggingface.co/zai-org/GLM-5.3-BF16 |
+| GLM-5.3-FP8-kv | ✓ | `models=GLM-5.3-FP8-kv` | https://huggingface.co/zai-org/GLM-5.3 |
 | GLM-5.3-Flash | ✓ | `models=GLM-5.3-Flash` | https://huggingface.co/zai-org/GLM-5.3-Flash |
 | GLM-5.3-W8A8 | ✓ | `models=GLM-5.3-W8A8` | https://modelscope.cn/models/metax-tech/GLM-5.3-W8A8 |
 | glm-z1-32b |  | `models=GLM-Z1-32B-0414` | https://modelscope.cn/models/ZhipuAI/GLM-Z1-32B-0414/ |
