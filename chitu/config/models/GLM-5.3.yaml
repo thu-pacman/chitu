@@ -2,9 +2,10 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# GLM-5.3 shares the same model architecture as GLM-5.2
+# GLM-5.3 is a quantization of GLM-5.3-BF16
 defaults:
-  - GLM-5.2
+  - GLM-5.3-BF16
+  - quant_config: blockfp8
   - _self_ # Config in this file overrides configs in defaults
 
 name: GLM-5.3
