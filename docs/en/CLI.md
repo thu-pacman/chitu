@@ -1205,7 +1205,7 @@ such as the per-rank model-load progress bars.
 - "auto": print only when stdout and stderr are attached to a terminal.
   When output is redirected to a file or piped (e.g. `2>&1 | tee`), pretty
   output is suppressed to keep logs small.
-- "true": always print pretty output, even when output is redirected.
-- "false": never print pretty output.
+- True: always print pretty output, even when output is redirected.
+- False: never print pretty output.
 
 *Default: `auto`.*

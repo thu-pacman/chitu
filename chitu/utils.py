@@ -113,20 +113,23 @@ def get_chitu_bool_env(
 def should_pretty_log(args=None) -> bool:
     """Whether pretty (interactive) terminal output should be printed.
 
-    Follows the `pretty_log` serve config:
-      - "auto": only when stdout and stderr are attached to a terminal.
-      - "true": always, even when redirected (e.g. `2>&1 | tee`).
-      - "false": never.
+    Follows the `pretty_log` serve config if defined. See
+    `chitu/config/serve_config.yaml`.
+
     When `args` is omitted or does not define `pretty_log` (e.g. global args
-    are not initialized yet during logging setup), fall back to terminal
-    detection.
+    are not initialized yet during logging setup), fall back to "auto"
     """
-    pretty_log = str(getattr(args, "pretty_log", "auto")).lower() if args else "auto"
-    if pretty_log in ("true", "1"):
+    pretty_log = getattr(args, "pretty_log", "auto") if args else "auto"
+    if pretty_log is True:
         return True
-    if pretty_log in ("false", "0"):
+    elif pretty_log is False:
         return False
-    return sys.stdout.isatty() and sys.stderr.isatty()
+    elif pretty_log == "auto":
+        return sys.stdout.isatty() and sys.stderr.isatty()
+    else:
+        raise ValueError(
+            f'Unrecognized value for `pretty_log`: {pretty_log}. Expecting "auto", True, or False.'
+        )
 
 
 _regex_special_chars = set(".^$*+?{}[]|()")
