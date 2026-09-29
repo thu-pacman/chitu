@@ -73,7 +73,7 @@ class TaskInfo:
     prefill_generation: int = 0
 
     cache_new_block_ids: dict[str, list[int]] = field(default_factory=dict)
-    """cache name -> full prefix block ids to install in the decode block table."""
+    """cache name -> all allocated block ids, including MTP lookahead pages."""
 
     cache_transfer_block_ids: dict[str, list[int]] = field(default_factory=dict)
     """cache name -> block ids that are written by this RDMA transfer."""

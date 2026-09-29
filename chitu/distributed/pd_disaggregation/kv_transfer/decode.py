@@ -130,10 +130,11 @@ class KVManagerDecode(KVManagerBase):
     def get_recv_buffers(self, req_id: str) -> TransferBuffers:
         """Collect block IDs for all caches on the recv (decode) side.
 
-        Truncates decode-side hit blocks from the front. The full block list is
-        still kept so the request block table can point at both hit and
-        transferred blocks. Singleton caches (linear attn / MTP state) have no
-        hit blocks, so all of their pre-allocated blocks (all inplace_blocks) are transferred.
+        Keep all allocated block IDs for installation in the worker block table,
+        including reserved MTP lookahead pages. For token-mapped caches, transfer
+        only prompt pages after skipping decode-side prefix-cache hits.
+        Singleton caches (linear attn / MTP state) have no hit blocks, so all
+        their pre-allocated in-place blocks are transferred.
         """
         info = self._info(req_id)
         recv_buffers = TransferBuffers()
@@ -166,7 +167,9 @@ class KVManagerDecode(KVManagerBase):
                 )
             transfer_block_ids = full_block_ids[skip:]
             ids = np.array(transfer_block_ids, dtype=np.int32)
-            info.cache_new_block_ids[cache_name] = full_block_ids
+            # Already allocated lookahead pages will not be sent again by the
+            # scheduler. Install them even though they need no RDMA transfer.
+            info.cache_new_block_ids[cache_name] = list(new_block_ids)
             info.cache_transfer_block_ids[cache_name] = transfer_block_ids
 
             for key in cache.paged_kv_cache:
