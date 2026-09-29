@@ -2,17 +2,39 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
+import chitu.serve.anthropic_api as anthropic_api
 import chitu.serve.api_server as api_server
 import chitu.serve.api_app as api_app
 import chitu.serve.common as serve_common
 import chitu.serve.middleware as serve_middleware
 import chitu.serve.openai_api as openai_api
+import chitu.serve.responses_api as responses_api
 import chitu.task as task
 import chitu.tool_call.utils as tool_call_utils
 
 
 class DummyFormatter:
     def encode_dialog_prompt(self, messages, chat_template_kwargs):
+        return [1, 2, 3, 4, 5]
+
+
+class _DummyInnerTokenizer:
+    """Stands in for the HF tokenizer behind Backend.tokenizer.model.
+
+    The legacy /v1/complete path tokenizes through ``tokenizer.model.encode``
+    rather than ``tokenizer.encode``.
+    """
+
+    def encode(self, s, add_special_tokens=False):
+        return [1, 2, 3, 4, 5]
+
+
+class DummyTokenizer:
+    model = _DummyInnerTokenizer()
+
+    def encode(self, s, *, bos, eos, **kwargs):
+        # Always 5 tokens, matching DummyFormatter, so both endpoint families
+        # trip the same max_seq_len=4 limit.
         return [1, 2, 3, 4, 5]
 
 
@@ -28,8 +50,11 @@ def create_client(monkeypatch):
         serve=SimpleNamespace(api_keys=[], validate_api_key=False),
     )
     monkeypatch.setattr(api_server.Backend, "formatter", DummyFormatter())
+    monkeypatch.setattr(api_server.Backend, "tokenizer", DummyTokenizer())
     monkeypatch.setattr(task, "get_global_args", lambda: args)
     monkeypatch.setattr(openai_api, "get_global_args", lambda: args)
+    monkeypatch.setattr(anthropic_api, "get_global_args", lambda: args)
+    monkeypatch.setattr(responses_api, "get_global_args", lambda: args)
     monkeypatch.setattr(serve_common, "get_global_args", lambda: args)
     monkeypatch.setattr(serve_middleware, "get_global_args", lambda: args)
     monkeypatch.setattr(api_app, "get_server_status", lambda: True)
@@ -46,6 +71,16 @@ def create_client(monkeypatch):
     )
     monkeypatch.setattr(
         openai_api,
+        "submit_request",
+        unexpected_submit_request,
+    )
+    monkeypatch.setattr(
+        anthropic_api,
+        "submit_request",
+        unexpected_submit_request,
+    )
+    monkeypatch.setattr(
+        responses_api,
         "submit_request",
         unexpected_submit_request,
     )
@@ -127,3 +162,73 @@ def test_rejected_completion_does_not_change_min_batch_size(monkeypatch):
 
     assert response.status_code == 400
     assert serve_common.min_batch_size == 1
+
+
+def test_oversized_messages_prompt_returns_bad_request(monkeypatch):
+    """Anthropic /v1/messages keeps its own error envelope."""
+    client = create_client(monkeypatch)
+
+    response = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "too long"}],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "prompt length(5) cannot be greater than max_seq_len(4)",
+        },
+    }
+
+
+def test_oversized_responses_prompt_returns_bad_request(monkeypatch):
+    """Responses /v1/responses keeps its own error envelope."""
+    client = create_client(monkeypatch)
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "max_output_tokens": 1,
+            "input": [{"role": "user", "content": "too long"}],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": {
+            "message": "prompt length(5) cannot be greater than max_seq_len(4)",
+            "type": "invalid_request_error",
+            "param": None,
+            "code": None,
+        },
+    }
+
+
+def test_oversized_complete_prompt_returns_bad_request(monkeypatch):
+    """The legacy Anthropic /v1/complete path is a 400 too, not a 500."""
+    client = create_client(monkeypatch)
+
+    response = client.post(
+        "/v1/complete",
+        json={
+            "model": "test-model",
+            "prompt": "too long",
+            "max_tokens_to_sample": 1,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": "prompt length(5) cannot be greater than max_seq_len(4)",
+        },
+    }
