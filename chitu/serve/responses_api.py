@@ -27,7 +27,7 @@ DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
 
 if not DOC_GENERATION:
     from chitu.global_vars import get_global_args
-    from chitu.task import UserRequest, RequestParams
+    from chitu.task import UserRequest, RequestParams, PromptTooLongError
     from chitu.tool_call import get_tool_parser_cls, parse_stream_by_parser
     from chitu.serve.anthropic_api import resolve_requested_model_or_error
     from chitu.serve.common import (
@@ -1185,7 +1185,10 @@ async def handle_responses_request(
         stop_with_eos=True,
         ttft_timeout_s=request.ttft_timeout_s,
     )
-    user_req = UserRequest.from_request_params(req_params)
+    try:
+        user_req = UserRequest.from_request_params(req_params)
+    except PromptTooLongError as e:
+        return responses_error(400, "invalid_request_error", str(e))
     await submit_request(user_req)
 
     if request.stream:
