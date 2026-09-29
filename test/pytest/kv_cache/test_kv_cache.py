@@ -6,7 +6,7 @@ from chitu.kv_cache import (
     PagedKVCache,
     SingletonPagedKVCache,
 )
-from chitu.global_vars import set_global_args
+from chitu.global_vars import get_global_args, set_global_args
 from chitu.ops.kv_cache import append_to_sliding_window_paged_kv_cache
 from omegaconf import OmegaConf
 from chitu.task import PackedTasksBase
@@ -363,6 +363,43 @@ def _build_singleton_cache(
 
 class TestSingletonPagedKVCacheLifecycle:
     """In-place / ckpt block lifetime of the recurrent-state cache."""
+
+    @pytest.mark.parametrize("checkpoint_interval", [None, 64])
+    @pytest.mark.parametrize("finalize_previous", [False, True])
+    def test_mtp_accept_refreshes_incoming_pp_batch(
+        self, checkpoint_interval, finalize_previous
+    ):
+        get_global_args().infer.mtp_size = 3
+        cache = _build_singleton_cache(checkpoint_interval=checkpoint_interval)
+        cache.inplace_block_ids.update(
+            {"previous": [0, 1, 2], "a": [3, 4, 5], "b": [6, 7, 8]}
+        )
+        cache.tid_to_cached_len.update({"previous": 66, "a": 66, "b": 66})
+        cache.ckpt_block_ids.update({"previous": [9], "a": [10], "b": [11]})
+        cache.curr_tids = ["previous"]
+        cache._upd_read_page_ids(["previous"], [66])
+        if finalize_previous:
+            cache.finalize_cache_all_decode(
+                PackedTasksBase(
+                    num_tasks=1, task_ids=["previous"], task_type=TaskType.Special
+                )
+            )
+
+        tasks = PackedTasksBase(
+            num_tasks=2, task_ids=["b", "a"], task_type=TaskType.Decode
+        )
+        cache.update_mtp_cache_accept(tasks, [0, 2])
+
+        assert cache.tid_to_cached_len["b"] == 64
+        assert cache.tid_to_cached_len["a"] == 66
+        # b accepts the token at position 63 (a checkpoint boundary); a accepts
+        # position 65 from its third in-place page. Preserve incoming batch order.
+        assert cache._read_page_ids.get().tolist() == [
+            11 if checkpoint_interval is not None else 6,
+            5,
+        ]
+        assert cache.tid_to_accept_index["b"] == 0
+        assert cache.tid_to_accept_index["a"] == 2
 
     def test_pd_transfer_finalize_releases_inplace_blocks(self):
         """PD 传输路径（只写 inplace_block_ids、从不建 ckpt_block_ids）也不能漏删。"""
