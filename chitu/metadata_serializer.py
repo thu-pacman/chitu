@@ -334,9 +334,13 @@ class MetadataSerializer:
                     if config.include_tokens:
                         task_data["tokens"] = list(task.prefix_tokens)
                         task_data["standard_tokens"] = task._test_standard_tokens
-                        task_data["tool_call_params"] = ToolCallParams.to_dict(
-                            task.grammar_params
-                        )
+                    # 工具调用约束参数：新任务必须携带，且不能放进 include_tokens
+                    # 里 —— 全前缀命中转 Decode（for_pp_bootstrap_decode）等配置
+                    # 不带 tokens，接收侧 _create_task_from_data 建出的
+                    # task.grammar_params 就是 None，文法约束会被静默丢弃。
+                    task_data["tool_call_params"] = ToolCallParams.to_dict(
+                        task.grammar_params
+                    )
                     # 只对新任务传输 sample_params
                     if config.include_sample_params:
                         task_data["sample_params"] = {

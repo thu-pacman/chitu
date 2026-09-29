@@ -342,6 +342,58 @@ class TestMTP3Grammar:
         assert torch.isfinite(logits_flat[0, 42]).item(), "token 42 should be finite"
         assert not torch.isfinite(logits_flat[0, 0]).item(), "token 0 should be -inf"
 
+    def test_unfilled_draft_tree_rows_are_not_applied(self, sampler, global_args):
+        """Only the rows traverse_draft_tree actually filled may be applied.
+
+        A draft token the grammar rejects is written as an all-zero row and
+        every row below it keeps allocate_token_bitmask()'s allow-all
+        initialiser. Applying those rows would sample those depths with no
+        grammar constraint at all (allow-all) or from an all -inf row (token 0
+        on the greedy path, NaN on the mixed one).
+        """
+        sampler.mtp_size = 3
+        from xgrammar import Grammar, GrammarCompiler, TokenizerInfo, StructuralTag
+        from xgrammar.structural_tag import ConstStringFormat
+
+        V = global_args.models.vocab_size
+        tok_info = TokenizerInfo([str(i) for i in range(V)], stop_token_ids=V - 1)
+        compiler = GrammarCompiler(tok_info)
+        grammar = compiler.compile_grammar(
+            Grammar.from_structural_tag(
+                StructuralTag(format=ConstStringFormat(value="42"))
+            )
+        )
+        task = _make_task(
+            _make_sample_params(temperature=0, top_k=1, top_p=1.0),
+            grammar=grammar,
+        )
+        state = TaskSampleState.from_task(task)
+        state.token_blocks = [torch.zeros(TOKEN_BLOCK_SIZE, dtype=torch.int64)]
+
+        # draft [4, 60]: "4" is accepted, "60" is rejected -> rows 0/1 carry a
+        # real mask, row 2 (below the rejected node) is left allow-all
+        logits_flat = torch.full((3, V), 10.0, dtype=torch.float32)
+        sampler._apply_grammar_bitmask(logits_flat, [state], 3, [[4, 60]])
+        assert not torch.isfinite(logits_flat[0, 0]).item(), "row 0 must be masked"
+        assert torch.isfinite(logits_flat[0, 4]).item(), "row 0 allows '4'"
+        assert not torch.isfinite(logits_flat[1, 0]).item(), "row 1 must be masked"
+        assert torch.isfinite(logits_flat[1, 2]).item(), "row 1 allows '2'"
+        assert torch.isfinite(
+            logits_flat[2]
+        ).all(), "row 2 was never filled by traverse_draft_tree and must not be applied"
+
+        # draft [60, 4]: the first draft node is rejected -> only row 0 is filled
+        logits_flat = torch.full((3, V), 10.0, dtype=torch.float32)
+        sampler._apply_grammar_bitmask(logits_flat, [state], 3, [[60, 4]])
+        assert not torch.isfinite(logits_flat[0, 0]).item(), "row 0 must be masked"
+        assert torch.isfinite(logits_flat[0, 4]).item(), "row 0 allows '4'"
+        assert torch.isfinite(
+            logits_flat[1]
+        ).all(), "row 1 is the rejected node's empty row and must not be applied"
+        assert torch.isfinite(
+            logits_flat[2]
+        ).all(), "row 2 was never filled by traverse_draft_tree and must not be applied"
+
 
 # ========================================================
 #  update_results
@@ -395,6 +447,76 @@ class TestTaskSampleState:
         assert state.enable_frequency_penalty
         assert state.output_len == 3
         assert len(state.token_blocks) == 1
+
+    def test_from_task_replays_output_tokens_without_prompt(self, sampler, global_args):
+        """A metadata-rebuilt Decode task carries no prompt tokens.
+
+        Every Decode metadata config ships include_tokens=False, so on the
+        rank that samples such a task prefix_tokens holds only the output
+        generated so far (see the first-token update_response_sync in
+        PDScheduler). Slicing at prompt_len drops them and leaves the
+        matcher at the grammar initial state -- i.e. no constraint at all.
+        """
+        from xgrammar import Grammar, GrammarCompiler, TokenizerInfo, StructuralTag
+        from xgrammar.structural_tag import ConstStringFormat
+
+        sampler.mtp_size = 1
+        V = global_args.models.vocab_size
+        tok_info = TokenizerInfo([str(i) for i in range(V)], stop_token_ids=V - 1)
+        grammar = GrammarCompiler(tok_info).compile_grammar(
+            Grammar.from_structural_tag(
+                StructuralTag(format=ConstStringFormat(value="42"))
+            )
+        )
+
+        task = _make_task(
+            _make_sample_params(temperature=0, top_k=1, top_p=1.0),
+            grammar=grammar,
+            prompt_len=128,
+        )
+        task.prefix_tokens = [4]  # "4" already sampled; prompt never shipped
+
+        state = TaskSampleState.from_task(task)
+        assert state.output_len == 1, "the output tokens must be replayed"
+
+        logits = torch.full((1, V), 10.0, dtype=torch.float32)
+        logits[0, 4] = 100.0  # unconstrained argmax, legal only at the start
+        result = sampler.sample(logits, _make_packed_tasks([task]))
+        assert result.tokens[0, 0].item() == 2, (
+            "after '4' the grammar only allows '2'; picking 4 means the "
+            "matcher was left at the initial state"
+        )
+
+    def test_from_task_does_not_replay_prompt_tokens(self, sampler, global_args):
+        """When the prompt is present, only the part after prompt_len replays."""
+        from xgrammar import Grammar, GrammarCompiler, TokenizerInfo, StructuralTag
+        from xgrammar.structural_tag import ConstStringFormat
+
+        sampler.mtp_size = 1
+        V = global_args.models.vocab_size
+        tok_info = TokenizerInfo([str(i) for i in range(V)], stop_token_ids=V - 1)
+        grammar = GrammarCompiler(tok_info).compile_grammar(
+            Grammar.from_structural_tag(
+                StructuralTag(format=ConstStringFormat(value="42"))
+            )
+        )
+
+        task = _make_task(
+            _make_sample_params(temperature=0, top_k=1, top_p=1.0),
+            grammar=grammar,
+            prompt_len=128,
+        )
+        task.prefix_tokens = [4] * 128  # prompt only, nothing generated yet
+
+        state = TaskSampleState.from_task(task)
+        assert state.output_len == 0
+
+        logits = torch.full((1, V), 10.0, dtype=torch.float32)
+        logits[0, 2] = 100.0
+        result = sampler.sample(logits, _make_packed_tasks([task]))
+        assert (
+            result.tokens[0, 0].item() == 4
+        ), "prompt tokens must never be replayed into the matcher"
 
     def test_append_tokens_extends_blocks(self):
         task = _make_task(_make_sample_params())
