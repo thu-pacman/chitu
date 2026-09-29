@@ -21,11 +21,15 @@ class DummyFormatter:
 class _DummyInnerTokenizer:
     """Stands in for the HF tokenizer behind Backend.tokenizer.model.
 
-    The legacy /v1/complete path tokenizes through ``tokenizer.model.encode``
-    rather than ``tokenizer.encode``.
+    build_fim_prompt() reaches for convert_tokens_to_ids on this object, so
+    the attribute has to exist. Tokenization itself must NOT go through here;
+    see test_complete_uses_tokenizer_encode_not_the_inner_model.
     """
 
+    encode_calls = 0
+
     def encode(self, s, add_special_tokens=False):
+        _DummyInnerTokenizer.encode_calls += 1
         return [1, 2, 3, 4, 5]
 
 
@@ -232,3 +236,31 @@ def test_oversized_complete_prompt_returns_bad_request(monkeypatch):
             "message": "prompt length(5) cannot be greater than max_seq_len(4)",
         },
     }
+
+
+def test_complete_uses_tokenizer_encode_not_the_inner_model(monkeypatch):
+    """/v1/complete must tokenize through Backend.tokenizer.encode().
+
+    It used to call Backend.tokenizer.model.encode(text,
+    add_special_tokens=False). That only works when the backend tokenizer is
+    TokenizerHF; the tiktoken Tokenizer exposes a tiktoken.Encoding as .model,
+    which has no add_special_tokens argument, so the call raised TypeError and
+    was swallowed into a vague "Tokenize error" 400. Routing through the
+    tokenizer's own encode() also keeps the long-input splitting that
+    tokenizer.py does before handing substrings to tiktoken.
+    """
+    monkeypatch.setattr(_DummyInnerTokenizer, "encode_calls", 0)
+    client = create_client(monkeypatch)
+
+    response = client.post(
+        "/v1/complete",
+        json={
+            "model": "test-model",
+            "prompt": "too long",
+            "max_tokens_to_sample": 1,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"].startswith("prompt length(")
+    assert _DummyInnerTokenizer.encode_calls == 0
