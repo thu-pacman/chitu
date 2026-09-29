@@ -31,6 +31,6 @@ When submitting optimizations:
 
 ## Testing
 
-- Unit tests: test/pytest contains all the unit tests. Run it with pytest test/ptest. Please ensure all tests pass before submitting a PR.
+- Unit tests: test/pytest contains all the unit tests. Run it with pytest test/pytest. Please ensure all tests pass before submitting a PR.
 - Integrated tests: Inference of full models can be tested by test/single_req_test.py. Since many of the test cases require a dedicated hardware, currently we perform the tests only in proprietary environment. You may contact solution@chitu.ai for assistant.
 - Performance tests for optimizations are welcome but not required.
