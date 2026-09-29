@@ -88,3 +88,42 @@ def test_internal_value_error_remains_server_error(monkeypatch):
 
     assert response.status_code == 500
     assert response.json() == {"detail": "internal failure"}
+
+
+def post_completion(client):
+    return client.post(
+        "/v1/completions",
+        json={
+            "model": "test-model",
+            "prompt": "too long",
+            "max_tokens": 1,
+            "min_batch_size": 7,
+        },
+    )
+
+
+def test_oversized_completion_prompt_returns_bad_request(monkeypatch):
+    client = create_client(monkeypatch)
+
+    response = post_completion(client)
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "prompt length(5) cannot be greater than max_seq_len(4)"
+    }
+
+
+def test_rejected_completion_does_not_change_min_batch_size(monkeypatch):
+    """A request rejected for length must not mutate the global.
+
+    set_min_batch_size() used to run before build_completion_user_request(),
+    so a request that was about to be rejected had already written to the
+    module-level serve_common.min_batch_size. handle_chat_completion builds
+    first; this asserts the same contract for the completions endpoint.
+    """
+    client = create_client(monkeypatch)
+
+    response = post_completion(client)
+
+    assert response.status_code == 400
+    assert serve_common.min_batch_size == 1

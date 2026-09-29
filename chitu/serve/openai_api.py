@@ -831,8 +831,11 @@ async def handle_completion(request: CompletionsRequest, priority: int):
         response_model = resolve_model_name(request.model, args)
     except ValueError as e:
         return _model_not_found_error(e)
+    try:
+        user_req = build_completion_user_request(request, priority)
+    except PromptTooLongError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     set_min_batch_size(request.min_batch_size)
-    user_req = build_completion_user_request(request, priority)
     await submit_request(user_req)
     rsp = CompletionAsyncResponse(user_req, response_model=response_model)
 
