@@ -2,11 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-# GLM-5.3 is a quantization of GLM-5.3-BF16
+# GLM-5.3 with FP8 MLA KV cache.
 defaults:
-  - GLM-5.3-BF16
-  - quant_config: blockfp8
+  - GLM-5.3
+  - override quant_config: blockfp8_dsa_kv
   - _self_ # Config in this file overrides configs in defaults
 
-name: GLM-5.3
+name: GLM-5.3-FP8-kv
 source: "https://huggingface.co/zai-org/GLM-5.3" # Just for displaying. No automatic download.

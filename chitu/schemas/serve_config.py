@@ -62,7 +62,7 @@ class InferConfig(InferConfigLegacy):
     max_seq_len: int = MISSING
     cache_type: str = MISSING
     indexer_type: str = MISSING
-    indexer_logits_chunk_bytes: Optional[int] = MISSING
+    indexer_logits_chunk_bytes: Optional[int | str] = MISSING
     attn_type: str = MISSING
     op_impl: str = MISSING
     mla_absorb: Optional[str] = MISSING
@@ -390,7 +390,7 @@ class ServeConfig(ServeConfigLegacy):
     gpu_preprocess: bool = MISSING
     disable_layerwise_load: bool = MISSING
     model_load_per_layer_timeout_s: float = MISSING
-    pretty_log: str = "auto"
+    pretty_log: str | bool = "auto"
     float_16bit_variant: str = MISSING
     use_float32_rotary: bool = MISSING
     keep_dtype_in_checkpoint: bool = MISSING

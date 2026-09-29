@@ -737,5 +737,60 @@ class TestTPPPChunkedPrefill:
         assert recv_slot_idx == 1
 
 
+class TestToolCallParamsOnTheWire:
+    """tool_call_params must be shipped by every config that registers a task.
+
+    Regression: it used to be serialized only inside `if config.include_tokens:`,
+    so a fully prefix-cache-hit Prefill promoted straight to Decode
+    (for_pp_bootstrap_decode, which carries no tokens) reached the downstream
+    stage without grammar_params; the tool-call grammar was then silently
+    dropped and the output was no longer constrained.
+    """
+
+    @pytest.mark.parametrize(
+        "config_factory",
+        [
+            "for_pp_prefill",
+            "for_pp_bootstrap_decode",
+            "for_pd_decode_rank",
+        ],
+    )
+    def test_roundtrip_keeps_grammar_params(self, config_factory, prefill_task_factory):
+        from chitu.metadata_serializer import MetadataConfig, MetadataSerializer
+        from chitu.task import PackedTasks, TaskPool, TaskType
+        from chitu.tool_call import ToolCallParams, ToolConfig
+
+        params = ToolCallParams(
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "get_temperature", "parameters": {}},
+                }
+            ],
+            config=ToolConfig(choice="required"),
+            enable_thinking=True,
+        )
+        task = prefill_task_factory("0000000d", [1, 2, 3, 4, 5], consumed=0)
+        task.grammar_params = params
+        task.task_type = TaskType.Decode
+        packed = PackedTasks([], tasks=[task])
+        config = getattr(MetadataConfig, config_factory)()
+
+        serializer = MetadataSerializer(mode="PP")
+        data = serializer.serialize_metadata(packed, config=config)
+        msg = msgpack.unpackb(data, raw=False)
+        assert msg["tasks"][0].get("tool_call_params") is not None
+
+        # the receiving stage has never seen the task: it rebuilds it from the
+        # wire payload, which must carry the grammar params
+        TaskPool.remove(task.task_id)
+        _, out, _, _ = MetadataSerializer(mode="PP").deserialize_metadata(data)
+        rebuilt = [t for t in out.tasks if t.task_id == task.task_id][0]
+        assert rebuilt.grammar_params is not None
+        assert rebuilt.grammar_params.tools == params.tools
+        assert rebuilt.grammar_params.config.choice == "required"
+        assert rebuilt.grammar_params.enable_thinking is True
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -322,21 +322,22 @@ def resolve_full_default_args(args):
                 elif has_native_fp8() and has_triton:
                     args.infer.indexer_type = "triton"
                 else:
+                    args.infer.indexer_type = "torch"
+            else:  # FP8 indexer
+                if (
+                    support_indexer_hygon
+                    and args.infer.cache_type == "paged"
+                    and args.infer.mtp_size <= HYGON_INDEXER_MAX_MTP_SIZE
+                    and int(args.models.index_head_dim) == 128
+                    and int(args.models.index_n_heads) in (32, 64)
+                ):
+                    args.infer.indexer_type = "hygon"
+                elif args.infer.cache_type == "paged":
+                    args.infer.indexer_type = "torch_bf16"
+                else:
                     raise NotImplementedError(
-                        "No available FP8 infer.indexer_type found"
+                        "No available BF16 infer.indexer_type found"
                     )
-            elif (
-                support_indexer_hygon
-                and args.infer.cache_type == "paged"
-                and args.infer.mtp_size <= HYGON_INDEXER_MAX_MTP_SIZE
-                and int(args.models.index_head_dim) == 128
-                and int(args.models.index_n_heads) in (32, 64)
-            ):
-                args.infer.indexer_type = "hygon"
-            elif args.infer.cache_type == "paged":
-                args.infer.indexer_type = "torch_bf16"
-            else:
-                raise NotImplementedError("No available BF16 infer.indexer_type found")
         validate_indexer_config(args, args.infer.indexer_type)
 
     logger.debug(f"Auto setting configs done. Full configs are: {args}")

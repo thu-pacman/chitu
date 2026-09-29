@@ -218,7 +218,11 @@ class MooncakeKVTransferHook:
             task = TaskPool.pool.get(req_id)
             if task is None:
                 continue
-            task.update_response_sync([first_token])
+            # A Task shared with the scheduler already accounts for the first
+            # token before allocation. Independent worker Tasks still need to
+            # update their local token history and generated-token count here.
+            if task.num_new_tokens == 0:
+                task.update_response_sync([first_token])
             mtp_size = Backend.executor.mtp_size
             if mtp_size > 1:
                 # pad next_tokens to (mtp_size,)

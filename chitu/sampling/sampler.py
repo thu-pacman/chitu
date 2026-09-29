@@ -84,6 +84,15 @@ class TaskSampleState:
     @staticmethod
     def from_task(task: Task):
         tokens = task.prefix_tokens[task.prompt_len :]
+        if not tokens and len(task.prefix_tokens) < task.prompt_len:
+            # A rank that registers the task from Decode metadata never
+            # receives the prompt tokens (every Decode config ships
+            # include_tokens=False), so prefix_tokens holds only the output
+            # tokens generated since then (see the first-token
+            # update_response_sync in PDScheduler). Slicing at prompt_len
+            # would drop them and leave the matcher at the grammar initial
+            # state, i.e. no constraint at all.
+            tokens = list(task.prefix_tokens)
 
         state = TaskSampleState(
             task=task,
@@ -547,7 +556,20 @@ class Sampler:
             state.matcher.traverse_draft_tree(
                 retrieve_next, retrieve_sibling, draft_local, task_bitmask
             )
-            all_filled_indices.extend(ti * mtp_size + d for d in range(mtp_size))
+            # traverse_draft_tree() fills one row per *visited* node only: row d
+            # is written for every draft token d1..dd the grammar accepts, the row
+            # of the node it rejects is left all-zero, and every row below it keeps
+            # allocate_token_bitmask()'s allow-all initialiser. Only that filled
+            # prefix constrains anything, so only it is applied: the untouched rows
+            # would sample those depths with no grammar constraint at all, and the
+            # all-zero row would sample from an all -inf row (token 0 on the greedy
+            # path, NaN on the mixed one).
+            n_filled = mtp_size
+            for d in range(mtp_size):
+                if not bool(task_bitmask[d].any()):
+                    n_filled = d
+                    break
+            all_filled_indices.extend(ti * mtp_size + d for d in range(n_filled))
 
         # ---- apply bitmasks ----
         if all_filled_indices:

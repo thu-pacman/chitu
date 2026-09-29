@@ -1151,8 +1151,9 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             # 完成后其它请求才可能命中并复用，避免读到未reorder的block。
             task.req.num_hit_tokens = prefill_done.input_cached_tokens
             task.req.add_data(prefill_done.first_token)
-            if task.dp_rank != 0:
-                task.update_response_sync([prefill_done.first_token])
+            # Include the Prefill output in every scheduler-owned Task before
+            # computing alloc_seq_len for the first Decode step, including DP0.
+            task.update_response_sync([prefill_done.first_token])
             if prefill_done.trace:
                 task.req.trace_data.merge(prefill_done.trace)
 
