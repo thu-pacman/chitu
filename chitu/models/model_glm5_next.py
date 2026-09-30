@@ -1616,7 +1616,7 @@ class TransformerGLM5Next(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
             h_for_cache = self._reduce_mhc(h)
             self.update_mtp_hidden_states(
                 self.norm(h_for_cache, compute_dtype=h_for_cache.dtype),
-                is_mtp=True,
+                is_draft=False,
             )
         return self._post_layers(h).float()
 
@@ -1706,7 +1706,7 @@ class TransformerGLM5Next(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
                 h_for_cache = self._reduce_mhc(h)
                 self.update_mtp_hidden_states(
                     self.norm(h_for_cache, compute_dtype=h_for_cache.dtype),
-                    is_mtp=True,
+                    is_draft=False,
                 )
             return self._post_layers(h).float()
         return h
@@ -1722,13 +1722,13 @@ class TransformerGLM5Next(QwenVLMmCacheCoreMixin, TransformerDeepSeekV3):
             h = mtp_layer(
                 h,
                 freqs_cis,
-                self.read_mtp_hidden_states(),
+                self.read_mtp_hidden_states(is_draft=True),
                 is_mtp=True,
             )
         finally:
             mtp_layer.set_indexer_buffer(None, None)
         h = self._reduce_mhc(h)
-        self.update_mtp_hidden_states(h)
+        self.update_mtp_hidden_states(h, is_draft=True)
         return self._post_layers_mtp(h).float()
 
     @override

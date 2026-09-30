@@ -1384,14 +1384,12 @@ class SingletonPagedKVCache(PagedKVCache):
                 f"expect in [-1, {self.mtp_size - 1}]"
             )
             self.tid_to_accept_index[tid] = accept_index
-        # 刚应用的 accept 直到这里才记进tid_to_cached_len/tid_to_accept_index。
-        # last stage 上是在 postprocess_generate_draft 里调该函数，紧接着
-        # model.read_mtp_hidden_states(is_draft=False)拿 _read_page_ids 得到
-        # draft 链的起点，此处需重算_read_page_ids
-        if self.curr_tids:
+        # 应用接受结果后，按 tasks 的顺序重算读取页号，供最后一个 PP stage 继续 draft。
+        # PP 切换批次时 curr_tids 尚未刷新，可能指向已释放的上一批请求。
+        if tasks.task_ids:
             self._upd_read_page_ids(
-                self.curr_tids,
-                [self.tid_to_cached_len.get(tid, 0) for tid in self.curr_tids],
+                tasks.task_ids,
+                [self.tid_to_cached_len.get(tid, 0) for tid in tasks.task_ids],
             )
 
     @override
