@@ -24,6 +24,6 @@
 3. 注明任何硬件/软件环境要求
 
 ## 测试要求
-- **单元测试**：所有单元测试位于test/pytest目录，使用命令`pytest test/ptest`运行。提交PR前请确保所有测试通过。
+- **单元测试**：所有单元测试位于test/pytest目录，使用命令`pytest test/pytest`运行。提交PR前请确保所有测试通过。
 - **集成测试**：完整模型推理测试可通过test/single_req_test.py进行。由于许多测试需要专用硬件，可通过 solution@chitu.ai 联系团队成员协助您验证和改进PR。
 - **优化性能测试**：欢迎但非强制要求。

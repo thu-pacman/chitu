@@ -23,7 +23,7 @@ DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
 if not DOC_GENERATION:
     from chitu.backend import Backend
     from chitu.global_vars import get_global_args
-    from chitu.task import SampleParams, UserRequest, RequestParams
+    from chitu.task import SampleParams, UserRequest, RequestParams, PromptTooLongError
     from chitu.tool_call import get_tool_parser_cls, parse_stream_by_parser
     from chitu.serve.common import (
         build_chat_template_kwargs,
@@ -855,7 +855,10 @@ async def handle_messages_request(*, request: AnthropicMessagesRequest, priority
         priority=priority,
         ttft_timeout_s=request.ttft_timeout_s,
     )
-    user_req = UserRequest.from_request_params(req_params)
+    try:
+        user_req = UserRequest.from_request_params(req_params)
+    except PromptTooLongError as e:
+        return anthropic_error(400, "invalid_request_error", str(e))
 
     await submit_request(user_req)
     if request.stream:
@@ -923,10 +926,12 @@ async def handle_completion_request(
         except ValueError as e:
             return anthropic_error(400, "invalid_request_error", str(e))
 
+    # bos=False, eos=False matches the /v1/completions path: the client's
+    # text is sent as-is. Going through the tokenizer's own encode() rather
+    # than .model.encode() keeps the long-input splitting in tokenizer.py,
+    # and works for both the tiktoken and the HF tokenizer.
     try:
-        prompt_tokens = Backend.tokenizer.model.encode(
-            prompt_text, add_special_tokens=False
-        )
+        prompt_tokens = Backend.tokenizer.encode(prompt_text, bos=False, eos=False)
     except Exception as e:
         return anthropic_error(400, "invalid_request_error", f"Tokenize error: {e}")
     prompt_len = len(prompt_tokens)
@@ -935,7 +940,10 @@ async def handle_completion_request(
         if request.max_tokens_to_sample is not None
         else args.infer.max_seq_len
     )
-    max_new_tokens = UserRequest.cap_max_new_tokens(max_new_tokens, prompt_len)
+    try:
+        max_new_tokens = UserRequest.cap_max_new_tokens(max_new_tokens, prompt_len)
+    except PromptTooLongError as e:
+        return anthropic_error(400, "invalid_request_error", str(e))
     sample_params = SampleParams(
         request.temperature if request.temperature is not None else 0.8,
         top_p=request.top_p if request.top_p is not None else 0.9,
