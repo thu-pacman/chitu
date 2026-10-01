@@ -297,6 +297,143 @@ def test_qwen3():
     run_parse(parser, data, "begin--mid--end", std_tools)
 
 
+TOOLS_WITH_DEF_REF = [
+    {
+        "type": "function",
+        "function": {
+            "name": "my-function-1",
+            "strict": True,
+            "description": "A tool using $defs/$ref.",
+            "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "required": ["query", "mode"],
+                "$defs": {
+                    "SearchMode": {
+                        "oneOf": [
+                            {
+                                "const": "literal",
+                                "type": "string",
+                                "description": "Substring match of the query as plain text.",
+                            },
+                            {
+                                "const": "regex",
+                                "type": "string",
+                                "description": "Rust regex engine match.",
+                            },
+                        ],
+                        "description": "Match strategy.",
+                    }
+                },
+                "properties": {
+                    "query": {"type": "string"},
+                    "mode": {
+                        "description": "Match strategy: `literal` or `regex`.",
+                        "$ref": "#/$defs/SearchMode",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "my-function-2",
+            "strict": True,
+            "description": "A tool with $ref to an object def.",
+            "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "required": ["anchor", "query", "mode"],
+                "$defs": {
+                    "SearchAnchorInput": {
+                        "type": "object",
+                        "description": "Prior match position used as the scan anchor.",
+                        "required": ["offsetBytes", "matchLen"],
+                        "properties": {
+                            "offsetBytes": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "format": "uint64",
+                            },
+                            "matchLen": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "format": "uint32",
+                            },
+                        },
+                    },
+                    "SearchMode": {
+                        "oneOf": [
+                            {"const": "literal", "type": "string"},
+                            {"const": "regex", "type": "string"},
+                        ]
+                    },
+                },
+                "properties": {
+                    "query": {"type": "string"},
+                    "mode": {"$ref": "#/$defs/SearchMode"},
+                    "anchor": {"$ref": "#/$defs/SearchAnchorInput"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "my-function-3",
+            "strict": True,
+            "description": "A tool with nested $ref inside array items (draft-07 definitions).",
+            "parameters": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "required": ["items"],
+                "definitions": {
+                    "Item": {
+                        "type": "object",
+                        "required": ["id"],
+                        "properties": {"id": {"type": "integer"}},
+                    }
+                },
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {"$ref": "#/definitions/Item"},
+                    },
+                },
+            },
+        },
+    },
+]
+
+
+def test_tool_schema_defs_ref():
+    """
+    Tool schemas using $defs/$ref.
+
+    JSON Schema 2020-12 (https://json-schema.org/draft/2020-12/draft-bhutton-json-schema-01#section-8.2.4)
+    allows to place shared sub-schemas under "$defs" and reference them via "$ref". MCP
+    tools may use this feature.
+
+    One important point is that in a tool schema, the "$defs" will be placed at the root
+    level for each tool, while "$ref" may be in any leaf level. The parser must be able
+    to pass the "$defs" down to the leaf level.
+    """
+    broken = []
+    for name in sorted(_registere_parsers):
+        if name == "DummyToolParser":
+            continue
+        parser_cls = _registere_parsers[name]
+        grammar = parser_cls.build_grammar(
+            ToolCallParams(
+                tools=TOOLS_WITH_DEF_REF,
+                enable_thinking=False,
+                config=ToolConfig(choice="auto"),
+            )
+        )
+        assert grammar is not None, f"build_grammar degraded to None for parser: {name}"
+
+
 def test_reasoning():
     parser = "Qwen3ToolParser"
     data = '<tool_call>\n{"name": "test_empty", "arguments": {}}\n</tool_call>'
@@ -311,16 +448,3 @@ def test_reasoning():
     kwargs["initial_thinking"] = True
     run_match(parser, data, False, **kwargs)
     run_match(parser, data2, True, **kwargs)
-
-
-if __name__ == "__main__":
-    test_deepseekv3()
-    test_deepseekv31()
-    test_deepseekv32()
-    test_deepseekv4()
-    test_glm45()
-    test_glm47()
-    test_qwen3()
-    test_qwen3coder()
-    test_reasoning()
-    print("test ok")
