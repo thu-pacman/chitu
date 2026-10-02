@@ -103,4 +103,4 @@ vision_config:
   max_vision_tokens: 16384
 eos_token_id: "$(config.json:text_config.eos_token_id)"
 tool_parser: GLM47ToolParser
-reasoning_type: switchable
+reasoning_type: forced

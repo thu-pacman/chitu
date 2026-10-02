@@ -8,7 +8,7 @@ from logging import getLogger
 from typing import Optional
 
 from chitu.serve.event_loop import get_server_event_loop
-from chitu.reasoning import ReasoningParser
+from chitu.reasoning import ReasoningParser, ReasoningState
 
 logger = getLogger(__name__)
 
@@ -29,8 +29,8 @@ class AsyncDataStream:
         self.top_logprobs_list = []
         self.top_tokens_list = []
         self.reasoning_parser = ReasoningParser(enable_thinking)
-        self.reasoning_states: list[bool] = []
-        self.cached_reasoning_state: bool = False
+        self.reasoning_states: list[ReasoningState] = []
+        self.cached_reasoning_state: ReasoningState = ReasoningState.OUTPUT
         self.callbacks_on_stop = []
         self.error_message: Optional[str] = None
         self.input_cached_tokens: Optional[int] = None
@@ -64,12 +64,18 @@ class AsyncDataStream:
     ):
         with self.lock:
             if value is not None:
-                self.cached_reasoning_state = self.reasoning_parser.update(value)
+                state = self.reasoning_parser.update(value)
+                self.cached_reasoning_state = state
                 self.tokens_len += 1
                 # Count generated token IDs before decoding/buffering. The parser
-                # includes generated thinking delimiters in the reasoning span.
-                self.reasoning_tokens += int(self.cached_reasoning_state)
-                self.cache_tokens.append(value)
+                # includes generated thinking delimiters in the reasoning span
+                # (REASONING and DELIMITER both count, OUTPUT does not).
+                self.reasoning_tokens += int(state != ReasoningState.OUTPUT)
+                if state != ReasoningState.DELIMITER:
+                    self.cache_tokens.append(value)
+                # else: <think>/</think> are structural markers, not output
+                # text. Their token IDs are kept out of the decode buffer so
+                # the literal tag string never reaches the user.
             elif len(self.cache_tokens) == 0:
                 return
             s = self.tokenizer.decode(self.cache_tokens)

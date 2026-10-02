@@ -448,8 +448,15 @@ class AsyncResponse:
         message = {}
         message["role"] = "assistant"
 
-        if self.async_stream.reasoning_parser.params.enable_reasoning:
-            message["reasoning_content"] = "".join(rchunks)
+        # Omit reasoning_content entirely when there is no reasoning text
+        # (e.g. the model closed <think> immediately): an empty reasoning
+        # span should not surface as a reasoning field at all.
+        reasoning_content = "".join(rchunks)
+        if (
+            self.async_stream.reasoning_parser.params.enable_reasoning
+            and reasoning_content
+        ):
+            message["reasoning_content"] = reasoning_content
 
         content = "".join(chunks)
         if self.tool_parser:
