@@ -456,6 +456,16 @@ class KVCacheBase:
                 self.tid_to_cached_len[tid] += -self.mtp_size + accept_index + 1
 
     def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", draft_offset: int):
+        """
+        Prepare for MTP step `draft_offset` with `1 <= draft_offset <= mtp_size - 1`.
+
+        When `mtp_draft_single_graph` is false, this function will run for every
+        MTP step. Each time `draft_offset` increses by 1.
+
+        When `mtp_draft_single_graph` is true, this function will only run for
+        `draft_offset == 1`, and the next steps will be prepared only on the
+        device via `advance_mtp_cache_decode`.
+        """
         self.mtp_seq_len_delta.copy_from_list(
             [self.tid_to_cached_len[tid] + draft_offset - 1 for tid in tasks.task_ids],
             [self.tid_to_cached_len[tid] + draft_offset for tid in tasks.task_ids],
@@ -907,6 +917,39 @@ class PagedKVCache(KVCacheBase):
         # paged kv cache in place.
         super().prepare_cache_decode(tasks)
         self._update_block_table_from_scheduler(tasks, incremental=True)
+
+    @override
+    def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", draft_offset: int):
+        """Prepare the MTP draft position, with additional guards on the draft's
+        K/V writes compared to the base class.
+
+        The draft loop starts from the anchor (the last accepted token) and
+        runs ``mtp_size - 1`` steps, each feeding one token and writing that
+        token's MTP-layer K/V into this cache: the anchor first, then every
+        drafted token except the last (the final draft is sampled but never
+        fed). Those tokens occupy the sequence positions from
+        ``tid_to_cached_len[tid]`` to ``tid_to_cached_len[tid] + mtp_size - 2``,
+        both ends included.
+
+        The guard is CPU-only.
+        """
+        if draft_offset == 1:
+            # `draft_offset == 1` means the first draft step. We only check on
+            # the first step, but for every steps. This is to be compatible
+            # with `infer.mtp_draft_single_graph`.
+            for tid in tasks.task_ids:
+                allocated_tokens = len(self.block_table.get(tid, ())) * self.block_size
+                anchor = self.tid_to_cached_len[tid]
+                if anchor + self.mtp_size - 2 >= allocated_tokens:
+                    raise RuntimeError(
+                        f"{type(self).__name__}: MTP draft window "
+                        f"[{anchor}, {anchor + self.mtp_size - 2}] of '{tid}' is not "
+                        f"covered by its block table ({allocated_tokens} tokens "
+                        f"allocated). The draft would write K/V outside the "
+                        f"request's pages -- scheduler allocation is behind "
+                        f"the draft (see Task.alloc_seq_len)."
+                    )
+        super().prepare_mtp_cache_decode(tasks, draft_offset)
 
     def prepare_cache_decode_dllm(
         self,
@@ -1421,6 +1464,11 @@ class SingletonPagedKVCache(PagedKVCache):
     # 直接报错，而不是让调用方拿到一个别的东西（比如 ckpt block）当页表/页 id 用：
     has_token_block_table = False
 
+    @override
+    def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", draft_offset: int):
+        # Directly call `KVCacheBase` and skip `PagedKVCache`'s guard.
+        KVCacheBase.prepare_mtp_cache_decode(self, tasks, draft_offset)
+
     _PAGE_IDS_MSG = (
         "SingletonPagedKVCache has no token -> page mapping; use "
         "get_accessor().get_read_page_ids() / get_write_page_ids() instead"
@@ -1710,7 +1758,7 @@ class MMPagedKVCache(PagedKVCache):
         pass
 
     @override
-    def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", offset: int):
+    def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", draft_offset: int):
         self.update_page_offs()
 
     @override
@@ -2068,6 +2116,15 @@ class DeepSeekV4PagedKVCache(PagedKVCache):
         self._zero_new_request_blocks(tasks)
 
     @override
+    def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", draft_offset: int):
+        """Advance the MTP draft position, skipping the position-range guard.
+
+        This cache (a DeepSeek-V4 compressed stream) is never written by the
+        MTP draft.
+        """
+        KVCacheBase.prepare_mtp_cache_decode(self, tasks, draft_offset)
+
+    @override
     def realloc(self, num_blocks):
         super().realloc(num_blocks)
         self._allocate_request_buffer()
@@ -2178,6 +2235,11 @@ class DeepSeekV4SlidingWindowPagedKVCache(DeepSeekV4PagedKVCache):
         # has exactly one entry per request.
         self.allocatable_max_num_blocks = self.max_num_blocks
         self.fixed_num_blocks = True
+
+    @override
+    def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", draft_offset: int):
+        # Directly call `KVCacheBase` and skip `PagedKVCache`'s guard.
+        KVCacheBase.prepare_mtp_cache_decode(self, tasks, draft_offset)
 
     @override
     def realloc(self, num_blocks):

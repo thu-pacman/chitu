@@ -362,7 +362,9 @@ def build_deepseek_v4_cache_managers(args, attn_backend_type) -> CacheBuildBundl
             if spec.block_size is not None
             else default_paged_block_size_policy(args)
         )
-        if use_flashmla_packed and int(getattr(args.infer, "mtp_size", 1)) > 1:
+        # The sliding-window ring must hold the model's logical window plus
+        # the MTP margin.
+        if int(getattr(args.infer, "mtp_size", 1)) > 1:
             min_sliding_block_size = window_size + int(args.infer.mtp_size)
             if min_sliding_block_size > sliding_block_size:
                 raise ValueError(

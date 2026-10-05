@@ -916,22 +916,29 @@ class Task:
     @property
     def alloc_seq_len(self) -> int:
         """在下一个step完成后缓存到kv cache中的token长度"""
+
+        # Deciding reservations for MTP:
+        # - The main model needs `mtp_size` tokens reserved, because it needs
+        #   to verify + generate this number of tokens. This is only for decoding.
+        # - The draft model needs an extra `mtp_size - 1` tokens reserved,
+        #   because it needs to generate an extra draft tokens in this number.
+        #   This is both for the last step of prefilling, and decoding.
+        mtp_size = get_global_args().infer.mtp_size
+        main_model_window = mtp_size
+        draft_model_window = mtp_size - 1 if mtp_size > 1 else 0
+
         if self.task_type == TaskType.Prefill:
-            # The first MTP draft runs before the first decode scheduler allocation is
-            # applied to the block table, so the final prefill chunk reserves the draft
-            # lookahead pages itself (mtp_size beyond the prompt).
             # Only the FINAL prefill chunk (the one that completes the prompt and
-            # transitions to decode) reserves MTP draft lookahead pages. Reserving on
-            # every intermediate chunk would allocate more blocks than
-            # num_token_mapped_blocks_for_seq_len(consumed_req_tokens) accounts for,
-            # so the next chunk's prepare_metadata_before_prefill invariant would break.
-            mtp_lookahead = 0
-            if get_global_args().infer.mtp_size > 1 and (
+            # transitions to decode) reserves MTP draft lookahead pages.
+            completes_prompt = (
                 self.consumed_req_tokens + self.next_req_tokens_len
                 >= self.prefix_tokens_len
-            ):
-                mtp_lookahead = get_global_args().infer.mtp_size
-            return self.consumed_req_tokens + self.next_req_tokens_len + mtp_lookahead
+            )
+            return (
+                self.consumed_req_tokens
+                + self.next_req_tokens_len
+                + (draft_model_window if completes_prompt else 0)
+            )
         elif self.task_type == TaskType.Decode:
             # For DLLM decode, need decoding_start + block_length
             if (
@@ -944,10 +951,16 @@ class Task:
                     self.decoding_start + self.block_length,
                     max_alloc_seq_len(get_global_args().infer.max_seq_len),
                 )
-            return (
+            # Clamp to the addressable upper bound: the length check in
+            # update_decode_status stops scheduling one synced step before
+            # max_seq_len, so the clamp is normally not hit; it only
+            # guarantees the allocation always fits the block-table row width.
+            return min(
                 self.cached_seq_len
                 + self.num_unsync_tokens
-                + get_global_args().infer.mtp_size
+                + main_model_window
+                + draft_model_window,
+                max_alloc_seq_len(get_global_args().infer.max_seq_len),
             )
         else:
             assert False

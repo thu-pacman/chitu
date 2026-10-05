@@ -381,17 +381,22 @@ class TestPagedKVCacheManager:
             task.alloc_seq_len,
             cache_manager.block_size,
         )
-        assert task.alloc_seq_len == 1100
+        # 600 (cached) + 0 (unsync) + 500 (main-model verify window) + 499
+        # (draft-model window, mtp_size - 1: the draft runs before the next
+        # decode step's allocation is applied to the block table, see
+        # Task.alloc_seq_len)
+        assert task.alloc_seq_len == 1599
         assert aviable_blocks == 98
         assert cur_blocks == 2
-        assert target_blocks == 3
+        assert target_blocks == 4
         task.new_cache_ids = {
             "main": cache_manager.prepare_metadata_before_decode(task)
         }
 
-        assert task.new_cache_ids["main"] == [2]
-        assert cache_manager.task_to_cache_ids[task.task_id] == {0, 1, 2}
+        assert task.new_cache_ids["main"] == [2, 3]
+        assert cache_manager.task_to_cache_ids[task.task_id] == {0, 1, 2, 3}
         assert cache_manager.active_blocks[2] is task_token_blocks[2].runtime
+        assert cache_manager.active_blocks[3] is task_token_blocks[3].runtime
         assert task_token_blocks[1].active_cnt == 1
 
         # 在executor中执行decode step
@@ -400,22 +405,22 @@ class TestPagedKVCacheManager:
         assert task.prefix_tokens_len == 1001
 
         # 再次被decode调度
-        assert cache_manager.num_cached_blocks(task) == 3
+        assert cache_manager.num_cached_blocks(task) == 4
         aviable_blocks = cache_manager.num_blocks - cache_manager.num_active_blocks
         cur_blocks = cache_manager.num_cached_blocks(task)
         target_blocks = ceil_div(
             task.alloc_seq_len,
             cache_manager.block_size,
         )
-        assert task.alloc_seq_len == 1500
-        assert aviable_blocks == 97
-        assert cur_blocks == 3
-        assert target_blocks == 3
+        assert task.alloc_seq_len == 1999
+        assert aviable_blocks == 96
+        assert cur_blocks == 4
+        assert target_blocks == 4
         task.new_cache_ids = {
             "main": cache_manager.prepare_metadata_before_decode(task)
         }
         assert task.new_cache_ids["main"] == []
-        assert cache_manager.task_to_cache_ids[task.task_id] == {0, 1, 2}
+        assert cache_manager.task_to_cache_ids[task.task_id] == {0, 1, 2, 3}
 
 
 @pytest.fixture
