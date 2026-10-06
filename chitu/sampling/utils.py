@@ -5,20 +5,13 @@
 import functools
 import logging
 import contextlib
-from xgrammar import (
-    TokenizerInfo,
-    GrammarCompiler,
-    CompiledGrammar,
-    Grammar,
-)
+from xgrammar import TokenizerInfo, GrammarCompiler, CompiledGrammar, Grammar
 import threading
 import json
-
 from collections import OrderedDict
 from concurrent.futures import Future
 
 from chitu.utils import DaemonThreadPoolExecutor
-
 from chitu.global_vars import get_global_args
 from chitu.tool_call.type_def import ToolCallParams
 from chitu.tool_call import build_grammar
@@ -31,8 +24,19 @@ def get_tokenizer_info():
     from chitu.backend import Backend
 
     try:
+        # by default xgrammar only recognize HF tokenizer's `eos_token_id` as
+        # the EOS token. But in reality there are also other tokens acting as
+        # EOS tokens. So we need to set them explicitly to xgrammar via
+        # `stop_token_ids`.
+        stop_tokens = Backend.tokenizer.stop_tokens
+        vocab_size = Backend.args.models.vocab_size
+        assert isinstance(stop_tokens, set)
+        assert len(stop_tokens) > 0
+        assert all(0 <= t < vocab_size for t in stop_tokens)
         tokenizer_info = TokenizerInfo.from_huggingface(
-            Backend.tokenizer.model, vocab_size=Backend.args.models.vocab_size
+            Backend.tokenizer.model,
+            vocab_size=vocab_size,
+            stop_token_ids=list(stop_tokens),
         )
         return tokenizer_info
     except Exception:
