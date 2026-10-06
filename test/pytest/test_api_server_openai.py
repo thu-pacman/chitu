@@ -129,6 +129,98 @@ def test_internal_value_error_remains_server_error(monkeypatch):
     assert response.json() == {"detail": "internal failure"}
 
 
+def test_invalid_tool_call_arguments_returns_bad_request_in_completions_api(
+    monkeypatch,
+):
+    """
+    A bad tool-call argument in a replayed history is a bad request (HTTP 400)
+    instead of a server error (HTTP 500).
+
+    This test is for the /v1/chat/completions endpoint.
+    """
+
+    client = create_client(monkeypatch)
+    # Test with GLM parser
+    monkeypatch.setattr(
+        tool_call_utils,
+        "get_tool_parser_cls",
+        lambda: tool_call_utils._registere_parsers["GLM47ToolParser"],
+    )
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "max_tokens": 1,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "insert_edit_into_file",
+                                "arguments": '{"newText": "unterminated',  # bad: trancated
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "tool error",
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "messages[0].tool_calls[0]" in detail
+    assert "insert_edit_into_file" in detail
+    assert "JSON object" in detail
+
+
+def test_invalid_tool_call_arguments_returns_bad_request_in_responses_api(monkeypatch):
+    """
+    A bad tool-call argument in a replayed history is a bad request (HTTP 400)
+    instead of a server error (HTTP 500).
+
+    This test is for the /v1/responses endpoint.
+    """
+
+    client = create_client(monkeypatch)
+    # Test with GLM parser
+    monkeypatch.setattr(
+        tool_call_utils,
+        "get_tool_parser_cls",
+        lambda: tool_call_utils._registere_parsers["GLM47ToolParser"],
+    )
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "max_output_tokens": 1,
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "insert_edit_into_file",
+                    "arguments": '{"newText": "unterminated',
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error"
+    assert "messages[0].tool_calls[0]" in error["message"]
+
+
 def post_completion(client):
     return client.post(
         "/v1/completions",

@@ -101,6 +101,7 @@ def test_responses_endpoint_returns_text_response(monkeypatch):
         prompt_len=5,
         finish_reason="stop",
         tool_call_params=None,
+        response_format_params=None,
         async_stream=StaticAsyncStream(
             [
                 ("Hello", False, (None, None)),
@@ -137,6 +138,7 @@ def test_responses_endpoint_streams_sse_events(monkeypatch):
         prompt_len=3,
         finish_reason="stop",
         tool_call_params=None,
+        response_format_params=None,
         async_stream=StaticAsyncStream(
             [
                 ("Hi", False, (None, None)),
@@ -172,6 +174,7 @@ def test_responses_endpoint_returns_function_call_item(monkeypatch):
         request_id="req_tool",
         prompt_len=4,
         finish_reason="tool_calls",
+        response_format_params=None,
         tool_call_params=SimpleNamespace(
             tools=[
                 {

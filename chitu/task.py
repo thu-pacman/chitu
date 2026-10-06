@@ -32,6 +32,7 @@ from chitu.task_type import TaskType
 from chitu.tool_call import (
     ToolCallParams,
     ToolConfig,
+    ResponseFormatParams,
     adjust_message_for_tool_calls,
     build_grammar,
 )
@@ -86,6 +87,7 @@ class RequestParams:
     enable_thinking: bool = True
     tools: list[dict] = field(default_factory=list)
     tool_config: ToolConfig = field(default_factory=ToolConfig)
+    response_format: dict | None = None
     save_trace_dir: str | None = None
     priority: int = 1
     stop_with_eos: bool = True
@@ -142,6 +144,7 @@ class UserRequest:
     grid_thw: Any | None
     prompt_len: int
     max_new_tokens: int
+    response_format_params: ResponseFormatParams | None = None
     generated_tokens: list[int] = field(default_factory=list)
     ttft_deadline_ts: Optional[float] = None
 
@@ -203,7 +206,21 @@ class UserRequest:
         update_chat_template_kwargs_reasoning(
             chat_template_kwargs, params.enable_thinking
         )
-        if params.tools and params.tool_config.choice != "none":
+        response_format_params = ResponseFormatParams.from_dict(params.response_format)
+        if response_format_params is not None:
+            # The API layer's flat dict does not carry enable_thinking; the
+            # grammar's reasoning wrapper must follow the request's setting.
+            response_format_params.enable_thinking = params.enable_thinking
+            if params.tools and params.tool_config.choice != "none":
+                # response_fomat and tools cannot be combined. Already checked
+                # in HTTP API layer. Raise here again as defense.
+                raise ValueError(
+                    "response_format cannot be combined with tools: only one "
+                    "output constraint can be enforced per request"
+                )
+            else:
+                tool_call_params = None
+        elif params.tools and params.tool_config.choice != "none":
             chat_template_kwargs["tools"] = params.tools
             tool_call_params = ToolCallParams(
                 tools=params.tools,
@@ -245,6 +262,7 @@ class UserRequest:
             grid_thw=grid_thw,
             prompt_len=prompt_len,
             max_new_tokens=max_new_tokens,
+            response_format_params=response_format_params,
         )
         req.ttft_timeout_s = params.ttft_timeout_s
         return req
@@ -508,6 +526,7 @@ class Task:
         prefix_tokens=None,
         prompt_len=None,
         tool_call_params: ToolCallParams | None = None,
+        response_format_params: ResponseFormatParams | None = None,
         priority: int = 1,
         stop_with_eos: bool = True,
         block_length: int = 32,
@@ -555,12 +574,16 @@ class Task:
         # Request
         self.req = req
 
-        # Grammar. The tool-call grammar is defined entirely by grammar_params
-        # (a ToolCallParams, or None when the request has no tools). We ship these
+        # Grammar. The grammar is defined entirely by grammar_params (a
+        # ToolCallParams for tool calls, a ResponseFormatParams for
+        # response_format requests, or None when unconstrained). We ship these
         # tiny params across PP/PD boundaries and compile locally only on the rank
         # that samples. The compile itself is a cached background Future (grammar_future),
         # submitted by submit_grammar() ahead of sampling.
-        self.grammar_params = req.tool_call_params if req else tool_call_params
+        if req is not None:
+            self.grammar_params = req.response_format_params or req.tool_call_params
+        else:
+            self.grammar_params = response_format_params or tool_call_params
         self.grammar_future = None
 
         self.prefill_chunk_size: Optional[int] = (
@@ -916,22 +939,29 @@ class Task:
     @property
     def alloc_seq_len(self) -> int:
         """在下一个step完成后缓存到kv cache中的token长度"""
+
+        # Deciding reservations for MTP:
+        # - The main model needs `mtp_size` tokens reserved, because it needs
+        #   to verify + generate this number of tokens. This is only for decoding.
+        # - The draft model needs an extra `mtp_size - 1` tokens reserved,
+        #   because it needs to generate an extra draft tokens in this number.
+        #   This is both for the last step of prefilling, and decoding.
+        mtp_size = get_global_args().infer.mtp_size
+        main_model_window = mtp_size
+        draft_model_window = mtp_size - 1 if mtp_size > 1 else 0
+
         if self.task_type == TaskType.Prefill:
-            # The first MTP draft runs before the first decode scheduler allocation is
-            # applied to the block table, so the final prefill chunk reserves the draft
-            # lookahead pages itself (mtp_size beyond the prompt).
             # Only the FINAL prefill chunk (the one that completes the prompt and
-            # transitions to decode) reserves MTP draft lookahead pages. Reserving on
-            # every intermediate chunk would allocate more blocks than
-            # num_token_mapped_blocks_for_seq_len(consumed_req_tokens) accounts for,
-            # so the next chunk's prepare_metadata_before_prefill invariant would break.
-            mtp_lookahead = 0
-            if get_global_args().infer.mtp_size > 1 and (
+            # transitions to decode) reserves MTP draft lookahead pages.
+            completes_prompt = (
                 self.consumed_req_tokens + self.next_req_tokens_len
                 >= self.prefix_tokens_len
-            ):
-                mtp_lookahead = get_global_args().infer.mtp_size
-            return self.consumed_req_tokens + self.next_req_tokens_len + mtp_lookahead
+            )
+            return (
+                self.consumed_req_tokens
+                + self.next_req_tokens_len
+                + (draft_model_window if completes_prompt else 0)
+            )
         elif self.task_type == TaskType.Decode:
             # For DLLM decode, need decoding_start + block_length
             if (
@@ -944,10 +974,16 @@ class Task:
                     self.decoding_start + self.block_length,
                     max_alloc_seq_len(get_global_args().infer.max_seq_len),
                 )
-            return (
+            # Clamp to the addressable upper bound: the length check in
+            # update_decode_status stops scheduling one synced step before
+            # max_seq_len, so the clamp is normally not hit; it only
+            # guarantees the allocation always fits the block-table row width.
+            return min(
                 self.cached_seq_len
                 + self.num_unsync_tokens
-                + get_global_args().infer.mtp_size
+                + main_model_window
+                + draft_model_window,
+                max_alloc_seq_len(get_global_args().infer.max_seq_len),
             )
         else:
             assert False

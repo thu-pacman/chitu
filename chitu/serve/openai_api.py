@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -29,7 +30,12 @@ if not DOC_GENERATION:
         submit_request,
         build_chat_template_kwargs,
     )
-    from chitu.tool_call import parse_stream_by_parser, get_tool_parser_cls
+    from chitu.sampling.utils import validate_response_format_grammar
+    from chitu.tool_call import (
+        parse_stream_by_parser,
+        get_tool_parser_cls,
+        InvalidToolCallArgumentsError,
+    )
 
 logger = getLogger(__name__)
 
@@ -118,6 +124,64 @@ class ToolChoiceNamedTool(BaseModel):
     type: Literal["function"]
 
 
+class ResponseFormatJsonSchema(BaseModel):
+    """Nested ``json_schema`` object of ``response_format`` (Chat Completions)."""
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    name: str = DocField(
+        en="Name of the response schema.",
+        zh="响应 schema 的名称。",
+    )
+    description: Optional[str] = DocField(
+        None,
+        en="Optional description of the response schema.",
+        zh="响应 schema 的可选描述。",
+    )
+    schema_: dict = DocField(
+        {},
+        alias="schema",
+        serialization_alias="schema",
+        en="JSON schema the response must conform to.",
+        zh="响应必须遵循的 JSON schema。",
+    )
+    strict: bool = DocField(
+        False,
+        en="NOT IMPLEMENTED: The schema is enforced via constrained decoding regardless of this flag.",
+        zh="未实现：无论该标志如何，都会通过约束解码强制遵循 schema。",
+    )
+
+
+class ResponseFormat(BaseModel):
+    """OpenAI ``response_format`` parameter (Chat Completions)."""
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    type: Literal["text", "json_object", "json_schema"] = DocField(
+        "text",
+        en='Output format: "text", "json_object", or "json_schema".',
+        zh='输出格式："text"、"json_object" 或 "json_schema"。',
+    )
+    json_schema: Optional[ResponseFormatJsonSchema] = DocField(
+        None,
+        en="JSON schema configuration, required when type is json_schema.",
+        zh="JSON schema 配置，type 为 json_schema 时必填。",
+    )
+
+    @model_validator(mode="after")
+    def validate_json_schema(self):
+        if self.type == "json_schema":
+            if self.json_schema is None:
+                raise ValueError(
+                    "response_format of type json_schema requires the json_schema field"
+                )
+            if not self.json_schema.name:
+                raise ValueError(
+                    "response_format.json_schema.name is required for type json_schema"
+                )
+        return self
+
+
 class ChatRequest(BaseModel):
     model: Optional[str] = DocField(
         None,
@@ -142,6 +206,11 @@ class ChatRequest(BaseModel):
         "auto",
         en='Controls tool calling behavior: "auto", "none", "required", or a named function tool.',
         zh='控制工具调用行为："auto"、"none"、"required"，或指定一个命名 function tool。',
+    )
+    response_format: Optional[ResponseFormat] = DocField(
+        None,
+        en='Output format configuration: "text" (default), "json_object" for valid JSON output, or "json_schema" for schema-constrained output.',
+        zh='输出格式配置："text"（默认）、"json_object"（保证输出合法 JSON）或 "json_schema"（按 schema 约束输出）。',
     )
     parallel_tool_calls: bool = DocField(
         True,
@@ -448,8 +517,15 @@ class AsyncResponse:
         message = {}
         message["role"] = "assistant"
 
-        if self.async_stream.reasoning_parser.params.enable_reasoning:
-            message["reasoning_content"] = "".join(rchunks)
+        # Omit reasoning_content entirely when there is no reasoning text
+        # (e.g. the model closed <think> immediately): an empty reasoning
+        # span should not surface as a reasoning field at all.
+        reasoning_content = "".join(rchunks)
+        if (
+            self.async_stream.reasoning_parser.params.enable_reasoning
+            and reasoning_content
+        ):
+            message["reasoning_content"] = reasoning_content
 
         content = "".join(chunks)
         if self.tool_parser:
@@ -500,6 +576,43 @@ class AsyncResponse:
         return full_response
 
 
+def _response_format_dict(response_format: ResponseFormat | None) -> dict | None:
+    """Normalize ``ChatRequest.response_format`` into the flat internal dict.
+
+    ``None`` / ``{"type": "text"}`` mean "no constraint" and map to ``None``.
+    """
+    if response_format is None or response_format.type == "text":
+        return None
+    if response_format.type == "json_object":
+        return {"type": "json_object"}
+    elif response_format.type == "json_schema":
+        js = response_format.json_schema
+        assert isinstance(js, ResponseFormatJsonSchema)
+        return {
+            "type": "json_schema",
+            "name": js.name,
+            "description": js.description,
+            "schema": js.schema_,
+            "strict": js.strict,
+        }
+    else:
+        assert False, f"Unexpected response_format type: {response_format.type}"
+
+
+def _response_format_error(message: str, status_code: int = 400) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": "response_format",
+                "code": None,
+            }
+        },
+    )
+
+
 def build_user_request(req: ChatRequest, priority: int = 1) -> UserRequest:
     # enable_thinking / max_new_tokens / chat_template_kwargs
     args = get_global_args()
@@ -539,6 +652,7 @@ def build_user_request(req: ChatRequest, priority: int = 1) -> UserRequest:
         enable_thinking=enable_thinking,
         tools=req.tools,
         tool_config=tool_config,
+        response_format=_response_format_dict(req.response_format),
         save_trace_dir=args.debug.save_trace_dir,
         priority=priority,
         stop_with_eos=req.stop_with_eos,
@@ -572,10 +686,28 @@ async def handle_chat_completion(
         response_model = resolve_model_name(request.model, args)
     except ValueError as e:
         return _model_not_found_error(e)
+    if (
+        request.response_format is not None
+        and request.response_format.type != "text"
+        and request.tools
+        and request.tool_choice != "none"
+    ):
+        return _response_format_error(
+            "response_format cannot be combined with tools: only one output "
+            "constraint can be enforced per request"
+        )
     try:
         user_req = build_user_request(request, priority)
-    except PromptTooLongError as e:
+    except (PromptTooLongError, InvalidToolCallArgumentsError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    if user_req.response_format_params is not None:
+        # Early rejection of invalid response format schemas. The actual
+        # grammar enforcement is deferred to sample time.
+        error = await asyncio.to_thread(
+            validate_response_format_grammar, user_req.response_format_params
+        )
+        if error is not None:
+            return _response_format_error(error, status_code=422)
     set_min_batch_size(request.min_batch_size)
     await submit_request(user_req)
     rsp = AsyncResponse(user_req, response_model=response_model, created=created)

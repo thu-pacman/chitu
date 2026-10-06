@@ -89,3 +89,51 @@ class ConstraintParams:
     at_least_one: bool
     stop_after_first: bool
     tool_schemas: dict[str, dict]
+
+
+@dataclass
+class ResponseFormatParams:
+    """Grammar parameters for OpenAI-style ``response_format`` requests.
+
+    Carried next to :class:`ToolCallParams` on ``UserRequest``/``Task`` and
+    enforced through the same xgrammar pipeline.  The schema is enforced
+    regardless of ``strict`` (kept for request fidelity); ``name`` and
+    ``description`` are likewise carried for fidelity and do not affect the
+    grammar.
+    """
+
+    type: Literal["json_object", "json_schema"]
+    name: str | None = None
+    description: str | None = None
+    schema: dict | None = None
+    strict: bool = False
+    enable_thinking: bool = True
+
+    @staticmethod
+    def from_dict(d: dict | None) -> "ResponseFormatParams | None":
+        if not d:
+            return None
+        return ResponseFormatParams(
+            type=d.get("type", "json_object"),
+            name=d.get("name"),
+            description=d.get("description"),
+            schema=d.get("schema"),
+            strict=bool(d.get("strict", False)),
+            enable_thinking=bool(d.get("enable_thinking", True)),
+        )
+
+    @staticmethod
+    def to_dict(params: "ResponseFormatParams | None") -> dict | None:
+        if params is None:
+            return None
+        assert (
+            type(params) == ResponseFormatParams
+        ), f"params should be ResponseFormatParams instance, but got {type(params)}"
+        return {
+            "type": params.type,
+            "name": params.name,
+            "description": params.description,
+            "schema": params.schema,
+            "strict": params.strict,
+            "enable_thinking": params.enable_thinking,
+        }

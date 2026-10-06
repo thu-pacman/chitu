@@ -5,22 +5,15 @@
 import functools
 import logging
 import contextlib
-from xgrammar import (
-    TokenizerInfo,
-    GrammarCompiler,
-    CompiledGrammar,
-    Grammar,
-)
+from xgrammar import TokenizerInfo, GrammarCompiler, CompiledGrammar, Grammar
 import threading
 import json
-
 from collections import OrderedDict
 from concurrent.futures import Future
 
 from chitu.utils import DaemonThreadPoolExecutor
-
 from chitu.global_vars import get_global_args
-from chitu.tool_call.type_def import ToolCallParams
+from chitu.tool_call.type_def import ToolCallParams, ResponseFormatParams
 from chitu.tool_call import build_grammar
 
 logger = logging.getLogger(__name__)
@@ -31,8 +24,19 @@ def get_tokenizer_info():
     from chitu.backend import Backend
 
     try:
+        # by default xgrammar only recognize HF tokenizer's `eos_token_id` as
+        # the EOS token. But in reality there are also other tokens acting as
+        # EOS tokens. So we need to set them explicitly to xgrammar via
+        # `stop_token_ids`.
+        stop_tokens = Backend.tokenizer.stop_tokens
+        vocab_size = Backend.args.models.vocab_size
+        assert isinstance(stop_tokens, set)
+        assert len(stop_tokens) > 0
+        assert all(0 <= t < vocab_size for t in stop_tokens)
         tokenizer_info = TokenizerInfo.from_huggingface(
-            Backend.tokenizer.model, vocab_size=Backend.args.models.vocab_size
+            Backend.tokenizer.model,
+            vocab_size=vocab_size,
+            stop_token_ids=list(stop_tokens),
         )
         return tokenizer_info
     except Exception:
@@ -118,9 +122,35 @@ def _compile_grammar_worker(params):
     return compile_grammar(grammar)
 
 
-def submit_grammar_compile(params: ToolCallParams) -> Future:
-    """Return a Future resolving to the CompiledGrammar (or None) for this
-    tool-schema.
+def _grammar_params_cache_key(params: ToolCallParams | ResponseFormatParams) -> str:
+    """Stable cache key for either tools or response_format grammar parameters.
+
+    The ``tools:`` / ``response_format:`` prefix keeps the two flavours' keys
+    from colliding (both dump to plain dicts).
+    """
+    if isinstance(params, ToolCallParams):
+        kind, payload = "tools", ToolCallParams.to_dict(params)
+    elif isinstance(params, ResponseFormatParams):
+        kind, payload = "response_format", ResponseFormatParams.to_dict(params)
+    else:
+        raise TypeError(f"Unsupported grammar params type: {type(params).__name__}")
+    return (
+        kind
+        + ":"
+        + json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    )
+
+
+def submit_grammar_compile(
+    params: ToolCallParams | ResponseFormatParams,
+) -> Future:
+    """Return a Future resolving to the CompiledGrammar (or None) for these
+    grammar params (tool schemas or response_format).
         - completed hit -> a cached completed Future
         - in-flight hit -> the shared Future for a concurrent compile
         - cold miss     -> a new Future backed by the background compile pool
@@ -130,12 +160,7 @@ def submit_grammar_compile(params: ToolCallParams) -> Future:
     global _GRAMMAR_CACHE_LOOKUPS, _GRAMMAR_CACHE_HITS
 
     assert params is not None
-    key = json.dumps(
-        ToolCallParams.to_dict(params),
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
+    key = _grammar_params_cache_key(params)
 
     if get_grammar_compiler() is None:
         logger.debug(
@@ -168,3 +193,22 @@ def submit_grammar_compile(params: ToolCallParams) -> Future:
             len(_GRAMMAR_FUTURES),
         )
         return fut
+
+
+def validate_response_format_grammar(params: ResponseFormatParams) -> str | None:
+    """Check that a response_format grammar can be enforced on this server.
+
+    This is an early check to return HTTP 4xx in time. The actual grammar
+    enforcement is deferred to sample time.
+    """
+    if get_grammar_compiler() is None:
+        return (
+            "response_format is not available on this server: "
+            "the grammar compiler could not be initialized"
+        )
+    if submit_grammar_compile(params).result() is None:
+        return (
+            "response_format could not be compiled into an enforceable "
+            "grammar; please check that the schema is a supported JSON Schema"
+        )
+    return None

@@ -37,6 +37,7 @@ POST /v1/chat/completions
 | `messages` | `list[Message]` | **必填** | 组成对话的消息对象列表。 |
 | `tools` | `list[object]` | `[]` | 模型可调用的工具或函数定义列表。 |
 | `tool_choice` | `none` \| `auto` \| `required` \| `ToolChoiceNamedTool` | `"auto"` | 控制工具调用行为："auto"、"none"、"required"，或指定一个命名 function tool。 |
+| `response_format` | `ResponseFormat` \| `null` | `null` | 输出格式配置："text"（默认）、"json_object"（保证输出合法 JSON）或 "json_schema"（按 schema 约束输出）。 |
 | `parallel_tool_calls` | `boolean` | `true` | 模型是否可以并行发起多个工具调用。 |
 | `logprobs` | `boolean` | `false` | 是否返回生成 token 的 log 概率。 |
 | `top_logprobs` | `integer` \| `null` | `null` | 启用 logprobs 时返回最可能 token 的 log 概率数量。 |
@@ -108,6 +109,22 @@ POST /v1/chat/completions
 | 参数 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `name` | `string` | **必填** |  |
+
+#### `ResponseFormat` 对象
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `type` | `text` \| `json_object` \| `json_schema` | `"text"` | 输出格式："text"、"json_object" 或 "json_schema"。 |
+| `json_schema` | `ResponseFormatJsonSchema` \| `null` | `null` | JSON schema 配置，type 为 json_schema 时必填。 |
+
+#### `ResponseFormatJsonSchema` 对象
+
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `name` | `string` | **必填** | 响应 schema 的名称。 |
+| `description` | `string` \| `null` | `null` | 响应 schema 的可选描述。 |
+| `schema` | `object` | `{}` | 响应必须遵循的 JSON schema。 |
+| `strict` | `boolean` | `false` | 未实现：无论该标志如何，都会通过约束解码强制遵循 schema。 |
 
 #### `ChatStreamOptions` 对象
 

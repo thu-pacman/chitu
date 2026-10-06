@@ -37,6 +37,7 @@ Creates a model response for the given chat conversation.
 | `messages` | `list[Message]` | **required** | List of message objects composing the conversation. |
 | `tools` | `list[object]` | `[]` | Tool or function definitions available for the model to call. |
 | `tool_choice` | `none` \| `auto` \| `required` \| `ToolChoiceNamedTool` | `"auto"` | Controls tool calling behavior: "auto", "none", "required", or a named function tool. |
+| `response_format` | `ResponseFormat` \| `null` | `null` | Output format configuration: "text" (default), "json_object" for valid JSON output, or "json_schema" for schema-constrained output. |
 | `parallel_tool_calls` | `boolean` | `true` | Whether the model can make multiple tool calls in parallel. |
 | `logprobs` | `boolean` | `false` | Whether to return log probabilities for generated tokens. |
 | `top_logprobs` | `integer` \| `null` | `null` | Number of most likely tokens to include log probabilities for when logprobs is enabled. |
@@ -108,6 +109,22 @@ Creates a model response for the given chat conversation.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `name` | `string` | **required** |  |
+
+#### `ResponseFormat` Object
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `type` | `text` \| `json_object` \| `json_schema` | `"text"` | Output format: "text", "json_object", or "json_schema". |
+| `json_schema` | `ResponseFormatJsonSchema` \| `null` | `null` | JSON schema configuration, required when type is json_schema. |
+
+#### `ResponseFormatJsonSchema` Object
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `name` | `string` | **required** | Name of the response schema. |
+| `description` | `string` \| `null` | `null` | Optional description of the response schema. |
+| `schema` | `object` | `{}` | JSON schema the response must conform to. |
+| `strict` | `boolean` | `false` | NOT IMPLEMENTED: The schema is enforced via constrained decoding regardless of this flag. |
 
 #### `ChatStreamOptions` Object
 

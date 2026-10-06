@@ -9,6 +9,7 @@ from .type_def import (
     ChoiceToolCall,
     ToolCallParams,
     ToolConfig,
+    ResponseFormatParams,
 )
 
 DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
@@ -20,6 +21,7 @@ if not DOC_GENERATION:
         adjust_message_for_tool_calls,
         patch_chat_template,
         build_grammar,
+        InvalidToolCallArgumentsError,
     )
 
     # Parser modules register their parser classes during normal runtime import.

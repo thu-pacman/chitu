@@ -13,3 +13,6 @@ defaults:
 
 name: GLM-5.3-BF16
 source: "https://huggingface.co/zai-org/GLM-5.3-BF16" # Just for displaying. No automatic download.
+
+# Overrides
+reasoning_type: forced  # Different from GLM-5.2: no thinking switch

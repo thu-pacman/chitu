@@ -22,7 +22,7 @@ from chitu.task import (
     SampleParams,
     is_normal_payload,
 )
-from chitu.tool_call.type_def import ToolCallParams
+from chitu.tool_call.type_def import ToolCallParams, ResponseFormatParams
 
 logger = getLogger(__name__)
 
@@ -334,13 +334,29 @@ class MetadataSerializer:
                     if config.include_tokens:
                         task_data["tokens"] = list(task.prefix_tokens)
                         task_data["standard_tokens"] = task._test_standard_tokens
-                    # 工具调用约束参数：新任务必须携带，且不能放进 include_tokens
-                    # 里 —— 全前缀命中转 Decode（for_pp_bootstrap_decode）等配置
-                    # 不带 tokens，接收侧 _create_task_from_data 建出的
-                    # task.grammar_params 就是 None，文法约束会被静默丢弃。
-                    task_data["tool_call_params"] = ToolCallParams.to_dict(
-                        task.grammar_params
-                    )
+                    # Grammar constraint params (tool call or response_format):
+                    # new tasks must carry them, and they must not be tied to
+                    # include_tokens — configs like full-prefix-hit-to-Decode
+                    # (for_pp_bootstrap_decode) carry no tokens, so the
+                    # receiving side's _create_task_from_data would build
+                    # task.grammar_params as None and silently drop the
+                    # grammar constraint.
+                    if isinstance(task.grammar_params, ResponseFormatParams):
+                        task_data["tool_call_params"] = None
+                        task_data["response_format_params"] = (
+                            ResponseFormatParams.to_dict(task.grammar_params)
+                        )
+                    elif isinstance(task.grammar_params, ToolCallParams):
+                        task_data["tool_call_params"] = ToolCallParams.to_dict(
+                            task.grammar_params
+                        )
+                    elif task.grammar_params is None:
+                        task_data["tool_call_params"] = None
+                    else:
+                        raise TypeError(
+                            "Unsupported grammar_params type: "
+                            f"{type(task.grammar_params).__name__}"
+                        )
                     # 只对新任务传输 sample_params
                     if config.include_sample_params:
                         task_data["sample_params"] = {
@@ -516,6 +532,9 @@ class MetadataSerializer:
         )
         tokens = task_data.get("tokens")
         tool_call_params = ToolCallParams.from_dict(task_data.get("tool_call_params"))
+        response_format_params = ResponseFormatParams.from_dict(
+            task_data.get("response_format_params")
+        )
         prompt_len = task_data.get("prompt_len")
         task = Task(
             task_id=task_id,
@@ -523,6 +542,7 @@ class MetadataSerializer:
             sample_params=sample_params,
             prefix_tokens=tokens,
             tool_call_params=tool_call_params,
+            response_format_params=response_format_params,
             prompt_len=prompt_len,
         )
         task.return_logprobs = task_data.get("return_logprobs")
