@@ -90,17 +90,59 @@ async def parse_stream_by_parser(
                     yield adapter.wrap(chunk)
 
 
+class InvalidToolCallArgumentsError(ValueError):
+    """Raised when a tool call in the message history cannot be rendered.
+
+    Parsers mixing in ``JsonMessageToolParserMixin`` use chat templates that
+    iterate ``tool_calls[].function.arguments`` as a *mapping* (``arguments|items``),
+    so the OpenAI-format JSON *string* must be parsed into an object before
+    templating. A tool call whose ``arguments`` is not a JSON object cannot
+    be rendered and is rejected as an invalid request (HTTP 400) instead of
+    a server error (HTTP 500).
+    """
+
+
 def adjust_message_for_tool_calls(message: list):
     parser_cls = get_tool_parser_cls()
     if not issubclass(parser_cls, JsonMessageToolParserMixin):
         return message
-    for chunk in message:
+    for msg_idx, chunk in enumerate(message):
         if not isinstance(chunk, dict):
             continue
-        tools = chunk.get("tool_calls", [])
-        for tool in tools:
-            function = tool["function"]
-            function["arguments"] = json.loads(function["arguments"])
+        tools = chunk.get("tool_calls") or []
+        for call_idx, tool in enumerate(tools):
+            function = tool.get("function") if isinstance(tool, dict) else None
+            if not isinstance(function, dict):
+                raise InvalidToolCallArgumentsError(
+                    f"Invalid tool call at messages[{msg_idx}].tool_calls[{call_idx}]: "
+                    f"missing or malformed 'function' object."
+                )
+            where = (
+                f"messages[{msg_idx}].tool_calls[{call_idx}] "
+                f"(function={function.get('name')!r}, id={tool.get('id')!r})"
+            )
+            arguments = function.get("arguments", "")
+            if isinstance(arguments, dict):
+                # Already a JSON object (some clients pre-parse it); keep it.
+                continue
+            if not isinstance(arguments, str):
+                raise InvalidToolCallArgumentsError(
+                    f"Invalid tool call arguments at {where}: expected a JSON object "
+                    f"encoded as a string, got {type(arguments).__name__}."
+                )
+            try:
+                parsed = json.loads(arguments)
+            except json.JSONDecodeError as e:
+                raise InvalidToolCallArgumentsError(
+                    f"Invalid tool call arguments at {where}: arguments must be a "
+                    f"JSON object encoded as a string, but failed to parse ({e})."
+                ) from e
+            if not isinstance(parsed, dict):
+                raise InvalidToolCallArgumentsError(
+                    f"Invalid tool call arguments at {where}: arguments must be a "
+                    f"JSON object, got {type(parsed).__name__}."
+                )
+            function["arguments"] = parsed
     return message
 
 

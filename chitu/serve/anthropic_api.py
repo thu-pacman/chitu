@@ -24,7 +24,11 @@ if not DOC_GENERATION:
     from chitu.backend import Backend
     from chitu.global_vars import get_global_args
     from chitu.task import SampleParams, UserRequest, RequestParams, PromptTooLongError
-    from chitu.tool_call import get_tool_parser_cls, parse_stream_by_parser
+    from chitu.tool_call import (
+        get_tool_parser_cls,
+        parse_stream_by_parser,
+        InvalidToolCallArgumentsError,
+    )
     from chitu.serve.common import (
         build_chat_template_kwargs,
         submit_request,
@@ -857,7 +861,7 @@ async def handle_messages_request(*, request: AnthropicMessagesRequest, priority
     )
     try:
         user_req = UserRequest.from_request_params(req_params)
-    except PromptTooLongError as e:
+    except (PromptTooLongError, InvalidToolCallArgumentsError) as e:
         return anthropic_error(400, "invalid_request_error", str(e))
 
     await submit_request(user_req)

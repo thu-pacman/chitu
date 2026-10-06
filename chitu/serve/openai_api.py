@@ -29,7 +29,11 @@ if not DOC_GENERATION:
         submit_request,
         build_chat_template_kwargs,
     )
-    from chitu.tool_call import parse_stream_by_parser, get_tool_parser_cls
+    from chitu.tool_call import (
+        parse_stream_by_parser,
+        get_tool_parser_cls,
+        InvalidToolCallArgumentsError,
+    )
 
 logger = getLogger(__name__)
 
@@ -581,7 +585,7 @@ async def handle_chat_completion(
         return _model_not_found_error(e)
     try:
         user_req = build_user_request(request, priority)
-    except PromptTooLongError as e:
+    except (PromptTooLongError, InvalidToolCallArgumentsError) as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     set_min_batch_size(request.min_batch_size)
     await submit_request(user_req)

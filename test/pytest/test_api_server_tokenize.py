@@ -125,3 +125,49 @@ def test_tokenize_messages_use_chat_template(monkeypatch, payload, expected_kwar
             expected_kwargs,
         )
     ]
+
+
+def test_invalid_tool_call_arguments_returns_bad_request_in_tokenize_api(monkeypatch):
+    """
+    A bad tool-call argument in a replayed history is a bad request (HTTP 400)
+    instead of a server error (HTTP 500).
+
+    This test is for the /v1/responses endpoint.
+    """
+
+    formatter = DummyFormatter()
+    patch_message_tokenize_deps(monkeypatch, formatter)
+    # Test with GLM parser
+    monkeypatch.setattr(
+        tool_call_utils,
+        "get_tool_parser_cls",
+        lambda: tool_call_utils._registere_parsers["GLM47ToolParser"],
+    )
+
+    client = create_client()
+    response = client.post(
+        "/tokenize",
+        json={
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "insert_edit_into_file",
+                                "arguments": '{"newText": "unterminated',
+                            },
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 400
+    assert "messages[0].tool_calls[0]" in response.json()["detail"]
+    # Rejected before the chat template is applied.
+    assert formatter.calls == []

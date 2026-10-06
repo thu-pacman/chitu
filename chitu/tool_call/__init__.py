@@ -20,6 +20,7 @@ if not DOC_GENERATION:
         adjust_message_for_tool_calls,
         patch_chat_template,
         build_grammar,
+        InvalidToolCallArgumentsError,
     )
 
     # Parser modules register their parser classes during normal runtime import.

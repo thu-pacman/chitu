@@ -28,7 +28,11 @@ DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
 if not DOC_GENERATION:
     from chitu.global_vars import get_global_args
     from chitu.task import UserRequest, RequestParams, PromptTooLongError
-    from chitu.tool_call import get_tool_parser_cls, parse_stream_by_parser
+    from chitu.tool_call import (
+        get_tool_parser_cls,
+        parse_stream_by_parser,
+        InvalidToolCallArgumentsError,
+    )
     from chitu.serve.anthropic_api import resolve_requested_model_or_error
     from chitu.serve.common import (
         build_chat_template_kwargs,
@@ -519,14 +523,22 @@ def responses_input_to_internal(
             name = item.get("name")
             if not call_id or not name:
                 raise ValueError("function_call requires call_id and name")
+            arguments = item.get("arguments", "")
+            if isinstance(arguments, dict):
+                # Some clients send arguments as a JSON object; serialize it
+                # instead of Python-repr'ing it (str() would produce single
+                # quotes, which is not valid JSON).
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            elif not isinstance(arguments, str):
+                raise ValueError(
+                    "function_call.arguments must be a JSON object encoded as "
+                    "a string"
+                )
             pending_tool_calls.append(
                 {
                     "id": call_id,
                     "type": "function",
-                    "function": {
-                        "name": name,
-                        "arguments": str(item.get("arguments", "")),
-                    },
+                    "function": {"name": name, "arguments": arguments},
                 }
             )
             continue
@@ -1187,7 +1199,7 @@ async def handle_responses_request(
     )
     try:
         user_req = UserRequest.from_request_params(req_params)
-    except PromptTooLongError as e:
+    except (PromptTooLongError, InvalidToolCallArgumentsError) as e:
         return responses_error(400, "invalid_request_error", str(e))
     await submit_request(user_req)
 

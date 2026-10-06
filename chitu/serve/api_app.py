@@ -45,7 +45,10 @@ if not DOC_GENERATION:
     from chitu.serve.crash import is_dying
     from chitu.serve.middleware import RejectOverloadMiddleware
     from chitu.task import TaskPool
-    from chitu.tool_call import adjust_message_for_tool_calls
+    from chitu.tool_call import (
+        adjust_message_for_tool_calls,
+        InvalidToolCallArgumentsError,
+    )
 
 logger = getLogger(__name__)
 
@@ -814,7 +817,10 @@ async def tokenize(request: TokenizeRequest):
         if tools and tool_choice != "none":
             chat_template_kwargs["tools"] = tools
         message = [message.model_dump() for message in request.messages]
-        message = adjust_message_for_tool_calls(message)
+        try:
+            message = adjust_message_for_tool_calls(message)
+        except InvalidToolCallArgumentsError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         tokens = Backend.formatter.encode_dialog_prompt(
             message,
             chat_template_kwargs=chat_template_kwargs,
