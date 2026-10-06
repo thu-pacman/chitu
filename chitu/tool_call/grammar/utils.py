@@ -11,9 +11,10 @@ from xgrammar.structural_tag import (
     AnyTextFormat,
     SequenceFormat,
     ConstStringFormat,
+    JSONSchemaFormat,
 )
 from .tools import AbstractToolsGrammar
-from ..type_def import ToolCallParams, ConstraintParams
+from ..type_def import ToolCallParams, ConstraintParams, ResponseFormatParams
 from chitu.reasoning.utils import get_reasoning_params
 
 logger = logging.getLogger(__name__)
@@ -131,10 +132,15 @@ def compile_format_to_grammar(format: Format):
     return Grammar.from_structural_tag(StructuralTag(format=format))
 
 
-def build_reasoning_grammar(format: Format, constraint: ConstraintParams):
-    if not constraint.at_least_one:
-        return format
-    reasoning_params = get_reasoning_params(constraint.params.enable_thinking)
+def wrap_format_with_reasoning(format: Format, enable_thinking: bool) -> Format:
+    """Prefix *format* with the model's reasoning span (thinking models only).
+
+    ``[start_token?] AnyText(excludes=[end_token]) end_token <format>`` — the
+    model may reason freely, but once it closes the reasoning span the rest of
+    the output must match *format*.  ``start_token`` is omitted when the chat
+    template already opened the reasoning span (``initial_state``).
+    """
+    reasoning_params = get_reasoning_params(enable_thinking)
     if not reasoning_params.enable_reasoning:
         return format
 
@@ -151,6 +157,53 @@ def build_reasoning_grammar(format: Format, constraint: ConstraintParams):
     return SequenceFormat(
         elements=elements,
     )
+
+
+def build_reasoning_grammar(format: Format, constraint: ConstraintParams):
+    if not constraint.at_least_one:
+        return format
+    return wrap_format_with_reasoning(format, constraint.params.enable_thinking)
+
+
+_ANY_JSON_SCHEMA: dict = {}
+"""Empty JSON Schema: accepts any single JSON value.
+
+Used for ``response_format: {"type": "json_object"}`` and for
+``json_schema`` requests that carry no schema.
+
+NOTE: despite the parameter name ``json_object``, the output is NOT restricted
+to a top-level JSON object.  OpenAI's JSON mode guarantees "any valid JSON
+document" (their docs explicitly mention arrays/strings as possible output)
+and vLLM behaves the same, so the grammar must accept any JSON value.
+"""
+
+
+def build_response_format_grammar(params: ResponseFormatParams) -> Grammar | None:
+    """Build a Grammar constraining the whole response to a JSON format.
+
+    An unexpected failure here returns ``None`` (unconstrained) because
+    this runs on a background compile thread, where raising would crash the
+    inference loop via ``Task.grammar``.
+    """
+    try:
+        if params.type == "json_schema" and params.schema:
+            schema = normalize_schema_types(copy.deepcopy(params.schema))
+        else:
+            # json_object, or json_schema without a schema: any JSON value.
+            schema = copy.deepcopy(_ANY_JSON_SCHEMA)
+
+        fmt = wrap_format_with_reasoning(
+            JSONSchemaFormat(json_schema=schema), params.enable_thinking
+        )
+        return compile_format_to_grammar(fmt)
+    except Exception:
+        logger.warning(
+            "build_response_format_grammar: failed to build grammar with "
+            "schema %r, returning None (unconstrained)",
+            params.schema,
+            exc_info=True,
+        )
+        return None
 
 
 def build_grammar(

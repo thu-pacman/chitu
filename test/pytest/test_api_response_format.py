@@ -57,6 +57,7 @@ def request(items=(("hello", False, (None, None)),), reason="stop", cached=6):
         prompt_len=10,
         finish_reason=reason,
         tool_call_params=None,
+        response_format_params=None,
         logprobs=False,
         top_logprobs=None,
         output="hello",

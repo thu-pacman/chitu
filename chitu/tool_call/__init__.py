@@ -9,6 +9,7 @@ from .type_def import (
     ChoiceToolCall,
     ToolCallParams,
     ToolConfig,
+    ResponseFormatParams,
 )
 
 DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -38,6 +39,7 @@ if not DOC_GENERATION:
         build_chat_template_kwargs,
         submit_request,
     )
+    from chitu.sampling.utils import validate_response_format_grammar
 
 logger = getLogger(__name__)
 
@@ -1149,6 +1151,19 @@ async def handle_responses_request(
     except ValueError as e:
         return responses_error(400, "invalid_request_error", str(e))
 
+    _, internal_response_format = normalize_text_config(request.text)
+    if (
+        internal_response_format is not None
+        and internal_tools
+        and tool_config.choice != "none"
+    ):
+        return responses_error(
+            400,
+            "invalid_request_error",
+            "text.format cannot be combined with tools: only one output "
+            "constraint can be enforced per request",
+        )
+
     if request.previous_response_id is not None:
         return responses_error(
             400,
@@ -1192,6 +1207,7 @@ async def handle_responses_request(
         frequency_penalty=0.0,
         chat_template_kwargs=chat_template_kwargs,
         enable_thinking=enable_thinking,
+        response_format=internal_response_format,
         save_trace_dir=args.debug.save_trace_dir,
         priority=priority,
         stop_with_eos=True,
@@ -1201,6 +1217,14 @@ async def handle_responses_request(
         user_req = UserRequest.from_request_params(req_params)
     except (PromptTooLongError, InvalidToolCallArgumentsError) as e:
         return responses_error(400, "invalid_request_error", str(e))
+    if user_req.response_format_params is not None:
+        # Early rejection of invalid response format schemas. The actual
+        # grammar enforcement is deferred to sample time.
+        error = await asyncio.to_thread(
+            validate_response_format_grammar, user_req.response_format_params
+        )
+        if error is not None:
+            return responses_error(422, "invalid_request_error", error)
     await submit_request(user_req)
 
     if request.stream:

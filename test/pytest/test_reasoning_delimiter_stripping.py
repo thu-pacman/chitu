@@ -173,6 +173,7 @@ def _make_req(monkeypatch, reason="stop"):
         prompt_len=10,
         finish_reason=reason,
         tool_call_params=None,
+        response_format_params=None,
         logprobs=False,
         top_logprobs=None,
         output="",

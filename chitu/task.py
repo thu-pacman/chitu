@@ -32,6 +32,7 @@ from chitu.task_type import TaskType
 from chitu.tool_call import (
     ToolCallParams,
     ToolConfig,
+    ResponseFormatParams,
     adjust_message_for_tool_calls,
     build_grammar,
 )
@@ -86,6 +87,7 @@ class RequestParams:
     enable_thinking: bool = True
     tools: list[dict] = field(default_factory=list)
     tool_config: ToolConfig = field(default_factory=ToolConfig)
+    response_format: dict | None = None
     save_trace_dir: str | None = None
     priority: int = 1
     stop_with_eos: bool = True
@@ -142,6 +144,7 @@ class UserRequest:
     grid_thw: Any | None
     prompt_len: int
     max_new_tokens: int
+    response_format_params: ResponseFormatParams | None = None
     generated_tokens: list[int] = field(default_factory=list)
     ttft_deadline_ts: Optional[float] = None
 
@@ -203,7 +206,21 @@ class UserRequest:
         update_chat_template_kwargs_reasoning(
             chat_template_kwargs, params.enable_thinking
         )
-        if params.tools and params.tool_config.choice != "none":
+        response_format_params = ResponseFormatParams.from_dict(params.response_format)
+        if response_format_params is not None:
+            # The API layer's flat dict does not carry enable_thinking; the
+            # grammar's reasoning wrapper must follow the request's setting.
+            response_format_params.enable_thinking = params.enable_thinking
+            if params.tools and params.tool_config.choice != "none":
+                # response_fomat and tools cannot be combined. Already checked
+                # in HTTP API layer. Raise here again as defense.
+                raise ValueError(
+                    "response_format cannot be combined with tools: only one "
+                    "output constraint can be enforced per request"
+                )
+            else:
+                tool_call_params = None
+        elif params.tools and params.tool_config.choice != "none":
             chat_template_kwargs["tools"] = params.tools
             tool_call_params = ToolCallParams(
                 tools=params.tools,
@@ -245,6 +262,7 @@ class UserRequest:
             grid_thw=grid_thw,
             prompt_len=prompt_len,
             max_new_tokens=max_new_tokens,
+            response_format_params=response_format_params,
         )
         req.ttft_timeout_s = params.ttft_timeout_s
         return req
@@ -508,6 +526,7 @@ class Task:
         prefix_tokens=None,
         prompt_len=None,
         tool_call_params: ToolCallParams | None = None,
+        response_format_params: ResponseFormatParams | None = None,
         priority: int = 1,
         stop_with_eos: bool = True,
         block_length: int = 32,
@@ -555,12 +574,16 @@ class Task:
         # Request
         self.req = req
 
-        # Grammar. The tool-call grammar is defined entirely by grammar_params
-        # (a ToolCallParams, or None when the request has no tools). We ship these
+        # Grammar. The grammar is defined entirely by grammar_params (a
+        # ToolCallParams for tool calls, a ResponseFormatParams for
+        # response_format requests, or None when unconstrained). We ship these
         # tiny params across PP/PD boundaries and compile locally only on the rank
         # that samples. The compile itself is a cached background Future (grammar_future),
         # submitted by submit_grammar() ahead of sampling.
-        self.grammar_params = req.tool_call_params if req else tool_call_params
+        if req is not None:
+            self.grammar_params = req.response_format_params or req.tool_call_params
+        else:
+            self.grammar_params = response_format_params or tool_call_params
         self.grammar_future = None
 
         self.prefill_chunk_size: Optional[int] = (

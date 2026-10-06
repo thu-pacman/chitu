@@ -10,7 +10,8 @@ from .abstract_parser import (
     JsonMessageToolParserMixin,
     PatchTemplateToolParserMixin,
 )
-from .type_def import ChoiceDelta, ToolCallParams
+from .type_def import ChoiceDelta, ToolCallParams, ResponseFormatParams
+from .grammar.utils import build_response_format_grammar
 from .dummy_parser import DummyToolParser
 from typing import Any, AsyncIterable, AsyncGenerator, TypeVar
 from chitu.global_vars import get_global_args
@@ -156,6 +157,8 @@ def patch_chat_template(model):
         logger.exception(f"patch chat template failed, tool call may be incorrect!")
 
 
-def build_grammar(params: ToolCallParams):
+def build_grammar(params: ToolCallParams | ResponseFormatParams):
+    if isinstance(params, ResponseFormatParams):
+        return build_response_format_grammar(params)
     parser_cls = get_tool_parser_cls()
     return parser_cls.build_grammar(params)
