@@ -17,6 +17,7 @@ angle ``i``. Any batch size, head count or head dimension is supported.
 
 from __future__ import annotations
 
+import os
 from logging import getLogger
 from typing import Optional
 
@@ -46,6 +47,11 @@ def _triton_supported(
     rotary_type: str,
     is_mtp: bool,
 ) -> bool:
+    # Fused-path parity is guaranteed only when explicitly enabled; by default the
+    # reference path is used so results are byte-for-byte identical to the unfused
+    # implementation (important for greedy/eval reproducibility).
+    if os.environ.get("CHITU_GCU_FUSED_OPS") != "1":
+        return False
     if not (_HAS_TRITON and is_enflame()):
         return False
     if is_mtp or rotary_type != "separated":

@@ -243,7 +243,8 @@ def _ensure_gcu_attn_gate_lazy_registration():
         gate = x.kwargs["gate"]
         bs = block_size[1] if isinstance(block_size, (list, tuple)) else block_size
         supported = (
-            x_scale is None
+            os.environ.get("CHITU_GCU_FUSED_OPS") == "1"
+            and x_scale is None
             and output.shape == gate.shape
             and output.dtype == torch.bfloat16
             and gate.dtype == torch.bfloat16
