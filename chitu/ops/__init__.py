@@ -39,6 +39,7 @@ from chitu.ops.moe_sum import (
 from chitu.ops.linear_attn import (
     chunk_gated_delta_rule,
     recurrent_gated_delta_rule,
+    recurrent_gated_delta_rule_compact_qk_gcu,
     recurrent_gated_delta_rule_all_state,
 )
 from chitu.ops.quant import (
@@ -83,7 +84,12 @@ from chitu.ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_concat_permuted,
 )
 from chitu.ops.hadamard import hadamard_transform
-from chitu.ops.causal_conv import causal_conv1d_update, causal_conv1d_prefill
+from chitu.ops.causal_conv import (
+    causal_conv1d_update,
+    causal_conv1d_update_qwen3_next,
+    causal_conv1d_update_qwen3_next_with_g,
+    causal_conv1d_prefill,
+)
 from chitu.ops.norm_gate import rms_norm_gate
 from chitu.ops.mhc import mhc_pre, mhc_post
 from chitu.ops.fused_g import fused_g
