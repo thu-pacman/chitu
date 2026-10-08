@@ -11,6 +11,7 @@ import sys
 # "import triton_gcu.triton" activates the GCU backend for the stock `triton` package.
 try:
     from torch_gcu import transfer_to_gcu  # noqa: F401
+
     try:
         import triton_gcu.triton  # noqa: F401
     except Exception:

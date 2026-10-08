@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import pytest
 import torch
 
@@ -18,9 +22,7 @@ def test_qwen3_next_singleton_index_select_is_exact(
         dtype=torch.float32,
         device="cuda",
     ).reshape(num_pages, *tail_shape)
-    page_ids = torch.arange(
-        batch_size - 1, -1, -1, dtype=torch.int32, device="cuda"
-    )
+    page_ids = torch.arange(batch_size - 1, -1, -1, dtype=torch.int32, device="cuda")
     page_ids = (2 * page_ids + 1).reshape(batch_size, 1).contiguous()
     if duplicate_page:
         page_ids[-1].copy_(page_ids[0])
@@ -68,9 +70,7 @@ def test_qwen3_next_singleton_index_select_fails_closed(
         assert not page_ids.is_contiguous()
     else:
         page_ids = torch.arange(batch_size, dtype=page_dtype).reshape(batch_size, 1)
-    mtp_accept_indices = (
-        torch.zeros(batch_size, dtype=torch.int64) if mtp else None
-    )
+    mtp_accept_indices = torch.zeros(batch_size, dtype=torch.int64) if mtp else None
     calls = []
 
     def fallback(kv_cache, page_table, mtp_accept_indices=None):
@@ -79,9 +79,7 @@ def test_qwen3_next_singleton_index_select_fails_closed(
             return kv_cache[page_table.squeeze(1), 0]
         return kv_cache[page_table.squeeze(1), mtp_accept_indices]
 
-    monkeypatch.setattr(
-        qwen3_next, "read_from_singleton_paged_kv_cache", fallback
-    )
+    monkeypatch.setattr(qwen3_next, "read_from_singleton_paged_kv_cache", fallback)
     actual = qwen3_next._read_qwen3_next_singleton_state(
         cache,
         page_ids,
@@ -90,9 +88,7 @@ def test_qwen3_next_singleton_index_select_fails_closed(
     )
 
     assert len(calls) == 1
-    assert torch.equal(
-        actual, fallback(cache, page_ids, mtp_accept_indices)
-    )
+    assert torch.equal(actual, fallback(cache, page_ids, mtp_accept_indices))
 
 
 def test_qwen3_next_singleton_index_select_can_be_disabled(monkeypatch):
@@ -104,9 +100,7 @@ def test_qwen3_next_singleton_index_select_can_be_disabled(monkeypatch):
         calls.append(True)
         return kv_cache[page_table.squeeze(1), 0]
 
-    monkeypatch.setattr(
-        qwen3_next, "read_from_singleton_paged_kv_cache", fallback
-    )
+    monkeypatch.setattr(qwen3_next, "read_from_singleton_paged_kv_cache", fallback)
     actual = qwen3_next._read_qwen3_next_singleton_state(
         cache,
         page_ids,

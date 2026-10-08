@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2025 Qingcheng.AI
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
 #
 # SPDX-License-Identifier: Apache-2.0
 
@@ -14,14 +14,10 @@ gate+per-token-group FP8 producer used by the block-FP8 linear specialization.
 
 from __future__ import annotations
 
-from logging import getLogger
-
 import torch
 
 from chitu.device_type import is_enflame
 from chitu.lazy import make_lazy_op
-
-logger = getLogger(__name__)
 
 try:
     import triton

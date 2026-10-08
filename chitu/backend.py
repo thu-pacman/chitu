@@ -165,7 +165,6 @@ class Backend:
                 from chitu.moe.load_balancer import ExpertParamAccessor
 
                 class _ModelExpertsAccessor(ExpertParamAccessor):  # type: ignore
-
                     def _copy_in(
                         self, dst_tensor: torch.Tensor, src: torch.Tensor, slot: int
                     ):
@@ -291,9 +290,9 @@ class Backend:
 
         # CP mode overrides: CP replaces TP as intra-node parallel dimension
         if prefill_context_parallel_size > 1:
-            assert (
-                tensor_parallel_size == 1
-            ), "CP and TP are currently incompatible; set tp_size=1 when pcp_size>1"
+            assert tensor_parallel_size == 1, (
+                "CP and TP are currently incompatible; set tp_size=1 when pcp_size>1"
+            )
             expert_tensor_parallel_size = (
                 1
                 if expert_tensor_parallel_size is None
@@ -314,17 +313,17 @@ class Backend:
                 )
         embed_tokens_lm_head_tp_size = int(args.infer.embed_tokens_lm_head_tp_size)
         if tensor_parallel_size > 1:
-            assert (
-                embed_tokens_lm_head_tp_size == tensor_parallel_size
-            ), "embed_tokens_lm_head_tp_size must be equal to tensor_parallel_size when tensor_parallel_size > 1"
+            assert embed_tokens_lm_head_tp_size == tensor_parallel_size, (
+                "embed_tokens_lm_head_tp_size must be equal to tensor_parallel_size when tensor_parallel_size > 1"
+            )
         elif non_expert_data_parallel_size > 1:
-            assert (
-                non_expert_data_parallel_size % embed_tokens_lm_head_tp_size == 0
-            ), "non_expert_data_parallel_size must be divisible by embed_tokens_lm_head_tp_size when non_expert_data_parallel_size > 1"
+            assert non_expert_data_parallel_size % embed_tokens_lm_head_tp_size == 0, (
+                "non_expert_data_parallel_size must be divisible by embed_tokens_lm_head_tp_size when non_expert_data_parallel_size > 1"
+            )
         else:
-            assert (
-                embed_tokens_lm_head_tp_size == 1
-            ), "embed_tokens_lm_head_tp_size must be 1 when tensor_parallel_size == 1 and non_expert_data_parallel_size == 1"
+            assert embed_tokens_lm_head_tp_size == 1, (
+                "embed_tokens_lm_head_tp_size must be 1 when tensor_parallel_size == 1 and non_expert_data_parallel_size == 1"
+            )
 
         effective_tp_size = (
             prefill_context_parallel_size
@@ -449,9 +448,9 @@ class Backend:
                 model_path=args.models.tokenizer_path,
                 force_full_seq_decode=force_full_seq_decode,
             )
-            assert (
-                args.models.vocab_size == tokenizer.n_words
-            ), f"{args.models.vocab_size} vs. {tokenizer.n_words}"
+            assert args.models.vocab_size == tokenizer.n_words, (
+                f"{args.models.vocab_size} vs. {tokenizer.n_words}"
+            )
 
         patch_chat_template(tokenizer.model)
         return tokenizer
@@ -842,9 +841,9 @@ class Backend:
             quant_type = getattr(quant_config, "type", None)
             if args.models.type == ModelType.LLAMA:
                 checkpoints = sorted(Path(args.models.ckpt_dir).glob("*.pth"))
-                assert (
-                    len(checkpoints) > 0
-                ), f"no checkpoint files found in {args.models.ckpt_dir}"
+                assert len(checkpoints) > 0, (
+                    f"no checkpoint files found in {args.models.ckpt_dir}"
+                )
                 ckpt_path = checkpoints[0]
                 checkpoint = torch.load(ckpt_path, map_location="cpu")
             elif quant_type in [
@@ -978,7 +977,7 @@ class Backend:
             model_prefix: str,
         ) -> str:
             if checkpoint_prefix != model_prefix and k.startswith(checkpoint_prefix):
-                k = f"{model_prefix}{k[len(checkpoint_prefix):]}"
+                k = f"{model_prefix}{k[len(checkpoint_prefix) :]}"
             return k
 
         def _load_and_apply(
@@ -1184,7 +1183,7 @@ class Backend:
             logger.debug(f"Skip/failed running warmup for MoE schema: {_e}")
 
         logger.info(
-            f"Backend initialized with CUDA mem at {torch.cuda.memory_allocated()/1024**3:.2f} GB"
+            f"Backend initialized with CUDA mem at {torch.cuda.memory_allocated() / 1024**3:.2f} GB"
         )
         logger.info(
             f"Using {len(c10d._pg_map)} communication groups. If this number is too high, there may be too much memory reserved for underlying communication libraries."
@@ -1243,7 +1242,7 @@ def load_state_dict(
 
 def memory_used():
     logger.debug(
-        f"gpu memory usage: {torch.cuda.memory_allocated()/(1024**3)} GB"
+        f"gpu memory usage: {torch.cuda.memory_allocated() / (1024**3)} GB"
     )  # torch.cuda.max_memory_allocated()/(1024**3)) #, torch.cuda.memory_reserved()/(1024**3))
     import resource
 
@@ -1614,7 +1613,6 @@ def load_state_dict_deepseek_v3_gguf_moe_layer(
                             main_weight_dtype == "float8_e4m3fn"
                             and not safetensor_name.endswith("norm.weight")
                         ):
-
                             safetensor_scale = safetensor_name[:-6] + "scale"
                             state_dict[safetensor_name] = gathered_experts_weight[
                                 expert_id

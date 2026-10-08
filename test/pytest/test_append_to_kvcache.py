@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import os
 import random
@@ -65,9 +69,9 @@ def _make_seq_ids_and_positions(
         b = int(seq_ids[t].item())
         p = per_batch_cnt[b]
         per_batch_cnt[b] += 1
-        assert (
-            p < max_pos_exclusive
-        ), f"Too many tokens for batch {b}: need pos {p}, max_pos_exclusive={max_pos_exclusive}"
+        assert p < max_pos_exclusive, (
+            f"Too many tokens for batch {b}: need pos {p}, max_pos_exclusive={max_pos_exclusive}"
+        )
         pos[t] = p
 
     return seq_ids, pos.contiguous()
@@ -126,9 +130,7 @@ def test_dense_kv_pair_torch_matches_two_scalar_appends(with_seq_ids):
     v_cache_ref = torch.zeros_like(k_cache_ref)
     k_cache_pair = k_cache_ref.clone()
     v_cache_pair = v_cache_ref.clone()
-    this_k = torch.randn(
-        (num_tokens, 8, 128), device=device, dtype=torch.bfloat16
-    )
+    this_k = torch.randn((num_tokens, 8, 128), device=device, dtype=torch.bfloat16)
     this_v = torch.randn_like(this_k)
     if with_seq_ids:
         seq_ids, positions = _make_seq_ids_and_positions(
@@ -138,12 +140,8 @@ def test_dense_kv_pair_torch_matches_two_scalar_appends(with_seq_ids):
         seq_ids = None
         positions = torch.arange(num_tokens, device=device, dtype=torch.int32)
 
-    append_to_dense_kv_cache(
-        k_cache_ref, this_k, positions, seq_ids, impl="torch"
-    )
-    append_to_dense_kv_cache(
-        v_cache_ref, this_v, positions, seq_ids, impl="torch"
-    )
+    append_to_dense_kv_cache(k_cache_ref, this_k, positions, seq_ids, impl="torch")
+    append_to_dense_kv_cache(v_cache_ref, this_v, positions, seq_ids, impl="torch")
     append_to_dense_kv_cache_pair(
         k_cache_pair,
         v_cache_pair,
@@ -187,12 +185,8 @@ def test_dense_kv_pair_gcu_matches_scalar_for_strided_qkv(num_tokens):
         batch_size, num_tokens, seq_len, device
     )
 
-    append_to_dense_kv_cache(
-        k_cache_ref, this_k, positions, seq_ids, impl="torch"
-    )
-    append_to_dense_kv_cache(
-        v_cache_ref, this_v, positions, seq_ids, impl="torch"
-    )
+    append_to_dense_kv_cache(k_cache_ref, this_k, positions, seq_ids, impl="torch")
+    append_to_dense_kv_cache(v_cache_ref, this_v, positions, seq_ids, impl="torch")
     launch = _get_gcu_fused_dense_kv_append()
     assert launch is not None, "the configured library must provide the v2 ABI"
     launches_before = launch._chitu_launch_count()
@@ -225,9 +219,7 @@ def test_dense_kv_pair_gcu_without_seq_ids_preserves_scalar_contract():
     k_ref = torch.zeros(shape, device=device, dtype=torch.bfloat16)
     v_ref = torch.zeros_like(k_ref)
     k_pair, v_pair = k_ref.clone(), v_ref.clone()
-    this_k = torch.randn(
-        (batch_size, 8, 128), device=device, dtype=torch.bfloat16
-    )
+    this_k = torch.randn((batch_size, 8, 128), device=device, dtype=torch.bfloat16)
     this_v = torch.randn_like(this_k)
     positions = torch.arange(batch_size, device=device, dtype=torch.int32)
     append_to_dense_kv_cache(k_ref, this_k, positions, impl="torch")
@@ -235,9 +227,7 @@ def test_dense_kv_pair_gcu_without_seq_ids_preserves_scalar_contract():
     launch = _get_gcu_fused_dense_kv_append()
     assert launch is not None
     launches_before = launch._chitu_launch_count()
-    append_to_dense_kv_cache_pair(
-        k_pair, v_pair, this_k, this_v, positions, impl="gcu"
-    )
+    append_to_dense_kv_cache_pair(k_pair, v_pair, this_k, this_v, positions, impl="gcu")
     torch.cuda.synchronize()
     assert launch._chitu_launch_count() == launches_before + 1
     _assert_bf16_copy_bit_exact(k_pair, k_ref)
@@ -269,8 +259,12 @@ def test_dense_kv_pair_gcu_guards_dynamic_metadata_bounds():
     v_cache = torch.zeros_like(k_cache)
     this_k = torch.randn((tokens, 8, 128), device=device, dtype=torch.bfloat16)
     this_v = torch.randn_like(this_k)
-    seq_ids = torch.tensor([-1, batch_size, -1, batch_size], device=device, dtype=torch.int32)
-    positions = torch.tensor([-1, seq_len, seq_len, -1], device=device, dtype=torch.int32)
+    seq_ids = torch.tensor(
+        [-1, batch_size, -1, batch_size], device=device, dtype=torch.int32
+    )
+    positions = torch.tensor(
+        [-1, seq_len, seq_len, -1], device=device, dtype=torch.int32
+    )
     launch = _get_gcu_fused_dense_kv_append()
     assert launch is not None
     launches_before = launch._chitu_launch_count()
@@ -295,9 +289,7 @@ def test_dense_kv_pair_gcu_graph_replay_reads_changed_inputs_and_bounds():
     shape = (batch_size, seq_len, 8, 128)
     k_cache = torch.zeros(shape, device=device, dtype=torch.bfloat16)
     v_cache = torch.zeros_like(k_cache)
-    packed_qkv = torch.zeros(
-        (tokens, 3, 8, 128), device=device, dtype=torch.bfloat16
-    )
+    packed_qkv = torch.zeros((tokens, 3, 8, 128), device=device, dtype=torch.bfloat16)
     this_k, this_v = packed_qkv[:, 1], packed_qkv[:, 2]
     positions = torch.arange(tokens, device=device, dtype=torch.int32)
     seq_ids = torch.arange(tokens, device=device, dtype=torch.int32)
@@ -360,9 +352,7 @@ def test_dense_kv_pair_gcu_graph_replay_reads_changed_inputs_and_bounds():
     seq_ids.copy_(
         torch.tensor([0, batch_size, -1, 2], device=device, dtype=torch.int32)
     )
-    positions.copy_(
-        torch.tensor([1, 2, 3, seq_len], device=device, dtype=torch.int32)
-    )
+    positions.copy_(torch.tensor([1, 2, 3, seq_len], device=device, dtype=torch.int32))
     k_cache.zero_()
     v_cache.zero_()
     graph.replay()
@@ -389,9 +379,7 @@ def test_dense_kv_pair_gcu_rejects_cpu_pointers():
     positions = torch.arange(batch_size, dtype=torch.int32)
     append_to_dense_kv_cache(k_ref, this_k, positions, impl="torch")
     append_to_dense_kv_cache(v_ref, this_v, positions, impl="torch")
-    append_to_dense_kv_cache_pair(
-        k_pair, v_pair, this_k, this_v, positions, impl="gcu"
-    )
+    append_to_dense_kv_cache_pair(k_pair, v_pair, this_k, this_v, positions, impl="gcu")
     _assert_bf16_copy_bit_exact(k_pair, k_ref)
     _assert_bf16_copy_bit_exact(v_pair, v_ref)
 
@@ -988,9 +976,9 @@ def test_paged_offset_overflow_case_matches_torch_with_i64(impl):
     ).contiguous()
 
     max_linear_offset = kv_out.view(num_pages, page_size, -1).numel() - 1
-    assert (
-        max_linear_offset > int32_max
-    ), f"max_linear_offset={max_linear_offset} should exceed int32_max={int32_max}"
+    assert max_linear_offset > int32_max, (
+        f"max_linear_offset={max_linear_offset} should exceed int32_max={int32_max}"
+    )
 
     # torch reference
     append_to_paged_kv_cache(

@@ -232,9 +232,9 @@ def _recurrent_gated_delta_rule_one_step_exact_torch(
         delta = raw_beta_delta(value_bf16, kv_mem, raw_beta)
     else:
         delta = (v_t - kv_mem) * beta_t
-    last_recurrent_state = last_recurrent_state + k_t.unsqueeze(
-        -1
-    ) * delta.unsqueeze(-2)
+    last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(
+        -2
+    )
     output = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2).unsqueeze(1)
 
     if not output_final_state:
@@ -735,9 +735,7 @@ def recurrent_gated_delta_rule_compact_qk_gcu(
 
     fused_qk_norm_scale = (
         fused_qk_scale
-        and os.environ.get(
-            "CHITU_GCU_QWEN3_NEXT_FUSED_COMPACT_QK_NORM_SCALE", "0"
-        )
+        and os.environ.get("CHITU_GCU_QWEN3_NEXT_FUSED_COMPACT_QK_NORM_SCALE", "0")
         == "1"
         and qkv_source is not None
         and tuple(qkv_source.shape) == (batch, 10240)
@@ -776,7 +774,6 @@ def recurrent_gated_delta_rule_compact_qk_gcu(
             impl="gcu",
         )
     if grouped_qk:
-
         # Qwen3-Next maps each compact Q/K head to exactly three adjacent
         # value heads.  Preserve the established BF16 normalization/scaling
         # boundaries, but broadcast [B,16,D] Q/K over a view of state shaped
@@ -872,9 +869,9 @@ def recurrent_gated_delta_rule_compact_qk_gcu(
                 grouped_state.reshape(batch, 48, 128, 128), query_compact
             ).reshape(batch, 16, 3, 128)
         else:
-            output = (
-                grouped_state * query_compact.unsqueeze(2).unsqueeze(-1)
-            ).sum(dim=-2)
+            output = (grouped_state * query_compact.unsqueeze(2).unsqueeze(-1)).sum(
+                dim=-2
+            )
         state = grouped_state.reshape(batch, 48, 128, 128)
         if not output_final_state:
             state = None

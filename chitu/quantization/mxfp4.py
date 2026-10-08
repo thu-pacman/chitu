@@ -51,7 +51,9 @@ def dequant_mxfp4_weight(
     """
 
     if packed_weight.dtype != torch.uint8:
-        raise TypeError(f"MXFP4 weight must be uint8 storage, got {packed_weight.dtype}")
+        raise TypeError(
+            f"MXFP4 weight must be uint8 storage, got {packed_weight.dtype}"
+        )
     if weight_scale.dtype != torch.uint8:
         raise TypeError(f"MXFP4 scale must be uint8 storage, got {weight_scale.dtype}")
     if packed_weight.ndim != 2 or weight_scale.ndim != 2:
@@ -144,9 +146,7 @@ class Mxfp4MoeExpertsUnmergedGCU(QuantizedMoeExpertsUnmerged):
             requires_grad=False,
         )
         self.down_proj_weight = torch.nn.Parameter(
-            torch.empty(
-                self.group_size, dim, moe_inter_dim // 2, dtype=torch.uint8
-            ),
+            torch.empty(self.group_size, dim, moe_inter_dim // 2, dtype=torch.uint8),
             requires_grad=False,
         )
         self.down_proj_weight_scale = torch.nn.Parameter(
@@ -164,7 +164,9 @@ class Mxfp4MoeExpertsUnmergedGCU(QuantizedMoeExpertsUnmerged):
         self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         if x_scale is not None:
-            raise ValueError("The MXFP4 BF16 fallback does not accept quantized activations")
+            raise ValueError(
+                "The MXFP4 BF16 fallback does not accept quantized activations"
+            )
         return linear_mxfp4_dequant(
             x, self.gate_proj_weight[i], self.gate_proj_weight_scale[i]
         )
@@ -174,7 +176,9 @@ class Mxfp4MoeExpertsUnmergedGCU(QuantizedMoeExpertsUnmerged):
         self, i: int, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         if x_scale is not None:
-            raise ValueError("The MXFP4 BF16 fallback does not accept quantized activations")
+            raise ValueError(
+                "The MXFP4 BF16 fallback does not accept quantized activations"
+            )
         return linear_mxfp4_dequant(
             x, self.up_proj_weight[i], self.up_proj_weight_scale[i]
         )

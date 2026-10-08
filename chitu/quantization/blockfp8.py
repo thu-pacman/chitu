@@ -190,9 +190,7 @@ def _ensure_gcu_siluq_lazy_registration():
             device=source.device,
             dtype=torch.float32,
         )
-        torch.ops._C.silu_mul_per_token_group_quant(
-            quantized, scales, source_2d, bs
-        )
+        torch.ops._C.silu_mul_per_token_group_quant(quantized, scales, source_2d, bs)
         result = source.new_empty((rows, weight.shape[0]), dtype=source.dtype)
         residual_bias = (
             _dynamic_residual_bias_provider(weight)
@@ -217,9 +215,7 @@ def _ensure_gcu_siluq_lazy_registration():
     # functools.singledispatch resolves the annotation at registration time.
     # Set it explicitly so postponed annotations or the local scope cannot turn
     # the LazyTensor type into an unresolved string.
-    _gcu_siluq_block_fp8_linear.__annotations__["x"] = (
-        silu_and_mul.lazy_tensor_type()
-    )
+    _gcu_siluq_block_fp8_linear.__annotations__["x"] = silu_and_mul.lazy_tensor_type()
     _gcu_block_fp8_linear.register(_gcu_siluq_block_fp8_linear)
     _gcu_siluq_lazy_registered = True
 
@@ -479,8 +475,10 @@ class Blockfp8Linear(QuantizedLinearBase):
 
 @QuantizationRegistry.register_linear(
     "blockfp8",
-    when=lambda _: has_marlin
-    and parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize > 1,
+    when=lambda _: (
+        has_marlin
+        and parse_dtype(get_global_args().infer.raise_lower_bit_float_to).itemsize > 1
+    ),
     priority=1,
 )
 class Blockfp8LinearMarlinLayout(
@@ -498,14 +496,16 @@ class Blockfp8LinearMarlinLayout(
 
 @QuantizationRegistry.register_linear(
     "blockfp8",
-    when=lambda quant_kwargs: quant_kwargs.get("block_size", 128) == 128
-    and has_deep_gemm
-    and torch.get_default_dtype() == torch.bfloat16
-    and (
-        torch.cuda.get_device_capability()[0] == 9
-        or (
-            torch.cuda.get_device_capability()[0] == 10
-            and quant_kwargs.get("round_scale_to_pow2", False)
+    when=lambda quant_kwargs: (
+        quant_kwargs.get("block_size", 128) == 128
+        and has_deep_gemm
+        and torch.get_default_dtype() == torch.bfloat16
+        and (
+            torch.cuda.get_device_capability()[0] == 9
+            or (
+                torch.cuda.get_device_capability()[0] == 10
+                and quant_kwargs.get("round_scale_to_pow2", False)
+            )
         )
     ),
     priority=1,

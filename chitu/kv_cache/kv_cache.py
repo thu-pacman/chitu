@@ -242,9 +242,9 @@ class KVCacheBase:
             }
         self.dtype_dict = dtype_dict
 
-        self.tid_to_cached_len: dict[str, int] = (
-            {}
-        )  # Map from task_id to cached kvcache length of the task
+        self.tid_to_cached_len: dict[
+            str, int
+        ] = {}  # Map from task_id to cached kvcache length of the task
         self.curr_tids: Optional[list[str]] = None  # current task ids in model run.
 
         prefill_chunk_size_global = get_global_args().infer.prefill_chunk_size
@@ -392,9 +392,7 @@ class KVCacheBase:
             self.seq_len_delta.copy_from_list_classic_decode(
                 cached_token_lens,
                 next_token_lens,
-                old_device_tensor_is_used=not isinstance(
-                    self, SingletonPagedKVCache
-                ),
+                old_device_tensor_is_used=not isinstance(self, SingletonPagedKVCache),
             )
         else:
             self.seq_len_delta.copy_from_list(cached_token_lens, next_token_lens)
@@ -535,8 +533,7 @@ class PagedKVCache(KVCacheBase):
             page_table_max_seq_len = int(page_table_max_seq_len)
             if page_table_max_seq_len < 0:
                 raise ValueError(
-                    "page_table_max_seq_len must be >= 0, "
-                    f"got {page_table_max_seq_len}"
+                    f"page_table_max_seq_len must be >= 0, got {page_table_max_seq_len}"
                 )
         self.page_table_max_seq_len = page_table_max_seq_len
         self.max_blocks_per_req = ceil_div(page_table_max_seq_len, block_size)
@@ -858,9 +855,9 @@ class PagedKVCache(KVCacheBase):
         # validate indices are within total blocks
         for idx in page_indices:
             assert 0 <= int(idx) < self.num_blocks, f"invalid page index: {idx}"
-        assert (
-            len(self.block_table[tid]) == 0
-        ), f"tid:{tid}, self.block_table[tid]:{self.block_table[tid]}"
+        assert len(self.block_table[tid]) == 0, (
+            f"tid:{tid}, self.block_table[tid]:{self.block_table[tid]}"
+        )
         self.block_table[tid] = list(int(x) for x in page_indices)
         self.tid_to_cached_len[tid] = int(prefix_length)
 
@@ -1020,9 +1017,9 @@ class SingletonPagedKVCache(PagedKVCache):
         Register transferred linear attention state into block table.
         For linear attention, each request uses exactly one block.
         """
-        assert (
-            0 <= int(page_index) < self.num_blocks
-        ), f"invalid page index: {page_index}"
+        assert 0 <= int(page_index) < self.num_blocks, (
+            f"invalid page index: {page_index}"
+        )
         self.block_table[tid] = [int(page_index)]
         self.tid_to_cached_len[tid] = prefix_length
 
@@ -1035,9 +1032,9 @@ class SingletonPagedKVCache(PagedKVCache):
         Unlike insert_kv_cache_from_transfer, this doesn't require empty block_table
         since SingletonPagedKVCache may have allocated a block during prepare_cache_prefill.
         """
-        assert (
-            0 <= int(page_index) < self.num_blocks
-        ), f"invalid page index: {page_index}"
+        assert 0 <= int(page_index) < self.num_blocks, (
+            f"invalid page index: {page_index}"
+        )
         self.block_table[tid] = [int(page_index)]
         self.tid_to_cached_len[tid] = prefix_length
 
@@ -1319,7 +1316,8 @@ class DenseKVCache(KVCacheBase):
         self.sidecar_free: list[int] = list(range(num_hot_req))
         self.sidecar_slots_static = (
             StaticTensor(max_nelem=num_hot_req, dtype=torch.int32, device=self.device)
-            if self._use_sidecar else None
+            if self._use_sidecar
+            else None
         )
         self._last_sidecar_slots: Optional[tuple[int, ...]] = None
 
@@ -1427,9 +1425,9 @@ class DenseKVCache(KVCacheBase):
         self._prepare_cache(task_ids, start_pos)
 
     def _prepare_cache(self, task_ids: list[str], start_pos: int):
-        assert (
-            start_pos + len(task_ids) <= self.num_hot_req
-        ), f"start_pos:{start_pos}, number of req:{len(task_ids)}, num_hot_req:{self.num_hot_req}"
+        assert start_pos + len(task_ids) <= self.num_hot_req, (
+            f"start_pos:{start_pos}, number of req:{len(task_ids)}, num_hot_req:{self.num_hot_req}"
+        )
         for key in self.kv_buffer:
             self.prepared_cache[key] = self.kv_buffer[key][
                 :, start_pos : start_pos + len(task_ids)
@@ -1464,11 +1462,14 @@ class DenseKVCache(KVCacheBase):
         sidecar_slots = self.sidecar_slots_static.get() if self._use_sidecar else None
         sidecar_key = (
             self.kv_buffer["k"][local_layer_id].data_ptr()
-            if self._use_sidecar and "k" in self.kv_buffer else None
+            if self._use_sidecar and "k" in self.kv_buffer
+            else None
         )
         return DenseKVCacheAccessor(
-            ret_kv, self.use_i64_offsets,
-            sidecar_slots=sidecar_slots, sidecar_key=sidecar_key,
+            ret_kv,
+            self.use_i64_offsets,
+            sidecar_slots=sidecar_slots,
+            sidecar_key=sidecar_key,
         )
 
     def _copy_cache_slot(self, dst_slot: int, src_slot: int):

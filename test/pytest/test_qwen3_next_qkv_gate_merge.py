@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import torch
 from torch import nn
 
@@ -16,9 +20,7 @@ class _FakeBlockfp8Linear(nn.Module):
         self.gather_output = False
         values = torch.arange(out_features * in_features, dtype=torch.float32)
         values = ((values % 31) - 15).reshape(out_features, in_features) / 16
-        self.weight = nn.Parameter(
-            values.to(torch.float8_e4m3fn), requires_grad=False
-        )
+        self.weight = nn.Parameter(values.to(torch.float8_e4m3fn), requires_grad=False)
         self.scale = nn.Parameter(
             torch.ones(out_features // 128, in_features // 128),
             requires_grad=False,
@@ -47,10 +49,8 @@ def test_qkv_gate_merge_is_exact_and_preserves_public_state_dict(monkeypatch):
     expected_gate = gate(x)
     expected_keys = set(attention.state_dict())
 
-    merged, qkv_n = (
-        qwen3_next.AttentionQwen3Next._get_gcu_qkv_gate_merged_projection(
-            attention
-        )
+    merged, qkv_n = qwen3_next.AttentionQwen3Next._get_gcu_qkv_gate_merged_projection(
+        attention
     )
     actual = merged(x)
 
@@ -73,9 +73,7 @@ def test_qkv_gate_merge_fails_closed_for_tp2(monkeypatch):
     )
 
     assert (
-        qwen3_next.AttentionQwen3Next._get_gcu_qkv_gate_merged_projection(
-            attention
-        )
+        qwen3_next.AttentionQwen3Next._get_gcu_qkv_gate_merged_projection(attention)
         is None
     )
     assert attention._gcu_qkv_gate_merge_state is False

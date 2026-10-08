@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Exact paged recurrent-state read plus FP32 decay for Enflame GCU.
 
 This module is intentionally imported only by the opt-in Qwen3-Next classic

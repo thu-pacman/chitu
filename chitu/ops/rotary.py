@@ -33,9 +33,7 @@ has_triton_impl = has_triton and has_accelerator()
 # Partial-head RoPE needs a contiguous staging buffer on GCU. Keep that path
 # fail-closed until it has passed the actual-model correctness gate; synthetic
 # operator tests can opt in explicitly.
-_GCU_ROTARY_ALLOW_STRIDED = (
-    os.environ.get("CHITU_GCU_ROTARY_ALLOW_STRIDED", "0") == "1"
-)
+_GCU_ROTARY_ALLOW_STRIDED = os.environ.get("CHITU_GCU_ROTARY_ALLOW_STRIDED", "0") == "1"
 
 if has_triton_impl:
     from chitu.ops.triton_ops import (
@@ -110,22 +108,14 @@ def _gcu_rotary_supported(
         # GCU handler stages such views through contiguous work buffers.
         and (
             (q.is_contiguous() and k.is_contiguous())
-            or (
-                _GCU_ROTARY_ALLOW_STRIDED
-                and q.stride(-1) == 1
-                and k.stride(-1) == 1
-            )
+            or (_GCU_ROTARY_ALLOW_STRIDED and q.stride(-1) == 1 and k.stride(-1) == 1)
         )
         and not _shares_storage(q, k)
         and freqs_cis.cos.shape == freqs_cis.sin.shape
         and freqs_cis.cos.shape == (q.shape[0], q.shape[-1] // 2)
         and _gcu_rotary_output_supported(q_out, q, k)
         and _gcu_rotary_output_supported(k_out, k, q)
-        and (
-            q_out is None
-            or k_out is None
-            or not _shares_storage(q_out, k_out)
-        )
+        and (q_out is None or k_out is None or not _shares_storage(q_out, k_out))
     )
 
 
@@ -583,9 +573,7 @@ def apply_rotary_pos_emb_gcu(
     out-of-place semantics. Unsupported layouts deliberately use the reference
     implementation rather than weakening its guards.
     """
-    supported = _gcu_rotary_supported(
-        q, k, freqs_cis, q_out, k_out, rotary_type
-    )
+    supported = _gcu_rotary_supported(q, k, freqs_cis, q_out, k_out, rotary_type)
     if not supported:
         return apply_rotary_pos_emb_torch(
             q,
@@ -619,11 +607,7 @@ def apply_rotary_pos_emb_gcu(
     rows = q.shape[0]
     positions = getattr(freqs_cis, "_gcu_local_positions", None)
     cos_sin = getattr(freqs_cis, "_gcu_cos_sin", None)
-    if (
-        positions is None
-        or positions.shape != (rows,)
-        or positions.device != q.device
-    ):
+    if positions is None or positions.shape != (rows,) or positions.device != q.device:
         positions = torch.arange(rows, device=q.device, dtype=torch.int32)
         freqs_cis._gcu_local_positions = positions
     cos_sources = getattr(freqs_cis, "_gcu_cos_sin_sources", None)

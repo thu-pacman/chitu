@@ -94,7 +94,9 @@ _DECODE_READS_DENSE_FAVARLEN = (
     and not _GCU_DECODE_FLASH
     and not _GCU_DECODE_PAGED
 )
-_gcu_paged_available = None  # lazily-probed: are `paged_attention_v1` + `reshape_and_cache` loaded?
+_gcu_paged_available = (
+    None  # lazily-probed: are `paged_attention_v1` + `reshape_and_cache` loaded?
+)
 
 
 def _paged_ops_available():
@@ -140,9 +142,7 @@ class GcuAttnBackend(RefAttnBackend):
         sinks=None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
-        window_unsupported = (
-            window_size is not None and tuple(window_size) != (-1, -1)
-        )
+        window_unsupported = window_size is not None and tuple(window_size) != (-1, -1)
         unsupported = (
             not has_flash_attn
             or os.environ.get("CHITU_GCU_NO_FLASH_PREFILL")
@@ -248,7 +248,9 @@ class GcuAttnBackend(RefAttnBackend):
             nb = B * bpp
             dev, dt = kv_cache.k.device, kv_cache.k.dtype
             ent = (
-                torch.zeros(nb, kv_h, d // x, _GCU_PAGED_BLOCK, x, dtype=dt, device=dev),
+                torch.zeros(
+                    nb, kv_h, d // x, _GCU_PAGED_BLOCK, x, dtype=dt, device=dev
+                ),
                 torch.zeros(nb, kv_h, d, _GCU_PAGED_BLOCK, dtype=dt, device=dev),
                 bpp,
             )
@@ -341,9 +343,29 @@ class GcuAttnBackend(RefAttnBackend):
 
         max_seq = int(get_global_args().infer.max_seq_len)
         torch.ops._C.paged_attention_v1(
-            out, q.contiguous(), kc, vc, kv_h, softmax_scale,
-            block_tables, seq_lens, _GCU_PAGED_BLOCK, max_seq,
-            None, "auto", 1.0, 1.0, 0, 0, 0, 64, 0, 0.0, 0.0, None, None,
+            out,
+            q.contiguous(),
+            kc,
+            vc,
+            kv_h,
+            softmax_scale,
+            block_tables,
+            seq_lens,
+            _GCU_PAGED_BLOCK,
+            max_seq,
+            None,
+            "auto",
+            1.0,
+            1.0,
+            0,
+            0,
+            0,
+            64,
+            0,
+            0.0,
+            0.0,
+            None,
+            None,
         )
         return out
 
@@ -427,7 +449,9 @@ class GcuAttnBackend(RefAttnBackend):
         `fast` iff every request is pooled AND its slot is contiguous up to its old length."""
         P = _GCU_PREFILL_POOL
         self._pp_step += 1
-        regions = region_map.tolist()  # local idx -> region (one small sync; prefill is eager)
+        regions = (
+            region_map.tolist()
+        )  # local idx -> region (one small sync; prefill is eager)
         old_lens = seq_len_delta.old.lens_list
         new_lens = seq_len_delta.new.lens_list
         active = set(regions)
@@ -525,8 +549,15 @@ class GcuAttnBackend(RefAttnBackend):
             if seq_len_delta.old.max_len == 0:
                 # Single chunk: the raw k/v ARE the full context (attends to itself, causal).
                 return self.prefill_ragged_qkvo(
-                    q, k, v, seq_len_delta, causal=causal, window_size=window_size,
-                    softcap=softcap, softmax_scale=softmax_scale, sinks=sinks,
+                    q,
+                    k,
+                    v,
+                    seq_len_delta,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=softcap,
+                    softmax_scale=softmax_scale,
+                    sinks=sinks,
                     topk_indices=topk_indices,
                 )
             # Chunked prefill: attend this chunk's q over the full prior context (cu_q=delta,
@@ -552,8 +583,15 @@ class GcuAttnBackend(RefAttnBackend):
                         plan["new_pool_ids"],
                     )
             return self.prefill_ragged_qkvo(
-                q, k_full, v_full, seq_len_delta, causal=causal, window_size=window_size,
-                softcap=softcap, softmax_scale=softmax_scale, sinks=sinks,
+                q,
+                k_full,
+                v_full,
+                seq_len_delta,
+                causal=causal,
+                window_size=window_size,
+                softcap=softcap,
+                softmax_scale=softmax_scale,
+                sinks=sinks,
                 topk_indices=topk_indices,
             )
         out = super().prefill_ragged_qo_dense_kv(
@@ -575,12 +613,22 @@ class GcuAttnBackend(RefAttnBackend):
         # The paged sidecar is only needed when decode reads it back (paged / no-dense paths).
         # Under the default dense fa-varlen decode it is never read, so seeding it here is a dead
         # store; skip it.
-        if paged and not (_GCU_SKIP_UNUSED_PAGED_PREFILL and _DECODE_READS_DENSE_FAVARLEN):
+        if paged and not (
+            _GCU_SKIP_UNUSED_PAGED_PREFILL and _DECODE_READS_DENSE_FAVARLEN
+        ):
             kc, vc, bpp = self._vendor_paged_cache(kv_cache)
             slot = self._paged_slots(seq_len_delta, bpp, region_map)
             torch.ops._C_cache_ops.reshape_and_cache(
-                k.contiguous(), v.contiguous(), kc, vc, slot,
-                "auto", 1.0, 1.0, 0.0, 0.0,
+                k.contiguous(),
+                v.contiguous(),
+                kc,
+                vc,
+                slot,
+                "auto",
+                1.0,
+                1.0,
+                0.0,
+                0.0,
             )
         return out
 
@@ -621,12 +669,14 @@ class GcuAttnBackend(RefAttnBackend):
         )
         if paged_ok and not use_favarlen and not _GCU_DECODE_FLASH:
             return self._decode_paged_vendor(
-                q, kv_cache, k, v,
-                seq_len_delta=seq_len_delta, softmax_scale=softmax_scale,
+                q,
+                kv_cache,
+                k,
+                v,
+                seq_len_delta=seq_len_delta,
+                softmax_scale=softmax_scale,
             )
-        window_unsupported = (
-            window_size is not None and tuple(window_size) != (-1, -1)
-        )
+        window_unsupported = window_size is not None and tuple(window_size) != (-1, -1)
         unsupported = (
             not has_flash_attn
             or os.environ.get("CHITU_GCU_NO_FLASH_DECODE")
@@ -714,7 +764,9 @@ class GcuAttnBackend(RefAttnBackend):
         kc, vc = kv_cache.k, kv_cache.v
         B, max_seq, kv_h, d = kc.shape
         PB = _GCU_FAVARLEN_BLOCK
-        while max_seq % PB != 0 and PB > 1:  # block size must divide max_seq (host-side, graph-safe)
+        while (
+            max_seq % PB != 0 and PB > 1
+        ):  # block size must divide max_seq (host-side, graph-safe)
             PB //= 2
         nblk = max_seq // PB
         kc_b = kc.reshape(B * nblk, PB, kv_h, d)
@@ -735,14 +787,19 @@ class GcuAttnBackend(RefAttnBackend):
                 cache[key] = metadata
             block_table, cu_seqlens_q = metadata
         else:
-            block_table = (
-                torch.arange(B, device=dev, dtype=torch.int32).unsqueeze(1) * nblk
-                + torch.arange(nblk, device=dev, dtype=torch.int32).unsqueeze(0)
-            )
+            block_table = torch.arange(B, device=dev, dtype=torch.int32).unsqueeze(
+                1
+            ) * nblk + torch.arange(nblk, device=dev, dtype=torch.int32).unsqueeze(0)
             cu_seqlens_q = torch.arange(0, B + 1, device=dev, dtype=torch.int32)
         return _fa_varlen(
-            q, kc_b, vc_b,
-            max_seqlen_q=1, cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_k=max_seq, seqused_k=seqused_k,
-            causal=True, softmax_scale=softmax_scale, block_table=block_table,
+            q,
+            kc_b,
+            vc_b,
+            max_seqlen_q=1,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=max_seq,
+            seqused_k=seqused_k,
+            causal=True,
+            softmax_scale=softmax_scale,
+            block_table=block_table,
         )

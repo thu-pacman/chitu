@@ -87,9 +87,9 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> tuple[Any, bool]:
         "hpc_ops",
         "nvidia-ml-py",
     }
-    assert (
-        opt_dep_name in opt_deps
-    ), f"To chitu developers: Please don't use {opt_dep_name} as an optional dependency name, it is not listed in get_requires.py."
+    assert opt_dep_name in opt_deps, (
+        f"To chitu developers: Please don't use {opt_dep_name} as an optional dependency name, it is not listed in get_requires.py."
+    )
 
     try:
         return importlib.import_module(pkg_name), True
@@ -204,7 +204,9 @@ def ensure_gcu_c_ops():
             old_flags = sys.getdlopenflags()
             sys.setdlopenflags(os.RTLD_LAZY | os.RTLD_GLOBAL)
             try:
-                cspec = importlib.util.spec_from_file_location("vllm_gcu._C", so_files[0])
+                cspec = importlib.util.spec_from_file_location(
+                    "vllm_gcu._C", so_files[0]
+                )
                 mod = importlib.util.module_from_spec(cspec)
                 cspec.loader.exec_module(mod)
             finally:

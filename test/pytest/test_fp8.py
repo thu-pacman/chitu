@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import torch
 import pytest
 from omegaconf import OmegaConf
@@ -35,9 +39,7 @@ def test_gcu_lazy_silu_blockfp8_linear_is_bit_exact(rows):
     )
     block_size = 128
     in_features = out_features = 256
-    source = torch.randn(
-        (rows, in_features * 2), device="cuda", dtype=torch.bfloat16
-    )
+    source = torch.randn((rows, in_features * 2), device="cuda", dtype=torch.bfloat16)
     weight_fp32 = torch.randn(
         (out_features, in_features), device="cuda", dtype=torch.float32
     )
@@ -47,9 +49,7 @@ def test_gcu_lazy_silu_blockfp8_linear_is_bit_exact(rows):
         in_features // block_size,
         block_size,
     )
-    weight_scale = (
-        weight_blocks.abs().amax(dim=1).amax(dim=-1).clamp(min=1e-5) / 448.0
-    )
+    weight_scale = weight_blocks.abs().amax(dim=1).amax(dim=-1).clamp(min=1e-5) / 448.0
     weight = (
         (weight_blocks / weight_scale[:, None, :, None])
         .clamp(-448.0, 448.0)

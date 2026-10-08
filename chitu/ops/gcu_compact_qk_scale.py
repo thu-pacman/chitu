@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 """Exact compact Q/K post-norm scaling for Qwen3-Next on Enflame GCU.
 
 The fixed decode path has two BF16 RMSNorm outputs.  This kernel preserves the

@@ -168,9 +168,9 @@ class BatchedSeqLen:
         Args:
             lens_tensor: Tensor of sequence lengths [batch_size], must be on same device.
         """
-        assert (
-            lens_tensor.device == self.device
-        ), f"Device mismatch: {lens_tensor.device} vs {self.device}"
+        assert lens_tensor.device == self.device, (
+            f"Device mismatch: {lens_tensor.device} vs {self.device}"
+        )
         self.lens_list = lens_tensor.tolist()
         self.lens_static_tensor_device.set(lens_tensor.to(torch.int32))
 
@@ -188,9 +188,9 @@ class BatchedSeqLen:
         invalidate_cached_property(self, "max_len")
 
     def copy_from(self, other: "BatchedSeqLen"):
-        assert (
-            self.device == other.device
-        ), f"Device mismatch: {self.device} vs {other.device}"
+        assert self.device == other.device, (
+            f"Device mismatch: {self.device} vs {other.device}"
+        )
         self.lens_list = other.lens_list
         self.lens_static_tensor_device.set(other.lens_tensor_device)
 

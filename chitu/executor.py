@@ -102,9 +102,11 @@ def _phase_tick():
     if _PHASE_N[0] % 40 == 0:
         n = _PHASE_N[0]
         parts = "  ".join(
-            f"{k}={v / n:.2f}" for k, v in sorted(_PHASE_MS.items(), key=lambda x: -x[1])
+            f"{k}={v / n:.2f}"
+            for k, v in sorted(_PHASE_MS.items(), key=lambda x: -x[1])
         )
         logger.info(f"[PHASE ms/step avg over {n}] {parts}")
+
 
 # Although tags are not fully supported in the NCCL backend, they are helpful to understand the code
 TASK_TENSOR_TAG = 1
@@ -381,7 +383,7 @@ class PipeDispatcher(TasksDispatcher):
 
             self.recv_socket = self.ctx.socket(zmq.PULL)
             self.recv_socket.connect(self.recv_url)
-            logger.info(f"PP stage {self.prev_rank} → {self.rank}: " f"{self.recv_url}")
+            logger.info(f"PP stage {self.prev_rank} → {self.rank}: {self.recv_url}")
 
         self.pp_group.barrier()
 
@@ -700,9 +702,9 @@ class ExpertDataDispatcher(TasksDispatcher):
             if extra_info.get("boot_ids", None) is not None:
                 logger.debug(f"DP rank {self.rank_in_group} received decode bootstrap")
                 boot_ids = extra_info["boot_ids"]
-                assert all(
-                    task_id in TaskPool.pool for task_id in boot_ids
-                ), "Bootstrap ID not in task pool"
+                assert all(task_id in TaskPool.pool for task_id in boot_ids), (
+                    "Bootstrap ID not in task pool"
+                )
                 # PD decode-only: prepare TransferInfo on worker ranks immediately upon bootstrap.
                 kv_hook = self.get_executor().get_kv_hook()
                 kv_manager = getattr(kv_hook, "kv_manager", None)
@@ -848,7 +850,6 @@ class ExpertDataDispatcher(TasksDispatcher):
 
 
 class Executor:
-
     @classmethod
     def build(cls, args) -> "Executor":
         return cls(args)

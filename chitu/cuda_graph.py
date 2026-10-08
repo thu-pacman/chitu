@@ -84,7 +84,6 @@ def make_dispatched_graphed_callables(
         )
 
     if enable:
-
         graph_dict: dict[Any, torch.cuda.CUDAGraph] = {}
         cuda_graph_pool = None
 

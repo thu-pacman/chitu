@@ -431,9 +431,9 @@ def resolve_default_args(args):
     if args.infer.embed_tokens_lm_head_tp_size == "auto":
         args.infer.embed_tokens_lm_head_tp_size = args.infer.tp_size
     else:
-        assert (
-            args.infer.embed_tokens_lm_head_tp_size.isdigit()
-        ), "embed_tokens_lm_head_tp_size must be auto or an integer"
+        assert args.infer.embed_tokens_lm_head_tp_size.isdigit(), (
+            "embed_tokens_lm_head_tp_size must be auto or an integer"
+        )
 
     from chitu.models.registry import ModelType
 
@@ -556,9 +556,9 @@ def _apply_multi_inst_override(cfg: Any, override_inst_id: Optional[int] = None)
     }
 
     inst_id_value = getattr(multi_inst, "inst_id", None)
-    assert (
-        override_inst_id is not None or inst_id_value is not None
-    ), "multi_inst.inst_id must be set when applying an instance config"
+    assert override_inst_id is not None or inst_id_value is not None, (
+        "multi_inst.inst_id must be set when applying an instance config"
+    )
 
     inst_id = int(inst_id_value if override_inst_id is None else override_inst_id)
     if inst_id not in normalized_overrides:

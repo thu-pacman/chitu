@@ -74,24 +74,15 @@ def rms_norm_gate_torch(
     )
     use_gcu_dual_widen = (
         use_gcu_elementwise_tail
-        and os.environ.get(
-            "CHITU_GCU_QWEN3_NEXT_GATED_RMS_DUAL_WIDEN", "0"
-        )
-        == "1"
+        and os.environ.get("CHITU_GCU_QWEN3_NEXT_GATED_RMS_DUAL_WIDEN", "0") == "1"
     )
     use_gcu_widen_square = (
         use_gcu_dual_widen
-        and os.environ.get(
-            "CHITU_GCU_QWEN3_NEXT_GATED_RMS_WIDEN_SQUARE", "0"
-        )
-        == "1"
+        and os.environ.get("CHITU_GCU_QWEN3_NEXT_GATED_RMS_WIDEN_SQUARE", "0") == "1"
     )
     use_gcu_add_rsqrt = (
         use_gcu_widen_square
-        and os.environ.get(
-            "CHITU_GCU_QWEN3_NEXT_GATED_RMS_ADD_RSQRT", "0"
-        )
-        == "1"
+        and os.environ.get("CHITU_GCU_QWEN3_NEXT_GATED_RMS_ADD_RSQRT", "0") == "1"
     )
     x_square = None
     if use_gcu_dual_widen:
@@ -107,9 +98,7 @@ def rms_norm_gate_torch(
         x = x.to(compute_dtype)
         gate = gate.to(compute_dtype)
     # weight = weight.to(compute_dtype)
-    variance = (x.pow(2) if x_square is None else x_square).mean(
-        -1, keepdim=True
-    )
+    variance = (x.pow(2) if x_square is None else x_square).mean(-1, keepdim=True)
     if use_gcu_add_rsqrt:
         from chitu.ops.gcu_gated_rms_tail import add_rsqrt
 

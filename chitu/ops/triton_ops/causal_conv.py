@@ -138,12 +138,12 @@ def causal_conv1d_update_triton(
 
     # Check shape
 
-    assert (
-        this_hidden_states.stride()[-1] == 1
-    ), f"The last dim of this_hidden_states should be continuous"
-    assert (
-        old_hidden_states.stride()[-1] == 1
-    ), f"The last dim of old_hidden_states should be continuous"
+    assert this_hidden_states.stride()[-1] == 1, (
+        f"The last dim of this_hidden_states should be continuous"
+    )
+    assert old_hidden_states.stride()[-1] == 1, (
+        f"The last dim of old_hidden_states should be continuous"
+    )
     assert weight.is_contiguous(), f"weight should be contiguous"
 
     bsz, hidden_size = this_hidden_states.shape
@@ -153,7 +153,9 @@ def causal_conv1d_update_triton(
         hidden_size,
         1,
         state_len,
-    ), f"weight shape mismatch: expected ({hidden_size}, 1, {state_len}), got {weight.shape}"
+    ), (
+        f"weight shape mismatch: expected ({hidden_size}, 1, {state_len}), got {weight.shape}"
+    )
 
     # allocate output
     out = torch.empty_like(this_hidden_states)
@@ -239,9 +241,7 @@ def causal_conv1d_update_gcu_b1_inplace_kernel(
     )
     current = tl.load(this_ptr + h, mask=mask, other=0.0)
     weight = tl.load(weight_ptr + state_offsets, mask=mask[:, None], other=0.0)
-    new_state = tl.where(taps[None, :] == 3, current[:, None], shifted).to(
-        weight.dtype
-    )
+    new_state = tl.where(taps[None, :] == 3, current[:, None], shifted).to(weight.dtype)
     result = tl.sum(new_state.to(tl.float32) * weight, axis=1)
     output = result * tl.sigmoid(result)
 

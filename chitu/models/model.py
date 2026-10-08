@@ -216,7 +216,6 @@ class Attention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -571,9 +570,9 @@ class Transformer(nn.Module):
                 if name.split(".")[-1] in self._get_1d_out_tensor_names(
                     quant, quant_kwargs
                 ):
-                    assert (
-                        param.dim() == 1
-                    ), f"{name} is expected to be 1D, but got {param.dim()}D"
+                    assert param.dim() == 1, (
+                        f"{name} is expected to be 1D, but got {param.dim()}D"
+                    )
                     if param.shape[-1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
@@ -584,17 +583,17 @@ class Transformer(nn.Module):
                         chunks = torch.chunk(param, tp_or_etp_size, dim=-1)
                         partial_checkpoint[name] = chunks[tp_or_etp_rank]
                 elif name.split(".")[-1] in self._get_1d_in_tensor_names(quant):
-                    assert (
-                        param.dim() == 1
-                    ), f"{name} is expected to be 1D, but got {param.dim()}D"
+                    assert param.dim() == 1, (
+                        f"{name} is expected to be 1D, but got {param.dim()}D"
+                    )
                     if get_tp_group().rank_in_group == 0:
                         partial_checkpoint[name] = param
                 elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(
                     quant, quant_kwargs
                 ):
-                    assert (
-                        param.dim() >= 2
-                    ), f"{name} is expected to be >=2D, but got {param.dim()}D"
+                    assert param.dim() >= 2, (
+                        f"{name} is expected to be >=2D, but got {param.dim()}D"
+                    )
                     if param.shape[-2] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
@@ -605,9 +604,9 @@ class Transformer(nn.Module):
                         chunks = torch.chunk(param, tp_or_etp_size, dim=-2)
                         partial_checkpoint[name] = chunks[tp_or_etp_rank]
                 elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names(quant):
-                    assert (
-                        param.dim() >= 2
-                    ), f"{name} is expected to be >=2D, but got {param.dim()}D"
+                    assert param.dim() >= 2, (
+                        f"{name} is expected to be >=2D, but got {param.dim()}D"
+                    )
                     if param.shape[-1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
@@ -623,9 +622,9 @@ class Transformer(nn.Module):
 
             elif any(is_layer(s, name) for s in rpl_names):
                 if name.split(".")[-1] in self._get_1d_in_tensor_names(quant):
-                    assert (
-                        param.dim() == 1
-                    ), f"{name} is expected to be 1D, but got {param.dim()}D"
+                    assert param.dim() == 1, (
+                        f"{name} is expected to be 1D, but got {param.dim()}D"
+                    )
                     if param.shape[-1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
@@ -638,9 +637,9 @@ class Transformer(nn.Module):
                 elif name.split(".")[-1] in self._get_1d_out_tensor_names(
                     quant, quant_kwargs
                 ):
-                    assert (
-                        param.dim() == 1
-                    ), f"{name} is expected to be 1D, but got {param.dim()}D"
+                    assert param.dim() == 1, (
+                        f"{name} is expected to be 1D, but got {param.dim()}D"
+                    )
                     if name.split(".")[-1] == "bias":
                         if get_tp_group().rank_in_group != 0:
                             continue
@@ -648,9 +647,9 @@ class Transformer(nn.Module):
                 elif name.split(".")[-1] in self._get_2d_out_x_in_tensor_names(
                     quant, quant_kwargs
                 ):
-                    assert (
-                        param.dim() >= 2
-                    ), f"{name} is expected to be >=2D, but got {param.dim()}D"
+                    assert param.dim() >= 2, (
+                        f"{name} is expected to be >=2D, but got {param.dim()}D"
+                    )
                     if param.shape[-1] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
@@ -661,9 +660,9 @@ class Transformer(nn.Module):
                         chunks = torch.chunk(param, tp_or_etp_size, dim=-1)
                         partial_checkpoint[name] = chunks[tp_or_etp_rank]
                 elif name.split(".")[-1] in self._get_2d_in_x_out_tensor_names(quant):
-                    assert (
-                        param.dim() >= 2
-                    ), f"{name} is expected to be >=2D, but got {param.dim()}D"
+                    assert param.dim() >= 2, (
+                        f"{name} is expected to be >=2D, but got {param.dim()}D"
+                    )
                     if param.shape[-2] == 1:  # Broadcast
                         partial_checkpoint[name] = param
                     else:
@@ -1718,7 +1717,6 @@ class Transformer(nn.Module):
             extra_inputs_mtp, extra_inputs_mtp_max_nelem = (), ()
 
         if self.do_decode_callable is None:
-
             before_replay_callback = None
 
             if is_ascend() and not (
@@ -1731,13 +1729,13 @@ class Transformer(nn.Module):
                     # DSA sparse MLA read only min(seq_len, topk) KV positions, NOT the full context length.
                     # `prepare_decoding_attn` -> `prepare_sparse_mla_metadata` recomputes this host list on
                     # every decode step (before each replay).
-                    actual_seq_lengths_kv_fn = (
-                        lambda: self.attn_backend.actual_seq_lengths_kv
+                    actual_seq_lengths_kv_fn = lambda: (
+                        self.attn_backend.actual_seq_lengths_kv
                     )
                 else:
-                    actual_seq_lengths_kv_fn = lambda: self.cache_dict[
-                        "main"
-                    ].seq_len_delta.new.lens_list
+                    actual_seq_lengths_kv_fn = lambda: (
+                        self.cache_dict["main"].seq_len_delta.new.lens_list
+                    )
 
                 before_replay_callback = lambda graph: graph.update(
                     cpu_update_input=[
@@ -1755,8 +1753,8 @@ class Transformer(nn.Module):
             tokens_max_nelem = self.max_batch_size_per_dp * numel_per_seq(
                 batch_size, tokens
             )
-            output_max_nelem_callback = (
-                lambda key, out: numel_per_seq(key[0], out) * self.max_batch_size_per_dp
+            output_max_nelem_callback = lambda key, out: (
+                numel_per_seq(key[0], out) * self.max_batch_size_per_dp
             )
 
             @make_dispatched_graphed_callables(
@@ -1828,7 +1826,6 @@ class Transformer(nn.Module):
                     self.do_empty_decode_callable_mtp = do_empty_decode_mtp
 
         if batch_size != 0:
-
             if self.mtp_size > 1:
                 return self.mtp_decode_no_pipeline_total(
                     tokens,
@@ -2219,14 +2216,14 @@ def get_linear_layout_native_y(
             else args.models.quant_config.type
         )
         if quant_method is None:
-            assert (
-                len(quant_kwargs.get(None, {})) == 0
-            ), "quant_kwargs is not supported for muxi_custom_kernel"
+            assert len(quant_kwargs.get(None, {})) == 0, (
+                "quant_kwargs is not supported for muxi_custom_kernel"
+            )
             return LinearMuxiLayoutNativeY
         elif quant_method == "blockfp8":
-            assert (
-                len(quant_kwargs.get("blockfp8", {})) == 0
-            ), "quant_kwargs is not supported for muxi_custom_kernel"
+            assert len(quant_kwargs.get("blockfp8", {})) == 0, (
+                "quant_kwargs is not supported for muxi_custom_kernel"
+            )
             # Blockfp8LinearMuxiLayoutNativeY is not implemented. Fall back.
             return Blockfp8LinearMuxiLayoutContigY
         else:
@@ -2255,14 +2252,14 @@ def get_linear_layout_contig_y(
         # FIXME: get layer-specifc quant_method via get_quant_from_checkpoint_prefix
 
         if quant_method is None:
-            assert (
-                len(quant_kwargs.get(None, {})) == 0
-            ), "quant_kwargs is not supported for muxi_custom_kernel"
+            assert len(quant_kwargs.get(None, {})) == 0, (
+                "quant_kwargs is not supported for muxi_custom_kernel"
+            )
             return LinearMuxiLayoutContigY
         elif quant_method == "blockfp8":
-            assert (
-                len(quant_kwargs.get("blockfp8", {})) == 0
-            ), "quant_kwargs is not supported for muxi_custom_kernel"
+            assert len(quant_kwargs.get("blockfp8", {})) == 0, (
+                "quant_kwargs is not supported for muxi_custom_kernel"
+            )
             return Blockfp8LinearMuxiLayoutContigY
         else:
             raise NotImplementedError(

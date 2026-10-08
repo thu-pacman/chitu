@@ -5,12 +5,14 @@
 import logging
 from dataclasses import dataclass, field
 import torch
+
 try:
     from xgrammar import (
         allocate_token_bitmask,
         GrammarMatcher,
         BatchGrammarMatcher,
     )
+
     _HAS_XGRAMMAR = True
 except ImportError:
     # Grammar-constrained (guided) decoding is optional. The installed xgrammar may be
@@ -32,6 +34,7 @@ from chitu.utils import ceil_div, create_tensor, AsyncCPUTensor
 from chitu.backend import Backend
 
 import os as _os
+
 # Fast sort-free top-k/top-p sampling in PURE PYTORCH — stays in chitu's mainline (no vendor `_C`
 # op, no Triton, no ABI risk). chitu's default path sorts the whole vocab (~3.75ms/step @ bs16,
 # 152K vocab); this pre-filters to the batch's max top_k with torch.topk (one O(N) pass) and does
@@ -48,16 +51,19 @@ def _sortfree_topk_topp_sample(logits, top_ks, top_ps):
     max_k = int(top_ks.max())
     if max_k <= 0 or max_k >= V:
         return top_k_top_p_min_p_sampling_from_logits(logits, top_ks, top_ps)
-    vals, idx = torch.topk(logits, max_k, dim=-1)                      # [B, max_k], sorted desc
+    vals, idx = torch.topk(logits, max_k, dim=-1)  # [B, max_k], sorted desc
     ar = torch.arange(max_k, device=logits.device).view(1, -1)
     vals = vals.masked_fill(ar >= top_ks.view(-1, 1), float("-inf"))  # per-row top-k
     probs = torch.softmax(vals, dim=-1)
     csum = probs.cumsum(-1)
-    probs = probs * ((csum - probs) <= top_ps.view(-1, 1))            # per-row top-p (vals sorted)
+    probs = probs * (
+        (csum - probs) <= top_ps.view(-1, 1)
+    )  # per-row top-p (vals sorted)
     q = torch.empty_like(probs)
     q.exponential_()
-    sel = (probs / q).argmax(-1)                                      # gumbel sample ~ proportional
+    sel = (probs / q).argmax(-1)  # gumbel sample ~ proportional
     return torch.gather(idx, 1, sel.unsqueeze(1)).squeeze(1)
+
 
 from .utils import get_tokenizer_info, get_op_device
 

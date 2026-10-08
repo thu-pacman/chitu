@@ -260,7 +260,6 @@ def _build_indexer_cache(args):
     num_hot_req = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
 
     if args.infer.cache_type == "paged":
-
         block_size = (
             int(spec.block_size)
             if spec.block_size is not None
@@ -474,9 +473,9 @@ def _build_deepseek_v3_with_indexer_cache_managers(
         cache_dict["indexer"] = indexer
 
     if indexer.block_size == main_cache.block_size:
-        assert (
-            indexer.num_blocks == main_cache.num_blocks
-        ), f"{indexer.num_blocks} vs {main_cache.num_blocks}"
+        assert indexer.num_blocks == main_cache.num_blocks, (
+            f"{indexer.num_blocks} vs {main_cache.num_blocks}"
+        )
 
     return CacheBuildBundle(
         cache_type=args.infer.cache_type,

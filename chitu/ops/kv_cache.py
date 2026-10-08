@@ -83,9 +83,7 @@ def _get_gcu_fused_dense_kv_append():
                 raise RuntimeError(f"unsupported ABI version {abi_version()}")
             launch = library.launch_fused_dense_kv_append_v2
             launch.argtypes = (
-                [ctypes.c_void_p] * 6
-                + [ctypes.c_int] * 6
-                + [ctypes.c_void_p]
+                [ctypes.c_void_p] * 6 + [ctypes.c_int] * 6 + [ctypes.c_void_p]
             )
             launch.restype = ctypes.c_int
             launch_count = library.chitu_fused_dense_kv_append_launch_count_v2
@@ -656,7 +654,9 @@ def append_to_dense_kv_cache_pair_gcu(
         )
 
     def pointer(tensor):
-        return ctypes.c_void_p() if tensor is None else ctypes.c_void_p(tensor.data_ptr())
+        return (
+            ctypes.c_void_p() if tensor is None else ctypes.c_void_p(tensor.data_ptr())
+        )
 
     with torch.gcu.device(k_cache.device):
         stream = torch.gcu.current_stream(k_cache.device)

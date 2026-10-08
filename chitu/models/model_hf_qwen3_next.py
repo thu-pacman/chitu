@@ -33,7 +33,6 @@ from chitu.models.registry import ModelType, register_model
 from chitu.ops import (
     update_singleton_paged_kv_cache,
     read_from_singleton_paged_kv_cache,
-    apply_rotary_pos_emb_partial,
     qknorm_partial_rope,
     attn_output_gate,
     chunk_gated_delta_rule,
@@ -42,7 +41,6 @@ from chitu.ops import (
     recurrent_gated_delta_rule_all_state,
     silu_and_mul,
     causal_conv1d_update,
-    causal_conv1d_update_qwen3_next,
     causal_conv1d_update_qwen3_next_with_g,
     causal_conv1d_prefill,
     rms_norm_gate,
@@ -66,18 +64,20 @@ from chitu.utils import proportion_split
 from chitu.global_vars import get_global_args
 
 
-_GCU_QKV_GATE_MERGE_ENABLED = is_enflame() and os.environ.get(
-    "CHITU_GCU_QWEN3_NEXT_QKV_GATE_MERGE", "1"
-) != "0"
-_GCU_MTP_DIRECT_RECURRENT_CACHE_ENABLED = is_enflame() and os.environ.get(
-    "CHITU_GCU_QWEN3_NEXT_MTP_DIRECT_RECURRENT_CACHE", "0"
-) == "1"
-_GCU_COMPACT_QK_BATCH_ENABLED = is_enflame() and os.environ.get(
-    "CHITU_GCU_QWEN3_NEXT_COMPACT_QK_BATCH", "0"
-) == "1"
-_GCU_RECURRENCE_SINGLE_STEP_ENABLED = is_enflame() and os.environ.get(
-    "CHITU_GCU_QWEN3_NEXT_RECURRENCE_SINGLE_STEP", "0"
-) == "1"
+_GCU_QKV_GATE_MERGE_ENABLED = (
+    is_enflame() and os.environ.get("CHITU_GCU_QWEN3_NEXT_QKV_GATE_MERGE", "1") != "0"
+)
+_GCU_MTP_DIRECT_RECURRENT_CACHE_ENABLED = (
+    is_enflame()
+    and os.environ.get("CHITU_GCU_QWEN3_NEXT_MTP_DIRECT_RECURRENT_CACHE", "0") == "1"
+)
+_GCU_COMPACT_QK_BATCH_ENABLED = (
+    is_enflame() and os.environ.get("CHITU_GCU_QWEN3_NEXT_COMPACT_QK_BATCH", "0") == "1"
+)
+_GCU_RECURRENCE_SINGLE_STEP_ENABLED = (
+    is_enflame()
+    and os.environ.get("CHITU_GCU_QWEN3_NEXT_RECURRENCE_SINGLE_STEP", "0") == "1"
+)
 _GCU_RECURRENCE_MIXED_DECAY_ENABLED = (
     is_enflame()
     and os.environ.get("CHITU_GCU_QWEN3_NEXT_RECURRENCE_MIXED_DECAY", "0") == "1"
@@ -97,21 +97,18 @@ _GCU_RECURRENCE_GROUPED_QK_ENABLED = (
 )
 _GCU_RECURRENCE_MIXED_QUERY_SCALE_ENABLED = (
     is_enflame()
-    and os.environ.get(
-        "CHITU_GCU_QWEN3_NEXT_RECURRENCE_MIXED_QUERY_SCALE", "0"
-    )
-    == "1"
+    and os.environ.get("CHITU_GCU_QWEN3_NEXT_RECURRENCE_MIXED_QUERY_SCALE", "0") == "1"
     and _GCU_RECURRENCE_GROUPED_QK_ENABLED
 )
 _GCU_RECURRENCE_FUSED_QK_SCALE_ENABLED = (
     is_enflame()
-    and os.environ.get("CHITU_GCU_QWEN3_NEXT_RECURRENCE_FUSED_QK_SCALE", "0")
-    == "1"
+    and os.environ.get("CHITU_GCU_QWEN3_NEXT_RECURRENCE_FUSED_QK_SCALE", "0") == "1"
     and _GCU_RECURRENCE_MIXED_QUERY_SCALE_ENABLED
 )
-_GCU_SINGLETON_INDEX_SELECT_ENABLED = is_enflame() and os.environ.get(
-    "CHITU_GCU_QWEN3_NEXT_SINGLETON_INDEX_SELECT", "0"
-) == "1"
+_GCU_SINGLETON_INDEX_SELECT_ENABLED = (
+    is_enflame()
+    and os.environ.get("CHITU_GCU_QWEN3_NEXT_SINGLETON_INDEX_SELECT", "0") == "1"
+)
 _GCU_PAGED_MIXED_DECAY_ENABLED = (
     is_enflame()
     and os.environ.get("CHITU_GCU_QWEN3_NEXT_PAGED_MIXED_DECAY", "0") == "1"
@@ -281,11 +278,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
     def _get_gcu_compact_qk_norm_weight(self, device):
         weight = self._gcu_compact_qk_norm_weight
-        if (
-            weight is None
-            or weight.device != device
-            or weight.dtype != torch.float32
-        ):
+        if weight is None or weight.device != device or weight.dtype != torch.float32:
             # Keep this constant out of module-wide dtype conversion.  GCU's
             # vendor RMSNorm requires the established FP32-weight boundary.
             weight = torch.ones(self.head_dim, device=device, dtype=torch.float32)
@@ -360,10 +353,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             and x.shape[0] in (2, 4, 8)
             and recurrent_cache.ndim == 5
             and recurrent_cache.shape[0] >= x.shape[0]
-            and tuple(recurrent_cache.shape[1:]) == (
-                1, self.n_local_v_heads, self.head_dim, self.head_dim
-            )
-            and tuple(recurrent_cache.stride()[1:]) == (
+            and tuple(recurrent_cache.shape[1:])
+            == (1, self.n_local_v_heads, self.head_dim, self.head_dim)
+            and tuple(recurrent_cache.stride()[1:])
+            == (
                 self.n_local_v_heads * self.head_dim * self.head_dim,
                 self.head_dim * self.head_dim,
                 self.head_dim,
@@ -402,15 +395,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             # so exact shape-specialized GCU kernels may update it in place. The
             # dispatcher keeps unsupported shapes/platforms on the original
             # out-of-place implementation.
-            qkv, conv_state, fused_g_from_conv = (
-                causal_conv1d_update_qwen3_next_with_g(
-                    qkv,
-                    conv_state,
-                    self.conv1d.weight,
-                    a,
-                    self.A_log,
-                    self.dt_bias,
-                )
+            qkv, conv_state, fused_g_from_conv = causal_conv1d_update_qwen3_next_with_g(
+                qkv,
+                conv_state,
+                self.conv1d.weight,
+                a,
+                self.A_log,
+                self.dt_bias,
             )
             # qkv: (bsz, hidden_size), conv_state: (bsz, hidden_size, state_len)
         # mtp decode, could be optimized with a fused kernel
@@ -431,9 +422,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     qkv, conv_state, self.conv1d.weight, conv_cache[:1]
                 )
             elif mtp_conv is not None:
-                qkv_out, conv_state = mtp_conv(
-                    qkv, conv_state, self.conv1d.weight
-                )
+                qkv_out, conv_state = mtp_conv(qkv, conv_state, self.conv1d.weight)
             else:
                 qkv_out = torch.empty_like(qkv)
                 conv_state_out = torch.empty(
@@ -512,19 +501,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 or (
                     recurrent_state is not None
                     and recurrent_state.shape[0] == q.shape[0]
-                    and tuple(recurrent_state.shape[1:]) == (
-                        self.n_local_v_heads, self.head_dim, self.head_dim
-                    )
+                    and tuple(recurrent_state.shape[1:])
+                    == (self.n_local_v_heads, self.head_dim, self.head_dim)
                 )
             )
             and q.dtype == torch.bfloat16
             and k.dtype == torch.bfloat16
             and v.dtype == torch.bfloat16
             and b.dtype == torch.bfloat16
-            and (
-                use_paged_mixed_decay
-                or recurrent_state.dtype == torch.bfloat16
-            )
+            and (use_paged_mixed_decay or recurrent_state.dtype == torch.bfloat16)
         )
 
         # Optional platform candidates may consume raw BF16 beta logits and
@@ -781,9 +766,7 @@ class AttentionQwen3Next(AttentionHFLlama):
         # width; False permanently selects the ordinary path for an unsupported
         # topology.  Keeping the merged module unregistered preserves the public
         # state_dict schema.
-        self._gcu_qkv_gate_merge_state = (
-            None if _GCU_QKV_GATE_MERGE_ENABLED else False
-        )
+        self._gcu_qkv_gate_merge_state = None if _GCU_QKV_GATE_MERGE_ENABLED else False
 
     @torch.no_grad()
     def _get_gcu_qkv_gate_merged_projection(self):
@@ -860,8 +843,12 @@ class AttentionQwen3Next(AttentionHFLlama):
 
         qkv.weight = nn.Parameter(merged_weight[:qkv_n], requires_grad=False)
         gate.weight = nn.Parameter(merged_weight[qkv_n:], requires_grad=False)
-        qkv.scale = nn.Parameter(merged_scale[: qkv.scale.shape[0]], requires_grad=False)
-        gate.scale = nn.Parameter(merged_scale[qkv.scale.shape[0] :], requires_grad=False)
+        qkv.scale = nn.Parameter(
+            merged_scale[: qkv.scale.shape[0]], requires_grad=False
+        )
+        gate.scale = nn.Parameter(
+            merged_scale[qkv.scale.shape[0] :], requires_grad=False
+        )
 
         state = (merged, qkv_n)
         self._gcu_qkv_gate_merge_state = state
@@ -989,7 +976,6 @@ class MLPQwen3Next(nn.Module):
 
     def forward(self, x):
         if self.merge_gate_up:
-
             gate_up_out = self.gate_up_proj(x)
             silu_and_mul_out = silu_and_mul(gate_up_out, impl="auto")
 

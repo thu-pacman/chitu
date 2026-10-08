@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import torch
 import pytest
 
@@ -98,12 +102,8 @@ def test_qwen3_next_gated_rms_tail_is_exact(
     rows = batch_size * 48
     x = (torch.randn(rows, 128, device="cuda") * 0.25).bfloat16()
     gate = (torch.randn(rows, 128, device="cuda") * 1.5).bfloat16()
-    norm = Qwen3NextRMSNormGated(
-        128, eps=1.0e-6, dtype=torch.bfloat16
-    ).cuda()
-    norm.weight.copy_(
-        (1.0 + torch.randn(128, device="cuda") * 0.05).bfloat16()
-    )
+    norm = Qwen3NextRMSNormGated(128, eps=1.0e-6, dtype=torch.bfloat16).cuda()
+    norm.weight.copy_((1.0 + torch.randn(128, device="cuda") * 0.05).bfloat16())
 
     monkeypatch.setenv("CHITU_GCU_QWEN3_NEXT_GATED_RMS_TAIL", "0")
     monkeypatch.setenv("CHITU_GCU_QWEN3_NEXT_GATED_RMS_DUAL_WIDEN", "0")
@@ -111,15 +111,9 @@ def test_qwen3_next_gated_rms_tail_is_exact(
     monkeypatch.setenv("CHITU_GCU_QWEN3_NEXT_GATED_RMS_ADD_RSQRT", "0")
     expected = norm(x, gate, compute_dtype=torch.float32, impl="torch")
     monkeypatch.setenv("CHITU_GCU_QWEN3_NEXT_GATED_RMS_TAIL", "1")
-    monkeypatch.setenv(
-        "CHITU_GCU_QWEN3_NEXT_GATED_RMS_DUAL_WIDEN", str(dual_widen)
-    )
-    monkeypatch.setenv(
-        "CHITU_GCU_QWEN3_NEXT_GATED_RMS_WIDEN_SQUARE", str(fused_square)
-    )
-    monkeypatch.setenv(
-        "CHITU_GCU_QWEN3_NEXT_GATED_RMS_ADD_RSQRT", str(fused_add_rsqrt)
-    )
+    monkeypatch.setenv("CHITU_GCU_QWEN3_NEXT_GATED_RMS_DUAL_WIDEN", str(dual_widen))
+    monkeypatch.setenv("CHITU_GCU_QWEN3_NEXT_GATED_RMS_WIDEN_SQUARE", str(fused_square))
+    monkeypatch.setenv("CHITU_GCU_QWEN3_NEXT_GATED_RMS_ADD_RSQRT", str(fused_add_rsqrt))
     actual = norm(x, gate, compute_dtype=torch.float32, impl="torch")
 
     assert torch.equal(actual, expected)

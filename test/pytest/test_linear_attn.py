@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -176,17 +180,13 @@ def test_recurrent_gated_delta_rule_compact_qk_gcu_is_exact(
     key = qkv[:, :, 16:32]
     value = qkv[:, :, 32:]
     g = -(torch.rand(batch_size, 1, 48, device="cuda") * 0.8 + 0.0001)
-    beta_storage = (
-        torch.randn(batch_size, 1, 96, device="cuda") * 0.5
-    ).bfloat16()
+    beta_storage = (torch.randn(batch_size, 1, 96, device="cuda") * 0.5).bfloat16()
     beta_logits = beta_storage[:, :, :48]
     assert query.stride(0) == 128 * 128
     assert value.stride(0) == 128 * 128
     assert beta_logits.stride(0) == 96
     beta = beta_logits.sigmoid()
-    state = (
-        torch.randn(batch_size, 48, 128, 128, device="cuda") * 0.02
-    ).bfloat16()
+    state = (torch.randn(batch_size, 48, 128, 128, device="cuda") * 0.02).bfloat16()
     state_cache = None
     page_table = None
     if paged_mixed_decay:
@@ -224,9 +224,7 @@ def test_recurrent_gated_delta_rule_compact_qk_gcu_is_exact(
         grouped_qk=grouped_qk,
         mixed_query_scale=mixed_query_scale,
         fused_qk_scale=fused_qk_scale,
-        query_scale=torch.full(
-            (1,), 128**-0.5, dtype=torch.float32, device="cuda"
-        ),
+        query_scale=torch.full((1,), 128**-0.5, dtype=torch.float32, device="cuda"),
         initial_state_cache=state_cache,
         page_table=page_table,
         paged_mixed_decay=paged_mixed_decay,
