@@ -210,6 +210,80 @@ def _ensure_gcu_siluq_lazy_registration():
     _gcu_siluq_lazy_registered = True
 
 
+_gcu_attn_gate_lazy_registered = False
+
+
+def _ensure_gcu_attn_gate_lazy_registration():
+    """Register the fused attention output-gate + block-FP8 producer specialization.
+
+    Mirrors the SiLU+FP8 producer: the gate multiply is fused with the
+    per-token-group FP8 activation quantization, so the vendor ``linear_quant``
+    GEMM consumes the FP8 activation directly.
+    """
+    global _gcu_attn_gate_lazy_registered
+    if _gcu_attn_gate_lazy_registered:
+        return
+
+    from chitu.ops.attn_gate import attn_gate_blockfp8_quant, attn_output_gate
+
+    def _gcu_attn_gate_block_fp8_linear(
+        x, weight, weight_scale, bias, *, x_scale, block_size
+    ):
+        output = x.kwargs["output"]
+        gate = x.kwargs["gate"]
+        bs = block_size[1] if isinstance(block_size, (list, tuple)) else block_size
+        supported = (
+            x_scale is None
+            and output.shape == gate.shape
+            and output.dtype == torch.bfloat16
+            and gate.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and gate.is_contiguous()
+            and output.shape[-1] % bs == 0
+            and weight.ndim == 2
+            and weight.shape[1] == output.shape[-1]
+            and weight.element_size() == 1
+            and weight_scale.dtype == torch.float32
+        )
+        if not supported:
+            return _gcu_block_fp8_linear(
+                x.evaluate(),
+                weight,
+                weight_scale,
+                bias,
+                x_scale=x_scale,
+                block_size=block_size,
+            )
+
+        _ensure_gcu_C()
+        quantized, scales = attn_gate_blockfp8_quant(output, gate, bs)
+        n_cols = output.shape[-1]
+        rows = output.numel() // n_cols
+        N = weight.shape[0]
+        weight_for_gemm = (
+            weight.view(torch.float8_e4m3fn) if weight.dtype == torch.uint8 else weight
+        )
+        result = output.new_empty((rows, N), dtype=output.dtype)
+        torch.ops._C.linear_quant(
+            result,
+            quantized,
+            weight_for_gemm,
+            None,
+            scales,
+            weight_scale.to(torch.float32),
+            -1,
+        )
+        if bias is not None:
+            result = result + bias
+        return result.reshape(*output.shape[:-1], N)
+
+    _gcu_attn_gate_block_fp8_linear.__annotations__["x"] = (
+        attn_output_gate.lazy_tensor_type()
+    )
+    _gcu_block_fp8_linear.register(_gcu_attn_gate_block_fp8_linear)
+    _gcu_attn_gate_lazy_registered = True
+
+
 def linear_blockfp8(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -242,6 +316,7 @@ def linear_blockfp8(
     if is_enflame():
         if _GCU_SILUQ_LAZY_ENABLED:
             _ensure_gcu_siluq_lazy_registration()
+        _ensure_gcu_attn_gate_lazy_registration()
         return _gcu_block_fp8_linear(
             x, weight, weight_scale, bias, x_scale=x_scale, block_size=block_size
         )
