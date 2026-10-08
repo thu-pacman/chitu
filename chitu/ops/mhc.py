@@ -36,10 +36,10 @@ def mhc_pre(
 
 @mhc_pre.register_auto
 def _auto_mhc_pre():
-    if has_triton:
-        return "triton"
     if has_tilelang:
         return "tilelang"
+    if has_triton:
+        return "triton"
     return "torch"
 
 
