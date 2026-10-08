@@ -65,10 +65,35 @@ _GCU_DECODE_FAVARLEN = os.environ.get("CHITU_GCU_DECODE_FAVARLEN") == "1"
 _GCU_FAVARLEN_BLOCK = int(os.environ.get("CHITU_GCU_FAVARLEN_BLOCK", "64"))
 # Force the vendor paged_attention_v1 decode (A/B against the fa_varlen default).
 _GCU_DECODE_PAGED = os.environ.get("CHITU_GCU_DECODE_PAGED") == "1"
+# Cache the arange-derived fa-varlen metadata (block table / cu_seqlens_q) once instead of
+# rebuilding it in every layer/step; the values depend only on the static cache geometry, so
+# under CUDA Graph this removes 2 replay nodes per decoder layer.
+_GCU_STATIC_FAVARLEN_METADATA = (
+    os.environ.get("CHITU_GCU_STATIC_FAVARLEN_METADATA", "1") != "0"
+)
+# For classic decoding the scheduler already holds the post-append length (new_len == old_len + 1),
+# so pass it straight to the fa-varlen helper instead of adding 1 in every layer.
+_GCU_SHARED_POST_APPEND_LENGTH = (
+    os.environ.get("CHITU_GCU_SHARED_POST_APPEND_LENGTH", "1") != "0"
+)
+# When decode reads only the dense cache via flash-attn varlen (the default dense path), the
+# per-layer prefill writes into the vendor paged sidecar are never read back, so seeding them is a
+# dead store. Skip them (set CHITU_GCU_SKIP_UNUSED_PAGED_PREFILL=0 to force seeding).
+_GCU_SKIP_UNUSED_PAGED_PREFILL = (
+    os.environ.get("CHITU_GCU_SKIP_UNUSED_PAGED_PREFILL", "1") != "0"
+)
 try:
     from flash_attn.vllm_flash_attn import flash_attn_varlen_func as _fa_varlen
 except Exception:
     _fa_varlen = None
+# True when the default decode route reads the dense cache through fa-varlen and never touches the
+# paged sidecar (mirrors `use_favarlen` in decode_dense_kv).
+_DECODE_READS_DENSE_FAVARLEN = (
+    _fa_varlen is not None
+    and not _GCU_PAGED_NO_DENSE
+    and not _GCU_DECODE_FLASH
+    and not _GCU_DECODE_PAGED
+)
 _gcu_paged_available = None  # lazily-probed: are `paged_attention_v1` + `reshape_and_cache` loaded?
 
 
@@ -547,7 +572,10 @@ class GcuAttnBackend(RefAttnBackend):
             sinks=sinks,
             topk_indices=topk_indices,
         )
-        if paged:
+        # The paged sidecar is only needed when decode reads it back (paged / no-dense paths).
+        # Under the default dense fa-varlen decode it is never read, so seeding it here is a dead
+        # store; skip it.
+        if paged and not (_GCU_SKIP_UNUSED_PAGED_PREFILL and _DECODE_READS_DENSE_FAVARLEN):
             kc, vc, bpp = self._vendor_paged_cache(kv_cache)
             slot = self._paged_slots(seq_len_delta, bpp, region_map)
             torch.ops._C_cache_ops.reshape_and_cache(
@@ -655,10 +683,14 @@ class GcuAttnBackend(RefAttnBackend):
         # this step). cache_seqlens == old_lens, so the effective length is old_lens+1.
         cache_seqlens = seq_len_delta.old.lens_tensor_device.to(torch.int32)
         if use_favarlen:
-            # The attention backend contract is expressed in terms of the
-            # pre-step cache lengths. Include the just-appended token inside the
-            # helper, matching the established production path.
-            return self._decode_fa_varlen(q, kv_cache, cache_seqlens, softmax_scale)
+            # For classic decoding the scheduler already holds the post-append length
+            # (new_len == old_len + 1), so pass it directly and skip the +1 that would
+            # otherwise be emitted in every attention layer. Otherwise derive it here.
+            if _GCU_SHARED_POST_APPEND_LENGTH and seq_len_delta.is_classic_decoding:
+                seqused_k = seq_len_delta.new.lens_tensor_device.to(torch.int32)
+            else:
+                seqused_k = cache_seqlens + 1
+            return self._decode_fa_varlen(q, kv_cache, seqused_k, softmax_scale)
         out = flash_attn.flash_attn_with_kvcache(
             q.unsqueeze(1),
             kv_cache.k,
@@ -672,15 +704,13 @@ class GcuAttnBackend(RefAttnBackend):
 
         return out.squeeze(1)
 
-    _decode_fa_varlen_uses_post_append_lengths = False
-
-    def _decode_fa_varlen(self, q, kv_cache, cache_seqlens, softmax_scale):
+    def _decode_fa_varlen(self, q, kv_cache, seqused_k, softmax_scale):
         """Decode via `flash_attn.vllm_flash_attn.flash_attn_varlen_func` over a block-view of the
         dense KV cache (the new k/v was already scattered in at old_lens). The dense cache
         [B, max_seq, kv_h, d] is reshaped (free view) into paged blocks [B*nblk, PB, kv_h, d] with a
-        generated block_table. `seqused_k = cache_seqlens + 1` includes the
-        token appended by this step. CUDA-graph-safe: only static shapes and
-        device tensors (arange/`cache_seqlens`), no host sync (max_seqlen_k is the static bound)."""
+        generated block_table; `seqused_k` is the effective KV length of this step (the scheduler's
+        post-append lengths, or old_lens + 1). CUDA-graph-safe: only static shapes and
+        device tensors (arange/`seqused_k`), no host sync (max_seqlen_k is the static bound)."""
         kc, vc = kv_cache.k, kv_cache.v
         B, max_seq, kv_h, d = kc.shape
         PB = _GCU_FAVARLEN_BLOCK
@@ -690,12 +720,26 @@ class GcuAttnBackend(RefAttnBackend):
         kc_b = kc.reshape(B * nblk, PB, kv_h, d)
         vc_b = vc.reshape(B * nblk, PB, kv_h, d)
         dev = kc.device
-        block_table = (
-            torch.arange(B, device=dev, dtype=torch.int32).unsqueeze(1) * nblk
-            + torch.arange(nblk, device=dev, dtype=torch.int32).unsqueeze(0)
-        )
-        cu_seqlens_q = torch.arange(0, B + 1, device=dev, dtype=torch.int32)
-        seqused_k = cache_seqlens + 1
+        if _GCU_STATIC_FAVARLEN_METADATA:
+            key = (str(dev), B, max_seq, PB)
+            cache = self.__dict__.get("_static_favarlen_metadata")
+            if cache is None:
+                cache = self._static_favarlen_metadata = {}
+            metadata = cache.get(key)
+            if metadata is None:
+                metadata = (
+                    torch.arange(B, device=dev, dtype=torch.int32).unsqueeze(1) * nblk
+                    + torch.arange(nblk, device=dev, dtype=torch.int32).unsqueeze(0),
+                    torch.arange(0, B + 1, device=dev, dtype=torch.int32),
+                )
+                cache[key] = metadata
+            block_table, cu_seqlens_q = metadata
+        else:
+            block_table = (
+                torch.arange(B, device=dev, dtype=torch.int32).unsqueeze(1) * nblk
+                + torch.arange(nblk, device=dev, dtype=torch.int32).unsqueeze(0)
+            )
+            cu_seqlens_q = torch.arange(0, B + 1, device=dev, dtype=torch.int32)
         return _fa_varlen(
             q, kc_b, vc_b,
             max_seqlen_q=1, cu_seqlens_q=cu_seqlens_q,
