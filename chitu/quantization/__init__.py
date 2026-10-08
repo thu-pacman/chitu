@@ -65,5 +65,6 @@ from chitu.quantization.blockfp4 import (
     Blockfp4MoeExpertsUnmergedPackNPUNative,
     Blockfp4MoeExpertsMergedPackNPUNative,
 )
+from chitu.quantization.mxfp4 import Mxfp4MoeExpertsUnmergedGCU
 from chitu.quantization.q4km import MoeExpertsDeepSeekV3CPUInfer
 from chitu.quantization.hygon_utils import InXOutLinear

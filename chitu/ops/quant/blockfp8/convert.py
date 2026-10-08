@@ -105,7 +105,57 @@ def soft_fp8_blockfp8_weight_dequant(
 
 @soft_fp8_blockfp8_weight_dequant.register_auto
 def _auto_soft_fp8_blockfp8_weight_dequant():
+    if is_enflame():
+        return "torch"
     return "triton"
+
+
+@soft_fp8_blockfp8_weight_dequant.register("torch")
+def soft_fp8_blockfp8_weight_dequant_torch(
+    x: torch.Tensor, s: torch.Tensor, block_size: int = 128
+) -> torch.Tensor:
+    """Software FP8-E4M3FN weight dequantization for GCU bring-up.
+
+    With ``raise_lower_bit_float_to=bfloat16`` Chitu deliberately stores FP8
+    weights as their raw uint8 payload.  Recreate the finite E4M3 values using
+    the same bit transform as the Triton implementation, then apply each 2-D
+    block scale.  The two E4M3 NaN encodings map to +/-480 exactly as in that
+    implementation; valid checkpoints do not contain them.
+    """
+
+    if x.ndim not in (2, 3) or s.ndim != x.ndim:
+        raise ValueError(
+            "BlockFP8 dequant expects rank-2/3 weight and matching scale rank, "
+            f"got {x.shape=} and {s.shape=}"
+        )
+    if x.element_size() != 1:
+        raise TypeError(f"BlockFP8 weight must use one-byte storage, got {x.dtype}")
+
+    raw = x.view(torch.uint8)
+    signed = torch.where(
+        raw >= 128, raw.to(torch.int32) - 256, raw.to(torch.int32)
+    )
+    # 0x87F00000 represented as signed int32.  Multiplication by 2**120
+    # completes the E4M3FN-to-FP32 exponent rebias used by the Triton path.
+    fp8_as_fp32 = (((signed << 20) & -2014314496).view(torch.float32)) * (
+        2.0**120
+    )
+
+    rows, cols = x.shape[-2:]
+    expected_scale_shape = (
+        (rows + block_size - 1) // block_size,
+        (cols + block_size - 1) // block_size,
+    )
+    if tuple(s.shape[-2:]) != expected_scale_shape:
+        raise ValueError(
+            f"BlockFP8 scale shape mismatch: expected {expected_scale_shape}, "
+            f"got {tuple(s.shape[-2:])}"
+        )
+    expanded_scale = s.to(torch.float32).repeat_interleave(
+        block_size, dim=-2
+    ).repeat_interleave(block_size, dim=-1)
+    expanded_scale = expanded_scale[..., :rows, :cols]
+    return (fp8_as_fp32 * expanded_scale).to(torch.get_default_dtype())
 
 
 soft_fp8_blockfp8_weight_dequant.register_candidate("triton")

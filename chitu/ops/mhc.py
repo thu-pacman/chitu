@@ -6,6 +6,7 @@
 import torch
 import torch.nn.functional as F
 
+from chitu.device_type import is_enflame
 from chitu.utils import try_import_platform_dep
 
 triton, has_triton = try_import_platform_dep("triton")
@@ -30,7 +31,12 @@ def mhc_pre(
     impl: str = "auto",
 ):
     if impl == "auto":
-        if has_triton:
+        # torch_gcu exposes a Triton package, but the shipped backend API is not
+        # compatible with Chitu's CUDA-oriented mHC Triton kernels.  Keep GCU on
+        # the numerically equivalent Torch path until a native kernel is added.
+        if is_enflame():
+            impl = "torch"
+        elif has_triton:
             impl = "triton"
         elif has_tilelang:
             impl = "tilelang"
@@ -85,7 +91,9 @@ def mhc_post(
     impl: str = "auto",
 ) -> torch.Tensor:
     if impl == "auto":
-        if has_triton:
+        if is_enflame():
+            impl = "torch"
+        elif has_triton:
             impl = "triton"
         elif has_tilelang:
             impl = "tilelang"

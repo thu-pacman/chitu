@@ -19,6 +19,7 @@ from chitu.kv_cache import (
     PagedKVCacheAccessor,
 )
 from chitu.global_vars import get_global_args
+from chitu.device_type import is_enflame
 from chitu.models.model import (
     Attention,
     MoeGate,
@@ -57,7 +58,12 @@ from chitu.ops.deepseek_compressor import (
 
 _, _has_triton = try_import_platform_dep("triton")
 
-if _has_triton:
+# Enflame exposes a Triton package, but its backend API is not compatible with
+# the compressor kernels used here (for example, add_stages requires a
+# platform-specific language argument).  Treating import success as kernel
+# support incorrectly routes GCU prefill and MTP decode through that backend.
+# Keep the existing Torch implementations as the correctness path on GCU.
+if _has_triton and not is_enflame():
     from chitu.ops.triton_ops.deepseek_compressor import (
         gather_pending_and_new as _gather_pending_and_new_triton,
         compress_hca as _compress_hca_triton,
@@ -249,6 +255,11 @@ def precompute_freqs_cis_deepseek_v4(
 
     t = torch.arange(seqlen, device=device)
     freqs = torch.outer(t, freqs)
+    if is_enflame():
+        # GCU does not support indexing ComplexFloat tensors.  Keep the same
+        # information as an ordinary [..., 2] cos/sin tensor so every dynamic
+        # position gather in attention, indexer and compressor stays native.
+        return torch.stack((torch.cos(freqs), torch.sin(freqs)), dim=-1)
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
@@ -276,8 +287,17 @@ def _prepare_freqs_cis_v4(
         else torch.get_default_dtype()
     )
     freqs_cis = freqs_cis.to(device=device)
-    cos = freqs_cis.real.to(rotary_dtype)
-    sin = freqs_cis.imag.to(rotary_dtype)
+    if freqs_cis.is_complex():
+        cos = freqs_cis.real.to(rotary_dtype)
+        sin = freqs_cis.imag.to(rotary_dtype)
+    elif freqs_cis.shape[-1] == 2:
+        cos = freqs_cis[..., 0].to(rotary_dtype)
+        sin = freqs_cis[..., 1].to(rotary_dtype)
+    else:
+        raise ValueError(
+            "DeepSeek-V4 RoPE frequencies must be complex or [..., 2] cos/sin, "
+            f"got shape {tuple(freqs_cis.shape)} and dtype {freqs_cis.dtype}"
+        )
     if inverse:
         sin = -sin
 
@@ -303,6 +323,11 @@ def apply_rotary_emb_v4(
     if rope_dim is None:
         rope_dim = q_for_rotary.shape[-1]
 
+    # The currently packaged GCU Triton compiler cannot compile Chitu's RoPE
+    # kernels.  Keep this override local to DeepSeek-V4 so other model paths
+    # retain their independently validated dispatch policy.
+    rope_impl = "torch" if is_enflame() else "auto"
+
     prepared_freqs_cis = _prepare_freqs_cis_v4(
         freqs_cis,
         device=q.device,
@@ -317,6 +342,7 @@ def apply_rotary_emb_v4(
             rotary_begin=q_for_rotary.shape[-1] - rope_dim,
             rotary_type="interleaved",
             inplace=True,
+            impl=rope_impl,
         )
         return q_out.reshape_as(q)
     else:
@@ -331,7 +357,7 @@ def apply_rotary_emb_v4(
         k_rotary_begin=k_for_rotary.shape[-1] - rope_dim,
         rotary_type="interleaved",
         inplace=True,
-        impl="auto",
+        impl=rope_impl,
     )
     return q_out.reshape_as(q), k_out.reshape_as(k)
 
@@ -3478,5 +3504,16 @@ class TransformerDeepSeekV4(Transformer):
                 elif tensor_name == "weight":
                     if quant == "mxfp4" and value.dtype == torch.int8:
                         value = value.view(torch.uint8)
+            # DeepSeek-V4 stores BlockFP8 scales as E8M0 bytes.  Chitu's
+            # Blockfp8Linear parameter contract is a real-valued FP32 scale;
+            # decode it before the generic lower-bit loader views one-byte
+            # tensors as raw uint8 storage.
+            if name.endswith(".scale") and FE8M0_DTYPE is not None:
+                prefix, _, _ = name.rpartition(".")
+                if (
+                    get_quant_from_checkpoint_prefix(prefix) == "blockfp8"
+                    and value.dtype == FE8M0_DTYPE
+                ):
+                    value = value.to(torch.float32)
             normalized[name] = value
         return normalized

@@ -90,9 +90,16 @@ def _gcu_block_fp8_linear(x, weight, weight_scale, bias, *, x_scale, block_size)
     else:
         x_q = x2.view(torch.float8_e4m3fn)
         x_s = x_scale.reshape(x2.shape[0], -1).to(torch.float32)
+    # With raise_lower_bit_float_to=bfloat16, checkpoint FP8 payload is kept in
+    # uint8 parameters so unsupported generic FP8 ops cannot touch it.  The
+    # vendor GEMM ABI still requires an FP8-typed RHS; this is a zero-copy dtype
+    # reinterpretation of the same E4M3 bytes.
+    weight_for_gemm = (
+        weight.view(torch.float8_e4m3fn) if weight.dtype == torch.uint8 else weight
+    )
     c = x2.new_empty((x2.shape[0], N), dtype=out_dtype)
     torch.ops._C.linear_quant(
-        c, x_q, weight, None, x_s, weight_scale.to(torch.float32), -1
+        c, x_q, weight_for_gemm, None, x_s, weight_scale.to(torch.float32), -1
     )
     if bias is not None:
         c = c + bias

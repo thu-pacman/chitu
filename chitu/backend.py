@@ -790,7 +790,15 @@ class Backend:
             quant = get_quant_from_checkpoint_prefix(k, args.models.quant_config.rules)
             if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
                 if quant == "blockfp8" and checkpoint[k].element_size() == 1:
-                    checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
+                    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+                    if e8m0_dtype is not None and checkpoint[k].dtype == e8m0_dtype:
+                        # E8M0 tensors are real block scales, not raw FP8-E4M3
+                        # payload. Decode them while they are still on CPU;
+                        # viewing them as uint8 would later turn 2**(e-127)
+                        # into the numeric byte value e.
+                        checkpoint[k] = checkpoint[k].to(torch.float32)
+                    else:
+                        checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
             if (
                 quant in ("blockfp4", "blockfp4_merged")
                 and checkpoint[k].element_size() == 1
