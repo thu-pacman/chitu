@@ -25,9 +25,9 @@ def _ptr(tensor: torch.Tensor) -> ctypes.c_void_p:
 
 def _get_launch():
     global _launch, _library_path
-    configured_path = os.environ.get("QWEN38_FUSED_WEIGHTED_ROW_SUM_LIB")
+    configured_path = os.environ.get("CHITU_GCU_FUSED_WEIGHTED_ROW_SUM_LIB")
     if not configured_path:
-        raise RuntimeError("QWEN38_FUSED_WEIGHTED_ROW_SUM_LIB must name the GCU library")
+        raise RuntimeError("CHITU_GCU_FUSED_WEIGHTED_ROW_SUM_LIB must name the GCU library")
     path = os.path.realpath(configured_path)
     if _launch is not None:
         if _library_path != path:

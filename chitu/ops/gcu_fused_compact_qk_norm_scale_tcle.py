@@ -22,10 +22,10 @@ def _ptr(tensor: torch.Tensor) -> ctypes.c_void_p:
 
 def _get_launch():
     global _launch, _library_path
-    configured = os.environ.get("QWEN38_FUSED_COMPACT_QK_NORM_SCALE_LIB")
+    configured = os.environ.get("CHITU_GCU_FUSED_COMPACT_QK_NORM_SCALE_LIB")
     if not configured:
         raise RuntimeError(
-            "QWEN38_FUSED_COMPACT_QK_NORM_SCALE_LIB must name the GCU library"
+            "CHITU_GCU_FUSED_COMPACT_QK_NORM_SCALE_LIB must name the GCU library"
         )
     path = os.path.realpath(configured)
     if _launch is not None:

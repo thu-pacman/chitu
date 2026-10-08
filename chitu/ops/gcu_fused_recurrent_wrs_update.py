@@ -22,9 +22,9 @@ def _ptr(tensor: torch.Tensor) -> ctypes.c_void_p:
 
 def _get_launch():
     global _launch, _library_path
-    configured = os.environ.get("QWEN38_FUSED_RECURRENT_WRS_UPDATE_LIB")
+    configured = os.environ.get("CHITU_GCU_FUSED_RECURRENT_WRS_UPDATE_LIB")
     if not configured:
-        raise RuntimeError("QWEN38_FUSED_RECURRENT_WRS_UPDATE_LIB must name the GCU library")
+        raise RuntimeError("CHITU_GCU_FUSED_RECURRENT_WRS_UPDATE_LIB must name the GCU library")
     path = os.path.realpath(configured)
     if _launch is not None:
         if _library_path != path:

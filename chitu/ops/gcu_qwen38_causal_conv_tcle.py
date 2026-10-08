@@ -24,9 +24,9 @@ def _ptr(tensor: torch.Tensor) -> ctypes.c_void_p:
 
 def _get_launch():
     global _launch, _library_path
-    configured_path = os.environ.get("QWEN38_CAUSAL_CONV_TCLE_LIB")
+    configured_path = os.environ.get("CHITU_GCU_QWEN3_NEXT_CAUSAL_CONV_TCLE_LIB")
     if not configured_path:
-        raise RuntimeError("QWEN38_CAUSAL_CONV_TCLE_LIB must name the TCLE library")
+        raise RuntimeError("CHITU_GCU_QWEN3_NEXT_CAUSAL_CONV_TCLE_LIB must name the TCLE library")
     path = os.path.realpath(configured_path)
     if _launch is not None:
         if _library_path != path:
