@@ -109,6 +109,20 @@ def _gcu_block_fp8_linear(x, weight, weight_scale, bias, *, x_scale, block_size)
 _gcu_siluq_lazy_registered = False
 _GCU_SILUQ_LAZY_ENABLED = os.environ.get("CHITU_GCU_SILUQ_LAZY", "0") == "1"
 
+# Optional "dynamic residual" epilogue: a fused block-FP8 producer can fold the
+# residual add into the vendor GEMM via a dynamic bias tensor. External
+# accelerator kernels register a provider; when none is registered the fused
+# producers use a plain bias (None). This replaces the old environment-flag +
+# named-module coupling with a clean extension point.
+_dynamic_residual_bias_provider = None
+
+
+def register_dynamic_residual_bias_provider(provider):
+    """Register ``provider(weight) -> Optional[torch.Tensor]`` for the fused
+    block-FP8 producer epilogue (external kernels may install it at load time)."""
+    global _dynamic_residual_bias_provider
+    _dynamic_residual_bias_provider = provider
+
 
 def _ensure_gcu_siluq_lazy_registration():
     """Lazily register the exact vendor SiLU+FP8 producer specialization.
@@ -180,11 +194,11 @@ def _ensure_gcu_siluq_lazy_registration():
             quantized, scales, source_2d, bs
         )
         result = source.new_empty((rows, weight.shape[0]), dtype=source.dtype)
-        residual_bias = None
-        if os.environ.get("QWEN38_RESIDUAL_MLP_EPILOGUE") == "1":
-            import residual_mlp_epilogue_patch
-
-            residual_bias = residual_mlp_epilogue_patch.consume_bias(weight)
+        residual_bias = (
+            _dynamic_residual_bias_provider(weight)
+            if _dynamic_residual_bias_provider is not None
+            else None
+        )
         if residual_bias is not None and bias is not None:
             raise RuntimeError("both module bias and dynamic residual were provided")
         torch.ops._C.linear_quant(
@@ -264,11 +278,18 @@ def _ensure_gcu_attn_gate_lazy_registration():
             weight.view(torch.float8_e4m3fn) if weight.dtype == torch.uint8 else weight
         )
         result = output.new_empty((rows, N), dtype=output.dtype)
+        residual_bias = (
+            _dynamic_residual_bias_provider(weight)
+            if _dynamic_residual_bias_provider is not None
+            else None
+        )
+        if residual_bias is not None and bias is not None:
+            raise RuntimeError("both module bias and dynamic residual were provided")
         torch.ops._C.linear_quant(
             result,
             quantized,
             weight_for_gemm,
-            None,
+            residual_bias,
             scales,
             weight_scale.to(torch.float32),
             -1,
