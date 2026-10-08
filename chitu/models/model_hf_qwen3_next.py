@@ -35,6 +35,7 @@ from chitu.ops import (
     read_from_singleton_paged_kv_cache,
     apply_rotary_pos_emb_partial,
     qknorm_partial_rope,
+    attn_output_gate,
     chunk_gated_delta_rule,
     recurrent_gated_delta_rule,
     recurrent_gated_delta_rule_compact_qk_gcu,
@@ -907,12 +908,7 @@ class AttentionQwen3Next(AttentionHFLlama):
             seq_len_delta=seq_len_delta,
             causal=True,
         ).view(bs_seq, -1)
-        gate_quant_producer = getattr(self, "_attn_gate_quant_producer", None)
-        output = (
-            gate_quant_producer(self, output, gate)
-            if gate_quant_producer is not None and not is_mtp
-            else output * torch.sigmoid(gate)
-        )
+        output = attn_output_gate(output, gate)
         return self._run_output_linear(output).reshape(x.shape)
 
 

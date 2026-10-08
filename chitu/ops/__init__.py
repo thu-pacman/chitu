@@ -9,6 +9,7 @@ from chitu.ops.rotary import (
     apply_rotary_pos_emb_single_partial,
 )
 from chitu.ops.qknorm_partial_rope import qknorm_partial_rope
+from chitu.ops.attn_gate import attn_output_gate
 from chitu.ops.activation import silu_and_mul
 from chitu.ops.sampling import multinomial, apply_frequency_penalty
 from chitu.ops.kv_cache import (
