@@ -6,6 +6,7 @@ from typing import Any, Sequence, Optional, Callable, Iterable, TYPE_CHECKING
 from typing_extensions import override
 from dataclasses import dataclass
 from logging import getLogger
+import os
 import torch
 import functools
 from enum import Enum
@@ -15,7 +16,8 @@ from chitu.cuda_graph import cuda_graph_safe_cached_property
 from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
-from chitu.utils import ceil_div
+from chitu.device_type import is_enflame
+from chitu.utils import ceil_div, create_tensor
 from chitu.ops import fp8_pertensor_kvcache_quant, fp8_pertoken_kvcache_quant_dsa
 
 if TYPE_CHECKING:
@@ -158,6 +160,8 @@ class PagedKVCacheAccessor(KVCacheAccessor):
 class DenseKVCacheAccessor(KVCacheAccessor):
     kv: dict[str, torch.Tensor]  # shape: [num_req, max_seqlen + 1, shape_per_token...]
     use_i64_offsets: bool = False
+    sidecar_slots: Optional[torch.Tensor] = None
+    sidecar_key: Optional[int] = None
 
     @property
     def k(self):  # Legacy interface
@@ -370,10 +374,30 @@ class KVCacheBase:
         ]
         self.curr_tids = tasks.task_ids
 
-        self.seq_len_delta.copy_from_list(
-            cached_token_lens,
-            [cached + self.mtp_size for cached in cached_token_lens],
-        )
+        next_token_lens = [cached + self.mtp_size for cached in cached_token_lens]
+        infer_args = get_global_args().infer
+        model_type = get_global_args().models.type
+        if (
+            os.environ.get("CHITU_CLASSIC_DECODE_MINIMAL_LENGTH_UPDATES") == "1"
+            and self.mtp_size == 1
+            and is_enflame()
+            and model_type in {"hf-qwen3-next", "hf-qwen3-5"}
+            and infer_args.cache_type == "skew"
+            and infer_args.language_model_only
+        ):
+            # Full-attention classic decode reads the old length tensor for
+            # RoPE/cache lengths, but does not consume new/_delta device
+            # tensors.  Singleton recurrent caches specialize this further and
+            # do not need any device length tensor.
+            self.seq_len_delta.copy_from_list_classic_decode(
+                cached_token_lens,
+                next_token_lens,
+                old_device_tensor_is_used=not isinstance(
+                    self, SingletonPagedKVCache
+                ),
+            )
+        else:
+            self.seq_len_delta.copy_from_list(cached_token_lens, next_token_lens)
         for tid in tasks.task_ids:
             self.tid_to_cached_len[tid] += self.mtp_size
 
@@ -1287,6 +1311,18 @@ class DenseKVCache(KVCacheBase):
         self.hot_reqs: list[Optional[str]] = [None] * num_hot_req
         self.req2slot: dict[str, int] = {}
 
+        # Vendor-sidecar stable-region bookkeeping (see gcu_attn_backend). Each request holds a
+        # non-compacting region for its whole lifetime; local-index -> region published as a
+        # graph-safe StaticTensor updated via chitu's pinned-async create_tensor.
+        self._use_sidecar = is_enflame()
+        self.req2sidecar: dict[str, int] = {}
+        self.sidecar_free: list[int] = list(range(num_hot_req))
+        self.sidecar_slots_static = (
+            StaticTensor(max_nelem=num_hot_req, dtype=torch.int32, device=self.device)
+            if self._use_sidecar else None
+        )
+        self._last_sidecar_slots: Optional[tuple[int, ...]] = None
+
         self.kv_buffer: dict[str, torch.Tensor] = {}
         for key in self.shape_per_token_dict:
             self.kv_buffer[key] = torch.zeros(
@@ -1398,6 +1434,26 @@ class DenseKVCache(KVCacheBase):
             self.prepared_cache[key] = self.kv_buffer[key][
                 :, start_pos : start_pos + len(task_ids)
             ]
+        if self._use_sidecar:
+            for tid in task_ids:
+                if tid not in self.req2sidecar:
+                    assert self.sidecar_free, "sidecar region free-list exhausted"
+                    self.req2sidecar[tid] = self.sidecar_free.pop(0)
+            sidecar_slots = tuple(self.req2sidecar[t] for t in task_ids)
+            if (
+                os.environ.get("CHITU_GCU_SIDECAR_SKIP_UNCHANGED") == "1"
+                and sidecar_slots == self._last_sidecar_slots
+            ):
+                self.sidecar_slots_static.set_shape((len(sidecar_slots),))
+            else:
+                self.sidecar_slots_static.set(
+                    create_tensor(
+                        sidecar_slots,
+                        device=self.device,
+                        dtype=torch.int32,
+                    )
+                )
+                self._last_sidecar_slots = sidecar_slots
 
     @override
     def get_accessor(self, layer_id: int, is_mtp: bool = False) -> DenseKVCacheAccessor:
@@ -1405,7 +1461,15 @@ class DenseKVCache(KVCacheBase):
         ret_kv = {
             key: cache[local_layer_id] for key, cache in self.prepared_cache.items()
         }
-        return DenseKVCacheAccessor(ret_kv, self.use_i64_offsets)
+        sidecar_slots = self.sidecar_slots_static.get() if self._use_sidecar else None
+        sidecar_key = (
+            self.kv_buffer["k"][local_layer_id].data_ptr()
+            if self._use_sidecar and "k" in self.kv_buffer else None
+        )
+        return DenseKVCacheAccessor(
+            ret_kv, self.use_i64_offsets,
+            sidecar_slots=sidecar_slots, sidecar_key=sidecar_key,
+        )
 
     def _copy_cache_slot(self, dst_slot: int, src_slot: int):
         for key in self.kv_buffer:
@@ -1418,6 +1482,8 @@ class DenseKVCache(KVCacheBase):
     @override
     def finalize_cache_all_decode(self, tasks: "PackedTasksBase"):
         for tid in tasks.task_ids:
+            if self._use_sidecar and tid in self.req2sidecar:
+                self.sidecar_free.append(self.req2sidecar.pop(tid))
             if tid not in self.hot_reqs:
                 continue
             slot_id = self.hot_reqs.index(tid)

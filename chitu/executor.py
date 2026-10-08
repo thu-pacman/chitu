@@ -67,6 +67,45 @@ from chitu.distributed.coordinator import get_endpoint, set_endpoint
 logger = getLogger(__name__)
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
+# --- env-gated decode phase timer (CHITU_PHASE_TIMING=1): attribute per-step decode host time ---
+import time as _time
+from collections import defaultdict as _defaultdict
+
+_PHASE_MS = _defaultdict(float)
+_PHASE_N = [0]
+_PHASE_ON = os.environ.get("CHITU_PHASE_TIMING") == "1"
+
+
+class _phase:
+    """Sync-timed context manager (only active when CHITU_PHASE_TIMING=1). Breaks schedule overlap
+    while active, so use for attribution only — not for measuring end-to-end throughput."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        if _PHASE_ON:
+            torch.gcu.synchronize()
+            self.t0 = _time.time()
+        return self
+
+    def __exit__(self, *a):
+        if _PHASE_ON:
+            torch.gcu.synchronize()
+            _PHASE_MS[self.name] += (_time.time() - self.t0) * 1000.0
+
+
+def _phase_tick():
+    if not _PHASE_ON:
+        return
+    _PHASE_N[0] += 1
+    if _PHASE_N[0] % 40 == 0:
+        n = _PHASE_N[0]
+        parts = "  ".join(
+            f"{k}={v / n:.2f}" for k, v in sorted(_PHASE_MS.items(), key=lambda x: -x[1])
+        )
+        logger.info(f"[PHASE ms/step avg over {n}] {parts}")
+
 # Although tags are not fully supported in the NCCL backend, they are helpful to understand the code
 TASK_TENSOR_TAG = 1
 HIDDEN_TENSOR_TAG = 2
@@ -1263,7 +1302,8 @@ class Executor:
                     task.has_unsync_new_token = True
 
         if self.is_sample_rank and self.model_type != ModelType.LLADA2:
-            tasks.generated_result = self.sampler.sample(out, tasks)
+            with _phase("sample"):
+                tasks.generated_result = self.sampler.sample(out, tasks)
 
         # For DLLM: convert finished block results into BatchResults
         if self.model_type == ModelType.LLADA2:
@@ -1407,11 +1447,13 @@ class Executor:
                 for cache in Backend.cache_dict.values():
                     cache.update_mtp_cache_accept(tasks, mtp_token_indices)
 
-            for cache in Backend.cache_dict.values():
-                cache.prepare_cache_decode(tasks)
+            with _phase("prep_cache"):
+                for cache in Backend.cache_dict.values():
+                    cache.prepare_cache_decode(tasks)
 
         if get_pp_group().is_first_rank:
-            payload = self._prepare_tokens_decode(tasks)
+            with _phase("prep_tokens"):
+                payload = self._prepare_tokens_decode(tasks)
         else:
             payload = self._prepare_hiddens(tasks)
 
@@ -1419,8 +1461,10 @@ class Executor:
             self._collect_task_and_pp_results(tasks)
 
         self.timers("decode").start()
-        out = Backend.model.decode(payload)
+        with _phase("forward"):
+            out = Backend.model.decode(payload)
         self.timers("decode").stop()
+        _phase_tick()
 
         if not is_empty_step:
             self._send_pp_payload(out, tasks)
@@ -1814,7 +1858,8 @@ class Executor:
             assert isinstance(tasks, PackedTasks)
             assert tasks.generated_result is not None
 
-            tasks.generated_result = tasks.generated_result.cpu()
+            with _phase("result_cpu"):
+                tasks.generated_result = tasks.generated_result.cpu()
 
             accept_indices_list = (
                 [int(v) for v in tasks.generated_result.accept_indices.tolist()]

@@ -197,7 +197,7 @@ def run_pipe_or_tensor_parallelism(args, timers):
                 and not args.infer.language_model_only,
             )
             for req in reqs:
-                TaskPool.add(Task(req.request_id, req, stop_with_eos=True))
+                TaskPool.add(Task(req.request_id, req, stop_with_eos=False))
             logger.info(f"------ batch {i} ------")
             t_start = time.perf_counter()
             timers("overall").start()
@@ -246,7 +246,7 @@ def run_normal(args, timers):
             and not args.infer.language_model_only,
         )
         for req in reqs:
-            TaskPool.add(Task(req.request_id, req, stop_with_eos=True))
+            TaskPool.add(Task(req.request_id, req, stop_with_eos=False))
         logger.info(f"------ batch {i} ------")
         t_start = time.time()
         timers("overall").start()
@@ -268,6 +268,16 @@ def run_normal(args, timers):
             logger.info(f"Response in rank {rank}: reqs[{i}].output={req.output}")
 
         timers.log()
+
+        if os.environ.get("CHITU_GCU_IMPL_LOG"):
+            try:
+                from chitu.ops.utils import format_observed_op_impl_summary_lines
+
+                logger.info("===== OP IMPL MAP (warmup+inference accumulated) =====")
+                for line in format_observed_op_impl_summary_lines():
+                    logger.info("[OPIMPL] " + line)
+            except Exception as e:
+                logger.info(f"[OPIMPL] dump failed: {e}")
 
 
 @hydra.main(

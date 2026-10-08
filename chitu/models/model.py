@@ -1693,6 +1693,11 @@ class Transformer(nn.Module):
             key = (batch_size, get_global_args().infer.num_blocks)
         else:
             assert False
+        # Optional operator candidates may need two pre-captured graph variants
+        # with identical tensor shapes.  The suffix is empty in normal runtime,
+        # so this has no behavioral effect unless an explicitly bound candidate
+        # sets it before decode.
+        key += tuple(getattr(self, "_decode_graph_key_suffix", ()))
 
         for cache in self.cache_dict.values():
             cache.seq_len_delta.is_decode_stage = True

@@ -10,6 +10,20 @@ import torch
 from chitu.static_tensor import StaticTensor
 from chitu.cuda_graph import cuda_graph_safe_cached_property
 from chitu.utils import invalidate_cached_property, create_tensor
+from chitu.device_type import is_enflame
+
+
+def _searchsorted_right_i32(sorted_1d, total_len, device):
+    """Equivalent to torch.searchsorted(sorted_1d, arange(total_len), right=True), int32.
+    On Enflame GCU torch.searchsorted hangs (and a CPU fallback is forced back onto the
+    device by the torch_gcu shim), so compute it GCU-natively as a broadcast compare + sum:
+    the right-insertion index of a position equals the count of cumulative-length entries
+    that are <= that position."""
+    positions = torch.arange(total_len, device=device, dtype=torch.int32)
+    if is_enflame():
+        cumlens = sorted_1d.to(positions.dtype).reshape(1, -1)
+        return (positions.reshape(-1, 1) >= cumlens).sum(dim=1).to(torch.int32)
+    return torch.searchsorted(sorted_1d, positions, right=True).to(torch.int32)
 
 
 class BatchedSeqLen:
@@ -113,10 +127,19 @@ class BatchedSeqLen:
         )
 
     def copy_from_list(self, lens_list: list[int]):
-        self.lens_list = lens_list
+        self.copy_from_list_metadata_only(lens_list)
         self.lens_static_tensor_device.set(
             create_tensor(self.lens_list, device=self.device, dtype=torch.int32)
         )
+
+    def copy_from_list_metadata_only(self, lens_list: list[int]):
+        """Update host-visible lengths without touching the device buffer.
+
+        This is useful for classic decode metadata whose device tensor has no
+        consumer.  Callers must prove that ``lens_tensor_device`` is not read
+        before a normal ``copy_from_*`` refreshes it.
+        """
+        self.lens_list = lens_list
 
         if self.cache_prefix_lens_tensor_device:
             self._prefix_lens_tensor_device_up_to_date = False
@@ -258,12 +281,11 @@ class BatchedSeqLen:
         # Example: lens = [3, 5, 2], prefix_lens = [0, 3, 8, 10]
 
         # Use searchsorted to find which sequence each position belongs to
-        positions = torch.arange(self.total_len, device=self.device, dtype=torch.int32)
-
-        # searchsorted returns int64 by default, so  cast to int32
-        ret = torch.searchsorted(
-            self.prefix_lens_tensor_device[1:], positions, right=True
-        ).to(torch.int32)
+        # searchsorted returns int64 by default; cast to int32. On Enflame GCU the
+        # on-device searchsorted hangs, so this helper falls back to CPU.
+        ret = _searchsorted_right_i32(
+            self.prefix_lens_tensor_device[1:], self.total_len, self.device
+        )
         # Example: ret = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2]
 
         return ret
@@ -399,6 +421,34 @@ class BatchedSeqLenDelta:
         )
         self._delta_position_ids_tensor_device_up_to_date = False
 
+    def copy_from_list_classic_decode(
+        self,
+        old_len_list: list[int],
+        new_len_list: list[int],
+        *,
+        old_device_tensor_is_used: bool,
+    ):
+        """Minimal metadata refresh for the one-token classic-decode case.
+
+        The full-attention path consumes only ``old.lens_tensor_device`` (for
+        positions/cache lengths); linear recurrent caches consume no device
+        length tensor.  ``new`` and ``_delta`` still need correct host metadata
+        for scheduler/control-flow properties, but copying them to the device
+        is redundant in this phase.
+        """
+        if old_device_tensor_is_used:
+            self.old.copy_from_list(old_len_list)
+        else:
+            self.old.copy_from_list_metadata_only(old_len_list)
+        self.new.copy_from_list_metadata_only(new_len_list)
+        self._delta.copy_from_list_metadata_only(
+            [x - y for x, y in zip(new_len_list, old_len_list)]
+        )
+        self.is_classic_decoding = all(x > 0 for x in old_len_list) and all(
+            x + 1 == y for x, y in zip(old_len_list, new_len_list)
+        )
+        self._delta_position_ids_tensor_device_up_to_date = False
+
     def copy_from_tensor(
         self, old_len_tensor: torch.Tensor, new_len_tensor: torch.Tensor
     ):
@@ -503,8 +553,8 @@ class BatchedSeqLenDelta:
         )
         # Example: positions = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
-        seq_ids = torch.searchsorted(prefix_delta_lens, positions, right=True).to(
-            torch.int32
+        seq_ids = _searchsorted_right_i32(
+            prefix_delta_lens, delta_total_len, self.old.device
         )
         # Example: seq_ids = [0, 0, 0, 1, 1, 1, 1, 1, 2, 2]
 

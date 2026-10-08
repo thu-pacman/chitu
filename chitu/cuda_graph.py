@@ -5,6 +5,7 @@
 from typing import Callable, Sequence, Mapping, Any, Optional
 import functools
 import gc
+import os
 import torch
 
 from chitu.static_tensor import StaticTensor
@@ -13,6 +14,13 @@ from chitu.device_type import is_ascend
 _is_warming_up_before_cuda_graph_capture = False
 _currently_capturing_graph_object = None
 _post_hook_per_graph_object: dict[torch.cuda.CUDAGraph, list[Callable[[], None]]] = {}
+_graph_output_shape_only = os.environ.get("CHITU_GRAPH_OUTPUT_SHAPE_ONLY") == "1"
+
+
+def set_graph_output_shape_only(enabled: bool):
+    """Select the replay output reset policy; exposed for same-process A/B tests."""
+    global _graph_output_shape_only
+    _graph_output_shape_only = bool(enabled)
 
 
 def is_warming_up_before_cuda_graph_capture():
@@ -200,13 +208,19 @@ def make_dispatched_graphed_callables(
                     static_tensor.set(arg)
                 for k in kwargs:
                     kwargs_static_tensors[k].set(kwargs[k])
-                output_static_tensor.set(
-                    torch.empty(
-                        output_shape_dict[key],
-                        dtype=output_dtype_dict[key],
-                        device=output_device_dict[key],
+                if _graph_output_shape_only:
+                    # The captured graph overwrites the shared output buffer before
+                    # it is returned.  Only its logical shape needs to be restored;
+                    # allocating and copying an uninitialized tensor is redundant.
+                    output_static_tensor.set_shape(output_shape_dict[key])
+                else:
+                    output_static_tensor.set(
+                        torch.empty(
+                            output_shape_dict[key],
+                            dtype=output_dtype_dict[key],
+                            device=output_device_dict[key],
+                        )
                     )
-                )
                 if before_replay_callback is not None:
                     before_replay_callback(graph_dict[key])
                 graph_dict[key].replay()

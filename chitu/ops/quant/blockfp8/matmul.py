@@ -8,6 +8,10 @@ from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.native_layout import DeepGemmScale
 from chitu.global_vars import get_global_args
 from chitu.ops.utils import make_op_dispatcher
+from chitu.device_type import is_enflame
+from logging import getLogger
+
+logger = getLogger(__name__)
 from chitu.utils import (
     try_import_platform_dep,
     try_import_opt_dep,
@@ -89,6 +93,97 @@ def blockfp8_gemm_deep_gemm(
     c = a.new_empty(*a.shape[:-1], b.shape[0], dtype=torch.get_default_dtype())
     deep_gemm.fp8_gemm_nt((a, a_s), (b.view(torch.float8_e4m3fn), b_s), c)
     return c
+
+
+# Lazily load the vendor vllm_gcu native block-FP8 op WITHOUT importing the full
+# vllm_gcu / vllm Python stack (which patches vllm globally and could clash with chitu's
+# own distributed/platform setup). We load only the compiled extension, which registers
+# `torch.ops._C.linear_quant` (== the vendor `w8a8_block_fp8_matmul`).
+_gcu_linear_quant = None
+_gcu_linear_quant_loaded = False
+
+
+def _load_gcu_linear_quant():
+    global _gcu_linear_quant, _gcu_linear_quant_loaded
+    if not _gcu_linear_quant_loaded:
+        _gcu_linear_quant_loaded = True
+        try:
+            # Use the shared lazy loader (RTLD_LAZY|RTLD_GLOBAL, namespace-package aware).
+            # Loading `vllm_gcu._C` eagerly (RTLD_NOW) fails on the 4.0 stack: the build
+            # carries one skewed, unused overload (topsvllmMRotaryEmbedding) whose signature
+            # no longer matches the installed libtopsaten, so eager binding rejects the whole
+            # module -> linear_quant never registers and this op silently falls back to a
+            # ~3.5x slower bf16 dequant matmul. Lazy binding resolves only what we call.
+            from chitu.import_utils import ensure_gcu_c_ops
+
+            ensure_gcu_c_ops()
+            _gcu_linear_quant = getattr(torch.ops._C, "linear_quant", None)
+            if _gcu_linear_quant is None:
+                logger.warning(
+                    "vendor GCU op torch.ops._C.linear_quant not found; "
+                    "falling back to bf16 dequant matmul"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Could not load vendor GCU block-FP8 op ({e!r}); "
+                f"falling back to bf16 dequant matmul"
+            )
+            _gcu_linear_quant = None
+    return _gcu_linear_quant
+
+
+@blockfp8_gemm.register("gcu", available=is_enflame())
+def blockfp8_gemm_gcu(
+    a: torch.Tensor,
+    a_s: torch.Tensor | DeepGemmScale,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    *,
+    block_size: int = 128,
+    round_scale_to_pow2: bool = False,
+):
+    """
+    Enflame GCU block-FP8 GEMM (W8A8, 128x128 weight blocks, per-token-group acts).
+
+    Borrows the vendor `vllm_gcu` native fused op `torch.ops._C.linear_quant` (i.e.
+    `w8a8_block_fp8_matmul`) so weights stay in fp8 and the L600 fp8 units are used,
+    matching the reference FP8 vLLM. Falls back to a bf16 dequant matmul only if the
+    native op cannot be loaded.
+    """
+    if isinstance(a_s, DeepGemmScale):
+        a_s = a_s.layout_tensor
+    if isinstance(b_s, DeepGemmScale):
+        b_s = b_s.layout_tensor
+
+    out_dtype = torch.get_default_dtype()
+    K = a.size(-1)
+    N = b.size(0)
+    a2 = a.reshape(-1, K)
+
+    linear_quant = None if round_scale_to_pow2 else _load_gcu_linear_quant()
+    if linear_quant is not None:
+        a_s2 = a_s.reshape(a2.size(0), -1).to(torch.float32).contiguous()
+        b_s2 = b_s.to(torch.float32).contiguous()
+        c = a2.new_empty((a2.size(0), N), dtype=out_dtype)
+        # linear_quant(C, A_fp8, B_fp8, bias, A_scales, B_scales, group_size)
+        linear_quant(c, a2.contiguous(), b.contiguous(), None, a_s2, b_s2, -1)
+        return c.reshape(*a.size()[:-1], N)
+
+    # Fallback: dequantize block-fp8 to bf16 and matmul (reference correctness path).
+    a_f = a2.to(torch.float32)
+    b_f = b.reshape(N, K).to(torch.float32)
+    a_full = (
+        a_s.reshape(a2.size(0), -1)
+        .to(torch.float32)
+        .repeat_interleave(block_size, dim=1)[:, :K]
+    )
+    b_full = (
+        b_s.to(torch.float32)
+        .repeat_interleave(block_size, dim=0)
+        .repeat_interleave(block_size, dim=1)[:N, :K]
+    )
+    c = torch.matmul((a_f * a_full).to(out_dtype), (b_f * b_full).to(out_dtype).t())
+    return c.reshape(*a.size()[:-1], N).to(out_dtype)
 
 
 blockfp8_gemm.register_candidate("triton")

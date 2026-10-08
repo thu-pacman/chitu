@@ -1,20 +1,164 @@
 import pytest
 import math
 import torch
+import chitu.ops.rotary as rotary_ops
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.ops import (
     apply_rotary_pos_emb,
+    apply_rotary_pos_emb_partial,
     apply_rotary_pos_emb_single,
     apply_rotary_pos_emb_single_partial,
 )
 from chitu.native_layout import NativeLayoutTensor, ColumnOddEvenSeparatedTensor
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 from chitu.testing import assert_close
+from chitu.device_type import is_enflame
 
 triton, has_triton = try_import_platform_dep("triton")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+
+
+@pytest.mark.skipif(not is_enflame(), reason="Enflame GCU is required")
+@pytest.mark.parametrize("rows", [1, 16, 127, 1024])
+def test_apply_rotary_pos_emb_gcu_is_bit_exact_and_out_of_place(rows):
+    q = torch.randn((rows, 40, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((rows, 8, 128), device="cuda", dtype=torch.bfloat16)
+    q_before = q.clone()
+    k_before = k.clone()
+    angles = torch.randn((rows, 64), device="cuda", dtype=torch.bfloat16)
+    freqs_cis = BatchedFreqsCis(torch.cos(angles), torch.sin(angles))
+
+    q_ref, k_ref = apply_rotary_pos_emb(q, k, freqs_cis, impl="torch")
+    q_actual, k_actual = apply_rotary_pos_emb(q, k, freqs_cis, impl="gcu")
+    # Reuse the same BatchedFreqsCis to exercise its instance-owned vendor
+    # metadata cache and ensure repeated calls do not retain mutable q/k state.
+    q_replay, k_replay = apply_rotary_pos_emb(q, k, freqs_cis, impl="gcu")
+
+    assert torch.equal(q, q_before)
+    assert torch.equal(k, k_before)
+    assert torch.equal(q_actual, q_ref)
+    assert torch.equal(k_actual, k_ref)
+    assert torch.equal(q_replay, q_ref)
+    assert torch.equal(k_replay, k_ref)
+
+
+@pytest.mark.skipif(not is_enflame(), reason="Enflame GCU is required")
+@pytest.mark.parametrize("rows", [1, 16, 127, 1024])
+def test_apply_rotary_pos_emb_gcu_auto_uses_permitted_inplace_output(rows):
+    q = torch.randn((rows, 40, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((rows, 8, 128), device="cuda", dtype=torch.bfloat16)
+    angles = torch.randn((rows, 64), device="cuda", dtype=torch.bfloat16)
+    freqs_cis = BatchedFreqsCis(torch.cos(angles), torch.sin(angles))
+    q_ref, k_ref = apply_rotary_pos_emb(
+        q.clone(), k.clone(), freqs_cis, inplace=False, impl="torch"
+    )
+    q_ptr, k_ptr = q.data_ptr(), k.data_ptr()
+    q_actual, k_actual = apply_rotary_pos_emb(q, k, freqs_cis, impl="auto")
+
+    assert q_actual.data_ptr() == q_ptr
+    assert k_actual.data_ptr() == k_ptr
+    assert torch.equal(q_actual, q_ref)
+    assert torch.equal(k_actual, k_ref)
+
+
+@pytest.mark.skipif(not is_enflame(), reason="Enflame GCU is required")
+@pytest.mark.parametrize("rows", [1, 16, 127, 1024])
+def test_apply_rotary_pos_emb_partial_gcu_stages_strided_prefix_inplace(
+    rows, monkeypatch
+):
+    monkeypatch.setattr(rotary_ops, "_GCU_ROTARY_ALLOW_STRIDED", True)
+    q = torch.randn((rows, 40, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((rows, 8, 128), device="cuda", dtype=torch.bfloat16)
+    angles = torch.randn((rows, 16), device="cuda", dtype=torch.bfloat16)
+    freqs_cis = BatchedFreqsCis(torch.cos(angles), torch.sin(angles))
+    q_ref, k_ref, *_ = apply_rotary_pos_emb_partial(
+        q.clone(),
+        k.clone(),
+        freqs_cis,
+        q_rotary_end=32,
+        k_rotary_end=32,
+        inplace=True,
+        impl="torch",
+    )
+    q_ptr, k_ptr = q.data_ptr(), k.data_ptr()
+
+    q_actual, k_actual, *_ = apply_rotary_pos_emb_partial(
+        q,
+        k,
+        freqs_cis,
+        q_rotary_end=32,
+        k_rotary_end=32,
+        inplace=True,
+        impl="auto",
+    )
+
+    assert q_actual.data_ptr() == q_ptr
+    assert k_actual.data_ptr() == k_ptr
+    assert torch.equal(q_actual, q_ref)
+    assert torch.equal(k_actual, k_ref)
+
+
+@pytest.mark.skipif(not is_enflame(), reason="Enflame GCU is required")
+def test_apply_rotary_pos_emb_gcu_auto_does_not_force_unsupported_inplace():
+    rows = 16
+    q = torch.randn((rows, 40, 128), device="cuda", dtype=torch.float16)
+    k = torch.randn((rows, 8, 128), device="cuda", dtype=torch.float16)
+    angles = torch.randn((rows, 64), device="cuda", dtype=torch.float16)
+    freqs_cis = BatchedFreqsCis(torch.cos(angles), torch.sin(angles))
+    q_before, k_before = q.clone(), k.clone()
+    q_ref, k_ref = apply_rotary_pos_emb(
+        q.clone(), k.clone(), freqs_cis, inplace=False, impl="torch"
+    )
+    if has_triton:
+        assert (
+            rotary_ops._dispatch_apply_rotary_pos_emb.resolve_impl(
+                q, k, freqs_cis, impl="auto"
+            )
+            == "triton"
+        )
+    q_actual, k_actual = apply_rotary_pos_emb(q, k, freqs_cis, impl="auto")
+
+    # FP16 is outside the vendor RoPE contract. ``inplace=True`` must not
+    # manufacture output buffers before dispatch and thereby block Triton.
+    assert q_actual.data_ptr() != q.data_ptr()
+    assert k_actual.data_ptr() != k.data_ptr()
+    assert torch.equal(q, q_before)
+    assert torch.equal(k, k_before)
+    assert_close(q_actual, q_ref)
+    assert_close(k_actual, k_ref)
+
+
+@pytest.mark.skipif(not is_enflame(), reason="Enflame GCU is required")
+def test_apply_rotary_pos_emb_gcu_rejects_shared_and_crossed_storage():
+    rows, heads, dim = 16, 8, 128
+    elements = rows * heads * dim
+    shared = torch.randn((elements * 2,), device="cuda", dtype=torch.bfloat16)
+    q = shared[:elements].view(rows, heads, dim)
+    k = shared[elements:].view(rows, heads, dim)
+    angles = torch.randn((rows, dim // 2), device="cuda", dtype=torch.bfloat16)
+    freqs_cis = BatchedFreqsCis(torch.cos(angles), torch.sin(angles))
+    q_ref, k_ref = apply_rotary_pos_emb(
+        q.clone(), k.clone(), freqs_cis, inplace=False, impl="torch"
+    )
+
+    # Different contiguous views can still share an allocation. The native
+    # in-place kernel must fall back instead of assuming pointer independence.
+    q_actual, k_actual = apply_rotary_pos_emb(q, k, freqs_cis, impl="gcu")
+    assert q_actual.data_ptr() != q.data_ptr()
+    assert k_actual.data_ptr() != k.data_ptr()
+    assert torch.equal(q_actual, q_ref)
+    assert torch.equal(k_actual, k_ref)
+
+    q2, k2 = q.clone(), k.clone()
+    q_actual, k_actual = apply_rotary_pos_emb(
+        q2, k2, freqs_cis, q_out=k2, k_out=q2, impl="gcu"
+    )
+    assert q_actual is k2
+    assert k_actual is q2
+    assert torch.equal(q_actual, q_ref)
+    assert torch.equal(k_actual, k_ref)
 
 
 @pytest.mark.parametrize(

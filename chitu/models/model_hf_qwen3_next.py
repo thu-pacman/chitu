@@ -270,16 +270,53 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             lambda h: h.reshape(h.size(0), -1, self.head_dim), (q, k, v)
         )  # (total_len, n_heads, head_dim)
 
-        beta = b.sigmoid()
+        # A decode-only platform candidate may consume the raw BF16 beta
+        # logits and reproduce the standalone sigmoid's BF16 boundary inside
+        # recurrent.  The hook is absent by default; prefill, MTP, and every
+        # unbound model retain the original materialized sigmoid producer.
+        raw_beta_recurrent = getattr(
+            self, "_compact_classic_decode_recurrent_raw_beta", None
+        )
+        use_raw_beta_recurrent = (
+            use_precomputed_states
+            and not is_mtp_decode_stage
+            and raw_beta_recurrent is not None
+        )
+        beta = b if use_raw_beta_recurrent else b.sigmoid()
 
         g = fused_g(a, self.A_log, self.dt_bias)
 
-        q = q.repeat_interleave(
-            self.n_v_heads // self.n_qk_heads, dim=1
-        )  # (total_len, n_v_heads, head_dim)
-        k = k.repeat_interleave(
-            self.n_v_heads // self.n_qk_heads, dim=1
-        )  # (total_len, n_v_heads, head_dim)
+        # A platform candidate may consume the original compact Q/K heads in
+        # classic decode.  The default is absent and preserves the existing
+        # path byte-for-byte; prefill and MTP always retain their normal
+        # materialization.  This hook lets an accelerator kernel map value head
+        # ``h`` to Q/K head ``h // (n_v_heads / n_qk_heads)`` without launching
+        # two repeat_interleave producers per Gated-Delta layer.
+        compact_classic_recurrent = raw_beta_recurrent or getattr(
+            self, "_compact_classic_decode_recurrent", None
+        )
+        use_compact_classic_recurrent = (
+            use_precomputed_states
+            and not is_mtp_decode_stage
+            and compact_classic_recurrent is not None
+        )
+
+        # An opt-in Chitu prefill dispatcher may also consume compact Q/K.
+        # The hook is bound only after validating the fixed Qwen3.8 TP1 shape;
+        # decode, MTP, and unbound models keep the original materialization.
+        use_compact_prefill_qk = (
+            not use_precomputed_states
+            and not is_mtp_decode_stage
+            and getattr(self, "_compact_prefill_qk", False)
+        )
+
+        if not (use_compact_classic_recurrent or use_compact_prefill_qk):
+            q = q.repeat_interleave(
+                self.n_v_heads // self.n_qk_heads, dim=1
+            )  # (total_len, n_v_heads, head_dim)
+            k = k.repeat_interleave(
+                self.n_v_heads // self.n_qk_heads, dim=1
+            )  # (total_len, n_v_heads, head_dim)
 
         # prefill
         if not use_precomputed_states and not is_mtp_decode_stage:
@@ -320,7 +357,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
         # classic decode
         else:
-            core_attn_out, last_recurrent_state = recurrent_gated_delta_rule(
+            recurrent_impl = (
+                compact_classic_recurrent
+                if use_compact_classic_recurrent
+                else recurrent_gated_delta_rule
+            )
+            core_attn_out, last_recurrent_state = recurrent_impl(
                 q.unsqueeze(1),
                 k.unsqueeze(1),
                 v.unsqueeze(1),
@@ -397,6 +439,7 @@ class AttentionQwen3Next(AttentionHFLlama):
         self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
     ):
         seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
+        cache_accessor = self.cache.get_accessor(self.layer_id, is_mtp=is_mtp)
 
         xq, xk, xv = self._run_linear(x)
         gate = self.attn_gate(x)
@@ -406,33 +449,73 @@ class AttentionQwen3Next(AttentionHFLlama):
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
 
-        if hasattr(self, "q_norm"):
-            xq = self.q_norm(xq)
-        if hasattr(self, "k_norm"):
-            xk = self.k_norm(xk)
-
-        assert (xq.shape[-1] * self.partial_rotary_factor) % 1 == 0
-        assert (xk.shape[-1] * self.partial_rotary_factor) % 1 == 0
-        xq, xk, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
-            xq,
-            xk,
-            freqs_cis,
-            q_rotary_end=int(xq.shape[-1] * self.partial_rotary_factor),
-            k_rotary_end=int(xk.shape[-1] * self.partial_rotary_factor),
-            rotary_type=self.rotary_type,
-            inplace=True,
-            impl="auto",
+        qknorm_partial_rope = getattr(self, "_qknorm_partial_rope", None)
+        fused_qk = (
+            qknorm_partial_rope(self, xq, xk, freqs_cis)
+            if qknorm_partial_rope is not None and not is_mtp
+            else None
         )
+        if fused_qk is not None:
+            xq, xk = fused_qk
+        else:
+            if hasattr(self, "q_norm"):
+                xq = self.q_norm(xq)
+            if hasattr(self, "k_norm"):
+                xk = self.k_norm(xk)
+
+            partial_rope_kv_append = getattr(
+                self, "_partial_rope_kv_append", None
+            )
+            fused_rope = (
+                partial_rope_kv_append(
+                    self,
+                    xq,
+                    xk,
+                    xv,
+                    freqs_cis,
+                    cache_accessor,
+                    seq_len_delta,
+                )
+                if partial_rope_kv_append is not None and not is_mtp
+                else None
+            )
+            if fused_rope is None:
+                partial_rope_fullrow = getattr(self, "_partial_rope_fullrow", None)
+                fused_rope = (
+                    partial_rope_fullrow(self, xq, xk, freqs_cis)
+                    if partial_rope_fullrow is not None and not is_mtp
+                    else None
+                )
+            if fused_rope is not None:
+                xq, xk = fused_rope
+            else:
+                assert (xq.shape[-1] * self.partial_rotary_factor) % 1 == 0
+                assert (xk.shape[-1] * self.partial_rotary_factor) % 1 == 0
+                xq, xk, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
+                    xq,
+                    xk,
+                    freqs_cis,
+                    q_rotary_end=int(xq.shape[-1] * self.partial_rotary_factor),
+                    k_rotary_end=int(xk.shape[-1] * self.partial_rotary_factor),
+                    rotary_type=self.rotary_type,
+                    inplace=True,
+                    impl="auto",
+                )
 
         output = self.attn_backend(
             xq,
-            self.cache.get_accessor(self.layer_id, is_mtp=is_mtp),
+            cache_accessor,
             xk,
             xv,
             seq_len_delta=seq_len_delta,
             causal=True,
         ).view(bs_seq, -1)
-        output = output * torch.sigmoid(gate)
+        gate_quant_producer = getattr(self, "_attn_gate_quant_producer", None)
+        output = (
+            gate_quant_producer(self, output, gate)
+            if gate_quant_producer is not None and not is_mtp
+            else output * torch.sigmoid(gate)
+        )
         return self._run_output_linear(output).reshape(x.shape)
 
 

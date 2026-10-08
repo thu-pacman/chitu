@@ -15,6 +15,7 @@ from chitu.ops.kv_cache import (
     append_to_sliding_window_paged_kv_cache,
     update_singleton_paged_kv_cache,
     append_to_dense_kv_cache,
+    append_to_dense_kv_cache_pair,
     read_from_paged_kv_cache,
     read_from_singleton_paged_kv_cache,
     read_from_dense_kv_cache,

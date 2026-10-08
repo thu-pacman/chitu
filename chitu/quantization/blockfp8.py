@@ -4,6 +4,8 @@
 
 from typing import Optional
 import functools
+import math
+import os
 from typing_extensions import override
 from logging import getLogger
 
@@ -26,7 +28,8 @@ from chitu.ops.quant import (
     soft_fp8_blockfp8_gemm_marlin,
 )
 from chitu.ops.utils import make_op_dispatcher
-from chitu.device_type import get_device_name, is_muxi, is_nvidia
+from chitu.device_type import get_device_name, is_muxi, is_nvidia, is_enflame
+from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.utils import parse_dtype, ceil_div
 from chitu.import_utils import try_import_platform_dep, try_import_opt_dep
 from chitu.global_vars import get_global_args
@@ -62,6 +65,144 @@ if has_deep_gemm:
 logger = getLogger(__name__)
 
 
+# On Enflame GCU, reuse the vendor vllm_gcu official block-FP8 linear (its own activation
+# quantization + fused fp8 GEMM). We must NOT pair chitu's activation quantization with the
+# vendor GEMM op: the per-token activation-scale layouts differ, producing wrong results.
+from chitu.import_utils import ensure_gcu_c_ops as _ensure_gcu_C
+
+
+@single_dispatch_lazy_tensor
+def _gcu_block_fp8_linear(x, weight, weight_scale, bias, *, x_scale, block_size):
+    """Enflame GCU block-FP8 linear, borrowed from the vendor vllm_gcu
+    `apply_w8a8_block_fp8_linear`: per-token-group fp8 activation quant + native block-fp8
+    GEMM, called through torch.ops._C (no vllm import)."""
+    _ensure_gcu_C()
+    bs = block_size[1] if isinstance(block_size, (list, tuple)) else block_size
+    out_dtype = x.dtype
+    N = weight.shape[0]
+    x2 = x.reshape(-1, x.shape[-1]).contiguous()
+    if x_scale is None:
+        x_q = torch.empty_like(x2, dtype=torch.float8_e4m3fn)
+        x_s = torch.empty(
+            x2.shape[:-1] + (x2.shape[-1] // bs,), device=x2.device, dtype=torch.float32
+        )
+        torch.ops._C.dynamic_per_token_group_fp8_quant(x_q, x_s, x2, bs)
+    else:
+        x_q = x2.view(torch.float8_e4m3fn)
+        x_s = x_scale.reshape(x2.shape[0], -1).to(torch.float32)
+    c = x2.new_empty((x2.shape[0], N), dtype=out_dtype)
+    torch.ops._C.linear_quant(
+        c, x_q, weight, None, x_s, weight_scale.to(torch.float32), -1
+    )
+    if bias is not None:
+        c = c + bias
+    return c.reshape(*x.shape[:-1], N)
+
+
+_gcu_siluq_lazy_registered = False
+_GCU_SILUQ_LAZY_ENABLED = os.environ.get("CHITU_GCU_SILUQ_LAZY", "0") == "1"
+
+
+def _ensure_gcu_siluq_lazy_registration():
+    """Lazily register the exact vendor SiLU+FP8 producer specialization.
+
+    Importing activation while this module is initialized would create a cycle
+    through ``chitu.ops.quant``. Registration is therefore delayed until the
+    first model call, when the op modules are fully initialized.
+    """
+    global _gcu_siluq_lazy_registered
+    if _gcu_siluq_lazy_registered:
+        return
+
+    from chitu.lazy import eval_lazy
+    from chitu.ops.activation import silu_and_mul
+
+    def _gcu_siluq_block_fp8_linear(
+        x,
+        weight,
+        weight_scale,
+        bias,
+        *,
+        x_scale,
+        block_size,
+    ):
+        source = x.kwargs["x"]
+        expert_n_tokens = x.kwargs["expert_n_tokens"]
+        swiglu_limit = x.kwargs["swiglu_limit"]
+        rows = math.prod(x.shape[:-1])
+        bs = block_size[1] if isinstance(block_size, (list, tuple)) else block_size
+        supported = (
+            x_scale is None
+            and expert_n_tokens is None
+            and swiglu_limit is None
+            and isinstance(source, torch.Tensor)
+            and source.dtype == torch.bfloat16
+            and source.ndim >= 2
+            and source.shape[-1] == 2 * x.shape[-1]
+            and source.is_contiguous()
+            and x.shape[-1] % bs == 0
+            and weight.dtype == torch.float8_e4m3fn
+            and weight_scale.dtype == torch.float32
+            # Isolated sweeps show the two-kernel path wins these decode rows.
+            and rows not in (8, 16)
+        )
+        if not supported:
+            return _gcu_block_fp8_linear(
+                x.evaluate(),
+                weight,
+                weight_scale,
+                bias,
+                x_scale=x_scale,
+                block_size=block_size,
+            )
+
+        _ensure_gcu_C()
+        source = eval_lazy(source)
+        source_2d = source.reshape(rows, source.shape[-1])
+        quantized = torch.empty(
+            (rows, x.shape[-1]),
+            device=source.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        scales = torch.empty(
+            (rows, x.shape[-1] // bs),
+            device=source.device,
+            dtype=torch.float32,
+        )
+        torch.ops._C.silu_mul_per_token_group_quant(
+            quantized, scales, source_2d, bs
+        )
+        result = source.new_empty((rows, weight.shape[0]), dtype=source.dtype)
+        residual_bias = None
+        if os.environ.get("QWEN38_RESIDUAL_MLP_EPILOGUE") == "1":
+            import residual_mlp_epilogue_patch
+
+            residual_bias = residual_mlp_epilogue_patch.consume_bias(weight)
+        if residual_bias is not None and bias is not None:
+            raise RuntimeError("both module bias and dynamic residual were provided")
+        torch.ops._C.linear_quant(
+            result,
+            quantized,
+            weight,
+            residual_bias,
+            scales,
+            weight_scale,
+            -1,
+        )
+        if bias is not None:
+            result = result + bias
+        return result.reshape(*x.shape[:-1], weight.shape[0])
+
+    # functools.singledispatch resolves the annotation at registration time.
+    # Set it explicitly so postponed annotations or the local scope cannot turn
+    # the LazyTensor type into an unresolved string.
+    _gcu_siluq_block_fp8_linear.__annotations__["x"] = (
+        silu_and_mul.lazy_tensor_type()
+    )
+    _gcu_block_fp8_linear.register(_gcu_siluq_block_fp8_linear)
+    _gcu_siluq_lazy_registered = True
+
+
 def linear_blockfp8(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -90,6 +231,13 @@ def linear_blockfp8(
     """
 
     assert weight.element_size() == 1
+
+    if is_enflame():
+        if _GCU_SILUQ_LAZY_ENABLED:
+            _ensure_gcu_siluq_lazy_registration()
+        return _gcu_block_fp8_linear(
+            x, weight, weight_scale, bias, x_scale=x_scale, block_size=block_size
+        )
 
     if get_global_args().infer.raise_lower_bit_float_to == "bfloat16":
         if x.dtype not in {torch.float16, torch.bfloat16}:

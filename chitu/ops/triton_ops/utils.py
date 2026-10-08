@@ -5,6 +5,7 @@
 import random
 import time
 import functools
+import os
 from logging import getLogger
 
 import torch
@@ -91,6 +92,25 @@ def auto_tuning_logger(args, *, name: str, **kwargs):
 
 
 def autotune_compat(*, configs, key, cache_results=False, **kwargs):
+    # On Enflame GCU, Triton autotuning is prohibitively slow: the autotuner benchmarks
+    # every config via do_bench, and each GCU synchronize is expensive, which stalls the
+    # very first forward (e.g. RMSNorm) for many minutes at 100% utilization. Triton skips
+    # benchmarking when given a single config, so collapse to the first config on GCU.
+    try:
+        from chitu.device_type import is_enflame
+
+        # CHITU_GCU_FULL_AUTOTUNE=1 keeps the full config list so the autotuner actually
+        # benchmarks and picks the *best* config (the collapse below pins configs[0], which
+        # the vendor tuning guide warns is usually NOT the winner). Use it to measure/derive
+        # the best config per kernel; then pin that (and cache_results) to "freeze" it.
+        if (
+            is_enflame()
+            and len(configs) > 1
+            and not os.environ.get("CHITU_GCU_FULL_AUTOTUNE")
+        ):
+            configs = [configs[0]]
+    except Exception:
+        pass
     if _support_cache_results:
         return triton.autotune(
             configs=configs,

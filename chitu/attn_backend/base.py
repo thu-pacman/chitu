@@ -19,6 +19,7 @@ from chitu.native_layout import (
 from chitu.global_vars import get_global_args
 from chitu.ops import (
     append_to_dense_kv_cache,
+    append_to_dense_kv_cache_pair,
     append_to_paged_kv_cache,
     append_to_sliding_window_paged_kv_cache,
     read_from_dense_kv_cache,
@@ -1147,11 +1148,16 @@ class AttnBackend(abc.ABC):
         sinks=None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
-        if k is not None:
+        if k is not None and v is not None:
             assert kv_cache.k is not None
-            append_to_dense_kv_cache(
+            assert kv_cache.v is not None
+            k = k.contiguous()
+            v = v.contiguous()
+            append_to_dense_kv_cache_pair(
                 kv_cache.k,
-                k.contiguous(),
+                kv_cache.v,
+                k,
+                v,
                 seq_len_delta.delta_position_ids_tensor_device,
                 seq_len_delta.delta_seq_ids_tensor_device,
                 kv_cache.use_i64_offsets,
@@ -1162,21 +1168,42 @@ class AttnBackend(abc.ABC):
                     seq_len_delta.new.position_ids_tensor_device,
                     seq_len_delta.new.seq_ids_tensor_device,
                 )
-        if v is not None:
-            assert kv_cache.v is not None
-            append_to_dense_kv_cache(
-                kv_cache.v,
-                v.contiguous(),
-                seq_len_delta.delta_position_ids_tensor_device,
-                seq_len_delta.delta_seq_ids_tensor_device,
-                kv_cache.use_i64_offsets,
-            )
-            if seq_len_delta.old.max_len > 0:  # The >1st chunks in chunked prefill
                 v = read_from_dense_kv_cache(
                     kv_cache.v,
                     seq_len_delta.new.position_ids_tensor_device,
                     seq_len_delta.new.seq_ids_tensor_device,
                 )
+        else:
+            if k is not None:
+                assert kv_cache.k is not None
+                append_to_dense_kv_cache(
+                    kv_cache.k,
+                    k.contiguous(),
+                    seq_len_delta.delta_position_ids_tensor_device,
+                    seq_len_delta.delta_seq_ids_tensor_device,
+                    kv_cache.use_i64_offsets,
+                )
+                if seq_len_delta.old.max_len > 0:
+                    k = read_from_dense_kv_cache(
+                        kv_cache.k,
+                        seq_len_delta.new.position_ids_tensor_device,
+                        seq_len_delta.new.seq_ids_tensor_device,
+                    )
+            if v is not None:
+                assert kv_cache.v is not None
+                append_to_dense_kv_cache(
+                    kv_cache.v,
+                    v.contiguous(),
+                    seq_len_delta.delta_position_ids_tensor_device,
+                    seq_len_delta.delta_seq_ids_tensor_device,
+                    kv_cache.use_i64_offsets,
+                )
+                if seq_len_delta.old.max_len > 0:
+                    v = read_from_dense_kv_cache(
+                        kv_cache.v,
+                        seq_len_delta.new.position_ids_tensor_device,
+                        seq_len_delta.new.seq_ids_tensor_device,
+                    )
         descales = {}
         if any(s is not None for s in (q_descale, k_descale, v_descale)):
             if not all(s is not None for s in (q_descale, k_descale, v_descale)):

@@ -14,6 +14,62 @@ import torch
 
 logger = getLogger(__name__)
 
+# Optional per-op timing for GCU perf debugging (set CHITU_OP_TIMING=1). Synchronizes the
+# GCU around each dispatched op so wall-time is attributed correctly, and prints a running
+# top-N to stderr every 200 ops. Profiling only (adds sync overhead).
+import os as _os
+import time as _time
+import atexit as _atexit
+
+_CHITU_OP_TIMING = _os.environ.get("CHITU_OP_TIMING", "0") == "1"
+_op_times: Dict[str, float] = {}
+_op_counts: Dict[str, int] = {}
+_op_calls_total = 0
+
+
+def _print_op_times():
+    import sys
+
+    items = sorted(_op_times.items(), key=lambda kv: -kv[1])
+    sys.stderr.write("=== CHITU_OP_TIMING top (total_s x calls) ===\n")
+    for name, t in items[:25]:
+        sys.stderr.write(f"  {name}: {t:.3f}s x{_op_counts.get(name, 0)}\n")
+    sys.stderr.flush()
+
+
+def _gcu_sync():
+    g = getattr(torch, "gcu", None)
+    if g is not None:
+        try:
+            g.synchronize()
+        except Exception:
+            pass
+
+
+if _CHITU_OP_TIMING:
+    _atexit.register(_print_op_times)
+
+
+_is_enflame_flag = None
+
+
+def _enflame():
+    global _is_enflame_flag
+    if _is_enflame_flag is None:
+        try:
+            from chitu.device_type import is_enflame as _ie
+
+            _is_enflame_flag = bool(_ie())
+        except Exception:
+            _is_enflame_flag = False
+    return _is_enflame_flag
+
+
+# Max leading (token) dim for which a Triton kernel is used on Enflame GCU. triton_gcu
+# kernels are fast for small (decode) shapes but hang/crawl for large (prefill) shapes on
+# this build, so above this we fall back to torch/ref. Tunable via env; 0 disables Triton.
+_GCU_TRITON_MAX_TOKENS = int(_os.environ.get("CHITU_GCU_TRITON_MAX_TOKENS", "256"))
+
 
 @dataclass
 class _ObservedOpImplState:
@@ -174,7 +230,10 @@ def reset_observed_op_impl_state():
 
 
 def make_op_dispatcher(
-    func: Optional[Callable] = None, *, op_name: Optional[str] = None
+    func: Optional[Callable] = None,
+    *,
+    op_name: Optional[str] = None,
+    promote_triton_to_gcu: bool = True,
 ):
     """
     Make a function-level impl dispatcher.
@@ -234,6 +293,39 @@ def make_op_dispatcher(
                     f"(set CHITU_LOG_STACK_TRACE=1 for call site)"
                 )
 
+            # Enflame GCU Triton policy. Two distinct issues were diagnosed:
+            #   1. Triton *autotuning* (do_bench over many configs, each GCU sync expensive)
+            #      stalled the first forward for minutes — fixed by collapsing to a single
+            #      config (see triton_ops/utils.autotune_compat).
+            #   2. Even single-config triton_gcu kernels hang/crawl at *large* (prefill)
+            #      shapes, while being fast and correct at *small* (decode) shapes.
+            # So: prefer a vendor native `_C` ("gcu") impl when present (best precision+
+            # speed); else use Triton only when the leading (token) dim is small; else fall
+            # back to torch/ref. Set CHITU_GCU_TRITON_MAX_TOKENS=0 to disable Triton entirely.
+            if impl == "triton" and _enflame():
+                if (
+                    promote_triton_to_gcu
+                    and "gcu" in handlers
+                    and impl_availability.get("gcu", True)
+                ):
+                    impl = "gcu"
+                else:
+                    n_tok = None
+                    for _a in args:
+                        if isinstance(_a, torch.Tensor) and _a.dim() >= 1:
+                            n_tok = _a.shape[0]
+                            break
+                    if (
+                        n_tok is not None
+                        and n_tok <= _GCU_TRITON_MAX_TOKENS
+                        and impl_availability.get("triton", True)
+                    ):
+                        impl = "triton"
+                    elif "torch" in handlers and impl_availability.get("torch", True):
+                        impl = "torch"
+                    elif "ref" in handlers and impl_availability.get("ref", True):
+                        impl = "ref"
+
             if impl not in handlers:
                 raise NotImplementedError(
                     f"{dispatch_name}: impl '{impl}' is not registered"
@@ -256,6 +348,27 @@ def make_op_dispatcher(
             elif "impl" in kwargs:
                 del kwargs["impl"]
 
+            if _CHITU_OP_TIMING:
+                global _op_calls_total
+                _gcu_sync()
+                _t0 = _time.time()
+                _r = handlers[impl](*args, **kwargs)
+                _gcu_sync()
+                _tkey = f"{dispatch_name}/{impl}"
+                _op_times[_tkey] = _op_times.get(_tkey, 0.0) + (_time.time() - _t0)
+                _op_counts[_tkey] = _op_counts.get(_tkey, 0) + 1
+                _op_calls_total += 1
+                if _op_calls_total <= 40:
+                    import sys as _sys2
+
+                    _sys2.stderr.write(
+                        f"[op#{_op_calls_total}] {dispatch_name}/{impl} "
+                        f"{(_time.time() - _t0) * 1000:.1f}ms\n"
+                    )
+                    _sys2.stderr.flush()
+                elif _op_calls_total % 200 == 0:
+                    _print_op_times()
+                return _r
             return handlers[impl](*args, **kwargs)
 
         def register_candidate(name: str):

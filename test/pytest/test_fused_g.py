@@ -32,3 +32,26 @@ def test_fused_g(default_dtype, dim, bs, impl, record_benchmark):
     y_ref = fused_g(a, A_log, dt_bias, impl="torch")
 
     assert_close(y, y_ref, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("bs", [1, 2, 4, 8])
+@torch.inference_mode()
+def test_fused_g_noncontiguous_batch_stride(bs):
+    """Regression test for split views used by Qwen gated-delta layers."""
+    if not has_triton:
+        pytest.skip("triton is missing")
+
+    dim = 48
+    mixed_ba = torch.randn(bs, dim * 2, dtype=torch.bfloat16).cuda()
+    _, a = torch.split(mixed_ba, dim, dim=-1)
+    assert a.stride() == (dim * 2, 1)
+    if bs > 1:
+        assert not a.is_contiguous()
+
+    A_log = torch.randn(dim, dtype=torch.bfloat16).cuda()
+    dt_bias = torch.randn(dim, dtype=torch.bfloat16).cuda()
+
+    y = fused_g(a, A_log, dt_bias, impl="triton")
+    y_ref = fused_g(a, A_log, dt_bias, impl="torch")
+
+    assert_close(y, y_ref, rtol=1e-3, atol=1e-3)

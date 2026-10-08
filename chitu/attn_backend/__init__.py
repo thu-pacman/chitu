@@ -12,6 +12,7 @@ from chitu.attn_backend.hopper_mixed_backend import (
 )
 from chitu.attn_backend.flash_infer_backend import FlashInferBackend
 from chitu.attn_backend.npu_attn_backend import NpuAttnBackend
+from chitu.attn_backend.gcu_attn_backend import GcuAttnBackend
 from chitu.attn_backend.hybrid_attn_backend import HybridAttnBackend
 from chitu.attn_backend.dllm_backend import DLLMAttnBackend
 from chitu.attn_backend.hunyuan_attn_backend import HunyuanAttnBackend

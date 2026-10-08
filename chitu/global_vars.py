@@ -372,6 +372,13 @@ def resolve_default_args(args):
         else:
             args.infer.bind_process_to_cpu = "numa_near_device"
 
+    try:
+        from chitu.device_type import is_enflame as _is_enflame
+
+        _enflame = _is_enflame()
+    except Exception:
+        _enflame = False
+
     if args.infer.use_cuda_graph == "auto":
         if args.models.name in [
             "Mixtral-8x7B-Instruct-v0.1",
@@ -387,6 +394,15 @@ def resolve_default_args(args):
             args.infer.use_cuda_graph = False
         elif args.infer.attn_type == "ref":
             args.infer.use_cuda_graph = False
+        elif _enflame:
+            # Enflame GCU: CUDA graph IS a large decode win here (~30%: decode is
+            # overhead-bound, the graph removes per-step launch/python overhead). It
+            # requires the decode path to be CUDA-graph-safe — GcuAttnBackend now uses
+            # device-tensor KV scatter + device cache_seqlens (no python-int seq lengths
+            # baked from the near-max warmup capture). Default ON; set
+            # CHITU_GCU_CUDA_GRAPH=0 to force it off (e.g. to bisect a regression).
+            _gcg = os.environ.get("CHITU_GCU_CUDA_GRAPH")
+            args.infer.use_cuda_graph = True if _gcg is None else (_gcg == "1")
         elif args.infer.op_impl is not None and args.infer.op_impl == "cpu":
             args.infer.use_cuda_graph = False
         elif (

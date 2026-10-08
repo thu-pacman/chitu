@@ -2,12 +2,13 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from typing import Optional
 
 import torch
 
 from chitu.batched_freqs_cis import BatchedFreqsCis
-from chitu.device_type import has_accelerator
+from chitu.device_type import has_accelerator, is_enflame
 from chitu.utils import (
     try_import_platform_dep,
     try_import_and_setup_torch_npu,
@@ -29,10 +30,102 @@ torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 has_triton_impl = has_triton and has_accelerator()
 
+# Partial-head RoPE needs a contiguous staging buffer on GCU. Keep that path
+# fail-closed until it has passed the actual-model correctness gate; synthetic
+# operator tests can opt in explicitly.
+_GCU_ROTARY_ALLOW_STRIDED = (
+    os.environ.get("CHITU_GCU_ROTARY_ALLOW_STRIDED", "0") == "1"
+)
+
 if has_triton_impl:
     from chitu.ops.triton_ops import (
         apply_rotary_pos_emb_single_triton,
         apply_rotary_pos_emb_triton,
+    )
+
+
+def _shares_storage(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    """Conservatively reject any shared allocation for native in-place RoPE."""
+    if lhs is rhs:
+        return True
+    try:
+        return lhs.untyped_storage().data_ptr() == rhs.untyped_storage().data_ptr()
+    except (AttributeError, RuntimeError):
+        try:
+            return lhs.storage().data_ptr() == rhs.storage().data_ptr()
+        except (AttributeError, RuntimeError):
+            # ``data_ptr`` only proves equal starts, but remaining conservative
+            # here is preferable to silently corrupting crossed output views.
+            return lhs.data_ptr() == rhs.data_ptr()
+
+
+def _gcu_rotary_output_supported(
+    output: Optional[torch.Tensor],
+    own_input: torch.Tensor,
+    other_input: torch.Tensor,
+) -> bool:
+    if output is None:
+        return True
+    if not (
+        isinstance(output, torch.Tensor)
+        and output.shape == own_input.shape
+        and output.dtype == own_input.dtype
+        and output.device == own_input.device
+    ):
+        return False
+    # Exact in-place reuse is valid. Any different view into either input's
+    # allocation is rejected, including crossed q/k output buffers.
+    return output is own_input or (
+        not _shares_storage(output, own_input)
+        and not _shares_storage(output, other_input)
+    )
+
+
+def _gcu_rotary_supported(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
+    q_out=None,
+    k_out=None,
+    rotary_type: str = "separated",
+) -> bool:
+    tensors = (q, k, freqs_cis.cos, freqs_cis.sin)
+    return (
+        is_enflame()
+        and rotary_type == "separated"
+        and q.ndim == 3
+        and k.ndim == 3
+        and q.shape[0] > 0
+        and q.numel() > 0
+        and k.numel() > 0
+        and q.shape[0] == k.shape[0]
+        and q.shape[-1] == k.shape[-1]
+        and q.shape[-1] % 2 == 0
+        and q.dtype == torch.bfloat16
+        and all(tensor.dtype == q.dtype for tensor in tensors)
+        and all(tensor.device == q.device for tensor in tensors)
+        and q.device.type == "gcu"
+        # Qwen3-Next rotates a prefix of each head. Those prefix views are
+        # dense in their last dimension but are not globally contiguous. The
+        # GCU handler stages such views through contiguous work buffers.
+        and (
+            (q.is_contiguous() and k.is_contiguous())
+            or (
+                _GCU_ROTARY_ALLOW_STRIDED
+                and q.stride(-1) == 1
+                and k.stride(-1) == 1
+            )
+        )
+        and not _shares_storage(q, k)
+        and freqs_cis.cos.shape == freqs_cis.sin.shape
+        and freqs_cis.cos.shape == (q.shape[0], q.shape[-1] // 2)
+        and _gcu_rotary_output_supported(q_out, q, k)
+        and _gcu_rotary_output_supported(k_out, k, q)
+        and (
+            q_out is None
+            or k_out is None
+            or not _shares_storage(q_out, k_out)
+        )
     )
 
 
@@ -61,7 +154,13 @@ def reshape_rotary_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     return freqs_cis.view(*shape)
 
 
-@make_op_dispatcher(op_name="apply_rotary_pos_emb")
+@make_op_dispatcher(
+    op_name="apply_rotary_pos_emb",
+    # This op's auto resolver has a stricter native GCU contract than Triton.
+    # If it selected Triton, the generic dispatcher must not promote that choice
+    # back to a GCU handler which can only fall through to torch.
+    promote_triton_to_gcu=False,
+)
 def _dispatch_apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -85,6 +184,8 @@ def _auto_apply_rotary_pos_emb(
 ):
     if has_cpuinfer and get_global_args().infer.op_impl == "cpu":
         return "cpu"
+    if _gcu_rotary_supported(q, k, freqs_cis, q_out, k_out, rotary_type):
+        return "gcu"
     if (
         q_out is None
         and k_out is None
@@ -464,6 +565,92 @@ def apply_rotary_pos_emb_torch(
     return q_out, k_out
 
 
+_dispatch_apply_rotary_pos_emb.register_candidate("gcu")
+
+
+@_dispatch_apply_rotary_pos_emb.register("gcu", available=is_enflame())
+def apply_rotary_pos_emb_gcu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
+    q_out: Optional[torch.Tensor] = None,
+    k_out: Optional[torch.Tensor] = None,
+    rotary_type: str = "separated",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use the vendor GCU RoPE kernel for its exact supported contract.
+
+    The native op mutates q/k, so clone them to preserve this dispatcher's
+    out-of-place semantics. Unsupported layouts deliberately use the reference
+    implementation rather than weakening its guards.
+    """
+    supported = _gcu_rotary_supported(
+        q, k, freqs_cis, q_out, k_out, rotary_type
+    )
+    if not supported:
+        return apply_rotary_pos_emb_torch(
+            q,
+            k,
+            freqs_cis,
+            q_out=q_out,
+            k_out=k_out,
+            rotary_type=rotary_type,
+        )
+
+    from chitu.import_utils import ensure_gcu_c_ops
+
+    ensure_gcu_c_ops()
+    q_result = q if q_out is q else q_out
+    k_result = k if k_out is k else k_out
+    if q_result is None:
+        q_result = q.clone(memory_format=torch.contiguous_format)
+    elif q_result is not q:
+        q_result.copy_(q)
+    if k_result is None:
+        k_result = k.clone(memory_format=torch.contiguous_format)
+    elif k_result is not k:
+        k_result.copy_(k)
+
+    # The native operator needs each [row, heads * rotary_dim] matrix to be
+    # contiguous. A partial-RoPE view has gaps between heads, so stage only its
+    # rotated prefix and copy it back after the kernel. Full-head RoPE stays on
+    # the allocation-free in-place path.
+    q_work = q_result if q_result.is_contiguous() else q.contiguous()
+    k_work = k_result if k_result.is_contiguous() else k.contiguous()
+    rows = q.shape[0]
+    positions = getattr(freqs_cis, "_gcu_local_positions", None)
+    cos_sin = getattr(freqs_cis, "_gcu_cos_sin", None)
+    if (
+        positions is None
+        or positions.shape != (rows,)
+        or positions.device != q.device
+    ):
+        positions = torch.arange(rows, device=q.device, dtype=torch.int32)
+        freqs_cis._gcu_local_positions = positions
+    cos_sources = getattr(freqs_cis, "_gcu_cos_sin_sources", None)
+    sources_changed = (
+        cos_sources is None
+        or cos_sources[0] is not freqs_cis.cos
+        or cos_sources[1] is not freqs_cis.sin
+    )
+    if cos_sin is None or sources_changed:
+        cos_sin = torch.cat([freqs_cis.cos, freqs_cis.sin], dim=-1).contiguous()
+        freqs_cis._gcu_cos_sin = cos_sin
+        freqs_cis._gcu_cos_sin_sources = (freqs_cis.cos, freqs_cis.sin)
+    torch.ops._C.rotary_embedding(
+        positions,
+        q_work.view(rows, -1),
+        k_work.view(rows, -1),
+        q.shape[-1],
+        cos_sin,
+        True,
+    )
+    if q_work is not q_result:
+        q_result.copy_(q_work)
+    if k_work is not k_result:
+        k_result.copy_(k_work)
+    return q_result, k_result
+
+
 @_dispatch_apply_rotary_pos_emb_single.register("torch")
 def apply_rotary_pos_emb_single_torch(
     x: torch.Tensor,
@@ -577,6 +764,20 @@ def apply_rotary_pos_emb(
             impl=impl,
         )
         return q_out, k_out
+
+    # The public contract permits mutation when ``inplace=True``.  On GCU's
+    # auto path, make that permission explicit to the native in-place kernel so
+    # the common Llama/Qwen path avoids two full q/k clones per layer.  Explicit
+    # impl selection keeps its caller-provided output semantics for testing.
+    if (
+        impl == "auto"
+        and inplace
+        and is_enflame()
+        and q_out is None
+        and k_out is None
+        and _gcu_rotary_supported(q, k, freqs_cis, q, k, rotary_type)
+    ):
+        q_out, k_out = q, k
 
     return _dispatch_apply_rotary_pos_emb(
         q, k, freqs_cis, q_out=q_out, k_out=k_out, rotary_type=rotary_type, impl=impl

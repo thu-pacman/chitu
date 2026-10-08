@@ -13,6 +13,8 @@ def fused_g_kernel(
     A_log_ptr,
     dt_bias_ptr,
     g_ptr,
+    a_batch_stride,
+    g_batch_stride,
     d_inner: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -44,7 +46,7 @@ def fused_g_kernel(
     dt_bias = tl.load(dt_bias_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
 
     # Load a for current batch
-    a_offset = batch_idx * d_inner + offsets
+    a_offset = batch_idx * a_batch_stride + offsets
     a = tl.load(a_ptr + a_offset, mask=mask, other=0.0).to(tl.float32)
 
     # Compute: -exp(A_log) * softplus(a + dt_bias)
@@ -57,7 +59,8 @@ def fused_g_kernel(
     g = -exp_A_log * softplus_val
 
     # Store result
-    tl.store(g_ptr + a_offset, g, mask=mask)
+    g_offset = batch_idx * g_batch_stride + offsets
+    tl.store(g_ptr + g_offset, g, mask=mask)
 
 
 def fused_g_triton(a: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor):
@@ -86,6 +89,8 @@ def fused_g_triton(a: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor):
         A_log,
         dt_bias,
         g,
+        a.stride(0),
+        g.stride(0),
         d_inner,
         BLOCK_SIZE=BLOCK_SIZE,
     )

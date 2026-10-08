@@ -1,16 +1,28 @@
 import math
+import os
 import random
 import packaging.version
 import pytest
 import torch
 
 from chitu.testing import assert_close
-from chitu.device_type import has_accelerator, has_native_fp8
+from chitu.device_type import has_accelerator, has_native_fp8, is_enflame
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
-from chitu.ops import append_to_dense_kv_cache, append_to_paged_kv_cache
+from chitu.ops import (
+    append_to_dense_kv_cache,
+    append_to_dense_kv_cache_pair,
+    append_to_paged_kv_cache,
+)
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
+
+
+def _assert_bf16_copy_bit_exact(actual: torch.Tensor, expected: torch.Tensor):
+    """Compare cache copies by payload bits, including identical NaN payloads."""
+    actual_bits = actual.cpu().contiguous().view(torch.int16)
+    expected_bits = expected.cpu().contiguous().view(torch.int16)
+    assert torch.equal(actual_bits, expected_bits)
 
 
 def _make_page_table(
@@ -101,6 +113,364 @@ def _run_paged(
         impl=impl,
     )
     return kv
+
+
+@pytest.mark.skipif(not has_accelerator(), reason="accelerator is required")
+@pytest.mark.parametrize("with_seq_ids", [False, True])
+def test_dense_kv_pair_torch_matches_two_scalar_appends(with_seq_ids):
+    device = "cuda"
+    batch_size, seq_len, num_tokens = 4, 32, 8 if with_seq_ids else 4
+    k_cache_ref = torch.zeros(
+        (batch_size, seq_len, 8, 128), device=device, dtype=torch.bfloat16
+    )
+    v_cache_ref = torch.zeros_like(k_cache_ref)
+    k_cache_pair = k_cache_ref.clone()
+    v_cache_pair = v_cache_ref.clone()
+    this_k = torch.randn(
+        (num_tokens, 8, 128), device=device, dtype=torch.bfloat16
+    )
+    this_v = torch.randn_like(this_k)
+    if with_seq_ids:
+        seq_ids, positions = _make_seq_ids_and_positions(
+            batch_size, num_tokens, seq_len, device
+        )
+    else:
+        seq_ids = None
+        positions = torch.arange(num_tokens, device=device, dtype=torch.int32)
+
+    append_to_dense_kv_cache(
+        k_cache_ref, this_k, positions, seq_ids, impl="torch"
+    )
+    append_to_dense_kv_cache(
+        v_cache_ref, this_v, positions, seq_ids, impl="torch"
+    )
+    append_to_dense_kv_cache_pair(
+        k_cache_pair,
+        v_cache_pair,
+        this_k,
+        this_v,
+        positions,
+        seq_ids,
+        impl="torch",
+    )
+
+    _assert_bf16_copy_bit_exact(k_cache_pair, k_cache_ref)
+    _assert_bf16_copy_bit_exact(v_cache_pair, v_cache_ref)
+
+
+@pytest.mark.skipif(
+    not is_enflame() or not os.environ.get("CHITU_GCU_FUSED_KV_APPEND_LIB"),
+    reason="opt-in Enflame paired K/V library is required",
+)
+@pytest.mark.parametrize("num_tokens", [1, 4, 16, 127, 1024])
+def test_dense_kv_pair_gcu_matches_scalar_for_strided_qkv(num_tokens):
+    from chitu.ops.kv_cache import _get_gcu_fused_dense_kv_append
+
+    device = "cuda"
+    batch_size = min(16, num_tokens)
+    per_batch = math.ceil(num_tokens / batch_size)
+    seq_len = per_batch + 4
+    k_cache_ref = torch.zeros(
+        (batch_size, seq_len, 8, 128), device=device, dtype=torch.bfloat16
+    )
+    v_cache_ref = torch.zeros_like(k_cache_ref)
+    k_cache_pair = k_cache_ref.clone()
+    v_cache_pair = v_cache_ref.clone()
+    packed_qkv = torch.randn(
+        (num_tokens, 3, 8, 128), device=device, dtype=torch.bfloat16
+    )
+    # These are dense per token but deliberately retain a larger QKV token
+    # stride, matching the real model producer contract.
+    this_k = packed_qkv[:, 1]
+    this_v = packed_qkv[:, 2]
+    seq_ids, positions = _make_seq_ids_and_positions(
+        batch_size, num_tokens, seq_len, device
+    )
+
+    append_to_dense_kv_cache(
+        k_cache_ref, this_k, positions, seq_ids, impl="torch"
+    )
+    append_to_dense_kv_cache(
+        v_cache_ref, this_v, positions, seq_ids, impl="torch"
+    )
+    launch = _get_gcu_fused_dense_kv_append()
+    assert launch is not None, "the configured library must provide the v2 ABI"
+    launches_before = launch._chitu_launch_count()
+    append_to_dense_kv_cache_pair(
+        k_cache_pair,
+        v_cache_pair,
+        this_k,
+        this_v,
+        positions,
+        seq_ids,
+        impl="gcu",
+    )
+    torch.cuda.synchronize()
+    assert launch._chitu_launch_count() == launches_before + 1
+
+    _assert_bf16_copy_bit_exact(k_cache_pair, k_cache_ref)
+    _assert_bf16_copy_bit_exact(v_cache_pair, v_cache_ref)
+
+
+@pytest.mark.skipif(
+    not is_enflame() or not os.environ.get("CHITU_GCU_FUSED_KV_APPEND_LIB"),
+    reason="opt-in Enflame paired K/V library is required",
+)
+def test_dense_kv_pair_gcu_without_seq_ids_preserves_scalar_contract():
+    from chitu.ops.kv_cache import _get_gcu_fused_dense_kv_append
+
+    device = "cuda"
+    batch_size, seq_len = 4, 8
+    shape = (batch_size, seq_len, 8, 128)
+    k_ref = torch.zeros(shape, device=device, dtype=torch.bfloat16)
+    v_ref = torch.zeros_like(k_ref)
+    k_pair, v_pair = k_ref.clone(), v_ref.clone()
+    this_k = torch.randn(
+        (batch_size, 8, 128), device=device, dtype=torch.bfloat16
+    )
+    this_v = torch.randn_like(this_k)
+    positions = torch.arange(batch_size, device=device, dtype=torch.int32)
+    append_to_dense_kv_cache(k_ref, this_k, positions, impl="torch")
+    append_to_dense_kv_cache(v_ref, this_v, positions, impl="torch")
+    launch = _get_gcu_fused_dense_kv_append()
+    assert launch is not None
+    launches_before = launch._chitu_launch_count()
+    append_to_dense_kv_cache_pair(
+        k_pair, v_pair, this_k, this_v, positions, impl="gcu"
+    )
+    torch.cuda.synchronize()
+    assert launch._chitu_launch_count() == launches_before + 1
+    _assert_bf16_copy_bit_exact(k_pair, k_ref)
+    _assert_bf16_copy_bit_exact(v_pair, v_ref)
+
+    with pytest.raises((AssertionError, IndexError, RuntimeError, ValueError)):
+        append_to_dense_kv_cache_pair(
+            k_pair,
+            v_pair,
+            this_k[: batch_size - 1],
+            this_v[: batch_size - 1],
+            positions[: batch_size - 1],
+            impl="gcu",
+        )
+
+
+@pytest.mark.skipif(
+    not is_enflame() or not os.environ.get("CHITU_GCU_FUSED_KV_APPEND_LIB"),
+    reason="opt-in Enflame paired K/V library is required",
+)
+def test_dense_kv_pair_gcu_guards_dynamic_metadata_bounds():
+    from chitu.ops.kv_cache import _get_gcu_fused_dense_kv_append
+
+    device = "cuda"
+    batch_size, seq_len, tokens = 4, 8, 4
+    k_cache = torch.zeros(
+        (batch_size, seq_len, 8, 128), device=device, dtype=torch.bfloat16
+    )
+    v_cache = torch.zeros_like(k_cache)
+    this_k = torch.randn((tokens, 8, 128), device=device, dtype=torch.bfloat16)
+    this_v = torch.randn_like(this_k)
+    seq_ids = torch.tensor([-1, batch_size, -1, batch_size], device=device, dtype=torch.int32)
+    positions = torch.tensor([-1, seq_len, seq_len, -1], device=device, dtype=torch.int32)
+    launch = _get_gcu_fused_dense_kv_append()
+    assert launch is not None
+    launches_before = launch._chitu_launch_count()
+    append_to_dense_kv_cache_pair(
+        k_cache, v_cache, this_k, this_v, positions, seq_ids, impl="gcu"
+    )
+    torch.cuda.synchronize()
+    assert launch._chitu_launch_count() == launches_before + 1
+    assert torch.count_nonzero(k_cache).item() == 0
+    assert torch.count_nonzero(v_cache).item() == 0
+
+
+@pytest.mark.skipif(
+    not is_enflame() or not os.environ.get("CHITU_GCU_FUSED_KV_APPEND_LIB"),
+    reason="opt-in Enflame paired K/V library is required",
+)
+def test_dense_kv_pair_gcu_graph_replay_reads_changed_inputs_and_bounds():
+    from chitu.ops.kv_cache import _get_gcu_fused_dense_kv_append
+
+    device = "cuda"
+    batch_size, seq_len, tokens = 4, 16, 4
+    shape = (batch_size, seq_len, 8, 128)
+    k_cache = torch.zeros(shape, device=device, dtype=torch.bfloat16)
+    v_cache = torch.zeros_like(k_cache)
+    packed_qkv = torch.zeros(
+        (tokens, 3, 8, 128), device=device, dtype=torch.bfloat16
+    )
+    this_k, this_v = packed_qkv[:, 1], packed_qkv[:, 2]
+    positions = torch.arange(tokens, device=device, dtype=torch.int32)
+    seq_ids = torch.arange(tokens, device=device, dtype=torch.int32)
+    launch = _get_gcu_fused_dense_kv_append()
+    assert launch is not None
+    launches_before = launch._chitu_launch_count()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        append_to_dense_kv_cache_pair(
+            k_cache,
+            v_cache,
+            this_k,
+            this_v,
+            positions,
+            seq_ids,
+            impl="gcu",
+        )
+    torch.cuda.synchronize()
+    assert launch._chitu_launch_count() == launches_before + 1
+
+    for replay in range(3):
+        k_new = torch.full_like(this_k, replay + 1)
+        v_new = torch.full_like(this_v, replay + 11)
+        seq_new = torch.roll(
+            torch.arange(tokens, device=device, dtype=torch.int32), replay
+        )
+        pos_new = (
+            torch.arange(tokens, device=device, dtype=torch.int32) * 2 + replay + 1
+        )
+        this_k.copy_(k_new)
+        this_v.copy_(v_new)
+        seq_ids.copy_(seq_new)
+        positions.copy_(pos_new)
+        k_cache.zero_()
+        v_cache.zero_()
+        k_ref = torch.zeros_like(k_cache)
+        v_ref = torch.zeros_like(v_cache)
+        append_to_dense_kv_cache(k_ref, this_k, positions, seq_ids, impl="torch")
+        append_to_dense_kv_cache(v_ref, this_v, positions, seq_ids, impl="torch")
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_bf16_copy_bit_exact(k_cache, k_ref)
+        _assert_bf16_copy_bit_exact(v_cache, v_ref)
+
+    # The metadata tensors are graph inputs. Change every element to an invalid
+    # negative/upper-bound combination and prove replay performs no OOB write.
+    seq_ids.copy_(
+        torch.tensor([-1, batch_size, -1, batch_size], device=device, dtype=torch.int32)
+    )
+    positions.copy_(
+        torch.tensor([-1, seq_len, seq_len, -1], device=device, dtype=torch.int32)
+    )
+    k_cache.zero_()
+    v_cache.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(k_cache).item() == 0
+    assert torch.count_nonzero(v_cache).item() == 0
+
+    seq_ids.copy_(
+        torch.tensor([0, batch_size, -1, 2], device=device, dtype=torch.int32)
+    )
+    positions.copy_(
+        torch.tensor([1, 2, 3, seq_len], device=device, dtype=torch.int32)
+    )
+    k_cache.zero_()
+    v_cache.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    k_ref = torch.zeros_like(k_cache)
+    v_ref = torch.zeros_like(v_cache)
+    k_ref[0, 1].copy_(this_k[0])
+    v_ref[0, 1].copy_(this_v[0])
+    _assert_bf16_copy_bit_exact(k_cache, k_ref)
+    _assert_bf16_copy_bit_exact(v_cache, v_ref)
+    # Host launch counters count capture-time launches, not device graph replay.
+    assert launch._chitu_launch_count() == launches_before + 1
+
+
+@pytest.mark.skipif(not is_enflame(), reason="Enflame fallback path is required")
+def test_dense_kv_pair_gcu_rejects_cpu_pointers():
+    batch_size, seq_len = 4, 8
+    shape = (batch_size, seq_len, 8, 128)
+    k_ref = torch.zeros(shape, dtype=torch.bfloat16)
+    v_ref = torch.zeros_like(k_ref)
+    k_pair, v_pair = k_ref.clone(), v_ref.clone()
+    this_k = torch.randn((batch_size, 8, 128), dtype=torch.bfloat16)
+    this_v = torch.randn_like(this_k)
+    positions = torch.arange(batch_size, dtype=torch.int32)
+    append_to_dense_kv_cache(k_ref, this_k, positions, impl="torch")
+    append_to_dense_kv_cache(v_ref, this_v, positions, impl="torch")
+    append_to_dense_kv_cache_pair(
+        k_pair, v_pair, this_k, this_v, positions, impl="gcu"
+    )
+    _assert_bf16_copy_bit_exact(k_pair, k_ref)
+    _assert_bf16_copy_bit_exact(v_pair, v_ref)
+
+
+@pytest.mark.skipif(
+    not is_enflame() or not os.environ.get("CHITU_GCU_FUSED_KV_APPEND_LIB"),
+    reason="opt-in Enflame paired K/V library is required",
+)
+@pytest.mark.parametrize("use_i64_offsets", [False, True])
+def test_dense_kv_pair_gcu_unaligned_or_i64_falls_back(use_i64_offsets):
+    from chitu.ops.kv_cache import _get_gcu_fused_dense_kv_append
+
+    device = "cuda"
+    batch_size, seq_len, elements = 4, 8, 8 * 128
+    shape = (batch_size, seq_len, 8, 128)
+    k_ref = torch.zeros(shape, device=device, dtype=torch.bfloat16)
+    v_ref = torch.zeros_like(k_ref)
+    k_pair, v_pair = k_ref.clone(), v_ref.clone()
+    # Offset one BF16 element and use a 1025-element token stride. The scalar
+    # path supports this dense-per-token view, while the 512-byte vector ABI must not.
+    k_storage = torch.randn(
+        (batch_size, elements + 1), device=device, dtype=torch.bfloat16
+    )
+    v_storage = torch.randn_like(k_storage)
+    this_k = k_storage[:, 1:].view(batch_size, 8, 128)
+    this_v = v_storage[:, 1:].view(batch_size, 8, 128)
+    positions = torch.arange(batch_size, device=device, dtype=torch.int32)
+    append_to_dense_kv_cache(
+        k_ref, this_k, positions, use_i64_offsets=use_i64_offsets, impl="torch"
+    )
+    append_to_dense_kv_cache(
+        v_ref, this_v, positions, use_i64_offsets=use_i64_offsets, impl="torch"
+    )
+    launch = _get_gcu_fused_dense_kv_append()
+    launches_before = launch._chitu_launch_count()
+    append_to_dense_kv_cache_pair(
+        k_pair,
+        v_pair,
+        this_k,
+        this_v,
+        positions,
+        use_i64_offsets=use_i64_offsets,
+        impl="gcu",
+    )
+    torch.cuda.synchronize()
+    assert launch._chitu_launch_count() == launches_before
+    _assert_bf16_copy_bit_exact(k_pair, k_ref)
+    _assert_bf16_copy_bit_exact(v_pair, v_ref)
+
+
+@pytest.mark.skipif(
+    not is_enflame() or not os.environ.get("CHITU_GCU_FUSED_KV_APPEND_LIB"),
+    reason="opt-in Enflame paired K/V library is required",
+)
+def test_dense_kv_pair_gcu_uses_non_default_current_stream():
+    from chitu.ops.kv_cache import _get_gcu_fused_dense_kv_append
+
+    device = "cuda"
+    batch_size, seq_len = 4, 8
+    shape = (batch_size, seq_len, 8, 128)
+    k_ref = torch.zeros(shape, device=device, dtype=torch.bfloat16)
+    v_ref = torch.zeros_like(k_ref)
+    k_pair, v_pair = k_ref.clone(), v_ref.clone()
+    this_k = torch.randn((batch_size, 8, 128), device=device, dtype=torch.bfloat16)
+    this_v = torch.randn_like(this_k)
+    positions = torch.arange(batch_size, device=device, dtype=torch.int32)
+    append_to_dense_kv_cache(k_ref, this_k, positions, impl="torch")
+    append_to_dense_kv_cache(v_ref, this_v, positions, impl="torch")
+    launch = _get_gcu_fused_dense_kv_append()
+    launches_before = launch._chitu_launch_count()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        append_to_dense_kv_cache_pair(
+            k_pair, v_pair, this_k, this_v, positions, impl="gcu"
+        )
+    stream.synchronize()
+    assert launch._chitu_launch_count() == launches_before + 1
+    _assert_bf16_copy_bit_exact(k_pair, k_ref)
+    _assert_bf16_copy_bit_exact(v_pair, v_ref)
 
 
 def _tail_prod(tail_shape: tuple[int, ...]) -> int:

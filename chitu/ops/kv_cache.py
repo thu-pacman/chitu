@@ -3,9 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import Optional, Callable
+import ctypes
+import os
+import threading
+from logging import getLogger
+
 import torch
 
-from chitu.device_type import has_accelerator
+from chitu.device_type import has_accelerator, is_enflame
 from chitu.ops.utils import make_op_dispatcher
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 from chitu.global_vars import get_global_args
@@ -14,6 +19,7 @@ triton, has_triton = try_import_platform_dep("triton")
 chitu_backend, has_chitu_backend = try_import_platform_dep("chitu_backend")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 has_triton_impl = has_triton and has_accelerator()
+logger = getLogger(__name__)
 
 if has_triton_impl:
     from chitu.ops.triton_ops import (
@@ -26,6 +32,80 @@ if has_triton_impl:
         read_from_paged_indexer_kv_cache_deepgemm_triton,
         convert_req_index_to_global_ragged_index_triton,
     )
+
+
+_gcu_fused_dense_kv_append = None
+_gcu_fused_dense_kv_append_path = None
+_gcu_fused_dense_kv_append_lock = threading.Lock()
+
+
+def _get_gcu_fused_dense_kv_append():
+    """Load the optional paired dense-K/V launcher once.
+
+    The library is opt-in so builds without the Enflame SDK retain the existing
+    two-append path. A failed optional load is a normal fallback, not a reason
+    to mutate global call ordering or leave half of a K/V pair pending.
+    """
+    global _gcu_fused_dense_kv_append, _gcu_fused_dense_kv_append_path
+    configured_path = os.environ.get("CHITU_GCU_FUSED_KV_APPEND_LIB")
+    if not configured_path or not is_enflame():
+        return None
+    path = os.path.realpath(configured_path)
+    # A captured graph may retain code from this CDLL. Once a launcher has been
+    # selected successfully, freeze it for the process lifetime instead of
+    # replacing the last Python reference and risking module unload.
+    if _gcu_fused_dense_kv_append is not None:
+        if _gcu_fused_dense_kv_append_path != path:
+            raise RuntimeError(
+                "GCU fused K/V library path cannot change after a successful load; "
+                "restart the process to preserve captured-graph code identity: "
+                f"loaded={_gcu_fused_dense_kv_append_path} requested={path}"
+            )
+        return _gcu_fused_dense_kv_append
+    if _gcu_fused_dense_kv_append_path == path:
+        return _gcu_fused_dense_kv_append
+    with _gcu_fused_dense_kv_append_lock:
+        if _gcu_fused_dense_kv_append is not None:
+            if _gcu_fused_dense_kv_append_path != path:
+                raise RuntimeError(
+                    "GCU fused K/V library path changed during initialization; "
+                    f"loaded={_gcu_fused_dense_kv_append_path} requested={path}"
+                )
+            return _gcu_fused_dense_kv_append
+        if _gcu_fused_dense_kv_append_path == path:
+            return _gcu_fused_dense_kv_append
+        try:
+            library = ctypes.CDLL(path)
+            abi_version = library.chitu_fused_dense_kv_append_abi_version
+            abi_version.argtypes = []
+            abi_version.restype = ctypes.c_int
+            if abi_version() != 2:
+                raise RuntimeError(f"unsupported ABI version {abi_version()}")
+            launch = library.launch_fused_dense_kv_append_v2
+            launch.argtypes = (
+                [ctypes.c_void_p] * 6
+                + [ctypes.c_int] * 6
+                + [ctypes.c_void_p]
+            )
+            launch.restype = ctypes.c_int
+            launch_count = library.chitu_fused_dense_kv_append_launch_count_v2
+            launch_count.argtypes = []
+            launch_count.restype = ctypes.c_ulonglong
+            # Keep the CDLL and the native-path proof hook alive with the callable.
+            launch._chitu_library = library
+            launch._chitu_launch_count = launch_count
+            launch._chitu_path = path
+            _gcu_fused_dense_kv_append = launch
+        except (OSError, AttributeError, RuntimeError) as error:
+            logger.warning(
+                "Unable to load optional GCU fused dense K/V append from %s: %s; "
+                "using the standard two-append path",
+                path,
+                error,
+            )
+            _gcu_fused_dense_kv_append = None
+        _gcu_fused_dense_kv_append_path = path
+    return _gcu_fused_dense_kv_append
 
 
 @make_op_dispatcher
@@ -404,6 +484,201 @@ def append_to_dense_kv_cache_torch_npu(
 append_to_dense_kv_cache.register_candidate("triton")
 if has_triton_impl:
     append_to_dense_kv_cache.register("triton")(append_to_dense_kv_cache_triton)
+
+
+@make_op_dispatcher
+def append_to_dense_kv_cache_pair(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    this_k: torch.Tensor,
+    this_v: torch.Tensor,
+    delta_position_ids: torch.Tensor,
+    delta_seq_ids: Optional[torch.Tensor] = None,
+    use_i64_offsets: bool = False,
+    impl: str = "auto",
+):
+    """Append an explicit K/V pair to dense caches.
+
+    Unlike intercepting two independent scalar append calls, this API makes
+    pairing, lifetime and fallback atomic at the Python callsite. Backends that
+    do not provide a paired kernel retain the exact existing behavior.
+    """
+    raise NotImplementedError
+
+
+@append_to_dense_kv_cache_pair.register_auto
+def _auto_append_to_dense_kv_cache_pair(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    this_k: torch.Tensor,
+    this_v: torch.Tensor,
+    delta_position_ids: torch.Tensor,
+    delta_seq_ids: Optional[torch.Tensor] = None,
+    use_i64_offsets: bool = False,
+):
+    if _get_gcu_fused_dense_kv_append() is not None:
+        return "gcu"
+    return "torch"
+
+
+@append_to_dense_kv_cache_pair.register("torch")
+def append_to_dense_kv_cache_pair_torch(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    this_k: torch.Tensor,
+    this_v: torch.Tensor,
+    delta_position_ids: torch.Tensor,
+    delta_seq_ids: Optional[torch.Tensor] = None,
+    use_i64_offsets: bool = False,
+):
+    append_to_dense_kv_cache(
+        k_cache,
+        this_k,
+        delta_position_ids,
+        delta_seq_ids,
+        use_i64_offsets,
+        impl="torch",
+    )
+    append_to_dense_kv_cache(
+        v_cache,
+        this_v,
+        delta_position_ids,
+        delta_seq_ids,
+        use_i64_offsets,
+        impl="torch",
+    )
+
+
+def _dense_per_token(tensor: torch.Tensor) -> bool:
+    expected_stride = 1
+    for dim in range(tensor.dim() - 1, 0, -1):
+        if tensor.stride(dim) != expected_stride:
+            return False
+        expected_stride *= tensor.shape[dim]
+    return tensor.stride(0) >= expected_stride
+
+
+def _aligned_for_gcu_vector(tensor: torch.Tensor, alignment: int = 512) -> bool:
+    """Check the 256-BF16 vector ABI for the base and every token row."""
+    return (
+        tensor.data_ptr() % alignment == 0
+        and tensor.stride(0) * tensor.element_size() % alignment == 0
+    )
+
+
+@append_to_dense_kv_cache_pair.register("gcu", available=is_enflame())
+def append_to_dense_kv_cache_pair_gcu(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    this_k: torch.Tensor,
+    this_v: torch.Tensor,
+    delta_position_ids: torch.Tensor,
+    delta_seq_ids: Optional[torch.Tensor] = None,
+    use_i64_offsets: bool = False,
+):
+    """Native paired append for valid scheduler metadata.
+
+    Negative or upper-bound sequence/position IDs are treated as inactive Graph
+    lanes and become no-ops in the v2 kernel. Callers must not use invalid IDs to
+    request Python/Torch negative-index semantics.
+    """
+    launch = _get_gcu_fused_dense_kv_append()
+    tokens = this_k.shape[0] if this_k.ndim > 0 else 0
+    elements = this_k.numel() // tokens if tokens else 0
+    cache_elements = (
+        k_cache.numel() // (k_cache.shape[0] * k_cache.shape[1])
+        if k_cache.ndim >= 2 and k_cache.shape[0] and k_cache.shape[1]
+        else 0
+    )
+    int32_max = (1 << 31) - 1
+    batch = k_cache.shape[0] if k_cache.ndim else 0
+    max_seq = k_cache.shape[1] if k_cache.ndim >= 2 else 0
+    int32_args = (
+        tokens,
+        batch,
+        max_seq,
+        elements,
+        this_k.stride(0) if this_k.ndim else 0,
+        this_v.stride(0) if this_v.ndim else 0,
+    )
+    supported = (
+        launch is not None
+        and tokens > 0
+        and k_cache.device.type == "gcu"
+        and k_cache.shape == v_cache.shape
+        and this_k.shape == this_v.shape
+        and k_cache.device == v_cache.device == this_k.device == this_v.device
+        and delta_position_ids.device == this_k.device
+        and (delta_seq_ids is None or delta_seq_ids.device == this_k.device)
+        and k_cache.data_ptr() != v_cache.data_ptr()
+        and k_cache.dtype == torch.bfloat16
+        and v_cache.dtype == k_cache.dtype
+        and this_k.dtype == k_cache.dtype
+        and this_v.dtype == k_cache.dtype
+        and k_cache.ndim >= 3
+        and (delta_seq_ids is not None or tokens == batch)
+        and k_cache.is_contiguous()
+        and v_cache.is_contiguous()
+        and _dense_per_token(this_k)
+        and _dense_per_token(this_v)
+        and delta_position_ids.shape == (tokens,)
+        and delta_position_ids.dtype == torch.int32
+        and delta_position_ids.is_contiguous()
+        and (
+            delta_seq_ids is None
+            or (
+                delta_seq_ids.shape == (tokens,)
+                and delta_seq_ids.dtype == torch.int32
+                and delta_seq_ids.is_contiguous()
+            )
+        )
+        and not use_i64_offsets
+        and elements >= 256
+        and elements == cache_elements
+        and elements % 256 == 0
+        and this_k.stride(0) >= elements
+        and this_v.stride(0) >= elements
+        and _aligned_for_gcu_vector(k_cache)
+        and _aligned_for_gcu_vector(v_cache)
+        and _aligned_for_gcu_vector(this_k)
+        and _aligned_for_gcu_vector(this_v)
+        and all(0 < value <= int32_max for value in int32_args)
+    )
+    if not supported:
+        return append_to_dense_kv_cache_pair_torch(
+            k_cache,
+            v_cache,
+            this_k,
+            this_v,
+            delta_position_ids,
+            delta_seq_ids,
+            use_i64_offsets,
+        )
+
+    def pointer(tensor):
+        return ctypes.c_void_p() if tensor is None else ctypes.c_void_p(tensor.data_ptr())
+
+    with torch.gcu.device(k_cache.device):
+        stream = torch.gcu.current_stream(k_cache.device)
+        rc = launch(
+            pointer(k_cache),
+            pointer(v_cache),
+            pointer(this_k),
+            pointer(this_v),
+            pointer(delta_position_ids),
+            pointer(delta_seq_ids),
+            tokens,
+            batch,
+            max_seq,
+            elements,
+            this_k.stride(0),
+            this_v.stride(0),
+            ctypes.c_void_p(stream.gcu_stream),
+        )
+    if rc != 0:
+        # Do not issue a second writer after a launch failure: the runtime may
+        # already have enqueued a partial operation. Surface the error instead.
+        raise RuntimeError(f"GCU fused dense K/V append launch failed: {rc}")
 
 
 @make_op_dispatcher

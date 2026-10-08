@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from typing import Optional
 
 import torch
@@ -19,6 +20,38 @@ from chitu.tensor_parallel import (
     VocabParallelEmbedding,
     get_tp_size,
 )
+
+# Fuse the block's residual-add + the following rms_norm into the vendor GCU single-kernel
+# `_C.fused_add_rms_norm` (residual += x; x = rms_norm(residual), in place). Self-gating: the
+# op only exists on the enflame GCU stack, so `_fused_add_rms_norm` returns None elsewhere and
+# the plain add+norm path runs.
+#
+# Default OFF: measured 0 wall-clock gain (fusing 1 add+norm pair/layer ~= 1ms/token, under the
+# run noise). Under cuda graph these small ops are nearly free — the decode cost is the FP8 GEMV
+# (weight reads, near the HBM-bandwidth floor), not norm/add. Set CHITU_GCU_FUSED_NORM=1 to try.
+_GCU_FUSED_NORM = os.environ.get("CHITU_GCU_FUSED_NORM", "0") == "1"
+_gcu_fused_norm_op = None
+
+
+def _fused_add_rms_norm(inp, residual, norm):
+    """If the vendor fused kernel is available, do `residual += inp; inp = rms_norm(residual)`
+    in place and return (normed_view=inp, sum_view=residual). Returns None to signal the caller
+    to use the unfused path. `inp` and `residual` MUST be contiguous (mutated in place)."""
+    global _gcu_fused_norm_op
+    if not _GCU_FUSED_NORM:
+        return None
+    if _gcu_fused_norm_op is None:
+        try:
+            from chitu.import_utils import ensure_gcu_c_ops
+
+            ensure_gcu_c_ops()
+            _gcu_fused_norm_op = getattr(torch.ops._C, "fused_add_rms_norm", None)
+        except Exception:
+            _gcu_fused_norm_op = False
+    if not _gcu_fused_norm_op or inp.device.type == "meta":
+        return None
+    _gcu_fused_norm_op(inp, residual, norm.weight, norm.eps)
+    return inp, residual
 
 
 class AttentionLlama(Attention):
@@ -216,7 +249,14 @@ class TransformerBlockLlama(TransformerBlock):
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
     def forward(self, x: torch.Tensor, freqs_cis: BatchedFreqsCis):
-        h = self.attention(self.attention_norm(x), freqs_cis)
-        h += x
+        h_attn = self.attention(self.attention_norm(x), freqs_cis)
+        # Fuse the post-attention residual add with ffn_norm: one vendor kernel does
+        # `h = h_attn + x; f = ffn_norm(h)` instead of an add plus a separate norm. The unfused
+        # path (below) is used when the fused kernel is unavailable.
+        fused = _fused_add_rms_norm(h_attn.contiguous(), x.contiguous(), self.ffn_norm)
+        if fused is not None:
+            f, h = fused  # f = ffn_norm(h_attn + x), h = h_attn + x
+            return h + self.feed_forward(f)
+        h = h_attn + x
         out = h + self.feed_forward(self.ffn_norm(h))
         return out

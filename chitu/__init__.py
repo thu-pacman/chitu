@@ -4,6 +4,20 @@
 
 import sys
 
+# Enflame GCU early setup (no-op without torch_gcu / triton_gcu). MUST run before any
+# other chitu submodule import: chitu.device_type.get_device_name() caches its result,
+# and chitu.ops.triton_ops resolves Triton's active driver at import time. The torch_gcu
+# shim maps ".cuda()"->".gcu()" and the "nccl" process-group backend->"eccl";
+# "import triton_gcu.triton" activates the GCU backend for the stock `triton` package.
+try:
+    from torch_gcu import transfer_to_gcu  # noqa: F401
+    try:
+        import triton_gcu.triton  # noqa: F401
+    except Exception:
+        pass
+except Exception:
+    pass
+
 # If this attribute exists, we are running inside a PyInstaller bundle, then
 # we skip import unneeded dependencies.
 if not getattr(sys, "frozen", False):

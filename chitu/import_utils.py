@@ -141,3 +141,73 @@ def try_import_and_setup_torch_npu():
         _torch_npu_has_set_up = True
 
     return torch_npu, has_torch_npu
+
+
+_torch_gcu_has_set_up = False
+
+
+def try_import_and_setup_torch_gcu():
+    """
+    Try importing `torch_gcu` (Enflame GCU). If successful, apply the
+    `transfer_to_gcu` shim so that `torch.cuda.*`, `.cuda()` and the "nccl"
+    process-group backend transparently map to GCU / ECCL.
+    """
+
+    global _torch_gcu_has_set_up
+
+    torch_gcu, has_torch_gcu = try_import_platform_dep("torch_gcu")
+
+    if has_torch_gcu and not _torch_gcu_has_set_up:
+        # Make "torch.cuda" point to GCU devices (.cuda()->.gcu(), nccl->eccl, etc.)
+        from torch_gcu import transfer_to_gcu  # noqa: F401
+
+        _torch_gcu_has_set_up = True
+
+    return torch_gcu, has_torch_gcu
+
+
+_gcu_c_ops_loaded = False
+
+
+def ensure_gcu_c_ops():
+    """Load the compiled `vllm_gcu._C` extension exactly once, which registers the native
+    GCU kernels under `torch.ops._C.*` (rms_norm, rotary_embedding, silu_and_mul,
+    linear_quant, dynamic_per_token_group_fp8_quant, ...). We load only the .so, NOT the
+    vllm / vllm_gcu Python stack (importing those inside chitu re-activates vLLM's platform
+    and hangs the GCU). Idempotent; safe to call from any GCU op impl."""
+    global _gcu_c_ops_loaded
+    if _gcu_c_ops_loaded:
+        return
+    import importlib.util
+    import os
+    import glob
+    import sys
+
+    spec = importlib.util.find_spec("vllm_gcu")
+    if spec is not None:
+        # Support both a regular package (spec.origin = __init__.py) and a namespace
+        # package (origin=None, dir in submodule_search_locations).
+        search_dirs = []
+        if spec.origin and os.path.isfile(spec.origin):
+            search_dirs.append(os.path.dirname(spec.origin))
+        search_dirs += list(spec.submodule_search_locations or [])
+        for d in dict.fromkeys(search_dirs):
+            so_files = glob.glob(os.path.join(d, "_C*.so"))
+            if not so_files:
+                continue
+            # Load with LAZY + GLOBAL binding. The vendor `_C.abi3.so` may carry a skewed
+            # unused overload (e.g. topsvllmMRotaryEmbedding) vs the installed libtopsaten;
+            # eager (RTLD_NOW) binding rejects the whole module at load, but chitu never
+            # calls that overload — lazy binding resolves only the ops we use at call time.
+            # GLOBAL so its symbols are visible to later dlopens. Name MUST end in "._C"
+            # so CPython looks up PyInit__C in the abi3 extension.
+            old_flags = sys.getdlopenflags()
+            sys.setdlopenflags(os.RTLD_LAZY | os.RTLD_GLOBAL)
+            try:
+                cspec = importlib.util.spec_from_file_location("vllm_gcu._C", so_files[0])
+                mod = importlib.util.module_from_spec(cspec)
+                cspec.loader.exec_module(mod)
+            finally:
+                sys.setdlopenflags(old_flags)
+            break
+    _gcu_c_ops_loaded = True

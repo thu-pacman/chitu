@@ -14,14 +14,65 @@ from chitu.ops import (
     blockfp8_index_score_ragged_q_dense_k_dsv32,
     blockfp8_index_score_ragged_q_paged_k_dsv32,
 )
-from chitu.device_type import has_native_fp8
+from chitu.device_type import has_native_fp8, is_enflame
 from chitu.lazy import eval_lazy
+from chitu.quantization.blockfp8 import linear_blockfp8
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.utils import try_import_platform_dep, ceil_div
 from chitu.global_vars import set_global_args
 from chitu.testing import assert_close, AssertOpCalled
 
 triton, has_triton = try_import_platform_dep("triton")
+
+
+@pytest.mark.skipif(not is_enflame(), reason="Enflame GCU is required")
+@pytest.mark.parametrize("rows", [1, 8, 16, 127])
+def test_gcu_lazy_silu_blockfp8_linear_is_bit_exact(rows):
+    set_global_args(
+        OmegaConf.create({"infer": {"op_impl": "torch"}}),
+        need_ensure=False,
+        need_preprocess=False,
+    )
+    block_size = 128
+    in_features = out_features = 256
+    source = torch.randn(
+        (rows, in_features * 2), device="cuda", dtype=torch.bfloat16
+    )
+    weight_fp32 = torch.randn(
+        (out_features, in_features), device="cuda", dtype=torch.float32
+    )
+    weight_blocks = weight_fp32.view(
+        out_features // block_size,
+        block_size,
+        in_features // block_size,
+        block_size,
+    )
+    weight_scale = (
+        weight_blocks.abs().amax(dim=1).amax(dim=-1).clamp(min=1e-5) / 448.0
+    )
+    weight = (
+        (weight_blocks / weight_scale[:, None, :, None])
+        .clamp(-448.0, 448.0)
+        .to(torch.float8_e4m3fn)
+        .view(out_features, in_features)
+    )
+
+    actual = linear_blockfp8(
+        silu_and_mul(source),
+        weight,
+        weight_scale,
+        block_size=block_size,
+        round_scale_to_pow2=False,
+    )
+    reference = linear_blockfp8(
+        eval_lazy(silu_and_mul(source)),
+        weight,
+        weight_scale,
+        block_size=block_size,
+        round_scale_to_pow2=False,
+    )
+
+    assert torch.equal(actual, reference)
 
 
 def init_b_and_b_s(dim, block_size):

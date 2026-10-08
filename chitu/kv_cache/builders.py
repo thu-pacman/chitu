@@ -2,11 +2,14 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from logging import getLogger
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
+
+from chitu.device_type import is_enflame
 
 from chitu.kv_cache import (
     GlobalLocalMap,
@@ -199,10 +202,17 @@ def _build_main_cache_bundle(
         return main_cache, main_managers
 
     if args.infer.cache_type == "skew":
+        # CHITU_GCU_PAGED_NO_DENSE: the GCU paged sidecar (in the attention backend) is the sole
+        # KV store, so allocate this dense buffer tiny — it is never indexed for attention/decode
+        # under that flag; only its shape/identity is used. Halves total KV memory.
+        storage_max_seq_len = None
+        if os.environ.get("CHITU_GCU_PAGED_NO_DENSE") == "1" and is_enflame():
+            storage_max_seq_len = 32
         main_cache = DenseKVCache(
             layer_id_map,
             max_seq_len=args.infer.max_seq_len,
             num_hot_req=ceil_div(args.infer.max_batch_size, args.infer.dp_size),
+            storage_max_seq_len=storage_max_seq_len,
             device=device,
             **kvargs,
         )

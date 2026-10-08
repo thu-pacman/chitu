@@ -29,6 +29,7 @@ from chitu.attn_backend import (
     DLLMAttnBackend,
     NpuAttnBackend,
     RefAttnBackend,
+    GcuAttnBackend,
     TritonAttnBackend,
     NpuAttnBackend,
     HybridAttnBackend,
@@ -42,7 +43,7 @@ from chitu.kv_cache.registry import (
 )
 from chitu.kv_cache import KVCacheManagerBase, PagedKVCache, KVCacheBase
 from chitu.custom_gguf import *
-from chitu.device_type import is_ascend, is_muxi
+from chitu.device_type import is_ascend, is_muxi, is_enflame
 from chitu.distributed.parallel_state import (
     get_ep_group,
     get_dp_group,
@@ -506,6 +507,8 @@ class Backend:
         if args.infer.attn_type == "auto":
             if is_ascend():
                 return NpuAttnBackend
+            elif is_enflame():
+                return GcuAttnBackend
             elif args.infer.op_impl == "cpu":
                 return RefAttnBackend
             elif should_use_hopper_mixed_backend(args):
@@ -534,6 +537,8 @@ class Backend:
             return NpuAttnBackend
         elif args.infer.attn_type == "ref":
             return RefAttnBackend
+        elif args.infer.attn_type == "gcu":
+            return GcuAttnBackend
         elif args.infer.attn_type == "hopper_mixed":
             return HopperMixedBackend
         elif args.infer.attn_type == "hunyuan_attn":
