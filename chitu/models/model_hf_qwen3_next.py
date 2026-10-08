@@ -360,8 +360,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             and x.shape[0] in (2, 4, 8)
             and recurrent_cache.ndim == 5
             and recurrent_cache.shape[0] >= x.shape[0]
-            and tuple(recurrent_cache.shape[1:]) == (1, 48, 128, 128)
-            and tuple(recurrent_cache.stride()[1:]) == (786432, 16384, 128, 1)
+            and tuple(recurrent_cache.shape[1:]) == (
+                1, self.n_local_v_heads, self.head_dim, self.head_dim
+            )
+            and tuple(recurrent_cache.stride()[1:]) == (
+                self.n_local_v_heads * self.head_dim * self.head_dim,
+                self.head_dim * self.head_dim,
+                self.head_dim,
+                1,
+            )
             and tuple(cache_accessor.block_table.shape) == (x.shape[0], 1)
             and tuple(cache_accessor.block_table.stride()) == (1, 1)
             and recurrent_cache.dtype == torch.bfloat16
@@ -473,10 +480,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         use_paged_mixed_decay = (
             delay_recurrent_read
             and q.shape[0] in (2, 4, 8)
-            and tuple(q.shape[1:]) == (16, 128)
+            and tuple(q.shape[1:]) == (self.n_local_qk_heads, self.head_dim)
             and k.shape == q.shape
-            and tuple(v.shape[1:]) == (48, 128)
-            and tuple(b.shape[1:]) == (48,)
+            and tuple(v.shape[1:]) == (self.n_local_v_heads, self.head_dim)
+            and tuple(b.shape[1:]) == (self.n_local_v_heads,)
             and q.dtype == torch.bfloat16
             and k.dtype == torch.bfloat16
             and v.dtype == torch.bfloat16
@@ -496,16 +503,18 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             and use_precomputed_states
             and not is_mtp_decode_stage
             and q.shape[0] in (2, 4, 8)
-            and tuple(q.shape[1:]) == (16, 128)
+            and tuple(q.shape[1:]) == (self.n_local_qk_heads, self.head_dim)
             and k.shape == q.shape
-            and tuple(v.shape[1:]) == (48, 128)
-            and tuple(b.shape[1:]) == (48,)
+            and tuple(v.shape[1:]) == (self.n_local_v_heads, self.head_dim)
+            and tuple(b.shape[1:]) == (self.n_local_v_heads,)
             and (
                 use_paged_mixed_decay
                 or (
                     recurrent_state is not None
                     and recurrent_state.shape[0] == q.shape[0]
-                    and tuple(recurrent_state.shape[1:]) == (48, 128, 128)
+                    and tuple(recurrent_state.shape[1:]) == (
+                        self.n_local_v_heads, self.head_dim, self.head_dim
+                    )
                 )
             )
             and q.dtype == torch.bfloat16
