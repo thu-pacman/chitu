@@ -34,6 +34,7 @@ from chitu.ops import (
     update_singleton_paged_kv_cache,
     read_from_singleton_paged_kv_cache,
     apply_rotary_pos_emb_partial,
+    qknorm_partial_rope,
     chunk_gated_delta_rule,
     recurrent_gated_delta_rule,
     recurrent_gated_delta_rule_compact_qk_gcu,
@@ -887,58 +888,16 @@ class AttentionQwen3Next(AttentionHFLlama):
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
 
-        qknorm_partial_rope = getattr(self, "_qknorm_partial_rope", None)
-        fused_qk = (
-            qknorm_partial_rope(self, xq, xk, freqs_cis)
-            if qknorm_partial_rope is not None and not is_mtp
-            else None
+        xq, xk = qknorm_partial_rope(
+            xq,
+            xk,
+            freqs_cis,
+            getattr(self, "q_norm", None),
+            getattr(self, "k_norm", None),
+            partial_rotary_factor=self.partial_rotary_factor,
+            rotary_type=self.rotary_type,
+            is_mtp=is_mtp,
         )
-        if fused_qk is not None:
-            xq, xk = fused_qk
-        else:
-            if hasattr(self, "q_norm"):
-                xq = self.q_norm(xq)
-            if hasattr(self, "k_norm"):
-                xk = self.k_norm(xk)
-
-            partial_rope_kv_append = getattr(
-                self, "_partial_rope_kv_append", None
-            )
-            fused_rope = (
-                partial_rope_kv_append(
-                    self,
-                    xq,
-                    xk,
-                    xv,
-                    freqs_cis,
-                    cache_accessor,
-                    seq_len_delta,
-                )
-                if partial_rope_kv_append is not None and not is_mtp
-                else None
-            )
-            if fused_rope is None:
-                partial_rope_fullrow = getattr(self, "_partial_rope_fullrow", None)
-                fused_rope = (
-                    partial_rope_fullrow(self, xq, xk, freqs_cis)
-                    if partial_rope_fullrow is not None and not is_mtp
-                    else None
-                )
-            if fused_rope is not None:
-                xq, xk = fused_rope
-            else:
-                assert (xq.shape[-1] * self.partial_rotary_factor) % 1 == 0
-                assert (xk.shape[-1] * self.partial_rotary_factor) % 1 == 0
-                xq, xk, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
-                    xq,
-                    xk,
-                    freqs_cis,
-                    q_rotary_end=int(xq.shape[-1] * self.partial_rotary_factor),
-                    k_rotary_end=int(xk.shape[-1] * self.partial_rotary_factor),
-                    rotary_type=self.rotary_type,
-                    inplace=True,
-                    impl="auto",
-                )
 
         output = self.attn_backend(
             xq,
