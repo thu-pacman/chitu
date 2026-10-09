@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 from chitu.distributed.pd_disaggregation.pd_request_router import PDRequestRouter
 from chitu.dp_request_router import LoadBalancer, PrefixCacheAwarePolicy, SchedulerStats
-from chitu.global_vars import set_global_args
+from chitu.global_vars import get_global_args, set_global_args
 from chitu.schemas.serve_config import (
     PDDisaggregationConfig,
     RouterConfig,
@@ -33,6 +33,13 @@ class MockReq:
 
     request_id: str
     prompt_tokens: list[int] = field(default_factory=list)
+    max_new_tokens: int = 1
+    ttft_deadline_ts: Optional[float] = None
+    finish_reason: Optional[str] = None
+
+    @property
+    def prompt_len(self) -> int:
+        return len(self.prompt_tokens)
 
 
 class TestPDRequestRouter(PDRequestRouter):
@@ -71,6 +78,7 @@ class TestPDRequestRouter(PDRequestRouter):
         self, request, finish_reason: Optional[str] = None, error: Optional[str] = None
     ):
         self._test_finished_reqs.add(request.request_id)
+        request.finish_reason = finish_reason
 
     # tests
 
@@ -403,6 +411,165 @@ def test_pd_router_prefix_prefill_decode_uses_decode_policy():
 
     assert isinstance(router.prefill_policy, PrefixCacheAwarePolicy)
     assert router.decode_policy.algorithm == "round_robin"
+
+
+def _length_test_router(
+    prefill_limits, decode_limits, *, length_routing=True, decode_length_routing=True
+):
+    cfg = _pd_router_config(
+        routing_algorithm="prefix_cache_aware",
+        routing_algorithm_for_decode="prefix_cache_aware",
+    )
+    cfg.routing_by_req_len = length_routing
+    cfg.decode_routing_by_req_len = decode_length_routing
+    args = get_global_args()
+    instances = [("prefill", limit) for limit in prefill_limits] + [
+        ("decode", limit) for limit in decode_limits
+    ]
+    args.multi_inst.n_insts = len(instances)
+    args.multi_inst.inst_overrides = {
+        i: {"multi_inst": {"role": role}} for i, (role, _) in enumerate(instances)
+    }
+    set_global_args(args, need_ensure=False, need_preprocess=False)
+
+    class LengthTestPDRequestRouter(TestPDRequestRouter):
+        def _scheduler_max_seq_len(self, inst_id):
+            return instances[inst_id][1]
+
+        def _reject_ttft_timeout(self, request, stage="ttft_router"):
+            return False
+
+    router = LengthTestPDRequestRouter(cfg, PDDisaggregationConfig())
+    router.pd_coordination_service = None
+    return router
+
+
+async def _run_pd_router_iteration(router):
+    router._shutdown = False
+    task = asyncio.create_task(router._pd_request_processor_task())
+    await asyncio.sleep(0)
+    router._shutdown = True
+    await asyncio.wait_for(task, timeout=1)
+
+
+def test_pd_router_length_admission_respects_routing_flags():
+    cases = [
+        ([8], [16], 9, 1, True, True, True),
+        ([16], [8], 9, 1, True, True, True),
+        ([16], [8], 7, 2, True, True, True),
+        ([4, 8], [4, 8], 7, 2, True, True, True),
+        ([8], [16], 9, 1, True, False, True),
+        ([16], [8], 7, 2, False, True, True),
+        ([8], [16], 9, 1, False, True, False),
+        ([16], [8], 7, 2, True, False, False),
+        ([8], [8], 9, 1, False, False, False),
+    ]
+    for (
+        prefill_limits,
+        decode_limits,
+        prompt_len,
+        max_new_tokens,
+        length_routing,
+        decode_length_routing,
+        rejected,
+    ) in cases:
+        router = _length_test_router(
+            prefill_limits,
+            decode_limits,
+            length_routing=length_routing,
+            decode_length_routing=decode_length_routing,
+        )
+        assert ("max_seq_len" in router.prefill_schedulers[0]) == length_routing
+        assert ("max_seq_len" in router.decode_schedulers[0]) == decode_length_routing
+        request = MockReq("oversize", [1] * prompt_len, max_new_tokens)
+        selected_requests = []
+
+        async def select(request):
+            selected_requests.append(request)
+            return True
+
+        router._add_pd_request = select
+        asyncio.run(router.add_request(request))
+        asyncio.run(_run_pd_router_iteration(router))
+
+        if rejected:
+            assert not selected_requests
+            assert request.finish_reason == "length"
+            assert router._test_finished_reqs == {request.request_id}
+            assert router.total_requests == 1
+        else:
+            assert selected_requests == [request]
+            assert request.finish_reason is None
+            assert not router._test_finished_reqs
+            assert router.total_requests == 0
+        assert not router.waiting_for_pd_workers
+        assert not router.pending_pd_requests
+        assert not router.pending_requests
+
+
+def test_pd_router_length_boundary_and_queue_progress():
+    cases = [
+        ([8], [16], 8, 8, 0),
+        ([16], [8], 7, 1, 0),
+        ([4, 8], [4, 8], 7, 1, 1),
+    ]
+    for (
+        prefill_limits,
+        decode_limits,
+        prompt_len,
+        max_new_tokens,
+        expected_sid,
+    ) in cases:
+        router = _length_test_router(prefill_limits, decode_limits)
+        oversize = MockReq("oversize", [1] * (max(prefill_limits) + 1))
+        valid = MockReq("valid", [1] * prompt_len, max_new_tokens)
+        dispatched_requests = []
+
+        async def dispatched(pd_request):
+            dispatched_requests.append(pd_request)
+            router._shutdown = True
+
+        router._process_pd_request = dispatched
+        asyncio.run(router.add_request(oversize))
+        asyncio.run(router.add_request(valid))
+        asyncio.run(asyncio.wait_for(router._pd_request_processor_task(), timeout=1))
+
+        assert router._test_finished_reqs == {oversize.request_id}
+        assert router.total_requests == 1
+        assert not router.waiting_for_pd_workers
+        pair = router.pending_pd_requests[valid.request_id]
+        assert pair.prefill_scheduler_id == expected_sid
+        assert pair.decode_scheduler_id == expected_sid
+        assert dispatched_requests == [pair]
+
+
+def test_pd_router_waits_for_capable_worker_recovery():
+    for unavailable_role in ("prefill", "decode"):
+        router = _length_test_router([4, 8], [4, 8])
+        policy = (
+            router.prefill_policy
+            if unavailable_role == "prefill"
+            else router.decode_policy
+        )
+        policy.scheduler_stats[1].is_alive = False
+        request = MockReq("waiting", [1] * 7, 1)
+
+        asyncio.run(router.add_request(request))
+        asyncio.run(_run_pd_router_iteration(router))
+
+        assert not router._test_finished_reqs
+        assert router.total_requests == 0
+        assert list(router.waiting_for_pd_workers) == [request]
+        assert not router.pending_pd_requests
+
+        policy.scheduler_stats[1].is_alive = True
+        asyncio.run(_run_pd_router_iteration(router))
+
+        assert not router._test_finished_reqs
+        assert not router.waiting_for_pd_workers
+        pair = router.pending_pd_requests[request.request_id]
+        assert pair.prefill_scheduler_id == 1
+        assert pair.decode_scheduler_id == 1
 
 
 def test_pd_router_liveness_heartbeat_refreshes_online_worker():
