@@ -24,6 +24,7 @@ from chitu.kv_cache import (
     MMPagedKVCache,
     PagedKVCacheAccessor,
 )
+from chitu.lazy import eval_lazy
 from chitu.models.model import (
     LayerNorm,
     RMSNorm,
@@ -61,12 +62,15 @@ from chitu.ops import (
     soft_fp8_blockfp8_weight_dequant,
     update_singleton_paged_kv_cache,
 )
+from chitu.ops.linear_attn import (
+    _prepare_kimi_delta_beta,
+    _prepare_kimi_delta_gate,
+)
 from chitu.quantization import QuantizationRegistry
 from chitu.task_type import TaskType
 from chitu.tensor_parallel import ColumnParallelLinear, LocalLinear, RowParallelLinear
 from chitu.distributed.parallel_state import get_tp_size
 from chitu.utils import try_import_opt_dep
-
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
 
@@ -772,17 +776,22 @@ class Glm5NextForgetGate(nn.Module):
             torch.empty(self.num_heads // get_tp_size(), dtype=torch.float32)
         )
 
-    def forward(self, x, f_a: Optional[torch.Tensor] = None):
+    def forward(self, x, beta_raw: torch.Tensor, f_a: Optional[torch.Tensor] = None):
+        """Project the gate and return lazy gate/beta matching beta_raw's layout."""
         if f_a is None:
             f_a = self.f_a_proj(x)
-        g = self.f_b_proj(f_a).float() + self.dt_bias.float().view(1, -1)
         # `x` may hold fewer rows than `f_a` under CP, where the gate is also
         # computed from all-gathered projections.
-        g = g.view(g.shape[0], -1, self.head_dim)
-        decay_rate = torch.exp(self.A_log.float()).view(1, -1, 1)
-        if self.safe_gate_lower_bound is not None:
-            return self.safe_gate_lower_bound * torch.sigmoid(decay_rate * g.float())
-        return -decay_rate * F.softplus(g.float())
+        raw_g = self.f_b_proj(f_a).view(*beta_raw.shape, self.head_dim)
+        g = _prepare_kimi_delta_gate(
+            raw_g=raw_g,
+            raw_beta=beta_raw,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias.view(-1, self.head_dim),
+            lower_bound=self.safe_gate_lower_bound,
+        )
+        beta = _prepare_kimi_delta_beta(raw_beta=beta_raw)
+        return g, beta
 
 
 class Glm5NextRMSNormGated(nn.Module):
@@ -815,9 +824,31 @@ class Glm5NextLinearAttention(nn.Module):
         self.conv_impl = getattr(args, "linear_conv_impl", "auto")
         self.layer_id = layer_id
         self.cache = cache
-        self.impl = getattr(args, "linear_attention_impl", "auto")
-        self.mtp_size = get_global_args().infer.mtp_size
+        requested_impl = getattr(args, "linear_attention_impl", "auto")
+        global_args = get_global_args()
+        self.mtp_size = global_args.infer.mtp_size
         self.forget_gate = Glm5NextForgetGate(args, checkpoint_prefix / "forget_gate")
+        # Fix the prefill backend for the lifetime of the cache, including
+        # short chunks that do not produce checkpoints themselves. The decode
+        # instance must use the same layout when prefix-cached states are
+        # transferred from a prefill instance.
+        self.prefill_impl = chunk_kimi_delta_attention.resolve_impl(
+            head_dim=self.head_dim,
+            lower_bound=self.forget_gate.safe_gate_lower_bound,
+            has_raw_gates=True,
+            requires_checkpoints=(
+                self.cache.checkpoint_interval is not None
+                or global_args.infer.enable_prefix_caching
+            ),
+            requested_impl=requested_impl,
+        )
+        self.decode_impl = recurrent_kimi_delta_attention.resolve_impl(
+            impl=requested_impl
+        )
+        # BoltOps prefill writes V-first states; Torch/FLA write K-first.
+        # BoltOps decode supports both layouts natively, so a Torch prefill
+        # can still feed BoltOps decode without a transpose.
+        self.kda_state_v_first = self.prefill_impl == "boltops_kda"
         self.merge_qkv = QuantizationRegistry.allowed_merge_qkv(
             checkpoint_prefix / "in_proj_qkvbfg_a"
         )
@@ -1017,25 +1048,36 @@ class Glm5NextLinearAttention(nn.Module):
             lambda h: h.reshape(h.size(0), -1, self.head_dim), (q, k, v)
         )  # (total_len, n_heads, head_dim)
 
-        beta = beta_raw.sigmoid()
-        g = self.forget_gate(x, f_a=f_a)
+        if use_precomputed_states:
+            gate_shape = (q.shape[0], 1)
+        elif is_mtp_decode_stage:
+            gate_shape = (q.shape[0] // self.mtp_size, self.mtp_size)
+        else:
+            gate_shape = (1, q.shape[0])
+        g, beta = self.forget_gate(
+            x, beta_raw.view(*gate_shape, self.n_local_heads), f_a=f_a
+        )
+
         if use_precomputed_states:
             out, last_state = recurrent_kimi_delta_attention(
                 q.unsqueeze(1),
                 k.unsqueeze(1),
                 v.unsqueeze(1),
-                g=g.unsqueeze(1),
-                beta=beta.unsqueeze(1),
+                g=g,
+                beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
-                impl=self.impl,
+                state_v_first=self.kda_state_v_first,
+                impl=self.decode_impl,
             )
         elif is_mtp_decode_stage:
-            q_mtp, k_mtp, v_mtp, beta_mtp, g_mtp = map(
+            q_mtp, k_mtp, v_mtp = map(
                 lambda x: x.view(-1, self.mtp_size, *x.shape[1:]).contiguous(),
-                [q, k, v, beta, g],
+                [q, k, v],
             )
+            # LazyTensor has no token slicing; materialize once before the loop.
+            g_mtp, beta_mtp = eval_lazy(g), eval_lazy(beta)
 
             out_mtp = torch.empty_like(q_mtp)
             last_state = torch.empty(
@@ -1053,7 +1095,8 @@ class Glm5NextLinearAttention(nn.Module):
                     initial_state=recurrent_state,
                     output_final_state=True,
                     use_qk_l2norm_in_kernel=True,
-                    impl=self.impl,
+                    state_v_first=self.kda_state_v_first,
+                    impl=self.decode_impl,
                 )
                 out_mtp[:, step] = out_step.squeeze(1)
                 last_state[:, step] = recurrent_state
@@ -1063,8 +1106,8 @@ class Glm5NextLinearAttention(nn.Module):
                 q.unsqueeze(0),
                 k.unsqueeze(0),
                 v.unsqueeze(0),
-                g=g.unsqueeze(0),
-                beta=beta.unsqueeze(0),
+                g=g,
+                beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
@@ -1073,9 +1116,8 @@ class Glm5NextLinearAttention(nn.Module):
                 state_checkpoints=state_checkpoints,
                 checkpoint_cu_starts=ckpt_cu_starts,
                 checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-                impl=self.impl,
+                impl=self.prefill_impl,
             )
-
         if cp_active:
             # The recurrence above ran on the all-gathered global sequence, so
             # `out` and the gate source cover every token; keep only this

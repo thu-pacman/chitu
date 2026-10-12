@@ -158,22 +158,26 @@ def _a8_per_token_act_quant_with_expert_mask(
     scale_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     E, M, hidden = activation_per_expert.shape
-    q_activation = torch.zeros(
-        (E, M, hidden), dtype=torch.int8, device=activation_per_expert.device
-    )
-    activation_scale = torch.zeros(
-        (E, M, 1), dtype=scale_dtype, device=activation_per_expert.device
-    )
-    for expert_id, n_tokens in enumerate(n_tokens_per_expert.detach().cpu().tolist()):
-        n_tokens = min(max(int(n_tokens), 0), M)
-        if n_tokens == 0:
-            continue
-        q_valid, scale_valid = a8_per_token_act_quant(
-            activation_per_expert[expert_id, :n_tokens].contiguous(),
-            scale_dtype=scale_dtype,
+    if E == 0 or M == 0:
+        return (
+            torch.zeros_like(activation_per_expert, dtype=torch.int8),
+            torch.zeros(
+                (E, M, 1), dtype=scale_dtype, device=activation_per_expert.device
+            ),
         )
-        q_activation[expert_id, :n_tokens].copy_(q_valid.view(n_tokens, hidden))
-        activation_scale[expert_id, :n_tokens].copy_(scale_valid.reshape(n_tokens, 1))
+
+    # Keep expert counts on device so graph replay can use new routing decisions.
+    valid_tokens = torch.arange(M, device=activation_per_expert.device).view(
+        1, M, 1
+    ) < n_tokens_per_expert.view(E, 1, 1)
+    # Mask before quantization: padding from the masked GEMM/activation may be
+    # uninitialized (including NaN/Inf). Multiplying it by zero is not sufficient.
+    safe_activation = activation_per_expert.masked_fill(~valid_tokens, 0)
+    q_activation, activation_scale = a8_per_token_act_quant(
+        safe_activation.reshape(E * M, hidden), scale_dtype=scale_dtype
+    )
+    q_activation = q_activation.view(E, M, hidden).masked_fill_(~valid_tokens, 0)
+    activation_scale = activation_scale.reshape(E, M, 1).masked_fill_(~valid_tokens, 0)
     return q_activation.contiguous(), activation_scale.contiguous()
 
 
@@ -335,16 +339,13 @@ class W8A8PerTokenPerChannelDynLinear(QuantizedLinearBase):
             requires_grad=False,
         )
 
-        if weight_scale_dtype is None:
-            # Hygon* impl classes run W8A8 kernels that consume fp32 scales;
-            # store fp32 to avoid per-forward casts. Gate on the concrete
-            # class, not the platform: only the Hygon linear subclass hits
-            # the isinstance check below.
-            weight_scale_dtype = (
-                torch.float32
-                if isinstance(self, _HYGON_FP32_SCALE_CONSUMER_CLASSES)
-                else torch.get_default_dtype()
-            )
+        if isinstance(self, _HYGON_FP32_SCALE_CONSUMER_CLASSES):
+            # Hygon kernels consume fp32 scales. Keep them fp32 even when a
+            # model config describes the checkpoint scale tensors as bf16;
+            # load_state_dict converts the checkpoint values once at load time.
+            weight_scale_dtype = torch.float32
+        elif weight_scale_dtype is None:
+            weight_scale_dtype = torch.get_default_dtype()
         elif isinstance(weight_scale_dtype, str):
             weight_scale_dtype = parse_dtype(weight_scale_dtype)
         self.weight_scale = torch.nn.Parameter(
@@ -646,15 +647,13 @@ class W8A8PerTokenPerChannelDynMoeExpertsMergedBase(QuantizedMoeExpertsMerged):
             n_activated_experts,
             checkpoint_prefix,
         )
-        if weight_scale_dtype is None:
-            # The Hygon* MoE impl classes run W8A8 kernels that consume
-            # fp32 scales; store fp32 to avoid per-forward casts. Gate on
-            # the concrete class, not the platform.
-            weight_scale_dtype = (
-                torch.float32
-                if isinstance(self, _HYGON_FP32_SCALE_CONSUMER_CLASSES)
-                else torch.get_default_dtype()
-            )
+        if isinstance(self, _HYGON_FP32_SCALE_CONSUMER_CLASSES):
+            # Hygon kernels consume fp32 scales. Keep them fp32 even when a
+            # model config describes the checkpoint scale tensors as bf16;
+            # load_state_dict converts the checkpoint values once at load time.
+            weight_scale_dtype = torch.float32
+        elif weight_scale_dtype is None:
+            weight_scale_dtype = torch.get_default_dtype()
         elif isinstance(weight_scale_dtype, str):
             weight_scale_dtype = parse_dtype(weight_scale_dtype)
         self.gate_up_proj_weight = torch.nn.Parameter(
@@ -1050,7 +1049,7 @@ class HygonLightopW8A8PerTokenPerChannelDynMoeExpertsMerged(
                     "Hygon W8A8 LightOP currently expects per-token INT8 scales"
                 )
             scale_a = scale_a.contiguous()
-        scale_b = weight_scale.to(torch.float32).view(weight_int8.shape[0], 1)
+        scale_b = weight_scale.view(weight_int8.shape[0], 1)
         status, out = lightop.gemm_w8a8_smooth(
             q_x,
             weight_int8.t(),

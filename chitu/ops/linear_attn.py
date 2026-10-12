@@ -5,8 +5,9 @@
 import torch
 import torch.nn.functional as F
 
+from chitu.lazy import eval_lazy, make_lazy_op
 from chitu.ops.utils import check_checkpoint_args, make_op_dispatcher
-from chitu.device_type import is_muxi
+from chitu.device_type import is_hygon, is_muxi
 from chitu.utils import try_import_opt_dep, try_import_platform_dep
 
 if is_muxi():
@@ -29,6 +30,9 @@ if has_fla:
         has_fla_kda = False
 else:
     has_fla_kda = False
+
+boltops_kda, has_boltops_kda = try_import_platform_dep("boltops.fla.kda")
+has_boltops_kda = has_boltops_kda and is_hygon()
 
 triton, has_triton = try_import_platform_dep("triton")
 if has_triton:
@@ -361,6 +365,52 @@ def _kda_l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6):
     return x / inv_norm
 
 
+@make_lazy_op
+def _prepare_kimi_delta_gate(
+    raw_g,
+    raw_beta,
+    A_log,
+    dt_bias,
+    lower_bound,
+):
+    """Materialize GLM-5.3's processed gate when no consumer fuses it.
+
+    ``raw_beta`` is deliberately captured even though the gate formula does not
+    use it. It ties both raw inputs to one lazy producer, allowing a fused KDA
+    consumer to recover and validate the complete raw-gate contract.
+    """
+    del raw_beta
+    gate = raw_g.float() + dt_bias.float()
+    decay_rate = torch.exp(A_log.float()).unsqueeze(-1)
+    if lower_bound is not None:
+        return lower_bound * torch.sigmoid(decay_rate * gate)
+    return -decay_rate * F.softplus(gate)
+
+
+@make_lazy_op
+def _prepare_kimi_delta_beta(raw_beta):
+    return raw_beta.sigmoid()
+
+
+def _get_raw_kimi_delta_gate_inputs(g, beta):
+    if not isinstance(g, _prepare_kimi_delta_gate.lazy_tensor_type()) or not isinstance(
+        beta, _prepare_kimi_delta_beta.lazy_tensor_type()
+    ):
+        return None
+    if g.is_evaluated() or beta.is_evaluated():
+        return None
+    raw_beta = g.kwargs["raw_beta"]
+    if beta.kwargs["raw_beta"] is not raw_beta:
+        return None
+    return (
+        g.kwargs["raw_g"],
+        raw_beta,
+        g.kwargs["A_log"],
+        g.kwargs["dt_bias"],
+        g.kwargs["lower_bound"],
+    )
+
+
 @make_op_dispatcher
 def chunk_kimi_delta_attention(
     query,
@@ -390,34 +440,139 @@ def chunk_kimi_delta_attention(
         checkpoint_every_n_tokens: 每 C 个 token 的最后一个位置存一份 state，0 表示不存
             （默认）。位置从本 chunk 的起点往前数，所以只有 chunk 起点对齐到 C 时它才和
             kv cache 按 seq 绝对位置判定的 checkpoint 是同一批位置。目前只有 torch 实现支持。
+        initial_state: 使用所选实现的原生布局；BoltOps 为
+            [num_seqs, n_heads, v_head_dim, k_head_dim]，FLA/Torch 为
+            [num_seqs, n_heads, k_head_dim, v_head_dim]。不会自动转置 state；
+            调用方应提前固定实现，并让 cache 和后续 decode 使用同一布局。
 
     Returns:
         (out, last_state)：out 的 shape 是 [bs, total_len, n_heads, v_head_dim]，其中 bs 恒为 1
         —— 一个 step 里各请求的 token 首尾相接成一条扁平序列（请求边界见 cu_seqlens/
-        seq_len_list），所以 total_len 是这条序列的总长度，前两维与输入 query 一致；fla 与
-        torch 两种实现的 out 布局相同。last_state 是按请求给的，shape 是
-        [num_seqs, n_heads, k_head_dim, v_head_dim]，num_seqs 即 len(seq_len_list)。
+        seq_len_list），所以 total_len 是这条序列的总长度，前两维与输入 query 一致；
+        各实现的 out 布局相同。last_state 按请求给出，采用与 initial_state 相同的
+        原生布局。num_seqs 即 len(seq_len_list)。
     """
     raise NotImplementedError
 
 
 @chunk_kimi_delta_attention.register_auto
 def _auto_chunk_kimi_delta_attention(
-    *,
+    query=None,
+    key=None,
+    value=None,
+    g=None,
+    beta=None,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+    cu_seqlens=None,
+    seq_len_list=None,
     state_checkpoints=None,
     checkpoint_cu_starts=None,
     checkpoint_every_n_tokens: int = 0,
+    *,
+    head_dim=None,
+    lower_bound=None,
+    has_raw_gates=False,
+    requires_checkpoints=False,
+    requested_impl="auto",
 ):
+    """Resolve from runtime tensors or initialization-time metadata.
+
+    The keyword-only arguments are for ``resolve_impl`` before tensors exist;
+    they are not arguments of the executable attention interface. Actual query
+    and gate tensors take precedence over the corresponding metadata.
+    ``requested_impl`` lets explicit choices pass through the same startup
+    validation instead of bypassing the resolver via ``impl``.
+    """
+    if query is not None:
+        head_dim = query.shape[-1]
+    if g is not None or beta is not None:
+        raw_inputs = _get_raw_kimi_delta_gate_inputs(g, beta)
+        has_raw_gates = raw_inputs is not None
+        lower_bound = raw_inputs[4] if has_raw_gates else None
+
+    requires_checkpoints = (
+        requires_checkpoints
+        or checkpoint_every_n_tokens > 0
+        or state_checkpoints is not None
+        or checkpoint_cu_starts is not None
+    )
+    boltops_supported = has_raw_gates and head_dim == 128 and lower_bound is not None
+    if requested_impl != "auto":
+        if requires_checkpoints and requested_impl in ("boltops_kda", "fla"):
+            raise NotImplementedError(
+                f"chunk_kimi_delta_attention: impl '{requested_impl}' does not "
+                "support checkpoints; use linear_attention_impl='auto' or 'torch'"
+            )
+        if requested_impl == "boltops_kda" and not boltops_supported:
+            raise NotImplementedError(
+                "BoltOps KDA prefill requires raw gate/beta, head_dim=128, "
+                "and a non-None lower_bound"
+            )
+        # The dispatcher validates registration and availability afterwards.
+        return requested_impl
+
+    if requires_checkpoints:
+        # 目前只有 torch 实现支持 checkpoint（fla 实现在这里会直接 assert）
+        return "torch"
+    if has_boltops_kda and boltops_supported:
+        return "boltops_kda"
+    if has_fla_kda:
+        return "fla"
+    return "torch"
+
+
+@chunk_kimi_delta_attention.register("boltops_kda", available=has_boltops_kda)
+def _chunk_kimi_delta_attention_boltops(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+    cu_seqlens=None,
+    seq_len_list=None,
+    state_checkpoints=None,
+    checkpoint_cu_starts=None,
+    checkpoint_every_n_tokens=0,
+):
+    raw_inputs = _get_raw_kimi_delta_gate_inputs(g, beta)
+    if raw_inputs is None:
+        raise ValueError(
+            "BoltOps KDA prefill requires lazy gate/beta from "
+            "_prepare_kimi_delta_gate and _prepare_kimi_delta_beta"
+        )
     if (
         checkpoint_every_n_tokens > 0
         or state_checkpoints is not None
         or checkpoint_cu_starts is not None
     ):
-        # 目前只有 torch 实现支持 checkpoint（fla 实现在这里会直接 assert）
-        return "torch"
-    if has_fla_kda:
-        return "fla"
-    return "torch"
+        raise NotImplementedError("BoltOps KDA prefill does not support checkpoints")
+    if initial_state is None:
+        raise ValueError("BoltOps KDA prefill requires an initial state")
+    if cu_seqlens is None:
+        raise ValueError("BoltOps KDA prefill requires cu_seqlens")
+
+    raw_g, raw_beta, A_log, dt_bias, lower_bound = raw_inputs
+    if lower_bound is None:
+        raise ValueError("BoltOps KDA prefill requires a finite lower_bound")
+    return boltops_kda.chunk_kda_prefill(
+        query,
+        key,
+        value,
+        raw_g.to(dtype=query.dtype).contiguous(),
+        raw_beta.to(dtype=query.dtype).contiguous(),
+        A_log.float().contiguous(),
+        dt_bias=dt_bias.float().contiguous(),
+        lower_bound=float(lower_bound),
+        initial_state=initial_state.float().contiguous(),
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens.contiguous(),
+        use_qk_l2norm=use_qk_l2norm_in_kernel,
+    )
 
 
 @chunk_kimi_delta_attention.register("fla", available=has_fla_kda)
@@ -442,6 +597,7 @@ def _chunk_kimi_delta_attention_fla(
         and checkpoint_cu_starts is None
     ), "chunk_kimi_delta_attention with checkpoints is not supported by the fla impl yet"
     assert cu_seqlens is not None
+    g, beta = eval_lazy(g), eval_lazy(beta)
     if initial_state is not None:
         initial_state = initial_state.to(torch.float32)
     return chunk_kda_fla(
@@ -580,6 +736,7 @@ def chunk_kimi_delta_attention_torch(
 ):
     assert seq_len_list is not None
 
+    g, beta = eval_lazy(g), eval_lazy(beta)
     check_checkpoint_args(
         state_checkpoints,
         checkpoint_cu_starts,
@@ -588,6 +745,7 @@ def chunk_kimi_delta_attention_torch(
         (query.shape[-2], query.shape[-1], value.shape[-1]),
         "chunk_kimi_delta_attention",
     )
+
     if checkpoint_every_n_tokens > 0:
         out, last_state = _chunk_delta_attention_torch_with_checkpoints(
             chunk_kimi_delta_attention_torch_dense,
@@ -676,13 +834,22 @@ def recurrent_kimi_delta_attention(
     initial_state,
     output_final_state,
     use_qk_l2norm_in_kernel=False,
+    state_v_first=False,
     impl="auto",
 ):
+    """Decode using the cache's existing state layout, without transposing it.
+
+    ``state_v_first=False`` means [B, H, K, V]; True means [B, H, V, K].
+    BoltOps supports both natively. FLA/Torch require K-first and reject True.
+    The final state keeps the input layout.
+    """
     raise NotImplementedError
 
 
 @recurrent_kimi_delta_attention.register_auto
 def _auto_recurrent_kimi_delta_attention():
+    if has_boltops_kda:
+        return "boltops_kda"
     if has_fla_kda:
         return "fla"
     return "torch"
@@ -698,7 +865,13 @@ def _recurrent_kimi_delta_attention_fla(
     initial_state,
     output_final_state,
     use_qk_l2norm_in_kernel=False,
+    state_v_first=False,
 ):
+    if state_v_first:
+        raise ValueError(
+            "FLA KDA decode only supports K-first states (state_v_first=False)"
+        )
+    g, beta = eval_lazy(g), eval_lazy(beta)
     if initial_state is not None:
         initial_state = initial_state.to(torch.float32)
     return fused_recurrent_kda_fla(
@@ -713,6 +886,34 @@ def _recurrent_kimi_delta_attention_fla(
     )
 
 
+@recurrent_kimi_delta_attention.register("boltops_kda", available=has_boltops_kda)
+def _recurrent_kimi_delta_attention_boltops(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state,
+    output_final_state,
+    use_qk_l2norm_in_kernel=False,
+    state_v_first=False,
+):
+    g, beta = eval_lazy(g), eval_lazy(beta)
+    if initial_state is not None:
+        initial_state = initial_state.float().contiguous()
+    return boltops_kda.recurrent_kimi_delta_attention(
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state,
+        output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        state_v_first=state_v_first,
+    )
+
+
 @recurrent_kimi_delta_attention.register("torch")
 def recurrent_kimi_delta_attention_torch(
     query,
@@ -723,8 +924,14 @@ def recurrent_kimi_delta_attention_torch(
     initial_state,
     output_final_state,
     use_qk_l2norm_in_kernel=False,
+    state_v_first=False,
 ):
+    if state_v_first:
+        raise ValueError(
+            "Torch KDA decode only supports K-first states (state_v_first=False)"
+        )
     initial_dtype = query.dtype
+    g, beta = eval_lazy(g), eval_lazy(beta)
     query, key, value, g, beta = [
         x.to(torch.float32) for x in (query, key, value, g, beta)
     ]

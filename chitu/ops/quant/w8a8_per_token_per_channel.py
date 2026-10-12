@@ -9,7 +9,7 @@ from chitu.native_layout import NpuFractalZnTensor
 from chitu.ops.activation import silu_and_mul
 from chitu.ops.utils import make_op_dispatcher
 from chitu.import_utils import try_import_platform_dep, try_import_and_setup_torch_npu
-from chitu.lazy import single_dispatch_lazy_tensor
+from chitu.lazy import eval_lazy, single_dispatch_lazy_tensor
 
 triton, has_triton = try_import_platform_dep("triton")
 lmslim, has_lmslim = try_import_platform_dep("lmslim")
@@ -192,6 +192,18 @@ if has_lightop and hasattr(lightop, "fuse_silu_mul_quant"):
 
     @a8_per_token_act_quant_hygon.register
     def _(act: silu_and_mul.lazy_tensor_type(), scale_dtype=torch.float):
+        # LightOp's fused kernel only implements plain SwiGLU. Evaluate variants
+        # first so clipping, OAI parameters and expert masks are preserved.
+        if any(
+            act.kwargs.get(name) is not None
+            for name in (
+                "swiglu_limit",
+                "swiglu_alpha",
+                "swiglu_beta",
+                "expert_n_tokens",
+            )
+        ):
+            return a8_per_token_act_quant_hygon(eval_lazy(act), scale_dtype=scale_dtype)
         return silu_and_mul_and_a8_per_token_act_quant(
             act.kwargs["x"],
             swiglu_limit=act.kwargs["swiglu_limit"],
