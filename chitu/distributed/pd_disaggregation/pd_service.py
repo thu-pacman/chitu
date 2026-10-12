@@ -53,6 +53,11 @@ from chitu.hooks import (
     PDTaskEvictHook,
 )
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
+from chitu.metrics.task_stats import (
+    count_kv_send_inflight,
+    count_router_load,
+    set_kv_send_change_notifier,
+)
 from chitu.serve.common import (
     enqueue_profile_payload,
     start_worker,
@@ -633,6 +638,19 @@ class PDSchedulerService:
         """Report statistics to router"""
         logger.info("starting stats reporter")
 
+        # A KV transfer can be shorter than the 1 Hz heartbeat, and /dp/debug has
+        # to be able to observe one (that is the only way to interrupt a request
+        # while its blocks are on the wire). Publish a stats update as soon as a
+        # send starts or finishes instead of waiting for the next tick, and keep
+        # the 1 Hz tick as the fallback.
+        loop = asyncio.get_running_loop()
+        kv_send_changed = asyncio.Event()
+
+        def _on_kv_send_change() -> None:
+            loop.call_soon_threadsafe(kv_send_changed.set)
+
+        set_kv_send_change_notifier(_on_kv_send_change)
+
         while self.running:
             stats = self._collect_stats()
             if not self._stats_identity_logged:
@@ -660,7 +678,11 @@ class PDSchedulerService:
             if Backend.state == BackendState.Terminating:
                 self._log_termination_drain_state("stats_reporter_terminating")
 
-            await asyncio.sleep(1.0)  # Report every second
+            kv_send_changed.clear()
+            try:
+                await asyncio.wait_for(kv_send_changed.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
 
     def _collect_stats(self) -> dict:
         """Collect scheduler statistics"""
@@ -668,6 +690,15 @@ class PDSchedulerService:
         last_update_ts = get_server_event_loop().time()
         main_cache = Backend.cache_dict[MAIN_CACHE_NAME]
 
+        # TaskPool load of this instance, reported the same way the Enhanced
+        # Scheduler process reports it (chitu.metrics.task_stats.count_router_load),
+        # so /dp/debug and the Router see what the engine is really running.
+        running_requests, waiting_requests = count_router_load()
+        # KV blocks of this (Prefill) instance that are on the wire right now: the
+        # transfer is asynchronous and reports nothing back to Python, so this
+        # counter is what makes the transfer window observable from outside (see
+        # chitu.metrics.task_stats.mark_kv_send_started).
+        kv_send_inflight = count_kv_send_inflight()
         stats = {
             "msg_type": MSG_TYPE_HEARTBEAT,  # distinguish heartbeat vs crash
             "local_instance_id": self.scheduler.local_instance_id,
@@ -677,9 +708,11 @@ class PDSchedulerService:
             # FIXME: stats from all cache?
             "num_blocks": main_cache.num_blocks,
             "block_size": main_cache.block_size,
-            # 目前仅透传 scheduler.get_pd_stats()，以下字段暂不统计，固定为 0。
-            "running_requests": 0,
-            "waiting_requests": 0,
+            # 本实例 TaskPool 的负载与 Enhanced Scheduler 一致 (count_router_load)；
+            # pending_tokens 暂未统计，固定为 0。
+            "running_requests": running_requests,
+            "waiting_requests": waiting_requests,
+            "kv_send_inflight": kv_send_inflight,
             "pending_tokens": 0,
             "throughput_tokens_per_sec": 0.0,
             "last_update_time": last_update_ts,

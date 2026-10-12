@@ -38,6 +38,9 @@ class MockReq:
     max_new_tokens: int = 1
     ttft_deadline_ts: Optional[float] = None
     finish_reason: Optional[str] = None
+    # The router drops a queued request whose client already went away, which it
+    # reads from ``UserRequest.finished``.
+    finished: bool = False
 
     @property
     def prompt_len(self) -> int:

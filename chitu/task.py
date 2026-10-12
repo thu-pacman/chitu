@@ -1069,6 +1069,17 @@ class TaskPool:
             cls.pending_queue.append(task)
 
     @classmethod
+    def find_queued(cls, task_id: str) -> Optional[Task]:
+        """Enqueued (not yet promoted) task for ``task_id``, if any.
+
+        Enqueueing happens on the serve / scheduler-service thread while
+        ``add_all_queued()`` drains the queue on the compute thread, so the
+        lookup takes ``_lock``.
+        """
+        with cls._lock:
+            return next((t for t in cls.pending_queue if t.task_id == task_id), None)
+
+    @classmethod
     def _drain_pending_pool_removals(cls):
         """Compute thread: apply marks for tasks already resident in ``pool``.
 
@@ -1152,6 +1163,72 @@ class TaskPool:
             pass
         with cls._lock:
             cls.pending_remove.discard(task_id)
+
+
+ABORTED_FINISH_REASON = "aborted"
+"""``finish_reason`` recorded for a request stopped because the user went away."""
+
+
+def _stop_aborted_request(task: Task, finish_reason: str) -> None:
+    """End the user-facing stream of a task that is being aborted.
+
+    Single-instance mode wakes the HTTP handler awaiting the stream; on a DP/PD
+    instance the token sender turns it into a ``finish`` frame for the Router.
+    Without it a handler whose request never runs would wait forever.
+    """
+    req = getattr(task, "req", None)
+    if req is None or req.finished:
+        return
+    req.finish_reason = finish_reason
+    req.stop_stream()
+
+
+def abort_task(task_id: str, *, finish_reason: str = ABORTED_FINISH_REASON) -> bool:
+    """Stop engine-side processing of ``task_id`` and drop it from the pool.
+
+    Used when the user is gone before the request completed (client
+    disconnect): the request must stop occupying batch slots and KV blocks
+    instead of running to ``max_new_tokens``.
+
+    Safe to call from any thread (the caller is normally the scheduler-service
+    thread). The pool removal / KV release itself stays on the compute thread:
+    running tasks leave through ``Scheduler.update()`` (they are still in
+    ``TaskPool.id_list``), while a task that never entered the pool is dropped
+    by the ``pending_remove`` mark when the pending queue is drained (its stream
+    is ended here either way, so no handler keeps waiting).
+
+    Idempotent: returns ``True`` when a task was found (queued or running) and
+    ``False`` when the request is already gone.
+    """
+    task = TaskPool.pool.get(task_id)
+    if task is None:
+        # Not running (yet). The serve path may still have it queued in
+        # TaskPool.pending_queue, where the pending-remove mark keeps it from
+        # being promoted; that copy still has to be stopped here, otherwise the
+        # handler waiting on its stream would never wake up.
+        queued = TaskPool.find_queued(task_id)
+        TaskPool.mark_pending_remove(task_id)
+        if queued is None:
+            return False
+        queued.set_stopped()
+        _stop_aborted_request(queued, finish_reason)
+        return True
+
+    # Snapshot before set_stopped() rewrites the status: a task still in the PD
+    # incoming/prealloc stages must leave through the pending-remove path below.
+    was_pd_incoming = task.is_pd_status()
+    task.set_stopped()
+    if was_pd_incoming:
+        # PD incoming/prealloc stages own no local KV blocks yet, so there is
+        # nothing for Scheduler.update() to release; drain them instead.
+        TaskPool.mark_pending_remove(task_id)
+    else:
+        # Let the post-step update pass finalize the KV metadata and remove the
+        # task.
+        TaskCollector.add_update_task_ids([task_id])
+
+    _stop_aborted_request(task, finish_reason)
+    return True
 
 
 class SerializedPackedTasksPayloadType(Enum):

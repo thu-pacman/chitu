@@ -932,6 +932,22 @@ curl localhost:21002/terminate_engine \
   -d '{"confirm": true}'
 ```
 
+如果客户端在响应生成完成前断开连接（无论流式还是非流式请求），HTTP 层会检测到连接已关闭，
+并通知引擎停止处理该请求：任务被移除、占用的 KV cache 块被释放，不再继续生成 token。
+该行为对单实例部署和多实例部署都生效；在 PD 分离部署下，Prefill 和 Decode 实例都会被停止。
+断连检测基于事件：把 abort 折进 ASGI server 自身的连接关闭处理（uvicorn 在 socket 关闭时会把该请求的连接标记为
+disconnected），每连接只跑一次——推理请求身上**没有任何逐消息包装**，响应流不为此多花一分钱；客户端断开后立即停止该请求，
+无需轮询。这条路径依赖 uvicorn 的 HTTP 协议类；若挂不上，启动时会打 error 日志，此时被放弃的请求不会提前停止。
+CI 覆盖了三种部署形态：`test/client_interrupt_test.py` 验证单实例引擎，
+`test/client_interrupt_dp_test.py` 验证 DP（非 PD）多实例部署，
+`test/client_interrupt_pd_test.py` 通过 `boot.on_ready` 验证 PD 分离部署，
+后两者都从 `/dp/debug` 读回各实例的负载。
+每个 case 都会把下面这些接口的流式与非流式两种形态各跑一遍：
+OpenAI 对话补全与文本补全、OpenAI Responses、Anthropic Messages 与补全接口。
+PD 的 case 另外还会在**首 token 之前**断连（包括 KV 块正在传输时——各实例会把"正在传输的
+KV 请求数"`kv_send_inflight` 与负载一起上报到 `/dp/debug`），以及在请求还排在 Router
+里等 Prefill/Decode 实例时断连。
+
 OpenAI 兼容、OpenAI Responses 兼容和 Anthropic 兼容接口的参数说明请参见 [API_PARAMETERS.md](./API_PARAMETERS.md)。如果需要为新模型适配工具调用，请参见 [工具调用适配指南](./TOOL_CALL_ADAPTATION.md)。
 
 ### Grafana 监控面板
@@ -1068,3 +1084,4 @@ torchrun --nproc_per_node 8 --no-python ./test/dist_pytest/run_pytest_with_prett
 | `CHITU_MEM_TRACK`              | `0`, `1`                     | 启用启动时 CUDA 显存跟踪。参见 [性能分析](./PROFILING.md)。 |
 | `CHITU_MEM_TRACK_MAX_ENTRIES`  | 整数                         | CUDA 显存跟踪的环形缓冲区大小。参见 [性能分析](./PROFILING.md)。 |
 | `CHITU_MEM_TRACK_SNAPSHOT_DIR` | 指向目录的路径               | CUDA 显存 snapshot 输出目录。参见 [性能分析](./PROFILING.md)。 |
+| `CHITU_CLIENT_ABORT_POLL_INTERVAL_S` | 秒（默认 `0.2`）        | 客户端断连的兜底轮询间隔，仅在请求未经过内置 ASGI 中间件时使用。取值越小，被放弃的请求停止得越快，但轮询更频繁。 |

@@ -18,6 +18,8 @@ from chitu.global_vars import get_global_args
 from chitu.serve.crash import report_and_exit
 from chitu.distributed.parallel_state import get_world_group
 from chitu.task import PackedTasksResult, TaskPool
+from chitu.metrics.task_stats import mark_kv_send_finished, mark_kv_send_started
+from chitu.testing.exception import test_inject_exception_kv_transfer_slow
 from chitu.trace import Trace
 from chitu.metrics.prometheus_collector import (
     inc_kv_transfer_failures,
@@ -428,16 +430,25 @@ class KVManagerPrefill(KVManagerBase):
             info.num_hit_tokens = num_hit_tokens[i]
             inst_id = self._decode_inst_ids[info.decode_sid]
             first_token = first_tokens[i] if first_tokens is not None else None
-            self.executor.submit(
-                self.transfer_worker,
-                event,
-                req_id,
-                inst_id,
-                info.decode_sid,
-                info.decode_generation,
-                first_token,
-                info.recv_buffers,
-            )
+            # Count the transfer from here (handed to the worker) until the
+            # worker's finally clause: that interval is the KV send, which the
+            # instance reports in its heartbeat (chitu.metrics.task_stats).
+            mark_kv_send_started(req_id)
+            try:
+                self.executor.submit(
+                    self.transfer_worker,
+                    event,
+                    req_id,
+                    inst_id,
+                    info.decode_sid,
+                    info.decode_generation,
+                    first_token,
+                    info.recv_buffers,
+                )
+            except Exception:
+                # Never submitted: do not leave it counted as in flight.
+                mark_kv_send_finished(req_id)
+                raise
 
     def transfer_worker(
         self,
@@ -455,6 +466,9 @@ class KVManagerPrefill(KVManagerBase):
         """
         logger.debug(f"transfer_worker.start {req_id=}")
         try:
+            # Test injection: make this (usually millisecond) send observable from
+            # outside so a client disconnect can be aimed at it.
+            test_inject_exception_kv_transfer_slow(req_id)
             send_buffers = self.get_send_buffers(req_id)
 
             event.synchronize()
@@ -510,6 +524,10 @@ class KVManagerPrefill(KVManagerBase):
                 f"transfer_worker fatal error req_id={req_id}, entering crash protocol"
             )
             report_and_exit(f"KV transfer_worker crashed req_id={req_id}")
+        finally:
+            # The transfer is over either way (sent, reported as failed, or the
+            # process is going down): stop counting it as in flight.
+            mark_kv_send_finished(req_id)
 
     def remove_request_all_rank(self, request_id: str):
         """Broadcast RemoveRequest to all Prefill ranks (including self).

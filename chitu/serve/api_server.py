@@ -34,6 +34,7 @@ from chitu.serve.api_app import (
     set_server_status,
     set_uvicorn_server,
 )
+from chitu.serve.abort import install_connection_abort_hook
 from chitu.serve.event_loop import start_server_in_new_event_loop
 from chitu.serve.router import start_dp_components
 
@@ -82,6 +83,10 @@ async def start_uvicorn_async(args):
     )
     server = uvicorn.Server(config)
     set_uvicorn_server(server)
+    # Take the client-disconnect signal from the server's connection handling, so
+    # that inference requests need no per-message watcher; the middleware stays as
+    # the fallback when the protocol cannot be hooked.
+    install_connection_abort_hook()
     # Run server in current event loop - use await instead of asyncio.run!
     await server.serve()
 
@@ -138,6 +143,11 @@ async def start_router_components_and_serve():
             )
             server = uvicorn.Server(config)
             set_uvicorn_server(server)
+            # Same as in start_uvicorn_async: the Router is the process that
+            # serves user HTTP requests in multi-instance mode, so it is the one
+            # that benefits most from taking the disconnect from the connection
+            # instead of wrapping every response chunk.
+            install_connection_abort_hook()
             # Run server in current event loop - use await instead of asyncio.run!
             await server.serve()
 

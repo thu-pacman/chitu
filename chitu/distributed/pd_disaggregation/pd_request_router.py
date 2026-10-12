@@ -23,6 +23,7 @@ from chitu.dp_request_router import (
     PrefixCacheAwarePolicy,
     RequestRouter,
     SchedulerStats,
+    build_abort_request_message,
     build_terminate_engine_message,
     build_flush_cache_message,
 )
@@ -877,6 +878,10 @@ class PDRequestRouter(RequestRouter):
                         last_heartbeat_time=time.time(),
                         is_alive=worker_is_alive,
                         max_seq_len=stats_dict.get("max_seq_len", None),
+                        # PD instances report their KV sends on the wire; this is
+                        # the only window /dp/debug cannot otherwise see (the RDMA
+                        # is asynchronous). See chitu.metrics.task_stats.
+                        kv_send_inflight=stats_dict.get("kv_send_inflight", 0),
                         num_blocks=stats_dict.get("num_blocks", None),
                         block_size=stats_dict.get("block_size", None),
                         evicted_blk_hashes=evicted_blk_hashes,
@@ -1103,6 +1108,75 @@ class PDRequestRouter(RequestRouter):
                 request_id, include_generated_tokens=True
             )
 
+    @override
+    def _find_inflight_request(self, request_id: str) -> Optional[UserRequest]:
+        # PD keeps its own registries until a request is dispatched: the P/D
+        # pairing exists before dispatch, and not-yet-bound requests wait in
+        # waiting_for_pd_workers.
+        pd_request = self.pending_pd_requests.get(request_id)
+        if pd_request is not None:
+            return pd_request.original_request
+        for request in self.waiting_for_pd_workers:
+            if request.request_id == request_id:
+                return request
+        return super()._find_inflight_request(request_id)
+
+    @override
+    async def abort_request(
+        self, request_id: str, reason: str = "client disconnected"
+    ) -> bool:
+        """Abort a PD request on both halves of its P/D pair.
+
+        A PD request runs on two instances at once, so telling only one of them
+        leaves the other working (Prefill keeps writing KV, Decode keeps
+        decoding). The pair is recorded before dispatch, so it is known for
+        every request that already left ``waiting_for_pd_workers``.
+        """
+        if not request_id:
+            return False
+
+        pd_request = self.pending_pd_requests.get(request_id)
+        if pd_request is None:
+            logger.info(
+                "[CLIENT_ABORT][pd] req_id=%s is not bound to a P/D pair "
+                "(reason=%s); nothing to stop engine-side",
+                request_id,
+                reason,
+            )
+        else:
+            prefill_sid = pd_request.prefill_scheduler_id
+            decode_sid = pd_request.decode_scheduler_id
+            logger.info(
+                "[CLIENT_ABORT][pd] req_id=%s aborting prefill=%s decode=%s "
+                "(reason=%s)",
+                request_id,
+                prefill_sid,
+                decode_sid,
+                reason,
+            )
+            payload = msgpack.packb(build_abort_request_message(request_id, reason))
+            for role, sid, sockets in (
+                ("prefill", prefill_sid, self.prefill_sockets),
+                ("decode", decode_sid, self.decode_sockets),
+            ):
+                socket = sockets.get(sid)
+                if socket is None:
+                    logger.warning(
+                        "[CLIENT_ABORT][pd] %s instance %s has no socket; "
+                        "engine-side stop skipped",
+                        role,
+                        sid,
+                    )
+                    continue
+                await self._send_control_message(socket, payload, f"{role}:{sid}")
+
+        # Finalize the Router-side request so the HTTP handler stops streaming
+        # and the P/D pairing state is released.
+        request = self._find_inflight_request(request_id)
+        if request is not None and not request.finished:
+            self.finish_request_before_recv_stop(request, finish_reason="aborted")
+        return True
+
     async def add_request(self, request: UserRequest):
         """Add request to router"""
         self._ensure_ttft_deadline(request)
@@ -1291,6 +1365,11 @@ class PDRequestRouter(RequestRouter):
                     pd_request = self.pending_requests.popleft()
 
                     if isinstance(pd_request, PendingPDRequest):
+                        if pd_request.original_request.finished:
+                            # The user connection went away while this request
+                            # was queued for dispatch: do not (re)dispatch it.
+                            pd_request.status = PDRequestStatus.FAILED
+                            continue
                         if pd_request.status == PDRequestStatus.FAILED:
                             # Terminated by a dead-instance handler while still
                             # queued in the dispatch deque; skip re-dispatch to
@@ -1312,6 +1391,10 @@ class PDRequestRouter(RequestRouter):
 
                 elif self.waiting_for_pd_workers:
                     request = self.waiting_for_pd_workers.popleft()
+                    if request.finished:
+                        # Already aborted by a client disconnect: drop it instead
+                        # of binding it to a P/D pair.
+                        continue
                     if self._reject_ttft_timeout(
                         request, "ttft_pd_router_wait_worker"
                     ) or self._reject_overlong_request(request):
