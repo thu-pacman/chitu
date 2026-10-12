@@ -137,6 +137,14 @@ extras_require = {
         "sugon_mixq4_kernels @ file://localhost"
         + os.path.join(setup_dir, "third_party/sugon_mixq4_kernels"),
     ],
+    "sugon_w4a8_kernels": [
+        "sugon_w4a8_kernels @ file://localhost"
+        + os.path.join(setup_dir, "third_party/sugon_w4a8_kernels"),
+    ],
+    "boltops": [
+        "boltops[triton] @ file://localhost"
+        + os.path.join(setup_dir, "third_party/boltops-hygon"),
+    ],
     ##########################################################################
     # Really third-party kernels
     "flash_attn": [

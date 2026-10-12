@@ -52,6 +52,8 @@
 | GLM-5.3-BF16 | ✓ | `models=GLM-5.3-BF16` | https://huggingface.co/zai-org/GLM-5.3-BF16 |
 | GLM-5.3-FP8-kv | ✓ | `models=GLM-5.3-FP8-kv` | https://huggingface.co/zai-org/GLM-5.3 |
 | GLM-5.3-Flash | ✓ | `models=GLM-5.3-Flash` | https://huggingface.co/zai-org/GLM-5.3-Flash |
+| GLM-5.3-Flash-BF16 | ✓ | `models=GLM-5.3-Flash-BF16` | https://huggingface.co/zai-org/GLM-5.3-Flash-BF16 |
+| GLM-5.3-Flash-W8A8 | ✓ | `models=GLM-5.3-Flash-W8A8` | https://modelscope.cn/models/metax-tech/GLM-5.3-Flash-W8A8 |
 | GLM-5.3-W8A8 | ✓ | `models=GLM-5.3-W8A8` | https://modelscope.cn/models/metax-tech/GLM-5.3-W8A8 |
 | glm-z1-32b |  | `models=GLM-Z1-32B-0414` | https://modelscope.cn/models/ZhipuAI/GLM-Z1-32B-0414/ |
 | glm-z1-9b |  | `models=GLM-Z1-9B-0414` | https://modelscope.cn/models/ZhipuAI/GLM-Z1-9B-0414 |

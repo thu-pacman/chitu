@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: 2026 Qingcheng.AI
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Flash compressed-tensors W8A8 with BF16 per-channel weight scales.
+# Includes MTP; KDA attention, indexers, kv_b_proj and routers remain unquantized.
+# Quantized MLA q_b_proj/o_proj require infer.mla_absorb=absorb-without-precomp.
+defaults:
+  - GLM-5.3-Flash
+  - _self_ # Replace the inherited block-FP8 rules.
+
+name: GLM-5.3-Flash-W8A8
+source: "https://modelscope.cn/models/metax-tech/GLM-5.3-Flash-W8A8" # Display only; set models.ckpt_dir at launch.
+
+quant_config:
+  quant:
+    - model: "."
+      rules:
+        # Dense/shared MLP projections and routed-expert containers, including MTP.
+        - regex: '^\.(?:model\.language_model\.)?layers\.\d+\.mlp\.(?:(?:shared_experts\.)?(?:gate_proj|gate_up_proj|up_proj|down_proj)|experts|moe)\.'
+          type: w8a8_per_token_per_channel_dyn
+          kwargs:
+            weight_scale_dtype: bfloat16
+            weight_scale_has_singleton_last_dim: true
+        # Full-attention layers plus MTP layer 45; KDA o_proj stays BF16.
+        - regex: '^\.(?:model\.language_model\.)?layers\.\d+\.self_attn\.(?:q_a_proj|q_b_proj|kv_a_proj_with_mqa|o_proj)\.'
+          layers: [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 45]
+          type: w8a8_per_token_per_channel_dyn
+          kwargs:
+            weight_scale_dtype: bfloat16
+            weight_scale_has_singleton_last_dim: true

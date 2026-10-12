@@ -1061,6 +1061,37 @@ class PDRequestRouter(RequestRouter):
             len(self.pending_pd_requests) + len(self.waiting_for_pd_workers)
         )
 
+    def _reject_overlong_request(self, request: UserRequest) -> bool:
+        for enabled, stage, req_len, schedulers in (
+            (
+                self.routing_by_req_len,
+                "prefill",
+                request.prompt_len,
+                self.prefill_schedulers,
+            ),
+            (
+                self.decode_routing_by_req_len,
+                "decode",
+                request.prompt_len + request.max_new_tokens,
+                self.decode_schedulers,
+            ),
+        ):
+            if enabled and not any(
+                info["max_seq_len"] >= req_len for info in schedulers.values()
+            ):
+                logger.warning(
+                    "[LENGTH_EXCEED][router] req_id=%s stage=%s req_len=%s max_seq_len=%s",
+                    request.request_id,
+                    stage,
+                    req_len,
+                    max(
+                        (info["max_seq_len"] for info in schedulers.values()), default=0
+                    ),
+                )
+                self.finish_request_before_recv_stop(request, finish_reason="length")
+                return True
+        return False
+
     async def _add_pd_request(self, request: UserRequest) -> bool:
         """Bind one request to an available P/D pair."""
         request_id = request.request_id
@@ -1208,7 +1239,9 @@ class PDRequestRouter(RequestRouter):
 
                 elif self.waiting_for_pd_workers:
                     request = self.waiting_for_pd_workers.popleft()
-                    if self._reject_ttft_timeout(request, "ttft_pd_router_wait_worker"):
+                    if self._reject_ttft_timeout(
+                        request, "ttft_pd_router_wait_worker"
+                    ) or self._reject_overlong_request(request):
                         self.total_requests += 1
                     elif not await self._add_pd_request(request):
                         self.waiting_for_pd_workers.appendleft(request)

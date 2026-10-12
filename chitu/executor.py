@@ -293,8 +293,21 @@ class TasksDispatcher(ABC):
         group.barrier()
 
         if is_main_rank:
-            for _ in range(1, group.group_size):
+            expected_clients = {str(i).encode() for i in range(1, group.group_size)}
+            connected_clients: set[bytes] = set()
+            while connected_clients != expected_clients:
                 msgs = self.socket.recv_multipart()
+                # A restarted instance may reuse a former metrics port. Old
+                # HTTP scrapes must not count as workers and end the handshake
+                # before every DEALER has received its acknowledgement.
+                if (
+                    len(msgs) != 2
+                    or msgs[0] not in expected_clients
+                    or msgs[1] != b"connect"
+                ):
+                    logger.warning("Ignoring invalid %s worker handshake", group_name)
+                    continue
+                connected_clients.add(msgs[0])
                 logger.info(f"{group_name} zmq client {msgs[0].decode()} connected")
                 self.socket.send_multipart(msgs)
         else:
@@ -414,6 +427,11 @@ class PipeDispatcher(TasksDispatcher):
             logger.info(
                 f"PP stage {self.rank} → {self.next_rank}: {ipc_url} + {tcp_url}"
             )
+
+        # The coordinator survives an instance restart and still contains the
+        # previous PP endpoints. Wait for every stage to replace its endpoint
+        # before any downstream stage looks it up.
+        self.pp_group.barrier()
 
         if not self.is_first_stage:
             ipc_url, tcp_ip, tcp_url = self._get_zmq_urls(

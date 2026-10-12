@@ -150,6 +150,8 @@ def test_hygon_deepgemm_moe_contiguous_forward_matches_reference(monkeypatch):
         n_activated_experts=2,
         checkpoint_prefix="",
     )
+    assert module.gate_up_proj_weight_scale.dtype == torch.float32
+    assert module.down_proj_weight_scale.dtype == torch.float32
 
     gate_up_weight = torch.tensor(
         [
