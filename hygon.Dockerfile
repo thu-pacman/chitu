@@ -220,6 +220,13 @@ ENV CHITU_HYGON_BUILD_FOR_SHCA=$build_for_shca
 ENV HIP_GRAPH_ACCUMULATE_DISPATCH=1
 ENV GPU_MAX_HW_QUEUES=3
 
+# aiter uses `AITER_JIT_DIR` as jit directory if it is set, or uses its
+# default directory. Although they are logically equivalent, the default-
+# directory branch in aiter does not handle race during directory creation.
+# Only the `AITER_JIT_DIR` branch is multi-process-safe. See aiter's
+# `jit/core.py` for details.
+ENV AITER_JIT_DIR=/tmp/chitu-aiter-jit
+
 # Update entrypoint, which calls the original entrypoint of the base image.
 #
 # If you want to change the base image, use
