@@ -206,7 +206,8 @@ def _direct_warmup_target_lens(
         curr_bs = min(curr_bs, local_max_bs)
         for req_idx in range(curr_bs):
             target_lens[req_idx] += mtp_size
-    return target_lens
+    # The final MTP draft writes beyond the length reached by main-model decode.
+    return [length + max(0, mtp_size - 1) for length in target_lens]
 
 
 def _cache_consumes_direct_warmup_new_cache_ids(cache) -> bool:
