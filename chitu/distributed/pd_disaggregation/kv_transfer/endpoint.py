@@ -8,6 +8,7 @@ import zmq
 
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.distributed.coordinator import get_endpoint, set_endpoint
+from chitu.global_vars import get_launch_timeout
 from chitu.distributed.parallel_state import get_world_group
 from chitu.serve.crash import report_and_exit
 import logging
@@ -108,8 +109,14 @@ class KVManagerEndpoint:
         self.socket.connect(endpoint)
 
     def init_remote(self):
-        """init sender on any rank"""
-        endpoint = TCP_ENDPOINT.format(*get_endpoint(self.role, self.name))
+        """init sender on any rank.
+
+        The peer instance may still be starting up, so wait up to
+        `multi_inst.router.launch_timeout` for it to register its endpoint.
+        """
+        endpoint = TCP_ENDPOINT.format(
+            *get_endpoint(self.role, self.name, timeout=get_launch_timeout())
+        )
         self._connect_remote(endpoint)
 
     def _connect_remote(self, endpoint: str) -> None:

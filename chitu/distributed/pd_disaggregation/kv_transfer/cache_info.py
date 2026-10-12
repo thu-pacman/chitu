@@ -213,6 +213,7 @@ def exchange_instance_cache_infos(
     import torch
     from chitu.distributed.parallel_state import get_world_group
     from chitu.distributed.coordinator import set_value, get_value
+    from chitu.global_vars import get_launch_timeout
     from .protocol import ProtocolSerializer
 
     # Gather all ranks' info
@@ -239,7 +240,9 @@ def exchange_instance_cache_infos(
 
     remote: dict[int, InstanceCacheInfos] = {}
     for inst_id in remote_inst_ids:
-        raw = get_value(f"inst{inst_id}:all_rank_cache_dists")
+        raw = get_value(
+            f"inst{inst_id}:all_rank_cache_dists", timeout=get_launch_timeout()
+        )
         remote[inst_id] = ProtocolSerializer.unpack(raw, InstanceCacheInfos)
 
     return local_all, remote

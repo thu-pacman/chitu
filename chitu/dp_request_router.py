@@ -683,6 +683,10 @@ class PrefixCacheAwarePolicy(LoadBalancer):
 class RequestRouter:
     """Main Request Router for two-level data parallel scheduling."""
 
+    #: Delay between two attempts to discover the Prometheus collector endpoints
+    #: while some declared instances are not online yet.
+    PROMETHEUS_REDISCOVERY_INTERVAL_S = 10.0
+
     def __init__(self, config: ServeRouterConfig):
         self.config = config
         self.prefill_and_decode_schedulers: dict[int, dict] = {}
@@ -888,6 +892,13 @@ class RequestRouter:
             )
             logger.info("Discovering Prometheus collector endpoints from coordinator")
             await asyncio.to_thread(self._discover_prometheus_collectors)
+            while self._retry_prometheus_collector_discovery() and (
+                not self._collector_targets_ready()
+            ):
+                # Some declared instances are not online yet and may be started
+                # later, one by one, so keep watching for their collectors.
+                await asyncio.sleep(self.PROMETHEUS_REDISCOVERY_INTERVAL_S)
+                await asyncio.to_thread(self._discover_prometheus_collectors)
             logger.info(
                 f"Discovered Prometheus collector endpoints: {self.collector_addrs}"
             )
@@ -1453,6 +1464,10 @@ class RequestRouter:
             self.collector_addrs.get(instance_id) is not None
             for instance_id in range(self._n_insts)
         )
+
+    def _retry_prometheus_collector_discovery(self) -> bool:
+        """Whether to keep discovering collectors while some instances are offline."""
+        return False
 
     def _start_prometheus_manager(self):
         if not self._collector_targets_ready():

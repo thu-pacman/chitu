@@ -481,6 +481,17 @@ def get_kv_transfer_args():
     return get_global_args().multi_inst.pd_disaggregation.kv_transfer
 
 
+def get_launch_timeout() -> float:
+    """Seconds a startup wait involving a peer process is allowed to take.
+
+    Instances use it to wait for the Router and for the peer Prefill/Decode
+    instances, which may be started separately and later.
+    """
+    args = get_global_args()
+    assert args is not None
+    return float(args.multi_inst.router.launch_timeout)
+
+
 def set_global_args(raw_args, need_ensure=True, need_preprocess=True):
     global _RAW_GLOBAL_ARGS
     global _GLOBAL_ARGS

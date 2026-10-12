@@ -9,10 +9,12 @@ selection helpers — no ZMQ or ``_pd_stats_collector_task`` integration.
 """
 
 import asyncio
+import pytest
 from omegaconf import OmegaConf
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from chitu.distributed.coordinator import find_endpoint, init_coordinator, set_endpoint
 from chitu.distributed.pd_disaggregation.pd_request_router import PDRequestRouter
 from chitu.dp_request_router import LoadBalancer, PrefixCacheAwarePolicy, SchedulerStats
 from chitu.global_vars import get_global_args, set_global_args
@@ -184,6 +186,7 @@ def _pd_router_config(
     *,
     routing_algorithm: str,
     routing_algorithm_for_decode: str = "power_of_two_choices",
+    launch_timeout: float = 3600.0,
 ) -> RouterConfig:
     set_default_global_args()
     return RouterConfig(
@@ -196,7 +199,7 @@ def _pd_router_config(
         router_balance_rel_threshold=1.1,
         router_evict_buffer_size=64,
         router_local_reservation_timeout_s=600.0,
-        launch_timeout=3600.0,
+        launch_timeout=launch_timeout,
         routing_by_req_len=False,
         decode_routing_by_req_len=False,
     )
@@ -612,3 +615,196 @@ def test_pd_router_handle_instance_fail():
     router._test_check_prefill_msg(0, "pd_decode_fail", ["test0"])
     router._test_check_prefill_msg(1, "pd_decode_fail", [])
     assert router._test_finished_reqs == {"test0"}
+
+
+# ---------------------------------------------------------------------------
+# A Router started without instances
+#
+# With `multi_inst.fail_fast=False` the Router must come up while its instances
+# are still starting, park the slots that are not online and connect each one when
+# it registers. The strict startup path (True) must stay unchanged.
+# ---------------------------------------------------------------------------
+
+#: Schedulers are indexed by their role-local id, not by their global instance
+#: id: the decode instance of `_pd_router_config` has global instance id 2 and
+#: registers itself as `decode_instance_0`.
+DECODE_SLOT = 0
+
+
+@pytest.fixture
+def isolated_coordinator():
+    """Give one test its own endpoint store, so registered roles do not leak."""
+    init_coordinator("127.0.0.1", 0, is_coordinator_host=True, override_existing=True)
+    yield
+
+
+def _destroy_router(router: PDRequestRouter) -> None:
+    """Close a test router's ZMQ sockets, and then its context.
+
+    A `zmq.Context` garbage collected before its sockets blocks in `term()`
+    forever, which hangs the whole test session instead of failing one test.
+    """
+    for socket in list(router.prefill_sockets.values()) + list(
+        router.decode_sockets.values()
+    ):
+        socket.close(linger=0)
+    if router.stats_socket is not None:
+        router.stats_socket.close(linger=0)
+        router.stats_socket = None
+    router.context.destroy(linger=0)
+
+
+@pytest.fixture
+def make_pd_router(isolated_coordinator):
+    """Build PD request routers, and destroy every one of them after the test."""
+    routers: list[PDRequestRouter] = []
+
+    def _make(*, fail_fast: bool, launch_timeout: float = 3600.0) -> PDRequestRouter:
+        cfg = _pd_router_config(
+            routing_algorithm="round_robin", launch_timeout=launch_timeout
+        )
+        # `fail_fast` is a `multi_inst` setting; the service passes it to the
+        # Router separately from the router config.
+        router = PDRequestRouter(cfg, PDDisaggregationConfig(), fail_fast=fail_fast)
+        routers.append(router)
+        return router
+
+    yield _make
+
+    for router in routers:
+        _destroy_router(router)
+
+
+def _tolerant_router(make_pd_router) -> PDRequestRouter:
+    """A Router of a standalone deployment, which does not wait for instances."""
+    return make_pd_router(fail_fast=False)
+
+
+def _strict_router(make_pd_router, *, launch_timeout: float = 3600.0):
+    """A Router launched together with all of its instances."""
+    return make_pd_router(fail_fast=True, launch_timeout=launch_timeout)
+
+
+def test_find_endpoint_returns_none_until_endpoint_is_registered(isolated_coordinator):
+    assert find_endpoint("prefill_instance_0", "request_port") is None
+
+    set_endpoint("prefill_instance_0", "request_port", "127.0.0.1", 39801)
+
+    assert find_endpoint("prefill_instance_0", "request_port") == (
+        "127.0.0.1",
+        39801,
+    )
+
+
+def test_pd_router_tolerant_startup_parks_the_schedulers_that_are_not_online(
+    make_pd_router,
+):
+    router = _tolerant_router(make_pd_router)
+
+    asyncio.run(router._init_pd_sockets())
+
+    # Nothing is online yet, so every declared slot is parked as `pending`.
+    # Neither the routing policies nor the heartbeat monitor may treat a parked
+    # slot as an online scheduler.
+    for slot in (0, 1):
+        assert router.prefill_schedulers[slot]["status"] == "pending"
+        assert not router.prefill_policy.scheduler_stats[slot].is_alive
+    assert router.decode_schedulers[DECODE_SLOT]["status"] == "pending"
+    assert not router.decode_policy.scheduler_stats[DECODE_SLOT].is_alive
+    assert router.prefill_sockets == {}
+    assert router.decode_sockets == {}
+
+
+def test_pd_router_tolerant_startup_connects_the_schedulers_that_are_online(
+    make_pd_router,
+):
+    set_endpoint("prefill_instance_1", "request_port", "127.0.0.1", 39802)
+    router = _tolerant_router(make_pd_router)
+
+    asyncio.run(router._init_pd_sockets())
+
+    assert router.prefill_schedulers[1]["status"] == "online"
+    assert router.prefill_schedulers[1]["address"] == "tcp://127.0.0.1:39802"
+    assert list(router.prefill_sockets) == [1]
+    # Slot 0 has not registered, so it is parked instead of stopping the Router.
+    assert router.prefill_schedulers[0]["status"] == "pending"
+
+
+def test_pd_router_tolerant_first_connect_does_not_bump_generation(make_pd_router):
+    router = _tolerant_router(make_pd_router)
+    asyncio.run(router._init_pd_sockets())
+    assert router.prefill_schedulers[0]["status"] == "pending"
+
+    # The instance registers, and the statistics collector connects it. No peer
+    # ever saw this slot online, so this is a first connect, not a reconnection:
+    # the peers must keep the metadata they built for it.
+    set_endpoint("prefill_instance_0", "request_port", "127.0.0.1", 39803)
+    connected = asyncio.run(router._connect_scheduler("prefill", 0))
+
+    assert connected
+    assert router.prefill_schedulers[0]["status"] == "online"
+    assert router.prefill_schedulers[0]["generation"] == 0
+
+
+def test_pd_router_reconnect_of_a_scheduler_that_was_online_bumps_generation(
+    make_pd_router,
+):
+    router = _tolerant_router(make_pd_router)
+    decode_role = f"decode_instance_{DECODE_SLOT}"
+    set_endpoint(decode_role, "request_port", "127.0.0.1", 39804)
+    assert asyncio.run(router._connect_scheduler("decode", DECODE_SLOT))
+
+    # The slot goes offline, and a new incarnation of it reconnects with a new
+    # endpoint, which the peers have to refresh.
+    router.decode_schedulers[DECODE_SLOT]["status"] = "offline"
+    router.decode_policy.scheduler_stats[DECODE_SLOT].is_alive = False
+    set_endpoint(decode_role, "request_port", "127.0.0.1", 39805)
+    assert asyncio.run(
+        router._connect_scheduler("decode", DECODE_SLOT, new_generation=True)
+    )
+
+    assert router.decode_schedulers[DECODE_SLOT]["generation"] == 1
+    assert router.decode_schedulers[DECODE_SLOT]["address"] == "tcp://127.0.0.1:39805"
+
+
+def test_pd_router_strict_startup_fails_when_a_scheduler_never_registers(
+    make_pd_router,
+):
+    router = _strict_router(make_pd_router, launch_timeout=0.2)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(router._init_pd_sockets())
+
+
+def test_pd_router_tolerant_router_stays_up_with_no_scheduler_online(make_pd_router):
+    router = _tolerant_router(make_pd_router)
+    asyncio.run(router._init_pd_sockets())
+    shutdowns = []
+
+    async def _record_shutdown():
+        shutdowns.append(True)
+
+    router._shutdown_service_after_all_workers_down = _record_shutdown
+    stopped = asyncio.run(router._handle_dead_workers({"prefill": [], "decode": []}))
+
+    # Instances of a standalone Router are started and restarted separately, so
+    # the Router does not stop when none of them is online.
+    assert not stopped
+    assert shutdowns == []
+
+
+def test_pd_router_strict_router_stops_when_no_scheduler_is_online(make_pd_router):
+    router = _strict_router(make_pd_router)
+    for slot in (0, 1):
+        router.prefill_policy.scheduler_stats[slot].is_alive = False
+    router.decode_policy.scheduler_stats[DECODE_SLOT].is_alive = False
+    shutdowns = []
+
+    async def _record_shutdown():
+        shutdowns.append(True)
+
+    router._shutdown_service_after_all_workers_down = _record_shutdown
+    stopped = asyncio.run(router._handle_dead_workers({"prefill": [], "decode": []}))
+
+    assert stopped
+    assert shutdowns == [True]
