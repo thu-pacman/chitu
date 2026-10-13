@@ -9,6 +9,7 @@ from typing import Optional
 
 import torch
 
+from chitu.device_type import is_enflame
 from chitu.ops.deepseek_v4_decode_plan import (
     DeepSeekV4DecodeCompressPlan,
     build_decode_compress_plan,
@@ -32,6 +33,11 @@ if _has_triton:
         postprocess_write_kv_cache_hadamard as _postprocess_write_kv_cache_hadamard_triton,
         writeback_pending_triton,
     )
+
+# Enflame's Triton backend is not compatible with these compressor kernels
+# (e.g. ``add_stages`` needs a platform-specific language argument), so keep
+# the Torch implementations as the correctness path on GCU.
+_triton_compressor_available = _has_triton and not is_enflame()
 
 
 def _to_int_list(tensor: torch.Tensor) -> list[int]:
@@ -176,7 +182,7 @@ def gather_pending_and_new(
 
 @gather_pending_and_new.register_auto
 def _auto_gather_pending_and_new():
-    if _has_triton:
+    if _triton_compressor_available:
         return "triton"
     return "torch"
 
@@ -262,7 +268,7 @@ def compress_hca(
 
 @compress_hca.register_auto
 def _auto_compress_hca():
-    if _has_triton:
+    if _triton_compressor_available:
         return "triton"
     return "torch"
 
@@ -338,7 +344,7 @@ def compress_csa(
 
 @compress_csa.register_auto
 def _auto_compress_csa():
-    if _has_triton:
+    if _triton_compressor_available:
         return "triton"
     return "torch"
 
@@ -451,7 +457,7 @@ def writeback_pending(
 
 @writeback_pending.register_auto
 def _auto_writeback_pending():
-    if _has_triton:
+    if _triton_compressor_available:
         return "triton"
     return "torch"
 
@@ -534,7 +540,7 @@ def pack_prefill_kv(
 
 @pack_prefill_kv.register_auto
 def _auto_pack_prefill_kv():
-    if _has_triton:
+    if _triton_compressor_available:
         return "triton"
     return "torch"
 
@@ -616,7 +622,7 @@ def masked_write_kv_cache(
 
 @masked_write_kv_cache.register_auto
 def _auto_masked_write_kv_cache():
-    if _has_triton:
+    if _triton_compressor_available:
         return "triton"
     return "torch"
 

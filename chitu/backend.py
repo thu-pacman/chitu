@@ -36,6 +36,7 @@ from chitu.attn_backend import (
     HybridAttnBackend,
     DLLMAttnBackend,
     HunyuanAttnBackend,
+    GcuAttnBackend,
 )
 from chitu.kv_cache.registry import (
     should_use_hopper_mixed_backend,
@@ -43,7 +44,7 @@ from chitu.kv_cache.registry import (
 )
 from chitu.kv_cache import KVCacheManagerBase, PagedKVCache, KVCacheBase
 from chitu.custom_gguf import *
-from chitu.device_type import is_ascend, is_muxi
+from chitu.device_type import is_ascend, is_enflame, is_muxi
 from chitu.distributed.parallel_state import (
     get_ep_group,
     get_dp_group,
@@ -543,6 +544,8 @@ class Backend:
         if args.infer.attn_type == "auto":
             if is_ascend():
                 return NpuAttnBackend
+            elif is_enflame():
+                return GcuAttnBackend
             elif args.infer.op_impl == "cpu":
                 return RefAttnBackend
             elif should_use_hopper_mixed_backend(args):
@@ -573,6 +576,8 @@ class Backend:
             return NpuAttnBackend
         elif args.infer.attn_type == "ref":
             return RefAttnBackend
+        elif args.infer.attn_type == "gcu":
+            return GcuAttnBackend
         elif args.infer.attn_type == "hopper_mixed":
             return HopperMixedBackend
         elif args.infer.attn_type == "hunyuan_attn":
@@ -612,6 +617,15 @@ class Backend:
                 n_heads=args.n_heads,
                 n_kv_heads=getattr(args, "n_kv_heads", None),
             )
+        if attn_backend_type is GcuAttnBackend:
+            # Enflame GCU uses the paged KV store (vendor flash-decode over
+            # `PagedKVCache`); the ragged `skew` (dense) layout is not supported.
+            if Backend.cache_type != "paged":
+                raise NotImplementedError(
+                    "`infer.attn_type=gcu` is only compatible with "
+                    "`infer.cache_type=paged` on Enflame GCU; set `infer.cache_type=paged`."
+                )
+            return attn_backend_type()
         else:
             return attn_backend_type()
 
@@ -899,7 +913,15 @@ class Backend:
             quant = get_quant_from_checkpoint_prefix(k, args.models.quant_config.rules)
             if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
                 if quant == "blockfp8" and checkpoint[k].element_size() == 1:
-                    checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
+                    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+                    if e8m0_dtype is not None and checkpoint[k].dtype == e8m0_dtype:
+                        # E8M0 tensors are real block scales, not raw FP8-E4M3
+                        # payload. Decode them while they are still on CPU;
+                        # viewing them as uint8 would later turn 2**(e-127)
+                        # into the numeric byte value e.
+                        checkpoint[k] = checkpoint[k].to(torch.float32)
+                    else:
+                        checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
             if (
                 quant in ("blockfp4", "blockfp4_merged")
                 and checkpoint[k].element_size() == 1

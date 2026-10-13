@@ -1,0 +1,10 @@
+# Architecture-adaptation checkpoint derived from DeepSeek-V4-Flash.
+# Keep the complete source compression schedule for kernel-specialization work.
+defaults:
+  - DeepSeek-V4-Flash
+  - _self_
+
+name: DeepSeek-V4-Flash-4L
+source: "modelscope://deepseek-ai/DeepSeek-V4-Flash"
+n_layers: 4
+source_n_layers: 43
