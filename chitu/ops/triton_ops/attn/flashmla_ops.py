@@ -7,6 +7,8 @@ import triton
 import triton.language as tl
 
 from chitu.cuda_graph import is_warming_up_or_cuda_graph_capture
+from chitu.device_type import is_blackwell
+from chitu.ops.triton_ops.quant.blockfp8.convert import fast_round_scale
 from chitu.ops.triton_ops.utils import autotune_compat
 
 
@@ -19,6 +21,7 @@ def _quant_pertoken_kvcache_dsa_kernel(
     D,
     input_token_stride,
     dv,  # N: n_tokens, D,
+    SCALE_IS_UE8M0: tl.constexpr,
     tile_size: tl.constexpr = 128,
     BLOCK_N: tl.constexpr = 128,
 ):
@@ -41,6 +44,12 @@ def _quant_pertoken_kvcache_dsa_kernel(
 
     # # avoid division by zero
     scale = tl.where(scale == 0.0, 1e-5, scale)
+    if SCALE_IS_UE8M0:
+        # SM100 FlashMLA converts these FP32 fields to E8M0 internally.
+        # Quantize with the same power-of-two scale, or Decode silently uses
+        # a different scale than Prefill's BF16 dequantization.
+        scale = tl.maximum(max_.to(tl.float32) / 448.0, 1e-4)
+        scale = fast_round_scale(scale, 1.0)
     # # store float32 scales
     scales_offs = dv + pid_d * 4
     scales_ptrs = k_quant_ptr + offs_n * 656 + scales_offs
@@ -141,6 +150,7 @@ def quant_pertoken_kvcache_dsa(
         input_token_stride=input_k_cache_2d.stride(0),
         dv=dv,
         tile_size=tile_size,
+        SCALE_IS_UE8M0=is_blackwell(),
         **launch_options,
     )
     # the last dim: 576 -> 656

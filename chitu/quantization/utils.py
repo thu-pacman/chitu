@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import re
-from typing import Optional, Any
-from omegaconf import ListConfig
+from typing import Optional, Any, cast
+from omegaconf import ListConfig, OmegaConf
 from chitu.global_vars import get_global_args
 from chitu.checkpoint_prefix import (
     CheckpointPrefix,
@@ -63,7 +63,13 @@ def _get_quant_kwargs_from_single_checkpoint_prefix(
     rule = _match_rule_for_checkpoint_prefix(checkpoint_prefix, rules)
     if rule is None:
         return {}
-    return dict(rule.get("kwargs") or {})
+    kwargs = rule.get("kwargs") or {}
+    if OmegaConf.is_config(kwargs):
+        # Plain Python containers, not `ListConfig`/`DictConfig`: the Cython
+        # build turns a `scale_block_shape: list` annotation into an *exact*
+        # `PyList_Type` check, which a `ListConfig` fails.
+        kwargs = cast(dict[str, Any], OmegaConf.to_container(kwargs, resolve=True))
+    return dict(kwargs)
 
 
 def get_quant_kwargs_from_checkpoint_prefix(

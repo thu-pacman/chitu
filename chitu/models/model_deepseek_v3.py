@@ -1977,7 +1977,7 @@ class TransformerDeepSeekV3(Transformer):
                 self.local_begin_layer_id, self.local_end_layer_id
             ):
                 tensor_column_parallel_list.append(
-                    f"layers\.{self.params.n_layers - self.local_begin_layer_id}\.shared_head\.head"
+                    rf"layers\.{self.params.n_layers - self.local_begin_layer_id}\.shared_head\.head"
                 )
         return tensor_column_parallel_list
 

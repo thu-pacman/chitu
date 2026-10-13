@@ -624,7 +624,7 @@ infer:
   #: If set, C must be a positive integer not exceeding both infer.max_seq_len and
   #: infer.prefill_chunk_size (validated at startup).
   #: -default: null, meaning C is derived automatically as the main KV cache block size, shrunk to
-  #: infer.max_seq_len / infer.prefill_chunk_size when the block size exceeds them 
+  #: infer.max_seq_len / infer.prefill_chunk_size when the block size exceeds them
   linear_checkpoint_interval: null
 
   #: Minimum prefix-cache hit rate required to keep a task on the best prefix-cache DP rank.

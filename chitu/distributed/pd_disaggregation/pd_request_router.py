@@ -1672,31 +1672,16 @@ class PDRequestRouter(RequestRouter):
             await asyncio.sleep(1.0)  # Check every second
 
     async def _check_pd_request_status(self):
-        """Check PD request status"""
-        current_time = time.time()
-        timeout_threshold = 30.0  # 30s timeout
-
-        for request_id, pd_request in list(self.pending_pd_requests.items()):
+        """Expire pending PD requests using their original TTFT deadline."""
+        for pd_request in list(self.pending_pd_requests.values()):
             if (
                 pd_request.status == PDRequestStatus.PENDING
-                and current_time - pd_request.created_time > timeout_threshold
-            ):
-                logger.warning(f"pd request timeout: {request_id}")
-                pd_request.status = PDRequestStatus.FAILED
-                pd_request.error_message = "request timeout"
-                # Also fail the user-facing stream so the client does not hang
-                # indefinitely waiting for a request that never dispatched.
-                self.finish_request_before_recv_stop(
-                    pd_request.original_request, error="request timeout"
+                and self._reject_ttft_timeout(
+                    pd_request.original_request, "ttft_pd_router"
                 )
-                # Drop it from the dispatch deque so it is not dispatched later
-                # onto a finished request. Iterate a snapshot so removing
-                # from the deque while iterating is safe; request_id maps to at
-                # most one entry, so break after the first match.
-                for pr in list(self.pending_requests):
-                    if isinstance(pr, PendingPDRequest) and pr.request_id == request_id:
-                        self.pending_requests.remove(pr)
-                        break
+            ):
+                pd_request.status = PDRequestStatus.FAILED
+                pd_request.error_message = "TTFT timeout"
 
     # ------------------------------------------------------------------
     # PD instance readiness (always active in PD mode)
