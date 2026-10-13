@@ -21,3 +21,4 @@ from chitu.ops.quant.blockfp8.index_score import (
     blockfp8_index_score_ragged_q_dense_k_dsv32,
     blockfp8_index_score_ragged_q_paged_k_dsv32,
 )
+from chitu.ops.quant.blockfp8 import gcu  # noqa: F401  (registers GCU impls)

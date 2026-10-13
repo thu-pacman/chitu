@@ -8,6 +8,7 @@ import torch
 
 from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.native_layout import DeepGemmScale
+from chitu.device_type import is_enflame
 from chitu.global_vars import get_global_args
 from chitu.ops.utils import make_op_dispatcher
 from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
@@ -53,6 +54,8 @@ def _auto_blockfp8_gemm(
     round_scale_to_pow2: bool = False,
     scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
 ):
+    if is_enflame():
+        return "gcu"
     if (
         scale_block_shape == DEFAULT_SCALE_BLOCK_SHAPE
         and has_deep_gemm
@@ -127,6 +130,15 @@ def soft_fp8_blockfp8_gemm(
 
 @soft_fp8_blockfp8_gemm.register_auto
 def _auto_soft_fp8_blockfp8_gemm():
+    if is_enflame():
+        # Enflame GCU has no fused soft-FP8 GEMM kernel. Selecting the Triton
+        # impl here would hang the Triton autotuner on the GCU synchronize
+        # during `do_bench` (see the DSV4 warmup hang). Let the caller's
+        # existing fallback engage: soft-fp8 weight dequant (torch) + linear.
+        raise NotImplementedError(
+            "soft_fp8_blockfp8_gemm is not implemented on Enflame; "
+            "fall back to soft-fp8 dequant + torch linear"
+        )
     if has_triton:
         return "triton"
     if has_torch_npu:
