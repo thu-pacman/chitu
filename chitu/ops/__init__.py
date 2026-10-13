@@ -8,6 +8,8 @@ from chitu.ops.rotary import (
     apply_rotary_pos_emb_single,
     apply_rotary_pos_emb_single_partial,
 )
+from chitu.ops.qknorm_partial_rope import qknorm_partial_rope
+from chitu.ops.attn_gate import attn_output_gate
 from chitu.ops.activation import silu_and_mul
 from chitu.ops.sampling import apply_frequency_penalty
 from chitu.ops.kv_cache import (
@@ -40,6 +42,7 @@ from chitu.ops.linear_attn import (
     chunk_gated_delta_rule,
     chunk_kimi_delta_attention,
     recurrent_gated_delta_rule,
+    recurrent_gated_delta_rule_compact_qk_gcu,
     recurrent_gated_delta_rule_all_state,
     recurrent_kimi_delta_attention,
 )
@@ -85,7 +88,12 @@ from chitu.ops.batched_routed_activation import (
     batched_routed_activation_indexed_to_concat_permuted,
 )
 from chitu.ops.hadamard import hadamard_transform
-from chitu.ops.causal_conv import causal_conv1d_update, causal_conv1d_prefill
+from chitu.ops.causal_conv import (
+    causal_conv1d_update,
+    causal_conv1d_update_qwen3_next,
+    causal_conv1d_update_qwen3_next_with_g,
+    causal_conv1d_prefill,
+)
 from chitu.ops.norm_gate import rms_norm_gate
 from chitu.ops.mhc import mhc_pre, mhc_post
 from chitu.ops.fused_g import fused_g

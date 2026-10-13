@@ -4,6 +4,7 @@
 
 from typing import Optional
 from logging import getLogger
+import os
 
 import torch
 
@@ -13,11 +14,12 @@ from chitu.utils import (
     try_import_and_setup_torch_npu,
 )
 from chitu.native_layout import Vector, MuxiNativeLayoutActivation
-from chitu.device_type import is_muxi, has_accelerator
+from chitu.device_type import is_enflame, is_muxi, has_accelerator
+from chitu.import_utils import ensure_gcu_c_ops
 from chitu.cpuinfer_singleton import get_cpu_infer
 from chitu.custom_gguf import get_ggml_quant_type
 from chitu.global_vars import get_global_args
-from chitu.lazy import make_lazy_op
+from chitu.lazy import eval_lazy, make_lazy_op
 from chitu.ops.utils import make_op_dispatcher
 
 triton, has_triton = try_import_platform_dep("triton")
@@ -197,6 +199,45 @@ def _silu_and_mul_triton(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
     )
+
+
+@silu_and_mul.register(
+    "gcu", available=is_enflame() and not os.environ.get("CHITU_NO_GCU_SILU")
+)
+def _silu_and_mul_gcu(
+    x, expert_n_tokens=None, swiglu_limit=None, swiglu_alpha=None, swiglu_beta=None
+):
+    if swiglu_alpha is not None or swiglu_beta is not None:
+        raise ValueError("silu_and_mul(impl=gcu) does not support OAI SwiGLU")
+    # Vendor single-kernel SiLU-and-mul (vllm_gcu `torch.ops._C.silu_and_mul`). Measured on
+    # GCU: ~3x faster than the torch composite (0.005 vs 0.015ms @decode, 0.12 vs 0.35ms
+    # @prefill). NOTE: chitu's Triton silu is actually *slower* than torch here, so the right
+    # migration off the torch fallback is `_C`, not Triton.  The packaged GCU
+    # Triton compiler is ABI-incompatible with these kernels, so retain exact
+    # SwiGLU-limit semantics by clamping before the vendor op.  For masked MoE
+    # buffers, computing all padded rows is a correctness-safe fallback because
+    # consumers already use expert_n_tokens to ignore the tail.
+    x = eval_lazy(x)  # `_C` needs a materialized tensor, not a LazyTensor
+    # `silu_and_mul` is a make_lazy_op: it is run on the `meta` device for shape/dtype
+    # inference. The vendor `_C` op has no meta kernel, so use the torch composite (which
+    # supports meta) for that path and the fast `_C` kernel only for real tensors.
+    if x.device.type == "meta":
+        return silu_and_mul_torch(x, swiglu_limit=swiglu_limit)
+    ensure_gcu_c_ops()
+    if swiglu_limit is not None:
+        d = x.shape[-1] // 2
+        x = torch.cat(
+            (
+                torch.clamp(x[..., :d], max=swiglu_limit),
+                torch.clamp(x[..., d:], min=-swiglu_limit, max=swiglu_limit),
+            ),
+            dim=-1,
+        )
+    xc = x if x.is_contiguous() else x.contiguous()
+    d = xc.shape[-1] // 2
+    out = torch.empty((*xc.shape[:-1], d), dtype=xc.dtype, device=xc.device)
+    torch.ops._C.silu_and_mul(out, xc)
+    return out
 
 
 @silu_and_mul.register("torch_npu", available=has_torch_npu)
