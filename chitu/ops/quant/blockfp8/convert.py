@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 
 from chitu.lazy import single_dispatch_lazy_tensor
+from chitu.device_type import is_enflame
 from chitu.ops.utils import make_op_dispatcher
 from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
 from chitu.utils import try_import_platform_dep
@@ -115,7 +116,64 @@ def soft_fp8_blockfp8_weight_dequant(
 
 @soft_fp8_blockfp8_weight_dequant.register_auto
 def _auto_soft_fp8_blockfp8_weight_dequant():
+    if is_enflame():
+        return "torch"
     return "triton"
+
+
+@soft_fp8_blockfp8_weight_dequant.register("torch")
+def soft_fp8_blockfp8_weight_dequant_torch(
+    x: torch.Tensor,
+    s: torch.Tensor,
+    block_size: int = 128,
+    *,
+    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
+) -> torch.Tensor:
+    """Software FP8-E4M3FN weight dequantization for GCU bring-up.
+
+    With ``raise_lower_bit_float_to=bfloat16`` Chitu deliberately stores FP8
+    weights as their raw uint8 payload.  Recreate the finite E4M3 values using
+    the same bit transform as the Triton implementation, then apply each 2-D
+    block scale.  The transform is numerically equivalent to
+    ``torch.float8_e4m3fn`` on every value present in a valid checkpoint: the
+    ``exp=1111`` payloads (e.g. 0x7E) decode as ordinary finite values
+    (0x7E -> +448), and only the true NaN encodings 0x7F/0xFF are non-finite.
+    """
+
+    if x.ndim not in (2, 3) or s.ndim != x.ndim:
+        raise ValueError(
+            "BlockFP8 dequant expects rank-2/3 weight and matching scale rank, "
+            f"got {x.shape=} and {s.shape=}"
+        )
+    if x.element_size() != 1:
+        raise TypeError(f"BlockFP8 weight must use one-byte storage, got {x.dtype}")
+
+    raw = x.view(torch.uint8)
+    signed = torch.where(
+        raw >= 128, raw.to(torch.int32) - 256, raw.to(torch.int32)
+    )
+    # 0x87F00000 represented as signed int32.  Multiplication by 2**120
+    # completes the E4M3FN-to-FP32 exponent rebias used by the Triton path.
+    fp8_as_fp32 = (((signed << 20) & -2014314496).view(torch.float32)) * (
+        2.0**120
+    )
+
+    rows, cols = x.shape[-2:]
+    out_blk, in_blk = scale_block_shape
+    expected_scale_shape = (
+        (rows + out_blk - 1) // out_blk,
+        (cols + in_blk - 1) // in_blk,
+    )
+    if tuple(s.shape[-2:]) != expected_scale_shape:
+        raise ValueError(
+            f"BlockFP8 scale shape mismatch: expected {expected_scale_shape}, "
+            f"got {tuple(s.shape[-2:])}"
+        )
+    expanded_scale = s.to(torch.float32).repeat_interleave(
+        out_blk, dim=-2
+    ).repeat_interleave(in_blk, dim=-1)
+    expanded_scale = expanded_scale[..., :rows, :cols]
+    return (fp8_as_fp32 * expanded_scale).to(torch.get_default_dtype())
 
 
 soft_fp8_blockfp8_weight_dequant.register_candidate("triton")
@@ -158,6 +216,8 @@ def blockfp8_act_quant(
 
 @blockfp8_act_quant.register_auto
 def _auto_blockfp8_act_quant():
+    if is_enflame():
+        return "gcu"
     if has_triton:
         return "triton"
     return "torch"
