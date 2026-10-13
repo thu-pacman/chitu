@@ -2,10 +2,12 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import torch
 import torch.nn.functional as F
 
-from chitu.device_type import has_accelerator
+from chitu.device_type import has_accelerator, is_enflame
 from chitu.ops.utils import check_checkpoint_args, make_op_dispatcher
 from chitu.utils import try_import_platform_dep
 from typing import Optional
@@ -16,8 +18,24 @@ has_triton_impl = has_triton and has_accelerator()
 if has_triton_impl:
     from chitu.ops.triton_ops import (
         causal_conv1d_update_triton,
+        causal_conv1d_update_gcu_b1_inplace,
+        causal_conv1d_update_gcu_batch_inplace,
         causal_conv1d_prefill_triton,
     )
+
+
+_GCU_QWEN3_NEXT_CONV_B1 = (
+    os.environ.get("CHITU_GCU_QWEN3_NEXT_CONV_B1", "1") != "0"
+)
+_GCU_QWEN3_NEXT_CONV_BATCH = (
+    os.environ.get("CHITU_GCU_QWEN3_NEXT_CONV_BATCH", "0") == "1"
+)
+_GCU_QWEN3_NEXT_CONV_TCLE = (
+    os.environ.get("CHITU_GCU_QWEN3_NEXT_CONV_TCLE", "0") == "1"
+)
+_GCU_QWEN3_NEXT_CONV_G_TCLE = (
+    os.environ.get("CHITU_GCU_QWEN3_NEXT_CONV_G_TCLE", "0") == "1"
+)
 
 
 @make_op_dispatcher
@@ -107,6 +125,161 @@ if has_triton_impl:
     causal_conv1d_update.register("triton", available=has_triton_impl)(
         causal_conv1d_update_triton
     )
+
+
+def causal_conv1d_update_qwen3_next(
+    this_hidden_states: torch.Tensor,
+    old_hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+):
+    """Qwen3-Next decode entry point with fail-closed GCU fast paths.
+
+    Keeping this separate from the public generic operator makes the in-place
+    state contract explicit and preserves generic callers' aliasing semantics.
+    """
+    same_gcu_device = (
+        this_hidden_states.device.type == "gcu"
+        and this_hidden_states.device == old_hidden_states.device
+        and this_hidden_states.device == weight.device
+    )
+    batch_size = this_hidden_states.shape[0]
+    tcle_supported = (
+        _GCU_QWEN3_NEXT_CONV_TCLE
+        and has_triton_impl
+        and is_enflame()
+        and same_gcu_device
+        and batch_size in (2, 4, 8)
+        and tuple(this_hidden_states.shape) == (batch_size, 10240)
+        and tuple(old_hidden_states.shape) == (batch_size, 10240, 4)
+        and tuple(weight.shape) == (10240, 1, 4)
+        and this_hidden_states.dtype == torch.bfloat16
+        and old_hidden_states.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and this_hidden_states.stride(1) == 1
+        and old_hidden_states.is_contiguous()
+        and weight.is_contiguous()
+    )
+    if tcle_supported:
+        from chitu.ops.gcu_qwen38_causal_conv_tcle import (
+            qwen38_causal_conv_update_tcle,
+        )
+
+        return qwen38_causal_conv_update_tcle(
+            this_hidden_states,
+            old_hidden_states,
+            weight,
+        )
+    supported = (
+        _GCU_QWEN3_NEXT_CONV_B1
+        and has_triton_impl
+        and is_enflame()
+        and same_gcu_device
+        and tuple(this_hidden_states.shape) == (1, 10240)
+        and tuple(old_hidden_states.shape) == (1, 10240, 4)
+        and tuple(weight.shape) == (10240, 1, 4)
+        and this_hidden_states.dtype == torch.bfloat16
+        and old_hidden_states.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and this_hidden_states.stride(1) == 1
+        and old_hidden_states.is_contiguous()
+        and weight.is_contiguous()
+    )
+    if supported:
+        return causal_conv1d_update_gcu_b1_inplace(
+            this_hidden_states, old_hidden_states, weight
+        )
+    batch_supported = (
+        _GCU_QWEN3_NEXT_CONV_BATCH
+        and has_triton_impl
+        and is_enflame()
+        and same_gcu_device
+        and batch_size in (2, 4, 8)
+        and tuple(this_hidden_states.shape) == (batch_size, 10240)
+        and tuple(old_hidden_states.shape) == (batch_size, 10240, 4)
+        and tuple(weight.shape) == (10240, 1, 4)
+        and this_hidden_states.dtype == torch.bfloat16
+        and old_hidden_states.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        # Qwen3-Next slices the 10240-wide QKV view from a 16384-wide
+        # projection, so the hidden dimension is contiguous while the batch
+        # stride is padded.  The specialized kernel consumes that stride
+        # explicitly; requiring full contiguity would silently disable it.
+        and this_hidden_states.stride(1) == 1
+        and old_hidden_states.is_contiguous()
+        and weight.is_contiguous()
+    )
+    if batch_supported:
+        return causal_conv1d_update_gcu_batch_inplace(
+            this_hidden_states,
+            old_hidden_states,
+            weight,
+        )
+    return causal_conv1d_update(this_hidden_states, old_hidden_states, weight)
+
+
+def causal_conv1d_update_qwen3_next_with_g(
+    this_hidden_states: torch.Tensor,
+    old_hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    a: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+):
+    """Fuse independent classic-decode conv and g only for the exact contract."""
+    batch_size = this_hidden_states.shape[0]
+    tensors = (
+        this_hidden_states,
+        old_hidden_states,
+        weight,
+        a,
+        A_log,
+        dt_bias,
+    )
+    supported = (
+        _GCU_QWEN3_NEXT_CONV_G_TCLE
+        and has_triton_impl
+        and is_enflame()
+        and batch_size in (2, 4, 8)
+        and tuple(this_hidden_states.shape) == (batch_size, 10240)
+        and tuple(old_hidden_states.shape) == (batch_size, 10240, 4)
+        and tuple(weight.shape) == (10240, 1, 4)
+        and tuple(a.shape) == (batch_size, 48)
+        and tuple(A_log.shape) == (48,)
+        and tuple(dt_bias.shape) == (48,)
+        and this_hidden_states.dtype == torch.bfloat16
+        and old_hidden_states.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and a.dtype == torch.bfloat16
+        and A_log.dtype == torch.bfloat16
+        and dt_bias.dtype == torch.bfloat16
+        and all(tensor.device.type == "gcu" for tensor in tensors)
+        and len({tensor.device for tensor in tensors}) == 1
+        and this_hidden_states.stride(1) == 1
+        and a.stride(1) == 1
+        and old_hidden_states.is_contiguous()
+        and weight.is_contiguous()
+        and A_log.is_contiguous()
+        and dt_bias.is_contiguous()
+    )
+    if supported:
+        from chitu.ops.gcu_qwen38_causal_conv_g_tcle import (
+            qwen38_causal_conv_g_update_tcle,
+        )
+
+        return qwen38_causal_conv_g_update_tcle(
+            this_hidden_states,
+            old_hidden_states,
+            weight,
+            a,
+            A_log,
+            dt_bias,
+        )
+    output, state = causal_conv1d_update_qwen3_next(
+        this_hidden_states,
+        old_hidden_states,
+        weight,
+    )
+    return output, state, None
 
 
 @make_op_dispatcher
