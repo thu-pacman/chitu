@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
+import os
 from collections import OrderedDict
 from typing import Any, Mapping, Optional
 from typing_extensions import override
@@ -33,20 +35,27 @@ from chitu.ops import (
     update_singleton_paged_kv_cache,
     read_from_singleton_paged_kv_cache,
     apply_rotary_pos_emb_partial,
+    qknorm_partial_rope,
+    attn_output_gate,
     chunk_gated_delta_rule,
     recurrent_gated_delta_rule,
+    recurrent_gated_delta_rule_compact_qk_gcu,
     recurrent_gated_delta_rule_all_state,
     silu_and_mul,
     causal_conv1d_update,
+    causal_conv1d_update_qwen3_next,
+    causal_conv1d_update_qwen3_next_with_g,
     causal_conv1d_prefill,
     rms_norm_gate,
     fused_g,
 )
 from chitu.quantization import (
+    Blockfp8Linear,
     QuantizationRegistry,
     get_quant_from_checkpoint_prefix,
     get_quant_kwargs_from_checkpoint_prefix,
 )
+from chitu.device_type import is_enflame
 from chitu.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -58,6 +67,49 @@ from chitu.utils import proportion_split
 from chitu.global_vars import get_global_args
 
 
+_GCU_QKV_GATE_MERGE_ENABLED = is_enflame() and os.environ.get(
+    "CHITU_GCU_QWEN3_NEXT_QKV_GATE_MERGE", "0"
+) == "1"
+_GCU_MTP_DIRECT_RECURRENT_CACHE_ENABLED = is_enflame() and os.environ.get(
+    "CHITU_GCU_QWEN3_NEXT_MTP_DIRECT_RECURRENT_CACHE", "0"
+) == "1"
+_GCU_COMPACT_QK_BATCH_ENABLED = is_enflame() and os.environ.get(
+    "CHITU_GCU_QWEN3_NEXT_COMPACT_QK_BATCH", "0"
+) == "1"
+_GCU_RECURRENCE_SINGLE_STEP_ENABLED = is_enflame() and os.environ.get(
+    "CHITU_GCU_QWEN3_NEXT_RECURRENCE_SINGLE_STEP", "0"
+) == "1"
+_GCU_RECURRENCE_MIXED_DECAY_ENABLED = (
+    is_enflame()
+    and os.environ.get("CHITU_GCU_QWEN3_NEXT_RECURRENCE_MIXED_DECAY", "0") == "1"
+    and _GCU_RECURRENCE_SINGLE_STEP_ENABLED
+)
+_GCU_RAW_BETA_DELTA_BATCH_ENABLED = (
+    is_enflame()
+    and os.environ.get("CHITU_GCU_QWEN3_NEXT_RAW_BETA_DELTA_BATCH", "0") == "1"
+    and _GCU_RECURRENCE_SINGLE_STEP_ENABLED
+)
+_GCU_RECURRENCE_GROUPED_QK_ENABLED = (
+    is_enflame()
+    and os.environ.get("CHITU_GCU_QWEN3_NEXT_RECURRENCE_GROUPED_QK", "0") == "1"
+    and _GCU_RECURRENCE_SINGLE_STEP_ENABLED
+    and _GCU_RECURRENCE_MIXED_DECAY_ENABLED
+    and _GCU_RAW_BETA_DELTA_BATCH_ENABLED
+)
+_GCU_RECURRENCE_MIXED_QUERY_SCALE_ENABLED = (
+    is_enflame()
+    and os.environ.get(
+        "CHITU_GCU_QWEN3_NEXT_RECURRENCE_MIXED_QUERY_SCALE", "0"
+    )
+    == "1"
+    and _GCU_RECURRENCE_GROUPED_QK_ENABLED
+)
+_GCU_RECURRENCE_FUSED_QK_SCALE_ENABLED = (
+    is_enflame()
+    and os.environ.get("CHITU_GCU_QWEN3_NEXT_RECURRENCE_FUSED_QK_SCALE", "0")
+    == "1"
+    and _GCU_RECURRENCE_MIXED_QUERY_SCALE_ENABLED
+)
 class Qwen3NextRMSNorm(RMSNorm):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__(dim, eps)
@@ -92,12 +144,6 @@ class Qwen3NextRMSNormGated(nn.Module):
             impl=impl,
         )
         return out
-
-
-def get_mtp_accept_indices():
-    from chitu.backend import Backend
-
-    return Backend.model.mtp_accept_indices.get()
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
@@ -159,6 +205,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         self.impl = args.linear_attention_impl
         self.norm = Qwen3NextRMSNormGated(self.head_dim, args.norm_eps)
+        self.register_buffer(
+            "_gcu_compact_qk_norm_weight",
+            None,
+            persistent=False,
+        )
+        self.register_buffer(
+            "_gcu_compact_qk_query_scale",
+            None,
+            persistent=False,
+        )
 
         self.out_proj = RowParallelLinear(
             self.n_v_heads * self.head_dim,
@@ -169,6 +225,28 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         )
 
         self.mtp_size = get_global_args().infer.mtp_size
+
+    def _get_gcu_compact_qk_norm_weight(self, device):
+        weight = self._gcu_compact_qk_norm_weight
+        if (
+            weight is None
+            or weight.device != device
+            or weight.dtype != torch.float32
+        ):
+            # Keep this constant out of module-wide dtype conversion.  GCU's
+            # vendor RMSNorm requires the established FP32-weight boundary.
+            weight = torch.ones(self.head_dim, device=device, dtype=torch.float32)
+            self._gcu_compact_qk_norm_weight = weight
+        return weight
+
+    def _get_gcu_compact_qk_query_scale(self, device):
+        scale = self._gcu_compact_qk_query_scale
+        if scale is None or scale.device != device or scale.dtype != torch.float32:
+            scale = torch.full(
+                (1,), self.head_dim**-0.5, device=device, dtype=torch.float32
+            )
+            self._gcu_compact_qk_query_scale = scale
+        return scale
 
     def fix_qkvz_ba_ordering(self, mixed_qkvz, mixed_ba):
         """
@@ -255,31 +333,64 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         qkv, z, b, a = self.fix_qkvz_ba_ordering(qkvz, ba)
 
+        direct_mtp_conv_cache = False
+        fused_g_from_conv = None
+
         # classic decode: only reached when mtp_size == 1. With mtp_size > 1,
         # is_classic_decoding is True only for 1-length prefill chunks, which are
         # routed to the prefill branch below (mtp_size == 1 keeps this branch for
         # real decode; the prefill branch would be equivalent but uses the
         # slower chunk kernels).
         if use_precomputed_states:
-            qkv, conv_state = causal_conv1d_update(qkv, conv_state, self.conv1d.weight)
+            # The state is read solely for this update and written back below,
+            # so exact shape-specialized GCU kernels may update it in place. The
+            # dispatcher keeps unsupported shapes/platforms on the original
+            # out-of-place implementation.
+            qkv, conv_state, fused_g_from_conv = (
+                causal_conv1d_update_qwen3_next_with_g(
+                    qkv,
+                    conv_state,
+                    self.conv1d.weight,
+                    a,
+                    self.A_log,
+                    self.dt_bias,
+                )
+            )
             # qkv: (bsz, hidden_size), conv_state: (bsz, hidden_size, state_len)
         # mtp decode, could be optimized with a fused kernel
         elif is_mtp_decode_stage:
             qkv = qkv.view(-1, self.mtp_size, *qkv.shape[1:])
-            qkv_out = torch.empty_like(qkv)
-            # conv_state_out[:, i, ...] 是第 i 个 draft token 之后的 state，写第 i 列
-            # （和 write_page_ids 的第 i 列对应）
-            conv_state_out = torch.empty(
-                (qkv.shape[0], self.mtp_size, *conv_state.shape[1:]), device=qkv.device
+            mtp_conv = getattr(self, "_mtp_decode_conv", None)
+            mtp_conv_direct = getattr(self, "_mtp_decode_conv_direct_cache", None)
+            conv_cache = cache_accessor.kv["conv_state"]
+            direct_mtp_conv_cache = (
+                mtp_conv_direct is not None
+                and qkv.shape[0] == 1
+                and conv_cache.shape[0] == 1
+                and conv_cache.shape[1] == self.mtp_size
             )
-            for i in range(0, self.mtp_size):
-                qkv_slice = qkv[:, i, ...]
-                qkv_out[:, i, ...], conv_state = causal_conv1d_update(
-                    qkv_slice, conv_state, self.conv1d.weight
+            if direct_mtp_conv_cache:
+                qkv_out, conv_state = mtp_conv_direct(
+                    qkv, conv_state, self.conv1d.weight, conv_cache[:1]
                 )
-                conv_state_out[:, i, ...] = conv_state
+            elif mtp_conv is not None:
+                qkv_out, conv_state = mtp_conv(
+                    qkv, conv_state, self.conv1d.weight
+                )
+            else:
+                qkv_out = torch.empty_like(qkv)
+                conv_state_out = torch.empty(
+                    (qkv.shape[0], self.mtp_size, *conv_state.shape[1:]),
+                    device=qkv.device,
+                )
+                for i in range(0, self.mtp_size):
+                    qkv_slice = qkv[:, i, ...]
+                    qkv_out[:, i, ...], conv_state = causal_conv1d_update(
+                        qkv_slice, conv_state, self.conv1d.weight
+                    )
+                    conv_state_out[:, i, ...] = conv_state
+                conv_state = conv_state_out
             qkv = qkv_out.view(-1, *qkv_out.shape[2:])
-            conv_state = conv_state_out
         # prefill
         else:
             qkv, conv_state = causal_conv1d_prefill(
@@ -294,6 +405,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             # qkv: (total_len, hidden_size), conv_state: (total_len, hidden_size, state_len)
             # Prefill只写每个 seq 的第 0 个 in-place block，所以这里不需要为 mtp_size 复制
 
+        compact_qkv_source = qkv
         q, k, v = torch.split(
             qkv,
             [
@@ -308,16 +420,98 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             lambda h: h.reshape(h.size(0), -1, self.head_dim), (q, k, v)
         )  # (total_len, n_heads, head_dim)
 
-        beta = b.sigmoid()
+        use_gcu_compact_qk_batch = (
+            _GCU_COMPACT_QK_BATCH_ENABLED
+            and self.impl == "torch"
+            and use_precomputed_states
+            and not is_mtp_decode_stage
+            and q.shape[0] in (2, 4, 8)
+            and tuple(q.shape[1:]) == (self.n_local_qk_heads, self.head_dim)
+            and k.shape == q.shape
+            and tuple(v.shape[1:]) == (self.n_local_v_heads, self.head_dim)
+            and tuple(b.shape[1:]) == (self.n_local_v_heads,)
+            and recurrent_state is not None
+            and recurrent_state.shape[0] == q.shape[0]
+            and tuple(recurrent_state.shape[1:]) == (
+                self.n_local_v_heads, self.head_dim, self.head_dim
+            )
+            and q.dtype == torch.bfloat16
+            and k.dtype == torch.bfloat16
+            and v.dtype == torch.bfloat16
+            and b.dtype == torch.bfloat16
+            and recurrent_state.dtype == torch.bfloat16
+        )
 
-        g = fused_g(a, self.A_log, self.dt_bias)
+        # Optional platform candidates may consume raw BF16 beta logits and
+        # reproduce the standalone sigmoid's BF16 boundary inside recurrent.
+        # Both hooks are absent by default, so every unbound model retains the
+        # original materialized sigmoid producer.
+        raw_beta_recurrent = getattr(
+            self, "_compact_classic_decode_recurrent_raw_beta", None
+        )
+        raw_beta_mtp_recurrent = getattr(
+            self, "_compact_mtp_decode_recurrent_raw_beta", None
+        )
+        use_raw_beta_recurrent = (
+            use_precomputed_states
+            and not is_mtp_decode_stage
+            and raw_beta_recurrent is not None
+            and not use_gcu_compact_qk_batch
+        )
+        use_raw_beta_mtp_recurrent = (
+            is_mtp_decode_stage and raw_beta_mtp_recurrent is not None
+        )
+        beta = (
+            b
+            if use_raw_beta_recurrent
+            or use_raw_beta_mtp_recurrent
+            or (use_gcu_compact_qk_batch and _GCU_RAW_BETA_DELTA_BATCH_ENABLED)
+            else b.sigmoid()
+        )
 
-        q = q.repeat_interleave(
-            self.n_v_heads // self.n_qk_heads, dim=1
-        )  # (total_len, n_v_heads, head_dim)
-        k = k.repeat_interleave(
-            self.n_v_heads // self.n_qk_heads, dim=1
-        )  # (total_len, n_v_heads, head_dim)
+        g = (
+            fused_g_from_conv
+            if fused_g_from_conv is not None
+            else fused_g(a, self.A_log, self.dt_bias)
+        )
+
+        # A bound classic or MTP candidate may consume the original compact
+        # Q/K heads.  Unbound paths preserve the existing materialization.
+        # This lets an accelerator kernel map value head ``h`` to Q/K head
+        # ``h // (n_v_heads / n_qk_heads)`` without two repeat_interleave
+        # producers per Gated-Delta layer.
+        compact_classic_recurrent = raw_beta_recurrent or getattr(
+            self, "_compact_classic_decode_recurrent", None
+        )
+        use_compact_classic_recurrent = (
+            use_precomputed_states
+            and not is_mtp_decode_stage
+            and compact_classic_recurrent is not None
+        )
+
+        # An opt-in Chitu prefill dispatcher may also consume compact Q/K.
+        # The hook is bound only after validating the fixed Qwen3.8 TP1 shape;
+        # decode, MTP, and unbound models keep the original materialization.
+        use_compact_prefill_qk = (
+            not use_precomputed_states
+            and not is_mtp_decode_stage
+            and getattr(self, "_compact_prefill_qk", False)
+        )
+
+        if not (
+            use_compact_classic_recurrent
+            or use_compact_prefill_qk
+            or use_raw_beta_mtp_recurrent
+            or use_gcu_compact_qk_batch
+        ):
+            q = q.repeat_interleave(
+                self.n_v_heads // self.n_qk_heads, dim=1
+            )  # (total_len, n_v_heads, head_dim)
+            k = k.repeat_interleave(
+                self.n_v_heads // self.n_qk_heads, dim=1
+            )  # (total_len, n_v_heads, head_dim)
+
+        direct_mtp_recurrent_cache = False
 
         # prefill
         if not use_precomputed_states and not is_mtp_decode_stage:
@@ -345,7 +539,24 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 [q, k, v, beta, g],
             )
 
-            core_attn_out, last_recurrent_state = recurrent_gated_delta_rule_all_state(
+            recurrent_cache = cache_accessor.kv["recurrent_state"]
+            direct_mtp_recurrent_cache = (
+                _GCU_MTP_DIRECT_RECURRENT_CACHE_ENABLED
+                and self.impl == "torch"
+                and q.shape[0] == 1
+                and recurrent_cache.shape[0] == 1
+                and recurrent_cache.shape[1] == self.mtp_size
+            )
+            recurrent_state_output = (
+                recurrent_cache[:1] if direct_mtp_recurrent_cache else None
+            )
+
+            recurrent_all_state_impl = (
+                raw_beta_mtp_recurrent
+                if use_raw_beta_mtp_recurrent
+                else recurrent_gated_delta_rule_all_state
+            )
+            core_attn_out, last_recurrent_state = recurrent_all_state_impl(
                 q,
                 k,
                 v,
@@ -354,21 +565,58 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 initial_state=recurrent_state,
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
+                state_output_dtype=x.dtype,
+                state_output=recurrent_state_output,
                 impl=self.impl,
             )
         # classic decode
         else:
-            core_attn_out, last_recurrent_state = recurrent_gated_delta_rule(
-                q.unsqueeze(1),
-                k.unsqueeze(1),
-                v.unsqueeze(1),
-                g=g.unsqueeze(1),
-                beta=beta.unsqueeze(1),
-                initial_state=recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                impl=self.impl,
-            )
+            if use_gcu_compact_qk_batch:
+                core_attn_out, last_recurrent_state = (
+                    recurrent_gated_delta_rule_compact_qk_gcu(
+                        q.unsqueeze(1),
+                        k.unsqueeze(1),
+                        v.unsqueeze(1),
+                        g=g.unsqueeze(1),
+                        beta=beta.unsqueeze(1),
+                        initial_state=recurrent_state,
+                        output_final_state=True,
+                        norm_weight=self._get_gcu_compact_qk_norm_weight(q.device),
+                        impl=self.impl,
+                        single_step=_GCU_RECURRENCE_SINGLE_STEP_ENABLED,
+                        raw_beta_delta=_GCU_RAW_BETA_DELTA_BATCH_ENABLED,
+                        mixed_decay=_GCU_RECURRENCE_MIXED_DECAY_ENABLED,
+                        grouped_qk=_GCU_RECURRENCE_GROUPED_QK_ENABLED,
+                        mixed_query_scale=_GCU_RECURRENCE_MIXED_QUERY_SCALE_ENABLED,
+                        fused_qk_scale=_GCU_RECURRENCE_FUSED_QK_SCALE_ENABLED,
+                        query_scale=(
+                            self._get_gcu_compact_qk_query_scale(q.device)
+                            if _GCU_RECURRENCE_MIXED_QUERY_SCALE_ENABLED
+                            else None
+                        ),
+                        qkv_source=compact_qkv_source,
+                        initial_state_cache=None,
+                        page_table=None,
+                        paged_mixed_decay=False,
+                    )
+                )
+            else:
+                recurrent_impl = (
+                    compact_classic_recurrent
+                    if use_compact_classic_recurrent
+                    else recurrent_gated_delta_rule
+                )
+                core_attn_out, last_recurrent_state = recurrent_impl(
+                    q.unsqueeze(1),
+                    k.unsqueeze(1),
+                    v.unsqueeze(1),
+                    g=g.unsqueeze(1),
+                    beta=beta.unsqueeze(1),
+                    initial_state=recurrent_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    impl=self.impl,
+                )
 
         if is_mtp_decode_stage:
             # mtp decode: 第 i 个 draft token 之后的 state 写第 i 列（data-dependent 的边界列
@@ -409,9 +657,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 ckpt_page_ids,
                 state_checkpoints,
             )
-
         self.last_conv_state = conv_state.contiguous()
-        self.last_recurrent_state = last_recurrent_state.to(x.dtype).contiguous()
+        self.last_recurrent_state = last_recurrent_state
 
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
@@ -458,36 +705,145 @@ class AttentionQwen3Next(AttentionHFLlama):
         )
 
         self.partial_rotary_factor = float(getattr(args, "partial_rotary_factor", 0.25))
+        # Initialized lazily after checkpoint loading and device placement.  A
+        # tuple holds the unregistered merged projection and the original QKV
+        # width; False permanently selects the ordinary path for an unsupported
+        # topology.  Keeping the merged module unregistered preserves the public
+        # state_dict schema.
+        self._gcu_qkv_gate_merge_state = (
+            None if _GCU_QKV_GATE_MERGE_ENABLED else False
+        )
+
+    @torch.no_grad()
+    def _get_gcu_qkv_gate_merged_projection(self):
+        """Return an exact TP1 block-FP8 QKV+gate projection when supported.
+
+        QKV and the attention gate consume the same normalized hidden state.
+        On Enflame, concatenating their block-aligned output rows preserves
+        every per-128 weight scale and output element while removing one input
+        quantization and one M=1 GEMM launch.  Packing is delayed until the
+        first forward because layer-wise checkpoint loading moves registered
+        parameters to the accelerator only after load-state hooks run.
+        """
+
+        state = self._gcu_qkv_gate_merge_state
+        if state is False:
+            return None
+        if state is not None:
+            merged, qkv_n = state
+            qkv = self.qkv_proj
+            gate = self.attn_gate
+            # A later load_state_dict() or model.to() may replace the registered
+            # views.  Repack instead of retaining a stale hidden module.
+            if (
+                merged.weight.device == qkv.weight.device == gate.weight.device
+                and qkv.weight.data_ptr() == merged.weight.data_ptr()
+                and gate.weight.data_ptr()
+                == merged.weight.data_ptr() + qkv_n * qkv.in_features
+            ):
+                return state
+
+        qkv = self.qkv_proj
+        gate = self.attn_gate
+        # New-upstream Blockfp8Linear exposes the block shape as
+        # ``scale_block_shape`` (previously a scalar ``block_size``).  Fail
+        # closed on any other linear kind so the ordinary path is preserved.
+        qkv_block = getattr(qkv, "scale_block_shape", None)
+        gate_block = getattr(gate, "scale_block_shape", None)
+        supported = (
+            isinstance(qkv, Blockfp8Linear)
+            and isinstance(gate, Blockfp8Linear)
+            and getattr(qkv, "tp_size", None) == getattr(gate, "tp_size", None)
+            and getattr(qkv, "tp_size", None) == 1
+            and not getattr(qkv, "gather_output", True)
+            and not getattr(gate, "gather_output", True)
+            and getattr(qkv, "in_features", None) == getattr(gate, "in_features", None)
+            and qkv_block is not None
+            and qkv_block == gate_block
+            and getattr(qkv, "round_scale_to_pow2", None)
+            == getattr(gate, "round_scale_to_pow2", None)
+            and qkv.out_features % qkv_block[0] == 0
+            and gate.out_features % qkv_block[0] == 0
+            and qkv.bias is None
+            and gate.bias is None
+            and qkv.weight.dtype == gate.weight.dtype == torch.float8_e4m3fn
+            and qkv.scale.dtype == gate.scale.dtype == torch.float32
+            and qkv.weight.is_contiguous()
+            and gate.weight.is_contiguous()
+            and qkv.scale.is_contiguous()
+            and gate.scale.is_contiguous()
+        )
+        if not supported:
+            self._gcu_qkv_gate_merge_state = False
+            return None
+
+        qkv_n = qkv.out_features
+        gate_n = gate.out_features
+        merged_weight = torch.cat((qkv.weight, gate.weight), dim=0).contiguous()
+        merged_scale = torch.cat((qkv.scale, gate.scale), dim=0).contiguous()
+
+        # Use the same generated ColumnParallelLinear class so global
+        # Blockfp8Linear specializations (for example reusable RMS+FP8 input)
+        # continue to compose with this optimization.  The hidden module owns
+        # the full packed tensors; the registered public modules retain views
+        # with their original state_dict shapes and no duplicate storage.
+        merged = copy.copy(qkv)
+        merged._parameters = qkv._parameters.copy()
+        merged._buffers = qkv._buffers.copy()
+        merged._modules = qkv._modules.copy()
+        merged.weight = nn.Parameter(merged_weight, requires_grad=False)
+        merged.scale = nn.Parameter(merged_scale, requires_grad=False)
+        merged.out_features = qkv_n + gate_n
+        merged.local_out_features = qkv_n + gate_n
+
+        qkv.weight = nn.Parameter(merged_weight[:qkv_n], requires_grad=False)
+        gate.weight = nn.Parameter(merged_weight[qkv_n:], requires_grad=False)
+        qkv.scale = nn.Parameter(merged_scale[: qkv.scale.shape[0]], requires_grad=False)
+        gate.scale = nn.Parameter(merged_scale[qkv.scale.shape[0] :], requires_grad=False)
+
+        state = (merged, qkv_n)
+        self._gcu_qkv_gate_merge_state = state
+        return state
 
     def forward(
         self, x: torch.Tensor, freqs_cis: BatchedFreqsCis, is_mtp: bool = False
     ):
         seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
 
-        xq, xk, xv = self._run_linear(x)
-        gate = self.attn_gate(x)
+        merged_state = (
+            self._get_gcu_qkv_gate_merged_projection() if not is_mtp else None
+        )
+        if merged_state is None:
+            xq, xk, xv = self._run_linear(x)
+            gate = self.attn_gate(x)
+        else:
+            merged_projection, qkv_n = merged_state
+            qkv_gate = merged_projection(x)
+            qkv = qkv_gate[..., :qkv_n]
+            gate = qkv_gate[..., qkv_n:]
+            xq, xk, xv = qkv.split(
+                [
+                    self.n_local_heads * self.head_dim,
+                    self.n_local_kv_heads * self.head_dim,
+                    self.n_local_kv_heads * self.head_dim,
+                ],
+                dim=-1,
+            )
 
         bs_seq = xq.numel() // xq.shape[-1]
         xq = xq.view(bs_seq, self.n_local_heads, self.head_dim).contiguous()
         xk = xk.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
         xv = xv.view(bs_seq, self.n_local_kv_heads, self.head_dim).contiguous()
 
-        if hasattr(self, "q_norm"):
-            xq = self.q_norm(xq)
-        if hasattr(self, "k_norm"):
-            xk = self.k_norm(xk)
-
-        assert (xq.shape[-1] * self.partial_rotary_factor) % 1 == 0
-        assert (xk.shape[-1] * self.partial_rotary_factor) % 1 == 0
-        xq, xk, _, _, _, _, _, _ = apply_rotary_pos_emb_partial(
+        xq, xk = qknorm_partial_rope(
             xq,
             xk,
             freqs_cis,
-            q_rotary_end=int(xq.shape[-1] * self.partial_rotary_factor),
-            k_rotary_end=int(xk.shape[-1] * self.partial_rotary_factor),
+            getattr(self, "q_norm", None),
+            getattr(self, "k_norm", None),
+            partial_rotary_factor=self.partial_rotary_factor,
             rotary_type=self.rotary_type,
-            inplace=True,
-            impl="auto",
+            is_mtp=is_mtp,
         )
 
         output = self.attn_backend(
@@ -498,7 +854,7 @@ class AttentionQwen3Next(AttentionHFLlama):
             seq_len_delta=seq_len_delta,
             causal=True,
         ).view(bs_seq, -1)
-        output = output * torch.sigmoid(gate)
+        output = attn_output_gate(output, gate)
         return self._run_output_linear(output).reshape(x.shape)
 
 
