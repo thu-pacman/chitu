@@ -362,6 +362,39 @@ def writeback_pending(
         score_state[slot, rows] = flat_score[src] + ape[positions.remainder(ratio)]
 
 
+def masked_write_kv_cache(
+    values: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor | None,
+    cache_slots: torch.Tensor,
+    positions: torch.Tensor,
+    cache_seq_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> None:
+    """Masked scatter of ``values`` rows into the flat or paged KV cache.
+
+    Numerically equivalent to the Triton ``masked_write_kv_cache`` kernel: only
+    rows selected by ``valid_mask`` are written, addressed either by
+    ``block_table[seq_id, pos // page_size]`` (paged) or by ``cache_slots``
+    (flat).  Used as the torch fallback on platforms without that kernel.
+    """
+    valid = valid_mask.to(device=values.device, dtype=torch.bool)
+    valid_idx = valid.nonzero(as_tuple=False).squeeze(-1)
+    if valid_idx.numel() == 0:
+        return
+
+    positions_v = positions.to(device=values.device, dtype=torch.long)[valid_idx]
+    if block_table is not None:
+        page_size = kv_cache.shape[1]
+        seq_ids_v = cache_seq_ids.to(device=values.device, dtype=torch.long)[valid_idx]
+        rows = block_table[seq_ids_v, positions_v // page_size].to(torch.long)
+        cols = positions_v % page_size
+    else:
+        rows = cache_slots.to(device=values.device, dtype=torch.long)[valid_idx]
+        cols = positions_v
+    kv_cache[rows, cols] = values[valid_idx]
+
+
 _, _has_triton = try_import_platform_dep("triton")
 if _has_triton:
     from chitu.ops.triton_ops.deepseek_compressor import (

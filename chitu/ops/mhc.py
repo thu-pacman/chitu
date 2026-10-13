@@ -5,6 +5,7 @@
 
 import torch
 
+from chitu.device_type import is_enflame
 from chitu.ops.utils import make_op_dispatcher
 from chitu.utils import try_import_platform_dep
 
@@ -36,6 +37,11 @@ def mhc_pre(
 
 @mhc_pre.register_auto
 def _auto_mhc_pre():
+    # torch_gcu exposes a Triton package, but the shipped backend API is not
+    # compatible with Chitu's CUDA-oriented mHC Triton kernels.  Keep GCU on
+    # the numerically equivalent Torch path until a native kernel is added.
+    if is_enflame():
+        return "torch"
     if has_tilelang:
         return "tilelang"
     if has_triton:
@@ -57,6 +63,8 @@ def mhc_post(
 
 @mhc_post.register_auto
 def _auto_mhc_post():
+    if is_enflame():
+        return "torch"
     if has_triton:
         return "triton"
     if has_tilelang:
