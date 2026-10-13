@@ -31,6 +31,10 @@ if not DOC_GENERATION:
         build_chat_template_kwargs,
     )
     from chitu.sampling.utils import validate_response_format_grammar
+    from chitu.serve.abort import (
+        run_with_client_abort,
+        stream_with_client_abort,
+    )
     from chitu.tool_call import (
         parse_stream_by_parser,
         get_tool_parser_cls,
@@ -678,6 +682,7 @@ def _model_not_found_error(error: ValueError) -> JSONResponse:
 async def handle_chat_completion(
     request: ChatRequest,
     priority: int,
+    http_request: Optional[Any] = None,
 ):
 
     args = get_global_args()
@@ -714,11 +719,19 @@ async def handle_chat_completion(
 
     if request.stream:
         return StreamingResponse(
-            rsp.stream_generator(include_usage=request.stream_options.include_usage),
+            stream_with_client_abort(
+                http_request,
+                user_req.request_id,
+                rsp.stream_generator(
+                    include_usage=request.stream_options.include_usage
+                ),
+            ),
             media_type="text/event-stream",
         )
     else:
-        full_response = await rsp.full_generator()
+        full_response = await run_with_client_abort(
+            http_request, user_req.request_id, rsp.full_generator()
+        )
         response_dict = full_response.model_dump()
         return JSONResponse(response_dict)
 
@@ -955,7 +968,11 @@ def build_completion_user_request(
     )
 
 
-async def handle_completion(request: CompletionsRequest, priority: int):
+async def handle_completion(
+    request: CompletionsRequest,
+    priority: int,
+    http_request: Optional[Any] = None,
+):
     """openai text-completions endpoint (raw prompt, no chat template)."""
 
     args = get_global_args()
@@ -973,9 +990,17 @@ async def handle_completion(request: CompletionsRequest, priority: int):
 
     if request.stream:
         return StreamingResponse(
-            rsp.stream_generator(include_usage=request.stream_options.include_usage),
+            stream_with_client_abort(
+                http_request,
+                user_req.request_id,
+                rsp.stream_generator(
+                    include_usage=request.stream_options.include_usage
+                ),
+            ),
             media_type="text/event-stream",
         )
     else:
-        full_response = await rsp.full_generator()
+        full_response = await run_with_client_abort(
+            http_request, user_req.request_id, rsp.full_generator()
+        )
         return JSONResponse(full_response.model_dump())

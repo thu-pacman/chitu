@@ -159,6 +159,21 @@ def get_endpoint(
     return ip, int(port)
 
 
+def find_endpoint(host_role: str, connection_name: str) -> Optional[tuple[str, int]]:
+    """Look up a server endpoint without waiting for it to be registered.
+
+    Returns `None` when the endpoint is not registered (yet), which lets a
+    caller connect the services that are already online instead of blocking on
+    the ones that are still starting up.
+    """
+
+    store = _coordinator
+    assert store is not None, "the coordinator is not initialized"
+    if not store.check([f"{ENDPOINT_PREFIX}{host_role}:{connection_name}"]):
+        return None
+    return get_endpoint(host_role, connection_name)
+
+
 def set_value(key: str, value: bytes, *, override: bool = False) -> None:
     """Store a raw byte payload under *key* in the coordinator store.
 
@@ -174,6 +189,21 @@ def set_value(key: str, value: bytes, *, override: bool = False) -> None:
     _coordinator.set(key, value)
 
 
-def get_value(key: str) -> bytes:
-    """Retrieve a raw byte payload for *key* from the coordinator store."""
-    return _coordinator.get(key)
+def get_value(key: str, timeout: Optional[float] = None) -> bytes:
+    """Retrieve a raw byte payload for *key* from the coordinator store.
+
+    If `timeout` (in seconds) is given, wait at most that long for the key to be
+    registered. Otherwise the store's default timeout is used.
+    """
+
+    store = _coordinator
+    assert store is not None, "the coordinator is not initialized"
+    if timeout is None:
+        return store.get(key)
+    # Temporarily override the store's wait timeout for this lookup.
+    prev_timeout = store.timeout
+    store.set_timeout(datetime.timedelta(seconds=timeout))
+    try:
+        return store.get(key)
+    finally:
+        store.set_timeout(prev_timeout)

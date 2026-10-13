@@ -55,6 +55,8 @@ REQUEST_LEVEL = {
 CRASH_LEVEL = {"kv_wait_timeout"}
 DELAYED_CRASH = "delayed_crash"
 INSTANCE_CRASH_SETTLE_S = 45.0
+# How long to wait between two attempts to reach a servable deployment.
+SERVICE_POLL_INTERVAL_S = 5.0
 
 
 def _post(
@@ -156,9 +158,32 @@ def _assert_service_down(base: str) -> None:
     raise AssertionError(f"service still up after crash injection ({CRASH_BOUND_S}s)")
 
 
+def _wait_until_serving(base: str) -> None:
+    """Wait until the deployment answers a request.
+
+    With `multi_inst.fail_fast=False` the Router reports ready before its
+    instances finish loading, so a request sent right after `on_ready` waits in
+    the Router queue. Give it the whole verification budget instead of a single
+    request timeout.
+    """
+    deadline = time.monotonic() + DEFAULT_TIMEOUT_S
+    while True:
+        status, body = _post(base, stream=False)
+        if status == 200:
+            print("[INJECT] deployment is serving requests")
+            return
+        print(f"[INJECT] deployment is not serving yet (status={status})")
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"deployment did not serve a request within "
+                f"{DEFAULT_TIMEOUT_S}s: status={status} body={str(body)[:200]}"
+            )
+        time.sleep(SERVICE_POLL_INTERVAL_S)
+
+
 def _assert_service_survives_instance_crash(base: str) -> None:
     """Verify a redundant P/D deployment still serves after one instance exits."""
-    _assert_request_succeeds(base)
+    _wait_until_serving(base)
     time.sleep(INSTANCE_CRASH_SETTLE_S)
     _assert_request_succeeds(base)
 

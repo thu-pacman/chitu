@@ -930,6 +930,31 @@ curl localhost:21002/terminate_engine \
   -d '{"confirm": true}'
 ```
 
+If a client disconnects before its response is finished (for both streaming and
+non-streaming requests), the HTTP layer notices the closed connection and tells
+the engine to stop working on that request: the task is dropped, its KV cache
+blocks are released, and no more tokens are generated for it. This applies to
+standalone (single-instance) deployments as well as to multi-instance
+deployments, including PD disaggregation, where both the Prefill and the Decode
+instance are stopped. The closed connection is observed event-driven: the abort is
+folded into the ASGI server's own connection-closed handling (uvicorn marks the
+request's connection as disconnected when the socket closes), which runs once per
+connection - an inference request carries no per-message watcher, and its response
+stream costs nothing extra. An abandoned request is therefore stopped as soon as
+the socket closes, without polling. This rests on uvicorn's HTTP protocols; if they
+cannot be hooked, startup logs an error and abandoned requests are not stopped
+early. CI covers all three deployments: `test/client_interrupt_test.py` checks
+a single-instance engine, `test/client_interrupt_dp_test.py` a DP (non-PD)
+multi-instance deployment, and `test/client_interrupt_pd_test.py` a PD
+deployment - the last two through `boot.on_ready`, reading the instances' load
+back from `/dp/debug`. Every case drives all the endpoints below in both the
+streaming and the non-streaming shape: the OpenAI chat and text completions
+APIs, the OpenAI Responses API, and the Anthropic messages and completions
+APIs. The PD case additionally interrupts a request before its first token,
+while its KV blocks are being transferred (the instances report how many
+transfers they have on the wire, `kv_send_inflight`, next to their load in
+`/dp/debug`), and while it still waits in the Router for a Prefill/Decode pair.
+
 For OpenAI-compatible, OpenAI Responses, and Anthropic-compatible API parameters, see [API Parameters](./API_PARAMETERS.md). To adapt tool calling for a new model, see the [Tool Calling Adaptation Guide](./TOOL_CALL_ADAPTATION.md).
 
 ### Grafana Dashboard
@@ -1066,3 +1091,4 @@ Runtime:
 | `CHITU_MEM_TRACK`              | `0`, `1`                     | Enable startup-time CUDA memory tracking. See [Profiling](./PROFILING.md). |
 | `CHITU_MEM_TRACK_MAX_ENTRIES`  | Integer                      | Ring-buffer size for CUDA memory tracking. See [Profiling](./PROFILING.md). |
 | `CHITU_MEM_TRACK_SNAPSHOT_DIR` | Path to a directory          | Output directory for CUDA memory snapshots. See [Profiling](./PROFILING.md). |
+| `CHITU_CLIENT_ABORT_POLL_INTERVAL_S` | Seconds (default `0.2`) | Fallback poll interval for a client disconnect, used only when requests are served without the built-in ASGI middleware. Lower values stop abandoned requests sooner at the cost of more frequent polling. |

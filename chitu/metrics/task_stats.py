@@ -5,8 +5,71 @@
 """Shared task statistics utilities for metrics collection."""
 
 import logging
+import threading
+import time
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+# KV transfers this (Prefill) instance has handed to its transfer worker and that
+# have not finished yet. The RDMA itself is asynchronous and reports nothing back
+# to Python, so without this the instance could only say "a request is running";
+# with it, the heartbeat can say "the KV blocks of N requests are on the wire",
+# which is the only way to observe the transfer window from outside the process
+# (see pd_service._collect_stats and api_app._instance_load_snapshot).
+_KV_SEND_INFLIGHT: "dict[str, float]" = {}
+_KV_SEND_LOCK = threading.Lock()
+_KV_SEND_NOTIFIER: "Optional[Callable[[], None]]" = None
+
+
+def set_kv_send_change_notifier(notifier: "Optional[Callable[[], None]]") -> None:
+    """Install a callback fired (from any thread) when the in-flight set changes.
+
+    The PD stats reporter uses it to publish the count immediately: a transfer can
+    be shorter than the 1 Hz heartbeat, so a heartbeat-sampled counter would never
+    show it (see pd_service._stats_reporter).
+    """
+    global _KV_SEND_NOTIFIER
+    _KV_SEND_NOTIFIER = notifier
+
+
+def _notify_kv_send_change() -> None:
+    notifier = _KV_SEND_NOTIFIER
+    if notifier is None:
+        return
+    try:
+        notifier()
+    except Exception:
+        logger.exception("KV send change notifier failed")
+
+
+def mark_kv_send_started(request_id: str) -> None:
+    """Record that ``request_id``'s KV blocks were handed to the transfer worker."""
+    with _KV_SEND_LOCK:
+        changed = request_id not in _KV_SEND_INFLIGHT
+        _KV_SEND_INFLIGHT[request_id] = time.monotonic()
+    if changed:
+        _notify_kv_send_change()
+
+
+def mark_kv_send_finished(request_id: str) -> None:
+    """Record that ``request_id``'s KV transfer is over (success or failure)."""
+    with _KV_SEND_LOCK:
+        changed = _KV_SEND_INFLIGHT.pop(request_id, None) is not None
+    if changed:
+        _notify_kv_send_change()
+
+
+def count_kv_send_inflight() -> int:
+    """KV transfers of this instance that are submitted but not finished yet."""
+    with _KV_SEND_LOCK:
+        return len(_KV_SEND_INFLIGHT)
+
+
+def kv_send_inflight_request_ids() -> "list[str]":
+    """Requests whose KV transfer is in flight (sorted; test/diagnostic helper)."""
+    with _KV_SEND_LOCK:
+        return sorted(_KV_SEND_INFLIGHT)
 
 
 def _count_unassigned_waiting_in_pool() -> int:

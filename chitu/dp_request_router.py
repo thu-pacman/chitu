@@ -31,6 +31,14 @@ import zmq.asyncio
 import msgpack
 from typing import Optional
 
+
+def _global_args():
+    """get_global_args() with the None case ruled out for the type checker."""
+    args = get_global_args()
+    assert args is not None, "global args are not initialised"
+    return args
+
+
 from chitu.task import UserRequest
 from chitu.kv_cache.prefix_caching import (
     BlockIdentity,
@@ -79,6 +87,7 @@ class SchedulerStats:
     evicted_blk_hashes: list[str] = field(
         default_factory=list
     )  # evicted block hash values returned from the instance
+    kv_send_inflight: int = 0  # this instance's KV transfers on the wire
 
 
 @dataclass
@@ -97,6 +106,7 @@ PENDING_TOKENS_WEIGHT = 1 / NUM_ESTIMATED_TOKENS_PER_REQ  # 0.01
 ROUTER_BLOCK_IDENTITY_MANAGER_NAME = "router"
 TERMINATE_ENGINE_MESSAGE_TYPE = "terminate_engine"
 FLUSH_CACHE_MESSAGE_TYPE = "flush_cache"
+ABORT_REQUEST_MESSAGE_TYPE = "abort_request"
 
 
 def is_terminate_engine_message(request_data: dict) -> bool:
@@ -113,6 +123,26 @@ def is_flush_cache_message(request_data: dict) -> bool:
 
 def build_flush_cache_message() -> dict:
     return {"type": FLUSH_CACHE_MESSAGE_TYPE}
+
+
+def is_abort_request_message(request_data: dict) -> bool:
+    return request_data.get("type") == ABORT_REQUEST_MESSAGE_TYPE
+
+
+def build_abort_request_message(
+    request_id: str, reason: str = "client disconnected"
+) -> dict:
+    """Control message asking an instance to stop one in-flight request.
+
+    Sent by the Router when the user connection goes away: the instance must
+    drop the task (and the KV blocks it holds) instead of generating a response
+    nobody will read.
+    """
+    return {
+        "type": ABORT_REQUEST_MESSAGE_TYPE,
+        "request_id": request_id,
+        "reason": reason,
+    }
 
 
 def is_profile_message(request_data: dict) -> bool:
@@ -197,6 +227,10 @@ class RoutePolicy:
 
     def remove_request(self, request_id: str):
         pass
+
+    def request_instance(self, request_id: str) -> Optional[int]:
+        """local_instance_id currently serving ``request_id``, if known."""
+        return None
 
 
 class LoadBalancer(RoutePolicy):
@@ -309,6 +343,12 @@ class LoadBalancer(RoutePolicy):
 
     def remove_request(self, request_id: str):
         self._release_router_reservation(request_id)
+
+    def request_instance(self, request_id: str) -> Optional[int]:
+        reservation = self.router_reservations.get(request_id)
+        if reservation is None:
+            return None
+        return reservation.local_instance_id
 
     def _round_robin(self, eligible_ids: list[int]) -> int:
         idx = self.round_robin_counter % len(eligible_ids)
@@ -679,9 +719,24 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         self.req_to_request.pop(request_id, None)
         self.req_to_scheduler.pop(request_id, None)
 
+    def request_instance(self, request_id: str) -> Optional[int]:
+        # While the request is being set up, the prefix-cache bookkeeping knows
+        # its instance; from the first token on that state is dropped with the
+        # rest of the prefix-cache bookkeeping, and the owner is the load
+        # reservation, which independent multi-instance keeps until the request
+        # finishes.
+        local_instance_id = self.req_to_scheduler.get(request_id)
+        if local_instance_id is not None:
+            return local_instance_id
+        return super().request_instance(request_id)
+
 
 class RequestRouter:
     """Main Request Router for two-level data parallel scheduling."""
+
+    #: Delay between two attempts to discover the Prometheus collector endpoints
+    #: while some declared instances are not online yet.
+    PROMETHEUS_REDISCOVERY_INTERVAL_S = 10.0
 
     def __init__(self, config: ServeRouterConfig):
         self.config = config
@@ -718,7 +773,7 @@ class RequestRouter:
         # endpoints under roles `instance_0`, `instance_1`, ...
         self._scheduler_addresses: list[str] = []
         try:
-            self._n_insts = max(1, int(get_global_args().multi_inst.n_insts))
+            self._n_insts = max(1, int(_global_args().multi_inst.n_insts))
         except Exception:
             self._n_insts = 1
 
@@ -828,7 +883,7 @@ class RequestRouter:
         # `instance_0`, `instance_1`, ... before the router connects. Instances
         # need to initialize their model first, so wait up to `launch_timeout`
         # seconds for each endpoint to be registered.
-        launch_timeout = float(get_global_args().multi_inst.router.launch_timeout)
+        launch_timeout = float(_global_args().multi_inst.router.launch_timeout)
         self._scheduler_addresses = []
         for instance_id in range(self._n_insts):
             ip, port = get_endpoint(
@@ -888,6 +943,13 @@ class RequestRouter:
             )
             logger.info("Discovering Prometheus collector endpoints from coordinator")
             await asyncio.to_thread(self._discover_prometheus_collectors)
+            while self._retry_prometheus_collector_discovery() and (
+                not self._collector_targets_ready()
+            ):
+                # Some declared instances are not online yet and may be started
+                # later, one by one, so keep watching for their collectors.
+                await asyncio.sleep(self.PROMETHEUS_REDISCOVERY_INTERVAL_S)
+                await asyncio.to_thread(self._discover_prometheus_collectors)
             logger.info(
                 f"Discovered Prometheus collector endpoints: {self.collector_addrs}"
             )
@@ -952,6 +1014,7 @@ class RequestRouter:
                         last_heartbeat_time=time.time(),  # update heartbeat timestamp
                         is_alive=stats_dict.get("heartbeat", False),  # mark alive
                         max_seq_len=stats_dict.get("max_seq_len", None),
+                        kv_send_inflight=stats_dict.get("kv_send_inflight", 0),
                         num_blocks=stats_dict.get("num_blocks", None),
                         block_size=stats_dict.get("block_size", None),
                         evicted_blk_hashes=stats_dict.get("evicted_blk_hashes", []),
@@ -1060,6 +1123,70 @@ class RequestRouter:
             token_router.active_requests.pop(request.request_id, None)
         remove_request_everywhere(request.request_id)
 
+    def _find_inflight_request(self, request_id: str) -> Optional[UserRequest]:
+        """Router-side UserRequest for ``request_id``, if it is still in flight."""
+        token_router = get_token_router(check_exist=False)
+        if token_router is not None:
+            request = token_router.active_requests.get(request_id)
+            if request is not None:
+                return request
+        for request in self.pending_requests:
+            if request.request_id == request_id:
+                return request
+        return None
+
+    async def abort_request(
+        self, request_id: str, reason: str = "client disconnected"
+    ) -> bool:
+        """Terminate engine-side processing of a request whose client went away.
+
+        The Router is the only component that knows which instance owns an
+        in-flight request, so the user-facing disconnect signal is turned into
+        an ``abort_request`` control message here. Not finding an owner is not
+        an error: the request may still be queued for routing, or may have
+        completed between the disconnect and this call.
+        """
+        if not request_id:
+            return False
+
+        local_instance_id = self.policy.request_instance(request_id)
+        if local_instance_id is None:
+            logger.info(
+                "[CLIENT_ABORT] req_id=%s has no owning instance yet (reason=%s)",
+                request_id,
+                reason,
+            )
+        else:
+            socket = self.scheduler_sockets.get(local_instance_id)
+            if socket is None:
+                logger.warning(
+                    "[CLIENT_ABORT] req_id=%s owner instance %s has no socket; "
+                    "engine-side stop skipped",
+                    request_id,
+                    local_instance_id,
+                )
+            else:
+                logger.info(
+                    "[CLIENT_ABORT] req_id=%s aborting on instance %s (reason=%s)",
+                    request_id,
+                    local_instance_id,
+                    reason,
+                )
+                payload = (
+                    msgpack.packb(build_abort_request_message(request_id, reason))
+                    or b""
+                )
+                await self._send_control_message(
+                    socket, payload, f"abort:{local_instance_id}"
+                )
+
+        # Finalize the Router-side request so the HTTP handler stops streaming,
+        # and release the load reservation / prefix-cache state for this request.
+        request = self._find_inflight_request(request_id)
+        if request is not None and not request.finished:
+            self.finish_request_before_recv_stop(request, finish_reason="aborted")
+        return True
+
     def _length_routing_candidates(
         self,
         *,
@@ -1092,6 +1219,11 @@ class RequestRouter:
                 if self.pending_requests:
                     request_counter += 1
                     request = self.pending_requests.popleft()
+                    if request.finished:
+                        # The user connection went away (or a crash protocol
+                        # finished it) while the request was queued here: it must
+                        # not be dispatched to an instance anymore.
+                        continue
                     if self._reject_ttft_timeout(request):
                         self.total_requests += 1
                         continue
@@ -1319,8 +1451,9 @@ class RequestRouter:
             raise
 
     async def _send_control_message(
-        self, socket, payload: bytes, label: str, timeout_s: float = 5.0
+        self, socket, payload: Optional[bytes], label: str, timeout_s: float = 5.0
     ) -> None:
+        payload = b"" if payload is None else payload
         try:
             await self._send_with_retry(socket, payload, label, timeout_s=timeout_s)
             logger.info(f"[REQUEST_ROUTER] control message sent to {label}")
@@ -1328,7 +1461,7 @@ class RequestRouter:
             logger.exception(f"[REQUEST_ROUTER] control message failed for {label}")
 
     async def terminate_instances(self) -> None:
-        payload = msgpack.packb(build_terminate_engine_message())
+        payload = msgpack.packb(build_terminate_engine_message()) or b""
 
         for local_instance_id, socket in list(self.scheduler_sockets.items()):
             await self._send_control_message(
@@ -1430,7 +1563,7 @@ class RequestRouter:
         }
 
     def _discover_prometheus_collectors(self) -> None:
-        launch_timeout = float(get_global_args().multi_inst.router.launch_timeout)
+        launch_timeout = float(_global_args().multi_inst.router.launch_timeout)
         for instance_id in range(self._n_insts):
             world_size = calculate_parallelism_sizes(
                 get_multi_inst_config(instance_id)
@@ -1453,6 +1586,10 @@ class RequestRouter:
             self.collector_addrs.get(instance_id) is not None
             for instance_id in range(self._n_insts)
         )
+
+    def _retry_prometheus_collector_discovery(self) -> bool:
+        """Whether to keep discovering collectors while some instances are offline."""
+        return False
 
     def _start_prometheus_manager(self):
         if not self._collector_targets_ready():
@@ -1519,6 +1656,7 @@ async def start_request_router():
     logger.info("Creating new Request Router instance...")
 
     args = get_global_args()
+    assert args is not None, "global args are not initialised"
     multi_inst = args.multi_inst
 
     if is_classic_pd_disagg():

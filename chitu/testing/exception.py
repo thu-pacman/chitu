@@ -153,6 +153,32 @@ def test_inject_exception_kv_wait_timeout(req_id: str) -> bool:
     return False
 
 
+def test_inject_exception_kv_transfer_slow(req_id: str = "") -> None:
+    """Inject a deliberately slow KV transfer.
+
+    Location: `transfer_worker` (kv_transfer/prefill.py), before the RDMA runs.
+    Purpose: the KV send of one request is milliseconds long on a compressed-KV
+    model (MLA), which is far below any cadence an outside observer can poll, so
+    the client-disconnect case cannot otherwise interrupt a request whose blocks
+    are demonstrably on the wire. While active this sleeps for
+    ``CHITU_TEST_KV_TRANSFER_SLOW_S`` seconds (default 3) on *every* transfer, so
+    the window is wide enough to be observed in /dp/debug; the abort then lands
+    while the send is still pending, which is exactly the ordering under test (the
+    send finishes for a request the Decode side has already dropped).
+    """
+    if not _active("kv_transfer_slow"):
+        return
+    import os
+
+    delay_s = float(os.getenv("CHITU_TEST_KV_TRANSFER_SLOW_S", "3.0"))
+    logger.warning(
+        "[TEST_INJECT][kv_transfer_slow] holding the KV send of req_id=%s for %.1fs",
+        req_id,
+        delay_s,
+    )
+    time.sleep(delay_s)
+
+
 def test_inject_exception_delayed_crash(role: str) -> None:
     """Inject a delayed process crash (unified crash protocol).
 

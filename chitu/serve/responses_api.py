@@ -40,6 +40,10 @@ if not DOC_GENERATION:
         submit_request,
     )
     from chitu.sampling.utils import validate_response_format_grammar
+    from chitu.serve.abort import (
+        run_with_client_abort,
+        stream_with_client_abort,
+    )
 
 logger = getLogger(__name__)
 
@@ -1130,6 +1134,7 @@ async def handle_responses_request(
     *,
     request: ResponsesCreateRequest,
     priority: int,
+    http_request: Optional[Any] = None,
 ):
     created_at = int(time.time())
     try:
@@ -1229,18 +1234,26 @@ async def handle_responses_request(
 
     if request.stream:
         return StreamingResponse(
-            responses_stream_from_async_stream(
-                created_at=created_at,
-                user_req=user_req,
-                request=request,
-                response_model=response_model,
-                public_tools=public_tools,
-                public_tool_choice=public_tool_choice,
+            stream_with_client_abort(
+                http_request,
+                user_req.request_id,
+                responses_stream_from_async_stream(
+                    created_at=created_at,
+                    user_req=user_req,
+                    request=request,
+                    response_model=response_model,
+                    public_tools=public_tools,
+                    public_tool_choice=public_tool_choice,
+                ),
             ),
             media_type="text/event-stream",
         )
 
-    output_text, output_items = await collect_response_output(req=user_req)
+    output_text, output_items = await run_with_client_abort(
+        http_request,
+        user_req.request_id,
+        collect_response_output(req=user_req),
+    )
     return JSONResponse(
         build_responses_response(
             created_at=created_at,

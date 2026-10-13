@@ -521,6 +521,67 @@ bash script/srun_pd_disagg_base_apptainer.sh \
 bash script/start_pd_disagg_1p2d_local.sh <MODEL_CONFIG> <MODEL_CKPT_DIR>
 ```
 
+#### 单独启动 Router 与实例
+
+默认由同一个启动脚本一次性拉起 Router 和全部 P/D 实例。若希望 Router 先独立运行，
+之后再按需逐个启动（或重启）每个实例，可以把 Router 和实例拆成各自的命令。
+
+**第 1 步：只启动 Router**
+
+Router 就是 `multi_inst.router.is_router=True` 的那个进程，单独启动它即可
+（`script/srun_pd_disagg_base_apptainer.sh` 也是这么做的）：
+
+```bash
+<chitu 启动命令> \
+  multi_inst.inst_id=null multi_inst.router.is_router=True \
+  coordinator.host=<Router_IP> coordinator.port=21001 \
+  multi_inst.n_insts=3 \
+  multi_inst.fail_fast=False \
+  multi_inst.inst_overrides={} \
+  +multi_inst.inst_overrides.0.multi_inst.role=prefill \
+  +multi_inst.inst_overrides.0.infer.tp_size=8 \
+  +multi_inst.inst_overrides.1.multi_inst.role=decode \
+  +multi_inst.inst_overrides.1.infer.tp_size=8 \
+  +multi_inst.inst_overrides.2.multi_inst.role=decode \
+  +multi_inst.inst_overrides.2.infer.tp_size=8
+```
+
+关键是 `multi_inst.fail_fast=False`：Router 不等所有实例都在线，只连接当前已经在线的
+实例，尚未启动的实例在注册后再接入，不会因为没有实例在线而退出。此时到达的请求先进入
+Router 的等待队列，等一个 Prefill 和一个 Decode 实例上线后自动开始处理，而不是直接失败。
+
+**第 2 步：逐个启动实例**
+
+```bash
+# Prefill 实例 0
+<chitu 启动命令> boot.restart_instance_id=0 \
+  coordinator.host=<Router_IP> coordinator.port=21001 \
+  multi_inst.n_insts=3 multi_inst.inst_overrides={} \
+  +multi_inst.inst_overrides.0.multi_inst.role=prefill \
+  +multi_inst.inst_overrides.0.infer.tp_size=8
+
+# Decode 实例 2
+<chitu 启动命令> boot.restart_instance_id=2 \
+  coordinator.host=<Router_IP> coordinator.port=21001 \
+  multi_inst.n_insts=3 multi_inst.inst_overrides={} \
+  +multi_inst.inst_overrides.2.multi_inst.role=decode \
+  +multi_inst.inst_overrides.2.infer.tp_size=8
+```
+
+实例 ID 必须是 Router 配置中 `multi_inst.inst_overrides` 已经声明的编号；实例通过
+`coordinator.host` / `coordinator.port` 发现 Router 的统计端口和对端实例的 KV endpoint，
+因此这两个字段必须与 Router 保持一致。
+
+需要注意：
+
+- 各实例的 `multi_inst.inst_overrides` 必须与 Router 一致，否则两边的角色和并行度对不上。
+- 实例启动时会等待对端实例的 KV endpoint 和 cache geometry，等待上限为
+  `multi_inst.router.launch_timeout`（默认 3600 秒），请在该时间窗口内启动全部实例。
+- Router 启动时若仍有实例未上线，Prometheus collector 的发现会每 10 秒重试，直到所有已
+  声明的实例都上报后才启动 Prometheus/Grafana。
+- `multi_inst.fail_fast=False` 下单个实例退出不会连带停掉 Router，Router 继续服务其余在线
+  实例，等该实例重新启动后自动接入。
+
 ### 请求测试
 
 ```bash

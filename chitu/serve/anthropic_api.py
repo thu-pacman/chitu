@@ -33,6 +33,10 @@ if not DOC_GENERATION:
         build_chat_template_kwargs,
         submit_request,
     )
+    from chitu.serve.abort import (
+        run_with_client_abort,
+        stream_with_client_abort,
+    )
 
 logger = getLogger(__name__)
 
@@ -799,7 +803,12 @@ async def anthropic_completion_stream_from_async_stream(
     )
 
 
-async def handle_messages_request(*, request: AnthropicMessagesRequest, priority: int):
+async def handle_messages_request(
+    *,
+    request: AnthropicMessagesRequest,
+    priority: int,
+    http_request: Optional[Any] = None,
+):
     try:
         tools = normalize_anthropic_tools(request.tools)
         tool_config = map_anthropic_tool_choice(request.tool_choice)
@@ -867,14 +876,20 @@ async def handle_messages_request(*, request: AnthropicMessagesRequest, priority
     await submit_request(user_req)
     if request.stream:
         return StreamingResponse(
-            anthropic_stream_from_async_stream(
-                user_req=user_req, response_model=response_model
+            stream_with_client_abort(
+                http_request,
+                user_req.request_id,
+                anthropic_stream_from_async_stream(
+                    user_req=user_req, response_model=response_model
+                ),
             ),
             media_type="text/event-stream",
         )
 
-    reasoning_text, output_text = await collect_reasoning_and_text(
-        user_req.async_stream
+    reasoning_text, output_text = await run_with_client_abort(
+        http_request,
+        user_req.request_id,
+        collect_reasoning_and_text(user_req.async_stream),
     )
     output_text, stop_reason_override, stop_sequence = apply_stop_sequences_weak(
         output_text, request.stop_sequences
@@ -916,6 +931,7 @@ async def handle_completion_request(
     *,
     request: AnthropicCompletionRequest,
     priority: int,
+    http_request: Optional[Any] = None,
 ):
     try:
         response_model = resolve_requested_model_or_error(request.model)
@@ -976,14 +992,20 @@ async def handle_completion_request(
 
     if request.stream:
         return StreamingResponse(
-            anthropic_completion_stream_from_async_stream(
-                req=user_req, response_model=response_model
+            stream_with_client_abort(
+                http_request,
+                user_req.request_id,
+                anthropic_completion_stream_from_async_stream(
+                    req=user_req, response_model=response_model
+                ),
             ),
             media_type="text/event-stream",
         )
 
-    _reasoning_text, output_text = await collect_reasoning_and_text(
-        user_req.async_stream
+    _reasoning_text, output_text = await run_with_client_abort(
+        http_request,
+        user_req.request_id,
+        collect_reasoning_and_text(user_req.async_stream),
     )
     output_text, stop_reason_override, stop_sequence = apply_stop_sequences_weak(
         output_text, request.stop_sequences

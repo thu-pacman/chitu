@@ -24,6 +24,8 @@ from chitu.task import (
     UserRequest,
     TaskCollector,
     TaskStatus,
+    abort_task,
+    ABORTED_FINISH_REASON,
 )
 from chitu.global_vars import get_global_args
 from chitu.kv_cache.manager_names import MAIN_CACHE_NAME
@@ -381,8 +383,32 @@ class PDInstanceRequestManager:
         If force_stop=False, requests that do not require other instances will not be stopped.
         """
         # [Prefill/Decode Common Part] Remove request from KV Manager
-        self.kv_manager.remove_request_all_rank(request_id=request_id)
+        if self.kv_manager is not None:
+            self.kv_manager.remove_request_all_rank(request_id=request_id)
         return True
+
+    def abort_request(self, request_id: str) -> bool:
+        """Stop local processing of a request whose client disconnected.
+
+        Unlike the peer-failure paths (``pd_prefill_fail`` / ``pd_decode_fail``)
+        this must not notify the other role: the Router already failed the
+        request for the user and told both roles to stop, so an extra frame
+        would only race with that cleanup. Prefill-only / Decode-only
+        ``stop_request`` overrides do the actual task teardown.
+        """
+        if self.kv_manager is None:
+            # Unified mode owns no KV transfer state; just drop the local task.
+            return abort_task(request_id)
+
+        stopped = self.stop_request(request_id, force_stop=True, timeout=0.0)
+        task = TaskPool.pool.get(request_id)
+        req = getattr(task, "req", None)
+        if req is not None and not req.finished:
+            # Ends this instance's token stream so it stops sending tokens for a
+            # request the Router has already dropped.
+            req.finish_reason = ABORTED_FINISH_REASON
+            req.stop_stream()
+        return stopped
 
     async def process_request(self, request_data: dict[str, Any]):
         """Process incoming request"""
@@ -444,8 +470,17 @@ class PDInstanceRequestManager:
                 raise ValueError(
                     f"unexpected request type: {request_type} in {type(self).__name__}"
                 )
-        elif request_type == "interrupt":
-            await self.stop_request(request_id, force_stop=True, timeout=0.0)
+        elif request_type in ("abort_request", "interrupt"):
+            # abort_request: the user connection went away (Router-driven).
+            # "interrupt" is the legacy name for the same operation.
+            logger.info(
+                "[PD_ABORT] req_id=%s type=%s mode=%s reason=%s",
+                request_id,
+                request_type,
+                self.pd_mode.value,
+                request_data.get("reason", ""),
+            )
+            self.abort_request(request_id)
         else:
             raise ValueError(f"unexpected request type: {request_type}")
 

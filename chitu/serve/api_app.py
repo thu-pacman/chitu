@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from logging import getLogger
 from typing import Annotated, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
@@ -264,12 +264,17 @@ async def list_models():
     },
 )
 async def create_chat_completion(
+    http_request: Request,
     request: openai_api.ChatRequest,
     priority=Depends(api_guard),
 ):
     """openai chat.completions endpoint"""
 
-    return await openai_api.handle_chat_completion(request=request, priority=priority)
+    return await openai_api.handle_chat_completion(
+        request=request,
+        priority=priority,
+        http_request=http_request,
+    )
 
 
 @app.post(
@@ -292,12 +297,17 @@ async def create_chat_completion(
     },
 )
 async def create_completion(
+    http_request: Request,
     request: openai_api.CompletionsRequest,
     priority=Depends(api_guard),
 ):
     """openai text completions endpoint (raw prompt, no chat template)"""
 
-    return await openai_api.handle_completion(request=request, priority=priority)
+    return await openai_api.handle_completion(
+        request=request,
+        priority=priority,
+        http_request=http_request,
+    )
 
 
 @app.post(
@@ -313,12 +323,13 @@ async def create_completion(
     },
 )
 async def v1_messages(
+    http_request: Request,
     request: anthropic_api.AnthropicMessagesRequest,
     priority=Depends(api_guard),
 ):
     """anthropic messages endpoint"""
     return await anthropic_api.handle_messages_request(
-        request=request, priority=priority
+        request=request, priority=priority, http_request=http_request
     )
 
 
@@ -335,6 +346,7 @@ async def v1_messages(
     },
 )
 async def v1_complete(
+    http_request: Request,
     request: anthropic_api.AnthropicCompletionRequest,
     priority=Depends(api_guard),
 ):
@@ -342,6 +354,7 @@ async def v1_complete(
     return await anthropic_api.handle_completion_request(
         request=request,
         priority=priority,
+        http_request=http_request,
     )
 
 
@@ -364,6 +377,7 @@ async def v1_complete(
     },
 )
 async def v1_responses(
+    http_request: Request,
     request: responses_api.ResponsesCreateRequest,
     priority=Depends(api_guard),
 ):
@@ -371,6 +385,7 @@ async def v1_responses(
     return await responses_api.handle_responses_request(
         request=request,
         priority=priority,
+        http_request=http_request,
     )
 
 
@@ -898,6 +913,43 @@ async def get_dp_config():
         return {"dp_enabled": True, "error": f"Failed to get config: {str(e)}"}
 
 
+def _route_policy(request_router):
+    """Routing policy of a (non-PD) request router, if it exposes one.
+
+    The instance load lives on the policy (``RequestRouter.policy``, a
+    ``LoadBalancer`` / ``PrefixCacheAwarePolicy``), not on the router itself:
+    reading ``request_router.load_balancer`` reports "no load" forever, because
+    no router has that attribute. ``load_balancer`` is still honoured as a
+    fallback for callers that expose the policy under the older name.
+    """
+    policy = getattr(request_router, "policy", None)
+    if policy is None:
+        policy = getattr(request_router, "load_balancer", None)
+    return policy
+
+
+def _instance_load_snapshot(scheduler_stats) -> dict:
+    """Load of every instance, as the instance itself reported it.
+
+    Instances publish their own ``TaskPool`` counts over the stats channel
+    (``running_requests`` / ``waiting_requests``) plus the KV transfers they have
+    on the wire (``kv_send_inflight``, see ``chitu.metrics.task_stats``), so this
+    is the Router-side view of what the engines are working on. PD
+    disaggregation keeps separate Prefill and Decode instance id spaces, hence
+    one snapshot per role.
+    """
+    snapshot = {}
+    for instance_id, stats in (scheduler_stats or {}).items():
+        snapshot[str(instance_id)] = {
+            "running_requests": stats.running_requests,
+            "waiting_requests": stats.waiting_requests,
+            "kv_send_inflight": getattr(stats, "kv_send_inflight", 0),
+            "is_alive": bool(stats.is_alive),
+            "last_update_time": stats.last_update_time,
+        }
+    return snapshot
+
+
 @app.get("/dp/debug")
 async def get_dp_debug_info():
     """Debug endpoint: get DP system detailed status"""
@@ -926,6 +978,35 @@ async def get_dp_debug_info():
                 token_router = get_token_router()
                 request_router = get_request_router()
 
+                request_router_info = {
+                    "total_requests": getattr(request_router, "total_requests", 0),
+                    "pending_requests": (
+                        len(request_router.pending_requests)
+                        if hasattr(request_router, "pending_requests")
+                        else 0
+                    ),
+                }
+                if getattr(request_router, "pending_pd_requests", None) is None:
+                    policy = _route_policy(request_router)
+                    request_router_info["scheduler_stats"] = _instance_load_snapshot(
+                        getattr(policy, "scheduler_stats", {})
+                    )
+                else:
+                    # PD disaggregation: a request is bound to one Prefill/Decode
+                    # pair, and each role has its own instance id space.
+                    request_router_info["pending_pd_requests"] = len(
+                        getattr(request_router, "pending_pd_requests", {})
+                    )
+                    request_router_info["waiting_for_pd_workers"] = len(
+                        getattr(request_router, "waiting_for_pd_workers", [])
+                    )
+                    request_router_info["prefill_instances"] = _instance_load_snapshot(
+                        getattr(request_router.prefill_policy, "scheduler_stats", {})
+                    )
+                    request_router_info["decode_instances"] = _instance_load_snapshot(
+                        getattr(request_router.decode_policy, "scheduler_stats", {})
+                    )
+
                 debug_info.update(
                     {
                         "token_router": {
@@ -938,19 +1019,7 @@ async def get_dp_debug_info():
                                 token_router, "total_tokens_received", 0
                             ),
                         },
-                        "request_router": {
-                            "total_requests": getattr(
-                                request_router, "total_requests", 0
-                            ),
-                            "pending_requests": (
-                                len(request_router.pending_requests)
-                                if hasattr(request_router, "pending_requests")
-                                else 0
-                            ),
-                            "scheduler_stats": getattr(
-                                request_router.load_balancer, "scheduler_stats", {}
-                            ),
-                        },
+                        "request_router": request_router_info,
                     }
                 )
             except Exception as router_error:
@@ -999,10 +1068,10 @@ async def test_dp_system():
                         "router_active_requests": active_requests,
                         "router_pending_requests": pending_requests,
                         "connected_schedulers": scheduler_count,
-                        "load_balancer_stats": (
-                            dict(request_router.load_balancer.scheduler_stats)
-                            if hasattr(request_router, "load_balancer")
-                            else {}
+                        "load_balancer_stats": dict(
+                            getattr(
+                                _route_policy(request_router), "scheduler_stats", {}
+                            )
                         ),
                     }
                 )

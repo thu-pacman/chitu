@@ -45,6 +45,7 @@ from chitu.task import (
     TaskCollector,
     DPTaskCollector,
     TaskStatus,
+    abort_task,
 )
 from chitu.utils import (
     gen_req_id,
@@ -78,6 +79,7 @@ from chitu.dp_request_router import (
     is_terminate_engine_message,
     is_profile_message,
     is_flush_cache_message,
+    is_abort_request_message,
 )
 from chitu.kv_cache.manager_names import MAIN_CACHE_NAME
 from chitu.kv_cache.utils import (
@@ -206,7 +208,8 @@ def _direct_warmup_target_lens(
         curr_bs = min(curr_bs, local_max_bs)
         for req_idx in range(curr_bs):
             target_lens[req_idx] += mtp_size
-    return target_lens
+    # The final MTP draft writes beyond the length reached by main-model decode.
+    return [length + max(0, mtp_size - 1) for length in target_lens]
 
 
 def _cache_consumes_direct_warmup_new_cache_ids(cache) -> bool:
@@ -1956,6 +1959,9 @@ async def start_enhanced_scheduler_service(rank: int, multi_inst, args):
                         "throughput_tokens_per_sec": throughput,
                         "last_update_time": current_time,
                         "heartbeat": True,
+                        # A non-PD instance sends no KV to a peer; the field keeps
+                        # the heartbeat shape identical to the PD one.
+                        "kv_send_inflight": 0,
                     }
 
                     # num_blocks, block_size, evicted_blk_hashes这3个参数有变动时才传输
@@ -2070,6 +2076,24 @@ async def process_scheduler_request(rank: int, request_data: dict):
                 logger.info("flush_cache applied: %s", result)
             except Exception as e:
                 logger.exception(f"flush_cache failed: {e}")
+            return
+
+        if is_abort_request_message(request_data):
+            # The user connection went away: stop this request instead of
+            # running it to completion for nobody. Regular (non-PD) instances run
+            # the plain engine-side abort; PD instances never reach here (their
+            # scheduler service handles the message in pd_scheduler).
+            request_id = request_data.get("request_id")
+            if request_id:
+                found = abort_task(request_id)
+                logger.info(
+                    "abort_request received: req_id=%s reason=%s stopped=%s",
+                    request_id,
+                    request_data.get("reason", ""),
+                    found,
+                )
+            else:
+                logger.warning("abort_request received without request_id")
             return
 
         if is_profile_message(request_data):

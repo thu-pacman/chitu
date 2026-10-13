@@ -23,6 +23,7 @@ from chitu.dp_request_router import (
     PrefixCacheAwarePolicy,
     RequestRouter,
     SchedulerStats,
+    build_abort_request_message,
     build_terminate_engine_message,
     build_flush_cache_message,
 )
@@ -48,7 +49,7 @@ from chitu.global_vars import (
     get_multi_inst_config,
     get_multi_inst_ids_by_role,
 )
-from chitu.distributed.coordinator import set_endpoint, get_endpoint
+from chitu.distributed.coordinator import set_endpoint, get_endpoint, find_endpoint
 from chitu.boot.arg_utils import calculate_parallelism_sizes
 from chitu.boot.tcp_ip import get_local_ip
 from chitu.serve.crash import (
@@ -115,6 +116,10 @@ class PDRequestRouter(RequestRouter):
     ):
         super().__init__(config)
         self.pd_config = pd_config
+        # With fail_fast=False the Router does not stop for an instance that is
+        # missing or has gone away. This is what lets a Router started without
+        # any instance be used together with the instances started one by one
+        # through `boot.restart_instance_id`.
         self.fail_fast = fail_fast
 
         logger.info("using classic pd disaggregation")
@@ -223,6 +228,9 @@ class PDRequestRouter(RequestRouter):
         The request endpoint (ip/port) of each scheduler is discovered from the
         coordinator in `_init_pd_sockets`; only the per-scheduler parameters are
         read here.
+
+        `status` is `online` while connected, `offline` after the scheduler
+        disappears, and `pending` before its first connection.
         """
         for i, inst_id in enumerate(get_multi_inst_ids_by_role("prefill")):
             self.prefill_schedulers[i] = {
@@ -302,59 +310,18 @@ class PDRequestRouter(RequestRouter):
         the role `prefill_instance_<id>` / `decode_instance_<id>`. Schedulers
         need to initialize their model first, so wait up to `launch_timeout`
         seconds for each endpoint to be registered.
+
+        The statistics endpoint is published before that wait, so that a
+        scheduler that is already online can report its statistics while the
+        Router is still waiting for the other schedulers.
+
+        With `multi_inst.fail_fast=False`, an endpoint that is not registered
+        yet is not waited for at all: the slot is parked as `pending` instead of
+        stopping the Router, and the statistics collector connects it once it
+        registers.
         """
-        launch_timeout = float(get_global_args().multi_inst.router.launch_timeout)
-
-        # Create sockets to Prefill Schedulers
-        for local_instance_id, info in self.prefill_schedulers.items():
-            ip, port = get_endpoint(
-                f"prefill_instance_{local_instance_id}",
-                "request_port",
-                timeout=launch_timeout,
-            )
-            info["host"] = ip
-            info["port"] = port
-            info["address"] = f"tcp://{ip}:{port}"
-            if self.pd_coordination_service:
-                await self.pd_coordination_service.register_scheduler(
-                    local_instance_id, SchedulerType.PREFILL, ip, port
-                )
-            socket = self.context.socket(zmq.PUSH)
-            # Fail immdediately if peer not connected to avoid silent drops.
-            socket.setsockopt(zmq.LINGER, 0)
-            socket.setsockopt(zmq.IMMEDIATE, 1)
-            socket.connect(info["address"])
-            self.prefill_sockets[local_instance_id] = socket
-            logger.info(
-                f"connected to prefill instance {local_instance_id}: {info['address']}"
-            )
-
-        self._init_prefill_policy_shadow_caches()
-
-        # Create sockets to Decode Schedulers
-        for local_instance_id, info in self.decode_schedulers.items():
-            ip, port = get_endpoint(
-                f"decode_instance_{local_instance_id}",
-                "request_port",
-                timeout=launch_timeout,
-            )
-            info["host"] = ip
-            info["port"] = port
-            info["address"] = f"tcp://{ip}:{port}"
-            if self.pd_coordination_service:
-                await self.pd_coordination_service.register_scheduler(
-                    local_instance_id, SchedulerType.DECODE, ip, port
-                )
-            socket = self.context.socket(zmq.PUSH)
-            socket.setsockopt(zmq.LINGER, 0)
-            socket.setsockopt(zmq.IMMEDIATE, 1)
-            socket.connect(info["address"])
-            self.decode_sockets[local_instance_id] = socket
-            logger.info(
-                f"connected to decode instance {local_instance_id}: {info['address']}"
-            )
-
-        # Create statistics collection socket
+        # Publish the statistics socket before the schedulers, so they can report
+        # their statistics while the Router is still connecting the others.
         if not self.stats_socket:
             self.stats_socket = self.context.socket(zmq.PULL)
             # Bind the TCP server to a random port on the non-wildcard ip, then
@@ -364,10 +331,38 @@ class PDRequestRouter(RequestRouter):
             set_endpoint("router", "stats_port", stats_ip, stats_port)
             logger.info(f"listening for stats: tcp://{stats_ip}:{stats_port}")
 
-    async def _refresh_scheduler_socket(
-        self, role: str, local_instance_id: int
-    ) -> None:
-        """Reconnect a recovered worker when it publishes a new request endpoint."""
+        # Create sockets to Prefill Schedulers
+        for local_instance_id in self.prefill_schedulers:
+            await self._connect_scheduler("prefill", local_instance_id)
+
+        self._init_prefill_policy_shadow_caches()
+
+        # Create sockets to Decode Schedulers
+        for local_instance_id in self.decode_schedulers:
+            await self._connect_scheduler("decode", local_instance_id)
+
+    async def _connect_scheduler(
+        self,
+        role: str,
+        local_instance_id: int,
+        *,
+        new_generation: bool = False,
+    ) -> bool:
+        """Discover one scheduler's request endpoint and connect to it.
+
+        With `multi_inst.fail_fast=True` this waits up to `launch_timeout` for
+        the endpoint to be registered and raises when it never appears. With
+        False, an endpoint that is not registered yet parks the slot as
+        `pending` instead of waiting, so that the Router serves the schedulers
+        that are online; the statistics collector connects this slot once the
+        scheduler registers.
+
+        `new_generation` declares the slot as a new incarnation of a scheduler
+        that has been online before, so that the peers refresh the metadata they
+        hold for the previous one.
+
+        Returns whether the scheduler is connected now.
+        """
         if role == "prefill":
             schedulers = self.prefill_schedulers
             sockets = self.prefill_sockets
@@ -377,14 +372,35 @@ class PDRequestRouter(RequestRouter):
             sockets = self.decode_sockets
             scheduler_type = SchedulerType.DECODE
 
+        host_role = f"{role}_instance_{local_instance_id}"
+        if self.fail_fast:
+            ip, port = get_endpoint(
+                host_role,
+                "request_port",
+                timeout=float(self.config.launch_timeout),
+            )
+        else:
+            endpoint = find_endpoint(host_role, "request_port")
+            if endpoint is None:
+                # Not online yet: park the slot instead of waiting for it.
+                logger.warning(
+                    "[PD_ROUTER][worker_pending] role=%s sid=%s: request endpoint is "
+                    "not registered yet, waiting for the instance to come online",
+                    role,
+                    local_instance_id,
+                )
+                self._park_scheduler(role, local_instance_id)
+                return False
+            ip, port = endpoint
+
         info = schedulers[local_instance_id]
-        ip, port = get_endpoint(f"{role}_instance_{local_instance_id}", "request_port")
         address = f"tcp://{ip}:{port}"
         if info.get("address") != address:
             previous_socket = sockets.pop(local_instance_id, None)
             if previous_socket is not None:
                 previous_socket.close(linger=0)
             socket = self.context.socket(zmq.PUSH)
+            # Fail immediately if peer not connected to avoid silent drops.
             socket.setsockopt(zmq.LINGER, 0)
             socket.setsockopt(zmq.IMMEDIATE, 1)
             socket.connect(address)
@@ -392,17 +408,43 @@ class PDRequestRouter(RequestRouter):
             info.update(host=ip, port=port, address=address)
 
         info["status"] = "online"
-        info["generation"] += 1
-        await self.pd_coordination_service.register_scheduler(
-            local_instance_id, scheduler_type, ip, port
-        )
+        if new_generation:
+            info["generation"] += 1
+        if self.pd_coordination_service:
+            await self.pd_coordination_service.register_scheduler(
+                local_instance_id, scheduler_type, ip, port
+            )
+        event = "worker_recovered" if new_generation else "worker_connected"
         logger.info(
-            "[PD_ROUTER][worker_recovered] role=%s sid=%s generation=%s " "address=%s",
+            "[PD_ROUTER][%s] role=%s sid=%s generation=%s address=%s",
+            event,
             role,
             local_instance_id,
             info["generation"],
             address,
         )
+        return True
+
+    def _park_scheduler(self, role: str, local_instance_id: int) -> None:
+        """Park a scheduler whose request endpoint is not registered yet.
+
+        Leaving it out of the online state makes the statistics collector treat
+        its first statistics frame as a connection, and leaving it out of the
+        routing policy's live set keeps requests in the waiting queue meanwhile.
+        """
+        if role == "prefill":
+            schedulers = self.prefill_schedulers
+            policy = self.prefill_policy
+        else:
+            schedulers = self.decode_schedulers
+            policy = self.decode_policy
+
+        info = schedulers[local_instance_id]
+        info["status"] = "pending"
+        info.pop("instance_uuid", None)
+        stats = policy.scheduler_stats.get(local_instance_id)
+        if stats is not None:
+            stats.is_alive = False
 
     def _init_prefill_policy_shadow_caches(self) -> None:
         """Mirror RequestRouter._init_sockets prefix-cache bookkeeping for each P/D slot."""
@@ -464,7 +506,9 @@ class PDRequestRouter(RequestRouter):
             return True
 
         policies = (self.prefill_policy, self.decode_policy)
-        if all(
+        # With fail_fast=False the declared instances may be (re)started
+        # separately, so having none of them online must not stop the Router.
+        if self.fail_fast and all(
             not stats.is_alive
             for policy in policies
             for stats in policy.scheduler_stats.values()
@@ -808,7 +852,14 @@ class PDRequestRouter(RequestRouter):
                         and instance_uuid != previous_instance_uuid
                     )
                     if recovered:
-                        await self._refresh_scheduler_socket(role, local_instance_id)
+                        # A scheduler parked as `pending` was never connected, so
+                        # the peers have not seen a previous incarnation and the
+                        # transfer plans they hold for it are still valid.
+                        await self._connect_scheduler(
+                            role,
+                            local_instance_id,
+                            new_generation=scheduler["status"] != "pending",
+                        )
                         scheduler["instance_uuid"] = instance_uuid
 
                     worker_is_alive = is_alive and scheduler["status"] == "online"
@@ -827,6 +878,10 @@ class PDRequestRouter(RequestRouter):
                         last_heartbeat_time=time.time(),
                         is_alive=worker_is_alive,
                         max_seq_len=stats_dict.get("max_seq_len", None),
+                        # PD instances report their KV sends on the wire; this is
+                        # the only window /dp/debug cannot otherwise see (the RDMA
+                        # is asynchronous). See chitu.metrics.task_stats.
+                        kv_send_inflight=stats_dict.get("kv_send_inflight", 0),
                         num_blocks=stats_dict.get("num_blocks", None),
                         block_size=stats_dict.get("block_size", None),
                         evicted_blk_hashes=evicted_blk_hashes,
@@ -1053,6 +1108,75 @@ class PDRequestRouter(RequestRouter):
                 request_id, include_generated_tokens=True
             )
 
+    @override
+    def _find_inflight_request(self, request_id: str) -> Optional[UserRequest]:
+        # PD keeps its own registries until a request is dispatched: the P/D
+        # pairing exists before dispatch, and not-yet-bound requests wait in
+        # waiting_for_pd_workers.
+        pd_request = self.pending_pd_requests.get(request_id)
+        if pd_request is not None:
+            return pd_request.original_request
+        for request in self.waiting_for_pd_workers:
+            if request.request_id == request_id:
+                return request
+        return super()._find_inflight_request(request_id)
+
+    @override
+    async def abort_request(
+        self, request_id: str, reason: str = "client disconnected"
+    ) -> bool:
+        """Abort a PD request on both halves of its P/D pair.
+
+        A PD request runs on two instances at once, so telling only one of them
+        leaves the other working (Prefill keeps writing KV, Decode keeps
+        decoding). The pair is recorded before dispatch, so it is known for
+        every request that already left ``waiting_for_pd_workers``.
+        """
+        if not request_id:
+            return False
+
+        pd_request = self.pending_pd_requests.get(request_id)
+        if pd_request is None:
+            logger.info(
+                "[CLIENT_ABORT][pd] req_id=%s is not bound to a P/D pair "
+                "(reason=%s); nothing to stop engine-side",
+                request_id,
+                reason,
+            )
+        else:
+            prefill_sid = pd_request.prefill_scheduler_id
+            decode_sid = pd_request.decode_scheduler_id
+            logger.info(
+                "[CLIENT_ABORT][pd] req_id=%s aborting prefill=%s decode=%s "
+                "(reason=%s)",
+                request_id,
+                prefill_sid,
+                decode_sid,
+                reason,
+            )
+            payload = msgpack.packb(build_abort_request_message(request_id, reason))
+            for role, sid, sockets in (
+                ("prefill", prefill_sid, self.prefill_sockets),
+                ("decode", decode_sid, self.decode_sockets),
+            ):
+                socket = sockets.get(sid)
+                if socket is None:
+                    logger.warning(
+                        "[CLIENT_ABORT][pd] %s instance %s has no socket; "
+                        "engine-side stop skipped",
+                        role,
+                        sid,
+                    )
+                    continue
+                await self._send_control_message(socket, payload, f"{role}:{sid}")
+
+        # Finalize the Router-side request so the HTTP handler stops streaming
+        # and the P/D pairing state is released.
+        request = self._find_inflight_request(request_id)
+        if request is not None and not request.finished:
+            self.finish_request_before_recv_stop(request, finish_reason="aborted")
+        return True
+
     async def add_request(self, request: UserRequest):
         """Add request to router"""
         self._ensure_ttft_deadline(request)
@@ -1174,7 +1298,6 @@ class PDRequestRouter(RequestRouter):
         return True
 
     def _discover_prometheus_collectors(self) -> None:
-        launch_timeout = float(get_global_args().multi_inst.router.launch_timeout)
         all_scheduler_ids = get_multi_inst_ids_by_role(
             "prefill"
         ) + get_multi_inst_ids_by_role("decode")
@@ -1184,13 +1307,37 @@ class PDRequestRouter(RequestRouter):
             ).world_size
             addrs = []
             for rank in range(world_size):
-                ip, port = get_endpoint(
-                    f"instance_{instance_id}_rank_{rank}",
-                    "prometheus_collector_port",
-                    timeout=launch_timeout,
-                )
-                addrs.append(f"{ip}:{port}")
-            self.collector_addrs[instance_id] = addrs
+                endpoint = self._prometheus_collector_endpoint(instance_id, rank)
+                if endpoint is None:
+                    # The instance is not online yet, so it has no collector to
+                    # scrape. Keep the targets that are known and skip this
+                    # instance instead of failing the whole metrics task.
+                    addrs = []
+                    break
+                addrs.append(f"{endpoint[0]}:{endpoint[1]}")
+            if addrs:
+                self.collector_addrs[instance_id] = addrs
+
+    def _prometheus_collector_endpoint(
+        self, instance_id: int, rank: int
+    ) -> Optional[tuple[str, int]]:
+        """Find one instance rank's Prometheus collector endpoint, if it is online."""
+        host_role = f"instance_{instance_id}_rank_{rank}"
+        if self.fail_fast:
+            return get_endpoint(
+                host_role,
+                "prometheus_collector_port",
+                timeout=float(self.config.launch_timeout),
+            )
+        # The instance may still be starting up; return nothing for it now and
+        # pick its collectors up when this discovery is retried.
+        return find_endpoint(host_role, "prometheus_collector_port")
+
+    @override
+    def _retry_prometheus_collector_discovery(self) -> bool:
+        # Instances may be started one by one after the Router, so keep watching
+        # for the collectors of the ones that are not online yet.
+        return not self.fail_fast
 
     def _collector_targets_ready(self) -> bool:
         router_addrs = self.collector_addrs.get("router")
@@ -1218,6 +1365,11 @@ class PDRequestRouter(RequestRouter):
                     pd_request = self.pending_requests.popleft()
 
                     if isinstance(pd_request, PendingPDRequest):
+                        if pd_request.original_request.finished:
+                            # The user connection went away while this request
+                            # was queued for dispatch: do not (re)dispatch it.
+                            pd_request.status = PDRequestStatus.FAILED
+                            continue
                         if pd_request.status == PDRequestStatus.FAILED:
                             # Terminated by a dead-instance handler while still
                             # queued in the dispatch deque; skip re-dispatch to
@@ -1239,6 +1391,10 @@ class PDRequestRouter(RequestRouter):
 
                 elif self.waiting_for_pd_workers:
                     request = self.waiting_for_pd_workers.popleft()
+                    if request.finished:
+                        # Already aborted by a client disconnect: drop it instead
+                        # of binding it to a P/D pair.
+                        continue
                     if self._reject_ttft_timeout(
                         request, "ttft_pd_router_wait_worker"
                     ) or self._reject_overlong_request(request):
@@ -1547,7 +1703,11 @@ class PDRequestRouter(RequestRouter):
     # ------------------------------------------------------------------
 
     async def _wait_for_pd_instances(self, poll_interval_s: float = 0.5):
-        """Block until all configured P/D instances have sent at least one stats update."""
+        """Block until all configured P/D instances have sent at least one stats update.
+
+        With `multi_inst.fail_fast=False` the Router keeps serving the instances
+        it has instead of stopping when some of them are still missing.
+        """
         expected_prefill = set(self.prefill_schedulers.keys())
         expected_decode = set(self.decode_schedulers.keys())
         expected = {("prefill", pid) for pid in expected_prefill} | {
@@ -1575,6 +1735,14 @@ class PDRequestRouter(RequestRouter):
 
             if time.time() - started > launch_timeout:
                 missing = expected - connected
+                if not self.fail_fast:
+                    logger.warning(
+                        f"[PD_LAUNCH][PARTIAL] {len(missing)}/{len(expected)} instances "
+                        f"still missing after {launch_timeout:.1f}s: {sorted(missing)}. "
+                        "Continuing with the instances that are online "
+                        "(multi_inst.fail_fast=False)."
+                    )
+                    break
                 logger.error(
                     f"[PD_LAUNCH][TIMEOUT] {len(missing)}/{len(expected)} instances "
                     f"missing after {launch_timeout:.1f}s: {sorted(missing)}"
