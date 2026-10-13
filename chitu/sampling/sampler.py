@@ -6,11 +6,21 @@ import logging
 from typing import Optional
 from dataclasses import dataclass, field, replace
 import torch
-from xgrammar import (
-    allocate_token_bitmask,
-    GrammarMatcher,
-    BatchGrammarMatcher,
-)
+
+try:
+    from xgrammar import (
+        allocate_token_bitmask,
+        GrammarMatcher,
+        BatchGrammarMatcher,
+    )
+except ImportError:
+    # Grammar-constrained (guided) decoding is optional. The installed xgrammar may be
+    # older than chitu expects (e.g. lacks BatchGrammarMatcher). Disable it gracefully;
+    # normal (unconstrained) sampling does not require xgrammar.
+    allocate_token_bitmask = None
+    GrammarMatcher = None
+    BatchGrammarMatcher = None
+
 from chitu.global_vars import get_global_args, is_pd_prefill_only
 from chitu.task import Task, SampleParams, PackedTasks, PackedTasksResult, TaskType
 from chitu.ops.sampling import (
@@ -93,7 +103,7 @@ class TaskSampleState:
     enable_frequency_penalty: bool
     token_blocks: list[torch.Tensor] | None = None
     output_len: int = 0
-    matcher: GrammarMatcher | None = None
+    matcher: "GrammarMatcher | None" = None
     # Sparse proposal p' (probs, token_ids), shape (mtp_size-1, k) per task:
     # stored at the task's OWN top-k width -- the proposal a draft step returns
     # is `Sampler.max_top_k_samples` wide -- so a task is not pinned to the width of
@@ -123,6 +133,11 @@ class TaskSampleState:
         )
 
         if task.grammar:
+            if GrammarMatcher is None:
+                raise RuntimeError(
+                    "Grammar-constrained decoding requested but the installed xgrammar "
+                    "does not provide GrammarMatcher/BatchGrammarMatcher; install a newer xgrammar."
+                )
             matcher = GrammarMatcher(task.grammar)
             for i, token in enumerate(tokens):
                 if matcher.is_terminated():
@@ -209,9 +224,12 @@ class Sampler:
         )
 
         self.states: dict[str, TaskSampleState] = {}
+
         # The rows of the step whose draft has run but whose verify has not.
         self._draft_batch: DraftBatch | None = None
-        self.batch_matcher = BatchGrammarMatcher()
+        self.batch_matcher = (
+            BatchGrammarMatcher() if BatchGrammarMatcher is not None else None
+        )
 
         # Draft proposal params (per-request), set by `prepare_draft_sample_params`
         # before each draft loop. The model reads them via `sample_draft_tokens`
