@@ -5,11 +5,33 @@
 from typing import Optional
 import itertools
 import functools
+import os
 import torch
 
 from chitu.static_tensor import StaticTensor
 from chitu.cuda_graph import cuda_graph_safe_cached_property
 from chitu.utils import invalidate_cached_property, create_tensor
+from chitu.device_type import is_enflame
+
+# Classic decode (B=1-style decoding) has constant delta sequence IDs equal to
+# arange(batch_size). Building them once per step avoids re-emitting an arange
+# per access (which, under CUDA Graph, becomes a per-layer replay node).
+_CLASSIC_DECODE_SEQ_IDS_CACHE = (
+    os.environ.get("CHITU_CLASSIC_DECODE_SEQ_IDS_CACHE", "1") != "0"
+)
+
+
+def _searchsorted_right_i32(sorted_1d, total_len, device):
+    """Equivalent to torch.searchsorted(sorted_1d, arange(total_len), right=True), int32.
+    On Enflame GCU torch.searchsorted hangs (and a CPU fallback is forced back onto the
+    device by the torch_gcu shim), so compute it GCU-natively as a broadcast compare + sum:
+    the right-insertion index of a position equals the count of cumulative-length entries
+    that are <= that position."""
+    positions = torch.arange(total_len, device=device, dtype=torch.int32)
+    if is_enflame():
+        cumlens = sorted_1d.to(positions.dtype).reshape(1, -1)
+        return (positions.reshape(-1, 1) >= cumlens).sum(dim=1).to(torch.int32)
+    return torch.searchsorted(sorted_1d, positions, right=True).to(torch.int32)
 
 
 class BatchedSeqLen:
@@ -600,7 +622,22 @@ class BatchedSeqLenDelta:
     @property
     def delta_seq_ids_tensor_device(self):
         if self.is_classic_decoding:
-            return torch.arange(self.batch_size, device=self.device, dtype=torch.int32)
+            if not _CLASSIC_DECODE_SEQ_IDS_CACHE:
+                return torch.arange(
+                    self.batch_size, device=self.device, dtype=torch.int32
+                )
+            # Values depend only on (device, batch_size), which are fixed for this
+            # delta's lifetime, so materialize once and reuse across all layers.
+            cache = self.__dict__.get("_classic_decode_seq_ids_cache")
+            if cache is None or cache[0] != self.batch_size:
+                cache = (
+                    self.batch_size,
+                    torch.arange(
+                        self.batch_size, device=self.device, dtype=torch.int32
+                    ),
+                )
+                self._classic_decode_seq_ids_cache = cache
+            return cache[1]
         else:
             return self._delta.seq_ids_tensor_device
 

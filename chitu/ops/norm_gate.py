@@ -2,11 +2,13 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import torch
 from typing import Optional
 import torch.nn.functional as F
 from chitu.utils import try_import_platform_dep
 from chitu.ops.utils import make_op_dispatcher
+from chitu.device_type import is_enflame
 
 triton, has_triton = try_import_platform_dep("triton")
 
@@ -55,11 +57,74 @@ def rms_norm_gate_torch(
     out: Optional[torch.tensor] = None,
 ):
     input_dtype = x.dtype
-    x = x.to(compute_dtype)
+    use_gcu_elementwise_tail = (
+        is_enflame()
+        and os.environ.get("CHITU_GCU_QWEN3_NEXT_GATED_RMS_TAIL", "0") == "1"
+        and out is None
+        and compute_dtype == torch.float32
+        and x.ndim == 2
+        and tuple(x.shape) == tuple(gate.shape) == (384, 128)
+        and x.dtype == torch.bfloat16
+        and gate.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and tuple(weight.shape) == (128,)
+        and x.device.type == "gcu"
+        and x.device == gate.device == weight.device
+        and x.is_contiguous()
+        and gate.is_contiguous()
+        and weight.is_contiguous()
+    )
+    use_gcu_dual_widen = (
+        use_gcu_elementwise_tail
+        and os.environ.get(
+            "CHITU_GCU_QWEN3_NEXT_GATED_RMS_DUAL_WIDEN", "0"
+        )
+        == "1"
+    )
+    use_gcu_widen_square = (
+        use_gcu_dual_widen
+        and os.environ.get(
+            "CHITU_GCU_QWEN3_NEXT_GATED_RMS_WIDEN_SQUARE", "0"
+        )
+        == "1"
+    )
+    use_gcu_add_rsqrt = (
+        use_gcu_widen_square
+        and os.environ.get(
+            "CHITU_GCU_QWEN3_NEXT_GATED_RMS_ADD_RSQRT", "0"
+        )
+        == "1"
+    )
+    x_square = None
+    if use_gcu_dual_widen:
+        if use_gcu_widen_square:
+            from chitu.ops.gcu_gated_rms_tail import dual_bf16_to_fp32_square
+
+            x, gate, x_square = dual_bf16_to_fp32_square(x, gate)
+        else:
+            from chitu.ops.gcu_gated_rms_tail import dual_bf16_to_fp32
+
+            x, gate = dual_bf16_to_fp32(x, gate)
+    else:
+        x = x.to(compute_dtype)
+        gate = gate.to(compute_dtype)
     # weight = weight.to(compute_dtype)
-    gate = gate.to(compute_dtype)
-    variance = x.pow(2).mean(-1, keepdim=True)
-    x = x * torch.rsqrt(variance + eps)
+    variance = (x.pow(2) if x_square is None else x_square).mean(
+        -1, keepdim=True
+    )
+    if use_gcu_add_rsqrt:
+        from chitu.ops.gcu_gated_rms_tail import add_rsqrt
+
+        inv_rms = add_rsqrt(variance, eps)
+    else:
+        inv_rms = torch.rsqrt(variance + eps)
+
+    if use_gcu_elementwise_tail:
+        from chitu.ops.gcu_gated_rms_tail import gated_rms_tail
+
+        return gated_rms_tail(x, inv_rms, weight, F.silu(gate))
+
+    x = x * inv_rms
 
     x = weight * x.to(input_dtype)
     if activation == "silu":
