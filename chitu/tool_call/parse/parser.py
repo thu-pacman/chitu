@@ -5,7 +5,7 @@
 import json
 import logging
 import re
-from typing import AsyncIterable
+from typing import AsyncIterable, AsyncIterator
 
 from .stream_parse import BufferedStream
 from .context import ParseContext, StreamParseContext, ChoiceDelta
@@ -245,15 +245,24 @@ class ArgNameParser(AbstractParser):
 
 
 class StringArgValueParser(AbstractParser):
-    def parse(self, ctx: ParseContext, string: str):
-        ctx.as_arg_value_mapped(string, self.convert)
+    def parse(self, ctx: ParseContext, string: str) -> None:
+        ctx.as_arg_value_mapped(string, self.escape)
 
-    def stream_parse(self, ctx, stream):
-        return ctx.as_arg_value_mapped(stream, self.convert)
+    def stream_parse(
+        self, ctx: StreamParseContext, stream: AsyncIterable[str]
+    ) -> AsyncIterator[ChoiceDelta]:
+        return ctx.as_arg_value_mapped(stream, self.escape)
 
     @staticmethod
-    def convert(string: str):
-        return json.dumps(string)
+    def escape(string: str) -> str:
+        """JSON-escape string content, without the surrounding quotes.
+
+        ``json.dumps`` quotes the whole value, so it cannot be applied per
+        chunk. Its content escaping is a stateless per-character map, hence
+        ``json.dumps(chunk)[1:-1]`` composes over arbitrary chunks and equals
+        ``json.dumps("".join(chunks))[1:-1]``.
+        """
+        return json.dumps(string)[1:-1]
 
 
 class JsonArgValueParser(AbstractParser):
