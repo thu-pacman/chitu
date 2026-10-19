@@ -331,11 +331,12 @@ def _dequant_dsa_fp8_kv_cache(kv_fp8: torch.Tensor) -> torch.Tensor:
     [
         (1, 4096),  # mtp=1
         (2, 4096),  # mtp=2
+        (3, 4096),  # two draft tokens plus target verification
         (4096, 4096),  # prefill
         (2048, 4096),  # chunked prefill
     ],
 )
-@pytest.mark.parametrize("n_heads", [64])
+@pytest.mark.parametrize("n_heads", [64, 32])  # DeepSeek-V3.2 / GLM-5.2
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("impl", ["deepgemm", "triton"])
 @pytest.mark.skipif(
@@ -364,7 +365,7 @@ def test_dsa_indexer_paged_kv(
     torch.set_default_dtype(torch.bfloat16)
 
     max_seq_len = 8192
-    mtp_size = s_q if s_q <= 2 else 1
+    mtp_size = s_q if s_q <= 3 else 1
     set_global_args(
         OmegaConf.create(
             {
@@ -389,7 +390,7 @@ def test_dsa_indexer_paged_kv(
         need_preprocess=False,
     )
 
-    is_decode = s_q <= 2
+    is_decode = s_q <= 3
     if is_decode:
         old_seq_len_list = [torch.randint(1, s_k - s_q, (1,)).item() for _ in range(bs)]
         new_seq_len_list = [ol + s_q for ol in old_seq_len_list]
@@ -1303,10 +1304,11 @@ def test_mla_prefill_ragged_qo_paged_kv(
     # this test is complex, not add record benchmark now
 
 
-@pytest.mark.parametrize("bs,seq_len", [(1, 40960)])
+@pytest.mark.parametrize("bs,seq_len,local_n_heads", [(1, 40960, 8), (1, 4096, 64)])
 def test_flash_mla_fp8_kvcache_dequant_bf16_prefill(
     bs,
     seq_len,
+    local_n_heads,
     record_benchmark,
 ):
     if not has_accelerator() or not has_flash_mla:
@@ -1320,7 +1322,6 @@ def test_flash_mla_fp8_kvcache_dequant_bf16_prefill(
 
     torch.set_default_dtype(torch.bfloat16)
 
-    local_n_heads = 8  # GLM-5 TP8 shape
     kv_lora_rank = 512
     qk_rope_head_dim = 64
     qk_nope_head_dim = 192

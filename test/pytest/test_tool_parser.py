@@ -448,3 +448,67 @@ def test_reasoning():
     kwargs["initial_thinking"] = True
     run_match(parser, data, False, **kwargs)
     run_match(parser, data2, True, **kwargs)
+
+
+def test_reasoning_auto():
+    """auto + thinking: the tool grammar must not be reachable from the reasoning span.
+
+    Regression guard: the grammar used to be wrapped only for
+    ``tool_choice="required"``.  With ``auto`` the raw triggered-tags format was
+    used, so the ``<tool_call>`` trigger stayed live while the model was still
+    thinking and a tool-call-looking prefix inside the reasoning span was forced
+    to become a valid tool call.
+    """
+    parser = "Qwen3ToolParser"
+    data = '<tool_call>\n{"name": "test_empty", "arguments": {}}\n</tool_call>'
+
+    # Thinking disabled: no reasoning span, behaviour unchanged.
+    run_match(parser, data, True, tool_choice="auto", thinking=False)
+
+    kwargs = dict(tool_choice="auto", thinking=True, initial_thinking=True)
+
+    # A trigger inside the reasoning span is plain text, not a tool call.
+    run_match(
+        parser,
+        "thinking about <tool_call>not a call</tool_call></think>",
+        True,
+        **kwargs,
+    )
+    # The reasoning span has to be closed before a tool call.
+    run_match(parser, "thinking" + data, False, **kwargs)
+    run_match(parser, "thinking</think>" + data, True, **kwargs)
+    # Plain answer without any tool call is still valid for auto.
+    run_match(parser, "thinking</think>the answer", True, **kwargs)
+
+    # Chat template does not open the reasoning span: the start token is required.
+    kwargs["initial_thinking"] = False
+    run_match(parser, "<think>thinking</think>" + data, True, **kwargs)
+    run_match(parser, "thinking</think>" + data, False, **kwargs)
+
+
+def test_forced_reasoning_params():
+    """``reasoning_type: forced`` ignores the client's enable_thinking flag.
+
+    GLM-5.3 cannot disable thinking; if ``forced`` fell back to
+    ``ReasoningParams(False)`` on ``enable_thinking=false``, neither the parser
+    nor the grammar would know the model is still in a reasoning span.
+    """
+    import chitu.reasoning.utils as reasoning_utils
+    from types import SimpleNamespace
+
+    old_get_args = reasoning_utils.get_global_args
+    old_get_token_ids = reasoning_utils.get_reasoning_token_id
+    try:
+        reasoning_utils.get_global_args = lambda: SimpleNamespace(
+            models=SimpleNamespace(reasoning_type="forced")
+        )
+        reasoning_utils.get_reasoning_token_id = lambda: (1, 2)
+        reasoning_utils._reasoning_params_cache.clear()
+        params = reasoning_utils.get_reasoning_params(False)
+    finally:
+        reasoning_utils.get_global_args = old_get_args
+        reasoning_utils.get_reasoning_token_id = old_get_token_ids
+        reasoning_utils._reasoning_params_cache.clear()
+
+    assert params.enable_reasoning
+    assert params.initial_state

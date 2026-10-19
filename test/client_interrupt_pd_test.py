@@ -131,7 +131,6 @@ def _router_counts(snapshot: dict) -> dict:
     token = snapshot.get("token_router") or {}
     return {
         "pd_requests": router.get("pending_pd_requests", 0),
-        "pd_waiting": router.get("waiting_for_pd_workers", 0),
         "pending": router.get("pending_requests", 0),
         "active": token.get("active_requests", 0),
     }
@@ -545,15 +544,12 @@ def _tokens_in(snapshot: dict) -> int:
 def _queue_state(snapshot: dict) -> str:
     """Where a request that just arrived sits inside the Router.
 
-    ``waiting`` is ``waiting_for_pd_workers`` (no P/D pair bound yet), ``bound`` is
-    ``pending_requests`` (the pair is chosen, but the engines have not been told
-    about the request yet). Both mean no instance has started on it, which is the
-    state ``stage-router-queued`` interrupts; ``running`` means the Router already
+    ``bound`` is ``pending_requests``: a P/D pair is chosen, but the engines have
+    not been told about the request yet. This is the state
+    ``stage-router-queued`` interrupts; ``running`` means the Router already
     dispatched it and it is too late.
     """
     counts = _router_counts(snapshot)
-    if counts["pd_waiting"] > 0:
-        return "waiting"
     if counts["pending"] > 0:
         return "bound"
     return "running"
@@ -562,30 +558,22 @@ def _queue_state(snapshot: dict) -> str:
 def _check_router_queued_interrupt(base: str, host: str, port: int, expected: dict):
     """Drop the client while its request still sits in the Router, undispatched.
 
-    A PD request passes through the Router before any instance sees it: it waits in
-    ``waiting_for_pd_workers`` for a free P/D pair and, once a pair is picked, it
-    sits in the dispatch deque until the Router sends it to both engines. The CI
-    case pins ``max_inflight_per_instance=1`` so one running request uses the pair
-    up: this phase holds that slot with request A, queues B behind it and
-    interrupts B. No instance is running B when its client leaves, so the abort has
+    An admitted PD request is bound to a P/D pair and sits in the dispatch deque
+    until the Router sends it to both engines. This phase sends request B while
+    request A is prefilling and interrupts B before dispatch.
+    No instance is running B when its client leaves, so the abort has
     to find it in the Router's own registries (``_find_inflight_request``), and the
     dispatch loop must not send it to the engines afterwards - if it did, B would
     run for nobody, and the drain assertion after dropping A would see it.
 
     The Router holds a request like that for a very short time: its dispatcher
-    binds a request to the pair on its next 10ms tick, so the state above is a few
+    dispatches the bound request on its next 10ms tick, so the state above is a few
     milliseconds wide. This phase therefore polls much faster than the rest of the
     case (``CHITU_INTERRUPT_QUEUE_POLL_S``, 5ms); at the case's 250ms cadence the
     state is simply missed, and the phase then waits for a dispatch that already
-    happened (seen in CI as "request B was never queued" with an empty
-    deployment). Which of the two Router states was interrupted is printed.
+    happened. The observed Router state is printed.
 
-    A has to be a request whose *prompt* is long: in PD the load reservation is
-    released when the first token is produced, so a long-generation request holds
-    the slot only for as long as its prefill lasts. Holding with one of those left
-    B to be dispatched straight away whenever A had already emitted a token, and
-    the queue assertion then failed with the deployment empty (both requests had
-    simply run and finished).
+    A uses a long prompt so its prefill remains active when B arrives.
     """
     label = "stage-router-queued"
     config = _debug_snapshot(base).get("dp_config") or {}
@@ -604,13 +592,10 @@ def _check_router_queued_interrupt(base: str, host: str, port: int, expected: di
     )
     queued = None
     try:
-        # A holds the slot while two things are true at once: the Router still keeps
+        # A is prefilling while two things are true at once: the Router still keeps
         # its load reservation (no token produced yet - PD releases it at the first
         # token) *and* the Prefill instance already reports it as running, which is
-        # what consumes the capacity that keeps B waiting. Waiting for only the first
-        # condition is not enough: while A is still in the incoming/prealloc stage the
-        # instance reports it as waiting, capacity looks free, and a second request is
-        # dispatched straight away (observed with tp2pp2 prefill on h20).
+        # Confirm both to observe actual prefill work rather than incoming/prealloc.
         window_at = time.monotonic()
         while True:
             snapshot = _debug_snapshot(base)
@@ -644,7 +629,7 @@ def _check_router_queued_interrupt(base: str, host: str, port: int, expected: di
         # Poll until the Router is seen holding B. B's arrival is a step of its own
         # (the Router has to receive and parse the request before it shows up in a
         # queue); if the dispatcher wins the race instead, B ends up in
-        # ``pending_pd_requests`` and in neither queue, which is a limitation of this
+        # ``pending_pd_requests`` and outside the dispatch queue, which is a limitation of this
         # phase's ordering rather than a product behaviour - reported as such.
         sent_at = time.monotonic()
         polls = 0
@@ -656,7 +641,7 @@ def _check_router_queued_interrupt(base: str, host: str, port: int, expected: di
             if where != "running":
                 break
             if (_router_counts(snapshot).get("pd_requests") or 0) > baseline_requests:
-                # B is bound and out of both queues: the engines have it already.
+                # B is bound and out of the dispatch queue: the engines have it already.
                 break
             assert time.monotonic() - sent_at < QUEUE_ARRIVAL_TIMEOUT_S, (
                 f"({label}) request B never reached the Router "
@@ -678,7 +663,7 @@ def _check_router_queued_interrupt(base: str, host: str, port: int, expected: di
 
     def b_gone() -> bool:
         counts = _router_counts(_debug_snapshot(base))
-        return not counts["pd_waiting"] and not counts["pending"]
+        return not counts["pending"]
 
     assert _wait_until(
         b_gone, DRAIN_TIMEOUT_S

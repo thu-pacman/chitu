@@ -20,6 +20,7 @@ from chitu.global_vars import (
     is_classic_pd_disagg,
     is_independent_multi_inst,
     set_global_args,
+    set_quant_variables,
 )
 from chitu.metrics.definitions import MetricContext
 from chitu.metrics.registry import metrics_runtime_context
@@ -165,6 +166,9 @@ def init_dp_router(args):
     from chitu.chitu_main import init_logger
 
     init_logger()
+    # Like workers, resolve quantization recipes before indexer validation
+    # in set_global_args; otherwise FP8 cache rules look like BF16 defaults.
+    set_quant_variables(args)
     set_global_args(args)
     args = get_global_args()  # Get the pre-processed global args
 

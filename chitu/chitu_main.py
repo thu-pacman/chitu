@@ -180,11 +180,12 @@ def _direct_warmup_target_lens(
     decode_steps: int,
     bs_descend: int,
     skip_model_decode: bool,
+    prefill_seq_len: int = 1,
 ) -> list[int]:
     """Build a list of target token lengths for direct warmup requests.
 
     Direct warmup bypasses the scheduler and drives the model directly with mock
-    requests.  Each request starts with 1 prefill token.  If decode is enabled,
+    requests.  Each request starts with ``prefill_seq_len`` tokens.  If decode is enabled,
     the warmup simulates multiple decode steps where each step advances the
     sequence by ``mtp_size`` tokens (for multi-token prediction models).
     Later decode steps use progressively smaller batch sizes when ``bs_descend``
@@ -194,9 +195,8 @@ def _direct_warmup_target_lens(
     if local_max_bs <= 0:
         return []
 
-    # _warmup_backend_direct always runs prepare_cache_prefill with one token per
-    # request, even when model.prefill itself is skipped for decode-only workers.
-    target_lens = [1 for _ in range(local_max_bs)]
+    # Decode-only workers keep the default one-token cache initialization.
+    target_lens = [int(prefill_seq_len) for _ in range(local_max_bs)]
     if skip_model_decode:
         return target_lens
 
@@ -266,6 +266,7 @@ def _build_direct_warmup_new_cache_ids_list(
     decode_steps: int,
     bs_descend: int,
     skip_model_decode: bool,
+    prefill_seq_len: int = 1,
 ) -> list[dict[str, list[int]]]:
     """Build scheduler-style cache block metadata for direct warmup.
 
@@ -281,6 +282,7 @@ def _build_direct_warmup_new_cache_ids_list(
         decode_steps,
         bs_descend,
         skip_model_decode,
+        prefill_seq_len=prefill_seq_len,
     )
     new_cache_ids_list: list[dict[str, list[int]]] = [{} for _ in range(local_max_bs)]
 
@@ -1047,6 +1049,7 @@ def _warmup_backend_direct(
     *,
     skip_model_prefill: bool = False,
     skip_model_decode: bool = False,
+    prefill_seq_len: int = 1,
 ):
     """Warm up the model backend directly, bypassing the scheduler.
 
@@ -1065,13 +1068,15 @@ def _warmup_backend_direct(
     logger.info(
         f"Starting local backend warmup (direct) with local max batch size {local_max_bs}..."
     )
+    assert prefill_seq_len >= 1
+    assert prefill_seq_len == 1 or skip_model_decode
     init_cache_static()
 
     req_ids = [f"__warmup_{i}__" for i in range(local_max_bs)]
     tokens = torch.randint(
         1,
         args.models.vocab_size,
-        size=(local_max_bs,),
+        size=(local_max_bs * prefill_seq_len,),
         device="cuda",
         dtype=torch.int64,
     )
@@ -1083,7 +1088,7 @@ def _warmup_backend_direct(
             # Match executor._recv_hiddens(): PP prefill receives CP-local
             # hidden rows, while direct warmup bypasses the real pipe receiver.
             prefill_tokens = Backend.model.cp_context.compute_pp_num_tokens(
-                local_max_bs
+                local_max_bs * prefill_seq_len
             )
             prefill_hiddens = torch.randn(
                 Backend.executor.get_payload_shape(prefill_tokens),
@@ -1103,8 +1108,9 @@ def _warmup_backend_direct(
         decode_steps,
         bs_descend,
         bool(skip_model_decode),
+        prefill_seq_len=prefill_seq_len,
     )
-    all_tasks.tokens = [[1] for _ in range(local_max_bs)]
+    all_tasks.tokens = [[1] * prefill_seq_len for _ in range(local_max_bs)]
 
     # Prefill
     for cache in Backend.cache_dict.values():
@@ -1116,8 +1122,10 @@ def _warmup_backend_direct(
     # Cache prepare is enough here, and avoids executing Prefill kernels in Decode processes.
     # MoE task_type is set on moe_impl so Decode warmup has an explicit task type.
 
-    output_token_offsets = torch.arange(
-        local_max_bs, dtype=torch.int32, device=tokens.device
+    output_token_offsets = (
+        torch.arange(1, local_max_bs + 1, dtype=torch.int32, device=tokens.device)
+        * prefill_seq_len
+        - 1
     )
     if args.infer.mtp_size > 1:
         mtp_accept_indices = torch.zeros(
@@ -1190,6 +1198,31 @@ def _warmup_backend_direct(
         cache.finalize_cache_all_decode(all_tasks)
     PrometheusMetricsCollector.update_GPU_usage()
     logger.info("Local backend warmup (direct) completed")
+
+
+def _warmup_direct_prefill_token_buckets(args):
+    """Exercise short Prefill token counts before serving real requests.
+
+    Full-chunk and batch-size warmup do not cover the token-count buckets of
+    Triton MoE autotuning (including BF16 MTP experts in mixed checkpoints).
+    These representatives cover 16/32/128/256/512 in
+    triton_fused_experts._bucket_m_for_autotune_key, also under CP8 padding.
+    """
+    limit = min(
+        args.infer.prefill_chunk_size or args.infer.max_seq_len,
+        args.infer.max_seq_len - 1,
+    )
+    for length in (8, 32, 128, 256, 512):
+        if length > limit:
+            continue
+        logger.info(f"[warmup][direct] Prefill token-count warmup: {length}")
+        _warmup_backend_direct(
+            args,
+            local_max_bs=1,
+            skip_model_prefill=False,
+            skip_model_decode=True,
+            prefill_seq_len=length,
+        )
 
 
 def warmup_engine(args):
@@ -1273,6 +1306,16 @@ def warmup_engine(args):
             decode_steps=2,
             skip_model_prefill=bool(skip_model_prefill),
             skip_model_decode=bool(skip_model_decode),
+            # A one-token request under CP does not exercise the regular Prefill
+            # kernels when small-row Decode kernels have a separate dispatch path.
+            # Cover the configured chunk before readiness and KV memory estimation.
+            # Like real prompts, leave room for the first generated token; without
+            # MTP, the RoPE table only has max_seq_len - 1 rows.
+            prefill_seq_len=(
+                min(args.infer.prefill_chunk_size, args.infer.max_seq_len - 1)
+                if full_warmup and role == "prefill" and args.infer.prefill_chunk_size
+                else 1
+            ),
         )
     else:
         assert False
@@ -1289,6 +1332,7 @@ def warmup_engine(args):
     #######################################################################################
     # If full_warmup is enabled, run for all possible batch sizes, to ensure the operators
     # are tuned, and to re-capture all CUDA graphs.
+    local_max_bs = 1
     if full_warmup:
         _log_skip_prefill()
         max_reqs_per_dp = ceil_div(args.infer.max_batch_size, args.infer.dp_size)
@@ -1310,6 +1354,9 @@ def warmup_engine(args):
             skip_model_prefill=bool(skip_model_prefill),
             skip_model_decode=bool(skip_model_decode),
         )
+
+    if full_warmup and runner == "direct" and role == "prefill":
+        _warmup_direct_prefill_token_buckets(args)
 
     _emit_observed_op_impl_summary_after_warmup()
 

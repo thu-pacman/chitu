@@ -39,9 +39,26 @@ class DeepGemmScale(NativeLayoutTensor):
         disable_ue8m0_cast: bool,
     ) -> "DeepGemmScale":
         if tensor.device.type == "meta":
+            if not disable_ue8m0_cast and torch.cuda.get_device_capability()[0] == 10:
+                # Blackwell broadcasts each 128-row block scale to every row,
+                # packs four UE8M0 exponents per int32, and stores MN-major
+                # columns aligned to 16 bytes. Meta parameters must have the
+                # same layout as the converted checkpoint before load_state_dict.
+                packed_k = (k + 511) // 512
+                aligned_mn = ((mn + 3) // 4) * 4
+                shape = (mn, packed_k)
+                stride = (1, aligned_mn)
+                if num_groups is not None:
+                    shape = (num_groups, *shape)
+                    stride = (aligned_mn * packed_k, *stride)
+                layout_tensor = torch.empty_strided(
+                    shape, stride, device="meta", dtype=torch.int32
+                )
+            else:
+                layout_tensor = torch.empty_like(tensor, dtype=torch.float32)
             return cls(
                 plain_shape=tensor.shape,
-                layout_tensor=torch.empty_like(tensor, dtype=torch.float32),
+                layout_tensor=layout_tensor,
                 mn=mn,
                 k=k,
                 num_groups=num_groups,

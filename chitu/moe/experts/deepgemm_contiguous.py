@@ -398,6 +398,7 @@ def _(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             block_shape=block_shape,
+            round_scale_to_pow2=round_scale_to_pow2,
             swiglu_limit=swiglu_limit,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,

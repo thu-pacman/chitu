@@ -46,6 +46,9 @@ class MockReq:
     def prompt_len(self) -> int:
         return len(self.prompt_tokens)
 
+    def ttft_expired(self, now):
+        return self.ttft_deadline_ts is not None and now >= self.ttft_deadline_ts
+
 
 class TestPDRequestRouter(PDRequestRouter):
     """A testing PD request router without communication"""
@@ -84,6 +87,9 @@ class TestPDRequestRouter(PDRequestRouter):
     ):
         self._test_finished_reqs.add(request.request_id)
         request.finish_reason = finish_reason
+        request.error = error
+        request.finished = True
+        self.remove_request(request.request_id)
 
     # tests
 
@@ -446,7 +452,6 @@ def _length_test_router(
             return False
 
     router = LengthTestPDRequestRouter(cfg, PDDisaggregationConfig())
-    router.pd_coordination_service = None
     return router
 
 
@@ -496,7 +501,6 @@ def test_pd_router_length_admission_respects_routing_flags():
 
         router._add_pd_request = select
         asyncio.run(router.add_request(request))
-        asyncio.run(_run_pd_router_iteration(router))
 
         if rejected:
             assert not selected_requests
@@ -508,7 +512,6 @@ def test_pd_router_length_admission_respects_routing_flags():
             assert request.finish_reason is None
             assert not router._test_finished_reqs
             assert router.total_requests == 0
-        assert not router.waiting_for_pd_workers
         assert not router.pending_pd_requests
         assert not router.pending_requests
 
@@ -542,14 +545,17 @@ def test_pd_router_length_boundary_and_queue_progress():
 
         assert router._test_finished_reqs == {oversize.request_id}
         assert router.total_requests == 1
-        assert not router.waiting_for_pd_workers
         pair = router.pending_pd_requests[valid.request_id]
         assert pair.prefill_scheduler_id == expected_sid
         assert pair.decode_scheduler_id == expected_sid
         assert dispatched_requests == [pair]
 
 
-def test_pd_router_waits_for_capable_worker_recovery():
+def test_pd_router_rejects_unavailable_capable_worker(monkeypatch):
+    monkeypatch.setattr(
+        "chitu.distributed.pd_disaggregation.pd_request_router.report_and_exit",
+        pytest.fail,
+    )
     for unavailable_role in ("prefill", "decode"):
         router = _length_test_router([4, 8], [4, 8])
         policy = (
@@ -558,24 +564,104 @@ def test_pd_router_waits_for_capable_worker_recovery():
             else router.decode_policy
         )
         policy.scheduler_stats[1].is_alive = False
-        request = MockReq("waiting", [1] * 7, 1)
+        request = MockReq("rejected", [1] * 7, 1)
 
         asyncio.run(router.add_request(request))
-        asyncio.run(_run_pd_router_iteration(router))
 
-        assert not router._test_finished_reqs
-        assert router.total_requests == 0
-        assert list(router.waiting_for_pd_workers) == [request]
+        assert router._test_finished_reqs == {request.request_id}
+        assert request.finish_reason == "error"
+        assert request.error == "No available prefill/decode workers"
+        assert router.total_requests == 1
         assert not router.pending_pd_requests
+        assert not router.pending_requests
+        assert not router.prefill_policy.router_reservations
+        assert not router.decode_policy.router_reservations
 
         policy.scheduler_stats[1].is_alive = True
         asyncio.run(_run_pd_router_iteration(router))
 
-        assert not router._test_finished_reqs
-        assert not router.waiting_for_pd_workers
-        pair = router.pending_pd_requests[request.request_id]
+        assert not router.pending_pd_requests
+        assert request.finished
+        replacement = MockReq("replacement", [1] * 7, 1)
+        asyncio.run(router.add_request(replacement))
+        pair = router.pending_pd_requests[replacement.request_id]
         assert pair.prefill_scheduler_id == 1
         assert pair.decode_scheduler_id == 1
+
+
+def test_pd_router_rejects_no_live_workers():
+    for unavailable_role in ("prefill", "decode"):
+        cfg = _pd_router_config(routing_algorithm="round_robin")
+        router = TestPDRequestRouter(cfg, PDDisaggregationConfig())
+        policy = (
+            router.prefill_policy
+            if unavailable_role == "prefill"
+            else router.decode_policy
+        )
+        for stats in policy.scheduler_stats.values():
+            stats.is_alive = False
+        request = MockReq("unavailable", [1, 2])
+
+        asyncio.run(router.add_request(request))
+
+        assert request.error == "No available prefill/decode workers"
+        assert router._test_finished_reqs == {request.request_id}
+        assert not router.pending_requests
+        assert not router.pending_pd_requests
+        assert not router.prefill_policy.router_reservations
+        assert not router.decode_policy.router_reservations
+        assert not router.pd_coordination_service.pd_pairs
+
+
+def test_pd_router_pending_pair_failure():
+    for failed_role in ("prefill", "decode"):
+        for has_alternative in (True, False):
+            router = _length_test_router([8, 8], [8, 8])
+            request = MockReq("pending", [1] * 7, 1)
+            asyncio.run(router.add_request(request))
+            original_pair = router.pending_pd_requests[request.request_id]
+            policy = (
+                router.prefill_policy
+                if failed_role == "prefill"
+                else router.decode_policy
+            )
+            failed_sid = (
+                original_pair.prefill_scheduler_id
+                if failed_role == "prefill"
+                else original_pair.decode_scheduler_id
+            )
+            policy.scheduler_stats[failed_sid].is_alive = False
+            if not has_alternative:
+                for stats in policy.scheduler_stats.values():
+                    stats.is_alive = False
+
+            handler = (
+                router.handle_dead_instance_prefill
+                if failed_role == "prefill"
+                else router.handle_dead_instance_decode
+            )
+            asyncio.run(handler(failed_sid))
+
+            if has_alternative:
+                replacement = router.pending_pd_requests[request.request_id]
+                assert replacement is not original_pair
+                assert list(router.pending_requests) == [replacement]
+                assert not router._test_finished_reqs
+                selected_sid = (
+                    replacement.prefill_scheduler_id
+                    if failed_role == "prefill"
+                    else replacement.decode_scheduler_id
+                )
+                assert selected_sid != failed_sid
+                assert request.request_id in router.pd_coordination_service.pd_pairs
+            else:
+                assert request.error == "No available prefill/decode workers"
+                assert router._test_finished_reqs == {request.request_id}
+                assert not router.pending_requests
+                assert not router.pending_pd_requests
+                assert not router.prefill_policy.router_reservations
+                assert not router.decode_policy.router_reservations
+                assert not router.pd_coordination_service.pd_pairs
 
 
 def test_pd_router_liveness_heartbeat_refreshes_online_worker():
