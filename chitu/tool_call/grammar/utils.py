@@ -139,6 +139,13 @@ def wrap_format_with_reasoning(format: Format, enable_thinking: bool) -> Format:
     model may reason freely, but once it closes the reasoning span the rest of
     the output must match *format*.  ``start_token`` is omitted when the chat
     template already opened the reasoning span (``initial_state``).
+
+    This applies to every tool choice, ``auto`` included.  *format* already
+    encodes whether a tool call is required (``TriggeredTagsFormat.at_least_one``),
+    so the wrapper only pins *ordering*: without it, the tool trigger stays live
+    inside the reasoning span and a ``<tool_call>`` emitted while the model is
+    still thinking is forced to be a syntactically valid tool call instead of
+    plain text.
     """
     reasoning_params = get_reasoning_params(enable_thinking)
     if not reasoning_params.enable_reasoning:
@@ -157,12 +164,6 @@ def wrap_format_with_reasoning(format: Format, enable_thinking: bool) -> Format:
     return SequenceFormat(
         elements=elements,
     )
-
-
-def build_reasoning_grammar(format: Format, constraint: ConstraintParams):
-    if not constraint.at_least_one:
-        return format
-    return wrap_format_with_reasoning(format, constraint.params.enable_thinking)
 
 
 _ANY_JSON_SCHEMA: dict = {}
@@ -249,7 +250,7 @@ def build_grammar(
                 )
                 return None
 
-        fmt = build_reasoning_grammar(fmt, constraint)
+        fmt = wrap_format_with_reasoning(fmt, constraint.params.enable_thinking)
         return compile_format_to_grammar(fmt)
 
     except Exception:
