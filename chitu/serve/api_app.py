@@ -995,10 +995,7 @@ async def get_dp_debug_info():
                     # PD disaggregation: a request is bound to one Prefill/Decode
                     # pair, and each role has its own instance id space.
                     request_router_info["pending_pd_requests"] = len(
-                        getattr(request_router, "pending_pd_requests", {})
-                    )
-                    request_router_info["waiting_for_pd_workers"] = len(
-                        getattr(request_router, "waiting_for_pd_workers", [])
+                        request_router.pending_pd_requests
                     )
                     request_router_info["prefill_instances"] = _instance_load_snapshot(
                         getattr(request_router.prefill_policy, "scheduler_stats", {})

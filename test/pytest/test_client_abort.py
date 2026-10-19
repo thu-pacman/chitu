@@ -473,7 +473,7 @@ def test_pd_router_abort_request_stops_both_prefill_and_decode():
     assert req.request_id not in router.pending_pd_requests
 
 
-def test_pd_router_find_inflight_request_checks_pd_queues():
+def test_pd_router_find_inflight_request_checks_pd_registry():
     router = _build_pd_router()
 
     bound_req = _make_request("pd-bound")
@@ -484,11 +484,7 @@ def test_pd_router_find_inflight_request_checks_pd_queues():
         decode_scheduler_id=0,
         status=PDRequestStatus.DISPATCHED,
     )
-    waiting_req = _make_request("pd-waiting")
-    router.waiting_for_pd_workers.append(waiting_req)
-
     assert router._find_inflight_request("pd-bound") is bound_req
-    assert router._find_inflight_request("pd-waiting") is waiting_req
     assert router._find_inflight_request("pd-unknown") is None
 
 
@@ -496,17 +492,11 @@ def test_pd_request_processor_drops_aborted_requests():
     router = _build_pd_router()
     router._shutdown = False
     dispatched: list[str] = []
-    added: list[str] = []
 
     async def process_pd_request(pd_request):
         dispatched.append(pd_request.request_id)
 
-    async def add_pd_request(request):
-        added.append(request.request_id)
-        return True
-
     router._process_pd_request = process_pd_request
-    router._add_pd_request = add_pd_request
 
     finished_req = _make_request("pd-aborted", finished=True)
     pd_request = PendingPDRequest(
@@ -519,16 +509,12 @@ def test_pd_request_processor_drops_aborted_requests():
     router.pending_pd_requests["pd-aborted"] = pd_request
     router.pending_requests.append(pd_request)
 
-    # An aborted request may also still be waiting for a free P/D pair.
-    waiting_req = _make_request("pd-aborted-waiting", finished=True)
-    router.waiting_for_pd_workers.append(waiting_req)
-
     async def run_processor():
         task = asyncio.create_task(router._pd_request_processor_task())
         try:
             deadline = time.monotonic() + 1.0
             while time.monotonic() < deadline:
-                if not router.pending_requests and not router.waiting_for_pd_workers:
+                if not router.pending_requests:
                     break
                 await asyncio.sleep(0.005)
         finally:
@@ -538,7 +524,7 @@ def test_pd_request_processor_drops_aborted_requests():
     asyncio.run(run_processor())
 
     assert dispatched == []
-    assert added == []
+    assert not router.pending_requests
     assert pd_request.status == PDRequestStatus.FAILED
 
 

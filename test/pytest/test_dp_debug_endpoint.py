@@ -60,7 +60,6 @@ def test_dp_debug_reports_both_pd_roles(monkeypatch):
         total_requests=7,
         pending_requests=["req"],
         pending_pd_requests={"req": object()},
-        waiting_for_pd_workers=["q1", "q2"],
         prefill_policy=SimpleNamespace(
             scheduler_stats={0: _stats(0, 1, 0, kv_send_inflight=2)}
         ),
@@ -75,7 +74,7 @@ def test_dp_debug_reports_both_pd_roles(monkeypatch):
     assert "router_error" not in info
     router = info["request_router"]
     assert router["pending_pd_requests"] == 1
-    assert router["waiting_for_pd_workers"] == 2
+    assert "waiting_for_pd_workers" not in router
     # Separate id spaces: a Prefill and a Decode instance can share an id. The
     # Prefill instance is in the middle of a KV transfer here (kv_send_inflight).
     assert router["prefill_instances"] == {

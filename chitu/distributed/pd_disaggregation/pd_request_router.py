@@ -125,8 +125,6 @@ class PDRequestRouter(RequestRouter):
         logger.info("using classic pd disaggregation")
 
         self.pending_pd_requests: dict[str, PendingPDRequest] = {}
-        # Pending request when system has no avaliable P/D worker
-        self.waiting_for_pd_workers: deque[UserRequest] = deque()
         self.prefill_schedulers: dict[int, dict] = {}  # local_instance_id -> info
         self.decode_schedulers: dict[int, dict] = {}  # local_instance_id -> info
 
@@ -537,7 +535,7 @@ class PDRequestRouter(RequestRouter):
         self._clear_prefill_instance_state(dead_instance_id)
         for pd_request in affected_pd_requests:
             if pd_request.status == PDRequestStatus.PENDING:
-                self._return_request_to_waiting_queue(pd_request)
+                await self._reroute_pending_pd_request(pd_request)
                 continue
 
             self.prefill_policy.remove_request(pd_request.request_id)
@@ -576,6 +574,9 @@ class PDRequestRouter(RequestRouter):
             if pd_req.decode_scheduler_id == dead_instance_id
         ]
         for pd_request in removed_pd_requests:
+            if pd_request.status == PDRequestStatus.PENDING:
+                await self._reroute_pending_pd_request(pd_request)
+                continue
             try:
                 await self._send_to_prefill_scheduler(
                     local_instance_id=pd_request.prefill_scheduler_id,
@@ -601,9 +602,7 @@ class PDRequestRouter(RequestRouter):
         )
         if self.pd_coordination_service:
             self.pd_coordination_service.remove_pd_pair(request_id)
-        set_router_pending_requests(
-            len(self.pending_pd_requests) + len(self.waiting_for_pd_workers)
-        )
+        set_router_pending_requests(len(self.pending_pd_requests))
 
     def _clear_prefill_instance_state(self, local_instance_id: int) -> None:
         """Discard router metadata that belongs to an unavailable prefill instance."""
@@ -641,30 +640,10 @@ class PDRequestRouter(RequestRouter):
             block_size,
         )
 
-    def _return_request_to_waiting_queue(self, pd_request: PendingPDRequest) -> None:
-        """Return an request back to wait until a P/D pair is available."""
-        request_id = pd_request.request_id
-
-        self.pending_pd_requests.pop(request_id, None)
-        self.pending_requests = deque(
-            item for item in self.pending_requests if item.request_id != request_id
-        )
-
-        # correct scheduling metadata
-        self.prefill_policy.remove_request(request_id)
-        self.decode_policy.remove_request(request_id)
-
-        self.waiting_for_pd_workers.appendleft(pd_request.original_request)
-        if self.pd_coordination_service:
-            self.pd_coordination_service.remove_pd_pair(request_id)
-        set_router_pending_requests(
-            len(self.pending_pd_requests) + len(self.waiting_for_pd_workers)
-        )
-
-        logger.info(
-            "[PD_ROUTER][request_requeued] req_id=%s reason=pd_pair_unavailable",
-            request_id,
-        )
+    async def _reroute_pending_pd_request(self, pd_request: PendingPDRequest) -> None:
+        """Rebind an undispatched request using currently available P/D workers."""
+        self.remove_request(pd_request.request_id)
+        await self.add_request(pd_request.original_request)
 
     @override
     async def _health_monitor_task(self):
@@ -1086,18 +1065,11 @@ class PDRequestRouter(RequestRouter):
         self.pending_requests = deque(
             item for item in self.pending_requests if item.request_id != request_id
         )
-        self.waiting_for_pd_workers = deque(
-            request
-            for request in self.waiting_for_pd_workers
-            if request.request_id != request_id
-        )
         self.prefill_policy.remove_request(request_id)
         self.decode_policy.remove_request(request_id)
         if self.pd_coordination_service:
             self.pd_coordination_service.remove_pd_pair(request_id)
-        set_router_pending_requests(
-            len(self.pending_pd_requests) + len(self.waiting_for_pd_workers)
-        )
+        set_router_pending_requests(len(self.pending_pd_requests))
 
     def finalize_request_cache(self, request_id: str) -> None:
         """Refresh cache-routing state after Decode has completed a request."""
@@ -1110,15 +1082,9 @@ class PDRequestRouter(RequestRouter):
 
     @override
     def _find_inflight_request(self, request_id: str) -> Optional[UserRequest]:
-        # PD keeps its own registries until a request is dispatched: the P/D
-        # pairing exists before dispatch, and not-yet-bound requests wait in
-        # waiting_for_pd_workers.
         pd_request = self.pending_pd_requests.get(request_id)
         if pd_request is not None:
             return pd_request.original_request
-        for request in self.waiting_for_pd_workers:
-            if request.request_id == request_id:
-                return request
         return super()._find_inflight_request(request_id)
 
     @override
@@ -1129,8 +1095,8 @@ class PDRequestRouter(RequestRouter):
 
         A PD request runs on two instances at once, so telling only one of them
         leaves the other working (Prefill keeps writing KV, Decode keeps
-        decoding). The pair is recorded before dispatch, so it is known for
-        every request that already left ``waiting_for_pd_workers``.
+        decoding). The pair is recorded before dispatch, so queued requests
+        can also be located and cancelled.
         """
         if not request_id:
             return False
@@ -1180,10 +1146,22 @@ class PDRequestRouter(RequestRouter):
     async def add_request(self, request: UserRequest):
         """Add request to router"""
         self._ensure_ttft_deadline(request)
-        self.waiting_for_pd_workers.append(request)
-        set_router_pending_requests(
-            len(self.pending_pd_requests) + len(self.waiting_for_pd_workers)
-        )
+        if self._reject_ttft_timeout(
+            request, "ttft_pd_router"
+        ) or self._reject_overlong_request(request):
+            self.total_requests += 1
+            return
+        if not await self._add_pd_request(request):
+            logger.warning(
+                "[PD_ROUTER][request_rejected] req_id=%s reason=pd_pair_unavailable",
+                request.request_id,
+            )
+            self.finish_request_before_recv_stop(
+                request,
+                finish_reason="error",
+                error="No available prefill/decode workers",
+            )
+            self.total_requests += 1
 
     def _reject_overlong_request(self, request: UserRequest) -> bool:
         for enabled, stage, req_len, schedulers in (
@@ -1222,36 +1200,34 @@ class PDRequestRouter(RequestRouter):
         logger.debug(f"[PD_STAGE][router.recv.start] req_id={request_id}")
 
         with observe_pd_stage("router", "recv"):
-            try:
-                prefill_eligible_ids = (
-                    self._length_routing_candidates(
-                        policy=self.prefill_policy,
-                        schedulers=self.prefill_schedulers,
-                        req_seq_len=request.prompt_len,
-                    )
-                    if self.routing_by_req_len
-                    else self.prefill_policy.eligible_schedulers()
+            prefill_eligible_ids = (
+                self._length_routing_candidates(
+                    policy=self.prefill_policy,
+                    schedulers=self.prefill_schedulers,
+                    req_seq_len=request.prompt_len,
                 )
-                decode_eligible_ids = (
-                    self._length_routing_candidates(
-                        policy=self.decode_policy,
-                        schedulers=self.decode_schedulers,
-                        req_seq_len=request.prompt_len + request.max_new_tokens,
-                    )
-                    if self.decode_routing_by_req_len
-                    else self.decode_policy.eligible_schedulers()
+                if self.routing_by_req_len
+                else self.prefill_policy.eligible_schedulers()
+            )
+            decode_eligible_ids = (
+                self._length_routing_candidates(
+                    policy=self.decode_policy,
+                    schedulers=self.decode_schedulers,
+                    req_seq_len=request.prompt_len + request.max_new_tokens,
                 )
-                prefill_scheduler_id = self.prefill_policy.select_scheduler(
-                    request,
-                    eligible_ids=prefill_eligible_ids,
-                )
-                decode_scheduler_id = self.decode_policy.select_scheduler(
-                    request,
-                    eligible_ids=decode_eligible_ids,
-                )
-
-            except Exception:
+                if self.decode_routing_by_req_len
+                else self.decode_policy.eligible_schedulers()
+            )
+            if not prefill_eligible_ids or not decode_eligible_ids:
                 return False
+            prefill_scheduler_id = self.prefill_policy.select_scheduler(
+                request,
+                eligible_ids=prefill_eligible_ids,
+            )
+            decode_scheduler_id = self.decode_policy.select_scheduler(
+                request,
+                eligible_ids=decode_eligible_ids,
+            )
             # PD trace: Router selected a P/D pair for this request.
             prompt_len = request.prompt_len
             max_new_tokens = request.max_new_tokens
@@ -1291,9 +1267,7 @@ class PDRequestRouter(RequestRouter):
             self.pending_requests.append(pd_request)
 
         # Update router pending requests gauge
-        set_router_pending_requests(
-            len(self.pending_pd_requests) + len(self.waiting_for_pd_workers)
-        )
+        set_router_pending_requests(len(self.pending_pd_requests))
         logger.debug(f"[PD_STAGE][router.recv.end] req_id={request_id}")
         return True
 
@@ -1380,28 +1354,11 @@ class PDRequestRouter(RequestRouter):
                         ):
                             pd_request.status = PDRequestStatus.FAILED
                             self.total_requests += 1
-                            set_router_pending_requests(
-                                len(self.pending_pd_requests)
-                                + len(self.waiting_for_pd_workers)
-                            )
+                            set_router_pending_requests(len(self.pending_pd_requests))
                             continue
                         await self._process_pd_request(pd_request)
                     else:
                         raise ValueError(f"unexpected request type: {type(pd_request)}")
-
-                elif self.waiting_for_pd_workers:
-                    request = self.waiting_for_pd_workers.popleft()
-                    if request.finished:
-                        # Already aborted by a client disconnect: drop it instead
-                        # of binding it to a P/D pair.
-                        continue
-                    if self._reject_ttft_timeout(
-                        request, "ttft_pd_router_wait_worker"
-                    ) or self._reject_overlong_request(request):
-                        self.total_requests += 1
-                    elif not await self._add_pd_request(request):
-                        self.waiting_for_pd_workers.appendleft(request)
-                        await asyncio.sleep(0.05)
 
                 await asyncio.sleep(0.01)  # 10ms polling interval
             except asyncio.CancelledError:
@@ -1414,9 +1371,8 @@ class PDRequestRouter(RequestRouter):
     async def _process_pd_request(self, pd_request: PendingPDRequest):
         """Process PD disaggregation request"""
 
-        # when either prefill or decode scheduler is down, continue wait
         if not self._pd_pair_is_alive(pd_request):
-            self._return_request_to_waiting_queue(pd_request)
+            await self._reroute_pending_pd_request(pd_request)
             return
 
         # Update status
@@ -1755,7 +1711,6 @@ class PDRequestRouter(RequestRouter):
         pd_stats = {
             "pd_enabled": True,
             "pending_pd_requests": len(self.pending_pd_requests),
-            "waiting_for_pd_workers": len(self.waiting_for_pd_workers),
             "prefill_schedulers": len(self.prefill_schedulers),
             "decode_schedulers": len(self.decode_schedulers),
         }
