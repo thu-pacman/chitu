@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from chitu.serve.api_docs import DocField
-from chitu.tool_call.type_def import ChoiceDelta, ChoiceToolCall, ToolConfig
+from chitu.tool_call.type_def import ChoiceDelta, ChoiceDeltaToolCall, ToolConfig
 from chitu.serve.request_id import gen_req_id
 
 DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
@@ -125,6 +125,9 @@ class ToolChoiceNamedTool(BaseModel):
     name: str = DocField(
         en="Name of the function tool to select.", zh="要选择的 function tool 名称。"
     )
+    namespace: str | None = DocField(
+        None, en="Namespace containing the function.", zh="函数所属的命名空间。"
+    )
 
 
 class ResponsesInputTextBlock(BaseModel):
@@ -197,6 +200,9 @@ class ResponsesFunctionCallInputItem(BaseModel):
     )
     call_id: str = DocField(en="Function call identifier.", zh="函数调用 ID。")
     name: str = DocField(en="Function name.", zh="函数名称。")
+    namespace: str | None = DocField(
+        None, en="Namespace containing the function.", zh="函数所属的命名空间。"
+    )
     arguments: str = DocField(
         "",
         en="Function call arguments as a JSON string.",
@@ -306,8 +312,8 @@ class ResponsesCreateRequest(BaseModel):
     )
     tools: list[dict[str, Any]] = DocField(
         default_factory=list,
-        en="Function tools. Both Responses-style flat function tools and Chat Completions-style nested function tools are accepted.",
-        zh="函数工具。既支持 Responses 风格的扁平 function tool，也支持 Chat Completions 风格的嵌套 function tool。",
+        en="Function tools, optionally grouped in namespaces. Both Responses-style flat function tools and Chat Completions-style nested function tools are accepted.",
+        zh="函数工具，可按 namespace 分组。既支持 Responses 风格的扁平 function tool，也支持 Chat Completions 风格的嵌套 function tool。",
     )
     tool_choice: Literal["none", "auto", "required"] | ToolChoiceNamedTool = DocField(
         "auto",
@@ -426,19 +432,44 @@ def flatten_response_content(
     return "\n".join(part for part in parts if part)
 
 
+# Internal names are an implementation detail; never infer a namespace by
+# splitting a generated name, since user-supplied names can contain '__'.
+ResponseToolNames = dict[str, dict[str, str]]
+
+
+def _internal_tool_name(name: str, namespace: str | None = None) -> str:
+    if not isinstance(name, str) or not name:
+        raise ValueError("Tool name is required and must be a non-empty string")
+    if namespace is None:
+        return name
+    if not isinstance(namespace, str) or not namespace:
+        raise ValueError("Tool namespace must be a non-empty string")
+    return f"{namespace}__{name}"
+
+
 def normalize_response_tools(
     tools: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], ResponseToolNames]:
     internal_tools: list[dict[str, Any]] = []
     public_tools: list[dict[str, Any]] = []
-    for tool in tools:
+    tool_names: ResponseToolNames = {}
+
+    def add_function(
+        tool: Any,
+        namespace: str | None = None,
+        namespace_description: str = "",
+    ) -> dict[str, Any]:
+        if not isinstance(tool, dict):
+            raise ValueError("Each tool must be an object")
         if "function" in tool:
             fn = tool["function"]
+            if not isinstance(fn, dict):
+                raise ValueError("Tool function must be an object")
             tool_type = tool.get("type")
             if tool_type not in {None, "function"}:
                 raise ValueError(f"Unsupported tool type: {tool_type}")
             name = fn.get("name", "")
-            description = fn.get("description", "")
+            description = fn.get("description") or ""
             parameters = fn.get("parameters") or {}
             strict = tool.get("strict", fn.get("strict"))
         else:
@@ -446,19 +477,28 @@ def normalize_response_tools(
             if tool_type != "function":
                 raise ValueError(f"Unsupported tool type: {tool_type}")
             name = tool.get("name", "")
-            description = tool.get("description", "")
+            description = tool.get("description") or ""
             parameters = tool.get("parameters") or {}
             strict = tool.get("strict")
 
-        if not name:
-            raise ValueError("Tool name is required")
+        internal_name = _internal_tool_name(name, namespace)
+        if not isinstance(description, str):
+            raise ValueError("Tool description must be a string")
+        if internal_name in tool_names:
+            raise ValueError(f"Duplicate or conflicting tool name: {internal_name}")
+        tool_names[internal_name] = {"name": name}
+        if namespace is not None:
+            tool_names[internal_name]["namespace"] = namespace
+        internal_description = "\n".join(
+            part for part in (namespace_description, description) if part
+        )
 
         internal_tools.append(
             {
                 "type": "function",
                 "function": {
-                    "name": name,
-                    "description": description,
+                    "name": internal_name,
+                    "description": internal_description,
                     "parameters": parameters,
                 },
             }
@@ -471,14 +511,38 @@ def normalize_response_tools(
         }
         if strict is not None:
             public_tool["strict"] = strict
-        public_tools.append(public_tool)
-    return internal_tools, public_tools
+        return public_tool
+
+    for tool in tools:
+        if tool.get("type") != "namespace":
+            public_tools.append(add_function(tool))
+            continue
+        namespace = tool.get("name")
+        if not isinstance(namespace, str) or not namespace:
+            raise ValueError("Namespace name is required")
+        children = tool.get("tools")
+        if not isinstance(children, list):
+            raise ValueError("Namespace tools must be an array")
+        description = tool.get("description") or ""
+        if not isinstance(description, str):
+            raise ValueError("Namespace description must be a string")
+        public_tools.append(
+            {
+                "type": "namespace",
+                "name": namespace,
+                "description": description,
+                "tools": [
+                    add_function(child, namespace, description) for child in children
+                ],
+            }
+        )
+    return internal_tools, public_tools, tool_names
 
 
 def normalize_text_config(
     text_config: ResponsesTextConfig | None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    normalized = {"format": {"type": "text"}}
+    normalized: dict[str, Any] = {"format": {"type": "text"}}
     internal_response_format = None
     if text_config is None or text_config.format is None:
         return normalized, None
@@ -544,7 +608,10 @@ def responses_input_to_internal(
                 {
                     "id": call_id,
                     "type": "function",
-                    "function": {"name": name, "arguments": arguments},
+                    "function": {
+                        "name": _internal_tool_name(name, item.get("namespace")),
+                        "arguments": arguments,
+                    },
                 }
             )
             continue
@@ -587,6 +654,9 @@ def responses_input_to_internal(
 
 
 def build_internal_messages(request: ResponsesCreateRequest) -> list[dict[str, Any]]:
+    # Request validation guarantees this, but type checkers cannot infer the
+    # postcondition of the Pydantic model validator.
+    assert request.input is not None
     internal_messages = responses_input_to_internal(request.input)
     _, response_format = normalize_text_config(request.text)
     if request.instructions is None and response_format is None:
@@ -616,7 +686,9 @@ def reasoning_effort_from_request(request: ResponsesCreateRequest) -> Optional[s
     # Only GLM-5.2 and DeepSeek-V4 templates/encoders consume reasoning_effort.
     # Other models silently ignore the kwarg, but we return None early to avoid
     # passing a meaningless value.
-    model_name = get_global_args().models.name
+    args = get_global_args()
+    assert args is not None
+    model_name = args.models.name
     if not any(model_name.startswith(prefix) for prefix in _REASONING_EFFORT_MODELS):
         return None
     # Both templates recognise exactly two tiers:
@@ -651,12 +723,13 @@ def _make_function_call_item(
     call_id: str,
     name: str,
     arguments: str,
+    tool_names: ResponseToolNames | None = None,
 ) -> dict[str, Any]:
     return {
         "id": item_id,
         "type": "function_call",
         "call_id": call_id,
-        "name": name,
+        **((tool_names or {}).get(name, {"name": name})),
         "arguments": arguments,
         "status": "completed",
     }
@@ -664,7 +737,7 @@ def _make_function_call_item(
 
 def _update_tool_buffer(
     tool_buffers: dict[int, dict[str, str]],
-    tool_call: ChoiceToolCall,
+    tool_call: ChoiceDeltaToolCall,
     *,
     track_started: bool,
 ) -> dict[str, str]:
@@ -857,20 +930,18 @@ def _build_function_call_started_event(
     call_id: str,
     name: str,
     output_index: int,
+    tool_names: ResponseToolNames | None = None,
 ) -> str:
+    item = _make_function_call_item(
+        item_id=item_id, call_id=call_id, name=name, arguments="", tool_names=tool_names
+    )
+    item["status"] = "in_progress"
     return emit(
         "response.output_item.added",
         {
             "type": "response.output_item.added",
             "output_index": output_index,
-            "item": {
-                "id": item_id,
-                "type": "function_call",
-                "call_id": call_id,
-                "name": name,
-                "arguments": "",
-                "status": "in_progress",
-            },
+            "item": item,
         },
     )
 
@@ -890,6 +961,11 @@ def _build_function_call_done_events(
                 "output_index": output_index,
                 "arguments": function_item["arguments"],
                 "name": function_item["name"],
+                **(
+                    {"namespace": function_item["namespace"]}
+                    if "namespace" in function_item
+                    else {}
+                ),
             },
         ),
         emit(
@@ -906,6 +982,7 @@ def _build_function_call_done_events(
 async def collect_response_output(
     *,
     req: UserRequest,
+    tool_names: ResponseToolNames | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     output_text_parts: list[str] = []
     tool_buffers: dict[int, dict[str, str]] = {}
@@ -938,6 +1015,7 @@ async def collect_response_output(
                 call_id=call_id,
                 name=buf["name"],
                 arguments=buf["arguments"],
+                tool_names=tool_names,
             )
         )
     return output_text, output_items
@@ -981,6 +1059,7 @@ async def responses_stream_from_async_stream(
     response_model: str,
     public_tools: list[dict[str, Any]],
     public_tool_choice: str | dict[str, Any],
+    tool_names: ResponseToolNames | None = None,
 ):
     sequence_number = 0
 
@@ -1043,10 +1122,15 @@ async def responses_stream_from_async_stream(
                 )
             for tool_call in data.tool_calls or []:
                 buf = _update_tool_buffer(tool_buffers, tool_call, track_started=True)
-                call_id = buf["id"] or f"call_{gen_req_id()}"
+                if not buf["id"]:
+                    buf["id"] = f"call_{gen_req_id()}"
+                call_id = buf["id"]
                 item_id = f"fc_{call_id}"
                 output_index = tool_call.index + (1 if text_started else 0)
-                if not buf["started"]:
+                argument_delta = tool_call.function.arguments
+                # Names may arrive in fragments. Wait for arguments before
+                # exposing the tool identity, then flush any buffered arguments.
+                if not buf["started"] and (not tool_names or argument_delta):
                     buf["started"] = "1"
                     yield _build_function_call_started_event(
                         emit=emit,
@@ -1054,20 +1138,22 @@ async def responses_stream_from_async_stream(
                         call_id=call_id,
                         name=buf["name"],
                         output_index=output_index,
+                        tool_names=tool_names,
                     )
-                if tool_call.function.arguments:
+                    argument_delta = buf["arguments"]
+                if buf["started"] and argument_delta:
                     yield emit(
                         "response.function_call_arguments.delta",
                         {
                             "type": "response.function_call_arguments.delta",
                             "item_id": item_id,
                             "output_index": output_index,
-                            "delta": tool_call.function.arguments,
+                            "delta": argument_delta,
                         },
                     )
             continue
 
-        if is_reasoning:
+        if is_reasoning or not isinstance(data, str):
             continue
         if not text_started:
             text_started = True
@@ -1103,11 +1189,21 @@ async def responses_stream_from_async_stream(
         buf = tool_buffers[index]
         call_id = buf["id"] or f"call_{gen_req_id()}"
         output_index = index + (1 if text_started else 0)
+        if not buf["started"]:
+            yield _build_function_call_started_event(
+                emit=emit,
+                item_id=f"fc_{call_id}",
+                call_id=call_id,
+                name=buf["name"],
+                output_index=output_index,
+                tool_names=tool_names,
+            )
         function_item = _make_function_call_item(
             item_id=f"fc_{call_id}",
             call_id=call_id,
             name=buf["name"],
             arguments=buf["arguments"],
+            tool_names=tool_names,
         )
         function_item["status"] = status
         for event in _build_function_call_done_events(
@@ -1139,14 +1235,24 @@ async def handle_responses_request(
     created_at = int(time.time())
     try:
         response_model = resolve_requested_model_or_error(request.model)
-        internal_tools, public_tools = normalize_response_tools(request.tools)
+        internal_tools, public_tools, tool_names = normalize_response_tools(
+            request.tools
+        )
         if isinstance(request.tool_choice, ToolChoiceNamedTool):
+            selected_name = _internal_tool_name(
+                request.tool_choice.name, request.tool_choice.namespace
+            )
+            selected_identity = request.tool_choice.model_dump(
+                exclude={"type"}, exclude_none=True
+            )
+            if tool_names.get(selected_name) != selected_identity:
+                raise ValueError("tool_choice must select a defined function tool")
             tool_config = ToolConfig(
                 "required",
-                request.parallel_tool_calls,
-                [request.tool_choice.name],
+                not request.parallel_tool_calls,
+                [selected_name],
             )
-            public_tool_choice = request.tool_choice.model_dump()
+            public_tool_choice = request.tool_choice.model_dump(exclude_none=True)
         else:
             tool_config = ToolConfig(
                 request.tool_choice, not request.parallel_tool_calls
@@ -1189,6 +1295,7 @@ async def handle_responses_request(
         )
 
     args = get_global_args()
+    assert args is not None
     enable_thinking = enable_thinking_from_request(request)
     chat_template_kwargs = build_chat_template_kwargs(
         enable_thinking, reasoning_effort_from_request(request)
@@ -1244,6 +1351,7 @@ async def handle_responses_request(
                     response_model=response_model,
                     public_tools=public_tools,
                     public_tool_choice=public_tool_choice,
+                    tool_names=tool_names,
                 ),
             ),
             media_type="text/event-stream",
@@ -1252,7 +1360,7 @@ async def handle_responses_request(
     output_text, output_items = await run_with_client_abort(
         http_request,
         user_req.request_id,
-        collect_response_output(req=user_req),
+        collect_response_output(req=user_req, tool_names=tool_names),
     )
     return JSONResponse(
         build_responses_response(
