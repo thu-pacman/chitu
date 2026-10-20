@@ -141,6 +141,7 @@ def glm5_next_indexer_cache_spec(args, attn_backend_type) -> KVCacheSpec:
     model_types=[
         ModelType.DEEPSEEK_V3,
         ModelType.KIMI_K2_5,
+        ModelType.KIMI_K3,
         ModelType.GLM_5_2,
         ModelType.GLM_5_NEXT,
     ],

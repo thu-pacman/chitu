@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Literal
+from typing import Literal, Optional
 
 
 class ReasoningState(IntEnum):
@@ -38,6 +38,19 @@ class ReasoningParams:
     start_token: str = "<think>"
     end_token: str = "</think>"
     initial_state: bool = False
+    # For "multi-token-forced" models: the multi-token end delimiter — matched
+    # when all its tokens appear in order, but not necessarily contiguously
+    # (tokens in between are hidden as structural filler; see
+    # MultiTokenReasoningParser). None for the classic single-tag types.
+    end_delimiter_token_ids: Optional[list[int]] = None
 
 
-ReasoningType = Literal["auto", "disabled", "triggered", "forced", "switchable"]
+ReasoningType = Literal[
+    "auto",
+    "disabled",
+    "triggered",
+    "forced",
+    "switchable",
+    "multi-token-forced",
+    "multi-token-switchable",
+]

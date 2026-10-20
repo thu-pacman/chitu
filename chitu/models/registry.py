@@ -24,6 +24,7 @@ class ModelType(str, Enum):
     LLADA2 = "llada2"
     HF_QWEN3_5 = "hf-qwen3-5"
     KIMI_K2_5 = "kimi-k2-5"
+    KIMI_K3 = "kimi-k3"
     GLM_5_2 = "glm-5-2"
     GLM_5_NEXT = "glm-5-next"
     MINIMAX_M3_VL = "minimax-m3-vl"

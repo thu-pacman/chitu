@@ -33,6 +33,43 @@ def test_causal_conv1d_update(batch_size, hidden_size, state_len, impl):
     assert_close(new_hidden_state, new_hidden_state_ref, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("impl", ["torch", "triton"])
+def test_causal_conv1d_update_fp32_weight(impl):
+    if impl == "triton" and not has_triton:
+        pytest.skip("triton is missing")
+    torch.set_default_dtype(torch.bfloat16)
+    batch_size, hidden_size, state_len = 4, 2048, 4
+    old_hidden_state = torch.randn(
+        batch_size, hidden_size, state_len, dtype=torch.bfloat16, device="cuda"
+    )
+    this_hidden_state = torch.randn(
+        batch_size, hidden_size, dtype=torch.bfloat16, device="cuda"
+    )
+    weight = torch.randn(hidden_size, 1, state_len, dtype=torch.float32, device="cuda")
+    output, new_hidden_state = causal_conv1d_update(
+        this_hidden_state, old_hidden_state, weight, impl=impl
+    )
+    output_ref, new_hidden_state_ref = causal_conv1d_update(
+        this_hidden_state, old_hidden_state, weight, impl="ref"
+    )
+    # Outputs keep the activation dtype; the new state keeps the cache dtype
+    # (NOT the fp32 weight dtype).
+    assert output.dtype == torch.bfloat16
+    assert new_hidden_state.dtype == torch.bfloat16
+    assert_close(output, output_ref, atol=1e-2, rtol=1e-2)
+    assert_close(new_hidden_state, new_hidden_state_ref, atol=1e-2, rtol=1e-2)
+    # The fp32-weight result must be close to the bf16-weight result: the only
+    # difference is the rounding of the weight values (and, for the torch impl,
+    # the einsum accumulating in the weight dtype), which on N(0,1) 4-tap dots
+    # can exceed the usual 1e-2 on rare elements — hence the looser bound. The
+    # new state does not depend on the weight at all.
+    output_bf16, new_hidden_state_bf16 = causal_conv1d_update(
+        this_hidden_state, old_hidden_state, weight.to(torch.bfloat16), impl=impl
+    )
+    assert_close(output, output_bf16, atol=5e-2, rtol=5e-2)
+    assert_close(new_hidden_state, new_hidden_state_bf16, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize(
     "prefix_lens",
     [
@@ -65,6 +102,33 @@ def test_causal_conv1d_prefill(prefix_lens, hidden_size, state_len, impl):
     output_ref, new_hidden_state_ref = causal_conv1d_prefill(
         inputs, conv_state, weight, prefix_lens, impl="ref"
     )
+    assert_close(output, output_ref, atol=1e-2, rtol=1e-2)
+    assert_close(new_hidden_state, new_hidden_state_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("impl", ["triton"])
+def test_causal_conv1d_prefill_fp32_weight(impl):
+    if impl == "triton" and not has_triton:
+        pytest.skip("triton is missing")
+    torch.set_default_dtype(torch.bfloat16)
+    prefix_lens = torch.tensor([0, 2, 5], device="cuda")
+    hidden_size, state_len = 2048, 4
+    batch_size = prefix_lens.shape[0] - 1
+    total_len = prefix_lens[-1].item()
+
+    inputs = torch.randn([total_len, hidden_size], device="cuda")
+    conv_state = torch.randn([batch_size, hidden_size, state_len], device="cuda")
+    weight = torch.randn(
+        [hidden_size, 1, state_len], device="cuda", dtype=torch.float32
+    )
+    output, new_hidden_state = causal_conv1d_prefill(
+        inputs, conv_state, weight, prefix_lens, impl=impl
+    )
+    output_ref, new_hidden_state_ref = causal_conv1d_prefill(
+        inputs, conv_state, weight, prefix_lens, impl="ref"
+    )
+    assert output.dtype == torch.bfloat16
+    assert new_hidden_state.dtype == torch.bfloat16
     assert_close(output, output_ref, atol=1e-2, rtol=1e-2)
     assert_close(new_hidden_state, new_hidden_state_ref, atol=1e-2, rtol=1e-2)
 

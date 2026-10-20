@@ -503,7 +503,8 @@ class Backend:
         """
 
         if not hasattr(args.models, "vision_config") or (
-            args.models.type in [ModelType.HF_QWEN3_5, ModelType.GLM_5_NEXT]
+            args.models.type
+            in [ModelType.HF_QWEN3_5, ModelType.GLM_5_NEXT, ModelType.KIMI_K3]
             and args.infer.language_model_only
         ):
             return None
@@ -549,6 +550,7 @@ class Backend:
             elif args.models.type in [
                 ModelType.DEEPSEEK_V3,
                 ModelType.KIMI_K2_5,
+                ModelType.KIMI_K3,
                 ModelType.GLM_5_2,
                 ModelType.GLM_5_NEXT,
             ]:
@@ -970,6 +972,7 @@ class Backend:
                 ModelType.LLADA2,
                 ModelType.DEEPSEEK_V4,
                 ModelType.MINIMAX_M3_VL,
+                ModelType.KIMI_K3,
             }:
                 if not args.disable_layerwise_load:
                     if args.gpu_preprocess is True:

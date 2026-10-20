@@ -5,6 +5,7 @@
 import random
 import time
 import functools
+import os
 from logging import getLogger
 
 import torch
@@ -67,10 +68,11 @@ def auto_retry_triton_compilation(fn):
                     raise e
                 i += 1
                 msg = str(e)
-                if (
-                    "cannot stat shared object: Stale file handle" in msg
-                    or "No such file or directory"
-                    and "/.triton/cache/" in msg
+                cache_dir_pattern = os.environ.get(
+                    "TRITON_CACHE_DIR", "/.triton/cache/"
+                )
+                if "cannot stat shared object: Stale file handle" in msg or (
+                    "No such file or directory" in msg and cache_dir_pattern in msg
                 ):
                     time.sleep(random.random() * 2 + 1)
                     continue

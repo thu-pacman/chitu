@@ -767,6 +767,39 @@ def _build_qwen3_5_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
     )
 
 
+@register_cache_manager_builder(model_types=[ModelType.KIMI_K3], priority=5)
+def _build_kimi_k3_cache_managers(args, attn_backend_type) -> CacheBuildBundle:
+    """Kimi-K3 hybrid cache: main (Gated MLA) + linear (KDA) caches."""
+
+    def is_full_attention(layer_id: int) -> bool:
+        return args.models.layer_types[layer_id] == "full_attention"
+
+    def filter_full(layers: Iterable[int]):
+        return [i for i in layers if is_full_attention(i)]
+
+    def filter_linear(layers: Iterable[int]):
+        return [i for i in layers if not is_full_attention(i)]
+
+    main_cache, main_managers = _build_main_cache_bundle(
+        args,
+        attn_backend_type,
+        layer_filter_fn=filter_full,
+    )
+    cache_dict = {
+        "main": main_cache,
+        "linear": _build_linear_cache(
+            args,
+            layer_filter_fn=filter_linear,
+            main_block_size=_main_cache_block_size(main_cache),
+        ),
+    }
+    return CacheBuildBundle(
+        cache_type=args.infer.cache_type,
+        cache_dict=cache_dict,
+        cache_managers=main_managers,
+    )
+
+
 @register_cache_manager_builder(
     predicate=lambda args: (
         _normalize_model_type(getattr(args.models, "type", None))

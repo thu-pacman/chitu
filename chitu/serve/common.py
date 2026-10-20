@@ -456,7 +456,12 @@ def build_chat_template_kwargs(
 ) -> dict[str, Any]:
     chat_template_kwargs = {}
     model_name = get_global_args().models.name
-    if "DeepSeek-V3.1" in model_name or "Kimi-K2" in model_name:
+    if (
+        "DeepSeek-V3.1" in model_name
+        or "DeepSeek-V3.2" in model_name
+        or "Kimi-K2" in model_name
+        or "Kimi-K3" in model_name
+    ):
         # These models' chat templates use `thinking` instead of `enable_thinking`.
         chat_template_kwargs["thinking"] = enable_thinking
     else:

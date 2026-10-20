@@ -381,7 +381,12 @@ class TokenizerHF:
         self.n_words = self.model.vocab_size
 
     def encode(self, s: str, bos: bool, eos: bool) -> list[int]:
-        t = self.model.encode(s, add_special_tokens=False)
+        try:
+            t = self.model.encode(s, add_special_tokens=False)
+        except TypeError:
+            # Custom tokenizers may use a different kwarg name (e.g. Kimi-K3's
+            # TikTokenTokenizer: encode(text, allow_special_tokens=True)).
+            t = self.model.encode(s)
         if bos and self.bos_id is not None:
             t.insert(0, self.bos_id)
         if eos and self.eos_id is not None:
@@ -520,13 +525,24 @@ class ChatFormatHF:
 
         if hasattr(self.tokenizer.model, "apply_chat_template"):
             chat_template_kwargs = chat_template_kwargs or {}
-            # Explicitly request list[int] output (transformers 5.0+ defaults may changed)
-            return self.tokenizer.model.apply_chat_template(
+            # Explicitly request list[int] output (transformers 5.0+ defaults may
+            # changed). `tokenize=True` is also the HF default, but custom
+            # tokenizers such as Kimi-K3's TikTokenTokenizer default to
+            # tokenize=False and would return a rendered string instead.
+            ids = self.tokenizer.model.apply_chat_template(
                 dialog,
                 add_generation_prompt=True,
+                tokenize=True,
                 return_dict=False,
                 **chat_template_kwargs,
             )
+            if not isinstance(ids, list):
+                raise RuntimeError(
+                    "tokenizer.apply_chat_template(tokenize=True) did not return "
+                    f"token ids (got {type(ids)}); the chat template of this "
+                    "model is incompatible with ChatFormatHF"
+                )
+            return ids
 
         else:
             if chat_template_kwargs:

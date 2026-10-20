@@ -68,6 +68,7 @@ class ServeConfigRules(Callback):
                 "deepseek-v3",
                 "deepseek-v4",
                 "kimi-k2-5",
+                "kimi-k3",
                 "glm-5-2",
                 "glm-5-next",
             ]:

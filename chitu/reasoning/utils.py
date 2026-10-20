@@ -56,6 +56,38 @@ def _get_reasoning_params(enable_thinking: bool) -> ReasoningParams:
     if reasoning_type == "switchable":
         reasoning_type = "forced" if enable_thinking else "disabled"
 
+    if reasoning_type == "multi-token-switchable":
+        # Same relation to multi-token-forced as "switchable" has to "forced":
+        # reasoning can be turned off per request. Turning it off requires the
+        # chat template to render a non-thinking prompt — the serve layer's
+        # build_chat_template_kwargs passes the request's setting under the
+        # kwarg name the model's template reads (e.g. `thinking` for Kimi-K3).
+        reasoning_type = "multi-token-forced" if enable_thinking else "disabled"
+
+    if reasoning_type == "multi-token-forced":
+        # Like "forced", generation starts inside the reasoning channel (the
+        # prompt already ends there) and reasoning is always on —
+        # `enable_thinking` is ignored, exactly as for "forced". Unlike
+        # "forced", the channel is left through a multi-token delimiter
+        # sequence instead of a single end tag; the delimiter comes from the
+        # model config and matches when all its tokens appear in order, but
+        # not necessarily contiguously (see MultiTokenReasoningParser).
+        delimiter = getattr(
+            get_global_args().models, "reasoning_end_delimiter_token_ids", None
+        )
+        if not delimiter or not all(isinstance(t, int) for t in delimiter):
+            raise ValueError(
+                "multi-token reasoning types (multi-token-forced / "
+                "multi-token-switchable) require a non-empty list of int token "
+                "ids in models.reasoning_end_delimiter_token_ids, got "
+                f"{delimiter!r}"
+            )
+        return ReasoningParams(
+            True,
+            initial_state=True,
+            end_delimiter_token_ids=list(delimiter),
+        )
+
     if reasoning_type == "triggered":
         if not enable_thinking:
             reasoning_type = "disabled"
@@ -91,6 +123,15 @@ def get_reasoning_params(enable_thinking: bool) -> ReasoningParams:
 
 
 def update_chat_template_kwargs_reasoning(kwargs: dict, enable_thinking: bool):
+    """Normalize the reasoning flag(s) already present in `kwargs`.
+
+    Which kwarg name a model's chat template reads (`thinking` vs
+    `enable_thinking`) is decided solely by the serve layer's
+    `build_chat_template_kwargs` (keyed by model name); this function only
+    rewrites the *values* of whichever flags are present so they follow the
+    effective reasoning state (e.g. a `forced` model keeps thinking on even
+    for enable_thinking=False requests). It never adds or renames keys.
+    """
     reasoning_params = get_reasoning_params(enable_thinking)
     KEYS = {"thinking", "enable_thinking"}
     for k in KEYS:

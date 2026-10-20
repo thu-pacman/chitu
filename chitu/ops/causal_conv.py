@@ -50,10 +50,15 @@ def causal_conv1d_update_torch(
     assert weight.shape[1] == 1
     _, hidden_size, _ = this_hidden_states.shape
 
+    # Compute is in the weight's dtype. Depending on the model. Maybe fp32.
     new_hidden_states = torch.cat(
         [old_hidden_states[..., 1:], this_hidden_states], dim=-1
-    ).to(weight.dtype)
-    out = torch.einsum("bhs,hs->bh", new_hidden_states, weight.squeeze(1)).unsqueeze(-1)
+    )
+    out = torch.einsum(
+        "bhs,hs->bh", new_hidden_states.to(weight.dtype), weight.squeeze(1)
+    ).unsqueeze(-1)
+
+    # Return is in the input's dtype
     out = F.silu(out).to(this_hidden_states.dtype)
 
     assert out.shape[-1] == 1
@@ -75,12 +80,19 @@ def causal_conv1d_update_ref(
     _, hidden_size, seq_len = this_hidden_states.shape
     state_len = old_hidden_states.shape[-1]
 
-    new_hidden_states = torch.cat([old_hidden_states, this_hidden_states], dim=-1).to(
-        weight.dtype
-    )
+    # Compute is in the weight's dtype. Depending on the model. Maybe fp32.
+    new_hidden_states = torch.cat([old_hidden_states, this_hidden_states], dim=-1)
     old_hidden_states = new_hidden_states[:, :, -state_len:]
-    out = F.conv1d(new_hidden_states, weight, bias=None, padding=0, groups=hidden_size)
+    out = F.conv1d(
+        new_hidden_states.to(weight.dtype),
+        weight,
+        bias=None,
+        padding=0,
+        groups=hidden_size,
+    )
     out = F.silu(out[:, :, -seq_len:])
+
+    # Return is in the input's dtype
     out = out.to(this_hidden_states.dtype)
     assert out.shape[-1] == 1
     out = out.squeeze(-1)
@@ -230,11 +242,14 @@ def causal_conv1d_prefill_ref(
         # token 的输出要用「以它结尾」的窗口，即 full[:, :, t + 1 : t + 1 +
         # conv_kernel_size]（full 前面多了 conv_kernel_size 个 state，所以窗口整体后移
         # 一位），因此输出取 [1 : actual_len + 1]，不能取 [:actual_len]。
+        #
+        # Compute is in the weight's dtype. Depending on the model. Maybe fp32.
+        # Return is in the input's dtype
         chunk = F.silu(
-            F.conv1d(full, weight, padding=0, groups=hidden_size)[
+            F.conv1d(full.to(weight.dtype), weight, padding=0, groups=hidden_size)[
                 :, :, 1 : actual_len + 1
             ]
-        )
+        ).to(inputs.dtype)
         outputs.append(chunk.squeeze(0).transpose(0, 1))
 
     outputs = torch.cat(outputs, dim=0)  # (total_len,hidden_size)

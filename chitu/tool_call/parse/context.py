@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import uuid
-from typing import Callable, AsyncIterable
+from typing import Callable, AsyncIterable, AsyncIterator
 from ..type_def import (
     ChoiceToolCallFunction,
     ChoiceToolCall,
@@ -12,6 +12,11 @@ from ..type_def import (
     ChoiceDeltaToolCall,
 )
 from .type_def import ToolsInfo
+
+# Maps string content to the escape sequences of a JSON string literal, without
+# the surrounding quotes. Implementations must be stateless and compose over
+# chunk boundaries, i.e. escape(a + b) == escape(a) + escape(b).
+EscapeFn = Callable[[str], str]
 
 
 class ParseContext:
@@ -45,9 +50,8 @@ class ParseContext:
     def as_arg_value(self, string: str):
         self.arguments += '": ' + string
 
-    def as_arg_value_mapped(self, string: str, map_fn: Callable[[str], str]):
-        string = '": ' + map_fn(string)
-        self.arguments += string
+    def as_arg_value_mapped(self, string: str, escape: EscapeFn) -> None:
+        self.arguments += '": "' + escape(string) + '"'
 
     def end_function(self):
         if self.arg_count == 0:
@@ -136,14 +140,31 @@ class StreamParseContext:
         self.arguments += prefix + string
 
     async def as_arg_value_mapped(
-        self, stream: AsyncIterable[str], map_fn: Callable[[str], str]
-    ):
-        string = ""
+        self, stream: AsyncIterable[str], escape: EscapeFn
+    ) -> AsyncIterator[ChoiceDelta]:
+        """Stream a string argument value as an escaped JSON string.
+
+        ``escape`` encodes string content to its JSON escape sequence(s) and
+        must be stateless and compose over chunk boundaries, i.e.
+        ``escape(a + b) == escape(a) + escape(b)``. JSON escaping has no
+        cross-chunk state, so every chunk can be encoded and yielded as soon
+        as it arrives instead of buffering the whole value.
+        """
+        prefix = '": "'
+        is_first_chunk = True
         async for chunk in stream:
-            string += chunk
-        string = '": ' + map_fn(string)
-        yield self.make_arguments_delta(string)
-        self.arguments += string
+            text = escape(chunk)
+            if is_first_chunk:
+                text = prefix + text
+                is_first_chunk = False
+            if text:
+                yield self.make_arguments_delta(text)
+                self.arguments += text
+
+        # An empty value must still be emitted as a valid JSON string.
+        tail = (prefix if is_first_chunk else "") + '"'
+        yield self.make_arguments_delta(tail)
+        self.arguments += tail
 
     async def end_function(self):
         if self.arg_count == 0:

@@ -237,6 +237,41 @@ def test_deepseekv4():
     run_match(parser, wrong_block, False, tool_choice="required")
 
 
+def _string_arg_data(raw: str) -> str:
+    return (
+        "begin-<｜DSML｜tool_calls>\n"
+        '<｜DSML｜invoke name="test_type">\n'
+        f'<｜DSML｜parameter name="ks" string="true">{raw}</｜DSML｜parameter>\n'
+        '<｜DSML｜parameter name="ko" string="false">{"kb": true}</｜DSML｜parameter>\n'
+        '<｜DSML｜parameter name="ka" string="false">[1, 2, 3]</｜DSML｜parameter>\n'
+        "</｜DSML｜invoke>\n"
+        '<｜DSML｜invoke name="test_empty">\n</｜DSML｜invoke>\n'
+        "</｜DSML｜tool_calls>-end"
+    )
+
+
+def test_deepseekv4_string_arg_value_escaping():
+    parser = "DeepSeekV4ToolParser"
+    # String arguments are escaped into a JSON string. The streamed chunks must
+    # concatenate to exactly the same arguments as the whole-string parse, no
+    # matter where the chunk boundaries fall.
+    raw = 'quote:" backslash:\\ newline:\n tab:\t cjk:中文 emoji:😀'
+    data = _string_arg_data(raw)
+    arguments = '{"ks": ' + json.dumps(raw) + ', "ko": {"kb": true}, "ka": [1, 2, 3]}'
+    std = [make_std_tool("test_type", arguments), make_std_tool("test_empty", "{}")]
+    run_match(parser, data, True)
+    run_parse(parser, data, "begin--end", std)
+
+
+def test_deepseekv4_empty_string_arg_value():
+    parser = "DeepSeekV4ToolParser"
+    data = _string_arg_data("")
+    arguments = '{"ks": "", "ko": {"kb": true}, "ka": [1, 2, 3]}'
+    std = [make_std_tool("test_type", arguments), make_std_tool("test_empty", "{}")]
+    run_match(parser, data, True)
+    run_parse(parser, data, "begin--end", std)
+
+
 def test_glm47():
     parser = "GLM47ToolParser"
     data = (
