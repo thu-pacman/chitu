@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 
 from chitu.lazy import eval_lazy, make_lazy_op
-from chitu.device_type import has_accelerator
+from chitu.device_type import has_accelerator, is_enflame
 from chitu.ops.utils import compatible_with_inplace, make_op_dispatcher
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 
@@ -48,6 +48,11 @@ def moe_sum_per_token(
 
 @moe_sum_per_token.register_auto
 def _auto_moe_sum_per_token():
+    # The Enflame software stack exposes Triton, but the packaged compiler ABI
+    # cannot compile this kernel.  The Torch reduction preserves FP32
+    # accumulation and supports the dispatcher's out= contract.
+    if is_enflame():
+        return "torch"
     if has_triton_impl:
         return "triton"
     return "torch"

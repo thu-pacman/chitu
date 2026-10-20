@@ -212,6 +212,164 @@ def causal_conv1d_update_triton(
 
 
 @triton.jit
+def causal_conv1d_update_gcu_b1_inplace_kernel(
+    this_ptr,
+    state_ptr,
+    weight_ptr,
+    out_ptr,
+    HIDDEN_SIZE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Exact 4-tap B=1 decode specialization for Enflame L600.
+
+    Each program owns one 256-channel row.  Keeping the reduction width at
+    four preserves the established BF16/FP32 boundary while eliminating the
+    generic kernel's unused 16-way batch lane and separate state allocation.
+    """
+    h = tl.program_id(0) * BLOCK_H + tl.arange(0, BLOCK_H)
+    taps = tl.arange(0, 4)
+    mask = h < HIDDEN_SIZE
+    state_offsets = h[:, None] * 4 + taps[None, :]
+    shifted_offsets = h[:, None] * 4 + (taps[None, :] + 1)
+
+    shifted = tl.load(
+        state_ptr + shifted_offsets,
+        mask=mask[:, None] & (taps[None, :] < 3),
+        other=0.0,
+    )
+    current = tl.load(this_ptr + h, mask=mask, other=0.0)
+    weight = tl.load(weight_ptr + state_offsets, mask=mask[:, None], other=0.0)
+    new_state = tl.where(taps[None, :] == 3, current[:, None], shifted).to(
+        weight.dtype
+    )
+    result = tl.sum(new_state.to(tl.float32) * weight, axis=1)
+    output = result * tl.sigmoid(result)
+
+    tl.store(out_ptr + h, output.to(current.dtype), mask=mask)
+    tl.store(state_ptr + state_offsets, new_state, mask=mask[:, None])
+
+
+def causal_conv1d_update_gcu_b1_inplace(
+    this_hidden_states: torch.Tensor,
+    old_hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+):
+    """B=1 Qwen3-Next decode with an explicitly permitted state mutation."""
+    if tuple(this_hidden_states.shape) != (1, 10240):
+        raise ValueError(f"unexpected input shape {tuple(this_hidden_states.shape)}")
+    if tuple(old_hidden_states.shape) != (1, 10240, 4):
+        raise ValueError(f"unexpected state shape {tuple(old_hidden_states.shape)}")
+    if tuple(weight.shape) != (10240, 1, 4):
+        raise ValueError(f"unexpected weight shape {tuple(weight.shape)}")
+    if not (
+        this_hidden_states.dtype == torch.bfloat16
+        and old_hidden_states.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+    ):
+        raise ValueError("input/state/weight must be BF16")
+    if not (
+        this_hidden_states.device.type == "gcu"
+        and this_hidden_states.device == old_hidden_states.device
+        and this_hidden_states.device == weight.device
+    ):
+        raise ValueError("input/state/weight must be colocated GCU tensors")
+    if not (
+        this_hidden_states.is_contiguous()
+        and old_hidden_states.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        raise ValueError("input/state/weight must be contiguous")
+
+    out = torch.empty_like(this_hidden_states)
+    causal_conv1d_update_gcu_b1_inplace_kernel[(40,)](
+        this_hidden_states,
+        old_hidden_states,
+        weight,
+        out,
+        HIDDEN_SIZE=10240,
+        BLOCK_H=256,
+        num_warps=4,
+        num_stages=3,
+    )
+    return out, old_hidden_states
+
+
+def causal_conv1d_update_gcu_batch_inplace(
+    this_hidden_states: torch.Tensor,
+    old_hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+):
+    """Qwen3-Next B2/B4/B8 decode with exact in-place state mutation.
+
+    This intentionally reuses the generic kernel and its B16/H256 launch
+    geometry.  Changing that geometry can alter rare BF16 rounding cases on
+    Enflame, so this path optimizes only the state allocation/aliasing contract.
+    """
+    batch_size = this_hidden_states.shape[0]
+    if batch_size not in (2, 4, 8):
+        raise ValueError(f"unexpected batch size {batch_size}")
+    if tuple(this_hidden_states.shape) != (batch_size, 10240):
+        raise ValueError(f"unexpected input shape {tuple(this_hidden_states.shape)}")
+    if tuple(old_hidden_states.shape) != (batch_size, 10240, 4):
+        raise ValueError(f"unexpected state shape {tuple(old_hidden_states.shape)}")
+    if tuple(weight.shape) != (10240, 1, 4):
+        raise ValueError(f"unexpected weight shape {tuple(weight.shape)}")
+    if not (
+        this_hidden_states.dtype == torch.bfloat16
+        and old_hidden_states.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+    ):
+        raise ValueError("input/state/weight must be BF16")
+    if not (
+        this_hidden_states.device.type == "gcu"
+        and this_hidden_states.device == old_hidden_states.device
+        and this_hidden_states.device == weight.device
+    ):
+        raise ValueError("input/state/weight must be colocated GCU tensors")
+    if this_hidden_states.stride(1) != 1:
+        raise ValueError("input hidden dimension must have unit stride")
+    if not (old_hidden_states.is_contiguous() and weight.is_contiguous()):
+        raise ValueError("state/weight must be contiguous")
+
+    out = torch.empty_like(this_hidden_states)
+    weight_squeezed = weight.squeeze(1)
+    stride_this_b, stride_this_h = this_hidden_states.stride()
+    stride_state_b, stride_state_h, stride_state_s = old_hidden_states.stride()
+    stride_weight_h, stride_weight_s = weight_squeezed.stride()
+    stride_out_b, stride_out_h = out.stride()
+    block_b = 16
+    block_h = 256
+    causal_conv1d_update_kernel[
+        (triton.cdiv(batch_size, block_b), triton.cdiv(10240, block_h))
+    ](
+        this_hidden_states,
+        old_hidden_states,
+        old_hidden_states,
+        weight_squeezed,
+        out,
+        batch_size,
+        10240,
+        4,
+        stride_this_b,
+        stride_this_h,
+        stride_state_b,
+        stride_state_h,
+        stride_state_s,
+        stride_state_b,
+        stride_state_h,
+        stride_state_s,
+        stride_weight_h,
+        stride_weight_s,
+        stride_out_b,
+        stride_out_h,
+        block_b,
+        block_h,
+        4,
+    )
+    return out, old_hidden_states
+
+
+@triton.jit
 def causal_conv1d_prefill_kernel(
     inputs_ptr,
     old_state_ptr,

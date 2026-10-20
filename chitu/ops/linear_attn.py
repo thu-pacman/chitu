@@ -2,12 +2,15 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 import torch
 import torch.nn.functional as F
 
 from chitu.lazy import eval_lazy, make_lazy_op
 from chitu.ops.utils import check_checkpoint_args, make_op_dispatcher
-from chitu.device_type import is_hygon, is_muxi
+from chitu.ops.norm import rms_norm
+from chitu.device_type import is_enflame, is_hygon, is_muxi
 from chitu.utils import try_import_opt_dep, try_import_platform_dep
 
 if is_muxi():
@@ -55,6 +58,8 @@ def naive_recurrent_gated_delta_rule_all_state(
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel=False,
+    state_output_dtype: torch.dtype = None,
+    state_output: torch.Tensor = None,
 ):
     """
     Reference PyTorch implementation of recurrent gated delta rule.
@@ -68,10 +73,12 @@ def naive_recurrent_gated_delta_rule_all_state(
         scale: float, optional
         initial_state: [B, H, K, V], optional
         output_final_state: bool
+        state_output_dtype: optional dtype used only for the returned state
+        state_output: optional preallocated [B, T, H, K, V] result tensor
 
     Returns:
         o: [B, T, H, V]
-        final_state: [B, H, T, K, V] if output_final_state else None
+        final_state: [B, T, H, K, V] if output_final_state else None
     """
     initial_dtype = q.dtype
     if use_qk_l2norm_in_kernel:
@@ -80,46 +87,173 @@ def naive_recurrent_gated_delta_rule_all_state(
         q = F.rms_norm(q, (head_dim,), eps=1e-6) * inv_scale
         k = F.rms_norm(k, (head_dim,), eps=1e-6) * inv_scale
 
+    # Inputs already use the public [B, T, H, ...] layout.  Keep that layout
+    # instead of materializing five H/T transposes only to transpose outputs
+    # back at the end.  Each per-head reduction still sees the same contiguous
+    # K/V row and therefore retains the established arithmetic order.
     q, k, v, beta, g = map(
-        lambda x: x.transpose(1, 2).contiguous().to(torch.float32), [q, k, v, beta, g]
+        lambda x: x.contiguous().to(torch.float32), [q, k, v, beta, g]
     )
-    B, H, T, K = k.shape
+    B, T, H, K = k.shape
     V = v.shape[-1]
 
-    o = torch.zeros(B, H, T, V, device=v.device, dtype=v.dtype)
-    h = torch.zeros(B, H, K, V, device=v.device, dtype=v.dtype)
-
-    if initial_state is not None:
+    # Every time slice of ``o`` is assigned below, so zero-filling it only
+    # adds a device launch.  Likewise, do not allocate and fill a throwaway
+    # state when the caller supplies ``initial_state`` (the decode path).
+    # Allocate in the public [B, T, H, ...] layout.  The old implementation
+    # wrote strided token slices in [B, H, T, ...] and then transposed and
+    # materialized both outputs, even though every element is produced once.
+    o = torch.empty(B, T, H, V, device=v.device, dtype=v.dtype)
+    if initial_state is None:
+        h = torch.zeros(B, H, K, V, device=v.device, dtype=v.dtype)
+    else:
         h = initial_state.to(torch.float32)
 
     if scale is None:
         scale = 1 / (q.shape[-1] ** 0.5)
     q = q * scale
 
-    h_all = torch.empty(B, H, T, K, V, device=v.device, dtype=v.dtype)
+    # The recurrence stays FP32.  Decode callers that immediately cast saved
+    # states to the cache dtype can request that storage dtype here, avoiding
+    # an FP32 all-state materialization and its subsequent full-tensor cast.
+    if state_output is None:
+        h_all = torch.empty(
+            B,
+            T,
+            H,
+            K,
+            V,
+            device=v.device,
+            dtype=state_output_dtype or v.dtype,
+        )
+    else:
+        expected_shape = (B, T, H, K, V)
+        if state_output.shape != expected_shape:
+            raise ValueError(
+                f"state_output shape {state_output.shape} != {expected_shape}"
+            )
+        if state_output.device != v.device:
+            raise ValueError("state_output must be on the recurrent input device")
+        h_all = state_output
 
     for i in range(T):
-        b_q = q[:, :, i]
-        b_k = k[:, :, i]
-        b_v = v[:, :, i]
-        h = h * g[:, :, i].exp()[..., None, None]
-        b_beta = beta[:, :, i]
+        b_q = q[:, i]
+        b_k = k[:, i]
+        b_v = v[:, i]
+        h = h * g[:, i].exp()[..., None, None]
+        b_beta = beta[:, i]
         b_v = b_v - (h * b_k[..., None]).sum(-2)
         b_v = b_v * b_beta[..., None]
         h = h + b_k.unsqueeze(-1) * b_v.unsqueeze(-2)
-        o[:, :, i] = torch.einsum("bhd,bhdm->bhm", b_q, h)
-        h_all[:, :, i] = h
-
-    h_all = h_all.transpose(1, 2).contiguous()
+        o[:, i] = torch.einsum("bhd,bhdm->bhm", b_q, h)
+        h_all[:, i] = h
 
     if not output_final_state:
         h_all = None
-    o = o.transpose(1, 2).contiguous().to(initial_dtype)
+    o = o.to(initial_dtype)
 
     return o, h_all
 
 
 # SPDX-SnippetEnd
+
+
+def _recurrent_gated_delta_rule_one_step_exact_torch(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state,
+    output_final_state,
+    raw_beta_delta=False,
+    mixed_decay=False,
+):
+    """Specialize the torch recurrence for the classic T=1 decode shape.
+
+    The default retains every arithmetic operation and FP32 materialization
+    from ``recurrent_gated_delta_rule_torch``.  It only removes the zero-filled
+    output allocation plus the indexed write used by the generic loop, whose
+    trip count is exactly one after the H/T transpose.  An explicitly enabled
+    GCU path may fuse the exact BF16 beta sigmoid and FP32 delta elementwise
+    chain while leaving both reductions and the recurrent update unchanged.
+    """
+    if (
+        query.ndim != 4
+        or key.shape != query.shape
+        or query.shape[1] != 1
+        or value.ndim != 4
+        or value.shape[:2] != query.shape[:2]
+        or g.shape != value.shape[:-1]
+        or beta.shape != value.shape[:-1]
+        or initial_state is None
+    ):
+        raise ValueError("one-step recurrent expects compatible [B, 1, H, D] tensors")
+
+    initial_dtype = query.dtype
+    if raw_beta_delta:
+        value_bf16 = value[:, 0]
+        raw_beta = beta[:, 0]
+        query, key, g = [
+            tensor.transpose(1, 2).contiguous().to(torch.float32)
+            for tensor in (query, key, g)
+        ]
+    else:
+        query, key, value, beta, g = [
+            tensor.transpose(1, 2).contiguous().to(torch.float32)
+            for tensor in (query, key, value, beta, g)
+        ]
+    if query.shape[2] != 1:
+        raise ValueError("one-step recurrent specialization requires T=1")
+
+    query = query * (query.shape[-1] ** -0.5)
+    q_t = query[:, :, 0]
+    k_t = key[:, :, 0]
+    g_t = g[:, :, 0].exp().unsqueeze(-1).unsqueeze(-1)
+    if not raw_beta_delta:
+        v_t = value[:, :, 0]
+        beta_t = beta[:, :, 0].unsqueeze(-1)
+
+    mixed_decay_supported = False
+    if mixed_decay:
+        # BF16 -> FP32 is an exact widening conversion.  On GCU400 the mixed
+        # BF16*FP32 MUL produces the same FP32 result as the materialized cast
+        # followed by FP32*FP32, while deleting one full-state cast and its
+        # intermediate.  Keep this behind the narrow measured decode contract;
+        # unsupported layouts retain the established materialized-cast path.
+        batch = initial_state.shape[0] if initial_state.ndim == 4 else 0
+        mixed_decay_supported = (
+            batch in (2, 4, 8)
+            and tuple(initial_state.shape) == (batch, 48, 128, 128)
+            and initial_state.dtype == torch.bfloat16
+            and query.dtype == torch.float32
+            and g_t.dtype == torch.float32
+            and initial_state.device.type == "gcu"
+            and len({initial_state.device, query.device, g_t.device}) == 1
+            and initial_state.is_contiguous()
+        )
+    if mixed_decay_supported:
+        last_recurrent_state = initial_state * g_t
+        if last_recurrent_state.dtype != torch.float32:
+            raise RuntimeError("mixed decay must produce an FP32 recurrent state")
+    else:
+        last_recurrent_state = initial_state.to(query)
+        last_recurrent_state = last_recurrent_state * g_t
+    kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
+    if raw_beta_delta:
+        from chitu.ops.gcu_raw_beta_delta import raw_beta_delta
+
+        delta = raw_beta_delta(value_bf16, kv_mem, raw_beta)
+    else:
+        delta = (v_t - kv_mem) * beta_t
+    last_recurrent_state = last_recurrent_state + k_t.unsqueeze(
+        -1
+    ) * delta.unsqueeze(-2)
+    output = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2).unsqueeze(1)
+
+    if not output_final_state:
+        last_recurrent_state = None
+    return output.to(initial_dtype), last_recurrent_state
 
 
 @make_op_dispatcher
@@ -168,6 +302,11 @@ def _auto_chunk_gated_delta_rule(
     checkpoint_cu_starts=None,
     checkpoint_every_n_tokens: int = 0,
 ):
+    if is_enflame():
+        # No GCU implementation is ported onto the new model yet; f-la's flash
+        # kernels are CUDA-only. Pin to the torch implementation (revisit when a
+        # GCU impl is registered below).
+        return "torch"
     if (
         checkpoint_every_n_tokens > 0
         or state_checkpoints is not None
@@ -477,6 +616,9 @@ def _auto_chunk_kimi_delta_attention(
     requires_checkpoints=False,
     requested_impl="auto",
 ):
+    if is_enflame():
+        return "torch"
+
     """Resolve from runtime tensors or initialization-time metadata.
 
     The keyword-only arguments are for ``resolve_impl`` before tensors exist;
@@ -848,6 +990,8 @@ def recurrent_kimi_delta_attention(
 
 @recurrent_kimi_delta_attention.register_auto
 def _auto_recurrent_kimi_delta_attention():
+    if is_enflame():
+        return "torch"
     if has_boltops_kda:
         return "boltops_kda"
     if has_fla_kda:
@@ -1265,6 +1409,8 @@ def recurrent_gated_delta_rule(
 
 @recurrent_gated_delta_rule.register_auto
 def _auto_recurrent_gated_delta_rule():
+    if is_enflame():
+        return "torch"
     if has_fla:
         return "fla"
     return "torch"
@@ -1337,6 +1483,320 @@ def recurrent_gated_delta_rule_torch(
 # SPDX-SnippetEnd
 
 
+def recurrent_gated_delta_rule_compact_qk_gcu(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    initial_state,
+    output_final_state,
+    norm_weight,
+    impl="torch",
+    single_step=None,
+    raw_beta_delta=False,
+    mixed_decay=False,
+    grouped_qk=False,
+    mixed_query_scale=False,
+    fused_qk_scale=False,
+    query_scale=None,
+    qkv_source=None,
+    initial_state_cache=None,
+    page_table=None,
+    paged_mixed_decay=False,
+):
+    """Run exact batched Qwen3-Next decode from compact Q/K heads on GCU.
+
+    Qwen3.8 maps each of its 16 Q/K heads to three of its 48 value heads.
+    RMS-normalizing after that repeat performs the same work three times.  The
+    GCU path preserves the established BF16 normalization and scaling boundary,
+    then expands only at the BF16-to-FP32 conversion consumed by recurrent.
+    """
+    if query.ndim != 4 or key.shape != query.shape or value.ndim != 4:
+        raise ValueError("compact Q/K recurrent expects [B, T, H, D] tensors")
+    if query.shape[:2] != value.shape[:2] or query.shape[-1] != value.shape[-1]:
+        raise ValueError("compact Q/K and value batch/time/head dimensions disagree")
+    qk_heads = query.shape[-2]
+    value_heads = value.shape[-2]
+    if qk_heads == 0 or value_heads % qk_heads:
+        raise ValueError("value head count must be a multiple of Q/K head count")
+    head_dim = query.shape[-1]
+    if tuple(norm_weight.shape) != (head_dim,):
+        raise ValueError("compact Q/K norm weight has the wrong shape")
+    if norm_weight.device != query.device or norm_weight.dtype != torch.float32:
+        raise ValueError("compact Q/K norm weight must be FP32 on the query device")
+
+    inv_scale = head_dim**-0.5
+    repeat = value_heads // qk_heads
+    if single_step is None:
+        single_step = (
+            os.environ.get("CHITU_GCU_QWEN3_NEXT_RECURRENCE_SINGLE_STEP") == "1"
+        )
+    if raw_beta_delta and not single_step:
+        raise ValueError("raw-beta delta requires the exact T=1 specialization")
+    if mixed_decay and not single_step:
+        raise ValueError("mixed decay requires the exact T=1 specialization")
+    batch = query.shape[0]
+    dense_state_supported = (
+        initial_state is not None
+        and tuple(initial_state.shape) == (batch, 48, 128, 128)
+        and initial_state.dtype == torch.bfloat16
+        and initial_state.device.type == "gcu"
+        and initial_state.is_contiguous()
+    )
+    paged_state_supported = (
+        paged_mixed_decay
+        and initial_state is None
+        and initial_state_cache is not None
+        and page_table is not None
+        and initial_state_cache.ndim == 5
+        and initial_state_cache.shape[0] >= batch
+        and tuple(initial_state_cache.shape[1:]) == (1, 48, 128, 128)
+        and tuple(initial_state_cache.stride()[1:]) == (786432, 16384, 128, 1)
+        and tuple(page_table.shape) == (batch, 1)
+        and tuple(page_table.stride()) == (1, 1)
+        and initial_state_cache.dtype == torch.bfloat16
+        and page_table.dtype == torch.int32
+        and initial_state_cache.device.type == "gcu"
+        and initial_state_cache.device == page_table.device
+        and initial_state_cache.is_contiguous()
+        and page_table.is_contiguous()
+    )
+    if paged_mixed_decay and not paged_state_supported:
+        raise ValueError("unsupported paged mixed-decay state source")
+
+    grouped_qk = grouped_qk and (
+        single_step
+        and raw_beta_delta
+        and mixed_decay
+        and batch in (2, 4, 8)
+        and tuple(query.shape) == (batch, 1, 16, 128)
+        and key.shape == query.shape
+        and tuple(value.shape) == (batch, 1, 48, 128)
+        and tuple(g.shape) == (batch, 1, 48)
+        and tuple(beta.shape) == (batch, 1, 48)
+        and (dense_state_supported or paged_state_supported)
+        and query.dtype == torch.bfloat16
+        and key.dtype == torch.bfloat16
+        and value.dtype == torch.bfloat16
+        and beta.dtype == torch.bfloat16
+        and g.dtype == torch.float32
+        and query.device.type == "gcu"
+        and len(
+            {
+                query.device,
+                key.device,
+                value.device,
+                g.device,
+                beta.device,
+                (
+                    initial_state.device
+                    if dense_state_supported
+                    else initial_state_cache.device
+                ),
+            }
+        )
+        == 1
+    )
+    mixed_query_scale = mixed_query_scale and (
+        grouped_qk
+        and query_scale is not None
+        and tuple(query_scale.shape) == (1,)
+        and query_scale.dtype == torch.float32
+        and query_scale.device == query.device
+        and query_scale.is_contiguous()
+    )
+    fused_qk_scale = fused_qk_scale and mixed_query_scale
+
+    fused_qk_norm_scale = (
+        fused_qk_scale
+        and os.environ.get(
+            "CHITU_GCU_QWEN3_NEXT_FUSED_COMPACT_QK_NORM_SCALE", "0"
+        )
+        == "1"
+        and qkv_source is not None
+        and tuple(qkv_source.shape) == (batch, 10240)
+        and tuple(qkv_source.stride()) == (10240, 1)
+        and qkv_source.dtype == torch.bfloat16
+        and qkv_source.device == query.device
+        and qkv_source.is_contiguous()
+    )
+
+    # Keep the grouped candidate fail-safe: unsupported layouts use the
+    # established expanded compact-Q/K implementation instead of turning an
+    # optional optimization into a service failure.  Evaluate this predicate
+    # before launching either RMSNorm so fallback is deterministic.
+    if fused_qk_norm_scale:
+        from chitu.ops.gcu_fused_compact_qk_norm_scale_tcle import (
+            fused_compact_qk_norm_scale,
+        )
+
+        query_compact, key_compact = fused_compact_qk_norm_scale(
+            qkv_source,
+            query_scale,
+        )
+    else:
+        query_rms = rms_norm(
+            query,
+            norm_weight,
+            eps=1.0e-6,
+            compute_dtype=torch.float32,
+            impl="gcu",
+        )
+        key_rms = rms_norm(
+            key,
+            norm_weight,
+            eps=1.0e-6,
+            compute_dtype=torch.float32,
+            impl="gcu",
+        )
+    if grouped_qk:
+
+        # Qwen3-Next maps each compact Q/K head to exactly three adjacent
+        # value heads.  Preserve the established BF16 normalization/scaling
+        # boundaries, but broadcast [B,16,D] Q/K over a view of state shaped
+        # [B,16,3,D,D] instead of materializing expanded [B,48,D] tensors.
+        if fused_qk_scale:
+            if not fused_qk_norm_scale:
+                from chitu.ops.gcu_compact_qk_scale import compact_qk_scale
+
+                query_compact, key_compact = compact_qk_scale(
+                    query_rms,
+                    key_rms,
+                    query_scale,
+                )
+        else:
+            query_scaled = query_rms * inv_scale
+        if mixed_query_scale and not fused_qk_scale:
+            # A length-one FP32 tensor forces tensor/tensor promotion, so GCU
+            # combines the exact BF16 widening conversion with the second
+            # query scale in one mixed-dtype MUL.  A scalar would retain BF16.
+            query_compact = query_scaled.squeeze(1) * query_scale
+            if query_compact.dtype != torch.float32:
+                raise RuntimeError("mixed query scale must produce FP32")
+        elif not fused_qk_scale:
+            query_compact = query_scaled.to(torch.float32).squeeze(1)
+            query_compact = query_compact * inv_scale
+        if not fused_qk_scale:
+            key_compact = (key_rms * inv_scale).to(torch.float32).squeeze(1)
+        g_t = (
+            g.transpose(1, 2)
+            .contiguous()
+            .to(torch.float32)
+            .squeeze(2)
+            .exp()
+            .reshape(batch, 16, 3, 1, 1)
+        )
+        if paged_state_supported:
+            from chitu.ops.gcu_paged_mixed_decay import paged_mixed_decay as paged_decay
+
+            grouped_state = paged_decay(
+                initial_state_cache,
+                page_table,
+                g_t.reshape(batch, 48),
+            ).reshape(batch, 16, 3, 128, 128)
+        else:
+            grouped_state = initial_state.reshape(batch, 16, 3, 128, 128) * g_t
+        if grouped_state.dtype != torch.float32:
+            raise RuntimeError("grouped mixed decay must produce an FP32 state")
+        if os.environ.get("CHITU_GCU_QWEN3_NEXT_FUSED_RECURRENT_WRS_UPDATE", "") in (
+            "1",
+            "on",
+            "true",
+        ):
+            from chitu.ops.gcu_fused_recurrent_wrs_update import (
+                fused_recurrent_wrs_update,
+            )
+
+            output, state = fused_recurrent_wrs_update(
+                grouped_state.reshape(batch, 48, 128, 128),
+                key_compact,
+                query_compact,
+                value.squeeze(1),
+                beta.squeeze(1),
+            )
+            if not output_final_state:
+                state = None
+            return output.reshape(batch, 1, 48, 128).to(value.dtype), state
+        key_grouped = key_compact.unsqueeze(2).unsqueeze(-1)
+        fused_weighted_sum_mode = os.environ.get(
+            "CHITU_GCU_QWEN3_NEXT_FUSED_WEIGHTED_ROW_SUM", ""
+        )
+        fuse_kv_weighted_sum = fused_weighted_sum_mode in ("1", "both", "kv")
+        fuse_output_weighted_sum = fused_weighted_sum_mode in ("1", "both", "out")
+        if fuse_kv_weighted_sum or fuse_output_weighted_sum:
+            from chitu.ops.gcu_fused_weighted_row_sum import fused_weighted_row_sum
+
+        if fuse_kv_weighted_sum:
+            kv_mem = fused_weighted_row_sum(
+                grouped_state.reshape(batch, 48, 128, 128), key_compact
+            ).reshape(batch, 16, 3, 128)
+        else:
+            kv_mem = (grouped_state * key_grouped).sum(dim=-2)
+
+        from chitu.ops.gcu_raw_beta_delta import raw_beta_delta as raw_beta_delta_op
+
+        delta = raw_beta_delta_op(
+            value.squeeze(1),
+            kv_mem.reshape(batch, 48, 128),
+            beta.squeeze(1),
+        ).reshape(batch, 16, 3, 128)
+        grouped_state = grouped_state + key_grouped * delta.unsqueeze(-2)
+        if fuse_output_weighted_sum:
+            output = fused_weighted_row_sum(
+                grouped_state.reshape(batch, 48, 128, 128), query_compact
+            ).reshape(batch, 16, 3, 128)
+        else:
+            output = (
+                grouped_state * query_compact.unsqueeze(2).unsqueeze(-1)
+            ).sum(dim=-2)
+        state = grouped_state.reshape(batch, 48, 128, 128)
+        if not output_final_state:
+            state = None
+        return output.reshape(batch, 1, 48, 128).to(value.dtype), state
+
+    expanded_shape = (*query.shape[:2], value_heads, head_dim)
+    query_fp32 = (
+        (query_rms * inv_scale)
+        .unsqueeze(-2)
+        .expand(*query.shape[:-2], qk_heads, repeat, head_dim)
+        .to(torch.float32)
+        .reshape(expanded_shape)
+    )
+    key_fp32 = (
+        (key_rms * inv_scale)
+        .unsqueeze(-2)
+        .expand(*key.shape[:-2], qk_heads, repeat, head_dim)
+        .to(torch.float32)
+        .reshape(expanded_shape)
+    )
+    if single_step:
+        output, state = _recurrent_gated_delta_rule_one_step_exact_torch(
+            query_fp32,
+            key_fp32,
+            value,
+            g,
+            beta,
+            initial_state,
+            output_final_state,
+            raw_beta_delta=raw_beta_delta,
+            mixed_decay=mixed_decay,
+        )
+    else:
+        output, state = recurrent_gated_delta_rule(
+            query_fp32,
+            key_fp32,
+            value,
+            g,
+            beta,
+            initial_state,
+            output_final_state,
+            use_qk_l2norm_in_kernel=False,
+            impl=impl,
+        )
+    return output.to(value.dtype), state
+
+
 recurrent_gated_delta_rule.register_candidate("fla")
 if has_fla:
     # With check_params, the caller can only call with positional arguments.
@@ -1356,6 +1816,8 @@ def recurrent_gated_delta_rule_all_state(
     initial_state,
     output_final_state,
     use_qk_l2norm_in_kernel=False,
+    state_output_dtype=None,
+    state_output=None,
     impl="auto",
 ):
     raise NotImplementedError
@@ -1363,6 +1825,8 @@ def recurrent_gated_delta_rule_all_state(
 
 @recurrent_gated_delta_rule_all_state.register_auto
 def _auto_recurrent_gated_delta_rule_all_state():
+    if is_enflame():
+        return "torch"
     if has_triton:
         return "triton"
     return "torch"
@@ -1378,6 +1842,8 @@ def _recurrent_gated_delta_rule_all_state_torch(
     initial_state,
     output_final_state,
     use_qk_l2norm_in_kernel=False,
+    state_output_dtype=None,
+    state_output=None,
 ):
     return naive_recurrent_gated_delta_rule_all_state(
         q=query,
@@ -1389,6 +1855,8 @@ def _recurrent_gated_delta_rule_all_state_torch(
         initial_state=initial_state,
         output_final_state=output_final_state,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        state_output_dtype=state_output_dtype,
+        state_output=state_output,
     )
 
 
@@ -1402,8 +1870,10 @@ def _recurrent_gated_delta_rule_all_state_triton(
     initial_state,
     output_final_state,
     use_qk_l2norm_in_kernel=False,
+    state_output_dtype=None,
+    state_output=None,
 ):
-    return fused_recurrent_gated_delta_rule_fwd_all_state_triton(
+    output, state = fused_recurrent_gated_delta_rule_fwd_all_state_triton(
         q=query,
         k=key,
         v=value,
@@ -1414,3 +1884,9 @@ def _recurrent_gated_delta_rule_all_state_triton(
         output_final_state=output_final_state,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
+    if state is not None and state_output_dtype is not None:
+        state = state.to(state_output_dtype)
+    if state is not None and state_output is not None:
+        state_output.copy_(state)
+        state = state_output
+    return output, state
