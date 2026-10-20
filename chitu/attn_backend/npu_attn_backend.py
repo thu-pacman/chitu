@@ -24,7 +24,9 @@ from chitu.utils import (
 )
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
-cinfer_ascendc, _ = try_import_opt_dep("cinfer_ascendc", "ascend_kernels")
+cinfer_ascendc, has_cinfer_ascendc = try_import_opt_dep(
+    "cinfer_ascendc", "ascend_kernels"
+)
 
 core_num_each_platform = {
     "Ascend910_9361": 40,
@@ -148,7 +150,7 @@ class NpuAttnBackend(RefAttnBackend):
 
     @classmethod
     def should_use_attn_from_cinfer_ascendc(cls, model_type, batch_size):
-        return hasattr(cinfer_ascendc, "incre_flash_attention")
+        return has_cinfer_ascendc and hasattr(cinfer_ascendc, "incre_flash_attention")
 
     def prepare_metadata_for_prefill(self, seq_len_delta: BatchedSeqLenDelta):
         """construct attention mask for prefilling, different sequences will not attend each other
@@ -657,6 +659,12 @@ class NpuAttnBackend(RefAttnBackend):
             q = q.view(
                 self.batch_size, q.shape[0] // self.batch_size, *q.shape[1:]
             ).contiguous()
+            # `output` is [TND]; the operator requires its dim to match the
+            # [BSND] query. The view shares storage, so `output` still carries
+            # the result.
+            output_bsnd = output.view(
+                self.batch_size, output.shape[0] // self.batch_size, *output.shape[1:]
+            )
             lse = torch.empty(1, dtype=q.dtype, device="npu")
             torch_npu.npu_fused_infer_attention_score.out(
                 q,
@@ -667,7 +675,7 @@ class NpuAttnBackend(RefAttnBackend):
                 scale=softmax_scale,
                 num_heads=self.local_n_heads,
                 num_key_value_heads=self.local_n_kv_heads,
-                out=[output, lse],
+                out=[output_bsnd, lse],
             )
 
         return output
