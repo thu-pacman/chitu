@@ -16,7 +16,7 @@ from torch import nn
 
 from chitu.lazy import eval_lazy
 from chitu.task_type import TaskType
-from chitu.device_type import is_muxi
+from chitu.device_type import is_muxi, is_hygon
 from chitu.attn_backend import AttnBackend, NpuAttnBackend
 from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.kv_cache import KVCacheBase, PagedKVCache, DenseKVCache
@@ -2656,7 +2656,9 @@ class ParallelMoeBlock(nn.Module):
         self.shared_experts = non_fused_shared_experts
 
         self.shared_experts_stream = None
-        if self.shared_experts is not None and not is_muxi():
+        if self.shared_experts is not None and not is_muxi() and not is_hygon():
+            # NOTE on hygon: Although Hygon supports multi-stream, we observed memory
+            # leak on main memory in this case, and therefore we disable it.
             self.shared_experts_stream = _make_shared_experts_stream()
 
         self.moe_impl = moe_impl
