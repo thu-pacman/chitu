@@ -120,7 +120,9 @@ def test_responses_input_to_internal_supports_tool_roundtrip_items():
     ],
 )
 def test_normalize_response_tools_accepts_flat_and_chat_shapes(tools):
-    internal_tools, public_tools = normalize_response_tools(tools)
+    internal_tools, public_tools, tool_names = normalize_response_tools(tools)
+
+    assert tool_names == {"get_weather": {"name": "get_weather"}}
 
     assert internal_tools == [
         {

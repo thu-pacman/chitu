@@ -196,7 +196,7 @@ OpenAI Responses API 的最小可用子集，用于文本生成、流式返回�
 | `top_p` | `number` \| `null` | `null` | 核采样阈值。省略时使用服务端默认值。 |
 | `text` | `ResponsesTextConfig` \| `null` | `null` | 文本输出配置，包括 text.format。 |
 | `reasoning` | `ResponsesReasoningConfig` \| `null` | `null` | 推理配置。reasoning.effort='none' 会关闭 thinking；其他值会视为开启。 |
-| `tools` | `list[object]` | `[]` | 函数工具。既支持 Responses 风格的扁平 function tool，也支持 Chat Completions 风格的嵌套 function tool。 |
+| `tools` | `list[object]` | `[]` | 函数工具，可按 namespace 分组。既支持 Responses 风格的扁平 function tool，也支持 Chat Completions 风格的嵌套 function tool。 |
 | `tool_choice` | `none` \| `auto` \| `required` \| `ToolChoiceNamedTool` | `"auto"` | 工具选择行为："auto"、"none"、"required"，或指定一个命名 function tool。 |
 | `parallel_tool_calls` | `boolean` | `true` | 模型是否可以并行发起多个工具调用。 |
 | `previous_response_id` | `string` \| `null` | `null` | 暂不支持。设置该字段的请求会被拒绝。 |
@@ -244,6 +244,7 @@ OpenAI Responses API 的最小可用子集，用于文本生成、流式返回�
 | `type` | `function_call` | `"function_call"` | 函数调用输入项。 |
 | `call_id` | `string` | **必填** | 函数调用 ID。 |
 | `name` | `string` | **必填** | 函数名称。 |
+| `namespace` | `string` \| `null` | `null` | 函数所属的命名空间。 |
 | `arguments` | `string` | `""` | JSON 字符串形式的函数调用参数。 |
 
 #### `ResponsesFunctionCallOutputInputItem` 对象
@@ -296,6 +297,7 @@ OpenAI Responses API 的最小可用子集，用于文本生成、流式返回�
 |---|---|---|---|
 | `type` | `function` | `"function"` | 命名 function tool 选择器类型。 |
 | `name` | `string` | **必填** | 要选择的 function tool 名称。 |
+| `namespace` | `string` \| `null` | `null` | 函数所属的命名空间。 |
 
 #### 当前限制
 

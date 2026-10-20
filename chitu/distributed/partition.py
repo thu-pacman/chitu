@@ -24,9 +24,20 @@ def compute_layer_dist_in_pp(pp_size: int):
     if args.infer.pp_layer_partition is not None:
         assert (
             len(args.infer.pp_layer_partition) == pp_size
-            and sum(args.infer.pp_layer_partition) == args.models.n_layers
-        ), f"pp_layer_partition must be a list of length {pp_size} and sum up to {args.models.n_layers}"
-        num_layers_of_each_rank = args.infer.pp_layer_partition
+            and sum(args.infer.pp_layer_partition) == num_layers
+        ), (
+            f"pp_layer_partition must be a list of length {pp_size} and sum up to "
+            f"{num_layers} (models.n_layers={args.models.n_layers}), got "
+            f"{list(args.infer.pp_layer_partition)}"
+            + (
+                f"; infer.mtp_size={args.infer.mtp_size} > 1 adds one synthetic "
+                "MTP layer, so add 1 to the last stage"
+                if args.infer.mtp_size > 1
+                else ""
+            )
+        )
+        # Copy the list so we never mutate the Hydra/OmegaConf input in place.
+        num_layers_of_each_rank = list(args.infer.pp_layer_partition)
     else:
         num_layers_of_each_rank = [
             num_layers // pp_size + (1 if i < num_layers % pp_size else 0)

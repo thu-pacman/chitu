@@ -196,7 +196,7 @@ Minimal subset of the OpenAI Responses API for text generation, streaming, funct
 | `top_p` | `number` \| `null` | `null` | Nucleus sampling threshold. Uses the server default when omitted. |
 | `text` | `ResponsesTextConfig` \| `null` | `null` | Text output configuration, including text.format. |
 | `reasoning` | `ResponsesReasoningConfig` \| `null` | `null` | Reasoning configuration. reasoning.effort='none' disables thinking; other values are treated as enabled. |
-| `tools` | `list[object]` | `[]` | Function tools. Both Responses-style flat function tools and Chat Completions-style nested function tools are accepted. |
+| `tools` | `list[object]` | `[]` | Function tools, optionally grouped in namespaces. Both Responses-style flat function tools and Chat Completions-style nested function tools are accepted. |
 | `tool_choice` | `none` \| `auto` \| `required` \| `ToolChoiceNamedTool` | `"auto"` | Tool choice behavior: "auto", "none", "required", or a named function tool. |
 | `parallel_tool_calls` | `boolean` | `true` | Whether the model can make multiple tool calls in parallel. |
 | `previous_response_id` | `string` \| `null` | `null` | Unsupported. Requests setting this field are rejected. |
@@ -244,6 +244,7 @@ Minimal subset of the OpenAI Responses API for text generation, streaming, funct
 | `type` | `function_call` | `"function_call"` | Function call input item. |
 | `call_id` | `string` | **required** | Function call identifier. |
 | `name` | `string` | **required** | Function name. |
+| `namespace` | `string` \| `null` | `null` | Namespace containing the function. |
 | `arguments` | `string` | `""` | Function call arguments as a JSON string. |
 
 #### `ResponsesFunctionCallOutputInputItem` Object
@@ -296,6 +297,7 @@ Minimal subset of the OpenAI Responses API for text generation, streaming, funct
 |---|---|---|---|
 | `type` | `function` | `"function"` | Named function tool selector type. |
 | `name` | `string` | **required** | Name of the function tool to select. |
+| `namespace` | `string` \| `null` | `null` | Namespace containing the function. |
 
 #### Current Limitations
 
