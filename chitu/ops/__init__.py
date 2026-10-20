@@ -8,7 +8,8 @@ from chitu.ops.rotary import (
     apply_rotary_pos_emb_single,
     apply_rotary_pos_emb_single_partial,
 )
-from chitu.ops.activation import silu_and_mul
+from chitu.ops.activation import silu_and_mul, situ_and_mul
+from chitu.ops.attn_res import attn_res_mix
 from chitu.ops.sampling import apply_frequency_penalty
 from chitu.ops.kv_cache import (
     append_to_paged_kv_cache,

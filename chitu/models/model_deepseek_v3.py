@@ -45,6 +45,7 @@ from chitu.ops import (
     apply_rotary_pos_emb_partial,
     apply_rotary_pos_emb_single_partial,
     silu_and_mul,
+    situ_and_mul,
     blockfp8_weight_dequant,
     soft_fp8_blockfp8_weight_dequant,
     blockfp8_weight_quant,
@@ -564,6 +565,9 @@ class AttentionDeepSeekV3(Attention):
         self.qk_rope_head_dim = args.qk_rope_head_dim
         self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
+        # NoPE models (e.g. Kimi-K3 Gated MLA) keep the rope dims in q/k and the
+        # latent KV cache but never apply the rotary embedding.
+        self.mla_apply_rope = bool(getattr(args, "mla_apply_rope", True))
         self.index_head_dim = getattr(args, "index_head_dim", None)
         self.index_n_heads = getattr(args, "index_n_heads", None)
         self.index_topk = getattr(args, "index_topk", None)
@@ -915,14 +919,21 @@ class AttentionDeepSeekV3(Attention):
         q = q.view(n_tokens, self.n_local_heads, -1)
         kv = kv.view(n_tokens, 1, -1)
 
-        q, kv, q_nope, q_pe, _, kv_lora, k_pe, _ = apply_rotary_pos_emb_partial(
-            q,
-            kv,
-            freqs_cis,
-            q_rotary_begin=q.shape[-1] - self.qk_rope_head_dim,
-            k_rotary_begin=self.kv_lora_rank,
-            rotary_type="interleaved",
-        )
+        if self.mla_apply_rope:
+            q, kv, q_nope, q_pe, _, kv_lora, k_pe, _ = apply_rotary_pos_emb_partial(
+                q,
+                kv,
+                freqs_cis,
+                q_rotary_begin=q.shape[-1] - self.qk_rope_head_dim,
+                k_rotary_begin=self.kv_lora_rank,
+                rotary_type="interleaved",
+            )
+        else:
+            # NoPE: split the latent q/kv into (nope, rope) parts without rotating.
+            q_nope = q[..., : self.qk_nope_head_dim]
+            q_pe = q[..., self.qk_nope_head_dim :]
+            kv_lora = kv[..., : self.kv_lora_rank]
+            k_pe = kv[..., self.kv_lora_rank :]
 
         indexer_k_global: torch.Tensor | None = None
         if cp_active:
@@ -995,6 +1006,7 @@ class AttentionDeepSeekV3(Attention):
         """
         bs_seq, _ = x.size()
         seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
+        attn_input = x
 
         # Build full Q/K/V and normalized latent KV for absorb-kv-only prefill.
         n_tokens = x.size(0)
@@ -1098,7 +1110,7 @@ class AttentionDeepSeekV3(Attention):
             softmax_scale=self.softmax_scale,
         )
 
-        return self.o_proj(x.flatten(-2)).view(bs_seq, -1)
+        return self._final_output(x, attn_input, bs_seq)
 
     def make_indexer(
         self,
@@ -1127,6 +1139,9 @@ class AttentionDeepSeekV3(Attention):
         seq_len_delta = self.cache.get_seq_len_delta(is_mtp)
         bs_seq, _ = x.size()
         n_tokens = bs_seq
+        # The attention input is needed by `_final_output` (e.g. for the Kimi-K3
+        # output gate); `x` is reassigned below.
+        attn_input = x
 
         cp_ctx = get_cp_context()
         cp_active = cp_ctx.step_active and not seq_len_delta.is_decode_stage
@@ -1397,7 +1412,17 @@ class AttentionDeepSeekV3(Attention):
                     f"MLA absorb mode {self.mla_absorb} not supported"
                 )
 
-        return self.o_proj(x.flatten(-2)).view(n_tokens, -1)
+        return self._final_output(x, attn_input, n_tokens)
+
+    def _final_output(
+        self, attn_out: torch.Tensor, attn_input: torch.Tensor, n_tokens: int
+    ) -> torch.Tensor:
+        """Project the attention output back to the hidden size.
+
+        Subclasses may override this to post-process the attention output with
+        the original attention input.
+        """
+        return self.o_proj(attn_out.flatten(-2)).view(n_tokens, -1)
 
 
 class SharedHeadDeepSeekV3(nn.Module):
@@ -1458,8 +1483,27 @@ class MLPDeepSeekV3(nn.Module):
         checkpoint_prefix: str | CheckpointPrefix,
         merge_gate_up=None,  # only work when role is "shared_experts"
         layer_id: int = 0,
+        activation: Optional[str] = None,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ):
         super().__init__()
+        if activation is None:
+            activation = (
+                "situ" if getattr(args, "hidden_act", "silu") == "situ" else "silu"
+            )
+        assert activation in (
+            "silu",
+            "situ",
+        ), f"Unsupported MLP activation: {activation}"
+        if activation == "situ":
+            if situ_beta is None:
+                situ_beta = float(getattr(args, "activation_situ_beta", None) or 1.0)
+            if situ_linear_beta is None:
+                situ_linear_beta = getattr(args, "activation_situ_linear_beta", None)
+        self.activation = activation
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
         checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         gate_up_checkpoint_prefix = checkpoint_prefix / CheckpointPrefix.merged(
             "gate_proj", "up_proj"
@@ -1476,13 +1520,16 @@ class MLPDeepSeekV3(nn.Module):
         self.swiglu_limit = getattr(args, "swiglu_limit", 0.0)
 
         if role == "standalone":
-            inter_dim = args.inter_dim
+            resolved_inter_dim = args.inter_dim
         elif role == "shared_experts":
-            inter_dim = args.moe_inter_dim
+            resolved_inter_dim = args.moe_inter_dim * getattr(
+                args, "n_shared_experts", 1
+            )
         else:
             raise ValueError(
                 f"Invalid role: {role}. Expected 'standalone' or 'shared_experts'."
             )
+        inter_dim = resolved_inter_dim
 
         if self.merge_gate_up:
             self.gate_up_proj = ColumnParallelLinear(
@@ -1549,19 +1596,39 @@ class MLPDeepSeekV3(nn.Module):
         """
         if self.merge_gate_up:
             gate_up_proj_out = self.gate_up_proj(x)
-            swiglu_limit = self.swiglu_limit if self.swiglu_limit > 0 else None
-            return self.down_proj(
-                silu_and_mul(gate_up_proj_out, swiglu_limit=swiglu_limit)
-            )
+            if self.activation == "silu":
+                swiglu_limit = self.swiglu_limit if self.swiglu_limit > 0 else None
+                activation_out = silu_and_mul(
+                    gate_up_proj_out, swiglu_limit=swiglu_limit
+                )
+            elif self.activation == "situ":
+                activation_out = situ_and_mul(
+                    gate_up_proj_out,
+                    beta=self.situ_beta,
+                    linear_beta=self.situ_linear_beta,
+                )
+            else:
+                raise ValueError(f"Unsupported MLP activation: {self.activation}")
+            return self.down_proj(activation_out)
         else:
             gate_proj_out = self.gate_proj(x)
             up_proj_out = self.up_proj(x)
-            if self.swiglu_limit > 0:
-                gate_proj_out = torch.clamp(gate_proj_out, max=self.swiglu_limit)
-                up_proj_out = torch.clamp(
-                    up_proj_out, min=-self.swiglu_limit, max=self.swiglu_limit
+            if self.activation == "silu":
+                if self.swiglu_limit > 0:
+                    gate_proj_out = torch.clamp(gate_proj_out, max=self.swiglu_limit)
+                    up_proj_out = torch.clamp(
+                        up_proj_out, min=-self.swiglu_limit, max=self.swiglu_limit
+                    )
+                activation_out = F.silu(gate_proj_out) * up_proj_out
+            elif self.activation == "situ":
+                activation_out = situ_and_mul(
+                    torch.cat([gate_proj_out, up_proj_out], dim=-1),
+                    beta=self.situ_beta,
+                    linear_beta=self.situ_linear_beta,
                 )
-            return self.down_proj(F.silu(gate_proj_out) * up_proj_out)
+            else:
+                raise ValueError(f"Unsupported MLP activation: {self.activation}")
+            return self.down_proj(activation_out)
 
 
 class GateDeepSeekV3(MoeGate):
@@ -1639,7 +1706,14 @@ def MoeExpertsDeepSeekV3(
     checkpoint_prefix: str | CheckpointPrefix,
     base_moe_experts_class: Optional[type] = None,
     quant_kwargs: Mapping[str, Mapping[str, Any]] = {},
+    expert_dim: Optional[int] = None,
 ):
+    """Create the routed-experts (plus optionally the fused shared expert).
+
+    ``expert_dim`` overrides the experts' input hidden size. Kimi-K3's latent
+    MoE experts live in a compressed space (``routed_expert_hidden_size``)
+    while the rest of the model uses ``args.dim``.
+    """
     checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
     moe_checkpoint_prefix = checkpoint_prefix / "moe"
     gate_up_quant_prefix = _deepseek_v3_moe_quant_prefixes(
@@ -1659,9 +1733,10 @@ def MoeExpertsDeepSeekV3(
             )
         )
 
-    assert args.moe_inter_dim % get_etp_size() == 0
+    expert_dim = expert_dim if expert_dim is not None else args.dim
+    assert expert_dim % get_etp_size() == 0
     experts = base_moe_experts_class(
-        dim=args.dim,
+        dim=expert_dim,
         moe_inter_dim=args.moe_inter_dim // get_etp_size(),
         global_n_experts=global_n_experts,
         experts_start_idx=experts_start_idx,
@@ -1685,7 +1760,11 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
         moe_impl: Optional[MoEImplBase] = None,
         *,
         checkpoint_prefix: str | CheckpointPrefix,
+        expert_dim: Optional[int] = None,
     ):
+        """``expert_dim`` overrides the routed experts' input hidden size
+        (Kimi-K3's latent MoE runs its experts in a compressed space; see
+        ``ParallelMoeBlockKimiK3``)."""
         checkpoint_prefix = as_checkpoint_prefix(checkpoint_prefix)
         if moe_impl is None:
             moe_impl = get_moe_impl()
@@ -1729,6 +1808,7 @@ class ParallelMoeBlockDeepSeekV3(ParallelMoeBlock):
                 checkpoint_prefix=checkpoint_prefix,
                 base_moe_experts_class=base_moe_experts_class,
                 quant_kwargs=quant_kwargs,
+                expert_dim=expert_dim,
             ),
             non_fused_shared_experts=non_fused_shared_experts,
             layer_id=layer_id,

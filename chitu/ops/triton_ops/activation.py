@@ -5,6 +5,7 @@
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.libdevice as tldevice
 
 from chitu.native_layout import Vector
 from chitu.ops.triton_ops.utils import auto_retry_triton_compilation, autotune_compat
@@ -146,6 +147,95 @@ def silu_and_mul_kernel(
         result = silu_part1 * part2_fp32.to(part2.dtype)
     output = output_ptr + tl.cast(row_idx, INDEX_DTYPE) * output_n_cols + offsets
     tl.store(output, result, mask=(offsets < output_n_cols))
+
+
+@autotune_compat(
+    configs=silu_and_mul_configs, key=["output_n_cols"], cache_results=True
+)
+@triton.jit
+def situ_and_mul_kernel(
+    output_ptr,
+    x_ptr,
+    output_n_cols,
+    BLOCK_SIZE: tl.constexpr,
+    INDEX_DTYPE: tl.constexpr,
+    SITU_BETA: tl.constexpr,
+    SITU_LINEAR_BETA: tl.constexpr,
+):
+    """SituGLU activation used by Kimi models.
+
+    gate = x[..., :d], up = x[..., d:]; computed in fp32:
+        gate' = beta * tanh(gate / beta) * sigmoid(gate)
+        up'   = linear_beta * tanh(up / linear_beta)   (when linear_beta is set)
+        out   = gate' * up'
+    """
+    row_idx = tl.program_id(0)
+    row_start_ptr = x_ptr + tl.cast(row_idx, INDEX_DTYPE) * output_n_cols * 2
+    offsets = tl.arange(0, BLOCK_SIZE)
+    col_mask = offsets < output_n_cols
+    gate = tl.load(row_start_ptr + offsets, mask=col_mask, other=0).to(tl.float32)
+    up = tl.load(row_start_ptr + output_n_cols + offsets, mask=col_mask, other=0).to(
+        tl.float32
+    )
+
+    sig = 1.0 / (1.0 + tl.exp(-gate))
+    gate = SITU_BETA * tldevice.tanh(gate / SITU_BETA) * sig
+    if SITU_LINEAR_BETA > 0.0:
+        up = SITU_LINEAR_BETA * tldevice.tanh(up / SITU_LINEAR_BETA)
+
+    result = (gate * up).to(output_ptr.dtype.element_ty)
+    output = output_ptr + tl.cast(row_idx, INDEX_DTYPE) * output_n_cols + offsets
+    tl.store(output, result, mask=col_mask)
+
+
+@auto_retry_triton_compilation
+def situ_and_mul_triton(
+    x,
+    beta: float = 1.0,
+    linear_beta: float | None = None,
+):
+    assert isinstance(x, torch.Tensor)
+
+    n_rows = x.nelement() // x.shape[-1]
+    n_cols = x.shape[-1]
+    assert n_cols % 2 == 0
+
+    output_shape = x.shape[:-1] + (n_cols // 2,)
+    output = torch.empty(output_shape, device=x.device, dtype=x.dtype)
+
+    if output.device == torch.device("meta"):
+        return output
+
+    if output.numel() == 0:
+        return output
+
+    assert x.is_contiguous()
+    assert output.is_contiguous()
+
+    if x.numel() >= 2147483648:
+        INDEX_DTYPE = tl.int64
+    else:
+        INDEX_DTYPE = tl.int32
+
+    # Same block-size policy as silu_and_mul_triton (see the unsloth snippet there).
+    MAX_FUSED_SIZE = 65536
+    BLOCK_SIZE = triton.next_power_of_2(n_cols // 2)
+    if BLOCK_SIZE > MAX_FUSED_SIZE:
+        raise RuntimeError(
+            f"Cannot launch Triton kernel since n = {n_cols // 2} exceeds "
+            f"the recommended Triton blocksize = {MAX_FUSED_SIZE}."
+        )
+
+    situ_and_mul_kernel[(n_rows,)](
+        output,
+        x,
+        n_cols // 2,
+        BLOCK_SIZE=BLOCK_SIZE,
+        INDEX_DTYPE=INDEX_DTYPE,
+        SITU_BETA=float(beta),
+        SITU_LINEAR_BETA=(float(linear_beta) if linear_beta is not None else -1.0),
+    )
+    return output
 
 
 @triton.jit

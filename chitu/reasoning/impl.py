@@ -32,3 +32,74 @@ class ReasoningParser:
             if token_id == self.params.end_token_id:
                 return ReasoningState.DELIMITER
             return ReasoningState.OUTPUT
+
+
+class MultiTokenReasoningParser(ReasoningParser):
+    """Reasoning parser shared by the ``multi-token-forced`` and
+    ``multi-token-switchable`` types.
+
+    Features:
+    - No start delimiter matching: the chat template must render it.
+    - The end delimiter may contain multiple tokens.
+
+    Configure end delimiter via ``models.reasoning_end_delimiter_token_ids``.
+    The token sequence is matched in order, but not necessarily contiguously.
+    """
+
+    _THINKING = 0
+    _MATCHING = 1  # anchor seen, waiting for the remaining delimiter tokens
+    _OUTPUT = 2
+
+    def __init__(self, enable_thinking: bool):
+        super().__init__(enable_thinking)
+        self.delimiter = list(self.params.end_delimiter_token_ids or [])
+        if self.params.enable_reasoning:
+            assert self.delimiter, (
+                "multi-token reasoning types (multi-token-forced / "
+                "multi-token-switchable) require "
+                "models.reasoning_end_delimiter_token_ids"
+            )
+        self.progress = 0
+        self.channel = self._THINKING if self.params.enable_reasoning else self._OUTPUT
+
+    def update(self, token_id) -> ReasoningState:
+        if not self.params.enable_reasoning:
+            return ReasoningState.OUTPUT
+
+        if self.channel == self._THINKING:
+            if token_id == self.delimiter[0]:
+                self.progress = 1
+                self.channel = (
+                    self._OUTPUT
+                    if self.progress == len(self.delimiter)
+                    else self._MATCHING
+                )
+                return ReasoningState.DELIMITER
+            return ReasoningState.REASONING
+        if self.channel == self._MATCHING:
+            if token_id == self.delimiter[self.progress]:
+                self.progress += 1
+                if self.progress == len(self.delimiter):
+                    self.channel = self._OUTPUT
+            # Advancing or skipping filler, the whole structural region is
+            # delimiter and must never reach the user.
+            return ReasoningState.DELIMITER
+        return ReasoningState.OUTPUT
+
+
+def make_reasoning_parser(enable_thinking: bool) -> ReasoningParser:
+    """Create the reasoning parser selected by the model's reasoning_type."""
+    try:
+        from chitu.global_vars import get_global_args
+
+        if get_global_args().models.reasoning_type in (
+            "multi-token-forced",
+            "multi-token-switchable",
+        ):
+            # The parser is agnostic to forced vs switchable: both read the
+            # delimiter from ReasoningParams, and a disabled parser (switchable
+            # + enable_thinking=False) classifies everything as OUTPUT.
+            return MultiTokenReasoningParser(enable_thinking)
+    except Exception:
+        pass
+    return ReasoningParser(enable_thinking)

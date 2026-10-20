@@ -2721,8 +2721,13 @@ class ParallelMoeBlock(nn.Module):
         if rerouted_indices is None:
             rerouted_indices = indices
 
+        # Hook for models that wrap the routed-expert path in a latent space
+        # (Kimi-K3): compress the tokens before they are dispatched, so EP
+        # communication carries routed_dim-wide tokens. Identity for everyone else.
+        x_routed, routed_dim = self._routed_input(x, hidden_size)
+
         routed_x = IndexedBatchedRoutedActivation(
-            x,
+            x_routed,
             rerouted_indices,
             expected_n_tokens_per_expert=ceil_div(
                 weights.numel(), self.experts.global_n_experts
@@ -2824,7 +2829,7 @@ class ParallelMoeBlock(nn.Module):
                     inplace=inplace and not x_in_use_simultenously,
                     impl=experts_impl,
                 )
-                assert y_item.ndim == 2 and y_item.shape[-1] == hidden_size
+                assert y_item.ndim == 2 and y_item.shape[-1] == routed_dim
                 y_list.append(y_item)
             assert len(y_list) > 0
             if len(y_list) == 1:
@@ -2832,7 +2837,14 @@ class ParallelMoeBlock(nn.Module):
             else:
                 y = torch.cat([eval_lazy(y_item) for y_item in y_list], dim=0)
 
-            if shared_y is not None and self.moe_impl.tp_size > 1:
+            if (
+                shared_y is not None
+                and self.moe_impl.tp_size > 1
+                # Latent-MoE models: y is still in the latent space here, so the
+                # shared-experts output (model hidden space) cannot be fused
+                # into it; such models take the separate shared_y reduce below.
+                and routed_dim == hidden_size
+            ):
                 # Note that shared experts are partitioned among TP groups instead of ETP groups,
                 # so we need to reduce shared_y on tp group. If this group equals the group reduce
                 # y on EP and/or ETP group, we can merge them together.
@@ -2849,13 +2861,39 @@ class ParallelMoeBlock(nn.Module):
 
             y = self.moe_impl.exit_moe_after_local_sum(y)
 
+        # Hook for latent-MoE models: project the experts' combined output back
+        # to the model hidden space before it is merged with the shared experts.
+        # Identity for everyone else.
+        y = self._routed_output(y)
+
         if shared_y is not None:
-            if self.shared_experts_stream:
+            if self.shared_experts_stream is not None:
                 torch.cuda.current_stream().wait_stream(self.shared_experts_stream)
             if self.moe_impl.tp_size > 1:
                 shared_y = self.moe_impl.tp_group.all_reduce(shared_y)
             y += shared_y
         return eval_lazy(y).view(shape)
+
+    def _routed_input(
+        self, x: torch.Tensor, hidden_size: int
+    ) -> tuple[torch.Tensor, int]:
+        """Transform the tokens entering the routed-expert path.
+
+        Returns the routed activation source and its last-dim size. The default
+        is the identity; models that wrap the routed path in a latent space
+        (Kimi-K3) override this to compress the tokens first, so dispatch
+        carries the smaller latent width.
+        """
+        return x, hidden_size
+
+    def _routed_output(self, y: torch.Tensor) -> torch.Tensor:
+        """Transform the experts' combined output (after the MoE reduce).
+
+        The default is the identity; latent-MoE models override this to map the
+        combined output back to the model hidden space before it is added to
+        the shared-experts output.
+        """
+        return y
 
 
 def get_linear_layout_native_y(

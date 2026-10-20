@@ -263,3 +263,64 @@ def _silu_and_mul_torch_handler(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
     )
+
+
+def situ_and_mul_torch(
+    x: torch.Tensor,
+    beta: float = 1.0,
+    linear_beta: Optional[float] = None,
+):
+    """SituGLU activation used by Kimi models (reference formula).
+
+    ``situ(gate, up) = beta * tanh(gate / beta) * sigmoid(gate) * up``; when
+    ``linear_beta`` is set, ``up`` is also softly clipped with
+    ``linear_beta * tanh(up / linear_beta)``. Computed in fp32, cast back to ``x.dtype``.
+    """
+    d = x.shape[-1] // 2
+    gate = x[..., :d].to(torch.float32)
+    up = x[..., d:].to(torch.float32)
+    gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+    if linear_beta is not None:
+        up = linear_beta * torch.tanh(up / linear_beta)
+    return (gate * up).to(x.dtype)
+
+
+@make_op_dispatcher
+def situ_and_mul(
+    x: torch.Tensor,
+    beta: float = 1.0,
+    linear_beta: Optional[float] = None,
+    impl="auto",
+):
+    raise NotImplementedError
+
+
+@situ_and_mul.register_auto
+def _auto_situ_and_mul(
+    x: torch.Tensor,
+    beta: float = 1.0,
+    linear_beta: Optional[float] = None,
+):
+    if has_triton_impl:
+        return "triton"
+    return "torch"
+
+
+@situ_and_mul.register("triton", available=has_triton_impl)
+def _situ_and_mul_triton_handler(
+    x,
+    beta: float = 1.0,
+    linear_beta: Optional[float] = None,
+):
+    from chitu.ops.triton_ops.activation import situ_and_mul_triton
+
+    return situ_and_mul_triton(x, beta=beta, linear_beta=linear_beta)
+
+
+@situ_and_mul.register("torch")
+def _situ_and_mul_torch_handler(
+    x,
+    beta: float = 1.0,
+    linear_beta: Optional[float] = None,
+):
+    return situ_and_mul_torch(x, beta=beta, linear_beta=linear_beta)

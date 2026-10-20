@@ -83,18 +83,18 @@ def causal_conv1d_update_kernel(
         None, :, :
     ]  # (1, hidden_size,state_len)
     this_dtype = this_values.dtype
-    weight_dtype = weight_values.dtype
 
-    # 'cat' old and this into new
+    # 'cat' old and this into new. The new state keeps the old state's dtype.
     is_last = s_offsets[None, None, :] == state_len - 1
     new_values = tl.where(
-        is_last, this_values, old_values
+        is_last, this_values.to(old_values.dtype), old_values
     )  # (bsz,hidden_size,state_len)
-    new_values = new_values.to(weight_dtype)
 
     # apply conv1d and silu
     # raise compute_type to float32 to reduce error of product and sum operations.
-    products = new_values.to(tl.float32) * weight_values  # (bsz,hidden_size,state_len)
+    products = new_values.to(tl.float32) * weight_values.to(
+        tl.float32
+    )  # (bsz,hidden_size,state_len)
     results = tl.sum(products, axis=2)  # (bs,hidden_size)
     sigmoid_results = tl.sigmoid(results)
     out_values = results * sigmoid_results
@@ -158,11 +158,11 @@ def causal_conv1d_update_triton(
     # allocate output
     out = torch.empty_like(this_hidden_states)
 
-    # allocate new_hidden_states
+    # allocate new_hidden_states in the old state's dtype (not the weight dtype).
     new_hidden_states = torch.empty(
         [bsz, hidden_size, state_len],
         device=old_hidden_states.device,
-        dtype=weight.dtype,
+        dtype=old_hidden_states.dtype,
     )
 
     # weight.shape: [hidden_size, 1, state_len] -> [hidden_size, state_len]

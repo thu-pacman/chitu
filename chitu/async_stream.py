@@ -8,7 +8,7 @@ from logging import getLogger
 from typing import Optional
 
 from chitu.serve.event_loop import get_server_event_loop
-from chitu.reasoning import ReasoningParser, ReasoningState
+from chitu.reasoning import ReasoningState, make_reasoning_parser
 
 logger = getLogger(__name__)
 
@@ -28,7 +28,7 @@ class AsyncDataStream:
         self.data_event = asyncio.Event()
         self.top_logprobs_list = []
         self.top_tokens_list = []
-        self.reasoning_parser = ReasoningParser(enable_thinking)
+        self.reasoning_parser = make_reasoning_parser(enable_thinking)
         self.reasoning_states: list[ReasoningState] = []
         self.cached_reasoning_state: ReasoningState = ReasoningState.OUTPUT
         self.callbacks_on_stop = []

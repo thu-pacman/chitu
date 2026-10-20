@@ -176,6 +176,14 @@ def init_moe_impl(args) -> None:
         )  # size=1, no allgather
         effective_dp_size = args.infer.dp_size
 
+        # MoEImplEP is constructed once for the whole model. For latent-MoE models
+        # (Kimi-K3) the dispatched tokens live in the routed experts' hidden space,
+        # so size the dispatcher buffers with that dim; hidden_dim is only used for
+        # buffer allocation (the dispatchers are activation-dim agnostic).
+        moe_dispatch_hidden_dim = (
+            getattr(args.models, "routed_expert_hidden_size", None) or args.models.dim
+        )
+
         MOE_IMPL_INSTANCE = MoEImplEP(
             n_layers=n_layers,
             n_dense_layers=(
@@ -183,7 +191,7 @@ def init_moe_impl(args) -> None:
                 if hasattr(args.models, "n_dense_layers")
                 else 0
             ),
-            hidden_dim=args.models.dim,
+            hidden_dim=moe_dispatch_hidden_dim,
             max_bs_per_dp_rank=ceil_div(
                 args.infer.max_batch_size * args.infer.mtp_size, effective_dp_size
             ),

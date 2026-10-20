@@ -9,6 +9,7 @@ from chitu.ops.triton_ops.rotary import (
 from chitu.ops.triton_ops.activation import (
     silu_and_mul_triton,
     silu_and_mul_triton_with_expert_mask,
+    situ_and_mul_triton,
 )
 from chitu.ops.triton_ops.sampling import apply_frequency_penalty_triton
 from chitu.ops.triton_ops.kv_cache import (
