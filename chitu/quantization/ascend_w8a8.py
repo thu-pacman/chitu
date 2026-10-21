@@ -92,7 +92,7 @@ class AscendW8A8Linear(NativeLayoutMixin, QuantizedLinearBase):
         super().init_native_layout()
         # Ascend 950 (aclnn-only) 上 Fractal 布局不可用（load_state_dict 的
         # copy_ 不支持 internal format），950 上权重保持 ND，由
-        # _maybe_build_quant_params 在首次前向时惰性转换为 Fractal ZN 并缓存。
+        # _maybe_build_quant_params 在首次前向时缓存 [K, N] 的 ND 权重。
         if not is_ascend_950():
             self.apply_native_layout(self.weight, NpuFractalZnTensor)
         self.apply_native_layout(
@@ -126,11 +126,10 @@ class AscendW8A8Linear(NativeLayoutMixin, QuantizedLinearBase):
         else:
             self.register_buffer("aclnn_input_offset", off, persistent=True)
         if is_ascend_950():
-            # 950 上权重保持 ND（未走 apply_native_layout），首次前向时
-            # 直接转成 Fractal ZN 并缓存，避免每次 forward 重复转换。
-            self._fractal_weight = NpuFractalZnTensor.convert_from(
-                self.weight.data
-            ).layout_tensor
+            # 950 设备不再支持 internal format（Fractal ZN），npu_quant_matmul
+            # 需要 ND 且 [K, N] 排布的权重。首次前向转置一次并缓存，避免每次
+            # forward 重复 (16MB) 的转置拷贝。
+            self._nd_weight = self.weight.data.t().contiguous()
         self._ready = True
 
     @torch.no_grad()
@@ -158,12 +157,11 @@ class AscendW8A8Linear(NativeLayoutMixin, QuantizedLinearBase):
             if ((get_tp_group().rank_in_group == 0 and self.is_rpl) or not self.is_rpl)
             else None
         )
-        # Ascend 950 上权重保持 ND（加载时跳过 Fractal 转换），
-        # 首次前向时已缓存 Fractal ZN 权重（_maybe_build_quant_params）。
+        # 950: 用缓存的 ND [K, N] 权重（设备不支持 internal format）。
         if is_ascend_950():
-            weight = getattr(self, "_fractal_weight", None)
+            weight = getattr(self, "_nd_weight", None)
             if weight is None:
-                weight = NpuFractalZnTensor.convert_from(self.weight.data).layout_tensor
+                weight = self.weight.data.t().contiguous()
         else:
             weight = self.weight
         output = torch_npu.npu_quant_matmul(
