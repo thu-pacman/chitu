@@ -11,6 +11,7 @@ from chitu.quantization.base import QuantizedLinearBase
 from chitu.distributed.parallel_state import get_tp_group
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.native_layout import (
+    InXOutWeight,
     NativeLayoutMixin,
     NpuFractalZnTensor,
     Repeat1ToLength,
@@ -92,10 +93,12 @@ class AscendW8A8Linear(NativeLayoutMixin, QuantizedLinearBase):
         super().init_native_layout()
         # Ascend 950 (aclnn-only) 不支持 internal format：
         # allow_internal_format=True 会被拒绝，convert_from() 实际退回 base
-        # format（check_tensor()=False，copy_ 也不支持），Fractal 在 950 上
-        # 实际不可用（不是单纯 copy_ 限制）。950 上权重保持 ND，由
-        # _maybe_build_quant_params 在首次前向时缓存 [K, N] 的 ND 权重。
-        if not is_ascend_950():
+        # format（check_tensor()=False，copy_ 也不支持），Fractal 实际不可用。
+        # 950 用 InXOutWeight 表达 [out, in] -> [in, out] 的 ND 转置，
+        # 由 native-layout 框架在加载时转换一次并缓存。
+        if is_ascend_950():
+            self.apply_native_layout(self.weight, InXOutWeight)
+        else:
             self.apply_native_layout(self.weight, NpuFractalZnTensor)
         self.apply_native_layout(
             self.input_scale,
@@ -127,11 +130,6 @@ class AscendW8A8Linear(NativeLayoutMixin, QuantizedLinearBase):
             self.aclnn_input_offset.copy_(off)
         else:
             self.register_buffer("aclnn_input_offset", off, persistent=True)
-        if is_ascend_950():
-            # 950 设备不再支持 internal format（Fractal ZN），npu_quant_matmul
-            # 需要 ND 且 [K, N] 排布的权重。首次前向转置一次并缓存，避免每次
-            # forward 重复 (16MB) 的转置拷贝。
-            self._nd_weight = self.weight.data.t().contiguous()
         self._ready = True
 
     @torch.no_grad()
@@ -159,16 +157,11 @@ class AscendW8A8Linear(NativeLayoutMixin, QuantizedLinearBase):
             if ((get_tp_group().rank_in_group == 0 and self.is_rpl) or not self.is_rpl)
             else None
         )
-        # 950: 用缓存的 ND [K, N] 权重（设备不支持 internal format）。
-        if is_ascend_950():
-            weight = getattr(self, "_nd_weight", None)
-            if weight is None:
-                weight = self.weight.data.t().contiguous()
-        else:
-            weight = self.weight
+        # init_native_layout stores the weight transposed:
+        # Fractal ZN on other platforms, ND [K, N] on Ascend 950.
         output = torch_npu.npu_quant_matmul(
             x,
-            weight,
+            self.weight,
             self.deq_scale,
             bias=quant_bias,
             output_dtype=torch.get_default_dtype(),
