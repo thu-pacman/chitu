@@ -90,8 +90,10 @@ class AscendW8A8Linear(NativeLayoutMixin, QuantizedLinearBase):
 
     def init_native_layout(self):
         super().init_native_layout()
-        # Ascend 950 (aclnn-only) 上 Fractal 布局不可用（load_state_dict 的
-        # copy_ 不支持 internal format），950 上权重保持 ND，由
+        # Ascend 950 (aclnn-only) 不支持 internal format：
+        # allow_internal_format=True 会被拒绝，convert_from() 实际退回 base
+        # format（check_tensor()=False，copy_ 也不支持），Fractal 在 950 上
+        # 实际不可用（不是单纯 copy_ 限制）。950 上权重保持 ND，由
         # _maybe_build_quant_params 在首次前向时缓存 [K, N] 的 ND 权重。
         if not is_ascend_950():
             self.apply_native_layout(self.weight, NpuFractalZnTensor)
