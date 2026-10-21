@@ -1229,6 +1229,7 @@ class DecodeOnlyManager(PDInstanceRequestManager):
 
             self._release_decode_prealloc_budget(task)
             task.status = TaskStatus.AvailableForSchedule
+            self.kv_manager.remove_transfer_state(rid)
 
             decode_info = self.pending_decode_requests.pop(rid, None)
             if decode_info is not None:

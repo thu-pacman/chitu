@@ -380,6 +380,12 @@ class KVManagerDecode(KVManagerBase):
         self._remove_info(request_id)
         self._transfer_done_states.pop(request_id, None)
 
+    def remove_transfer_state(self, request_id: str) -> None:
+        # Drop only the ctrl-rank transfer status after the KV is ready (task
+        # promotion). TaskInfo is owned by recv_kv_cache_and_insert's normal
+        # lifecycle and must not be removed here.
+        self._transfer_done_states.pop(request_id, None)
+
     def remove_request_all_rank(self, request_id: str):
         # Local cleanup first, then broadcast. Relay loopback double-delivers to
         # ctrl rank (remove_request is idempotent). Slave ranks do local cleanup only.
