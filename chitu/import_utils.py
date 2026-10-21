@@ -157,5 +157,3 @@ def is_ascend_950():
         return name.startswith("Ascend950") or "950" in name
     except Exception:
         return False
-
-
