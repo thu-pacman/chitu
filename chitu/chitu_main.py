@@ -1694,7 +1694,7 @@ def chitu_run_main_rank():
                             getattr(task, "req", None), "request_id", task_id
                         )
                         logger.debug(
-                            f"[PD_STAGE][decode.sched_wait.end] req_id={req_id}"
+                            "[PD_STAGE][decode.sched_wait.end] req_id=%s", req_id
                         )
                 break
         if all(len(task_ids) == 0 for task_ids in task_ids_list):
@@ -1736,7 +1736,7 @@ def chitu_run_main_rank():
                     continue
                 task.pd_sched_wait_end_logged = True
                 req_id = getattr(getattr(task, "req", None), "request_id", task_id)
-                logger.debug(f"[PD_STAGE][decode.sched_wait.end] req_id={req_id}")
+                logger.debug("[PD_STAGE][decode.sched_wait.end] req_id=%s", req_id)
         tasks = PackedTasks(task_ids)
     else:
         tasks = PackedTasksBase(

@@ -139,7 +139,10 @@ def get_endpoint(
     """Get a server endpoint registered under the given host role.
 
     If `timeout` (in seconds) is given, wait at most that long for the endpoint
-    to be registered. Otherwise the store's default timeout is used.
+    to be registered. This temporarily replaces the store's default operation
+    timeout; it does not add to it or change the completed store initialization.
+    Otherwise the store's default timeout is used. Callers waiting for model
+    startup should pass `multi_inst.router.launch_timeout`.
 
     Returns a (ip, port) tuple.
     """

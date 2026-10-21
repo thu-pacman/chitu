@@ -264,8 +264,15 @@ class ChatRequest(BaseModel):
     )
     top_k: int = DocField(
         50,
-        en="Top-k sampling value. Use -1 to disable top-k filtering.",
-        zh="Top-k 采样值。设为 -1 可禁用 top-k 过滤。",
+        en=(
+            "Top-k sampling value. Use -1 (or 0) to disable top-k filtering and "
+            "sample over the full vocabulary (top_p still applies). top_k=1 is "
+            "greedy decoding, as is temperature=0."
+        ),
+        zh=(
+            "Top-k 采样值。设为 -1（或 0）可禁用 top-k 过滤，在整个词表上采样"
+            "（top_p 仍然生效）。top_k=1 等价于贪心解码，temperature=0 亦然。"
+        ),
     )
     frequency_penalty: float = DocField(
         0.0,
@@ -770,7 +777,17 @@ class CompletionsRequest(BaseModel):
     )
     temperature: float = DocField(0.8, en="Sampling temperature.", zh="采样温度。")
     top_p: float = DocField(0.9, en="Nucleus sampling threshold.", zh="核采样阈值。")
-    top_k: int = DocField(50, en="Top-k sampling value.", zh="Top-k 采样值。")
+    top_k: int = DocField(
+        50,
+        en=(
+            "Top-k sampling value. Use -1 (or 0) to disable top-k filtering. "
+            "top_k=1 is greedy decoding, as is temperature=0."
+        ),
+        zh=(
+            "Top-k 采样值。设为 -1（或 0）可禁用 top-k 过滤。"
+            "top_k=1 等价于贪心解码，temperature=0 亦然。"
+        ),
+    )
     frequency_penalty: float = DocField(
         0.0,
         en="Frequency penalty applied to repeated tokens.",

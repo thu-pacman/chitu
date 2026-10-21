@@ -14,7 +14,7 @@ from chitu.kv_cache.manager_names import MAIN_CACHE_NAME
 from chitu.task import TaskPool, TaskType, Task, TaskStatus
 from chitu.global_vars import get_global_args, SlotHandle, is_pd_prefill_only
 from chitu.hooks import TaskEvictHook, NoopTaskEvictHook
-from chitu.utils import ceil_div
+from chitu.utils import ceil_div, step_timer
 from chitu.backend import Backend
 from chitu.testing.exception import test_inject_exception_kv_capacity_exceeded
 from chitu.distributed.partition import compute_local_batch_size_dist_in_dp
@@ -608,9 +608,12 @@ class Scheduler:
         task.consumed_req_tokens = cached_len
 
         for name, cache_manager in self.cache_manager_dict.items():
-            task.new_cache_ids[name] = cache_manager.prepare_metadata_before_prefill(
-                task, eager_prefix_cache_insert=eager_prefix_cache_insert
-            )
+            with step_timer(f"sched.prep_prefill_meta.{name}"):
+                task.new_cache_ids[name] = (
+                    cache_manager.prepare_metadata_before_prefill(
+                        task, eager_prefix_cache_insert=eager_prefix_cache_insert
+                    )
+                )
 
     def _prepare_decode_metadata(self, task) -> None:
         """task进行Decode前的元数据准备: 调用prepare_metadata_before_decode维护所有cache_manager中的元信息，
@@ -676,14 +679,16 @@ class Scheduler:
             # This is in a busy loop waiting for tasks, so don't print logs here.
             return []
 
-        task_ids = self._drop_ttft_expired_candidates(task_ids)
+        with step_timer("sched.ttft_filter"):
+            task_ids = self._drop_ttft_expired_candidates(task_ids)
         if len(task_ids) == 0:
             return []
 
-        task_ids.sort(
-            key=lambda x: self.scorer(TaskPool.pool[x]),
-            reverse=True,  # Largest first
-        )  # list.sort is a stable sort
+        with step_timer("sched.sort"):
+            task_ids.sort(
+                key=lambda x: self.scorer(TaskPool.pool[x]),
+                reverse=True,  # Largest first
+            )  # list.sort is a stable sort
 
         filter_task_type = TaskPool.pool[
             task_ids[0]
@@ -695,7 +700,8 @@ class Scheduler:
 
         # scheduling prefill tasks
         if filter_task_type == TaskType.Prefill:
-            prefill_task_ids = self._schedule_prefill_tasks(task_ids)
+            with step_timer("sched.prefill_tasks"):
+                prefill_task_ids = self._schedule_prefill_tasks(task_ids)
             if prefill_task_ids:
                 task_ids = prefill_task_ids
             else:
@@ -704,7 +710,8 @@ class Scheduler:
 
         # scheduling decode tasks
         if filter_task_type == TaskType.Decode:
-            task_ids = self._schedule_decode_tasks(task_ids)
+            with step_timer("sched.decode_tasks"):
+                task_ids = self._schedule_decode_tasks(task_ids)
 
         # Allocate sgroup for for task_ids
         keep_unwait: Optional[set[str]] = None
@@ -715,7 +722,8 @@ class Scheduler:
                 if TaskPool.pool[task_id].task_type == TaskType.Prefill
                 and not TaskPool.pool[task_id].has_output()
             }
-        self.sgroup_list.set_task_ids(task_ids, keep_unwait=keep_unwait)
+        with step_timer("sched.set_task_ids"):
+            self.sgroup_list.set_task_ids(task_ids, keep_unwait=keep_unwait)
 
         # postprocess
         for task_id in task_ids:
@@ -847,7 +855,8 @@ class Scheduler:
 
             # task.prefix_tokens_len: in prefill stage, it's prompt length
             # num_cached_tokens: number of tokens that are hit by cached_idle_blocks or active_blocks
-            num_cached_tokens = self._num_prefill_cached_tokens(task)
+            with step_timer("sched.prefix_hit_scan"):
+                num_cached_tokens = self._num_prefill_cached_tokens(task)
             num_uncomputed_tokens = task.prefix_tokens_len - num_cached_tokens
 
             if (
@@ -935,9 +944,10 @@ class Scheduler:
             task.set_prefill_chunk_size_for_one_step(task_prefill_chunk_size)
 
             need_reserve_capacity = task.consumed_req_tokens == 0
-            capacity_status = self._check_prefill_capacity(
-                task, num_cached_tokens, need_reserve_capacity=need_reserve_capacity
-            )
+            with step_timer("sched.capacity_check"):
+                capacity_status = self._check_prefill_capacity(
+                    task, num_cached_tokens, need_reserve_capacity=need_reserve_capacity
+                )
             if capacity_status is KVCacheCapacityStatus.EXCEEDS_CAPACITY:
                 task.prefill_chunk_size = task_origin_prefill_chunk_size
                 self._terminate_task_exceeds_capacity(task_id)

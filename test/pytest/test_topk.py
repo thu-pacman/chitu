@@ -129,3 +129,74 @@ def test_topk_page_table_decode_cuda(bs, dim, dtype):
             torch.sort(page_table[batch_idx, valid_mask]).values,
             torch.sort(reference_page_table[batch_idx, reference_mask]).values,
         )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_cuda_topk_ties_with_row_starts_and_short_lengths(dtype):
+    if not has_chitu_backend or not torch.cuda.is_available():
+        pytest.skip("CUDA and chitu_backend are required")
+
+    starts = [0, 17, 5]
+    lengths = [8192, 2049, 1000]
+    scale = 1e6 if dtype == torch.float32 else 1.0
+    scores = torch.full((3, 8209), 10 * scale, dtype=dtype, device="cuda")
+    for row, (start, length) in enumerate(zip(starts, lengths)):
+        scores[row, start : start + length] = -scale
+    # More than 4096 tied candidates must survive the selector's buffer limit.
+    scores[0, 4000:4100] = 2 * scale
+    scores[1, starts[1] + lengths[1] - 1] = 2 * scale
+    row_starts = torch.tensor(starts, dtype=torch.int32, device="cuda")
+    row_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+
+    for _ in range(2):
+        indices = topk_indices(
+            scores, 2048, lengths=row_lengths, row_starts=row_starts, impl="cuda"
+        )
+        for row, (start, length) in enumerate(zip(starts, lengths)):
+            expected = torch.argsort(
+                scores[row, start : start + length], descending=True, stable=True
+            )[:2048]
+            actual = indices[row][indices[row] < length].long()
+            assert torch.equal(actual.sort().values, expected.sort().values)
+
+
+@pytest.mark.parametrize("transform", ["page_table", "ragged"])
+def test_cuda_topk_transform_ties_and_padding(transform):
+    if not has_chitu_backend or not torch.cuda.is_available():
+        pytest.skip("CUDA and chitu_backend are required")
+
+    width = 8192
+    scores = torch.ones((3, width), dtype=torch.bfloat16, device="cuda")
+    scores[1, 4000:4100] = 2
+    lengths = torch.tensor([width, width, 17], dtype=torch.int32, device="cuda")
+    out = torch.empty((3, 2048), dtype=torch.int32, device="cuda")
+    if transform == "page_table":
+        table = (
+            torch.arange(2 * width, dtype=torch.int32, device="cuda")
+            .reshape(2, width)
+            .flip(1)
+            .contiguous()
+        )
+        # The first request has two query rows; the second has one.
+        cu_seqlens_q = torch.tensor([0, 2, 3], dtype=torch.int32, device="cuda")
+        chitu_backend.fast_topk_transform(
+            scores, lengths, out, table, cu_seqlens_q, None
+        )
+    else:
+        offsets = torch.tensor([9000, 9000, 18000], dtype=torch.int32, device="cuda")
+        chitu_backend.fast_topk_transform_ragged(scores, lengths, out, offsets, None)
+
+    for row, length in enumerate(lengths.tolist()):
+        indices = torch.argsort(scores[row, :length], descending=True, stable=True)[
+            :2048
+        ]
+        expected = (
+            table[0 if row < 2 else 1, indices]
+            if transform == "page_table"
+            else indices + offsets[row]
+        )
+        count = min(length, 2048)
+        assert torch.equal(
+            out[row, :count].long().sort().values, expected.long().sort().values
+        )
+        assert torch.all(out[row, count:] == -1)

@@ -941,6 +941,11 @@ class RequestRouter:
                 router_collector.ip,
                 router_collector.port,
             )
+            # Same wording as the worker ranks (`chitu_main.py`): benchmark
+            # tooling discovers every scrape target by grepping the logs for
+            # this line, and without it the Router's own metrics (its stage
+            # histograms, TTFT and e2e histograms) were never collected.
+            logger.info(f"Prometheus collector address:{router_collector.addr}")
             logger.info("Discovering Prometheus collector endpoints from coordinator")
             await asyncio.to_thread(self._discover_prometheus_collectors)
             while self._retry_prometheus_collector_discovery() and (

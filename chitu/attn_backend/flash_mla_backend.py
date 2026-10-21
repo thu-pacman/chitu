@@ -176,12 +176,11 @@ class FlashMLABackend(TritonAttnBackend):
                     range(65, 128)
                 )
             else:
-                if arch_major == 9:
+                if arch_major in (9, 10):
+                    # Hopper and Blackwell sparse kernels support 64/128 heads.
                     self.sparse_attn_unsupported_h_q_set = set(range(1, 64)).union(
                         range(65, 128)
                     )
-                elif arch_major == 10:
-                    self.sparse_attn_unsupported_h_q_set = set(range(1, 128))
                 else:
                     raise NotImplementedError(
                         "FlashMLA backend only supports Hopper (sm9x) and Blackwell (sm10x)"
@@ -652,7 +651,6 @@ class FlashMLABackend(TritonAttnBackend):
     ) -> torch.Tensor:
         num_tokens, local_h_q, d_q = q.shape
 
-        # pad h_q for hardware requirement of FlashMLA
         q = self.pad_h_q(q, num_tokens, local_h_q)
 
         if not is_decode:  # mixed (prefill) batch: add batch_dim=1

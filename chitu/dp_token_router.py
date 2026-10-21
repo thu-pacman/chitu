@@ -284,9 +284,22 @@ class TokenRouter:
                 req.prefill_end_time = time.monotonic()
                 ttft_s = req.prefill_end_time - req.start_time
                 # Record TTFT metric (router-side, includes network latency)
-                from chitu.metrics.prometheus_collector import observe_ttft
+                from chitu.metrics.prometheus_collector import (
+                    observe_router_stage,
+                    observe_ttft,
+                )
 
                 observe_ttft(ttft_s)
+                # `req.start_time` is stamped when the UserRequest is built,
+                # i.e. *after* tokenization, so `observe_ttft` misses the
+                # ~100 ms/50K-tokens the Router spends in the tokenizer.
+                # `router_arrival_ts` is the HTTP handler entry, which is what
+                # the client's TTFT actually measures against.
+                observe_router_stage(
+                    "first_token",
+                    req.prefill_end_time
+                    - getattr(req, "router_arrival_ts", req.start_time),
+                )
                 logger.debug(
                     f"[TTFT] request={request_id} ttft_ms={ttft_s * 1000.0:.1f} instance={instance_id}"
                 )

@@ -47,7 +47,7 @@ Creates a model response for the given chat conversation.
 | `stream_options` | `object` | `{"include_usage": false}` |  |
 | `temperature` | `number` | `0.8` | Sampling temperature. Higher values make output more random. |
 | `top_p` | `number` | `0.9` | Nucleus sampling threshold. |
-| `top_k` | `integer` | `50` | Top-k sampling value. Use -1 to disable top-k filtering. |
+| `top_k` | `integer` | `50` | Top-k sampling value. Use -1 (or 0) to disable top-k filtering and sample over the full vocabulary (top_p still applies). top_k=1 is greedy decoding, as is temperature=0. |
 | `frequency_penalty` | `number` | `0.0` | Frequency penalty applied to repeated tokens. |
 | `min_batch_size` | `integer` | `1` | Minimum batch size for processing this request. |
 | `stop_with_eos` | `boolean` \| `null` | `null` | Whether generation should stop at the EOS token. Cannot conflict with ignore_eos. |
@@ -157,7 +157,7 @@ Completes the user's raw sequence without treating it as chat, so no chat templa
 | `stream_options` | `object` | `{"include_usage": true}` |  |
 | `temperature` | `number` | `0.8` | Sampling temperature. |
 | `top_p` | `number` | `0.9` | Nucleus sampling threshold. |
-| `top_k` | `integer` | `50` | Top-k sampling value. |
+| `top_k` | `integer` | `50` | Top-k sampling value. Use -1 (or 0) to disable top-k filtering. top_k=1 is greedy decoding, as is temperature=0. |
 | `frequency_penalty` | `number` | `0.0` | Frequency penalty applied to repeated tokens. |
 | `min_batch_size` | `integer` | `1` | Minimum batch size for processing this request. |
 | `ignore_eos` | `boolean` \| `null` | `null` | vLLM/SGLang-compatible inverse of stop_with_eos. ignore_eos=True forces generation to max_tokens. |

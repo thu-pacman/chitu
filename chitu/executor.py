@@ -60,6 +60,10 @@ from chitu.utils import (
     dataclass_from_dict,
     dataclass_to_dict,
     create_tensor,
+    step_timer,
+    bump_step_counter,
+    maybe_report_step_phases,
+    CACHE_PREP_TIMING_ENABLED,
 )
 from chitu.moe.load_balancer import get_moe_load_planner  # added
 from chitu.metrics.prometheus_collector import PrometheusMetricsCollector
@@ -715,25 +719,31 @@ class TensorDispatcher(TasksDispatcher):
         if self.is_main_rank:
             slot_handle = get_slot_handle()
             slot_idx = slot_handle.get_slot_idx() if slot_handle else None
-            tasks_msg = self.metadata_serializer.serialize_metadata(
-                tasks, config=None, slot_idx=slot_idx
-            )
-            for rank_in_group in range(1, self.group_size):
-                msgs = self._append_control_frame(
-                    [f"{rank_in_group}".encode(), tasks_msg]
+            with step_timer("meta.serialize"):
+                tasks_msg = self.metadata_serializer.serialize_metadata(
+                    tasks, config=None, slot_idx=slot_idx
                 )
-                self.socket.send_multipart(msgs)
+            bump_step_counter("meta.frames")
+            bump_step_counter("meta.bytes", len(tasks_msg))
+            with step_timer("meta.fanout"):
+                for rank_in_group in range(1, self.group_size):
+                    msgs = self._append_control_frame(
+                        [f"{rank_in_group}".encode(), tasks_msg]
+                    )
+                    self.socket.send_multipart(msgs)
 
             return tasks.payload_type, tasks
 
         else:
-            msgs = self.socket.recv_multipart()
+            with step_timer("meta.recv_wait"):
+                msgs = self.socket.recv_multipart()
             tasks_msg = self._consume_control_frame(msgs)
-            payload_type, tasks, slot_idx, extra_info = (
-                self.metadata_serializer.deserialize_metadata(
-                    tasks_msg,
+            with step_timer("meta.deserialize"):
+                payload_type, tasks, slot_idx, extra_info = (
+                    self.metadata_serializer.deserialize_metadata(
+                        tasks_msg,
+                    )
                 )
-            )
             slot_handle = get_slot_handle()
             if slot_handle and slot_idx is not None:
                 slot_handle.set_slot_idx(slot_idx)
@@ -1290,6 +1300,11 @@ class Executor:
         self.prefill_queue = overlap_prefix + prefill_body + flush_suffix
         self.decode_queue = overlap_prefix + decode_body + flush_suffix
         self.empty_queue = overlap_prefix + empty_body + flush_suffix
+        if CACHE_PREP_TIMING_ENABLED:
+            self._process_queue_names = {
+                id(queue): [f"queue.{fn.__name__}" for fn in queue]
+                for queue in (self.prefill_queue, self.decode_queue, self.empty_queue)
+            }
 
     def _prepend_dispatcher(self, dispatcher: TasksDispatcher):
         self.task_dispatchers.insert(0, dispatcher)
@@ -1533,6 +1548,7 @@ class Executor:
         if Backend.state == BackendState.Terminated:
             return SerializedPackedTasksPayloadType.TerminateBackend
 
+        assert tasks is not None
         # Payload Type: EndTask, remove given tasks
         if payload_type == SerializedPackedTasksPayloadType.EndTask:
             if self.is_sample_rank:
@@ -1562,8 +1578,15 @@ class Executor:
             int(getattr(tasks, "num_tasks", 0) or 0),
         )
         try:
-            for process_step in process_queue:
-                process_step()
+            if CACHE_PREP_TIMING_ENABLED:
+                for name, process_step in zip(
+                    self._process_queue_names[id(process_queue)], process_queue
+                ):
+                    with step_timer(name):
+                        process_step()
+            else:
+                for process_step in process_queue:
+                    process_step()
         finally:
             del self.ctx
             if profiler_step_started:
@@ -1571,6 +1594,7 @@ class Executor:
                     getattr(tasks, "task_type", None),
                     int(getattr(tasks, "num_tasks", 0) or 0),
                 )
+        maybe_report_step_phases(logger, f" rank={self.rank}")
         return payload_type
 
     def _select_process_queue(self) -> list[ProcessStep]:
@@ -1642,8 +1666,9 @@ class Executor:
 
     def _lb_trigger_and_sync(self) -> None:
         """Trigger and sync the MoE load-balancer window of a decode step."""
-        self._lb_trigger()
-        self._lb_sync()
+        with step_timer("verify.lb"):
+            self._lb_trigger()
+            self._lb_sync()
 
     def _advance_lb_step(self) -> None:
         """Advance the MoE load-balancer step counter."""
@@ -1680,8 +1705,10 @@ class Executor:
         if not (self.is_sample_rank and self.model_type != ModelType.LLADA2):
             return
         tasks = self.ctx.tasks
-        tasks.generated_result_device = self.sampler.sample(out, tasks)
-        tasks.generated_result = tasks.generated_result_device.start_sync()
+        with step_timer("verify.sampler_sample"):
+            tasks.generated_result_device = self.sampler.sample(out, tasks)
+        with step_timer("verify.start_sync"):
+            tasks.generated_result = tasks.generated_result_device.start_sync()
 
     def _on_prefill_done(self) -> None:
         """Notify the KV transfer hook that this prefill step finished."""
@@ -1915,7 +1942,8 @@ class Executor:
         del self.ctx.payload
 
         self.timers("decode").start()
-        out = Backend.model.decode(payload)
+        with step_timer("verify.model_decode"):
+            out = Backend.model.decode(payload)
         self.timers("decode").stop()
 
         if self.ctx.tasks.num_tasks > 0:
@@ -2017,26 +2045,29 @@ class Executor:
             last_tokens = dispatcher.broadcast_data(last_tokens)
         last_tokens = create_tensor(last_tokens, device=self.device, dtype=torch.int64)
 
-        if Backend.model.moe_impl is not None:
-            Backend.model.moe_impl.prepare(TaskType.Decode, len(tasks.output_task_ids))
+        with step_timer("draft.moe_prepare"):
+            if Backend.model.moe_impl is not None:
+                Backend.model.moe_impl.prepare(
+                    TaskType.Decode, len(tasks.output_task_ids)
+                )
 
-        # 把接受列的隐藏态复制到第 0 页，作为 draft 链的起点（draft 只借用第 0 页）
-        # 此处的is_draft参数并不是当前是否为draft_model的语义，而是利用该参数读写正确的位置：
-        # is_draft=False读上个step的accpet indice对应的hidden_state
-        # is_draft=True上读到的hidden_state复制到inplace_block_0上
-        Backend.model.update_mtp_hidden_states(
-            Backend.model.read_mtp_hidden_states(is_draft=False), is_draft=True
-        )
+        with step_timer("draft.mtp_hidden_states"):
+            Backend.model.update_mtp_hidden_states(
+                Backend.model.read_mtp_hidden_states(is_draft=False), is_draft=True
+            )
         if self.is_sample_rank:
             # Draft proposal params (temperature/top-k/top-p/greedy mask) must be
-            # refreshed per decode step from the CURRENT batch: the next drafts
-            # are drawn from p' on the sample rank (in-graph when the draft is
-            # captured), and the next verify consumes the same p' via
-            # state.draft_probs.
-            self.sampler.prepare_draft_sample_params(tasks)
-            next_tokens, draft_probs = Backend.model.draft(tasks, last_tokens)
-            next_tokens = torch.cat([last_tokens.unsqueeze(1), next_tokens], dim=1)
-            self.sampler.update_draft_results(tasks, next_tokens, draft_probs)
+            # refreshed per decode step from the CURRENT batch: sample_draft_tokens
+            # samples the next drafts (possibly in-graph), and the next
+            # verify consumes the same p' via state.draft_probs.
+            with step_timer("draft.sample_params"):
+                self.sampler.prepare_draft_sample_params(tasks)
+            with step_timer("draft.model_draft"):
+                assert Backend.model is not None
+                next_tokens, draft_probs = Backend.model.draft(tasks, last_tokens)
+            with step_timer("draft.update_draft_results"):
+                next_tokens = torch.cat([last_tokens.unsqueeze(1), next_tokens], dim=1)
+                self.sampler.update_draft_results(tasks, next_tokens, draft_probs)
         else:
             Backend.model.draft(tasks, last_tokens)
 
@@ -2353,8 +2384,16 @@ class Executor:
         if self.is_sample_rank and self.model_type != ModelType.LLADA2:
             tasks = TaskCollector.get_postprocess_tasks()
             if tasks is not None and not tasks.is_empty_tasks():
-                tasks.generated_result.finish_sync()
-                self.sampler.update_results(tasks)
+                # This is the step's one unavoidable device->host wait: the event
+                # was re-recorded by `Sampler.update_draft_results` after the
+                # draft replays, so it blocks until draft2 of *this* iteration has
+                # run. Timed separately because it dominates the host timeline.
+                with step_timer("update_sampler.finish_sync"):
+                    assert tasks.generated_result is not None
+                    tasks.generated_result.finish_sync()
+                with step_timer("update_sampler.update_results"):
+                    assert self.sampler is not None
+                    self.sampler.update_results(tasks)
 
     def _can_async_pp_results(self):
         return (
@@ -2600,11 +2639,14 @@ class Executor:
         if tasks is None or tasks.is_empty_tasks():
             return
 
-        if self.pipe_dispatcher and self.is_pp_first_stage:
-            self.pipe_dispatcher.recv_results(tasks)
-            tasks.generated_result = tasks.generated_result_device.sync()
-        else:
-            tasks.generated_result = tasks.generated_result.finish_sync()
+        with step_timer("sync.finish_sync"):
+            if self.pipe_dispatcher and self.is_pp_first_stage:
+                self.pipe_dispatcher.recv_results(tasks)
+                assert tasks.generated_result_device is not None
+                tasks.generated_result = tasks.generated_result_device.sync()
+            else:
+                assert tasks.generated_result is not None
+                tasks.generated_result = tasks.generated_result.finish_sync()
 
         accept_indices_list = (
             [int(v) for v in tasks.generated_result.accept_indices.tolist()]
@@ -2627,9 +2669,10 @@ class Executor:
         if self.rank != 0:
             return
 
-        tasks.batch_update_test_result()
-        TaskCollector.append_to_last_batch_results(tasks.create_batch_result())
-        tasks.batch_update_decode_status()
+        with step_timer("sync.batch_result"):
+            tasks.batch_update_test_result()
+            TaskCollector.append_to_last_batch_results(tasks.create_batch_result())
+            tasks.batch_update_decode_status()
 
     def _flush_batch_results(self) -> None:
         """Push the batches prepared by `postprocess_sync_part` to the user requests."""

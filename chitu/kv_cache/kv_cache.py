@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import Any, Sequence, Optional, Callable, Iterable, TYPE_CHECKING
+import os
+import time
 from typing_extensions import override
 from dataclasses import dataclass
 from logging import getLogger
@@ -16,7 +18,17 @@ from chitu.global_vars import get_slot_handle, get_global_args
 from chitu.kv_cache.manager_names import MAIN_CACHE_NAME, MTP_CACHE_NAME
 from chitu.static_tensor import StaticTensor
 from chitu.batched_seq_len import BatchedSeqLen, BatchedSeqLenDelta
-from chitu.utils import ceil_div, create_tensor, max_alloc_seq_len
+from chitu.utils import (
+    ceil_div,
+    create_tensor,
+    max_alloc_seq_len,
+    bump_step_counter,
+    get_step_counters,
+    reset_step_counters,
+    CACHE_PREP_TIMING_ENABLED,
+    get_step_times,
+    reset_step_times,
+)
 from chitu.ops import fp8_pertensor_kvcache_quant, fp8_pertoken_kvcache_quant_dsa
 
 if TYPE_CHECKING:
@@ -31,6 +43,124 @@ if TYPE_CHECKING:
 
 
 logger = getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Optional cache-preparation instrumentation (CHITU_CACHE_PREP_TIMING=1)
+# ---------------------------------------------------------------------------
+
+
+class _CachePrepStats:
+    """Accumulates per-decode-iteration cache-preparation cost.
+
+    Only active with ``CHITU_CACHE_PREP_TIMING=1``. A summary is logged on rank
+    0 every ``CHITU_CACHE_PREP_TIMING_INTERVAL`` (default 50) decode iterations,
+    together with the number of host-to-device copies issued per iteration.
+    """
+
+    def __init__(self, interval: int = 50):
+        self.interval = interval
+        self.totals: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+        self.iterations = 0
+        self.ticking_manager: Optional[str] = None
+
+    def add(self, key: str, elapsed: float) -> None:
+        self.totals[key] = self.totals.get(key, 0.0) + elapsed
+        self.counts[key] = self.counts.get(key, 0) + 1
+
+    def tick(self) -> None:
+        self.iterations += 1
+        if self.iterations % self.interval == 0:
+            self.report()
+
+    def report(self) -> None:
+        try:
+            import torch.distributed as _dist
+
+            is_log_rank = not (_dist.is_available() and _dist.is_initialized()) or (
+                _dist.get_rank() == 0
+            )
+        except Exception:
+            is_log_rank = True
+        iters = max(self.iterations, 1)
+        if is_log_rank:
+            parts = [
+                f"{key}: {self.totals[key] * 1e6 / iters:.1f} us/iter "
+                f"({self.counts[key] / iters:.2f} calls/iter)"
+                for key in sorted(self.totals, key=lambda k: -self.totals[k])
+            ]
+            seg_times = get_step_times()
+            seg_parts = [
+                f"{key}: {total * 1e6 / iters:.1f} us/iter ({count / iters:.2f} calls/iter)"
+                for key, (total, count) in sorted(
+                    seg_times.items(), key=lambda kv: -kv[1][0]
+                )
+            ]
+            counters = get_step_counters()
+            counter_parts = [
+                f"{name}: {value / iters:.2f}/iter" for name, value in counters.items()
+            ]
+            total_us = sum(self.totals.values()) * 1e6 / iters
+            logger.info(
+                f"[cache-prep-timing] iterations={self.iterations} "
+                f"total={total_us:.1f} us/iter | "
+                + " | ".join(parts + seg_parts + counter_parts)
+            )
+        self.totals.clear()
+        self.counts.clear()
+        reset_step_counters()
+        reset_step_times()
+        self.iterations = 0
+
+
+_CACHE_PREP_STATS = _CachePrepStats(
+    interval=int(os.environ.get("CHITU_CACHE_PREP_TIMING_INTERVAL", "50") or 50)
+)
+
+
+class _NullCachePrepTimer:
+    __slots__ = ()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+_NULL_CACHE_PREP_TIMER = _NullCachePrepTimer()
+
+
+class _CachePrepTimer:
+    __slots__ = ("_key", "_is_iteration", "_start")
+
+    def __init__(self, key: str, is_iteration: bool):
+        self._key = key
+        self._is_iteration = is_iteration
+
+    def __enter__(self):
+        self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        _CACHE_PREP_STATS.add(self._key, time.perf_counter() - self._start)
+        if self._is_iteration:
+            _CACHE_PREP_STATS.tick()
+        return False
+
+
+def _cache_prep_timing(cache, name: str, is_iteration: bool = False):
+    """Time one cache-preparation call; a no-op unless timing is enabled."""
+    if not CACHE_PREP_TIMING_ENABLED:
+        return _NULL_CACHE_PREP_TIMER
+    manager = getattr(cache, "manager_name", type(cache).__name__)
+    if is_iteration:
+        # Exactly one cache manager drives the iteration counter.
+        if _CACHE_PREP_STATS.ticking_manager is None:
+            _CACHE_PREP_STATS.ticking_manager = manager
+        is_iteration = _CACHE_PREP_STATS.ticking_manager == manager
+    return _CachePrepTimer(f"{manager}.{name}", is_iteration)
 
 
 class GlobalLocalMap:
@@ -784,6 +914,8 @@ class PagedKVCache(KVCacheBase):
                 staging[staging_offset : staging_offset + num_blocks],
                 non_blocking=self.device.type != "cpu",
             )
+            bump_step_counter("h2d_copies")
+            bump_step_counter("block_table_blocks", num_blocks)
             staging_offset += num_blocks
 
     def _validate_gpu_block_table_batch(self, task_ids: list[str]) -> None:
@@ -915,8 +1047,9 @@ class PagedKVCache(KVCacheBase):
     def prepare_cache_decode(self, tasks: "PackedTasksBase"):
         # Prepare enough block table for next decoding. When decoding, AttnBackend will fill new kv into
         # paged kv cache in place.
-        super().prepare_cache_decode(tasks)
-        self._update_block_table_from_scheduler(tasks, incremental=True)
+        with _cache_prep_timing(self, "prepare_cache_decode", is_iteration=True):
+            super().prepare_cache_decode(tasks)
+            self._update_block_table_from_scheduler(tasks, incremental=True)
 
     @override
     def prepare_mtp_cache_decode(self, tasks: "PackedTasksBase", draft_offset: int):

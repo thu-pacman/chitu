@@ -1861,9 +1861,9 @@ class Transformer(nn.Module):
         knobs only have to match in shape and dtype. So does a batch the sampler
         has not prepared: the backend warmup calls `draft()` without the
         executor's per-step `prepare_draft_sample_params`, and the knobs must
-        still carry one row per request. The sampler clips every request's top_k
-        to this width, so none of them asks for more candidates than the graph's
-        proposal holds.
+        still carry one row per request. The graph bounds its proposal width;
+        a request with disabled top-k can still have a full-vocabulary target
+        distribution, which verification handles using the stored proposal.
         """
         if sampler is not None and sampler.draft_params_match(bs):
             return sampler.draft_sample_params()

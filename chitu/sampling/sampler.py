@@ -23,7 +23,7 @@ from chitu.ops.sampling import (
     resample_mtp_rejected,
     batch_append_tokens,
 )
-from chitu.utils import ceil_div, create_tensor
+from chitu.utils import ceil_div, create_tensor, get_chitu_bool_env, step_timer
 
 from .utils import get_tokenizer_info, get_op_device
 
@@ -180,12 +180,9 @@ class Sampler:
         assert args is not None  # "not initialized yet" is the only `None` case
         self.mtp_size = args.infer.mtp_size
 
-        # Width of every top-k proposal this sampler materializes: the draft's
-        # p' and the top-k filtered target distributions the verify compares it
-        # with. One server-wide value -- rather than the widest top_k in the
-        # running batch -- keeps the draft's captured graphs keyed by batch
-        # size alone, gives every filter the same shape, and lets a request's
-        # top_k be clipped against a bound that does not move.
+        # Fixed draft proposal width, also the cap for positive request top-k.
+        # Disabled top-k keeps a full-vocabulary target distribution; its draft
+        # proposal may be narrower without changing rejection sampling's target.
         self.max_top_k_samples = max(
             int(getattr(args.infer, "max_top_k_samples", 50)), 1
         )
@@ -214,8 +211,17 @@ class Sampler:
         states = self._get_states(tasks.output_tasks)
 
         device = get_op_device()
+        self.all_greedy = all(s.sample_params.is_greedy for s in states)
+        # The captured draft consumes these tensors even for all-greedy
+        # batches. Keep the greedy mask available to the graph input path.
+        # `resolved_top_k` turns the "top-k disabled" sentinel (`top_k <= 0`,
+        # the documented `top_k: -1`) into the full vocabulary. Passing the raw
+        # value would make `torch.topk(k=-1)` raise, or -- worse, in a mixed
+        # batch where `max_top_k` stays positive -- blank the row to -inf.
+        vocab_size = get_tokenizer_info().vocab_size
+        top_ks = [s.sample_params.resolved_top_k(vocab_size) for s in states]
         self.draft_greedy_mask = create_tensor(
-            [s.sample_params.top_k <= 1 for s in states],
+            [s.sample_params.is_greedy for s in states],
             device=device,
             dtype=torch.bool,
         )
@@ -225,7 +231,7 @@ class Sampler:
             dtype=torch.float32,
         )
         self.draft_top_ks = create_tensor(
-            [s.sample_params.top_k for s in states],
+            top_ks,
             device=device,
             dtype=torch.int32,
         )
@@ -234,7 +240,6 @@ class Sampler:
             device=device,
             dtype=torch.float32,
         )
-        self.all_greedy = all(s.sample_params.top_k <= 1 for s in states)
 
     def draft_params_match(self, bs: int) -> bool:
         """Whether the prepared draft params describe a batch of `bs` rows.
@@ -342,12 +347,9 @@ class Sampler:
         for task in tasks:
             if task.task_id not in self.states:
                 state = TaskSampleState.from_task(task)
-                # The sampler only ever materializes `self.max_top_k_samples`
-                # candidates per row, so a request asking for more is clipped
-                # to that width: it samples from the top `self.max_top_k_samples` of
-                # its own distribution, the support every downstream shape
-                # (the draft's proposal, the verify's filters) is built for.
-                # The request keeps the top_k it asked for.
+                # Preserve the server cap for positive request top-k. The
+                # disabled sentinel is not capped: its target uses all tokens.
+                # Keep the original request parameters unchanged.
                 if state.sample_params.top_k > self.max_top_k_samples:
                     state.sample_params = replace(
                         state.sample_params, top_k=self.max_top_k_samples
@@ -388,26 +390,33 @@ class Sampler:
 
         Returns (draft_tokens, draft_probs, draft_tokens_list):
         - draft_tokens:     (bs, mtp_size-1) drafted token ids per task.
-        - draft_probs:      (bs, mtp_size-1, max_top_k_samples) sparse proposal p'
+        - draft_probs:      (bs, mtp_size-1, max_top_k) sparse proposal p'
                             (probs, token_ids), or None for an empty batch.
         - draft_tokens_list: CPU list mirror of draft_tokens.
 
-        Proposal rows are stored per-task at the task's own top-k width (see
-        update_draft_results), while the verify's filters are `max_top_k_samples` wide:
-        allocate at that width and copy each row into its leading columns;
-        trailing slots stay zero, exactly like the draft-time padding.
+        Reconstruct the proposal at its stored width, independently of the
+        target filter width. With top-k disabled, the target may cover the full
+        vocabulary while the captured draft still uses a bounded proposal.
         """
         K = self.mtp_size
         n_drafts = K - 1
         draft_tokens_list = []
-        max_top_k_samples = self.max_top_k_samples
+        # Preserve the actual proposal width, independently of the target's
+        # top-k setting. A missing proposal needs one slot for the fallback.
+        max_top_k = max(
+            (
+                s.draft_probs[0].shape[-1] if s.draft_probs is not None else 1
+                for s in states
+            ),
+            default=1,
+        )
         probs = torch.zeros(
-            (len(states), n_drafts, max_top_k_samples),
+            (len(states), n_drafts, max_top_k),
             device=device,
             dtype=torch.float32,
         )
         token_ids = torch.zeros(
-            (len(states), n_drafts, max_top_k_samples),
+            (len(states), n_drafts, max_top_k),
             device=device,
             dtype=torch.int64,
         )
@@ -438,7 +447,7 @@ class Sampler:
         draft_tokens = create_tensor(
             draft_tokens_list, device=device, dtype=torch.int64
         )
-        # (bs, K-1, max_top_k_samples) each: proposal p' sparse probs / token ids
+        # (bs, K-1, max_top_k) each: proposal p' sparse probs / token ids
         draft_probs = (probs, token_ids) if len(states) > 0 else None
 
         # Frequency penalty: the MTP target positions 1..K-1 continue from
@@ -466,21 +475,24 @@ class Sampler:
         list[TaskSampleState],
         torch.Tensor,
         torch.Tensor | None,
-        torch.Tensor | None,
+        tuple[torch.Tensor, torch.Tensor] | None,
         list[list[int]] | None,
     ]:
         """Flatten logits, get states, rebuild the MTP draft verify inputs."""
-        states = self._get_states(tasks.output_tasks)
+        with step_timer("prep.get_states"):
+            states = self._get_states(tasks.output_tasks)
 
-        logits = logits.contiguous()
+        with step_timer("prep.contiguous"):
+            logits = logits.contiguous()
         draft_tokens = None
         draft_probs = None
         draft_tokens_list = None
         if mtp_size > 1:
             logits = logits.view(-1, logits.shape[-1])
-            draft_tokens, draft_probs, draft_tokens_list = (
-                self._rebuild_mtp_draft_inputs(states, logits.device)
-            )
+            with step_timer("prep.rebuild_mtp_draft_inputs"):
+                draft_tokens, draft_probs, draft_tokens_list = (
+                    self._rebuild_mtp_draft_inputs(states, logits.device)
+                )
 
         return states, logits, draft_tokens, draft_probs, draft_tokens_list
 
@@ -587,20 +599,23 @@ class Sampler:
             return self._sample_mtp(logits, states, mtp_size)
 
         # Temperature / top-k / top-p sampling (non-MTP)
-        if all(state.sample_params.top_k <= 1 for state in states):
+        if all(state.sample_params.is_greedy for state in states):
             tokens = torch.argmax(logits, dim=-1)
         else:
+            vocab_size = logits.shape[-1]
             temperatures = []
             top_ps = []
             top_ks = []
             for state in states:
                 temperatures.append(state.sample_params.temperature)
                 top_ps.append(state.sample_params.top_p)
-                top_ks.append(state.sample_params.top_k)
+                # `resolved_top_k`, not the raw value: `top_k <= 0` means
+                # "no top-k restriction", i.e. the whole vocabulary.
+                top_ks.append(state.sample_params.resolved_top_k(vocab_size))
             temperatures = create_tensor(temperatures, device=logits.device)
             top_ps = create_tensor(top_ps, device=logits.device)
+            max_top_k_samples = max(top_ks)
             top_ks = create_tensor(top_ks, device=logits.device)
-            max_top_k_samples = self.max_top_k_samples
             logits = logits / temperatures.view(-1, 1)
             tokens = top_k_top_p_min_p_sampling_from_logits(
                 logits, top_ks, top_ps, max_top_k=max_top_k_samples
@@ -619,11 +634,12 @@ class Sampler:
         Mixed/non-greedy: apply temperature and top_k/top_p per-request depth,
                           greedy requests degenerate to argmax automatically (top_k=1).
         """
-        if all(s.sample_params.top_k <= 1 for s in states):
+        if all(s.sample_params.is_greedy for s in states):
             # Fast path: all greedy
             return torch.argmax(logits, dim=-1), logits
 
         # Mixed: apply temperature, sample via top_k_top_p
+        vocab_size = logits.shape[-1]
         bs = len(states)
         logits = logits.view(bs, mtp_size, -1)
         logits_flat = logits.reshape(bs * mtp_size, -1)
@@ -634,12 +650,16 @@ class Sampler:
         temperatures = [
             s.sample_params.temperature for s in states for _ in range(mtp_size)
         ]
-        top_ks_list = [s.sample_params.top_k for s in states for _ in range(mtp_size)]
+        top_ks_list = [
+            s.sample_params.resolved_top_k(vocab_size)
+            for s in states
+            for _ in range(mtp_size)
+        ]
         top_ps_list = [s.sample_params.top_p for s in states for _ in range(mtp_size)]
         temperatures = create_tensor(temperatures, device=logits.device)
         top_ks_t = create_tensor(top_ks_list, device=logits.device)
         top_ps_t = create_tensor(top_ps_list, device=logits.device)
-        max_top_k_samples = self.max_top_k_samples
+        max_top_k_samples = max(top_ks_list)
         logits_flat = logits_flat / temperatures.view(-1, 1)
         tokens = top_k_top_p_min_p_sampling_from_logits(
             logits_flat, top_ks_t, top_ps_t, max_top_k=max_top_k_samples
@@ -665,16 +685,19 @@ class Sampler:
         logits = logits.view(bs, mtp_size, -1)
         n_drafts = mtp_size - 1
 
-        # Determine which requests are greedy (temperature=0 → top_k=1)
+        # Determine which requests are greedy (temperature=0 → top_k=1).
+        # The mask itself is only read by the mixed path, so it is built lazily:
+        # the all-greedy fast path must not pay a host->device copy for it.
+        greedy_mask = None
         if states is not None:
-            greedy_mask = create_tensor(
-                [s.sample_params.top_k <= 1 for s in states],
-                device=tokens.device,
-                dtype=torch.bool,
-            )
-            all_greedy = all(s.sample_params.top_k <= 1 for s in states)
+            all_greedy = all(s.sample_params.is_greedy for s in states)
+            if not all_greedy:
+                greedy_mask = create_tensor(
+                    [s.sample_params.is_greedy for s in states],
+                    device=tokens.device,
+                    dtype=torch.bool,
+                )
         else:
-            greedy_mask = torch.ones(bs, dtype=torch.bool, device=tokens.device)
             all_greedy = True
 
         if all_greedy:
@@ -709,7 +732,7 @@ class Sampler:
         tokens: torch.Tensor,
         logits: torch.Tensor,
         draft_tokens: torch.Tensor,
-        draft_probs: torch.Tensor,
+        draft_probs: tuple[torch.Tensor, torch.Tensor] | None,
         greedy_mask: torch.Tensor,
         mtp_size: int,
         states: list[TaskSampleState],
@@ -728,11 +751,14 @@ class Sampler:
         top_ks_all, top_ps_all = [], []
         for s in states:
             for _ in range(mtp_size):
-                top_ks_all.append(s.sample_params.top_k)
+                top_ks_all.append(s.sample_params.resolved_top_k(V))
                 top_ps_all.append(s.sample_params.top_p)
         top_ks_all_t = create_tensor(top_ks_all, device=logits.device)
         top_ps_all_t = create_tensor(top_ps_all, device=logits.device)
-        max_top_k_samples = self.max_top_k_samples
+        # A disabled top-k must keep the full target distribution even when
+        # the draft graph uses a narrower proposal. Rejection sampling reads
+        # the stored proposal probabilities, so the widths need not match.
+        max_top_k_samples = max(top_ks_all)
 
         # filtered q for ALL positions
         q_all_probs, q_all_token_ids = filter_logits_top_k_top_p(
@@ -756,6 +782,7 @@ class Sampler:
         # instead of min(q, p'), biasing output toward the draft distribution.
         # Kept sparse: verify only reads p' at the draft tokens (acceptance) and at
         # the target's top-k positions (resample), so no full-vocab tensor is built.
+        assert draft_probs is not None
         p_probs, p_token_ids = draft_probs
         p_probs = p_probs.float().reshape(bs, n_drafts, -1)
         p_token_ids = p_token_ids.reshape(bs, n_drafts, -1)
@@ -799,30 +826,36 @@ class Sampler:
 
         return_logits = tasks.return_logprobs or tasks._test_flag
 
-        states, logits, draft_tokens, draft_probs, draft_tokens_list = self._prepare(
-            logits, tasks, mtp_size
-        )
+        with step_timer("sample.prepare"):
+            states, logits, draft_tokens, draft_probs, draft_tokens_list = (
+                self._prepare(logits, tasks, mtp_size)
+            )
 
-        self._apply_frequency_penalty(logits, states, mtp_size)
+        with step_timer("sample.frequency_penalty"):
+            self._apply_frequency_penalty(logits, states, mtp_size)
 
-        self._apply_grammar_bitmask(logits, states, mtp_size, draft_tokens_list)
+        with step_timer("sample.grammar_bitmask"):
+            self._apply_grammar_bitmask(logits, states, mtp_size, draft_tokens_list)
 
-        tokens, logits = self._sample_tokens(logits, states, mtp_size)
+        with step_timer("sample.sample_tokens"):
+            tokens, logits = self._sample_tokens(logits, states, mtp_size)
 
         if mtp_size <= 1:
             self._apply_test_tokens(tokens, states)
 
-        tokens, logits, accept_indices = self._verify_tokens(
-            logits,
-            tokens,
-            mtp_size,
-            return_logits,
-            states=states,
-            draft_tokens=draft_tokens,
-            draft_probs=draft_probs,
-        )
+        with step_timer("sample.verify_tokens"):
+            tokens, logits, accept_indices = self._verify_tokens(
+                logits,
+                tokens,
+                mtp_size,
+                return_logits,
+                states=states,
+                draft_tokens=draft_tokens,
+                draft_probs=draft_probs,
+            )
 
-        result = self._make_results(tasks, tokens, logits, accept_indices)
+        with step_timer("sample.make_results"):
+            result = self._make_results(tasks, tokens, logits, accept_indices)
 
         if tasks.task_type == TaskType.Prefill and self.mtp_size > 1:
             sampled = result.tokens  # (bs, 1)
@@ -887,10 +920,10 @@ class Sampler:
         if draft_probs is not None:
             probs, token_ids = draft_probs
             for i, state in enumerate(states):
-                # Store at the task's OWN top-k width -- the proposal the draft
-                # returns is `self.max_top_k_samples` wide, and the extra columns of a
-                # sparse row are padding; _prepare re-pads to match.
-                k = max(int(state.sample_params.top_k), 1)
+                # Store at the task's OWN top-k width (not the draft batch's
+                # max) so a per-task slice stays valid when the batch max top-k
+                # changes between steps; _prepare re-pads to the verify max.
+                k = state.sample_params.resolved_top_k(probs.shape[-1])
                 state.draft_probs = (
                     probs[i, :, :k].detach().clone(),
                     token_ids[i, :, :k].detach().clone(),

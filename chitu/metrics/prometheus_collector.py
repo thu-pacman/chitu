@@ -150,6 +150,33 @@ def observe_stage_duration(role: str, stage: str, duration_s: float):
             metric.labels(role=role, stage=stage).observe(duration_s)
 
 
+#: Stages of the Router's own per-request timeline, all recorded into
+#: ``chitu_pd_stage_duration_seconds{role="router"}`` so the existing
+#: before/after collector-dump tooling picks them up unchanged.
+#:
+#: * ``req_received``  HTTP handler entry -> request params assembled
+#: * ``tokenize``      the chat-template + tokenizer call itself
+#: * ``routed``        HTTP handler entry -> request dispatched to P and D
+#: * ``first_token``   HTTP handler entry -> first token forwarded to the client
+#:
+#: ``recv`` (scheduler selection) and ``dispatch`` (the ZMQ dual send) already
+#: existed and are unchanged.
+ROUTER_STAGES = ("req_received", "tokenize", "routed", "first_token")
+
+
+def observe_router_stage(stage: str, duration_s: float):
+    """Record one Router-side stage duration (seconds).
+
+    A no-op when no metrics runtime is active (offline tests, worker-only
+    processes), so call sites need no guard.
+    """
+    if duration_s < 0:
+        return
+    metric = _role_metric("chitu_pd_stage_duration_seconds", "router")
+    if metric is not None:
+        metric.labels(role="router", stage=stage).observe(duration_s)
+
+
 def observe_e2e_duration(duration_s: float):
     """Record end-to-end request duration."""
     if duration_s >= 0:
