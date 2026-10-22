@@ -12,6 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
+from chitu.device_type import is_muxi
+
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
 
@@ -43,6 +45,19 @@ def _is_arch_support_pdl() -> bool:
     return torch.cuda.get_device_capability()[0] >= 9
 
 
+def _gqa_sparse_fwd_block_size_h(gqa_group_size):
+    """BLOCK_SIZE_H for the GQA sparse prefill kernel.
+
+    MACA triton is a fork of upstream 3.0.0 and still asserts every tl.dot
+    dimension is >= 16 (newer upstream triton compiles smaller M), so pad the
+    query-head tile on muxi. The kernel bounds-checks this dimension against
+    the runtime gqa_group_size (block_ptr boundary_check on load and store),
+    so the padded lanes load and store nothing.
+    """
+    block_size_h = triton.next_power_of_2(gqa_group_size)
+    return max(16, block_size_h) if is_muxi() else block_size_h
+
+
 # ---------------------------------------------------------------------------
 # GQA block-sparse attention (paged). Main heads attend only to the selected
 # blocks. BLOCK_SIZE_K == 128 so each selected block is one page.
@@ -53,10 +68,12 @@ def _is_arch_support_pdl() -> bool:
 @triton.heuristics(
     {
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
+        "BLOCK_SIZE_H": lambda args: _gqa_sparse_fwd_block_size_h(
+            args["gqa_group_size"]
+        ),
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
         "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"]
-        * triton.next_power_of_2(args["gqa_group_size"]),
+        * _gqa_sparse_fwd_block_size_h(args["gqa_group_size"]),
     }
 )
 @_minimax_sparse_triton_jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
@@ -451,6 +468,9 @@ def minimax_m3_sparse_attn(
     gqa_group_size = num_heads // num_kv_heads
     use_fp8 = kv_cache.dtype in _FP8_DTYPES
     grid = (max_query_len, num_kv_heads, batch)
+    # MetaX C500 has 64 KiB shared memory per block. With BLOCK_SIZE_H padded
+    # to >= 16 on muxi, only num_stage=1 fits one tile into shared memory.
+    launch_kwargs = {"num_stages": 1} if is_muxi() else {}
     _gqa_sparse_fwd_kernel[grid](
         q,
         kv_cache,
@@ -485,6 +505,7 @@ def minimax_m3_sparse_attn(
         BLOCK_SIZE_Q=1,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         USE_FP8=use_fp8,
+        **launch_kwargs,
     )
 
 
@@ -512,6 +533,9 @@ def minimax_m3_sparse_attn_decode(
     # launch_pdl was specified but unrecognised"). Only pass it when PDL is
     # actually supported -- on ROCm use_pdl is always False, so it's omitted.
     pdl_launch = {"launch_pdl": True} if use_pdl else {}
+    # MetaX C500 has 64 KiB shared memory per block. With BLOCK_SIZE_H padded
+    # to >= 16 on muxi, only num_stage=1 fits one tile into shared memory.
+    launch_kwargs = {"num_stages": 1} if is_muxi() else {}
     # split-K over the selected blocks; chunk count is shape-constant (cuda graph).
     TARGET_GRID = 256
     target = max(1, min(max_topk, TARGET_GRID // max(1, total_q * num_kv_heads)))
@@ -561,6 +585,7 @@ def minimax_m3_sparse_attn_decode(
         USE_FP8=use_fp8,
         USE_PDL=use_pdl,
         **pdl_launch,
+        **launch_kwargs,
     )
     merge_grid = (total_q, num_heads)
     _merge_topk_attn_out_kernel[merge_grid](

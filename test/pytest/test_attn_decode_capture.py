@@ -332,11 +332,13 @@ _CASES = [
         # FlashAttention's paged MQA kernel, which cannot take an MLA cache at
         # all: its head is `kv_lora_rank + qk_rope_head_dim` (576 here) and its
         # pages are 64-wide, against a 256 head limit and a 256-wide page on
-        # CUDA. `test_attn.py` skips the same pair.
+        # CUDA. `test_attn.py` skips the same pair. On muxi the backend is
+        # pinned to FA2 (MACA's FA3 port lacks the in-kernel KV append), so the
+        # same restriction applies even though flash_attn_interface imports.
         skip=(
             None
-            if has_flash_attn3
-            else "MLA paged decode with flash_attn needs flash_attn_interface (FA3)"
+            if has_flash_attn3 and not is_muxi()
+            else "MLA paged decode with flash_attn needs the FA3 path"
         ),
     ),
     _Case(

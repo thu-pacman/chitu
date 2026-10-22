@@ -1,4 +1,4 @@
-FROM maca-pytorch:3.0.0.4-torch2.6-py310-ubuntu24.04-amd64 AS base
+FROM cr.metax-tech.com/public-library/maca-pytorch:3.8.2.6-torch2.6-py310-ubuntu24.04-amd64 AS base
 
 SHELL ["/bin/bash", "-c"]
 

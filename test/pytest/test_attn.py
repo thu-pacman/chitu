@@ -1777,6 +1777,11 @@ def test_mla_decode_paged_kv(
             pytest.skip(
                 "MLA paged decode with flash_attn requires flash_attn_interface"
             )
+        if is_muxi():
+            # FlashAttnBackend is pinned to FA2 on muxi (MACA's FA3 port lacks
+            # the in-kernel KV append), and the FA2 MLA fallback cannot take
+            # an MLA cache (head 576 > FA2's 256 limit).
+            pytest.skip("MLA paged decode with flash_attn requires the FA3 path")
         if topk is not None:
             pytest.skip("flash_attn only supports dense attention for now")
 
@@ -3589,6 +3594,8 @@ def test_decode_dense_kv(
         < packaging.version.parse("0.2.3")
     ):
         pytest.skip("flashinfer is missing or too old")
+    if impl == "flashinfer" and is_muxi():
+        pytest.skip("Muxi's flashinfer port has no single_decode_with_kv_cache")
     if impl == "flash_attn":
         if not has_flash_attn:
             pytest.skip("flash_attn is missing")
