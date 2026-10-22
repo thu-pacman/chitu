@@ -85,6 +85,16 @@ def _auto_apply_rotary_pos_emb(
 ):
     if has_cpuinfer and get_global_args().infer.op_impl == "cpu":
         return "cpu"
+    if has_torch_npu:
+        if (
+            rotary_type == "interleaved"
+            and q.shape[-1] == 64
+            and q.dtype == freqs_cis.cos.dtype
+            and (q_out is None or isinstance(q_out, ColumnOddEvenSeparatedTensor))
+            and (k_out is None or isinstance(k_out, ColumnOddEvenSeparatedTensor))
+        ):
+            return "torch_npu_with_output_layout"
+        return "torch_npu"
     if (
         q_out is None
         and k_out is None
@@ -99,16 +109,6 @@ def _auto_apply_rotary_pos_emb(
         return "triton"
     if has_chitu_backend:
         return "cuda"
-    if has_torch_npu:
-        if (
-            rotary_type == "interleaved"
-            and q.shape[-1] == 64
-            and q.dtype == freqs_cis.cos.dtype
-            and (q_out is None or isinstance(q_out, ColumnOddEvenSeparatedTensor))
-            and (k_out is None or isinstance(k_out, ColumnOddEvenSeparatedTensor))
-        ):
-            return "torch_npu_with_output_layout"
-        return "torch_npu"
     return "torch"
 
 

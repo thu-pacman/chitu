@@ -11,11 +11,13 @@ from chitu.quantization.base import QuantizedLinearBase
 from chitu.distributed.parallel_state import get_tp_group
 from chitu.quantization.registry import QuantizationRegistry
 from chitu.native_layout import (
+    InXOutWeight,
     NativeLayoutMixin,
     NpuFractalZnTensor,
     Repeat1ToLength,
 )
 from chitu.lazy import eval_lazy
+from chitu.device_type import is_ascend_950
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 
@@ -89,7 +91,15 @@ class AscendW8A8Linear(NativeLayoutMixin, QuantizedLinearBase):
 
     def init_native_layout(self):
         super().init_native_layout()
-        self.apply_native_layout(self.weight, NpuFractalZnTensor)
+        # Ascend 950 (aclnn-only) 不支持 internal format：
+        # allow_internal_format=True 会被拒绝，convert_from() 实际退回 base
+        # format（check_tensor()=False，copy_ 也不支持），Fractal 实际不可用。
+        # 950 用 InXOutWeight 表达 [out, in] -> [in, out] 的 ND 转置，
+        # 由 native-layout 框架在加载时转换一次并缓存。
+        if is_ascend_950():
+            self.apply_native_layout(self.weight, InXOutWeight)
+        else:
+            self.apply_native_layout(self.weight, NpuFractalZnTensor)
         self.apply_native_layout(
             self.input_scale,
             Repeat1ToLength,
@@ -147,6 +157,8 @@ class AscendW8A8Linear(NativeLayoutMixin, QuantizedLinearBase):
             if ((get_tp_group().rank_in_group == 0 and self.is_rpl) or not self.is_rpl)
             else None
         )
+        # init_native_layout stores the weight transposed:
+        # Fractal ZN on other platforms, ND [K, N] on Ascend 950.
         output = torch_npu.npu_quant_matmul(
             x,
             self.weight,

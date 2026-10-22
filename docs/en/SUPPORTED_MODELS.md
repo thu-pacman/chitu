@@ -163,6 +163,7 @@ The following models are part of chitu-pro. Please concat [solution@chitu.ai](so
 | Qwen2.5-3B-Mix |  | `models=Qwen2.5-3B-Mix` |
 | Qwen2.5-72B-Instruct-ascend-int8 |  | `models=Qwen2.5-72B-Instruct-ascend-int8` |
 | Qwen2.5-VL-32B-Instruct-ascend-int8 |  | `models=Qwen2.5-VL-32B-Instruct-ascend-int8` |
+| Qwen3-0.6B-ascend-int8 | ✓ | `models=Qwen3-0.6B-ascend-int8` |
 | Qwen3-14B-QServe-g128 | ✓ | `models=Qwen3-14B-QServe-g128` |
 | Qwen3-14B-ascend-int8 | ✓ | `models=Qwen3-14B-ascend-int8` |
 | Qwen3-14B-fp4 | ✓ | `models=Qwen3-14B-fp4` |

@@ -13,7 +13,7 @@ from chitu.utils import (
     try_import_and_setup_torch_npu,
     create_tensor,
 )
-from chitu.device_type import has_accelerator, is_muxi, is_ascend
+from chitu.device_type import has_accelerator, is_muxi, is_ascend, is_ascend_950
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
@@ -275,7 +275,13 @@ def gumbel_max_sample(
     (`torch.cuda.CUDAGraph.register_generator_state`), so the draw happens
     inside the graph and every replay advances it normally.
     """
-    noise = torch.empty_like(probs).exponential_(generator=generator)
+    if is_ascend_950():
+        u = torch.rand(
+            probs.shape, dtype=probs.dtype, device=probs.device, generator=generator
+        ).clamp_min(1e-20)
+        noise = -torch.log(-torch.log(u))
+    else:
+        noise = torch.empty_like(probs).exponential_(generator=generator)
     sample_idx = (probs / noise).argmax(dim=-1)
     return torch.gather(token_ids, index=sample_idx[:, None], dim=1).squeeze(1)
 
