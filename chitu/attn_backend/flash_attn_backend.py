@@ -10,6 +10,7 @@ import torch
 from chitu.attn_backend.base import AttnBackend
 from chitu.batched_seq_len import BatchedSeqLenDelta
 from chitu.kv_cache import PagedKVCacheAccessor, DenseKVCacheAccessor
+from chitu.device_type import is_muxi
 from chitu.utils import try_import_opt_dep
 
 flash_attn, has_flash_attn = try_import_opt_dep("flash_attn", "flash_attn")
@@ -32,7 +33,12 @@ class FlashAttnBackend(AttnBackend):
 
         self._fa = None
         self._use_fa3 = False
-        if has_flash_attn3:
+        # Prefer FA3 where available, but not on MetaX: MACA's flash_attn_3
+        # port silently ignores the k/v append arguments of
+        # flash_attn_with_kvcache (the new token's KV is neither written into
+        # the cache nor attended), which corrupts every decode-with-append
+        # path. MACA's FA2 build implements append correctly, so pin to FA2.
+        if has_flash_attn3 and not is_muxi():
             self._fa = flash_attn3
             self._use_fa3 = True
         elif has_flash_attn:

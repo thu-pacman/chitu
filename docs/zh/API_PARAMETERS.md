@@ -47,7 +47,7 @@ POST /v1/chat/completions
 | `stream_options` | `object` | `{"include_usage": false}` |  |
 | `temperature` | `number` | `0.8` | 采样温度。值越高，输出越随机。 |
 | `top_p` | `number` | `0.9` | 核采样阈值。 |
-| `top_k` | `integer` | `50` | Top-k 采样值。设为 -1 可禁用 top-k 过滤。 |
+| `top_k` | `integer` | `50` | Top-k 采样值。设为 -1（或 0）可禁用 top-k 过滤，在整个词表上采样（top_p 仍然生效）。top_k=1 等价于贪心解码，temperature=0 亦然。 |
 | `frequency_penalty` | `number` | `0.0` | 对重复 token 应用的频率惩罚。 |
 | `min_batch_size` | `integer` | `1` | 处理该请求时使用的最小 batch size。 |
 | `stop_with_eos` | `boolean` \| `null` | `null` | 是否在 EOS token 处停止生成。不能与 ignore_eos 冲突。 |
@@ -157,7 +157,7 @@ POST /v1/completions
 | `stream_options` | `object` | `{"include_usage": true}` |  |
 | `temperature` | `number` | `0.8` | 采样温度。 |
 | `top_p` | `number` | `0.9` | 核采样阈值。 |
-| `top_k` | `integer` | `50` | Top-k 采样值。 |
+| `top_k` | `integer` | `50` | Top-k 采样值。设为 -1（或 0）可禁用 top-k 过滤。top_k=1 等价于贪心解码，temperature=0 亦然。 |
 | `frequency_penalty` | `number` | `0.0` | 对重复 token 应用的频率惩罚。 |
 | `min_batch_size` | `integer` | `1` | 处理该请求时使用的最小 batch size。 |
 | `ignore_eos` | `boolean` \| `null` | `null` | 兼容 vLLM/SGLang 的 stop_with_eos 反向参数。ignore_eos=True 会强制生成到 max_tokens。 |

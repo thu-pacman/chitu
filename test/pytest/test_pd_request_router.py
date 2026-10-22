@@ -13,10 +13,13 @@ import pytest
 from omegaconf import OmegaConf
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from types import SimpleNamespace
 
+import chitu.dp_router as dp_router
 from chitu.distributed.coordinator import find_endpoint, init_coordinator, set_endpoint
 from chitu.distributed.pd_disaggregation.pd_request_router import PDRequestRouter
 from chitu.dp_request_router import LoadBalancer, PrefixCacheAwarePolicy, SchedulerStats
+from chitu.dp_token_router import TokenRouter
 from chitu.global_vars import get_global_args, set_global_args
 from chitu.schemas.serve_config import (
     PDDisaggregationConfig,
@@ -27,6 +30,7 @@ from chitu.distributed.pd_disaggregation.pd_types import (
     PendingPDRequest,
     SchedulerType,
 )
+from chitu.task import UserRequest
 
 
 @dataclass
@@ -212,6 +216,57 @@ def _pd_router_config(
         routing_by_req_len=False,
         decode_routing_by_req_len=False,
     )
+
+
+@pytest.mark.parametrize(
+    "timeout_s,age_s,status,expired",
+    [
+        (None, 2000.0, PDRequestStatus.PENDING, False),
+        (30.0, 29.0, PDRequestStatus.PENDING, False),
+        (30.0, 30.0, PDRequestStatus.PENDING, True),
+        (120.0, 31.0, PDRequestStatus.PENDING, False),
+        (30.0, 31.0, PDRequestStatus.DISPATCHED, False),
+    ],
+)
+def test_pd_pending_request_ttft_deadline(
+    monkeypatch, timeout_s, age_s, status, expired
+):
+    cfg = _pd_router_config(routing_algorithm="round_robin")
+    router = PDRequestRouter(cfg, PDDisaggregationConfig())
+    token_router = TokenRouter(SimpleNamespace())
+    monkeypatch.setattr(dp_router, "_request_router", router)
+    monkeypatch.setattr(dp_router, "_token_router", token_router)
+    user_request = UserRequest.create_mock(4, "timeout-test", enable_thinking=False)
+    if timeout_s is not None and timeout_s > 0:
+        user_request.ttft_deadline_ts = 1000.0 + timeout_s
+    request = PendingPDRequest(
+        request_id=user_request.request_id,
+        original_request=user_request,
+        prefill_scheduler_id=0,
+        decode_scheduler_id=0,
+        status=status,
+        # Pairing happens later and must not restart the request's TTFT budget.
+        created_time=1000.0 + age_s,
+    )
+    router.pending_pd_requests[request.request_id] = request
+    router.pending_requests.append(request)
+    asyncio.run(token_router.register_request(user_request))
+    monkeypatch.setattr(
+        "chitu.distributed.pd_disaggregation.pd_request_router.time.time",
+        lambda: 1000.0 + age_s,
+    )
+
+    try:
+        asyncio.run(router._check_pd_request_status())
+        assert request.status == (PDRequestStatus.FAILED if expired else status)
+        assert user_request.finished == expired
+        assert (request in router.pending_requests) == (not expired)
+        assert (request.request_id in router.pending_pd_requests) == (not expired)
+        assert (request.request_id in token_router.active_requests) == (not expired)
+        assert request.error_message == ("TTFT timeout" if expired else None)
+    finally:
+        router.context.destroy(linger=0)
+        token_router.context.destroy(linger=0)
 
 
 def test_pd_prefill_prefix_among_prefers_more_prefix_hits():

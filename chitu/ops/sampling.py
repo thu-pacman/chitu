@@ -233,12 +233,23 @@ def filter_logits_top_k_top_p(
     and the residual are off by ``sum(p) / sum(q)`` and the output drifts from
     the target.
 
+    Precondition: every entry of `top_ks` must be >= 1. A non-positive k (the
+    OpenAI-compatible `top_k = -1`, "disable top-k") would make step 2's bound
+    `arange >= top_k` mask the whole row to -inf, i.e. produce an all-zero
+    distribution instead of an unrestricted one. Callers resolve "disabled" to
+    the vocabulary size on the host -- `SampleParams.resolved_top_k` -- so this
+    stays free of an extra per-step device op on the decode critical path.
+
     Returns:
         filtered_probs: (N, max_top_k)  renormalized filtered probabilities
         token_ids:      (N, max_top_k)  original vocab indices from topk
     """
-    if max_top_k is None:
-        max_top_k = logits.shape[-1]
+    vocab_size = logits.shape[-1]
+    # max_top_k is a host int: unset, non-positive ("disabled") or past the
+    # vocabulary all mean "keep every candidate". Clamping here also keeps
+    # `torch.topk` from raising on a k it cannot satisfy.
+    if max_top_k is None or max_top_k <= 0 or max_top_k > vocab_size:
+        max_top_k = vocab_size
 
     logits, token_ids = torch.topk(logits, k=max_top_k, dim=-1)  # reduce calculation
     topk_mask = (

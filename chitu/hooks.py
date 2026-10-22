@@ -164,8 +164,9 @@ class MooncakeKVTransferHook:
                 )
 
             _kv_send_start = time.monotonic()
-            for rid in req_ids_output:
-                logger.debug(f"[PD_STAGE][prefill.kv_send.start] req_id={rid}")
+            if logger.isEnabledFor(logging.DEBUG):
+                for rid in req_ids_output:
+                    logger.debug("[PD_STAGE][prefill.kv_send.start] req_id=%s", rid)
 
             if pd_trace_enabled():
                 logger.debug(

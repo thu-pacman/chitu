@@ -566,12 +566,11 @@ def _check_router_queued_interrupt(base: str, host: str, port: int, expected: di
     dispatch loop must not send it to the engines afterwards - if it did, B would
     run for nobody, and the drain assertion after dropping A would see it.
 
-    The Router holds a request like that for a very short time: its dispatcher
-    dispatches the bound request on its next 10ms tick, so the state above is a few
-    milliseconds wide. This phase therefore polls much faster than the rest of the
-    case (``CHITU_INTERRUPT_QUEUE_POLL_S``, 5ms); at the case's 250ms cadence the
-    state is simply missed, and the phase then waits for a dispatch that already
-    happened. The observed Router state is printed.
+    Draining the whole dispatch deque per pass leaves no natural pacing window,
+    so the service under test sets ``CHITU_TEST_ROUTER_DISPATCH_DELAY_S`` (see the
+    CI job) to hold a newly arrived request in the deque long enough for the 5ms
+    poll (``CHITU_INTERRUPT_QUEUE_POLL_S``) to observe it. The observed Router
+    state is printed.
 
     A uses a long prompt so its prefill remains active when B arrives.
     """

@@ -154,6 +154,18 @@ class PDSchedulerInfo:
     def begin_observe_stage(self, stage: str):
         setattr(self, f"_{stage}_start_ts", time.monotonic())
 
+    # Start a stage clock only if it is not already running.
+    #
+    # Use this from code that re-visits the same task on every scheduler poll
+    # (e.g. `_bootstrap_check_and_promote`): `begin_observe_stage` there would
+    # reset the start timestamp each poll and the stage would always measure ~0.
+    # Returns True when this call actually started the clock.
+    def begin_observe_stage_once(self, stage: str) -> bool:
+        if getattr(self, f"_{stage}_start_ts") > 0:
+            return False
+        setattr(self, f"_{stage}_start_ts", time.monotonic())
+        return True
+
     # Record the elapsed time for the observed stage.
     # For prefill, this measures the time spent waiting for transfer_info from decode.
     # For decode, this measures the time spent waiting for kv_cache from prefill.
@@ -490,7 +502,7 @@ class PDInstanceRequestManager:
         original_request = request_data["request"]
 
         logger.debug(f"processing prefill request: {request_id}")
-        logger.debug(f"[PD_STAGE][prefill.queue.start] req_id={request_id}")
+        logger.debug("[PD_STAGE][prefill.queue.start] req_id=%s", request_id)
 
         # Create task from request (request-build boundary). Actual batched prefill
         # compute is driven by the background compute loop (start_worker -> chitu_run()).
@@ -508,7 +520,7 @@ class PDInstanceRequestManager:
         logger.debug(
             f"prefill task enqueued for request: {request_id}; compute will be handled by worker loop"
         )
-        logger.debug(f"[PD_STAGE][prefill.queue.end] req_id={request_id}")
+        logger.debug("[PD_STAGE][prefill.queue.end] req_id=%s", request_id)
 
     async def _process_decode_request(self, request_data: dict[str, Any]):
         """Process Decode-only request"""
@@ -571,7 +583,7 @@ class PDInstanceRequestManager:
         logger.debug(
             f"[PD_QUEUE][decode.enqueue] req_id={request_id} cache_owner=pending"
         )
-        logger.debug(f"[PD_STAGE][decode.enqueue.start] req_id={request_id}")
+        logger.debug("[PD_STAGE][decode.enqueue.start] req_id=%s", request_id)
 
     def _create_task_from_request(self, request_data: dict) -> Task:
         """Create Task from serialized request. Whitelist boundary: only
@@ -785,7 +797,7 @@ class PrefillOnlyManager(PDInstanceRequestManager):
         # 该日志表示 Prefill scheduler 已接收该请求，但尚未进入 prefill executor.step 流程
         # 在等待 Decode schedule 该请求并发送 DecodeAllocated
         logger.debug(f"[PD_QUEUE][prefill.enqueue] request queued: req_id={request_id}")
-        logger.debug(f"[PD_STAGE][prefill.queue.start] req_id={request_id}")
+        logger.debug("[PD_STAGE][prefill.queue.start] req_id=%s", request_id)
 
     def _bootstrap_check_and_promote(self):
         """Drive Prefill status: incoming -> TaskPool."""
@@ -818,11 +830,17 @@ class PrefillOnlyManager(PDInstanceRequestManager):
             info = task.pd_scheduler_info
             time_since_task_created = info.time_since_task_created(now)
 
-            info.begin_observe_stage("transfer_info")
-            logger.debug(f"[PD_STAGE][prefill.transfer_info.start] req_id={rid}")
-            logger.debug(
-                f"[PD_QUEUE][prefill.move] incoming->bootstrap_wait req_id={rid}"
-            )
+            # `_bootstrap_check_and_promote` re-visits every still-incoming task
+            # on every 10 ms poll. Calling `begin_observe_stage` unconditionally
+            # here reset the start timestamp on each poll, so the histogram
+            # always observed ~0 s and the DecodeAllocated wait — the largest
+            # un-attributed block of PD TTFT — was invisible. Start the clock
+            # once, on the first poll that sees the task.
+            if info.begin_observe_stage_once("transfer_info"):
+                logger.debug("[PD_STAGE][prefill.transfer_info.start] req_id=%s", rid)
+                logger.debug(
+                    f"[PD_QUEUE][prefill.move] incoming->bootstrap_wait req_id={rid}"
+                )
 
             if not self.kv_manager.is_decode_allocated(rid):
                 if info.should_refresh_log(now, 10.0):
@@ -853,7 +871,7 @@ class PrefillOnlyManager(PDInstanceRequestManager):
             logger.debug(
                 f"[PD_QUEUE][prefill.ready] req_id={rid} DecodeAllocated ready waited={time_since_task_created:.1f}s"
             )
-            logger.debug(f"[PD_STAGE][prefill.transfer_info.end] req_id={rid}")
+            logger.debug("[PD_STAGE][prefill.transfer_info.end] req_id=%s", rid)
 
         # Update prefill queue size gauges
         set_queue_size("prefill", "incoming", len(incoming_task_ids))
@@ -1117,8 +1135,8 @@ class DecodeOnlyManager(PDInstanceRequestManager):
             info.begin_observe_stage("prealloc")
             # Record enqueue stage duration
             observe_stage_duration("decode", "enqueue", time_since_task_created)
-            logger.debug(f"[PD_STAGE][decode.enqueue.end] req_id={rid}")
-            logger.debug(f"[PD_STAGE][decode.prealloc.start] req_id={rid}")
+            logger.debug("[PD_STAGE][decode.enqueue.end] req_id=%s", rid)
+            logger.debug("[PD_STAGE][decode.prealloc.start] req_id=%s", rid)
             logger.debug(
                 f"[PD_QUEUE][decode.prealloc] req_id={rid} cache_owner={target_dp_rank} waited={time_since_task_created:.1f}s"
             )
@@ -1203,14 +1221,15 @@ class DecodeOnlyManager(PDInstanceRequestManager):
                 logger.warning(
                     f"[PD_SLOW] decode.prealloc req_id={rid} waited={time_since_task_created:.1f}s"
                 )
-            logger.debug(f"[PD_STAGE][decode.prealloc.end] req_id={rid}")
-            logger.debug(f"[PD_STAGE][decode.ready.start] req_id={rid}")
+            logger.debug("[PD_STAGE][decode.prealloc.end] req_id=%s", rid)
+            logger.debug("[PD_STAGE][decode.ready.start] req_id=%s", rid)
             logger.debug(
                 f"[PD_QUEUE][decode.ready] req_id={rid} KV ready waited={time_since_task_created:.1f}s"
             )
 
             self._release_decode_prealloc_budget(task)
             task.status = TaskStatus.AvailableForSchedule
+            self.kv_manager.remove_transfer_state(rid)
 
             decode_info = self.pending_decode_requests.pop(rid, None)
             if decode_info is not None:

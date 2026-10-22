@@ -38,7 +38,7 @@ from chitu.tool_call import (
 )
 from chitu.trace import Trace, TraceLevel
 from chitu.utils import dataclass_to_dict, dataclass_from_dict, max_alloc_seq_len
-from chitu.reasoning import (
+from chitu.output_parser import (
     update_chat_template_kwargs_reasoning,
 )
 from chitu.sampling.utils import submit_grammar_compile
@@ -59,6 +59,17 @@ class TaskStatus(Enum):
     PDDecodePrealloc = 4
 
 
+TOP_K_DISABLED = 0
+"""Canonical "no top-k restriction" value.
+
+The OpenAI-compatible API documents ``top_k = -1`` as "disable top-k filtering"
+(``chitu/serve/openai_api.py``). Every non-positive request value is normalized
+to this single sentinel by :meth:`SampleParams.__post_init__`, so consumers have
+exactly one value to test for -- and so it can never be confused with
+``top_k == 1``, which *is* greedy decoding.
+"""
+
+
 @dataclass
 class SampleParams:
     temperature: float
@@ -68,8 +79,36 @@ class SampleParams:
 
     def __post_init__(self):
         if self.temperature == 0:
+            # Canonical greedy encoding: neutral temperature (logits / 0 is
+            # undefined) plus top_k == 1, i.e. argmax.
             self.temperature = 1
             self.top_k = 1
+        elif self.top_k <= 0:
+            self.top_k = TOP_K_DISABLED
+
+    @property
+    def is_greedy(self) -> bool:
+        """True iff decoding this request is deterministic argmax.
+
+        Greedy is ``temperature == 0`` (normalized to ``top_k == 1`` above) or an
+        explicit ``top_k == 1``. ``top_k <= 0`` means "no top-k restriction" and
+        is NOT greedy: the sampler used to define greedy as ``top_k <= 1``, which
+        silently decoded every documented ``top_k: -1`` request greedily
+        (argmax target, argmax MTP drafts, exact-match verify acceptance).
+        """
+        return self.temperature == 0 or self.top_k == 1
+
+    def resolved_top_k(self, vocab_size: int) -> int:
+        """``top_k`` as a concrete candidate count in ``[1, vocab_size]``.
+
+        The disabled sentinel -- and any value past the vocabulary -- becomes
+        ``vocab_size``, so the top-k filter never receives a non-positive k:
+        ``torch.topk(k=-1)`` raises, and a ``-1`` row bound in the top-k mask
+        (``arange >= top_k``) would blank the entire row to ``-inf``.
+        """
+        if self.top_k <= 0 or self.top_k > vocab_size:
+            return vocab_size
+        return self.top_k
 
 
 @dataclass
@@ -190,6 +229,13 @@ class UserRequest:
         # performance metrics
         self.timestamp: str = datetime.now().strftime("%H:%M:%S:%f")
         self.start_time: float = time.monotonic()
+        # Monotonic timestamp of the HTTP handler entry for this request. It is
+        # the anchor for every Router-side stage histogram; unlike
+        # ``start_time`` (set when this object is constructed, i.e. *after*
+        # tokenization) it also covers the tokenizer, which is the dominant
+        # Router cost for long prompts. The HTTP layer overwrites it; the
+        # default keeps non-HTTP callers (offline, tests) working.
+        self.router_arrival_ts: float = self.start_time
         self.prefill_end_time: float = 0
         self.completion_time: float = 0
         self.ttft_timeout_s: Optional[float] = None
@@ -716,6 +762,10 @@ class Task:
             return
         if self.req is None:
             return
+        remaining = max(
+            0, self.req.max_new_tokens - (self.num_new_tokens - len(tokens))
+        )
+        tokens = tokens[:remaining]
         if self.stop_with_eos and (set(tokens) & Backend.tokenizer.stop_tokens):
             self.set_stopped()
             self.req.finish_reason = "stop"
@@ -736,7 +786,9 @@ class Task:
                 request_id = self.req.request_id
                 finish_reason = self.req.finish_reason or "stop"
                 logger.info(
-                    f"[PD_STAGE][decode.exec.end] req_id={request_id} finish_reason={finish_reason}"
+                    "[PD_STAGE][decode.exec.end] req_id=%s finish_reason=%s",
+                    request_id,
+                    finish_reason,
                 )
 
     def update_response_sync(self, tokens: list[int]):

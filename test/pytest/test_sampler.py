@@ -1508,6 +1508,69 @@ class TestVerifyMtpMixed:
         assert out_tokens[0, 1].item() == 20  # draft[1] accepted (q_d=1.0, p_d=1.0)
 
 
+class TestFixedWidthDraftWithUnrestrictedTarget:
+    def test_bounded_draft_preserves_full_target_distribution(
+        self, sampler, monkeypatch
+    ):
+        _patch_cpu_create_tensor(monkeypatch)
+        sampler.mtp_size = 2
+        sampler.max_top_k_samples = 2
+        trials = 20000
+        target = torch.tensor([0.1, 0.15, 0.2, 0.25, 0.2, 0.1])
+        vocab_size = len(target)
+        state = sampler._get_states(
+            [_make_task(_make_sample_params(temperature=1, top_k=-1, top_p=1))]
+        )[0]
+        states = [state] * trials
+        torch.manual_seed(42)
+        generator = torch.Generator().manual_seed(7)
+        draft, (probs, ids) = Sampler.sample_draft_token(
+            torch.tensor([[3.0, 2.0, 1.0, 0.0, -1.0, -2.0]]).repeat(trials, 1),
+            torch.ones(trials),
+            torch.full((trials,), vocab_size, dtype=torch.int32),
+            torch.ones(trials),
+            torch.zeros(trials, dtype=torch.bool),
+            sampler.max_top_k_samples,
+            generator,
+        )
+        assert probs.shape == (trials, 2)
+        logits = target.log().repeat(trials * 2, 1)
+        tokens, scaled_logits = sampler._sample_mtp(logits, states, 2)
+        tokens, _, _ = sampler._verify_tokens(
+            scaled_logits,
+            tokens,
+            2,
+            False,
+            states=states,
+            draft_tokens=draft[:, None],
+            draft_probs=(probs[:, None, :], ids[:, None, :]),
+        )
+        for position in (0, 1):
+            empirical = torch.bincount(tokens[:, position], minlength=vocab_size)
+            torch.testing.assert_close(
+                empirical.float() / trials, target, atol=0.02, rtol=0
+            )
+
+    def test_greedy_batch_keeps_graph_inputs(self, sampler, monkeypatch):
+        import chitu.sampling.sampler as sm
+
+        _patch_cpu_create_tensor(monkeypatch)
+        monkeypatch.setattr(sm, "get_op_device", lambda: "cpu")
+        tasks = _make_packed_tasks([_make_task(_make_sample_params(temperature=0))])
+        sampler.prepare_draft_sample_params(tasks)
+        assert sampler.draft_params_match(1)
+        logits = torch.tensor([[1.0, 3.0, 2.0]])
+        token, _ = Sampler.sample_draft_token(logits, *sampler.draft_sample_params(), 2)
+        assert token.tolist() == [1]
+
+    def test_positive_top_k_keeps_main_server_cap(self, sampler):
+        sampler.max_top_k_samples = 2
+        task = _make_task(_make_sample_params(top_k=8))
+        state = sampler._get_states([task])[0]
+        assert state.sample_params.top_k == 2
+        assert task.sample_params.top_k == 8
+
+
 class TestRejectionSamplingRenormalization:
     """Regression: top-p filtered probs are renormalized, so MTP rejection
     sampling reproduces the renormalized target q.
@@ -1738,7 +1801,13 @@ class TestMTPRejectionEdgeCases:
         assert out_tokens[0, 1].item() == 88  # draft[1] not resolved, stays as sampled
 
     def test_topk_1_with_temperature(self, sampler, global_args):
-        """top_k=1 with T>0: goes through non-greedy path, but q is one-hot."""
+        """top_k=1: q is one-hot, so the mixed kernel accepts only an exact draft.
+
+        NOTE: `top_k == 1` IS greedy (`SampleParams.is_greedy`), so `sample()`
+        dispatches such a batch to the exact-match fast path. This test drives
+        `_verify_mtp_mixed` directly (explicit `greedy_mask`) to pin down the
+        rejection-sampling arithmetic for a one-hot q.
+        """
         sampler.mtp_size = 3
         V = global_args.models.vocab_size
         bs, mtp_size = 1, 3
@@ -2143,3 +2212,78 @@ class TestMTPRejectionEdgeCases:
 
         assert out_tokens.shape == (bs, mtp_size)
         assert accept_indices.shape == (bs,)
+
+
+def _patch_cpu_create_tensor(monkeypatch):
+    """Use ordinary CPU tensors instead of pinned host staging in these tests."""
+    import chitu.sampling.sampler as sm
+
+    def plain(data, device, dtype=None, sync_free=True):
+        return torch.tensor(data, dtype=dtype, device=device)
+
+    monkeypatch.setattr(sm, "create_tensor", plain)
+
+
+class TestTopKDisabledIsNotGreedy:
+    @pytest.mark.parametrize(
+        "temperature,top_k,is_greedy",
+        [(0, -1, True), (0.7, 1, True), (0.7, -1, False), (0.7, 0, False)],
+    )
+    def test_sampling_parameters(self, global_args, temperature, top_k, is_greedy):
+        params = _make_sample_params(temperature=temperature, top_k=top_k)
+        vocab_size = global_args.models.vocab_size
+        assert params.is_greedy == is_greedy
+        assert params.resolved_top_k(vocab_size) == (1 if is_greedy else vocab_size)
+
+    def test_disabled_top_k_still_honours_top_p(
+        self, sampler, global_args, monkeypatch
+    ):
+        """Disabling top-k must still sample, within the top-p nucleus."""
+        _patch_cpu_create_tensor(monkeypatch)
+        sampler.mtp_size = 1
+        torch.manual_seed(0)
+        logits = torch.full((1, global_args.models.vocab_size), -10.0)
+        logits[0, 3] = 1.0
+        logits[0, 7] = 0.9
+        params = _make_sample_params(temperature=1.0, top_k=-1, top_p=0.6)
+        drawn = set()
+        for _ in range(60):
+            tasks = _make_packed_tasks([_make_task(params)])
+            drawn.add(sampler.sample(logits.clone(), tasks).tokens[0, 0].item())
+        assert drawn == {3, 7}
+
+    @pytest.mark.parametrize("top_k", [-1, 1000])
+    def test_disabled_or_oversized_top_k_proposal_survives_batch_change(
+        self, sampler, global_args, monkeypatch, top_k
+    ):
+        import chitu.sampling.sampler as sm
+
+        _patch_cpu_create_tensor(monkeypatch)
+        monkeypatch.setattr(sm, "get_op_device", lambda: "cpu")
+        sampler.mtp_size = 3
+        V = global_args.models.vocab_size
+        unrestricted = _make_task(_make_sample_params(top_k=top_k))
+        restricted = _make_task(_make_sample_params(top_k=5))
+        tasks = _make_packed_tasks([unrestricted, restricted])
+        sampler.prepare_draft_sample_params(tasks)
+        torch.manual_seed(7)
+        tokens, proposal = sampler.sample_draft_tokens(torch.randn(2, V))
+        probs, ids = proposal
+        draft_probs = probs[:, None, :].repeat(1, 2, 1)
+        draft_ids = ids[:, None, :].repeat(1, 2, 1)
+        next_tokens = tokens[:, None].repeat(1, 3)
+        tasks.generated_result_device = PackedTasksResult(tokens=next_tokens)
+        sampler.update_draft_results(tasks, next_tokens, (draft_probs, draft_ids))
+
+        # Reorder the batch between draft and verification; all candidates of
+        # the actual proposal must survive storage and reconstruction.
+        states = sampler._get_states([restricted, unrestricted])
+        assert states[0].draft_probs[0].shape[-1] == 5
+        assert states[1].draft_probs[0].shape[-1] == min(V, sampler.max_top_k_samples)
+        _, (rebuilt_probs, rebuilt_ids), _ = sampler._rebuild_mtp_draft_inputs(
+            states, torch.device("cpu")
+        )
+        torch.testing.assert_close(rebuilt_probs[1], draft_probs[0])
+        torch.testing.assert_close(rebuilt_ids[1], draft_ids[0])
+        torch.testing.assert_close(rebuilt_probs[0, :, :5], draft_probs[1, :, :5])
+        assert torch.count_nonzero(rebuilt_probs[0, :, 5:]) == 0

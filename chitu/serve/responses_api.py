@@ -29,6 +29,7 @@ DOC_GENERATION = os.environ.get("CHITU_GENERATING_DOCS") == "1"
 if not DOC_GENERATION:
     from chitu.global_vars import get_global_args
     from chitu.task import UserRequest, RequestParams, PromptTooLongError
+    from chitu.output_parser import REASONING_OUTPUT_STATES
     from chitu.tool_call import (
         get_tool_parser_cls,
         parse_stream_by_parser,
@@ -989,7 +990,7 @@ async def collect_response_output(
 
     if req.tool_call_params:
         stream = _stream_source_for_response(req)
-        async for data, _is_reasoning, _extra in stream:
+        async for data, _state, _extra in stream:
             if not data or not isinstance(data, ChoiceDelta):
                 continue
             if data.content:
@@ -997,8 +998,8 @@ async def collect_response_output(
             for tool_call in data.tool_calls or []:
                 _update_tool_buffer(tool_buffers, tool_call, track_started=False)
     else:
-        async for data, is_reasoning, _extra in req.async_stream:
-            if not data or is_reasoning:
+        async for data, state, _extra in req.async_stream:
+            if not data or state in REASONING_OUTPUT_STATES:
                 continue
             output_text_parts.append(data)
 
@@ -1097,7 +1098,7 @@ async def responses_stream_from_async_stream(
 
     text_item_id = f"msg_{user_req.request_id}"
     text_started = False
-    async for data, is_reasoning, _extra in stream:
+    async for data, state, _extra in stream:
         if not data:
             continue
         if public_tools and isinstance(data, ChoiceDelta):
@@ -1153,7 +1154,7 @@ async def responses_stream_from_async_stream(
                     )
             continue
 
-        if is_reasoning or not isinstance(data, str):
+        if state in REASONING_OUTPUT_STATES or not isinstance(data, str):
             continue
         if not text_started:
             text_started = True

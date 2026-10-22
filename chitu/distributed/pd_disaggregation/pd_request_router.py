@@ -9,6 +9,7 @@ Extends the original RequestRouter to support Prefill-Decode disaggregation
 
 import asyncio
 import logging
+import os
 import time
 from collections import OrderedDict, deque
 from typing import Optional
@@ -42,6 +43,7 @@ from chitu.distributed.pd_disaggregation.pd_types import (
 )
 from chitu.metrics.prometheus_collector import (
     observe_pd_stage,
+    observe_router_stage,
     set_router_pending_requests,
 )
 from chitu.global_vars import (
@@ -1197,7 +1199,7 @@ class PDRequestRouter(RequestRouter):
     async def _add_pd_request(self, request: UserRequest) -> bool:
         """Bind one request to an available P/D pair."""
         request_id = request.request_id
-        logger.debug(f"[PD_STAGE][router.recv.start] req_id={request_id}")
+        logger.debug("[PD_STAGE][router.recv.start] req_id=%s", request_id)
 
         with observe_pd_stage("router", "recv"):
             prefill_eligible_ids = (
@@ -1268,7 +1270,7 @@ class PDRequestRouter(RequestRouter):
 
         # Update router pending requests gauge
         set_router_pending_requests(len(self.pending_pd_requests))
-        logger.debug(f"[PD_STAGE][router.recv.end] req_id={request_id}")
+        logger.debug("[PD_STAGE][router.recv.end] req_id=%s", request_id)
         return True
 
     def _discover_prometheus_collectors(self) -> None:
@@ -1329,13 +1331,29 @@ class PDRequestRouter(RequestRouter):
         """PD request processing task"""
         logger.info("starting pd request processor")
 
+        # Test-only: hold newly arrived requests in the dispatch deque long
+        # enough for the queued-interrupt phase to observe them. Draining the
+        # whole deque per pass leaves no natural pacing window. Off unless the
+        # CI job sets CHITU_TEST_ROUTER_DISPATCH_DELAY_S.
+        dispatch_delay_s = float(
+            os.environ.get("CHITU_TEST_ROUTER_DISPATCH_DELAY_S", "0") or 0
+        )
+
         while not self._shutdown:
             if is_dying():
                 # During the crash window, stop dispatching new requests.
                 await asyncio.sleep(0.1)
                 continue
             try:
-                if self.pending_requests:
+                if not self.pending_requests:
+                    # Idle: 10ms polling interval.
+                    await asyncio.sleep(0.01)
+                    continue
+
+                if dispatch_delay_s > 0:
+                    await asyncio.sleep(dispatch_delay_s)
+
+                while self.pending_requests and not self._shutdown:
                     pd_request = self.pending_requests.popleft()
 
                     if isinstance(pd_request, PendingPDRequest):
@@ -1360,7 +1378,7 @@ class PDRequestRouter(RequestRouter):
                     else:
                         raise ValueError(f"unexpected request type: {type(pd_request)}")
 
-                await asyncio.sleep(0.01)  # 10ms polling interval
+                    await asyncio.sleep(0)
             except asyncio.CancelledError:
                 logger.info("[PD_ROUTER][request_processor_cancelled]")
                 raise
@@ -1409,8 +1427,10 @@ class PDRequestRouter(RequestRouter):
 
         # Dual dispatch: send to both Prefill and Decode simultaneously
         logger.debug(
-            f"[PD_STAGE][router.dispatch.start] req_id={pd_request.request_id} "
-            f"prefill_sid={pd_request.prefill_scheduler_id} decode_sid={pd_request.decode_scheduler_id}"
+            "[PD_STAGE][router.dispatch.start] req_id=%s prefill_sid=%s decode_sid=%s",
+            pd_request.request_id,
+            pd_request.prefill_scheduler_id,
+            pd_request.decode_scheduler_id,
         )
         logger.debug(
             f"[PD_TRACE][router.dispatch_start] req_id={pd_request.request_id} "
@@ -1440,7 +1460,11 @@ class PDRequestRouter(RequestRouter):
                 self.pending_requests.appendleft(pd_request)
                 await asyncio.sleep(0.05)
                 return
-        logger.debug(f"[PD_STAGE][router.dispatch.end] req_id={pd_request.request_id}")
+        logger.debug("[PD_STAGE][router.dispatch.end] req_id=%s", pd_request.request_id)
+
+        # arrival -> both peers have the request: the Router's own contribution to
+        # TTFT (HTTP + params + tokenize + route select + queue + ZMQ dual send).
+        observe_router_stage("routed", time.monotonic() - req.router_arrival_ts)
 
         # Update router performance counters on successful dispatch
         if not is_evict:

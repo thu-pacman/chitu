@@ -14,5 +14,5 @@ vocab_size: 152064
 intermediate_dim: 13824
 norm_eps: 1e-05
 rope_theta: 1000000.0
-rs_token_id: 151648
-re_token_id: 151649
+reasoning_start_delimiter_ids: [151648]
+reasoning_end_delimiter_ids: [151649]

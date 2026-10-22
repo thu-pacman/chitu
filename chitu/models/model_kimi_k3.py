@@ -66,7 +66,7 @@ from chitu.ops import (
 from chitu.quantization import QuantizationRegistry
 from chitu.task_type import TaskType
 from chitu.tensor_parallel import ColumnParallelLinear, LocalLinear, RowParallelLinear
-from chitu.distributed.parallel_state import get_tp_size, get_pp_size
+from chitu.distributed.parallel_state import get_tp_size
 
 
 class AttentionKimiK3(AttentionDeepSeekV3):
@@ -628,7 +628,11 @@ class TransformerBlockKimiK3(TransformerBlock):
 
 @register_model(ModelType.KIMI_K3)
 class TransformerKimiK3(TransformerDeepSeekV3):
-    """Kimi-K3 text backbone (v1: text-only, TP/DP/EP, no PP/CP/MTP)."""
+    """Kimi-K3 text backbone with TP/DP/EP/PP (no CP/MTP).
+
+    PP carries the running stream and only the AttnRes blocks produced before
+    the next stage.
+    """
 
     _CKPT_TEXT_PREFIX = "language_model."
 
@@ -643,11 +647,6 @@ class TransformerKimiK3(TransformerDeepSeekV3):
         mla_absorb: str,
         **kwargs,
     ):
-        if get_pp_size() > 1:
-            raise NotImplementedError(
-                "Kimi-K3 v1 does not support pipeline parallelism (the AttnRes "
-                "block_residual would need to be shipped across PP stages)"
-            )
         if get_cp_context().pcp_size > 1:
             raise NotImplementedError("Kimi-K3 v1 does not support context parallelism")
         if int(get_global_args().infer.mtp_size) > 1:
@@ -713,22 +712,88 @@ class TransformerKimiK3(TransformerDeepSeekV3):
             h = self.lm_head(h)
         return h
 
-    def _run_layers(self, h: torch.Tensor, freqs_cis: BatchedFreqsCis):
-        block_residual = h.new_zeros(h.shape[0], 0, self.params.dim)
+    def get_pipeline_payload_shape(self, num_tokens: int) -> list[int]:
+        """Opaque wire buffer containing contiguous stream and valid bank.
+
+        Its first dimension preserves the executor's token-count convention.
+        The contents are two flat segments, not independently indexable token
+        rows: stream [T, D], then bank [T, B, D].
+        """
+        block_size = int(self.params.attn_res_block_size)
+        inherited_blocks = (self.local_begin_layer_id + block_size - 1) // block_size
+        return [num_tokens, (1 + inherited_blocks) * self.params.dim]
+
+    def get_pipeline_payload_dtype(self) -> torch.dtype:
+        return torch.get_default_dtype()
+
+    def _pack_pipeline(
+        self, h: torch.Tensor, block_residual: torch.Tensor
+    ) -> torch.Tensor:
+        block_size = int(self.params.attn_res_block_size)
+        produced_blocks = (self.local_end_layer_id + block_size - 1) // block_size
+        expected_bank_shape = (h.shape[0], produced_blocks, self.params.dim)
+        if tuple(block_residual.shape) != expected_bank_shape:
+            raise ValueError(
+                f"Kimi-K3 outgoing AttnRes bank must have shape {expected_bank_shape}, "
+                f"got {tuple(block_residual.shape)}"
+            )
+        # One message, no global-width padding. Keep the entire stream and
+        # the entire token-major bank in separate contiguous segments, so the
+        # receiver can use both directly without materializing either slice.
+        return torch.cat((h.flatten(), block_residual.flatten())).view(
+            h.shape[0], (1 + produced_blocks) * self.params.dim
+        )
+
+    def _unpack_pipeline(
+        self, payload: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        expected = self.get_pipeline_payload_shape(payload.shape[0])
+        if list(payload.shape) != expected or not payload.is_contiguous():
+            raise ValueError(
+                f"Kimi-K3 incoming PP payload must be contiguous with shape "
+                f"{expected}, got {list(payload.shape)}"
+            )
+        num_tokens = payload.shape[0]
+        dim = self.params.dim
+        inherited_blocks = expected[1] // dim - 1
+        stream_elements = num_tokens * dim
+        # Async PP receive may allocate on a dedicated receive stream. These
+        # views keep its storage through computation on the current stream;
+        # a wait alone orders the reads but does not delay allocator reuse.
+        if payload.device.type == "cuda":
+            payload.record_stream(torch.cuda.current_stream(payload.device))
+        flat = payload.view(-1)
+        return (
+            flat[:stream_elements].view(num_tokens, dim),
+            flat[stream_elements:].view(num_tokens, inherited_blocks, dim),
+        )
+
+    def _run_layers(
+        self,
+        h: torch.Tensor,
+        freqs_cis: BatchedFreqsCis,
+        block_residual: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if block_residual is None:
+            block_residual = h.new_zeros(h.shape[0], 0, self.params.dim)
         for layer in self.non_mtp_layers:
             h, block_residual = layer(h, freqs_cis, block_residual=block_residual)
+        return h, block_residual
+
+    def _final_attn_res(
+        self, h: torch.Tensor, block_residual: torch.Tensor
+    ) -> torch.Tensor:
         # Final AttnRes mix. Applied here (on all positions) rather than in
         # _post_layers because prefill selects output positions before calling
         # _post_layers; the mix is purely per-token, so this is equivalent to
         # the reference's mix-then-select order.
-        h = attn_res_mix(
+        return attn_res_mix(
             h,
             block_residual,
             self.output_attn_res_norm.weight,
             self.output_attn_res_proj.weight.view(-1),
             self.output_attn_res_norm.eps,
         )
-        return h
 
     @override
     @torch.inference_mode()
@@ -739,7 +804,8 @@ class TransformerKimiK3(TransformerDeepSeekV3):
         if self.moe_impl is not None:
             self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
         h = self._pre_layers(tokens, **args)
-        h = self._run_layers(h, freqs_cis)
+        h, block_residual = self._run_layers(h, freqs_cis)
+        h = self._final_attn_res(h, block_residual)
         return self.cp_context.allgather_hidden_states(
             h,
             output_token_offsets,
@@ -750,7 +816,55 @@ class TransformerKimiK3(TransformerDeepSeekV3):
     @torch.inference_mode()
     def decode_no_pipeline(self, tokens, freqs_cis: BatchedFreqsCis):
         h = self._pre_layers(tokens)
-        h = self._run_layers(h, freqs_cis)
+        h, block_residual = self._run_layers(h, freqs_cis)
+        h = self._final_attn_res(h, block_residual)
+        return self._post_layers(h).float()
+
+    @override
+    @torch.inference_mode()
+    def prefill_pipeline(
+        self,
+        tokens: Optional[torch.Tensor],
+        hiddens: Optional[torch.Tensor],
+        output_token_offsets: torch.Tensor,
+        **args,
+    ) -> torch.Tensor:
+        freqs_cis = self.prepare_freqs_cis()
+        if self.pp_stage == 0:
+            if tokens is None or hiddens is not None:
+                raise ValueError("Kimi-K3 first PP stage requires tokens only")
+            if self.moe_impl is not None:
+                self.moe_impl.prepare(TaskType.Prefill, int(tokens.shape[0]))
+            h = self._pre_layers(tokens, **args)
+            block_residual = None
+        else:
+            if hiddens is None or tokens is not None:
+                raise ValueError(
+                    "Kimi-K3 later PP stages require an AttnRes payload only"
+                )
+            h, block_residual = self._unpack_pipeline(hiddens)
+            if self.moe_impl is not None:
+                self.moe_impl.prepare(TaskType.Prefill, int(h.shape[0]))
+        h, block_residual = self._run_layers(h, freqs_cis, block_residual)
+        if self.pp_stage != self.pp_end_stage:
+            return self._pack_pipeline(h, block_residual)
+        h = self._final_attn_res(h, block_residual)
+        return self.cp_context.allgather_hidden_states(
+            h, output_token_offsets, self._post_layers
+        )
+
+    @override
+    @torch.inference_mode()
+    def decode_pipeline(self, middle_state, freqs_cis: BatchedFreqsCis):
+        if self.pp_stage == 0:
+            h = self._pre_layers(middle_state)
+            block_residual = None
+        else:
+            h, block_residual = self._unpack_pipeline(middle_state)
+        h, block_residual = self._run_layers(h, freqs_cis, block_residual)
+        if self.pp_stage != self.pp_end_stage:
+            return self._pack_pipeline(h, block_residual)
+        h = self._final_attn_res(h, block_residual)
         return self._post_layers(h).float()
 
     # ------------------------------------------------------------------
@@ -772,15 +886,18 @@ class TransformerKimiK3(TransformerDeepSeekV3):
     @override
     def _get_non_layer_prefix_mappings(self) -> list[tuple[str, str]]:
         p = self._CKPT_TEXT_PREFIX
-        prefix_mappings = [(f"{p}model.embed_tokens.", "embed_tokens.")]
-        prefix_mappings.extend(
-            [
-                (f"{p}model.norm.", "norm."),
-                (f"{p}lm_head.", "lm_head."),
-                (f"{p}model.output_attn_res_norm.", "output_attn_res_norm."),
-                (f"{p}model.output_attn_res_proj.", "output_attn_res_proj."),
-            ]
-        )
+        prefix_mappings = []
+        if self.pp_stage == 0:
+            prefix_mappings.append((f"{p}model.embed_tokens.", "embed_tokens."))
+        if self.pp_stage == self.pp_end_stage:
+            prefix_mappings.extend(
+                [
+                    (f"{p}model.norm.", "norm."),
+                    (f"{p}lm_head.", "lm_head."),
+                    (f"{p}model.output_attn_res_norm.", "output_attn_res_norm."),
+                    (f"{p}model.output_attn_res_proj.", "output_attn_res_proj."),
+                ]
+            )
         return prefix_mappings
 
     @override

@@ -16,6 +16,7 @@ from types import UnionType
 import importlib
 import importlib.resources
 import threading
+import time
 import weakref
 from collections import deque
 from types import UnionType
@@ -583,6 +584,136 @@ def create_tensor(data, device, dtype=None, sync_free=True):
             device=device, non_blocking=True
         )
     return torch.tensor(data, dtype=dtype, device=device)
+
+
+# ---------------------------------------------------------------------------
+# Per-step host -> device staging
+# ---------------------------------------------------------------------------
+
+# Set CHITU_CACHE_PREP_TIMING=1 to collect per-iteration cache-preparation
+# timings and H2D copy counts (summary logged by chitu/kv_cache/kv_cache.py).
+CACHE_PREP_TIMING_ENABLED = os.environ.get("CHITU_CACHE_PREP_TIMING", "0") not in (
+    "0",
+    "",
+    "false",
+    "False",
+)
+
+_STEP_COUNTERS: dict[str, int] = {}
+
+
+def bump_step_counter(name: str, n: int = 1) -> None:
+    """Count a per-step event (only active under ``CHITU_CACHE_PREP_TIMING``)."""
+    if CACHE_PREP_TIMING_ENABLED:
+        _STEP_COUNTERS[name] = _STEP_COUNTERS.get(name, 0) + n
+
+
+def get_step_counters() -> dict[str, int]:
+    return dict(_STEP_COUNTERS)
+
+
+def reset_step_counters() -> None:
+    _STEP_COUNTERS.clear()
+
+
+# ---------------------------------------------------------------------------
+# Per-step host segment timing (same knob as the cache-prep timing above)
+# ---------------------------------------------------------------------------
+#
+# The post-verify host bubble of an MTP decode iteration is ~2 ms of pure CPU
+# between the verify replay's end and the next draft replay's launch. Attributing
+# it needs sub-segment resolution that `_CachePrepStats` (which only sees the KV
+# cache calls) cannot give, so `step_timer` marks arbitrary named host segments;
+# they are accumulated here and reported by the same
+# ``[cache-prep-timing]`` line (see ``chitu/kv_cache/kv_cache.py``).
+
+_STEP_TIMES: dict[str, float] = {}
+_STEP_TIME_COUNTS: dict[str, int] = {}
+
+
+class _NullStepTimer:
+    __slots__ = ()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+_NULL_STEP_TIMER = _NullStepTimer()
+
+
+class _StepTimer:
+    __slots__ = ("_key", "_start")
+
+    def __init__(self, key: str):
+        self._key = key
+
+    def __enter__(self):
+        self._start = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        add_step_time(self._key, time.perf_counter() - self._start)
+        return False
+
+
+def step_timer(name: str):
+    """Time one named host segment; a no-op unless ``CHITU_CACHE_PREP_TIMING=1``."""
+    if not CACHE_PREP_TIMING_ENABLED:
+        return _NULL_STEP_TIMER
+    return _StepTimer(name)
+
+
+# Standalone reporter for the per-step host phases. The `[cache-prep-timing]`
+# line in chitu/kv_cache/kv_cache.py is driven by `prepare_cache_decode`, so it
+# never fires in the PD Prefill role (which runs no decode step). Set
+# ``CHITU_STEP_PHASE_REPORT=<n>`` (together with ``CHITU_CACHE_PREP_TIMING=1``)
+# to have `Executor.step` log the accumulated segment times and counters of the
+# *local* rank every n steps instead. Use one reporter at a time: both reset the
+# same accumulators.
+STEP_PHASE_REPORT_INTERVAL = int(os.environ.get("CHITU_STEP_PHASE_REPORT", "0") or 0)
+
+_STEP_PHASE_SEEN = [0]
+
+
+def maybe_report_step_phases(logger_, tag: str = "") -> None:
+    """Log and reset this rank's per-step host segment timings, every
+    ``CHITU_STEP_PHASE_REPORT`` steps. No-op unless both knobs are set."""
+    if not (CACHE_PREP_TIMING_ENABLED and STEP_PHASE_REPORT_INTERVAL > 0):
+        return
+    _STEP_PHASE_SEEN[0] += 1
+    n = _STEP_PHASE_SEEN[0]
+    if n % STEP_PHASE_REPORT_INTERVAL:
+        return
+    segs = get_step_times()
+    counters = get_step_counters()
+    parts = [
+        f"{key}: {total * 1e3 / n:.3f} ms/step ({count / n:.2f} calls/step)"
+        for key, (total, count) in sorted(segs.items(), key=lambda kv: -kv[1][0])
+    ]
+    parts += [f"{name}: {value / n:.1f}/step" for name, value in counters.items()]
+    logger_.info(f"[step-phase-timing]{tag} steps={n} | " + " | ".join(parts))
+    reset_step_times()
+    reset_step_counters()
+    _STEP_PHASE_SEEN[0] = 0
+
+
+def add_step_time(name: str, elapsed: float) -> None:
+    if not CACHE_PREP_TIMING_ENABLED:
+        return
+    _STEP_TIMES[name] = _STEP_TIMES.get(name, 0.0) + elapsed
+    _STEP_TIME_COUNTS[name] = _STEP_TIME_COUNTS.get(name, 0) + 1
+
+
+def get_step_times() -> dict[str, tuple[float, int]]:
+    return {k: (v, _STEP_TIME_COUNTS.get(k, 0)) for k, v in _STEP_TIMES.items()}
+
+
+def reset_step_times() -> None:
+    _STEP_TIMES.clear()
+    _STEP_TIME_COUNTS.clear()
 
 
 def dataclass_to_dict(obj: Any) -> dict[str, Any] | Any:

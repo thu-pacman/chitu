@@ -13,7 +13,10 @@ version: 1
 formatters:
   simple:
     class: "chitu.logging_utils.ChituFormatter"
-    format: "%(levelname)s %(asctime)s %(rank)s [%(name)s:%(lineno)d] %(context)s %(message)s%(stack_trace)s"
+    # `%(msecs)03d` keeps the compact `%m-%d %H:%M:%S` date while giving the
+    # millisecond resolution every per-request PD timeline needs (a 1-second
+    # stamp cannot split a 3 s TTFT into router / prefill / decode segments).
+    format: "%(levelname)s %(asctime)s.%(msecs)03d %(rank)s [%(name)s:%(lineno)d] %(context)s %(message)s%(stack_trace)s"
     datefmt: "%m-%d %H:%M:%S"
 handlers:
   console:
