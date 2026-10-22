@@ -35,8 +35,8 @@ rope_factor: 40
 index_head_dim: 128
 index_n_heads: 64
 index_topk: 2048
-rs_token_id: 128798
-re_token_id: 128799
+reasoning_start_delimiter_ids: [128798]
+reasoning_end_delimiter_ids: [128799]
 main_weight_dtype: float8_e4m3fn
 rms_norm_dtype: float32
 tool_parser: DeepSeekV31ToolParser

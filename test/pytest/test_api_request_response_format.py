@@ -19,7 +19,7 @@ from xgrammar import (
     VocabType,
 )
 
-import chitu.reasoning.utils as reasoning_utils
+import chitu.output_parser.utils as output_parser_utils
 import chitu.sampling.utils as sampling_utils
 import chitu.serve.api_app as api_app
 import chitu.serve.api_server as api_server
@@ -30,7 +30,7 @@ import chitu.serve.responses_api as responses_api
 import chitu.task as task
 import chitu.tool_call.grammar.utils as grammar_utils
 import chitu.tool_call.utils as tool_call_utils
-from chitu.reasoning.type_def import ReasoningParams
+from chitu.output_parser.type_def import OutputParserParams
 from chitu.tool_call import (
     ResponseFormatParams,
     ToolCallParams,
@@ -124,35 +124,45 @@ def accepts(compiler: GrammarCompiler, grammar, text: str) -> bool:
 def reasoning_disabled(monkeypatch):
     monkeypatch.setattr(
         grammar_utils,
-        "get_reasoning_params",
-        lambda enable_thinking: ReasoningParams(False),
+        "get_output_parser_params",
+        lambda enable_thinking: OutputParserParams(False),
     )
 
 
 @pytest.fixture
 def reasoning_triggered(monkeypatch):
-    def _get(enable_thinking: bool) -> ReasoningParams:
+    def _get(enable_thinking: bool) -> OutputParserParams:
         if not enable_thinking:
-            return ReasoningParams(False)
-        return ReasoningParams(
-            True, 101, 102, "<think>", "</think>", initial_state=False
+            return OutputParserParams(False)
+        return OutputParserParams(
+            True,
+            reasoning_start_delimiter_ids=[101],
+            reasoning_end_delimiter_ids=[102],
+            reasoning_start_token="<think>",
+            reasoning_end_token="</think>",
+            initial_state=False,
         )
 
-    monkeypatch.setattr(grammar_utils, "get_reasoning_params", _get)
+    monkeypatch.setattr(grammar_utils, "get_output_parser_params", _get)
 
 
 @pytest.fixture
 def reasoning_forced(monkeypatch):
     """initial_state=True: the chat template already emitted the start token."""
 
-    def _get(enable_thinking: bool) -> ReasoningParams:
+    def _get(enable_thinking: bool) -> OutputParserParams:
         if not enable_thinking:
-            return ReasoningParams(False)
-        return ReasoningParams(
-            True, 101, 102, "<think>", "</think>", initial_state=True
+            return OutputParserParams(False)
+        return OutputParserParams(
+            True,
+            reasoning_start_delimiter_ids=[101],
+            reasoning_end_delimiter_ids=[102],
+            reasoning_start_token="<think>",
+            reasoning_end_token="</think>",
+            initial_state=True,
         )
 
-    monkeypatch.setattr(grammar_utils, "get_reasoning_params", _get)
+    monkeypatch.setattr(grammar_utils, "get_output_parser_params", _get)
 
 
 # ---------------------------------------------------------------------------
@@ -331,8 +341,8 @@ def mocked_backend(monkeypatch):
         lambda kwargs, enable_thinking: None,
     )
     monkeypatch.setattr(tool_call_utils, "get_tool_parser_cls", lambda: DummyToolParser)
-    # get_reasoning_params caches per-process; start each test clean
-    monkeypatch.setattr(reasoning_utils, "_reasoning_params_cache", {})
+    # get_output_parser_params caches per-process; start each test clean
+    monkeypatch.setattr(output_parser_utils, "_output_parser_params_cache", {})
 
 
 def make_request_params(**overrides):
@@ -539,7 +549,7 @@ class StaticStream:
         self.tokens_len = len(items)
         self.reasoning_tokens = 0
         self.input_cached_tokens = cached
-        self.reasoning_parser = SimpleNamespace(
+        self.output_parser = SimpleNamespace(
             params=SimpleNamespace(enable_reasoning=False)
         )
 
@@ -583,15 +593,15 @@ def create_chat_client(monkeypatch, captured):
         lambda kwargs, enable_thinking: None,
     )
     monkeypatch.setattr(tool_call_utils, "get_tool_parser_cls", lambda: DummyToolParser)
-    monkeypatch.setattr(reasoning_utils, "_reasoning_params_cache", {})
+    monkeypatch.setattr(output_parser_utils, "_output_parser_params_cache", {})
     # request-time schema validation compiles through the grammar cache;
     # give it a synthetic compiler and an isolated cache
     compiler = make_compiler()
     monkeypatch.setattr(sampling_utils, "get_grammar_compiler", lambda: compiler)
     monkeypatch.setattr(
         grammar_utils,
-        "get_reasoning_params",
-        lambda enable_thinking: ReasoningParams(False),
+        "get_output_parser_params",
+        lambda enable_thinking: OutputParserParams(False),
     )
     monkeypatch.setattr(sampling_utils, "_GRAMMAR_FUTURES", OrderedDict())
 
@@ -810,15 +820,15 @@ def create_responses_client(monkeypatch, captured):
         lambda kwargs, enable_thinking: None,
     )
     monkeypatch.setattr(tool_call_utils, "get_tool_parser_cls", lambda: DummyToolParser)
-    monkeypatch.setattr(reasoning_utils, "_reasoning_params_cache", {})
+    monkeypatch.setattr(output_parser_utils, "_output_parser_params_cache", {})
     # request-time schema validation compiles through the grammar cache;
     # give it a synthetic compiler and an isolated cache
     compiler = make_compiler()
     monkeypatch.setattr(sampling_utils, "get_grammar_compiler", lambda: compiler)
     monkeypatch.setattr(
         grammar_utils,
-        "get_reasoning_params",
-        lambda enable_thinking: ReasoningParams(False),
+        "get_output_parser_params",
+        lambda enable_thinking: OutputParserParams(False),
     )
     monkeypatch.setattr(sampling_utils, "_GRAMMAR_FUTURES", OrderedDict())
 

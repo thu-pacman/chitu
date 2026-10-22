@@ -24,6 +24,7 @@ if not DOC_GENERATION:
     from chitu.backend import Backend
     from chitu.global_vars import get_global_args
     from chitu.task import SampleParams, UserRequest, RequestParams, PromptTooLongError
+    from chitu.output_parser import REASONING_OUTPUT_STATES
     from chitu.tool_call import (
         get_tool_parser_cls,
         parse_stream_by_parser,
@@ -518,9 +519,9 @@ def build_tool_use_delta(index: int, partial_json: str) -> dict:
 async def collect_reasoning_and_text(async_stream) -> tuple[str, str]:
     chunks: list[str] = []
     rchunks: list[str] = []
-    async for data, is_reasoning, (_top_logprobs, _top_tokens) in async_stream:
+    async for data, state, (_top_logprobs, _top_tokens) in async_stream:
         if data:
-            if is_reasoning:
+            if state in REASONING_OUTPUT_STATES:
                 rchunks.append(data)
             else:
                 chunks.append(data)
@@ -692,7 +693,7 @@ async def anthropic_stream_from_async_stream(
         )
 
     if tool_parser:
-        async for data, _is_reasoning, _extra in stream:
+        async for data, _state, _extra in stream:
             if not data:
                 continue
             if data.reasoning_content:
@@ -715,10 +716,10 @@ async def anthropic_stream_from_async_stream(
                     if tool_call.function.arguments:
                         buf["arguments"] += tool_call.function.arguments
     else:
-        async for data, is_reasoning, (_top_logprobs, _top_tokens) in stream:
+        async for data, state, (_top_logprobs, _top_tokens) in stream:
             if not data:
                 continue
-            async for event in _emit_text_delta(data, is_reasoning):
+            async for event in _emit_text_delta(data, state in REASONING_OUTPUT_STATES):
                 yield event
 
     if current_block_type is not None:

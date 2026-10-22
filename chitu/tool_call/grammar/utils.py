@@ -15,7 +15,7 @@ from xgrammar.structural_tag import (
 )
 from .tools import AbstractToolsGrammar
 from ..type_def import ToolCallParams, ConstraintParams, ResponseFormatParams
-from chitu.reasoning.utils import get_reasoning_params
+from chitu.output_parser.utils import get_output_parser_params
 
 logger = logging.getLogger(__name__)
 
@@ -135,9 +135,12 @@ def compile_format_to_grammar(format: Format):
 def wrap_format_with_reasoning(format: Format, enable_thinking: bool) -> Format:
     """Prefix *format* with the model's reasoning span (thinking models only).
 
-    ``[start_token?] AnyText(excludes=[end_token]) end_token <format>`` — the
-    model may reason freely, but once it closes the reasoning span the rest of
-    the output must match *format*.  ``start_token`` is omitted when the chat
+    ```
+    [reasoning_start_token?] AnyText(excludes=[reasoning_end_token]) reasoning_end_token <format>
+    ```
+
+    The model may reason freely, but once it closes the reasoning span the rest of
+    the output must match *format*.  ``reasoning_start_token`` is omitted when the chat
     template already opened the reasoning span (``initial_state``).
 
     This applies to every tool choice, ``auto`` included.  *format* already
@@ -147,18 +150,18 @@ def wrap_format_with_reasoning(format: Format, enable_thinking: bool) -> Format:
     still thinking is forced to be a syntactically valid tool call instead of
     plain text.
     """
-    reasoning_params = get_reasoning_params(enable_thinking)
-    if not reasoning_params.enable_reasoning:
+    parser_params = get_output_parser_params(enable_thinking)
+    if not parser_params.enable_reasoning:
         return format
 
-    if reasoning_params.initial_state:
+    if parser_params.initial_state:
         elements = []
     else:
-        elements = [ConstStringFormat(value=reasoning_params.start_token)]
+        elements = [ConstStringFormat(value=parser_params.reasoning_start_token)]
 
     elements += [
-        AnyTextFormat(excludes=[reasoning_params.end_token]),
-        ConstStringFormat(value=reasoning_params.end_token),
+        AnyTextFormat(excludes=[parser_params.reasoning_end_token]),
+        ConstStringFormat(value=parser_params.reasoning_end_token),
         format,
     ]
     return SequenceFormat(

@@ -12,6 +12,7 @@ import torch
 
 from chitu.async_stream import AsyncDataStream
 from chitu.executor import Executor
+from chitu.output_parser import OutputState
 from chitu.serve.openai_api import AsyncResponse
 
 
@@ -30,7 +31,7 @@ class StaticAsyncStream:
         self.reasoning_tokens = 0
         self.input_cached_tokens = 0
         self.index = 0
-        self.reasoning_parser = SimpleNamespace(
+        self.output_parser = SimpleNamespace(
             params=SimpleNamespace(enable_reasoning=False)
         )
 
@@ -69,9 +70,13 @@ def make_data_stream():
     stream.data_event = asyncio.Event()
     stream.top_logprobs_list = []
     stream.top_tokens_list = []
-    stream.reasoning_parser = SimpleNamespace(update=lambda token_id: False)
-    stream.reasoning_states = []
-    stream.cached_reasoning_state = False
+    stream.output_parser = SimpleNamespace(
+        update=lambda token_id: [(token_id, OutputState.OUTPUT)],
+        flush=lambda: [],
+    )
+    stream.output_states = []
+    stream.cached_output_state = OutputState.OUTPUT
+    stream._text_pending = False
     stream.callbacks_on_stop = []
     stream.error_message = None
     stream.input_cached_tokens = None

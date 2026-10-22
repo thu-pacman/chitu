@@ -35,6 +35,7 @@ if not DOC_GENERATION:
         run_with_client_abort,
         stream_with_client_abort,
     )
+    from chitu.output_parser import REASONING_OUTPUT_STATES
     from chitu.tool_call import (
         parse_stream_by_parser,
         get_tool_parser_cls,
@@ -420,13 +421,13 @@ class AsyncResponse:
             try:
                 has_tool_calls = False
                 first_delta = True
-                async for data, is_reasoning, (top_logprobs, top_tokens) in stream:
+                async for data, state, (top_logprobs, top_tokens) in stream:
                     if data:
                         if isinstance(data, ChoiceDelta) and data.tool_calls:
                             has_tool_calls = True
                         if isinstance(data, ChoiceDelta):
                             delta = data.model_dump(exclude_none=True)
-                        elif is_reasoning:
+                        elif state in REASONING_OUTPUT_STATES:
                             delta = dict(reasoning_content=data)
                         else:
                             delta = dict(content=data)
@@ -517,8 +518,8 @@ class AsyncResponse:
         top_tokens_list = []
         chunks = []
         rchunks = []
-        async for data, is_reasoning, (top_logprobs, top_tokens) in self.async_stream:
-            if is_reasoning:
+        async for data, state, (top_logprobs, top_tokens) in self.async_stream:
+            if state in REASONING_OUTPUT_STATES:
                 rchunks.append(data)
             else:
                 chunks.append(data)
@@ -533,7 +534,7 @@ class AsyncResponse:
         # span should not surface as a reasoning field at all.
         reasoning_content = "".join(rchunks)
         if (
-            self.async_stream.reasoning_parser.params.enable_reasoning
+            self.async_stream.output_parser.params.enable_reasoning
             and reasoning_content
         ):
             message["reasoning_content"] = reasoning_content
@@ -884,7 +885,7 @@ class CompletionAsyncResponse:
 
         async def stream_response():
             try:
-                async for data, _is_reasoning, (_top_logprobs, _top_tokens) in stream:
+                async for data, _state, (_top_logprobs, _top_tokens) in stream:
                     text = data if isinstance(data, str) else ""
                     if text:
                         chunk = CompletionResponse(
@@ -937,7 +938,7 @@ class CompletionAsyncResponse:
         chunks: list[str] = []
         async for (
             data,
-            _is_reasoning,
+            _state,
             (_top_logprobs, _top_tokens),
         ) in self.async_stream:
             if isinstance(data, str):

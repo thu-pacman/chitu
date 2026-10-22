@@ -32,6 +32,6 @@ qk_rope_head_dim: 64
 v_head_dim: 128
 rope_theta: 50000.0
 rope_factor: 32.0
-rs_token_id: 163584
-re_token_id: 163585
+reasoning_start_delimiter_ids: [163584]
+reasoning_end_delimiter_ids: [163585]
 main_weight_dtype: float8_e4m3fn

@@ -161,7 +161,7 @@ def test_invalid_tool_call_arguments_returns_bad_request_in_completions_api(
                             "id": "call_1",
                             "type": "function",
                             "function": {
-                                "name": "insert_edit_into_file",
+                                "name": "my_func_1",
                                 "arguments": '{"newText": "unterminated',  # bad: trancated
                             },
                         }
@@ -179,7 +179,7 @@ def test_invalid_tool_call_arguments_returns_bad_request_in_completions_api(
     assert response.status_code == 400
     detail = response.json()["detail"]
     assert "messages[0].tool_calls[0]" in detail
-    assert "insert_edit_into_file" in detail
+    assert "my_func_1" in detail
     assert "JSON object" in detail
 
 
@@ -208,7 +208,7 @@ def test_invalid_tool_call_arguments_returns_bad_request_in_responses_api(monkey
                 {
                     "type": "function_call",
                     "call_id": "call_1",
-                    "name": "insert_edit_into_file",
+                    "name": "my_func_1",
                     "arguments": '{"newText": "unterminated',
                 }
             ],

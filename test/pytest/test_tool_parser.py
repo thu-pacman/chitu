@@ -5,8 +5,8 @@ import xgrammar
 from chitu.tool_call import ToolCallParams, ToolConfig
 from chitu.tool_call.utils import _registere_parsers
 from chitu.tool_call.type_def import ChoiceToolCall, ChoiceToolCallFunction
-from chitu.reasoning.type_def import ReasoningParams
-from chitu.reasoning.utils import _reasoning_params_cache
+from chitu.output_parser.type_def import OutputParserParams
+from chitu.output_parser.utils import _output_parser_params_cache
 
 test_type_arguments = json.dumps({"ks": "vs", "ko": {"kb": True}, "ka": [1, 2, 3]})
 
@@ -55,8 +55,8 @@ def run_match(
     initial_thinking=False,
 ):
     parser_cls = _registere_parsers[parser]
-    _reasoning_params_cache.clear()
-    _reasoning_params_cache[thinking] = ReasoningParams(
+    _output_parser_params_cache.clear()
+    _output_parser_params_cache[thinking] = OutputParserParams(
         thinking, initial_state=initial_thinking
     )
     grammar = parser_cls.build_grammar(
@@ -525,25 +525,25 @@ def test_forced_reasoning_params():
     """``reasoning_type: forced`` ignores the client's enable_thinking flag.
 
     GLM-5.3 cannot disable thinking; if ``forced`` fell back to
-    ``ReasoningParams(False)`` on ``enable_thinking=false``, neither the parser
+    ``OutputParserParams(False)`` on ``enable_thinking=false``, neither the parser
     nor the grammar would know the model is still in a reasoning span.
     """
-    import chitu.reasoning.utils as reasoning_utils
+    import chitu.output_parser.utils as output_parser_utils
     from types import SimpleNamespace
 
-    old_get_args = reasoning_utils.get_global_args
-    old_get_token_ids = reasoning_utils.get_reasoning_token_id
+    old_get_args = output_parser_utils.get_global_args
+    old_get_token_ids = output_parser_utils.get_output_parser_marker_token_ids
     try:
-        reasoning_utils.get_global_args = lambda: SimpleNamespace(
+        output_parser_utils.get_global_args = lambda: SimpleNamespace(
             models=SimpleNamespace(reasoning_type="forced")
         )
-        reasoning_utils.get_reasoning_token_id = lambda: (1, 2)
-        reasoning_utils._reasoning_params_cache.clear()
-        params = reasoning_utils.get_reasoning_params(False)
+        output_parser_utils.get_output_parser_marker_token_ids = lambda: (1, 2)
+        output_parser_utils._output_parser_params_cache.clear()
+        params = output_parser_utils.get_output_parser_params(False)
     finally:
-        reasoning_utils.get_global_args = old_get_args
-        reasoning_utils.get_reasoning_token_id = old_get_token_ids
-        reasoning_utils._reasoning_params_cache.clear()
+        output_parser_utils.get_global_args = old_get_args
+        output_parser_utils.get_output_parser_marker_token_ids = old_get_token_ids
+        output_parser_utils._output_parser_params_cache.clear()
 
     assert params.enable_reasoning
     assert params.initial_state

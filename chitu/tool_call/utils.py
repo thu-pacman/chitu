@@ -15,7 +15,7 @@ from .grammar.utils import build_response_format_grammar
 from .dummy_parser import DummyToolParser
 from typing import Any, AsyncIterable, AsyncGenerator, TypeVar
 from chitu.global_vars import get_global_args
-from chitu.reasoning import ReasoningState
+from chitu.output_parser import OutputState, DELIMITER_STATES
 
 logger = logging.getLogger(__name__)
 
@@ -40,20 +40,18 @@ def get_tool_parser_cls() -> type[AbstractToolParser]:
 
 
 class StreamAdapter:
-    def __init__(
-        self, stream: AsyncIterable[tuple[str, ReasoningState, tuple[Any, Any]]]
-    ):
+    def __init__(self, stream: AsyncIterable[tuple[str, OutputState, tuple[Any, Any]]]):
         self.stream = aiter(stream)
         self.chunk = None
         self.not_end = True
 
-    async def filtered(self, state: ReasoningState):
+    async def filtered(self, state: OutputState):
         """Yield the text of chunks classified as ``state``.
 
         Chunks in another state stop the generator and stay pending, so the
-        next phase (reasoning / output) can pick them up. DELIMITER chunks are
-        structural markers: they never carry text (``AsyncDataStream`` keeps
-        delimiter token ids out of the decode buffer), so they are consumed
+        next phase (reasoning / output) can pick them up. Structural chunks
+        (delimiter markers) never carry text (``AsyncDataStream`` keeps
+        structural token ids out of the decode buffer), so they are consumed
         transparently in any phase instead of blocking the stream forever.
         Empty chunks are skipped for the same reason: parsers would no-op on
         them.
@@ -61,7 +59,7 @@ class StreamAdapter:
         while self.not_end:
             if self.chunk:
                 chunk_state = self.chunk[1]
-                if chunk_state != state and chunk_state != ReasoningState.DELIMITER:
+                if chunk_state != state and chunk_state not in DELIMITER_STATES:
                     return
                 if self.chunk[0]:
                     yield self.chunk[0]
@@ -76,14 +74,14 @@ class StreamAdapter:
 
 
 async def parse_stream_by_parser(
-    stream: AsyncIterable[tuple[str, ReasoningState, tuple[Any, Any]]],
+    stream: AsyncIterable[tuple[str, OutputState, tuple[Any, Any]]],
     parser: AbstractToolParser,
-) -> AsyncGenerator[tuple[ChoiceDelta, ReasoningState, tuple[Any, Any]], None]:
+) -> AsyncGenerator[tuple[ChoiceDelta, OutputState, tuple[Any, Any]], None]:
     adapter = StreamAdapter(stream)
     while adapter.not_end:
-        async for chunk in adapter.filtered(ReasoningState.REASONING):
+        async for chunk in adapter.filtered(OutputState.REASONING):
             yield adapter.wrap(ChoiceDelta(reasoning_content=chunk))
-        async for item in parser.parse_stream(adapter.filtered(ReasoningState.OUTPUT)):
+        async for item in parser.parse_stream(adapter.filtered(OutputState.OUTPUT)):
             if isinstance(item, ChoiceDelta):
                 yield adapter.wrap(item)
             else:

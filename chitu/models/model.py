@@ -1586,8 +1586,8 @@ class Transformer(nn.Module):
         if bs == 0:
             if self.do_empty_decode_callable_mtp is None:
                 self._init_empty_mtp_draft_callable()
-            if self.moe_impl is not None:
-                self.moe_impl.prepare(TaskType.Decode, int(self.dummy_input.shape[0]))
+            # No moe_impl.prepare here: the executor's step body already ran
+            # _prepare_moe_decode for this step.
             for i in range(1, self.mtp_size):
                 self.do_empty_decode_callable_mtp((1,) + ("empty_mtp",))
             return None
@@ -2154,8 +2154,8 @@ class Transformer(nn.Module):
     @torch.inference_mode()
     def empty_prefill(self) -> torch.Tensor:
         self.cp_context.set_step_active(False)
-        if self.moe_impl is not None:
-            self.moe_impl.prepare(TaskType.Prefill, int(self.dummy_input.shape[0]))
+        # No moe_impl.prepare here: the executor's step body already ran
+        # _prepare_moe_prefill for this step.
         if self.specialize_embed_tokens_lm_head_parallel:
             self.embed_tokens(
                 self.dummy_embed_tokens_input,
@@ -2190,8 +2190,8 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def empty_decode(self):
-        if self.moe_impl is not None:
-            self.moe_impl.prepare(TaskType.Decode, int(self.dummy_input.shape[0]))
+        # No moe_impl.prepare here: the executor's step body already ran
+        # _prepare_moe_decode for this step.
         if self.specialize_embed_tokens_lm_head_parallel:
             self.embed_tokens(
                 self.dummy_embed_tokens_input,

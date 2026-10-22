@@ -558,7 +558,7 @@ class ChatFormatHF:
 
 from chitu.encoding_dsv32 import encode_messages as encode_messages_dsv32
 from chitu.encoding_dsv4 import encode_messages as encode_messages_dsv4
-from chitu.reasoning import get_reasoning_params
+from chitu.output_parser import get_output_parser_params
 
 
 class ChatFormatHF_dsv32(ChatFormatHF):
@@ -574,7 +574,7 @@ class ChatFormatHF_dsv32(ChatFormatHF):
         if tools:
             messages = [dict(role="system", tools=tools), *messages]
         enable_thinking = chat_template_kwargs.get("enable_thinking", True)
-        enable_thinking = get_reasoning_params(enable_thinking).enable_reasoning
+        enable_thinking = get_output_parser_params(enable_thinking).enable_reasoning
         thinking_mode = "thinking" if enable_thinking else "chat"
         drop_thinking = messages[-1]["role"] == "user"
         prompt = encode_messages_dsv32(
@@ -598,7 +598,7 @@ class ChatFormatHF_dsv4(ChatFormatHF):
         if tools:
             messages = [dict(role="system", tools=tools), *messages]
         enable_thinking = chat_template_kwargs.get("enable_thinking", True)
-        enable_thinking = get_reasoning_params(enable_thinking).enable_reasoning
+        enable_thinking = get_output_parser_params(enable_thinking).enable_reasoning
         thinking_mode = "thinking" if enable_thinking else "chat"
         drop_thinking = messages[-1]["role"] == "user"
         prompt = encode_messages_dsv4(

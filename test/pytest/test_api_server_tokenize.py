@@ -157,7 +157,7 @@ def test_invalid_tool_call_arguments_returns_bad_request_in_tokenize_api(monkeyp
                             "id": "call_1",
                             "type": "function",
                             "function": {
-                                "name": "insert_edit_into_file",
+                                "name": "my_func_1",
                                 "arguments": '{"newText": "unterminated',
                             },
                         }

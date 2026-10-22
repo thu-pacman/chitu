@@ -1190,6 +1190,13 @@ def _warmup_backend_direct(
         and args.infer.use_cuda_graph
         and Backend.model._requires_empty_token_collective()
     ):
+        # The empty-token replay bypasses the executor, so it must prepare
+        # the MoE dispatchers explicitly (inside the step body this is
+        # _prepare_moe_decode's job; empty_decode itself deliberately does
+        # not re-prepare — a second prepare per step desyncs the DP-rank
+        # collective sequence).
+        if Backend.model.moe_impl is not None:
+            Backend.model.moe_impl.prepare(TaskType.Decode, 0)
         Backend.model.draft(all_tasks, torch.empty(0, dtype=torch.int64, device="cuda"))
         _ = Backend.model.decode(torch.empty(0, dtype=torch.int64, device="cuda"))
 

@@ -38,7 +38,7 @@ from chitu.tool_call import (
 )
 from chitu.trace import Trace, TraceLevel
 from chitu.utils import dataclass_to_dict, dataclass_from_dict, max_alloc_seq_len
-from chitu.reasoning import (
+from chitu.output_parser import (
     update_chat_template_kwargs_reasoning,
 )
 from chitu.sampling.utils import submit_grammar_compile

@@ -33,7 +33,7 @@ class StaticStream:
         self.tokens_len = len(items)
         self.reasoning_tokens = 0
         self.input_cached_tokens = cached
-        self.reasoning_parser = SimpleNamespace(
+        self.output_parser = SimpleNamespace(
             params=SimpleNamespace(enable_reasoning=False)
         )
 
