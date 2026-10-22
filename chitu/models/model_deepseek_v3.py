@@ -38,8 +38,7 @@ from chitu.models.model import (
     get_linear_layout_contig_y,
 )
 from chitu.models.registry import ModelType, register_model
-from chitu.device_type import is_ascend, is_hygon
-from chitu.import_utils import is_ascend_950
+from chitu.device_type import is_ascend, is_ascend_950, is_hygon
 from chitu.native_layout import NativeLayoutTensor
 from chitu.muxi_utils import NormalMoeExpertsMuxiLayout, Blockfp8MoeExpertsMuxiLayout
 from chitu.ops import (

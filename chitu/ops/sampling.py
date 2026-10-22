@@ -13,8 +13,7 @@ from chitu.utils import (
     try_import_and_setup_torch_npu,
     create_tensor,
 )
-from chitu.device_type import has_accelerator, is_muxi, is_ascend
-from chitu.import_utils import is_ascend_950
+from chitu.device_type import has_accelerator, is_muxi, is_ascend, is_ascend_950
 
 triton, has_triton = try_import_platform_dep("triton")
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()

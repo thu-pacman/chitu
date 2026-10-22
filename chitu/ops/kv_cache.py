@@ -5,7 +5,7 @@
 from typing import Optional, Callable
 import torch
 
-from chitu.device_type import has_accelerator
+from chitu.device_type import has_accelerator, is_ascend_950
 from chitu.ops.utils import make_op_dispatcher
 from chitu.utils import try_import_platform_dep, try_import_and_setup_torch_npu
 from chitu.global_vars import get_global_args
@@ -332,7 +332,7 @@ def _auto_append_to_dense_kv_cache(
     delta_seq_ids: Optional[torch.Tensor] = None,
     use_i64_offsets: bool = False,
 ):
-    if has_torch_npu:
+    if has_torch_npu and is_ascend_950():
         return "torch_npu"
     if has_triton_impl:
         return "triton"

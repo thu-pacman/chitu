@@ -17,7 +17,7 @@ from chitu.native_layout import (
     Repeat1ToLength,
 )
 from chitu.lazy import eval_lazy
-from chitu.import_utils import is_ascend_950
+from chitu.device_type import is_ascend_950
 
 torch_npu, has_torch_npu = try_import_and_setup_torch_npu()
 

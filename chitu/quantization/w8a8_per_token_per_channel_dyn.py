@@ -11,9 +11,8 @@ import math
 import torch
 
 from chitu.checkpoint_prefix import CheckpointPrefix
-from chitu.device_type import get_device_name, is_hygon
+from chitu.device_type import get_device_name, is_hygon, is_ascend_950
 from chitu.import_utils import (
-    is_ascend_950,
     try_import_platform_dep,
     try_import_opt_dep,
     try_import_and_setup_torch_npu,

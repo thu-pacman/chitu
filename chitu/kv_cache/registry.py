@@ -8,8 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
-from chitu.device_type import is_hygon
-from chitu.import_utils import is_ascend_950
+from chitu.device_type import is_hygon, is_ascend_950
 from chitu.models.registry import ModelType
 from chitu.utils import try_import_opt_dep
 

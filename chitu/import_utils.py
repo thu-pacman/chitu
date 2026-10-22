@@ -141,19 +141,3 @@ def try_import_and_setup_torch_npu():
         _torch_npu_has_set_up = True
 
     return torch_npu, has_torch_npu
-
-
-def is_ascend_950():
-    """Return whether we are running on Ascend 950 (3510 architecture, aclnn-only).
-
-    Several upstream mechanisms are unusable on this platform (triton kernels
-    produce wrong/slow results, Fractal internal format is unavailable, FP8
-    kv-cache is unsupported), so call sites use this predicate to choose a
-    supported path. Other Ascend/NVIDIA platforms are unaffected."""
-    try:
-        from chitu.device_type import get_device_name
-
-        name = get_device_name()
-        return name.startswith("Ascend950") or "950" in name
-    except Exception:
-        return False
