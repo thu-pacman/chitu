@@ -9,6 +9,7 @@ Extends the original RequestRouter to support Prefill-Decode disaggregation
 
 import asyncio
 import logging
+import os
 import time
 from collections import OrderedDict, deque
 from typing import Optional
@@ -1330,13 +1331,29 @@ class PDRequestRouter(RequestRouter):
         """PD request processing task"""
         logger.info("starting pd request processor")
 
+        # Test-only: hold newly arrived requests in the dispatch deque long
+        # enough for the queued-interrupt phase to observe them. Draining the
+        # whole deque per pass leaves no natural pacing window. Off unless the
+        # CI job sets CHITU_TEST_ROUTER_DISPATCH_DELAY_S.
+        dispatch_delay_s = float(
+            os.environ.get("CHITU_TEST_ROUTER_DISPATCH_DELAY_S", "0") or 0
+        )
+
         while not self._shutdown:
             if is_dying():
                 # During the crash window, stop dispatching new requests.
                 await asyncio.sleep(0.1)
                 continue
             try:
-                if self.pending_requests:
+                if not self.pending_requests:
+                    # Idle: 10ms polling interval.
+                    await asyncio.sleep(0.01)
+                    continue
+
+                if dispatch_delay_s > 0:
+                    await asyncio.sleep(dispatch_delay_s)
+
+                while self.pending_requests and not self._shutdown:
                     pd_request = self.pending_requests.popleft()
 
                     if isinstance(pd_request, PendingPDRequest):
@@ -1361,7 +1378,7 @@ class PDRequestRouter(RequestRouter):
                     else:
                         raise ValueError(f"unexpected request type: {type(pd_request)}")
 
-                await asyncio.sleep(0.01)  # 10ms polling interval
+                    await asyncio.sleep(0)
             except asyncio.CancelledError:
                 logger.info("[PD_ROUTER][request_processor_cancelled]")
                 raise
