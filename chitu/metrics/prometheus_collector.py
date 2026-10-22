@@ -33,6 +33,50 @@ from chitu.metrics.definitions import MetricContext, MetricType, raw_metrics_for
 
 logger = logging.getLogger(__name__)
 
+# How long a gauge reading below may be reused, in seconds. Rebuilding faster than
+# Prometheus scrapes is invisible -- and not free (`update_GPU_usage` asks NVML for the
+# device's process list, ~14 ms on a loaded node, and decode asks for a rebuild on every
+# step that retires a request) -- so the interval follows the configured scrape period
+# rather than a second, independent constant. `CHITU_METRICS_REFRESH_INTERVAL_S` overrides
+# it (`=0` restores the old per-step rebuild).
+_GAUGE_REFRESH_INTERVAL_FALLBACK_S = 1.0
+
+
+def _gauge_refresh_interval_s() -> float:
+    """The gauge rebuild interval, in seconds.
+
+    Read per call rather than frozen at import: the override is a deployment knob and the
+    scrape period is configuration, and neither should need a restart to disagree with the
+    other. Both are read defensively -- this runs in unit tests, where neither the
+    environment nor the global args need to be set.
+    """
+    override = os.environ.get("CHITU_METRICS_REFRESH_INTERVAL_S")
+    if override is not None:
+        try:
+            return float(override)
+        except ValueError:
+            logger.warning(
+                "ignoring CHITU_METRICS_REFRESH_INTERVAL_S=%r: not a number", override
+            )
+    try:
+        return float(get_global_args().metrics.prometheus_scrape_interval)
+    except Exception:
+        return _GAUGE_REFRESH_INTERVAL_FALLBACK_S
+
+
+_gauge_refreshed_at: dict[str, float] = {}
+
+
+def _gauge_refresh_due(name: str) -> bool:
+    """Whether gauge `name` may be rebuilt now (one rebuild per interval)."""
+    now = time.monotonic()
+    last = _gauge_refreshed_at.get(name)
+    if last is not None and now - last < _gauge_refresh_interval_s():
+        return False
+    _gauge_refreshed_at[name] = now
+    return True
+
+
 _COLLECTOR_ATTR_BY_METRIC_NAME = {
     "chitu_total_generated_tokens": "total_generated_tokens",
     "chitu_total_prompt_tokens": "total_prompt_tokens",
@@ -620,6 +664,8 @@ class PrometheusMetricsCollector:
     @classmethod
     def update_task_counts(cls):
         """Update running/waiting request count metrics."""
+        if not _gauge_refresh_due("task_counts"):
+            return
         collector, running_metric = cls._metric_attr_or_none(
             "chitu_running_requests", "running_requests"
         )
@@ -698,6 +744,8 @@ class PrometheusMetricsCollector:
 
     @classmethod
     def update_GPU_usage(cls):
+        if not _gauge_refresh_due("gpu_usage"):
+            return
         if get_active_metrics_runtime() is None:
             return
         if Backend.cache_dict is None:

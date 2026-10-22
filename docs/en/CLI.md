@@ -784,6 +784,25 @@ Acceptable values:
 
 *Default: `physical_core`.*
 
+### Argument `infer.sync_free_decode`
+
+Whether to run decode steps without making the GPU wait for the host: the per-step
+state (KV lengths, MTP accept counts) stays on the device and the draft is launched
+off it, so the host's wait for the previous step's result lands behind this step's
+graphs instead of idling the GPU. While the device path holds that state, the host
+mirror of the draft's lengths is one window behind and deliberately poisoned (reading
+it raises instead of handing out the previous step's lengths); the sync phase of the
+same step writes it back. Steps the device path does not cover -- the prefill -> decode
+boundary, batch changes, `mtp_size <= 1`, and the layouts it rejects (PCP > 1, PD
+prefill-only, and any device whose accept counts cannot be read back as CUDA tensors,
+e.g. `op_impl = cpu`) -- run the historical order. With PP > 1 the device path runs on
+the last PP stage -- the one that drafts and samples -- and every stage ahead of it
+keeps the historical order.
+- true: enabled
+- false: previous behavior
+
+*Default: `false`.*
+
 ### Argument `infer.enable_prefix_caching`
 
 Whether to enable prefix caching

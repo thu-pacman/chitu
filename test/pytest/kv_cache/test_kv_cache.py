@@ -10,6 +10,7 @@ from chitu.global_vars import get_global_args, set_global_args
 from chitu.ops.kv_cache import append_to_sliding_window_paged_kv_cache
 from omegaconf import OmegaConf
 from chitu.task import PackedTasksBase
+from chitu.kv_cache.kv_cache_sync_free import state_of
 from chitu.task_type import TaskType
 import torch
 
@@ -339,6 +340,52 @@ class TestPagedKVCache:
         assert "req_3" not in kvcache.block_table
         assert "req_4" not in kvcache.tid_to_cached_len
         assert "req_4" not in kvcache.block_table
+
+    def test_decode_step_inside_a_block_still_drops_the_page_offsets(
+        self, kvcache: PagedKVCache
+    ):
+        """A decode step that appends inside the block the request already owns pushes no
+        new block-table row, so the block-table push short-circuits -- but the page ids /
+        in-page offsets come from the *position*, so they still have to be dropped.
+        """
+        prefill = PackedTasksBase(
+            num_tasks=1,
+            task_ids=["req_0"],
+            task_type=TaskType.Prefill,
+            tokens=[[1] * 8],
+            num_tokens=8,
+            new_cache_ids_list=[{"main": [0]}],
+        )
+        kvcache.prepare_cache_prefill(prefill)
+        assert kvcache.block_table["req_0"] == [0]
+        # As if a write had derived them for the prefill window.
+        kvcache._page_ids_up_to_date = True
+        kvcache._offs_in_page_up_to_date = True
+
+        decode = PackedTasksBase(
+            num_tasks=1,
+            task_ids=["req_0"],
+            task_type=TaskType.Decode,
+            tokens=[[2]],
+            num_tokens=1,
+            new_cache_ids_list=[{}],
+        )
+        kvcache.prepare_cache_decode(decode)
+
+        # The row on the device is the one that was already there...
+        assert kvcache.block_table["req_0"] == [0]
+        # ... which the production path recorded: the snapshot `_upd_gpu_block_table()`
+        # compared has to be exactly these rows, not merely "the call returned True"
+        # (calling `gpu_block_table_rows_unchanged()` here would write that memo itself).
+        assert state_of(kvcache).gpu_block_table_pushed == (("req_0", (0,)),)
+        # Negative control: the same predicate rejects a row that differs, so the
+        # comparison above is not vacuous.
+        assert (
+            state_of(kvcache).gpu_block_table_rows_unchanged(["req_0"], [[1]]) is False
+        )
+        # ... and the offsets are gone all the same.
+        assert not kvcache._page_ids_up_to_date
+        assert not kvcache._offs_in_page_up_to_date
 
 
 def _build_singleton_cache(

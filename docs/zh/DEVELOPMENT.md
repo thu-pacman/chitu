@@ -1085,3 +1085,4 @@ torchrun --nproc_per_node 8 --no-python ./test/dist_pytest/run_pytest_with_prett
 | `CHITU_MEM_TRACK_MAX_ENTRIES`  | 整数                         | CUDA 显存跟踪的环形缓冲区大小。参见 [性能分析](./PROFILING.md)。 |
 | `CHITU_MEM_TRACK_SNAPSHOT_DIR` | 指向目录的路径               | CUDA 显存 snapshot 输出目录。参见 [性能分析](./PROFILING.md)。 |
 | `CHITU_CLIENT_ABORT_POLL_INTERVAL_S` | 秒（默认 `0.2`）        | 客户端断连的兜底轮询间隔，仅在请求未经过内置 ASGI 中间件时使用。取值越小，被放弃的请求停止得越快，但轮询更频繁。 |
+| `CHITU_METRICS_REFRESH_INTERVAL_S` | 秒（浮点，默认 `1.0`）    | Prometheus gauge 的最小重建间隔。覆盖 `metrics.prometheus_scrape_interval`；`0` 表示每个请求都重建，即旧行为。 |
