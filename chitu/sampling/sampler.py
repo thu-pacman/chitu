@@ -66,6 +66,27 @@ class FrequencyPenaltyOps:
 
 
 @dataclass
+class DraftBatch:
+    """One step's draft rows, for the whole batch, as device tensors.
+
+    The draft returns one `(bs, mtp_size)` token tensor plus one
+    `(bs, mtp_size-1, max_top_k_samples)` proposal pair, which the step's verify reads
+    back as this batch. `probs` is None for an all-greedy batch.
+    """
+
+    task_ids: list[str]
+    next_tokens: torch.Tensor
+    probs: torch.Tensor | None = None
+    token_ids: torch.Tensor | None = None
+
+    def matches(self, task_ids) -> bool:
+        """Whether these rows are the given tasks', in the same order: they are
+        positional, so a batch that changed since the draft ran must not read them.
+        """
+        return list(task_ids) == self.task_ids
+
+
+@dataclass
 class TaskSampleState:
     task: Task
     sample_params: SampleParams
@@ -79,7 +100,6 @@ class TaskSampleState:
     # the step that drafted it (_prepare pads back up at verify time).
     draft_probs: tuple[torch.Tensor, torch.Tensor] | None = None
     next_tokens_device: torch.Tensor | None = None
-    draft_tokens: list[int] | None = None
 
     @staticmethod
     def from_task(task: Task):
@@ -188,6 +208,8 @@ class Sampler:
         )
 
         self.states: dict[str, TaskSampleState] = {}
+        # The rows of the step whose draft has run but whose verify has not.
+        self._draft_batch: DraftBatch | None = None
         self.batch_matcher = BatchGrammarMatcher()
 
         # Draft proposal params (per-request), set by `prepare_draft_sample_params`
@@ -199,6 +221,9 @@ class Sampler:
         self.draft_top_ps: torch.Tensor | None = None
         self.draft_greedy_mask: torch.Tensor | None = None  # True → argmax draft
         self.all_greedy: bool = True  # pre-computed by prepare_draft_sample_params
+        # The rows `draft_*` above were built from, as `prepare_draft_sample_params`
+        # saw them: equal rows mean those tensors are still the ones the draft needs.
+        self._draft_params_signature: tuple | None = None
 
     def prepare_draft_sample_params(self, tasks: PackedTasks):
         """Set per-request draft proposal params in `tasks.output_tasks` order.
@@ -207,8 +232,23 @@ class Sampler:
         identical sample_params. In decode, `output_tasks == tasks`, matching
         the token payload order. The model broadcasts greedy_mask on tp_group
         so all TP ranks propose identical drafts.
+
+        The four tensors below are the only reason this call touches the device, and
+        rebuilding them costs four H2D copies plus four pinned staging allocations per
+        step. A serving run hands the draft the same proposal params step after step (a
+        request's temperature/top-k/top-p only moves when the request does), so the
+        rebuild is skipped while the rows come out the same: the previous step's tensors
+        are still the ones the draft graph reads.
         """
         states = self._get_states(tasks.output_tasks)
+
+        signature = tuple(
+            (s.sample_params.temperature, s.sample_params.top_k, s.sample_params.top_p)
+            for s in states
+        )
+        if signature == self._draft_params_signature:
+            return
+        self._draft_params_signature = signature
 
         device = get_op_device()
         self.all_greedy = all(s.sample_params.is_greedy for s in states)
@@ -277,6 +317,16 @@ class Sampler:
             and greedy_mask is not None
         )
         return temperatures, top_ks, top_ps, greedy_mask
+
+    def draft_batch_for(self, task_ids) -> DraftBatch | None:
+        """The step's draft rows if they describe exactly these tasks, else None.
+
+        Membership and order both have to match.
+        """
+        batch = self._draft_batch
+        if batch is None or not batch.matches(task_ids):
+            return None
+        return batch
 
     def sample_draft_tokens(
         self, logits: torch.Tensor
@@ -386,23 +436,52 @@ class Sampler:
         tuple[torch.Tensor, torch.Tensor] | None,
         list[list[int]],
     ]:
-        """Rebuild the per-task MTP draft rows for the next verify.
+        """Rebuild the MTP draft rows the verify compares its own output against.
 
         Returns (draft_tokens, draft_probs, draft_tokens_list):
-        - draft_tokens:     (bs, mtp_size-1) drafted token ids per task.
-        - draft_probs:      (bs, mtp_size-1, max_top_k) sparse proposal p'
-                            (probs, token_ids), or None for an empty batch.
-        - draft_tokens_list: CPU list mirror of draft_tokens.
+        - draft_tokens:      (bs, mtp_size-1) drafted token ids per task,
+        - draft_probs:       (bs, mtp_size-1, max_top_k) sparse proposal p'
+                             (probs, token_ids), or None for an empty batch,
+        - draft_tokens_list: CPU mirror of `draft_tokens` for the host-only
+                             consumers (grammar bitmask, frequency penalty).
 
-        Reconstruct the proposal at its stored width, independently of the
-        target filter width. With top-k disabled, the target may cover the full
-        vocabulary while the captured draft still uses a bounded proposal.
+        Rows the step's own draft set are consumed in place; a batch the draft did not
+        run for takes the per-task path below.
+
+        The proposal is rebuilt at its stored width, independently of the target filter
+        width: with top-k disabled the target may cover the full vocabulary while the
+        captured draft still uses a bounded proposal.
         """
         K = self.mtp_size
         n_drafts = K - 1
-        draft_tokens_list = []
-        # Preserve the actual proposal width, independently of the target's
-        # top-k setting. A missing proposal needs one slot for the fallback.
+        host_rows_needed = any(
+            state.enable_frequency_penalty
+            or (state.matcher and not state.matcher.is_terminated())
+            for state in states
+        )
+
+        batch = self.draft_batch_for(state.task.task_id for state in states)
+        if batch is not None:
+            draft_tokens = batch.next_tokens[:, 1:K]
+            draft_probs = (
+                None if batch.probs is None else (batch.probs, batch.token_ids)
+            )
+            if draft_probs is None:
+                # No proposal came back (an all-greedy batch, whose verify
+                # accepts on exact match and never reads p').
+                draft_probs = self._onehot_draft_proposal(draft_tokens, device)
+            draft_tokens_list = None
+            if host_rows_needed:
+                draft_tokens_list = self._host_draft_rows(states, K)
+                self._append_draft_rows(states, draft_tokens_list)
+            return draft_tokens, draft_probs, draft_tokens_list
+
+        # Not this step's draft (a fresh batch): rebuild the rows per task.
+        draft_tokens_list = self._host_draft_rows(states, K)
+        if host_rows_needed:
+            self._append_draft_rows(states, draft_tokens_list)
+        # Preserve the actual proposal width, independently of the target's top-k
+        # setting. A missing proposal needs one slot for the fallback.
         max_top_k = max(
             (
                 s.draft_probs[0].shape[-1] if s.draft_probs is not None else 1
@@ -421,12 +500,6 @@ class Sampler:
             dtype=torch.int64,
         )
         for i, state in enumerate(states):
-            nt = state.draft_tokens
-            if nt is not None and len(nt) >= K:
-                draft_tokens_list.append(nt[1:K])  # d1, ..., d_{K-1}
-            else:
-                draft_tokens_list.append([0] * n_drafts)
-
             dp = state.draft_probs
             if dp is not None:
                 probs_i, token_ids_i = dp
@@ -437,7 +510,7 @@ class Sampler:
                 # One-hot fallback (PD first step / new task): p[draft] = 1,
                 # rest = 0, so rejection sampling degenerates to
                 # accept_prob = q(d), semantically equivalent to mtp_size=1.
-                dt = draft_tokens_list[-1]
+                dt = draft_tokens_list[i]
                 for d in range(n_drafts):
                     tid = dt[d] if d < len(dt) else 0
                     if tid >= 0:
@@ -450,22 +523,62 @@ class Sampler:
         # (bs, K-1, max_top_k) each: proposal p' sparse probs / token ids
         draft_probs = (probs, token_ids) if len(states) > 0 else None
 
-        # Frequency penalty: the MTP target positions 1..K-1 continue from
-        # the draft tokens, so append them to the per-task token blocks
-        # (same condition as the old needs_cpu_draft path).
-        if any(
-            state.enable_frequency_penalty
-            or (state.matcher and not state.matcher.is_terminated())
-            for state in states
-        ):
-            append_ops = AppendTokenOps()
-            for ti, state in enumerate(states):
-                draft_row = draft_tokens_list[ti]
-                if draft_row:
-                    state.append_tokens(append_ops, draft_row)
-            append_ops.execute()
-
         return draft_tokens, draft_probs, draft_tokens_list
+
+    def _host_draft_rows(
+        self, states: list[TaskSampleState], K: int
+    ) -> list[list[int]]:
+        """The host mirror of the drafted rows, one row per state.
+
+        The rows are the ones `update_results` mirrored onto the tasks under this
+        verify's own launch, which is where the host-only consumers look.
+        """
+        rows = []
+        for state in states:
+            nt = state.task.next_tokens
+            if nt and len(nt) >= K:
+                rows.append(nt[1:K])  # d1, ..., d_{K-1}
+            else:
+                rows.append([0] * (K - 1))
+        return rows
+
+    @staticmethod
+    def _append_draft_rows(
+        states: list[TaskSampleState], draft_tokens_list: list[list[int]]
+    ) -> None:
+        """Append the drafted positions to the per-task token blocks: the MTP
+        target positions 1..K-1 continue from the draft tokens, so the frequency
+        penalty has to count them.
+        """
+        append_ops = AppendTokenOps()
+        for ti, state in enumerate(states):
+            draft_row = draft_tokens_list[ti]
+            if draft_row:
+                state.append_tokens(append_ops, draft_row)
+        append_ops.execute()
+
+    def _onehot_draft_proposal(
+        self, draft_tokens: torch.Tensor, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """p' for a batch the draft returned none for: one-hot at the draft.
+
+        An all-greedy batch has no proposal, and neither has a task with none recorded
+        yet; both mean p[draft] = 1 and 0 elsewhere to the verify, so rejection sampling
+        degenerates to ``accept_prob = q(d)``.
+        """
+        bs, n_drafts = draft_tokens.shape
+        valid = draft_tokens >= 0
+        probs = torch.zeros(
+            (bs, n_drafts, self.max_top_k_samples), device=device, dtype=torch.float32
+        )
+        token_ids = torch.zeros(
+            (bs, n_drafts, self.max_top_k_samples), device=device, dtype=torch.int64
+        )
+        probs[:, :, 0] = valid.to(probs.dtype)
+        token_ids[:, :, 0] = torch.where(
+            valid, draft_tokens, torch.zeros_like(draft_tokens)
+        )
+        return probs, token_ids
 
     # ---- sample() and its helpers ----
 
@@ -916,33 +1029,46 @@ class Sampler:
         next_tokens: torch.Tensor,
         draft_probs: tuple[torch.Tensor, torch.Tensor] | None,
     ):
-        states = self._get_states(tasks.output_tasks)
+        """Store the step's draft rows, for the verify that reads them.
+
+        One `DraftBatch` holds the verify's input rows (device tensors) and the proposal
+        p' a mixed verify compares against; the same rows are kept per task, as views into
+        it, which is what `_rebuild_mtp_draft_inputs` falls back to for a batch that moved
+        since the draft ran.
+        """
         if draft_probs is not None:
+            # One copy for the whole batch: the draft's outputs are its graph's
+            # buffers, rewritten on its next replay.
             probs, token_ids = draft_probs
-            for i, state in enumerate(states):
-                # Store at the task's OWN top-k width (not the draft batch's
-                # max) so a per-task slice stays valid when the batch max top-k
-                # changes between steps; _prepare re-pads to the verify max.
-                k = state.sample_params.resolved_top_k(probs.shape[-1])
-                state.draft_probs = (
-                    probs[i, :, :k].detach().clone(),
-                    token_ids[i, :, :k].detach().clone(),
-                )
+            probs = probs.detach().clone()
+            token_ids = token_ids.detach().clone()
         else:
             # All-greedy batch: the verify uses exact-match acceptance and
             # never reads p'; drop any stale per-task proposal so a later mixed
             # verify rebuilds the correct one-hot (== greedy argmax) p'.
-            for state in states:
-                state.draft_probs = None
+            probs = token_ids = None
 
-        # Keep the drafted verify-input row on GPU so the next verify can
-        # consume it without a blocking CPU round trip. Clone the row so the
-        # per-task state does not keep the whole batch tensor alive for the
-        # task's lifetime. The CPU copy is started asynchronously;
-        # update_results() syncs it after the verify graph is launched, so the
-        # wait overlaps the model forward.
-        for i, state in enumerate(states):
-            state.next_tokens_device = next_tokens[i].clone()
+        # The drafted verify-input rows, as views of this step's own tensor.
+        next_tokens = next_tokens.detach()
+        for i, state in enumerate(self._get_states(tasks.output_tasks)):
+            state.next_tokens_device = next_tokens[i]
+            if probs is None:
+                # All-greedy batch: drop any stale per-task proposal so a later
+                # mixed verify rebuilds the correct one-hot (== greedy argmax) p'.
+                state.draft_probs = None
+            else:
+                # Store at the task's OWN top-k width (not the batch's max) so the
+                # per-task slice stays valid when the batch max top-k changes
+                # between steps; _prepare re-pads to the verify max.
+                k = state.sample_params.resolved_top_k(probs.shape[-1])
+                state.draft_probs = (probs[i, :, :k], token_ids[i, :, :k])
+
+        self._draft_batch = DraftBatch(
+            task_ids=[task.task_id for task in tasks.output_tasks],
+            next_tokens=next_tokens,
+            probs=probs,
+            token_ids=token_ids,
+        )
 
         tasks.generated_result_device.next_tokens = next_tokens
         result = tasks.generated_result
@@ -967,10 +1093,10 @@ class Sampler:
         result = tasks.generated_result
         if result is not None and result.next_tokens is not None:
             result.sync()
+            # One host read for the whole batch.
+            rows = result.next_tokens.tolist()
             for i, task in enumerate(tasks.output_tasks):
-                nt = result.next_tokens[i].tolist()
-                task.next_tokens = nt
-                states[i].draft_tokens = nt
+                task.next_tokens = rows[i]
 
     def end_tasks(self, task_ids: list[str]):
         for task_id in task_ids:

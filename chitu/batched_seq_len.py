@@ -9,7 +9,7 @@ import torch
 
 from chitu.static_tensor import StaticTensor
 from chitu.cuda_graph import cuda_graph_safe_cached_property
-from chitu.utils import invalidate_cached_property, create_tensor
+from chitu.utils import invalidate_cached_property, create_tensor, resolved_device
 
 
 class BatchedSeqLen:
@@ -146,8 +146,8 @@ class BatchedSeqLen:
         Args:
             lens_tensor: Tensor of sequence lengths [batch_size], must be on same device.
         """
-        assert (
-            lens_tensor.device == self.device
+        assert resolved_device(lens_tensor.device) == resolved_device(
+            self.device
         ), f"Device mismatch: {lens_tensor.device} vs {self.device}"
         self._lens_list = lens_tensor.tolist()
         self._host_lens_stale = False
@@ -164,9 +164,10 @@ class BatchedSeqLen:
         invalidate_cached_property(self, "max_len")
 
     def copy_from(self, other: "BatchedSeqLen"):
-        assert (
-            self.device == other.device
-        ), f"Device mismatch: {self.device} vs {other.device}"
+        # Same predicate as `copy_from_tensor()`: `self.device` is unindexed while a tensor's
+        # device carries an index, so the two have to be resolved before they are compared.
+        if resolved_device(self.device) != resolved_device(other.device):
+            raise ValueError(f"Device mismatch: {self.device} vs {other.device}")
         self._lens_list = other.lens_list
         self._host_lens_stale = False
         self.lens_static_tensor_device.set(other.lens_tensor_device)
@@ -233,12 +234,56 @@ class BatchedSeqLen:
         are the only ways back to a consistent state.
         """
         self.lens_tensor_device.add_(1)
+        self._mark_device_lens_changed()
+
+    def set_lens_device(self, lens_tensor: torch.Tensor) -> None:
+        """Overwrite the device lengths from a device tensor, in place.
+
+        The device-side `copy_from_tensor()`, minus the D2H read; the host mirror is
+        poisoned and `update_host_mirror()` restores it.
+        """
+        if resolved_device(lens_tensor.device) != resolved_device(self.device):
+            raise ValueError(f"Device mismatch: {lens_tensor.device} vs {self.device}")
+        self.lens_static_tensor_device.set(lens_tensor.to(torch.int32))
+        self._mark_device_lens_changed()
+
+    def _mark_device_lens_changed(self) -> None:
+        """Invalidate everything derived from the device lengths, on both sides.
+
+        The device-derived quantities are rebuilt on next use; the host mirror, which
+        cannot be rebuilt without a D2H read, is poisoned instead -- reading it raises
+        until `update_host_mirror()` or a `copy_from_*()` puts a value back.
+        """
         self._host_lens_stale = True
         self._prefix_lens_tensor_device_up_to_date = False
         self._position_ids_tensor_device_up_to_date = False
         self._seq_ids_tensor_device_up_to_date = False
         invalidate_cached_property(self, "lens_tensor_cpu")
         invalidate_cached_property(self, "prefix_lens_list")
+        # The device update may resize the batch, invalidating the cached batch size.
+        invalidate_cached_property(self, "batch_size")
+        invalidate_cached_property(self, "total_len")
+        invalidate_cached_property(self, "max_len")
+
+    def update_host_mirror(self, lens_list: list[int]) -> None:
+        """Refresh the host mirror after a device-side update, without a D2H read.
+
+        For a caller that can compute the same lengths on the host; this only
+        re-labels the mirror, so a wrong value is silently accepted.
+        """
+        # The device row count, not the mirror: the batch size may have changed. A `raise`
+        # rather than an `assert`, matching `set_lens_device()`: this is the contract the
+        # caller has to meet, and `-O` must not be able to strip it.
+        batch_size = self.lens_tensor_device.numel()
+        if len(lens_list) != batch_size:
+            raise ValueError(
+                f"host mirror length {len(lens_list)} != device batch size {batch_size}"
+            )
+        self._lens_list = [int(x) for x in lens_list]
+        self._host_lens_stale = False
+        invalidate_cached_property(self, "lens_tensor_cpu")
+        invalidate_cached_property(self, "prefix_lens_list")
+        invalidate_cached_property(self, "batch_size")
         invalidate_cached_property(self, "total_len")
         invalidate_cached_property(self, "max_len")
 
@@ -318,8 +363,11 @@ class BatchedSeqLen:
 
     @functools.cached_property
     def batch_size(self) -> int:
-        # Advancing the device lengths does not change the batch size, so this
-        # stays readable while the host mirror is stale.
+        # Readable while the host mirror is stale, but a stale mirror may describe
+        # a different batch (`set_lens_device()` can resize), and that would be
+        # silently wrong; the device tensor is right either way.
+        if self._host_lens_stale:
+            return self.lens_tensor_device.numel()
         return len(self._lens_list)
 
     @functools.cached_property
@@ -558,7 +606,9 @@ class BatchedSeqLenDelta:
         prefix_delta_lens = torch.cumsum(delta_lens, dim=0, dtype=torch.int32)
         # Example: prefix_delta_lens = [3, 8, 10]
 
-        delta_total_len = self.new.total_len - self.old.total_len
+        # The delta's own total: equal to `new - old` by construction, but only
+        # this one survives a device-side update (`set_lens_device()`).
+        delta_total_len = self._delta.total_len
         positions = torch.arange(
             delta_total_len, device=self.old.device, dtype=torch.int32
         )
@@ -588,6 +638,31 @@ class BatchedSeqLenDelta:
         # Example: x = [10, 11, 12, 20, 21, 22, 23, 24, 30, 31]
 
         return x
+
+    def set_lens_device(
+        self,
+        old_len_tensor: torch.Tensor,
+        new_len_tensor: torch.Tensor,
+        *,
+        is_classic_decoding: bool,
+        is_first_prefill_chunk: bool = False,
+        delta_len_host: list[int] | None = None,
+    ) -> None:
+        """Set `old`, `new` and `_delta` from device tensors, in place.
+
+        The device-side `copy_from_list()`, for a step whose lengths only exist on
+        the device: nothing is read back, and the host mirrors are poisoned
+        (`BatchedSeqLen.update_host_mirror()` restores them). The flags describe the
+        batch rather than the lengths, so the caller states them.
+        """
+        self.old.set_lens_device(old_len_tensor)
+        self.new.set_lens_device(new_len_tensor)
+        self._delta.set_lens_device(new_len_tensor - old_len_tensor)
+        if delta_len_host is not None:
+            self._delta.update_host_mirror(delta_len_host)
+        self.is_classic_decoding = is_classic_decoding
+        self.is_first_prefill_chunk = is_first_prefill_chunk
+        self._delta_position_ids_tensor_device_up_to_date = False
 
     @property
     def delta_position_ids_tensor_device(self):

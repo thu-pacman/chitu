@@ -93,6 +93,7 @@ class InferConfig(InferConfigLegacy):
     dllm_block_length: int = MISSING  # block length for dLLM decode
     enable_prefix_caching: bool = MISSING
     linear_checkpoint_interval: Optional[int] = MISSING
+    sync_free_decode: bool = False
     dp_prefix_caching_cache_threshold: float = MISSING
     dp_prefix_caching_balance_abs_threshold: float = MISSING
     dp_prefix_caching_balance_rel_threshold: float = MISSING

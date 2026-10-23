@@ -1092,3 +1092,4 @@ Runtime:
 | `CHITU_MEM_TRACK_MAX_ENTRIES`  | Integer                      | Ring-buffer size for CUDA memory tracking. See [Profiling](./PROFILING.md). |
 | `CHITU_MEM_TRACK_SNAPSHOT_DIR` | Path to a directory          | Output directory for CUDA memory snapshots. See [Profiling](./PROFILING.md). |
 | `CHITU_CLIENT_ABORT_POLL_INTERVAL_S` | Seconds (default `0.2`) | Fallback poll interval for a client disconnect, used only when requests are served without the built-in ASGI middleware. Lower values stop abandoned requests sooner at the cost of more frequent polling. |
+| `CHITU_METRICS_REFRESH_INTERVAL_S` | Seconds (float, default `1.0`) | Minimum interval between rebuilds of the Prometheus gauges. Overrides `metrics.prometheus_scrape_interval`; `0` rebuilds on every request, which is the old behavior. |

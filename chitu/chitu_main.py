@@ -19,7 +19,6 @@ import msgpack
 
 from chitu.backend import Backend, BackendState
 from chitu.device_type import is_nvidia, has_accelerator
-from chitu.executor import Executor
 from chitu.global_vars import (
     get_global_args,
     get_multi_inst_config,
@@ -34,6 +33,7 @@ from chitu.global_vars import (
 from chitu.models.registry import ModelType
 from chitu.moe.load_balancer import get_moe_load_planner
 from chitu.scheduler import Scheduler
+from chitu.sync_free_decode import build_executor
 from chitu.task import (
     PackedTasks,
     PackedTasksBase,
@@ -1423,7 +1423,7 @@ def chitu_init(args):
                 Scheduler.build(args.scheduler, args.infer, dp_rank=i)
                 for i in range(args.infer.dp_size)
             ]
-        executor = Executor.build(args)
+        executor = build_executor(args)
         Backend.executor = executor
         PackedTasks.configure(max_num_tasks=args.infer.max_batch_size)
         logger.info("Chitu has been initialized")

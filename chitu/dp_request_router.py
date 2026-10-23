@@ -693,13 +693,6 @@ class PrefixCacheAwarePolicy(LoadBalancer):
             if blk_hash in buffer or blk_hash in lru:
                 buffer.pop(blk_hash, None)
                 lru.pop(blk_hash, None)
-            else:
-                logger.warning(
-                    "[REQUEST_ROUTER] instance evict hash not found in cached_blocks "
-                    f"or evicted block buffer, local_instance_id={local_instance_id}, blk_hash={blk_hash}. "
-                    "If this warning is frequent, router/instance cache states may drift; "
-                    "try increasing multi_inst.router.router_evict_buffer_size."
-                )
 
     def _push_evict_buffer(self, local_instance_id: int, blk_hash: str) -> None:
         buffer = self.evict_buffer.setdefault(local_instance_id, OrderedDict())
@@ -707,12 +700,6 @@ class PrefixCacheAwarePolicy(LoadBalancer):
         buffer.move_to_end(blk_hash, last=True)
         if len(buffer) > self.evict_buffer_size:
             overflow_hash, _ = buffer.popitem(last=False)
-            logger.warning(
-                "[REQUEST_ROUTER] evicted block buffer overflow, dropping oldest buffer block hash, "
-                f"local_instance_id={local_instance_id}, dropped_blk_hash={overflow_hash}, "
-                f"capacity={self.evict_buffer_size}. "
-                "If this warning is frequent, router/instance cache states may drift."
-            )
 
     def remove_request(self, request_id: str):
         super().remove_request(request_id)

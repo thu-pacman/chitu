@@ -586,6 +586,30 @@ def create_tensor(data, device, dtype=None, sync_free=True):
     return torch.tensor(data, dtype=dtype, device=device)
 
 
+# Device types whose index is "which one of them this process is on"; only these
+# have an unindexed form meaning something else. (`torch.cpu` also exposes
+# `current_device`, hence the explicit list.)
+_INDEXED_DEVICE_TYPES = ("cuda", "musa", "npu", "xpu")
+
+
+def resolved_device(device) -> torch.device:
+    """`torch.device`, with an unspecified accelerator index filled in.
+
+    `torch.device("cuda") != torch.device("cuda:0")` as values, although on a rank
+    that owns a GPU the two name the same one, and both forms show up side by side
+    (`Executor.device` is unindexed, tensors carry the index). Anything comparing a
+    tensor against a configured device has to resolve it first.
+    """
+    device = torch.device(device)
+    if device.index is not None or device.type not in _INDEXED_DEVICE_TYPES:
+        return device
+    current_device = getattr(getattr(torch, device.type, None), "current_device", None)
+    if current_device is None:
+        return device
+    index = current_device()
+    return torch.device(device.type, index) if isinstance(index, int) else device
+
+
 # ---------------------------------------------------------------------------
 # Per-step host -> device staging
 # ---------------------------------------------------------------------------

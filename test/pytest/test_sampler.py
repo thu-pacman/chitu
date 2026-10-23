@@ -8,6 +8,7 @@ import numpy as np
 
 from chitu.sampling.sampler import (
     Sampler,
+    DraftBatch,
     TaskSampleState,
     AppendTokenOps,
     FrequencyPenaltyOps,
@@ -40,6 +41,7 @@ def _make_task(sample_params, grammar=None, num_new_tokens=0, prompt_len=0):
     task.task_id = f"test_{id(task)}"
     task.prompt_len = prompt_len
     task.prefix_tokens = [0] * prompt_len
+    task.next_tokens = []
     task.req = None
     return task
 
@@ -2212,6 +2214,200 @@ class TestMTPRejectionEdgeCases:
 
         assert out_tokens.shape == (bs, mtp_size)
         assert accept_indices.shape == (bs,)
+
+
+# ========================================================
+#  the step's draft rows, batch-wide (DraftBatch)
+# ========================================================
+
+
+class TestDraftBatchRows:
+    """The batch-wide draft rows have to be the per-task rows, seen once.
+
+    `update_draft_results` keeps the step's draft as one `DraftBatch`, which the verify
+    of that same step reads in place; it used to read the per-task state, so the two
+    forms have to agree on everything the verify consumes -- including the sparse
+    proposal rows, whose columns past a task's own top_k are zero probability either way.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _set_mtp3(self, monkeypatch, global_args):
+        monkeypatch.setattr(get_global_args().infer, "mtp_size", 3)
+
+    @staticmethod
+    def _states(sampler):
+        """Two tasks asking for different top_k (3 and 5, the sampler's width)."""
+        sampler.max_top_k_samples = 5
+        return [
+            TaskSampleState.from_task(
+                _make_task(_make_sample_params(temperature=1.0, top_k=top_k, top_p=0.9))
+            )
+            for top_k in (3, 5)
+        ]
+
+    @staticmethod
+    def _step_rows(states):
+        """A step's draft rows: the anchors, the drafts, and p' five wide.
+
+        Task 0's proposal has mass in its first 3 columns and task 1's in all 5, the
+        shape `filter_logits_top_k_top_p` returns -- masked columns are zero probability
+        but still carry a real vocab id.
+        """
+        probs = torch.tensor(
+            [
+                [[0.5, 0.3, 0.2, 0.0, 0.0], [0.6, 0.4, 0.0, 0.0, 0.0]],
+                [[0.25, 0.25, 0.25, 0.25, 0.0], [1.0, 0.0, 0.0, 0.0, 0.0]],
+            ],
+            dtype=torch.float32,
+        )
+        token_ids = torch.tensor(
+            [
+                [[7, 8, 9, 100, 101], [11, 12, 150, 151, 152]],
+                [[1, 2, 3, 4, 199], [21, 190, 191, 192, 193]],
+            ],
+            dtype=torch.int64,
+        )
+        next_tokens = torch.tensor([[50, 7, 8], [60, 1, 2]], dtype=torch.int64)
+        return probs, token_ids, next_tokens
+
+    def test_batch_rows_reproduce_the_per_task_rows(self, sampler, global_args):
+        sampler.mtp_size = 3
+        states = self._states(sampler)
+        probs, token_ids, next_tokens = self._step_rows(states)
+        for i, (state, top_k) in enumerate(zip(states, (3, 5))):
+            # The per-task form: the row at the task's own top-k width.
+            state.draft_probs = (probs[i, :, :top_k], token_ids[i, :, :top_k])
+            state.task.next_tokens = next_tokens[i].tolist()
+
+        per_task = sampler._rebuild_mtp_draft_inputs(states, torch.device("cpu"))
+
+        sampler._draft_batch = DraftBatch(
+            task_ids=[state.task.task_id for state in states],
+            next_tokens=next_tokens,
+            probs=probs,
+            token_ids=token_ids,
+        )
+        batch_wise = sampler._rebuild_mtp_draft_inputs(states, torch.device("cpu"))
+
+        # The drafted rows are the anchor plus the drafts, both ways.
+        assert torch.equal(per_task[0], batch_wise[0])
+        assert torch.equal(
+            per_task[0], torch.tensor([[7, 8], [1, 2]], dtype=torch.int64)
+        )
+        # p' agrees on its mass; the two forms differ only in the vocab ids of
+        # the zero-probability padding columns, which no lookup can read.
+        assert torch.equal(per_task[1][0], batch_wise[1][0])
+        assert torch.equal(per_task[1][1][probs > 0], batch_wise[1][1][probs > 0])
+
+        # ... and so does the verify that consumes them.
+        V = global_args.models.vocab_size
+        logits = torch.zeros(2, 3, V)
+        logits[:, :, 42] = 100.0
+        tokens = torch.full((2, 3), 42, dtype=torch.int64)
+        greedy_mask = torch.tensor([False, False])
+        torch.manual_seed(0)
+        accept_a, out_a = sampler._verify_mtp_mixed(
+            tokens, logits, per_task[0], per_task[1], greedy_mask, 3, states
+        )
+        torch.manual_seed(0)
+        accept_b, out_b = sampler._verify_mtp_mixed(
+            tokens, logits, batch_wise[0], batch_wise[1], greedy_mask, 3, states
+        )
+        assert torch.equal(out_a, out_b)
+        assert torch.equal(accept_a, accept_b)
+
+    def test_greedy_batch_builds_the_same_one_hot(self, sampler):
+        """A batch whose draft returned no proposal: one-hot, both ways."""
+        sampler.mtp_size = 3
+        states = self._states(sampler)
+        _, _, next_tokens = self._step_rows(states)
+        for i, state in enumerate(states):
+            state.draft_probs = None
+            state.task.next_tokens = next_tokens[i].tolist()
+
+        per_task = sampler._rebuild_mtp_draft_inputs(states, torch.device("cpu"))
+        sampler._draft_batch = DraftBatch(
+            task_ids=[state.task.task_id for state in states],
+            next_tokens=next_tokens,
+        )
+        batch_wise = sampler._rebuild_mtp_draft_inputs(states, torch.device("cpu"))
+
+        assert torch.equal(per_task[0], batch_wise[0])
+        # Without a stored proposal, the per-task fallback uses width 1.
+        # The batch path creates a one-hot proposal at the configured sampler width.
+        # Compare the represented distributions rather than tensor shapes;
+        # _prepare pads proposals to the width required by verify.
+        for probs, token_ids in (per_task[1], batch_wise[1]):
+            assert probs[:, :, 0].tolist() == [[1.0, 1.0], [1.0, 1.0]]
+            assert token_ids[:, :, 0].tolist() == [[7, 8], [1, 2]]
+
+    def test_rows_are_refused_for_a_different_batch(self, sampler):
+        """The rows are positional: a batch that moved is not this one's."""
+        sampler.mtp_size = 3
+        states = self._states(sampler)
+        probs, token_ids, next_tokens = self._step_rows(states)
+        batch = DraftBatch(
+            task_ids=[state.task.task_id for state in states],
+            next_tokens=next_tokens,
+            probs=probs,
+            token_ids=token_ids,
+        )
+        sampler._draft_batch = batch
+        ids = [state.task.task_id for state in states]
+
+        assert sampler.draft_batch_for(ids) is batch
+        assert sampler.draft_batch_for(reversed(ids)) is None
+        assert sampler.draft_batch_for(ids[:1]) is None
+        assert sampler.draft_batch_for([]) is None
+        # A batch it does not describe falls back to the per-task state, which
+        # sample() uses to rebuild draft inputs when batch membership or order differs.
+        one = sampler._rebuild_mtp_draft_inputs(states[:1], torch.device("cpu"))
+        assert one[0].shape == (1, 2)
+
+    def test_update_draft_results_keeps_the_step_on_device(self, sampler):
+        """`update_draft_results` stores one batch, and copies it once."""
+        sampler.mtp_size = 3
+        sampler.max_top_k_samples = 5
+        tasks = [_make_task(_make_sample_params(top_k=5)) for _ in range(2)]
+        pt = _make_packed_tasks(tasks)
+        pt.generated_result = None  # the sync event needs CUDA; not this test
+        pt.generated_result_device = PackedTasksResult(
+            torch.zeros(2, 3, dtype=torch.int64)
+        )
+        next_tokens = torch.tensor([[50, 7, 8], [60, 1, 2]], dtype=torch.int64)
+        probs, token_ids, _ = self._step_rows(self._states(sampler))
+
+        sampler.update_draft_results(pt, next_tokens, (probs, token_ids))
+
+        batch = sampler.draft_batch_for([task.task_id for task in tasks])
+        assert batch is not None
+        for i, task in enumerate(tasks):
+            state = sampler.states[task.task_id]
+            assert state.next_tokens_device.tolist() == next_tokens[i].tolist()
+            assert torch.equal(state.draft_probs[0], probs[i])
+        # The batch owns its copy: the draft rewrites its own buffers on the
+        # next replay, so the rows the verify will read must not follow them.
+        probs.zero_()
+        token_ids.zero_()
+        assert batch.probs.sum().item() > 0
+        assert batch.token_ids.sum().item() > 0
+
+    def test_update_results_reads_the_batch_once(self, sampler):
+        sampler.mtp_size = 1
+        tasks = [_make_task(_make_sample_params()) for _ in range(2)]
+        pt = _make_packed_tasks(tasks)
+        pt.generated_result = PackedTasksResult(
+            tokens=torch.tensor([[42], [43]]),
+            accept_indices=None,
+            next_tokens=torch.tensor([[42, 7, 8], [43, 1, 2]], dtype=torch.int64),
+            synced=True,
+        )
+
+        sampler.update_results(pt)
+
+        rows = [[42, 7, 8], [43, 1, 2]]
+        for i, task in enumerate(tasks):
+            assert task.next_tokens == rows[i]
 
 
 def _patch_cpu_create_tensor(monkeypatch):

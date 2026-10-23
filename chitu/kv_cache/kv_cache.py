@@ -30,6 +30,7 @@ from chitu.utils import (
     reset_step_times,
 )
 from chitu.ops import fp8_pertensor_kvcache_quant, fp8_pertoken_kvcache_quant_dsa
+from chitu.kv_cache.kv_cache_sync_free import state_of
 
 if TYPE_CHECKING:
     from chitu.task import PackedTasksBase
@@ -596,6 +597,11 @@ class KVCacheBase:
         `draft_offset == 1`, and the next steps will be prepared only on the
         device via `advance_mtp_cache_decode`.
         """
+        # The device path may write this window from device lengths itself, skipping
+        # the host lists (see `chitu/kv_cache/kv_cache_sync_free.py`).
+        if state_of(self).prepare_mtp_cache_decode(tasks, draft_offset):
+            return
+
         self.mtp_seq_len_delta.copy_from_list(
             [self.tid_to_cached_len[tid] + draft_offset - 1 for tid in tasks.task_ids],
             [self.tid_to_cached_len[tid] + draft_offset for tid in tasks.task_ids],
@@ -948,6 +954,12 @@ class PagedKVCache(KVCacheBase):
                 f"max_len={max_len} max_blocks_per_req={self.max_blocks_per_req} "
                 f"max_seq_len={get_global_args().infer.max_seq_len} block_size={self.block_size}"
             )
+
+        if state_of(self).gpu_block_table_rows_unchanged(task_ids, block_rows):
+            # Nothing to push, but the decode position still moved: the page ids /
+            # in-page offsets come from the positions, not the rows, so drop them.
+            self.update_page_offs()
+            return
 
         # Keep the row stride stable so synchronization history remains valid
         # regardless of whether CUDA Graph is enabled.
@@ -1362,6 +1374,13 @@ class SingletonPagedKVCache(PagedKVCache):
         """
         if not task_ids:
             return
+        if state_of(self).read_page_ids_written_from_device():
+            # `_sync_free_point_read_pages()` already pointed these at this step's
+            # accepted column before the draft ran: the list below is the same one, so
+            # deriving it again is pure host time in front of the verify. Drop the dedup
+            # memo -- this cache never computed this step's list.
+            self._read_page_ids_written = None
+            return
         C = self.checkpoint_interval
         page_ids = []
         for tid, n_consumed in zip(task_ids, consumed_lens):
@@ -1375,7 +1394,7 @@ class SingletonPagedKVCache(PagedKVCache):
             return
         self._read_page_ids_written = page_ids
         self._read_page_ids.set(
-            torch.tensor(page_ids, dtype=torch.int32, device=self.device)
+            create_tensor(page_ids, device=self.device, dtype=torch.int32)
         )
 
     def _update_write_page_ids(self, task_ids: Sequence[str]) -> None:
@@ -1400,7 +1419,7 @@ class SingletonPagedKVCache(PagedKVCache):
                     pos += C
             pages.append(row)
         self._write_page_ids.set(
-            torch.tensor(pages, dtype=torch.int32, device=self.device)
+            create_tensor(pages, device=self.device, dtype=torch.int32)
         )
 
     def _upd_gpu_block_table(

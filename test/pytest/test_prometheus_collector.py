@@ -150,3 +150,31 @@ def test_PrometheusMetricsCollector(rank_dp, monkeypatch):
                 assert target_sample.value == 100
 
     assert PrometheusMetricsCollector._instance is None
+
+
+def test_gauge_refresh_is_throttled(monkeypatch):
+    """A gauge rebuild is allowed once per interval, not once per call.
+
+    The decode loop asks for one on every step that retires a request, and the rebuild
+    itself is what the GPU waits for; the answer only has to be as fresh as a scrape.
+    """
+    from chitu.metrics import prometheus_collector as pc
+
+    # Pin the interval through the override, so the case does not depend on whatever
+    # `metrics.prometheus_scrape_interval` the global args (or a caller's environment)
+    # happen to carry -- with an interval of 0 the first assertion would flip.
+    monkeypatch.setenv("CHITU_METRICS_REFRESH_INTERVAL_S", "1.0")
+    monkeypatch.setattr(pc, "_gauge_refreshed_at", {})
+    assert pc._gauge_refresh_due("gpu_usage") is True
+    assert pc._gauge_refresh_due("gpu_usage") is False
+    assert pc._gauge_refresh_due("task_counts") is True  # per gauge, not global
+    assert pc._gauge_refresh_due("task_counts") is False
+
+    pc._gauge_refreshed_at["gpu_usage"] -= pc._gauge_refresh_interval_s()
+    assert pc._gauge_refresh_due("gpu_usage") is True
+    # The override takes precedence over the configured scrape period.
+    # Zero disables throttling, allowing every call to rebuild the gauge.
+    monkeypatch.setenv("CHITU_METRICS_REFRESH_INTERVAL_S", "0")
+    assert pc._gauge_refresh_interval_s() == 0.0
+    assert pc._gauge_refresh_due("gpu_usage") is True
+    assert pc._gauge_refresh_due("gpu_usage") is True
