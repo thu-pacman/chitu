@@ -786,20 +786,23 @@ Acceptable values:
 
 ### Argument `infer.sync_free_decode`
 
-Whether to run decode steps without making the GPU wait for the host: the per-step
-state (KV lengths, MTP accept counts) stays on the device and the draft is launched
-off it, so the host's wait for the previous step's result lands behind this step's
-graphs instead of idling the GPU. While the device path holds that state, the host
-mirror of the draft's lengths is one window behind and deliberately poisoned (reading
-it raises instead of handing out the previous step's lengths); the sync phase of the
-same step writes it back. Steps the device path does not cover -- the prefill -> decode
-boundary, batch changes, `mtp_size <= 1`, and the layouts it rejects (PCP > 1, PD
-prefill-only, and any device whose accept counts cannot be read back as CUDA tensors,
-e.g. `op_impl = cpu`) -- run the historical order. With PP > 1 the device path runs on
-the last PP stage -- the one that drafts and samples -- and every stage ahead of it
-keeps the historical order.
-- true: enabled
-- false: previous behavior
+Whether to launch MTP drafts using device results before waiting for host results.
+Accept indices and anchor tokens come from the previous batch's device results.
+The accept-index readback is queued before the draft. Cache preparation waits for
+these indices after the draft is launched, allowing host synchronization and verify
+preparation to overlap draft execution. Verify KV lengths still use host bookkeeping.
+Draft lengths are computed on the device. Stale host length mirrors raise on access
+until explicitly refreshed by a host update.
+
+Requires `mtp_size > 1`, PCP = 1, and a device with CUDA-compatible tensors.
+PD prefill-only nodes and PP stages before the last stage use the base executor
+queue. DLLM models also keep the base queue.
+If the previous batch has no usable device inputs, host results are synchronized
+before the base draft implementation runs. A different current batch does not by
+itself disable device-based drafting. Verify rebuilds draft inputs per task when
+the stored draft batch does not match its tasks in order.
+- true: enable device-based drafting and decode queue reordering where supported
+- false: use the base executor queue
 
 *Default: `false`.*
 

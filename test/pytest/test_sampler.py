@@ -2333,11 +2333,10 @@ class TestDraftBatchRows:
         batch_wise = sampler._rebuild_mtp_draft_inputs(states, torch.device("cpu"))
 
         assert torch.equal(per_task[0], batch_wise[0])
-        # The two paths legitimately differ in proposal *width*, so compare the semantics rather than
-        # the tensors: the per-task fallback has no stored proposal to take a width from -- upstream
-        # now narrows each task's proposal to its own top-k, which leaves this one at width 1, and
-        # `_prepare` re-pads it to the verify width -- while the batch path synthesises the one-hot at
-        # the sampler's configured width.
+        # Without a stored proposal, the per-task fallback uses width 1.
+        # The batch path creates a one-hot proposal at the configured sampler width.
+        # Compare the represented distributions rather than tensor shapes;
+        # _prepare pads proposals to the width required by verify.
         for probs, token_ids in (per_task[1], batch_wise[1]):
             assert probs[:, :, 0].tolist() == [[1.0, 1.0], [1.0, 1.0]]
             assert token_ids[:, :, 0].tolist() == [[7, 8], [1, 2]]
@@ -2361,7 +2360,7 @@ class TestDraftBatchRows:
         assert sampler.draft_batch_for(ids[:1]) is None
         assert sampler.draft_batch_for([]) is None
         # A batch it does not describe falls back to the per-task state, which
-        # `sample()` has to be able to rebuild from (that is the old path).
+        # sample() uses to rebuild draft inputs when batch membership or order differs.
         one = sampler._rebuild_mtp_draft_inputs(states[:1], torch.device("cpu"))
         assert one[0].shape == (1, 2)
 

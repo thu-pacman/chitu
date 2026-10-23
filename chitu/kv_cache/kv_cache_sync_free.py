@@ -2,20 +2,16 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""The sync-free decode device path of the KV caches.
+"""Prepare draft KV-cache metadata from device results.
 
-`chitu/sync_free_decode.py` is the executor's half: a decode step's inputs (the accept
-counts and the anchor token) stay on the device. This is the cache's half: the draft's
-window is built from device lengths, so that the draft can be launched before the host
-has the accept counts of the step it verifies, and a GPU block table that already holds
-the rows is left alone. See `docs/design/sync-free-decode.md`.
+The executor shares the previous batch's accept indices through state_of(cache).
+The cache uses these indices and device KV lengths to prepare the draft window
+before the host receives the results. Caches with hidden-state page tables also
+select the draft's initial read pages on the device.
 
-The state hangs off the cache (`state_of()`) rather than in a mixin of the cache classes:
-every one of them reaches the window code through `KVCacheBase`'s own methods, so a
-subclass placed anywhere in the hierarchy would be bypassed. `kv_cache.py` calls in here
-at three points -- the draft window, the block-table sync, and the page ids a device step
-has already written -- each of which falls back to the historical behavior when the
-device state is not there.
+KVCacheBase and PagedKVCache call this module for draft-window preparation,
+block-table upload deduplication, and read-page reuse. State is attached lazily
+to each cache instance. See docs/design/sync-free-decode.md.
 """
 
 from typing import TYPE_CHECKING, Optional
@@ -30,11 +26,10 @@ if TYPE_CHECKING:
 
 
 def state_of(cache) -> "SyncFreeDecodeState":
-    """The cache's device state, created the first time it is asked for.
+    """Return the cache's sync-free state, creating it on first use.
 
-    Lazily rather than in `KVCacheBase.__init__`: the caches in `Backend.cache_dict` are
-    built by a dozen classes, some overriding the window methods and some not calling
-    `super().__init__()`, and a state created only on demand cannot break any of them.
+    Lazy initialization lets cache implementations use these helpers without
+    adding initialization code to each cache constructor.
     """
     state = getattr(cache, "_sync_free", None)
     if state is None:
@@ -54,12 +49,11 @@ class SyncFreeDecodeState:
 
     def __init__(self, cache) -> None:
         self.cache = cache
-        # The step's accept counts as the device tensor the executor shared, and their
-        # batch: never a previous step's counts.
+        # Accept indices shared for this draft and the corresponding ordered task IDs.
         self.accept_indices_device: Optional[torch.Tensor] = None
         self.accept_indices_batch: Optional[tuple[str, ...]] = None
-        # Set while `_read_page_ids` holds pages this step wrote off the device, so the
-        # host's own recomputation of the same list is skipped instead of rewriting it.
+        # Whether _read_page_ids was computed from device inputs and can be reused
+        # by the host cache preparation path.
         self.read_page_ids_device: bool = False
         # The rows the GPU block table holds, as last pushed: most decode steps append
         # no block, and can skip the staging copy the GPU would wait for.
@@ -68,7 +62,7 @@ class SyncFreeDecodeState:
     def set_accept_indices_device(
         self, accept_indices: Optional[torch.Tensor], task_ids: tuple[str, ...]
     ) -> None:
-        """Take the step's accept counts, as the device tensor the executor shared.
+        """Take the step's accept indices, as the device tensor the executor shared.
 
         On a rank without a sampler this is where they come from; a step off the device
         path pushes None, so a stale pair is never read. They also invalidate the
@@ -88,32 +82,22 @@ class SyncFreeDecodeState:
         return self.read_page_ids_device
 
     def clear_device_read_page_ids(self) -> None:
-        """Close the window `set_read_page_ids_device()` opened.
-
-        Called by the phase that owns the step's count-dependent cache preparation, once
-        it has run: after that a host write of `_read_page_ids` is the only one the cache
-        is supposed to have.
-        """
+        """Clear the device read-page reuse flag after cache preparation."""
         self.read_page_ids_device = False
 
     def set_read_page_ids_device(self, accept_indices: torch.Tensor) -> bool:
-        """Point `_read_page_ids` at this step's accepted column, off the device.
+        """Select draft read-page IDs from the device write-page table.
 
-        The draft chain starts from the hidden state of the last accepted token, and
-        `_read_page_ids` is the cache's own answer to where that state lives: the
-        previous step's `_write_page_ids` column `max(accept_index, 0)`.
-        `_update_write_page_ids()` sends a checkpoint column to its `ckpt_block_ids`
-        page, exactly the page `_upd_read_page_ids()` picks for the same column.
+        The draft starts from the last accepted token's hidden state. For each task,
+        select the previous verify's write-page column given by accept_indices, clamped
+        to the table's column range. Checkpoint columns already contain checkpoint page
+        IDs, matching the host calculation in _upd_read_page_ids().
 
-        Both halves are on the device by the time the draft runs: the rows were rebuilt
-        by the previous step's `prepare_cache_decode()`, this step's has not run yet, and
-        `accept_indices` never left the device. Writing here is therefore the same list
-        the host derives, moved out of the way of the wait for those counts, and the
-        dedup in `_upd_read_page_ids()` stays sound: the list it would write is this one.
+        The write-page table and accept indices are available on the device before the
+        draft runs, so selecting pages here requires no host readback.
 
-        True when this cache keeps no page-id pair at all, or when the pages could be
-        written; False when the device tensors do not line up, and the caller leaves the
-        step to the host path rather than read a page it cannot vouch for.
+        Return True if no page-ID pair exists or the selection succeeds. Return False
+        if table dimensions or devices do not match, so the caller can use the host path.
         """
         write_ids = getattr(self.cache, "_write_page_ids", None)
         read_ids = getattr(self.cache, "_read_page_ids", None)
@@ -137,14 +121,14 @@ class SyncFreeDecodeState:
     ) -> bool:
         """Build the draft's window from device lengths, if they are there.
 
-        Called by `KVCacheBase.prepare_mtp_cache_decode()`; False means the caller's own
-        host path stays in charge. The draft is launched before the sync phase has
-        corrected `tid_to_cached_len` for the accept counts of the step it verifies, so
-        the host lists are one window behind; the device lengths are not, since
-        `accepted_lens_device_for_draft()` computes the same window off `seq_len_delta`
-        and the counts. The host mirror is left poisoned (`set_lens_device()`) rather than
-        stale, so a reader raises instead of reading the previous step's lengths; the
-        verify's own window writes them again.
+        Return False if device lengths are unavailable so the caller can use host lists.
+        The draft runs before _prepare_cache_decode() applies the previous batch's
+        accept indices to tid_to_cached_len. Compute accepted lengths from device
+        seq_len_delta and accept indices instead of using the uncorrected host values.
+
+        set_lens_device() marks the draft window's host length mirrors as stale.
+        Reading those mirrors raises until they are explicitly refreshed; preparing
+        the verify window does not itself refresh the separate draft length mirrors.
         """
         accepted_lens = self.accepted_lens_device_for_draft(tasks)
         if accepted_lens is None:

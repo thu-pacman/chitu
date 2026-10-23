@@ -2,29 +2,28 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-"""The sync-free decode device path: the base's decode step, re-launched from the device.
+"""Launch MTP drafts using device results before waiting for host results.
 
-One switch, off by default: ``infer.sync_free_decode`` keeps a decode step's inputs
-(the MTP accept counts, the anchor row, the KV windows) on the device and launches the
-draft off them, so that the host never waits for the previous step's result with an
-idle GPU. The draft reads the previous step's list off those same rows, so it runs while
-the GPU is still busy with the step whose result the host would otherwise wait for.
+With ``infer.sync_free_decode`` enabled, the executor reads accept indices and
+anchor tokens from the previous batch's device results. It enqueues an asynchronous
+copy of the accept indices, then launches the draft using device-side KV lengths.
+Cache preparation waits for the copy and updates host KV lengths before verify.
+Result synchronization and token bookkeeping run after verify and sampling.
 
-The base needs no extension point for that: a step is a list of processors over one
-``ProcessContext``, so ``SyncFreeDecodeMixin`` lays out its own decode queue
-(``_build_process_queues``), writes the two processors that order needs -- the step's
-inputs (``_sync_free_share_inputs``) and the draft that reads them
-(``_sync_free_generate_draft``) -- and overrides the base's phases where they would
-otherwise read the same values off the host. The inputs live in a ``SyncFreeStep`` on the
-step's *own* context, which dies with the step, so no processor can read another step's.
-Where the device path is not wired (``pcp > 1``, no MTP draft, a ``pp`` stage that does
-not draft) the queue stays the base's and every one of those writes falls back, step by
-step.
+The previous batch is ``TaskCollector.get_postprocess_tasks()``; the current batch
+is ``self.ctx.tasks``, which this step verifies. These batches can differ when PP
+scheduling rotates between groups. Draft inputs always belong to the previous batch.
+An accept index identifies the last accepted token, rather than a token count;
+cache-length calculations account for the index convention and the -1 sentinel.
 
-``build_executor()`` picks the class, off ``infer.sync_free_decode``. This module
-imports ``chitu.backend`` and ``chitu.task``, so it may only be imported once those are
-loaded: ``chitu/kv_cache/kv_cache_sync_free.py`` therefore imports the switch in place,
-inside the one method that uses them. See ``docs/design/sync-free-decode.md``.
+``SyncFreeDecodeMixin`` reorders the base executor's processors and stores shared
+inputs in a ``SyncFreeStep`` on the current ``ProcessContext``. Unsupported layouts
+use the base queue. If device inputs are unavailable in a reordered step, the host
+results are synchronized before calling the base draft implementation.
+
+``build_executor()`` selects the executor from ``infer.sync_free_decode``.
+The KV cache module imports this module inside a method to avoid an import cycle
+through ``chitu.backend``. See ``docs/design/sync-free-decode.md``.
 """
 
 from dataclasses import dataclass
@@ -44,10 +43,7 @@ from chitu.task_type import TaskType
 from chitu.utils import resolved_device
 
 _STEP_ATTR = "sync_free_step"
-"""Where the device path keeps its state on the step's own context. An attribute
-rather than a field: ``ProcessContext`` belongs to the base, and the device path adds to
-it instead of asking the base for a place to sit.
-"""
+"""Dynamic attribute used to store SyncFreeStep on the current ProcessContext."""
 
 
 def is_sync_free_decode_enabled() -> bool:
@@ -58,15 +54,15 @@ def is_sync_free_decode_enabled() -> bool:
 
 
 def device_path_layout_supported() -> bool:
-    """Whether this rank layout lets a step read its inputs off the device.
+    """Whether the configured layout and device support device-based draft inputs.
 
     Four exclusions, each one a way the device path would be half-wired:
 
     * ``pcp > 1``: per-slice window arithmetic;
     * PD prefill-only nodes: they never sample, and the base's
-      ``postprocess_generate_draft()`` returns early there, so the accept counts are applied
+      ``postprocess_generate_draft()`` returns early there, so the accept indices are applied
       by nobody;
-    * a device whose accept counts cannot be read back as CUDA tensors (``op_impl = cpu``,
+    * a device whose accept indices cannot be read back as CUDA tensors (``op_impl = cpu``,
       or any accelerator where ``Tensor.is_cuda`` is false): ``update_mtp_cache_accept()``
       is then never called -- only the base path calls it -- while the rest of the device
       path would still advance the lengths, so the two would drift apart;
@@ -74,8 +70,7 @@ def device_path_layout_supported() -> bool:
       (the draft and the sampler live on the last stage, and the stages ahead of it have no
       draft to put the host's wait behind).
 
-    Any ``tp`` / ``dp`` is covered. An uncovered layout keeps the historical order rather
-    than mixing it with the device path.
+    Any ``tp`` / ``dp`` is covered. Unsupported layouts use the base executor queue.
     """
     infer = getattr(get_global_args(), "infer", None)
     if infer is None:
@@ -102,7 +97,7 @@ def device_path_layout_supported() -> bool:
 class SyncFreeStep:
     """One step's device inputs, left by `_sync_free_share_inputs` on the step's own
     context for the phases behind it to read. A context without one is a step whose
-    inputs were not read off the device, which turns every reader below back into the
+    device inputs are unavailable, which turns every reader below back into the
     base's own path.
     """
 
@@ -110,11 +105,12 @@ class SyncFreeStep:
     """The `task_ids` `inputs` describe: the previous step's batch."""
 
     tasks: PackedTasksBase
-    """That batch itself. The counts above are applied to *it*, not to the batch this
-    step verifies: with `pp > 1` the two are different scheduler groups."""
+    """The previous batch whose KV cache is updated using inputs[0].
+    This may differ from the current batch being verified under PP scheduling.
+    """
 
     inputs: tuple[torch.Tensor, torch.Tensor]
-    """This step's `(accept counts, anchor row)`, one row per task."""
+    """This step's `(accept indices, anchor row)`, one row per task."""
 
     counts_readback: Optional[tuple[torch.Tensor, torch.cuda.Event]] = None
     """The counts' non-blocking read-back: `(pinned host buffer, event)`."""
@@ -170,7 +166,7 @@ class SyncFreeDecodeMixin:
         Two orderings here are load-bearing, not cosmetic:
 
         * `early` sits in front of the wait: those phases read the draft's device rows, not
-          the accept counts, so they can run while the GPU is still busy.
+          the accept indices, so they can run while the GPU is still busy.
         * `commit` sits *behind* `sync`: `_commit_step_tokens()` refreshes
           `update_decode_status()` and raises `has_unsync_new_token`, and both have to see
           the counts this step's sync just applied. Run in front of it, the scheduler keeps
@@ -219,20 +215,19 @@ class SyncFreeDecodeMixin:
     # ---- the device path's own processors ----
 
     def _sync_free_share_inputs(self) -> None:
-        """Share this step's device inputs, first in the decode queue.
+        """Share the previous batch's device inputs with all participating ranks.
 
-        Both inputs come off the previous step's result (`_sync_free_prev_batch`), which
-        only the sample rank holds, while the draft and the verify run on every rank: one
-        broadcast hands them over as device tensors. Here too the caches take the counts,
-        so the draft's window is built from device lengths
-        (`chitu/kv_cache/kv_cache_sync_free.py`), the page the draft chain starts from is
-        pointed at this step's accepted column, and the read-back of the same counts is
-        queued ahead of the draft's graphs -- the phase that needs them on the host then
-        waits for a copy the GPU was busy with anyway.
+        Read accept indices and anchor tokens from the sample rank's device results and
+        broadcast them. Select the draft's initial read-page IDs on the device, and enqueue
+        an asynchronous copy of the accept indices to pinned host memory.
 
-        A step whose inputs cannot be read off the device leaves the context without a
-        `SyncFreeStep`, which sends every phase behind this one back to the base's host
-        path (the draft then takes the sync phase's host state in front of it).
+        Store the inputs and copy event in the current context. Share the accept indices
+        with the caches so they can compute draft lengths without reading host results.
+        Cache preparation waits for the copy after the draft has been launched.
+
+        If device inputs or read-page IDs are unavailable, leave the context without a
+        SyncFreeStep. The draft processor then synchronizes host results and uses the
+        base draft implementation.
         """
         source = self._sync_free_prev_batch()
         inputs = None if source is None else self._sync_free_gather_inputs(source)
@@ -258,13 +253,12 @@ class SyncFreeDecodeMixin:
             )
 
     def _sync_free_point_read_pages(self, counts: torch.Tensor) -> bool:
-        """Point every cache's read pages at this step's accepted column, off the device.
+        """Select each cache's draft read-page IDs using device accept indices.
 
-        The draft chain starts from the hidden state of the last accepted token, which
-        `_prepare_cache_decode()` only points `_read_page_ids` at once it has the counts
-        on the host -- later in the step, behind the wait this order exists to avoid.
-        False when a cache cannot be pointed that way, and the caller turns that into the
-        historical order rather than a draft that reads a page it cannot vouch for.
+        The draft starts from the last accepted token's hidden state. Select its page
+        from the previous batch's write-page table before launching the draft.
+        Return False if a cache's page-table shape or device is incompatible with the
+        accept-index tensor; the caller then falls back to the host draft path.
         """
         return all(
             state_of(cache).set_read_page_ids_device(counts)
@@ -272,30 +266,26 @@ class SyncFreeDecodeMixin:
         )
 
     def _sync_free_generate_draft(self) -> None:
-        """Run the MTP draft, first in the reordered decode queue.
+        """Draft tokens for the previous batch using its device results.
 
-        The base's `postprocess_generate_draft()` drafts the batch the sync phase is
-        about to retire (`TaskCollector.get_postprocess_tasks()` holds the *previous*
-        step's list), but takes the anchor row and the counts off the host, both written
-        by the sync phase. The device path drafts that same list, on that same object,
-        off the step's shared inputs (`_sync_free_share_inputs`) instead, and points the
-        page the draft chain starts from off the device too
-        (`_sync_free_point_read_pages`), so none of it has to reach the host. The rows it
-        stores are picked up by that list's next verify -- one step later, as in the base
-        -- so those stay on the device as well. A step whose inputs are not on the device
-        runs the sync phase's host half first and then the base's own draft, unchanged.
+        Like the base implementation, this drafts the batch returned by
+        TaskCollector.get_postprocess_tasks(), which may differ from self.ctx.tasks.
+        Use the shared accept indices and anchor tokens, with read-page IDs already
+        prepared by _sync_free_share_inputs(). Store the draft rows for that batch's
+        next verify.
+
+        If device inputs are unavailable, synchronize the previous batch's host results
+        before calling the base draft implementation.
         """
         if self.model_type == ModelType.LLADA2 or self._pd_prefill_only:
             # 与基类一样：DLLM 没有 draft，PD 的 prefill 节点也不做。
             return
         if self.mtp_size <= 1 or not self.is_pp_last_stage:
             return
-        # The draft runs on the list the sync phase is about to retire -- the list the
-        # step's inputs were gathered from (`_sync_free_share_inputs`). Only that list
-        # has to line up with them, which `_sync_free_inputs_for` checks; this step's own
-        # batch often is another one, since with `pp > 1` the scheduler round-robins
-        # `pp_size` decode groups. Either check failing means the historical order, with
-        # the sync phase's host half pulled forward for the base's draft.
+        # The draft runs on the previous batch, whose results provide the
+        # step's inputs were gathered from (_sync_free_share_inputs). Its task IDs
+        # must match the shared inputs. The current verify may use a different PP
+        # group. If inputs are unavailable, synchronize before running the base draft.
         previous = self._sync_free_prev_batch()
         inputs = None if previous is None else self._sync_free_inputs_for(previous)
         if inputs is None:
@@ -309,10 +299,8 @@ class SyncFreeDecodeMixin:
             )
             return
 
-        # One batch, one set of counts: wherever the retiring list is this step's own
-        # batch too, the verify's preparation installs the same device tensor again, so
-        # this no longer has to say whether it prepares for the draft (`is_draft_prepare`),
-        # which only the base's host path reads.
+        # The device path only installs accept indices here; host KV lengths are
+        # updated in _prepare_cache_decode(). It does not use is_draft_prepare.
         self._prepare_accept_indices(tasks)
         last_tokens = inputs[1]
 
@@ -335,13 +323,13 @@ class SyncFreeDecodeMixin:
         else:
             Backend.model.draft(tasks, last_tokens)
 
-    # ---- the base's own phases, read off the device ----
+    # ---- base phases using device inputs ----
 
     @override
     def _prepare_accept_indices(
         self, tasks, is_draft_prepare=False
     ) -> Optional[list[int]]:
-        """Hand the model its MTP accept counts, from the device when they are there.
+        """Hand the model its MTP accept indices, from the device when they are there.
 
         The base builds them out of `task.mtp_accept_index` -- a host int, turned into a
         device tensor with an H2D copy per step. A reordered step has the same numbers on
@@ -361,7 +349,7 @@ class SyncFreeDecodeMixin:
     def _get_draft_tokens_device(
         self, tasks: PackedTasks, K: int
     ) -> Optional[torch.Tensor]:
-        """The verify's input rows: this batch's draft rows, off the device.
+        """Return this batch's draft token rows from the sampler's device tensor.
 
         The sampler keeps the whole batch's rows as one device tensor; the base's
         per-task rows come from the same place one at a time, and fall back to the host
@@ -375,15 +363,12 @@ class SyncFreeDecodeMixin:
 
     @override
     def _prepare_cache_decode(self) -> None:
-        """Prepare the decode caches, with the retiring list's counts applied first.
+        """Apply the previous batch's accept indices, then prepare the current batch.
 
-        The counts the draft launched from are read back here (the copy is behind that
-        launch, so the wait is covered) and applied to the list they describe -- the one
-        the sync phase is retiring. That is the base's own correction, which the
-        historical order applies in the draft phase, moved behind the draft's launch
-        instead: `tid_to_cached_len` for that list is corrected before its window is
-        built, so the window, the page ids and the sampler's state all come out exactly
-        as the historical order would have them.
+        The D2H copy is enqueued before the draft. Wait for that copy here, after the
+        draft has been launched, so the host wait can overlap draft execution.
+        Update the previous batch's host KV lengths before the base implementation
+        prepares the current batch's verify window. These batches may differ under PP.
         """
         counts = self._sync_free_take_counts()
         if counts is not None:
@@ -393,24 +378,22 @@ class SyncFreeDecodeMixin:
                 cache.update_mtp_cache_accept(step.tasks, counts)
         super()._prepare_cache_decode()
         for cache in Backend.cache_dict.values():
-            # The step's count-dependent preparation has run, so the window
-            # `_sync_free_point_read_pages()` opened closes here and the host's own write
-            # of the same list is the only one left (the next step opens it again).
+            # Cache preparation is complete. Do not reuse this step's device
+            # read-page selection in subsequent host cache updates.
             state_of(cache).clear_device_read_page_ids()
 
     # ---- the step's own state ----
 
     def _sync_free_step(self) -> Optional[SyncFreeStep]:
-        """This step's device state, if `_sync_free_share_inputs` left one.
+        """Return the sync-free state stored on the current ProcessContext, if any.
 
-        An attribute of the step's `ProcessContext` (`_STEP_ATTR`) rather than a field,
-        since a field would mean a hole in the base's own context class. Nothing outside
-        this module reads it.
+        A dynamic attribute keeps feature-specific state out of the base context's
+        field definitions. Only this module accesses the attribute.
         """
         return getattr(self.ctx, _STEP_ATTR, None)
 
     def _sync_free_set_step(self, step: Optional[SyncFreeStep]) -> None:
-        """Leave the device path's state where this step's readers look for it."""
+        """Store the sync-free state on the current ProcessContext."""
         setattr(self.ctx, _STEP_ATTR, step)
 
     # ---- the step's inputs: gathered on the device, read back behind the draft ----
@@ -428,10 +411,9 @@ class SyncFreeDecodeMixin:
         payload = torch.zeros(2 * width, dtype=torch.int64, device=self.device)
         if local is None:
             if self.is_main_rank:
-                # `_sync_free_prev_batch()` only vouched for the retiring batch, not for
-                # its result rows; loud rather than quiet, since the other ranks are
-                # already in the broadcast below, so a disagreement there would run the
-                # step on two sets of counts.
+                # Batch eligibility does not guarantee that device results exist.
+                # Fail explicitly: other ranks enter the broadcast, so a local
+                # fallback would leave the ranks following different paths.
                 raise RuntimeError(
                     "sync-free decode: the step's inputs are shared but the "
                     "sample rank has no device result to share"
@@ -465,13 +447,15 @@ class SyncFreeDecodeMixin:
     def _sync_free_queue_counts_readback(
         self, counts: torch.Tensor
     ) -> Optional[tuple[torch.Tensor, torch.cuda.Event]]:
-        """Queue a non-blocking read-back of `counts`, or None off CUDA.
+        """Enqueue an asynchronous D2H copy of accept indices, or return None off CUDA.
 
-        The copy is queued ahead of the draft's graphs, so the event it is paired with
-        says when the host may read it: by then the GPU has the draft to run and the wait
-        costs nothing. The destination is pinned -- a pageable one would block the host
-        right here, in front of the draft, the one place this path cannot wait -- and is
-        kept between steps, since only one read-back is ever in flight.
+        Record an event after the copy, before the draft is enqueued. Cache preparation
+        waits for this event after launching the draft, allowing the host wait to overlap
+        GPU work. Pinned host memory avoids a blocking pageable-memory transfer before
+        the draft launch.
+
+        Reuse the host buffer while its shape and dtype match. Only one counts readback
+        is in flight at a time.
         """
         if not counts.is_cuda:
             return None
@@ -484,13 +468,11 @@ class SyncFreeDecodeMixin:
         return host, event
 
     def _sync_free_take_counts(self) -> Optional[list[int]]:
-        """The retiring list's counts on the host, if the shared inputs carried them.
+        """Wait for the previous batch's accept indices and return them as a host list.
 
-        These are the counts the step's inputs describe, and they are applied to the
-        cache entries of that same list (`step.tasks`), which is the list whose next
-        verify needs them. They are *not* necessarily the counts this step's own batch
-        needs: with `pp > 1` the scheduler round-robins `pp_size` decode groups, so this
-        step's batch was last verified a step ago and carries its own counts already.
+        The caller applies these indices to step.tasks. They need not describe the
+        current batch being verified: PP scheduling can select a different group.
+        Return None if this step has no device inputs or no queued readback.
         """
         step = self._sync_free_step()
         if step is None or step.counts_readback is None:
@@ -500,13 +482,11 @@ class SyncFreeDecodeMixin:
         return [int(v) for v in host.tolist()]
 
     def _sync_free_inputs_for(self, tasks) -> Optional[tuple]:
-        """The step's device inputs, if they describe `tasks`; else None.
+        """Return shared device inputs if their task IDs match tasks in order.
 
-        None means the step is not on the device path, or the pair belongs to another
-        batch. The inputs are the retiring list's, so the draft asks about that list --
-        the one they were gathered from -- while the verify asks about the batch it is
-        about to run; the two are the same list only while the batch does not change from
-        one step to the next.
+        The inputs describe the previous batch. Draft preparation requests that batch;
+        verify preparation requests the current batch. A missing state or a different
+        batch returns None, allowing the caller to use the base implementation.
         """
         step = self._sync_free_step()
         if step is None or not isinstance(tasks, PackedTasksBase):
@@ -516,20 +496,19 @@ class SyncFreeDecodeMixin:
         return step.inputs
 
     def _sync_free_counts_for(self, tasks) -> Optional[torch.Tensor]:
-        """This step's accept counts as a device tensor, if they were shared."""
+        """This step's accept indices as a device tensor, if they were shared."""
         inputs = self._sync_free_inputs_for(tasks)
         return None if inputs is None else inputs[0]
 
     def _sync_free_ensure_sync_part(self, tasks=None) -> None:
-        """Run the sync phase's host half now, for a draft that cannot use the device.
+        """Synchronize host results before drafting without device inputs.
 
-        The reordered queue launches the draft in front of this phase, safe only while
-        the draft's inputs are all on the device; when they are not, the host has to
-        have the previous step's results before the draft runs, so a step that falls
-        back pays the historical wait -- the one the device path exists to avoid -- and
-        runs the historical order from there on. The DP exchange and the request-level
-        results stay where the queue put them: pulling them forward could park both
-        ranks (see `_build_process_queues`).
+        Finish the previous batch's result copy and update its task accept indices.
+        The base draft implementation requires these host values before it can run.
+
+        Keep DP result exchange and request-level result processing in the queue's
+        postprocess_sync_part phase. Moving those operations ahead of model execution
+        can deadlock ranks waiting for each other's results.
         """
         if tasks is None:
             tasks = TaskCollector.get_postprocess_tasks()
@@ -551,18 +530,15 @@ class SyncFreeDecodeMixin:
     # ---- which batch the device path may read ----
 
     def _sync_free_prev_batch(self) -> Optional[PackedTasksBase]:
-        """The batch the draft reads off the device, or None.
+        """Return the previous batch if it is eligible for device-based drafting.
 
-        That batch is always `TaskCollector.get_postprocess_tasks()`, the list the sync
-        phase is about to retire -- the list the base drafts too. The checks below decide
-        whether its result rows may be read in place of the counts the sync phase copies
-        to the host. This step's own batch is deliberately not compared to it: with
-        `pp > 1` the scheduler round-robins `pp_size` decode groups, so the retiring list
-        is the *other* group and the two never match, while the rows still line up one to
-        one with the draft that reads them, since that list is in the order its own
-        verify ran it. The test is `PackedTasksBase` rather than `PackedTasks` because
-        the sibling ranks get the batch back from `MetadataSerializer`, and the answer
-        picks the *group's* broadcast, so it has to be the same on every rank.
+        The draft uses TaskCollector.get_postprocess_tasks(), as in the base executor.
+        Do not require this batch to match self.ctx.tasks: PP scheduling can select a
+        different group for the current verify.
+
+        Require one output row per task so result rows match draft input rows. Accept
+        PackedTasksBase because non-sample ranks reconstruct this type from serialized
+        metadata. All participating ranks must agree whether to enter the broadcast.
         """
         if not is_sync_free_decode_enabled() or not device_path_layout_supported():
             return None
@@ -593,16 +569,17 @@ class SyncFreeDecodeMixin:
 
 
 class SyncFreeDecodeExecutor(SyncFreeDecodeMixin, Executor):
-    """A decode pipeline whose GPU does not wait for the host: the mixin's device path,
-    plus the state that outlives a step and the one decision taken before the base lays
-    the process queues out.
+    """Executor that launches MTP drafts before synchronizing host results.
+
+    The mixin implements the device path. This class initializes queue selection
+    and the reusable host buffer before the base constructor builds the queues.
     """
 
     def __init__(self, args):
         # Both decided before `super().__init__()`: the base lays out the process queues
         # there, and the reorder is the decode queue's shape. The reorder needs the
         # device path, which with `pp > 1` exists on the last stage alone: the stages
-        # ahead of it take their accept counts from the pipeline's own payloads, and
+        # ahead of it take their accept indices from the pipeline's own payloads, and
         # have no draft to put the host's wait behind. Where the device path is not
         # wired (pcp > 1, no MTP draft) the queue is the base's.
         # `_sync_free_counts_host` is the pinned destination the steps' read-back copies

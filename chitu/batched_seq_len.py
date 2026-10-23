@@ -260,7 +260,7 @@ class BatchedSeqLen:
         self._seq_ids_tensor_device_up_to_date = False
         invalidate_cached_property(self, "lens_tensor_cpu")
         invalidate_cached_property(self, "prefix_lens_list")
-        # A surviving `batch_size` would size a branch off the contradicted mirror.
+        # The device update may resize the batch, invalidating the cached batch size.
         invalidate_cached_property(self, "batch_size")
         invalidate_cached_property(self, "total_len")
         invalidate_cached_property(self, "max_len")

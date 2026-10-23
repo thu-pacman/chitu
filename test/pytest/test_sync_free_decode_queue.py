@@ -5,7 +5,7 @@
 """The decode queue's layout, without an executor: what the reorder may move, and in what order.
 
 A decode step with the switch on is a list of processors; two orderings inside that list carry
-meaning, and both were once wrong in a way the benchmarks did not show:
+correctness and performance constraints:
 
 * the draft must come before the phase that waits for the previous step's result -- otherwise the
   feature has nothing to overlap and its whole gain is gone;
@@ -13,7 +13,7 @@ meaning, and both were once wrong in a way the benchmarks did not show:
   `update_decode_status()` and raises `has_unsync_new_token`, and both have to see the counts that
   wait just applied. Run in front of it, a request that reached `max_seq_len` stays schedulable for
   one more draft (`IndexKernel: index out of bounds`) and `Task.alloc_seq_len` loses the window
-  covering the row the draft writes into (upstream's `MTP draft window ... not covered by its block
+  covering the row the draft writes into (`MTP draft window ... not covered by its block
   table`).
 
 The reorder itself is `SyncFreeDecodeMixin._sync_free_decode_queue`, a pure function of the base
@@ -271,11 +271,10 @@ class TestTheBaseQueuePremise:
 
 
 class TestRetiredSwitches:
-    """The switches this feature used to have are gone, and only one draft order is left.
+    """Require one public sync-free switch and exactly one draft phase.
 
-    Both were removed while the feature was being reworked (`CHITU_SYNC_FREE_REORDER`, and
-    `infer.sync_free_draft_batch = auto | prev | current`); nothing in the shipped tree may
-    still offer them, and the queue must hold exactly one draft phase.
+    The source tree must not expose CHITU_SYNC_FREE_REORDER or
+    infer.sync_free_draft_batch. Queue selection uses infer.sync_free_decode.
     """
 
     def test_the_retired_names_are_absent_from_the_tree(self):

@@ -38,17 +38,16 @@ logger = logging.getLogger(__name__)
 # device's process list, ~14 ms on a loaded node, and decode asks for a rebuild on every
 # step that retires a request) -- so the interval follows the configured scrape period
 # rather than a second, independent constant. `CHITU_METRICS_REFRESH_INTERVAL_S` overrides
-# it (`=0` restores the old per-step rebuild).
+# it (`=0` disables refresh throttling).
 _GAUGE_REFRESH_INTERVAL_FALLBACK_S = 1.0
 
 
 def _gauge_refresh_interval_s() -> float:
-    """The gauge rebuild interval, in seconds.
+    """Return the minimum gauge refresh interval in seconds.
 
-    Read per call rather than frozen at import: the override is a deployment knob and the
-    scrape period is configuration, and neither should need a restart to disagree with the
-    other. Both are read defensively -- this runs in unit tests, where neither the
-    environment nor the global args need to be set.
+    Read the environment override and configured scrape interval on each call,
+    rather than caching them at import time. Fall back to the default interval
+    when global configuration is unavailable, including in unit tests.
     """
     override = os.environ.get("CHITU_METRICS_REFRESH_INTERVAL_S")
     if override is not None:

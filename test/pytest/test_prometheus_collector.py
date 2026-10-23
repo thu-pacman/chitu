@@ -172,8 +172,8 @@ def test_gauge_refresh_is_throttled(monkeypatch):
 
     pc._gauge_refreshed_at["gpu_usage"] -= pc._gauge_refresh_interval_s()
     assert pc._gauge_refresh_due("gpu_usage") is True
-    # The override wins over the configured scrape period -- that is what makes `=0` a
-    # supported way back to the old per-step rebuild.
+    # The override takes precedence over the configured scrape period.
+    # Zero disables throttling, allowing every call to rebuild the gauge.
     monkeypatch.setenv("CHITU_METRICS_REFRESH_INTERVAL_S", "0")
     assert pc._gauge_refresh_interval_s() == 0.0
     assert pc._gauge_refresh_due("gpu_usage") is True
