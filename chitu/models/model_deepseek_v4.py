@@ -295,11 +295,6 @@ def apply_rotary_emb_v4(
     if rope_dim is None:
         rope_dim = q_for_rotary.shape[-1]
 
-    # The currently packaged GCU Triton compiler cannot compile Chitu's RoPE
-    # kernels.  Keep this override local to DeepSeek-V4 so other model paths
-    # retain their independently validated dispatch policy.
-    rope_impl = "torch" if is_enflame() else "auto"
-
     prepared_freqs_cis = _prepare_freqs_cis_v4(
         freqs_cis,
         device=q.device,
@@ -314,7 +309,6 @@ def apply_rotary_emb_v4(
             rotary_begin=q_for_rotary.shape[-1] - rope_dim,
             rotary_type="interleaved",
             inplace=True,
-            impl=rope_impl,
         )
         return q_out.reshape_as(q)
     else:
@@ -329,7 +323,6 @@ def apply_rotary_emb_v4(
         k_rotary_begin=k_for_rotary.shape[-1] - rope_dim,
         rotary_type="interleaved",
         inplace=True,
-        impl=rope_impl,
     )
     return q_out.reshape_as(q), k_out.reshape_as(k)
 
