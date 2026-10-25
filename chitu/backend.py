@@ -58,10 +58,12 @@ from chitu.models.registry import ModelType, get_model_class
 from chitu.native_layout import init_native_layout
 from chitu.native_layout.base import TensorWithNativeLayout
 from chitu.native_layout.npu import NpuFractalNzTensor, NpuFractalZnTensor
+from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE, blockfp8_scale_dtype
 from chitu.quantization import (
     QuantizationRegistry,
     QuantizedMoeExpertsBase,
     get_quant_from_checkpoint_prefix,
+    get_quant_kwargs_from_checkpoint_prefix,
     utils,
 )
 from chitu.tokenizer import (
@@ -909,19 +911,32 @@ class Backend:
                     checkpoint[k] = checkpoint[k].to(torch.get_default_dtype())
         # Some platforms do not support float8, but we can run them with `infer.raise_lower_bit_float_to=bfloat16`.
         # However, we need to treat float8 items as uint8 first, to avoid the missing ops on these platforms.
+        e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
         for k in checkpoint.keys():
             quant = get_quant_from_checkpoint_prefix(k, args.models.quant_config.rules)
-            if parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
-                if quant == "blockfp8" and checkpoint[k].element_size() == 1:
-                    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
-                    if e8m0_dtype is not None and checkpoint[k].dtype == e8m0_dtype:
-                        # E8M0 tensors are real block scales, not raw FP8-E4M3
-                        # payload. Decode them while they are still on CPU;
-                        # viewing them as uint8 would later turn 2**(e-127)
-                        # into the numeric byte value e.
+            if quant == "blockfp8" and checkpoint[k].element_size() == 1:
+                if e8m0_dtype is not None and checkpoint[k].dtype == e8m0_dtype:
+                    # E8M0 tensors are real block scales, not raw FP8-E4M3
+                    # payload. Decode them while they are still on CPU;
+                    # viewing them as uint8 would later turn 2**(e-127)
+                    # into the numeric byte value e.
+                    quant_kwargs = get_quant_kwargs_from_checkpoint_prefix(
+                        k, args.models.quant_config.rules
+                    )
+                    scale_dtype = blockfp8_scale_dtype(
+                        round_scale_to_pow2=quant_kwargs.get(
+                            "round_scale_to_pow2", False
+                        ),
+                        scale_block_shape=quant_kwargs.get(
+                            "scale_block_shape", DEFAULT_SCALE_BLOCK_SHAPE
+                        ),
+                    )
+                    if scale_dtype == torch.float32:
                         checkpoint[k] = checkpoint[k].to(torch.float32)
                     else:
                         checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
+                elif parse_dtype(args.infer.raise_lower_bit_float_to).itemsize > 1:
+                    checkpoint[k] = checkpoint[k].view(dtype=torch.uint8)
             if (
                 quant in ("blockfp4", "blockfp4_merged")
                 and checkpoint[k].element_size() == 1
