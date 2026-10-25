@@ -239,9 +239,7 @@ def causal_conv1d_update_gcu_b1_inplace_kernel(
     )
     current = tl.load(this_ptr + h, mask=mask, other=0.0)
     weight = tl.load(weight_ptr + state_offsets, mask=mask[:, None], other=0.0)
-    new_state = tl.where(taps[None, :] == 3, current[:, None], shifted).to(
-        weight.dtype
-    )
+    new_state = tl.where(taps[None, :] == 3, current[:, None], shifted).to(weight.dtype)
     result = tl.sum(new_state.to(tl.float32) * weight, axis=1)
     output = result * tl.sigmoid(result)
 

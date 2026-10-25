@@ -149,14 +149,10 @@ def soft_fp8_blockfp8_weight_dequant_torch(
         raise TypeError(f"BlockFP8 weight must use one-byte storage, got {x.dtype}")
 
     raw = x.view(torch.uint8)
-    signed = torch.where(
-        raw >= 128, raw.to(torch.int32) - 256, raw.to(torch.int32)
-    )
+    signed = torch.where(raw >= 128, raw.to(torch.int32) - 256, raw.to(torch.int32))
     # 0x87F00000 represented as signed int32.  Multiplication by 2**120
     # completes the E4M3FN-to-FP32 exponent rebias used by the Triton path.
-    fp8_as_fp32 = (((signed << 20) & -2014314496).view(torch.float32)) * (
-        2.0**120
-    )
+    fp8_as_fp32 = (((signed << 20) & -2014314496).view(torch.float32)) * (2.0**120)
 
     rows, cols = x.shape[-2:]
     out_blk, in_blk = scale_block_shape
@@ -169,9 +165,11 @@ def soft_fp8_blockfp8_weight_dequant_torch(
             f"BlockFP8 scale shape mismatch: expected {expected_scale_shape}, "
             f"got {tuple(s.shape[-2:])}"
         )
-    expanded_scale = s.to(torch.float32).repeat_interleave(
-        out_blk, dim=-2
-    ).repeat_interleave(in_blk, dim=-1)
+    expanded_scale = (
+        s.to(torch.float32)
+        .repeat_interleave(out_blk, dim=-2)
+        .repeat_interleave(in_blk, dim=-1)
+    )
     expanded_scale = expanded_scale[..., :rows, :cols]
     return (fp8_as_fp32 * expanded_scale).to(torch.get_default_dtype())
 

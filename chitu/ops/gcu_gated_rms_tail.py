@@ -87,9 +87,7 @@ def _gated_rms_tail_kernel(
     x_value = tl.load(x + row * x_row_stride + cols, mask=mask, other=0.0)
     inv_value = tl.load(inv_rms + row)
     weight_value = tl.load(weight + cols, mask=mask, other=0.0)
-    gate_value = tl.load(
-        silu_gate + row * gate_row_stride + cols, mask=mask, other=0.0
-    )
+    gate_value = tl.load(silu_gate + row * gate_row_stride + cols, mask=mask, other=0.0)
 
     # Match torch reference semantics exactly:
     #   weight * (x * inv_rms).to(BF16), then * FP32 SiLU, then to BF16.
@@ -172,9 +170,7 @@ def dual_bf16_to_fp32(
     x_fp32 = torch.empty_like(x, dtype=torch.float32)
     gate_fp32 = torch.empty_like(gate, dtype=torch.float32)
     elements = x.numel()
-    _dual_bf16_to_fp32_kernel[
-        (triton.cdiv(elements, _DUAL_WIDEN_BLOCK_SIZE),)
-    ](
+    _dual_bf16_to_fp32_kernel[(triton.cdiv(elements, _DUAL_WIDEN_BLOCK_SIZE),)](
         x,
         gate,
         x_fp32,
@@ -206,9 +202,7 @@ def dual_bf16_to_fp32_square(
     gate_fp32 = torch.empty_like(gate, dtype=torch.float32)
     x_square = torch.empty_like(x, dtype=torch.float32)
     elements = x.numel()
-    _dual_bf16_to_fp32_square_kernel[
-        (triton.cdiv(elements, _DUAL_WIDEN_BLOCK_SIZE),)
-    ](
+    _dual_bf16_to_fp32_square_kernel[(triton.cdiv(elements, _DUAL_WIDEN_BLOCK_SIZE),)](
         x,
         gate,
         x_fp32,

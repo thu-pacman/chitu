@@ -82,18 +82,13 @@ def test_causal_conv1d_update_fp32_weight(impl):
     assert_close(output, output_bf16, atol=5e-2, rtol=5e-2)
     assert_close(new_hidden_state, new_hidden_state_bf16, atol=1e-2, rtol=1e-2)
 
+
 @pytest.mark.skipif(not is_enflame(), reason="Enflame GCU is required")
 def test_causal_conv1d_update_qwen3_next_b1_is_exact_and_inplace():
     torch.manual_seed(1234)
-    this_hidden_state = torch.randn(
-        1, 10240, dtype=torch.bfloat16, device="cuda"
-    )
-    old_hidden_state = torch.randn(
-        1, 10240, 4, dtype=torch.bfloat16, device="cuda"
-    )
-    weight = torch.randn(
-        10240, 1, 4, dtype=torch.bfloat16, device="cuda"
-    )
+    this_hidden_state = torch.randn(1, 10240, dtype=torch.bfloat16, device="cuda")
+    old_hidden_state = torch.randn(1, 10240, 4, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(10240, 1, 4, dtype=torch.bfloat16, device="cuda")
     state_ref_input = old_hidden_state.clone()
     # The production control for this shape is Chitu's generic Triton kernel.
     # Compare byte-for-byte at that exact numerical boundary (the framework
@@ -126,9 +121,7 @@ def test_causal_conv1d_update_qwen3_next_batch_is_exact_and_inplace(
     old_hidden_state = torch.randn(
         batch_size, 10240, 4, dtype=torch.bfloat16, device="cuda"
     )
-    weight = torch.randn(
-        10240, 1, 4, dtype=torch.bfloat16, device="cuda"
-    )
+    weight = torch.randn(10240, 1, 4, dtype=torch.bfloat16, device="cuda")
     state_ref_input = old_hidden_state.clone()
     output_ref, state_ref = causal_conv1d_update(
         this_hidden_state, state_ref_input, weight, impl="triton"
@@ -148,9 +141,7 @@ def test_causal_conv1d_update_qwen3_next_batch_is_exact_and_inplace(
 @pytest.mark.skipif(not is_enflame(), reason="Enflame GCU is required")
 @pytest.mark.parametrize("batch_size", [2, 4, 8])
 def test_qwen3_next_batch_dispatcher_accepts_strided_input(monkeypatch, batch_size):
-    storage = torch.empty(
-        batch_size, 16384, dtype=torch.bfloat16, device="cuda"
-    )
+    storage = torch.empty(batch_size, 16384, dtype=torch.bfloat16, device="cuda")
     this_hidden_state = storage[:, :10240]
     old_hidden_state = torch.empty(
         batch_size, 10240, 4, dtype=torch.bfloat16, device="cuda"
@@ -169,9 +160,7 @@ def test_qwen3_next_batch_dispatcher_accepts_strided_input(monkeypatch, batch_si
     monkeypatch.setattr(
         causal_conv_module, "causal_conv1d_update_gcu_batch_inplace", fake_batch
     )
-    monkeypatch.setattr(
-        causal_conv_module, "causal_conv1d_update", unexpected_generic
-    )
+    monkeypatch.setattr(causal_conv_module, "causal_conv1d_update", unexpected_generic)
 
     output, state = causal_conv_module.causal_conv1d_update_qwen3_next(
         this_hidden_state, old_hidden_state, weight
@@ -192,12 +181,8 @@ def test_qwen3_next_batch_dispatcher_fails_closed_for_cpu_or_disabled(
         old_hidden_state = torch.empty(2, 10240, 4, dtype=torch.bfloat16)
         weight = torch.empty(10240, 1, 4, dtype=torch.bfloat16)
     else:
-        this_hidden_state = torch.empty(
-            2, 10240, dtype=torch.bfloat16, device="cuda"
-        )
-        old_hidden_state = torch.empty(
-            2, 10240, 4, dtype=torch.bfloat16, device="cuda"
-        )
+        this_hidden_state = torch.empty(2, 10240, dtype=torch.bfloat16, device="cuda")
+        old_hidden_state = torch.empty(2, 10240, 4, dtype=torch.bfloat16, device="cuda")
         weight = torch.empty(10240, 1, 4, dtype=torch.bfloat16, device="cuda")
     calls = []
 
@@ -208,9 +193,7 @@ def test_qwen3_next_batch_dispatcher_fails_closed_for_cpu_or_disabled(
         calls.append((this.device.type, state.device.type, conv_weight.device.type))
         return this, state
 
-    monkeypatch.setattr(
-        causal_conv_module, "_GCU_QWEN3_NEXT_CONV_BATCH", batch_enabled
-    )
+    monkeypatch.setattr(causal_conv_module, "_GCU_QWEN3_NEXT_CONV_BATCH", batch_enabled)
     monkeypatch.setattr(
         causal_conv_module,
         "causal_conv1d_update_gcu_batch_inplace",
@@ -234,18 +217,14 @@ def test_qwen3_next_batch_dispatcher_is_exact_across_state_sequence(
     monkeypatch, batch_size, sequence_seed
 ):
     torch.manual_seed(sequence_seed + batch_size)
-    state = torch.randn(
-        batch_size, 10240, 4, dtype=torch.bfloat16, device="cuda"
-    )
+    state = torch.randn(batch_size, 10240, 4, dtype=torch.bfloat16, device="cuda")
     state_ref = state.clone()
     weight = torch.randn(10240, 1, 4, dtype=torch.bfloat16, device="cuda")
     state_ptr = state.data_ptr()
     monkeypatch.setattr(causal_conv_module, "_GCU_QWEN3_NEXT_CONV_BATCH", True)
 
     for step in range(100):
-        storage = torch.randn(
-            batch_size, 16384, dtype=torch.bfloat16, device="cuda"
-        )
+        storage = torch.randn(batch_size, 16384, dtype=torch.bfloat16, device="cuda")
         this_hidden_state = storage[:, :10240]
         output_ref, state_ref = causal_conv1d_update(
             this_hidden_state, state_ref, weight, impl="triton"
@@ -260,12 +239,11 @@ def test_qwen3_next_batch_dispatcher_is_exact_across_state_sequence(
         output_max_abs = (output.float() - output_ref.float()).abs().max().item()
         state_max_abs = (state.float() - state_ref.float()).abs().max().item()
         assert output_bad == 0, (
-            f"step={step} output_bad={output_bad} "
-            f"output_max_abs={output_max_abs}"
+            f"step={step} output_bad={output_bad} " f"output_max_abs={output_max_abs}"
         )
-        assert state_bad == 0, (
-            f"step={step} state_bad={state_bad} state_max_abs={state_max_abs}"
-        )
+        assert (
+            state_bad == 0
+        ), f"step={step} state_bad={state_bad} state_max_abs={state_max_abs}"
 
 
 @pytest.mark.parametrize(

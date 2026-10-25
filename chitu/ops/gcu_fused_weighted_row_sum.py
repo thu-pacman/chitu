@@ -27,7 +27,9 @@ def _get_launch():
     global _launch, _library_path
     configured_path = os.environ.get("CHITU_GCU_FUSED_WEIGHTED_ROW_SUM_LIB")
     if not configured_path:
-        raise RuntimeError("CHITU_GCU_FUSED_WEIGHTED_ROW_SUM_LIB must name the GCU library")
+        raise RuntimeError(
+            "CHITU_GCU_FUSED_WEIGHTED_ROW_SUM_LIB must name the GCU library"
+        )
     path = os.path.realpath(configured_path)
     if _launch is not None:
         if _library_path != path:
@@ -91,7 +93,9 @@ def fused_weighted_row_sum(state: torch.Tensor, weight: torch.Tensor) -> torch.T
 
     output = torch.empty((batch, 48, 128), dtype=torch.float32, device=state.device)
     if not _aligned_rows(output, 512):
-        raise RuntimeError("GCU allocator returned an unaligned weighted-row-sum output")
+        raise RuntimeError(
+            "GCU allocator returned an unaligned weighted-row-sum output"
+        )
     launch = _get_launch()
     with torch.gcu.device(state.device):
         stream = torch.gcu.current_stream(state.device)

@@ -187,9 +187,7 @@ if _HAS_TRITON:
         )
 
 
-def _fused_qknorm_partial_rope(
-    q, k, q_weight, k_weight, cos, sin, eps, rotary_dim
-):
+def _fused_qknorm_partial_rope(q, k, q_weight, k_weight, cos, sin, eps, rotary_dim):
     n_tokens, q_heads, head_dim = q.shape
     k_heads = k.shape[1]
     q_out = torch.empty_like(q)
