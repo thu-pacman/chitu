@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib
 import os
 import sys
 
@@ -9,15 +10,17 @@ import sys
 # any other chitu submodule import: device_type.get_device_name() caches its result,
 # and the stock `triton` package resolves its active driver at import time. The
 # torch_gcu shim maps ".cuda()"->".gcu()" and the "nccl" process-group backend->"eccl";
-# "import triton_gcu.triton" activates the GCU backend for the stock `triton` package.
+# importing triton_gcu.triton activates the GCU backend for the stock `triton` package.
 try:
-    from torch_gcu import transfer_to_gcu  # noqa: F401
+    importlib.import_module("torch_gcu.transfer_to_gcu")
 
     try:
-        import triton_gcu.triton  # noqa: F401
+        importlib.import_module("triton_gcu.triton")
     except Exception:
+        # triton_gcu is optional; without it the stock Triton backend is used.
         pass
 except Exception:
+    # torch_gcu is optional; without it this setup is a no-op.
     pass
 
 # Package-level logging setup is for normal runtime imports. Boot-time and docs
