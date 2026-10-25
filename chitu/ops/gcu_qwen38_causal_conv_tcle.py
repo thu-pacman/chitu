@@ -26,7 +26,9 @@ def _get_launch():
     global _launch, _library_path
     configured_path = os.environ.get("CHITU_GCU_QWEN3_NEXT_CAUSAL_CONV_TCLE_LIB")
     if not configured_path:
-        raise RuntimeError("CHITU_GCU_QWEN3_NEXT_CAUSAL_CONV_TCLE_LIB must name the TCLE library")
+        raise RuntimeError(
+            "CHITU_GCU_QWEN3_NEXT_CAUSAL_CONV_TCLE_LIB must name the TCLE library"
+        )
     path = os.path.realpath(configured_path)
     if _launch is not None:
         if _library_path != path:
@@ -49,10 +51,11 @@ def _get_launch():
                 f"TCLE conv ABI mismatch: 0x{actual_abi:016x} != 0x{_ABI:016x}"
             )
         launch = library.launch_qwen38_causal_conv_update
-        launch.argtypes = (
-            [ctypes.c_void_p] * 4
-            + [ctypes.c_int, ctypes.c_longlong, ctypes.c_void_p]
-        )
+        launch.argtypes = [ctypes.c_void_p] * 4 + [
+            ctypes.c_int,
+            ctypes.c_longlong,
+            ctypes.c_void_p,
+        ]
         launch.restype = ctypes.c_int
         launch._chitu_library = library
         launch._chitu_path = path

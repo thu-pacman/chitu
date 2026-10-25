@@ -29,7 +29,9 @@ def _get_launch():
     global _launch, _library_path
     configured_path = os.environ.get("CHITU_GCU_RAW_BETA_DELTA_BATCH_LIB")
     if not configured_path:
-        raise RuntimeError("CHITU_GCU_RAW_BETA_DELTA_BATCH_LIB must name the GCU library")
+        raise RuntimeError(
+            "CHITU_GCU_RAW_BETA_DELTA_BATCH_LIB must name the GCU library"
+        )
     path = os.path.realpath(configured_path)
     if _launch is not None:
         if _library_path != path:

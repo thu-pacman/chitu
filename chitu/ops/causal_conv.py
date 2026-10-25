@@ -29,15 +29,11 @@ if has_boltops_causal_conv:
     from chitu.ops.triton_ops.causal_conv import causal_conv1d_state_snapshots_triton
 
 
-_GCU_QWEN3_NEXT_CONV_B1 = (
-    os.environ.get("CHITU_GCU_QWEN3_NEXT_CONV_B1", "1") != "0"
-)
+_GCU_QWEN3_NEXT_CONV_B1 = os.environ.get("CHITU_GCU_QWEN3_NEXT_CONV_B1", "1") != "0"
 _GCU_QWEN3_NEXT_CONV_BATCH = (
     os.environ.get("CHITU_GCU_QWEN3_NEXT_CONV_BATCH", "0") == "1"
 )
-_GCU_QWEN3_NEXT_CONV_TCLE = (
-    os.environ.get("CHITU_GCU_QWEN3_NEXT_CONV_TCLE", "0") == "1"
-)
+_GCU_QWEN3_NEXT_CONV_TCLE = os.environ.get("CHITU_GCU_QWEN3_NEXT_CONV_TCLE", "0") == "1"
 _GCU_QWEN3_NEXT_CONV_G_TCLE = (
     os.environ.get("CHITU_GCU_QWEN3_NEXT_CONV_G_TCLE", "0") == "1"
 )
