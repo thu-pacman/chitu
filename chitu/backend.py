@@ -624,8 +624,8 @@ class Backend:
             # `PagedKVCache`); the ragged `skew` (dense) layout is not supported.
             if Backend.cache_type != "paged":
                 raise NotImplementedError(
-                    "`infer.attn_type=gcu` is only compatible with "
-                    "`infer.cache_type=paged` on Enflame GCU; set `infer.cache_type=paged`."
+                    "Enflame GCU requires `infer.cache_type=paged`; "
+                    f"got `{Backend.cache_type}`."
                 )
             return attn_backend_type()
         else:
