@@ -3590,16 +3590,5 @@ class TransformerDeepSeekV4(Transformer):
                 elif tensor_name == "weight":
                     if quant == "mxfp4" and value.dtype == torch.int8:
                         value = value.view(torch.uint8)
-            # DeepSeek-V4 stores BlockFP8 scales as E8M0 bytes.  Chitu's
-            # Blockfp8Linear parameter contract is a real-valued FP32 scale;
-            # decode it before the generic lower-bit loader views one-byte
-            # tensors as raw uint8 storage.
-            if name.endswith(".scale") and FE8M0_DTYPE is not None:
-                prefix, _, _ = name.rpartition(".")
-                if (
-                    get_quant_from_checkpoint_prefix(prefix) == "blockfp8"
-                    and value.dtype == FE8M0_DTYPE
-                ):
-                    value = value.to(torch.float32)
             normalized[name] = value
         return normalized
