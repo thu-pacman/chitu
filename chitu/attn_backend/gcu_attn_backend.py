@@ -36,9 +36,9 @@ _GCU_DECODE_FLASH = os.environ.get("CHITU_GCU_DECODE_FLASH") == "1"
 # Flash-decode page block size. 64 measured ~1.7x faster than 16 at long context (fewer, larger
 # blocks -> better memory coalescing).
 _GCU_FAVARLEN_BLOCK = int(os.environ.get("CHITU_GCU_FAVARLEN_BLOCK", "64"))
-# Cache the arange-derived fa-varlen metadata (block table / cu_seqlens_q) once instead of
-# rebuilding it in every layer/step; the values depend only on the static cache geometry, so
-# under CUDA Graph this removes 2 replay nodes per decoder layer.
+# Cache the arange-derived fa-varlen metadata (block table and cu_seqlens_q) once
+# instead of rebuilding it in every layer/step; the values depend only on the static
+# cache geometry, so under CUDA Graph this removes 2 replay nodes per decoder layer.
 _GCU_STATIC_FAVARLEN_METADATA = (
     os.environ.get("CHITU_GCU_STATIC_FAVARLEN_METADATA", "1") != "0"
 )
@@ -359,6 +359,7 @@ class GcuAttnBackend(RefAttnBackend):
             seqused_k=seqused_k,
             softmax_scale=softmax_scale,
             max_seqlen_k=max_seqlen,
+            cu_seqlens_q=cu_seqlens_q,
         )
 
     def _fa_varlen_decode(
@@ -371,12 +372,14 @@ class GcuAttnBackend(RefAttnBackend):
         seqused_k,
         softmax_scale,
         max_seqlen_k,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
     ):
         """Common vendor flash-decode call over a paged KV view (either the reshaped dense
         cache or a real PagedKVCache). One query token per sequence."""
         B = block_table.shape[0]
         dev = kc.device
-        cu_seqlens_q = torch.arange(0, B + 1, device=dev, dtype=torch.int32)
+        if cu_seqlens_q is None:
+            cu_seqlens_q = torch.arange(0, B + 1, device=dev, dtype=torch.int32)
         return _fa_varlen(
             q,
             kc,
