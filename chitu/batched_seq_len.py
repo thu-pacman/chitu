@@ -5,19 +5,11 @@
 from typing import Optional
 import itertools
 import functools
-import os
 import torch
 
 from chitu.static_tensor import StaticTensor
 from chitu.cuda_graph import cuda_graph_safe_cached_property
 from chitu.utils import invalidate_cached_property, create_tensor, resolved_device
-
-# Classic decode (B=1-style decoding) has constant delta sequence IDs equal to
-# arange(batch_size). Building them once per step avoids re-emitting an arange
-# per access (which, under CUDA Graph, becomes a per-layer replay node).
-_CLASSIC_DECODE_SEQ_IDS_CACHE = (
-    os.environ.get("CHITU_CLASSIC_DECODE_SEQ_IDS_CACHE", "1") != "0"
-)
 
 
 class BatchedSeqLen:
@@ -683,12 +675,10 @@ class BatchedSeqLenDelta:
     @property
     def delta_seq_ids_tensor_device(self):
         if self.is_classic_decoding:
-            if not _CLASSIC_DECODE_SEQ_IDS_CACHE:
-                return torch.arange(
-                    self.batch_size, device=self.device, dtype=torch.int32
-                )
-            # Values depend only on (device, batch_size), which are fixed for this
-            # delta's lifetime, so materialize once and reuse across all layers.
+            # Classic decode (B=1-style decoding) has constant delta sequence IDs
+            # equal to arange(batch_size). Values depend only on (device,
+            # batch_size), which are fixed for this delta's lifetime, so
+            # materialize once and reuse across all layers.
             cache = self.__dict__.get("_classic_decode_seq_ids_cache")
             if cache is None or cache[0] != self.batch_size:
                 cache = (

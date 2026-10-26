@@ -4,7 +4,6 @@
 
 from typing import Optional
 from typing_extensions import override
-import os
 import math
 from logging import getLogger
 
@@ -26,21 +25,6 @@ logger = getLogger(__name__)
 # upstream PagedKVCache is itself the single KV store and its block_table / page ids feed the
 # flash-decode kernel directly.
 
-# For classic decoding the scheduler already holds the post-append length (new_len == old_len + 1),
-# so pass it straight to the fa-varlen helper instead of adding 1 in every layer.
-_GCU_SHARED_POST_APPEND_LENGTH = (
-    os.environ.get("CHITU_GCU_SHARED_POST_APPEND_LENGTH", "1") != "0"
-)
-# The old no-dense sidecar / paged_attention_v1 paths are OBSOLETE on the new PagedKVCache API:
-# refuse to re-enable them via env instead of crashing on half-migrated accessor attrs.
-if (
-    os.environ.get("CHITU_GCU_PAGED_NO_DENSE") == "1"
-    or os.environ.get("CHITU_GCU_DECODE_PAGED") == "1"
-):
-    logger.warning(
-        "GCU: CHITU_GCU_PAGED_NO_DENSE / CHITU_GCU_DECODE_PAGED are obsolete on the new "
-        "PagedKVCache API; use infer.cache_type=paged. Ignoring the flags."
-    )
 try:
     from flash_attn.vllm_flash_attn import flash_attn_varlen_func as _fa_varlen
 except Exception:
@@ -75,7 +59,6 @@ class GcuAttnBackend(RefAttnBackend):
         window_unsupported = window_size is not None and tuple(window_size) != (-1, -1)
         unsupported = (
             not has_flash_attn
-            or os.environ.get("CHITU_GCU_NO_FLASH_PREFILL")
             or sinks is not None
             or topk_indices is not None
             or window_unsupported
@@ -230,10 +213,9 @@ class GcuAttnBackend(RefAttnBackend):
                 get_offs_in_page=kv_cache.get_offs_in_page,
                 use_i64_offsets=kv_cache.use_i64_offsets,
             )
-        if _GCU_SHARED_POST_APPEND_LENGTH and seq_len_delta.is_classic_decoding:
-            seqused_k = seq_len_delta.new.lens_tensor_device.to(torch.int32)
-        else:
-            seqused_k = seq_len_delta.old.lens_tensor_device.to(torch.int32) + 1
+        # Classic decoding already holds the post-append length
+        # (new_len == old_len + 1), so pass it straight to the fa-varlen helper.
+        seqused_k = seq_len_delta.new.lens_tensor_device.to(torch.int32)
         from chitu.global_vars import get_global_args
 
         if not getattr(GcuAttnBackend, "_paged_decode_logged", False):

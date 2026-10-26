@@ -11,19 +11,16 @@ picks ``"gcu"`` on Enflame, so every ``linear_blockfp8`` caller (dense rows,
 MoE experts, absorb-gemm) routes through these kernels unchanged.
 """
 
-import os
-
 import torch
 
 from chitu.blockfp8_shape import DEFAULT_SCALE_BLOCK_SHAPE
 from chitu.device_type import is_enflame
 from chitu.import_utils import ensure_gcu_c_ops
-from chitu.lazy import eval_lazy, single_dispatch_lazy_tensor
+from chitu.lazy import single_dispatch_lazy_tensor
 from chitu.native_layout import DeepGemmScale
 
 from chitu.ops.quant.blockfp8.convert import blockfp8_act_quant
 from chitu.ops.quant.blockfp8.matmul import blockfp8_gemm
-from chitu.ops.attn_gate import attn_gate_blockfp8_quant, attn_output_gate
 
 
 @blockfp8_act_quant.register("gcu", available=is_enflame())
@@ -50,47 +47,6 @@ def _gcu_blockfp8_act_quant(
     )
     torch.ops._C.dynamic_per_token_group_fp8_quant(x_q, x_s, x2, block_size)
     return x_q.view(x.shape), x_s
-
-
-@_gcu_blockfp8_act_quant.register
-def _gcu_attn_gate_blockfp8_act_quant(
-    x: attn_output_gate.lazy_tensor_type(),
-    *,
-    scale_block_shape: list = DEFAULT_SCALE_BLOCK_SHAPE,
-    round_scale_to_pow2: bool = False,
-    eps: float = 1e-4,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fuse attention output-gate with the block-FP8 activation quantization.
-
-    Mirrors the upstream ``silu_and_mul`` fusion (see
-    ``chitu/ops/triton_ops/quant/blockfp8/convert.py``): when the block-FP8
-    linear consumes a ``attn_output_gate`` LazyTensor, produce the FP8 activation
-    + per-token-group scale directly from the gate operands, skipping the BF16
-    ``output * sigmoid(gate)`` materialization. The fused kernel rounds slightly
-    differently from the reference, so this path is opt-in via
-    ``CHITU_GCU_FUSED_OPS=1`` and otherwise transparently falls back.
-    """
-    output = x.kwargs["output"]
-    gate = x.kwargs["gate"]
-    block_size = scale_block_shape[1]
-    supported = (
-        os.environ.get("CHITU_GCU_FUSED_OPS") == "1"
-        and output.shape == gate.shape
-        and output.dtype == torch.bfloat16
-        and gate.dtype == torch.bfloat16
-        and output.is_contiguous()
-        and gate.is_contiguous()
-        and output.shape[-1] % block_size == 0
-    )
-    if not supported:
-        return _gcu_blockfp8_act_quant(
-            eval_lazy(x),
-            scale_block_shape=scale_block_shape,
-            round_scale_to_pow2=round_scale_to_pow2,
-            eps=eps,
-        )
-    quantized, scales = attn_gate_blockfp8_quant(output, gate, block_size)
-    return quantized.view(x.shape), scales
 
 
 @blockfp8_gemm.register("gcu", available=is_enflame())
