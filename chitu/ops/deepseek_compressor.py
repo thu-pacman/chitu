@@ -9,6 +9,7 @@ from typing import Optional
 
 import torch
 
+from chitu.batched_freqs_cis import BatchedFreqsCis
 from chitu.device_type import is_enflame
 from chitu.ops.deepseek_v4_decode_plan import (
     DeepSeekV4DecodeCompressPlan,
@@ -946,7 +947,7 @@ def _is_flashmla_packed_cache(kv_cache: Optional[torch.Tensor]) -> bool:
 def try_fused_decode_postprocess_write_cache(
     kv_compress: torch.Tensor,
     norm_weight: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
     kv_cache: Optional[torch.Tensor],
     block_table: Optional[torch.Tensor],
     start_positions: torch.Tensor,
@@ -969,7 +970,7 @@ def try_fused_decode_postprocess_write_cache(
 def _auto_try_fused_decode_postprocess_write_cache(
     kv_compress: torch.Tensor,
     norm_weight: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
     kv_cache: Optional[torch.Tensor],
     block_table: Optional[torch.Tensor],
     start_positions: torch.Tensor,
@@ -1028,7 +1029,7 @@ def _auto_try_fused_decode_postprocess_write_cache(
 def _try_fused_decode_postprocess_write_cache_skip(
     kv_compress: torch.Tensor,
     norm_weight: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
     kv_cache: Optional[torch.Tensor],
     block_table: Optional[torch.Tensor],
     start_positions: torch.Tensor,
@@ -1050,7 +1051,7 @@ def _try_fused_decode_postprocess_write_cache_skip(
 def _try_fused_decode_postprocess_write_cache_flashmla_impl(
     kv_compress: torch.Tensor,
     norm_weight: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
     kv_cache: Optional[torch.Tensor],
     block_table: Optional[torch.Tensor],
     start_positions: torch.Tensor,
@@ -1085,7 +1086,7 @@ def _call_postprocess_kv_cache_writer(
     writer,
     kv_compress: torch.Tensor,
     norm_weight: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
     kv_cache: Optional[torch.Tensor],
     block_table: Optional[torch.Tensor],
     start_positions: torch.Tensor,
@@ -1120,7 +1121,7 @@ def _call_postprocess_kv_cache_writer(
 def _try_fused_decode_postprocess_write_cache_kv_impl(
     kv_compress: torch.Tensor,
     norm_weight: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
     kv_cache: Optional[torch.Tensor],
     block_table: Optional[torch.Tensor],
     start_positions: torch.Tensor,
@@ -1159,7 +1160,7 @@ def _try_fused_decode_postprocess_write_cache_kv_impl(
 def _try_fused_decode_postprocess_write_cache_kv_hadamard_impl(
     kv_compress: torch.Tensor,
     norm_weight: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
     kv_cache: Optional[torch.Tensor],
     block_table: Optional[torch.Tensor],
     start_positions: torch.Tensor,

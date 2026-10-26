@@ -26,7 +26,6 @@ from chitu.kv_cache import (
     PagedKVCacheAccessor,
 )
 from chitu.global_vars import get_global_args
-from chitu.device_type import is_enflame
 from chitu.models.model import (
     Attention,
     MoeGate,
@@ -194,7 +193,7 @@ def precompute_freqs_cis_deepseek_v4(
     beta_fast: int,
     beta_slow: int,
     device: torch.device | str | None = None,
-) -> torch.Tensor:
+) -> BatchedFreqsCis:
     def find_correction_dim(num_rotations, dim, base, max_seq_len):
         return (
             dim
@@ -227,12 +226,10 @@ def precompute_freqs_cis_deepseek_v4(
 
     t = torch.arange(seqlen, device=device)
     freqs = torch.outer(t, freqs)
-    if is_enflame():
-        # GCU does not support indexing ComplexFloat tensors.  Keep the same
-        # information as an ordinary [..., 2] cos/sin tensor so every dynamic
-        # position gather in attention, indexer and compressor stays native.
-        return torch.stack((torch.cos(freqs), torch.sin(freqs)), dim=-1)
-    return torch.polar(torch.ones_like(freqs), freqs)
+    return BatchedFreqsCis(
+        torch.cos(freqs).contiguous(),
+        torch.sin(freqs).contiguous(),
+    )
 
 
 def _flatten_rope_input_v4(x: torch.Tensor) -> tuple[torch.Tensor, int, int]:
@@ -246,7 +243,7 @@ def _flatten_rope_input_v4(x: torch.Tensor) -> tuple[torch.Tensor, int, int]:
 
 
 def _prepare_freqs_cis_v4(
-    freqs_cis: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
     *,
     device: torch.device,
     bsz: int,
@@ -258,18 +255,8 @@ def _prepare_freqs_cis_v4(
         if get_global_args().use_float32_rotary
         else torch.get_default_dtype()
     )
-    freqs_cis = freqs_cis.to(device=device)
-    if freqs_cis.is_complex():
-        cos = freqs_cis.real.to(rotary_dtype)
-        sin = freqs_cis.imag.to(rotary_dtype)
-    elif freqs_cis.shape[-1] == 2:
-        cos = freqs_cis[..., 0].to(rotary_dtype)
-        sin = freqs_cis[..., 1].to(rotary_dtype)
-    else:
-        raise ValueError(
-            "DeepSeek-V4 RoPE frequencies must be complex or [..., 2] cos/sin, "
-            f"got shape {tuple(freqs_cis.shape)} and dtype {freqs_cis.dtype}"
-        )
+    cos = freqs_cis.cos.to(device=device, dtype=rotary_dtype)
+    sin = freqs_cis.sin.to(device=device, dtype=rotary_dtype)
     if inverse:
         sin = -sin
 
@@ -285,7 +272,7 @@ def _prepare_freqs_cis_v4(
 
 def apply_rotary_emb_v4(
     q: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: BatchedFreqsCis,
     *,
     rope_dim: Optional[int] = None,
     k: Optional[torch.Tensor] = None,
@@ -648,7 +635,7 @@ class CompressorDeepSeekV4(nn.Module):
         self.kv_block_table: Optional[torch.Tensor] = None
         self.register_buffer("kv_state", torch.empty(0), persistent=False)
         self.register_buffer("score_state", torch.empty(0), persistent=False)
-        self.freqs_cis: Optional[torch.Tensor] = None
+        self.freqs_cis: Optional[BatchedFreqsCis] = None
 
     def reset_runtime_buffers(self, device: torch.device | str):
         self.kv_cache = None
@@ -1239,7 +1226,7 @@ class IndexerDeepSeekV4(nn.Module):
         self.register_buffer("kv_cache", torch.empty(0), persistent=False)
         self.kv_cache_is_paged = False
         self.kv_block_table: Optional[torch.Tensor] = None
-        self.freqs_cis: Optional[torch.Tensor] = None
+        self.freqs_cis: Optional[BatchedFreqsCis] = None
 
     def reset_runtime_buffers(self, device: torch.device | str):
         self.kv_cache = torch.empty(0, dtype=torch.bfloat16, device=device)
@@ -1712,7 +1699,7 @@ class AttentionDeepSeekV4(Attention):
             if self.compress_ratio
             else (0, args.rope_theta)
         )
-        self.register_buffer("freqs_cis", torch.empty(0), persistent=False)
+        self.freqs_cis: Optional[BatchedFreqsCis] = None
         self.kv_cache_is_paged = False
         self.kv_block_table: Optional[torch.Tensor] = None
         self.slidingwindow_cache_accessor: Optional[Any] = None
