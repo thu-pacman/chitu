@@ -95,10 +95,42 @@ class InvalidToolCallArgumentsError(ValueError):
     Parsers mixing in ``JsonMessageToolParserMixin`` use chat templates that
     iterate ``tool_calls[].function.arguments`` as a *mapping* (``arguments|items``),
     so the OpenAI-format JSON *string* must be parsed into an object before
-    templating. A tool call whose ``arguments`` is not a JSON object cannot
-    be rendered and is rejected as an invalid request (HTTP 400) instead of
-    a server error (HTTP 500).
+    templating. A tool call whose ``function`` is not an object cannot be
+    rendered and is rejected as an invalid request (HTTP 400) instead of a
+    server error (HTTP 500). Unparsable ``arguments`` are replayed instead of
+    rejected, see ``_arguments_as_mapping``.
     """
+
+
+# Key under which tool-call arguments that are not a JSON object are replayed.
+# Chat templates iterate ``arguments`` as a mapping, so the original text has
+# to travel as a value. ``_raw`` is the same sentinel the response side uses
+# when the arguments cannot be decoded (see
+# ``anthropic_api.tool_calls_to_anthropic_blocks``).
+_RAW_ARGUMENTS_KEY = "_raw"
+
+
+def _arguments_as_mapping(arguments: Any) -> dict:
+    """Turn OpenAI-style tool-call arguments into something a template can iterate.
+
+    A JSON object passes through unchanged, and a call without arguments
+    becomes ``{}``. Anything else is carried as ``{"_raw": <original text>}``.
+    The history may contain a tool call that the server itself truncated at
+    ``max_tokens`` and the client replayed verbatim, so rejecting the request
+    would make the rest of the conversation unusable; dropping the text would
+    hide what the model produced.
+    """
+    if isinstance(arguments, dict):
+        return arguments
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments, ensure_ascii=False)
+    if not arguments.strip():
+        return {}
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return {_RAW_ARGUMENTS_KEY: arguments}
+    return parsed if isinstance(parsed, dict) else {_RAW_ARGUMENTS_KEY: arguments}
 
 
 def adjust_message_for_tool_calls(message: list):
@@ -116,32 +148,7 @@ def adjust_message_for_tool_calls(message: list):
                     f"Invalid tool call at messages[{msg_idx}].tool_calls[{call_idx}]: "
                     f"missing or malformed 'function' object."
                 )
-            where = (
-                f"messages[{msg_idx}].tool_calls[{call_idx}] "
-                f"(function={function.get('name')!r}, id={tool.get('id')!r})"
-            )
-            arguments = function.get("arguments", "")
-            if isinstance(arguments, dict):
-                # Already a JSON object (some clients pre-parse it); keep it.
-                continue
-            if not isinstance(arguments, str):
-                raise InvalidToolCallArgumentsError(
-                    f"Invalid tool call arguments at {where}: expected a JSON object "
-                    f"encoded as a string, got {type(arguments).__name__}."
-                )
-            try:
-                parsed = json.loads(arguments)
-            except json.JSONDecodeError as e:
-                raise InvalidToolCallArgumentsError(
-                    f"Invalid tool call arguments at {where}: arguments must be a "
-                    f"JSON object encoded as a string, but failed to parse ({e})."
-                ) from e
-            if not isinstance(parsed, dict):
-                raise InvalidToolCallArgumentsError(
-                    f"Invalid tool call arguments at {where}: arguments must be a "
-                    f"JSON object, got {type(parsed).__name__}."
-                )
-            function["arguments"] = parsed
+            function["arguments"] = _arguments_as_mapping(function.get("arguments", ""))
     return message
 
 
