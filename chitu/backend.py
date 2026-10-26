@@ -36,7 +36,6 @@ from chitu.attn_backend import (
     HybridAttnBackend,
     DLLMAttnBackend,
     HunyuanAttnBackend,
-    GcuAttnBackend,
 )
 from chitu.kv_cache.registry import (
     should_use_hopper_mixed_backend,
@@ -547,7 +546,9 @@ class Backend:
             if is_ascend():
                 return NpuAttnBackend
             elif is_enflame():
-                return GcuAttnBackend
+                # GCU is a paged-only mode of FlashAttnBackend (see
+                # `_init_attention_backend`); there is no separate class.
+                return FlashAttnBackend
             elif args.infer.op_impl == "cpu":
                 return RefAttnBackend
             elif should_use_hopper_mixed_backend(args):
@@ -579,7 +580,9 @@ class Backend:
         elif args.infer.attn_type == "ref":
             return RefAttnBackend
         elif args.infer.attn_type == "gcu":
-            return GcuAttnBackend
+            # Backward-compatible alias: GCU is now an enflame mode of
+            # FlashAttnBackend.
+            return FlashAttnBackend
         elif args.infer.attn_type == "hopper_mixed":
             return HopperMixedBackend
         elif args.infer.attn_type == "hunyuan_attn":
@@ -619,7 +622,7 @@ class Backend:
                 n_heads=args.n_heads,
                 n_kv_heads=getattr(args, "n_kv_heads", None),
             )
-        if attn_backend_type is GcuAttnBackend:
+        if is_enflame() and attn_backend_type is FlashAttnBackend:
             # Enflame GCU uses the paged KV store (vendor flash-decode over
             # `PagedKVCache`); the ragged `skew` (dense) layout is not supported.
             if Backend.cache_type != "paged":
@@ -627,9 +630,7 @@ class Backend:
                     "Enflame GCU requires `infer.cache_type=paged`; "
                     f"got `{Backend.cache_type}`."
                 )
-            return attn_backend_type()
-        else:
-            return attn_backend_type()
+        return attn_backend_type()
 
     @staticmethod
     def _move_one_module_to_device(
