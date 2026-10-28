@@ -2,35 +2,19 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from __future__ import annotations
-
 from abc import ABC, abstractmethod
 
-from chitu.utils import try_import_opt_dep
-
-xgrammar, has_xgrammar = try_import_opt_dep("xgrammar", "grammar")
-if has_xgrammar:
-    from xgrammar.structural_tag import (
-        Format,
-        JSONSchemaFormat,
-        TagsWithSeparatorFormat,
-        TagFormat,
-        RegexFormat,
-        SequenceFormat,
-        ConstStringFormat,
-    )
-else:
-    (
-        Format,
-        JSONSchemaFormat,
-        TagsWithSeparatorFormat,
-        TagFormat,
-        RegexFormat,
-        SequenceFormat,
-        ConstStringFormat,
-    ) = (None,) * 7
-
 from .argument import AbstractArgumentGrammar
+
+from xgrammar.structural_tag import (
+    Format,
+    JSONSchemaFormat,
+    TagsWithSeparatorFormat,
+    TagFormat,
+    RegexFormat,
+    SequenceFormat,
+    ConstStringFormat,
+)
 
 
 class AbstractArgumentsGrammar(ABC):

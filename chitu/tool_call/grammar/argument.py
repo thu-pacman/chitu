@@ -2,17 +2,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from __future__ import annotations
-
 from typing import Callable
 
-from chitu.utils import try_import_opt_dep
-
-xgrammar, has_xgrammar = try_import_opt_dep("xgrammar", "grammar")
-if has_xgrammar:
-    from xgrammar.structural_tag import TagFormat
-else:
-    TagFormat = None
+from xgrammar.structural_tag import TagFormat
 
 from chitu.tool_call.grammar.arg_value import AbstractArgValueGrammar
 

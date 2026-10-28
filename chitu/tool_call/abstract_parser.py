@@ -2,15 +2,11 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from __future__ import annotations
-
+from xgrammar import Grammar
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, AsyncIterable
+from typing import AsyncIterable
 
 from chitu.tool_call.type_def import ToolCallParams, ChoiceToolCall, ChoiceDelta
-
-if TYPE_CHECKING:
-    from xgrammar import Grammar
 
 
 class AbstractToolParser(ABC):

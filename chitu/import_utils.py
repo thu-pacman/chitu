@@ -63,7 +63,6 @@ def try_import_opt_dep(pkg_name: str, opt_dep_name: str) -> tuple[Any, bool]:
     # Keep this sync with get_requires.py
     opt_deps = {
         "quant",
-        "grammar",
         "muxi_layout_kernels",
         "muxi_w8a8_kernels",
         "ascend_kernels",
@@ -144,9 +143,6 @@ def try_import_and_setup_torch_npu():
     return torch_npu, has_torch_npu
 
 
-_torch_gcu_has_set_up = False
-
-
 def try_import_and_setup_torch_gcu():
     """
     Try importing `torch_gcu`. If successful, install its torch and Triton shims.
@@ -156,11 +152,9 @@ def try_import_and_setup_torch_gcu():
     driver at import time.
     """
 
-    global _torch_gcu_has_set_up
-
     torch_gcu, has_torch_gcu = try_import_platform_dep("torch_gcu")
 
-    if has_torch_gcu and not _torch_gcu_has_set_up:
+    if has_torch_gcu:
         try:
             # The shim maps ".cuda()" to ".gcu()" and the "nccl" process-group
             # backend to "eccl".
@@ -176,8 +170,6 @@ def try_import_and_setup_torch_gcu():
         except Exception:
             # triton_gcu is optional; without it the stock Triton backend is used.
             pass
-
-        _torch_gcu_has_set_up = True
 
     return torch_gcu, has_torch_gcu
 

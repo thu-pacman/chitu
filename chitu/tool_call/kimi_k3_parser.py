@@ -32,29 +32,14 @@ the same expectation for declared types, ignoring it for
 unknown/union/missing declared types.
 """
 
-from __future__ import annotations
-
-from chitu.utils import try_import_opt_dep
-
-xgrammar, has_xgrammar = try_import_opt_dep("xgrammar", "grammar")
-if has_xgrammar:
-    from xgrammar.structural_tag import (
-        AnyTextFormat,
-        ConstStringFormat,
-        Format,
-        RegexFormat,
-        SequenceFormat,
-        TagFormat,
-    )
-else:
-    (
-        AnyTextFormat,
-        ConstStringFormat,
-        Format,
-        RegexFormat,
-        SequenceFormat,
-        TagFormat,
-    ) = (None,) * 6
+from xgrammar.structural_tag import (
+    AnyTextFormat,
+    ConstStringFormat,
+    Format,
+    RegexFormat,
+    SequenceFormat,
+    TagFormat,
+)
 
 from .utils import register
 from .abstract_parser import AbstractToolParser

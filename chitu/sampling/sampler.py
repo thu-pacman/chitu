@@ -6,6 +6,7 @@ import logging
 from typing import Optional
 from dataclasses import dataclass, field, replace
 import torch
+import xgrammar
 
 from chitu.global_vars import get_global_args, is_pd_prefill_only
 from chitu.task import Task, SampleParams, PackedTasks, PackedTasksResult, TaskType
@@ -19,30 +20,17 @@ from chitu.ops.sampling import (
     resample_mtp_rejected,
     batch_append_tokens,
 )
-from chitu.utils import (
-    ceil_div,
-    create_tensor,
-    get_chitu_bool_env,
-    step_timer,
-    try_import_opt_dep,
-)
+from chitu.utils import ceil_div, create_tensor, step_timer
 
 from .utils import get_tokenizer_info, get_op_device
 
 logger = logging.getLogger(__name__)
 
-xgrammar, has_xgrammar = try_import_opt_dep("xgrammar", "grammar")
-if has_xgrammar:
-    # The installed xgrammar may be older than chitu expects (e.g. lacks
-    # BatchGrammarMatcher). Disable the missing pieces gracefully; normal
-    # (unconstrained) sampling does not require xgrammar.
-    allocate_token_bitmask = getattr(xgrammar, "allocate_token_bitmask", None)
-    GrammarMatcher = getattr(xgrammar, "GrammarMatcher", None)
-    BatchGrammarMatcher = getattr(xgrammar, "BatchGrammarMatcher", None)
-else:
-    allocate_token_bitmask = None
-    GrammarMatcher = None
-    BatchGrammarMatcher = None
+# xgrammar is a required dependency; older versions may lack the batched
+# matcher. Keep the per-task GrammarMatcher path available in that case.
+allocate_token_bitmask = getattr(xgrammar, "allocate_token_bitmask", None)
+GrammarMatcher = getattr(xgrammar, "GrammarMatcher", None)
+BatchGrammarMatcher = getattr(xgrammar, "BatchGrammarMatcher", None)
 
 TOKEN_BLOCK_SIZE = 256
 "token block size for frequency penalty"
@@ -140,8 +128,8 @@ class TaskSampleState:
         if task.grammar:
             if GrammarMatcher is None:
                 raise RuntimeError(
-                    "Grammar-constrained decoding requested but the installed xgrammar "
-                    "does not provide GrammarMatcher/BatchGrammarMatcher; install a newer xgrammar."
+                    "Grammar-constrained decoding requested but the installed "
+                    "xgrammar does not provide GrammarMatcher; install a newer xgrammar."
                 )
             matcher = GrammarMatcher(task.grammar)
             for i, token in enumerate(tokens):
@@ -229,7 +217,6 @@ class Sampler:
         )
 
         self.states: dict[str, TaskSampleState] = {}
-
         # The rows of the step whose draft has run but whose verify has not.
         self._draft_batch: DraftBatch | None = None
         self.batch_matcher = (
@@ -676,9 +663,13 @@ class Sampler:
                     batch_matchers.append(state.matcher)
                     batch_indices.append(ti)
             if batch_matchers:
-                self.batch_matcher.batch_fill_next_token_bitmask(
-                    batch_matchers, bitmask, batch_indices
-                )
+                if self.batch_matcher is not None:
+                    self.batch_matcher.batch_fill_next_token_bitmask(
+                        batch_matchers, bitmask, batch_indices
+                    )
+                else:
+                    for matcher, batch_index in zip(batch_matchers, batch_indices):
+                        matcher.fill_next_token_bitmask(bitmask, batch_index)
                 all_filled_indices.extend(batch_indices)
             if all_filled_indices:
                 bitmask_gpu = bitmask.to(logits.device, non_blocking=True)
